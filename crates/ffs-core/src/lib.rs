@@ -1169,6 +1169,14 @@ struct BtrfsAllocState {
     nodesize: u32,
     /// Sector size in bytes (copied from superblock for convenience).
     sectorsize: u32,
+    /// Data-checksum algorithm (copied from superblock for convenience).
+    ///
+    /// Carried here for the same reason as `nodesize`: the csum-tree write path
+    /// needs it on every extent, and it decides BOTH the digest and the packing
+    /// stride of an EXTENT_CSUM item. Writing crc32c digests into an xxhash64
+    /// filesystem produces an image the kernel reads as corrupt on every data
+    /// read, so this is not a formatting detail that can default.
+    csum_type: u16,
     /// bd-0ajub: the tree-log blocks currently reachable from the superblock, as
     /// `(bytenr, num_bytes, is_metadata)`.
     ///
@@ -9224,6 +9232,7 @@ impl OpenFs {
         };
         let nodesize = sb.nodesize;
         let sectorsize = sb.sectorsize;
+        let csum_type = sb.csum_type;
         let generation = sb.generation;
 
         // btrfs leaf: header (BTRFS_HEADER_SIZE=101 bytes) + N items (BTRFS_ITEM_SIZE=25 bytes each)
@@ -9654,6 +9663,7 @@ impl OpenFs {
             generation,
             nodesize,
             sectorsize,
+            csum_type,
             // Empty on purpose: the tree was just rebuilt from items, so no block
             // id in it corresponds to anything on disk yet (bd-42gtq).
             written_tree_blocks: std::collections::HashMap::new(),
@@ -11990,13 +12000,19 @@ impl OpenFs {
     ///
     /// Reads each on-disk sector of the extent (`disk_num_bytes` from
     /// `disk_bytenr` — the compressed bytes for a compressed extent, which is
-    /// exactly what btrfs checksums) and compares its crc32c to the recorded
+    /// exactly what btrfs checksums) and compares its digest to the recorded
     /// `EXTENT_CSUM`, returning [`FfsError::Corruption`] on the first mismatch.
     /// Holes (`disk_bytenr == 0`) and preallocated extents carry no checksum
     /// and are skipped, as are sectors with no recorded checksum.
     ///
+    /// The digest and the csum-array stride both come from the filesystem's own
+    /// `csum_type`. Hardcoding crc32c here would report EVERY sector of a valid
+    /// xxhash64 filesystem as corrupt, so an unimplemented algorithm is refused
+    /// as unsupported rather than checked with the wrong one.
+    ///
     /// # Errors
-    /// [`FfsError::Corruption`] on mismatch, or a read error.
+    /// [`FfsError::Corruption`] on mismatch, [`FfsError::UnsupportedFeature`] on
+    /// a checksum algorithm FrankenFS does not implement, or a read error.
     fn btrfs_verify_one_extent_csum(
         &self,
         cx: &Cx,
@@ -12009,6 +12025,15 @@ impl OpenFs {
         if disk_bytenr == 0 || extent_type == BTRFS_FILE_EXTENT_PREALLOC {
             return Ok(()); // hole / preallocated-unwritten — no on-disk data checksum
         }
+        let csum_type = self
+            .btrfs_context()
+            .map_or(ffs_types::BTRFS_CSUM_TYPE_CRC32C, |ctx| ctx.csum_type);
+        let csum_size = ffs_btrfs::btrfs_data_csum_size(csum_type).ok_or_else(|| {
+            FfsError::UnsupportedFeature(format!(
+                "btrfs checksum algorithm {csum_type} is not implemented \
+                 (CRC32C=0 and XXHASH64=1 are)"
+            ))
+        })?;
         let dnb = usize::try_from(disk_num_bytes)
             .map_err(|_| FfsError::Format("btrfs disk_num_bytes overflow".into()))?;
         let sectors = dnb.div_ceil(sectorsize);
@@ -12028,17 +12053,20 @@ impl OpenFs {
             let bytenr = disk_bytenr
                 .checked_add(delta)
                 .ok_or_else(|| FfsError::Format("btrfs csum sector bytenr overflow".into()))?;
-            let Some(expected) = lookup_data_block_csum(csum_items, bytenr, sectorsize) else {
+            let Some(expected) = lookup_data_block_csum(csum_items, bytenr, sectorsize, csum_size)
+            else {
                 continue; // no checksum recorded for this sector
             };
             self.btrfs_read_logical_into(cx, bytenr, &mut sector)?;
-            let actual = ffs_types::crc32c(&sector);
-            if actual != expected {
+            if !ffs_btrfs::btrfs_data_csum_matches(csum_type, &sector, expected) {
+                let actual = ffs_btrfs::btrfs_data_csum(csum_type, &sector).unwrap_or_default();
                 return Err(FfsError::Corruption {
                     block: bytenr,
                     detail: format!(
                         "btrfs data csum mismatch at logical {bytenr}: \
-                         expected {expected:#010x}, computed {actual:#010x}"
+                         expected {}, computed {} (csum_type {csum_type})",
+                        btrfs_csum_hex(expected),
+                        btrfs_csum_hex(&actual[..csum_size]),
                     ),
                 });
             }
@@ -12223,9 +12251,13 @@ impl OpenFs {
         if !any_datasum_extent {
             return Ok(()); // only holes / inline / preallocated extents — nothing to verify
         }
-        let nodesize = self.btrfs_superblock().map_or(0, |sb| sb.nodesize);
-        let max_span =
-            (ffs_btrfs::max_data_csums_per_item(nodesize) as u64).saturating_mul(sectorsize as u64);
+        let (nodesize, csum_type) = self
+            .btrfs_superblock()
+            .map_or((0, ffs_types::BTRFS_CSUM_TYPE_CRC32C), |sb| {
+                (sb.nodesize, sb.csum_type)
+            });
+        let max_span = (ffs_btrfs::max_data_csums_per_item(nodesize, csum_type) as u64)
+            .saturating_mul(sectorsize as u64);
         let csum_lo = BtrfsKey {
             objectid: ffs_btrfs::BTRFS_EXTENT_CSUM_OBJECTID,
             item_type: ffs_btrfs::BTRFS_ITEM_EXTENT_CSUM,
@@ -20066,6 +20098,21 @@ fn parse_to_ffs_error(e: &ParseError) -> FfsError {
 }
 
 /// Convert a btrfs mutation error to an `FfsError`.
+/// Render a btrfs checksum for a diagnostic, in the on-disk byte order.
+///
+/// Digests are variable width across `csum_type`, so a corruption message cannot
+/// use a fixed `{:#010x}`: that would print an xxhash64 digest as a truncated
+/// u32 and make the two sides of a mismatch look narrower than they are.
+fn btrfs_csum_hex(csum: &[u8]) -> String {
+    use std::fmt::Write as _;
+    let mut s = String::with_capacity(2 + csum.len() * 2);
+    s.push_str("0x");
+    for b in csum {
+        let _ = write!(s, "{b:02x}");
+    }
+    s
+}
+
 fn btrfs_mutation_to_ffs(e: &BtrfsMutationError) -> FfsError {
     match e {
         BtrfsMutationError::BrokenInvariant(msg) => FfsError::Corruption {
@@ -29009,12 +29056,13 @@ impl OpenFs {
                 &read_buf
             }
         };
-        let max_per_item = ffs_btrfs::max_data_csums_per_item(alloc.nodesize);
+        let max_per_item = ffs_btrfs::max_data_csums_per_item(alloc.nodesize, alloc.csum_type);
         let csum_items = ffs_btrfs::build_extent_csum_items(
             disk_bytenr,
             on_disk,
             sectorsize_usize,
             max_per_item,
+            alloc.csum_type,
         )
         .map_err(|e| btrfs_mutation_to_ffs(&e))?;
         for (key, value) in csum_items {
@@ -29656,15 +29704,28 @@ impl OpenFs {
         if sectorsize == 0 {
             return Err(FfsError::Format("btrfs sectorsize must be non-zero".into()));
         }
-        let csum_size = u64::try_from(ffs_btrfs::BTRFS_CRC32C_CSUM_SIZE)
-            .map_err(|_| FfsError::Format("csum size does not fit u64".into()))?;
+        // The stride of the packed csum array is the filesystem's digest width,
+        // not a constant: re-keying an xxhash64 item with a 4-byte stride splits
+        // it mid-digest and hands the kernel checksums for the wrong sectors.
+        let csum_size = ffs_btrfs::btrfs_data_csum_size(alloc.csum_type)
+            .and_then(|s| u64::try_from(s).ok())
+            .ok_or_else(|| {
+                FfsError::UnsupportedFeature(format!(
+                    "btrfs checksum algorithm {} is not implemented \
+                     (CRC32C=0 and XXHASH64=1 are)",
+                    alloc.csum_type
+                ))
+            })?;
         let remove_end = disk_bytenr.saturating_add(disk_num_bytes);
 
         // An item starting up to (max_csums_per_item - 1) sectors before the
         // range can still reach into it, so the scan must begin that far back.
-        let max_span = u64::try_from(ffs_btrfs::max_data_csums_per_item(alloc.nodesize))
-            .unwrap_or(1)
-            .saturating_mul(sectorsize);
+        let max_span = u64::try_from(ffs_btrfs::max_data_csums_per_item(
+            alloc.nodesize,
+            alloc.csum_type,
+        ))
+        .unwrap_or(1)
+        .saturating_mul(sectorsize);
         let scan_lo = disk_bytenr.saturating_sub(max_span.saturating_sub(sectorsize));
         let lo = BtrfsKey {
             objectid: ffs_btrfs::BTRFS_EXTENT_CSUM_OBJECTID,
@@ -30940,8 +31001,8 @@ impl OpenFs {
         let min_disk = extents.iter().map(|(lo, _)| *lo).min().unwrap_or(0);
         let max_disk_end = extents.iter().map(|(_, hi)| *hi).max().unwrap_or(0);
         let sectorsize = u64::from(alloc.sectorsize);
-        let max_span =
-            (ffs_btrfs::max_data_csums_per_item(alloc.nodesize) as u64).saturating_mul(sectorsize);
+        let max_span = (ffs_btrfs::max_data_csums_per_item(alloc.nodesize, alloc.csum_type) as u64)
+            .saturating_mul(sectorsize);
         let lo = BtrfsKey {
             objectid: ffs_btrfs::BTRFS_EXTENT_CSUM_OBJECTID,
             item_type: ffs_btrfs::BTRFS_ITEM_EXTENT_CSUM,
@@ -30953,7 +31014,15 @@ impl OpenFs {
             offset: max_disk_end,
         };
 
-        let csum_size = ffs_btrfs::BTRFS_CRC32C_CSUM_SIZE as u64;
+        let csum_size = ffs_btrfs::btrfs_data_csum_size(alloc.csum_type)
+            .and_then(|s| u64::try_from(s).ok())
+            .ok_or_else(|| {
+                FfsError::UnsupportedFeature(format!(
+                    "btrfs checksum algorithm {} is not implemented \
+                     (CRC32C=0 and XXHASH64=1 are)",
+                    alloc.csum_type
+                ))
+            })?;
         let mut logged = Vec::new();
         for (key, data) in alloc
             .csum_tree
@@ -31180,6 +31249,10 @@ impl OpenFs {
             child_generations: Vec::new(),
             child_bytenrs: Vec::new(),
             child_min_keys: Vec::new(),
+            // The log's blocks belong to this filesystem, so they carry its
+            // algorithm — a crc32c log on an xxhash64 filesystem fails the
+            // kernel's checksum on the first block of replay.
+            csum_type: sb.csum_type,
         };
         let log_tree_bytes = node
             .serialize(&serialize_params(log_tree))
@@ -32164,6 +32237,7 @@ impl OpenFs {
             new_gen,
             BTRFS_FS_TREE_OBJECTID,
             nodesize,
+            sb.csum_type,
             alloc.sectorsize,
             allocated_addrs,
             reused_generations,
@@ -32391,6 +32465,7 @@ impl OpenFs {
                 new_gen,
                 BTRFS_CSUM_TREE_OBJECTID,
                 nodesize,
+                sb.csum_type,
                 alloc.sectorsize,
                 csum_allocated_addrs,
             );
@@ -32507,6 +32582,7 @@ impl OpenFs {
                 new_gen,
                 *subvol_objectid,
                 nodesize,
+                sb.csum_type,
                 alloc.sectorsize,
                 subvol_allocated_addrs,
             );
@@ -32821,6 +32897,7 @@ impl OpenFs {
                     new_gen,
                     BTRFS_DEV_TREE_OBJECTID,
                     nodesize,
+                    sb.csum_type,
                     alloc.sectorsize,
                     dev_addrs,
                 );
@@ -32907,6 +32984,7 @@ impl OpenFs {
                     new_gen,
                     BTRFS_CHUNK_TREE_OBJECTID,
                     nodesize,
+                    sb.csum_type,
                     alloc.sectorsize,
                     chunk_addrs,
                 );
@@ -32993,6 +33071,7 @@ impl OpenFs {
             new_gen,
             BTRFS_EXTENT_TREE_OBJECTID,
             nodesize,
+            sb.csum_type,
             alloc.sectorsize,
             extent_allocated_addrs,
         );
@@ -33088,6 +33167,7 @@ impl OpenFs {
             new_gen,
             BTRFS_ROOT_TREE_OBJECTID,
             nodesize,
+            sb.csum_type,
             alloc.sectorsize,
             root_allocated_addrs,
         );
@@ -33234,6 +33314,7 @@ impl OpenFs {
                         fst_generation,
                         ffs_btrfs::BTRFS_FREE_SPACE_TREE_OBJECTID,
                         nodesize,
+                        sb.csum_type,
                         alloc.sectorsize,
                         addrs,
                     );
@@ -33464,8 +33545,24 @@ impl OpenFs {
             sb_bytes[0xB4..0xBC].copy_from_slice(&compat_ro.to_le_bytes());
         }
 
-        let csum = ffs_types::crc32c(&sb_bytes[0x20..]);
-        sb_bytes[0..4].copy_from_slice(&csum.to_le_bytes());
+        // Stamp with the filesystem's OWN algorithm, read back from the bytes
+        // about to be written. A hardcoded crc32c here writes a superblock the
+        // kernel rejects outright on an xxhash64 filesystem — and it would do so
+        // silently, since our own reader would then be the only thing that
+        // agreed with it.
+        let sb_csum_type =
+            u16::from_le_bytes(sb_bytes[0xC4..0xC6].try_into().map_err(|_| {
+                FfsError::Format("btrfs superblock too short for csum_type".into())
+            })?);
+        let csum_size = ffs_ondisk::btrfs_csum_size(sb_csum_type).ok_or_else(|| {
+            FfsError::UnsupportedFeature(format!(
+                "btrfs checksum algorithm {sb_csum_type} is not implemented \
+                 (CRC32C=0 and XXHASH64=1 are)"
+            ))
+        })?;
+        let csum = ffs_ondisk::btrfs_csum(sb_csum_type, &sb_bytes[0x20..])
+            .ok_or_else(|| FfsError::Format("btrfs superblock checksum failed".into()))?;
+        sb_bytes[..csum_size].copy_from_slice(&csum[..csum_size]);
 
         // Write superblock to primary location (0x10000 = 64 KiB)
         self.dev
@@ -53097,8 +53194,13 @@ mod tests {
             &committed[BTRFS_TEST_FILE_DATA_LOGICAL..BTRFS_TEST_FILE_DATA_LOGICAL + 4096],
         );
         assert_eq!(
-            lookup_data_block_csum(&csum_items, data_bytenr, 4096),
-            Some(expected),
+            lookup_data_block_csum(
+                &csum_items,
+                data_bytenr,
+                4096,
+                ffs_btrfs::BTRFS_CRC32C_CSUM_SIZE
+            ),
+            Some(&expected.to_le_bytes()[..]),
             "committed csum tree must persist the data sector's checksum across remount"
         );
     }
@@ -53399,7 +53501,11 @@ mod tests {
             offset: u64::MAX,
         };
         let items = alloc.csum_tree.range(&lo, &hi).expect("range csum tree");
-        lookup_data_block_csum(&items, bytenr, 4096)
+        // These fixtures are crc32c images; `items` is a local, so narrow the
+        // borrowed digest to an owned u32 before it goes out of scope.
+        lookup_data_block_csum(&items, bytenr, 4096, ffs_btrfs::BTRFS_CRC32C_CSUM_SIZE)
+            .and_then(|csum| csum.try_into().ok())
+            .map(u32::from_le_bytes)
     }
 
     #[test]

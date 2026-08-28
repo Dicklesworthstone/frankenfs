@@ -170,6 +170,51 @@ pub const BTRFS_EXTENT_CSUM_OBJECTID: u64 = 0xFFFF_FFFF_FFFF_FFF6;
 /// On-disk size of a single crc32c data checksum (kernel: `BTRFS_CSUM_SIZE`
 /// for the crc32c algorithm).
 pub const BTRFS_CRC32C_CSUM_SIZE: usize = 4;
+/// On-disk size of a single xxhash64 data checksum.
+pub const BTRFS_XXHASH64_CSUM_SIZE: usize = 8;
+/// Widest digest FrankenFS produces for a data sector, so a single checksum can
+/// travel by value instead of by allocation.
+pub const BTRFS_MAX_IMPL_CSUM_SIZE: usize = BTRFS_XXHASH64_CSUM_SIZE;
+
+/// On-disk width of one data checksum under `csum_type`, or `None` when
+/// FrankenFS does not implement that algorithm.
+///
+/// Re-exported from [`ffs_ondisk::btrfs_csum_size`] so the csum tree and the
+/// metadata verifiers cannot disagree about a filesystem's algorithm: the width
+/// is not merely how many bytes to compare, it is the STRIDE of the packed
+/// per-sector array, so a reader that assumes 4 bytes on an xxhash64 filesystem
+/// indexes into the middle of a neighbouring sector's checksum.
+pub use ffs_ondisk::btrfs_csum_size as btrfs_data_csum_size;
+
+/// One data sector's checksum under `csum_type`, little-endian, in the low
+/// `btrfs_data_csum_size(csum_type)` bytes of the returned buffer.
+///
+/// The trailing bytes are zero and carry no meaning; compare only the prefix, as
+/// [`verify_extent_csum`] and [`btrfs_data_csum_matches`] do.
+#[must_use]
+pub fn btrfs_data_csum(csum_type: u16, sector: &[u8]) -> Option<[u8; BTRFS_MAX_IMPL_CSUM_SIZE]> {
+    let full = ffs_ondisk::btrfs_csum(csum_type, sector)?;
+    let mut out = [0_u8; BTRFS_MAX_IMPL_CSUM_SIZE];
+    out.copy_from_slice(&full[..BTRFS_MAX_IMPL_CSUM_SIZE]);
+    Some(out)
+}
+
+/// Whether `sector` hashes, under `csum_type`, to the digest `expected` recorded
+/// in the csum tree.
+///
+/// `expected` is the raw on-disk slice from the packed array, so its length is the
+/// algorithm's width; a length that disagrees with `csum_type` is a mismatch, never
+/// a partial comparison.
+#[must_use]
+pub fn btrfs_data_csum_matches(csum_type: u16, sector: &[u8], expected: &[u8]) -> bool {
+    let Some(size) = btrfs_data_csum_size(csum_type) else {
+        return false;
+    };
+    if expected.len() != size {
+        return false;
+    }
+    btrfs_data_csum(csum_type, sector).is_some_and(|actual| actual[..size] == *expected)
+}
 
 /// Block group type flags.
 pub const BTRFS_BLOCK_GROUP_DATA: u64 = 1;
@@ -289,13 +334,20 @@ pub fn hash_extent_data_ref(root: u64, owner: u64, offset: u64) -> u64 {
 /// violation returns [`BtrfsMutationError::InvalidConfig`] rather than
 /// producing a silently truncated checksum run.
 ///
+/// `csum_type` is the filesystem's own algorithm, from the superblock at `0xC4`.
+/// It selects both the digest and the packing stride; writing crc32c digests into
+/// an xxhash64 filesystem's csum tree produces an image the kernel reads as
+/// corrupt on every data read.
+///
 /// # Errors
-/// Returns [`BtrfsMutationError::InvalidConfig`] if `sectorsize` is zero or if
-/// `data.len()` is not a positive multiple of `sectorsize`.
+/// Returns [`BtrfsMutationError::InvalidConfig`] if `sectorsize` is zero, if
+/// `data.len()` is not a positive multiple of `sectorsize`, or if `csum_type` is
+/// an algorithm FrankenFS does not implement.
 pub fn build_extent_csum_item(
     disk_bytenr: u64,
     data: &[u8],
     sectorsize: usize,
+    csum_type: u16,
 ) -> Result<(BtrfsKey, Vec<u8>), BtrfsMutationError> {
     if sectorsize == 0 {
         return Err(BtrfsMutationError::InvalidConfig(
@@ -307,11 +359,16 @@ pub fn build_extent_csum_item(
             "data must be a positive whole multiple of sectorsize",
         ));
     }
+    let csum_size = btrfs_data_csum_size(csum_type).ok_or(BtrfsMutationError::InvalidConfig(
+        "unsupported btrfs csum_type: only CRC32C (0) and XXHASH64 (1) are implemented",
+    ))?;
     let sectors = data.len() / sectorsize;
-    let mut value = Vec::with_capacity(sectors * BTRFS_CRC32C_CSUM_SIZE);
+    let mut value = Vec::with_capacity(sectors * csum_size);
     for sector in data.chunks_exact(sectorsize) {
-        let csum = ffs_types::crc32c(sector);
-        value.extend_from_slice(&csum.to_le_bytes());
+        let csum = btrfs_data_csum(csum_type, sector).ok_or(BtrfsMutationError::InvalidConfig(
+            "unsupported btrfs csum_type",
+        ))?;
+        value.extend_from_slice(&csum[..csum_size]);
     }
     let key = BtrfsKey {
         objectid: BTRFS_EXTENT_CSUM_OBJECTID,
@@ -327,15 +384,24 @@ pub fn build_extent_csum_item(
 /// A leaf is `BTRFS_HEADER_SIZE` (101) of header plus item slots; a single
 /// item costs its 25-byte item entry plus its value bytes. So the value of one
 /// EXTENT_CSUM item that is alone in a leaf can be at most
-/// `nodesize - 101 - 25` bytes, i.e. `(nodesize - 126) / 4` crc32c checksums.
+/// `nodesize - 101 - 25` bytes, i.e. `(nodesize - 126) / csum_size` checksums —
+/// half as many on an xxhash64 filesystem as on a crc32c one, which is why the
+/// bound is a function of `csum_type` and not a constant.
 /// Items at or below this bound always fit in a leaf (the B-tree handles
 /// packing several smaller items per leaf); the kernel accepts an EXTENT_CSUM
 /// item of any valid length, so any split that respects this bound is
 /// kernel-readable.
+///
+/// An unimplemented `csum_type` yields 1: no split bound can be honest about an
+/// algorithm whose width is unknown, and every builder that would consume the
+/// bound refuses that `csum_type` outright.
 #[must_use]
-pub fn max_data_csums_per_item(nodesize: u32) -> usize {
+pub fn max_data_csums_per_item(nodesize: u32, csum_type: u16) -> usize {
     let usable = (nodesize as usize).saturating_sub(101 + 25);
-    (usable / BTRFS_CRC32C_CSUM_SIZE).max(1)
+    let Some(csum_size) = btrfs_data_csum_size(csum_type) else {
+        return 1;
+    };
+    (usable / csum_size).max(1)
 }
 
 /// Build the csum-tree leaf items for one contiguous on-disk data extent,
@@ -351,17 +417,18 @@ pub fn max_data_csums_per_item(nodesize: u32) -> usize {
 ///
 /// `data` must be a non-empty whole multiple of `sectorsize`; `sectorsize` and
 /// `max_csums_per_item` must be non-zero. Pass
-/// `max_data_csums_per_item(nodesize)` for `max_csums_per_item`.
+/// `max_data_csums_per_item(nodesize, csum_type)` for `max_csums_per_item`.
 ///
 /// # Errors
 /// Returns [`BtrfsMutationError::InvalidConfig`] on a zero `sectorsize` /
-/// `max_csums_per_item`, or `data` that is not a positive multiple of
-/// `sectorsize`.
+/// `max_csums_per_item`, `data` that is not a positive multiple of
+/// `sectorsize`, or an unimplemented `csum_type`.
 pub fn build_extent_csum_items(
     disk_bytenr: u64,
     data: &[u8],
     sectorsize: usize,
     max_csums_per_item: usize,
+    csum_type: u16,
 ) -> Result<Vec<(BtrfsKey, Vec<u8>)>, BtrfsMutationError> {
     if max_csums_per_item == 0 {
         return Err(BtrfsMutationError::InvalidConfig(
@@ -399,13 +466,14 @@ pub fn build_extent_csum_items(
             chunk_bytenr,
             &data[offset..end],
             sectorsize,
+            csum_type,
         )?);
         offset = end;
     }
     Ok(items)
 }
 
-/// Look up the expected crc32c for the on-disk sector at `disk_bytenr` among a
+/// Look up the expected checksum for the on-disk sector at `disk_bytenr` among a
 /// set of EXTENT_CSUM items (the read-side counterpart of
 /// [`build_extent_csum_items`]).
 ///
@@ -413,11 +481,17 @@ pub fn build_extent_csum_items(
 /// carrying the disk bytenr of the item's first sector in `key.offset`. They
 /// must be sorted ascending by `key.offset` — the order both
 /// [`build_extent_csum_items`] emits and a csum-tree range/B-tree walk yields,
-/// so every real caller already satisfies it. Returns the checksum recorded for
-/// the sector that begins at `disk_bytenr`, or `None` if no item covers it or
-/// `disk_bytenr` is not sector-aligned to an item's coverage. A reader/scrub
-/// feeds the result to [`verify_extent_csum`] (or compares directly) to detect
-/// data corruption.
+/// so every real caller already satisfies it. Returns the raw on-disk checksum
+/// recorded for the sector that begins at `disk_bytenr`, or `None` if no item
+/// covers it or `disk_bytenr` is not sector-aligned to an item's coverage. A
+/// reader/scrub feeds the result to [`btrfs_data_csum_matches`] (or
+/// [`verify_extent_csum`] for a whole extent) to detect data corruption.
+///
+/// `csum_size` is the filesystem's digest width, from
+/// [`btrfs_data_csum_size`] — it is the STRIDE of the packed array, not merely
+/// the length of the answer. Passing 4 on an xxhash64 filesystem does not return
+/// a truncated digest; from the second sector on it returns bytes straddling two
+/// neighbouring checksums, so every read of a valid extent reports corruption.
 ///
 /// Whole-file csum verification calls this once per sector against the entire
 /// csum tree, so a linear scan made it O(sectors * items); the covering item is
@@ -428,8 +502,9 @@ pub fn lookup_data_block_csum(
     items: &[(BtrfsKey, Vec<u8>)],
     disk_bytenr: u64,
     sectorsize: usize,
-) -> Option<u32> {
-    if sectorsize == 0 {
+    csum_size: usize,
+) -> Option<&[u8]> {
+    if sectorsize == 0 || csum_size == 0 {
         return None;
     }
     // Items are sorted ascending by key.offset. The covering item is the last
@@ -454,17 +529,12 @@ pub fn lookup_data_block_csum(
         return None;
     }
     let index = delta / sectorsize;
-    let base = index.checked_mul(BTRFS_CRC32C_CSUM_SIZE)?;
-    let end = base.checked_add(BTRFS_CRC32C_CSUM_SIZE)?;
+    let base = index.checked_mul(csum_size)?;
+    let end = base.checked_add(csum_size)?;
     if end > value.len() {
         return None; // beyond this item's coverage
     }
-    Some(u32::from_le_bytes([
-        value[base],
-        value[base + 1],
-        value[base + 2],
-        value[base + 3],
-    ]))
+    Some(&value[base..end])
 }
 
 /// First-mismatch detail from [`verify_extent_csum`].
@@ -472,30 +542,54 @@ pub fn lookup_data_block_csum(
 pub struct CsumMismatch {
     /// Zero-based index of the first sector whose checksum did not match.
     pub sector_index: usize,
-    /// The crc32c recorded in the csum tree for that sector.
-    pub expected: u32,
-    /// The crc32c actually computed over the on-disk sector bytes.
-    pub actual: u32,
+    /// The digest recorded in the csum tree for that sector, little-endian, in
+    /// the low [`CsumMismatch::csum_size`] bytes.
+    pub expected: [u8; BTRFS_MAX_IMPL_CSUM_SIZE],
+    /// The digest actually computed over the on-disk sector bytes, same layout.
+    pub actual: [u8; BTRFS_MAX_IMPL_CSUM_SIZE],
+    /// How many bytes of `expected` / `actual` are significant — the algorithm's
+    /// width. Bytes above it are zero padding and must not be compared or
+    /// printed as part of the digest.
+    pub csum_size: usize,
 }
 
-/// Verify a contiguous on-disk data extent against its packed crc32c checksums.
+impl CsumMismatch {
+    /// The recorded digest, trimmed to the significant bytes.
+    #[must_use]
+    pub fn expected_digest(&self) -> &[u8] {
+        &self.expected[..self.csum_size.min(BTRFS_MAX_IMPL_CSUM_SIZE)]
+    }
+
+    /// The computed digest, trimmed to the significant bytes.
+    #[must_use]
+    pub fn actual_digest(&self) -> &[u8] {
+        &self.actual[..self.csum_size.min(BTRFS_MAX_IMPL_CSUM_SIZE)]
+    }
+}
+
+/// Verify a contiguous on-disk data extent against its packed checksums.
 ///
 /// Read-side inverse of [`build_extent_csum_item`]: given the extent's
-/// sector-padded bytes and the densely packed little-endian crc32c-per-sector
-/// value from its EXTENT_CSUM item, recompute each sector's crc32c (the same
-/// `ffs_types::crc32c` the kernel uses) and compare. The kernel returns EIO on
-/// the first mismatch when reading a `datasum` file; a reader or scrub built on
-/// this can do the same instead of silently returning corrupted data.
+/// sector-padded bytes and the densely packed little-endian per-sector value from
+/// its EXTENT_CSUM item, recompute each sector's digest under `csum_type` (the
+/// same algorithm the kernel uses) and compare. The kernel returns EIO on the
+/// first mismatch when reading a `datasum` file; a reader or scrub built on this
+/// can do the same instead of silently returning corrupted data.
+///
+/// `csum_type` sets both the digest and the array stride, so an
+/// `expected_csums` length that does not match `sectors * csum_size` is rejected
+/// as a configuration error rather than verified against a misaligned prefix.
 ///
 /// # Errors
 /// - `Err(Err(BtrfsMutationError::InvalidConfig))` if `sectorsize` is zero,
-///   `data` is not a positive whole multiple of `sectorsize`, or
-///   `expected_csums` length does not match the sector count.
+///   `data` is not a positive whole multiple of `sectorsize`, `csum_type` is
+///   unimplemented, or `expected_csums` length does not match the sector count.
 /// - `Err(Ok(CsumMismatch))` on the first sector whose checksum does not match.
 pub fn verify_extent_csum(
     data: &[u8],
     sectorsize: usize,
     expected_csums: &[u8],
+    csum_type: u16,
 ) -> Result<(), Result<CsumMismatch, BtrfsMutationError>> {
     if sectorsize == 0 {
         return Err(Err(BtrfsMutationError::InvalidConfig(
@@ -507,26 +601,33 @@ pub fn verify_extent_csum(
             "data must be a positive whole multiple of sectorsize",
         )));
     }
+    let Some(csum_size) = btrfs_data_csum_size(csum_type) else {
+        return Err(Err(BtrfsMutationError::InvalidConfig(
+            "unsupported btrfs csum_type: only CRC32C (0) and XXHASH64 (1) are implemented",
+        )));
+    };
     let sectors = data.len() / sectorsize;
-    if expected_csums.len() != sectors * BTRFS_CRC32C_CSUM_SIZE {
+    if expected_csums.len() != sectors * csum_size {
         return Err(Err(BtrfsMutationError::InvalidConfig(
             "expected_csums length does not match sector count",
         )));
     }
     for (index, sector) in data.chunks_exact(sectorsize).enumerate() {
-        let base = index * BTRFS_CRC32C_CSUM_SIZE;
-        let expected = u32::from_le_bytes([
-            expected_csums[base],
-            expected_csums[base + 1],
-            expected_csums[base + 2],
-            expected_csums[base + 3],
-        ]);
-        let actual = ffs_types::crc32c(sector);
-        if actual != expected {
+        let base = index * csum_size;
+        let recorded = &expected_csums[base..base + csum_size];
+        let Some(actual) = btrfs_data_csum(csum_type, sector) else {
+            return Err(Err(BtrfsMutationError::InvalidConfig(
+                "unsupported btrfs csum_type",
+            )));
+        };
+        if actual[..csum_size] != *recorded {
+            let mut expected = [0_u8; BTRFS_MAX_IMPL_CSUM_SIZE];
+            expected[..csum_size].copy_from_slice(recorded);
             return Err(Ok(CsumMismatch {
                 sector_index: index,
                 expected,
                 actual,
+                csum_size,
             }));
         }
     }
@@ -3245,6 +3346,14 @@ pub struct BtrfsNodeSerializeParams {
     /// ("Wrong key of child node/leaf"); production writeback now supplies this
     /// (bd-6uyto). Preserved-empty for the simulator/standalone serializer tests.
     pub child_min_keys: Vec<BtrfsKey>,
+    /// Checksum algorithm this filesystem uses, from its superblock at `0xC4`.
+    ///
+    /// Every tree block carries a digest of THIS algorithm in its first 32 bytes.
+    /// Stamping crc32c on an xxhash64 filesystem writes a block the kernel
+    /// rejects, and rejects silently as far as FrankenFS is concerned, since our
+    /// own reader would be the only thing that agreed with it. Carried here, not
+    /// defaulted, so a caller has to say which filesystem it is writing.
+    pub csum_type: u16,
 }
 
 /// The `NodeOverflow` a leaf's items justify, with the arithmetic filled in.
@@ -3436,9 +3545,16 @@ impl BtrfsCowNode {
             }
         }
 
-        // Compute CRC32C over [32..nodesize) and store at [0..4)
-        let crc = ffs_types::crc32c(&buf[32..]);
-        buf[0..4].copy_from_slice(&crc.to_le_bytes());
+        // Digest [32..nodesize) under the filesystem's own algorithm and store it
+        // at the front of the 32-byte csum field.
+        let csum_size =
+            btrfs_data_csum_size(params.csum_type).ok_or(BtrfsMutationError::InvalidConfig(
+                "unsupported btrfs csum_type: only CRC32C (0) and XXHASH64 (1) are implemented",
+            ))?;
+        let csum = ffs_ondisk::btrfs_csum(params.csum_type, &buf[32..]).ok_or(
+            BtrfsMutationError::InvalidConfig("unsupported btrfs csum_type"),
+        )?;
+        buf[..csum_size].copy_from_slice(&csum[..csum_size]);
 
         Ok(buf)
     }
@@ -12058,8 +12174,13 @@ mod tests {
         data.extend(std::iter::repeat_n(0xCD_u8, sectorsize));
 
         let disk_bytenr = 0x1_0000_u64;
-        let (key, value) = build_extent_csum_item(disk_bytenr, &data, sectorsize)
-            .expect("aligned two-sector extent");
+        let (key, value) = build_extent_csum_item(
+            disk_bytenr,
+            &data,
+            sectorsize,
+            ffs_types::BTRFS_CSUM_TYPE_CRC32C,
+        )
+        .expect("aligned two-sector extent");
 
         // Key identifies the csum tree's single EXTENT_CSUM objectid, the
         // EXTENT_CSUM item type, and the extent's logical start as the offset.
@@ -12086,19 +12207,20 @@ mod tests {
 
     #[test]
     fn build_extent_csum_item_rejects_misaligned_or_empty_bd_x3fcu() {
+        let crc = ffs_types::BTRFS_CSUM_TYPE_CRC32C;
         // Not a whole multiple of sectorsize.
         assert!(matches!(
-            build_extent_csum_item(0, &[0u8; 4097], 4096),
+            build_extent_csum_item(0, &[0u8; 4097], 4096, crc),
             Err(BtrfsMutationError::InvalidConfig(_))
         ));
         // Empty extent.
         assert!(matches!(
-            build_extent_csum_item(0, &[], 4096),
+            build_extent_csum_item(0, &[], 4096, crc),
             Err(BtrfsMutationError::InvalidConfig(_))
         ));
         // Zero sectorsize.
         assert!(matches!(
-            build_extent_csum_item(0, &[0u8; 8], 0),
+            build_extent_csum_item(0, &[0u8; 8], 0, crc),
             Err(BtrfsMutationError::InvalidConfig(_))
         ));
     }
@@ -12113,8 +12235,14 @@ mod tests {
             data.extend(std::iter::repeat_n(0xA0 | s, sectorsize));
         }
         let disk_bytenr = 0x40_000_u64;
-        let items =
-            build_extent_csum_items(disk_bytenr, &data, sectorsize, max_per_item).expect("split");
+        let items = build_extent_csum_items(
+            disk_bytenr,
+            &data,
+            sectorsize,
+            max_per_item,
+            ffs_types::BTRFS_CSUM_TYPE_CRC32C,
+        )
+        .expect("split");
 
         assert_eq!(items.len(), 3, "5 sectors / 2 per item = 3 items");
         // Item keys advance by max_per_item*sectorsize from disk_bytenr.
@@ -12132,9 +12260,14 @@ mod tests {
         assert_eq!(items[2].1.len(), BTRFS_CRC32C_CSUM_SIZE);
         // Concatenating all item values reproduces the single-item packing
         // (proves the split is a faithful partition, not a recompute).
-        let whole = build_extent_csum_item(disk_bytenr, &data, sectorsize)
-            .expect("single")
-            .1;
+        let whole = build_extent_csum_item(
+            disk_bytenr,
+            &data,
+            sectorsize,
+            ffs_types::BTRFS_CSUM_TYPE_CRC32C,
+        )
+        .expect("single")
+        .1;
         let joined: Vec<u8> = items.iter().flat_map(|(_, v)| v.clone()).collect();
         assert_eq!(joined, whole);
     }
@@ -12143,7 +12276,14 @@ mod tests {
     fn build_extent_csum_items_single_item_when_under_limit_bd_x3fcu() {
         let sectorsize = 4096_usize;
         let data = vec![0x5A_u8; sectorsize * 3];
-        let items = build_extent_csum_items(0x1000, &data, sectorsize, 8).expect("fits");
+        let items = build_extent_csum_items(
+            0x1000,
+            &data,
+            sectorsize,
+            8,
+            ffs_types::BTRFS_CSUM_TYPE_CRC32C,
+        )
+        .expect("fits");
         assert_eq!(
             items.len(),
             1,
@@ -12154,25 +12294,45 @@ mod tests {
 
     #[test]
     fn max_data_csums_per_item_matches_leaf_geometry_bd_x3fcu() {
+        let crc = ffs_types::BTRFS_CSUM_TYPE_CRC32C;
         // (nodesize - 101 - 25) / 4, floored, min 1.
-        assert_eq!(max_data_csums_per_item(4096), (4096 - 126) / 4);
-        assert_eq!(max_data_csums_per_item(16384), (16384 - 126) / 4);
+        assert_eq!(max_data_csums_per_item(4096, crc), (4096 - 126) / 4);
+        assert_eq!(max_data_csums_per_item(16384, crc), (16384 - 126) / 4);
         // Degenerate tiny nodesize never returns 0.
-        assert_eq!(max_data_csums_per_item(64), 1);
+        assert_eq!(max_data_csums_per_item(64, crc), 1);
+
+        // An xxhash64 leaf holds HALF as many checksums, because the bound is a
+        // function of the digest width. A bound that ignored csum_type would
+        // pack twice a leaf's worth of 8-byte digests into one item and overflow
+        // the leaf (bd-csum-parity).
+        let xxh = ffs_types::BTRFS_CSUM_TYPE_XXHASH64;
+        assert_eq!(max_data_csums_per_item(16384, xxh), (16384 - 126) / 8);
+        assert_eq!(
+            max_data_csums_per_item(16384, xxh) * 2,
+            max_data_csums_per_item(16384, crc),
+            "16258 bytes holds 4064 crc32c digests or exactly half that many xxh64"
+        );
+
+        // An algorithm with no implemented width cannot yield an honest bound.
+        assert_eq!(
+            max_data_csums_per_item(16384, ffs_types::BTRFS_CSUM_TYPE_SHA256),
+            1
+        );
     }
 
     #[test]
     fn build_extent_csum_items_rejects_bad_args_bd_x3fcu() {
+        let crc = ffs_types::BTRFS_CSUM_TYPE_CRC32C;
         assert!(matches!(
-            build_extent_csum_items(0, &[0u8; 4096], 4096, 0),
+            build_extent_csum_items(0, &[0u8; 4096], 4096, 0, crc),
             Err(BtrfsMutationError::InvalidConfig(_))
         ));
         assert!(matches!(
-            build_extent_csum_items(0, &[0u8; 4097], 4096, 4),
+            build_extent_csum_items(0, &[0u8; 4097], 4096, 4, crc),
             Err(BtrfsMutationError::InvalidConfig(_))
         ));
         assert!(matches!(
-            build_extent_csum_items(0, &[], 4096, 4),
+            build_extent_csum_items(0, &[], 4096, 4, crc),
             Err(BtrfsMutationError::InvalidConfig(_))
         ));
     }
@@ -12182,57 +12342,87 @@ mod tests {
         let sectorsize = 4096_usize;
         let mut data = vec![0xC3_u8; sectorsize];
         data.extend(std::iter::repeat_n(0x7E_u8, sectorsize)); // 2 sectors
-        let (_key, csums) = build_extent_csum_item(0x1000, &data, sectorsize).expect("build csums");
+        let crc = ffs_types::BTRFS_CSUM_TYPE_CRC32C;
+        let (_key, csums) =
+            build_extent_csum_item(0x1000, &data, sectorsize, crc).expect("build csums");
 
         // Faithful data verifies clean (round-trip with the builder).
-        assert_eq!(verify_extent_csum(&data, sectorsize, &csums), Ok(()));
+        assert_eq!(verify_extent_csum(&data, sectorsize, &csums, crc), Ok(()));
 
         // Corrupt one byte in the SECOND sector -> mismatch reported at sector 1
         // with the recomputed crc, sector 0 still considered good.
         let mut corrupt = data.clone();
         corrupt[sectorsize + 10] ^= 0xFF;
-        let expected_good = ffs_types::crc32c(&data[sectorsize..]);
-        let result = verify_extent_csum(&corrupt, sectorsize, &csums);
+        let expected_good = ffs_types::crc32c(&data[sectorsize..]).to_le_bytes();
+        let result = verify_extent_csum(&corrupt, sectorsize, &csums, crc);
         assert!(
             matches!(result, Err(Ok(_))),
             "expected a sector mismatch, got {result:?}"
         );
         if let Err(Ok(m)) = result {
             assert_eq!(m.sector_index, 1);
-            assert_eq!(m.expected, expected_good);
-            assert_ne!(m.actual, m.expected);
+            assert_eq!(m.csum_size, BTRFS_CRC32C_CSUM_SIZE);
+            assert_eq!(m.expected_digest(), expected_good);
+            assert_ne!(m.actual_digest(), m.expected_digest());
         }
     }
 
     #[test]
     fn verify_extent_csum_rejects_bad_args_bd_x3fcu() {
+        let crc = ffs_types::BTRFS_CSUM_TYPE_CRC32C;
         // Zero sectorsize.
         assert!(matches!(
-            verify_extent_csum(&[0u8; 8], 0, &[0u8; 8]),
+            verify_extent_csum(&[0u8; 8], 0, &[0u8; 8], crc),
             Err(Err(BtrfsMutationError::InvalidConfig(_)))
         ));
         // Non-multiple data.
         assert!(matches!(
-            verify_extent_csum(&[0u8; 4097], 4096, &[0u8; 4]),
+            verify_extent_csum(&[0u8; 4097], 4096, &[0u8; 4], crc),
             Err(Err(BtrfsMutationError::InvalidConfig(_)))
         ));
         // Wrong csum length (2 sectors but only 1 csum).
         assert!(matches!(
-            verify_extent_csum(&[0u8; 8192], 4096, &[0u8; 4]),
+            verify_extent_csum(&[0u8; 8192], 4096, &[0u8; 4], crc),
+            Err(Err(BtrfsMutationError::InvalidConfig(_)))
+        ));
+        // An unimplemented algorithm is refused, never verified with another's
+        // digest: 32 bytes of "sha256" over one sector is a well-formed csum run
+        // for a filesystem FrankenFS cannot check.
+        assert!(matches!(
+            verify_extent_csum(
+                &[0u8; 4096],
+                4096,
+                &[0u8; 32],
+                ffs_types::BTRFS_CSUM_TYPE_SHA256
+            ),
             Err(Err(BtrfsMutationError::InvalidConfig(_)))
         ));
     }
 
     proptest::proptest! {
-        /// verify_extent_csum accepts correct per-sector crc32c and reports the
+        /// verify_extent_csum accepts correct per-sector checksums and reports the
         /// first mismatching sector when one is corrupted, across varying sector
-        /// counts. The unit tests only use fixed 2-sector examples.
+        /// counts AND both implemented algorithms. The unit tests only use fixed
+        /// 2-sector crc32c examples.
+        ///
+        /// Running the identical property under xxhash64 is what makes a
+        /// width-blind implementation fail here rather than only in production:
+        /// with an 8-byte digest and a 4-byte stride the second sector's expected
+        /// checksum is read from the middle of the first sector's, so the
+        /// round-trip half of this property breaks on `num_sectors >= 2`.
         #[test]
         fn proptest_verify_extent_csum_roundtrip_and_tamper(
             num_sectors in 1_usize..=8,
             seed in any::<u64>(),
             corrupt_sector in 0_usize..8,
+            use_xxhash in any::<bool>(),
         ) {
+            let csum_type = if use_xxhash {
+                ffs_types::BTRFS_CSUM_TYPE_XXHASH64
+            } else {
+                ffs_types::BTRFS_CSUM_TYPE_CRC32C
+            };
+            let csum_size = btrfs_data_csum_size(csum_type).expect("implemented algorithm");
             let sectorsize = 64_usize;
             let mut data = vec![0_u8; num_sectors * sectorsize];
             let mut rng = seed;
@@ -12243,22 +12433,34 @@ mod tests {
                 *b = rng.to_le_bytes()[7];
             }
 
-            let mut csums = Vec::with_capacity(num_sectors * 4);
+            // Pack the expected run INDEPENDENTLY of the builder, so this is a
+            // check against the on-disk format and not a self-consistency test.
+            let mut csums = Vec::with_capacity(num_sectors * csum_size);
             for s in 0..num_sectors {
-                let crc = ffs_types::crc32c(&data[s * sectorsize..(s + 1) * sectorsize]);
-                csums.extend_from_slice(&crc.to_le_bytes());
+                let sector = &data[s * sectorsize..(s + 1) * sectorsize];
+                if use_xxhash {
+                    csums.extend_from_slice(&xxhash_rust::xxh64::xxh64(sector, 0).to_le_bytes());
+                } else {
+                    csums.extend_from_slice(&ffs_types::crc32c(sector).to_le_bytes());
+                }
             }
 
             // Correct csums verify.
-            proptest::prop_assert_eq!(verify_extent_csum(&data, sectorsize, &csums), Ok(()));
+            proptest::prop_assert_eq!(
+                verify_extent_csum(&data, sectorsize, &csums, csum_type),
+                Ok(())
+            );
 
             // Corrupting one sector flags exactly that sector (the only, hence
             // first, mismatch).
             if corrupt_sector < num_sectors {
                 let mut tampered = data.clone();
                 tampered[corrupt_sector * sectorsize] ^= 0x5A;
-                match verify_extent_csum(&tampered, sectorsize, &csums) {
-                    Err(Ok(m)) => proptest::prop_assert_eq!(m.sector_index, corrupt_sector),
+                match verify_extent_csum(&tampered, sectorsize, &csums, csum_type) {
+                    Err(Ok(m)) => {
+                        proptest::prop_assert_eq!(m.sector_index, corrupt_sector);
+                        proptest::prop_assert_eq!(m.csum_size, csum_size);
+                    }
                     other => proptest::prop_assert!(
                         false,
                         "expected mismatch at sector {}, got {:?}",
@@ -12272,16 +12474,23 @@ mod tests {
 
     proptest::proptest! {
         /// build_extent_csum_items + lookup_data_block_csum form a roundtrip:
-        /// every sector's packed crc32c must be recoverable, across arbitrary
-        /// sector counts, split factors, and bases. The unit test below covers
-        /// one fixed configuration only.
+        /// every sector's packed checksum must be recoverable, across arbitrary
+        /// sector counts, split factors, bases, AND both implemented algorithms.
+        /// The unit test below covers one fixed crc32c configuration only.
         #[test]
         fn proptest_build_csum_items_then_lookup_each_sector(
             num_sectors in 1_usize..=12,
             split in 1_usize..=4,
             base_units in 0_u64..=1000,
             seed in any::<u64>(),
+            use_xxhash in any::<bool>(),
         ) {
+            let csum_type = if use_xxhash {
+                ffs_types::BTRFS_CSUM_TYPE_XXHASH64
+            } else {
+                ffs_types::BTRFS_CSUM_TYPE_CRC32C
+            };
+            let csum_size = btrfs_data_csum_size(csum_type).expect("implemented algorithm");
             let sectorsize = 4096_usize;
             let base = base_units * u64::try_from(sectorsize).unwrap();
 
@@ -12294,17 +12503,24 @@ mod tests {
                 *b = rng.to_le_bytes()[7];
             }
 
-            let items = build_extent_csum_items(base, &data, sectorsize, split)
+            let items = build_extent_csum_items(base, &data, sectorsize, split, csum_type)
                 .expect("build csum items");
 
-            // Every sector's csum is recoverable.
+            // Every sector's csum is recoverable, computed independently of the
+            // builder. Under xxhash64 a 4-byte stride would return bytes spanning
+            // two neighbouring digests from sector 1 onward.
             for s in 0..num_sectors {
                 let off = s * sectorsize;
                 let bytenr = base + u64::try_from(off).unwrap();
-                let want = ffs_types::crc32c(&data[off..off + sectorsize]);
+                let sector = &data[off..off + sectorsize];
+                let want: Vec<u8> = if use_xxhash {
+                    xxhash_rust::xxh64::xxh64(sector, 0).to_le_bytes().to_vec()
+                } else {
+                    ffs_types::crc32c(sector).to_le_bytes().to_vec()
+                };
                 proptest::prop_assert_eq!(
-                    lookup_data_block_csum(&items, bytenr, sectorsize),
-                    Some(want),
+                    lookup_data_block_csum(&items, bytenr, sectorsize, csum_size),
+                    Some(&want[..]),
                     "sector {} of {}",
                     s,
                     num_sectors
@@ -12313,7 +12529,10 @@ mod tests {
 
             // Just past the covered run -> miss.
             let past = base + u64::try_from(num_sectors * sectorsize).unwrap();
-            proptest::prop_assert_eq!(lookup_data_block_csum(&items, past, sectorsize), None);
+            proptest::prop_assert_eq!(
+                lookup_data_block_csum(&items, past, sectorsize, csum_size),
+                None
+            );
         }
     }
 
@@ -12326,7 +12545,9 @@ mod tests {
         for s in 0..5_u8 {
             data.extend(std::iter::repeat_n(0x10 | s, sectorsize));
         }
-        let items = build_extent_csum_items(base, &data, sectorsize, 2).expect("split");
+        let crc = ffs_types::BTRFS_CSUM_TYPE_CRC32C;
+        let cs = BTRFS_CRC32C_CSUM_SIZE;
+        let items = build_extent_csum_items(base, &data, sectorsize, 2, crc).expect("split");
         assert_eq!(items.len(), 3);
 
         let ss = u64::try_from(sectorsize).unwrap();
@@ -12334,21 +12555,27 @@ mod tests {
         for s in 0..5_usize {
             let off = s * sectorsize;
             let bytenr = base + u64::try_from(off).unwrap();
-            let want = ffs_types::crc32c(&data[off..off + sectorsize]);
+            let want = ffs_types::crc32c(&data[off..off + sectorsize]).to_le_bytes();
             assert_eq!(
-                lookup_data_block_csum(&items, bytenr, sectorsize),
-                Some(want),
+                lookup_data_block_csum(&items, bytenr, sectorsize, cs),
+                Some(&want[..]),
                 "sector {s} (crosses item boundaries at 2 and 4)"
             );
         }
 
         // Misses: before the run, past the run, and a non-sector-aligned bytenr.
-        assert_eq!(lookup_data_block_csum(&items, base - ss, sectorsize), None);
         assert_eq!(
-            lookup_data_block_csum(&items, base + 5 * ss, sectorsize),
+            lookup_data_block_csum(&items, base - ss, sectorsize, cs),
             None
         );
-        assert_eq!(lookup_data_block_csum(&items, base + 100, sectorsize), None);
+        assert_eq!(
+            lookup_data_block_csum(&items, base + 5 * ss, sectorsize, cs),
+            None
+        );
+        assert_eq!(
+            lookup_data_block_csum(&items, base + 100, sectorsize, cs),
+            None
+        );
         // Unrelated key types are ignored.
         let noise = vec![(
             BtrfsKey {
@@ -12358,7 +12585,7 @@ mod tests {
             },
             vec![0xFF_u8; 4],
         )];
-        assert_eq!(lookup_data_block_csum(&noise, base, sectorsize), None);
+        assert_eq!(lookup_data_block_csum(&noise, base, sectorsize, cs), None);
     }
 
     #[test]
@@ -12372,7 +12599,10 @@ mod tests {
         for s in 0..2_u8 {
             data.extend(std::iter::repeat_n(0x20 | s, sectorsize));
         }
-        let mut items = build_extent_csum_items(base, &data, sectorsize, 2).expect("csum item");
+        let crc = ffs_types::BTRFS_CSUM_TYPE_CRC32C;
+        let cs = BTRFS_CRC32C_CSUM_SIZE;
+        let mut items =
+            build_extent_csum_items(base, &data, sectorsize, 2, crc).expect("csum item");
         assert_eq!(items.len(), 1);
 
         // A non-csum item at a HIGHER offset (base + sectorsize), still
@@ -12390,12 +12620,192 @@ mod tests {
 
         // Sector 1 lives at base + sectorsize, exactly where the non-csum item
         // sits. The lookup must skip it and resolve sector index 1's real crc.
-        let want = ffs_types::crc32c(&data[sectorsize..2 * sectorsize]);
+        let want = ffs_types::crc32c(&data[sectorsize..2 * sectorsize]).to_le_bytes();
         assert_eq!(
-            lookup_data_block_csum(&items, base + ss, sectorsize),
-            Some(want),
+            lookup_data_block_csum(&items, base + ss, sectorsize, cs),
+            Some(&want[..]),
             "must skip the interleaved non-csum item and resolve sector 1",
         );
+    }
+
+    /// btrfs data-csum parity: an XXHASH64 filesystem packs 8-byte digests.
+    ///
+    /// The positive half. `mainline` btrfs has supported this since kernel 5.5 and
+    /// the format tool emits it on demand, so a reader that packs and reads only
+    /// crc32c cannot round-trip such a filesystem's data at all.
+    #[test]
+    fn xxhash64_data_csums_round_trip_bd_csum_parity() {
+        let sectorsize = 4096_usize;
+        let xxh = ffs_types::BTRFS_CSUM_TYPE_XXHASH64;
+        let mut data = vec![0xAB_u8; sectorsize];
+        data.extend(std::iter::repeat_n(0xCD_u8, sectorsize));
+
+        let (key, value) =
+            build_extent_csum_item(0x1_0000, &data, sectorsize, xxh).expect("two-sector extent");
+        assert_eq!(key.item_type, BTRFS_ITEM_EXTENT_CSUM);
+        assert_eq!(
+            value.len(),
+            2 * BTRFS_XXHASH64_CSUM_SIZE,
+            "an xxhash64 run is 8 bytes per sector, not 4"
+        );
+        // Computed independently of the builder, from the algorithm's definition.
+        assert_eq!(
+            &value[0..8],
+            &xxhash_rust::xxh64::xxh64(&data[..sectorsize], 0).to_le_bytes()
+        );
+        assert_eq!(
+            &value[8..16],
+            &xxhash_rust::xxh64::xxh64(&data[sectorsize..], 0).to_le_bytes()
+        );
+        assert_eq!(verify_extent_csum(&data, sectorsize, &value, xxh), Ok(()));
+    }
+
+    /// PLANTED NEGATIVE: a width-blind reader accepts this. It must not.
+    ///
+    /// The lookup stride is the digest width, not a constant 4. On an xxhash64
+    /// filesystem a hardcoded 4-byte stride returns, for sector 1, the HIGH half
+    /// of sector 0's digest concatenated with the LOW half of sector 1's — bytes
+    /// that belong to no sector's checksum. The failure is not "a truncated
+    /// digest"; it is a wrong digest, so every read of a healthy file reports
+    /// corruption.
+    ///
+    /// This test asserts the two strides disagree, which is exactly the property
+    /// a `BTRFS_CRC32C_CSUM_SIZE`-everywhere implementation cannot satisfy.
+    #[test]
+    fn xxhash64_lookup_with_crc32c_stride_returns_wrong_bytes_bd_csum_parity() {
+        let sectorsize = 4096_usize;
+        let xxh = ffs_types::BTRFS_CSUM_TYPE_XXHASH64;
+        let base = 0x80_000_u64;
+        let ss = u64::try_from(sectorsize).expect("ss");
+        let mut data = Vec::new();
+        for s in 0..3_u8 {
+            data.extend(std::iter::repeat_n(0x30 | s, sectorsize));
+        }
+        let items = build_extent_csum_items(base, &data, sectorsize, 4, xxh).expect("csum items");
+
+        // Correct stride: sector 1 resolves to its own digest.
+        let want = xxhash_rust::xxh64::xxh64(&data[sectorsize..2 * sectorsize], 0).to_le_bytes();
+        assert_eq!(
+            lookup_data_block_csum(&items, base + ss, sectorsize, BTRFS_XXHASH64_CSUM_SIZE),
+            Some(&want[..]),
+            "sector 1 must resolve to its own xxh64 digest"
+        );
+
+        // Wrong stride: what a crc32c-only implementation would read for the same
+        // sector. It is NOT the digest, and it is not a prefix of it either.
+        let straddled =
+            lookup_data_block_csum(&items, base + ss, sectorsize, BTRFS_CRC32C_CSUM_SIZE)
+                .expect("a 4-byte stride still lands inside the item, which is the hazard");
+        assert_ne!(
+            straddled,
+            &want[..BTRFS_CRC32C_CSUM_SIZE],
+            "a 4-byte stride reads the high half of sector 0's digest, not sector 1's"
+        );
+        // Name what those bytes actually are, so the failure mode is on record
+        // rather than merely asserted to be "wrong".
+        let sector0 = xxhash_rust::xxh64::xxh64(&data[..sectorsize], 0).to_le_bytes();
+        assert_eq!(
+            straddled,
+            &sector0[BTRFS_CRC32C_CSUM_SIZE..],
+            "the 4-byte stride lands on the high half of SECTOR 0's digest"
+        );
+    }
+
+    /// PLANTED NEGATIVE: a reader that ignores `csum_type` accepts this.
+    ///
+    /// The csum run is a perfectly valid crc32c packing, and the filesystem says
+    /// XXHASH64. An implementation that always runs crc32c "verifies" it — while
+    /// the kernel, reading the same image, computes xxh64 and returns EIO. The
+    /// only safe answer is to refuse the run whose length disagrees with the
+    /// declared algorithm.
+    #[test]
+    fn crc32c_run_is_rejected_under_xxhash64_bd_csum_parity() {
+        let sectorsize = 4096_usize;
+        let data = vec![0x77_u8; sectorsize * 2];
+        let (_key, crc_run) =
+            build_extent_csum_item(0x1000, &data, sectorsize, ffs_types::BTRFS_CSUM_TYPE_CRC32C)
+                .expect("crc32c run");
+        assert_eq!(crc_run.len(), 2 * BTRFS_CRC32C_CSUM_SIZE);
+
+        let result = verify_extent_csum(
+            &data,
+            sectorsize,
+            &crc_run,
+            ffs_types::BTRFS_CSUM_TYPE_XXHASH64,
+        );
+        assert!(
+            matches!(result, Err(Err(BtrfsMutationError::InvalidConfig(_)))),
+            "a crc32c run must not satisfy an xxhash64 filesystem, got {result:?}"
+        );
+
+        // And the single-sector comparison refuses it too, where the length check
+        // is the only thing standing between the two algorithms.
+        assert!(
+            !btrfs_data_csum_matches(
+                ffs_types::BTRFS_CSUM_TYPE_XXHASH64,
+                &data[..sectorsize],
+                &crc_run[..BTRFS_CRC32C_CSUM_SIZE]
+            ),
+            "a 4-byte digest can never satisfy an 8-byte algorithm"
+        );
+    }
+
+    /// PLANTED NEGATIVE: a reader comparing only the low 32 bits accepts this.
+    ///
+    /// The recorded digest's LOW four bytes are the correct xxh64 value and only
+    /// the high four are corrupted — the exact shape a `u32`-shaped comparison
+    /// (the natural mistake, since the crc32c path is a `u32`) lets through,
+    /// weakening detection by a factor of 2^32.
+    #[test]
+    fn truncated_xxhash64_data_comparison_is_rejected_bd_csum_parity() {
+        let sectorsize = 4096_usize;
+        let xxh = ffs_types::BTRFS_CSUM_TYPE_XXHASH64;
+        let data = vec![0x9E_u8; sectorsize];
+        let mut run = xxhash_rust::xxh64::xxh64(&data, 0).to_le_bytes();
+        run[4] ^= 0xFF; // corrupt ONLY above the low 32 bits
+
+        assert!(
+            !btrfs_data_csum_matches(xxh, &data, &run),
+            "a digest differing only in its high half must not match"
+        );
+        let result = verify_extent_csum(&data, sectorsize, &run, xxh);
+        match result {
+            Err(Ok(m)) => {
+                assert_eq!(m.sector_index, 0);
+                assert_eq!(m.csum_size, BTRFS_XXHASH64_CSUM_SIZE);
+                assert_eq!(
+                    m.expected_digest()[..4],
+                    m.actual_digest()[..4],
+                    "the low halves agree — which is precisely why a u32 compare passes"
+                );
+                assert_ne!(m.expected_digest(), m.actual_digest());
+            }
+            other => panic!("expected a sector-0 mismatch, got {other:?}"),
+        }
+    }
+
+    /// SHA256 and BLAKE2b fail CLOSED at every layer rather than being checked
+    /// with an algorithm FrankenFS happens to have.
+    #[test]
+    fn unimplemented_csum_types_are_refused_not_guessed_bd_csum_parity() {
+        let sectorsize = 4096_usize;
+        let data = vec![0x11_u8; sectorsize];
+        for csum_type in [
+            ffs_types::BTRFS_CSUM_TYPE_SHA256,
+            ffs_types::BTRFS_CSUM_TYPE_BLAKE2B,
+        ] {
+            assert_eq!(btrfs_data_csum_size(csum_type), None);
+            assert_eq!(btrfs_data_csum(csum_type, &data), None);
+            assert!(!btrfs_data_csum_matches(csum_type, &data, &[0_u8; 32]));
+            assert!(matches!(
+                build_extent_csum_item(0x1000, &data, sectorsize, csum_type),
+                Err(BtrfsMutationError::InvalidConfig(_))
+            ));
+            assert!(matches!(
+                build_extent_csum_items(0x1000, &data, sectorsize, 4, csum_type),
+                Err(BtrfsMutationError::InvalidConfig(_))
+            ));
+        }
     }
 
     fn test_key(objectid: u64) -> BtrfsKey {
@@ -13873,6 +14283,7 @@ mod tests {
                 child_generations: vec![7; children.len()],
                 child_bytenrs: children.clone(),
                 child_min_keys: Vec::new(),
+                csum_type: ffs_types::BTRFS_CSUM_TYPE_CRC32C,
             };
             let buf = node.serialize(&params).unwrap_or_else(|e| {
                 panic!("node {block} at level {level} does not fit a {nodesize}-byte node: {e}")
@@ -22828,15 +23239,18 @@ mod tests {
         // Now CRC check should fail
         let err =
             verify_tree_block_checksum(&block, ffs_types::BTRFS_CSUM_TYPE_CRC32C).unwrap_err();
+        // The reason no longer names CRC32C: the verifier dispatches on
+        // csum_type now, so the message describes WHAT failed (the tree block's
+        // checksum) rather than which algorithm computed it.
         assert!(
             matches!(
                 err,
                 ParseError::InvalidField {
                     field: "tree_block_csum",
-                    reason: "CRC32C checksum mismatch",
+                    reason: "tree block checksum mismatch",
                 }
             ),
-            "expected CRC mismatch error, got: {err:?}"
+            "expected a tree-block checksum mismatch, got: {err:?}"
         );
     }
 
@@ -27002,6 +27416,7 @@ mod tests {
             child_generations: vec![],
             child_bytenrs: vec![],
             child_min_keys: vec![],
+            csum_type: ffs_types::BTRFS_CSUM_TYPE_CRC32C,
         };
 
         let buf = node.serialize(&params).expect("serialize should succeed");
@@ -27056,6 +27471,7 @@ mod tests {
             child_generations: vec![190, 195, 200],
             child_bytenrs: vec![],
             child_min_keys: vec![],
+            csum_type: ffs_types::BTRFS_CSUM_TYPE_CRC32C,
         };
 
         let buf = node.serialize(&params).expect("serialize should succeed");

@@ -5880,11 +5880,21 @@ fn btrfs_chunk_type_flag_names(chunk_type: u64) -> Vec<String> {
     flags
 }
 
+/// Name a btrfs checksum algorithm the way `btrfs inspect-internal dump-super`
+/// does.
+///
+/// All four kernel algorithms are NAMED, because a diagnostic that prints
+/// `unknown(2)` for sha256 tells the operator FrankenFS did not recognise the
+/// image when in fact it recognised the algorithm and does not implement it —
+/// two different problems with two different answers. Whether an algorithm is
+/// implemented is decided by `ffs_btrfs::btrfs_data_csum_size`, not here.
 fn btrfs_checksum_type_name(csum_type: u16) -> String {
-    if csum_type == ffs_types::BTRFS_CSUM_TYPE_CRC32C {
-        "crc32c".to_owned()
-    } else {
-        format!("unknown({csum_type})")
+    match csum_type {
+        ffs_types::BTRFS_CSUM_TYPE_CRC32C => "crc32c".to_owned(),
+        ffs_types::BTRFS_CSUM_TYPE_XXHASH64 => "xxhash64".to_owned(),
+        ffs_types::BTRFS_CSUM_TYPE_SHA256 => "sha256".to_owned(),
+        ffs_types::BTRFS_CSUM_TYPE_BLAKE2B => "blake2b".to_owned(),
+        _ => format!("unknown({csum_type})"),
     }
 }
 

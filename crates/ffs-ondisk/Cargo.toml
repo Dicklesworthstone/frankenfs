@@ -9,6 +9,7 @@ rust-version.workspace = true
 [dependencies]
 ffs-types = { workspace = true }
 crc32c = { workspace = true }
+xxhash-rust = { workspace = true }
 serde = { workspace = true }
 smallvec = { workspace = true }
 

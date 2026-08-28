@@ -30,6 +30,10 @@ proptest = { workspace = true }
 serde_json = { workspace = true }
 sha2 = { workspace = true }
 tempfile = { workspace = true }
+# Tests compute xxh64 digests INDEPENDENTLY of the production path, so a
+# csum-parity assertion checks the on-disk format rather than agreeing with
+# whatever ffs-ondisk happens to produce.
+xxhash-rust = { workspace = true }
 
 [[bench]]
 name = "extent_fetch"

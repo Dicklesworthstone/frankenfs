@@ -1466,7 +1466,7 @@ fn build_items() -> Vec<(BtrfsKey, Vec<u8>)> {
 
 /// Linear scan (the pre-bd-dgih3 shape): greatest offset `<=` target among
 /// EXTENT_CSUM items, then unpack the covering sector's crc32c.
-fn linear(items: &[(BtrfsKey, Vec<u8>)], disk_bytenr: u64, sectorsize: usize) -> Option<u32> {
+fn linear(items: &[(BtrfsKey, Vec<u8>)], disk_bytenr: u64, sectorsize: usize) -> Option<&[u8]> {
     let mut best: Option<(u64, &[u8])> = None;
     for (key, value) in items {
         if key.item_type != BTRFS_ITEM_EXTENT_CSUM || key.objectid != BTRFS_EXTENT_CSUM_OBJECTID {
@@ -1489,12 +1489,16 @@ fn linear(items: &[(BtrfsKey, Vec<u8>)], disk_bytenr: u64, sectorsize: usize) ->
     if end > value.len() {
         return None;
     }
-    Some(u32::from_le_bytes([
-        value[base],
-        value[base + 1],
-        value[base + 2],
-        value[base + 3],
-    ]))
+    Some(&value[base..end])
+}
+
+/// Fold a checksum into the accumulator so the benched result cannot be
+/// optimized away. Width-agnostic, because the digest width now follows
+/// `csum_type` rather than being a fixed `u32`.
+fn fold_csum(acc: u64, csum: Option<&[u8]>) -> u64 {
+    csum.unwrap_or(&[])
+        .iter()
+        .fold(acc, |a, &b| a.wrapping_mul(31).wrapping_add(u64::from(b)))
 }
 
 fn bench_csum_lookup(c: &mut Criterion) {
@@ -1551,7 +1555,7 @@ fn bench_csum_lookup(c: &mut Criterion) {
     // scan does for every probe.
     for &t in &probes {
         assert_eq!(
-            lookup_data_block_csum(&items, t, SECTORSIZE),
+            lookup_data_block_csum(&items, t, SECTORSIZE, CSUM_SIZE),
             linear(&items, t, SECTORSIZE),
             "disk_bytenr {t} diverged"
         );
@@ -1565,9 +1569,7 @@ fn bench_csum_lookup(c: &mut Criterion) {
         b.iter(|| {
             let mut acc = 0_u64;
             for &t in &probes {
-                acc = acc.wrapping_add(u64::from(
-                    linear(black_box(&items), t, SECTORSIZE).unwrap_or(0),
-                ));
+                acc = fold_csum(acc, linear(black_box(&items), t, SECTORSIZE));
             }
             black_box(acc)
         });
@@ -1576,9 +1578,10 @@ fn bench_csum_lookup(c: &mut Criterion) {
         b.iter(|| {
             let mut acc = 0_u64;
             for &t in &probes {
-                acc = acc.wrapping_add(u64::from(
-                    lookup_data_block_csum(black_box(&items), t, SECTORSIZE).unwrap_or(0),
-                ));
+                acc = fold_csum(
+                    acc,
+                    lookup_data_block_csum(black_box(&items), t, SECTORSIZE, CSUM_SIZE),
+                );
             }
             black_box(acc)
         });

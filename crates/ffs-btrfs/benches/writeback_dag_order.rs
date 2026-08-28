@@ -252,6 +252,7 @@ fn serialize_block_levels(
         GENERATION,
         5,
         NODESIZE,
+        ffs_types::BTRFS_CSUM_TYPE_CRC32C,
         4096,
         allocated_addrs,
     );

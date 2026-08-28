@@ -714,6 +714,15 @@ pub struct DiskWritebackContext {
     pub owner: u64,
     /// Node size in bytes (from superblock).
     pub nodesize: u32,
+    /// Checksum algorithm every serialized node is stamped with (from
+    /// superblock `0xC4`).
+    ///
+    /// A constructor ARGUMENT, not a defaulted field, and deliberately so: a
+    /// default here would be a crc32c stamp silently applied to an xxhash64
+    /// filesystem, producing blocks the kernel refuses while our own reader
+    /// agrees with them. Making it positional costs every caller one argument
+    /// and buys a compiler error instead of a corrupt image.
+    pub csum_type: u16,
     /// Block device sector size.
     pub sector_size: u32,
     /// Mapping from in-memory block numbers to allocated logical addresses.
@@ -746,6 +755,7 @@ impl DiskWritebackContext {
         generation: u64,
         owner: u64,
         nodesize: u32,
+        csum_type: u16,
         sector_size: u32,
     ) -> Self {
         Self {
@@ -754,6 +764,7 @@ impl DiskWritebackContext {
             generation,
             owner,
             nodesize,
+            csum_type,
             sector_size,
             allocated_addrs: None,
             block_generations: None,
@@ -765,12 +776,18 @@ impl DiskWritebackContext {
     /// The `allocated_addrs` map provides real chunk-covered logical addresses
     /// for each in-memory block number. These addresses must be obtained from
     /// `BtrfsAllocState::alloc_metadata_for_tree` before calling this.
+    #[expect(
+        clippy::too_many_arguments,
+        reason = "a field-wise constructor: the arguments ARE the struct's fields, in \
+                  declaration order, and this has callers in two crates."
+    )]
     pub fn with_allocated_addresses(
         fsid: [u8; 16],
         chunk_tree_uuid: [u8; 16],
         generation: u64,
         owner: u64,
         nodesize: u32,
+        csum_type: u16,
         sector_size: u32,
         allocated_addrs: BTreeMap<u64, u64>,
     ) -> Self {
@@ -780,6 +797,7 @@ impl DiskWritebackContext {
             generation,
             owner,
             nodesize,
+            csum_type,
             sector_size,
             allocated_addrs: Some(allocated_addrs),
             block_generations: None,
@@ -795,7 +813,7 @@ impl DiskWritebackContext {
     #[must_use]
     #[expect(
         clippy::too_many_arguments,
-        reason = "a field-wise constructor: the eight arguments ARE the struct's eight \
+        reason = "a field-wise constructor: the nine arguments ARE the struct's nine \
                   fields, in declaration order. Grouping them into a parameter struct \
                   would add a type whose only purpose is to be destructured immediately, \
                   and this has callers in two crates."
@@ -806,6 +824,7 @@ impl DiskWritebackContext {
         generation: u64,
         owner: u64,
         nodesize: u32,
+        csum_type: u16,
         sector_size: u32,
         allocated_addrs: BTreeMap<u64, u64>,
         block_generations: BTreeMap<u64, u64>,
@@ -816,6 +835,7 @@ impl DiskWritebackContext {
             generation,
             owner,
             nodesize,
+            csum_type,
             sector_size,
             allocated_addrs: Some(allocated_addrs),
             block_generations: Some(block_generations),
@@ -888,6 +908,7 @@ impl DiskWritebackContext {
             child_generations,
             child_bytenrs,
             child_min_keys,
+            csum_type: self.csum_type,
         }
     }
 
@@ -1860,6 +1881,7 @@ mod tests {
             generation,
             5, // FS_TREE
             TEST_NODESIZE,
+            ffs_types::BTRFS_CSUM_TYPE_CRC32C,
             4096,
         )
     }
@@ -1885,6 +1907,7 @@ mod tests {
             100,
             5,
             TEST_NODESIZE,
+            ffs_types::BTRFS_CSUM_TYPE_CRC32C,
             4096,
             allocated_addrs,
         );
@@ -1892,6 +1915,76 @@ mod tests {
         assert!(ctx.has_allocated_addresses());
         assert_eq!(ctx.block_to_bytenr(1), 0x4000_0000);
         assert_eq!(ctx.block_to_bytenr(10), 0x4001_0000);
+    }
+
+    /// btrfs csum-type parity, write side: a node is stamped with the algorithm
+    /// the context DECLARES, and a reader using the other one rejects it.
+    ///
+    /// PLANTED NEGATIVE. A `serialize` that hardcodes crc32c — which is what it
+    /// did before this bead — passes the first assertion here and fails the
+    /// second, because its stamp verifies as crc32c no matter what the context
+    /// says. That is precisely the production defect: on an xxhash64 filesystem
+    /// FrankenFS would write blocks only FrankenFS can read, and the kernel would
+    /// refuse the filesystem at `open_ctree`.
+    ///
+    /// The cross-check in both directions is what makes this more than a
+    /// round-trip: verifying a block only with the algorithm that wrote it is
+    /// self-consistent for ANY implementation, correct or not.
+    #[test]
+    fn serialize_node_stamps_declared_csum_type_bd_csum_parity() {
+        let tree = make_test_tree();
+        let root = tree.root_block();
+        // `make_test_tree` inserts enough items to force a real tree, so its root
+        // is an INTERNAL node and serializing it at level 0 is rejected outright.
+        // (`disk_writeback_context_serialize_leaf_roundtrip` guards this with an
+        // `if let Leaf`, which is why it never noticed.)
+        let level = match tree.node_snapshot(root).expect("root snapshot") {
+            BtrfsCowNode::Leaf { .. } => 0,
+            BtrfsCowNode::Internal { .. } => 1,
+        };
+
+        let xxh_ctx = super::DiskWritebackContext::new(
+            TEST_FSID,
+            TEST_CHUNK_UUID,
+            100,
+            5,
+            TEST_NODESIZE,
+            ffs_types::BTRFS_CSUM_TYPE_XXHASH64,
+            4096,
+        );
+        let buf = xxh_ctx
+            .serialize_node(&tree, root, level)
+            .expect("serialize");
+        verify_btrfs_tree_block_checksum(&buf, ffs_types::BTRFS_CSUM_TYPE_XXHASH64)
+            .expect("a block stamped for an xxhash64 filesystem must verify as xxhash64");
+        assert!(
+            verify_btrfs_tree_block_checksum(&buf, ffs_types::BTRFS_CSUM_TYPE_CRC32C).is_err(),
+            "an xxhash64-stamped block must NOT verify as crc32c — if it does, \
+             serialize ignored csum_type and stamped crc32c"
+        );
+
+        // And the mirror image, so neither direction can pass by accident.
+        let crc_ctx = make_disk_context(100);
+        let crc_buf = crc_ctx
+            .serialize_node(&tree, root, level)
+            .expect("serialize");
+        verify_btrfs_tree_block_checksum(&crc_buf, ffs_types::BTRFS_CSUM_TYPE_CRC32C)
+            .expect("a crc32c filesystem's block must verify as crc32c");
+        assert!(
+            verify_btrfs_tree_block_checksum(&crc_buf, ffs_types::BTRFS_CSUM_TYPE_XXHASH64)
+                .is_err(),
+            "a crc32c-stamped block must not verify as xxhash64"
+        );
+
+        // The two stamps differ in the bytes, not merely in how they are read.
+        assert_ne!(
+            &buf[..8],
+            &crc_buf[..8],
+            "the same node under two algorithms must produce two different digests"
+        );
+        // Everything after the csum field is byte-identical: the algorithm
+        // changes the checksum and nothing else about the block.
+        assert_eq!(&buf[32..], &crc_buf[32..]);
     }
 
     #[test]
@@ -2328,7 +2421,15 @@ mod tests {
         gens.insert(9_u64, 4_u64);
 
         let ctx = DiskWritebackContext::with_allocated_addresses_and_generations(
-            [0x5A; 16], [0x5A; 16], 10, 5, 16384, 4096, addrs, gens,
+            [0x5A; 16],
+            [0x5A; 16],
+            10,
+            5,
+            16384,
+            ffs_types::BTRFS_CSUM_TYPE_CRC32C,
+            4096,
+            addrs,
+            gens,
         );
 
         assert_eq!(
@@ -2363,6 +2464,7 @@ mod tests {
             10,
             5,
             16384,
+            ffs_types::BTRFS_CSUM_TYPE_CRC32C,
             4096,
             addrs.clone(),
         );
@@ -2372,6 +2474,7 @@ mod tests {
             10,
             5,
             16384,
+            ffs_types::BTRFS_CSUM_TYPE_CRC32C,
             4096,
             addrs,
             BTreeMap::new(),

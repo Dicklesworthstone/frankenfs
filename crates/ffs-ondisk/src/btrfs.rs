@@ -437,13 +437,102 @@ fn validate_superblock_tree_level(field: &'static str, level: u8) -> Result<(), 
 }
 
 fn validate_supported_csum_type(csum_type: u16) -> Result<(), ParseError> {
-    if csum_type != ffs_types::BTRFS_CSUM_TYPE_CRC32C {
-        return Err(ParseError::InvalidField {
+    match csum_type {
+        ffs_types::BTRFS_CSUM_TYPE_CRC32C | ffs_types::BTRFS_CSUM_TYPE_XXHASH64 => Ok(()),
+        _ => Err(ParseError::InvalidField {
             field: "csum_type",
-            reason: "only CRC32C (type 0) is currently supported",
+            reason: "unsupported btrfs checksum type: CRC32C (0) and XXHASH64 (1) are implemented, \
+                     SHA256 (2) and BLAKE2b (3) are not",
+        }),
+    }
+}
+
+/// Width of the on-disk `csum` field at the front of a btrfs superblock and of
+/// every tree block (kernel `BTRFS_CSUM_SIZE`). The digest occupies a prefix of
+/// it and the remaining bytes are zero.
+pub const BTRFS_CSUM_FIELD_SIZE: usize = 32;
+
+/// On-disk digest width for `csum_type`, or `None` when FrankenFS does not
+/// implement that algorithm.
+///
+/// btrfs has carried four checksum algorithms since kernel 5.5. The width is not
+/// merely how many bytes to compare: in the csum tree it is the STRIDE of the
+/// packed per-sector array, so a reader that assumes 4 bytes on an xxhash64
+/// filesystem indexes into the middle of a neighbouring sector's checksum.
+///
+/// SHA256 (2) and BLAKE2b (3) return `None`. FrankenFS refuses them rather than
+/// guessing, because computing the wrong digest and reporting the resulting
+/// mismatch as corruption is worse than declining to read the filesystem.
+#[must_use]
+pub const fn btrfs_csum_size(csum_type: u16) -> Option<usize> {
+    match csum_type {
+        ffs_types::BTRFS_CSUM_TYPE_CRC32C => Some(4),
+        ffs_types::BTRFS_CSUM_TYPE_XXHASH64 => Some(8),
+        _ => None,
+    }
+}
+
+/// The btrfs checksum of `bytes` under `csum_type`, little-endian, in the low
+/// [`btrfs_csum_size`] bytes; the rest of the field is zero, exactly as btrfs
+/// stores it.
+///
+/// This is THE digest primitive for the format — superblocks, tree blocks and
+/// data sectors all use it, differing only in which bytes they cover. Having one
+/// implementation is what keeps the metadata and data paths from drifting onto
+/// different algorithms for the same filesystem.
+#[must_use]
+pub fn btrfs_csum(csum_type: u16, bytes: &[u8]) -> Option<[u8; BTRFS_CSUM_FIELD_SIZE]> {
+    let mut out = [0_u8; BTRFS_CSUM_FIELD_SIZE];
+    match csum_type {
+        ffs_types::BTRFS_CSUM_TYPE_CRC32C => {
+            out[..4].copy_from_slice(&crc32c::crc32c(bytes).to_le_bytes());
+        }
+        ffs_types::BTRFS_CSUM_TYPE_XXHASH64 => {
+            // btrfs seeds xxh64 with 0.
+            out[..8].copy_from_slice(&xxhash_rust::xxh64::xxh64(bytes, 0).to_le_bytes());
+        }
+        _ => return None,
+    }
+    Some(out)
+}
+
+/// Compare a stored btrfs checksum against the one `bytes` actually hashes to.
+///
+/// btrfs has supported four checksum algorithms since kernel 5.5 and `mkfs.btrfs`
+/// will produce any of them; the type lives in the superblock at `0xC4` and applies
+/// to the superblock and every tree block. A reader that assumes CRC32C does not
+/// merely fail to mount an XXHASH64 filesystem — if it ignores the type it will
+/// happily "verify" one algorithm's bytes with another's, which is why the checksum
+/// field is compared here at its ALGORITHM-SPECIFIC WIDTH rather than always as a
+/// `u32`:
+///
+/// * CRC32C stores a 4-byte little-endian value in `csum[0..4]`;
+/// * XXHASH64 stores an 8-byte little-endian value in `csum[0..8]`.
+///
+/// Reading only the low 4 bytes of an XXH64 sum would compare a quarter of the
+/// digest and accept a corrupt block roughly one time in 2^32 more often than it
+/// should. The remaining bytes of the 32-byte field are zero in both cases.
+fn btrfs_checksum_matches(
+    stored_field: &[u8],
+    bytes: &[u8],
+    csum_type: u16,
+) -> Result<bool, ParseError> {
+    let csum_size = btrfs_csum_size(csum_type).ok_or(ParseError::InvalidField {
+        field: "csum_type",
+        reason: "unsupported btrfs checksum type",
+    })?;
+    if stored_field.len() < csum_size {
+        return Err(ParseError::InsufficientData {
+            needed: csum_size,
+            offset: 0,
+            actual: stored_field.len(),
         });
     }
-    Ok(())
+    let computed = btrfs_csum(csum_type, bytes).ok_or(ParseError::InvalidField {
+        field: "csum_type",
+        reason: "unsupported btrfs checksum type",
+    })?;
+    Ok(computed[..csum_size] == stored_field[..csum_size])
 }
 
 // ── sys_chunk_array entry types ──────────────────────────────────────────────
@@ -2454,14 +2543,15 @@ pub fn parse_internal_items(block: &[u8]) -> Result<(BtrfsHeader, Vec<BtrfsKeyPt
 
 // ── Checksum verification ───────────────────────────────────────────────────
 
-/// Verify the CRC32C checksum of a btrfs superblock.
+/// Verify the checksum of a btrfs superblock.
 ///
-/// The checksum covers `region[0x20..]` (everything after the 32-byte `csum`
-/// field). The expected checksum is stored as a little-endian u32 in
-/// `region[0..4]`.
+/// The checksum covers `region[0x20..BTRFS_SUPER_INFO_SIZE]` (everything after the
+/// 32-byte `csum` field) and is stored little-endian at the front of that field, at
+/// the width its algorithm produces. The algorithm is named by the superblock's own
+/// `csum_type` at `0xC4`, so this function reads it rather than taking it.
 ///
-/// Only CRC32C (`csum_type == 0`) is currently supported. Other algorithms
-/// return an error.
+/// CRC32C (0) and XXHASH64 (1) are implemented; SHA256 (2) and BLAKE2b (3) are
+/// refused rather than verified with the wrong algorithm.
 pub fn verify_superblock_checksum(region: &[u8]) -> Result<(), ParseError> {
     if region.len() < BTRFS_SUPER_INFO_SIZE {
         return Err(ParseError::InsufficientData {
@@ -2471,28 +2561,28 @@ pub fn verify_superblock_checksum(region: &[u8]) -> Result<(), ParseError> {
         });
     }
 
-    validate_supported_csum_type(read_le_u16(region, 0xC4)?)?;
+    let csum_type = read_le_u16(region, 0xC4)?;
+    validate_supported_csum_type(csum_type)?;
 
-    let stored = read_le_u32(region, 0)?;
-    let computed = crc32c::crc32c(&region[0x20..BTRFS_SUPER_INFO_SIZE]);
-
-    if stored != computed {
+    if !btrfs_checksum_matches(region, &region[0x20..BTRFS_SUPER_INFO_SIZE], csum_type)? {
         return Err(ParseError::InvalidField {
             field: "superblock_csum",
-            reason: "CRC32C checksum mismatch",
+            reason: "superblock checksum mismatch",
         });
     }
 
     Ok(())
 }
 
-/// Verify the CRC32C checksum of a btrfs tree block (leaf or internal node).
+/// Verify the checksum of a btrfs tree block (leaf or internal node).
 ///
-/// The checksum covers `block[0x20..block.len()]` (everything after the
-/// 32-byte `csum` field in the header). The expected checksum is stored as a
-/// little-endian u32 in `block[0..4]`.
+/// The checksum covers `block[0x20..block.len()]` (everything after the 32-byte
+/// `csum` field in the header) and is stored little-endian at the front of that
+/// field, at the width its algorithm produces.
 ///
-/// Only CRC32C (`csum_type == 0`) is currently supported.
+/// `csum_type` comes from the superblock at `0xC4` and applies to every tree block
+/// in the filesystem. CRC32C (0) and XXHASH64 (1) are implemented; SHA256 (2) and
+/// BLAKE2b (3) are refused rather than verified with the wrong algorithm.
 pub fn verify_tree_block_checksum(block: &[u8], csum_type: u16) -> Result<(), ParseError> {
     if block.len() < BTRFS_HEADER_SIZE {
         return Err(ParseError::InsufficientData {
@@ -2504,13 +2594,10 @@ pub fn verify_tree_block_checksum(block: &[u8], csum_type: u16) -> Result<(), Pa
 
     validate_supported_csum_type(csum_type)?;
 
-    let stored = read_le_u32(block, 0)?;
-    let computed = crc32c::crc32c(&block[0x20..]);
-
-    if stored != computed {
+    if !btrfs_checksum_matches(block, &block[0x20..], csum_type)? {
         return Err(ParseError::InvalidField {
             field: "tree_block_csum",
-            reason: "CRC32C checksum mismatch",
+            reason: "tree block checksum mismatch",
         });
     }
 
@@ -3556,6 +3643,13 @@ mod tests {
         );
     }
 
+    /// The superblock parser refuses the algorithms FrankenFS does not implement
+    /// — and, since csum-type parity landed, ACCEPTS the one it does.
+    ///
+    /// This test used `csum_type = 1` (XXHASH64) as its example of "unsupported",
+    /// which was true when it was written and is exactly the limitation this bead
+    /// removes. Pointing it at SHA256/BLAKE2b keeps the refusal covered, and the
+    /// acceptance arm below is what stops the gate quietly narrowing again.
     #[test]
     fn superblock_rejects_unsupported_csum_type() {
         let mut sb = [0_u8; BTRFS_SUPER_INFO_SIZE];
@@ -3563,15 +3657,35 @@ mod tests {
         set_valid_superblock_device_accounting(&mut sb);
         sb[0x90..0x94].copy_from_slice(&4096_u32.to_le_bytes());
         sb[0x94..0x98].copy_from_slice(&16384_u32.to_le_bytes());
-        sb[0xC4..0xC6].copy_from_slice(&1_u16.to_le_bytes());
-        let err = BtrfsSuperblock::parse_superblock_region(&sb).unwrap_err();
-        assert_eq!(
-            err,
-            ParseError::InvalidField {
-                field: "csum_type",
-                reason: "only CRC32C (type 0) is currently supported",
-            }
-        );
+
+        for csum_type in [
+            ffs_types::BTRFS_CSUM_TYPE_SHA256,
+            ffs_types::BTRFS_CSUM_TYPE_BLAKE2B,
+            9, // not an algorithm at all
+        ] {
+            sb[0xC4..0xC6].copy_from_slice(&csum_type.to_le_bytes());
+            let err = BtrfsSuperblock::parse_superblock_region(&sb).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ParseError::InvalidField {
+                        field: "csum_type",
+                        ..
+                    }
+                ),
+                "csum_type {csum_type} must be refused, got: {err:?}"
+            );
+        }
+
+        for csum_type in [
+            ffs_types::BTRFS_CSUM_TYPE_CRC32C,
+            ffs_types::BTRFS_CSUM_TYPE_XXHASH64,
+        ] {
+            sb[0xC4..0xC6].copy_from_slice(&csum_type.to_le_bytes());
+            let parsed = BtrfsSuperblock::parse_superblock_region(&sb)
+                .expect("an implemented checksum algorithm must parse");
+            assert_eq!(parsed.csum_type, csum_type);
+        }
     }
 
     #[test]
@@ -4991,22 +5105,165 @@ mod tests {
         );
     }
 
+    /// An unimplemented algorithm is refused as an ALGORITHM, not reported as a
+    /// checksum mismatch.
+    ///
+    /// The distinction is the whole point: "I cannot check this filesystem"
+    /// and "this filesystem is corrupt" call for different operator responses,
+    /// and a verifier that computes crc32c over a sha256 image reports the
+    /// second while meaning the first. This test used XXHASH64 as its example
+    /// before that algorithm was implemented (bd-csum-parity).
     #[test]
     fn verify_superblock_checksum_unsupported_type() {
+        for csum_type in [
+            ffs_types::BTRFS_CSUM_TYPE_SHA256,
+            ffs_types::BTRFS_CSUM_TYPE_BLAKE2B,
+        ] {
+            let mut sb = make_checksummed_sb();
+            sb[0xC4..0xC6].copy_from_slice(&csum_type.to_le_bytes());
+            let err = verify_superblock_checksum(&sb).unwrap_err();
+            assert!(
+                matches!(
+                    err,
+                    ParseError::InvalidField {
+                        field: "csum_type",
+                        ..
+                    }
+                ),
+                "csum_type {csum_type} must be refused as unsupported, got: {err:?}"
+            );
+        }
+    }
+
+    /// PLANTED NEGATIVE at the superblock: crc32c bytes under an XXHASH64
+    /// `csum_type` must be REJECTED.
+    ///
+    /// `make_checksummed_sb` stamps a valid CRC32C sum. Declaring the filesystem
+    /// XXHASH64 leaves those bytes untouched, so a verifier that ignores
+    /// `csum_type` accepts a superblock the kernel refuses — and a superblock is
+    /// the one block where "accepted by us, refused by the kernel" means the
+    /// whole filesystem.
+    #[test]
+    fn crc32c_superblock_is_rejected_under_xxhash64_bd_csum_parity() {
         let mut sb = make_checksummed_sb();
-        // Change csum_type to XXHASH64
-        sb[0xC4..0xC6].copy_from_slice(&1_u16.to_le_bytes());
-        let err = verify_superblock_checksum(&sb).unwrap_err();
+        sb[0xC4..0xC6].copy_from_slice(&ffs_types::BTRFS_CSUM_TYPE_XXHASH64.to_le_bytes());
+        let err = verify_superblock_checksum(&sb)
+            .expect_err("a CRC32C sum must not satisfy an XXHASH64 superblock");
         assert!(
             matches!(
                 err,
                 ParseError::InvalidField {
-                    field: "csum_type",
+                    field: "superblock_csum",
                     ..
                 }
             ),
-            "expected unsupported csum_type error, got: {err:?}"
+            "expected a checksum mismatch, got: {err:?}"
         );
+
+        // And the same superblock, stamped for the algorithm it declares, verifies.
+        let region_csum =
+            xxhash_rust::xxh64::xxh64(&sb[0x20..BTRFS_SUPER_INFO_SIZE], 0).to_le_bytes();
+        sb[0..8].copy_from_slice(&region_csum);
+        verify_superblock_checksum(&sb)
+            .expect("an xxhash64-stamped superblock must verify as xxhash64");
+    }
+
+    /// btrfs csum-type parity: an XXHASH64 filesystem must verify with XXH64.
+    ///
+    /// mainline btrfs has supported four checksum algorithms since 5.5, and the
+    /// format tool emits this one on demand; a CRC32C-only reader cannot open such
+    /// an image at all. This is the positive half.
+    #[test]
+    fn xxhash64_tree_block_verifies_bd_csum_parity() {
+        let mut block = vec![0_u8; 16384];
+        block[0x64] = 0;
+        block[0x60..0x64].copy_from_slice(&0_u32.to_le_bytes());
+        let csum = xxhash_rust::xxh64::xxh64(&block[0x20..], 0);
+        block[0..8].copy_from_slice(&csum.to_le_bytes());
+        verify_tree_block_checksum(&block, ffs_types::BTRFS_CSUM_TYPE_XXHASH64)
+            .expect("XXHASH64 tree block must verify under csum_type 1");
+    }
+
+    /// PLANTED NEGATIVE: a naive reader that ignores `csum_type` and always runs
+    /// CRC32C accepts this block. It must be REJECTED.
+    ///
+    /// The bytes carry a perfectly valid CRC32C sum, and the caller declares the
+    /// filesystem to be XXHASH64. Verifying with the wrong algorithm is not a
+    /// harmless mismatch — it is how a reader silently "validates" an image whose
+    /// integrity it never actually checked.
+    #[test]
+    fn crc32c_bytes_are_rejected_under_xxhash64_bd_csum_parity() {
+        let mut block = vec![0_u8; 16384];
+        block[0x64] = 0;
+        let crc = crc32c::crc32c(&block[0x20..]);
+        block[0..4].copy_from_slice(&crc.to_le_bytes());
+        let err = verify_tree_block_checksum(&block, ffs_types::BTRFS_CSUM_TYPE_XXHASH64)
+            .expect_err("a CRC32C sum must not satisfy an XXHASH64 filesystem");
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "tree_block_csum",
+                    ..
+                }
+            ),
+            "expected a checksum mismatch, got {err:?}"
+        );
+    }
+
+    /// PLANTED NEGATIVE: a reader that compares the stored checksum as a `u32`
+    /// accepts this block. It must be REJECTED.
+    ///
+    /// The low four bytes of the stored field are the CORRECT XXH64 digest; only the
+    /// high four are corrupted. Comparing at `u32` width — the natural mistake when
+    /// the CRC32C path already reads `read_le_u32` — checks a quarter of the digest
+    /// and lets this through, weakening detection by a factor of 2^32.
+    #[test]
+    fn truncated_xxhash64_comparison_is_rejected_bd_csum_parity() {
+        let mut block = vec![0_u8; 16384];
+        block[0x64] = 0;
+        let csum = xxhash_rust::xxh64::xxh64(&block[0x20..], 0);
+        let mut raw = csum.to_le_bytes();
+        raw[4] ^= 0xFF; // corrupt ONLY the high half
+        block[0..8].copy_from_slice(&raw);
+        let err = verify_tree_block_checksum(&block, ffs_types::BTRFS_CSUM_TYPE_XXHASH64)
+            .expect_err("a checksum differing only above the low 32 bits must be rejected");
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "tree_block_csum",
+                    ..
+                }
+            ),
+            "expected a checksum mismatch, got {err:?}"
+        );
+    }
+
+    /// The unimplemented algorithms must still fail CLOSED and say so.
+    #[test]
+    fn sha256_and_blake2b_are_refused_not_guessed_bd_csum_parity() {
+        let mut block = vec![0_u8; 16384];
+        block[0x64] = 0;
+        let crc = crc32c::crc32c(&block[0x20..]);
+        block[0..4].copy_from_slice(&crc.to_le_bytes());
+        for csum_type in [
+            ffs_types::BTRFS_CSUM_TYPE_SHA256,
+            ffs_types::BTRFS_CSUM_TYPE_BLAKE2B,
+        ] {
+            let err = verify_tree_block_checksum(&block, csum_type)
+                .expect_err("unimplemented checksum types must be refused, never assumed CRC32C");
+            assert!(
+                matches!(
+                    err,
+                    ParseError::InvalidField {
+                        field: "csum_type",
+                        ..
+                    }
+                ),
+                "expected an unsupported-csum_type refusal, got {err:?}"
+            );
+        }
     }
 
     #[test]
