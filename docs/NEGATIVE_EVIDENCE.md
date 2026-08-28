@@ -19321,3 +19321,50 @@ count is a mechanism and a floor, not a time model.
 
 Nothing shipped in this entry, nothing reverted; it re-prices a row against a default shipped earlier
 today.
+
+## 2026-08-27 — worst-row re-measurement VOIDED for load (gate refused it), but two load-insensitive results survive: the shipped zero-message-open default does NOT touch this row (counts bit-identical), and all four arms passed cross-arm digest parity
+
+Having finally caught a gate-passing window for parallel read, I tried to spend it on the campaign's
+worst row — ext4 `xattr-get-list-report`, banked `8.428754x`, a headline I have never verified myself
+in wall time. The window closed first.
+
+**VOIDED, by the pre-stated gate, not by hindsight.** Load was 52.6 at launch and 57.6 after:
+
+| check | value | verdict |
+|---|---|---|
+| kernel tail burden `k1` / `k2` | `1.2596` / `1.3279` | **both above the 1.20 gate — VOID** |
+| FUSE A/A null `shipA/shipB` | `0.940921` (min) | 6% off unity, the same bad-window signature |
+| kernel A/A null `k1/k2` | `0.988499` (min) | passes, but a passing kernel null does not rescue the run |
+
+The run did produce a vs-incumbent ratio. **I am not publishing it as a figure and it must not be
+quoted**: it came out far ABOVE the banked `8.428754x`, and a run whose own instrument checks fail is
+not evidence of a regression — it is what a loaded host does to a row whose kernel arm takes 34 ms and
+whose FUSE arm takes 410 ms. Recording that it happened, rather than silently dropping it, so that a
+future clean run reproducing something similar is not mistaken for a new discovery. **The worst row's
+shipping wall-time figure remains OWED.**
+
+**SURVIVING RESULT 1 — the shipped default does not touch this row, confirmed by counts.** Counts are
+load-insensitive, so this is valid from the same session. Re-running the deterministic oracle on the
+shipping ELF:
+
+| quantity | pre-ZMO ELF (earlier today) | **shipping ELF** |
+|---|---|---|
+| `crossings_total` | 20,010 | **20,010** |
+| `crossings_getxattr` | 16,004 | **16,004** |
+| `nvcsw` / report | `10.000` | **`9.998`** |
+| `op_counts getxattr` / `listxattr` | 7 / 2 | **7 / 2** |
+
+**Bit-identical.** Predicted, because this workload performs no file opens and zero-message open only
+removes `open`/`release` — but predicted-and-checked beats predicted. The worst row is unaffected by
+the default shipped this morning, so its banked mechanism (`2.000` blocking crossings per user
+syscall: 1.0 user answer + 1.0 audit capability probe) stands unchanged.
+
+**SURVIVING RESULT 2 — cross-arm digest parity passed on all four arms, in the voided run.** Every arm
+— both kernel ext4 mounts and both FrankenFS mounts — returned digest `13764262966921926213`. The
+digest folds xattr VALUE and NAME bytes only, never a path, so it is a real parity oracle rather than
+a self-comparison. **A bad window destroys a timing ratio; it cannot make two filesystems agree on
+1,648,000 bytes of xattr payload by accident.** FrankenFS served byte-identical xattr data to the
+live kernel across 10,000 operations.
+
+ELF `df946f5c3dabb7efea6555651e18f3164571b83ef21914d959e881265edc41ff` (release, HEAD).
+`hostname=thinkstation1`. Nothing shipped, nothing reverted.
