@@ -9119,7 +9119,29 @@ impl OpenFs {
                 }
                 self.ext4_forced_read_only.store(false, Ordering::SeqCst);
             }
-            FsFlavor::Btrfs(_) => {
+            FsFlavor::Btrfs(sb) => {
+                // bd-btfeat: a read-only-compat feature is one a READER may
+                // ignore and a WRITER may not. The mount-time gate in
+                // `validate_btrfs_superblock` deliberately lets these through so
+                // the filesystem is still readable; refusing here is what keeps
+                // that read-only promise honest instead of writing an image the
+                // kernel then rejects.
+                //
+                // BLOCK_GROUP_TREE is the concrete case: block-group items live
+                // in their own tree (objectid 11) that this workspace has as a
+                // pinned constant with no reader, so a write would put them in
+                // the extent tree where the kernel will not look for them.
+                if sb.compat_ro_features().unsupported_bits() != 0 {
+                    let unsupported = ffs_ondisk::BtrfsCompatRoFeatures(
+                        sb.compat_ro_features().unsupported_bits(),
+                    );
+                    return Err(FfsError::UnsupportedFeature(format!(
+                        "btrfs image uses read-only-compatible features this build cannot \
+                         maintain across a write: {unsupported}. The filesystem is readable; \
+                         mount it read-only."
+                    )));
+                }
+
                 // bd-jhuob: a tree log we cannot replay means acknowledged fsyncs
                 // whose data lives only in that log. Enabling writes would let a
                 // commit clear `log_root` (bd-mogn1) and discard them with no
@@ -16965,6 +16987,26 @@ const fn ext4_symlink_target_is_fast(target_len: usize) -> bool {
 /// Checks that `sectorsize` and `nodesize` are within the range accepted
 /// by the kernel and are consistent with each other.
 fn validate_btrfs_superblock(sb: &BtrfsSuperblock) -> Result<(), FfsError> {
+    // Feature gate FIRST, before any geometry claim is trusted: an incompat
+    // feature can change what the geometry fields even mean, and reporting
+    // "nodesize out of range" for a filesystem we simply do not implement sends
+    // the operator after the wrong problem.
+    //
+    // Nothing checked these flags before bd-btfeat. btrfs defines an incompat
+    // bit as one a reader MUST NOT mount without implementing, so the failure
+    // this prevents is not a refusal to open — it is opening successfully and
+    // returning wrong bytes.
+    if sb.incompat_features().unsupported_bits() != 0 {
+        let unsupported =
+            ffs_ondisk::BtrfsIncompatFeatures(sb.incompat_features().unsupported_bits());
+        return Err(FfsError::UnsupportedFeature(format!(
+            "btrfs image requires incompatible features this build does not implement: {unsupported} \
+             (filesystem has {}, FrankenFS implements {})",
+            sb.incompat_features(),
+            ffs_ondisk::BtrfsIncompatFeatures::IMPLEMENTED,
+        )));
+    }
+
     // sectorsize: power of 2, [512, 4096]
     if sb.sectorsize < 512 || sb.sectorsize > 4096 {
         return Err(FfsError::InvalidGeometry(format!(
@@ -19625,14 +19667,21 @@ const BTRFS_FEATURE_COMPAT_SUPP: u64 = 0;
 const BTRFS_FEATURE_COMPAT_SAFE_SET: u64 = 0;
 const BTRFS_FEATURE_COMPAT_SAFE_CLEAR: u64 = 0;
 
-const BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE: u64 = 1 << 0;
-const BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID: u64 = 1 << 1;
-const BTRFS_FEATURE_COMPAT_RO_VERITY: u64 = 1 << 2;
-const BTRFS_FEATURE_COMPAT_RO_BLOCK_GROUP_TREE: u64 = 1 << 3;
-const BTRFS_FEATURE_COMPAT_RO_SUPP: u64 = BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE
-    | BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID
-    | BTRFS_FEATURE_COMPAT_RO_VERITY
-    | BTRFS_FEATURE_COMPAT_RO_BLOCK_GROUP_TREE;
+// Aliases of the single definition in ffs-ondisk, so the ioctl surface and the
+// mount gate cannot drift apart (bd-btfeat).
+const BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE: u64 =
+    ffs_ondisk::BtrfsCompatRoFeatures::FREE_SPACE_TREE.0;
+const BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID: u64 =
+    ffs_ondisk::BtrfsCompatRoFeatures::FREE_SPACE_TREE_VALID.0;
+
+/// What `BTRFS_IOC_GET_SUPPORTED_FEATURES` reports for `compat_ro`.
+///
+/// This USED to be the kernel's own mask — VERITY and BLOCK_GROUP_TREE
+/// included — which told userspace FrankenFS maintains features it has no code
+/// for. It is now the same `IMPLEMENTED` mask the write gate enforces, because
+/// an ioctl that advertises a feature the mount then refuses is worse than
+/// either answer alone (bd-btfeat).
+const BTRFS_FEATURE_COMPAT_RO_SUPP: u64 = ffs_ondisk::BtrfsCompatRoFeatures::IMPLEMENTED.0;
 const BTRFS_FEATURE_COMPAT_RO_SAFE_SET: u64 = 0;
 const BTRFS_FEATURE_COMPAT_RO_SAFE_CLEAR: u64 = 0;
 
@@ -19735,35 +19784,16 @@ const fn btrfs_compat_ro_after_commit(existing: u64, fst_committed: bool) -> u64
     }
 }
 
-const BTRFS_FEATURE_INCOMPAT_MIXED_BACKREF: u64 = 1 << 0;
-const BTRFS_FEATURE_INCOMPAT_DEFAULT_SUBVOL: u64 = 1 << 1;
-const BTRFS_FEATURE_INCOMPAT_MIXED_GROUPS: u64 = 1 << 2;
-const BTRFS_FEATURE_INCOMPAT_COMPRESS_LZO: u64 = 1 << 3;
-const BTRFS_FEATURE_INCOMPAT_COMPRESS_ZSTD: u64 = 1 << 4;
-const BTRFS_FEATURE_INCOMPAT_BIG_METADATA: u64 = 1 << 5;
-const BTRFS_FEATURE_INCOMPAT_EXTENDED_IREF: u64 = 1 << 6;
-const BTRFS_FEATURE_INCOMPAT_RAID56: u64 = 1 << 7;
-const BTRFS_FEATURE_INCOMPAT_SKINNY_METADATA: u64 = 1 << 8;
-const BTRFS_FEATURE_INCOMPAT_NO_HOLES: u64 = 1 << 9;
-const BTRFS_FEATURE_INCOMPAT_METADATA_UUID: u64 = 1 << 10;
-const BTRFS_FEATURE_INCOMPAT_RAID1C34: u64 = 1 << 11;
-const BTRFS_FEATURE_INCOMPAT_ZONED: u64 = 1 << 12;
-const BTRFS_FEATURE_INCOMPAT_SIMPLE_QUOTA: u64 = 1 << 16;
-const BTRFS_FEATURE_INCOMPAT_SUPP: u64 = BTRFS_FEATURE_INCOMPAT_MIXED_BACKREF
-    | BTRFS_FEATURE_INCOMPAT_DEFAULT_SUBVOL
-    | BTRFS_FEATURE_INCOMPAT_MIXED_GROUPS
-    | BTRFS_FEATURE_INCOMPAT_COMPRESS_LZO
-    | BTRFS_FEATURE_INCOMPAT_COMPRESS_ZSTD
-    | BTRFS_FEATURE_INCOMPAT_BIG_METADATA
-    | BTRFS_FEATURE_INCOMPAT_EXTENDED_IREF
-    | BTRFS_FEATURE_INCOMPAT_RAID56
-    | BTRFS_FEATURE_INCOMPAT_SKINNY_METADATA
-    | BTRFS_FEATURE_INCOMPAT_NO_HOLES
-    | BTRFS_FEATURE_INCOMPAT_METADATA_UUID
-    | BTRFS_FEATURE_INCOMPAT_RAID1C34
-    | BTRFS_FEATURE_INCOMPAT_ZONED
-    | BTRFS_FEATURE_INCOMPAT_SIMPLE_QUOTA;
-const BTRFS_FEATURE_INCOMPAT_SAFE_SET: u64 = BTRFS_FEATURE_INCOMPAT_EXTENDED_IREF;
+/// What `BTRFS_IOC_GET_SUPPORTED_FEATURES` reports for `incompat`.
+///
+/// This USED to be a verbatim copy of the KERNEL's `BTRFS_FEATURE_INCOMPAT_SUPP`
+/// — so FrankenFS told userspace it supports ZONED, METADATA_UUID and
+/// SIMPLE_QUOTA, none of which it has any code for, while the mount path checked
+/// nothing at all. It is now the same `IMPLEMENTED` mask the mount gate
+/// enforces: one definition, in ffs-ondisk, where each bit carries the reason it
+/// is there (bd-btfeat).
+const BTRFS_FEATURE_INCOMPAT_SUPP: u64 = ffs_ondisk::BtrfsIncompatFeatures::IMPLEMENTED.0;
+const BTRFS_FEATURE_INCOMPAT_SAFE_SET: u64 = ffs_ondisk::BtrfsIncompatFeatures::EXTENDED_IREF.0;
 const BTRFS_FEATURE_INCOMPAT_SAFE_CLEAR: u64 = 0;
 
 fn encode_btrfs_feature_flags(
@@ -41657,7 +41687,8 @@ fn skipped_free_space_tree_rewrite_clears_the_feature_bits_bd_73bi2() {
 
     // Unrelated compat_ro bits must survive both paths untouched: this
     // function may clear only the two bits it owns.
-    let unrelated = BTRFS_FEATURE_COMPAT_RO_VERITY | BTRFS_FEATURE_COMPAT_RO_BLOCK_GROUP_TREE;
+    let unrelated = ffs_ondisk::BtrfsCompatRoFeatures::VERITY.0
+        | ffs_ondisk::BtrfsCompatRoFeatures::BLOCK_GROUP_TREE.0;
     assert_eq!(
         btrfs_compat_ro_after_commit(from_source | unrelated, false),
         unrelated,

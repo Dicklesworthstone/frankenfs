@@ -71,6 +71,65 @@ pub struct BtrfsSuperblock {
 }
 
 impl BtrfsSuperblock {
+    /// Typed view of `incompat_flags`.
+    #[must_use]
+    pub const fn incompat_features(&self) -> BtrfsIncompatFeatures {
+        BtrfsIncompatFeatures(self.incompat_flags)
+    }
+
+    /// Typed view of `compat_ro_flags`.
+    #[must_use]
+    pub const fn compat_ro_features(&self) -> BtrfsCompatRoFeatures {
+        BtrfsCompatRoFeatures(self.compat_ro_flags)
+    }
+
+    /// Mount-time feature gate: may FrankenFS read this filesystem at all?
+    ///
+    /// btrfs defines an incompat bit as one a reader **must not** mount without
+    /// implementing, because it changes how existing structures are encoded. So
+    /// the failure this prevents is not "cannot open" — it is opening
+    /// successfully and returning wrong bytes. Nothing checked these flags
+    /// before this bead, which meant a filesystem using a feature invented after
+    /// this reader was written would mount and be silently misread.
+    ///
+    /// Read-only-compat flags are deliberately NOT checked here; see
+    /// [`Self::validate_features_writable_v1`].
+    ///
+    /// # Errors
+    /// [`ParseError::InvalidField`] naming `incompat_flags` when any set bit is
+    /// outside [`BtrfsIncompatFeatures::IMPLEMENTED`].
+    pub fn validate_features_v1(&self) -> Result<(), ParseError> {
+        if self.incompat_features().unsupported_bits() != 0 {
+            return Err(ParseError::InvalidField {
+                field: "incompat_flags",
+                reason: "btrfs incompatible features this build does not implement",
+            });
+        }
+        Ok(())
+    }
+
+    /// Additional gate for a READ-WRITE mount.
+    ///
+    /// A read-only-compat feature may be safely ignored by a reader but not by a
+    /// writer: writing without maintaining it produces an image the kernel
+    /// rejects. Splitting the two gates is what lets a `-O block-group-tree`
+    /// filesystem still be mounted read-only, which is the entire purpose of the
+    /// compat_ro class.
+    ///
+    /// # Errors
+    /// [`ParseError::InvalidField`] naming `compat_ro_flags` when any set bit is
+    /// outside [`BtrfsCompatRoFeatures::IMPLEMENTED`].
+    pub fn validate_features_writable_v1(&self) -> Result<(), ParseError> {
+        if self.compat_ro_features().unsupported_bits() != 0 {
+            return Err(ParseError::InvalidField {
+                field: "compat_ro_flags",
+                reason: "btrfs read-only-compatible features this build cannot maintain \
+                         across a write; mount read-only instead",
+            });
+        }
+        Ok(())
+    }
+
     #[allow(clippy::too_many_lines)]
     pub fn parse_superblock_region(region: &[u8]) -> Result<Self, ParseError> {
         if region.len() < BTRFS_SUPER_INFO_SIZE {
@@ -533,6 +592,260 @@ fn btrfs_checksum_matches(
         reason: "unsupported btrfs checksum type",
     })?;
     Ok(computed[..csum_size] == stored_field[..csum_size])
+}
+
+// ── btrfs feature flags ─────────────────────────────────────────────────────
+
+/// btrfs incompatible feature flags (`super.incompat_flags`, offset `0xBC`).
+///
+/// Bit values pinned to `BTRFS_FEATURE_INCOMPAT_*` in `/usr/include/linux/btrfs.h`
+/// (kernel 6.17 uapi), read on this box; see
+/// `btrfs_incompat_bits_match_kernel_header`.
+///
+/// The name states the contract: a reader that does not implement an incompat
+/// feature **must not mount the filesystem at all**, because the feature changes
+/// how existing structures are encoded rather than adding ignorable ones. Reading
+/// such an image "successfully" means returning wrong data, not degraded data.
+/// Note bit 15 is genuinely unassigned — `SIMPLE_QUOTA` is bit 16.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BtrfsIncompatFeatures(pub u64);
+
+impl BtrfsIncompatFeatures {
+    pub const MIXED_BACKREF: Self = Self(1 << 0);
+    pub const DEFAULT_SUBVOL: Self = Self(1 << 1);
+    pub const MIXED_GROUPS: Self = Self(1 << 2);
+    pub const COMPRESS_LZO: Self = Self(1 << 3);
+    pub const COMPRESS_ZSTD: Self = Self(1 << 4);
+    pub const BIG_METADATA: Self = Self(1 << 5);
+    pub const EXTENDED_IREF: Self = Self(1 << 6);
+    pub const RAID56: Self = Self(1 << 7);
+    pub const SKINNY_METADATA: Self = Self(1 << 8);
+    pub const NO_HOLES: Self = Self(1 << 9);
+    pub const METADATA_UUID: Self = Self(1 << 10);
+    pub const RAID1C34: Self = Self(1 << 11);
+    pub const ZONED: Self = Self(1 << 12);
+    pub const EXTENT_TREE_V2: Self = Self(1 << 13);
+    pub const RAID_STRIPE_TREE: Self = Self(1 << 14);
+    pub const SIMPLE_QUOTA: Self = Self(1 << 16);
+
+    const KNOWN: &[(u64, &'static str)] = &[
+        (1 << 0, "MIXED_BACKREF"),
+        (1 << 1, "DEFAULT_SUBVOL"),
+        (1 << 2, "MIXED_GROUPS"),
+        (1 << 3, "COMPRESS_LZO"),
+        (1 << 4, "COMPRESS_ZSTD"),
+        (1 << 5, "BIG_METADATA"),
+        (1 << 6, "EXTENDED_IREF"),
+        (1 << 7, "RAID56"),
+        (1 << 8, "SKINNY_METADATA"),
+        (1 << 9, "NO_HOLES"),
+        (1 << 10, "METADATA_UUID"),
+        (1 << 11, "RAID1C34"),
+        (1 << 12, "ZONED"),
+        (1 << 13, "EXTENT_TREE_V2"),
+        (1 << 14, "RAID_STRIPE_TREE"),
+        (1 << 16, "SIMPLE_QUOTA"),
+    ];
+
+    /// The incompat features FrankenFS actually implements.
+    ///
+    /// This is **not** the kernel's `BTRFS_FEATURE_INCOMPAT_SUPP`. Each bit is
+    /// here because code in this workspace reads the structures it changes:
+    ///
+    /// * `MIXED_BACKREF`, `BIG_METADATA` — the modern on-disk shape every
+    ///   `mkfs.btrfs` produces; the whole reader assumes it.
+    /// * `DEFAULT_SUBVOL` — `BtrfsContext::subvol_objectid` resolves a non-FS_TREE
+    ///   default subvolume.
+    /// * `MIXED_GROUPS` — mixed `DATA|METADATA` block groups are allocated from
+    ///   correctly (`ffs-btrfs` bd-s0ogm coverage).
+    /// * `COMPRESS_LZO` / `COMPRESS_ZSTD` — both decompressors are on the read
+    ///   path in `ffs-core` beside zlib.
+    /// * `EXTENDED_IREF` — `INODE_EXTREF` (type 13) is parsed for parent lookup.
+    /// * `SKINNY_METADATA` — `METADATA_ITEM` (type 169) is parsed in the extent
+    ///   tree.
+    /// * `NO_HOLES` — implicit holes are handled, and so is the older explicit
+    ///   `disk_bytenr == 0` form.
+    /// * `RAID56`, `RAID1C34` — the chunk mapper resolves these profiles'
+    ///   stripes.
+    ///
+    /// DELIBERATELY ABSENT, because nothing in this workspace reads them — each
+    /// was previously advertised as supported by
+    /// `BTRFS_IOC_GET_SUPPORTED_FEATURES`, which is what this bead corrects:
+    ///
+    /// * `ZONED` — no zoned code at all; the superblock's zone size is not even
+    ///   parsed.
+    /// * `METADATA_UUID` — tree blocks carry `metadata_uuid` rather than `fsid`
+    ///   under this feature, and every fsid comparison here uses `fsid`, so the
+    ///   filesystem would fail block-by-block instead of once at mount.
+    /// * `SIMPLE_QUOTA` — the qgroup ioctl surface exists, the squota on-disk
+    ///   accounting does not.
+    /// * `EXTENT_TREE_V2`, `RAID_STRIPE_TREE` — no reader, and both were missing
+    ///   from this workspace's constant list entirely before this bead.
+    pub const IMPLEMENTED: Self = Self(
+        Self::MIXED_BACKREF.0
+            | Self::DEFAULT_SUBVOL.0
+            | Self::MIXED_GROUPS.0
+            | Self::COMPRESS_LZO.0
+            | Self::COMPRESS_ZSTD.0
+            | Self::BIG_METADATA.0
+            | Self::EXTENDED_IREF.0
+            | Self::RAID56.0
+            | Self::SKINNY_METADATA.0
+            | Self::NO_HOLES.0
+            | Self::RAID1C34.0,
+    );
+
+    #[must_use]
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn contains(self, flag: Self) -> bool {
+        (self.0 & flag.0) != 0
+    }
+
+    /// Names of all set flags; unknown bits are not included (see
+    /// [`Self::unknown_bits`]).
+    #[must_use]
+    pub fn describe(self) -> Vec<&'static str> {
+        btrfs_describe_flags(self.0, Self::KNOWN)
+    }
+
+    /// Bits set here that no named constant covers — features invented after
+    /// this table was written.
+    #[must_use]
+    pub fn unknown_bits(self) -> u64 {
+        let known: u64 = Self::KNOWN.iter().map(|(bit, _)| bit).fold(0, |a, b| a | b);
+        self.0 & !known
+    }
+
+    /// Bits that would make this filesystem unreadable to FrankenFS: everything
+    /// set that [`Self::IMPLEMENTED`] does not cover, named or not.
+    #[must_use]
+    pub const fn unsupported_bits(self) -> u64 {
+        self.0 & !Self::IMPLEMENTED.0
+    }
+}
+
+impl std::fmt::Display for BtrfsIncompatFeatures {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        btrfs_format_flags(f, self.0, Self::KNOWN)
+    }
+}
+
+/// btrfs read-only-compatible feature flags (`super.compat_ro_flags`, `0xB4`).
+///
+/// Bit values pinned to `BTRFS_FEATURE_COMPAT_RO_*` in
+/// `/usr/include/linux/btrfs.h`; see `btrfs_compat_ro_bits_match_kernel_header`.
+///
+/// The contract is weaker than incompat and the difference is the whole point of
+/// the class: a reader that does not implement one of these may still mount the
+/// filesystem **read-only**, because the feature only affects structures that
+/// writers must maintain. Mounting such an image read-write means writing an
+/// image the kernel will reject.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BtrfsCompatRoFeatures(pub u64);
+
+impl BtrfsCompatRoFeatures {
+    pub const FREE_SPACE_TREE: Self = Self(1 << 0);
+    pub const FREE_SPACE_TREE_VALID: Self = Self(1 << 1);
+    pub const VERITY: Self = Self(1 << 2);
+    pub const BLOCK_GROUP_TREE: Self = Self(1 << 3);
+
+    const KNOWN: &[(u64, &'static str)] = &[
+        (1 << 0, "FREE_SPACE_TREE"),
+        (1 << 1, "FREE_SPACE_TREE_VALID"),
+        (1 << 2, "VERITY"),
+        (1 << 3, "BLOCK_GROUP_TREE"),
+    ];
+
+    /// The read-only-compat features FrankenFS can maintain across a WRITE.
+    ///
+    /// The free-space tree is built and its `_VALID` bit is managed on commit.
+    ///
+    /// `VERITY` and `BLOCK_GROUP_TREE` are absent. `BLOCK_GROUP_TREE` is the
+    /// consequential one: it moves `BLOCK_GROUP_ITEM`s out of the extent tree
+    /// into their own tree (objectid 11), and this workspace has the objectid
+    /// as a pinned constant with NO reader — so a `-O block-group-tree`
+    /// filesystem would find no block groups in the extent tree and, mounted
+    /// read-write, would write its block-group items into the wrong tree.
+    /// Read-only is still correct and is still allowed, which is exactly what
+    /// the compat_ro class is for.
+    pub const IMPLEMENTED: Self =
+        Self(Self::FREE_SPACE_TREE.0 | Self::FREE_SPACE_TREE_VALID.0);
+
+    #[must_use]
+    pub const fn bits(self) -> u64 {
+        self.0
+    }
+
+    #[must_use]
+    pub const fn contains(self, flag: Self) -> bool {
+        (self.0 & flag.0) != 0
+    }
+
+    #[must_use]
+    pub fn describe(self) -> Vec<&'static str> {
+        btrfs_describe_flags(self.0, Self::KNOWN)
+    }
+
+    #[must_use]
+    pub fn unknown_bits(self) -> u64 {
+        let known: u64 = Self::KNOWN.iter().map(|(bit, _)| bit).fold(0, |a, b| a | b);
+        self.0 & !known
+    }
+
+    /// Bits that block a READ-WRITE mount. A read-only mount ignores these.
+    #[must_use]
+    pub const fn unsupported_bits(self) -> u64 {
+        self.0 & !Self::IMPLEMENTED.0
+    }
+}
+
+impl std::fmt::Display for BtrfsCompatRoFeatures {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        btrfs_format_flags(f, self.0, Self::KNOWN)
+    }
+}
+
+fn btrfs_describe_flags(bits: u64, known: &[(u64, &'static str)]) -> Vec<&'static str> {
+    known
+        .iter()
+        .filter(|(bit, _)| bits & bit != 0)
+        .map(|(_, name)| *name)
+        .collect()
+}
+
+/// Pipe-separated flag names, with any unnamed bits appended as hex, so a
+/// diagnostic about a feature invented after this table still identifies it.
+fn btrfs_format_flags(
+    f: &mut std::fmt::Formatter<'_>,
+    bits: u64,
+    known: &[(u64, &'static str)],
+) -> std::fmt::Result {
+    if bits == 0 {
+        return write!(f, "(none)");
+    }
+    let mut first = true;
+    for (bit, name) in known {
+        if bits & bit != 0 {
+            if !first {
+                write!(f, "|")?;
+            }
+            write!(f, "{name}")?;
+            first = false;
+        }
+    }
+    let known_mask: u64 = known.iter().map(|(bit, _)| bit).fold(0, |a, b| a | b);
+    let unknown = bits & !known_mask;
+    if unknown != 0 {
+        if !first {
+            write!(f, "|")?;
+        }
+        write!(f, "{unknown:#x}")?;
+    }
+    Ok(())
 }
 
 // ── sys_chunk_array entry types ──────────────────────────────────────────────
@@ -3643,12 +3956,249 @@ mod tests {
         );
     }
 
-    /// The superblock parser refuses the algorithms FrankenFS does not implement
-    /// — and, since csum-type parity landed, ACCEPTS the one it does.
+    /// Every btrfs feature bit is pinned to the kernel uapi header.
+    #[test]
+    fn btrfs_incompat_bits_match_kernel_header_bd_btfeat() {
+        // Pinned to /usr/include/linux/btrfs.h (kernel 6.17 uapi), read on this
+        // box. A wrong bit here does not fail loudly — it silently gates the
+        // wrong feature, so the mount either refuses a filesystem it can read or
+        // accepts one it cannot.
+        //   #define BTRFS_FEATURE_INCOMPAT_MIXED_BACKREF     (1ULL << 0)
+        //   #define BTRFS_FEATURE_INCOMPAT_DEFAULT_SUBVOL    (1ULL << 1)
+        //   #define BTRFS_FEATURE_INCOMPAT_MIXED_GROUPS      (1ULL << 2)
+        //   #define BTRFS_FEATURE_INCOMPAT_COMPRESS_LZO      (1ULL << 3)
+        //   #define BTRFS_FEATURE_INCOMPAT_COMPRESS_ZSTD     (1ULL << 4)
+        //   #define BTRFS_FEATURE_INCOMPAT_BIG_METADATA      (1ULL << 5)
+        //   #define BTRFS_FEATURE_INCOMPAT_EXTENDED_IREF     (1ULL << 6)
+        //   #define BTRFS_FEATURE_INCOMPAT_RAID56            (1ULL << 7)
+        //   #define BTRFS_FEATURE_INCOMPAT_SKINNY_METADATA   (1ULL << 8)
+        //   #define BTRFS_FEATURE_INCOMPAT_NO_HOLES          (1ULL << 9)
+        //   #define BTRFS_FEATURE_INCOMPAT_METADATA_UUID     (1ULL << 10)
+        //   #define BTRFS_FEATURE_INCOMPAT_RAID1C34          (1ULL << 11)
+        //   #define BTRFS_FEATURE_INCOMPAT_ZONED             (1ULL << 12)
+        //   #define BTRFS_FEATURE_INCOMPAT_EXTENT_TREE_V2    (1ULL << 13)
+        //   #define BTRFS_FEATURE_INCOMPAT_RAID_STRIPE_TREE  (1ULL << 14)
+        //   #define BTRFS_FEATURE_INCOMPAT_SIMPLE_QUOTA      (1ULL << 16)
+        use BtrfsIncompatFeatures as I;
+        assert_eq!(I::MIXED_BACKREF.0, 1 << 0);
+        assert_eq!(I::DEFAULT_SUBVOL.0, 1 << 1);
+        assert_eq!(I::MIXED_GROUPS.0, 1 << 2);
+        assert_eq!(I::COMPRESS_LZO.0, 1 << 3);
+        assert_eq!(I::COMPRESS_ZSTD.0, 1 << 4);
+        assert_eq!(I::BIG_METADATA.0, 1 << 5);
+        assert_eq!(I::EXTENDED_IREF.0, 1 << 6);
+        assert_eq!(I::RAID56.0, 1 << 7);
+        assert_eq!(I::SKINNY_METADATA.0, 1 << 8);
+        assert_eq!(I::NO_HOLES.0, 1 << 9);
+        assert_eq!(I::METADATA_UUID.0, 1 << 10);
+        assert_eq!(I::RAID1C34.0, 1 << 11);
+        assert_eq!(I::ZONED.0, 1 << 12);
+        assert_eq!(I::EXTENT_TREE_V2.0, 1 << 13);
+        assert_eq!(I::RAID_STRIPE_TREE.0, 1 << 14);
+        assert_eq!(I::SIMPLE_QUOTA.0, 1 << 16);
+
+        // Bit 15 is genuinely unassigned upstream — SIMPLE_QUOTA is 16, not 15.
+        // Stated as a test because "off by one" is the single most likely way
+        // this table goes wrong, and it would go wrong silently.
+        assert_eq!(
+            I(1 << 15).unknown_bits(),
+            1 << 15,
+            "bit 15 must remain unnamed; SIMPLE_QUOTA is bit 16"
+        );
+
+        use BtrfsCompatRoFeatures as R;
+        //   #define BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE        (1ULL << 0)
+        //   #define BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID  (1ULL << 1)
+        //   #define BTRFS_FEATURE_COMPAT_RO_VERITY                 (1ULL << 2)
+        //   #define BTRFS_FEATURE_COMPAT_RO_BLOCK_GROUP_TREE       (1ULL << 3)
+        assert_eq!(R::FREE_SPACE_TREE.0, 1 << 0);
+        assert_eq!(R::FREE_SPACE_TREE_VALID.0, 1 << 1);
+        assert_eq!(R::VERITY.0, 1 << 2);
+        assert_eq!(R::BLOCK_GROUP_TREE.0, 1 << 3);
+    }
+
+    /// The IMPLEMENTED masks must be SUBSETS of what the kernel defines.
+    ///
+    /// A bit in `IMPLEMENTED` that no named constant covers would mean claiming
+    /// a feature that does not exist — and, worse, would make `unsupported_bits`
+    /// silently pass it through the mount gate.
+    #[test]
+    fn implemented_masks_are_subsets_of_known_bits_bd_btfeat() {
+        assert_eq!(
+            BtrfsIncompatFeatures::IMPLEMENTED.unknown_bits(),
+            0,
+            "IMPLEMENTED must not claim a bit the kernel does not define"
+        );
+        assert_eq!(
+            BtrfsCompatRoFeatures::IMPLEMENTED.unknown_bits(),
+            0,
+            "IMPLEMENTED must not claim a bit the kernel does not define"
+        );
+        // And the features we deliberately do NOT implement must be excluded —
+        // each of these was advertised as supported before this bead.
+        for absent in [
+            BtrfsIncompatFeatures::ZONED,
+            BtrfsIncompatFeatures::METADATA_UUID,
+            BtrfsIncompatFeatures::SIMPLE_QUOTA,
+            BtrfsIncompatFeatures::EXTENT_TREE_V2,
+            BtrfsIncompatFeatures::RAID_STRIPE_TREE,
+        ] {
+            assert!(
+                !BtrfsIncompatFeatures::IMPLEMENTED.contains(absent),
+                "{absent} has no reader in this workspace and must not be claimed"
+            );
+        }
+        for absent in [
+            BtrfsCompatRoFeatures::VERITY,
+            BtrfsCompatRoFeatures::BLOCK_GROUP_TREE,
+        ] {
+            assert!(
+                !BtrfsCompatRoFeatures::IMPLEMENTED.contains(absent),
+                "{absent} cannot be maintained across a write and must not be claimed"
+            );
+        }
+    }
+
+    /// PLANTED NEGATIVE: a gate written as "reject only bits I have NAMED"
+    /// accepts this. It must be REJECTED.
+    ///
+    /// This is the single most likely way to write this check wrong, because it
+    /// reads as thorough: enumerate the features, reject the ones you know you
+    /// lack. But an incompat bit invented AFTER this table was written is
+    /// exactly the case the btrfs incompat contract exists for — an unknown bit
+    /// is the strongest possible reason to refuse, not a reason to shrug.
+    ///
+    /// `unsupported_bits` is therefore `& !IMPLEMENTED`, never `& KNOWN_BAD`.
+    #[test]
+    fn an_unknown_future_incompat_bit_is_refused_bd_btfeat() {
+        let mut sb = supported_feature_superblock();
+        // Bit 40: not defined by any kernel this table knows about.
+        sb[0xBC..0xC4].copy_from_slice(&(1_u64 << 40).to_le_bytes());
+        let parsed = BtrfsSuperblock::parse_superblock_region(&sb).expect("sb parses");
+
+        assert_eq!(parsed.incompat_features().unknown_bits(), 1 << 40);
+        assert_eq!(
+            parsed.incompat_features().unsupported_bits(),
+            1 << 40,
+            "an unnamed bit must count as UNSUPPORTED, not merely unknown"
+        );
+        let err = parsed
+            .validate_features_v1()
+            .expect_err("a future incompat feature must refuse the mount");
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "incompat_flags",
+                    ..
+                }
+            ),
+            "expected an incompat_flags refusal, got {err:?}"
+        );
+    }
+
+    /// PLANTED NEGATIVE: a gate that treats compat_ro like incompat REFUSES this
+    /// filesystem outright. It must MOUNT — read-only.
+    ///
+    /// The inverse error to the one above, and just as wrong: `BLOCK_GROUP_TREE`
+    /// is read-only-compatible precisely so a reader that ignores it can still
+    /// read the filesystem. Refusing it at mount would deny access to data we
+    /// can read perfectly well. The refusal belongs on the WRITE path only.
+    #[test]
+    fn an_unsupported_compat_ro_feature_still_reads_bd_btfeat() {
+        let mut sb = supported_feature_superblock();
+        sb[0xB4..0xBC]
+            .copy_from_slice(&BtrfsCompatRoFeatures::BLOCK_GROUP_TREE.0.to_le_bytes());
+        let parsed = BtrfsSuperblock::parse_superblock_region(&sb).expect("sb parses");
+
+        parsed
+            .validate_features_v1()
+            .expect("a read-only-compat feature must NOT block a read mount");
+        let err = parsed
+            .validate_features_writable_v1()
+            .expect_err("...but it must block a WRITE mount");
+        assert!(
+            matches!(
+                err,
+                ParseError::InvalidField {
+                    field: "compat_ro_flags",
+                    ..
+                }
+            ),
+            "expected a compat_ro_flags refusal, got {err:?}"
+        );
+    }
+
+    /// A filesystem using only implemented features passes both gates — the
+    /// arm that stops this bead from being "refuse everything".
+    #[test]
+    fn an_ordinary_mkfs_filesystem_passes_both_gates_bd_btfeat() {
+        let mut sb = supported_feature_superblock();
+        // What a default `mkfs.btrfs` actually sets today.
+        let typical = BtrfsIncompatFeatures::MIXED_BACKREF.0
+            | BtrfsIncompatFeatures::DEFAULT_SUBVOL.0
+            | BtrfsIncompatFeatures::BIG_METADATA.0
+            | BtrfsIncompatFeatures::EXTENDED_IREF.0
+            | BtrfsIncompatFeatures::SKINNY_METADATA.0
+            | BtrfsIncompatFeatures::NO_HOLES.0;
+        sb[0xBC..0xC4].copy_from_slice(&typical.to_le_bytes());
+        sb[0xB4..0xBC].copy_from_slice(
+            &(BtrfsCompatRoFeatures::FREE_SPACE_TREE.0
+                | BtrfsCompatRoFeatures::FREE_SPACE_TREE_VALID.0)
+                .to_le_bytes(),
+        );
+        let parsed = BtrfsSuperblock::parse_superblock_region(&sb).expect("sb parses");
+
+        parsed.validate_features_v1().expect("read gate");
+        parsed
+            .validate_features_writable_v1()
+            .expect("write gate: free-space tree is maintained across commit");
+        assert_eq!(parsed.incompat_features().unknown_bits(), 0);
+    }
+
+    /// A diagnostic must NAME the feature, including one it has no name for.
+    ///
+    /// "unsupported feature 0x10000000000" sends an operator to a hex table;
+    /// "ZONED" sends them to the right answer. And an unnamed bit still has to
+    /// appear, or the message silently omits the reason for the refusal.
+    #[test]
+    fn feature_display_names_known_bits_and_shows_unknown_ones_bd_btfeat() {
+        assert_eq!(BtrfsIncompatFeatures(0).to_string(), "(none)");
+        assert_eq!(
+            BtrfsIncompatFeatures(
+                BtrfsIncompatFeatures::ZONED.0 | BtrfsIncompatFeatures::NO_HOLES.0
+            )
+            .to_string(),
+            "NO_HOLES|ZONED"
+        );
+        assert_eq!(
+            BtrfsIncompatFeatures(BtrfsIncompatFeatures::NO_HOLES.0 | (1 << 40)).to_string(),
+            "NO_HOLES|0x10000000000",
+            "an unnamed bit must still be reported, in hex"
+        );
+        assert_eq!(
+            BtrfsCompatRoFeatures(BtrfsCompatRoFeatures::BLOCK_GROUP_TREE.0).to_string(),
+            "BLOCK_GROUP_TREE"
+        );
+    }
+
+    /// A minimal superblock that parses, with both feature fields zeroed so a
+    /// test can set exactly the bits it is about.
+    fn supported_feature_superblock() -> [u8; BTRFS_SUPER_INFO_SIZE] {
+        let mut sb = [0_u8; BTRFS_SUPER_INFO_SIZE];
+        sb[0x40..0x48].copy_from_slice(&BTRFS_MAGIC.to_le_bytes());
+        set_valid_superblock_device_accounting(&mut sb);
+        sb[0x90..0x94].copy_from_slice(&4096_u32.to_le_bytes());
+        sb[0x94..0x98].copy_from_slice(&16384_u32.to_le_bytes());
+        sb
+    }
+
+    /// The superblock parser refuses the checksum algorithms FrankenFS does not
+    /// implement — and, since csum-type parity landed, ACCEPTS the one it does.
     ///
     /// This test used `csum_type = 1` (XXHASH64) as its example of "unsupported",
-    /// which was true when it was written and is exactly the limitation this bead
-    /// removes. Pointing it at SHA256/BLAKE2b keeps the refusal covered, and the
+    /// which was true when it was written and is exactly the limitation bd-btcsum
+    /// removed. Pointing it at SHA256/BLAKE2b keeps the refusal covered, and the
     /// acceptance arm below is what stops the gate quietly narrowing again.
     #[test]
     fn superblock_rejects_unsupported_csum_type() {

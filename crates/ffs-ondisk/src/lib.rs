@@ -12,11 +12,12 @@ pub mod crc_incremental;
 pub mod ext4;
 
 pub use btrfs::{
-    BTRFS_CSUM_FIELD_SIZE, BtrfsChunkEntry, BtrfsDevItem, BtrfsHeader, BtrfsItem, BtrfsKey,
-    BtrfsKeyPtr, BtrfsPhysicalMapping, BtrfsRaidProfile, BtrfsStripe, BtrfsStripeMapping,
-    BtrfsSuperblock, btrfs_csum, btrfs_csum_size, chunk_type_flags, map_logical_to_physical,
-    map_logical_to_stripes, parse_dev_item, parse_internal_items, parse_leaf_items,
-    parse_sys_chunk_array, verify_superblock_checksum as verify_btrfs_superblock_checksum,
+    BTRFS_CSUM_FIELD_SIZE, BtrfsChunkEntry, BtrfsCompatRoFeatures, BtrfsDevItem, BtrfsHeader,
+    BtrfsIncompatFeatures, BtrfsItem, BtrfsKey, BtrfsKeyPtr, BtrfsPhysicalMapping,
+    BtrfsRaidProfile, BtrfsStripe, BtrfsStripeMapping, BtrfsSuperblock, btrfs_csum,
+    btrfs_csum_size, chunk_type_flags, map_logical_to_physical, map_logical_to_stripes,
+    parse_dev_item, parse_internal_items, parse_leaf_items, parse_sys_chunk_array,
+    verify_superblock_checksum as verify_btrfs_superblock_checksum,
     verify_tree_block_checksum as verify_btrfs_tree_block_checksum,
 };
 pub use ext4::{
