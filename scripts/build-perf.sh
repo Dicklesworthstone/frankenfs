@@ -47,8 +47,31 @@ BIN="ffs-cli"
 #
 # Building locally is correct and expected for this script — the mounted-kernel
 # comparator mounts a real FUSE filesystem and compares against the live kernel,
-# and rch cannot retrieve a compiled binary anyway. The defect was never
-# "builds locally"; it was "builds into a directory it does not own".
+# The defect was never "builds locally"; it was "builds into a directory it does
+# not own".
+#
+# ⛔ CORRECTION 2026-08-30 (bd-m1bpu): this comment used to assert "and rch cannot
+# retrieve a compiled binary anyway". THAT IS FALSE, and believing it is expensive
+# — it is the reason a v3+PGO ELF was treated as local-build-only, which in turn
+# left every comparator-gated bead parked (ffs-mounted-kernel-bench fails closed
+# on the ISA and PGO gates, so no baseline-ISA binary can run it).
+#
+# rch CAN return a binary. `rch exec --job --result-dir <repo-relative-dir>` syncs
+# a declared directory back from the worker after the job, including on nonzero
+# exit. Demonstrated the same day: a 60 MB release-perf ffs-cli built on worker
+# hz2 and retrieved intact (it ran locally and self-reported its own sha256), with
+# no force_local and no local cargo invocation:
+#
+#   rch exec --job --result-dir artifacts/elf -- sh -c '
+#       cargo build --profile release-perf -p ffs-cli -j2 &&
+#       cp "$(find . -type f -name ffs-cli -path "*release-perf*" | head -1)" \
+#          artifacts/elf/'
+#
+# `artifacts/` is gitignored, so a large binary parked there cannot be committed
+# by accident. What rch excludes is the WORKER TARGET DIR (`.rch-target-*/` in
+# [transfer] exclude_patterns), which is why a plain `rch exec -- cargo build`
+# appears to retrieve nothing — the artifact exists, it is just not in a synced
+# path. Declaring one with --result-dir is the whole fix.
 #
 # So: honour an inherited CARGO_TARGET_DIR only when it is NOT the shared path.
 # Anything at or beneath the shared root is refused and replaced with the
