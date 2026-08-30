@@ -8217,6 +8217,27 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
     };
     emit_mount_banner(&open_fs, mountpoint, options.read_write, runtime.mode);
     emit_optional_recovery_banner(&open_fs);
+
+    // bd-4zjkz: attach the image's own internal journal BEFORE the durability
+    // gate, so a journalled ext4 image mounts read-write through JBD2 instead of
+    // being refused. Attaching is what makes `ext4_flush_boundary_via_jbd2` take
+    // over the boundary: journal -> sync -> checkpoint home -> sync -> reclaim.
+    // Must run after mount-time replay (performed during open) — that is
+    // `open_segmented`'s stated precondition.
+    if options.read_write {
+        let cx = cli_cx();
+        let attached = open_fs
+            .attach_ext4_internal_jbd2_writer(&cx)
+            .context("failed to attach the ext4 internal JBD2 writer")?;
+        info!(
+            target: "ffs::cli::mount",
+            operation_id,
+            scenario_id,
+            outcome = "jbd2_writer_attach",
+            jbd2_attached = attached,
+            "mount_jbd2_writer_attach"
+        );
+    }
     require_jbd2_durability_for_mount(&open_fs, options.read_write)?;
 
     if options.read_write {
@@ -8375,25 +8396,33 @@ fn build_mount_open_options(options: &MountCmdOptions) -> OpenOptions {
     }
 }
 
-/// Refuse a writable ext4 mount that advertises JBD2 until its complete
-/// durability boundary routes through JBD2.
+/// Refuse a writable ext4 mount that advertises JBD2 unless its durability
+/// boundary actually routes through JBD2.
 ///
-/// `OpenFs` has a `Jbd2Writer` attachment point, but attaching it alone is not
-/// a durability implementation: the production `fsync` path currently flushes
-/// MVCC versions directly to their home blocks and never calls
-/// `commit_transaction_journaled`. In particular, an attached writer is not a
-/// signal that the mounted checkpoint's inode, allocation, group-descriptor,
-/// and superblock writes are represented in one ordered JBD2 transaction.
-/// Allowing this mount to proceed would make a journalled ext4 image look
-/// durable while silently skipping descriptor and commit blocks. A no-journal
-/// ext4 image remains a valid writable mount.
+/// HISTORY, because the condition here has been deliberately loosened once and
+/// must not be loosened again by accident. This used to refuse EVERY writable
+/// journalled ext4 mount, because attaching a `Jbd2Writer` was not by itself a
+/// durability implementation: the fsync path flushed MVCC versions straight to
+/// their home blocks and never journalled anything, so an attached writer proved
+/// nothing about the checkpoint. That is no longer true — `OpenFs`'s ext4
+/// boundary now routes through `ext4_flush_boundary_via_jbd2` whenever a writer
+/// is attached (journal, sync, checkpoint home, sync, reclaim), which is what
+/// makes an attached writer meaningful evidence rather than decoration.
+///
+/// So the gate is now exactly: a journalled image mounted read-write must HAVE
+/// an attached writer. It stays fail-closed for the cases where attachment did
+/// not happen — a journal we cannot map, or an image whose journal inode maps no
+/// blocks — because mounting those read-write would write a journalled
+/// filesystem while silently skipping the descriptor and commit blocks, which is
+/// the original defect (bd-4zjkz). A no-journal ext4 image remains a valid
+/// writable mount and needs no writer.
 fn require_jbd2_durability_for_mount(open_fs: &OpenFs, read_write: bool) -> Result<()> {
     let journalled_ext4 = open_fs.ext4_superblock().is_some_and(|superblock| {
         superblock.has_compat(ffs_ondisk::Ext4CompatFeatures::HAS_JOURNAL)
     });
-    if read_write && journalled_ext4 {
+    if read_write && journalled_ext4 && !open_fs.has_jbd2_writer() {
         bail!(
-            "refusing writable journalled ext4 mount: the mounted fsync path does not route its complete durability checkpoint through JBD2"
+            "refusing writable journalled ext4 mount: no JBD2 writer is attached, so the durability checkpoint would skip the journal's descriptor and commit blocks"
         );
     }
     Ok(())
@@ -13703,8 +13732,18 @@ mod tests {
         );
     }
 
+    /// bd-4zjkz: the gate now turns on whether a JBD2 writer is ATTACHED, since
+    /// the ext4 boundary routes through one when it is. Both directions are
+    /// asserted, because a gate that only ever says "no" and a gate that only
+    /// ever says "yes" are equally useless.
+    ///
+    /// The refusal arm is the one that matters: an image advertising a journal,
+    /// mounted read-write, with no writer attached, must still be REFUSED. That
+    /// is the original defect — writing a journalled filesystem while skipping
+    /// the descriptor and commit blocks, so a crash leaves torn metadata with
+    /// nothing to replay.
     #[test]
-    fn journalled_ext4_rw_mount_refuses_the_unwired_jbd2_path() {
+    fn journalled_ext4_rw_mount_requires_an_attached_jbd2_writer_bd_4zjkz() {
         let image = build_test_ext4_image_with_internal_journal_feature();
         with_temp_image_path(&image, |path| {
             let cx = Cx::for_testing();
@@ -13721,18 +13760,19 @@ mod tests {
             assert!(fs.is_ext4());
             assert!(!fs.has_jbd2_writer());
             let error = require_jbd2_durability_for_mount(&fs, true)
-                .expect_err("rw journalled ext4 must not bypass the unwired JBD2 durability path");
+                .expect_err("rw journalled ext4 with no attached writer must be refused");
             assert!(
-                error
-                    .to_string()
-                    .contains("complete durability checkpoint through JBD2"),
+                error.to_string().contains("no JBD2 writer is attached"),
                 "unexpected rejection: {error:#}"
             );
 
-            // A naive implementation would treat an attached writer as proof that
-            // FUSE fsync journals its entire checkpoint. The mounted path still
-            // bypasses `commit_transaction_journaled`, so that must remain
-            // fail-closed until the full routing is implemented.
+            // Read-only never writes, so it needs no journal either way.
+            require_jbd2_durability_for_mount(&fs, false)
+                .expect("read-only journalled ext4 never writes and remains valid");
+
+            // With a writer attached the boundary journals, so the mount is
+            // permitted. This is the half that was impossible before the routing
+            // existed, and it is why the refusal above is now conditional.
             fs.attach_jbd2_writer(ffs_journal::Jbd2Writer::new(
                 ffs_journal::JournalRegion {
                     start: ffs_types::BlockNumber(20),
@@ -13741,16 +13781,8 @@ mod tests {
                 1,
             ));
             assert!(fs.has_jbd2_writer());
-            let attached_error = require_jbd2_durability_for_mount(&fs, true)
-                .expect_err("an attached writer alone must not permit an unwired fsync path");
-            assert!(
-                attached_error
-                    .to_string()
-                    .contains("complete durability checkpoint through JBD2"),
-                "unexpected attached-writer rejection: {attached_error:#}"
-            );
-            require_jbd2_durability_for_mount(&fs, false)
-                .expect("read-only journalled ext4 never writes and remains valid");
+            require_jbd2_durability_for_mount(&fs, true)
+                .expect("an attached writer routes the boundary through JBD2, so rw is allowed");
         });
     }
 
