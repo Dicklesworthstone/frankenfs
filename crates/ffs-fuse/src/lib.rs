@@ -635,8 +635,12 @@ fn count_memoized_requests_from_value(value: Option<&str>) -> bool {
 
 /// Default TTL for cached attributes and entries.
 ///
-/// Read-only images are immutable, so a generous TTL is safe.
-const ATTR_TTL: Duration = Duration::from_secs(60);
+/// Read-only images are immutable, while every mutable metadata path sends the
+/// matching reverse invalidation after it commits.  The cache is consequently
+/// bounded by our invalidations rather than an arbitrary one-minute expiry.
+/// Five minutes keeps repeated directory/stat walks in the kernel cache without
+/// extending the stale-data window after a mutation.
+const ATTR_TTL: Duration = Duration::from_secs(5 * 60);
 /// Keep an unsuccessful lookup briefly so repeated misses do not cross FUSE.
 ///
 /// A positive entry is valid for [`ATTR_TTL`]; a negative entry needs a much
@@ -9905,7 +9909,7 @@ mod tests {
         assert_eq!(
             read_u64(ENTRY_VALID_OFFSET),
             NEGATIVE_ENTRY_TTL.as_secs(),
-            "the negative dentry must be cached briefly, not for the 60s positive TTL"
+            "the negative dentry must be cached briefly, not for the positive TTL"
         );
         assert_eq!(
             read_u64(ATTR_VALID_OFFSET),
@@ -9966,6 +9970,11 @@ mod tests {
 
     #[test]
     fn lookup_of_stable_metadata_advertises_entry_and_attr_ttls_bd_yu6jz() {
+        assert_eq!(
+            ATTR_TTL,
+            Duration::from_secs(5 * 60),
+            "the positive-cache lifetime is coupled to reverse invalidation, not a one-minute expiry"
+        );
         let sender = RecordingSender::default();
         FrankenFuse::with_options(
             Box::new(CapabilityMutationFs::default()),
