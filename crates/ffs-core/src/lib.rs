@@ -1600,6 +1600,12 @@ pub struct OpenFs {
     /// Read-only remounts overlay these items onto the FS tree so the fsynced
     /// inode is visible without requiring a full transaction commit.
     btrfs_tree_log_items: Vec<BtrfsLeafEntry>,
+    /// Whether the mount must still overlay [`Self::btrfs_tree_log_items`].
+    ///
+    /// A successful full transaction commit folds the replayed items into the
+    /// writable tree and retires `log_root`; applying the retained vector after
+    /// that point would mask newer mutations with stale values (bd-jhuob).
+    btrfs_tree_log_overlay_active: AtomicBool,
     /// True when `log_root` held a tree log this implementation cannot replay —
     /// the kernel's log ROOT TREE shape rather than our single leaf (bd-jhuob).
     ///
@@ -5805,6 +5811,7 @@ impl OpenFs {
             flavor,
             ext4_geometry,
             btrfs_context,
+            btrfs_tree_log_overlay_active: AtomicBool::new(!btrfs_tree_log_items.is_empty()),
             btrfs_tree_log_items,
             btrfs_foreign_tree_log,
             ext4_journal_replay: None,
@@ -10610,7 +10617,9 @@ impl OpenFs {
         let Some(ctx) = self.btrfs_context() else {
             return;
         };
-        if subvol_id != ctx.subvol_objectid || self.btrfs_tree_log_items.is_empty() {
+        if subvol_id != ctx.subvol_objectid
+            || !self.btrfs_tree_log_overlay_active.load(Ordering::Acquire)
+        {
             return;
         }
 
@@ -10641,7 +10650,9 @@ impl OpenFs {
         let Some(ctx) = self.btrfs_context() else {
             return;
         };
-        if subvol_id != ctx.subvol_objectid || self.btrfs_tree_log_items.is_empty() {
+        if subvol_id != ctx.subvol_objectid
+            || !self.btrfs_tree_log_overlay_active.load(Ordering::Acquire)
+        {
             return;
         }
 
@@ -11018,7 +11029,7 @@ impl OpenFs {
         // objectid+type (the inode item is the only INODE_ITEM key for the object,
         // so this equals the range walk's `btrfs_find_inode_item`). Skip only when
         // no tree-log overlay must be merged (bd-cc-btrfs-point).
-        let inode_item = if self.btrfs_tree_log_items.is_empty() {
+        let inode_item = if !self.btrfs_tree_log_overlay_active.load(Ordering::Acquire) {
             self.walk_btrfs_fs_tree_floor(cx, inode_hi)?
                 .filter(|e| e.key.objectid == canonical && e.key.item_type == BTRFS_ITEM_INODE_ITEM)
                 .ok_or_else(|| FfsError::NotFound(format!("btrfs inode objectid {canonical}")))?
@@ -11106,7 +11117,7 @@ impl OpenFs {
         // non-empty log falls back to the overlay-applying range walk. Keys are
         // unique in a btrfs tree, so the floor-exact result is identical to the
         // one-key range walk's (bd-cc-btrfs-point).
-        let bucket: Vec<BtrfsLeafEntry> = if self.btrfs_tree_log_items.is_empty() {
+        let bucket: Vec<BtrfsLeafEntry> = if !self.btrfs_tree_log_overlay_active.load(Ordering::Acquire) {
             self.walk_btrfs_fs_tree_floor(cx, dir_item_lo)?
                 .filter(|e| e.key == dir_item_lo)
                 .into_iter()
@@ -12630,7 +12641,7 @@ impl OpenFs {
                     None => BtrfsReadExtents::Owned(Vec::new()),
                 };
                 (inode, exts)
-            } else if self.btrfs_tree_log_items.is_empty() {
+            } else if !self.btrfs_tree_log_overlay_active.load(Ordering::Acquire) {
                 // bd-n5w92: per-inode read-only extent cache. With no pending
                 // tree log the on-disk fs tree is the complete, immutable extent
                 // source, so resolve the inode's FULL extent list once and filter
@@ -12707,7 +12718,7 @@ impl OpenFs {
                 let inode =
                     parse_inode_item(&inode_entry.data).map_err(|e| parse_to_ffs_error(&e))?;
 
-                let lower_offset = if self.btrfs_tree_log_items.is_empty() {
+                let lower_offset = if !self.btrfs_tree_log_overlay_active.load(Ordering::Acquire) {
                     let seek = BtrfsKey {
                         objectid: canonical,
                         item_type: BTRFS_ITEM_EXTENT_DATA,
@@ -14066,7 +14077,7 @@ impl OpenFs {
         let probe_hash = (!self
             .btrfs_xattr_memo_disabled
             .load(std::sync::atomic::Ordering::Relaxed)
-            && self.btrfs_tree_log_items.is_empty())
+            && !self.btrfs_tree_log_overlay_active.load(Ordering::Acquire))
         .then(|| u64::from(ffs_btrfs::btrfs_name_hash(b"security.capability")));
 
         for canonical in objectids {
@@ -31889,44 +31900,45 @@ impl OpenFs {
             return Err(FfsError::ReadOnly);
         }
 
-        // Durable-by-default (bd-jdo53): full transaction commit unless ephemeral mode
-        // is explicitly requested via --btrfs-rw-ephemeral-ok flag.
-        if self.btrfs_rw_ephemeral_ok {
-            return self.btrfs_sync_ephemeral_tree_log(
-                cx,
-                &operation_id,
+        // A recovery mount still has the replayed tree-log entries only as an
+        // overlay. Fold that overlay into the writable CoW trees before a new
+        // log can supersede it; otherwise the new `log_root` would hide the
+        // earlier acknowledged entries. The full commit retires the old log
+        // only after its superblock is durable, at which point it disables the
+        // overlay as the matching in-memory transition (bd-jhuob).
+        if self.btrfs_tree_log_overlay_active.load(Ordering::Acquire) {
+            let writeback_stats = self.btrfs_full_transaction_commit(cx, &operation_id)?;
+            info!(
+                target: "ffs::btrfs::rw",
+                operation_id = %operation_id,
                 scenario_id,
-                ino,
+                outcome = "applied",
+                ino = ino.0,
                 datasync,
+                commit_strategy = "full_commit_recovery_tree_log_fallback",
+                nodes_written = writeback_stats.nodes_written,
+                bytes_written = writeback_stats.bytes_written,
+                new_generation = writeback_stats.new_generation,
+                fsync_barrier_issued = writeback_stats.fsync_barrier_issued,
+                full_commit_required = true,
+                ephemeral_mode = self.btrfs_rw_ephemeral_ok,
+                "btrfs_sync_applied"
             );
+            return Ok(());
         }
 
-        // Durable mode (default): full transaction commit
-        let writeback_stats = self.btrfs_full_transaction_commit(cx, &operation_id)?;
-
-        info!(
-            target: "ffs::btrfs::rw",
-            operation_id = %operation_id,
-            scenario_id,
-            outcome = "applied",
-            ino = ino.0,
-            datasync,
-            commit_strategy = "full_transaction_commit",
-            nodes_written = writeback_stats.nodes_written,
-            bytes_written = writeback_stats.bytes_written,
-            new_generation = writeback_stats.new_generation,
-            fsync_barrier_issued = writeback_stats.fsync_barrier_issued,
-            ephemeral_mode = false,
-            "btrfs_sync_applied"
-        );
-        Ok(())
+        // bd-jhuob: an eligible single-file fsync publishes the tree log by
+        // default. The helper retains the full-transaction fallback for log
+        // shapes it cannot represent (deletions, duplicate keys, or overflow).
+        self.btrfs_sync_tree_log_fast_path(cx, &operation_id, scenario_id, ino, datasync)
     }
 
-    /// Ephemeral-mode (`--btrfs-rw-ephemeral-ok`) fsync: MVCC flush plus the
-    /// tree-log fast path instead of a full transaction commit. Split out of
-    /// [`Self::btrfs_sync_with_logging`]; the caller has already emitted the
-    /// start record and checked writability.
-    fn btrfs_sync_ephemeral_tree_log(
+    /// Tree-log fsync: MVCC flush plus the fast path for eligible mutations.
+    ///
+    /// The caller has already emitted the start record and checked writability.
+    /// Unsupported tree-log shapes deliberately fall back to a full transaction
+    /// commit rather than losing acknowledged changes.
+    fn btrfs_sync_tree_log_fast_path(
         &self,
         cx: &Cx,
         operation_id: &str,
@@ -31934,11 +31946,10 @@ impl OpenFs {
         ino: InodeNumber,
         datasync: bool,
     ) -> ffs_error::Result<()> {
-        // Ephemeral mode: tree-log only (fast fsync, non-durable across unmount)
         debug!(
             target: "ffs::btrfs::rw",
             operation_id = %operation_id,
-            "ephemeral_mode_tree_log_only"
+            "tree_log_fast_fsync"
         );
 
         // Flush committed MVCC block versions to the underlying device.
@@ -32001,7 +32012,7 @@ impl OpenFs {
                     tree_log_allocated_bytes = tree_log.allocated_bytes,
                     tree_log_metadata_allocation = tree_log.metadata_allocation,
                     full_commit_required = false,
-                    ephemeral_mode = true,
+                    ephemeral_mode = self.btrfs_rw_ephemeral_ok,
                     "btrfs_sync_applied"
                 );
                 Ok(())
@@ -33869,6 +33880,12 @@ impl OpenFs {
 
         // Final fsync to ensure superblock is durable
         self.dev.sync(cx)?;
+
+        // The durable commit now contains the mount-time replay and no longer
+        // names its source log. Disable the overlay only after that same sync;
+        // otherwise a failed commit could hide acknowledged data (bd-jhuob).
+        self.btrfs_tree_log_overlay_active
+            .store(false, Ordering::Release);
 
         // THE LINEARIZATION POINT HAS PASSED (bd-mqb9t). Only now are the trees
         // this transaction replaced actually dead, so only now may the allocator
@@ -36665,7 +36682,7 @@ impl OpenFs {
         let xattr_memo_enabled = !self
             .btrfs_xattr_memo_disabled
             .load(std::sync::atomic::Ordering::Relaxed);
-        if xattr_memo_enabled && self.btrfs_tree_log_items.is_empty() {
+        if xattr_memo_enabled && !self.btrfs_tree_log_overlay_active.load(Ordering::Acquire) {
             return match self.walk_btrfs_fs_tree_floor(cx, lo)? {
                 // ⚠️ THE KEY EQUALITY IS LOAD-BEARING. A floor descent returns the
                 // greatest key `<= lo`, so when this bucket is absent it hands
@@ -40080,7 +40097,7 @@ impl OpenFs {
             // still reached. The floor is skipped (lower bound 0) when a tree log
             // is pending, since the floor descent does not see logged items
             // (mirrors btrfs_read_file).
-            let lower_offset = if self.btrfs_tree_log_items.is_empty() {
+            let lower_offset = if !self.btrfs_tree_log_overlay_active.load(Ordering::Acquire) {
                 let seek = BtrfsKey {
                     objectid: canonical,
                     item_type: BTRFS_ITEM_EXTENT_DATA,

@@ -3737,10 +3737,15 @@ impl CapabilityBitmap {
 
 // ── readdirplus attribute hand-off memo (bd-q0xnl) ──────────────────────────
 
-/// Slots in the readdirplus attribute memo. One `ls -lU` batch is at most a few
-/// hundred entries before the kernel drains it, so this only has to bridge one
-/// readdirplus reply to the getattr storm that follows it.
-const READDIRPLUS_ATTR_MEMO_SLOTS: usize = 1024;
+/// Slots in the readdirplus attribute memo.
+///
+/// A readdirplus reply can cover the whole 20,001-entry fixture before the
+/// kernel sends its follow-up getattr wave.  The former 1,024-slot table
+/// therefore evicted every hand-off before it could be claimed.  32K direct
+/// slots retain that one bounded wave while generation plus mutation/forget
+/// invalidation still bound correctness; the opt-in gate keeps its footprint
+/// off the shipping path until a live A/B proves it worthwhile.
+const READDIRPLUS_ATTR_MEMO_SLOTS: usize = 32 * 1024;
 
 /// One readdirplus memo slot: inode number, publish-time generation, attributes.
 type ReaddirplusMemoEntry = Option<(InodeNumber, u64, InodeAttr)>;
@@ -8215,6 +8220,29 @@ mod tests {
             "the newer generation's attributes are the live ones"
         );
         assert_eq!(got.size, 512, "and its attributes, not the previous life's");
+    }
+
+    /// A single large readdirplus reply must survive until its follow-up getattr
+    /// wave.  This is the capacity boundary the old 1K table violated on the
+    /// 20,001-entry fixture; direct mapping is collision-free for this range in
+    /// the 32K production table.
+    #[test]
+    fn readdirplus_attr_memo_retains_large_directory_handoffs_bd_warm_stat() {
+        let memo = ReaddirplusAttrMemo::with_slots(READDIRPLUS_ATTR_MEMO_SLOTS, true);
+        for raw_ino in 1..=20_001 {
+            let mut attr = make_test_attr(FfsFileType::RegularFile, raw_ino);
+            attr.ino = InodeNumber(raw_ino);
+            attr.generation = 1;
+            memo.remember(InodeNumber(raw_ino), &attr);
+        }
+
+        for raw_ino in [1, 1_024, 10_000, 20_001] {
+            let attr = memo
+                .take(InodeNumber(raw_ino))
+                .expect("a large directory hand-off must not be evicted before getattr");
+            assert_eq!(attr.ino, InodeNumber(raw_ino));
+            assert_eq!(attr.generation, 1);
+        }
     }
 
     /// Mutation and inode-drop seams must clear the hand-off.
