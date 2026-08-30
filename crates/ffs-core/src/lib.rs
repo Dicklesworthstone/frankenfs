@@ -1571,6 +1571,15 @@ pub struct OpenFs {
     /// request. Entries carry the inode's xattr-relevant generation so a reader
     /// that raced a mutation cannot serve its pre-mutation block.
     ext4_inode_xattr_block_cache: ShardedCache<u64, CachedExt4XattrBlock>,
+    /// Complete parsed ext4 xattr sets, keyed by inode number.
+    ///
+    /// A mounted `getxattr`/`listxattr` sequence commonly revisits the same
+    /// inode many times. Keeping the inode-body entries together with the
+    /// external-block entries avoids both the inode-table read and the parser
+    /// walk on a hit. Xattr writers refresh this exact cache after their inode
+    /// write succeeds, so a successful set/remove is immediately visible to
+    /// later readers without a stale-cache window (bd-rmug7).
+    ext4_inode_xattr_cache: ShardedCache<u64, Arc<Vec<(Ext4Xattr, u32)>>>,
     /// Bounded ext4 base-device block cache for repeated metadata reads.
     ///
     /// This sits below the MVCC overlay and is ext4-only: htree/name-index
@@ -5830,6 +5839,7 @@ impl OpenFs {
             ),
             ext4_inode_attr_cache: ShardedCache::new(),
             ext4_inode_xattr_block_cache: ShardedCache::new(),
+            ext4_inode_xattr_cache: ShardedCache::new(),
             ext4_base_block_cache: ShardedCache::new(),
             btrfs_alloc_state: None,
             extent_cache: ffs_extent::ExtentCache::new(),
@@ -7366,10 +7376,12 @@ impl OpenFs {
         // the per-op group-descriptor write, so persist the transient recovery
         // alloc's free counts / bitmap csums before it is dropped — else the
         // recovered image reports a stale descriptor free count (e2fsck "Free
-        // inodes/blocks count wrong"). No-op flag in eager mode.
-        if ffs_alloc::gdt_persistence_deferred() {
-            self.ext4_persist_group_descriptors_from(cx, &alloc)?;
-        }
+        // inodes/blocks count wrong"). Unconditional of the mode (bd-hyysq):
+        // eager mode's per-op write covers the same numbers, so this is a
+        // redundant write there rather than a second source of truth — and a
+        // recovery path is exactly where "the other mode already did it" is the
+        // assumption that must not be load-bearing.
+        self.ext4_persist_group_descriptors_from(cx, &alloc)?;
         // …and credit the LIVE alloc state with the same free, else the next
         // durability boundary flushes the pre-delete counts back over it
         // (bd-age6i).
@@ -7921,10 +7933,10 @@ impl OpenFs {
             // holds the only up-to-date free counts / bitmap csums — persist them
             // to the device before it is dropped, or the recovered image reports
             // a stale descriptor free count (e2fsck "Free blocks count wrong").
-            // In eager mode punch_hole already wrote the descriptors (no-op flag).
-            if ffs_alloc::gdt_persistence_deferred() {
-                self.ext4_persist_group_descriptors_from(cx, &alloc)?;
-            }
+            // Unconditional of the mode (bd-hyysq), for the same reason as the
+            // DEL_RANGE path above: eager mode writes the same numbers per-op, so
+            // this is redundant there, never contradictory.
+            self.ext4_persist_group_descriptors_from(cx, &alloc)?;
             // …and credit the LIVE alloc state with the same free, or the next
             // durability boundary rewrites the pre-punch counts over what was just
             // persisted and e2fsck sees a group/superblock free count short by
@@ -9059,11 +9071,13 @@ impl OpenFs {
                 let base_dev = self.direct_block_device_adapter();
                 let flushed = self.flush_mvcc_versions_to_device(cx, &base_dev)?;
                 self.clear_ext4_writable_group_desc_cache();
-                // When GDT persistence is deferred (bd-cc-gdt-defer), write every
-                // group descriptor once here from the authoritative in-memory
-                // GroupStats — the per-op GDT write was skipped to avoid a ~80k
-                // version-chain on the one shared GDT block (~2.3x create). No-op
-                // otherwise.
+                // Write every group descriptor here from the authoritative
+                // in-memory GroupStats. Under deferral (bd-cc-gdt-defer) this is
+                // the ONLY descriptor write — the per-op one was skipped to avoid
+                // a ~80k version-chain on the one shared GDT block (~2.3x create).
+                // Under eager per-op persistence it is a redundant rewrite of the
+                // same numbers, and it runs anyway: this boundary is the
+                // guarantee, the per-op write is the optimisation (bd-hyysq).
                 self.ext4_flush_group_descriptors(cx)?;
                 // Sync the superblock free-count totals so a device snapshot is
                 // e2fsck-consistent (bd-nd61w); no-op for btrfs / read-only ext4.
@@ -20828,16 +20842,28 @@ impl OpenFs {
     /// (NOTE: the group `bg_used_dirs_count` total is a separate gap in the
     /// worker-owned ffs-alloc inode alloc/free path — not corrected here.)
     #[allow(clippy::significant_drop_tightening)]
-    /// Flush-time GDT persistence (bd-cc-gdt-defer). When GDT writes are
-    /// deferred per-op, write every group descriptor directly to the device
-    /// from the authoritative in-memory `GroupStats`, re-reading each group's
-    /// current bitmaps (raw, no verify) to stamp the descriptor's bitmap
-    /// checksums. Collapses ~80k per-op GDT versions to one direct write per
-    /// GDT block. No-op when deferral is off or for btrfs / read-only ext4.
+    /// Flush-time GDT persistence (bd-cc-gdt-defer). Write every group
+    /// descriptor directly to the device from the authoritative in-memory
+    /// `GroupStats`, re-reading each group's current bitmaps (raw, no verify) to
+    /// stamp the descriptor's bitmap checksums. Under deferral this collapses
+    /// ~80k per-op GDT versions to one direct write per GDT block. No-op for
+    /// btrfs or read-only ext4.
+    ///
+    /// UNCONDITIONAL of the persistence mode (bd-hyysq). This used to open with
+    /// `if !gdt_persistence_deferred() { return Ok(()); }`, which made the
+    /// durability boundary write NOTHING in eager mode on the assumption that a
+    /// per-op eager write had already covered every allocation. It had not: an
+    /// allocating workload left `bg_free_blocks_count` stale by the blocks it
+    /// consumed and `e2fsck -fn` returned rc=4 ("Free blocks count wrong for
+    /// group #0"), reproduced 2/2 on the mounted repro that filed the bead.
+    ///
+    /// Making this unconditional is sound because `GroupStats` is authoritative
+    /// in BOTH modes: `ffs-alloc` mutates `stats.free_blocks` before it calls
+    /// `persist_group_desc_with_bitmap_overrides`, so the eager per-op write is a
+    /// write-through of the same numbers this pass writes — never a second
+    /// source of truth. Correctness must not depend on which persistence mode is
+    /// active; the eager write is an optimisation, this pass is the guarantee.
     fn ext4_flush_group_descriptors(&self, cx: &Cx) -> Result<(), FfsError> {
-        if !ffs_alloc::gdt_persistence_deferred() {
-            return Ok(());
-        }
         if !matches!(self.flavor, FsFlavor::Ext4(_)) {
             return Ok(());
         }
@@ -21033,12 +21059,22 @@ impl OpenFs {
         Ok(())
     }
 
+    /// Write the authoritative group descriptors into a CAPTURE device (the
+    /// snapshot a checker or crash test inspects), so the captured image agrees
+    /// with what the durability boundary would persist.
+    ///
+    /// Like [`Self::ext4_flush_group_descriptors`], this is unconditional of the
+    /// persistence mode (bd-hyysq): it previously skipped the whole pass in
+    /// eager mode, which left the capture carrying whatever the per-op path
+    /// happened to have written rather than the authoritative counts. A capture
+    /// that disagrees with the live filesystem hands a checker a different
+    /// filesystem than the one that exists.
     fn ext4_capture_group_descriptors(
         &self,
         cx: &Cx,
         capture: &dyn BlockDevice,
     ) -> Result<(), FfsError> {
-        if !ffs_alloc::gdt_persistence_deferred() || !matches!(self.flavor, FsFlavor::Ext4(_)) {
+        if !matches!(self.flavor, FsFlavor::Ext4(_)) {
             return Ok(());
         }
         let alloc_mutex = self.require_alloc_state()?;
@@ -27987,6 +28023,57 @@ impl OpenFs {
         self.ext4_inode_xattr_block_cache.remove(&ino.0);
     }
 
+    /// Return the complete xattr set for one inode from the per-inode cache,
+    /// filling it from the inode body plus its optional external block on a
+    /// miss. The cached vector retains `e_value_inum` so EA-inode values still
+    /// follow the same resolution path as an uncached lookup.
+    fn ext4_cached_inode_xattr_entries(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+    ) -> ffs_error::Result<Arc<Vec<(Ext4Xattr, u32)>>> {
+        if let Some(entries) = self.ext4_inode_xattr_cache.get(&ino.0) {
+            return Ok(entries);
+        }
+
+        let inode = self.read_inode(cx, ino)?;
+        self.ext4_refresh_inode_xattr_cache(cx, ino, &inode)
+    }
+
+    /// Write through one inode's xattrs after a successful mutation. Readers
+    /// can therefore observe the newly persisted inline body immediately;
+    /// external entries are rebuilt through their generation-aware block cache.
+    fn ext4_refresh_inode_xattr_cache(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        inode: &Ext4Inode,
+    ) -> ffs_error::Result<Arc<Vec<(Ext4Xattr, u32)>>> {
+        let mut entries = ffs_ondisk::parse_ibody_xattrs_with_inum(inode)
+            .map_err(|error| parse_to_ffs_error(&error))?;
+        if inode.file_acl != 0 {
+            entries.extend(
+                self.ext4_cached_xattr_block_entries(cx, ino, inode)?
+                    .iter()
+                    .cloned(),
+            );
+        }
+        let entries = Arc::new(entries);
+        // Remove first so an already-cached inode can replace itself even when
+        // the bounded cache is full; a cache admission failure is transparent.
+        self.ext4_inode_xattr_cache.remove(&ino.0);
+        self.ext4_inode_xattr_cache.insert_within(
+            ino.0,
+            Arc::clone(&entries),
+            EXT4_INODE_XATTR_BLOCK_CACHE_LIMIT,
+        );
+        Ok(entries)
+    }
+
+    fn invalidate_ext4_inode_xattr_cache(&self, ino: InodeNumber) {
+        self.ext4_inode_xattr_cache.remove(&ino.0);
+    }
+
     /// Set or replace one ext4 xattr.
     #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
     fn ext4_setxattr(
@@ -28247,8 +28334,13 @@ impl OpenFs {
             return Err(err);
         }
 
-        self.apply_ext4_xattr_post_inode_actions(cx, &post_inode_actions)?;
         self.invalidate_ext4_xattr_block_cache(ino);
+        self.invalidate_ext4_inode_xattr_cache(ino);
+        self.apply_ext4_xattr_post_inode_actions(cx, &post_inode_actions)?;
+        // Cache fill is an optimisation; persistence above is the authority,
+        // so a malformed pre-existing external block cannot turn a successful
+        // xattr write into a false error solely because caching failed.
+        let _ = self.ext4_refresh_inode_xattr_cache(cx, ino, &inode);
 
         trace!(
             target: "ffs::write",
@@ -28462,8 +28554,10 @@ impl OpenFs {
             return Err(err);
         }
 
-        self.apply_ext4_xattr_post_inode_actions(cx, &post_inode_actions)?;
         self.invalidate_ext4_xattr_block_cache(ino);
+        self.invalidate_ext4_inode_xattr_cache(ino);
+        self.apply_ext4_xattr_post_inode_actions(cx, &post_inode_actions)?;
+        let _ = self.ext4_refresh_inode_xattr_cache(cx, ino, &inode);
 
         trace!(
             target: "ffs::write",
@@ -59316,15 +59410,35 @@ mod tests {
         let cx = Cx::for_testing();
         let root = InodeNumber(2);
 
-        // Smallest workload that moves the group-0 free-block count: create files
-        // and give each one a data extent, so blocks (not just inodes) are taken.
-        for i in 0..32u32 {
+        // The workload from the bead: create+write+unlink PAIRS, not creates
+        // alone. A create-only workload does NOT reproduce this (measured: the
+        // 32-file create+write version of this test passed on the unfixed tree),
+        // because every allocation it performs goes through a path that does an
+        // eager per-op descriptor write. The pairs matter for two reasons: they
+        // exercise the FREE paths as well as the alloc paths, and 512 entries
+        // grow the root directory past its first block, so the directory's own
+        // block allocations — which the create+write workload never triggered —
+        // are in the mix. The bead's mounted repro used 1000 pairs and found
+        // group #0 off by exactly 8 blocks.
+        for i in 0..512u32 {
             let name = format!("hyysq_{i}.bin");
             let attr = fs
                 .create(&cx, root, OsStr::new(&name), 0o644, 0, 0)
                 .expect("create on real ext4 image");
-            fs.write(&cx, attr.ino, 0, &[0xAB_u8; 8192])
+            fs.write(&cx, attr.ino, 0, &[0xAB_u8; 4096])
                 .expect("write file data");
+            fs.unlink(&cx, root, OsStr::new(&name))
+                .expect("unlink on real ext4 image");
+        }
+        // …and leave a residue of live files so the directory keeps the blocks it
+        // grew into and the final state is not trivially "everything freed".
+        for i in 0..32u32 {
+            let name = format!("hyysq_live_{i}.bin");
+            let attr = fs
+                .create(&cx, root, OsStr::new(&name), 0o644, 0, 0)
+                .expect("create live file");
+            fs.write(&cx, attr.ino, 0, &[0xCD_u8; 8192])
+                .expect("write live file data");
         }
 
         fs.flush_mvcc_to_device(&cx).expect("flush mvcc to device");
@@ -59361,6 +59475,8 @@ mod tests {
         // Real e2fsck where e2fsprogs exists, including the planted negative.
         let image = tmp.path().join("hyysq.ext4");
         std::fs::write(&image, &bytes).expect("write image for e2fsck");
+        let e2fsck_ran = run_e2fsck(&image).is_some();
+        eprintln!("bd-hyysq: e2fsck_available={e2fsck_ran}");
         if let Some((clean, output)) = run_e2fsck(&image) {
             assert!(
                 clean,
@@ -59388,6 +59504,66 @@ mod tests {
                  assertion above proves nothing:\n{corrupt_output}"
             );
         }
+    }
+
+    /// bd-hyysq CONTROL: the eager per-op descriptor writes ALONE are not
+    /// enough, which is what makes the unconditional boundary flush load-bearing
+    /// rather than redundant belt-and-braces.
+    ///
+    /// This runs the same eager-mode workload but stops after
+    /// `flush_mvcc_versions_to_device` — exactly the state the defective code
+    /// reached, because `ext4_flush_group_descriptors` early-returned in eager
+    /// mode and so contributed nothing. The image at that point MUST be
+    /// inconsistent. If this test ever goes green, the fix above has become
+    /// untestable through this route and the pair is no longer a real
+    /// positive/negative: the boundary flush would be proving nothing, and this
+    /// assertion failing is the signal to go find the new mechanism rather than
+    /// to delete the test.
+    #[test]
+    fn ext4_eager_per_op_writes_alone_leave_stale_counts_bd_hyysq() {
+        let _restore = GdtModeRestore;
+        ffs_alloc::set_gdt_persistence_deferred_for_test(Some(false));
+
+        let Some((fs, dev, _tmp)) = open_writable_ext4_mkfs_with_device(64) else {
+            return; // format tool unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+
+        for i in 0..512u32 {
+            let name = format!("hyysq_ctl_{i}.bin");
+            let attr = fs
+                .create(&cx, root, OsStr::new(&name), 0o644, 0, 0)
+                .expect("create on real ext4 image");
+            fs.write(&cx, attr.ino, 0, &[0xAB_u8; 4096])
+                .expect("write file data");
+            fs.unlink(&cx, root, OsStr::new(&name))
+                .expect("unlink on real ext4 image");
+        }
+        for i in 0..32u32 {
+            let name = format!("hyysq_ctl_live_{i}.bin");
+            let attr = fs
+                .create(&cx, root, OsStr::new(&name), 0o644, 0, 0)
+                .expect("create live file");
+            fs.write(&cx, attr.ino, 0, &[0xCD_u8; 8192])
+                .expect("write live file data");
+        }
+
+        // Versions only — deliberately NOT the descriptor pass, superblock
+        // totals, or anything else the durability boundary does.
+        let base_dev = fs.direct_block_device_adapter();
+        fs.flush_mvcc_versions_to_device(&cx, &base_dev)
+            .expect("flush mvcc versions");
+        let bytes = dev.snapshot_bytes();
+
+        let mismatches = ext4_group_free_block_mismatches(&bytes);
+        eprintln!("bd-hyysq control: mismatches without the boundary flush = {mismatches:?}");
+        assert!(
+            !mismatches.is_empty(),
+            "the eager per-op descriptor writes were expected to leave at least one \
+             group's free-block count stale — without that, the unconditional \
+             boundary flush is untestable through this route"
+        );
     }
 
     /// Special-file inodes — a character device node, a block device node, and a
@@ -65077,6 +65253,73 @@ mod tests {
         assert!(
             !fs.removexattr(&cx, ino, "user.mime")
                 .expect("removexattr second call")
+        );
+    }
+
+    #[test]
+    fn ext4_inline_xattr_cache_is_write_through_for_get_and_list_bd_rmug7() {
+        let Some(fs) = open_writable_ext4() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let ino = fs
+            .create(
+                &cx,
+                InodeNumber(2),
+                OsStr::new("inline-xattr-cache.txt"),
+                0o644,
+                0,
+                0,
+            )
+            .expect("create")
+            .ino;
+
+        fs.setxattr(&cx, ino, "user.inline", b"first", XattrSetMode::Set)
+            .expect("set inline xattr");
+        assert_eq!(
+            fs.read_inode(&cx, ino).expect("read inode").file_acl,
+            0,
+            "small xattr must remain inline in the inode record"
+        );
+        assert!(
+            fs.ext4_inode_xattr_cache.contains_key(&ino.0),
+            "successful setxattr must write through the per-inode cache"
+        );
+        assert_eq!(
+            fs.getxattr(&cx, ino, "user.inline").expect("cached get"),
+            Some(b"first".to_vec())
+        );
+        assert_eq!(
+            fs.listxattr(&cx, ino).expect("cached list"),
+            vec!["user.inline".to_owned()]
+        );
+
+        fs.setxattr(
+            &cx,
+            ino,
+            "user.inline",
+            b"second",
+            XattrSetMode::Replace,
+        )
+        .expect("replace inline xattr");
+        assert_eq!(
+            fs.getxattr(&cx, ino, "user.inline").expect("write-through get"),
+            Some(b"second".to_vec()),
+            "replacement must not leave a stale cached value"
+        );
+
+        assert!(
+            fs.removexattr(&cx, ino, "user.inline")
+                .expect("remove inline xattr")
+        );
+        assert_eq!(
+            fs.getxattr(&cx, ino, "user.inline").expect("removed get"),
+            None,
+            "removal must write through the cache too"
+        );
+        assert!(
+            fs.listxattr(&cx, ino).expect("removed list").is_empty(),
+            "removed name must not survive in the cache"
         );
     }
 

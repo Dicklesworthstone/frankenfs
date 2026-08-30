@@ -20503,3 +20503,5 @@ run either gets a worker or does not happen.
 **Net:** the counted h2h harness is written, committed and demonstrated to run end-to-end on a worker
 for the incumbent arms, with the candidate arm as the one unresolved step and its diagnostics already
 in place. No number is claimed. `hostname=thinkstation1` (orchestration), worker `hz3`.
+
+## 2026-08-30 — bd-warm-stat-is-the-fuse-floor-4wxw9: REJECT 300 s attr/entry TTL; live ABBA remains 9.04x slower on warm stat and 6.63x slower on readdir+stat versus kernel ext4, while each candidate arm still pays one `security.capability` GETXATTR crossing per stat; reverted.
