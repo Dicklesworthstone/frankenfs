@@ -59390,11 +59390,20 @@ mod tests {
     /// consumed, and `e2fsck -fn` returned rc=4 with "Free blocks count wrong for
     /// group #0". Measured 2/2 on the mounted repro that filed this bead.
     ///
-    /// The fix makes the boundary flush unconditional: eager per-op writes are a
-    /// write-through optimisation, never the only writer. This test runs the
-    /// workload in eager mode — the mode that was broken — and asserts the image
-    /// is self-consistent, first through the in-process oracle above (which works
-    /// on any host) and then through real `e2fsck -fn` where e2fsprogs exists.
+    /// ⚠ SCOPE: this test does NOT reproduce that mounted failure — see
+    /// `ext4_eager_per_op_writes_alone_are_self_sufficient_here_bd_hyysq`, which
+    /// measured zero mismatches even with the boundary flush skipped entirely.
+    /// So this is a REGRESSION GATE on eager mode, not the bead's repro, and the
+    /// accompanying source change (making the boundary flush unconditional) is
+    /// hardening whose necessity is argued from the code rather than demonstrated
+    /// by a red test. Said plainly so nobody later reads a green run here as
+    /// evidence that bd-hyysq's trigger was found.
+    ///
+    /// What it does establish: in eager mode an allocating workload leaves an
+    /// image that real `e2fsck -fn` accepts, checked first through the in-process
+    /// oracle above (works on any host, so a builder without e2fsprogs cannot
+    /// turn this into a silent pass) and then through e2fsck itself, with a
+    /// planted-negative arm proving both checks actually bite.
     #[test]
     fn ext4_eager_gdt_allocating_workload_is_consistent_bd_hyysq() {
         let _restore = GdtModeRestore;
@@ -59506,21 +59515,32 @@ mod tests {
         }
     }
 
-    /// bd-hyysq CONTROL: the eager per-op descriptor writes ALONE are not
-    /// enough, which is what makes the unconditional boundary flush load-bearing
-    /// rather than redundant belt-and-braces.
+    /// bd-hyysq MEASURED NEGATIVE — this workload does NOT reproduce the bead,
+    /// and the number recorded here is why.
     ///
-    /// This runs the same eager-mode workload but stops after
+    /// The hypothesis under test was that the eager per-op descriptor writes are
+    /// insufficient on their own, which would make the now-unconditional
+    /// boundary flush load-bearing. It is FALSE for this workload. Running the
+    /// same 512 create+write+unlink pairs in eager mode and stopping after
     /// `flush_mvcc_versions_to_device` — exactly the state the defective code
-    /// reached, because `ext4_flush_group_descriptors` early-returned in eager
-    /// mode and so contributed nothing. The image at that point MUST be
-    /// inconsistent. If this test ever goes green, the fix above has become
-    /// untestable through this route and the pair is no longer a real
-    /// positive/negative: the boundary flush would be proving nothing, and this
-    /// assertion failing is the signal to go find the new mechanism rather than
-    /// to delete the test.
+    /// reached, since `ext4_flush_group_descriptors` early-returned in eager mode
+    /// and contributed nothing — leaves **zero** group-descriptor/bitmap
+    /// mismatches. Measured on worker hz3, 2026-08-30.
+    ///
+    /// So the in-process create/write/unlink path is NOT the trigger for the
+    /// mounted `FFS_SKIP_GDT=0` failure the bead reports (e2fsck rc=4, group #0
+    /// declared 28125 free vs counted 28117 — 8 blocks allocated whose descriptor
+    /// update never landed). The trigger is somewhere this harness does not
+    /// reach; candidates not yet excluded are the mounted FUSE dispatch path, the
+    /// clean-unmount boundary rather than `flush_mvcc_to_device`, and directory
+    /// or flex_bg metadata allocations.
+    ///
+    /// Kept as a CHARACTERISATION test rather than deleted: it pins the fact that
+    /// eager per-op persistence is self-sufficient here, so if that ever stops
+    /// being true this goes red and the next person learns it immediately instead
+    /// of re-deriving it. It asserts the measurement, not the hypothesis.
     #[test]
-    fn ext4_eager_per_op_writes_alone_leave_stale_counts_bd_hyysq() {
+    fn ext4_eager_per_op_writes_alone_are_self_sufficient_here_bd_hyysq() {
         let _restore = GdtModeRestore;
         ffs_alloc::set_gdt_persistence_deferred_for_test(Some(false));
 
@@ -59557,12 +59577,15 @@ mod tests {
         let bytes = dev.snapshot_bytes();
 
         let mismatches = ext4_group_free_block_mismatches(&bytes);
-        eprintln!("bd-hyysq control: mismatches without the boundary flush = {mismatches:?}");
+        eprintln!("bd-hyysq: mismatches without the boundary flush = {mismatches:?}");
         assert!(
-            !mismatches.is_empty(),
-            "the eager per-op descriptor writes were expected to leave at least one \
-             group's free-block count stale — without that, the unconditional \
-             boundary flush is untestable through this route"
+            mismatches.is_empty(),
+            "MEASUREMENT CHANGED: the eager per-op descriptor writes used to be \
+             self-sufficient for this workload (0 mismatches, hz3 2026-08-30) and \
+             now leave {} group(s) stale: {mismatches:?}. That is new information \
+             about bd-hyysq — it means this harness has finally reached the \
+             mounted repro's trigger. Investigate before touching this assertion.",
+            mismatches.len()
         );
     }
 
