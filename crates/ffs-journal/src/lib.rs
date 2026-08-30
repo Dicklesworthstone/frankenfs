@@ -1065,6 +1065,11 @@ pub struct Jbd2Writer {
     region: JournalRegion,
     /// Next free index within the journal region (region-relative).
     head: u64,
+    /// Lowest index a transaction may occupy: 0 for a bare region, 1 when the
+    /// region opens with a JBD2 superblock at its first block. This is where
+    /// [`Jbd2Writer::reset_after_checkpoint`] rewinds to, so it must never be
+    /// allowed to point at the superblock and overwrite it (bd-4zjkz).
+    base_head: u64,
     /// Next sequence number for a new transaction.
     next_seq: u32,
     /// Whether to use 64-bit block number format.
@@ -1104,6 +1109,7 @@ impl Jbd2Writer {
         Self {
             region,
             head: 0,
+            base_head: 0,
             next_seq: start_seq,
             is_64bit: false,
             tag_format: Jbd2TagFormat::Legacy,
@@ -1123,6 +1129,7 @@ impl Jbd2Writer {
         Self {
             region,
             head: 0,
+            base_head: 0,
             next_seq: start_seq,
             is_64bit: false,
             tag_format: if has_checksum {
@@ -1152,6 +1159,10 @@ impl Jbd2Writer {
         start_seq: u32,
     ) -> Result<Self> {
         let mut head = 0_u64;
+        // Lowest index a transaction may occupy. Stays 0 for a bare region and
+        // becomes 1 below if the region opens with a JBD2 superblock, so that
+        // `reset_after_checkpoint` can never rewind onto the superblock.
+        let mut base_head = 0_u64;
         let mut max_seq = start_seq;
         let mut is_64bit = false;
         let mut tag_format = Jbd2TagFormat::Legacy;
@@ -1170,6 +1181,7 @@ impl Jbd2Writer {
                 has_checksum = sb.has_checksum();
                 csum_seed = sb.csum_seed();
                 head = head.saturating_add(1);
+                base_head = head;
                 continue;
             }
 
@@ -1187,12 +1199,43 @@ impl Jbd2Writer {
         Ok(Self {
             region,
             head,
+            base_head,
             next_seq: max_seq,
             is_64bit,
             tag_format,
             has_checksum,
             csum_seed,
         })
+    }
+
+    /// Reclaim the whole journal region after its committed transactions have
+    /// been CHECKPOINTED to their home blocks (bd-4zjkz).
+    ///
+    /// `alloc_block` only ever advances `head` and returns [`FfsError::NoSpace`]
+    /// at `region.blocks`, so without this a journalled mount writes until the
+    /// region fills and then cannot commit at all. Real jbd2 avoids that with a
+    /// circular log and a lazily-advanced tail; FrankenFS's ext4 durability
+    /// boundary instead checkpoints SYNCHRONOUSLY (journal -> sync -> write home
+    /// -> sync), so at most one transaction is ever live and the region can be
+    /// reclaimed wholesale. That is a deliberate simplification of jbd2, not an
+    /// implementation of it: it trades the log's ability to batch several
+    /// transactions before checkpointing for not having to track a tail.
+    ///
+    /// ⚠ Calling this before every block the journal describes is durable at its
+    /// HOME location discards the only recoverable copy of those blocks. The
+    /// caller owns that ordering; this type cannot check it.
+    ///
+    /// The sequence number deliberately keeps advancing — rewinding it would let
+    /// replay mistake a stale transaction for a live one.
+    pub fn reset_after_checkpoint(&mut self) {
+        self.head = self.base_head;
+    }
+
+    /// Lowest index a transaction may occupy (past the journal superblock, if
+    /// the region has one).
+    #[must_use]
+    pub fn base_head(&self) -> u64 {
+        self.base_head
     }
 
     /// Begin a new transaction, consuming the next sequence number.
@@ -7826,6 +7869,110 @@ mod tests {
     fn blocks_needed_saturates_on_impossible_descriptor_geometry() {
         assert_eq!(Jbd2Writer::blocks_needed(8, 1, 0, false), u64::MAX);
         assert_eq!(Jbd2Writer::blocks_needed(12, 0, 1, false), u64::MAX);
+    }
+
+    /// bd-4zjkz: without reclaim, a journalled mount writes until the region
+    /// fills and then cannot commit at all — `alloc_block` only advances `head`.
+    /// The NEGATIVE half of this test is the load-bearing half: it first proves
+    /// the region really does run out (so the reclaim is not being credited for
+    /// space that was never scarce), and only then that reclaim restores it.
+    #[test]
+    fn reset_after_checkpoint_reclaims_a_filled_region_bd_4zjkz() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 512);
+        let region = JournalRegion {
+            start: BlockNumber(0),
+            blocks: 8,
+        };
+        let mut writer = Jbd2Writer::new(region, 1);
+
+        // Fill the region: each commit costs descriptor + data + commit = 3.
+        let mut committed = 0_u32;
+        loop {
+            let mut txn = writer.begin_transaction();
+            txn.add_write(BlockNumber(99), vec![0xAB; 512]);
+            match writer.commit_transaction(&cx, &dev, &txn) {
+                Ok(_) => committed += 1,
+                Err(FfsError::NoSpace) => break,
+                Err(other) => panic!("unexpected commit error: {other:?}"),
+            }
+            assert!(committed < 100, "region never filled — the negative is vacuous");
+        }
+        assert!(
+            committed > 0,
+            "at least one transaction must fit before the region fills"
+        );
+        assert!(writer.head() > writer.base_head(), "head must have advanced");
+
+        // Reclaim, then the very next commit must succeed again.
+        writer.reset_after_checkpoint();
+        assert_eq!(writer.head(), writer.base_head(), "head rewinds to base");
+        let mut txn = writer.begin_transaction();
+        txn.add_write(BlockNumber(99), vec![0xCD; 512]);
+        writer
+            .commit_transaction(&cx, &dev, &txn)
+            .expect("a reclaimed region must accept a new transaction");
+
+        // The sequence number must NOT rewind: replay distinguishes a live
+        // transaction from a stale one by sequence, so reusing one would let a
+        // reclaimed slot masquerade as current.
+        assert!(
+            writer.next_seq() > committed,
+            "sequence numbers must keep advancing across a reclaim"
+        );
+    }
+
+    /// bd-4zjkz: reclaim must never rewind onto a journal superblock. A region
+    /// opened with one starts transactions at index 1, and `base_head` is what
+    /// keeps `reset_after_checkpoint` from overwriting it.
+    #[test]
+    fn reset_after_checkpoint_never_rewinds_onto_the_journal_superblock_bd_4zjkz() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(1024, 64);
+        let region = JournalRegion {
+            start: BlockNumber(0),
+            blocks: 16,
+        };
+        // Lay down a real JBD2 superblock at the region's first block.
+        let mut sb = vec![0_u8; 1024];
+        sb[0..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+        sb[4..8].copy_from_slice(&JBD2_BLOCKTYPE_SUPERBLOCK_V2.to_be_bytes());
+        sb[12..16].copy_from_slice(&1024_u32.to_be_bytes()); // s_blocksize
+        sb[16..20].copy_from_slice(&16_u32.to_be_bytes()); // s_maxlen
+        sb[20..24].copy_from_slice(&1_u32.to_be_bytes()); // s_first
+        dev.write_block(&cx, BlockNumber(0), &sb)
+            .expect("write journal superblock");
+
+        let mut writer =
+            Jbd2Writer::open(&cx, &dev, region, 1).expect("open region with a superblock");
+        assert_eq!(
+            writer.base_head(),
+            1,
+            "a region with a journal superblock must start transactions at index 1"
+        );
+
+        writer.reset_after_checkpoint();
+        assert_eq!(
+            writer.head(),
+            1,
+            "reclaim must rewind to index 1, never onto the superblock at index 0"
+        );
+
+        let mut txn = writer.begin_transaction();
+        txn.add_write(BlockNumber(99), vec![0xEE; 1024]);
+        writer
+            .commit_transaction(&cx, &dev, &txn)
+            .expect("commit after reclaim");
+
+        // The superblock must still be intact.
+        let after = dev
+            .read_block(&cx, BlockNumber(0))
+            .expect("re-read journal superblock");
+        assert_eq!(
+            &after.as_slice()[0..4],
+            &JBD2_MAGIC.to_be_bytes(),
+            "the journal superblock was overwritten by a reclaimed transaction"
+        );
     }
 
     #[test]
