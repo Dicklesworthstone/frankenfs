@@ -59212,6 +59212,184 @@ mod tests {
         );
     }
 
+    /// Restores production GDT-persistence mode on scope exit, so a panicking
+    /// eager-mode test cannot leak `Some(false)` into whatever libtest schedules
+    /// next on this thread.
+    struct GdtModeRestore;
+    impl Drop for GdtModeRestore {
+        fn drop(&mut self) {
+            ffs_alloc::set_gdt_persistence_deferred_for_test(None);
+        }
+    }
+
+    /// Audit an ext4 image's group descriptors against its own block bitmaps.
+    ///
+    /// Returns one `(group, declared_free, counted_free)` row per group whose
+    /// `bg_free_blocks_count` disagrees with the number of zero bits in that
+    /// group's on-disk block bitmap — the exact inconsistency `e2fsck` reports as
+    /// "Free blocks count wrong for group #N". Groups still flagged
+    /// `EXT4_BG_BLOCK_UNINIT` are skipped: their bitmap is not authoritative
+    /// (the kernel synthesises it), so a mismatch there is not a defect.
+    ///
+    /// This is an IN-PROCESS oracle deliberately independent of e2fsck, because
+    /// a build host without e2fsprogs would otherwise turn this whole regression
+    /// into a silent pass (bd-hyysq).
+    fn ext4_group_free_block_mismatches(image: &[u8]) -> Vec<(u32, u32, u32)> {
+        let sb = ffs_ondisk::ext4::Ext4Superblock::parse_from_image(image)
+            .expect("parse ext4 superblock from image bytes");
+        let block_size = sb.block_size as usize;
+        let bpg = sb.blocks_per_group;
+        let desc_size = sb.desc_size.max(32);
+        let group_count = u32::try_from(
+            sb.blocks_count
+                .saturating_sub(u64::from(sb.first_data_block))
+                .div_ceil(u64::from(bpg)),
+        )
+        .expect("group count fits u32");
+        // The GDT starts in the block after the one holding the superblock.
+        let gdt_block = if block_size == 1024 { 2 } else { 1 };
+        let gdt_off = gdt_block * block_size;
+
+        let mut mismatches = Vec::new();
+        for g in 0..group_count {
+            let off = gdt_off + (g as usize) * usize::from(desc_size);
+            let Ok(gd) = ffs_ondisk::ext4::Ext4GroupDesc::parse_from_bytes(
+                &image[off..off + usize::from(desc_size)],
+                desc_size,
+            ) else {
+                continue;
+            };
+            if gd.flags & ffs_ondisk::ext4::EXT4_BG_BLOCK_UNINIT != 0 {
+                continue; // bitmap not authoritative for an uninitialised group
+            }
+            // Blocks this group actually owns (the last group is short).
+            let first = u64::from(sb.first_data_block) + u64::from(g) * u64::from(bpg);
+            let owned = u32::try_from((sb.blocks_count - first).min(u64::from(bpg)))
+                .expect("blocks per group fits u32");
+            let bm_off = (gd.block_bitmap as usize) * block_size;
+            if bm_off + block_size > image.len() {
+                continue;
+            }
+            let bitmap = &image[bm_off..bm_off + block_size];
+            let counted = (0..owned)
+                .filter(|b| {
+                    let i = *b as usize;
+                    bitmap[i / 8] & (1u8 << (i % 8)) == 0
+                })
+                .count();
+            let counted = u32::try_from(counted).expect("free count fits u32");
+            if counted != gd.free_blocks_count {
+                mismatches.push((g, gd.free_blocks_count, counted));
+            }
+        }
+        mismatches
+    }
+
+    /// bd-hyysq (P0): an ALLOCATING workload must leave the group descriptors
+    /// consistent with the bitmaps under BOTH GDT-persistence modes.
+    ///
+    /// The defect: `ext4_flush_group_descriptors` opened with
+    /// `if !gdt_persistence_deferred() { return Ok(()); }`, so in eager mode the
+    /// durability boundary persisted NOTHING, on the assumption that a per-op
+    /// eager write had already covered every allocation. It had not — a create
+    /// storm left `bg_free_blocks_count` stale by exactly the blocks the workload
+    /// consumed, and `e2fsck -fn` returned rc=4 with "Free blocks count wrong for
+    /// group #0". Measured 2/2 on the mounted repro that filed this bead.
+    ///
+    /// The fix makes the boundary flush unconditional: eager per-op writes are a
+    /// write-through optimisation, never the only writer. This test runs the
+    /// workload in eager mode — the mode that was broken — and asserts the image
+    /// is self-consistent, first through the in-process oracle above (which works
+    /// on any host) and then through real `e2fsck -fn` where e2fsprogs exists.
+    #[test]
+    fn ext4_eager_gdt_allocating_workload_is_consistent_bd_hyysq() {
+        let _restore = GdtModeRestore;
+        ffs_alloc::set_gdt_persistence_deferred_for_test(Some(false));
+        assert!(
+            !ffs_alloc::gdt_persistence_deferred(),
+            "this test must run in the EAGER mode that bd-hyysq broke"
+        );
+
+        let Some((fs, dev, tmp)) = open_writable_ext4_mkfs_with_device(64) else {
+            return; // format tool unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+
+        // Smallest workload that moves the group-0 free-block count: create files
+        // and give each one a data extent, so blocks (not just inodes) are taken.
+        for i in 0..32u32 {
+            let name = format!("hyysq_{i}.bin");
+            let attr = fs
+                .create(&cx, root, OsStr::new(&name), 0o644, 0, 0)
+                .expect("create on real ext4 image");
+            fs.write(&cx, attr.ino, 0, &[0xAB_u8; 8192])
+                .expect("write file data");
+        }
+
+        fs.flush_mvcc_to_device(&cx).expect("flush mvcc to device");
+        let bytes = dev.snapshot_bytes();
+
+        let mismatches = ext4_group_free_block_mismatches(&bytes);
+        assert!(
+            mismatches.is_empty(),
+            "eager-mode allocating workload left stale group-descriptor free-block \
+             counts (group, declared, counted): {mismatches:?}"
+        );
+
+        // Planted negative: the oracle must actually bite. Corrupt group 0's
+        // declared free-block count and require the audit to report it — a green
+        // audit on a knowingly-wrong image would mean the check proves nothing.
+        {
+            let mut corrupt = bytes.clone();
+            let sb = ffs_ondisk::ext4::Ext4Superblock::parse_from_image(&corrupt)
+                .expect("parse superblock");
+            let bs = sb.block_size as usize;
+            let gdt_off = if bs == 1024 { 2 * bs } else { bs };
+            // bg_free_blocks_count lo lives at descriptor offset 0x0C.
+            let declared = u16::from_le_bytes([corrupt[gdt_off + 0x0C], corrupt[gdt_off + 0x0D]]);
+            let wrong = declared.wrapping_add(8).to_le_bytes();
+            corrupt[gdt_off + 0x0C] = wrong[0];
+            corrupt[gdt_off + 0x0D] = wrong[1];
+            let planted = ext4_group_free_block_mismatches(&corrupt);
+            assert!(
+                planted.iter().any(|&(g, _, _)| g == 0),
+                "the free-count audit must flag a deliberately corrupted group 0"
+            );
+        }
+
+        // Real e2fsck where e2fsprogs exists, including the planted negative.
+        let image = tmp.path().join("hyysq.ext4");
+        std::fs::write(&image, &bytes).expect("write image for e2fsck");
+        if let Some((clean, output)) = run_e2fsck(&image) {
+            assert!(
+                clean,
+                "e2fsck -fn must accept an image written by an eager-mode \
+                 allocating workload:\n{output}"
+            );
+
+            let corrupt_image = tmp.path().join("hyysq_corrupt.ext4");
+            let mut corrupt = bytes.clone();
+            let bs = ffs_ondisk::ext4::Ext4Superblock::parse_from_image(&corrupt)
+                .expect("parse superblock")
+                .block_size as usize;
+            let gdt_off = if bs == 1024 { 2 * bs } else { bs };
+            let declared = u16::from_le_bytes([corrupt[gdt_off + 0x0C], corrupt[gdt_off + 0x0D]]);
+            let wrong = declared.wrapping_add(8).to_le_bytes();
+            corrupt[gdt_off + 0x0C] = wrong[0];
+            corrupt[gdt_off + 0x0D] = wrong[1];
+            std::fs::write(&corrupt_image, &corrupt).expect("write corrupt image");
+            let (corrupt_clean, corrupt_output) =
+                run_e2fsck(&corrupt_image).expect("e2fsck available for the negative arm too");
+            assert!(
+                !corrupt_clean,
+                "e2fsck must REJECT an image whose group-0 free-block count was \
+                 deliberately falsified — a green run here would mean the rc=0 \
+                 assertion above proves nothing:\n{corrupt_output}"
+            );
+        }
+    }
+
     /// Special-file inodes — a character device node, a block device node, and a
     /// FIFO — must leave an ext4 image e2fsck-clean. Existing mknod tests only
     /// round-trip the rdev back through FrankenFS's own getattr (internal
