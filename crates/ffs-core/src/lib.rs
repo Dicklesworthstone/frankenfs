@@ -8754,6 +8754,46 @@ impl OpenFs {
         self.jbd2_writer.is_some()
     }
 
+    /// Attach a JBD2 writer over this image's own INTERNAL journal, so the ext4
+    /// durability boundary routes through it (bd-4zjkz).
+    ///
+    /// Returns `Ok(false)`, attaching nothing, when the image has no internal
+    /// journal (`s_journal_inum == 0`) or the journal inode maps no blocks. The
+    /// caller decides what an un-journalled mount means; this only reports that
+    /// it could not provide one.
+    ///
+    /// The writer inherits the journal's on-disk format from its superblock, so
+    /// what FrankenFS writes stays replayable BY THE KERNEL — a checksummed
+    /// journal written with legacy tags is not a journal the kernel will accept.
+    ///
+    /// # Errors
+    /// Propagates failures to read the journal inode or walk its extents. Those
+    /// are hard errors rather than a `false`: an image that claims a journal we
+    /// cannot map must not be mounted as if it had none.
+    pub fn attach_ext4_internal_jbd2_writer(&mut self, cx: &Cx) -> Result<bool, FfsError> {
+        let Some(sb) = self.ext4_superblock() else {
+            return Ok(false);
+        };
+        let inum = sb.journal_inum;
+        if inum == 0 {
+            return Ok(false);
+        }
+        let inode = self.read_inode(cx, InodeNumber(u64::from(inum)))?;
+        let segments = self.collect_ext4_journal_segments(cx, &inode)?;
+        if segments.is_empty() {
+            return Ok(false);
+        }
+        let writer = {
+            let direct = self.direct_block_device_adapter();
+            // `open_segmented` does not scan for a committed tail; its
+            // precondition is that mount-time replay already drained the
+            // journal, which `from_device` performs before writes are enabled.
+            ffs_journal::Jbd2Writer::open_segmented(cx, &direct, segments, 1)?
+        };
+        self.attach_jbd2_writer(writer);
+        Ok(true)
+    }
+
     /// Attach a repair flush lifecycle for spec §12.1.3 compliance.
     ///
     /// Once attached, `commit_transaction` and `commit_transaction_ssi` will
@@ -9068,6 +9108,22 @@ impl OpenFs {
         self.handle_ext4_write_result(
             "flush_mvcc_to_device",
             (|| {
+                // bd-4zjkz: when a JBD2 writer is attached, this whole boundary
+                // goes through the journal instead — journal, sync, checkpoint
+                // home, sync. Returns None (and changes nothing) when it is not.
+                {
+                    let mut flushed_through = self.mvcc_flushed_through.lock();
+                    if let Some((flushed, durable_through)) =
+                        self.ext4_flush_boundary_via_jbd2(cx, *flushed_through)?
+                    {
+                        *flushed_through = (*flushed_through).max(durable_through);
+                        drop(flushed_through);
+                        if flushed > 0 {
+                            info!(flushed_blocks = flushed, "flush_mvcc_to_device_journaled");
+                        }
+                        return Ok(flushed);
+                    }
+                }
                 let base_dev = self.direct_block_device_adapter();
                 let flushed = self.flush_mvcc_versions_to_device(cx, &base_dev)?;
                 self.clear_ext4_writable_group_desc_cache();
@@ -21069,6 +21125,98 @@ impl OpenFs {
     /// happened to have written rather than the authoritative counts. A capture
     /// that disagrees with the live filesystem hands a checker a different
     /// filesystem than the one that exists.
+    /// bd-4zjkz: run an ext4 durability boundary THROUGH JBD2 rather than
+    /// writing straight to home blocks.
+    ///
+    /// Returns `Ok(None)` when no JBD2 writer is attached or this is not ext4,
+    /// so every caller keeps its existing direct-to-home path untouched.
+    ///
+    /// WHERE THE WRITE SET COMES FROM. By the time a client `fsync` arrives,
+    /// every mounted write has already auto-committed, so there is no open MVCC
+    /// `Transaction` to journal — which is what made this look impossible. It is
+    /// not: the write set is the set of blocks this boundary is ABOUT to send
+    /// home, and running the flush passes against a capture device materialises
+    /// exactly that, the same trick `flush_ext4_metadata_log` already uses.
+    ///
+    /// ORDERING, which is the entire point:
+    ///  1. flush MVCC versions + group descriptors + superblock totals into a
+    ///     CAPTURE device, so nothing has reached a home block yet;
+    ///  2. commit that set to the journal region and sync — after this returns a
+    ///     crash is recoverable, because replay reapplies the whole set;
+    ///  3. only THEN write the same blocks to their home locations, and sync;
+    ///  4. reclaim the journal region, now that the home copies are durable and
+    ///     the journal's contents are pure redundancy.
+    ///
+    /// Steps 2 and 3 must not be reordered or merged: writing a home block before
+    /// the commit block is durable is precisely the torn-metadata window this
+    /// exists to close.
+    ///
+    /// COST, stated plainly because this bead exists to stop us hiding it. This
+    /// writes the jbd2 descriptor and commit blocks we previously never wrote,
+    /// and syncs twice where we used to sync once. It is expected to make fsync
+    /// measurably SLOWER, and that is the correct outcome — the 0.182706x
+    /// "win" it replaces compared an unjournalled FrankenFS against a journalled
+    /// kernel, which is not a comparison.
+    fn ext4_flush_boundary_via_jbd2(
+        &self,
+        cx: &Cx,
+        flushed_through: CommitSeq,
+    ) -> Result<Option<(usize, CommitSeq)>, FfsError> {
+        let Some(jbd2_mutex) = self.jbd2_writer.as_ref() else {
+            return Ok(None);
+        };
+        if !matches!(self.flavor, FsFlavor::Ext4(_)) {
+            return Ok(None);
+        }
+
+        // Empty prior index: this capture exists only to intercept THIS
+        // boundary's writes, not to shadow a metadata log.
+        let capture =
+            MetadataLogCaptureDevice::new(self.dev.as_ref(), self.block_size(), BTreeMap::new());
+        let (flushed, durable_through) =
+            self.mvcc_store
+                .flush_to_device_after(cx, &capture, flushed_through)?;
+        self.clear_ext4_writable_group_desc_cache();
+        self.ext4_capture_group_descriptors(cx, &capture)?;
+        self.ext4_sync_superblock_free_totals_to(cx, &capture)?;
+
+        let writes = capture.take_writes();
+        if writes.is_empty() {
+            return Ok(Some((flushed, durable_through)));
+        }
+
+        let direct = ByteDeviceBlockAdapter {
+            dev: self.dev.as_ref(),
+            block_size: self.block_size(),
+        };
+        {
+            let mut writer = jbd2_mutex.lock();
+            let mut txn = writer.begin_transaction();
+            for (block, data) in &writes {
+                txn.add_write(*block, data.clone());
+            }
+            // Phase 1 — journal, then make the journal durable.
+            writer.commit_transaction(cx, &direct, &txn)?;
+            self.dev.sync(cx)?;
+
+            // Phase 2 — checkpoint to home locations, then make THAT durable.
+            for (block, data) in &writes {
+                direct.write_block(cx, *block, data)?;
+            }
+            self.dev.sync(cx)?;
+
+            // Phase 3 — the home copies are durable, so the region is reclaimable.
+            // Only correct because phase 2 completed; see `reset_after_checkpoint`.
+            writer.reset_after_checkpoint();
+        }
+
+        // The home writes bypassed the MVCC overlay and both read caches, exactly
+        // as `ext4_persist_group_descriptors_from` does, so drop them.
+        self.ext4_group_desc_cache.clear();
+        self.ext4_base_block_cache.clear();
+        Ok(Some((flushed, durable_through)))
+    }
+
     fn ext4_capture_group_descriptors(
         &self,
         cx: &Cx,
@@ -30843,6 +30991,27 @@ impl OpenFs {
         // that still need a consistent on-disk summary.
         let base_dev = self.direct_block_device_adapter();
         let mut flushed_through = self.mvcc_flushed_through.lock();
+        // bd-4zjkz: the journalled boundary owns its own syncs and its own
+        // checkpoint, so it returns early rather than falling through to the
+        // single `dev.sync` below. A mount with no JBD2 writer attached takes the
+        // unchanged direct path underneath.
+        if let Some((flushed, durable_through)) =
+            self.ext4_flush_boundary_via_jbd2(cx, *flushed_through)?
+        {
+            *flushed_through = (*flushed_through).max(durable_through);
+            drop(flushed_through);
+            info!(
+                target: "ffs::ext4::rw",
+                operation_id = %operation_id,
+                scenario_id,
+                outcome = "applied",
+                ino = ino.0,
+                datasync,
+                flushed_blocks = flushed,
+                "ext4_sync_applied_journaled"
+            );
+            return Ok(());
+        }
         let (flushed, durable_through) =
             self.mvcc_store
                 .flush_to_device_after(cx, &base_dev, *flushed_through)?;
@@ -59587,6 +59756,158 @@ mod tests {
              mounted repro's trigger. Investigate before touching this assertion.",
             mismatches.len()
         );
+    }
+
+    /// Resolve a mkfs-created image's INTERNAL journal to a single contiguous
+    /// region, or `None` if it is absent or fragmented.
+    ///
+    /// `Jbd2Writer` addresses one contiguous `JournalRegion`, so a fragmented
+    /// journal cannot be represented and must be refused rather than journalled
+    /// into the wrong blocks — the same rule that says half-implementing an
+    /// on-disk format is worse than declining it (bd-4zjkz).
+    fn ext4_journal_segments_for_test(
+        fs: &OpenFs,
+        cx: &Cx,
+    ) -> std::result::Result<Vec<ffs_journal::JournalSegment>, String> {
+        let Some(sb) = fs.ext4_superblock() else {
+            return Err("not an ext4 filesystem".to_owned());
+        };
+        let inum = sb.journal_inum;
+        if inum == 0 {
+            return Err("s_journal_inum is 0: mkfs produced no internal journal".to_owned());
+        }
+        let inode = fs
+            .read_inode(cx, InodeNumber(u64::from(inum)))
+            .map_err(|e| format!("read journal inode {inum} failed: {e}"))?;
+        let segments = fs
+            .collect_ext4_journal_segments(cx, &inode)
+            .map_err(|e| format!("collect journal segments failed: {e}"))?;
+        if segments.is_empty() {
+            return Err(format!("journal inode {inum} maps no blocks"));
+        }
+        Ok(segments)
+    }
+
+    /// bd-4zjkz: with a JBD2 writer attached, an ext4 durability boundary must
+    /// actually route through the journal.
+    ///
+    /// THE NEGATIVE CONTROL IS THE BEAD'S OWN MEASUREMENT. The bead established
+    /// by strace that a mounted FrankenFS fsync writes exactly 2.00 blocks and
+    /// ZERO journal blocks — it touches only home blocks, so a crash between the
+    /// two writes leaves torn metadata with no journal to replay. Arm A
+    /// reproduces that in-process: with no writer attached the journal region
+    /// must come back byte-identical. Arm B then requires that attaching a writer
+    /// changes it. Without arm A, arm B could pass on an image where something
+    /// else happened to dirty those blocks.
+    ///
+    /// Arm B also checks the two things journalling must not break: the home
+    /// block ends up carrying the data (the checkpoint really ran, so this is not
+    /// a write that only ever reached the log), and `e2fsck -fn` still accepts
+    /// the result.
+    #[test]
+    fn ext4_fsync_routes_through_jbd2_when_attached_bd_4zjkz() {
+        let cx = Cx::for_testing();
+
+        // ---- Arm A: no JBD2 writer -> the journal must stay untouched. ----
+        let Some((fs, dev, _tmp_a)) = open_writable_ext4_mkfs_with_device(64) else {
+            return; // format tool unavailable
+        };
+        // A mkfs.ext4 image is expected to carry a usable internal journal. If it
+        // does not, FAIL rather than skip: a silent skip here is how this test
+        // passed in 0.10s having exercised nothing at all (measured, first run).
+        let segments = match ext4_journal_segments_for_test(&fs, &cx) {
+            Ok(segments) => segments,
+            Err(reason) => panic!(
+                "bd-4zjkz: cannot resolve this mkfs image's internal journal, so the \
+                 journalled boundary is untested rather than passing: {reason}"
+            ),
+        };
+        eprintln!(
+            "bd-4zjkz: journal extents = {:?}",
+            segments
+                .iter()
+                .map(|s| (s.start.0, s.blocks))
+                .collect::<Vec<_>>()
+        );
+        let bs = fs.block_size() as usize;
+        // Compare every journal extent, not just the first — a writer bug that
+        // spilled past extent 0 would be invisible if we only looked there.
+        let journal_bytes = |image: &[u8]| -> Vec<u8> {
+            let mut out = Vec::new();
+            for s in &segments {
+                let start = s.start.0 as usize * bs;
+                let end = start + (s.blocks as usize) * bs;
+                out.extend_from_slice(&image[start..end]);
+            }
+            out
+        };
+
+        let before_a = journal_bytes(&dev.snapshot_bytes());
+        let attr = fs
+            .create(&cx, InodeNumber(2), OsStr::new("nojournal.bin"), 0o644, 0, 0)
+            .expect("create");
+        fs.write(&cx, attr.ino, 0, &[0x5A_u8; 4096])
+            .expect("write");
+        fs.flush_mvcc_to_device(&cx).expect("unjournalled boundary");
+        let after_a = journal_bytes(&dev.snapshot_bytes());
+        assert_eq!(
+            before_a, after_a,
+            "with no JBD2 writer attached the journal must be untouched — this is \
+             the bead's measured starting point (ZERO journal blocks written); if \
+             it fails, the journal region resolved here is not really the journal"
+        );
+
+        // ---- Arm B: writer attached -> the journal must be written. ----
+        let Some((mut fs, dev, tmp)) = open_writable_ext4_mkfs_with_device(64) else {
+            return;
+        };
+        let segments_b = ext4_journal_segments_for_test(&fs, &cx)
+            .expect("arm A already proved this image has a usable journal");
+        let writer = {
+            let direct = fs.direct_block_device_adapter();
+            ffs_journal::Jbd2Writer::open_segmented(&cx, &direct, segments_b, 1)
+                .expect("open the image's own journal for writing")
+        };
+        fs.attach_jbd2_writer(writer);
+        assert!(fs.has_jbd2_writer());
+
+        let before_b = journal_bytes(&dev.snapshot_bytes());
+        let attr = fs
+            .create(&cx, InodeNumber(2), OsStr::new("journalled.bin"), 0o644, 0, 0)
+            .expect("create");
+        fs.write(&cx, attr.ino, 0, &[0xA5_u8; 4096])
+            .expect("write");
+        fs.flush_mvcc_to_device(&cx).expect("journalled boundary");
+        let image = dev.snapshot_bytes();
+        let after_b = journal_bytes(&image);
+
+        assert_ne!(
+            before_b, after_b,
+            "attaching a JBD2 writer must make the durability boundary WRITE the \
+             journal — an unchanged region means fsync still bypasses it, which is \
+             exactly the defect bd-4zjkz reports"
+        );
+
+        // The checkpoint must also have run: the data has to be at its HOME
+        // location, not only in the log.
+        let read_back = fs
+            .read(&cx, attr.ino, 0, 4096)
+            .expect("read back journalled file");
+        assert_eq!(
+            read_back,
+            vec![0xA5_u8; 4096],
+            "the journalled boundary must still land the data at its home block"
+        );
+
+        let path = tmp.path().join("journalled.ext4");
+        std::fs::write(&path, &image).expect("write image for e2fsck");
+        if let Some((clean, output)) = run_e2fsck(&path) {
+            assert!(
+                clean,
+                "e2fsck -fn must accept an image written through the JBD2 \
+                 boundary:\n{output}"
+            );
+        }
     }
 
     /// Special-file inodes — a character device node, a block device node, and a
