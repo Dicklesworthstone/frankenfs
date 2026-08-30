@@ -236,14 +236,12 @@ fn tree_logged_fsync_survives_the_full_commit_after_recovery_bd_jhuob() {
     );
 }
 
-/// A non-deleting single-file fsync is the narrow default-policy case for the
-/// tree-log fast path.  This is deliberately a planted negative: before
-/// bd-jhuob promotes that eligible case, the default mount takes a full
-/// transaction commit and leaves `log_root` zero, so the raw-superblock
-/// precondition below fails.  Merely making the file survive is insufficient:
-/// a full commit also survives, but would not exercise the faster path.
+/// A non-deleting single-file fsync remains durable-by-default. This catches a
+/// future accidental default tree-log promotion: the measured bd-jhuob policy
+/// attempt was slower than the live kernel, so the default must take a full
+/// transaction commit and retire `log_root`.
 #[test]
-fn default_single_file_fsync_publishes_a_replayable_tree_log_bd_jhuob() {
+fn default_single_file_fsync_uses_full_transaction_commit_bd_jhuob() {
     init_tracing();
     let tmp = tempfile::TempDir::new().expect("temporary directory");
     let Some(image) = mkfs_btrfs_image(tmp.path(), "jhuob-default-single-file.btrfs") else {
@@ -255,22 +253,21 @@ fn default_single_file_fsync_publishes_a_replayable_tree_log_bd_jhuob() {
     // `false` is the shipping default.  The regression must use it explicitly,
     // rather than inherit a helper's historical ephemeral setting.
     let fs = open_rw(&cx, &image, false).expect("open default-policy btrfs mount");
-    create_and_log(&fs, &cx, "default-fast-fsync.bin");
-    drop(fs); // model a crash; a clean shutdown would hide a missing log.
+    create_and_log(&fs, &cx, "default-durable-fsync.bin");
+    drop(fs); // model a crash after the full transaction commit.
 
-    assert_ne!(
+    assert_eq!(
         on_disk_log_root(&image),
         0,
-        "bd-jhuob planted negative: default single-file fsync used a full transaction \
-         commit instead of publishing the tree log; this must fail before the default \
-         dispatch changes and must never be satisfied by a full-commit fallback"
+        "bd-jhuob regression: default single-file fsync published a tree log; the measured \
+         default policy is a full transaction commit, which must retire log_root"
     );
 
-    let recovered = open_ro(&cx, &image).expect("recover default-policy tree log");
+    let recovered = open_ro(&cx, &image).expect("recover default-policy full commit");
     assert_eq!(
-        read_back(&recovered, &cx, "default-fast-fsync.bin").as_deref(),
+        read_back(&recovered, &cx, "default-durable-fsync.bin").as_deref(),
         Some(LOGGED_CONTENT),
-        "the default-policy fsync published a log but recovery could not replay its file"
+        "the default-policy full commit did not make its file durable"
     );
 }
 

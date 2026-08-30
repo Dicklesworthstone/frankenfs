@@ -20528,3 +20528,5 @@ a corruption mechanism, not a slow filesystem. The response to this loss is a ch
 an unsafe one. Headroom is exact and non-speculative: `ext4_flush_boundary_via_jbd2` checkpoints
 SYNCHRONOUSLY every boundary while jbd2 batches and defers, so deferring the checkpoint takes us
 to 4.00 blocks / 2.00 flushes per op — kernel parity on both counted quantities.
+
+**2026-08-30 — bd-jhuob: LOSS, reverted.** Same-invocation 32-round/200-op direct-I/O-loop btrfs fsync H2H on `thinkstation1`: kernel A/A `k1/k2=0.985011` (passes the 0.97–1.03 rule), while the default tree-log candidate was `ffsA/k1=1.491340x` and `ffsB/k2=1.524774x` slower; ELF `bec957d52767745de52efdef3db302ae36b589408f4b223bbac455bfc10ed24e`, built via RCH worker `ovh-a` (51.222.245.56), fixture SHA `7bebc40716ed0b7ed5d7b9bc9a36219cfb86515880cfd6cd33277e26cabeda02`; default tree-log dispatch reverted to the durable full transaction commit.

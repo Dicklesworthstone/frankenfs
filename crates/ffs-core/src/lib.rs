@@ -31927,18 +31927,45 @@ impl OpenFs {
             return Ok(());
         }
 
-        // bd-jhuob: an eligible single-file fsync publishes the tree log by
-        // default. The helper retains the full-transaction fallback for log
-        // shapes it cannot represent (deletions, duplicate keys, or overflow).
-        self.btrfs_sync_tree_log_fast_path(cx, &operation_id, scenario_id, ino, datasync)
+        // Durable-by-default (bd-jdo53): retain the full transaction commit
+        // unless ephemeral mode is explicitly requested. bd-jhuob measured the
+        // default tree-log promotion 1.49x--1.52x slower than the live kernel,
+        // so it remains an opt-in strategy rather than a shipping regression.
+        if self.btrfs_rw_ephemeral_ok {
+            return self.btrfs_sync_ephemeral_tree_log(
+                cx,
+                &operation_id,
+                scenario_id,
+                ino,
+                datasync,
+            );
+        }
+
+        let writeback_stats = self.btrfs_full_transaction_commit(cx, &operation_id)?;
+
+        info!(
+            target: "ffs::btrfs::rw",
+            operation_id = %operation_id,
+            scenario_id,
+            outcome = "applied",
+            ino = ino.0,
+            datasync,
+            commit_strategy = "full_transaction_commit",
+            nodes_written = writeback_stats.nodes_written,
+            bytes_written = writeback_stats.bytes_written,
+            new_generation = writeback_stats.new_generation,
+            fsync_barrier_issued = writeback_stats.fsync_barrier_issued,
+            ephemeral_mode = false,
+            "btrfs_sync_applied"
+        );
+        Ok(())
     }
 
-    /// Tree-log fsync: MVCC flush plus the fast path for eligible mutations.
-    ///
-    /// The caller has already emitted the start record and checked writability.
-    /// Unsupported tree-log shapes deliberately fall back to a full transaction
-    /// commit rather than losing acknowledged changes.
-    fn btrfs_sync_tree_log_fast_path(
+    /// Ephemeral-mode (`--btrfs-rw-ephemeral-ok`) fsync: MVCC flush plus the
+    /// tree-log fast path instead of a full transaction commit. The caller has
+    /// already emitted the start record and checked writability; unsupported
+    /// tree-log shapes deliberately fall back to a full transaction commit.
+    fn btrfs_sync_ephemeral_tree_log(
         &self,
         cx: &Cx,
         operation_id: &str,
