@@ -1697,6 +1697,24 @@ impl Jbd2Writer {
             }
         }
 
+        // --- Barrier: the journalled body must be durable BEFORE the commit
+        // block that vouches for it (bd-4zjkz) ---
+        //
+        // Without this, nothing orders the descriptor/data/revoke writes above
+        // against the commit block below. A device free to reorder can land the
+        // commit block first; a crash in that window leaves a journal whose
+        // commit record is valid and whose data blocks are stale or absent, and
+        // replay then copies that garbage OVER good home blocks. That turns the
+        // journal from a recovery mechanism into a corruption mechanism — strictly
+        // worse than not journalling, because replay trusts what it finds.
+        //
+        // This is exactly why jbd2 issues a barrier (or writes the commit block
+        // FUA) between the two phases; `barrier_prefix_check.py` in the fsync rig
+        // exists to police the same property. The cost is one flush per
+        // transaction and it is not optional: a journal without this ordering is
+        // not a journal.
+        dev.sync(cx)?;
+
         // --- Final phase: commit block ---
         let mut commit = vec![0_u8; bs];
         encode_jbd2_header(&mut commit, JBD2_BLOCKTYPE_COMMIT, seq);
@@ -7977,6 +7995,125 @@ mod tests {
     fn blocks_needed_saturates_on_impossible_descriptor_geometry() {
         assert_eq!(Jbd2Writer::blocks_needed(8, 1, 0, false), u64::MAX);
         assert_eq!(Jbd2Writer::blocks_needed(12, 0, 1, false), u64::MAX);
+    }
+
+    /// Records the exact order of writes and barriers a device sees.
+    ///
+    /// Crash consistency here is settled by diffing the device WRITE/BARRIER
+    /// SEQUENCE rather than by injecting crashes: the ordering property is what
+    /// recovery depends on, and a sequence oracle tests it directly and
+    /// deterministically.
+    struct SeqRecordingDevice {
+        inner: MemBlockDevice,
+        events: std::sync::Mutex<Vec<String>>,
+    }
+
+    impl SeqRecordingDevice {
+        fn new(block_size: u32, block_count: u64) -> Self {
+            Self {
+                inner: MemBlockDevice::new(block_size, block_count),
+                events: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+        fn events(&self) -> Vec<String> {
+            self.events.lock().expect("events lock").clone()
+        }
+    }
+
+    impl BlockDevice for SeqRecordingDevice {
+        fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<ffs_block::BlockBuf> {
+            self.inner.read_block(cx, block)
+        }
+        fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
+            self.events
+                .lock()
+                .expect("events lock")
+                .push(format!("W{}", block.0));
+            self.inner.write_block(cx, block, data)
+        }
+        fn sync(&self, cx: &Cx) -> Result<()> {
+            self.events
+                .lock()
+                .expect("events lock")
+                .push("BARRIER".to_owned());
+            self.inner.sync(cx)
+        }
+        fn block_size(&self) -> u32 {
+            self.inner.block_size()
+        }
+        fn block_count(&self) -> u64 {
+            self.inner.block_count()
+        }
+    }
+
+    /// bd-4zjkz: the journalled BODY must be durable before the COMMIT BLOCK
+    /// that vouches for it — otherwise the journal is a corruption mechanism.
+    ///
+    /// Nothing ordered the descriptor/data writes against the commit block, so a
+    /// device free to reorder could land the commit block first. A crash in that
+    /// window leaves a journal whose commit record is VALID and whose data blocks
+    /// are stale, and replay then copies that garbage over good home blocks —
+    /// strictly worse than not journalling at all, because replay trusts what it
+    /// finds. This became a production concern the moment the ext4 durability
+    /// boundary started routing through `commit_transaction`.
+    ///
+    /// The oracle is the device's own write/barrier SEQUENCE, which is the thing
+    /// recovery actually depends on. The negative half is the load-bearing half:
+    /// it is not enough that a barrier exists somewhere, it must fall strictly
+    /// between the last body write and the commit block.
+    #[test]
+    fn commit_block_is_barriered_off_from_the_journal_body_bd_4zjkz() {
+        let cx = test_cx();
+        let dev = SeqRecordingDevice::new(512, 512);
+        let region = JournalRegion {
+            start: BlockNumber(0),
+            blocks: 16,
+        };
+        let mut writer = Jbd2Writer::new(region, 1);
+        let mut txn = writer.begin_transaction();
+        txn.add_write(BlockNumber(300), vec![0x11; 512]);
+        txn.add_write(BlockNumber(301), vec![0x22; 512]);
+        writer
+            .commit_transaction(&cx, &dev, &txn)
+            .expect("commit transaction");
+
+        let events = dev.events();
+        let barrier = events
+            .iter()
+            .position(|e| e == "BARRIER")
+            .unwrap_or_else(|| {
+                panic!("no barrier was issued at all; sequence was {events:?}")
+            });
+        let last_write = events
+            .iter()
+            .rposition(|e| e.starts_with('W'))
+            .expect("at least one write");
+
+        // The commit block is the LAST write of the transaction.
+        assert!(
+            barrier < last_write,
+            "the barrier must precede the commit block write, but the sequence was \
+             {events:?} — a commit block that can reach the device before the body \
+             it describes makes replay copy stale journal data over good home blocks"
+        );
+        // …and it must come AFTER the body, not merely somewhere earlier: at least
+        // one write has to precede it, or the barrier is ordering nothing.
+        assert!(
+            barrier > 0 && events[..barrier].iter().any(|e| e.starts_with('W')),
+            "the barrier must fall AFTER the journal body writes, not before them; \
+             sequence was {events:?}"
+        );
+        // Exactly one write after the barrier: the commit block alone.
+        let after: Vec<_> = events[barrier + 1..]
+            .iter()
+            .filter(|e| e.starts_with('W'))
+            .collect();
+        assert_eq!(
+            after.len(),
+            1,
+            "exactly one write (the commit block) must follow the barrier, got \
+             {after:?} in {events:?}"
+        );
     }
 
     /// bd-4zjkz: a real `mkfs.ext4` internal journal is FRAGMENTED — measured
