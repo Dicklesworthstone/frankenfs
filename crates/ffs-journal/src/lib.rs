@@ -1062,8 +1062,19 @@ impl Jbd2Transaction {
 /// counterpart needed for compatibility-mode ext4 writes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Jbd2Writer {
-    region: JournalRegion,
-    /// Next free index within the journal region (region-relative).
+    /// The journal's on-disk extents, in order.
+    ///
+    /// NOT a single contiguous region: a real `mkfs.ext4` internal journal is
+    /// fragmented — measured `[(15,10), (26,15), (1066,999)]` on a stock 64 MiB
+    /// image — so a writer that could only address one run could not journal a
+    /// real ext4 filesystem at all (bd-4zjkz). The REPLAY side already took
+    /// segments (`replay_jbd2_segments`); this closes the asymmetry where the
+    /// reader understood the real on-disk shape and the writer assumed an
+    /// idealised one.
+    segments: Vec<JournalSegment>,
+    /// Sum of `segments[..].blocks`, i.e. the journal's capacity.
+    total_blocks: u64,
+    /// Next free index, journal-relative (walks across segments in order).
     head: u64,
     /// Lowest index a transaction may occupy: 0 for a bare region, 1 when the
     /// region opens with a JBD2 superblock at its first block. This is where
@@ -1103,11 +1114,37 @@ fn assemble_jbd2_descriptor_data_run(
 }
 
 impl Jbd2Writer {
-    /// Create a writer for an empty journal region starting at `start_seq`.
+    /// Create a writer over a journal's on-disk EXTENTS, starting at `start_seq`.
+    ///
+    /// This is the constructor a real ext4 image needs: its internal journal is
+    /// routinely fragmented, and [`Jbd2Writer::new`] can only express a single
+    /// contiguous run (bd-4zjkz).
+    #[must_use]
+    pub fn new_segmented(segments: Vec<JournalSegment>, start_seq: u32) -> Self {
+        let total_blocks = segments.iter().map(|s| s.blocks).sum();
+        Self {
+            segments,
+            total_blocks,
+            head: 0,
+            base_head: 0,
+            next_seq: start_seq,
+            is_64bit: false,
+            tag_format: Jbd2TagFormat::Legacy,
+            has_checksum: false,
+            csum_seed: 0,
+        }
+    }
+
+    /// Create a writer for an empty, CONTIGUOUS journal region starting at
+    /// `start_seq`. Equivalent to [`Jbd2Writer::new_segmented`] with one segment.
     #[must_use]
     pub fn new(region: JournalRegion, start_seq: u32) -> Self {
         Self {
-            region,
+            segments: vec![JournalSegment {
+                start: region.start,
+                blocks: region.blocks,
+            }],
+            total_blocks: region.blocks,
             head: 0,
             base_head: 0,
             next_seq: start_seq,
@@ -1127,7 +1164,11 @@ impl Jbd2Writer {
         csum_seed: u32,
     ) -> Self {
         Self {
-            region,
+            segments: vec![JournalSegment {
+                start: region.start,
+                blocks: region.blocks,
+            }],
+            total_blocks: region.blocks,
             head: 0,
             base_head: 0,
             next_seq: start_seq,
@@ -1197,7 +1238,11 @@ impl Jbd2Writer {
         }
 
         Ok(Self {
-            region,
+            segments: vec![JournalSegment {
+                start: region.start,
+                blocks: region.blocks,
+            }],
+            total_blocks: region.blocks,
             head,
             base_head,
             next_seq: max_seq,
@@ -1206,6 +1251,67 @@ impl Jbd2Writer {
             has_checksum,
             csum_seed,
         })
+    }
+
+    /// Open a FRAGMENTED journal for writing, inheriting its on-disk format
+    /// (64-bit tags, checksum feature and seed) from the JBD2 superblock in its
+    /// first block (bd-4zjkz).
+    ///
+    /// ⚠ PRECONDITION: the journal must already have been REPLAYED, so that it
+    /// holds nothing this writer needs to preserve. Unlike [`Jbd2Writer::open`]
+    /// this does NOT scan forward for a committed tail — it starts writing at the
+    /// first block after the superblock. Mount-time replay is what establishes
+    /// that precondition; calling this on an unreplayed journal would overwrite
+    /// transactions that were never applied.
+    ///
+    /// Inheriting the format flags rather than defaulting them is what keeps the
+    /// resulting journal readable by the KERNEL: a checksummed journal written
+    /// with legacy tags is not a journal the kernel will replay.
+    pub fn open_segmented(
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        segments: Vec<JournalSegment>,
+        start_seq: u32,
+    ) -> Result<Self> {
+        let total_blocks: u64 = segments.iter().map(|s| s.blocks).sum();
+        if total_blocks == 0 {
+            return Err(FfsError::Format(
+                "journal has no blocks: refusing to open it for writing".to_owned(),
+            ));
+        }
+        let first = resolve_segment_block(&segments, 0, total_blocks)?;
+        let raw = dev.read_block(cx, first)?;
+
+        let mut is_64bit = false;
+        let mut tag_format = Jbd2TagFormat::Legacy;
+        let mut has_checksum = false;
+        let mut csum_seed = 0_u32;
+        let mut base_head = 0_u64;
+        if let Some(sb) = Jbd2Superblock::parse(raw.as_slice()) {
+            is_64bit = sb.is_64bit();
+            tag_format = sb.tag_format();
+            has_checksum = sb.has_checksum();
+            csum_seed = sb.csum_seed();
+            base_head = 1; // never write over the superblock
+        }
+
+        Ok(Self {
+            segments,
+            total_blocks,
+            head: base_head,
+            base_head,
+            next_seq: start_seq,
+            is_64bit,
+            tag_format,
+            has_checksum,
+            csum_seed,
+        })
+    }
+
+    /// The journal's extents, in order.
+    #[must_use]
+    pub fn segments(&self) -> &[JournalSegment] {
+        &self.segments
     }
 
     /// Reclaim the whole journal region after its committed transactions have
@@ -1265,7 +1371,7 @@ impl Jbd2Writer {
     /// Number of free blocks remaining in the journal region.
     #[must_use]
     pub fn free_blocks(&self) -> u64 {
-        self.region.blocks.saturating_sub(self.head)
+        self.total_blocks.saturating_sub(self.head)
     }
 
     /// Compute how many journal blocks a transaction with `writes` data blocks
@@ -1619,10 +1725,12 @@ impl Jbd2Writer {
 
     /// Allocate the next journal block, advancing head.
     fn alloc_block(&self, head: &mut u64) -> Result<BlockNumber> {
-        if *head >= self.region.blocks {
+        if *head >= self.total_blocks {
             return Err(FfsError::NoSpace);
         }
-        let block = resolve_region_block(self.region, *head)?;
+        // Walks the extent list, so a fragmented journal allocates correctly
+        // rather than running off the end of its first run (bd-4zjkz).
+        let block = resolve_segment_block(&self.segments, *head, self.total_blocks)?;
         *head = head.saturating_add(1);
         Ok(block)
     }
@@ -7869,6 +7977,66 @@ mod tests {
     fn blocks_needed_saturates_on_impossible_descriptor_geometry() {
         assert_eq!(Jbd2Writer::blocks_needed(8, 1, 0, false), u64::MAX);
         assert_eq!(Jbd2Writer::blocks_needed(12, 0, 1, false), u64::MAX);
+    }
+
+    /// bd-4zjkz: a real `mkfs.ext4` internal journal is FRAGMENTED — measured
+    /// `[(15,10), (26,15), (1066,999)]` on a stock 64 MiB image — so a writer
+    /// that can only address one contiguous run cannot journal a real ext4
+    /// filesystem at all. This pins that a transaction spanning an extent
+    /// boundary lands in the SECOND extent's blocks and not in whatever happens
+    /// to follow the first, which is user data.
+    #[test]
+    fn writer_allocates_across_a_fragmented_journals_extents_bd_4zjkz() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 4096);
+        // Two small, non-adjacent extents, mirroring the measured shape.
+        let segments = vec![
+            JournalSegment {
+                start: BlockNumber(15),
+                blocks: 2,
+            },
+            JournalSegment {
+                start: BlockNumber(1066),
+                blocks: 6,
+            },
+        ];
+        let mut writer = Jbd2Writer::new_segmented(segments, 1);
+        assert_eq!(writer.free_blocks(), 8, "capacity is the SUM of the extents");
+
+        // One transaction of 2 data blocks needs descriptor + 2 + commit = 4
+        // blocks, so it cannot fit in the 2-block first extent and must continue
+        // into the second.
+        let mut txn = writer.begin_transaction();
+        txn.add_write(BlockNumber(300), vec![0x11; 512]);
+        txn.add_write(BlockNumber(301), vec![0x22; 512]);
+        writer
+            .commit_transaction(&cx, &dev, &txn)
+            .expect("a fragmented journal must accept a transaction that spans its extents");
+
+        // The blocks immediately after the first extent (17, 18, ...) are NOT
+        // part of the journal. If the writer had treated the journal as one run
+        // starting at 15, it would have written there — over live filesystem
+        // data. They must be untouched.
+        for stray in [17_u64, 18, 19, 20] {
+            let raw = dev
+                .read_block(&cx, BlockNumber(stray))
+                .expect("read block past the first extent");
+            assert!(
+                raw.as_slice().iter().all(|&b| b == 0),
+                "block {stray} lies past the journal's first extent and must never be \
+                 written — a non-zero byte here is the writer running off the end of \
+                 one run and corrupting whatever follows it"
+            );
+        }
+
+        // …and the second extent must actually carry the overflow.
+        let second = dev
+            .read_block(&cx, BlockNumber(1066))
+            .expect("read first block of the second extent");
+        assert!(
+            second.as_slice().iter().any(|&b| b != 0),
+            "the transaction outgrew the first extent, so the second must hold part of it"
+        );
     }
 
     /// bd-4zjkz: without reclaim, a journalled mount writes until the region
