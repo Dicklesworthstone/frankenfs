@@ -20507,3 +20507,24 @@ for the incumbent arms, with the candidate arm as the one unresolved step and it
 in place. No number is claimed. `hostname=thinkstation1` (orchestration), worker `hz3`.
 
 ## 2026-08-30 — bd-warm-stat-is-the-fuse-floor-4wxw9: REJECT 300 s attr/entry TTL; live ABBA remains 9.04x slower on warm stat and 6.63x slower on readdir+stat versus kernel ext4, while each candidate arm still pays one `security.capability` GETXATTR crossing per stat; reverted.
+
+## 2026-08-30 — bd-4zjkz: LOSS 1.540x vs journalled kernel ext4 fsync after barriering the JBD2 commit block; NOT reverted because the barrier is a correctness requirement, not a perf lever
+
+Routing the mounted ext4 durability boundary through JBD2 (`ef2f21028`) and then barriering the
+journal body off from its commit block (`79e90b817`) costs **1.540x vs live journalled kernel
+ext4**, worst bound, both A/A nulls holding in the replicate (kernel `k1/k2 = 1.027357`,
+candidate `ffsA/ffsA2 = 0.996457`, n=48 each; run 1's candidate null failed at 0.954497 but its
+range [1.446, 1.624] contains run 2's [1.507, 1.540], so the runs agree). ELF
+`c6cb3dea7b07906e841a739a133b48a2d776c2e4a4492a8e63de4d291030977f` built on worker `hz2` via
+`rch exec --job --result-dir`, measured on `thinkstation1`, 5 arms each on its own loop device
+`--direct-io=on`, 48 rounds x 8 ops. Mechanism is counted and consistent: we write 6.00 blocks
+and 3.00 flushes per op against the kernel's 4.00 and 2.00 — 1.50x on both — and land at 1.54x on
+wall. This REPLACES the withdrawn `1.022x` (measured before the barrier existed) and the
+long-withdrawn `0.182706x` (unjournalled vs journalled, never a comparison).
+
+**Not reverted, deliberately.** Reverting restores a state where the commit block can become
+durable before the body it describes, so replay copies stale journal data over good home blocks —
+a corruption mechanism, not a slow filesystem. The response to this loss is a cheaper journal, not
+an unsafe one. Headroom is exact and non-speculative: `ext4_flush_boundary_via_jbd2` checkpoints
+SYNCHRONOUSLY every boundary while jbd2 batches and defers, so deferring the checkpoint takes us
+to 4.00 blocks / 2.00 flushes per op — kernel parity on both counted quantities.
