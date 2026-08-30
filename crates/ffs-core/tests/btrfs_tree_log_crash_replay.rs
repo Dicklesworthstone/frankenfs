@@ -209,6 +209,14 @@ fn tree_logged_fsync_survives_the_full_commit_after_recovery_bd_jhuob() {
         .expect("full transaction commit on the recovery mount");
     drop(recovered);
 
+    assert_eq!(
+        on_disk_log_root(&image),
+        0,
+        "the recovery fence must retire the replayed tree log only after folding it into \
+         the full transaction; a replacement log would hide earlier acknowledged entries \
+         from the next mount (bd-jhuob)"
+    );
+
     // 5. Fresh mount. `log_root` is retired, so nothing is being served by the
     //    overlay any more — whatever is readable here is what the commit wrote.
     let after = open_ro(&cx, &image).expect("post-commit mount");
