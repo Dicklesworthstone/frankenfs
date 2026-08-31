@@ -119,7 +119,7 @@ use std::fs::{self, File, OpenOptions};
 use std::hint::black_box;
 use std::io::{BufRead, BufReader, Read, Write};
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
-use std::os::unix::fs::{FileExt, MetadataExt};
+use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::{
@@ -176,7 +176,9 @@ const DEFAULT_FUSE_CPUS: usize = 1;
 const MAX_CLIENT_THREADS: usize = 4096;
 const PARALLEL_READ_FILE_BYTES: usize = 256 * 1024;
 const BULK_DURABLE_FILE: &str = "bulk-durable.bin";
+const DIRECT_DURABLE_FILE: &str = "direct-durable.bin";
 const BULK_DURABLE_CHUNK_BYTES: usize = 1024 * 1024;
+const DIRECT_DURABLE_ALIGNMENT: usize = 4096;
 const BULK_DURABLE_IMAGE_HEADROOM_BYTES: u64 = 64 * 1024 * 1024;
 const XATTR_INLINE_FILE: &str = "xattr-inline.bin";
 const XATTR_EXTERNAL_FILE: &str = "xattr-external.bin";
@@ -252,6 +254,7 @@ enum Workload {
     ReaddirStat8,
     FsyncJournalCommit,
     BulkDurableWrite,
+    DirectDurableWrite,
     XattrGetListReport,
 }
 
@@ -266,6 +269,7 @@ impl Workload {
             Self::ReaddirStat8 => "large_directory_readdir_stat_8t",
             Self::FsyncJournalCommit => "fsync_journal_commit",
             Self::BulkDurableWrite => "bulk_durable_write",
+            Self::DirectDurableWrite => "direct_durable_write",
             Self::XattrGetListReport => "xattr_get_list_report",
         }
     }
@@ -277,6 +281,7 @@ impl Workload {
                 | Self::CreateDeleteStorm
                 | Self::FsyncJournalCommit
                 | Self::BulkDurableWrite
+                | Self::DirectDurableWrite
         )
     }
 
@@ -302,6 +307,7 @@ impl Workload {
             | Self::CreateDeleteStorm
             | Self::FsyncJournalCommit
             | Self::BulkDurableWrite
+            | Self::DirectDurableWrite
             | Self::XattrGetListReport => 1,
         }
     }
@@ -312,6 +318,9 @@ impl Workload {
             Self::CreateDeleteStorm => "create_fsyncdir_delete_fsyncdir",
             Self::FsyncJournalCommit => "write_4k_then_fsync_each_operation",
             Self::BulkDurableWrite => "overwrite_1m_chunks_then_single_file_fsync",
+            Self::DirectDurableWrite => {
+                "overwrite_preallocated_1m_chunks_with_o_direct_then_single_file_fsync"
+            }
             Self::WarmStat
             | Self::ParallelRead8
             | Self::ParallelRead8ColdCache
@@ -334,6 +343,7 @@ impl Workload {
             | Self::CreateDeleteStorm
             | Self::FsyncJournalCommit
             | Self::BulkDurableWrite
+            | Self::DirectDurableWrite
             | Self::XattrGetListReport => {
                 "single Linux benchmark-driver TID observed before and after each timed batch"
             }
@@ -383,6 +393,12 @@ impl Workload {
                 "one bulk durable output job: overwrite one preallocated file with {operations} \
                  sequential {BULK_DURABLE_CHUNK_BYTES}-byte positioned writes ({} total bytes), \
                  then fsync the file once",
+                operations.saturating_mul(BULK_DURABLE_CHUNK_BYTES)
+            ),
+            Self::DirectDurableWrite => format!(
+                "one direct durable output job: open one preallocated file with O_DIRECT, \
+                 overwrite it with {operations} sequential {BULK_DURABLE_CHUNK_BYTES}-byte \
+                 4096-byte-aligned positioned writes ({} total bytes), then fsync the file once",
                 operations.saturating_mul(BULK_DURABLE_CHUNK_BYTES)
             ),
             Self::XattrGetListReport => format!(
@@ -474,6 +490,17 @@ impl Workload {
                 "total_bytes_written": operations.saturating_mul(BULK_DURABLE_CHUNK_BYTES),
                 "preallocated_fixed_length_file": true,
                 "entire_file_overwritten": true,
+                "final_bytes_and_sha256_validated_outside_timing": true,
+            }),
+            Self::DirectDurableWrite => json!({
+                "positioned_writes": operations,
+                "bytes_per_write": BULK_DURABLE_CHUNK_BYTES,
+                "file_fsyncs": 1,
+                "total_bytes_written": operations.saturating_mul(BULK_DURABLE_CHUNK_BYTES),
+                "preallocated_fixed_length_file": true,
+                "entire_file_overwritten": true,
+                "open_flag": "O_DIRECT",
+                "buffer_and_offsets_alignment_bytes": DIRECT_DURABLE_ALIGNMENT,
                 "final_bytes_and_sha256_validated_outside_timing": true,
             }),
             Self::XattrGetListReport => json!({
@@ -1456,7 +1483,8 @@ fn usage() {
                                           parallel-read-8t | parallel-read-8t-cold-cache |\n\
                                           create-delete-storm |\n\
                                           readdir-stat-8t | fsync-journal-commit |\n\
-                                          bulk-durable-write | xattr-get-list-report\n\
+                                          bulk-durable-write | direct-durable-write |\n\
+                                          xattr-get-list-report\n\
            --artifact-root PATH           Persistent artifacts under /data/tmp\n\
            --pairs N                      Paired rounds, multiple of 4 and >= 12 (default 32;\n\
                                           with a candidate comparison the schedule period is\n\
@@ -1584,9 +1612,10 @@ fn parse_workload(value: &str) -> Result<Workload> {
         "readdir-stat-8t" => Ok(Workload::ReaddirStat8),
         "fsync-journal-commit" => Ok(Workload::FsyncJournalCommit),
         "bulk-durable-write" => Ok(Workload::BulkDurableWrite),
+        "direct-durable-write" => Ok(Workload::DirectDurableWrite),
         "xattr-get-list-report" => Ok(Workload::XattrGetListReport),
         _ => bail!(
-            "unsupported --workload {value}; expected warm-stat|parallel-metadata-write|parallel-read-8t|parallel-read-8t-cold-cache|create-delete-storm|readdir-stat-8t|fsync-journal-commit|bulk-durable-write|xattr-get-list-report"
+            "unsupported --workload {value}; expected warm-stat|parallel-metadata-write|parallel-read-8t|parallel-read-8t-cold-cache|create-delete-storm|readdir-stat-8t|fsync-journal-commit|bulk-durable-write|direct-durable-write|xattr-get-list-report"
         ),
     }
 }
@@ -1678,10 +1707,14 @@ fn validate_host_quiet_budget(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Bulk-durable-write stages the payload plus fixed fixture/headroom bytes, so
-/// the image must actually hold them. Overflow fails CLOSED rather than wrapping.
-fn validate_bulk_durable_image_capacity(config: &Config) -> Result<()> {
-    if config.workload != Workload::BulkDurableWrite {
+/// Both durable-overwrite rows stage the payload plus fixed fixture/headroom
+/// bytes, so the image must actually hold them. Overflow fails CLOSED rather
+/// than wrapping.
+fn validate_durable_overwrite_image_capacity(config: &Config) -> Result<()> {
+    if !matches!(
+        config.workload,
+        Workload::BulkDurableWrite | Workload::DirectDurableWrite
+    ) {
         return Ok(());
     }
     let payload_bytes = u64::try_from(bulk_durable_total_bytes(config.operations)?)
@@ -1696,7 +1729,8 @@ fn validate_bulk_durable_image_capacity(config: &Config) -> Result<()> {
         .ok_or_else(|| anyhow!("image byte count overflow"))?;
     ensure!(
         required_bytes <= image_bytes,
-        "bulk-durable-write requires at least {} image bytes for {} payload bytes plus fixed fixture/headroom, but --image-size-mib={} provides {image_bytes}",
+        "{} requires at least {} image bytes for {} payload bytes plus fixed fixture/headroom, but --image-size-mib={} provides {image_bytes}",
+        config.workload.label(),
         required_bytes,
         payload_bytes,
         config.image_size_mib
@@ -1791,7 +1825,7 @@ fn validate_config(config: &Config) -> Result<()> {
             || config.filesystems == RequestedFilesystems::Ext4,
         "xattr-get-list-report currently requires --filesystem ext4 because its inline/external storage-shape proof is ext4-specific"
     );
-    validate_bulk_durable_image_capacity(config)?;
+    validate_durable_overwrite_image_capacity(config)?;
     Ok(())
 }
 
@@ -2303,9 +2337,14 @@ fn create_fixture_tree(run_dir: &Path, config: &Config) -> Result<PathBuf> {
         Workload::FsyncJournalCommit => {
             write_fixture_file(&root.join("fsync.bin"), 4096, 0xF5)?;
         }
-        Workload::BulkDurableWrite => {
+        Workload::BulkDurableWrite | Workload::DirectDurableWrite => {
+            let file = match config.workload {
+                Workload::BulkDurableWrite => BULK_DURABLE_FILE,
+                Workload::DirectDurableWrite => DIRECT_DURABLE_FILE,
+                _ => unreachable!("durable fixture workload was matched above"),
+            };
             write_fixture_file(
-                &root.join(BULK_DURABLE_FILE),
+                &root.join(file),
                 bulk_durable_total_bytes(config.operations)?,
                 0xB7,
             )?;
@@ -3641,12 +3680,13 @@ fn bulk_durable_sequence_byte(sequence: usize) -> u8 {
     u8::try_from(((sequence % 251) * 37 + 113) % 251).expect("bulk durable sequence byte fits u8")
 }
 
-fn bulk_durable_write_witness(
+fn durable_write_witness(
     root: &Path,
+    file_name: &str,
     expected_bytes: usize,
     expected_uniform_byte: Option<u8>,
 ) -> Result<BulkDurableWriteWitness> {
-    let path = root.join(BULK_DURABLE_FILE);
+    let path = root.join(file_name);
     let mut file = File::open(&path)
         .with_context(|| format!("open bulk durable witness {}", path.display()))?;
     let metadata = file
@@ -3687,6 +3727,32 @@ fn bulk_durable_write_witness(
         bytes: metadata.len(),
         uniform_byte: expected_uniform_byte,
     })
+}
+
+fn bulk_durable_write_witness(
+    root: &Path,
+    expected_bytes: usize,
+    expected_uniform_byte: Option<u8>,
+) -> Result<BulkDurableWriteWitness> {
+    durable_write_witness(
+        root,
+        BULK_DURABLE_FILE,
+        expected_bytes,
+        expected_uniform_byte,
+    )
+}
+
+fn direct_durable_write_witness(
+    root: &Path,
+    expected_bytes: usize,
+    expected_uniform_byte: Option<u8>,
+) -> Result<BulkDurableWriteWitness> {
+    durable_write_witness(
+        root,
+        DIRECT_DURABLE_FILE,
+        expected_bytes,
+        expected_uniform_byte,
+    )
 }
 
 fn list_xattr_names(path: &Path) -> Result<Vec<Vec<u8>>> {
@@ -4177,11 +4243,43 @@ fn create_delete_storm_batch(root: &Path, operations: usize) -> Result<(u64, u64
 /// Decode the deliberately tiny child protocol used to bound a mutating FUSE
 /// batch. Keeping this separate from the workload result makes a partial line
 /// from a killed child a hard error rather than a zero-duration observation.
-fn parse_mutating_batch_result(line: &str) -> Result<(u64, u64)> {
-    let (elapsed, digest) = line
-        .trim()
-        .split_once(',')
+/// Parse `elapsed,digest[,sequence]` from a bounded mutating batch child.
+///
+/// `expected_sequence` is the sequence the PARENT handed the child. When the
+/// child echoes one back it MUST match, and that check is the whole reason the
+/// third field exists (bd-xtnk1).
+///
+/// WHY AN ECHO IS NECESSARY HERE, and why the harness's existing gates do not
+/// cover it. Routing a workload through a subprocess is per-WORKLOAD, not
+/// per-arm, so kernel and FUSE arms alike run the same child. A child that
+/// dropped or mangled `sequence` would therefore produce the same wrong result
+/// on every arm, and:
+///   - the arm-parity gate compares arms against each other, so a UNIFORM bug
+///     passes it;
+///   - the cross-round gate requires digest STABILITY, which a dropped sequence
+///     makes easier to satisfy, not harder;
+///   - the sequence-advance gate validates the PARENT's counters and says
+///     nothing about the child's use of the value.
+/// The failure mode would be silently wrong fsync and bulk-durable-write
+/// timings that pass every existing check. Echoing the sequence back turns that
+/// into a fail-closed error.
+///
+/// The two-field form stays accepted so a workload that genuinely has no
+/// sequence (create-delete-storm) is unchanged.
+fn parse_mutating_batch_result(line: &str, expected_sequence: Option<usize>) -> Result<(u64, u64)> {
+    let trimmed = line.trim();
+    let mut fields = trimmed.split(',');
+    let elapsed = fields
+        .next()
         .ok_or_else(|| anyhow!("mutating batch child emitted malformed result {line:?}"))?;
+    let digest = fields
+        .next()
+        .ok_or_else(|| anyhow!("mutating batch child emitted malformed result {line:?}"))?;
+    let echoed = fields.next();
+    ensure!(
+        fields.next().is_none(),
+        "mutating batch child emitted too many fields in {line:?}"
+    );
     let elapsed = elapsed
         .parse::<u64>()
         .with_context(|| format!("parse mutating batch elapsed {elapsed:?}"))?;
@@ -4192,6 +4290,24 @@ fn parse_mutating_batch_result(line: &str) -> Result<(u64, u64)> {
         elapsed > 0,
         "mutating batch child reported a zero elapsed duration"
     );
+    if let Some(expected) = expected_sequence {
+        let echoed = echoed.ok_or_else(|| {
+            anyhow!(
+                "mutating batch child did not echo its sequence; the parent passed \
+                 {expected} and cannot confirm the child used it, so the timing is \
+                 not trustworthy (bd-xtnk1)"
+            )
+        })?;
+        let echoed: usize = echoed
+            .parse()
+            .with_context(|| format!("parse mutating batch echoed sequence {echoed:?}"))?;
+        ensure!(
+            echoed == expected,
+            "mutating batch child echoed sequence {echoed} but the parent passed \
+             {expected}: the child is not running the sequence it was given, which \
+             would silently mis-time this workload on every arm at once (bd-xtnk1)"
+        );
+    }
     Ok((elapsed, digest))
 }
 
@@ -4200,16 +4316,46 @@ fn parse_mutating_batch_result(line: &str) -> Result<(u64, u64)> {
 /// unwinds through their existing Drop cleanup instead of leaving rw mounts
 /// owned by a stuck workload thread.
 fn create_delete_storm_batch_bounded(root: &Path, operations: usize) -> Result<(u64, u64)> {
+    mutating_batch_bounded("create-delete-storm", root, operations, None)
+}
+
+/// Run a serial MUTATING workload in a bounded subprocess (bd-xtnk1).
+///
+/// Generalised from the create-delete-storm-only version. `FsyncJournalCommit`
+/// and `BulkDurableWrite` were still running in-process and unbounded, and both
+/// mutate a `--rw` mount, so both were exposed to the same hang class this bead
+/// reports: the root cause was a `fuse_reverse_inval_entry` deadlock that fired
+/// on the FIRST WRITE TO ANY `--rw` mount (fixed in 805115c65), which is not
+/// specific to create/delete.
+///
+/// `sequence` is threaded through and ECHOED BACK by the child, then verified by
+/// `parse_mutating_batch_result`. Without that echo a child that dropped the
+/// value would mis-time the workload identically on every arm and pass every
+/// existing gate — see that function's comment for why arm-parity, cross-round
+/// and sequence-advance all miss it.
+fn mutating_batch_bounded(
+    workload: &str,
+    root: &Path,
+    operations: usize,
+    sequence: Option<usize>,
+) -> Result<(u64, u64)> {
     let executable = env::current_exe().context("resolve mounted comparator executable")?;
-    let mut child = Command::new(executable)
+    let mut command = Command::new(executable);
+    command
         .arg("--mutating-batch-child")
-        .arg("create-delete-storm")
+        .arg(workload)
         .arg(root)
-        .arg(operations.to_string())
+        .arg(operations.to_string());
+    if let Some(sequence) = sequence {
+        command.arg(sequence.to_string());
+    }
+    let mut child = command
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| format!("spawn bounded create/delete batch for {}", root.display()))?;
+        .with_context(|| {
+            format!("spawn bounded {workload} batch for {}", root.display())
+        })?;
     let deadline = Instant::now() + MUTATING_BATCH_TIMEOUT;
     let status = loop {
         if let Some(status) = child.try_wait().context("poll mutating batch child")? {
@@ -4219,7 +4365,7 @@ fn create_delete_storm_batch_bounded(root: &Path, operations: usize) -> Result<(
             let _ = child.kill();
             let status = child.wait().context("wait for killed mutating batch child")?;
             bail!(
-                "mutating workload deadline elapsed after {} ms in phase=create-delete-storm, root={}; child killed with status {status}; mounted arms will now be unmounted and reaped",
+                "mutating workload deadline elapsed after {} ms in phase={workload}, root={}; child killed with status {status}; mounted arms will now be unmounted and reaped",
                 MUTATING_BATCH_TIMEOUT.as_millis(),
                 root.display(),
             );
@@ -4242,23 +4388,66 @@ fn create_delete_storm_batch_bounded(root: &Path, operations: usize) -> Result<(
         .context("read mutating batch child stderr")?;
     ensure!(
         status.success(),
-        "mutating batch child failed in phase=create-delete-storm: status={status}; stderr={}",
+        "mutating batch child failed in phase={workload}: status={status}; stderr={}",
         stderr.trim()
     );
-    parse_mutating_batch_result(&stdout)
+    parse_mutating_batch_result(&stdout, sequence)
 }
 
+/// Child side of the bounded mutating batch (bd-xtnk1).
+///
+/// Protocol: `--mutating-batch-child <workload> <root> <operations> [sequence]`.
+/// The workload name is dispatched explicitly and an unknown one is REFUSED —
+/// silently accepting it would let the parent think it timed workload A while
+/// the child ran workload B.
+///
+/// When a sequence is supplied it is ECHOED BACK as a third output field so the
+/// parent can verify the child actually used the value it was handed. See
+/// `parse_mutating_batch_result` for why none of the harness's existing gates
+/// would catch a child that dropped it.
 fn run_mutating_batch_child(args: &[String]) -> Result<ExitCode> {
     ensure!(
-        args.len() == 4 && args[1] == "create-delete-storm",
-        "invalid --mutating-batch-child arguments"
+        (4..=5).contains(&args.len()),
+        "invalid --mutating-batch-child arguments: expected \
+         <workload> <root> <operations> [sequence], got {:?}",
+        &args[1..]
     );
+    let workload = args[1].as_str();
     let root = Path::new(&args[2]);
     let operations = args[3]
         .parse::<usize>()
         .with_context(|| format!("parse child operations {:?}", args[3]))?;
-    let (elapsed, digest) = create_delete_storm_batch(root, operations)?;
-    println!("{elapsed},{digest}");
+    let sequence = match args.get(4) {
+        Some(raw) => Some(
+            raw.parse::<usize>()
+                .with_context(|| format!("parse child sequence {raw:?}"))?,
+        ),
+        None => None,
+    };
+
+    let (elapsed, digest) = match (workload, sequence) {
+        ("create-delete-storm", None) => create_delete_storm_batch(root, operations)?,
+        ("fsync-journal-commit", Some(sequence)) => {
+            fsync_journal_batch(root, operations, sequence)?
+        }
+        ("bulk-durable-write", Some(sequence)) => {
+            bulk_durable_write_batch(root, operations, sequence)?
+        }
+        // A workload that needs a sequence but was given none (or vice versa) is
+        // a protocol error, not something to paper over with a default: running
+        // with the wrong sequence is exactly the silent mis-timing this design
+        // exists to prevent.
+        (name, seq) => bail!(
+            "unsupported --mutating-batch-child workload {name:?} with sequence \
+             {seq:?}; create-delete-storm takes no sequence, fsync-journal-commit \
+             and bulk-durable-write require one"
+        ),
+    };
+
+    match sequence {
+        Some(sequence) => println!("{elapsed},{digest},{sequence}"),
+        None => println!("{elapsed},{digest}"),
+    }
     Ok(ExitCode::SUCCESS)
 }
 
@@ -4447,8 +4636,23 @@ fn workload_batch(
             unreachable!("parallel workloads handled above")
         }
         Workload::CreateDeleteStorm => create_delete_storm_batch_bounded(root, config.operations)?,
-        Workload::FsyncJournalCommit => fsync_journal_batch(root, config.operations, sequence)?,
-        Workload::BulkDurableWrite => bulk_durable_write_batch(root, config.operations, sequence)?,
+        // bd-xtnk1: both of these mutate a --rw mount and were previously run
+        // in-process with NOTHING bounding them, so a recurrence of the
+        // first-write deadlock would hang the comparator indefinitely while
+        // holding rw FUSE mounts on a shared host. Bounded now, on the same
+        // subprocess path create-delete-storm already used.
+        Workload::FsyncJournalCommit => mutating_batch_bounded(
+            "fsync-journal-commit",
+            root,
+            config.operations,
+            Some(sequence),
+        )?,
+        Workload::BulkDurableWrite => mutating_batch_bounded(
+            "bulk-durable-write",
+            root,
+            config.operations,
+            Some(sequence),
+        )?,
         Workload::XattrGetListReport => xattr_get_list_report_batch(root, config.operations)?,
     };
     let driver_tid_after = current_linux_tid()?;
@@ -8941,15 +9145,68 @@ mod tests {
     #[test]
     fn mutating_batch_child_result_rejects_partial_or_zero_records_bd_xtnk1() {
         assert_eq!(
-            super::parse_mutating_batch_result("17,23").expect("complete child record"),
+            super::parse_mutating_batch_result("17,23", None).expect("complete child record"),
             (17, 23)
         );
-        for malformed in ["", "17", "0,23", "17,", "17,23,29", "no,23"] {
+        for malformed in ["", "17", "0,23", "17,", "17,23,29,31", "no,23"] {
             assert!(
-                super::parse_mutating_batch_result(malformed).is_err(),
+                super::parse_mutating_batch_result(malformed, None).is_err(),
                 "a killed or malformed child record must fail closed: {malformed:?}"
             );
         }
+    }
+
+    /// bd-xtnk1: the sequence echo must be VERIFIED, not merely carried.
+    ///
+    /// `FsyncJournalCommit` and `BulkDurableWrite` now run in the bounded
+    /// subprocess and take a `sequence`. A child that dropped or mangled that
+    /// value would mis-time the workload IDENTICALLY ON EVERY ARM, because the
+    /// subprocess routing is per-workload rather than per-arm — and none of the
+    /// harness's three existing gates would notice: arm-parity compares arms
+    /// against each other (a uniform bug passes), the cross-round gate demands
+    /// digest STABILITY (a dropped sequence makes that easier), and the
+    /// sequence-advance gate checks the PARENT's counters, not the child's use of
+    /// the value.
+    ///
+    /// So the echo is the only thing standing between a protocol slip and
+    /// plausible-looking wrong numbers. The negative cases are the point.
+    #[test]
+    fn mutating_batch_child_sequence_echo_is_verified_bd_xtnk1() {
+        // Matching echo is accepted.
+        assert_eq!(
+            super::parse_mutating_batch_result("17,23,5", Some(5)).expect("matching sequence"),
+            (17, 23)
+        );
+
+        // A MISMATCHED echo must fail closed — this is the silent-mis-timing case.
+        let err = super::parse_mutating_batch_result("17,23,4", Some(5))
+            .expect_err("a child running a different sequence must be refused");
+        assert!(
+            err.to_string().contains("echoed sequence 4"),
+            "unexpected mismatch error: {err}"
+        );
+
+        // A MISSING echo must also fail closed: the parent passed a sequence and
+        // cannot otherwise confirm the child used it.
+        let err = super::parse_mutating_batch_result("17,23", Some(5))
+            .expect_err("a child that omits the echo must be refused");
+        assert!(
+            err.to_string().contains("did not echo its sequence"),
+            "unexpected missing-echo error: {err}"
+        );
+
+        // A non-numeric echo is malformed, not silently ignored.
+        assert!(
+            super::parse_mutating_batch_result("17,23,no", Some(5)).is_err(),
+            "a non-numeric sequence echo must fail closed"
+        );
+
+        // And a workload with NO sequence still accepts the two-field form, so
+        // create-delete-storm is unchanged by this widening.
+        assert_eq!(
+            super::parse_mutating_batch_result("17,23", None).expect("sequenceless workload"),
+            (17, 23)
+        );
     }
 
     #[test]
