@@ -59802,6 +59802,96 @@ mod tests {
         );
     }
 
+    /// bd-hyysq, SECOND ATTEMPT ON THE PATH THE MOUNTED REPRO ACTUALLY USED.
+    ///
+    /// My first reproduction attempt concluded "not reproduced" and that
+    /// conclusion was drawn on the WRONG CODE PATH. `open_writable_ext4_mkfs_*`
+    /// leaves the bd-bhh0i sharded allocator off, and `ffs-core`'s own tests
+    /// compile with the `bhh0i_sharded_alloc` feature OFF, so the control
+    /// exercised the SINGLE-LOCK allocator. The mounted repro did not:
+    /// `ffs-core/Cargo.toml` records that the compile-time feature is ON via
+    /// `ffs-cli`'s `default`, and the runtime switch is ON by default —
+    /// `sharded_create_enabled_from_env(None)` returns TRUE — so a plain
+    /// `ffs-cli mount --rw` runs the SHARDED path. (That documentation was itself
+    /// wrong until bd-rmug7 corrected it, which is how the mismatch went unnoticed.)
+    ///
+    /// Why the distinction is load-bearing here rather than incidental: under
+    /// sharding the authoritative free counts live in the per-group sharded
+    /// records, NOT in `alloc.groups`. The defective boundary flush
+    /// early-returned in eager mode, and the eager per-op writes are the only
+    /// other writer — so if the sharded records and the single-lock array can
+    /// disagree, eager mode is exactly where that disagreement reaches the disk.
+    ///
+    /// This test runs the same 512 create+write+unlink pairs in eager mode with
+    /// sharding ACTIVE and stops after `flush_mvcc_versions_to_device`, i.e. the
+    /// state the defective code reached. It asserts consistency because that is
+    /// what the fixed tree must produce; if it ever fails, that failure IS
+    /// bd-hyysq reproduced in-process and the message says so.
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[test]
+    fn ext4_eager_sharded_allocating_workload_is_consistent_bd_hyysq() {
+        let _restore = GdtModeRestore;
+        ffs_alloc::set_gdt_persistence_deferred_for_test(Some(false));
+
+        let Some((fs, dev, _tmp)) = open_writable_ext4_mkfs_with_device(64) else {
+            return; // format tool unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+
+        // The mounted repro's configuration: sharded ops ACTIVE.
+        //
+        // NOTE `set_bhh0i_sharded_ops` returns the PREVIOUS value, not a success
+        // flag — asserting on its return was a bug in an earlier revision of this
+        // test, which then failed in setup and looked like a reproduction. Check
+        // the actual activity predicate instead, which also requires
+        // `ext4_sharded_alloc` to have been built by `enable_writes`.
+        fs.set_bhh0i_sharded_ops(true);
+        assert!(
+            fs.bhh0i_sharded_ops_active(),
+            "the sharded allocator must be ACTIVE for this test to mean anything: \
+             the toggle is on but ext4_sharded_alloc is absent, so this would have \
+             silently re-run the single-lock path the other control already covers"
+        );
+
+        for i in 0..512u32 {
+            let name = format!("hyysq_sh_{i}.bin");
+            let attr = fs
+                .create(&cx, root, OsStr::new(&name), 0o644, 0, 0)
+                .expect("sharded create");
+            fs.write(&cx, attr.ino, 0, &[0xAB_u8; 4096])
+                .expect("write file data");
+            fs.unlink(&cx, root, OsStr::new(&name))
+                .expect("sharded unlink");
+        }
+        for i in 0..32u32 {
+            let name = format!("hyysq_sh_live_{i}.bin");
+            let attr = fs
+                .create(&cx, root, OsStr::new(&name), 0o644, 0, 0)
+                .expect("create live file");
+            fs.write(&cx, attr.ino, 0, &[0xCD_u8; 8192])
+                .expect("write live file data");
+        }
+
+        // Versions only — the state the defective boundary reached in eager mode.
+        let base_dev = fs.direct_block_device_adapter();
+        fs.flush_mvcc_versions_to_device(&cx, &base_dev)
+            .expect("flush mvcc versions");
+        let bytes = dev.snapshot_bytes();
+
+        let mismatches = ext4_group_free_block_mismatches(&bytes);
+        eprintln!("bd-hyysq sharded: mismatches without the boundary flush = {mismatches:?}");
+        assert!(
+            mismatches.is_empty(),
+            "bd-hyysq REPRODUCED IN-PROCESS on the sharded path: {} group(s) carry stale \
+             free-block counts (group, declared, counted) {mismatches:?} after an eager-mode \
+             allocating workload. This is the trigger the single-lock control could not reach. \
+             Do NOT weaken this assertion — the boundary flush being unconditional (bd-hyysq) is \
+             what must keep it green.",
+            mismatches.len()
+        );
+    }
+
     /// Resolve a mkfs-created image's INTERNAL journal to a single contiguous
     /// region, or `None` if it is absent or fragmented.
     ///
