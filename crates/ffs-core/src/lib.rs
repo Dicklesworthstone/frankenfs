@@ -59956,6 +59956,91 @@ mod tests {
         );
     }
 
+    /// bd-hyysq, FOURTH SUSPECT and the strongest remaining one: CONCURRENCY.
+    ///
+    /// Five in-process results now say the eager per-op descriptor writes are
+    /// self-sufficient — single-lock and sharded allocators, files with data,
+    /// create-only, empty-file storms, and htree conversion (512 entries is 3-4x
+    /// past the linear-block threshold). Every one of them is SINGLE-THREADED.
+    /// The mounted daemon that produced the original e2fsck rc=4 serves FUSE
+    /// requests from multiple worker threads.
+    ///
+    /// That difference is not speculative for this allocator: bd-y2t0r fixed FOUR
+    /// separate races in the sharded create path — a BitmapOr proof, a
+    /// block-bitmap find-race, an inode-table pruning-race, and a read-vs-prune
+    /// TOCTOU — and its own regression test is recorded as FLAKY rather than
+    /// reliably red. An eager per-op descriptor write racing a concurrent
+    /// allocation in a DIFFERENT group is exactly the shape that leaves one
+    /// group's count stale while every single-threaded workload stays clean.
+    ///
+    /// Private subdirectory per worker, mirroring the comparator's
+    /// parallel-metadata shape, so the directory is not the contention point and
+    /// the ALLOCATOR is. Stops before any boundary flush, like the other four.
+    #[test]
+    fn ext4_eager_concurrent_storm_is_consistent_bd_hyysq() {
+        let _restore = GdtModeRestore;
+        ffs_alloc::set_gdt_persistence_deferred_for_test(Some(false));
+
+        let Some((fs, dev, _tmp)) = open_writable_ext4_mkfs_with_device(64) else {
+            return; // format tool unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+
+        // One private subdirectory per worker, created serially up front.
+        let mut dirs = Vec::new();
+        for worker in 0..4u32 {
+            let name = format!("hyysq_conc_{worker}");
+            let attr = fs
+                .mkdir(&cx, root, OsStr::new(&name), 0o755, 0, 0)
+                .expect("create worker subdirectory");
+            dirs.push(attr.ino);
+        }
+
+        let fs = std::sync::Arc::new(fs);
+        std::thread::scope(|scope| {
+            for (worker, dir) in dirs.iter().copied().enumerate() {
+                let fs = std::sync::Arc::clone(&fs);
+                scope.spawn(move || {
+                    // The eager-mode override is THREAD-LOCAL, so each worker must
+                    // set it or it would silently run the deferred path and this
+                    // test would prove nothing about eager mode.
+                    ffs_alloc::set_gdt_persistence_deferred_for_test(Some(false));
+                    let cx = Cx::for_testing();
+                    let fs: &OpenFs = fs.as_ref();
+                    for i in 0..128u32 {
+                        let name = format!("w{worker}_f{i}.bin");
+                        let attr = fs
+                            .create(&cx, dir, OsStr::new(&name), 0o644, 0, 0)
+                            .expect("concurrent create");
+                        fs.write(&cx, attr.ino, 0, &[0xAB_u8; 4096])
+                            .expect("concurrent write");
+                        fs.unlink(&cx, dir, OsStr::new(&name))
+                            .expect("concurrent unlink");
+                    }
+                });
+            }
+        });
+
+        // Stop where the defective code stopped: versions only, no boundary flush.
+        let base_dev = fs.direct_block_device_adapter();
+        fs.flush_mvcc_versions_to_device(&cx, &base_dev)
+            .expect("flush mvcc versions");
+        let bytes = dev.snapshot_bytes();
+
+        let mismatches = ext4_group_free_block_mismatches(&bytes);
+        eprintln!("bd-hyysq concurrent storm: mismatches without the boundary flush = {mismatches:?}");
+        assert!(
+            mismatches.is_empty(),
+            "bd-hyysq REPRODUCED IN-PROCESS under CONCURRENCY: {} group(s) carry stale \
+             free-block counts (group, declared, counted) {mismatches:?}. Five single-threaded \
+             workloads were clean, so the trigger is a race between an eager per-op descriptor \
+             write and a concurrent allocation — which is why the mounted multi-threaded daemon \
+             reproduced it and no serial test could. Do NOT weaken this assertion.",
+            mismatches.len()
+        );
+    }
+
     /// Resolve a mkfs-created image's INTERNAL journal to a single contiguous
     /// region, or `None` if it is absent or fragmented.
     ///
