@@ -736,6 +736,69 @@ def is_document_structure(cells: list[str], title: str) -> bool:
     return not TITLE_DATE.search(title) and not TITLE_BEAD.search(title)
 
 
+# --- entries written above the entry level are SILENTLY UNLINTED (bd-vacgl) ---
+# parse_text() treats a heading shallower than `entry_level` as a GROUPING heading:
+# it flushes, sets pending=None, and DROPS every body line until the next heading at
+# the entry level. That is correct for a real date-group heading. It is a hole when
+# someone writes a whole entry there: the entry contributes no row, so the KEEP and
+# REJECT contracts never run against it, and nothing says so.
+#
+# Measured on docs/NEGATIVE_EVIDENCE.md (entry_level=3) via this module's own parser,
+# never a line grep -- the warning at the top of this file about a one-off grep
+# mis-splitting entries and publishing a wrong void figure (79.3 -> 75.1) applies
+# exactly here:
+#   rows parsed                                        1463
+#   '##' headings carrying a verdict word                44
+#   of those, present as a row title                      0
+#   of those, ALSO attributable (date or bead id)        32
+# So 44 verdict-carrying entries are invisible to the gate, including rows that
+# announce KEEP and REJECT in their own heading. The check below reports the 32
+# ATTRIBUTABLE ones, not all 44: attribution is what distinguishes an entry filed at
+# the wrong depth from a section header that merely contains the word 'reject', and
+# reporting the other 12 would be the false-positive direction this file warns about
+# at parse_text(). The gap between 44 and 32 is therefore deliberate, not a drift --
+# if a future edit makes these numbers equal, the attribution filter has stopped
+# working.
+#
+# This check is STRICTLY ADDITIVE. It reports a new class of problem and reclassifies
+# nothing, so it cannot excuse a row that the contract would otherwise catch -- the
+# failure it fixes is a FALSE NEGATIVE, which is the dangerous direction for a
+# provenance gate because it is invisible by construction.
+#
+# Deliberately NOT done here (bd-vacgl): changing `entry_level` for this ledger.
+# Measured 1463 rows at level 3 against 955 at level 2, so lowering it would merge
+# each '###' entry into its parent and stop 508 from being checked individually --
+# trading one silent-miss class for another. Which level this ledger SHOULD use is a
+# decision about the document, not a parser tweak, and this check makes the drift
+# visible either way.
+UNLINTED_VERDICT = re.compile(r"\b(KEEP|REJECT|LOSS|WIN)\b")
+
+
+def unlinted_entry_headings(
+    path: Path, text: str, entry_level: int
+) -> list[tuple[int, str]]:
+    """Headings above `entry_level` that look like ENTRIES rather than grouping.
+
+    A heading qualifies when it is shallower than the entry level (so its body is
+    dropped), carries a verdict word, and is ATTRIBUTABLE — a date or a bead id.
+    Attribution is what separates 'this is an entry filed at the wrong depth' from
+    'this is a section header that happens to contain the word reject'; it reuses
+    the same signal `is_document_structure` already trusts.
+    """
+    found: list[tuple[int, str]] = []
+    for i, ln in enumerate(text.splitlines(), 1):
+        heading = re.match(r"(#{1,6})\s", ln)
+        if not heading or len(heading.group(1)) >= entry_level:
+            continue
+        title = ln.lstrip("#").strip()
+        if not UNLINTED_VERDICT.search(title):
+            continue
+        if is_document_structure([], title):
+            continue
+        found.append((i, title))
+    return found
+
+
 def verdict_of(cells: list[str], title: str, body: str) -> str:
     """Verdict from the table's Verdict column, else the prose title, else the body."""
     if is_document_structure(cells, title):
@@ -1009,6 +1072,41 @@ def cmd_lint(since: str | None, staged: bool) -> int:
     structure_note = (
         f", {structure_checked} document-structure" if structure_checked else ""
     )
+
+    # bd-vacgl: surface entries filed ABOVE the entry level, whose bodies parse_text()
+    # drops — they are silently exempt from the KEEP/REJECT contracts. Reported as a
+    # WARNING and deliberately NOT folded into the exit code: 32 such entries already
+    # exist in NEGATIVE_EVIDENCE.md, so blocking on them would fail every commit that
+    # touches the ledger for a defect none of those commits introduced. This module
+    # already states the principle at parse_text() — "a false positive is worse than a
+    # miss here, because a guard that cries wolf gets disabled" — and a gate that
+    # blocks on unrelated history is the same failure. Visible, attributable, and
+    # non-blocking is what makes it survivable; the count is a ratchet to drive down.
+    for ledger_path, ledger_level in LEDGERS:
+        if not ledger_path.exists():
+            continue
+        try:
+            unlinted = unlinted_entry_headings(
+                ledger_path, ledger_path.read_text(encoding="utf-8"), ledger_level
+            )
+        except OSError:
+            continue
+        if not unlinted:
+            continue
+        print(
+            f"preflight lint: WARNING — {_display_path(ledger_path)} has "
+            f"{len(unlinted)} entry heading(s) above its entry level "
+            f"(`{'#' * ledger_level}`); their bodies are DROPPED by the parser, so "
+            f"the KEEP/REJECT contracts never run against them:"
+        )
+        for line, title in unlinted[:5]:
+            print(f"    :{line}  {title[:120]}")
+        if len(unlinted) > 5:
+            print(f"    … and {len(unlinted) - 5} more")
+        print(
+            "  Fix by writing the entry at the ledger's entry level, so it is parsed "
+            "as a row and checked.\n"
+        )
     if not bad:
         print(
             f"preflight lint: OK — {total} row(s) in {scope} "
@@ -2048,6 +2146,55 @@ def cmd_self_test() -> int:
             (
                 "the live ledgers hold exactly the 5 measured structure sections",
                 sum(1 for r in all_rows() if r.verdict == "STRUCTURE") == 5,
+            ),
+            # bd-vacgl: the unlinted-entry check. The NEGATIVE cases carry the
+            # weight -- this check reports a heading nobody is looking at, so its
+            # dangerous failure is over-flagging until the warning is ignored.
+            (
+                "an attributable verdict entry filed above the entry level is caught",
+                [
+                    t
+                    for _, t in unlinted_entry_headings(
+                        sample_path,
+                        "## KEEP — 2026-07-01 — `bd-x` a lever\n\nbody\n",
+                        3,
+                    )
+                ]
+                == ["KEEP — 2026-07-01 — `bd-x` a lever"],
+            ),
+            (
+                "a heading AT the entry level is left alone (it is parsed as a row)",
+                not unlinted_entry_headings(
+                    sample_path, "### KEEP — 2026-07-01 — `bd-x` a lever\n", 3
+                ),
+            ),
+            (
+                "a plain date-group heading is left alone",
+                not unlinted_entry_headings(sample_path, "## 2026-07-01\n", 3),
+            ),
+            (
+                "an unattributable heading naming a verdict word is left alone",
+                not unlinted_entry_headings(
+                    sample_path, "## When to REJECT a lever\n", 3
+                ),
+            ),
+            (
+                "a verdict-free attributable grouping heading is left alone",
+                not unlinted_entry_headings(
+                    sample_path, "## 2026-07-01 — `bd-x` session notes\n", 3
+                ),
+            ),
+            (
+                "the attribution filter is doing real work on the live ledger "
+                "(32 attributable of 44 verdict-carrying), not passing everything",
+                len(
+                    unlinted_entry_headings(
+                        sample_path,
+                        sample_path.read_text(encoding="utf-8"),
+                        3,
+                    )
+                )
+                == 32,
             ),
         ]
     )
