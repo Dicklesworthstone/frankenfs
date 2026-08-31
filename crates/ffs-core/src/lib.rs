@@ -59891,6 +59891,71 @@ mod tests {
         );
     }
 
+    /// bd-hyysq, THIRD SUSPECT: EMPTY-file create/unlink, where the only block
+    /// allocation is the DIRECTORY growing.
+    ///
+    /// Every reproduction attempt so far wrote 4 KiB into each file before
+    /// unlinking it, so most block movement came from file data extents — and
+    /// those allocate through a path that does perform an eager per-op descriptor
+    /// write. The bead's mounted repro is described as "1000 create+unlink
+    /// pairs", with no writes mentioned, and its symptom is specifically "Free
+    /// BLOCKS count wrong for group #0 (28125, counted=28117)" — off by 8, on a
+    /// workload whose files hold no data at all.
+    ///
+    /// That points somewhere the earlier tests could not reach: with empty files
+    /// the ONLY thing consuming blocks is the parent directory growing as 512
+    /// entries are inserted. If directory-block allocation is the path that skips
+    /// the eager descriptor write, this is where it shows.
+    ///
+    /// Asserts consistency because that is what the fixed tree must produce. A
+    /// failure here IS bd-hyysq reproduced in-process, and the message says so
+    /// rather than leaving the next reader to interpret a bare assert.
+    #[test]
+    fn ext4_eager_empty_file_storm_is_consistent_bd_hyysq() {
+        let _restore = GdtModeRestore;
+        ffs_alloc::set_gdt_persistence_deferred_for_test(Some(false));
+
+        let Some((fs, dev, _tmp)) = open_writable_ext4_mkfs_with_device(64) else {
+            return; // format tool unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+
+        // EMPTY files: create then unlink, never write. The only block consumer
+        // is the directory itself.
+        for i in 0..512u32 {
+            let name = format!("hyysq_empty_{i}");
+            fs.create(&cx, root, OsStr::new(&name), 0o644, 0, 0)
+                .expect("create empty file");
+            fs.unlink(&cx, root, OsStr::new(&name))
+                .expect("unlink empty file");
+        }
+        // Leave a residue so the directory keeps the blocks it grew into.
+        for i in 0..64u32 {
+            let name = format!("hyysq_empty_live_{i}");
+            fs.create(&cx, root, OsStr::new(&name), 0o644, 0, 0)
+                .expect("create live empty file");
+        }
+
+        // Stop where the defective code stopped: versions only, no boundary flush.
+        let base_dev = fs.direct_block_device_adapter();
+        fs.flush_mvcc_versions_to_device(&cx, &base_dev)
+            .expect("flush mvcc versions");
+        let bytes = dev.snapshot_bytes();
+
+        let mismatches = ext4_group_free_block_mismatches(&bytes);
+        eprintln!("bd-hyysq empty-file storm: mismatches without the boundary flush = {mismatches:?}");
+        assert!(
+            mismatches.is_empty(),
+            "bd-hyysq REPRODUCED IN-PROCESS on the empty-file storm: {} group(s) carry stale \
+             free-block counts (group, declared, counted) {mismatches:?}. The only block consumer \
+             here is DIRECTORY GROWTH, so that is the allocation path skipping its eager \
+             descriptor write. Do NOT weaken this assertion — the unconditional boundary flush is \
+             what must keep it green.",
+            mismatches.len()
+        );
+    }
+
     /// Resolve a mkfs-created image's INTERNAL journal to a single contiguous
     /// region, or `None` if it is absent or fragmented.
     ///
