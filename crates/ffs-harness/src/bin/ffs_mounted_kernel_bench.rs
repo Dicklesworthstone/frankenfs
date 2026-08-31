@@ -313,6 +313,43 @@ impl Workload {
         }
     }
 
+    /// Pairs this workload needs before its A/A nulls can be PROVEN tight, when
+    /// the caller did not say (bd-ynqwx).
+    ///
+    /// This is a precision floor, not a gate. Measured on this host 2026-08-17
+    /// (PlumBeacon, seven certification attempts): every BLOCKED_NULL was blocked on
+    /// the null CI SPREAD and never on the null MEDIAN — all six medians landed
+    /// within 1.4% of 1.0 against a 2% limit, while the spreads sat at 1.0256-1.0434
+    /// against a 1.025 limit. The estimates were in the right place; at 96 pairs the
+    /// instrument could not prove it. At 192 the same row's spreads fell to
+    /// 1.0157-1.0173 and it ADMITTED.
+    ///
+    /// A bootstrap CI narrows as sqrt(n), so this buys precision arithmetically
+    /// rather than by moving the 1.025 limit — widening that limit is gate
+    /// self-weakening, which the standing orders ban by name, and it is what makes
+    /// an admitted row mean anything.
+    ///
+    /// Scoped to fsync ALONE on purpose. A peer measured the opposite on btrfs
+    /// readdir+stat (CreamTrout, 06f76c71a, bd-btrfs-readdir-stat-8x-8y7vp):
+    /// doubling the pairs made that row's FUSE A/A null WORSE and flipped its sign,
+    /// so pairs do not buy every row and this must not be generalised without its
+    /// own measurement. 192 is legal in both schedules — a multiple of 4 for the
+    /// four-arm run and of 12 for the six-arm one.
+    const fn default_pairs(self) -> Option<usize> {
+        match self {
+            Self::FsyncJournalCommit => Some(192),
+            Self::WarmStat
+            | Self::ParallelMetadataWrite
+            | Self::ParallelRead8
+            | Self::ParallelRead8ColdCache
+            | Self::CreateDeleteStorm
+            | Self::ReaddirStat8
+            | Self::BulkDurableWrite
+            | Self::DirectDurableWrite
+            | Self::XattrGetListReport => None,
+        }
+    }
+
     const fn durability(self) -> &'static str {
         match self {
             Self::ParallelMetadataWrite => "create_then_fsync_each_worker_directory",
@@ -1489,7 +1526,9 @@ fn usage() {
            --artifact-root PATH           Persistent artifacts under /data/tmp\n\
            --pairs N                      Paired rounds, multiple of 4 and >= 12 (default 32;\n\
                                           with a candidate comparison the schedule period is\n\
-                                          12, so pairs must be a multiple of 12, default 36)\n\
+                                          12, so pairs must be a multiple of 12, default 36;\n\
+                                          fsync-journal-commit defaults to 192 -- it cannot\n\
+                                          prove its A/A null spread at fewer, bd-ynqwx)\n\
            --fuse-transport file|loop     How the FUSE arm reaches its image (default file).\n\
 `loop` puts it behind a loop device so BOTH arms cross\n\
 the same block layer; the kernel arm always does, which\n\
@@ -2025,10 +2064,19 @@ fn parse_config_args(args: &[String]) -> Result<Option<Config>> {
         index += 1;
     }
 
+    // Some workloads cannot prove their own A/A nulls at the generic default and
+    // need pairs bought for them (bd-ynqwx). An explicit --pairs always wins, so
+    // this raises the FLOOR for an unflagged run and never overrides an operator.
+    if !pairs_explicit && let Some(floor) = config.workload.default_pairs() {
+        config.pairs = floor;
+    }
+
     // The six-arm schedule only closes on a multiple of 12 rounds, so the
     // four-arm default of 32 is not expressible there. Take the smallest legal
-    // count above it rather than silently running an unbalanced schedule.
-    if config.compares_candidates() && !pairs_explicit {
+    // count above it rather than silently running an unbalanced schedule. A
+    // workload floor that is already a multiple of 12 is left alone -- lowering it
+    // to 36 here would silently undo the precision it was chosen to buy.
+    if config.compares_candidates() && !pairs_explicit && config.pairs % 12 != 0 {
         config.pairs = 36;
     }
 
@@ -11482,6 +11530,89 @@ mod tests {
             tight_null_ci,
             wide_null_ci
         ));
+    }
+
+    #[test]
+    fn fsync_defaults_to_192_pairs_and_only_fsync_does_bd_ynqwx() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let cli = temp.path().join("ffs-cli");
+        fs::write(&cli, b"placeholder").expect("write placeholder candidate");
+        let base = || {
+            vec![
+                "--ffs-cli".to_owned(),
+                cli.display().to_string(),
+                "--harness-builder".to_owned(),
+                "hz1".to_owned(),
+                "--candidate-builder".to_owned(),
+                "hz2".to_owned(),
+                // Mutating workloads require this, so every timed row has exactly
+                // one durability boundary; harmless for the read-only rows below.
+                "--observation-repeats".to_owned(),
+                "1".to_owned(),
+            ]
+        };
+
+        // The floor applies to the row that measured it.
+        let mut fsync = base();
+        fsync.extend(["--workload".to_owned(), "fsync-journal-commit".to_owned()]);
+        let config = parse_config_args(&fsync)
+            .expect("parse fsync invocation")
+            .expect("normal invocation");
+        assert_eq!(config.workload, Workload::FsyncJournalCommit);
+        assert_eq!(config.pairs, 192);
+
+        // 192 must be legal in BOTH schedules, or the floor would be silently
+        // rewritten by the six-arm normaliser below.
+        assert_eq!(192 % 4, 0);
+        assert_eq!(192 % 12, 0);
+
+        // An explicit --pairs always wins: this raises a floor for an unflagged
+        // run, it does not overrule an operator who asked for a count.
+        let mut explicit = fsync.clone();
+        explicit.extend(["--pairs".to_owned(), "96".to_owned()]);
+        let config = parse_config_args(&explicit)
+            .expect("parse explicit pairs")
+            .expect("normal invocation");
+        assert_eq!(config.pairs, 96);
+
+        // The six-arm normaliser must leave the floor alone rather than pulling it
+        // back down to 36, which would undo the precision it was chosen to buy.
+        let mut six_arm = fsync.clone();
+        six_arm.extend(["--candidate-b-env".to_owned(), "FFS_ANY_KNOB=0".to_owned()]);
+        let config = parse_config_args(&six_arm)
+            .expect("parse six-arm fsync")
+            .expect("normal invocation");
+        assert!(config.compares_candidates());
+        assert_eq!(config.pairs, 192);
+
+        // SCOPE, and the reason this test exists as much as the floor does: a peer
+        // measured that doubling the pairs made btrfs readdir+stat's FUSE A/A null
+        // WORSE and flipped its sign (CreamTrout, 06f76c71a). Pairs do not buy every
+        // row, so every other workload must keep the generic default until it has
+        // its own measurement saying otherwise.
+        for workload in ["readdir-stat-8t", "warm-stat", "create-delete-storm"] {
+            let mut other = base();
+            other.extend(["--workload".to_owned(), workload.to_owned()]);
+            let parsed = parse_config_args(&other);
+            assert!(parsed.is_ok(), "parse {workload}: {:?}", parsed.err());
+            let config = parsed
+                .expect("parse checked just above")
+                .expect("normal invocation");
+            assert_eq!(config.pairs, 32, "{workload} must keep the generic default");
+
+            let mut other_six = other.clone();
+            other_six.extend(["--candidate-b-env".to_owned(), "FFS_ANY_KNOB=0".to_owned()]);
+            let parsed = parse_config_args(&other_six);
+            assert!(
+                parsed.is_ok(),
+                "parse six-arm {workload}: {:?}",
+                parsed.err()
+            );
+            let config = parsed
+                .expect("parse checked just above")
+                .expect("normal invocation");
+            assert_eq!(config.pairs, 36, "{workload} must keep the six-arm default");
+        }
     }
 
     #[test]
