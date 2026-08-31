@@ -27298,8 +27298,8 @@ impl OpenFs {
         // e2compr is a rare legacy path whose conformance test validates that the
         // on-disk group-descriptor free counts reflect each compressed write. Under
         // the default GDT-persistence deferral the GD is otherwise written only at a
-        // durability boundary, so force a descriptor flush here (a no-op in eager
-        // mode) to keep the compressed-write GD eager without deferring the mainline
+        // durability boundary, so force a descriptor flush here to keep the
+        // compressed-write GD eager without deferring the mainline
         // create/write win (bd-cc-gdt-defer-default). Best-effort: the GD is a hint
         // (bitmap authoritative), so a flush error must not fail an otherwise-durable
         // compressed write.
@@ -44271,9 +44271,8 @@ mod tests {
         // Baseline free space BEFORE the file exists. Flush first so the on-disk
         // group descriptors are sampled at a durability boundary in both this and
         // the final read — under GDT-persistence deferral (bd-cc-gdt-defer) the
-        // descriptor free counts only reconcile with the eager bitmap at a flush
-        // (no-op in eager mode); the bitmap-based `free_blocks_total` assertion
-        // below is exact regardless.
+        // descriptor free counts only reconcile with the eager bitmap at a flush;
+        // the bitmap-based `free_blocks_total` assertion below is exact regardless.
         fs.flush_mvcc_to_device(&cx).expect("flush baseline");
         let baseline = fs.free_space_summary(&cx).expect("baseline");
 
@@ -44320,7 +44319,7 @@ mod tests {
 
         // Every block the file ever held must be back: zero net leak. Flush so
         // the on-disk descriptors reflect the truncate+unlink frees before
-        // sampling (bd-cc-gdt-defer durability boundary; no-op in eager mode).
+        // sampling (bd-cc-gdt-defer durability boundary).
         fs.flush_mvcc_to_device(&cx).expect("flush final");
         let end = fs.free_space_summary(&cx).expect("final");
         assert_eq!(
@@ -74917,8 +74916,7 @@ mod tests {
         // Under GDT-persistence deferral (bd-cc-gdt-defer) the on-disk group
         // descriptors are updated only at a durability boundary, so flush before
         // sampling them — statfs reads the authoritative in-memory GroupStats,
-        // which the descriptor sum matches exactly once persisted (no-op in eager
-        // mode).
+        // which the descriptor sum matches exactly once persisted.
         fs.flush_mvcc_to_device(&cx).expect("flush");
 
         // Replicate the OLD aggregation: sum the on-disk group descriptors,
@@ -77938,7 +77936,7 @@ mod tests {
         // The DEL_RANGE freed blocks; under GDT-persistence deferral
         // (bd-cc-gdt-defer) the group descriptors reconcile with the eager bitmap
         // only at a durability boundary, so flush before snapshotting for e2fsck
-        // (a real crash-recovery flushes after replay; no-op in eager mode).
+        // (a real crash-recovery flushes after replay).
         fs.flush_mvcc_to_device(&cx).expect("flush after replay");
         std::fs::write(&image, dev.snapshot_bytes()).expect("write recovered image");
         let Some((clean, output)) = run_e2fsck(&image) else {
@@ -78127,7 +78125,7 @@ mod tests {
         // (2) Consistency: real e2fsck must accept the punched image. Flush the
         // recovery mount first so the deferred group descriptors reconcile with
         // the eager bitmap before the snapshot (bd-cc-gdt-defer durability
-        // boundary; a real post-crash replay flushes; no-op in eager mode).
+        // boundary; a real post-crash replay flushes).
         fs2.flush_mvcc_to_device(&cx).expect("flush after replay");
         std::fs::write(&image, recov.lock().unwrap().clone()).expect("write recovered image");
         let Some((clean, output)) = run_e2fsck(&image) else {
@@ -78357,7 +78355,7 @@ mod tests {
         // (2) Consistency: real e2fsck must accept the image — no leaked
         // zero-link inode and no leaked data blocks. Flush the recovery mount so
         // the deferred group descriptors reconcile with the eager bitmap before
-        // the snapshot (bd-cc-gdt-defer durability boundary; no-op in eager mode).
+        // the snapshot (bd-cc-gdt-defer durability boundary).
         fs2.flush_mvcc_to_device(&cx).expect("flush after replay");
         std::fs::write(&image, recov.lock().unwrap().clone()).expect("write recovered image");
         let Some((clean, output)) = run_e2fsck(&image) else {
@@ -78489,8 +78487,7 @@ mod tests {
 
         // The whole interleaved batch leaves an e2fsck-clean image. Flush the
         // recovery mount so the deferred group descriptors reconcile with the
-        // eager bitmap before the snapshot (bd-cc-gdt-defer durability boundary;
-        // no-op in eager mode).
+        // eager bitmap before the snapshot (bd-cc-gdt-defer durability boundary).
         fs2.flush_mvcc_to_device(&cx).expect("flush after replay");
         std::fs::write(&image, recov.lock().unwrap().clone()).expect("write recovered image");
         let Some((clean, output)) = run_e2fsck(&image) else {
