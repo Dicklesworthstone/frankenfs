@@ -1073,6 +1073,35 @@ def cmd_lint(since: str | None, staged: bool) -> int:
         f", {structure_checked} document-structure" if structure_checked else ""
     )
 
+    # bd-4sull: report RATCHET STATE on every lint run.
+    #
+    # The provenance ratchets (worker scope, placement scope, precision scope,
+    # incumbent absolute) are forward-only floors: each may fall, never rise. But
+    # nothing evaluated them on the path anyone actually runs. The installed
+    # pre-commit hook is `--lint --staged`, which never touched them, so a row that
+    # breached a ratchet COMMITTED CLEANLY and the breach surfaced only in
+    # `--self-test` or a hand-run audit flag.
+    #
+    # Measured 2026-08-31: two ratchets were already breached and had been for four
+    # days -- placement 41 against a 39 floor, precision-scope 39 against 33 -- by
+    # rows banked 2026-08-27. `--self-test` had been red that whole time, which is
+    # precisely why a red gate nobody reads is worth no more than an absent one.
+    #
+    # WARNING, not a refusal, and for the same reason the check below is: the
+    # breaching rows are already banked, so failing on them would block every commit
+    # that touches a ledger for rows the committer did not write, and this shared
+    # tree routinely has one agent staging another's edits. Raising a baseline to
+    # make this quiet is explicitly forbidden by the audits' own text -- the floors
+    # may only fall.
+    for label, found, baseline, flag in breached_ratchets():
+        print(
+            f"preflight lint: WARNING — the {label} ratchet is BREACHED: {found} "
+            f"row(s) against a floor of {baseline} (+{found - baseline}). A row was "
+            f"banked without the provenance this floor requires. Run "
+            f"`{flag} --list` to name it, and add the declaration to that row -- "
+            f"the floor may only FALL, so do not raise the baseline.\n"
+        )
+
     # bd-vacgl: surface entries filed ABOVE the entry level, whose bodies parse_text()
     # drops — they are silently exempt from the KEEP/REJECT contracts. Reported as a
     # WARNING and deliberately NOT folded into the exit code: 32 such entries already
@@ -1152,6 +1181,48 @@ def placement_scoped_rows(rows: list[Row] | None = None) -> list[Row]:
 
 def precision_scope_missing_rows(rows: list[Row] | None = None) -> list[Row]:
     return [r for r in (all_rows() if rows is None else rows) if r.lacks_precision_scope()]
+
+
+def breached_ratchets(
+    counts: dict[str, int] | None = None,
+) -> list[tuple[str, int, int, str]]:
+    """Provenance ratchets whose count has RISEN above its floor (bd-4sull).
+
+    Each floor is forward-only: it may fall as rows are fixed, never rise. A count
+    above its floor means a row was banked without the provenance that floor
+    requires. Returns (label, found, baseline, audit_flag) per breach.
+
+    `counts` is injectable so the self-test can exercise the predicate without
+    depending on the live ledgers, whose real counts move as agents bank rows.
+    """
+    live = {
+        "worker-scope": (len(worker_scoped_rows()), WORKER_SCOPE_BASELINE, "--worker-scope"),
+        "placement-scope": (
+            len(placement_scoped_rows()),
+            PLACEMENT_SCOPE_BASELINE,
+            "--placement-audit",
+        ),
+        "precision-scope": (
+            len(precision_scope_missing_rows()),
+            PRECISION_SCOPE_BASELINE,
+            "--precision-scope-audit",
+        ),
+        "incumbent-absolute": (
+            len(incumbent_absolute_missing_rows()),
+            INCUMBENT_ABSOLUTE_BASELINE,
+            "--incumbent-absolute-audit",
+        ),
+    }
+    breached: list[tuple[str, int, int, str]] = []
+    for label, (found, baseline, flag) in live.items():
+        if counts is not None:
+            if label not in counts:
+                continue
+            found = counts[label]
+        if baseline is None or found <= baseline:
+            continue
+        breached.append((label, found, baseline, flag))
+    return breached
 
 
 def cmd_precision_scope_audit(list_rows: bool) -> int:
@@ -2146,6 +2217,41 @@ def cmd_self_test() -> int:
             (
                 "the live ledgers hold exactly the 5 measured structure sections",
                 sum(1 for r in all_rows() if r.verdict == "STRUCTURE") == 5,
+            ),
+            # bd-4sull: the ratchet-state report. Injected counts, never the live
+            # ledgers -- the real counts move as agents bank rows, and a self-test
+            # that fails when a peer commits is a self-test that gets ignored.
+            (
+                "a ratchet ABOVE its floor is reported as breached",
+                [
+                    (label, found, baseline)
+                    for label, found, baseline, _ in breached_ratchets(
+                        {"placement-scope": PLACEMENT_SCOPE_BASELINE + 2}
+                    )
+                ]
+                == [("placement-scope", PLACEMENT_SCOPE_BASELINE + 2, PLACEMENT_SCOPE_BASELINE)],
+            ),
+            (
+                "a ratchet exactly AT its floor is not a breach",
+                not breached_ratchets({"placement-scope": PLACEMENT_SCOPE_BASELINE}),
+            ),
+            (
+                "a ratchet BELOW its floor is not a breach (floors may fall)",
+                not breached_ratchets({"placement-scope": PLACEMENT_SCOPE_BASELINE - 1}),
+            ),
+            (
+                "a label the report does not know is ignored, not invented",
+                not breached_ratchets({"not-a-ratchet": 10_000}),
+            ),
+            (
+                "the report names the audit flag that lists the offending rows",
+                [
+                    flag
+                    for _, _, _, flag in breached_ratchets(
+                        {"precision-scope": PRECISION_SCOPE_BASELINE + 1}
+                    )
+                ]
+                == ["--precision-scope-audit"],
             ),
             # bd-vacgl: the unlinted-entry check. The NEGATIVE cases carry the
             # weight -- this check reports a heading nobody is looking at, so its
