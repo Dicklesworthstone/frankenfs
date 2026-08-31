@@ -111,6 +111,7 @@ fn path_is_mounted(mounts: &str, path: &std::path::Path) -> bool {
 use anyhow::{Context, Result, anyhow, bail, ensure};
 use nix::sched::{CpuSet, sched_getcpu, sched_setaffinity};
 use nix::unistd::Pid;
+use nix::libc;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -3755,6 +3756,23 @@ fn direct_durable_write_witness(
     )
 }
 
+fn durable_write_witness_for_workload(
+    workload: Workload,
+    root: &Path,
+    expected_bytes: usize,
+    expected_uniform_byte: Option<u8>,
+) -> Result<BulkDurableWriteWitness> {
+    match workload {
+        Workload::BulkDurableWrite => {
+            bulk_durable_write_witness(root, expected_bytes, expected_uniform_byte)
+        }
+        Workload::DirectDurableWrite => {
+            direct_durable_write_witness(root, expected_bytes, expected_uniform_byte)
+        }
+        _ => unreachable!("only durable overwrite workloads have durable-write witnesses"),
+    }
+}
+
 fn list_xattr_names(path: &Path) -> Result<Vec<Vec<u8>>> {
     let mut names = xattr::list(path)
         .with_context(|| format!("list xattrs for {}", path.display()))?
@@ -4433,6 +4451,9 @@ fn run_mutating_batch_child(args: &[String]) -> Result<ExitCode> {
         ("bulk-durable-write", Some(sequence)) => {
             bulk_durable_write_batch(root, operations, sequence)?
         }
+        ("direct-durable-write", Some(sequence)) => {
+            direct_durable_write_batch(root, operations, sequence)?
+        }
         // A workload that needs a sequence but was given none (or vice versa) is
         // a protocol error, not something to paper over with a default: running
         // with the wrong sequence is exactly the silent mis-timing this design
@@ -4440,7 +4461,7 @@ fn run_mutating_batch_child(args: &[String]) -> Result<ExitCode> {
         (name, seq) => bail!(
             "unsupported --mutating-batch-child workload {name:?} with sequence \
              {seq:?}; create-delete-storm takes no sequence, fsync-journal-commit \
-             and bulk-durable-write require one"
+             bulk-durable-write, and direct-durable-write require one"
         ),
     };
 
@@ -4597,6 +4618,79 @@ fn bulk_durable_write_batch(root: &Path, operations: usize, sequence: usize) -> 
     Ok((elapsed, total_bytes_u64))
 }
 
+/// Return storage plus the range whose address is suitable for Linux `O_DIRECT`.
+///
+/// The direct row intentionally proves its alignment in safe Rust rather than
+/// assuming a `Vec` allocation happens to be page aligned. The file offsets and
+/// chunk size are also multiples of this alignment.
+fn direct_durable_aligned_payload(value: u8) -> Result<(Vec<u8>, usize)> {
+    let payload = vec![value; BULK_DURABLE_CHUNK_BYTES + DIRECT_DURABLE_ALIGNMENT];
+    let offset = payload.as_ptr().align_offset(DIRECT_DURABLE_ALIGNMENT);
+    ensure!(
+        offset != usize::MAX,
+        "could not construct a {DIRECT_DURABLE_ALIGNMENT}-byte-aligned direct-I/O payload"
+    );
+    let end = offset
+        .checked_add(BULK_DURABLE_CHUNK_BYTES)
+        .ok_or_else(|| anyhow!("direct durable payload range overflow"))?;
+    ensure!(
+        end <= payload.len(),
+        "direct durable aligned payload exceeds its backing allocation"
+    );
+    Ok((payload, offset))
+}
+
+fn direct_durable_write_batch(
+    root: &Path,
+    operations: usize,
+    sequence: usize,
+) -> Result<(u64, u64)> {
+    let path = root.join(DIRECT_DURABLE_FILE);
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(&path)
+        .with_context(|| format!("open O_DIRECT durable workload {}", path.display()))?;
+    let total_bytes = bulk_durable_total_bytes(operations)?;
+    let total_bytes_u64 =
+        u64::try_from(total_bytes).context("direct durable byte count does not fit u64")?;
+    ensure!(
+        file.metadata()
+            .with_context(|| format!("stat direct durable workload {}", path.display()))?
+            .len()
+            == total_bytes_u64,
+        "direct durable workload file length differs from its exact work contract"
+    );
+    let value = bulk_durable_sequence_byte(sequence);
+    let (payload_backing, payload_offset) = direct_durable_aligned_payload(value)?;
+    let payload_end = payload_offset
+        .checked_add(BULK_DURABLE_CHUNK_BYTES)
+        .ok_or_else(|| anyhow!("direct durable payload end overflow"))?;
+    let payload = &payload_backing[payload_offset..payload_end];
+    ensure!(
+        (payload.as_ptr() as usize).is_multiple_of(DIRECT_DURABLE_ALIGNMENT),
+        "direct durable payload address is not {DIRECT_DURABLE_ALIGNMENT}-byte aligned"
+    );
+    let started = Instant::now();
+    for index in 0..operations {
+        let offset = index
+            .checked_mul(BULK_DURABLE_CHUNK_BYTES)
+            .ok_or_else(|| anyhow!("direct durable write offset overflow"))?;
+        write_all_at(
+            &file,
+            black_box(payload),
+            u64::try_from(offset).context("direct durable write offset does not fit u64")?,
+            &path,
+        )?;
+    }
+    file.sync_all()
+        .with_context(|| format!("fsync O_DIRECT durable workload {}", path.display()))?;
+    let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+    black_box(payload_backing);
+    Ok((elapsed, total_bytes_u64))
+}
+
 fn workload_batch(
     root: &Path,
     config: &Config,
@@ -4621,6 +4715,7 @@ fn workload_batch(
         | Workload::CreateDeleteStorm
         | Workload::FsyncJournalCommit
         | Workload::BulkDurableWrite
+        | Workload::DirectDurableWrite
         | Workload::XattrGetListReport => {}
     }
     // The driver thread is bound once at startup; reaffirm and capture it here
@@ -4649,6 +4744,12 @@ fn workload_batch(
         )?,
         Workload::BulkDurableWrite => mutating_batch_bounded(
             "bulk-durable-write",
+            root,
+            config.operations,
+            Some(sequence),
+        )?,
+        Workload::DirectDurableWrite => mutating_batch_bounded(
+            "direct-durable-write",
             root,
             config.operations,
             Some(sequence),
@@ -7181,10 +7282,14 @@ fn fs_report(
         if config.workload == Workload::XattrGetListReport {
             initial_xattrs.insert(mount.arm, xattr_witness(mount.workload_root())?);
         }
-        if config.workload == Workload::BulkDurableWrite {
+        if matches!(
+            config.workload,
+            Workload::BulkDurableWrite | Workload::DirectDurableWrite
+        ) {
             initial_bulk_writes.insert(
                 mount.arm,
-                bulk_durable_write_witness(
+                durable_write_witness_for_workload(
+                    config.workload,
                     mount.workload_root(),
                     bulk_durable_total_bytes(config.operations)?,
                     None,
@@ -7227,7 +7332,10 @@ fn fs_report(
     } else {
         None
     };
-    let expected_initial_bulk_write = if config.workload == Workload::BulkDurableWrite {
+    let expected_initial_bulk_write = if matches!(
+        config.workload,
+        Workload::BulkDurableWrite | Workload::DirectDurableWrite
+    ) {
         let expected = initial_bulk_writes
             .get(&Arm::KernelA)
             .cloned()
@@ -7889,7 +7997,10 @@ fuse_null_median={:.6},inflation_suspected={},gate_input=false",
     } else {
         None
     };
-    let expected_final_bulk_write = if config.workload == Workload::BulkDurableWrite {
+    let expected_final_bulk_write = if matches!(
+        config.workload,
+        Workload::BulkDurableWrite | Workload::DirectDurableWrite
+    ) {
         let expected_byte = bulk_durable_sequence_byte(samples.last_sequence);
         let expected_bytes = bulk_durable_total_bytes(config.operations)?;
         let final_bulk_writes = mounts
@@ -7897,7 +8008,8 @@ fuse_null_median={:.6},inflation_suspected={},gate_input=false",
             .map(|mount| {
                 Ok((
                     mount.arm,
-                    bulk_durable_write_witness(
+                    durable_write_witness_for_workload(
+                        config.workload,
                         mount.workload_root(),
                         expected_bytes,
                         Some(expected_byte),
@@ -8090,10 +8202,20 @@ fuse_null_median={:.6},inflation_suspected={},gate_input=false",
                 "bytes": final_witness.bytes,
                 "final_sequence": samples.last_sequence,
                 "final_uniform_byte": final_witness.uniform_byte,
-                "positioned_write_bytes": BULK_DURABLE_CHUNK_BYTES,
-                "file_fsyncs_per_observation": 1,
-                "entire_file_overwritten": true,
-            }),
+            "positioned_write_bytes": BULK_DURABLE_CHUNK_BYTES,
+            "file_fsyncs_per_observation": 1,
+            "entire_file_overwritten": true,
+            "open_flag": if config.workload == Workload::DirectDurableWrite {
+                "O_DIRECT"
+            } else {
+                "buffered"
+            },
+            "buffer_and_offsets_alignment_bytes": if config.workload == Workload::DirectDurableWrite {
+                DIRECT_DURABLE_ALIGNMENT
+            } else {
+                1
+            },
+        }),
             (None, None) => json!("not_applicable"),
             _ => unreachable!("bulk durable witnesses must be present at both parity boundaries"),
         };
@@ -8474,7 +8596,7 @@ fuse_null_median={:.6},inflation_suspected={},gate_input=false",
         },
         "observation_start_state": match config.workload {
             Workload::ParallelMetadataWrite => "empty per-thread worker directories",
-            Workload::BulkDurableWrite => {
+            Workload::BulkDurableWrite | Workload::DirectDurableWrite => {
                 "preallocated fixed-length file; every observation overwrites every prior byte"
             }
             _ => "fixture-defined stable state",
@@ -10541,6 +10663,8 @@ mod tests {
             Workload::WarmStat,
             Workload::CreateDeleteStorm,
             Workload::FsyncJournalCommit,
+            Workload::BulkDurableWrite,
+            Workload::DirectDurableWrite,
             Workload::XattrGetListReport,
         ] {
             assert!(
@@ -10687,7 +10811,7 @@ mod tests {
     }
 
     #[test]
-    fn bulk_durable_workload_accepts_each_filesystem_and_bounds_image_capacity() {
+    fn durable_overwrite_workloads_accept_each_filesystem_and_bound_image_capacity() {
         let temp = tempfile::tempdir().expect("tempdir");
         let cli = temp.path().join("ffs-cli");
         fs::write(&cli, b"placeholder").expect("write placeholder candidate");
@@ -10705,6 +10829,12 @@ mod tests {
             ..Config::default()
         };
         validate_config(&base).expect("bounded ext4 bulk workload");
+
+        let direct = Config {
+            workload: Workload::DirectDurableWrite,
+            ..base.clone()
+        };
+        validate_config(&direct).expect("bounded ext4 direct durable workload");
 
         let mut btrfs = base.clone();
         btrfs.filesystems = RequestedFilesystems::Btrfs;
@@ -10732,6 +10862,7 @@ mod tests {
         );
         assert_eq!(Workload::CreateDeleteStorm.client_threads(96), 1);
         assert_eq!(Workload::BulkDurableWrite.client_threads(96), 1);
+        assert_eq!(Workload::DirectDurableWrite.client_threads(96), 1);
         assert_eq!(Workload::XattrGetListReport.client_threads(96), 1);
     }
 
@@ -10780,6 +10911,10 @@ mod tests {
         assert!(bulk_write.contains("67108864 total bytes"));
         assert!(bulk_write.contains("fsync the file once"));
 
+        let direct_write = Workload::DirectDurableWrite.job_statement(64, 1);
+        assert!(direct_write.contains("O_DIRECT"));
+        assert!(direct_write.contains("4096-byte-aligned"));
+
         let xattr = Workload::XattrGetListReport.job_statement(2_000, 1);
         assert!(xattr.contains("2000 complete five-call reports"));
         assert!(xattr.contains("external-block value"));
@@ -10811,6 +10946,13 @@ mod tests {
             67_108_864
         );
         assert_eq!(bulk_work["workload_specific"]["file_fsyncs"], 1);
+
+        let direct_work = Workload::DirectDurableWrite.semantic_work_contract(64, 1);
+        assert_eq!(direct_work["workload_specific"]["open_flag"], "O_DIRECT");
+        assert_eq!(
+            direct_work["workload_specific"]["buffer_and_offsets_alignment_bytes"],
+            DIRECT_DURABLE_ALIGNMENT
+        );
     }
 
     #[test]
@@ -10842,6 +10984,45 @@ mod tests {
             Some(bulk_durable_sequence_byte(sequence))
         );
         assert_eq!(witness.sha256.len(), 64);
+    }
+
+    #[test]
+    fn direct_durable_batch_requires_aligned_payload_and_matches_untimed_witness() {
+        let (backing, offset) = direct_durable_aligned_payload(0xD4)
+            .expect("safe direct-I/O payload alignment");
+        let payload = &backing[offset..offset + BULK_DURABLE_CHUNK_BYTES];
+        assert!(
+            (payload.as_ptr() as usize).is_multiple_of(DIRECT_DURABLE_ALIGNMENT),
+            "direct payload must satisfy O_DIRECT buffer alignment"
+        );
+        assert!(payload.iter().all(|byte| *byte == 0xD4));
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let operations = 2;
+        write_fixture_file(
+            &temp.path().join(DIRECT_DURABLE_FILE),
+            bulk_durable_total_bytes(operations).expect("direct byte count"),
+            0xB7,
+        )
+        .expect("direct durable fixture");
+
+        let sequence = 11;
+        let (elapsed_ns, digest) = direct_durable_write_batch(temp.path(), operations, sequence)
+            .expect("O_DIRECT durable batch");
+        assert!(elapsed_ns > 0);
+        assert_eq!(digest, 2 * 1024 * 1024);
+
+        let witness = direct_durable_write_witness(
+            temp.path(),
+            bulk_durable_total_bytes(operations).expect("direct byte count"),
+            Some(bulk_durable_sequence_byte(sequence)),
+        )
+        .expect("exact final direct witness");
+        assert_eq!(witness.bytes, 2 * 1024 * 1024);
+        assert_eq!(
+            witness.uniform_byte,
+            Some(bulk_durable_sequence_byte(sequence))
+        );
     }
 
     #[test]
@@ -12482,15 +12663,16 @@ mod tests {
 
         // The rest are clean for a reason, not by luck: parallel-metadata-write and
         // create-delete-storm bake EMPTY directories and create through the mount at
-        // measure time; warm-stat adds no directory; fsync and bulk-durable are one
-        // file each at the fixture root; xattr is three files at the root, measured
-        // unindexed on BOTH construction paths (the audit's negative control).
+        // measure time; warm-stat adds no directory; fsync plus both durable rows
+        // are one file each at the fixture root; xattr is three files at the root,
+        // measured unindexed on BOTH construction paths (the audit's negative control).
         for workload in [
             Workload::WarmStat,
             Workload::ParallelMetadataWrite,
             Workload::CreateDeleteStorm,
             Workload::FsyncJournalCommit,
             Workload::BulkDurableWrite,
+            Workload::DirectDurableWrite,
             Workload::XattrGetListReport,
         ] {
             assert_eq!(
