@@ -11199,6 +11199,76 @@ mod tests {
         assert!(candidate_knob_divergence(&split_replicas, true).is_err());
     }
 
+    /// bd-087wt: an A/B differing ONLY in the adaptive-spin flag must be
+    /// ADMITTED, and the same pair with that field absent must still be REFUSED.
+    ///
+    /// WHY THIS TEST IS THE POINT OF THE CHANGE. `receive_spin_adaptive` was
+    /// added to the mount knob line so the adaptive lever is attestable
+    /// in-process. Emitting a field proves nothing on its own — what matters is
+    /// that it makes an adaptive-only A/B DIVERGE, because
+    /// `candidate_knob_divergence` fails a run closed when the two arms
+    /// self-report identical knobs. Before the field existed, both arms of an
+    /// adaptive A/B reported the same `receive_spin=<n>` and the run was refused
+    /// as a configuration compared against itself.
+    ///
+    /// This is not pedantry for this particular lever. Adaptive and fixed spin
+    /// are EXPECTED to behave identically under a dense request stream — the
+    /// bead measured 4.252876x adaptive against 4.281783x fixed — so the wall
+    /// numbers cannot discriminate them. A run whose adaptive flag silently
+    /// failed to apply would produce exactly those numbers. The knob line is the
+    /// only in-process evidence that the daemon actually TOOK the setting, as
+    /// opposed to the harness having merely SET it in `candidate_b_env`.
+    ///
+    /// The second half is the load-bearing one: it reconstructs the pre-fix line
+    /// by dropping the field, and asserts the run is refused. Without it, this
+    /// test would pass just as well if `receive_spin_adaptive` were a constant.
+    #[test]
+    fn candidate_knob_divergence_admits_an_adaptive_only_ab_bd_087wt() {
+        // Post-fix lines: identical but for the adaptive flag, which is exactly
+        // what `--candidate-b-env FFS_FUSE_RECEIVE_SPIN_ADAPTIVE=1` produces.
+        let fixed = "receive_spin=2000,receive_spin_adaptive=false,spin_pause=0";
+        let adaptive = "receive_spin=2000,receive_spin_adaptive=true,spin_pause=0";
+        let diverged = vec![
+            fuse_mount_for_test(Arm::FuseA, fixed),
+            fuse_mount_for_test(Arm::FuseB, fixed),
+            fuse_mount_for_test(Arm::CandidateBA, adaptive),
+            fuse_mount_for_test(Arm::CandidateBB, adaptive),
+        ];
+        assert_eq!(
+            candidate_knob_divergence(&diverged, true)
+                .expect("an adaptive-only A/B must be admitted once the flag is on the knob line"),
+            (fixed.to_owned(), adaptive.to_owned())
+        );
+
+        // NEGATIVE HALF: the same A/B as the line looked BEFORE the field was
+        // added — spin value only. The two arms are indistinguishable, so the
+        // run must fail closed. This is what made the adaptive lever
+        // unmeasurable, and it is what the new field fixes.
+        let pre_fix = "receive_spin=2000,spin_pause=0";
+        let indistinguishable = vec![
+            fuse_mount_for_test(Arm::FuseA, pre_fix),
+            fuse_mount_for_test(Arm::FuseB, pre_fix),
+            fuse_mount_for_test(Arm::CandidateBA, pre_fix),
+            fuse_mount_for_test(Arm::CandidateBB, pre_fix),
+        ];
+        let error = candidate_knob_divergence(&indistinguishable, true).expect_err(
+            "without the adaptive field the two arms are identical and the run must be refused",
+        );
+        assert!(
+            error.to_string().contains("IDENTICAL runtime knobs"),
+            "unexpected refusal reason: {error}"
+        );
+
+        // And the A/A null keeps its opposite requirement for this lever too:
+        // identical adaptive settings must AGREE, differing ones must not.
+        candidate_knob_divergence(&indistinguishable, false)
+            .expect("an A/A null with identical knobs agrees");
+        assert!(
+            candidate_knob_divergence(&diverged, false).is_err(),
+            "an A/A null whose arms differ in the adaptive flag is not a null"
+        );
+    }
+
     /// bd-ha71t: an `FFS_FUSE_XATTR_NO_SUPPORT` A/B diverges only because the
     /// RESOLVED suppression state is part of the knob string.
     ///
