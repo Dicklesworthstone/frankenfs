@@ -7609,10 +7609,11 @@ fn log_mount_shutdown_metrics(
         Ok("1" | "true")
     ) {
         eprintln!(
-            "mount_dispatch_metrics,filesystem={filesystem},getattr_dispatch_count={},getattr_dispatch_nanos={},getxattr_dispatch_count={},getxattr_dispatch_nanos={},lookup_dispatch_count={},lookup_dispatch_nanos={},readdir_dispatch_count={},readdir_dispatch_nanos={},mutation_dispatch_count={},mutation_dispatch_nanos={},other_dispatch_count={},other_dispatch_nanos={},handler_total_count={},handler_total_nanos={},forget_nodes={},readdirplus_memo_remembers={},readdirplus_memo_hits={}",
+            "mount_dispatch_metrics,filesystem={filesystem},getattr_dispatch_count={},getattr_dispatch_nanos={},getxattr_dispatch_count={},getxattr_request_count={},getxattr_dispatch_nanos={},lookup_dispatch_count={},lookup_dispatch_nanos={},readdir_dispatch_count={},readdir_dispatch_nanos={},mutation_dispatch_count={},mutation_dispatch_nanos={},other_dispatch_count={},other_dispatch_nanos={},handler_total_count={},handler_total_nanos={},forget_nodes={},readdirplus_memo_remembers={},readdirplus_memo_hits={}",
             metrics.getattr_dispatch_count,
             metrics.getattr_dispatch_nanos,
             metrics.getxattr_dispatch_count,
+            metrics.getxattr_request_count,
             metrics.getxattr_dispatch_nanos,
             metrics.lookup_dispatch_count,
             metrics.lookup_dispatch_nanos,

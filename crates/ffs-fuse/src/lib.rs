@@ -2481,6 +2481,9 @@ pub struct AtomicMetrics {
     pub getattr_dispatch_nanos: CacheLinePadded<AtomicU64>,
     /// Number of `Getxattr` request-scope dispatches completed by the daemon.
     pub getxattr_dispatch_count: CacheLinePadded<AtomicU64>,
+    /// Number of `Getxattr` requests received at the FUSE boundary, including
+    /// memo-served replies which deliberately never open a dispatch scope.
+    pub getxattr_request_count: CacheLinePadded<AtomicU64>,
     /// Cumulative daemon dispatch time for `Getxattr` request scopes, in ns.
     pub getxattr_dispatch_nanos: CacheLinePadded<AtomicU64>,
     /// Number of `Lookup` request-scope dispatches completed by the daemon.
@@ -2549,6 +2552,7 @@ impl AtomicMetrics {
             getattr_dispatch_count: CacheLinePadded(AtomicU64::new(0)),
             getattr_dispatch_nanos: CacheLinePadded(AtomicU64::new(0)),
             getxattr_dispatch_count: CacheLinePadded(AtomicU64::new(0)),
+            getxattr_request_count: CacheLinePadded(AtomicU64::new(0)),
             getxattr_dispatch_nanos: CacheLinePadded(AtomicU64::new(0)),
             handler_total_nanos: CacheLinePadded(AtomicU64::new(0)),
             handler_total_count: CacheLinePadded(AtomicU64::new(0)),
@@ -2589,6 +2593,16 @@ impl AtomicMetrics {
     fn record_memoized(&self) {
         Self::saturating_add(&self.requests_total.0, 1);
         Self::saturating_add(&self.requests_ok.0, 1);
+    }
+
+    /// Record a `getxattr` request before a memo can answer it.
+    ///
+    /// Dispatch counters intentionally exclude memo hits, but warm-stat
+    /// attribution needs the number of kernel-originated capability probes at
+    /// the FUSE boundary. Keeping the two counters distinct prevents a
+    /// memo-served request from being presented as a format-layer dispatch.
+    fn record_getxattr_request(&self) {
+        Self::saturating_add(&self.getxattr_request_count.0, 1);
     }
 
     fn record_bytes_read(&self, n: u64) {
@@ -2724,6 +2738,7 @@ impl AtomicMetrics {
             getattr_dispatch_count: self.getattr_dispatch_count.0.load(Ordering::Relaxed),
             getattr_dispatch_nanos: self.getattr_dispatch_nanos.0.load(Ordering::Relaxed),
             getxattr_dispatch_count: self.getxattr_dispatch_count.0.load(Ordering::Relaxed),
+            getxattr_request_count: self.getxattr_request_count.0.load(Ordering::Relaxed),
             getxattr_dispatch_nanos: self.getxattr_dispatch_nanos.0.load(Ordering::Relaxed),
             mutation_dispatch_count: self.mutation_dispatch_count.0.load(Ordering::Relaxed),
             mutation_dispatch_nanos: self.mutation_dispatch_nanos.0.load(Ordering::Relaxed),
@@ -2769,6 +2784,7 @@ impl std::fmt::Debug for AtomicMetrics {
             .field("getattr_dispatch_count", &s.getattr_dispatch_count)
             .field("getattr_dispatch_nanos", &s.getattr_dispatch_nanos)
             .field("getxattr_dispatch_count", &s.getxattr_dispatch_count)
+            .field("getxattr_request_count", &s.getxattr_request_count)
             .field("getxattr_dispatch_nanos", &s.getxattr_dispatch_nanos)
             .field("mutation_dispatch_count", &s.mutation_dispatch_count)
             .field("mutation_dispatch_nanos", &s.mutation_dispatch_nanos)
@@ -2804,6 +2820,7 @@ pub struct MetricsSnapshot {
     pub getattr_dispatch_count: u64,
     pub getattr_dispatch_nanos: u64,
     pub getxattr_dispatch_count: u64,
+    pub getxattr_request_count: u64,
     pub getxattr_dispatch_nanos: u64,
     /// Mutating dispatches and their cumulative time (bd-i353e). Aggregated
     /// across every write-side `RequestOp`; see `record_dispatch_duration`.
@@ -5416,6 +5433,7 @@ impl FrankenFuse {
         // only ever caches ABSENCE, so the failure it must not permit is
         // "reported absent after it exists", which is precisely what `forget`
         // closes.
+        self.inner.metrics.record_getxattr_request();
         record_xattr_probe_name(name);
         let is_capability_probe = name == SECURITY_CAPABILITY_XATTR;
         // bd-t0xoq: checked BEFORE the memo, because it subsumes it. The memo can
@@ -11014,6 +11032,9 @@ mod tests {
                 .is_none()
         );
         assert_eq!(calls.load(Ordering::Relaxed), 1);
+        let snap = fuse.metrics().snapshot();
+        assert_eq!(snap.getxattr_request_count, 2);
+        assert_eq!(snap.getxattr_dispatch_count, 1);
 
         assert!(fuse.getxattr_value(ino, "user.mime").unwrap().is_none());
         assert!(
@@ -21808,7 +21829,7 @@ mod tests {
             // hand-written AtomicMetrics Debug needed a comment of its own.
             "handler_total_nanos: 0, handler_total_count: 0, ",
             "getattr_dispatch_count: 0, ",
-            "getattr_dispatch_nanos: 0, getxattr_dispatch_count: 0, getxattr_dispatch_nanos: 0, ",
+            "getattr_dispatch_nanos: 0, getxattr_dispatch_count: 0, getxattr_request_count: 0, getxattr_dispatch_nanos: 0, ",
             // bd-i353e added the mutation counters in 3145d182 without updating this
             // golden, which left `mount_handle_debug_format` red on HEAD. Restored.
             "mutation_dispatch_count: 0, mutation_dispatch_nanos: 0, ",
@@ -23007,6 +23028,7 @@ AllowOther"#;
             getattr_dispatch_count: 4,
             getattr_dispatch_nanos: 400,
             getxattr_dispatch_count: 2,
+            getxattr_request_count: 2,
             getxattr_dispatch_nanos: 200,
             lookup_dispatch_count: 5,
             lookup_dispatch_nanos: 500,
@@ -23026,6 +23048,7 @@ AllowOther"#;
             getattr_dispatch_count: 4,
             getattr_dispatch_nanos: 400,
             getxattr_dispatch_count: 2,
+            getxattr_request_count: 2,
             getxattr_dispatch_nanos: 200,
             lookup_dispatch_count: 5,
             lookup_dispatch_nanos: 500,
@@ -23313,6 +23336,7 @@ AllowOther"#;
             getattr_dispatch_count: 0,
             getattr_dispatch_nanos: 0,
             getxattr_dispatch_count: 0,
+            getxattr_request_count: 0,
             getxattr_dispatch_nanos: 0,
             handler_total_nanos: 0,
             handler_total_count: 0,
@@ -23361,6 +23385,7 @@ AllowOther"#;
             "getattr_dispatch_count: 0, ",
             "getattr_dispatch_nanos: 0, ",
             "getxattr_dispatch_count: 0, ",
+            "getxattr_request_count: 0, ",
             "getxattr_dispatch_nanos: 0, ",
             "mutation_dispatch_count: 0, ",
             "mutation_dispatch_nanos: 0, ",

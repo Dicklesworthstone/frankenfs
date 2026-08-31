@@ -1184,6 +1184,7 @@ struct FfsDispatchMetrics {
     getattr_dispatch_count: u64,
     getattr_dispatch_nanos: u64,
     getxattr_dispatch_count: u64,
+    getxattr_request_count: u64,
     getxattr_dispatch_nanos: u64,
     lookup_dispatch_count: u64,
     lookup_dispatch_nanos: u64,
@@ -3259,6 +3260,7 @@ fn parse_mount_dispatch_metrics(
         getattr_dispatch_count: parse("getattr_dispatch_count")?,
         getattr_dispatch_nanos: parse("getattr_dispatch_nanos")?,
         getxattr_dispatch_count: parse("getxattr_dispatch_count")?,
+        getxattr_request_count: parse("getxattr_request_count")?,
         getxattr_dispatch_nanos: parse("getxattr_dispatch_nanos")?,
         lookup_dispatch_count: parse("lookup_dispatch_count")?,
         lookup_dispatch_nanos: parse("lookup_dispatch_nanos")?,
@@ -7777,6 +7779,7 @@ fuse_null_median={:.6},inflation_suspected={},gate_input=false",
                                     "getattr_dispatch_count": metrics.getattr_dispatch_count,
                                     "getattr_dispatch_nanos": metrics.getattr_dispatch_nanos,
                                     "getxattr_dispatch_count": metrics.getxattr_dispatch_count,
+                                    "getxattr_request_count": metrics.getxattr_request_count,
                                     "getxattr_dispatch_nanos": metrics.getxattr_dispatch_nanos,
                                     "lookup_dispatch_count": metrics.lookup_dispatch_count,
                                     "lookup_dispatch_nanos": metrics.lookup_dispatch_nanos,
@@ -12410,7 +12413,7 @@ mod tests {
         let old_log = temp.path().join("old.log");
         fs::write(
             &old_log,
-            "mount_dispatch_metrics,filesystem=btrfs,getattr_dispatch_count=20,getattr_dispatch_nanos=200,getxattr_dispatch_count=4,getxattr_dispatch_nanos=40,lookup_dispatch_count=8,lookup_dispatch_nanos=800,readdir_dispatch_count=2,readdir_dispatch_nanos=20\n",
+            "mount_dispatch_metrics,filesystem=btrfs,getattr_dispatch_count=20,getattr_dispatch_nanos=200,getxattr_dispatch_count=4,getxattr_request_count=9,getxattr_dispatch_nanos=40,lookup_dispatch_count=8,lookup_dispatch_nanos=800,readdir_dispatch_count=2,readdir_dispatch_nanos=20\n",
         )
         .expect("write old log");
         let old = parse_mount_dispatch_metrics(&old_log, FilesystemKind::Btrfs)
@@ -12429,7 +12432,7 @@ mod tests {
         let new_log = temp.path().join("new.log");
         fs::write(
             &new_log,
-            "mount_dispatch_metrics,filesystem=btrfs,getattr_dispatch_count=20,getattr_dispatch_nanos=200,getxattr_dispatch_count=4,getxattr_dispatch_nanos=40,lookup_dispatch_count=8,lookup_dispatch_nanos=800,readdir_dispatch_count=2,readdir_dispatch_nanos=20,mutation_dispatch_count=15,mutation_dispatch_nanos=105,other_dispatch_count=11,other_dispatch_nanos=77,handler_total_count=7,handler_total_nanos=4242\n",
+            "mount_dispatch_metrics,filesystem=btrfs,getattr_dispatch_count=20,getattr_dispatch_nanos=200,getxattr_dispatch_count=4,getxattr_request_count=9,getxattr_dispatch_nanos=40,lookup_dispatch_count=8,lookup_dispatch_nanos=800,readdir_dispatch_count=2,readdir_dispatch_nanos=20,mutation_dispatch_count=15,mutation_dispatch_nanos=105,other_dispatch_count=11,other_dispatch_nanos=77,handler_total_count=7,handler_total_nanos=4242\n",
         )
         .expect("write new log");
         let new = parse_mount_dispatch_metrics(&new_log, FilesystemKind::Btrfs)
@@ -12444,7 +12447,7 @@ mod tests {
         let zero_log = temp.path().join("zero.log");
         fs::write(
             &zero_log,
-            "mount_dispatch_metrics,filesystem=btrfs,getattr_dispatch_count=20,getattr_dispatch_nanos=200,getxattr_dispatch_count=4,getxattr_dispatch_nanos=40,lookup_dispatch_count=8,lookup_dispatch_nanos=800,readdir_dispatch_count=2,readdir_dispatch_nanos=20,handler_total_count=0,handler_total_nanos=0\n",
+            "mount_dispatch_metrics,filesystem=btrfs,getattr_dispatch_count=20,getattr_dispatch_nanos=200,getxattr_dispatch_count=4,getxattr_request_count=9,getxattr_dispatch_nanos=40,lookup_dispatch_count=8,lookup_dispatch_nanos=800,readdir_dispatch_count=2,readdir_dispatch_nanos=20,handler_total_count=0,handler_total_nanos=0\n",
         )
         .expect("write zero log");
         let zero = parse_mount_dispatch_metrics(&zero_log, FilesystemKind::Btrfs)
@@ -12464,7 +12467,7 @@ mod tests {
         let log = temp.path().join("mount.log");
         fs::write(
             &log,
-            "mount_dispatch_metrics,filesystem=btrfs,getattr_dispatch_count=20,getattr_dispatch_nanos=200,getxattr_dispatch_count=4,getxattr_dispatch_nanos=40,lookup_dispatch_count=8,lookup_dispatch_nanos=800,readdir_dispatch_count=2,readdir_dispatch_nanos=20\n",
+            "mount_dispatch_metrics,filesystem=btrfs,getattr_dispatch_count=20,getattr_dispatch_nanos=200,getxattr_dispatch_count=4,getxattr_request_count=9,getxattr_dispatch_nanos=40,lookup_dispatch_count=8,lookup_dispatch_nanos=800,readdir_dispatch_count=2,readdir_dispatch_nanos=20\n",
         )
         .expect("write mount log");
 
@@ -12472,6 +12475,7 @@ mod tests {
             .expect("parse dispatch metrics")
             .expect("metrics reported");
         assert_eq!(metrics.getattr_dispatch_count, 20);
+        assert_eq!(metrics.getxattr_request_count, 9);
         assert_eq!(metrics.getxattr_dispatch_nanos, 40);
         assert_eq!(metrics.lookup_dispatch_count, 8);
         assert_eq!(metrics.lookup_dispatch_nanos, 800);
@@ -12496,7 +12500,7 @@ mod tests {
         let log = temp.path().join("mount.log");
         fs::write(
             &log,
-            "mount_dispatch_metrics,filesystem=btrfs,getattr_dispatch_count=20,getattr_dispatch_nanos=200,getxattr_dispatch_count=4,getxattr_dispatch_nanos=40,readdir_dispatch_count=2,readdir_dispatch_nanos=20\n",
+            "mount_dispatch_metrics,filesystem=btrfs,getattr_dispatch_count=20,getattr_dispatch_nanos=200,getxattr_dispatch_count=4,getxattr_request_count=9,getxattr_dispatch_nanos=40,readdir_dispatch_count=2,readdir_dispatch_nanos=20\n",
         )
         .expect("write pre-lookup mount log");
         assert!(parse_mount_dispatch_metrics(&log, FilesystemKind::Btrfs).is_err());
