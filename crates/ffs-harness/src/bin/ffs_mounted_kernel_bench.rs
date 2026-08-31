@@ -3981,21 +3981,115 @@ fn fold_xattr_names(mut digest: u64, names: &[Vec<u8>]) -> u64 {
     digest
 }
 
+/// Where one xattr report job's time went, bucket by bucket (bd-4sull phase-split
+/// of the worst standing loss).
+///
+/// The six buckets TILE the timed region: every nanosecond between the start and
+/// end of a loop iteration belongs to exactly one of them, so they close against
+/// the batch's own elapsed total rather than merely summing to something smaller.
+/// That is the whole point — a decomposition whose parts do not add up to the whole
+/// is an attribution with an unexplained residual, and this campaign has already
+/// been bitten by publishing one.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct XattrPhaseSplit {
+    get_inline_ns: u64,
+    get_external_ns: u64,
+    get_absent_ns: u64,
+    list_single_ns: u64,
+    list_many_ns: u64,
+    fold_ns: u64,
+    records: u64,
+}
+
+impl XattrPhaseSplit {
+    const fn attributed_ns(self) -> u64 {
+        self.get_inline_ns
+            .saturating_add(self.get_external_ns)
+            .saturating_add(self.get_absent_ns)
+            .saturating_add(self.list_single_ns)
+            .saturating_add(self.list_many_ns)
+            .saturating_add(self.fold_ns)
+    }
+
+    fn as_json(self, elapsed_ns: u64) -> Value {
+        json!({
+            "xattr_phase_split": {
+                "get_inline_ns": self.get_inline_ns,
+                "get_external_ns": self.get_external_ns,
+                "get_absent_ns": self.get_absent_ns,
+                "list_single_ns": self.list_single_ns,
+                "list_many_ns": self.list_many_ns,
+                "fold_ns": self.fold_ns,
+                "records": self.records,
+                "attributed_ns": self.attributed_ns(),
+                "elapsed_ns": elapsed_ns,
+                "unattributed_ns": elapsed_ns.saturating_sub(self.attributed_ns()),
+            }
+        })
+    }
+}
+
+/// Is the per-phase split enabled? Default OFF (`bd-4sull`).
+///
+/// OFF by design, not caution: the banked `6.059387x` row was measured without
+/// these clock reads, and enabling them by default would move the very absolutes
+/// the split exists to explain. With the knob off the loop pays one predictable
+/// branch per call and takes no timestamp; that cost is stated rather than claimed
+/// to be zero, and any row published with the split ON must say so.
+fn xattr_phase_split_requested() -> bool {
+    env::var("FFS_XATTR_PHASE_SPLIT").is_ok_and(|value| value == "1")
+}
+
 fn xattr_get_list_report_batch(root: &Path, operations: usize) -> Result<(u64, u64)> {
+    let (elapsed, digest, split) =
+        xattr_get_list_report_batch_split(root, operations, xattr_phase_split_requested())?;
+    if let Some(split) = split {
+        println!("{}", split.as_json(elapsed));
+    }
+    Ok((elapsed, digest))
+}
+
+/// The batch, plus the per-phase split when it is enabled.
+///
+/// The digest is computed identically on both paths and is asserted equal across
+/// them by test, because an instrument that changes the result it measures is not
+/// an instrument.
+fn xattr_get_list_report_batch_split(
+    root: &Path,
+    operations: usize,
+    timed: bool,
+) -> Result<(u64, u64, Option<XattrPhaseSplit>)> {
     let inline_path = root.join(XATTR_INLINE_FILE);
     let external_path = root.join(XATTR_EXTERNAL_FILE);
     let many_path = root.join(XATTR_MANY_FILE);
     let mut digest = 0xCBF2_9CE4_8422_2325_u64;
+    let mut split = XattrPhaseSplit::default();
+    // `None` on the fast path, so a disabled split takes no timestamp at all.
+    let mut mark = timed.then(Instant::now);
+    let lap = |split_bucket: &mut u64, mark: &mut Option<Instant>| {
+        if let Some(previous) = mark {
+            let now = Instant::now();
+            *split_bucket = split_bucket.saturating_add(
+                u64::try_from(now.duration_since(*previous).as_nanos()).unwrap_or(u64::MAX),
+            );
+            *mark = Some(now);
+        }
+    };
     let started = Instant::now();
     for report in 0..operations {
         let inline = xattr::get(black_box(&inline_path), XATTR_INLINE_NAME)
             .with_context(|| format!("timed getxattr {}", inline_path.display()))?;
+        lap(&mut split.get_inline_ns, &mut mark);
         let external = xattr::get(black_box(&external_path), XATTR_EXTERNAL_NAME)
             .with_context(|| format!("timed getxattr {}", external_path.display()))?;
+        lap(&mut split.get_external_ns, &mut mark);
         let absent = xattr::get(black_box(&inline_path), XATTR_ABSENT_NAME)
             .with_context(|| format!("timed absent getxattr {}", inline_path.display()))?;
+        lap(&mut split.get_absent_ns, &mut mark);
         let single_names = list_xattr_names(black_box(&inline_path))?;
+        lap(&mut split.list_single_ns, &mut mark);
         let many_names = list_xattr_names(black_box(&many_path))?;
+        lap(&mut split.list_many_ns, &mut mark);
 
         digest ^= u64::try_from(report).unwrap_or(u64::MAX).rotate_left(17);
         digest = fold_xattr_bytes(digest, inline.as_deref().unwrap_or_default());
@@ -4007,10 +4101,12 @@ fn xattr_get_list_report_batch(root: &Path, operations: usize) -> Result<(u64, u
         };
         digest = fold_xattr_names(digest, &single_names);
         digest = fold_xattr_names(digest, &many_names);
+        lap(&mut split.fold_ns, &mut mark);
+        split.records = split.records.saturating_add(u64::from(timed));
     }
     let elapsed = u64::try_from(started.elapsed().as_nanos()).unwrap_or(u64::MAX);
     black_box(digest);
-    Ok((elapsed, digest))
+    Ok((elapsed, digest, timed.then_some(split)))
 }
 
 fn digest_path(path: &Path) -> u64 {
@@ -11106,6 +11202,55 @@ mod tests {
         assert_eq!(witness.single_list_names, 1);
         assert_eq!(witness.many_list_names, XATTR_MANY_NAMES);
         assert!(witness.absent_lookup_none);
+
+        // bd-4sull: the phase split must CLOSE and must not change the result.
+        {
+            let (plain_ns, plain_digest, plain_split) =
+                xattr_get_list_report_batch_split(temp.path(), 4, false)
+                    .expect("unsplit xattr report");
+            assert!(plain_ns > 0);
+            assert_eq!(
+                plain_split, None,
+                "the split must be OFF by default: the banked row was measured without it"
+            );
+
+            let (split_ns, split_digest, split) =
+                xattr_get_list_report_batch_split(temp.path(), 4, true)
+                    .expect("split xattr report");
+
+            let split = split.expect("the split is enabled");
+            assert_eq!(
+                split_digest, plain_digest,
+                "an instrument that changes the result it measures is not an instrument"
+            );
+            assert_eq!(split.records, 4, "every job must be recorded");
+
+            // Each phase RAN. A bucket that is silently zero would attribute the
+            // row's cost to the wrong call while every other assertion passed.
+            for (label, ns) in [
+                ("get_inline", split.get_inline_ns),
+                ("get_external", split.get_external_ns),
+                ("get_absent", split.get_absent_ns),
+                ("list_single", split.list_single_ns),
+                ("list_many", split.list_many_ns),
+                ("fold", split.fold_ns),
+            ] {
+                assert!(ns > 0, "phase {label} recorded no time, so it did not run");
+            }
+
+            // CLOSURE: the six buckets tile the timed region, so they must account
+            // for essentially all of it. They can never exceed it.
+            assert!(
+                split.attributed_ns() <= split_ns,
+                "attributed {} ns exceeds the measured {split_ns} ns",
+                split.attributed_ns()
+            );
+            let unattributed = split_ns - split.attributed_ns();
+            assert!(
+                unattributed * 4 <= split_ns,
+                "phase split does not close: {unattributed} ns of {split_ns} ns unattributed"
+            );
+        }
 
         let (elapsed_ns, first_digest) =
             xattr_get_list_report_batch(temp.path(), 2).expect("first xattr report");
