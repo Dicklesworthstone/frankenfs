@@ -5408,6 +5408,64 @@ fn read_cpu_ticks() -> Result<BTreeMap<usize, CpuTicks>> {
     Ok(cpus)
 }
 
+/// Per-device milliseconds spent doing I/O — `/proc/diskstats` field 10.
+///
+/// Every other field in that file counts REQUESTS or SECTORS, which say how much
+/// work arrived, not whether the device could keep up. Field 10 is wall time the
+/// request queue was non-empty, so a fraction built from it over the same window
+/// is device UTILISATION: 1.0 means the queue never drained.
+///
+/// This exists because bd-xhl2g measured that iowait cannot stand in for it. In
+/// 9 windows with `dm-0` at 0.98-1.00 utilisation, off-placement mean iowait read
+/// 0.0165-0.2283, and 4 of those 9 sat INSIDE the quiet population's range
+/// (max quiet 0.020123). iowait tracks how many tasks are blocked at once, not
+/// how hard the device is being pushed — a saturated queue with few blocked
+/// readers looks exactly like an idle host.
+///
+/// Errors are the caller's to swallow: this is evidence, never a gate input.
+fn read_disk_io_ms() -> Result<BTreeMap<String, u64>> {
+    let mut out = BTreeMap::new();
+    for line in fs::read_to_string("/proc/diskstats")?.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        // Name is field 3 (1-indexed); io_ticks is field 13 (1-indexed), which is
+        // the kernel's "field 10" in Documentation/admin-guide/iostats.rst because
+        // that document numbers from the first STAT rather than the first column.
+        if fields.len() < 13 {
+            continue;
+        }
+        if let Ok(ms) = fields[12].parse::<u64>() {
+            out.insert(fields[2].to_string(), ms);
+        }
+    }
+    ensure!(!out.is_empty(), "no device rows in /proc/diskstats");
+    Ok(out)
+}
+
+/// Per-device utilisation over a window, from two `read_disk_io_ms` snapshots.
+///
+/// `elapsed_ms` is measured rather than assumed, because the sampler's window is
+/// `CPU_SAMPLE_INTERVAL` plus whatever the two `/proc` reads cost, and dividing
+/// by the nominal interval would report utilisation above 1.0 on a pinned device.
+/// Clamped to `1.0` regardless, since a device cannot be busier than the clock.
+fn device_io_fractions(
+    before: &BTreeMap<String, u64>,
+    after: &BTreeMap<String, u64>,
+    elapsed_ms: f64,
+) -> BTreeMap<String, f64> {
+    let mut out = BTreeMap::new();
+    if elapsed_ms <= 0.0 {
+        return out;
+    }
+    for (device, start) in before {
+        let Some(end) = after.get(device) else {
+            continue;
+        };
+        let busy_ms = end.saturating_sub(*start) as f64;
+        out.insert(device.clone(), (busy_ms / elapsed_ms).min(1.0));
+    }
+    out
+}
+
 /// One sample of per-CPU busy AND iowait fractions over `CPU_SAMPLE_INTERVAL`.
 ///
 /// Both come from the same tick pair, so they describe the same window and can
@@ -5543,13 +5601,34 @@ const MAX_EXTERNAL_BUSY_CPUS_UNDER_IO_STORM: usize = 2;
 
 /// Off-placement mean iowait above which a SAMPLE is treated as an I/O storm.
 ///
-/// Calibrated from the two populations, which separate by three orders of
-/// magnitude, so the exact value is not delicate:
+/// Calibrated from the two populations, which separate by two orders of
+/// magnitude:
 ///
-///   quiet   0.002199, 0.002369, 0.004484   (this box's floor, loadavg ~5)
-///   storm   0.864447, 0.870921, 0.920051, 0.922171   (bd-xhl2g harvest)
+///   quiet   0.002057, 0.002199, 0.002369, 0.004484, 0.006937, 0.007649, 0.020123
+///   storm   0.864447, 0.870921, 0.920051, 0.922171   (parallel-build windows)
 ///
-/// `0.10` sits ~25x above the worst quiet sample and ~9x below the mildest storm.
+/// ⚠ CORRECTED 2026-09-01 (bd-xhl2g). This comment previously listed three quiet
+/// samples and claimed `0.10` sits "~25x above the worst quiet sample". Four more
+/// quiet windows harvested at loadavg ~5-7 reached 0.020123, so the real margin is
+/// **4.9x**, not 25x. The value is still defensible; the stated headroom was not.
+///
+/// ⚠ AND IT DETECTS THE WRONG THING, which matters more than the margin. This
+/// threshold names itself an I/O-STORM detector, and bd-xhl2g measured that it is
+/// not one. Across 9 windows with `dm-0` held at 0.98-1.00 utilisation by direct
+/// reads, off-placement mean iowait read:
+///
+///   0.016519  0.016792  0.018185  0.020425  0.023634  0.041493  0.052810
+///   0.066296  0.228283
+///
+/// Exactly ONE of the nine clears `0.10`. Four sit inside the quiet range above.
+/// iowait is high when many tasks are blocked AT ONCE — the parallel-build storms
+/// ran at loadavg 443-731 — and a fully saturated queue driven by three readers at
+/// loadavg 9.9 is invisible to it.
+///
+/// So what this constant actually selects is HEAVY MULTI-TASK I/O LOAD, which is a
+/// real and useful thing to withhold the busy relaxation from, and it is left in
+/// place for that. It is not a device-contention gate and must not be described as
+/// one. `peak_device_io_fraction` is the field that measures the queue.
 const IO_STORM_OFF_PLACEMENT_MEAN_IOWAIT: f64 = 0.10;
 
 /// Fraction of contended samples above which a run is refused.
@@ -5671,6 +5750,40 @@ struct ExternalLoadWitness {
     max_placement_mhz: Option<f64>,
     /// Clock samples taken. Zero means the two endpoint figures are all there is.
     clock_samples: usize,
+    /// Highest single-device utilisation seen in any sample, and which device.
+    ///
+    /// bd-xhl2g: the mechanism by which I/O load hurts a mounted comparator is
+    /// contention for the DEVICE QUEUE, and until now nothing in the report
+    /// measured it — the harness read `/proc/stat` and never `/proc/diskstats`.
+    /// iowait was the closest available proxy and was measured NOT to be one
+    /// (see `read_disk_io_ms`).
+    ///
+    /// Recorded and deliberately NOT fed to the verdict, on exactly the reasoning
+    /// that landed `peak_mean_iowait` as evidence: a new refusal criterion would
+    /// retroactively split banked rows into admitted and refused without
+    /// re-running any of them. Whether device utilisation SHOULD gate needs the
+    /// one thing this campaign has never measured — whether a saturated queue
+    /// actually moves a ratio — and that is bd-cljvq, not this field.
+    peak_device_io_fraction: f64,
+    busiest_device: Option<String>,
+    /// Running sum of each device's per-sample utilisation, so a SUSTAINED figure
+    /// can be reported beside the peak.
+    ///
+    /// Both are here because measurement said one is not enough (bd-cljvq). The
+    /// PEAK is a burst detector and separates badly: on a quiet box at loadavg
+    /// 4.3-8.2 it reached 0.061, 0.106, 0.133, 0.354, 0.496, 0.529 — so a quiet
+    /// window can peak past HALF a pinned device, and against a saturated ~1.0
+    /// that is under 2x with overlap. The window MEAN separates cleanly on the
+    /// same evidence (quiet 0.023-0.125 vs saturated 0.983-1.000, ~7.8x, no
+    /// overlap), because a single stalled second cannot move it.
+    ///
+    /// Neither gates. Recording both is what lets bd-cljvq ask whether a ratio
+    /// moves with a BURST or with SUSTAINED pressure — different questions with
+    /// different answers, and a single field would have silently picked one.
+    device_io_sums: BTreeMap<String, f64>,
+    /// Samples in which diskstats could be read at all. Zero means the two
+    /// fields above are absence, not a measured quiet.
+    device_samples: usize,
 }
 
 impl ExternalLoadWitness {
@@ -5747,6 +5860,50 @@ impl ExternalLoadWitness {
                 self.peak_placement_mean_iowait = mean;
             }
         }
+    }
+
+    /// Record device utilisation for one sample (bd-xhl2g).
+    ///
+    /// Separate from `observe` for the same reason `observe_clock` is: folding it
+    /// in would touch every existing test call site for a field none of them
+    /// exercise, and a host that cannot read `/proc/diskstats` must still be able
+    /// to take CPU samples.
+    ///
+    /// Evidence, not a gate — nothing here can refuse a run.
+    fn observe_device_io(&mut self, util: &BTreeMap<String, f64>) {
+        if util.is_empty() {
+            return;
+        }
+        self.device_samples += 1;
+        for (device, fraction) in util {
+            if *fraction > self.peak_device_io_fraction {
+                self.peak_device_io_fraction = *fraction;
+                self.busiest_device = Some(device.clone());
+            }
+            *self.device_io_sums.entry(device.clone()).or_insert(0.0) += *fraction;
+        }
+    }
+
+    /// The busiest device's SUSTAINED utilisation, and its name.
+    ///
+    /// Mean over the samples actually taken, not over the run's wall time, so a
+    /// sampler that missed reads reports the mean of what it saw rather than a
+    /// figure diluted towards zero by its own gaps.
+    fn mean_device_io(&self) -> (f64, Option<String>) {
+        if self.device_samples == 0 {
+            return (0.0, None);
+        }
+        let samples = self.device_samples as f64;
+        self.device_io_sums
+            .iter()
+            .map(|(device, sum)| (sum / samples, device))
+            .fold((0.0, None), |(best, name), (mean, device)| {
+                if mean > best {
+                    (mean, Some(device.clone()))
+                } else {
+                    (best, name)
+                }
+            })
     }
 
     /// Record the clocks of the CPUs our own arms occupy.
@@ -9202,11 +9359,30 @@ fn run() -> Result<Option<PathBuf>> {
             while !stop.load(Ordering::Relaxed) {
                 // Errors here must never fail a run: this is evidence, not a gate
                 // input, until the verdict below reads it.
+                //
+                // bd-xhl2g: the diskstats snapshots bracket the CPU sample rather
+                // than sharing its sleep, so the device window is the CPU window
+                // plus the cost of the /proc reads. `device_io_fractions` divides
+                // by the MEASURED elapsed time for exactly that reason.
+                let disk_before = read_disk_io_ms().ok();
+                let sample_started = Instant::now();
                 if let Ok((busy, iowait)) = sample_cpu_load() {
                     let clocks = cpu_mhz();
+                    let device_io = disk_before
+                        .as_ref()
+                        .and_then(|before| {
+                            let after = read_disk_io_ms().ok()?;
+                            Some(device_io_fractions(
+                                before,
+                                &after,
+                                sample_started.elapsed().as_secs_f64() * 1000.0,
+                            ))
+                        })
+                        .unwrap_or_default();
                     if let Ok(mut w) = witness.lock() {
                         w.observe(&busy, &iowait, &placement_cpus, MAX_EXTERNAL_BUSY_CPUS);
                         w.observe_clock(&clocks, &placement_cpus);
+                        w.observe_device_io(&device_io);
                     }
                 }
             }
@@ -9243,6 +9419,7 @@ fn run() -> Result<Option<PathBuf>> {
         .map(|w| w.clone())
         .unwrap_or_default();
     let external_load_clean = external_load.clean();
+    let (mean_device_io_fraction, mean_device_io_device) = external_load.mean_device_io();
     println!(
         "external_load_during_run,samples={},max_external_busy_cpus={},over_limit_samples={},\
          contended_fraction={:.4},max_consecutive_over_limit={},\
@@ -9251,6 +9428,8 @@ fn run() -> Result<Option<PathBuf>> {
          busy_cpu_fraction_limit={:.2},max_external_busy_cpus_limit={},\
          io_storm_samples={},max_external_busy_cpus_limit_under_io_storm={},\
          io_storm_mean_iowait_threshold={:.2},\
+         peak_device_io_fraction={:.4},busiest_device={},device_samples={},\
+         mean_device_io_fraction={:.4},busiest_device_by_mean={},\
          max_contended_fraction_limit={:.2},max_consecutive_limit={},\
          placement_cpus_excluded={},verdict={}",
         external_load.samples,
@@ -9267,6 +9446,11 @@ fn run() -> Result<Option<PathBuf>> {
         external_load.io_storm_samples,
         MAX_EXTERNAL_BUSY_CPUS_UNDER_IO_STORM,
         IO_STORM_OFF_PLACEMENT_MEAN_IOWAIT,
+        external_load.peak_device_io_fraction,
+        external_load.busiest_device.as_deref().unwrap_or("none"),
+        external_load.device_samples,
+        mean_device_io_fraction,
+        mean_device_io_device.as_deref().unwrap_or("none"),
         MAX_CONTENDED_SAMPLE_FRACTION,
         MAX_CONSECUTIVE_CONTENDED_SAMPLES,
         sampler_placement.len(),
@@ -9284,6 +9468,23 @@ fn run() -> Result<Option<PathBuf>> {
         "driver_thread_cpu": driver_thread_cpu,
         "driver_thread_binding": "one_fixed_cpu_for_the_whole_run",
         "reason": "the timed region includes driver-thread directory fsyncs, so the driver thread is bound like every worker",
+    });
+    // bd-xhl2g / bd-cljvq: the device queue during the timed region. Evidence,
+    // never a gate input — `device_io_is_recorded_and_does_not_gate_bd_xhl2g`
+    // pins that.
+    //
+    // BOTH statistics are reported because measurement said one is not enough.
+    // The PEAK is a burst detector and separates badly: a quiet box at loadavg
+    // 4.3-8.2 peaked to 0.061-0.529, which against a saturated ~1.0 is under 2x
+    // with overlap. The MEAN separates ~7.8x with none, because a single stalled
+    // second cannot move it. `device_samples` of 0 means diskstats could not be
+    // read at all, so the fractions are ABSENCE rather than a measured quiet.
+    let device_io_json = json!({
+        "peak_device_io_fraction": external_load.peak_device_io_fraction,
+        "busiest_device": external_load.busiest_device.clone(),
+        "mean_device_io_fraction": mean_device_io_fraction,
+        "busiest_device_by_mean": mean_device_io_device,
+        "device_samples": external_load.device_samples,
     });
     let binary_provenance_json = json!({
         "driver_elf_sha256": harness_sha,
@@ -9306,6 +9507,58 @@ fn run() -> Result<Option<PathBuf>> {
     }) else {
         unreachable!("JSON object literal must construct an object");
     };
+    let external_load_json = json!({
+        "samples": external_load.samples,
+        "max_external_busy_cpus": external_load.max_busy_cpus,
+        "over_limit_samples": external_load.over_limit_samples,
+        "contended_fraction": external_load.contended_fraction(),
+        "max_consecutive_over_limit": external_load.max_consecutive_over_limit,
+        "peak_off_placement_mean_busy": external_load.peak_mean_busy,
+        // bd-arm-contention: OUR OWN arms. Evidence, not a gate input.
+        "peak_placement_mean_busy": external_load.peak_placement_mean_busy,
+        // iowait is invisible to every busy figure above (it counts as idle),
+        // so these are the only fields in the report that can show an I/O
+        // storm.
+        //
+        // ⚠ These no longer say "not a gate input" without qualification
+        // (bd-d5pdz). Per-sample off-placement iowait now selects WHICH
+        // busy-CPU limit a sample is held to — see
+        // `MAX_EXTERNAL_BUSY_CPUS_UNDER_IO_STORM`. It still cannot refuse a
+        // sample the pre-2026-09-01 gate admitted; it can only withhold the
+        // relaxation landed that day. `io_storm_samples` below says how often
+        // that actually bound.
+        "peak_off_placement_mean_iowait": external_load.peak_mean_iowait,
+        "peak_placement_mean_iowait": external_load.peak_placement_mean_iowait,
+        "io_storm_samples": external_load.io_storm_samples,
+        "max_external_busy_cpus_limit_under_io_storm": MAX_EXTERNAL_BUSY_CPUS_UNDER_IO_STORM,
+        "io_storm_mean_iowait_threshold": IO_STORM_OFF_PLACEMENT_MEAN_IOWAIT,
+        // bd-xhl2g: the DEVICE QUEUE, which is the thing an I/O storm actually
+        // contends for and which no field above could see. Built as its own
+        // object rather than five more keys here, for the reason the comment
+        // on `timed_thread_binding_json` gives: one `json!` literal carrying
+        // every top-level key exceeds the macro's recursion limit, and adding
+        // these inline is what tipped it over.
+        "device_io_during_run": device_io_json,
+        // The arms' own clocks sampled ACROSS the timed region, beside the
+        // two endpoint figures in `cpu_mhz_observed`. A core that parks
+        // between those two snapshots is invisible to both, and "did the FUSE
+        // arm run at the 1429 MHz floor while being measured" is the open
+        // question on the worst row in the bank. Evidence, not a gate.
+        "placement_mhz_during_run": json!({
+            "min": external_load.min_placement_mhz,
+            "max": external_load.max_placement_mhz,
+            "spread": external_load.placement_mhz_spread(),
+            "samples": external_load.clock_samples,
+        }),
+        "busy_cpu_fraction_limit": EXTERNAL_BUSY_CPU_FRACTION,
+        "max_external_busy_cpus_limit": MAX_EXTERNAL_BUSY_CPUS,
+        "max_contended_fraction_limit": MAX_CONTENDED_SAMPLE_FRACTION,
+        "max_consecutive_limit": MAX_CONSECUTIVE_CONTENDED_SAMPLES,
+        "placement_cpus_excluded": sampler_placement.len(),
+        "sample_interval_ms": CPU_SAMPLE_INTERVAL_MS,
+        "verdict": if external_load_clean { "clear" } else { "contended" },
+    });
+
     let report = json!({
         "kernel_release": fs::read_to_string("/proc/sys/kernel/osrelease")?.trim(),
         "artifact_root": run_dir,
@@ -9359,50 +9612,7 @@ fn run() -> Result<Option<PathBuf>> {
         // it is clean so a later reader can disqualify a banked row without
         // re-running it. The pre-run fields above describe the placement CPUs at
         // one instant; these describe everything else for the whole measured region.
-        "external_load_during_run": json!({
-            "samples": external_load.samples,
-            "max_external_busy_cpus": external_load.max_busy_cpus,
-            "over_limit_samples": external_load.over_limit_samples,
-            "contended_fraction": external_load.contended_fraction(),
-            "max_consecutive_over_limit": external_load.max_consecutive_over_limit,
-            "peak_off_placement_mean_busy": external_load.peak_mean_busy,
-            // bd-arm-contention: OUR OWN arms. Evidence, not a gate input.
-            "peak_placement_mean_busy": external_load.peak_placement_mean_busy,
-            // iowait is invisible to every busy figure above (it counts as idle),
-            // so these are the only fields in the report that can show an I/O
-            // storm.
-            //
-            // ⚠ These no longer say "not a gate input" without qualification
-            // (bd-d5pdz). Per-sample off-placement iowait now selects WHICH
-            // busy-CPU limit a sample is held to — see
-            // `MAX_EXTERNAL_BUSY_CPUS_UNDER_IO_STORM`. It still cannot refuse a
-            // sample the pre-2026-09-01 gate admitted; it can only withhold the
-            // relaxation landed that day. `io_storm_samples` below says how often
-            // that actually bound.
-            "peak_off_placement_mean_iowait": external_load.peak_mean_iowait,
-            "peak_placement_mean_iowait": external_load.peak_placement_mean_iowait,
-            "io_storm_samples": external_load.io_storm_samples,
-            "max_external_busy_cpus_limit_under_io_storm": MAX_EXTERNAL_BUSY_CPUS_UNDER_IO_STORM,
-            "io_storm_mean_iowait_threshold": IO_STORM_OFF_PLACEMENT_MEAN_IOWAIT,
-            // The arms' own clocks sampled ACROSS the timed region, beside the
-            // two endpoint figures in `cpu_mhz_observed`. A core that parks
-            // between those two snapshots is invisible to both, and "did the FUSE
-            // arm run at the 1429 MHz floor while being measured" is the open
-            // question on the worst row in the bank. Evidence, not a gate.
-            "placement_mhz_during_run": json!({
-                "min": external_load.min_placement_mhz,
-                "max": external_load.max_placement_mhz,
-                "spread": external_load.placement_mhz_spread(),
-                "samples": external_load.clock_samples,
-            }),
-            "busy_cpu_fraction_limit": EXTERNAL_BUSY_CPU_FRACTION,
-            "max_external_busy_cpus_limit": MAX_EXTERNAL_BUSY_CPUS,
-            "max_contended_fraction_limit": MAX_CONTENDED_SAMPLE_FRACTION,
-            "max_consecutive_limit": MAX_CONSECUTIVE_CONTENDED_SAMPLES,
-            "placement_cpus_excluded": sampler_placement.len(),
-            "sample_interval_ms": CPU_SAMPLE_INTERVAL_MS,
-            "verdict": if external_load_clean { "clear" } else { "contended" },
-        }),
+        "external_load_during_run": external_load_json,
         "initial_host_wide_quiescence": placement.initial_host_quiet_window.as_ref().map_or_else(
             || json!("not_applicable"),
             |window| json!({
@@ -12934,6 +13144,123 @@ mod tests {
         assert!(
             never_stricter.clean(),
             "the storm scoping must never refuse what the pre-relaxation gate admitted"
+        );
+    }
+
+    /// Device utilisation is RECORDED on the witness and cannot change a verdict.
+    ///
+    /// The companion to `iowait_is_recorded_on_both_sides_and_does_not_gate`, and
+    /// it exists for the same reason: bd-xhl2g decided that device utilisation is
+    /// the field that actually tracks I/O contention, and simultaneously decided
+    /// NOT to gate on it, because no measurement yet shows a saturated queue moving
+    /// a ratio. Flipping it to a gate makes this test fail and forces whoever does
+    /// it to produce that measurement first.
+    ///
+    /// The second half pins the finding that motivated the field at all: a witness
+    /// fed a PINNED device and quiet CPUs must still come back clean, because
+    /// nothing about the device reaches `clean()`.
+    #[test]
+    fn device_io_is_recorded_and_does_not_gate_bd_xhl2g() {
+        let placement: BTreeSet<usize> = (0..8).collect();
+        let quiet_busy: BTreeMap<usize, f64> = (0..64).map(|c| (c, 0.02)).collect();
+        // The measured blind spot: dm-0 pinned, iowait inside the quiet range.
+        let quiet_iowait: BTreeMap<usize, f64> = (0..64).map(|c| (c, 0.020425)).collect();
+        let pinned: BTreeMap<String, f64> =
+            [("dm-0".to_string(), 0.99), ("nvme0n1".to_string(), 0.80)]
+                .into_iter()
+                .collect();
+
+        let mut w = ExternalLoadWitness::default();
+        for _ in 0..20 {
+            w.observe(
+                &quiet_busy,
+                &quiet_iowait,
+                &placement,
+                MAX_EXTERNAL_BUSY_CPUS,
+            );
+            w.observe_device_io(&pinned);
+        }
+
+        assert_eq!(w.device_samples, 20, "every sample must be recorded");
+        assert_eq!(
+            w.busiest_device.as_deref(),
+            Some("dm-0"),
+            "the peak must name the device that carried it, not just the number"
+        );
+        assert!(
+            (w.peak_device_io_fraction - 0.99).abs() < 1e-9,
+            "peak device utilisation must survive to the report, got {}",
+            w.peak_device_io_fraction
+        );
+        assert_eq!(
+            w.io_storm_samples, 0,
+            "0.020425 is BELOW the storm threshold — this is the bd-xhl2g finding, \
+             a device at 0.99 utilisation that the iowait scoping cannot see"
+        );
+        assert!(
+            w.clean(),
+            "device utilisation must not refuse a run: it is evidence. Turning it \
+             into a gate is a NEW refusal criterion that would retroactively split \
+             the bank — see bd-xhl2g before changing this"
+        );
+
+        // The SUSTAINED figure, which is a different statistic from the peak and
+        // the one that actually separates (bd-cljvq). Every sample here is 0.99,
+        // so peak and mean coincide; the case that matters is the next block.
+        let (mean, by_mean) = w.mean_device_io();
+        assert!(
+            (mean - 0.99).abs() < 1e-9,
+            "sustained utilisation of a constantly-pinned device must equal the \
+             per-sample value, got {mean}"
+        );
+        assert_eq!(by_mean.as_deref(), Some("dm-0"));
+
+        // ONE stalled second in a 40-sample window: the peak reads 1.0 and the
+        // mean stays low. This is the organic window bd-cljvq recorded (peak
+        // 1.0000, window average 0.0707) and it is the whole reason both figures
+        // are kept — a gate on the peak alone would refuse this, and a quiet box
+        // was measured to peak as high as 0.529 on its own.
+        let mut bursty = ExternalLoadWitness::default();
+        let idle: BTreeMap<String, f64> = [("dm-0".to_string(), 0.02)].into_iter().collect();
+        let pinned_second: BTreeMap<String, f64> =
+            [("dm-0".to_string(), 1.0)].into_iter().collect();
+        for i in 0..40 {
+            bursty.observe_device_io(if i == 17 { &pinned_second } else { &idle });
+        }
+        assert!(
+            (bursty.peak_device_io_fraction - 1.0).abs() < 1e-9,
+            "the burst must be visible in the peak"
+        );
+        let (bursty_mean, _) = bursty.mean_device_io();
+        assert!(
+            bursty_mean < 0.05,
+            "one pinned second in 40 must NOT look like sustained pressure, got \
+             {bursty_mean}"
+        );
+
+        // Absence must be distinguishable from a measured quiet.
+        let mut blind = ExternalLoadWitness::default();
+        for _ in 0..20 {
+            blind.observe(
+                &quiet_busy,
+                &quiet_iowait,
+                &placement,
+                MAX_EXTERNAL_BUSY_CPUS,
+            );
+            blind.observe_device_io(&BTreeMap::new());
+        }
+        assert_eq!(
+            blind.device_samples, 0,
+            "a host whose diskstats never read must report 0 samples, so a reader \
+             cannot mistake an unmeasured device for an idle one"
+        );
+        assert_eq!(blind.peak_device_io_fraction, 0.0);
+        assert!(blind.busiest_device.is_none());
+        assert_eq!(
+            blind.mean_device_io(),
+            (0.0, None),
+            "with no device samples the sustained figure must be absence, not zero \
+             pressure"
         );
     }
 
