@@ -84,3 +84,54 @@ longer applies.
 Only `over_limit_samples` / `external_load_verdict` were wrong; the iowait and busy
 populations themselves were never affected, so `iowait_probe_quiet_1..3` remain
 valid as harvested. The banked record here is a re-run on the repaired script.
+
+## 4. Two MOUNTED runs, back to back — and the gate's verdict is LENGTH-DEPENDENT (2026-09-01, cc)
+
+Section 3 is a probe replaying the verdict. These two are the real thing: mounted
+runs, kernel btrfs beside FrankenFS-over-FUSE in one invocation, on a driver built
+from `4b1bd9dd3` that carries the recalibrated constants — the report's own
+`max_external_busy_cpus_limit` reads **4**, which is the first time any run has
+printed it.
+
+| File | pairs | EL samples | contended_fraction | max_consecutive | max_busy | verdict |
+| --- | --- | --- | --- | --- | --- | --- |
+| `mounted_run_btrfs_12pair_clear` | 12 | 15 | **0.0667** | 1 | 5 | **clear** |
+| `mounted_run_btrfs_192pair_contended` | 192 | 99 | **0.3737** | 7 | 8 | **CONTENDED** |
+
+They started **40 seconds apart**, on the same driver and candidate, at the same
+`--placement-scope same-llc`, with the **same 10 placement CPUs excluded**, so
+they are directly comparable to each other.
+
+**So the close condition is met on the letter and not on the spirit.** A mounted
+run WAS observed to pass `external_load_during_run` at the recalibrated limit —
+that is the first one, and it is real. But the very next run, over the same
+minutes, refused at `0.3737` with a 7-sample consecutive burst. The 15-sample
+region caught a quiet patch; the 99-sample region saw the bursts.
+
+This is bd-d5pdz's own methodological point turned on its own evidence. The bead's
+09:42Z comment records that a single `mpstat` spot-check returned 0,0,0,0,2 in a
+window whose real 20-sample verdict was CONTENDED three times of three — "the
+spot-check catches the quiet samples and misses the bursts, and the bursts are the
+whole quantity being counted". A 15-sample timed region is a longer spot-check, not
+a different kind of measurement.
+
+**What this means for planning a row, and it is the useful part.** The gate's
+difficulty scales with the length of the row's TIMED REGION, not with the wall time
+of the run. Cheap rows are easy to admit and prove little about whether an expensive
+one can be; the rows that most need admitting — btrfs readdir+stat needs 192 pairs
+for its A/A nulls (`bd-ynqwx`) — are exactly the ones most exposed. An observation
+that the gate can pass should therefore be quoted WITH its sample count, and only an
+observation at measurement length retires the question.
+
+**The relaxation did not make the gate toothless**, which is the other thing these
+two runs settle. `L=4` still refused a real 99-sample region on a loadavg-10 box, at
+`0.3737` against a `0.10` ceiling — nearly four times over. The concern that raising
+`2 -> 4` would admit contended windows is not borne out here.
+
+⚠ One thing these runs canNOT settle, stated because the temptation is obvious: the
+report records only aggregates, not the per-sample busy counts, so **neither run can
+say what the OLD limit of 2 would have returned for it.** `max_external_busy_cpus`
+of 5 and 8 proves at least one sample was over 2 in each, and nothing more. The
+evidence that `L=2` refuses quiet windows is the probe population in sections 1-3,
+not these reports.
+
