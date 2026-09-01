@@ -1096,6 +1096,137 @@ pub fn htree_find_leaf(entries: &[HtreeEntry], target_hash: u32) -> Option<u32> 
 
 #[cfg(test)]
 mod tests {
+    /// Every byte a dir-block mutation changes MUST lie inside the span the
+    /// mutation reports, or the incremental checksum stamps a wrong value
+    /// (bd-4sull).
+    ///
+    /// The incremental path is only correct because `DirBlockEdit` encloses the
+    /// WHOLE changed region: `stamp_dir_block_checksum_incremental` folds the XOR
+    /// delta of that span alone, so a byte mutated outside it is invisible to the
+    /// checksum and the block is silently stamped wrong. Today the four call sites
+    /// enclose their writes correctly by construction — the tombstone path spans
+    /// the whole reused slot, the split path spans from the rewritten `rec_len`
+    /// field to the end of the vacated slack. Nothing pinned that, and it is
+    /// exactly the invariant that carries more weight the moment
+    /// [`INCREMENTAL_DIR_CSUM_MAX_SPAN`] rises: a wider threshold puts MORE edits
+    /// on the incremental path, so the geometry has to be checked before the
+    /// constant moves, not after.
+    ///
+    /// This asserts the property against the mutation itself — diffing the block
+    /// before and after and demanding every differing byte fall inside the
+    /// reported region — rather than re-deriving the offsets the implementation
+    /// already computed, which would pass by construction and prove nothing.
+    #[test]
+    fn reported_edit_span_encloses_every_mutated_byte_bd_4sull() {
+        // (label, builder) covering BOTH tracked entry points and, within each,
+        // both the tombstone-reuse and the slack-split slot paths.
+        let cases: Vec<(&str, fn(&mut [u8]) -> Result<(usize, Option<DirBlockEdit>)>)> = vec![
+            ("add_entry_tracked", |block| {
+                add_entry_tracked(block, 7, b"inserted", Ext4FileType::RegFile, 0)
+            }),
+            ("add_entry_reject_existing_tracked", |block| {
+                add_entry_reject_existing_tracked(block, 7, b"inserted", Ext4FileType::RegFile, 0)
+            }),
+        ];
+
+        // Which (path -> was the edit tracked?) outcomes we actually exercised.
+        // Without this the loop below could `continue` past every case and the
+        // test would pass having checked nothing.
+        let mut observed: Vec<(&str, &str, bool)> = Vec::new();
+
+        for (label, insert) in cases {
+            // SPLIT path: one live entry with a short name owning the whole block,
+            // so the insert splits its slack.
+            let mut split_block = vec![0u8; 4096];
+            write_entry(&mut split_block, 0, 11, 4096, Ext4FileType::Dir, b"a")
+                .expect("seed the split fixture");
+
+            // TOMBSTONE path: a deleted slot large enough to reuse, followed by a
+            // live entry so the scan cannot simply run off the end.
+            let mut tomb_block = vec![0u8; 4096];
+            write_entry(&mut tomb_block, 0, 11, 64, Ext4FileType::RegFile, b"victim")
+                .expect("seed the tombstone fixture");
+            tomb_block[0..4].copy_from_slice(&0u32.to_le_bytes()); // ino = 0 -> tombstone
+            write_entry(
+                &mut tomb_block,
+                64,
+                12,
+                4096 - 64,
+                Ext4FileType::Dir,
+                b"keep",
+            )
+            .expect("seed the tombstone tail");
+
+            for (path, mut block) in [("split", split_block), ("tombstone", tomb_block)] {
+                let before = block.clone();
+                let inserted = insert(&mut block);
+                assert!(
+                    inserted.is_ok(),
+                    "{label}/{path}: insert failed: {:?}",
+                    inserted.err()
+                );
+                let (_, edit) = inserted.expect("insert checked just above");
+
+                observed.push((label, path, edit.is_some()));
+                let Some(edit) = edit else {
+                    // `None` means "full recompute", which imposes no span
+                    // obligation. Nothing to check, and it must NOT be read as a
+                    // pass for the incremental geometry.
+                    continue;
+                };
+
+                let region_start = edit.region_start;
+                let region_end = region_start + edit.old_bytes.len();
+
+                // The pre-image must be exactly what was there before.
+                assert_eq!(
+                    &before[region_start..region_end],
+                    &edit.old_bytes[..],
+                    "{label}/{path}: reported pre-image is not the block's own pre-image"
+                );
+
+                let mutated: Vec<usize> = (0..before.len())
+                    .filter(|&i| before[i] != block[i])
+                    .collect();
+                assert!(
+                    !mutated.is_empty(),
+                    "{label}/{path}: the fixture recorded no mutation, so this case proves nothing"
+                );
+                for byte in mutated {
+                    assert!(
+                        (region_start..region_end).contains(&byte),
+                        "{label}/{path}: byte {byte} changed OUTSIDE the reported span \
+                         [{region_start}, {region_end}) — the incremental checksum would \
+                         stamp a wrong value for this edit"
+                    );
+                }
+            }
+        }
+
+        // COVERAGE, so a vacuous pass is impossible. Both entry points must reach
+        // both slot paths, and the Some/None split must be the one the current
+        // threshold produces:
+        //   tombstone -> the reused slot is 64 B, well under
+        //                INCREMENTAL_DIR_CSUM_MAX_SPAN, so the edit is TRACKED and
+        //                its geometry is byte-checked above;
+        //   split     -> the vacated slack spans nearly the whole block, over the
+        //                threshold, so it falls back to a full recompute.
+        // That second line is precisely the case the span sweep measures as still
+        // cheaper incrementally (7.77x at 256 B, 1.29x at 3072 B), so if the
+        // threshold is ever raised this expectation flips to `true` and this test
+        // is where that shows up.
+        assert_eq!(
+            observed,
+            vec![
+                ("add_entry_tracked", "split", false),
+                ("add_entry_tracked", "tombstone", true),
+                ("add_entry_reject_existing_tracked", "split", false),
+                ("add_entry_reject_existing_tracked", "tombstone", true),
+            ],
+            "slot-path coverage changed; a tracked edit must stay byte-checked above"
+        );
+    }
+
     use super::*;
     use ffs_ondisk::{Ext4FileType, parse_dir_block};
     use proptest::prelude::*;
