@@ -308,6 +308,44 @@ WORKER_SCOPE_BASELINE = 166
 # saying where its daemon ran. Discovered by --placement-audit; do not raise it.
 PLACEMENT_SCOPE_BASELINE = 39
 
+# The day the only mounted instrument that pins BY CONSTRUCTION began to exist:
+# `crates/ffs-harness/src/bin/ffs_mounted_kernel_bench.rs`, added 2026-07-27 in
+# 6506e1fe6, which has spawned every FUSE arm through `taskset -c <fuse_cpus>`
+# since its FIRST commit. It has exactly one FUSE spawn site (`mount_fuse`, one
+# caller) and both CPU selectors `bail!` rather than return an empty set, so it
+# CANNOT mount an unpinned daemon -- it fails closed.
+#
+# WHY THIS MATTERS TO THE BACKLOG, and it is the answer to bd-plt79 item 3 (what
+# to do about the originally-audited rows). The 39 are not one population:
+#
+#   * a row banked BEFORE this date cannot have come from that instrument, so its
+#     daemon placement is whatever an ad-hoc rig or the bare scheduler did. The
+#     measured unpinned floor -- an A/A null swinging to 1.4875x and a 1.2613x
+#     cross-run disagreement -- is LIVE for it, and no declaration can be written
+#     after the fact because the rig and its log are gone. These rows are not
+#     fixable; they are quotable only with that floor attached.
+#   * a row banked AFTER it may or may not be a comparator row, which is decidable
+#     from the gate vocabulary the comparator alone emits, and a comparator row is
+#     pinned-but-scope-unknown: bounded by the sweep's PINNED spread (1.0049x to
+#     1.0946x), not by 1.4875x.
+#
+# So the backlog splits into an UNFIXABLE part and a NAMEABLE part, and only the
+# second is worth anyone's turn. Reported by --placement-audit; nothing gates on
+# it, because a date is not evidence about a daemon and must never become one.
+PINNED_COMPARATOR_LANDED = "2026-07-27"
+PINNED_COMPARATOR_COMMIT = "6506e1fe6"
+
+# Fields emitted ONLY by ffs-mounted-kernel-bench's own gate. A row quoting one of
+# these was produced by the pinning instrument, whatever else it fails to say.
+# Deliberately NOT `fuse_over_kernel` alone: hand rigs copy that field name (the
+# 2026-08-27 parallel-metadata rig emits `kernel_median_wall_ns`), so the tell has
+# to be the GATE vocabulary, which no hand rig reproduces.
+COMPARATOR_GATE = re.compile(
+    r"ffs-mounted-kernel-bench|fuse_over_kernel_median|directional_claim_clear"
+    r"|placement_evidence_mode|crossover_blocks|six[_ -]arm[_ ]williams",
+    re.I,
+)
+
 # Forward-only ratchet for bd-4sull item 3, seeded from the tree at the time it
 # was added. Same contract as the two above: a floor that may only FALL. It does
 # not retract a banked row; it stops a NEW competitive ratio being banked without
@@ -512,6 +550,27 @@ class Row:
             cells = [c.strip() for c in first.strip().strip("|").split(" | ")]
             return cells[1] if len(cells) > 1 else cells[0]
         return first.lstrip("#").strip()
+
+    @property
+    def banked_date(self) -> str:
+        """The row's own date, ISO, or "" when it carries none.
+
+        Cell 0 for a table row -- parse_text() puts the physical line at the head
+        of `text`, and `is_document_structure` already relies on cell 0 being the
+        date. For an entry, the heading date, falling back to the first date in
+        the body. Used only to partition a backlog by era; nothing gates on it.
+        """
+        first = self.text.splitlines()[0] if self.text else ""
+        if first.startswith("| 2026"):
+            cell0 = first.strip().strip("|").split(" | ")[0].strip()
+            m = TITLE_DATE.fullmatch(cell0)
+            if m:
+                return cell0
+        for hay in (self.title, self.text[:400]):
+            m = TITLE_DATE.search(hay)
+            if m:
+                return m.group(0)
+        return ""
 
     def is_worker_scoped_ratio(self) -> bool:
         """A banked competitive claim that cannot name the machine it ran on.
@@ -1330,10 +1389,34 @@ def cmd_placement_audit(list_rows: bool) -> int:
     for f, k in sorted(per_file.items()):
         print(f"  {f:<40s} {k}")
 
+    # bd-plt79 item 3: the backlog is two populations, not one. Split it so the
+    # part nobody can fix stops being counted as work anybody could do.
+    pre = [r for r in scoped if r.banked_date and r.banked_date < PINNED_COMPARATOR_LANDED]
+    post = [r for r in scoped if r not in pre]
+    gated = [r for r in post if COMPARATOR_GATE.search(decision_evidence(r.text))]
+    print(
+        f"  predating the pinning comparator (< {PINNED_COMPARATOR_LANDED}, "
+        f"{PINNED_COMPARATOR_COMMIT})  {len(pre)}   UNFIXABLE: rig and log gone, "
+        f"1.4875x unpinned floor is LIVE"
+    )
+    print(
+        f"  after it, comparator gate vocabulary                    {len(gated)}   "
+        f"pinned-but-scope-unknown: bounded by the 1.0049-1.0946x PINNED spread"
+    )
+    print(
+        f"  after it, no instrument named                           "
+        f"{len(post) - len(gated)}   NAMEABLE: whoever ran it can still declare it"
+    )
+
     if list_rows:
         print("\nflagged (mounted KEEP quoting a ratio, no daemon placement declared):")
         for r in scoped:
-            print(f"  {r.ref}\n    {r.title[:160]}")
+            era = (
+                "pre-comparator"
+                if r in pre
+                else "comparator" if r in gated else "post, unnamed"
+            )
+            print(f"  {r.ref}  [{r.banked_date or '????-??-??'} {era}]\n    {r.title[:160]}")
 
     if PLACEMENT_SCOPE_BASELINE is None:
         print(
@@ -1404,7 +1487,48 @@ def _placement_scope_ratchet_checks() -> list[tuple[str, bool]]:
             f"placement ratchet holds at {PLACEMENT_SCOPE_BASELINE}",
             len(placement_scoped_rows()) == PLACEMENT_SCOPE_BASELINE,
         ),
-    ] + _incumbent_absolute_selftests()
+    ] + _placement_era_selftests() + _incumbent_absolute_selftests()
+
+
+def _placement_era_selftests() -> list[tuple[str, bool]]:
+    """bd-plt79 item 3: the backlog partition, pinned so it cannot rot.
+
+    Three things have to stay true or the split stops meaning anything: a table
+    row must yield its own cell-0 date, an entry must yield its heading date, and
+    the comparator tell must be the GATE vocabulary rather than a field name a
+    hand rig also emits. That last one is the discrimination that cost the most to
+    get right -- the 2026-08-27 parallel-metadata hand rig prints
+    `kernel_median_wall_ns` and `fuse_median_wall_ns` exactly as the comparator
+    does, so anything keying on those would have called it a comparator row and
+    attached the wrong (much tighter) uncertainty to it.
+    """
+    table = Row(
+        Path("x.md"),
+        1,
+        "| 2026-06-21 | `bd-x` | mounted-kernel head-to-head | KEEP 3.36x vs kernel |",
+        "KEEP",
+    )
+    entry = Row(Path("x.md"), 1, "## 2026-08-16 - KEEP: mounted m (bd-x)\nbody\n", "KEEP")
+    undated = Row(Path("x.md"), 1, "## KEEP: mounted m (bd-x)\nbody\n", "KEEP")
+    comparator = "admitted=true, verdict=HONEST_NEUTRAL, directional_claim_clear=false"
+    hand_rig = "kernel_median_wall_ns=161504000 against fuse_median_wall_ns=249147000"
+    return [
+        ("a table row's banked date is its cell 0", table.banked_date == "2026-06-21"),
+        ("an entry's banked date is its heading date", entry.banked_date == "2026-08-16"),
+        ("a row with no date yields no era", undated.banked_date == ""),
+        (
+            "the comparator tell is its gate vocabulary",
+            bool(COMPARATOR_GATE.search(comparator)),
+        ),
+        (
+            "a hand rig copying the comparator's field names is NOT a comparator row",
+            not COMPARATOR_GATE.search(hand_rig),
+        ),
+        (
+            "the pre-comparator era predates the instrument's own first commit",
+            PINNED_COMPARATOR_LANDED == "2026-07-27",
+        ),
+    ]
 
 
 def _incumbent_absolute_selftests() -> list[tuple[str, bool]]:
