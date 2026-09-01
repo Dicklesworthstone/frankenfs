@@ -16,10 +16,26 @@ It does not have to. The two fields are pure `/proc/stat` arithmetic over a
     iowait_i =  iowait_i / total_i
     peak_off_placement_mean_X = max over samples of mean(X_i : i not in placement)
     peak_placement_mean_X     = max over samples of mean(X_i : i in     placement)
-    external busy count       = |{i not in placement : busy_i > 0.25}|, refused if > 2
+    external busy count       = |{i not in placement : busy_i > 0.25}|
+
+    a sample is CONTENDED iff that count exceeds the sample's EFFECTIVE limit,
+    which is MAX_EXTERNAL_BUSY_CPUS normally and the stricter
+    MAX_EXTERNAL_BUSY_CPUS_UNDER_IO_STORM on a sample whose off-placement mean
+    iowait exceeds IO_STORM_OFF_PLACEMENT_MEAN_IOWAIT (bd-d5pdz); the window is
+    REFUSED iff the contended FRACTION exceeds MAX_CONTENDED_SAMPLE_FRACTION or a
+    run of MAX_CONSECUTIVE_CONTENDED_SAMPLES contended samples occurs
 
 so a value harvested here is the same quantity the harness would print, and the
 populations it builds are comparable to the ones a run would build.
+
+CORRECTED 2026-09-01 (cc). This probe shipped with `MAX_EXTERNAL_BUSY_CPUS = 2`
+and no consecutive-run rule, and bd-d5pdz's recalibration (23264bce7) moved the
+harness to 4 with an I/O-storm scoping WITHOUT updating this file -- exactly the
+drift the constants comment below warns about. The probe therefore reported a
+STRICTER verdict than the code it claims to mirror: `external_load_verdict` here
+could read CONTENDED on a window the harness would admit. Every field other than
+`over_limit_samples` / `external_load_verdict` was unaffected, so iowait
+populations harvested before this fix remain valid; the VERDICT column does not.
 
 THE ONE DIFFERENCE, stated rather than buried: a comparator run samples DURING its
 own timed region, so its on-placement numbers include its own arms' load. This
@@ -49,7 +65,15 @@ from pathlib import Path
 # point of the probe, so they are named rather than inlined.
 CPU_SAMPLE_INTERVAL_S = 1.0  # CPU_SAMPLE_INTERVAL_MS = 1_000
 EXTERNAL_BUSY_CPU_FRACTION = 0.25
-MAX_EXTERNAL_BUSY_CPUS = 2
+MAX_EXTERNAL_BUSY_CPUS = 4  # was 2 until bd-d5pdz, 2026-09-01
+# A sample taken during an I/O storm keeps the pre-relaxation limit. This is the
+# SCOPE of bd-d5pdz's relaxation, not bd-xhl2g's iowait gate: it can only withhold
+# the relaxation, never refuse a sample the pre-2026-09-01 code admitted.
+MAX_EXTERNAL_BUSY_CPUS_UNDER_IO_STORM = 2
+IO_STORM_OFF_PLACEMENT_MEAN_IOWAIT = 0.10
+# The window-level refusal predicate: `ExternalLoadWitness::clean`.
+MAX_CONTENDED_SAMPLE_FRACTION = 0.10
+MAX_CONSECUTIVE_CONTENDED_SAMPLES = 3
 
 
 def read_cpu_ticks() -> dict[int, tuple[int, int, int]]:
@@ -111,6 +135,9 @@ def main() -> int:
     peak_off_busy = peak_on_busy = peak_off_iowait = peak_on_iowait = 0.0
     max_busy_cpus = 0
     over_limit = 0
+    io_storm_samples = 0
+    consecutive = 0
+    max_consecutive = 0
     per_sample = []
 
     disk_before = read_disk_ms()
@@ -138,18 +165,31 @@ def main() -> int:
         on_w = [v for c, v in wait.items() if c in placement]
         count = sum(1 for v in off if v > EXTERNAL_BUSY_CPU_FRACTION)
         max_busy_cpus = max(max_busy_cpus, count)
-        if count > MAX_EXTERNAL_BUSY_CPUS:
-            over_limit += 1
         m_off = sum(off) / len(off) if off else 0.0
         m_on = sum(on) / len(on) if on else 0.0
         m_off_w = sum(off_w) / len(off_w) if off_w else 0.0
         m_on_w = sum(on_w) / len(on_w) if on_w else 0.0
+        # `ExternalLoadWitness::observe`: the per-sample limit is chosen by THIS
+        # sample's off-placement mean iowait, before the count is compared.
+        if m_off_w > IO_STORM_OFF_PLACEMENT_MEAN_IOWAIT:
+            io_storm_samples += 1
+            effective_limit = min(MAX_EXTERNAL_BUSY_CPUS,
+                                  MAX_EXTERNAL_BUSY_CPUS_UNDER_IO_STORM)
+        else:
+            effective_limit = MAX_EXTERNAL_BUSY_CPUS
+        if count > effective_limit:
+            over_limit += 1
+            consecutive += 1
+            max_consecutive = max(max_consecutive, consecutive)
+        else:
+            consecutive = 0
         peak_off_busy = max(peak_off_busy, m_off)
         peak_on_busy = max(peak_on_busy, m_on)
         peak_off_iowait = max(peak_off_iowait, m_off_w)
         peak_on_iowait = max(peak_on_iowait, m_on_w)
         per_sample.append({"off_busy": m_off, "off_iowait": m_off_w,
-                           "busy_cpus_over_limit": count})
+                           "busy_cpus_over_limit": count,
+                           "effective_limit": effective_limit})
 
     elapsed_ms = (time.time() - t_start) * 1000.0
     disk_after = read_disk_ms()
@@ -165,7 +205,11 @@ def main() -> int:
         key=lambda kv: -kv[1],
     )[:8]
 
-    veto = "CONTENDED" if over_limit > a.samples * 0.10 else "CLEAR"
+    # `ExternalLoadWitness::clean`: BOTH rules, not just the fraction.
+    contended_fraction = over_limit / a.samples if a.samples else 0.0
+    clean = (contended_fraction <= MAX_CONTENDED_SAMPLE_FRACTION
+             and max_consecutive < MAX_CONSECUTIVE_CONTENDED_SAMPLES)
+    veto = "CLEAR" if clean else "CONTENDED"
     record = {
         "label": a.label,
         "samples": a.samples,
@@ -177,6 +221,12 @@ def main() -> int:
         "peak_placement_mean_iowait": round(peak_on_iowait, 6),
         "max_external_busy_cpus": max_busy_cpus,
         "over_limit_samples": over_limit,
+        "contended_fraction": round(contended_fraction, 4),
+        "max_consecutive_over_limit": max_consecutive,
+        "io_storm_samples": io_storm_samples,
+        "max_external_busy_cpus_limit": MAX_EXTERNAL_BUSY_CPUS,
+        "max_external_busy_cpus_limit_under_io_storm":
+            MAX_EXTERNAL_BUSY_CPUS_UNDER_IO_STORM,
         "external_load_verdict": veto,
         "busy_devices_io_time_fraction": [
             {"device": n, "io_time_fraction": round(f, 4)} for n, f in devices

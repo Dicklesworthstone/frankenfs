@@ -20,6 +20,8 @@ iowait counts as IDLE). Replay any candidate threshold pair over them with:
 | `cal_loaded_heavy` | synthetic, 32 CPU spinners | ~12-26 | 35 / 47 |
 | `cal_loaded_realfleet_1..2` | real fleet contention, I/O-bound | **~731** | **2 / 7-8** |
 | `iowait_probe_quiet_1..3` | same quiet window, via `iowait_population_probe.py` | ~5 | peak off-placement mean iowait 0.0022-0.0045 |
+| `live_window_1` | **a LIVE window admitted at the shipping constants**, 40 samples | **2.7-2.9** | 3 / 5 |
+| `iowait_probe_live_1` | the same live window, iowait side, 20 samples | ~5.5 | peak off-placement mean iowait 0.0021 |
 
 ## The two things these windows settle
 
@@ -42,3 +44,43 @@ never refuses a sample the pre-2026-09-01 code admitted.
 ⚠ The loaded arms are two different things and should not be pooled: the synthetic
 windows are CPU contention, the real-fleet ones are I/O contention. They are the two
 distinct failure modes, and only the first is visible to the busy metric at all.
+
+## 3. The recalibration is reachable in practice, not only on replay (2026-09-01, cc)
+
+`live_window_1` is the first window measured at the box's actual quiet floor —
+loadavg **2.7-2.9**, lower than any of the four `cal_quiet_*` windows — and the
+shipping constants admit it: `contended_fraction=0.075` against the `0.10` ceiling,
+`max_consecutive=1` against the limit of `3`, `max_busy_cpus=5`. Under the old
+`L=2` the same window is REFUSED: its per-sample busy-CPU count has `p50=3`, so at
+least half its samples are contended by construction.
+
+That also confirms the bead's claim that the `1-5` floor is IRREDUCIBLE rather than
+fleet contention. At loadavg 2.7 — a third of the calibration windows' load, with
+nothing else benchmarking — the count still sits at `p50=3`. Waiting for a quieter
+box cannot fix `L=2`, because this IS the quieter box.
+
+`iowait_probe_live_1` shows the same window is clear on the OTHER side too:
+off-placement mean iowait `0.0021` against the `0.10` storm threshold, devices at
+2.4% I/O time, `io_storm_samples=0` — so the relaxation applies here rather than
+being withheld, and the CLEAN verdict is the relaxed limit's, not an accident of a
+window that would have passed anyway.
+
+⚠ Read narrowly, as the bead's own comment says: this is the PROBE replaying the
+verdict, not a mounted run's `external_load_during_run`. It shows the gate CAN pass,
+not that any given window will.
+
+### A correction this window forced
+
+`iowait_probe_live_1` is the first record written by `iowait_population_probe.py`
+AFTER it was repaired. That script shipped with `MAX_EXTERNAL_BUSY_CPUS = 2` and no
+consecutive-run rule, and the `2 -> 4` recalibration (`23264bce7`) did not update it
+— so the probe whose own comment warns that "changing one here without changing it
+there makes the harvested population incomparable to a real run" had become exactly
+that. It reported a STRICTER verdict than the harness it mirrors. The first
+`live_window_1` iowait pass, taken before the fix, printed
+`over_limit_samples=1, max_external_busy_cpus=3` — over a limit the shipping code no
+longer applies.
+
+Only `over_limit_samples` / `external_load_verdict` were wrong; the iowait and busy
+populations themselves were never affected, so `iowait_probe_quiet_1..3` remain
+valid as harvested. The banked record here is a re-run on the repaired script.
