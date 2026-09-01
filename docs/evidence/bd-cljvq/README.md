@@ -492,3 +492,49 @@ That is the tension this bead has to state plainly:
 
 **bd-cljvq is therefore not answered by this section alone.** It is answered for
 warm stat, with a mechanism, and the device-bound half is the remaining work.
+
+## 15. The device-bound half is BLOCKED, and by causes that already have owners
+
+Section 14 answers this bead for a cached row. Answering it for a device-bound row
+requires a workload whose timed region actually touches the device. Every candidate
+is blocked, and none of the blockers is new:
+
+| candidate row | status |
+|---|---|
+| create-delete-storm, bulk-durable-write | **bd-w5ok5** (P1, in progress): every mutating row is dominated by workload variability on BOTH arms — A/A spreads of 15–39% against a 2.5% limit. An instrument limit, not a FrankenFS defect. |
+| parallel-read-8t-cold-cache | needs root to write `/proc/sys/vm/drop_caches`; unavailable, and dropping caches host-wide would harm co-tenants. |
+| direct-durable-write | **bd-y0hzq** (filed this turn): the btrfs fixture fails `btrfs check --readonly` — "errors found in extent allocation tree or chunk allocation" — reproduced 3/3. Traced to the KERNEL-side seeding path, so not a FrankenFS defect. |
+
+**So bd-cljvq cannot be answered for a device-bound row on this instrument today**,
+and that is a statement about the instrument, not about device contention.
+
+### What this bead concludes
+
+1. **On a cached row, a saturated device queue is measurably harmless.** btrfs warm
+   stat, admitted runs both sides, FUSE arm storm/quiet `0.9948` (−0.52%), with the
+   storm proven applied (`devmean` 0.9902 / 0.9883). A device gate would refuse
+   windows for nothing on rows of this shape.
+2. **On a device-bound row the question is open and not answerable here.** The
+   blockers are bd-w5ok5, bd-y0hzq, and the absence of root.
+3. **Therefore `peak_device_io_fraction` and `mean_device_io_fraction` STAY
+   EVIDENCE.** A gate needs a demonstrated bias; the only row where the bias could
+   be measured shows none, and the rows where it might exist cannot be measured.
+   Gating on a mechanism that has never been shown to move a number would be the
+   error bd-xhl2g was filed to prevent, one level along.
+4. **The fields still earned their place.** They are what proved the storm was
+   applied at all, and what showed bd-xhl2g's blind spot opening in an admitted
+   window (`devmean` 0.9883 at `verdict=clear`). Recording beat gating, which is
+   what bd-xhl2g concluded and what this bead now confirms from the other side.
+
+### The methodological residue, which outlasts the answer
+
+* **Choosing the most measurable row can select against the treatment.** Warm stat
+  was picked for its 0.69% spread; that spread and its device-insensitivity are the
+  same property. Pick the row for its exposure to the mechanism first, then find out
+  what it costs in precision.
+* **Decompose the ratio.** The ratio's cross-window spread here is the incumbent's
+  bimodality (kernel arm ~4.15 vs ~4.64 ms); our arm is stable to 0.6%. Measuring
+  the arm rather than the ratio turned an unresolvable 9% into a resolvable 0.5%.
+* **Prove the treatment was applied, in the run's own report.** Every storm run
+  carries its `devmean`. Three storm attempts had `devmean` 0.40–0.84 rather than
+  ~0.99 and would have silently diluted the effect had they been pooled.
