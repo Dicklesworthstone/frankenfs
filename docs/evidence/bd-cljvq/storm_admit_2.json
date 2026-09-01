@@ -1,0 +1,34 @@
+{
+  "label": "storm_admit_test",
+  "samples": 40,
+  "placement": [],
+  "loadavg": "4.54",
+  "peak_off_placement_mean_busy": 0.23749,
+  "peak_placement_mean_busy": 0.0,
+  "peak_off_placement_mean_iowait": 0.018094,
+  "peak_placement_mean_iowait": 0.0,
+  "max_external_busy_cpus": 18,
+  "over_limit_samples": 27,
+  "contended_fraction": 0.675,
+  "max_consecutive_over_limit": 27,
+  "io_storm_samples": 0,
+  "max_external_busy_cpus_limit": 4,
+  "max_external_busy_cpus_limit_under_io_storm": 2,
+  "external_load_verdict": "CONTENDED",
+  "peak_device_io_fraction": 0.9963,
+  "busiest_device": "nvme0n1p3",
+  "busy_devices_io_time_fraction": [
+    {
+      "device": "nvme0n1p3",
+      "io_time_fraction": 0.9862
+    },
+    {
+      "device": "dm-0",
+      "io_time_fraction": 0.9845
+    },
+    {
+      "device": "nvme0n1",
+      "io_time_fraction": 0.7931
+    }
+  ]
+}

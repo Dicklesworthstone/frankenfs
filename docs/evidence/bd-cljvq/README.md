@@ -127,3 +127,40 @@ each the paired attempt succeeds ~18% of the time and the run needs retries, not
 new instrument. A cheaper generator — one thread issuing asynchronous readahead
 rather than blocking reads — would buy more headroom if the retry cost proves too
 high.
+
+## 5. The storm arm is admissible — DEMONSTRATED, not just predicted
+
+The headroom model above predicted ~43% admission for a generator costing 2 busy
+CPUs. Tested directly with the in-process 2-reader generator on a quiet box
+(loadavg 1.84), five consecutive 40-sample windows:
+
+| window | peak device | **window-avg dm-0** | iowait | busy CPUs | contended frac | verdict |
+|---|---|---|---|---|---|---|
+| 1 | 0.9953 | 0.9884 | 0.016248 | 7 | 0.125 | CONTENDED |
+| 2 | 0.9963 | 0.9845 | 0.018094 | 18 | 0.675 | CONTENDED |
+| 3 | 0.9973 | **0.9883** | 0.017341 | 6 | 0.075 | **CLEAR** |
+| 4 | 0.9963 | 0.9873 | 0.019559 | 11 | 0.350 | CONTENDED |
+| 5 | 0.9983 | 0.9868 | 0.016432 | 14 | 0.275 | CONTENDED |
+
+Observed admission 1/5. Lower than the predicted 43% and on the same order; n=5
+cannot separate 20% from 43%, and the generator's cost is not exactly 2 (busy-CPU
+counts ran 6–18). **The arm exists, which is what the bead needed to know.**
+
+**Window 3 is the strongest artifact this campaign has for the blind spot.** It is
+SUSTAINED, not a burst — `dm-0` averaged **0.9883 over the whole 40-second window**,
+not one stalled second — and the shipping gate ADMITTED it, while off-placement mean
+iowait read `0.017341`, inside the quiet population's range (quiet max `0.020123`).
+
+So the shipping policy will admit a run whose device queue is ~99% busy for its
+entire duration, and iowait reads quiet the whole time. bd-xhl2g's organic window
+showed this for a single second; this shows it for a whole window.
+
+It also confirms the choice to record the MEAN: the sustained figure separates
+quiet (0.023–0.125) from this window (0.9883) by ~7.9x, exactly as the
+window-average population predicted, whereas the PEAK cannot tell window 3 from a
+quiet box that happened to peak at 0.529.
+
+**What remains is the actual question.** All of this is still about the SIGNAL. No
+ratio has been measured under either condition, and the paired quiet-vs-storm
+comparator run is what this bead has to deliver. Both arms must land in admitted
+windows; at the observed rate that needs retries.
