@@ -194,3 +194,23 @@ flight from ONE thread — asynchronous submission (io_uring, or `readahead`-sty
 hints) rather than blocking `preadv`. That decouples queue depth from CPU cost
 instead of trading one for the other. Untried; only worth building if the retry
 cost of variant C proves prohibitive in the paired run.
+
+## 7. The A/A null CANNOT substitute for the paired run — do not take this shortcut
+
+The paired design is expensive: both arms must land in admitted windows, and at ~20%
+each that is ~4% per attempt. The tempting economy is to run ONE storm arm and read
+the comparator's built-in A/A null: if the storm biases the instrument, surely the
+null moves, and one admitted window suffices instead of two.
+
+**It does not work, and the reason is already recorded in this repo.** An A/A null
+compares an arm against ITSELF, so any bias that hits both halves equally cancels
+exactly — the same argument that made `peak_placement_mean_busy` necessary for
+bd-arm-contention, where franken_numpy confirmed an arm slowing the incumbent it is
+measured against while the A/A null stayed clean. A device-queue storm is precisely
+a symmetric perturbation: it slows both halves of an A/A pair.
+
+So an A/A null under storm would come back clean whether or not the storm biases the
+ratio, and reading that as "no effect" would be a false null bought for half price.
+
+The paired quiet-vs-storm comparison of the RATIO is therefore not a stylistic
+preference; it is the only design that can see a symmetric bias. Budget the retries.
