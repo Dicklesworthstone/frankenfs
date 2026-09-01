@@ -322,8 +322,14 @@ pub fn zero_message_opendir_enabled() -> bool {
     )
 }
 
-/// MEASUREMENT-ONLY zero-message open for ORDINARY FILES
-/// (`FFS_FUSE_ZERO_MESSAGE_OPEN`, default OFF).
+/// Zero-message open for ORDINARY FILES (`FFS_FUSE_ZERO_MESSAGE_OPEN`,
+/// **default ON since 2026-08-27**).
+///
+/// ⚠ This heading read "MEASUREMENT-ONLY ... default OFF" until 2026-09-01 while
+/// the body below had defaulted it ON since 2026-08-27 — a doc that contradicted
+/// its own function and cost a later reader several turns reasoning from it. The
+/// history that made it measurement-only is kept below because the refutations are
+/// the evidence for the default; it is no longer what the knob IS.
 ///
 /// The `⛔ DO NOT ADD FUSE_NO_OPEN_SUPPORT` note at the negotiation site rejects
 /// this on reasoning: zero-message open means the kernel synthesises the open with
@@ -422,6 +428,33 @@ pub fn inode_invalidation_enabled() -> bool {
     })
 }
 
+/// Parse `FFS_FUSE_ZERO_MESSAGE_OPEN`. Unset means ON — see the knob's doc above.
+///
+/// ⚠ CASE-INSENSITIVE SINCE 2026-09-01 (bd-ga4ug), and that is a FIX, not a
+/// tidy-up. Until then this knob alone matched `"0" | "false" | "off" | "no"`
+/// case-SENSITIVELY, while every sibling in this crate — `splice_from_value`,
+/// `zero_message_opendir_from_value`, and the rest — uses `eq_ignore_ascii_case`.
+/// So `FFS_FUSE_ZERO_MESSAGE_OPEN=OFF` silently left the lever ON.
+///
+/// That is not a cosmetic difference on a knob whose only purpose is to supply the
+/// OFF arm of an A/B from one ELF: an ignored off-value produces two arms that are
+/// byte-identical and a ratio of ~1.0, which reads as a clean NULL rather than as a
+/// knob that never took effect. This campaign has already paid for that exact
+/// failure once, when `MALLOC_CONF` was silently ignored under `tikv-jemallocator`
+/// and buried a counted mechanism. The new off-set is a strict SUPERSET of the old
+/// one, so no value that used to disable the knob has stopped doing so.
+#[must_use]
+pub fn zero_message_open_from_value(raw: Option<&str>) -> bool {
+    let Some(raw) = raw else {
+        return true;
+    };
+    let t = raw.trim();
+    !(t == "0"
+        || t.eq_ignore_ascii_case("false")
+        || t.eq_ignore_ascii_case("off")
+        || t.eq_ignore_ascii_case("no"))
+}
+
 pub fn zero_message_open_measurement_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
@@ -440,10 +473,9 @@ pub fn zero_message_open_measurement_enabled() -> bool {
         //     `Ok(())`, the only other definition is the `Arc` forwarder, and
         //     `no_fsops_impl_overrides_release_bd_q0xnl` keeps it that way.
         // Worth 48.60% of this row's crossings and a balanced 1.160389x.
-        match std::env::var("FFS_FUSE_ZERO_MESSAGE_OPEN") {
-            Ok(raw) => !matches!(raw.trim(), "0" | "false" | "off" | "no"),
-            Err(_) => true,
-        }
+        zero_message_open_from_value(
+            std::env::var("FFS_FUSE_ZERO_MESSAGE_OPEN").ok().as_deref(),
+        )
     })
 }
 
@@ -8741,13 +8773,21 @@ mod tests {
         }
     }
 
-    /// bd-q0xnl: why zero-message OPEN is not the twin of zero-message opendir.
+    /// bd-q0xnl: an ordinary read-only open asks the kernel to KEEP its page cache.
     ///
-    /// The asymmetry is entirely in what each reply carries. `opendir` answers
-    /// with no open flags, so letting the kernel handle it gives up nothing;
-    /// `open` answers with FOPEN_KEEP_CACHE, and the kernel's synthesised open
-    /// uses default flags, so the page cache would be dropped on every open —
-    /// a silent read regression that would still look like a transport win.
+    /// ⚠ THE NAME AND THE OLD RATIONALE ARE BOTH WRONG, and the name is kept only
+    /// because `docs/NEGATIVE_EVIDENCE.md:12221` cites it. This test used to say
+    /// zero-message open "would lose" `FOPEN_KEEP_CACHE` — that the kernel would
+    /// synthesise an open with default flags and drop the page cache on every open,
+    /// "which is why it is refused".
+    ///
+    /// That was REFUTED by measurement on 2026-08-27: with `FUSE_NO_OPEN_SUPPORT`
+    /// the kernel does not call `fuse_open` at all, so the invalidate-on-open path
+    /// never runs and there is nothing for `FOPEN_KEEP_CACHE` to prevent.
+    /// `op_counts read` was **512 in all four arms**, and the knob now defaults ON.
+    ///
+    /// What the assertions below still pin is worth keeping: the flags an ordinary
+    /// open replies with. They just do not mean what the old comment said.
     #[test]
     fn zero_message_open_would_lose_keep_cache_bd_q0xnl() {
         assert_eq!(
@@ -8761,6 +8801,39 @@ mod tests {
             0,
             "if this ever becomes zero the refusal above needs re-deciding, not keeping"
         );
+    }
+
+    /// bd-q0xnl / bd-ga4ug: the zero-message-open DEFAULT is load-bearing and was
+    /// pinned by nothing until 2026-09-01.
+    ///
+    /// It is worth **48.60% of the parallel-read row's crossings and a balanced
+    /// `1.160389x`**, taking that row from `1.321623x` to `1.135508x` against live
+    /// kernel ext4. Every parallel-read ratio banked since 2026-08-27 was measured
+    /// with it ON. Its sibling `zero_message_opendir` has had
+    /// `zero_message_opendir_defaults_off_bd_q0xnl` guarding its default all along;
+    /// this one had no equivalent, so a flipped default would have silently
+    /// re-priced a banked row — the bd-6kpp4 failure mode exactly.
+    #[test]
+    fn zero_message_open_defaults_on_bd_q0xnl() {
+        assert!(
+            zero_message_open_from_value(None),
+            "unset MUST enable zero-message open — that is what every banked \
+             parallel-read row since 2026-08-27 was measured with"
+        );
+        // Case-insensitivity is the bd-ga4ug fix: `OFF` used to be IGNORED, which
+        // silently produced an A/B with two identical arms.
+        for raw in ["0", "false", "off", "no", "  off  ", "OFF", "False", "No"] {
+            assert!(
+                !zero_message_open_from_value(Some(raw)),
+                "{raw:?} must disable the knob so one ELF can supply both A/B arms"
+            );
+        }
+        for raw in ["1", "true", "on", "yes"] {
+            assert!(
+                zero_message_open_from_value(Some(raw)),
+                "{raw:?} must leave the shipping default in place"
+            );
+        }
     }
 
     /// bd-q0xnl: opting in must NOT by itself arm the `ENOSYS` reply.
@@ -23098,12 +23171,18 @@ AllowOther"#;
         m.record_throttled();
         m.record_shed();
         m.record_handler_duration(Duration::from_nanos(7));
-        // bd-i353e / bd-q0xnl: these three are boundary/mechanism counters that no
-        // dispatch op reaches, so exercising every RequestOp does not touch them.
+        // bd-i353e / bd-q0xnl / bd-b07o1: these are boundary/mechanism counters that
+        // no dispatch op reaches, so exercising every RequestOp does not touch them.
         // They must still be driven here, or this guard passes while they read zero.
+        //
+        // `record_getxattr_request` is the THIRD time this list has gone stale — it
+        // arrived with the memoized-xattr counter in `50626af11` and was not added
+        // here, so this guard failed on `main` until 2026-09-01. That is the guard
+        // working, not the guard being wrong: the field was live and unexercised.
         m.record_forget_nodes(1);
         m.record_readdirplus_memo_remember();
         m.record_readdirplus_memo_hit();
+        m.record_getxattr_request();
         for op in RequestOp::ALL {
             m.record_dispatch_duration(op, Some(Duration::from_nanos(7)));
         }
@@ -23575,7 +23654,10 @@ AllowOther"#;
             "bytes_read: 0, metadata_requests: 0, ",
             "handler_total_nanos: 0, handler_total_count: 0, ",
             "getattr_dispatch_count: 0, ",
-            "getattr_dispatch_nanos: 0, getxattr_dispatch_count: 0, getxattr_dispatch_nanos: 0, ",
+            "getattr_dispatch_nanos: 0, getxattr_dispatch_count: 0, ",
+            // bd-b07o1 added this counter in `50626af11`; the golden string was not
+            // updated, so this test failed on `main` until 2026-09-01.
+            "getxattr_request_count: 0, getxattr_dispatch_nanos: 0, ",
             "mutation_dispatch_count: 0, mutation_dispatch_nanos: 0, ",
             "other_dispatch_count: 0, other_dispatch_nanos: 0, ",
             "lookup_dispatch_count: 0, lookup_dispatch_nanos: 0, ",
