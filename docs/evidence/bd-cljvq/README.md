@@ -438,3 +438,57 @@ that matters: the noise a quiet-vs-storm comparison must beat is the INCUMBENT's
    FUSE medians 21.282/21.408 versus storm 21.703/22.214/21.321. The storm runs were
    all CONTENDED, so CPU contention is confounded with the device storm and this
    comparison cannot be cited. It says where to look, not what is true.
+
+## 14. RESULT for btrfs warm stat: a saturated device queue does NOT slow our arm
+
+Admitted runs only (`external_load_during_run=clear`, both A/A nulls passing),
+192 pairs, one ELF, btrfs warm stat. The storm arm ran the 2-reader `O_DIRECT`
+generator; `devmean` is the run's OWN recorded `mean_device_io_fraction`, which is
+the proof the treatment was actually applied.
+
+| condition | run | kernel (ms) | **FUSE (ms)** | ratio | devmean |
+|---|---|---|---|---|---|
+| quiet | quietq1_2 | 4.165 | 21.282 | 5.1005 | 0.0477 |
+| quiet | quietq1_3 | 4.654 | 21.408 | 4.6700 | 0.0430 |
+| quiet | quietq2_2 | 4.637 | 21.282 | 4.6238 | 0.0410 |
+| quiet | quietq2_3 | 4.639 | 21.318 | 4.7080 | 0.0602 |
+| **storm** | storm_160420_1 | 4.161 | **21.133** | 5.0984 | **0.9902** |
+| **storm** | storm_160420_2 | 4.168 | **21.245** | 5.0585 | **0.9883** |
+
+    QUIET  n=4  FUSE median 21.300 ms  range [21.282, 21.408]  spread 0.59%
+    STORM  n=2  FUSE median 21.189 ms  range [21.133, 21.245]  spread 0.53%
+
+    FUSE arm storm/quiet = 0.9948   (-0.52%)
+
+**The storm arm is not slower — it is marginally faster.** The two ranges do not
+overlap, but in the harmless direction, and half a percent is not a physically
+meaningful speedup from saturating a disk; it is the size of this instrument's
+systematic. The honest reading is **no effect at the ~0.5% resolution achieved**.
+
+Note the ratio column would have told a different and wrong story: storm ratios
+5.0984/5.0585 versus quiet 4.6238–5.1005. That spread is the incumbent's bimodality
+(section 13), and reading the ratio alone could suggest the storm "raised" our loss.
+Decomposing into arms shows our arm did not move.
+
+### Why this null was nearly guaranteed, and what it does and does not settle
+
+The quiet runs' own device utilisation is `devmean` **0.031–0.060** — and that
+figure includes the untimed fixture build and e2fsck. **Warm stat is a cached
+metadata workload; its timed region barely touches the device at all.** A device
+storm cannot slow a workload that is not waiting on the device.
+
+So this row was close to immune to the treatment by construction, and the row was
+chosen (section 8) for its low cross-window spread. **Those two properties are the
+same property.** The rows with real device sensitivity — bulk durable write, cold
+cache reads, fsync — are exactly the rows with 3–9% spread, and the stable rows are
+stable because they are cached.
+
+That is the tension this bead has to state plainly:
+
+* On a CACHED row, device saturation is measurably harmless (this section), so an
+  external-load gate on device utilisation would refuse windows for nothing.
+* On a DEVICE-BOUND row the question is still open, and it is the one that matters
+  for a gate, since a gate applies to every row.
+
+**bd-cljvq is therefore not answered by this section alone.** It is answered for
+warm stat, with a mechanism, and the device-bound half is the remaining work.
