@@ -70,6 +70,14 @@ MAX_CONTENDED_SAMPLE_FRACTION = 0.10
 MAX_CONSECUTIVE_CONTENDED_SAMPLES = 3
 
 FRACTION_GRID = [0.20, 0.25, 0.30, 0.40, 0.50, 0.60, 0.75, 0.90]
+
+# The OTHER gate these windows can answer, for free (bd-host-wide-scope-gap-four-rows-dy9s8).
+# `--placement-scope host-wide` runs `wait_for_host_quiet`, which needs ZERO of the
+# process's allowed CPUs above MAX_DRIVER_PREFLIGHT_BUSY for DEFAULT_HOST_QUIET_SAMPLES
+# CONSECUTIVE 1-second samples. That is strictly stricter than the external-load veto:
+# not "few busy CPUs", but NONE.
+MAX_DRIVER_PREFLIGHT_BUSY = 0.20
+DEFAULT_HOST_QUIET_SAMPLES = 5
 LIMIT_GRID = list(range(0, 17))
 
 
@@ -135,6 +143,45 @@ def verdict(rows: list[list[float]], frac: float, limit: int) -> dict:
     }
 
 
+def host_wide_gate(paths: list[str]) -> int:
+    """Replay `wait_for_host_quiet` over recorded windows.
+
+    Answers whether `--placement-scope host-wide` can ever arm on this fleet,
+    without paying for a run that would time out trying.
+    """
+    recs = load(paths)
+    if not recs:
+        print("no windows given", file=sys.stderr)
+        return 2
+    print(f"HOST-WIDE QUIESCENCE GATE replayed over {len(recs)} window(s)")
+    print(f"criterion: ZERO allowed CPUs above {MAX_DRIVER_PREFLIGHT_BUSY:.0%} busy, "
+          f"for {DEFAULT_HOST_QUIET_SAMPLES} CONSECUTIVE 1-second samples\n")
+    total = clear_total = best_overall = 0
+    for r in recs:
+        rows = r["rows"]
+        clear = [all(b <= MAX_DRIVER_PREFLIGHT_BUSY for b in row) for row in rows]
+        run = best = 0
+        for c in clear:
+            run = run + 1 if c else 0
+            best = max(best, run)
+        above = [sum(1 for b in row if b > MAX_DRIVER_PREFLIGHT_BUSY) for row in rows]
+        total += len(rows)
+        clear_total += sum(clear)
+        best_overall = max(best_overall, best)
+        name = r["_path"].rsplit("/", 1)[-1]
+        print(f"  {name:<28} label={r.get('label','?'):<18} loadavg {r.get('loadavg_start')}"
+              f"  clear {sum(clear)}/{len(rows)}  longest run {best}"
+              f"  cpus>{MAX_DRIVER_PREFLIGHT_BUSY:.0%}: median {sorted(above)[len(above)//2]}, max {max(above)}")
+    print(f"\n  TOTAL {clear_total}/{total} samples clear; longest consecutive run anywhere "
+          f"= {best_overall}, need {DEFAULT_HOST_QUIET_SAMPLES}")
+    reached = best_overall >= DEFAULT_HOST_QUIET_SAMPLES
+    print(f"  => host-wide gate {'REACHABLE' if reached else 'NOT REACHED'} in these windows")
+    if not reached and clear_total == 0:
+        print("     and not a SINGLE sample was clear, so this is structural rather than\n"
+              "     a matter of waiting: the floor of always-busy CPUs never reaches zero.")
+    return 0
+
+
 def load(paths: list[str]) -> list[dict]:
     recs = []
     for pat in paths:
@@ -197,9 +244,14 @@ def main() -> int:
     ap.add_argument("--json", default=None)
     ap.add_argument("--compare", nargs="+", metavar="QUIET",
                     help="quiet JSONs; put loaded JSONs after a bare --")
+    ap.add_argument("--host-wide-gate", nargs="+", metavar="JSON",
+                    help="replay the host-wide quiescence gate over recorded windows "
+                         "(bd-host-wide-scope-gap-four-rows-dy9s8)")
     ap.add_argument("rest", nargs="*")
     a = ap.parse_args()
 
+    if a.host_wide_gate:
+        return host_wide_gate(a.host_wide_gate)
     if a.compare:
         return compare(a.compare, a.rest)
 
