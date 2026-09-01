@@ -164,3 +164,33 @@ quiet box that happened to peak at 0.529.
 ratio has been measured under either condition, and the paired quiet-vs-storm
 comparator run is what this bead has to deliver. Both arms must land in admitted
 windows; at the observed rate that needs retries.
+
+## 6. You cannot buy admission by weakening the storm
+
+The 2-reader generator is admitted ~20% of the time, so the obvious move is a
+cheaper one: fewer readers, bigger reads, maximising device time per CPU-second.
+Variant D is one reader issuing 32 MiB `O_DIRECT` reads instead of two issuing
+8 MiB (`io_storm_d.sh`). Four windows:
+
+| window | peak device | window-avg dm-0 | busy CPUs | contended frac | verdict |
+|---|---|---|---|---|---|
+| 1 | 0.3258 | 0.2829 | 6 | 0.150 | CONTENDED |
+| 2 | 0.5864 | 0.2865 | 6 | 0.100 | CLEAR |
+| 3 | 0.3157 | 0.2754 | 5 | 0.050 | CLEAR |
+| 4 | 0.3577 | 0.2786 | 7 | 0.125 | CONTENDED |
+
+Admission rises to 2/4, and the device utilisation collapses to **0.28**. That is
+not a saturated queue — it is between the quiet population (0.023–0.125) and the
+2-reader storm (0.985), and closer to quiet.
+
+**So the trade is not favourable, it is degenerate.** Admission was bought by
+removing the treatment. A generator that does not pin the queue cannot answer
+"does a pinned queue move a ratio", however often it is admitted. Variant C with
+2 readers stays the instrument: sustained `dm-0` 0.985–0.990, admitted ~20% of the
+time, retried.
+
+The remaining way to widen the budget is a generator that keeps many requests in
+flight from ONE thread — asynchronous submission (io_uring, or `readahead`-style
+hints) rather than blocking `preadv`. That decouples queue depth from CPU cost
+instead of trading one for the other. Untried; only worth building if the retry
+cost of variant C proves prohibitive in the paired run.
