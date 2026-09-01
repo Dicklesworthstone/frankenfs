@@ -246,3 +246,49 @@ an expensive null.
 be larger, and if it is, that is not an obstacle to report — it is part of the
 answer. "The storm inflates the row's variance" is a real finding about whether a
 saturated queue harms a measurement, even if the central ratio does not move.
+
+## 9. Admission collapses with RUN LENGTH — and that, not the storm, is the binding constraint
+
+Everything above scored 40-second windows because that is what the probe takes. A
+comparator run is far longer, and the gate is evaluated over the whole timed region.
+bd-d5pdz recorded a "length-dependence caveat" without quantifying it; this
+quantifies it.
+
+`trace.py` records one CONTIGUOUS 900-second trace of per-sample busy-CPU counts —
+contiguous rather than resampled because contention here ARRIVES IN BURSTS, and
+shuffling would destroy the autocorrelation that decides whether a long run survives
+the 3-consecutive rule. Real windows of each length are then scored with
+`ExternalLoadWitness::clean`.
+
+Trace of 2026-09-01 14:18–14:33 (`p50=2, p90=13, p99=16, max=21`; 37.6% of samples
+over the limit of 4):
+
+| window | admitted, no storm (k=0) | admitted, storm (k=2) |
+|---|---|---|
+| 40 s | 10/22 (45%) | 7/22 (32%) |
+| 80 s | 4/11 (36%) | 2/11 (18%) |
+| 150 s | 1/6 (17%) | 0/6 (0%) |
+| 300 s | 0/3 (0%) | 0/3 (0%) |
+| 600 s | 0/1 (0%) | 0/1 (0%) |
+| 900 s | 0/1 (0%) | 0/1 (0%) |
+
+**In this regime nothing longer than ~150 s is admitted, storm or no storm.** A
+48-pair run is ~5–6.5 min (300–390 s) and a 24-pair run ~2.5 min (150 s), so the RUN
+LENGTH — not the storm — is what refuses the measurement. Note the k=0 column: at
+300 s the run is refused even with no storm at all.
+
+⚠ THIS IS REGIME-DEPENDENT AND MUST NOT BE READ AS A CONSTANT. An earlier 280-sample
+trace the same afternoon gave `p50=2, p90=4, p99=11, max=18` — the box was far
+quieter, and long windows would fare much better. Peers had resumed by 14:18. The
+finding is the SHAPE (admission decays sharply with length, and the storm shifts the
+curve left by roughly one length step), not the specific percentages.
+
+**Consequences for this bead's run plan:**
+1. Use the SHORTEST run that still resolves the effect. The row choice in section 8
+   already buys this: btrfs warm stat's 0.69% cross-window spread means few pairs
+   are needed, where btrfs readdir+stat would have wanted 384.
+2. Take the arms in a quiet regime, and measure the regime first — a 300-second
+   trace costs 5 minutes and tells you whether the attempt is worth making.
+3. If long runs cannot be admitted at all in any available regime, that is a finding
+   about the INSTRUMENT rather than about device contention, and it belongs to
+   bd-8c9u0 and the host-quiescence work rather than being silently absorbed here.
