@@ -250,8 +250,37 @@ fn write_entry(
 /// large-directory create/rename. An insert into a near-*empty* block splits the
 /// one huge free slot (span ≈ whole block), and its zero-fill of the vacated
 /// slack can touch arbitrary stale bytes, so the span exceeds this and we fall
-/// back to a full recompute (which is exactly today's behaviour). The bench
-/// `dir_csum_incremental` crosses over well below 256 B, so this is conservative.
+/// back to a full recompute (which is exactly today's behaviour).
+///
+/// ⚠ THE 256 IS NOT JUSTIFIED BY A MEASUREMENT, and the claim that used to stand
+/// here — "the bench `dir_csum_incremental` crosses over well below 256 B, so this
+/// is conservative" — is REFUTED (bd-4sull, 2026-08-31). That bench had no span
+/// sweep at all: every arm used one fixed 28-byte delta and never varied it, so no
+/// crossover could be read off it in either direction.
+///
+/// Measured with the sweep now in that bench (`dir_csum_span`, release-perf, rch
+/// worker hz4), full recompute against incremental, nanoseconds:
+///
+/// | span | full | incremental | incremental is |
+/// |------|------|-------------|----------------|
+/// | 8    | 962.95 | 38.91  | 24.7x faster |
+/// | 128  | 869.13 | 73.15  | 11.9x faster |
+/// | 256  | 870.91 | 112.13 | 7.77x faster |
+/// | 1024 | 885.05 | 260.76 | 3.39x faster |
+/// | 3072 | 869.59 | 672.85 | 1.29x faster |
+///
+/// Incremental wins at EVERY span up to 3072 B, and the equivalence assertion in
+/// that bench passes at every one of them. The crossover is therefore above the
+/// widest span the coverage region admits, not below 256 — so this threshold sits
+/// far under it and the full recompute it forces on wider spans is pure loss.
+///
+/// The value is deliberately LEFT AT 256 pending one more measurement: the caller
+/// ([`dir_block_edit`]) also snapshots the pre-mutation region with `to_vec()`,
+/// an allocation and copy that grow with the span while the full path carries
+/// neither. The `incremental_with_snapshot` arm exists to price that and has not
+/// been run (the fleet refused the bench four times on `queue_timeout`). Raising
+/// this constant on the stamp-only numbers would be the counted-proxy error this
+/// campaign has already made once: a counted win reversed by wall clock.
 pub const INCREMENTAL_DIR_CSUM_MAX_SPAN: usize = 256;
 
 /// Build a [`DirBlockEdit`] snapshotting `block[region_start..region_end]` — but
