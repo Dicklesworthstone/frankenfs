@@ -1,0 +1,11 @@
+samples=280  busy-CPU count: p50=2 p90=4 p99=11 max=18
+non-overlapping 40-sample windows: 7
+
+ storm adds k busy CPUs -> windows ADMITTED
+   k=0: 4/7
+   k=1: 4/7
+   k=2: 3/7
+   k=3: 0/7
+   k=4: 0/7
+   k=5: 0/7
+   k=6: 0/7

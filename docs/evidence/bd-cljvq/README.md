@@ -83,3 +83,47 @@ reading is sound to within timer granularity — but a raw unclamped check taken
 during a controlled storm is still owed, and a re-check run in a later, quiet window
 saw only 0.115 raw with no overshoot (device idle at the time, so it did not
 exercise the clamp). Anyone placing a threshold should confirm this first.
+
+## 4. Is the storm arm ADMISSIBLE at all? Yes — with a generator costing <= 2 busy CPUs
+
+This bead's stated hard part is not producing a storm, it is getting the storm arm
+past `external_load_during_run`: 0 of 9 manufactured storms cleared it, and the
+refusals came from this box's background churn rather than from the storm. If the
+storm arm can never be admitted, the bead is unanswerable by the mounted comparator
+on this host, and saying so is the correct outcome.
+
+`headroom.py` settles it without touching the device, so it can run beside a peer's
+benchmark — and beside one is the RIGHT reading, since realistic co-tenancy is what
+the storm arm would actually face. It samples the background's per-sample busy-CPU
+count and asks, for each `k`, what fraction of 40-sample windows would still be
+admitted if a storm added `k` busy CPUs. It mirrors `ExternalLoadWitness::clean`
+exactly (both the 0.10 contended-fraction ceiling and the 3-consecutive rule).
+
+Over 280 samples — `p50=2, p90=4, p99=11, max=18`:
+
+| storm adds | windows admitted |
+|---|---|
+| k=0 | 4/7 |
+| k=1 | 4/7 |
+| k=2 | **3/7** |
+| k=3 | 0/7 |
+| k>=3 | 0/7 |
+
+**The arm is admissible if and only if the generator costs at most 2 busy CPUs**,
+and then in roughly 43% of windows. Note k=0 is already only 4/7: the background
+alone refuses 43% of windows, so most of the loss is not the storm's doing.
+
+⚠ A SHORTER RUN SAID OTHERWISE AND WAS WRONG. A first pass over 120 samples read
+`p50=1, p90=3, p99=5, max=6` and put the cliff at k=2 (3/3 admitted at k<=1, 0/3 at
+k>=2), which would have made the 2-reader generator inadmissible and the bead
+unanswerable. 280 samples moved the cliff to k=3. Three windows cannot characterise
+a tail — `p99` went 5 -> 11 and `max` 6 -> 18 between the two runs. Buy windows
+before concluding a bead is unanswerable.
+
+**This makes the measurement feasible.** The in-process 2-reader generator holds
+`dm-0` at 0.983–0.990 (see the bd-xhl2g table) and costs ~2 busy CPUs, which is
+exactly the admissible budget. Both arms must land in admitted windows, so at ~43%
+each the paired attempt succeeds ~18% of the time and the run needs retries, not a
+new instrument. A cheaper generator — one thread issuing asynchronous readahead
+rather than blocking reads — would buy more headroom if the retry cost proves too
+high.
