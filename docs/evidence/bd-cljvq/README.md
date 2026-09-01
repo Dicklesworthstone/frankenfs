@@ -395,3 +395,46 @@ established. Do not cite it as a finding until the admitted arm exists.
 It is also, for the campaign generally, an argument that the external-load gate is
 protecting something real: these four ratios span 11.2% while the row's banked
 quiet cross-window spread is 0.69%.
+
+## 13. The ratio's spread is the INCUMBENT's — and it looks bimodal
+
+Two admitted 192-pair quiet runs, taken two minutes apart on one ELF:
+
+| run | verdict | kernel median | FUSE median | ratio |
+|---|---|---|---|---|
+| quietq1_2 | clear | 4.165 ms | 21.282 ms | 5.1005 |
+| quietq1_3 | clear | **4.654 ms** | 21.408 ms | 4.6700 |
+
+The ratio differs by **9.2%**. Decomposed: the **FUSE arm differs by 0.6%** and the
+**kernel arm by 11.7%**. The spread is almost entirely the incumbent's.
+
+Across all eleven 192-pair runs collected (any load state) the kernel medians are
+
+    4.138  4.162  4.165  4.167  4.232 | 4.372  4.424 | 4.624  4.630  4.654  4.663
+
+which clusters near ~4.15 and ~4.64 with little in between — the shape of a system
+toggling between two states (boost/frequency residency or cache placement are the
+obvious candidates) rather than of continuous noise. Unproven as a mechanism; the
+clustering is what is observed.
+
+**This CORRECTS section 12.** That section reported the opposite — our arm varying
+11.8% against the incumbent's 6.2% — from four runs that were all heavily contended.
+Both can hold without contradiction: under socket contention our arm suffers more
+(a FUSE round trip crosses more of the shared machine), while in ADMITTED windows
+the incumbent's bimodality dominates. Section 12 was labelled preliminary and
+not-to-be-cited precisely so this could overturn it, and it has, in the direction
+that matters: the noise a quiet-vs-storm comparison must beat is the INCUMBENT's.
+
+**Consequences for this bead:**
+1. The row's banked `0.69%` cross-window spread is not reproducing. Eleven runs say
+   the achievable spread is an order of magnitude worse, so the effect size this
+   design can resolve is far larger than section 8 assumed — the banked figure was
+   one lucky pair, which is exactly what the scorecard warns a two-run spread is.
+2. **Compare the FUSE arm's wall time, not only the ratio.** The physically
+   meaningful question is whether a saturated queue slows OUR filesystem; the ratio
+   imports the incumbent's bimodality as pure noise. The FUSE arm is stable to 0.6%
+   across admitted windows, which is a far better instrument.
+3. On that measure a signal is already visible and is NOT yet trustworthy: quiet
+   FUSE medians 21.282/21.408 versus storm 21.703/22.214/21.321. The storm runs were
+   all CONTENDED, so CPU contention is confounded with the device storm and this
+   comparison cannot be cited. It says where to look, not what is true.
