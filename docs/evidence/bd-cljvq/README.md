@@ -214,3 +214,35 @@ ratio, and reading that as "no effect" would be a false null bought for half pri
 
 The paired quiet-vs-storm comparison of the RATIO is therefore not a stylistic
 preference; it is the only design that can see a symmetric bias. Budget the retries.
+
+## 8. Which row, and what effect size this can resolve
+
+The storm and quiet arms are two DIFFERENT windows, so the noise floor for their
+comparison is the row's **cross-window spread**, not its within-invocation CI.
+`docs/MOUNTED_KERNEL_SCORECARD.md` banks both, measured 2026-08-08:
+
+| row | cross-window spread | run-1 CI width |
+|---|---|---|
+| bulk durable write | 9.15% | — |
+| btrfs parallel read (co-tenant) | 6.09% | — |
+| btrfs parallel read (quiet) | 3.81% | — |
+| ext4 readdir+stat | 2.73% | 1.84% |
+| btrfs readdir+stat | 1.36% | 0.40% |
+| **ext4 warm stat** | **1.08%** | 0.88% |
+| **ext4 parallel read** | **0.83%** | 0.86% |
+| **btrfs warm stat** | **0.69%** | 1.37% |
+
+**Use btrfs warm stat (0.69%) or ext4 parallel read (0.83%).** They resolve a storm
+effect of roughly 1.5–2% — enough to matter for a gate decision, since a bias
+smaller than the spread of the rows it would protect cannot justify refusing
+windows. Warm stat is also the cheapest row to iterate on.
+
+**Do NOT use readdir+stat or bulk durable write.** bulk durable write's 9.15% spread
+would swamp any plausible effect, and btrfs readdir+stat is the row bd-bredw needed
+384 pairs to stabilise. Picking a noisy row here converts a decidable question into
+an expensive null.
+
+⚠ The spreads above were measured in QUIET windows. The storm arm's own spread may
+be larger, and if it is, that is not an obstacle to report — it is part of the
+answer. "The storm inflates the row's variance" is a real finding about whether a
+saturated queue harms a measurement, even if the central ratio does not move.
