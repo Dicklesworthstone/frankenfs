@@ -5461,10 +5461,96 @@ fn sample_cpu_busy() -> Result<BTreeMap<usize, f64>> {
 const EXTERNAL_BUSY_CPU_FRACTION: f64 = 0.25;
 
 /// How many off-placement CPUs may carry external load before a SAMPLE counts as
-/// contended. Two is deliberately permissive — a lone background daemon does not
-/// invalidate a measurement — while the case that flipped a published verdict
-/// showed five.
-const MAX_EXTERNAL_BUSY_CPUS: usize = 2;
+/// contended.
+///
+/// ⚠ RECALIBRATED 2026-09-01 from `2` to `4` (bd-d5pdz). The original `2` was not
+/// wrong when it was set; the host it was calibrated against no longer exists.
+/// It was derived when "quiet" meant ZERO busy off-placement CPUs, and on the
+/// current fleet that state is unreachable — so the gate had stopped
+/// discriminating and was refusing every window, the quietest ones included.
+///
+/// The recalibration is the same shape as the original: measure a genuinely-quiet
+/// window and a genuinely-loaded one and put the threshold between them. Taken
+/// with `scripts/external_load_calibration.py`, which replays this exact verdict
+/// over a grid of thresholds, at `EXTERNAL_BUSY_CPU_FRACTION = 0.25`:
+///
+///   QUIET   4 windows x 40 samples, loadavg ~5 (this box's real floor)
+///           per-sample counts 1-5, median 2, max 5
+///           ALL FOUR were REFUSED at the old limit, contended fraction
+///           0.225-0.375 against a 0.10 ceiling
+///   LOADED  synthetic 8 spinners  min 11, median 14, max 19
+///           synthetic 32 spinners min 33, median 35, max 47
+///           real fleet (bd-xhl2g harvest) 11, 25, 48
+///
+/// The old `2` sat BELOW the quiet population's own MEDIAN, which is why nothing
+/// could pass it: half of a quiet window's samples are at or over it by
+/// construction.
+///
+/// WHY `4` AND NOT MORE. `4` is the SMALLEST limit that admits all four quiet
+/// windows, and it is chosen deliberately over the looser values that also work:
+///
+///   L=3  quiet 2/4 admitted        — still refuses genuinely-quiet windows
+///   L=4  quiet 4/4, fraction 0.000-0.050 against the 0.10 ceiling; loaded 0/2
+///        at fraction 1.000; and the 2026 contended window (5 busy CPUs) is
+///        STILL REFUSED, because 5 > 4
+///   L>=5 admits the 2026 contended window and buys nothing — the loaded
+///        windows are already refused outright at 1.000
+///
+/// So `4` is the only value that both makes the gate satisfiable and preserves
+/// the refusal of the window that originally motivated the gate. That window is
+/// pinned by `external_load_policy_separates_the_two_real_windows_bd_bt2dy`.
+///
+/// ⚠ THIS LOOSENS A REFUSAL CRITERION, and that direction is the safe one: every
+/// row admitted under `2` is still admitted under `4`, so no banked ratio is
+/// invalidated. Rows banked before this date were measured against a STRICTER
+/// gate. It cannot manufacture a win either — every row this veto has refused
+/// was an `HONEST_LOSS`.
+///
+/// ⚠ It does NOT make the fleet quiet, and does not close bd-8c9u0. That bead
+/// removes the 11-48 band; it cannot remove the 1-5 floor measured above, which
+/// is this box's irreducible background. The earlier assumption that bd-8c9u0
+/// might make this recalibration unnecessary is refuted by the quiet population:
+/// even at loadavg ~5 with no other benchmark running, the old limit refused
+/// 4 windows out of 4.
+const MAX_EXTERNAL_BUSY_CPUS: usize = 4;
+
+/// The limit that still applies to a sample taken during an I/O STORM (bd-d5pdz).
+///
+/// Raising `MAX_EXTERNAL_BUSY_CPUS` from `2` to `4` is correct for CPU contention
+/// and WRONG to extend to a storm, and that is not a guess — it was measured the
+/// same afternoon. A real fleet window at loadavg **731** produced busy-CPU counts
+/// of p50 `2`, p90 `4`, max `8`: statistically indistinguishable from the quiet
+/// windows (p50 `2`, p90 `3-4`, max `5`). It looks quiet because it IS quiet by
+/// this metric — the load is D-state, and `CpuTicks::idle` sums /proc/stat fields
+/// 4+5, so iowait counts as IDLE in every busy fraction here.
+///
+/// The old limit of `2` refused that window, but only INCIDENTALLY: at a contended
+/// fraction of 0.325/0.350 it was tripped by occasional count spikes, not by
+/// seeing the storm. At `4` those windows come back CLEAN (0.050/0.025), so the
+/// recalibration would have opened a hole that nobody decided to open — and an
+/// I/O storm is the contention a FILESYSTEM comparator can least afford, since
+/// bd-xhl2g measured the storm to be on our own backing store (dm-0 0.9999,
+/// nvme0n1p3 0.9963).
+///
+/// So the relaxation is SCOPED rather than dropped: a storm sample keeps the old
+/// limit. Note carefully what this is and is not. It is NOT the iowait GATE —
+/// that decision is bd-xhl2g's and is deliberately left there. It never refuses a
+/// sample the shipping code would have admitted; it only declines to extend a NEW
+/// tolerance into windows that never had it. The set of refused runs is therefore
+/// a strict subset of today's, which is why it can land without re-running a
+/// single banked row.
+const MAX_EXTERNAL_BUSY_CPUS_UNDER_IO_STORM: usize = 2;
+
+/// Off-placement mean iowait above which a SAMPLE is treated as an I/O storm.
+///
+/// Calibrated from the two populations, which separate by three orders of
+/// magnitude, so the exact value is not delicate:
+///
+///   quiet   0.002199, 0.002369, 0.004484   (this box's floor, loadavg ~5)
+///   storm   0.864447, 0.870921, 0.920051, 0.922171   (bd-xhl2g harvest)
+///
+/// `0.10` sits ~25x above the worst quiet sample and ~9x below the mildest storm.
+const IO_STORM_OFF_PLACEMENT_MEAN_IOWAIT: f64 = 0.10;
 
 /// Fraction of contended samples above which a run is refused.
 ///
@@ -5520,6 +5606,10 @@ struct ExternalLoadWitness {
     max_consecutive_over_limit: usize,
     /// Live counter feeding `max_consecutive_over_limit`.
     current_consecutive: usize,
+    /// Samples that were treated as an I/O storm, and so were held to
+    /// `MAX_EXTERNAL_BUSY_CPUS_UNDER_IO_STORM` rather than the relaxed limit.
+    /// Evidence only — it says how often the scoping actually bound (bd-d5pdz).
+    io_storm_samples: usize,
     /// Largest off-placement mean busy fraction seen in any single sample.
     peak_mean_busy: f64,
     /// Largest ON-placement mean busy fraction — OUR OWN arms (bd-arm-contention).
@@ -5554,6 +5644,13 @@ struct ExternalLoadWitness {
     /// `EXTERNAL_BUSY_CPU_FRACTION` got before a threshold means anything — and
     /// must also settle whether an iowait storm on a DIFFERENT device can hurt us
     /// at all, since a CPU in iowait is idle rather than stealing our cycles.
+    ///
+    /// ⚠ AMENDED 2026-09-01 (bd-d5pdz), and the amendment is narrow on purpose.
+    /// Per-sample off-placement iowait now selects WHICH busy-CPU limit applies —
+    /// see `MAX_EXTERNAL_BUSY_CPUS_UNDER_IO_STORM`. That is still not a gate: it
+    /// can only withhold the relaxation introduced that day, never refuse a sample
+    /// the previous code admitted, so it cannot retroactively split banked rows.
+    /// Whether iowait should REFUSE a run remains bd-xhl2g, untouched.
     peak_mean_iowait: f64,
     /// Largest ON-placement mean iowait fraction — our own arms blocked on I/O.
     peak_placement_mean_iowait: f64,
@@ -5587,7 +5684,17 @@ impl ExternalLoadWitness {
         self.samples += 1;
         let count = external_busy_cpu_count(busy, placement, EXTERNAL_BUSY_CPU_FRACTION);
         self.max_busy_cpus = self.max_busy_cpus.max(count);
-        if count > limit {
+        // bd-d5pdz: a storm sample keeps the pre-relaxation limit. `min` is what
+        // makes this incapable of tightening past the caller's limit, so a caller
+        // passing a stricter limit than the storm value still gets its own.
+        let off_iowait_mean = mean_off_placement(iowait, placement);
+        let effective_limit = if off_iowait_mean > IO_STORM_OFF_PLACEMENT_MEAN_IOWAIT {
+            self.io_storm_samples += 1;
+            limit.min(MAX_EXTERNAL_BUSY_CPUS_UNDER_IO_STORM)
+        } else {
+            limit
+        };
+        if count > effective_limit {
             self.over_limit_samples += 1;
             self.current_consecutive += 1;
             self.max_consecutive_over_limit = self
@@ -5694,6 +5801,20 @@ impl ExternalLoadWitness {
     fn clean(&self) -> bool {
         self.contended_fraction() <= MAX_CONTENDED_SAMPLE_FRACTION
             && self.max_consecutive_over_limit < MAX_CONSECUTIVE_CONTENDED_SAMPLES
+    }
+}
+
+/// Mean of the OFF-placement entries of a per-CPU map, or 0.0 when there are none.
+fn mean_off_placement(values: &BTreeMap<usize, f64>, placement: &BTreeSet<usize>) -> f64 {
+    let off: Vec<f64> = values
+        .iter()
+        .filter(|(cpu, _)| !placement.contains(*cpu))
+        .map(|(_, v)| *v)
+        .collect();
+    if off.is_empty() {
+        0.0
+    } else {
+        off.iter().sum::<f64>() / off.len() as f64
     }
 }
 
@@ -9128,6 +9249,8 @@ fn run() -> Result<Option<PathBuf>> {
          peak_off_placement_mean_busy={:.6},peak_placement_mean_busy={:.6},\
          peak_off_placement_mean_iowait={:.6},peak_placement_mean_iowait={:.6},\
          busy_cpu_fraction_limit={:.2},max_external_busy_cpus_limit={},\
+         io_storm_samples={},max_external_busy_cpus_limit_under_io_storm={},\
+         io_storm_mean_iowait_threshold={:.2},\
          max_contended_fraction_limit={:.2},max_consecutive_limit={},\
          placement_cpus_excluded={},verdict={}",
         external_load.samples,
@@ -9141,6 +9264,9 @@ fn run() -> Result<Option<PathBuf>> {
         external_load.peak_placement_mean_iowait,
         EXTERNAL_BUSY_CPU_FRACTION,
         MAX_EXTERNAL_BUSY_CPUS,
+        external_load.io_storm_samples,
+        MAX_EXTERNAL_BUSY_CPUS_UNDER_IO_STORM,
+        IO_STORM_OFF_PLACEMENT_MEAN_IOWAIT,
         MAX_CONTENDED_SAMPLE_FRACTION,
         MAX_CONSECUTIVE_CONTENDED_SAMPLES,
         sampler_placement.len(),
@@ -9244,9 +9370,20 @@ fn run() -> Result<Option<PathBuf>> {
             "peak_placement_mean_busy": external_load.peak_placement_mean_busy,
             // iowait is invisible to every busy figure above (it counts as idle),
             // so these are the only fields in the report that can show an I/O
-            // storm. Evidence, not a gate input.
+            // storm.
+            //
+            // ⚠ These no longer say "not a gate input" without qualification
+            // (bd-d5pdz). Per-sample off-placement iowait now selects WHICH
+            // busy-CPU limit a sample is held to — see
+            // `MAX_EXTERNAL_BUSY_CPUS_UNDER_IO_STORM`. It still cannot refuse a
+            // sample the pre-2026-09-01 gate admitted; it can only withhold the
+            // relaxation landed that day. `io_storm_samples` below says how often
+            // that actually bound.
             "peak_off_placement_mean_iowait": external_load.peak_mean_iowait,
             "peak_placement_mean_iowait": external_load.peak_placement_mean_iowait,
+            "io_storm_samples": external_load.io_storm_samples,
+            "max_external_busy_cpus_limit_under_io_storm": MAX_EXTERNAL_BUSY_CPUS_UNDER_IO_STORM,
+            "io_storm_mean_iowait_threshold": IO_STORM_OFF_PLACEMENT_MEAN_IOWAIT,
             // The arms' own clocks sampled ACROSS the timed region, beside the
             // two endpoint figures in `cpu_mhz_observed`. A core that parks
             // between those two snapshots is invisible to both, and "did the FUSE
@@ -12734,6 +12871,72 @@ mod tests {
         );
     }
 
+    /// bd-d5pdz: the relaxed busy-CPU limit must NOT extend into an I/O storm.
+    ///
+    /// Measured 2026-09-01. A real fleet window at loadavg **731** produced
+    /// busy-CPU counts indistinguishable from a quiet one — p50 `2`, max `8`
+    /// against quiet's p50 `2`, max `5` — because the load was D-state and iowait
+    /// counts as IDLE in every busy fraction here. Relaxing the limit from `2` to
+    /// `4` admitted those windows (contended fraction 0.325 -> 0.050). The scoping
+    /// holds such samples to the old limit.
+    ///
+    /// The third assertion is the one that makes this safe to land without
+    /// re-running a banked row: the scoping can only WITHHOLD the new tolerance,
+    /// never refuse a sample the pre-relaxation code admitted.
+    #[test]
+    fn io_storm_samples_keep_the_pre_relaxation_limit_bd_d5pdz() {
+        assert!(
+            MAX_EXTERNAL_BUSY_CPUS_UNDER_IO_STORM < MAX_EXTERNAL_BUSY_CPUS,
+            "this test is only meaningful while the storm limit is the stricter one"
+        );
+        let placement: BTreeSet<usize> = (0..8).collect();
+        let quiet_io: BTreeMap<usize, f64> = (0..64).map(|c| (c, 0.004)).collect();
+        let storm_io: BTreeMap<usize, f64> = (0..64).map(|c| (c, 0.90)).collect();
+
+        // Exactly at the relaxed limit, and so over the storm limit.
+        let mut busy: BTreeMap<usize, f64> = (0..64).map(|c| (c, 0.02)).collect();
+        for cpu in 20..20 + MAX_EXTERNAL_BUSY_CPUS {
+            busy.insert(cpu, 0.8);
+        }
+
+        let mut calm = ExternalLoadWitness::default();
+        for _ in 0..20 {
+            calm.observe(&busy, &quiet_io, &placement, MAX_EXTERNAL_BUSY_CPUS);
+        }
+        assert!(
+            calm.clean(),
+            "at the relaxed limit with no storm, the run must be admitted — this is \
+             the whole point of the recalibration"
+        );
+        assert_eq!(calm.io_storm_samples, 0, "no sample here is a storm");
+
+        let mut storm = ExternalLoadWitness::default();
+        for _ in 0..20 {
+            storm.observe(&busy, &storm_io, &placement, MAX_EXTERNAL_BUSY_CPUS);
+        }
+        assert_eq!(storm.io_storm_samples, 20, "every sample here is a storm");
+        assert!(
+            !storm.clean(),
+            "the SAME busy shape during an I/O storm must keep the pre-relaxation \
+             limit and refuse"
+        );
+
+        // The safety property: a sample the OLD limit admitted is still admitted,
+        // storm or not. Nothing that used to pass can start failing.
+        let mut at_old_limit: BTreeMap<usize, f64> = (0..64).map(|c| (c, 0.02)).collect();
+        for cpu in 20..20 + MAX_EXTERNAL_BUSY_CPUS_UNDER_IO_STORM {
+            at_old_limit.insert(cpu, 0.8);
+        }
+        let mut never_stricter = ExternalLoadWitness::default();
+        for _ in 0..20 {
+            never_stricter.observe(&at_old_limit, &storm_io, &placement, MAX_EXTERNAL_BUSY_CPUS);
+        }
+        assert!(
+            never_stricter.clean(),
+            "the storm scoping must never refuse what the pre-relaxation gate admitted"
+        );
+    }
+
     #[test]
     fn external_load_policy_separates_the_two_real_windows_bd_bt2dy() {
         let placement: BTreeSet<usize> = [0, 1, 2, 3, 4, 5, 6, 7, 32, 33, 34, 35, 36, 37, 38, 39]
@@ -12794,8 +12997,12 @@ mod tests {
         let placement: BTreeSet<usize> = (0..8).collect();
         let mut busy_quiet: BTreeMap<usize, f64> = (0..64).map(|c| (c, 0.02)).collect();
         busy_quiet.insert(3, 0.99); // placement CPU: the bench, ignored
+        // Contended means "over the limit", so build the fixture RELATIVE to the
+        // limit. Hard-coding a count here silently stops testing anything the day
+        // the threshold is recalibrated (bd-d5pdz moved it from 2 to 8).
+        let loaded_cpus = MAX_EXTERNAL_BUSY_CPUS + 4;
         let mut busy_loaded: BTreeMap<usize, f64> = (0..64).map(|c| (c, 0.02)).collect();
-        for cpu in [20, 21, 22, 23] {
+        for cpu in 20..20 + loaded_cpus {
             busy_loaded.insert(cpu, 0.8);
         }
 
@@ -12828,17 +13035,21 @@ mod tests {
         );
         assert_eq!(sustained.over_limit_samples, 23);
         assert_eq!(sustained.max_consecutive_over_limit, 23);
-        assert_eq!(sustained.max_busy_cpus, 4);
+        assert_eq!(sustained.max_busy_cpus, loaded_cpus);
         assert!(sustained.peak_mean_busy > 0.0);
 
         // Exactly at the limit is permitted: two busy off-placement CPUs is the
         // documented tolerance for ordinary background daemons.
         let mut at_limit: BTreeMap<usize, f64> = (0..64).map(|c| (c, 0.02)).collect();
-        at_limit.insert(30, 0.9);
-        at_limit.insert(31, 0.9);
+        for cpu in 30..30 + MAX_EXTERNAL_BUSY_CPUS {
+            at_limit.insert(cpu, 0.9);
+        }
         let mut edge = ExternalLoadWitness::default();
         edge.observe(&at_limit, &no_iowait(), &placement, MAX_EXTERNAL_BUSY_CPUS);
-        assert!(edge.clean(), "2 busy CPUs is at the limit, not over it");
+        assert!(
+            edge.clean(),
+            "exactly MAX_EXTERNAL_BUSY_CPUS busy CPUs is AT the limit, not over it"
+        );
     }
 
     /// bd-bt2dy: the SUSTAINED-versus-TRANSIENT correction, pinned against the
@@ -12855,7 +13066,7 @@ mod tests {
         let placement: BTreeSet<usize> = (0..4).collect();
         let quiet: BTreeMap<usize, f64> = (0..64).map(|c| (c, 0.02)).collect();
         let mut loaded: BTreeMap<usize, f64> = (0..64).map(|c| (c, 0.02)).collect();
-        for cpu in [16, 19, 48, 51] {
+        for cpu in 16..16 + MAX_EXTERNAL_BUSY_CPUS + 4 {
             loaded.insert(cpu, 1.0);
         }
 

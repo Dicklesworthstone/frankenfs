@@ -1,0 +1,31 @@
+{
+  "label": "quiet",
+  "samples": 20,
+  "placement": [],
+  "loadavg": "6.04",
+  "peak_off_placement_mean_busy": 0.149626,
+  "peak_placement_mean_busy": 0.0,
+  "peak_off_placement_mean_iowait": 0.002369,
+  "peak_placement_mean_iowait": 0.0,
+  "max_external_busy_cpus": 5,
+  "over_limit_samples": 7,
+  "external_load_verdict": "CONTENDED",
+  "busy_devices_io_time_fraction": [
+    {
+      "device": "dm-0",
+      "io_time_fraction": 0.1085
+    },
+    {
+      "device": "nvme0n1p3",
+      "io_time_fraction": 0.1085
+    },
+    {
+      "device": "nvme0n1",
+      "io_time_fraction": 0.0902
+    },
+    {
+      "device": "zram0",
+      "io_time_fraction": 0.0001
+    }
+  ]
+}

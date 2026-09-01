@@ -1,5 +1,23 @@
 # Btrfs scorecard: FrankenFS FUSE against the incumbent, Linux kernel btrfs
 
+> ## ⚠ EVERY ROW BELOW WAS MEASURED UNDER A STRICTER EXTERNAL-LOAD GATE THAN SHIPS TODAY
+>
+> `MAX_EXTERNAL_BUSY_CPUS` was recalibrated **`2` -> `4`** on **2026-09-01** (`bd-d5pdz`), so
+> every row banked before that date was admitted under the older, **stricter** limit of `2`.
+> This flag is required by that bead's acceptance; it is not a defect in any row.
+>
+> The direction is the safe one and that is why nothing here needs re-measuring on this
+> account: the change LOOSENS a refusal criterion, so a run admitted under `2` is still
+> admitted under `4`. It cannot retroactively un-admit a banked row, and it cannot have
+> manufactured a win — every row this veto has ever refused was an `HONEST_LOSS`.
+>
+> What changed is the reverse direction: rows REFUSED before 2026-09-01 were refused by a gate
+> that, measured against this box's real quiet floor, refused genuinely-quiet windows too
+> (4 quiet windows out of 4, at loadavg ~5 with no other benchmark running). Those refusals
+> should not be read as evidence that the window was contended. See the calibration in
+> `MAX_EXTERNAL_BUSY_CPUS`' own doc comment and `scripts/external_load_calibration.py`.
+
+
 > ## ⛔⛔ THE fsync AND parallel-metadata WINS ARE SUBSTANTIALLY **TRANSPORT**, NOT FILESYSTEM
 >
 > **Measured 2026-08-17 (`bd-w2u82`).** Every row in this file puts the kernel arm on a LOOP
