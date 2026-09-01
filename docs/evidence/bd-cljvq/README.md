@@ -321,3 +321,44 @@ replication can see it.
 ⚠ The 12-pair floor widens each run's own CI, so N must be large enough that the
 spread of the N ratios — not any single run's CI — carries the conclusion. Report
 the N ratios per condition, not a mean with a CI borrowed from one of them.
+
+## 11. 192 pairs is where btrfs warm stat's A/A nulls pass — and a correction to section 9
+
+Measured convergence of the A/A null spreads against the `1.025` limit, one ELF
+(`head-v3`), btrfs warm stat:
+
+| pairs | gated samples | wall clock | kernel_aa | fuse_aa | verdict |
+|---|---|---|---|---|---|
+| 12 | 15 | — | 1.0654 | 1.0402 | blocked_null |
+| 48 | 36 | — | 1.0271 | 1.0344 | blocked_null |
+| 96 | 63 | 1:12 | 1.0403 | 1.0042 | blocked_null |
+| **192** | 118 | **2:07** | **1.0104** | **1.0046** | **honest_loss** |
+
+**192 pairs is the floor**, confirmed across five further 192-pair runs on the
+second ELF (`kernel_aa` 1.0093–1.0137, `fuse_aa` 1.0046–1.0249 — all passing). This
+is the same shape as bd-bredw, which needed 384 pairs for btrfs readdir+stat.
+
+Note the blocker is the **incumbent** arm and it does not converge monotonically:
+`kernel_aa` went 1.0654 → 1.0271 → 1.0403 → 1.0104. "The variance is the
+incumbent's" is not a law, but here it was.
+
+⚠ **THIS CORRECTS SECTION 9.** That section reasoned that a 48-pair run is
+"~5–6.5 min (300–390 s)" and therefore unadmittable, since admission reaches 0% by
+300 s. Both halves were wrong:
+
+* The gate covers only the **timed region**, not wall clock. Fixture construction,
+  mounting, the workload's untimed settling and e2fsck are all outside it. Measured:
+  12 pairs → 15 samples, 48 → 36, 96 → 63, 192 → 118.
+* The runs are far faster than the estimate: a 192-pair run is **2:07 total**, where
+  section 9 assumed 48 pairs alone would take longer than that.
+
+So the length constraint is real — 192 pairs still puts 118 samples under the gate,
+which the trace scores at ~17% admission in a busy regime — but section 9 overstated
+it by scoring wall clock against a curve built for gated samples. The conclusion in
+section 10 (replicate short runs) survives, but the reason is the *gated sample
+count*, and the affordable pair count is much higher than it implied.
+
+**The lesson is the same one this bead keeps re-teaching:** the quantity the gate
+actually consumes was not the quantity being modelled. Section 9 modelled wall
+clock, the gate reads timed samples; section 3 modelled a window average, the
+harness records a per-sample peak.
