@@ -362,3 +362,36 @@ count*, and the affordable pair count is much higher than it implied.
 actually consumes was not the quantity being modelled. Section 9 modelled wall
 clock, the gate reads timed samples; section 3 modelled a window average, the
 harness records a per-sample peak.
+
+## 12. Preliminary: under contention OUR arm moves twice as much as the incumbent
+
+Four 192-pair runs, one ELF, all refused on external load (`contended_fraction`
+0.88–1.00) — the by-product of trying to collect an admitted quiet arm during a
+period of heavy peer builds:
+
+| run | contended frac | kernel median (ms) | FUSE median (ms) | ratio |
+|---|---|---|---|---|
+| quiet_1 | 0.884 | 4.424 | 22.113 | 4.9480 |
+| quiet_2 | 1.000 | 4.372 | 24.101 | 5.5025 |
+| quiet_3 | 1.000 | 4.232 | 22.308 | 5.2593 |
+| quiet_4 | 0.882 | 4.167 | 21.554 | 5.1209 |
+
+Spread: **kernel 6.2%, FUSE 11.8%, ratio 11.2%.**
+
+Under socket contention the FrankenFS arm's wall time varies about **twice** as much
+as the kernel arm's, and the ratio tracks the FUSE arm rather than cancelling. That
+is the opposite of the folk rule that "the variance is the incumbent's", which
+`docs/MOUNTED_KERNEL_SCORECARD.md` already warns is not a law.
+
+⚠ **PRELIMINARY, and stated as such deliberately.** n=4; every run is heavily
+contended, so there is almost no dynamic range in the predictor and this cannot
+support a contention→ratio slope; and the comparison that matters — contended
+versus ADMITTED on the same ELF — does not exist yet, because no admitted run on
+this ELF has been collected. It is recorded because it is real data with a plausible
+mechanism (a FUSE round trip crosses more of the shared socket than an in-kernel
+call, so it should be more exposed to bandwidth and LLC pressure), not because it is
+established. Do not cite it as a finding until the admitted arm exists.
+
+It is also, for the campaign generally, an argument that the external-load gate is
+protecting something real: these four ratios span 11.2% while the row's banked
+quiet cross-window spread is 0.69%.
