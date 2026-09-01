@@ -292,3 +292,32 @@ curve left by roughly one length step), not the specific percentages.
 3. If long runs cannot be admitted at all in any available regime, that is a finding
    about the INSTRUMENT rather than about device contention, and it belongs to
    bd-8c9u0 and the host-quiescence work rather than being silently absorbed here.
+
+## 10. The length constraint forces REPLICATION, not a longer run
+
+Sections 8 and 9 combine into a run plan that is not the obvious one.
+
+The instinct with a noisy comparison is to buy pairs — that is what bd-bredw did,
+taking btrfs readdir+stat from 96 to 384 pairs and its spread from 22.0% to 0.8%.
+Here that instinct is exactly wrong: more pairs means a longer run, and admission
+decays sharply with length, reaching 0% by 300 s. Buying pairs buys refusals.
+
+**So replicate short runs instead of extending one.** A 12-pair warm-stat run
+(`--pairs 12`, the floor for a run with no candidate comparison) is roughly 75 s,
+which sits in the 36–45% admission band rather than the 0% one. Take N admitted
+short runs per condition and compare the two distributions of ratios.
+
+This works because the quantity that matters is the CROSS-WINDOW spread, not the
+within-run CI: the storm and quiet arms are different windows regardless, so the
+comparison was always going to be against run-to-run variation. Replication
+estimates that variation directly instead of assuming a single long run would have
+suppressed it — which, per section 9, it would not have been allowed to do anyway.
+
+It also gives something a single pair of runs cannot: the storm condition's OWN
+spread. If a saturated queue inflates run-to-run variance without moving the
+central ratio, that is a real answer about whether it harms a measurement, and only
+replication can see it.
+
+⚠ The 12-pair floor widens each run's own CI, so N must be large enough that the
+spread of the N ratios — not any single run's CI — carries the conclusion. Report
+the N ratios per condition, not a mean with a CI borrowed from one of them.
