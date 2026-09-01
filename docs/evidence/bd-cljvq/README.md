@@ -47,6 +47,33 @@ average was 0.0707. Peak device utilisation swings 14x across these six windows
 Whether any of that moves a ratio is exactly what this bead has to measure, and
 these rows do not answer it.
 
+## 3. The PEAK separates badly — and that changed what got landed
+
+Acceptance item 0 asked for the quiet population of the RECORDED field rather than
+of the window average. Six quiet windows (loadavg 4.3–8.2, nothing manufactured):
+
+| window | loadavg | off-plc mean iowait | **peak device** | busiest | verdict |
+|---|---|---|---|---|---|
+| 1 | 8.22 | 0.001717 | 0.1059 | nvme0n1 | CONTENDED |
+| 2 | 7.58 | 0.001965 | 0.1329 | nvme0n1p3 | CONTENDED |
+| 3 | 5.86 | 0.002969 | 0.3537 | dm-0 | CLEAR |
+| 4 | 4.51 | 0.000641 | 0.0610 | nvme0n1 | CLEAR |
+| 5 | 4.29 | 0.003286 | 0.4956 | dm-0 | CLEAR |
+| 6 | 4.60 | 0.001623 | 0.5286 | dm-0 | CONTENDED |
+
+**A quiet box peaks past half a pinned device.** Against a saturated ~1.0 that is
+under **2x with overlap** — where the window MEAN separated 7.8x with none. The
+peak is a burst detector, and on a 64-thread machine with ordinary background churn
+a single stalled second is normal. Anyone who had read a threshold off bd-xhl2g's
+7.8x and applied it to `peak_device_io_fraction` would have refused quiet windows.
+
+So the harness records **both**: `peak_device_io_fraction` (burst) and
+`mean_device_io_fraction` (sustained). One field would have silently picked a
+statistic, and the measurement says it would have picked the worse one. Neither
+gates. The two also let this bead ask its question properly, because "does a BURST
+move a ratio" and "does SUSTAINED pressure move a ratio" are different questions
+that may well have different answers.
+
 ## Caveat recorded rather than buried
 
 `peak_device_io_fraction` is clamped with `.min(1.0)`, so an exact `1.0` cannot be

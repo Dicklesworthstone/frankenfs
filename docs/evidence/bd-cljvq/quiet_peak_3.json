@@ -1,0 +1,34 @@
+{
+  "label": "quiet_peak",
+  "samples": 40,
+  "placement": [],
+  "loadavg": "5.86",
+  "peak_off_placement_mean_busy": 0.103712,
+  "peak_placement_mean_busy": 0.0,
+  "peak_off_placement_mean_iowait": 0.002969,
+  "peak_placement_mean_iowait": 0.0,
+  "max_external_busy_cpus": 4,
+  "over_limit_samples": 0,
+  "contended_fraction": 0.0,
+  "max_consecutive_over_limit": 0,
+  "io_storm_samples": 0,
+  "max_external_busy_cpus_limit": 4,
+  "max_external_busy_cpus_limit_under_io_storm": 2,
+  "external_load_verdict": "CLEAR",
+  "peak_device_io_fraction": 0.3537,
+  "busiest_device": "dm-0",
+  "busy_devices_io_time_fraction": [
+    {
+      "device": "dm-0",
+      "io_time_fraction": 0.0423
+    },
+    {
+      "device": "nvme0n1p3",
+      "io_time_fraction": 0.0344
+    },
+    {
+      "device": "nvme0n1",
+      "io_time_fraction": 0.0312
+    }
+  ]
+}
