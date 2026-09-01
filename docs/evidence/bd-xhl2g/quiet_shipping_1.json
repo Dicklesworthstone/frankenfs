@@ -1,0 +1,32 @@
+{
+  "label": "quiet_shipping",
+  "samples": 40,
+  "placement": [],
+  "loadavg": "6.90",
+  "peak_off_placement_mean_busy": 0.239564,
+  "peak_placement_mean_busy": 0.0,
+  "peak_off_placement_mean_iowait": 0.007649,
+  "peak_placement_mean_iowait": 0.0,
+  "max_external_busy_cpus": 19,
+  "over_limit_samples": 29,
+  "contended_fraction": 0.725,
+  "max_consecutive_over_limit": 29,
+  "io_storm_samples": 0,
+  "max_external_busy_cpus_limit": 4,
+  "max_external_busy_cpus_limit_under_io_storm": 2,
+  "external_load_verdict": "CONTENDED",
+  "busy_devices_io_time_fraction": [
+    {
+      "device": "nvme0n1p3",
+      "io_time_fraction": 0.0503
+    },
+    {
+      "device": "dm-0",
+      "io_time_fraction": 0.0502
+    },
+    {
+      "device": "nvme0n1",
+      "io_time_fraction": 0.0479
+    }
+  ]
+}

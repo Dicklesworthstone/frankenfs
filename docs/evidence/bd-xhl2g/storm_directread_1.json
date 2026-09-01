@@ -1,0 +1,32 @@
+{
+  "label": "storm_directread",
+  "samples": 40,
+  "placement": [],
+  "loadavg": "70.98",
+  "peak_off_placement_mean_busy": 0.980616,
+  "peak_placement_mean_busy": 0.0,
+  "peak_off_placement_mean_iowait": 0.018185,
+  "peak_placement_mean_iowait": 0.0,
+  "max_external_busy_cpus": 64,
+  "over_limit_samples": 40,
+  "contended_fraction": 1.0,
+  "max_consecutive_over_limit": 40,
+  "io_storm_samples": 0,
+  "max_external_busy_cpus_limit": 4,
+  "max_external_busy_cpus_limit_under_io_storm": 2,
+  "external_load_verdict": "CONTENDED",
+  "busy_devices_io_time_fraction": [
+    {
+      "device": "nvme0n1p3",
+      "io_time_fraction": 1.0
+    },
+    {
+      "device": "dm-0",
+      "io_time_fraction": 1.0
+    },
+    {
+      "device": "nvme0n1",
+      "io_time_fraction": 0.9121
+    }
+  ]
+}

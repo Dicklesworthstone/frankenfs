@@ -142,10 +142,30 @@ def main() -> int:
 
     disk_before = read_disk_ms()
     t_start = time.time()
+    peak_device_io_fraction = 0.0
+    busiest_device = None
     for _ in range(a.samples):
+        # bd-xhl2g: bracket each sample so the probe reports the PEAK per-sample
+        # device utilisation, which is exactly what `ExternalLoadWitness`
+        # records. The window-average below is a different quantity and a
+        # 40-second average hides a 3-second stall; keeping only the average
+        # would make the harvested population incomparable to a real run, which
+        # is the drift this file's header warns about.
+        sample_disk_before = read_disk_ms()
+        sample_start = time.time()
         before = read_cpu_ticks()
         time.sleep(CPU_SAMPLE_INTERVAL_S)
         after = read_cpu_ticks()
+        sample_elapsed_ms = (time.time() - sample_start) * 1000.0
+        sample_disk_after = read_disk_ms()
+        if sample_elapsed_ms > 0:
+            for name, ms in sample_disk_before.items():
+                if name not in sample_disk_after:
+                    continue
+                frac = min(1.0, (sample_disk_after[name] - ms) / sample_elapsed_ms)
+                if frac > peak_device_io_fraction:
+                    peak_device_io_fraction = frac
+                    busiest_device = name
         busy: dict[int, float] = {}
         wait: dict[int, float] = {}
         for cpu, (t0, i0, w0) in before.items():
@@ -228,6 +248,10 @@ def main() -> int:
         "max_external_busy_cpus_limit_under_io_storm":
             MAX_EXTERNAL_BUSY_CPUS_UNDER_IO_STORM,
         "external_load_verdict": veto,
+        # The harness's own fields, same definition, so a probe row and a run row
+        # can be compared directly (bd-xhl2g).
+        "peak_device_io_fraction": round(peak_device_io_fraction, 4),
+        "busiest_device": busiest_device,
         "busy_devices_io_time_fraction": [
             {"device": n, "io_time_fraction": round(f, 4)} for n, f in devices
         ],
