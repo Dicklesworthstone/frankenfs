@@ -221,7 +221,7 @@ if jq -s \
         | map(. as $prefix | select($text | contains($prefix)))
         | .[0] // null;
     def activity_epoch:
-        ((.updated_at // .created_at // null) | normalized_iso8601 | fromdateiso8601?);
+        (((.updated_at // .created_at // null) | normalized_iso8601 | fromdateiso8601?) // null);
     def issue_prefix:
         foreign_franken_project_prefix as $project_prefix
         | (.id // "") as $id

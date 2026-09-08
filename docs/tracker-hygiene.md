@@ -133,29 +133,32 @@ local open rows that are not claimable because they are epics, blocked, or
 permission-gated. These artifacts are copies; generating them does not close,
 rewrite, delete, or rename any tracker row.
 
-When `bv --robot-triage` needs a clean FrankenFS-only graph, do not point it at
-the polluted live `.beads` store. Materialize an offline `.beads` view from
-full local-prefix rows, import that copy into a temp Beads DB, and pass that
-temp `.beads` directory to `bv --db`. Including all local-prefix rows preserves
-closed dependency context while still excluding foreign-project rows:
+For a local graph, use the wrapper rather than importing a prefix-filtered
+copy by hand. Current `bv` rejects `wont_fix`, even though `br` imports it:
 
 ```bash
-mkdir -p /data/tmp/ffs-source-aware-bv/.beads
-jq -c 'select((.id // "") | test("^(bd|frankenfs)-"))' .beads/issues.jsonl \
-  > /data/tmp/ffs-source-aware-bv/.beads/issues.jsonl
-BEADS_DIR=/data/tmp/ffs-source-aware-bv/.beads \
-  br --db /data/tmp/ffs-source-aware-bv/.beads/beads.db \
-  sync --import-only --orphans allow --json
-bv --no-cache --db /data/tmp/ffs-source-aware-bv/.beads --robot-triage
+FFS_E2E_DISABLE_TEMP_CLEANUP=1 ./scripts/e2e/ffs_tracker_source_hygiene_e2e.sh
 ```
 
-The E2E wrapper validates this path with
-`tracker_source_hygiene_bv_source_aware_triage_clean`: the `bv` open count must
-match local open plus local in-progress rows, total issue counts must cover that
-active local set, and every emitted recommendation/top-pick/blocker ID must
-match the FrankenFS local ID prefixes. This is the acceptance path for graph
-analysis under closed-row pollution; raw `bv` over the live store remains
-diagnostic only until the contaminated history is reconciled by its owner.
+The wrapper saves `tracker_source_hygiene_bv_projection.json` beside its report.
+It accounts for every source row, retaining the complete original rows in
+`included_source_rows` or `excluded_source_rows` with a reason. Unsupported
+statuses are excluded from the temporary graph, not rewritten as completed
+work. Referenced missing or excluded local dependencies become explicitly
+blocked placeholders. Included statuses are preserved, and a checksum verifies
+that the source JSONL did not change during projection.
+
+`tracker_source_hygiene_bv_source_aware_triage_clean` requires complete source
+authority, zero loading errors/skips, exact graph counts, and separate matching
+open and in-progress counts. Negative fixtures reject partial graphs and verify
+that refused, unknown, missing-dependency, and permissioned work cannot become
+claimable. Existing report goldens remain unchanged.
+
+Even a complete temporary graph establishes graph context only. Use the
+source-aware report's `claimable_ids` and exact permission checks for work
+selection; a local ID prefix alone does not establish semantic ownership.
+Raw `bv` over the live store remains diagnostic when it reports partial source
+authority. Reconcile foreign history only with its owner's authorization.
 
 `foreign_reconciliation_plan` is also report-only. It turns each foreign group
 into an owner-handoff packet with the recommended Agent Mail thread, owner
