@@ -1,5 +1,187 @@
 # Reality-Check Bridge: Closing the Gap Between Claims and Code
 
+## Current assessment — 2026-09-08
+
+**Audit:** `bd-e34ey`, source revision
+`260833046b1e7bc01a51fb8aa9e8f2d96118a8a2`.
+The May writeup below is historical. Its statements that parity is now
+execution-derived and that no overclaims remain are **not valid current
+conclusions**.
+
+**Verdict:** FrankenFS contains substantial filesystem implementation, including
+durable mutation machinery. It has not demonstrated delivery of the complete
+advertised filesystem contract on the current build. The principal problems are
+an unreliable completion signal, gaps between helper capability and mounted
+behavior, incomplete lifecycle integration, and missing current external proof.
+Neither `97/97` nor the fraction of closed tracker rows measures readiness.
+
+### Scope and evidence discipline
+
+The local AGENTS.md and README.md were read in full, along with the suite-wide
+instructions. The review traced the high-risk public claims through the canonical
+specification, port plan, architecture, parity tables, current call paths, inline
+tests, kernel-reference tests, release machinery, operational reports and live
+tracker. This is a requirements-led audit of those paths, **not an exhaustive
+line-by-line audit of every Rust file or every historical design document**.
+Source inspection establishes implementation, not successful execution. Historical
+artifacts establish only the source/configuration and cases they actually tested.
+
+The installed suite AGENTS.md does not contain the two named sections referenced
+by local Rule 0.5. The explicit local prohibitions on self-certified speedups,
+weakened gates and tracker manipulation remain binding. No requirements or
+acceptance thresholds were relaxed during this audit.
+
+### Vision checklist and current reality
+
+| # | Testable promise | Assessment | Evidence and remaining delivery work |
+|---|---|---|---|
+| 1 | Parse and inspect real ext4/btrfs images safely | Implemented; current execution evaluated separately below | `ffs-ondisk`, `OpenFs::open`, CLI inspect, and kernel-reference suites contain real parsers and external-tool comparisons. Parser fixtures alone do not certify mounted mutation. |
+| 2 | Mount ext4 with correct writes and acknowledged durability | Implemented, external closeout incomplete | CLI now attaches the internal JBD2 writer before requiring mount durability (`ffs-cli/src/main.rs:8222`). The old “never attaches” claim is obsolete. `bd-4zjkz`, `bd-hyysq`, and `bd-y2t0r` retain durability/accounting/allocator closeout work. |
+| 3 | Persist btrfs writes across reopen and crashes | Implemented, high-risk proof incomplete | Full commit, accumulated tree logs, overflow fallback and log retirement exist in `ffs-core`; this is no longer the May in-memory facade. `bd-dm01m`, `bd-0ajub`, `bd-lzr3e`, `bd-f3fsg` require current clean-fixture external validation. |
+| 4 | Grow btrfs allocation when existing chunks fill | Partial/default-disabled | Chunk-growth planning and application exist, controlled by `FFS_BTRFS_GROW_CHUNKS` (`ffs-core/src/lib.rs:2391`). `bd-a136s` owns delivery; do not describe this as absent code or established default behavior. |
+| 5 | Serve the advertised multi-device RAID profiles through mounts | Integration gap | Mounted core uses `map_logical_to_physical`; `chunk_physical` explicitly rejects all profiles except Single/Dup (`ffs-ondisk/src/btrfs.rs:1123`). Standalone device-set/stripe helpers do not prove the README RAID RW matrix. |
+| 6 | Recover ext4 fast commits | Partial; incomplete recovery can continue | `apply_fast_commit_operations` applies directory/inode operations and coordinated extent recovery; it is more than logging. But its caller warns and continues after errors (`ffs-core/src/lib.rs:5933`), and directory insertion's `Ok(false)` is discarded before incrementing the verified count. Unsupported growth/no-room/casefold cases need fail-closed recovery and independent crash-image tests (`bd-gqsnh`, `bd-9m84h`). |
+| 7 | Match namespace, xattr, extent and casefold semantics | Substantial implementation, scoped gaps | Parity includes real success and deterministic rejection contracts. Full Unicode 12.1/kernel hash validation remains blocked in `bd-vsuni.3`; broad Unicode equivalence claims are premature. Unsupported operations are contract coverage, not supported functionality. |
+| 8 | Provide MVCC/SSI and useful same-block merge proofs | Implemented primitives and mounted wiring; benefit unproven | Ext4 writes stage `NonOverlappingExtents` proofs (`ffs-core/src/lib.rs:26718`), contradicting stale “all Unsafe” text. Tests and two audited merge mechanisms do not establish the headline expected-loss benefit on mounted workloads. |
+| 9 | Make repair a default, fresh, persistent durability substrate | Partial integration | Canonical spec §0.4 says default/continuous. CLI scrub remains opt-in, repair lifecycle is optional, and flush notification uses ambient `Cx::current` (`ffs-core/src/lib.rs:8701`). Codec recovery is real; default mounted freshness is a separate requirement. |
+| 10 | Propagate cancellation and bound worker lifetime | Partial architectural conformance | Explicit Cx APIs coexist with ambient context and std-thread workers. A joined thread is meaningful lifecycle handling, but it is not proof of the stipulated asupersync structured cancellation contract. |
+| 11 | Offer working serial/parallel/per-core FUSE modes | Implemented transport; operational evidence incomplete | `mount_managed_per_core` calls the real vendored per-core worker spawn (`ffs-fuse/src/lib.rs:7964`). `bd-28mw2` wording predates this implementation. Performance and cancellation need current mode-specific evidence. |
+| 12 | Report feature completion from actual tests | Wrong evidence path | Public parity calls `ParityReport::current`, which sums compiled Markdown. The separate execution report is not wired into those commands and trusts boolean substring matches. No current execution-derived 97/97 result was established. |
+| 13 | Pass the canonical conformance and release gates | Unproven on current build | Spec §22 uses `gate1`…`gate7` Cargo filters; matching test functions were not found in the searched source. Zero-selected Cargo success must be rejected. Current baseline and tracker failures are recorded below. |
+| 14 | Demonstrate real xfstests, crash, repair and soak readiness | Missing aggregate proof | The cited xfstests baseline has 17 planned cases and zero executed cases. Its former execution task was closed without a real run. Old crash/soak artifacts cannot certify this revision. |
+| 15 | Compete with live kernel ext4/btrfs under equivalent semantics | Unproven as a blanket claim | Existing scorecards and active tasks contain losses, invalidated configurations and failed A/A admission. Internal self-speedups and contended/blocked ratios do not establish incumbent wins. |
+| 16 | Give users accurate installation/API/safety documentation | Drift | Workspace has 22 members including `tools/ffs-ops`; manifests specify Rust 1.95, asupersync 0.3.9 and fuser ABI 7.42. Tutorial signatures/exports disagree with the facade. First-party `forbid(unsafe_code)` does not cover vendored unsafe FUSE transport. |
+
+### Why the completion signal is unsound
+
+`ParityReport::current` in `crates/ffs-harness/src/lib.rs:140` parses the coverage
+summary in `FEATURE_PARITY.md`. The harness command (`src/main.rs:720`) and user
+CLI (`ffs-cli/src/main.rs:9430`) both use it. This describes a declared contract;
+it does not report which tests ran or which behaviors worked.
+
+The separate `ExecutionGatedParityReport::from_evidence` accepts
+`HashMap<String, bool>` and an optional SHA. Its substring check allows an empty
+passing key to match every cited row; an unrelated nonempty map satisfies
+`require_evidence` even when no capability has green evidence. Neither test
+selection nor source freshness is enforced there. The observed uses are local
+tests, not the public parity path. The remedy is exact capability mappings and
+actual runner results shared by CLI and CI, with negative tests at that boundary.
+
+The denominator also needs care: the 97 summary units differ from the detailed
+operation/scenario rows, and successful rejection is intentionally included.
+Keep **declared contract coverage**, **implemented supported behavior**, and
+**current verified behavior** distinct. Do not invent a replacement overall
+completion percentage from this audit.
+
+### Executed checks and their limits
+
+| Check | Observed outcome | What it proves |
+|---|---|---|
+| `rch exec -- cargo test -p ffs-types --lib` | PASS: 142 passed, 0 failed, 0 ignored, 0 filtered | Current filesystem-type unit/property tests passed on `vmi1227854`. This does not certify mounted behavior or the rest of the workspace. |
+| `cargo fmt --check` | FAIL, exit 1; diffs in 23 files | Current committed baseline is not formatting-clean. Captured in `/tmp/ffs-reality-fmt-20260908.log`; no formatting changes applied. |
+| `rch exec -- cargo check --workspace --all-targets` | Incomplete, exit 137 after 301 seconds on `vmi1153651` | Worker command was killed at the configured approximately five-minute limit. No successful workspace check and no demonstrated Rust compiler error from this run. RCH's resource-exhaustion suggestion is not a confirmed diagnosis. |
+| Selected harness conformance/kernel-reference tests | Cancelled before test execution, exit 143 | Compilation reached core/FUSE/harness, with duplicate `#[must_use]` warning at `ffs-fuse/src/lib.rs:421`. The test sources contain unconditional `remove_file` and `TempDir` cleanup; the still-building run was cancelled via RCH to honor the no-deletion rule. No test pass/fail result was produced. |
+| Local tracker source-hygiene E2E | FAIL, 12/14 scenarios | Source-aware bv triage rejects `wont_fix`; the ACK fixture also fails through that path. Artifact directory: `artifacts/e2e/20260908_002904_ffs_tracker_source_hygiene_tmvfyq/`. |
+| Archived CLI `parity --json` | Exit 0, reports 97/97 without running tests | Runtime reproduction on an existing historical binary, **not current-source build validation**. SHA256 `b0c2a6699ce2c589192b7d605714f1c71d9f50cb6dca9a10634eed6ba01f9c64`, path `.rch-artifacts/bd-warm-stat-memo-capacity/ffs-cli`. |
+| Archived CLI `--version` | Rejected option | That artifact does not expose this conventional version flag; source identity must come from build provenance. |
+| Archived CLI `inspect` on an existing ext4 image | PASS, exit 0; image unchanged | `/data/tmp/ffs-e2e-setversion-2995323-ThreadId(1024).img`: 4096-byte blocks, 4096 blocks/inodes, volume `ffs_gen`. SHA256 before/after: `3dafcaf27fa3e999a79745515b7aee1e9000e24da78d1eff494117f8fbe0adc3`. This is an archived-binary smoke test, not mounted or current-source proof. |
+| Fresh ext4 fixture creation | Blocked before execution | DCG rejected `mkfs.ext4` under `system.disk:mkfs` because formatting can erase existing data. Used the read-only existing-image alternative; no bypass or formatting occurred. |
+| Self-healing demo | Not executed | Build attempt stopped with SIGINT before demo execution after discovering unconditional temporary-image deletion, incompatible with the no-delete instruction. This is not a recovery test result. |
+| Real xfstests, mounted destructive crash/corruption runs, soak and competitive benchmarks | Not executed in this audit | No device mutation ACK was supplied. No runtime or performance success is claimed for these lanes. |
+
+Workspace Clippy, the full workspace test suite and benchmarks were not completed
+in this audit. The existing formatting failure, incomplete workspace check and
+unexecuted mounted lanes prevent a green-baseline or release-readiness claim.
+For this documentation/tracker-only change, `git diff --check` passed and JSONL
+was parsed and checked for ID/status conservation. UBS `--diff` exited 3 because
+Markdown/JSONL have no supported scanner; that is **not a passing code scan**.
+No scanner bypass, ignored diagnostic or filesystem source change was introduced.
+
+Tracked-file census: 173 Rust benchmark files, 125 E2E shell scripts, 226 snapshots
+and 63 fuzz-target Rust files. `cargo metadata --no-deps --locked --offline`
+independently reports 22 workspace members and 173 bench targets, plus 61 test
+targets and 11 example targets. These are inventories, not successful test counts
+or independent requirements proven. The README's 92 benchmark figure is stale.
+
+### Backlog coverage and delivery order
+
+Before this audit's additions, JSONL contained 4,213 rows: 4,134 closed, 68
+in-progress, 7 open, 3 blocked and one `wont_fix`. The local source-aware report
+marked all 68 existing in-progress rows stale under its six-hour rule. Staleness
+does not authorize stealing their ownership. Raw bv loaded 4,212 valid rows and
+one error and correctly withheld claimability. Prefix classification alone also
+does not settle ownership of semantically foreign-looking tasks.
+
+**Completing the pre-existing open backlog would not finish the vision.** It is
+heavily weighted toward performance and known correctness closeout. It had no
+remaining execution-bound public parity task or real xfstests successor, and did
+not close the mounted RAID/default-repair integration gaps identified here.
+
+The new `reality-check-20260908` tasks have self-contained descriptions, acceptance
+criteria and separate behavioral test work. Existing owners retain their tasks.
+
+| Delivery gap | Implementation / execution task | Companion verification |
+|---|---|---|
+| Public parity and canonical gate binding | `bd-wh1xk` | `bd-lc132` |
+| Mounted btrfs device routing | `bd-hk5w3` | `bd-mjxxk` |
+| Current documentation and runtime boundaries | `bd-3kpkz` | `bd-ed3i5` |
+| Default repair and cancellation lifecycle | `bd-11a8t` | `bd-j7a4e` |
+| Complete-or-reject fast-commit recovery | `bd-gqsnh` | `bd-9m84h` |
+| Permissioned real xfstests successor | `bd-vngdq` (blocked pending authorization) | Per-case external evidence required in the execution task |
+| Lossless tracker interoperability | `bd-09urx` | `bd-24ydx` |
+| Green pinned-nightly workspace | `bd-vuzzq`, depending on existing lint tasks | Completed fmt/check/clippy/test evidence |
+| Combined current-build delivery | `bd-z5bav` | Depends on the above test lanes and ten existing correctness/configuration tasks |
+
+1. Restore truthful observation: public parity/gate binding and its adversarial
+   tests; lossless tracker interoperability; a completed pinned-nightly baseline.
+2. Finish correctness closeout already owned: clean fixtures, JBD2/GDT accounting,
+   btrfs accumulated fsync logs and retirement. Measure acknowledged data with an
+   external reader/checker, not only FrankenFS reopening its own output.
+3. Complete missing mounted device routing and repair lifecycle, with independent
+   end-to-end tests. Finish existing chunk-growth and Unicode scope work.
+4. Run the explicitly permission-gated xfstests successor and the combined
+   current-build crash/repair/soak acceptance lane.
+5. Re-measure the existing performance surface with equivalent durability,
+   checksum policy, device transport and accepted A/A controls. Only then optimize
+   a profiled lever, preserve behavior and compare a live incumbent in the same
+   invocation. A loss is a useful result; a rejected measurement has no win ratio.
+
+This ordering is risk-based, not an instruction to serialize every independent
+task. Correctness and executable evidence have higher delivery value than another
+dashboard, synthetic ratio or mechanically closed issue. Capability matrices
+must remain precise without quietly editing away promised functionality.
+
+### Design review of the bridge
+
+The ambition reviews strengthened three aspects of the plan: (1) connect claims
+to public execution rather than another internal report; (2) follow acknowledged
+writes through journal/COW, repair freshness and restart; (3) evaluate actual
+mounted device routing and matched-incumbent behavior rather than isolated helper
+capabilities. Deterministic crash schedules, byte-identity oracles and bounded
+resource invariants are more useful here than adding speculative policy math.
+
+Five refinement passes checked: (1) coverage, adding the incomplete-FC-recovery
+gap; (2) ordering/ownership, wiring existing closeout tasks without claiming them;
+(3) test completeness, adding runnable-documentation verification and making test
+companions prerequisites of delivery; (4) permission and conservation semantics,
+explicitly blocking xfstests and clarifying source-aware tracker projection;
+(5) the final goal-to-task map and graph, with no further scope change required.
+They preserve current implementations even where old ticket titles disagree.
+The audit task closes on this reviewable assessment and work graph; delivery
+tasks close only on their named executed evidence.
+
+Final graph validation: **15 delivery tasks, 27 new blocking edges, no active
+cycles** (`br --no-db dep cycles --json`). All 4,213 pre-existing IDs and statuses
+were preserved. Final bv triage sees 4,228 valid rows plus the existing invalid
+`wont_fix` row; it remains `partial`, `claim_safe=false`, despite reporting no
+cycles. A successful bv process exit is therefore not a clean-tracker result.
+The xfstests successor is explicitly blocked. No delivery task was closed by
+this assessment.
+
+---
+
+## Historical May 2026 writeup
+
 > Engineering writeup on the bd-xuo95 epic (2026-05-20 to 2026-05-21)
 
 ---
