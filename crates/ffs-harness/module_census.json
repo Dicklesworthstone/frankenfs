@@ -7,14 +7,14 @@
     "meta": "Harness plumbing, operational readiness reports, evidence packaging, dashboards, gates, schedulers, benchmark/report metadata, and CLI/runtime support around those lanes."
   },
   "summary": {
-    "modules": 88,
-    "total_loc": 154888,
-    "conformance_modules": 23,
-    "conformance_loc": 29403,
-    "conformance_loc_basis_points": 1898,
+    "modules": 89,
+    "total_loc": 168719,
+    "conformance_modules": 24,
+    "conformance_loc": 43194,
+    "conformance_loc_basis_points": 2560,
     "meta_modules": 65,
-    "meta_loc": 125485,
-    "meta_loc_basis_points": 8102
+    "meta_loc": 125525,
+    "meta_loc_basis_points": 7440
   },
   "modules": [
     {
@@ -35,7 +35,7 @@
     {
       "path": "src/artifact_manifest.rs",
       "classification": "meta",
-      "loc": 4216
+      "loc": 4219
     },
     {
       "path": "src/authoritative_environment_manifest.rs",
@@ -50,7 +50,12 @@
     {
       "path": "src/benchmark_taxonomy.rs",
       "classification": "meta",
-      "loc": 1413
+      "loc": 1412
+    },
+    {
+      "path": "src/bin/ffs_mounted_kernel_bench.rs",
+      "classification": "conformance",
+      "loc": 13782
     },
     {
       "path": "src/btrfs_capability_drift.rs",
@@ -80,7 +85,7 @@
     {
       "path": "src/claimability_plan.rs",
       "classification": "meta",
-      "loc": 2776
+      "loc": 2778
     },
     {
       "path": "src/crash_promotion.rs",
@@ -110,7 +115,7 @@
     {
       "path": "src/e2e.rs",
       "classification": "meta",
-      "loc": 3724
+      "loc": 3728
     },
     {
       "path": "src/error_taxonomy.rs",
@@ -160,7 +165,7 @@
     {
       "path": "src/lib.rs",
       "classification": "meta",
-      "loc": 2301
+      "loc": 2300
     },
     {
       "path": "src/log_contract.rs",
@@ -255,7 +260,7 @@
     {
       "path": "src/operational_readiness_report.rs",
       "classification": "meta",
-      "loc": 2488
+      "loc": 2491
     },
     {
       "path": "src/operator_recovery_drill.rs",
@@ -310,7 +315,7 @@
     {
       "path": "src/rch_capacity_preflight.rs",
       "classification": "meta",
-      "loc": 636
+      "loc": 642
     },
     {
       "path": "src/readiness_action_autopilot.rs",
@@ -325,7 +330,7 @@
     {
       "path": "src/readiness_lab.rs",
       "classification": "meta",
-      "loc": 6763
+      "loc": 6762
     },
     {
       "path": "src/release_gate.rs",
@@ -345,7 +350,7 @@
     {
       "path": "src/repair_confidence_lab.rs",
       "classification": "conformance",
-      "loc": 1771
+      "loc": 1774
     },
     {
       "path": "src/repair_corpus.rs",
@@ -385,7 +390,7 @@
     {
       "path": "src/stale_mounts.rs",
       "classification": "meta",
-      "loc": 576
+      "loc": 589
     },
     {
       "path": "src/support_state_accounting.rs",
@@ -425,7 +430,7 @@
     {
       "path": "src/tracker_source_hygiene.rs",
       "classification": "meta",
-      "loc": 3649
+      "loc": 3658
     },
     {
       "path": "src/verification_runner.rs",
@@ -440,7 +445,7 @@
     {
       "path": "src/workload_corpus.rs",
       "classification": "meta",
-      "loc": 1150
+      "loc": 1153
     },
     {
       "path": "src/writeback_cache_audit.rs",
@@ -455,7 +460,7 @@
     {
       "path": "src/xfstests.rs",
       "classification": "conformance",
-      "loc": 4984
+      "loc": 4990
     }
   ]
 }

@@ -1199,8 +1199,16 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             "scrub complete"
         );
         self.update_adaptive_policy(&report)?;
+        let grouped_corrupt = self.group_corrupt_blocks(&report);
         if self.repair_writes_enabled {
-            self.refresh_dirty_groups_now(cx)?;
+            for group in self.dirty_groups() {
+                if !grouped_corrupt
+                    .iter()
+                    .any(|(cfg, _)| cfg.layout.group == group)
+                {
+                    self.maybe_refresh_dirty_group(cx, group, false)?;
+                }
+            }
         }
         self.sync_atomic_staleness_gauge();
 
@@ -1216,13 +1224,19 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             });
         }
 
-        // Group corrupt blocks by their owning group.
-        let grouped_corrupt = self.group_corrupt_blocks(&report);
-
-        let mut block_outcomes = BTreeMap::new();
+        // Every detected block starts unrecoverable, including blocks outside
+        // configured source ranges. Successful group recovery replaces outcomes;
+        // missing repair coverage must never erase a scrub finding.
+        let corrupt_blocks = Self::corrupt_blocks_from_report(&report);
+        let mut block_outcomes = corrupt_blocks
+            .iter()
+            .map(|block| (block.0, BlockOutcome::Unrecoverable))
+            .collect();
         let mut group_summaries = Vec::new();
         let mut total_recovered: usize = 0;
-        let mut total_unrecoverable: usize = 0;
+        // group_corrupt_blocks assigns each unique finding to at most one group.
+        let covered_blocks: usize = grouped_corrupt.iter().map(|(_, blocks)| blocks.len()).sum();
+        let mut total_unrecoverable = corrupt_blocks.len() - covered_blocks;
 
         for (group_cfg, corrupt_blocks) in &grouped_corrupt {
             let summary = if self.repair_writes_enabled {
@@ -1246,7 +1260,7 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
 
         Ok(RecoveryReport {
             blocks_scanned: report.blocks_scanned,
-            total_corrupt: grouped_corrupt.iter().map(|(_, blocks)| blocks.len()).sum(),
+            total_corrupt: corrupt_blocks.len(),
             total_recovered,
             total_unrecoverable,
             block_outcomes,
@@ -1299,12 +1313,11 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
         })?;
 
         self.update_adaptive_policy(&report)?;
-        if self.repair_writes_enabled {
-            self.maybe_refresh_dirty_group(cx, group, false)?;
-        }
-
         let corrupt_blocks = Self::corrupt_blocks_from_report(&report);
         if corrupt_blocks.is_empty() {
+            if self.repair_writes_enabled {
+                self.maybe_refresh_dirty_group(cx, group, false)?;
+            }
             return Ok((report, None));
         }
 
@@ -1963,6 +1976,27 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
         group_cfg: &GroupConfig,
         corrupt_blocks: &[BlockNumber],
     ) -> RecoveryAttemptResult {
+        // A successful decode only proves agreement with the encoded generation.
+        // It cannot prove freshness after client writes. Until dirty partitions
+        // are tracked separately, the whole dirty group is ineligible (spec 3.10).
+        if self.is_group_dirty(group_cfg.layout.group) {
+            return RecoveryAttemptResult {
+                evidence: crate::recovery::RecoveryEvidence {
+                    group: group_cfg.layout.group.0,
+                    generation: 0,
+                    corrupt_count: corrupt_blocks.len(),
+                    symbols_available: 0,
+                    symbols_used: 0,
+                    decoder_stats: RecoveryDecoderStats::default(),
+                    outcome: RecoveryOutcome::Failed,
+                    reason: Some(
+                        "repair symbols are stale after writes; refusing recovery from a dirty group"
+                            .to_owned(),
+                    ),
+                },
+                repaired_blocks: Vec::new(),
+            };
+        }
         let orchestrator = match GroupRecoveryOrchestrator::new_with_writeback(
             self.device,
             self.recovery_writeback.as_ref(),
@@ -3612,6 +3646,43 @@ mod tests {
     }
 
     #[test]
+    fn full_scrub_counts_corruption_outside_repair_groups() {
+        for repair_writes_enabled in [true, false] {
+            let cx = Cx::for_testing();
+            let device = MemBlockDevice::new(256, 64);
+            let layout =
+                RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 32, 0, 2).expect("layout");
+            let validator = CorruptBlockValidator::new(vec![2, 20]);
+            let mut pipeline = ScrubWithRecovery::new(
+                &device,
+                &validator,
+                test_uuid(),
+                vec![GroupConfig {
+                    layout,
+                    source_first_block: BlockNumber(0),
+                    source_block_count: 8,
+                }],
+                Vec::new(),
+                0,
+            )
+            .with_repair_writes_enabled(repair_writes_enabled);
+
+            let report = pipeline.scrub_and_recover(&cx).expect("scrub");
+            assert_eq!(report.blocks_scanned, 64);
+            assert_eq!(report.total_corrupt, 2);
+            assert_eq!(report.total_recovered, 0);
+            assert_eq!(report.total_unrecoverable, 2);
+            assert!(!report.is_fully_recovered());
+            for block in [2, 20] {
+                assert_eq!(
+                    report.block_outcomes.get(&block),
+                    Some(&BlockOutcome::Unrecoverable)
+                );
+            }
+        }
+    }
+
+    #[test]
     fn clean_scrub_produces_empty_report() {
         let cx = Cx::for_testing();
         let block_size = 256;
@@ -3883,7 +3954,10 @@ mod tests {
             if dirty {
                 assert_eq!(restored.as_slice(), &[0xDE; 256]);
                 assert_eq!(
-                    device.read_block(&cx, BlockNumber(1)).expect("client data").as_slice(),
+                    device
+                        .read_block(&cx, BlockNumber(1))
+                        .expect("client data")
+                        .as_slice(),
                     &[0x5A; 256]
                 );
             } else {

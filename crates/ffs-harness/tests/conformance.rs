@@ -3141,10 +3141,12 @@ fn build_fc_tag(tag_type: u16, payload: &[u8]) -> Vec<u8> {
     bytes
 }
 
-fn build_fc_inode_update_transaction(ino: u32, tid: u32) -> Vec<u8> {
+fn build_fc_inode_update_transaction(ino: u32, tid: u32, raw_inode: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::new();
     bytes.extend(build_fc_tag(0x09, &[0; 16]));
-    bytes.extend(build_fc_tag(0x06, &ino.to_le_bytes()));
+    let mut inode_payload = ino.to_le_bytes().to_vec();
+    inode_payload.extend_from_slice(raw_inode);
+    bytes.extend(build_fc_tag(0x06, &inode_payload));
     let mut tail = [0_u8; 8];
     tail[..4].copy_from_slice(&tid.to_le_bytes());
     bytes.extend(build_fc_tag(0x08, &tail));
@@ -3211,7 +3213,12 @@ fn build_ext4_fast_commit_test_image() -> Vec<u8> {
     let j_commit = 23 * 4096;
     write_jbd2_header(&mut image[j_commit..j_commit + 4096], 2, 1);
 
-    let fc_payload = build_fc_inode_update_transaction(42, 1);
+    // Replay a complete record for an existing inode, and prove its metadata
+    // changes. An empty record for absent inode 42 only exercised the old skip.
+    let ino11_off = 4 * 4096 + 10 * 256;
+    let mut raw_inode = image[ino11_off..ino11_off + 256].to_vec();
+    raw_inode[0x10..0x14].copy_from_slice(&1_700_000_123_u32.to_le_bytes());
+    let fc_payload = build_fc_inode_update_transaction(11, 1, &raw_inode);
     let fc_block = 24 * 4096;
     image[fc_block..fc_block + fc_payload.len()].copy_from_slice(&fc_payload);
 
@@ -3831,9 +3838,19 @@ fn ext4_fast_commit_replay_openfs_evidence_conforms() {
     assert_eq!(fc.replay.transactions_found, 1);
     assert_eq!(fc.replay.last_tid, 1);
     assert_eq!(fc.replay.operations.len(), 1);
+    let original_image = build_ext4_extent_test_image();
+    let ino11_off = 4 * 4096 + 10 * 256;
+    let mut expected_inode = original_image[ino11_off..ino11_off + 256].to_vec();
+    expected_inode[0x10..0x14].copy_from_slice(&1_700_000_123_u32.to_le_bytes());
     assert_eq!(
         format!("{:?}", fc.replay.operations),
-        "[InodeUpdate(42, [])]"
+        format!("[InodeUpdate(11, {expected_inode:?})]")
+    );
+    assert_eq!(
+        fs.read_inode(&cx, InodeNumber(11))
+            .expect("recovered inode")
+            .mtime,
+        1_700_000_123
     );
     assert_eq!(fc.replay.incomplete_transactions, 0);
     assert!(!fc.replay.fallback_required);
@@ -3843,6 +3860,33 @@ fn ext4_fast_commit_replay_openfs_evidence_conforms() {
         .read_block_vec(&cx, ffs_types::BlockNumber(15))
         .expect("read replayed data block");
     assert_eq!(&target[..16], b"JBD2-REPLAY-TEST");
+}
+
+#[test]
+fn ext4_fast_commit_empty_inode_record_rejects_without_mutating_overlay_source() {
+    let cx = Cx::for_testing();
+    let mut image = build_ext4_fast_commit_test_image();
+    let fc_block = 24 * 4096;
+    let payload = build_fc_inode_update_transaction(11, 1, &[]);
+    image[fc_block..fc_block + 4096].fill(0);
+    image[fc_block..fc_block + payload.len()].copy_from_slice(&payload);
+    let temp = tempfile::TempDir::new().expect("temporary image directory");
+    let path = temp.path().join("empty-inode-record.ext4");
+    fs::write(&path, &image).expect("write image");
+    let result = OpenFs::open_with_options(
+        &cx,
+        &path,
+        &OpenOptions {
+            ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
+            ..OpenOptions::default()
+        },
+    );
+    assert!(matches!(
+        result,
+        Err(ffs_error::FfsError::UnsupportedFeature(ref reason))
+            if reason.contains("no recoverable inode bytes")
+    ));
+    assert_eq!(fs::read(&path).expect("read source after rejection"), image);
 }
 
 #[test]

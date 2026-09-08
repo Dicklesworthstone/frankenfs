@@ -4310,11 +4310,14 @@ The known gaps are already linked to bd-l7ov7 and artifact reports/open-ended.js
         );
         assert!(report.valid, "scan should validate: {:?}", report.errors);
         assert_eq!(report.workspace_file_source, "filesystem_fallback");
+        // A temp directory outside a checkout has no Git scan; under TMPDIR
+        // inside a checkout its fixture files are untracked instead.
+        let reason = &report.workspace_file_source_reason;
         assert!(
-            report
-                .workspace_file_source_reason
-                .contains("git-tracked scan unavailable"),
-            "temp fixtures should record why they used filesystem fallback"
+            reason.starts_with("git-tracked scan unavailable:")
+                || (reason.starts_with("git-tracked scan incomplete for ")
+                    && reason.ends_with("; filesystem fallback missing <none>")),
+            "temp fixtures should record why they used filesystem fallback: {reason}"
         );
         assert_eq!(report.source_count, REQUIRED_SOURCE_FAMILIES.len());
         assert_eq!(

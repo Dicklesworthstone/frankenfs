@@ -32,8 +32,11 @@
 
 use std::ffi::OsStr;
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
 
 use asupersync::Cx;
+use asupersync::runtime::RuntimeBuilder;
+use asupersync::sync::{Mutex, MutexGuard};
 use ffs_core::{FsOps, OpenFs, OpenOptions};
 use ffs_types::InodeNumber;
 
@@ -53,6 +56,20 @@ const SIZES: [usize; 3] = [600, 6_000, 20_048];
 /// `BTRFS_TREE_NODE_CACHE_LIMIT` (512 nodes), measured rather than derived: at
 /// 6,000 entries pass 2 takes 0 misses, at 20,048 it takes ~1,676.
 const BTRFS_TREE_NODE_CACHE_LIMIT_ENTRIES_EQUIVALENT: usize = 20_000;
+
+static COUNTER_MEASUREMENT_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+/// All tests share process-global counters, including their fixture setup.
+/// Hold this guard from test entry until teardown so another test cannot add
+/// cache activity between either endpoint of a measured delta.
+fn isolate_counter_measurement() -> MutexGuard<'static, ()> {
+    let cx = Cx::for_testing();
+    RuntimeBuilder::current_thread()
+        .build()
+        .expect("build test lock runtime")
+        .block_on(COUNTER_MEASUREMENT_LOCK.lock(&cx))
+        .expect("acquire process-global counter measurement lock")
+}
 
 fn mkfs_btrfs_image(dir: &Path, name: &str) -> Option<PathBuf> {
     let image = dir.join(name);
@@ -130,10 +147,11 @@ fn probe_all(fs: &OpenFs, cx: &Cx, names: &[String]) -> Vec<InodeNumber> {
 /// entries, and a single small fixture would report a healthy cache and prove
 /// nothing about the row that actually loses.
 ///
-/// The counters are process-global, so this reads DELTAS. It is one test rather
-/// than three for that reason — concurrent tests would see each other's lookups.
+/// The counters are process-global, so this reads DELTAS while holding the
+/// shared test guard; concurrent tests would see each other's lookups.
 #[test]
 fn a_repeated_capability_sweep_is_served_from_the_node_cache_bd_2s8zy() {
+    let _measurement = isolate_counter_measurement();
     let tmp = tempfile::TempDir::new().expect("temporary directory");
     let cx = Cx::for_testing();
     let mut inert: Vec<String> = Vec::new();
@@ -246,6 +264,7 @@ fn a_repeated_capability_sweep_is_served_from_the_node_cache_bd_2s8zy() {
 /// adding invalidation will break correctness silently.
 #[test]
 fn the_node_cache_is_disabled_on_a_writable_mount_bd_2s8zy() {
+    let _measurement = isolate_counter_measurement();
     let tmp = tempfile::TempDir::new().expect("temporary directory");
     let entries = 600;
     let Some(image) = seeded_image(&tmp.path().join("."), entries, "nc-rw.btrfs") else {
@@ -293,6 +312,7 @@ fn the_node_cache_is_disabled_on_a_writable_mount_bd_2s8zy() {
 /// attempt at this row this session has been refused for host contention.
 #[test]
 fn readdir_stat_descent_cost_decomposes_by_operation_bd_2s8zy() {
+    let _measurement = isolate_counter_measurement();
     let tmp = tempfile::TempDir::new().expect("temporary directory");
     let entries = 6_000;
     let Some(image) = seeded_image(&tmp.path().join("."), entries, "nc-decomp.btrfs") else {
@@ -446,6 +466,7 @@ fn readdir_stat_descent_cost_decomposes_by_operation_bd_2s8zy() {
 /// exonerated and the cost is elsewhere in the FUSE layer.
 #[test]
 fn interleaved_stat_order_costs_more_descents_than_sequential_bd_2s8zy() {
+    let _measurement = isolate_counter_measurement();
     let tmp = tempfile::TempDir::new().expect("temporary directory");
     let entries = 6_000;
     let streams = 8;
@@ -593,6 +614,7 @@ fn the_floor_memo_sizing_prices_out_against_an_aa_null_bd_2s8zy() {
     /// effect rather than from a separate window that can drift 37% away from it.
     const ARMS: [usize; 3] = [SHIPPING_SLOTS, CANDIDATE_SLOTS, SHIPPING_SLOTS];
 
+    let _measurement = isolate_counter_measurement();
     let tmp = tempfile::TempDir::new().expect("temporary directory");
     let entries = 6_000;
     let streams = 8;
@@ -711,6 +733,7 @@ fn the_floor_memo_sizing_prices_out_against_an_aa_null_bd_2s8zy() {
 /// working set re-descends what it evicted.
 #[test]
 fn the_measurement_resize_actually_changes_the_memo_bd_2s8zy() {
+    let _measurement = isolate_counter_measurement();
     let tmp = tempfile::TempDir::new().expect("temporary directory");
     let entries = 6_000;
     let Some(image) = seeded_image(&tmp.path().join("."), entries, "nc-resize.btrfs") else {
@@ -770,6 +793,7 @@ fn the_measurement_resize_actually_changes_the_memo_bd_2s8zy() {
 fn the_per_request_scope_cost_is_priced_against_the_mounted_gap_bd_2s8zy() {
     const ROUNDS: usize = 15;
 
+    let _measurement = isolate_counter_measurement();
     let tmp = tempfile::TempDir::new().expect("temporary directory");
     let entries = 6_000;
     let Some(image) = seeded_image(&tmp.path().join("."), entries, "nc-scope.btrfs") else {
@@ -874,6 +898,7 @@ fn the_per_request_scope_cost_is_priced_against_the_mounted_gap_bd_2s8zy() {
 /// gate actually did.
 #[test]
 fn the_miss_streak_gate_does_not_fire_on_a_real_sweep_bd_79li3() {
+    let _measurement = isolate_counter_measurement();
     let tmp = tempfile::TempDir::new().expect("temporary directory");
     let entries = 6_000;
     let Some(image) = seeded_image(&tmp.path().join("."), entries, "nc-gate.btrfs") else {
@@ -980,6 +1005,7 @@ fn the_miss_streak_gate_does_not_fire_on_a_real_sweep_bd_79li3() {
 /// sizing found sixteen 6-12% slower, so the default was restored.
 #[test]
 fn the_shipping_floor_memo_size_matches_the_measured_one_bd_2s8zy() {
+    let _measurement = isolate_counter_measurement();
     assert_eq!(
         ffs_core::btrfs_floor_memo_slots_effective(),
         4,

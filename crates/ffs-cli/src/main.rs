@@ -12279,8 +12279,27 @@ mod tests {
                 "requests_ok": 97,
                 "requests_err": 3,
                 "bytes_read": 8192,
+                "metadata_requests": 60,
+                "handler_total_nanos": 9000,
+                "handler_total_count": 60,
+                "getattr_dispatch_count": 20,
+                "getattr_dispatch_nanos": 2000,
+                "getxattr_dispatch_count": 10,
+                "getxattr_request_count": 10,
+                "getxattr_dispatch_nanos": 1000,
+                "mutation_dispatch_count": 15,
+                "mutation_dispatch_nanos": 3000,
+                "other_dispatch_count": 5,
+                "other_dispatch_nanos": 500,
+                "lookup_dispatch_count": 30,
+                "lookup_dispatch_nanos": 3000,
+                "readdir_dispatch_count": 20,
+                "readdir_dispatch_nanos": 2000,
                 "requests_throttled": 4,
-                "requests_shed": 1
+                "requests_shed": 1,
+                "readdirplus_memo_remembers": 12,
+                "readdirplus_memo_hits": 8,
+                "forget_nodes": 7
             },
             "cache": {
                 "cache_hits": 80,
@@ -12335,6 +12354,7 @@ mod tests {
                 let value = serde_json::to_value(report).expect("serialize report");
                 assert_eq!(value["preset"], "metrics");
                 assert_eq!(value["metrics"]["requests_total"], 100);
+                assert_eq!(value["metrics"], bundle["metrics"]);
                 assert_eq!(value["cache"]["cache_hits"], 80);
                 assert_eq!(value["mvcc"]["commit_attempts_total"], 80);
                 assert_eq!(value["repair_live"]["decode_successes"], 4);

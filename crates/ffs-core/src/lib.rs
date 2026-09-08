@@ -7344,8 +7344,18 @@ impl OpenFs {
                 ));
             }
             if let std::collections::btree_map::Entry::Vacant(entry) = extent_maps.entry(ino) {
-                let inode = self.read_inode(cx, InodeNumber(u64::from(ino)))?;
-                entry.insert(self.collect_extents(cx, &inode)?);
+                let inode = self.recovery_read_inode(cx, InodeNumber(u64::from(ino)))?;
+                let mut extents = Vec::new();
+                ffs_btree::walk(
+                    cx,
+                    &self.direct_block_device_adapter(),
+                    &Self::extent_root(&inode),
+                    &mut |extent| {
+                        extents.push(*extent);
+                        Ok(())
+                    },
+                )?;
+                entry.insert(extents);
             }
             let extents = &extent_maps[&ino];
             let intervals = covered.entry(ino).or_default();
@@ -7382,6 +7392,34 @@ impl OpenFs {
             intervals.insert(merged_start, merged_end);
         }
         Ok(())
+    }
+
+    /// Recovery writes establish the unversioned baseline. Validate that same
+    /// baseline even when a caller still holds an older runtime MVCC version.
+    fn recovery_read_inode(&self, cx: &Cx, ino: InodeNumber) -> Result<Ext4Inode, FfsError> {
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let loc = sb
+            .locate_inode(ino)
+            .map_err(|error| parse_to_ffs_error(&error))?;
+        let table = self.ext4_inode_table_location(cx, &RequestScope::empty(), loc.group)?;
+        let offset = table
+            .checked_mul(u64::from(sb.block_size))
+            .and_then(|base| base.checked_add(u64::from(loc.index) * u64::from(sb.inode_size)))
+            .ok_or_else(|| FfsError::Corruption {
+                block: table,
+                detail: "recovery inode offset overflow".into(),
+            })?;
+        let mut raw = vec![0; usize::from(sb.inode_size)];
+        self.dev.read_exact_at(cx, ByteOffset(offset), &mut raw)?;
+        let mut inode =
+            Ext4Inode::parse_from_bytes(&raw).map_err(|error| parse_to_ffs_error(&error))?;
+        inode.number = ino.0;
+        if inode.mode == 0 {
+            return Err(FfsError::NotFound(format!("inode {}", ino.0)));
+        }
+        Ok(inode)
     }
 
     fn verify_fast_commit_mapping_segment(
@@ -14674,8 +14712,10 @@ impl OpenFs {
         // the MVCC-committed authority (its integrity comes from the version store
         // / block device, like every other metadata block), and the flush pass
         // re-stamps a consistent descriptor csum so the at-rest image stays
-        // e2fsck-clean. Eager mode keeps the full cross-check.
-        if sb.has_metadata_csum() && !ffs_alloc::gdt_persistence_deferred() {
+        // e2fsck-clean. Read-only images have no live allocation mutations and
+        // must always verify the at-rest checksum, regardless of that setting.
+        if sb.has_metadata_csum() && (!self.is_writable() || !ffs_alloc::gdt_persistence_deferred())
+        {
             ffs_ondisk::ext4::verify_block_bitmap_checksum(
                 &bitmap,
                 sb.csum_seed(),
@@ -14709,8 +14749,10 @@ impl OpenFs {
         // stored `bg_inode_bitmap_csum` lags the eagerly-written inode bitmap
         // between flushes, so the read-time cross-check is structurally
         // inapplicable (bitmap is the MVCC authority; flush re-stamps a consistent
-        // descriptor csum → e2fsck-clean at rest). Eager mode keeps the check.
-        if sb.has_metadata_csum() && !ffs_alloc::gdt_persistence_deferred() {
+        // descriptor csum → e2fsck-clean at rest). A read-only image has no
+        // deferred mutations, so its at-rest checksum must always be checked.
+        if sb.has_metadata_csum() && (!self.is_writable() || !ffs_alloc::gdt_persistence_deferred())
+        {
             ffs_ondisk::ext4::verify_inode_bitmap_checksum(
                 &bitmap,
                 sb.csum_seed(),
@@ -32304,6 +32346,15 @@ impl OpenFs {
             }
         };
 
+        // File data is staged through the MVCC block adapter, whereas the CoW
+        // trees below are written directly. Drain the committed data while the
+        // allocator lock excludes further btrfs writes, before publishing any
+        // metadata that refers to it. The existing pre-superblock sync barrier
+        // then makes both data and tree nodes durable. A failed drain must leave
+        // the old generation and tree publication state intact.
+        let base_dev = self.direct_block_device_adapter();
+        let flushed_data_blocks = self.flush_mvcc_versions_to_device(cx, &base_dev)?;
+
         let current_gen = alloc.generation;
         let new_gen = current_gen.saturating_add(1);
         let nodesize = alloc.nodesize;
@@ -32358,6 +32409,9 @@ impl OpenFs {
 
         let node_count = dag.node_count();
         if node_count == 0 {
+            if flushed_data_blocks > 0 {
+                self.dev.sync(cx)?;
+            }
             debug!(
                 target: "ffs::btrfs::writeback",
                 operation_id,
@@ -66895,9 +66949,8 @@ mod tests {
             "test requires an external xattr block"
         );
 
-        // listxattr fills the parsed external-block cache without reading a
-        // value. A later mutation must evict it rather than leave a stale
-        // answer for getxattr/listxattr.
+        // Retain the old parsed block so a same-size replacement must publish
+        // fresh contents, whether the mutation evicts or writes through.
         assert!(
             fs.listxattr(&cx, ino)
                 .expect("listxattr")
@@ -66905,33 +66958,82 @@ mod tests {
                 .any(|name| name == "user.cached")
         );
         assert!(fs.ext4_inode_xattr_block_cache.contains_key(&ino.0));
+        let original_entries = fs
+            .ext4_inode_xattr_block_cache
+            .get(&ino.0)
+            .expect("external xattr cache filled")
+            .entries;
+        assert_eq!(original_entries.len(), 1);
+        assert_eq!(original_entries[0].0.value, initial);
 
         let replaced = vec![0xB2_u8; 512];
         fs.setxattr(&cx, ino, "user.cached", &replaced, XattrSetMode::Replace)
             .expect("replace external xattr");
-        assert!(
-            !fs.ext4_inode_xattr_block_cache.contains_key(&ino.0),
-            "setxattr must evict the old parsed external xattr block"
-        );
         assert_eq!(
             fs.getxattr(&cx, ino, "user.cached").expect("get replaced"),
-            Some(replaced)
+            Some(replaced.clone())
         );
-        assert!(fs.ext4_inode_xattr_block_cache.contains_key(&ino.0));
+        let replaced_entries = fs
+            .ext4_inode_xattr_block_cache
+            .get(&ino.0)
+            .expect("external xattr cache refreshed")
+            .entries;
+        assert_eq!(replaced_entries.len(), 1);
+        assert_eq!(replaced_entries[0].0.value, replaced);
+        assert_eq!(original_entries[0].0.value, initial);
+        assert_eq!(
+            fs.listxattr(&cx, ino).expect("list replaced"),
+            vec!["user.cached".to_owned()]
+        );
+
+        let replaced_again = vec![0xC3_u8; 512];
+        fs.setxattr(
+            &cx,
+            ino,
+            "user.cached",
+            &replaced_again,
+            XattrSetMode::Replace,
+        )
+        .expect("replace external xattr again");
+        assert_eq!(
+            fs.getxattr(&cx, ino, "user.cached")
+                .expect("get second replacement"),
+            Some(replaced_again.clone())
+        );
+        let current_entries = fs
+            .ext4_inode_xattr_block_cache
+            .get(&ino.0)
+            .expect("external xattr cache refreshed again")
+            .entries;
+        assert_eq!(current_entries.len(), 1);
+        assert_eq!(current_entries[0].0.value, replaced_again);
+        assert_eq!(replaced_entries[0].0.value, replaced);
+        assert_eq!(
+            fs.listxattr(&cx, ino).expect("list second replacement"),
+            vec!["user.cached".to_owned()]
+        );
 
         assert!(
             fs.removexattr(&cx, ino, "user.cached")
                 .expect("remove external xattr")
         );
-        assert!(
-            !fs.ext4_inode_xattr_block_cache.contains_key(&ino.0),
-            "removexattr must evict the parsed external xattr block"
-        );
+        if let Some(cached) = fs.ext4_inode_xattr_block_cache.get(&ino.0) {
+            assert_eq!(
+                cached.entries.len(),
+                0,
+                "removed value must not stay cached"
+            );
+        }
         assert_eq!(
             fs.getxattr(&cx, ino, "user.cached")
                 .expect("get removed attribute"),
             None
         );
+        assert_eq!(
+            fs.listxattr(&cx, ino).expect("list removed"),
+            [] as [String; 0]
+        );
+        assert_eq!(current_entries[0].0.value, replaced_again);
     }
 
     #[test]

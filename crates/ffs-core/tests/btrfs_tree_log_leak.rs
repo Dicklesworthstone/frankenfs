@@ -111,6 +111,24 @@ fn durable_fsync_retains_its_committed_extent_items_bd_0ajub() {
         .expect("count durable baseline")
         .extent_items;
     let inode = create_file(&fs, &cx, "durable-file");
+    // An empty file can reuse existing metadata blocks after a full commit
+    // retires its tree log. Force a regular data extent beyond the inline limit
+    // so allocation growth measures committed file storage, not transient logs.
+    let sectorsize = fs.btrfs_superblock().expect("btrfs superblock").sectorsize;
+    let payload_len = sectorsize.checked_mul(2).expect("two-sector payload size");
+    let payload: Vec<u8> = (0..payload_len)
+        .map(|index| u8::try_from(index % 251).expect("pattern byte"))
+        .collect();
+    assert_eq!(
+        fs.write(&cx, inode, 0, &payload)
+            .expect("write non-inline durable payload"),
+        payload_len
+    );
+    assert_eq!(
+        fs.read(&cx, inode, 0, payload_len)
+            .expect("read staged payload before fsync"),
+        payload
+    );
     fs.fsync(&cx, inode, 0, false)
         .expect("durable fsync must commit");
     let after = fs
@@ -120,5 +138,21 @@ fn durable_fsync_retains_its_committed_extent_items_bd_0ajub() {
     assert!(
         after > before,
         "the durable fsync must keep its committed extent items: before={before}, after={after}"
+    );
+    drop(fs);
+
+    let device = FileByteDevice::open(&image).expect("reopen durable btrfs image");
+    let reopened = OpenFs::from_device(&cx, Box::new(device), &OpenOptions::default())
+        .expect("read-only reopen after durable fsync");
+    let attr = reopened
+        .lookup(&cx, BTRFS_ROOT_DIR, OsStr::new("durable-file"))
+        .expect("committed inode survives reopen");
+    assert_eq!(attr.ino, inode);
+    assert_eq!(attr.size, u64::from(payload_len));
+    assert_eq!(
+        reopened
+            .read(&cx, attr.ino, 0, payload_len)
+            .expect("read committed non-inline payload after reopen"),
+        payload
     );
 }

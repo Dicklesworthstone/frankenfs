@@ -3886,7 +3886,8 @@ def setflags_buffer(flags: int) -> bytes:
         return struct.pack('@Q', flags)
     return struct.pack('@I', flags)
 
-with open(path, 'r+b', buffering=0) as fh:
+# The descriptor must open on read-only mounts so SETFLAGS itself is tested.
+with open(path, 'rb', buffering=0) as fh:
     try:
         if command == 'get':
             buffer = bytearray(word_size)
@@ -4149,6 +4150,7 @@ fn ext4_move_ext_ioctl(
     orig_start: u64,
     donor_start: u64,
     len: u64,
+    read_only_fd: bool,
 ) -> Value {
     let script = r"
 import fcntl, json, struct, sys
@@ -4162,6 +4164,7 @@ donor_path = sys.argv[2]
 orig_start = int(sys.argv[3])
 donor_start = int(sys.argv[4])
 length = int(sys.argv[5])
+mode = sys.argv[6]
 
 buffer = bytearray(MOVE_EXT_SIZE)
 struct.pack_into('@Q', buffer, 8, orig_start)
@@ -4171,7 +4174,7 @@ struct.pack_into('@Q', buffer, 24, length)
 def _timeout(_signum, _frame):
     raise TimeoutError('move_ext ioctl timed out')
 
-with open(path, 'r+b', buffering=0) as orig, open(donor_path, 'r+b', buffering=0) as donor:
+with open(path, mode, buffering=0) as orig, open(donor_path, mode, buffering=0) as donor:
     struct.pack_into('@i', buffer, 4, donor.fileno())
     signal.signal(signal.SIGALRM, _timeout)
     signal.alarm(15)
@@ -4217,6 +4220,7 @@ with open(path, 'r+b', buffering=0) as orig, open(donor_path, 'r+b', buffering=0
             &orig_start.to_string(),
             &donor_start.to_string(),
             &len.to_string(),
+            if read_only_fd { "rb" } else { "r+b" },
         ])
         .output()
         .expect("python3 ext4 move_ext ioctl");
@@ -4905,7 +4909,7 @@ fn assert_pwritev2_rwf_persists_after_remount(
         "pwritev2 {flag_name} write should be immediately readable: {report}"
     );
 
-    drop(session);
+    session.unmount_and_join();
     wait_for_fuse_mount_released(&mnt);
 
     let Some(_remount) = try_mount_ffs_rw_with_options(&image, &mnt, &mount_opts) else {
@@ -7626,7 +7630,7 @@ fn fuse_ioctl_ext4_setfslabel_updates_label_and_survives_remount() {
         "SETFSLABEL should succeed on rw ext4 mount: {set_report}"
     );
 
-    drop(session);
+    session.unmount_and_join();
     wait_for_fuse_mount_released(&mnt);
 
     let Some(_remount) = try_mount_ffs_rw_with_options(&image, &mnt, &mount_opts) else {
@@ -8384,7 +8388,7 @@ fn fuse_ioctl_ext4_move_ext_swaps_middle_extent_on_mounted_path() {
         );
         return;
     }
-    let report = ext4_move_ext_ioctl(&source, &donor, 1, 1, 1);
+    let report = ext4_move_ext_ioctl(&source, &donor, 1, 1, 1, false);
     let ioctl_trace = read_ioctl_trace(&ioctl_trace_path);
     if report["timeout"].as_bool() == Some(true) {
         assert!(
@@ -8593,7 +8597,7 @@ fn fuse_ioctl_ext4_move_ext_rejects_hole_backed_range_on_mounted_path() {
     );
     let donor_before = fs::read(&donor).expect("read donor before move_ext");
 
-    let report = ext4_move_ext_ioctl(&source, &donor, 1, 1, 1);
+    let report = ext4_move_ext_ioctl(&source, &donor, 1, 1, 1, false);
     let ioctl_trace = read_ioctl_trace(&ioctl_trace_path);
     if report["timeout"].as_bool() == Some(true) {
         assert!(
@@ -8697,7 +8701,7 @@ fn fuse_ioctl_ext4_mutation_ioctls_fast_fail_erofs_on_read_only_mount() {
         };
         fs::write(mnt.join(source_rel), &source_payload).expect("write ro source seed");
         fs::write(mnt.join(donor_rel), &donor_payload).expect("write ro donor seed");
-        drop(setup_session);
+        setup_session.unmount_and_join();
     }
     wait_for_fuse_mount_released(&mnt);
 
@@ -8758,7 +8762,7 @@ fn fuse_ioctl_ext4_mutation_ioctls_fast_fail_erofs_on_read_only_mount() {
     }
 
     // MOVE_EXT: swap 1 block between source and donor.  On ro, must reject.
-    let move_ext_report = ext4_move_ext_ioctl(&source_path, &donor_path, 0, 0, 1);
+    let move_ext_report = ext4_move_ext_ioctl(&source_path, &donor_path, 0, 0, 1, true);
     let move_ext_trace = read_ioctl_trace(&ro_trace_path);
     if move_ext_report["timeout"].as_bool() == Some(true) {
         assert!(
@@ -9703,7 +9707,7 @@ fn writeback_cache_ext4_opt_in_flush_fsyncdir_reopen() {
         "writeback-cache v2\n"
     );
 
-    drop(session);
+    session.unmount_and_join();
     wait_for_fuse_mount_released(&mnt);
 
     let Some(_remount) = try_mount_ffs_rw_with_options(&image, &mnt, &mount_opts) else {
@@ -11891,7 +11895,7 @@ fn assert_btrfs_pwritev2_rwf_persists_after_remount(
         "btrfs pwritev2 {flag_name} write should be immediately readable: {report}"
     );
 
-    drop(session);
+    session.unmount_and_join();
     wait_for_fuse_mount_released(&mnt);
 
     let Some(_remount) = try_mount_btrfs_rw_with_options(&image, &mnt, &mount_opts) else {
@@ -13480,7 +13484,7 @@ fn btrfs_fuse_xattr_read_only_set_and_remove_report_erofs_without_side_effects()
         fs::write(&path, b"readonly btrfs xattr seed\n").expect("write ro btrfs xattr seed file");
         py_setxattr(&path, "user.locked", b"original");
         py_setxattr(&path, "user.keep", b"preserve");
-        drop(setup_session);
+        setup_session.unmount_and_join();
     }
 
     wait_for_fuse_mount_released(&mnt);
@@ -15414,8 +15418,25 @@ fn btrfs_fuse_rename_overwrite() {
     });
 }
 
+fn assert_invalid_rename_flags_preserve_files(mnt: &Path, src: &Path, dst: &Path) {
+    let src_before = snapshot_file_state(src);
+    let dst_before = snapshot_file_state(dst);
+    let entries_before = snapshot_directory_entries(mnt);
+    for flags in [libc::RENAME_NOREPLACE | libc::RENAME_EXCHANGE, 1_u32 << 31] {
+        let report = py_renameat2_report(src, dst, flags);
+        assert_eq!(
+            report["errno"].as_i64(),
+            Some(i64::from(libc::EINVAL)),
+            "invalid rename flags {flags:#x} must return EINVAL: {report:?}"
+        );
+        assert_eq!(snapshot_directory_entries(mnt), entries_before);
+        assert_file_state_unchanged(src, &src_before, "invalid rename source");
+        assert_file_state_unchanged(dst, &dst_before, "invalid rename destination");
+    }
+}
+
 #[test]
-fn btrfs_fuse_renameat2_honors_noreplace_and_rejects_exchange() {
+fn btrfs_fuse_renameat2_honors_noreplace_and_exchange() {
     with_btrfs_rw_mount(|mnt| {
         let scenario_id = "btrfs_rw_renameat2_flags";
         if !command_available("python3") {
@@ -15445,6 +15466,12 @@ fn btrfs_fuse_renameat2_honors_noreplace_and_rejects_exchange() {
         let noreplace_existing_dst_before = snapshot_file_state(&noreplace_existing_dst);
         let exchange_src_before = snapshot_file_state(&exchange_src);
         let exchange_dst_before = snapshot_file_state(&exchange_dst);
+        let exchange_src_ino = fs::metadata(&exchange_src)
+            .expect("stat exchange source")
+            .ino();
+        let exchange_dst_ino = fs::metadata(&exchange_dst)
+            .expect("stat exchange destination")
+            .ino();
 
         let noreplace_report =
             py_renameat2_report(&noreplace_src, &noreplace_dst, libc::RENAME_NOREPLACE);
@@ -15487,30 +15514,46 @@ fn btrfs_fuse_renameat2_honors_noreplace_and_rejects_exchange() {
         let exchange_report =
             py_renameat2_report(&exchange_src, &exchange_dst, libc::RENAME_EXCHANGE);
         assert_eq!(
-            exchange_report["errno"].as_i64(),
-            Some(i64::from(libc::EINVAL)),
-            "renameat2(RENAME_EXCHANGE) should surface exact EINVAL on btrfs: {exchange_report:?}"
+            exchange_report["ok"].as_bool(),
+            Some(true),
+            "renameat2(RENAME_EXCHANGE) should swap btrfs entries: {exchange_report:?}"
         );
         assert_eq!(
             snapshot_directory_entries(mnt),
             entries_before_exchange,
-            "rejected btrfs RENAME_EXCHANGE must not change visible workspace entries"
+            "btrfs RENAME_EXCHANGE must preserve both visible workspace names"
         );
-        assert_file_state_unchanged(
-            &exchange_src,
-            &exchange_src_before,
-            "btrfs renameat2 RENAME_EXCHANGE source",
+        assert_eq!(
+            fs::read(&exchange_src).expect("read exchanged source"),
+            exchange_dst_before.bytes,
+            "exchange source must contain former destination bytes"
         );
-        assert_file_state_unchanged(
-            &exchange_dst,
-            &exchange_dst_before,
-            "btrfs renameat2 RENAME_EXCHANGE destination",
+        assert_eq!(
+            fs::read(&exchange_dst).expect("read exchanged destination"),
+            exchange_src_before.bytes,
+            "exchange destination must contain former source bytes"
         );
+        assert_eq!(
+            fs::metadata(&exchange_src)
+                .expect("stat swapped source")
+                .ino(),
+            exchange_dst_ino
+        );
+        assert_eq!(
+            fs::metadata(&exchange_dst)
+                .expect("stat swapped destination")
+                .ino(),
+            exchange_src_ino
+        );
+
+        assert_invalid_rename_flags_preserve_files(mnt, &exchange_src, &exchange_dst);
 
         emit_scenario_result(
             scenario_id,
             "PASS",
-            Some("noreplace=create+noreplace_existing=EEXIST+exchange=EINVAL_no_drift"),
+            Some(
+                "noreplace=create+noreplace_existing=EEXIST+exchange=swapped+invalid=EINVAL_no_drift",
+            ),
         );
     });
 }

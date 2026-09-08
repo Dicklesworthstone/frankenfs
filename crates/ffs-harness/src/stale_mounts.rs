@@ -422,6 +422,19 @@ impl Drop for MountGuard {
     }
 }
 
+impl MountGuard {
+    /// Unmount and wait for the server's destroy-time persistence to finish.
+    /// Use this before reopening an image; ordinary drop only requests unmount.
+    ///
+    /// # Panics
+    /// Panics if the background server panicked or returned an I/O error.
+    pub fn unmount_and_join(mut self) {
+        if let Some(session) = self.session.take() {
+            session.join();
+        }
+    }
+}
+
 /// Reclaim every leaked FrankenFS mount on an abrupt (signal) exit, where no
 /// `Drop` runs. Must not panic or block for long (it runs from the `ctrlc`
 /// handler thread and from the panic hook).
