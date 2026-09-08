@@ -1,6 +1,8 @@
 # PROPOSED_ARCHITECTURE.md — FrankenFS (ffs)
 
-> 21-crate Cargo workspace architecture (20 implementation/tooling crates + 1 legacy/reference wrapper) for a memory-safe, FUSE-based Rust reimplementation of ext4 and btrfs with block-level MVCC and RaptorQ self-healing.
+> 22-member Cargo workspace architecture (21 members under `crates/`, plus `tools/ffs-ops`) for a FUSE-based Rust reimplementation of ext4 and btrfs with block-level MVCC and RaptorQ self-healing.
+
+> **Source check (2026-09-08):** Cargo.toml declares Rust 1.95 minimum, asupersync 0.3.9, and vendored fuser 0.17.0 with ABI 7.42 enabled. First-party crates forbid unsafe Rust; `vendor/fuser` is excluded from the workspace and contains unsafe transport code. Implemented CLI paths attach the ext4 JBD2 writer before enabling writes, selected ext4 writes stage merge proofs, and per-core FUSE dispatch calls vendored workers. These source connections do not substitute for fresh mounted/crash/performance evidence. Default mounted repair and fully region-scoped background work remain incomplete against the canonical specification.
 
 > **Status note (2026-05-01):** The architecture map describes the implemented
 > crate topology and target boundaries. Current reality-check bridge work outside
@@ -39,6 +41,8 @@
 | 21 | `ffs-btrfs` | Btrfs tree walking and mutation layer: root/inode/dir/extent-data helpers, chunk/device tree discovery, COW tree updates, delayed refs, snapshot/subvolume metadata, MVCC-backed transaction manifests, **metadata writeback serialization (CoW node → on-disk bytes)**, extent tree allocation for new nodes with `METADATA_ITEM`/`TREE_BLOCK_REF` accounting, data orphan reclamation after interrupted writeback, atomic superblock commit with generation bump; re-exports low-level `ffs-ondisk::btrfs::*` primitives | `ffs-ondisk`, `ffs-types`, `ffs-mvcc`, `asupersync`, `thiserror`, `tracing` | 4-7 |
 
 ---
+
+The 22nd member, `ffs-ops` in `tools/ffs-ops`, provides operational validation commands and depends on `ffs-harness`, `anyhow`, and `serde_json`.
 
 ## 2. Dependency Graph
 
@@ -247,9 +251,9 @@ pub trait RepairManager: Send + Sync {
 2. **MVCC is transport-agnostic.** `ffs-mvcc` operates on blocks, not files or directories. It depends on `ffs-block` for versioned block storage but has no knowledge of FUSE, inodes, or directory entries.
 3. **FUSE adapter delegates to ffs-core.** `ffs-fuse` maps FUSE protocol to the `ffs-core::FsOps` trait (runtime path currently uses `OpenFs`) — it contains no filesystem logic and does not depend on domain crates directly.
 4. **Repair is orthogonal.** `ffs-repair` operates on blocks, not files. It doesn't know about inodes or directories.
-5. **Harness depends on everything.** `ffs-harness` may use any internal crate. No production crate depends on harness.
+5. **Harness dependency boundary.** `ffs-harness` consumes internal crates for validation; `ffs-cli` and `ffs-ops` also depend on it for operator-facing validation commands. Core filesystem crates must remain independent of the harness.
 6. **No cycles.** The dependency graph is a DAG. If crate A depends on B, B must not depend on A.
-7. **Cx everywhere.** Any operation that performs I/O or may block takes `&Cx` as its first parameter.
+7. **Explicit Cx is required by the target design.** Context-aware filesystem operations accept `&Cx`; current repair-flush notification still has a `Cx::current()` path, and CLI/FUSE workers use standard threads. Completing explicit propagation and region ownership remains required work. Absence of a `Cx` argument does not prohibit Rust standard-library I/O.
 
 ---
 
@@ -259,9 +263,9 @@ pub trait RepairManager: Send + Sync {
 
 | Feature | Usage |
 |---------|-------|
-| `Cx` (capability context) | Threaded through all I/O operations for cooperative cancellation and deadline propagation |
+| `Cx` (capability context) | Passed through context-aware filesystem I/O; ambient and standard-thread paths remain to be integrated |
 | `Budget` | Resource budgeting for block cache memory, open file descriptors, repair symbol storage |
-| `Region` | Structured concurrency scopes for background tasks (scrub, GC, flush) |
+| `Region` | Required target ownership for background tasks; current CLI scrub and FUSE workers also use standard threads |
 | `Lab` | Deterministic runtime for testing concurrent MVCC operations |
 | `RaptorQ codec` | Encoding/decoding repair symbols in `ffs-repair` |
 | `blocking_pool` | Offload synchronous disk I/O from async context |
@@ -282,7 +286,7 @@ pub trait RepairManager: Send + Sync {
 | `MountOption` | Mount configuration (read-only, allow_other, auto_unmount) |
 | `Session` | FUSE session lifecycle management |
 
-> **Status:** `fuser` is a workspace dependency. `ffs-fuse` implements the `fuser::Filesystem` trait and `ffs mount` currently reaches both ext4 and btrfs paths under the fully tracked V1 contract. Default mount is read-only; `--rw` enables write paths whose operator-facing runtime remains experimental while hardening continues.
+> **Status:** vendored `fuser` is a patched dependency, excluded from first-party workspace lint enforcement. `ffs-fuse` implements `fuser::Filesystem`; mounts reach ext4 and btrfs paths, including a wired per-core dispatcher. Default mount is read-only; read-write behavior remains experimental, and complete V1 acceptance requires execution evidence beyond this architecture map.
 
 ---
 
@@ -403,13 +407,13 @@ pub enum FfsError {
 }
 ```
 
-> **Canonical variant count: 18.** Other sections of the spec that reference FfsError with different counts or variant names (e.g., `AlreadyExists` for `Exists`, `DirectoryNotEmpty` for `NotEmpty`) are non-normative — this listing and `ffs-error/src/lib.rs` are the single source of truth.
+> This error listing is an architectural sketch, not the complete current API. `crates/ffs-error/src/lib.rs` is authoritative for variants and errno mappings.
 
 ---
 
 ## 8. Configuration
 
-Mount-time configuration lives in `ffs-core`:
+Current library callers open images with synchronous `OpenFs::open(&cx, path)` or `OpenFs::open_with_options(&cx, path, &OpenOptions)`. FUSE configuration is in `ffs_fuse::MountOptions` and `ffs_fuse::MountConfig`. The following historical combined configuration sketch is not an exported `ffs_core::MountConfig`:
 
 ```rust
 pub struct MountConfig {

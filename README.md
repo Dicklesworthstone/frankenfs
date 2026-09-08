@@ -9,7 +9,7 @@
   <code>&nbsp;╚  ┴└─┴ ┴┘└┘┴ ┴└─┘┘└┘╚  ╚═╝&nbsp;</code><br>
   <br>
   <strong>Memory-safe ext4 + btrfs in Rust, from userspace</strong><br>
-  <em>Block-level MVCC &middot; RaptorQ self-healing &middot; Adaptive conflict arbitration &middot; Zero unsafe code</em>
+  <em>Block-level MVCC &middot; RaptorQ self-healing &middot; Adaptive conflict arbitration &middot; Unsafe forbidden in first-party crates</em>
 </p>
 
 <p align="center">
@@ -32,16 +32,16 @@
 
 **The approach.** FrankenFS extracts ext4 and btrfs behavior from ~205K lines of Linux kernel C (v6.19), re-implements that behavior in Rust with `#![forbid(unsafe_code)]`, and adds experimental layers for block-level MVCC, RaptorQ repair symbols, and explicit-opt-in FUSE writeback-cache barriers.
 
-It runs as a normal Linux process via FUSE. The current `ParityReport::current()` printout is 97/97 rows in the tracked feature denominator, while the B-series accounting keeps implemented, kernel-verified, and rejection-only rows separate instead of treating the table as a blanket readiness score. Public readiness wording is gated by a checked-in release-gate policy with structured proof bundles, and the workspace ships **21 crates, a source-derived test inventory, 63 fuzz targets, 92 criterion benchmarks, 125 tracked end-to-end gate scripts, and 23 evidence-event types** under `#![forbid(unsafe_code)]`. The README count guard `readme_quantitative_claims_match_code` re-derives these inventory numbers from source so fast-moving test counts are not hand-pinned here.
+It runs as a normal Linux process via FUSE. `ParityReport::current()` prints 97/97 from the Markdown feature table; that number is not an executed-test result or a readiness score. The workspace has **22 members**, including `tools/ffs-ops`. The 2026-09-08 source-derived test inventory found **63 fuzz targets, 173 Rust benchmark files, 125 tracked E2E scripts, and 226 tracked insta snapshots**; the evidence schema declares **23 evidence-event types**. File and enum counts are not evidence that checks ran or passed. Release readiness requires fresh execution evidence in addition to the checked-in release-gate policy. The unsafe-code ban covers first-party workspace crates; the vendored FUSE transport is outside that boundary.
 
 | Pillar | What it does | Why it matters |
 |---|---|---|
-| **Block-level MVCC** | Version chains per block, snapshot isolation, 2 executable same-block merge mechanisms (`AppendOnly` and range overlay) exposed through `MergeProof` labels, the 3-outcome `MergeProofMechanism` enum (`NoSameBlockMerge`, `AppendOnly`, `RangeOverlay`), and three `ConflictPolicy` modes (`Strict` / `SafeMerge` / `Adaptive`) selected by an expected-loss decision model | Concurrent readers + writers without routing every commit through the ext4 JBD2 model. Safe-merge proofs let non-conflicting concurrent writes to the same block coexist when they validate through one of the two audited mechanisms. Under a 120-writer stress benchmark, SafeMerge runs 9.5× lower expected loss than Strict with no corruptions observed in that run. Note: the FUSE write path currently stages all writes with `MergeProof::Unsafe`; the 9.5× benefit is bench-demonstrated but not yet wired into production FUSE writes (tracked: bd-xuo95.28). |
+| **Block-level MVCC** | Version chains per block, snapshot isolation, 2 executable same-block merge mechanisms (`AppendOnly` and range overlay) exposed through `MergeProof` labels, the 3-outcome `MergeProofMechanism` enum (`NoSameBlockMerge`, `AppendOnly`, `RangeOverlay`), and three `ConflictPolicy` modes (`Strict` / `SafeMerge` / `Adaptive`) selected by an expected-loss decision model | Selected ext4 write paths derive range and disjoint-block proofs and stage them through MVCC. The historical 120-writer benchmark reported 9.5× lower expected loss for SafeMerge than Strict; it does not establish that benefit for mounted workloads. JBD2 attachment now exists on the ext4 read-write CLI mount path; current crash/replay evidence is still required. |
 | **RaptorQ self-healing** | Fountain-coded repair symbols (RFC 6330), Bayesian Beta-posterior durability autopilot, four refresh policies (`Eager` / `Lazy` / `Adaptive` / `Hybrid`), percentile-based stale-window SLO monitoring | Scrub detects corruption; `ffs repair` / `ffs fsck --repair` can recover offline when repair symbols are available. Mounted repair requires explicit `--background-repair --background-scrub-ledger <jsonl>` and records a durable evidence trail. Hybrid refresh has benchmark coverage for lower p95 stale-window age under write-heavy workloads; the exact percentage remains benchmark-artifact scoped. |
 | **Writeback-cache safety net** | Per-inode `staged ≥ visible ≥ durable` epoch state machine, six formal invariants (I1–I6), 12-scenario crash/replay artifact gate, runtime kill switch | Kernel FUSE `writeback_cache` can reorder visibility in ways MVCC must account for. FrankenFS opts in *only* with `--rw --writeback-cache` plus three accepted-artifact gates, a matching host/lane manifest, and a disarmed kill switch. `flush` stays non-durable; `fsync` / `fsyncdir` are the durability boundaries operators reason about. |
-| **Memory safety** | `#![forbid(unsafe_code)]` at every crate root, edition 2024 (nightly), workspace-level Clippy enforcement | Removes direct use of unsafe Rust from FrankenFS crates, including the common C filesystem hazards around buffer bounds, lifetime errors, and uninitialized reads. |
-| **Structured concurrency** | [asupersync](https://github.com/Dicklesworthstone/asupersync) 0.3 instead of tokio: `Cx` capability contexts, regions, two-phase reserve/commit channels, deterministic `LabRuntime` with virtual time + DPOR | No orphan tasks. Cancellation is cooperative and budget-aware at every I/O boundary. Stress tests reproduce concurrency bugs deterministically across seeds. |
-| **Userspace FUSE** | Vendored `fuser` 7.40 with unrestricted ioctls; runs as a normal process | Debug with `gdb`, profile with `perf`, replace the binary without a reboot. No kernel module loading. No reboot-on-crash. |
+| **Memory safety** | `#![forbid(unsafe_code)]` in first-party crates, edition 2024 (nightly), workspace lint enforcement | Prohibits direct unsafe operations in those crates; soundness of vendored transport and dependencies remains part of the safety boundary. |
+| **Structured concurrency** | [asupersync](https://github.com/Dicklesworthstone/asupersync) 0.3.9: `Cx` capability contexts, regions, two-phase reserve/commit channels, deterministic `LabRuntime` | The required architecture uses structured concurrency. Current CLI/FUSE workers also use standard threads, and some repair-flush paths use `Cx::current()`. Complete explicit-context propagation and worker scoping remain implementation gaps. |
+| **Userspace FUSE** | Vendored `fuser` 0.17.0 with ABI 7.42 enabled; runs as a normal process | Debug with `gdb`, profile with `perf`, replace the binary without a reboot. Per-core transport is wired in source; that wiring alone does not establish mounted correctness or a speedup. |
 
 ---
 
@@ -101,7 +101,7 @@ This produces code that is Rust-native rather than "C with Rust syntax", and typ
 
 ### 2. No ambient authority
 
-Every I/O operation takes an `&asupersync::Cx` capability context. The `Cx` carries a poll budget, deadline, cancellation signal, and pressure feedback. No function can perform I/O, read the clock, or sleep without holding one. This enables cooperative cancellation, deadline propagation, and deterministic testing under a virtual-time lab runtime, with no global state and no hidden singletons.
+Filesystem I/O APIs generally take an `&asupersync::Cx` capability context carrying budget, deadline, and cancellation information. This supports cooperative checks where callers propagate the context and callees consult it. It is not a Rust type-system prohibition on standard-library I/O, clocks, or threads. Ambient `Cx::current()` use in repair-flush notification and standard-thread workers remain gaps against the canonical explicit-context and structured-concurrency requirements.
 
 ### 3. Proof over heuristic
 
@@ -127,9 +127,9 @@ Public readiness assertions are tied to machine-readable artifacts:
 - Public serialized `ffs-harness` report schemas (release-gate, writeback-cache audit, ordering oracle, crash-replay oracle, repair confidence, repair corpus, soak/canary, swarm tail latency, fuzz dashboard, mounted-lane decision, ...) are snapshot-pinned with `insta` against a checked-in schema inventory, and a drift detector catches silent shape changes. Crate-local human-output snapshots and exact-golden tests are tracked at their own test surfaces instead of being forced into that JSON schema inventory.
 - Every checksum, parser, and reporting surface has metamorphic-relation proptests.
 
-### 6. Zero unsafe, always
+### 6. Unsafe forbidden in first-party crates
 
-`#![forbid(unsafe_code)]` is set at every crate root and enforced as a workspace lint. There are no exceptions and no plans for exceptions. The performance cost is negligible: FUSE round-trip overhead (~10µs) dominates any bounds-check overhead (~1ns).
+`#![forbid(unsafe_code)]` and the workspace lint prohibit unsafe Rust in first-party crates. `vendor/fuser` is excluded from that workspace lint and contains unsafe transport/FFI code; dependencies and the kernel remain part of the overall safety boundary. This policy does not prove absence of logical corruption or dependency vulnerabilities.
 
 ---
 
@@ -155,7 +155,7 @@ Public readiness assertions are tied to machine-readable artifacts:
 
 | Project | Scope | Difference from FrankenFS |
 |---|---|---|
-| **Servo `rust-fuse`** (`fuser` upstream) | A FUSE protocol binding | Lower-level. FrankenFS *uses* a vendored `fuser` at ABI 7.40 as its FUSE transport. |
+| **Servo `rust-fuse`** (`fuser` upstream) | A FUSE protocol binding | Lower-level. FrankenFS uses a vendored `fuser` 0.17.0 with ABI 7.42 enabled as its FUSE transport. |
 | **`bento`** | Rust-in-kernel filesystem framework | Kernel-level, requires kernel build; FrankenFS is userspace |
 | **`gotenks`** | Pedagogical Rust ext-style filesystem | Custom on-disk format; FrankenFS preserves the real ext4/btrfs format and is mount-compatible |
 | **`rfs`** / `rsfs` | Filesystem-on-flat-file projects | Custom formats; no on-disk compatibility |
@@ -180,7 +180,7 @@ To avoid wasted reading, here is what this project is explicitly **not** trying 
 
 ## Architecture
 
-FrankenFS is a 21-crate Cargo workspace with a strict DAG dependency graph.
+FrankenFS is a 22-member Cargo workspace: 21 crates under `crates/` and the `tools/ffs-ops` operational CLI, with an acyclic dependency graph.
 
 ```
 Layer 1 (Foundation):  [ffs-types]  [ffs-error]
@@ -215,7 +215,7 @@ Legacy extraction reference (retained, not on the runtime path):
 | **Storage** | `ffs-block`, `ffs-journal`, `ffs-mvcc` | Block I/O with ARC / S3-FIFO cache; JBD2 replay + ext4 fast-commit + external-journal pairing; native MVCC with version chains, sharded store, snapshot isolation, two same-block merge mechanisms behind semantic proof labels, three conflict policies, Zstd/Brotli version compression, WAL persistence + recovery |
 | **Tree / Alloc** | `ffs-btree`, `ffs-alloc`, `ffs-extent`, `ffs-btrfs` | B+tree search/insert/split/merge; mballoc-style buddy allocator with goal-directed placement and Orlov directory spreading; ext4 extent mapping; btrfs runtime tree walk, chunk/device mapping, tree-log replay, COW tree mutation helpers, and delayed-ref helpers consumed by `ffs-core` |
 | **Namespace** | `ffs-inode`, `ffs-dir`, `ffs-xattr` | Inode lifecycle with CRC32C checksum, htree directories with case-folding, user/system/security/trusted xattr namespaces |
-| **Interface** | `ffs-fuse`, `ffs-core`, `ffs` | FUSE protocol adapter (vendored `fuser` 7.40); `OpenFs` implementation of `FsOps` orchestrating format detection, mount, writeback epoch barrier, degradation FSM, backpressure gates; thin public facade |
+| **Interface** | `ffs-fuse`, `ffs-core`, `ffs` | FUSE protocol adapter (vendored `fuser` 0.17.0, ABI 7.42); `OpenFs` implementation of `FsOps` orchestrating format detection, mount, writeback epoch barrier, degradation FSM, backpressure gates; thin public facade |
 | **Repair** | `ffs-repair` | RaptorQ symbol generation/recovery, background `ScrubDaemon`, Bayesian `DurabilityAutopilot`, four refresh policies, stale-window SLO with breach detection, optimistic lease-based multi-host coordination, 23-event evidence ledger, repair-writeback serializer for read-write mounted repair |
 | **Tooling** | `ffs-cli`, `ffs-tui`, `ffs-harness` | 11-subcommand CLI; live TUI monitoring; conformance harness with sparse fixtures, golden-file validation, parity tracking, proof-bundle validation, performance manifests, schema inventory, metamorphic seed catalog, soak/canary campaign runner, release-gate validator |
 
@@ -228,7 +228,7 @@ Legacy extraction reference (retained, not on the runtime path):
 - **Repair is orthogonal.** `ffs-repair` operates on blocks, not files. It doesn't know about inodes or directories.
 - **Repair wiring is lifecycle-based.** `ffs-core` reaches repair via `ffs-mvcc` / block-flush integration rather than a direct `ffs-core → ffs-repair` dependency edge.
 - **No dependency cycles.** The crate graph is a strict DAG, enforced by `cargo check`.
-- **`Cx` everywhere.** Any operation that performs I/O or may block takes `&asupersync::Cx` as its first parameter.
+- **Explicit `Cx` is the target boundary.** Filesystem operations accept `&asupersync::Cx`; ambient-context and standard-thread paths still need migration to meet this requirement throughout.
 
 ---
 
@@ -507,7 +507,7 @@ E[loss_strict]      = conflict_rate · abort_cost
 E[loss_safe_merge]  = P(corruption) · severity + conflict_rate · (1 − merge_success_rate) · abort_cost
 ```
 
-Three EMA-smoothed metrics drive the decision: `conflict_rate`, `merge_success_rate`, `abort_rate`. During a configurable warmup (default 50 commits) the system defaults to SafeMerge; afterwards the Adaptive policy selects whichever strategy has the lower expected loss. Under a 120-writer stress benchmark where test code explicitly stages merge proofs, SafeMerge achieves **9.5× lower expected loss than Strict with no corruptions observed in that run**. The FUSE write path does not yet derive real merge proofs (tracked: bd-xuo95.28), so production writes currently use `MergeProof::Unsafe` and do not benefit from safe-merge until this is wired in.
+Three EMA-smoothed metrics drive the decision: `conflict_rate`, `merge_success_rate`, `abort_rate`. During a configurable warmup (default 50 commits) the system defaults to SafeMerge; afterwards the Adaptive policy selects whichever strategy has the lower expected loss. A historical 120-writer stress benchmark with explicit merge proofs reported **9.5× lower expected loss than Strict with no corruptions observed in that run**. Selected ext4 write paths now call `stage_write_with_proof` with range or disjoint-block evidence. This is implemented integration, not evidence that mounted workloads achieve the benchmark result; unresolved conflicts still fall back to rejection.
 
 ### Sharded store for high concurrency
 
@@ -669,7 +669,7 @@ pub trait BlockDevice: Send + Sync {
 }
 ```
 
-The canonical concrete `ByteDevice` is `FileByteDevice`, which `OpenFs::open` constructs from a path. Every call takes `&Cx`, enabling cooperative cancellation and budget tracking at the lowest I/O layer. A companion `VectoredBlockDevice` trait adds scatter/gather with a default scalar implementation.
+The canonical concrete `ByteDevice` is `FileByteDevice`, which `OpenFs::open` constructs from a path. Device I/O trait methods accept `&Cx` for cooperative cancellation and budget checks; constructors and standard-library I/O are not universally context-bound. A companion `VectoredBlockDevice` trait adds scatter/gather with a default scalar implementation.
 
 ### Aligned buffers
 
@@ -746,7 +746,9 @@ Replay is idempotent. V2/V3 checksums (CRC32C with optional UUID-seed) are verif
 
 ### Ext4 fast-commit replay
 
-`replay_fast_commit()` parses fast-commit tag streams, buffers operations until the `TAIL` commit, and forces fallback when the stream is truncated. Committed FC operations are processed after JBD2 replay: `Create` / `Link` / `Unlink` / `AddRange` / `DelRange` are logged as observational evidence (JBD2 provides the authoritative block-level recovery); `InodeUpdate` triggers a verification read.
+`replay_fast_commit()` parses tag streams and buffers operations until `TAIL`. After JBD2 replay, `OpenFs` applies the supported committed inode, directory-entry, and extent operations and verifies the final range mappings. Unsupported operations and inconsistent targets fail the open instead of being logged as successful recovery. A malformed tail following committed operations also fails recovery when equivalent JBD2 recovery has not been established.
+
+`SimulateOverlay` recovers into a private overlay and leaves the base image unchanged; `Skip` is diagnostic and does not provide a recovered view. The implementation covers bounded inline-extent and coordinated external-extent paths, not full ext4 fast-commit compatibility. Independent kernel/e2fsck recovery certification remains pending (`bd-9m84h`).
 
 ### External-journal pairing
 
@@ -769,14 +771,14 @@ The native WAL in `ffs-mvcc`:
 
 ## Deep Dive: Structured Concurrency with asupersync
 
-FrankenFS uses [`asupersync`](https://github.com/Dicklesworthstone/asupersync) 0.3 for all async and concurrent operations. The design requires properties tokio cannot provide.
+FrankenFS requires [`asupersync`](https://github.com/Dicklesworthstone/asupersync) and currently declares version 0.3.9. Core filesystem APIs are synchronous and context-aware; standard-thread workers remain alongside runtime-managed tasks. Full structured ownership and cancellation propagation are required integration work.
 
 ### Why not tokio?
 
 | Requirement | asupersync | tokio |
 |---|---|---|
 | Structured concurrency (no orphan tasks) | `create_root_region` + `create_task` | Manual `JoinSet` management |
-| Cooperative cancellation via capability context | `&Cx` threaded through all calls | `CancellationToken` (opt-in, not universal) |
+| Cooperative cancellation via capability context | Explicit `&Cx` APIs; propagation incomplete in some current paths | `CancellationToken` (opt-in, not universal) |
 | Cancel-correct channels (no data loss on cancel) | Two-phase `reserve()` / `send()` | `send()` can lose data on cancel |
 | Deterministic testing | `LabRuntime` with virtual time + DPOR | Non-deterministic executor |
 | Budget-aware operations | `Cx::budget()` with poll quotas | No built-in budget mechanism |
@@ -785,14 +787,14 @@ The entire `tokio`/`hyper`/`reqwest`/`axum`/`async-std`/`smol` ecosystem is forb
 
 ### Capability context (`Cx`)
 
-Every I/O operation takes `&Cx` as its first parameter. The `Cx` carries:
+Context-aware filesystem operations accept `&Cx`. The context carries:
 
 - **Budget.** Remaining poll quota and deadline; enables cooperative yielding.
 - **Cancellation.** Checked at every `cx.checkpoint()`; propagates cancel through the call stack.
-- **Deadline.** Operations automatically fail if the deadline expires.
+- **Deadline.** Context checks can report expiry; blocking calls are not automatically preempted.
 - **Pressure.** System pressure feedback for backpressure-aware algorithms.
 
-There is no way to fabricate a `Cx` without an explicit grant from the runtime.
+Library examples use `Cx::for_request()`; tests can construct contexts with explicit budgets. These constructors do not by themselves establish ownership by a structured runtime region.
 
 ### Deterministic lab runtime
 
@@ -1015,7 +1017,7 @@ btrfs uses copy-on-write B-trees addressed by logical block addresses that must 
 2. **Chunk lookup.** Find the chunk entry whose `[key.offset, key.offset + length)` range contains the target logical address.
 3. **Stripe calculation.** For single-device images, `physical = stripe.offset + (logical - chunk.key.offset)`.
 
-For RAID profiles (single, DUP, RAID0, RAID1, RAID5, RAID6, RAID10), stripe calculation accounts for stripe width, sub-stripe interleaving, and mirror selection. `BtrfsDeviceSet` dispatches across multi-device sets with mirror fallback.
+Standalone RAID mapping and `BtrfsDeviceSet` helpers cover stripe calculations and mirror fallback. The mounted core path still calls the single-device `map_logical_to_physical` mapper, which rejects profiles other than Single/Dup. Helper coverage does not establish mounted multi-device read/write support.
 
 ### Tree walk algorithm
 
@@ -1150,9 +1152,9 @@ Three metric types, all lock-free atomic:
 
 ## Deep Dive: The `Cx` Capability Context
 
-Almost every Rust async ecosystem uses ambient authority somewhere: a global executor, an implicit current task, a built-in clock. `asupersync`, and therefore FrankenFS, eliminates ambient authority by passing an explicit `Cx` capability into every call that might block or time out.
+FrankenFS's target architecture passes explicit `Cx` capabilities through operations that can block or time out. Current propagation is incomplete: repair-flush notification can consult `Cx::current()`, and CLI/FUSE lifecycle code uses standard threads and clocks. Those paths require further integration before an ambient-authority-free runtime can be claimed.
 
-**Important:** FrankenFS itself is **synchronous Rust**. The `Cx` is a capability handle, not a future-driven runtime. Functions take `&Cx` and return `Result<T, FfsError>` directly; the cooperative yield point is the explicit `cx.checkpoint()` call. The async runtime primitives (region scoping via `runtime.state.create_root_region` / `create_task`, two-phase `reserve()`/`send()` channels, `LabRuntime`) live in the upstream `asupersync` crate; FrankenFS uses them only at the outermost runtime boundary (mainly in the `ffs-fuse` session loop and in tests).
+**Important:** The public filesystem API is **synchronous Rust**. `Cx` is a capability handle; functions return results directly, and explicit checkpoints consult cancellation and budgets. A synchronous checkpoint is not an async scheduler yield. The runtime also exposes regions, task scheduling, channels, and `LabRuntime`; using them in selected paths does not establish structured ownership of every CLI/FUSE worker.
 
 ### What's inside a `Cx` (conceptual model)
 
@@ -1167,11 +1169,11 @@ The exact field layout lives in the `asupersync` crate and is private; what call
 | **Waker** | `cx.waker()` | The underlying task waker; rarely used by application code. |
 | **Pressure** | `SystemPressure` observer | Backpressure feedback for adaptive batch sizing. |
 
-The `Cx` is **borrowed, not owned**. A function signature `fn read_block(&self, cx: &Cx, …)` literally cannot store the `Cx` past its callsite, so no background work can outlive the region that produced the context.
+Filesystem methods generally borrow `Cx`. Rust checks the lifetime of that reference; the signature alone does not prove that background workers are region-scoped or that standard-library side effects use the context. Worker ownership and cancellation must be checked separately.
 
 ### Why this matters for a filesystem
 
-1. **No accidental I/O in pure functions.** `Ext4Superblock::parse_from_bytes(&[u8])` cannot perform I/O because there is no `&Cx` in its signature. The Rust type system prevents the bug.
+1. **Pure parser convention.** `Ext4Superblock::parse_superblock_region(&[u8])` parses supplied bytes without I/O. Source review and tests protect this boundary; absence of a `Cx` parameter does not itself prohibit standard-library I/O.
 2. **Cancellation is universal.** When the FUSE layer cancels a request (kernel interrupt), every nested call sees the cancel at its next `checkpoint()`.
 3. **Deadlines compose.** A FUSE callback can install a 5-second deadline; a sub-operation can derive a tighter 1-second context; the lower limit wins.
 4. **Determinism in tests.** Under `LabRuntime`, every `Cx` checkpoint is a DPOR scheduling point. The runtime can reorder operations across these points to explore alternative schedules, making concurrency bugs reproducible across seeds.
@@ -1180,14 +1182,18 @@ The `Cx` is **borrowed, not owned**. A function signature `fn read_block(&self, 
 ### Common patterns (sync, as used in FrankenFS)
 
 ```rust
-use asupersync::{Cx, Budget};
+use asupersync::Cx;
+use ffs_block::BlockDevice;
 use ffs_error::FfsError;
+use ffs_types::BlockNumber;
 
-// Tight inner loop with cooperative checkpoints
-fn flush_batch(cx: &Cx, blocks: &[BlockNumber]) -> Result<(), FfsError> {
+// Verify readability in batches with cooperative checkpoints.
+fn read_batch(cx: &Cx, device: &dyn BlockDevice, blocks: &[BlockNumber]) -> Result<(), FfsError> {
     let target_batch = if cx.budget().poll_quota < 256 { 8 } else { 64 };
     for chunk in blocks.chunks(target_batch) {
-        flush_chunk(cx, chunk)?;
+        for &block in chunk {
+            let _ = device.read_block(cx, block)?;
+        }
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
     }
     Ok(())
@@ -1195,14 +1201,13 @@ fn flush_batch(cx: &Cx, blocks: &[BlockNumber]) -> Result<(), FfsError> {
 
 // Test contexts have explicit budgets and deadlines
 #[cfg(test)]
-fn cx_with_short_deadline() -> Cx {
-    let deadline = asupersync::types::Time::now()
-        + asupersync::types::Duration::from_secs(1);
-    Cx::for_testing_with_budget(Budget::new().with_deadline(deadline))
+fn cx_with_expired_deadline() -> Cx {
+    let budget = asupersync::Budget::new().with_deadline(asupersync::types::Time::ZERO);
+    Cx::for_testing_with_budget(budget)
 }
 ```
 
-The asupersync async primitives (region scoping via `create_root_region` + `create_task`, two-phase `sender.reserve(cx).await` then `.send(value)` for cancel-correct channels) exist in the runtime and are used by the async parts of `ffs-fuse` (the FUSE session loop) and `asupersync` itself, but FrankenFS application code is synchronous.
+The asupersync runtime provides regions, task scheduling, and cancellation-aware channels. Public filesystem methods remain synchronous; inspect each background worker's ownership and checkpoint wiring before attributing runtime guarantees to it.
 
 ### How `Cx` interacts with FUSE
 
@@ -1213,7 +1218,7 @@ The FUSE adapter (`ffs-fuse`) is the *root* of every `Cx` chain on the mount pat
 - Cancel hook installed for kernel interrupts.
 - Pressure observer linked to the dirty-cache watermark.
 
-Every downstream call (read, write, lookup, repair, GC, scrub) receives this `Cx` or a derived sub-context. When the kernel-side request is cancelled, every nested operation observes the cancel within one `checkpoint()`.
+Downstream filesystem calls receive the request context, but separate scrub/GC workers and ambient repair-flush notification paths need their own lifecycle review. An operation observes cancellation when it checks the corresponding context; this is not a bound on time spent inside blocking I/O or code between checkpoints.
 
 ---
 
@@ -1221,12 +1226,12 @@ Every downstream call (read, write, lookup, repair, GC, scrub) receives this `Cx
 
 Why this codebase looks the way it does. These are the load-bearing design decisions; everything else is a consequence.
 
-### Decision 1: 21 small crates, not 3 big ones
+### Decision 1: Separate domain crates
 
-The natural alternative would be `ffs-core` (everything), `ffs-fuse` (FUSE adapter), `ffs-cli` (CLI). We chose 21 small crates with a strict DAG instead. The reasons:
+The workspace separates domain libraries from the FUSE adapter and CLI. It currently has 22 members, including `tools/ffs-ops`. The reasons:
 
-1. **Pure parser isolation.** Without `ffs-ondisk` as its own crate, accidental I/O in a parser path becomes possible. Crate boundaries are the only universally-enforced "no `Cx`, no I/O" boundary.
-2. **Test parallelism.** `cargo test --workspace` can compile and run 21 test suites in parallel; the same code in three big crates would serialize.
+1. **Pure parser isolation.** `ffs-ondisk` isolates byte parsing from device I/O, making the boundary easier to review and test.
+2. **Independent testing.** Domain crates can be compiled and tested separately; Cargo schedules eligible build work in parallel.
 3. **Targeted CI.** A PR that only touches `ffs-extent` doesn't need to recompile `ffs-fuse`.
 4. **Public-API surface.** The `ffs` facade re-exports only what's stable. Internal crate APIs can change freely.
 5. **Fuzz target boundaries.** Each fuzz target imports a specific crate's API, providing structural input-space scoping.
@@ -1269,12 +1274,12 @@ Every "should I do X or Y?" decision in FrankenFS could be a tuned constant. We 
 
 The cost is more code per decision (one model per knob) and the cognitive overhead of reading Bayesian posterior updates instead of an `if rate > 0.8`. The benefit is auditable, principled behavior.
 
-### Decision 6: `#![forbid(unsafe_code)]` everywhere
+### Decision 6: `#![forbid(unsafe_code)]` in first-party crates
 
-The bug class most likely to corrupt a filesystem in kernel C is the bug class Rust's safety model eliminates. We forbid unsafe entirely instead of restricting it to "audited" islands, because:
+We forbid unsafe Rust in first-party workspace crates. This is a compiler-enforced boundary for our code, not the vendored transport or dependencies. The reasons:
 
 - An audited island is a moving target. The audit decays as code changes around it.
-- The performance cost is negligible for a FUSE filesystem (FUSE round-trip is ~10 µs; bounds checks are ~1 ns).
+- Safe implementations keep local safety reasoning tractable; performance still requires workload-specific measurement.
 - It's verifiable by the compiler, which is the cheapest possible audit.
 
 The cost: we can't use SIMD intrinsics directly; we rely on third-party safe crates (e.g., BLAKE3's SIMD path is wrapped in safe Rust by the upstream `blake3` crate).
@@ -1290,7 +1295,7 @@ The cost is a 94-KB spec document that has to stay current. The benefit is that 
 
 ### Decision 8: Vendor a `fuser` patch
 
-The crates.io `fuser` 0.17 does not expose ABI 7.40 features (unrestricted ioctls, certain modern operations) needed for full FrankenFS parity. We ship the patch in `vendor/fuser` and apply it via `[patch.crates-io]`. This:
+We ship `fuser` 0.17.0 in `vendor/fuser`, apply it via `[patch.crates-io]`, and enable ABI 7.42. Local transport extensions include ioctls and per-core workers. This:
 
 - Keeps the upstream crate name (`fuser`) intact in `Cargo.toml`.
 - Lets us submit upstream PRs without forking the project's identity.
@@ -2059,20 +2064,23 @@ Set `ConflictPolicy::Adaptive` in your library-mode embedder (CLI does not yet e
 
 ### Storage engine research
 
-A database engineer wants to prototype a new B-tree algorithm against real ext4-format blocks without writing a kernel module. The `ffs-btree` and `ffs-extent` crates provide ext4-compatible structures with `Cx`-aware async APIs:
+A database engineer can inspect real ext4/btrfs images through the synchronous public facade without writing a kernel module:
 
 ```rust
 use asupersync::Cx;
-use ffs::{OpenFs, MountConfig};
+use ffs::OpenFs;
+use ffs_types::InodeNumber;
+use std::path::Path;
 
-async fn experiment(cx: &Cx, image: &Path) -> anyhow::Result<()> {
-    let fs = OpenFs::open(cx, image, MountConfig::default()).await?;
-    // walk extents, capture metrics, ...
+fn experiment(cx: &Cx, image: &Path) -> anyhow::Result<()> {
+    let fs = OpenFs::open(cx, image)?;
+    let root = fs.getattr(cx, InodeNumber(1))?;
+    println!("root inode {:?}: {} bytes", root.ino, root.size);
     Ok(())
 }
 ```
 
-Library consumers depend only on the `ffs` facade crate; the FUSE layer is optional.
+Use `ffs` for the core facade and direct dependencies for types named in your code (`asupersync`, `ffs-types`, and `anyhow` above). The FUSE layer is optional. Low-level block, repair, and on-disk APIs live in their respective crates rather than `ffs::repair` or `ffs::ondisk` modules.
 
 ### Container / read-only root with self-healing
 
@@ -2231,22 +2239,19 @@ Neither walkthrough requires production-readiness wording or release-gate ACK; b
 
 ## API Cookbook (Rust)
 
-The `ffs` facade crate re-exports the public surface of `ffs-core` (`pub use ffs_core::*;`). The FrankenFS public API is **synchronous Rust**: functions take `&asupersync::Cx` for budget, deadline, and cancellation, but they return `Result<T, FfsError>` directly. No `async fn`, no `.await`. Internally, `Cx::checkpoint()` is the cooperative yield point and lets the surrounding runtime schedule other work.
+The `ffs` facade crate re-exports the public surface of `ffs-core` (`pub use ffs_core::*;`). The filesystem API is **synchronous Rust**: functions accept `&asupersync::Cx` for budget, deadline, and cancellation checks and return results directly. A synchronous `Cx::checkpoint()` consults the context; it does not itself yield an async task. Examples using other crate types require the corresponding direct dependencies.
 
 ### 1. Open an image and walk the root directory
 
 ```rust
 use anyhow::Result;
 use asupersync::Cx;
-use ffs::{OpenFs, FfsError};
+use ffs::OpenFs;
 use ffs_types::InodeNumber;
 use std::path::Path;
 
-// ext4 root inode is always 2 by convention; btrfs root also resolves
-// to inode 2 through the convenience layer. InodeNumber is a tuple
-// newtype around u64; the field is pub so the tuple constructor works
-// in const context.
-const ROOT_INO: InodeNumber = InodeNumber(2);
+// The VFS root alias is inode 1 for both formats; the on-disk roots differ.
+const ROOT_INO: InodeNumber = InodeNumber(1);
 
 fn list_root(image: &Path) -> Result<()> {
     let cx = Cx::for_request();
@@ -2273,8 +2278,11 @@ The convenience layer (`getattr`, `readdir`, `lookup`, `read`, etc.) flavor-disp
 ### 2. Read a specific file by path
 
 ```rust
-use ffs::vfs::RequestScope;
+use anyhow::Result;
+use asupersync::Cx;
+use ffs::OpenFs;
 use std::ffi::OsStr;
+use std::path::Path;
 use ffs_types::InodeNumber;
 
 // Format-agnostic version: walk path components via FsOps::lookup,
@@ -2283,14 +2291,15 @@ fn cat_file(image: &Path, path: &str) -> Result<Vec<u8>> {
     let cx = Cx::for_request();
     let fs = OpenFs::open(&cx, image)?;
 
-    let mut ino = InodeNumber(2);  // both flavors expose root as inode 2
+    let mut ino = InodeNumber(1); // format-independent VFS root alias
     for component in path.trim_start_matches('/').split('/').filter(|s| !s.is_empty()) {
         let attr = fs.lookup(&cx, ino, OsStr::new(component))?;
         ino = attr.ino;
     }
 
-    let attr  = fs.getattr(&cx, ino)?;
-    let bytes = fs.read(&cx, ino, 0, attr.size as u32)?;
+    let attr = fs.getattr(&cx, ino)?;
+    let size = u32::try_from(attr.size)?; // reject files exceeding this single-read API
+    let bytes = fs.read(&cx, ino, 0, size)?;
     Ok(bytes)
 }
 ```
@@ -2300,7 +2309,11 @@ fn cat_file(image: &Path, path: &str) -> Result<Vec<u8>> {
 ### 3. Mount via the library API (blocking)
 
 ```rust
+use anyhow::Result;
+use asupersync::Cx;
+use ffs::OpenFs;
 use ffs_fuse::{mount, MountOptions, WritebackCacheMode};
+use std::path::Path;
 
 fn run_mount(image: &Path, mountpoint: &Path) -> Result<()> {
     let cx = Cx::for_request();
@@ -2341,9 +2354,11 @@ Programmatic usage means assembling a `ScrubWithRecovery<'a, W>` pipeline (with 
 ### 5. Iterate the evidence ledger
 
 ```rust
-use ffs::repair::{EvidenceRecord, EvidenceEventType};
+use anyhow::Result;
+use ffs_repair::evidence::{EvidenceRecord, EvidenceEventType};
 use std::fs::File;
 use std::io::{BufRead, BufReader};
+use std::path::Path;
 
 fn count_corruptions(path: &Path) -> Result<usize> {
     let reader = BufReader::new(File::open(path)?);
@@ -2369,14 +2384,18 @@ Note: `EvidenceEventType` variants are `CamelCase` in Rust, and serde-rename to 
 ### 6. `Cx` budget and deadline (synchronous capability)
 
 ```rust
-use asupersync::{Cx, Budget};
-use ffs::FfsError;
+use asupersync::Cx;
+use ffs::OpenFs;
+use ffs_error::FfsError;
+use ffs_types::InodeNumber;
 
-fn budgeted_work(cx: &Cx) -> Result<(), FfsError> {
+fn budgeted_work(cx: &Cx, fs: &OpenFs, inodes: &[InodeNumber]) -> Result<(), FfsError> {
     // Inspect the budget before launching a batch.
     let target_batch = if cx.budget().poll_quota < 256 { 8 } else { 64 };
-    for chunk in (0..1024_u64).step_by(target_batch) {
-        do_chunk(cx, chunk)?;
+    for chunk in inodes.chunks(target_batch) {
+        for &ino in chunk {
+            println!("{:?}", fs.getattr(cx, ino)?);
+        }
         // Cooperative yield + cancellation point.
         // Returns Err if cancelled or the deadline expired.
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
@@ -2388,24 +2407,23 @@ fn budgeted_work(cx: &Cx) -> Result<(), FfsError> {
 fn with_test_deadline_cx() -> Cx {
     // Budget builder for tests: an explicitly-expired or short-deadline Cx,
     // matching the real pattern in crates/ffs-block/src/lib.rs.
-    let expired_budget = Budget::new().with_deadline(asupersync::types::Time::ZERO);
+    let expired_budget = asupersync::Budget::new().with_deadline(asupersync::types::Time::ZERO);
     Cx::for_testing_with_budget(expired_budget)
 }
 ```
 
-The full asupersync runtime surface (region scoping via `runtime.state.create_root_region` + `create_task`, two-phase `sender.reserve(cx).await` then `.send(value)` channels, the `LabRuntime` with virtual time + DPOR) lives in the upstream crate. FrankenFS itself is synchronous code that *uses* `Cx` for cancellation and budget but does not spawn async tasks from filesystem code paths. Async primitives are only invoked at the runtime root (e.g., the `ffs-fuse` session loop and `LabRuntime`-based stress tests).
+The asupersync runtime exposes region scoping, task creation, two-phase channels, and `LabRuntime`. The synchronous API above demonstrates context checks only. Current standard-thread workers and ambient-context paths still need integration to meet the canonical structured-concurrency requirement.
 
 ### 7. Direct on-disk parsing (no I/O)
 
 ```rust
-use ffs::ondisk::ext4::Ext4Superblock;
+use anyhow::{Context, Result};
+use ffs_ondisk::Ext4Superblock;
 
 fn parse_superblock(image_bytes: &[u8]) -> Result<Ext4Superblock> {
     // ext4 superblock lives at offset 1024 and is 1024 bytes wide.
-    // `parse_from_bytes` also takes the group-descriptor size hint
-    // (default 32 for classic ext4, 64 with the 64-bit feature).
-    let desc_size: u16 = 32;
-    Ext4Superblock::parse_from_bytes(&image_bytes[1024..2048], desc_size).map_err(Into::into)
+    let region = image_bytes.get(1024..2048).context("image is shorter than its ext4 superblock")?;
+    Ext4Superblock::parse_superblock_region(region).map_err(Into::into)
 }
 ```
 
@@ -2461,44 +2479,44 @@ sudo gdb -p <pid>
 (gdb) thread apply all bt
 ```
 
-Because FrankenFS runs in userspace, no kernel-debugger setup is needed; standard `gdb` works on the live mount process. The `tracing` spans surface in `gdb` thread names when `tokio_console` style instrumentation is enabled (off by default).
+Because FrankenFS runs in userspace, no kernel-debugger setup is needed; standard `gdb` works on the live mount process. Inspect `tracing` output separately from debugger thread names; this project does not use `tokio_console`.
 
 ### Reproducing a stress-test failure deterministically
 
-The real `LabRuntime` pattern is synchronous: build a runtime with a seed, create a root region with a `Budget`, run synchronous code that uses `Cx::checkpoint()` as the scheduling point, then drain the runtime.
+To schedule a task in `LabRuntime`, create a root region and task, explicitly schedule the task, then drain the runtime. This small example verifies that an MVCC write actually ran; it does not reproduce the 120-writer safe-merge benchmark.
 
 ```rust
-// In a #[test] using LabRuntime (canonical shape from
-// crates/ffs-mvcc/tests/mvcc_stress_suite.rs).
 use asupersync::lab::{LabRuntime, LabConfig};
-use asupersync::{Budget, yield_now};
+use asupersync::Budget;
+use ffs_mvcc::sharded::ShardedMvccStore;
+use ffs_types::BlockNumber;
+use std::sync::Arc;
 
 #[test]
-fn reproduce_safe_merge_120_writers() {
+fn lab_task_commits_a_block() {
     let seed = 0xDEADBEEF_u64;
-    let mut runtime = LabRuntime::new(LabConfig::new(seed).max_steps(4_000_000));
-    let region    = runtime.state.create_root_region(Budget::INFINITE);
-    let store     = std::sync::Arc::new(ffs_mvcc::ShardedMvccStore::new(8));
-
-    for writer_id in 0..120_u64 {
-        let store = store.clone();
-        runtime
-            .state
-            .create_task(region, Budget::INFINITE, async move {
-                for op in 0..300_u64 {
-                    yield_now().await;     // cooperative scheduling point
-                    let mut txn = store.begin();
-                    // ... stage writes, attach merge proofs, commit ...
-                    let _ = store.commit(txn);
-                }
-            });
-    }
-
+    let mut runtime = LabRuntime::new(LabConfig::new(seed).max_steps(1_000));
+    let region = runtime.state.create_root_region(Budget::INFINITE);
+    let store = Arc::new(ShardedMvccStore::new(8));
+    let writer = Arc::clone(&store);
+    let (task_id, _handle) = runtime
+        .state
+        .create_task(region, Budget::INFINITE, async move {
+            let mut txn = writer.begin();
+            txn.stage_write(BlockNumber(7), vec![42; 16]);
+            writer.commit(txn).expect("commit block");
+        })
+        .expect("create task");
+    runtime.scheduler.lock().schedule(task_id, 0);
     runtime.run_until_quiescent();
+    assert_eq!(
+        store.read_visible(BlockNumber(7), store.current_snapshot()),
+        Some(vec![42; 16])
+    );
 }
 ```
 
-The same seed produces the same DPOR exploration order, the same task interleavings, and the same merge-proof commit sequence. A failure observed at seed `0xDEADBEEF` reproduces locally with `cargo test reproduce_safe_merge_120_writers`. The existing stress tests live under `crates/ffs-mvcc/tests/mvcc_stress_suite.rs`.
+The same seed and test configuration support repeatable lab scheduling. The actual concurrent workloads, conflict checks, and schedule coverage live in `crates/ffs-mvcc/tests/mvcc_stress_suite.rs`; run that integration-test target to exercise them. This one-task example makes no concurrency or DPOR coverage claim.
 
 ### Reading evidence post-mortem
 
@@ -2626,7 +2644,7 @@ A short tour of the repository layout, for anyone cloning the source and wonderi
 
 ```
 frankenfs/
-├── Cargo.toml                  Workspace root (21 members, [patch.crates-io] for vendored fuser)
+├── Cargo.toml                  Workspace root (22 members, [patch.crates-io] for vendored fuser)
 ├── Cargo.lock
 ├── README.md                   This file
 ├── CHANGELOG.md                Capability-area changelog (3,448 commits, 2026-02-09 → 2026-05-18)
@@ -2682,8 +2700,9 @@ frankenfs/
 │   ├── flamegraph_generate.sh  Flamegraph workflow
 │   ├── run_e2e.sh              E2E suite orchestrator
 │   ├── update-goldens.sh       Regenerate golden outputs (use with care)
-│   └── e2e/                    121 tracked E2E gate scripts (one per scenario)
+│   └── e2e/                    125 tracked E2E scripts (2026-09-08 inventory, not execution evidence)
 │
+├── tools/ffs-ops/              Operational CLI (the 22nd workspace member)
 ├── benchmarks/                 Saved baseline JSON manifests
 ├── baselines/                  Historical baseline archive
 ├── profiles/                   Flamegraph SVGs + perf records
@@ -2691,7 +2710,7 @@ frankenfs/
 │
 ├── docs/                       Design docs, manifests, runbooks, reports
 ├── security/                   adversarial_image_threat_model.json
-├── vendor/                     vendor/fuser pinned to ABI 7.40 via [patch.crates-io]
+├── vendor/                     vendor/fuser with ABI 7.42 enabled via [patch.crates-io]
 ├── .beads/                     issues.jsonl (source-aware tracker state; counts move with each close)
 ├── beads_compliance_audit/     Cross-pass bead-completion audit artifacts
 └── ci-artifacts/               CI run outputs
@@ -2705,6 +2724,7 @@ frankenfs/
 | `ffs-tui` | `ffs-tui` | Live TUI dashboard |
 | `ffs-demo` | `ffs-repair` (`src/bin/ffs-demo.rs`) | Self-healing adoption-wedge demo |
 | `ffs-harness` | `ffs-harness` | Conformance + proof-bundle validation tool |
+| `ffs-ops` | `tools/ffs-ops` | Operational validation commands |
 
 ---
 
@@ -2842,7 +2862,7 @@ These items are surfaced via the proof-bundle release-gate policy (`tests/releas
 
 | Term | Definition |
 |---|---|
-| **ABI 7.40** | The FUSE protocol version supported by the vendored `fuser` 7.40 patch; required for unrestricted ioctls. |
+| **ABI 7.42** | The FUSE protocol feature level enabled for vendored `fuser` 0.17.0 in Cargo.toml. |
 | **Adaptive policy** | A `ConflictPolicy` mode that selects between `Strict` and `SafeMerge` per commit using EMA contention metrics and an expected-loss decision rule. |
 | **ARC (Adaptive Replacement Cache)** | The Megiddo-Modha cache eviction algorithm with four lists (T1/T2/B1/B2) that auto-tunes the recency-vs-frequency split. |
 | **`asupersync`** | The structured-concurrency runtime used in place of tokio (cancel-correct channels, `Cx` capability, `LabRuntime` with virtual time + DPOR). |
@@ -2850,7 +2870,7 @@ These items are surfaced via the proof-bundle release-gate policy (`tests/releas
 | **BLAKE3** | The cryptographic Merkle-tree hash used for FrankenFS-native integrity checks; complements CRC32C used in compat mode. |
 | **Block group** | The unit of ext4 / btrfs space allocation; FrankenFS tracks repair symbols, autopilot posteriors, and refresh policies per group. |
 | **bd-rchk0.*** | The current parity-reality-check tracker prefix in `.beads/issues.jsonl`. |
-| **`Cx` (capability context)** | An `asupersync` value carrying poll budget, deadline, cancellation, and pressure feedback; required by every I/O operation. |
+| **`Cx` (capability context)** | An `asupersync` value carrying budget, deadline, and cancellation information; explicit propagation is the target, with remaining ambient-context paths. |
 | **CRC32C (Castagnoli)** | The CRC polynomial `0x1EDC6F41` used by ext4 and btrfs for metadata checksums; faster and stronger than the older Ethernet CRC32. |
 | **DPOR (Dynamic Partial Order Reduction)** | The algorithm `LabRuntime` uses to deterministically explore concurrent schedules, pruning by commutativity. |
 | **EBR (Epoch-Based Reclamation)** | The memory-reclamation strategy from `crossbeam-epoch` used to free retired MVCC versions safely. |
@@ -2894,13 +2914,13 @@ These items are surfaced via the proof-bundle release-gate policy (`tests/releas
 
 Three hard constraints, not best-effort guidelines.
 
-### Zero unsafe code
+### First-party unsafe-code ban
 
-`#![forbid(unsafe_code)]` is set at every crate root and enforced as a workspace-level Clippy lint. No buffer overflows (bounds-checked indexing). No use-after-free (ownership system). No uninitialized memory reads. No data races (`Send`/`Sync` enforced at compile time). The performance cost is negligible: FUSE protocol overhead (~10µs per round-trip) dominates any bounds-check overhead (~1ns per access).
+First-party workspace crates forbid unsafe Rust. This blocks direct unsafe operations in those crates, while relying on dependency soundness. The excluded `vendor/fuser` transport contains unsafe code and FFI; kernel and dependency defects remain possible. Memory safety also does not prevent incorrect on-disk writes, stale metadata, deadlocks, or resource exhaustion.
 
 ### No ambient authority
 
-Every I/O operation requires an explicit `&Cx` capability. Code that doesn't have a `Cx` reference cannot perform I/O, read the clock, or sleep. This prevents hidden side effects in "pure" code paths, resource leaks from forgotten cancel handlers, and accidental I/O in unit tests (test contexts have explicit budgets).
+Explicit `&Cx` propagation is the required architecture, not a complete current guarantee. Standard-library I/O, clocks, and thread creation remain callable without a `Cx`, and repair-flush notification still has an ambient-context path. Cancellation behavior depends on actual checkpoint and worker-lifecycle wiring.
 
 ### Mount-time validation
 
@@ -2932,14 +2952,14 @@ The release-gate policy treats `security.hostile_image` as a distinct, separatel
 | Submits an image that triggers infinite-loop parsing | `cx.checkpoint()` plus bounded iteration; the `LabRuntime` `max_steps` parameter caps stress-test work. |
 | Tries to leak operator host paths via report output | Adversarial path redaction in harness reports (`bd-rchk0` adversarial path redaction hardening). |
 | Submits an image that would mutate test/scratch devices outside the sandbox | Mount-time geometry / device-id validation; xfstests permissioned-lane ACK boundary is required for any device-mutating run. |
-| Tries to escape containment by exploiting unsafe FFI / `unsafe` blocks | None possible. `#![forbid(unsafe_code)]` is set at every crate root and enforced as a workspace lint. There is no `unsafe` block to exploit. |
+| Tries to escape containment by exploiting unsafe FFI / `unsafe` blocks | First-party crates forbid unsafe code; the vendored FUSE transport and dependencies contain unsafe/FFI boundaries that still require review. No blanket immunity is claimed. |
 | Tries to escalate via setuid binaries inside the image | FrankenFS is mounted as a normal user process via FUSE; setuid semantics in the image surface only when the host kernel re-evaluates them on the mounted view, which is the host's policy choice, not FrankenFS's. |
 | Tries to wedge the mount with one slow / hostile request | `BackpressureGate` + per-request deadline + `cx.checkpoint()` interleaving prevent single-request starvation. |
 
 **Trust boundaries:**
 - **Code → image bytes:** untrusted. Every parser is fuzz-validated and the on-disk format is rejected on any deviation.
 - **Code → host filesystem:** FrankenFS only reads/writes the image path, the optional external-journal path, and any explicitly-passed evidence-ledger / artifact paths. No ambient host-filesystem authority.
-- **Code → kernel FUSE protocol:** the vendored `fuser` 7.40 is in scope; kernel-side bugs in FUSE itself are out of scope (use a current kernel).
+- **Code → kernel FUSE protocol:** vendored `fuser` 0.17.0 with ABI 7.42 enabled is in scope, including its unsafe code; kernel-side bugs in FUSE itself are out of scope (use a current kernel).
 - **Code → proof-bundle artifacts:** untrusted at parse time (validators reject malformed / forged artifacts before granting "evidence accepted" status).
 - **Operator → release gates:** the release-gate policy file is the authoritative claim mapping; bypassing it via undocumented ACK strings is not supported.
 
@@ -3126,7 +3146,7 @@ Crash recovery for a committing transaction depends on which side of the WAL `fs
 
 ## E2E Test Categories
 
-The 121 tracked E2E gate scripts in `scripts/e2e/` are organized by capability area. Selected highlights, grouped by category:
+The 125 tracked E2E scripts in `scripts/e2e/` (2026-09-08 inventory) are organized by capability area. Their presence does not establish execution or passing results. Selected highlights, grouped by category:
 
 ### Conformance and baseline
 - `ffs_baseline_validation_e2e.sh`: initial conformance gate
@@ -3246,7 +3266,7 @@ FrankenFS pins a vendored copy of the `fuser` crate via `[patch.crates-io]`:
 fuser = { path = "vendor/fuser" }
 ```
 
-The patch is at ABI 7.40 and is the only mechanism by which FUSE protocol features added after the upstream crate's last release are available to FrankenFS. Specifically, the patch:
+The workspace enables ABI 7.42 on the vendored `fuser` 0.17.0 patch. The transport's implemented extensions include:
 
 - **Forwards unrestricted ioctls** to FrankenFS userspace handlers. Upstream `fuser` filters ioctls based on a built-in allow-list; for FrankenFS parity tests against `FIEMAP`, `EXT4_IOC_GETFLAGS`, `EXT4_IOC_SETFLAGS`, `EXT4_IOC_GETSTATE`, `FS_IOC_GET_ENCRYPTION_POLICY`, `FS_IOC_GET_ENCRYPTION_POLICY_EX`, `FS_IOC_GETFSUUID`, `FS_IOC_GETFSSYSFSPATH`, `BTRFS_IOC_INO_LOOKUP`, `BTRFS_IOC_DEV_INFO`, `BTRFS_IOC_GET_SUBVOL_INFO`, `FIBMAP`, `FITRIM`, etc., we need full forwarding.
 - **Exposes `splice`/`sendfile` plumbing** that newer kernels rely on for zero-copy reads.
@@ -3318,7 +3338,7 @@ cargo build --workspace
 
 ### Requirements
 
-- **Rust nightly** (edition 2024, minimum 1.85).
+- **Rust nightly** (edition 2024, declared minimum 1.95; use the pin in `rust-toolchain.toml`).
 - **Linux** (FUSE target).
 - **FUSE headers**: `sudo apt install libfuse-dev` (Debian/Ubuntu) or `sudo dnf install fuse-devel` (Fedora).
 - **fusermount3** for mount/unmount probes (`sudo apt install fuse3` / `sudo dnf install fuse3`).
@@ -3536,7 +3556,7 @@ The behavioral spec maps to a Rust crate/module structure (`PROPOSED_ARCHITECTUR
 
 ### Step 3: Idiomatic implementation
 
-Code is written from the spec, not by translating C control flow. No `goto → loop` patterns (Rust's `?` and `match` replace C's error-handling gotos). No manual memory management (`Vec` / `Box` / `Arc` replace `kmalloc`/`kfree`). No global state (`&Cx` replaces the kernel's ambient `current` task). Enum-based dispatch replaces function-pointer tables.
+Code is written from the spec, not by translating C control flow. Rust's `?` and `match` express error handling, and `Vec` / `Box` / `Arc` manage first-party allocations. Explicit `&Cx` propagation is the intended replacement for ambient authority, but current global state and ambient-context paths still require review. Enum-based dispatch replaces many function-pointer tables.
 
 ### Step 4: Conformance validation
 
@@ -3576,17 +3596,17 @@ Rows in the btrfs experimental RW contract can still be `partially supported` or
 ### What works today
 
 - **ext4.** Superblock, inode, extent header/entry, group descriptor, feature flag decoding, mount-time journal recovery (JBD2 + fast-commit + external-journal pairing), FUSE mount (RO default, experimental RW), `e2compr` read+write for gzip/LZO/none, casefold, encryption nokey mode, inline data, indirect block addressing, fallocate (KEEP_SIZE / PUNCH_HOLE / ZERO_RANGE / COLLAPSE_RANGE / INSERT_RANGE), POSIX ACL xattrs, MMP conservative rejection.
-- **btrfs.** Superblock, B-tree header, leaf item metadata, geometry validation, RAID stripe mapping (single/DUP/RAID0/1/5/6/10), FUSE mount (RO default; experimental RW with durable writeback via `btrfs_full_transaction_commit`), transparent ZLIB/LZO/ZSTD decompression, named subvolume/snapshot selection, tree-log replay, send/receive stream parsing, btrfs fallocate (KEEP_SIZE / PUNCH_HOLE / ZERO_RANGE / COLLAPSE_RANGE / INSERT_RANGE), backup superblock mirror repair, fragmentation-aware free-run reporting.
+- **btrfs.** Superblock, B-tree header, leaf item metadata, geometry validation, standalone RAID mapping helpers, single-device Single/Dup mounted mapping, FUSE mount (RO default; experimental RW with durable writeback via `btrfs_full_transaction_commit`), transparent ZLIB/LZO/ZSTD decompression, named subvolume/snapshot selection, tree-log replay, send/receive stream parsing, btrfs fallocate (KEEP_SIZE / PUNCH_HOLE / ZERO_RANGE / COLLAPSE_RANGE / INSERT_RANGE), backup superblock mirror repair, fragmentation-aware free-run reporting. Mounted multi-device RAID integration remains incomplete.
 - **MVCC.** Snapshot visibility, commit sequencing, FCW conflict detection, two same-block merge mechanisms behind semantic `MergeProof` labels, three conflict policies with adaptive expected-loss selection, EMA contention tracking, sharded concurrent store, Zstd/Brotli version compression, WAL persistence + crash recovery, SSI two-edge rw-antidependency detection.
 - **Self-healing.** Bayesian durability autopilot, RaptorQ symbol generation/recovery, four refresh policies (Eager/Lazy/Adaptive/Hybrid), stale-window SLO with percentile-based breach detection, multi-host repair-ownership coordination, expected-loss policy comparison, mounted automatic repair contract (read-only + read-write via MVCC repair-writeback serializer).
 - **Writeback-cache.** Epoch-based commit barriers with per-inode staged/visible/durable tracking, deferred visibility for MVCC isolation, dirty-page ordering oracle, 12-point crash/replay matrix artifact gate, runtime guard, and host/lane manifest checks. Kernel option default-off; explicit opt-in is evidence-gated.
 - **Observability.** Evidence ledger with 23 event types and 8 operator presets (`replay-anomalies`, `repair-failures`, `pressure-transitions`, `contention`, `metrics`, `cache`, `mvcc`, `repair-live`), contention metrics, policy-switch detection, structured logging across all subsystems, JSONL audit trail.
 - **CLI.** `inspect`, `mvcc-stats`, `info`, `dump`, `fsck`, `repair`, `mount` (22 flags), `scrub`, `parity`, `evidence`, `mkfs`.
-- **Testing.** Source-derived `#[test]` / `proptest!` inventory across 21 crates, 63 fuzz targets, 92 criterion benchmarks, 125 tracked end-to-end gate scripts, metamorphic-relation proptests across the checksum/parser surface, and 226 tracked insta snapshots covering every emitted report shape.
+- **Testing inventory (2026-09-08).** 22 workspace members, 63 fuzz targets, 173 Rust benchmark files, 125 E2E scripts, and 226 tracked insta snapshots. These counts describe source coverage inventory, not checks executed or passed, and do not prove that every emitted report is covered.
 
-### What's next
+### Historical bridge closeouts and remaining work
 
-Items outside the tracked 97-row parity denominator, the operational bridge backlog:
+The following May 2026 bridge records are historical closeouts, not current readiness evidence. The September assessment in [`docs/reality-check-bridge-writeup.md`](docs/reality-check-bridge-writeup.md) identifies remaining delivery tasks, including executed parity, mounted RAID integration, full recovery semantics, default repair, current mounted/crash tests, and real xfstests execution. Closed tracker status does not substitute for those checks.
 
 | Bead | Area | Current target |
 |---|---|---|
@@ -3606,11 +3626,11 @@ See [`FEATURE_PARITY.md`](FEATURE_PARITY.md) for the full capability matrix and 
 
 **ext4.** Single-device images with block sizes 1K/2K/4K. Requires `FILETYPE`; `EXTENTS` is optional (indirect-block addressing is supported). FUSE mount defaults to read-only; `--rw` is available but experimental. All known incompat feature flags are accepted at mount time. `COMPRESSION` covers ext4 e2compr read/write for the implemented gzip/LZO/"none" method-table paths; rare legacy codecs (`lzv1`, `bzip2`, `lzrw3a`) reject deterministically with `EOPNOTSUPP`. `JOURNAL_DEV` images are detected; data filesystems referencing an external journal support paired-open replay through `OpenOptions::external_journal_path` (library API) with UUID/block-size validation. `ENCRYPT` shows filenames as raw bytes (nokey mode). `CASEFOLD` provides case-insensitive directory lookup. `INLINE_DATA` reads from inode block area + `system.data` xattr. MMP unsafe states are rejected with `EOPNOTSUPP`.
 
-**btrfs.** Single- and multi-device images with single / DUP / RAID 0/1/5/6/10 support. Metadata parsing + validation (superblock, leaf items, sys_chunk_array, chunk tree walking, device tree walking). FUSE mount/runtime contract fully tracked; the operator-facing mount path is experimental and defaults to read-only. `--rw` enables durable btrfs metadata mutation via `btrfs_full_transaction_commit()`. The `--btrfs-rw-ephemeral-ok` flag now controls commit strategy (ephemeral tree-log vs full durable commit), not permission. Transparent ZLIB/LZO/ZSTD decompression, named subvolume/snapshot selection (`--subvol`, `--snapshot`), tree-log replay, and send/receive stream parsing all implemented.
+**btrfs.** Current mounted address translation supports single-device Single/Dup images. Multi-device RAID helpers exist, but their integration into mounted reads and writes is incomplete. Metadata parsing + validation covers superblocks, leaf items, sys_chunk_array, chunk-tree walking, and device-tree walking. The operator-facing mount path is experimental and defaults to read-only. `--rw` enables durable btrfs metadata mutation via `btrfs_full_transaction_commit()`. The `--btrfs-rw-ephemeral-ok` flag controls commit strategy (ephemeral tree-log vs full durable commit), not permission. Transparent ZLIB/LZO/ZSTD decompression, named subvolume/snapshot selection (`--subvol`, `--snapshot`), tree-log replay, and send/receive stream parsing are implemented in source; current compatibility evidence must identify the exercised paths.
 
 ### btrfs RW contract
 
-Btrfs RW is **durable by default** as of bd-jdo53. The commit sequence allocates real logical addresses from chunk-covered metadata block groups, rewrites internal child blockptrs, translates logical→physical via `map_logical_to_physical` for each device write, updates the FS_TREE ROOT_ITEM, commits EXTENT_TREE and ROOT_TREE, and patches the on-disk superblock in place. Coverage in `scripts/e2e/ffs_btrfs_rw_durable_remount_e2e.sh` proves 6/6 mutations survive unmount/remount with byte-exact content.
+Btrfs RW selects the **durable commit path by default** as of bd-jdo53. The commit sequence allocates real logical addresses from chunk-covered metadata block groups, rewrites internal child blockptrs, translates logical→physical via `map_logical_to_physical`, updates the FS_TREE ROOT_ITEM, commits EXTENT_TREE and ROOT_TREE, and patches the on-disk superblock in place. `scripts/e2e/ffs_btrfs_rw_durable_remount_e2e.sh` checks mutation survival across remount; its presence and historical results are not a fresh successful run. The statuses below describe intended implemented behavior, subject to current crash/remount verification.
 
 | Operation class | Status | Contract |
 |---|---|---|
@@ -3653,7 +3673,7 @@ Full normative scope: [`COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md`](COMPREHENSIVE_S
 - **Swarm responsiveness claims require permissioned large-host evidence.** Local swarm workload and tail-latency smoke lanes are downgrade artifacts; only fresh `authoritative_large_host` proof-bundle lanes strengthen `swarm.responsiveness`.
 - **Default CLI mount path does not enable optional backpressure / per-core scheduling hooks.** `ffs-cli mount` defaults to the `standard` runtime mode without wiring `BackpressureGate` controls.
 - **Mount background scrub is detection-only by default**, with explicit automatic repair available via `--background-repair --background-scrub-ledger <jsonl>`. Read-write repair uses the mounted MVCC request-scope authority so recovered blocks share the same serializer as client writes.
-- **External dependencies.** Workspace dependencies currently use crates.io releases (`asupersync = 0.3.1`, `ftui = 0.3.1`); local path overrides can be supplied with Cargo `[patch]` during sibling-repo development. `vendor/fuser` is pinned via `[patch.crates-io]` to expose ABI 7.40 and unrestricted ioctls.
+- **External dependencies.** Workspace dependencies declare `asupersync = 0.3.9` and `ftui = 0.3.1`; local path overrides can be supplied with Cargo `[patch]` during sibling-repo development. `vendor/fuser` 0.17.0 is selected via `[patch.crates-io]` with ABI 7.42 enabled.
 - **Legacy reference corpus is not included.** The Linux kernel ext4/btrfs source used for behavioral extraction (~205K lines) is gitignored due to size. Extracted contracts are in [`EXISTING_EXT4_BTRFS_STRUCTURE.md`](EXISTING_EXT4_BTRFS_STRUCTURE.md). For the original source, see `git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git` at tag v6.19.
 - **Multi-host repair is single-host only in V1.x.** Lease-based ownership coordination exists; concurrent write-side repair across hosts is V1.x-deferred.
 - **Hostile-image safety is a separate claim.** Containment is implemented and threat-modeled, but `security.hostile_image` is release-gated and requires its own proof-bundle lanes before docs may improve wording.
@@ -3687,7 +3707,7 @@ A: When two transactions write the same block, FrankenFS can either abort the la
 A: Repair symbols become stale when source blocks are modified. FrankenFS supports four refresh triggers: Eager (every write), Lazy (age timeout or scrub cycle), Adaptive (switches based on the corruption posterior), and Hybrid (first of age timeout OR block-count threshold). `RefreshLossModel` compares all four using expected-loss calculations across workload profiles, and `StaleWindowSlo` monitors percentile staleness with configurable breach detection.
 
 **Q: Why not tokio?**
-A: We need structured concurrency without orphan tasks, cooperative cancellation via a capability context threaded through every call, two-phase reserve/commit channels that don't lose data on cancel, deterministic testing under virtual time with DPOR, and a per-operation poll budget. asupersync provides all of these; tokio provides none of them.
+A: The project requires asupersync's explicit capabilities, cancellation-aware channels, structured regions, and deterministic lab support. Integrating those mechanisms throughout the filesystem remains work in progress; adopting the dependency alone does not establish those guarantees.
 
 **Q: What does `--background-repair` actually do?**
 A: It turns mounted scrub from detection-only into recovery-enabled. The `ScrubDaemon` runs as part of the mount lifecycle; on a corruption detect, it loads RaptorQ repair symbols, decodes the original data, validates the result, and writes the corrected block back. On read-only mounts this uses direct backing-image authority; on read-write mounts it routes through the MVCC repair-writeback serializer so repair writes share the serialization boundary with client writes. Every step emits structured evidence to the JSONL ledger.
@@ -3707,7 +3727,7 @@ A: Same on-disk format for the tracked V1 features, with different internals: MV
 | [`COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md`](COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md) | 344 KB | Canonical specification, all subsystems |
 | [`EXISTING_EXT4_BTRFS_STRUCTURE.md`](EXISTING_EXT4_BTRFS_STRUCTURE.md) | 94 KB | Behavioral extraction from Linux kernel ext4/btrfs source |
 | [`PLAN_TO_PORT_FRANKENFS_TO_RUST.md`](PLAN_TO_PORT_FRANKENFS_TO_RUST.md) | 79 KB | 9-phase porting roadmap with scope and acceptance criteria |
-| [`PROPOSED_ARCHITECTURE.md`](PROPOSED_ARCHITECTURE.md) | 24 KB | 21-crate architecture, trait hierarchy, data flow |
+| [`PROPOSED_ARCHITECTURE.md`](PROPOSED_ARCHITECTURE.md) | 24 KB | 22-member architecture, trait hierarchy, data flow |
 | [`FEATURE_PARITY.md`](FEATURE_PARITY.md) | 72 KB | Quantitative implementation coverage |
 | [`CHANGELOG.md`](CHANGELOG.md) | n/a | Project history organized by capability area |
 | [`AGENTS.md`](AGENTS.md) | 43 KB | Guidelines for AI coding agents working in this codebase |
@@ -3735,7 +3755,7 @@ A: Same on-disk format for the tracked V1 features, with different internals: MV
 
 - **RFC 6330**: *RaptorQ Forward Error Correction Scheme for Object Delivery* (Watson, Stockhammer, Luby, IETF, August 2011). The fountain code at the heart of FrankenFS self-healing.
 - **POSIX.1-2017**: *IEEE Std 1003.1-2017*. The semantic baseline for filesystem operations exposed via FUSE.
-- **FUSE protocol**: Linux kernel `include/uapi/linux/fuse.h`; ABI 7.40 specifically, exposed through the vendored `fuser` crate.
+- **FUSE protocol**: Linux kernel `include/uapi/linux/fuse.h`; ABI 7.42 enabled through the vendored `fuser` crate.
 
 ### Papers underpinning the design
 

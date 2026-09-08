@@ -4716,14 +4716,24 @@ truncated or incomplete. `OpenFs` collects mount-time fast-commit evidence from
 JBD2 journals that advertise `s_num_fc_blocks` and processes committed FC
 operations during ext4 open/recovery after ordinary JBD2 replay.
 
-The supported contract is deliberately narrow and matches the current parity
-matrix: Create/Link/Unlink/AddRange/DelRange operations are applied as
-observational metadata evidence after JBD2 has already provided the
-authoritative block-level recovery, and `InodeUpdate` verifies that the target
-inode is readable. Truncated or incomplete FC streams deterministically fall
-back to JBD2-only replay. FrankenFS therefore no longer treats fast commit as a
-parser-only feature, but it also does not claim a separate FC-only recovery
-engine independent of JBD2 replay.
+Recovery must complete every committed operation or reject the open. A readable
+target does not establish that its directory entry, inode bytes or extent
+mapping was recovered. Ordinary JBD2 replay is not evidence of an equivalent
+recovery for omitted committed FC operations. A stream requiring fallback that
+also contains committed operations must be rejected until such equivalence is
+established. An incomplete transaction without committed operations remains
+eligible for ordinary JBD2-only recovery.
+
+The current implementation applies directory updates, inode updates, inline
+range deletion and coordinated single-leaf external extent recovery. Unsupported
+directory insertion or extent-tree growth, unreadable targets and mismatched
+final mappings propagate errors from `OpenFs`. Later range records supersede
+earlier overlapping records when checking the final mapping. `SimulateOverlay`
+applies recovery to its private device overlay and must preserve the base image;
+explicit `Skip` is diagnostic and provides no recovery guarantee. Failure must
+preserve committed FC records for retry and must not publish a ready filesystem.
+Current external crash-image certification is tracked in `bd-9m84h`; this bounded
+implementation does not establish full kernel fast-commit compatibility.
 
 ### 15.16 Bigalloc (Cluster-Based Allocation)
 
