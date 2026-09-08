@@ -6,11 +6,17 @@
 // arm. Renaming them to satisfy the lint would break the correspondence that makes
 // a paired run readable. `expect` rather than `allow` so it reports itself as
 // unnecessary if these ever go away.
-#![expect(clippy::similar_names, reason = "lhs/rhs are the two arms of a paired measurement")]
+#![expect(
+    clippy::similar_names,
+    reason = "lhs/rhs are the two arms of a paired measurement"
+)]
 // These are whole benchmark bodies: fixture, both arms, and the summary they print.
 // Splitting them moves the arms away from the setup they share, which is exactly
 // the coupling a paired measurement depends on.
-#![expect(clippy::too_many_lines, reason = "one benchmark body: fixture, both arms, summary")]
+#![expect(
+    clippy::too_many_lines,
+    reason = "one benchmark body: fixture, both arms, summary"
+)]
 
 //! Whole-stream benchmark for btrfs send path construction (bd-h3087).
 //!
@@ -444,7 +450,10 @@ fn observe_ns_per_iteration(mut operation: impl FnMut(), iterations: u32) -> f64
 ///
 /// `expect` rather than `allow` deliberately: the moment a bench uses these
 /// again, the compiler reports this expectation as unfulfilled and it comes out.
-#[expect(dead_code, reason = "retained buffer-growth instrument; removal is the author's call")]
+#[expect(
+    dead_code,
+    reason = "retained buffer-growth instrument; removal is the author's call"
+)]
 #[derive(Debug, Clone, Copy, Default)]
 struct BufferGrowthMechanism {
     command_frames: usize,
@@ -454,7 +463,10 @@ struct BufferGrowthMechanism {
     final_capacity: usize,
 }
 
-#[expect(dead_code, reason = "retained buffer-growth instrument; see BufferGrowthMechanism")]
+#[expect(
+    dead_code,
+    reason = "retained buffer-growth instrument; see BufferGrowthMechanism"
+)]
 fn record_buffer_growth(
     buffer: &Vec<u8>,
     prior_capacity: usize,
@@ -476,7 +488,10 @@ fn record_buffer_growth(
 /// generated stream. Command bytes are appended as one frame after the same
 /// `reserve(full_len)` call production makes; capacity evolution is therefore
 /// identical even though the individual frame fields are already serialized.
-#[expect(dead_code, reason = "retained buffer-growth instrument; see BufferGrowthMechanism")]
+#[expect(
+    dead_code,
+    reason = "retained buffer-growth instrument; see BufferGrowthMechanism"
+)]
 fn count_output_buffer_growth(stream: &[u8]) -> BufferGrowthMechanism {
     let header_len = BTRFS_SEND_STREAM_MAGIC.len() + std::mem::size_of::<u32>();
     assert!(
@@ -2569,7 +2584,10 @@ fn legacy_generate_send_stream_for_fixture(
             &mut builder,
             build_chown_command(&path, u64::from(inode.uid), u64::from(inode.gid)),
         );
-        #[expect(clippy::cast_possible_wrap, reason = "on-disk unsigned times into the signed send-stream fields")]
+        #[expect(
+            clippy::cast_possible_wrap,
+            reason = "on-disk unsigned times into the signed send-stream fields"
+        )]
         legacy_add_command(
             &mut builder,
             build_utimes_command(

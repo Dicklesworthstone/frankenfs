@@ -886,7 +886,6 @@ pub const BTRFS_ROOT_ITEM_SIZE: usize = 279;
 /// ```
 pub const BTRFS_ROOT_ITEM_FULL_SIZE: usize = 439;
 
-
 /// Parsed subset of `btrfs_root_item` needed for tree bootstrapping,
 /// subvolume enumeration, and snapshot navigation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -7047,9 +7046,7 @@ impl GrowthDevice {
                 offset: u64::MAX,
             },
             |key, value| {
-                if key.item_type != BTRFS_DEV_ITEM_KEY
-                    || key.objectid != BTRFS_DEV_ITEMS_OBJECTID
-                {
+                if key.item_type != BTRFS_DEV_ITEM_KEY || key.objectid != BTRFS_DEV_ITEMS_OBJECTID {
                     return;
                 }
                 if found.is_some() {
@@ -7503,8 +7500,8 @@ pub fn apply_chunk_allocation(
 
     if plan.needs_sys_chunk_array {
         let sb = superblock.ok_or(BtrfsMutationError::BrokenInvariant(
-                "superblock vanished between the capacity check and the append",
-            ))?;
+            "superblock vanished between the capacity check and the append",
+        ))?;
         sb.append_sys_chunk_entry(&plan.chunk).map_err(|_| {
             BtrfsMutationError::BrokenInvariant(
                 "sys_chunk_array append failed after its capacity was checked",
@@ -10858,11 +10855,7 @@ struct SendTimestamps {
     ctime: (i64, i32),
 }
 
-fn add_utimes_command_direct(
-    builder: &mut SendStreamBuilder,
-    path: &[u8],
-    times: &SendTimestamps,
-) {
+fn add_utimes_command_direct(builder: &mut SendStreamBuilder, path: &[u8], times: &SendTimestamps) {
     let atime = send_timespec_bytes(times.atime.0, times.atime.1);
     let mtime = send_timespec_bytes(times.mtime.0, times.mtime.1);
     let ctime = send_timespec_bytes(times.ctime.0, times.ctime.1);
@@ -17352,8 +17345,8 @@ mod tests {
         let parsed = parse_dir_items(&payload).expect("parse multi-entry dir payload");
         assert_eq!(parsed, [first, second.clone()]);
         assert_eq!(
-            parse_dir_items(&[])
-                .expect("parse empty dir payload"), [] as [BtrfsDirItem; 0]
+            parse_dir_items(&[]).expect("parse empty dir payload"),
+            [] as [BtrfsDirItem; 0]
         );
 
         assert_insufficient_data(parse_dir_items(&[0_u8; 29]), 30, 0, 29);
@@ -17402,8 +17395,8 @@ mod tests {
             None
         );
         assert_eq!(
-            parse_xattr_items(&[])
-                .expect("parse empty xattr payload"), [] as [BtrfsXattrItem; 0]
+            parse_xattr_items(&[]).expect("parse empty xattr payload"),
+            [] as [BtrfsXattrItem; 0]
         );
         assert_eq!(
             find_xattr_item_value(&[], b"user.a").expect("find in empty payload"),
@@ -19448,7 +19441,10 @@ mod tests {
         let decided = policy
             .decide(ChunkKind::Metadata, 512 * MB, 512 * MB)
             .expect("a 512 MB device must be growable");
-        assert_eq!(decided, (512 * MB / 100 * 10) / BTRFS_STRIPE_LEN * BTRFS_STRIPE_LEN);
+        assert_eq!(
+            decided,
+            (512 * MB / 100 * 10) / BTRFS_STRIPE_LEN * BTRFS_STRIPE_LEN
+        );
         assert!(decided < 256 * MB, "the device cap must bind here");
 
         // The free run binds when it is the smallest of the three.
@@ -19644,7 +19640,10 @@ mod tests {
         assert_eq!(plan.dev_extent_key.item_type, BTRFS_DEV_EXTENT_KEY);
         assert_eq!(plan.dev_extent_key.offset, 96 * MB);
         assert_eq!(plan.dev_extent.chunk_offset, plan.chunk.key.offset);
-        assert_eq!(plan.dev_extent.chunk_objectid, BTRFS_FIRST_CHUNK_TREE_OBJECTID);
+        assert_eq!(
+            plan.dev_extent.chunk_objectid,
+            BTRFS_FIRST_CHUNK_TREE_OBJECTID
+        );
         assert_eq!(plan.dev_extent.chunk_tree, BTRFS_CHUNK_TREE_OBJECTID);
 
         // Lengths agree across all three records.
@@ -19771,7 +19770,12 @@ mod tests {
 
         // A ragged end is rounded UP to the stripe length: rounding down would
         // overlap the chunk below it.
-        let ragged = vec![logical_chunk(0, 8 * MB + 1, BTRFS_BLOCK_GROUP_METADATA, &[(1, 0)])];
+        let ragged = vec![logical_chunk(
+            0,
+            8 * MB + 1,
+            BTRFS_BLOCK_GROUP_METADATA,
+            &[(1, 0)],
+        )];
         let start = next_logical_chunk_start(&ragged).expect("start");
         assert!(start > 8 * MB, "must not overlap the chunk below");
         assert_eq!(start % BTRFS_STRIPE_LEN, 0, "must be stripe aligned");
@@ -19852,8 +19856,7 @@ mod tests {
             .alloc_metadata_for_tree(16384, BTRFS_FS_TREE_OBJECTID, 0)
             .expect("allocation must succeed once the chunk exists");
         assert!(
-            allocated.bytenr >= 128 * MB
-                && allocated.bytenr + 16384 <= 128 * MB + 32 * MB,
+            allocated.bytenr >= 128 * MB && allocated.bytenr + 16384 <= 128 * MB + 32 * MB,
             "the allocation must land inside the new chunk, got {}",
             allocated.bytenr
         );
@@ -20125,7 +20128,10 @@ mod tests {
             },
         );
         assert_eq!(alloc.commit_metadata_shortfall(NODES, NODESIZE), None);
-        assert_eq!(alloc.allocatable_bytes(BTRFS_BLOCK_GROUP_METADATA), 64 * MB - demand);
+        assert_eq!(
+            alloc.allocatable_bytes(BTRFS_BLOCK_GROUP_METADATA),
+            64 * MB - demand
+        );
 
         // Now pin the live tree, which is what a commit does before deleting its
         // extent items. The same group, the same demand — and now the commit
@@ -20144,7 +20150,10 @@ mod tests {
 
         // A shortfall is what tells the caller how big a chunk to ask for, so it
         // must be the amount MISSING, not the amount required.
-        assert!(short < demand, "the shortfall is the gap, not the whole demand");
+        assert!(
+            short < demand,
+            "the shortfall is the gap, not the whole demand"
+        );
     }
 
     /// bd-a136s. The boundaries, and one of them is a trap: an overflowing demand
@@ -20301,7 +20310,10 @@ mod tests {
 
         // The state bd-uxh7t observed: the commit cannot be satisfied, and an
         // allocation fails, on a device with 87 MiB of unallocated space.
-        assert_eq!(alloc.commit_metadata_shortfall(NODES, NODESIZE), Some(demand));
+        assert_eq!(
+            alloc.commit_metadata_shortfall(NODES, NODESIZE),
+            Some(demand)
+        );
         assert!(
             alloc
                 .alloc_metadata_for_tree(NODESIZE, BTRFS_FS_TREE_OBJECTID, 0)
@@ -20312,15 +20324,9 @@ mod tests {
         let policy = ChunkSizePolicy::default();
         let mut device = growth_device(100 * MB, 17 * MB);
         let mut grown = 0_usize;
-        while let Some(plan) = plan_growth_for_commit(
-            &alloc,
-            &chunks,
-            NODES,
-            NODESIZE,
-            &device,
-            &policy,
-        )
-        .expect("growth must not fail on a device with room")
+        while let Some(plan) =
+            plan_growth_for_commit(&alloc, &chunks, NODES, NODESIZE, &device, &policy)
+                .expect("growth must not fail on a device with room")
         {
             apply_chunk_allocation(&plan, &mut chunk_tree, &mut dev_tree, &mut alloc, None)
                 .expect("apply");
@@ -20393,9 +20399,16 @@ mod tests {
             &[(1, MB)],
         )];
         assert!(
-            plan_growth_for_commit(&roomy, &chunks, 100, NODESIZE, &growth_device(512 * MB, 65 * MB), &policy)
-                .expect("no growth needed")
-                .is_none(),
+            plan_growth_for_commit(
+                &roomy,
+                &chunks,
+                100,
+                NODESIZE,
+                &growth_device(512 * MB, 65 * MB),
+                &policy
+            )
+            .expect("no growth needed")
+            .is_none(),
             "a commit that already fits must not allocate a chunk"
         );
 
@@ -20411,7 +20424,12 @@ mod tests {
                 flags: BTRFS_BLOCK_GROUP_METADATA,
             },
         );
-        let packed = vec![logical_chunk(0, 32 * MB, BTRFS_BLOCK_GROUP_METADATA, &[(1, 0)])];
+        let packed = vec![logical_chunk(
+            0,
+            32 * MB,
+            BTRFS_BLOCK_GROUP_METADATA,
+            &[(1, 0)],
+        )];
         assert!(
             plan_growth_for_commit(
                 &full,
@@ -20529,8 +20547,8 @@ mod tests {
             item_type: BTRFS_DEV_ITEM_KEY,
             offset: 1,
         };
-        let before = parse_dev_item(&chunk_tree.get(&dev_item_key).expect("seeded"))
-            .expect("parses");
+        let before =
+            parse_dev_item(&chunk_tree.get(&dev_item_key).expect("seeded")).expect("parses");
         assert_eq!(before.bytes_used, 64 * MB, "the seeded device usage");
 
         let plan = plan_chunk_allocation(&chunk_request(
@@ -20543,8 +20561,8 @@ mod tests {
         apply_chunk_allocation(&plan, &mut chunk_tree, &mut dev_tree, &mut alloc, None)
             .expect("apply");
 
-        let after = parse_dev_item(&chunk_tree.get(&dev_item_key).expect("still present"))
-            .expect("parses");
+        let after =
+            parse_dev_item(&chunk_tree.get(&dev_item_key).expect("still present")).expect("parses");
         assert_eq!(
             after.bytes_used, plan.dev_bytes_used_after,
             "bytes_used must be exactly what the plan computed"
@@ -20582,8 +20600,8 @@ mod tests {
                 .is_err(),
             "a plan whose dev_bytes_used_before no longer matches the DEV_ITEM is stale              and must be refused"
         );
-        let unchanged = parse_dev_item(&chunk_tree.get(&dev_item_key).expect("present"))
-            .expect("parses");
+        let unchanged =
+            parse_dev_item(&chunk_tree.get(&dev_item_key).expect("present")).expect("parses");
         assert_eq!(
             unchanged.bytes_used, after.bytes_used,
             "and the refusal must leave the DEV_ITEM exactly as it was"
@@ -20770,12 +20788,18 @@ mod tests {
 
         // Both trees are counted, each with room to split. Two single-node trees
         // at level 0 give (1 + 2) + (1 + 2) = 6.
-        let chunk_nodes =
-            u64::try_from(WriteDependencyDag::from_cow_tree(&chunk_tree, 7).expect("dag").node_count())
-                .expect("fits");
-        let dev_nodes =
-            u64::try_from(WriteDependencyDag::from_cow_tree(&dev_tree, 7).expect("dag").node_count())
-                .expect("fits");
+        let chunk_nodes = u64::try_from(
+            WriteDependencyDag::from_cow_tree(&chunk_tree, 7)
+                .expect("dag")
+                .node_count(),
+        )
+        .expect("fits");
+        let dev_nodes = u64::try_from(
+            WriteDependencyDag::from_cow_tree(&dev_tree, 7)
+                .expect("dag")
+                .node_count(),
+        )
+        .expect("fits");
         assert_eq!(overhead, chunk_nodes + dev_nodes + 4);
 
         // ⚠️ THE ALLOWANCE IS THE POINT. The count is taken BEFORE the growth's
@@ -20845,7 +20869,10 @@ mod tests {
         // An empty tree is not an error — it is a filesystem with no chunks,
         // which the planner will refuse on its own terms.
         let empty = InMemoryCowBtrfsTree::new(8).expect("chunk tree");
-        assert_eq!(chunk_entries_from_chunk_tree(&empty).expect("empty"), [] as [ffs_ondisk::BtrfsChunkEntry; 0]);
+        assert_eq!(
+            chunk_entries_from_chunk_tree(&empty).expect("empty"),
+            [] as [ffs_ondisk::BtrfsChunkEntry; 0]
+        );
     }
 
     /// bd-a136s. ⚠️ An unparseable CHUNK_ITEM must REFUSE, not be skipped.
@@ -20861,7 +20888,9 @@ mod tests {
             .insert(good.key, &good.to_item_bytes().expect("serialize"))
             .expect("insert");
         assert_eq!(
-            chunk_entries_from_chunk_tree(&chunk_tree).expect("good map").len(),
+            chunk_entries_from_chunk_tree(&chunk_tree)
+                .expect("good map")
+                .len(),
             1
         );
 
@@ -20925,7 +20954,10 @@ mod tests {
 
         let mut regenerated = after_first.clone();
         BtrfsRootItem::patch_root_commit(&mut regenerated, 0x1_0000, 1, 8).expect("patch");
-        assert_ne!(regenerated, after_first, "a new generation must change the item");
+        assert_ne!(
+            regenerated, after_first,
+            "a new generation must change the item"
+        );
     }
 
     /// bd-a136s. ⚠️ THE TEST THAT WOULD HAVE CAUGHT THE ACCEPTANCE-GATE FAILURE.
@@ -21166,7 +21198,11 @@ mod tests {
         ])
         .expect("well-formed deletion records");
 
-        assert_eq!(items, vec![live], "tombstones must not enter the FS overlay");
+        assert_eq!(
+            items,
+            vec![live],
+            "tombstones must not enter the FS overlay"
+        );
         assert_eq!(
             deleted_keys,
             vec![dir_item, dir_index],
@@ -21186,7 +21222,10 @@ mod tests {
             },
         )])
         .expect("a supported but disabled feature is not malformed");
-        assert!(result.foreign_format, "default-off deletion replay must fail closed");
+        assert!(
+            result.foreign_format,
+            "default-off deletion replay must fail closed"
+        );
         assert!(
             !result.replayed,
             "an old core cannot safely apply a deletion-only log"
@@ -21682,7 +21721,10 @@ mod tests {
             alloc.extent_item_refs(a.bytenr, a.num_bytes).unwrap(),
             Some(0)
         );
-        assert_eq!(alloc.get_extent_data_refs(a.bytenr).unwrap(), [] as [BtrfsExtentDataRef; 0]);
+        assert_eq!(
+            alloc.get_extent_data_refs(a.bytenr).unwrap(),
+            [] as [BtrfsExtentDataRef; 0]
+        );
 
         // Dropping a ref that isn't present is an atomic error (no change).
         alloc
@@ -21795,13 +21837,15 @@ mod tests {
             alloc
                 .extent_tree
                 .range(&metadata_key, &metadata_key)
-                .expect("metadata item lookup"), [] as [(ffs_ondisk::BtrfsKey, std::vec::Vec<u8>); 0]
+                .expect("metadata item lookup"),
+            [] as [(ffs_ondisk::BtrfsKey, std::vec::Vec<u8>); 0]
         );
         assert_eq!(
             alloc
                 .extent_tree
                 .range(&ref_key, &ref_key)
-                .expect("tree block ref lookup"), [] as [(ffs_ondisk::BtrfsKey, std::vec::Vec<u8>); 0]
+                .expect("tree block ref lookup"),
+            [] as [(ffs_ondisk::BtrfsKey, std::vec::Vec<u8>); 0]
         );
         assert_eq!(alloc.block_group(0x20_0000).expect("meta bg").used_bytes, 0);
     }
@@ -24815,7 +24859,8 @@ mod tests {
             alloc
                 .extent_tree
                 .range(&orphan_key, &orphan_key)
-                .expect("orphan extent lookup"), [] as [(ffs_ondisk::BtrfsKey, std::vec::Vec<u8>); 0]
+                .expect("orphan extent lookup"),
+            [] as [(ffs_ondisk::BtrfsKey, std::vec::Vec<u8>); 0]
         );
         assert_eq!(
             alloc.block_group(bg_start).expect("bg").used_bytes,

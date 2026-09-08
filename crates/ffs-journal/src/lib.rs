@@ -1286,14 +1286,13 @@ impl Jbd2Writer {
         let mut tag_format = Jbd2TagFormat::Legacy;
         let mut has_checksum = false;
         let mut csum_seed = 0_u32;
-        let mut base_head = 0_u64;
-        if let Some(sb) = Jbd2Superblock::parse(raw.as_slice()) {
+        let base_head = Jbd2Superblock::parse(raw.as_slice()).map_or(0_u64, |sb| {
             is_64bit = sb.is_64bit();
             tag_format = sb.tag_format();
             has_checksum = sb.has_checksum();
             csum_seed = sb.csum_seed();
-            base_head = 1; // never write over the superblock
-        }
+            1 // never write over the superblock
+        });
 
         Ok(Self {
             segments,
@@ -2225,7 +2224,7 @@ mod fc_tests {
             result.fallback_required,
             "an unknown FC feature bit must force JBD2 fallback"
         );
-        assert!(result.operations.is_empty());
+        assert_eq!(result.operations, [] as [FcOperation; 0]);
         assert_eq!(result.transactions_found, 0);
         // A zero fc_features HEAD is still accepted (regression guard).
         let mut ok = Vec::new();
@@ -2275,7 +2274,7 @@ mod fc_tests {
     #[test]
     fn replay_empty_data() {
         let result = replay_fast_commit(&[]).unwrap();
-        assert!(result.operations.is_empty());
+        assert_eq!(result.operations, [] as [FcOperation; 0]);
         assert_eq!(result.transactions_found, 0);
         assert_eq!(result.incomplete_transactions, 0);
         assert!(!result.fallback_required);
@@ -2304,7 +2303,7 @@ mod fc_tests {
         assert_eq!(result.incomplete_transactions, u64::MAX);
         assert!(result.fallback_required);
         assert!(!pending.active);
-        assert!(pending.operations.is_empty());
+        assert_eq!(pending.operations, [] as [FcOperation; 0]);
     }
 
     /// Build the on-disk `ext4_fc_add_range` payload: fc_ino(le32) followed by a
@@ -2463,7 +2462,7 @@ mod fc_tests {
         data.extend(build_fc_tag(0x08, &tail)); // TAIL
 
         let result = replay_fast_commit(&data).unwrap();
-        assert!(result.operations.is_empty());
+        assert_eq!(result.operations, [] as [FcOperation; 0]);
         assert_eq!(result.transactions_found, 0);
         assert_eq!(result.incomplete_transactions, 1);
         assert!(result.fallback_required);
@@ -2475,7 +2474,7 @@ mod fc_tests {
         data.extend(build_fc_tag(0x06, &42_u32.to_le_bytes())); // INODE without HEAD
 
         let result = replay_fast_commit(&data).unwrap();
-        assert!(result.operations.is_empty());
+        assert_eq!(result.operations, [] as [FcOperation; 0]);
         assert!(result.fallback_required);
     }
 
@@ -2490,7 +2489,7 @@ mod fc_tests {
         data.extend(build_fc_tag(0x08, &tail)); // TAIL
 
         let result = replay_fast_commit(&data).unwrap();
-        assert!(result.operations.is_empty());
+        assert_eq!(result.operations, [] as [FcOperation; 0]);
         assert_eq!(result.transactions_found, 0);
         assert_eq!(result.incomplete_transactions, 0);
         assert!(result.fallback_required);
@@ -2501,7 +2500,7 @@ mod fc_tests {
         let mut data = Vec::new();
         data.extend(build_fc_tag(0x01, &[1, 2, 3])); // ADD_RANGE with payload too short
         let result = replay_fast_commit(&data).unwrap();
-        assert!(result.operations.is_empty()); // Payload < 16 bytes, skipped
+        assert_eq!(result.operations, [] as [FcOperation; 0]); // Payload < 16 bytes, skipped
         assert!(result.fallback_required);
     }
 
@@ -2516,7 +2515,7 @@ mod fc_tests {
         data.extend(build_fc_tag(0x08, &tail)); // TAIL
 
         let result = replay_fast_commit(&data).unwrap();
-        assert!(result.operations.is_empty());
+        assert_eq!(result.operations, [] as [FcOperation; 0]);
         assert_eq!(result.transactions_found, 0);
         assert_eq!(result.incomplete_transactions, 1);
         assert!(result.fallback_required);
@@ -2530,7 +2529,7 @@ mod fc_tests {
         data.extend(build_fc_tag(0x08, &[1, 2, 3])); // TAIL too short for tid
 
         let result = replay_fast_commit(&data).unwrap();
-        assert!(result.operations.is_empty());
+        assert_eq!(result.operations, [] as [FcOperation; 0]);
         assert_eq!(result.transactions_found, 0);
         assert_eq!(result.incomplete_transactions, 1);
         assert!(result.fallback_required);
@@ -2572,7 +2571,7 @@ mod fc_tests {
         data.extend(build_fc_tag(0x08, &3_u32.to_le_bytes())); // TAIL missing crc
 
         let result = replay_fast_commit(&data).unwrap();
-        assert!(result.operations.is_empty());
+        assert_eq!(result.operations, [] as [FcOperation; 0]);
         assert_eq!(result.transactions_found, 0);
         assert_eq!(result.incomplete_transactions, 1);
         assert!(result.fallback_required);
@@ -2585,7 +2584,7 @@ mod fc_tests {
         data.extend(build_fc_tag(0x06, &42_u32.to_le_bytes())); // INODE
 
         let result = replay_fast_commit(&data).unwrap();
-        assert!(result.operations.is_empty());
+        assert_eq!(result.operations, [] as [FcOperation; 0]);
         assert_eq!(result.transactions_found, 0);
         assert_eq!(result.incomplete_transactions, 1);
         assert!(result.fallback_required);
@@ -4331,7 +4330,7 @@ mod tests {
             .read_block(&cx, BlockNumber(9))
             .expect("target block should be readable");
         assert_eq!(target.as_slice(), &[0_u8; 512]);
-        assert!(out.committed_sequences.is_empty());
+        assert_eq!(out.committed_sequences, [] as [u32; 0]);
         assert_eq!(out.stats.incomplete_transactions, 1);
     }
 
@@ -4714,7 +4713,7 @@ mod tests {
 
         // Replaying the cleared journal should produce no committed sequences.
         let second = replay_jbd2(&cx, &dev, region).expect("replay cleared journal");
-        assert!(second.committed_sequences.is_empty());
+        assert_eq!(second.committed_sequences, [] as [u32; 0]);
         assert_eq!(second.stats.replayed_blocks, 0);
     }
 
@@ -5219,7 +5218,7 @@ mod tests {
         // No commit block written — simulates crash.
 
         let outcome = replay_jbd2(&cx, &dev, region).expect("replay");
-        assert!(outcome.committed_sequences.is_empty());
+        assert_eq!(outcome.committed_sequences, [] as [u32; 0]);
         assert_eq!(outcome.stats.incomplete_transactions, 1);
 
         // Target block should remain untouched.
@@ -5253,7 +5252,7 @@ mod tests {
         assert_eq!(writer.head(), 0, "failed commit must not advance head");
 
         let outcome = replay_jbd2(&cx, &dev, region).expect("replay partial journal");
-        assert!(outcome.committed_sequences.is_empty());
+        assert_eq!(outcome.committed_sequences, [] as [u32; 0]);
         assert_eq!(outcome.stats.incomplete_transactions, 1);
         assert_eq!(
             dev.read_block(&cx, BlockNumber(7)).unwrap().as_slice(),
@@ -5638,9 +5637,9 @@ mod tests {
             strict_descriptor_tag_count_with_format(&desc, false, false, Jbd2TagFormat::CsumV3),
             None
         );
-        assert!(
-            parse_descriptor_tags_with_format(&desc, false, false, Jbd2TagFormat::CsumV3)
-                .is_empty()
+        assert_eq!(
+            parse_descriptor_tags_with_format(&desc, false, false, Jbd2TagFormat::CsumV3),
+            [] as [DescriptorTag; 0]
         );
     }
 
@@ -5753,7 +5752,7 @@ mod tests {
             &[0_u8; 512],
             "aborted txn should not modify target"
         );
-        assert!(out.committed_sequences.is_empty());
+        assert_eq!(out.committed_sequences, [] as [u32; 0]);
         assert_eq!(out.stats.incomplete_transactions, 1);
         assert_eq!(out.stats.replayed_blocks, 0);
     }
@@ -6188,7 +6187,7 @@ mod tests {
         };
 
         let recovered = recover_native_cow(&cx, &dev, region).expect("recover empty");
-        assert!(recovered.is_empty());
+        assert_eq!(recovered, [] as [RecoveredCommit; 0]);
     }
 
     #[test]
@@ -6277,7 +6276,7 @@ mod tests {
             replay_jbd2(&cx, &dev, region).expect("truncated descriptor should not cause error");
 
         // No commit block present, so nothing should be replayed.
-        assert!(out.committed_sequences.is_empty());
+        assert_eq!(out.committed_sequences, [] as [u32; 0]);
         // Target blocks should remain untouched.
         assert_eq!(
             dev.read_block(&cx, BlockNumber(3)).unwrap().as_slice(),
@@ -6747,7 +6746,7 @@ mod tests {
         dev.raw_write(BlockNumber(11), commit_block(512, 1));
 
         let out = replay_jbd2(&cx, &dev, region).expect("should succeed");
-        assert!(out.committed_sequences.is_empty());
+        assert_eq!(out.committed_sequences, [] as [u32; 0]);
         assert_eq!(out.stats.descriptor_blocks, 1);
         assert_eq!(out.stats.descriptor_tags, 0);
         assert_eq!(out.stats.replayed_blocks, 0);
@@ -6772,7 +6771,7 @@ mod tests {
         dev.raw_write(BlockNumber(73), commit_block(512, 1));
 
         let out = replay_jbd2(&cx, &dev, region).expect("should succeed");
-        assert!(out.committed_sequences.is_empty());
+        assert_eq!(out.committed_sequences, [] as [u32; 0]);
         assert_eq!(out.stats.descriptor_blocks, 1);
         assert_eq!(out.stats.descriptor_tags, 0);
         assert_eq!(out.stats.replayed_blocks, 0);
@@ -6815,7 +6814,7 @@ mod tests {
 
         let out = replay_jbd2(&cx, &dev, region).expect("should succeed");
 
-        assert!(out.committed_sequences.is_empty());
+        assert_eq!(out.committed_sequences, [] as [u32; 0]);
         assert_eq!(out.stats.skipped_revoked_blocks, 0);
         assert_eq!(out.stats.replayed_blocks, 0);
         assert_eq!(
@@ -6883,7 +6882,7 @@ mod tests {
         // All blocks default to zeros in MemBlockDevice — no writes needed.
 
         let out = replay_jbd2(&cx, &dev, region).expect("should succeed on all-zero journal");
-        assert!(out.committed_sequences.is_empty());
+        assert_eq!(out.committed_sequences, [] as [u32; 0]);
         assert_eq!(out.stats.scanned_blocks, 8);
         assert_eq!(out.stats.replayed_blocks, 0);
     }
@@ -6906,7 +6905,7 @@ mod tests {
         dev.raw_write(BlockNumber(10), garbage);
 
         let out = replay_jbd2(&cx, &dev, region).expect("should succeed");
-        assert!(out.committed_sequences.is_empty());
+        assert_eq!(out.committed_sequences, [] as [u32; 0]);
         assert_eq!(out.stats.scanned_blocks, 4);
     }
 
@@ -6995,7 +6994,7 @@ mod tests {
         };
         // Device is all zeros by default — no valid JBD2 headers.
         let out = replay_jbd2(&cx, &dev, region).expect("replay");
-        assert!(out.committed_sequences.is_empty());
+        assert_eq!(out.committed_sequences, [] as [u32; 0]);
         assert_eq!(out.stats.scanned_blocks, 8);
     }
 
@@ -7015,7 +7014,7 @@ mod tests {
         dev.raw_write(BlockNumber(10), block);
 
         let out = replay_jbd2(&cx, &dev, region).expect("replay");
-        assert!(out.committed_sequences.is_empty());
+        assert_eq!(out.committed_sequences, [] as [u32; 0]);
         assert_eq!(out.stats.descriptor_blocks, 0);
     }
 
@@ -7035,7 +7034,7 @@ mod tests {
         dev.raw_write(BlockNumber(10), block);
 
         let out = replay_jbd2(&cx, &dev, region).expect("replay");
-        assert!(out.committed_sequences.is_empty());
+        assert_eq!(out.committed_sequences, [] as [u32; 0]);
         assert_eq!(out.stats.descriptor_blocks, 0);
         assert_eq!(out.stats.commit_blocks, 0);
     }
@@ -7063,7 +7062,7 @@ mod tests {
         dev.raw_write(BlockNumber(13), commit_block(512, 1));
 
         let out = replay_jbd2(&cx, &dev, region).expect("replay");
-        assert!(out.committed_sequences.is_empty());
+        assert_eq!(out.committed_sequences, [] as [u32; 0]);
         assert_eq!(out.stats.replayed_blocks, 0);
         assert_eq!(
             dev.read_block(&cx, BlockNumber(5)).unwrap().as_slice(),
@@ -7132,7 +7131,7 @@ mod tests {
         // No room for commit block — transaction is incomplete.
 
         let out = replay_jbd2(&cx, &dev, region).expect("replay");
-        assert!(out.committed_sequences.is_empty());
+        assert_eq!(out.committed_sequences, [] as [u32; 0]);
         assert_eq!(out.stats.incomplete_transactions, 1);
     }
 
@@ -7305,7 +7304,7 @@ mod tests {
         };
         // Device is all zeros, so no valid COW magic.
         let recovered = recover_native_cow(&cx, &dev, region).expect("recover");
-        assert!(recovered.is_empty());
+        assert_eq!(recovered, [] as [RecoveredCommit; 0]);
     }
 
     #[test]
@@ -7324,7 +7323,7 @@ mod tests {
         // No commit for sequence 5.
 
         let recovered = recover_native_cow(&cx, &dev, region).expect("recover");
-        assert!(recovered.is_empty());
+        assert_eq!(recovered, [] as [RecoveredCommit; 0]);
     }
 
     #[test]
@@ -7483,7 +7482,7 @@ mod tests {
     #[test]
     fn replay_outcome_default() {
         let outcome = ReplayOutcome::default();
-        assert!(outcome.committed_sequences.is_empty());
+        assert_eq!(outcome.committed_sequences, [] as [u32; 0]);
         assert_eq!(outcome.stats, ReplayStats::default());
     }
 
@@ -8081,9 +8080,7 @@ mod tests {
         let barrier = events
             .iter()
             .position(|e| e == "BARRIER")
-            .unwrap_or_else(|| {
-                panic!("no barrier was issued at all; sequence was {events:?}")
-            });
+            .unwrap_or_else(|| panic!("no barrier was issued at all; sequence was {events:?}"));
         let last_write = events
             .iter()
             .rposition(|e| e.starts_with('W'))
@@ -8138,7 +8135,11 @@ mod tests {
             },
         ];
         let mut writer = Jbd2Writer::new_segmented(segments, 1);
-        assert_eq!(writer.free_blocks(), 8, "capacity is the SUM of the extents");
+        assert_eq!(
+            writer.free_blocks(),
+            8,
+            "capacity is the SUM of the extents"
+        );
 
         // One transaction of 2 data blocks needs descriptor + 2 + commit = 4
         // blocks, so it cannot fit in the 2-block first extent and must continue
@@ -8201,13 +8202,19 @@ mod tests {
                 Err(FfsError::NoSpace) => break,
                 Err(other) => panic!("unexpected commit error: {other:?}"),
             }
-            assert!(committed < 100, "region never filled — the negative is vacuous");
+            assert!(
+                committed < 100,
+                "region never filled — the negative is vacuous"
+            );
         }
         assert!(
             committed > 0,
             "at least one transaction must fit before the region fills"
         );
-        assert!(writer.head() > writer.base_head(), "head must have advanced");
+        assert!(
+            writer.head() > writer.base_head(),
+            "head must have advanced"
+        );
 
         // Reclaim, then the very next commit must succeed again.
         writer.reset_after_checkpoint();
@@ -8737,13 +8744,13 @@ mod tests {
             prop_assert_eq!(recovered[0].commit_seq, CommitSeq(1));
             prop_assert_eq!(recovered[0].writes.len(), num_writes);
 
-            for i in 0..num_writes {
+            for (i, write) in recovered[0].writes.iter().enumerate() {
                 let expected_byte = payload_byte.wrapping_add(u8::try_from(i % 256).unwrap());
                 prop_assert_eq!(
-                    recovered[0].writes[i].block,
+                    write.block,
                     BlockNumber(u64::try_from(i).unwrap()),
                 );
-                prop_assert_eq!(recovered[0].writes[i].bytes[0], expected_byte);
+                prop_assert_eq!(write.bytes[0], expected_byte);
             }
         }
 

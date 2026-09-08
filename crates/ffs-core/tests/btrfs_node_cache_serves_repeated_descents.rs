@@ -81,8 +81,8 @@ fn seeded_image(dir: &Path, entries: usize, name: &str) -> Option<PathBuf> {
     // ext4/MVCC durability boundary and does not commit the btrfs trees, which is
     // what an earlier version of this fixture used — the reopen then found no
     // files at all.
-    let mut fs = OpenFs::from_device(&cx, Box::new(device), &OpenOptions::default())
-        .expect("open btrfs");
+    let mut fs =
+        OpenFs::from_device(&cx, Box::new(device), &OpenOptions::default()).expect("open btrfs");
     fs.enable_writes(&cx).expect("enable writes");
     for index in 0..entries {
         fs.create(
@@ -139,8 +139,11 @@ fn a_repeated_capability_sweep_is_served_from_the_node_cache_bd_2s8zy() {
     let mut inert: Vec<String> = Vec::new();
 
     for entries in SIZES {
-        let Some(image) = seeded_image(&tmp.path().join("."), entries, &format!("nc-{entries}.btrfs"))
-        else {
+        let Some(image) = seeded_image(
+            &tmp.path().join("."),
+            entries,
+            &format!("nc-{entries}.btrfs"),
+        ) else {
             eprintln!("btrfs-progs unavailable; skipping bd-2s8zy node-cache probe");
             return;
         };
@@ -167,9 +170,20 @@ fn a_repeated_capability_sweep_is_served_from_the_node_cache_bd_2s8zy() {
 
         // The identity must hold or the counters are lying and nothing else here
         // means anything (bd-mdtqc's lasting lesson: report the identity).
-        assert_eq!(p1l, p1h + p1m, "entries={entries}: pass 1 lookups != hits + misses");
-        assert_eq!(p2l, p2h + p2m, "entries={entries}: pass 2 lookups != hits + misses");
-        assert!(p1l > 0, "entries={entries}: the sweep performed no node lookups at all");
+        assert_eq!(
+            p1l,
+            p1h + p1m,
+            "entries={entries}: pass 1 lookups != hits + misses"
+        );
+        assert_eq!(
+            p2l,
+            p2h + p2m,
+            "entries={entries}: pass 2 lookups != hits + misses"
+        );
+        assert!(
+            p1l > 0,
+            "entries={entries}: the sweep performed no node lookups at all"
+        );
 
         // Pass 2 walks an IMMUTABLE tree that pass 1 already read in full.
         //
@@ -242,8 +256,8 @@ fn the_node_cache_is_disabled_on_a_writable_mount_bd_2s8zy() {
     let names: Vec<String> = (0..entries).map(|index| format!("f{index:06}")).collect();
 
     let device = ffs_block::FileByteDevice::open(&image).expect("open image");
-    let mut fs = OpenFs::from_device(&cx, Box::new(device), &OpenOptions::default())
-        .expect("open btrfs");
+    let mut fs =
+        OpenFs::from_device(&cx, Box::new(device), &OpenOptions::default()).expect("open btrfs");
     fs.enable_writes(&cx).expect("enable writes");
 
     let (l0, h0, m0) = ffs_core::btrfs_node_cache_counters_full();
@@ -469,7 +483,10 @@ fn interleaved_stat_order_costs_more_descents_than_sequential_bd_2s8zy() {
         interleaved_cost as f64 / sequential as f64
     );
 
-    assert!(sequential > 0, "the sequential sweep performed no node lookups");
+    assert!(
+        sequential > 0,
+        "the sequential sweep performed no node lookups"
+    );
     // No assertion on the DIRECTION beyond a sanity bound: this test exists to
     // publish the ratio, and pinning a direction I have not yet explained is how
     // a premise gets frozen before it is understood (the mistake the arm above
@@ -505,7 +522,11 @@ fn interleaved_order(entries: usize, streams: usize) -> Vec<usize> {
             }
         }
     }
-    assert_eq!(interleaved.len(), entries, "the interleaving must cover every entry");
+    assert_eq!(
+        interleaved.len(),
+        entries,
+        "the interleaving must cover every entry"
+    );
     interleaved
 }
 
@@ -790,7 +811,8 @@ fn the_per_request_scope_cost_is_priced_against_the_mounted_gap_bd_2s8zy() {
     };
 
     const ARMS: [bool; 3] = [false, true, false];
-    let mut times: [Vec<std::time::Duration>; 3] = std::array::from_fn(|_| Vec::with_capacity(ROUNDS));
+    let mut times: [Vec<std::time::Duration>; 3] =
+        std::array::from_fn(|_| Vec::with_capacity(ROUNDS));
     for round in 0..ROUNDS {
         for position in 0..ARMS.len() {
             let arm = (round + position) % ARMS.len();
@@ -801,8 +823,8 @@ fn the_per_request_scope_cost_is_priced_against_the_mounted_gap_bd_2s8zy() {
     let null_ratio = null_right.as_secs_f64() / null_left.as_secs_f64();
     let baseline = (null_left + null_right) / 2;
     // Two scopes per entry: one for the LOOKUP, one for the capability probe.
-    let per_scope_ns = (scoped.as_secs_f64() - baseline.as_secs_f64()) * 1e9
-        / (entries as f64 * 2.0);
+    let per_scope_ns =
+        (scoped.as_secs_f64() - baseline.as_secs_f64()) * 1e9 / (entries as f64 * 2.0);
     // The banked mounted row: 21.30ms for 2,000 stats.
     let mounted_per_stat_ns = 21.30e6 / 2_000.0;
     let share = (per_scope_ns * 2.0) / mounted_per_stat_ns * 100.0;
@@ -903,7 +925,11 @@ fn the_miss_streak_gate_does_not_fire_on_a_real_sweep_bd_79li3() {
     let mut seen = random.clone();
     seen.sort_unstable();
     seen.dedup();
-    assert_eq!(seen.len(), entries, "the stride permutation must cover every entry exactly once");
+    assert_eq!(
+        seen.len(),
+        entries,
+        "the stride permutation must cover every entry exactly once"
+    );
     let (rnd_suppressions, rnd_lookups) = sweep(&random);
 
     eprintln!(

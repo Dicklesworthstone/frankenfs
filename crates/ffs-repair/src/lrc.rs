@@ -631,7 +631,6 @@ pub fn repair_global(
             }
             // Must index by c since we read coeff_matrix[col][c] while
             // writing coeff_matrix[row][c] — two different rows.
-            #[expect(clippy::needless_range_loop)]
             for c in 0..m {
                 coeff_matrix[row][c] ^= gf256::mul(coeff_matrix[col][c], factor);
             }
@@ -1230,7 +1229,7 @@ mod tests {
         let mut data = make_data(4, 16);
         data[2].truncate(8);
         let global = encode_global(&cfg, &data);
-        assert!(global.is_empty());
+        assert_eq!(global, [] as [Vec<u8>; 0]);
     }
 
     #[test]

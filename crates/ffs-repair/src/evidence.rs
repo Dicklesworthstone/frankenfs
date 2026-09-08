@@ -1592,19 +1592,19 @@ mod tests {
         let buf: Vec<u8> = Vec::new();
         let ledger = EvidenceLedger::new(buf);
         let inner = ledger.into_inner();
-        assert!(inner.is_empty());
+        assert_eq!(inner, [] as [u8; 0]);
     }
 
     #[test]
     fn parse_evidence_ledger_empty_input() {
         let records = parse_evidence_ledger(b"");
-        assert!(records.is_empty());
+        assert_eq!(records, [] as [EvidenceRecord; 0]);
     }
 
     #[test]
     fn parse_evidence_ledger_all_blank_lines() {
         let records = parse_evidence_ledger(b"\n\n\n");
-        assert!(records.is_empty());
+        assert_eq!(records, [] as [EvidenceRecord; 0]);
     }
 
     #[test]
@@ -1708,7 +1708,7 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::Other);
 
         let bytes_after_failure = ledger.writer.inner.clone();
-        assert!(!bytes_after_failure.is_empty());
+        assert_ne!(bytes_after_failure, [] as [u8; 0]);
         assert!(
             !bytes_after_failure.ends_with(b"\n"),
             "test writer should leave a torn JSONL prefix; got {bytes_after_failure:?}"
@@ -1721,7 +1721,7 @@ mod tests {
 
         let bytes = ledger.into_inner().inner;
         assert_eq!(bytes, bytes_after_failure);
-        assert!(parse_evidence_ledger(&bytes).is_empty());
+        assert_eq!(parse_evidence_ledger(&bytes), [] as [EvidenceRecord; 0]);
     }
 
     #[test]

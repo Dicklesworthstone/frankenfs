@@ -574,10 +574,8 @@ fn verify_execution(
         );
     }
 
-    for shard_index in 0..GROUP_COUNT {
-        let shard = model.shards[shard_index]
-            .lock()
-            .expect("inspect shard state");
+    for (shard_index, shard) in model.shards.iter().enumerate() {
+        let shard = shard.lock().expect("inspect shard state");
         for version in &shard.versions {
             assert!(
                 version.sequence <= successful_count,

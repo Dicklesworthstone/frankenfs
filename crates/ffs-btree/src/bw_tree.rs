@@ -3012,11 +3012,11 @@ mod tests {
 
         // With high threshold, no pages should need consolidation.
         let to_consolidate = table.scan_for_consolidation(100);
-        assert!(to_consolidate.is_empty());
+        assert_eq!(to_consolidate, [] as [PageId; 0]);
 
         // With low threshold, the page should need consolidation.
         let to_consolidate = table.scan_for_consolidation(5);
-        assert!(!to_consolidate.is_empty());
+        assert_ne!(to_consolidate, [] as [PageId; 0]);
         assert!(to_consolidate.contains(&page));
     }
 

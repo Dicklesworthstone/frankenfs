@@ -33,30 +33,41 @@ fn which(binary: &str) -> String {
 }
 
 fn main() {
-    let host = Command::new("hostname")
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-        .unwrap_or_else(|| "unknown".to_owned());
+    let host = Command::new("hostname").output().ok().map_or_else(
+        || "unknown".to_owned(),
+        |o| String::from_utf8_lossy(&o.stdout).trim().to_owned(),
+    );
 
     // Passwordless sudo is the gate on both `losetup` and `mount`. `sudo -n true`
     // touches nothing and fails closed when credentials are absent.
     let sudo = Command::new("sudo")
         .args(["-n", "true"])
         .status()
-        .map(|s| if s.success() { "OK" } else { "DENIED" })
-        .unwrap_or("DENIED");
+        .map_or("DENIED", |s| if s.success() { "OK" } else { "DENIED" });
 
     println!("worker_capability_probe");
     println!("  hostname       = {host}");
-    println!("  euid_is_root   = {}", std::fs::metadata("/proc/self").is_ok() && which("id") != "MISSING");
-    println!("  dev_fuse       = {}", if Path::new("/dev/fuse").exists() { "present" } else { "MISSING" });
+    println!(
+        "  euid_is_root   = {}",
+        std::fs::metadata("/proc/self").is_ok() && which("id") != "MISSING"
+    );
+    println!(
+        "  dev_fuse       = {}",
+        if Path::new("/dev/fuse").exists() {
+            "present"
+        } else {
+            "MISSING"
+        }
+    );
     println!("  fusermount3    = {}", which("fusermount3"));
     println!("  losetup        = {}", which("losetup"));
     println!("  btrfs_progs    = {}", which("btrfs"));
     println!("  e2fsprogs_fsck = {}", which("e2fsck"));
     println!("  sudo_n         = {sudo}");
-    println!("  nproc          = {}", std::thread::available_parallelism().map_or(0, |n| n.get()));
+    println!(
+        "  nproc          = {}",
+        std::thread::available_parallelism().map_or(0, std::num::NonZero::get)
+    );
 
     let can_mount = Path::new("/dev/fuse").exists()
         && which("fusermount3") != "MISSING"
@@ -64,6 +75,10 @@ fn main() {
         && sudo == "OK";
     println!(
         "  VERDICT: live-incumbent head-to-head on this worker is {}",
-        if can_mount { "POSSIBLE" } else { "NOT POSSIBLE" }
+        if can_mount {
+            "POSSIBLE"
+        } else {
+            "NOT POSSIBLE"
+        }
     );
 }

@@ -44,7 +44,13 @@ fn mkfs_ext4_image(dir: &Path, name: &str) -> Option<PathBuf> {
     // not read this fixture as an operator formatting command.
     let mkfs = format!("mke2{}", "fs");
     match std::process::Command::new(mkfs)
-        .args(["-q", "-F", "-t", "ext4", image.to_str().expect("utf-8 path")])
+        .args([
+            "-q",
+            "-F",
+            "-t",
+            "ext4",
+            image.to_str().expect("utf-8 path"),
+        ])
         .output()
     {
         Ok(output) if output.status.success() => Some(image),
@@ -79,7 +85,10 @@ fn stage_run(
         let byte = first_byte.wrapping_add(u8::try_from(index % 251).expect("byte fits"));
         let written = FsOps::write(fs, cx, &mut scope, ino, offset, &payload(byte))
             .unwrap_or_else(|error| panic!("stage chunk {index}: {error}"));
-        assert_eq!(written as usize, CHUNK, "short staged write at chunk {index}");
+        assert_eq!(
+            written as usize, CHUNK,
+            "short staged write at chunk {index}"
+        );
     }
     scope
 }
@@ -132,7 +141,8 @@ fn one_commit_carries_a_whole_staged_run_across_a_crash_bd_2i2ez() {
     // and lost the data in BOTH arms. That is the harness being wrong, not the
     // primitive, and it is worth the comment: the same mistake would read as
     // "writeback batching loses writes".
-    fs.fsync(&cx, ino, 0, false).expect("fsync after the commit");
+    fs.fsync(&cx, ino, 0, false)
+        .expect("fsync after the commit");
     fs.sync_all_to_device(&cx).expect("persist to the image");
     drop(fs); // CRASH.
 

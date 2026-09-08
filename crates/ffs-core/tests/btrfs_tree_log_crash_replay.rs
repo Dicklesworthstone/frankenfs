@@ -201,7 +201,14 @@ fn tree_logged_fsync_survives_the_full_commit_after_recovery_bd_jhuob() {
     //    retires `log_root` (bd-mogn1). If the replayed items never reached
     //    those trees, this is the step that destroys them.
     let touched = recovered
-        .create(&cx, BTRFS_ROOT_DIR, OsStr::new("commit-trigger.bin"), 0o644, 0, 0)
+        .create(
+            &cx,
+            BTRFS_ROOT_DIR,
+            OsStr::new("commit-trigger.bin"),
+            0o644,
+            0,
+            0,
+        )
         .expect("create commit trigger")
         .ino;
     recovered
@@ -305,7 +312,14 @@ fn every_logged_inode_survives_the_recovery_commit_bd_jhuob() {
 
     let recovered = open_rw(&cx, &image, false).expect("recovery mount");
     let trigger = recovered
-        .create(&cx, BTRFS_ROOT_DIR, OsStr::new("multi-trigger.bin"), 0o644, 0, 0)
+        .create(
+            &cx,
+            BTRFS_ROOT_DIR,
+            OsStr::new("multi-trigger.bin"),
+            0o644,
+            0,
+            0,
+        )
         .expect("create commit trigger")
         .ino;
     recovered

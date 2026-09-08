@@ -197,7 +197,9 @@ pub fn receive_spin() -> u32 {
 #[must_use]
 pub fn receive_spin_adaptive() -> bool {
     fuser::channel::Channel::adaptive_from_value(
-        std::env::var("FFS_FUSE_RECEIVE_SPIN_ADAPTIVE").ok().as_deref(),
+        std::env::var("FFS_FUSE_RECEIVE_SPIN_ADAPTIVE")
+            .ok()
+            .as_deref(),
     )
 }
 
@@ -397,7 +399,6 @@ pub fn zero_message_opendir_enabled() -> bool {
 /// ⭐ What is retired: "measured as a transport win while costing more than it
 /// saved" is no longer an open question — it is a `1.160389x` win that costs
 /// nothing on this row's cache. The blocker moved; it did not survive.
-#[must_use]
 /// Whether the daemon tells the kernel to drop an inode's cached ATTRIBUTES after a
 /// mutation (`FFS_FUSE_INODE_INVAL`, default ON — may only ever SUBTRACT).
 ///
@@ -473,9 +474,7 @@ pub fn zero_message_open_measurement_enabled() -> bool {
         //     `Ok(())`, the only other definition is the `Arc` forwarder, and
         //     `no_fsops_impl_overrides_release_bd_q0xnl` keeps it that way.
         // Worth 48.60% of this row's crossings and a balanced 1.160389x.
-        zero_message_open_from_value(
-            std::env::var("FFS_FUSE_ZERO_MESSAGE_OPEN").ok().as_deref(),
-        )
+        zero_message_open_from_value(std::env::var("FFS_FUSE_ZERO_MESSAGE_OPEN").ok().as_deref())
     })
 }
 
@@ -3972,9 +3971,7 @@ impl ReaddirplusAttrMemo {
         // Relaxed is sufficient: a concurrent insert that this load misses is one
         // whose own `clear()` ordering the caller was already racing, and the memo
         // is a single-use hand-off whose miss costs a re-read, never a wrong answer.
-        if !self.enabled
-            || self.occupied.load(std::sync::atomic::Ordering::Relaxed) == 0
-        {
+        if !self.enabled || self.occupied.load(std::sync::atomic::Ordering::Relaxed) == 0 {
             return;
         }
         let Ok(mut state) = self.state.lock() else {
@@ -22935,8 +22932,14 @@ mod tests {
             "the five dispatches did not partition into the buckets; an attribution \
              that divides bucket nanoseconds by entries would move without the work moving"
         );
-        assert_eq!(snap.getattr_dispatch_count, 2, "two Getattr scopes were opened");
-        assert_eq!(snap.lookup_dispatch_count, 1, "Lookup must not fold into Getattr");
+        assert_eq!(
+            snap.getattr_dispatch_count, 2,
+            "two Getattr scopes were opened"
+        );
+        assert_eq!(
+            snap.lookup_dispatch_count, 1,
+            "Lookup must not fold into Getattr"
+        );
         // The granularity distinction, pinned so the doc above cannot go stale:
         // opening request scopes does NOT time a whole handler, because no handler
         // was entered. If this ever starts counting, the two quantities have been

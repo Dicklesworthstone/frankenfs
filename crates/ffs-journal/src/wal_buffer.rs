@@ -1413,7 +1413,7 @@ mod tests {
         let buf1 = pool.allocate_buffer(1);
 
         let (entries, result) = pool.drain_all(&mut [buf0, buf1]);
-        assert!(entries.is_empty());
+        assert_eq!(entries, [] as [WalEntry; 0]);
         assert_eq!(result.entries_flushed, 0);
         assert_eq!(result.buffers_drained, 0);
     }
@@ -1543,7 +1543,7 @@ mod tests {
     fn thread_local_drain_without_init_returns_empty() {
         let handle = std::thread::spawn(|| {
             let drained = drain_thread_buffer();
-            assert!(drained.is_empty());
+            assert_eq!(drained, [] as [WalEntry; 0]);
         });
         handle.join().expect("no panic");
     }
@@ -2064,7 +2064,7 @@ mod tests {
         assert_eq!(result.entries_written, 5);
         assert_eq!(result.payload_bytes, 5 * 64);
         assert_eq!(result.fsyncs_issued, 1);
-        assert!(remaining.is_empty());
+        assert_eq!(remaining, [] as [WalEntry; 0]);
 
         // Epoch 1 should now be durable.
         assert!(epoch_mgr.is_durable(1));
@@ -2130,7 +2130,7 @@ mod tests {
         let (result, remaining) = coord.flush_epoch(entries, 1).expect("flush");
         assert_eq!(result.entries_written, 0);
         assert_eq!(result.fsyncs_issued, 0);
-        assert!(remaining.is_empty());
+        assert_eq!(remaining, [] as [WalEntry; 0]);
         assert!(epoch_mgr.is_durable(1));
     }
 
@@ -2301,7 +2301,7 @@ mod tests {
         assert_eq!(gc_result.epoch, 1);
         assert_eq!(gc_result.entries_written, 8);
         assert_eq!(gc_result.fsyncs_issued, 1);
-        assert!(remaining.is_empty()); // All entries were epoch 1.
+        assert_eq!(remaining, [] as [WalEntry; 0]); // All entries were epoch 1.
         assert!(epoch_mgr.is_durable(1));
         assert_eq!(notifier.durable_epoch(), 1);
     }
@@ -2425,7 +2425,7 @@ mod tests {
         // Later: flush epoch 2 with remaining entries.
         let (result2, remaining2) = coord.flush_epoch(remaining, 2).expect("flush rest");
         assert_eq!(result2.entries_written, 3);
-        assert!(remaining2.is_empty());
+        assert_eq!(remaining2, [] as [WalEntry; 0]);
         assert!(epoch_mgr.is_durable(2));
     }
 
@@ -2533,7 +2533,7 @@ mod tests {
         // Flush epoch 2.
         let (result2, remaining2) = coord.flush_epoch(remaining, 2).expect("flush 2");
         assert_eq!(result2.entries_written, 6);
-        assert!(remaining2.is_empty());
+        assert_eq!(remaining2, [] as [WalEntry; 0]);
         assert!(epoch_mgr.is_durable(2));
     }
 

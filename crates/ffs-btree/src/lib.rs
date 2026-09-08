@@ -3034,7 +3034,7 @@ Hole { hole_len: 90 }
         let after_indexes = parse_index_entries(&root, &after_header).unwrap();
         assert_eq!(after_indexes.len(), 2);
         assert_eq!(after_indexes[1].logical_block, 30);
-        assert!(alloc.freed_blocks().is_empty());
+        assert_eq!(alloc.freed_blocks(), [] as [u64; 0]);
 
         let removed = search(&cx, &dev, &root, 20).unwrap();
         assert!(matches!(removed, SearchResult::Hole { .. }));
@@ -3090,7 +3090,7 @@ Hole { hole_len: 90 }
         .unwrap();
 
         assert_eq!(count, 0);
-        assert!(visited.is_empty());
+        assert_eq!(visited, [] as [Ext4Extent; 0]);
     }
 
     #[test]
@@ -3109,11 +3109,11 @@ Hole { hole_len: 90 }
 
         // Delete range entirely before the extent.
         let freed = delete_range(&cx, &dev, &mut root, 0, 5, &mut alloc).unwrap();
-        assert!(freed.is_empty());
+        assert_eq!(freed, [] as [FreedRange; 0]);
 
         // Delete range entirely after the extent.
         let freed = delete_range(&cx, &dev, &mut root, 20, 10, &mut alloc).unwrap();
-        assert!(freed.is_empty());
+        assert_eq!(freed, [] as [FreedRange; 0]);
 
         // Original extent still intact.
         let result = search(&cx, &dev, &root, 10).unwrap();
@@ -3569,7 +3569,7 @@ Hole { hole_len: 90 }
         let mut alloc = SeqAllocator::new(100);
 
         let freed = delete_range(&cx, &dev, &mut root, 0, 100, &mut alloc).unwrap();
-        assert!(freed.is_empty());
+        assert_eq!(freed, [] as [FreedRange; 0]);
 
         let (header, _) = parse_header(&root).unwrap();
         assert_eq!(header.entries, 0);
@@ -3797,7 +3797,7 @@ Hole { hole_len: 90 }
 
         // count=0 means empty range, should delete nothing.
         let freed = delete_range(&cx, &dev, &mut root, 10, 0, &mut alloc).unwrap();
-        assert!(freed.is_empty());
+        assert_eq!(freed, [] as [FreedRange; 0]);
 
         let result = search(&cx, &dev, &root, 10).unwrap();
         assert!(matches!(result, SearchResult::Found { .. }));
@@ -4674,7 +4674,7 @@ Hole { hole_len: 90 }
 
         // Delete range [0..50) — no overlap with extent [100..110)
         let freed = delete_range(&cx, &dev, &mut root, 0, 50, &mut alloc).unwrap();
-        assert!(freed.is_empty());
+        assert_eq!(freed, [] as [FreedRange; 0]);
 
         // Extent should still be there
         assert!(matches!(

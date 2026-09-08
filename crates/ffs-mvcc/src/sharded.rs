@@ -1544,19 +1544,17 @@ impl ShardedMvccStore {
         let mut run_next: u64 = 0;
         let mut run: Vec<FlushChunk> = Vec::new();
 
-        let write_run = |device: &D,
-                         start: Option<BlockNumber>,
-                         run: &mut Vec<FlushChunk>|
-         -> FfsResult<()> {
-            if let Some(start) = start
-                && !run.is_empty()
-            {
-                let slices: Vec<&[u8]> = run.iter().map(FlushChunk::as_slice).collect();
-                device.write_contiguous_blocks_vectored(cx, start, &slices)?;
-            }
-            run.clear();
-            Ok(())
-        };
+        let write_run =
+            |device: &D, start: Option<BlockNumber>, run: &mut Vec<FlushChunk>| -> FfsResult<()> {
+                if let Some(start) = start
+                    && !run.is_empty()
+                {
+                    let slices: Vec<&[u8]> = run.iter().map(FlushChunk::as_slice).collect();
+                    device.write_contiguous_blocks_vectored(cx, start, &slices)?;
+                }
+                run.clear();
+                Ok(())
+            };
 
         for block in &keys {
             let continues = run_start.is_some() && block.0 == run_next;

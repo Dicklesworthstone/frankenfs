@@ -844,10 +844,8 @@ impl FsOps for OpenFs {
     fn listxattr(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<Vec<String>> {
         match &self.flavor {
             FsFlavor::Ext4(_) => {
-                let entries = self.ext4_cached_inode_xattr_entries(
-                    cx,
-                    Self::ext4_canonical_inode(ino),
-                )?;
+                let entries =
+                    self.ext4_cached_inode_xattr_entries(cx, Self::ext4_canonical_inode(ino))?;
                 Ok(entries.iter().map(|(xattr, _)| xattr.full_name()).collect())
             }
             FsFlavor::Btrfs(_) => self.btrfs_listxattr(cx, ino),
@@ -865,23 +863,20 @@ impl FsOps for OpenFs {
         Self::xattr_name_within_limit_or_erange(name)?;
         match &self.flavor {
             FsFlavor::Ext4(_) => {
-                let entries = self.ext4_cached_inode_xattr_entries(
-                    cx,
-                    Self::ext4_canonical_inode(ino),
-                )?;
-                let found = if let Ok((name_index, suffix)) =
-                    ffs_xattr::parse_xattr_name_borrowed(name)
-                {
-                    entries.iter().find_map(|(xattr, value_inum)| {
-                        (xattr.name_index == name_index && xattr.name == suffix)
-                            .then(|| (xattr.name_index, xattr.value.clone(), *value_inum))
-                    })
-                } else {
-                    entries.iter().find_map(|(xattr, value_inum)| {
-                        (xattr.full_name() == name)
-                            .then(|| (xattr.name_index, xattr.value.clone(), *value_inum))
-                    })
-                };
+                let entries =
+                    self.ext4_cached_inode_xattr_entries(cx, Self::ext4_canonical_inode(ino))?;
+                let found =
+                    if let Ok((name_index, suffix)) = ffs_xattr::parse_xattr_name_borrowed(name) {
+                        entries.iter().find_map(|(xattr, value_inum)| {
+                            (xattr.name_index == name_index && xattr.name == suffix)
+                                .then(|| (xattr.name_index, xattr.value.clone(), *value_inum))
+                        })
+                    } else {
+                        entries.iter().find_map(|(xattr, value_inum)| {
+                            (xattr.full_name() == name)
+                                .then(|| (xattr.name_index, xattr.value.clone(), *value_inum))
+                        })
+                    };
                 let Some((name_index, value, value_inum)) = found else {
                     return Ok(None);
                 };

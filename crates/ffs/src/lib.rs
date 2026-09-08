@@ -409,7 +409,7 @@ mod tests {
             inodes: Vec::new(),
         };
         assert_eq!(orphans.head, 0);
-        assert!(orphans.inodes.is_empty());
+        assert_eq!(orphans.inodes.len(), 0);
     }
 
     #[test]

@@ -51,7 +51,10 @@ fn two_pass(raw: &[(u64, u64)]) -> (Vec<(u64, u64)>, u64) {
     // same work under a different spelling, but rewriting the control arm of a
     // comparison to satisfy a lint is how a benchmark quietly stops measuring what
     // its name says.
-    #[expect(clippy::iter_cloned_collect, reason = "the control arm's exact shape is the subject")]
+    #[expect(
+        clippy::iter_cloned_collect,
+        reason = "the control arm's exact shape is the subject"
+    )]
     let allocated_ranges: Vec<(u64, u64)> = raw.iter().copied().collect();
     let mut last_extent_end = MIN_USABLE;
     for &(ext_start, ext_size) in &allocated_ranges {

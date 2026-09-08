@@ -1118,9 +1118,10 @@ mod tests {
     /// already computed, which would pass by construction and prove nothing.
     #[test]
     fn reported_edit_span_encloses_every_mutated_byte_bd_4sull() {
+        type TrackedInsert = fn(&mut [u8]) -> Result<(usize, Option<DirBlockEdit>)>;
         // (label, builder) covering BOTH tracked entry points and, within each,
         // both the tombstone-reuse and the slack-split slot paths.
-        let cases: Vec<(&str, fn(&mut [u8]) -> Result<(usize, Option<DirBlockEdit>)>)> = vec![
+        let cases: Vec<(&str, TrackedInsert)> = vec![
             ("add_entry_tracked", |block| {
                 add_entry_tracked(block, 7, b"inserted", Ext4FileType::RegFile, 0)
             }),

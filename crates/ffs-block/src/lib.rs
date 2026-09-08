@@ -4213,7 +4213,7 @@ mod tests {
                 if message.contains("injected byte read failure")),
             "expected injected byte read Format error, got {err:?}"
         );
-        assert!(bufs[0].as_slice().is_empty());
+        assert_eq!(bufs[0].as_slice(), [] as [u8; 0]);
         assert_eq!(bufs[1].as_slice(), &[0xBB; 4]);
     }
 
@@ -4345,7 +4345,7 @@ mod tests {
                 if message.contains("contiguous read block range overflow")),
             "expected contiguous-read overflow Format error, got {err:?}"
         );
-        assert!(dev.read_sequence().is_empty());
+        assert_eq!(dev.read_sequence(), [] as [BlockNumber; 0]);
         assert_eq!(bufs[0].as_slice(), &[0xAA; 4]);
         assert_eq!(bufs[1].as_slice(), &[0xBB; 4]);
     }
@@ -4365,7 +4365,7 @@ mod tests {
                 if message.contains("contiguous read block range overflow")),
             "expected contiguous-read overflow Format error, got {err:?}"
         );
-        assert!(dev.read_sequence().is_empty());
+        assert_eq!(dev.read_sequence(), [] as [BlockNumber; 0]);
         assert_eq!(dst, [0xAA; 8]);
     }
 
@@ -4383,7 +4383,7 @@ mod tests {
                 if message.contains("contiguous write block range overflow")),
             "expected contiguous-write overflow Format error, got {err:?}"
         );
-        assert!(dev.write_sequence().is_empty());
+        assert_eq!(dev.write_sequence(), [] as [BlockNumber; 0]);
     }
 
     /// The invariant that makes `sync` safe to do with `fdatasync`.
@@ -4935,7 +4935,7 @@ mod tests {
                 if message.contains("read range overflows u64")),
             "expected read-range overflow Format error, got {err:?}"
         );
-        assert!(dev.read_calls().is_empty());
+        assert_eq!(dev.read_calls(), [] as [(ByteOffset, usize); 0]);
         assert_eq!(first, [0xAA; 2]);
         assert_eq!(second, [0xBB; 1]);
     }
@@ -4960,7 +4960,7 @@ mod tests {
                     && message.contains("device_len=4")),
             "expected read-bounds Format error, got {err:?}"
         );
-        assert!(dev.read_calls().is_empty());
+        assert_eq!(dev.read_calls(), [] as [(ByteOffset, usize); 0]);
         assert_eq!(first, [0xAA; 1]);
         assert_eq!(second, [0xBB; 2]);
     }
@@ -6188,7 +6188,7 @@ mod tests {
             .write_block(&cx, BlockNumber(0), &[5_u8; 4096])
             .expect("write");
         assert_eq!(cache.dirty_count(), 0);
-        assert!(cache.dirty_blocks_oldest_first().is_empty());
+        assert_eq!(cache.dirty_blocks_oldest_first(), [] as [BlockNumber; 0]);
     }
 
     #[test]
@@ -9223,7 +9223,7 @@ write_latency: 0ns, bandwidth_bps: 0, stall_probability: 0.0, stall_duration: \
         assert_eq!(dt.dirty_count(), 0);
         assert_eq!(dt.dirty_bytes(), 0);
         assert!(dt.oldest_dirty_age_ticks().is_none());
-        assert!(dt.dirty_blocks_oldest_first().is_empty());
+        assert_eq!(dt.dirty_blocks_oldest_first(), [] as [BlockNumber; 0]);
         assert!(!dt.is_dirty(BlockNumber(0)));
         assert!(dt.entry(BlockNumber(0)).is_none());
         let (in_flight, committed) = dt.state_counts();
@@ -10744,7 +10744,7 @@ write_latency: 0ns, bandwidth_bps: 0, stall_probability: 0.0, stall_duration: \
         assert_eq!(tracker.dirty_count(), 0);
         assert_eq!(tracker.dirty_bytes(), 0);
         assert!(tracker.oldest_dirty_age_ticks().is_none());
-        assert!(tracker.dirty_blocks_oldest_first().is_empty());
+        assert_eq!(tracker.dirty_blocks_oldest_first(), [] as [BlockNumber; 0]);
         assert!(!tracker.is_dirty(BlockNumber(0)));
         assert!(tracker.entry(BlockNumber(0)).is_none());
         assert_eq!(tracker.state_counts(), (0, 0));
@@ -10962,7 +10962,7 @@ write_latency: 0ns, bandwidth_bps: 0, stall_probability: 0.0, stall_duration: \
         let v = AlignedVec::new(0, 4096);
         assert_eq!(v.len(), 0);
         assert!(v.is_empty());
-        assert!(v.as_slice().is_empty());
+        assert_eq!(v.as_slice(), [] as [u8; 0]);
     }
 
     #[test]
@@ -11027,7 +11027,7 @@ write_latency: 0ns, bandwidth_bps: 0, stall_probability: 0.0, stall_duration: \
     fn block_buf_empty() {
         let buf = BlockBuf::new(Vec::new());
         assert_eq!(buf.len(), 0);
-        assert!(buf.as_slice().is_empty());
+        assert_eq!(buf.as_slice(), [] as [u8; 0]);
     }
 
     #[test]

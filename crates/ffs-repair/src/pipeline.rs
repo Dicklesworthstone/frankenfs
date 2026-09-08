@@ -3884,7 +3884,7 @@ mod tests {
             4,
         );
 
-        assert!(pipeline.dirty_groups().is_empty());
+        assert_eq!(pipeline.dirty_groups(), [] as [GroupNumber; 0]);
         assert!(!pipeline.is_group_dirty(GroupNumber(0)));
         pipeline
             .mark_group_dirty(GroupNumber(0))
@@ -3895,7 +3895,7 @@ mod tests {
         pipeline
             .refresh_dirty_groups_now(&cx)
             .expect("refresh dirty groups");
-        assert!(pipeline.dirty_groups().is_empty());
+        assert_eq!(pipeline.dirty_groups(), [] as [GroupNumber; 0]);
         assert!(!pipeline.is_group_dirty(GroupNumber(0)));
     }
 
@@ -4586,11 +4586,11 @@ mod tests {
             read_generation(&cx, cache.inner(), layout),
             generation_before + 1
         );
-        assert!(
+        assert_eq!(
             queue
                 .drain_queued_groups()
-                .expect("drain queue after daemon run")
-                .is_empty()
+                .expect("drain queue after daemon run"),
+            [] as [GroupNumber; 0]
         );
     }
 
@@ -5355,7 +5355,7 @@ mod tests {
     fn queued_repair_refresh_empty_drain() {
         let queue = QueuedRepairRefresh::from_group_configs(&[]);
         let drained = queue.drain_queued_groups().expect("drain");
-        assert!(drained.is_empty());
+        assert_eq!(drained, [] as [GroupNumber; 0]);
     }
 
     #[test]
@@ -5379,7 +5379,7 @@ mod tests {
 
         // Second drain should be empty.
         let drained2 = queue.drain_queued_groups().expect("drain2");
-        assert!(drained2.is_empty());
+        assert_eq!(drained2, [] as [GroupNumber; 0]);
     }
 
     #[test]
@@ -5463,7 +5463,7 @@ mod tests {
             .on_flush_committed(&cx, &[BlockNumber(100)])
             .expect("flush");
         let drained = queue.drain_queued_groups().expect("drain");
-        assert!(drained.is_empty());
+        assert_eq!(drained, [] as [GroupNumber; 0]);
     }
 
     /// bd-scg17 — Regression for the QueuedRepairRefresh

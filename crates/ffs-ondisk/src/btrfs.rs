@@ -772,8 +772,7 @@ impl BtrfsCompatRoFeatures {
     /// read-write, would write its block-group items into the wrong tree.
     /// Read-only is still correct and is still allowed, which is exactly what
     /// the compat_ro class is for.
-    pub const IMPLEMENTED: Self =
-        Self(Self::FREE_SPACE_TREE.0 | Self::FREE_SPACE_TREE_VALID.0);
+    pub const IMPLEMENTED: Self = Self(Self::FREE_SPACE_TREE.0 | Self::FREE_SPACE_TREE_VALID.0);
 
     #[must_use]
     pub const fn bits(self) -> u64 {
@@ -2132,14 +2131,12 @@ impl BtrfsSuperblock {
             });
         }
         let bytes = entry.to_bytes()?;
-        let new_len = self
-            .sys_chunk_array
-            .len()
-            .checked_add(bytes.len())
-            .ok_or(ParseError::InvalidField {
+        let new_len = self.sys_chunk_array.len().checked_add(bytes.len()).ok_or(
+            ParseError::InvalidField {
                 field: "sys_chunk_array",
                 reason: "array length overflow",
-            })?;
+            },
+        )?;
         if new_len > BTRFS_SYS_CHUNK_ARRAY_MAX {
             return Err(ParseError::InvalidField {
                 field: "sys_chunk_array",
@@ -3141,8 +3138,7 @@ mod tests {
         );
         let written = entry.to_bytes().expect("serialize");
         assert_eq!(
-            written,
-            original,
+            written, original,
             "the sys_chunk_array entry must serialize back to the bytes it was read from"
         );
 
@@ -3166,7 +3162,8 @@ mod tests {
     fn chunk_entry_writer_refuses_what_its_parser_would_reject_bd_a136s() {
         let sb = BtrfsSuperblock::parse_superblock_region(&representative_sys_chunk_superblock())
             .expect("sb parse");
-        let good = parse_sys_chunk_array(&sb.sys_chunk_array[..97]).expect("chunk parse")[0].clone();
+        let good =
+            parse_sys_chunk_array(&sb.sys_chunk_array[..97]).expect("chunk parse")[0].clone();
         good.to_bytes().expect("the fixture must serialize");
 
         // A stripe count that disagrees with the stripe list. Writing
@@ -3181,11 +3178,17 @@ mod tests {
 
         let mut zero_length = good.clone();
         zero_length.length = 0;
-        assert!(zero_length.to_bytes().is_err(), "a zero-length chunk backs nothing");
+        assert!(
+            zero_length.to_bytes().is_err(),
+            "a zero-length chunk backs nothing"
+        );
 
         let mut zero_stripe_len = good.clone();
         zero_stripe_len.stripe_len = 0;
-        assert!(zero_stripe_len.to_bytes().is_err(), "a zero stripe_len divides by zero");
+        assert!(
+            zero_stripe_len.to_bytes().is_err(),
+            "a zero stripe_len divides by zero"
+        );
 
         // Two RAID profile bits at once — the parser rejects it, so the writer
         // must not be able to create it.
@@ -3198,7 +3201,10 @@ mod tests {
 
         let mut zero_devid = good.clone();
         zero_devid.stripes[0].devid = 0;
-        assert!(zero_devid.to_bytes().is_err(), "a stripe must name a device");
+        assert!(
+            zero_devid.to_bytes().is_err(),
+            "a stripe must name a device"
+        );
 
         // The key is only inline in the sys_chunk_array, and the KERNEL reads
         // that array before any tree is available — a bad key here is an
@@ -3206,7 +3212,10 @@ mod tests {
         // key, so it must still succeed for the same entry.
         let mut wrong_key = good;
         wrong_key.key.item_type = BTRFS_CHUNK_ITEM_KEY.wrapping_add(1);
-        assert!(wrong_key.to_bytes().is_err(), "a non-CHUNK_ITEM key must be refused");
+        assert!(
+            wrong_key.to_bytes().is_err(),
+            "a non-CHUNK_ITEM key must be refused"
+        );
         wrong_key
             .to_item_bytes()
             .expect("the item form carries no key and must still serialize");
@@ -3238,7 +3247,10 @@ mod tests {
 
         let mut zero_len = extent;
         zero_len.length = 0;
-        assert!(zero_len.to_bytes().is_err(), "a zero-length dev extent backs nothing");
+        assert!(
+            zero_len.to_bytes().is_err(),
+            "a zero-length dev extent backs nothing"
+        );
 
         let mut short = [0_u8; BTRFS_DEV_EXTENT_SIZE - 1];
         assert!(
@@ -3293,7 +3305,12 @@ mod tests {
             .expect("a fully allocated device is valid");
     }
 
-    fn chunk_at(logical: u64, length: u64, chunk_type: u64, stripes: &[(u64, u64)]) -> BtrfsChunkEntry {
+    fn chunk_at(
+        logical: u64,
+        length: u64,
+        chunk_type: u64,
+        stripes: &[(u64, u64)],
+    ) -> BtrfsChunkEntry {
         BtrfsChunkEntry {
             key: BtrfsKey {
                 objectid: BTRFS_FIRST_CHUNK_TREE_OBJECTID,
@@ -3377,7 +3394,7 @@ mod tests {
         const MB: u64 = 1024 * 1024;
 
         let empty = DeviceOccupancy::from_chunks(1, &[]).expect("derive");
-        assert!(empty.ranges().is_empty());
+        assert_eq!(empty.ranges(), [] as [(u64, u64); 0]);
         assert_eq!(empty.occupied_bytes(), 0);
         // An empty device still may not allocate below the reserved head.
         assert_eq!(empty.find_free(8 * MB, MB, 64 * MB), Some(MB));
@@ -3435,8 +3452,8 @@ mod tests {
     #[test]
     fn device_occupancy_refuses_striped_profiles_it_does_not_model_bd_a136s() {
         use chunk_type_flags::{
-            BTRFS_BLOCK_GROUP_DATA, BTRFS_BLOCK_GROUP_RAID0, BTRFS_BLOCK_GROUP_RAID10,
-            BTRFS_BLOCK_GROUP_RAID5, BTRFS_BLOCK_GROUP_RAID6,
+            BTRFS_BLOCK_GROUP_DATA, BTRFS_BLOCK_GROUP_RAID0, BTRFS_BLOCK_GROUP_RAID5,
+            BTRFS_BLOCK_GROUP_RAID6, BTRFS_BLOCK_GROUP_RAID10,
         };
         const MB: u64 = 1024 * 1024;
 
@@ -3490,7 +3507,8 @@ mod tests {
             let fits = occ.find_free(length, 0, DEV).is_some();
             let expected = length > 0 && length <= occ.largest_free_run(0, DEV);
             assert_eq!(
-                fits, expected,
+                fits,
+                expected,
                 "find_free and largest_free_run disagree at {length_mb} MiB: \
                  find_free says {fits}, largest run is {} MiB",
                 occ.largest_free_run(0, DEV) / MB
@@ -3527,17 +3545,13 @@ mod tests {
         use chunk_type_flags::{BTRFS_BLOCK_GROUP_METADATA, BTRFS_BLOCK_GROUP_SYSTEM};
         const MB: u64 = 1024 * 1024;
 
-        let mut sb = BtrfsSuperblock::parse_superblock_region(&representative_sys_chunk_superblock())
-            .expect("sb parse");
+        let mut sb =
+            BtrfsSuperblock::parse_superblock_region(&representative_sys_chunk_superblock())
+                .expect("sb parse");
         let original = sb.sys_chunk_array.clone();
         assert_eq!(original.len(), 97);
 
-        let entry = chunk_at(
-            32 * MB,
-            8 * MB,
-            BTRFS_BLOCK_GROUP_SYSTEM,
-            &[(1, 24 * MB)],
-        );
+        let entry = chunk_at(32 * MB, 8 * MB, BTRFS_BLOCK_GROUP_SYSTEM, &[(1, 24 * MB)]);
         sb.append_sys_chunk_entry(&entry).expect("append");
 
         // The existing entry is byte-for-byte untouched — an append that rewrote
@@ -3558,13 +3572,18 @@ mod tests {
         let entries = parse_sys_chunk_array(&sb.sys_chunk_array).expect("reparse");
         assert_eq!(entries.len(), 2);
         assert_eq!(entries[0].key.offset, 0x100_0000);
-        assert_eq!(entries[1], entry, "the appended entry must round-trip exactly");
+        assert_eq!(
+            entries[1], entry,
+            "the appended entry must round-trip exactly"
+        );
 
         // Through the real superblock writer and back. If THIS assertion is the
         // one that fails, look at `to_bytes`/`parse_superblock_region` rather
         // than at the append — the array assertions above already passed.
-        let rebuilt = BtrfsSuperblock::parse_superblock_region(&sb.to_bytes().expect("superblock serializes"))
-            .expect("superblock round-trip");
+        let rebuilt = BtrfsSuperblock::parse_superblock_region(
+            &sb.to_bytes().expect("superblock serializes"),
+        )
+        .expect("superblock round-trip");
         assert_eq!(rebuilt.sys_chunk_array, sb.sys_chunk_array);
         assert_eq!(
             parse_sys_chunk_array(&rebuilt.sys_chunk_array)
@@ -3596,8 +3615,9 @@ mod tests {
         use chunk_type_flags::BTRFS_BLOCK_GROUP_SYSTEM;
         const MB: u64 = 1024 * 1024;
 
-        let mut sb = BtrfsSuperblock::parse_superblock_region(&representative_sys_chunk_superblock())
-            .expect("sb parse");
+        let mut sb =
+            BtrfsSuperblock::parse_superblock_region(&representative_sys_chunk_superblock())
+                .expect("sb parse");
         sb.sys_chunk_array.clear();
         assert_eq!(sb.sys_chunk_array_free(), 2048);
 
@@ -3614,7 +3634,10 @@ mod tests {
                 break;
             }
             appended += 1;
-            assert!(appended < 64, "the array must fill and refuse, not grow forever");
+            assert!(
+                appended < 64,
+                "the array must fill and refuse, not grow forever"
+            );
         }
 
         assert_eq!(appended, 21_u64, "97-byte entries: 21 fit in 2048 bytes");
@@ -3700,7 +3723,12 @@ mod tests {
         use chunk_type_flags::BTRFS_BLOCK_GROUP_METADATA;
         const MB: u64 = 1024 * 1024;
 
-        let chunks = vec![chunk_at(0, 8 * MB, BTRFS_BLOCK_GROUP_METADATA, &[(1, 16 * MB)])];
+        let chunks = vec![chunk_at(
+            0,
+            8 * MB,
+            BTRFS_BLOCK_GROUP_METADATA,
+            &[(1, 16 * MB)],
+        )];
         let mut occ = DeviceOccupancy::from_chunks(1, &chunks).expect("derive");
 
         // Below everything already there.
@@ -3738,8 +3766,9 @@ mod tests {
         // 22 whole 97-byte entries is 2134 bytes against the format's 2048-byte
         // sys_chunk_array — stated rather than asserted, because an assertion over
         // two literals is one clippy rightly refuses in either form.
-        let mut sb = BtrfsSuperblock::parse_superblock_region(&representative_sys_chunk_superblock())
-            .expect("sb parse");
+        let mut sb =
+            BtrfsSuperblock::parse_superblock_region(&representative_sys_chunk_superblock())
+                .expect("sb parse");
 
         // Exactly at the limit is fine: refusing it would refuse a legal
         // superblock.
@@ -4107,8 +4136,7 @@ mod tests {
     #[test]
     fn an_unsupported_compat_ro_feature_still_reads_bd_btfeat() {
         let mut sb = supported_feature_superblock();
-        sb[0xB4..0xBC]
-            .copy_from_slice(&BtrfsCompatRoFeatures::BLOCK_GROUP_TREE.0.to_le_bytes());
+        sb[0xB4..0xBC].copy_from_slice(&BtrfsCompatRoFeatures::BLOCK_GROUP_TREE.0.to_le_bytes());
         let parsed = BtrfsSuperblock::parse_superblock_region(&sb).expect("sb parses");
 
         parsed
@@ -4606,7 +4634,7 @@ mod tests {
     #[test]
     fn parse_sys_chunk_array_empty() {
         let entries = parse_sys_chunk_array(&[]).expect("empty array is valid");
-        assert!(entries.is_empty());
+        assert_eq!(entries, [] as [BtrfsChunkEntry; 0]);
     }
 
     #[test]
@@ -6204,7 +6232,7 @@ mod tests {
         let block = make_block(512, 0, 0);
         let (header, items) = parse_leaf_items(&block).expect("empty leaf");
         assert_eq!(header.nritems, 0);
-        assert!(items.is_empty());
+        assert_eq!(items, [] as [BtrfsItem; 0]);
     }
 
     const REPRESENTATIVE_BTRFS_SUPERBLOCK_DEBUG_GOLDEN: &str = concat!(

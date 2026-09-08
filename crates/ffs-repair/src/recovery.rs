@@ -1185,7 +1185,7 @@ mod tests {
         let result = orchestrator.recover_from_indices(&cx, &[]);
         assert!(result.is_success());
         assert_eq!(result.evidence.corrupt_count, 0);
-        assert!(result.repaired_blocks.is_empty());
+        assert_eq!(result.repaired_blocks, [] as [BlockNumber; 0]);
     }
 
     #[test]

@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 
-/// Degradation, backpressure, and compute-budget management for graceful overload handling.
-pub mod degradation;
 /// Read-only btrfs extent-tree allocation diagnostics.
 pub mod btrfs_debug;
+/// Degradation, backpressure, and compute-budget management for graceful overload handling.
+pub mod degradation;
 /// NFS-style file handles for `name_to_handle_at(2)` / `open_by_handle_at(2)`.
 pub mod file_handle;
 /// MVCC-store lock-model abstraction for the parallel-write wiring.
@@ -212,9 +212,9 @@ fn ext4_gdt_skip_unchanged() -> bool {
     static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *SKIP.get_or_init(|| {
         std::env::var("FFS_EXT4_GDT_SKIP_UNCHANGED").is_ok_and(|raw| {
-                let v = raw.trim();
-                v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
-            })
+            let v = raw.trim();
+            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+        })
     })
 }
 
@@ -1978,7 +1978,9 @@ impl<'a> Iterator for BtrfsReadExtentIter<'a> {
 
     fn next(&mut self) -> Option<Self::Item> {
         match self {
-            Self::Owned(rows) => rows.next().map(|(logical_start, extent)| (logical_start, extent)),
+            Self::Owned(rows) => rows
+                .next()
+                .map(|(logical_start, extent)| (logical_start, extent)),
             Self::Indexed { rows, indices } => indices.next().map(|index| {
                 let (logical_start, extent) = &rows[*index];
                 (logical_start, extent)
@@ -2530,9 +2532,7 @@ const BTRFS_FLOOR_MEMO_SLOTS: usize = 4;
 /// memo: a zero-slot memo is a silent ~2.9x increase in descent work, not a
 /// configuration anyone means.
 fn btrfs_floor_memo_slot_count() -> usize {
-    btrfs_floor_memo_slots_from_value(
-        std::env::var("FFS_BTRFS_FLOOR_MEMO_SLOTS").ok().as_deref(),
-    )
+    btrfs_floor_memo_slots_from_value(std::env::var("FFS_BTRFS_FLOOR_MEMO_SLOTS").ok().as_deref())
 }
 
 /// Pure half of the knob, so the spelling is testable without mutating
@@ -3782,7 +3782,8 @@ impl BlockDevice for ByteDeviceBlockAdapter<'_> {
                 self.dev.len_bytes()
             )));
         }
-        self.dev.write_vectored_all_at(cx, ByteOffset(offset), chunks)
+        self.dev
+            .write_vectored_all_at(cx, ByteOffset(offset), chunks)
     }
 
     fn write_contiguous_blocks(
@@ -3969,7 +3970,8 @@ impl BlockDevice for CachedByteDeviceBlockAdapter<'_> {
             ));
         }
         self.invalidate_range(start, total / bs)?;
-        self.base.write_contiguous_blocks_vectored(cx, start, chunks)
+        self.base
+            .write_contiguous_blocks_vectored(cx, start, chunks)
     }
 
     fn block_size(&self) -> u32 {
@@ -5906,6 +5908,18 @@ impl OpenFs {
             )?;
             fs.ext4_fast_commit_replay = fs.maybe_collect_ext4_fast_commit_evidence(cx)?;
 
+            if options.ext4_journal_replay_mode != Ext4JournalReplayMode::Skip
+                && let Some(evidence) = fs.ext4_fast_commit_replay.as_ref()
+                && evidence.replay.fallback_required
+                && !evidence.replay.operations.is_empty()
+            {
+                return Err(FfsError::UnsupportedFeature(
+                    "fast-commit stream requires fallback but contains committed operations; \
+                     equivalent full-journal recovery is not established"
+                        .into(),
+                ));
+            }
+
             // Apply fast-commit operations if we have committed FC transactions
             // that don't require fallback to full JBD2 replay.
             let maybe_fc_ops = fs.ext4_fast_commit_replay.as_ref().and_then(|evidence| {
@@ -5913,31 +5927,22 @@ impl OpenFs {
                     .then(|| evidence.replay.operations.clone())
             });
             if let Some(operations) = maybe_fc_ops {
-                // Only mutate the base device when recovery is in Apply mode —
-                // the same condition under which JBD2 replay wrote back. Skip /
-                // SimulateOverlay must not write the base image (bd-6nwjx).
-                let writes_allowed = matches!(
-                    options.ext4_journal_replay_mode,
-                    Ext4JournalReplayMode::Apply
-                );
-                let verified = fs.apply_fast_commit_operations(cx, &operations, writes_allowed);
+                // SimulateOverlay already wraps dev in OverlayByteDevice, so
+                // replay must apply there too to expose a recovered read view.
+                // Only Skip is observational; overlay writes never reach the
+                // underlying image.
+                let writes_allowed =
+                    options.ext4_journal_replay_mode != Ext4JournalReplayMode::Skip;
+                // A full JBD2 replay is not a substitute for a committed FC
+                // transaction. Do not expose a filesystem whose recovery
+                // failed after applying only part of that transaction.
+                let verified = fs.apply_fast_commit_operations(cx, &operations, writes_allowed)?;
                 if let Some(evidence) = fs.ext4_fast_commit_replay.as_mut() {
-                    match verified {
-                        Ok(count) => {
-                            evidence.verified_operations = u64::try_from(count).unwrap_or(u64::MAX);
-                            info!(
-                                verified_ops = count,
-                                "ext4 fast-commit operations verified against metadata"
-                            );
-                        }
-                        Err(e) => {
-                            warn!(
-                                error = %e,
-                                "ext4 fast-commit operation application failed; \
-                                 filesystem state relies on JBD2 replay only"
-                            );
-                        }
-                    }
+                    evidence.verified_operations = u64::try_from(verified).unwrap_or(u64::MAX);
+                    info!(
+                        verified_ops = verified,
+                        "ext4 fast-commit operations verified against metadata"
+                    );
                 }
             }
 
@@ -7158,22 +7163,14 @@ impl OpenFs {
 
     /// Apply fast-commit operations to the filesystem metadata.
     ///
-    /// For each committed FC operation, performs the corresponding mutation:
-    /// - Create: log that inode creation was recorded (full create requires allocator)
-    /// - Link/Unlink: log directory entry mutations
-    /// - AddRange: log extent mapping
-    /// - DelRange: log extent unmapping
-    /// - InodeUpdate: re-read the inode from disk (JBD2 replay already wrote it)
+    /// Apply supported directory, inode and extent recovery to the base device
+    /// or replay overlay. Unsupported mutations and unreadable targets must
+    /// stop recovery; preceding JBD2 replay cannot substitute for missing FC
+    /// operations. With writes disabled, only collect target-readability
+    /// evidence for an explicit Skip open.
     ///
-    /// Returns the number of operations whose on-disk targets were verified.
-    ///
-    /// NOTE: Currently, FC operations are applied at the observability level —
-    /// the actual inode/dir mutations from FC are assumed to have been partially
-    /// captured by the preceding JBD2 replay. Full FC apply (allocating inodes,
-    /// creating directory entries from FC records alone) requires write-mode
-    /// infrastructure and is deferred to a future enhancement. The key value
-    /// now is that FC evidence is no longer silently discarded.
-    #[allow(clippy::unnecessary_wraps)]
+    /// The returned count describes verified targets, not a separate durability
+    /// boundary. External crash-image validation is still required.
     fn apply_fast_commit_operations(
         &self,
         cx: &Cx,
@@ -7182,30 +7179,31 @@ impl OpenFs {
     ) -> Result<usize, FfsError> {
         // External-extent-tree inodes need their ADD_RANGE leaves AND their
         // InodeUpdate applied together; do that coordinated pass first (bd-6nwjx
-        // incr 3b). The per-op loop below then leaves those inodes' InodeUpdate
-        // to the depth>0 guard (skip) since the coordinated pass already wrote
-        // the recovered inode, and counts ADD_RANGE as verified.
-        if writes_allowed {
-            self.apply_fast_commit_external_extent_recovery(cx, operations)?;
+        // incr 3b). The per-op loop skips only InodeUpdate records completed by
+        // that pass. Final range checks verify the resulting mappings.
+        let recovered_external_inodes = if writes_allowed {
+            let recovered = self.apply_fast_commit_external_extent_recovery(cx, operations)?;
             // DEL_RANGE pre-pass (bd-w6fxn): punch the removed logical ranges and
             // FREE their blocks BEFORE the per-op loop applies any InodeUpdate —
             // the punch must read the pre-recovery (on-device) extent tree to know
             // which physical blocks to release; once an InodeUpdate rewrites the
             // inode to its post-truncate extent root, those blocks would leak.
             self.apply_fast_commit_del_range_ops(cx, operations)?;
-        }
+            recovered
+        } else {
+            BTreeSet::new()
+        };
         let mut applied = 0_usize;
         for op in operations {
             match op {
                 ffs_journal::FcOperation::Create(dentry) => {
                     if self.verify_fast_commit_dentry_target(cx, dentry, "create") {
-                        // Apply (bd-6nwjx/bd-w6fxn): splice the new dir entry into
-                        // the parent so the create's name survives, not just the
-                        // inode. Best-effort: a skip (htree/no-room) leaves the
-                        // record verify-only. Only mutate the base device in
-                        // Apply mode.
-                        if writes_allowed {
-                            self.apply_fast_commit_add_dentry(cx, dentry)?;
+                        // A readable target alone does not recover its name.
+                        if writes_allowed && !self.apply_fast_commit_add_dentry(cx, dentry)? {
+                            return Err(FfsError::UnsupportedFeature(format!(
+                                "fast-commit CREATE recovery incomplete for inode {} in parent {}",
+                                dentry.ino, dentry.parent_ino
+                            )));
                         }
                         applied += 1;
                     }
@@ -7215,8 +7213,11 @@ impl OpenFs {
                         // A hard link is the same directory-entry insertion as a
                         // create (the target inode already exists); reuse the
                         // same recovery splice (bd-6nwjx/bd-w6fxn).
-                        if writes_allowed {
-                            self.apply_fast_commit_add_dentry(cx, dentry)?;
+                        if writes_allowed && !self.apply_fast_commit_add_dentry(cx, dentry)? {
+                            return Err(FfsError::UnsupportedFeature(format!(
+                                "fast-commit LINK recovery incomplete for inode {} in parent {}",
+                                dentry.ino, dentry.parent_ino
+                            )));
                         }
                         applied += 1;
                     }
@@ -7227,8 +7228,11 @@ impl OpenFs {
                         // name does not survive the crash. The inode's link count
                         // is handled by the accompanying InodeUpdate. Only mutate
                         // the base device in Apply mode.
-                        if writes_allowed {
-                            self.apply_fast_commit_remove_dentry(cx, dentry)?;
+                        if writes_allowed && !self.apply_fast_commit_remove_dentry(cx, dentry)? {
+                            return Err(FfsError::UnsupportedFeature(format!(
+                                "fast-commit UNLINK recovery incomplete for inode {} in parent {}",
+                                dentry.ino, dentry.parent_ino
+                            )));
                         }
                         applied += 1;
                     }
@@ -7260,11 +7264,11 @@ impl OpenFs {
                 ffs_journal::FcOperation::InodeUpdate(ino, raw_inode) => {
                     // Apply (bd-6nwjx): write the fast-committed inode back to the
                     // inode table so FC-only inode changes survive a crash, not
-                    // just verify the inode is readable. Only write when recovery
-                    // is permitted to mutate the base device (Apply mode); the
-                    // ino-only/placeholder case (empty body) stays verify-only.
+                    // just verify the inode is readable. Apply writes to the
+                    // base; SimulateOverlay writes only to its private overlay.
+                    // Empty bodies are permitted only in diagnostic Skip mode.
                     if self.verify_fast_commit_inode(cx, *ino) {
-                        if writes_allowed {
+                        if writes_allowed && !recovered_external_inodes.contains(ino) {
                             self.apply_fast_commit_inode_update(cx, *ino, raw_inode)?;
                         }
                         applied += 1;
@@ -7272,13 +7276,160 @@ impl OpenFs {
                 }
             }
         }
+        if writes_allowed && applied != operations.len() {
+            return Err(FfsError::Corruption {
+                block: 0,
+                detail: format!(
+                    "fast-commit recovery verified {applied} of {} operation targets",
+                    operations.len()
+                ),
+            });
+        }
+        if writes_allowed {
+            self.verify_fast_commit_recovered_ranges(cx, operations)?;
+        }
         Ok(applied)
+    }
+
+    /// Check final mappings, rather than merely checking whether the inode is
+    /// readable. Later range records supersede earlier records on overlaps.
+    fn verify_fast_commit_recovered_ranges(
+        &self,
+        cx: &Cx,
+        operations: &[ffs_journal::FcOperation],
+    ) -> Result<(), FfsError> {
+        let mut covered: BTreeMap<u32, BTreeMap<u64, u64>> = BTreeMap::new();
+        let mut final_inodes = BTreeSet::new();
+        let mut deleted_inodes = BTreeSet::new();
+        let mut extent_maps = BTreeMap::new();
+        for operation in operations.iter().rev() {
+            if let ffs_journal::FcOperation::InodeUpdate(ino, raw) = operation
+                && final_inodes.insert(*ino)
+                && raw.len() >= 0x1C
+                && raw[0x1A..0x1C] == [0, 0]
+            {
+                deleted_inodes.insert(*ino);
+            }
+        }
+        for operation in operations.iter().rev() {
+            let (ino, logical, len, expected) = match operation {
+                ffs_journal::FcOperation::AddRange(range) => (
+                    range.ino,
+                    range.logical_block,
+                    range.len,
+                    Some((range.physical_block, range.unwritten)),
+                ),
+                ffs_journal::FcOperation::DelRange(range) => {
+                    (range.ino, range.logical_block, range.len, None)
+                }
+                _ => continue,
+            };
+            if deleted_inodes.contains(&ino) || len == 0 {
+                continue;
+            }
+            let start = u64::from(logical);
+            let end = start + u64::from(len);
+            if end > u64::from(u32::MAX) + 1 {
+                return Err(FfsError::Format(
+                    "fast-commit logical range overflow".into(),
+                ));
+            }
+            if let std::collections::btree_map::Entry::Vacant(entry) = extent_maps.entry(ino) {
+                let inode = self.read_inode(cx, InodeNumber(u64::from(ino)))?;
+                entry.insert(self.collect_extents(cx, &inode)?);
+            }
+            let extents = &extent_maps[&ino];
+            let intervals = covered.entry(ino).or_default();
+            let first = intervals
+                .range(..=start)
+                .next_back()
+                .filter(|(_, previous_end)| **previous_end > start)
+                .map_or(start, |(previous_start, _)| *previous_start);
+            let overlaps: Vec<(u64, u64)> = intervals
+                .range(first..end)
+                .map(|(&lo, &hi)| (lo, hi))
+                .collect();
+            let mut cursor = start;
+            for &(lo, hi) in &overlaps {
+                if cursor < lo {
+                    Self::verify_fast_commit_mapping_segment(
+                        ino, extents, cursor, lo, start, expected,
+                    )?;
+                }
+                cursor = cursor.max(hi);
+            }
+            if cursor < end {
+                Self::verify_fast_commit_mapping_segment(
+                    ino, extents, cursor, end, start, expected,
+                )?;
+            }
+            let mut merged_start = start;
+            let mut merged_end = end;
+            for (lo, hi) in overlaps {
+                intervals.remove(&lo);
+                merged_start = merged_start.min(lo);
+                merged_end = merged_end.max(hi);
+            }
+            intervals.insert(merged_start, merged_end);
+        }
+        Ok(())
+    }
+
+    fn verify_fast_commit_mapping_segment(
+        ino: u32,
+        extents: &[Ext4Extent],
+        start: u64,
+        end: u64,
+        record_start: u64,
+        expected: Option<(u64, bool)>,
+    ) -> Result<(), FfsError> {
+        let incomplete = || FfsError::Corruption {
+            block: 0,
+            detail: format!(
+                "fast-commit inode {ino} recovered mapping does not match logical range {start}..{end}"
+            ),
+        };
+        let mut cursor = start;
+        for extent in extents {
+            let extent_start = u64::from(extent.logical_block);
+            let extent_end = extent_start + u64::from(extent.actual_len());
+            if extent_end <= cursor {
+                continue;
+            }
+            if extent_start >= end {
+                break;
+            }
+            let Some((physical, unwritten)) = expected else {
+                return Err(incomplete());
+            };
+            if extent_start > cursor || extent.is_unwritten() != unwritten {
+                return Err(incomplete());
+            }
+            let actual = extent
+                .physical_start
+                .checked_add(cursor - extent_start)
+                .ok_or_else(incomplete)?;
+            let required = physical
+                .checked_add(cursor - record_start)
+                .ok_or_else(incomplete)?;
+            if actual != required {
+                return Err(incomplete());
+            }
+            cursor = extent_end.min(end);
+            if cursor == end {
+                return Ok(());
+            }
+        }
+        if expected.is_some() && cursor != end {
+            return Err(incomplete());
+        }
+        Ok(())
     }
 
     /// Apply an `EXT4_FC_TAG_INODE` record (bd-6nwjx): write its raw on-disk
     /// `ext4_inode` bytes back into the inode table, mirroring JBD2 replay's
     /// direct-device writeback (no alloc_state required at mount). An empty body
-    /// (legacy ino-only record) is a no-op.
+    /// cannot restore inode state and is rejected.
     #[allow(clippy::items_after_statements)]
     fn apply_fast_commit_inode_update(
         &self,
@@ -7287,7 +7438,9 @@ impl OpenFs {
         raw_inode: &[u8],
     ) -> Result<(), FfsError> {
         if raw_inode.is_empty() {
-            return Ok(());
+            return Err(FfsError::UnsupportedFeature(format!(
+                "fast-commit inode {ino} record has no recoverable inode bytes"
+            )));
         }
         // DELETION (bd-4tmpw): a fast-committed inode with links_count == 0 is a
         // deleted inode (no valid file has zero links). Free it AND its blocks
@@ -7301,15 +7454,9 @@ impl OpenFs {
                 return self.free_fast_commit_deleted_inode(cx, ino);
             }
         }
-        // CONSISTENCY GUARD (bd-6nwjx): an inode with an EXTERNAL extent tree
-        // (eh_depth > 0) keeps its data extents in leaf blocks outside the inode.
-        // Those leaves are recovered by ADD_RANGE replay, which is not yet
-        // applied — so writing back this inode's header alone would point at
-        // stale/unrecovered leaves (the FC write may even have grown the tree),
-        // producing an inconsistent file. Until AddRange apply lands, skip the
-        // write and leave the inode at its last consistent (JBD2-committed)
-        // state. Inline-extent inodes (depth 0) fully describe their data and
-        // are safe to apply.
+        // External extent roots must be applied with their recovered leaves.
+        // The dispatcher bypasses this helper for inodes already completed by
+        // the coordinated pass; any remaining external inode is unsupported.
         const EXT4_EXTENT_HEADER_MAGIC: u16 = 0xF30A;
         if raw_inode.len() >= 0x30 {
             let flags = u32::from_le_bytes([
@@ -7322,14 +7469,9 @@ impl OpenFs {
                 let eh_magic = u16::from_le_bytes([raw_inode[0x28], raw_inode[0x29]]);
                 let eh_depth = u16::from_le_bytes([raw_inode[0x2E], raw_inode[0x2F]]);
                 if eh_magic == EXT4_EXTENT_HEADER_MAGIC && eh_depth > 0 {
-                    warn!(
-                        ino,
-                        eh_depth,
-                        "fc_apply: skipping inode_update with external extent tree \
-                         (depth>0); leaf extents need ADD_RANGE apply — preserving \
-                         the last consistent on-disk inode"
-                    );
-                    return Ok(());
+                    return Err(FfsError::UnsupportedFeature(format!(
+                        "fast-commit inode {ino} requires coordinated external extent recovery (depth {eh_depth})"
+                    )));
                 }
             }
         }
@@ -7535,7 +7677,16 @@ impl OpenFs {
         // `add_entry` inserts into the first free slot without scanning other
         // blocks for the name, so check the whole directory first (lookup_name
         // covers both the htree index and the linear scan).
-        if self.lookup_name(cx, &parent, &dentry.name)?.is_some() {
+        if let Some(existing) = self.lookup_name(cx, &parent, &dentry.name)? {
+            if existing.inode != dentry.ino {
+                return Err(FfsError::Corruption {
+                    block: 0,
+                    detail: format!(
+                        "fast-commit directory entry in parent {parent_ino} points to inode {}, expected {}",
+                        existing.inode, dentry.ino
+                    ),
+                });
+            }
             debug!(
                 parent_ino,
                 ino = dentry.ino,
@@ -7753,12 +7904,21 @@ impl OpenFs {
         }
         // Idempotent: the unlink may also have been captured by JBD2 replay or a
         // prior apply, leaving the name already absent.
-        if self.lookup_name(cx, &parent, &dentry.name)?.is_none() {
+        let Some(existing) = self.lookup_name(cx, &parent, &dentry.name)? else {
             debug!(
                 parent_ino,
                 "fc_apply: UNLINK entry already absent — idempotent no-op"
             );
             return Ok(true);
+        };
+        if existing.inode != dentry.ino {
+            return Err(FfsError::Corruption {
+                block: 0,
+                detail: format!(
+                    "fast-commit UNLINK in parent {parent_ino} found inode {}, expected {}",
+                    existing.inode, dentry.ino
+                ),
+            });
         }
 
         self.ext4_superblock()
@@ -7821,8 +7981,8 @@ impl OpenFs {
     /// `ext4_fc_replay_del_range`.
     ///
     /// Scoped to inline-root (depth-0) extent inodes — the common case. Legacy
-    /// indirect-mapped inodes and external (depth>0) extent trees are left to the
-    /// (verify-only) per-op pass; widening to those is tracked in bd-w6fxn. The
+    /// indirect-mapped inodes and external (depth>0) extent trees are rejected;
+    /// widening to those is tracked in bd-w6fxn. The
     /// punch reads the current on-device extents, so it is idempotent under a
     /// re-run (a range already punched frees nothing).
     #[allow(clippy::too_many_lines)]
@@ -7859,25 +8019,21 @@ impl OpenFs {
                 continue;
             }
             let ino = InodeNumber(u64::from(range.ino));
-            let mut inode = match self.read_inode(cx, ino) {
-                Ok(i) => i,
-                Err(error) => {
-                    warn!(ino = range.ino, error = %error, "fc_apply: DEL_RANGE target inode unreadable; skipping");
-                    continue;
-                }
-            };
+            let mut inode = self.read_inode(cx, ino)?;
             // Only inline-root extent inodes (depth 0): depth>0 leaves and legacy
             // indirect maps need the coordinated / indirect paths (bd-w6fxn).
             if inode.flags & EXT4_EXTENTS_FL == 0 || inode.extent_bytes.len() < 60 {
-                continue;
+                return Err(FfsError::UnsupportedFeature(format!(
+                    "fast-commit DEL_RANGE inode {} is not extent-mapped",
+                    range.ino
+                )));
             }
             let eh_depth = u16::from_le_bytes([inode.extent_bytes[6], inode.extent_bytes[7]]);
             if eh_depth > 0 {
-                warn!(
-                    ino = range.ino,
-                    eh_depth, "fc_apply: DEL_RANGE on external extent tree deferred (bd-w6fxn)"
-                );
-                continue;
+                return Err(FfsError::UnsupportedFeature(format!(
+                    "fast-commit DEL_RANGE inode {} requires external extent recovery (depth {eh_depth})",
+                    range.ino
+                )));
             }
 
             let mut root_bytes = Self::extent_root(&inode);
@@ -8031,20 +8187,23 @@ impl OpenFs {
         &self,
         cx: &Cx,
         operations: &[ffs_journal::FcOperation],
-    ) -> Result<(), FfsError> {
+    ) -> Result<BTreeSet<u32>, FfsError> {
         let mut by_inode: BTreeMap<u32, (Vec<Ext4Extent>, Option<Vec<u8>>)> = BTreeMap::new();
         for op in operations {
             match op {
                 ffs_journal::FcOperation::AddRange(r) => {
-                    let Ok(len16) = u16::try_from(r.len) else {
-                        continue;
-                    };
+                    let len16 = u16::try_from(r.len).map_err(|_| {
+                        FfsError::Format(
+                            "fast-commit ADD_RANGE length exceeds extent encoding".into(),
+                        )
+                    })?;
+                    if len16 == 0 || len16 > 0x8000 || (r.unwritten && len16 == 0x8000) {
+                        return Err(FfsError::Format(
+                            "fast-commit ADD_RANGE has an invalid extent length".into(),
+                        ));
+                    }
                     // ee_len > 32768 encodes an unwritten extent (actual = ee_len - 32768).
-                    let raw_len = if r.unwritten {
-                        len16.wrapping_add(0x8000)
-                    } else {
-                        len16
-                    };
+                    let raw_len = if r.unwritten { len16 + 0x8000 } else { len16 };
                     by_inode.entry(r.ino).or_default().0.push(Ext4Extent {
                         logical_block: r.logical_block,
                         raw_len,
@@ -8057,16 +8216,26 @@ impl OpenFs {
                 _ => {}
             }
         }
+        let mut recovered = BTreeSet::new();
         for (ino, (extents, maybe_inode)) in by_inode {
             if extents.is_empty() {
                 continue; // pure InodeUpdate → the main loop's guard handles it
             }
             let Some(inode_raw) = maybe_inode else {
-                continue; // ADD_RANGE with no matching inode record → leave alone
+                return Err(FfsError::UnsupportedFeature(format!(
+                    "fast-commit ADD_RANGE inode {ino} lacks its inode update"
+                )));
             };
-            self.try_recover_single_leaf_inode(cx, ino, &extents, &inode_raw)?;
+            if inode_raw.len() >= 0x1C && inode_raw[0x1A..0x1C] == [0, 0] {
+                // The main pass frees a deleted inode and its original tree.
+                // Publishing a recovered root first could strand those blocks.
+                continue;
+            }
+            if self.try_recover_single_leaf_inode(cx, ino, &extents, &inode_raw)? {
+                recovered.insert(ino);
+            }
         }
-        Ok(())
+        Ok(recovered)
     }
 
     /// Recover one external-extent-tree inode whose tree is a single-leaf
@@ -8083,10 +8252,10 @@ impl OpenFs {
         ino: u32,
         extents: &[Ext4Extent],
         inode_raw: &[u8],
-    ) -> Result<(), FfsError> {
+    ) -> Result<bool, FfsError> {
         let inode = self.read_inode(cx, InodeNumber(u64::from(ino)))?;
         if inode.flags & EXT4_EXTENTS_FL == 0 {
-            return Ok(());
+            return Ok(false);
         }
         let root = Self::extent_root(&inode);
         let eh_magic = u16::from_le_bytes([root[0], root[1]]);
@@ -8094,7 +8263,7 @@ impl OpenFs {
         let eh_depth = u16::from_le_bytes([root[6], root[7]]);
         // Only the single-leaf depth-1 case (one index entry → one leaf block).
         if eh_magic != 0xF30A || eh_depth != 1 || eh_entries != 1 {
-            return Ok(());
+            return Ok(false);
         }
         // First index entry (i_block + 12): ei_block@12, ei_leaf_lo@16, ei_leaf_hi@20.
         let leaf_lo = u32::from_le_bytes([root[16], root[17], root[18], root[19]]);
@@ -8116,40 +8285,38 @@ impl OpenFs {
         let leaf_before = self.read_block_vec(cx, leaf_bn)?;
 
         let mut root_bytes = root;
-        let mut all_ok = true;
+        let mut recovery_error = None;
         for ext in extents {
             // A single-leaf insert mutates only the leaf via the device; the
             // index root is unchanged unless the leaf splits (which needs growth
             // → the no-grow allocator errors and we roll back).
-            if ffs_btree::insert(cx, &block_dev, &mut root_bytes, *ext, &mut no_grow).is_err() {
-                all_ok = false;
+            if let Err(error) =
+                ffs_btree::insert(cx, &block_dev, &mut root_bytes, *ext, &mut no_grow)
+            {
+                recovery_error = Some(error);
                 break;
             }
         }
         // The cached copy (if any) of the rewritten leaf is now stale.
         self.ext4_file_data_block_cache.remove(&leaf_bn);
 
-        if all_ok {
-            // Leaves recovered → the inode (i_size/i_blocks/root) is now safe to
-            // apply, bypassing the depth>0 consistency guard.
-            self.recovery_write_inode_raw(cx, ino, inode_raw)?;
-            info!(
-                ino,
-                leaf = leaf_bn.0,
-                extents = extents.len(),
-                "fc_apply: recovered external single-leaf extent-tree inode"
-            );
-        } else {
-            // Restore the leaf; leave the inode at its JBD2-committed state.
+        if let Some(error) = recovery_error {
+            // Preserve the pre-recovery leaf, but do not disguise the failed
+            // transaction as a successful replay.
             block_dev.write_block(cx, leaf_bn, &leaf_before)?;
             self.ext4_file_data_block_cache.remove(&leaf_bn);
-            warn!(
-                ino,
-                "fc_apply: external-extent inode needs tree growth at recovery; \
-                 left at last consistent state"
-            );
+            return Err(error);
         }
-        Ok(())
+        // Leaves recovered → the inode (i_size/i_blocks/root) is now safe to
+        // apply, bypassing the depth>0 consistency guard.
+        self.recovery_write_inode_raw(cx, ino, inode_raw)?;
+        info!(
+            ino,
+            leaf = leaf_bn.0,
+            extents = extents.len(),
+            "fc_apply: recovered external single-leaf extent-tree inode"
+        );
+        Ok(true)
     }
 
     fn verify_fast_commit_dentry_target(
@@ -10176,22 +10343,19 @@ impl OpenFs {
         // function can be reached while a commit holds the allocator's write lock,
         // and a blocking acquire there would deadlock. If the lock is unavailable
         // the original "not covered" error stands, exactly as before.
-        let mapping = match map_logical_to_physical(&ctx.chunks, logical)? {
-            Some(mapping) => mapping,
-            None => {
-                let grown = self
-                    .btrfs_alloc_state
-                    .as_ref()
-                    .and_then(|state| state.try_read())
-                    .and_then(|state| {
-                        ffs_btrfs::chunk_entries_from_chunk_tree(&state.chunk_tree).ok()
-                    })
-                    .and_then(|live| map_logical_to_physical(&live, logical).ok().flatten());
-                grown.ok_or(ParseError::InvalidField {
-                    field: "logical_address",
-                    reason: "not covered by any chunk",
-                })?
-            }
+        let mapping = if let Some(mapping) = map_logical_to_physical(&ctx.chunks, logical)? {
+            mapping
+        } else {
+            let grown = self
+                .btrfs_alloc_state
+                .as_ref()
+                .and_then(|state| state.try_read())
+                .and_then(|state| ffs_btrfs::chunk_entries_from_chunk_tree(&state.chunk_tree).ok())
+                .and_then(|live| map_logical_to_physical(&live, logical).ok().flatten());
+            grown.ok_or(ParseError::InvalidField {
+                field: "logical_address",
+                reason: "not covered by any chunk",
+            })?
         };
         let mut buf = vec![0_u8; ns];
         self.dev
@@ -11029,13 +11193,13 @@ impl OpenFs {
         // objectid+type (the inode item is the only INODE_ITEM key for the object,
         // so this equals the range walk's `btrfs_find_inode_item`). Skip only when
         // no tree-log overlay must be merged (bd-cc-btrfs-point).
-        let inode_item = if !self.btrfs_tree_log_overlay_active.load(Ordering::Acquire) {
+        let inode_item = if self.btrfs_tree_log_overlay_active.load(Ordering::Acquire) {
+            let items = self.walk_btrfs_fs_tree_range(cx, inode_lo, inode_hi)?;
+            Self::btrfs_find_inode_item(&items, canonical)?.clone()
+        } else {
             self.walk_btrfs_fs_tree_floor(cx, inode_hi)?
                 .filter(|e| e.key.objectid == canonical && e.key.item_type == BTRFS_ITEM_INODE_ITEM)
                 .ok_or_else(|| FfsError::NotFound(format!("btrfs inode objectid {canonical}")))?
-        } else {
-            let items = self.walk_btrfs_fs_tree_range(cx, inode_lo, inode_hi)?;
-            Self::btrfs_find_inode_item(&items, canonical)?.clone()
         };
         parse_inode_item(&inode_item.data).map_err(|e| parse_to_ffs_error(&e))
     }
@@ -11117,14 +11281,15 @@ impl OpenFs {
         // non-empty log falls back to the overlay-applying range walk. Keys are
         // unique in a btrfs tree, so the floor-exact result is identical to the
         // one-key range walk's (bd-cc-btrfs-point).
-        let bucket: Vec<BtrfsLeafEntry> = if !self.btrfs_tree_log_overlay_active.load(Ordering::Acquire) {
-            self.walk_btrfs_fs_tree_floor(cx, dir_item_lo)?
-                .filter(|e| e.key == dir_item_lo)
-                .into_iter()
-                .collect()
-        } else {
-            self.walk_btrfs_fs_tree_range(cx, dir_item_lo, dir_item_hi)?
-        };
+        let bucket: Vec<BtrfsLeafEntry> =
+            if self.btrfs_tree_log_overlay_active.load(Ordering::Acquire) {
+                self.walk_btrfs_fs_tree_range(cx, dir_item_lo, dir_item_hi)?
+            } else {
+                self.walk_btrfs_fs_tree_floor(cx, dir_item_lo)?
+                    .filter(|e| e.key == dir_item_lo)
+                    .into_iter()
+                    .collect()
+            };
         for item in &bucket {
             let dir_items = parse_dir_items(&item.data).map_err(|e| parse_to_ffs_error(&e))?;
             for dir_item in dir_items {
@@ -11501,9 +11666,7 @@ impl OpenFs {
         {
             return Some((*grown).clone());
         }
-        let Some(lock) = self.btrfs_alloc_state.as_ref() else {
-            return None;
-        };
+        let lock = self.btrfs_alloc_state.as_ref()?;
         let Some(state) = lock.try_read() else {
             // bd-cjqhh: measured, not assumed — this tells a failing run whether the
             // fallback was refused by the lock or by the tree.
@@ -12561,206 +12724,204 @@ impl OpenFs {
 
         // Fetch the inode and extent items from either the COW tree (when
         // writes are enabled) or the on-disk FS tree.
-        let (inode, extents): (BtrfsInodeItem, BtrfsReadExtents) =
-            if let Some(alloc_mutex) = self.btrfs_alloc_state.as_ref() {
-                let alloc = alloc_mutex.read();
-                let inode = self.btrfs_read_inode_from_tree(&alloc, canonical)?;
-                // Fetch only the EXTENT_DATA items that can overlap the requested
-                // read window [offset, offset+size), bounding BOTH edges so the
-                // query is O(log N + overlapping) instead of an O(extents) scan
-                // over every extent of the inode (bd-4milp):
-                //   - Lower bound: `floor_key` seeks to the extent covering (or
-                //     immediately preceding) the read start. Any earlier extent
-                //     ends at or before `offset` and cannot overlap. Fall back to
-                //     offset 0 when the read begins before the inode's first
-                //     extent (no EXTENT_DATA of this inode at/before `offset`).
-                //   - Upper bound: an item keyed at or past the window end starts
-                //     after the last byte read and cannot contribute.
-                // The assembly loop below skips any non-overlapping item the range
-                // still returns and explicitly zero-fills any uncovered gaps, so
-                // the read result is byte-identical to the full scan.
+        let (inode, extents): (BtrfsInodeItem, BtrfsReadExtents) = if let Some(alloc_mutex) =
+            self.btrfs_alloc_state.as_ref()
+        {
+            let alloc = alloc_mutex.read();
+            let inode = self.btrfs_read_inode_from_tree(&alloc, canonical)?;
+            // Fetch only the EXTENT_DATA items that can overlap the requested
+            // read window [offset, offset+size), bounding BOTH edges so the
+            // query is O(log N + overlapping) instead of an O(extents) scan
+            // over every extent of the inode (bd-4milp):
+            //   - Lower bound: `floor_key` seeks to the extent covering (or
+            //     immediately preceding) the read start. Any earlier extent
+            //     ends at or before `offset` and cannot overlap. Fall back to
+            //     offset 0 when the read begins before the inode's first
+            //     extent (no EXTENT_DATA of this inode at/before `offset`).
+            //   - Upper bound: an item keyed at or past the window end starts
+            //     after the last byte read and cannot contribute.
+            // The assembly loop below skips any non-overlapping item the range
+            // still returns and explicitly zero-fills any uncovered gaps, so
+            // the read result is byte-identical to the full scan.
+            let seek = BtrfsKey {
+                objectid: canonical,
+                item_type: BTRFS_ITEM_EXTENT_DATA,
+                offset,
+            };
+            let lower_offset = match alloc
+                .fs_tree
+                .floor_key(&seek)
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?
+            {
+                Some(k) if k.objectid == canonical && k.item_type == BTRFS_ITEM_EXTENT_DATA => {
+                    k.offset
+                }
+                _ => 0,
+            };
+            let ext_start = BtrfsKey {
+                objectid: canonical,
+                item_type: BTRFS_ITEM_EXTENT_DATA,
+                offset: lower_offset,
+            };
+            let ext_end = BtrfsKey {
+                objectid: canonical,
+                item_type: BTRFS_ITEM_EXTENT_DATA,
+                offset: offset.saturating_add(u64::from(size)),
+            };
+            // Parse each EXTENT_DATA item straight from the bytes borrowed
+            // from the tree node — `range_with` (bd-h9awv) avoids the
+            // throwaway per-extent `Vec<u8>` clone `range` makes before the
+            // parse discards it. The parsed structs are what the csum-verify
+            // and assembly loops below keep.
+            let mut exts: Vec<(u64, BtrfsExtentData)> = Vec::new();
+            let mut cb_err: Option<FfsError> = None;
+            alloc
+                .fs_tree
+                .range_with(&ext_start, &ext_end, |k, v| {
+                    if cb_err.is_some() {
+                        return;
+                    }
+                    match parse_extent_data(v) {
+                        Ok(parsed) => exts.push((k.offset, parsed)),
+                        Err(e) => cb_err = Some(parse_to_ffs_error(&e)),
+                    }
+                })
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            drop(alloc);
+            if let Some(e) = cb_err {
+                return Err(e);
+            }
+            (inode, BtrfsReadExtents::Owned(exts))
+        } else if let Some(index) = self.btrfs_cached_read_plan_index() {
+            let inode = index.inodes.get(&canonical).copied().ok_or_else(|| {
+                FfsError::NotFound(format!("btrfs INODE_ITEM for objectid {canonical}"))
+            })?;
+            let read_end = offset.saturating_add(u64::from(size));
+            let exts = match index.extents.get(&canonical) {
+                Some(rows) => BtrfsReadExtents::ReadPlan {
+                    rows: Arc::clone(rows),
+                    indices: Self::btrfs_window_extent_indices(rows, offset, read_end)?,
+                },
+                None => BtrfsReadExtents::Owned(Vec::new()),
+            };
+            (inode, exts)
+        } else if !self.btrfs_tree_log_overlay_active.load(Ordering::Acquire) {
+            // bd-n5w92: per-inode read-only extent cache. With no pending
+            // tree log the on-disk fs tree is the complete, immutable extent
+            // source, so resolve the inode's FULL extent list once and filter
+            // the read window in-memory thereafter — a random read becomes an
+            // in-memory range filter instead of a fresh O(log N) tree descent
+            // (~180 us/read). The filter (logical_start < read_end &&
+            // extent_end > offset) is identical to the cached-index branch
+            // above, and the assembly loop still zero-fills holes, so reads
+            // are byte-identical to the windowed walk.
+            let key = BlockNumber(canonical);
+            // Lock-free hot-inode fast path: a single-file read stream hits
+            // the same `canonical` every read; serve it from the ArcSwap slot
+            // (no shard Mutex) when it matches. The selected window retains
+            // the entry Arc across read assembly, then borrows extent data
+            // from it — one cheap refcount operation, never an inline-payload
+            // clone.
+            let hot = self.btrfs_hot_inode_extents.load();
+            let entry_storage;
+            let entry: &Arc<(BtrfsInodeItem, Vec<(u64, BtrfsExtentData)>)> = match hot.as_ref() {
+                Some(slot) if slot.0 == canonical => &slot.1,
+                _ => {
+                    let e = if let Some(e) = self.btrfs_ro_inode_extents.get(&key) {
+                        e
+                    } else {
+                        let built = self.btrfs_load_inode_all_extents(cx, canonical)?;
+                        let arc = Arc::new(built);
+                        self.btrfs_ro_inode_extents.insert(key, Arc::clone(&arc));
+                        arc
+                    };
+                    // Publish into the lock-free slot for the next read of
+                    // this inode (last-writer-wins; the value is the same
+                    // immutable RO extent list the sharded cache holds).
+                    self.btrfs_hot_inode_extents
+                        .store(Some(Arc::new((canonical, Arc::clone(&e)))));
+                    entry_storage = e;
+                    &entry_storage
+                }
+            };
+            let read_end = offset.saturating_add(u64::from(size));
+            let exts = BtrfsReadExtents::Cached {
+                entry: Arc::clone(entry),
+                indices: Self::btrfs_window_extent_indices(&entry.1, offset, read_end)?,
+            };
+            (entry.0, exts)
+        } else {
+            // Bound the on-disk walk to the read window on BOTH edges so a
+            // read of a large fragmented file fetches the inode item and only
+            // the extents that can overlap [offset, offset+size) — not every
+            // EXTENT_DATA of the inode (mirrors the COW path's window bound,
+            // bd-4milp / bd-kms5z). The inode item and the EXTENT_DATA window
+            // are read as two targeted O(log N) descents:
+            //   - Inode item: the INODE_ITEM key span of this inode.
+            //   - Extents: lower bound = floor(EXTENT_DATA, offset) (the
+            //     extent covering or immediately preceding the read start —
+            //     earlier extents end at/before `offset` and cannot overlap),
+            //     upper bound = the window end. The floor is skipped (lower
+            //     bound 0) when a tree log is pending, since the floor descent
+            //     does not see logged items; the assembly loop skips any
+            //     non-overlapping item either way and the output is pre-zeroed
+            //     for holes, so the read is byte-identical to the full walk.
+            let inode_lo = BtrfsKey {
+                objectid: canonical,
+                item_type: BTRFS_ITEM_INODE_ITEM,
+                offset: 0,
+            };
+            let inode_hi = BtrfsKey {
+                objectid: canonical,
+                item_type: BTRFS_ITEM_INODE_ITEM,
+                offset: u64::MAX,
+            };
+            let inode_items = self.walk_btrfs_fs_tree_range(cx, inode_lo, inode_hi)?;
+            let inode_entry = Self::btrfs_find_inode_item(&inode_items, canonical)?;
+            let inode = parse_inode_item(&inode_entry.data).map_err(|e| parse_to_ffs_error(&e))?;
+
+            let lower_offset = if self.btrfs_tree_log_overlay_active.load(Ordering::Acquire) {
+                0
+            } else {
                 let seek = BtrfsKey {
                     objectid: canonical,
                     item_type: BTRFS_ITEM_EXTENT_DATA,
                     offset,
                 };
-                let lower_offset = match alloc
-                    .fs_tree
-                    .floor_key(&seek)
-                    .map_err(|e| btrfs_mutation_to_ffs(&e))?
-                {
-                    Some(k) if k.objectid == canonical && k.item_type == BTRFS_ITEM_EXTENT_DATA => {
-                        k.offset
+                match self.walk_btrfs_fs_tree_floor(cx, seek)? {
+                    Some(e)
+                        if e.key.objectid == canonical
+                            && e.key.item_type == BTRFS_ITEM_EXTENT_DATA =>
+                    {
+                        e.key.offset
                     }
                     _ => 0,
-                };
-                let ext_start = BtrfsKey {
-                    objectid: canonical,
-                    item_type: BTRFS_ITEM_EXTENT_DATA,
-                    offset: lower_offset,
-                };
-                let ext_end = BtrfsKey {
-                    objectid: canonical,
-                    item_type: BTRFS_ITEM_EXTENT_DATA,
-                    offset: offset.saturating_add(u64::from(size)),
-                };
-                // Parse each EXTENT_DATA item straight from the bytes borrowed
-                // from the tree node — `range_with` (bd-h9awv) avoids the
-                // throwaway per-extent `Vec<u8>` clone `range` makes before the
-                // parse discards it. The parsed structs are what the csum-verify
-                // and assembly loops below keep.
-                let mut exts: Vec<(u64, BtrfsExtentData)> = Vec::new();
-                let mut cb_err: Option<FfsError> = None;
-                alloc
-                    .fs_tree
-                    .range_with(&ext_start, &ext_end, |k, v| {
-                        if cb_err.is_some() {
-                            return;
-                        }
-                        match parse_extent_data(v) {
-                            Ok(parsed) => exts.push((k.offset, parsed)),
-                            Err(e) => cb_err = Some(parse_to_ffs_error(&e)),
-                        }
-                    })
-                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-                drop(alloc);
-                if let Some(e) = cb_err {
-                    return Err(e);
                 }
-                (inode, BtrfsReadExtents::Owned(exts))
-            } else if let Some(index) = self.btrfs_cached_read_plan_index() {
-                let inode = index.inodes.get(&canonical).copied().ok_or_else(|| {
-                    FfsError::NotFound(format!("btrfs INODE_ITEM for objectid {canonical}"))
-                })?;
-                let read_end = offset.saturating_add(u64::from(size));
-                let exts = match index.extents.get(&canonical) {
-                    Some(rows) => BtrfsReadExtents::ReadPlan {
-                        rows: Arc::clone(rows),
-                        indices: Self::btrfs_window_extent_indices(rows, offset, read_end)?,
-                    },
-                    None => BtrfsReadExtents::Owned(Vec::new()),
-                };
-                (inode, exts)
-            } else if !self.btrfs_tree_log_overlay_active.load(Ordering::Acquire) {
-                // bd-n5w92: per-inode read-only extent cache. With no pending
-                // tree log the on-disk fs tree is the complete, immutable extent
-                // source, so resolve the inode's FULL extent list once and filter
-                // the read window in-memory thereafter — a random read becomes an
-                // in-memory range filter instead of a fresh O(log N) tree descent
-                // (~180 us/read). The filter (logical_start < read_end &&
-                // extent_end > offset) is identical to the cached-index branch
-                // above, and the assembly loop still zero-fills holes, so reads
-                // are byte-identical to the windowed walk.
-                let key = BlockNumber(canonical);
-                // Lock-free hot-inode fast path: a single-file read stream hits
-                // the same `canonical` every read; serve it from the ArcSwap slot
-                // (no shard Mutex) when it matches. The selected window retains
-                // the entry Arc across read assembly, then borrows extent data
-                // from it — one cheap refcount operation, never an inline-payload
-                // clone.
-                let hot = self.btrfs_hot_inode_extents.load();
-                let entry_storage;
-                let entry: &Arc<(BtrfsInodeItem, Vec<(u64, BtrfsExtentData)>)> = match hot.as_ref()
-                {
-                    Some(slot) if slot.0 == canonical => &slot.1,
-                    _ => {
-                        let e = if let Some(e) = self.btrfs_ro_inode_extents.get(&key) {
-                            e
-                        } else {
-                            let built = self.btrfs_load_inode_all_extents(cx, canonical)?;
-                            let arc = Arc::new(built);
-                            self.btrfs_ro_inode_extents.insert(key, Arc::clone(&arc));
-                            arc
-                        };
-                        // Publish into the lock-free slot for the next read of
-                        // this inode (last-writer-wins; the value is the same
-                        // immutable RO extent list the sharded cache holds).
-                        self.btrfs_hot_inode_extents
-                            .store(Some(Arc::new((canonical, Arc::clone(&e)))));
-                        entry_storage = e;
-                        &entry_storage
-                    }
-                };
-                let read_end = offset.saturating_add(u64::from(size));
-                let exts = BtrfsReadExtents::Cached {
-                    entry: Arc::clone(entry),
-                    indices: Self::btrfs_window_extent_indices(&entry.1, offset, read_end)?,
-                };
-                (entry.0, exts)
-            } else {
-                // Bound the on-disk walk to the read window on BOTH edges so a
-                // read of a large fragmented file fetches the inode item and only
-                // the extents that can overlap [offset, offset+size) — not every
-                // EXTENT_DATA of the inode (mirrors the COW path's window bound,
-                // bd-4milp / bd-kms5z). The inode item and the EXTENT_DATA window
-                // are read as two targeted O(log N) descents:
-                //   - Inode item: the INODE_ITEM key span of this inode.
-                //   - Extents: lower bound = floor(EXTENT_DATA, offset) (the
-                //     extent covering or immediately preceding the read start —
-                //     earlier extents end at/before `offset` and cannot overlap),
-                //     upper bound = the window end. The floor is skipped (lower
-                //     bound 0) when a tree log is pending, since the floor descent
-                //     does not see logged items; the assembly loop skips any
-                //     non-overlapping item either way and the output is pre-zeroed
-                //     for holes, so the read is byte-identical to the full walk.
-                let inode_lo = BtrfsKey {
-                    objectid: canonical,
-                    item_type: BTRFS_ITEM_INODE_ITEM,
-                    offset: 0,
-                };
-                let inode_hi = BtrfsKey {
-                    objectid: canonical,
-                    item_type: BTRFS_ITEM_INODE_ITEM,
-                    offset: u64::MAX,
-                };
-                let inode_items = self.walk_btrfs_fs_tree_range(cx, inode_lo, inode_hi)?;
-                let inode_entry = Self::btrfs_find_inode_item(&inode_items, canonical)?;
-                let inode =
-                    parse_inode_item(&inode_entry.data).map_err(|e| parse_to_ffs_error(&e))?;
-
-                let lower_offset = if !self.btrfs_tree_log_overlay_active.load(Ordering::Acquire) {
-                    let seek = BtrfsKey {
-                        objectid: canonical,
-                        item_type: BTRFS_ITEM_EXTENT_DATA,
-                        offset,
-                    };
-                    match self.walk_btrfs_fs_tree_floor(cx, seek)? {
-                        Some(e)
-                            if e.key.objectid == canonical
-                                && e.key.item_type == BTRFS_ITEM_EXTENT_DATA =>
-                        {
-                            e.key.offset
-                        }
-                        _ => 0,
-                    }
-                } else {
-                    0
-                };
-                let ext_lo = BtrfsKey {
-                    objectid: canonical,
-                    item_type: BTRFS_ITEM_EXTENT_DATA,
-                    offset: lower_offset,
-                };
-                let ext_hi = BtrfsKey {
-                    objectid: canonical,
-                    item_type: BTRFS_ITEM_EXTENT_DATA,
-                    offset: offset.saturating_add(u64::from(size)),
-                };
-                let items = self.walk_btrfs_fs_tree_range(cx, ext_lo, ext_hi)?;
-                let exts = items
-                    .iter()
-                    .filter(|item| {
-                        item.key.objectid == canonical
-                            && item.key.item_type == BTRFS_ITEM_EXTENT_DATA
-                    })
-                    .map(|item| {
-                        parse_extent_data(&item.data)
-                            .map(|parsed| (item.key.offset, parsed))
-                            .map_err(|e| parse_to_ffs_error(&e))
-                    })
-                    .collect::<Result<_, _>>()?;
-                (inode, BtrfsReadExtents::Owned(exts))
             };
+            let ext_lo = BtrfsKey {
+                objectid: canonical,
+                item_type: BTRFS_ITEM_EXTENT_DATA,
+                offset: lower_offset,
+            };
+            let ext_hi = BtrfsKey {
+                objectid: canonical,
+                item_type: BTRFS_ITEM_EXTENT_DATA,
+                offset: offset.saturating_add(u64::from(size)),
+            };
+            let items = self.walk_btrfs_fs_tree_range(cx, ext_lo, ext_hi)?;
+            let exts = items
+                .iter()
+                .filter(|item| {
+                    item.key.objectid == canonical && item.key.item_type == BTRFS_ITEM_EXTENT_DATA
+                })
+                .map(|item| {
+                    parse_extent_data(&item.data)
+                        .map(|parsed| (item.key.offset, parsed))
+                        .map_err(|e| parse_to_ffs_error(&e))
+                })
+                .collect::<Result<_, _>>()?;
+            (inode, BtrfsReadExtents::Owned(exts))
+        };
 
         match Self::btrfs_mode_to_file_type(inode.mode) {
             FileType::Directory => return Err(FfsError::IsDirectory),
@@ -13679,7 +13840,6 @@ impl OpenFs {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         groups.len().hash(&mut hasher);
         for gs in groups {
-
             gs.free_blocks.hash(&mut hasher);
             gs.free_inodes.hash(&mut hasher);
             gs.used_dirs.hash(&mut hasher);
@@ -15075,10 +15235,7 @@ impl OpenFs {
             && scope.snapshot.is_none()
             && self.can_cache_ext4_read_only_block(scope, start);
         if extent_cacheable {
-            if self
-                .ext4_file_data_extent_cache
-                .copy_into(start, bs, dst)
-            {
+            if self.ext4_file_data_extent_cache.copy_into(start, bs, dst) {
                 return Ok(());
             }
             dev.read_contiguous_into(cx, start, dst)?;
@@ -21201,13 +21358,13 @@ impl OpenFs {
             block_size: self.block_size(),
         };
         {
-            let mut writer = jbd2_mutex.lock();
-            let mut txn = writer.begin_transaction();
+            let mut journal = jbd2_mutex.lock();
+            let mut txn = journal.begin_transaction();
             for (block, data) in &writes {
                 txn.add_write(*block, data.clone());
             }
             // Phase 1 — journal, then make the journal durable.
-            writer.commit_transaction(cx, &direct, &txn)?;
+            journal.commit_transaction(cx, &direct, &txn)?;
             self.dev.sync(cx)?;
 
             // Phase 2 — checkpoint to home locations, then make THAT durable.
@@ -21218,7 +21375,7 @@ impl OpenFs {
 
             // Phase 3 — the home copies are durable, so the region is reclaimable.
             // Only correct because phase 2 completed; see `reset_after_checkpoint`.
-            writer.reset_after_checkpoint();
+            journal.reset_after_checkpoint();
         }
 
         // The home writes bypassed the MVCC overlay and both read caches, exactly
@@ -31090,7 +31247,6 @@ impl OpenFs {
                         self.ext4_gdt_persisted_fingerprint
                             .store(0, std::sync::atomic::Ordering::Release);
                     }
-
                 }
             }
             trace!(
@@ -31460,7 +31616,10 @@ impl OpenFs {
                 .into_iter()
                 .next()
             {
-                items.push(BtrfsTreeItem { key, data: data.into() });
+                items.push(BtrfsTreeItem {
+                    key,
+                    data: data.into(),
+                });
             }
         }
 
@@ -32349,9 +32508,7 @@ impl OpenFs {
             {
                 let data_low_water = (device.total_bytes / 16)
                     .min(policy.target(ffs_btrfs::ChunkKind::Data, device.total_bytes));
-                let data_have = alloc
-                    .extent_alloc
-                    .allocatable_bytes(BTRFS_BLOCK_GROUP_DATA);
+                let data_have = alloc.extent_alloc.allocatable_bytes(BTRFS_BLOCK_GROUP_DATA);
                 if data_have < data_low_water {
                     let shortfall = data_low_water - data_have;
                     match ffs_btrfs::plan_growth_for_shortfall(
@@ -34466,12 +34623,7 @@ impl OpenFs {
             // `btrfs_insert_dir_entry`; this batched path builds the keys inline,
             // so it has to record them itself or a tree-logged fsync of the new
             // file recovers it without a name.
-            Self::btrfs_log_new_dir_entry_keys(
-                &mut alloc,
-                dir_item_key,
-                dir_index_key,
-                parent_key,
-            );
+            Self::btrfs_log_new_dir_entry_keys(&mut alloc, dir_item_key, dir_index_key, parent_key);
         }
 
         drop(alloc);
@@ -34669,12 +34821,7 @@ impl OpenFs {
                 .map_err(|e| btrfs_mutation_to_ffs(&e))?;
             // bd-jhuob: same bypass as `btrfs_create`'s batched branch — see the
             // note there and on `btrfs_log_new_dir_entry_keys`.
-            Self::btrfs_log_new_dir_entry_keys(
-                &mut alloc,
-                dir_item_key,
-                dir_index_key,
-                parent_key,
-            );
+            Self::btrfs_log_new_dir_entry_keys(&mut alloc, dir_item_key, dir_index_key, parent_key);
         }
         drop(alloc);
 
@@ -37330,9 +37477,11 @@ impl OpenFs {
                 other => Err(other),
             })
             .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-        alloc
-            .btrfs_logged_dir_keys
-            .insert((dir_item_key.objectid, dir_item_key.item_type, dir_item_key.offset));
+        alloc.btrfs_logged_dir_keys.insert((
+            dir_item_key.objectid,
+            dir_item_key.item_type,
+            dir_item_key.offset,
+        ));
 
         // Insert a DIR_INDEX entry keyed by a monotonic per-directory sequence
         // number (not the child objectid). Each link — including multiple hard
@@ -37349,9 +37498,11 @@ impl OpenFs {
             .fs_tree
             .insert(dir_index_key, &new_bytes)
             .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-        alloc
-            .btrfs_logged_dir_keys
-            .insert((dir_index_key.objectid, dir_index_key.item_type, dir_index_key.offset));
+        alloc.btrfs_logged_dir_keys.insert((
+            dir_index_key.objectid,
+            dir_index_key.item_type,
+            dir_index_key.offset,
+        ));
         alloc
             .btrfs_logged_dir_keys
             .insert((parent_oid, BTRFS_ITEM_INODE_ITEM, 0));
@@ -38836,8 +38987,8 @@ impl OpenFs {
             .store(0, std::sync::atomic::Ordering::Relaxed);
         if disabled {
             for slot in self.btrfs_floor_leaf_memo.lock().iter_mut() {
-            *slot = None;
-        }
+                *slot = None;
+            }
         }
     }
 
@@ -40124,7 +40275,9 @@ impl OpenFs {
             // still reached. The floor is skipped (lower bound 0) when a tree log
             // is pending, since the floor descent does not see logged items
             // (mirrors btrfs_read_file).
-            let lower_offset = if !self.btrfs_tree_log_overlay_active.load(Ordering::Acquire) {
+            let lower_offset = if self.btrfs_tree_log_overlay_active.load(Ordering::Acquire) {
+                0
+            } else {
                 let seek = BtrfsKey {
                     objectid: canonical,
                     item_type: BTRFS_ITEM_EXTENT_DATA,
@@ -40139,8 +40292,6 @@ impl OpenFs {
                     }
                     _ => 0,
                 }
-            } else {
-                0
             };
             let ext_lo = BtrfsKey {
                 objectid: canonical,
@@ -41080,8 +41231,13 @@ impl IntegrityReport {
 fn erfc_approx(x: f64) -> f64 {
     // Abramowitz & Stegun approximation (7.1.26), max error < 1.5e-7
     let t = 1.0 / 0.327_591_1_f64.mul_add(x.abs(), 1.0);
-    let poly = t
-        * t.mul_add(t.mul_add(t.mul_add(t.mul_add(1.061_405_429, -1.453_152_027), 1.421_413_741), -0.284_496_736), 0.254_829_592);
+    let poly = t * t.mul_add(
+        t.mul_add(
+            t.mul_add(t.mul_add(1.061_405_429, -1.453_152_027), 1.421_413_741),
+            -0.284_496_736,
+        ),
+        0.254_829_592,
+    );
     let result = poly * (-x * x).exp();
     if x >= 0.0 { result } else { 2.0 - result }
 }
@@ -45517,7 +45673,7 @@ mod tests {
         let replay = fs
             .ext4_journal_replay()
             .expect("journal presence should still be reported");
-        assert!(replay.committed_sequences.is_empty());
+        assert_eq!(replay.committed_sequences, [] as [u32; 0]);
         assert_eq!(replay.stats.scanned_blocks, 0);
         assert_eq!(replay.stats.replayed_blocks, 0);
 
@@ -45590,10 +45746,22 @@ mod tests {
     #[test]
     fn open_fs_collects_fast_commit_replay_evidence() {
         let image = build_ext4_image_with_fast_commit_evidence();
-        let dev = TestDevice::from_vec(image);
+        let data = std::sync::Arc::new(std::sync::Mutex::new(image));
         let cx = Cx::for_testing();
-
-        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let error = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice {
+                data: std::sync::Arc::clone(&data),
+            }),
+            &OpenOptions::default(),
+        )
+        .expect_err("the fixture's unreadable FC inode cannot be recovered");
+        assert!(matches!(error, FfsError::Corruption { .. }));
+        let options = OpenOptions {
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+            ..OpenOptions::default()
+        };
+        let fs = OpenFs::from_device(&cx, Box::new(TestDevice { data }), &options).unwrap();
         let replay = fs
             .ext4_journal_replay()
             .expect("journal replay outcome should be present");
@@ -45601,8 +45769,8 @@ mod tests {
             .ext4_fast_commit_replay()
             .expect("fast-commit evidence should be present");
 
-        assert_eq!(replay.committed_sequences, vec![1]);
-        assert_eq!(replay.stats.replayed_blocks, 1);
+        assert_eq!(replay.committed_sequences, [] as [u32; 0]);
+        assert_eq!(replay.stats.replayed_blocks, 0);
         assert_eq!(fc.reserved_fc_blocks, 2);
         assert!(fc.bytes_collected >= 32);
         assert_eq!(fc.verified_operations, 0);
@@ -45685,7 +45853,7 @@ mod tests {
         raw[0x2E..0x30].copy_from_slice(&1_u16.to_le_bytes()); // eh_depth = 1 (external)
 
         fs.apply_fast_commit_inode_update(&cx, 2, &raw)
-            .expect("apply must succeed (as a skip)");
+            .expect_err("an unrecovered external inode must stop recovery");
 
         let after = fs.read_inode(&cx, root).expect("re-read root inode");
         assert_eq!(
@@ -45904,7 +46072,7 @@ mod tests {
             .collect();
         ops.push(ffs_journal::FcOperation::InodeUpdate(12, inode_raw));
         fs.apply_fast_commit_operations(&cx, &ops, true)
-            .expect("apply fc ops");
+            .expect_err("a rolled-back committed transaction must fail recovery");
 
         // Atomic skip: the inode is untouched (no partial recovery).
         let after = fs.read_inode(&cx, ino).expect("re-read inode 12");
@@ -45956,9 +46124,8 @@ mod tests {
         );
     }
 
-    /// bd-6nwjx SAFETY GATE: with writes disallowed (Skip / SimulateOverlay
-    /// recovery), the apply must NOT mutate the base device — a read-only or
-    /// overlay mount must never be corrupted by fast-commit replay.
+    /// With writes disallowed (Skip), verification must not mutate the device.
+    /// SimulateOverlay applies to a separate in-memory device, tested below.
     #[test]
     fn fast_commit_apply_respects_writes_disallowed_gate() {
         let dev = TestDevice::from_vec(build_ext4_image_with_inode());
@@ -45980,6 +46147,322 @@ mod tests {
             fs.read_inode(&cx, InodeNumber(2)).expect("re-read").mtime,
             before,
             "writes-disallowed recovery must leave the base inode untouched"
+        );
+    }
+
+    #[test]
+    fn fast_commit_apply_mapping_requires_physical_and_unwritten_agreement() {
+        let extents = [Ext4Extent {
+            logical_block: 10,
+            raw_len: 3,
+            physical_start: 100,
+        }];
+        OpenFs::verify_fast_commit_mapping_segment(11, &extents, 11, 13, 10, Some((100, false)))
+            .expect("matching subrange");
+        for expected in [Some((101, false)), Some((100, true)), None] {
+            assert!(
+                OpenFs::verify_fast_commit_mapping_segment(11, &extents, 11, 13, 10, expected)
+                    .is_err(),
+                "wrong physical mapping, unwritten state, or live deleted range must fail"
+            );
+        }
+        assert!(
+            OpenFs::verify_fast_commit_mapping_segment(
+                11,
+                &extents,
+                10,
+                14,
+                10,
+                Some((100, false))
+            )
+            .is_err(),
+            "a trailing hole must fail"
+        );
+        OpenFs::verify_fast_commit_mapping_segment(11, &extents, 13, 14, 13, None)
+            .expect("a deleted range is a hole");
+    }
+
+    #[test]
+    fn fast_commit_apply_mapping_rejects_matching_overflow() {
+        let extents = [Ext4Extent {
+            logical_block: 0,
+            raw_len: 3,
+            physical_start: u64::MAX,
+        }];
+        assert!(
+            OpenFs::verify_fast_commit_mapping_segment(
+                11,
+                &extents,
+                1,
+                2,
+                0,
+                Some((u64::MAX, false))
+            )
+            .is_err(),
+            "two overflowing addresses must not count as equal mappings"
+        );
+    }
+
+    #[test]
+    fn fast_commit_apply_rejects_inline_range_missing_from_inode_record() {
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(build_ext4_image_with_extents())),
+            &OpenOptions::default(),
+        )
+        .expect("open image");
+        let inode = fs
+            .read_inode(&cx, InodeNumber(11))
+            .expect("read inline inode");
+        let raw = ffs_inode::serialize_inode(&inode, 256);
+        let operations = [
+            ffs_journal::FcOperation::AddRange(ffs_journal::FcExtentRange {
+                ino: 11,
+                logical_block: 100,
+                len: 1,
+                physical_block: 60,
+                unwritten: false,
+            }),
+            ffs_journal::FcOperation::InodeUpdate(11, raw),
+        ];
+        let error = fs
+            .apply_fast_commit_operations(&cx, &operations, true)
+            .expect_err("readable inode does not prove the requested mapping exists");
+        assert!(matches!(error, FfsError::Corruption { .. }));
+        assert!(
+            error
+                .to_string()
+                .contains("recovered mapping does not match")
+        );
+    }
+
+    #[test]
+    fn fast_commit_apply_range_verification_respects_later_overlaps() {
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(build_ext4_image_with_extents())),
+            &OpenOptions::default(),
+        )
+        .expect("open image");
+        let operations = [
+            ffs_journal::FcOperation::AddRange(ffs_journal::FcExtentRange {
+                ino: 11,
+                logical_block: 100,
+                len: 3,
+                physical_block: 60,
+                unwritten: false,
+            }),
+            ffs_journal::FcOperation::DelRange(ffs_journal::FcDelRange {
+                ino: 11,
+                logical_block: 100,
+                len: 1,
+            }),
+            ffs_journal::FcOperation::DelRange(ffs_journal::FcDelRange {
+                ino: 11,
+                logical_block: 101,
+                len: 2,
+            }),
+        ];
+        fs.verify_fast_commit_recovered_ranges(&cx, &operations)
+            .expect("later deletions supersede the entire addition");
+        assert!(
+            fs.verify_fast_commit_recovered_ranges(&cx, &operations[..2])
+                .is_err(),
+            "the uncovered suffix must still match the earlier addition"
+        );
+    }
+
+    #[test]
+    fn fast_commit_apply_unlink_rejects_wrong_target_without_mutation() {
+        let before = build_ext4_image_with_fast_commit_create_evidence();
+        let data = std::sync::Arc::new(std::sync::Mutex::new(before.clone()));
+        let cx = Cx::for_testing();
+        let dev = TestDevice {
+            data: std::sync::Arc::clone(&data),
+        };
+        let options = OpenOptions {
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+            ..OpenOptions::default()
+        };
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &options).expect("open fixture");
+        let operation = ffs_journal::FcOperation::Unlink(ffs_journal::FcDentry {
+            parent_ino: 2,
+            ino: 12,
+            name: b"hello.txt".to_vec(),
+        });
+        let error = fs
+            .apply_fast_commit_operations(&cx, &[operation], true)
+            .expect_err("recovery must not unlink a different inode");
+        assert!(matches!(error, FfsError::Corruption { .. }));
+        assert!(error.to_string().contains("found inode 11, expected 12"));
+        assert_eq!(*data.lock().unwrap(), before);
+    }
+
+    #[test]
+    fn fast_commit_apply_rejects_unreadable_operation_target() {
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(build_ext4_image_with_inode())),
+            &OpenOptions::default(),
+        )
+        .expect("open image");
+        let op = ffs_journal::FcOperation::InodeUpdate(u32::MAX, Vec::new());
+        let error = fs
+            .apply_fast_commit_operations(&cx, &[op], true)
+            .expect_err("an unreadable committed target must stop recovery");
+        assert!(matches!(error, FfsError::Corruption { .. }));
+        assert!(error.to_string().contains("verified 0 of 1"));
+    }
+
+    fn build_full_directory_fast_commit_image() -> Vec<u8> {
+        let mut image = build_ext4_image_with_fast_commit_create_evidence();
+        let block = &mut image[10 * 4096..11 * 4096];
+        let mut full = false;
+        for index in 0..400 {
+            let name = format!("entry-{index:04}");
+            match ffs_dir::add_entry(block, 11, name.as_bytes(), Ext4FileType::RegFile, 0) {
+                Ok(_) => {}
+                Err(FfsError::NoSpace) => {
+                    full = true;
+                    break;
+                }
+                Err(error) => panic!("unexpected directory fixture error: {error}"),
+            }
+        }
+        assert!(full, "fixture must exhaust directory slack");
+        let payload = build_fc_create_transaction(2, 11, b"recovered-name.txt", 1);
+        let fc_block = &mut image[24 * 4096..25 * 4096];
+        fc_block.fill(0);
+        fc_block[..payload.len()].copy_from_slice(&payload);
+        image
+    }
+
+    #[test]
+    fn fast_commit_apply_rejects_full_directory_without_mutation() {
+        for create in [true, false] {
+            let image = build_full_directory_fast_commit_image();
+            let data = std::sync::Arc::new(std::sync::Mutex::new(image));
+            let dev = TestDevice {
+                data: std::sync::Arc::clone(&data),
+            };
+            let cx = Cx::for_testing();
+            let options = OpenOptions {
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                ..OpenOptions::default()
+            };
+            let fs =
+                OpenFs::from_device(&cx, Box::new(dev), &options).expect("open diagnostic image");
+            let before = data.lock().unwrap().clone();
+            let dentry = ffs_journal::FcDentry {
+                parent_ino: 2,
+                ino: 11,
+                name: b"recovered-name.txt".to_vec(),
+            };
+            let op = if create {
+                ffs_journal::FcOperation::Create(dentry)
+            } else {
+                ffs_journal::FcOperation::Link(dentry)
+            };
+            let error = fs
+                .apply_fast_commit_operations(&cx, &[op], true)
+                .expect_err("a skipped insertion must not be reported as recovery");
+            assert!(matches!(error, FfsError::UnsupportedFeature(_)));
+            assert!(error.to_string().contains("recovery incomplete"));
+            assert_eq!(*data.lock().unwrap(), before);
+        }
+    }
+
+    #[test]
+    fn fast_commit_apply_rejects_fallback_that_would_discard_committed_prefix() {
+        let mut image = build_ext4_image_with_fast_commit_create_evidence();
+        let payload = build_fc_create_transaction(2, 11, b"hello.txt", 1);
+        let tail = &mut image[24 * 4096..25 * 4096];
+        tail.fill(0);
+        tail[..payload.len()].copy_from_slice(&payload);
+        // An unsupported tag after a valid TAIL must not erase the recovery
+        // obligation for the already committed prefix.
+        tail[payload.len()..payload.len() + 4].copy_from_slice(&[0xFF, 0xFF, 0, 0]);
+        let cx = Cx::for_testing();
+        for mode in [
+            Ext4JournalReplayMode::Apply,
+            Ext4JournalReplayMode::SimulateOverlay,
+        ] {
+            let options = OpenOptions {
+                ext4_journal_replay_mode: mode,
+                ..OpenOptions::default()
+            };
+            let error =
+                OpenFs::from_device(&cx, Box::new(TestDevice::from_vec(image.clone())), &options)
+                    .expect_err("fallback cannot silently discard committed operations");
+            assert!(matches!(error, FfsError::UnsupportedFeature(_)));
+            assert!(error.to_string().contains("contains committed operations"));
+        }
+    }
+
+    #[test]
+    fn fast_commit_apply_open_rejects_incomplete_committed_recovery() {
+        let cx = Cx::for_testing();
+        for mode in [
+            Ext4JournalReplayMode::Apply,
+            Ext4JournalReplayMode::SimulateOverlay,
+        ] {
+            let before = build_full_directory_fast_commit_image();
+            let data = std::sync::Arc::new(std::sync::Mutex::new(before.clone()));
+            let options = OpenOptions {
+                ext4_journal_replay_mode: mode,
+                ..OpenOptions::default()
+            };
+            for _ in 0..2 {
+                let dev = TestDevice {
+                    data: std::sync::Arc::clone(&data),
+                };
+                let error = OpenFs::from_device(&cx, Box::new(dev), &options)
+                    .expect_err("initial open and retry must reject incomplete recovery");
+                assert!(matches!(error, FfsError::UnsupportedFeature(_)));
+                assert!(error.to_string().contains("CREATE recovery incomplete"));
+                assert_eq!(
+                    data.lock().unwrap()[24 * 4096..25 * 4096],
+                    before[24 * 4096..25 * 4096],
+                    "failed recovery must preserve its committed FC records"
+                );
+                if mode == Ext4JournalReplayMode::SimulateOverlay {
+                    assert_eq!(*data.lock().unwrap(), before);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fast_commit_apply_overlay_recovers_name_without_changing_base_image() {
+        let mut image = build_ext4_image_with_fast_commit_create_evidence();
+        assert!(
+            ffs_dir::remove_entry(&mut image[10 * 4096..11 * 4096], b"hello.txt", 0)
+                .expect("remove fixture directory entry")
+        );
+        let before = image.clone();
+        let data = std::sync::Arc::new(std::sync::Mutex::new(image));
+        let dev = TestDevice {
+            data: std::sync::Arc::clone(&data),
+        };
+        let cx = Cx::for_testing();
+        let options = OpenOptions {
+            ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
+            ..OpenOptions::default()
+        };
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &options).expect("recover overlay");
+        let root = fs.read_inode(&cx, InodeNumber(2)).expect("read root");
+        let entry = fs
+            .lookup_name(&cx, &root, b"hello.txt")
+            .expect("lookup recovered name")
+            .expect("committed name must be visible in the overlay");
+        assert_eq!(entry.inode, 11);
+        assert_eq!(
+            *data.lock().unwrap(),
+            before,
+            "base image must remain intact"
         );
     }
 
@@ -46024,10 +46507,10 @@ mod tests {
             name: b"hello.txt".to_vec(),
         };
         let applied = fs
-            .apply_fast_commit_add_dentry(&cx, &dentry)
+            .apply_fast_commit_operations(&cx, &[ffs_journal::FcOperation::Create(dentry)], true)
             .expect("apply create");
-        assert!(
-            applied,
+        assert_eq!(
+            applied, 1,
             "the entry should be spliced into a block with room"
         );
 
@@ -46101,10 +46584,16 @@ mod tests {
     #[test]
     fn open_fs_collects_fast_commit_replay_evidence_across_multiple_blocks() {
         let image = build_ext4_image_with_multi_block_fast_commit_evidence();
-        let dev = TestDevice::from_vec(image);
+        let dev = TestDevice::from_vec(image.clone());
         let cx = Cx::for_testing();
-
-        let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let error = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default())
+            .expect_err("unreadable committed inodes cannot be recovered");
+        assert!(matches!(error, FfsError::Corruption { .. }));
+        let options = OpenOptions {
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+            ..OpenOptions::default()
+        };
+        let fs = OpenFs::from_device(&cx, Box::new(TestDevice::from_vec(image)), &options).unwrap();
         let fc = fs
             .ext4_fast_commit_replay()
             .expect("fast-commit evidence should be present");
@@ -50841,7 +51330,11 @@ mod tests {
             .unwrap();
         assert_eq!(full_count, full.len(), "the full extent must be read");
         assert_eq!(full, vec![0_u8; 4 * 4096]);
-        assert_eq!(dev.read_count(), 1, "the initial cold extent needs one device read");
+        assert_eq!(
+            dev.read_count(),
+            1,
+            "the initial cold extent needs one device read"
+        );
 
         dev.reset_count();
         let mut middle = vec![0_u8; 2 * 4096];
@@ -59944,7 +60437,9 @@ mod tests {
         let bytes = dev.snapshot_bytes();
 
         let mismatches = ext4_group_free_block_mismatches(&bytes);
-        eprintln!("bd-hyysq empty-file storm: mismatches without the boundary flush = {mismatches:?}");
+        eprintln!(
+            "bd-hyysq empty-file storm: mismatches without the boundary flush = {mismatches:?}"
+        );
         assert!(
             mismatches.is_empty(),
             "bd-hyysq REPRODUCED IN-PROCESS on the empty-file storm: {} group(s) carry stale \
@@ -60029,7 +60524,9 @@ mod tests {
         let bytes = dev.snapshot_bytes();
 
         let mismatches = ext4_group_free_block_mismatches(&bytes);
-        eprintln!("bd-hyysq concurrent storm: mismatches without the boundary flush = {mismatches:?}");
+        eprintln!(
+            "bd-hyysq concurrent storm: mismatches without the boundary flush = {mismatches:?}"
+        );
         assert!(
             mismatches.is_empty(),
             "bd-hyysq REPRODUCED IN-PROCESS under CONCURRENCY: {} group(s) carry stale \
@@ -60127,10 +60624,16 @@ mod tests {
 
         let before_a = journal_bytes(&dev.snapshot_bytes());
         let attr = fs
-            .create(&cx, InodeNumber(2), OsStr::new("nojournal.bin"), 0o644, 0, 0)
+            .create(
+                &cx,
+                InodeNumber(2),
+                OsStr::new("nojournal.bin"),
+                0o644,
+                0,
+                0,
+            )
             .expect("create");
-        fs.write(&cx, attr.ino, 0, &[0x5A_u8; 4096])
-            .expect("write");
+        fs.write(&cx, attr.ino, 0, &[0x5A_u8; 4096]).expect("write");
         fs.flush_mvcc_to_device(&cx).expect("unjournalled boundary");
         let after_a = journal_bytes(&dev.snapshot_bytes());
         assert_eq!(
@@ -60156,10 +60659,16 @@ mod tests {
 
         let before_b = journal_bytes(&dev.snapshot_bytes());
         let attr = fs
-            .create(&cx, InodeNumber(2), OsStr::new("journalled.bin"), 0o644, 0, 0)
+            .create(
+                &cx,
+                InodeNumber(2),
+                OsStr::new("journalled.bin"),
+                0o644,
+                0,
+                0,
+            )
             .expect("create");
-        fs.write(&cx, attr.ino, 0, &[0xA5_u8; 4096])
-            .expect("write");
+        fs.write(&cx, attr.ino, 0, &[0xA5_u8; 4096]).expect("write");
         fs.flush_mvcc_to_device(&cx).expect("journalled boundary");
         let image = dev.snapshot_bytes();
         let after_b = journal_bytes(&image);
@@ -60947,7 +61456,10 @@ mod tests {
     #[test]
     fn btrfs_floor_memo_slots_from_value_parses_and_fails_safe_bd_2s8zy() {
         // Default when unset: the shipping size the counted 2.93x was measured on.
-        assert_eq!(btrfs_floor_memo_slots_from_value(None), BTRFS_FLOOR_MEMO_SLOTS);
+        assert_eq!(
+            btrfs_floor_memo_slots_from_value(None),
+            BTRFS_FLOOR_MEMO_SLOTS
+        );
         // An explicit value is honoured, which is what makes a mounted A/B of the
         // sizing expressible from ONE ELF at all — a compile-time count cannot be
         // measured against the live kernel.
@@ -65921,16 +66433,11 @@ mod tests {
             vec!["user.inline".to_owned()]
         );
 
-        fs.setxattr(
-            &cx,
-            ino,
-            "user.inline",
-            b"second",
-            XattrSetMode::Replace,
-        )
-        .expect("replace inline xattr");
+        fs.setxattr(&cx, ino, "user.inline", b"second", XattrSetMode::Replace)
+            .expect("replace inline xattr");
         assert_eq!(
-            fs.getxattr(&cx, ino, "user.inline").expect("write-through get"),
+            fs.getxattr(&cx, ino, "user.inline")
+                .expect("write-through get"),
             Some(b"second".to_vec()),
             "replacement must not leave a stale cached value"
         );
@@ -81354,7 +81861,10 @@ mod tests {
         )
         .expect("unlink records a deletion");
         {
-            let alloc = fs.require_btrfs_alloc_state().expect("writable btrfs").read();
+            let alloc = fs
+                .require_btrfs_alloc_state()
+                .expect("writable btrfs")
+                .read();
             assert!(
                 alloc.btrfs_tree_log_has_deletions,
                 "unlink must make tree-log collection refuse before allocation"
@@ -81369,7 +81879,10 @@ mod tests {
             committed.log_root, 0,
             "the deletion fallback is a full commit, which retires the previous log"
         );
-        let alloc = fs.require_btrfs_alloc_state().expect("writable btrfs").read();
+        let alloc = fs
+            .require_btrfs_alloc_state()
+            .expect("writable btrfs")
+            .read();
         assert!(
             !alloc.btrfs_tree_log_has_deletions,
             "the authoritative full commit clears the deletion marker"
@@ -87443,7 +87956,12 @@ mod tests {
             fs.enable_writes(&cx).expect("enable writes");
             let ops: &dyn FsOps = &fs;
             let ino = ops
-                .lookup(&cx, &mut RequestScope::empty(), InodeNumber(256), OsStr::new("f00000"))
+                .lookup(
+                    &cx,
+                    &mut RequestScope::empty(),
+                    InodeNumber(256),
+                    OsStr::new("f00000"),
+                )
                 .expect("the seeded fixture must contain f00000")
                 .ino;
 

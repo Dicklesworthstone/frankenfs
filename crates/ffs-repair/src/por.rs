@@ -686,7 +686,7 @@ mod tests {
         assert!(result.audit_passed);
         assert_eq!(result.passed, 50);
         assert_eq!(result.failed, 0);
-        assert!(result.failed_indices.is_empty());
+        assert_eq!(result.failed_indices, [] as [u64; 0]);
     }
 
     #[test]

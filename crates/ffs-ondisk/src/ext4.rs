@@ -8124,7 +8124,7 @@ mod tests {
         let full = Ext4Inode::parse_from_bytes(&raw).expect("full inode parse");
         let metadata = Ext4Inode::parse_metadata_from_bytes(&raw).expect("metadata inode parse");
         assert_eq!(full.xattr_ibody.as_slice(), &raw[160..]);
-        assert!(metadata.xattr_ibody.is_empty());
+        assert_eq!(metadata.xattr_ibody, [] as [u8; 0]);
 
         let mut expected = full;
         expected.xattr_ibody.clear();
@@ -13712,7 +13712,7 @@ mod tests {
         // Just a terminator
         let data = [0_u8; 4];
         let entries = super::parse_xattr_entries(&data, &data, 0).unwrap();
-        assert!(entries.is_empty());
+        assert_eq!(entries, [] as [Ext4Xattr; 0]);
     }
 
     #[test]
@@ -13725,7 +13725,7 @@ mod tests {
             .read_inode(&image, ffs_types::InodeNumber(2))
             .unwrap();
         let xattrs = reader.read_xattrs_ibody(&inode).unwrap();
-        assert!(xattrs.is_empty());
+        assert_eq!(xattrs, [] as [Ext4Xattr; 0]);
     }
 
     #[test]
@@ -13838,7 +13838,7 @@ mod tests {
         let buf = [0_u8; 128];
         let inode = Ext4Inode::parse_from_bytes(&buf).expect("parse inode");
         let xattrs = super::parse_ibody_xattrs(&inode).expect("parse ibody xattrs");
-        assert!(xattrs.is_empty());
+        assert_eq!(xattrs, [] as [Ext4Xattr; 0]);
     }
 
     fn build_sorted_external_xattr_block_with_entry_hashes(
@@ -15092,7 +15092,7 @@ mod tests {
     #[test]
     fn incompat_describe_empty_for_zero() {
         let flags = Ext4IncompatFeatures(0);
-        assert!(flags.describe().is_empty());
+        assert_eq!(flags.describe(), [] as [&str; 0]);
     }
 
     #[test]
@@ -15118,7 +15118,7 @@ mod tests {
                 | Ext4IncompatFeatures::ENCRYPT.0,
         );
         let rejected = flags.describe_rejected_v1();
-        assert!(rejected.is_empty());
+        assert_eq!(rejected, [] as [&str; 0]);
     }
 
     #[test]
@@ -15161,8 +15161,8 @@ mod tests {
         let parsed = Ext4Superblock::parse_superblock_region(&sb).unwrap();
         let diag = parsed.feature_diagnostics_v1();
         assert!(diag.is_ok());
-        assert!(diag.missing_required.is_empty());
-        assert!(diag.rejected_present.is_empty());
+        assert_eq!(diag.missing_required, [] as [&str; 0]);
+        assert_eq!(diag.rejected_present, [] as [&str; 0]);
         assert_eq!(diag.unknown_incompat_bits, 0);
     }
 
@@ -15179,7 +15179,7 @@ mod tests {
         assert!(!diag.is_ok());
         assert_eq!(diag.missing_required, vec!["FILETYPE"]);
         // ENCRYPT is now allowed, so rejected_present should be empty.
-        assert!(diag.rejected_present.is_empty());
+        assert_eq!(diag.rejected_present, [] as [&str; 0]);
     }
 
     #[test]
@@ -17362,7 +17362,7 @@ mod tests {
         let flags = Ext4IncompatFeatures(
             Ext4IncompatFeatures::FILETYPE.0 | Ext4IncompatFeatures::EXTENTS.0,
         );
-        assert!(flags.describe_missing_required_v1().is_empty());
+        assert_eq!(flags.describe_missing_required_v1(), [] as [&str; 0]);
     }
 
     #[test]

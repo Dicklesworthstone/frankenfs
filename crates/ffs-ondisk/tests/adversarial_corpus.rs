@@ -2018,8 +2018,8 @@ fn ext4_inline_data_adversarial_samples_exercise_ibody_boundaries() {
         Ext4Inode::parse_from_bytes(&samples["synthetic_ext4_inline_data_ibody_magic_only.bin"])
             .expect("magic-only ibody inode parses");
     assert_eq!(
-        parse_ibody_xattrs(&magic_only)
-            .expect("magic-only ibody xattr area is empty"), [] as [ffs_ondisk::Ext4Xattr; 0]
+        parse_ibody_xattrs(&magic_only).expect("magic-only ibody xattr area is empty"),
+        [] as [ffs_ondisk::Ext4Xattr; 0]
     );
 
     let valid_ibody =

@@ -1286,7 +1286,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::float_cmp)] // exact constant comparison
     fn normalized_steal_threshold_zero_returns_default() {
         let cfg = PerCoreConfig {
             steal_threshold: 0.0,
@@ -1299,7 +1298,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::float_cmp)] // exact constant comparison
     fn normalized_steal_threshold_negative_returns_default() {
         let cfg = PerCoreConfig {
             steal_threshold: -1.0,
@@ -1312,7 +1310,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::float_cmp)] // exact constant comparison
     fn normalized_steal_threshold_nan_returns_default() {
         let cfg = PerCoreConfig {
             steal_threshold: f64::NAN,
@@ -1325,7 +1322,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::float_cmp)] // exact constant comparison
     fn normalized_steal_threshold_infinity_returns_default() {
         let cfg = PerCoreConfig {
             steal_threshold: f64::INFINITY,
@@ -1338,7 +1334,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::float_cmp)] // exact constant comparison
     fn normalized_steal_threshold_neg_infinity_returns_default() {
         let cfg = PerCoreConfig {
             steal_threshold: f64::NEG_INFINITY,
