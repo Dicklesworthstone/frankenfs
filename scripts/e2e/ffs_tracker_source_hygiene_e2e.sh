@@ -29,6 +29,30 @@ scenario_result() {
     TOTAL=$((TOTAL + 1))
 }
 
+# Graph authority establishes a complete projection, not permission to execute
+# its recommendations. Claimability still comes from the source-aware report.
+bv_projection_valid() {
+    jq -e --slurpfile projection "$BV_SOURCE_AWARE_PROJECTION_JSON" \
+        --argjson local_open "$LOCAL_OPEN_COUNT" \
+        --argjson local_in_progress "$LOCAL_IN_PROGRESS_COUNT" '
+        (.source_authority.state == "complete")
+        and (.source_authority.claim_safe == true)
+        and (.source_authority.errors == 0)
+        and (.source_authority.skipped == 0)
+        and (.source_authority.read_errors == 0)
+        and (.triage.meta.issue_count == ($projection[0].graph_rows | length))
+        and (.triage.project_health.counts.total == ($projection[0].graph_rows | length))
+        and (.triage.quick_ref.open_count == $local_open)
+        and ((.triage.quick_ref.in_progress_count // 0) == $local_in_progress)
+        and ([
+            (.triage.quick_ref.top_picks[]?.id // empty),
+            (.triage.recommendations[]?.id // empty),
+            (.triage.quick_wins[]?.id // empty),
+            (.triage.blockers_to_clear[]?.id // empty)
+        ] | all(test("^(bd|frankenfs)-")))
+    ' "$1" >/dev/null
+}
+
 e2e_init "ffs_tracker_source_hygiene"
 
 ISSUES_JSONL="${TRACKER_SOURCE_HYGIENE_ISSUES:-$REPO_ROOT/.beads/issues.jsonl}"
@@ -778,28 +802,17 @@ if command -v br >/dev/null 2>&1 && command -v bv >/dev/null 2>&1; then
         && jq -c '.graph_rows[]' "$BV_SOURCE_AWARE_PROJECTION_JSON" >"$BV_SOURCE_AWARE_ISSUES_JSONL" \
         && BEADS_DIR="$BV_SOURCE_AWARE_BEADS_DIR" br --db "$BV_SOURCE_AWARE_BEADS_DIR/beads.db" sync --import-only --orphans allow --json >"$BV_SOURCE_AWARE_IMPORT_JSON" \
         && bv --no-cache --db "$BV_SOURCE_AWARE_BEADS_DIR" --robot-triage >"$BV_SOURCE_AWARE_TRIAGE_JSON" \
-        && jq -e \
-            --slurpfile projection "$BV_SOURCE_AWARE_PROJECTION_JSON" \
-            --argjson local_open "$LOCAL_OPEN_COUNT" \
-            --argjson local_in_progress "$LOCAL_IN_PROGRESS_COUNT" \
-            '
-            (.source_authority.claim_safe == true)
-            and (.source_authority.errors == 0)
-            and (.source_authority.skipped == 0)
-            and (.source_authority.read_errors == 0)
-            and (.triage.meta.issue_count == ($projection[0].graph_rows | length))
-            and (.triage.project_health.counts.total == ($projection[0].graph_rows | length))
-            and (.triage.quick_ref.open_count == $local_open)
-            and ((.triage.quick_ref.in_progress_count // 0) == $local_in_progress)
-            and ([
-                (.triage.quick_ref.top_picks[]?.id // empty),
-                (.triage.recommendations[]?.id // empty),
-                (.triage.quick_wins[]?.id // empty),
-                (.triage.blockers_to_clear[]?.id // empty)
-            ] | all(test("^(bd|frankenfs)-")))
-            ' "$BV_SOURCE_AWARE_TRIAGE_JSON" >/dev/null \
+        && bv_projection_valid "$BV_SOURCE_AWARE_TRIAGE_JSON" \
         && sha256sum -c "$SOURCE_SHA256" >/dev/null; then
         scenario_result "tracker_source_hygiene_bv_source_aware_triage_clean" "PASS" "triage=$BV_SOURCE_AWARE_TRIAGE_JSON local_open=${LOCAL_OPEN_COUNT} local_in_progress=${LOCAL_IN_PROGRESS_COUNT}"
+        PARTIAL_TRIAGE_JSON="${E2E_LOG_DIR}/tracker_source_hygiene_bv_partial_negative.json"
+        if jq '.source_authority.state = "partial" | .source_authority.claim_safe = false' \
+            "$BV_SOURCE_AWARE_TRIAGE_JSON" >"$PARTIAL_TRIAGE_JSON" \
+            && ! bv_projection_valid "$PARTIAL_TRIAGE_JSON"; then
+            scenario_result "tracker_source_hygiene_partial_graph_rejected" "PASS" "partial graph cannot pass projection validation"
+        else
+            scenario_result "tracker_source_hygiene_partial_graph_rejected" "FAIL" "partial graph accepted"
+        fi
     else
         scenario_result "tracker_source_hygiene_bv_source_aware_triage_clean" "FAIL" "source-aware bv triage failed"
     fi
@@ -1230,6 +1243,56 @@ JSONL
         fi
     else
         scenario_result "tracker_source_hygiene_release_readiness_blocked_by_open_p0" "FAIL" "log=$RELEASE_READY_P0_SELF_CHECK_LOG"
+    fi
+fi
+
+if [[ -z "${TRACKER_SOURCE_HYGIENE_ISSUES:-}" && -z "$EXPECTED_GOLDEN" && "$STRICT_MODE" -eq 0 ]]; then
+    e2e_step "Unsupported-status and unresolved-dependency fixture self-check"
+    PROJECTION_FIXTURE="$E2E_TEMP_DIR/tracker_source_hygiene_projection.jsonl"
+    PROJECTION_CHECK_LOG="$E2E_LOG_DIR/tracker_source_hygiene_projection_self_check.log"
+    cat >"$PROJECTION_FIXTURE" <<'JSONL'
+{"id":"bd-ready","title":"ordinary ready work","status":"open","priority":2}
+{"id":"bd-active","title":"owned work","status":"in_progress","priority":2}
+{"id":"bd-refused","title":"explicitly not implemented","status":"wont_fix","priority":2,"notes":"preserve this disposition"}
+{"id":"bd-unknown","title":"future status must not become ready","status":"future_terminal","priority":2}
+{"id":"bd-dependent","title":"depends on refused work","status":"open","priority":2,"dependencies":[{"depends_on_id":"bd-refused","type":"blocks"}]}
+{"id":"bd-missing-dependent","title":"depends on absent work","status":"open","priority":2,"dependencies":[{"depends_on_id":"bd-missing","type":"blocks"}]}
+{"id":"bd-permission","title":"real xfstests run","description":"requires XFSTESTS_REAL_RUN_ACK","status":"open","priority":2}
+{"id":"frankenredis-foreign","title":"foreign work","status":"open","priority":2}
+JSONL
+    if TRACKER_SOURCE_HYGIENE_ISSUES="$PROJECTION_FIXTURE" \
+        TRACKER_SOURCE_HYGIENE_EXPECT_LOCAL_OPEN=4 \
+        TRACKER_SOURCE_HYGIENE_EXPECT_FOREIGN_OPEN=1 \
+        TRACKER_SOURCE_HYGIENE_EXPECT_READY=1 \
+        TRACKER_SOURCE_HYGIENE_EXPECT_PERMISSION_GATED=1 \
+        TRACKER_SOURCE_HYGIENE_EXPECT_LOCAL_NONCLAIMABLE=3 \
+        TRACKER_SOURCE_HYGIENE_EXPECT_IN_PROGRESS=1 \
+        XFSTESTS_REAL_RUN_ACK= \
+        "$REPO_ROOT/scripts/e2e/ffs_tracker_source_hygiene_e2e.sh" >"$PROJECTION_CHECK_LOG" 2>&1; then
+        PROJECTION_CHECK_REPORT="$(awk -F'detail=report=' \
+            '/scenario_id=tracker_source_hygiene_report_emitted/ && /outcome=PASS/ {print $2; exit}' \
+            "$PROJECTION_CHECK_LOG")"
+        PROJECTION_CHECK_ARTIFACT="${PROJECTION_CHECK_REPORT%/*}/tracker_source_hygiene_bv_projection.json"
+        if jq -e '
+            .source_aware_queue_state.claimable_ids == ["bd-ready"]
+            and .source_aware_queue_state.permission_gated_ids == ["bd-permission"]
+            and (.source_aware_queue_state.blocked_local_ids | sort) == ["bd-dependent", "bd-missing-dependent"]
+            ' "$PROJECTION_CHECK_REPORT" >/dev/null \
+            && jq -e '
+                (.included_source_rows | length) == 5
+                and (.excluded_source_rows | length) == 3
+                and any(.excluded_source_rows[]; .row.id == "bd-refused" and .row.status == "wont_fix"
+                    and .row.notes == "preserve this disposition" and .reason == "unsupported_bv_status")
+                and any(.excluded_source_rows[]; .row.id == "bd-unknown" and .row.status == "future_terminal")
+                and .synthetic_dependency_ids == ["bd-missing", "bd-refused"]
+                and ([.graph_rows[] | select(.id == "bd-missing" or .id == "bd-refused") | .status] == ["blocked", "blocked"])
+                ' "$PROJECTION_CHECK_ARTIFACT" >/dev/null; then
+            scenario_result "tracker_source_hygiene_lossless_projection_self_check" "PASS" "report=$PROJECTION_CHECK_REPORT projection=$PROJECTION_CHECK_ARTIFACT"
+        else
+            scenario_result "tracker_source_hygiene_lossless_projection_self_check" "FAIL" "projection accounting or claimability mismatch; log=$PROJECTION_CHECK_LOG"
+        fi
+    else
+        scenario_result "tracker_source_hygiene_lossless_projection_self_check" "FAIL" "log=$PROJECTION_CHECK_LOG"
     fi
 fi
 
