@@ -181,12 +181,21 @@ Flush nodes in **reverse topological order** of the DAG:
 
 ### 4.3 fsync Barrier
 
+Before serializing the transaction's metadata, drain committed MVCC file-data
+blocks to the underlying device while holding the btrfs allocator lock. That
+lock excludes new btrfs writes from the metadata snapshot being committed.
+Publishing extent references and checksums without this drain can acknowledge
+an fsync whose file data disappears after reopening. A drain failure must return
+before advancing the generation or mutating commit publication state.
+
 Before writing the superblock:
 1. Issue `fsync()` on the underlying device
-2. This ensures all prior node writes are durable
+2. This ensures all prior file-data and node writes are durable
 3. Only then write the superblock
 
 The barrier makes the superblock write the single atomic commit point.
+If there are no metadata nodes to publish but the drain wrote file-data blocks,
+issue the device sync before returning success.
 
 ---
 

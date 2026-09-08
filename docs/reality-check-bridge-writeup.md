@@ -1,6 +1,6 @@
 # Reality-Check Bridge: Closing the Gap Between Claims and Code
 
-## Delivery progress — 2026-09-08, 06:41 UTC
+## Delivery progress — 2026-09-08, 17:56 UTC
 
 The audit below is the starting point, not a claim that its diagnosed defects
 remain unchanged. Implementation has advanced; the complete delivery contract
@@ -11,6 +11,9 @@ is still unproven.
   recovery preserves the base image, and recovered ranges are checked against
   committed mappings. Inode records outside the configured valid size range are
   rejected before writes, rather than partially copied or silently truncated.
+  Final mapping verification reads the recovery device, avoiding stale MVCC
+  views after extent deletion. The positive harness fixture now carries a real
+  inode update; an empty record must fail without changing the overlay source.
   Independent kernel/e2fsck crash-image certification remains
   pending (`bd-gqsnh`, `bd-9m84h`).
 - **Repair lifecycle:** failed/cancelled refresh batches retain unprocessed
@@ -19,6 +22,21 @@ is still unproven.
   explicit warning that the transaction is already committed; they do not imply
   rollback. This does not establish default repair, safe native reservation,
   persistent freshness or region-scoped worker ownership (`bd-11a8t`, `bd-j7a4e`).
+  Scrub no longer refreshes symbols from detected corrupt data. Dirty groups
+  refuse recovery from stale symbols, preserving newer client writes, and
+  corrupt blocks outside configured repair ranges count as unrecoverable.
+- **Metadata integrity:** read-only ext4 block and inode bitmap checksums are
+  verified even when deferred descriptor persistence is globally enabled.
+  Clean and tampered image tests pass for both bitmap types. The writable
+  deferred-checksum policy is unchanged and is not certified by these tests.
+- **Btrfs file-data durability:** full transaction commits now drain committed
+  MVCC file data before publishing metadata and checksums. The prior path
+  acknowledged fsync but reopening a real non-inline payload failed its data
+  checksum. The strengthened allocation/reopen regression now passes, as do
+  six existing tree-log crash/replay cases and the core library (1,271 passing,
+  25 existing ignored). No explicit flush outside fsync masks the regression.
+  The existing pre-superblock barrier covers file data and tree nodes; a
+  data-only/no-node return also syncs before acknowledging success.
 - **Tracker:** `bd-09urx` and `bd-24ydx` are closed on 17 passing scenarios,
   conserved source rows/statuses, unchanged original goldens and an acyclic
   dependency graph. Unsupported statuses remain intact in exclusion accounting;
@@ -28,9 +46,91 @@ is still unproven.
   quantitative terminology were corrected. Four count/negative-drift tests pass.
   Actual source dispatch implements four merge algorithms, including bitmap OR
   and bitmap delta; the earlier two-algorithm assessment was incorrect.
-  Compilation of every README example remains outstanding (`bd-3kpkz`, `bd-ed3i5`).
+  All ten literal Rust examples passed pinned rustdoc; an intentionally invalid
+  OpenFs signature failed with E0061. Current CLI help and inspection of the
+  existing btrfs primary-header fixture pass. `bd-3kpkz` and `bd-ed3i5` are closed
+  on this evidence, which does not establish complete-image mount compatibility.
 
-Current executed checks: workspace check, Clippy with warnings denied, and fmt
+The continuation ran the complete workspace test command with `--no-fail-fast`.
+It failed, exposing both stale fixtures and remaining implementation gaps.
+Subsequent bounded runs pass: the repair crate **503 tests**, harness library
+**2,058**, conformance **103 with 2 existing ignored**, bitmap checksum suite
+**2**, and combined core fast-commit/xattr selection **35**. The CLI suite passed
+**360** tests after its metrics fixture was updated to the existing strict schema.
+The xattr test now checks fresh cached values after replacement and removal;
+the production cache intentionally refreshes entries instead of leaving them absent.
+
+Mounted tests now verify actual btrfs rename exchange (bytes and inode identities),
+NOREPLACE, invalid flags, and read-only mutation ioctl rejection. The selected
+run reports **12 passing test functions**, but five return early because ioctl
+transport prerequisites are unavailable; those five are **not positive feature
+proof**. The exchange and read-only rejection scenarios emit explicit PASS results.
+Other restricted-transport cases demonstrate their stated refusal, not ioctl support.
+
+Still failing or unverified: open-unlink file-descriptor lifetime (ENOENT on the
+mounted ext4 path), unprivileged security-xattr fixtures run as root,
+and long-symlink EAGAIN. The latter reproduces in isolation: eager inode/directory
+commits mix with a target write using the older request transaction. The scope
+contract needs a coherent fix; the transaction was not bypassed for a green test.
+The
+trybuild failure preserves the expected type rejection but disagrees on the remote
+dependency-path prefix; its golden was not regenerated. The census was manually
+recounted against the local Git index (89 paths, 168706 lines), but its remote test
+reads stale index blobs despite synchronized working files, so no remote pass is
+claimed. After adding the teardown method, the final working-source inventory
+was recounted as 89 paths and 168719 lines, with every file and summary matching.
+That inventory anticipates staging the changed source; the index-based validator
+still needs the corresponding current index, locally and remotely.
+Full-workspace acceptance and `bd-vuzzq` remain open.
+
+The apparent btrfs cache regressions were measurement contamination: nine tests
+read process-global counters concurrently. The unchanged serial control passed
+9/9; a test-only asupersync mutex now isolates all fixtures and measurements,
+and the normal parallel invocation also passes 9/9. Assertions, thresholds and
+case coverage are unchanged. This fixes the measurement, not cache performance
+(`/tmp/ffs-node-cache-isolation-{control,final}-20260908.log`).
+
+A final harness run also exposed a read-only btrfs xattr fixture reopening its
+image before the background server finished destroy-time persistence. Dropping
+the vendor session unmounts but detaches its thread; the existing explicit join
+is now exposed through `MountGuard::unmount_and_join` and used at all six
+drop-before-remount sites in the FUSE suite. The failure reproduced on worker
+1227854 and passed on 1149989 before the fix; after the fix the original failing
+worker passes with unchanged seed, errno and byte assertions. The selected
+remount run reports 15 passing functions, including four explicit transport
+SKIPs; those SKIPs are not feature proof. Logs:
+`/tmp/ffs-btrfs-xattr-ro-{isolated,worker-control,joined}-20260908.log` and
+`/tmp/ffs-joined-remount-fixtures-final-20260908.log`.
+
+Continuation evidence: `/tmp/ffs-workspace-continuation-all-20260908.log`,
+`/tmp/ffs-repair-all-after-20260908.log`,
+`/tmp/ffs-harness-lib-final-20260908.log`,
+`/tmp/ffs-harness-selected-final-20260908.log`,
+`/tmp/ffs-core-continuation-fc-xattr-20260908.log`,
+`/tmp/ffs-fuse-fixtures-final-20260908.log`, and
+`/tmp/ffs-readme-rustdoc-{round5,negative}-20260908.log`.
+Final workspace check, Clippy with warnings denied and formatting pass
+(`/tmp/ffs-{check,clippy}-final-joined-remount-20260908.log`,
+`/tmp/ffs-fmt-final-20260908.log`). The earlier full workspace rerun
+completed with five failing targets before the cache isolation and data-flush fixes
+(`/tmp/ffs-workspace-final-20260908.log`); core passed 1,337 tests with 26 existing
+ignored under the workspace feature set, and FUSE passed 235 with four failures
+and eight ignored. The later full harness run still failed three targets
+(`/tmp/ffs-harness-final-data-flush-20260908.log`). After joining teardown, the
+full FUSE target reports 235 passing, four failing and eight ignored
+(`/tmp/ffs-fuse-final-joined-remount-20260908.log`); the remount race no longer
+fails. The writeback-cache-specific remount test skipped for mount failure and
+has no current positive proof (`/tmp/ffs-writeback-joined-remount-final-20260908.log`).
+Both benchmark invocations finished successfully. The second includes the
+data-flush fix (`/tmp/ffs-harness-bench-final-data-flush-20260908.log`, exit 0).
+The final data-flush core
+and integration run is `/tmp/ffs-core-final-data-flush-20260908.log`; final
+workspace check passed in `/tmp/ffs-check-final-data-flush-20260908.log`.
+The second benchmark contains the final filesystem implementation but predates
+the later harness teardown helper. Neither run compares a live incumbent;
+Criterion's self-comparisons are not performance-win evidence.
+
+Earlier 06:41 UTC checks: workspace check, Clippy with warnings denied, and fmt
 pass. The combined core recovery run selected **39 tests, all passing**; repair
 queue tests **9/9**, FUSE context/error-path tests **9/9**, README count tests
 **4/4**, CLI rate-boundary test **1/1**, and the benchmark admission guard test

@@ -182,7 +182,7 @@ To avoid wasted reading, here is what this project is explicitly **not** trying 
 
 FrankenFS is a 22-member Cargo workspace: 21 crates under `crates/` and the `tools/ffs-ops` operational CLI, with an acyclic dependency graph.
 
-```
+```text
 Layer 1 (Foundation):  [ffs-types]  [ffs-error]
                               \      /
 Layer 2 (On-disk):        [ffs-ondisk]                  [ffs-mvcc]
@@ -217,7 +217,7 @@ Legacy extraction reference (retained, not on the runtime path):
 | **Namespace** | `ffs-inode`, `ffs-dir`, `ffs-xattr` | Inode lifecycle with CRC32C checksum, htree directories with case-folding, user/system/security/trusted xattr namespaces |
 | **Interface** | `ffs-fuse`, `ffs-core`, `ffs` | FUSE protocol adapter (vendored `fuser` 0.17.0, ABI 7.42); `OpenFs` implementation of `FsOps` orchestrating format detection, mount, writeback epoch barrier, degradation FSM, backpressure gates; thin public facade |
 | **Repair** | `ffs-repair` | RaptorQ symbol generation/recovery, background `ScrubDaemon`, Bayesian `DurabilityAutopilot`, four refresh policies, stale-window SLO with breach detection, optimistic lease-based multi-host coordination, 23-event evidence ledger, repair-writeback serializer for read-write mounted repair |
-| **Tooling** | `ffs-cli`, `ffs-tui`, `ffs-harness` | 11-subcommand CLI; live TUI monitoring; conformance harness with sparse fixtures, golden-file validation, parity tracking, proof-bundle validation, performance manifests, schema inventory, metamorphic seed catalog, soak/canary campaign runner, release-gate validator |
+| **Tooling** | `ffs-cli`, `ffs-tui`, `ffs-harness`, `ffs-ops` | Operator and benchmark commands; live TUI monitoring; conformance harness with sparse fixtures, golden-file validation, parity tracking, proof-bundle validation, performance manifests, schema inventory, metamorphic seed catalog, soak/canary campaign runner, release-gate validator |
 
 ### Layering rules
 
@@ -236,7 +236,7 @@ Legacy extraction reference (retained, not on the runtime path):
 
 ### Read path
 
-```
+```text
 userspace read(fd, buf, count)
   → kernel FUSE → fuser → ffs-fuse::read()
     → begin_request_scope(cx, op): MVCC snapshot + backpressure check
@@ -250,7 +250,7 @@ userspace read(fd, buf, count)
 
 ### Write path
 
-```
+```text
 userspace write(fd, buf, count)
   → kernel FUSE → fuser → ffs-fuse::write()
     → ffs-core FsOps (OpenFs): flavor dispatch, requires --rw
@@ -264,7 +264,7 @@ userspace write(fd, buf, count)
 
 ### Corruption recovery
 
-```
+```text
 ffs-repair::ScrubDaemon [background, lifecycle-owned by mount]
   → ffs-block: read every block in the group
     → checksum verification (CRC32C for compat mode, BLAKE3 for native mode)
@@ -288,7 +288,7 @@ The data-flow boxes above show *which crate* handles each step. The diagrams bel
 
 ### Mount lifecycle (RO ext4, default `standard` runtime mode)
 
-```
+```text
                                                          (time →)
 Operator         ffs-cli           ffs-fuse              ffs-core         ffs-ondisk        ffs-block
    │                │                  │                     │                 │                 │
@@ -325,7 +325,7 @@ Operator         ffs-cli           ffs-fuse              ffs-core         ffs-on
 
 ### Read path (FUSE → MVCC snapshot)
 
-```
+```text
 kernel                FUSE          ffs-fuse           OpenFs            MVCC store        block layer
   │                    │                │                  │                  │                 │
   │ read(fd, buf, n)   │                │                  │                  │                 │
@@ -355,7 +355,7 @@ kernel                FUSE          ffs-fuse           OpenFs            MVCC st
 
 ### Write path (FUSE → MVCC commit with conflict policy)
 
-```
+```text
 caller          ffs-fuse        OpenFs           Transaction        MvccStore         BlockDevice
   │                │                │                  │                  │                 │
   │ write(fd, …)   │                │                  │                  │                 │
@@ -392,7 +392,7 @@ caller          ffs-fuse        OpenFs           Transaction        MvccStore   
 
 ### Background repair cycle (mounted, `--background-repair --background-scrub-ledger`)
 
-```
+```text
                                                         (every interval_secs)
 ScrubDaemon         BlockDevice        Checksum         RaptorQ decoder     EvidenceLedger
    │                    │                  │                  │                  │
@@ -419,7 +419,7 @@ ScrubDaemon         BlockDevice        Checksum         RaptorQ decoder     Evid
 
 ### Writeback-cache opt-in (release-gated path)
 
-```
+```text
 operator                ffs-cli            ffs-fuse           validators
    │                       │                  │                  │
    │ ffs mount --rw --writeback-cache         │                  │
@@ -496,7 +496,7 @@ When a writer commits and discovers that a block it wrote has been modified sinc
 
 Three policy modes are available:
 
-```
+```text
 ConflictPolicy::Strict      : pure FCW; any block-level conflict aborts later writer
 ConflictPolicy::SafeMerge   : merge when a valid MergeProof exists; otherwise abort (default)
 ConflictPolicy::Adaptive    : runtime decision per commit, using expected-loss model
@@ -504,7 +504,7 @@ ConflictPolicy::Adaptive    : runtime decision per commit, using expected-loss m
 
 The adaptive expected-loss model:
 
-```
+```text
 E[loss_strict]      = conflict_rate · abort_cost
 E[loss_safe_merge]  = P(corruption) · severity + conflict_rate · (1 − merge_success_rate) · abort_cost
 ```
@@ -529,7 +529,7 @@ Each block group stores a configurable overhead of repair symbols alongside its 
 
 The repair-symbol overhead isn't a fixed constant. `DurabilityAutopilot` maintains a Beta posterior over per-block corruption probability, updated from every scrub-cycle observation:
 
-```
+```text
 posterior  ~  Beta(α + corrupted, β + clean)
 
 E[loss]    =  P(unrecoverable | overhead) · data_loss_cost  +  overhead · storage_cost
@@ -556,7 +556,7 @@ Repair symbols become stale when source blocks are modified.
 
 ### Mounted automatic repair
 
-```
+```bash
 ffs mount IMAGE MOUNT --background-repair --background-scrub-ledger repair.jsonl
 ffs mount IMAGE MOUNT --rw --background-repair --background-scrub-ledger repair.jsonl
 ```
@@ -591,7 +591,7 @@ FUSE kernel writeback-cache mode improves throughput by batching and reordering 
 
 FrankenFS tracks three monotonically advancing epoch counters per inode:
 
-```
+```text
 staged_epoch  ≥  visible_epoch  ≥  durable_epoch
 ```
 
@@ -652,22 +652,21 @@ The crash/replay oracle artifact records all 12 crash-point IDs, the mounted ope
 FrankenFS has two complementary I/O traits in `ffs-block`. The byte-addressed trait is what `OpenFs` uses directly for parser-driven reads at fixed offsets; the block-addressed trait is what the ARC cache and MVCC adapter wrap.
 
 ```rust
-// Byte-addressed (pread/pwrite semantics), used by parsers and OpenFs
-pub trait ByteDevice: Send + Sync {
-    fn len_bytes(&self) -> u64;
-    fn read_exact_at (&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()>;
-    fn write_all_at  (&self, cx: &Cx, offset: ByteOffset, buf: &[u8])     -> Result<()>;
-    fn flush(&self, cx: &Cx) -> Result<()>;
-    // ...
-}
+use asupersync::Cx;
+use ffs_block::{BlockBuf, BlockDevice, ByteDevice};
+use ffs_error::Result;
+use ffs_types::{BlockNumber, ByteOffset};
 
-// Block-addressed, wrapping a ByteDevice + optional cache + MVCC integration
-pub trait BlockDevice: Send + Sync {
-    fn read_block (&self, cx: &Cx, block: BlockNumber)              -> Result<BlockBuf>;
-    fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()>;
-    fn block_size (&self) -> u32;
-    fn block_count(&self) -> u64;
-    fn sync(&self, cx: &Cx) -> Result<()>;
+// Call the real traits: byte offsets and block numbers are distinct types.
+fn read_first_byte_and_block(
+    cx: &Cx,
+    bytes: &dyn ByteDevice,
+    blocks: &dyn BlockDevice,
+) -> Result<(u8, BlockBuf)> {
+    let mut first = [0_u8];
+    bytes.read_exact_at(cx, ByteOffset(0), &mut first)?;
+    let block = blocks.read_block(cx, BlockNumber(0))?;
+    Ok((first[0], block))
 }
 ```
 
@@ -705,7 +704,7 @@ FrankenFS supports both ext4 and btrfs from a single binary. Format detection ha
 
 ### Superblock probing
 
-```
+```text
 ext4 :  offset 1024,  size 1024 bytes,  magic 0xEF53      at offset 0x38
 btrfs:  offset 65536, size 4096 bytes,  magic "_BHRfS_M"  at offset 0x40
 ```
@@ -821,7 +820,7 @@ Library examples use `Cx::for_request()`; tests can construct contexts with expl
 
 File data in ext4 (and FrankenFS's native mode) is mapped via an extent tree, a compact B+tree stored in the inode's `i_block` field with optional overflow blocks.
 
-```
+```text
 ExtentMapping {
     logical_start: u64,    // File-relative block offset
     physical_start: u64,   // Disk-absolute block offset
@@ -853,7 +852,7 @@ Indirect-block addressing is also supported for ext4 images without the `EXTENTS
 
 Directory entries in ext4 use a two-level scheme: an htree provides block-level indexing, while entries within each block are stored as a linked list.
 
-```
+```text
 +--------+---------+----------+-----------+------+
 | inode  | rec_len | name_len | file_type | name |
 | (4B)   | (2B)    | (1B)     | (1B)      | (var)|
@@ -912,7 +911,7 @@ The set operation tries inline first, then spills to external. The get operation
 
 ## Deep Dive: Inode Lifecycle
 
-```
+```text
 group  = (ino - 1) / inodes_per_group
 index  = (ino - 1) % inodes_per_group
 block  = inode_table_block[group] + (index * inode_size) / block_size
@@ -978,7 +977,7 @@ Design details: [`docs/design-multi-host-repair.md`](docs/design-multi-host-repa
 
 ## Deep Dive: FUSE Request Lifecycle
 
-```
+```text
 1. begin_request_scope(cx, op)  →  acquire MVCC snapshot, check backpressure
 2. execute operation             →  dispatch to ext4/btrfs handler in ffs-core
 3. end_request_scope(cx, scope)  →  release snapshot, update metrics
@@ -998,7 +997,7 @@ When the system is under pressure (high dirty-cache ratio, long GC pauses, or ex
 
 ### Mount tuning constants
 
-```
+```text
 ATTR_TTL                      = 60 seconds  (RO images are immutable from the kernel side)
 FUSE_MAX_READ_BYTES           = 16 MB
 MAX_COALESCED_READ_SIZE       = 256 KB
@@ -1065,7 +1064,7 @@ MVCC version chains grow with every write to a block. Without compression, a hot
 
 When a new version's bytes match the previous version (common for metadata "touched but unchanged"), the chain stores an `Identical` marker with zero data:
 
-```
+```text
 Version chain:  [Full(4KB), Identical, Identical, Full(4KB), Identical]
 Memory:           4096        0          0          4096        0      =   8192 bytes
 Without dedup:    4096      4096       4096         4096      4096     =  20480 bytes
@@ -1201,8 +1200,7 @@ fn read_batch(cx: &Cx, device: &dyn BlockDevice, blocks: &[BlockNumber]) -> Resu
     Ok(())
 }
 
-// Test contexts have explicit budgets and deadlines
-#[cfg(test)]
+// For tests, construct an explicitly expired deadline.
 fn cx_with_expired_deadline() -> Cx {
     let budget = asupersync::Budget::new().with_deadline(asupersync::types::Time::ZERO);
     Cx::for_testing_with_budget(budget)
@@ -1499,7 +1497,7 @@ AGENT_NAME="${AGENT_NAME:-operator}" ./scripts/e2e/ffs_readiness_lab_e2e.sh
 
 Broker packets are operator handoff material for evidence campaigns that need explicit permission (xfstests, large-host swarm). They make the pending commands reproducible, but they are not executed evidence and **cannot** upgrade `xfstests.baseline` or `swarm.responsiveness` public wording. The ACK boundaries are exact strings:
 
-```
+```text
 XFSTESTS_REAL_RUN_ACK = xfstests-may-mutate-test-and-scratch-devices
 FFS_SWARM_WORKLOAD_REAL_RUN_ACK = swarm-workload-may-use-permissioned-large-host
 ```
@@ -1618,7 +1616,7 @@ Given `K` source symbols and `r` repair symbols, RaptorQ guarantees that any `K 
 
 **Encoding pipeline** (`ffs-repair::codec`):
 
-```
+```text
 source_blocks  ──►  intermediate_symbols  ──►  encoded_symbols
    (K)              (precompute, LU-like)        (K + r, on demand)
 ```
@@ -1631,7 +1629,7 @@ The `DurabilityAutopilot` is a Bayesian agent that maintains a posterior over th
 
 **Conjugate model.** Block corruption is modeled as a Bernoulli process: each block is either corrupt or clean, independently. The conjugate prior for a Bernoulli rate is the Beta distribution:
 
-```
+```text
 prior     :  p ~ Beta(α₀, β₀)         # uninformative default α₀=β₀=1
 posterior :  p ~ Beta(α₀ + c, β₀ + n − c)
 ```
@@ -1640,7 +1638,7 @@ where `n` is the number of blocks scanned in the latest cycle and `c` is the num
 
 **Beta-Binomial tail.** The probability of seeing more than `k` corruptions in a future group of `m` blocks, integrating over the posterior, is the Beta-Binomial tail:
 
-```
+```text
 P(X > k | α, β, m) = ∑_{j=k+1}^{m} C(m, j) · B(α + j, β + m − j) / B(α, β)
 ```
 
@@ -1648,7 +1646,7 @@ where `B(·,·)` is the Beta function. The autopilot computes this for each cand
 
 **Loss function.**
 
-```
+```text
 E[loss(o)] = P(unrecoverable | o, posterior) · data_loss_cost  +  o · storage_cost
 ```
 
@@ -1660,14 +1658,14 @@ The autopilot evaluates this for `o ∈ [min_overhead, max_overhead]` on a fine 
 
 The adaptive conflict policy is a single-step decision-theoretic agent:
 
-```
+```text
 choose argmin  E[loss_strict],     E[loss_safe_merge]
        a∈A
 ```
 
 where the actions are `A = {Strict, SafeMerge}` and the loss model is:
 
-```
+```text
 E[loss_strict]      = conflict_rate · abort_cost
 E[loss_safe_merge]  = P(corruption) · severity
                     + conflict_rate · (1 − merge_success_rate) · abort_cost
@@ -1679,7 +1677,7 @@ E[loss_safe_merge]  = P(corruption) · severity
 
 For an observation `x_t` at step `t`:
 
-```
+```text
 ema_t = α · x_t + (1 − α) · ema_{t−1}
 ```
 
@@ -1770,7 +1768,7 @@ A standard `mpsc` channel has a fundamental cancel-correctness problem: if `send
 
 asupersync's two-phase channels split `send` into:
 
-```
+```text
 let slot = chan.reserve(cx, value).await?;   // reserves capacity, holds value
 slot.commit().await?;                         // publishes; cancelling this is safe
 ```
@@ -2398,14 +2396,13 @@ fn budgeted_work(cx: &Cx, fs: &OpenFs, inodes: &[InodeNumber]) -> Result<(), Ffs
         for &ino in chunk {
             println!("{:?}", fs.getattr(cx, ino)?);
         }
-        // Cooperative yield + cancellation point.
+        // Cooperative budget/cancellation check, not an async yield.
         // Returns Err if cancelled or the deadline expired.
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
     }
     Ok(())
 }
 
-#[cfg(test)]
 fn with_test_deadline_cx() -> Cx {
     // Budget builder for tests: an explicitly-expired or short-deadline Cx,
     // matching the real pattern in crates/ffs-block/src/lib.rs.
@@ -2494,7 +2491,6 @@ use ffs_mvcc::sharded::ShardedMvccStore;
 use ffs_types::BlockNumber;
 use std::sync::Arc;
 
-#[test]
 fn lab_task_commits_a_block() {
     let seed = 0xDEADBEEF_u64;
     let mut runtime = LabRuntime::new(LabConfig::new(seed).max_steps(1_000));
@@ -2516,6 +2512,8 @@ fn lab_task_commits_a_block() {
         Some(vec![42; 16])
     );
 }
+
+lab_task_commits_a_block();
 ```
 
 The same seed and test configuration support repeatable lab scheduling. The actual concurrent workloads, conflict checks, and schedule coverage live in `crates/ffs-mvcc/tests/mvcc_stress_suite.rs`; run that integration-test target to exercise them. This one-task example makes no concurrency or DPOR coverage claim.
@@ -2622,7 +2620,7 @@ Real images are large; FrankenFS uses **sparse JSON fixtures** containing only n
 
 For functions where there is no direct external reference, FrankenFS uses metamorphic-relation proptests: input perturbations whose effect on output must follow a known rule.
 
-```
+```text
 crc32c_append associativity:
    crc32c(append(a, b))    ==    crc32c_combine(crc32c(a), crc32c(b), len(b))
 
@@ -2644,7 +2642,7 @@ The full catalog is in `metamorphic_seed_catalog` (snapshot-pinned), and the pro
 
 A short tour of the repository layout, for anyone cloning the source and wondering what each top-level directory contains.
 
-```
+```text
 frankenfs/
 ├── Cargo.toml                  Workspace root (22 members, [patch.crates-io] for vendored fuser)
 ├── Cargo.lock
@@ -2671,7 +2669,7 @@ frankenfs/
 │   ├── ffs-repair/             RaptorQ + autopilot + ScrubDaemon + evidence
 │   ├── ffs-core/               OpenFs orchestrator + FsOps trait
 │   ├── ffs/                    Public facade (re-export of ffs-core)
-│   ├── ffs-cli/                11-subcommand binary
+│   ├── ffs-cli/                Operator and benchmark CLI
 │   ├── ffs-tui/                Live monitoring dashboard (ftui)
 │   ├── ffs-harness/            Conformance + benchmarks + proof-bundle validators
 │   ├── ffs-ext4/               Legacy extraction reference (not on runtime path)
@@ -2722,7 +2720,7 @@ frankenfs/
 
 | Binary | Crate | What it does |
 |---|---|---|
-| `ffs-cli` | `ffs-cli` | The 11-subcommand operator tool |
+| `ffs-cli` | `ffs-cli` | Operator, inspection, and benchmark commands; see `ffs-cli --help` |
 | `ffs-tui` | `ffs-tui` | Live TUI dashboard |
 | `ffs-demo` | `ffs-repair` (`src/bin/ffs-demo.rs`) | Self-healing adoption-wedge demo |
 | `ffs-harness` | `ffs-harness` | Conformance + proof-bundle validation tool |
@@ -3044,7 +3042,7 @@ Internal crate-specific errors (e.g., `ParseError` from `ffs-types`, `FuseError`
 
 A single 4 KB block can pass through every storage subsystem during its lifetime. This walkthrough shows the typical journey.
 
-```
+```text
                                                               evidence
    stage           commit            visible            durable        emitted
      │               │                  │                  │              │
@@ -3106,7 +3104,7 @@ The whole lifecycle is auditable. Every step that mutates global state emits a s
 
 The dual to "lifetime of a block": every state a transaction passes through, and what an aborted transaction looks like.
 
-```
+```text
    begin          stage           commit          publish        retire
      │              │                │               │              │
      ▼              ▼                ▼               ▼              ▼
@@ -3603,7 +3601,7 @@ Rows in the btrfs experimental RW contract can still be `partially supported` or
 - **Self-healing.** Bayesian durability autopilot, RaptorQ symbol generation/recovery, four refresh policies (Eager/Lazy/Adaptive/Hybrid), stale-window SLO with percentile-based breach detection, multi-host repair-ownership coordination, expected-loss policy comparison, mounted automatic repair contract (read-only + read-write via MVCC repair-writeback serializer).
 - **Writeback-cache.** Epoch-based commit barriers with per-inode staged/visible/durable tracking, deferred visibility for MVCC isolation, dirty-page ordering oracle, 12-point crash/replay matrix artifact gate, runtime guard, and host/lane manifest checks. Kernel option default-off; explicit opt-in is evidence-gated.
 - **Observability.** Evidence ledger with 23 event types and 8 operator presets (`replay-anomalies`, `repair-failures`, `pressure-transitions`, `contention`, `metrics`, `cache`, `mvcc`, `repair-live`), contention metrics, policy-switch detection, structured logging across all subsystems, JSONL audit trail.
-- **CLI.** `inspect`, `mvcc-stats`, `info`, `dump`, `fsck`, `repair`, `mount` (22 flags), `scrub`, `parity`, `evidence`, `mkfs`.
+- **Selected CLI commands.** `inspect`, `read`, `walk`, `mvcc-stats`, `info`, `dump`, `fsck`, `repair`, `mount`, `scrub`, `parity`, `evidence`, `mkfs`; `ffs-cli --help` lists the full command set, including benchmark commands, and each subcommand's `--help` lists its current flags.
 - **Testing inventory (2026-09-08).** 22 workspace members, 63 fuzz targets, 173 Rust benchmark files, 125 E2E scripts, and 226 tracked insta snapshots. These counts describe source coverage inventory, not checks executed or passed, and do not prove that every emitted report is covered.
 
 ### Historical bridge closeouts and remaining work
@@ -3776,7 +3774,7 @@ A: Same on-disk format for the tracked V1 features, with different internals: MV
 
 The behavioral spec extracted in `EXISTING_EXT4_BTRFS_STRUCTURE.md` (94 KB) is rooted in the Linux v6.19 kernel sources:
 
-```
+```text
 fs/ext4/super.c             ext4 superblock and mount behavior
 fs/ext4/inode.c             ext4 inode lifecycle
 fs/ext4/extents.c           ext4 extent tree

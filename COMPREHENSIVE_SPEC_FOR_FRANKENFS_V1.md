@@ -689,6 +689,15 @@ Written blocks make repair symbols **stale**. Two modes:
 
 The `repair_generation` counter MUST be incremented only after a **full** symbol refresh of the group completes. Partial refreshes MUST NOT increment the counter.
 
+A scrub finding MUST be handled before regenerating symbols for its source
+group: encoding known-corrupt bytes would replace the evidence needed for
+recovery. The current pipeline tracks staleness per group, so it refuses recovery
+for an entire dirty group and preserves its symbols and dirty state. Clean groups
+may refresh; fresh groups may recover and then refresh. This in-memory guard does
+not establish persistent freshness across restart or concurrent mounted writes.
+Full-device recovery reports MUST retain corruption outside configured repair
+ranges as unrecoverable, rather than drop those findings from their totals.
+
 ### 3.11 Durability Autopilot (Bayesian Expected-Loss)
 
 When `RepairPolicy::autopilot` is `Some`, `ffs-core` SHOULD choose `overhead_ratio` at the start of each scrub cycle (and MAY adjust it mid-scrub if evidence shifts materially).
