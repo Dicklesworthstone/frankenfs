@@ -7177,6 +7177,15 @@ impl OpenFs {
         operations: &[ffs_journal::FcOperation],
         writes_allowed: bool,
     ) -> Result<usize, FfsError> {
+        if writes_allowed {
+            for operation in operations {
+                if let ffs_journal::FcOperation::InodeUpdate(ino, raw) = operation
+                    && !raw.is_empty()
+                {
+                    self.validate_recovery_inode_bytes(*ino, raw)?;
+                }
+            }
+        }
         // External-extent-tree inodes need their ADD_RANGE leaves AND their
         // InodeUpdate applied together; do that coordinated pass first (bd-6nwjx
         // incr 3b). The per-op loop skips only InodeUpdate records completed by
@@ -7442,6 +7451,7 @@ impl OpenFs {
                 "fast-commit inode {ino} record has no recoverable inode bytes"
             )));
         }
+        self.validate_recovery_inode_bytes(ino, raw_inode)?;
         // DELETION (bd-4tmpw): a fast-committed inode with links_count == 0 is a
         // deleted inode (no valid file has zero links). Free it AND its blocks
         // rather than writing the zero-link header back — otherwise the inode
@@ -7551,6 +7561,24 @@ impl OpenFs {
         Ok(())
     }
 
+    fn validate_recovery_inode_bytes(&self, ino: u32, raw_inode: &[u8]) -> Result<(), FfsError> {
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let minimum = usize::from(ffs_ondisk::ext4::EXT4_GOOD_OLD_INODE_SIZE);
+        let maximum = usize::from(sb.inode_size);
+        if !(minimum..=maximum).contains(&raw_inode.len()) {
+            return Err(FfsError::Corruption {
+                block: 0,
+                detail: format!(
+                    "fast-commit inode {ino} has invalid record length {}; expected {minimum}..={maximum}",
+                    raw_inode.len()
+                ),
+            });
+        }
+        Ok(())
+    }
+
     /// Splice raw inode bytes into the inode table at recovery time and write
     /// the block back via the unversioned device adapter (the JBD2-replay write
     /// path — no alloc_state needed at mount). Shared by the fast-commit
@@ -7562,6 +7590,7 @@ impl OpenFs {
         ino: u32,
         raw_inode: &[u8],
     ) -> Result<(), FfsError> {
+        self.validate_recovery_inode_bytes(ino, raw_inode)?;
         let sb = self
             .ext4_superblock()
             .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
@@ -7593,7 +7622,7 @@ impl OpenFs {
             });
         }
         let mut updated = block.as_slice().to_vec();
-        let write_len = raw_inode.len().min(inode_size);
+        let write_len = raw_inode.len();
         updated[offset_in_block..offset_in_block + write_len]
             .copy_from_slice(&raw_inode[..write_len]);
 
@@ -8667,13 +8696,17 @@ impl OpenFs {
     /// # Errors
     /// Returns `CommitError::Conflict` if another transaction committed to
     /// a block in this transaction's write set after our snapshot.
+    /// If an attached repair lifecycle rejects its notification, returns
+    /// `CommitError::DurabilityFailure` after the MVCC commit has become visible.
+    /// That error does not roll back the transaction; callers must not assume
+    /// that retrying the original write is safe.
     ///
     /// # Logging
     /// - `txn_commit_start`: transaction details before commit
     /// - `txn_commit_success`: on successful commit with commit sequence
     /// - `txn_commit_conflict`: on FCW conflict with conflict details
     #[allow(clippy::cast_possible_truncation)]
-    pub fn commit_transaction(&self, txn: Transaction) -> Result<CommitSeq, CommitError> {
+    pub fn commit_transaction(&self, cx: &Cx, txn: Transaction) -> Result<CommitSeq, CommitError> {
         let txn_id = txn.id;
         let write_set_size = txn.pending_writes();
         let read_set_size = txn.read_set().len();
@@ -8776,7 +8809,13 @@ impl OpenFs {
 
         if let Ok(commit_seq) = &result {
             self.prune_mvcc_after_commit_if_due(*commit_seq);
-            self.notify_repair_flush_lifecycle(txn_id, &write_blocks);
+            self.notify_repair_flush_lifecycle_with_cx(cx, txn_id, &write_blocks)
+                .map_err(|error| CommitError::DurabilityFailure {
+                    detail: format!(
+                        "transaction {} committed at sequence {}, but repair refresh notification failed: {error}",
+                        txn_id.0, commit_seq.0
+                    ),
+                })?;
         }
 
         result
@@ -8790,8 +8829,14 @@ impl OpenFs {
     /// # Errors
     /// Returns `CommitError::Conflict` for write-write conflicts (FCW layer).
     /// Returns `CommitError::SsiConflict` for rw-antidependency cycles.
+    /// Repair notification failure returns `CommitError::DurabilityFailure`
+    /// after commit visibility, with the committed sequence in its detail.
     #[allow(clippy::cast_possible_truncation)]
-    pub fn commit_transaction_ssi(&self, txn: Transaction) -> Result<CommitSeq, CommitError> {
+    pub fn commit_transaction_ssi(
+        &self,
+        cx: &Cx,
+        txn: Transaction,
+    ) -> Result<CommitSeq, CommitError> {
         let txn_id = txn.id;
         let write_set_size = txn.pending_writes();
         let read_set_size = txn.read_set().len();
@@ -8848,40 +8893,16 @@ impl OpenFs {
 
         if let Ok(commit_seq) = &result {
             self.prune_mvcc_after_commit_if_due(*commit_seq);
-            self.notify_repair_flush_lifecycle(txn_id, &write_blocks);
+            self.notify_repair_flush_lifecycle_with_cx(cx, txn_id, &write_blocks)
+                .map_err(|error| CommitError::DurabilityFailure {
+                    detail: format!(
+                        "transaction {} committed at sequence {}, but repair refresh notification failed: {error}",
+                        txn_id.0, commit_seq.0
+                    ),
+                })?;
         }
 
         result
-    }
-
-    fn notify_repair_flush_lifecycle(
-        &self,
-        txn_id: ffs_types::TxnId,
-        write_blocks: &[BlockNumber],
-    ) {
-        if write_blocks.is_empty() {
-            return;
-        }
-        let Some(ref lifecycle) = self.repair_flush_lifecycle else {
-            return;
-        };
-        let Some(cx) = Cx::current() else {
-            trace!(
-                target: "ffs::repair",
-                txn_id = txn_id.0,
-                "repair_lifecycle_skipped_no_cx"
-            );
-            return;
-        };
-        if let Err(e) = lifecycle.on_flush_committed(&cx, write_blocks) {
-            warn!(
-                target: "ffs::repair",
-                txn_id = txn_id.0,
-                block_count = write_blocks.len(),
-                error = %e,
-                "repair_lifecycle_notify_failed"
-            );
-        }
     }
 
     fn notify_repair_flush_lifecycle_with_cx(
@@ -8889,12 +8910,12 @@ impl OpenFs {
         cx: &Cx,
         txn_id: ffs_types::TxnId,
         write_blocks: &[BlockNumber],
-    ) {
+    ) -> ffs_error::Result<()> {
         if write_blocks.is_empty() {
-            return;
+            return Ok(());
         }
         let Some(ref lifecycle) = self.repair_flush_lifecycle else {
-            return;
+            return Ok(());
         };
         if let Err(e) = lifecycle.on_flush_committed(cx, write_blocks) {
             warn!(
@@ -8904,7 +8925,12 @@ impl OpenFs {
                 error = %e,
                 "repair_lifecycle_notify_failed"
             );
+            return Err(FfsError::RepairFailed(format!(
+                "transaction {} is already committed, but its repair refresh notification failed: {e}",
+                txn_id.0
+            )));
         }
+        Ok(())
     }
 
     /// Attach a JBD2 writer for ext4 compatibility-mode journaled commits.
@@ -9073,7 +9099,7 @@ impl OpenFs {
             .map_or_else(Vec::new, |tx| tx.write_set().keys().copied().collect());
         let commit_seq = scope.commit_if_write(&self.mvcc_store)?;
         if let Some(tx_id) = tx_id {
-            self.notify_repair_flush_lifecycle_with_cx(cx, tx_id, &write_blocks);
+            self.notify_repair_flush_lifecycle_with_cx(cx, tx_id, &write_blocks)?;
         }
         Ok(commit_seq)
     }
@@ -10092,18 +10118,7 @@ impl OpenFs {
         );
 
         // Notify repair lifecycle on successful commit (spec §12.1.3).
-        if !write_blocks.is_empty()
-            && let Some(lifecycle) = &self.repair_flush_lifecycle
-            && let Err(e) = lifecycle.on_flush_committed(cx, &write_blocks)
-        {
-            warn!(
-                target: "ffs::repair",
-                txn_id = txn_id.0,
-                block_count = write_blocks.len(),
-                error = %e,
-                "repair_lifecycle_notify_failed"
-            );
-        }
+        self.notify_repair_flush_lifecycle_with_cx(cx, txn_id, &write_blocks)?;
 
         Ok((commit_seq, jbd2_stats))
     }
@@ -38514,7 +38529,7 @@ impl OpenFs {
         cx: &Cx,
         mut scope: RequestScope,
     ) -> ffs_error::Result<CommitSeq> {
-        let commit_result = <Self as FsOps>::commit_request_scope(self, &mut scope);
+        let commit_result = <Self as FsOps>::commit_request_scope(self, cx, &mut scope);
         let end_result = <Self as FsOps>::end_request_scope(self, cx, RequestOp::Write, scope);
 
         match (commit_result, end_result) {
@@ -39432,7 +39447,7 @@ impl OpenFs {
             new_name,
         ) {
             Ok(()) => {
-                self.commit_request_scope(&mut local_scope)?;
+                self.commit_request_scope(cx, &mut local_scope)?;
                 Ok(())
             }
             Err(err) => Err(err),
@@ -46151,6 +46166,36 @@ mod tests {
     }
 
     #[test]
+    fn fast_commit_apply_rejects_malformed_inode_size_before_mutation() {
+        let cx = Cx::for_testing();
+        for invalid_len in [1, 27, 32, 127, 257] {
+            let image = build_ext4_image_with_inode();
+            let dev = TestDevice::from_vec(image.clone());
+            let view = dev.clone();
+            let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+            assert_eq!(fs.ext4_superblock().unwrap().inode_size, 256);
+            let (_, operation) = fc_inode_update_op_for_root(&fs, &cx);
+            let ffs_journal::FcOperation::InodeUpdate(ino, mut raw) = operation else {
+                unreachable!("helper returns an inode update")
+            };
+            raw.resize(invalid_len, 0);
+            let error = fs
+                .apply_fast_commit_operations(
+                    &cx,
+                    &[ffs_journal::FcOperation::InodeUpdate(ino, raw)],
+                    true,
+                )
+                .expect_err("malformed inode size must stop recovery");
+            assert!(matches!(error, FfsError::Corruption { .. }));
+            assert_eq!(
+                view.snapshot_bytes(),
+                image,
+                "raw inode length={invalid_len}"
+            );
+        }
+    }
+
+    #[test]
     fn fast_commit_apply_mapping_requires_physical_and_unwritten_agreement() {
         let extents = [Ext4Extent {
             logical_block: 10,
@@ -47607,7 +47652,7 @@ mod tests {
         t2.stage_write(target, vec![0x22; block_size]);
         let t2_id = t2.id.0;
 
-        fs.commit_transaction(t1)
+        fs.commit_transaction(&cx, t1)
             .expect("first transaction should commit");
         let err = fs
             .commit_transaction_journaled(&cx, t2)
@@ -50175,7 +50220,7 @@ mod tests {
             .expect("begin ioctl write scope");
         fs.set_inode_flags(&cx, &mut write_scope, created.ino, ffs_types::EXT4_COMPR_FL)
             .expect("enable COMPR flag");
-        fs.commit_request_scope(&mut write_scope)
+        fs.commit_request_scope(&cx, &mut write_scope)
             .expect("commit ioctl write scope");
         fs.end_request_scope(&cx, RequestOp::IoctlWrite, write_scope)
             .expect("end ioctl write scope");
@@ -50256,7 +50301,7 @@ mod tests {
             .expect("begin ioctl write scope");
         fs.set_inode_flags(&cx, &mut write_scope, created.ino, ffs_types::EXT4_COMPR_FL)
             .expect("enable COMPR flag");
-        fs.commit_request_scope(&mut write_scope)
+        fs.commit_request_scope(&cx, &mut write_scope)
             .expect("commit ioctl write scope");
         fs.end_request_scope(&cx, RequestOp::IoctlWrite, write_scope)
             .expect("end ioctl write scope");
@@ -50329,7 +50374,7 @@ mod tests {
             .expect("begin ioctl write scope");
         fs.set_inode_flags(&cx, &mut write_scope, created.ino, ffs_types::EXT4_COMPR_FL)
             .expect("enable COMPR flag");
-        fs.commit_request_scope(&mut write_scope)
+        fs.commit_request_scope(&cx, &mut write_scope)
             .expect("commit ioctl write scope");
         fs.end_request_scope(&cx, RequestOp::IoctlWrite, write_scope)
             .expect("end ioctl write scope");
@@ -50409,7 +50454,7 @@ mod tests {
             .expect("begin ioctl write scope");
         fs.set_inode_flags(&cx, &mut write_scope, created.ino, ffs_types::EXT4_COMPR_FL)
             .expect("enable COMPR flag");
-        fs.commit_request_scope(&mut write_scope)
+        fs.commit_request_scope(&cx, &mut write_scope)
             .expect("commit ioctl write scope");
         fs.end_request_scope(&cx, RequestOp::IoctlWrite, write_scope)
             .expect("end ioctl write scope");
@@ -50493,7 +50538,7 @@ mod tests {
             .expect("begin ioctl write scope");
         fs.set_inode_flags(&cx, &mut write_scope, created.ino, ffs_types::EXT4_COMPR_FL)
             .expect("enable COMPR flag");
-        fs.commit_request_scope(&mut write_scope)
+        fs.commit_request_scope(&cx, &mut write_scope)
             .expect("commit ioctl write scope");
         fs.end_request_scope(&cx, RequestOp::IoctlWrite, write_scope)
             .expect("end ioctl write scope");
@@ -50568,7 +50613,7 @@ mod tests {
             .expect("begin ioctl write scope");
         fs.set_inode_flags(&cx, &mut write_scope, created.ino, ffs_types::EXT4_COMPR_FL)
             .expect("enable COMPR flag");
-        fs.commit_request_scope(&mut write_scope)
+        fs.commit_request_scope(&cx, &mut write_scope)
             .expect("commit ioctl write scope");
         fs.end_request_scope(&cx, RequestOp::IoctlWrite, write_scope)
             .expect("end ioctl write scope");
@@ -63717,7 +63762,7 @@ mod tests {
          -> ffs_error::Result<()> {
             let mut scope = <OpenFs as FsOps>::begin_request_scope(&fs, &cx, op)?;
             let result = run(&mut scope).and_then(|()| {
-                <OpenFs as FsOps>::commit_request_scope(&fs, &mut scope).map(|_| ())
+                <OpenFs as FsOps>::commit_request_scope(&fs, &cx, &mut scope).map(|_| ())
             });
             let end = <OpenFs as FsOps>::end_request_scope(&fs, &cx, op, scope);
             result.and(end)
@@ -63873,7 +63918,7 @@ mod tests {
             .expect("begin ioctl write scope");
         let result = fs.move_ext(cx, &mut scope, ino, donor_fd, orig_start, donor_start, len);
         if result.is_ok() {
-            fs.commit_request_scope(&mut scope)
+            fs.commit_request_scope(cx, &mut scope)
                 .expect("commit ioctl write scope");
         }
         fs.end_request_scope(cx, RequestOp::IoctlWrite, scope)
@@ -68540,7 +68585,7 @@ mod tests {
         assert_eq!(staged_x.ino, y.ino, "staged x must point at old y");
         assert_eq!(staged_y.ino, x.ino, "staged y must point at old x");
 
-        fs.commit_request_scope(&mut scope)
+        fs.commit_request_scope(&cx, &mut scope)
             .expect("commit rename scope");
         fs.end_request_scope(&cx, RequestOp::Rename, scope)
             .expect("end rename scope");
@@ -76073,6 +76118,7 @@ mod tests {
         let Some(fs) = open_writable_ext4() else {
             return;
         };
+        let cx = Cx::for_testing();
         let block = BlockNumber(9);
         let bs = usize::try_from(fs.block_size()).expect("block size fits");
         let _current_adapter = fs.block_device_adapter();
@@ -76082,7 +76128,7 @@ mod tests {
             let mut txn = fs.begin_transaction();
             let byte = u8::try_from(seq % 251).expect("modulo fits u8");
             fs.stage_block_write(&mut txn, block, vec![byte; bs]);
-            fs.commit_transaction(txn)
+            fs.commit_transaction(&cx, txn)
                 .expect("commit hot-block overwrite");
         }
 
@@ -76256,15 +76302,137 @@ mod tests {
     #[derive(Debug, Default)]
     struct RecordingRepairLifecycle {
         blocks: Mutex<Vec<BlockNumber>>,
+        reject_notifications: bool,
+        observed_poll_quota: std::sync::atomic::AtomicU32,
     }
 
     impl RepairFlushLifecycle for RecordingRepairLifecycle {
-        fn on_flush_committed(&self, _cx: &Cx, blocks: &[BlockNumber]) -> ffs_error::Result<()> {
+        fn on_flush_committed(&self, cx: &Cx, blocks: &[BlockNumber]) -> ffs_error::Result<()> {
+            self.observed_poll_quota
+                .store(cx.budget().poll_quota, Ordering::Relaxed);
+            if self.reject_notifications {
+                return Err(FfsError::RepairFailed(
+                    "injected lifecycle failure".to_owned(),
+                ));
+            }
             self.blocks
                 .lock()
                 .expect("repair lifecycle lock")
                 .extend_from_slice(blocks);
             Ok(())
+        }
+    }
+
+    #[test]
+    fn repair_commit_explicit_context_notifies_without_ambient_context() {
+        assert!(
+            Cx::current().is_none(),
+            "test must exercise the non-ambient path"
+        );
+        for ssi in [false, true] {
+            let cx = Cx::for_testing();
+            let dev = TestDevice::from_vec(build_ext4_image_with_state(EXT4_VALID_FS));
+            let mut fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+            let lifecycle = Arc::new(RecordingRepairLifecycle::default());
+            fs.attach_repair_flush_lifecycle(lifecycle.clone());
+            let block = BlockNumber(8);
+            let data = filled_repair_block(&fs, 0xA7);
+            let mut first = fs.begin_transaction();
+            let mut conflicting = fs.begin_transaction();
+            fs.stage_block_write(&mut first, block, data.clone());
+            fs.stage_block_write(&mut conflicting, block, filled_repair_block(&fs, 0xB8));
+            let committed = if ssi {
+                fs.commit_transaction_ssi(&cx, first)
+            } else {
+                fs.commit_transaction(&cx, first)
+            }
+            .expect("commit and notify");
+            assert!(committed.0 > 0);
+            assert_eq!(
+                std::mem::take(&mut *lifecycle.blocks.lock().unwrap()),
+                vec![block]
+            );
+            let conflict = if ssi {
+                fs.commit_transaction_ssi(&cx, conflicting)
+            } else {
+                fs.commit_transaction(&cx, conflicting)
+            };
+            assert!(matches!(conflict, Err(CommitError::Conflict { .. })));
+            assert_eq!(lifecycle.blocks.lock().unwrap().len(), 0);
+            assert_eq!(
+                fs.read_block_at_snapshot(&cx, block, fs.current_snapshot())
+                    .unwrap(),
+                data
+            );
+        }
+    }
+
+    #[test]
+    fn repair_commit_notification_failure_reports_committed_state() {
+        for ssi in [false, true] {
+            let cx = Cx::for_testing();
+            let dev = TestDevice::from_vec(build_ext4_image_with_state(EXT4_VALID_FS));
+            let mut fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+            fs.attach_repair_flush_lifecycle(Arc::new(RecordingRepairLifecycle {
+                reject_notifications: true,
+                ..RecordingRepairLifecycle::default()
+            }));
+            let block = BlockNumber(8);
+            let data = filled_repair_block(&fs, 0xC9);
+            let mut txn = fs.begin_transaction();
+            fs.stage_block_write(&mut txn, block, data.clone());
+            let outcome = if ssi {
+                fs.commit_transaction_ssi(&cx, txn)
+            } else {
+                fs.commit_transaction(&cx, txn)
+            };
+            assert!(
+                matches!(outcome, Err(CommitError::DurabilityFailure { ref detail })
+                if detail.contains("committed at sequence")
+                    && detail.contains("injected lifecycle failure"))
+            );
+            assert_eq!(
+                fs.read_block_at_snapshot(&cx, block, fs.current_snapshot())
+                    .unwrap(),
+                data,
+                "notification failure must not be described as rollback"
+            );
+        }
+    }
+
+    #[test]
+    fn repair_commit_mounted_scope_passes_request_context_and_propagates_failure() {
+        assert!(Cx::current().is_none());
+        for reject_notifications in [false, true] {
+            let cx = Cx::for_testing_with_budget(asupersync::Budget::new().with_poll_quota(17));
+            let dev = TestDevice::from_vec(build_ext4_image_with_state(EXT4_VALID_FS));
+            let mut fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+            let lifecycle = Arc::new(RecordingRepairLifecycle {
+                reject_notifications,
+                ..RecordingRepairLifecycle::default()
+            });
+            fs.attach_repair_flush_lifecycle(lifecycle.clone());
+            let mut scope = fs.begin_request_scope(&cx, RequestOp::Write).unwrap();
+            let block = BlockNumber(8);
+            let data = filled_repair_block(&fs, 0xD4);
+            let block_dev = fs.block_device_adapter();
+            OpenFs::write_block_with_scope(&cx, &mut scope, &block_dev, block, &data).unwrap();
+            let result = fs.commit_request_scope(&cx, &mut scope);
+            assert_eq!(lifecycle.observed_poll_quota.load(Ordering::Relaxed), 17);
+            if reject_notifications {
+                assert!(matches!(result, Err(FfsError::RepairFailed(ref detail))
+                    if detail.contains("already committed")));
+            } else {
+                assert!(result.is_ok());
+                assert_eq!(*lifecycle.blocks.lock().unwrap(), vec![block]);
+            }
+            fs.end_request_scope(&cx, RequestOp::Write, scope).unwrap();
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            assert_eq!(
+                fs.read_block_at_snapshot(&cx, block, fs.current_snapshot())
+                    .unwrap(),
+                data
+            );
         }
     }
 
@@ -76295,7 +76463,7 @@ mod tests {
                 .expect("stage client write");
         }
         let commit = fs
-            .commit_request_scope(&mut scope)
+            .commit_request_scope(cx, &mut scope)
             .expect("commit client write");
         fs.end_request_scope(cx, RequestOp::Write, scope)
             .expect("end client write scope");
@@ -77943,7 +78111,7 @@ mod tests {
         fs.stage_block_write(&mut txn, block, vec![0xCC; bs]);
 
         // Commit and verify.
-        let seq = fs.commit_transaction(txn).expect("commit");
+        let seq = fs.commit_transaction(&cx, txn).expect("commit");
         assert!(seq.0 > 0);
 
         // Read back via snapshot.
@@ -77969,7 +78137,7 @@ mod tests {
         let bs = fs.block_size() as usize;
         let mut txn = fs.begin_transaction();
         fs.stage_block_write(&mut txn, block, vec![0xAA; bs]);
-        let seq = fs.commit_transaction(txn).expect("commit");
+        let seq = fs.commit_transaction(&cx, txn).expect("commit");
 
         // latest_block_version should now return the commit seq.
         assert_eq!(fs.latest_block_version(block), seq);
@@ -77994,7 +78162,7 @@ mod tests {
         for val in 0..5_u8 {
             let mut txn = fs.begin_transaction();
             fs.stage_block_write(&mut txn, block, vec![val; bs]);
-            fs.commit_transaction(txn).expect("commit");
+            fs.commit_transaction(&cx, txn).expect("commit");
         }
 
         // Prune should return a watermark (CommitSeq is always valid).
@@ -78020,7 +78188,7 @@ mod tests {
         fs.record_read(&mut txn, block, version);
         fs.stage_block_write(&mut txn, block, vec![0xDD; bs]);
 
-        let seq = fs.commit_transaction_ssi(txn).expect("ssi commit");
+        let seq = fs.commit_transaction_ssi(&cx, txn).expect("ssi commit");
         assert!(seq.0 > 0);
 
         // Verify data visible.
@@ -78052,11 +78220,11 @@ mod tests {
         fs.stage_block_write(&mut t2, block, vec![0x22; bs]);
 
         // T1 commits first (succeeds).
-        fs.commit_transaction_ssi(t1).expect("t1 ssi commit");
+        fs.commit_transaction_ssi(&cx, t1).expect("t1 ssi commit");
 
         // T2 should conflict (read-write dependency).
         let err = fs
-            .commit_transaction_ssi(t2)
+            .commit_transaction_ssi(&cx, t2)
             .expect_err("t2 should conflict");
         assert!(
             matches!(

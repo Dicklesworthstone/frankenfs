@@ -6295,7 +6295,7 @@ impl Filesystem for FrankenFuse {
                 req.uid(),
                 req.gid(),
             )?;
-            self.inner.ops.commit_request_scope(scope)?;
+            self.inner.ops.commit_request_scope(cx, scope)?;
             Ok(attr)
         }) {
             Ok(attr) => {
@@ -6585,7 +6585,7 @@ impl Filesystem for FrankenFuse {
             self.inner
                 .ops
                 .unlink(cx, scope, InodeNumber(parent), name)?;
-            self.inner.ops.commit_request_scope(scope)?;
+            self.inner.ops.commit_request_scope(cx, scope)?;
             Ok(())
         }) {
             Ok(()) => {
@@ -6693,7 +6693,7 @@ impl Filesystem for FrankenFuse {
                 InodeNumber(newparent),
                 newname,
             )?;
-            self.inner.ops.commit_request_scope(scope)?;
+            self.inner.ops.commit_request_scope(cx, scope)?;
             Ok(attr)
         }) {
             Ok(attr) => {
@@ -6848,7 +6848,7 @@ impl Filesystem for FrankenFuse {
                 byte_length,
                 mode,
             )?;
-            self.inner.ops.commit_request_scope(scope)?;
+            self.inner.ops.commit_request_scope(cx, scope)?;
             Ok(())
         }) {
             Ok(()) => {
@@ -7030,7 +7030,7 @@ impl Filesystem for FrankenFuse {
             self.inner
                 .ops
                 .fsync(cx, scope, InodeNumber(ino), fh, datasync)?;
-            self.inner.ops.commit_request_scope(scope)?;
+            self.inner.ops.commit_request_scope(cx, scope)?;
             Ok(())
         }) {
             Ok(()) => reply.ok(),
@@ -7070,7 +7070,7 @@ impl Filesystem for FrankenFuse {
             self.inner
                 .ops
                 .fsyncdir(cx, scope, InodeNumber(ino), fh, datasync)?;
-            self.inner.ops.commit_request_scope(scope)?;
+            self.inner.ops.commit_request_scope(cx, scope)?;
             Ok(())
         }) {
             Ok(()) => reply.ok(),
@@ -7183,7 +7183,7 @@ impl Filesystem for FrankenFuse {
                 req.uid(),
                 req.gid(),
             )?;
-            self.inner.ops.commit_request_scope(scope)?;
+            self.inner.ops.commit_request_scope(cx, scope)?;
             Ok(attr)
         }) {
             Ok(attr) => {
@@ -7426,7 +7426,7 @@ impl FrankenFuse {
                 .inner
                 .ops
                 .removexattr(cx, scope, InodeNumber(ino), name)?;
-            self.inner.ops.commit_request_scope(scope)?;
+            self.inner.ops.commit_request_scope(cx, scope)?;
             Ok(removed)
         }) {
             Ok(true) => {
@@ -14335,7 +14335,11 @@ mod tests {
             Ok(())
         }
 
-        fn commit_request_scope(&self, _scope: &mut RequestScope) -> ffs_error::Result<CommitSeq> {
+        fn commit_request_scope(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+        ) -> ffs_error::Result<CommitSeq> {
             self.calls
                 .lock()
                 .expect("lock ioctl calls")
@@ -19429,6 +19433,7 @@ mod tests {
 
         fn commit_request_scope(
             &self,
+            _cx: &Cx,
             _scope: &mut RequestScope,
         ) -> ffs_error::Result<ffs_types::CommitSeq> {
             if self.record_scopes {

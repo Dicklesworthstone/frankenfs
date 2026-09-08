@@ -4240,7 +4240,11 @@ impl FsOps for OpenFs {
     /// # Errors
     ///
     /// Returns `FfsError::Conflict` if the transaction cannot be committed.
-    fn commit_request_scope(&self, scope: &mut RequestScope) -> ffs_error::Result<CommitSeq> {
+    fn commit_request_scope(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+    ) -> ffs_error::Result<CommitSeq> {
         let tx_id = scope.tx.as_ref().map(ffs_mvcc::Transaction::id);
         // Only the repair-flush lifecycle consumes write_blocks; when it is not
         // attached (normal operation) skip the per-commit Vec allocation of every
@@ -4257,7 +4261,7 @@ impl FsOps for OpenFs {
         if let Ok(commit_seq) = &result {
             self.prune_mvcc_after_commit_if_due(*commit_seq);
             if let Some(tx_id) = tx_id {
-                self.notify_repair_flush_lifecycle(tx_id, &write_blocks);
+                self.notify_repair_flush_lifecycle_with_cx(cx, tx_id, &write_blocks)?;
             }
         }
         result

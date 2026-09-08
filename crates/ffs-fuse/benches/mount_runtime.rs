@@ -290,7 +290,11 @@ impl FsOps for WritebackBenchFs {
         Ok(RequestScope::empty())
     }
 
-    fn commit_request_scope(&self, _scope: &mut RequestScope) -> ffs_error::Result<CommitSeq> {
+    fn commit_request_scope(
+        &self,
+        _cx: &Cx,
+        _scope: &mut RequestScope,
+    ) -> ffs_error::Result<CommitSeq> {
         let mut state = self.commits.load(AtomicOrdering::Relaxed);
         for n in 0..self.commit_work {
             state = state.wrapping_add(n.rotate_left(7)).rotate_left(13) ^ 0x9E37_79B9_7F4A_7C15;

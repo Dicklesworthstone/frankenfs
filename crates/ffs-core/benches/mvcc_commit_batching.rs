@@ -146,13 +146,15 @@ fn openfs_parallel_commits(fs: &OpenFs, data: &[u8]) -> u64 {
         let mut handles = Vec::with_capacity(PARALLEL_THREADS);
         for tid in 0..PARALLEL_THREADS {
             handles.push(scope.spawn(move || {
+                let cx = Cx::for_testing();
                 let tid_u64 = u64::try_from(tid).expect("thread index fits u64");
                 let thread_base = PARALLEL_BLOCK_BASE + tid_u64 * PARALLEL_COMMITS_PER_THREAD;
                 let mut committed = 0_u64;
                 for offset in 0..PARALLEL_COMMITS_PER_THREAD {
                     let mut txn = fs.begin_transaction();
                     txn.stage_write(BlockNumber(thread_base + offset), data.to_vec());
-                    fs.commit_transaction(txn).expect("parallel MVCC commit");
+                    fs.commit_transaction(&cx, txn)
+                        .expect("parallel MVCC commit");
                     committed += 1;
                 }
                 committed
@@ -166,13 +168,14 @@ fn openfs_parallel_commits(fs: &OpenFs, data: &[u8]) -> u64 {
 }
 
 fn openfs_hot_block_overwrite_commits(fs: &OpenFs, data: &[u8]) -> usize {
+    let cx = Cx::for_testing();
     for offset in 0..HOT_BLOCK_COMMITS {
         let mut txn = fs.begin_transaction();
         txn.stage_write(
             BlockNumber(HOT_BLOCK_BASE + offset % HOT_BLOCK_COUNT),
             data.to_vec(),
         );
-        fs.commit_transaction(txn)
+        fs.commit_transaction(&cx, txn)
             .expect("hot-block overwrite MVCC commit");
     }
     fs.mvcc_version_count()

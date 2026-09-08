@@ -66,6 +66,36 @@ fn injected_readme_benchmark_file_count_drift_is_detected() -> Result<(), String
     }
 }
 
+#[test]
+fn injected_readme_merge_mechanism_count_drift_is_detected() -> Result<(), String> {
+    let root = workspace_root()?;
+    let readme = read_to_string(&root, "README.md")?;
+    let source = read_to_string(&root, "crates/ffs-mvcc/src/lib.rs")?;
+    let outcomes = count_enum_variants(&source, "MergeProofMechanism")?;
+    let mechanisms = outcomes
+        .checked_sub(1)
+        .ok_or_else(|| "merge outcome enum has no refusal outcome".to_owned())?;
+    let original = format!("{mechanisms} executable same-block merge mechanisms");
+    if !readme.contains(&original) {
+        return Err(format!("merge mechanism claim is missing: {original}"));
+    }
+    let mutated = readme.replace(
+        &original,
+        &format!("{outcomes} executable same-block merge mechanisms"),
+    );
+    let mismatches = collect_mismatches(&root, &mutated)?;
+    if mismatches
+        .iter()
+        .any(|mismatch| mismatch.starts_with("executable MergeProof mechanism count:"))
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "counting the refusal outcome as a merge mechanism was not detected: {mismatches:?}"
+        ))
+    }
+}
+
 fn collect_mismatches(root: &Path, readme: &str) -> Result<Vec<String>, String> {
     let crate_count = git_ls_files_count(root, "crates/*/Cargo.toml")?;
     let fuzz_target_count = git_ls_files_count(root, "fuzz/fuzz_targets/*.rs")?;

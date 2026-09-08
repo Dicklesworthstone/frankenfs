@@ -2716,7 +2716,11 @@ pub trait FsOps: Send + Sync {
     }
 
     /// Commit any write transaction attached to the request scope.
-    fn commit_request_scope(&self, _scope: &mut RequestScope) -> ffs_error::Result<CommitSeq> {
+    fn commit_request_scope(
+        &self,
+        _cx: &Cx,
+        _scope: &mut RequestScope,
+    ) -> ffs_error::Result<CommitSeq> {
         Ok(CommitSeq(0))
     }
 
@@ -3641,8 +3645,12 @@ impl<T: FsOps + ?Sized> FsOps for Arc<T> {
         self.as_ref().end_request_scope(cx, op, scope)
     }
 
-    fn commit_request_scope(&self, scope: &mut RequestScope) -> ffs_error::Result<CommitSeq> {
-        self.as_ref().commit_request_scope(scope)
+    fn commit_request_scope(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+    ) -> ffs_error::Result<CommitSeq> {
+        self.as_ref().commit_request_scope(cx, scope)
     }
 
     // ⚠️ These two forwards are the load-bearing half of bd-2i2ez. A method added

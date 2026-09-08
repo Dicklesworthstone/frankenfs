@@ -416,6 +416,9 @@ impl QueuedRepairRefresh {
     ///
     /// Returns the number of groups refreshed immediately (groups that remain
     /// dirty were queued but deferred by policy).
+    /// On cancellation or error, the failed group and every unprocessed group
+    /// remain queued for a later attempt. Pipeline calls never hold the queue
+    /// lock, and restoring a batch preserves concurrently queued notifications.
     pub fn apply_queued_refreshes<W: Write>(
         &self,
         cx: &Cx,
@@ -427,10 +430,22 @@ impl QueuedRepairRefresh {
         }
 
         let mut refreshed_now = 0_usize;
-        for group in groups {
+        for (index, &group) in groups.iter().enumerate() {
             let started = Instant::now();
-            pipeline.mark_group_dirty(group)?;
-            pipeline.on_group_flush(cx, group)?;
+            let outcome = cx
+                .checkpoint()
+                .map_err(|_| FfsError::Cancelled)
+                .and_then(|()| pipeline.mark_group_dirty(group))
+                .and_then(|()| pipeline.on_group_flush(cx, group));
+            if let Err(error) = outcome {
+                let mut queued = self.queued_groups.lock().map_err(|_| {
+                    FfsError::RepairFailed(format!(
+                        "refresh failed ({error}); could not restore pending groups because the queue mutex is poisoned"
+                    ))
+                })?;
+                queued.extend(groups[index..].iter().copied());
+                return Err(error);
+            }
 
             if pipeline.is_group_dirty(group) {
                 debug!(
@@ -4067,6 +4082,139 @@ mod tests {
             read_generation(&cx, cache.inner(), layout),
             generation_before + 1
         );
+    }
+
+    fn queued_refresh_retry_fixture() -> (MemBlockDevice, Vec<GroupConfig>) {
+        let cx = Cx::for_testing();
+        let device = MemBlockDevice::new(256, 256);
+        let groups: Vec<_> = (0..3)
+            .map(|group| GroupConfig {
+                layout: RepairGroupLayout::new(
+                    GroupNumber(group),
+                    BlockNumber(u64::from(group) * 64),
+                    64,
+                    0,
+                    4,
+                )
+                .expect("layout"),
+                source_first_block: BlockNumber(u64::from(group) * 64),
+                source_block_count: 8,
+            })
+            .collect();
+        for group in &groups {
+            write_source_blocks(
+                &cx,
+                &device,
+                group.source_first_block,
+                group.source_block_count,
+            );
+            bootstrap_storage(
+                &cx,
+                &device,
+                group.layout,
+                group.source_first_block,
+                group.source_block_count,
+                4,
+            );
+        }
+        (device, groups)
+    }
+
+    #[test]
+    fn queued_refresh_retains_unprocessed_groups_after_pipeline_error() {
+        let cx = Cx::for_testing();
+        let (device, groups) = queued_refresh_retry_fixture();
+        let queue = QueuedRepairRefresh::from_group_configs(&groups);
+        let before: Vec<_> = groups
+            .iter()
+            .map(|group| read_generation(&cx, &device, group.layout))
+            .collect();
+        queue
+            .on_flush_committed(&cx, &[BlockNumber(1), BlockNumber(65), BlockNumber(129)])
+            .expect("queue all groups");
+        let validator = CorruptBlockValidator::new(vec![]);
+        let mut ledger = Vec::new();
+        // A stale pipeline configuration must not discard notifications for
+        // groups it cannot process, including groups after the first failure.
+        let mut stale_pipeline = ScrubWithRecovery::new(
+            &device,
+            &validator,
+            test_uuid(),
+            vec![groups[0]],
+            &mut ledger,
+            4,
+        );
+        assert!(matches!(
+            queue.apply_queued_refreshes(&cx, &mut stale_pipeline),
+            Err(FfsError::Format(_))
+        ));
+        assert_eq!(
+            read_generation(&cx, &device, groups[0].layout),
+            before[0] + 1
+        );
+        assert_eq!(
+            *queue.queued_groups.lock().expect("queue lock"),
+            HashSet::from([GroupNumber(1), GroupNumber(2)])
+        );
+        drop(stale_pipeline);
+        let mut pipeline = ScrubWithRecovery::new(
+            &device,
+            &validator,
+            test_uuid(),
+            groups.clone(),
+            &mut ledger,
+            4,
+        )
+        .with_group_refresh_policy(GroupNumber(1), RefreshPolicy::Eager)
+        .with_group_refresh_policy(GroupNumber(2), RefreshPolicy::Eager);
+        assert_eq!(queue.apply_queued_refreshes(&cx, &mut pipeline).unwrap(), 2);
+        for (group, generation) in groups.iter().zip(before) {
+            assert_eq!(read_generation(&cx, &device, group.layout), generation + 1);
+        }
+        assert_eq!(queue.drain_queued_groups().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn queued_refresh_retains_notifications_when_cancelled_then_retries() {
+        let cx = Cx::for_testing();
+        let (device, groups) = queued_refresh_retry_fixture();
+        let queue = QueuedRepairRefresh::from_group_configs(&groups);
+        let before: Vec<_> = groups
+            .iter()
+            .map(|group| read_generation(&cx, &device, group.layout))
+            .collect();
+        queue
+            .on_flush_committed(&cx, &[BlockNumber(1), BlockNumber(65), BlockNumber(129)])
+            .expect("queue all groups");
+        let validator = CorruptBlockValidator::new(vec![]);
+        let mut ledger = Vec::new();
+        let mut pipeline = ScrubWithRecovery::new(
+            &device,
+            &validator,
+            test_uuid(),
+            groups.clone(),
+            &mut ledger,
+            4,
+        )
+        .with_group_refresh_policy(GroupNumber(1), RefreshPolicy::Eager)
+        .with_group_refresh_policy(GroupNumber(2), RefreshPolicy::Eager);
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        assert!(matches!(
+            queue.apply_queued_refreshes(&cancelled, &mut pipeline),
+            Err(FfsError::Cancelled)
+        ));
+        assert_eq!(
+            *queue.queued_groups.lock().expect("queue lock"),
+            HashSet::from([GroupNumber(0), GroupNumber(1), GroupNumber(2)])
+        );
+        for (group, &generation) in groups.iter().zip(&before) {
+            assert_eq!(read_generation(&cx, &device, group.layout), generation);
+        }
+        assert_eq!(queue.apply_queued_refreshes(&cx, &mut pipeline).unwrap(), 3);
+        for (group, generation) in groups.iter().zip(before) {
+            assert_eq!(read_generation(&cx, &device, group.layout), generation + 1);
+        }
     }
 
     #[test]

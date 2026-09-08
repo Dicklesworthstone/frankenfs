@@ -223,8 +223,7 @@ impl FrankenFuse {
         // this mutation committed. Clear that userspace hand-off regardless of
         // whether a live kernel notifier has been installed; the kernel cache
         // and our own hand-off must have the same mutation boundary.
-        self.inner
-            .invalidate_readdirplus_attrs(InodeNumber(ino));
+        self.inner.invalidate_readdirplus_attrs(InodeNumber(ino));
         let Some(notifier) = self.kernel_notifier() else {
             return;
         };
@@ -364,7 +363,7 @@ impl FrankenFuse {
             self.inner
                 .ops
                 .fsync(cx, scope, InodeNumber(ino), fh, datasync)?;
-            self.inner.ops.commit_request_scope(scope)?;
+            self.inner.ops.commit_request_scope(cx, scope)?;
             Ok(())
         })
         .map_err(|error| error.to_errno())
@@ -505,7 +504,7 @@ impl FrankenFuse {
                 self.inner
                     .ops
                     .create(cx, scope, InodeNumber(parent), name, mode, uid, gid)?;
-            self.inner.ops.commit_request_scope(scope)?;
+            self.inner.ops.commit_request_scope(cx, scope)?;
             Ok(attr)
         })
         .map_err(|error| error.to_errno())
@@ -551,7 +550,7 @@ impl FrankenFuse {
         self.with_request_scope(cx, RequestOp::Setattr, |cx, scope| {
             self.authorize_setattr_owner_change(cx, scope, InodeNumber(ino), attrs, caller_uid)?;
             let attr = self.inner.ops.setattr(cx, scope, InodeNumber(ino), attrs)?;
-            self.inner.ops.commit_request_scope(scope)?;
+            self.inner.ops.commit_request_scope(cx, scope)?;
             Ok(attr)
         })
     }
@@ -740,7 +739,7 @@ impl FrankenFuse {
                 self.inner
                     .ops
                     .symlink(cx, scope, InodeNumber(parent), name, &target, uid, gid)?;
-            self.inner.ops.commit_request_scope(scope)?;
+            self.inner.ops.commit_request_scope(cx, scope)?;
             Ok(attr)
         })
         .map_err(|error| error.to_errno())
@@ -1489,7 +1488,7 @@ impl FrankenFuse {
                         self.inner
                             .ops
                             .fsync(cx, scope, InodeNumber(ino), fh, false)?;
-                        self.inner.ops.commit_request_scope(scope)?;
+                        self.inner.ops.commit_request_scope(cx, scope)?;
                         Ok(())
                     }) {
                         Ok(()) => {}
@@ -1680,7 +1679,7 @@ impl FrankenFuse {
                     self.inner
                         .ops
                         .set_inode_fsxattr(cx, scope, InodeNumber(ino), fsx)?;
-                    self.inner.ops.commit_request_scope(scope)?;
+                    self.inner.ops.commit_request_scope(cx, scope)?;
                     Ok(())
                 }) {
                     Ok(()) => IoctlResult::Data(Vec::new()),
@@ -1732,7 +1731,7 @@ impl FrankenFuse {
                     self.inner
                         .ops
                         .set_inode_generation(cx, scope, InodeNumber(ino), generation)?;
-                    self.inner.ops.commit_request_scope(scope)?;
+                    self.inner.ops.commit_request_scope(cx, scope)?;
                     Ok(())
                 }) {
                     Ok(()) => IoctlResult::Data(Vec::new()),
@@ -1840,7 +1839,7 @@ impl FrankenFuse {
                     self.inner
                         .ops
                         .set_inode_flags(cx, scope, InodeNumber(ino), flags)?;
-                    self.inner.ops.commit_request_scope(scope)?;
+                    self.inner.ops.commit_request_scope(cx, scope)?;
                     Ok(())
                 }) {
                     Ok(()) => IoctlResult::Data(Vec::new()),
@@ -1901,7 +1900,7 @@ impl FrankenFuse {
                     )?;
                     self.inner.ops.unregister_move_ext_donor_fd(donor_fd);
                     donor_registered = false;
-                    self.inner.ops.commit_request_scope(scope)?;
+                    self.inner.ops.commit_request_scope(cx, scope)?;
                     Ok(moved_len)
                 }) {
                     Ok(moved_len) => {
@@ -2091,7 +2090,7 @@ impl FrankenFuse {
                 let cx = Self::cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.set_fs_label(cx, scope, &label)?;
-                    self.inner.ops.commit_request_scope(scope)?;
+                    self.inner.ops.commit_request_scope(cx, scope)?;
                     Ok(())
                 }) {
                     Ok(()) => IoctlResult::Data(Vec::new()),
@@ -2222,7 +2221,7 @@ impl FrankenFuse {
                 let cx = Self::cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.btrfs_set_default_subvol(cx, scope, treeid)?;
-                    self.inner.ops.commit_request_scope(scope)?;
+                    self.inner.ops.commit_request_scope(cx, scope)?;
                     Ok(())
                 }) {
                     Ok(()) => IoctlResult::Data(Vec::new()),
@@ -2275,7 +2274,7 @@ impl FrankenFuse {
                 let cx = Self::cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.btrfs_start_transaction(cx, scope)?;
-                    self.inner.ops.commit_request_scope(scope)?;
+                    self.inner.ops.commit_request_scope(cx, scope)?;
                     Ok(())
                 }) {
                     Ok(()) => IoctlResult::Data(Vec::new()),
@@ -2286,7 +2285,7 @@ impl FrankenFuse {
                 let cx = Self::cx_for_request();
                 match self.with_request_scope(&cx, RequestOp::IoctlWrite, |cx, scope| {
                     self.inner.ops.btrfs_end_transaction(cx, scope)?;
-                    self.inner.ops.commit_request_scope(scope)?;
+                    self.inner.ops.commit_request_scope(cx, scope)?;
                     Ok(())
                 }) {
                     Ok(()) => IoctlResult::Data(Vec::new()),
@@ -2865,7 +2864,7 @@ impl FrankenFuse {
                     self.inner
                         .ops
                         .clone_file(cx, scope, InodeNumber(ino), src_ino)?;
-                    self.inner.ops.commit_request_scope(scope)?;
+                    self.inner.ops.commit_request_scope(cx, scope)?;
                     Ok(())
                 }) {
                     Ok(()) => IoctlResult::Data(Vec::new()),
@@ -2900,7 +2899,7 @@ impl FrankenFuse {
                         src_length,
                         dest_offset,
                     )?;
-                    self.inner.ops.commit_request_scope(scope)?;
+                    self.inner.ops.commit_request_scope(cx, scope)?;
                     Ok(())
                 }) {
                     Ok(()) => IoctlResult::Data(Vec::new()),
@@ -3177,7 +3176,7 @@ impl FrankenFuse {
                     self.inner
                         .ops
                         .mkdir(cx, scope, InodeNumber(parent), name, mode, uid, gid)?;
-                self.inner.ops.commit_request_scope(scope)?;
+                self.inner.ops.commit_request_scope(cx, scope)?;
                 Ok(attr)
             })
         }
@@ -3194,7 +3193,7 @@ impl FrankenFuse {
             let _inode_guards = self.acquire_mutation_inode_guards(&[InodeNumber(parent)]);
             self.with_request_scope(&cx, RequestOp::Rmdir, |cx, scope| {
                 self.inner.ops.rmdir(cx, scope, InodeNumber(parent), name)?;
-                self.inner.ops.commit_request_scope(scope)?;
+                self.inner.ops.commit_request_scope(cx, scope)?;
                 Ok(())
             })
         };
@@ -3214,7 +3213,7 @@ impl FrankenFuse {
                 self.inner
                     .ops
                     .unlink(cx, scope, InodeNumber(parent), name)?;
-                self.inner.ops.commit_request_scope(scope)?;
+                self.inner.ops.commit_request_scope(cx, scope)?;
                 Ok(())
             })
         };
@@ -3258,7 +3257,7 @@ impl FrankenFuse {
                         uid,
                         gid,
                     )?;
-                    self.inner.ops.commit_request_scope(scope)?;
+                    self.inner.ops.commit_request_scope(cx, scope)?;
                     Ok(attr)
                 })
             }
@@ -3294,7 +3293,7 @@ impl FrankenFuse {
                     uid,
                     gid,
                 )?;
-                self.inner.ops.commit_request_scope(scope)?;
+                self.inner.ops.commit_request_scope(cx, scope)?;
                 Ok(attr)
             })
         }
@@ -3327,7 +3326,7 @@ impl FrankenFuse {
                     newname,
                     flags,
                 )?;
-                self.inner.ops.commit_request_scope(scope)?;
+                self.inner.ops.commit_request_scope(cx, scope)?;
                 Ok(())
             })
         };
@@ -3387,7 +3386,7 @@ impl FrankenFuse {
                     self.inner
                         .ops
                         .write(cx, scope, InodeNumber(ino), write_offset, data)?;
-                let seq = self.inner.ops.commit_request_scope(scope)?;
+                let seq = self.inner.ops.commit_request_scope(cx, scope)?;
                 self.inner.readahead.invalidate_inode(InodeNumber(ino));
                 if let Some(sync_mode) = intent.sync_mode() {
                     self.inner.ops.fsync(
@@ -3429,7 +3428,7 @@ impl FrankenFuse {
         intent: WriteIntent,
     ) -> Result<u32, MutationDispatchError> {
         let mut operation_offset = byte_offset;
-        
+
         {
             let _inode_guards = if intent.nowait() {
                 self.try_acquire_mutation_inode_guards(&[InodeNumber(ino)])
@@ -3445,21 +3444,24 @@ impl FrankenFuse {
                 slot.as_ref().is_some_and(|(pending, _)| pending.ino != ino)
             };
             if flush_other {
-                self.flush_writeback_batch(cx)
-                    .map_err(|error| MutationDispatchError::Operation {
+                self.flush_writeback_batch(cx).map_err(|error| {
+                    MutationDispatchError::Operation {
                         error,
                         offset: Some(byte_offset),
-                    })?;
+                    }
+                })?;
             }
 
             let mut slot = self.inner.writeback.lock();
             if slot.is_none() {
-                let scope = self.inner.ops.begin_writeback_batch_scope(cx).map_err(
-                    |error| MutationDispatchError::Operation {
+                let scope = self
+                    .inner
+                    .ops
+                    .begin_writeback_batch_scope(cx)
+                    .map_err(|error| MutationDispatchError::Operation {
                         error,
                         offset: Some(byte_offset),
-                    },
-                )?;
+                    })?;
                 *slot = Some((PendingWriteback { ino, staged: 0 }, scope));
                 self.inner.writeback.set_outstanding(true);
             }
@@ -3571,7 +3573,7 @@ impl FrankenFuse {
                     dst_offset,
                     copy_len,
                 )?;
-                self.inner.ops.commit_request_scope(scope)?;
+                self.inner.ops.commit_request_scope(cx, scope)?;
                 Ok(copied)
             })
         }
@@ -3603,7 +3605,7 @@ impl FrankenFuse {
                 self.inner
                     .ops
                     .setxattr(cx, scope, InodeNumber(ino), name, value, mode)?;
-                self.inner.ops.commit_request_scope(scope)?;
+                self.inner.ops.commit_request_scope(cx, scope)?;
                 Ok(())
             })
         }

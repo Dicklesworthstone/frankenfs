@@ -78,7 +78,7 @@ fn ioctl_setflags(fs: &OpenFs, cx: &Cx, ino: InodeNumber, flags: u32) -> Result<
         .expect("begin ioctl scope");
     let result = fs.set_inode_flags(cx, &mut scope, ino, flags);
     if result.is_ok() {
-        fs.commit_request_scope(&mut scope)
+        fs.commit_request_scope(cx, &mut scope)
             .expect("commit ioctl scope");
     }
     fs.end_request_scope(cx, RequestOp::IoctlWrite, scope)
