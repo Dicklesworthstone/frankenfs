@@ -67,11 +67,29 @@ transport prerequisites are unavailable; those five are **not positive feature
 proof**. The exchange and read-only rejection scenarios emit explicit PASS results.
 Other restricted-transport cases demonstrate their stated refusal, not ioctl support.
 
+The two security-xattr fixtures now exercise actual unprivileged callers. On
+worker vmi1227854, both ext4 and btrfs passed with UID 65534, zero effective
+capabilities, successful ordinary reads and user-xattr round trips, and exact
+EPERM for the security write. File bytes remain unchanged and the rejected
+attribute remains absent. Root runners enable `allow_other` before dropping
+credentials; non-root runners retain their own UID without requiring that mount
+option. This is a fixture correction, not a new authorization implementation.
+Evidence: `/tmp/ffs-security-fixture-test-20260908.log` (2 executed, 2 passed,
+0 ignored or skipped), source SHA-256
+`384877045d77fad7425647532669fc496b3ecef8e934ca47e4a6c4e028d8b928`.
+The subsequent full mounted suite reports 237 passing test functions, 2 failures
+and 8 ignored; both privilege tests pass again. Some other passing functions
+contain explicit prerequisite skips, so 237 is not a count of proved features.
+The remaining failures are the syscall-sequence open-unlink mismatch and the
+PATH_MAX-1 symlink EAGAIN (`/tmp/ffs-security-fixture-fuse-full-20260908.log`).
+
 Still failing or unverified: open-unlink file-descriptor lifetime (ENOENT on the
-mounted ext4 path), unprivileged security-xattr fixtures run as root,
-and long-symlink EAGAIN. The latter reproduces in isolation: eager inode/directory
+mounted ext4 path) and long-symlink EAGAIN. The latter reproduces in isolation: eager inode/directory
 commits mix with a target write using the older request transaction. The scope
 contract needs a coherent fix; the transaction was not bypassed for a green test.
+Allocator counters also change before the caller commits, so a complete fix must
+cover allocation rollback together with inode, target data, and directory entry
+publication. No namespace runtime change was made in this continuation.
 The
 trybuild failure preserves the expected type rejection but disagrees on the remote
 dependency-path prefix; its golden was not regenerated. The census was manually

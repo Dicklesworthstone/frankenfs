@@ -14246,39 +14246,114 @@ fn btrfs_fuse_xattr_boundary_value_size_accepted() {
 
 #[test]
 fn ext4_fuse_security_xattr_requires_privilege() {
-    with_rw_mount(|mnt| {
-        let path = mnt.join("hello.txt");
-
-        // Attempting to set security.* xattr without CAP_SYS_ADMIN should fail.
-        // This tests the security namespace enforcement path.
-        let report = py_setxattr_report(&path, "security.test", b"test_value", 0);
-
-        // Expect EPERM (operation not permitted) for unprivileged security xattr write.
-        // Some kernels may return EOPNOTSUPP if security xattrs are disabled.
-        let errno = report["errno"].as_i64();
-        assert!(
-            errno == Some(i64::from(libc::EPERM)) || errno == Some(i64::from(libc::EOPNOTSUPP)),
-            "security.* xattr write should fail with EPERM or EOPNOTSUPP, got: {report}"
-        );
-    });
+    assert_unprivileged_security_xattr_rejected(false);
 }
 
 #[test]
 fn btrfs_fuse_security_xattr_requires_privilege() {
-    with_btrfs_rw_mount(|mnt| {
-        let path = mnt.join("security_test.txt");
-        fs::write(&path, b"security xattr test\n").expect("create test file");
+    assert_unprivileged_security_xattr_rejected(true);
+}
 
-        // Attempting to set security.* xattr without CAP_SYS_ADMIN should fail.
-        let report = py_setxattr_report(&path, "security.test", b"test_value", 0);
+fn assert_unprivileged_security_xattr_rejected(btrfs: bool) {
+    if !(if btrfs {
+        btrfs_fuse_available()
+    } else {
+        fuse_available()
+    }) {
+        eprintln!("SKIP: unprivileged security xattr mount prerequisites unavailable");
+        return;
+    }
+    let tmp = TempDir::new().expect("security xattr tmpdir");
+    let image = if btrfs {
+        create_btrfs_test_image(tmp.path())
+    } else {
+        create_test_image_with_size(tmp.path(), 4 * 1024 * 1024)
+    };
+    let mnt = tmp.path().join("mnt");
+    fs::create_dir(&mnt).expect("security xattr mountpoint");
+    let uid = Command::new("id")
+        .arg("-u")
+        .output()
+        .expect("effective UID");
+    assert!(uid.status.success(), "effective UID lookup failed");
+    let options = MountOptions {
+        read_only: false,
+        auto_unmount: false,
+        // A non-root runner already supplies the desired caller credentials;
+        // it must not need user_allow_other in /etc/fuse.conf to run this test.
+        allow_other: String::from_utf8_lossy(&uid.stdout).trim() == "0",
+        ..MountOptions::default()
+    };
+    let session = if btrfs {
+        try_mount_btrfs_rw_with_options(&image, &mnt, &options)
+    } else {
+        try_mount_ffs_rw_with_options(&image, &mnt, &options)
+    };
+    let Some(session) = session else {
+        eprintln!("SKIP: unprivileged security xattr allow_other mount unavailable");
+        return;
+    };
+    let path = mnt.join("security_test.txt");
+    let original = b"security xattr test\n";
+    fs::write(&path, original).expect("create security xattr file");
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o666))
+        .expect("allow ordinary unprivileged file access");
 
-        // Expect EPERM (operation not permitted) for unprivileged security xattr write.
-        let errno = report["errno"].as_i64();
-        assert!(
-            errno == Some(i64::from(libc::EPERM)) || errno == Some(i64::from(libc::EOPNOTSUPP)),
-            "btrfs security.* xattr write should fail with EPERM or EOPNOTSUPP, got: {report}"
-        );
-    });
+    // Enter the mount before dropping credentials: private temporary ancestors
+    // may be mode 0700. allow_other admits the new UID at the FUSE boundary.
+    // Positive read and user.* controls distinguish namespace rejection from
+    // inaccessible fixture paths, mount-owner checks, and generic write denial.
+    let script = r#"
+import json, os
+if os.geteuid() == 0:
+    os.setgroups([])
+    os.setgid(65534)
+    os.setuid(65534)
+assert os.geteuid() != 0, 'probe must not run as root'
+with open('/proc/self/status') as status:
+    caps = next(line.split()[1] for line in status if line.startswith('CapEff:'))
+assert int(caps, 16) & (1 << 21) == 0, 'probe must not have CAP_SYS_ADMIN'
+path = 'security_test.txt'
+with open(path, 'rb') as source:
+    assert source.read() == b'security xattr test\n'
+os.setxattr(path, 'user.privilege_control', b'ordinary-write')
+assert os.getxattr(path, 'user.privilege_control') == b'ordinary-write'
+report = {'uid': os.geteuid(), 'cap_eff': caps, 'ordinary_access': True}
+try:
+    os.setxattr(path, 'security.test', b'test_value')
+    report['ok'] = True
+except OSError as error:
+    report['errno'] = error.errno
+print(json.dumps(report))
+"#;
+    let output = Command::new("python3")
+        .args(["-c", script])
+        .current_dir(&mnt)
+        .output()
+        .expect("run unprivileged security xattr probe");
+    assert!(
+        output.status.success(),
+        "unprivileged probe controls failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: Value = serde_json::from_slice(&output.stdout).expect("security xattr report");
+    let errno = report["errno"].as_i64();
+    assert!(
+        errno == Some(i64::from(libc::EPERM)) || errno == Some(i64::from(libc::EOPNOTSUPP)),
+        "security.* must reject an unprivileged caller with EPERM or EOPNOTSUPP: {report}"
+    );
+    assert_eq!(fs::read(&path).expect("read after rejection"), original);
+    assert_eq!(
+        py_getxattr_report(&path, "security.test")["errno"].as_i64(),
+        Some(i64::from(libc::ENODATA)),
+        "rejected security xattr must remain absent"
+    );
+    assert_eq!(
+        py_getxattr(&path, "user.privilege_control"),
+        Some(b"ordinary-write".to_vec())
+    );
+    session.unmount_and_join();
+    eprintln!("PASS: unprivileged security xattr rejection, btrfs={btrfs}, {report}");
 }
 
 #[test]
