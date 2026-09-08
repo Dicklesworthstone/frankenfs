@@ -1190,9 +1190,9 @@ mod tests {
         assert_eq!(report.proof_bundle_lane, "operator_recovery_drill");
         assert_eq!(report.mutation_allowed_count, 1);
         assert!(report.mutation_refused_count >= 1);
-        assert!(report.missing_required_outcomes.is_empty());
-        assert!(report.missing_required_log_fields.is_empty());
-        assert!(report.missing_required_consumers.is_empty());
+        assert_eq!(report.missing_required_outcomes, [] as [String; 0]);
+        assert_eq!(report.missing_required_log_fields, [] as [String; 0]);
+        assert_eq!(report.missing_required_consumers, [] as [String; 0]);
         Ok(())
     }
 

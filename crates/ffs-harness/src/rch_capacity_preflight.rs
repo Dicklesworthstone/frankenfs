@@ -482,7 +482,10 @@ mod tests {
         let validation = validate(&report);
 
         assert!(validation.valid);
-        assert!(validation.diagnostics.is_empty());
+        assert_eq!(
+            validation.diagnostics,
+            [] as [RchCapacityPreflightDiagnostic; 0]
+        );
         assert_eq!(validation.capacity_verdict, "no_admissible_workers");
         assert_eq!(validation.probe_verdict, "local_fallback_rejected");
     }
@@ -505,7 +508,10 @@ mod tests {
         let validation = validate(&report);
 
         assert!(validation.valid);
-        assert!(validation.diagnostics.is_empty());
+        assert_eq!(
+            validation.diagnostics,
+            [] as [RchCapacityPreflightDiagnostic; 0]
+        );
     }
 
     #[test]

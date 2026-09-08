@@ -1635,7 +1635,7 @@ mod tests {
         assert_eq!(report.totals.product_failures, 2);
         assert_eq!(report.totals.environment_blockers, 3);
         assert!(!report.contract_failed);
-        assert!(report.required_workstreams_missing.is_empty());
+        assert_eq!(report.required_workstreams_missing, [] as [String; 0]);
         assert!(report.workstreams.contains_key("xfstests"));
         assert!(report.workstreams.contains_key("fuse_lane"));
         assert!(report.workstreams.contains_key("mounted_scenario_matrix"));
@@ -1705,7 +1705,10 @@ mod tests {
 
         assert!(report.contract_failed);
         assert_eq!(report.stale_artifacts.len(), 2);
-        assert!(report.invalid_artifact_timestamps.is_empty());
+        assert_eq!(
+            report.invalid_artifact_timestamps,
+            [] as [InvalidArtifactTimestamp; 0]
+        );
         assert!(
             report
                 .stale_artifacts
@@ -1753,7 +1756,7 @@ mod tests {
         let report = fixture.report_with_recency(Some("abc123"), 3, "2026-05-06T00:00:00Z")?;
 
         assert!(report.contract_failed);
-        assert!(report.stale_artifacts.is_empty());
+        assert_eq!(report.stale_artifacts, [] as [StaleArtifact; 0]);
         assert_eq!(report.invalid_artifact_timestamps.len(), 2);
         assert!(report.invalid_artifact_timestamps.iter().any(|invalid| {
             invalid.gate_id == "operational_readiness"
@@ -1784,7 +1787,7 @@ mod tests {
         let mut report = fixture.report_with_recency(Some("abc123"), 3, "2026-05-06T00:00:00Z")?;
 
         assert!(report.contract_failed);
-        assert!(report.stale_artifacts.is_empty());
+        assert_eq!(report.stale_artifacts, [] as [StaleArtifact; 0]);
         assert_eq!(report.invalid_artifact_timestamps.len(), 2);
         assert!(report.invalid_artifact_timestamps.iter().any(|invalid| {
             invalid.gate_id == "operational_readiness"

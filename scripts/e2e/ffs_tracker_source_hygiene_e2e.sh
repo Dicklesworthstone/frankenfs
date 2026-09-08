@@ -46,6 +46,8 @@ BV_SOURCE_AWARE_BEADS_DIR="${BV_SOURCE_AWARE_ROOT}/.beads"
 BV_SOURCE_AWARE_ISSUES_JSONL="${BV_SOURCE_AWARE_BEADS_DIR}/issues.jsonl"
 BV_SOURCE_AWARE_IMPORT_JSON="${E2E_LOG_DIR}/tracker_source_hygiene_bv_source_aware_import.json"
 BV_SOURCE_AWARE_TRIAGE_JSON="${E2E_LOG_DIR}/tracker_source_hygiene_bv_source_aware_triage.json"
+BV_SOURCE_AWARE_PROJECTION_JSON="${E2E_LOG_DIR}/tracker_source_hygiene_bv_projection.json"
+SOURCE_SHA256="${E2E_LOG_DIR}/tracker_source_hygiene_source.sha256"
 STRICT_MODE=0
 STRICT_JSON=false
 STALE_IN_PROGRESS_SECONDS="${TRACKER_SOURCE_HYGIENE_STALE_IN_PROGRESS_SECONDS:-21600}"
@@ -700,10 +702,14 @@ fi
 
 e2e_step "Verify source-aware bv triage"
 if command -v br >/dev/null 2>&1 && command -v bv >/dev/null 2>&1; then
-    if mkdir -p "$BV_SOURCE_AWARE_BEADS_DIR" \
+    if sha256sum "$ISSUES_JSONL" >"$SOURCE_SHA256" \
+        && mkdir -p "$BV_SOURCE_AWARE_BEADS_DIR" \
         && jq -c -s '
             def local_id($id):
                 (($id // "") | test("^(bd|frankenfs)-"));
+            def supported_status:
+                (.status // "open") as $status
+                | (["open", "in_progress", "blocked", "deferred", "closed", "tombstone"] | index($status)) != null;
             def normalize_row:
                 (.id // "") as $issue_id
                 | .description = (.description // .notes // "")
@@ -732,44 +738,67 @@ if command -v br >/dev/null 2>&1 && command -v bv >/dev/null 2>&1; then
                 {
                     id: $id,
                     title: "Synthetic local dependency placeholder for source-aware bv import",
-                    description: "Generated only inside the tracker-source-hygiene E2E temp Beads DB so bv can preserve a local orphan dependency edge.",
-                    status: "closed",
+                    description: "Unresolved dependency placeholder in the temporary graph. Its source row is missing or excluded; it is not completed work.",
+                    status: "blocked",
                     priority: 4,
                     issue_type: "task",
                     created_at: "2026-01-01T00:00:00Z",
                     created_by: "tracker-source-hygiene-e2e",
                     updated_at: "2026-01-01T00:00:00Z",
-                    closed_at: "2026-01-01T00:00:00Z",
-                    close_reason: "Synthetic temp-only dependency closure row",
                     source_repo: ".",
                     compaction_level: 0,
                     original_size: 0,
                     labels: ["tracker-source-hygiene", "synthetic-temp"],
                     dependencies: []
                 };
-            ([.[] | select(local_id(.id))] | sort_by(.id)) as $local_rows
+            . as $source_rows
+            | ([.[] | select(local_id(.id) and supported_status)] | sort_by(.id)) as $local_rows
             | ($local_rows | map(.id) | unique) as $local_ids
             | ($local_rows | [ .[] | (.dependencies // [])[]? | .depends_on_id // empty | select(local_id(.)) ] | unique) as $dependency_ids
             | ($dependency_ids - $local_ids) as $missing_ids
-            | (($local_rows | map(normalize_row)) + ($missing_ids | map(synthetic_dependency(.))))[]
-            ' "$ISSUES_JSONL" >"$BV_SOURCE_AWARE_ISSUES_JSONL" \
+            | {
+                included_source_rows: $local_rows,
+                excluded_source_rows: [
+                    $source_rows[]
+                    | if (local_id(.id) | not) then {reason: "foreign_id", row: .}
+                      elif (supported_status | not) then {reason: "unsupported_bv_status", row: .}
+                      else empty end
+                ],
+                synthetic_dependency_ids: $missing_ids,
+                graph_rows: (($local_rows | map(normalize_row)) + ($missing_ids | map(synthetic_dependency(.))))
+            }
+            ' "$ISSUES_JSONL" >"$BV_SOURCE_AWARE_PROJECTION_JSON" \
+        && jq -e --slurpfile source "$ISSUES_JSONL" '
+            ((.included_source_rows + [.excluded_source_rows[].row] | sort_by(.id)) == ($source | sort_by(.id)))
+            and ((.graph_rows | map(.id) | unique | length) == (.graph_rows | length))
+            and ([.included_source_rows[] | {id, status: (.status // "open")}] as $included
+                | [.graph_rows[] | select(.id as $id | ($included | map(.id) | index($id)) != null)
+                    | {id, status}] | sort_by(.id) == ($included | sort_by(.id)))
+            ' "$BV_SOURCE_AWARE_PROJECTION_JSON" >/dev/null \
+        && jq -c '.graph_rows[]' "$BV_SOURCE_AWARE_PROJECTION_JSON" >"$BV_SOURCE_AWARE_ISSUES_JSONL" \
         && BEADS_DIR="$BV_SOURCE_AWARE_BEADS_DIR" br --db "$BV_SOURCE_AWARE_BEADS_DIR/beads.db" sync --import-only --orphans allow --json >"$BV_SOURCE_AWARE_IMPORT_JSON" \
         && bv --no-cache --db "$BV_SOURCE_AWARE_BEADS_DIR" --robot-triage >"$BV_SOURCE_AWARE_TRIAGE_JSON" \
         && jq -e \
+            --slurpfile projection "$BV_SOURCE_AWARE_PROJECTION_JSON" \
             --argjson local_open "$LOCAL_OPEN_COUNT" \
             --argjson local_in_progress "$LOCAL_IN_PROGRESS_COUNT" \
             '
-            (($local_open + $local_in_progress) as $expected_open
-            | (.triage.meta.issue_count >= $expected_open)
-            and (.triage.quick_ref.open_count == $expected_open)
-            and (.triage.project_health.counts.total >= $expected_open)
+            (.source_authority.claim_safe == true)
+            and (.source_authority.errors == 0)
+            and (.source_authority.skipped == 0)
+            and (.source_authority.read_errors == 0)
+            and (.triage.meta.issue_count == ($projection[0].graph_rows | length))
+            and (.triage.project_health.counts.total == ($projection[0].graph_rows | length))
+            and (.triage.quick_ref.open_count == $local_open)
+            and ((.triage.quick_ref.in_progress_count // 0) == $local_in_progress)
             and ([
                 (.triage.quick_ref.top_picks[]?.id // empty),
                 (.triage.recommendations[]?.id // empty),
                 (.triage.quick_wins[]?.id // empty),
                 (.triage.blockers_to_clear[]?.id // empty)
-            ] | all(test("^(bd|frankenfs)-"))))
-            ' "$BV_SOURCE_AWARE_TRIAGE_JSON" >/dev/null; then
+            ] | all(test("^(bd|frankenfs)-")))
+            ' "$BV_SOURCE_AWARE_TRIAGE_JSON" >/dev/null \
+        && sha256sum -c "$SOURCE_SHA256" >/dev/null; then
         scenario_result "tracker_source_hygiene_bv_source_aware_triage_clean" "PASS" "triage=$BV_SOURCE_AWARE_TRIAGE_JSON local_open=${LOCAL_OPEN_COUNT} local_in_progress=${LOCAL_IN_PROGRESS_COUNT}"
     else
         scenario_result "tracker_source_hygiene_bv_source_aware_triage_clean" "FAIL" "source-aware bv triage failed"

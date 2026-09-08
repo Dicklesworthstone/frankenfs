@@ -2185,7 +2185,7 @@ mod tests {
         let report = validate_repair_writeback_serialization_contract(&contract, ARTIFACT_ROOT);
         assert!(report.valid, "{:?}", report.errors);
         assert!(report.schedule_count >= REQUIRED_RACE_COVERAGE_CASES.len());
-        assert!(report.missing_required_race_coverage.is_empty());
+        assert_eq!(report.missing_required_race_coverage, [] as [String; 0]);
         assert!(
             report
                 .schedule_reports

@@ -746,7 +746,7 @@ mod tests {
     #[test]
     fn discover_crashes_returns_empty_for_nonexistent_dir() {
         let crashes = discover_crashes(Path::new("/nonexistent/campaign"));
-        assert!(crashes.is_empty());
+        assert_eq!(crashes, [] as [CrashArtifact; 0]);
     }
 
     #[test]

@@ -2232,7 +2232,10 @@ mod tests {
                 "refuse-contradictory-readiness-upgrade",
             ]
         );
-        assert!(result.suppressed_duplicates.is_empty());
+        assert_eq!(
+            result.suppressed_duplicates,
+            [] as [ReadinessActionSuppressedDuplicate; 0]
+        );
     }
 
     #[test]

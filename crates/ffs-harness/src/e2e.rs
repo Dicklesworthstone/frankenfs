@@ -3155,7 +3155,7 @@ mod tests {
 
         // Log should be valid NDJSON.
         let content = fs::read_to_string(&log_path).unwrap();
-        assert!(!content.is_empty());
+        assert_ne!(content, "");
 
         // Cleanup.
         let _ = fs::remove_dir_all(&artifact_dir);
@@ -3344,8 +3344,8 @@ mod tests {
         let left = generate_crash_schedule(7, seed, 16, 24).expect("generate left schedule");
         let right = generate_crash_schedule(7, seed, 16, 24).expect("generate right schedule");
         assert_eq!(left, right);
-        assert!(!left.operations.is_empty());
-        assert!(!left.crash_points.is_empty());
+        assert_ne!(left.operations, [] as [CrashOperation; 0]);
+        assert_ne!(left.crash_points, [] as [CrashPoint; 0]);
     }
 
     #[test]

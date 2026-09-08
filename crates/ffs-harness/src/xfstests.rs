@@ -4094,7 +4094,10 @@ generic/006 resumed\n",
         let json = serde_json::to_string_pretty(&manifest)?;
         let parsed: XfstestsBaselineManifest = serde_json::from_str(&json)?;
         assert_eq!(parsed, manifest);
-        assert!(validate_xfstests_baseline_manifest(&parsed).is_empty());
+        assert_eq!(
+            validate_xfstests_baseline_manifest(&parsed),
+            [] as [String; 0]
+        );
         assert_eq!(parsed.bead_id, XFSTESTS_BASELINE_BEAD_ID);
         assert_eq!(parsed.cases.len(), 6);
         assert_eq!(parsed.disposition_counts.get("passed"), Some(&1));
@@ -4464,7 +4467,10 @@ generic/006 resumed\n",
         let json = serde_json::to_string_pretty(&report)?;
         let parsed: XfstestsFailureTriageReport = serde_json::from_str(&json)?;
         assert_eq!(parsed, report);
-        assert!(validate_xfstests_failure_triage_report(&parsed).is_empty());
+        assert_eq!(
+            validate_xfstests_failure_triage_report(&parsed),
+            [] as [String; 0]
+        );
         assert_eq!(parsed.proposed_beads.len(), 1);
         assert_eq!(parsed.fixture_recipes.len(), 1);
         assert_eq!(parsed.duplicate_groups.len(), 1);

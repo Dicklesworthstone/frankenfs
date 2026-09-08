@@ -1303,7 +1303,7 @@ mod tests {
         let report = evaluate_release_gates(&sample_policy(), &passing_proof());
         assert!(report.valid, "{:?}", report.errors);
         assert!(report.release_ready);
-        assert!(report.findings.is_empty());
+        assert_eq!(report.findings, [] as [ReleaseGateFinding; 0]);
         assert_eq!(
             report.feature_reports[0].final_state,
             FeatureState::Validated

@@ -2084,14 +2084,14 @@ Another log line
     #[test]
     fn parse_e2e_output_empty_input() {
         let scenarios = parse_e2e_output("");
-        assert!(scenarios.is_empty());
+        assert_eq!(scenarios, [] as [ParsedScenario; 0]);
     }
 
     #[test]
     fn parse_e2e_output_no_markers() {
         let output = "just some regular output\nno markers here\n";
         let scenarios = parse_e2e_output(output);
-        assert!(scenarios.is_empty());
+        assert_eq!(scenarios, [] as [ParsedScenario; 0]);
     }
 
     #[test]

@@ -74,7 +74,7 @@ fn standard_mount_runtime_emits_shutdown_metrics_bd_viil0() {
         .1;
     let branch_head = &standard_branch[..standard_branch
         .find("MountRuntimeMode::")
-        .unwrap_or(standard_branch.len().min(4096))];
+        .unwrap_or_else(|| standard_branch.len().min(4096))];
     assert!(
         branch_head.contains("log_mount_shutdown_metrics("),
         "the Standard mount runtime must call log_mount_shutdown_metrics so that \

@@ -2103,12 +2103,12 @@ mod tests {
             class_ids(&report, ClaimabilityClassification::PermissionGated),
             vec!["bd-rchk3"]
         );
-        assert!(
+        assert_eq!(
             class_ids(
                 &report,
                 ClaimabilityClassification::InfrastructureBlockedRchCapacity
-            )
-            .is_empty()
+            ),
+            [] as [String; 0]
         );
     }
 
@@ -2309,8 +2309,11 @@ mod tests {
         let allocation = &report.reservation_allocation_plan;
 
         assert_eq!(allocation.status, "blocked_broad_peer_reservation");
-        assert!(allocation.suggested_disjoint_target_paths.is_empty());
-        assert!(allocation.safe_reservation_commands.is_empty());
+        assert_eq!(
+            allocation.suggested_disjoint_target_paths,
+            [] as [String; 0]
+        );
+        assert_eq!(allocation.safe_reservation_commands, [] as [String; 0]);
         assert!(
             allocation.groups[0]
                 .overlap_reason
@@ -2377,7 +2380,10 @@ mod tests {
                 .self_held_reservation_count,
             1
         );
-        assert!(report.reservation_allocation_plan.groups.is_empty());
+        assert_eq!(
+            report.reservation_allocation_plan.groups,
+            [] as [ClaimabilityReservationConflictGroup; 0]
+        );
         assert!(
             report
                 .next_safe_actions
@@ -2409,11 +2415,9 @@ mod tests {
         );
 
         assert_eq!(report.reservation_snapshot.active_self_reservation_count, 0);
-        assert!(
-            report
-                .reservation_snapshot
-                .self_held_target_paths
-                .is_empty()
+        assert_eq!(
+            report.reservation_snapshot.self_held_target_paths,
+            [] as [String; 0]
         );
         assert_eq!(
             report.reservation_allocation_plan.status,
@@ -2449,11 +2453,9 @@ mod tests {
             report.reservation_allocation_plan.status,
             "blocked_stale_or_unknown_snapshot"
         );
-        assert!(
-            report
-                .reservation_allocation_plan
-                .self_held_target_paths
-                .is_empty()
+        assert_eq!(
+            report.reservation_allocation_plan.self_held_target_paths,
+            [] as [String; 0]
         );
     }
 
@@ -2582,11 +2584,11 @@ mod tests {
             report.reservation_allocation_plan.status,
             "blocked_no_safe_disjoint_scope"
         );
-        assert!(
+        assert_eq!(
             report
                 .reservation_allocation_plan
-                .suggested_disjoint_target_paths
-                .is_empty()
+                .suggested_disjoint_target_paths,
+            [] as [String; 0]
         );
     }
 
@@ -2704,12 +2706,12 @@ mod tests {
             class_ids(&report, ClaimabilityClassification::ForeignExcluded),
             vec!["br-r37"]
         );
-        assert!(
+        assert_eq!(
             class_ids(
                 &report,
                 ClaimabilityClassification::InfrastructureBlockedRchCapacity
-            )
-            .is_empty()
+            ),
+            [] as [String; 0]
         );
         assert!(report.rows[0].owner_handoff_required);
     }

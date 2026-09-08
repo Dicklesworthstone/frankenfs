@@ -281,7 +281,7 @@ mod tests {
             "measurements": []
         }"#;
         let baseline = parse_baseline(json)?;
-        assert!(baseline.measurements.is_empty());
+        assert_eq!(baseline.measurements, [] as [BaselineMeasurement; 0]);
         assert_eq!(baseline.commit, ""); // defaults to empty
         Ok(())
     }

@@ -1491,7 +1491,7 @@ mod tests {
             second.deterministic_replay_id
         );
         assert_eq!(first.model_version, INVARIANT_ORACLE_MODEL_VERSION);
-        assert!(validate_invariant_oracle_report(&first).is_empty());
+        assert_eq!(validate_invariant_oracle_report(&first), [] as [String; 0]);
         assert_eq!(first.operation_count, 3);
         Ok(())
     }
@@ -1517,7 +1517,7 @@ mod tests {
         ));
         let report = validate_invariant_trace(&trace);
         assert!(report.valid, "{report:?}");
-        assert!(report.violations.is_empty());
+        assert_eq!(report.violations, [] as [InvariantViolationReport; 0]);
     }
 
     #[test]
@@ -1735,7 +1735,7 @@ mod tests {
 
         let report = validate_invariant_trace(&trace);
         assert!(report.valid, "{report:?}");
-        assert!(report.violations.is_empty());
+        assert_eq!(report.violations, [] as [InvariantViolationReport; 0]);
     }
 
     #[test]
@@ -1833,7 +1833,7 @@ mod tests {
 
         let report = validate_invariant_trace(&trace);
         assert!(report.valid, "{report:?}");
-        assert!(report.violations.is_empty());
+        assert_eq!(report.violations, [] as [InvariantViolationReport; 0]);
     }
 
     #[test]

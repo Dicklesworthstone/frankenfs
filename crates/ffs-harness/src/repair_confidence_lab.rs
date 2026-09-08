@@ -1448,10 +1448,13 @@ mod tests {
         assert_eq!(report.calibration_case_count, 9);
         assert!(report.mutation_allowed_count >= 1);
         assert!(report.mutation_refused_count >= 2);
-        assert!(report.missing_required_outcomes.is_empty());
-        assert!(report.missing_required_calibration_classes.is_empty());
-        assert!(report.missing_required_refusal_reasons.is_empty());
-        assert!(report.missing_required_log_fields.is_empty());
+        assert_eq!(report.missing_required_outcomes, [] as [String; 0]);
+        assert_eq!(
+            report.missing_required_calibration_classes,
+            [] as [String; 0]
+        );
+        assert_eq!(report.missing_required_refusal_reasons, [] as [String; 0]);
+        assert_eq!(report.missing_required_log_fields, [] as [String; 0]);
         Ok(())
     }
 

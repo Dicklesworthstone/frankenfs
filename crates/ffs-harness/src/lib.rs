@@ -1718,7 +1718,7 @@ mod tests {
         let zeroes = vec![0_u8; 1024];
         let fixture = SparseFixture::from_bytes(&zeroes);
         assert_eq!(fixture.size, 1024);
-        assert!(fixture.writes.is_empty());
+        assert_eq!(fixture.writes, [] as [FixtureWrite; 0]);
         let materialized = fixture.materialize().expect("materialize");
         assert_eq!(materialized, zeroes);
     }
@@ -1872,7 +1872,7 @@ mod tests {
         let fixture = SparseFixture::from_region(&data, usize::MAX, usize::MAX);
 
         assert_eq!(fixture.size, 0);
-        assert!(fixture.writes.is_empty());
+        assert_eq!(fixture.writes, [] as [FixtureWrite; 0]);
     }
 
     #[test]

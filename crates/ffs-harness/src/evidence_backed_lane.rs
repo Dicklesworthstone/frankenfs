@@ -363,8 +363,8 @@ mod tests {
         assert_eq!(result.evidence.args(), ["hello"]);
         assert_eq!(result.evidence.exit_code(), Some(0));
         assert!(result.evidence.outcome().is_success());
-        assert!(!result.evidence.stdout_sha256().is_empty());
-        assert!(!result.evidence.git_sha().is_empty());
+        assert_ne!(result.evidence.stdout_sha256(), "");
+        assert_ne!(result.evidence.git_sha(), "");
         assert!(result.summary.contains("passed"));
         assert!(result.summary.contains("stdout_sha256="));
     }
@@ -434,8 +434,8 @@ mod tests {
     #[test]
     fn release_gate_lanes_have_correct_structure() {
         for lane_cmd in RELEASE_GATE_LANE_COMMANDS {
-            assert!(!lane_cmd.lane_id.is_empty());
-            assert!(!lane_cmd.command.is_empty());
+            assert_ne!(lane_cmd.lane_id, "");
+            assert_ne!(lane_cmd.command, "");
             assert!(
                 lane_cmd.command == "cargo",
                 "release gate lanes use cargo test"
@@ -561,7 +561,7 @@ mod tests {
 
         let result = execute_lane(&lane_cmd);
 
-        assert!(!result.evidence.git_sha().is_empty());
+        assert_ne!(result.evidence.git_sha(), "");
         assert!(!matches!(result.evidence.host_class(), HostClass::Unknown));
     }
 
@@ -593,8 +593,8 @@ mod tests {
     #[test]
     fn permissioned_lane_commands_have_correct_structure() {
         for lane_cmd in PERMISSIONED_LANE_COMMANDS {
-            assert!(!lane_cmd.lane_id.is_empty());
-            assert!(!lane_cmd.command.is_empty());
+            assert_ne!(lane_cmd.lane_id, "");
+            assert_ne!(lane_cmd.command, "");
             assert!(
                 lane_cmd.capability_check.is_some(),
                 "permissioned lanes require capability checks"

@@ -1200,20 +1200,23 @@ pub fn load_evidence_records(
 
         // Apply single event_type filter.
         if let Some(filter) = event_type_filter
-            && evidence_event_type_name(record.event_type) != filter {
-                continue;
-            }
+            && evidence_event_type_name(record.event_type) != filter
+        {
+            continue;
+        }
 
         // Apply preset multi-type filter.
         if let Some(types) = preset_types
-            && !types.contains(&record.event_type) {
-                continue;
-            }
+            && !types.contains(&record.event_type)
+        {
+            continue;
+        }
 
         if let Some(block_group) = block_group_filter
-            && record.block_group != block_group {
-                continue;
-            }
+            && record.block_group != block_group
+        {
+            continue;
+        }
 
         if let Some(limit) = tail {
             if limit == 0 {
@@ -1393,9 +1396,10 @@ fn print_wal_recovery_payload(record: &EvidenceRecord) {
             w.wal_total_bytes
         );
         if w.used_checkpoint
-            && let Some(seq) = w.checkpoint_commit_seq {
-                print!(" checkpoint_seq={seq}");
-            }
+            && let Some(seq) = w.checkpoint_commit_seq
+        {
+            print!(" checkpoint_seq={seq}");
+        }
     }
 }
 

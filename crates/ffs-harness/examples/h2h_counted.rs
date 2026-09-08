@@ -89,7 +89,10 @@ fn main() {
         ));
         eprintln!("h2h_counted: build ok={ok} {}", log.trim());
     }
-    let (_, sha) = sh(&format!("{} bench-evidence 2>/dev/null | grep binary_sha256", ffs_cli.display()));
+    let (_, sha) = sh(&format!(
+        "{} bench-evidence 2>/dev/null | grep binary_sha256",
+        ffs_cli.display()
+    ));
     eprintln!("h2h_counted: candidate {}", sha.trim());
 
     let work = PathBuf::from("/tmp/ffs-h2h-counted");
@@ -154,9 +157,18 @@ fn main() {
             // Diagnose rather than guess: an unprivileged FUSE mount needs a setuid
             // fusermount3 (or user_allow_other), and a container can have /dev/fuse
             // present while still refusing the mount.
-            eprintln!("h2h_counted: fusermount3 = {}", sh("ls -l $(command -v fusermount3) 2>&1").1.trim());
-            eprintln!("h2h_counted: fuse_conf   = {}", sh("cat /etc/fuse.conf 2>&1 | tr '\n' ' '").1.trim());
-            eprintln!("h2h_counted: dev_fuse    = {}", sh("ls -l /dev/fuse 2>&1").1.trim());
+            eprintln!(
+                "h2h_counted: fusermount3 = {}",
+                sh("ls -l $(command -v fusermount3) 2>&1").1.trim()
+            );
+            eprintln!(
+                "h2h_counted: fuse_conf   = {}",
+                sh("cat /etc/fuse.conf 2>&1 | tr '\n' ' '").1.trim()
+            );
+            eprintln!(
+                "h2h_counted: dev_fuse    = {}",
+                sh("ls -l /dev/fuse 2>&1").1.trim()
+            );
             for line in sh("grep -aiE 'error|refus|denied|permission|panic' /tmp/ffs-h2h-counted/fuse.log 2>&1 | tail -8").1.lines() {
                 eprintln!("h2h_counted: fuse.log! {line}");
             }
@@ -179,7 +191,9 @@ fn main() {
 
     eprintln!("h2h_counted: workload = {OPS} warm stat() of one file, single thread");
     for (name, per_op, digest) in &per_arm {
-        eprintln!("h2h_counted:   {name:<12} blocking_crossings_per_op={per_op:.4} digest={digest}");
+        eprintln!(
+            "h2h_counted:   {name:<12} blocking_crossings_per_op={per_op:.4} digest={digest}"
+        );
     }
     let k1 = per_arm[0].1;
     let k2 = per_arm[1].1;
@@ -189,6 +203,6 @@ fn main() {
     eprintln!("h2h_counted: digest parity across all arms = {digests_agree}");
     eprintln!(
         "h2h_counted: RESULT frankenfs={f:.4} blocking crossings/op against a live kernel btrfs arm at {:.4}",
-        (k1 + k2) / 2.0
+        f64::midpoint(k1, k2)
     );
 }

@@ -546,7 +546,7 @@ mod tests {
         // Improve throughput
         target_mut(&mut current, "fuzz_ext4_metadata")?.total_runs = 60_000;
         let alerts = detect_regressions(&baseline, &current);
-        assert!(alerts.is_empty());
+        assert_eq!(alerts, [] as [RegressionAlert; 0]);
         Ok(())
     }
 
@@ -557,7 +557,7 @@ mod tests {
         // Drop throughput by 60% (below 50% threshold)
         target_mut(&mut current, "fuzz_ext4_metadata")?.total_runs = 12_000;
         let alerts = detect_regressions(&baseline, &current);
-        assert!(!alerts.is_empty());
+        assert_ne!(alerts, [] as [RegressionAlert; 0]);
         let alert = first_alert(&alerts)?;
         assert_eq!(alert.target, "fuzz_ext4_metadata");
         assert_eq!(alert.metric, "execs_per_sec");

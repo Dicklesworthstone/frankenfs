@@ -890,11 +890,14 @@ mod tests {
         for status in ["positive", "negative", "unsupported", "host_skip"] {
             assert!(report.status_counts.contains_key(status));
         }
-        assert!(!report.host_skip_scenarios.is_empty());
-        assert!(!report.btrfs_default_permissions_scenarios.is_empty());
+        assert_ne!(report.host_skip_scenarios, [] as [String; 0]);
+        assert_ne!(
+            report.btrfs_default_permissions_scenarios,
+            [] as [String; 0]
+        );
         assert!(report.proof_bundle_coverage.ready);
         assert_eq!(report.coverage_matrix.len(), report.scenario_count);
-        assert!(report.missing_high_risk_user_risks.is_empty());
+        assert_eq!(report.missing_high_risk_user_risks, [] as [String; 0]);
         Ok(())
     }
 

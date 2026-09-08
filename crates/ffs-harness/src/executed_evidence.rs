@@ -437,8 +437,8 @@ mod tests {
         assert!(!evidence.outcome.is_skipped());
         assert!(!evidence.outcome.is_failure());
         assert!(evidence.duration_ms < 5000);
-        assert!(!evidence.stdout_sha256.is_empty());
-        assert!(!evidence.git_sha.is_empty());
+        assert_ne!(evidence.stdout_sha256, "");
+        assert_ne!(evidence.git_sha, "");
     }
 
     #[test]

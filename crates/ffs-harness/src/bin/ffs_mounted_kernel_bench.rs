@@ -109,9 +109,9 @@ fn path_is_mounted(mounts: &str, path: &std::path::Path) -> bool {
 }
 
 use anyhow::{Context, Result, anyhow, bail, ensure};
+use nix::libc;
 use nix::sched::{CpuSet, sched_getcpu, sched_setaffinity};
 use nix::unistd::Pid;
-use nix::libc;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
@@ -4422,6 +4422,7 @@ fn create_delete_storm_batch(root: &Path, operations: usize) -> Result<(u64, u64
 ///     makes easier to satisfy, not harder;
 ///   - the sequence-advance gate validates the PARENT's counters and says
 ///     nothing about the child's use of the value.
+///
 /// The failure mode would be silently wrong fsync and bulk-durable-write
 /// timings that pass every existing check. Echoing the sequence back turns that
 /// into a fail-closed error.
@@ -4515,9 +4516,7 @@ fn mutating_batch_bounded(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .with_context(|| {
-            format!("spawn bounded {workload} batch for {}", root.display())
-        })?;
+        .with_context(|| format!("spawn bounded {workload} batch for {}", root.display()))?;
     let deadline = Instant::now() + MUTATING_BATCH_TIMEOUT;
     let status = loop {
         if let Some(status) = child.try_wait().context("poll mutating batch child")? {
@@ -4525,7 +4524,9 @@ fn mutating_batch_bounded(
         }
         if Instant::now() >= deadline {
             let _ = child.kill();
-            let status = child.wait().context("wait for killed mutating batch child")?;
+            let status = child
+                .wait()
+                .context("wait for killed mutating batch child")?;
             bail!(
                 "mutating workload deadline elapsed after {} ms in phase={workload}, root={}; child killed with status {status}; mounted arms will now be unmounted and reaped",
                 MUTATING_BATCH_TIMEOUT.as_millis(),
@@ -8614,9 +8615,11 @@ fuse_null_median={:.6},inflation_suspected={},gate_input=false",
         (None, None) => json!("not_applicable"),
         _ => unreachable!("xattr witnesses must be present at both parity boundaries"),
     };
-    let bulk_durable_write_parity_json =
-        match (&expected_initial_bulk_write, &expected_final_bulk_write) {
-            (Some(initial), Some(final_witness)) => json!({
+    let bulk_durable_write_parity_json = match (
+        &expected_initial_bulk_write,
+        &expected_final_bulk_write,
+    ) {
+        (Some(initial), Some(final_witness)) => json!({
                 "verdict": "pass",
                 "validation_timing": "outside_measurement",
                 "initial_sha256": initial.sha256,
@@ -8638,9 +8641,9 @@ fuse_null_median={:.6},inflation_suspected={},gate_input=false",
                 1
             },
         }),
-            (None, None) => json!("not_applicable"),
-            _ => unreachable!("bulk durable witnesses must be present at both parity boundaries"),
-        };
+        (None, None) => json!("not_applicable"),
+        _ => unreachable!("bulk durable witnesses must be present at both parity boundaries"),
+    };
     let parity_json = json!({
         "verdict": "pass",
         "file_sha256": expected_parity.file_sha256,
@@ -9481,7 +9484,7 @@ fn run() -> Result<Option<PathBuf>> {
     // read at all, so the fractions are ABSENCE rather than a measured quiet.
     let device_io_json = json!({
         "peak_device_io_fraction": external_load.peak_device_io_fraction,
-        "busiest_device": external_load.busiest_device.clone(),
+        "busiest_device": external_load.busiest_device,
         "mean_device_io_fraction": mean_device_io_fraction,
         "busiest_device_by_mean": mean_device_io_device,
         "device_samples": external_load.device_samples,
@@ -9735,7 +9738,10 @@ fn run() -> Result<Option<PathBuf>> {
 
 fn main() -> ExitCode {
     let args = env::args().collect::<Vec<_>>();
-    if args.get(1).is_some_and(|arg| arg == "--mutating-batch-child") {
+    if args
+        .get(1)
+        .is_some_and(|arg| arg == "--mutating-batch-child")
+    {
         return match run_mutating_batch_child(&args[1..]) {
             Ok(code) => code,
             Err(error) => {
@@ -11479,8 +11485,8 @@ mod tests {
 
     #[test]
     fn direct_durable_batch_requires_aligned_payload_and_matches_untimed_witness() {
-        let (backing, offset) = direct_durable_aligned_payload(0xD4)
-            .expect("safe direct-I/O payload alignment");
+        let (backing, offset) =
+            direct_durable_aligned_payload(0xD4).expect("safe direct-I/O payload alignment");
         let payload = &backing[offset..offset + BULK_DURABLE_CHUNK_BYTES];
         assert!(
             (payload.as_ptr() as usize).is_multiple_of(DIRECT_DURABLE_ALIGNMENT),
@@ -13095,10 +13101,6 @@ mod tests {
     /// never refuse a sample the pre-relaxation code admitted.
     #[test]
     fn io_storm_samples_keep_the_pre_relaxation_limit_bd_d5pdz() {
-        assert!(
-            MAX_EXTERNAL_BUSY_CPUS_UNDER_IO_STORM < MAX_EXTERNAL_BUSY_CPUS,
-            "this test is only meaningful while the storm limit is the stricter one"
-        );
         let placement: BTreeSet<usize> = (0..8).collect();
         let quiet_io: BTreeMap<usize, f64> = (0..64).map(|c| (c, 0.004)).collect();
         let storm_io: BTreeMap<usize, f64> = (0..64).map(|c| (c, 0.90)).collect();
@@ -13119,6 +13121,11 @@ mod tests {
              the whole point of the recalibration"
         );
         assert_eq!(calm.io_storm_samples, 0, "no sample here is a storm");
+        assert_eq!(calm.max_busy_cpus, MAX_EXTERNAL_BUSY_CPUS);
+        assert!(
+            calm.max_busy_cpus > MAX_EXTERNAL_BUSY_CPUS_UNDER_IO_STORM,
+            "the observed quiet sample must exceed the stricter storm limit"
+        );
 
         let mut storm = ExternalLoadWitness::default();
         for _ in 0..20 {
@@ -13164,7 +13171,7 @@ mod tests {
         let placement: BTreeSet<usize> = (0..8).collect();
         let quiet_busy: BTreeMap<usize, f64> = (0..64).map(|c| (c, 0.02)).collect();
         // The measured blind spot: dm-0 pinned, iowait inside the quiet range.
-        let quiet_iowait: BTreeMap<usize, f64> = (0..64).map(|c| (c, 0.020425)).collect();
+        let quiet_iowait: BTreeMap<usize, f64> = (0..64).map(|c| (c, 0.020_425)).collect();
         let pinned: BTreeMap<String, f64> =
             [("dm-0".to_string(), 0.99), ("nvme0n1".to_string(), 0.80)]
                 .into_iter()
@@ -13221,9 +13228,9 @@ mod tests {
         // are kept — a gate on the peak alone would refuse this, and a quiet box
         // was measured to peak as high as 0.529 on its own.
         let mut bursty = ExternalLoadWitness::default();
-        let idle: BTreeMap<String, f64> = [("dm-0".to_string(), 0.02)].into_iter().collect();
+        let idle: BTreeMap<String, f64> = std::iter::once(("dm-0".to_string(), 0.02)).collect();
         let pinned_second: BTreeMap<String, f64> =
-            [("dm-0".to_string(), 1.0)].into_iter().collect();
+            std::iter::once(("dm-0".to_string(), 1.0)).collect();
         for i in 0..40 {
             bursty.observe_device_io(if i == 17 { &pinned_second } else { &idle });
         }

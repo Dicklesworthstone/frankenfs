@@ -14,7 +14,7 @@
 //!
 //! Everything is printed to STDERR because that is what rch returns.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 fn release_dir() -> Result<PathBuf, String> {
@@ -29,10 +29,13 @@ fn release_dir() -> Result<PathBuf, String> {
 /// `cargo run --example` builds the example and its dependencies, NOT the other
 /// binaries in the workspace, so the two the comparator needs may be absent. Build
 /// them explicitly; cargo has released the target lock by the time an example runs.
-fn ensure_binaries(release: &PathBuf) -> Result<(), String> {
+fn ensure_binaries(release: &Path) -> Result<(), String> {
     let needed = ["ffs-cli", "ffs-mounted-kernel-bench"];
     if needed.iter().all(|b| release.join(b).exists()) {
-        eprintln!("h2h_worker: both binaries already present in {}", release.display());
+        eprintln!(
+            "h2h_worker: both binaries already present in {}",
+            release.display()
+        );
         return Ok(());
     }
     eprintln!("h2h_worker: building ffs-cli + ffs-mounted-kernel-bench on the worker");
@@ -58,7 +61,10 @@ fn ensure_binaries(release: &PathBuf) -> Result<(), String> {
     }
     for b in needed {
         if !release.join(b).exists() {
-            return Err(format!("{} still missing after build", release.join(b).display()));
+            return Err(format!(
+                "{} still missing after build",
+                release.join(b).display()
+            ));
         }
     }
     Ok(())
@@ -89,10 +95,14 @@ fn main() {
     let passthrough: Vec<String> = std::env::args().skip(1).collect();
     let mut args: Vec<String> = if passthrough.is_empty() {
         [
-            "--filesystem", "ext4",
-            "--workload", "xattr-get-list-report",
-            "--pairs", "12",
-            "--fuse-transport", "loop",
+            "--filesystem",
+            "ext4",
+            "--workload",
+            "xattr-get-list-report",
+            "--pairs",
+            "12",
+            "--fuse-transport",
+            "loop",
             // No PGO profile exists on a worker build; the gate is explicit about
             // recording such a candidate as non-production rather than silently
             // accepting it.
@@ -145,9 +155,8 @@ fn main() {
 }
 
 fn hostname() -> String {
-    Command::new("hostname")
-        .output()
-        .ok()
-        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned())
-        .unwrap_or_else(|| "unknown".into())
+    Command::new("hostname").output().ok().map_or_else(
+        || "unknown".into(),
+        |o| String::from_utf8_lossy(&o.stdout).trim().to_owned(),
+    )
 }

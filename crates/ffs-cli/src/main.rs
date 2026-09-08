@@ -2778,7 +2778,7 @@ fn createbench_cmd(
             "createbench: {} creates / {threads} threads in {} us = {} creates/s",
             per * threads,
             elapsed.as_micros(),
-            cps as u64
+            truncated_rate(cps)
         );
         return Ok(());
     }
@@ -2807,12 +2807,12 @@ fn createbench_cmd(
         count,
         created,
         duration_us,
-        creates_per_s = creates_per_s as u64,
+        creates_per_s = truncated_rate(creates_per_s),
         "createbench_done"
     );
     eprintln!(
         "createbench: {count} creates in {dir_path} -> {created} created in {duration_us} us = {} creates/s",
-        creates_per_s as u64
+        truncated_rate(creates_per_s)
     );
     Ok(())
 }
@@ -3071,7 +3071,7 @@ fn createbench_rounds(
             "createbench_round,round={round},threads={threads},count={per_round_total},\
 create_us={},creates_per_s={}",
             create_us.as_micros(),
-            (per_round_total as f64 / secs) as u64
+            truncated_rate(per_round_total as f64 / secs)
         );
     }
     // One flush for the whole run, timed and reported separately so it can be
@@ -3733,6 +3733,13 @@ performance_admitted={performance_admitted},gate_basis=bootstrap_median_ci,cv_us
     }
 }
 
+/// Truncate a reported rate, preserving Rust's saturating float-to-u64 behavior.
+/// The signed intermediate covers the entire u64 range; clamping before the
+/// conversion maps negative values and NaN to zero, and overflow saturates.
+fn truncated_rate(rate: f64) -> u64 {
+    u64::try_from(rate.max(0.0) as i128).unwrap_or(u64::MAX)
+}
+
 fn mkdirbench_cmd(path: &PathBuf, dir_path: &str, count: usize) -> Result<()> {
     let cx = cli_cx();
     let mut open_fs = OpenFs::open(&cx, path)
@@ -3768,12 +3775,12 @@ fn mkdirbench_cmd(path: &PathBuf, dir_path: &str, count: usize) -> Result<()> {
         count,
         made,
         duration_us,
-        mkdirs_per_s = mkdirs_per_s as u64,
+        mkdirs_per_s = truncated_rate(mkdirs_per_s),
         "mkdirbench_done"
     );
     eprintln!(
         "mkdirbench: {count} mkdirs in {dir_path} -> {made} made in {duration_us} us = {} mkdirs/s",
-        mkdirs_per_s as u64
+        truncated_rate(mkdirs_per_s)
     );
     Ok(())
 }
@@ -3821,12 +3828,12 @@ fn rmdirbench_cmd(path: &PathBuf, dir_path: &str, count: usize) -> Result<()> {
         count,
         removed,
         duration_us,
-        rmdirs_per_s = rmdirs_per_s as u64,
+        rmdirs_per_s = truncated_rate(rmdirs_per_s),
         "rmdirbench_done"
     );
     eprintln!(
         "rmdirbench: {count} rmdirs in {dir_path} -> {removed} removed in {duration_us} us = {} rmdirs/s",
-        rmdirs_per_s as u64
+        truncated_rate(rmdirs_per_s)
     );
     Ok(())
 }
@@ -3874,12 +3881,12 @@ fn unlinkbench_cmd(path: &PathBuf, dir_path: &str, count: usize) -> Result<()> {
         count,
         removed,
         duration_us,
-        unlinks_per_s = unlinks_per_s as u64,
+        unlinks_per_s = truncated_rate(unlinks_per_s),
         "unlinkbench_done"
     );
     eprintln!(
         "unlinkbench: {count} unlinks in {dir_path} -> {removed} removed in {duration_us} us = {} unlinks/s",
-        unlinks_per_s as u64
+        truncated_rate(unlinks_per_s)
     );
     Ok(())
 }
@@ -3934,12 +3941,12 @@ fn renamebench_cmd(path: &PathBuf, dir_path: &str, count: usize) -> Result<()> {
         count,
         renamed,
         duration_us,
-        renames_per_s = renames_per_s as u64,
+        renames_per_s = truncated_rate(renames_per_s),
         "renamebench_done"
     );
     eprintln!(
         "renamebench: {count} renames in {dir_path} -> {renamed} renamed in {duration_us} us = {} renames/s",
-        renames_per_s as u64
+        truncated_rate(renames_per_s)
     );
     Ok(())
 }
@@ -4317,13 +4324,13 @@ fn lookupbench_cmd(path: &PathBuf, dir_path: &str, count: usize, seed: u64) -> R
         dir_entries = names.len(),
         found,
         duration_us,
-        lookups_per_s = lookups_per_s as u64,
+        lookups_per_s = truncated_rate(lookups_per_s),
         "lookupbench_done"
     );
     eprintln!(
         "lookupbench: {count} lookups in {dir_path} ({} entries) -> {found} found in {duration_us} us = {} lookups/s",
         names.len(),
-        lookups_per_s as u64
+        truncated_rate(lookups_per_s)
     );
     Ok(())
 }
@@ -4427,15 +4434,15 @@ fn writebench_cmd(
         random,
         bytes = total_bytes,
         duration_us,
-        iops = iops as u64,
-        mib_per_s = mib_s as u64,
+        iops = truncated_rate(iops),
+        mib_per_s = truncated_rate(mib_s),
         "writebench_done"
     );
     eprintln!(
         "writebench: {count} x {size}B {} -> {total_bytes} B in {duration_us} us = {} IOPS, {} MiB/s",
         if random { "random" } else { "sequential" },
-        iops as u64,
-        mib_s as u64
+        truncated_rate(iops),
+        truncated_rate(mib_s)
     );
     // Persist the overlay (created file + written blocks) to the image so a
     // fresh open (e.g. a following `rand-read`) observes them.
@@ -4530,15 +4537,15 @@ fn randread_cmd(
         parallel,
         bytes = total_bytes,
         duration_us,
-        iops = iops as u64,
-        mib_per_s = mib_s as u64,
+        iops = truncated_rate(iops),
+        mib_per_s = truncated_rate(mib_s),
         "randread_done"
     );
     eprintln!(
         "randread: {count} x {size}B {} -> {total_bytes} B in {duration_us} us = {} IOPS, {} MiB/s",
         if parallel { "parallel" } else { "serial" },
-        iops as u64,
-        mib_s as u64
+        truncated_rate(iops),
+        truncated_rate(mib_s)
     );
     Ok(())
 }
@@ -4908,8 +4915,7 @@ fn walk_cmd(path: &PathBuf, no_stat: bool, parallel: bool, read_data: bool) -> R
     // already-cached nodes, not device I/O" reading gets tested rather than
     // asserted. ~3 lookups/entry at a high hit rate confirms it; a low hit rate
     // would mean the 512-node cache is thrashing, which is a different fix.
-    let (node_lookups, node_hits, node_misses) =
-        ffs_core::btrfs_node_cache_counters_full();
+    let (node_lookups, node_hits, node_misses) = ffs_core::btrfs_node_cache_counters_full();
     if node_lookups > 0 {
         let per_stat = node_lookups as f64 / stats.max(1) as f64;
         let hit_rate = node_hits as f64 / node_lookups as f64 * 100.0;
@@ -4926,9 +4932,7 @@ fn walk_cmd(path: &PathBuf, no_stat: bool, parallel: bool, read_data: bool) -> R
             if accounted == node_lookups {
                 String::new()
             } else {
-                format!(
-                    " [UNACCOUNTED: hits+misses={accounted} != lookups={node_lookups}]"
-                )
+                format!(" [UNACCOUNTED: hits+misses={accounted} != lookups={node_lookups}]")
             }
         );
     }
@@ -8743,10 +8747,12 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
             source.offset, source.generation
         )
     });
-    if flags.repair() && repair_coordination.writes_allowed
-        && let FsFlavor::Ext4(_) = &flavor {
-            ext4_recovery = Some(run_ext4_mount_recovery(path)?);
-        }
+    if flags.repair()
+        && repair_coordination.writes_allowed
+        && let FsFlavor::Ext4(_) = &flavor
+    {
+        ext4_recovery = Some(run_ext4_mount_recovery(path)?);
+    }
 
     phases.push(FsckPhaseOutput {
         phase: "superblock_validation".to_owned(),
@@ -9673,8 +9679,8 @@ mod tests {
         log_mount_runtime_rejected, log_mount_runtime_selected, mount_cmd, mount_operation_id,
         open_filesystem_for_mount, parse_btrfs_mount_selection, parse_fuse_dispatch_workers,
         read_ext4_group_desc_from_path, read_ext4_inode_from_path, read_file_region,
-        require_jbd2_durability_for_mount,
-        start_mount_background_scrub, summarize_repair_staleness, unavailable_repair_info,
+        require_jbd2_durability_for_mount, start_mount_background_scrub,
+        summarize_repair_staleness, unavailable_repair_info,
         validate_mount_adaptive_runtime_request_with_config,
         validate_mount_writeback_cache_request,
     };
@@ -9690,8 +9696,8 @@ mod tests {
         repair_coordination_record_path, repair_worker_limit, select_btrfs_repair_groups,
         select_ext4_repair_groups,
     };
-    use clap::Parser;
     use asupersync::Cx;
+    use clap::Parser;
     use ffs_block::CacheRuntimeMetricsSnapshot;
     use ffs_core::{OpenFs, OpenOptions};
     use ffs_harness::adaptive_runtime_manifest::{
@@ -9714,6 +9720,28 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn benchmark_rate_truncation_preserves_saturation_and_boundaries() {
+        for (rate, expected) in [
+            (f64::NAN, 0),
+            (f64::NEG_INFINITY, 0),
+            (-1.5, 0),
+            (-0.0, 0),
+            (0.0, 0),
+            (f64::MIN_POSITIVE, 0),
+            (0.999, 0),
+            (1.999, 1),
+            (42.75, 42),
+            (9_007_199_254_740_991.0, 9_007_199_254_740_991),
+            (18_446_744_073_709_549_568.0, u64::MAX - 2047),
+            (18_446_744_073_709_551_616.0, u64::MAX),
+            (f64::MAX, u64::MAX),
+            (f64::INFINITY, u64::MAX),
+        ] {
+            assert_eq!(super::truncated_rate(rate), expected, "rate={rate}");
+        }
+    }
 
     #[test]
     fn cli_parses_read_pool_cutover_gate() {
@@ -10203,7 +10231,6 @@ mod tests {
                     cache_misses: 0,
                     stolen_from: 0,
                     stolen_to: 0,
-                    ..Default::default()
                 })
                 .collect(),
         }
@@ -10517,7 +10544,7 @@ mod tests {
     #[test]
     fn mount_adaptive_runtime_shutdown_summary_reports_default_off_explicitly() {
         let observation = super::MountAdaptiveRuntimeShutdownObservation {
-            metrics: Default::default(),
+            metrics: ffs_fuse::MetricsSnapshot::default(),
             worker_count: 0,
             per_core: None,
         };
@@ -12326,7 +12353,6 @@ mod tests {
             cache_dirty_count: 40,
             writeback_queue_depth: 12,
             hit_rate: 0.9,
-            ..Default::default()
         };
         with_temp_image_path(
             serde_json::to_string_pretty(&snapshot)
@@ -12392,7 +12418,6 @@ mod tests {
             pruned_versions_total: 99,
             commit_latency_us: test_histogram(5, 200),
             conflict_resolution_latency_us: test_histogram(2, 50),
-            ..Default::default()
         };
         with_temp_image_path(
             serde_json::to_string_pretty(&snapshot)
@@ -12464,7 +12489,6 @@ mod tests {
             decode_successes: 6,
             symbol_refresh_count: 14,
             symbol_staleness_max_seconds: 120.0,
-            ..Default::default()
         };
         with_temp_image_path(
             serde_json::to_string_pretty(&snapshot)

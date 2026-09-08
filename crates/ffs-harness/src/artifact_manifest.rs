@@ -3037,7 +3037,7 @@ mod tests {
     fn evaluate_retention_empty_list() {
         let policy = RetentionPolicy::default();
         let prune = evaluate_retention(&[], &policy, 0);
-        assert!(prune.is_empty());
+        assert_eq!(prune, [] as [usize; 0]);
     }
 
     // ── Redaction tests ──────────────────────────────────────────────
@@ -4014,7 +4014,10 @@ mod tests {
             positive.observed_result,
             ArtifactSchemaFixtureExpectation::Accept
         );
-        assert!(positive.observed_diagnostics.is_empty());
+        assert_eq!(
+            positive.observed_diagnostics,
+            [] as [ArtifactSchemaFixtureDiagnostic; 0]
+        );
         assert!(positive.classification.contains("security_refusal"));
         assert!(
             positive

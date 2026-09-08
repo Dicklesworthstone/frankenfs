@@ -1342,7 +1342,7 @@ mod tests {
         assert_eq!(report.large_host_plan_count, 1);
         assert_eq!(report.verdict_counts.get("pass"), Some(&1));
         assert_eq!(report.verdict_counts.get("skip"), Some(&1));
-        assert!(report.issues.is_empty());
+        assert_eq!(report.issues, [] as [SwarmValidationIssue; 0]);
         Ok(())
     }
 

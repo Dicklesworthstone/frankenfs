@@ -1679,7 +1679,7 @@ mod tests {
 
         assert_eq!(decision_for(&report, "log_bytes"), BudgetDecision::Excepted);
         assert_eq!(report.release_gate_verdict, BudgetDecision::Warn);
-        assert!(report.errors.is_empty());
+        assert_eq!(report.errors, [] as [String; 0]);
         assert!(
             report
                 .warnings

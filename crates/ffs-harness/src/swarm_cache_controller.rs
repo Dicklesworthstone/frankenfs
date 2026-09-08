@@ -921,7 +921,7 @@ mod tests {
         assert_eq!(report.candidate_count, 3);
         assert_eq!(report.small_host_downgrade_count, 1);
         assert_eq!(report.authoritative_claim_count, 1);
-        assert!(report.errors.is_empty());
+        assert_eq!(report.errors, [] as [String; 0]);
         Ok(())
     }
 

@@ -985,7 +985,7 @@ fn ext4_and_btrfs_fixtures_conform() {
     assert_eq!(btrfs.log_root_level, 2);
     assert_eq!(btrfs.label, "ffs-lab");
     assert_eq!(btrfs.sys_chunk_array_size, 0);
-    assert!(btrfs.sys_chunk_array.is_empty());
+    assert_eq!(btrfs.sys_chunk_array, [] as [u8; 0]);
 }
 
 #[test]
@@ -3862,7 +3862,7 @@ fn ext4_fast_commit_truncated_stream_falls_back_to_jbd2_only() {
     assert_eq!(fc.reserved_fc_blocks, 2);
     assert_eq!(fc.replay.transactions_found, 0);
     assert_eq!(fc.replay.last_tid, 0);
-    assert!(fc.replay.operations.is_empty());
+    assert_eq!(fc.replay.operations.len(), 0);
     assert_eq!(fc.replay.incomplete_transactions, 1);
     assert!(fc.replay.fallback_required);
     assert_eq!(fc.replay.blocks_scanned, 1);

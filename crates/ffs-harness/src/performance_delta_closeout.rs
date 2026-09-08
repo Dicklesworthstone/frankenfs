@@ -1718,7 +1718,7 @@ mod tests {
             &mut errors,
         );
         assert_eq!(follow_up.as_deref(), Some("bd-rchk5.8"));
-        assert!(errors.is_empty());
+        assert_eq!(errors, [] as [String; 0]);
     }
 
     #[test]
@@ -1883,7 +1883,7 @@ mod tests {
             );
             let Some(row) = maybe_row else { continue };
             assert_eq!(row.release_claim_state, "reference_limited_experimental");
-            assert!(!row.raw_logs.is_empty());
+            assert_ne!(row.raw_logs, [] as [String; 0]);
             assert!(row.comparison_target_rationale.is_some());
             assert!(row.release_wording.is_some());
             assert!(row.validation_command.is_some());

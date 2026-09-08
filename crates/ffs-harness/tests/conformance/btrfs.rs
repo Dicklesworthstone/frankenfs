@@ -573,7 +573,7 @@ fn btrfs_send_stream_multi_command_conforms() {
     );
     assert_eq!(result.commands[1].attrs[2], (19, b"hello".to_vec()));
     assert_eq!(result.commands[2].cmd, SendCommand::End);
-    assert!(result.commands[2].attrs.is_empty());
+    assert_eq!(result.commands[2].attrs, [] as [(u16, Vec<u8>); 0]);
 }
 
 #[test]
@@ -902,8 +902,8 @@ fn btrfs_tree_log_replay_multilevel_conforms() {
     };
 
     let sb = build_btrfs_tree_log_superblock(root_logical, 1);
-    let replay = replay_tree_log(&mut read, &sb, &chunks, BTRFS_FS_TREE_OBJECTID)
-        .expect("replay tree-log");
+    let replay =
+        replay_tree_log(&mut read, &sb, &chunks, BTRFS_FS_TREE_OBJECTID).expect("replay tree-log");
     assert!(replay.replayed, "tree-log with log_root should replay");
     assert_eq!(reads, vec![root_physical, leaf_physical]);
     assert_eq!(replay.items_count, 2);
@@ -968,7 +968,15 @@ fn btrfs_tree_log_replay_follows_a_log_root_tree_bd_jhuob() {
     let mut log_tree = vec![0_u8; BTRFS_TEST_NODESIZE as usize];
     write_btrfs_header(&mut log_tree, log_tree_logical, 1, 0, 5, 78);
     let payload_off = 3600_u32;
-    write_btrfs_leaf_item(&mut log_tree, 0, 256, BTRFS_ITEM_INODE_ITEM, 0, payload_off, 6);
+    write_btrfs_leaf_item(
+        &mut log_tree,
+        0,
+        256,
+        BTRFS_ITEM_INODE_ITEM,
+        0,
+        payload_off,
+        6,
+    );
     log_tree[payload_off as usize..(payload_off + 6) as usize].copy_from_slice(b"logged");
 
     stamp_btrfs_tree_block_checksum(&mut log_root);
@@ -987,9 +995,16 @@ fn btrfs_tree_log_replay_follows_a_log_root_tree_bd_jhuob() {
     let sb = build_btrfs_tree_log_superblock(log_root_logical, 0);
     let replay = replay_tree_log(&mut read, &sb, &chunks, BTRFS_FS_TREE_OBJECTID)
         .expect("replay a log root tree");
-    assert!(replay.replayed, "a log root tree naming our subvolume must replay");
+    assert!(
+        replay.replayed,
+        "a log root tree naming our subvolume must replay"
+    );
     assert!(!replay.foreign_format);
-    assert_eq!(replay.items.len(), 1, "the LOG TREE's items, not the root tree's");
+    assert_eq!(
+        replay.items.len(),
+        1,
+        "the LOG TREE's items, not the root tree's"
+    );
     assert_eq!(replay.items[0].key.objectid, 256);
     assert_eq!(replay.items[0].data, b"logged");
 
@@ -1005,7 +1020,7 @@ fn btrfs_tree_log_replay_follows_a_log_root_tree_bd_jhuob() {
         "a log for another subvolume is unreplayable HERE, and the caller must \
          refuse writes rather than clear it"
     );
-    assert!(other.items.is_empty());
+    assert_eq!(other.items, [] as [ffs_btrfs::BtrfsLeafEntry; 0]);
 }
 
 #[test]
@@ -1025,7 +1040,7 @@ fn btrfs_tree_log_replay_skips_when_log_root_absent() {
     assert_eq!(read_calls, 0, "no physical reads should occur");
     assert!(!replay.replayed);
     assert_eq!(replay.items_count, 0);
-    assert!(replay.items.is_empty());
+    assert_eq!(replay.items, [] as [ffs_btrfs::BtrfsLeafEntry; 0]);
 }
 
 #[test]

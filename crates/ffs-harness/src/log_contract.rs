@@ -374,7 +374,7 @@ mod tests {
 
     #[test]
     fn outcome_vocabulary_is_non_empty() {
-        assert!(!outcome::VOCABULARY.is_empty());
+        assert_ne!(outcome::VOCABULARY, [] as [&str; 0]);
     }
 
     #[test]

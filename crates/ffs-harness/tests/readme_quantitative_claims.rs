@@ -40,11 +40,37 @@ fn injected_readme_count_drift_is_detected() -> Result<(), String> {
     }
 }
 
+#[test]
+fn injected_readme_benchmark_file_count_drift_is_detected() -> Result<(), String> {
+    let root = workspace_root()?;
+    let readme = read_to_string(&root, "README.md")?;
+    let benchmark_files = git_ls_files_count(&root, "crates/*/benches/*.rs")?;
+    let original = format!("{benchmark_files} Rust benchmark files");
+    if !readme.contains(&original) {
+        return Err(format!("benchmark inventory claim is missing: {original}"));
+    }
+    let mutated = readme.replace(
+        &original,
+        &format!("{} Rust benchmark files", benchmark_files + 1),
+    );
+    let mismatches = collect_mismatches(&root, &mutated)?;
+    if mismatches
+        .iter()
+        .any(|mismatch| mismatch.starts_with("Rust benchmark file count:"))
+    {
+        Ok(())
+    } else {
+        Err(format!(
+            "injected benchmark-file drift was not detected: {mismatches:?}"
+        ))
+    }
+}
+
 fn collect_mismatches(root: &Path, readme: &str) -> Result<Vec<String>, String> {
     let crate_count = git_ls_files_count(root, "crates/*/Cargo.toml")?;
     let fuzz_target_count = git_ls_files_count(root, "fuzz/fuzz_targets/*.rs")?;
     let e2e_script_count = git_ls_files_count(root, "scripts/e2e/*.sh")?;
-    let criterion_bench_count = git_ls_files_count(root, "crates/*/benches/*.rs")?;
+    let benchmark_file_count = git_ls_files_count(root, "crates/*/benches/*.rs")?;
     let snapshot_count = git_ls_files_count(root, "*.snap")?;
 
     let btrfs_source = read_to_string(root, "crates/ffs-btrfs/src/lib.rs")?;
@@ -63,7 +89,7 @@ fn collect_mismatches(root: &Path, readme: &str) -> Result<Vec<String>, String> 
     require_contains(
         readme,
         &format!("{crate_count} crates"),
-        "workspace crate count",
+        "crates-directory package count",
         &mut mismatches,
     );
     require_contains(
@@ -101,13 +127,13 @@ fn collect_mismatches(root: &Path, readme: &str) -> Result<Vec<String>, String> 
 
     require_contains(
         readme,
-        &format!("{criterion_bench_count} criterion benchmarks"),
-        "criterion benchmark count",
+        &format!("{benchmark_file_count} Rust benchmark files"),
+        "Rust benchmark file count",
         &mut mismatches,
     );
     require_contains(
         readme,
-        &format!("{e2e_script_count} tracked end-to-end gate scripts"),
+        &format!("{e2e_script_count} tracked E2E scripts"),
         "tracked E2E script count",
         &mut mismatches,
     );

@@ -798,8 +798,8 @@ mod tests {
         assert!(report.seed_count >= 7);
         assert!(report.source_kind_count >= MIN_SOURCE_KIND_COUNT);
         assert_eq!(report.source_value_verified_count, report.seed_count);
-        assert!(!report.dry_run_seed_ids.is_empty());
-        assert!(!report.permissioned_seed_ids.is_empty());
+        assert_ne!(report.dry_run_seed_ids, [] as [String; 0]);
+        assert_ne!(report.permissioned_seed_ids, [] as [String; 0]);
         assert_eq!(report.coverage_matrix.len(), report.seed_count);
         assert!(report.coverage_matrix.iter().all(|row| {
             !row.source_value_pointer.is_empty()

@@ -2508,7 +2508,7 @@ mod tests {
         let parsed: OpenEndedInventoryReport = serde_json::from_str(&json)?;
         assert_eq!(parsed, report);
         assert!(parsed.row_count >= 10, "expected substantive inventory");
-        assert!(parsed.errors.is_empty());
+        assert_eq!(parsed.errors, [] as [String; 0]);
         assert!(
             parsed
                 .rows
@@ -2642,7 +2642,7 @@ mod tests {
         );
         assert_eq!(positive.unresolved_note_count, 0);
         for row in &positive.rows {
-            assert!(!row.existing_evidence.is_empty());
+            assert_ne!(row.existing_evidence, "");
             assert!(PROOF_TYPES.contains(&row.proof_type.as_str()));
             assert_eq!(
                 row.unit_test_expectation,
@@ -2835,9 +2835,9 @@ The known gaps are already linked to bd-l7ov7 and artifact reports/open-ended.js
         assert!(report.valid, "{:?}", report.errors);
         assert_eq!(report.unresolved_note_count, 0);
         for row in report.rows {
-            assert!(!row.source_path.is_empty());
+            assert_ne!(row.source_path, "");
             assert!(row.line_number > 0);
-            assert!(!row.section_id.is_empty());
+            assert_ne!(row.section_id, "");
             assert!(row.matched_text_snippet_hash.starts_with("sha256:"));
             assert!(
                 row.required_log_fields
@@ -3338,7 +3338,7 @@ The known gaps are already linked to bd-l7ov7 and artifact reports/open-ended.js
                 "missing required family {family}"
             );
         }
-        assert!(report.stale_sources.is_empty());
+        assert_eq!(report.stale_sources, [] as [String; 0]);
     }
 
     #[test]

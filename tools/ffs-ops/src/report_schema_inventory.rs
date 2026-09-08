@@ -2282,7 +2282,7 @@ mod tests {
             report.row_results[0].report_id,
             "adaptive_runtime_evidence_report"
         );
-        assert!(report.uncovered_required_report_ids.is_empty());
+        assert_eq!(report.uncovered_required_report_ids, [] as [String; 0]);
         assert!(report.row_results.iter().all(|row| row.errors.is_empty()));
     }
 

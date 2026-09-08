@@ -2294,8 +2294,11 @@ mod tests {
         assert_eq!(report.snapshot_status, "missing");
         assert_eq!(report.source_freshness, "unknown");
         assert_eq!(report.conflict_classification, "unknown");
-        assert!(report.reservations.is_empty());
-        assert!(report.errors.is_empty());
+        assert_eq!(
+            report.reservations,
+            [] as [AgentMailReservationLeaseReport; 0]
+        );
+        assert_eq!(report.errors, [] as [String; 0]);
         Ok(())
     }
 
@@ -2323,7 +2326,7 @@ mod tests {
         assert_eq!(row.conflict_classification, "active_peer_conflict");
         assert!(row.active);
         assert!(row.overlaps_target);
-        assert!(report.errors.is_empty());
+        assert_eq!(report.errors, [] as [String; 0]);
         Ok(())
     }
 
@@ -2377,7 +2380,7 @@ mod tests {
         assert_eq!(row.conflict_classification, "expired");
         assert!(!row.active);
         assert!(row.overlaps_target);
-        assert!(report.errors.is_empty());
+        assert_eq!(report.errors, [] as [String; 0]);
         Ok(())
     }
 
@@ -2403,7 +2406,7 @@ mod tests {
         assert_eq!(row.conflict_classification, "shared_observation");
         assert!(row.active);
         assert!(!row.exclusive);
-        assert!(report.errors.is_empty());
+        assert_eq!(report.errors, [] as [String; 0]);
         Ok(())
     }
 
@@ -2430,7 +2433,7 @@ mod tests {
         assert_eq!(row.conflict_classification, "self_held");
         assert!(row.active);
         assert!(row.overlaps_target);
-        assert!(report.errors.is_empty());
+        assert_eq!(report.errors, [] as [String; 0]);
         Ok(())
     }
 
@@ -2869,7 +2872,10 @@ mod tests {
         let report =
             analyze_tracker_source_hygiene(&issues, &cfg).map_err(|err| err.to_string())?;
 
-        assert!(report.permission_gated_rows.is_empty());
+        assert_eq!(
+            report.permission_gated_rows,
+            [] as [TrackerPermissionGatedRow; 0]
+        );
         assert_eq!(
             report.source_aware_queue_state.claimable_ids,
             vec!["bd-swarm", "bd-xfstests"]
@@ -3183,7 +3189,7 @@ mod tests {
             .get("bd-local")
             .ok_or_else(|| "missing bd-local".to_owned())?;
         assert!(!local_row.rch_dependent);
-        assert!(local_row.rch_dependency_markers.is_empty());
+        assert_eq!(local_row.rch_dependency_markers, [] as [String; 0]);
         Ok(())
     }
 
@@ -3201,7 +3207,10 @@ mod tests {
         let report =
             analyze_tracker_source_hygiene(&issues, &config()).map_err(|err| err.to_string())?;
 
-        assert!(report.permission_gated_rows.is_empty());
+        assert_eq!(
+            report.permission_gated_rows,
+            [] as [TrackerPermissionGatedRow; 0]
+        );
         assert_eq!(
             report.source_aware_queue_state.claimable_ids,
             vec!["bd-planner"]

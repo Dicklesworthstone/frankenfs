@@ -214,11 +214,7 @@ fn dump_group_cmd(group: u32, path: &PathBuf, json: bool, hex: bool) -> Result<(
     Ok(())
 }
 
-pub fn build_dump_group_output(
-    path: &PathBuf,
-    group: u32,
-    hex: bool,
-) -> Result<DumpGroupOutput> {
+pub fn build_dump_group_output(path: &PathBuf, group: u32, hex: bool) -> Result<DumpGroupOutput> {
     let cx = cli_cx();
     let flavor = detect_filesystem_at_path(&cx, path)
         .with_context(|| format!("failed to detect ext4/btrfs metadata in {}", path.display()))?;
@@ -357,11 +353,7 @@ fn dump_inode_cmd(inode: u64, path: &PathBuf, json: bool, hex: bool) -> Result<(
     Ok(())
 }
 
-pub fn build_dump_inode_output(
-    path: &PathBuf,
-    inode: u64,
-    hex: bool,
-) -> Result<DumpInodeOutput> {
+pub fn build_dump_inode_output(path: &PathBuf, inode: u64, hex: bool) -> Result<DumpInodeOutput> {
     let cx = cli_cx();
     let flavor = detect_filesystem_at_path(&cx, path)
         .with_context(|| format!("failed to detect ext4/btrfs metadata in {}", path.display()))?;
@@ -646,11 +638,7 @@ fn dump_dir_cmd(inode: u64, path: &PathBuf, json: bool, hex: bool) -> Result<()>
     Ok(())
 }
 
-pub fn build_dump_dir_output(
-    path: &PathBuf,
-    inode: u64,
-    hex: bool,
-) -> Result<DumpDirOutput> {
+pub fn build_dump_dir_output(path: &PathBuf, inode: u64, hex: bool) -> Result<DumpDirOutput> {
     let cx = cli_cx();
     let flavor = detect_filesystem_at_path(&cx, path)
         .with_context(|| format!("failed to detect ext4/btrfs metadata in {}", path.display()))?;

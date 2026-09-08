@@ -1197,7 +1197,6 @@ mod tests {
     }
 
     #[test]
-    #[expect(clippy::float_cmp)] // comparing exact constants from default_envelope()
     fn mount_runtime_benchmark_envelopes_match_family() {
         let taxonomy = Taxonomy::canonical();
 
