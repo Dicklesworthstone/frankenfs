@@ -3832,6 +3832,72 @@ mod tests {
     }
 
     #[test]
+    fn scrub_refresh_never_encodes_detected_corruption() {
+        for (full_scrub, dirty) in [(true, true), (false, true), (true, false), (false, false)] {
+            let cx = Cx::for_testing();
+            let device = MemBlockDevice::new(256, 64);
+            let layout =
+                RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout");
+            let originals = write_source_blocks(&cx, &device, BlockNumber(0), 8);
+            bootstrap_storage(&cx, &device, layout, BlockNumber(0), 8, 4);
+            let generation_before = read_generation(&cx, &device, layout);
+            let validator = CorruptBlockValidator::new(vec![2]);
+            let group_cfg = GroupConfig {
+                layout,
+                source_first_block: BlockNumber(0),
+                source_block_count: 8,
+            };
+            let mut pipeline = ScrubWithRecovery::new(
+                &device,
+                &validator,
+                test_uuid(),
+                vec![group_cfg],
+                Vec::new(),
+                4,
+            );
+            if dirty {
+                device
+                    .write_block(&cx, BlockNumber(1), &[0x5A; 256])
+                    .expect("client write after symbol generation");
+                pipeline.mark_group_dirty(GroupNumber(0)).expect("dirty");
+            }
+            device
+                .write_block(&cx, BlockNumber(2), &[0xDE; 256])
+                .expect("inject corruption");
+
+            if full_scrub {
+                let report = pipeline.scrub_and_recover(&cx).expect("full scrub");
+                assert_eq!(report.total_recovered, usize::from(!dirty));
+                assert_eq!(report.total_unrecoverable, usize::from(dirty));
+            } else {
+                let (_, summary) = pipeline
+                    .scrub_group_once(&cx, group_cfg)
+                    .expect("group scrub");
+                let summary = summary.expect("corruption summary");
+                assert_eq!(summary.recovered_count, usize::from(!dirty));
+                assert_eq!(summary.unrecoverable_count, usize::from(dirty));
+            }
+            let restored = device
+                .read_block(&cx, BlockNumber(2))
+                .expect("read after scrub");
+            if dirty {
+                assert_eq!(restored.as_slice(), &[0xDE; 256]);
+                assert_eq!(
+                    device.read_block(&cx, BlockNumber(1)).expect("client data").as_slice(),
+                    &[0x5A; 256]
+                );
+            } else {
+                assert_eq!(restored.as_slice(), originals[2].as_slice());
+            }
+            assert_eq!(
+                read_generation(&cx, &device, layout),
+                generation_before + u64::from(!dirty)
+            );
+            assert_eq!(pipeline.is_group_dirty(GroupNumber(0)), dirty);
+        }
+    }
+
+    #[test]
     fn eager_policy_refreshes_symbols_on_write() {
         let cx = Cx::for_testing();
         let block_size = 256;
