@@ -9,6 +9,11 @@
 > is partial pending external crash-image verification. Public execution-bound
 > reporting is tracked in `bd-wh1xk` / `bd-lc132`; do not interpret `97/97` as
 > successful execution or release readiness.
+>
+> **Repair integration update:** explicit request contexts now reach attached
+> refresh lifecycles, and failed/cancelled refresh batches preserve pending work.
+> These tested fixes do not establish default repair, reserved native storage,
+> or mounted restart freshness; `bd-11a8t` / `bd-j7a4e` remain incomplete.
 
 | Domain | Implemented | Total Tracked | Coverage |
 |--------|-------------|---------------|----------|

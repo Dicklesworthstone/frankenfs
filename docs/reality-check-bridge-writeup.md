@@ -1,6 +1,63 @@
 # Reality-Check Bridge: Closing the Gap Between Claims and Code
 
-## Current assessment — 2026-09-08
+## Delivery progress — 2026-09-08, 06:41 UTC
+
+The audit below is the starting point, not a claim that its diagnosed defects
+remain unchanged. Implementation has advanced; the complete delivery contract
+is still unproven.
+
+- **Fast-commit recovery:** supported operations now apply or return an error;
+  incomplete directory/extent recovery cannot be counted as success. Overlay
+  recovery preserves the base image, and recovered ranges are checked against
+  committed mappings. Inode records outside the configured valid size range are
+  rejected before writes, rather than partially copied or silently truncated.
+  Independent kernel/e2fsck crash-image certification remains
+  pending (`bd-gqsnh`, `bd-9m84h`).
+- **Repair lifecycle:** failed/cancelled refresh batches retain unprocessed
+  groups for retry. FCW, SSI and mounted request commits pass explicit `Cx`
+  through both FUSE adapters. Attached-lifecycle failures propagate with an
+  explicit warning that the transaction is already committed; they do not imply
+  rollback. This does not establish default repair, safe native reservation,
+  persistent freshness or region-scoped worker ownership (`bd-11a8t`, `bd-j7a4e`).
+- **Tracker:** `bd-09urx` and `bd-24ydx` are closed on 17 passing scenarios,
+  conserved source rows/statuses, unchanged original goldens and an acyclic
+  dependency graph. Unsupported statuses remain intact in exclusion accounting;
+  unresolved dependencies stay blocked. Missing timestamps no longer erase
+  in-progress rows.
+- **Documentation:** signatures, dependencies, capability boundaries and
+  quantitative terminology were corrected. Four count/negative-drift tests pass.
+  Actual source dispatch implements four merge algorithms, including bitmap OR
+  and bitmap delta; the earlier two-algorithm assessment was incorrect.
+  Compilation of every README example remains outstanding (`bd-3kpkz`, `bd-ed3i5`).
+
+Current executed checks: workspace check, Clippy with warnings denied, and fmt
+pass. The combined core recovery run selected **39 tests, all passing**; repair
+queue tests **9/9**, FUSE context/error-path tests **9/9**, README count tests
+**4/4**, CLI rate-boundary test **1/1**, and the benchmark admission guard test
+**1/1** also passed. The two new queue regressions and the malformed-inode-size
+regression failed before their implementation fixes. These are bounded tests, not
+a complete workspace or mounted-service run. Logs are retained in `/tmp` under
+`ffs-fc-repair-reviewed-build-20260908`, `ffs-delivery-reviewed-clippy-20260908`,
+`ffs-delivery-reviewed-check-20260908`, `ffs-repair-queue-{before,after}-20260908`,
+`ffs-repair-fuse-context-test-20260908`, `ffs-readme-counts-test-current-20260908`
+`ffs-cli-rate-test-correct-20260908`, and
+`ffs-bench-admission-guard-test-correct-20260908` (all `.log`). Tracker evidence is
+`artifacts/e2e/20260908_020721_ffs_tracker_source_hygiene_1Cloc3/`.
+
+UBS remains red: the completed scan reported 244 critical findings, including
+sampled false positives but also findings not yet individually resolved.
+No clean scanner or release result is claimed. Commits created elsewhere in the
+shared workspace captured earlier changes while validation was ongoing; their
+existence is not evidence that these gates passed.
+
+Remaining delivery TODOs are kept in the original beads and the granular notes
+on `bd-z5bav`. In particular, public execution-bound parity, mounted RAID
+routing, native repair storage/worker lifecycle, external crash/xfstests tests,
+and aggregate release acceptance remain open. Do not enable automatic repair
+symbol writes merely by connecting the queue: current CLI tail-layout arithmetic
+does not itself establish ownership of that space against filesystem allocation.
+
+## Initial assessment — 2026-09-08
 
 **Audit:** `bd-e34ey`, source revision
 `260833046b1e7bc01a51fb8aa9e8f2d96118a8a2`.
@@ -42,7 +99,7 @@ acceptance thresholds were relaxed during this audit.
 | 5 | Serve the advertised multi-device RAID profiles through mounts | Integration gap | Mounted core uses `map_logical_to_physical`; `chunk_physical` explicitly rejects all profiles except Single/Dup (`ffs-ondisk/src/btrfs.rs:1123`). Standalone device-set/stripe helpers do not prove the README RAID RW matrix. |
 | 6 | Recover ext4 fast commits | Partial; incomplete recovery can continue | `apply_fast_commit_operations` applies directory/inode operations and coordinated extent recovery; it is more than logging. But its caller warns and continues after errors (`ffs-core/src/lib.rs:5933`), and directory insertion's `Ok(false)` is discarded before incrementing the verified count. Unsupported growth/no-room/casefold cases need fail-closed recovery and independent crash-image tests (`bd-gqsnh`, `bd-9m84h`). |
 | 7 | Match namespace, xattr, extent and casefold semantics | Substantial implementation, scoped gaps | Parity includes real success and deterministic rejection contracts. Full Unicode 12.1/kernel hash validation remains blocked in `bd-vsuni.3`; broad Unicode equivalence claims are premature. Unsupported operations are contract coverage, not supported functionality. |
-| 8 | Provide MVCC/SSI and useful same-block merge proofs | Implemented primitives and mounted wiring; benefit unproven | Ext4 writes stage `NonOverlappingExtents` proofs (`ffs-core/src/lib.rs:26718`), contradicting stale “all Unsafe” text. Tests and two audited merge mechanisms do not establish the headline expected-loss benefit on mounted workloads. |
+| 8 | Provide MVCC/SSI and useful same-block merge proofs | Implemented primitives and mounted wiring; benefit unproven | Ext4 writes stage `NonOverlappingExtents` proofs (`ffs-core/src/lib.rs:26718`), contradicting stale “all Unsafe” text. Correction from 2026-09-08 source inspection: `MergeProof::merge_bytes` implements four mechanisms (`AppendOnly`, `RangeOverlay`, `BitmapOr`, `BitmapDelta`), with five enum outcomes including refusal. This implementation inventory does not establish the headline expected-loss benefit on mounted workloads. |
 | 9 | Make repair a default, fresh, persistent durability substrate | Partial integration | Canonical spec §0.4 says default/continuous. CLI scrub remains opt-in, repair lifecycle is optional, and flush notification uses ambient `Cx::current` (`ffs-core/src/lib.rs:8701`). Codec recovery is real; default mounted freshness is a separate requirement. |
 | 10 | Propagate cancellation and bound worker lifetime | Partial architectural conformance | Explicit Cx APIs coexist with ambient context and std-thread workers. A joined thread is meaningful lifecycle handling, but it is not proof of the stipulated asupersync structured cancellation contract. |
 | 11 | Offer working serial/parallel/per-core FUSE modes | Implemented transport; operational evidence incomplete | `mount_managed_per_core` calls the real vendored per-core worker spawn (`ffs-fuse/src/lib.rs:7964`). `bd-28mw2` wording predates this implementation. Performance and cancellation need current mode-specific evidence. |
