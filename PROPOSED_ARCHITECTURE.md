@@ -113,6 +113,12 @@ mirror's checksum, logical address and structure before caching it, retrying
 another copy on invalid content. Kernel-written RAID1/RAID10/C3/C4 tests corrupt
 chunk-tree, root-tree and fs-tree copies independently: all but the final mirror
 can be corrupt and still recover through FUSE; corrupting every copy fails.
+Core reader-fault tests also cover I/O errors and empty, short and oversized
+responses for RAID1/C3/C4 and both RAID10 mirror groups. They require recovery
+from the final eligible complete copy, refuse all-copy failure, reject reads
+from another RAID10 group, and prevent failed metadata from entering the cache
+or a failed data sector from changing caller output. These are deterministic
+fault-injection tests, not live-device failure evidence.
 Checksummed file reads validate whole sectors
 and retry mirrors both during the existing pre-output extent check and when
 filling read/decompression buffers, so the bytes returned come from the validated

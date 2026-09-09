@@ -53072,6 +53072,155 @@ mod tests {
     }
 
     #[test]
+    fn btrfs_mirror_read_failures_recover_only_from_eligible_complete_copies() {
+        use ffs_ondisk::chunk_type_flags::{
+            BTRFS_BLOCK_GROUP_RAID1, BTRFS_BLOCK_GROUP_RAID1C3, BTRFS_BLOCK_GROUP_RAID1C4,
+            BTRFS_BLOCK_GROUP_RAID10,
+        };
+        #[derive(Clone, Copy, Debug)]
+        enum Fault {
+            Io,
+            Empty,
+            Short,
+            Oversized,
+        }
+        // Exercise both RAID10 groups. A readable device outside the selected
+        // group must never be used as a substitute for a failed mirror.
+        for (profile, count, group) in [
+            (BTRFS_BLOCK_GROUP_RAID1, 2_u16, 0_u64),
+            (BTRFS_BLOCK_GROUP_RAID1C3, 3, 0),
+            (BTRFS_BLOCK_GROUP_RAID1C4, 4, 0),
+            (BTRFS_BLOCK_GROUP_RAID10, 4, 0),
+            (BTRFS_BLOCK_GROUP_RAID10, 4, 1),
+        ] {
+            for fault in [Fault::Io, Fault::Empty, Fault::Short, Fault::Oversized] {
+                for all_bad in [false, true] {
+                    for metadata in [true, false] {
+                        let cx = Cx::for_testing();
+                        let image = Arc::new(build_btrfs_csum_image());
+                        let mut fs = OpenFs::from_device(
+                            &cx,
+                            Box::new(TestDevice::from_vec(image.as_ref().clone())),
+                            &OpenOptions::default(),
+                        )
+                        .unwrap();
+                        let root = fs.btrfs_superblock().unwrap().root;
+                        let expected_items = fs.walk_btrfs_tree(&cx, root).unwrap();
+                        assert!(!expected_items.is_empty());
+                        let csums = fs.btrfs_read_csum_items(&cx).unwrap();
+                        fs.btrfs_test_clear_node_cache();
+                        let logical = if metadata {
+                            root
+                        } else {
+                            BTRFS_TEST_FILE_DATA_LOGICAL as u64
+                        };
+                        let size = 4096_u64;
+                        let raid10 = profile == BTRFS_BLOCK_GROUP_RAID10;
+                        let first = 1 + group * 2;
+                        let mirrors = if raid10 { 2 } else { u64::from(count) };
+                        let last = first + mirrors - 1;
+                        let mut chunk = fs.btrfs_context().unwrap().chunks[0].clone();
+                        chunk.key.offset = logical - group * size;
+                        chunk.length = size * 2;
+                        chunk.stripe_len = size;
+                        chunk.chunk_type = profile;
+                        chunk.num_stripes = count;
+                        chunk.sub_stripes = if raid10 { 2 } else { 0 };
+                        chunk.stripes = (1..=u64::from(count))
+                            .map(|devid| ffs_ondisk::BtrfsStripe {
+                                devid,
+                                offset: logical,
+                                dev_uuid: [0; 16],
+                            })
+                            .collect();
+                        fs.btrfs_context.as_mut().unwrap().chunks = vec![chunk];
+                        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                        let mut readers = ffs_btrfs::BtrfsDeviceSet::new();
+                        for devid in 1..=u64::from(count) {
+                            let image = Arc::clone(&image);
+                            let calls = Arc::clone(&calls);
+                            readers
+                                .add_device(
+                                    devid,
+                                    Box::new(move |_, offset, len| {
+                                        assert!(
+                                            (first..=last).contains(&devid),
+                                            "crossed RAID10 group"
+                                        );
+                                        let attempt = calls
+                                            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                                        assert_eq!(devid, first + u64::try_from(attempt).unwrap());
+                                        assert_eq!(offset, logical);
+                                        assert_eq!(len, 4096);
+                                        let start = usize::try_from(offset).unwrap();
+                                        let mut bytes = image[start..start + len].to_vec();
+                                        if devid == last && !all_bad {
+                                            return Ok(bytes);
+                                        }
+                                        match fault {
+                                            Fault::Io => Err(ffs_btrfs::BtrfsDeviceError::Io(
+                                                std::io::Error::other(
+                                                    "injected device read failure",
+                                                ),
+                                            )),
+                                            Fault::Empty => Ok(Vec::new()),
+                                            Fault::Short => {
+                                                bytes.pop();
+                                                Ok(bytes)
+                                            }
+                                            Fault::Oversized => {
+                                                bytes.push(0);
+                                                Ok(bytes)
+                                            }
+                                        }
+                                    }),
+                                )
+                                .unwrap();
+                        }
+                        fs.btrfs_devices = Some(BtrfsReadDevices {
+                            readers,
+                            identities: Default::default(),
+                        });
+                        if metadata {
+                            let result = fs.walk_btrfs_tree(&cx, root);
+                            if all_bad {
+                                assert!(result.is_err(), "metadata {profile}/{group}/{fault:?}");
+                                assert!(fs.btrfs_parsed_node_cache.get(&root).is_none());
+                            } else {
+                                assert_eq!(result.unwrap(), expected_items);
+                                // Only the complete validated node may be cached.
+                                assert_eq!(fs.walk_btrfs_tree(&cx, root).unwrap(), expected_items);
+                            }
+                        } else {
+                            let mut out = [0xA5; 22];
+                            let result = fs.btrfs_read_checksummed_into(
+                                &cx,
+                                &csums,
+                                4096,
+                                logical + 3,
+                                &mut out,
+                            );
+                            if all_bad {
+                                assert!(result.is_err(), "data {profile}/{group}/{fault:?}");
+                                assert_eq!(out, [0xA5; 22], "failed sector must not change output");
+                            } else {
+                                result.unwrap();
+                                let start = usize::try_from(logical).unwrap() + 3;
+                                assert_eq!(out, image[start..start + out.len()]);
+                            }
+                        }
+                        assert_eq!(
+                            u64::try_from(calls.load(std::sync::atomic::Ordering::Relaxed))
+                                .unwrap(),
+                            mirrors
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn btrfs_metadata_mirror_cancellation_stops_before_next_copy() {
         let image = build_btrfs_image();
         let sb = BtrfsSuperblock::parse_superblock_region(&image[65_536..]).unwrap();
