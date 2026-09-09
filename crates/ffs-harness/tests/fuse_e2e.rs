@@ -14043,6 +14043,117 @@ fn btrfs_openfs_ioctl_dev_info_two_device_inventory() {
     emit_scenario_result("btrfs_dev_info_two_device_inventory", "PASS", None);
 }
 
+fn assert_btrfs_metadata_mirror_recovery(cx: &Cx, images: &[PathBuf; 2], payload: &[u8]) {
+    let options = OpenOptions {
+        btrfs_device_paths: vec![images[1].clone()],
+        ..OpenOptions::default()
+    };
+    let filesystem = OpenFs::open_with_options(cx, &images[0], &options).unwrap();
+    let sb = filesystem.btrfs_superblock().unwrap().clone();
+    let chunks = filesystem.btrfs_context().unwrap().chunks.clone();
+    let roots = filesystem.walk_btrfs_root_tree(cx).unwrap();
+    let fs_root = roots
+        .iter()
+        .find(|item| {
+            item.key.objectid == 5 && item.key.item_type == ffs_btrfs::BTRFS_ITEM_ROOT_ITEM
+        })
+        .unwrap();
+    let fs_root = ffs_btrfs::parse_root_item(&fs_root.data).unwrap().bytenr;
+    drop(filesystem);
+    for logical in [sb.chunk_root, sb.root, fs_root] {
+        let mapping = ffs_ondisk::map_logical_to_stripes(&chunks, logical)
+            .unwrap()
+            .unwrap();
+        assert_eq!(mapping.stripes.len(), 2);
+        assert!(mapping.contiguous_len >= u64::from(sb.nodesize));
+        let mut copies = Vec::new();
+        for stripe in mapping.stripes {
+            let image = images
+                .iter()
+                .find(|image| {
+                    let mut file = fs::File::open(image).unwrap();
+                    file.seek(SeekFrom::Start(65_536 + 0xC9)).unwrap();
+                    let mut id = [0; 8];
+                    file.read_exact(&mut id).unwrap();
+                    u64::from_le_bytes(id) == stripe.devid
+                })
+                .unwrap();
+            let mut file = fs::File::open(image).unwrap();
+            file.seek(SeekFrom::Start(stripe.physical)).unwrap();
+            let mut original = vec![0; sb.nodesize as usize];
+            file.read_exact(&mut original).unwrap();
+            // Independently confirm that the selected physical copy contains
+            // the requested node, not an unrelated block or zero-filled space.
+            assert_eq!(
+                u64::from_le_bytes(original[48..56].try_into().unwrap()),
+                logical
+            );
+            copies.push((image.clone(), stripe.physical, original));
+        }
+        assert_eq!(
+            copies[0].2, copies[1].2,
+            "kernel wrote identical metadata mirrors"
+        );
+        let corrupt = |copy: &(PathBuf, u64, Vec<u8>)| {
+            let mut file = fs::OpenOptions::new().write(true).open(&copy.0).unwrap();
+            file.seek(SeekFrom::Start(copy.1)).unwrap();
+            file.write_all(&[copy.2[0] ^ 1]).unwrap();
+            file.sync_all().unwrap();
+        };
+        corrupt(&copies[0]);
+        let recovered = OpenFs::open_with_options(cx, &images[0], &options)
+            .unwrap_or_else(|error| panic!("recover metadata node {logical}: {error}"));
+        let attr = recovered
+            .lookup(cx, InodeNumber(1), std::ffi::OsStr::new("payload"))
+            .unwrap();
+        assert_eq!(
+            recovered
+                .read(cx, attr.ino, 0, u32::try_from(payload.len()).unwrap())
+                .unwrap(),
+            payload
+        );
+        // FUSE must exercise its own cold metadata path, not reuse the node
+        // cache warmed by the direct API read above.
+        drop(recovered);
+        let mounted = OpenFs::open_with_options(cx, &images[0], &options).unwrap();
+        let mountpoint = images[0]
+            .parent()
+            .unwrap()
+            .join(format!("mirror-{logical}"));
+        fs::create_dir(&mountpoint).unwrap();
+        let session = mount_background(
+            Box::new(mounted),
+            &mountpoint,
+            &MountOptions {
+                read_only: true,
+                auto_unmount: false,
+                ..MountOptions::default()
+            },
+        )
+        .unwrap();
+        let mount = ffs_harness::stale_mounts::MountGuard::new(session, &mountpoint);
+        wait_for_fuse_mount_ready(&mountpoint);
+        assert_eq!(fs::read(mountpoint.join("payload")).unwrap(), payload);
+        drop(mount);
+        corrupt(&copies[1]);
+        let both_bad = OpenFs::open_with_options(cx, &images[0], &options).and_then(|filesystem| {
+            let attr = filesystem.lookup(cx, InodeNumber(1), std::ffi::OsStr::new("payload"))?;
+            filesystem.read(cx, attr.ino, 0, u32::try_from(payload.len()).unwrap())
+        });
+        assert!(
+            both_bad.is_err(),
+            "two corrupt copies must not return data for node {logical}"
+        );
+        for (path, physical, original) in copies {
+            let mut file = fs::OpenOptions::new().write(true).open(path).unwrap();
+            file.seek(SeekFrom::Start(physical)).unwrap();
+            file.write_all(&original).unwrap();
+            file.sync_all().unwrap();
+        }
+    }
+    emit_scenario_result("btrfs_raid1_metadata_checksum_fallback", "PASS", None);
+}
+
 #[test]
 fn btrfs_attached_devices_read_seeded_files() {
     assert!(
@@ -14259,6 +14370,9 @@ fn btrfs_attached_devices_read_seeded_files() {
             OpenFs::open_with_options(&cancelled, &images[0], &valid),
             Err(ffs_error::FfsError::Cancelled)
         ));
+        if profile == "raid1" {
+            assert_btrfs_metadata_mirror_recovery(&cx, &images, &payload);
+        }
         emit_scenario_result(&format!("btrfs_attached_devices_{profile}"), "PASS", None);
     }
 }

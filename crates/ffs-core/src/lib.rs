@@ -776,14 +776,49 @@ impl BtrfsReadDevices {
         nodesize: u32,
         csum_type: u16,
     ) -> Result<Arc<BtrfsParsedNode>, ParseError> {
-        let bytes = self
-            .readers
-            .read_logical(cx, chunks, logical, nodesize as usize)
-            .map_err(|_| ParseError::InvalidField {
-                field: "btrfs_device_read",
-                reason: "attached device read failed",
-            })?;
-        parse_btrfs_tree_node_owned(bytes, csum_type, logical, nodesize).map(Arc::new)
+        let mapping = ffs_ondisk::map_logical_to_stripes(chunks, logical)?.ok_or(
+            ParseError::InvalidField {
+                field: "logical_address",
+                reason: "metadata node is not covered by any chunk",
+            },
+        )?;
+        // A tree node is one checksum unit. Never stitch pieces from different
+        // mirrors or read past the physical span described by this mapping.
+        if mapping.contiguous_len < u64::from(nodesize) {
+            return Err(ParseError::InvalidField {
+                field: "nodesize",
+                reason: "metadata node crosses a stripe or chunk boundary",
+            });
+        }
+        let ns = usize::try_from(nodesize)
+            .map_err(|_| ParseError::IntegerConversion { field: "nodesize" })?;
+        let mut failure = ParseError::InsufficientData {
+            needed: ns,
+            offset: 0,
+            actual: 0,
+        };
+        for stripe in mapping.stripes {
+            let bytes = match self
+                .readers
+                .read_physical(cx, stripe.devid, stripe.physical, ns)
+            {
+                Ok(bytes) => bytes,
+                Err(ffs_btrfs::BtrfsDeviceError::Cancelled) => {
+                    return Err(ParseError::InvalidField {
+                        field: "btrfs_device_read",
+                        reason: "metadata read cancelled",
+                    });
+                }
+                Err(_) => continue,
+            };
+            // Only a checksum-valid, structurally valid node at the expected
+            // logical address may reach the parsed-node cache or tree walker.
+            match parse_btrfs_tree_node_owned(bytes, csum_type, logical, nodesize) {
+                Ok(node) => return Ok(Arc::new(node)),
+                Err(error) => failure = error,
+            }
+        }
+        Err(failure)
     }
 
     fn walk_tree(
@@ -52731,6 +52766,90 @@ mod tests {
     }
 
     // ── Btrfs OpenFs tests ──────────────────────────────────────────────
+
+    #[test]
+    fn btrfs_metadata_mirror_cancellation_stops_before_next_copy() {
+        let image = build_btrfs_image();
+        let sb = BtrfsSuperblock::parse_superblock_region(&image[65_536..]).unwrap();
+        let mut chunk = parse_sys_chunk_array(&sb.sys_chunk_array)
+            .unwrap()
+            .remove(0);
+        chunk.chunk_type = ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_RAID1;
+        chunk.num_stripes = 2;
+        chunk.stripes = vec![
+            ffs_ondisk::BtrfsStripe {
+                devid: 1,
+                offset: 0,
+                dev_uuid: [1; 16],
+            },
+            ffs_ondisk::BtrfsStripe {
+                devid: 2,
+                offset: 0,
+                dev_uuid: [2; 16],
+            },
+        ];
+        let logical = chunk.key.offset;
+        let mut readers = ffs_btrfs::BtrfsDeviceSet::new();
+        readers
+            .add_device(
+                1,
+                Box::new(|cx, _, len| {
+                    cx.set_cancel_requested(true);
+                    Ok(vec![0; len])
+                }),
+            )
+            .unwrap();
+        readers
+            .add_device(2, Box::new(|_, _, _| panic!("read after cancellation")))
+            .unwrap();
+        let devices = BtrfsReadDevices {
+            readers,
+            identities: Default::default(),
+        };
+        let cx = Cx::for_testing();
+        assert!(matches!(
+            devices.walk_tree(&cx, &[chunk], logical, &sb),
+            Err(FfsError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn btrfs_metadata_mirror_rejects_node_crossing_mapping_without_io() {
+        let image = build_btrfs_image();
+        let sb = BtrfsSuperblock::parse_superblock_region(&image[65_536..]).unwrap();
+        let mut chunk = parse_sys_chunk_array(&sb.sys_chunk_array)
+            .unwrap()
+            .remove(0);
+        chunk.length = u64::from(sb.nodesize) / 2;
+        let logical = chunk.key.offset;
+        let mut readers = ffs_btrfs::BtrfsDeviceSet::new();
+        for stripe in &chunk.stripes {
+            readers
+                .add_device(
+                    stripe.devid,
+                    Box::new(|_, _, _| panic!("read beyond mapping")),
+                )
+                .unwrap();
+        }
+        let devices = BtrfsReadDevices {
+            readers,
+            identities: Default::default(),
+        };
+        let error = devices
+            .read_node(
+                &Cx::for_testing(),
+                &[chunk],
+                logical,
+                sb.nodesize,
+                sb.csum_type,
+            )
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("crosses a stripe or chunk boundary")
+        );
+    }
 
     /// Build a minimal synthetic btrfs image with a sys_chunk_array and a leaf
     /// node at the root tree address.

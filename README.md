@@ -1018,7 +1018,7 @@ btrfs uses copy-on-write B-trees addressed by logical block addresses that must 
 2. **Chunk lookup.** Find the chunk entry whose `[key.offset, key.offset + length)` range contains the target logical address.
 3. **Stripe calculation.** For single-device images, `physical = stripe.offset + (logical - chunk.key.offset)`.
 
-`--btrfs-device PATH` attaches additional devices for clean, read-only btrfs mounts. Bootstrap, metadata and file-data reads use `BtrfsDeviceSet`; kernel-written RAID0 and RAID1 images are tested through FUSE with either primary device. The remaining profile/degraded matrix, dirty-image recovery and checksum-aware mirror retry remain open. Multi-device writes are deferred and refused.
+`--btrfs-device PATH` attaches additional devices for clean, read-only btrfs mounts. Bootstrap, metadata and file-data reads use `BtrfsDeviceSet`; kernel-written RAID0 and RAID1 images are tested through FUSE with either primary device. Metadata recovers from readable corrupt mirrors by validating each copy before caching it. The remaining profile/degraded matrix, dirty-image recovery and checksum-aware file-data mirror retry remain open. Multi-device writes are deferred and refused.
 
 ### Tree walk algorithm
 
@@ -3288,7 +3288,7 @@ read requirement remains open under `bd-hk5w3`; helper tests do not certify it.
 | `Single` | Linear, split at chunk boundaries | Implemented | Experimental |
 | `DUP` | Alternate copies on one device | Implemented using primary mapping | Experimental |
 | `RAID0` | Split across data stripes | Clean two-device kernel image + FUSE verified | Deferred |
-| `RAID1` | Mirror fallback on read error | Clean two-device kernel image + FUSE verified; degraded evidence pending | Deferred |
+| `RAID1` | Mirror fallback on read error | Kernel image + FUSE verified, including corrupt metadata mirror recovery; degraded evidence pending | Deferred |
 | `RAID10` | Split across mirrored stripe groups | Routed; mounted evidence pending | Deferred |
 | `RAID5` | Owning data stripe; no reconstruction | Routed; mounted evidence pending | Deferred |
 | `RAID6` | Owning data stripe; no reconstruction | Routed; mounted evidence pending | Deferred |
@@ -3304,6 +3304,12 @@ The parity rotation logic for RAID5/RAID6 received an explicit fix (`18bc6b0`) t
 `BtrfsDeviceSet::read_logical` retries another mirror when a reader returns an
 error or the wrong byte count. It does not independently verify data checksums:
 a corrupt buffer of the correct length requires validation by the caller.
+Attached-device metadata reads validate each whole node before accepting it;
+checksum-invalid or structurally invalid copies fall back to another mirror.
+Kernel-written RAID1 tests cover corrupt chunk-tree, root-tree and fs-tree
+copies through FUSE, plus refusal when both copies are bad. File-data mirror
+recovery still needs to connect checksum validation to the bytes returned to
+the caller; its current verify-then-read-again path has not been changed.
 Cross-stripe and cross-chunk helpers use independent device byte arrays. The
 `btrfs_attached_devices_read_seeded_files` test additionally reads kernel-written
 RAID0/RAID1 files through core and FUSE with either primary device. Use repeatable
@@ -3659,7 +3665,7 @@ See [`FEATURE_PARITY.md`](FEATURE_PARITY.md) for the full capability matrix and 
 
 **ext4.** Single-device images with block sizes 1K/2K/4K. Requires `FILETYPE`; `EXTENTS` is optional (indirect-block addressing is supported). FUSE mount defaults to read-only; `--rw` is available but experimental. All known incompat feature flags are accepted at mount time. `COMPRESSION` covers ext4 e2compr read/write for the implemented gzip/LZO/"none" method-table paths; rare legacy codecs (`lzv1`, `bzip2`, `lzrw3a`) reject deterministically with `EOPNOTSUPP`. `JOURNAL_DEV` images are detected; data filesystems referencing an external journal support paired-open replay through `OpenOptions::external_journal_path` (library API) with UUID/block-size validation. `ENCRYPT` shows filenames as raw bytes (nokey mode). `CASEFOLD` provides case-insensitive directory lookup. `INLINE_DATA` reads from inode block area + `system.data` xattr. MMP unsafe states are rejected with `EOPNOTSUPP`.
 
-**btrfs.** Mounted address translation supports single-device Single/Dup images and explicit clean multi-device read-only attachment, with kernel-written RAID0/RAID1 FUSE evidence. The remaining profile/degraded read matrix and checksum-aware mirror retry are incomplete; multi-device writes remain deferred. Metadata parsing + validation covers superblocks, leaf items, sys_chunk_array, chunk-tree walking, and device-tree walking. The operator-facing mount path is experimental and defaults to read-only. `--rw` enables durable single-device btrfs metadata mutation via `btrfs_full_transaction_commit()`. The `--btrfs-rw-ephemeral-ok` flag controls commit strategy (ephemeral tree-log vs full durable commit), not permission. Transparent ZLIB/LZO/ZSTD decompression, named subvolume/snapshot selection (`--subvol`, `--snapshot`), tree-log replay, and send/receive stream parsing are implemented in source; current compatibility evidence must identify the exercised paths.
+**btrfs.** Mounted address translation supports single-device Single/Dup images and explicit clean multi-device read-only attachment, with kernel-written RAID0/RAID1 FUSE evidence and corrupt-metadata mirror recovery. The remaining profile/degraded read matrix and checksum-aware file-data mirror retry are incomplete; multi-device writes remain deferred. Metadata parsing + validation covers superblocks, leaf items, sys_chunk_array, chunk-tree walking, and device-tree walking. The operator-facing mount path is experimental and defaults to read-only. `--rw` enables durable single-device btrfs metadata mutation via `btrfs_full_transaction_commit()`. The `--btrfs-rw-ephemeral-ok` flag controls commit strategy (ephemeral tree-log vs full durable commit), not permission. Transparent ZLIB/LZO/ZSTD decompression, named subvolume/snapshot selection (`--subvol`, `--snapshot`), tree-log replay, and send/receive stream parsing are implemented in source; current compatibility evidence must identify the exercised paths.
 
 ### btrfs RW contract
 

@@ -108,8 +108,12 @@ superblock checksums, filesystem generation/roots/geometry, device IDs/UUIDs and
 capacity, then checks identities against the committed CHUNK_TREE inventory and
 stripe references. Bootstrap, parsed metadata and file-data reads use the device
 set. Kernel-written RAID0 and RAID1 images are covered through the core API and
-FUSE with each primary-device choice. Attached mounts currently require a clean
-tree log and no MVCC WAL; dirty-image recovery, checksum-aware mirror selection,
+FUSE with each primary-device choice. Metadata reads validate each complete
+mirror's checksum, logical address and structure before caching it, retrying
+another copy on invalid content. Kernel-written RAID1 tests corrupt chunk-tree,
+root-tree and fs-tree copies independently: one corrupt copy recovers through
+FUSE; two corrupt copies fail. Attached mounts currently require a clean
+tree log and no MVCC WAL; dirty-image recovery, checksum-aware data mirror selection,
 degraded/profile coverage and parity reconstruction remain open. There is no
 multi-device mutation support.
 `OpenFs::enable_writes` refuses any device count other than one and any known
