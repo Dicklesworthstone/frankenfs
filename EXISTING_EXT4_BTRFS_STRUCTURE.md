@@ -2505,6 +2505,9 @@ For metadata blocks, verification includes:
     requires an exact ID, including when the requested ID is zero. A nonzero
     UUID adds an exact UUID constraint. See Linux v6.19 `fs/btrfs/volumes.c`
     (`dev_args_match_device`) and `fs/btrfs/ioctl.c` (`btrfs_ioctl_dev_info`).
+    Accounting comes from the live device state (`btrfs_device_get_bytes_used`
+    and `btrfs_device_get_total_bytes`), so chunk allocation must become visible
+    through the ioctl without waiting for a superblock write.
 13. `BTRFS_IOC_FS_INFO.max_id` is the maximum ID in the filesystem's device
     inventory, not `num_devices`. Linux v6.19 `btrfs_ioctl_fs_info` computes
     it across the device list. A single device with ID 7 therefore reports

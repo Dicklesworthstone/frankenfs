@@ -13894,7 +13894,7 @@ fn btrfs_openfs_ioctl_dev_info_payload_contract() {
         ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
         ..OpenOptions::default()
     };
-    let fs = OpenFs::open_with_options(&cx, &image, &opts).expect("open btrfs image");
+    let mut fs = OpenFs::open_with_options(&cx, &image, &opts).expect("open btrfs image");
 
     let info = fs
         .get_btrfs_fs_info(&cx, &mut RequestScope::empty())
@@ -13957,6 +13957,15 @@ fn btrfs_openfs_ioctl_dev_info_payload_contract() {
         .get_btrfs_dev_info(&cx, &mut RequestScope::empty(), 0, [0; 16])
         .expect_err("zero device ID is not a wildcard");
     assert_eq!(zero_id.to_errno(), libc::ENODEV);
+    fs.enable_writes(&cx)
+        .expect("load writable chunk-tree state");
+    let live = fs
+        .get_btrfs_dev_info(&cx, &mut RequestScope::empty(), devid, uuid)
+        .expect("DEV_INFO from loaded chunk-tree accounting");
+    assert_eq!(
+        live, wildcard,
+        "freshly loaded accounting matches the image"
+    );
     emit_scenario_result("btrfs_dev_info_backing_device_identity", "PASS", None);
 }
 

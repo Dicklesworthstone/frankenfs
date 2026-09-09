@@ -106,9 +106,12 @@ chunk profile other than Single/DUP before loading mutable allocation state.
 Skipping read validation does not bypass this write-admission check.
 `OpenFs::get_btrfs_dev_info` reads the backing superblock through the request's
 `Cx`, verifies its checksum, parses the embedded device item, and checks its
-filesystem UUID before encoding device ID, device UUID, and on-disk device
-accounting. This identifies the one backing image; it does not enumerate or
-validate a mounted multi-device set.
+filesystem UUID. Writable mounts then read the live CHUNK_TREE device item
+under the allocator's read lock, validate its ID and UUIDs against the backing
+identity, and report its current accounting. Partial tree loads return an
+unsupported error; missing or malformed records return corruption errors.
+Read-only mounts still use the superblock accounting. This identifies the one
+backing image; it does not enumerate or validate a mounted multi-device set.
 `FS_INFO` uses the same verified device item to report `max_id` for a
 single-device image, so sparse device IDs remain discoverable through
 `DEV_INFO`. Until the mounted registry covers all devices, `FS_INFO` refuses

@@ -10029,6 +10029,52 @@ impl OpenFs {
         self.btrfs_alloc_state.as_ref().ok_or(FfsError::ReadOnly)
     }
 
+    /// Use the writable mount's device accounting, which chunk allocation
+    /// updates before the superblock is persisted. The backing image remains
+    /// the identity anchor; an incomplete tree cannot supply current accounting.
+    fn current_btrfs_backing_device_item(
+        &self,
+        cx: &Cx,
+        sb: &BtrfsSuperblock,
+    ) -> Result<ffs_ondisk::BtrfsDevItem, FfsError> {
+        // Match commit's lock order so the superblock cannot be rewritten
+        // between verifying its checksum and reading live device state.
+        let alloc = self.btrfs_alloc_state.as_ref().map(|mutex| mutex.read());
+        let backing = read_btrfs_backing_device_item(cx, self.dev.as_ref(), sb)?;
+        let Some(alloc) = alloc else {
+            return Ok(backing);
+        };
+        if !alloc.chunk_trees_authoritative {
+            return Err(FfsError::UnsupportedFeature(
+                "DEV_INFO requires authoritative chunk-tree device accounting".to_owned(),
+            ));
+        }
+        let corrupt = |detail: String| FfsError::Corruption {
+            block: sb.chunk_root / u64::from(sb.sectorsize),
+            detail,
+        };
+        let key = BtrfsKey {
+            objectid: ffs_ondisk::btrfs::BTRFS_DEV_ITEMS_OBJECTID,
+            item_type: ffs_ondisk::btrfs::BTRFS_DEV_ITEM_KEY,
+            offset: backing.devid,
+        };
+        let bytes = alloc
+            .chunk_tree
+            .get(&key)
+            .ok_or_else(|| corrupt("chunk tree has no backing device item".to_owned()))?;
+        let current =
+            ffs_ondisk::parse_dev_item(&bytes).map_err(|error| corrupt(error.to_string()))?;
+        if current.devid != backing.devid
+            || current.uuid != backing.uuid
+            || current.fsid != backing.fsid
+        {
+            return Err(corrupt(
+                "chunk-tree device identity disagrees with backing superblock".to_owned(),
+            ));
+        }
+        Ok(current)
+    }
+
     /// Map a JBD2 commit error to an `FfsError` with context.
     fn map_journal_commit_error(
         txn_id: u64,
@@ -78655,6 +78701,160 @@ mod tests {
             assert_eq!(error.to_errno(), libc::EIO, "FS_INFO {defect}: {error}");
             assert_eq!(dev.snapshot_bytes(), before);
         }
+    }
+
+    #[test]
+    fn btrfs_dev_info_tracks_live_chunk_allocation() {
+        let Some((fs, dev, _tmp, _image)) = open_writable_btrfs_mkfs(128) else {
+            eprintln!(
+                "SCENARIO_RESULT|scenario_id=btrfs_dev_info_live_allocation|outcome=SKIP|reason=format_tool_unavailable"
+            );
+            return;
+        };
+        let cx = Cx::for_testing();
+        let FsFlavor::Btrfs(sb) = &fs.flavor else {
+            panic!("expected btrfs");
+        };
+        let backing = read_btrfs_backing_device_item(&cx, &dev, sb).unwrap();
+        let before = fs
+            .get_btrfs_dev_info(&cx, &mut RequestScope::empty(), backing.devid, [0; 16])
+            .unwrap();
+        let before_used = u64::from_ne_bytes(before[24..32].try_into().unwrap());
+        let length = ffs_btrfs::BTRFS_STRIPE_LEN;
+        {
+            let mut alloc = fs.require_btrfs_alloc_state().unwrap().write();
+            assert!(alloc.chunk_trees_authoritative);
+            let chunks = ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree).unwrap();
+            let logical = chunks
+                .iter()
+                .map(|chunk| chunk.key.offset + chunk.length)
+                .max()
+                .unwrap()
+                .next_multiple_of(length);
+            let physical = chunks
+                .iter()
+                .flat_map(|chunk| {
+                    chunk
+                        .stripes
+                        .iter()
+                        .map(|stripe| stripe.offset + chunk.length)
+                })
+                .max()
+                .unwrap()
+                .next_multiple_of(length);
+            let plan = ffs_btrfs::plan_chunk_allocation(&ffs_btrfs::ChunkAllocationRequest {
+                kind: ffs_btrfs::ChunkKind::Data,
+                logical,
+                length,
+                devid: backing.devid,
+                physical,
+                dev_total_bytes: backing.total_bytes,
+                dev_bytes_used_before: before_used,
+                sector_size: backing.sector_size,
+                chunk_tree_uuid: sb.fsid,
+                dev_uuid: backing.uuid,
+            })
+            .unwrap();
+            let state = &mut *alloc;
+            ffs_btrfs::apply_chunk_allocation(
+                &plan,
+                &mut state.chunk_tree,
+                &mut state.dev_tree,
+                &mut state.extent_alloc,
+                None,
+            )
+            .unwrap();
+            state.chunk_trees_dirty = true;
+        }
+        let after = fs
+            .get_btrfs_dev_info(&cx, &mut RequestScope::empty(), backing.devid, backing.uuid)
+            .unwrap();
+        assert_eq!(
+            u64::from_ne_bytes(after[24..32].try_into().unwrap()),
+            before_used + length,
+            "the new SINGLE chunk reserves exactly its length on the device"
+        );
+        assert_eq!(&after[..24], &before[..24]);
+        assert_eq!(&after[32..], &before[32..]);
+        assert_eq!(
+            read_btrfs_backing_device_item(&cx, &dev, sb).unwrap(),
+            backing,
+            "live accounting must be visible before superblock writeback"
+        );
+        eprintln!("SCENARIO_RESULT|scenario_id=btrfs_dev_info_live_allocation|outcome=PASS");
+    }
+
+    #[test]
+    fn btrfs_dev_info_rejects_untrustworthy_live_accounting() {
+        let Some((fs, dev, _tmp, _image)) = open_writable_btrfs_mkfs(128) else {
+            eprintln!(
+                "SCENARIO_RESULT|scenario_id=btrfs_dev_info_live_corruption|outcome=SKIP|reason=format_tool_unavailable"
+            );
+            return;
+        };
+        let cx = Cx::for_testing();
+        let FsFlavor::Btrfs(sb) = &fs.flavor else {
+            panic!("expected btrfs");
+        };
+        let backing = read_btrfs_backing_device_item(&cx, &dev, sb).unwrap();
+        let key = BtrfsKey {
+            objectid: ffs_ondisk::btrfs::BTRFS_DEV_ITEMS_OBJECTID,
+            item_type: ffs_ondisk::btrfs::BTRFS_DEV_ITEM_KEY,
+            offset: backing.devid,
+        };
+        let original = fs
+            .require_btrfs_alloc_state()
+            .unwrap()
+            .read()
+            .chunk_tree
+            .get(&key)
+            .unwrap();
+        for defect in [
+            "devid",
+            "uuid",
+            "fsid",
+            "accounting",
+            "truncated",
+            "missing",
+            "partial",
+        ] {
+            let mut bytes = original.clone();
+            match defect {
+                "devid" => bytes[..8].copy_from_slice(&(backing.devid + 1).to_le_bytes()),
+                "uuid" => bytes[66] ^= 1,
+                "fsid" => bytes[82] ^= 1,
+                "accounting" => {
+                    bytes[16..24].copy_from_slice(&(backing.total_bytes + 1).to_le_bytes())
+                }
+                "truncated" => bytes.truncate(97),
+                _ => {}
+            }
+            {
+                let mut alloc = fs.require_btrfs_alloc_state().unwrap().write();
+                alloc.chunk_trees_authoritative = defect != "partial";
+                alloc.chunk_tree.upsert(key, &bytes).unwrap();
+                if defect == "missing" {
+                    alloc.chunk_tree.remove_many(&[key]).unwrap();
+                }
+            }
+            let error = fs
+                .get_btrfs_dev_info(&cx, &mut RequestScope::empty(), backing.devid, [0; 16])
+                .unwrap_err();
+            assert_eq!(
+                error.to_errno(),
+                if defect == "partial" {
+                    libc::EOPNOTSUPP
+                } else {
+                    libc::EIO
+                },
+                "{defect}: {error}"
+            );
+        }
+        assert_eq!(
+            read_btrfs_backing_device_item(&cx, &dev, sb).unwrap(),
+            backing
+        );
+        eprintln!("SCENARIO_RESULT|scenario_id=btrfs_dev_info_live_corruption|outcome=PASS");
     }
 
     #[test]

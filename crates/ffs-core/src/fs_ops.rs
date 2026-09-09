@@ -3461,7 +3461,7 @@ impl FsOps for OpenFs {
                 "BTRFS_IOC_DEV_INFO is not supported on ext4 filesystems".to_owned(),
             )),
             FsFlavor::Btrfs(sb) => {
-                let device = read_btrfs_backing_device_item(cx, self.dev.as_ref(), sb)?;
+                let device = self.current_btrfs_backing_device_item(cx, sb)?;
                 encode_btrfs_dev_info_args(&device, devid_in, &uuid_in)
             }
         }
