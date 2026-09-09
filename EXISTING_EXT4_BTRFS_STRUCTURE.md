@@ -2499,6 +2499,12 @@ For metadata blocks, verification includes:
     Each segment must return exactly its requested length; a short mirror
     read is a failed attempt and may fall back to another copy of that segment.
     RAID5/6 parity is not a readable mirror and requires separate reconstruction.
+12. `BTRFS_IOC_DEV_INFO` reports device-item identity and device accounting,
+    not filesystem-wide UUID or byte totals. The embedded device item starts
+    at superblock offset `0xC9`. Device IDs need not be contiguous; lookup
+    requires an exact ID, including when the requested ID is zero. A nonzero
+    UUID adds an exact UUID constraint. See Linux v6.19 `fs/btrfs/volumes.c`
+    (`dev_args_match_device`) and `fs/btrfs/ioctl.c` (`btrfs_ioctl_dev_info`).
 
 ### 16.3 Key Implementation Patterns
 

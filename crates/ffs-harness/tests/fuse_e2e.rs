@@ -13861,6 +13861,26 @@ fn btrfs_openfs_ioctl_dev_info_payload_contract() {
 
     let tmp = TempDir::new().expect("tmpdir");
     let image = create_btrfs_test_image(tmp.path());
+    // Read the mkfs-produced device fields independently of the parser and
+    // ioctl under test. A nonzero UUID alone would accept an invented fsid.
+    let mut backing = fs::File::open(&image).expect("open backing image");
+    backing
+        .seek(SeekFrom::Start(65_536))
+        .expect("seek superblock");
+    let mut superblock = [0_u8; 4096];
+    backing
+        .read_exact(&mut superblock)
+        .expect("read superblock");
+    let item = &superblock[0xC9..0x12B];
+    let expected_devid = u64::from_le_bytes(item[..8].try_into().unwrap());
+    let expected_total = u64::from_le_bytes(item[8..16].try_into().unwrap());
+    let expected_used = u64::from_le_bytes(item[16..24].try_into().unwrap());
+    let expected_uuid: [u8; 16] = item[66..82].try_into().unwrap();
+    let fsid: [u8; 16] = superblock[0x20..0x30].try_into().unwrap();
+    assert_ne!(
+        expected_uuid, fsid,
+        "mkfs device UUID must differ from fsid"
+    );
     let cx = Cx::for_testing();
     let opts = OpenOptions {
         skip_validation: false,
@@ -13869,9 +13889,14 @@ fn btrfs_openfs_ioctl_dev_info_payload_contract() {
     };
     let fs = OpenFs::open_with_options(&cx, &image, &opts).expect("open btrfs image");
 
-    let wildcard =
-        <OpenFs as FsOps>::get_btrfs_dev_info(&fs, &cx, &mut RequestScope::empty(), 0, [0_u8; 16])
-            .expect("wildcard DEV_INFO lookup");
+    let wildcard = <OpenFs as FsOps>::get_btrfs_dev_info(
+        &fs,
+        &cx,
+        &mut RequestScope::empty(),
+        expected_devid,
+        [0_u8; 16],
+    )
+    .expect("DEV_INFO lookup by ID with wildcard UUID");
     assert_eq!(wildcard.len(), BTRFS_DEV_INFO_SIZE);
 
     let devid = u64::from_ne_bytes(wildcard[0x00..0x08].try_into().expect("devid bytes"));
@@ -13880,8 +13905,10 @@ fn btrfs_openfs_ioctl_dev_info_payload_contract() {
     let total_bytes =
         u64::from_ne_bytes(wildcard[0x20..0x28].try_into().expect("total_bytes bytes"));
 
-    assert_eq!(devid, 1, "single-device btrfs should report devid 1");
-    assert_ne!(uuid, [0_u8; 16], "device uuid/fsid should be populated");
+    assert_eq!(devid, expected_devid);
+    assert_eq!(uuid, expected_uuid);
+    assert_eq!(bytes_used, expected_used);
+    assert_eq!(total_bytes, expected_total);
     assert!(bytes_used > 0, "bytes_used should be non-zero");
     assert!(
         total_bytes >= bytes_used,
@@ -13907,6 +13934,15 @@ fn btrfs_openfs_ioctl_dev_info_payload_contract() {
         <OpenFs as FsOps>::get_btrfs_dev_info(&fs, &cx, &mut RequestScope::empty(), 2, [0_u8; 16])
             .expect_err("unknown DEV_INFO devid should fail");
     assert_eq!(missing.to_errno(), libc::ENODEV);
+    let wrong_uuid = fs
+        .get_btrfs_dev_info(&cx, &mut RequestScope::empty(), devid, fsid)
+        .expect_err("filesystem UUID is not a device UUID");
+    assert_eq!(wrong_uuid.to_errno(), libc::ENODEV);
+    let zero_id = fs
+        .get_btrfs_dev_info(&cx, &mut RequestScope::empty(), 0, [0; 16])
+        .expect_err("zero device ID is not a wildcard");
+    assert_eq!(zero_id.to_errno(), libc::ENODEV);
+    emit_scenario_result("btrfs_dev_info_backing_device_identity", "PASS", None);
 }
 
 #[test]
@@ -13928,6 +13964,7 @@ BTRFS_DEV_INFO_PATH_OFFSET = 0x0c00
 fd = os.open({mnt:?}, os.O_RDONLY | os.O_DIRECTORY)
 try:
     wildcard = bytearray(BTRFS_DEV_INFO_SIZE)
+    struct.pack_into('<Q', wildcard, 0x00, 1)
     fcntl.ioctl(fd, BTRFS_IOC_DEV_INFO, wildcard, True)
 
     devid, = struct.unpack_from('<Q', wildcard, 0x00)
@@ -13936,7 +13973,7 @@ try:
     path = bytes(wildcard[BTRFS_DEV_INFO_PATH_OFFSET:])
 
     assert devid == 1, "single-device btrfs should report canonical devid 1, got %d" % devid
-    assert uuid != bytes(16), "device uuid/fsid should be populated"
+    assert uuid != bytes(16), "device uuid should be populated"
     assert bytes_used > 0, "bytes_used should be non-zero"
     assert total_bytes >= bytes_used, "total_bytes should cover bytes_used"
     assert path == bytes(len(path)), "FrankenFS image-backed DEV_INFO path should be empty"
@@ -13947,14 +13984,15 @@ try:
     fcntl.ioctl(fd, BTRFS_IOC_DEV_INFO, exact, True)
     assert exact[:0x28] == wildcard[:0x28], "explicit devid+uuid lookup should return same device"
 
-    missing = bytearray(BTRFS_DEV_INFO_SIZE)
-    struct.pack_into('<Q', missing, 0x00, 2)
-    try:
-        fcntl.ioctl(fd, BTRFS_IOC_DEV_INFO, missing, True)
-    except OSError as exc:
-        assert exc.errno == errno.ENODEV, "unknown devid should return ENODEV, got %d" % exc.errno
-    else:
-        raise AssertionError("unknown devid unexpectedly succeeded")
+    for missing_id in (0, 2):
+        missing = bytearray(BTRFS_DEV_INFO_SIZE)
+        struct.pack_into('<Q', missing, 0x00, missing_id)
+        try:
+            fcntl.ioctl(fd, BTRFS_IOC_DEV_INFO, missing, True)
+        except OSError as exc:
+            assert exc.errno == errno.ENODEV, "unknown devid should return ENODEV, got %d" % exc.errno
+        else:
+            raise AssertionError("unknown devid unexpectedly succeeded")
 
     print("devid=%d bytes_used=%d total_bytes=%d uuid=%s" % (devid, bytes_used, total_bytes, uuid.hex()))
     print("PASS")
@@ -13979,7 +14017,7 @@ finally:
         emit_scenario_result(
             "btrfs_ioctl_dev_info_mounted_path",
             "PASS",
-            Some("wildcard_exact_and_missing_device_contract"),
+            Some("exact_id_uuid_and_missing_device_contract"),
         );
     });
 }

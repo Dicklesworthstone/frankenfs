@@ -104,6 +104,11 @@ reconstruction, or multi-device mutation support in `OpenFs`.
 `OpenFs::enable_writes` refuses any device count other than one and any known
 chunk profile other than Single/DUP before loading mutable allocation state.
 Skipping read validation does not bypass this write-admission check.
+`OpenFs::get_btrfs_dev_info` reads the backing superblock through the request's
+`Cx`, verifies its checksum, parses the embedded device item, and checks its
+filesystem UUID before encoding device ID, device UUID, and on-disk device
+accounting. This identifies the one backing image; it does not enumerate or
+validate a mounted multi-device set.
 
 ---
 

@@ -20363,25 +20363,22 @@ fn btrfs_dev_info_enodev() -> FfsError {
     FfsError::Io(std::io::Error::from_raw_os_error(libc::ENODEV))
 }
 
-/// Encode a `struct btrfs_ioctl_dev_info_args` reply from the btrfs
-/// superblock, validating the caller-supplied `devid` + `uuid` lookup keys.
+/// Encode a `struct btrfs_ioctl_dev_info_args` reply from the backing device's
+/// DEV_ITEM, validating the caller-supplied `devid` + `uuid` lookup keys.
 ///
 /// Kernel semantics (from `btrfs_find_device`): the caller asks for *a*
-/// device identified by either `devid` (non-zero) or `uuid` (non-all-zero)
-/// or both.  For the single-device btrfs images FrankenFS currently serves
-/// we accept:
-///   * `devid == 0 || devid == 1` — `0` means "don't filter by devid",
-///     `1` is the canonical single-device id ext4-era btrfs tools assume.
-///   * `uuid` all-zero (don't filter) or `uuid == sb.fsid` (the device UUID
-///     for a single-device volume is the filesystem UUID).
+/// device identified by `devid`, optionally constrained by a nonzero `uuid`.
+/// A zero UUID does not filter; the device ID must always match, including
+/// when the supplied ID is zero. Device IDs need not be contiguous and the
+/// device UUID is distinct from the filesystem UUID, even on a single-device filesystem.
 ///
 /// Any other combination returns `ENODEV`, matching the kernel's
 /// "no such device" rejection path.
 ///
 /// Layout of the 4096-byte reply:
 /// ```text
-///   0x0000  __u64     devid            (echoed)
-///   0x0008  __u8[16]  uuid             (= sb.fsid for single-device volumes)
+///   0x0000  __u64     devid            (device item ID)
+///   0x0008  __u8[16]  uuid             (device UUID)
 ///   0x0018  __u64     bytes_used
 ///   0x0020  __u64     total_bytes
 ///   0x0028  __u64[379] unused          (zero)
@@ -20389,24 +20386,23 @@ fn btrfs_dev_info_enodev() -> FfsError {
 ///                                      backing block-device path to report)
 /// ```
 fn encode_btrfs_dev_info_args(
-    sb: &ffs_ondisk::BtrfsSuperblock,
+    device: &ffs_ondisk::BtrfsDevItem,
     devid_in: u64,
     uuid_in: &[u8; 16],
 ) -> Result<Vec<u8>, FfsError> {
-    const CANONICAL_DEVID: u64 = 1;
-    if devid_in != 0 && devid_in != CANONICAL_DEVID {
+    if devid_in != device.devid {
         return Err(btrfs_dev_info_enodev());
     }
     let uuid_is_wildcard = uuid_in.iter().all(|b| *b == 0);
-    if !uuid_is_wildcard && uuid_in != &sb.fsid {
+    if !uuid_is_wildcard && uuid_in != &device.uuid {
         return Err(btrfs_dev_info_enodev());
     }
 
     let mut buf = vec![0_u8; BTRFS_DEV_INFO_ARGS_SIZE];
-    buf[0x00..0x08].copy_from_slice(&CANONICAL_DEVID.to_ne_bytes());
-    buf[0x08..0x18].copy_from_slice(&sb.fsid);
-    buf[0x18..0x20].copy_from_slice(&sb.bytes_used.to_ne_bytes());
-    buf[0x20..0x28].copy_from_slice(&sb.total_bytes.to_ne_bytes());
+    buf[0x00..0x08].copy_from_slice(&device.devid.to_ne_bytes());
+    buf[0x08..0x18].copy_from_slice(&device.uuid);
+    buf[0x18..0x20].copy_from_slice(&device.bytes_used.to_ne_bytes());
+    buf[0x20..0x28].copy_from_slice(&device.total_bytes.to_ne_bytes());
     // `unused[379]` (0x28..0x0C00) stays zeroed.  `path[1024]` (0x0C00..4096)
     // also stays zeroed — FrankenFS serves btrfs images out of a backing
     // file, not a /dev/* node, so there is no meaningful device path to
@@ -78537,6 +78533,93 @@ mod tests {
     }
 
     // ── Btrfs write-path integration tests ────────────────────────────
+
+    #[test]
+    fn btrfs_dev_info_uses_device_identity_and_accounting() {
+        let cx = Cx::for_testing();
+        let mut image = build_btrfs_fsops_image();
+        let sb_offset = BTRFS_SUPER_INFO_OFFSET;
+        let item = sb_offset + 0xC9;
+        let fsid: [u8; 16] = image[sb_offset + 0x20..sb_offset + 0x30]
+            .try_into()
+            .unwrap();
+        let uuid = [0xA7_u8; 16];
+        assert_ne!(uuid, fsid);
+        image[item..item + 8].copy_from_slice(&7_u64.to_le_bytes());
+        image[item + 8..item + 16].copy_from_slice(&123_456_u64.to_le_bytes());
+        image[item + 16..item + 24].copy_from_slice(&8192_u64.to_le_bytes());
+        image[item + 66..item + 82].copy_from_slice(&uuid);
+        image[item + 82..item + 98].copy_from_slice(&fsid);
+        let checksum = ffs_types::crc32c(&image[sb_offset + 0x20..sb_offset + 4096]);
+        image[sb_offset..sb_offset + 4].copy_from_slice(&checksum.to_le_bytes());
+        let dev = TestDevice::from_vec(image.clone());
+        let fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+        for (devid, key) in [(7, [0; 16]), (7, uuid)] {
+            let reply = fs
+                .get_btrfs_dev_info(&cx, &mut RequestScope::empty(), devid, key)
+                .unwrap();
+            assert_eq!(reply.len(), BTRFS_DEV_INFO_ARGS_SIZE);
+            assert_eq!(&reply[..8], &7_u64.to_ne_bytes());
+            assert_eq!(&reply[8..24], &uuid);
+            assert_eq!(&reply[24..32], &8192_u64.to_ne_bytes());
+            assert_eq!(&reply[32..40], &123_456_u64.to_ne_bytes());
+            assert!(reply[40..].iter().all(|&byte| byte == 0));
+        }
+        for (devid, key) in [
+            (0, [0; 16]),
+            (0, uuid),
+            (1, [0; 16]),
+            (1, uuid),
+            (7, [0xD4; 16]),
+        ] {
+            let error = fs
+                .get_btrfs_dev_info(&cx, &mut RequestScope::empty(), devid, key)
+                .unwrap_err();
+            assert_eq!(error.to_errno(), libc::ENODEV);
+        }
+        assert_eq!(dev.snapshot_bytes(), image);
+    }
+
+    #[test]
+    fn btrfs_dev_info_rejects_corrupt_identity() {
+        let cx = Cx::for_testing();
+        for defect in ["checksum", "fsid", "devid", "accounting"] {
+            let mut image = build_btrfs_fsops_image();
+            let sb_offset = BTRFS_SUPER_INFO_OFFSET;
+            let item = sb_offset + 0xC9;
+            let fsid: [u8; 16] = image[sb_offset + 0x20..sb_offset + 0x30]
+                .try_into()
+                .unwrap();
+            image[item..item + 8].copy_from_slice(&7_u64.to_le_bytes());
+            image[item + 8..item + 16].copy_from_slice(&123_456_u64.to_le_bytes());
+            image[item + 16..item + 24].copy_from_slice(&8192_u64.to_le_bytes());
+            image[item + 66..item + 82].fill(0xA7);
+            image[item + 82..item + 98].copy_from_slice(&fsid);
+            match defect {
+                "fsid" => image[item + 82] ^= 1,
+                "devid" => image[item..item + 8].fill(0),
+                "accounting" => {
+                    image[item + 16..item + 24].copy_from_slice(&123_457_u64.to_le_bytes())
+                }
+                _ => {}
+            }
+            let checksum = ffs_types::crc32c(&image[sb_offset + 0x20..sb_offset + 4096]);
+            image[sb_offset..sb_offset + 4].copy_from_slice(&checksum.to_le_bytes());
+            let dev = TestDevice::from_vec(image);
+            let fs =
+                OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+            if defect == "checksum" {
+                dev.write_all_at(&cx, ByteOffset(u64::try_from(item + 66).unwrap()), &[0xA6])
+                    .unwrap();
+            }
+            let before = dev.snapshot_bytes();
+            let error = fs
+                .get_btrfs_dev_info(&cx, &mut RequestScope::empty(), 0, [0; 16])
+                .unwrap_err();
+            assert_eq!(error.to_errno(), libc::EIO, "{defect}: {error}");
+            assert_eq!(dev.snapshot_bytes(), before);
+        }
+    }
 
     #[test]
     fn btrfs_enable_writes_rejects_multi_device_before_mutation() {

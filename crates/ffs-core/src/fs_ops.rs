@@ -3440,7 +3440,7 @@ impl FsOps for OpenFs {
 
     fn get_btrfs_dev_info(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         _scope: &mut RequestScope,
         devid_in: u64,
         uuid_in: [u8; 16],
@@ -3449,7 +3449,26 @@ impl FsOps for OpenFs {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_DEV_INFO is not supported on ext4 filesystems".to_owned(),
             )),
-            FsFlavor::Btrfs(sb) => encode_btrfs_dev_info_args(sb, devid_in, &uuid_in),
+            FsFlavor::Btrfs(sb) => {
+                let region = read_btrfs_superblock_region(cx, self.dev.as_ref())?;
+                let corrupt = |detail: String| FfsError::Corruption {
+                    block: u64::try_from(BTRFS_SUPER_INFO_OFFSET).unwrap()
+                        / u64::from(sb.sectorsize),
+                    detail,
+                };
+                ffs_ondisk::verify_btrfs_superblock_checksum(&region)
+                    .map_err(|error| corrupt(error.to_string()))?;
+                // The superblock embeds this backing device's 98-byte DEV_ITEM
+                // at 0xc9. Filesystem totals and fsid are not device fields.
+                let device = ffs_ondisk::parse_dev_item(
+                    &region[0xC9..0xC9 + ffs_ondisk::btrfs::BTRFS_DEV_ITEM_SIZE],
+                )
+                .map_err(|error| corrupt(error.to_string()))?;
+                if device.fsid != sb.fsid {
+                    return Err(corrupt("device item filesystem UUID mismatch".to_owned()));
+                }
+                encode_btrfs_dev_info_args(&device, devid_in, &uuid_in)
+            }
         }
     }
 
