@@ -10740,6 +10740,7 @@ impl OpenFs {
         cx: &Cx,
         root_logical: u64,
     ) -> Result<Vec<BtrfsLeafEntry>, FfsError> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let ctx = self
             .btrfs_context()
             .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?;
@@ -10748,8 +10749,9 @@ impl OpenFs {
 
         let provider = |logical: u64| self.btrfs_read_parsed_node(cx, logical);
 
-        walk_tree_parallel_with_nodes(&provider, root_logical, nodesize)
-            .map_err(|e| parse_to_ffs_error(&e))
+        let result = walk_tree_parallel_with_nodes(&provider, root_logical, nodesize);
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        result.map_err(|e| parse_to_ffs_error(&e))
     }
 
     /// Logical addresses of every node in the tree rooted at `root_logical`.
@@ -10760,6 +10762,7 @@ impl OpenFs {
     /// therefore invisible to the allocator (bd-mqb9t). Serial rather than
     /// parallel: it runs twice at mount and needs a plain `&mut` accumulator.
     fn btrfs_tree_node_addresses(&self, cx: &Cx, root_logical: u64) -> Result<Vec<u64>, FfsError> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let nodesize = self
             .btrfs_context()
             .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?
@@ -10770,8 +10773,9 @@ impl OpenFs {
                 seen.push(logical);
                 self.btrfs_read_parsed_node(cx, logical)
             };
-            ffs_btrfs::walk_tree_with_nodes(&mut provider, root_logical, nodesize)
-                .map_err(|e| parse_to_ffs_error(&e))?;
+            let result = ffs_btrfs::walk_tree_with_nodes(&mut provider, root_logical, nodesize);
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            result.map_err(|e| parse_to_ffs_error(&e))?;
         }
         Ok(seen)
     }
@@ -10788,6 +10792,12 @@ impl OpenFs {
         cx: &Cx,
         logical: u64,
     ) -> Result<Arc<BtrfsParsedNode>, ParseError> {
+        // Walkers use ParseError providers; operation boundaries restore the
+        // runtime cancellation error before interpreting any parser failure.
+        cx.checkpoint().map_err(|_| ParseError::InvalidField {
+            field: "btrfs_device_read",
+            reason: "metadata read cancelled",
+        })?;
         let cacheable = self.btrfs_alloc_state.is_none();
         if cacheable {
             BTRFS_NODE_LOOKUPS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -10856,6 +10866,10 @@ impl OpenFs {
                 offset: 0,
                 actual: 0,
             })?;
+        cx.checkpoint().map_err(|_| ParseError::InvalidField {
+            field: "btrfs_device_read",
+            reason: "metadata read cancelled",
+        })?;
         // Verify + parse ONCE, before the node enters the cache, so every cached
         // node is already-verified — a hit never skips a checksum that was not
         // already checked.
@@ -10947,6 +10961,7 @@ impl OpenFs {
         lo: BtrfsKey,
         hi: BtrfsKey,
     ) -> Result<Vec<BtrfsLeafEntry>, FfsError> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let ctx = self
             .btrfs_context()
             .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?;
@@ -10955,8 +10970,9 @@ impl OpenFs {
 
         let provider = |logical: u64| self.btrfs_read_parsed_node(cx, logical);
 
-        walk_tree_range_parallel_with_nodes(&provider, root_logical, nodesize, lo, hi)
-            .map_err(|e| parse_to_ffs_error(&e))
+        let result = walk_tree_range_parallel_with_nodes(&provider, root_logical, nodesize, lo, hi);
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        result.map_err(|e| parse_to_ffs_error(&e))
     }
 
     /// Should this descent REPLACE the retained floor leaf? (bd-79li3)
@@ -11032,6 +11048,7 @@ impl OpenFs {
         root_logical: u64,
         target: BtrfsKey,
     ) -> Result<Option<BtrfsLeafEntry>, FfsError> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let ctx = self
             .btrfs_context()
             .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?;
@@ -11070,10 +11087,11 @@ impl OpenFs {
                     .map(|slot| Arc::clone(&slot.leaf))
             };
             if let Some(leaf) = hit {
+                let result = ffs_btrfs::floor_in_leaf(leaf.as_ref(), &target);
+                cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
                 self.btrfs_floor_memo_consecutive_misses
                     .store(0, std::sync::atomic::Ordering::Relaxed);
-                return ffs_btrfs::floor_in_leaf(leaf.as_ref(), &target)
-                    .map_err(|e| parse_to_ffs_error(&e));
+                return result.map_err(|e| parse_to_ffs_error(&e));
             }
         }
 
@@ -11086,8 +11104,9 @@ impl OpenFs {
             reached = Some(Arc::clone(&node));
             Ok(node)
         };
-        let entry = walk_tree_floor_with_nodes(&mut provider, root_logical, nodesize, target)
-            .map_err(|e| parse_to_ffs_error(&e))?;
+        let result = walk_tree_floor_with_nodes(&mut provider, root_logical, nodesize, target);
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let entry = result.map_err(|e| parse_to_ffs_error(&e))?;
         if memoizable
             && self.btrfs_floor_memo_should_replace()
             && let Some(node) = reached
@@ -52958,6 +52977,99 @@ mod tests {
     }
 
     // ── Btrfs OpenFs tests ──────────────────────────────────────────────
+
+    #[test]
+    fn btrfs_metadata_walk_cancellation_cold_and_cached() {
+        for cached in [false, true] {
+            let cx = Cx::for_testing();
+            let fs = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(build_btrfs_fsops_image())),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            let root = fs.btrfs_superblock().unwrap().root;
+            let entries = fs.walk_btrfs_tree(&cx, root).unwrap();
+            let key = entries[0].key;
+            assert!(fs.walk_btrfs_tree_floor(&cx, root, key).unwrap().is_some());
+            if !cached {
+                fs.btrfs_test_clear_node_cache();
+            }
+            cx.set_cancel_requested(true);
+            let results = [
+                fs.walk_btrfs_tree(&cx, root).map(|_| ()),
+                fs.walk_btrfs_tree_range(&cx, root, key, key).map(|_| ()),
+                fs.walk_btrfs_tree_floor(&cx, root, key).map(|_| ()),
+                fs.btrfs_tree_node_addresses(&cx, root).map(|_| ()),
+            ];
+            for (operation, result) in results.into_iter().enumerate() {
+                assert!(
+                    matches!(result, Err(FfsError::Cancelled)),
+                    "cached={cached} operation={operation}: {result:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn btrfs_metadata_walk_cancellation_during_device_read() {
+        for operation in 0..4 {
+            let cx = Cx::for_testing();
+            let image = build_btrfs_fsops_image();
+            let mut fs = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(image.clone())),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            let root = fs.btrfs_superblock().unwrap().root;
+            let key = fs.walk_btrfs_tree(&cx, root).unwrap()[0].key;
+            fs.btrfs_test_clear_node_cache();
+            let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let counted = Arc::clone(&calls);
+            let devid = fs.btrfs_context().unwrap().chunks[0].stripes[0].devid;
+            let mut readers = ffs_btrfs::BtrfsDeviceSet::new();
+            readers
+                .add_device(
+                    devid,
+                    Box::new(move |cx, offset, len| {
+                        counted.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        // Return valid fixture bytes, but cancel while I/O is in flight.
+                        cx.set_cancel_requested(true);
+                        let start = usize::try_from(offset).unwrap();
+                        Ok(image[start..start + len].to_vec())
+                    }),
+                )
+                .unwrap();
+            fs.btrfs_devices = Some(BtrfsReadDevices {
+                readers,
+                identities: Default::default(),
+            });
+            let result = match operation {
+                0 => fs.walk_btrfs_tree(&cx, root).map(|_| ()),
+                1 => fs
+                    .walk_btrfs_tree_range(
+                        &cx,
+                        root,
+                        key,
+                        BtrfsKey {
+                            objectid: u64::MAX,
+                            item_type: u8::MAX,
+                            offset: u64::MAX,
+                        },
+                    )
+                    .map(|_| ()),
+                2 => fs.walk_btrfs_tree_floor(&cx, root, key).map(|_| ()),
+                _ => fs.btrfs_tree_node_addresses(&cx, root).map(|_| ()),
+            };
+            assert_eq!(calls.load(std::sync::atomic::Ordering::Relaxed), 1);
+            assert!(
+                matches!(result, Err(FfsError::Cancelled)),
+                "operation={operation}: {result:?}"
+            );
+            assert!(fs.btrfs_parsed_node_cache.get(&root).is_none());
+        }
+    }
 
     #[test]
     fn btrfs_metadata_mirror_cancellation_stops_before_next_copy() {

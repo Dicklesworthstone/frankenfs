@@ -119,7 +119,13 @@ filling read/decompression buffers, so the bytes returned come from the validate
 copy. Recovery uses sector-sized buffers rather than retaining whole extents.
 Kernel-written RAID1/RAID10/C3/C4 ordinary/zstd data recovery, unaligned reads, all-copy
 refusal, verification opt-out and NODATASUM behavior are covered through core
-and FUSE tests. Clean multi-device images use this routing even with no extra
+and FUSE tests. Metadata whole-tree, range, floor and node-address walks check
+the caller's cancellation before cache access and after traversal, before
+converting parser errors. A cancelled operation returns `FfsError::Cancelled`,
+including empty ranges and cached results; cancellation observed during I/O
+must not publish a parsed node or floor memo. Parser error types remain about
+format interpretation, with runtime cancellation handled at the operation boundary.
+Clean multi-device images use this routing even with no extra
 paths: a lone RAID1 survivor is admitted only after every committed chunk has
 device coverage. RAID1/C3/C4 need a surviving copy; RAID10 needs one survivor in each
 adjacent `sub_stripes` mirror group, after validating stripe geometry. Other
