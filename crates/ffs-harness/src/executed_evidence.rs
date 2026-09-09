@@ -552,6 +552,38 @@ pub struct TestResults {
 }
 
 impl TestResults {
+    // RCH reserves stdout for its own protocol and forwards both worker streams
+    // to stderr. Cargo/RCH diagnostics may surround the libtest JSON stream.
+    // Keep the event parser strict: never select only successful test events.
+    fn parse_rch(stderr: &[u8]) -> Self {
+        let Ok(transcript) = std::str::from_utf8(stderr) else {
+            return Self {
+                error: Some("RCH transcript is not UTF-8".to_owned()),
+                ..Self::default()
+            };
+        };
+        let mut events = String::new();
+        let mut in_suite = false;
+        for line in transcript.lines() {
+            let line = line.trim();
+            if line.starts_with('{') {
+                if let Ok(event) = serde_json::from_str::<serde_json::Value>(line)
+                    && event["type"] == "suite"
+                {
+                    in_suite = event["event"] == "started";
+                }
+                events.push_str(line);
+                events.push('\n');
+            } else if in_suite && !line.is_empty() && !line.starts_with("[RCH]") {
+                return Self {
+                    error: Some("unexpected output inside RCH libtest stream".to_owned()),
+                    ..Self::default()
+                };
+            }
+        }
+        Self::parse(events.as_bytes())
+    }
+
     fn parse(stdout: &[u8]) -> Self {
         let mut results = Self::default();
         if let Err(error) = results.read_stream(stdout) {
@@ -675,7 +707,11 @@ impl TestRunEvidence {
     pub fn run(command: &str, args: &[&str]) -> Self {
         let before = SourceIdentity::capture();
         let (execution, stdout, stderr) = ExecutedEvidence::run_captured(command, args);
-        let results = TestResults::parse(&stdout);
+        let results = if command == "rch" {
+            TestResults::parse_rch(&stderr)
+        } else {
+            TestResults::parse(&stdout)
+        };
         // Keep compiler errors, RCH diagnostics and test stderr visible.
         eprint!("{}", String::from_utf8_lossy(&stderr));
         let after = SourceIdentity::capture();
@@ -888,6 +924,47 @@ mod tests {
         assert!(stale.require_pass(&source).is_err());
         stale.execution.ran_at = u64::MAX;
         assert!(stale.require_pass(&source).is_err());
+    }
+
+    #[test]
+    fn test_evidence_reads_rch_stderr_without_discarding_bad_events() {
+        let executable = std::env::current_exe().unwrap();
+        let output = Command::new(executable)
+            .args([
+                "--exact",
+                "executed_evidence::tests::test_evidence_child_probe",
+                "-Z",
+                "unstable-options",
+                "--format=json",
+                "--show-output",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success());
+        let events = String::from_utf8(output.stdout).unwrap();
+        let transcript = format!(
+            "[RCH] remote worker\n    Finished test profile\n{events}[RCH] remote worker completed\n"
+        );
+        let results = TestResults::parse_rch(transcript.as_bytes());
+        assert!(results.error.is_none(), "{:?}", results.error);
+        assert_eq!(results.selected, 1);
+        assert_eq!(results.executed, 1);
+        assert_eq!(results.passed, 1);
+        assert!(TestResults::parse(b"").error.is_some());
+
+        for corrupt in [
+            format!("{transcript}{events}"),
+            transcript.replace("\"passed\": 1", "\"passed\": 2"),
+            format!("{transcript}{{broken JSON\n"),
+            events.lines().take(2).collect::<Vec<_>>().join("\n"),
+            events.replacen('\n', "\nunexpected output\n", 1),
+            "[RCH] no test output\n".to_owned(),
+        ] {
+            assert!(
+                TestResults::parse_rch(corrupt.as_bytes()).error.is_some(),
+                "accepted corrupt RCH transcript: {corrupt}"
+            );
+        }
     }
 
     #[test]

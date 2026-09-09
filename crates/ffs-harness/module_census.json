@@ -8,13 +8,13 @@
   },
   "summary": {
     "modules": 89,
-    "total_loc": 168742,
+    "total_loc": 169437,
     "conformance_modules": 24,
     "conformance_loc": 43194,
-    "conformance_loc_basis_points": 2560,
+    "conformance_loc_basis_points": 2549,
     "meta_modules": 65,
-    "meta_loc": 125548,
-    "meta_loc_basis_points": 7440
+    "meta_loc": 126243,
+    "meta_loc_basis_points": 7451
   },
   "modules": [
     {
@@ -130,7 +130,7 @@
     {
       "path": "src/executed_evidence.rs",
       "classification": "meta",
-      "loc": 559
+      "loc": 1187
     },
     {
       "path": "src/fault_injection_corpus.rs",
@@ -165,7 +165,7 @@
     {
       "path": "src/lib.rs",
       "classification": "meta",
-      "loc": 2300
+      "loc": 2351
     },
     {
       "path": "src/log_contract.rs",
@@ -185,7 +185,7 @@
     {
       "path": "src/main.rs",
       "classification": "meta",
-      "loc": 11200
+      "loc": 11216
     },
     {
       "path": "src/metamorphic_workload_seed_catalog.rs",
