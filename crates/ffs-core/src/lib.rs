@@ -493,7 +493,7 @@ pub struct OpenOptions {
     /// Additional backing images for clean, read-only btrfs device sets.
     /// Each image must belong to the same committed filesystem generation.
     /// A clean multi-device image uses device-set routing even when this is
-    /// empty; missing RAID1 copies are allowed only if every chunk is readable.
+    /// empty; missing RAID1/RAID10 copies require coverage of every chunk.
     pub btrfs_device_paths: Vec<std::path::PathBuf>,
     /// ext4 `data_err=` policy for ordered-mode file data writeback errors.
     pub ext4_data_err_policy: Ext4DataErrPolicy,
@@ -684,21 +684,42 @@ struct BtrfsReadDevices {
 
 impl BtrfsReadDevices {
     /// Prove device coverage for every committed chunk, not only the metadata
-    /// touched during open. For now only RAID1 permits an absent stripe: each
-    /// of its stripes covers the whole chunk. Other profiles require all their
-    /// stripe devices until their degraded mapping/reconstruction is supported.
+    /// touched during open. RAID1 needs one complete copy; RAID10 needs one
+    /// copy in every mirrored stripe group. Other profiles require all devices.
     fn validate_read_coverage(&self, chunks: &[BtrfsChunkEntry]) -> Result<(), FfsError> {
-        use ffs_ondisk::chunk_type_flags::{BTRFS_BLOCK_GROUP_RAID1, RAID_MASK};
+        use ffs_ondisk::chunk_type_flags::{
+            BTRFS_BLOCK_GROUP_RAID1, BTRFS_BLOCK_GROUP_RAID10, RAID_MASK,
+        };
         for chunk in chunks {
             let present = chunk
                 .stripes
                 .iter()
                 .filter(|stripe| self.identities.contains_key(&stripe.devid))
                 .count();
-            if present == 0
-                || (present != chunk.stripes.len()
-                    && chunk.chunk_type & RAID_MASK != BTRFS_BLOCK_GROUP_RAID1)
-            {
+            let readable = match chunk.chunk_type & RAID_MASK {
+                BTRFS_BLOCK_GROUP_RAID1 => present > 0,
+                BTRFS_BLOCK_GROUP_RAID10 => {
+                    // Use the same shape validation as actual I/O before
+                    // grouping: nonzero stripe length/count/sub_stripes,
+                    // matching vector length and exact mirror-group division.
+                    ffs_ondisk::map_logical_to_stripes(
+                        std::slice::from_ref(chunk),
+                        chunk.key.offset,
+                    )
+                    .map_err(|error| parse_to_ffs_error(&error))?
+                    .ok_or_else(|| FfsError::Format("empty RAID10 chunk".into()))?;
+                    chunk
+                        .stripes
+                        .chunks(usize::from(chunk.sub_stripes))
+                        .all(|group| {
+                            group
+                                .iter()
+                                .any(|stripe| self.identities.contains_key(&stripe.devid))
+                        })
+                }
+                _ => present > 0 && present == chunk.stripes.len(),
+            };
+            if !readable {
                 return Err(FfsError::UnsupportedFeature(format!(
                     "btrfs chunk {} lacks a supported readable device set ({present}/{} stripes attached)",
                     chunk.key.offset,
@@ -53008,6 +53029,40 @@ mod tests {
                 .to_string()
                 .contains("crosses a stripe or chunk boundary")
         );
+    }
+
+    #[test]
+    fn btrfs_raid10_admission_rejects_malformed_groups() {
+        let image = build_btrfs_image();
+        let sb = BtrfsSuperblock::parse_superblock_region(&image[65_536..]).unwrap();
+        let base = parse_sys_chunk_array(&sb.sys_chunk_array)
+            .unwrap()
+            .remove(0);
+        let devices = BtrfsReadDevices {
+            readers: ffs_btrfs::BtrfsDeviceSet::new(),
+            identities: Default::default(),
+        };
+        for (count, sub, stripe_len, field) in [
+            (4, 0, 65_536, "sub_stripes"),
+            (4, 3, 65_536, "num_stripes"),
+            (3, 2, 65_536, "num_stripes"),
+            (4, 2, 0, "stripe_len"),
+        ] {
+            let mut chunk = base.clone();
+            chunk.chunk_type = ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_RAID10;
+            chunk.num_stripes = count;
+            chunk.sub_stripes = sub;
+            chunk.stripe_len = stripe_len;
+            chunk.stripes = (1..=4)
+                .map(|devid| ffs_ondisk::BtrfsStripe {
+                    devid,
+                    offset: 0,
+                    dev_uuid: [0; 16],
+                })
+                .collect();
+            let error = devices.validate_read_coverage(&[chunk]).unwrap_err();
+            assert!(error.to_string().contains(field), "{error}");
+        }
     }
 
     /// Build a minimal synthetic btrfs image with a sys_chunk_array and a leaf

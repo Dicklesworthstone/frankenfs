@@ -120,8 +120,12 @@ Kernel-written RAID1 ordinary/zstd data recovery, unaligned reads, two-bad-copy
 refusal, verification opt-out and NODATASUM behavior are covered through core
 and FUSE tests. Clean multi-device images use this routing even with no extra
 paths: a lone RAID1 survivor is admitted only after every committed chunk has
-device coverage. Missing stripes are supported only for RAID1 with a surviving
-copy; other chunk profiles require all stripe devices. Unused missing devices
+device coverage. RAID1 needs a surviving copy; RAID10 needs one survivor in each
+adjacent `sub_stripes` mirror group, after validating stripe geometry. Other
+chunk profiles require all stripe devices. A four-device kernel RAID10 fixture
+checks all 14 nonempty proper attachment subsets, with full and stripe-crossing
+ordinary data reads plus cold FUSE mounts for supported subsets and refusal
+when an entire group is missing. Unused missing devices
 remain in the authoritative inventory. Kernel-image tests mount each RAID1
 survivor alone and reject a missing RAID0 data device despite readable mirrored
 metadata. No sibling images are discovered implicitly. Multi-device mounts require a clean
