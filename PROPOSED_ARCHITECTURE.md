@@ -110,13 +110,14 @@ stripe references. Bootstrap, parsed metadata and file-data reads use the device
 set. Kernel-written RAID0 and RAID1 images are covered through the core API and
 FUSE with each primary-device choice. Metadata reads validate each complete
 mirror's checksum, logical address and structure before caching it, retrying
-another copy on invalid content. Kernel-written RAID1 tests corrupt chunk-tree,
-root-tree and fs-tree copies independently: one corrupt copy recovers through
-FUSE; two corrupt copies fail. Checksummed file reads validate whole sectors
+another copy on invalid content. Kernel-written RAID1/RAID10/C3/C4 tests corrupt
+chunk-tree, root-tree and fs-tree copies independently: all but the final mirror
+can be corrupt and still recover through FUSE; corrupting every copy fails.
+Checksummed file reads validate whole sectors
 and retry mirrors both during the existing pre-output extent check and when
 filling read/decompression buffers, so the bytes returned come from the validated
 copy. Recovery uses sector-sized buffers rather than retaining whole extents.
-Kernel-written RAID1 ordinary/zstd data recovery, unaligned reads, two-bad-copy
+Kernel-written RAID1/RAID10/C3/C4 ordinary/zstd data recovery, unaligned reads, all-copy
 refusal, verification opt-out and NODATASUM behavior are covered through core
 and FUSE tests. Clean multi-device images use this routing even with no extra
 paths: a lone RAID1 survivor is admitted only after every committed chunk has
@@ -128,8 +129,9 @@ ordinary data reads plus cold FUSE mounts for supported subsets and refusal
 when an entire group is missing. C3/C4 validate mirror-profile geometry before
 admitting a survivor. Kernel-written three/four-device images cover every
 nonempty proper subset (6 C3 and 14 C4), plus each complete-set primary, through
-ordinary core and cold FUSE reads. Corrupt/compressed C3/C4 combinations remain
-unverified. Clean three-device RAID5 and four-device RAID6 kernel images pass
+ordinary core and cold FUSE reads. Separate corruption tests use full attachments;
+the complete corruption/missing-device/checksum-codec matrix remains unverified.
+Clean three-device RAID5 and four-device RAID6 kernel images pass
 full-file, stripe-boundary and cold FUSE reads with each primary. Their mapper
 rotates ordered data slots forward per physical row, matching Linux; it does
 not reconstruct parity, and admission still requires every stripe device.

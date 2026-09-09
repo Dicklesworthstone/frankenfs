@@ -1018,7 +1018,7 @@ btrfs uses copy-on-write B-trees addressed by logical block addresses that must 
 2. **Chunk lookup.** Find the chunk entry whose `[key.offset, key.offset + length)` range contains the target logical address.
 3. **Stripe calculation.** For single-device images, `physical = stripe.offset + (logical - chunk.key.offset)`.
 
-`--btrfs-device PATH` attaches additional devices for clean, read-only btrfs mounts. A clean multi-device image uses `BtrfsDeviceSet` even without extra paths: a surviving RAID1/C3/C4 device can open alone if every committed chunk has a supported readable copy. RAID10 requires a survivor in every mirrored stripe group; other profiles require all stripe devices. Nearby images are never discovered implicitly. Kernel-written RAID0, RAID1, RAID10, C3 and C4 images are tested through FUSE with each primary device. Metadata validates copies before caching; checksummed file reads validate each sector before copying its bytes or decompressing, retrying corrupt mirrors. RAID1 corruption recovery is tested for metadata, ordinary data and zstd data. The remaining profile/degraded matrix and dirty-image recovery remain open. Multi-device writes are deferred and refused.
+`--btrfs-device PATH` attaches additional devices for clean, read-only btrfs mounts. A clean multi-device image uses `BtrfsDeviceSet` even without extra paths: a surviving RAID1/C3/C4 device can open alone if every committed chunk has a supported readable copy. RAID10 requires a survivor in every mirrored stripe group; other profiles require all stripe devices. Nearby images are never discovered implicitly. Kernel-written RAID0, RAID1, RAID10, C3, C4, RAID5 and RAID6 images are tested through FUSE with each primary device. Metadata validates copies before caching; checksummed file reads validate each sector before copying its bytes or decompressing, retrying corrupt mirrors. RAID1/RAID10/C3/C4 corruption recovery is tested for metadata, ordinary data and zstd data, including recovery with only the last mirror healthy and refusal when all copies are corrupt. The remaining profile/degraded matrix and dirty-image recovery remain open. Multi-device writes are deferred and refused.
 
 ### Tree walk algorithm
 
@@ -3314,11 +3314,12 @@ error or the wrong byte count. It does not independently verify data checksums:
 a corrupt buffer of the correct length requires validation by the caller.
 Attached-device metadata reads validate each whole node before accepting it;
 checksum-invalid or structurally invalid copies fall back to another mirror.
-Kernel-written RAID1 tests cover corrupt chunk-tree, root-tree and fs-tree
-copies through FUSE, plus refusal when both copies are bad. Attached-device
+Kernel-written RAID1, RAID10, C3 and C4 tests cover corrupt chunk-tree, root-tree
+and fs-tree copies through FUSE. They recover with only the last mirror healthy
+and refuse when every copy is corrupt. Attached-device
 file reads preserve the pre-output extent check and also validate the exact
 sector bytes copied into the caller's window or compressed input buffer.
-RAID1 tests cover ordinary and zstd data, unaligned windows, two-bad-copy
+The same profiles cover ordinary and zstd data, unaligned windows, all-copy
 refusal, verification opt-out, and NODATASUM behavior. Missing sector checksums
 retain the existing unchecked-read policy. Sector buffers bound recovery
 memory; this path still rereads data and makes no performance claim.
@@ -3337,7 +3338,9 @@ C3/C4 also admit a surviving copy in every committed chunk, after validating
 the profile's stripe geometry. Three-device C3 and four-device C4 kernel images
 exercise all 6 and 14 nonempty proper subsets respectively, plus complete sets
 with each primary. Evidence covers ordinary full-file and unaligned core reads
-and cold FUSE reads; C3/C4 corruption and compressed-data cases remain unproven.
+and cold FUSE reads. Separate corruption tests cover metadata, ordinary/zstd
+data and NODATASUM behavior with all attachments present; they do not exhaust
+every combination of corruption and missing devices or every checksum codec.
 Use repeatable `--btrfs-device PATH` options to attach other images; no implicit
 device discovery occurs. Attachments must share
 the same committed generation and pass checksum, identity and capacity checks.

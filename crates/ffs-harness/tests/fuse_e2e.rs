@@ -14043,9 +14043,14 @@ fn btrfs_openfs_ioctl_dev_info_two_device_inventory() {
     emit_scenario_result("btrfs_dev_info_two_device_inventory", "PASS", None);
 }
 
-fn assert_btrfs_metadata_mirror_recovery(cx: &Cx, images: &[PathBuf; 2], payload: &[u8]) {
+fn assert_btrfs_metadata_mirror_recovery(
+    cx: &Cx,
+    images: &[PathBuf],
+    payload: &[u8],
+    profile: &str,
+) {
     let options = OpenOptions {
-        btrfs_device_paths: vec![images[1].clone()],
+        btrfs_device_paths: images[1..].to_vec(),
         ..OpenOptions::default()
     };
     let filesystem = OpenFs::open_with_options(cx, &images[0], &options).unwrap();
@@ -14064,7 +14069,10 @@ fn assert_btrfs_metadata_mirror_recovery(cx: &Cx, images: &[PathBuf; 2], payload
         let mapping = ffs_ondisk::map_logical_to_stripes(&chunks, logical)
             .unwrap()
             .unwrap();
-        assert_eq!(mapping.stripes.len(), 2);
+        assert_eq!(
+            mapping.stripes.len(),
+            if profile == "raid10" { 2 } else { images.len() }
+        );
         assert!(mapping.contiguous_len >= u64::from(sb.nodesize));
         let mut copies = Vec::new();
         for stripe in mapping.stripes {
@@ -14090,21 +14098,35 @@ fn assert_btrfs_metadata_mirror_recovery(cx: &Cx, images: &[PathBuf; 2], payload
             );
             copies.push((image.clone(), stripe.physical, original));
         }
-        assert_eq!(
-            copies[0].2, copies[1].2,
-            "kernel wrote identical metadata mirrors"
-        );
+        for copy in &copies[1..] {
+            assert_eq!(
+                copies[0].2, copy.2,
+                "kernel wrote identical metadata mirrors"
+            );
+        }
         let corrupt = |copy: &(PathBuf, u64, Vec<u8>)| {
             let mut file = fs::OpenOptions::new().write(true).open(&copy.0).unwrap();
             file.seek(SeekFrom::Start(copy.1)).unwrap();
             file.write_all(&[copy.2[0] ^ 1]).unwrap();
             file.sync_all().unwrap();
         };
-        corrupt(&copies[0]);
-        let lone_bad = OpenFs::open(cx, &copies[0].0).and_then(|filesystem| {
-            let attr = filesystem.lookup(cx, InodeNumber(1), std::ffi::OsStr::new("payload"))?;
-            filesystem.read(cx, attr.ino, 0, 32)
-        });
+        for copy in &copies[..copies.len() - 1] {
+            corrupt(copy);
+        }
+        let missing_healthy = OpenOptions {
+            btrfs_device_paths: images
+                .iter()
+                .filter(|path| **path != copies[0].0 && **path != copies.last().unwrap().0)
+                .cloned()
+                .collect(),
+            ..OpenOptions::default()
+        };
+        let lone_bad =
+            OpenFs::open_with_options(cx, &copies[0].0, &missing_healthy).and_then(|filesystem| {
+                let attr =
+                    filesystem.lookup(cx, InodeNumber(1), std::ffi::OsStr::new("payload"))?;
+                filesystem.read(cx, attr.ino, 0, 32)
+            });
         assert!(
             lone_bad.is_err(),
             "unattached healthy metadata mirror must not be discovered"
@@ -14143,14 +14165,14 @@ fn assert_btrfs_metadata_mirror_recovery(cx: &Cx, images: &[PathBuf; 2], payload
         wait_for_fuse_mount_ready(&mountpoint);
         assert_eq!(fs::read(mountpoint.join("payload")).unwrap(), payload);
         drop(mount);
-        corrupt(&copies[1]);
+        corrupt(copies.last().unwrap());
         let both_bad = OpenFs::open_with_options(cx, &images[0], &options).and_then(|filesystem| {
             let attr = filesystem.lookup(cx, InodeNumber(1), std::ffi::OsStr::new("payload"))?;
             filesystem.read(cx, attr.ino, 0, u32::try_from(payload.len()).unwrap())
         });
         assert!(
             both_bad.is_err(),
-            "two corrupt copies must not return data for node {logical}"
+            "all corrupt copies must not return data for node {logical}"
         );
         for (path, physical, original) in copies {
             let mut file = fs::OpenOptions::new().write(true).open(path).unwrap();
@@ -14159,19 +14181,24 @@ fn assert_btrfs_metadata_mirror_recovery(cx: &Cx, images: &[PathBuf; 2], payload
             file.sync_all().unwrap();
         }
     }
-    emit_scenario_result("btrfs_raid1_metadata_checksum_fallback", "PASS", None);
+    emit_scenario_result(
+        &format!("btrfs_{profile}_metadata_checksum_fallback"),
+        "PASS",
+        None,
+    );
 }
 
 fn assert_btrfs_data_mirror_recovery(
     cx: &Cx,
-    images: &[PathBuf; 2],
+    images: &[PathBuf],
     payload: &[u8],
     name: &str,
     compression: u8,
     datasum: bool,
+    profile: &str,
 ) {
     let options = OpenOptions {
-        btrfs_device_paths: vec![images[1].clone()],
+        btrfs_device_paths: images[1..].to_vec(),
         ..OpenOptions::default()
     };
     let filesystem = OpenFs::open_with_options(cx, &images[0], &options).unwrap();
@@ -14228,7 +14255,10 @@ fn assert_btrfs_data_mirror_recovery(
         ffs_ondisk::map_logical_to_stripes(&filesystem.btrfs_context().unwrap().chunks, logical)
             .unwrap()
             .unwrap();
-    assert_eq!(mapping.stripes.len(), 2);
+    assert_eq!(
+        mapping.stripes.len(),
+        if profile == "raid10" { 2 } else { images.len() }
+    );
     let mut copies = Vec::new();
     for stripe in mapping.stripes {
         let image = images
@@ -14254,10 +14284,9 @@ fn assert_btrfs_data_mirror_recovery(
         }
         copies.push((image.clone(), stripe.physical, original));
     }
-    assert_eq!(
-        copies[0].2, copies[1].2,
-        "kernel wrote identical data mirrors"
-    );
+    for copy in &copies[1..] {
+        assert_eq!(copies[0].2, copy.2, "kernel wrote identical data mirrors");
+    }
     drop(filesystem);
     let corrupt = |copy: &(PathBuf, u64, Vec<u8>)| {
         let mut file = fs::OpenOptions::new().write(true).open(&copy.0).unwrap();
@@ -14265,9 +14294,19 @@ fn assert_btrfs_data_mirror_recovery(
         file.write_all(&[copy.2[17] ^ 1]).unwrap();
         file.sync_all().unwrap();
     };
-    corrupt(&copies[0]);
+    for copy in &copies[..copies.len() - 1] {
+        corrupt(copy);
+    }
     if datasum {
-        let lone_bad = OpenFs::open(cx, &copies[0].0).unwrap();
+        let missing_healthy = OpenOptions {
+            btrfs_device_paths: images
+                .iter()
+                .filter(|path| **path != copies[0].0 && **path != copies.last().unwrap().0)
+                .cloned()
+                .collect(),
+            ..OpenOptions::default()
+        };
+        let lone_bad = OpenFs::open_with_options(cx, &copies[0].0, &missing_healthy).unwrap();
         let attr = lone_bad
             .lookup(cx, InodeNumber(1), std::ffi::OsStr::new(name))
             .unwrap();
@@ -14337,7 +14376,7 @@ fn assert_btrfs_data_mirror_recovery(
         );
     }
     drop(unchecked);
-    corrupt(&copies[1]);
+    corrupt(copies.last().unwrap());
     let broken = OpenFs::open_with_options(cx, &images[0], &options).unwrap();
     let attr = broken
         .lookup(cx, InodeNumber(1), std::ffi::OsStr::new(name))
@@ -14366,7 +14405,7 @@ fn assert_btrfs_data_mirror_recovery(
         file.write_all(&original).unwrap();
         file.sync_all().unwrap();
     }
-    emit_scenario_result(&format!("btrfs_raid1_data_mirror_{name}"), "PASS", None);
+    emit_scenario_result(&format!("btrfs_{profile}_data_mirror_{name}"), "PASS", None);
 }
 
 fn assert_btrfs_mirror_survivors(cx: &Cx, images: &[PathBuf], payload: &[u8], profile: &str) {
@@ -14632,7 +14671,7 @@ fn btrfs_attached_devices_read_seeded_files() {
                 .unwrap()
                 .success()
         );
-        if profile == "raid1" {
+        if matches!(profile, "raid1" | "raid10" | "raid1c3" | "raid1c4") {
             let compressed = kernel_mount.join("compressed");
             assert!(
                 Command::new("sudo")
@@ -14903,12 +14942,27 @@ fn btrfs_attached_devices_read_seeded_files() {
             OpenFs::open_with_options(&cancelled, &images[0], &valid),
             Err(ffs_error::FfsError::Cancelled)
         ));
-        if profile == "raid1" {
-            let pair = [images[0].clone(), images[1].clone()];
-            assert_btrfs_metadata_mirror_recovery(&cx, &pair, &payload);
-            assert_btrfs_data_mirror_recovery(&cx, &pair, &payload, "payload", 0, true);
-            assert_btrfs_data_mirror_recovery(&cx, &pair, &payload, "compressed", 3, true);
-            assert_btrfs_data_mirror_recovery(&cx, &pair, &payload, "nodatasum", 0, false);
+        if matches!(profile, "raid1" | "raid10" | "raid1c3" | "raid1c4") {
+            assert_btrfs_metadata_mirror_recovery(&cx, &images, &payload, profile);
+            assert_btrfs_data_mirror_recovery(&cx, &images, &payload, "payload", 0, true, profile);
+            assert_btrfs_data_mirror_recovery(
+                &cx,
+                &images,
+                &payload,
+                "compressed",
+                3,
+                true,
+                profile,
+            );
+            assert_btrfs_data_mirror_recovery(
+                &cx,
+                &images,
+                &payload,
+                "nodatasum",
+                0,
+                false,
+                profile,
+            );
         }
         if matches!(profile, "raid10" | "raid1c3" | "raid1c4") {
             assert_btrfs_mirror_survivors(&cx, &images, &payload, profile);
