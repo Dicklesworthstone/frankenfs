@@ -9428,6 +9428,24 @@ impl OpenFs {
                 self.ext4_forced_read_only.store(false, Ordering::SeqCst);
             }
             FsFlavor::Btrfs(sb) => {
+                // The writeback engine addresses one physical device and only
+                // maintains Single/DUP chunks. Refuse before loading mutable
+                // allocator state, even when read validation was skipped.
+                let unsupported_chunks = self.btrfs_context.as_ref().is_some_and(|ctx| {
+                    ctx.chunks.iter().any(|chunk| {
+                        !matches!(
+                            chunk.chunk_type & ffs_ondisk::chunk_type_flags::RAID_MASK,
+                            0 | ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_DUP
+                        )
+                    })
+                });
+                if sb.num_devices != 1 || unsupported_chunks {
+                    return Err(FfsError::UnsupportedFeature(
+                        "btrfs writes require one device with only Single/DUP chunks; \
+                         multi-device and RAID mutation are not supported"
+                            .to_owned(),
+                    ));
+                }
                 // bd-btfeat: a read-only-compat feature is one a READER may
                 // ignore and a WRITER may not. The mount-time gate in
                 // `validate_btrfs_superblock` deliberately lets these through so
@@ -78519,6 +78537,88 @@ mod tests {
     }
 
     // ── Btrfs write-path integration tests ────────────────────────────
+
+    #[test]
+    fn btrfs_enable_writes_rejects_multi_device_before_mutation() {
+        let cx = Cx::for_testing();
+        for num_devices in [2_u64, 3] {
+            for skip_validation in [false, true] {
+                let mut image = build_btrfs_fsops_image();
+                let offset = BTRFS_SUPER_INFO_OFFSET + 0x88;
+                image[offset..offset + 8].copy_from_slice(&num_devices.to_le_bytes());
+                let dev = TestDevice::from_vec(image.clone());
+                let options = OpenOptions {
+                    skip_validation,
+                    ..OpenOptions::default()
+                };
+                let mut fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &options).unwrap();
+                let error = fs.enable_writes(&cx).unwrap_err();
+                assert!(matches!(error, FfsError::UnsupportedFeature(_)));
+                assert!(error.to_string().contains("one device"));
+                assert!(!fs.is_writable());
+                assert_eq!(fs.mvcc_store.version_count(), 0);
+                drop(fs);
+                assert_eq!(dev.snapshot_bytes(), image);
+            }
+        }
+    }
+
+    #[test]
+    fn btrfs_enable_writes_rejects_raid_when_validation_is_skipped() {
+        use ffs_ondisk::chunk_type_flags::{
+            BTRFS_BLOCK_GROUP_RAID0, BTRFS_BLOCK_GROUP_RAID1, BTRFS_BLOCK_GROUP_RAID1C3,
+            BTRFS_BLOCK_GROUP_RAID1C4, BTRFS_BLOCK_GROUP_RAID5, BTRFS_BLOCK_GROUP_RAID6,
+            BTRFS_BLOCK_GROUP_RAID10,
+        };
+        let cx = Cx::for_testing();
+        for (profile, num_stripes) in [
+            (BTRFS_BLOCK_GROUP_RAID0, 2_u16),
+            (BTRFS_BLOCK_GROUP_RAID1, 2),
+            (BTRFS_BLOCK_GROUP_RAID10, 4),
+            (BTRFS_BLOCK_GROUP_RAID5, 3),
+            (BTRFS_BLOCK_GROUP_RAID6, 4),
+            (BTRFS_BLOCK_GROUP_RAID1C3, 3),
+            (BTRFS_BLOCK_GROUP_RAID1C4, 4),
+        ] {
+            let mut image = build_btrfs_fsops_image();
+            let offset = BTRFS_SUPER_INFO_OFFSET + 0x32B;
+            let mut chunk = ffs_ondisk::parse_sys_chunk_array(&image[offset..offset + 97])
+                .unwrap()
+                .remove(0);
+            chunk.chunk_type = 1 | profile;
+            chunk.num_stripes = num_stripes;
+            chunk.sub_stripes = if profile == BTRFS_BLOCK_GROUP_RAID10 {
+                2
+            } else {
+                0
+            };
+            let stripe = chunk.stripes[0].clone();
+            chunk.stripes = (1..=num_stripes)
+                .map(|devid| ffs_ondisk::BtrfsStripe {
+                    devid: u64::from(devid),
+                    ..stripe.clone()
+                })
+                .collect();
+            let encoded = chunk.to_bytes().unwrap();
+            image[offset..offset + encoded.len()].copy_from_slice(&encoded);
+            let size_offset = BTRFS_SUPER_INFO_OFFSET + 0xA0;
+            image[size_offset..size_offset + 4]
+                .copy_from_slice(&u32::try_from(encoded.len()).unwrap().to_le_bytes());
+            let dev = TestDevice::from_vec(image.clone());
+            let options = OpenOptions {
+                skip_validation: true,
+                ..OpenOptions::default()
+            };
+            let mut fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &options).unwrap();
+            let error = fs.enable_writes(&cx).unwrap_err();
+            assert!(matches!(error, FfsError::UnsupportedFeature(_)));
+            assert!(error.to_string().contains("RAID mutation"));
+            assert!(!fs.is_writable());
+            assert_eq!(fs.mvcc_store.version_count(), 0);
+            drop(fs);
+            assert_eq!(dev.snapshot_bytes(), image);
+        }
+    }
 
     /// Open a writable btrfs filesystem from the test image.
     fn open_writable_btrfs_with_device() -> (OpenFs, Cx, TestDevice) {

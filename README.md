@@ -3280,19 +3280,20 @@ The vendored copy is included in `cargo vet`'s supply-chain audit, can be diffed
 
 ## RAID Profile Support Matrix
 
-Btrfs supports a number of RAID profiles. FrankenFS V1 tests these explicitly via the `ffs-btrfs::map_logical_to_stripes` dispatcher:
+Btrfs stripe helpers and mounted support currently differ. The V1 multi-device
+read requirement remains open under `bd-hk5w3`; helper tests do not certify it.
 
-| Profile | Read | Write | Stripe-fallback | Mirror dispatch | Status |
-|---|---|---|---|---|---|
-| `Single` | ✅ | ✅ (experimental) | n/a | n/a | Supported |
-| `DUP` | ✅ | ✅ (experimental) | n/a | ✅ (primary + mirror) | Supported |
-| `RAID0` | ✅ | ✅ (experimental) | ✅ | n/a | Supported |
-| `RAID1` | ✅ | ✅ (experimental) | n/a | ✅ (mirror fallback) | Supported |
-| `RAID10` | ✅ | ✅ (experimental) | ✅ | ✅ (mirror-stripe) | Supported |
-| `RAID5` | ✅ | ✅ (experimental) | ✅ (parity rotation) | n/a | Supported |
-| `RAID6` | ✅ | ✅ (experimental) | ✅ (double parity) | n/a | Supported |
-| `RAID1C3` | ❌ | ❌ | n/a | n/a | V1.x deferred |
-| `RAID1C4` | ❌ | ❌ | n/a | n/a | V1.x deferred |
+| Profile | Device-set read helper | Mounted read | Mounted write |
+|---|---|---|---|
+| `Single` | Linear, split at chunk boundaries | Implemented | Experimental |
+| `DUP` | Alternate copies on one device | Implemented using primary mapping | Experimental |
+| `RAID0` | Split across data stripes | Not integrated | Deferred |
+| `RAID1` | Mirror fallback on read error | Not integrated | Deferred |
+| `RAID10` | Split across mirrored stripe groups | Not integrated | Deferred |
+| `RAID5` | Owning data stripe; no reconstruction | Not integrated | Deferred |
+| `RAID6` | Owning data stripe; no reconstruction | Not integrated | Deferred |
+| `RAID1C3` | Three-copy mapping and read fallback | V1.x deferred | Deferred |
+| `RAID1C4` | Four-copy mapping and read fallback | V1.x deferred | Deferred |
 
 The parity rotation logic for RAID5/RAID6 received an explicit fix (`18bc6b0`) to align with btrfs's left-symmetric layout. Stripe-translation properties are differentially validated via metamorphic relations:
 
@@ -3300,7 +3301,11 @@ The parity rotation logic for RAID5/RAID6 received an explicit fix (`18bc6b0`) t
 - **Chunk-order permutation invariance:** `parse(perm(chunks)) == parse(chunks)` for any permutation `perm` of the chunk list.
 - **Single-vs-DUP primary mapping equivalence:** the primary mirror in DUP must return the same physical mapping as the equivalent Single chunk.
 
-Mirror dispatch in RAID1 / DUP / RAID10 also exercises a **fallback path**: if the primary mirror returns a corrupt block (per checksum), the next mirror is tried. This is part of `BtrfsDeviceSet::read_logical` and is tested directly in harness coverage.
+`BtrfsDeviceSet::read_logical` retries another mirror when a reader returns an
+error or the wrong byte count. It does not independently verify data checksums:
+a corrupt buffer of the correct length requires validation by the caller.
+Cross-stripe and cross-chunk tests use independent device byte arrays; mounted
+kernel-generated multi-device evidence remains outstanding.
 
 ---
 

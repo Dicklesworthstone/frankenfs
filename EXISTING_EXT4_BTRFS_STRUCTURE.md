@@ -2493,6 +2493,12 @@ For metadata blocks, verification includes:
    subvolumes via reference counting.
 10. Scrub verifies all allocated extents against their checksums and can
     repair from redundant copies in RAID configurations.
+11. A logical read must be split at chunk boundaries and, for striped
+    profiles, stripe boundaries. A physical mapping describes only the
+    contiguous bytes before the next such boundary, not the entire request.
+    Each segment must return exactly its requested length; a short mirror
+    read is a failed attempt and may fall back to another copy of that segment.
+    RAID5/6 parity is not a readable mirror and requires separate reconstruction.
 
 ### 16.3 Key Implementation Patterns
 

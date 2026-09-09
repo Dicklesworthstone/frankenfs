@@ -10023,41 +10023,80 @@ impl BtrfsDeviceSet {
                 field: "devid",
                 reason: "device not found in device set",
             })?;
-        reader(physical_offset, len)
+        let bytes = u64::try_from(len).map_err(|_| ffs_types::ParseError::IntegerConversion {
+            field: "read_length",
+        })?;
+        physical_offset
+            .checked_add(bytes)
+            .ok_or(ffs_types::ParseError::InvalidField {
+                field: "physical_offset",
+                reason: "read range overflow",
+            })?;
+        let data = reader(physical_offset, len)?;
+        if data.len() != len {
+            return Err(ffs_types::ParseError::InvalidField {
+                field: "device_read",
+                reason: "reader returned incorrect byte count",
+            });
+        }
+        Ok(data)
     }
 
     /// Read a logical block using the chunk map and stripe resolution.
     ///
     /// Resolves the logical address to physical stripes via `map_logical_to_stripes`,
-    /// then reads from the first available stripe's device. For mirrored profiles
-    /// (RAID1/10), this reads from the first mirror; fallback to other mirrors on
-    /// error could be added in the future.
+    /// then reads each contiguous segment from its owning device. Reads crossing
+    /// stripe or chunk boundaries are remapped. Mirror read errors, including
+    /// short reads, fall back to the next copy of the same segment. RAID5/6
+    /// reads require the owning data device; parity reconstruction is not provided.
     pub fn read_logical(
         &self,
         chunks: &[ffs_ondisk::BtrfsChunkEntry],
         logical: u64,
         len: usize,
     ) -> Result<Vec<u8>, ffs_types::ParseError> {
-        let mapping = ffs_ondisk::map_logical_to_stripes(chunks, logical)?.ok_or(
-            ffs_types::ParseError::InvalidField {
+        let mut remaining =
+            u64::try_from(len).map_err(|_| ffs_types::ParseError::IntegerConversion {
+                field: "read_length",
+            })?;
+        let end = logical
+            .checked_add(remaining)
+            .ok_or(ffs_types::ParseError::InvalidField {
                 field: "logical_address",
-                reason: "address not mapped in chunk table",
-            },
-        )?;
-
-        // Try each stripe until one succeeds (redundancy for mirrored profiles).
-        for stripe in &mapping.stripes {
-            match self.read_physical(stripe.devid, stripe.physical, len) {
-                Ok(data) => return Ok(data),
-                Err(_) if mapping.stripes.len() > 1 => {} // Try next mirror.
-                Err(e) => return Err(e),
+                reason: "read range overflow",
+            })?;
+        let mut data = Vec::new();
+        data.try_reserve_exact(len)
+            .map_err(|_| ffs_types::ParseError::InvalidField {
+                field: "read_length",
+                reason: "read buffer allocation failed",
+            })?;
+        while remaining != 0 {
+            let mapping = ffs_ondisk::map_logical_to_stripes(chunks, end - remaining)?.ok_or(
+                ffs_types::ParseError::InvalidField {
+                    field: "logical_address",
+                    reason: "address not mapped in chunk table",
+                },
+            )?;
+            let take = remaining.min(mapping.contiguous_len);
+            let segment_len =
+                usize::try_from(take).map_err(|_| ffs_types::ParseError::IntegerConversion {
+                    field: "read_length",
+                })?;
+            let mut segment = Err(ffs_types::ParseError::InvalidField {
+                field: "stripe",
+                reason: "no readable stripe",
+            });
+            for stripe in &mapping.stripes {
+                segment = self.read_physical(stripe.devid, stripe.physical, segment_len);
+                if segment.is_ok() {
+                    break;
+                }
             }
+            data.extend_from_slice(&segment?);
+            remaining -= take;
         }
-
-        Err(ffs_types::ParseError::InvalidField {
-            field: "stripe",
-            reason: "all mirrors failed to read",
-        })
+        Ok(data)
     }
 }
 
@@ -12019,6 +12058,160 @@ mod tests {
 
     const NODESIZE: u32 = 4096;
     const HEADER_SIZE: usize = 101;
+
+    fn device_read_chunk(profile: u64, length: u64, devices: &[u64]) -> BtrfsChunkEntry {
+        BtrfsChunkEntry {
+            key: BtrfsKey {
+                objectid: 256,
+                item_type: 228,
+                offset: 0x1000,
+            },
+            length,
+            owner: 2,
+            stripe_len: 4,
+            chunk_type: ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_DATA | profile,
+            io_align: 4,
+            io_width: 4,
+            sector_size: 4,
+            num_stripes: u16::try_from(devices.len()).unwrap(),
+            sub_stripes: 2,
+            stripes: devices
+                .iter()
+                .map(|&devid| BtrfsStripe {
+                    devid,
+                    offset: 0,
+                    dev_uuid: [0; 16],
+                })
+                .collect(),
+        }
+    }
+
+    fn add_read_device(devices: &mut BtrfsDeviceSet, devid: u64, data: Vec<u8>) {
+        devices.add_device(
+            devid,
+            Box::new(move |offset, len| {
+                let start = usize::try_from(offset).unwrap();
+                data.get(start..start + len)
+                    .map(<[u8]>::to_vec)
+                    .ok_or(ParseError::InvalidField {
+                        field: "test_device",
+                        reason: "read outside physical device",
+                    })
+            }),
+        );
+    }
+
+    #[test]
+    fn device_set_reads_across_stripes_and_mirror_groups() {
+        use ffs_ondisk::chunk_type_flags::{BTRFS_BLOCK_GROUP_RAID0, BTRFS_BLOCK_GROUP_RAID10};
+        for profile in [BTRFS_BLOCK_GROUP_RAID0, BTRFS_BLOCK_GROUP_RAID10] {
+            let mut devices = BtrfsDeviceSet::new();
+            let first = vec![0, 1, 2, 3, 8, 9, 10, 11];
+            let second = vec![4, 5, 6, 7, 12, 13, 14, 15];
+            let ids = if profile == BTRFS_BLOCK_GROUP_RAID0 {
+                add_read_device(&mut devices, 1, first);
+                add_read_device(&mut devices, 2, second);
+                vec![1, 2]
+            } else {
+                // First mirror of each stripe group is missing. Each segment
+                // must retry its own group, not reuse a prior group's device.
+                add_read_device(&mut devices, 2, first);
+                add_read_device(&mut devices, 4, second);
+                vec![1, 2, 3, 4]
+            };
+            let chunks = [device_read_chunk(profile, 16, &ids)];
+            assert_eq!(
+                devices.read_logical(&chunks, 0x1000, 16).unwrap(),
+                (0_u8..16).collect::<Vec<_>>()
+            );
+            assert_eq!(
+                devices.read_logical(&chunks, 0x1003, 11).unwrap(),
+                (3_u8..14).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn device_set_reads_across_parity_rows_without_reading_parity() {
+        use ffs_ondisk::chunk_type_flags::{BTRFS_BLOCK_GROUP_RAID5, BTRFS_BLOCK_GROUP_RAID6};
+        // Three physical rows, four bytes per stripe. Parity bytes deliberately
+        // differ from every expected data byte. These fixed layouts exercise
+        // boundary assembly, not kernel compatibility or parity reconstruction.
+        let raid5 = vec![
+            vec![0, 1, 2, 3, 8, 9, 10, 11, 99, 99, 99, 99],
+            vec![4, 5, 6, 7, 99, 99, 99, 99, 16, 17, 18, 19],
+            vec![99, 99, 99, 99, 12, 13, 14, 15, 20, 21, 22, 23],
+        ];
+        let raid6 = vec![
+            vec![0, 1, 2, 3, 8, 9, 10, 11, 99, 99, 99, 99],
+            vec![4, 5, 6, 7, 99, 99, 99, 99, 99, 99, 99, 99],
+            vec![99, 99, 99, 99, 99, 99, 99, 99, 16, 17, 18, 19],
+            vec![99, 99, 99, 99, 12, 13, 14, 15, 20, 21, 22, 23],
+        ];
+        for (profile, contents) in [
+            (BTRFS_BLOCK_GROUP_RAID5, raid5),
+            (BTRFS_BLOCK_GROUP_RAID6, raid6),
+        ] {
+            let ids: Vec<_> = (1..=u64::try_from(contents.len()).unwrap()).collect();
+            let mut devices = BtrfsDeviceSet::new();
+            for (&devid, data) in ids.iter().zip(contents) {
+                add_read_device(&mut devices, devid, data);
+            }
+            let chunks = [device_read_chunk(profile, 24, &ids)];
+            assert_eq!(
+                devices.read_logical(&chunks, 0x1003, 19).unwrap(),
+                (3_u8..22).collect::<Vec<_>>()
+            );
+            devices.add_device(
+                1,
+                Box::new(|_, _| {
+                    Err(ParseError::InvalidField {
+                        field: "test_device",
+                        reason: "missing data device",
+                    })
+                }),
+            );
+            assert!(devices.read_logical(&chunks, 0x1000, 4).is_err());
+        }
+    }
+
+    #[test]
+    fn device_set_remaps_chunk_boundaries_and_rejects_holes() {
+        let mut devices = BtrfsDeviceSet::new();
+        add_read_device(&mut devices, 1, vec![10, 11, 12, 13, 14, 99, 99, 99]);
+        add_read_device(&mut devices, 2, vec![20, 21, 22, 23, 24]);
+        let first = device_read_chunk(0, 5, &[1]);
+        let mut second = device_read_chunk(0, 5, &[2]);
+        second.key.offset += 5;
+        let mut chunks = [first, second];
+        assert_eq!(
+            devices.read_logical(&chunks, 0x1003, 5).unwrap(),
+            vec![13, 14, 20, 21, 22]
+        );
+        chunks[1].key.offset += 1;
+        assert!(devices.read_logical(&chunks, 0x1003, 5).is_err());
+        assert!(devices.read_logical(&chunks, 0x100a, 2).is_err());
+    }
+
+    #[test]
+    fn device_set_requires_exact_lengths_and_checks_ranges() {
+        use ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_RAID1;
+        for wrong_len in [0, 3, 5] {
+            let mut devices = BtrfsDeviceSet::new();
+            devices.add_device(1, Box::new(move |_, _| Ok(vec![99; wrong_len])));
+            add_read_device(&mut devices, 2, vec![1, 2, 3, 4]);
+            let mirror = device_read_chunk(BTRFS_BLOCK_GROUP_RAID1, 4, &[1, 2]);
+            assert_eq!(
+                devices.read_logical(&[mirror], 0x1000, 4).unwrap(),
+                vec![1, 2, 3, 4]
+            );
+            let single = device_read_chunk(0, 4, &[1]);
+            assert!(devices.read_logical(&[single], 0x1000, 4).is_err());
+            assert!(devices.read_physical(1, u64::MAX, 2).is_err());
+            assert!(devices.read_logical(&[], u64::MAX, 2).is_err());
+            assert_eq!(devices.read_logical(&[], u64::MAX, 0).unwrap(), [0_u8; 0]);
+        }
+    }
 
     #[test]
     fn send_inode_grouping_spans_match_btree_fallback() {

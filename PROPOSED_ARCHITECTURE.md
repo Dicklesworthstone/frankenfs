@@ -95,6 +95,16 @@ The 22nd member, `ffs-ops` in `tools/ffs-ops`, provides operational validation c
 
 > **Note:** `ffs-fuse` depends on `ffs-core` (which orchestrates domain crates), NOT on domain crates directly. This is the canonical layering — ffs-core is the integration point, ffs-fuse is a thin FUSE protocol adapter. `ffs-mvcc` now depends on `ffs-block` for versioned block storage (MvccBlockDevice wraps a BlockDevice to provide snapshot-isolated reads/writes). As MVCC persistence lands (bd-1u7), `ffs-mvcc` will additionally use `ByteDevice` (via `ffs-block`) to implement an append-only durable overlay log for versioned blocks (see COMPREHENSIVE_SPEC §5.9). `ffs-core` depends on `ffs-btrfs` for btrfs root tree walking during format detection and multi-format support.
 
+`ffs-ondisk::BtrfsStripeMapping` bounds each mapping with a contiguous byte
+length. `ffs-btrfs::BtrfsDeviceSet` assembles longer reads segment by segment,
+requiring exact physical read lengths and retrying alternate mirrors on read
+failure. These lower-level guarantees are prerequisites for mounted multi-device
+routing; they do not establish device identity validation, degraded RAID5/6
+reconstruction, or multi-device mutation support in `OpenFs`.
+`OpenFs::enable_writes` refuses any device count other than one and any known
+chunk profile other than Single/DUP before loading mutable allocation state.
+Skipping read validation does not bypass this write-admission check.
+
 ---
 
 ## 3. Trait Hierarchy

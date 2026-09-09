@@ -1292,6 +1292,9 @@ impl BtrfsRaidProfile {
 pub struct BtrfsStripeMapping {
     /// RAID profile of the chunk.
     pub profile: BtrfsRaidProfile,
+    /// Contiguous bytes readable from these physical locations before a chunk
+    /// or striped-profile stripe boundary requires another mapping.
+    pub contiguous_len: u64,
     /// All readable stripes (device, physical offset) for this logical address.
     /// For RAID1: 2 entries (either can serve the read).
     /// For RAID0: 1 entry (the stripe owning this offset).
@@ -1352,7 +1355,22 @@ fn chunk_stripes(
     let offset_within = logical - chunk_start;
     let profile = BtrfsRaidProfile::from_chunk_type(chunk.chunk_type);
     let stripes = resolve_chunk_stripes(chunk, offset_within, profile)?;
-    Ok(Some(BtrfsStripeMapping { profile, stripes }))
+    let chunk_remaining = chunk_end - logical;
+    let contiguous_len = match profile {
+        BtrfsRaidProfile::Raid0
+        | BtrfsRaidProfile::Raid10
+        | BtrfsRaidProfile::Raid5
+        | BtrfsRaidProfile::Raid6 => {
+            // Successful stripe resolution above already requires stripe_len > 0.
+            chunk_remaining.min(chunk.stripe_len - offset_within % chunk.stripe_len)
+        }
+        _ => chunk_remaining,
+    };
+    Ok(Some(BtrfsStripeMapping {
+        profile,
+        contiguous_len,
+        stripes,
+    }))
 }
 
 /// Resolve stripe mappings for a single chunk at the given offset.
