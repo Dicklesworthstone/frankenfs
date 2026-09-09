@@ -110,8 +110,18 @@ filesystem UUID. Writable mounts then read the live CHUNK_TREE device item
 under the allocator's read lock, validate its ID and UUIDs against the backing
 identity, and report its current accounting. Partial tree loads return an
 unsupported error; missing or malformed records return corruption errors.
-Read-only mounts still use the superblock accounting. This identifies the one
-backing image; it does not enumerate or validate a mounted multi-device set.
+Read-only mounts use the existing checksum-verified floor descent into the
+committed CHUNK_TREE, requiring exact key equality before the same identity
+validation. A predecessor or missing record cannot supply device accounting.
+This identifies the one backing image; it does not enumerate or validate a
+mounted multi-device set. The allocator lock stabilizes writable accounting,
+but full commit releases it before superblock publication; serializing that
+publication with device-info reads remains open (`bd-hk5w3`).
+Mount initialization preserves DATA, METADATA, and SYSTEM block-group types.
+Chunk-tree COW allocates from SYSTEM space so the superblock's bootstrap map
+can resolve the new root. When growth dirties CHUNK_TREE and DEV_TREE, full
+commit retires their old extent records before allocating replacement nodes;
+the existing pin mechanism protects those old blocks until publication.
 `FS_INFO` uses the same verified device item to report `max_id` for a
 single-device image, so sparse device IDs remain discoverable through
 `DEV_INFO`. Until the mounted registry covers all devices, `FS_INFO` refuses

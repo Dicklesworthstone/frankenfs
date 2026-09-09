@@ -2508,6 +2508,11 @@ For metadata blocks, verification includes:
     Accounting comes from the live device state (`btrfs_device_get_bytes_used`
     and `btrfs_device_get_total_bytes`), so chunk allocation must become visible
     through the ioctl without waiting for a superblock write.
+    On mount, `btrfs_read_chunk_tree` loads DEV_ITEM records through
+    `read_one_dev` and `fill_device_from_item` (`fs/btrfs/volumes.c`), including
+    their committed byte accounting. Read-only mounts therefore also use
+    CHUNK_TREE accounting; the embedded superblock copy is not a substitute
+    for a missing committed record.
 13. `BTRFS_IOC_FS_INFO.max_id` is the maximum ID in the filesystem's device
     inventory, not `num_devices`. Linux v6.19 `btrfs_ioctl_fs_info` computes
     it across the device list. A single device with ID 7 therefore reports

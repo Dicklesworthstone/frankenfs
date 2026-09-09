@@ -9669,8 +9669,8 @@ impl OpenFs {
             } else {
                 0
             };
-            let alloc_flags =
-                chunk.chunk_type & (BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA);
+            let alloc_flags = chunk.chunk_type
+                & (BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_SYSTEM);
             let alloc_flags = if alloc_flags == 0 {
                 BTRFS_BLOCK_GROUP_DATA
             } else {
@@ -10029,26 +10029,18 @@ impl OpenFs {
         self.btrfs_alloc_state.as_ref().ok_or(FfsError::ReadOnly)
     }
 
-    /// Use the writable mount's device accounting, which chunk allocation
-    /// updates before the superblock is persisted. The backing image remains
-    /// the identity anchor; an incomplete tree cannot supply current accounting.
+    /// Read current device accounting from the live or committed chunk tree.
+    /// The backing superblock anchors identity, but its accounting can lag the
+    /// chunk tree. Missing or incomplete records cannot supply current totals.
     fn current_btrfs_backing_device_item(
         &self,
         cx: &Cx,
         sb: &BtrfsSuperblock,
     ) -> Result<ffs_ondisk::BtrfsDevItem, FfsError> {
-        // Match commit's lock order so the superblock cannot be rewritten
-        // between verifying its checksum and reading live device state.
+        // Stabilize live accounting against chunk allocation. Full commit
+        // releases this lock before its later superblock publication.
         let alloc = self.btrfs_alloc_state.as_ref().map(|mutex| mutex.read());
         let backing = read_btrfs_backing_device_item(cx, self.dev.as_ref(), sb)?;
-        let Some(alloc) = alloc else {
-            return Ok(backing);
-        };
-        if !alloc.chunk_trees_authoritative {
-            return Err(FfsError::UnsupportedFeature(
-                "DEV_INFO requires authoritative chunk-tree device accounting".to_owned(),
-            ));
-        }
         let corrupt = |detail: String| FfsError::Corruption {
             block: sb.chunk_root / u64::from(sb.sectorsize),
             detail,
@@ -10058,10 +10050,25 @@ impl OpenFs {
             item_type: ffs_ondisk::btrfs::BTRFS_DEV_ITEM_KEY,
             offset: backing.devid,
         };
-        let bytes = alloc
-            .chunk_tree
-            .get(&key)
-            .ok_or_else(|| corrupt("chunk tree has no backing device item".to_owned()))?;
+        let bytes = if let Some(alloc) = alloc {
+            if !alloc.chunk_trees_authoritative {
+                return Err(FfsError::UnsupportedFeature(
+                    "DEV_INFO requires authoritative chunk-tree device accounting".to_owned(),
+                ));
+            }
+            alloc.chunk_tree.get(&key)
+        } else {
+            // Floor lookup also handles devid=u64::MAX without constructing
+            // an overflowing upper bound. A predecessor is not this device.
+            self.walk_btrfs_tree_floor(cx, sb.chunk_root, key)
+                .map_err(|error| match error {
+                    FfsError::Format(detail) | FfsError::NotFound(detail) => corrupt(detail),
+                    other => other,
+                })?
+                .filter(|entry| entry.key == key)
+                .map(|entry| entry.data)
+        }
+        .ok_or_else(|| corrupt("chunk tree has no backing device item".to_owned()))?;
         let current =
             ffs_ondisk::parse_dev_item(&bytes).map_err(|error| corrupt(error.to_string()))?;
         if current.devid != backing.devid
@@ -32445,8 +32452,8 @@ impl OpenFs {
         // wholesale at fresh addresses (root/extent/fs/csum). Their old nodes,
         // loaded from disk, otherwise linger as backrefs for blocks no live tree
         // references, poisoning btrfs check's refcount walk (bd-x36qn levers
-        // A+B). The chunk/dev/uuid/free-space/data-reloc trees are not rewritten,
-        // so their items are preserved.
+        // A+B). Chunk/dev trees are retired separately after deciding whether
+        // this commit grows chunks. UUID/free-space/data-reloc items are preserved.
         alloc
             .extent_alloc
             .remove_metadata_items_owned_by_roots(&[
@@ -32786,6 +32793,21 @@ impl OpenFs {
                     "grew_the_filesystem_to_fit_the_commit"
                 );
             }
+        }
+
+        // Chunk growth rewrites both allocation trees wholesale. Retire their
+        // old extent records only when those trees will actually be replaced,
+        // and pin the old blocks until the new superblock is durable. Do this
+        // after growth can set the dirty flag, before allocating any tree nodes
+        // or computing the extent-tree self-description fixpoint.
+        if alloc.chunk_trees_dirty {
+            alloc
+                .extent_alloc
+                .remove_metadata_items_owned_by_roots(&[
+                    BTRFS_CHUNK_TREE_OBJECTID,
+                    BTRFS_DEV_TREE_OBJECTID,
+                ])
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
         }
 
         // Pre-allocate logical addresses for each node from the chunk-tree-covered
@@ -78601,6 +78623,41 @@ mod tests {
 
     // ── Btrfs write-path integration tests ────────────────────────────
 
+    /// Give the ioctl fixture a committed device record, independently encoded
+    /// with the same leaf writer used by the filesystem-operation fixtures.
+    fn add_btrfs_dev_info_chunk_tree(image: &mut [u8]) -> usize {
+        let sb = BTRFS_SUPER_INFO_OFFSET;
+        let root = 0x2_0000_usize;
+        let logical = u64::try_from(root).unwrap();
+        let item = image[sb + 0xC9..sb + 0x12B].to_vec();
+        let devid = u64::from_le_bytes(item[..8].try_into().unwrap());
+        let fsid: [u8; 16] = image[sb + 0x20..sb + 0x30].try_into().unwrap();
+        image[root..root + 4096].fill(0);
+        image[root + 0x20..root + 0x30].copy_from_slice(&fsid);
+        image[root + 0x30..root + 0x38].copy_from_slice(&logical.to_le_bytes());
+        image[root + 0x40..root + 0x50].copy_from_slice(&fsid);
+        image[root + 0x50..root + 0x58].copy_from_slice(&1_u64.to_le_bytes());
+        image[root + 0x58..root + 0x60].copy_from_slice(&BTRFS_CHUNK_TREE_OBJECTID.to_le_bytes());
+        image[root + 0x60..root + 0x64].copy_from_slice(&1_u32.to_le_bytes());
+        write_btrfs_leaf_item(
+            image,
+            root,
+            0,
+            ffs_ondisk::btrfs::BTRFS_DEV_ITEMS_OBJECTID,
+            ffs_ondisk::btrfs::BTRFS_DEV_ITEM_KEY,
+            devid,
+            3998,
+            98,
+        );
+        image[root + 3998..root + 4096].copy_from_slice(&item);
+        stamp_btrfs_test_tree_block_crc32c(image, root);
+        image[sb + 0x58..sb + 0x60].copy_from_slice(&logical.to_le_bytes());
+        image[sb + 0xA4..sb + 0xAC].copy_from_slice(&1_u64.to_le_bytes());
+        let checksum = ffs_types::crc32c(&image[sb + 0x20..sb + 4096]);
+        image[sb..sb + 4].copy_from_slice(&checksum.to_le_bytes());
+        root
+    }
+
     #[test]
     fn btrfs_dev_info_uses_device_identity_and_accounting() {
         let cx = Cx::for_testing();
@@ -78617,6 +78674,7 @@ mod tests {
         image[item + 16..item + 24].copy_from_slice(&8192_u64.to_le_bytes());
         image[item + 66..item + 82].copy_from_slice(&uuid);
         image[item + 82..item + 98].copy_from_slice(&fsid);
+        add_btrfs_dev_info_chunk_tree(&mut image);
         let checksum = ffs_types::crc32c(&image[sb_offset + 0x20..sb_offset + 4096]);
         image[sb_offset..sb_offset + 4].copy_from_slice(&checksum.to_le_bytes());
         let dev = TestDevice::from_vec(image.clone());
@@ -78673,6 +78731,7 @@ mod tests {
             image[item + 16..item + 24].copy_from_slice(&8192_u64.to_le_bytes());
             image[item + 66..item + 82].fill(0xA7);
             image[item + 82..item + 98].copy_from_slice(&fsid);
+            add_btrfs_dev_info_chunk_tree(&mut image);
             match defect {
                 "fsid" => image[item + 82] ^= 1,
                 "devid" => image[item..item + 8].fill(0),
@@ -78704,8 +78763,67 @@ mod tests {
     }
 
     #[test]
+    fn btrfs_dev_info_committed_device_id_max() {
+        let mut image = build_btrfs_fsops_image();
+        let item = BTRFS_SUPER_INFO_OFFSET + 0xC9;
+        image[item..item + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        image[item + 8..item + 16].copy_from_slice(&123_456_u64.to_le_bytes());
+        image[item + 16..item + 24].copy_from_slice(&8192_u64.to_le_bytes());
+        image[item + 66..item + 82].fill(0xA7);
+        add_btrfs_dev_info_chunk_tree(&mut image);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(image)),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let reply = fs
+            .get_btrfs_dev_info(&cx, &mut RequestScope::empty(), u64::MAX, [0; 16])
+            .unwrap();
+        assert_eq!(&reply[..8], &u64::MAX.to_ne_bytes());
+        assert_eq!(&reply[24..32], &8192_u64.to_ne_bytes());
+    }
+
+    #[test]
+    fn btrfs_dev_info_rejects_untrustworthy_committed_accounting() {
+        let cx = Cx::for_testing();
+        for defect in ["checksum", "missing", "predecessor", "uuid", "accounting"] {
+            let mut image = build_btrfs_fsops_image();
+            let item = BTRFS_SUPER_INFO_OFFSET + 0xC9;
+            image[item..item + 8].copy_from_slice(&7_u64.to_le_bytes());
+            image[item + 8..item + 16].copy_from_slice(&123_456_u64.to_le_bytes());
+            image[item + 16..item + 24].copy_from_slice(&8192_u64.to_le_bytes());
+            image[item + 66..item + 82].fill(0xA7);
+            let root = add_btrfs_dev_info_chunk_tree(&mut image);
+            match defect {
+                "missing" => image[root + 0x60..root + 0x64].fill(0),
+                "predecessor" => {
+                    image[root + 110..root + 118].copy_from_slice(&6_u64.to_le_bytes())
+                }
+                "uuid" => image[root + 3998 + 66] ^= 1,
+                "accounting" => image[root + 3998 + 16..root + 3998 + 24]
+                    .copy_from_slice(&123_457_u64.to_le_bytes()),
+                _ => {}
+            }
+            stamp_btrfs_test_tree_block_crc32c(&mut image, root);
+            if defect == "checksum" {
+                image[root + 3998 + 66] ^= 1;
+            }
+            let dev = TestDevice::from_vec(image.clone());
+            let fs =
+                OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+            let error = fs
+                .get_btrfs_dev_info(&cx, &mut RequestScope::empty(), 7, [0; 16])
+                .unwrap_err();
+            assert_eq!(error.to_errno(), libc::EIO, "{defect}: {error}");
+            assert_eq!(dev.snapshot_bytes(), image);
+        }
+    }
+
+    #[test]
     fn btrfs_dev_info_tracks_live_chunk_allocation() {
-        let Some((fs, dev, _tmp, _image)) = open_writable_btrfs_mkfs(128) else {
+        let Some((fs, dev, _tmp, image)) = open_writable_btrfs_mkfs(128) else {
             eprintln!(
                 "SCENARIO_RESULT|scenario_id=btrfs_dev_info_live_allocation|outcome=SKIP|reason=format_tool_unavailable"
             );
@@ -78724,6 +78842,13 @@ mod tests {
         {
             let mut alloc = fs.require_btrfs_alloc_state().unwrap().write();
             assert!(alloc.chunk_trees_authoritative);
+            assert!(
+                alloc
+                    .extent_alloc
+                    .allocatable_bytes(BTRFS_BLOCK_GROUP_SYSTEM)
+                    >= u64::from(sb.nodesize),
+                "mounted SYSTEM chunks must remain available for chunk-tree COW"
+            );
             let chunks = ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree).unwrap();
             let logical = chunks
                 .iter()
@@ -78782,6 +78907,41 @@ mod tests {
             "live accounting must be visible before superblock writeback"
         );
         eprintln!("SCENARIO_RESULT|scenario_id=btrfs_dev_info_live_allocation|outcome=PASS");
+
+        // Publish the allocated chunk through the real commit pipeline, then
+        // discard all mount state. Read-only DEV_INFO must use the committed
+        // chunk tree even though the embedded superblock device item is older.
+        let file = fs
+            .create(
+                &cx,
+                InodeNumber(256),
+                OsStr::new("device-accounting"),
+                0o644,
+                0,
+                0,
+            )
+            .unwrap();
+        fs.write(&cx, file.ino, 0, b"committed").unwrap();
+        let stats = fs
+            .btrfs_full_transaction_commit(&cx, "dev-info-remount")
+            .unwrap();
+        assert!(stats.nodes_written > 0);
+        drop(fs);
+        let reopened =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+        assert!(!reopened.is_writable());
+        let committed = reopened
+            .get_btrfs_dev_info(&cx, &mut RequestScope::empty(), backing.devid, backing.uuid)
+            .unwrap();
+        assert_eq!(committed, after);
+        assert_eq!(reopened.read(&cx, file.ino, 0, 9).unwrap(), b"committed");
+        std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+        let (clean, output) = run_btrfs_check(&image).expect("btrfs-progs must be available");
+        assert!(
+            clean,
+            "committed chunk allocation must pass btrfs check: {output}"
+        );
+        eprintln!("SCENARIO_RESULT|scenario_id=btrfs_dev_info_committed_allocation|outcome=PASS");
     }
 
     #[test]
