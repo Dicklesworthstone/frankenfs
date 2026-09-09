@@ -11622,6 +11622,7 @@ impl OpenFs {
     }
 
     fn btrfs_read_inode_attr(&self, cx: &Cx, ino: InodeNumber) -> Result<InodeAttr, FfsError> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let canonical = self.btrfs_canonical_inode(ino)?;
 
         // When writes are enabled the COW tree holds all items (seeded from
@@ -11720,6 +11721,7 @@ impl OpenFs {
         parent: InodeNumber,
         name: &[u8],
     ) -> Result<InodeAttr, FfsError> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let canonical_parent = self.btrfs_canonical_inode(parent)?;
 
         // When writes are enabled, look up via the COW tree so mutations are
@@ -13342,6 +13344,9 @@ impl OpenFs {
         // immutable). The limit is read once from the environment so memory can
         // be tuned per workload; 0 disables the cache.
         static BTRFS_DECOMP_CACHE_ENTRIES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        // Inline data, holes and EOF can be served entirely from cached extents.
+        // They must observe cancellation without relying on a device read.
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let read_started = tracing::enabled!(tracing::Level::TRACE).then(Instant::now);
         let canonical = self.btrfs_canonical_inode(ino)?;
         trace!(inode = canonical, offset, length = size, "btrfs read_start");
@@ -56204,6 +56209,118 @@ mod tests {
         stamp_btrfs_test_tree_block_crc32c(&mut image, BTRFS_TEST_FS_TREE_LOGICAL);
 
         image
+    }
+
+    #[test]
+    fn btrfs_cached_getattr_honors_cancellation() {
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(build_btrfs_inline_image(b"cached"))),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let ino = InodeNumber(257);
+        let expected = fs.getattr(&cx, ino).unwrap();
+        assert!(fs.ext4_inode_attr_cache.get(&ino.0).is_some());
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        assert!(matches!(
+            fs.getattr(&cancelled, ino),
+            Err(FfsError::Cancelled)
+        ));
+        assert_eq!(fs.getattr(&cx, ino).unwrap(), expected);
+    }
+
+    #[test]
+    fn btrfs_cached_read_into_honors_cancellation() {
+        let content = b"cached inline bytes";
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(build_btrfs_inline_image(content))),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let ino = InodeNumber(257);
+        let mut warm = [0; 32];
+        assert_eq!(fs.read_into(&cx, ino, 0, &mut warm).unwrap(), content.len());
+        assert!(fs.btrfs_hot_inode_extents.load().is_some());
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        for (offset, size) in [(0, 32), (content.len() as u64, 32), (0, 0)] {
+            let mut out = [0xA5; 32];
+            assert!(matches!(
+                fs.read_into(&cancelled, ino, offset, &mut out[..size]),
+                Err(FfsError::Cancelled)
+            ));
+            assert_eq!(out, [0xA5; 32]);
+        }
+        assert_eq!(fs.read_into(&cx, ino, 0, &mut warm).unwrap(), content.len());
+        assert_eq!(&warm[..content.len()], content);
+    }
+
+    #[test]
+    fn btrfs_cached_readdir_honors_cancellation() {
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(build_btrfs_readdir_image(&[(
+                b"file",
+                257,
+                ffs_btrfs::BTRFS_FT_REG_FILE,
+                0o100_644,
+            )]))),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let expected = fs.readdir(&cx, InodeNumber(1), 0).unwrap();
+        assert!(expected.len() >= 3);
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        for offset in [0, 1, u64::MAX] {
+            assert!(matches!(
+                fs.readdir(&cancelled, InodeNumber(1), offset),
+                Err(FfsError::Cancelled)
+            ));
+        }
+        assert_eq!(fs.readdir(&cx, InodeNumber(1), 0).unwrap(), expected);
+        assert_eq!(fs.readdir_full_reads.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn btrfs_cached_lookup_honors_cancellation() {
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(build_btrfs_readdir_image(&[(
+                b"file",
+                257,
+                ffs_btrfs::BTRFS_FT_REG_FILE,
+                0o100_644,
+            )]))),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        fs.readdir(&cx, InodeNumber(1), 0).unwrap();
+        assert!(fs.btrfs_dir_entry_cache.get(&256).is_some());
+        let expected = fs.lookup(&cx, InodeNumber(1), OsStr::new("file")).unwrap();
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        for name in ["file", "absent"] {
+            assert!(matches!(
+                fs.lookup(&cancelled, InodeNumber(1), OsStr::new(name)),
+                Err(FfsError::Cancelled)
+            ));
+        }
+        assert_eq!(
+            fs.lookup(&cx, InodeNumber(1), OsStr::new("file")).unwrap(),
+            expected
+        );
+        assert!(matches!(
+            fs.lookup(&cx, InodeNumber(1), OsStr::new("absent")),
+            Err(FfsError::NotFound(_))
+        ));
     }
 
     #[test]

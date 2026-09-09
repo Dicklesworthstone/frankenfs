@@ -131,6 +131,10 @@ converting parser errors. A cancelled operation returns `FfsError::Cancelled`,
 including empty ranges and cached results; cancellation observed during I/O
 must not publish a parsed node or floor memo. Parser error types remain about
 format interpretation, with runtime cancellation handled at the operation boundary.
+The btrfs attribute, name-lookup, readdir and read-into-buffer entry points also
+checkpoint before consulting their higher-level caches. A request already
+cancelled cannot return cached attributes, a positive or negative name lookup,
+a directory page, inline bytes, or an empty/EOF read as a normal result.
 Clean multi-device images use this routing even with no extra
 paths: a lone RAID1 survivor is admitted only after every committed chunk has
 device coverage. RAID1/C3/C4 need a surviving copy; RAID10 needs one survivor in each

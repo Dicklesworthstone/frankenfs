@@ -401,6 +401,7 @@ impl OpenFs {
         ino: InodeNumber,
         offset: u64,
     ) -> ffs_error::Result<ReaddirPage> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         // Same snapshot lever as ext4: a paginated readdir otherwise
         // re-walks the dir's DIR_INDEX items on every call (O(N^2)).
         //
