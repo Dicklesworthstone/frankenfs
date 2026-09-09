@@ -14154,6 +14154,200 @@ fn assert_btrfs_metadata_mirror_recovery(cx: &Cx, images: &[PathBuf; 2], payload
     emit_scenario_result("btrfs_raid1_metadata_checksum_fallback", "PASS", None);
 }
 
+fn assert_btrfs_data_mirror_recovery(
+    cx: &Cx,
+    images: &[PathBuf; 2],
+    payload: &[u8],
+    name: &str,
+    compression: u8,
+    datasum: bool,
+) {
+    let options = OpenOptions {
+        btrfs_device_paths: vec![images[1].clone()],
+        ..OpenOptions::default()
+    };
+    let filesystem = OpenFs::open_with_options(cx, &images[0], &options).unwrap();
+    let inode = filesystem
+        .lookup(cx, InodeNumber(1), std::ffi::OsStr::new(name))
+        .unwrap()
+        .ino;
+    let roots = filesystem.walk_btrfs_root_tree(cx).unwrap();
+    let root = roots
+        .iter()
+        .find(|item| {
+            item.key.objectid == 5 && item.key.item_type == ffs_btrfs::BTRFS_ITEM_ROOT_ITEM
+        })
+        .unwrap();
+    let root = ffs_btrfs::parse_root_item(&root.data).unwrap().bytenr;
+    let items = filesystem.walk_btrfs_tree(cx, root).unwrap();
+    let inode_item = items
+        .iter()
+        .find(|item| {
+            item.key.objectid == inode.0 && item.key.item_type == ffs_btrfs::BTRFS_ITEM_INODE_ITEM
+        })
+        .unwrap();
+    let inode_item = ffs_btrfs::parse_inode_item(&inode_item.data).unwrap();
+    assert_eq!(
+        inode_item.flags & ffs_btrfs::BTRFS_INODE_NODATASUM == 0,
+        datasum
+    );
+    let logical = items
+        .iter()
+        .find_map(|item| {
+            if item.key.item_type != ffs_btrfs::BTRFS_ITEM_EXTENT_DATA
+                || item.key.offset != 0
+                || item.key.objectid != inode.0
+            {
+                return None;
+            }
+            match ffs_btrfs::parse_extent_data(&item.data).unwrap() {
+                ffs_btrfs::BtrfsExtentData::Regular {
+                    disk_bytenr,
+                    compression: actual_compression,
+                    ..
+                } if disk_bytenr != 0 => {
+                    assert_eq!(
+                        actual_compression, compression,
+                        "kernel extent codec for {name}"
+                    );
+                    Some(disk_bytenr)
+                }
+                _ => None,
+            }
+        })
+        .expect("kernel-written payload extent");
+    let mapping =
+        ffs_ondisk::map_logical_to_stripes(&filesystem.btrfs_context().unwrap().chunks, logical)
+            .unwrap()
+            .unwrap();
+    assert_eq!(mapping.stripes.len(), 2);
+    let mut copies = Vec::new();
+    for stripe in mapping.stripes {
+        let image = images
+            .iter()
+            .find(|image| {
+                let mut file = fs::File::open(image).unwrap();
+                file.seek(SeekFrom::Start(65_536 + 0xC9)).unwrap();
+                let mut id = [0; 8];
+                file.read_exact(&mut id).unwrap();
+                u64::from_le_bytes(id) == stripe.devid
+            })
+            .unwrap();
+        let mut file = fs::File::open(image).unwrap();
+        file.seek(SeekFrom::Start(stripe.physical)).unwrap();
+        let mut original = vec![0; filesystem.btrfs_superblock().unwrap().sectorsize as usize];
+        file.read_exact(&mut original).unwrap();
+        if compression == 0 {
+            assert_eq!(
+                original,
+                payload[..original.len()],
+                "physical copy is payload data"
+            );
+        }
+        copies.push((image.clone(), stripe.physical, original));
+    }
+    assert_eq!(
+        copies[0].2, copies[1].2,
+        "kernel wrote identical data mirrors"
+    );
+    drop(filesystem);
+    let corrupt = |copy: &(PathBuf, u64, Vec<u8>)| {
+        let mut file = fs::OpenOptions::new().write(true).open(&copy.0).unwrap();
+        file.seek(SeekFrom::Start(copy.1 + 17)).unwrap();
+        file.write_all(&[copy.2[17] ^ 1]).unwrap();
+        file.sync_all().unwrap();
+    };
+    corrupt(&copies[0]);
+    let mut expected = payload.to_vec();
+    if !datasum {
+        expected[17] ^= 1;
+    }
+    let recovered = OpenFs::open_with_options(cx, &images[0], &options).unwrap();
+    let attr = recovered
+        .lookup(cx, InodeNumber(1), std::ffi::OsStr::new(name))
+        .unwrap();
+    assert_eq!(
+        recovered
+            .read(cx, attr.ino, 0, u32::try_from(payload.len()).unwrap())
+            .unwrap(),
+        expected
+    );
+    assert_eq!(
+        recovered.read(cx, attr.ino, 13, 8197).unwrap(),
+        expected[13..8210]
+    );
+    drop(recovered);
+    let mounted = OpenFs::open_with_options(cx, &images[0], &options).unwrap();
+    let mountpoint = images[0]
+        .parent()
+        .unwrap()
+        .join(format!("data-mirror-{name}"));
+    fs::create_dir(&mountpoint).unwrap();
+    let session = mount_background(
+        Box::new(mounted),
+        &mountpoint,
+        &MountOptions {
+            read_only: true,
+            auto_unmount: false,
+            ..MountOptions::default()
+        },
+    )
+    .unwrap();
+    let mount = ffs_harness::stale_mounts::MountGuard::new(session, &mountpoint);
+    wait_for_fuse_mount_ready(&mountpoint);
+    assert_eq!(fs::read(mountpoint.join(name)).unwrap(), expected);
+    drop(mount);
+    let unchecked = OpenFs::open_with_options(
+        cx,
+        &images[0],
+        &OpenOptions {
+            btrfs_verify_data_on_read: false,
+            ..options.clone()
+        },
+    )
+    .unwrap();
+    let attr = unchecked
+        .lookup(cx, InodeNumber(1), std::ffi::OsStr::new(name))
+        .unwrap();
+    if compression == 0 {
+        assert_eq!(
+            unchecked.read(cx, attr.ino, 17, 1).unwrap(),
+            [payload[17] ^ 1]
+        );
+    }
+    drop(unchecked);
+    corrupt(&copies[1]);
+    let broken = OpenFs::open_with_options(cx, &images[0], &options).unwrap();
+    let attr = broken
+        .lookup(cx, InodeNumber(1), std::ffi::OsStr::new(name))
+        .unwrap();
+    if datasum {
+        assert!(matches!(
+            broken.read(cx, attr.ino, 0, 32),
+            Err(ffs_error::FfsError::Corruption { .. })
+        ));
+        let mut destination = [0xA5; 32];
+        assert!(matches!(
+            broken.read_into(cx, attr.ino, 0, &mut destination),
+            Err(ffs_error::FfsError::Corruption { .. })
+        ));
+        assert_eq!(
+            destination, [0xA5; 32],
+            "preflight failure must not change caller output"
+        );
+    } else {
+        assert_eq!(broken.read(cx, attr.ino, 0, 32).unwrap(), expected[..32]);
+    }
+    drop(broken);
+    for (path, physical, original) in copies {
+        let mut file = fs::OpenOptions::new().write(true).open(path).unwrap();
+        file.seek(SeekFrom::Start(physical)).unwrap();
+        file.write_all(&original).unwrap();
+        file.sync_all().unwrap();
+    }
+    emit_scenario_result(&format!("btrfs_raid1_data_mirror_{name}"), "PASS", None);
+}
+
 #[test]
 fn btrfs_attached_devices_read_seeded_files() {
     assert!(
@@ -14249,6 +14443,71 @@ fn btrfs_attached_devices_read_seeded_files() {
                 .unwrap()
                 .success()
         );
+        if profile == "raid1" {
+            let compressed = kernel_mount.join("compressed");
+            assert!(
+                Command::new("sudo")
+                    .args(["-n", "touch"])
+                    .arg(&compressed)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(
+                Command::new("sudo")
+                    .args(["-n", "btrfs", "property", "set"])
+                    .arg(&compressed)
+                    .args(["compression", "zstd"])
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(
+                Command::new("sudo")
+                    .args(["-n", "cp", "--reflink=never"])
+                    .arg(&input)
+                    .arg(&compressed)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            let nodatasum = kernel_mount.join("nodatasum");
+            // Force an on-disk compressed rewrite: setting the property alone
+            // does not guarantee that a copy operation writes compressed extents.
+            assert!(
+                Command::new("sudo")
+                    .args(["-n", "btrfs", "filesystem", "defragment", "-czstd", "-f"])
+                    .arg(&compressed)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(
+                Command::new("sudo")
+                    .args(["-n", "touch"])
+                    .arg(&nodatasum)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(
+                Command::new("sudo")
+                    .args(["-n", "chattr", "+C"])
+                    .arg(&nodatasum)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+            assert!(
+                Command::new("sudo")
+                    .args(["-n", "cp", "--reflink=never"])
+                    .arg(&input)
+                    .arg(&nodatasum)
+                    .status()
+                    .unwrap()
+                    .success()
+            );
+        }
         assert!(
             Command::new("sudo")
                 .args(["-n", "umount"])
@@ -14372,6 +14631,9 @@ fn btrfs_attached_devices_read_seeded_files() {
         ));
         if profile == "raid1" {
             assert_btrfs_metadata_mirror_recovery(&cx, &images, &payload);
+            assert_btrfs_data_mirror_recovery(&cx, &images, &payload, "payload", 0, true);
+            assert_btrfs_data_mirror_recovery(&cx, &images, &payload, "compressed", 3, true);
+            assert_btrfs_data_mirror_recovery(&cx, &images, &payload, "nodatasum", 0, false);
         }
         emit_scenario_result(&format!("btrfs_attached_devices_{profile}"), "PASS", None);
     }

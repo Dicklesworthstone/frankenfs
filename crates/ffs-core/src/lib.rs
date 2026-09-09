@@ -12700,6 +12700,107 @@ impl OpenFs {
         Ok(arc)
     }
 
+    /// Read attached-device data through whole-sector checksum validation.
+    /// Only bytes from the validated copy reach the destination, including
+    /// unaligned windows and compressed on-disk data. Missing checksums keep
+    /// the existing unchecked-read policy; single-device reads are unchanged.
+    fn btrfs_read_checksummed_into(
+        &self,
+        cx: &Cx,
+        csum_items: &[(BtrfsKey, Vec<u8>)],
+        sectorsize: usize,
+        mut logical: u64,
+        mut out: &mut [u8],
+    ) -> ffs_error::Result<()> {
+        let Some(devices) = &self.btrfs_devices else {
+            return self.btrfs_read_logical_into(cx, logical, out);
+        };
+        let ctx = self
+            .btrfs_context()
+            .ok_or_else(|| FfsError::Format("not btrfs".into()))?;
+        let sector_len = u64::try_from(sectorsize)
+            .ok()
+            .filter(|size| *size != 0)
+            .ok_or_else(|| FfsError::Format("invalid btrfs sectorsize".into()))?;
+        let csum_size = ffs_btrfs::btrfs_data_csum_size(ctx.csum_type).ok_or_else(|| {
+            FfsError::UnsupportedFeature(format!(
+                "btrfs checksum algorithm {} is not implemented",
+                ctx.csum_type
+            ))
+        })?;
+        logical
+            .checked_add(
+                u64::try_from(out.len())
+                    .map_err(|_| FfsError::Format("btrfs read length overflow".into()))?,
+            )
+            .ok_or_else(|| FfsError::Format("btrfs read end overflow".into()))?;
+        while !out.is_empty() {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            let sector_start = logical - logical % sector_len;
+            let within = usize::try_from(logical - sector_start)
+                .map_err(|_| FfsError::Format("btrfs sector offset overflow".into()))?;
+            let count = out.len().min(sectorsize - within);
+            let Some(expected) =
+                lookup_data_block_csum(csum_items, sector_start, sectorsize, csum_size)
+            else {
+                self.btrfs_read_logical_into(cx, logical, &mut out[..count])?;
+                logical += u64::try_from(count)
+                    .map_err(|_| FfsError::Format("btrfs read length overflow".into()))?;
+                out = &mut out[count..];
+                continue;
+            };
+            let mapping = ffs_ondisk::map_logical_to_stripes(&ctx.chunks, sector_start)
+                .map_err(|error| parse_to_ffs_error(&error))?
+                .ok_or_else(|| FfsError::Corruption {
+                    block: sector_start,
+                    detail: "data sector is not covered by any btrfs chunk".into(),
+                })?;
+            if mapping.contiguous_len < sector_len {
+                return Err(FfsError::Corruption {
+                    block: sector_start,
+                    detail: "data checksum sector crosses a stripe or chunk boundary".into(),
+                });
+            }
+            let mut failure = FfsError::Corruption {
+                block: sector_start,
+                detail: "no readable btrfs data mirror".into(),
+            };
+            let mut verified = None;
+            for stripe in mapping.stripes {
+                let bytes = match devices.readers.read_physical(
+                    cx,
+                    stripe.devid,
+                    stripe.physical,
+                    sectorsize,
+                ) {
+                    Ok(bytes) => bytes,
+                    Err(ffs_btrfs::BtrfsDeviceError::Cancelled) => return Err(FfsError::Cancelled),
+                    Err(error) => {
+                        failure = btrfs_device_error_to_ffs(error);
+                        continue;
+                    }
+                };
+                if ffs_btrfs::btrfs_data_csum_matches(ctx.csum_type, &bytes, expected) {
+                    verified = Some(bytes);
+                    break;
+                }
+                failure = FfsError::Corruption {
+                    block: sector_start,
+                    detail: format!(
+                        "btrfs data csum mismatch at logical {sector_start} (csum_type {})",
+                        ctx.csum_type
+                    ),
+                };
+            }
+            let bytes = verified.ok_or(failure)?;
+            out[..count].copy_from_slice(&bytes[within..within + count]);
+            logical += u64::try_from(count)
+                .map_err(|_| FfsError::Format("btrfs read length overflow".into()))?;
+            out = &mut out[count..];
+        }
+        Ok(())
+    }
+
     /// Verify one regular data extent against the csum tree (bd-x3fcu).
     ///
     /// Reads each on-disk sector of the extent (`disk_num_bytes` from
@@ -12761,7 +12862,7 @@ impl OpenFs {
             else {
                 continue; // no checksum recorded for this sector
             };
-            self.btrfs_read_logical_into(cx, bytenr, &mut sector)?;
+            self.btrfs_read_checksummed_into(cx, csum_items, sectorsize, bytenr, &mut sector)?;
             if !ffs_btrfs::btrfs_data_csum_matches(csum_type, &sector, expected) {
                 let actual = ffs_btrfs::btrfs_data_csum(csum_type, &sector).unwrap_or_default();
                 return Err(FfsError::Corruption {
@@ -13412,6 +13513,7 @@ impl OpenFs {
         // return EIO (Corruption) on a mismatch — matching the kernel — before
         // any data is returned. ON by default, so a plain read pays this cost;
         // the read rows banked before the default flipped did not (bd-6kpp4).
+        let mut read_checksums = None;
         if self.btrfs_verify_data_on_read && inode.flags & BTRFS_INODE_NODATASUM == 0 {
             let verify_sectorsize = self
                 .btrfs_superblock()
@@ -13441,6 +13543,9 @@ impl OpenFs {
                         *disk_num_bytes,
                     )?;
                 }
+            }
+            if self.btrfs_devices.is_some() {
+                read_checksums = Some((csum_items, verify_sectorsize));
             }
         }
 
@@ -13823,7 +13928,18 @@ impl OpenFs {
                                 return (idx, result);
                             }
                             let mut compressed = vec![0_u8; compressed_len];
-                            match self.btrfs_read_logical_into(cx, logical, &mut compressed) {
+                            let read = if let Some((items, sectorsize)) = &read_checksums {
+                                self.btrfs_read_checksummed_into(
+                                    cx,
+                                    items,
+                                    *sectorsize,
+                                    logical,
+                                    &mut compressed,
+                                )
+                            } else {
+                                self.btrfs_read_logical_into(cx, logical, &mut compressed)
+                            };
+                            match read {
                                 Ok(()) => {
                                     let result = if whole_zstd_extent {
                                         Self::btrfs_decompress_zstd_into(&compressed, chunk)
@@ -13872,7 +13988,17 @@ impl OpenFs {
                             idx,
                             source_logical,
                             dst,
-                        } => match self.btrfs_read_logical_into(cx, source_logical, dst) {
+                        } => match if let Some((items, sectorsize)) = &read_checksums {
+                            self.btrfs_read_checksummed_into(
+                                cx,
+                                items,
+                                *sectorsize,
+                                source_logical,
+                                dst,
+                            )
+                        } else {
+                            self.btrfs_read_logical_into(cx, source_logical, dst)
+                        } {
                             Ok(()) => (idx, Ok(BtrfsDeferredReadResult::Done)),
                             Err(err) => (idx, Err(err)),
                         },
@@ -54908,6 +55034,81 @@ mod tests {
             .read(&cx, &mut RequestScope::empty(), InodeNumber(257), 0, 22)
             .expect("read with verify off returns data unverified");
         assert_eq!(data_off.len(), 22);
+    }
+
+    #[test]
+    fn btrfs_data_mirror_cancellation_and_invalid_span_leave_destination_untouched() {
+        for invalid_span in [false, true] {
+            let cx = Cx::for_testing();
+            let mut fs = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(build_btrfs_csum_image())),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            let csums = fs.btrfs_read_csum_items(&cx).unwrap();
+            let logical = BTRFS_TEST_FILE_DATA_LOGICAL as u64;
+            let chunk = fs
+                .btrfs_context
+                .as_mut()
+                .unwrap()
+                .chunks
+                .iter_mut()
+                .find(|chunk| {
+                    logical >= chunk.key.offset && logical - chunk.key.offset < chunk.length
+                })
+                .unwrap();
+            chunk.chunk_type = ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_RAID1;
+            chunk.num_stripes = 2;
+            chunk.stripes = vec![
+                ffs_ondisk::BtrfsStripe {
+                    devid: 1,
+                    offset: 0,
+                    dev_uuid: [1; 16],
+                },
+                ffs_ondisk::BtrfsStripe {
+                    devid: 2,
+                    offset: 0,
+                    dev_uuid: [2; 16],
+                },
+            ];
+            if invalid_span {
+                chunk.length = logical - chunk.key.offset + 2048;
+            }
+            let mut readers = ffs_btrfs::BtrfsDeviceSet::new();
+            readers
+                .add_device(
+                    1,
+                    Box::new(move |cx, _, len| {
+                        assert!(!invalid_span, "invalid checksum span must fail before I/O");
+                        cx.set_cancel_requested(true);
+                        Ok(vec![0; len])
+                    }),
+                )
+                .unwrap();
+            readers
+                .add_device(2, Box::new(|_, _, _| panic!("fallback after cancellation")))
+                .unwrap();
+            fs.btrfs_devices = Some(BtrfsReadDevices {
+                readers,
+                identities: Default::default(),
+            });
+            let mut destination = [0xA5; 22];
+            let error = fs
+                .btrfs_read_checksummed_into(&cx, &csums, 4096, logical, &mut destination)
+                .unwrap_err();
+            if invalid_span {
+                assert!(matches!(error, FfsError::Corruption { .. }));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("crosses a stripe or chunk boundary")
+                );
+            } else {
+                assert!(matches!(error, FfsError::Cancelled));
+            }
+            assert_eq!(destination, [0xA5; 22]);
+        }
     }
 
     #[allow(clippy::significant_drop_tightening)]

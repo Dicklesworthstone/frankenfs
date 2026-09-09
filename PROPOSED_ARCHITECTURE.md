@@ -112,8 +112,14 @@ FUSE with each primary-device choice. Metadata reads validate each complete
 mirror's checksum, logical address and structure before caching it, retrying
 another copy on invalid content. Kernel-written RAID1 tests corrupt chunk-tree,
 root-tree and fs-tree copies independently: one corrupt copy recovers through
-FUSE; two corrupt copies fail. Attached mounts currently require a clean
-tree log and no MVCC WAL; dirty-image recovery, checksum-aware data mirror selection,
+FUSE; two corrupt copies fail. Checksummed file reads validate whole sectors
+and retry mirrors both during the existing pre-output extent check and when
+filling read/decompression buffers, so the bytes returned come from the validated
+copy. Recovery uses sector-sized buffers rather than retaining whole extents.
+Kernel-written RAID1 ordinary/zstd data recovery, unaligned reads, two-bad-copy
+refusal, verification opt-out and NODATASUM behavior are covered through core
+and FUSE tests. Attached mounts currently require a clean
+tree log and no MVCC WAL; dirty-image recovery,
 degraded/profile coverage and parity reconstruction remain open. There is no
 multi-device mutation support.
 `OpenFs::enable_writes` refuses any device count other than one and any known
