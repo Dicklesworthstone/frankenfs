@@ -1589,12 +1589,9 @@ fn resolve_raid10_stripes(
 
 /// RAID5/6: return the data stripe (parity stripes excluded).
 ///
-/// Parity rotation: for each "row" (stripe_nr), the parity position(s) rotate
-/// across devices. RAID5 has 1 parity (P), RAID6 has 2 (P + Q at adjacent
-/// positions modulo num_stripes). Data stripe indices are mapped to actual
-/// device positions by adjusting their rank around the parity positions; this
-/// correctly handles the wrap-around case where P is at the last position
-/// and Q wraps to position 0.
+/// Linux `map_blocks_raid56_read` rotates the ordered data slots forward by
+/// one device per row. Selecting non-parity devices in sorted order loses
+/// that ordering when the row wraps. This does not reconstruct missing data.
 fn resolve_raid56_stripe(
     chunk: &BtrfsChunkEntry,
     offset_within: u64,
@@ -1632,35 +1629,8 @@ fn resolve_raid56_stripe(
                 reason: "RAID5/6 stripe_len * data_stripes overflow",
             })?;
 
-    // Btrfs parity rotation: P and Q rotate left (decreasing device index)
-    // by 1 for each stripe_nr row. For stripe_nr=0, P is at num-1, Q at num-2.
-    let rot = stripe_nr % num;
-    let p_pos = (num - 1).saturating_sub(rot) % num;
-    let q_pos = (num.saturating_sub(2) + num - rot) % num;
-
-    // Map the data rank to its device position by accounting for the one or
-    // two parity slots before it. This selects the same kth non-parity slot as
-    // a linear scan, but its work is independent of the stripe count.
-    let actual_idx = if parity_count == 1 {
-        if stripe_idx < p_pos {
-            stripe_idx
-        } else {
-            stripe_idx + 1
-        }
-    } else {
-        let first_parity = p_pos.min(q_pos);
-        let second_parity = p_pos.max(q_pos);
-        let after_first = if stripe_idx < first_parity {
-            stripe_idx
-        } else {
-            stripe_idx + 1
-        };
-        if after_first < second_parity {
-            after_first
-        } else {
-            after_first + 1
-        }
-    };
+    // Reduce the row first so the addition is bounded by twice num_stripes.
+    let actual_idx = ((stripe_nr % num) + stripe_idx) % num;
 
     let idx = usize::try_from(actual_idx).unwrap_or(usize::MAX);
     let s = chunk.stripes.get(idx).ok_or(ParseError::InvalidField {
@@ -9249,21 +9219,22 @@ mod tests {
             1,
             chunk_type_flags::BTRFS_BLOCK_GROUP_DATA | chunk_type_flags::BTRFS_BLOCK_GROUP_RAID5,
             vec![
-                stripe(1, u64::MAX - 1),
+                stripe(1, u64::MAX - 2),
                 stripe(2, 0x20_0000),
                 stripe(3, 0x30_0000),
             ],
             0,
         )];
 
-        let boundary = map_logical_to_stripes(&chunks, 2)
+        // Device 1 holds the second data slot in row 2, then the first in row 3.
+        let boundary = map_logical_to_stripes(&chunks, 5)
             .expect("boundary stripe mapping should be valid")
             .expect("chunk should cover boundary logical address");
         assert_eq!(boundary.stripes.len(), 1);
         assert_eq!(boundary.stripes[0].devid, 1);
         assert_eq!(boundary.stripes[0].physical, u64::MAX);
 
-        let err = map_logical_to_stripes(&chunks, 8).unwrap_err();
+        let err = map_logical_to_stripes(&chunks, 6).unwrap_err();
         assert_eq!(
             err,
             ParseError::InvalidField {
@@ -9274,7 +9245,7 @@ mod tests {
     }
 
     #[test]
-    fn stripe_resolve_raid5_skips_rotated_parity_position() {
+    fn stripe_resolve_raid5_rotates_data_order() {
         let chunks = vec![make_chunk(
             0,
             65536 * 2 * 4,
@@ -9288,14 +9259,14 @@ mod tests {
             0,
         )];
 
-        // Row 1: parity rotates to position 1 (device 2), so data uses positions 0 and 2.
+        // Row 1: data uses devices 2 then 3; parity is on device 1.
         let data0 = map_logical_to_stripes(&chunks, 131_072)
             .expect("RAID5 row 1 data stripe 0 should map")
             .expect("chunk should cover logical address");
         assert_eq!(data0.profile, BtrfsRaidProfile::Raid5);
         assert_eq!(data0.stripes.len(), 1);
-        assert_eq!(data0.stripes[0].devid, 1);
-        assert_eq!(data0.stripes[0].physical, 0x10_0000 + 65_536);
+        assert_eq!(data0.stripes[0].devid, 2);
+        assert_eq!(data0.stripes[0].physical, 0x20_0000 + 65_536);
 
         let data1 = map_logical_to_stripes(&chunks, 196_608)
             .expect("RAID5 row 1 data stripe 1 should map")
@@ -9308,7 +9279,7 @@ mod tests {
     #[test]
     fn stripe_resolve_raid6_parity_wraparound() {
         // 4 devices, RAID6 (2 parity), stripe_len=65536
-        // This tests the case where P is at device 0 and Q wraps to the last device.
+        // The ordered data slots wrap from the last device to the first.
         let chunks = vec![make_chunk(
             0,
             // Large enough to cover multiple stripe rows
@@ -9324,28 +9295,78 @@ mod tests {
             0,
         )];
 
-        // Row 3 (stripe_nr=3): P at pos 0 (dev 1), Q at pos 3 (dev 4).
-        // Data should be at pos 1 (dev 2) and pos 2 (dev 3).
+        // Row 3: data is on devices 4 then 1; parity is on devices 2 and 3.
         // offset for row 3, data stripe 0 = 3 * 65536 * 2 + 0 = 393216
         let r = map_logical_to_stripes(&chunks, 393_216).unwrap().unwrap();
         assert_eq!(r.profile, BtrfsRaidProfile::Raid6);
         assert_eq!(r.stripes.len(), 1);
-        // Should NOT be dev 1 or 4
-        assert_ne!(
-            r.stripes[0].devid, 1,
-            "stripe_nr=3: position 0 is P parity, data should not map there"
-        );
+        // Must not select a parity device.
+        assert_ne!(r.stripes[0].devid, 2, "stripe_nr=3: device 2 holds parity");
         assert_eq!(
-            r.stripes[0].devid, 2,
-            "stripe_nr=3, data_idx=0: should map to device 2 (position 1)"
+            r.stripes[0].devid, 4,
+            "stripe_nr=3, data_idx=0: should map to device 4"
         );
 
         // Row 3, data stripe 1 = 393216 + 65536 = 458752
         let r2 = map_logical_to_stripes(&chunks, 458_752).unwrap().unwrap();
         assert_eq!(
-            r2.stripes[0].devid, 3,
-            "stripe_nr=3, data_idx=1: should map to device 3 (position 2)"
+            r2.stripes[0].devid, 1,
+            "stripe_nr=3, data_idx=1: should map to device 1"
         );
+    }
+
+    #[test]
+    fn stripe_resolve_raid56_complete_rotation_cycles() {
+        // Fixed ordered-device vectors from the Linux RAID56 layout contract.
+        // Include three data slots so this cannot pass by swapping a pair.
+        let cases: &[(u64, &[&[u64]])] = &[
+            (
+                chunk_type_flags::BTRFS_BLOCK_GROUP_RAID5,
+                &[&[1, 2], &[2, 3], &[3, 1]],
+            ),
+            (
+                chunk_type_flags::BTRFS_BLOCK_GROUP_RAID6,
+                &[&[1, 2], &[2, 3], &[3, 4], &[4, 1]],
+            ),
+            (
+                chunk_type_flags::BTRFS_BLOCK_GROUP_RAID5,
+                &[&[1, 2, 3], &[2, 3, 4], &[3, 4, 1], &[4, 1, 2]],
+            ),
+            (
+                chunk_type_flags::BTRFS_BLOCK_GROUP_RAID6,
+                &[&[1, 2, 3], &[2, 3, 4], &[3, 4, 5], &[4, 5, 1], &[5, 1, 2]],
+            ),
+        ];
+        for &(profile, rows) in cases {
+            let device_count = u64::try_from(rows.len()).unwrap();
+            let data_count = u64::try_from(rows[0].len()).unwrap();
+            let chunks = [make_chunk(
+                4096,
+                64 * data_count * device_count * 2,
+                64,
+                chunk_type_flags::BTRFS_BLOCK_GROUP_DATA | profile,
+                (1..=device_count)
+                    .map(|id| stripe(id, id * 65536))
+                    .collect(),
+                0,
+            )];
+            for (row, devices) in rows.iter().cycle().take(rows.len() * 2).enumerate() {
+                let row = u64::try_from(row).unwrap();
+                for (slot, &device) in devices.iter().enumerate() {
+                    let slot = u64::try_from(slot).unwrap();
+                    for within in [0, 1, 63] {
+                        let logical = 4096 + (row * data_count + slot) * 64 + within;
+                        let mapped = map_logical_to_stripes(&chunks, logical).unwrap().unwrap();
+                        assert_eq!(mapped.stripes.len(), 1);
+                        assert_eq!(mapped.stripes[0].devid, device, "row={row} slot={slot}");
+                        assert_eq!(
+                            mapped.stripes[0].physical,
+                            device * 65536 + row * 64 + within
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]

@@ -14512,6 +14512,8 @@ fn btrfs_attached_devices_read_seeded_files() {
         "raid10",
         "raid1c3",
         "raid1c4",
+        "raid5",
+        "raid6",
     ] {
         let tmp = TempDir::new().expect("tmpdir");
         let payload = patterned_bytes(1024 * 1024 + 37, 251, 0);
@@ -14519,10 +14521,13 @@ fn btrfs_attached_devices_read_seeded_files() {
             tmp.path().join("first.btrfs"),
             tmp.path().join("second.btrfs"),
         ];
-        if matches!(profile, "raid10" | "raid1c3" | "raid1c4") {
+        if matches!(
+            profile,
+            "raid10" | "raid1c3" | "raid1c4" | "raid5" | "raid6"
+        ) {
             images.push(tmp.path().join("third.btrfs"));
         }
-        if matches!(profile, "raid10" | "raid1c4") {
+        if matches!(profile, "raid10" | "raid1c4" | "raid6") {
             images.push(tmp.path().join("fourth.btrfs"));
         }
         for image in &images {
@@ -14797,6 +14802,19 @@ fn btrfs_attached_devices_read_seeded_files() {
             };
             let mut filesystem = OpenFs::open_with_options(&cx, &images[primary], &options)
                 .unwrap_or_else(|error| panic!("open {profile} primary {primary}: {error}"));
+            if matches!(profile, "raid5" | "raid6") {
+                for chunk in &filesystem.btrfs_context().unwrap().chunks {
+                    assert_eq!(
+                        chunk.chunk_type & ffs_ondisk::chunk_type_flags::RAID_MASK,
+                        if profile == "raid5" {
+                            ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_RAID5
+                        } else {
+                            ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_RAID6
+                        }
+                    );
+                    assert_eq!(usize::from(chunk.num_stripes), images.len());
+                }
+            }
             let attr = filesystem
                 .lookup(&cx, InodeNumber(1), std::ffi::OsStr::new("payload"))
                 .unwrap();

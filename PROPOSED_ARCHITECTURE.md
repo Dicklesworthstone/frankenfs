@@ -129,7 +129,11 @@ when an entire group is missing. C3/C4 validate mirror-profile geometry before
 admitting a survivor. Kernel-written three/four-device images cover every
 nonempty proper subset (6 C3 and 14 C4), plus each complete-set primary, through
 ordinary core and cold FUSE reads. Corrupt/compressed C3/C4 combinations remain
-unverified. Unused missing devices
+unverified. Clean three-device RAID5 and four-device RAID6 kernel images pass
+full-file, stripe-boundary and cold FUSE reads with each primary. Their mapper
+rotates ordered data slots forward per physical row, matching Linux; it does
+not reconstruct parity, and admission still requires every stripe device.
+Unused missing devices
 remain in the authoritative inventory. Kernel-image tests mount each RAID1
 survivor alone and reject a missing RAID0 data device despite readable mirrored
 metadata. No sibling images are discovered implicitly. Multi-device mounts require a clean

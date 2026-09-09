@@ -2499,6 +2499,17 @@ For metadata blocks, verification includes:
     Each segment must return exactly its requested length; a short mirror
     read is a failed attempt and may fall back to another copy of that segment.
     RAID5/6 parity is not a readable mirror and requires separate reconstruction.
+    For RAID5/6, Linux v6.19 `map_blocks_raid56_read` in
+    [`fs/btrfs/volumes.c`](https://github.com/torvalds/linux/blob/v6.19/fs/btrfs/volumes.c#L6074-L6085)
+    rotates the ordered data slots, not just the parity positions. With `N`
+    devices, `D = N - parity_count`, stripe length `S`, and chunk-relative
+    offset `x`, the physical row is `floor(x / (S * D))`, the data slot is
+    `floor(x / S) mod D`, and the device index is `(row + slot) mod N`.
+    The device offset is its chunk-stripe base plus `row * S + (x mod S)`.
+    For three-device RAID5 the first three rows use device-index pairs
+    `[0,1], [1,2], [2,0]`; four-device RAID6 adds row `[3,0]` after
+    `[0,1], [1,2], [2,3]`. Sorting data positions around parity loses this
+    ordering and can return parity or another logical stripe's bytes.
 12. `BTRFS_IOC_DEV_INFO` reports device-item identity and device accounting,
     not filesystem-wide UUID or byte totals. The embedded device item starts
     at superblock offset `0xC9`. Device IDs need not be contiguous; lookup

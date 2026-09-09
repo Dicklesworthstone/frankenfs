@@ -273,6 +273,12 @@ and `copy_file_range` dispatch paths used by splice/sendfile-style transfers
 while checking deterministic mount-option labels and the explicit
 writeback-cache-disabled policy.
 
+RAID5/6 read evidence (`bd-hk5w3`): clean kernel-written three/four-device images
+pass full-file, unaligned and cold FUSE reads with every primary. The mapper now
+uses Linux's ordered data rotation; the prior device-order selection reproduced
+a RAID5 data-checksum failure on that same test. Missing stripe devices remain
+refused, parity reconstruction is absent, and the multi-device row stays partial.
+
 ### 2.1 btrfs Experimental RW Capability Contract (Machine-Checkable)
 
 The table below is the authoritative btrfs experimental RW contract for `bd-h6nz.3.1`.

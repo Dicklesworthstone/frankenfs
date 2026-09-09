@@ -176,6 +176,9 @@ fn bench_stripe_map(c: &mut Criterion) {
 }
 
 #[derive(Clone, Copy)]
+// Historical comparison of two non-parity rank selectors. Neither implements
+// Linux RAID56's ordered data rotation; these timings do not measure the
+// production mapper or establish filesystem correctness (bd-hk5w3).
 struct Raid56PositionProbe {
     num_stripes: u64,
     parity_count: u64,

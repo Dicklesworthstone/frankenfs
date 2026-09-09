@@ -12186,15 +12186,15 @@ mod tests {
         // differ from every expected data byte. These fixed layouts exercise
         // boundary assembly, not kernel compatibility or parity reconstruction.
         let raid5 = vec![
-            vec![0, 1, 2, 3, 8, 9, 10, 11, 99, 99, 99, 99],
-            vec![4, 5, 6, 7, 99, 99, 99, 99, 16, 17, 18, 19],
-            vec![99, 99, 99, 99, 12, 13, 14, 15, 20, 21, 22, 23],
+            vec![0, 1, 2, 3, 99, 99, 99, 99, 20, 21, 22, 23],
+            vec![4, 5, 6, 7, 8, 9, 10, 11, 99, 99, 99, 99],
+            vec![99, 99, 99, 99, 12, 13, 14, 15, 16, 17, 18, 19],
         ];
         let raid6 = vec![
-            vec![0, 1, 2, 3, 8, 9, 10, 11, 99, 99, 99, 99],
-            vec![4, 5, 6, 7, 99, 99, 99, 99, 99, 99, 99, 99],
-            vec![99, 99, 99, 99, 99, 99, 99, 99, 16, 17, 18, 19],
-            vec![99, 99, 99, 99, 12, 13, 14, 15, 20, 21, 22, 23],
+            vec![0, 1, 2, 3, 99, 99, 99, 99, 99, 99, 99, 99],
+            vec![4, 5, 6, 7, 8, 9, 10, 11, 99, 99, 99, 99],
+            vec![99, 99, 99, 99, 12, 13, 14, 15, 16, 17, 18, 19],
+            vec![99, 99, 99, 99, 99, 99, 99, 99, 20, 21, 22, 23],
         ];
         for (profile, contents) in [
             (BTRFS_BLOCK_GROUP_RAID5, raid5),
@@ -26746,26 +26746,27 @@ mod tests {
         };
         let chunks = vec![chunk];
 
-        // Row 3: P at pos 3 (dev 4), Q at pos 0 (dev 1).
-        // Data should be at pos 1 (dev 2) and pos 2 (dev 3).
+        // Row 3: data wraps through devices 4 then 1; devices 2 and 3 hold parity.
         // Row 3 offset = 3 * 65536 * 2 = 393216
         let r = map_logical_to_stripes(&chunks, 393_216).unwrap().unwrap();
         assert_eq!(r.profile, BtrfsRaidProfile::Raid6);
         assert_ne!(
-            r.stripes[0].devid, 1,
-            "dev 1 is Q parity in row 3, must not be data target"
+            r.stripes[0].devid, 2,
+            "dev 2 holds parity in row 3, must not be data target"
         );
         assert_ne!(
-            r.stripes[0].devid, 4,
-            "dev 4 is P parity in row 3, must not be data target"
+            r.stripes[0].devid, 3,
+            "dev 3 holds parity in row 3, must not be data target"
         );
-        assert_eq!(r.stripes[0].devid, 2, "data stripe 0 should be dev 2");
+        assert_eq!(r.stripes[0].devid, 4, "data stripe 0 should be dev 4");
+        assert_eq!(r.stripes[0].physical, 0x40_0000 + 3 * 65_536);
 
         // Row 3, data stripe 1
         let r2 = map_logical_to_stripes(&chunks, 393_216 + 65_536)
             .unwrap()
             .unwrap();
-        assert_eq!(r2.stripes[0].devid, 3, "data stripe 1 should be dev 3");
+        assert_eq!(r2.stripes[0].devid, 1, "data stripe 1 should be dev 1");
+        assert_eq!(r2.stripes[0].physical, 0x10_0000 + 3 * 65_536);
     }
 
     // ── Send stream tests ───────────────────────────────────────────────

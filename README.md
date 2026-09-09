@@ -3290,12 +3290,20 @@ read requirement remains open under `bd-hk5w3`; helper tests do not certify it.
 | `RAID0` | Split across data stripes | Clean two-device kernel image + FUSE verified | Deferred |
 | `RAID1` | Mirror fallback on read error | Kernel image + FUSE verified, including either lone surviving device and corrupt metadata/ordinary/zstd data recovery | Deferred |
 | `RAID10` | Split across mirrored stripe groups | Four-device kernel image + FUSE reads; degraded reads require a survivor in every group of every chunk | Deferred |
-| `RAID5` | Owning data stripe; no reconstruction | Routed; mounted evidence pending | Deferred |
-| `RAID6` | Owning data stripe; no reconstruction | Routed; mounted evidence pending | Deferred |
+| `RAID5` | Owning data stripe; no reconstruction | Clean three-device kernel image + core/FUSE reads with each primary | Deferred |
+| `RAID6` | Owning data stripe; no reconstruction | Clean four-device kernel image + core/FUSE reads with each primary | Deferred |
 | `RAID1C3` | Three-copy mapping and read fallback | Clean kernel image + core/FUSE reads across all nonempty device subsets | Deferred |
 | `RAID1C4` | Four-copy mapping and read fallback | Clean kernel image + core/FUSE reads across all nonempty device subsets | Deferred |
 
-The parity rotation logic for RAID5/RAID6 received an explicit fix (`18bc6b0`) to align with btrfs's left-symmetric layout. Stripe-translation properties are differentially validated via metamorphic relations:
+RAID5/6 data slots follow Linux's ordered forward rotation across devices.
+The earlier parity-slot fix (`18bc6b0`) still selected data in device order;
+kernel-written RAID5 data exposed a checksum failure. The corrected mapper
+passes the same image test plus RAID6, with full-file and unaligned reads using
+every primary. Fixed unit vectors cover complete rotations at two data widths.
+Missing stripe devices are refused; parity reconstruction is not implemented.
+The historical non-parity rank-selector microbenchmark does not measure this
+corrected mapping and provides no performance claim for it.
+Additional stripe-translation properties are validated via metamorphic relations:
 
 - **Stripe-translation covariance:** `physical(logical + k) == physical(logical) + k` when `k` fits within one stripe.
 - **Chunk-order permutation invariance:** `parse(perm(chunks)) == parse(chunks)` for any permutation `perm` of the chunk list.
