@@ -684,11 +684,12 @@ struct BtrfsReadDevices {
 
 impl BtrfsReadDevices {
     /// Prove device coverage for every committed chunk, not only the metadata
-    /// touched during open. RAID1 needs one complete copy; RAID10 needs one
-    /// copy in every mirrored stripe group. Other profiles require all devices.
+    /// touched during open. RAID1/C3/C4 need one complete copy; RAID10 needs
+    /// one copy in every mirrored stripe group. Other profiles need all devices.
     fn validate_read_coverage(&self, chunks: &[BtrfsChunkEntry]) -> Result<(), FfsError> {
         use ffs_ondisk::chunk_type_flags::{
-            BTRFS_BLOCK_GROUP_RAID1, BTRFS_BLOCK_GROUP_RAID10, RAID_MASK,
+            BTRFS_BLOCK_GROUP_RAID1, BTRFS_BLOCK_GROUP_RAID1C3, BTRFS_BLOCK_GROUP_RAID1C4,
+            BTRFS_BLOCK_GROUP_RAID10, RAID_MASK,
         };
         for chunk in chunks {
             let present = chunk
@@ -698,6 +699,17 @@ impl BtrfsReadDevices {
                 .count();
             let readable = match chunk.chunk_type & RAID_MASK {
                 BTRFS_BLOCK_GROUP_RAID1 => present > 0,
+                BTRFS_BLOCK_GROUP_RAID1C3 | BTRFS_BLOCK_GROUP_RAID1C4 => {
+                    // Even chunks not read during open must declare a valid
+                    // full-copy profile before a surviving device can cover it.
+                    ffs_ondisk::map_logical_to_stripes(
+                        std::slice::from_ref(chunk),
+                        chunk.key.offset,
+                    )
+                    .map_err(|error| parse_to_ffs_error(&error))?
+                    .ok_or_else(|| FfsError::Format("empty mirrored chunk".into()))?;
+                    present > 0
+                }
                 BTRFS_BLOCK_GROUP_RAID10 => {
                     // Use the same shape validation as actual I/O before
                     // grouping: nonzero stripe length/count/sub_stripes,
@@ -53029,6 +53041,53 @@ mod tests {
                 .to_string()
                 .contains("crosses a stripe or chunk boundary")
         );
+    }
+
+    #[test]
+    fn btrfs_raid1c_admission_requires_valid_geometry_and_a_survivor() {
+        let image = build_btrfs_image();
+        let sb = BtrfsSuperblock::parse_superblock_region(&image[65_536..]).unwrap();
+        let base = parse_sys_chunk_array(&sb.sys_chunk_array)
+            .unwrap()
+            .remove(0);
+        let devices = BtrfsReadDevices {
+            readers: ffs_btrfs::BtrfsDeviceSet::new(),
+            identities: Default::default(),
+        };
+        for (profile, count) in [
+            (ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_RAID1C3, 3),
+            (ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_RAID1C4, 4),
+        ] {
+            let mut chunk = base.clone();
+            chunk.chunk_type = profile;
+            chunk.num_stripes = count;
+            chunk.stripes = (1..=u64::from(count))
+                .map(|devid| ffs_ondisk::BtrfsStripe {
+                    devid,
+                    offset: 0,
+                    dev_uuid: [0; 16],
+                })
+                .collect();
+            let error = devices
+                .validate_read_coverage(std::slice::from_ref(&chunk))
+                .unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("lacks a supported readable device set")
+            );
+
+            // A malformed profile must fail geometry validation, even when
+            // no metadata traversal happened to touch this particular chunk.
+            chunk.num_stripes -= 1;
+            let error = devices
+                .validate_read_coverage(std::slice::from_ref(&chunk))
+                .unwrap_err();
+            assert!(error.to_string().contains("num_stripes"), "{error}");
+            chunk.stripes.pop();
+            let error = devices.validate_read_coverage(&[chunk]).unwrap_err();
+            assert!(error.to_string().contains("num_stripes"), "{error}");
+        }
     }
 
     #[test]

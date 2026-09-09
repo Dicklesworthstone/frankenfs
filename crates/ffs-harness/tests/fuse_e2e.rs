@@ -14369,8 +14369,8 @@ fn assert_btrfs_data_mirror_recovery(
     emit_scenario_result(&format!("btrfs_raid1_data_mirror_{name}"), "PASS", None);
 }
 
-fn assert_btrfs_raid10_survivors(cx: &Cx, images: &[PathBuf], payload: &[u8]) {
-    assert_eq!(images.len(), 4);
+fn assert_btrfs_mirror_survivors(cx: &Cx, images: &[PathBuf], payload: &[u8], profile: &str) {
+    assert_eq!(images.len(), if profile == "raid1c3" { 3 } else { 4 });
     let full = OpenFs::open_with_options(
         cx,
         &images[0],
@@ -14395,19 +14395,38 @@ fn assert_btrfs_raid10_survivors(cx: &Cx, images: &[PathBuf], payload: &[u8]) {
     for chunk in &chunks {
         assert_eq!(
             chunk.chunk_type & ffs_ondisk::chunk_type_flags::RAID_MASK,
-            ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_RAID10
+            match profile {
+                "raid10" => ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_RAID10,
+                "raid1c3" => ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_RAID1C3,
+                "raid1c4" => ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_RAID1C4,
+                _ => panic!("unexpected mirrored profile {profile}"),
+            }
         );
-        assert_eq!(chunk.num_stripes, 4);
-        assert_eq!(chunk.sub_stripes, 2);
+        assert_eq!(usize::from(chunk.num_stripes), images.len());
+        let mut stripe_ids: Vec<_> = chunk.stripes.iter().map(|stripe| stripe.devid).collect();
+        stripe_ids.sort_unstable();
+        let mut expected_ids = ids.clone();
+        expected_ids.sort_unstable();
+        assert_eq!(stripe_ids, expected_ids);
+        if profile == "raid10" {
+            assert_eq!(chunk.sub_stripes, 2);
+        }
     }
     let mut accepted = 0;
     let mut refused = 0;
-    for mask in 1_u32..15 {
-        let selected: Vec<usize> = (0..4).filter(|index| mask & (1 << index) != 0).collect();
+    let full_mask = (1_u32 << images.len()) - 1;
+    for mask in 1_u32..full_mask {
+        let selected: Vec<usize> = (0..images.len())
+            .filter(|index| mask & (1 << index) != 0)
+            .collect();
         // The kernel wrote adjacent pairs of mirrors. Every pair in every
         // committed chunk must intersect the supplied device subset. Actual
         // full payload and stripe-crossing reads below check this prediction.
         let readable = chunks.iter().all(|chunk| {
+            // C3/C4 place a complete copy on every member, verified above.
+            if profile != "raid10" {
+                return true;
+            }
             let (pairs, remainder) = chunk.stripes.as_chunks::<2>();
             assert_eq!(remainder, []);
             pairs.iter().all(|pair| {
@@ -14425,7 +14444,7 @@ fn assert_btrfs_raid10_survivors(cx: &Cx, images: &[PathBuf], payload: &[u8]) {
         let opened = OpenFs::open_with_options(cx, &images[selected[0]], &options);
         if readable {
             let mut filesystem =
-                opened.unwrap_or_else(|error| panic!("RAID10 subset {mask:04b}: {error}"));
+                opened.unwrap_or_else(|error| panic!("{profile} subset {mask:04b}: {error}"));
             let attr = filesystem
                 .lookup(cx, InodeNumber(1), std::ffi::OsStr::new("payload"))
                 .unwrap();
@@ -14444,7 +14463,7 @@ fn assert_btrfs_raid10_survivors(cx: &Cx, images: &[PathBuf], payload: &[u8]) {
             let mountpoint = images[0]
                 .parent()
                 .unwrap()
-                .join(format!("raid10-{mask:04b}"));
+                .join(format!("{profile}-{mask:04b}"));
             fs::create_dir(&mountpoint).unwrap();
             let session = mount_background(
                 Box::new(OpenFs::open_with_options(cx, &images[selected[0]], &options).unwrap()),
@@ -14469,10 +14488,15 @@ fn assert_btrfs_raid10_survivors(cx: &Cx, images: &[PathBuf], payload: &[u8]) {
             refused += 1;
         }
     }
-    assert!(accepted > 0 && refused > 0);
-    assert_eq!(accepted + refused, 14);
-    eprintln!("RAID10 proper device subsets: {accepted} accepted, {refused} refused");
-    emit_scenario_result("btrfs_raid10_surviving_groups", "PASS", None);
+    if profile == "raid10" {
+        assert!(accepted > 0 && refused > 0);
+        assert_eq!(accepted + refused, 14);
+    } else {
+        assert_eq!(accepted, full_mask - 1);
+        assert_eq!(refused, 0);
+    }
+    eprintln!("{profile} proper device subsets: {accepted} accepted, {refused} refused");
+    emit_scenario_result(&format!("btrfs_{profile}_surviving_groups"), "PASS", None);
 }
 
 #[test]
@@ -14481,18 +14505,25 @@ fn btrfs_attached_devices_read_seeded_files() {
         command_available("mkfs.btrfs"),
         "mkfs.btrfs is required for attached-device evidence"
     );
-    for profile in ["raid0", "raid1", "raid0-data", "raid10"] {
+    for profile in [
+        "raid0",
+        "raid1",
+        "raid0-data",
+        "raid10",
+        "raid1c3",
+        "raid1c4",
+    ] {
         let tmp = TempDir::new().expect("tmpdir");
         let payload = patterned_bytes(1024 * 1024 + 37, 251, 0);
         let mut images = vec![
             tmp.path().join("first.btrfs"),
             tmp.path().join("second.btrfs"),
         ];
-        if profile == "raid10" {
-            images.extend([
-                tmp.path().join("third.btrfs"),
-                tmp.path().join("fourth.btrfs"),
-            ]);
+        if matches!(profile, "raid10" | "raid1c3" | "raid1c4") {
+            images.push(tmp.path().join("third.btrfs"));
+        }
+        if matches!(profile, "raid10" | "raid1c4") {
+            images.push(tmp.path().join("fourth.btrfs"));
         }
         for image in &images {
             fs::File::create(image)
@@ -14741,7 +14772,7 @@ fn btrfs_attached_devices_read_seeded_files() {
                 drop(mount);
             }
             emit_scenario_result("btrfs_raid1_each_surviving_device", "PASS", None);
-        } else {
+        } else if !matches!(profile, "raid1c3" | "raid1c4") {
             for image in &images {
                 let error = OpenFs::open(&cx, image).unwrap_err();
                 if profile == "raid0-data" {
@@ -14861,8 +14892,8 @@ fn btrfs_attached_devices_read_seeded_files() {
             assert_btrfs_data_mirror_recovery(&cx, &pair, &payload, "compressed", 3, true);
             assert_btrfs_data_mirror_recovery(&cx, &pair, &payload, "nodatasum", 0, false);
         }
-        if profile == "raid10" {
-            assert_btrfs_raid10_survivors(&cx, &images, &payload);
+        if matches!(profile, "raid10" | "raid1c3" | "raid1c4") {
+            assert_btrfs_mirror_survivors(&cx, &images, &payload, profile);
         }
         emit_scenario_result(&format!("btrfs_attached_devices_{profile}"), "PASS", None);
     }

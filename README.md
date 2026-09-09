@@ -1018,7 +1018,7 @@ btrfs uses copy-on-write B-trees addressed by logical block addresses that must 
 2. **Chunk lookup.** Find the chunk entry whose `[key.offset, key.offset + length)` range contains the target logical address.
 3. **Stripe calculation.** For single-device images, `physical = stripe.offset + (logical - chunk.key.offset)`.
 
-`--btrfs-device PATH` attaches additional devices for clean, read-only btrfs mounts. A clean multi-device image uses `BtrfsDeviceSet` even without extra paths: either surviving RAID1 device can open alone if every committed chunk has a supported readable copy. RAID10 requires a survivor in every mirrored stripe group; other profiles require all stripe devices. Nearby images are never discovered implicitly. Kernel-written RAID0, RAID1 and RAID10 images are tested through FUSE with each primary device. Metadata validates copies before caching; checksummed file reads validate each sector before copying its bytes or decompressing, retrying corrupt mirrors. RAID1 corruption recovery is tested for metadata, ordinary data and zstd data. The remaining profile/degraded matrix and dirty-image recovery remain open. Multi-device writes are deferred and refused.
+`--btrfs-device PATH` attaches additional devices for clean, read-only btrfs mounts. A clean multi-device image uses `BtrfsDeviceSet` even without extra paths: a surviving RAID1/C3/C4 device can open alone if every committed chunk has a supported readable copy. RAID10 requires a survivor in every mirrored stripe group; other profiles require all stripe devices. Nearby images are never discovered implicitly. Kernel-written RAID0, RAID1, RAID10, C3 and C4 images are tested through FUSE with each primary device. Metadata validates copies before caching; checksummed file reads validate each sector before copying its bytes or decompressing, retrying corrupt mirrors. RAID1 corruption recovery is tested for metadata, ordinary data and zstd data. The remaining profile/degraded matrix and dirty-image recovery remain open. Multi-device writes are deferred and refused.
 
 ### Tree walk algorithm
 
@@ -3292,8 +3292,8 @@ read requirement remains open under `bd-hk5w3`; helper tests do not certify it.
 | `RAID10` | Split across mirrored stripe groups | Four-device kernel image + FUSE reads; degraded reads require a survivor in every group of every chunk | Deferred |
 | `RAID5` | Owning data stripe; no reconstruction | Routed; mounted evidence pending | Deferred |
 | `RAID6` | Owning data stripe; no reconstruction | Routed; mounted evidence pending | Deferred |
-| `RAID1C3` | Three-copy mapping and read fallback | V1.x deferred | Deferred |
-| `RAID1C4` | Four-copy mapping and read fallback | V1.x deferred | Deferred |
+| `RAID1C3` | Three-copy mapping and read fallback | Clean kernel image + core/FUSE reads across all nonempty device subsets | Deferred |
+| `RAID1C4` | Four-copy mapping and read fallback | Clean kernel image + core/FUSE reads across all nonempty device subsets | Deferred |
 
 The parity rotation logic for RAID5/RAID6 received an explicit fix (`18bc6b0`) to align with btrfs's left-symmetric layout. Stripe-translation properties are differentially validated via metamorphic relations:
 
@@ -3319,12 +3319,17 @@ Cross-stripe and cross-chunk helpers use independent device byte arrays. The
 RAID0/RAID1 files through core and FUSE with either primary device. It also mounts
 each surviving RAID1 device alone and rejects missing RAID0 data even when all
 metadata is mirrored and readable. Admission checks every committed chunk;
-missing stripes are allowed for RAID1 with at least one attached copy and for
+missing stripes are allowed for RAID1/C3/C4 with at least one attached copy and for
 RAID10 with at least one attached copy in each mirrored stripe group. The
 four-device RAID10 test checks all 14 nonempty proper device subsets, reading
 ordinary file data through FUSE for each supported subset and refusing subsets
 that lose a complete group. An absent unused device does not make a readable
 chunk unavailable.
+C3/C4 also admit a surviving copy in every committed chunk, after validating
+the profile's stripe geometry. Three-device C3 and four-device C4 kernel images
+exercise all 6 and 14 nonempty proper subsets respectively, plus complete sets
+with each primary. Evidence covers ordinary full-file and unaligned core reads
+and cold FUSE reads; C3/C4 corruption and compressed-data cases remain unproven.
 Use repeatable `--btrfs-device PATH` options to attach other images; no implicit
 device discovery occurs. Attachments must share
 the same committed generation and pass checksum, identity and capacity checks.
