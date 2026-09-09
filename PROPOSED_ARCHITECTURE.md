@@ -102,9 +102,16 @@ failure. Readers receive the caller's `Cx`; checkpoints before and after physica
 I/O prevent cancellation from returning bytes or triggering another mirror.
 `BtrfsDeviceError` distinguishes cancellation, I/O, mapping, missing devices and
 incorrect lengths. Registration rejects zero IDs and duplicate IDs without
-replacing an existing reader. These lower-level guarantees are prerequisites for mounted multi-device
-routing; they do not establish device identity validation, degraded RAID5/6
-reconstruction, checksum-aware mirror selection, or multi-device mutation support in `OpenFs`.
+replacing an existing reader. `OpenOptions::btrfs_device_paths` (CLI: repeatable
+`--btrfs-device`) attaches additional backings before bootstrap. Core validates
+superblock checksums, filesystem generation/roots/geometry, device IDs/UUIDs and
+capacity, then checks identities against the committed CHUNK_TREE inventory and
+stripe references. Bootstrap, parsed metadata and file-data reads use the device
+set. Kernel-written RAID0 and RAID1 images are covered through the core API and
+FUSE with each primary-device choice. Attached mounts currently require a clean
+tree log and no MVCC WAL; dirty-image recovery, checksum-aware mirror selection,
+degraded/profile coverage and parity reconstruction remain open. There is no
+multi-device mutation support.
 `OpenFs::enable_writes` refuses any device count other than one and any known
 chunk profile other than Single/DUP before loading mutable allocation state.
 Skipping read validation does not bypass this write-admission check.

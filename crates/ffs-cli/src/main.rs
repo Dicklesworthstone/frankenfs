@@ -600,6 +600,7 @@ struct MountCmdOptions {
     read_write: bool,
     mount_mode: MountMode,
     btrfs_mount_selection: BtrfsMountSelection,
+    btrfs_device_paths: Vec<PathBuf>,
     ext4_data_err_policy: Ext4DataErrPolicy,
     ext4_verify_journal_checksums: bool,
     /// Use ephemeral (tree-log only) commit strategy instead of full durable commit.
@@ -1311,6 +1312,9 @@ enum Command {
             action = ArgAction::Set
         )]
         btrfs_verify_data_on_read: bool,
+        /// Additional backing device for a clean, read-only btrfs filesystem (repeatable).
+        #[arg(long = "btrfs-device", value_name = "PATH", conflicts_with = "rw")]
+        btrfs_device_paths: Vec<PathBuf>,
     },
     /// Run a read-only integrity scan (scrub) on a filesystem image.
     Scrub {
@@ -2438,6 +2442,7 @@ fn run() -> Result<()> {
             snapshot,
             btrfs_rw_ephemeral_ok,
             btrfs_verify_data_on_read,
+            btrfs_device_paths,
         } => {
             let btrfs_mount_selection = parse_btrfs_mount_selection(subvol, snapshot)?;
             let background_scrub = MountBackgroundScrubConfig::resolve(
@@ -2467,6 +2472,7 @@ fn run() -> Result<()> {
                         MountMode::Compat
                     },
                     btrfs_mount_selection,
+                    btrfs_device_paths,
                     ext4_data_err_policy: if ext4_data_err_abort {
                         Ext4DataErrPolicy::Abort
                     } else {
@@ -7756,6 +7762,9 @@ fn build_mount_background_scrub_plan(
     }
 
     if let Some(sb) = open_fs.btrfs_superblock() {
+        if sb.num_devices != 1 {
+            bail!("multi-device background scrub and repair are not yet supported");
+        }
         let image_len = open_fs.device_len();
         let block_size = choose_btrfs_scrub_block_size(image_len, sb.nodesize, sb.sectorsize)
             .with_context(|| {
@@ -8405,6 +8414,7 @@ fn build_mount_open_options(options: &MountCmdOptions) -> OpenOptions {
         ext4_verify_journal_checksums: options.ext4_verify_journal_checksums,
         mount_mode: options.mount_mode,
         btrfs_mount_selection: options.btrfs_mount_selection.clone(),
+        btrfs_device_paths: options.btrfs_device_paths.clone(),
         btrfs_rw_ephemeral_ok: options.btrfs_rw_ephemeral_ok,
         btrfs_verify_data_on_read: options.btrfs_verify_data_on_read,
         ..OpenOptions::default()
@@ -9824,6 +9834,7 @@ mod tests {
             read_write,
             mount_mode: MountMode::Compat,
             btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
+            btrfs_device_paths: Vec::new(),
             ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
             ext4_verify_journal_checksums: true,
             btrfs_rw_ephemeral_ok: false,
@@ -13612,6 +13623,7 @@ mod tests {
                         btrfs_verify_data_on_read: false,
                         mount_mode: MountMode::Compat,
                         btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
+                        btrfs_device_paths: Vec::new(),
                         ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
                         ext4_verify_journal_checksums: true,
                         runtime: MountRuntimeConfig {
@@ -13688,6 +13700,7 @@ mod tests {
                 btrfs_verify_data_on_read: false,
                 mount_mode: MountMode::Compat,
                 btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
+                btrfs_device_paths: Vec::new(),
                 ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
                 ext4_verify_journal_checksums: true,
                 runtime: MountRuntimeConfig {
@@ -13724,6 +13737,7 @@ mod tests {
                 btrfs_verify_data_on_read: false,
                 mount_mode: MountMode::Compat,
                 btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
+                btrfs_device_paths: Vec::new(),
                 ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
                 ext4_verify_journal_checksums: true,
                 runtime: MountRuntimeConfig {
@@ -13742,6 +13756,49 @@ mod tests {
         assert!(
             message.contains("failed to open filesystem image"),
             "per-core mode must be reachable; got: {message}"
+        );
+    }
+
+    #[test]
+    fn cli_mount_btrfs_devices_are_repeatable_and_read_only() {
+        let cli = Cli::try_parse_from([
+            "ffs",
+            "mount",
+            "first.btrfs",
+            "/mnt/ffs",
+            "--btrfs-device",
+            "second.btrfs",
+            "--btrfs-device",
+            "third.btrfs",
+        ])
+        .unwrap();
+        let Command::Mount {
+            btrfs_device_paths, ..
+        } = cli.command
+        else {
+            panic!("expected mount command");
+        };
+        assert_eq!(
+            btrfs_device_paths,
+            vec![PathBuf::from("second.btrfs"), PathBuf::from("third.btrfs")]
+        );
+        let mut options = test_mount_cmd_options(false, MountWritebackCacheConfig::disabled());
+        options.btrfs_device_paths = btrfs_device_paths.clone();
+        assert_eq!(
+            build_mount_open_options(&options).btrfs_device_paths,
+            btrfs_device_paths
+        );
+        assert!(
+            Cli::try_parse_from([
+                "ffs",
+                "mount",
+                "first.btrfs",
+                "/mnt/ffs",
+                "--btrfs-device",
+                "second.btrfs",
+                "--rw",
+            ])
+            .is_err()
         );
     }
 
@@ -13789,6 +13846,7 @@ mod tests {
             btrfs_verify_data_on_read: false,
             mount_mode: MountMode::Compat,
             btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
+            btrfs_device_paths: Vec::new(),
             ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
             ext4_verify_journal_checksums: true,
             runtime: MountRuntimeConfig {
@@ -13876,6 +13934,7 @@ mod tests {
             btrfs_verify_data_on_read: verify,
             mount_mode: MountMode::Compat,
             btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
+            btrfs_device_paths: Vec::new(),
             ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
             ext4_verify_journal_checksums: true,
             runtime: MountRuntimeConfig {
@@ -13912,6 +13971,7 @@ mod tests {
             btrfs_verify_data_on_read: false,
             mount_mode: MountMode::Compat,
             btrfs_mount_selection: BtrfsMountSelection::Subvolume("home".to_owned()),
+            btrfs_device_paths: Vec::new(),
             ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
             ext4_verify_journal_checksums: true,
             runtime: MountRuntimeConfig {
@@ -13943,6 +14003,7 @@ mod tests {
             btrfs_verify_data_on_read: false,
             mount_mode: MountMode::Native,
             btrfs_mount_selection: BtrfsMountSelection::Snapshot("snap-1".to_owned()),
+            btrfs_device_paths: Vec::new(),
             ext4_data_err_policy: Ext4DataErrPolicy::Abort,
             ext4_verify_journal_checksums: false,
             runtime: MountRuntimeConfig {
@@ -13978,6 +14039,7 @@ mod tests {
                     btrfs_verify_data_on_read: false,
                     mount_mode: MountMode::Compat,
                     btrfs_mount_selection: BtrfsMountSelection::Subvolume("missing".to_owned()),
+                    btrfs_device_paths: Vec::new(),
                     ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
                     ext4_verify_journal_checksums: true,
                     runtime: MountRuntimeConfig {
@@ -14024,6 +14086,7 @@ mod tests {
                     btrfs_mount_selection: BtrfsMountSelection::Snapshot(
                         "missing-snapshot".to_owned(),
                     ),
+                    btrfs_device_paths: Vec::new(),
                     ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
                     ext4_verify_journal_checksums: true,
                     runtime: MountRuntimeConfig {
@@ -14067,6 +14130,7 @@ mod tests {
                     btrfs_verify_data_on_read: false,
                     mount_mode: MountMode::Compat,
                     btrfs_mount_selection: BtrfsMountSelection::Subvolume("home".to_owned()),
+                    btrfs_device_paths: Vec::new(),
                     ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
                     ext4_verify_journal_checksums: true,
                     runtime: MountRuntimeConfig {
@@ -14129,6 +14193,7 @@ mod tests {
                     btrfs_verify_data_on_read: false,
                     mount_mode: MountMode::Compat,
                     btrfs_mount_selection: BtrfsMountSelection::Snapshot("snap-home".to_owned()),
+                    btrfs_device_paths: Vec::new(),
                     ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
                     ext4_verify_journal_checksums: true,
                     runtime: MountRuntimeConfig {

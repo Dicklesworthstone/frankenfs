@@ -14044,6 +14044,226 @@ fn btrfs_openfs_ioctl_dev_info_two_device_inventory() {
 }
 
 #[test]
+fn btrfs_attached_devices_read_seeded_files() {
+    assert!(
+        command_available("mkfs.btrfs"),
+        "mkfs.btrfs is required for attached-device evidence"
+    );
+    for profile in ["raid0", "raid1"] {
+        let tmp = TempDir::new().expect("tmpdir");
+        let payload = patterned_bytes(1024 * 1024 + 37, 251, 0);
+        let images = [
+            tmp.path().join("first.btrfs"),
+            tmp.path().join("second.btrfs"),
+        ];
+        for image in &images {
+            fs::File::create(image)
+                .unwrap()
+                .set_len(128 * 1024 * 1024)
+                .unwrap();
+        }
+        let output = Command::new("mkfs.btrfs")
+            .args(["-f", "-d", profile, "-m", profile])
+            .args(&images)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "{profile} format failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        // Populate through the kernel: mkfs --rootdir only supports one device.
+        // The guard owns only loop devices allocated for these temporary images.
+        struct KernelDevices {
+            loops: Vec<String>,
+            mounted: Option<PathBuf>,
+        }
+        impl Drop for KernelDevices {
+            fn drop(&mut self) {
+                if let Some(path) = &self.mounted {
+                    let _ = Command::new("sudo")
+                        .args(["-n", "umount"])
+                        .arg(path)
+                        .status();
+                }
+                for device in &self.loops {
+                    let _ = Command::new("sudo")
+                        .args(["-n", "losetup", "-d", device])
+                        .status();
+                }
+            }
+        }
+        let mut kernel = KernelDevices {
+            loops: Vec::new(),
+            mounted: None,
+        };
+        for image in &images {
+            let output = Command::new("sudo")
+                .args(["-n", "losetup", "--find", "--show"])
+                .arg(image)
+                .output()
+                .unwrap();
+            assert!(
+                output.status.success(),
+                "loop attachment failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            kernel
+                .loops
+                .push(String::from_utf8(output.stdout).unwrap().trim().to_owned());
+        }
+        let kernel_mount = tmp.path().join("kernel");
+        fs::create_dir(&kernel_mount).unwrap();
+        let output = Command::new("sudo")
+            .args(["-n", "mount", "-t", "btrfs", "-o"])
+            .arg(format!("device={}", kernel.loops[1]))
+            .arg(&kernel.loops[0])
+            .arg(&kernel_mount)
+            .output()
+            .unwrap();
+        assert!(
+            output.status.success(),
+            "kernel mount failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        kernel.mounted = Some(kernel_mount.clone());
+        let input = tmp.path().join("payload");
+        fs::write(&input, &payload).unwrap();
+        assert!(
+            Command::new("sudo")
+                .args(["-n", "cp"])
+                .arg(&input)
+                .arg(kernel_mount.join("payload"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("sudo")
+                .args(["-n", "umount"])
+                .arg(&kernel_mount)
+                .status()
+                .unwrap()
+                .success()
+        );
+        kernel.mounted = None;
+        for device in &kernel.loops {
+            assert!(
+                Command::new("sudo")
+                    .args(["-n", "losetup", "-d", device])
+                    .status()
+                    .unwrap()
+                    .success(),
+                "detach owned test loop {device}"
+            );
+        }
+        kernel.loops.clear();
+        drop(kernel);
+        let cx = Cx::for_testing();
+        assert!(
+            OpenFs::open(&cx, &images[0]).is_err(),
+            "RAID image must require device-set routing"
+        );
+        for primary in 0..2 {
+            let options = OpenOptions {
+                btrfs_device_paths: vec![images[1 - primary].clone()],
+                ..OpenOptions::default()
+            };
+            let mut filesystem = OpenFs::open_with_options(&cx, &images[primary], &options)
+                .unwrap_or_else(|error| panic!("open {profile} primary {primary}: {error}"));
+            let attr = filesystem
+                .lookup(&cx, InodeNumber(1), std::ffi::OsStr::new("payload"))
+                .unwrap();
+            assert_eq!(
+                filesystem
+                    .read(&cx, attr.ino, 0, u32::try_from(payload.len()).unwrap())
+                    .unwrap(),
+                payload
+            );
+            assert_eq!(
+                filesystem.read(&cx, attr.ino, 65_530, 32).unwrap(),
+                payload[65_530..65_562]
+            );
+            assert!(filesystem.enable_writes(&cx).is_err());
+            assert!(!filesystem.is_writable());
+            for ssi in [false, true] {
+                let mut txn = filesystem.begin_transaction();
+                txn.stage_write(ffs_types::BlockNumber(0), vec![0xA5; 4096]);
+                let result = if ssi {
+                    filesystem.commit_transaction_ssi(&cx, txn)
+                } else {
+                    filesystem.commit_transaction(&cx, txn)
+                };
+                assert!(
+                    result
+                        .unwrap_err()
+                        .to_string()
+                        .contains("transaction was not published")
+                );
+                assert_eq!(filesystem.mvcc_version_count(), 0);
+            }
+            let mountpoint = tmp.path().join(format!("fuse-{primary}"));
+            fs::create_dir(&mountpoint).unwrap();
+            let session = mount_background(
+                Box::new(filesystem),
+                &mountpoint,
+                &MountOptions {
+                    read_only: true,
+                    auto_unmount: false,
+                    ..MountOptions::default()
+                },
+            )
+            .expect("mount attached devices through FUSE");
+            let mount = ffs_harness::stale_mounts::MountGuard::new(session, &mountpoint);
+            wait_for_fuse_mount_ready(&mountpoint);
+            assert_eq!(fs::read(mountpoint.join("payload")).unwrap(), payload);
+            drop(mount);
+        }
+        let duplicate = OpenOptions {
+            btrfs_device_paths: vec![images[0].clone()],
+            ..OpenOptions::default()
+        };
+        assert!(OpenFs::open_with_options(&cx, &images[0], &duplicate).is_err());
+        let foreign = tmp.path().join("foreign.btrfs");
+        fs::File::create(&foreign)
+            .unwrap()
+            .set_len(128 * 1024 * 1024)
+            .unwrap();
+        assert!(
+            Command::new("mkfs.btrfs")
+                .arg("-f")
+                .arg(&foreign)
+                .output()
+                .unwrap()
+                .status
+                .success()
+        );
+        let wrong = OpenOptions {
+            btrfs_device_paths: vec![foreign],
+            ..OpenOptions::default()
+        };
+        let error = OpenFs::open_with_options(&cx, &images[0], &wrong).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("does not match the clean committed filesystem"),
+            "{error}"
+        );
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        let valid = OpenOptions {
+            btrfs_device_paths: vec![images[1].clone()],
+            ..OpenOptions::default()
+        };
+        assert!(matches!(
+            OpenFs::open_with_options(&cancelled, &images[0], &valid),
+            Err(ffs_error::FfsError::Cancelled)
+        ));
+        emit_scenario_result(&format!("btrfs_attached_devices_{profile}"), "PASS", None);
+    }
+}
+
+#[test]
 fn btrfs_fuse_ioctl_dev_info_via_mounted_path() {
     if !command_available("python3") {
         eprintln!("python3 not available, skipping");

@@ -490,6 +490,9 @@ pub struct OpenOptions {
     pub external_journal_path: Option<std::path::PathBuf>,
     /// Which btrfs tree should be exposed as the mounted root.
     pub btrfs_mount_selection: BtrfsMountSelection,
+    /// Additional backing images for clean, read-only btrfs device sets.
+    /// Each image must belong to the same committed filesystem generation.
+    pub btrfs_device_paths: Vec<std::path::PathBuf>,
     /// ext4 `data_err=` policy for ordered-mode file data writeback errors.
     pub ext4_data_err_policy: Ext4DataErrPolicy,
     /// Whether JBD2 descriptor/commit/revoke checksums are enforced during replay.
@@ -541,6 +544,7 @@ impl Default for OpenOptions {
             mvcc_replay_policy: TailPolicy::default(),
             external_journal_path: None,
             btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
+            btrfs_device_paths: Vec::new(),
             ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
             ext4_verify_journal_checksums: true,
             numa_allocation_policy: NumaAllocationPolicy::Disabled,
@@ -669,6 +673,142 @@ pub struct BtrfsContext {
     pub subvol_objectid: u64,
     /// Root inode objectid inside the mounted subvolume's filesystem tree.
     pub subvol_root_dirid: u64,
+}
+
+struct BtrfsReadDevices {
+    readers: ffs_btrfs::BtrfsDeviceSet,
+    identities: std::collections::BTreeMap<u64, ffs_ondisk::BtrfsDevItem>,
+}
+
+impl BtrfsReadDevices {
+    fn open(
+        cx: &Cx,
+        primary: &Arc<dyn ByteDevice>,
+        sb: &BtrfsSuperblock,
+        paths: &[std::path::PathBuf],
+    ) -> Result<Self, FfsError> {
+        let mut devices = Self {
+            readers: ffs_btrfs::BtrfsDeviceSet::new(),
+            identities: std::collections::BTreeMap::new(),
+        };
+        devices.attach(cx, Arc::clone(primary), sb)?;
+        for path in paths {
+            devices.attach(cx, Arc::new(FileByteDevice::open(path)?), sb)?;
+        }
+        Ok(devices)
+    }
+
+    fn attach(
+        &mut self,
+        cx: &Cx,
+        dev: Arc<dyn ByteDevice>,
+        primary: &BtrfsSuperblock,
+    ) -> Result<(), FfsError> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let region = read_btrfs_superblock_region(cx, dev.as_ref())?;
+        ffs_ondisk::verify_btrfs_superblock_checksum(&region)
+            .map_err(|error| parse_to_ffs_error(&error))?;
+        let sb = BtrfsSuperblock::parse_superblock_region(&region)
+            .map_err(|error| parse_to_ffs_error(&error))?;
+        validate_btrfs_superblock(&sb)?;
+        if sb.fsid != primary.fsid
+            || sb.generation != primary.generation
+            || sb.root != primary.root
+            || sb.chunk_root != primary.chunk_root
+            || sb.chunk_root_generation != primary.chunk_root_generation
+            || sb.nodesize != primary.nodesize
+            || sb.sectorsize != primary.sectorsize
+            || sb.csum_type != primary.csum_type
+            || sb.num_devices != primary.num_devices
+            || sb.log_root != 0
+        {
+            return Err(FfsError::Format(
+                "attached btrfs device does not match the clean committed filesystem".into(),
+            ));
+        }
+        let item = read_btrfs_backing_device_item(cx, dev.as_ref(), &sb)?;
+        if item.total_bytes > dev.len_bytes()
+            || self
+                .identities
+                .values()
+                .any(|known| known.uuid == item.uuid)
+        {
+            return Err(FfsError::Format(
+                "attached btrfs device is truncated or has a duplicate UUID".into(),
+            ));
+        }
+        let total_bytes = item.total_bytes;
+        self.readers
+            .add_device(
+                item.devid,
+                Box::new(move |cx, offset, len| {
+                    if u64::try_from(len)
+                        .ok()
+                        .and_then(|len| offset.checked_add(len))
+                        .is_none_or(|end| end > total_bytes)
+                    {
+                        return Err(std::io::Error::new(
+                            std::io::ErrorKind::UnexpectedEof,
+                            "btrfs read exceeds declared device capacity",
+                        )
+                        .into());
+                    }
+                    let mut bytes = vec![0; len];
+                    dev.read_exact_at(cx, ByteOffset(offset), &mut bytes)
+                        .map_err(|error| match error {
+                            FfsError::Cancelled => ffs_btrfs::BtrfsDeviceError::Cancelled,
+                            FfsError::Io(error) => ffs_btrfs::BtrfsDeviceError::Io(error),
+                            other => ffs_btrfs::BtrfsDeviceError::Io(std::io::Error::other(other)),
+                        })?;
+                    Ok(bytes)
+                }),
+            )
+            .map_err(btrfs_device_error_to_ffs)?;
+        self.identities.insert(item.devid, item);
+        Ok(())
+    }
+
+    fn read_node(
+        &self,
+        cx: &Cx,
+        chunks: &[BtrfsChunkEntry],
+        logical: u64,
+        nodesize: u32,
+        csum_type: u16,
+    ) -> Result<Arc<BtrfsParsedNode>, ParseError> {
+        let bytes = self
+            .readers
+            .read_logical(cx, chunks, logical, nodesize as usize)
+            .map_err(|_| ParseError::InvalidField {
+                field: "btrfs_device_read",
+                reason: "attached device read failed",
+            })?;
+        parse_btrfs_tree_node_owned(bytes, csum_type, logical, nodesize).map(Arc::new)
+    }
+
+    fn walk_tree(
+        &self,
+        cx: &Cx,
+        chunks: &[BtrfsChunkEntry],
+        root: u64,
+        sb: &BtrfsSuperblock,
+    ) -> Result<Vec<BtrfsLeafEntry>, FfsError> {
+        let result = ffs_btrfs::walk_tree_with_nodes(
+            &mut |logical| self.read_node(cx, chunks, logical, sb.nodesize, sb.csum_type),
+            root,
+            sb.nodesize,
+        );
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        result.map_err(|error| parse_to_ffs_error(&error))
+    }
+}
+
+fn btrfs_device_error_to_ffs(error: ffs_btrfs::BtrfsDeviceError) -> FfsError {
+    match error {
+        ffs_btrfs::BtrfsDeviceError::Cancelled => FfsError::Cancelled,
+        ffs_btrfs::BtrfsDeviceError::Io(error) => FfsError::Io(error),
+        other => FfsError::Io(std::io::Error::other(other)),
+    }
 }
 
 /// Which btrfs tree should be exposed as the mounted root.
@@ -1459,7 +1599,9 @@ pub struct OpenFs {
     /// Latched when an ext4 write I/O error forces a read-only remount.
     ext4_forced_read_only: AtomicBool,
     /// Block device for I/O operations.
-    dev: Box<dyn ByteDevice>,
+    dev: Arc<dyn ByteDevice>,
+    /// Explicitly attached btrfs devices; writable mounts use the single-device path.
+    btrfs_devices: Option<BtrfsReadDevices>,
     /// MVCC version store for snapshot-isolated block access.
     ///
     /// Shared across all snapshots/transactions that operate on this filesystem.
@@ -5548,6 +5690,26 @@ impl OpenFs {
             dev
         };
 
+        let dev: Arc<dyn ByteDevice> = Arc::from(dev);
+        let btrfs_devices = if options.btrfs_device_paths.is_empty() {
+            None
+        } else {
+            let FsFlavor::Btrfs(sb) = &flavor else {
+                return Err(FfsError::Format("additional devices require btrfs".into()));
+            };
+            if sb.num_devices < 2 || sb.log_root != 0 || options.mvcc_wal_path.is_some() {
+                return Err(FfsError::UnsupportedFeature(
+                    "device attachment requires a clean multi-device btrfs image without an MVCC WAL".into(),
+                ));
+            }
+            Some(BtrfsReadDevices::open(
+                cx,
+                &dev,
+                sb,
+                &options.btrfs_device_paths,
+            )?)
+        };
+
         let mut btrfs_tree_log_items = Vec::new();
         let mut btrfs_foreign_tree_log = false;
         let (ext4_geometry, btrfs_context) = match &flavor {
@@ -5588,7 +5750,8 @@ impl OpenFs {
                 }
                 let bootstrap_chunks = parse_sys_chunk_array(&sb.sys_chunk_array)
                     .map_err(|e| parse_to_ffs_error(&e))?;
-                let bootstrap_only = options.skip_validation
+                let bootstrap_only = btrfs_devices.is_none()
+                    && options.skip_validation
                     && matches!(
                         options.btrfs_mount_selection,
                         BtrfsMountSelection::DefaultRoot
@@ -5606,7 +5769,20 @@ impl OpenFs {
                         sb.root_dir_objectid,
                     )
                 } else {
-                    let chunks = {
+                    let chunks = if let Some(devices) = &btrfs_devices {
+                        let items = devices.walk_tree(cx, &bootstrap_chunks, sb.chunk_root, sb)?;
+                        let mut chunks = Vec::new();
+                        for item in items {
+                            if item.key.item_type == ffs_btrfs::BTRFS_ITEM_CHUNK {
+                                chunks.push(
+                                    ffs_btrfs::parse_chunk_item(&item.data, item.key.offset)
+                                        .map_err(|error| parse_to_ffs_error(&error))?,
+                                );
+                            }
+                        }
+                        chunks.sort_by_key(|chunk| chunk.key.offset);
+                        chunks
+                    } else {
                         let bootstrap_ref = &bootstrap_chunks;
                         let mut read_bootstrap =
                             |physical: u64| -> std::result::Result<Vec<u8>, ParseError> {
@@ -5641,7 +5817,9 @@ impl OpenFs {
                         }
                     };
 
-                    let root_tree_items = {
+                    let root_tree_items = if let Some(devices) = &btrfs_devices {
+                        devices.walk_tree(cx, &chunks, sb.root, sb)?
+                    } else {
                         let nodesize = sb.nodesize;
                         let chunks_ref = &chunks;
                         let mut read_phys =
@@ -5826,6 +6004,7 @@ impl OpenFs {
             numa_allocation_policy: options.numa_allocation_policy.clone(),
             ext4_forced_read_only: AtomicBool::new(false),
             dev,
+            btrfs_devices,
             mvcc_store,
             mvcc_flushed_through: Mutex::new(CommitSeq(0)),
             metadata_log,
@@ -5898,6 +6077,36 @@ impl OpenFs {
             btrfs_dir_entry_cache: ShardedCache::new(),
             btrfs_decompressed_extent_cache: ShardedCache::new(),
         };
+
+        if let Some(devices) = &fs.btrfs_devices {
+            let sb = fs
+                .btrfs_superblock()
+                .ok_or_else(|| FfsError::Format("not btrfs".into()))?;
+            let inventory = fs.current_btrfs_device_items(cx, sb)?;
+            for (id, attached) in &devices.identities {
+                if !inventory.get(id).is_some_and(|item| {
+                    item.uuid == attached.uuid && item.total_bytes == attached.total_bytes
+                }) {
+                    return Err(FfsError::Format(
+                        "attached device disagrees with chunk-tree identity or capacity".into(),
+                    ));
+                }
+            }
+            if let Some(ctx) = &fs.btrfs_context {
+                for chunk in &ctx.chunks {
+                    for stripe in &chunk.stripes {
+                        if inventory
+                            .get(&stripe.devid)
+                            .is_none_or(|item| item.uuid != stripe.dev_uuid)
+                        {
+                            return Err(FfsError::Format(
+                                "chunk stripe device identity mismatch".into(),
+                            ));
+                        }
+                    }
+                }
+            }
+        }
 
         if fs.is_ext4() && !options.skip_validation {
             fs.ext4_journal_replay = fs.maybe_replay_ext4_journal(
@@ -8738,6 +8947,7 @@ impl OpenFs {
     /// `CommitError::DurabilityFailure` after the MVCC commit has become visible.
     /// That error does not roll back the transaction; callers must not assume
     /// that retrying the original write is safe.
+    /// Attached read-only btrfs devices reject publication before any MVCC change.
     ///
     /// # Logging
     /// - `txn_commit_start`: transaction details before commit
@@ -8745,6 +8955,12 @@ impl OpenFs {
     /// - `txn_commit_conflict`: on FCW conflict with conflict details
     #[allow(clippy::cast_possible_truncation)]
     pub fn commit_transaction(&self, cx: &Cx, txn: Transaction) -> Result<CommitSeq, CommitError> {
+        if self.btrfs_devices.is_some() {
+            return Err(CommitError::DurabilityFailure {
+                detail: "attached btrfs devices are read-only; transaction was not published"
+                    .into(),
+            });
+        }
         let txn_id = txn.id;
         let write_set_size = txn.pending_writes();
         let read_set_size = txn.read_set().len();
@@ -8875,6 +9091,12 @@ impl OpenFs {
         cx: &Cx,
         txn: Transaction,
     ) -> Result<CommitSeq, CommitError> {
+        if self.btrfs_devices.is_some() {
+            return Err(CommitError::DurabilityFailure {
+                detail: "attached btrfs devices are read-only; transaction was not published"
+                    .into(),
+            });
+        }
         let txn_id = txn.id;
         let write_set_size = txn.pending_writes();
         let read_set_size = txn.read_set().len();
@@ -10489,6 +10711,17 @@ impl OpenFs {
         let nodesize = ctx.nodesize;
         let ns = usize::try_from(nodesize)
             .map_err(|_| ParseError::IntegerConversion { field: "nodesize" })?;
+        if let Some(devices) = &self.btrfs_devices {
+            let node = devices.read_node(cx, &ctx.chunks, logical, nodesize, ctx.csum_type)?;
+            if cacheable {
+                self.btrfs_parsed_node_cache.insert_within(
+                    logical,
+                    Arc::clone(&node),
+                    BTRFS_TREE_NODE_CACHE_LIMIT,
+                );
+            }
+            return Ok(node);
+        }
         // bd-cjqhh: the mount-time chunk list is the FAST path, and the live chunk
         // tree is the fallback.
         //
@@ -11963,6 +12196,16 @@ impl OpenFs {
         let ctx = self
             .btrfs_context()
             .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?;
+        if let Some(devices) = &self.btrfs_devices {
+            // Attached-device mounts cannot enable writes or replay an MVCC WAL.
+            // There is therefore no physical-address-only overlay to bypass here.
+            let bytes = devices
+                .readers
+                .read_logical(cx, &ctx.chunks, logical, out.len())
+                .map_err(btrfs_device_error_to_ffs)?;
+            out.copy_from_slice(&bytes);
+            return Ok(());
+        }
         let block_size = u64::from(self.block_size());
         let bs_usize = block_size as usize;
         let block_dev = self.block_device_adapter();

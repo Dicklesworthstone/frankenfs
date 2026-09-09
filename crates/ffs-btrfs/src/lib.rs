@@ -9765,7 +9765,7 @@ const BTRFS_CHUNK_ITEM_STRIPE_SIZE: usize = 32;
 ///
 /// The `logical_offset` is the chunk's key.offset (logical start address).
 /// The data contains the fixed chunk header (48 bytes) + stripe entries.
-fn parse_chunk_item(data: &[u8], logical_offset: u64) -> Result<BtrfsChunkEntry, ParseError> {
+pub fn parse_chunk_item(data: &[u8], logical_offset: u64) -> Result<BtrfsChunkEntry, ParseError> {
     use ffs_types::{read_le_u16, read_le_u32, read_le_u64};
 
     if data.len() < BTRFS_CHUNK_ITEM_FIXED_SIZE {

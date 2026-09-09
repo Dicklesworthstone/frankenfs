@@ -1018,7 +1018,7 @@ btrfs uses copy-on-write B-trees addressed by logical block addresses that must 
 2. **Chunk lookup.** Find the chunk entry whose `[key.offset, key.offset + length)` range contains the target logical address.
 3. **Stripe calculation.** For single-device images, `physical = stripe.offset + (logical - chunk.key.offset)`.
 
-Standalone RAID mapping and `BtrfsDeviceSet` helpers cover stripe calculations and mirror fallback. The mounted core path still calls the single-device `map_logical_to_physical` mapper, which rejects profiles other than Single/Dup. Helper coverage does not establish mounted multi-device read/write support.
+`--btrfs-device PATH` attaches additional devices for clean, read-only btrfs mounts. Bootstrap, metadata and file-data reads use `BtrfsDeviceSet`; kernel-written RAID0 and RAID1 images are tested through FUSE with either primary device. The remaining profile/degraded matrix, dirty-image recovery and checksum-aware mirror retry remain open. Multi-device writes are deferred and refused.
 
 ### Tree walk algorithm
 
@@ -3287,11 +3287,11 @@ read requirement remains open under `bd-hk5w3`; helper tests do not certify it.
 |---|---|---|---|
 | `Single` | Linear, split at chunk boundaries | Implemented | Experimental |
 | `DUP` | Alternate copies on one device | Implemented using primary mapping | Experimental |
-| `RAID0` | Split across data stripes | Not integrated | Deferred |
-| `RAID1` | Mirror fallback on read error | Not integrated | Deferred |
-| `RAID10` | Split across mirrored stripe groups | Not integrated | Deferred |
-| `RAID5` | Owning data stripe; no reconstruction | Not integrated | Deferred |
-| `RAID6` | Owning data stripe; no reconstruction | Not integrated | Deferred |
+| `RAID0` | Split across data stripes | Clean two-device kernel image + FUSE verified | Deferred |
+| `RAID1` | Mirror fallback on read error | Clean two-device kernel image + FUSE verified; degraded evidence pending | Deferred |
+| `RAID10` | Split across mirrored stripe groups | Routed; mounted evidence pending | Deferred |
+| `RAID5` | Owning data stripe; no reconstruction | Routed; mounted evidence pending | Deferred |
+| `RAID6` | Owning data stripe; no reconstruction | Routed; mounted evidence pending | Deferred |
 | `RAID1C3` | Three-copy mapping and read fallback | V1.x deferred | Deferred |
 | `RAID1C4` | Four-copy mapping and read fallback | V1.x deferred | Deferred |
 
@@ -3304,8 +3304,14 @@ The parity rotation logic for RAID5/RAID6 received an explicit fix (`18bc6b0`) t
 `BtrfsDeviceSet::read_logical` retries another mirror when a reader returns an
 error or the wrong byte count. It does not independently verify data checksums:
 a corrupt buffer of the correct length requires validation by the caller.
-Cross-stripe and cross-chunk tests use independent device byte arrays; mounted
-kernel-generated multi-device evidence remains outstanding.
+Cross-stripe and cross-chunk helpers use independent device byte arrays. The
+`btrfs_attached_devices_read_seeded_files` test additionally reads kernel-written
+RAID0/RAID1 files through core and FUSE with either primary device. Use repeatable
+`--btrfs-device PATH` options to attach the other images. Attachments must share
+the same committed generation and pass checksum, identity and capacity checks.
+Dirty tree logs and MVCC WAL replay are not yet supported for attached mounts.
+Multi-device background scrub/repair is also pending; automatic scrub reports
+that limitation and explicit requests fail instead of scanning only one image.
 
 ---
 
@@ -3431,6 +3437,9 @@ cargo run -p ffs-cli -- mount <image-path> <mountpoint> --rw \
 
 # Mount with btrfs subvolume / snapshot selection
 cargo run -p ffs-cli -- mount <image-path> <mountpoint> --subvol home
+
+# Clean multi-device btrfs, read-only (repeat --btrfs-device for additional images)
+cargo run -p ffs-cli -- mount first.btrfs /mnt/ffs --btrfs-device second.btrfs
 cargo run -p ffs-cli -- mount <image-path> <mountpoint> --snapshot 2026-05-01
 
 # Mount with explicit kernel writeback-cache (fully evidence-gated)
@@ -3620,7 +3629,7 @@ Rows in the btrfs experimental RW contract can still be `partially supported` or
 ### What works today
 
 - **ext4.** Superblock, inode, extent header/entry, group descriptor, feature flag decoding, mount-time journal recovery (JBD2 + fast-commit + external-journal pairing), FUSE mount (RO default, experimental RW), `e2compr` read+write for gzip/LZO/none, casefold, encryption nokey mode, inline data, indirect block addressing, fallocate (KEEP_SIZE / PUNCH_HOLE / ZERO_RANGE / COLLAPSE_RANGE / INSERT_RANGE), POSIX ACL xattrs, MMP conservative rejection.
-- **btrfs.** Superblock, B-tree header, leaf item metadata, geometry validation, standalone RAID mapping helpers, single-device Single/Dup mounted mapping, FUSE mount (RO default; experimental RW with durable writeback via `btrfs_full_transaction_commit`), transparent ZLIB/LZO/ZSTD decompression, named subvolume/snapshot selection, tree-log replay, send/receive stream parsing, btrfs fallocate (KEEP_SIZE / PUNCH_HOLE / ZERO_RANGE / COLLAPSE_RANGE / INSERT_RANGE), backup superblock mirror repair, fragmentation-aware free-run reporting. Mounted multi-device RAID integration remains incomplete.
+- **btrfs.** Superblock, B-tree header, leaf item metadata, geometry validation, RAID mapping helpers, single-device Single/Dup mounts and clean multi-device read-only attachment with RAID0/RAID1 FUSE evidence, FUSE mount (RO default; experimental single-device RW with durable writeback via `btrfs_full_transaction_commit`), transparent ZLIB/LZO/ZSTD decompression, named subvolume/snapshot selection, tree-log replay, send/receive stream parsing, btrfs fallocate (KEEP_SIZE / PUNCH_HOLE / ZERO_RANGE / COLLAPSE_RANGE / INSERT_RANGE), backup superblock mirror repair, fragmentation-aware free-run reporting. The remaining mounted multi-device profile/degraded matrix is incomplete.
 - **MVCC.** Snapshot visibility, commit sequencing, FCW conflict detection, four same-block merge mechanisms behind semantic `MergeProof` labels, three conflict policies with adaptive expected-loss selection, EMA contention tracking, sharded concurrent store, Zstd/Brotli version compression, WAL persistence + crash recovery, SSI two-edge rw-antidependency detection.
 - **Self-healing.** Bayesian durability autopilot, RaptorQ symbol generation/recovery, four refresh policies (Eager/Lazy/Adaptive/Hybrid), stale-window SLO with percentile-based breach detection, multi-host repair-ownership coordination, expected-loss policy comparison, mounted automatic repair contract (read-only + read-write via MVCC repair-writeback serializer).
 - **Writeback-cache.** Epoch-based commit barriers with per-inode staged/visible/durable tracking, deferred visibility for MVCC isolation, dirty-page ordering oracle, 12-point crash/replay matrix artifact gate, runtime guard, and host/lane manifest checks. Kernel option default-off; explicit opt-in is evidence-gated.
@@ -3650,7 +3659,7 @@ See [`FEATURE_PARITY.md`](FEATURE_PARITY.md) for the full capability matrix and 
 
 **ext4.** Single-device images with block sizes 1K/2K/4K. Requires `FILETYPE`; `EXTENTS` is optional (indirect-block addressing is supported). FUSE mount defaults to read-only; `--rw` is available but experimental. All known incompat feature flags are accepted at mount time. `COMPRESSION` covers ext4 e2compr read/write for the implemented gzip/LZO/"none" method-table paths; rare legacy codecs (`lzv1`, `bzip2`, `lzrw3a`) reject deterministically with `EOPNOTSUPP`. `JOURNAL_DEV` images are detected; data filesystems referencing an external journal support paired-open replay through `OpenOptions::external_journal_path` (library API) with UUID/block-size validation. `ENCRYPT` shows filenames as raw bytes (nokey mode). `CASEFOLD` provides case-insensitive directory lookup. `INLINE_DATA` reads from inode block area + `system.data` xattr. MMP unsafe states are rejected with `EOPNOTSUPP`.
 
-**btrfs.** Current mounted address translation supports single-device Single/Dup images. Multi-device RAID helpers exist, but their integration into mounted reads and writes is incomplete. Metadata parsing + validation covers superblocks, leaf items, sys_chunk_array, chunk-tree walking, and device-tree walking. The operator-facing mount path is experimental and defaults to read-only. `--rw` enables durable btrfs metadata mutation via `btrfs_full_transaction_commit()`. The `--btrfs-rw-ephemeral-ok` flag controls commit strategy (ephemeral tree-log vs full durable commit), not permission. Transparent ZLIB/LZO/ZSTD decompression, named subvolume/snapshot selection (`--subvol`, `--snapshot`), tree-log replay, and send/receive stream parsing are implemented in source; current compatibility evidence must identify the exercised paths.
+**btrfs.** Mounted address translation supports single-device Single/Dup images and explicit clean multi-device read-only attachment, with kernel-written RAID0/RAID1 FUSE evidence. The remaining profile/degraded read matrix and checksum-aware mirror retry are incomplete; multi-device writes remain deferred. Metadata parsing + validation covers superblocks, leaf items, sys_chunk_array, chunk-tree walking, and device-tree walking. The operator-facing mount path is experimental and defaults to read-only. `--rw` enables durable single-device btrfs metadata mutation via `btrfs_full_transaction_commit()`. The `--btrfs-rw-ephemeral-ok` flag controls commit strategy (ephemeral tree-log vs full durable commit), not permission. Transparent ZLIB/LZO/ZSTD decompression, named subvolume/snapshot selection (`--subvol`, `--snapshot`), tree-log replay, and send/receive stream parsing are implemented in source; current compatibility evidence must identify the exercised paths.
 
 ### btrfs RW contract
 
