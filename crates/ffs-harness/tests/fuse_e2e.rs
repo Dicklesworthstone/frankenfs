@@ -14101,6 +14101,14 @@ fn assert_btrfs_metadata_mirror_recovery(cx: &Cx, images: &[PathBuf; 2], payload
             file.sync_all().unwrap();
         };
         corrupt(&copies[0]);
+        let lone_bad = OpenFs::open(cx, &copies[0].0).and_then(|filesystem| {
+            let attr = filesystem.lookup(cx, InodeNumber(1), std::ffi::OsStr::new("payload"))?;
+            filesystem.read(cx, attr.ino, 0, 32)
+        });
+        assert!(
+            lone_bad.is_err(),
+            "unattached healthy metadata mirror must not be discovered"
+        );
         let recovered = OpenFs::open_with_options(cx, &images[0], &options)
             .unwrap_or_else(|error| panic!("recover metadata node {logical}: {error}"));
         let attr = recovered
@@ -14258,6 +14266,19 @@ fn assert_btrfs_data_mirror_recovery(
         file.sync_all().unwrap();
     };
     corrupt(&copies[0]);
+    if datasum {
+        let lone_bad = OpenFs::open(cx, &copies[0].0).unwrap();
+        let attr = lone_bad
+            .lookup(cx, InodeNumber(1), std::ffi::OsStr::new(name))
+            .unwrap();
+        assert!(
+            matches!(
+                lone_bad.read(cx, attr.ino, 0, 32),
+                Err(ffs_error::FfsError::Corruption { .. })
+            ),
+            "unattached healthy data mirror must not be discovered"
+        );
+    }
     let mut expected = payload.to_vec();
     if !datasum {
         expected[17] ^= 1;
@@ -14354,7 +14375,7 @@ fn btrfs_attached_devices_read_seeded_files() {
         command_available("mkfs.btrfs"),
         "mkfs.btrfs is required for attached-device evidence"
     );
-    for profile in ["raid0", "raid1"] {
+    for profile in ["raid0", "raid1", "raid0-data"] {
         let tmp = TempDir::new().expect("tmpdir");
         let payload = patterned_bytes(1024 * 1024 + 37, 251, 0);
         let images = [
@@ -14368,7 +14389,21 @@ fn btrfs_attached_devices_read_seeded_files() {
                 .unwrap();
         }
         let output = Command::new("mkfs.btrfs")
-            .args(["-f", "-d", profile, "-m", profile])
+            .args([
+                "-f",
+                "-d",
+                if profile == "raid0-data" {
+                    "raid0"
+                } else {
+                    profile
+                },
+                "-m",
+                if profile == "raid0-data" {
+                    "raid1"
+                } else {
+                    profile
+                },
+            ])
             .args(&images)
             .output()
             .unwrap();
@@ -14530,10 +14565,77 @@ fn btrfs_attached_devices_read_seeded_files() {
         kernel.loops.clear();
         drop(kernel);
         let cx = Cx::for_testing();
-        assert!(
-            OpenFs::open(&cx, &images[0]).is_err(),
-            "RAID image must require device-set routing"
-        );
+        if profile == "raid1" {
+            for (primary, image) in images.iter().enumerate() {
+                // Only this path is supplied. The sibling image exists but is
+                // not authorized/attached and must not be discovered implicitly.
+                let mut degraded = OpenFs::open(&cx, image).expect("open surviving RAID1 mirror");
+                for name in ["payload", "compressed", "nodatasum"] {
+                    let attr = degraded
+                        .lookup(&cx, InodeNumber(1), std::ffi::OsStr::new(name))
+                        .unwrap();
+                    assert_eq!(
+                        degraded
+                            .read(&cx, attr.ino, 0, u32::try_from(payload.len()).unwrap())
+                            .unwrap(),
+                        payload
+                    );
+                    assert_eq!(
+                        degraded.read(&cx, attr.ino, 65_530, 32).unwrap(),
+                        payload[65_530..65_562]
+                    );
+                }
+                assert!(degraded.enable_writes(&cx).is_err());
+                for ssi in [false, true] {
+                    let mut txn = degraded.begin_transaction();
+                    txn.stage_write(ffs_types::BlockNumber(0), vec![0xA5; 4096]);
+                    let result = if ssi {
+                        degraded.commit_transaction_ssi(&cx, txn)
+                    } else {
+                        degraded.commit_transaction(&cx, txn)
+                    };
+                    assert!(
+                        result
+                            .unwrap_err()
+                            .to_string()
+                            .contains("transaction was not published")
+                    );
+                    assert_eq!(degraded.mvcc_version_count(), 0);
+                }
+                drop(degraded);
+                let mountpoint = tmp.path().join(format!("degraded-{primary}"));
+                fs::create_dir(&mountpoint).unwrap();
+                let session = mount_background(
+                    Box::new(OpenFs::open(&cx, image).unwrap()),
+                    &mountpoint,
+                    &MountOptions {
+                        read_only: true,
+                        auto_unmount: false,
+                        ..MountOptions::default()
+                    },
+                )
+                .unwrap();
+                let mount = ffs_harness::stale_mounts::MountGuard::new(session, &mountpoint);
+                wait_for_fuse_mount_ready(&mountpoint);
+                for name in ["payload", "compressed", "nodatasum"] {
+                    assert_eq!(fs::read(mountpoint.join(name)).unwrap(), payload);
+                }
+                drop(mount);
+            }
+            emit_scenario_result("btrfs_raid1_each_surviving_device", "PASS", None);
+        } else {
+            for image in &images {
+                let error = OpenFs::open(&cx, image).unwrap_err();
+                if profile == "raid0-data" {
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("lacks a supported readable device set"),
+                        "readable metadata must not admit missing RAID0 data: {error}"
+                    );
+                }
+            }
+        }
         for primary in 0..2 {
             let options = OpenOptions {
                 btrfs_device_paths: vec![images[1 - primary].clone()],

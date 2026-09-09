@@ -1018,7 +1018,7 @@ btrfs uses copy-on-write B-trees addressed by logical block addresses that must 
 2. **Chunk lookup.** Find the chunk entry whose `[key.offset, key.offset + length)` range contains the target logical address.
 3. **Stripe calculation.** For single-device images, `physical = stripe.offset + (logical - chunk.key.offset)`.
 
-`--btrfs-device PATH` attaches additional devices for clean, read-only btrfs mounts. Bootstrap, metadata and file-data reads use `BtrfsDeviceSet`; kernel-written RAID0 and RAID1 images are tested through FUSE with either primary device. Metadata validates copies before caching; checksummed file reads validate each sector before copying its bytes or decompressing, retrying corrupt mirrors. RAID1 corruption recovery is tested for metadata, ordinary data and zstd data. The remaining profile/degraded matrix and dirty-image recovery remain open. Multi-device writes are deferred and refused.
+`--btrfs-device PATH` attaches additional devices for clean, read-only btrfs mounts. A clean multi-device image uses `BtrfsDeviceSet` even without extra paths: either surviving RAID1 device can open alone if every committed chunk has a supported readable copy. Other profiles require all stripe devices; nearby images are never discovered implicitly. Kernel-written RAID0 and RAID1 images are tested through FUSE with either primary device. Metadata validates copies before caching; checksummed file reads validate each sector before copying its bytes or decompressing, retrying corrupt mirrors. RAID1 corruption recovery is tested for metadata, ordinary data and zstd data. The remaining profile/degraded matrix and dirty-image recovery remain open. Multi-device writes are deferred and refused.
 
 ### Tree walk algorithm
 
@@ -3288,7 +3288,7 @@ read requirement remains open under `bd-hk5w3`; helper tests do not certify it.
 | `Single` | Linear, split at chunk boundaries | Implemented | Experimental |
 | `DUP` | Alternate copies on one device | Implemented using primary mapping | Experimental |
 | `RAID0` | Split across data stripes | Clean two-device kernel image + FUSE verified | Deferred |
-| `RAID1` | Mirror fallback on read error | Kernel image + FUSE verified, including corrupt metadata and checksummed ordinary/zstd data recovery; degraded evidence pending | Deferred |
+| `RAID1` | Mirror fallback on read error | Kernel image + FUSE verified, including either lone surviving device and corrupt metadata/ordinary/zstd data recovery | Deferred |
 | `RAID10` | Split across mirrored stripe groups | Routed; mounted evidence pending | Deferred |
 | `RAID5` | Owning data stripe; no reconstruction | Routed; mounted evidence pending | Deferred |
 | `RAID6` | Owning data stripe; no reconstruction | Routed; mounted evidence pending | Deferred |
@@ -3316,8 +3316,13 @@ retain the existing unchecked-read policy. Sector buffers bound recovery
 memory; this path still rereads data and makes no performance claim.
 Cross-stripe and cross-chunk helpers use independent device byte arrays. The
 `btrfs_attached_devices_read_seeded_files` test additionally reads kernel-written
-RAID0/RAID1 files through core and FUSE with either primary device. Use repeatable
-`--btrfs-device PATH` options to attach the other images. Attachments must share
+RAID0/RAID1 files through core and FUSE with either primary device. It also mounts
+each surviving RAID1 device alone and rejects missing RAID0 data even when all
+metadata is mirrored and readable. Admission checks every committed chunk;
+missing stripes are currently allowed only for RAID1 with at least one attached
+copy. An absent unused device does not make a readable chunk unavailable.
+Use repeatable `--btrfs-device PATH` options to attach other images; no implicit
+device discovery occurs. Attachments must share
 the same committed generation and pass checksum, identity and capacity checks.
 Dirty tree logs and MVCC WAL replay are not yet supported for attached mounts.
 Multi-device background scrub/repair is also pending; automatic scrub reports

@@ -492,6 +492,8 @@ pub struct OpenOptions {
     pub btrfs_mount_selection: BtrfsMountSelection,
     /// Additional backing images for clean, read-only btrfs device sets.
     /// Each image must belong to the same committed filesystem generation.
+    /// A clean multi-device image uses device-set routing even when this is
+    /// empty; missing RAID1 copies are allowed only if every chunk is readable.
     pub btrfs_device_paths: Vec<std::path::PathBuf>,
     /// ext4 `data_err=` policy for ordered-mode file data writeback errors.
     pub ext4_data_err_policy: Ext4DataErrPolicy,
@@ -681,6 +683,32 @@ struct BtrfsReadDevices {
 }
 
 impl BtrfsReadDevices {
+    /// Prove device coverage for every committed chunk, not only the metadata
+    /// touched during open. For now only RAID1 permits an absent stripe: each
+    /// of its stripes covers the whole chunk. Other profiles require all their
+    /// stripe devices until their degraded mapping/reconstruction is supported.
+    fn validate_read_coverage(&self, chunks: &[BtrfsChunkEntry]) -> Result<(), FfsError> {
+        use ffs_ondisk::chunk_type_flags::{BTRFS_BLOCK_GROUP_RAID1, RAID_MASK};
+        for chunk in chunks {
+            let present = chunk
+                .stripes
+                .iter()
+                .filter(|stripe| self.identities.contains_key(&stripe.devid))
+                .count();
+            if present == 0
+                || (present != chunk.stripes.len()
+                    && chunk.chunk_type & RAID_MASK != BTRFS_BLOCK_GROUP_RAID1)
+            {
+                return Err(FfsError::UnsupportedFeature(format!(
+                    "btrfs chunk {} lacks a supported readable device set ({present}/{} stripes attached)",
+                    chunk.key.offset,
+                    chunk.stripes.len()
+                )));
+            }
+        }
+        Ok(())
+    }
+
     fn open(
         cx: &Cx,
         primary: &Arc<dyn ByteDevice>,
@@ -5726,7 +5754,8 @@ impl OpenFs {
         };
 
         let dev: Arc<dyn ByteDevice> = Arc::from(dev);
-        let btrfs_devices = if options.btrfs_device_paths.is_empty() {
+        let multi_device = matches!(&flavor, FsFlavor::Btrfs(sb) if sb.num_devices > 1);
+        let btrfs_devices = if options.btrfs_device_paths.is_empty() && !multi_device {
             None
         } else {
             let FsFlavor::Btrfs(sb) = &flavor else {
@@ -6140,6 +6169,7 @@ impl OpenFs {
                         }
                     }
                 }
+                devices.validate_read_coverage(&ctx.chunks)?;
             }
         }
 
@@ -12765,6 +12795,7 @@ impl OpenFs {
                 block: sector_start,
                 detail: "no readable btrfs data mirror".into(),
             };
+            let mut corruption = None;
             let mut verified = None;
             for stripe in mapping.stripes {
                 let bytes = match devices.readers.read_physical(
@@ -12784,15 +12815,17 @@ impl OpenFs {
                     verified = Some(bytes);
                     break;
                 }
-                failure = FfsError::Corruption {
+                corruption = Some(FfsError::Corruption {
                     block: sector_start,
                     detail: format!(
                         "btrfs data csum mismatch at logical {sector_start} (csum_type {})",
                         ctx.csum_type
                     ),
-                };
+                });
             }
-            let bytes = verified.ok_or(failure)?;
+            // A later absent mirror must not hide corruption observed in an
+            // available copy. Cancellation still takes precedence above.
+            let bytes = verified.ok_or_else(|| corruption.unwrap_or(failure))?;
             out[..count].copy_from_slice(&bytes[within..within + count]);
             logical += u64::try_from(count)
                 .map_err(|_| FfsError::Format("btrfs read length overflow".into()))?;
@@ -79548,22 +79581,32 @@ mod tests {
         let sb = BTRFS_SUPER_INFO_OFFSET;
         let item = sb + 0xC9;
         image[item..item + 8].copy_from_slice(&7_u64.to_le_bytes());
-        image[item + 8..item + 16].copy_from_slice(&123_456_u64.to_le_bytes());
+        image[item + 8..item + 16].copy_from_slice(&524_288_u64.to_le_bytes());
         image[item + 16..item + 24].copy_from_slice(&8192_u64.to_le_bytes());
         image[item + 66..item + 82].fill(0xA7);
         image[sb + 0x88..sb + 0x90].copy_from_slice(&2_u64.to_le_bytes());
+        // Device-set reads use stripe identity and declared capacity. Keep the
+        // bootstrap mapping consistent with the backing, including its UUID.
+        let stripe = sb + 0x32B + 17 + 48;
+        image[stripe..stripe + 8].copy_from_slice(&7_u64.to_le_bytes());
+        image[stripe + 16..stripe + 32].fill(0xA7);
         let root = add_btrfs_dev_info_chunk_tree(&mut image);
         let mut unused = image[item..item + 98].to_vec();
         unused[..8].copy_from_slice(&u64::MAX.to_le_bytes());
         unused[8..16].copy_from_slice(&234_567_u64.to_le_bytes());
         unused[16..24].fill(0);
         unused[66..82].fill(0xD4);
-        image[root + 0x60..root + 0x64].copy_from_slice(&3_u32.to_le_bytes());
+        image[root + 0x60..root + 0x64].copy_from_slice(&4_u32.to_le_bytes());
         write_btrfs_leaf_item(&mut image, root, 1, 1, 216, u64::MAX, 3900, 98);
         image[root + 3900..root + 3998].copy_from_slice(&unused);
         // The next item type is outside the half-open disk range, even at
         // offset zero. Its deliberately non-DEV_ITEM payload must be ignored.
         write_btrfs_leaf_item(&mut image, root, 2, 1, 217, 0, 3899, 1);
+        // Publish the same mapping in CHUNK_TREE; bootstrap-only chunks are
+        // not an authoritative inventory for multi-device admission.
+        let chunk = image[sb + 0x32B + 17..sb + 0x32B + 97].to_vec();
+        write_btrfs_leaf_item(&mut image, root, 3, 256, 228, 0, 3800, 80);
+        image[root + 3800..root + 3880].copy_from_slice(&chunk);
         stamp_btrfs_test_tree_block_crc32c(&mut image, root);
         (image, root)
     }
@@ -79580,7 +79623,7 @@ mod tests {
         assert_eq!(&info[..8], &u64::MAX.to_ne_bytes());
         assert_eq!(&info[8..16], &2_u64.to_ne_bytes());
         for (id, uuid, used, total) in [
-            (7, [0xA7; 16], 8192_u64, 123_456_u64),
+            (7, [0xA7; 16], 8192_u64, 524_288_u64),
             (u64::MAX, [0xD4; 16], 0, 234_567),
         ] {
             for query_uuid in [[0; 16], uuid] {
@@ -79629,7 +79672,10 @@ mod tests {
                 "foreign_fsid" => image[second + 82] ^= 1,
                 "wrong_key" => image[second..second + 8].copy_from_slice(&8_u64.to_le_bytes()),
                 "missing_backing" => {
-                    image[sb + 0xC9..sb + 0xD1].copy_from_slice(&3_u64.to_le_bytes())
+                    image[sb + 0xC9..sb + 0xD1].copy_from_slice(&3_u64.to_le_bytes());
+                    let stripe = sb + 0x32B + 17 + 48;
+                    image[stripe..stripe + 8].copy_from_slice(&3_u64.to_le_bytes());
+                    image[root + 3800 + 48..root + 3800 + 56].copy_from_slice(&3_u64.to_le_bytes());
                 }
                 "bad_accounting" => {
                     image[second + 16..second + 24].copy_from_slice(&234_568_u64.to_le_bytes())
@@ -79640,14 +79686,32 @@ mod tests {
             let checksum = ffs_types::crc32c(&image[sb + 0x20..sb + 4096]);
             image[sb..sb + 4].copy_from_slice(&checksum.to_le_bytes());
             let dev = TestDevice::from_vec(image.clone());
-            let fs =
-                OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
-            for result in [
-                fs.get_btrfs_fs_info(&cx, &mut RequestScope::empty()),
-                fs.get_btrfs_dev_info(&cx, &mut RequestScope::empty(), 7, [0; 16]),
-            ] {
-                let error = result.unwrap_err();
+            let opened = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default());
+            if defect == "count_low" {
+                let fs = opened.unwrap();
+                for result in [
+                    fs.get_btrfs_fs_info(&cx, &mut RequestScope::empty()),
+                    fs.get_btrfs_dev_info(&cx, &mut RequestScope::empty(), 7, [0; 16]),
+                ] {
+                    let error = result.unwrap_err();
+                    assert_eq!(error.to_errno(), libc::EIO, "{defect}: {error}");
+                    assert!(error.to_string().contains("device count disagrees"));
+                }
+            } else {
+                // Multi-device inventory is now validated at admission, before
+                // either ioctl can be reached. Keep the specific defect oracle.
+                let error = opened.unwrap_err();
+                let expected = match defect {
+                    "count_high" => "device count disagrees",
+                    "duplicate_uuid" => "duplicate device identities",
+                    "foreign_fsid" => "filesystem UUID mismatch",
+                    "wrong_key" => "device ID disagrees with its key",
+                    "missing_backing" => "no backing device item",
+                    "bad_accounting" => "exceeds total_bytes",
+                    _ => unreachable!(),
+                };
                 assert_eq!(error.to_errno(), libc::EIO, "{defect}: {error}");
+                assert!(error.to_string().contains(expected), "{defect}: {error}");
             }
             assert_eq!(dev.snapshot_bytes(), image);
         }
@@ -79742,17 +79806,20 @@ mod tests {
                     skip_validation,
                     ..OpenOptions::default()
                 };
-                let mut fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &options).unwrap();
-                let info = fs.get_btrfs_fs_info(&cx, &mut RequestScope::empty());
-                if num_devices == 2 {
-                    let info = info.unwrap();
-                    assert_eq!(&info[..8], &u64::MAX.to_ne_bytes());
-                    assert_eq!(&info[8..16], &2_u64.to_ne_bytes());
-                } else {
-                    let error = info.unwrap_err();
+                let opened = OpenFs::from_device(&cx, Box::new(dev.clone()), &options);
+                if num_devices == 3 {
+                    let error = opened.unwrap_err();
                     assert_eq!(error.to_errno(), libc::EIO);
                     assert!(error.to_string().contains("device count disagrees"));
+                    assert_eq!(dev.snapshot_bytes(), image);
+                    continue;
                 }
+                let mut fs = opened.unwrap();
+                let info = fs
+                    .get_btrfs_fs_info(&cx, &mut RequestScope::empty())
+                    .unwrap();
+                assert_eq!(&info[..8], &u64::MAX.to_ne_bytes());
+                assert_eq!(&info[8..16], &2_u64.to_ne_bytes());
                 let error = fs.enable_writes(&cx).unwrap_err();
                 assert!(matches!(error, FfsError::UnsupportedFeature(_)));
                 assert!(error.to_string().contains("one device"));
