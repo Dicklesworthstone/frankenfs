@@ -657,103 +657,225 @@ impl TestCitationAuditReport {
     }
 }
 
-/// Execution-gated parity report: counts rows as implemented ONLY when backed
-/// by fresh green ExecutedEvidence. Replaces the tautology self-sum approach.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// Public parity separates declared coverage from contracts exercised now.
+/// Reports are output artifacts; they cannot be loaded to manufacture credit.
+#[derive(Debug, Clone, Serialize)]
 pub struct ExecutionGatedParityReport {
-    /// Total capability rows in FEATURE_PARITY.md.
+    pub declared_contracts: ParityReport,
     pub total_rows: usize,
-    /// Rows with test citations that have matching green evidence.
     pub evidence_backed_rows: usize,
-    /// Rows explicitly marked 'unproven' (counted separately, not as implemented).
-    pub unproven_rows: usize,
-    /// Rows with citations but no matching evidence (test not run or failed).
     pub missing_evidence_rows: Vec<String>,
-    /// Whether this report has any execution evidence at all.
-    pub has_evidence: bool,
-    /// Git SHA the evidence was captured at.
-    pub evidence_git_sha: Option<String>,
+    pub source: Option<executed_evidence::SourceIdentity>,
+    pub contracts: Vec<VerifiedParityContract>,
+    pub runs: Vec<executed_evidence::TestRunEvidence>,
+    /// The selected contracts do not cover all canonical gate criteria.
+    pub readiness_verified: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct VerifiedParityContract {
+    pub capability: &'static str,
+    pub contract: &'static str,
+    pub suite: &'static str,
+    pub required_tests: &'static [&'static str],
+    pub verified: bool,
+    pub reason: Option<String>,
+}
+
+/// Stable exact mappings, deliberately independent of prose citations. Each
+/// entry states the bounded behavior its tests establish. Remaining rows stay
+/// missing until their acceptance tests are reviewed and mapped explicitly.
+const PARITY_CONTRACTS: &[(&str, &str, &str, &[&str])] = &[
+    (
+        "ext4 JOURNAL_DEV paired-open",
+        "Committed external JBD2 replay and missing/mismatched journal refusal",
+        "ext4-journal",
+        &[
+            "ext4_external_journal_recovery_replays_committed_transaction",
+            "ext4_external_journal_missing_for_dirty_fs_is_rejected",
+            "ext4_external_journal_uuid_mismatch_is_rejected",
+        ],
+    ),
+    (
+        "ext4 journal replay parity",
+        "Committed, uncommitted, revoked and interrupted JBD2 transaction replay",
+        "ext4-journal",
+        &[
+            "ext4_journal_recovery_replays_committed_transaction",
+            "ext4_journal_recovery_replays_non_contiguous_committed_transaction",
+            "ext4_journal_recovery_simulate_overlay_preserves_underlying_bytes",
+            "ext4_journal_recovery_ignores_uncommitted_transaction",
+            "ext4_journal_recovery_honors_revoke_before_commit",
+            "ext4_journal_recovery_replays_multiple_committed_transactions",
+            "ext4_journal_recovery_crash_mid_second_transaction",
+        ],
+    ),
+    (
+        "ext4 superblock decode",
+        "Generated ext4 superblock fields agree with e2fsprogs",
+        "ext4-reference",
+        &["ext4_kernel_vs_ffs_superblock"],
+    ),
+    (
+        "ext4 inode core decode",
+        "Generated ext4 inode metadata agrees with e2fsprogs",
+        "ext4-reference",
+        &["ext4_kernel_vs_ffs_inode_metadata"],
+    ),
+    (
+        "ext4 extent entry decode",
+        "Generated ext4 extent mappings agree with debugfs blocks",
+        "ext4-reference",
+        &["ext4_kernel_vs_ffs_extent_mapping"],
+    ),
+    (
+        "ext4 directory entry parsing",
+        "Generated ext4 directory entries agree with e2fsprogs",
+        "ext4-reference",
+        &["ext4_kernel_vs_ffs_directory_listing"],
+    ),
+    (
+        "ext4 bitmap free space reading",
+        "Generated ext4 bitmap free-space counts agree with e2fsprogs",
+        "ext4-reference",
+        &["ext4_bitmap_free_space_matches_kernel"],
+    ),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParityExecutor {
+    Rch,
+    /// For CI or invocation already executing on a build worker.
+    Cargo,
 }
 
 impl ExecutionGatedParityReport {
-    /// Build an execution-gated parity report from capability rows and evidence.
-    ///
-    /// `evidence_map` maps test citation patterns to whether they passed (true) or failed/missing (false).
-    /// If `evidence_map` is empty, the report is marked as having no evidence.
-    #[must_use]
-    pub fn from_evidence(
-        evidence_map: &std::collections::HashMap<String, bool>,
-        git_sha: Option<String>,
+    /// Run the selected known suites. No paths, shell commands, JSON reports or
+    /// caller-supplied pass/fail maps are accepted as parity evidence.
+    pub fn run(suites: &[String], executor: ParityExecutor) -> Result<Self> {
+        let mut selected = std::collections::BTreeSet::new();
+        for suite in suites {
+            if !matches!(suite.as_str(), "ext4-journal" | "ext4-reference") {
+                bail!("unknown parity suite {suite}; use ext4-journal or ext4-reference");
+            }
+            if !selected.insert(suite.as_str()) {
+                bail!("duplicate parity suite {suite}");
+            }
+        }
+        let mut runs = Vec::new();
+        for suite in &selected {
+            let target = match *suite {
+                "ext4-journal" => "ext4_journal_recovery",
+                "ext4-reference" => "kernel_reference",
+                _ => unreachable!("validated above"),
+            };
+            let mut args = vec![
+                "-Z",
+                "checksum-freshness",
+                "test",
+                "-p",
+                "ffs-harness",
+                "--test",
+                target,
+                "--",
+                "-Z",
+                "unstable-options",
+                "--format=json",
+                "--show-output",
+                "--test-threads=1",
+            ];
+            let command = match executor {
+                ParityExecutor::Rch => {
+                    args.splice(0..0, ["exec", "--source-content-receipt", "--", "cargo"]);
+                    "rch"
+                }
+                ParityExecutor::Cargo => "cargo",
+            };
+            runs.push(executed_evidence::TestRunEvidence::run(command, &args));
+        }
+        let source = executed_evidence::SourceIdentity::capture().ok();
+        Ok(Self::from_runs(&selected, runs, source))
+    }
+
+    fn from_runs(
+        selected: &std::collections::BTreeSet<&str>,
+        runs: Vec<executed_evidence::TestRunEvidence>,
+        source: Option<executed_evidence::SourceIdentity>,
     ) -> Self {
         let rows = capability_rows_from_feature_parity(FEATURE_PARITY_MARKDOWN);
-        let total_rows = rows.len();
-        let has_evidence = !evidence_map.is_empty();
-
-        let mut evidence_backed_rows = 0;
-        let mut unproven_rows = 0;
-        let mut missing_evidence_rows = Vec::new();
-
-        for row in &rows {
-            if row.notes.to_lowercase().contains("unproven") {
-                unproven_rows += 1;
-                continue;
-            }
-
-            if !row.has_test_citation {
-                missing_evidence_rows.push(row.capability.clone());
-                continue;
-            }
-
-            // Check if any evidence key matches this row's citation
-            let has_green_evidence = evidence_map
-                .iter()
-                .any(|(key, &passed)| passed && row.notes.contains(key));
-
-            if has_green_evidence {
-                evidence_backed_rows += 1;
-            } else {
-                missing_evidence_rows.push(row.capability.clone());
-            }
-        }
-
+        let contracts: Vec<_> = PARITY_CONTRACTS
+            .iter()
+            .map(|&(capability, contract, suite, required_tests)| {
+                let result = selected
+                    .iter()
+                    .position(|&id| id == suite)
+                    .and_then(|index| runs.get(index))
+                    .ok_or_else(|| "suite not executed".to_owned())
+                    .and_then(|run| {
+                        if !rows.iter().any(|row| row.capability == capability) {
+                            return Err("mapped capability is absent from the matrix".to_owned());
+                        }
+                        let source = source.as_ref().ok_or("source identity unavailable")?;
+                        run.require_pass(source)?;
+                        for &test in required_tests {
+                            if run.results().tests.get(test)
+                                != Some(&executed_evidence::TestOutcome::Passed)
+                            {
+                                return Err(format!(
+                                    "required exact test missing or not passed: {test}"
+                                ));
+                            }
+                        }
+                        Ok(())
+                    });
+                VerifiedParityContract {
+                    capability,
+                    contract,
+                    suite,
+                    required_tests,
+                    verified: result.is_ok(),
+                    reason: result.err(),
+                }
+            })
+            .collect();
+        let evidence_backed_rows = contracts.iter().filter(|row| row.verified).count();
+        let missing_evidence_rows = rows
+            .iter()
+            .filter(|row| {
+                !contracts
+                    .iter()
+                    .any(|c| c.verified && c.capability == row.capability)
+            })
+            .map(|row| row.capability.clone())
+            .collect();
         Self {
-            total_rows,
+            declared_contracts: ParityReport::current(),
+            total_rows: rows.len(),
             evidence_backed_rows,
-            unproven_rows,
             missing_evidence_rows,
-            has_evidence,
-            evidence_git_sha: git_sha,
+            source,
+            contracts,
+            runs,
+            readiness_verified: false,
         }
     }
 
-    /// Build from a set of test results where key is the test name and value is pass/fail.
-    #[must_use]
-    pub fn from_test_results(results: &[(String, bool)], git_sha: Option<String>) -> Self {
-        let evidence_map: std::collections::HashMap<String, bool> =
-            results.iter().cloned().collect();
-        Self::from_evidence(&evidence_map, git_sha)
-    }
-
-    /// Check if this report was built with actual execution evidence.
-    #[must_use]
-    pub fn is_evidence_backed(&self) -> bool {
-        self.has_evidence
-    }
-
-    /// Count of rows that can be claimed as "implemented" (evidence-backed only).
-    #[must_use]
-    pub fn implemented_count(&self) -> usize {
-        self.evidence_backed_rows
-    }
-
-    /// Fail if invoked without execution evidence - this is the gate.
+    /// Gate for the selected suites, not a declaration of whole-project readiness.
     pub fn require_evidence(&self) -> Result<(), String> {
-        if !self.has_evidence {
-            return Err(
-                "ExecutionGatedParityReport requires execution evidence but none was provided. \
-                 Run the test suite with evidence collection enabled."
-                    .to_string(),
-            );
+        if self.runs.is_empty() {
+            return Err("no test suites executed; use --verify <suite>".to_owned());
+        }
+        let source = self.source.as_ref().ok_or("source identity unavailable")?;
+        if &executed_evidence::SourceIdentity::capture()? != source {
+            return Err("source changed after parity execution".to_owned());
+        }
+        for run in &self.runs {
+            run.require_pass(source)?;
+        }
+        for contract in &self.contracts {
+            if contract.reason.as_deref() != Some("suite not executed") && !contract.verified {
+                return Err(format!("{}: {:?}", contract.capability, contract.reason));
+            }
         }
         Ok(())
     }
@@ -1894,148 +2016,77 @@ mod tests {
 
     #[test]
     fn execution_gated_parity_report_requires_evidence() {
-        // Build report with NO evidence - this should fail the gate
-        let empty_evidence: std::collections::HashMap<String, bool> =
-            std::collections::HashMap::new();
-        let report = ExecutionGatedParityReport::from_evidence(&empty_evidence, None);
-
-        // Verify the gate rejects empty evidence
-        assert!(!report.is_evidence_backed());
+        let report = ExecutionGatedParityReport::run(&[], ParityExecutor::Rch).unwrap();
         assert!(report.require_evidence().is_err());
-
-        // Verify implemented_count is zero without evidence
-        assert_eq!(report.implemented_count(), 0);
+        assert_eq!(report.evidence_backed_rows, 0);
+        assert_eq!(report.missing_evidence_rows.len(), report.total_rows);
+        assert!(!report.readiness_verified);
     }
 
     #[test]
     fn execution_gated_parity_report_counts_only_green_evidence() {
-        use std::collections::HashMap;
-
-        // Simulate evidence: some tests pass, some fail
-        let mut evidence: HashMap<String, bool> = HashMap::new();
-        evidence.insert("fuse::".to_string(), true); // green
-        evidence.insert("repair_lab::".to_string(), true); // green
-        evidence.insert("crash_replay::".to_string(), false); // red
-
-        let report =
-            ExecutionGatedParityReport::from_evidence(&evidence, Some("abc123".to_string()));
-
-        // Should be evidence-backed
-        assert!(report.is_evidence_backed());
-        assert!(report.require_evidence().is_ok());
-
-        // Only rows with green evidence count as implemented
-        // Rows with red evidence go to missing_evidence_rows
-        assert!(report.total_rows > 0);
-        assert_eq!(report.evidence_git_sha, Some("abc123".to_string()));
+        // A genuinely passing, unrelated test must not satisfy this contract.
+        let executable = std::env::current_exe().unwrap();
+        let run = executed_evidence::TestRunEvidence::run(
+            executable.to_str().unwrap(),
+            &[
+                "--exact",
+                "tests::extract_region_basic",
+                "-Z",
+                "unstable-options",
+                "--format=json",
+                "--show-output",
+            ],
+        );
+        assert_eq!(run.results().passed, 1);
+        assert!(run.results().error.is_none());
+        let report = ExecutionGatedParityReport::from_runs(
+            &std::collections::BTreeSet::from(["ext4-journal"]),
+            vec![run],
+            executed_evidence::SourceIdentity::capture().ok(),
+        );
+        assert!(report.require_evidence().is_err());
+        assert_eq!(report.evidence_backed_rows, 0);
     }
 
     #[test]
     fn execution_gated_parity_replaces_tautology() {
-        // This test verifies that parity counting is execution-gated:
-        // - ParityReport.implemented must equal count of rows with fresh green ExecutedEvidence
-        // - Running with stale/absent evidence set must fail CI
-
-        // With no evidence, require_evidence() gates CI failure
-        let no_evidence =
-            ExecutionGatedParityReport::from_evidence(&std::collections::HashMap::new(), None);
-        let gate_result = no_evidence.require_evidence();
-        assert!(gate_result.is_err(), "CI must fail when evidence is absent");
-
-        // With evidence, implemented count comes only from green evidence
-        let mut evidence = std::collections::HashMap::new();
-        evidence.insert("test::some_test".to_string(), true);
-        let with_evidence =
-            ExecutionGatedParityReport::from_evidence(&evidence, Some("deadbeef".to_string()));
-        assert!(
-            with_evidence.require_evidence().is_ok(),
-            "CI should pass when evidence is present"
-        );
-        // implemented_count reflects only evidence-backed rows, not self-certified parsing
-        assert!(with_evidence.implemented_count() <= with_evidence.total_rows);
+        let report = ExecutionGatedParityReport::run(&[], ParityExecutor::Rch).unwrap();
+        assert_eq!(report.declared_contracts, ParityReport::current());
+        assert!(report.declared_contracts.overall_implemented > 0);
+        assert_eq!(report.evidence_backed_rows, 0);
     }
 
     #[test]
     fn parity_honesty_fabricated_row_fails_closed() {
-        use std::collections::HashMap;
-
-        // Fabricated row: citation pattern that doesn't match ANY evidence key
-        // Even with evidence present, a row citing a non-existent test must not count
-        let mut evidence: HashMap<String, bool> = HashMap::new();
-        evidence.insert("real_test::actual_test".to_string(), true);
-
-        let report = ExecutionGatedParityReport::from_evidence(&evidence, Some("abc".to_string()));
-
-        // Report has evidence, but fabricated citations won't match
-        assert!(report.is_evidence_backed());
-
-        // Any row whose citation doesn't match evidence goes to missing_evidence_rows
-        // The fabricated pattern "nonexistent::fake" would never match "real_test::actual_test"
-        // So if a FEATURE_PARITY row cited "nonexistent::fake", it would be in missing_evidence_rows
-        // This test verifies the mechanism: implemented_count only counts rows with matching green evidence
-        assert!(
-            report.implemented_count() <= report.total_rows,
-            "Fabricated citations cannot inflate implemented count"
-        );
+        for suite in ["", "ext4", "ext4-journal-extra", "../ext4-journal", "true"] {
+            assert!(
+                ExecutionGatedParityReport::run(&[suite.to_owned()], ParityExecutor::Rch).is_err()
+            );
+        }
     }
 
     #[test]
-    fn parity_honesty_ignored_test_fails_closed() {
-        use std::collections::HashMap;
-
-        // Ignored test: citation exists in FEATURE_PARITY but no evidence provided for it
-        // (as if the test was #[ignore]d and never ran)
-        let evidence: HashMap<String, bool> = HashMap::new(); // Empty = ignored/not run
-
-        let report = ExecutionGatedParityReport::from_evidence(&evidence, None);
-
-        // No evidence means gate fails
-        assert!(!report.is_evidence_backed());
-        assert!(
-            report.require_evidence().is_err(),
-            "Ignored tests (no evidence) must fail the gate"
+    fn parity_honesty_missing_run_fails_closed() {
+        let report = ExecutionGatedParityReport::from_runs(
+            &std::collections::BTreeSet::from(["ext4-journal"]),
+            vec![],
+            executed_evidence::SourceIdentity::capture().ok(),
         );
-
-        // With no evidence, implemented count is zero
-        assert_eq!(
-            report.implemented_count(),
-            0,
-            "Ignored tests cannot count as implemented"
-        );
+        assert_eq!(report.evidence_backed_rows, 0);
+        assert!(report.require_evidence().is_err());
     }
 
     #[test]
     fn parity_honesty_failing_test_fails_closed() {
-        use std::collections::HashMap;
-
-        // Failing test: evidence exists but shows the test failed (false)
-        let mut evidence: HashMap<String, bool> = HashMap::new();
-        evidence.insert("fuse::".to_string(), false); // test ran but FAILED
-        evidence.insert("repair_lab::".to_string(), false); // test ran but FAILED
-
-        let report =
-            ExecutionGatedParityReport::from_evidence(&evidence, Some("def456".to_string()));
-
-        // Evidence is present (tests ran), but all failed
-        assert!(report.is_evidence_backed());
-        assert!(
-            report.require_evidence().is_ok(),
-            "Evidence was provided (tests ran, even if failed)"
+        let run = executed_evidence::TestRunEvidence::run("false", &[]);
+        let report = ExecutionGatedParityReport::from_runs(
+            &std::collections::BTreeSet::from(["ext4-journal"]),
+            vec![run],
+            executed_evidence::SourceIdentity::capture().ok(),
         );
-
-        // But failing tests don't count as implemented
-        // implemented_count should be 0 because all evidence is false (failed)
-        assert_eq!(
-            report.implemented_count(),
-            0,
-            "Failing tests must not count as implemented"
-        );
-
-        // The rows go to missing_evidence_rows because they have no GREEN evidence
-        assert!(
-            !report.missing_evidence_rows.is_empty(),
-            "Failed test rows should be in missing_evidence_rows"
-        );
+        assert_eq!(report.evidence_backed_rows, 0);
+        assert!(report.require_evidence().is_err());
     }
 
     #[test]

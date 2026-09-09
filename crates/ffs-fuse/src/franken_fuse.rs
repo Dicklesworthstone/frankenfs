@@ -3023,6 +3023,25 @@ impl FrankenFuse {
         }
     }
 
+    /// Wait for previously queued ioctl trace records to become visible to readers.
+    /// This is a diagnostic barrier, not a filesystem durability operation.
+    /// Concurrent requests may enqueue further records after the barrier.
+    ///
+    /// # Errors
+    /// Returns an error if tracing is disabled, events were lost, or the writer failed.
+    pub fn flush_ioctl_trace(&self) -> std::io::Result<()> {
+        self.inner
+            .ioctl_trace
+            .as_ref()
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::NotConnected,
+                    "ioctl tracing is not configured",
+                )
+            })?
+            .flush_sync()
+    }
+
     fn record_ioctl_probe(&self, ino: u64, cmd: u32, in_len: usize, out_size: u32) {
         let Some(trace) = self.inner.ioctl_trace.as_ref() else {
             return;

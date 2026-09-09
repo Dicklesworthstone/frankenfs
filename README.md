@@ -3447,6 +3447,11 @@ cargo run -p ffs-cli -- repair <image-path> --rebuild-symbols --max-threads 8 --
 # Current feature-parity report
 cargo run -p ffs-cli -- parity --json
 
+# Execute named current contract suites (Cargo tests are routed through RCH).
+cargo run -p ffs-cli -- parity --json --verify ext4-journal
+cargo run -p ffs-harness -- parity --verify ext4-reference
+# On CI or an existing build worker, add --local to execute Cargo there.
+
 # Evidence ledger inspection (with operator presets)
 cargo run -p ffs-cli -- evidence <ledger>.jsonl --json --tail 50
 cargo run -p ffs-cli -- evidence <ledger>.jsonl --preset contention
@@ -3579,6 +3584,20 @@ The ext4 extent-tree implementation handles the full 4-level tree structure in ~
 | **FUSE Writeback-Cache Barriers** | Gate-verified | 12-point crash/replay matrix, epoch monotonicity preserved |
 
 ### Feature parity accounting
+
+Both public `parity` commands now separate `declared_contracts` from current
+execution. Without `--verify`, verified contract coverage is zero. The initial
+exact mappings cover seven bounded ext4 contracts across `ext4-journal` and
+`ext4-reference`; remaining capability rows are reported as missing evidence.
+`--verify` captures named libtest results, source revision and dirty-source
+digest, command/build settings, output hashes, and pass/fail/skip counts. Empty,
+failed, skipped, malformed or stale runs fail the selected-suite gate. Reports
+are output artifacts and cannot be supplied as inputs to grant verification.
+Remote runs require RCH's source-content receipt for the invoked command, and
+Cargo uses checksum freshness when selecting test builds. `--local` is for CI
+or execution already on a worker.
+These scoped tests do not satisfy all canonical gates or establish readiness;
+the full mapping and gate integration remain tracked in `bd-wh1xk` / `bd-lc132`.
 
 | Domain | `ParityReport::current()` rows |
 |---|---|

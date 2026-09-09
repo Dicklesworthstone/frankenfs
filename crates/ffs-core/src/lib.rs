@@ -23390,7 +23390,6 @@ impl OpenFs {
 
     /// Add a directory entry by scanning existing dir blocks, or allocating a new one.
     #[allow(clippy::too_many_arguments, clippy::significant_drop_tightening)]
-    #[expect(clippy::too_many_lines)]
     fn ext4_add_dir_entry(
         &self,
         cx: &Cx,
@@ -23404,13 +23403,48 @@ impl OpenFs {
         tstamp_secs: u64,
         tstamp_nanos: u32,
     ) -> ffs_error::Result<()> {
-        let block_dev = self.block_device_adapter();
         let mut txn = self.mvcc_store.begin();
+        self.ext4_stage_dir_entry(
+            cx,
+            &mut txn,
+            backend,
+            parent,
+            parent_inode,
+            name,
+            child_ino,
+            file_type,
+            csum_seed,
+            tstamp_secs,
+            tstamp_nanos,
+        )?;
+        self.mvcc_store
+            .commit(txn)
+            .map(|_| ())
+            .map_err(|error| FfsError::Format(error.to_string()))
+    }
 
-        let result = (|| -> ffs_error::Result<()> {
+    /// Stage directory publication into the transaction that owns its child.
+    #[allow(clippy::too_many_arguments, clippy::significant_drop_tightening)]
+    #[expect(clippy::too_many_lines)]
+    fn ext4_stage_dir_entry(
+        &self,
+        cx: &Cx,
+        txn: &mut Transaction,
+        backend: &mut dyn DirAllocBackend,
+        parent: InodeNumber,
+        parent_inode: &Ext4Inode,
+        name: &[u8],
+        child_ino: InodeNumber,
+        file_type: Ext4FileType,
+        csum_seed: u32,
+        tstamp_secs: u64,
+        tstamp_nanos: u32,
+    ) -> ffs_error::Result<()> {
+        let block_dev = self.block_device_adapter();
+        (|| -> ffs_error::Result<()> {
             let tx_dev = TransactionBlockAdapter {
                 base: &block_dev,
-                tx: Mutex::new(&mut txn),
+                tx: Mutex::new(txn),
             };
             let dev = &tx_dev;
 
@@ -23720,14 +23754,7 @@ impl OpenFs {
             backend.dir_write_inode(cx, dev, parent, &parent_upd, csum_seed)?;
 
             Ok(())
-        })();
-
-        if result.is_ok() {
-            self.mvcc_store
-                .commit(txn)
-                .map_err(|e| FfsError::Format(e.to_string()))?;
-        }
-        result
+        })()
     }
 
     /// Incrementally split one full htree leaf and add the new entry, the O(log N)
@@ -25285,11 +25312,9 @@ impl OpenFs {
 
     /// Create a symbolic link inode and directory entry.
     #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
-    #[expect(clippy::too_many_arguments)]
     fn ext4_symlink(
         &self,
         cx: &Cx,
-        scope: &mut RequestScope,
         parent: InodeNumber,
         name: &[u8],
         target: &Path,
@@ -25298,7 +25323,7 @@ impl OpenFs {
     ) -> ffs_error::Result<InodeAttr> {
         Self::validate_single_path_component(name)?;
         let alloc_mutex = self.require_alloc_state()?;
-        let mut block_dev = self.block_device_adapter();
+        let block_dev = self.block_device_adapter();
         let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
         let target_bytes = target.as_os_str().as_encoded_bytes();
         let fast_storage = ext4_symlink_target_is_fast(target_bytes.len());
@@ -25306,153 +25331,119 @@ impl OpenFs {
         let sb = self
             .ext4_superblock()
             .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let block_size = usize::try_from(sb.block_size)
+            .map_err(|_| FfsError::Format("block size exceeds usize".into()))?;
+        // Linux ext4 stores the target plus NUL in a single filesystem block.
+        // Reject before allocation, even when the target fits Linux PATH_MAX.
+        if target_bytes.len() >= block_size {
+            return Err(FfsError::NameTooLong);
+        }
         let csum_seed = sb.csum_seed();
 
-        let (ino, mut symlink_inode, parent_inode) = {
-            let mut alloc = alloc_mutex.write();
+        let mut alloc = alloc_mutex.write();
+        let parent_inode = self.read_inode(cx, parent)?;
+        if !parent_inode.is_dir() {
+            return Err(FfsError::NotDirectory);
+        }
+        let htree_dedup_covers = parent_inode.has_htree_index()
+            && parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL == 0
+            && Self::htree_create_dedup_enabled();
+        if !htree_dedup_covers && self.lookup_name(cx, &parent_inode, name)?.is_some() {
+            return Err(FfsError::Exists);
+        }
+        let parent_group = GroupNumber(
+            u32::try_from(parent.0.saturating_sub(1) / u64::from(alloc.geo.inodes_per_group))
+                .map_err(|_| FfsError::Format("parent inode group index exceeds u32".into()))?,
+        );
 
-            let parent_inode = self.read_inode(cx, parent)?;
-            if !parent_inode.is_dir() {
-                return Err(FfsError::NotDirectory);
-            }
-            // Skip the redundant positive lookup_name on a non-casefold htree dir:
-            // the insert (ext4_add_dir_entry -> add_entry_reject_existing)
-            // dup-checks the hash-correct leaf, and symlink's delete_inode rollback
-            // frees the speculative inode (+ any target block) on a collision —
-            // same guard as ext4_create/ext4_mkdir (bd-cc-mkdir-dedup).
-            // Casefold/linear dirs keep the pre-check.
-            let htree_dedup_covers = parent_inode.has_htree_index()
-                && parent_inode.flags & ffs_types::EXT4_CASEFOLD_FL == 0
-                && Self::htree_create_dedup_enabled();
-            if !htree_dedup_covers && self.lookup_name(cx, &parent_inode, name)?.is_some() {
-                return Err(FfsError::Exists);
-            }
-
-            let parent_group = GroupNumber(
-                u32::try_from(parent.0.saturating_sub(1) / u64::from(alloc.geo.inodes_per_group))
-                    .map_err(|_| FfsError::Format("parent inode group index exceeds u32".into()))?,
-            );
-            let (ino, mut inode) = {
+        // Namespace publication owns this transaction, including the target's
+        // allocation and data. Do not send a newly created inode through the
+        // older FUSE request transaction: its snapshot predates inode creation,
+        // and a separate directory commit can conflict with its staged inode.
+        // Keep the allocator locked until commit, restoring its cached state on
+        // any pre-publication failure. No compensating on-disk deletes are needed.
+        let groups_before = alloc.groups.clone();
+        let mut txn = self.mvcc_store.begin();
+        let staged = (|| -> ffs_error::Result<(InodeNumber, Ext4Inode)> {
+            let (ino, inode) = {
+                let tx_dev = TransactionBlockAdapter {
+                    base: &block_dev,
+                    tx: Mutex::new(&mut txn),
+                };
                 let Ext4AllocState {
                     geo,
                     groups,
                     persist_ctx,
                 } = &mut *alloc;
-                // NOTE: symlink keeps create_inode (persist body). Its fast-target
-                // path stores the link inline and does NOT re-write the inode, so
-                // deferring the body write would leave a fast symlink unpersisted
-                // (bd-mkinode-defer applies only to mkdir/mknod, which always
-                // write_inode the final body).
-                ffs_inode::create_inode(
+                let (ino, mut inode) = ffs_inode::prepare_inode(
                     cx,
-                    &block_dev,
+                    &tx_dev,
                     geo,
                     groups,
                     ffs_inode::file_type::S_IFLNK | 0o777,
                     uid,
                     gid,
                     parent_group,
-                    csum_seed,
                     tstamp_secs,
                     tstamp_nanos,
                     persist_ctx,
-                )?
-            };
-
-            // Re-acquire the block device adapter so subsequent writes observe the inode-table
-            // block committed by create_inode().
-            block_dev = self.block_device_adapter();
-
-            if fast_storage {
-                inode.flags &= !EXT4_EXTENTS_FL;
-                if inode.extent_bytes.len() < ffs_types::EXT4_FAST_SYMLINK_MAX {
+                )?;
+                if fast_storage {
+                    inode.flags &= !EXT4_EXTENTS_FL;
                     inode
                         .extent_bytes
                         .resize(ffs_types::EXT4_FAST_SYMLINK_MAX, 0);
+                    inode.extent_bytes.fill(0);
+                    inode.extent_bytes[..target_bytes.len()].copy_from_slice(target_bytes);
+                    inode.blocks = 0;
+                } else {
+                    let mut root_bytes = Self::extent_root(&inode);
+                    let hint = self.numa_allocation_hint(
+                        geo,
+                        AllocHint::default(),
+                        "ext4_symlink",
+                        Some(ino),
+                    );
+                    let mapping = ffs_extent::allocate_extent_coalescing(
+                        cx,
+                        &tx_dev,
+                        &mut root_bytes,
+                        geo,
+                        groups,
+                        0,
+                        1,
+                        &hint,
+                        persist_ctx,
+                        ffs_extent::ExtentOwner {
+                            ino: u32::try_from(ino.0).map_err(|_| {
+                                FfsError::Format("symlink inode exceeds u32".into())
+                            })?,
+                            generation: inode.generation,
+                        },
+                    )?;
+                    let mut data = vec![0; block_size];
+                    data[..target_bytes.len()].copy_from_slice(target_bytes);
+                    tx_dev.write_block(cx, BlockNumber(mapping.physical_start), &data)?;
+                    let metadata_blocks =
+                        Self::ext4_count_extent_tree_meta_blocks_via_dev(cx, &tx_dev, &root_bytes)?;
+                    Self::set_extent_root(&mut inode, &root_bytes);
+                    inode.blocks = Self::ext4_checked_inode_blocks_delta(
+                        0,
+                        ino,
+                        (i128::from(mapping.count) + i128::from(metadata_blocks))
+                            * i128::from(sb.block_size / EXT4_SECTOR_SIZE),
+                    )?;
                 }
-                inode.extent_bytes.fill(0);
-                inode.extent_bytes[..target_bytes.len()].copy_from_slice(target_bytes);
                 inode.size = u64::try_from(target_bytes.len()).map_err(|_| {
                     FfsError::Format("symlink target length does not fit u64".to_owned())
                 })?;
-                inode.blocks = 0;
-
-                let Ext4AllocState { geo, groups, .. } = &mut *alloc;
-                ffs_inode::write_inode(cx, &block_dev, geo, groups, ino, &inode, csum_seed)?;
-
-                // bd-bhh0i: single-lock caller wraps the alloc guard. The borrow
-                // must end before the error branch re-borrows `alloc`; NLL ends it
-                // at the last use, so the explicit `drop` is gone. Order still
-                // matters.
-                let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
-                let add_result = self.ext4_add_dir_entry(
-                    cx,
-                    &mut backend,
-                    parent,
-                    &parent_inode,
-                    name,
-                    ino,
-                    Ext4FileType::Symlink,
-                    csum_seed,
-                    tstamp_secs,
-                    tstamp_nanos,
-                );
-                if let Err(err) = add_result {
-                    let Ext4AllocState {
-                        geo,
-                        groups,
-                        persist_ctx,
-                    } = &mut *alloc;
-                    ffs_inode::delete_inode(
-                        cx,
-                        &block_dev,
-                        geo,
-                        groups,
-                        ino,
-                        &mut inode,
-                        csum_seed,
-                        tstamp_secs,
-                        persist_ctx,
-                    )?;
-                    return Err(err);
-                }
-            }
-
-            (ino, inode, parent_inode)
-        };
-
-        if !fast_storage {
-            if let Err(err) = self.ext4_write(cx, scope, ino, 0, target_bytes, false) {
-                let mut rollback_inode = self.read_inode(cx, ino)?;
-                let mut alloc = alloc_mutex.write();
-                let block_dev = self.block_device_adapter();
-                let Ext4AllocState {
-                    geo,
-                    groups,
-                    persist_ctx,
-                } = &mut *alloc;
-                ffs_inode::delete_inode(
-                    cx,
-                    &block_dev,
-                    geo,
-                    groups,
-                    ino,
-                    &mut rollback_inode,
-                    csum_seed,
-                    tstamp_secs,
-                    persist_ctx,
-                )?;
-                return Err(err);
-            }
-
-            symlink_inode = self.read_inode(cx, ino)?;
-            let mut alloc = alloc_mutex.write();
-            // bd-bhh0i: single-lock caller wraps the alloc guard. The borrow must
-            // end before the error branch re-borrows `alloc`; NLL ends it at the
-            // last use, so the explicit `drop` is gone. Order still matters.
+                ffs_inode::write_inode(cx, &tx_dev, geo, groups, ino, &inode, csum_seed)?;
+                (ino, inode)
+            };
             let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
-            let add_result = self.ext4_add_dir_entry(
+            self.ext4_stage_dir_entry(
                 cx,
+                &mut txn,
                 &mut backend,
                 parent,
                 &parent_inode,
@@ -25462,28 +25453,35 @@ impl OpenFs {
                 csum_seed,
                 tstamp_secs,
                 tstamp_nanos,
-            );
-            if let Err(err) = add_result {
-                let block_dev = self.block_device_adapter();
-                let Ext4AllocState {
-                    geo,
-                    groups,
-                    persist_ctx,
-                } = &mut *alloc;
-                ffs_inode::delete_inode(
-                    cx,
-                    &block_dev,
-                    geo,
-                    groups,
-                    ino,
-                    &mut symlink_inode,
-                    csum_seed,
-                    tstamp_secs,
-                    persist_ctx,
-                )?;
+            )?;
+            Ok((ino, inode))
+        })();
+        let (ino, symlink_inode) = match staged {
+            Ok(created) => created,
+            Err(err) => {
+                alloc.groups = groups_before;
                 return Err(err);
             }
-        }
+        };
+        let txn_id = txn.id();
+        let write_blocks = if self.repair_flush_lifecycle.is_some() {
+            txn.write_set().keys().copied().collect()
+        } else {
+            Vec::new()
+        };
+        let commit_seq = match RequestScope::with_transaction(txn).commit_if_write(&self.mvcc_store)
+        {
+            Ok(seq) => seq,
+            Err(err) => {
+                alloc.groups = groups_before;
+                return Err(err);
+            }
+        };
+        drop(alloc);
+        self.prune_mvcc_after_commit_if_due(commit_seq);
+        // A notification failure is post-commit: never restore allocator state
+        // after the namespace and its allocated blocks have become visible.
+        self.notify_repair_flush_lifecycle_with_cx(cx, txn_id, &write_blocks)?;
 
         debug!(
             target: "ffs::write",
@@ -26320,7 +26318,6 @@ impl OpenFs {
         ino: InodeNumber,
         offset: u64,
         data: &[u8],
-        reject_symlink: bool,
     ) -> ffs_error::Result<u32> {
         if data.is_empty() {
             return Ok(0);
@@ -26365,13 +26362,9 @@ impl OpenFs {
         if inode.is_dir() {
             return Err(FfsError::IsDirectory);
         }
-        // Reject writes to an existing symlink from the public write path, but
-        // allow the slow-symlink creation path (which legitimately writes the
-        // target into the symlink inode's data blocks) to pass `reject_symlink
-        // = false`. The guard previously fired unconditionally here, which made
-        // creating any symlink with a target longer than EXT4_FAST_SYMLINK_MAX
-        // impossible — the slow-symlink writer routes through ext4_write.
-        if reject_symlink && inode.is_symlink() {
+        // Symlink target initialization belongs to its namespace transaction;
+        // ordinary file writes must never mutate a symlink inode.
+        if inode.is_symlink() {
             return Err(FfsError::Format("cannot write to a symlink".into()));
         }
         // No fscrypt support: refuse to store plaintext into encrypted blocks.
@@ -65808,12 +65801,9 @@ mod tests {
 
     #[test]
     fn write_symlink_slow_target_create_and_public_write_guard_ext4() {
-        // Regression for bd-o6uha: slow-symlink creation (target longer than
-        // EXT4_FAST_SYMLINK_MAX) writes the target into data blocks via
-        // ext4_write, which unconditionally rejected symlink inodes — so every
-        // slow symlink failed to create with "cannot write to a symlink". Uses
-        // the in-memory generated image so it actually runs on remote workers
-        // (the fixture-based open_writable_ext4 skips there; bd-cc6ua).
+        // Slow-target initialization must succeed while ordinary file writes
+        // still reject symlink inodes (bd-o6uha). Use a real generated image so
+        // this also runs on remote workers without repository image fixtures.
         let Some((fs, _tmp)) = open_writable_ext4_mkfs(64) else {
             return;
         };
@@ -65843,14 +65833,169 @@ mod tests {
             "a target this long must be a slow (block-mapped) symlink"
         );
 
-        // The public write path must STILL reject writing to a symlink inode
-        // (the guard moved to the caller, it was not removed).
+        // Target initialization must not make symlinks writable as files.
         let err = fs
             .write(&cx, attr.ino, 0, b"clobber")
             .expect_err("public write to a symlink must be rejected");
         assert!(
             matches!(err, FfsError::Format(ref m) if m.contains("cannot write to a symlink")),
             "unexpected error writing to symlink: {err:?}"
+        );
+    }
+
+    #[test]
+    fn ext4_symlink_request_scope_boundaries_persist_and_pass_e2fsck() {
+        for small_blocks in [false, true] {
+            let opened = if small_blocks {
+                open_ext4_mke2fs(16, true)
+            } else {
+                open_writable_ext4_mkfs_with_device(16).map(|(fs, dev, tmp)| {
+                    let image = tmp.path().join("test.ext4");
+                    (fs, dev, tmp, image)
+                })
+            };
+            let Some((fs, dev, _tmp, image)) = opened else {
+                eprintln!("SKIP: symlink scope regression requires e2fsprogs");
+                return;
+            };
+            let cx = Cx::for_testing();
+            let root = InodeNumber(2);
+            let mut links = Vec::new();
+            let block_size = usize::try_from(fs.ext4_superblock().unwrap().block_size).unwrap();
+            for len in [59, 60, 1023, 1024, 4095, 4096] {
+                let name = format!("scoped_symlink_{len}");
+                let target = "s".repeat(len);
+                // Match the FUSE lifecycle: the request snapshot exists before
+                // inode creation, and the outer request commits after symlink.
+                let mut scope = fs.begin_request_scope(&cx, RequestOp::Symlink).unwrap();
+                let before = fs.current_snapshot();
+                let result = FsOps::symlink(
+                    &fs,
+                    &cx,
+                    &mut scope,
+                    root,
+                    OsStr::new(&name),
+                    Path::new(&target),
+                    0,
+                    0,
+                );
+                if len >= block_size {
+                    assert!(matches!(result, Err(FfsError::NameTooLong)));
+                    assert_eq!(fs.current_snapshot(), before);
+                    assert!(matches!(
+                        fs.lookup(&cx, root, OsStr::new(&name)),
+                        Err(FfsError::NotFound(_))
+                    ));
+                    fs.end_request_scope(&cx, RequestOp::Symlink, scope)
+                        .unwrap();
+                    continue;
+                }
+                let attr = result.expect("scoped symlink must succeed");
+                fs.commit_request_scope(&cx, &mut scope)
+                    .expect("outer request must not conflict with symlink publication");
+                fs.end_request_scope(&cx, RequestOp::Symlink, scope)
+                    .unwrap();
+                assert_eq!(fs.readlink(&cx, attr.ino).unwrap(), target.as_bytes());
+                assert_eq!(attr.size, u64::try_from(len).unwrap());
+                assert_eq!(
+                    fs.read_inode(&cx, attr.ino).unwrap().is_fast_symlink(),
+                    len < 60
+                );
+                links.push((name, target));
+            }
+            fs.flush_mvcc_to_device(&cx)
+                .expect("flush symlink namespace");
+            std::fs::write(&image, dev.snapshot_bytes()).expect("persist test image");
+            let Some((clean, output)) = run_e2fsck(&image) else {
+                eprintln!("SKIP: symlink image verification requires e2fsck");
+                return;
+            };
+            assert!(clean, "scoped symlinks must leave a clean image: {output}");
+            drop(fs);
+            let reopened = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default())
+                .expect("reopen symlink image");
+            for (name, target) in links {
+                let attr = reopened.lookup(&cx, root, OsStr::new(&name)).unwrap();
+                assert_eq!(reopened.readlink(&cx, attr.ino).unwrap(), target.as_bytes());
+            }
+            eprintln!(
+                "PASS: scoped symlink boundaries, reopen and e2fsck; small_blocks={small_blocks}"
+            );
+        }
+    }
+
+    #[test]
+    fn ext4_symlink_htree_collision_preserves_blocks_inodes_and_commit_sequence() {
+        let Some((fs, _tmp)) = open_writable_ext4_mkfs(16) else {
+            eprintln!("SKIP: symlink collision regression requires mkfs.ext4");
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let names: Vec<String> = (0..32)
+            .map(|i| format!("entry_{i:03}_{}", "a".repeat(180)))
+            .collect();
+        for name in &names {
+            fs.create(&cx, root, OsStr::new(name), 0o644, 0, 0).unwrap();
+        }
+        assert!(fs.read_inode(&cx, root).unwrap().has_htree_index());
+        let original = fs.lookup(&cx, root, OsStr::new(&names[0])).unwrap();
+        let blocks_before = fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap();
+        let inodes_before = fs.count_free_inodes_in_group(&cx, GroupNumber(0)).unwrap();
+        let snapshot_before = fs.current_snapshot();
+        let counts_before: Vec<_> = fs
+            .require_alloc_state()
+            .unwrap()
+            .read()
+            .groups
+            .iter()
+            .map(|g| (g.free_blocks, g.free_inodes, g.used_dirs))
+            .collect();
+        for len in [59, 4095] {
+            let error = fs
+                .symlink(
+                    &cx,
+                    root,
+                    OsStr::new(&names[0]),
+                    Path::new(&"t".repeat(len)),
+                    0,
+                    0,
+                )
+                .expect_err("duplicate htree name must fail");
+            assert!(matches!(error, FfsError::Exists));
+            assert_eq!(
+                fs.current_snapshot(),
+                snapshot_before,
+                "failed creation must publish no blocks"
+            );
+            assert_eq!(
+                fs.count_free_blocks_in_group(&cx, GroupNumber(0)).unwrap(),
+                blocks_before
+            );
+            assert_eq!(
+                fs.count_free_inodes_in_group(&cx, GroupNumber(0)).unwrap(),
+                inodes_before
+            );
+            let counts_after: Vec<_> = fs
+                .require_alloc_state()
+                .unwrap()
+                .read()
+                .groups
+                .iter()
+                .map(|g| (g.free_blocks, g.free_inodes, g.used_dirs))
+                .collect();
+            assert_eq!(
+                counts_after, counts_before,
+                "cached allocator state must roll back"
+            );
+            assert_eq!(
+                fs.lookup(&cx, root, OsStr::new(&names[0])).unwrap().ino,
+                original.ino
+            );
+        }
+        eprintln!(
+            "PASS: symlink collision has no allocation or publication drift; htree_dedup={}",
+            OpenFs::htree_create_dedup_enabled()
         );
     }
 
@@ -66007,36 +66152,49 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "bd-cc6ua: needs a near-full filesystem to trigger ENOSPC; the generated 64 MiB image is too large, so the symlink succeeds. Passes against a small committed fixture"]
     fn write_symlink_slow_target_enospc_rolls_back_inode_and_name() {
-        let Some(fs) = open_writable_ext4() else {
+        let Some((fs, dev, _tmp)) = open_writable_ext4_mkfs_with_device(16) else {
+            eprintln!("SKIP: symlink ENOSPC regression requires mkfs.ext4");
             return;
         };
         let cx = Cx::for_testing();
         let root = InodeNumber(2);
+        let filler = fs
+            .create(&cx, root, OsStr::new("filler"), 0o600, 0, 0)
+            .unwrap();
+        let block_size = u64::from(fs.ext4_superblock().unwrap().block_size);
+        let available = fs.free_space_summary(&cx).unwrap().free_blocks_total;
+        // Fill real blocks with one contiguous file. The symlink target itself
+        // stays valid; an oversized target tests ENAMETOOLONG, not rollback.
+        for block in 0..available {
+            if fs.free_space_summary(&cx).unwrap().free_blocks_total == 0 {
+                break;
+            }
+            fs.fallocate(&cx, filler.ino, block * block_size, block_size, 0)
+                .expect("preallocate remaining space including extent metadata");
+        }
+        assert_eq!(fs.free_space_summary(&cx).unwrap().free_blocks_total, 0);
         let free_before = fs
             .count_free_inodes_in_group(&cx, GroupNumber(0))
             .expect("free inode count before slow symlink failure");
-        let summary = fs.free_space_summary(&cx).expect("free space summary");
-        let block_size = usize::try_from(fs.ext4_superblock().expect("ext4 superblock").block_size)
-            .expect("block size fits usize");
-        let target_len = usize::try_from(summary.free_blocks_total)
-            .expect("free block total fits usize")
-            .saturating_mul(block_size)
-            .saturating_add(1);
-        let huge_target = "x".repeat(target_len);
+        let before = fs.current_snapshot();
+        let before_device = dev.snapshot_bytes();
+        let target = "x".repeat(80);
 
         let err = fs
             .symlink(
                 &cx,
                 root,
                 OsStr::new("slow_link_enospc"),
-                Path::new(&huge_target),
+                Path::new(&target),
                 1000,
                 1000,
             )
             .unwrap_err();
         assert_eq!(err.to_errno(), libc::ENOSPC);
+        assert_eq!(fs.current_snapshot(), before);
+        assert_eq!(dev.snapshot_bytes(), before_device);
+        assert_eq!(fs.free_space_summary(&cx).unwrap().free_blocks_total, 0);
 
         let lookup_err = fs
             .lookup(&cx, root, OsStr::new("slow_link_enospc"))
@@ -66049,6 +66207,9 @@ mod tests {
         assert_eq!(
             free_after, free_before,
             "failed slow symlink should not leak inode"
+        );
+        eprintln!(
+            "PASS: valid slow target on full image returns ENOSPC without publication or inode leak"
         );
     }
 
@@ -78783,9 +78944,7 @@ mod tests {
         f.set_len(size_mb * 1024 * 1024).expect("set image size");
         drop(f);
 
-        // Tool name assembled to avoid the dev sandbox command-guard literal.
-        let fmt_tool = format!("mk{}2fs", "e");
-        let out = std::process::Command::new(fmt_tool)
+        let out = std::process::Command::new("mke2fs")
             .args([
                 "-q",
                 "-t",

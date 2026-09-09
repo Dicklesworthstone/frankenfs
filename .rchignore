@@ -1,2 +1,14 @@
 artifacts/e2e/
 beads_compliance_audit/
+# Generated libtool alias; its regular-file target ../libtest.la is transferred.
+third_party/xfstests-dev/lib/.libs/libtest.la
+# Git-ignored libFuzzer discoveries; retain the tracked seed_* and struct_* inputs.
+# Other targets contain tracked hash-named seeds and must remain included.
+fuzz/corpus/fuzz_repair*/[0-9a-f]*
+fuzz/corpus/fuzz_mvcc*/[0-9a-f]*
+fuzz/corpus/fuzz_btree*/[0-9a-f]*
+fuzz/corpus/fuzz_extent*/[0-9a-f]*
+fuzz/corpus/fuzz_alloc*/[0-9a-f]*
+fuzz/corpus/fuzz_block*/[0-9a-f]*
+fuzz/corpus/fuzz_dir*/[0-9a-f]*
+fuzz/corpus/fuzz_fuse*/[0-9a-f]*

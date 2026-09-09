@@ -17,6 +17,31 @@ use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
+#[test]
+fn parity_default_reports_declarations_without_execution_credit() {
+    let output = run_ffs_cli(&["parity", "--json"]);
+    assert!(
+        output.status.success(),
+        "{}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["declared_contracts"]["overall_total"], 97);
+    assert_eq!(report["evidence_backed_rows"], 0);
+    assert_eq!(report["readiness_verified"], false);
+    assert_eq!(report["runs"], serde_json::json!([]));
+    assert_eq!(
+        report["missing_evidence_rows"].as_array().unwrap().len() as u64,
+        report["total_rows"].as_u64().unwrap()
+    );
+
+    for suite in ["ext4", "ext4-journal-extra", "../ext4-journal"] {
+        let rejected = run_ffs_cli(&["parity", "--json", "--verify", suite]);
+        assert!(!rejected.status.success());
+        assert!(String::from_utf8_lossy(&rejected.stderr).contains("unknown parity suite"));
+    }
+}
+
 fn emit_scenario_result(scenario_id: &str, outcome: &str, detail: Option<&str>) {
     match detail {
         Some(detail) => {

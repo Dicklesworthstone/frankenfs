@@ -406,6 +406,18 @@ For 4K blocks with 32-byte descriptors: 4096/32 = 128 descriptors per block.
 The inode is the fundamental metadata structure describing a file, directory,
 symlink, device node, or other filesystem object.
 
+For unencrypted ext4 symlinks, Linux v6.19 passes the filesystem block size to
+`fscrypt_prepare_symlink`, which includes the trailing NUL in its size check.
+Creation therefore rejects a target length greater than or equal to the block
+size with `ENAMETOOLONG`, before allocating an inode. Up to 59 target bytes fit
+in the 60-byte `i_block` area; 60 bytes require a data block. `i_size` excludes
+the NUL. Inode allocation, target initialization and directory publication belong
+to the same namespace operation; a rejected creation must not leak allocations.
+Sources: [ext4 namei.c](https://raw.githubusercontent.com/torvalds/linux/v6.19/fs/ext4/namei.c)
+(`ext4_symlink`, `ext4_init_symlink_block`) and
+[fscrypt.h](https://raw.githubusercontent.com/torvalds/linux/v6.19/include/linux/fscrypt.h)
+(`fscrypt_prepare_symlink`, non-encrypted implementation).
+
 ### 3.1 Standard Inode Fields (First 128 Bytes)
 
 The first 128 bytes (`EXT4_GOOD_OLD_INODE_SIZE = 128`) constitute the

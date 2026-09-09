@@ -5,7 +5,7 @@ use asupersync::Cx;
 use ffs_core::{OpenFs, OpenOptions};
 use ffs_fuse::{FrankenFuse, MountOptions};
 use ffs_harness::{
-    ParityReport, ProfileReadPathReport,
+    ExecutionGatedParityReport, ParityExecutor, ProfileReadPathReport,
     adaptive_runtime_manifest::{
         AdaptiveRuntimeEvidenceValidationConfig, AdaptiveRuntimeRunnerCleanupStatus,
         AdaptiveRuntimeRunnerConfig, AdaptiveRuntimeRunnerMode,
@@ -578,7 +578,7 @@ fn run() -> Result<()> {
     }
 
     match cmd {
-        Some("parity") => parity_cmd(),
+        Some("parity") => parity_cmd(command_args),
         Some("check-fixtures") => check_fixtures_cmd(),
         Some("profile-read-path") => profile_read_path_cmd(&args[1..]),
         Some("generate-fixture") => generate_fixture(&args[1..]),
@@ -716,9 +716,25 @@ fn run() -> Result<()> {
     }
 }
 
-fn parity_cmd() -> Result<()> {
-    let report = ParityReport::current();
+fn parity_cmd(args: &[String]) -> Result<()> {
+    let mut suites = Vec::new();
+    let mut executor = ParityExecutor::Rch;
+    let mut args = args.iter();
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--verify" => suites.push(args.next().context("--verify requires a suite")?.clone()),
+            "--local" => executor = ParityExecutor::Cargo,
+            _ => bail!("unknown parity argument: {arg}"),
+        }
+    }
+    if executor == ParityExecutor::Cargo && suites.is_empty() {
+        bail!("--local requires --verify");
+    }
+    let report = ExecutionGatedParityReport::run(&suites, executor)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
+    if !suites.is_empty() {
+        report.require_evidence().map_err(anyhow::Error::msg)?;
+    }
     Ok(())
 }
 

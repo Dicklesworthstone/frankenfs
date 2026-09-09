@@ -718,11 +718,9 @@ impl FsOps for OpenFs {
                     ));
                 }
 
-                if inode.size <= 60 {
+                if let Some(target) = inode.fast_symlink_target() {
                     // Fast symlink: data is stored directly in the inode's block field.
-                    #[expect(clippy::cast_possible_truncation)]
-                    let len = inode.size as usize;
-                    Ok(inode.extent_bytes[..len].to_vec())
+                    Ok(target.to_vec())
                 } else {
                     // Slow symlink: data is stored in separate blocks.
                     let capped = inode.size.min(LINUX_PATH_MAX);
@@ -1216,14 +1214,9 @@ impl FsOps for OpenFs {
         data: &[u8],
     ) -> ffs_error::Result<u32> {
         match &self.flavor {
-            FsFlavor::Ext4(_) => self.ext4_write(
-                cx,
-                scope,
-                Self::ext4_canonical_inode(ino),
-                offset,
-                data,
-                true,
-            ),
+            FsFlavor::Ext4(_) => {
+                self.ext4_write(cx, scope, Self::ext4_canonical_inode(ino), offset, data)
+            }
             FsFlavor::Btrfs(_) => {
                 self.check_btrfs_mutation_allowed("write")?;
                 self.btrfs_write(cx, ino, offset, data)
@@ -1260,7 +1253,7 @@ impl FsOps for OpenFs {
     fn symlink(
         &self,
         cx: &Cx,
-        scope: &mut RequestScope,
+        _scope: &mut RequestScope,
         parent: InodeNumber,
         name: &OsStr,
         target: &Path,
@@ -1284,7 +1277,6 @@ impl FsOps for OpenFs {
             FsFlavor::Ext4(_) => self
                 .ext4_symlink(
                     cx,
-                    scope,
                     Self::ext4_canonical_inode(parent),
                     name.as_encoded_bytes(),
                     target,

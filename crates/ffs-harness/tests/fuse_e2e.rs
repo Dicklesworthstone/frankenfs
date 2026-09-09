@@ -14250,6 +14250,43 @@ fn ext4_fuse_security_xattr_requires_privilege() {
 }
 
 #[test]
+fn fuse_unmount_and_join_rejects_busy_mount_before_waiting() {
+    let uid = Command::new("id")
+        .arg("-u")
+        .output()
+        .expect("effective UID");
+    assert!(uid.status.success(), "effective UID lookup failed");
+    if String::from_utf8_lossy(&uid.stdout).trim() != "0" || !fuse_available() {
+        eprintln!("SKIP: busy clean-unmount regression requires root and FUSE");
+        return;
+    }
+    let tmp = TempDir::new().expect("busy unmount tmpdir");
+    let image = create_test_image_with_size(tmp.path(), 4 * 1024 * 1024);
+    let mnt = tmp.path().join("mnt");
+    fs::create_dir(&mnt).expect("busy unmount mountpoint");
+    let Some(session) = try_mount_ffs_rw(&image, &mnt) else {
+        return;
+    };
+    // Hold a real reference to this mount so the vendor's non-lazy root
+    // unmount returns EBUSY. Previously join then waited for a server that
+    // was still mounted, and MountGuard's cleanup could never run.
+    let pin = fs::File::open(&mnt).expect("pin mounted directory");
+    let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        session.unmount_and_join();
+    }));
+    drop(pin);
+    let error = result.expect_err("busy unmount must not certify completed persistence");
+    assert!(
+        error
+            .downcast_ref::<String>()
+            .is_some_and(|message| message.contains("clean unmount failed")),
+        "must reject the failed unmount, not an unrelated panic"
+    );
+    wait_for_fuse_mount_released(&mnt);
+    eprintln!("PASS: busy unmount rejected before join and owned mount cleaned up");
+}
+
+#[test]
 fn btrfs_fuse_security_xattr_requires_privilege() {
     assert_unprivileged_security_xattr_rejected(true);
 }
@@ -14303,7 +14340,7 @@ fn assert_unprivileged_security_xattr_rejected(btrfs: bool) {
     // may be mode 0700. allow_other admits the new UID at the FUSE boundary.
     // Positive read and user.* controls distinguish namespace rejection from
     // inaccessible fixture paths, mount-owner checks, and generic write denial.
-    let script = r#"
+    let script = r"
 import json, os
 if os.geteuid() == 0:
     os.setgroups([])
@@ -14325,7 +14362,7 @@ try:
 except OSError as error:
     report['errno'] = error.errno
 print(json.dumps(report))
-"#;
+";
     let output = Command::new("python3")
         .args(["-c", script])
         .current_dir(&mnt)
@@ -14471,15 +14508,36 @@ fn ext4_fuse_ioctl_setversion_roundtrips_via_mounted_path() {
         ioctl_trace_path: Some(ioctl_trace_path.clone()),
         ..MountOptions::default()
     };
-    let Some(_session) = try_mount_ffs_rw_with_options(&image, &mnt, &mount_opts) else {
-        return;
+    ffs_harness::stale_mounts::reap_stale_frankenfs_mounts_once();
+    let cx = Cx::for_testing();
+    let open_opts = OpenOptions {
+        skip_validation: false,
+        ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+        mvcc_wal_path: Some(image.with_extension("wal")),
+        ..OpenOptions::default()
     };
+    let mut filesystem =
+        OpenFs::open_with_options(&cx, &image, &open_opts).expect("open ext4 image");
+    filesystem.enable_writes(&cx).expect("enable ext4 writes");
+    let config = ffs_fuse::MountConfig {
+        options: mount_opts,
+        ..ffs_fuse::MountConfig::default()
+    };
+    let session = match ffs_fuse::mount_managed(Box::new(filesystem), &mnt, &config) {
+        Ok(session) => session,
+        Err(error) => {
+            eprintln!("FUSE mount (rw) failed (skipping test): {error}");
+            return;
+        }
+    };
+    wait_for_fuse_mount_ready(&mnt);
 
     let scenario_id = "ext4_ioctl_setversion_roundtrip";
     let path = mnt.join("version-target.txt");
     fs::write(&path, b"setversion mounted path target\n").expect("create setversion target");
 
     let original_report = ext4_inode_generation_ioctl(&path, "get", None);
+    session.flush_ioctl_trace().expect("flush GETVERSION trace");
     let get_trace = read_ioctl_trace(&ioctl_trace_path);
     if let Some(errno) = original_report["errno"].as_i64() {
         let transport_errno = errno == i64::from(libc::ENOTTY)
@@ -14514,6 +14572,7 @@ fn ext4_fuse_ioctl_setversion_roundtrips_via_mounted_path() {
     let requested = original ^ 0x1357_9BDF_u32;
 
     let set_report = ext4_inode_generation_ioctl(&path, "set", Some(requested));
+    session.flush_ioctl_trace().expect("flush SETVERSION trace");
     let set_trace = read_ioctl_trace(&ioctl_trace_path);
     if let Some(errno) = set_report["errno"].as_i64() {
         let transport_errno = errno == i64::from(libc::ENOTTY) || errno == i64::from(libc::EINVAL);
@@ -14542,6 +14601,9 @@ fn ext4_fuse_ioctl_setversion_roundtrips_via_mounted_path() {
     );
 
     let updated_report = ext4_inode_generation_ioctl(&path, "get", None);
+    session
+        .flush_ioctl_trace()
+        .expect("flush updated GETVERSION trace");
     let updated_trace = read_ioctl_trace(&ioctl_trace_path);
     assert!(
         trace_contains_cmd(&updated_trace, EXT4_IOC_GETVERSION_CMD),

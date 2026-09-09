@@ -105,6 +105,9 @@ jobs:
       - name: Unit tests
         run: cargo test --workspace
 
+      - name: Executed ext4 journal parity contracts
+        run: cargo run -p ffs-harness -- parity --verify ext4-journal --local
+
       - name: ffs-block all-features check
         run: cargo check -p ffs-block --all-features --all-targets
 

@@ -5044,8 +5044,7 @@ enum IoctlTraceMsg {
     /// messages, then signals on the supplied reply channel.  Used by tests
     /// (and any caller that needs a happens-before guarantee for an external
     /// reader of the trace file).
-    #[cfg_attr(not(test), allow(dead_code))]
-    Flush(SyncSender<()>),
+    Flush(SyncSender<std::io::Result<()>>),
 }
 
 /// Off-thread ioctl trace sink.
@@ -5149,9 +5148,8 @@ impl IoctlTraceProbe {
     }
 
     /// Round-trip a `Flush` barrier through the writer thread.  When this
-    /// returns, all previously enqueued `Record` messages have been written
+    /// returns successfully, all previously enqueued `Record` messages have been written
     /// to the trace file (visible to any same-process reader).
-    #[cfg_attr(not(test), allow(dead_code))]
     fn flush_sync(&self) -> std::io::Result<()> {
         let sender = self.sender.as_ref().ok_or_else(|| {
             std::io::Error::new(
@@ -5159,7 +5157,7 @@ impl IoctlTraceProbe {
                 "ioctl trace writer terminated",
             )
         })?;
-        let (reply_tx, reply_rx) = sync_channel::<()>(1);
+        let (reply_tx, reply_rx) = sync_channel(1);
         sender.send(IoctlTraceMsg::Flush(reply_tx)).map_err(|_| {
             std::io::Error::new(
                 std::io::ErrorKind::BrokenPipe,
@@ -5171,7 +5169,14 @@ impl IoctlTraceProbe {
                 std::io::ErrorKind::BrokenPipe,
                 "ioctl trace writer dropped flush reply",
             )
-        })
+        })??;
+        let dropped = self.dropped_events.load(Ordering::Relaxed);
+        if dropped > 0 {
+            return Err(std::io::Error::other(format!(
+                "ioctl trace lost {dropped} events"
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -5260,12 +5265,13 @@ fn ioctl_trace_writer_loop(path: &Path, receiver: &Receiver<IoctlTraceMsg>) {
             // not deadlock on a missing trace file.
             for msg in receiver {
                 if let IoctlTraceMsg::Flush(reply) = msg {
-                    let _ = reply.send(());
+                    let _ = reply.send(Err(std::io::Error::new(error.kind(), error.to_string())));
                 }
             }
             return;
         }
     };
+    let mut write_error: Option<std::io::Error> = None;
     while let Ok(msg) = receiver.recv() {
         match msg {
             IoctlTraceMsg::Record {
@@ -5278,10 +5284,14 @@ fn ioctl_trace_writer_loop(path: &Path, receiver: &Receiver<IoctlTraceMsg>) {
                     format!("ino={ino} cmd=0x{cmd:08x} in_len={in_len} out_size={out_size}\n");
                 if let Err(error) = file.write_all(line.as_bytes()) {
                     warn!(path = %path.display(), %error, "ioctl trace write failed");
+                    write_error.get_or_insert(error);
                 }
             }
             IoctlTraceMsg::Flush(reply) => {
-                let _ = reply.send(());
+                let result = write_error.as_ref().map_or(Ok(()), |error| {
+                    Err(std::io::Error::new(error.kind(), error.to_string()))
+                });
+                let _ = reply.send(result);
             }
         }
     }
@@ -7717,6 +7727,7 @@ impl Default for MountConfig {
 /// The `AutoUnmount` fuser option provides a safety net: the kernel
 /// unmounts the filesystem if the process exits without a clean unmount.
 pub struct MountHandle {
+    diagnostics: FrankenFuse,
     session: Option<fuser::BackgroundSession>,
     mountpoint: PathBuf,
     shutdown: Arc<std::sync::atomic::AtomicBool>,
@@ -7754,6 +7765,14 @@ impl From<fuser::PerCoreMetricsSnapshot> for PerCoreTransportMetrics {
 }
 
 impl MountHandle {
+    /// Wait for queued ioctl trace records to become visible to readers.
+    ///
+    /// # Errors
+    /// Returns an error if tracing is disabled, events were lost, or the writer failed.
+    pub fn flush_ioctl_trace(&self) -> std::io::Result<()> {
+        self.diagnostics.flush_ioctl_trace()
+    }
+
     /// The mountpoint path.
     #[must_use]
     pub fn mountpoint(&self) -> &Path {
@@ -7946,6 +7965,7 @@ pub fn mount_managed(
     info!(mountpoint = %mountpoint.display(), "FUSE mount active");
 
     Ok(MountHandle {
+        diagnostics: notifier_owner,
         session: Some(session),
         mountpoint: mountpoint.to_owned(),
         shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -7991,6 +8011,7 @@ pub fn mount_managed_per_core(
     );
 
     Ok(MountHandle {
+        diagnostics: notifier_owner,
         session: Some(session),
         mountpoint: mountpoint.to_owned(),
         shutdown: Arc::new(std::sync::atomic::AtomicBool::new(false)),
@@ -13552,12 +13573,7 @@ mod tests {
     }
 
     fn flush_ioctl_trace_for_testing(fuse: &FrankenFuse) {
-        fuse.inner
-            .ioctl_trace
-            .as_ref()
-            .expect("ioctl trace configured")
-            .flush_sync()
-            .expect("ioctl trace flush_sync");
+        fuse.flush_ioctl_trace().expect("ioctl trace flush_sync");
     }
 
     fn dispatch_ioctl_for_testing(
@@ -18151,6 +18167,104 @@ mod tests {
     }
 
     #[test]
+    fn ioctl_trace_flush_reports_open_failure() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system time after unix epoch")
+            .as_nanos();
+        let parent = std::env::temp_dir().join(format!(
+            "ffs_ioctl_missing_parent_{}_{unique}",
+            std::process::id()
+        ));
+        assert!(!parent.exists());
+        let probe = IoctlTraceProbe::new(parent.join("trace.log"));
+        probe.record(1, EXT4_IOC_GETFLAGS, 0, 4);
+        for _ in 0..2 {
+            assert_eq!(
+                probe
+                    .flush_sync()
+                    .expect_err("missing trace must fail")
+                    .kind(),
+                std::io::ErrorKind::NotFound
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "linux")]
+    fn ioctl_trace_flush_reports_write_failure() {
+        // Exercise an actual kernel write failure, bypassing the public path
+        // validator that correctly refuses special devices as trace destinations.
+        let (sender, receiver) = sync_channel(4);
+        let worker = std::thread::spawn(move || {
+            ioctl_trace_writer_loop(Path::new("/dev/full"), &receiver);
+        });
+        sender
+            .send(IoctlTraceMsg::Record {
+                ino: 1,
+                cmd: EXT4_IOC_GETFLAGS,
+                in_len: 0,
+                out_size: 4,
+            })
+            .expect("record enqueue");
+        for _ in 0..2 {
+            let (reply_tx, reply_rx) = sync_channel(1);
+            sender
+                .send(IoctlTraceMsg::Flush(reply_tx))
+                .expect("flush enqueue");
+            let error = reply_rx
+                .recv()
+                .expect("flush reply")
+                .expect_err("write failed");
+            assert_eq!(error.kind(), std::io::ErrorKind::StorageFull);
+        }
+        drop(sender);
+        worker.join().expect("trace writer exited");
+    }
+
+    #[test]
+    fn ioctl_trace_flush_rejects_dropped_records() {
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system time after unix epoch")
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "ffs_ioctl_backpressure_{}_{unique}.log",
+            std::process::id()
+        ));
+        let (sender, receiver) = sync_channel(1);
+        let mut probe = IoctlTraceProbe {
+            path: path.clone(),
+            sender: Some(sender),
+            worker: None,
+            dropped_events: Arc::new(AtomicU64::new(0)),
+        };
+        // Hold the real receiver until the second nonblocking enqueue has
+        // overflowed the queue, then let the normal writer drain it.
+        probe.record(1, EXT4_IOC_GETFLAGS, 0, 4);
+        probe.record(2, EXT4_IOC_GETFLAGS, 0, 4);
+        probe.worker = Some(std::thread::spawn(move || {
+            ioctl_trace_writer_loop(&path, &receiver);
+        }));
+        let error = probe.flush_sync().expect_err("incomplete trace must fail");
+        assert!(error.to_string().contains("lost 1 events"));
+        let trace = std::fs::read_to_string(&probe.path).expect("read partial trace");
+        assert_eq!(trace.lines().count(), 1);
+        assert!(trace.starts_with("ino=1 "));
+    }
+
+    #[test]
+    fn ioctl_trace_flush_rejects_disabled_tracing() {
+        let fuse = FrankenFuse::new(Box::new(MinimalTestFs));
+        assert_eq!(
+            fuse.flush_ioctl_trace()
+                .expect_err("tracing disabled")
+                .kind(),
+            std::io::ErrorKind::NotConnected
+        );
+    }
+
+    #[test]
     fn ioctl_trace_flush_sync_is_happens_before_barrier_for_concurrent_recorders() {
         // Spawning many threads that all enqueue records concurrently, then
         // a single `flush_sync` from the main thread, must guarantee that
@@ -21866,6 +21980,7 @@ mod tests {
         metrics.record_bytes_read(8192);
 
         let handle = MountHandle {
+            diagnostics: FrankenFuse::new(Box::new(MinimalTestFs)),
             session: None,
             mountpoint: PathBuf::from("/mnt/test"),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -21918,6 +22033,7 @@ mod tests {
         );
 
         let handle = MountHandle {
+            diagnostics: FrankenFuse::new(Box::new(MinimalTestFs)),
             session: None,
             mountpoint: PathBuf::from("/mnt/dbg"),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -21933,6 +22049,7 @@ mod tests {
     fn mount_handle_drop_is_safe_without_session() {
         // Verify that dropping a MountHandle with no session doesn't panic.
         let handle = MountHandle {
+            diagnostics: FrankenFuse::new(Box::new(MinimalTestFs)),
             session: None,
             mountpoint: PathBuf::from("/mnt/drop"),
             shutdown: Arc::new(AtomicBool::new(false)),
@@ -21952,6 +22069,7 @@ mod tests {
         let shutdown_trigger = Arc::clone(&shutdown);
 
         let handle = MountHandle {
+            diagnostics: FrankenFuse::new(Box::new(MinimalTestFs)),
             session: None,
             mountpoint: PathBuf::from("/mnt/wait"),
             shutdown: Arc::clone(&shutdown),
@@ -22023,6 +22141,7 @@ mod tests {
         let shutdown_trigger = Arc::clone(&shutdown);
 
         let handle = MountHandle {
+            diagnostics: FrankenFuse::new(Box::new(MinimalTestFs)),
             session: None,
             mountpoint: PathBuf::from("/mnt/timeout"),
             shutdown: Arc::clone(&shutdown),

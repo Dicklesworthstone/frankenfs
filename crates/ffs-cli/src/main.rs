@@ -106,7 +106,7 @@ use ffs_fuse::{
     mount_managed_per_core,
 };
 use ffs_harness::{
-    ParityReport,
+    ExecutionGatedParityReport, ParityExecutor,
     adaptive_runtime_manifest::{
         AdaptiveRuntimeEvidenceValidationConfig, AdaptiveRuntimeMode,
         fail_on_adaptive_runtime_evidence_errors, load_adaptive_runtime_evidence_manifest,
@@ -1325,6 +1325,12 @@ enum Command {
         /// Output in JSON format.
         #[arg(long)]
         json: bool,
+        /// Execute a current contract suite: ext4-journal or ext4-reference.
+        #[arg(long)]
+        verify: Vec<String>,
+        /// Run Cargo directly in CI or on an existing build worker.
+        #[arg(long, requires = "verify")]
+        local: bool,
     },
     /// Display the repair evidence ledger (JSONL).
     Evidence {
@@ -2493,7 +2499,11 @@ fn run() -> Result<()> {
             )
         }
         Command::Scrub { image, json } => scrub_cmd(&image, json),
-        Command::Parity { json } => parity(json),
+        Command::Parity {
+            json,
+            verify,
+            local,
+        } => parity(json, &verify, local),
         Command::Evidence {
             ledger,
             json,
@@ -9423,7 +9433,7 @@ fn print_fsck_output(json: bool, output: &FsckOutput) -> Result<()> {
     Ok(())
 }
 
-fn parity(json: bool) -> Result<()> {
+fn parity(json: bool, suites: &[String], local: bool) -> Result<()> {
     let command_span = info_span!(
         target: "ffs::cli::parity",
         "parity",
@@ -9433,7 +9443,12 @@ fn parity(json: bool) -> Result<()> {
     let started = Instant::now();
     info!(target: "ffs::cli::parity", "parity_start");
 
-    let report = ParityReport::current();
+    let executor = if local {
+        ParityExecutor::Cargo
+    } else {
+        ParityExecutor::Rch
+    };
+    let report = ExecutionGatedParityReport::run(suites, executor)?;
 
     if json {
         println!(
@@ -9441,9 +9456,9 @@ fn parity(json: bool) -> Result<()> {
             serde_json::to_string_pretty(&report).context("serialize parity report")?
         );
     } else {
-        println!("FrankenFS Feature Parity Report");
+        println!("FrankenFS declared contract coverage (not execution evidence)");
         println!();
-        for domain in &report.domains {
+        for domain in &report.declared_contracts.domains {
             println!(
                 "  {:<35} {:>2}/{:<2}  ({:.1}%)",
                 domain.domain, domain.implemented, domain.total, domain.coverage_percent
@@ -9453,19 +9468,34 @@ fn parity(json: bool) -> Result<()> {
         println!(
             "  {:<35} {:>2}/{:<2}  ({:.1}%)",
             "OVERALL",
-            report.overall_implemented,
-            report.overall_total,
-            report.overall_coverage_percent
+            report.declared_contracts.overall_implemented,
+            report.declared_contracts.overall_total,
+            report.declared_contracts.overall_coverage_percent
         );
+        println!(
+            "\nCurrent bounded contracts verified: {} / {} capability rows",
+            report.evidence_backed_rows, report.total_rows
+        );
+        println!("Project readiness: unverified (canonical gate coverage incomplete)");
+        for contract in &report.contracts {
+            if let Some(reason) = &contract.reason {
+                println!("  {}: {reason}", contract.capability);
+            } else {
+                println!("  {}: {}", contract.capability, contract.contract);
+            }
+        }
     }
 
     info!(
         target: "ffs::cli::parity",
-        overall_coverage_percent = report.overall_coverage_percent,
+        verified_contracts = report.evidence_backed_rows,
         duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
         "parity_complete"
     );
 
+    if !suites.is_empty() {
+        report.require_evidence().map_err(anyhow::Error::msg)?;
+    }
     Ok(())
 }
 
@@ -15413,7 +15443,7 @@ mod tests {
             Cli::try_parse_from(["ffs", "parity", "--json"]).expect("parity command should parse");
 
         match cli.command {
-            Command::Parity { json } => {
+            Command::Parity { json, .. } => {
                 assert!(json);
             }
             other => assert!(
@@ -15428,7 +15458,7 @@ mod tests {
         let cli = Cli::try_parse_from(["ffs", "parity"]).expect("parity command should parse");
 
         match cli.command {
-            Command::Parity { json } => {
+            Command::Parity { json, .. } => {
                 assert!(!json);
             }
             other => assert!(

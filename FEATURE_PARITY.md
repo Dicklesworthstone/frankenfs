@@ -7,7 +7,10 @@
 > **2026-09-08 audit status:** The following counts are legacy declared-contract
 > counts, not current executed results. In particular, the fast-commit row below
 > is partial pending external crash-image verification. Public execution-bound
-> reporting is tracked in `bd-wh1xk` / `bd-lc132`; do not interpret `97/97` as
+> reporting now separates declarations from seven mapped, bounded ext4 contracts
+> executed through `parity --verify ext4-journal` / `--verify ext4-reference`.
+> Remaining mappings and canonical gate coverage stay open in `bd-wh1xk` /
+> `bd-lc132`; do not interpret `97/97` as
 > successful execution or release readiness.
 >
 > **Repair integration update:** explicit request contexts now reach attached
@@ -24,6 +27,15 @@
 > `crates/ffs-core/tests/btrfs_tree_log_leak.rs` and
 > `crates/ffs-core/tests/btrfs_tree_log_crash_replay.rs`. This repairs a missing
 > durability step; full-workspace and external crash certification remain open.
+>
+> **Ext4 symlink update:** inode allocation, target data and directory publication
+> now commit together. The mounted 4095-byte target regression no longer returns
+> EAGAIN. `readlink` distinguishes a 60-byte extent-backed target from inline
+> storage, and creation rejects targets that cannot fit with NUL in one filesystem
+> block. Scoped 1 KiB/4 KiB image tests verify boundary behavior, reopen and clean
+> e2fsck results; htree name collisions preserve allocation counts and the commit
+> sequence. This does not establish open-unlink lifetime or workspace acceptance;
+> `bd-vuzzq` remains incomplete.
 
 | Domain | Implemented | Total Tracked | Coverage |
 |--------|-------------|---------------|----------|

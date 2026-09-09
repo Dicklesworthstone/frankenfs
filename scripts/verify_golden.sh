@@ -359,15 +359,21 @@ fi
 
 # ── 4. Parity report consistency ─────────────────────────────────
 echo "--- Parity report ---"
-if cargo_exec test -p ffs-harness -- parity_report_matches_feature_parity_md --quiet 2>/dev/null; then
+if cargo_exec test -p ffs-harness -- parity_report_matches_feature_parity_md --quiet; then
     pass "ParityReport matches FEATURE_PARITY.md"
 else
     fail "ParityReport vs FEATURE_PARITY.md mismatch"
 fi
 
+if cargo_exec run -p ffs-harness -- parity --verify ext4-journal --local; then
+    pass "current external and internal journal contracts executed"
+else
+    fail "journal parity execution failed, skipped, stale, or selected no tests"
+fi
+
 # ── 5. Conformance fixture validation ────────────────────────────
 echo "--- Conformance fixtures ---"
-if cargo_exec test -p ffs-harness --test conformance --quiet 2>/dev/null; then
+if cargo_exec test -p ffs-harness --test conformance --quiet; then
     pass "all conformance fixtures validate"
 else
     fail "conformance fixture validation failed"
@@ -375,7 +381,7 @@ fi
 
 # ── 6. Golden JSON structural validation ─────────────────────────
 echo "--- Golden JSON validation ---"
-if cargo_exec test -p ffs-harness --test kernel_reference golden_json_parses_and_is_consistent --quiet 2>/dev/null; then
+if cargo_exec test -p ffs-harness --test kernel_reference golden_json_parses_and_is_consistent --quiet; then
     pass "golden JSON parses and is consistent"
 else
     fail "golden JSON validation failed"

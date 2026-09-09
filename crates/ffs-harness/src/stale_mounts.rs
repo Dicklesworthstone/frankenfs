@@ -427,12 +427,35 @@ impl MountGuard {
     /// Use this before reopening an image; ordinary drop only requests unmount.
     ///
     /// # Panics
-    /// Panics if the background server panicked or returned an I/O error.
+    /// Panics if clean unmount fails, or the background server panicked or
+    /// returned an I/O error. Emergency detach is cleanup, not durability proof.
     pub fn unmount_and_join(mut self) {
         if let Some(session) = self.session.take() {
-            session.join();
+            let guard = request_unmount(session);
+            // BackgroundSession::join waits even when Mount::drop fails to
+            // unmount (for example EBUSY). The server then waits for requests
+            // forever, preventing this guard's emergency cleanup from running.
+            // Fail before joining in that case; unwinding runs our Drop path.
+            #[cfg(target_os = "linux")]
+            assert!(
+                !still_mounted(&self.mountpoint),
+                "clean unmount failed for {}; cannot certify destroy-time persistence",
+                self.mountpoint.display()
+            );
+            guard
+                .join()
+                .expect("FUSE server panicked")
+                .expect("FUSE server I/O error");
         }
     }
+}
+
+/// Moving the public thread handle out of this owned session drops its other
+/// fields, including the unmount handle, before returning to the caller.
+fn request_unmount(
+    session: fuser::BackgroundSession,
+) -> std::thread::JoinHandle<std::io::Result<()>> {
+    session.guard
 }
 
 /// Reclaim every leaked FrankenFS mount on an abrupt (signal) exit, where no

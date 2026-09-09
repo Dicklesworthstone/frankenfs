@@ -1,6 +1,6 @@
 # Reality-Check Bridge: Closing the Gap Between Claims and Code
 
-## Delivery progress — 2026-09-08, 17:56 UTC
+## Delivery progress — 2026-09-08, 21:10 UTC
 
 The audit below is the starting point, not a claim that its diagnosed defects
 remain unchanged. Implementation has advanced; the complete delivery contract
@@ -83,14 +83,99 @@ contain explicit prerequisite skips, so 237 is not a count of proved features.
 The remaining failures are the syscall-sequence open-unlink mismatch and the
 PATH_MAX-1 symlink EAGAIN (`/tmp/ffs-security-fixture-fuse-full-20260908.log`).
 
+Broader verification exposed a teardown hang on two workers: a failed clean
+unmount left the FUSE server waiting for requests while `BackgroundSession::join`
+waited for that server, preventing the guard's cleanup from running. The guard
+now drops the unmount handle first and checks mount presence before joining.
+If clean unmount failed, it reports failure and unwinds through cleanup;
+emergency detach does not count as proof of persistence. A real directory
+descriptor deliberately pins a mount in the new regression, which rejects the
+failed unmount and cleans up in 0.11 seconds. The unchanged successful remount
+paths also pass. The new full mounted run completes normally with 238 passing
+functions, the same 2 namespace failures, and 8 ignored
+(`/tmp/ffs-join-unmount-fuse-final-20260908.log`).
+
+The two older hung diagnostic runs required manual clean unmount of their own
+temporary mounts to finish; they are not normal-pass verification. Evidence is
+retained in `/tmp/ffs-remount-join-hang-20260908.log` and
+`/tmp/ffs-security-second-worker-join-hang-20260908.log`. Current teardown source
+SHA-256 is `e4a4ff6fc91af8328eaec7145a6ca7efdb855afef9e9d90b1282a6bf49b7cbfe`;
+the mounted test file is
+`ed04fd0268e01bacefb9244e881a498ad327634dc9d7546c19a64429cf621500`.
+
+The ext4 long-symlink EAGAIN now has a runtime fix: a namespace-owned transaction
+stages inode allocation, target data, and directory insertion together, restoring
+cached allocator groups on a pre-publication failure. It preserves the existing
+self-publishing namespace API boundary; it does not claim caller-batched namespace
+transactions. Ordinary scoped file writes retain their read-your-writes path.
+The unchanged mounted PATH_MAX regression now passes for both formats
+(`/tmp/ffs-atomic-symlink-mounted-20260908.log`, two executed scenarios).
+
+The new core boundary test found another defect: a 60-byte extent-backed target
+was returned as raw extent metadata because `readlink` classified solely by size.
+It now uses the inode's inline-storage classification. Creation also enforces
+Linux ext4's block-size-minus-one target limit before allocation, as extracted
+from Linux v6.19 `ext4_symlink` and `fscrypt_prepare_symlink`. The updated core
+selection passed 23 tests with one existing ignored ENOSPC fixture
+(`/tmp/ffs-atomic-symlink-test2-20260908.log`). New tests emit explicit PASS for
+1 KiB/4 KiB boundary acceptance/refusal, reopen, and clean e2fsck, plus htree
+collision rollback with dedup enabled. The ENOSPC fixture is now repaired and
+enabled: it fills a real 16 MiB image to zero free blocks, accounting for extent
+metadata, then attempts a valid 80-byte target. Exact ENOSPC, no published commit,
+unchanged backing bytes, no leaked inode and an absent name all pass
+(`/tmp/ffs-atomic-symlink-enospc2-20260908.log`). Its earlier oversized target
+could only exercise length rejection, not the intended allocation failure.
+The final full core command passes 1,274 library and 74 integration tests, with
+24 library and two integration ignores remaining; all five batched-write
+regressions pass (`/tmp/ffs-atomic-symlink-core-final-20260908.log`). Final workspace
+check, Clippy with warnings denied, and formatting pass after the fixture edit.
+Both harness benchmark executables complete successfully
+(`/tmp/ffs-atomic-symlink-harness-bench-20260908.log`, remote exit 0). Their
+historical comparisons do not establish a live-incumbent performance win.
+The final full harness command completes with three failing targets
+(`/tmp/ffs-atomic-symlink-harness-full-20260908.log`): compiler-rejection output
+normalization, the stale-index census, and the mounted suite. On worker
+vmi1264463, mounted results are 237 passing functions, three failures and eight
+ignores. Both PATH_MAX scenarios pass; failures are open-unlink, successful
+GETVERSION without userspace trace, and failed clean unmount in the read-only
+ioctl fixture. The latter now fails promptly instead of hanging. No assertion,
+golden, or prerequisite rule was relaxed to remove these failures. The single
+cross-worker comparison on vmi1227854 reports 239 passing functions, one
+open-unlink failure and eight ignores
+(`/tmp/ffs-atomic-symlink-fuse-cross-worker-20260908.log`). Both privilege tests,
+both PATH_MAX scenarios, and the intentional busy-unmount regression pass.
+The additional GETVERSION trace and clean-unmount failures did not reproduce
+in that run; their cause is not established and the first result remains part
+of the acceptance record.
+
+The subsequent ioctl investigation found a concrete observation race: the FUSE
+handler enqueued the trace asynchronously, replied to the ioctl, and the mounted
+test read the file without waiting for the writer. Managed mounts now expose the
+existing writer barrier, and the GETVERSION/SETVERSION roundtrip uses it before
+each trace read. A successful barrier also requires no dropped records and no
+earlier writer error; failed opens and writes previously received a successful
+acknowledgment. Missing-parent, full-device and bounded-queue overflow tests
+exercise those failures. The mounted roundtrip passes on vmi1264463 with its
+original command-routing and generation assertions intact (one actual PASS,
+no skip, `/tmp/ffs-ioctl-barrier-mounted.log`). This fixes trace observation;
+it does not establish filesystem durability or resolve open-unlink lifetime.
+The complete FUSE crate command passes 690 unit tests, two integration tests
+and one doctest, with one existing integration ignore
+(`/tmp/ffs-ioctl-barrier-fuse-full.log`). All four new barrier regressions and
+the existing concurrent recorder test execute successfully. Final workspace
+check, all-target Clippy with warnings denied and formatting also pass.
+The full harness on vmi1149989 completes with exit 101
+(`/tmp/ffs-ioctl-barrier-harness-full.log`): the same remote-path trybuild
+mismatch, the stale-index census (4219 versus 4216), and the mounted suite.
+Mounted results are 238 passing functions, two failures and eight ignores;
+the corrected ioctl roundtrip reports an actual PASS. Open-unlink and the
+read-only ioctl fixture's clean-unmount refusal remain failures. No manual
+unmount intervention was used in this run. Both harness benchmark executables
+complete successfully (`/tmp/ffs-ioctl-barrier-bench.log`, remote exit 0);
+no performance win is claimed.
+
 Still failing or unverified: open-unlink file-descriptor lifetime (ENOENT on the
-mounted ext4 path) and long-symlink EAGAIN. The latter reproduces in isolation: eager inode/directory
-commits mix with a target write using the older request transaction. The scope
-contract needs a coherent fix; the transaction was not bypassed for a green test.
-Allocator counters also change before the caller commits, so a complete fix must
-cover allocation rollback together with inode, target data, and directory entry
-publication. No namespace runtime change was made in this continuation.
-The
+mounted ext4 path). The
 trybuild failure preserves the expected type rejection but disagrees on the remote
 dependency-path prefix; its golden was not regenerated. The census was manually
 recounted against the local Git index (89 paths, 168706 lines), but its remote test
@@ -99,6 +184,8 @@ claimed. After adding the teardown method, the final working-source inventory
 was recounted as 89 paths and 168719 lines, with every file and summary matching.
 That inventory anticipates staging the changed source; the index-based validator
 still needs the corresponding current index, locally and remotely.
+The subsequent failed-unmount fix adds 23 lines: the working-source inventory
+now matches all 89 entries at 168742 lines (43194 conformance, 125548 meta).
 Full-workspace acceptance and `bd-vuzzq` remain open.
 
 The apparent btrfs cache regressions were measurement contamination: nine tests

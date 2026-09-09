@@ -3012,7 +3012,7 @@ pub trait FfsOperations: Send + Sync {
 }
 ```
 
-Semantics: `read` returns zeroes for holes. `write` extends file, returns bytes written. `create` allocates inode + dir entry. `mkdir` initializes `.`/`..`. `unlink` frees when nlink=0. `rmdir` returns `NotEmpty` if non-trivial. `rename` atomically replaces target. `link` returns `IsDirectory` for dirs. `symlink` inlines target <= 60B. `fallocate` creates unwritten extents.
+Semantics: `read` returns zeroes for holes. `write` extends file, returns bytes written. `create` allocates inode + dir entry. `mkdir` initializes `.`/`..`. `unlink` frees when nlink=0 and no open handles remain. `rmdir` returns `NotEmpty` if non-trivial. `rename` atomically replaces target. `link` returns `IsDirectory` for dirs. `symlink` inlines target < 60B, leaving space for NUL. `fallocate` creates unwritten extents.
 
 ### 9.5 RepairManager (ffs-repair)
 
@@ -3395,7 +3395,10 @@ All wrapped in write transactions. Htree index updated for large directories.
 
 ### 10.6 Symlink, Readlink, Link
 
-**symlink:** Write txn. Alloc inode. If `target.len() <= 60`: store in `i_block[]` (fast symlink). Else: alloc data block + extent. Add dir entry. Commit.
+**symlink:** Write txn. For ext4, reject target lengths greater than or equal to
+the filesystem block size before allocation (space for the trailing NUL).
+Alloc inode. If `target.len() < 60`: store in `i_block[]` (fast symlink).
+Else: alloc data block + extent. Add dir entry. Commit all staged changes together.
 
 **readlink:** Read txn. If `i_blocks==0 && i_size<=60`: read `i_block[]`. Else: extent tree.
 
@@ -4201,8 +4204,11 @@ update timestamps. Link count overflow at `u16` max returns `EMLINK`.
 #### 12.3.2 symlink
 
 Single MVCC transaction: allocate inode (`S_IFLNK | 0777`), store target as
-**fast symlink** (inline in `i_block[0..14]`, up to 60 bytes) or **slow symlink**
-(extent-mapped data block), insert entry in parent.
+**fast symlink** (inline in `i_block[0..14]`, up to 59 target bytes plus NUL) or
+**slow symlink** (extent-mapped data block), insert entry in parent. An ext4
+target must fit in one filesystem block including its NUL; otherwise return
+`ENAMETOOLONG` before allocation. Failed publication must leave inode/block
+allocation and cached allocator counts unchanged.
 
 #### 12.3.3 readlink
 
