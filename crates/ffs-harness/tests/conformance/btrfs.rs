@@ -1251,28 +1251,31 @@ fn btrfs_multi_device_dup_read_conforms() {
 
     let d1 = Arc::clone(&data1);
     let d2 = Arc::clone(&data2);
-    devices.add_device(
-        1,
-        Box::new(move |physical, len| {
-            assert_eq!(len, 4);
-            if physical == 0x100_000 {
-                // First mirror
-                Ok((*d1).clone())
-            } else if physical == 0x200_000 {
-                // Second mirror
-                Ok((*d2).clone())
-            } else {
-                Err(ParseError::InvalidField {
-                    field: "device",
-                    reason: "unexpected physical offset",
-                })
-            }
-        }),
-    );
+    devices
+        .add_device(
+            1,
+            Box::new(move |_cx, physical, len| {
+                assert_eq!(len, 4);
+                if physical == 0x100_000 {
+                    // First mirror
+                    Ok((*d1).clone())
+                } else if physical == 0x200_000 {
+                    // Second mirror
+                    Ok((*d2).clone())
+                } else {
+                    Err(ParseError::InvalidField {
+                        field: "device",
+                        reason: "unexpected physical offset",
+                    }
+                    .into())
+                }
+            }),
+        )
+        .unwrap();
 
     // Read from logical (picks first mirror)
     let res1 = devices
-        .read_logical(&chunks, logical, 4)
+        .read_logical(&Cx::for_testing(), &chunks, logical, 4)
         .expect("read DUP mirror 0");
     assert_eq!(res1, vec![0xAA_u8; 4]);
 
@@ -1333,47 +1336,53 @@ fn btrfs_multi_device_raid6_read_conforms() {
     // In RAID6, P and Q rotate.
     // For stripe_nr=0, P=dev4, Q=dev3. Data at dev1, dev2.
     let d1 = Arc::clone(&data1);
-    devices.add_device(
-        1,
-        Box::new(move |physical, len| {
-            assert_eq!(len, 4);
-            if physical == 0x100_000 {
-                Ok((*d1).clone())
-            } else {
-                Err(ParseError::InvalidField {
-                    field: "device",
-                    reason: "unexpected physical offset",
-                })
-            }
-        }),
-    );
+    devices
+        .add_device(
+            1,
+            Box::new(move |_cx, physical, len| {
+                assert_eq!(len, 4);
+                if physical == 0x100_000 {
+                    Ok((*d1).clone())
+                } else {
+                    Err(ParseError::InvalidField {
+                        field: "device",
+                        reason: "unexpected physical offset",
+                    }
+                    .into())
+                }
+            }),
+        )
+        .unwrap();
 
     // Row 0 has P=dev4 and Q=dev3, so the two data stripes are dev1 and dev2.
     let d2 = Arc::clone(&data2);
-    devices.add_device(
-        2,
-        Box::new(move |physical, len| {
-            assert_eq!(len, 4);
-            if physical == 0x200_000 {
-                Ok((*d2).clone())
-            } else {
-                Err(ParseError::InvalidField {
-                    field: "device",
-                    reason: "unexpected physical offset",
-                })
-            }
-        }),
-    );
+    devices
+        .add_device(
+            2,
+            Box::new(move |_cx, physical, len| {
+                assert_eq!(len, 4);
+                if physical == 0x200_000 {
+                    Ok((*d2).clone())
+                } else {
+                    Err(ParseError::InvalidField {
+                        field: "device",
+                        reason: "unexpected physical offset",
+                    }
+                    .into())
+                }
+            }),
+        )
+        .unwrap();
 
     // Read stripe 0 (data1)
     let res1 = devices
-        .read_logical(&chunks, logical, 4)
+        .read_logical(&Cx::for_testing(), &chunks, logical, 4)
         .expect("read RAID6 data1");
     assert_eq!(res1, vec![0x66_u8; 4]);
 
     // Read row 0, data stripe 1.
     let res2 = devices
-        .read_logical(&chunks, logical + stripe_len, 4)
+        .read_logical(&Cx::for_testing(), &chunks, logical + stripe_len, 4)
         .expect("read RAID6 data2");
     assert_eq!(res2, vec![0x77_u8; 4]);
 }
@@ -1428,41 +1437,48 @@ fn btrfs_multi_device_raid10_read_conforms() {
     // Stripe 0: dev1, dev2 (mirrors)
     // Stripe 1: dev3, dev4 (mirrors)
 
-    devices.add_device(
-        1,
-        Box::new(move |_physical, _len| {
-            Err(ParseError::InvalidField {
-                field: "device",
-                reason: "simulated failure dev1",
-            })
-        }),
-    );
-    devices.add_device(
-        2,
-        Box::new(move |physical, len| {
-            assert_eq!(physical, 0x200_000);
-            assert_eq!(len, 4);
-            Ok(b"mir0".to_vec())
-        }),
-    );
-    devices.add_device(
-        4,
-        Box::new(move |physical, len| {
-            assert_eq!(physical, 0x400_000);
-            assert_eq!(len, 4);
-            Ok(b"mir1".to_vec())
-        }),
-    );
+    devices
+        .add_device(
+            1,
+            Box::new(move |_cx, _physical, _len| {
+                Err(ParseError::InvalidField {
+                    field: "device",
+                    reason: "simulated failure dev1",
+                }
+                .into())
+            }),
+        )
+        .unwrap();
+    devices
+        .add_device(
+            2,
+            Box::new(move |_cx, physical, len| {
+                assert_eq!(physical, 0x200_000);
+                assert_eq!(len, 4);
+                Ok(b"mir0".to_vec())
+            }),
+        )
+        .unwrap();
+    devices
+        .add_device(
+            4,
+            Box::new(move |_cx, physical, len| {
+                assert_eq!(physical, 0x400_000);
+                assert_eq!(len, 4);
+                Ok(b"mir1".to_vec())
+            }),
+        )
+        .unwrap();
 
     // Read from stripe 0 (should fall back to dev2)
     let res1 = devices
-        .read_logical(&chunks, logical, 4)
+        .read_logical(&Cx::for_testing(), &chunks, logical, 4)
         .expect("read RAID10 stripe 0");
     assert_eq!(res1, b"mir0");
 
     // Read from stripe 1 (device 4)
     let res2 = devices
-        .read_logical(&chunks, logical + stripe_len, 4)
+        .read_logical(&Cx::for_testing(), &chunks, logical + stripe_len, 4)
         .expect("read RAID10 stripe 1");
     assert_eq!(res2, b"mir1");
 }
@@ -1518,56 +1534,65 @@ fn btrfs_multi_device_raid5_read_conforms() {
     // dev2:0x210_000, dev3:0x310_000.
 
     let d1 = Arc::clone(&data1);
-    devices.add_device(
-        1,
-        Box::new(move |physical, len| {
-            assert_eq!(len, 4);
-            if physical == 0x100_000 {
-                Ok((*d1).clone())
-            } else {
-                Err(ParseError::InvalidField {
-                    field: "device",
-                    reason: "unexpected physical offset",
-                })
-            }
-        }),
-    );
+    devices
+        .add_device(
+            1,
+            Box::new(move |_cx, physical, len| {
+                assert_eq!(len, 4);
+                if physical == 0x100_000 {
+                    Ok((*d1).clone())
+                } else {
+                    Err(ParseError::InvalidField {
+                        field: "device",
+                        reason: "unexpected physical offset",
+                    }
+                    .into())
+                }
+            }),
+        )
+        .unwrap();
 
     let d2 = Arc::clone(&data2);
-    devices.add_device(
-        2,
-        Box::new(move |physical, len| {
-            assert_eq!(len, 4);
-            if physical == 0x200_000 {
-                Ok((*d2).clone())
-            } else {
+    devices
+        .add_device(
+            2,
+            Box::new(move |_cx, physical, len| {
+                assert_eq!(len, 4);
+                if physical == 0x200_000 {
+                    Ok((*d2).clone())
+                } else {
+                    Err(ParseError::InvalidField {
+                        field: "device",
+                        reason: "unexpected physical offset",
+                    }
+                    .into())
+                }
+            }),
+        )
+        .unwrap();
+
+    devices
+        .add_device(
+            3,
+            Box::new(move |_cx, _physical, _len| {
                 Err(ParseError::InvalidField {
                     field: "device",
-                    reason: "unexpected physical offset",
-                })
-            }
-        }),
-    );
-
-    devices.add_device(
-        3,
-        Box::new(move |_physical, _len| {
-            Err(ParseError::InvalidField {
-                field: "device",
-                reason: "RAID5 data-stripe fixture unexpectedly read parity stripe",
-            })
-        }),
-    );
+                    reason: "RAID5 data-stripe fixture unexpectedly read parity stripe",
+                }
+                .into())
+            }),
+        )
+        .unwrap();
 
     // Read from logical 0x50_000 (stripe 0, data 1)
     let res1 = devices
-        .read_logical(&chunks, logical, 4)
+        .read_logical(&Cx::for_testing(), &chunks, logical, 4)
         .expect("read RAID5 data1");
     assert_eq!(res1, vec![0x11_u8; 4]);
 
     // Read row 0, data stripe 1. Row 0 has parity on dev3, so this maps to dev2:0x200_000.
     let res2 = devices
-        .read_logical(&chunks, logical + stripe_len, 4)
+        .read_logical(&Cx::for_testing(), &chunks, logical + stripe_len, 4)
         .expect("read RAID5 data2");
     assert_eq!(res2, vec![0x22_u8; 4]);
 }
@@ -1611,32 +1636,37 @@ fn btrfs_multi_device_raid1_read_falls_back_to_second_mirror() {
     let second_reads = Arc::new(AtomicUsize::new(0));
 
     let first_reads_for_closure = Arc::clone(&first_reads);
-    devices.add_device(
-        1,
-        Box::new(move |physical, len| {
-            first_reads_for_closure.fetch_add(1, AtomicOrdering::SeqCst);
-            assert_eq!(physical, 0x100_000);
-            assert_eq!(len, 4);
-            Err(ParseError::InvalidField {
-                field: "device",
-                reason: "simulated mirror read failure",
-            })
-        }),
-    );
+    devices
+        .add_device(
+            1,
+            Box::new(move |_cx, physical, len| {
+                first_reads_for_closure.fetch_add(1, AtomicOrdering::SeqCst);
+                assert_eq!(physical, 0x100_000);
+                assert_eq!(len, 4);
+                Err(ParseError::InvalidField {
+                    field: "device",
+                    reason: "simulated mirror read failure",
+                }
+                .into())
+            }),
+        )
+        .unwrap();
 
     let second_reads_for_closure = Arc::clone(&second_reads);
-    devices.add_device(
-        2,
-        Box::new(move |physical, len| {
-            second_reads_for_closure.fetch_add(1, AtomicOrdering::SeqCst);
-            assert_eq!(physical, 0x200_000);
-            assert_eq!(len, 4);
-            Ok(b"raid".to_vec())
-        }),
-    );
+    devices
+        .add_device(
+            2,
+            Box::new(move |_cx, physical, len| {
+                second_reads_for_closure.fetch_add(1, AtomicOrdering::SeqCst);
+                assert_eq!(physical, 0x200_000);
+                assert_eq!(len, 4);
+                Ok(b"raid".to_vec())
+            }),
+        )
+        .unwrap();
 
     let data = devices
-        .read_logical(&chunks, logical, 4)
+        .read_logical(&Cx::for_testing(), &chunks, logical, 4)
         .expect("second RAID1 mirror should satisfy read");
     assert_eq!(data, b"raid");
     assert_eq!(first_reads.load(AtomicOrdering::SeqCst), 1);
@@ -1682,27 +1712,31 @@ fn btrfs_multi_device_raid0_dispatches_to_correct_stripe() {
     let second_reads = Arc::new(AtomicUsize::new(0));
 
     let first_reads_for_closure = Arc::clone(&first_reads);
-    devices.add_device(
-        1,
-        Box::new(move |_physical, _len| {
-            first_reads_for_closure.fetch_add(1, AtomicOrdering::SeqCst);
-            Ok(b"first".to_vec())
-        }),
-    );
+    devices
+        .add_device(
+            1,
+            Box::new(move |_cx, _physical, _len| {
+                first_reads_for_closure.fetch_add(1, AtomicOrdering::SeqCst);
+                Ok(b"first".to_vec())
+            }),
+        )
+        .unwrap();
 
     let second_reads_for_closure = Arc::clone(&second_reads);
-    devices.add_device(
-        2,
-        Box::new(move |physical, len| {
-            second_reads_for_closure.fetch_add(1, AtomicOrdering::SeqCst);
-            assert_eq!(physical, 0x400_000);
-            assert_eq!(len, 5);
-            Ok(b"strip".to_vec())
-        }),
-    );
+    devices
+        .add_device(
+            2,
+            Box::new(move |_cx, physical, len| {
+                second_reads_for_closure.fetch_add(1, AtomicOrdering::SeqCst);
+                assert_eq!(physical, 0x400_000);
+                assert_eq!(len, 5);
+                Ok(b"strip".to_vec())
+            }),
+        )
+        .unwrap();
 
     let data = devices
-        .read_logical(&chunks, logical + stripe_len, 5)
+        .read_logical(&Cx::for_testing(), &chunks, logical + stripe_len, 5)
         .expect("RAID0 second stripe should dispatch to device 2");
     assert_eq!(data, b"strip");
     assert_eq!(first_reads.load(AtomicOrdering::SeqCst), 0);

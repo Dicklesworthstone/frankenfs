@@ -98,9 +98,13 @@ The 22nd member, `ffs-ops` in `tools/ffs-ops`, provides operational validation c
 `ffs-ondisk::BtrfsStripeMapping` bounds each mapping with a contiguous byte
 length. `ffs-btrfs::BtrfsDeviceSet` assembles longer reads segment by segment,
 requiring exact physical read lengths and retrying alternate mirrors on read
-failure. These lower-level guarantees are prerequisites for mounted multi-device
+failure. Readers receive the caller's `Cx`; checkpoints before and after physical
+I/O prevent cancellation from returning bytes or triggering another mirror.
+`BtrfsDeviceError` distinguishes cancellation, I/O, mapping, missing devices and
+incorrect lengths. Registration rejects zero IDs and duplicate IDs without
+replacing an existing reader. These lower-level guarantees are prerequisites for mounted multi-device
 routing; they do not establish device identity validation, degraded RAID5/6
-reconstruction, or multi-device mutation support in `OpenFs`.
+reconstruction, checksum-aware mirror selection, or multi-device mutation support in `OpenFs`.
 `OpenFs::enable_writes` refuses any device count other than one and any known
 chunk profile other than Single/DUP before loading mutable allocation state.
 Skipping read validation does not bypass this write-admission check.

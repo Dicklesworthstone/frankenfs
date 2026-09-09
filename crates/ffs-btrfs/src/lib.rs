@@ -9958,11 +9958,11 @@ pub fn walk_chunk_tree(
     Ok(chunks)
 }
 
-/// Walk the device tree to discover all physical devices.
+/// Walk DEV_TREE to inspect physical device extents.
 ///
 /// The `dev_root_bytenr` is the logical address of the DEV_TREE root node,
 /// obtained by looking up objectid 4 (`BTRFS_DEV_TREE_OBJECTID`) in the
-/// ROOT_TREE. Returns all leaf items in the device tree.
+/// ROOT_TREE. Device identities are DEV_ITEM records in CHUNK_TREE instead.
 pub fn walk_device_tree(
     read_physical: &mut dyn FnMut(u64) -> Result<Vec<u8>, ParseError>,
     dev_root_bytenr: u64,
@@ -9973,11 +9973,31 @@ pub fn walk_device_tree(
     walk_tree(read_physical, chunks, dev_root_bytenr, nodesize, csum_type)
 }
 
-/// Each device is identified by its `devid` (from `DEV_ITEM` in the device tree).
-/// The `read_physical` method dispatches reads to the correct device based on the
-/// stripe mapping returned by `map_logical_to_stripes`.
-/// Device reader: reads `len` bytes from physical offset, returns data or error.
-type DeviceReader = Box<dyn Fn(u64, usize) -> Result<Vec<u8>, ffs_types::ParseError> + Send + Sync>;
+/// Device registration and runtime read failures, distinct from format errors.
+#[derive(Debug, thiserror::Error)]
+pub enum BtrfsDeviceError {
+    #[error("device read cancelled")]
+    Cancelled,
+    #[error("device ID {devid} is already registered")]
+    DuplicateDevice { devid: u64 },
+    #[error("device ID must be nonzero")]
+    InvalidDeviceId,
+    #[error("device {devid} is not attached")]
+    MissingDevice { devid: u64 },
+    #[error("device {devid} returned {actual} bytes, expected {expected}")]
+    ReadLength {
+        devid: u64,
+        expected: usize,
+        actual: usize,
+    },
+    #[error(transparent)]
+    Io(#[from] std::io::Error),
+    #[error(transparent)]
+    Mapping(#[from] ParseError),
+}
+
+/// Read a physical span using the current request's capability context.
+type DeviceReader = Box<dyn Fn(&Cx, u64, usize) -> Result<Vec<u8>, BtrfsDeviceError> + Send + Sync>;
 
 /// A set of physical devices backing a btrfs filesystem.
 pub struct BtrfsDeviceSet {
@@ -9994,13 +10014,20 @@ impl BtrfsDeviceSet {
         }
     }
 
-    /// Register a device with the given devid.
-    pub fn add_device(
-        &mut self,
-        devid: u64,
-        reader: Box<dyn Fn(u64, usize) -> Result<Vec<u8>, ffs_types::ParseError> + Send + Sync>,
-    ) {
-        self.devices.insert(devid, reader);
+    /// Register a device without replacing an existing device's reader.
+    pub fn add_device(&mut self, devid: u64, reader: DeviceReader) -> Result<(), BtrfsDeviceError> {
+        if devid == 0 {
+            return Err(BtrfsDeviceError::InvalidDeviceId);
+        }
+        match self.devices.entry(devid) {
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                entry.insert(reader);
+                Ok(())
+            }
+            std::collections::btree_map::Entry::Occupied(_) => {
+                Err(BtrfsDeviceError::DuplicateDevice { devid })
+            }
+        }
     }
 
     /// Number of registered devices.
@@ -10012,17 +10039,16 @@ impl BtrfsDeviceSet {
     /// Read `len` bytes from the device identified by `devid` at `physical_offset`.
     pub fn read_physical(
         &self,
+        cx: &Cx,
         devid: u64,
         physical_offset: u64,
         len: usize,
-    ) -> Result<Vec<u8>, ffs_types::ParseError> {
+    ) -> Result<Vec<u8>, BtrfsDeviceError> {
+        cx.checkpoint().map_err(|_| BtrfsDeviceError::Cancelled)?;
         let reader = self
             .devices
             .get(&devid)
-            .ok_or(ffs_types::ParseError::InvalidField {
-                field: "devid",
-                reason: "device not found in device set",
-            })?;
+            .ok_or(BtrfsDeviceError::MissingDevice { devid })?;
         let bytes = u64::try_from(len).map_err(|_| ffs_types::ParseError::IntegerConversion {
             field: "read_length",
         })?;
@@ -10032,11 +10058,16 @@ impl BtrfsDeviceSet {
                 field: "physical_offset",
                 reason: "read range overflow",
             })?;
-        let data = reader(physical_offset, len)?;
+        let result = reader(cx, physical_offset, len);
+        // A reader may observe cancellation while performing I/O. Check again
+        // before accepting bytes or trying a different mirror after an error.
+        cx.checkpoint().map_err(|_| BtrfsDeviceError::Cancelled)?;
+        let data = result?;
         if data.len() != len {
-            return Err(ffs_types::ParseError::InvalidField {
-                field: "device_read",
-                reason: "reader returned incorrect byte count",
+            return Err(BtrfsDeviceError::ReadLength {
+                devid,
+                expected: len,
+                actual: data.len(),
             });
         }
         Ok(data)
@@ -10047,14 +10078,17 @@ impl BtrfsDeviceSet {
     /// Resolves the logical address to physical stripes via `map_logical_to_stripes`,
     /// then reads each contiguous segment from its owning device. Reads crossing
     /// stripe or chunk boundaries are remapped. Mirror read errors, including
-    /// short reads, fall back to the next copy of the same segment. RAID5/6
+    /// short reads, fall back to the next copy of the same segment. Cancellation
+    /// stops immediately instead of trying another mirror or segment. RAID5/6
     /// reads require the owning data device; parity reconstruction is not provided.
     pub fn read_logical(
         &self,
+        cx: &Cx,
         chunks: &[ffs_ondisk::BtrfsChunkEntry],
         logical: u64,
         len: usize,
-    ) -> Result<Vec<u8>, ffs_types::ParseError> {
+    ) -> Result<Vec<u8>, BtrfsDeviceError> {
+        cx.checkpoint().map_err(|_| BtrfsDeviceError::Cancelled)?;
         let mut remaining =
             u64::try_from(len).map_err(|_| ffs_types::ParseError::IntegerConversion {
                 field: "read_length",
@@ -10083,12 +10117,17 @@ impl BtrfsDeviceSet {
                 usize::try_from(take).map_err(|_| ffs_types::ParseError::IntegerConversion {
                     field: "read_length",
                 })?;
-            let mut segment = Err(ffs_types::ParseError::InvalidField {
-                field: "stripe",
-                reason: "no readable stripe",
-            });
+            let mut segment = Err(BtrfsDeviceError::Mapping(
+                ffs_types::ParseError::InvalidField {
+                    field: "stripe",
+                    reason: "no readable stripe",
+                },
+            ));
             for stripe in &mapping.stripes {
-                segment = self.read_physical(stripe.devid, stripe.physical, segment_len);
+                segment = self.read_physical(cx, stripe.devid, stripe.physical, segment_len);
+                if matches!(segment, Err(BtrfsDeviceError::Cancelled)) {
+                    return segment;
+                }
                 if segment.is_ok() {
                     break;
                 }
@@ -12087,18 +12126,23 @@ mod tests {
     }
 
     fn add_read_device(devices: &mut BtrfsDeviceSet, devid: u64, data: Vec<u8>) {
-        devices.add_device(
-            devid,
-            Box::new(move |offset, len| {
-                let start = usize::try_from(offset).unwrap();
-                data.get(start..start + len)
-                    .map(<[u8]>::to_vec)
-                    .ok_or(ParseError::InvalidField {
-                        field: "test_device",
-                        reason: "read outside physical device",
-                    })
-            }),
-        );
+        devices
+            .add_device(
+                devid,
+                Box::new(move |_cx, offset, len| {
+                    let start = usize::try_from(offset).unwrap();
+                    data.get(start..start + len)
+                        .map(<[u8]>::to_vec)
+                        .ok_or_else(|| {
+                            ParseError::InvalidField {
+                                field: "test_device",
+                                reason: "read outside physical device",
+                            }
+                            .into()
+                        })
+                }),
+            )
+            .unwrap();
     }
 
     #[test]
@@ -12121,11 +12165,15 @@ mod tests {
             };
             let chunks = [device_read_chunk(profile, 16, &ids)];
             assert_eq!(
-                devices.read_logical(&chunks, 0x1000, 16).unwrap(),
+                devices
+                    .read_logical(&Cx::for_testing(), &chunks, 0x1000, 16)
+                    .unwrap(),
                 (0_u8..16).collect::<Vec<_>>()
             );
             assert_eq!(
-                devices.read_logical(&chunks, 0x1003, 11).unwrap(),
+                devices
+                    .read_logical(&Cx::for_testing(), &chunks, 0x1003, 11)
+                    .unwrap(),
                 (3_u8..14).collect::<Vec<_>>()
             );
         }
@@ -12154,24 +12202,25 @@ mod tests {
         ] {
             let ids: Vec<_> = (1..=u64::try_from(contents.len()).unwrap()).collect();
             let mut devices = BtrfsDeviceSet::new();
-            for (&devid, data) in ids.iter().zip(contents) {
-                add_read_device(&mut devices, devid, data);
+            for (&devid, data) in ids.iter().zip(&contents) {
+                add_read_device(&mut devices, devid, data.clone());
             }
             let chunks = [device_read_chunk(profile, 24, &ids)];
             assert_eq!(
-                devices.read_logical(&chunks, 0x1003, 19).unwrap(),
+                devices
+                    .read_logical(&Cx::for_testing(), &chunks, 0x1003, 19)
+                    .unwrap(),
                 (3_u8..22).collect::<Vec<_>>()
             );
-            devices.add_device(
-                1,
-                Box::new(|_, _| {
-                    Err(ParseError::InvalidField {
-                        field: "test_device",
-                        reason: "missing data device",
-                    })
-                }),
+            let mut missing = BtrfsDeviceSet::new();
+            for (&devid, data) in ids.iter().zip(contents).skip(1) {
+                add_read_device(&mut missing, devid, data);
+            }
+            assert!(
+                missing
+                    .read_logical(&Cx::for_testing(), &chunks, 0x1000, 4)
+                    .is_err()
             );
-            assert!(devices.read_logical(&chunks, 0x1000, 4).is_err());
         }
     }
 
@@ -12185,12 +12234,22 @@ mod tests {
         second.key.offset += 5;
         let mut chunks = [first, second];
         assert_eq!(
-            devices.read_logical(&chunks, 0x1003, 5).unwrap(),
+            devices
+                .read_logical(&Cx::for_testing(), &chunks, 0x1003, 5)
+                .unwrap(),
             vec![13, 14, 20, 21, 22]
         );
         chunks[1].key.offset += 1;
-        assert!(devices.read_logical(&chunks, 0x1003, 5).is_err());
-        assert!(devices.read_logical(&chunks, 0x100a, 2).is_err());
+        assert!(
+            devices
+                .read_logical(&Cx::for_testing(), &chunks, 0x1003, 5)
+                .is_err()
+        );
+        assert!(
+            devices
+                .read_logical(&Cx::for_testing(), &chunks, 0x100a, 2)
+                .is_err()
+        );
     }
 
     #[test]
@@ -12198,19 +12257,151 @@ mod tests {
         use ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_RAID1;
         for wrong_len in [0, 3, 5] {
             let mut devices = BtrfsDeviceSet::new();
-            devices.add_device(1, Box::new(move |_, _| Ok(vec![99; wrong_len])));
+            devices
+                .add_device(1, Box::new(move |_, _, _| Ok(vec![99; wrong_len])))
+                .unwrap();
             add_read_device(&mut devices, 2, vec![1, 2, 3, 4]);
             let mirror = device_read_chunk(BTRFS_BLOCK_GROUP_RAID1, 4, &[1, 2]);
             assert_eq!(
-                devices.read_logical(&[mirror], 0x1000, 4).unwrap(),
+                devices
+                    .read_logical(&Cx::for_testing(), &[mirror], 0x1000, 4)
+                    .unwrap(),
                 vec![1, 2, 3, 4]
             );
             let single = device_read_chunk(0, 4, &[1]);
-            assert!(devices.read_logical(&[single], 0x1000, 4).is_err());
-            assert!(devices.read_physical(1, u64::MAX, 2).is_err());
-            assert!(devices.read_logical(&[], u64::MAX, 2).is_err());
-            assert_eq!(devices.read_logical(&[], u64::MAX, 0).unwrap(), [0_u8; 0]);
+            assert!(
+                devices
+                    .read_logical(&Cx::for_testing(), &[single], 0x1000, 4)
+                    .is_err()
+            );
+            assert!(
+                devices
+                    .read_physical(&Cx::for_testing(), 1, u64::MAX, 2)
+                    .is_err()
+            );
+            assert!(
+                devices
+                    .read_logical(&Cx::for_testing(), &[], u64::MAX, 2)
+                    .is_err()
+            );
+            assert_eq!(
+                devices
+                    .read_logical(&Cx::for_testing(), &[], u64::MAX, 0)
+                    .unwrap(),
+                [0_u8; 0]
+            );
         }
+    }
+
+    #[test]
+    fn device_set_registration_preserves_existing_reader() {
+        let mut devices = BtrfsDeviceSet::new();
+        add_read_device(&mut devices, 7, b"original".to_vec());
+        assert!(matches!(
+            devices.add_device(7, Box::new(|_, _, _| panic!("replacement reader used"))),
+            Err(BtrfsDeviceError::DuplicateDevice { devid: 7 })
+        ));
+        assert!(matches!(
+            devices.add_device(0, Box::new(|_, _, _| panic!("zero-ID reader used"))),
+            Err(BtrfsDeviceError::InvalidDeviceId)
+        ));
+        assert_eq!(devices.device_count(), 1);
+        assert_eq!(
+            devices.read_physical(&Cx::for_testing(), 7, 0, 8).unwrap(),
+            b"original"
+        );
+    }
+
+    #[test]
+    fn device_set_cancelled_request_performs_no_io() {
+        let mut devices = BtrfsDeviceSet::new();
+        devices
+            .add_device(
+                1,
+                Box::new(|_, _, _| panic!("cancelled request performed I/O")),
+            )
+            .unwrap();
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+        let chunks = [device_read_chunk(0, 4, &[1])];
+        for result in [
+            devices.read_physical(&cx, 1, 0, 4),
+            devices.read_logical(&cx, &chunks, 0x1000, 4),
+            devices.read_logical(&cx, &[], 0, 0),
+        ] {
+            assert!(matches!(result, Err(BtrfsDeviceError::Cancelled)));
+        }
+    }
+
+    #[test]
+    fn device_set_cancellation_during_read_does_not_retry_or_return_bytes() {
+        use ffs_ondisk::chunk_type_flags::{BTRFS_BLOCK_GROUP_RAID0, BTRFS_BLOCK_GROUP_RAID1};
+        for profile in [BTRFS_BLOCK_GROUP_RAID0, BTRFS_BLOCK_GROUP_RAID1] {
+            for succeeds in [false, true] {
+                let mut devices = BtrfsDeviceSet::new();
+                devices
+                    .add_device(
+                        1,
+                        Box::new(move |cx, _, len| {
+                            cx.set_cancel_requested(true);
+                            if succeeds {
+                                Ok(vec![1; len])
+                            } else {
+                                Err(std::io::Error::other("I/O failed after cancellation").into())
+                            }
+                        }),
+                    )
+                    .unwrap();
+                devices
+                    .add_device(
+                        2,
+                        Box::new(|_, _, _| panic!("read continued after cancellation")),
+                    )
+                    .unwrap();
+                let cx = Cx::for_testing();
+                let chunks = [device_read_chunk(profile, 8, &[1, 2])];
+                assert!(matches!(
+                    devices.read_logical(&cx, &chunks, 0x1000, 8),
+                    Err(BtrfsDeviceError::Cancelled)
+                ));
+                assert!(
+                    cx.checkpoint().is_err(),
+                    "reader must receive the caller's context"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn device_set_reads_real_file_devices() {
+        use ffs_block::{ByteDevice, FileByteDevice};
+        use ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_RAID0;
+        let tmp = tempfile::tempdir().unwrap();
+        let mut devices = BtrfsDeviceSet::new();
+        for (id, bytes) in [(1, b"abcdijkl"), (2, b"efghmnop")] {
+            let path = tmp.path().join(format!("device-{id}"));
+            std::fs::write(&path, bytes).unwrap();
+            let device = FileByteDevice::open(&path).unwrap();
+            devices
+                .add_device(
+                    id,
+                    Box::new(move |cx, offset, len| {
+                        let mut bytes = vec![0; len];
+                        device
+                            .read_exact_at(cx, ffs_types::ByteOffset(offset), &mut bytes)
+                            .map_err(std::io::Error::other)?;
+                        Ok(bytes)
+                    }),
+                )
+                .unwrap();
+        }
+        let chunks = [device_read_chunk(BTRFS_BLOCK_GROUP_RAID0, 16, &[1, 2])];
+        assert_eq!(
+            devices
+                .read_logical(&Cx::for_testing(), &chunks, 0x1002, 12)
+                .unwrap(),
+            b"cdefghijklmn"
+        );
     }
 
     #[test]

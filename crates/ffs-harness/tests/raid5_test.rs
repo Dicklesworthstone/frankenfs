@@ -57,58 +57,67 @@ fn btrfs_multi_device_raid5_read_conforms() {
     // dev2:0x210_000, dev3:0x310_000.
 
     let d1 = Arc::clone(&data1);
-    devices.add_device(
-        1,
-        Box::new(move |physical, len| {
-            assert_eq!(len, 4);
-            if physical == 0x100_000 {
-                Ok((*d1).clone())
-            } else {
-                Err(ParseError::InvalidField {
-                    field: "device",
-                    reason: "unexpected physical offset",
-                })
-            }
-        }),
-    );
+    devices
+        .add_device(
+            1,
+            Box::new(move |_cx, physical, len| {
+                assert_eq!(len, 4);
+                if physical == 0x100_000 {
+                    Ok((*d1).clone())
+                } else {
+                    Err(ParseError::InvalidField {
+                        field: "device",
+                        reason: "unexpected physical offset",
+                    }
+                    .into())
+                }
+            }),
+        )
+        .unwrap();
 
     let d2 = Arc::clone(&data2);
-    devices.add_device(
-        2,
-        Box::new(move |physical, len| {
-            assert_eq!(len, 4);
-            if physical == 0x200_000 {
-                Ok((*d2).clone())
-            } else {
+    devices
+        .add_device(
+            2,
+            Box::new(move |_cx, physical, len| {
+                assert_eq!(len, 4);
+                if physical == 0x200_000 {
+                    Ok((*d2).clone())
+                } else {
+                    Err(ParseError::InvalidField {
+                        field: "device",
+                        reason: "unexpected physical offset",
+                    }
+                    .into())
+                }
+            }),
+        )
+        .unwrap();
+
+    devices
+        .add_device(
+            3,
+            Box::new(move |_cx, _physical, _len| {
                 Err(ParseError::InvalidField {
                     field: "device",
-                    reason: "unexpected physical offset",
-                })
-            }
-        }),
-    );
+                    reason: "RAID5 data-stripe fixture unexpectedly read parity stripe",
+                }
+                .into())
+            }),
+        )
+        .unwrap();
 
-    devices.add_device(
-        3,
-        Box::new(move |_physical, _len| {
-            Err(ParseError::InvalidField {
-                field: "device",
-                reason: "RAID5 data-stripe fixture unexpectedly read parity stripe",
-            })
-        }),
-    );
-
-    let _cx = Cx::for_testing();
+    let cx = Cx::for_testing();
 
     // Read from logical 0x50_000 (stripe 0, data 1)
     let res1 = devices
-        .read_logical(&chunks, logical, 4)
+        .read_logical(&cx, &chunks, logical, 4)
         .expect("read RAID5 data1");
     assert_eq!(res1, vec![0x11_u8; 4]);
 
     // Read row 0, data stripe 1. Row 0 has parity on dev3, so this maps to dev2:0x200_000.
     let res2 = devices
-        .read_logical(&chunks, logical + stripe_len, 4)
+        .read_logical(&cx, &chunks, logical + stripe_len, 4)
         .expect("read RAID5 data2");
     assert_eq!(res2, vec![0x22_u8; 4]);
 }
