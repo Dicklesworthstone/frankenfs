@@ -109,6 +109,10 @@ Skipping read validation does not bypass this write-admission check.
 filesystem UUID before encoding device ID, device UUID, and on-disk device
 accounting. This identifies the one backing image; it does not enumerate or
 validate a mounted multi-device set.
+`FS_INFO` uses the same verified device item to report `max_id` for a
+single-device image, so sparse device IDs remain discoverable through
+`DEV_INFO`. Until the mounted registry covers all devices, `FS_INFO` refuses
+multi-device inventory requests rather than treating the count as a maximum ID.
 
 ---
 

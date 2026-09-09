@@ -13825,7 +13825,13 @@ try:
     nodesize, sectorsize = struct.unpack_from('<II', buf, 0x20)
     print("max_id=%d num_devices=%d nodesize=%d sectorsize=%d" % (max_id, num_devices, nodesize, sectorsize))
     print("fsid=%s" % fsid.hex())
-    assert num_devices >= 1, "num_devices should be at least 1"
+    assert num_devices == 1, "mkfs fixture has exactly one device"
+    assert max_id == 1, "mkfs fixture device ID is 1"
+    device = bytearray(4096)
+    struct.pack_into('<Q', device, 0, max_id)
+    fcntl.ioctl(fd, 0xd000941e, device, True)
+    assert struct.unpack_from('<Q', device, 0)[0] == max_id, "FS_INFO must discover DEV_INFO"
+    assert device[8:24] != fsid, "device UUID must not be substituted with filesystem UUID"
     assert nodesize in (4096, 8192, 16384, 32768, 65536), "unexpected nodesize %d" % nodesize
     assert sectorsize in (512, 1024, 2048, 4096), "unexpected sectorsize %d" % sectorsize
     print("PASS")
@@ -13846,6 +13852,7 @@ finally:
             out.status.success() && stdout.contains("PASS"),
             "BTRFS_IOC_FS_INFO via mounted path failed: stdout={stdout}, stderr={stderr}"
         );
+        emit_scenario_result("btrfs_fs_info_device_discovery_mounted_path", "PASS", None);
     });
 }
 
@@ -13889,6 +13896,14 @@ fn btrfs_openfs_ioctl_dev_info_payload_contract() {
     };
     let fs = OpenFs::open_with_options(&cx, &image, &opts).expect("open btrfs image");
 
+    let info = fs
+        .get_btrfs_fs_info(&cx, &mut RequestScope::empty())
+        .expect("FS_INFO device discovery");
+    assert_eq!(
+        u64::from_ne_bytes(info[..8].try_into().unwrap()),
+        expected_devid
+    );
+    assert_eq!(u64::from_ne_bytes(info[8..16].try_into().unwrap()), 1);
     let wildcard = <OpenFs as FsOps>::get_btrfs_dev_info(
         &fs,
         &cx,

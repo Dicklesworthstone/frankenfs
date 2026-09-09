@@ -26,10 +26,10 @@ use super::{
     encode_btrfs_tree_search_results_with_limit, ext4_flags_to_xflags, ext4_present_xattr_value,
     ext4_read_buffer_len, first_nul, fsflags_to_btrfs_inode_flags, generate_send_stream, info,
     map_logical_to_physical, parse_btrfs_tree_search_key_bytes, parse_extent_data, parse_root_item,
-    parse_to_ffs_error, read_btrfs_superblock_region, read_ext4_superblock_region,
-    readdir_snapshot_serve, readdir_snapshot_serve_unvalidated, readdir_snapshot_store,
-    slice_readdir_snapshot, systemtime_nanos, trace, warn, xflags_to_btrfs_inode_flags,
-    xflags_to_ext4_flags,
+    parse_to_ffs_error, read_btrfs_backing_device_item, read_btrfs_superblock_region,
+    read_ext4_superblock_region, readdir_snapshot_serve, readdir_snapshot_serve_unvalidated,
+    readdir_snapshot_store, slice_readdir_snapshot, systemtime_nanos, trace, warn,
+    xflags_to_btrfs_inode_flags, xflags_to_ext4_flags,
 };
 use crate::vfs::XattrPresence;
 
@@ -2051,12 +2051,23 @@ impl FsOps for OpenFs {
         }
     }
 
-    fn get_btrfs_fs_info(&self, _cx: &Cx, _scope: &mut RequestScope) -> ffs_error::Result<Vec<u8>> {
+    fn get_btrfs_fs_info(&self, cx: &Cx, _scope: &mut RequestScope) -> ffs_error::Result<Vec<u8>> {
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_FS_INFO is not supported on ext4 filesystems".to_owned(),
             )),
-            FsFlavor::Btrfs(sb) => Ok(encode_btrfs_fs_info_args(sb)),
+            FsFlavor::Btrfs(sb) => {
+                // Chunk stripes alone cannot enumerate unused devices. Until
+                // the mounted device registry is complete, only one backing
+                // device provides enough evidence to report the maximum ID.
+                if sb.num_devices != 1 {
+                    return Err(FfsError::UnsupportedFeature(
+                        "BTRFS_IOC_FS_INFO requires complete multi-device discovery".to_owned(),
+                    ));
+                }
+                let device = read_btrfs_backing_device_item(cx, self.dev.as_ref(), sb)?;
+                Ok(encode_btrfs_fs_info_args(sb, device.devid))
+            }
         }
     }
 
@@ -3450,23 +3461,7 @@ impl FsOps for OpenFs {
                 "BTRFS_IOC_DEV_INFO is not supported on ext4 filesystems".to_owned(),
             )),
             FsFlavor::Btrfs(sb) => {
-                let region = read_btrfs_superblock_region(cx, self.dev.as_ref())?;
-                let corrupt = |detail: String| FfsError::Corruption {
-                    block: u64::try_from(BTRFS_SUPER_INFO_OFFSET).unwrap()
-                        / u64::from(sb.sectorsize),
-                    detail,
-                };
-                ffs_ondisk::verify_btrfs_superblock_checksum(&region)
-                    .map_err(|error| corrupt(error.to_string()))?;
-                // The superblock embeds this backing device's 98-byte DEV_ITEM
-                // at 0xc9. Filesystem totals and fsid are not device fields.
-                let device = ffs_ondisk::parse_dev_item(
-                    &region[0xC9..0xC9 + ffs_ondisk::btrfs::BTRFS_DEV_ITEM_SIZE],
-                )
-                .map_err(|error| corrupt(error.to_string()))?;
-                if device.fsid != sb.fsid {
-                    return Err(corrupt("device item filesystem UUID mismatch".to_owned()));
-                }
+                let device = read_btrfs_backing_device_item(cx, self.dev.as_ref(), sb)?;
                 encode_btrfs_dev_info_args(&device, devid_in, &uuid_in)
             }
         }

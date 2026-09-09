@@ -19942,7 +19942,7 @@ fn btrfs_csum_size_for_type(csum_type: u16) -> u16 {
 /// btrfs superblock.  The layout matches the kernel UAPI exactly:
 ///
 /// ```text
-///   0x00  __u64  max_id              (= num_devices — largest observed devid)
+///   0x00  __u64  max_id              (largest device ID in the complete inventory)
 ///   0x08  __u64  num_devices
 ///   0x10  __u8[16] fsid
 ///   0x20  __u32  nodesize
@@ -19956,13 +19956,11 @@ fn btrfs_csum_size_for_type(csum_type: u16) -> u16 {
 ///   0x50  __u8[944] reserved         (zero)
 /// ```
 ///
-/// We do not track per-fs `max_id` separately, so mirror `num_devices`
-/// (a valid upper bound on observed device IDs).  We also lack a separate
-/// `metadata_uuid` path — absent the METADATA_UUID incompat feature the
-/// kernel itself returns `fsid` here, so we mirror that behaviour.
-fn encode_btrfs_fs_info_args(sb: &ffs_ondisk::BtrfsSuperblock) -> Vec<u8> {
+/// The caller must supply a verified inventory's maximum ID, not its count.
+/// Absent the METADATA_UUID incompat feature, metadata_uuid equals fsid.
+fn encode_btrfs_fs_info_args(sb: &ffs_ondisk::BtrfsSuperblock, max_id: u64) -> Vec<u8> {
     let mut buf = vec![0_u8; BTRFS_FS_INFO_ARGS_SIZE];
-    buf[0x00..0x08].copy_from_slice(&sb.num_devices.to_ne_bytes());
+    buf[0x00..0x08].copy_from_slice(&max_id.to_ne_bytes());
     buf[0x08..0x10].copy_from_slice(&sb.num_devices.to_ne_bytes());
     buf[0x10..0x20].copy_from_slice(&sb.fsid);
     buf[0x20..0x24].copy_from_slice(&sb.nodesize.to_ne_bytes());
@@ -20361,6 +20359,29 @@ const BTRFS_DEV_INFO_PATH_MAX: usize = 1024;
 /// `to_errno()` path forwards the right value to userspace.
 fn btrfs_dev_info_enodev() -> FfsError {
     FfsError::Io(std::io::Error::from_raw_os_error(libc::ENODEV))
+}
+
+/// Read this backing image's identity and on-disk accounting for device ioctls.
+fn read_btrfs_backing_device_item(
+    cx: &Cx,
+    dev: &dyn ByteDevice,
+    sb: &ffs_ondisk::BtrfsSuperblock,
+) -> Result<ffs_ondisk::BtrfsDevItem, FfsError> {
+    let region = read_btrfs_superblock_region(cx, dev)?;
+    let corrupt = |detail: String| FfsError::Corruption {
+        block: u64::try_from(BTRFS_SUPER_INFO_OFFSET).unwrap() / u64::from(sb.sectorsize),
+        detail,
+    };
+    ffs_ondisk::verify_btrfs_superblock_checksum(&region)
+        .map_err(|error| corrupt(error.to_string()))?;
+    // The superblock embeds this backing device's 98-byte DEV_ITEM at 0xc9.
+    let device =
+        ffs_ondisk::parse_dev_item(&region[0xC9..0xC9 + ffs_ondisk::btrfs::BTRFS_DEV_ITEM_SIZE])
+            .map_err(|error| corrupt(error.to_string()))?;
+    if device.fsid != sb.fsid {
+        return Err(corrupt("device item filesystem UUID mismatch".to_owned()));
+    }
+    Ok(device)
 }
 
 /// Encode a `struct btrfs_ioctl_dev_info_args` reply from the backing device's
@@ -78554,6 +78575,17 @@ mod tests {
         image[sb_offset..sb_offset + 4].copy_from_slice(&checksum.to_le_bytes());
         let dev = TestDevice::from_vec(image.clone());
         let fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+        let info = fs
+            .get_btrfs_fs_info(&cx, &mut RequestScope::empty())
+            .unwrap();
+        assert_eq!(info.len(), BTRFS_FS_INFO_ARGS_SIZE);
+        let max_id = u64::from_ne_bytes(info[..8].try_into().unwrap());
+        assert_eq!(max_id, 7, "maximum device ID is not the device count");
+        assert_eq!(&info[8..16], &1_u64.to_ne_bytes());
+        let discovered = fs
+            .get_btrfs_dev_info(&cx, &mut RequestScope::empty(), max_id, [0; 16])
+            .unwrap();
+        assert_eq!(&discovered[8..24], &uuid);
         for (devid, key) in [(7, [0; 16]), (7, uuid)] {
             let reply = fs
                 .get_btrfs_dev_info(&cx, &mut RequestScope::empty(), devid, key)
@@ -78617,6 +78649,10 @@ mod tests {
                 .get_btrfs_dev_info(&cx, &mut RequestScope::empty(), 0, [0; 16])
                 .unwrap_err();
             assert_eq!(error.to_errno(), libc::EIO, "{defect}: {error}");
+            let error = fs
+                .get_btrfs_fs_info(&cx, &mut RequestScope::empty())
+                .unwrap_err();
+            assert_eq!(error.to_errno(), libc::EIO, "FS_INFO {defect}: {error}");
             assert_eq!(dev.snapshot_bytes(), before);
         }
     }
@@ -78635,6 +78671,15 @@ mod tests {
                     ..OpenOptions::default()
                 };
                 let mut fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &options).unwrap();
+                let info_error = fs
+                    .get_btrfs_fs_info(&cx, &mut RequestScope::empty())
+                    .unwrap_err();
+                assert_eq!(info_error.to_errno(), libc::EOPNOTSUPP);
+                assert!(
+                    info_error
+                        .to_string()
+                        .contains("complete multi-device discovery")
+                );
                 let error = fs.enable_writes(&cx).unwrap_err();
                 assert!(matches!(error, FfsError::UnsupportedFeature(_)));
                 assert!(error.to_string().contains("one device"));
