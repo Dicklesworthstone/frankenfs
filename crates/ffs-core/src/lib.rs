@@ -10029,14 +10029,14 @@ impl OpenFs {
         self.btrfs_alloc_state.as_ref().ok_or(FfsError::ReadOnly)
     }
 
-    /// Read current device accounting from the live or committed chunk tree.
-    /// The backing superblock anchors identity, but its accounting can lag the
-    /// chunk tree. Missing or incomplete records cannot supply current totals.
-    fn current_btrfs_backing_device_item(
+    /// Enumerate current device identities and accounting from CHUNK_TREE.
+    /// The backing superblock anchors this image's identity, but neither its
+    /// embedded device item nor chunk stripes enumerate unused devices.
+    fn current_btrfs_device_items(
         &self,
         cx: &Cx,
         sb: &BtrfsSuperblock,
-    ) -> Result<ffs_ondisk::BtrfsDevItem, FfsError> {
+    ) -> Result<std::collections::BTreeMap<u64, ffs_ondisk::BtrfsDevItem>, FfsError> {
         // Stabilize live accounting against chunk allocation. Full commit
         // releases this lock before its later superblock publication.
         let alloc = self.btrfs_alloc_state.as_ref().map(|mutex| mutex.read());
@@ -10045,41 +10045,77 @@ impl OpenFs {
             block: sb.chunk_root / u64::from(sb.sectorsize),
             detail,
         };
-        let key = BtrfsKey {
+        let lo = BtrfsKey {
             objectid: ffs_ondisk::btrfs::BTRFS_DEV_ITEMS_OBJECTID,
             item_type: ffs_ondisk::btrfs::BTRFS_DEV_ITEM_KEY,
-            offset: backing.devid,
+            offset: 0,
         };
-        let bytes = if let Some(alloc) = alloc {
+        let entries = if let Some(alloc) = alloc {
             if !alloc.chunk_trees_authoritative {
                 return Err(FfsError::UnsupportedFeature(
                     "DEV_INFO requires authoritative chunk-tree device accounting".to_owned(),
                 ));
             }
-            alloc.chunk_tree.get(&key)
+            // In-memory ranges are inclusive, unlike on-disk range descent.
+            let hi = BtrfsKey {
+                offset: u64::MAX,
+                ..lo
+            };
+            alloc
+                .chunk_tree
+                .range(&lo, &hi)
+                .map_err(|error| corrupt(error.to_string()))?
         } else {
-            // Floor lookup also handles devid=u64::MAX without constructing
-            // an overflowing upper bound. A predecessor is not this device.
-            self.walk_btrfs_tree_floor(cx, sb.chunk_root, key)
+            // End at the next item type, including devid=u64::MAX without
+            // overflowing its offset. Unrelated item types cannot supply IDs.
+            let hi = BtrfsKey {
+                item_type: lo.item_type + 1,
+                ..lo
+            };
+            self.walk_btrfs_tree_range(cx, sb.chunk_root, lo, hi)
                 .map_err(|error| match error {
                     FfsError::Format(detail) | FfsError::NotFound(detail) => corrupt(detail),
                     other => other,
                 })?
-                .filter(|entry| entry.key == key)
-                .map(|entry| entry.data)
+                .into_iter()
+                .map(|entry| (entry.key, entry.data))
+                .collect()
+        };
+        let mut devices = std::collections::BTreeMap::new();
+        let mut uuids = std::collections::BTreeSet::new();
+        for (key, bytes) in entries {
+            let device =
+                ffs_ondisk::parse_dev_item(&bytes).map_err(|error| corrupt(error.to_string()))?;
+            if key.offset != device.devid {
+                return Err(corrupt(
+                    "chunk-tree device ID disagrees with its key".to_owned(),
+                ));
+            }
+            if device.fsid != sb.fsid {
+                return Err(corrupt(
+                    "chunk-tree device filesystem UUID mismatch".to_owned(),
+                ));
+            }
+            if !uuids.insert(device.uuid) || devices.insert(device.devid, device).is_some() {
+                return Err(corrupt(
+                    "chunk tree contains duplicate device identities".to_owned(),
+                ));
+            }
         }
-        .ok_or_else(|| corrupt("chunk tree has no backing device item".to_owned()))?;
-        let current =
-            ffs_ondisk::parse_dev_item(&bytes).map_err(|error| corrupt(error.to_string()))?;
-        if current.devid != backing.devid
-            || current.uuid != backing.uuid
-            || current.fsid != backing.fsid
-        {
+        if u64::try_from(devices.len()).ok() != Some(sb.num_devices) {
+            return Err(corrupt(
+                "chunk-tree device count disagrees with superblock".to_owned(),
+            ));
+        }
+        let current = devices
+            .get(&backing.devid)
+            .ok_or_else(|| corrupt("chunk tree has no backing device item".to_owned()))?;
+        if current.uuid != backing.uuid {
             return Err(corrupt(
                 "chunk-tree device identity disagrees with backing superblock".to_owned(),
             ));
         }
-        Ok(current)
+        Ok(devices)
     }
 
     /// Map a JBD2 commit error to an `FfsError` with context.
@@ -78944,6 +78980,116 @@ mod tests {
         eprintln!("SCENARIO_RESULT|scenario_id=btrfs_dev_info_committed_allocation|outcome=PASS");
     }
 
+    fn build_btrfs_device_inventory_image() -> (Vec<u8>, usize) {
+        let mut image = build_btrfs_fsops_image();
+        let sb = BTRFS_SUPER_INFO_OFFSET;
+        let item = sb + 0xC9;
+        image[item..item + 8].copy_from_slice(&7_u64.to_le_bytes());
+        image[item + 8..item + 16].copy_from_slice(&123_456_u64.to_le_bytes());
+        image[item + 16..item + 24].copy_from_slice(&8192_u64.to_le_bytes());
+        image[item + 66..item + 82].fill(0xA7);
+        image[sb + 0x88..sb + 0x90].copy_from_slice(&2_u64.to_le_bytes());
+        let root = add_btrfs_dev_info_chunk_tree(&mut image);
+        let mut unused = image[item..item + 98].to_vec();
+        unused[..8].copy_from_slice(&u64::MAX.to_le_bytes());
+        unused[8..16].copy_from_slice(&234_567_u64.to_le_bytes());
+        unused[16..24].fill(0);
+        unused[66..82].fill(0xD4);
+        image[root + 0x60..root + 0x64].copy_from_slice(&3_u32.to_le_bytes());
+        write_btrfs_leaf_item(&mut image, root, 1, 1, 216, u64::MAX, 3900, 98);
+        image[root + 3900..root + 3998].copy_from_slice(&unused);
+        // The next item type is outside the half-open disk range, even at
+        // offset zero. Its deliberately non-DEV_ITEM payload must be ignored.
+        write_btrfs_leaf_item(&mut image, root, 2, 1, 217, 0, 3899, 1);
+        stamp_btrfs_test_tree_block_crc32c(&mut image, root);
+        (image, root)
+    }
+
+    #[test]
+    fn btrfs_dev_info_enumerates_unused_sparse_device() {
+        let (image, _) = build_btrfs_device_inventory_image();
+        let dev = TestDevice::from_vec(image.clone());
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+        let info = fs
+            .get_btrfs_fs_info(&cx, &mut RequestScope::empty())
+            .unwrap();
+        assert_eq!(&info[..8], &u64::MAX.to_ne_bytes());
+        assert_eq!(&info[8..16], &2_u64.to_ne_bytes());
+        for (id, uuid, used, total) in [
+            (7, [0xA7; 16], 8192_u64, 123_456_u64),
+            (u64::MAX, [0xD4; 16], 0, 234_567),
+        ] {
+            for query_uuid in [[0; 16], uuid] {
+                let reply = fs
+                    .get_btrfs_dev_info(&cx, &mut RequestScope::empty(), id, query_uuid)
+                    .unwrap();
+                assert_eq!(&reply[..8], &id.to_ne_bytes());
+                assert_eq!(&reply[8..24], &uuid);
+                assert_eq!(&reply[24..32], &used.to_ne_bytes());
+                assert_eq!(&reply[32..40], &total.to_ne_bytes());
+            }
+        }
+        for (id, uuid) in [
+            (0, [0; 16]),
+            (8, [0; 16]),
+            (7, [0xD4; 16]),
+            (u64::MAX, [0xA7; 16]),
+        ] {
+            let error = fs
+                .get_btrfs_dev_info(&cx, &mut RequestScope::empty(), id, uuid)
+                .unwrap_err();
+            assert_eq!(error.to_errno(), libc::ENODEV);
+        }
+        assert_eq!(dev.snapshot_bytes(), image);
+    }
+
+    #[test]
+    fn btrfs_dev_info_rejects_incomplete_or_conflicting_inventory() {
+        let cx = Cx::for_testing();
+        for defect in [
+            "count_low",
+            "count_high",
+            "duplicate_uuid",
+            "foreign_fsid",
+            "wrong_key",
+            "missing_backing",
+            "bad_accounting",
+        ] {
+            let (mut image, root) = build_btrfs_device_inventory_image();
+            let sb = BTRFS_SUPER_INFO_OFFSET;
+            let second = root + 3900;
+            match defect {
+                "count_low" => image[sb + 0x88..sb + 0x90].copy_from_slice(&1_u64.to_le_bytes()),
+                "count_high" => image[sb + 0x88..sb + 0x90].copy_from_slice(&3_u64.to_le_bytes()),
+                "duplicate_uuid" => image[second + 66..second + 82].fill(0xA7),
+                "foreign_fsid" => image[second + 82] ^= 1,
+                "wrong_key" => image[second..second + 8].copy_from_slice(&8_u64.to_le_bytes()),
+                "missing_backing" => {
+                    image[sb + 0xC9..sb + 0xD1].copy_from_slice(&3_u64.to_le_bytes())
+                }
+                "bad_accounting" => {
+                    image[second + 16..second + 24].copy_from_slice(&234_568_u64.to_le_bytes())
+                }
+                _ => unreachable!(),
+            }
+            stamp_btrfs_test_tree_block_crc32c(&mut image, root);
+            let checksum = ffs_types::crc32c(&image[sb + 0x20..sb + 4096]);
+            image[sb..sb + 4].copy_from_slice(&checksum.to_le_bytes());
+            let dev = TestDevice::from_vec(image.clone());
+            let fs =
+                OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+            for result in [
+                fs.get_btrfs_fs_info(&cx, &mut RequestScope::empty()),
+                fs.get_btrfs_dev_info(&cx, &mut RequestScope::empty(), 7, [0; 16]),
+            ] {
+                let error = result.unwrap_err();
+                assert_eq!(error.to_errno(), libc::EIO, "{defect}: {error}");
+            }
+            assert_eq!(dev.snapshot_bytes(), image);
+        }
+    }
+
     #[test]
     fn btrfs_dev_info_rejects_untrustworthy_live_accounting() {
         let Some((fs, dev, _tmp, _image)) = open_writable_btrfs_mkfs(128) else {
@@ -79022,24 +79168,28 @@ mod tests {
         let cx = Cx::for_testing();
         for num_devices in [2_u64, 3] {
             for skip_validation in [false, true] {
-                let mut image = build_btrfs_fsops_image();
+                let (mut image, _) = build_btrfs_device_inventory_image();
                 let offset = BTRFS_SUPER_INFO_OFFSET + 0x88;
                 image[offset..offset + 8].copy_from_slice(&num_devices.to_le_bytes());
+                let sb = BTRFS_SUPER_INFO_OFFSET;
+                let checksum = ffs_types::crc32c(&image[sb + 0x20..sb + 4096]);
+                image[sb..sb + 4].copy_from_slice(&checksum.to_le_bytes());
                 let dev = TestDevice::from_vec(image.clone());
                 let options = OpenOptions {
                     skip_validation,
                     ..OpenOptions::default()
                 };
                 let mut fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &options).unwrap();
-                let info_error = fs
-                    .get_btrfs_fs_info(&cx, &mut RequestScope::empty())
-                    .unwrap_err();
-                assert_eq!(info_error.to_errno(), libc::EOPNOTSUPP);
-                assert!(
-                    info_error
-                        .to_string()
-                        .contains("complete multi-device discovery")
-                );
+                let info = fs.get_btrfs_fs_info(&cx, &mut RequestScope::empty());
+                if num_devices == 2 {
+                    let info = info.unwrap();
+                    assert_eq!(&info[..8], &u64::MAX.to_ne_bytes());
+                    assert_eq!(&info[8..16], &2_u64.to_ne_bytes());
+                } else {
+                    let error = info.unwrap_err();
+                    assert_eq!(error.to_errno(), libc::EIO);
+                    assert!(error.to_string().contains("device count disagrees"));
+                }
                 let error = fs.enable_writes(&cx).unwrap_err();
                 assert!(matches!(error, FfsError::UnsupportedFeature(_)));
                 assert!(error.to_string().contains("one device"));

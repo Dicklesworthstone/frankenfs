@@ -18,18 +18,18 @@ use super::{
     FiemapExtent, FileType, FsFlavor, FsGeometry, FsOps, FsStat, FsxattrInfo, InodeAttr,
     InodeNumber, LINUX_PATH_MAX, LINUX_SYMLINK_TARGET_MAX, Mutex, OpenFs, OsStr, Path, QuotaInfo,
     ReaddirPage, ReaddirValidation, RequestCommitMode, RequestOp, RequestScope, SeekWhence,
-    SetAttrRequest, TransactionBlockAdapter, XattrSetMode, btrfs_inode_flags_to_fsflags,
-    btrfs_inode_flags_to_xflags, btrfs_mutation_to_ffs, btrfs_ro_readdir_snapshot_enabled,
-    clear_readdir_snapshot, dir_entry_file_type, encode_btrfs_dev_info_args,
-    encode_btrfs_fs_info_args, encode_btrfs_ino_paths_container,
+    SetAttrRequest, TransactionBlockAdapter, XattrSetMode, btrfs_dev_info_enodev,
+    btrfs_inode_flags_to_fsflags, btrfs_inode_flags_to_xflags, btrfs_mutation_to_ffs,
+    btrfs_ro_readdir_snapshot_enabled, clear_readdir_snapshot, dir_entry_file_type,
+    encode_btrfs_dev_info_args, encode_btrfs_fs_info_args, encode_btrfs_ino_paths_container,
     encode_btrfs_supported_feature_flags, encode_btrfs_tree_search_results,
     encode_btrfs_tree_search_results_with_limit, ext4_flags_to_xflags, ext4_present_xattr_value,
     ext4_read_buffer_len, first_nul, fsflags_to_btrfs_inode_flags, generate_send_stream, info,
     map_logical_to_physical, parse_btrfs_tree_search_key_bytes, parse_extent_data, parse_root_item,
-    parse_to_ffs_error, read_btrfs_backing_device_item, read_btrfs_superblock_region,
-    read_ext4_superblock_region, readdir_snapshot_serve, readdir_snapshot_serve_unvalidated,
-    readdir_snapshot_store, slice_readdir_snapshot, systemtime_nanos, trace, warn,
-    xflags_to_btrfs_inode_flags, xflags_to_ext4_flags,
+    parse_to_ffs_error, read_btrfs_superblock_region, read_ext4_superblock_region,
+    readdir_snapshot_serve, readdir_snapshot_serve_unvalidated, readdir_snapshot_store,
+    slice_readdir_snapshot, systemtime_nanos, trace, warn, xflags_to_btrfs_inode_flags,
+    xflags_to_ext4_flags,
 };
 use crate::vfs::XattrPresence;
 
@@ -2057,16 +2057,15 @@ impl FsOps for OpenFs {
                 "BTRFS_IOC_FS_INFO is not supported on ext4 filesystems".to_owned(),
             )),
             FsFlavor::Btrfs(sb) => {
-                // Chunk stripes alone cannot enumerate unused devices. Until
-                // the mounted device registry is complete, only one backing
-                // device provides enough evidence to report the maximum ID.
-                if sb.num_devices != 1 {
-                    return Err(FfsError::UnsupportedFeature(
-                        "BTRFS_IOC_FS_INFO requires complete multi-device discovery".to_owned(),
-                    ));
-                }
-                let device = read_btrfs_backing_device_item(cx, self.dev.as_ref(), sb)?;
-                Ok(encode_btrfs_fs_info_args(sb, device.devid))
+                let devices = self.current_btrfs_device_items(cx, sb)?;
+                let (&max_id, _) =
+                    devices
+                        .last_key_value()
+                        .ok_or_else(|| FfsError::Corruption {
+                            block: sb.chunk_root / u64::from(sb.sectorsize),
+                            detail: "chunk tree has no devices".to_owned(),
+                        })?;
+                Ok(encode_btrfs_fs_info_args(sb, max_id))
             }
         }
     }
@@ -3461,8 +3460,9 @@ impl FsOps for OpenFs {
                 "BTRFS_IOC_DEV_INFO is not supported on ext4 filesystems".to_owned(),
             )),
             FsFlavor::Btrfs(sb) => {
-                let device = self.current_btrfs_backing_device_item(cx, sb)?;
-                encode_btrfs_dev_info_args(&device, devid_in, &uuid_in)
+                let devices = self.current_btrfs_device_items(cx, sb)?;
+                let device = devices.get(&devid_in).ok_or_else(btrfs_dev_info_enodev)?;
+                encode_btrfs_dev_info_args(device, devid_in, &uuid_in)
             }
         }
     }

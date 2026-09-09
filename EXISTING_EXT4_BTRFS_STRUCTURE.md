@@ -2517,6 +2517,11 @@ For metadata blocks, verification includes:
     inventory, not `num_devices`. Linux v6.19 `btrfs_ioctl_fs_info` computes
     it across the device list. A single device with ID 7 therefore reports
     `max_id = 7` and `num_devices = 1`; callers must tolerate holes in IDs.
+    Enumeration includes all `(1, DEV_ITEM, devid)` entries in CHUNK_TREE,
+    even devices with no allocated chunks. DEV_TREE contains device extents,
+    not that inventory. Linux v6.19 `btrfs_read_chunk_tree` counts DEV_ITEMs
+    and repairs a disagreeing superblock device count in memory for the next
+    commit; the two counts are not independent sources of device identity.
 
 ### 16.3 Key Implementation Patterns
 

@@ -104,17 +104,19 @@ reconstruction, or multi-device mutation support in `OpenFs`.
 `OpenFs::enable_writes` refuses any device count other than one and any known
 chunk profile other than Single/DUP before loading mutable allocation state.
 Skipping read validation does not bypass this write-admission check.
-`OpenFs::get_btrfs_dev_info` reads the backing superblock through the request's
+`OpenFs::current_btrfs_device_items` reads the backing superblock through the request's
 `Cx`, verifies its checksum, parses the embedded device item, and checks its
-filesystem UUID. Writable mounts then read the live CHUNK_TREE device item
-under the allocator's read lock, validate its ID and UUIDs against the backing
-identity, and report its current accounting. Partial tree loads return an
-unsupported error; missing or malformed records return corruption errors.
-Read-only mounts use the existing checksum-verified floor descent into the
-committed CHUNK_TREE, requiring exact key equality before the same identity
-validation. A predecessor or missing record cannot supply device accounting.
-This identifies the one backing image; it does not enumerate or validate a
-mounted multi-device set. The allocator lock stabilizes writable accounting,
+filesystem UUID. Writable mounts enumerate live CHUNK_TREE DEV_ITEM records
+under the allocator's read lock; read-only mounts use checksum-verified range
+descent over the committed device-item keyspace. Both include unused devices
+and maximum IDs, require IDs to match their keys, reject duplicate IDs/UUIDs
+and foreign filesystem UUIDs, and verify the backing device's identity.
+Partial live tree loads return an unsupported error; missing, malformed or
+count-inconsistent inventories return corruption errors. Unlike Linux's
+mount-time count repair, FrankenFS currently refuses a superblock/DEV_ITEM
+count mismatch. This inventory does not open or validate additional backing
+files, and does not enable cross-device reads. Seed-device inventories with
+different filesystem UUIDs are not yet supported. The allocator lock stabilizes writable accounting,
 but full commit releases it before superblock publication; serializing that
 publication with device-info reads remains open (`bd-hk5w3`).
 Mount initialization preserves DATA, METADATA, and SYSTEM block-group types.
@@ -122,10 +124,9 @@ Chunk-tree COW allocates from SYSTEM space so the superblock's bootstrap map
 can resolve the new root. When growth dirties CHUNK_TREE and DEV_TREE, full
 commit retires their old extent records before allocating replacement nodes;
 the existing pin mechanism protects those old blocks until publication.
-`FS_INFO` uses the same verified device item to report `max_id` for a
-single-device image, so sparse device IDs remain discoverable through
-`DEV_INFO`. Until the mounted registry covers all devices, `FS_INFO` refuses
-multi-device inventory requests rather than treating the count as a maximum ID.
+`FS_INFO` derives `max_id` from the complete validated inventory. `DEV_INFO`
+looks up any inventory device by exact ID and optional UUID, with current
+per-device accounting. Neither ioctl infers device IDs from chunk stripes.
 
 ---
 

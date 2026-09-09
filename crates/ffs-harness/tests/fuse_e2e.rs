@@ -13970,6 +13970,80 @@ fn btrfs_openfs_ioctl_dev_info_payload_contract() {
 }
 
 #[test]
+fn btrfs_openfs_ioctl_dev_info_two_device_inventory() {
+    if !command_available("mkfs.btrfs") {
+        emit_scenario_result(
+            "btrfs_dev_info_two_device_inventory",
+            "SKIP",
+            Some("format_tool_unavailable"),
+        );
+        return;
+    }
+    let tmp = TempDir::new().expect("tmpdir");
+    let images = [
+        tmp.path().join("first.btrfs"),
+        tmp.path().join("second.btrfs"),
+    ];
+    for image in &images {
+        let file = fs::File::create(image).expect("create device image");
+        file.set_len(128 * 1024 * 1024).expect("size device image");
+    }
+    // SINGLE metadata keeps the chunk tree readable on the first image. This
+    // checks inventory discovery, not routing metadata across multiple devices.
+    let output = Command::new("mkfs.btrfs")
+        .args(["-f", "-d", "single", "-m", "single"])
+        .args(&images)
+        .output()
+        .expect("format two-device filesystem");
+    assert!(
+        output.status.success(),
+        "two-device format failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let mut expected = Vec::new();
+    for image in &images {
+        let mut file = fs::File::open(image).expect("open device image");
+        file.seek(SeekFrom::Start(65_536)).unwrap();
+        let mut sb = [0_u8; 4096];
+        file.read_exact(&mut sb).unwrap();
+        assert_eq!(u64::from_le_bytes(sb[0x88..0x90].try_into().unwrap()), 2);
+        let item = &sb[0xC9..0x12B];
+        expected.push((
+            u64::from_le_bytes(item[..8].try_into().unwrap()),
+            <[u8; 16]>::try_from(&item[66..82]).unwrap(),
+            u64::from_le_bytes(item[16..24].try_into().unwrap()),
+            u64::from_le_bytes(item[8..16].try_into().unwrap()),
+        ));
+    }
+    assert_ne!(expected[0].0, expected[1].0);
+    assert_ne!(expected[0].1, expected[1].1);
+    let cx = Cx::for_testing();
+    let fs = OpenFs::open_with_options(&cx, &images[0], &OpenOptions::default())
+        .expect("open first device");
+    assert!(!fs.is_writable());
+    let info = fs
+        .get_btrfs_fs_info(&cx, &mut RequestScope::empty())
+        .expect("complete FS_INFO inventory");
+    assert_eq!(
+        u64::from_ne_bytes(info[..8].try_into().unwrap()),
+        expected[0].0.max(expected[1].0)
+    );
+    assert_eq!(u64::from_ne_bytes(info[8..16].try_into().unwrap()), 2);
+    for (devid, uuid, used, total) in expected {
+        for query_uuid in [[0; 16], uuid] {
+            let reply = fs
+                .get_btrfs_dev_info(&cx, &mut RequestScope::empty(), devid, query_uuid)
+                .expect("device from committed inventory");
+            assert_eq!(&reply[..8], &devid.to_ne_bytes());
+            assert_eq!(&reply[8..24], &uuid);
+            assert_eq!(&reply[24..32], &used.to_ne_bytes());
+            assert_eq!(&reply[32..40], &total.to_ne_bytes());
+        }
+    }
+    emit_scenario_result("btrfs_dev_info_two_device_inventory", "PASS", None);
+}
+
+#[test]
 fn btrfs_fuse_ioctl_dev_info_via_mounted_path() {
     if !command_available("python3") {
         eprintln!("python3 not available, skipping");
