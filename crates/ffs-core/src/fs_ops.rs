@@ -695,6 +695,9 @@ impl FsOps for OpenFs {
                 if attr.kind == FileType::Symlink {
                     return Err(FfsError::Format("cannot read a symlink".into()));
                 }
+                // Bound the owned buffer before allocating, including reads at EOF.
+                let size =
+                    size.min(u32::try_from(attr.size.saturating_sub(offset)).unwrap_or(u32::MAX));
                 self.btrfs_read_file(cx, ino, offset, size, false)
             }
         }

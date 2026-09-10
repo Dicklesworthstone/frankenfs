@@ -56324,6 +56324,51 @@ mod tests {
     }
 
     #[test]
+    fn btrfs_owned_read_allocation_is_bounded_by_file_size() {
+        let inline = b"small inline data";
+        let regular = b"hello from btrfs fsops";
+        for (image, content) in [
+            (build_btrfs_inline_image(inline), inline.as_slice()),
+            (build_btrfs_fsops_image(), regular.as_slice()),
+            (build_btrfs_inline_image(b""), b"".as_slice()),
+        ] {
+            let cx = Cx::for_testing();
+            let fs = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(image)),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            let ops: &dyn FsOps = &fs;
+            for offset in [0, 3, content.len() as u64, u64::MAX] {
+                for requested in [0, 2, 1_048_576] {
+                    let data = ops
+                        .read(
+                            &cx,
+                            &mut RequestScope::empty(),
+                            InodeNumber(257),
+                            offset,
+                            requested,
+                        )
+                        .unwrap();
+                    let start = usize::try_from(offset)
+                        .unwrap_or(usize::MAX)
+                        .min(content.len());
+                    let expected =
+                        &content[start..][..(requested as usize).min(content.len() - start)];
+                    assert_eq!(data, expected);
+                    assert!(
+                        data.capacity() <= expected.len(),
+                        "offset={offset}, requested={requested}, capacity={}, remaining={}",
+                        data.capacity(),
+                        expected.len()
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn btrfs_read_inline_file() {
         let content = b"small inline data";
         let image = build_btrfs_inline_image(content);
