@@ -113,6 +113,10 @@ mirror's checksum, logical address and structure before caching it, retrying
 another copy on invalid content. Kernel-written RAID1/RAID10/C3/C4 tests corrupt
 chunk-tree, root-tree and fs-tree copies independently: all but the final mirror
 can be corrupt and still recover through FUSE; corrupting every copy fails.
+The attached-device kernel-image suite runs with both CRC32C and XXHASH64,
+asserting the on-disk checksum type. Both runs cover mirrored metadata and
+ordinary/zstd data recovery, survivor-device reads, and clean RAID5/6 reads;
+they do not establish degraded parity reconstruction or multi-device writes.
 Core reader-fault tests also cover I/O errors and empty, short and oversized
 responses for RAID1/C3/C4 and both RAID10 mirror groups. They require recovery
 from the final eligible complete copy, refuse all-copy failure, reject reads

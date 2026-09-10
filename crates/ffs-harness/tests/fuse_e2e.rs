@@ -14540,6 +14540,15 @@ fn assert_btrfs_mirror_survivors(cx: &Cx, images: &[PathBuf], payload: &[u8], pr
 
 #[test]
 fn btrfs_attached_devices_read_seeded_files() {
+    assert_btrfs_attached_devices_read_seeded_files("crc32c", ffs_types::BTRFS_CSUM_TYPE_CRC32C);
+}
+
+#[test]
+fn btrfs_attached_devices_read_seeded_files_xxhash64() {
+    assert_btrfs_attached_devices_read_seeded_files("xxhash", ffs_types::BTRFS_CSUM_TYPE_XXHASH64);
+}
+
+fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u16) {
     assert!(
         command_available("mkfs.btrfs"),
         "mkfs.btrfs is required for attached-device evidence"
@@ -14554,6 +14563,7 @@ fn btrfs_attached_devices_read_seeded_files() {
         "raid5",
         "raid6",
     ] {
+        eprintln!("attached-device kernel fixture: profile={profile}, checksum={checksum}");
         let tmp = TempDir::new().expect("tmpdir");
         let payload = patterned_bytes(1024 * 1024 + 37, 251, 0);
         let mut images = vec![
@@ -14578,6 +14588,8 @@ fn btrfs_attached_devices_read_seeded_files() {
         let output = Command::new("mkfs.btrfs")
             .args([
                 "-f",
+                "--csum",
+                checksum,
                 "-d",
                 if profile == "raid0-data" {
                     "raid0"
@@ -14841,6 +14853,11 @@ fn btrfs_attached_devices_read_seeded_files() {
             };
             let mut filesystem = OpenFs::open_with_options(&cx, &images[primary], &options)
                 .unwrap_or_else(|error| panic!("open {profile} primary {primary}: {error}"));
+            assert_eq!(
+                filesystem.btrfs_superblock().unwrap().csum_type,
+                csum_type,
+                "kernel fixture must use the requested checksum algorithm"
+            );
             if matches!(profile, "raid5" | "raid6") {
                 for chunk in &filesystem.btrfs_context().unwrap().chunks {
                     assert_eq!(
@@ -14967,7 +14984,11 @@ fn btrfs_attached_devices_read_seeded_files() {
         if matches!(profile, "raid10" | "raid1c3" | "raid1c4") {
             assert_btrfs_mirror_survivors(&cx, &images, &payload, profile);
         }
-        emit_scenario_result(&format!("btrfs_attached_devices_{profile}"), "PASS", None);
+        emit_scenario_result(
+            &format!("btrfs_attached_devices_{profile}"),
+            "PASS",
+            Some(checksum),
+        );
     }
 }
 
