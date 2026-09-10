@@ -13894,7 +13894,7 @@ impl OpenFs {
             }
             // Carve disjoint `&mut out` windows for output-writing jobs. The
             // specs are in increasing `dst_start` order (extents are returned in
-            // logical-offset order and their output ranges are disjoint), so a
+            // logical-offset order). Check for overlapping output ranges as a
             // single forward `split_at_mut` walk hands each job its own
             // non-overlapping window without copying. Uncompressed extents are
             // still split into <=1 MiB sub-reads so a few-large-extent file
@@ -13925,7 +13925,12 @@ impl OpenFs {
                         extent_offset,
                         extent_delta,
                     } => {
-                        let skip = dst_start - consumed;
+                        let skip = dst_start.checked_sub(consumed).ok_or_else(|| {
+                            FfsError::Corruption {
+                                block: disk_bytenr,
+                                detail: "overlapping btrfs file extents".into(),
+                            }
+                        })?;
                         let (_, rest) = remaining.split_at_mut(skip);
                         let (dst, rest_after) = rest.split_at_mut(copy_len);
                         remaining = rest_after;
@@ -13948,7 +13953,12 @@ impl OpenFs {
                         copy_len,
                         source_logical,
                     } => {
-                        let skip = dst_start - consumed;
+                        let skip = dst_start.checked_sub(consumed).ok_or_else(|| {
+                            FfsError::Corruption {
+                                block: source_logical,
+                                detail: "overlapping btrfs file extents".into(),
+                            }
+                        })?;
                         let (_, rest) = remaining.split_at_mut(skip);
                         let (dst, rest_after) = rest.split_at_mut(copy_len);
                         remaining = rest_after;
@@ -56423,6 +56433,65 @@ mod tests {
             .read(&cx, &mut RequestScope::empty(), InodeNumber(257), 0, 128)
             .unwrap();
         assert_eq!(&data, content);
+    }
+
+    #[test]
+    fn btrfs_read_overlapping_extents_returns_corruption_without_output_mutation() {
+        let payload = b"hello from btrfs fsops";
+        for (second_start, compression) in [(8_u64, 0), (22, 0), (32, 0), (8, 1), (22, 1), (32, 1)]
+        {
+            let mut image = build_btrfs_fsops_image();
+            let leaf = BTRFS_TEST_FS_TREE_LOGICAL;
+            image[leaf + 0x60..leaf + 0x64].copy_from_slice(&5_u32.to_le_bytes());
+            let mut second = encode_btrfs_extent_regular(
+                BTRFS_TEST_FILE_DATA_LOGICAL as u64,
+                payload.len() as u64,
+            );
+            if compression == 1 {
+                let compressed = btrfs_test_zlib_compress(payload);
+                let data_start = BTRFS_TEST_FILE_DATA_LOGICAL + 4096;
+                image[data_start..data_start + compressed.len()].copy_from_slice(&compressed);
+                second[16] = compression;
+                second[21..29].copy_from_slice(&(data_start as u64).to_le_bytes());
+                second[29..37].copy_from_slice(&(compressed.len() as u64).to_le_bytes());
+            }
+            write_btrfs_leaf_item(
+                &mut image,
+                leaf,
+                4,
+                257,
+                BTRFS_ITEM_EXTENT_DATA,
+                second_start,
+                2600,
+                second.len() as u32,
+            );
+            image[leaf + 2600..leaf + 2600 + second.len()].copy_from_slice(&second);
+            let file_size = second_start as usize + payload.len();
+            set_btrfs_test_file_size(&mut image, file_size as u64);
+            let cx = Cx::for_testing();
+            let fs = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(image)),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            let mut out = vec![0xA5; file_size];
+            let result = fs.read_into(&cx, InodeNumber(257), 0, &mut out);
+            if second_start == 8 {
+                assert!(matches!(result, Err(FfsError::Corruption { .. })));
+                assert_eq!(out, vec![0xA5; file_size]);
+                assert!(matches!(
+                    fs.read(&cx, InodeNumber(257), 0, file_size as u32),
+                    Err(FfsError::Corruption { .. })
+                ));
+            } else {
+                assert_eq!(result.unwrap(), file_size);
+                let mut expected = payload.to_vec();
+                expected.resize(second_start as usize, 0);
+                expected.extend_from_slice(payload);
+                assert_eq!(out, expected);
+            }
+        }
     }
 
     #[test]
