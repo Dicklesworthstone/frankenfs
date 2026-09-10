@@ -14043,6 +14043,81 @@ fn btrfs_openfs_ioctl_dev_info_two_device_inventory() {
     emit_scenario_result("btrfs_dev_info_two_device_inventory", "PASS", None);
 }
 
+fn assert_btrfs_degraded_mirror_recovery(
+    cx: &Cx,
+    images: &[PathBuf],
+    copies: &[(PathBuf, u64, Vec<u8>)],
+    name: &str,
+    payload: &[u8],
+    scenario: &str,
+) {
+    if images.len() < 3 {
+        // Two-copy RAID1 cannot retain a healthy copy after both failures.
+        return;
+    }
+    let primary = &copies[0].0;
+    let healthy = &copies.last().unwrap().0;
+    let missing = if copies.len() >= 3 {
+        // C3/C4: omit one corrupt copy, retaining another corrupt copy first.
+        &copies[1].0
+    } else {
+        // RAID10: lose a device in the other mirror group, leaving its sibling.
+        images
+            .iter()
+            .find(|image| !copies.iter().any(|copy| &copy.0 == *image))
+            .unwrap()
+    };
+    assert_ne!(missing, primary);
+    assert_ne!(missing, healthy);
+    let options = OpenOptions {
+        btrfs_device_paths: images
+            .iter()
+            .filter(|image| *image != primary && *image != missing)
+            .cloned()
+            .collect(),
+        ..OpenOptions::default()
+    };
+    assert_eq!(options.btrfs_device_paths.len() + 1, images.len() - 1);
+    assert!(options.btrfs_device_paths.contains(healthy));
+    let recovered = OpenFs::open_with_options(cx, primary, &options).unwrap();
+    let attr = recovered
+        .lookup(cx, InodeNumber(1), std::ffi::OsStr::new(name))
+        .unwrap();
+    assert_eq!(
+        recovered
+            .read(cx, attr.ino, 0, u32::try_from(payload.len()).unwrap())
+            .unwrap(),
+        payload
+    );
+    assert_eq!(
+        recovered.read(cx, attr.ino, 13, 8197).unwrap(),
+        payload[13..8210]
+    );
+    drop(recovered);
+    let mounted = OpenFs::open_with_options(cx, primary, &options).unwrap();
+    let mountpoint = primary.parent().unwrap().join(scenario);
+    fs::create_dir(&mountpoint).unwrap();
+    let session = mount_background(
+        Box::new(mounted),
+        &mountpoint,
+        &MountOptions {
+            read_only: true,
+            auto_unmount: false,
+            ..MountOptions::default()
+        },
+    )
+    .unwrap();
+    let mount = ffs_harness::stale_mounts::MountGuard::new(session, &mountpoint);
+    wait_for_fuse_mount_ready(&mountpoint);
+    assert_eq!(fs::read(mountpoint.join(name)).unwrap(), payload);
+    drop(mount);
+    emit_scenario_result(
+        scenario,
+        "PASS",
+        Some("one device omitted; attached copy corrupt"),
+    );
+}
+
 fn assert_btrfs_metadata_mirror_recovery(
     cx: &Cx,
     images: &[PathBuf],
@@ -14165,6 +14240,14 @@ fn assert_btrfs_metadata_mirror_recovery(
         wait_for_fuse_mount_ready(&mountpoint);
         assert_eq!(fs::read(mountpoint.join("payload")).unwrap(), payload);
         drop(mount);
+        assert_btrfs_degraded_mirror_recovery(
+            cx,
+            images,
+            &copies,
+            "payload",
+            payload,
+            &format!("btrfs_{profile}_missing_and_corrupt_metadata_{logical}"),
+        );
         corrupt(copies.last().unwrap());
         let both_bad = OpenFs::open_with_options(cx, &images[0], &options).and_then(|filesystem| {
             let attr = filesystem.lookup(cx, InodeNumber(1), std::ffi::OsStr::new("payload"))?;
@@ -14357,6 +14440,16 @@ fn assert_btrfs_data_mirror_recovery(
     wait_for_fuse_mount_ready(&mountpoint);
     assert_eq!(fs::read(mountpoint.join(name)).unwrap(), expected);
     drop(mount);
+    if datasum {
+        assert_btrfs_degraded_mirror_recovery(
+            cx,
+            images,
+            &copies,
+            name,
+            payload,
+            &format!("btrfs_{profile}_missing_and_corrupt_data_{name}"),
+        );
+    }
     let unchecked = OpenFs::open_with_options(
         cx,
         &images[0],

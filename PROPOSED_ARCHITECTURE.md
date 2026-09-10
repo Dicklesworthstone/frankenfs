@@ -117,6 +117,11 @@ The attached-device kernel-image suite runs with both CRC32C and XXHASH64,
 asserting the on-disk checksum type. Both runs cover mirrored metadata and
 ordinary/zstd data recovery, survivor-device reads, and clean RAID5/6 reads;
 they do not establish degraded parity reconstruction or multi-device writes.
+Combined-failure probes also recover chunk/root/fs-tree metadata and ordinary
+or zstd data when a device is omitted and an attached copy is corrupt: C3/C4
+retain a valid copy in the same mirror set, while RAID10 retains a valid copy
+in each mirror group. These use both checksum algorithms and cold core/FUSE
+reads; two-device RAID1 cannot tolerate that combination of failures.
 Core reader-fault tests also cover I/O errors and empty, short and oversized
 responses for RAID1/C3/C4 and both RAID10 mirror groups. They require recovery
 from the final eligible complete copy, refuse all-copy failure, reject reads
