@@ -12437,12 +12437,21 @@ impl OpenFs {
                     let decoder = slot.get_or_insert_with(|| flate2::Decompress::new(true));
                     decoder.reset(true);
                     let mut out = Vec::with_capacity(uncompressed_size.saturating_add(1));
-                    decoder
+                    let status = decoder
                         .decompress_vec(compressed, &mut out, FlushDecompress::Finish)
                         .map_err(|e| FfsError::Corruption {
                             block: 0,
                             detail: format!("btrfs zlib decompression failed: {e}"),
                         })?;
+                    // A short, complete frame may be sector-padded below, but
+                    // incomplete input must never become fabricated zero bytes.
+                    // StreamEnd also confirms the zlib checksum trailer.
+                    if status != flate2::Status::StreamEnd {
+                        return Err(FfsError::Corruption {
+                            block: 0,
+                            detail: "btrfs zlib stream did not finish within extent bounds".into(),
+                        });
+                    }
                     Ok(out)
                 })?;
                 Self::validate_btrfs_decompressed_len("zlib", out, uncompressed_size)
@@ -18879,12 +18888,19 @@ impl OpenFs {
                     let decoder = slot.get_or_insert_with(|| flate2::Decompress::new(true));
                     decoder.reset(true);
                     let mut output = Vec::with_capacity(ulen.saturating_add(1));
-                    decoder
+                    let status = decoder
                         .decompress_vec(compressed, &mut output, FlushDecompress::Finish)
                         .map_err(|e| FfsError::Corruption {
                             block: 0,
                             detail: format!("e2compr gzip decompress failed: {e}"),
                         })?;
+                    if status != flate2::Status::StreamEnd {
+                        return Err(FfsError::Corruption {
+                            block: 0,
+                            detail: "e2compr gzip stream did not finish within cluster bounds"
+                                .into(),
+                        });
+                    }
                     Ok(output)
                 })
             }
@@ -48091,11 +48107,37 @@ mod tests {
 
     #[test]
     fn e2compr_decompress_empty_input() {
-        // Empty compressed data should error gracefully.
-        let result_gzip = OpenFs::e2compr_decompress(20, &[], 0);
-        // Empty gzip is valid (produces empty output)
-        assert!(result_gzip.is_ok());
-        assert!(result_gzip.unwrap().is_empty());
+        // An absent stream has no header or checksum trailer.
+        assert!(matches!(
+            OpenFs::e2compr_decompress(20, &[], 0),
+            Err(FfsError::Corruption { .. })
+        ));
+        let encoded_empty = btrfs_test_zlib_compress(b"");
+        assert!(
+            OpenFs::e2compr_decompress(20, &encoded_empty, 0)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn e2compr_decompress_rejects_truncated_checksum_trailer() {
+        let payload = b"complete output does not prove a complete stream";
+        let compressed = btrfs_test_zlib_compress(payload);
+        for omitted in 1..=4 {
+            assert!(matches!(
+                OpenFs::e2compr_decompress(
+                    20,
+                    &compressed[..compressed.len() - omitted],
+                    payload.len()
+                ),
+                Err(FfsError::Corruption { .. })
+            ));
+            assert_eq!(
+                OpenFs::e2compr_decompress(20, &compressed, payload.len()).unwrap(),
+                payload
+            );
+        }
     }
 
     #[test]
@@ -56557,6 +56599,69 @@ mod tests {
             ),
             "unexpected oversized decompression error: {err:?}"
         );
+    }
+
+    #[test]
+    fn btrfs_decompress_zlib_rejects_truncated_streams_and_reuses_decoder() {
+        let payload = b"a complete zlib stream includes its checksum trailer";
+        let compressed = btrfs_test_zlib_compress(payload);
+        for end in (0..compressed.len()).rev() {
+            assert!(
+                matches!(
+                    OpenFs::btrfs_decompress(&compressed[..end], 1, 4096),
+                    Err(FfsError::Corruption { .. })
+                ),
+                "accepted truncated zlib stream: {end}/{} bytes",
+                compressed.len()
+            );
+            let recovered = OpenFs::btrfs_decompress(&compressed, 1, payload.len()).unwrap();
+            assert_eq!(recovered, payload, "decoder must reset after truncation");
+        }
+        let mut padded = compressed.clone();
+        padded.resize(4096, 0);
+        let out = OpenFs::btrfs_decompress(&padded, 1, 4096).unwrap();
+        assert_eq!(&out[..payload.len()], payload);
+        assert!(out[payload.len()..].iter().all(|&byte| byte == 0));
+        let mut bad_checksum = compressed;
+        *bad_checksum.last_mut().unwrap() ^= 1;
+        assert!(matches!(
+            OpenFs::btrfs_decompress(&bad_checksum, 1, 4096),
+            Err(FfsError::Corruption { .. })
+        ));
+    }
+
+    #[test]
+    fn btrfs_read_rejects_truncated_inline_zlib_before_returning_bytes() {
+        let payload = b"hello zlib";
+        let compressed = btrfs_test_zlib_compress(payload);
+        for truncated in [false, true] {
+            let end = compressed.len() - usize::from(truncated);
+            let mut image = build_btrfs_inline_image(&compressed[..end]);
+            set_btrfs_test_file_size(&mut image, payload.len() as u64);
+            let extent_off = btrfs_test_extent_payload_off();
+            image[extent_off + 8..extent_off + 16]
+                .copy_from_slice(&(payload.len() as u64).to_le_bytes());
+            set_btrfs_test_extent_compression(&mut image, 1);
+            let cx = Cx::for_testing();
+            let fs = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(image)),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            let owned = fs.read(&cx, InodeNumber(257), 0, 128);
+            let mut out = [0xA5; 10];
+            let into = fs.read_into(&cx, InodeNumber(257), 0, &mut out);
+            if truncated {
+                assert!(matches!(owned, Err(FfsError::Corruption { .. })));
+                assert!(matches!(into, Err(FfsError::Corruption { .. })));
+                assert_eq!(out, [0xA5; 10]);
+            } else {
+                assert_eq!(owned.unwrap(), payload);
+                assert_eq!(into.unwrap(), payload.len());
+                assert_eq!(&out, payload);
+            }
+        }
     }
 
     #[test]
