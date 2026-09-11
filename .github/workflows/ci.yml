@@ -108,6 +108,14 @@ jobs:
       - name: Executed ext4 journal parity contracts
         run: cargo run -p ffs-harness -- parity --verify ext4-journal --verify parity-honesty --local
 
+      # §22.1 names seven gate commands. This executes them and fails the job when
+      # a gate that HAS tests does not pass. A filter that selects zero tests is
+      # reported as `not_implemented` and can never be green here.
+      - name: Canonical §22 gates
+        run: |
+          mkdir -p artifacts/canonical-gates
+          cargo run -p ffs-harness -- gates --all --local --out artifacts/canonical-gates/report.json
+
       - name: ffs-block all-features check
         run: cargo check -p ffs-block --all-features --all-targets
 
@@ -196,6 +204,7 @@ jobs:
             target/debug/deps/ffs-*.d
             conformance/golden/*.json
             conformance/fixtures/checksums.sha256
+            artifacts/canonical-gates/report.json
             artifacts/e2e/**/*.log
             artifacts/e2e/**/xfstests/*.json
             artifacts/e2e/**/xfstests/*.md

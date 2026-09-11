@@ -11,6 +11,7 @@ pub mod benchmark_taxonomy;
 pub mod btrfs_capability_drift;
 pub mod btrfs_multidevice_corpus;
 pub mod btrfs_send_receive_corpus;
+pub mod canonical_gates;
 pub mod casefold_corpus;
 pub mod chaos_replay_lab;
 pub mod claimability_plan;
@@ -695,7 +696,12 @@ pub struct ExecutionGatedParityReport {
     pub contracts: Vec<VerifiedParityContract>,
     pub selected_suites: Vec<String>,
     pub runs: Vec<executed_evidence::TestRunEvidence>,
-    /// The selected contracts do not cover all canonical gate criteria.
+    /// Canonical §22 gate evidence. Empty when no gate was requested; an empty
+    /// report never counts towards readiness.
+    pub canonical_gates: canonical_gates::CanonicalGateReport,
+    /// Whole-project readiness. True only when every declared capability row has
+    /// exact executed evidence AND every canonical §22 gate passed with a
+    /// nonempty selection. The bounded contracts alone never establish it.
     pub readiness_verified: bool,
 }
 
@@ -805,6 +811,17 @@ impl ExecutionGatedParityReport {
     /// Run the selected known suites. No paths, shell commands, JSON reports or
     /// caller-supplied pass/fail maps are accepted as parity evidence.
     pub fn run(suites: &[String], executor: ParityExecutor) -> Result<Self> {
+        Self::run_with_gates(suites, &[], executor)
+    }
+
+    /// Run the selected suites and the selected canonical §22 gates against one
+    /// shared source identity. Both public parity consumers and CI use this path,
+    /// so a gate result and a capability claim are always the same evidence.
+    pub fn run_with_gates(
+        suites: &[String],
+        gate_ids: &[String],
+        executor: ParityExecutor,
+    ) -> Result<Self> {
         let mut selected = std::collections::BTreeSet::new();
         for suite in suites {
             if !matches!(
@@ -819,6 +836,7 @@ impl ExecutionGatedParityReport {
                 bail!("duplicate parity suite {suite}");
             }
         }
+        let gates_selected = canonical_gates::select_gate_ids(gate_ids)?;
         let mut runs = Vec::new();
         for suite in &selected {
             let mut args = vec!["-Z", "checksum-freshness", "test", "-p", "ffs-harness"];
@@ -849,14 +867,21 @@ impl ExecutionGatedParityReport {
             };
             runs.push(executed_evidence::TestRunEvidence::run(command, &args));
         }
+        let gate_runs = canonical_gates::execute_runs(&gates_selected, executor);
         let source = executed_evidence::SourceIdentity::capture().ok();
-        Ok(Self::from_runs(&selected, runs, source))
+        let gates = canonical_gates::CanonicalGateReport::from_runs(
+            &gates_selected,
+            &gate_runs,
+            source.clone(),
+        );
+        Ok(Self::from_runs(&selected, runs, source, gates))
     }
 
     fn from_runs(
         selected: &std::collections::BTreeSet<&str>,
         runs: Vec<executed_evidence::TestRunEvidence>,
         source: Option<executed_evidence::SourceIdentity>,
+        canonical_gates: canonical_gates::CanonicalGateReport,
     ) -> Self {
         let rows = capability_rows_from_feature_parity(FEATURE_PARITY_MARKDOWN);
         let contracts: Vec<_> = PARITY_CONTRACTS
@@ -895,7 +920,7 @@ impl ExecutionGatedParityReport {
             })
             .collect();
         let evidence_backed_rows = contracts.iter().filter(|row| row.verified).count();
-        let missing_evidence_rows = rows
+        let missing_evidence_rows: Vec<String> = rows
             .iter()
             .filter(|row| {
                 !contracts
@@ -904,6 +929,11 @@ impl ExecutionGatedParityReport {
             })
             .map(|row| row.capability.clone())
             .collect();
+        // Readiness needs both halves, and neither is inferable from the other:
+        // every declared capability row carrying exact executed evidence, and
+        // every canonical §22 gate passing with a nonempty selection.
+        let readiness_verified =
+            !rows.is_empty() && missing_evidence_rows.is_empty() && canonical_gates.all_passed();
         Self {
             declared_contracts: ParityReport::current(),
             total_rows: rows.len(),
@@ -913,14 +943,34 @@ impl ExecutionGatedParityReport {
             contracts,
             selected_suites: selected.iter().map(|suite| (*suite).to_owned()).collect(),
             runs,
-            readiness_verified: false,
+            canonical_gates,
+            readiness_verified,
         }
     }
 
     /// Gate for the selected suites, not a declaration of whole-project readiness.
     pub fn require_evidence(&self) -> Result<(), String> {
-        if self.runs.is_empty() {
-            return Err("no test suites executed; use --verify <suite>".to_owned());
+        // A gate that has executable tests and does not pass fails the run, and is
+        // reported first because it is the most specific failure available.
+        // `NotImplemented` gates do not fail it, but they keep `readiness_verified`
+        // false and are reported with their criteria so they cannot be forgotten.
+        for gate in &self.canonical_gates.gates {
+            if gate.status == canonical_gates::CanonicalGateStatus::Failed {
+                return Err(format!(
+                    "canonical gate {} failed: {}",
+                    gate.gate_id,
+                    gate.reason.as_deref().unwrap_or("no reason recorded")
+                ));
+            }
+        }
+        if self.runs.is_empty()
+            && self.selected_suites.is_empty()
+            && self.canonical_gates.gates.is_empty()
+        {
+            return Err(
+                "no test suites or canonical gates executed; use --verify <suite> or --gate <id>"
+                    .to_owned(),
+            );
         }
         if self.runs.len() != self.selected_suites.len() {
             return Err("selected suites do not match execution count".to_owned());
@@ -2131,10 +2181,67 @@ mod tests {
                 &std::collections::BTreeSet::from([suite]),
                 vec![run.clone()],
                 executed_evidence::SourceIdentity::capture().ok(),
+                canonical_gates::CanonicalGateReport::empty(),
             );
             assert!(report.require_evidence().is_err(), "{suite}");
             assert_eq!(report.evidence_backed_rows, 0);
         }
+    }
+
+    #[test]
+    fn failed_canonical_gate_fails_the_parity_gate() {
+        // A real failing process, so the gate is `Failed`, not `NotImplemented`.
+        let gate_run = executed_evidence::TestRunEvidence::run("false", &[]);
+        let gates = canonical_gates::CanonicalGateReport::from_runs(
+            &std::collections::BTreeSet::from(["gate1"]),
+            &[gate_run],
+            executed_evidence::SourceIdentity::capture().ok(),
+        );
+        let report = ExecutionGatedParityReport::from_runs(
+            &std::collections::BTreeSet::<&str>::new(),
+            vec![],
+            executed_evidence::SourceIdentity::capture().ok(),
+            gates,
+        );
+        assert_eq!(report.canonical_gates.failed_gates(), ["gate1"]);
+        let error = report
+            .require_evidence()
+            .expect_err("a failed canonical gate must fail the parity gate");
+        assert!(error.contains("canonical gate gate1 failed"), "{error}");
+        assert!(!report.readiness_verified);
+    }
+
+    #[test]
+    fn passing_gates_do_not_promote_unmapped_rows() {
+        let executable = std::env::current_exe().unwrap();
+        let run = executed_evidence::TestRunEvidence::run(
+            executable.to_str().unwrap(),
+            &[
+                "--exact",
+                "tests::extract_region_basic",
+                "-Z",
+                "unstable-options",
+                "--format=json",
+                "--show-output",
+            ],
+        );
+        let source = executed_evidence::SourceIdentity::capture().ok();
+        let gates = canonical_gates::CanonicalGateReport::from_runs(
+            &std::collections::BTreeSet::from(["gate1"]),
+            &[run],
+            source.clone(),
+        );
+        let report = ExecutionGatedParityReport::from_runs(
+            &std::collections::BTreeSet::<&str>::new(),
+            vec![],
+            source,
+            gates,
+        );
+        assert_eq!(report.canonical_gates.passed_gates(), ["gate1"]);
+        assert!(report.canonical_gates.all_passed());
+        assert_eq!(report.evidence_backed_rows, 0);
+        assert_eq!(report.missing_evidence_rows.len(), report.total_rows);
+        assert!(!report.readiness_verified);
     }
 
     #[test]
@@ -2160,6 +2267,7 @@ mod tests {
             &std::collections::BTreeSet::from(["ext4-journal"]),
             vec![],
             executed_evidence::SourceIdentity::capture().ok(),
+            canonical_gates::CanonicalGateReport::empty(),
         );
         assert_eq!(report.evidence_backed_rows, 0);
         assert!(report.require_evidence().is_err());
@@ -2172,6 +2280,7 @@ mod tests {
             &std::collections::BTreeSet::from(["ext4-journal"]),
             vec![run],
             executed_evidence::SourceIdentity::capture().ok(),
+            canonical_gates::CanonicalGateReport::empty(),
         );
         assert_eq!(report.evidence_backed_rows, 0);
         assert!(report.require_evidence().is_err());

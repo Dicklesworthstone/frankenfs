@@ -13,6 +13,20 @@
 > `bd-lc132`; do not interpret `97/97` as
 > successful execution or release readiness.
 >
+> **2026-09-11 canonical gate binding:** §22.1's seven gate commands are now
+> executed rather than assumed. `ffs-harness gates --all` runs each named command
+> through the same execution-evidence path the parity commands use, and either
+> public parity command accepts `--gate all` (or a single `gateN`) to run them
+> alongside its suites. Each gate reports `passed`, `failed`, or
+> `not_implemented`; a Cargo filter that selects zero tests is
+> `not_implemented` — never a pass — and `readiness_verified` requires every
+> capability row to carry executed evidence *and* every canonical gate to pass.
+> No `gateN` test exists in any owning crate yet, so all seven currently report
+> `not_implemented` together with the §22 criteria each one still has to prove.
+> The gate commands, their packages and their filters are pinned to the spec text
+> by `canonical_gates::tests::catalog_commands_equal_the_spec_document`, so the
+> catalog cannot drift from §22 silently.
+>
 > **Repair integration update:** explicit request contexts now reach attached
 > refresh lifecycles, and failed/cancelled refresh batches preserve pending work.
 > Scrub no longer regenerates symbols from detected corruption or recovers from
