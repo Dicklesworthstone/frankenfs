@@ -875,6 +875,16 @@ mod tests {
         }
     }
 
+    // Intentionally ignored protocol fixture: the parent verifies that libtest
+    // reports an ignored result instead of crediting it as an executed test.
+    #[test]
+    #[ignore = "child-only evidence protocol probe"]
+    fn ignored_evidence_child_probe() {
+        // An explicit --include-ignored run should remain valid. The parent
+        // checks libtest's ignored counts, not a planted failure in this body.
+        test_evidence_child_probe();
+    }
+
     fn child_test_evidence(case: &str, name: &str) -> TestRunEvidence {
         let executable = std::env::current_exe().unwrap();
         TestRunEvidence::run(
@@ -915,6 +925,16 @@ mod tests {
         assert_eq!(empty.execution.exit_code(), Some(0));
         assert_eq!(empty.results.selected, 0);
         assert!(empty.require_pass(&source).is_err());
+
+        let ignored = child_test_evidence(
+            "pass",
+            "executed_evidence::tests::ignored_evidence_child_probe",
+        );
+        assert_eq!(ignored.execution.exit_code(), Some(0));
+        assert_eq!(ignored.results.selected, 1);
+        assert_eq!(ignored.results.executed, 0);
+        assert_eq!(ignored.results.skipped, 1);
+        assert!(ignored.require_pass(&source).is_err());
 
         let mut other_source = source.clone();
         other_source.dirty_source_sha256.push('0');

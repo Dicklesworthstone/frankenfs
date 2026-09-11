@@ -1329,7 +1329,7 @@ enum Command {
         /// Output in JSON format.
         #[arg(long)]
         json: bool,
-        /// Execute a current contract suite: ext4-journal or ext4-reference.
+        /// Execute ext4-journal, ext4-reference, or the parity-honesty self-check.
         #[arg(long)]
         verify: Vec<String>,
         /// Run Cargo directly in CI or on an existing build worker.

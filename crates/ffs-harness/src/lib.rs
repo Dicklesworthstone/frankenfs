@@ -425,21 +425,47 @@ fn parse_capability_row(line: &str) -> Option<CapabilityRow> {
 #[must_use]
 pub fn capability_rows_from_feature_parity(markdown: &str) -> Vec<CapabilityRow> {
     let mut rows = Vec::new();
-    let mut in_capability_matrix = false;
+    let mut matrix_heading_level = None;
+    let mut in_capability_table = false;
 
     for line in markdown.lines() {
         let trimmed = line.trim();
+        let heading_level = trimmed.bytes().take_while(|&byte| byte == b'#').count();
+        let is_heading = (1..=6).contains(&heading_level)
+            && trimmed.as_bytes().get(heading_level) == Some(&b' ');
 
-        if trimmed.contains("Tracked Capability Matrix") {
-            in_capability_matrix = true;
+        if is_heading {
+            if let Some(level) = matrix_heading_level {
+                if heading_level <= level {
+                    break;
+                }
+            } else if trimmed[heading_level..].contains("Tracked Capability Matrix") {
+                matrix_heading_level = Some(heading_level);
+            }
+            in_capability_table = false;
             continue;
         }
 
-        if in_capability_matrix && trimmed.starts_with("###") {
-            break;
+        if matrix_heading_level.is_none() {
+            continue;
         }
 
-        if in_capability_matrix && let Some(row) = parse_capability_row(trimmed) {
+        if !trimmed.starts_with('|') {
+            in_capability_table = false;
+            continue;
+        }
+
+        let columns: Vec<_> = trimmed.split('|').map(str::trim).collect();
+        if columns.get(1) == Some(&"Capability")
+            && columns.get(2) == Some(&"Legacy Reference")
+            && columns.get(3) == Some(&"Status")
+            && columns.get(4) == Some(&"Notes")
+        {
+            in_capability_table = true;
+            continue;
+        }
+
+        if in_capability_table && let Some(row) = parse_capability_row(trimmed) {
             rows.push(row);
         }
     }
@@ -667,6 +693,7 @@ pub struct ExecutionGatedParityReport {
     pub missing_evidence_rows: Vec<String>,
     pub source: Option<executed_evidence::SourceIdentity>,
     pub contracts: Vec<VerifiedParityContract>,
+    pub selected_suites: Vec<String>,
     pub runs: Vec<executed_evidence::TestRunEvidence>,
     /// The selected contracts do not cover all canonical gate criteria.
     pub readiness_verified: bool,
@@ -740,6 +767,31 @@ const PARITY_CONTRACTS: &[(&str, &str, &str, &[&str])] = &[
         "ext4-reference",
         &["ext4_bitmap_free_space_matches_kernel"],
     ),
+    (
+        "ext4 inline data read",
+        "Inline i_block and system.data continuation bytes agree with debugfs",
+        "ext4-reference",
+        &["ext4_inline_data_continuation_kernel_reference"],
+    ),
+    (
+        "ext4 inode device read",
+        "OpenFs reads a generated large inode size matching debugfs",
+        "ext4-reference",
+        &["ext4_large_isize_high_matches_debugfs_and_openfs"],
+    ),
+];
+
+// These test the evidence consumer itself, not filesystem capability rows.
+// Exact names prevent a renamed or empty filter from becoming a green self-check.
+const PARITY_HONESTY_TESTS: &[&str] = &[
+    "tests::execution_gated_parity_report_requires_evidence",
+    "tests::execution_gated_parity_report_counts_only_green_evidence",
+    "tests::parity_honesty_fabricated_row_fails_closed",
+    "tests::parity_honesty_missing_run_fails_closed",
+    "tests::parity_honesty_failing_test_fails_closed",
+    "executed_evidence::tests::test_evidence_requires_real_nonempty_passing_tests",
+    "executed_evidence::tests::test_evidence_reads_rch_stderr_without_discarding_bad_events",
+    "executed_evidence::tests::test_evidence_rejects_malformed_duplicate_and_incomplete_streams",
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -755,8 +807,13 @@ impl ExecutionGatedParityReport {
     pub fn run(suites: &[String], executor: ParityExecutor) -> Result<Self> {
         let mut selected = std::collections::BTreeSet::new();
         for suite in suites {
-            if !matches!(suite.as_str(), "ext4-journal" | "ext4-reference") {
-                bail!("unknown parity suite {suite}; use ext4-journal or ext4-reference");
+            if !matches!(
+                suite.as_str(),
+                "ext4-journal" | "ext4-reference" | "parity-honesty"
+            ) {
+                bail!(
+                    "unknown parity suite {suite}; use ext4-journal, ext4-reference or parity-honesty"
+                );
             }
             if !selected.insert(suite.as_str()) {
                 bail!("duplicate parity suite {suite}");
@@ -764,26 +821,25 @@ impl ExecutionGatedParityReport {
         }
         let mut runs = Vec::new();
         for suite in &selected {
-            let target = match *suite {
-                "ext4-journal" => "ext4_journal_recovery",
-                "ext4-reference" => "kernel_reference",
+            let mut args = vec!["-Z", "checksum-freshness", "test", "-p", "ffs-harness"];
+            match *suite {
+                "ext4-journal" => args.extend(["--test", "ext4_journal_recovery"]),
+                "ext4-reference" => args.extend(["--test", "kernel_reference"]),
+                "parity-honesty" => args.push("--lib"),
                 _ => unreachable!("validated above"),
-            };
-            let mut args = vec![
-                "-Z",
-                "checksum-freshness",
-                "test",
-                "-p",
-                "ffs-harness",
-                "--test",
-                target,
+            }
+            args.extend([
                 "--",
                 "-Z",
                 "unstable-options",
                 "--format=json",
                 "--show-output",
                 "--test-threads=1",
-            ];
+            ]);
+            if *suite == "parity-honesty" {
+                args.push("--exact");
+                args.extend_from_slice(PARITY_HONESTY_TESTS);
+            }
             let command = match executor {
                 ParityExecutor::Rch => {
                     args.splice(0..0, ["exec", "--source-content-receipt", "--", "cargo"]);
@@ -855,6 +911,7 @@ impl ExecutionGatedParityReport {
             missing_evidence_rows,
             source,
             contracts,
+            selected_suites: selected.iter().map(|suite| (*suite).to_owned()).collect(),
             runs,
             readiness_verified: false,
         }
@@ -865,12 +922,26 @@ impl ExecutionGatedParityReport {
         if self.runs.is_empty() {
             return Err("no test suites executed; use --verify <suite>".to_owned());
         }
+        if self.runs.len() != self.selected_suites.len() {
+            return Err("selected suites do not match execution count".to_owned());
+        }
         let source = self.source.as_ref().ok_or("source identity unavailable")?;
         if &executed_evidence::SourceIdentity::capture()? != source {
             return Err("source changed after parity execution".to_owned());
         }
-        for run in &self.runs {
+        for (suite, run) in self.selected_suites.iter().zip(&self.runs) {
             run.require_pass(source)?;
+            if suite == "parity-honesty" {
+                for &test in PARITY_HONESTY_TESTS {
+                    if run.results().tests.get(test)
+                        != Some(&executed_evidence::TestOutcome::Passed)
+                    {
+                        return Err(format!(
+                            "required exact self-check missing or not passed: {test}"
+                        ));
+                    }
+                }
+            }
         }
         for contract in &self.contracts {
             if contract.reason.as_deref() != Some("suite not executed") && !contract.verified {
@@ -2021,6 +2092,21 @@ mod tests {
         assert_eq!(report.evidence_backed_rows, 0);
         assert_eq!(report.missing_evidence_rows.len(), report.total_rows);
         assert!(!report.readiness_verified);
+        for capability in [
+            "MVCC snapshot visibility",
+            "corruption recovery orchestrator + evidence ledger",
+            "FUSE read",
+            "CLI repair command",
+            "benchmark harness",
+        ] {
+            assert!(
+                report
+                    .missing_evidence_rows
+                    .iter()
+                    .any(|row| row == capability),
+                "unexecuted late capability must remain visible: {capability}"
+            );
+        }
     }
 
     #[test]
@@ -2040,13 +2126,15 @@ mod tests {
         );
         assert_eq!(run.results().passed, 1);
         assert!(run.results().error.is_none());
-        let report = ExecutionGatedParityReport::from_runs(
-            &std::collections::BTreeSet::from(["ext4-journal"]),
-            vec![run],
-            executed_evidence::SourceIdentity::capture().ok(),
-        );
-        assert!(report.require_evidence().is_err());
-        assert_eq!(report.evidence_backed_rows, 0);
+        for suite in ["ext4-journal", "parity-honesty"] {
+            let report = ExecutionGatedParityReport::from_runs(
+                &std::collections::BTreeSet::from([suite]),
+                vec![run.clone()],
+                executed_evidence::SourceIdentity::capture().ok(),
+            );
+            assert!(report.require_evidence().is_err(), "{suite}");
+            assert_eq!(report.evidence_backed_rows, 0);
+        }
     }
 
     #[test]
@@ -2241,6 +2329,66 @@ mod tests {
         assert!(!rows[0].has_test_citation);
         assert_eq!(rows[1].capability, "ext4 path resolution");
         assert!(rows[1].has_test_citation);
+    }
+
+    #[test]
+    fn capability_row_parser_preserves_subsections_and_excludes_other_tables() {
+        for next_heading in ["## 3. Other Section", "# Next Document"] {
+            let markdown = format!(
+                "\
+Prose mentioning Tracked Capability Matrix does not start the section.
+| Capability | Legacy Reference | Status | Notes |
+| outside-before | reference | Missing | unproven |
+
+## 2. Tracked Capability Matrix
+| Capability | Legacy Reference | Status | Notes |
+|------------|------------------|--------|-------|
+| first | reference | ✅ | unproven |
+
+### 2.1 Scenarios
+| Contract ID | Operation | Class | Expected Result |
+| scenario | operation | ✅ | success |
+
+#### 2.1.1 More Capabilities
+| Capability | Legacy Reference | Status | Notes |
+|------------|------------------|--------|-------|
+| missing feature | reference | Missing | unproven |
+| excluded feature | reference | Excluded | outside scope |
+
+{next_heading}
+| Capability | Legacy Reference | Status | Notes |
+| outside-after | reference | ✅ | unproven |
+"
+            );
+            let rows = capability_rows_from_feature_parity(&markdown);
+            let names: Vec<_> = rows.iter().map(|row| row.capability.as_str()).collect();
+            assert_eq!(names, ["first", "missing feature", "excluded feature"]);
+        }
+    }
+
+    #[test]
+    fn capability_row_parser_includes_canonical_late_families() {
+        let rows = capability_rows_from_feature_parity(FEATURE_PARITY_MARKDOWN);
+        for capability in [
+            "ext4 superblock decode",
+            "MVCC snapshot visibility",
+            "repair symbol storage I/O (dual-slot generation commit)",
+            "FUSE mount runtime",
+            "CLI repair command",
+            "benchmark harness",
+        ] {
+            assert_eq!(
+                rows.iter()
+                    .filter(|row| row.capability == capability)
+                    .count(),
+                1,
+                "capability must be counted exactly once: {capability}"
+            );
+        }
+        assert!(
+            rows.iter()
+                .all(|row| { !row.capability.starts_with('`') && row.capability != "Contract ID" })
+        );
     }
 
     #[test]

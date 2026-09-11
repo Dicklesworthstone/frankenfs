@@ -56438,8 +56438,20 @@ mod tests {
     #[test]
     fn btrfs_read_overlapping_extents_returns_corruption_without_output_mutation() {
         let payload = b"hello from btrfs fsops";
-        for (second_start, compression) in [(8_u64, 0), (22, 0), (32, 0), (8, 1), (22, 1), (32, 1)]
-        {
+        for (second_start, kind) in [
+            (8_u64, "regular"),
+            (22, "regular"),
+            (32, "regular"),
+            (8, "zlib"),
+            (22, "zlib"),
+            (32, "zlib"),
+            (8, "hole"),
+            (22, "hole"),
+            (32, "hole"),
+            (8, "prealloc"),
+            (22, "prealloc"),
+            (32, "prealloc"),
+        ] {
             let mut image = build_btrfs_fsops_image();
             let leaf = BTRFS_TEST_FS_TREE_LOGICAL;
             image[leaf + 0x60..leaf + 0x64].copy_from_slice(&5_u32.to_le_bytes());
@@ -56447,13 +56459,17 @@ mod tests {
                 BTRFS_TEST_FILE_DATA_LOGICAL as u64,
                 payload.len() as u64,
             );
-            if compression == 1 {
+            if kind == "zlib" {
                 let compressed = btrfs_test_zlib_compress(payload);
                 let data_start = BTRFS_TEST_FILE_DATA_LOGICAL + 4096;
                 image[data_start..data_start + compressed.len()].copy_from_slice(&compressed);
-                second[16] = compression;
+                second[16] = 1;
                 second[21..29].copy_from_slice(&(data_start as u64).to_le_bytes());
                 second[29..37].copy_from_slice(&(compressed.len() as u64).to_le_bytes());
+            } else if kind == "hole" {
+                second[21..37].fill(0);
+            } else if kind == "prealloc" {
+                second[20] = BTRFS_FILE_EXTENT_PREALLOC;
             }
             write_btrfs_leaf_item(
                 &mut image,
@@ -56478,7 +56494,10 @@ mod tests {
             let mut out = vec![0xA5; file_size];
             let result = fs.read_into(&cx, InodeNumber(257), 0, &mut out);
             if second_start == 8 {
-                assert!(matches!(result, Err(FfsError::Corruption { .. })));
+                assert!(
+                    matches!(result, Err(FfsError::Corruption { .. })),
+                    "{kind}: {result:?}, out={out:?}"
+                );
                 assert_eq!(out, vec![0xA5; file_size]);
                 assert!(matches!(
                     fs.read(&cx, InodeNumber(257), 0, file_size as u32),
@@ -56488,7 +56507,11 @@ mod tests {
                 assert_eq!(result.unwrap(), file_size);
                 let mut expected = payload.to_vec();
                 expected.resize(second_start as usize, 0);
-                expected.extend_from_slice(payload);
+                if matches!(kind, "hole" | "prealloc") {
+                    expected.resize(file_size, 0);
+                } else {
+                    expected.extend_from_slice(payload);
+                }
                 assert_eq!(out, expected);
             }
         }

@@ -3499,6 +3499,8 @@ cargo run -p ffs-cli -- parity --json
 # Execute named current contract suites (Cargo tests are routed through RCH).
 cargo run -p ffs-cli -- parity --json --verify ext4-journal
 cargo run -p ffs-harness -- parity --verify ext4-reference
+# Verify the evidence consumer against passing, failing, skipped and empty runs.
+cargo run -p ffs-harness -- parity --verify parity-honesty
 # On CI or an existing build worker, add --local to execute Cargo there.
 
 # Evidence ledger inspection (with operator presets)
@@ -3636,7 +3638,7 @@ The ext4 extent-tree implementation handles the full 4-level tree structure in ~
 
 Both public `parity` commands now separate `declared_contracts` from current
 execution. Without `--verify`, verified contract coverage is zero. The initial
-exact mappings cover seven bounded ext4 contracts across `ext4-journal` and
+exact mappings cover nine bounded ext4 contracts across `ext4-journal` and
 `ext4-reference`; remaining capability rows are reported as missing evidence.
 `--verify` captures named libtest results, source revision and dirty-source
 digest, command/build settings, output hashes, and pass/fail/skip counts. Empty,
@@ -3645,6 +3647,10 @@ are output artifacts and cannot be supplied as inputs to grant verification.
 Remote runs require RCH's source-content receipt for the invoked command, and
 Cargo uses checksum freshness when selecting test builds. `--local` is for CI
 or execution already on a worker.
+`parity-honesty` executes eight exact self-checks through the same consumer;
+CI requires them alongside the journal contracts. Its child processes exercise
+passing, failing, ignored, soft-skipped and zero-selected outcomes. These
+self-checks grant no filesystem capability credit.
 These scoped tests do not satisfy all canonical gates or establish readiness;
 the full mapping and gate integration remain tracked in `bd-wh1xk` / `bd-lc132`.
 
