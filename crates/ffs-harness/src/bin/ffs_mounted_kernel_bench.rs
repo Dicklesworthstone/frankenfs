@@ -672,6 +672,16 @@ struct Config {
     /// unindexed construction so both can be measured in one window on one ELF,
     /// and forces `BLOCKED_UNFAIR_FIXTURE` so it can never be quoted as a row.
     fixture_construction: FixtureConstruction,
+    /// Build and validate the fixture, then stop (bd-y0hzq).
+    ///
+    /// Fixture construction is load-independent — it creates files and checks the
+    /// resulting image — but the comparator normally reaches it only AFTER the
+    /// placement preflight, so a fixture-level defect cannot be diagnosed on a
+    /// host that is too busy to admit a measurement. This mode runs the same
+    /// `create_base_image` / `seed_fixture_through_mount` / `validate_image` calls,
+    /// reports their outcome, and exits. It takes no timing, mounts no arm, and
+    /// cannot produce a bankable row.
+    fixture_only: bool,
     output: Option<PathBuf>,
 }
 
@@ -774,6 +784,7 @@ impl Default for Config {
             harness_builder: String::new(),
             candidate_builder: String::new(),
             fixture_construction: FixtureConstruction::Seeded,
+            fixture_only: false,
             output: None,
         }
     }
@@ -1552,6 +1563,10 @@ is a transport it pays and we otherwise do not (bd-w2u82)\n\
            --fixture-construction MODE    seeded | baked (default seeded). `baked` restores the\n\
                                           pre-bd-plkzd unindexed fixture for ATTRIBUTION ONLY and\n\
                                           FORCES the BLOCKED_UNFAIR_FIXTURE verdict (bd-pb85e)\n\
+           --fixture-only                 Build and validate the fixture, print the result, and\n\
+                                          exit: no placement preflight, no arms, no timing, no\n\
+                                          bankable row. Fixture work is load-independent, which is\n\
+                                          what makes a fixture defect diagnosable on a busy host\n\
            --observation-repeats N        min-of-N repeats for read-only workloads (default 3)\n\
            --kernel-occupancy-padding N   UNTIMED extra batches per kernel-arm visit (default 0)\n\
            --fuse-occupancy-padding N     UNTIMED extra batches per FrankenFS-arm visit (default 0)\n\
@@ -1922,6 +1937,9 @@ fn apply_config_flag(
         }
         "--ffs-cli" => {
             config.ffs_cli = parse_value::<PathBuf>(args, index, "--ffs-cli")?;
+        }
+        "--fixture-only" => {
+            config.fixture_only = true;
         }
         "--fuse-transport" => {
             let value = parse_value::<String>(args, index, "--fuse-transport")?;
@@ -2931,12 +2949,20 @@ fn fixture_tree_bytes(config: &Config) -> u64 {
 /// directions. Saturating throughout — an overflow here must fail CLOSED (an
 /// unreachably large floor), never wrap to a small one.
 fn required_free_bytes(config: &Config) -> Result<u64> {
+    required_free_bytes_with_images(config, IMAGES_PER_FILESYSTEM)
+}
+
+/// Free-space floor for a given image count per filesystem.
+///
+/// `--fixture-only` stages one base image per filesystem instead of the full arm
+/// set, so it must not be held to the arm-set floor it never fills.
+fn required_free_bytes_with_images(config: &Config, images_per_filesystem: u64) -> Result<u64> {
     let image_bytes = config
         .image_size_mib
         .checked_mul(1024 * 1024)
         .ok_or_else(|| anyhow!("image byte count overflow"))?;
     let staged = requested_filesystem_count(config.filesystems)
-        .saturating_mul(IMAGES_PER_FILESYSTEM)
+        .saturating_mul(images_per_filesystem)
         .saturating_mul(image_bytes)
         .saturating_add(fixture_tree_bytes(config));
     Ok(staged
@@ -6120,10 +6146,62 @@ fn cgroup_cpuset_effective() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// How strictly a per-CPU frequency-provenance file must be readable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrequencyProvenance {
+    /// Every allowed CPU must expose the file.
+    EveryCpu,
+    /// Either every allowed CPU exposes the file, or none does.
+    ///
+    /// A virtualized host whose hypervisor owns frequency selection has no
+    /// cpufreq interface at all, so there is no governor or driver policy to
+    /// record. That is reported as `unavailable` — never as a policy that passed
+    /// — and the run remains comparable only to runs that say the same thing.
+    /// PARTIAL coverage stays a hard error: some CPUs exposing the interface and
+    /// others not is a real anomaly, unlike a host class where it cannot exist.
+    EveryCpuOrNone,
+    /// Any subset may be missing.
+    AnySubset,
+}
+
+/// Whether a provenance read satisfies its requirement.
+///
+/// Split out from the sysfs read so the accept/reject matrix is unit-testable on
+/// hosts that have a cpufreq interface and on hosts that do not.
+fn frequency_coverage_allowed(
+    filename: &str,
+    covered: usize,
+    allowed: usize,
+    requirement: FrequencyProvenance,
+) -> Result<()> {
+    ensure!(
+        covered <= allowed,
+        "{filename} provenance covers {covered} of {allowed} allowed CPUs"
+    );
+    match requirement {
+        FrequencyProvenance::AnySubset => Ok(()),
+        FrequencyProvenance::EveryCpu => {
+            ensure!(
+                covered == allowed,
+                "{filename} provenance covers {covered} of {allowed} allowed CPUs"
+            );
+            Ok(())
+        }
+        FrequencyProvenance::EveryCpuOrNone => {
+            ensure!(
+                covered == 0 || covered == allowed,
+                "{filename} provenance covers only {covered} of {allowed} allowed CPUs: partial \
+                 coverage is an anomaly. A host with no cpufreq interface covers none"
+            );
+            Ok(())
+        }
+    }
+}
+
 fn per_cpu_frequency_value(
     cpus: &BTreeSet<usize>,
     filename: &str,
-    required: bool,
+    requirement: FrequencyProvenance,
 ) -> Result<BTreeMap<usize, String>> {
     let mut values = BTreeMap::new();
     for &cpu in cpus {
@@ -6140,37 +6218,53 @@ fn per_cpu_frequency_value(
                 );
                 values.insert(cpu, value.to_owned());
             }
-            Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error)
+                if requirement != FrequencyProvenance::EveryCpu
+                    && error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("read CPU frequency policy {}", path.display()));
             }
         }
     }
-    if required {
-        ensure!(
-            values.len() == cpus.len(),
-            "{filename} provenance covers {} of {} allowed CPUs",
-            values.len(),
-            cpus.len()
-        );
-    }
+    frequency_coverage_allowed(filename, values.len(), cpus.len(), requirement)?;
     Ok(values)
 }
 
 fn cpu_frequency_policy(cpus: &BTreeSet<usize>) -> Result<CpuFrequencyPolicy> {
+    let drivers =
+        per_cpu_frequency_value(cpus, "scaling_driver", FrequencyProvenance::EveryCpuOrNone)?;
+    let governors = per_cpu_frequency_value(
+        cpus,
+        "scaling_governor",
+        FrequencyProvenance::EveryCpuOrNone,
+    )?;
+    ensure!(
+        drivers.is_empty() == governors.is_empty(),
+        "cpufreq driver and governor provenance disagree: {} driver values, {} governor values",
+        drivers.len(),
+        governors.len()
+    );
     Ok(CpuFrequencyPolicy {
-        drivers: per_cpu_frequency_value(cpus, "scaling_driver", true)?,
-        governors: per_cpu_frequency_value(cpus, "scaling_governor", true)?,
+        drivers,
+        governors,
         energy_performance_preferences: per_cpu_frequency_value(
             cpus,
             "energy_performance_preference",
-            false,
+            FrequencyProvenance::AnySubset,
         )?,
     })
 }
 
+/// Render the distinct provenance values, naming an absent interface out loud.
+///
+/// An empty map must never render as an empty string: that reads like a value
+/// nobody filled in. `unavailable` says the host has no cpufreq interface, which
+/// is a different claim from `performance` and has to look different.
 fn distinct_frequency_values(values: &BTreeMap<usize, String>) -> String {
+    if values.is_empty() {
+        return "unavailable".to_owned();
+    }
     values
         .values()
         .cloned()
@@ -7586,6 +7680,71 @@ fn wait_for_child(child: &mut Child, timeout: Duration) -> Result<()> {
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Build and validate the fixture for this configuration, then stop (bd-y0hzq).
+///
+/// This runs the same `create_base_image`, `seed_fixture_through_mount` and
+/// `validate_image` sequence the measured path runs, without the placement
+/// preflight, the arm mounts or any timing. Fixture construction is
+/// load-independent, so a fixture defect is diagnosable on a busy host — which is
+/// the only way a defect of this shape gets a cause instead of a guess.
+fn fixture_only_run(
+    config: &Config,
+    run_dir: &Path,
+    fixture_root: &Path,
+) -> Result<Option<PathBuf>> {
+    let interrupted = AtomicBool::new(false);
+    let requested = match config.filesystems {
+        RequestedFilesystems::Ext4 => vec![FilesystemKind::Ext4],
+        RequestedFilesystems::Btrfs => vec![FilesystemKind::Btrfs],
+        RequestedFilesystems::Both => vec![FilesystemKind::Ext4, FilesystemKind::Btrfs],
+    };
+    let mut fixtures = Vec::with_capacity(requested.len());
+    for kind in requested {
+        let base = create_base_image(kind, fixture_root, run_dir, config)?;
+        // A workload whose fixture directory is built through a kernel mount gets
+        // the same seeding and the same post-seed validation the measured path
+        // runs, against the same base image.
+        let mut seeded_through_mount = false;
+        if let Some(fixture) = SeededFixture::for_workload(config.workload) {
+            seed_fixture_through_mount(kind, &base, fixture, config.operations, &interrupted)?;
+            validate_image(kind, &base)?;
+            seeded_through_mount = true;
+        }
+        fixtures.push(json!({
+            "filesystem": kind.label(),
+            "base_image": base.display().to_string(),
+            "base_image_sha256": file_sha256(&base)?,
+            "image_size_mib": config.image_size_mib,
+            "operations": config.operations,
+            "workload": config.workload.label(),
+            "fixture_construction": config.fixture_construction.label(),
+            "seeded_through_mount": seeded_through_mount,
+            "validate": "pass",
+        }));
+    }
+    let fixture_count = fixtures.len();
+    let report = json!({
+        "schema_version": 1,
+        "mode": "fixture_only",
+        "note": "fixture construction and validation only: no placement preflight, no arms, no timing",
+        "fixtures": fixtures,
+    });
+    let output = config
+        .output
+        .clone()
+        .unwrap_or_else(|| run_dir.join("fixture-only-report.json"));
+    fs::write(
+        &output,
+        format!("{}\n", serde_json::to_string_pretty(&report)?),
+    )
+    .with_context(|| format!("write fixture-only report {}", output.display()))?;
+    println!(
+        "fixture_only,verdict=pass,fixtures={fixture_count},report={}",
+        output.display()
+    );
+    Ok(Some(output))
 }
 
 // This is the auditable four-arm transaction boundary. Splitting its context
@@ -9224,11 +9383,16 @@ fn run() -> Result<Option<PathBuf>> {
     );
 
     let free_before = free_bytes_for_artifacts(&config.artifact_root)?;
-    let free_floor = required_free_bytes(&config)?;
+    let images_per_filesystem = if config.fixture_only {
+        1
+    } else {
+        IMAGES_PER_FILESYSTEM
+    };
+    let free_floor = required_free_bytes_with_images(&config, images_per_filesystem)?;
     ensure!(
         free_before >= free_floor,
         "{} has {:.1} GiB free, below the {:.1} GiB abort floor this configuration \
-         requires ({} filesystem(s) x {IMAGES_PER_FILESYSTEM} images of \
+         requires ({} filesystem(s) x {images_per_filesystem} images of \
          {} MiB, plus a {:.1} GiB fixture tree, x{SCRATCH_SAFETY_FACTOR} safety, \
          plus a {:.0} GiB absolute reserve)",
         config.artifact_root.display(),
@@ -9256,6 +9420,9 @@ fn run() -> Result<Option<PathBuf>> {
         protect_report_dir_from_reclaim(report_dir, &scratch_dir);
     }
     let fixture_root = create_fixture_tree(&scratch_dir, &config)?;
+    if config.fixture_only {
+        return fixture_only_run(&config, &run_dir, &fixture_root);
+    }
     let placement = select_cpu_placement(
         config.client_threads(),
         config.fuse_cpu_count,
@@ -11884,6 +12051,44 @@ mod tests {
         assert!(!policy.governor_warning());
         policy.governors.insert(1, "powersave".to_owned());
         assert!(policy.governor_warning());
+    }
+
+    /// A host with no cpufreq interface at all (virtualized) must be able to run
+    /// and must SAY so; partial coverage stays a hard error.
+    #[test]
+    fn frequency_provenance_accepts_an_absent_interface_but_not_partial_coverage() {
+        use FrequencyProvenance::{AnySubset, EveryCpu, EveryCpuOrNone};
+        assert!(frequency_coverage_allowed("scaling_driver", 4, 4, EveryCpu).is_ok());
+        assert!(frequency_coverage_allowed("scaling_driver", 0, 4, EveryCpu).is_err());
+        assert!(frequency_coverage_allowed("scaling_driver", 3, 4, EveryCpu).is_err());
+        assert!(frequency_coverage_allowed("scaling_driver", 0, 4, EveryCpuOrNone).is_ok());
+        assert!(frequency_coverage_allowed("scaling_driver", 4, 4, EveryCpuOrNone).is_ok());
+        assert!(frequency_coverage_allowed("scaling_driver", 3, 4, EveryCpuOrNone).is_err());
+        assert!(frequency_coverage_allowed("scaling_driver", 1, 4, EveryCpuOrNone).is_err());
+        assert!(frequency_coverage_allowed("scaling_driver", 2, 4, AnySubset).is_ok());
+        assert!(frequency_coverage_allowed("scaling_driver", 0, 4, AnySubset).is_ok());
+        assert!(frequency_coverage_allowed("scaling_driver", 5, 4, AnySubset).is_err());
+    }
+
+    #[test]
+    fn absent_cpufreq_is_reported_as_unavailable_not_as_a_policy() {
+        let policy = CpuFrequencyPolicy {
+            drivers: BTreeMap::new(),
+            governors: BTreeMap::new(),
+            energy_performance_preferences: BTreeMap::new(),
+        };
+        let json = cpu_frequency_policy_json(&policy);
+        assert_eq!(json["distinct_drivers"], "unavailable");
+        assert_eq!(json["distinct_governors"], "unavailable");
+        assert_eq!(
+            json["distinct_energy_performance_preferences"],
+            "unavailable"
+        );
+        // Absence is not a governor claim in either direction: nothing is
+        // asserted to be `performance`, and no governor is called wrong.
+        assert_eq!(json["governors_by_cpu"], json!({}));
+        assert_eq!(json["non_performance_or_mixed_governor_warning"], false);
+        assert!(!policy.governor_warning());
     }
 
     #[test]
