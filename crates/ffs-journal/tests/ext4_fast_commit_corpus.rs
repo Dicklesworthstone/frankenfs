@@ -65,8 +65,9 @@ fn decode_hex_string(hex: &str) -> Vec<u8> {
 
 fn assert_expected_operation(actual: &FcOperation, expected: &ExpectedOperation) {
     match (actual, expected) {
-        (FcOperation::InodeUpdate(actual_ino, _raw), ExpectedOperation::InodeUpdate { ino }) => {
+        (FcOperation::InodeUpdate(actual_ino, raw), ExpectedOperation::InodeUpdate { ino }) => {
             assert_eq!(actual_ino, ino);
+            assert_eq!(raw, &corpus_inode_bytes());
         }
         (
             FcOperation::AddRange(actual),
@@ -81,6 +82,7 @@ fn assert_expected_operation(actual: &FcOperation, expected: &ExpectedOperation)
             assert_eq!(actual.logical_block, *logical_block);
             assert_eq!(actual.len, *len);
             assert_eq!(actual.physical_block, *physical_block);
+            assert!(!actual.unwritten);
         }
         (
             FcOperation::Create(actual),
@@ -94,15 +96,62 @@ fn assert_expected_operation(actual: &FcOperation, expected: &ExpectedOperation)
             assert_eq!(actual.ino, *ino);
             assert_eq!(actual.name, name.as_bytes());
         }
-        _ => panic!("operation mismatch: actual={actual:?} expected={expected:?}"),
+        _ => assert!(false, "operation mismatch: actual={actual:?} expected={expected:?}"),
     }
 }
 
 #[test]
-fn fast_commit_clean_replay_fixture_matches_oracle() {
+fn fast_commit_historical_malformed_fixtures_are_rejected() {
+    // Retain these historical payloads byte-for-byte: their old expected
+    // success is evidence of the former parser defect, not a kernel oracle.
+    for name in [
+        "ext4_fast_commit_clean_replay.json",
+        "ext4_fast_commit_fallback_missing_tail.json",
+    ] {
+        let fixture = load_fixture(name);
+        let bytes = decode_hex_string(&fixture.fast_commit_hex);
+        assert_eq!(&bytes[..4], &[9, 0, 16, 0]);
+        let error = replay_fast_commit(&bytes, 256)
+            .expect_err("historical oversized HEAD must not be accepted");
+        assert!(matches!(error, ffs_error::FfsError::Corruption { .. }));
+    }
+}
+
+fn corpus_inode_bytes() -> Vec<u8> {
+    let mut inode = vec![0; 128];
+    inode[..2].copy_from_slice(&0o100_644_u16.to_le_bytes());
+    inode[0x1a..0x1c].copy_from_slice(&1_u16.to_le_bytes());
+    inode
+}
+
+fn length_valid_stream() -> Vec<u8> {
+    // A constructed parser regression, not a kernel-generated crash image.
+    // Tag IDs/layouts come from Linux v6.19 fast_commit.h; CRC verification
+    // remains outside this parser's current contract.
+    let mut bytes = Vec::new();
+    let mut tag = |id: u16, payload: &[u8]| {
+        bytes.extend_from_slice(&id.to_le_bytes());
+        bytes.extend_from_slice(&u16::try_from(payload.len()).unwrap().to_le_bytes());
+        bytes.extend_from_slice(payload);
+    };
+    tag(9, &[0, 0, 0, 0, 7, 0, 0, 0]);
+    let mut inode = 42_u32.to_le_bytes().to_vec();
+    inode.extend(corpus_inode_bytes());
+    tag(6, &inode);
+    tag(
+        1,
+        &[42, 0, 0, 0, 100, 0, 0, 0, 10, 0, 0, 0, 0x88, 0x13, 0, 0],
+    );
+    tag(3, &[2, 0, 0, 0, 11, 0, 0, 0, b'h', b'e', b'l', b'l', b'o']);
+    tag(8, &[7, 0, 0, 0, 0, 0, 0, 0]);
+    bytes
+}
+
+#[test]
+fn fast_commit_length_valid_stream_preserves_operations() {
     let fixture = load_fixture("ext4_fast_commit_clean_replay.json");
-    let bytes = decode_hex_string(&fixture.fast_commit_hex);
-    let replay = replay_fast_commit(&bytes).expect("replay should succeed");
+    let bytes = length_valid_stream();
+    let replay = replay_fast_commit(&bytes, 256).expect("replay should succeed");
 
     assert_eq!(fixture.scenario_id, "ext4_fast_commit_clean_replay");
     assert!(
@@ -130,8 +179,10 @@ fn fast_commit_clean_replay_fixture_matches_oracle() {
 #[test]
 fn fast_commit_missing_tail_fixture_forces_fallback() {
     let fixture = load_fixture("ext4_fast_commit_fallback_missing_tail.json");
-    let bytes = decode_hex_string(&fixture.fast_commit_hex);
-    let replay = replay_fast_commit(&bytes).expect("replay should succeed");
+    let mut bytes = length_valid_stream();
+    // Remove exactly the final TAIL TLV, leaving the same complete operations.
+    bytes.truncate(bytes.len() - 12);
+    let replay = replay_fast_commit(&bytes, 256).expect("replay should succeed");
 
     assert_eq!(
         fixture.scenario_id,

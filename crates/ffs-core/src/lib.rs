@@ -7419,8 +7419,13 @@ impl OpenFs {
         &self,
         cx: &Cx,
     ) -> Result<Option<Ext4FastCommitReplayEvidence>, FfsError> {
-        let (block_size, journal_inum, journal_dev) = match self.ext4_superblock() {
-            Some(sb) => (sb.block_size, sb.journal_inum, sb.journal_dev),
+        let (block_size, journal_inum, journal_dev, inode_size) = match self.ext4_superblock() {
+            Some(sb) => (
+                sb.block_size,
+                sb.journal_inum,
+                sb.journal_dev,
+                sb.inode_size,
+            ),
             None => return Ok(None),
         };
 
@@ -7447,7 +7452,7 @@ impl OpenFs {
             return Ok(None);
         }
 
-        let replay = replay_fast_commit(&fc_bytes)?;
+        let replay = replay_fast_commit(&fc_bytes, inode_size)?;
         let evidence = Ext4FastCommitReplayEvidence {
             reserved_fc_blocks: journal_sb.num_fc_blocks,
             bytes_collected: u64::try_from(fc_bytes.len()).unwrap_or(u64::MAX),
@@ -46503,7 +46508,7 @@ mod tests {
         assert_eq!(fc.replay.blocks_scanned, 1);
         assert_eq!(
             fc.replay.operations,
-            vec![ffs_journal::FcOperation::InodeUpdate(42, Vec::new())]
+            vec![ffs_journal::FcOperation::InodeUpdate(42, vec![0; 128])]
         );
 
         let target = fs.read_block_vec(&cx, BlockNumber(15)).unwrap();
@@ -47127,6 +47132,50 @@ mod tests {
     }
 
     #[test]
+    fn fast_commit_open_rejects_invalid_tlv_lengths_preserving_recovery_records() {
+        let cx = Cx::for_testing();
+        for raw_len in [0, 1, 127, 257] {
+            for committed_prefix in [false, true] {
+                let mut image = build_ext4_image_with_fast_commit_create_evidence();
+                let mut stream = if committed_prefix {
+                    build_fc_create_transaction(2, 11, b"hello.txt", 1)
+                } else {
+                    Vec::new()
+                };
+                stream.extend(build_fc_tag(9, &[0; 8]));
+                let mut inode = 11_u32.to_le_bytes().to_vec();
+                inode.resize(4 + raw_len, 0);
+                stream.extend(build_fc_tag(6, &inode));
+                stream.extend(build_fc_tag(8, &[1, 0, 0, 0, 0, 0, 0, 0]));
+                image[24 * 4096..26 * 4096].fill(0);
+                image[24 * 4096..24 * 4096 + stream.len()].copy_from_slice(&stream);
+                for mode in [
+                    Ext4JournalReplayMode::Apply,
+                    Ext4JournalReplayMode::SimulateOverlay,
+                ] {
+                    let device = TestDevice::from_vec(image.clone());
+                    let view = device.clone();
+                    let options = OpenOptions {
+                        ext4_journal_replay_mode: mode,
+                        ..OpenOptions::default()
+                    };
+                    for _ in 0..2 {
+                        let error = OpenFs::from_device(&cx, Box::new(device.clone()), &options)
+                            .expect_err("a complete malformed inode TLV must stop recovery");
+                        assert!(matches!(error, FfsError::Corruption { .. }));
+                        let after = view.snapshot_bytes();
+                        assert_eq!(&after[24 * 4096..26 * 4096], &image[24 * 4096..26 * 4096]);
+                        assert_eq!(&after[4 * 4096..5 * 4096], &image[4 * 4096..5 * 4096]);
+                        if mode == Ext4JournalReplayMode::SimulateOverlay {
+                            assert_eq!(after, image);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn fast_commit_apply_rejects_fallback_that_would_discard_committed_prefix() {
         let mut image = build_ext4_image_with_fast_commit_create_evidence();
         let payload = build_fc_create_transaction(2, 11, b"hello.txt", 1);
@@ -47361,8 +47410,8 @@ mod tests {
         assert_eq!(
             fc.replay.operations,
             vec![
-                ffs_journal::FcOperation::InodeUpdate(42, Vec::new()),
-                ffs_journal::FcOperation::InodeUpdate(43, Vec::new()),
+                ffs_journal::FcOperation::InodeUpdate(42, vec![0; 128]),
+                ffs_journal::FcOperation::InodeUpdate(43, vec![0; 128]),
             ]
         );
     }
@@ -48738,8 +48787,10 @@ mod tests {
 
     fn build_fc_inode_update_transaction(ino: u32, tid: u32) -> Vec<u8> {
         let mut bytes = Vec::new();
-        bytes.extend(build_fc_tag(0x09, &[0; 16]));
-        bytes.extend(build_fc_tag(0x06, &ino.to_le_bytes()));
+        bytes.extend(build_fc_tag(0x09, &[0; 8]));
+        let mut payload = ino.to_le_bytes().to_vec();
+        payload.extend_from_slice(&[0; 128]);
+        bytes.extend(build_fc_tag(0x06, &payload));
         let mut tail = [0_u8; 8];
         tail[..4].copy_from_slice(&tid.to_le_bytes());
         bytes.extend(build_fc_tag(0x08, &tail));
@@ -48748,7 +48799,7 @@ mod tests {
 
     fn build_fc_create_transaction(parent_ino: u32, ino: u32, name: &[u8], tid: u32) -> Vec<u8> {
         let mut bytes = Vec::new();
-        bytes.extend(build_fc_tag(0x09, &[0; 16]));
+        bytes.extend(build_fc_tag(0x09, &[0; 8]));
         let mut payload = Vec::with_capacity(8 + name.len());
         payload.extend_from_slice(&parent_ino.to_le_bytes());
         payload.extend_from_slice(&ino.to_le_bytes());
@@ -49072,9 +49123,8 @@ mod tests {
     fn build_ext4_image_with_truncated_fast_commit_evidence() -> Vec<u8> {
         let mut image = build_ext4_image_with_fast_commit_evidence();
         let fc_block = 24 * 4096;
-        let mut truncated = Vec::new();
-        truncated.extend(build_fc_tag(0x09, &[0; 16]));
-        truncated.extend(build_fc_tag(0x06, &42_u32.to_le_bytes()));
+        let mut truncated = build_fc_inode_update_transaction(42, 1);
+        truncated.truncate(truncated.len() - 12); // Remove only the TAIL TLV.
         image[fc_block..fc_block + 4096].fill(0);
         image[fc_block..fc_block + truncated.len()].copy_from_slice(&truncated);
         image
