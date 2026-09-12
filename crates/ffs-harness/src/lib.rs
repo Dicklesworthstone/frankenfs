@@ -1162,6 +1162,73 @@ const PARITY_CONTRACTS: &[(&str, &str, &str, &[&str])] = &[
         "profile-artifacts",
         &["canonical_profile_artifacts_are_committed_and_structured"],
     ),
+    (
+        "btrfs scrub parity",
+        "Btrfs scrub leaves unallocated zero blocks alone, still detects a zeroed \
+         superblock, and its validator agrees with the composite check on \
+         representative blocks",
+        "repair-lib",
+        &[
+            "scrub::tests::btrfs_scrub_does_not_flag_unallocated_zero_blocks",
+            "scrub::tests::btrfs_scrub_still_detects_zeroed_superblock",
+            "scrub::tests::btrfs_scrub_validator_matches_composite_on_representative_blocks",
+        ],
+    ),
+    (
+        "format-aware scrub superblock validation",
+        "The btrfs superblock validator accepts a valid superblock and backup mirror \
+         and detects checksum corruption, a corrupt mirror, and a mirror carrying the \
+         wrong bytenr, skipping mirrors outside the filesystem",
+        "repair-lib",
+        &[
+            "scrub::tests::btrfs_superblock_validator_accepts_valid_superblock",
+            "scrub::tests::btrfs_superblock_validator_detects_checksum_corruption",
+            "scrub::tests::btrfs_superblock_validator_detects_corrupt_backup_mirror",
+            "scrub::tests::btrfs_superblock_validator_detects_mirror_with_wrong_bytenr",
+            "scrub::tests::btrfs_superblock_validator_skips_mirror_outside_filesystem",
+        ],
+    ),
+    (
+        "durability policy model",
+        "The adaptive policy switches to eager on the posterior, its clamp preserves \
+         the metadata expected loss, it controls the symbol refresh count, and the lazy \
+         policy defers refresh until a scrub or timeout",
+        "repair-lib",
+        &[
+            "pipeline::tests::adaptive_policy_switches_eager_based_on_posterior",
+            "pipeline::tests::adaptive_policy_clamp_preserves_metadata_expected_loss",
+            "pipeline::tests::adaptive_policy_controls_symbol_refresh_count",
+            "pipeline::tests::lazy_policy_defers_refresh_until_scrub_or_timeout",
+        ],
+    ),
+    (
+        "ext4 fallocate range operations",
+        "Collapse and insert preserve preallocated zeros and data, refuse misaligned or \
+         out-of-range requests including one past the maximum file size, and invalid \
+         mode combinations are rejected",
+        "core-lib",
+        &[
+            "tests::ext4_collapse_range_preserves_preallocated_zeros_and_data",
+            "tests::ext4_insert_range_preserves_preallocated_zeros_and_data",
+            "tests::ext4_fallocate_collapse_range_rejects_misaligned_and_eof_reaching",
+            "tests::ext4_fallocate_insert_range_rejects_misaligned_and_past_eof",
+            "tests::ext4_fallocate_insert_range_past_max_file_size_returns_efbig_bd_a3fh8",
+            "tests::ext4_fallocate_rejects_invalid_mode_combinations",
+        ],
+    ),
+    (
+        "CLI dump command",
+        "The dump command parses its arguments and builds the directory, group and \
+         inode projections from a btrfs image",
+        "cli-bins",
+        &[
+            "tests::build_dump_dir_output_btrfs_returns_vfs_directory_projection",
+            "tests::build_dump_dir_output_btrfs_hex_returns_dir_index_payloads",
+            "tests::build_dump_group_output_btrfs_returns_chunk_mapping",
+            "tests::build_dump_inode_output_btrfs_reads_root_inode_alias",
+            "tests::cli_parses_dump_dir_command_with_hex",
+        ],
+    ),
 ];
 
 // These test the evidence consumer itself, not filesystem capability rows.
@@ -1290,6 +1357,18 @@ const PARITY_SUITES: &[ParitySuite] = &[
             "storage::tests::storage_multi_generation_upgrade",
             "pipeline::tests::evidence_ledger_captures_all_events",
             "pipeline::tests::recovery_succeeds_with_fresh_symbols_under_write_churn",
+            "scrub::tests::btrfs_scrub_does_not_flag_unallocated_zero_blocks",
+            "scrub::tests::btrfs_scrub_still_detects_zeroed_superblock",
+            "scrub::tests::btrfs_scrub_validator_matches_composite_on_representative_blocks",
+            "scrub::tests::btrfs_superblock_validator_accepts_valid_superblock",
+            "scrub::tests::btrfs_superblock_validator_detects_checksum_corruption",
+            "scrub::tests::btrfs_superblock_validator_detects_corrupt_backup_mirror",
+            "scrub::tests::btrfs_superblock_validator_detects_mirror_with_wrong_bytenr",
+            "scrub::tests::btrfs_superblock_validator_skips_mirror_outside_filesystem",
+            "pipeline::tests::adaptive_policy_switches_eager_based_on_posterior",
+            "pipeline::tests::adaptive_policy_clamp_preserves_metadata_expected_loss",
+            "pipeline::tests::adaptive_policy_controls_symbol_refresh_count",
+            "pipeline::tests::lazy_policy_defers_refresh_until_scrub_or_timeout",
         ],
     },
     // The FUSE rows are proven at the dispatch boundary, which is where the FUSE
@@ -1390,6 +1469,34 @@ const PARITY_SUITES: &[ParitySuite] = &[
         package: "ffs-harness",
         targets: &["--test", "profile_artifacts"],
         exact: &["canonical_profile_artifacts_are_committed_and_structured"],
+    },
+    // ffs-core owns the high-level file operations the ext4 range rows describe.
+    ParitySuite {
+        id: "core-lib",
+        package: "ffs-core",
+        targets: &["--lib"],
+        exact: &[
+            "tests::ext4_collapse_range_preserves_preallocated_zeros_and_data",
+            "tests::ext4_insert_range_preserves_preallocated_zeros_and_data",
+            "tests::ext4_fallocate_collapse_range_rejects_misaligned_and_eof_reaching",
+            "tests::ext4_fallocate_insert_range_rejects_misaligned_and_past_eof",
+            "tests::ext4_fallocate_insert_range_past_max_file_size_returns_efbig_bd_a3fh8",
+            "tests::ext4_fallocate_rejects_invalid_mode_combinations",
+        ],
+    },
+    // The dump command's behavior is unit-tested inside the binary, not in the
+    // end-to-end target, so this suite selects those tests explicitly.
+    ParitySuite {
+        id: "cli-bins",
+        package: "ffs-cli",
+        targets: &["--bins"],
+        exact: &[
+            "tests::build_dump_dir_output_btrfs_returns_vfs_directory_projection",
+            "tests::build_dump_dir_output_btrfs_hex_returns_dir_index_payloads",
+            "tests::build_dump_group_output_btrfs_returns_chunk_mapping",
+            "tests::build_dump_inode_output_btrfs_reads_root_inode_alias",
+            "tests::cli_parses_dump_dir_command_with_hex",
+        ],
     },
 ];
 

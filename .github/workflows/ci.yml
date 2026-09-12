@@ -128,6 +128,8 @@ jobs:
             --verify ondisk-lib \
             --verify fuse-lib \
             --verify cli-e2e \
+            --verify cli-bins \
+            --verify core-lib \
             --verify btrfs-lib \
             --verify conformance \
             --verify profile-artifacts \
