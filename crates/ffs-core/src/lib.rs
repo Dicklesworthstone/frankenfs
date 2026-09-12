@@ -9882,6 +9882,32 @@ impl OpenFs {
         })
     }
 
+    /// Block-group flags a chunk is registered with for the in-memory allocator.
+    ///
+    /// The mask MUST include [`BTRFS_BLOCK_GROUP_SYSTEM`]. Masking with
+    /// DATA|METADATA alone collapses a `SYSTEM|DUP` chunk (type `2|32 = 34`,
+    /// `34 & 5 = 0`) to zero, and the `== 0` fallback then registers that chunk as
+    /// a DATA block group — after which `alloc_data` hands out data extents inside
+    /// the SYSTEM chunk's logical range. `btrfs check` reports one
+    /// `type mismatch with chunk` per such extent while the kernel still mounts
+    /// and reads the image, so the mis-accounting of the chunk that carries the
+    /// system array is silent. Measured on a fixture whose SYSTEM chunk is 8 MiB:
+    /// seven 1 MiB data extents landed in it (bd-y0hzq), and `02cc006d`
+    /// (bd-hk5w3) is the commit that added SYSTEM to this mask.
+    ///
+    /// The fallback stays for chunks carrying none of the three type bits: those
+    /// are unrecognised rather than system space, and DATA is the conservative
+    /// reading of an unknown chunk.
+    fn btrfs_block_group_alloc_flags(chunk_type: u64) -> u64 {
+        let typed = chunk_type
+            & (BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_SYSTEM);
+        if typed == 0 {
+            BTRFS_BLOCK_GROUP_DATA
+        } else {
+            typed
+        }
+    }
+
     fn block_bitmap_units_per_group(geo: &FsGeometry) -> u32 {
         if geo
             .feature_ro_compat
@@ -9994,13 +10020,7 @@ impl OpenFs {
             } else {
                 0
             };
-            let alloc_flags = chunk.chunk_type
-                & (BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_SYSTEM);
-            let alloc_flags = if alloc_flags == 0 {
-                BTRFS_BLOCK_GROUP_DATA
-            } else {
-                alloc_flags
-            };
+            let alloc_flags = Self::btrfs_block_group_alloc_flags(chunk.chunk_type);
             extent_alloc.add_block_group(
                 chunk.key.offset,
                 BtrfsBlockGroupItem {
@@ -57652,6 +57672,47 @@ mod tests {
         assert_eq!(
             OpenFs::btrfs_dir_type_to_file_type(0xFF),
             FileType::RegularFile
+        );
+    }
+
+    #[test]
+    fn btrfs_system_chunks_are_not_registered_as_data_block_groups() {
+        // bd-y0hzq: a SYSTEM|DUP chunk is type 2|32 = 34. Masking with DATA|METADATA
+        // alone gives 34 & 5 = 0, the `== 0` fallback then registers the chunk as a
+        // DATA block group, and the data allocator fills the system chunk with 1 MiB
+        // data extents — which `btrfs check` reports as one "type mismatch with
+        // chunk" per extent. bd-hk5w3 (02cc006d) fixed the mask; this pins it.
+        use ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_DUP;
+        assert_eq!(
+            OpenFs::btrfs_block_group_alloc_flags(BTRFS_BLOCK_GROUP_SYSTEM | BTRFS_BLOCK_GROUP_DUP),
+            BTRFS_BLOCK_GROUP_SYSTEM,
+            "a SYSTEM chunk must never be offered to the data allocator"
+        );
+        assert_eq!(
+            OpenFs::btrfs_block_group_alloc_flags(
+                BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_DUP
+            ),
+            BTRFS_BLOCK_GROUP_METADATA
+        );
+        assert_eq!(
+            OpenFs::btrfs_block_group_alloc_flags(BTRFS_BLOCK_GROUP_DATA),
+            BTRFS_BLOCK_GROUP_DATA
+        );
+        // A mixed DATA|METADATA chunk keeps both bits, and profile bits are dropped.
+        assert_eq!(
+            OpenFs::btrfs_block_group_alloc_flags(
+                BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA
+            ),
+            BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA
+        );
+        // A chunk carrying no type bit at all is unrecognised, not system space.
+        assert_eq!(
+            OpenFs::btrfs_block_group_alloc_flags(BTRFS_BLOCK_GROUP_DUP),
+            BTRFS_BLOCK_GROUP_DATA
+        );
+        assert_eq!(
+            OpenFs::btrfs_block_group_alloc_flags(0),
+            BTRFS_BLOCK_GROUP_DATA
         );
     }
 

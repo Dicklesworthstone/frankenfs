@@ -170,6 +170,15 @@ const DEFAULT_HOST_QUIET_SAMPLES: usize = 5;
 const DEFAULT_HOST_QUIET_TIMEOUT_MS: u64 = 300_000;
 const MAX_HOST_QUIET_SAMPLES: usize = 60;
 const MAX_HOST_QUIET_TIMEOUT_MS: u64 = 900_000;
+/// Where arm mountpoints live.
+///
+/// `/tmp` is not a style choice: AppArmor's `fusermount3` profile permits mounts
+/// only under `$HOME/**`, `/mnt/**`, `/media/**`, `/tmp/**` and
+/// `$XDG_RUNTIME_DIR/**` (with `nosuid,nodev` and no `allow_other`). A mountpoint
+/// anywhere else fails with `fusermount3: mount failed: Permission denied` and the
+/// real reason appears only in `dmesg` as `apparmor="DENIED" ... info="failed
+/// mntpnt match"`, which reads like a permissions bug in the caller. The same rule
+/// applies to any ad-hoc `ffs mount` used to reproduce a fixture defect.
 const MOUNT_ROOT: &str = "/tmp/frankenfs-mounted-kernel-mounts";
 const DEFAULT_PARALLEL_THREADS: usize = 8;
 /// One daemon CPU is what every banked row was measured at; see `Config::fuse_cpu_count`.
@@ -1578,10 +1587,29 @@ is a transport it pays and we otherwise do not (bd-w2u82)\n\
            --pre-measurement-settle-ms N  Untimed delay after durable fixture setup (default 1000)\n\
            --host-quiet-samples N         Consecutive clear host-wide samples (default 5)\n\
            --host-quiet-timeout-ms N      Fail-closed quiet-window timeout (default 300000)\n\
-           --harness-builder ID           Machine that built this driver ELF (required)\n\
-           --candidate-builder ID         Machine that built the candidate ELF (required)\n\
+           --harness-builder ID           Machine that built this driver ELF (required unless\n\
+                                          --fixture-only)\n\
+           --candidate-builder ID         Machine that built the candidate ELF (required unless\n\
+                                          --fixture-only)\n\
            --out PATH                     JSON report path (default inside run dir)\n\
-           -h, --help                     Show this help"
+           -h, --help                     Show this help\n\
+\n\
+         Environment notes, all measured on hosts this ran on:\n\
+\n\
+         * Mountpoints are created under /tmp/frankenfs-mounted-kernel-mounts. That is\n\
+           not a preference: AppArmor's fusermount3 profile allows mounts only under\n\
+           $HOME/**, /mnt/**, /media/**, /tmp/** and $XDG_RUNTIME_DIR/**. Elsewhere the\n\
+           mount fails with a bare \"Permission denied\" whose cause is only in dmesg.\n\
+         * A host with NO cpufreq interface (a VM where the hypervisor owns frequency\n\
+           selection) is allowed to run. It records cpu_frequency_drivers and\n\
+           scaling_governors as `unavailable`, which is a different claim from\n\
+           `performance`; a host where SOME CPUs expose the interface and others do not\n\
+           is still refused, because that is an anomaly rather than a host class.\n\
+         * The disk floor is 4 x (filesystems x 7 images x --image-size-mib) plus a\n\
+           40 GiB absolute reserve, checked before anything is created. --fixture-only\n\
+           needs one image per filesystem instead of the arm set.\n\
+         * --fixture-only needs no candidate ELF, no builders and no quiet window: it\n\
+           builds and validates the fixture only, takes no timing, and cannot be banked."
     );
 }
 
@@ -1696,6 +1724,9 @@ fn bulk_durable_total_bytes(operations: usize) -> Result<usize> {
 /// a remote worker and copied to this host. Record which worker produced
 /// each one: a binary of unknown origin is not evidence.
 fn validate_builder_provenance(config: &Config) -> Result<()> {
+    if config.fixture_only {
+        return Ok(());
+    }
     for (value, flag) in [
         (&config.harness_builder, "--harness-builder"),
         (&config.candidate_builder, "--candidate-builder"),
@@ -1731,6 +1762,13 @@ fn validate_candidate_comparison(comparison: &CandidateComparison) -> Result<()>
 /// silently changing what a mutating row measures. Mutating rows also require a
 /// single repeat so every timed row has one durability boundary.
 fn validate_mutating_workload_rules(config: &Config) -> Result<()> {
+    // Both rules below protect TIMED rows: padding would advance filesystem state
+    // outside the timed contract, and a single repeat is what gives each mutating
+    // row one durability boundary. `--fixture-only` takes no timing at all, so a
+    // mutating workload there is only a fixture shape.
+    if config.fixture_only {
+        return Ok(());
+    }
     ensure!(
         !config.workload.is_mutating()
             || (config.kernel_occupancy_padding == 0 && config.fuse_occupancy_padding == 0),
@@ -1794,15 +1832,21 @@ fn validate_durable_overwrite_image_capacity(config: &Config) -> Result<()> {
 }
 
 fn validate_config(config: &Config) -> Result<()> {
-    ensure!(
-        !config.ffs_cli.as_os_str().is_empty(),
-        "--ffs-cli is required"
-    );
-    ensure!(
-        config.ffs_cli.is_file(),
-        "ffs-cli does not exist: {}",
-        config.ffs_cli.display()
-    );
+    // `--fixture-only` never executes a candidate: it builds and validates an
+    // image. Requiring a production ELF (and its builder pedigree) for that would
+    // be exactly the coupling this mode exists to remove, so those checks are
+    // skipped when the run cannot produce a measurement at all.
+    if !config.fixture_only {
+        ensure!(
+            !config.ffs_cli.as_os_str().is_empty(),
+            "--ffs-cli is required"
+        );
+        ensure!(
+            config.ffs_cli.is_file(),
+            "ffs-cli does not exist: {}",
+            config.ffs_cli.display()
+        );
+    }
     validate_builder_provenance(config)?;
     // bd-zth9k: refuse an invocation whose --client-threads cannot take effect.
     // It used to be parsed, validated and silently discarded, so the run executed
@@ -2941,6 +2985,17 @@ fn fixture_tree_bytes(config: &Config) -> u64 {
         .saturating_mul(per_entry)
 }
 
+/// Free-space floor for a full arm set, as the floor tests pin it.
+///
+/// Production code computes the image count explicitly (see
+/// [`required_free_bytes_with_images`]) because `--fixture-only` stages one image
+/// per filesystem instead of the arm set, so this wrapper is only reached from
+/// tests now.
+#[cfg(test)]
+fn required_free_bytes(config: &Config) -> Result<u64> {
+    required_free_bytes_with_images(config, IMAGES_PER_FILESYSTEM)
+}
+
 /// Free bytes `/data` must have before this configuration may start
 /// (bd-btrfs-warm-stat-5x-9pxn1).
 ///
@@ -2948,11 +3003,6 @@ fn fixture_tree_bytes(config: &Config) -> u64 {
 /// [`ABSOLUTE_FREE_RESERVE_BYTES`] for why a flat constant was wrong in both
 /// directions. Saturating throughout — an overflow here must fail CLOSED (an
 /// unreachably large floor), never wrap to a small one.
-fn required_free_bytes(config: &Config) -> Result<u64> {
-    required_free_bytes_with_images(config, IMAGES_PER_FILESYSTEM)
-}
-
-/// Free-space floor for a given image count per filesystem.
 ///
 /// `--fixture-only` stages one base image per filesystem instead of the full arm
 /// set, so it must not be held to the arm-set floor it never fills.
@@ -7692,6 +7742,7 @@ fn wait_for_child(child: &mut Child, timeout: Duration) -> Result<()> {
 fn fixture_only_run(
     config: &Config,
     run_dir: &Path,
+    scratch_dir: &Path,
     fixture_root: &Path,
 ) -> Result<Option<PathBuf>> {
     let interrupted = AtomicBool::new(false);
@@ -7702,16 +7753,24 @@ fn fixture_only_run(
     };
     let mut fixtures = Vec::with_capacity(requested.len());
     for kind in requested {
-        let base = create_base_image(kind, fixture_root, run_dir, config)?;
+        // Mirror `fs_report`: the base image belongs under the scratch root, which
+        // `prepare_scratch_dir` clears at the start of every invocation. Passing the
+        // artifact run dir here instead put the image outside that clearing and a
+        // second invocation in the same artifact root died on EEXIST creating it.
+        let fs_dir = scratch_dir.join(kind.label());
+        fs::create_dir(&fs_dir).with_context(|| format!("create {}", fs_dir.display()))?;
+        let base = create_base_image(kind, fixture_root, &fs_dir, config)?;
         // A workload whose fixture directory is built through a kernel mount gets
         // the same seeding and the same post-seed validation the measured path
         // runs, against the same base image.
-        let mut seeded_through_mount = false;
-        if let Some(fixture) = SeededFixture::for_workload(config.workload) {
-            seed_fixture_through_mount(kind, &base, fixture, config.operations, &interrupted)?;
-            validate_image(kind, &base)?;
-            seeded_through_mount = true;
-        }
+        let seeded_through_mount =
+            if let Some(fixture) = SeededFixture::for_workload(config.workload) {
+                seed_fixture_through_mount(kind, &base, fixture, config.operations, &interrupted)?;
+                validate_image(kind, &base)?;
+                true
+            } else {
+                false
+            };
         fixtures.push(json!({
             "filesystem": kind.label(),
             "base_image": base.display().to_string(),
@@ -9308,19 +9367,16 @@ fn run() -> Result<Option<PathBuf>> {
         config.client_threads(),
         host.allowed_cpus_before_pin.len()
     );
-    let ffs_binary_identity = inspect_ffs_binary(&config.ffs_cli, config.allow_non_pgo_candidate)?;
+    let ffs_binary_identity = if config.fixture_only {
+        None
+    } else {
+        Some(inspect_ffs_binary(
+            &config.ffs_cli,
+            config.allow_non_pgo_candidate,
+        )?)
+    };
     let harness_sha = current_elf_sha256()?;
     println!("bench_evidence,binary_sha256={harness_sha}");
-    println!(
-        "candidate_identity,binary_sha256={},pgo_profile_sha256={},isa=x86-64-v3,build_mode={},verdict=pass",
-        ffs_binary_identity.binary_sha256,
-        ffs_binary_identity.pgo_profile_sha256,
-        if config.allow_non_pgo_candidate {
-            "authorized_non_pgo"
-        } else {
-            "production_pgo"
-        },
-    );
     // Where each ELF was built is recorded, and whether it had to be copied
     // here is derived from that rather than assumed: see `RetrievalProvenance`.
     let retrieval = RetrievalProvenance::classify(
@@ -9328,14 +9384,26 @@ fn run() -> Result<Option<PathBuf>> {
         &config.candidate_builder,
         &host.hostname,
     );
-    println!(
-        "binary_provenance,driver_elf_sha256={harness_sha},driver_built_on={},candidate_elf_sha256={},candidate_built_on={},executed_on={},retrieval={}",
-        config.harness_builder,
-        ffs_binary_identity.binary_sha256,
-        config.candidate_builder,
-        host.hostname,
-        retrieval.label(),
-    );
+    if let Some(ffs_binary_identity) = &ffs_binary_identity {
+        println!(
+            "candidate_identity,binary_sha256={},pgo_profile_sha256={},isa=x86-64-v3,build_mode={},verdict=pass",
+            ffs_binary_identity.binary_sha256,
+            ffs_binary_identity.pgo_profile_sha256,
+            if config.allow_non_pgo_candidate {
+                "authorized_non_pgo"
+            } else {
+                "production_pgo"
+            },
+        );
+        println!(
+            "binary_provenance,driver_elf_sha256={harness_sha},driver_built_on={},candidate_elf_sha256={},candidate_built_on={},executed_on={},retrieval={}",
+            config.harness_builder,
+            ffs_binary_identity.binary_sha256,
+            config.candidate_builder,
+            host.hostname,
+            retrieval.label(),
+        );
+    }
     println!(
         "codegen_isa,target_arch={},compile_sse2={},compile_sse4_2={},compile_avx={},compile_avx2={},compile_f16c={},compile_fma={},compile_avx512f={},compile_avx512bw={},runtime_sse2={},runtime_sse4_2={},runtime_avx={},runtime_avx2={},runtime_f16c={},runtime_fma={},runtime_avx512f={},runtime_avx512bw={}",
         env::consts::ARCH,
@@ -9421,8 +9489,11 @@ fn run() -> Result<Option<PathBuf>> {
     }
     let fixture_root = create_fixture_tree(&scratch_dir, &config)?;
     if config.fixture_only {
-        return fixture_only_run(&config, &run_dir, &fixture_root);
+        return fixture_only_run(&config, &run_dir, &scratch_dir, &fixture_root);
     }
+    // Everything below measures, so a candidate was inspected above.
+    let ffs_binary_identity =
+        ffs_binary_identity.expect("a measuring run inspects its candidate ELF first");
     let placement = select_cpu_placement(
         config.client_threads(),
         config.fuse_cpu_count,
