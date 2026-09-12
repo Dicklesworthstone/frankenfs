@@ -1532,6 +1532,20 @@ pub enum BtrfsExtentData {
 }
 
 impl BtrfsExtentData {
+    /// Length this item covers in FILE space.
+    ///
+    /// Inline data occupies exactly its own bytes; a regular item occupies
+    /// `num_bytes` regardless of the on-disk `disk_num_bytes` a compressed item
+    /// needs. Callers that validate the item sequence of a file (bd-opjvw) need
+    /// this without matching every variant themselves.
+    #[must_use]
+    pub fn file_len(&self) -> u64 {
+        match self {
+            Self::Inline { data, .. } => u64::try_from(data.len()).unwrap_or(u64::MAX),
+            Self::Regular { num_bytes, .. } => *num_bytes,
+        }
+    }
+
     /// Serialize to the on-disk EXTENT_DATA layout.
     ///
     /// Fixed header (21 bytes): generation(8) + ram_bytes(8) + compression(1)

@@ -13612,6 +13612,41 @@ impl OpenFs {
         // holes/prealloc gaps.
         let out: &mut [u8] = &mut dst[..to_read];
         let read_end = offset.saturating_add(to_read as u64);
+        // bd-opjvw: the extent items covering this window must be disjoint, and the
+        // overlap has to be caught HERE — before anything is written into `out` —
+        // because "no output mutation on error" is part of the read contract.
+        // Detecting it later means an earlier extent has already filled its bytes
+        // and the caller is handed a buffer the call refused to produce.
+        //
+        // A hole or prealloc item starting inside an earlier extent used to be the
+        // silent case: the assembly loop zero-filled over the live bytes, so the
+        // file read back as if it had been truncated to the hole's start. btrfs
+        // never writes such a pair and `btrfs check` reports one error per pair, so
+        // removing the earlier extent's bytes is not a defensible interpretation —
+        // the image is corrupt and the read must say so.
+        {
+            let mut covered = offset;
+            for (logical_start, extent) in extents.iter() {
+                let Some(extent_end) = logical_start.checked_add(extent.file_len()) else {
+                    return Err(FfsError::Corruption {
+                        block: *logical_start,
+                        detail: "extent logical range overflow".into(),
+                    });
+                };
+                let overlap_start = (*logical_start).max(offset);
+                let overlap_end = extent_end.min(read_end);
+                if overlap_start >= overlap_end {
+                    continue;
+                }
+                if overlap_start < covered {
+                    return Err(FfsError::Corruption {
+                        block: *logical_start,
+                        detail: "overlapping btrfs file extents".into(),
+                    });
+                }
+                covered = overlap_end;
+            }
+        }
         let zero_fill_range =
             |out: &mut [u8], range_start: u64, range_end: u64| -> Result<(), FfsError> {
                 if range_start >= range_end {
