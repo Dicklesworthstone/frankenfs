@@ -833,6 +833,42 @@ const PARITY_CONTRACTS: &[(&str, &str, &str, &[&str])] = &[
         "ext4-kernel-differential",
         &["ext4_iblocks_kernel_reference_matches_debugfs_blockcount"],
     ),
+    (
+        "MVCC snapshot visibility",
+        "A reader sees one consistent snapshot across shards",
+        "mvcc-lib",
+        &[
+            "sharded::tests::snapshot_isolation",
+            "sharded::tests::snapshot_reads_consistent_across_shards",
+        ],
+    ),
+    (
+        "MVCC commit sequencing",
+        "Commit ordering is preserved and replayed exactly once",
+        "mvcc-lib",
+        &[
+            "sharded::tests::commit_snapshots_policy_before_shard_locks",
+            "persist::tests::replay_discards_duplicate_commit_sequence",
+        ],
+    ),
+    (
+        "repair symbol storage I/O (dual-slot generation commit)",
+        "Repair symbol slots commit and upgrade by generation without regression",
+        "repair-lib",
+        &[
+            "storage::tests::storage_round_trip_symbols_and_generation_commit",
+            "storage::tests::storage_multi_generation_upgrade",
+        ],
+    ),
+    (
+        "corruption recovery orchestrator + evidence ledger",
+        "Recovery runs to completion under churn and every event reaches the ledger",
+        "repair-lib",
+        &[
+            "pipeline::tests::evidence_ledger_captures_all_events",
+            "pipeline::tests::recovery_succeeds_with_fresh_symbols_under_write_churn",
+        ],
+    ),
 ];
 
 // These test the evidence consumer itself, not filesystem capability rows.
@@ -846,6 +882,96 @@ const PARITY_HONESTY_TESTS: &[&str] = &[
     "executed_evidence::tests::test_evidence_requires_real_nonempty_passing_tests",
     "executed_evidence::tests::test_evidence_reads_rch_stderr_without_discarding_bad_events",
     "executed_evidence::tests::test_evidence_rejects_malformed_duplicate_and_incomplete_streams",
+];
+
+/// A parity suite is one Cargo invocation whose executed tests are evidence for
+/// capability rows. `exact` filters are module-qualified test names passed to
+/// libtest with `--exact`, so a suite can select named tests from a large crate
+/// without running (or quietly skipping) the rest of it.
+struct ParitySuite {
+    id: &'static str,
+    package: &'static str,
+    /// Cargo-level target selection, e.g. `--test kernel_reference`.
+    targets: &'static [&'static str],
+    /// Libtest `--exact` filters applied after `--`.
+    exact: &'static [&'static str],
+}
+
+const PARITY_SUITES: &[ParitySuite] = &[
+    ParitySuite {
+        id: "ext4-journal",
+        package: "ffs-harness",
+        targets: &["--test", "ext4_journal_recovery"],
+        exact: &[],
+    },
+    ParitySuite {
+        id: "ext4-reference",
+        package: "ffs-harness",
+        targets: &["--test", "kernel_reference"],
+        exact: &[],
+    },
+    // The ext4 kernel-differential targets are separate test binaries, and one
+    // Cargo invocation runs all of them: the libtest stream then carries one suite
+    // block per target, which the evidence parser aggregates. Every test here is a
+    // differential comparison against e2fsprogs/debugfs output on a generated
+    // image.
+    ParitySuite {
+        id: "ext4-kernel-differential",
+        package: "ffs-harness",
+        targets: &[
+            "--test",
+            "ext4_group_desc_kernel_reference",
+            "--test",
+            "ext4_iblocks_kernel_reference",
+            "--test",
+            "ext4_inode_flags_uidgid_kernel_reference",
+            "--test",
+            "ext4_dir_rec_len_kernel_reference",
+            "--test",
+            "ext4_bitmap_csum_kernel_reference",
+        ],
+        exact: &[],
+    },
+    // bd-wh1xk: the btrfs goldens are captured from btrfs-progs, so this suite
+    // needs it installed and at the golden's anchor version, or its tests
+    // soft-skip and the suite cannot pass. That is also why CI selects its suites
+    // explicitly rather than running every suite.
+    ParitySuite {
+        id: "btrfs-reference",
+        package: "ffs-harness",
+        targets: &["--test", "btrfs_kernel_reference"],
+        exact: &[],
+    },
+    ParitySuite {
+        id: "parity-honesty",
+        package: "ffs-harness",
+        targets: &["--lib"],
+        exact: PARITY_HONESTY_TESTS,
+    },
+    // Cross-package suites: the MVCC and repair rows are proven by the crates'
+    // own unit tests, selected by exact module-qualified name.
+    ParitySuite {
+        id: "mvcc-lib",
+        package: "ffs-mvcc",
+        targets: &["--lib"],
+        exact: &[
+            "sharded::tests::snapshot_isolation",
+            "sharded::tests::snapshot_reads_consistent_across_shards",
+            "sharded::tests::commit_snapshots_policy_before_shard_locks",
+            "persist::tests::replay_discards_duplicate_commit_sequence",
+        ],
+    },
+    ParitySuite {
+        id: "repair-lib",
+        package: "ffs-repair",
+        targets: &["--lib"],
+        exact: &[
+            "storage::tests::storage_round_trip_symbols_and_generation_commit",
+            "storage::tests::storage_multi_generation_upgrade",
+            "pipeline::tests::evidence_ledger_captures_all_events",
+            "pipeline::tests::recovery_succeeds_with_fresh_symbols_under_write_churn",
+        ],
+    },
 ];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -872,18 +998,13 @@ impl ExecutionGatedParityReport {
     ) -> Result<Self> {
         let mut selected = std::collections::BTreeSet::new();
         for suite in suites {
-            if !matches!(
-                suite.as_str(),
-                "ext4-journal"
-                    | "ext4-reference"
-                    | "ext4-kernel-differential"
-                    | "btrfs-reference"
-                    | "parity-honesty"
-            ) {
-                bail!(
-                    "unknown parity suite {suite}; use ext4-journal, ext4-reference, \
-                     ext4-kernel-differential, btrfs-reference or parity-honesty"
-                );
+            if !PARITY_SUITES.iter().any(|known| known.id == suite) {
+                let known = PARITY_SUITES
+                    .iter()
+                    .map(|suite| suite.id)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!("unknown parity suite {suite}; use one of {known}");
             }
             if !selected.insert(suite.as_str()) {
                 bail!("duplicate parity suite {suite}");
@@ -892,35 +1013,12 @@ impl ExecutionGatedParityReport {
         let gates_selected = canonical_gates::select_gate_ids(gate_ids)?;
         let mut runs = Vec::new();
         for suite in &selected {
-            let mut args = vec!["-Z", "checksum-freshness", "test", "-p", "ffs-harness"];
-            match *suite {
-                "ext4-journal" => args.extend(["--test", "ext4_journal_recovery"]),
-                "ext4-reference" => args.extend(["--test", "kernel_reference"]),
-                // The ext4 kernel-differential targets are separate test binaries,
-                // and one Cargo invocation runs all of them: the libtest stream then
-                // carries one suite block per target, which the evidence parser
-                // aggregates. Every test here is a differential comparison against
-                // e2fsprogs/debugfs output on a generated image.
-                "ext4-kernel-differential" => args.extend([
-                    "--test",
-                    "ext4_group_desc_kernel_reference",
-                    "--test",
-                    "ext4_iblocks_kernel_reference",
-                    "--test",
-                    "ext4_inode_flags_uidgid_kernel_reference",
-                    "--test",
-                    "ext4_dir_rec_len_kernel_reference",
-                    "--test",
-                    "ext4_bitmap_csum_kernel_reference",
-                ]),
-                // bd-wh1xk: the btrfs goldens are captured from btrfs-progs, so this
-                // suite needs it installed and at the golden's anchor version, or its
-                // tests soft-skip and the suite cannot pass. That is also why CI
-                // selects its suites explicitly rather than running every suite.
-                "btrfs-reference" => args.extend(["--test", "btrfs_kernel_reference"]),
-                "parity-honesty" => args.push("--lib"),
-                _ => unreachable!("validated above"),
-            }
+            let spec = PARITY_SUITES
+                .iter()
+                .find(|known| known.id == *suite)
+                .expect("validated above");
+            let mut args = vec!["-Z", "checksum-freshness", "test", "-p", spec.package];
+            args.extend_from_slice(spec.targets);
             args.extend([
                 "--",
                 "-Z",
@@ -929,9 +1027,9 @@ impl ExecutionGatedParityReport {
                 "--show-output",
                 "--test-threads=1",
             ]);
-            if *suite == "parity-honesty" {
+            if !spec.exact.is_empty() {
                 args.push("--exact");
-                args.extend_from_slice(PARITY_HONESTY_TESTS);
+                args.extend_from_slice(spec.exact);
             }
             let command = match executor {
                 ParityExecutor::Rch => {

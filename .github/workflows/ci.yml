@@ -105,8 +105,27 @@ jobs:
       - name: Unit tests
         run: cargo test --workspace
 
-      - name: Executed ext4 journal parity contracts
-        run: cargo run -p ffs-harness -- parity --verify ext4-journal --verify parity-honesty --local
+      - name: Install ext4 tools for parity contracts
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs
+
+      # The ext4 reference and kernel-differential suites compare against
+      # mkfs.ext4/debugfs output. Without e2fsprogs those tests report a skip
+      # marker, which the evidence model classifies as Skipped rather than
+      # Passed, so the step fails closed instead of passing vacuously.
+      # btrfs-reference is deliberately not selected here: it additionally pins
+      # btrfs-progs to the golden's anchor version.
+      - name: Executed parity contracts
+        run: |
+          cargo run -p ffs-harness -- parity \
+            --verify ext4-journal \
+            --verify ext4-reference \
+            --verify ext4-kernel-differential \
+            --verify mvcc-lib \
+            --verify repair-lib \
+            --verify parity-honesty \
+            --local
 
       # §22.1 names seven gate commands. This executes them and fails the job when
       # a gate that HAS tests does not pass. A filter that selects zero tests is

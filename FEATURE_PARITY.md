@@ -45,12 +45,23 @@
 > binaries in one Cargo invocation (group descriptors vs e2fsprogs, indirect block
 > addressing vs debugfs blockcount, inode flags/uid/gid vs debugfs, directory
 > record coalescing, bitmap checksums), and backs two further rows: `ext4 group
-> descriptor decode` and `ext4 indirect block addressing`. Running all five suites
-> in one invocation executes 57 tests and verifies seventeen exact contracts of 97
-> declared rows; readiness stays false until every row carries such evidence.
-> Three tests in those same binaries exercise rows already credited through
-> `ext4-reference`, and a contract names one suite, so they stay executed but
-> unmapped rather than running `kernel_reference` twice.
+> descriptor decode` and `ext4 indirect block addressing`.
+>
+> **2026-09-12 cross-package suites:** the suite table now carries a package and a
+> list of exact module-qualified test names, so evidence can come from the crates
+> that own the behavior instead of only from the harness. `--verify mvcc-lib`
+> runs four ffs-mvcc unit tests and backs `MVCC snapshot visibility` and `MVCC
+> commit sequencing`; `--verify repair-lib` runs four ffs-repair unit tests and
+> backs `repair symbol storage I/O (dual-slot generation commit)` and `corruption
+> recovery orchestrator + evidence ledger`. Those eight tests need no external
+> tools, so CI selects them alongside the ext4 suites (installing e2fsprogs first,
+> because a missing tool makes the differential tests report skipped and the step
+> fails closed). Running all seven suites in one invocation executes 65 tests and
+> verifies twenty-one exact contracts of 97 declared rows; readiness stays false
+> until every row carries such evidence. Three tests in the differential binaries
+> exercise rows already credited through `ext4-reference`, and a contract names
+> one suite, so they stay executed but unmapped rather than running
+> `kernel_reference` twice.
 >
 > **Repair integration update:** explicit request contexts now reach attached
 > refresh lifecycles, and failed/cancelled refresh batches preserve pending work.
