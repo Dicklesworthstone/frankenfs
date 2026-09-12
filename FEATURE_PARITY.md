@@ -96,8 +96,14 @@
 > carried through replay, forced fallback on unsupported head features) and
 > `ext4 JBD2 checksum verification` (commit and descriptor checksums round-trip,
 > tampering is detected, replay refuses a block whose data checksum disagrees).
-> All eleven suites in one invocation execute 105 tests and verify forty-five exact
-> contracts of 97 declared rows; readiness stays false.
+> All eleven suites in one invocation execute 110 tests and verify forty-eight exact
+> contracts of 97 declared rows; readiness stays false. The same pass added
+> `ext4 path resolution` (a kernel-created image's paths resolve to the inode
+> holding the kernel-written content), `FUSE ABI 7.40 protocol surface` (the
+> vendored fuser surface exposes the ABI it claims) and
+> `FUSE pwritev2/io_uring RWF write intent propagation` (append/no-append offset
+> semantics, conflicting flags refused before mutation, read-strict io_uring
+> switch).
 >
 > **Repair integration update:** explicit request contexts now reach attached
 > refresh lifecycles, and failed/cancelled refresh batches preserve pending work.

@@ -762,6 +762,12 @@ const PARITY_CONTRACTS: &[(&str, &str, &str, &[&str])] = &[
         &["ext4_kernel_vs_ffs_extent_mapping"],
     ),
     (
+        "ext4 path resolution",
+        "Paths in a kernel-created image resolve to the inode holding the kernel-written content",
+        "ext4-reference",
+        &["ext4_kernel_vs_ffs_file_content"],
+    ),
+    (
         "ext4 directory entry parsing",
         "Generated ext4 directory entries agree with e2fsprogs",
         "ext4-reference",
@@ -950,6 +956,25 @@ const PARITY_CONTRACTS: &[(&str, &str, &str, &[&str])] = &[
             "tests::dispatch_ioctl_move_ext_does_not_double_unregister_after_commit_error",
             "tests::dispatch_ioctl_move_ext_does_not_unregister_after_register_error",
             "tests::dispatch_ioctl_move_ext_rejection_logs_contract_fields",
+        ],
+    ),
+    (
+        "FUSE ABI 7.40 protocol surface",
+        "The vendored fuser surface exposes the ABI 7.40 protocol it claims",
+        "fuse-lib",
+        &["tests::vendored_fuser_exposes_abi_7_40_protocol_surface"],
+    ),
+    (
+        "FUSE pwritev2/io_uring RWF write intent propagation",
+        "RWF_APPEND and RWF_NOAPPEND change the write offset the way the flags say, \
+         conflicting flags are refused before any mutation, and the io_uring switch \
+         stays read-strict",
+        "fuse-lib",
+        &[
+            "tests::dispatch_write_rwf_append_uses_current_file_size_as_offset",
+            "tests::dispatch_write_rwf_noappend_suppresses_open_append_offset_rewrite",
+            "tests::dispatch_write_rwf_append_noappend_conflict_rejects_before_mutation",
+            "tests::io_uring_kernel_switch_is_read_strictly_bd_vbqc6",
         ],
     ),
     (
@@ -1204,6 +1229,11 @@ const PARITY_SUITES: &[ParitySuite] = &[
             "tests::dispatch_ioctl_move_ext_does_not_double_unregister_after_commit_error",
             "tests::dispatch_ioctl_move_ext_does_not_unregister_after_register_error",
             "tests::dispatch_ioctl_move_ext_rejection_logs_contract_fields",
+            "tests::vendored_fuser_exposes_abi_7_40_protocol_surface",
+            "tests::dispatch_write_rwf_append_uses_current_file_size_as_offset",
+            "tests::dispatch_write_rwf_noappend_suppresses_open_append_offset_rewrite",
+            "tests::dispatch_write_rwf_append_noappend_conflict_rejects_before_mutation",
+            "tests::io_uring_kernel_switch_is_read_strictly_bd_vbqc6",
         ],
     },
     // The CLI rows are proven by whole-binary end-to-end tests: the target spawns the
