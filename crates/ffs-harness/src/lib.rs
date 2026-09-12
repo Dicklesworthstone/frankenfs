@@ -908,6 +908,30 @@ const PARITY_CONTRACTS: &[(&str, &str, &str, &[&str])] = &[
             "tests::dispatch_ioctl_fiemap_sync_fsyncs_before_extent_lookup",
         ],
     ),
+    (
+        "FUSE ioctl EXT4_IOC_GETFLAGS",
+        "GETFLAGS returns the file's flags as the ABI encodes them",
+        "fuse-lib",
+        &["tests::dispatch_ioctl_getflags_encodes_u32_response_for_fileattr_path"],
+    ),
+    (
+        "FUSE ioctl EXT4_IOC_GETVERSION / EXT4_IOC_SETVERSION",
+        "The version ioctls carry the inode generation both ways",
+        "fuse-lib",
+        &[
+            "tests::dispatch_ioctl_getversion_encodes_u32_response_for_inode_generation",
+            "tests::dispatch_ioctl_setversion_passes_generation_to_backend_and_commits",
+        ],
+    ),
+    (
+        "FUSE ioctl EXT4_IOC_SETFLAGS",
+        "SETFLAGS routes to the backend and commits the new flags",
+        "fuse-lib",
+        &[
+            "tests::dispatch_ioctl_setflags_routes_to_fsops_and_commits",
+            "tests::dispatch_ioctl_setflags_accepts_8_byte_long_payload_by_using_low_u32",
+        ],
+    ),
 ];
 
 // These test the evidence consumer itself, not filesystem capability rows.
@@ -1025,6 +1049,11 @@ const PARITY_SUITES: &[ParitySuite] = &[
             "tests::conformance_fuse_readlink_directory_round_trip",
             "tests::dispatch_ioctl_fibmap_maps_written_extent_physical_block",
             "tests::dispatch_ioctl_fiemap_sync_fsyncs_before_extent_lookup",
+            "tests::dispatch_ioctl_getflags_encodes_u32_response_for_fileattr_path",
+            "tests::dispatch_ioctl_setflags_routes_to_fsops_and_commits",
+            "tests::dispatch_ioctl_setflags_accepts_8_byte_long_payload_by_using_low_u32",
+            "tests::dispatch_ioctl_getversion_encodes_u32_response_for_inode_generation",
+            "tests::dispatch_ioctl_setversion_passes_generation_to_backend_and_commits",
         ],
     },
 ];
