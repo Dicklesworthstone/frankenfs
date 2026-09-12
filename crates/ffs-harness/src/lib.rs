@@ -1119,6 +1119,49 @@ const PARITY_CONTRACTS: &[(&str, &str, &str, &[&str])] = &[
         "ondisk-lib",
         &["btrfs::tests::btrfs_proptest_internal_items_structured_roundtrip"],
     ),
+    (
+        "version retention policy",
+        "Version chains stay bounded, and chain pressure advances the oldest snapshot \
+         only when it is allowed to, refusing at critical pressure with a pinned snapshot",
+        "mvcc-lib",
+        &[
+            "tests::chain_length_bounded_after_many_writes",
+            "tests::chain_backpressure_rejects_at_critical_with_snapshot_pin",
+            "tests::chain_pressure_without_snapshot_pin_allows_commit",
+            "tests::chain_backpressure_triggers_and_force_advances_oldest_snapshot",
+        ],
+    ),
+    (
+        "SSI dangerous-structure detection",
+        "A dangerous structure accumulates across records and detection stops at the \
+         first complete one, while read-only, disjoint and empty-write-set cases never \
+         form a structure",
+        "mvcc-lib",
+        &[
+            "tests::ssi_dangerous_structure_accumulates_edges_across_records",
+            "tests::ssi_detect_stops_at_first_completed_dangerous_structure",
+            "tests::ssi_empty_write_set_is_never_a_dangerous_structure",
+            "tests::ssi_disjoint_key_spans_do_not_create_edges",
+            "tests::ssi_allows_read_only_transactions",
+        ],
+    ),
+    (
+        "fixture conformance harness",
+        "Committed fixtures and goldens carry provenance, and the ext4/btrfs fixtures \
+         conform through the harness",
+        "conformance",
+        &[
+            "conformance_fixture_provenance_covers_committed_fixtures",
+            "conformance_golden_provenance_covers_committed_artifacts",
+            "ext4_and_btrfs_fixtures_conform",
+        ],
+    ),
+    (
+        "benchmark harness",
+        "The canonical criterion profile artifacts are committed and structured",
+        "profile-artifacts",
+        &["canonical_profile_artifacts_are_committed_and_structured"],
+    ),
 ];
 
 // These test the evidence consumer itself, not filesystem capability rows.
@@ -1213,6 +1256,15 @@ const PARITY_SUITES: &[ParitySuite] = &[
             "tests::fcw_multi_block_fails_on_conflicting_block",
             "tests::fcw_concurrent_disjoint_blocks_all_succeed",
             "tests::cow_hundred_rewrites_produce_unique_physical_blocks",
+            "tests::chain_length_bounded_after_many_writes",
+            "tests::chain_backpressure_rejects_at_critical_with_snapshot_pin",
+            "tests::chain_pressure_without_snapshot_pin_allows_commit",
+            "tests::chain_backpressure_triggers_and_force_advances_oldest_snapshot",
+            "tests::ssi_dangerous_structure_accumulates_edges_across_records",
+            "tests::ssi_detect_stops_at_first_completed_dangerous_structure",
+            "tests::ssi_empty_write_set_is_never_a_dangerous_structure",
+            "tests::ssi_disjoint_key_spans_do_not_create_edges",
+            "tests::ssi_allows_read_only_transactions",
         ],
     },
     // ffs-journal owns the JBD2 fast-commit and checksum paths; the harness
@@ -1318,6 +1370,26 @@ const PARITY_SUITES: &[ParitySuite] = &[
             "btrfs::tests::btrfs_proptest_leaf_items_structured_key_roundtrip",
             "btrfs::tests::btrfs_proptest_internal_items_structured_roundtrip",
         ],
+    },
+    // Infrastructure rows. These two suites are the only place the fixture and
+    // benchmark harness rows may draw evidence from: the rows describe the harness
+    // itself, so the harness's own provenance and artifact contracts are the right
+    // proof class. They are deliberately not used for filesystem capability rows.
+    ParitySuite {
+        id: "conformance",
+        package: "ffs-harness",
+        targets: &["--test", "conformance"],
+        exact: &[
+            "conformance_fixture_provenance_covers_committed_fixtures",
+            "conformance_golden_provenance_covers_committed_artifacts",
+            "ext4_and_btrfs_fixtures_conform",
+        ],
+    },
+    ParitySuite {
+        id: "profile-artifacts",
+        package: "ffs-harness",
+        targets: &["--test", "profile_artifacts"],
+        exact: &["canonical_profile_artifacts_are_committed_and_structured"],
     },
 ];
 

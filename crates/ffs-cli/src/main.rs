@@ -1331,8 +1331,8 @@ enum Command {
         json: bool,
         /// Execute a parity suite: ext4-journal, ext4-reference,
         /// ext4-kernel-differential, btrfs-reference, mvcc-lib, repair-lib,
-        /// journal-lib, ondisk-lib, fuse-lib, cli-e2e, btrfs-lib, or the
-        /// parity-honesty self-check.
+        /// journal-lib, ondisk-lib, fuse-lib, cli-e2e, btrfs-lib, conformance,
+        /// profile-artifacts, or the parity-honesty self-check.
         #[arg(long)]
         verify: Vec<String>,
         /// Execute canonical spec §22 gates: `all`, or one or more of gate1..gate7.

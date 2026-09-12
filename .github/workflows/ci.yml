@@ -129,6 +129,8 @@ jobs:
             --verify fuse-lib \
             --verify cli-e2e \
             --verify btrfs-lib \
+            --verify conformance \
+            --verify profile-artifacts \
             --verify parity-honesty \
             --local
 

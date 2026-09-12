@@ -115,6 +115,20 @@
 > execute 117 tests and verify fifty-three exact contracts of 97 declared rows;
 > readiness stays false.
 >
+> **2026-09-12 retention, SSI and infrastructure rows:** `mvcc-lib` grew nine tests
+> backing `version retention policy` (bounded chains; pressure advances the oldest
+> snapshot only when allowed, refusing at critical pressure with a pinned snapshot)
+> and `SSI dangerous-structure detection` (the structure accumulates across records,
+> detection stops at the first complete one, and read-only, disjoint and
+> empty-write-set cases never form one). Two further suites cover the rows that
+> describe the harness itself, which is the only place those rows may draw evidence
+> from: `--verify conformance` backs `fixture conformance harness` (fixture and
+> golden provenance, and the ext4/btrfs fixtures conform) and
+> `--verify profile-artifacts` backs `benchmark harness` (the canonical criterion
+> artifacts are committed and structured). All fourteen suites in one invocation
+> execute 130 tests and verify fifty-seven exact contracts of 97 declared rows;
+> readiness stays false.
+>
 > **Repair integration update:** explicit request contexts now reach attached
 > refresh lifecycles, and failed/cancelled refresh batches preserve pending work.
 > Scrub no longer regenerates symbols from detected corruption or recovers from
