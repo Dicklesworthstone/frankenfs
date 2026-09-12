@@ -105,6 +105,16 @@
 > semantics, conflicting flags refused before mutation, read-strict io_uring
 > switch).
 >
+> **2026-09-12 on-disk decode ownership:** a twelfth suite, `--verify ondisk-lib`
+> (package ffs-ondisk), backs `ext4 feature flag validation` (unknown compat bits
+> accounted for), `ext4 casefold (case-insensitive dirs)` (unicode folds including
+> the capital-sigma rule, and a casefold-rebuilt htree stays fold-navigable),
+> `btrfs btree header decode` (header parsed at its kernel-documented offsets),
+> `btrfs leaf item metadata decode` and `btrfs internal node parsing` (leaf and
+> internal items round-trip with keys intact). All twelve suites in one invocation
+> execute 117 tests and verify fifty-three exact contracts of 97 declared rows;
+> readiness stays false.
+>
 > **Repair integration update:** explicit request contexts now reach attached
 > refresh lifecycles, and failed/cancelled refresh batches preserve pending work.
 > Scrub no longer regenerates symbols from detected corruption or recovers from

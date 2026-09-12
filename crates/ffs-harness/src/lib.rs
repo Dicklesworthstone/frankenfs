@@ -1084,6 +1084,41 @@ const PARITY_CONTRACTS: &[(&str, &str, &str, &[&str])] = &[
             "tests::replay_jbd2_csum_v3_data_checksum_mismatch_skips_write",
         ],
     ),
+    (
+        "ext4 feature flag validation",
+        "Unknown compat feature bits are accounted for instead of being silently accepted",
+        "ondisk-lib",
+        &["ext4::tests::compat_features_unknown_bits"],
+    ),
+    (
+        "ext4 casefold (case-insensitive dirs)",
+        "Casefold keys fold the way the unicode rules require and an htree rebuilt for \
+         casefold stays navigable",
+        "ondisk-lib",
+        &[
+            "ext4::tests::build_htree_directory_casefold_rebuild_is_fold_navigable_bd_owt2r",
+            "ext4::tests::casefold_eq_matches_key_on_unicode_folds",
+            "ext4::tests::ext4_casefold_key_capital_sigma_folds_like_lowercase_sigma",
+        ],
+    ),
+    (
+        "btrfs btree header decode",
+        "The btree header decodes from its kernel-documented offsets",
+        "ondisk-lib",
+        &["btrfs::tests::btrfs_header_parse_from_block_kernel_offsets_match_ctree_h"],
+    ),
+    (
+        "btrfs leaf item metadata decode",
+        "Leaf items round-trip with their keys intact",
+        "ondisk-lib",
+        &["btrfs::tests::btrfs_proptest_leaf_items_structured_key_roundtrip"],
+    ),
+    (
+        "btrfs internal node parsing",
+        "Internal node items round-trip as structured key pointers",
+        "ondisk-lib",
+        &["btrfs::tests::btrfs_proptest_internal_items_structured_roundtrip"],
+    ),
 ];
 
 // These test the evidence consumer itself, not filesystem capability rows.
@@ -1266,6 +1301,22 @@ const PARITY_SUITES: &[ParitySuite] = &[
             "crash_consistency::tests::writeback_cache_crash_matrix_passes_every_invariant",
             "crash_consistency::tests::writeback_cache_crash_matrix_observes_generation_atomicity",
             "crash_consistency::proptests::mr_wb_writeback_order_preserves_invariants",
+        ],
+    },
+    // ffs-ondisk owns on-disk structure decode for both formats, including the
+    // ext4 feature-flag and casefold rules and the btrfs header/leaf layout.
+    ParitySuite {
+        id: "ondisk-lib",
+        package: "ffs-ondisk",
+        targets: &["--lib"],
+        exact: &[
+            "ext4::tests::compat_features_unknown_bits",
+            "ext4::tests::build_htree_directory_casefold_rebuild_is_fold_navigable_bd_owt2r",
+            "ext4::tests::casefold_eq_matches_key_on_unicode_folds",
+            "ext4::tests::ext4_casefold_key_capital_sigma_folds_like_lowercase_sigma",
+            "btrfs::tests::btrfs_header_parse_from_block_kernel_offsets_match_ctree_h",
+            "btrfs::tests::btrfs_proptest_leaf_items_structured_key_roundtrip",
+            "btrfs::tests::btrfs_proptest_internal_items_structured_roundtrip",
         ],
     },
 ];

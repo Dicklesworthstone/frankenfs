@@ -125,6 +125,7 @@ jobs:
             --verify mvcc-lib \
             --verify repair-lib \
             --verify journal-lib \
+            --verify ondisk-lib \
             --verify fuse-lib \
             --verify cli-e2e \
             --verify btrfs-lib \
