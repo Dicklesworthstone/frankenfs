@@ -1021,6 +1021,44 @@ const PARITY_CONTRACTS: &[(&str, &str, &str, &[&str])] = &[
         "btrfs-lib",
         &["crash_consistency::proptests::mr_wb_writeback_order_preserves_invariants"],
     ),
+    (
+        "FCW conflict detection",
+        "First-committer-wins lets disjoint blocks through and fails the conflicting one \
+         with a correctly populated error",
+        "mvcc-lib",
+        &[
+            "tests::fcw_conflict_error_contains_correct_fields",
+            "tests::fcw_multi_block_fails_on_conflicting_block",
+            "tests::fcw_concurrent_disjoint_blocks_all_succeed",
+        ],
+    ),
+    (
+        "COW block rewrite path",
+        "Repeated rewrites of the same logical block land on distinct physical blocks",
+        "mvcc-lib",
+        &["tests::cow_hundred_rewrites_produce_unique_physical_blocks"],
+    ),
+    (
+        "ext4 fast commit replay",
+        "Replay carries the fast-commit inode body and falls back when the head \
+         advertises unsupported features",
+        "journal-lib",
+        &[
+            "fc_tests::replay_fast_commit_carries_inode_body",
+            "fc_tests::replay_head_with_unsupported_fc_features_forces_fallback",
+        ],
+    ),
+    (
+        "ext4 JBD2 checksum verification",
+        "Commit and descriptor checksums round-trip, tampering is detected, and replay \
+         refuses a block whose data checksum does not match",
+        "journal-lib",
+        &[
+            "tests::verify_jbd2_async_commit_commit_checksum_roundtrip_and_tamper_detection",
+            "tests::verify_jbd2_async_commit_descriptor_checksum_roundtrip_and_tamper_detection",
+            "tests::replay_jbd2_csum_v3_data_checksum_mismatch_skips_write",
+        ],
+    ),
 ];
 
 // These test the evidence consumer itself, not filesystem capability rows.
@@ -1111,6 +1149,24 @@ const PARITY_SUITES: &[ParitySuite] = &[
             "sharded::tests::snapshot_reads_consistent_across_shards",
             "sharded::tests::commit_snapshots_policy_before_shard_locks",
             "persist::tests::replay_discards_duplicate_commit_sequence",
+            "tests::fcw_conflict_error_contains_correct_fields",
+            "tests::fcw_multi_block_fails_on_conflicting_block",
+            "tests::fcw_concurrent_disjoint_blocks_all_succeed",
+            "tests::cow_hundred_rewrites_produce_unique_physical_blocks",
+        ],
+    },
+    // ffs-journal owns the JBD2 fast-commit and checksum paths; the harness
+    // ext4-journal suite covers recovery outcomes one level up.
+    ParitySuite {
+        id: "journal-lib",
+        package: "ffs-journal",
+        targets: &["--lib"],
+        exact: &[
+            "fc_tests::replay_fast_commit_carries_inode_body",
+            "fc_tests::replay_head_with_unsupported_fc_features_forces_fallback",
+            "tests::verify_jbd2_async_commit_commit_checksum_roundtrip_and_tamper_detection",
+            "tests::verify_jbd2_async_commit_descriptor_checksum_roundtrip_and_tamper_detection",
+            "tests::replay_jbd2_csum_v3_data_checksum_mismatch_skips_write",
         ],
     },
     ParitySuite {

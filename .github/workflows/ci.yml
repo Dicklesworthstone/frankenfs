@@ -124,6 +124,7 @@ jobs:
             --verify ext4-kernel-differential \
             --verify mvcc-lib \
             --verify repair-lib \
+            --verify journal-lib \
             --verify fuse-lib \
             --verify cli-e2e \
             --verify btrfs-lib \

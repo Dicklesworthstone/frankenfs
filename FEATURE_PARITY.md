@@ -88,6 +88,17 @@
 > the tests actually witness. All ten suites in one invocation execute 96 tests and
 > verify forty-one exact contracts of 97 declared rows; readiness stays false.
 >
+> **2026-09-12 mechanism-level bindings:** `mvcc-lib` grew the conflict-detection and
+> copy-on-write tests, backing `FCW conflict detection` (disjoint blocks commit,
+> the conflicting block fails with a populated error) and `COW block rewrite path`
+> (repeated rewrites land on distinct physical blocks). A new `--verify journal-lib`
+> suite runs ffs-journal unit tests and backs `ext4 fast commit replay` (inode body
+> carried through replay, forced fallback on unsupported head features) and
+> `ext4 JBD2 checksum verification` (commit and descriptor checksums round-trip,
+> tampering is detected, replay refuses a block whose data checksum disagrees).
+> All eleven suites in one invocation execute 105 tests and verify forty-five exact
+> contracts of 97 declared rows; readiness stays false.
+>
 > **Repair integration update:** explicit request contexts now reach attached
 > refresh lifecycles, and failed/cancelled refresh batches preserve pending work.
 > Scrub no longer regenerates symbols from detected corruption or recovers from
