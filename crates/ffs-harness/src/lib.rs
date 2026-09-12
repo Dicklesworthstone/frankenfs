@@ -821,6 +821,18 @@ const PARITY_CONTRACTS: &[(&str, &str, &str, &[&str])] = &[
         "btrfs-reference",
         &["btrfs_send_stream_matches_btrfs_receive_dump_reference"],
     ),
+    (
+        "ext4 group descriptor decode",
+        "Generated image group descriptors agree with e2fsprogs",
+        "ext4-kernel-differential",
+        &["ext4_group_desc_kernel_reference_matches"],
+    ),
+    (
+        "ext4 indirect block addressing",
+        "Generated no-extent image block maps agree with debugfs blockcount",
+        "ext4-kernel-differential",
+        &["ext4_iblocks_kernel_reference_matches_debugfs_blockcount"],
+    ),
 ];
 
 // These test the evidence consumer itself, not filesystem capability rows.
@@ -862,11 +874,15 @@ impl ExecutionGatedParityReport {
         for suite in suites {
             if !matches!(
                 suite.as_str(),
-                "ext4-journal" | "ext4-reference" | "btrfs-reference" | "parity-honesty"
+                "ext4-journal"
+                    | "ext4-reference"
+                    | "ext4-kernel-differential"
+                    | "btrfs-reference"
+                    | "parity-honesty"
             ) {
                 bail!(
                     "unknown parity suite {suite}; use ext4-journal, ext4-reference, \
-                     btrfs-reference or parity-honesty"
+                     ext4-kernel-differential, btrfs-reference or parity-honesty"
                 );
             }
             if !selected.insert(suite.as_str()) {
@@ -880,6 +896,23 @@ impl ExecutionGatedParityReport {
             match *suite {
                 "ext4-journal" => args.extend(["--test", "ext4_journal_recovery"]),
                 "ext4-reference" => args.extend(["--test", "kernel_reference"]),
+                // The ext4 kernel-differential targets are separate test binaries,
+                // and one Cargo invocation runs all of them: the libtest stream then
+                // carries one suite block per target, which the evidence parser
+                // aggregates. Every test here is a differential comparison against
+                // e2fsprogs/debugfs output on a generated image.
+                "ext4-kernel-differential" => args.extend([
+                    "--test",
+                    "ext4_group_desc_kernel_reference",
+                    "--test",
+                    "ext4_iblocks_kernel_reference",
+                    "--test",
+                    "ext4_inode_flags_uidgid_kernel_reference",
+                    "--test",
+                    "ext4_dir_rec_len_kernel_reference",
+                    "--test",
+                    "ext4_bitmap_csum_kernel_reference",
+                ]),
                 // bd-wh1xk: the btrfs goldens are captured from btrfs-progs, so this
                 // suite needs it installed and at the golden's anchor version, or its
                 // tests soft-skip and the suite cannot pass. That is also why CI

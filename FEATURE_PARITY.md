@@ -38,8 +38,19 @@
 > the fixture schema rather than filesystem behavior. That suite needs btrfs-progs
 > installed at the golden's anchor version, otherwise its tests soft-skip and it
 > cannot pass — which is why CI selects its parity suites explicitly instead of
-> running every suite. Mapped contracts now total fifteen of 97 declared rows;
-> readiness is still false.
+> running every suite.
+>
+> **2026-09-12 ext4 kernel-differential binding:** a fifth suite,
+> `--verify ext4-kernel-differential`, runs five separate differential test
+> binaries in one Cargo invocation (group descriptors vs e2fsprogs, indirect block
+> addressing vs debugfs blockcount, inode flags/uid/gid vs debugfs, directory
+> record coalescing, bitmap checksums), and backs two further rows: `ext4 group
+> descriptor decode` and `ext4 indirect block addressing`. Running all five suites
+> in one invocation executes 57 tests and verifies seventeen exact contracts of 97
+> declared rows; readiness stays false until every row carries such evidence.
+> Three tests in those same binaries exercise rows already credited through
+> `ext4-reference`, and a contract names one suite, so they stay executed but
+> unmapped rather than running `kernel_reference` twice.
 >
 > **Repair integration update:** explicit request contexts now reach attached
 > refresh lifecycles, and failed/cancelled refresh batches preserve pending work.
