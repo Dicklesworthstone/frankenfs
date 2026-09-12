@@ -96,7 +96,7 @@ fn assert_expected_operation(actual: &FcOperation, expected: &ExpectedOperation)
             assert_eq!(actual.ino, *ino);
             assert_eq!(actual.name, name.as_bytes());
         }
-        _ => assert!(false, "operation mismatch: actual={actual:?} expected={expected:?}"),
+        _ => panic!("operation mismatch: actual={actual:?} expected={expected:?}"),
     }
 }
 

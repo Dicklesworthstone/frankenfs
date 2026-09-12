@@ -2289,11 +2289,12 @@ mod fc_tests {
                 stream.extend(build_fc_tag(0x06, &payload));
                 stream.extend(build_fc_tag(0x08, &[0; 8]));
 
+                let err = replay_fast_commit(&stream, inode_size)
+                    .expect_err("invalid inode body must be corruption");
                 let detail = match err {
                     FfsError::Corruption { detail, .. } => detail,
                     other => {
-                        assert!(false, "invalid inode body must be corruption: {other:?}");
-                        unreachable!();
+                        panic!("invalid inode body must be corruption: {other:?}");
                     }
                 };
                 assert!(detail.contains("Inode (0x0006)"), "{detail}");
@@ -2366,7 +2367,7 @@ mod fc_tests {
         assert!(result.fallback_required);
         assert_eq!(result.transactions_found, 0);
         assert_eq!(result.incomplete_transactions, 1);
-        assert!(result.operations.is_empty());
+        assert_eq!(result.operations, [] as [FcOperation; 0]);
     }
 
     /// Golden: the fast-commit tag discriminants must equal the on-disk
@@ -2569,8 +2570,7 @@ mod fc_tests {
         let r = match &result.operations[0] {
             FcOperation::AddRange(r) => r,
             other => {
-                assert!(false, "expected AddRange, got {other:?}");
-                unreachable!();
+                panic!("expected AddRange, got {other:?}");
             }
         };
         assert_eq!(r.ino, 42);
