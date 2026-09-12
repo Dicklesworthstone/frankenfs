@@ -74,6 +74,20 @@
 > ABI 7.40 protocol surface) remain unmapped because no dispatch test can establish
 > them.
 >
+> **2026-09-12 CLI and btrfs ownership:** two more suites put evidence where the
+> behavior lives. `--verify cli-e2e` runs whole-binary end-to-end tests from
+> `crates/ffs-cli/tests/cli_e2e.rs`, which spawn the built `ffs` executable and
+> assert on its observable output, backing `CLI inspect command`, `CLI info
+> command`, `CLI fsck command` and `CLI repair command`. `--verify btrfs-lib` runs
+> ffs-btrfs unit tests backing `btrfs chunk tree walking`, `btrfs device tree
+> discovery`, `btrfs delayed refs parity`, `btrfs crash consistency (WB-I1/WB-I2)`
+> and `btrfs metadata writeback serialization`. The same increment added
+> `FUSE ioctl FS_IOC_GETFSLABEL / FS_IOC_SETFSLABEL` and
+> `FUSE ioctl EXT4_IOC_MOVE_EXT` to `fuse-lib`; the MOVE_EXT row's contract is the
+> donor-registration lifecycle and the rejection log fields, because that is what
+> the tests actually witness. All ten suites in one invocation execute 96 tests and
+> verify forty-one exact contracts of 97 declared rows; readiness stays false.
+>
 > **Repair integration update:** explicit request contexts now reach attached
 > refresh lifecycles, and failed/cancelled refresh batches preserve pending work.
 > Scrub no longer regenerates symbols from detected corruption or recovers from

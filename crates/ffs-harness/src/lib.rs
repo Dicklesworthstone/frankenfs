@@ -932,6 +932,95 @@ const PARITY_CONTRACTS: &[(&str, &str, &str, &[&str])] = &[
             "tests::dispatch_ioctl_setflags_accepts_8_byte_long_payload_by_using_low_u32",
         ],
     ),
+    (
+        "FUSE ioctl FS_IOC_GETFSLABEL / FS_IOC_SETFSLABEL",
+        "The label ioctls carry the filesystem label both ways in the ABI buffer",
+        "fuse-lib",
+        &[
+            "tests::dispatch_ioctl_getfslabel_returns_label_in_256_byte_buffer",
+            "tests::dispatch_ioctl_setfslabel_passes_label_to_backend_and_commits",
+        ],
+    ),
+    (
+        "FUSE ioctl EXT4_IOC_MOVE_EXT",
+        "MOVE_EXT registers the donor for the operation, unregisters it on every exit \
+         path, and logs the rejection contract",
+        "fuse-lib",
+        &[
+            "tests::dispatch_ioctl_move_ext_does_not_double_unregister_after_commit_error",
+            "tests::dispatch_ioctl_move_ext_does_not_unregister_after_register_error",
+            "tests::dispatch_ioctl_move_ext_rejection_logs_contract_fields",
+        ],
+    ),
+    (
+        "CLI inspect command",
+        "The built binary inspects an ext4 and a btrfs image and reports it as JSON",
+        "cli-e2e",
+        &[
+            "cli_inspect_ext4_returns_json",
+            "cli_inspect_btrfs_returns_json",
+        ],
+    ),
+    (
+        "CLI info command",
+        "The built binary reports both formats' superblocks",
+        "cli-e2e",
+        &[
+            "cli_info_ext4_shows_superblock",
+            "cli_info_btrfs_shows_superblock",
+        ],
+    ),
+    (
+        "CLI fsck command",
+        "The built binary passes a clean image and reports a corrupted superblock",
+        "cli-e2e",
+        &[
+            "cli_fsck_ext4_clean_image",
+            "cli_fsck_corrupted_superblock_reports_error",
+        ],
+    ),
+    (
+        "CLI repair command",
+        "The built binary runs repair in verify-only mode against an ext4 image",
+        "cli-e2e",
+        &["cli_repair_verify_only_ext4"],
+    ),
+    (
+        "btrfs chunk tree walking",
+        "Chunk entries round-trip out of the chunk tree",
+        "btrfs-lib",
+        &["tests::chunk_entries_round_trip_out_of_the_chunk_tree_bd_a136s"],
+    ),
+    (
+        "btrfs device tree discovery",
+        "The device is discovered from its dev item and a contradicting item is refused",
+        "btrfs-lib",
+        &["tests::growth_device_is_read_from_the_dev_item_bd_a136s"],
+    ),
+    (
+        "btrfs delayed refs parity",
+        "Delayed refs queue shared extents and flush applies the refcounts",
+        "btrfs-lib",
+        &[
+            "tests::delayed_ref_queue_shared_extent_refcount",
+            "tests::flush_delayed_refs_applies_refcounts",
+        ],
+    ),
+    (
+        "btrfs crash consistency (WB-I1/WB-I2)",
+        "The writeback crash matrix passes every invariant and observes generation atomicity",
+        "btrfs-lib",
+        &[
+            "crash_consistency::tests::writeback_cache_crash_matrix_passes_every_invariant",
+            "crash_consistency::tests::writeback_cache_crash_matrix_observes_generation_atomicity",
+        ],
+    ),
+    (
+        "btrfs metadata writeback serialization",
+        "Writeback ordering preserves the serialization invariants under the given schedule",
+        "btrfs-lib",
+        &["crash_consistency::proptests::mr_wb_writeback_order_preserves_invariants"],
+    ),
 ];
 
 // These test the evidence consumer itself, not filesystem capability rows.
@@ -1054,6 +1143,43 @@ const PARITY_SUITES: &[ParitySuite] = &[
             "tests::dispatch_ioctl_setflags_accepts_8_byte_long_payload_by_using_low_u32",
             "tests::dispatch_ioctl_getversion_encodes_u32_response_for_inode_generation",
             "tests::dispatch_ioctl_setversion_passes_generation_to_backend_and_commits",
+            "tests::dispatch_ioctl_getfslabel_returns_label_in_256_byte_buffer",
+            "tests::dispatch_ioctl_setfslabel_passes_label_to_backend_and_commits",
+            "tests::dispatch_ioctl_move_ext_does_not_double_unregister_after_commit_error",
+            "tests::dispatch_ioctl_move_ext_does_not_unregister_after_register_error",
+            "tests::dispatch_ioctl_move_ext_rejection_logs_contract_fields",
+        ],
+    },
+    // The CLI rows are proven by whole-binary end-to-end tests: the target spawns the
+    // built `ffs` executable and asserts on its observable output.
+    ParitySuite {
+        id: "cli-e2e",
+        package: "ffs-cli",
+        targets: &["--test", "cli_e2e"],
+        exact: &[
+            "cli_inspect_ext4_returns_json",
+            "cli_inspect_btrfs_returns_json",
+            "cli_info_ext4_shows_superblock",
+            "cli_info_btrfs_shows_superblock",
+            "cli_fsck_ext4_clean_image",
+            "cli_fsck_corrupted_superblock_reports_error",
+            "cli_repair_verify_only_ext4",
+        ],
+    },
+    // ffs-btrfs owns the tree/mutation behavior the btrfs rows describe; the
+    // harness btrfs-reference suite only covers on-disk fixture parity.
+    ParitySuite {
+        id: "btrfs-lib",
+        package: "ffs-btrfs",
+        targets: &["--lib"],
+        exact: &[
+            "tests::chunk_entries_round_trip_out_of_the_chunk_tree_bd_a136s",
+            "tests::growth_device_is_read_from_the_dev_item_bd_a136s",
+            "tests::delayed_ref_queue_shared_extent_refcount",
+            "tests::flush_delayed_refs_applies_refcounts",
+            "crash_consistency::tests::writeback_cache_crash_matrix_passes_every_invariant",
+            "crash_consistency::tests::writeback_cache_crash_matrix_observes_generation_atomicity",
+            "crash_consistency::proptests::mr_wb_writeback_order_preserves_invariants",
         ],
     },
 ];

@@ -125,6 +125,8 @@ jobs:
             --verify mvcc-lib \
             --verify repair-lib \
             --verify fuse-lib \
+            --verify cli-e2e \
+            --verify btrfs-lib \
             --verify parity-honesty \
             --local
 
