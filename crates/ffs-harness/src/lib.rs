@@ -869,6 +869,45 @@ const PARITY_CONTRACTS: &[(&str, &str, &str, &[&str])] = &[
             "pipeline::tests::recovery_succeeds_with_fresh_symbols_under_write_churn",
         ],
     ),
+    (
+        "FUSE getattr",
+        "Dispatch answers getattr with the backend's metadata",
+        "fuse-lib",
+        &["tests::conformance_fuse_getattr_metadata_round_trip"],
+    ),
+    (
+        "FUSE lookup",
+        "Dispatch answers lookup with the backend's metadata",
+        "fuse-lib",
+        &["tests::conformance_fuse_lookup_metadata_round_trip"],
+    ),
+    (
+        "FUSE readdir",
+        "Dispatch lists a directory the way the backend stores it",
+        "fuse-lib",
+        &["tests::conformance_fuse_readdir_directory_round_trip"],
+    ),
+    (
+        "FUSE read",
+        "Dispatch reads file contents through the backend lifecycle",
+        "fuse-lib",
+        &["tests::conformance_fuse_read_file_lifecycle_round_trip"],
+    ),
+    (
+        "FUSE readlink",
+        "Dispatch resolves a symlink target through the backend",
+        "fuse-lib",
+        &["tests::conformance_fuse_readlink_directory_round_trip"],
+    ),
+    (
+        "FUSE ioctl FIEMAP / FIBMAP",
+        "FIEMAP and FIBMAP report the block mapping the backend actually wrote",
+        "fuse-lib",
+        &[
+            "tests::dispatch_ioctl_fibmap_maps_written_extent_physical_block",
+            "tests::dispatch_ioctl_fiemap_sync_fsyncs_before_extent_lookup",
+        ],
+    ),
 ];
 
 // These test the evidence consumer itself, not filesystem capability rows.
@@ -970,6 +1009,22 @@ const PARITY_SUITES: &[ParitySuite] = &[
             "storage::tests::storage_multi_generation_upgrade",
             "pipeline::tests::evidence_ledger_captures_all_events",
             "pipeline::tests::recovery_succeeds_with_fresh_symbols_under_write_churn",
+        ],
+    },
+    // The FUSE rows are proven at the dispatch boundary, which is where the FUSE
+    // ABI behavior lives; the mounted end-to-end tests are a separate job.
+    ParitySuite {
+        id: "fuse-lib",
+        package: "ffs-fuse",
+        targets: &["--lib"],
+        exact: &[
+            "tests::conformance_fuse_getattr_metadata_round_trip",
+            "tests::conformance_fuse_lookup_metadata_round_trip",
+            "tests::conformance_fuse_readdir_directory_round_trip",
+            "tests::conformance_fuse_read_file_lifecycle_round_trip",
+            "tests::conformance_fuse_readlink_directory_round_trip",
+            "tests::dispatch_ioctl_fibmap_maps_written_extent_physical_block",
+            "tests::dispatch_ioctl_fiemap_sync_fsyncs_before_extent_lookup",
         ],
     },
 ];

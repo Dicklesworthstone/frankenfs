@@ -56,12 +56,20 @@
 > recovery orchestrator + evidence ledger`. Those eight tests need no external
 > tools, so CI selects them alongside the ext4 suites (installing e2fsprogs first,
 > because a missing tool makes the differential tests report skipped and the step
-> fails closed). Running all seven suites in one invocation executes 65 tests and
-> verifies twenty-one exact contracts of 97 declared rows; readiness stays false
+> fails closed). Running all eight suites in one invocation executes 72 tests and
+> verifies twenty-seven exact contracts of 97 declared rows; readiness stays false
 > until every row carries such evidence. Three tests in the differential binaries
 > exercise rows already credited through `ext4-reference`, and a contract names
 > one suite, so they stay executed but unmapped rather than running
 > `kernel_reference` twice.
+>
+> **2026-09-12 FUSE dispatch binding:** `--verify fuse-lib` runs seven ffs-fuse unit
+> tests at the dispatch boundary — where the FUSE ABI behavior actually lives — and
+> backs `FUSE getattr`, `FUSE lookup`, `FUSE readdir`, `FUSE read`, `FUSE readlink`
+> and `FUSE ioctl FIEMAP / FIBMAP`. The mounted end-to-end tests stay a separate CI
+> job, and the rows that describe the live mount (`FUSE mount runtime`, the mount
+> background scrub lifecycle) remain unmapped because no unit test can establish
+> them.
 >
 > **Repair integration update:** explicit request contexts now reach attached
 > refresh lifecycles, and failed/cancelled refresh batches preserve pending work.

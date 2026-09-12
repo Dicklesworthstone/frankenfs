@@ -124,6 +124,7 @@ jobs:
             --verify ext4-kernel-differential \
             --verify mvcc-lib \
             --verify repair-lib \
+            --verify fuse-lib \
             --verify parity-honesty \
             --local
 
