@@ -785,6 +785,42 @@ const PARITY_CONTRACTS: &[(&str, &str, &str, &[&str])] = &[
         "ext4-reference",
         &["ext4_large_isize_high_matches_debugfs_and_openfs"],
     ),
+    (
+        "btrfs superblock decode",
+        "Generated image superblock and root tree agree with the btrfs-progs golden",
+        "btrfs-reference",
+        &["btrfs_small_superblock_and_root_tree_match_golden"],
+    ),
+    (
+        "btrfs sys_chunk mapping",
+        "Generated image chunk layout matches the btrfs-progs golden",
+        "btrfs-reference",
+        &["btrfs_small_chunk_layout_matches_golden"],
+    ),
+    (
+        "btrfs item payload decode (ROOT/INODE/DIR/EXTENT_DATA)",
+        "Generated image directory entries and file extent views match the btrfs-progs golden",
+        "btrfs-reference",
+        &["btrfs_medium_directory_and_file_views_match_golden"],
+    ),
+    (
+        "btrfs read-only tree walk",
+        "Generated image subvolume catalog from the root tree matches the btrfs-progs golden",
+        "btrfs-reference",
+        &["btrfs_large_subvolume_catalog_matches_golden"],
+    ),
+    (
+        "btrfs transparent decompression (ZLIB/LZO/ZSTD)",
+        "Generated image large compressed extent reads back matching the btrfs-progs golden",
+        "btrfs-reference",
+        &["btrfs_large_compressed_extent_and_readback_match_golden"],
+    ),
+    (
+        "btrfs send/receive streams",
+        "Generated image send stream agrees with the btrfs-progs receive-dump reference",
+        "btrfs-reference",
+        &["btrfs_send_stream_matches_btrfs_receive_dump_reference"],
+    ),
 ];
 
 // These test the evidence consumer itself, not filesystem capability rows.
@@ -826,10 +862,11 @@ impl ExecutionGatedParityReport {
         for suite in suites {
             if !matches!(
                 suite.as_str(),
-                "ext4-journal" | "ext4-reference" | "parity-honesty"
+                "ext4-journal" | "ext4-reference" | "btrfs-reference" | "parity-honesty"
             ) {
                 bail!(
-                    "unknown parity suite {suite}; use ext4-journal, ext4-reference or parity-honesty"
+                    "unknown parity suite {suite}; use ext4-journal, ext4-reference, \
+                     btrfs-reference or parity-honesty"
                 );
             }
             if !selected.insert(suite.as_str()) {
@@ -843,6 +880,11 @@ impl ExecutionGatedParityReport {
             match *suite {
                 "ext4-journal" => args.extend(["--test", "ext4_journal_recovery"]),
                 "ext4-reference" => args.extend(["--test", "kernel_reference"]),
+                // bd-wh1xk: the btrfs goldens are captured from btrfs-progs, so this
+                // suite needs it installed and at the golden's anchor version, or its
+                // tests soft-skip and the suite cannot pass. That is also why CI
+                // selects its suites explicitly rather than running every suite.
+                "btrfs-reference" => args.extend(["--test", "btrfs_kernel_reference"]),
                 "parity-honesty" => args.push("--lib"),
                 _ => unreachable!("validated above"),
             }

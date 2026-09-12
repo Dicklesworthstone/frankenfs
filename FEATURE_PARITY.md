@@ -27,6 +27,20 @@
 > by `canonical_gates::tests::catalog_commands_equal_the_spec_document`, so the
 > catalog cannot drift from §22 silently.
 >
+> **2026-09-12 btrfs execution binding:** the same evidence path now covers btrfs
+> through a fourth suite, `--verify btrfs-reference` (`--test btrfs_kernel_reference`),
+> with six exact contract mappings for the rows that suite verifies: superblock
+> decode, sys_chunk mapping, item payload decode (ROOT/INODE/DIR/EXTENT_DATA),
+> read-only tree walk, transparent decompression, and send/receive streams. Each
+> mapping names an exact test that compares a generated image against a golden
+> captured from btrfs-progs, so nothing is credited from a filename pattern; the
+> suite's own consistency test is deliberately left unmapped because it validates
+> the fixture schema rather than filesystem behavior. That suite needs btrfs-progs
+> installed at the golden's anchor version, otherwise its tests soft-skip and it
+> cannot pass — which is why CI selects its parity suites explicitly instead of
+> running every suite. Mapped contracts now total fifteen of 97 declared rows;
+> readiness is still false.
+>
 > **Repair integration update:** explicit request contexts now reach attached
 > refresh lifecycles, and failed/cancelled refresh batches preserve pending work.
 > Scrub no longer regenerates symbols from detected corruption or recovers from

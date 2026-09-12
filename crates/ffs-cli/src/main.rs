@@ -1329,7 +1329,7 @@ enum Command {
         /// Output in JSON format.
         #[arg(long)]
         json: bool,
-        /// Execute ext4-journal, ext4-reference, or the parity-honesty self-check.
+        /// Execute ext4-journal, ext4-reference, btrfs-reference, or the parity-honesty self-check.
         #[arg(long)]
         verify: Vec<String>,
         /// Execute canonical spec §22 gates: `all`, or one or more of gate1..gate7.
