@@ -537,8 +537,10 @@ pub enum TestOutcome {
     Skipped,
 }
 
-/// Counts and exact test names read from one libtest JSON stream. There must be
-/// one start, one completion and matching per-test events for the selected suite.
+/// Counts and exact test names read from one libtest JSON stream. A crate-level
+/// `cargo test` emits one suite block per test target, so a stream may carry
+/// several; each block must start, complete and agree with its own events, and no
+/// test name may repeat across blocks.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct TestResults {
     pub selected: u64,
@@ -548,6 +550,10 @@ pub struct TestResults {
     pub skipped: u64,
     pub filtered_out: u64,
     pub tests: std::collections::BTreeMap<String, TestOutcome>,
+    /// The stream was complete and well-formed but selected no test at all: a
+    /// filter that matched nothing. Distinct from a malformed or truncated
+    /// stream, and never a pass.
+    pub empty_selection: bool,
     pub error: Option<String>,
 }
 
@@ -593,11 +599,22 @@ impl TestResults {
     }
 
     fn read_stream(&mut self, stdout: &[u8]) -> Result<(), String> {
-        let mut started = false;
+        // One `cargo test -p crate` invocation runs every test target of that
+        // crate, so the stream carries one suite block per target. Each block is
+        // validated on its own; counts aggregate across blocks. A test name may
+        // not repeat across blocks either: the libtest events carry no target
+        // identity, gate filters make cross-target collisions impossible, and a
+        // repeat means the stream duplicated output.
+        let mut in_suite = false;
         let mut finished = false;
+        let mut blocks = 0_u64;
         let mut pending = std::collections::BTreeSet::new();
-        let mut reported_ignored = 0;
-        let mut soft_skipped = 0;
+        let mut block_selected = 0_u64;
+        let mut block_executed = 0_u64;
+        let mut block_passed = 0_u64;
+        let mut block_failed = 0_u64;
+        let mut block_ignored = 0_u64;
+        let mut block_soft_skipped = 0_u64;
         for line in std::str::from_utf8(stdout)
             .map_err(|e| e.to_string())?
             .lines()
@@ -613,11 +630,17 @@ impl TestResults {
                     .ok_or_else(|| format!("libtest event lacks {name}"))
             };
             match (event["type"].as_str(), event["event"].as_str()) {
-                (Some("suite"), Some("started")) if !started => {
-                    started = true;
-                    self.selected = count("test_count")?;
+                (Some("suite"), Some("started")) if !in_suite => {
+                    in_suite = true;
+                    finished = false;
+                    block_selected = count("test_count")?;
+                    block_executed = 0;
+                    block_passed = 0;
+                    block_failed = 0;
+                    block_ignored = 0;
+                    block_soft_skipped = 0;
                 }
-                (Some("test"), Some(kind)) if started && !finished => {
+                (Some("test"), Some(kind)) if in_suite && !finished => {
                     let name = event["name"].as_str().ok_or("test event lacks name")?;
                     if kind == "started" {
                         if self.tests.contains_key(name) || !pending.insert(name.to_owned()) {
@@ -630,49 +653,63 @@ impl TestResults {
                     }
                     let outcome = match kind {
                         "ok" | "failed" if pending.remove(name) => {
-                            self.executed += 1;
+                            block_executed += 1;
                             if kind == "failed" {
-                                self.failed += 1;
+                                block_failed += 1;
                                 TestOutcome::Failed
                             } else if event["stdout"].as_str().is_some_and(has_skip_marker) {
-                                soft_skipped += 1;
-                                self.skipped += 1;
+                                block_soft_skipped += 1;
                                 TestOutcome::Skipped
                             } else {
-                                self.passed += 1;
+                                block_passed += 1;
                                 TestOutcome::Passed
                             }
                         }
                         "ignored" => {
                             pending.remove(name);
-                            reported_ignored += 1;
-                            self.skipped += 1;
+                            block_ignored += 1;
                             TestOutcome::Skipped
                         }
                         _ => return Err(format!("unexpected test event {kind}: {name}")),
                     };
                     self.tests.insert(name.to_owned(), outcome);
                 }
-                (Some("suite"), Some("ok" | "failed")) if started && !finished => {
+                (Some("suite"), Some("ok" | "failed")) if in_suite && !finished => {
                     finished = true;
-                    self.filtered_out = count("filtered_out")?;
-                    if count("passed")? != self.passed + soft_skipped
-                        || count("failed")? != self.failed
-                        || count("ignored")? != reported_ignored
-                        || self.selected != self.executed + reported_ignored
+                    in_suite = false;
+                    blocks += 1;
+                    if count("passed")? != block_passed + block_soft_skipped
+                        || count("failed")? != block_failed
+                        || count("ignored")? != block_ignored
+                        || block_selected != block_executed + block_ignored
                         || !pending.is_empty()
                     {
                         return Err("libtest summary disagrees with named test events".to_owned());
                     }
-                    if event["event"] == "ok" && self.failed != 0 {
+                    if event["event"] == "ok" && block_failed != 0 {
                         return Err("successful suite contains failing tests".to_owned());
                     }
+                    self.selected += block_selected;
+                    self.executed += block_executed;
+                    self.passed += block_passed;
+                    self.failed += block_failed;
+                    self.skipped += block_ignored + block_soft_skipped;
+                    self.filtered_out += count("filtered_out")?;
                 }
                 _ => return Err("unexpected or repeated libtest suite event".to_owned()),
             }
         }
-        if !finished || self.selected == 0 || self.executed == 0 {
+        if blocks == 0 || in_suite || !finished {
+            return Err("incomplete libtest stream".to_owned());
+        }
+        if self.selected == 0 {
+            // A well-formed stream whose filter matched nothing. Never a pass, and
+            // distinguishable from a malformed stream or an all-ignored run.
+            self.empty_selection = true;
             return Err("no complete, nonempty test execution".to_owned());
+        }
+        if self.executed == 0 {
+            return Err("no test executed: every selected test was ignored or skipped".to_owned());
         }
         Ok(())
     }
@@ -754,6 +791,12 @@ impl TestRunEvidence {
     #[must_use]
     pub fn results(&self) -> &TestResults {
         &self.results
+    }
+
+    /// Process evidence for the invocation that produced these results.
+    #[must_use]
+    pub fn execution(&self) -> &ExecutedEvidence {
+        &self.execution
     }
 
     /// All selected tests must actually pass. Ignored tests and soft skips do
@@ -1012,6 +1055,72 @@ mod tests {
                 "{corrupt}"
             );
         }
+    }
+
+    // A crate-level `cargo test -p <crate>` runs every test target of that crate,
+    // so one invocation legitimately carries several suite blocks. Counts
+    // aggregate across them, and a well-formed stream that selected nothing is
+    // marked as an empty selection rather than reported as a pass.
+    #[test]
+    fn test_evidence_aggregates_multi_target_streams_and_flags_empty_selection() {
+        let block = |name: &str| {
+            format!(
+                concat!(
+                    "{{\"type\":\"suite\",\"event\":\"started\",\"test_count\":1}}\n",
+                    "{{\"type\":\"test\",\"event\":\"started\",\"name\":\"{name}\"}}\n",
+                    "{{\"type\":\"test\",\"event\":\"ok\",\"name\":\"{name}\"}}\n",
+                    "{{\"type\":\"suite\",\"event\":\"ok\",\"passed\":1,\"failed\":0,",
+                    "\"ignored\":0,\"filtered_out\":7}}\n",
+                ),
+                name = name
+            )
+        };
+        let empty_block = concat!(
+            "{\"type\":\"suite\",\"event\":\"started\",\"test_count\":0}\n",
+            "{\"type\":\"suite\",\"event\":\"ok\",\"passed\":0,\"failed\":0,\"ignored\":0,\"filtered_out\":708}\n",
+        );
+        let multi = format!(
+            "{}{}{empty_block}",
+            block("gate1_lib"),
+            block("gate1_integration")
+        );
+        let results = TestResults::parse(multi.as_bytes());
+        assert!(results.error.is_none(), "{:?}", results.error);
+        assert_eq!(results.selected, 2);
+        assert_eq!(results.executed, 2);
+        assert_eq!(results.passed, 2);
+        assert_eq!(results.filtered_out, 722);
+        assert!(!results.empty_selection);
+        assert_eq!(results.tests.len(), 2);
+
+        // A repeated test name across blocks is still refused.
+        let duplicated =
+            TestResults::parse(format!("{}{}", block("same"), block("same")).as_bytes());
+        assert!(duplicated.error.is_some());
+
+        let empty = TestResults::parse(empty_block.as_bytes());
+        assert!(empty.error.is_some());
+        assert!(empty.selected == 0 && empty.executed == 0);
+        assert!(empty.empty_selection);
+        assert_eq!(empty.filtered_out, 708);
+
+        // An all-ignored run selected a real test and executed none: it is a
+        // failure, never an "empty selection".
+        let ignored = concat!(
+            "{\"type\":\"suite\",\"event\":\"started\",\"test_count\":1}\n",
+            "{\"type\":\"test\",\"event\":\"ignored\",\"name\":\"gate_test\"}\n",
+            "{\"type\":\"suite\",\"event\":\"ok\",\"passed\":0,\"failed\":0,\"ignored\":1,\"filtered_out\":0}\n",
+        );
+        let ignored = TestResults::parse(ignored.as_bytes());
+        assert!(ignored.error.is_some());
+        assert!(ignored.selected == 1 && ignored.executed == 0);
+        assert!(!ignored.empty_selection);
+
+        // A truncated multi-target stream is malformed, not an empty selection.
+        let truncated = multi.lines().take(2).collect::<Vec<_>>().join("\n");
+        let truncated = TestResults::parse(truncated.as_bytes());
+        assert!(truncated.error.is_some());
+        assert!(!truncated.empty_selection);
     }
 
     #[test]

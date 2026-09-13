@@ -7,14 +7,14 @@
     "meta": "Harness plumbing, operational readiness reports, evidence packaging, dashboards, gates, schedulers, benchmark/report metadata, and CLI/runtime support around those lanes."
   },
   "summary": {
-    "modules": 89,
-    "total_loc": 169437,
+    "modules": 90,
+    "total_loc": 170694,
     "conformance_modules": 24,
     "conformance_loc": 43194,
-    "conformance_loc_basis_points": 2549,
-    "meta_modules": 65,
-    "meta_loc": 126243,
-    "meta_loc_basis_points": 7451
+    "conformance_loc_basis_points": 2530,
+    "meta_modules": 66,
+    "meta_loc": 127500,
+    "meta_loc_basis_points": 7470
   },
   "modules": [
     {
@@ -71,6 +71,11 @@
       "path": "src/btrfs_send_receive_corpus.rs",
       "classification": "conformance",
       "loc": 918
+    },
+    {
+      "path": "src/canonical_gates.rs",
+      "classification": "meta",
+      "loc": 769
     },
     {
       "path": "src/casefold_corpus.rs",
@@ -130,7 +135,7 @@
     {
       "path": "src/executed_evidence.rs",
       "classification": "meta",
-      "loc": 1187
+      "loc": 1316
     },
     {
       "path": "src/fault_injection_corpus.rs",
@@ -165,7 +170,7 @@
     {
       "path": "src/lib.rs",
       "classification": "meta",
-      "loc": 2351
+      "loc": 2608
     },
     {
       "path": "src/log_contract.rs",
@@ -185,7 +190,7 @@
     {
       "path": "src/main.rs",
       "classification": "meta",
-      "loc": 11216
+      "loc": 11318
     },
     {
       "path": "src/metamorphic_workload_seed_catalog.rs",

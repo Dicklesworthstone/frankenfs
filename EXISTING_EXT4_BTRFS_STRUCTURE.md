@@ -1434,6 +1434,21 @@ commits for common operations (file appends, inode updates) without a
 full JBD2 transaction commit. The fast commit log is appended after the
 main journal and uses a separate replay path.
 
+Linux v6.19 `ext4_fc_value_len_isvalid` validates the complete TLV payload
+before replay dispatch: HEAD is exactly 8 bytes, ADD_RANGE exactly 16,
+DEL_RANGE exactly 12, and CREAT/LINK/UNLINK contain two 32-bit inode numbers
+followed by 1–255 name bytes (9–263 total). INODE contains a 32-bit inode
+number plus 128 through the superblock's configured inode-size bytes.
+TAIL is at least 8 bytes; extra bytes are permitted for padding. PAD accepts
+any payload length. See `fs/ext4/fast_commit.c` lines 1907–1929.
+
+FrankenFS must distinguish a complete record violating these lengths from an
+uncommitted truncated tail: the former is corruption and cannot be downgraded
+to successful JBD2-only recovery by discarding its pending operations. The
+latter retains the existing incomplete-transaction fallback policy. This
+length contract does not establish FC checksum, transaction-ID, block-boundary
+or external crash-replay conformance.
+
 ---
 
 ## 9. Extended Attributes (xattr)

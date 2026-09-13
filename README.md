@@ -20,7 +20,7 @@
   <img src="https://img.shields.io/badge/tests-source--derived-brightgreen" alt="Tests source-derived">
   <img src="https://img.shields.io/badge/fuzz%20targets-63-brightgreen" alt="63 fuzz targets">
   <img src="https://img.shields.io/badge/unsafe-forbidden-brightgreen.svg" alt="Unsafe Forbidden">
-  <img src="https://img.shields.io/badge/runtime-asupersync%200.3-blueviolet.svg" alt="asupersync 0.3 runtime">
+  <img src="https://img.shields.io/badge/runtime-asupersync%200.5-blueviolet.svg" alt="asupersync 0.5 runtime">
   <img src="https://img.shields.io/badge/status-experimental-yellow.svg" alt="Experimental">
 </p>
 
@@ -40,7 +40,7 @@ It runs as a normal Linux process via FUSE. `ParityReport::current()` prints 97/
 | **RaptorQ self-healing** | Fountain-coded repair symbols (RFC 6330), Bayesian Beta-posterior durability autopilot, four refresh policies (`Eager` / `Lazy` / `Adaptive` / `Hybrid`), percentile-based stale-window SLO monitoring | Scrub detects corruption; `ffs repair` / `ffs fsck --repair` can recover offline when repair symbols are available. Mounted repair requires explicit `--background-repair --background-scrub-ledger <jsonl>` and records a durable evidence trail. Hybrid refresh has benchmark coverage for lower p95 stale-window age under write-heavy workloads; the exact percentage remains benchmark-artifact scoped. |
 | **Writeback-cache safety net** | Per-inode `staged ≥ visible ≥ durable` epoch state machine, six formal invariants (I1–I6), 12-scenario crash/replay artifact gate, runtime kill switch | Kernel FUSE `writeback_cache` can reorder visibility in ways MVCC must account for. FrankenFS opts in *only* with `--rw --writeback-cache` plus three accepted-artifact gates, a matching host/lane manifest, and a disarmed kill switch. `flush` stays non-durable; `fsync` / `fsyncdir` are the durability boundaries operators reason about. |
 | **Memory safety** | `#![forbid(unsafe_code)]` in first-party crates, edition 2024 (nightly), workspace lint enforcement | Prohibits direct unsafe operations in those crates; soundness of vendored transport and dependencies remains part of the safety boundary. |
-| **Structured concurrency** | [asupersync](https://github.com/Dicklesworthstone/asupersync) 0.3.9: `Cx` capability contexts, regions, two-phase reserve/commit channels, deterministic `LabRuntime` | The required architecture uses structured concurrency. Current CLI/FUSE workers also use standard threads, and some repair-flush paths use `Cx::current()`. Complete explicit-context propagation and worker scoping remain implementation gaps. |
+| **Structured concurrency** | [asupersync](https://github.com/Dicklesworthstone/asupersync) 0.5.0: `Cx` capability contexts, regions, two-phase reserve/commit channels, deterministic `LabRuntime` | The required architecture uses structured concurrency. Current CLI/FUSE workers also use standard threads. Complete explicit-context propagation and worker scoping remain implementation gaps. |
 | **Userspace FUSE** | Vendored `fuser` 0.17.0 with ABI 7.42 enabled; runs as a normal process | Debug with `gdb`, profile with `perf`, replace the binary without a reboot. Per-core transport is wired in source; that wiring alone does not establish mounted correctness or a speedup. |
 
 ---
@@ -772,7 +772,16 @@ The native WAL in `ffs-mvcc`:
 
 ## Deep Dive: Structured Concurrency with asupersync
 
-FrankenFS requires [`asupersync`](https://github.com/Dicklesworthstone/asupersync) and currently declares version 0.3.9. Core filesystem APIs are synchronous and context-aware; standard-thread workers remain alongside runtime-managed tasks. Full structured ownership and cancellation propagation are required integration work.
+FrankenFS requires [`asupersync`](https://github.com/Dicklesworthstone/asupersync) and currently declares version 0.5.0. Core filesystem APIs are synchronous and context-aware; standard-thread workers remain alongside runtime-managed tasks. Full structured ownership and cancellation propagation are required integration work.
+
+The 0.5.0 dependency migration is prepared but its native validation is pending.
+The existing `test-internals` feature remains enabled because CLI/FUSE request
+factories and test fixtures use it. The migration does not establish capability
+enforcement for standard-library file I/O. Before qualification, run the retained
+`ffs-block` test `file_byte_device_preserves_runtime_context_and_cancellation`,
+the `ffs-repair` codec suite, and the workspace gates; compare repair-symbol
+golden output against the previous dependency before claiming on-disk repair
+compatibility. Mounted, crash-recovery, and performance evidence remain separate.
 
 ### Why not tokio?
 
@@ -3747,7 +3756,7 @@ Full normative scope: [`COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md`](COMPREHENSIVE_S
 - **Swarm responsiveness claims require permissioned large-host evidence.** Local swarm workload and tail-latency smoke lanes are downgrade artifacts; only fresh `authoritative_large_host` proof-bundle lanes strengthen `swarm.responsiveness`.
 - **Default CLI mount path does not enable optional backpressure / per-core scheduling hooks.** `ffs-cli mount` defaults to the `standard` runtime mode without wiring `BackpressureGate` controls.
 - **Mount background scrub is detection-only by default**, with explicit automatic repair available via `--background-repair --background-scrub-ledger <jsonl>`. Read-write repair uses the mounted MVCC request-scope authority so recovered blocks share the same serializer as client writes.
-- **External dependencies.** Workspace dependencies declare `asupersync = 0.3.9` and `ftui = 0.3.1`; local path overrides can be supplied with Cargo `[patch]` during sibling-repo development. `vendor/fuser` 0.17.0 is selected via `[patch.crates-io]` with ABI 7.42 enabled.
+- **External dependencies.** Workspace dependencies declare `asupersync = 0.5.0` and `ftui = 0.3.1`; local path overrides can be supplied with Cargo `[patch]` during sibling-repo development. `vendor/fuser` 0.17.0 is selected via `[patch.crates-io]` with ABI 7.42 enabled.
 - **Legacy reference corpus is not included.** The Linux kernel ext4/btrfs source used for behavioral extraction (~205K lines) is gitignored due to size. Extracted contracts are in [`EXISTING_EXT4_BTRFS_STRUCTURE.md`](EXISTING_EXT4_BTRFS_STRUCTURE.md). For the original source, see `git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git` at tag v6.19.
 - **Multi-host repair is single-host only in V1.x.** Lease-based ownership coordination exists; concurrent write-side repair across hosts is V1.x-deferred.
 - **Hostile-image safety is a separate claim.** Containment is implemented and threat-modeled, but `security.hostile_image` is release-gated and requires its own proof-bundle lanes before docs may improve wording.

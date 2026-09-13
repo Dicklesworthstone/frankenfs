@@ -4458,6 +4458,99 @@ mod tests {
     }
 
     #[test]
+    fn file_byte_device_preserves_runtime_context_and_cancellation() {
+        let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+            .build()
+            .expect("native runtime");
+        let budget = asupersync::Budget::INFINITE.with_poll_quota(64);
+        let owner = runtime.request_cx_with_budget(budget);
+        assert!(Cx::current().is_none());
+        assert!(owner.timer_driver().is_some());
+        let full_guard = Cx::set_current(Some(owner.clone()));
+        let restricted = {
+            let _guard = owner
+                .restrict::<asupersync::cx::cap::None>()
+                .set_current_restricted();
+            Cx::current().expect("restricted caller")
+        };
+        let capabilities = restricted.capabilities();
+        assert_eq!(
+            [
+                capabilities.spawn,
+                capabilities.time,
+                capabilities.entropy,
+                capabilities.io,
+                capabilities.remote,
+            ],
+            [false; 5]
+        );
+        assert_eq!(restricted.task_id(), owner.task_id());
+        assert_eq!(restricted.region_id(), owner.region_id());
+        assert_eq!(restricted.budget(), budget);
+
+        // Reinstall after the original restriction guard has gone away. This
+        // must preserve the caller's mask even though the owning task is full.
+        let restricted_guard = Cx::set_current(Some(restricted));
+        let cx = Cx::current().expect("reinstalled caller");
+        assert_eq!(cx.capabilities(), capabilities);
+        assert!(cx.timer_driver().is_none());
+        let factories = StdArc::new(AtomicUsize::new(0));
+        let entered = factories.clone();
+        let spawn = cx.spawn(move |_| {
+            entered.fetch_add(1, Ordering::SeqCst);
+            async {}
+        });
+        assert!(matches!(
+            spawn,
+            Err(asupersync::runtime::SpawnError::RuntimeUnavailable)
+        ));
+        assert_eq!(factories.load(Ordering::SeqCst), 0);
+
+        let directory = tempfile::tempdir().expect("retained fixture").keep();
+        let path = directory.join("runtime-context.img");
+        eprintln!("retained native block fixture: {}", path.display());
+        std::fs::write(&path, [0_u8; 64]).expect("seed image");
+        let device = FileByteDevice::open(&path).expect("open owned file");
+        // The explicitly supplied file remains usable. Cx checkpoints enforce
+        // cancellation here; its IO mask does not fence std::fs operations.
+        device
+            .write_all_at(&cx, ByteOffset(8), &[42_u8; 8])
+            .expect("write live caller");
+        device.sync(&cx).expect("sync live caller");
+        let mut read = [0_u8; 8];
+        device
+            .read_exact_at(&cx, ByteOffset(8), &mut read)
+            .expect("read live caller");
+        assert_eq!(read, [42_u8; 8]);
+        let before = std::fs::read(&path).expect("persisted bytes");
+        let epochs = device.sync_epochs();
+
+        owner.cancel_with(asupersync::CancelKind::User, Some("cancel file caller"));
+        assert!(matches!(
+            device.write_all_at(&cx, ByteOffset(8), &[99_u8; 8]),
+            Err(FfsError::Cancelled)
+        ));
+        read.fill(17);
+        assert!(matches!(
+            device.read_exact_at(&cx, ByteOffset(8), &mut read),
+            Err(FfsError::Cancelled)
+        ));
+        assert!(matches!(device.sync(&cx), Err(FfsError::Cancelled)));
+        assert_eq!(read, [17_u8; 8]);
+        assert_eq!(std::fs::read(&path).expect("unchanged image"), before);
+        assert_eq!(device.sync_epochs(), epochs);
+        assert_eq!(cx.capabilities(), capabilities);
+        assert_eq!(cx.budget(), budget);
+
+        drop(restricted_guard);
+        let restored = Cx::current().expect("restored owner");
+        assert_eq!(restored.task_id(), owner.task_id());
+        assert_eq!(restored.capabilities(), owner.capabilities());
+        drop(full_guard);
+        assert!(Cx::current().is_none());
+    }
+
+    #[test]
     fn file_byte_device_cannot_extend_its_file_so_fdatasync_suffices() {
         let cx = Cx::for_testing();
         let dir = tempfile::tempdir().expect("tempdir");

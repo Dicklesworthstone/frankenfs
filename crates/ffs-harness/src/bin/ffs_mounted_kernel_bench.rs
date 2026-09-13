@@ -170,6 +170,15 @@ const DEFAULT_HOST_QUIET_SAMPLES: usize = 5;
 const DEFAULT_HOST_QUIET_TIMEOUT_MS: u64 = 300_000;
 const MAX_HOST_QUIET_SAMPLES: usize = 60;
 const MAX_HOST_QUIET_TIMEOUT_MS: u64 = 900_000;
+/// Where arm mountpoints live.
+///
+/// `/tmp` is not a style choice: AppArmor's `fusermount3` profile permits mounts
+/// only under `$HOME/**`, `/mnt/**`, `/media/**`, `/tmp/**` and
+/// `$XDG_RUNTIME_DIR/**` (with `nosuid,nodev` and no `allow_other`). A mountpoint
+/// anywhere else fails with `fusermount3: mount failed: Permission denied` and the
+/// real reason appears only in `dmesg` as `apparmor="DENIED" ... info="failed
+/// mntpnt match"`, which reads like a permissions bug in the caller. The same rule
+/// applies to any ad-hoc `ffs mount` used to reproduce a fixture defect.
 const MOUNT_ROOT: &str = "/tmp/frankenfs-mounted-kernel-mounts";
 const DEFAULT_PARALLEL_THREADS: usize = 8;
 /// One daemon CPU is what every banked row was measured at; see `Config::fuse_cpu_count`.
@@ -672,6 +681,16 @@ struct Config {
     /// unindexed construction so both can be measured in one window on one ELF,
     /// and forces `BLOCKED_UNFAIR_FIXTURE` so it can never be quoted as a row.
     fixture_construction: FixtureConstruction,
+    /// Build and validate the fixture, then stop (bd-y0hzq).
+    ///
+    /// Fixture construction is load-independent — it creates files and checks the
+    /// resulting image — but the comparator normally reaches it only AFTER the
+    /// placement preflight, so a fixture-level defect cannot be diagnosed on a
+    /// host that is too busy to admit a measurement. This mode runs the same
+    /// `create_base_image` / `seed_fixture_through_mount` / `validate_image` calls,
+    /// reports their outcome, and exits. It takes no timing, mounts no arm, and
+    /// cannot produce a bankable row.
+    fixture_only: bool,
     output: Option<PathBuf>,
 }
 
@@ -774,6 +793,7 @@ impl Default for Config {
             harness_builder: String::new(),
             candidate_builder: String::new(),
             fixture_construction: FixtureConstruction::Seeded,
+            fixture_only: false,
             output: None,
         }
     }
@@ -1552,6 +1572,10 @@ is a transport it pays and we otherwise do not (bd-w2u82)\n\
            --fixture-construction MODE    seeded | baked (default seeded). `baked` restores the\n\
                                           pre-bd-plkzd unindexed fixture for ATTRIBUTION ONLY and\n\
                                           FORCES the BLOCKED_UNFAIR_FIXTURE verdict (bd-pb85e)\n\
+           --fixture-only                 Build and validate the fixture, print the result, and\n\
+                                          exit: no placement preflight, no arms, no timing, no\n\
+                                          bankable row. Fixture work is load-independent, which is\n\
+                                          what makes a fixture defect diagnosable on a busy host\n\
            --observation-repeats N        min-of-N repeats for read-only workloads (default 3)\n\
            --kernel-occupancy-padding N   UNTIMED extra batches per kernel-arm visit (default 0)\n\
            --fuse-occupancy-padding N     UNTIMED extra batches per FrankenFS-arm visit (default 0)\n\
@@ -1563,10 +1587,29 @@ is a transport it pays and we otherwise do not (bd-w2u82)\n\
            --pre-measurement-settle-ms N  Untimed delay after durable fixture setup (default 1000)\n\
            --host-quiet-samples N         Consecutive clear host-wide samples (default 5)\n\
            --host-quiet-timeout-ms N      Fail-closed quiet-window timeout (default 300000)\n\
-           --harness-builder ID           Machine that built this driver ELF (required)\n\
-           --candidate-builder ID         Machine that built the candidate ELF (required)\n\
+           --harness-builder ID           Machine that built this driver ELF (required unless\n\
+                                          --fixture-only)\n\
+           --candidate-builder ID         Machine that built the candidate ELF (required unless\n\
+                                          --fixture-only)\n\
            --out PATH                     JSON report path (default inside run dir)\n\
-           -h, --help                     Show this help"
+           -h, --help                     Show this help\n\
+\n\
+         Environment notes, all measured on hosts this ran on:\n\
+\n\
+         * Mountpoints are created under /tmp/frankenfs-mounted-kernel-mounts. That is\n\
+           not a preference: AppArmor's fusermount3 profile allows mounts only under\n\
+           $HOME/**, /mnt/**, /media/**, /tmp/** and $XDG_RUNTIME_DIR/**. Elsewhere the\n\
+           mount fails with a bare \"Permission denied\" whose cause is only in dmesg.\n\
+         * A host with NO cpufreq interface (a VM where the hypervisor owns frequency\n\
+           selection) is allowed to run. It records cpu_frequency_drivers and\n\
+           scaling_governors as `unavailable`, which is a different claim from\n\
+           `performance`; a host where SOME CPUs expose the interface and others do not\n\
+           is still refused, because that is an anomaly rather than a host class.\n\
+         * The disk floor is 4 x (filesystems x 7 images x --image-size-mib) plus a\n\
+           40 GiB absolute reserve, checked before anything is created. --fixture-only\n\
+           needs one image per filesystem instead of the arm set.\n\
+         * --fixture-only needs no candidate ELF, no builders and no quiet window: it\n\
+           builds and validates the fixture only, takes no timing, and cannot be banked."
     );
 }
 
@@ -1681,6 +1724,9 @@ fn bulk_durable_total_bytes(operations: usize) -> Result<usize> {
 /// a remote worker and copied to this host. Record which worker produced
 /// each one: a binary of unknown origin is not evidence.
 fn validate_builder_provenance(config: &Config) -> Result<()> {
+    if config.fixture_only {
+        return Ok(());
+    }
     for (value, flag) in [
         (&config.harness_builder, "--harness-builder"),
         (&config.candidate_builder, "--candidate-builder"),
@@ -1716,6 +1762,13 @@ fn validate_candidate_comparison(comparison: &CandidateComparison) -> Result<()>
 /// silently changing what a mutating row measures. Mutating rows also require a
 /// single repeat so every timed row has one durability boundary.
 fn validate_mutating_workload_rules(config: &Config) -> Result<()> {
+    // Both rules below protect TIMED rows: padding would advance filesystem state
+    // outside the timed contract, and a single repeat is what gives each mutating
+    // row one durability boundary. `--fixture-only` takes no timing at all, so a
+    // mutating workload there is only a fixture shape.
+    if config.fixture_only {
+        return Ok(());
+    }
     ensure!(
         !config.workload.is_mutating()
             || (config.kernel_occupancy_padding == 0 && config.fuse_occupancy_padding == 0),
@@ -1779,15 +1832,21 @@ fn validate_durable_overwrite_image_capacity(config: &Config) -> Result<()> {
 }
 
 fn validate_config(config: &Config) -> Result<()> {
-    ensure!(
-        !config.ffs_cli.as_os_str().is_empty(),
-        "--ffs-cli is required"
-    );
-    ensure!(
-        config.ffs_cli.is_file(),
-        "ffs-cli does not exist: {}",
-        config.ffs_cli.display()
-    );
+    // `--fixture-only` never executes a candidate: it builds and validates an
+    // image. Requiring a production ELF (and its builder pedigree) for that would
+    // be exactly the coupling this mode exists to remove, so those checks are
+    // skipped when the run cannot produce a measurement at all.
+    if !config.fixture_only {
+        ensure!(
+            !config.ffs_cli.as_os_str().is_empty(),
+            "--ffs-cli is required"
+        );
+        ensure!(
+            config.ffs_cli.is_file(),
+            "ffs-cli does not exist: {}",
+            config.ffs_cli.display()
+        );
+    }
     validate_builder_provenance(config)?;
     // bd-zth9k: refuse an invocation whose --client-threads cannot take effect.
     // It used to be parsed, validated and silently discarded, so the run executed
@@ -1922,6 +1981,9 @@ fn apply_config_flag(
         }
         "--ffs-cli" => {
             config.ffs_cli = parse_value::<PathBuf>(args, index, "--ffs-cli")?;
+        }
+        "--fixture-only" => {
+            config.fixture_only = true;
         }
         "--fuse-transport" => {
             let value = parse_value::<String>(args, index, "--fuse-transport")?;
@@ -2923,6 +2985,17 @@ fn fixture_tree_bytes(config: &Config) -> u64 {
         .saturating_mul(per_entry)
 }
 
+/// Free-space floor for a full arm set, as the floor tests pin it.
+///
+/// Production code computes the image count explicitly (see
+/// [`required_free_bytes_with_images`]) because `--fixture-only` stages one image
+/// per filesystem instead of the arm set, so this wrapper is only reached from
+/// tests now.
+#[cfg(test)]
+fn required_free_bytes(config: &Config) -> Result<u64> {
+    required_free_bytes_with_images(config, IMAGES_PER_FILESYSTEM)
+}
+
 /// Free bytes `/data` must have before this configuration may start
 /// (bd-btrfs-warm-stat-5x-9pxn1).
 ///
@@ -2930,13 +3003,16 @@ fn fixture_tree_bytes(config: &Config) -> u64 {
 /// [`ABSOLUTE_FREE_RESERVE_BYTES`] for why a flat constant was wrong in both
 /// directions. Saturating throughout — an overflow here must fail CLOSED (an
 /// unreachably large floor), never wrap to a small one.
-fn required_free_bytes(config: &Config) -> Result<u64> {
+///
+/// `--fixture-only` stages one base image per filesystem instead of the full arm
+/// set, so it must not be held to the arm-set floor it never fills.
+fn required_free_bytes_with_images(config: &Config, images_per_filesystem: u64) -> Result<u64> {
     let image_bytes = config
         .image_size_mib
         .checked_mul(1024 * 1024)
         .ok_or_else(|| anyhow!("image byte count overflow"))?;
     let staged = requested_filesystem_count(config.filesystems)
-        .saturating_mul(IMAGES_PER_FILESYSTEM)
+        .saturating_mul(images_per_filesystem)
         .saturating_mul(image_bytes)
         .saturating_add(fixture_tree_bytes(config));
     Ok(staged
@@ -6120,10 +6196,62 @@ fn cgroup_cpuset_effective() -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+/// How strictly a per-CPU frequency-provenance file must be readable.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum FrequencyProvenance {
+    /// Every allowed CPU must expose the file.
+    EveryCpu,
+    /// Either every allowed CPU exposes the file, or none does.
+    ///
+    /// A virtualized host whose hypervisor owns frequency selection has no
+    /// cpufreq interface at all, so there is no governor or driver policy to
+    /// record. That is reported as `unavailable` — never as a policy that passed
+    /// — and the run remains comparable only to runs that say the same thing.
+    /// PARTIAL coverage stays a hard error: some CPUs exposing the interface and
+    /// others not is a real anomaly, unlike a host class where it cannot exist.
+    EveryCpuOrNone,
+    /// Any subset may be missing.
+    AnySubset,
+}
+
+/// Whether a provenance read satisfies its requirement.
+///
+/// Split out from the sysfs read so the accept/reject matrix is unit-testable on
+/// hosts that have a cpufreq interface and on hosts that do not.
+fn frequency_coverage_allowed(
+    filename: &str,
+    covered: usize,
+    allowed: usize,
+    requirement: FrequencyProvenance,
+) -> Result<()> {
+    ensure!(
+        covered <= allowed,
+        "{filename} provenance covers {covered} of {allowed} allowed CPUs"
+    );
+    match requirement {
+        FrequencyProvenance::AnySubset => Ok(()),
+        FrequencyProvenance::EveryCpu => {
+            ensure!(
+                covered == allowed,
+                "{filename} provenance covers {covered} of {allowed} allowed CPUs"
+            );
+            Ok(())
+        }
+        FrequencyProvenance::EveryCpuOrNone => {
+            ensure!(
+                covered == 0 || covered == allowed,
+                "{filename} provenance covers only {covered} of {allowed} allowed CPUs: partial \
+                 coverage is an anomaly. A host with no cpufreq interface covers none"
+            );
+            Ok(())
+        }
+    }
+}
+
 fn per_cpu_frequency_value(
     cpus: &BTreeSet<usize>,
     filename: &str,
-    required: bool,
+    requirement: FrequencyProvenance,
 ) -> Result<BTreeMap<usize, String>> {
     let mut values = BTreeMap::new();
     for &cpu in cpus {
@@ -6140,37 +6268,53 @@ fn per_cpu_frequency_value(
                 );
                 values.insert(cpu, value.to_owned());
             }
-            Err(error) if !required && error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error)
+                if requirement != FrequencyProvenance::EveryCpu
+                    && error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => {
                 return Err(error)
                     .with_context(|| format!("read CPU frequency policy {}", path.display()));
             }
         }
     }
-    if required {
-        ensure!(
-            values.len() == cpus.len(),
-            "{filename} provenance covers {} of {} allowed CPUs",
-            values.len(),
-            cpus.len()
-        );
-    }
+    frequency_coverage_allowed(filename, values.len(), cpus.len(), requirement)?;
     Ok(values)
 }
 
 fn cpu_frequency_policy(cpus: &BTreeSet<usize>) -> Result<CpuFrequencyPolicy> {
+    let drivers =
+        per_cpu_frequency_value(cpus, "scaling_driver", FrequencyProvenance::EveryCpuOrNone)?;
+    let governors = per_cpu_frequency_value(
+        cpus,
+        "scaling_governor",
+        FrequencyProvenance::EveryCpuOrNone,
+    )?;
+    ensure!(
+        drivers.is_empty() == governors.is_empty(),
+        "cpufreq driver and governor provenance disagree: {} driver values, {} governor values",
+        drivers.len(),
+        governors.len()
+    );
     Ok(CpuFrequencyPolicy {
-        drivers: per_cpu_frequency_value(cpus, "scaling_driver", true)?,
-        governors: per_cpu_frequency_value(cpus, "scaling_governor", true)?,
+        drivers,
+        governors,
         energy_performance_preferences: per_cpu_frequency_value(
             cpus,
             "energy_performance_preference",
-            false,
+            FrequencyProvenance::AnySubset,
         )?,
     })
 }
 
+/// Render the distinct provenance values, naming an absent interface out loud.
+///
+/// An empty map must never render as an empty string: that reads like a value
+/// nobody filled in. `unavailable` says the host has no cpufreq interface, which
+/// is a different claim from `performance` and has to look different.
 fn distinct_frequency_values(values: &BTreeMap<usize, String>) -> String {
+    if values.is_empty() {
+        return "unavailable".to_owned();
+    }
     values
         .values()
         .cloned()
@@ -7586,6 +7730,80 @@ fn wait_for_child(child: &mut Child, timeout: Duration) -> Result<()> {
         }
         thread::sleep(Duration::from_millis(20));
     }
+}
+
+/// Build and validate the fixture for this configuration, then stop (bd-y0hzq).
+///
+/// This runs the same `create_base_image`, `seed_fixture_through_mount` and
+/// `validate_image` sequence the measured path runs, without the placement
+/// preflight, the arm mounts or any timing. Fixture construction is
+/// load-independent, so a fixture defect is diagnosable on a busy host — which is
+/// the only way a defect of this shape gets a cause instead of a guess.
+fn fixture_only_run(
+    config: &Config,
+    run_dir: &Path,
+    scratch_dir: &Path,
+    fixture_root: &Path,
+) -> Result<Option<PathBuf>> {
+    let interrupted = AtomicBool::new(false);
+    let requested = match config.filesystems {
+        RequestedFilesystems::Ext4 => vec![FilesystemKind::Ext4],
+        RequestedFilesystems::Btrfs => vec![FilesystemKind::Btrfs],
+        RequestedFilesystems::Both => vec![FilesystemKind::Ext4, FilesystemKind::Btrfs],
+    };
+    let mut fixtures = Vec::with_capacity(requested.len());
+    for kind in requested {
+        // Mirror `fs_report`: the base image belongs under the scratch root, which
+        // `prepare_scratch_dir` clears at the start of every invocation. Passing the
+        // artifact run dir here instead put the image outside that clearing and a
+        // second invocation in the same artifact root died on EEXIST creating it.
+        let fs_dir = scratch_dir.join(kind.label());
+        fs::create_dir(&fs_dir).with_context(|| format!("create {}", fs_dir.display()))?;
+        let base = create_base_image(kind, fixture_root, &fs_dir, config)?;
+        // A workload whose fixture directory is built through a kernel mount gets
+        // the same seeding and the same post-seed validation the measured path
+        // runs, against the same base image.
+        let seeded_through_mount =
+            if let Some(fixture) = SeededFixture::for_workload(config.workload) {
+                seed_fixture_through_mount(kind, &base, fixture, config.operations, &interrupted)?;
+                validate_image(kind, &base)?;
+                true
+            } else {
+                false
+            };
+        fixtures.push(json!({
+            "filesystem": kind.label(),
+            "base_image": base.display().to_string(),
+            "base_image_sha256": file_sha256(&base)?,
+            "image_size_mib": config.image_size_mib,
+            "operations": config.operations,
+            "workload": config.workload.label(),
+            "fixture_construction": config.fixture_construction.label(),
+            "seeded_through_mount": seeded_through_mount,
+            "validate": "pass",
+        }));
+    }
+    let fixture_count = fixtures.len();
+    let report = json!({
+        "schema_version": 1,
+        "mode": "fixture_only",
+        "note": "fixture construction and validation only: no placement preflight, no arms, no timing",
+        "fixtures": fixtures,
+    });
+    let output = config
+        .output
+        .clone()
+        .unwrap_or_else(|| run_dir.join("fixture-only-report.json"));
+    fs::write(
+        &output,
+        format!("{}\n", serde_json::to_string_pretty(&report)?),
+    )
+    .with_context(|| format!("write fixture-only report {}", output.display()))?;
+    println!(
+        "fixture_only,verdict=pass,fixtures={fixture_count},report={}",
+        output.display()
+    );
+    Ok(Some(output))
 }
 
 // This is the auditable four-arm transaction boundary. Splitting its context
@@ -9149,19 +9367,16 @@ fn run() -> Result<Option<PathBuf>> {
         config.client_threads(),
         host.allowed_cpus_before_pin.len()
     );
-    let ffs_binary_identity = inspect_ffs_binary(&config.ffs_cli, config.allow_non_pgo_candidate)?;
+    let ffs_binary_identity = if config.fixture_only {
+        None
+    } else {
+        Some(inspect_ffs_binary(
+            &config.ffs_cli,
+            config.allow_non_pgo_candidate,
+        )?)
+    };
     let harness_sha = current_elf_sha256()?;
     println!("bench_evidence,binary_sha256={harness_sha}");
-    println!(
-        "candidate_identity,binary_sha256={},pgo_profile_sha256={},isa=x86-64-v3,build_mode={},verdict=pass",
-        ffs_binary_identity.binary_sha256,
-        ffs_binary_identity.pgo_profile_sha256,
-        if config.allow_non_pgo_candidate {
-            "authorized_non_pgo"
-        } else {
-            "production_pgo"
-        },
-    );
     // Where each ELF was built is recorded, and whether it had to be copied
     // here is derived from that rather than assumed: see `RetrievalProvenance`.
     let retrieval = RetrievalProvenance::classify(
@@ -9169,14 +9384,26 @@ fn run() -> Result<Option<PathBuf>> {
         &config.candidate_builder,
         &host.hostname,
     );
-    println!(
-        "binary_provenance,driver_elf_sha256={harness_sha},driver_built_on={},candidate_elf_sha256={},candidate_built_on={},executed_on={},retrieval={}",
-        config.harness_builder,
-        ffs_binary_identity.binary_sha256,
-        config.candidate_builder,
-        host.hostname,
-        retrieval.label(),
-    );
+    if let Some(ffs_binary_identity) = &ffs_binary_identity {
+        println!(
+            "candidate_identity,binary_sha256={},pgo_profile_sha256={},isa=x86-64-v3,build_mode={},verdict=pass",
+            ffs_binary_identity.binary_sha256,
+            ffs_binary_identity.pgo_profile_sha256,
+            if config.allow_non_pgo_candidate {
+                "authorized_non_pgo"
+            } else {
+                "production_pgo"
+            },
+        );
+        println!(
+            "binary_provenance,driver_elf_sha256={harness_sha},driver_built_on={},candidate_elf_sha256={},candidate_built_on={},executed_on={},retrieval={}",
+            config.harness_builder,
+            ffs_binary_identity.binary_sha256,
+            config.candidate_builder,
+            host.hostname,
+            retrieval.label(),
+        );
+    }
     println!(
         "codegen_isa,target_arch={},compile_sse2={},compile_sse4_2={},compile_avx={},compile_avx2={},compile_f16c={},compile_fma={},compile_avx512f={},compile_avx512bw={},runtime_sse2={},runtime_sse4_2={},runtime_avx={},runtime_avx2={},runtime_f16c={},runtime_fma={},runtime_avx512f={},runtime_avx512bw={}",
         env::consts::ARCH,
@@ -9224,11 +9451,16 @@ fn run() -> Result<Option<PathBuf>> {
     );
 
     let free_before = free_bytes_for_artifacts(&config.artifact_root)?;
-    let free_floor = required_free_bytes(&config)?;
+    let images_per_filesystem = if config.fixture_only {
+        1
+    } else {
+        IMAGES_PER_FILESYSTEM
+    };
+    let free_floor = required_free_bytes_with_images(&config, images_per_filesystem)?;
     ensure!(
         free_before >= free_floor,
         "{} has {:.1} GiB free, below the {:.1} GiB abort floor this configuration \
-         requires ({} filesystem(s) x {IMAGES_PER_FILESYSTEM} images of \
+         requires ({} filesystem(s) x {images_per_filesystem} images of \
          {} MiB, plus a {:.1} GiB fixture tree, x{SCRATCH_SAFETY_FACTOR} safety, \
          plus a {:.0} GiB absolute reserve)",
         config.artifact_root.display(),
@@ -9256,6 +9488,12 @@ fn run() -> Result<Option<PathBuf>> {
         protect_report_dir_from_reclaim(report_dir, &scratch_dir);
     }
     let fixture_root = create_fixture_tree(&scratch_dir, &config)?;
+    if config.fixture_only {
+        return fixture_only_run(&config, &run_dir, &scratch_dir, &fixture_root);
+    }
+    // Everything below measures, so a candidate was inspected above.
+    let ffs_binary_identity =
+        ffs_binary_identity.expect("a measuring run inspects its candidate ELF first");
     let placement = select_cpu_placement(
         config.client_threads(),
         config.fuse_cpu_count,
@@ -11884,6 +12122,44 @@ mod tests {
         assert!(!policy.governor_warning());
         policy.governors.insert(1, "powersave".to_owned());
         assert!(policy.governor_warning());
+    }
+
+    /// A host with no cpufreq interface at all (virtualized) must be able to run
+    /// and must SAY so; partial coverage stays a hard error.
+    #[test]
+    fn frequency_provenance_accepts_an_absent_interface_but_not_partial_coverage() {
+        use FrequencyProvenance::{AnySubset, EveryCpu, EveryCpuOrNone};
+        assert!(frequency_coverage_allowed("scaling_driver", 4, 4, EveryCpu).is_ok());
+        assert!(frequency_coverage_allowed("scaling_driver", 0, 4, EveryCpu).is_err());
+        assert!(frequency_coverage_allowed("scaling_driver", 3, 4, EveryCpu).is_err());
+        assert!(frequency_coverage_allowed("scaling_driver", 0, 4, EveryCpuOrNone).is_ok());
+        assert!(frequency_coverage_allowed("scaling_driver", 4, 4, EveryCpuOrNone).is_ok());
+        assert!(frequency_coverage_allowed("scaling_driver", 3, 4, EveryCpuOrNone).is_err());
+        assert!(frequency_coverage_allowed("scaling_driver", 1, 4, EveryCpuOrNone).is_err());
+        assert!(frequency_coverage_allowed("scaling_driver", 2, 4, AnySubset).is_ok());
+        assert!(frequency_coverage_allowed("scaling_driver", 0, 4, AnySubset).is_ok());
+        assert!(frequency_coverage_allowed("scaling_driver", 5, 4, AnySubset).is_err());
+    }
+
+    #[test]
+    fn absent_cpufreq_is_reported_as_unavailable_not_as_a_policy() {
+        let policy = CpuFrequencyPolicy {
+            drivers: BTreeMap::new(),
+            governors: BTreeMap::new(),
+            energy_performance_preferences: BTreeMap::new(),
+        };
+        let json = cpu_frequency_policy_json(&policy);
+        assert_eq!(json["distinct_drivers"], "unavailable");
+        assert_eq!(json["distinct_governors"], "unavailable");
+        assert_eq!(
+            json["distinct_energy_performance_preferences"],
+            "unavailable"
+        );
+        // Absence is not a governor claim in either direction: nothing is
+        // asserted to be `performance`, and no governor is called wrong.
+        assert_eq!(json["governors_by_cpu"], json!({}));
+        assert_eq!(json["non_performance_or_mixed_governor_warning"], false);
+        assert!(!policy.governor_warning());
     }
 
     #[test]

@@ -13,6 +13,122 @@
 > `bd-lc132`; do not interpret `97/97` as
 > successful execution or release readiness.
 >
+> **2026-09-11 canonical gate binding:** §22.1's seven gate commands are now
+> executed rather than assumed. `ffs-harness gates --all` runs each named command
+> through the same execution-evidence path the parity commands use, and either
+> public parity command accepts `--gate all` (or a single `gateN`) to run them
+> alongside its suites. Each gate reports `passed`, `failed`, or
+> `not_implemented`; a Cargo filter that selects zero tests is
+> `not_implemented` — never a pass — and `readiness_verified` requires every
+> capability row to carry executed evidence *and* every canonical gate to pass.
+> No `gateN` test exists in any owning crate yet, so all seven currently report
+> `not_implemented` together with the §22 criteria each one still has to prove.
+> The gate commands, their packages and their filters are pinned to the spec text
+> by `canonical_gates::tests::catalog_commands_equal_the_spec_document`, so the
+> catalog cannot drift from §22 silently.
+>
+> **2026-09-12 btrfs execution binding:** the same evidence path now covers btrfs
+> through a fourth suite, `--verify btrfs-reference` (`--test btrfs_kernel_reference`),
+> with six exact contract mappings for the rows that suite verifies: superblock
+> decode, sys_chunk mapping, item payload decode (ROOT/INODE/DIR/EXTENT_DATA),
+> read-only tree walk, transparent decompression, and send/receive streams. Each
+> mapping names an exact test that compares a generated image against a golden
+> captured from btrfs-progs, so nothing is credited from a filename pattern; the
+> suite's own consistency test is deliberately left unmapped because it validates
+> the fixture schema rather than filesystem behavior. That suite needs btrfs-progs
+> installed at the golden's anchor version, otherwise its tests soft-skip and it
+> cannot pass — which is why CI selects its parity suites explicitly instead of
+> running every suite.
+>
+> **2026-09-12 ext4 kernel-differential binding:** a fifth suite,
+> `--verify ext4-kernel-differential`, runs five separate differential test
+> binaries in one Cargo invocation (group descriptors vs e2fsprogs, indirect block
+> addressing vs debugfs blockcount, inode flags/uid/gid vs debugfs, directory
+> record coalescing, bitmap checksums), and backs two further rows: `ext4 group
+> descriptor decode` and `ext4 indirect block addressing`.
+>
+> **2026-09-12 cross-package suites:** the suite table now carries a package and a
+> list of exact module-qualified test names, so evidence can come from the crates
+> that own the behavior instead of only from the harness. `--verify mvcc-lib`
+> runs four ffs-mvcc unit tests and backs `MVCC snapshot visibility` and `MVCC
+> commit sequencing`; `--verify repair-lib` runs four ffs-repair unit tests and
+> backs `repair symbol storage I/O (dual-slot generation commit)` and `corruption
+> recovery orchestrator + evidence ledger`. Those eight tests need no external
+> tools, so CI selects them alongside the ext4 suites (installing e2fsprogs first,
+> because a missing tool makes the differential tests report skipped and the step
+> fails closed). Running all eight suites in one invocation executes 77 tests and
+> verifies thirty exact contracts of 97 declared rows; readiness stays false until
+> every row carries such evidence. Three tests in the differential binaries
+> exercise rows already credited through `ext4-reference`, and a contract names
+> one suite, so they stay executed but unmapped rather than running
+> `kernel_reference` twice.
+>
+> **2026-09-12 FUSE dispatch binding:** `--verify fuse-lib` runs twelve ffs-fuse unit
+> tests at the dispatch boundary — where the FUSE ABI behavior actually lives — and
+> backs `FUSE getattr`, `FUSE lookup`, `FUSE readdir`, `FUSE read`, `FUSE readlink`
+> and `FUSE ioctl FIEMAP / FIBMAP`, plus `FUSE ioctl EXT4_IOC_GETFLAGS`,
+> `FUSE ioctl EXT4_IOC_GETVERSION / EXT4_IOC_SETVERSION` and
+> `FUSE ioctl EXT4_IOC_SETFLAGS` through the same suite's ioctl dispatch tests.
+> The mounted end-to-end tests stay a separate CI job, and the rows that describe
+> the live mount (`FUSE mount runtime`, the mount background scrub lifecycle, the
+> ABI 7.40 protocol surface) remain unmapped because no dispatch test can establish
+> them.
+>
+> **2026-09-12 CLI and btrfs ownership:** two more suites put evidence where the
+> behavior lives. `--verify cli-e2e` runs whole-binary end-to-end tests from
+> `crates/ffs-cli/tests/cli_e2e.rs`, which spawn the built `ffs` executable and
+> assert on its observable output, backing `CLI inspect command`, `CLI info
+> command`, `CLI fsck command` and `CLI repair command`. `--verify btrfs-lib` runs
+> ffs-btrfs unit tests backing `btrfs chunk tree walking`, `btrfs device tree
+> discovery`, `btrfs delayed refs parity`, `btrfs crash consistency (WB-I1/WB-I2)`
+> and `btrfs metadata writeback serialization`. The same increment added
+> `FUSE ioctl FS_IOC_GETFSLABEL / FS_IOC_SETFSLABEL` and
+> `FUSE ioctl EXT4_IOC_MOVE_EXT` to `fuse-lib`; the MOVE_EXT row's contract is the
+> donor-registration lifecycle and the rejection log fields, because that is what
+> the tests actually witness. All ten suites in one invocation execute 96 tests and
+> verify forty-one exact contracts of 97 declared rows; readiness stays false.
+>
+> **2026-09-12 mechanism-level bindings:** `mvcc-lib` grew the conflict-detection and
+> copy-on-write tests, backing `FCW conflict detection` (disjoint blocks commit,
+> the conflicting block fails with a populated error) and `COW block rewrite path`
+> (repeated rewrites land on distinct physical blocks). A new `--verify journal-lib`
+> suite runs ffs-journal unit tests and backs `ext4 fast commit replay` (inode body
+> carried through replay, forced fallback on unsupported head features) and
+> `ext4 JBD2 checksum verification` (commit and descriptor checksums round-trip,
+> tampering is detected, replay refuses a block whose data checksum disagrees).
+> All eleven suites in one invocation execute 110 tests and verify forty-eight exact
+> contracts of 97 declared rows; readiness stays false. The same pass added
+> `ext4 path resolution` (a kernel-created image's paths resolve to the inode
+> holding the kernel-written content), `FUSE ABI 7.40 protocol surface` (the
+> vendored fuser surface exposes the ABI it claims) and
+> `FUSE pwritev2/io_uring RWF write intent propagation` (append/no-append offset
+> semantics, conflicting flags refused before mutation, read-strict io_uring
+> switch).
+>
+> **2026-09-12 on-disk decode ownership:** a twelfth suite, `--verify ondisk-lib`
+> (package ffs-ondisk), backs `ext4 feature flag validation` (unknown compat bits
+> accounted for), `ext4 casefold (case-insensitive dirs)` (unicode folds including
+> the capital-sigma rule, and a casefold-rebuilt htree stays fold-navigable),
+> `btrfs btree header decode` (header parsed at its kernel-documented offsets),
+> `btrfs leaf item metadata decode` and `btrfs internal node parsing` (leaf and
+> internal items round-trip with keys intact). All twelve suites in one invocation
+> execute 117 tests and verify fifty-three exact contracts of 97 declared rows;
+> readiness stays false.
+>
+> **2026-09-12 retention, SSI and infrastructure rows:** `mvcc-lib` grew nine tests
+> backing `version retention policy` (bounded chains; pressure advances the oldest
+> snapshot only when allowed, refusing at critical pressure with a pinned snapshot)
+> and `SSI dangerous-structure detection` (the structure accumulates across records,
+> detection stops at the first complete one, and read-only, disjoint and
+> empty-write-set cases never form one). Two further suites cover the rows that
+> describe the harness itself, which is the only place those rows may draw evidence
+> from: `--verify conformance` backs `fixture conformance harness` (fixture and
+> golden provenance, and the ext4/btrfs fixtures conform) and
+> `--verify profile-artifacts` backs `benchmark harness` (the canonical criterion
+> artifacts are committed and structured). All fourteen suites in one invocation
+> execute 130 tests and verify fifty-seven exact contracts of 97 declared rows;
+> readiness stays false.
+>
 > **Repair integration update:** explicit request contexts now reach attached
 > refresh lifecycles, and failed/cancelled refresh batches preserve pending work.
 > Scrub no longer regenerates symbols from detected corruption or recovers from

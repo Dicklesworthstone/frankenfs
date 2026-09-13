@@ -1329,11 +1329,18 @@ enum Command {
         /// Output in JSON format.
         #[arg(long)]
         json: bool,
-        /// Execute ext4-journal, ext4-reference, or the parity-honesty self-check.
+        /// Execute a parity suite: ext4-journal, ext4-reference,
+        /// ext4-kernel-differential, btrfs-reference, mvcc-lib, repair-lib,
+        /// journal-lib, ondisk-lib, fuse-lib, cli-e2e, cli-bins, core-lib,
+        /// btrfs-lib, conformance, profile-artifacts, or the parity-honesty
+        /// self-check.
         #[arg(long)]
         verify: Vec<String>,
+        /// Execute canonical spec §22 gates: `all`, or one or more of gate1..gate7.
+        #[arg(long, value_name = "GATE")]
+        gate: Vec<String>,
         /// Run Cargo directly in CI or on an existing build worker.
-        #[arg(long, requires = "verify")]
+        #[arg(long)]
         local: bool,
     },
     /// Display the repair evidence ledger (JSONL).
@@ -2508,8 +2515,9 @@ fn run() -> Result<()> {
         Command::Parity {
             json,
             verify,
+            gate,
             local,
-        } => parity(json, &verify, local),
+        } => parity(json, &verify, &gate, local),
         Command::Evidence {
             ledger,
             json,
@@ -9443,7 +9451,7 @@ fn print_fsck_output(json: bool, output: &FsckOutput) -> Result<()> {
     Ok(())
 }
 
-fn parity(json: bool, suites: &[String], local: bool) -> Result<()> {
+fn parity(json: bool, suites: &[String], gates: &[String], local: bool) -> Result<()> {
     let command_span = info_span!(
         target: "ffs::cli::parity",
         "parity",
@@ -9458,7 +9466,10 @@ fn parity(json: bool, suites: &[String], local: bool) -> Result<()> {
     } else {
         ParityExecutor::Rch
     };
-    let report = ExecutionGatedParityReport::run(suites, executor)?;
+    if local && suites.is_empty() && gates.is_empty() {
+        anyhow::bail!("--local requires --verify or --gate");
+    }
+    let report = ExecutionGatedParityReport::run_with_gates(suites, gates, executor)?;
 
     if json {
         println!(
@@ -9486,7 +9497,34 @@ fn parity(json: bool, suites: &[String], local: bool) -> Result<()> {
             "\nCurrent bounded contracts verified: {} / {} capability rows",
             report.evidence_backed_rows, report.total_rows
         );
-        println!("Project readiness: unverified (canonical gate coverage incomplete)");
+        let gates = &report.canonical_gates;
+        if gates.gates.is_empty() {
+            println!("Canonical §22 gates: none executed (pass --gate all to execute them)");
+        } else {
+            println!(
+                "Canonical §22 gates: {} passed, {} failed, {} not implemented",
+                gates.passed_gates().len(),
+                gates.failed_gates().len(),
+                gates.not_implemented_gates().len()
+            );
+            for gate in &gates.gates {
+                match &gate.reason {
+                    Some(reason) => println!("  {} {:?}: {reason}", gate.gate_id, gate.status),
+                    None => println!(
+                        "  {} {:?}: selected={} passed={}",
+                        gate.gate_id, gate.status, gate.selected, gate.passed
+                    ),
+                }
+            }
+        }
+        println!(
+            "Project readiness: {}",
+            if report.readiness_verified {
+                "verified"
+            } else {
+                "unverified (missing evidence or canonical gates)"
+            }
+        );
         for contract in &report.contracts {
             if let Some(reason) = &contract.reason {
                 println!("  {}: {reason}", contract.capability);
@@ -9503,7 +9541,7 @@ fn parity(json: bool, suites: &[String], local: bool) -> Result<()> {
         "parity_complete"
     );
 
-    if !suites.is_empty() {
+    if !suites.is_empty() || !gates.is_empty() {
         report.require_evidence().map_err(anyhow::Error::msg)?;
     }
     Ok(())

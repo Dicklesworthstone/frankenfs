@@ -3143,7 +3143,7 @@ fn build_fc_tag(tag_type: u16, payload: &[u8]) -> Vec<u8> {
 
 fn build_fc_inode_update_transaction(ino: u32, tid: u32, raw_inode: &[u8]) -> Vec<u8> {
     let mut bytes = Vec::new();
-    bytes.extend(build_fc_tag(0x09, &[0; 16]));
+    bytes.extend(build_fc_tag(0x09, &[0; 8]));
     let mut inode_payload = ino.to_le_bytes().to_vec();
     inode_payload.extend_from_slice(raw_inode);
     bytes.extend(build_fc_tag(0x06, &inode_payload));
@@ -3229,9 +3229,10 @@ fn build_ext4_fast_commit_test_image() -> Vec<u8> {
 fn build_ext4_truncated_fast_commit_test_image() -> Vec<u8> {
     let mut image = build_ext4_fast_commit_test_image();
     let fc_block = 24 * 4096;
-    let mut truncated = Vec::new();
-    truncated.extend(build_fc_tag(0x09, &[0; 16]));
-    truncated.extend(build_fc_tag(0x06, &42_u32.to_le_bytes()));
+    let inode_offset = 4 * 4096 + 10 * 256;
+    let mut truncated =
+        build_fc_inode_update_transaction(11, 1, &image[inode_offset..inode_offset + 256]);
+    truncated.truncate(truncated.len() - 12); // Remove only the final TAIL TLV.
     image[fc_block..fc_block + 4096].fill(0);
     image[fc_block..fc_block + truncated.len()].copy_from_slice(&truncated);
     image
@@ -3883,8 +3884,7 @@ fn ext4_fast_commit_empty_inode_record_rejects_without_mutating_overlay_source()
     );
     assert!(matches!(
         result,
-        Err(ffs_error::FfsError::UnsupportedFeature(ref reason))
-            if reason.contains("no recoverable inode bytes")
+        Err(ffs_error::FfsError::Corruption { .. })
     ));
     assert_eq!(fs::read(&path).expect("read source after rejection"), image);
 }

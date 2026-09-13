@@ -7419,8 +7419,13 @@ impl OpenFs {
         &self,
         cx: &Cx,
     ) -> Result<Option<Ext4FastCommitReplayEvidence>, FfsError> {
-        let (block_size, journal_inum, journal_dev) = match self.ext4_superblock() {
-            Some(sb) => (sb.block_size, sb.journal_inum, sb.journal_dev),
+        let (block_size, journal_inum, journal_dev, inode_size) = match self.ext4_superblock() {
+            Some(sb) => (
+                sb.block_size,
+                sb.journal_inum,
+                sb.journal_dev,
+                sb.inode_size,
+            ),
             None => return Ok(None),
         };
 
@@ -7447,7 +7452,7 @@ impl OpenFs {
             return Ok(None);
         }
 
-        let replay = replay_fast_commit(&fc_bytes)?;
+        let replay = replay_fast_commit(&fc_bytes, inode_size)?;
         let evidence = Ext4FastCommitReplayEvidence {
             reserved_fc_blocks: journal_sb.num_fc_blocks,
             bytes_collected: u64::try_from(fc_bytes.len()).unwrap_or(u64::MAX),
@@ -9877,6 +9882,32 @@ impl OpenFs {
         })
     }
 
+    /// Block-group flags a chunk is registered with for the in-memory allocator.
+    ///
+    /// The mask MUST include [`BTRFS_BLOCK_GROUP_SYSTEM`]. Masking with
+    /// DATA|METADATA alone collapses a `SYSTEM|DUP` chunk (type `2|32 = 34`,
+    /// `34 & 5 = 0`) to zero, and the `== 0` fallback then registers that chunk as
+    /// a DATA block group — after which `alloc_data` hands out data extents inside
+    /// the SYSTEM chunk's logical range. `btrfs check` reports one
+    /// `type mismatch with chunk` per such extent while the kernel still mounts
+    /// and reads the image, so the mis-accounting of the chunk that carries the
+    /// system array is silent. Measured on a fixture whose SYSTEM chunk is 8 MiB:
+    /// seven 1 MiB data extents landed in it (bd-y0hzq), and `02cc006d`
+    /// (bd-hk5w3) is the commit that added SYSTEM to this mask.
+    ///
+    /// The fallback stays for chunks carrying none of the three type bits: those
+    /// are unrecognised rather than system space, and DATA is the conservative
+    /// reading of an unknown chunk.
+    fn btrfs_block_group_alloc_flags(chunk_type: u64) -> u64 {
+        let typed = chunk_type
+            & (BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_SYSTEM);
+        if typed == 0 {
+            BTRFS_BLOCK_GROUP_DATA
+        } else {
+            typed
+        }
+    }
+
     fn block_bitmap_units_per_group(geo: &FsGeometry) -> u32 {
         if geo
             .feature_ro_compat
@@ -9989,13 +10020,7 @@ impl OpenFs {
             } else {
                 0
             };
-            let alloc_flags = chunk.chunk_type
-                & (BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_SYSTEM);
-            let alloc_flags = if alloc_flags == 0 {
-                BTRFS_BLOCK_GROUP_DATA
-            } else {
-                alloc_flags
-            };
+            let alloc_flags = Self::btrfs_block_group_alloc_flags(chunk.chunk_type);
             extent_alloc.add_block_group(
                 chunk.key.offset,
                 BtrfsBlockGroupItem {
@@ -13587,6 +13612,41 @@ impl OpenFs {
         // holes/prealloc gaps.
         let out: &mut [u8] = &mut dst[..to_read];
         let read_end = offset.saturating_add(to_read as u64);
+        // bd-opjvw: the extent items covering this window must be disjoint, and the
+        // overlap has to be caught HERE — before anything is written into `out` —
+        // because "no output mutation on error" is part of the read contract.
+        // Detecting it later means an earlier extent has already filled its bytes
+        // and the caller is handed a buffer the call refused to produce.
+        //
+        // A hole or prealloc item starting inside an earlier extent used to be the
+        // silent case: the assembly loop zero-filled over the live bytes, so the
+        // file read back as if it had been truncated to the hole's start. btrfs
+        // never writes such a pair and `btrfs check` reports one error per pair, so
+        // removing the earlier extent's bytes is not a defensible interpretation —
+        // the image is corrupt and the read must say so.
+        {
+            let mut covered = offset;
+            for (logical_start, extent) in extents.iter() {
+                let Some(extent_end) = logical_start.checked_add(extent.file_len()) else {
+                    return Err(FfsError::Corruption {
+                        block: *logical_start,
+                        detail: "extent logical range overflow".into(),
+                    });
+                };
+                let overlap_start = (*logical_start).max(offset);
+                let overlap_end = extent_end.min(read_end);
+                if overlap_start >= overlap_end {
+                    continue;
+                }
+                if overlap_start < covered {
+                    return Err(FfsError::Corruption {
+                        block: *logical_start,
+                        detail: "overlapping btrfs file extents".into(),
+                    });
+                }
+                covered = overlap_end;
+            }
+        }
         let zero_fill_range =
             |out: &mut [u8], range_start: u64, range_end: u64| -> Result<(), FfsError> {
                 if range_start >= range_end {
@@ -46503,7 +46563,7 @@ mod tests {
         assert_eq!(fc.replay.blocks_scanned, 1);
         assert_eq!(
             fc.replay.operations,
-            vec![ffs_journal::FcOperation::InodeUpdate(42, Vec::new())]
+            vec![ffs_journal::FcOperation::InodeUpdate(42, vec![0; 128])]
         );
 
         let target = fs.read_block_vec(&cx, BlockNumber(15)).unwrap();
@@ -47127,6 +47187,50 @@ mod tests {
     }
 
     #[test]
+    fn fast_commit_open_rejects_invalid_tlv_lengths_preserving_recovery_records() {
+        let cx = Cx::for_testing();
+        for raw_len in [0, 1, 127, 257] {
+            for committed_prefix in [false, true] {
+                let mut image = build_ext4_image_with_fast_commit_create_evidence();
+                let mut stream = if committed_prefix {
+                    build_fc_create_transaction(2, 11, b"hello.txt", 1)
+                } else {
+                    Vec::new()
+                };
+                stream.extend(build_fc_tag(9, &[0; 8]));
+                let mut inode = 11_u32.to_le_bytes().to_vec();
+                inode.resize(4 + raw_len, 0);
+                stream.extend(build_fc_tag(6, &inode));
+                stream.extend(build_fc_tag(8, &[1, 0, 0, 0, 0, 0, 0, 0]));
+                image[24 * 4096..26 * 4096].fill(0);
+                image[24 * 4096..24 * 4096 + stream.len()].copy_from_slice(&stream);
+                for mode in [
+                    Ext4JournalReplayMode::Apply,
+                    Ext4JournalReplayMode::SimulateOverlay,
+                ] {
+                    let device = TestDevice::from_vec(image.clone());
+                    let view = device.clone();
+                    let options = OpenOptions {
+                        ext4_journal_replay_mode: mode,
+                        ..OpenOptions::default()
+                    };
+                    for _ in 0..2 {
+                        let error = OpenFs::from_device(&cx, Box::new(device.clone()), &options)
+                            .expect_err("a complete malformed inode TLV must stop recovery");
+                        assert!(matches!(error, FfsError::Corruption { .. }));
+                        let after = view.snapshot_bytes();
+                        assert_eq!(&after[24 * 4096..26 * 4096], &image[24 * 4096..26 * 4096]);
+                        assert_eq!(&after[4 * 4096..5 * 4096], &image[4 * 4096..5 * 4096]);
+                        if mode == Ext4JournalReplayMode::SimulateOverlay {
+                            assert_eq!(after, image);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn fast_commit_apply_rejects_fallback_that_would_discard_committed_prefix() {
         let mut image = build_ext4_image_with_fast_commit_create_evidence();
         let payload = build_fc_create_transaction(2, 11, b"hello.txt", 1);
@@ -47361,8 +47465,8 @@ mod tests {
         assert_eq!(
             fc.replay.operations,
             vec![
-                ffs_journal::FcOperation::InodeUpdate(42, Vec::new()),
-                ffs_journal::FcOperation::InodeUpdate(43, Vec::new()),
+                ffs_journal::FcOperation::InodeUpdate(42, vec![0; 128]),
+                ffs_journal::FcOperation::InodeUpdate(43, vec![0; 128]),
             ]
         );
     }
@@ -48738,8 +48842,10 @@ mod tests {
 
     fn build_fc_inode_update_transaction(ino: u32, tid: u32) -> Vec<u8> {
         let mut bytes = Vec::new();
-        bytes.extend(build_fc_tag(0x09, &[0; 16]));
-        bytes.extend(build_fc_tag(0x06, &ino.to_le_bytes()));
+        bytes.extend(build_fc_tag(0x09, &[0; 8]));
+        let mut payload = ino.to_le_bytes().to_vec();
+        payload.extend_from_slice(&[0; 128]);
+        bytes.extend(build_fc_tag(0x06, &payload));
         let mut tail = [0_u8; 8];
         tail[..4].copy_from_slice(&tid.to_le_bytes());
         bytes.extend(build_fc_tag(0x08, &tail));
@@ -48748,7 +48854,7 @@ mod tests {
 
     fn build_fc_create_transaction(parent_ino: u32, ino: u32, name: &[u8], tid: u32) -> Vec<u8> {
         let mut bytes = Vec::new();
-        bytes.extend(build_fc_tag(0x09, &[0; 16]));
+        bytes.extend(build_fc_tag(0x09, &[0; 8]));
         let mut payload = Vec::with_capacity(8 + name.len());
         payload.extend_from_slice(&parent_ino.to_le_bytes());
         payload.extend_from_slice(&ino.to_le_bytes());
@@ -49072,9 +49178,8 @@ mod tests {
     fn build_ext4_image_with_truncated_fast_commit_evidence() -> Vec<u8> {
         let mut image = build_ext4_image_with_fast_commit_evidence();
         let fc_block = 24 * 4096;
-        let mut truncated = Vec::new();
-        truncated.extend(build_fc_tag(0x09, &[0; 16]));
-        truncated.extend(build_fc_tag(0x06, &42_u32.to_le_bytes()));
+        let mut truncated = build_fc_inode_update_transaction(42, 1);
+        truncated.truncate(truncated.len() - 12); // Remove only the TAIL TLV.
         image[fc_block..fc_block + 4096].fill(0);
         image[fc_block..fc_block + truncated.len()].copy_from_slice(&truncated);
         image
@@ -57602,6 +57707,47 @@ mod tests {
         assert_eq!(
             OpenFs::btrfs_dir_type_to_file_type(0xFF),
             FileType::RegularFile
+        );
+    }
+
+    #[test]
+    fn btrfs_system_chunks_are_not_registered_as_data_block_groups() {
+        // bd-y0hzq: a SYSTEM|DUP chunk is type 2|32 = 34. Masking with DATA|METADATA
+        // alone gives 34 & 5 = 0, the `== 0` fallback then registers the chunk as a
+        // DATA block group, and the data allocator fills the system chunk with 1 MiB
+        // data extents — which `btrfs check` reports as one "type mismatch with
+        // chunk" per extent. bd-hk5w3 (02cc006d) fixed the mask; this pins it.
+        use ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_DUP;
+        assert_eq!(
+            OpenFs::btrfs_block_group_alloc_flags(BTRFS_BLOCK_GROUP_SYSTEM | BTRFS_BLOCK_GROUP_DUP),
+            BTRFS_BLOCK_GROUP_SYSTEM,
+            "a SYSTEM chunk must never be offered to the data allocator"
+        );
+        assert_eq!(
+            OpenFs::btrfs_block_group_alloc_flags(
+                BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_DUP
+            ),
+            BTRFS_BLOCK_GROUP_METADATA
+        );
+        assert_eq!(
+            OpenFs::btrfs_block_group_alloc_flags(BTRFS_BLOCK_GROUP_DATA),
+            BTRFS_BLOCK_GROUP_DATA
+        );
+        // A mixed DATA|METADATA chunk keeps both bits, and profile bits are dropped.
+        assert_eq!(
+            OpenFs::btrfs_block_group_alloc_flags(
+                BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA
+            ),
+            BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA
+        );
+        // A chunk carrying no type bit at all is unrecognised, not system space.
+        assert_eq!(
+            OpenFs::btrfs_block_group_alloc_flags(BTRFS_BLOCK_GROUP_DUP),
+            BTRFS_BLOCK_GROUP_DATA
+        );
+        assert_eq!(
+            OpenFs::btrfs_block_group_alloc_flags(0),
+            BTRFS_BLOCK_GROUP_DATA
         );
     }
 

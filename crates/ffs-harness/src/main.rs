@@ -579,6 +579,7 @@ fn run() -> Result<()> {
 
     match cmd {
         Some("parity") => parity_cmd(command_args),
+        Some("gates") => gates_cmd(command_args),
         Some("check-fixtures") => check_fixtures_cmd(),
         Some("profile-read-path") => profile_read_path_cmd(&args[1..]),
         Some("generate-fixture") => generate_fixture(&args[1..]),
@@ -718,22 +719,99 @@ fn run() -> Result<()> {
 
 fn parity_cmd(args: &[String]) -> Result<()> {
     let mut suites = Vec::new();
+    let mut gates = Vec::new();
     let mut executor = ParityExecutor::Rch;
     let mut args = args.iter();
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--verify" => suites.push(args.next().context("--verify requires a suite")?.clone()),
+            "--gate" => gates.push(args.next().context("--gate requires a gate id")?.clone()),
             "--local" => executor = ParityExecutor::Cargo,
             _ => bail!("unknown parity argument: {arg}"),
         }
     }
-    if executor == ParityExecutor::Cargo && suites.is_empty() {
-        bail!("--local requires --verify");
+    if executor == ParityExecutor::Cargo && suites.is_empty() && gates.is_empty() {
+        bail!("--local requires --verify or --gate");
     }
-    let report = ExecutionGatedParityReport::run(&suites, executor)?;
+    let report = ExecutionGatedParityReport::run_with_gates(&suites, &gates, executor)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
-    if !suites.is_empty() {
+    if !suites.is_empty() || !gates.is_empty() {
         report.require_evidence().map_err(anyhow::Error::msg)?;
+    }
+    Ok(())
+}
+
+/// Execute the canonical spec §22 gate commands and report their real status.
+///
+/// The gates are named exactly as §22.1 names them, and a filter that selects no
+/// test is reported as `not_implemented` rather than passing. Exits nonzero only
+/// when a gate that has executable tests fails to pass.
+fn gates_cmd(args: &[String]) -> Result<()> {
+    use ffs_harness::canonical_gates::{self, CanonicalGateReport, CanonicalGateStatus};
+
+    let mut gate_ids: Vec<String> = Vec::new();
+    let mut executor = ParityExecutor::Rch;
+    let mut out_path: Option<String> = None;
+    let mut i = 0;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--gate" => {
+                i += 1;
+                gate_ids.push(args.get(i).context("--gate requires a gate id")?.clone());
+            }
+            "--all" => gate_ids.push(canonical_gates::ALL_GATES_ARG.to_owned()),
+            "--local" => executor = ParityExecutor::Cargo,
+            "--out" => {
+                i += 1;
+                out_path = Some(args.get(i).context("--out requires a path")?.clone());
+            }
+            "--help" | "-h" => {
+                print_gates_usage();
+                return Ok(());
+            }
+            other => bail!("unknown gates argument: {other}"),
+        }
+        i += 1;
+    }
+    if gate_ids.is_empty() {
+        gate_ids.push(canonical_gates::ALL_GATES_ARG.to_owned());
+    }
+    let report = CanonicalGateReport::run(&gate_ids, executor)?;
+    let json = serde_json::to_string_pretty(&report)?;
+    if let Some(path) = out_path {
+        std::fs::write(&path, format!("{json}\n"))
+            .with_context(|| format!("write canonical gate report to {path}"))?;
+    }
+    println!("{json}");
+    let failed = report.failed_gates();
+    let not_implemented = report.not_implemented_gates();
+    eprintln!(
+        "canonical §22 gates: {} passed, {} failed, {} not implemented (readiness_verified=false while any gate is not passed)",
+        report.passed_gates().len(),
+        failed.len(),
+        not_implemented.len()
+    );
+    if !not_implemented.is_empty() {
+        eprintln!(
+            "not implemented: {} (each names its §22 command and criteria in the report)",
+            not_implemented.join(", ")
+        );
+    }
+    if !failed.is_empty() {
+        let reasons = report
+            .gates
+            .iter()
+            .filter(|gate| gate.status == CanonicalGateStatus::Failed)
+            .map(|gate| {
+                format!(
+                    "{}: {}",
+                    gate.gate_id,
+                    gate.reason.as_deref().unwrap_or("-")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        bail!("canonical gates failed: {reasons}");
     }
     Ok(())
 }
@@ -9540,6 +9618,7 @@ fn print_usage() {
 #[allow(clippy::too_many_lines)]
 fn print_usage_core_commands() {
     println!("  ffs-harness parity");
+    println!("  ffs-harness gates [--gate ID|all] [--local] [--out FILE]");
     println!("  ffs-harness check-fixtures");
     println!(
         "  ffs-harness profile-read-path --fixture PATH --duration-sec N [--mode cli-inspect|direct-read|fuse-read]"
@@ -10328,6 +10407,29 @@ fn print_source_scope_manifest_usage() {
     println!("  --out FILE                         Write JSON report to FILE");
     println!(
         "  --remove-source-family FAMILY      Negative smoke: omit a required family before validation"
+    );
+}
+
+fn print_gates_usage() {
+    println!("Usage: ffs-harness gates [OPTIONS]");
+    println!();
+    println!("Execute the canonical spec §22.1 gate commands and report their real");
+    println!("status. A filter that selects zero tests is reported as `not_implemented`");
+    println!("and never as `passed`; the command exits nonzero only when a gate that HAS");
+    println!("executable tests fails to pass.");
+    println!();
+    println!("Options:");
+    println!(
+        "  --gate ID                          Execute one gate (gate1..gate7 or all); repeatable"
+    );
+    println!("  --all                              Execute every gate (same as --gate all)");
+    println!("  --local                            Run Cargo directly in CI or on a build worker");
+    println!("  --out FILE                         Write the JSON report to FILE");
+    println!("  --help, -h                         Print this help");
+    println!();
+    println!(
+        "Gates: {}",
+        ffs_harness::canonical_gates::canonical_gate_ids().join(", ")
     );
 }
 

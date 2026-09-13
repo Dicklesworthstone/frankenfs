@@ -11,6 +11,7 @@ pub mod benchmark_taxonomy;
 pub mod btrfs_capability_drift;
 pub mod btrfs_multidevice_corpus;
 pub mod btrfs_send_receive_corpus;
+pub mod canonical_gates;
 pub mod casefold_corpus;
 pub mod chaos_replay_lab;
 pub mod claimability_plan;
@@ -695,7 +696,12 @@ pub struct ExecutionGatedParityReport {
     pub contracts: Vec<VerifiedParityContract>,
     pub selected_suites: Vec<String>,
     pub runs: Vec<executed_evidence::TestRunEvidence>,
-    /// The selected contracts do not cover all canonical gate criteria.
+    /// Canonical §22 gate evidence. Empty when no gate was requested; an empty
+    /// report never counts towards readiness.
+    pub canonical_gates: canonical_gates::CanonicalGateReport,
+    /// Whole-project readiness. True only when every declared capability row has
+    /// exact executed evidence AND every canonical §22 gate passed with a
+    /// nonempty selection. The bounded contracts alone never establish it.
     pub readiness_verified: bool,
 }
 
@@ -756,6 +762,12 @@ const PARITY_CONTRACTS: &[(&str, &str, &str, &[&str])] = &[
         &["ext4_kernel_vs_ffs_extent_mapping"],
     ),
     (
+        "ext4 path resolution",
+        "Paths in a kernel-created image resolve to the inode holding the kernel-written content",
+        "ext4-reference",
+        &["ext4_kernel_vs_ffs_file_content"],
+    ),
+    (
         "ext4 directory entry parsing",
         "Generated ext4 directory entries agree with e2fsprogs",
         "ext4-reference",
@@ -779,6 +791,444 @@ const PARITY_CONTRACTS: &[(&str, &str, &str, &[&str])] = &[
         "ext4-reference",
         &["ext4_large_isize_high_matches_debugfs_and_openfs"],
     ),
+    (
+        "btrfs superblock decode",
+        "Generated image superblock and root tree agree with the btrfs-progs golden",
+        "btrfs-reference",
+        &["btrfs_small_superblock_and_root_tree_match_golden"],
+    ),
+    (
+        "btrfs sys_chunk mapping",
+        "Generated image chunk layout matches the btrfs-progs golden",
+        "btrfs-reference",
+        &["btrfs_small_chunk_layout_matches_golden"],
+    ),
+    (
+        "btrfs item payload decode (ROOT/INODE/DIR/EXTENT_DATA)",
+        "Generated image directory entries and file extent views match the btrfs-progs golden",
+        "btrfs-reference",
+        &["btrfs_medium_directory_and_file_views_match_golden"],
+    ),
+    (
+        "btrfs read-only tree walk",
+        "Generated image subvolume catalog from the root tree matches the btrfs-progs golden",
+        "btrfs-reference",
+        &["btrfs_large_subvolume_catalog_matches_golden"],
+    ),
+    (
+        "btrfs transparent decompression (ZLIB/LZO/ZSTD)",
+        "Generated image large compressed extent reads back matching the btrfs-progs golden",
+        "btrfs-reference",
+        &["btrfs_large_compressed_extent_and_readback_match_golden"],
+    ),
+    (
+        "btrfs send/receive streams",
+        "Generated image send stream agrees with the btrfs-progs receive-dump reference",
+        "btrfs-reference",
+        &["btrfs_send_stream_matches_btrfs_receive_dump_reference"],
+    ),
+    (
+        "ext4 group descriptor decode",
+        "Generated image group descriptors agree with e2fsprogs",
+        "ext4-kernel-differential",
+        &["ext4_group_desc_kernel_reference_matches"],
+    ),
+    (
+        "ext4 indirect block addressing",
+        "Generated no-extent image block maps agree with debugfs blockcount",
+        "ext4-kernel-differential",
+        &["ext4_iblocks_kernel_reference_matches_debugfs_blockcount"],
+    ),
+    (
+        "MVCC snapshot visibility",
+        "A reader sees one consistent snapshot across shards",
+        "mvcc-lib",
+        &[
+            "sharded::tests::snapshot_isolation",
+            "sharded::tests::snapshot_reads_consistent_across_shards",
+        ],
+    ),
+    (
+        "MVCC commit sequencing",
+        "Commit ordering is preserved and replayed exactly once",
+        "mvcc-lib",
+        &[
+            "sharded::tests::commit_snapshots_policy_before_shard_locks",
+            "persist::tests::replay_discards_duplicate_commit_sequence",
+        ],
+    ),
+    (
+        "repair symbol storage I/O (dual-slot generation commit)",
+        "Repair symbol slots commit and upgrade by generation without regression",
+        "repair-lib",
+        &[
+            "storage::tests::storage_round_trip_symbols_and_generation_commit",
+            "storage::tests::storage_multi_generation_upgrade",
+        ],
+    ),
+    (
+        "corruption recovery orchestrator + evidence ledger",
+        "Recovery runs to completion under churn and every event reaches the ledger",
+        "repair-lib",
+        &[
+            "pipeline::tests::evidence_ledger_captures_all_events",
+            "pipeline::tests::recovery_succeeds_with_fresh_symbols_under_write_churn",
+        ],
+    ),
+    (
+        "FUSE getattr",
+        "Dispatch answers getattr with the backend's metadata",
+        "fuse-lib",
+        &["tests::conformance_fuse_getattr_metadata_round_trip"],
+    ),
+    (
+        "FUSE lookup",
+        "Dispatch answers lookup with the backend's metadata",
+        "fuse-lib",
+        &["tests::conformance_fuse_lookup_metadata_round_trip"],
+    ),
+    (
+        "FUSE readdir",
+        "Dispatch lists a directory the way the backend stores it",
+        "fuse-lib",
+        &["tests::conformance_fuse_readdir_directory_round_trip"],
+    ),
+    (
+        "FUSE read",
+        "Dispatch reads file contents through the backend lifecycle",
+        "fuse-lib",
+        &["tests::conformance_fuse_read_file_lifecycle_round_trip"],
+    ),
+    (
+        "FUSE readlink",
+        "Dispatch resolves a symlink target through the backend",
+        "fuse-lib",
+        &["tests::conformance_fuse_readlink_directory_round_trip"],
+    ),
+    (
+        "FUSE ioctl FIEMAP / FIBMAP",
+        "FIEMAP and FIBMAP report the block mapping the backend actually wrote",
+        "fuse-lib",
+        &[
+            "tests::dispatch_ioctl_fibmap_maps_written_extent_physical_block",
+            "tests::dispatch_ioctl_fiemap_sync_fsyncs_before_extent_lookup",
+        ],
+    ),
+    (
+        "FUSE ioctl EXT4_IOC_GETFLAGS",
+        "GETFLAGS returns the file's flags as the ABI encodes them",
+        "fuse-lib",
+        &["tests::dispatch_ioctl_getflags_encodes_u32_response_for_fileattr_path"],
+    ),
+    (
+        "FUSE ioctl EXT4_IOC_GETVERSION / EXT4_IOC_SETVERSION",
+        "The version ioctls carry the inode generation both ways",
+        "fuse-lib",
+        &[
+            "tests::dispatch_ioctl_getversion_encodes_u32_response_for_inode_generation",
+            "tests::dispatch_ioctl_setversion_passes_generation_to_backend_and_commits",
+        ],
+    ),
+    (
+        "FUSE ioctl EXT4_IOC_SETFLAGS",
+        "SETFLAGS routes to the backend and commits the new flags",
+        "fuse-lib",
+        &[
+            "tests::dispatch_ioctl_setflags_routes_to_fsops_and_commits",
+            "tests::dispatch_ioctl_setflags_accepts_8_byte_long_payload_by_using_low_u32",
+        ],
+    ),
+    (
+        "FUSE ioctl FS_IOC_GETFSLABEL / FS_IOC_SETFSLABEL",
+        "The label ioctls carry the filesystem label both ways in the ABI buffer",
+        "fuse-lib",
+        &[
+            "tests::dispatch_ioctl_getfslabel_returns_label_in_256_byte_buffer",
+            "tests::dispatch_ioctl_setfslabel_passes_label_to_backend_and_commits",
+        ],
+    ),
+    (
+        "FUSE ioctl EXT4_IOC_MOVE_EXT",
+        "MOVE_EXT registers the donor for the operation, unregisters it on every exit \
+         path, and logs the rejection contract",
+        "fuse-lib",
+        &[
+            "tests::dispatch_ioctl_move_ext_does_not_double_unregister_after_commit_error",
+            "tests::dispatch_ioctl_move_ext_does_not_unregister_after_register_error",
+            "tests::dispatch_ioctl_move_ext_rejection_logs_contract_fields",
+        ],
+    ),
+    (
+        "FUSE ABI 7.40 protocol surface",
+        "The vendored fuser surface exposes the ABI 7.40 protocol it claims",
+        "fuse-lib",
+        &["tests::vendored_fuser_exposes_abi_7_40_protocol_surface"],
+    ),
+    (
+        "FUSE pwritev2/io_uring RWF write intent propagation",
+        "RWF_APPEND and RWF_NOAPPEND change the write offset the way the flags say, \
+         conflicting flags are refused before any mutation, and the io_uring switch \
+         stays read-strict",
+        "fuse-lib",
+        &[
+            "tests::dispatch_write_rwf_append_uses_current_file_size_as_offset",
+            "tests::dispatch_write_rwf_noappend_suppresses_open_append_offset_rewrite",
+            "tests::dispatch_write_rwf_append_noappend_conflict_rejects_before_mutation",
+            "tests::io_uring_kernel_switch_is_read_strictly_bd_vbqc6",
+        ],
+    ),
+    (
+        "CLI inspect command",
+        "The built binary inspects an ext4 and a btrfs image and reports it as JSON",
+        "cli-e2e",
+        &[
+            "cli_inspect_ext4_returns_json",
+            "cli_inspect_btrfs_returns_json",
+        ],
+    ),
+    (
+        "CLI info command",
+        "The built binary reports both formats' superblocks",
+        "cli-e2e",
+        &[
+            "cli_info_ext4_shows_superblock",
+            "cli_info_btrfs_shows_superblock",
+        ],
+    ),
+    (
+        "CLI fsck command",
+        "The built binary passes a clean image and reports a corrupted superblock",
+        "cli-e2e",
+        &[
+            "cli_fsck_ext4_clean_image",
+            "cli_fsck_corrupted_superblock_reports_error",
+        ],
+    ),
+    (
+        "CLI repair command",
+        "The built binary runs repair in verify-only mode against an ext4 image",
+        "cli-e2e",
+        &["cli_repair_verify_only_ext4"],
+    ),
+    (
+        "btrfs chunk tree walking",
+        "Chunk entries round-trip out of the chunk tree",
+        "btrfs-lib",
+        &["tests::chunk_entries_round_trip_out_of_the_chunk_tree_bd_a136s"],
+    ),
+    (
+        "btrfs device tree discovery",
+        "The device is discovered from its dev item and a contradicting item is refused",
+        "btrfs-lib",
+        &["tests::growth_device_is_read_from_the_dev_item_bd_a136s"],
+    ),
+    (
+        "btrfs delayed refs parity",
+        "Delayed refs queue shared extents and flush applies the refcounts",
+        "btrfs-lib",
+        &[
+            "tests::delayed_ref_queue_shared_extent_refcount",
+            "tests::flush_delayed_refs_applies_refcounts",
+        ],
+    ),
+    (
+        "btrfs crash consistency (WB-I1/WB-I2)",
+        "The writeback crash matrix passes every invariant and observes generation atomicity",
+        "btrfs-lib",
+        &[
+            "crash_consistency::tests::writeback_cache_crash_matrix_passes_every_invariant",
+            "crash_consistency::tests::writeback_cache_crash_matrix_observes_generation_atomicity",
+        ],
+    ),
+    (
+        "btrfs metadata writeback serialization",
+        "Writeback ordering preserves the serialization invariants under the given schedule",
+        "btrfs-lib",
+        &["crash_consistency::proptests::mr_wb_writeback_order_preserves_invariants"],
+    ),
+    (
+        "FCW conflict detection",
+        "First-committer-wins lets disjoint blocks through and fails the conflicting one \
+         with a correctly populated error",
+        "mvcc-lib",
+        &[
+            "tests::fcw_conflict_error_contains_correct_fields",
+            "tests::fcw_multi_block_fails_on_conflicting_block",
+            "tests::fcw_concurrent_disjoint_blocks_all_succeed",
+        ],
+    ),
+    (
+        "COW block rewrite path",
+        "Repeated rewrites of the same logical block land on distinct physical blocks",
+        "mvcc-lib",
+        &["tests::cow_hundred_rewrites_produce_unique_physical_blocks"],
+    ),
+    (
+        "ext4 fast commit replay",
+        "Replay carries the fast-commit inode body and falls back when the head \
+         advertises unsupported features",
+        "journal-lib",
+        &[
+            "fc_tests::replay_fast_commit_carries_inode_body",
+            "fc_tests::replay_head_with_unsupported_fc_features_forces_fallback",
+        ],
+    ),
+    (
+        "ext4 JBD2 checksum verification",
+        "Commit and descriptor checksums round-trip, tampering is detected, and replay \
+         refuses a block whose data checksum does not match",
+        "journal-lib",
+        &[
+            "tests::verify_jbd2_async_commit_commit_checksum_roundtrip_and_tamper_detection",
+            "tests::verify_jbd2_async_commit_descriptor_checksum_roundtrip_and_tamper_detection",
+            "tests::replay_jbd2_csum_v3_data_checksum_mismatch_skips_write",
+        ],
+    ),
+    (
+        "ext4 feature flag validation",
+        "Unknown compat feature bits are accounted for instead of being silently accepted",
+        "ondisk-lib",
+        &["ext4::tests::compat_features_unknown_bits"],
+    ),
+    (
+        "ext4 casefold (case-insensitive dirs)",
+        "Casefold keys fold the way the unicode rules require and an htree rebuilt for \
+         casefold stays navigable",
+        "ondisk-lib",
+        &[
+            "ext4::tests::build_htree_directory_casefold_rebuild_is_fold_navigable_bd_owt2r",
+            "ext4::tests::casefold_eq_matches_key_on_unicode_folds",
+            "ext4::tests::ext4_casefold_key_capital_sigma_folds_like_lowercase_sigma",
+        ],
+    ),
+    (
+        "btrfs btree header decode",
+        "The btree header decodes from its kernel-documented offsets",
+        "ondisk-lib",
+        &["btrfs::tests::btrfs_header_parse_from_block_kernel_offsets_match_ctree_h"],
+    ),
+    (
+        "btrfs leaf item metadata decode",
+        "Leaf items round-trip with their keys intact",
+        "ondisk-lib",
+        &["btrfs::tests::btrfs_proptest_leaf_items_structured_key_roundtrip"],
+    ),
+    (
+        "btrfs internal node parsing",
+        "Internal node items round-trip as structured key pointers",
+        "ondisk-lib",
+        &["btrfs::tests::btrfs_proptest_internal_items_structured_roundtrip"],
+    ),
+    (
+        "version retention policy",
+        "Version chains stay bounded, and chain pressure advances the oldest snapshot \
+         only when it is allowed to, refusing at critical pressure with a pinned snapshot",
+        "mvcc-lib",
+        &[
+            "tests::chain_length_bounded_after_many_writes",
+            "tests::chain_backpressure_rejects_at_critical_with_snapshot_pin",
+            "tests::chain_pressure_without_snapshot_pin_allows_commit",
+            "tests::chain_backpressure_triggers_and_force_advances_oldest_snapshot",
+        ],
+    ),
+    (
+        "SSI dangerous-structure detection",
+        "A dangerous structure accumulates across records and detection stops at the \
+         first complete one, while read-only, disjoint and empty-write-set cases never \
+         form a structure",
+        "mvcc-lib",
+        &[
+            "tests::ssi_dangerous_structure_accumulates_edges_across_records",
+            "tests::ssi_detect_stops_at_first_completed_dangerous_structure",
+            "tests::ssi_empty_write_set_is_never_a_dangerous_structure",
+            "tests::ssi_disjoint_key_spans_do_not_create_edges",
+            "tests::ssi_allows_read_only_transactions",
+        ],
+    ),
+    (
+        "fixture conformance harness",
+        "Committed fixtures and goldens carry provenance, and the ext4/btrfs fixtures \
+         conform through the harness",
+        "conformance",
+        &[
+            "conformance_fixture_provenance_covers_committed_fixtures",
+            "conformance_golden_provenance_covers_committed_artifacts",
+            "ext4_and_btrfs_fixtures_conform",
+        ],
+    ),
+    (
+        "benchmark harness",
+        "The canonical criterion profile artifacts are committed and structured",
+        "profile-artifacts",
+        &["canonical_profile_artifacts_are_committed_and_structured"],
+    ),
+    (
+        "btrfs scrub parity",
+        "Btrfs scrub leaves unallocated zero blocks alone, still detects a zeroed \
+         superblock, and its validator agrees with the composite check on \
+         representative blocks",
+        "repair-lib",
+        &[
+            "scrub::tests::btrfs_scrub_does_not_flag_unallocated_zero_blocks",
+            "scrub::tests::btrfs_scrub_still_detects_zeroed_superblock",
+            "scrub::tests::btrfs_scrub_validator_matches_composite_on_representative_blocks",
+        ],
+    ),
+    (
+        "format-aware scrub superblock validation",
+        "The btrfs superblock validator accepts a valid superblock and backup mirror \
+         and detects checksum corruption, a corrupt mirror, and a mirror carrying the \
+         wrong bytenr, skipping mirrors outside the filesystem",
+        "repair-lib",
+        &[
+            "scrub::tests::btrfs_superblock_validator_accepts_valid_superblock",
+            "scrub::tests::btrfs_superblock_validator_detects_checksum_corruption",
+            "scrub::tests::btrfs_superblock_validator_detects_corrupt_backup_mirror",
+            "scrub::tests::btrfs_superblock_validator_detects_mirror_with_wrong_bytenr",
+            "scrub::tests::btrfs_superblock_validator_skips_mirror_outside_filesystem",
+        ],
+    ),
+    (
+        "durability policy model",
+        "The adaptive policy switches to eager on the posterior, its clamp preserves \
+         the metadata expected loss, it controls the symbol refresh count, and the lazy \
+         policy defers refresh until a scrub or timeout",
+        "repair-lib",
+        &[
+            "pipeline::tests::adaptive_policy_switches_eager_based_on_posterior",
+            "pipeline::tests::adaptive_policy_clamp_preserves_metadata_expected_loss",
+            "pipeline::tests::adaptive_policy_controls_symbol_refresh_count",
+            "pipeline::tests::lazy_policy_defers_refresh_until_scrub_or_timeout",
+        ],
+    ),
+    (
+        "ext4 fallocate range operations",
+        "Collapse and insert preserve preallocated zeros and data, refuse misaligned or \
+         out-of-range requests including one past the maximum file size, and invalid \
+         mode combinations are rejected",
+        "core-lib",
+        &[
+            "tests::ext4_collapse_range_preserves_preallocated_zeros_and_data",
+            "tests::ext4_insert_range_preserves_preallocated_zeros_and_data",
+            "tests::ext4_fallocate_collapse_range_rejects_misaligned_and_eof_reaching",
+            "tests::ext4_fallocate_insert_range_rejects_misaligned_and_past_eof",
+            "tests::ext4_fallocate_insert_range_past_max_file_size_returns_efbig_bd_a3fh8",
+            "tests::ext4_fallocate_rejects_invalid_mode_combinations",
+        ],
+    ),
+    (
+        "CLI dump command",
+        "The dump command parses its arguments and builds the directory, group and \
+         inode projections from a btrfs image",
+        "cli-bins",
+        &[
+            "tests::build_dump_dir_output_btrfs_returns_vfs_directory_projection",
+            "tests::build_dump_dir_output_btrfs_hex_returns_dir_index_payloads",
+            "tests::build_dump_group_output_btrfs_returns_chunk_mapping",
+            "tests::build_dump_inode_output_btrfs_reads_root_inode_alias",
+            "tests::cli_parses_dump_dir_command_with_hex",
+        ],
+    ),
 ];
 
 // These test the evidence consumer itself, not filesystem capability rows.
@@ -794,6 +1244,262 @@ const PARITY_HONESTY_TESTS: &[&str] = &[
     "executed_evidence::tests::test_evidence_rejects_malformed_duplicate_and_incomplete_streams",
 ];
 
+/// A parity suite is one Cargo invocation whose executed tests are evidence for
+/// capability rows. `exact` filters are module-qualified test names passed to
+/// libtest with `--exact`, so a suite can select named tests from a large crate
+/// without running (or quietly skipping) the rest of it.
+struct ParitySuite {
+    id: &'static str,
+    package: &'static str,
+    /// Cargo-level target selection, e.g. `--test kernel_reference`.
+    targets: &'static [&'static str],
+    /// Libtest `--exact` filters applied after `--`.
+    exact: &'static [&'static str],
+}
+
+const PARITY_SUITES: &[ParitySuite] = &[
+    ParitySuite {
+        id: "ext4-journal",
+        package: "ffs-harness",
+        targets: &["--test", "ext4_journal_recovery"],
+        exact: &[],
+    },
+    ParitySuite {
+        id: "ext4-reference",
+        package: "ffs-harness",
+        targets: &["--test", "kernel_reference"],
+        exact: &[],
+    },
+    // The ext4 kernel-differential targets are separate test binaries, and one
+    // Cargo invocation runs all of them: the libtest stream then carries one suite
+    // block per target, which the evidence parser aggregates. Every test here is a
+    // differential comparison against e2fsprogs/debugfs output on a generated
+    // image.
+    ParitySuite {
+        id: "ext4-kernel-differential",
+        package: "ffs-harness",
+        targets: &[
+            "--test",
+            "ext4_group_desc_kernel_reference",
+            "--test",
+            "ext4_iblocks_kernel_reference",
+            "--test",
+            "ext4_inode_flags_uidgid_kernel_reference",
+            "--test",
+            "ext4_dir_rec_len_kernel_reference",
+            "--test",
+            "ext4_bitmap_csum_kernel_reference",
+        ],
+        exact: &[],
+    },
+    // bd-wh1xk: the btrfs goldens are captured from btrfs-progs, so this suite
+    // needs it installed and at the golden's anchor version, or its tests
+    // soft-skip and the suite cannot pass. That is also why CI selects its suites
+    // explicitly rather than running every suite.
+    ParitySuite {
+        id: "btrfs-reference",
+        package: "ffs-harness",
+        targets: &["--test", "btrfs_kernel_reference"],
+        exact: &[],
+    },
+    ParitySuite {
+        id: "parity-honesty",
+        package: "ffs-harness",
+        targets: &["--lib"],
+        exact: PARITY_HONESTY_TESTS,
+    },
+    // Cross-package suites: the MVCC and repair rows are proven by the crates'
+    // own unit tests, selected by exact module-qualified name.
+    ParitySuite {
+        id: "mvcc-lib",
+        package: "ffs-mvcc",
+        targets: &["--lib"],
+        exact: &[
+            "sharded::tests::snapshot_isolation",
+            "sharded::tests::snapshot_reads_consistent_across_shards",
+            "sharded::tests::commit_snapshots_policy_before_shard_locks",
+            "persist::tests::replay_discards_duplicate_commit_sequence",
+            "tests::fcw_conflict_error_contains_correct_fields",
+            "tests::fcw_multi_block_fails_on_conflicting_block",
+            "tests::fcw_concurrent_disjoint_blocks_all_succeed",
+            "tests::cow_hundred_rewrites_produce_unique_physical_blocks",
+            "tests::chain_length_bounded_after_many_writes",
+            "tests::chain_backpressure_rejects_at_critical_with_snapshot_pin",
+            "tests::chain_pressure_without_snapshot_pin_allows_commit",
+            "tests::chain_backpressure_triggers_and_force_advances_oldest_snapshot",
+            "tests::ssi_dangerous_structure_accumulates_edges_across_records",
+            "tests::ssi_detect_stops_at_first_completed_dangerous_structure",
+            "tests::ssi_empty_write_set_is_never_a_dangerous_structure",
+            "tests::ssi_disjoint_key_spans_do_not_create_edges",
+            "tests::ssi_allows_read_only_transactions",
+        ],
+    },
+    // ffs-journal owns the JBD2 fast-commit and checksum paths; the harness
+    // ext4-journal suite covers recovery outcomes one level up.
+    ParitySuite {
+        id: "journal-lib",
+        package: "ffs-journal",
+        targets: &["--lib"],
+        exact: &[
+            "fc_tests::replay_fast_commit_carries_inode_body",
+            "fc_tests::replay_head_with_unsupported_fc_features_forces_fallback",
+            "tests::verify_jbd2_async_commit_commit_checksum_roundtrip_and_tamper_detection",
+            "tests::verify_jbd2_async_commit_descriptor_checksum_roundtrip_and_tamper_detection",
+            "tests::replay_jbd2_csum_v3_data_checksum_mismatch_skips_write",
+        ],
+    },
+    ParitySuite {
+        id: "repair-lib",
+        package: "ffs-repair",
+        targets: &["--lib"],
+        exact: &[
+            "storage::tests::storage_round_trip_symbols_and_generation_commit",
+            "storage::tests::storage_multi_generation_upgrade",
+            "pipeline::tests::evidence_ledger_captures_all_events",
+            "pipeline::tests::recovery_succeeds_with_fresh_symbols_under_write_churn",
+            "scrub::tests::btrfs_scrub_does_not_flag_unallocated_zero_blocks",
+            "scrub::tests::btrfs_scrub_still_detects_zeroed_superblock",
+            "scrub::tests::btrfs_scrub_validator_matches_composite_on_representative_blocks",
+            "scrub::tests::btrfs_superblock_validator_accepts_valid_superblock",
+            "scrub::tests::btrfs_superblock_validator_detects_checksum_corruption",
+            "scrub::tests::btrfs_superblock_validator_detects_corrupt_backup_mirror",
+            "scrub::tests::btrfs_superblock_validator_detects_mirror_with_wrong_bytenr",
+            "scrub::tests::btrfs_superblock_validator_skips_mirror_outside_filesystem",
+            "pipeline::tests::adaptive_policy_switches_eager_based_on_posterior",
+            "pipeline::tests::adaptive_policy_clamp_preserves_metadata_expected_loss",
+            "pipeline::tests::adaptive_policy_controls_symbol_refresh_count",
+            "pipeline::tests::lazy_policy_defers_refresh_until_scrub_or_timeout",
+        ],
+    },
+    // The FUSE rows are proven at the dispatch boundary, which is where the FUSE
+    // ABI behavior lives; the mounted end-to-end tests are a separate job.
+    ParitySuite {
+        id: "fuse-lib",
+        package: "ffs-fuse",
+        targets: &["--lib"],
+        exact: &[
+            "tests::conformance_fuse_getattr_metadata_round_trip",
+            "tests::conformance_fuse_lookup_metadata_round_trip",
+            "tests::conformance_fuse_readdir_directory_round_trip",
+            "tests::conformance_fuse_read_file_lifecycle_round_trip",
+            "tests::conformance_fuse_readlink_directory_round_trip",
+            "tests::dispatch_ioctl_fibmap_maps_written_extent_physical_block",
+            "tests::dispatch_ioctl_fiemap_sync_fsyncs_before_extent_lookup",
+            "tests::dispatch_ioctl_getflags_encodes_u32_response_for_fileattr_path",
+            "tests::dispatch_ioctl_setflags_routes_to_fsops_and_commits",
+            "tests::dispatch_ioctl_setflags_accepts_8_byte_long_payload_by_using_low_u32",
+            "tests::dispatch_ioctl_getversion_encodes_u32_response_for_inode_generation",
+            "tests::dispatch_ioctl_setversion_passes_generation_to_backend_and_commits",
+            "tests::dispatch_ioctl_getfslabel_returns_label_in_256_byte_buffer",
+            "tests::dispatch_ioctl_setfslabel_passes_label_to_backend_and_commits",
+            "tests::dispatch_ioctl_move_ext_does_not_double_unregister_after_commit_error",
+            "tests::dispatch_ioctl_move_ext_does_not_unregister_after_register_error",
+            "tests::dispatch_ioctl_move_ext_rejection_logs_contract_fields",
+            "tests::vendored_fuser_exposes_abi_7_40_protocol_surface",
+            "tests::dispatch_write_rwf_append_uses_current_file_size_as_offset",
+            "tests::dispatch_write_rwf_noappend_suppresses_open_append_offset_rewrite",
+            "tests::dispatch_write_rwf_append_noappend_conflict_rejects_before_mutation",
+            "tests::io_uring_kernel_switch_is_read_strictly_bd_vbqc6",
+        ],
+    },
+    // The CLI rows are proven by whole-binary end-to-end tests: the target spawns the
+    // built `ffs` executable and asserts on its observable output.
+    ParitySuite {
+        id: "cli-e2e",
+        package: "ffs-cli",
+        targets: &["--test", "cli_e2e"],
+        exact: &[
+            "cli_inspect_ext4_returns_json",
+            "cli_inspect_btrfs_returns_json",
+            "cli_info_ext4_shows_superblock",
+            "cli_info_btrfs_shows_superblock",
+            "cli_fsck_ext4_clean_image",
+            "cli_fsck_corrupted_superblock_reports_error",
+            "cli_repair_verify_only_ext4",
+        ],
+    },
+    // ffs-btrfs owns the tree/mutation behavior the btrfs rows describe; the
+    // harness btrfs-reference suite only covers on-disk fixture parity.
+    ParitySuite {
+        id: "btrfs-lib",
+        package: "ffs-btrfs",
+        targets: &["--lib"],
+        exact: &[
+            "tests::chunk_entries_round_trip_out_of_the_chunk_tree_bd_a136s",
+            "tests::growth_device_is_read_from_the_dev_item_bd_a136s",
+            "tests::delayed_ref_queue_shared_extent_refcount",
+            "tests::flush_delayed_refs_applies_refcounts",
+            "crash_consistency::tests::writeback_cache_crash_matrix_passes_every_invariant",
+            "crash_consistency::tests::writeback_cache_crash_matrix_observes_generation_atomicity",
+            "crash_consistency::proptests::mr_wb_writeback_order_preserves_invariants",
+        ],
+    },
+    // ffs-ondisk owns on-disk structure decode for both formats, including the
+    // ext4 feature-flag and casefold rules and the btrfs header/leaf layout.
+    ParitySuite {
+        id: "ondisk-lib",
+        package: "ffs-ondisk",
+        targets: &["--lib"],
+        exact: &[
+            "ext4::tests::compat_features_unknown_bits",
+            "ext4::tests::build_htree_directory_casefold_rebuild_is_fold_navigable_bd_owt2r",
+            "ext4::tests::casefold_eq_matches_key_on_unicode_folds",
+            "ext4::tests::ext4_casefold_key_capital_sigma_folds_like_lowercase_sigma",
+            "btrfs::tests::btrfs_header_parse_from_block_kernel_offsets_match_ctree_h",
+            "btrfs::tests::btrfs_proptest_leaf_items_structured_key_roundtrip",
+            "btrfs::tests::btrfs_proptest_internal_items_structured_roundtrip",
+        ],
+    },
+    // Infrastructure rows. These two suites are the only place the fixture and
+    // benchmark harness rows may draw evidence from: the rows describe the harness
+    // itself, so the harness's own provenance and artifact contracts are the right
+    // proof class. They are deliberately not used for filesystem capability rows.
+    ParitySuite {
+        id: "conformance",
+        package: "ffs-harness",
+        targets: &["--test", "conformance"],
+        exact: &[
+            "conformance_fixture_provenance_covers_committed_fixtures",
+            "conformance_golden_provenance_covers_committed_artifacts",
+            "ext4_and_btrfs_fixtures_conform",
+        ],
+    },
+    ParitySuite {
+        id: "profile-artifacts",
+        package: "ffs-harness",
+        targets: &["--test", "profile_artifacts"],
+        exact: &["canonical_profile_artifacts_are_committed_and_structured"],
+    },
+    // ffs-core owns the high-level file operations the ext4 range rows describe.
+    ParitySuite {
+        id: "core-lib",
+        package: "ffs-core",
+        targets: &["--lib"],
+        exact: &[
+            "tests::ext4_collapse_range_preserves_preallocated_zeros_and_data",
+            "tests::ext4_insert_range_preserves_preallocated_zeros_and_data",
+            "tests::ext4_fallocate_collapse_range_rejects_misaligned_and_eof_reaching",
+            "tests::ext4_fallocate_insert_range_rejects_misaligned_and_past_eof",
+            "tests::ext4_fallocate_insert_range_past_max_file_size_returns_efbig_bd_a3fh8",
+            "tests::ext4_fallocate_rejects_invalid_mode_combinations",
+        ],
+    },
+    // The dump command's behavior is unit-tested inside the binary, not in the
+    // end-to-end target, so this suite selects those tests explicitly.
+    ParitySuite {
+        id: "cli-bins",
+        package: "ffs-cli",
+        targets: &["--bins"],
+        exact: &[
+            "tests::build_dump_dir_output_btrfs_returns_vfs_directory_projection",
+            "tests::build_dump_dir_output_btrfs_hex_returns_dir_index_payloads",
+            "tests::build_dump_group_output_btrfs_returns_chunk_mapping",
+            "tests::build_dump_inode_output_btrfs_reads_root_inode_alias",
+            "tests::cli_parses_dump_dir_command_with_hex",
+        ],
+    },
+];
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ParityExecutor {
     Rch,
@@ -805,29 +1511,40 @@ impl ExecutionGatedParityReport {
     /// Run the selected known suites. No paths, shell commands, JSON reports or
     /// caller-supplied pass/fail maps are accepted as parity evidence.
     pub fn run(suites: &[String], executor: ParityExecutor) -> Result<Self> {
+        Self::run_with_gates(suites, &[], executor)
+    }
+
+    /// Run the selected suites and the selected canonical §22 gates against one
+    /// shared source identity. Both public parity consumers and CI use this path,
+    /// so a gate result and a capability claim are always the same evidence.
+    pub fn run_with_gates(
+        suites: &[String],
+        gate_ids: &[String],
+        executor: ParityExecutor,
+    ) -> Result<Self> {
         let mut selected = std::collections::BTreeSet::new();
         for suite in suites {
-            if !matches!(
-                suite.as_str(),
-                "ext4-journal" | "ext4-reference" | "parity-honesty"
-            ) {
-                bail!(
-                    "unknown parity suite {suite}; use ext4-journal, ext4-reference or parity-honesty"
-                );
+            if !PARITY_SUITES.iter().any(|known| known.id == suite) {
+                let known = PARITY_SUITES
+                    .iter()
+                    .map(|suite| suite.id)
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                bail!("unknown parity suite {suite}; use one of {known}");
             }
             if !selected.insert(suite.as_str()) {
                 bail!("duplicate parity suite {suite}");
             }
         }
+        let gates_selected = canonical_gates::select_gate_ids(gate_ids)?;
         let mut runs = Vec::new();
         for suite in &selected {
-            let mut args = vec!["-Z", "checksum-freshness", "test", "-p", "ffs-harness"];
-            match *suite {
-                "ext4-journal" => args.extend(["--test", "ext4_journal_recovery"]),
-                "ext4-reference" => args.extend(["--test", "kernel_reference"]),
-                "parity-honesty" => args.push("--lib"),
-                _ => unreachable!("validated above"),
-            }
+            let spec = PARITY_SUITES
+                .iter()
+                .find(|known| known.id == *suite)
+                .expect("validated above");
+            let mut args = vec!["-Z", "checksum-freshness", "test", "-p", spec.package];
+            args.extend_from_slice(spec.targets);
             args.extend([
                 "--",
                 "-Z",
@@ -836,9 +1553,9 @@ impl ExecutionGatedParityReport {
                 "--show-output",
                 "--test-threads=1",
             ]);
-            if *suite == "parity-honesty" {
+            if !spec.exact.is_empty() {
                 args.push("--exact");
-                args.extend_from_slice(PARITY_HONESTY_TESTS);
+                args.extend_from_slice(spec.exact);
             }
             let command = match executor {
                 ParityExecutor::Rch => {
@@ -849,14 +1566,21 @@ impl ExecutionGatedParityReport {
             };
             runs.push(executed_evidence::TestRunEvidence::run(command, &args));
         }
+        let gate_runs = canonical_gates::execute_runs(&gates_selected, executor);
         let source = executed_evidence::SourceIdentity::capture().ok();
-        Ok(Self::from_runs(&selected, runs, source))
+        let gates = canonical_gates::CanonicalGateReport::from_runs(
+            &gates_selected,
+            &gate_runs,
+            source.clone(),
+        );
+        Ok(Self::from_runs(&selected, runs, source, gates))
     }
 
     fn from_runs(
         selected: &std::collections::BTreeSet<&str>,
         runs: Vec<executed_evidence::TestRunEvidence>,
         source: Option<executed_evidence::SourceIdentity>,
+        canonical_gates: canonical_gates::CanonicalGateReport,
     ) -> Self {
         let rows = capability_rows_from_feature_parity(FEATURE_PARITY_MARKDOWN);
         let contracts: Vec<_> = PARITY_CONTRACTS
@@ -895,7 +1619,7 @@ impl ExecutionGatedParityReport {
             })
             .collect();
         let evidence_backed_rows = contracts.iter().filter(|row| row.verified).count();
-        let missing_evidence_rows = rows
+        let missing_evidence_rows: Vec<String> = rows
             .iter()
             .filter(|row| {
                 !contracts
@@ -904,6 +1628,11 @@ impl ExecutionGatedParityReport {
             })
             .map(|row| row.capability.clone())
             .collect();
+        // Readiness needs both halves, and neither is inferable from the other:
+        // every declared capability row carrying exact executed evidence, and
+        // every canonical §22 gate passing with a nonempty selection.
+        let readiness_verified =
+            !rows.is_empty() && missing_evidence_rows.is_empty() && canonical_gates.all_passed();
         Self {
             declared_contracts: ParityReport::current(),
             total_rows: rows.len(),
@@ -913,14 +1642,34 @@ impl ExecutionGatedParityReport {
             contracts,
             selected_suites: selected.iter().map(|suite| (*suite).to_owned()).collect(),
             runs,
-            readiness_verified: false,
+            canonical_gates,
+            readiness_verified,
         }
     }
 
     /// Gate for the selected suites, not a declaration of whole-project readiness.
     pub fn require_evidence(&self) -> Result<(), String> {
-        if self.runs.is_empty() {
-            return Err("no test suites executed; use --verify <suite>".to_owned());
+        // A gate that has executable tests and does not pass fails the run, and is
+        // reported first because it is the most specific failure available.
+        // `NotImplemented` gates do not fail it, but they keep `readiness_verified`
+        // false and are reported with their criteria so they cannot be forgotten.
+        for gate in &self.canonical_gates.gates {
+            if gate.status == canonical_gates::CanonicalGateStatus::Failed {
+                return Err(format!(
+                    "canonical gate {} failed: {}",
+                    gate.gate_id,
+                    gate.reason.as_deref().unwrap_or("no reason recorded")
+                ));
+            }
+        }
+        if self.runs.is_empty()
+            && self.selected_suites.is_empty()
+            && self.canonical_gates.gates.is_empty()
+        {
+            return Err(
+                "no test suites or canonical gates executed; use --verify <suite> or --gate <id>"
+                    .to_owned(),
+            );
         }
         if self.runs.len() != self.selected_suites.len() {
             return Err("selected suites do not match execution count".to_owned());
@@ -2131,10 +2880,67 @@ mod tests {
                 &std::collections::BTreeSet::from([suite]),
                 vec![run.clone()],
                 executed_evidence::SourceIdentity::capture().ok(),
+                canonical_gates::CanonicalGateReport::empty(),
             );
             assert!(report.require_evidence().is_err(), "{suite}");
             assert_eq!(report.evidence_backed_rows, 0);
         }
+    }
+
+    #[test]
+    fn failed_canonical_gate_fails_the_parity_gate() {
+        // A real failing process, so the gate is `Failed`, not `NotImplemented`.
+        let gate_run = executed_evidence::TestRunEvidence::run("false", &[]);
+        let gates = canonical_gates::CanonicalGateReport::from_runs(
+            &std::collections::BTreeSet::from(["gate1"]),
+            &[gate_run],
+            executed_evidence::SourceIdentity::capture().ok(),
+        );
+        let report = ExecutionGatedParityReport::from_runs(
+            &std::collections::BTreeSet::<&str>::new(),
+            vec![],
+            executed_evidence::SourceIdentity::capture().ok(),
+            gates,
+        );
+        assert_eq!(report.canonical_gates.failed_gates(), ["gate1"]);
+        let error = report
+            .require_evidence()
+            .expect_err("a failed canonical gate must fail the parity gate");
+        assert!(error.contains("canonical gate gate1 failed"), "{error}");
+        assert!(!report.readiness_verified);
+    }
+
+    #[test]
+    fn passing_gates_do_not_promote_unmapped_rows() {
+        let executable = std::env::current_exe().unwrap();
+        let run = executed_evidence::TestRunEvidence::run(
+            executable.to_str().unwrap(),
+            &[
+                "--exact",
+                "tests::extract_region_basic",
+                "-Z",
+                "unstable-options",
+                "--format=json",
+                "--show-output",
+            ],
+        );
+        let source = executed_evidence::SourceIdentity::capture().ok();
+        let gates = canonical_gates::CanonicalGateReport::from_runs(
+            &std::collections::BTreeSet::from(["gate1"]),
+            &[run],
+            source.clone(),
+        );
+        let report = ExecutionGatedParityReport::from_runs(
+            &std::collections::BTreeSet::<&str>::new(),
+            vec![],
+            source,
+            gates,
+        );
+        assert_eq!(report.canonical_gates.passed_gates(), ["gate1"]);
+        assert!(report.canonical_gates.all_passed());
+        assert_eq!(report.evidence_backed_rows, 0);
+        assert_eq!(report.missing_evidence_rows.len(), report.total_rows);
+        assert!(!report.readiness_verified);
     }
 
     #[test]
@@ -2160,6 +2966,7 @@ mod tests {
             &std::collections::BTreeSet::from(["ext4-journal"]),
             vec![],
             executed_evidence::SourceIdentity::capture().ok(),
+            canonical_gates::CanonicalGateReport::empty(),
         );
         assert_eq!(report.evidence_backed_rows, 0);
         assert!(report.require_evidence().is_err());
@@ -2172,6 +2979,7 @@ mod tests {
             &std::collections::BTreeSet::from(["ext4-journal"]),
             vec![run],
             executed_evidence::SourceIdentity::capture().ok(),
+            canonical_gates::CanonicalGateReport::empty(),
         );
         assert_eq!(report.evidence_backed_rows, 0);
         assert!(report.require_evidence().is_err());
