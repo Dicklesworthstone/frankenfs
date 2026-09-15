@@ -8,13 +8,13 @@
   },
   "summary": {
     "modules": 90,
-    "total_loc": 170694,
+    "total_loc": 171455,
     "conformance_modules": 24,
-    "conformance_loc": 43194,
-    "conformance_loc_basis_points": 2530,
+    "conformance_loc": 43470,
+    "conformance_loc_basis_points": 2535,
     "meta_modules": 66,
-    "meta_loc": 127500,
-    "meta_loc_basis_points": 7470
+    "meta_loc": 127985,
+    "meta_loc_basis_points": 7465
   },
   "modules": [
     {
@@ -55,7 +55,7 @@
     {
       "path": "src/bin/ffs_mounted_kernel_bench.rs",
       "classification": "conformance",
-      "loc": 13782
+      "loc": 14058
     },
     {
       "path": "src/btrfs_capability_drift.rs",
@@ -170,7 +170,7 @@
     {
       "path": "src/lib.rs",
       "classification": "meta",
-      "loc": 2608
+      "loc": 3093
     },
     {
       "path": "src/log_contract.rs",
