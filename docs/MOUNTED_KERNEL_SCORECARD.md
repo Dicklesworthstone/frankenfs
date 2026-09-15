@@ -460,6 +460,22 @@ comparison it was taken for. Unlike the other five it also ran with every CPU on
   (`93ed…` / PGO `1410…`) and a different driver, and they predate worker pinning, which
   is why read and readdir were `blocked_null` in the same window. No host-wide-scoped
   admitted row exists for any of the other four workloads.
+- **The host-wide rerun for the four uncovered rows is structurally unreachable on
+  this host as shared (retired 2026-09-14, `bd-host-wide-scope-gap-four-rows-dy9s8`).**
+  The host-wide gate requires zero of the 64 allowed CPUs above 20% busy for five
+  consecutive one-second samples. Replayed over the four quietest windows banked for
+  `bd-d5pdz` (`docs/evidence/bd-d5pdz/cal_quiet_*.json`, loadavg ≈ 5, nothing else
+  benchmarking), **0 of 160 samples were clear and the longest clear run was 0 of the
+  required 5**: the box carries an irreducible floor of 2–3 CPUs above 20% (dashboard
+  processes, agent panes, ananicy, kworkers). Reproduce with
+  `scripts/external_load_calibration.py --host-wide-gate 'docs/evidence/bd-d5pdz/cal_quiet_*.json'`.
+  That is structural, not a busy minute, so waiting for a host-wide quiet window on this
+  host waits for a state that does not occur: the four rows cannot be re-run under
+  `--placement-scope host-wide` here, and the caveat above stands as a permanent scope
+  limitation of this host, discharged by this record rather than by an admitted run.
+  The gate itself is untouched; the 2026-07-29 storm corroboration above remains the
+  only host-wide-scoped evidence, and no row number in this document changes because
+  of this bullet.
 - **The governor was recorded, not set.** All 64 CPUs ran `amd-pstate-epp` with the
   `powersave` governor; the host is shared with other agents, so it was deliberately
   left alone and `non_performance_or_mixed_governor_warning=true` is carried on every
