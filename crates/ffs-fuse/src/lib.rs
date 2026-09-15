@@ -4681,14 +4681,11 @@ pub fn create_entry_invalidation_enabled() -> bool {
 /// default itself is assertable in-process (the cached wrapper reads the
 /// environment exactly once per process).
 fn resolve_create_invalidation(raw: Option<&str>) -> bool {
-    match raw {
-        // bd-6xwql: unset means the create reply's own instantiate is trusted.
-        None => false,
-        Some(raw) => {
-            let raw = raw.trim();
-            !(raw == "0" || raw.eq_ignore_ascii_case("false") || raw.eq_ignore_ascii_case("off"))
-        }
-    }
+    // bd-6xwql: unset means the create reply's own instantiate is trusted.
+    raw.is_some_and(|raw| {
+        let raw = raw.trim();
+        !(raw == "0" || raw.eq_ignore_ascii_case("false") || raw.eq_ignore_ascii_case("off"))
+    })
 }
 
 /// One FUSE reverse notification, queued for the thread that owns the notifier.
@@ -10053,18 +10050,13 @@ mod tests {
 
         // Consumed even though suppressed — a later unlink of the same name
         // cannot inherit a stale hint (rerouting, not removal).
-        let queue = fuse
+        let guard = fuse
             .inner
             .kernel_notifier
             .lock()
-            .expect("test notifier lock must not be poisoned")
-            .as_ref()
-            .expect("notifier installed above");
+            .expect("test notifier lock must not be poisoned");
+        let queue = guard.as_ref().expect("notifier installed above");
         assert!(!queue.take_negative_entry(parent, missed));
-
-        // The opt-in path sends for the exact cached negative only. The knob is
-        // process-cached, so this asserts the queue-level gate the opt-in
-        // resolver feeds: a present hint sends, an absent one does not.
         queue.remember_negative_entry(parent, OsStr::new("opted-in-name"));
         assert!(queue.take_negative_entry(parent, OsStr::new("opted-in-name")));
         assert!(!queue.take_negative_entry(parent, OsStr::new("opted-in-name")));
