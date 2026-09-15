@@ -124,8 +124,8 @@ use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, ExitCode, Stdio};
 use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicBool, Ordering},
+    Arc, Mutex, OnceLock,
+    atomic::{AtomicBool, AtomicU64, Ordering},
     mpsc,
 };
 use std::thread;
@@ -168,6 +168,7 @@ const MAX_DRIVER_PREFLIGHT_BUSY: f64 = 0.20;
 const MAX_FUSE_PREFLIGHT_BUSY: f64 = 0.35;
 const DEFAULT_HOST_QUIET_SAMPLES: usize = 5;
 const DEFAULT_HOST_QUIET_TIMEOUT_MS: u64 = 300_000;
+const DEFAULT_INVOCATION_DEADLINE_SECS: u64 = 3_600;
 const MAX_HOST_QUIET_SAMPLES: usize = 60;
 const MAX_HOST_QUIET_TIMEOUT_MS: u64 = 900_000;
 /// Where arm mountpoints live.
@@ -691,6 +692,9 @@ struct Config {
     /// reports their outcome, and exits. It takes no timing, mounts no arm, and
     /// cannot produce a bankable row.
     fixture_only: bool,
+    /// bd-xtnk1: overall fail-closed bound for one invocation. A hang costs
+    /// one timeout plus a reap, never an operator's attention.
+    invocation_deadline_secs: u64,
     output: Option<PathBuf>,
 }
 
@@ -790,6 +794,7 @@ impl Default for Config {
             placement_scope: PlacementScope::SameLlc,
             host_quiet_samples: DEFAULT_HOST_QUIET_SAMPLES,
             host_quiet_timeout_ms: DEFAULT_HOST_QUIET_TIMEOUT_MS,
+            invocation_deadline_secs: DEFAULT_INVOCATION_DEADLINE_SECS,
             harness_builder: String::new(),
             candidate_builder: String::new(),
             fixture_construction: FixtureConstruction::Seeded,
@@ -1392,6 +1397,21 @@ impl MountedArm {
         &self.mountpoint
     }
 
+    /// bd-xtnk1: publish this arm to the watchdog registry so a fail-closed
+    /// deadline can unmount and kill it even if the main thread is stuck.
+    fn register_live(&self) {
+        enter_phase(Phase::ArmMount);
+        let pid = match &self.kind {
+            MountedArmKind::Kernel => None,
+            MountedArmKind::Fuse { child, .. } => Some(child.id()),
+        };
+        register_live_arm(self.arm.label(), &self.mountpoint, pid);
+    }
+
+    fn unregister_live(&self) {
+        unregister_live_arm(&self.mountpoint);
+    }
+
     fn unmount(&mut self) -> Result<()> {
         match &mut self.kind {
             MountedArmKind::Kernel => {
@@ -1436,6 +1456,7 @@ impl MountedArm {
             "mount remained active after cleanup: {}",
             self.mountpoint.display()
         );
+        self.unregister_live();
         Ok(())
     }
 
@@ -1494,6 +1515,7 @@ impl MountedArm {
 
 impl Drop for MountedArm {
     fn drop(&mut self) {
+        self.unregister_live();
         // bd-w2u82: the loop device must be released even when the mount is
         // already gone — that is precisely the aborted-run case this guard exists
         // for, and the early return below would otherwise leak it. A leaked loop
@@ -1529,6 +1551,166 @@ impl Drop for MountedArm {
         }
         release_loop();
     }
+}
+
+// ── bd-xtnk1: invocation deadline, phase progress, abnormal-exit reap ──────
+//
+// A 6-arm mutating comparator once hung for 12 minutes with zero daemon CPU:
+// no gate bounded the whole invocation, and the operator's only remedy was an
+// external SIGKILL that skipped every Drop guard and left four rw FUSE mounts
+// plus a loop device orphaned on a shared box. The watchdog below fails
+// closed instead: it names the phase it died in, lazily unmounts and kills
+// every arm still registered, and exits nonzero. Any hang now costs one
+// timeout, never an operator's attention.
+
+/// Default bound for one bench invocation. Generous against the slowest
+/// admitted runs (fixture build plus rounds measured in minutes) while still
+/// bounded; `--invocation-deadline-secs` overrides it.
+const MAX_INVOCATION_DEADLINE_SECS: u64 = 86_400;
+
+/// Coarse phases a hang can be attributed to. Kept as a flat table so the
+/// watchdog can name a phase without touching shared state that a stuck
+/// thread might hold.
+#[derive(Clone, Copy)]
+enum Phase {
+    Identity,
+    FixtureBuild,
+    Placement,
+    ArmMount,
+    HostQuiet,
+    WorkloadRounds,
+    Collection,
+    Report,
+}
+
+impl Phase {
+    const fn name(self) -> &'static str {
+        match self {
+            Self::Identity => "identity_and_provenance",
+            Self::FixtureBuild => "fixture_build",
+            Self::Placement => "cpu_placement",
+            Self::ArmMount => "arm_mount",
+            Self::HostQuiet => "host_quiet_gate",
+            Self::WorkloadRounds => "workload_rounds",
+            Self::Collection => "collection",
+            Self::Report => "report",
+        }
+    }
+}
+
+fn current_phase() -> &'static str {
+    const NAMES: [&str; 8] = [
+        Phase::Identity.name(),
+        Phase::FixtureBuild.name(),
+        Phase::Placement.name(),
+        Phase::ArmMount.name(),
+        Phase::HostQuiet.name(),
+        Phase::WorkloadRounds.name(),
+        Phase::Collection.name(),
+        Phase::Report.name(),
+    ];
+    let index = CURRENT_PHASE
+        .load(Ordering::Relaxed)
+        .try_into()
+        .unwrap_or(0usize);
+    NAMES.get(index).copied().unwrap_or("unknown")
+}
+
+fn enter_phase(phase: Phase) {
+    CURRENT_PHASE.store(phase as u64, Ordering::Relaxed);
+    let elapsed = invocation_epoch()
+        .map(|start| start.elapsed().as_secs())
+        .unwrap_or_default();
+    eprintln!("[bench] phase={},elapsed_s={elapsed}", phase.name());
+}
+
+fn invocation_epoch() -> Option<Instant> {
+    INVOCATION_EPOCH.get().copied()
+}
+
+static INVOCATION_EPOCH: OnceLock<Instant> = OnceLock::new();
+static CURRENT_PHASE: AtomicU64 = AtomicU64::new(0);
+
+/// One still-mounted arm the watchdog must be able to tear down without the
+/// (possibly stuck) main thread. `pid` is the FUSE daemon when the arm has
+/// one; kernel arms are torn down by mountpoint alone.
+#[derive(Debug, Clone)]
+struct LiveArmRecord {
+    label: String,
+    mountpoint: PathBuf,
+    pid: Option<u32>,
+}
+
+static LIVE_ARMS: Mutex<Vec<LiveArmRecord>> = Mutex::new(Vec::new());
+
+fn register_live_arm(label: &str, mountpoint: &Path, pid: Option<u32>) {
+    LIVE_ARMS
+        .lock()
+        .map(|mut arms| {
+            arms.push(LiveArmRecord {
+                label: label.to_owned(),
+                mountpoint: mountpoint.to_path_buf(),
+                pid,
+            });
+        })
+        .ok();
+}
+
+fn unregister_live_arm(mountpoint: &Path) {
+    LIVE_ARMS
+        .lock()
+        .map(|mut arms| arms.retain(|arm| arm.mountpoint != mountpoint))
+        .ok();
+}
+
+/// Best-effort teardown of every registered arm: lazy-unmount the mountpoint
+/// (both the fusermount3 and kernel spellings, since a record does not carry
+/// its kind), then SIGKILL the daemon. Errors are ignored on purpose — a
+/// watchdog that dies on the first stale record reaps nothing.
+fn reap_live_arm_records() -> usize {
+    let arms = LIVE_ARMS
+        .lock()
+        .map(|arms| arms.clone())
+        .unwrap_or_default();
+    for arm in &arms {
+        let _ = Command::new("fusermount3")
+            .args(["-u", "-z", "--"])
+            .arg(&arm.mountpoint)
+            .status();
+        let _ = Command::new("sudo")
+            .args(["-n", "umount", "-l"])
+            .arg(&arm.mountpoint)
+            .status();
+        if let Some(pid) = arm.pid {
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
+        }
+        eprintln!(
+            "[bench] watchdog reaped arm={} mountpoint={}",
+            arm.label,
+            arm.mountpoint.display()
+        );
+    }
+    arms.len()
+}
+
+fn spawn_invocation_watchdog(deadline_secs: u64) -> Option<std::thread::JoinHandle<()>> {
+    let start = invocation_epoch()?;
+    Some(std::thread::spawn(move || {
+        let deadline = Duration::from_secs(deadline_secs);
+        loop {
+            std::thread::sleep(Duration::from_secs(1));
+            if start.elapsed() >= deadline {
+                let phase = current_phase();
+                let elapsed = start.elapsed().as_secs();
+                let reaped = reap_live_arm_records();
+                eprintln!(
+                    "[bench] INVOCATION_DEADLINE exceeded after {elapsed}s in \
+                     phase={phase}; reaped {reaped} arm(s); failing closed"
+                );
+                std::process::exit(2);
+            }
+        }
+    }))
 }
 
 fn usage() {
@@ -1587,6 +1769,8 @@ is a transport it pays and we otherwise do not (bd-w2u82)\n\
            --pre-measurement-settle-ms N  Untimed delay after durable fixture setup (default 1000)\n\
            --host-quiet-samples N         Consecutive clear host-wide samples (default 5)\n\
            --host-quiet-timeout-ms N      Fail-closed quiet-window timeout (default 300000)\n\
+           --invocation-deadline-secs N   Overall fail-closed invocation bound; on expiry every\n\
+                                          mounted arm is unmounted and killed (default 3600)\n\
            --harness-builder ID           Machine that built this driver ELF (required unless\n\
                                           --fixture-only)\n\
            --candidate-builder ID         Machine that built the candidate ELF (required unless\n\
@@ -1791,6 +1975,10 @@ fn validate_host_quiet_budget(config: &Config) -> Result<()> {
     ensure!(
         config.host_quiet_timeout_ms <= MAX_HOST_QUIET_TIMEOUT_MS,
         "--host-quiet-timeout-ms must be at most {MAX_HOST_QUIET_TIMEOUT_MS}"
+    );
+    ensure!(
+        (1..=MAX_INVOCATION_DEADLINE_SECS).contains(&config.invocation_deadline_secs),
+        "--invocation-deadline-secs must be in 1..={MAX_INVOCATION_DEADLINE_SECS}"
     );
     ensure!(
         config.host_quiet_timeout_ms
@@ -2105,6 +2293,10 @@ fn apply_config_knob(
         }
         "--host-quiet-timeout-ms" => {
             config.host_quiet_timeout_ms = parse_value(args, index, "--host-quiet-timeout-ms")?;
+        }
+        "--invocation-deadline-secs" => {
+            config.invocation_deadline_secs =
+                parse_value(args, index, "--invocation-deadline-secs")?;
         }
         "--out" => {
             config.output = Some(parse_value(args, index, "--out")?);
@@ -3241,6 +3433,7 @@ fn mount_kernel(
         // `mount -o loop` attaches and `umount` detaches this one implicitly.
         loop_device: None,
     };
+    mounted.register_live();
     assert_common_mount_options(&mounted.mount_info, arm.label(), read_write)?;
     ensure!(
         mounted.mount_info.filesystem_type == kind.label(),
@@ -3596,6 +3789,7 @@ fn mount_fuse(
         },
         loop_device: fuse_loop_device,
     };
+    mounted.register_live();
     assert_common_mount_options(
         &mounted.mount_info,
         arm.label(),
@@ -5027,6 +5221,7 @@ fn observe(
     // bd-fj2dg: starts BEFORE the timed loop and is read AFTER the padding loop,
     // so it spans everything this visit does to the host.
     let occupancy_start = Instant::now();
+    enter_phase(Phase::WorkloadRounds);
     for repeat in 0..config.observation_repeats {
         let current_sequence = sequence
             .saturating_mul(config.observation_repeats)
@@ -5113,6 +5308,7 @@ fn run_warmup_rounds(
     pinning: &WorkerPinning,
     next_sequences: &mut BTreeMap<Arm, usize>,
 ) -> Result<()> {
+    enter_phase(Phase::WorkloadRounds);
     for round in 0..config.workload.warmup_rounds() {
         for &logical_arm in balanced_order(config.compares_candidates(), round) {
             let physical_arm = physical_arm_for(logical_arm, round);
@@ -7994,6 +8190,7 @@ fn fs_report(
     };
 
     thread::sleep(Duration::from_millis(config.pre_measurement_settle_ms));
+    enter_phase(Phase::HostQuiet);
     let post_mount_host_quiet_window = if requires_host_wide_quiet_window(config.placement_scope) {
         Some(wait_for_host_quiet(
             &placement.allowed_cpus,
@@ -9355,6 +9552,10 @@ fn run() -> Result<Option<PathBuf>> {
     let Some(config) = parse_args()? else {
         return Ok(None);
     };
+    // bd-xtnk1: the epoch anchors every phase progress line and the watchdog.
+    let _ = INVOCATION_EPOCH.set(Instant::now());
+    enter_phase(Phase::Identity);
+    let _watchdog = spawn_invocation_watchdog(config.invocation_deadline_secs);
     let host = host_provenance()?;
     // Sampled before any fixture is built or any arm runs. Paired with the
     // per-filesystem sample taken when each report is built, this brackets the
@@ -9487,6 +9688,7 @@ fn run() -> Result<Option<PathBuf>> {
     if let Some(report_dir) = output.parent() {
         protect_report_dir_from_reclaim(report_dir, &scratch_dir);
     }
+    enter_phase(Phase::FixtureBuild);
     let fixture_root = create_fixture_tree(&scratch_dir, &config)?;
     if config.fixture_only {
         return fixture_only_run(&config, &run_dir, &scratch_dir, &fixture_root);
@@ -9502,6 +9704,7 @@ fn run() -> Result<Option<PathBuf>> {
         config.host_quiet_samples,
         config.host_quiet_timeout_ms,
     )?;
+    enter_phase(Phase::Placement);
     pin_current_process(&placement.driver_cpus)?;
     let driver_pinning = WorkerPinning::new(placement.driver_cpus.clone())?;
     let driver_thread_cpu = driver_pinning.bind_driver_thread()?;
@@ -9630,9 +9833,17 @@ fn run() -> Result<Option<PathBuf>> {
         })
     };
 
+    enter_phase(Phase::Collection);
     let mut filesystem_reports = Vec::with_capacity(requested.len());
     let mut blocked_filesystems = Vec::new();
     for kind in requested {
+        eprintln!(
+            "[bench] phase=collection,kind={},elapsed_s={}",
+            kind.label(),
+            invocation_epoch()
+                .map(|s| s.elapsed().as_secs())
+                .unwrap_or_default()
+        );
         filesystem_reports.push(fs_report(
             kind,
             &config,
@@ -9800,6 +10011,7 @@ fn run() -> Result<Option<PathBuf>> {
         "verdict": if external_load_clean { "clear" } else { "contended" },
     });
 
+    enter_phase(Phase::Report);
     let report = json!({
         "kernel_release": fs::read_to_string("/proc/sys/kernel/osrelease")?.trim(),
         "artifact_root": run_dir,
@@ -9999,6 +10211,61 @@ fn main() -> ExitCode {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn phase_names_cover_the_enum_bd_xtnk1() {
+        let phases = [
+            Phase::Identity,
+            Phase::FixtureBuild,
+            Phase::Placement,
+            Phase::ArmMount,
+            Phase::HostQuiet,
+            Phase::WorkloadRounds,
+            Phase::Collection,
+            Phase::Report,
+        ];
+        for (index, phase) in phases.iter().enumerate() {
+            CURRENT_PHASE.store(index as u64, Ordering::Relaxed);
+            assert_eq!(current_phase(), phase.name());
+        }
+        CURRENT_PHASE.store(u64::MAX, Ordering::Relaxed);
+        assert_eq!(current_phase(), "unknown");
+        CURRENT_PHASE.store(0, Ordering::Relaxed);
+    }
+
+    #[test]
+    fn watchdog_reap_kills_registered_daemons_and_best_effort_unmounts_bd_xtnk1() {
+        let mut child = Command::new("sleep")
+            .arg("30")
+            .spawn()
+            .expect("spawn sleep child");
+        let pid = child.id();
+        let mountpoint =
+            std::env::temp_dir().join(format!("bd-xtnk1-reap-{}-{}", std::process::id(), pid));
+        register_live_arm("fuse_test", &mountpoint, Some(pid));
+        assert_eq!(reap_live_arm_records(), 1);
+        // SIGKILL delivery is asynchronous; poll briefly for the death.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            if !matches!(child.try_wait(), Ok(None)) {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the registered daemon must be dead after the reap"
+            );
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        let _ = child.wait();
+        let _ = std::fs::remove_dir_all(&mountpoint);
+        unregister_live_arm(&mountpoint);
+    }
+
+    #[test]
+    fn watchdog_reap_of_empty_registry_is_a_no_op_bd_xtnk1() {
+        unregister_live_arm(Path::new("/nonexistent/bd-xtnk1-mountpoint"));
+        assert_eq!(reap_live_arm_records(), 0);
+    }
+
     #[test]
     fn mutating_batch_child_result_rejects_partial_or_zero_records_bd_xtnk1() {
         assert_eq!(
