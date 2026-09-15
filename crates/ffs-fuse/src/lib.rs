@@ -4672,8 +4672,9 @@ pub fn entry_invalidation_enabled() -> bool {
 #[must_use]
 pub fn create_entry_invalidation_enabled() -> bool {
     static CACHED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *CACHED
-        .get_or_init(|| resolve_create_invalidation(std::env::var("FFS_FUSE_CREATE_INVAL").ok().as_deref()))
+    *CACHED.get_or_init(|| {
+        resolve_create_invalidation(std::env::var("FFS_FUSE_CREATE_INVAL").ok().as_deref())
+    })
 }
 
 /// The resolver behind [`create_entry_invalidation_enabled`], separated so the
@@ -10042,14 +10043,19 @@ mod tests {
         fuse.notify_created_entry_invalidation(parent, OsStr::new("unseen-name"));
         fuse.notify_created_entry_invalidation(parent, missed);
         assert!(
-            matches!(receiver.try_recv(), Err(std::sync::mpsc::TryRecvError::Empty)),
+            matches!(
+                receiver.try_recv(),
+                Err(std::sync::mpsc::TryRecvError::Empty)
+            ),
             "with the knob unset the create side must not notify: the create \
              reply already instantiated the dentry"
         );
 
         // Consumed even though suppressed — a later unlink of the same name
         // cannot inherit a stale hint (rerouting, not removal).
-        let queue = fuse.inner.kernel_notifier
+        let queue = fuse
+            .inner
+            .kernel_notifier
             .lock()
             .expect("test notifier lock must not be poisoned")
             .as_ref()
@@ -10063,7 +10069,6 @@ mod tests {
         assert!(queue.take_negative_entry(parent, OsStr::new("opted-in-name")));
         assert!(!queue.take_negative_entry(parent, OsStr::new("opted-in-name")));
     }
-
 
     #[test]
     fn lookup_of_stable_metadata_advertises_entry_and_attr_ttls_bd_yu6jz() {
