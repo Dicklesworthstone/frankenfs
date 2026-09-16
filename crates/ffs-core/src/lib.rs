@@ -1476,6 +1476,69 @@ struct BtrfsAllocState {
         std::collections::HashMap<u64, std::collections::BTreeMap<u64, (u64, u64)>>,
 }
 
+impl BtrfsAllocState {
+    /// bd-a136s: a DATA allocation hit `NoSpace` — grow one data chunk from
+    /// unallocated device space (the kernel-btrfs behaviour) and report
+    /// whether the failed allocation is worth retrying.
+    ///
+    /// Best-effort by design: every model/parse failure returns `false` and
+    /// the caller surfaces the original `NoSpace`. The grown chunk tree and
+    /// device tree are marked dirty so the next full commit serializes them;
+    /// until then the live mapping is served from the published chunk list.
+    fn grow_data_chunk_on_nospace(
+        &mut self,
+        needed: u64,
+        fsid: &[u8; 16],
+        published: &arc_swap::ArcSwapOption<Vec<BtrfsChunkEntry>>,
+    ) -> bool {
+        let chunks = match ffs_btrfs::chunk_entries_from_chunk_tree(&self.chunk_tree) {
+            Ok(chunks) => chunks,
+            Err(_) => return false,
+        };
+        let device = match ffs_btrfs::GrowthDevice::from_chunk_tree(&self.chunk_tree, *fsid) {
+            Ok(device) => device,
+            Err(_) => return false,
+        };
+        let policy = ffs_btrfs::ChunkSizePolicy::default();
+        let have = self.extent_alloc.allocatable_bytes(BTRFS_BLOCK_GROUP_DATA);
+        // Same low-water shape as the commit-time top-up: a fraction of the
+        // device, capped by the policy target, so one write does not grow the
+        // whole device.
+        let low_water = (device.total_bytes / 16)
+            .min(policy.target(ffs_btrfs::ChunkKind::Data, device.total_bytes));
+        let shortfall = needed.max(low_water.saturating_sub(have)).max(1);
+        let plan = match ffs_btrfs::plan_growth_for_shortfall(
+            &chunks,
+            ffs_btrfs::ChunkKind::Data,
+            shortfall,
+            &device,
+            &policy,
+        ) {
+            Ok(Some(plan)) => plan,
+            _ => return false,
+        };
+        match ffs_btrfs::apply_chunk_allocation(
+            &plan,
+            &mut self.chunk_tree,
+            &mut self.dev_tree,
+            &mut self.extent_alloc,
+            // A SYSTEM chunk at write time cannot reach the superblock's
+            // sys_chunk_array, so apply refuses it here by design; system
+            // growth stays a commit-time operation.
+            None,
+        ) {
+            Ok(()) => {
+                self.chunk_trees_dirty = true;
+                if let Ok(fresh) = ffs_btrfs::chunk_entries_from_chunk_tree(&self.chunk_tree) {
+                    published.store(Some(std::sync::Arc::new(fresh)));
+                }
+                true
+            }
+            Err(_) => false,
+        }
+    }
+}
+
 /// What to do with the data extent (if any) referenced by a purged
 /// `EXTENT_DATA` item when its owning inode is deleted (bd-xkvcm).
 enum BtrfsExtentDisposition {
@@ -30105,6 +30168,38 @@ impl OpenFs {
         Ok(())
     }
 
+    /// bd-a136s: `alloc_data` with an on-demand data-chunk growth retry. A
+    /// DATA `alloc_data` that returns `NoSpace` first attempts to grow one
+    /// data chunk from unallocated device space (when
+    /// `FFS_BTRFS_GROW_CHUNKS` is on) and retries once — the kernel-btrfs
+    /// behaviour of growing instead of refusing while device space remains.
+    fn btrfs_alloc_data_with_growth(
+        &self,
+        alloc: &mut BtrfsAllocState,
+        num_bytes: u64,
+    ) -> ffs_error::Result<ffs_btrfs::ExtentAllocation> {
+        match alloc.extent_alloc.alloc_data(num_bytes) {
+            Ok(allocation) => Ok(allocation),
+            Err(nospace) => {
+                if !self.btrfs_grow_chunks_enabled() {
+                    return Err(btrfs_mutation_to_ffs(&nospace));
+                }
+                let sb = match &self.flavor {
+                    FsFlavor::Btrfs(boxed_sb) => boxed_sb.as_ref(),
+                    FsFlavor::Ext4(_) => return Err(btrfs_mutation_to_ffs(&nospace)),
+                };
+                if !alloc.grow_data_chunk_on_nospace(num_bytes, &sb.fsid, &self.btrfs_grown_chunks)
+                {
+                    return Err(btrfs_mutation_to_ffs(&nospace));
+                }
+                match alloc.extent_alloc.alloc_data(num_bytes) {
+                    Ok(allocation) => Ok(allocation),
+                    Err(e) => Err(btrfs_mutation_to_ffs(&e)),
+                }
+            }
+        }
+    }
+
     /// Allocate, write, and register ONE uncompressed regular data extent that is
     /// already sector-aligned in both offset and length. `data.len()` must be a
     /// multiple of the sector size and `aligned_offset` sector-aligned; the
@@ -30124,11 +30219,7 @@ impl OpenFs {
     ) -> ffs_error::Result<u64> {
         let alloc_size = u64::try_from(data.len())
             .map_err(|_| FfsError::InvalidGeometry("aligned extent length overflow".into()))?;
-        let disk_bytenr = alloc
-            .extent_alloc
-            .alloc_data(alloc_size)
-            .map_err(|e| btrfs_mutation_to_ffs(&e))?
-            .bytenr;
+        let disk_bytenr = self.btrfs_alloc_data_with_growth(alloc, alloc_size)?.bytenr;
         self.btrfs_emit_aligned_extent_at(
             cx,
             alloc,
@@ -30287,10 +30378,7 @@ impl OpenFs {
             .checked_add(sectorsize - 1)
             .ok_or_else(|| FfsError::InvalidGeometry("segment allocation overflow".into()))?
             & !(sectorsize - 1);
-        let allocation = alloc
-            .extent_alloc
-            .alloc_data(alloc_size)
-            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        let allocation = self.btrfs_alloc_data_with_growth(alloc, alloc_size)?;
         // Write through the logical->physical chunk mapping + MVCC overlay, the
         // same path the main write (btrfs_write_logical) and every read
         // (btrfs_read_logical_into) use. Writing raw to `self.dev` at the logical
@@ -35177,10 +35265,8 @@ impl OpenFs {
             // spurious ENOSPC is recoverable, destroyed data is not.
             let merged_len = u64::try_from(merged.len())
                 .map_err(|_| FfsError::InvalidGeometry("merged write length overflow".into()))?;
-            let reserved_bytenr = alloc
-                .extent_alloc
-                .alloc_data(merged_len)
-                .map_err(|e| btrfs_mutation_to_ffs(&e))?
+            let reserved_bytenr = self
+                .btrfs_alloc_data_with_growth(&mut *alloc, merged_len)?
                 .bytenr;
 
             // Replace any extents in the aligned range. Because all extents are
