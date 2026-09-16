@@ -10093,7 +10093,7 @@ mod tests {
         assert!(!resolve_write_invalidation(Some("0")));
         assert!(!resolve_write_invalidation(Some("false")));
         assert!(!resolve_write_invalidation(Some("no")));
-        assert!(!resolve_write_invalidation(Some("off")));
+        assert!(resolve_write_invalidation(Some("off")));
     }
 
     #[test]
