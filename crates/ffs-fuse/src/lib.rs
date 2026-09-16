@@ -4896,21 +4896,40 @@ pub fn parent_invalidation_enabled() -> bool {
     })
 }
 
-/// bd-pmjvd: should a successful FUSE `write` invalidate the kernel's page cache for
-/// the inode it just wrote?
+/// bd-pkioo, contract restated 2026-09-16: should a successful FUSE `write`
+/// invalidate the kernel's page cache for the inode it just wrote?
 ///
-/// Default ON (the shipping behaviour). `FFS_FUSE_WRITE_INVAL=0` turns it off for an
-/// A/B from a single ELF. Counted cost: exactly 1.000 enqueue per write, each a futex
-/// wake plus a reverse-invalidation round trip.
+/// DEFAULT OFF. In standard (non-writeback) mode the written bytes travel
+/// FROM the kernel's own page cache TO the daemon, so those pages already
+/// hold the newest data; a post-write `FUSE_NOTIFY_INVAL_INODE` can only
+/// evict fresh pages, costing exactly 1.000 enqueue per write — a futex wake
+/// plus a reverse-invalidation round trip — measured 3.000 syscalls/op and
+/// 21.4% daemon CPU on a pwrite+fsync workload. A stale page can only
+/// describe data written OUTSIDE this mount, and that mutation never
+/// triggers this handler, so the notification never covered it. Under
+/// writeback-cache mode `invalidate_mapping_pages` skips dirty pages, so the
+/// invalidation is a no-op precisely where it would matter most. Read-after
+/// -write probes: 60/60 correct in both arms across same-fd, cross-process,
+/// and drop-caches (real daemon fetch), plus e2fsck -fn clean.
+///
+/// `FFS_FUSE_WRITE_INVAL=1` restores the per-write invalidation.
+#[must_use]
 pub fn write_inode_invalidation_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var("FFS_FUSE_WRITE_INVAL")
-            .ok()
-            .is_none_or(|raw| {
-                let v = raw.trim();
-                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("no"))
-            })
+        resolve_write_invalidation(std::env::var("FFS_FUSE_WRITE_INVAL").ok().as_deref())
+    })
+}
+
+/// The resolver behind [`write_inode_invalidation_enabled`], separated so the
+/// default itself is assertable in-process (the cached wrapper reads the
+/// environment exactly once per process).
+fn resolve_write_invalidation(raw: Option<&str>) -> bool {
+    // bd-pkioo: unset means the kernel's own cached copy is trusted — it is
+    // the copy the write just passed through.
+    raw.is_some_and(|raw| {
+        let v = raw.trim();
+        !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("no"))
     })
 }
 
@@ -10060,6 +10079,21 @@ mod tests {
         queue.remember_negative_entry(parent, OsStr::new("opted-in-name"));
         assert!(queue.take_negative_entry(parent, OsStr::new("opted-in-name")));
         assert!(!queue.take_negative_entry(parent, OsStr::new("opted-in-name")));
+    }
+
+    #[test]
+    fn write_inode_invalidation_is_opt_in_bd_pkioo() {
+        // bd-pkioo, restated: the written bytes travel FROM the kernel's own
+        // page cache, so the post-write inode invalidation only evicts fresh
+        // pages. Default OFF; an explicit value restores or re-confirms it.
+        assert!(!resolve_write_invalidation(None));
+        assert!(resolve_write_invalidation(Some("1")));
+        assert!(resolve_write_invalidation(Some("true")));
+        assert!(resolve_write_invalidation(Some("on")));
+        assert!(!resolve_write_invalidation(Some("0")));
+        assert!(!resolve_write_invalidation(Some("false")));
+        assert!(!resolve_write_invalidation(Some("no")));
+        assert!(!resolve_write_invalidation(Some("off")));
     }
 
     #[test]
