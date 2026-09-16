@@ -25486,18 +25486,16 @@ mod tests {
         };
         let bytes = bg.to_bytes();
         assert_eq!(bytes.len(), 24);
-        // Serialization order: used_bytes, total_bytes, flags
+        // Serialization order: used_bytes, chunk_objectid (256 — the kernel
+        // tree-checker rejects anything else in this slot, bd-a136s), flags.
+        // The group's size is conveyed by the item KEY's offset, not here.
         assert_eq!(
             u64::from_le_bytes(bytes[0..8].try_into().unwrap()),
             0x50_000
         );
         assert_eq!(
             u64::from_le_bytes(bytes[8..16].try_into().unwrap()),
-            0x100_000
-        );
-        assert_eq!(
-            u64::from_le_bytes(bytes[16..24].try_into().unwrap()),
-            BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA
+            BTRFS_FIRST_CHUNK_TREE_OBJECTID
         );
         assert_eq!(bg.free_bytes(), 0x100_000 - 0x50_000);
     }
