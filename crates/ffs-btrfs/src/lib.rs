@@ -5882,11 +5882,19 @@ pub struct BtrfsBlockGroupItem {
 
 impl BtrfsBlockGroupItem {
     /// Serialize to on-disk format (24 bytes LE).
+    ///
+    /// The middle 8 bytes are the kernel's `chunk_objectid` and MUST be
+    /// `BTRFS_FIRST_CHUNK_TREE_OBJECTID` (256): the kernel tree-checker
+    /// rejects the leaf at open_ctree otherwise (bd-a136s — measured:
+    /// "invalid block group chunk objectid, have 26804224 expect 256").
+    /// The group's SIZE is conveyed by the item key's offset (the group's
+    /// logical length), matching every image mkfs.btrfs produces; the
+    /// in-memory `total_bytes` field stays private bookkeeping.
     #[must_use]
     pub fn to_bytes(&self) -> Vec<u8> {
         let mut buf = Vec::with_capacity(24);
         buf.extend_from_slice(&self.used_bytes.to_le_bytes());
-        buf.extend_from_slice(&self.total_bytes.to_le_bytes()); // Note: kernel stores chunk_objectid here; we reuse for total
+        buf.extend_from_slice(&BTRFS_FIRST_CHUNK_TREE_OBJECTID.to_le_bytes());
         buf.extend_from_slice(&self.flags.to_le_bytes());
         buf
     }
@@ -18153,24 +18161,22 @@ mod tests {
         );
     }
 
-    /// bd-yy6f5 — Canonical byte-layout snapshot for
+    /// bd-yy6f5/bd-a136s — Canonical byte-layout snapshot for
     /// BtrfsBlockGroupItem::to_bytes. Pins the encoder's exact 24-byte
     /// output for a magic-stamped fixture so any field-order or offset
     /// drift fails with a hex diff.
-    ///
     /// Layout matches the kernel struct btrfs_block_group_item per
-    /// fs/btrfs/btrfs_tree.h ONLY for `used`@0..8 and `flags`@16..24.
-    /// The middle 8 bytes (kernel: `chunk_objectid` u64@8..16) are
-    /// **deliberately** repurposed by our encoder to store
-    /// `total_bytes` instead. The kernel conveys total_bytes via
-    /// BTRFS_BLOCK_GROUP_ITEM_KEY.offset, but we don't surface that
-    /// key path on the ffs side, so we co-locate `total_bytes` in the
-    /// `chunk_objectid` slot. This canonical-bytes test pins that
-    /// divergence so any encoder regression that wrote total_bytes to
-    /// a different slot OR wrote the kernel's chunk_objectid value
-    /// (instead of total_bytes) gets caught with a hex diff. Pairs
-    /// with bd-7dhr1 (BtrfsExtentItem 24-byte canonical) and completes
-    /// ffs-btrfs encoder canonical-bytes coverage.
+    /// fs/btrfs/btrfs_tree.h: `used` u64@0..8, `chunk_objectid`
+    /// u64@8..16 = BTRFS_FIRST_CHUNK_TREE_OBJECTID (256), `flags`
+    /// u64@16..24. An earlier encoder wrote `total_bytes` into the
+    /// chunk_objectid slot; the kernel tree-checker rejected the leaf at
+    /// open_ctree ("invalid block group chunk objectid, have 26804224
+    /// expect 256", bd-a136s), so the slot now carries the kernel's
+    /// constant and the group's size is conveyed by the item KEY's
+    /// offset (the group's logical length), exactly as every
+    /// mkfs.btrfs image does. Pairs with bd-7dhr1 (BtrfsExtentItem
+    /// 24-byte canonical) and completes ffs-btrfs encoder
+    /// canonical-bytes coverage.
     #[test]
     fn block_group_item_to_bytes_canonical_byte_layout() {
         let item = BtrfsBlockGroupItem {
@@ -18184,10 +18190,8 @@ mod tests {
         let expected: [u8; 24] = [
             // used_bytes LE @0..8 = 0x1122_3344_5566_7788
             0x88, 0x77, 0x66, 0x55, 0x44, 0x33, 0x22, 0x11,
-            // total_bytes LE @8..16 = 0x99AA_BBCC_DDEE_FF00
-            // Kernel slot is `chunk_objectid`; we deliberately store
-            // total_bytes here (see encoder doc comment).
-            0x00, 0xFF, 0xEE, 0xDD, 0xCC, 0xBB, 0xAA, 0x99,
+            // chunk_objectid LE @8..16 = 256 (BTRFS_FIRST_CHUNK_TREE_OBJECTID)
+            0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
             // flags LE @16..24 = 0xCAFE_BABE_DEAD_BEEF
             0xEF, 0xBE, 0xAD, 0xDE, 0xBE, 0xBA, 0xFE, 0xCA,
         ];
