@@ -1491,13 +1491,11 @@ impl BtrfsAllocState {
         fsid: &[u8; 16],
         published: &arc_swap::ArcSwapOption<Vec<BtrfsChunkEntry>>,
     ) -> bool {
-        let chunks = match ffs_btrfs::chunk_entries_from_chunk_tree(&self.chunk_tree) {
-            Ok(chunks) => chunks,
-            Err(_) => return false,
+        let Ok(chunks) = ffs_btrfs::chunk_entries_from_chunk_tree(&self.chunk_tree) else {
+            return false;
         };
-        let device = match ffs_btrfs::GrowthDevice::from_chunk_tree(&self.chunk_tree, *fsid) {
-            Ok(device) => device,
-            Err(_) => return false,
+        let Ok(device) = ffs_btrfs::GrowthDevice::from_chunk_tree(&self.chunk_tree, *fsid) else {
+            return false;
         };
         let policy = ffs_btrfs::ChunkSizePolicy::default();
         let have = self.extent_alloc.allocatable_bytes(BTRFS_BLOCK_GROUP_DATA);
@@ -1507,15 +1505,14 @@ impl BtrfsAllocState {
         let low_water = (device.total_bytes / 16)
             .min(policy.target(ffs_btrfs::ChunkKind::Data, device.total_bytes));
         let shortfall = needed.max(low_water.saturating_sub(have)).max(1);
-        let plan = match ffs_btrfs::plan_growth_for_shortfall(
+        let Ok(Some(plan)) = ffs_btrfs::plan_growth_for_shortfall(
             &chunks,
             ffs_btrfs::ChunkKind::Data,
             shortfall,
             &device,
             &policy,
-        ) {
-            Ok(Some(plan)) => plan,
-            _ => return false,
+        ) else {
+            return false;
         };
         match ffs_btrfs::apply_chunk_allocation(
             &plan,
@@ -35266,12 +35263,8 @@ impl OpenFs {
             let merged_len = u64::try_from(merged.len())
                 .map_err(|_| FfsError::InvalidGeometry("merged write length overflow".into()))?;
             let reserved_bytenr = self
-                .btrfs_alloc_data_with_growth(&mut *alloc, merged_len)?
+                .btrfs_alloc_data_with_growth(&mut alloc, merged_len)?
                 .bytenr;
-
-            // Replace any extents in the aligned range. Because all extents are
-            // sector-aligned, the split boundaries here are aligned too, so the
-            // re-inserted left/right remnants stay aligned.
             let removed_nbytes_delta = if aligned_start >= inode.size && inode.nbytes <= inode.size
             {
                 // Pure append with no KEEP_SIZE/prealloc reservation past
