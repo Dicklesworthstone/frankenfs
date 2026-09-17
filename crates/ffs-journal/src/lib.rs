@@ -8543,6 +8543,50 @@ mod tests {
         );
     }
 
+    #[test]
+    fn failed_commit_then_retry_recovers_through_replay_bd_4zjkz() {
+        let cx = test_cx();
+        let dev = FailNthWriteBlockDevice::new(512, 32, 2);
+        let region = JournalRegion {
+            start: BlockNumber(0),
+            blocks: 8,
+        };
+        let mut writer = Jbd2Writer::new(region, 1);
+
+        // Attempt 1: descriptor lands, the injected failure kills the data
+        // write, so no commit block exists. Head must stay at 0 and the
+        // consumed sequence must not wedge the retry.
+        let mut failed = writer.begin_transaction();
+        failed.add_write(BlockNumber(7), vec![0xA7; 512]);
+        let err = writer
+            .commit_transaction(&cx, &dev, &failed)
+            .expect_err("second write should fail");
+        assert!(
+            err.to_string()
+                .contains("injected write failure on attempt 2")
+        );
+        assert_eq!(writer.head(), 0);
+
+        // Attempt 2: the retry must reuse the same head (no space consumed by
+        // the failed attempt) and commit cleanly with the NEXT sequence.
+        let mut retry = writer.begin_transaction();
+        retry.add_write(BlockNumber(9), vec![0xB9; 512]);
+        let (seq, stats) = writer
+            .commit_transaction(&cx, &dev, &retry)
+            .expect("retry after failed commit should succeed");
+        assert_eq!(seq, 2, "retry consumes the next sequence, never rewinds");
+        assert_eq!(stats.data_blocks, 1);
+
+        // Recovery: the successful transaction must replay onto block 9 even
+        // though a torn attempt at sequence 1 precedes it in the region.
+        let outcome = replay_jbd2(&cx, &dev, region).expect("replay after retry");
+        assert_eq!(outcome.committed_sequences, [2]);
+        assert_eq!(
+            dev.read_block(&cx, BlockNumber(9)).unwrap().as_slice(),
+            vec![0xB9_u8; 512].as_slice()
+        );
+    }
+
     // ── Property-based tests (proptest) ────────────────────────────────
 
     use proptest::prelude::*;
