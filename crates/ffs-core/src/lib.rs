@@ -62456,6 +62456,14 @@ mod tests {
             .expect("create");
         fs.write(&cx, attr.ino, 0, &[0xA5_u8; 4096]).expect("write");
         fs.flush_mvcc_to_device(&cx).expect("journalled boundary");
+        // Overwrite the same bytes and take the boundary again through the
+        // fsync surface itself, not only flush: this is the path a mounted
+        // write+fsync actually exercises (bd-4zjkz).
+        fs.write(&cx, attr.ino, 0, &[0x3C_u8; 4096])
+            .expect("overwrite");
+        fs.fsync(&cx, attr.ino, 0, false)
+            .expect("fsync after overwrite");
+
         let image = dev.snapshot_bytes();
         let after_b = journal_bytes(&image);
 
@@ -62467,14 +62475,31 @@ mod tests {
         );
 
         // The checkpoint must also have run: the data has to be at its HOME
-        // location, not only in the log.
-        let read_back = fs
-            .read(&cx, attr.ino, 0, 4096)
-            .expect("read back journalled file");
+        // location, not only in the log. Read it back through a FRESHLY
+        // REOPENED filesystem over the captured device bytes, so MVCC chains,
+        // parsed-inode caches and block caches cannot answer for the
+        // checkpoint; only real bytes at home locations can.
+        let reopened = {
+            let reopened_dev = TestDevice::from_vec(image.clone());
+            let opts = OpenOptions {
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                ..OpenOptions::default()
+            };
+            OpenFs::from_device(&cx, Box::new(reopened_dev), &opts).expect("reopen")
+        };
+        let reopened_attr = reopened.getattr(&cx, attr.ino).expect("reopened getattr");
         assert_eq!(
-            read_back,
-            vec![0xA5_u8; 4096],
-            "the journalled boundary must still land the data at its home block"
+            reopened_attr.size, 4096,
+            "reopened size must reflect the journalled boundary's checkpoint"
+        );
+        let reopened_bytes = reopened
+            .read(&cx, attr.ino, 0, 4096)
+            .expect("read back journalled file from reopened image");
+        assert_eq!(
+            reopened_bytes,
+            vec![0x3C_u8; 4096],
+            "the journalled boundary must land the OVERWRITTEN bytes at their home \
+             block, visible to a fresh open of the same image"
         );
 
         let path = tmp.path().join("journalled.ext4");
