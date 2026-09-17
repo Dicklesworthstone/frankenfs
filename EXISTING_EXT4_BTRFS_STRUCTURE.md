@@ -1336,6 +1336,19 @@ running -> committing -> committed -> checkpointed
    written to their final on-disk locations. The journal space used by
    this transaction can be reclaimed.
 
+Linux v6.19 `fs/jbd2/recovery.c:do_one_pass` requires each journal header's
+sequence to equal the expected transaction ID; a mismatch terminates the scan.
+A valid-looking later commit does not justify skipping a sequence gap.
+
+FrankenFS's `Jbd2Writer` aborts after any error once its write phase begins.
+Later commits on that writer return an I/O error without device mutation, even
+after `reset_after_checkpoint`. Recovery must precede opening a replacement
+writer: neither reusing a possibly persisted sequence nor accepting arbitrary
+newer replay records is a safe retry protocol. Preflight rejection does not
+abort the writer, but begin-time sequence allocation is not rolled back.
+This contract does not cover errors in the caller's final commit sync or home
+checkpoint; those remain outside `Jbd2Writer::commit_transaction`.
+
 ### 8.3 Journal Handles and Credits
 
 ```c

@@ -1083,6 +1083,9 @@ pub struct Jbd2Writer {
     base_head: u64,
     /// Next sequence number for a new transaction.
     next_seq: u32,
+    /// A failed commit may have left partial writes or an ambiguous commit record.
+    /// Only recovery and a newly opened writer can resume journal writes.
+    aborted: bool,
     /// Whether to use 64-bit block number format.
     is_64bit: bool,
     tag_format: Jbd2TagFormat,
@@ -1128,6 +1131,7 @@ impl Jbd2Writer {
             head: 0,
             base_head: 0,
             next_seq: start_seq,
+            aborted: false,
             is_64bit: false,
             tag_format: Jbd2TagFormat::Legacy,
             has_checksum: false,
@@ -1148,6 +1152,7 @@ impl Jbd2Writer {
             head: 0,
             base_head: 0,
             next_seq: start_seq,
+            aborted: false,
             is_64bit: false,
             tag_format: Jbd2TagFormat::Legacy,
             has_checksum: false,
@@ -1172,6 +1177,7 @@ impl Jbd2Writer {
             head: 0,
             base_head: 0,
             next_seq: start_seq,
+            aborted: false,
             is_64bit: false,
             tag_format: if has_checksum {
                 Jbd2TagFormat::CsumV3
@@ -1246,6 +1252,7 @@ impl Jbd2Writer {
             head,
             base_head,
             next_seq: max_seq,
+            aborted: false,
             is_64bit,
             tag_format,
             has_checksum,
@@ -1300,6 +1307,7 @@ impl Jbd2Writer {
             head: base_head,
             base_head,
             next_seq: start_seq,
+            aborted: false,
             is_64bit,
             tag_format,
             has_checksum,
@@ -1332,6 +1340,7 @@ impl Jbd2Writer {
     ///
     /// The sequence number deliberately keeps advancing — rewinding it would let
     /// replay mistake a stale transaction for a live one.
+    /// Reclaiming space does not clear an aborted writer.
     pub fn reset_after_checkpoint(&mut self) {
         self.head = self.base_head;
     }
@@ -1412,6 +1421,11 @@ impl Jbd2Writer {
     /// 3. One commit block.
     ///
     /// Returns `(sequence_number, write_stats)`.
+    /// Once the write phase starts, any error permanently aborts this writer.
+    /// Subsequent commits return an I/O error without touching the device;
+    /// recovery must precede opening a replacement writer. Preflight errors do
+    /// not abort the writer, but do not undo sequences consumed at begin time.
+    /// The caller must still sync the commit record before acknowledging durability.
     #[expect(clippy::too_many_lines)]
     pub fn commit_transaction(
         &mut self,
@@ -1419,6 +1433,11 @@ impl Jbd2Writer {
         dev: &dyn BlockDevice,
         txn: &Jbd2Transaction,
     ) -> Result<(u32, Jbd2WriteStats)> {
+        if self.aborted {
+            return Err(FfsError::Io(std::io::Error::other(
+                "JBD2 writer aborted after a failed commit; recovery is required",
+            )));
+        }
         let bs = usize::try_from(dev.block_size())
             .map_err(|_| FfsError::Format("block_size does not fit usize".to_owned()))?;
         if bs < JBD2_HEADER_SIZE {
@@ -1475,6 +1494,11 @@ impl Jbd2Writer {
             return Err(FfsError::NoSpace);
         }
 
+        // Arm before the first possible device write. Any subsequent error leaves
+        // this writer aborted: writes returning an error may still have reached
+        // storage. Reusing a sequence can match a stale commit; skipping one can
+        // make recovery stop before a later acknowledged transaction.
+        self.aborted = true;
         let mut stats = Jbd2WriteStats::default();
         let seq = txn.sequence;
         let mut staged_head = self.head;
@@ -1726,6 +1750,7 @@ impl Jbd2Writer {
         stats.commit_blocks = stats.commit_blocks.saturating_add(1);
 
         self.head = staged_head;
+        self.aborted = false;
 
         tracing::trace!(
             target: "ffs::journal",
@@ -8543,48 +8568,71 @@ mod tests {
         );
     }
 
+    /// A failed journal write must not permit a later success hidden behind a
+    /// sequence gap. Earlier committed data must remain recoverable.
     #[test]
-    fn failed_commit_then_retry_recovers_through_replay_bd_4zjkz() {
-        let cx = test_cx();
-        let dev = FailNthWriteBlockDevice::new(512, 32, 2);
-        let region = JournalRegion {
-            start: BlockNumber(0),
-            blocks: 8,
-        };
-        let mut writer = Jbd2Writer::new(region, 1);
+    fn failed_commit_rejects_retries_and_preserves_recovery_bd_4zjkz() {
+        // Fail the next descriptor, data, or commit write, respectively.
+        for fail_on_write in [4, 5, 6] {
+            let cx = test_cx();
+            let dev = FailNthWriteBlockDevice::new(512, 64, fail_on_write);
+            let region = JournalRegion {
+                start: BlockNumber(0),
+                blocks: 16,
+            };
+            let mut sb = jbd2_superblock_block(512, 1, 1, 0, 0, [0_u8; 16]);
+            sb[16..20].copy_from_slice(&16_u32.to_be_bytes());
+            sb[20..24].copy_from_slice(&1_u32.to_be_bytes());
+            dev.inner.raw_write(BlockNumber(0), sb);
+            let mut writer = Jbd2Writer::open(&cx, &dev, region, 1).unwrap();
 
-        // Attempt 1: descriptor lands, the injected failure kills the data
-        // write, so no commit block exists. Head must stay at 0 and the
-        // consumed sequence must not wedge the retry.
-        let mut failed = writer.begin_transaction();
-        failed.add_write(BlockNumber(7), vec![0xA7; 512]);
-        let err = writer
-            .commit_transaction(&cx, &dev, &failed)
-            .expect_err("second write should fail");
-        assert!(
-            err.to_string()
-                .contains("injected write failure on attempt 2")
-        );
-        assert_eq!(writer.head(), 0);
+            // Home blocks are outside the journal. Persist a complete predecessor.
+            let mut committed = writer.begin_transaction();
+            committed.add_write(BlockNumber(32), vec![0xA5; 512]);
+            writer.commit_transaction(&cx, &dev, &committed).unwrap();
+            dev.sync(&cx).unwrap();
 
-        // Attempt 2: the retry must reuse the same head (no space consumed by
-        // the failed attempt) and commit cleanly with the NEXT sequence.
-        let mut retry = writer.begin_transaction();
-        retry.add_write(BlockNumber(9), vec![0xB9; 512]);
-        let (seq, stats) = writer
-            .commit_transaction(&cx, &dev, &retry)
-            .expect("retry after failed commit should succeed");
-        assert_eq!(seq, 2, "retry consumes the next sequence, never rewinds");
-        assert_eq!(stats.data_blocks, 1);
+            let mut failed = writer.begin_transaction();
+            failed.add_write(BlockNumber(33), vec![0xA6; 512]);
+            let mut retained = writer.begin_transaction();
+            retained.add_write(BlockNumber(34), vec![0xB7; 512]);
+            assert!(writer.commit_transaction(&cx, &dev, &failed).is_err());
+            let writes_after_failure = dev.writes_seen.load(Ordering::Relaxed);
 
-        // Recovery: the successful transaction must replay onto block 9 even
-        // though a torn attempt at sequence 1 precedes it in the region.
-        let outcome = replay_jbd2(&cx, &dev, region).expect("replay after retry");
-        assert_eq!(outcome.committed_sequences, [2]);
-        assert_eq!(
-            dev.read_block(&cx, BlockNumber(9)).unwrap().as_slice(),
-            vec![0xB9_u8; 512].as_slice()
-        );
+            assert!(matches!(
+                writer.commit_transaction(&cx, &dev, &retained),
+                Err(FfsError::Io(_))
+            ));
+            let outcome = replay_jbd2(&cx, &dev, region).unwrap();
+            assert_eq!(outcome.committed_sequences, [1]);
+            assert_eq!(
+                dev.read_block(&cx, BlockNumber(32)).unwrap().as_slice(),
+                &[0xA5; 512]
+            );
+            assert_eq!(
+                dev.read_block(&cx, BlockNumber(34)).unwrap().as_slice(),
+                &[0; 512]
+            );
+            // Replay performs a home write; count only attempted journal retries.
+            assert_eq!(
+                dev.writes_seen.load(Ordering::Relaxed),
+                writes_after_failure + 1
+            );
+
+            // Even after recovery/checkpoint, the same aborted writer stays closed.
+            dev.sync(&cx).unwrap();
+            writer.reset_after_checkpoint();
+            let mut retry = writer.begin_transaction();
+            retry.add_write(BlockNumber(35), vec![0xC8; 512]);
+            assert!(matches!(
+                writer.commit_transaction(&cx, &dev, &retry),
+                Err(FfsError::Io(_))
+            ));
+            assert_eq!(
+                dev.writes_seen.load(Ordering::Relaxed),
+                writes_after_failure + 1
+            );
+        }
     }
 
     // ── Property-based tests (proptest) ────────────────────────────────
