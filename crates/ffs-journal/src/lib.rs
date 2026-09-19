@@ -1013,7 +1013,6 @@ pub struct Jbd2WriteStats {
 /// A pending JBD2 transaction being assembled before commit.
 #[derive(Debug, Clone)]
 pub struct Jbd2Transaction {
-    sequence: u32,
     body_items: Vec<Jbd2TxnBodyItem>,
     write_count: usize,
     revoke_count: usize,
@@ -1034,12 +1033,6 @@ impl Jbd2Transaction {
     pub fn add_revoke(&mut self, target: BlockNumber) {
         self.body_items.push(Jbd2TxnBodyItem::Revoke(target));
         self.revoke_count = self.revoke_count.saturating_add(1);
-    }
-
-    /// The sequence number assigned to this transaction.
-    #[must_use]
-    pub fn sequence(&self) -> u32 {
-        self.sequence
     }
 
     /// Number of writes staged so far.
@@ -1352,12 +1345,22 @@ impl Jbd2Writer {
         self.base_head
     }
 
-    /// Begin a new transaction, consuming the next sequence number.
+    /// Begin a new transaction.
+    ///
+    /// The transaction's sequence number is assigned when its commit's write
+    /// phase begins, NOT here (bd-rnzr5): a transaction that is discarded, or
+    /// rejected by [`Self::commit_transaction`]'s preflight, consumes no
+    /// sequence. Burning sequences for transactions that never reached the log
+    /// punches holes in the on-disk sequence numbering, and guided replay
+    /// stops at the first gap — stranding every later committed transaction.
     pub fn begin_transaction(&mut self) -> Jbd2Transaction {
-        let seq = self.next_seq;
-        self.next_seq = self.next_seq.wrapping_add(1);
+        tracing::trace!(
+            target: "ffs::journal",
+            next_seq = self.next_seq,
+            head = self.head,
+            "jbd2_txn_begun"
+        );
         Jbd2Transaction {
-            sequence: seq,
             body_items: Vec::new(),
             write_count: 0,
             revoke_count: 0,
@@ -1423,9 +1426,10 @@ impl Jbd2Writer {
     /// Returns `(sequence_number, write_stats)`.
     /// Once the write phase starts, any error permanently aborts this writer.
     /// Subsequent commits return an I/O error without touching the device;
-    /// recovery must precede opening a replacement writer. Preflight errors do
-    /// not abort the writer, but do not undo sequences consumed at begin time.
-    /// The caller must still sync the commit record before acknowledging durability.
+    /// recovery must precede opening a replacement writer. The sequence is
+    /// assigned when the write phase begins: preflight errors neither abort
+    /// the writer nor consume a sequence (bd-rnzr5). The caller must still
+    /// sync the commit record before acknowledging durability.
     #[expect(clippy::too_many_lines)]
     pub fn commit_transaction(
         &mut self,
@@ -1494,13 +1498,22 @@ impl Jbd2Writer {
             return Err(FfsError::NoSpace);
         }
 
+        // The sequence is assigned HERE, after every preflight check and at the
+        // point of no return: from this line the write phase may reach the
+        // device, so the sequence is consumed even if a later write fails (the
+        // writer is aborted and only recovery may resume). Assigning earlier
+        // let preflight rejections and abandoned transactions burn sequences,
+        // and the resulting gaps stopped guided replay before later committed
+        // transactions (bd-rnzr5).
+        let seq = self.next_seq;
+        self.next_seq = self.next_seq.wrapping_add(1);
+
         // Arm before the first possible device write. Any subsequent error leaves
         // this writer aborted: writes returning an error may still have reached
         // storage. Reusing a sequence can match a stale commit; skipping one can
         // make recovery stop before a later acknowledged transaction.
         self.aborted = true;
         let mut stats = Jbd2WriteStats::default();
-        let seq = txn.sequence;
         let mut staged_head = self.head;
 
         // --- Phase 1: descriptor + data blocks ---
@@ -5065,6 +5078,73 @@ mod tests {
         assert_eq!(target.as_slice(), &[0xAB; 512]);
     }
 
+    // bd-rnzr5: a preflight-rejected transaction used to consume its sequence
+    // in `begin_transaction`, before any preflight check ran. Two consecutive
+    // rejections punch a two-wide hole in the log's sequence numbering; the
+    // guided replay scan breaks when a block's sequence is neither `expected`
+    // nor `expected + 1`, so the next COMMITTED transaction — carrying data a
+    // caller saw acknowledged — is silently stranded in the log.
+    #[test]
+    fn jbd2_preflight_rejection_and_abandonment_do_not_burn_sequences() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(512, 256);
+        let region = JournalRegion {
+            start: BlockNumber(100),
+            blocks: 32,
+        };
+
+        let mut writer = Jbd2Writer::new(region, 1);
+
+        // Transaction 1 commits normally: sequence 1, later acknowledged.
+        let mut txn = writer.begin_transaction();
+        txn.add_write(BlockNumber(5), vec![0x11; 512]);
+        let (seq, _) = writer
+            .commit_transaction(&cx, &dev, &txn)
+            .expect("commit 1");
+        assert_eq!(seq, 1);
+
+        // Two consecutive preflight rejections: a payload larger than the
+        // block size fails before any device I/O. The writer must stay usable,
+        // and no sequence may be consumed by either rejection.
+        for size in [1024_usize, 2048] {
+            let mut rejected = writer.begin_transaction();
+            rejected.add_write(BlockNumber(6), vec![0x22; size]);
+            let err = writer
+                .commit_transaction(&cx, &dev, &rejected)
+                .expect_err("oversized payload is a preflight rejection");
+            assert!(
+                !err.to_string().contains("aborted"),
+                "preflight failure must not abort the writer: {err}"
+            );
+        }
+
+        // A transaction begun but never committed (caller dropped it after a
+        // conflict) must not burn a sequence either.
+        drop(writer.begin_transaction());
+
+        // The next acknowledged transaction gets the CONTIGUOUS sequence 2.
+        let mut txn3 = writer.begin_transaction();
+        txn3.add_write(BlockNumber(7), vec![0x33; 512]);
+        let (seq3, _) = writer
+            .commit_transaction(&cx, &dev, &txn3)
+            .expect("commit 3");
+        assert_eq!(
+            seq3, 2,
+            "preflight rejections and abandoned transactions must not consume sequences"
+        );
+
+        // Replay must recover BOTH acknowledged transactions: the gap used to
+        // stop the guided scan before sequence 4, stranding block 7's data.
+        let outcome = replay_jbd2(&cx, &dev, region).expect("replay");
+        assert_eq!(
+            outcome.committed_sequences,
+            vec![1, 2],
+            "a sequence gap must not strand an acknowledged transaction"
+        );
+        let block7 = dev.read_block(&cx, BlockNumber(7)).expect("read 7");
+        assert_eq!(block7.as_slice(), &[0x33; 512]);
+    }
+
     #[test]
     fn jbd2_writer_checksummed_journal_replays_with_verification() {
         let cx = test_cx();
@@ -6411,7 +6491,7 @@ mod tests {
     }
 
     #[test]
-    fn jbd2_writer_begin_transaction_increments_sequence() {
+    fn jbd2_writer_begin_transaction_does_not_consume_sequence() {
         let region = JournalRegion {
             start: BlockNumber(0),
             blocks: 100,
@@ -6420,13 +6500,14 @@ mod tests {
         let mut writer = Jbd2Writer::new(region, 10);
         assert_eq!(writer.next_seq(), 10);
 
-        let txn1 = writer.begin_transaction();
-        assert_eq!(txn1.sequence(), 10);
-        assert_eq!(writer.next_seq(), 11);
+        // bd-rnzr5: beginning a transaction reserves nothing. Sequences are
+        // assigned at the commit's write phase, so abandoned transactions and
+        // preflight rejections leave the numbering contiguous.
+        let _txn1 = writer.begin_transaction();
+        assert_eq!(writer.next_seq(), 10);
 
-        let txn2 = writer.begin_transaction();
-        assert_eq!(txn2.sequence(), 11);
-        assert_eq!(writer.next_seq(), 12);
+        let _txn2 = writer.begin_transaction();
+        assert_eq!(writer.next_seq(), 10);
     }
 
     #[test]
@@ -7791,7 +7872,9 @@ mod tests {
         };
         let mut writer = Jbd2Writer::new(region, 42);
         let mut txn = writer.begin_transaction();
-        assert_eq!(txn.sequence(), 42);
+        // bd-rnzr5: begin no longer burns a sequence; assignment moved to the
+        // commit write phase, so the writer's next sequence is untouched here.
+        assert_eq!(writer.next_seq(), 42);
         assert_eq!(txn.write_count(), 0);
         assert_eq!(txn.revoke_count(), 0);
 
@@ -8073,7 +8156,8 @@ mod tests {
         let mut writer = Jbd2Writer::new(region, 1);
         let txn = writer.begin_transaction();
         let cloned = txn.clone();
-        assert_eq!(cloned.sequence(), txn.sequence());
+        assert_eq!(cloned.write_count(), txn.write_count());
+        assert_eq!(cloned.revoke_count(), txn.revoke_count());
         let _ = format!("{txn:?}");
     }
 

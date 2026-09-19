@@ -10648,6 +10648,28 @@ impl OpenFs {
             }
         };
 
+        // Phase 2.5 (bd-rnzr5): make the journal commit record durable BEFORE
+        // MVCC visibility. `commit_transaction` orders the body before the
+        // commit block, but returning Ok does not mean the device flushed;
+        // without this barrier a crash after the caller is told "committed"
+        // leaves a journal holding descriptor and data but no commit record,
+        // and replay drops data the caller saw acknowledged.
+        if let Err(e) = self.dev.sync(cx) {
+            warn!(
+                target: "ffs::journal",
+                txn_id = txn_id.0,
+                error = %e,
+                "journaled_commit_sync_failed_before_visibility"
+            );
+            // The journal may or may not hold the commit record — ambiguous.
+            // MVCC must NOT publish: the transaction stays invisible and the
+            // caller owns the retry, which re-journals under a fresh
+            // sequence (idempotent on replay).
+            return Err(FfsError::Io(std::io::Error::other(format!(
+                "JBD2 journal commit sync failed before MVCC visibility: {e}"
+            ))));
+        }
+
         // Phase 3: make preflighted writes visible in MVCC.
         let commit_seq = mvcc_guard.commit_fcw_prechecked(txn).map_err(|e| {
             Self::map_journal_commit_error(
@@ -22184,15 +22206,61 @@ impl OpenFs {
             for (block, data) in &writes {
                 txn.add_write(*block, data.clone());
             }
-            // Phase 1 — journal, then make the journal durable.
-            journal.commit_transaction(cx, &direct, &txn)?;
-            self.dev.sync(cx)?;
-
+            // Phase 1a — journal. The writer classifies its own failures: a
+            // preflight rejection (NoSpace, format) did no I/O and left the
+            // writer usable; a write-phase failure aborted the writer and may
+            // have left partial blocks. Only recovery resumes the latter.
+            if let Err(e) = journal.commit_transaction(cx, &direct, &txn) {
+                warn!(
+                    target: "ffs::journal",
+                    error = %e,
+                    "flush_boundary_journal_write_failed"
+                );
+                return Err(FfsError::Io(std::io::Error::other(format!(
+                    "jbd2 flush boundary journal write failed: {e}"
+                ))));
+            }
+            // Phase 1b — journal commit record durability. Ambiguous on
+            // failure: the commit record may or may not have reached storage.
+            // The writer is NOT aborted (its write phase completed); the
+            // caller's watermark does not advance, so the retry re-journals
+            // the same versions under fresh contiguous sequences — idempotent
+            // on replay (bd-rnzr5).
+            if let Err(e) = self.dev.sync(cx) {
+                warn!(
+                    target: "ffs::journal",
+                    error = %e,
+                    "flush_boundary_journal_sync_failed"
+                );
+                return Err(FfsError::Io(std::io::Error::other(format!(
+                    "jbd2 flush boundary journal commit sync failed (commit record durability ambiguous): {e}"
+                ))));
+            }
             // Phase 2 — checkpoint to home locations, then make THAT durable.
             for (block, data) in &writes {
-                direct.write_block(cx, *block, data)?;
+                if let Err(e) = direct.write_block(cx, *block, data) {
+                    warn!(
+                        target: "ffs::journal",
+                        block = block.0,
+                        error = %e,
+                        "flush_boundary_checkpoint_write_failed"
+                    );
+                    return Err(FfsError::Io(std::io::Error::other(format!(
+                        "jbd2 flush boundary checkpoint write failed at block {}: {e}",
+                        block.0
+                    ))));
+                }
             }
-            self.dev.sync(cx)?;
+            if let Err(e) = self.dev.sync(cx) {
+                warn!(
+                    target: "ffs::journal",
+                    error = %e,
+                    "flush_boundary_checkpoint_sync_failed"
+                );
+                return Err(FfsError::Io(std::io::Error::other(format!(
+                    "jbd2 flush boundary checkpoint sync failed (checkpoint durability ambiguous; the journal still holds the committed copy): {e}"
+                ))));
+            }
 
             // Phase 3 — the home copies are durable, so the region is reclaimable.
             // Only correct because phase 2 completed; see `reset_after_checkpoint`.
@@ -43416,6 +43484,99 @@ mod tests {
         }
     }
 
+    /// Crash-simulation device (bd-rnzr5): writes land in a volatile layer;
+    /// only a successful `sync` promotes the volatile image into the durable
+    /// shadow a crash would leave behind. `arm_sync_failure(n)` injects a
+    /// deterministic failure on the nth sync call (1-based), distinguishing
+    /// the journal-body barrier from the journal-commit and checkpoint syncs.
+    #[derive(Debug, Clone)]
+    struct CrashDevice {
+        volatile: Arc<parking_lot::Mutex<Vec<u8>>>,
+        durable: Arc<parking_lot::Mutex<Vec<u8>>>,
+        sync_count: Arc<AtomicUsize>,
+        fail_on_sync: Arc<AtomicUsize>,
+    }
+
+    impl CrashDevice {
+        fn from_vec(v: Vec<u8>) -> Self {
+            Self {
+                volatile: Arc::new(parking_lot::Mutex::new(v.clone())),
+                durable: Arc::new(parking_lot::Mutex::new(v)),
+                sync_count: Arc::new(AtomicUsize::new(0)),
+                fail_on_sync: Arc::new(AtomicUsize::new(0)),
+            }
+        }
+
+        fn arm_sync_failure(&self, index: usize) {
+            self.fail_on_sync.store(index, AtomicOrdering::SeqCst);
+        }
+
+        fn disarm(&self) {
+            self.fail_on_sync.store(0, AtomicOrdering::SeqCst);
+        }
+
+        fn sync_count(&self) -> usize {
+            self.sync_count.load(AtomicOrdering::SeqCst)
+        }
+
+        /// The bytes a crash right now would leave on storage.
+        fn durable_bytes(&self) -> Vec<u8> {
+            self.durable.lock().clone()
+        }
+    }
+
+    impl ByteDevice for CrashDevice {
+        fn len_bytes(&self) -> u64 {
+            self.volatile.lock().len().try_into().unwrap_or(u64::MAX)
+        }
+
+        #[allow(clippy::cast_possible_truncation)]
+        fn read_exact_at(
+            &self,
+            _cx: &Cx,
+            offset: ByteOffset,
+            buf: &mut [u8],
+        ) -> ffs_error::Result<()> {
+            let off = offset.0 as usize;
+            let data = self.volatile.lock();
+            let end = off + buf.len();
+            if end > data.len() {
+                return Err(FfsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "read past end",
+                )));
+            }
+            buf.copy_from_slice(&data[off..end]);
+            Ok(())
+        }
+
+        #[allow(clippy::cast_possible_truncation)]
+        fn write_all_at(&self, _cx: &Cx, offset: ByteOffset, buf: &[u8]) -> ffs_error::Result<()> {
+            let off = offset.0 as usize;
+            let mut data = self.volatile.lock();
+            let end = off + buf.len();
+            if end > data.len() {
+                return Err(FfsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "write past end",
+                )));
+            }
+            data[off..end].copy_from_slice(buf);
+            Ok(())
+        }
+
+        fn sync(&self, _cx: &Cx) -> ffs_error::Result<()> {
+            let n = self.sync_count.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            let fail = self.fail_on_sync.load(AtomicOrdering::SeqCst);
+            if fail != 0 && n == fail {
+                return Err(FfsError::Io(std::io::Error::other("injected sync failure")));
+            }
+            let snapshot = self.volatile.lock().clone();
+            *self.durable.lock() = snapshot;
+            Ok(())
+        }
+    }
+
     /// Test device that advertises vectored reads and counts scalar vs vectored
     /// device operations. Used to prove the file-read path coalesces contiguous
     /// block reads into a single vectored device op (bd-a384r) rather than one
@@ -48582,6 +48743,148 @@ mod tests {
         );
         assert_eq!(err.to_errno(), libc::EAGAIN);
         assert_eq!(fs.current_snapshot().high, CommitSeq(1));
+    }
+
+    // bd-rnzr5: `commit_transaction_journaled` used to publish MVCC visibility
+    // and return Ok immediately after `commit_transaction`, without syncing the
+    // journal commit record. The commit block was volatile-only at ack time: a
+    // crash left a journal with descriptor+data but no commit record, and
+    // replay dropped data the caller saw acknowledged.
+    #[test]
+    fn journaled_commit_syncs_commit_record_before_acknowledging_bd_rnzr5() {
+        let image = build_ext4_image(2); // 4K blocks, 128K image
+        let dev = CrashDevice::from_vec(image);
+        let cx = Cx::for_testing();
+
+        let mut fs =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+        fs.attach_jbd2_writer(Jbd2Writer::new(
+            ffs_journal::JournalRegion {
+                start: BlockNumber(16), // in-range for this synthetic image
+                blocks: 8,
+            },
+            1,
+        ));
+
+        let target = BlockNumber(5);
+        let bs = usize::try_from(fs.block_size()).expect("block size fits usize");
+        let data = vec![0xAB; bs];
+        let mut txn = fs.begin_transaction();
+        txn.stage_write(target, data.clone());
+
+        let (commit_seq, _) = fs
+            .commit_transaction_journaled(&cx, txn)
+            .expect("journaled commit");
+        assert_eq!(commit_seq, CommitSeq(1));
+
+        // Crash immediately after the acknowledged commit: take the durable
+        // shadow, discard the volatile layer, replay the journal from it.
+        let durable = dev.durable_bytes();
+        let shadow = CrashDevice::from_vec(durable);
+        let shadow_adapter = ByteDeviceBlockAdapter {
+            dev: &shadow,
+            block_size: fs.block_size(),
+        };
+        let region = ffs_journal::JournalRegion {
+            start: BlockNumber(16),
+            blocks: 8,
+        };
+        let outcome =
+            ffs_journal::replay_jbd2(&cx, &shadow_adapter, region).expect("replay on crash image");
+
+        assert_eq!(
+            outcome.committed_sequences,
+            vec![1],
+            "the acknowledged commit's commit record must be durable at ack time"
+        );
+        assert_eq!(outcome.stats.replayed_blocks, 1);
+        let block5 = shadow_adapter
+            .read_block(&cx, target)
+            .expect("read replayed block");
+        assert_eq!(block5.as_slice(), data.as_slice());
+    }
+
+    // bd-rnzr5: `ext4_flush_boundary_via_jbd2` owned final sync and checkpoint
+    // errors with no phase classification, and nothing pinned the retry
+    // contract: a failed boundary must NOT wedge the writer (the journal write
+    // phase completed, so the writer is not aborted), must NOT advance the
+    // durability watermark, and a retry from the same watermark must re-journal
+    // the same versions under fresh contiguous sequences and checkpoint them.
+    //
+    // Uses a real mkfs.ext4 image, a writable mount, and the image's REAL
+    // internal journal — the production boundary configuration.
+    #[test]
+    fn flush_boundary_sync_failure_classifies_phase_and_recovers_bd_rnzr5() {
+        let Some((mut fs, dev, _tmp)) = open_writable_ext4_mkfs_with_crash_device(64) else {
+            return; // format tool unavailable
+        };
+        let cx = Cx::for_testing();
+        assert!(
+            fs.attach_ext4_internal_jbd2_writer(&cx)
+                .expect("attach journal writer"),
+            "the mkfs.ext4 image must carry an internal journal for this test"
+        );
+
+        let target = BlockNumber(25); // in-range data block on a 64 MiB image
+        let bs = usize::try_from(fs.block_size()).expect("block size fits usize");
+        let data = vec![0xCD; bs];
+        let mut txn = fs.begin_transaction();
+        txn.stage_write(target, data.clone());
+        fs.commit_transaction(&cx, txn).expect("plain MVCC commit");
+
+        for (sync_in_boundary, phase_label) in
+            [(2_usize, "journal commit sync"), (3, "checkpoint sync")]
+        {
+            // Syncs reaching the device inside one boundary, in order: 1 = the
+            // body barrier inside `commit_transaction`, 2 = journal commit
+            // record durability, 3 = checkpoint durability.
+            dev.arm_sync_failure(dev.sync_count() + sync_in_boundary);
+
+            let err = fs
+                .ext4_flush_boundary_via_jbd2(&cx, CommitSeq(0))
+                .expect_err("injected sync failure must fail the boundary");
+            let msg = err.to_string();
+            assert!(
+                msg.contains(phase_label),
+                "boundary failure must name its phase ({phase_label}), got: {msg}"
+            );
+
+            // The writer must not be wedged and the watermark must not have
+            // advanced: disarm and retry from the SAME watermark.
+            dev.disarm();
+            let boundary = fs
+                .ext4_flush_boundary_via_jbd2(&cx, CommitSeq(0))
+                .expect("retry after sync failure must succeed");
+            let (_, durable_through) = boundary.expect("retry boundary has pending writes");
+            assert!(durable_through >= CommitSeq(1));
+
+            // A crash after the retry: the acknowledged data must be on the
+            // durable shadow — checkpointed by the retry (and, for the journal
+            // sync failure, still recoverable from the committed journal).
+            let durable = dev.durable_bytes();
+            let shadow = CrashDevice::from_vec(durable);
+            let shadow_adapter = ByteDeviceBlockAdapter {
+                dev: &shadow,
+                block_size: fs.block_size(),
+            };
+            let journal_inum = fs.ext4_superblock().expect("ext4 superblock").journal_inum;
+            let journal_inode = fs
+                .read_inode(&cx, InodeNumber(u64::from(journal_inum)))
+                .expect("journal inode");
+            let segments = fs
+                .collect_ext4_journal_segments(&cx, &journal_inode)
+                .expect("journal segments");
+            let _ = ffs_journal::replay_jbd2_segments(&cx, &shadow_adapter, &segments)
+                .expect("replay on crash image");
+            let block_after = shadow_adapter
+                .read_block(&cx, target)
+                .expect("read block after retry");
+            assert_eq!(
+                block_after.as_slice(),
+                data.as_slice(),
+                "acknowledged data must be durable after the retry ({phase_label} class)"
+            );
+        }
     }
 
     #[test]
@@ -63117,6 +63420,49 @@ mod tests {
         fs.enable_writes(&cx).expect("enable writes");
         assert!(fs.is_writable());
         Some((fs, snapshot, tmp))
+    }
+
+    /// [`open_writable_ext4_mkfs_with_device`] over a [`CrashDevice`], for
+    /// durability-boundary tests that need sync-failure injection and the
+    /// durable shadow a crash would leave behind (bd-rnzr5).
+    fn open_writable_ext4_mkfs_with_crash_device(
+        size_mb: u64,
+    ) -> Option<(OpenFs, CrashDevice, tempfile::TempDir)> {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let image = tmp.path().join("test.ext4");
+        let f = std::fs::File::create(&image).expect("create image");
+        f.set_len(size_mb * 1024 * 1024).expect("set image size");
+        drop(f);
+
+        let out = std::process::Command::new("mkfs.ext4")
+            .args(["-F", "-b", "4096", image.to_str().unwrap()])
+            .output();
+        let out = match out {
+            Ok(o) if o.status.success() => o,
+            _ => return None,
+        };
+        let _ = out;
+
+        let _ = std::process::Command::new("debugfs")
+            .args([
+                "-w",
+                "-R",
+                "set_inode_field / mode 040777",
+                image.to_str().unwrap(),
+            ])
+            .output();
+
+        let cx = Cx::for_testing();
+        let data = std::fs::read(&image).expect("read image");
+        let dev = CrashDevice::from_vec(data);
+        let opts = OpenOptions {
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+            ..OpenOptions::default()
+        };
+        let mut fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &opts).expect("open ext4");
+        fs.enable_writes(&cx).expect("enable writes");
+        assert!(fs.is_writable());
+        Some((fs, dev, tmp))
     }
 
     /// bd-y2t0r: the sharded delete routing must hold up under CONCURRENT
