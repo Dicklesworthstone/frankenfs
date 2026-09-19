@@ -205,17 +205,28 @@ const BTRFS_DIR_START_INDEX: u64 = 2;
 /// Skip the group-descriptor + superblock persist at a durability boundary that
 /// changed no descriptor state (bd-1bh8i).
 ///
-/// Default OFF until measured. `FFS_EXT4_GDT_SKIP_UNCHANGED=1` enables it, so an
-/// A/B runs both arms from ONE ELF and the flag is the only difference between
-/// them.
+/// Skip unchanged group-descriptor and superblock persists at durability
+/// boundaries: fingerprint the per-group accounting in memory and, when it is
+/// byte-equivalent to what the previous boundary already persisted, answer the
+/// persist's reads (sb, GDT, block bitmap, inode bitmap) from memory instead
+/// of the device.
+///
+/// Default ON since the bd-6tw2s measurement (2026-09-19): strace on a live rw
+/// mount shows the skip removes ALL four per-fsync group-accounting preads
+/// (superblock, GDT, block bitmap, inode bitmap — 4.0/op → 0 measured); the
+/// prior clean-window A/B measured 0.703x at 32 groups, with the crash gate
+/// (3999 skips then SIGKILL, e2fsck-clean) and the fingerprint-completeness
+/// gate (constant-count churn correctly refuses to skip) green. Disable with
+/// `FFS_EXT4_GDT_SKIP_UNCHANGED=0` (also accepts false/no) — the knob stays so
+/// an A/B can run both arms from ONE ELF with the flag as the only difference.
 fn ext4_gdt_skip_unchanged() -> bool {
-    static SKIP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *SKIP.get_or_init(|| {
+    static SKIP: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         std::env::var("FFS_EXT4_GDT_SKIP_UNCHANGED").is_ok_and(|raw| {
             let v = raw.trim();
-            v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("yes")
+            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("no"))
         })
-    })
+    });
+    *SKIP
 }
 
 fn adler32_seeded(seed: u32, data: &[u8]) -> u32 {
