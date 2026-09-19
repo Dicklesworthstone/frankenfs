@@ -1655,6 +1655,128 @@ fn require_nonzero_stripe_len(chunk: &BtrfsChunkEntry, _label: &str) -> Result<u
     Ok(chunk.stripe_len)
 }
 
+/// The full stripe row of a RAID5/6 chunk for one logical address.
+///
+/// [`resolve_raid56_stripe`] answers "which slot holds this logical data" and
+/// deliberately excludes parity; a DEGRADED reader needs the whole row to
+/// rebuild a missing data slot from its survivors (bd-hk5w3). `data_slots` is
+/// in logical order — `data_slots[j]` holds logical stripe `j` of the row —
+/// and `parity_slots` is `[P]` for RAID5, `[P, Q]` for RAID6. Every physical
+/// address already includes [`BtrfsRaid56Row::offset_in_stripe`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BtrfsRaid56Row {
+    /// Physical locations of the row's data slots, in logical order.
+    pub data_slots: Vec<BtrfsPhysicalMapping>,
+    /// Physical locations of the parity slots: `[P]` (RAID5) or `[P, Q]`
+    /// (RAID6). P is the XOR of all data slots of the row.
+    pub parity_slots: Vec<BtrfsPhysicalMapping>,
+    /// Indices into `chunk.stripes` holding the data slots (row-rotated).
+    pub data_device_idx: Vec<usize>,
+    /// Indices into `chunk.stripes` holding the parity slots.
+    pub parity_device_idx: Vec<usize>,
+    /// Row number (`offset_within / (stripe_len * data_stripes)`).
+    pub stripe_nr: u64,
+    /// Bytes of this logical address that lie within the row's stripe.
+    pub offset_in_stripe: u64,
+    pub stripe_len: u64,
+    /// Number of parity slots (1 for RAID5, 2 for RAID6).
+    pub parity_count: u64,
+}
+
+/// Resolve the full RAID5/6 stripe row (data slots in logical order plus the
+/// parity slots) covering `logical`, or `None` when no chunk covers it.
+///
+/// Row layout is the same ordered rotation Linux `map_blocks_raid56_read`
+/// uses (and [`resolve_raid56_stripe`] implements for the data slot alone):
+/// row `stripe_nr` places logical slot `j` on device index
+/// `((stripe_nr % num) + j) % num`, and the `parity_count` parity slots take
+/// the device indices that follow.
+pub fn resolve_raid56_row(
+    chunks: &[BtrfsChunkEntry],
+    logical: u64,
+) -> Result<Option<BtrfsRaid56Row>, ParseError> {
+    let covering = {
+        let candidate = if chunks.len() > CHUNK_MAP_BINARY_SEARCH_THRESHOLD {
+            let pp = chunks.partition_point(|c| c.key.offset <= logical);
+            pp.checked_sub(1).map(|i| &chunks[i])
+        } else {
+            None
+        };
+        match candidate {
+            Some(c) if logical < c.key.offset.saturating_add(c.length) => Some(c),
+            _ => chunks.iter().find(|c| {
+                logical >= c.key.offset && logical < c.key.offset.saturating_add(c.length)
+            }),
+        }
+    };
+    let Some(chunk) = covering else {
+        return Ok(None);
+    };
+    let profile = BtrfsRaidProfile::from_chunk_type(chunk.chunk_type);
+    if !matches!(profile, BtrfsRaidProfile::Raid5 | BtrfsRaidProfile::Raid6) {
+        return Ok(None);
+    }
+    let offset_within = logical - chunk.key.offset;
+    let stripe_len = require_nonzero_stripe_len(chunk, "RAID5/6")?;
+    validate_stripe_count(chunk)?;
+    let num = u64::from(chunk.num_stripes);
+    let parity_count: u64 = if profile == BtrfsRaidProfile::Raid6 {
+        2
+    } else {
+        1
+    };
+    let data_stripes = num
+        .checked_sub(parity_count)
+        .filter(|d| *d >= 2)
+        .ok_or(ParseError::InvalidField {
+            field: "num_stripes",
+            reason: "RAID5/6 requires at least two data stripes plus parity",
+        })?;
+    let stripe_nr = offset_within
+        / stripe_len
+            .checked_mul(data_stripes)
+            .ok_or(ParseError::InvalidField {
+                field: "stripe_len",
+                reason: "RAID5/6 stripe_len * data_stripes overflow",
+            })?;
+    let offset_in_stripe = offset_within % stripe_len;
+    let rotate = stripe_nr % num;
+
+    let mut data_slots = Vec::with_capacity(usize::try_from(data_stripes).unwrap_or(0));
+    let mut data_device_idx = Vec::with_capacity(data_slots.capacity());
+    for j in 0..data_stripes {
+        let idx = usize::try_from((rotate + j) % num).unwrap_or(usize::MAX);
+        let s = chunk.stripes.get(idx).ok_or(ParseError::InvalidField {
+            field: "stripe_index",
+            reason: "stripe index out of range",
+        })?;
+        data_slots.push(stripe_physical_at(s, stripe_nr, stripe_len, offset_in_stripe)?);
+        data_device_idx.push(idx);
+    }
+    let mut parity_slots = Vec::with_capacity(usize::try_from(parity_count).unwrap_or(0));
+    let mut parity_device_idx = Vec::with_capacity(parity_slots.capacity());
+    for k in 0..parity_count {
+        let idx = usize::try_from((rotate + data_stripes + k) % num).unwrap_or(usize::MAX);
+        let s = chunk.stripes.get(idx).ok_or(ParseError::InvalidField {
+            field: "stripe_index",
+            reason: "parity stripe index out of range",
+        })?;
+        parity_slots.push(stripe_physical_at(s, stripe_nr, stripe_len, offset_in_stripe)?);
+        parity_device_idx.push(idx);
+    }
+
+    Ok(Some(BtrfsRaid56Row {
+        data_slots,
+        parity_slots,
+        data_device_idx,
+        parity_device_idx,
+        stripe_nr,
+        offset_in_stripe,
+        stripe_len,
+        parity_count,
+    }))
+}
+
 fn stripe_physical(
     s: &BtrfsStripe,
     offset_within: u64,
@@ -4341,6 +4463,102 @@ mod tests {
         let mapping = result.expect("should find a mapping");
         assert_eq!(mapping.devid, 1);
         assert_eq!(mapping.physical, 0x28_0000);
+    }
+
+    fn raid56_row_chunk(num_stripes: u16, stripe_len: u64, raid6: bool) -> BtrfsChunkEntry {
+        BtrfsChunkEntry {
+            key: BtrfsKey {
+                objectid: 256,
+                item_type: 228,
+                offset: 0x100_0000,
+            },
+            length: stripe_len * u64::from(num_stripes) * 8,
+            owner: 2,
+            stripe_len,
+            chunk_type: if raid6 { 1 << 8 } else { 1 << 7 },
+            io_align: 4096,
+            io_width: 4096,
+            sector_size: 4096,
+            num_stripes,
+            sub_stripes: 0,
+            stripes: (1..=u64::from(num_stripes))
+                .map(|devid| BtrfsStripe {
+                    devid,
+                    offset: 0x20_0000 + devid * 0x100_0000,
+                    dev_uuid: [0; 16],
+                })
+                .collect(),
+        }
+    }
+
+    // bd-hk5w3: the row resolver must reproduce the Linux ordered rotation —
+    // row r places logical slot j on device ((r % num) + j) % num and the
+    // parity slots follow — because reconstruction XORs exactly the surviving
+    // slots of THAT row.
+    #[test]
+    fn resolve_raid56_row_rotates_raid5_data_and_parity() {
+        let chunk = raid56_row_chunk(3, 0x1000, false);
+        for r in 0_u64..4 {
+            let offset = 0x100_0000 + r * 0x2000 + 0x10;
+            let row = resolve_raid56_row(&chunk, offset)
+                .expect("resolution succeeds")
+                .expect("logical is inside the chunk");
+            let expected_data: Vec<usize> =
+                [(r % 3), ((r + 1) % 3)].iter().map(|d| *d as usize).collect();
+            let expected_parity: Vec<usize> = [((r + 2) % 3) as usize].to_vec();
+            assert_eq!(row.data_device_idx, expected_data, "row {r}");
+            assert_eq!(row.parity_device_idx, expected_parity, "row {r}");
+            assert_eq!(row.parity_slots.len(), 1, "RAID5 has one parity slot");
+            assert_eq!(row.offset_in_stripe, 0x10);
+            for (slot, idx) in row
+                .data_slots
+                .iter()
+                .chain(row.parity_slots.iter())
+                .zip(row.data_device_idx.iter().chain(row.parity_device_idx.iter()))
+            {
+                assert_eq!(slot.devid, u64::from(chunk.stripes[*idx].devid));
+                let expected = 0x20_0000
+                    + u64::from(chunk.stripes[*idx].devid) * 0x100_0000
+                    + r * 0x1000
+                    + 0x10;
+                assert_eq!(slot.physical, expected, "row {r} slot on device {}", idx);
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_raid56_row_rotates_raid6_dual_parity() {
+        let chunk = raid56_row_chunk(4, 0x1000, true);
+        // Linux f011c2b2 doc example: 4-device RAID6 rows are [0,1], [1,2],
+        // [2,3], [3,0] with the two parity slots following each.
+        let expected = [
+            ([0_usize, 1], [2_usize, 3]),
+            ([1, 2], [3, 0]),
+            ([2, 3], [0, 1]),
+            ([3, 0], [1, 2]),
+        ];
+        for (r, (data, parity)) in expected.iter().enumerate() {
+            let offset = 0x100_0000 + r as u64 * 0x2000;
+            let row = resolve_raid56_row(&chunk, offset)
+                .expect("resolution succeeds")
+                .expect("logical is inside the chunk");
+            assert_eq!(row.data_device_idx, *data, "row {r}");
+            assert_eq!(row.parity_device_idx, *parity, "row {r}");
+            assert_eq!(row.parity_slots.len(), 2, "RAID6 has P and Q");
+        }
+    }
+
+    #[test]
+    fn resolve_raid56_row_none_for_non_raid56_and_outside_chunk() {
+        let mut chunk = raid56_row_chunk(3, 0x1000, false);
+        chunk.chunk_type = 1; // single
+        assert!(resolve_raid56_row(std::slice::from_ref(&chunk), 0x100_0010)
+            .unwrap()
+            .is_none());
+        chunk.chunk_type = 1 << 7;
+        assert!(resolve_raid56_row(std::slice::from_ref(&chunk), 0x100_0000 + 0x1000 * 3 * 8 + 8)
+            .unwrap()
+            .is_none());
     }
 
     #[test]
