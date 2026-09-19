@@ -13043,7 +13043,7 @@ impl OpenFs {
                     .iter()
                     .chain(row.parity_slots.iter().take(1))
                 {
-                    if slot.devid == raid56_data_devid {
+                    if Some(slot.devid) == raid56_data_devid {
                         continue;
                     }
                     match devices.readers.read_physical(
@@ -53991,7 +53991,7 @@ mod tests {
                 3 => vec![2, 3],
                 _ => vec![3, 4],
             };
-            fs.btrfs_devices = Some(make_devices(degraded));
+            fs.btrfs_devices = Some(make_devices(&degraded));
             let mut out = [0xA5; 22];
             fs.btrfs_read_checksummed_into(&cx, &csums, 4096, logical + 3, &mut out)
                 .expect("degraded read must reconstruct through parity");
