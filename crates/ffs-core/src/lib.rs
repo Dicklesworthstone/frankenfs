@@ -53848,6 +53848,177 @@ mod tests {
         }
     }
 
+    // bd-hk5w3: degraded RAID5/6 data reads are rebuilt from the surviving
+    // row slots plus parity and verified against the data checksum. The rig
+    // is a synthetic single-row RAID5/6 chunk over the real csum image whose
+    // per-device closures serve (slot 0 = real data D, slot 1 = unrelated
+    // bytes G, P = D^G, Q = a decoy), then device sets with the data slot
+    // absent (reconstruction must serve D) and all-but-parity absent (double
+    // erasure must stay refused).
+    #[test]
+    fn btrfs_raid56_degraded_reads_reconstruct_and_refuse_bd_hk5w3() {
+        fn dev_item(devid: u64) -> ffs_ondisk::BtrfsDevItem {
+            ffs_ondisk::BtrfsDevItem {
+                devid,
+                total_bytes: 0,
+                bytes_used: 0,
+                io_align: 4096,
+                io_width: 4096,
+                sector_size: 4096,
+                dev_type: 0,
+                generation: 0,
+                start_offset: 0,
+                dev_group: 0,
+                seek_speed: 0,
+                bandwidth: 0,
+                uuid: [0; 16],
+                fsid: [0; 16],
+            }
+        }
+
+        for (profile_flag, num_stripes) in [
+            (ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_RAID5, 3_u16),
+            (ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_RAID6, 4),
+        ] {
+            let cx = Cx::for_testing();
+            let image = Arc::new(build_btrfs_csum_image());
+            let mut fs = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(image.as_ref().clone())),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            let logical = BTRFS_TEST_FILE_DATA_LOGICAL as u64;
+            let csums = fs.btrfs_read_csum_items(&cx).unwrap();
+            let start = usize::try_from(logical).unwrap();
+            let data = image[start..start + 4096].to_vec();
+            let garbage = vec![0x5A_u8; 4096];
+            assert_ne!(data, garbage, "the decoy must not equal the real data");
+            let parity: Vec<u8> = data.iter().zip(garbage.iter()).map(|(d, g)| d ^ g).collect();
+            let decoy_q = vec![0x11_u8; 4096];
+
+            let mut chunk = fs.btrfs_context().unwrap().chunks[0].clone();
+            chunk.key.offset = logical;
+            chunk.length = 4096 * u64::from(num_stripes);
+            chunk.stripe_len = 4096;
+            chunk.chunk_type = u64::from(profile_flag);
+            chunk.num_stripes = num_stripes;
+            chunk.sub_stripes = 0;
+            // Single row (stripe_nr 0): logical slot j sits on
+            // chunk.stripes[j], all at offset == logical.
+            chunk.stripes = (1..=u64::from(num_stripes))
+                .map(|devid| ffs_ondisk::BtrfsStripe {
+                    devid,
+                    offset: logical,
+                    dev_uuid: [0; 16],
+                })
+                .collect();
+            fs.btrfs_context.as_mut().unwrap().chunks = vec![chunk.clone()];
+
+            let slot_bytes = |devid: u64| -> Vec<u8> {
+                match devid {
+                    1 => data.clone(),    // data slot j=0: the real data
+                    2 => garbage.clone(), // data slot j=1: unrelated bytes
+                    3 => parity.clone(),  // P = D ^ G
+                    _ => decoy_q.clone(), // Q: a decoy, never read for one erasure
+                }
+            };
+
+            let mut make_devices = |attached: &[u64]| {
+                let mut readers = ffs_btrfs::BtrfsDeviceSet::new();
+                let mut identities = std::collections::BTreeMap::new();
+                for devid in 1..=u64::from(num_stripes) {
+                    identities.insert(devid, dev_item(devid));
+                    if attached.contains(&devid) {
+                        let attached = attached;
+                        readers
+                            .add_device(
+                                devid,
+                                Box::new(move |_, offset, len| {
+                                    assert_eq!(offset, logical);
+                                    assert_eq!(len, 4096);
+                                    let mut bytes = slot_bytes(devid);
+                                    if attached.len() == num_stripes as usize
+                                        && devid == 1
+                                        && profile_flag
+                                            == ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_RAID5
+                                    {
+                                        // Corrupt the primary data copy in the
+                                        // all-attached RAID5 case so the read
+                                        // must come back through parity.
+                                        bytes[..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+                                    }
+                                    Ok(bytes)
+                                }),
+                            )
+                            .unwrap();
+                    }
+                }
+                BtrfsReadDevices {
+                    readers,
+                    identities,
+                }
+            };
+
+            // Coverage admission: RAID5 tolerates one absent stripe, RAID6 two.
+            for (attached, admitted) in [
+                (vec![1, 2, 3, 4], true),
+                (vec![2, 3, 4], true),
+                (vec![1, 2], true),
+                (vec![1], num_stripes == 3),
+                (vec![3, 4], num_stripes == 4),
+                (vec![], false),
+            ] {
+                let attached: Vec<u64> =
+                    attached.into_iter().filter(|d| *d <= u64::from(num_stripes)).collect();
+                let devices = BtrfsReadDevices {
+                    readers: ffs_btrfs::BtrfsDeviceSet::new(),
+                    identities: attached
+                        .iter()
+                        .map(|d| (*d, dev_item(*d)))
+                        .collect(),
+                };
+                assert_eq!(
+                    devices.validate_read_coverage(std::slice::from_ref(&chunk)).is_ok(),
+                    admitted,
+                    "coverage for {profile_flag:?} attached {attached:?}"
+                );
+            }
+
+            // Degraded data read: the data slot's device is ABSENT and the
+            // read must be rebuilt from the survivors plus parity.
+            let degraded: Vec<u64> = match num_stripes {
+                3 => vec![2, 3],
+                _ => vec![3, 4],
+            };
+            fs.btrfs_devices = Some(make_devices(degraded));
+            let mut out = [0xA5; 22];
+            fs.btrfs_read_checksummed_into(&cx, &csums, 4096, logical + 3, &mut out)
+                .expect("degraded read must reconstruct through parity");
+            let expected = &data[3..25];
+            assert_eq!(&out, expected, "reconstructed bytes must equal the data");
+
+            // Double erasure (RAID6: both data slots absent) stays refused.
+            if num_stripes == 4 {
+                fs.btrfs_devices = Some(make_devices(&[3, 4]));
+                let mut out = [0xA5; 22];
+                let result = fs.btrfs_read_checksummed_into(&cx, &csums, 4096, logical + 3, &mut out);
+                assert!(result.is_err(), "double erasure must stay refused");
+                assert_eq!(out, [0xA5; 22], "refused read must not touch output");
+            }
+
+            // Silent corruption of the primary data copy (all devices
+            // attached, csum fails on slot 0) is repaired through parity.
+            fs.btrfs_devices = Some(make_devices(&(1..=u64::from(num_stripes)).collect::<Vec<_>>()));
+            let mut out = [0xA5; 22];
+            if num_stripes == 3 {
+                fs.btrfs_read_checksummed_into(&cx, &csums, 4096, logical + 3, &mut out)
+                    .expect("corrupted RAID5 data slot must be repaired via parity");
+                assert_eq!(&out, &data[3..25]);
+            }
+        }
+    }
+
     #[test]
     fn btrfs_metadata_mirror_cancellation_stops_before_next_copy() {
         let image = build_btrfs_image();
