@@ -221,10 +221,18 @@ const BTRFS_DIR_START_INDEX: u64 = 2;
 /// an A/B can run both arms from ONE ELF with the flag as the only difference.
 fn ext4_gdt_skip_unchanged() -> bool {
     static SKIP: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-        std::env::var("FFS_EXT4_GDT_SKIP_UNCHANGED").is_ok_and(|raw| {
-            let v = raw.trim();
-            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("no"))
-        })
+        // Default ON; an explicit disable spelling turns it off. NOTE: this
+        // must be a `match` on the var, not `is_ok_and` — `is_ok_and` yields
+        // `false` when the var is ABSENT, which would leave the default-off
+        // behavior in place while the doc claims the flip (exactly the bug the
+        // bd-6tw2s runtime verification caught in the first flip attempt).
+        match std::env::var("FFS_EXT4_GDT_SKIP_UNCHANGED") {
+            Ok(raw) => {
+                let v = raw.trim();
+                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("no"))
+            }
+            Err(_) => true,
+        }
     });
     *SKIP
 }
