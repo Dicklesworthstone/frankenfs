@@ -263,11 +263,12 @@ sweep() { # $1 dir  $2 tag  $3 position  [$4 client cpu]
       "$(python3 -c "print((${e}-${s})*1e3)")" >> "$OUT/samples.tsv"
   done
 }
-v_ffs() { # $1 position  $2 arm tag  $3 optional NAME=VALUE for the daemon
+v_ffs() { # $1 position  $2 arm tag  $3 optional NAME=VALUE  $4 client cpu  $5 daemon cpuset (default DAEMON_CPU)
   local log="$OUT/$2-$1.log"; : > "$log"
+  local dcpus=${5:-$DAEMON_CPU}
   env ${3:+"$3"} FFS_FUSE_CAPABILITY_MEMO_SLOTS=65536 FFS_MOUNT_BENCH_EVIDENCE=1 \
     FFS_AUTO_UNMOUNT=0 \
-    taskset -c "$DAEMON_CPU" "$CLI" mount --runtime-mode managed --no-background-scrub \
+    taskset -c "$dcpus" "$CLI" mount --runtime-mode managed --no-background-scrub \
     "$IMG" "$FMNT" >> "$log" 2>&1 &
   local mp=$!
   sleep 7
@@ -355,6 +356,101 @@ if [ "$SIBLING_BIAS" = "1" ]; then
   echo "=== in-process ELF identity ==="
   grep -ohE "binary_sha256=[0-9a-f]{64}" "$OUT"/ffs*-*.log | tail -1
   FFS_OUT="$OUT" FFS_ENTRIES="$ENTRIES" FFS_KNOB="$KNOB" python3 "$HERE/fuse_vs_kernel_abba_report.py"
+  exit 0
+fi
+
+# bd-svhrq acceptance certification: the workers-lever A/B needs a placement
+# where the serial arm's A/A null clears at a daemon cpuset WIDER than one CPU
+# (before place_daemon_on_private_cores it failed at every width >1). Three
+# FrankenFS arms per block, every arm position-matched twice:
+#   ffs_ser_n — SERIAL dispatch, daemon on ONE private core (certified baseline)
+#   ffs_ser_w — SERIAL dispatch on a WIDE private-core daemon: acceptance (a) —
+#               this arm's A/A null is the placement-fix proof
+#   ffs_work  — FFS_FUSE_WORKERS=8 on the SAME wide cpuset: acceptance (b), the
+#               workers A/B against a position-matched serial wide arm
+if [ "${FFS_WORKERS_LEVER:-0}" = "1" ]; then
+  WIDE=${FFS_WORKER_DAEMON_CPUS:?FATAL: set FFS_WORKER_DAEMON_CPUS (e.g. 8-15)}
+  WCLIENT=${FFS_WORKER_CLIENT_CPU:?FATAL: set FFS_WORKER_CLIENT_CPU (a private core outside the wide set)}
+  WORKERS_N=${FFS_WORKERS_N:-8}
+  python3 - "$HERE" "$WIDE" "$WCLIENT" <<'PY' || exit 7
+import sys
+sys.path.insert(0, sys.argv[1])
+import host_stability as h
+
+def expand(s):
+    out = []
+    for part in s.split(","):
+        if "-" in part:
+            a, b = part.split("-")
+            out.extend(range(int(a), int(b) + 1))
+        else:
+            out.append(int(part))
+    return out
+
+wide = expand(sys.argv[2])
+client = int(sys.argv[3])
+sib = h.sibling_of(client)
+if client in wide or (sib is not None and sib in wide):
+    print(f"FATAL: client cpu {client} (sibling {sib}) collides with daemon cpuset {sys.argv[2]}")
+    sys.exit(1)
+print(f"workers-lever arms: wide daemon {sys.argv[2]}, client {client} (sibling {sib}) — no collision")
+PY
+
+  for b in $(seq 1 "$BLOCKS"); do
+    v_cal "${b}j1"
+    v_ffs "${b}j1" ffs_ser_n "" "$CLIENT_CPU" "$DAEMON_CPU"
+    v_ffs "${b}j1" ffs_ser_w "" "$WCLIENT" "$WIDE"
+    v_ffs "${b}j1" ffs_work "FFS_FUSE_WORKERS=$WORKERS_N" "$WCLIENT" "$WIDE"
+    v_kern "${b}j1"; v_kern "${b}j2"
+    v_ffs "${b}j2" ffs_work "FFS_FUSE_WORKERS=$WORKERS_N" "$WCLIENT" "$WIDE"
+    v_ffs "${b}j2" ffs_ser_w "" "$WCLIENT" "$WIDE"
+    v_ffs "${b}j2" ffs_ser_n "" "$CLIENT_CPU" "$DAEMON_CPU"
+    v_cal "${b}j2"
+  done
+  fusermount3 -u "$FMNT" 2>/dev/null
+  echo "=== bd-svhrq acceptance report ==="
+  python3 - "$OUT/samples.tsv" <<'PY'
+import statistics as st
+import sys
+
+rows = {}
+with open(sys.argv[1]) as fh:
+    next(fh)
+    for line in fh:
+        parts = line.rstrip("\n").split("\t")
+        if len(parts) != 3:
+            continue
+        tag, pos, us = parts[0], parts[1], float(parts[2])
+        rows.setdefault(tag, []).append((pos, us))
+
+def med(xs):
+    return st.median(xs)
+
+def aa_null(tag):
+    visits = {}
+    for pos, us in rows[tag]:
+        block, which = pos[:-2], pos[-2:]
+        visits.setdefault(which, {})[block] = us
+    a, b = visits.get("j1", {}), visits.get("j2", {})
+    pairs = [a[k] / b[k] for k in sorted(a) if k in b]
+    return [max(p, 1 / p) for p in pairs]
+
+for tag in ("ffs_ser_n", "ffs_ser_w", "ffs_work"):
+    if tag not in rows:
+        continue
+    nulls = aa_null(tag)
+    verdict = "CLEAR" if med(nulls) <= 1.025 else "FAILED"
+    print(f"A/A null {tag}: median {med(nulls):.4f} spread {min(nulls):.4f}-{max(nulls):.4f} -> {verdict}")
+
+if "ffs_ser_w" in rows and "ffs_work" in rows:
+    sw = dict(rows["ffs_ser_w"])
+    wk = dict(rows["ffs_work"])
+    paired = [sw[pos] / wk[pos] for pos in sorted(sw) if pos in wk]
+    print(
+        f"workers A/B (serial-wide / workers-wide, >1 means workers faster): "
+        f"median {st.median(paired):.4f} spread {min(paired):.4f}-{max(paired):.4f}"
+    )
+PY
   exit 0
 fi
 
