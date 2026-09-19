@@ -1725,13 +1725,13 @@ pub fn resolve_raid56_row(
     } else {
         1
     };
-    let data_stripes = num
-        .checked_sub(parity_count)
-        .filter(|d| *d >= 2)
-        .ok_or(ParseError::InvalidField {
-            field: "num_stripes",
-            reason: "RAID5/6 requires at least two data stripes plus parity",
-        })?;
+    let data_stripes =
+        num.checked_sub(parity_count)
+            .filter(|d| *d >= 2)
+            .ok_or(ParseError::InvalidField {
+                field: "num_stripes",
+                reason: "RAID5/6 requires at least two data stripes plus parity",
+            })?;
     let stripe_nr = offset_within
         / stripe_len
             .checked_mul(data_stripes)
@@ -1750,7 +1750,12 @@ pub fn resolve_raid56_row(
             field: "stripe_index",
             reason: "stripe index out of range",
         })?;
-        data_slots.push(stripe_physical_at(s, stripe_nr, stripe_len, offset_in_stripe)?);
+        data_slots.push(stripe_physical_at(
+            s,
+            stripe_nr,
+            stripe_len,
+            offset_in_stripe,
+        )?);
         data_device_idx.push(idx);
     }
     let mut parity_slots = Vec::with_capacity(usize::try_from(parity_count).unwrap_or(0));
@@ -1761,7 +1766,12 @@ pub fn resolve_raid56_row(
             field: "stripe_index",
             reason: "parity stripe index out of range",
         })?;
-        parity_slots.push(stripe_physical_at(s, stripe_nr, stripe_len, offset_in_stripe)?);
+        parity_slots.push(stripe_physical_at(
+            s,
+            stripe_nr,
+            stripe_len,
+            offset_in_stripe,
+        )?);
         parity_device_idx.push(idx);
     }
 
@@ -4503,19 +4513,20 @@ mod tests {
             let row = resolve_raid56_row(std::slice::from_ref(&chunk), offset)
                 .expect("resolution succeeds")
                 .expect("logical is inside the chunk");
-            let expected_data: Vec<usize> =
-                [(r % 3), ((r + 1) % 3)].iter().map(|d| *d as usize).collect();
+            let expected_data: Vec<usize> = [(r % 3), ((r + 1) % 3)]
+                .iter()
+                .map(|d| *d as usize)
+                .collect();
             let expected_parity: Vec<usize> = [((r + 2) % 3) as usize].to_vec();
             assert_eq!(row.data_device_idx, expected_data, "row {r}");
             assert_eq!(row.parity_device_idx, expected_parity, "row {r}");
             assert_eq!(row.parity_slots.len(), 1, "RAID5 has one parity slot");
             assert_eq!(row.offset_in_stripe, 0x10);
-            for (slot, idx) in row
-                .data_slots
-                .iter()
-                .chain(row.parity_slots.iter())
-                .zip(row.data_device_idx.iter().chain(row.parity_device_idx.iter()))
-            {
+            for (slot, idx) in row.data_slots.iter().chain(row.parity_slots.iter()).zip(
+                row.data_device_idx
+                    .iter()
+                    .chain(row.parity_device_idx.iter()),
+            ) {
                 assert_eq!(slot.devid, u64::from(chunk.stripes[*idx].devid));
                 let expected = 0x20_0000
                     + u64::from(chunk.stripes[*idx].devid) * 0x100_0000
@@ -4552,13 +4563,20 @@ mod tests {
     fn resolve_raid56_row_none_for_non_raid56_and_outside_chunk() {
         let mut chunk = raid56_row_chunk(3, 0x1000, false);
         chunk.chunk_type = 1; // single
-        assert!(resolve_raid56_row(std::slice::from_ref(&chunk), 0x100_0010)
-            .unwrap()
-            .is_none());
+        assert!(
+            resolve_raid56_row(std::slice::from_ref(&chunk), 0x100_0010)
+                .unwrap()
+                .is_none()
+        );
         chunk.chunk_type = 1 << 7;
-        assert!(resolve_raid56_row(std::slice::from_ref(&chunk), 0x100_0000 + 0x1000 * 3 * 8 + 8)
+        assert!(
+            resolve_raid56_row(
+                std::slice::from_ref(&chunk),
+                0x100_0000 + 0x1000 * 3 * 8 + 8
+            )
             .unwrap()
-            .is_none());
+            .is_none()
+        );
     }
 
     #[test]

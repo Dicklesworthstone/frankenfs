@@ -708,7 +708,7 @@ impl BtrfsReadDevices {
     fn validate_read_coverage(&self, chunks: &[BtrfsChunkEntry]) -> Result<(), FfsError> {
         use ffs_ondisk::chunk_type_flags::{
             BTRFS_BLOCK_GROUP_RAID1, BTRFS_BLOCK_GROUP_RAID1C3, BTRFS_BLOCK_GROUP_RAID1C4,
-            BTRFS_BLOCK_GROUP_RAID10, BTRFS_BLOCK_GROUP_RAID5, BTRFS_BLOCK_GROUP_RAID6, RAID_MASK,
+            BTRFS_BLOCK_GROUP_RAID5, BTRFS_BLOCK_GROUP_RAID6, BTRFS_BLOCK_GROUP_RAID10, RAID_MASK,
         };
         for chunk in chunks {
             let present = chunk
@@ -13038,27 +13038,19 @@ impl OpenFs {
                 // OTHER data slot plus P participates in the XOR.
                 let mut acc: Option<Vec<u8>> = None;
                 let mut second_erasure = false;
-                for slot in row
-                    .data_slots
-                    .iter()
-                    .chain(row.parity_slots.iter().take(1))
-                {
+                for slot in row.data_slots.iter().chain(row.parity_slots.iter().take(1)) {
                     if Some(slot.devid) == raid56_data_devid {
                         continue;
                     }
-                    match devices.readers.read_physical(
-                        cx,
-                        slot.devid,
-                        slot.physical,
-                        sectorsize,
-                    ) {
+                    match devices
+                        .readers
+                        .read_physical(cx, slot.devid, slot.physical, sectorsize)
+                    {
                         Ok(partner) => {
                             acc = Some(match acc {
                                 None => partner,
                                 Some(mut partial) => {
-                                    for (byte, other) in
-                                        partial.iter_mut().zip(partner.iter())
-                                    {
+                                    for (byte, other) in partial.iter_mut().zip(partner.iter()) {
                                         *byte ^= *other;
                                     }
                                     partial
@@ -53894,7 +53886,11 @@ mod tests {
             let data = image[start..start + 4096].to_vec();
             let garbage = vec![0x5A_u8; 4096];
             assert_ne!(data, garbage, "the decoy must not equal the real data");
-            let parity: Vec<u8> = data.iter().zip(garbage.iter()).map(|(d, g)| d ^ g).collect();
+            let parity: Vec<u8> = data
+                .iter()
+                .zip(garbage.iter())
+                .map(|(d, g)| d ^ g)
+                .collect();
             let decoy_q = vec![0x11_u8; 4096];
             let data = Arc::new(data);
             let garbage = Arc::new(garbage);
@@ -53941,30 +53937,33 @@ mod tests {
                         continue;
                     }
                     identities.insert(devid, dev_item(devid));
-                    let (data, garbage, parity, decoy_q) =
-                        (Arc::clone(&data), Arc::clone(&garbage), Arc::clone(&parity), Arc::clone(&decoy_q));
-                        readers
-                            .add_device(
-                                devid,
-                                Box::new(move |_, offset, len| {
-                                    assert_eq!(offset, logical);
-                                    assert_eq!(len, 4096);
-                                    let mut bytes = match devid {
-                                        1 => (*data).clone(),   // data slot j=0: the real data
-                                        2 => (*garbage).clone(), // data slot j=1: unrelated bytes
-                                        3 => (*parity).clone(), // P = D ^ G
-                                        _ => (*decoy_q).clone(), // Q: a decoy, never read for one erasure
-                                    };
-                                    if corrupt_primary && devid == 1 {
-                                        // Corrupt the primary data copy so the
-                                        // read must come back through parity.
-                                        bytes[..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
-                                    }
-                                    Ok(bytes)
-                                }),
-                            )
-                            .unwrap();
-                    }
+                    let (data, garbage, parity, decoy_q) = (
+                        Arc::clone(&data),
+                        Arc::clone(&garbage),
+                        Arc::clone(&parity),
+                        Arc::clone(&decoy_q),
+                    );
+                    readers
+                        .add_device(
+                            devid,
+                            Box::new(move |_, offset, len| {
+                                assert_eq!(offset, logical);
+                                assert_eq!(len, 4096);
+                                let mut bytes = match devid {
+                                    1 => (*data).clone(),    // data slot j=0: the real data
+                                    2 => (*garbage).clone(), // data slot j=1: unrelated bytes
+                                    3 => (*parity).clone(),  // P = D ^ G
+                                    _ => (*decoy_q).clone(), // Q: a decoy, never read for one erasure
+                                };
+                                if corrupt_primary && devid == 1 {
+                                    // Corrupt the primary data copy so the
+                                    // read must come back through parity.
+                                    bytes[..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+                                }
+                                Ok(bytes)
+                            }),
+                        )
+                        .unwrap();
                 }
                 BtrfsReadDevices {
                     readers,
@@ -53972,17 +53971,29 @@ mod tests {
                 }
             }
 
-            // Coverage admission: RAID5 tolerates one absent stripe, RAID6 two.
-            for (attached, admitted) in [
-                (vec![1, 2, 3, 4], true),
-                (vec![2, 3, 4], true),
-                (vec![1, 2], true),
-                (vec![1], num_stripes == 3),
-                (vec![3, 4], num_stripes == 4),
-                (vec![], false),
-            ] {
-                let attached: Vec<u64> =
-                    attached.into_iter().filter(|d| *d <= u64::from(num_stripes)).collect();
+            // Coverage admission: RAID5 tolerates one absent stripe (two
+            // present of three), RAID6 two (two present of four).
+            let cases: Vec<(Vec<u64>, bool)> = if num_stripes == 3 {
+                vec![
+                    (vec![1, 2, 3], true),
+                    (vec![1, 2], true),
+                    (vec![1], false),
+                    (vec![], false),
+                ]
+            } else {
+                vec![
+                    (vec![1, 2, 3, 4], true),
+                    (vec![1, 2, 3], true),
+                    (vec![1, 2], true),
+                    (vec![1], false),
+                    (vec![], false),
+                ]
+            };
+            for (attached, admitted) in cases {
+                let attached: Vec<u64> = attached
+                    .into_iter()
+                    .filter(|d| *d <= u64::from(num_stripes))
+                    .collect();
                 let devices = make_devices(
                     &attached,
                     num_stripes,
@@ -53994,7 +54005,9 @@ mod tests {
                     Arc::clone(&decoy_q),
                 );
                 assert_eq!(
-                    devices.validate_read_coverage(std::slice::from_ref(&chunk)).is_ok(),
+                    devices
+                        .validate_read_coverage(std::slice::from_ref(&chunk))
+                        .is_ok(),
                     admitted,
                     "coverage for attached {attached:?}"
                 );
@@ -54004,7 +54017,7 @@ mod tests {
             // read must be rebuilt from the survivors plus parity.
             let degraded: Vec<u64> = match num_stripes {
                 3 => vec![2, 3],
-                _ => vec![3, 4],
+                _ => vec![2, 3, 4], // RAID6: omit ONE data device (single erasure)
             };
             fs.btrfs_devices = Some(make_devices(
                 &degraded,
@@ -54035,7 +54048,8 @@ mod tests {
                     Arc::clone(&decoy_q),
                 ));
                 let mut out = [0xA5; 22];
-                let result = fs.btrfs_read_checksummed_into(&cx, &csums, 4096, logical + 3, &mut out);
+                let result =
+                    fs.btrfs_read_checksummed_into(&cx, &csums, 4096, logical + 3, &mut out);
                 assert!(result.is_err(), "double erasure must stay refused");
                 assert_eq!(out, [0xA5; 22], "refused read must not touch output");
             }
