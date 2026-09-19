@@ -2,6 +2,7 @@ use anyhow::{Context, Result, bail};
 use asupersync::Cx;
 use ffs_block::{BlockDevice, ByteBlockDevice, ByteDevice, FileByteDevice};
 use ffs_core::{FsFlavor, OpenFs, OpenOptions, detect_filesystem_at_path};
+use ffs_ondisk::btrfs::BTRFS_FIRST_CHUNK_TREE_OBJECTID;
 use ffs_ondisk::{
     BtrfsChunkEntry, BtrfsSuperblock, Ext4Superblock, map_logical_to_physical,
     verify_btrfs_superblock_checksum,
@@ -25,7 +26,7 @@ use crate::{
     RepairActionOutput, RepairCommandOptions, RepairFlags, RepairOutput, RepairScopeOutput,
     RepairScrubOutput, choose_btrfs_scrub_block_size, cli_cx, count_blocks_at_severity_or_higher,
     ext4_appears_clean_state, ext4_group_scrub_scope, ext4_recovery_detail, filesystem_name,
-    repair_btrfs_parsers::{parse_btrfs_block_group_total_bytes, parse_btrfs_root_item_bytenr},
+    repair_btrfs_parsers::{parse_btrfs_block_group_item, parse_btrfs_root_item_bytenr},
     run_ext4_mount_recovery, scrub_validator,
 };
 
@@ -1228,22 +1229,34 @@ pub fn discover_btrfs_repair_group_specs(
         .iter()
         .filter(|entry| entry.key.item_type == BTRFS_BLOCK_GROUP_ITEM_TYPE)
     {
-        let payload_total =
-            parse_btrfs_block_group_total_bytes(&entry.data).with_context(|| {
-                format!(
-                    "failed to parse btrfs block-group payload for key objectid={} offset={}",
-                    entry.key.objectid, entry.key.offset
-                )
-            })?;
-        let logical_bytes = if entry.key.offset == 0 {
-            payload_total
-        } else {
-            entry.key.offset
-        };
+        // A block group's length is carried by its KEY (key.offset), never by
+        // the item payload: struct btrfs_block_group_item is {used,
+        // chunk_objectid, flags}. The previous payload parse read the
+        // chunk_objectid slot (always 256) as a "total" fallback and silently
+        // sized repair groups at 256 bytes on zero-length keys (bd-k1738).
+        if entry.key.offset == 0 {
+            bail!(
+                "btrfs block-group key at objectid={} has zero length; extent tree is corrupt",
+                entry.key.objectid
+            );
+        }
+        let item = parse_btrfs_block_group_item(&entry.data).with_context(|| {
+            format!(
+                "failed to parse btrfs block-group payload for key objectid={} offset={}",
+                entry.key.objectid, entry.key.offset
+            )
+        })?;
+        if item.chunk_objectid != BTRFS_FIRST_CHUNK_TREE_OBJECTID {
+            bail!(
+                "btrfs block-group item at objectid={} has chunk_objectid {} (expected {BTRFS_FIRST_CHUNK_TREE_OBJECTID}); extent tree is corrupt",
+                entry.key.objectid,
+                item.chunk_objectid
+            );
+        }
         let spec = build_btrfs_repair_group_spec(
             group_index,
             entry.key.objectid,
-            logical_bytes,
+            entry.key.offset,
             block_size,
             &chunks,
         )?;

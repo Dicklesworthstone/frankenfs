@@ -1,5 +1,8 @@
 use anyhow::Result;
 
+#[cfg(test)]
+use ffs_ondisk::btrfs::BTRFS_FIRST_CHUNK_TREE_OBJECTID;
+
 pub fn parse_btrfs_root_item_bytenr(data: &[u8]) -> Result<u64> {
     if data.len() < 184 {
         anyhow::bail!(
@@ -16,20 +19,45 @@ pub fn parse_btrfs_root_item_bytenr(data: &[u8]) -> Result<u64> {
     Ok(bytenr)
 }
 
-pub fn parse_btrfs_block_group_total_bytes(data: &[u8]) -> Result<u64> {
-    if data.len() < 16 {
+/// The three fields of one on-disk btrfs block-group item.
+///
+/// Kernel `struct btrfs_block_group_item` is `{ used: le64 @0,
+/// chunk_objectid: le64 @8, flags: le64 @16 }` — 24 bytes. There is NO
+/// `total_bytes` in the item: a block group's length is carried by its KEY
+/// (`key.offset`), never by the payload. The previous
+/// `parse_btrfs_block_group_total_bytes` read `data[8..16]` as "total", which
+/// is the `chunk_objectid` slot — the constant
+/// `BTRFS_FIRST_CHUNK_TREE_OBJECTID` (256) on every well-formed image
+/// (bd-k1738).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BtrfsBlockGroupItemFields {
+    /// Bytes currently allocated within the block group.
+    pub used: u64,
+    /// Kernel writes `BTRFS_FIRST_CHUNK_TREE_OBJECTID` (256) here on every
+    /// block-group item; a different value means the extent tree is corrupt.
+    pub chunk_objectid: u64,
+    /// Type flags (DATA, METADATA, SYSTEM).
+    pub flags: u64,
+}
+
+pub fn parse_btrfs_block_group_item(data: &[u8]) -> Result<BtrfsBlockGroupItemFields> {
+    if data.len() < 24 {
         anyhow::bail!(
-            "btrfs block-group payload too short: expected at least 16 bytes, got {}",
+            "btrfs block-group payload too short: expected at least 24 bytes, got {}",
             data.len()
         );
     }
-    let mut total_raw = [0_u8; 8];
-    total_raw.copy_from_slice(&data[8..16]);
-    let total_bytes = u64::from_le_bytes(total_raw);
-    if total_bytes == 0 {
-        anyhow::bail!("btrfs block-group total_bytes must be non-zero");
-    }
-    Ok(total_bytes)
+    let mut used_raw = [0_u8; 8];
+    used_raw.copy_from_slice(&data[0..8]);
+    let mut chunk_objectid_raw = [0_u8; 8];
+    chunk_objectid_raw.copy_from_slice(&data[8..16]);
+    let mut flags_raw = [0_u8; 8];
+    flags_raw.copy_from_slice(&data[16..24]);
+    Ok(BtrfsBlockGroupItemFields {
+        used: u64::from_le_bytes(used_raw),
+        chunk_objectid: u64::from_le_bytes(chunk_objectid_raw),
+        flags: u64::from_le_bytes(flags_raw),
+    })
 }
 
 #[cfg(test)]
@@ -42,9 +70,11 @@ mod tests {
         payload
     }
 
-    fn block_group_payload(total_bytes: u64) -> Vec<u8> {
-        let mut payload = vec![0_u8; 16];
-        payload[8..16].copy_from_slice(&total_bytes.to_le_bytes());
+    fn block_group_item_payload(used: u64, chunk_objectid: u64, flags: u64) -> Vec<u8> {
+        let mut payload = vec![0_u8; 24];
+        payload[0..8].copy_from_slice(&used.to_le_bytes());
+        payload[8..16].copy_from_slice(&chunk_objectid.to_le_bytes());
+        payload[16..24].copy_from_slice(&flags.to_le_bytes());
         payload
     }
 
@@ -144,8 +174,8 @@ mod tests {
     }
 
     #[test]
-    fn parse_block_group_total_bytes_rejects_empty_payload() {
-        let err = parse_btrfs_block_group_total_bytes(&[])
+    fn parse_block_group_item_rejects_empty_payload() {
+        let err = parse_btrfs_block_group_item(&[])
             .expect_err("empty block-group payload must be rejected");
         let msg = err.to_string();
         assert!(
@@ -153,7 +183,7 @@ mod tests {
             "error must mention length: {msg}"
         );
         assert!(
-            msg.contains("16"),
+            msg.contains("24"),
             "error must mention required size: {msg}"
         );
         assert!(
@@ -163,68 +193,67 @@ mod tests {
     }
 
     #[test]
-    fn parse_block_group_total_bytes_rejects_one_byte_under_minimum() {
-        let err = parse_btrfs_block_group_total_bytes(&[0xFF_u8; 15])
-            .expect_err("15-byte payload must be rejected");
+    fn parse_block_group_item_rejects_one_byte_under_minimum() {
+        let err = parse_btrfs_block_group_item(&[0xFF_u8; 23])
+            .expect_err("23-byte payload must be rejected");
         let msg = err.to_string();
         assert!(
             msg.contains("too short"),
             "error must mention length: {msg}"
         );
         assert!(
-            msg.ends_with("got 15"),
+            msg.ends_with("got 23"),
             "error must report actual length: {msg}"
         );
     }
 
     #[test]
-    fn parse_block_group_total_bytes_rejects_zero_total() {
-        let err = parse_btrfs_block_group_total_bytes(&block_group_payload(0))
-            .expect_err("zero total_bytes must be rejected");
-        assert!(err.to_string().contains("non-zero"));
+    fn parse_block_group_item_decodes_fields_at_kernel_offsets() {
+        // Kernel struct btrfs_block_group_item: used @0, chunk_objectid @8,
+        // flags @16, all little-endian u64.
+        let item = parse_btrfs_block_group_item(&block_group_item_payload(
+            0x1122_3344_5566_7788,
+            BTRFS_FIRST_CHUNK_TREE_OBJECTID,
+            0xCAFE_BABE_DEAD_BEEF,
+        ))
+        .expect("well-formed item must parse");
+        assert_eq!(item.used, 0x1122_3344_5566_7788);
+        assert_eq!(item.chunk_objectid, BTRFS_FIRST_CHUNK_TREE_OBJECTID);
+        assert_eq!(item.flags, 0xCAFE_BABE_DEAD_BEEF);
     }
 
     #[test]
-    fn parse_block_group_total_bytes_accepts_minimum_length_with_valid_total() {
-        let total = parse_btrfs_block_group_total_bytes(&block_group_payload(8 * 1024 * 1024))
-            .expect("valid total_bytes must parse");
-        assert_eq!(total, 8 * 1024 * 1024);
-    }
-
-    #[test]
-    fn parse_block_group_total_bytes_accepts_payload_longer_than_minimum() {
-        let mut payload = block_group_payload(0x4000_0000);
+    fn parse_block_group_item_accepts_payload_longer_than_minimum() {
+        let mut payload = block_group_item_payload(0x4000_0000, 256, 0x01);
         payload.extend(std::iter::repeat_n(0x55_u8, 32));
-        let total = parse_btrfs_block_group_total_bytes(&payload)
-            .expect("oversized payload must still parse");
-        assert_eq!(total, 0x4000_0000);
+        let item =
+            parse_btrfs_block_group_item(&payload).expect("oversized payload must still parse");
+        assert_eq!(item.used, 0x4000_0000);
+        assert_eq!(item.chunk_objectid, 256);
+        assert_eq!(item.flags, 0x01);
     }
 
     #[test]
-    fn parse_block_group_total_bytes_decodes_little_endian_at_offset_8() {
-        let mut payload = vec![0xCC_u8; 16];
-        payload[8..16].copy_from_slice(&[0x10, 0x20, 0x30, 0x40, 0x50, 0x60, 0x70, 0x80]);
-        let total = parse_btrfs_block_group_total_bytes(&payload)
-            .expect("little-endian pattern must decode");
-        assert_eq!(total, 0x8070_6050_4030_2010);
+    fn parse_block_group_item_accepts_zero_used() {
+        // used == 0 is legitimate: a freshly allocated block group is empty.
+        let item = parse_btrfs_block_group_item(&block_group_item_payload(
+            0,
+            BTRFS_FIRST_CHUNK_TREE_OBJECTID,
+            0x01,
+        ))
+        .expect("zero used must parse");
+        assert_eq!(item.used, 0);
     }
 
     #[test]
-    fn parse_block_group_total_bytes_only_reads_offset_8_to_16() {
-        // First 8 bytes hold used_bytes (irrelevant here); ensure parser
-        // never reads from them as a fallback.
-        let mut payload = vec![0_u8; 16];
-        payload[0..8].copy_from_slice(&u64::MAX.to_le_bytes());
-        let err = parse_btrfs_block_group_total_bytes(&payload)
-            .expect_err("decoy in first 8 bytes must not become total_bytes");
-        assert!(err.to_string().contains("non-zero"));
-    }
-
-    #[test]
-    fn parse_block_group_total_bytes_accepts_u64_max() {
-        let total = parse_btrfs_block_group_total_bytes(&block_group_payload(u64::MAX))
-            .expect("u64::MAX is non-zero");
-        assert_eq!(total, u64::MAX);
+    fn parse_block_group_item_accepts_u64_max_used() {
+        let item = parse_btrfs_block_group_item(&block_group_item_payload(
+            u64::MAX,
+            BTRFS_FIRST_CHUNK_TREE_OBJECTID,
+            0x04,
+        ))
+        .expect("u64::MAX used must parse");
+        assert_eq!(item.used, u64::MAX);
     }
 
     // bd-vn9q4: metamorphic relations for the two btrfs scalar parsers.
@@ -267,50 +296,63 @@ mod tests {
             proptest::prop_assert_eq!(parsed, bytenr);
         }
 
-        // MR-1 round-trip / determinism for block-group total_bytes.
+        // MR-1 round-trip / determinism for each block-group item field.
         #[test]
-        fn block_group_total_bytes_round_trip(total in 1_u64..=u64::MAX) {
-            let payload = block_group_payload(total);
-            let parsed = parse_btrfs_block_group_total_bytes(&payload)
-                .expect("non-zero must parse");
-            proptest::prop_assert_eq!(parsed, total);
-        }
-
-        // MR-2 field-locality: bytes outside [8..16] are not read.
-        // The first 8 bytes hold used_bytes — overwrite with noise and ensure
-        // total_bytes parsing is unaffected.
-        #[test]
-        fn block_group_total_bytes_ignores_noise_outside_window(
-            total in 1_u64..=u64::MAX,
+        fn block_group_item_round_trip(
             used in proptest::prelude::any::<u64>(),
+            chunk_objectid in proptest::prelude::any::<u64>(),
+            flags in proptest::prelude::any::<u64>(),
         ) {
-            let mut payload = block_group_payload(total);
-            payload[0..8].copy_from_slice(&used.to_le_bytes());
-            let parsed = parse_btrfs_block_group_total_bytes(&payload)
-                .expect("total_bytes unchanged");
-            proptest::prop_assert_eq!(parsed, total);
+            let payload = block_group_item_payload(used, chunk_objectid, flags);
+            let parsed = parse_btrfs_block_group_item(&payload)
+                .expect("well-formed item must parse");
+            proptest::prop_assert_eq!(parsed.used, used);
+            proptest::prop_assert_eq!(parsed.chunk_objectid, chunk_objectid);
+            proptest::prop_assert_eq!(parsed.flags, flags);
         }
 
-        // MR-3 append-invariance for block-group payload.
+        // MR-2 field-locality: each field decodes only from its own 8-byte
+        // window; arbitrary noise in the other two windows must not leak in.
         #[test]
-        fn block_group_total_bytes_append_invariant(
-            total in 1_u64..=u64::MAX,
+        fn block_group_item_fields_are_field_local(
+            used in proptest::prelude::any::<u64>(),
+            chunk_objectid in proptest::prelude::any::<u64>(),
+            flags in proptest::prelude::any::<u64>(),
+        ) {
+            let mut payload = block_group_item_payload(used, chunk_objectid, flags);
+            payload[0..8].reverse();
+            payload[16..24].reverse();
+            let parsed = parse_btrfs_block_group_item(&payload)
+                .expect("reversed bytes are still well-formed");
+            proptest::prop_assert_eq!(parsed.used, used.swap_bytes());
+            proptest::prop_assert_eq!(parsed.chunk_objectid, chunk_objectid);
+            proptest::prop_assert_eq!(parsed.flags, flags.swap_bytes());
+        }
+
+        // MR-3 append-invariance for the block-group payload.
+        #[test]
+        fn block_group_item_append_invariant(
+            used in proptest::prelude::any::<u64>(),
+            chunk_objectid in proptest::prelude::any::<u64>(),
+            flags in proptest::prelude::any::<u64>(),
             suffix in proptest::collection::vec(proptest::prelude::any::<u8>(), 0..256),
         ) {
-            let mut payload = block_group_payload(total);
+            let mut payload = block_group_item_payload(used, chunk_objectid, flags);
             payload.extend_from_slice(&suffix);
-            let parsed = parse_btrfs_block_group_total_bytes(&payload)
+            let parsed = parse_btrfs_block_group_item(&payload)
                 .expect("oversized must parse");
-            proptest::prop_assert_eq!(parsed, total);
+            proptest::prop_assert_eq!(parsed.used, used);
+            proptest::prop_assert_eq!(parsed.chunk_objectid, chunk_objectid);
+            proptest::prop_assert_eq!(parsed.flags, flags);
         }
 
-        // bd-rkhx2 cross-crate round-trip: ffs_btrfs writes total_bytes via
-        // BtrfsBlockGroupItem::to_bytes, ffs_cli reads it via
-        // parse_btrfs_block_group_total_bytes. Both sides have internal
-        // round-trip tests, but no single test pins the writer-reader
-        // contract — drift on either side would corrupt every block-group
-        // recovery silently. Sweep arbitrary non-zero u64 to catch any
-        // offset/endianness regression on either side.
+        // bd-k1738 cross-crate round-trip: ffs_btrfs writes a kernel-aligned
+        // btrfs_block_group_item ({used, chunk_objectid=256, flags}); the
+        // repair parser must read back exactly those fields. The group's
+        // total_bytes is NOT representable in the item payload — the kernel
+        // conveys it via the item key's offset — so the previous version of
+        // this test demanded the parser return total from the chunk_objectid
+        // slot and failed on every input.
         #[test]
         fn btrfs_block_group_item_writer_to_parser_round_trip(
             total in 1_u64..=u64::MAX,
@@ -324,17 +366,19 @@ mod tests {
             }
             .to_bytes();
             proptest::prop_assert_eq!(written.len(), 24, "kernel-aligned 24-byte item");
-            let parsed = parse_btrfs_block_group_total_bytes(&written)
+            let parsed = parse_btrfs_block_group_item(&written)
                 .expect("writer output must parse");
+            proptest::prop_assert_eq!(parsed.used, used);
             proptest::prop_assert_eq!(
-                parsed,
-                total,
-                "ffs_btrfs writer and ffs_cli parser must agree on total_bytes"
+                parsed.chunk_objectid,
+                BTRFS_FIRST_CHUNK_TREE_OBJECTID,
+                "chunk_objectid slot must stay at the kernel constant"
             );
+            proptest::prop_assert_eq!(parsed.flags, flags);
         }
     }
 
-    // bd-rkhx2 named cross-crate round-trip — pins the writer-reader contract
+    // bd-k1738 named cross-crate round-trip — pins the writer-reader contract
     // for the canonical block-group sizes used in repair scenarios.
     #[test]
     fn btrfs_block_group_item_writer_to_parser_canonical_sizes() {
@@ -350,9 +394,14 @@ mod tests {
                 flags: 0x01, // BTRFS_BLOCK_GROUP_DATA
             }
             .to_bytes();
-            let parsed = parse_btrfs_block_group_total_bytes(&bytes)
+            let parsed = parse_btrfs_block_group_item(&bytes)
                 .unwrap_or_else(|err| panic!("canonical size {total} must parse: {err}"));
-            assert_eq!(parsed, total, "round-trip for size {total}");
+            assert_eq!(parsed.used, total / 2, "used round-trip for size {total}");
+            assert_eq!(
+                parsed.chunk_objectid, BTRFS_FIRST_CHUNK_TREE_OBJECTID,
+                "chunk_objectid slot for size {total}"
+            );
+            assert_eq!(parsed.flags, 0x01, "flags round-trip for size {total}");
         }
     }
 }
