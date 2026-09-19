@@ -181,6 +181,17 @@ run_session() {
         cleanup
         exit 3
     fi
+    # FFS_STRACE=1 profiles the daemon's syscalls for this session into
+    # $OUT/strace-$session.txt — the per-op counts (pread/pwrite/fdatasync/
+    # futex) are load-INDEPENDENT, so they certify a lever even when wall
+    # timing cannot (bd-6tw2s: 4.0 accounting preads/op -> 0 under the
+    # GDT-skip lever was proven exactly this way).
+    SP=""
+    if [ "${FFS_STRACE:-0}" = "1" ]; then
+        sudo -n strace -f -qq -c -p "$mp" -o "$OUT/strace-$session.txt" 2>/dev/null &
+        SP=$!
+        sleep 1
+    fi
 
     local round us
     for round in $(seq 0 "$ROUNDS"); do
@@ -199,6 +210,12 @@ run_session() {
         fi
         [ "$round" = 0 ] || printf '%s\t%s\tffs\t%s\n' "$session" "$round" "$us" >> "$LF"
     done
+
+    if [ -n "$SP" ]; then
+        sudo -n kill -INT "$SP" 2>/dev/null
+        wait "$SP" 2>/dev/null
+        echo "strace profile: $OUT/strace-$session.txt"
+    fi
 
     fusermount3 -u "$FMNT" 2>/dev/null
     wait "$mp" 2>/dev/null
