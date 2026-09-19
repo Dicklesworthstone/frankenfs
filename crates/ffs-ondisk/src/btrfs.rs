@@ -4527,12 +4527,12 @@ mod tests {
                     .iter()
                     .chain(row.parity_device_idx.iter()),
             ) {
-                assert_eq!(slot.devid, u64::from(chunk.stripes[*idx].devid));
+                assert_eq!(slot.devid, chunk.stripes[*idx].devid);
                 let expected = 0x20_0000
-                    + u64::from(chunk.stripes[*idx].devid) * 0x100_0000
+                    + chunk.stripes[*idx].devid * 0x100_0000
                     + r * 0x1000
                     + 0x10;
-                assert_eq!(slot.physical, expected, "row {r} slot on device {}", idx);
+                assert_eq!(slot.physical, expected, "row {r} slot on device {idx}");
             }
         }
     }
