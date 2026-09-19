@@ -53896,6 +53896,10 @@ mod tests {
             assert_ne!(data, garbage, "the decoy must not equal the real data");
             let parity: Vec<u8> = data.iter().zip(garbage.iter()).map(|(d, g)| d ^ g).collect();
             let decoy_q = vec![0x11_u8; 4096];
+            let data = Arc::new(data);
+            let garbage = Arc::new(garbage);
+            let parity = Arc::new(parity);
+            let decoy_q = Arc::new(decoy_q);
 
             let mut chunk = fs.btrfs_context().unwrap().chunks[0].clone();
             chunk.key.offset = logical;
@@ -53915,37 +53919,45 @@ mod tests {
                 .collect();
             fs.btrfs_context.as_mut().unwrap().chunks = vec![chunk.clone()];
 
-            let slot_bytes = |devid: u64| -> Vec<u8> {
-                match devid {
-                    1 => data.clone(),    // data slot j=0: the real data
-                    2 => garbage.clone(), // data slot j=1: unrelated bytes
-                    3 => parity.clone(),  // P = D ^ G
-                    _ => decoy_q.clone(), // Q: a decoy, never read for one erasure
-                }
-            };
+            let corrupt_primary =
+                profile_flag == ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_RAID5;
 
-            let mut make_devices = |attached: &[u64]| {
+            fn make_devices(
+                attached: &[u64],
+                num_stripes: u16,
+                corrupt_primary: bool,
+                logical: u64,
+                data: Arc<Vec<u8>>,
+                garbage: Arc<Vec<u8>>,
+                parity: Arc<Vec<u8>>,
+                decoy_q: Arc<Vec<u8>>,
+            ) -> BtrfsReadDevices {
                 let mut readers = ffs_btrfs::BtrfsDeviceSet::new();
                 let mut identities = std::collections::BTreeMap::new();
                 for devid in 1..=u64::from(num_stripes) {
+                    // Identities mirror the ATTACHED device set — an omitted
+                    // device must count as missing for coverage admission.
+                    if !attached.contains(&devid) {
+                        continue;
+                    }
                     identities.insert(devid, dev_item(devid));
-                    if attached.contains(&devid) {
-                        let attached = attached;
+                    let (data, garbage, parity, decoy_q) =
+                        (Arc::clone(&data), Arc::clone(&garbage), Arc::clone(&parity), Arc::clone(&decoy_q));
                         readers
                             .add_device(
                                 devid,
                                 Box::new(move |_, offset, len| {
                                     assert_eq!(offset, logical);
                                     assert_eq!(len, 4096);
-                                    let mut bytes = slot_bytes(devid);
-                                    if attached.len() == num_stripes as usize
-                                        && devid == 1
-                                        && profile_flag
-                                            == ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_RAID5
-                                    {
-                                        // Corrupt the primary data copy in the
-                                        // all-attached RAID5 case so the read
-                                        // must come back through parity.
+                                    let mut bytes = match devid {
+                                        1 => (*data).clone(),   // data slot j=0: the real data
+                                        2 => (*garbage).clone(), // data slot j=1: unrelated bytes
+                                        3 => (*parity).clone(), // P = D ^ G
+                                        _ => (*decoy_q).clone(), // Q: a decoy, never read for one erasure
+                                    };
+                                    if corrupt_primary && devid == 1 {
+                                        // Corrupt the primary data copy so the
+                                        // read must come back through parity.
                                         bytes[..4].copy_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
                                     }
                                     Ok(bytes)
@@ -53958,7 +53970,7 @@ mod tests {
                     readers,
                     identities,
                 }
-            };
+            }
 
             // Coverage admission: RAID5 tolerates one absent stripe, RAID6 two.
             for (attached, admitted) in [
@@ -53971,17 +53983,20 @@ mod tests {
             ] {
                 let attached: Vec<u64> =
                     attached.into_iter().filter(|d| *d <= u64::from(num_stripes)).collect();
-                let devices = BtrfsReadDevices {
-                    readers: ffs_btrfs::BtrfsDeviceSet::new(),
-                    identities: attached
-                        .iter()
-                        .map(|d| (*d, dev_item(*d)))
-                        .collect(),
-                };
+                let devices = make_devices(
+                    &attached,
+                    num_stripes,
+                    corrupt_primary,
+                    logical,
+                    Arc::clone(&data),
+                    Arc::clone(&garbage),
+                    Arc::clone(&parity),
+                    Arc::clone(&decoy_q),
+                );
                 assert_eq!(
                     devices.validate_read_coverage(std::slice::from_ref(&chunk)).is_ok(),
                     admitted,
-                    "coverage for {profile_flag:?} attached {attached:?}"
+                    "coverage for attached {attached:?}"
                 );
             }
 
@@ -53991,7 +54006,16 @@ mod tests {
                 3 => vec![2, 3],
                 _ => vec![3, 4],
             };
-            fs.btrfs_devices = Some(make_devices(&degraded));
+            fs.btrfs_devices = Some(make_devices(
+                &degraded,
+                num_stripes,
+                corrupt_primary,
+                logical,
+                Arc::clone(&data),
+                Arc::clone(&garbage),
+                Arc::clone(&parity),
+                Arc::clone(&decoy_q),
+            ));
             let mut out = [0xA5; 22];
             fs.btrfs_read_checksummed_into(&cx, &csums, 4096, logical + 3, &mut out)
                 .expect("degraded read must reconstruct through parity");
@@ -54000,7 +54024,16 @@ mod tests {
 
             // Double erasure (RAID6: both data slots absent) stays refused.
             if num_stripes == 4 {
-                fs.btrfs_devices = Some(make_devices(&[3, 4]));
+                fs.btrfs_devices = Some(make_devices(
+                    &[3, 4],
+                    num_stripes,
+                    corrupt_primary,
+                    logical,
+                    Arc::clone(&data),
+                    Arc::clone(&garbage),
+                    Arc::clone(&parity),
+                    Arc::clone(&decoy_q),
+                ));
                 let mut out = [0xA5; 22];
                 let result = fs.btrfs_read_checksummed_into(&cx, &csums, 4096, logical + 3, &mut out);
                 assert!(result.is_err(), "double erasure must stay refused");
@@ -54009,7 +54042,16 @@ mod tests {
 
             // Silent corruption of the primary data copy (all devices
             // attached, csum fails on slot 0) is repaired through parity.
-            fs.btrfs_devices = Some(make_devices(&(1..=u64::from(num_stripes)).collect::<Vec<_>>()));
+            fs.btrfs_devices = Some(make_devices(
+                &(1..=u64::from(num_stripes)).collect::<Vec<_>>(),
+                num_stripes,
+                corrupt_primary,
+                logical,
+                Arc::clone(&data),
+                Arc::clone(&garbage),
+                Arc::clone(&parity),
+                Arc::clone(&decoy_q),
+            ));
             let mut out = [0xA5; 22];
             if num_stripes == 3 {
                 fs.btrfs_read_checksummed_into(&cx, &csums, 4096, logical + 3, &mut out)
