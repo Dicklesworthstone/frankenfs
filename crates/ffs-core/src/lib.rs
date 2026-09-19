@@ -222,17 +222,15 @@ const BTRFS_DIR_START_INDEX: u64 = 2;
 fn ext4_gdt_skip_unchanged() -> bool {
     static SKIP: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
         // Default ON; an explicit disable spelling turns it off. NOTE: this
-        // must be a `match` on the var, not `is_ok_and` — `is_ok_and` yields
-        // `false` when the var is ABSENT, which would leave the default-off
-        // behavior in place while the doc claims the flip (exactly the bug the
-        // bd-6tw2s runtime verification caught in the first flip attempt).
-        match std::env::var("FFS_EXT4_GDT_SKIP_UNCHANGED") {
-            Ok(raw) => {
-                let v = raw.trim();
-                !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("no"))
-            }
-            Err(_) => true,
-        }
+        // must keep the absent case mapping to TRUE (map + unwrap_or), not
+        // `is_ok_and` — the latter yields false when the var is ABSENT, which
+        // would leave the old default-off behavior in place while the doc
+        // claims the flip (exactly the bug the bd-6tw2s runtime verification
+        // caught in the first flip attempt).
+        std::env::var("FFS_EXT4_GDT_SKIP_UNCHANGED").map_or(true, |raw| {
+            let v = raw.trim();
+            !(v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("no"))
+        })
     });
     *SKIP
 }
@@ -13063,10 +13061,10 @@ impl OpenFs {
                         Err(_) => second_erasure = true,
                     }
                 }
-                if let (Some(bytes), false) = (acc, second_erasure) {
-                    if ffs_btrfs::btrfs_data_csum_matches(ctx.csum_type, &bytes, expected) {
-                        verified = Some(bytes);
-                    }
+                if let (Some(bytes), false) = (acc, second_erasure)
+                    && ffs_btrfs::btrfs_data_csum_matches(ctx.csum_type, &bytes, expected)
+                {
+                    verified = Some(bytes);
                 }
             }
             // A later absent mirror must not hide corruption observed in an
@@ -53892,10 +53890,6 @@ mod tests {
                 .map(|(d, g)| d ^ g)
                 .collect();
             let decoy_q = vec![0x11_u8; 4096];
-            let data = Arc::new(data);
-            let garbage = Arc::new(garbage);
-            let parity = Arc::new(parity);
-            let decoy_q = Arc::new(decoy_q);
 
             let mut chunk = fs.btrfs_context().unwrap().chunks[0].clone();
             chunk.key.offset = logical;
@@ -53917,16 +53911,17 @@ mod tests {
 
             let corrupt_primary =
                 profile_flag == ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_RAID5;
+            // Per-devid slot bytes (index = devid - 1): the real data, an
+            // unrelated pattern, P = D ^ G, and a decoy Q.
+            let slots = Arc::new(vec![data, garbage, parity, decoy_q]);
+            let data = &slots[0]; // the real data bytes (also slot 0 of the row)
 
             fn make_devices(
                 attached: &[u64],
                 num_stripes: u16,
                 corrupt_primary: bool,
                 logical: u64,
-                data: Arc<Vec<u8>>,
-                garbage: Arc<Vec<u8>>,
-                parity: Arc<Vec<u8>>,
-                decoy_q: Arc<Vec<u8>>,
+                slots: Arc<Vec<Vec<u8>>>,
             ) -> BtrfsReadDevices {
                 let mut readers = ffs_btrfs::BtrfsDeviceSet::new();
                 let mut identities = std::collections::BTreeMap::new();
@@ -53937,24 +53932,14 @@ mod tests {
                         continue;
                     }
                     identities.insert(devid, dev_item(devid));
-                    let (data, garbage, parity, decoy_q) = (
-                        Arc::clone(&data),
-                        Arc::clone(&garbage),
-                        Arc::clone(&parity),
-                        Arc::clone(&decoy_q),
-                    );
+                    let slots = Arc::clone(&slots);
                     readers
                         .add_device(
                             devid,
                             Box::new(move |_, offset, len| {
                                 assert_eq!(offset, logical);
                                 assert_eq!(len, 4096);
-                                let mut bytes = match devid {
-                                    1 => (*data).clone(),    // data slot j=0: the real data
-                                    2 => (*garbage).clone(), // data slot j=1: unrelated bytes
-                                    3 => (*parity).clone(),  // P = D ^ G
-                                    _ => (*decoy_q).clone(), // Q: a decoy, never read for one erasure
-                                };
+                                let mut bytes = slots[(devid - 1) as usize].clone();
                                 if corrupt_primary && devid == 1 {
                                     // Corrupt the primary data copy so the
                                     // read must come back through parity.
@@ -53999,10 +53984,7 @@ mod tests {
                     num_stripes,
                     corrupt_primary,
                     logical,
-                    Arc::clone(&data),
-                    Arc::clone(&garbage),
-                    Arc::clone(&parity),
-                    Arc::clone(&decoy_q),
+                    Arc::clone(&slots),
                 );
                 assert_eq!(
                     devices
@@ -54024,10 +54006,7 @@ mod tests {
                 num_stripes,
                 corrupt_primary,
                 logical,
-                Arc::clone(&data),
-                Arc::clone(&garbage),
-                Arc::clone(&parity),
-                Arc::clone(&decoy_q),
+                Arc::clone(&slots),
             ));
             let mut out = [0xA5; 22];
             fs.btrfs_read_checksummed_into(&cx, &csums, 4096, logical + 3, &mut out)
@@ -54042,10 +54021,7 @@ mod tests {
                     num_stripes,
                     corrupt_primary,
                     logical,
-                    Arc::clone(&data),
-                    Arc::clone(&garbage),
-                    Arc::clone(&parity),
-                    Arc::clone(&decoy_q),
+                    Arc::clone(&slots),
                 ));
                 let mut out = [0xA5; 22];
                 let result =
@@ -54061,10 +54037,7 @@ mod tests {
                 num_stripes,
                 corrupt_primary,
                 logical,
-                Arc::clone(&data),
-                Arc::clone(&garbage),
-                Arc::clone(&parity),
-                Arc::clone(&decoy_q),
+                Arc::clone(&slots),
             ));
             let mut out = [0xA5; 22];
             if num_stripes == 3 {
