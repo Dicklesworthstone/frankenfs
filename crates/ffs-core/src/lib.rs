@@ -708,7 +708,7 @@ impl BtrfsReadDevices {
     fn validate_read_coverage(&self, chunks: &[BtrfsChunkEntry]) -> Result<(), FfsError> {
         use ffs_ondisk::chunk_type_flags::{
             BTRFS_BLOCK_GROUP_RAID1, BTRFS_BLOCK_GROUP_RAID1C3, BTRFS_BLOCK_GROUP_RAID1C4,
-            BTRFS_BLOCK_GROUP_RAID10, RAID_MASK,
+            BTRFS_BLOCK_GROUP_RAID10, BTRFS_BLOCK_GROUP_RAID5, BTRFS_BLOCK_GROUP_RAID6, RAID_MASK,
         };
         for chunk in chunks {
             let present = chunk
@@ -748,6 +748,12 @@ impl BtrfsReadDevices {
                                 .any(|stripe| self.identities.contains_key(&stripe.devid))
                         })
                 }
+                // bd-hk5w3: RAID5 tolerates one absent stripe and RAID6 two —
+                // reads on the degraded set are rebuilt from the surviving
+                // slots plus parity (XOR for a single erasure) and verified
+                // against the data checksum before they are served.
+                BTRFS_BLOCK_GROUP_RAID5 => present + 1 >= chunk.stripes.len(),
+                BTRFS_BLOCK_GROUP_RAID6 => present + 2 >= chunk.stripes.len(),
                 _ => present > 0 && present == chunk.stripes.len(),
             };
             if !readable {
@@ -12980,6 +12986,7 @@ impl OpenFs {
                     detail: "data checksum sector crosses a stripe or chunk boundary".into(),
                 });
             }
+            let raid56_data_devid = mapping.stripes.first().map(|stripe| stripe.devid);
             let mut failure = FfsError::Corruption {
                 block: sector_start,
                 detail: "no readable btrfs data mirror".into(),
@@ -13011,6 +13018,64 @@ impl OpenFs {
                         ctx.csum_type
                     ),
                 });
+            }
+            // Parity reconstruction for degraded RAID5/6 (bd-hk5w3): when the
+            // data stripe's device is absent, or the sector failed its
+            // checksum there, the row's surviving slots plus P still encode
+            // the original bytes (P is the XOR of the row's data slots, so a
+            // single erasure is exactly recoverable; Q exists only for a
+            // second erasure, which stays refused). The rebuilt sector must
+            // pass the same checksum before it is served, so every
+            // reconstruction is proven per read rather than hoped for.
+            if verified.is_none()
+                && matches!(
+                    mapping.profile,
+                    ffs_ondisk::BtrfsRaidProfile::Raid5 | ffs_ondisk::BtrfsRaidProfile::Raid6
+                )
+                && let Ok(Some(row)) = ffs_ondisk::resolve_raid56_row(&ctx.chunks, sector_start)
+            {
+                // The failing slot is this logical stripe's data slot; every
+                // OTHER data slot plus P participates in the XOR.
+                let mut acc: Option<Vec<u8>> = None;
+                let mut second_erasure = false;
+                for slot in row
+                    .data_slots
+                    .iter()
+                    .chain(row.parity_slots.iter().take(1))
+                {
+                    if slot.devid == raid56_data_devid {
+                        continue;
+                    }
+                    match devices.readers.read_physical(
+                        cx,
+                        slot.devid,
+                        slot.physical,
+                        sectorsize,
+                    ) {
+                        Ok(partner) => {
+                            acc = Some(match acc {
+                                None => partner,
+                                Some(mut partial) => {
+                                    for (byte, other) in
+                                        partial.iter_mut().zip(partner.iter())
+                                    {
+                                        *byte ^= *other;
+                                    }
+                                    partial
+                                }
+                            });
+                        }
+                        Err(ffs_btrfs::BtrfsDeviceError::Cancelled) => {
+                            return Err(FfsError::Cancelled);
+                        }
+                        Err(_) => second_erasure = true,
+                    }
+                }
+                if let (Some(bytes), false) = (acc, second_erasure) {
+                    if ffs_btrfs::btrfs_data_csum_matches(ctx.csum_type, &bytes, expected) {
+                        verified = Some(bytes);
+                    }
+                }
             }
             // A later absent mirror must not hide corruption observed in an
             // available copy. Cancellation still takes precedence above.

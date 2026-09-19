@@ -4500,7 +4500,7 @@ mod tests {
         let chunk = raid56_row_chunk(3, 0x1000, false);
         for r in 0_u64..4 {
             let offset = 0x100_0000 + r * 0x2000 + 0x10;
-            let row = resolve_raid56_row(&chunk, offset)
+            let row = resolve_raid56_row(std::slice::from_ref(&chunk), offset)
                 .expect("resolution succeeds")
                 .expect("logical is inside the chunk");
             let expected_data: Vec<usize> =
@@ -4539,7 +4539,7 @@ mod tests {
         ];
         for (r, (data, parity)) in expected.iter().enumerate() {
             let offset = 0x100_0000 + r as u64 * 0x2000;
-            let row = resolve_raid56_row(&chunk, offset)
+            let row = resolve_raid56_row(std::slice::from_ref(&chunk), offset)
                 .expect("resolution succeeds")
                 .expect("logical is inside the chunk");
             assert_eq!(row.data_device_idx, *data, "row {r}");
