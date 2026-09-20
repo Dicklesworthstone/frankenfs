@@ -392,8 +392,13 @@ writeback-cache-disabled policy.
 RAID5/6 read evidence (`bd-hk5w3`): clean kernel-written three/four-device images
 pass full-file, unaligned and cold FUSE reads with every primary. The mapper now
 uses Linux's ordered data rotation; the prior device-order selection reproduced
-a RAID5 data-checksum failure on that same test. Missing stripe devices remain
-refused, parity reconstruction is absent, and the multi-device row stays partial.
+a RAID5 data-checksum failure on that same test. Missing stripe devices are
+admitted for RAID5 (≤1 absent) and RAID6 (≤2 absent); degraded data reads are
+reconstructed from the surviving slots plus parity (XOR for RAID5, GF(256)
+syndrome solve from P+Q for RAID6 dual erasure) and verified against the data
+checksum before serving. Reconstruction is regression-tested at the unit level
+(missing data device, dual erasure, silent corruption repair, coverage
+admission matrix) and end-to-end through FUSE on kernel-built fixtures.
 
 ### 2.1 btrfs Experimental RW Capability Contract (Machine-Checkable)
 
