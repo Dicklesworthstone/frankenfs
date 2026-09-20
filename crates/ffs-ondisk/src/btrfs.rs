@@ -1803,6 +1803,69 @@ fn stripe_physical(
     })
 }
 
+/// GF(256) arithmetic for btrfs RAID6 (bd-hk5w3): polynomial
+/// x^8 + x^4 + x^3 + x^2 + 1 (0x11D), generator element 2 — the same field
+/// lib/raid6 uses, so the Q coefficients solved from kernel-written fixtures
+/// (Q = g^0·D0 ⊕ g^1·D1 ⊕ … for the row's data slots, empirically confirmed)
+/// compose with these helpers.
+struct BtrfsRaid56Gf {
+    exp: [u8; 512],
+    log: [u8; 256],
+}
+
+impl BtrfsRaid56Gf {
+    const fn new() -> Self {
+        let mut exp = [0_u8; 512];
+        let mut log = [0_u8; 256];
+        let mut x = 1_usize;
+        let mut i = 0;
+        while i < 255 {
+            exp[i] = x as u8;
+            log[x] = i as u8;
+            x <<= 1;
+            if x & 0x100 != 0 {
+                x ^= 0x11D;
+            }
+            i += 1;
+        }
+        while i < 512 {
+            exp[i] = exp[i - 255];
+            i += 1;
+        }
+        Self { exp, log }
+    }
+}
+
+/// Multiply two GF(256) elements.
+#[must_use]
+pub fn btrfs_raid56_gmul(a: u8, b: u8) -> u8 {
+    static GF: std::sync::LazyLock<BtrfsRaid56Gf> = std::sync::LazyLock::new(BtrfsRaid56Gf::new);
+    if a == 0 || b == 0 {
+        0
+    } else {
+        GF.exp[usize::from(GF.log[usize::from(a)]) + usize::from(GF.log[usize::from(b)])]
+    }
+}
+
+/// Divide `a` by nonzero `b` in GF(256).
+#[must_use]
+pub fn btrfs_raid56_gdiv(a: u8, b: u8) -> u8 {
+    static GF: std::sync::LazyLock<BtrfsRaid56Gf> = std::sync::LazyLock::new(BtrfsRaid56Gf::new);
+    if a == 0 {
+        0
+    } else {
+        GF.exp[(usize::from(GF.log[usize::from(a)]) + 255 - usize::from(GF.log[usize::from(b)]))
+            % 255]
+    }
+}
+
+/// Generator-element power: g^n (n reduced mod 255), g = 2.
+#[must_use]
+pub fn btrfs_raid56_gexp(n: usize) -> u8 {
+    static GF: std::sync::LazyLock<BtrfsRaid56Gf> = std::sync::LazyLock::new(BtrfsRaid56Gf::new);
+    GF.exp[n % 255]
+}
+
 fn stripe_physical_at(
     s: &BtrfsStripe,
     stripe_nr: u64,

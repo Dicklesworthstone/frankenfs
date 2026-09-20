@@ -13019,11 +13019,13 @@ impl OpenFs {
             }
             // Parity reconstruction for degraded RAID5/6 (bd-hk5w3): when the
             // data stripe's device is absent, or the sector failed its
-            // checksum there, the row's surviving slots plus P still encode
-            // the original bytes (P is the XOR of the row's data slots, so a
-            // single erasure is exactly recoverable; Q exists only for a
-            // second erasure, which stays refused). The rebuilt sector must
-            // pass the same checksum before it is served, so every
+            // checksum there, rebuild it from the row's surviving slots.
+            // P is the XOR of the row's data slots (single erasure = XOR with
+            // P); RAID6 adds the GF(256) syndrome Q = g^0·D0 ⊕ g^1·D1 ⊕ …
+            // (coefficients derived empirically from kernel-written fixtures
+            // and the rotation above), so two erasures solve from the 2x2 GF
+            // system. A third erasure is refused. The rebuilt sector must
+            // pass the same data checksum before it is served, so every
             // reconstruction is proven per read rather than hoped for.
             if verified.is_none()
                 && matches!(
@@ -13032,11 +13034,13 @@ impl OpenFs {
                 )
                 && let Ok(Some(row)) = ffs_ondisk::resolve_raid56_row(&ctx.chunks, sector_start)
             {
-                // The failing slot is this logical stripe's data slot; every
-                // OTHER data slot plus P participates in the XOR.
-                let mut acc: Option<Vec<u8>> = None;
-                let mut second_erasure = false;
-                for slot in row.data_slots.iter().chain(row.parity_slots.iter().take(1)) {
+                let is_raid6 = matches!(mapping.profile, ffs_ondisk::BtrfsRaidProfile::Raid6);
+                let mut xor_others: Option<Vec<u8>> = None;
+                let mut g_xor_others: Option<Vec<u8>> = None;
+                let mut others_failed: Vec<usize> = Vec::new();
+                let mut p_bytes: Option<Vec<u8>> = None;
+                let mut q_bytes: Option<Vec<u8>> = None;
+                for (j, slot) in row.data_slots.iter().enumerate() {
                     if Some(slot.devid) == raid56_data_devid {
                         continue;
                     }
@@ -13045,23 +13049,143 @@ impl OpenFs {
                         .read_physical(cx, slot.devid, slot.physical, sectorsize)
                     {
                         Ok(partner) => {
-                            acc = Some(match acc {
-                                None => partner,
-                                Some(mut partial) => {
-                                    for (byte, other) in partial.iter_mut().zip(partner.iter()) {
+                            let merged = xor_others.as_ref().map_or_else(
+                                || partner.clone(),
+                                |partial| {
+                                    let mut merged = partial.clone();
+                                    for (byte, other) in merged.iter_mut().zip(partner.iter()) {
                                         *byte ^= *other;
                                     }
-                                    partial
-                                }
-                            });
+                                    merged
+                                },
+                            );
+                            xor_others = Some(merged);
+                            if is_raid6 {
+                                let weighted: Vec<u8> = partner
+                                    .iter()
+                                    .map(|b| {
+                                        ffs_ondisk::btrfs_raid56_gmul(
+                                            ffs_ondisk::btrfs_raid56_gexp(j),
+                                            *b,
+                                        )
+                                    })
+                                    .collect();
+                                g_xor_others = Some(match g_xor_others {
+                                    None => weighted,
+                                    Some(mut partial) => {
+                                        for (byte, other) in partial.iter_mut().zip(weighted.iter())
+                                        {
+                                            *byte ^= *other;
+                                        }
+                                        partial
+                                    }
+                                });
+                            }
                         }
                         Err(ffs_btrfs::BtrfsDeviceError::Cancelled) => {
                             return Err(FfsError::Cancelled);
                         }
-                        Err(_) => second_erasure = true,
+                        Err(_) => others_failed.push(j),
                     }
                 }
-                if let (Some(bytes), false) = (acc, second_erasure)
+                match devices.readers.read_physical(
+                    cx,
+                    row.parity_slots[0].devid,
+                    row.parity_slots[0].physical,
+                    sectorsize,
+                ) {
+                    Ok(partner) => p_bytes = Some(partner),
+                    Err(ffs_btrfs::BtrfsDeviceError::Cancelled) => {
+                        return Err(FfsError::Cancelled);
+                    }
+                    Err(_) => {}
+                }
+                if is_raid6 && let Some(q_slot) = row.parity_slots.get(1) {
+                    match devices.readers.read_physical(
+                        cx,
+                        q_slot.devid,
+                        q_slot.physical,
+                        sectorsize,
+                    ) {
+                        Ok(partner) => q_bytes = Some(partner),
+                        Err(ffs_btrfs::BtrfsDeviceError::Cancelled) => {
+                            return Err(FfsError::Cancelled);
+                        }
+                        Err(_) => {}
+                    }
+                }
+
+                let rebuilt: Option<Vec<u8>> = if others_failed.is_empty() {
+                    // Single erasure: the primary slot. P is the XOR of the
+                    // row's data slots, so P ⊕ (surviving data slots) is the
+                    // primary — for RAID5 and RAID6 alike.
+                    match (p_bytes.as_ref(), xor_others.as_ref()) {
+                        (Some(p), Some(xor)) => {
+                            Some(p.iter().zip(xor.iter()).map(|(a, b)| a ^ b).collect())
+                        }
+                        (Some(p), None) => Some(p.clone()),
+                        _ => None,
+                    }
+                } else if is_raid6
+                    && others_failed.len() == 1
+                    && let (Some(p), Some(q)) = (p_bytes.as_ref(), q_bytes.as_ref())
+                {
+                    // Two erasures: the primary and one other data slot.
+                    // With A = P ⊕ readable-others = primary ⊕ failed and
+                    // B = Q ⊕ Σ g^j·readable-others = g^j*·primary ⊕ g^k·failed,
+                    // solve the 2x2 GF(256) system:
+                    //   failed = (B ⊕ g^j*·A) / (g^j* ⊕ g^k)
+                    //   primary = A ⊕ failed
+                    let failed_j = others_failed[0];
+                    let j_star = row
+                        .data_slots
+                        .iter()
+                        .position(|slot| Some(slot.devid) == raid56_data_devid)
+                        .expect("primary slot is a row data slot");
+                    let g_p = ffs_ondisk::btrfs_raid56_gexp(j_star);
+                    let g_k = ffs_ondisk::btrfs_raid56_gexp(failed_j);
+                    let denominator = g_p ^ g_k;
+                    if denominator == 0 {
+                        // Same generator exponent: the syndromes cannot
+                        // separate the two erasures. (Unreachable for
+                        // distinct logical slots of one row.)
+                        None
+                    } else {
+                        let zeroes = vec![0_u8; sectorsize];
+                        let a_bytes: Vec<u8> = p
+                            .iter()
+                            .zip(xor_others.as_deref().unwrap_or(&zeroes))
+                            .map(|(p_byte, o)| p_byte ^ o)
+                            .collect();
+                        let b_bytes: Vec<u8> = q
+                            .iter()
+                            .zip(g_xor_others.as_deref().unwrap_or(&zeroes))
+                            .map(|(q_byte, g)| q_byte ^ g)
+                            .collect();
+                        let failed: Vec<u8> = a_bytes
+                            .iter()
+                            .zip(b_bytes.iter())
+                            .map(|(a_byte, b_byte)| {
+                                ffs_ondisk::btrfs_raid56_gdiv(
+                                    b_byte ^ ffs_ondisk::btrfs_raid56_gmul(g_p, *a_byte),
+                                    denominator,
+                                )
+                            })
+                            .collect();
+                        Some(
+                            a_bytes
+                                .iter()
+                                .zip(failed.iter())
+                                .map(|(a, f)| a ^ f)
+                                .collect::<Vec<u8>>(),
+                        )
+                    }
+                } else {
+                    // Three-or-more erasures, or a lost parity with a lost
+                    // data slot: not recoverable from this row.
+                    None
+                };
+                if let Some(bytes) = rebuilt
                     && ffs_btrfs::btrfs_data_csum_matches(ctx.csum_type, &bytes, expected)
                 {
                     verified = Some(bytes);
@@ -53889,7 +54013,19 @@ mod tests {
                 .zip(garbage.iter())
                 .map(|(d, g)| d ^ g)
                 .collect();
-            let decoy_q = vec![0x11_u8; 4096];
+            // bd-hk5w3: Q is the RS syndrome Q = g^0·D0 ⊕ g^1·D1 = D0 ⊕ 2·D1
+            // (generator α = 2 in GF(256), poly 0x11D), computed over the
+            // logical data slots — required for the RAID6 dual-erasure GF
+            // solve to produce the correct primary bytes.
+            let decoy_q: Vec<u8> = data
+                .iter()
+                .zip(garbage.iter())
+                .map(|(d, g)| {
+                    let doubled =
+                        ((u16::from(*g) << 1) ^ if *g & 0x80 != 0 { 0x11D } else { 0 }) as u8;
+                    d ^ doubled
+                })
+                .collect();
 
             let mut chunk = fs.btrfs_context().unwrap().chunks[0].clone();
             chunk.key.offset = logical;
@@ -54014,7 +54150,8 @@ mod tests {
             let expected = &data[3..25];
             assert_eq!(&out, expected, "reconstructed bytes must equal the data");
 
-            // Double erasure (RAID6: both data slots absent) stays refused.
+            // Double erasure (RAID6: both data slots absent): the GF(256)
+            // solve reconstructs BOTH data slots from P and Q.
             if num_stripes == 4 {
                 fs.btrfs_devices = Some(make_devices(
                     &[3, 4],
@@ -54024,10 +54161,13 @@ mod tests {
                     Arc::clone(&slots),
                 ));
                 let mut out = [0xA5; 22];
-                let result =
-                    fs.btrfs_read_checksummed_into(&cx, &csums, 4096, logical + 3, &mut out);
-                assert!(result.is_err(), "double erasure must stay refused");
-                assert_eq!(out, [0xA5; 22], "refused read must not touch output");
+                fs.btrfs_read_checksummed_into(&cx, &csums, 4096, logical + 3, &mut out)
+                    .expect("dual-erasure read must reconstruct via the GF solve");
+                let expected = &data[3..25];
+                assert_eq!(
+                    &out, expected,
+                    "dual-erasure reconstruction must match the data"
+                );
             }
 
             // Silent corruption of the primary data copy (all devices

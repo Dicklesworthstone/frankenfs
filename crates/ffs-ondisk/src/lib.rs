@@ -15,9 +15,10 @@ pub use btrfs::{
     BTRFS_CSUM_FIELD_SIZE, BtrfsChunkEntry, BtrfsCompatRoFeatures, BtrfsDevItem, BtrfsHeader,
     BtrfsIncompatFeatures, BtrfsItem, BtrfsKey, BtrfsKeyPtr, BtrfsPhysicalMapping, BtrfsRaid56Row,
     BtrfsRaidProfile, BtrfsStripe, BtrfsStripeMapping, BtrfsSuperblock, btrfs_csum,
-    btrfs_csum_size, chunk_type_flags, map_logical_to_physical, map_logical_to_stripes,
-    parse_dev_item, parse_internal_items, parse_leaf_items, parse_sys_chunk_array,
-    resolve_raid56_row, verify_superblock_checksum as verify_btrfs_superblock_checksum,
+    btrfs_csum_size, btrfs_raid56_gdiv, btrfs_raid56_gexp, btrfs_raid56_gmul, chunk_type_flags,
+    map_logical_to_physical, map_logical_to_stripes, parse_dev_item, parse_internal_items,
+    parse_leaf_items, parse_sys_chunk_array, resolve_raid56_row,
+    verify_superblock_checksum as verify_btrfs_superblock_checksum,
     verify_tree_block_checksum as verify_btrfs_tree_block_checksum,
 };
 pub use ext4::{
