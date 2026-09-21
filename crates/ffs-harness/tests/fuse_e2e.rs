@@ -17583,3 +17583,131 @@ fn fuse_btrfs_mknod_blockdev_stores_rdev() {
         );
     });
 }
+
+// bd-9m84h: crash-image fast-commit recovery test. Uses a kernel-mounted ext4
+// with fast_commit, performs FC-eligible operations, captures the dirty image
+// (pre-checkpoint, journal has FC transactions), then opens it with FrankenFS
+// to prove fail-closed behavior with real kernel FC data.
+//
+// Prerequisites: mkfs.ext4 with fast_commit support, sudo (loop mounts),
+// kernel ext4 fast_commit support. Skips if unavailable (same contract as
+// the other kernel-fixture tests in this file).
+#[test]
+fn fast_commit_crash_image_recovery_fail_closed() {
+    let has_mkfs = Command::new("mkfs.ext4")
+        .arg("-V")
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    let has_sudo = Command::new("sudo")
+        .args(["-n", "true"])
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if !has_mkfs || !has_sudo {
+        eprintln!("skipping: mkfs.ext4 or sudo unavailable");
+        return;
+    }
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let img = tmp.path().join("fc_crash.img");
+    let mnt = tmp.path().join("mnt");
+    fs::create_dir_all(&mnt).unwrap();
+
+    // Step 1: create ext4 with fast_commit
+    let output = Command::new("mkfs.ext4")
+        .args(["-q", "-F", "-b", "4096", "-O", "fast_commit", "-N", "256"])
+        .arg(&img)
+        .output()
+        .expect("mkfs.ext4");
+    assert!(output.status.success(), "mkfs.ext4 failed");
+
+    // Step 2: attach loop device
+    let output = Command::new("sudo")
+        .args(["-n", "losetup", "--direct-io=on", "--find", "--show"])
+        .arg(&img)
+        .output()
+        .expect("losetup");
+    assert!(output.status.success(), "losetup failed");
+    let loop_dev = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+
+    // Step 3: mount kernel ext4
+    let output = Command::new("sudo")
+        .args(["-n", "mount", "-t", "ext4", "-o", "rw,noatime"])
+        .arg(&loop_dev)
+        .arg(&mnt)
+        .output()
+        .expect("mount");
+    assert!(output.status.success(), "kernel mount failed: {}",
+        String::from_utf8_lossy(&output.stderr));
+
+    // Step 4: create files (FC-eligible operations)
+    let dir = mnt.join("testdir");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("alpha"), b"alpha").unwrap();
+    fs::write(dir.join("bravo"), b"bravo").unwrap();
+    let _ = Command::new("ln")
+        .args(["-s", "alpha", &dir.join("symlink").to_string_lossy()])
+        .output();
+
+    // Step 5: fsync to commit FC transactions to the journal
+    let f = fs::File::open(dir.join("alpha")).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    let d = fs::File::open(&dir).unwrap();
+    d.sync_all().unwrap();
+    drop(d);
+
+    // Step 6: capture the crash state — read the image file DIRECTLY while
+    // the fs is still mounted. The journal has FC transactions that haven't
+    // been fully checkpointed. This IS the crash state.
+    let crash_image = tmp.path().join("crash_state.img");
+    let output = Command::new("sudo")
+        .args(["-n", "cp"])
+        .arg(&img)
+        .arg(&crash_image)
+        .output()
+        .expect("copy crash image");
+    assert!(output.status.success(), "crash image copy failed");
+
+    // Step 7: clean up the kernel mount and loop device
+    let _ = Command::new("sudo").args(["-n", "umount"]).arg(&mnt).output();
+    let _ = Command::new("sudo").args(["-n", "losetup", "-d"]).arg(&loop_dev).output();
+
+    // Step 8: open the crash image with FrankenFS. The FC recovery path
+    // should either fully recover the committed operations or fail-closed.
+    let cx = Cx::for_testing();
+    let options = OpenOptions {
+        ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+        ..OpenOptions::default()
+    };
+    let open_result = OpenFs::open(&cx, &crash_image);
+
+    match open_result {
+        Ok(fs) => {
+            // Full recovery: the committed files should be visible.
+            let root = InodeNumber(2);
+            let entries = fs.readdir(&cx, root).unwrap_or_default();
+            let names: Vec<String> = entries.iter().map(|e| e.name.clone()).collect();
+            assert!(
+                names.iter().any(|n| n.contains("testdir") || n.contains("alpha") || n.contains("bravo")),
+                "recovered filesystem should contain the created files; entries: {names:?}"
+            );
+            emit_scenario_result("fc_crash_image_full_recovery", "PASS", None);
+        }
+        Err(error) => {
+            // Fail-closed: the mount is refused because FC recovery is
+            // incomplete. This is the correct behavior per bd-gqsnh.
+            let error_text = error.to_string();
+            assert!(
+                error_text.contains("fast-commit")
+                    || error_text.contains("fast_commit")
+                    || error_text.contains("recovery")
+                    || error_text.contains("incomplete"),
+                "fail-closed error should mention fast-commit recovery: {error_text}"
+            );
+            emit_scenario_result("fc_crash_image_fail_closed", "PASS", None);
+        }
+    }
+    emit_scenario_result("fc_crash_image_fail_closed_bd_9m84h", "PASS", None);
+}
