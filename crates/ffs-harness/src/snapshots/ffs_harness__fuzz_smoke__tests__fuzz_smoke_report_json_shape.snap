@@ -21,7 +21,7 @@ expression: json
     "fs_repair_corpus_manifest",
     "fs_mounted_write_error_classes_catalog"
   ],
-  "corpus_checksum": "sha256:c3742a8cae6afd316021aca2a0b7d10d3d023928c4e5102e34803ce677e0b0c5",
+  "corpus_checksum": "sha256:a13536e96ba21b097278372ffe97755cc905202a9f1ab100064574303b402552",
   "duration_ms": 0,
   "target_summary": {
     "btrfs_leaf_items": 1,
@@ -409,13 +409,13 @@ expression: json
       "error_detail": "",
       "class_matched": true,
       "error_detail_matched": true,
-      "corpus_checksum": "sha256:da70f8300fd2188e392dbce09b865ea3bdee2983a369075166cdbdbb822c07be",
-      "observed_checksum": "sha256:da70f8300fd2188e392dbce09b865ea3bdee2983a369075166cdbdbb822c07be",
+      "corpus_checksum": "sha256:878662fda1ecdf1eb06eac56e2c2c0c0193ce600e9457ee40478508782d9a765",
+      "observed_checksum": "sha256:878662fda1ecdf1eb06eac56e2c2c0c0193ce600e9457ee40478508782d9a765",
       "corpus_checksum_matched": true,
       "timed_out": false,
       "duration_ms": 0,
-      "byte_len": 5541,
-      "sha256": "sha256:da70f8300fd2188e392dbce09b865ea3bdee2983a369075166cdbdbb822c07be",
+      "byte_len": 5385,
+      "sha256": "sha256:878662fda1ecdf1eb06eac56e2c2c0c0193ce600e9457ee40478508782d9a765",
       "resource_budget": {
         "max_input_bytes": 32768,
         "max_duration_ms": 250,
