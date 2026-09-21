@@ -15030,6 +15030,51 @@ fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u1
             assert_eq!(fs::read(mountpoint.join("payload")).unwrap(), payload);
             drop(mount);
         }
+        // bd-hk5w3/bd-mjxxk: degraded RAID5/6 — omit one device, open with the
+        // survivors, and verify that parity reconstruction serves the correct
+        // bytes through the checksummed read path.
+        if matches!(profile, "raid5" | "raid6") {
+            for omitted in 0..images.len() {
+                let attached: Vec<PathBuf> = images
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != omitted)
+                    .map(|(_, p)| p.clone())
+                    .collect();
+                let options = OpenOptions {
+                    btrfs_device_paths: attached[1..].to_vec(),
+                    ..OpenOptions::default()
+                };
+                let mut fs = OpenFs::open_with_options(&cx, &attached[0], &options)
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{profile} degraded open (omitted device {omitted}): {error}"
+                        )
+                    });
+                let attr = fs
+                    .lookup(&cx, InodeNumber(1), std::ffi::OsStr::new("payload"))
+                    .unwrap_or_else(|error| {
+                        panic!(
+                            "{profile} degraded lookup (omitted device {omitted}): {error}"
+                        )
+                    });
+                assert_eq!(
+                    fs.read(&cx, attr.ino, 0, u32::try_from(payload.len()).unwrap())
+                        .unwrap_or_else(|error| {
+                            panic!(
+                                "{profile} degraded read (omitted device {omitted}): {error}"
+                            )
+                        }),
+                    payload,
+                    "{profile} degraded read (omitted device {omitted}) must match the payload"
+                );
+            }
+            emit_scenario_result(
+                &format!("btrfs_{profile}_degraded_read"),
+                "PASS",
+                None,
+            );
+        }
         let duplicate = OpenOptions {
             btrfs_device_paths: vec![images[0].clone()],
             ..OpenOptions::default()
