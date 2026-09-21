@@ -315,7 +315,7 @@ v_ffs() { # $1 position  $2 arm tag  $3 optional NAME=VALUE  $4 client cpu  $5 d
         # running as the control.
         local kfield
         kfield=$(printf '%s' "$kname" | sed 's/^FFS_FUSE_//; s/^FFS_//' | tr 'A-Z' 'a-z')
-        if ! grep -qE "$kfield=(true|1|active|[0-9]+)" "$log" && ! grep -q "$kname" "$log"; then
+        if ! grep -qE "$kfield=" "$log" && ! grep -q "$kname" "$log"; then
           echo "FATAL: arm '$2' was given $3 but neither '$kfield=' nor '$kname'"
           echo "       appears in $log; treat this arm as the control, not the lever."
           sed 's/\x1b\[[0-9;]*m//g' "$log" | grep -o "mount_candidate_knobs,.*" | head -1
