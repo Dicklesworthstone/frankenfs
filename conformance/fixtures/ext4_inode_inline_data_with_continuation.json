@@ -2,25 +2,41 @@
   "description": "ext4 inode with EXT4_INLINE_DATA_FL + system.data xattr continuation in ibody",
   "size": 256,
   "writes": [
-    {"offset":   0, "hex": "a481", "_comment": "mode = S_IFREG | 0644"},
-    {"offset":   2, "hex": "e803", "_comment": "uid = 1000"},
-    {"offset":   4, "hex": "4c000000", "_comment": "size_lo = 76 bytes (60 in i_block + 16 in xattr)"},
-    {"offset":  24, "hex": "e803", "_comment": "gid = 1000"},
-    {"offset":  26, "hex": "0100", "_comment": "links_count = 1"},
-    {"offset":  28, "hex": "00000000", "_comment": "blocks = 0"},
-    {"offset":  32, "hex": "00000010", "_comment": "flags = EXT4_INLINE_DATA_FL"},
-    {"offset":  40, "hex": "4141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141", "_comment": "i_block[0..60] = 60 bytes of 'A' (0x41)"},
-    {"offset": 100, "hex": "00000000", "_comment": "size_hi = 0"},
-    {"offset": 128, "hex": "2000", "_comment": "extra_isize = 32"},
-    {"offset": 160, "hex": "000002ea", "_comment": "xattr magic = 0xEA020000 little-endian"},
-    {"offset": 164, "hex": "04", "_comment": "name_len = 4 ('data')"},
-    {"offset": 165, "hex": "07", "_comment": "name_index = 7 (EXT4_XATTR_INDEX_SYSTEM)"},
-    {"offset": 166, "hex": "4c00", "_comment": "value_offs = 76 (offset from the first ibody xattr entry, pointing to byte 240)"},
-    {"offset": 168, "hex": "00000000", "_comment": "value_block = 0"},
-    {"offset": 172, "hex": "10000000", "_comment": "value_size = 16 bytes of continuation"},
-    {"offset": 176, "hex": "00000000", "_comment": "hash = 0"},
-    {"offset": 180, "hex": "64617461", "_comment": "name = 'data'"},
-    {"offset": 184, "hex": "00000000", "_comment": "terminator entry (name_len=0)"},
-    {"offset": 240, "hex": "42424242424242424242424242424242", "_comment": "value = 16 bytes of 'B' (0x42) continuation data"}
+    { "offset": 0, "hex": "a481", "_comment": "mode = S_IFREG | 0644" },
+    { "offset": 2, "hex": "e803", "_comment": "uid = 1000" },
+    {
+      "offset": 4,
+      "hex": "4c000000",
+      "_comment": "size_lo = 76 bytes (60 in i_block + 16 in xattr)"
+    },
+    { "offset": 24, "hex": "e803", "_comment": "gid = 1000" },
+    { "offset": 26, "hex": "0100", "_comment": "links_count = 1" },
+    { "offset": 28, "hex": "00000000", "_comment": "blocks = 0" },
+    { "offset": 32, "hex": "00000010", "_comment": "flags = EXT4_INLINE_DATA_FL" },
+    {
+      "offset": 40,
+      "hex": "4141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141414141",
+      "_comment": "i_block[0..60] = 60 bytes of 'A' (0x41)"
+    },
+    { "offset": 100, "hex": "00000000", "_comment": "size_hi = 0" },
+    { "offset": 128, "hex": "2000", "_comment": "extra_isize = 32" },
+    { "offset": 160, "hex": "000002ea", "_comment": "xattr magic = 0xEA020000 little-endian" },
+    { "offset": 164, "hex": "04", "_comment": "name_len = 4 ('data')" },
+    { "offset": 165, "hex": "07", "_comment": "name_index = 7 (EXT4_XATTR_INDEX_SYSTEM)" },
+    {
+      "offset": 166,
+      "hex": "4c00",
+      "_comment": "value_offs = 76 (offset from the first ibody xattr entry, pointing to byte 240)"
+    },
+    { "offset": 168, "hex": "00000000", "_comment": "value_block = 0" },
+    { "offset": 172, "hex": "10000000", "_comment": "value_size = 16 bytes of continuation" },
+    { "offset": 176, "hex": "00000000", "_comment": "hash = 0" },
+    { "offset": 180, "hex": "64617461", "_comment": "name = 'data'" },
+    { "offset": 184, "hex": "00000000", "_comment": "terminator entry (name_len=0)" },
+    {
+      "offset": 240,
+      "hex": "42424242424242424242424242424242",
+      "_comment": "value = 16 bytes of 'B' (0x42) continuation data"
+    }
   ]
 }

@@ -28,14 +28,10 @@
   },
   "degradation_level": "normal",
   "per_core_distribution": {
-    "rows": [
-      { "core_id": 0, "request_count": 500, "cache_hits": 380, "cache_misses": 90 }
-    ],
+    "rows": [{ "core_id": 0, "request_count": 500, "cache_hits": 380, "cache_misses": 90 }],
     "imbalance_ratio": 1.0
   },
-  "artifact_paths": [
-    "artifacts/runtime-console/stale_timestamp.json"
-  ],
+  "artifact_paths": ["artifacts/runtime-console/stale_timestamp.json"],
   "cleanup_status": "clean",
   "reproduction_command": "ffs mount image.img /mnt --runtime-mode managed --console",
   "product_evidence_claim": "none",

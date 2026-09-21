@@ -68,17 +68,8 @@
     }
   ],
   "root_tree": {
-    "system_root_objectids": [
-      2,
-      4,
-      5,
-      7,
-      9,
-      10
-    ],
-    "user_subvolume_ids": [
-      18446744073709551607
-    ],
+    "system_root_objectids": [2, 4, 5, 7, 9, 10],
+    "user_subvolume_ids": [18446744073709551607],
     "root_ref_names": []
   },
   "directories": [

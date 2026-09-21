@@ -142,11 +142,7 @@
     "sudo_noninteractive": true
   },
   "manifest_validation": {
-    "long_profile_ids": [
-      "nightly",
-      "stress",
-      "canary"
-    ],
+    "long_profile_ids": ["nightly", "stress", "canary"],
     "profile_count": 4,
     "sample_outcome_counts": {
       "error": 1,
@@ -162,9 +158,7 @@
     {
       "attempt_count": 1,
       "classification": "measured",
-      "cleanup_statuses": [
-        "unmounted"
-      ],
+      "cleanup_statuses": ["unmounted"],
       "duration_ms": 92,
       "exit_code": 0,
       "iteration": 1,
@@ -178,9 +172,7 @@
     {
       "attempt_count": 1,
       "classification": "measured",
-      "cleanup_statuses": [
-        "unmounted"
-      ],
+      "cleanup_statuses": ["unmounted"],
       "duration_ms": 90,
       "exit_code": 0,
       "iteration": 2,
@@ -194,9 +186,7 @@
     {
       "attempt_count": 1,
       "classification": "measured",
-      "cleanup_statuses": [
-        "unmounted"
-      ],
+      "cleanup_statuses": ["unmounted"],
       "duration_ms": 86,
       "exit_code": 0,
       "iteration": 3,
@@ -210,9 +200,7 @@
     {
       "attempt_count": 2,
       "classification": "measured",
-      "cleanup_statuses": [
-        "unmounted"
-      ],
+      "cleanup_statuses": ["unmounted"],
       "duration_ms": 123,
       "exit_code": 0,
       "iteration": 1,
@@ -226,9 +214,7 @@
     {
       "attempt_count": 2,
       "classification": "measured",
-      "cleanup_statuses": [
-        "unmounted"
-      ],
+      "cleanup_statuses": ["unmounted"],
       "duration_ms": 129,
       "exit_code": 0,
       "iteration": 2,
@@ -242,9 +228,7 @@
     {
       "attempt_count": 2,
       "classification": "measured",
-      "cleanup_statuses": [
-        "unmounted"
-      ],
+      "cleanup_statuses": ["unmounted"],
       "duration_ms": 137,
       "exit_code": 0,
       "iteration": 3,
@@ -258,9 +242,7 @@
     {
       "attempt_count": 1,
       "classification": "measured",
-      "cleanup_statuses": [
-        "unmounted"
-      ],
+      "cleanup_statuses": ["unmounted"],
       "duration_ms": 100,
       "exit_code": 0,
       "iteration": 1,
@@ -274,9 +256,7 @@
     {
       "attempt_count": 1,
       "classification": "measured",
-      "cleanup_statuses": [
-        "unmounted"
-      ],
+      "cleanup_statuses": ["unmounted"],
       "duration_ms": 88,
       "exit_code": 0,
       "iteration": 2,
@@ -290,9 +270,7 @@
     {
       "attempt_count": 1,
       "classification": "measured",
-      "cleanup_statuses": [
-        "unmounted"
-      ],
+      "cleanup_statuses": ["unmounted"],
       "duration_ms": 92,
       "exit_code": 0,
       "iteration": 3,

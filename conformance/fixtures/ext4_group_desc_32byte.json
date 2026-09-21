@@ -1,14 +1,14 @@
 {
   "size": 32,
   "writes": [
-    {"offset":  0, "hex": "05000000"},
-    {"offset":  4, "hex": "06000000"},
-    {"offset":  8, "hex": "07000000"},
-    {"offset": 12, "hex": "c800"},
-    {"offset": 14, "hex": "e803"},
-    {"offset": 16, "hex": "0300"},
-    {"offset": 18, "hex": "0400"},
-    {"offset": 28, "hex": "f401"},
-    {"offset": 30, "hex": "abcd"}
+    { "offset": 0, "hex": "05000000" },
+    { "offset": 4, "hex": "06000000" },
+    { "offset": 8, "hex": "07000000" },
+    { "offset": 12, "hex": "c800" },
+    { "offset": 14, "hex": "e803" },
+    { "offset": 16, "hex": "0300" },
+    { "offset": 18, "hex": "0400" },
+    { "offset": 28, "hex": "f401" },
+    { "offset": 30, "hex": "abcd" }
   ]
 }

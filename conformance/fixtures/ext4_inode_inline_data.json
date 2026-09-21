@@ -2,15 +2,19 @@
   "description": "ext4 inode with EXT4_INLINE_DATA_FL, data stored in i_block field",
   "size": 256,
   "writes": [
-    {"offset":   0, "hex": "a481", "_comment": "mode = S_IFREG | 0644 = 0o100644 = 0x81a4"},
-    {"offset":   2, "hex": "e803", "_comment": "uid = 1000"},
-    {"offset":   4, "hex": "17000000", "_comment": "size_lo = 23 bytes (length of inline data)"},
-    {"offset":  24, "hex": "e803", "_comment": "gid = 1000"},
-    {"offset":  26, "hex": "0100", "_comment": "links_count = 1"},
-    {"offset":  28, "hex": "00000000", "_comment": "blocks = 0 (no blocks allocated)"},
-    {"offset":  32, "hex": "00000010", "_comment": "flags = EXT4_INLINE_DATA_FL = 0x10000000"},
-    {"offset":  40, "hex": "48656c6c6f2066726f6d20696e6c696e6520646174612100000000000000000000000000000000000000000000000000000000000000000000000000", "_comment": "i_block[0..60] = 'Hello from inline data!' + padding zeros"},
-    {"offset": 100, "hex": "00000000", "_comment": "size_hi = 0"},
-    {"offset": 128, "hex": "2000", "_comment": "extra_isize = 32"}
+    { "offset": 0, "hex": "a481", "_comment": "mode = S_IFREG | 0644 = 0o100644 = 0x81a4" },
+    { "offset": 2, "hex": "e803", "_comment": "uid = 1000" },
+    { "offset": 4, "hex": "17000000", "_comment": "size_lo = 23 bytes (length of inline data)" },
+    { "offset": 24, "hex": "e803", "_comment": "gid = 1000" },
+    { "offset": 26, "hex": "0100", "_comment": "links_count = 1" },
+    { "offset": 28, "hex": "00000000", "_comment": "blocks = 0 (no blocks allocated)" },
+    { "offset": 32, "hex": "00000010", "_comment": "flags = EXT4_INLINE_DATA_FL = 0x10000000" },
+    {
+      "offset": 40,
+      "hex": "48656c6c6f2066726f6d20696e6c696e6520646174612100000000000000000000000000000000000000000000000000000000000000000000000000",
+      "_comment": "i_block[0..60] = 'Hello from inline data!' + padding zeros"
+    },
+    { "offset": 100, "hex": "00000000", "_comment": "size_hi = 0" },
+    { "offset": 128, "hex": "2000", "_comment": "extra_isize = 32" }
   ]
 }

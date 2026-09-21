@@ -41,15 +41,9 @@
       "classification": "pass",
       "release_claim_state": "measured_authoritative",
       "reproduction_command": "ffs-harness validate-scrub-repair-scheduler --manifest benchmarks/scrub_repair_scheduler_manifest.json",
-      "raw_logs": [
-        "artifacts/performance/scrub-repair-scheduler/large-host/run.log"
-      ],
-      "artifact_paths": [
-        "artifacts/performance/scrub-repair-scheduler/large-host/report.json"
-      ],
-      "proof_bundle_artifact_paths": [
-        "artifacts/proof/scrub-repair-scheduler/large-host.json"
-      ]
+      "raw_logs": ["artifacts/performance/scrub-repair-scheduler/large-host/run.log"],
+      "artifact_paths": ["artifacts/performance/scrub-repair-scheduler/large-host/report.json"],
+      "proof_bundle_artifact_paths": ["artifacts/proof/scrub-repair-scheduler/large-host.json"]
     },
     {
       "scenario_id": "scrub_repair_overlap_fixture_smoke",
@@ -76,15 +70,9 @@
       "classification": "skip",
       "release_claim_state": "fixture_smoke_only",
       "reproduction_command": "ffs-harness validate-scrub-repair-scheduler --manifest benchmarks/scrub_repair_scheduler_manifest.json",
-      "raw_logs": [
-        "artifacts/performance/scrub-repair-scheduler/smoke/run.log"
-      ],
-      "artifact_paths": [
-        "artifacts/performance/scrub-repair-scheduler/smoke/report.json"
-      ],
-      "proof_bundle_artifact_paths": [
-        "artifacts/proof/scrub-repair-scheduler/smoke.json"
-      ]
+      "raw_logs": ["artifacts/performance/scrub-repair-scheduler/smoke/run.log"],
+      "artifact_paths": ["artifacts/performance/scrub-repair-scheduler/smoke/report.json"],
+      "proof_bundle_artifact_paths": ["artifacts/proof/scrub-repair-scheduler/smoke.json"]
     }
   ],
   "required_invariants": [
@@ -94,10 +82,5 @@
     "ledger_complete",
     "stale_symbols_refused"
   ],
-  "proof_bundle_consumers": [
-    "bd-p2j3e",
-    "bd-rchk0.5",
-    "proof-bundle",
-    "release-gates"
-  ]
+  "proof_bundle_consumers": ["bd-p2j3e", "bd-rchk0.5", "proof-bundle", "release-gates"]
 }

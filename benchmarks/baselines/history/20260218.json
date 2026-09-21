@@ -185,7 +185,7 @@
       "p50_us": 75473463,
       "p95_us": 75473463,
       "p99_us": 75473463,
-      "throughput_ops_sec": 0.013250,
+      "throughput_ops_sec": 0.01325,
       "throughput_mb_sec": 0.000052,
       "status": "measured"
     },
@@ -221,7 +221,7 @@
       "p50_us": 74513764,
       "p95_us": 74513764,
       "p99_us": 74513764,
-      "throughput_ops_sec": 0.013420,
+      "throughput_ops_sec": 0.01342,
       "throughput_mb_sec": 0.005242,
       "status": "measured"
     },

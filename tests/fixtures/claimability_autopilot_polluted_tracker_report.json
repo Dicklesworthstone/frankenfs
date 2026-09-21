@@ -30,15 +30,9 @@
     {
       "prefix": "br-r37",
       "count": 1,
-      "owner_hints": [
-        "unknown"
-      ],
-      "sample_ids": [
-        "br-r37-autopilot-foreign"
-      ],
-      "sample_titles": [
-        "Foreign polluted tracker fixture row"
-      ]
+      "owner_hints": ["unknown"],
+      "sample_ids": ["br-r37-autopilot-foreign"],
+      "sample_titles": ["Foreign polluted tracker fixture row"]
     }
   ],
   "foreign_reconciliation_plan": {
@@ -50,12 +44,8 @@
       {
         "prefix": "br-r37",
         "count": 1,
-        "owner_hints": [
-          "unknown"
-        ],
-        "sample_ids": [
-          "br-r37-autopilot-foreign"
-        ],
+        "owner_hints": ["unknown"],
+        "sample_ids": ["br-r37-autopilot-foreign"],
         "recommended_thread_id": "tracker-hygiene",
         "recommended_subject": "[tracker-hygiene] Owner handoff for br-r37",
         "proposed_action": "message likely owner before moving, closing, rewriting, or deleting rows",
@@ -67,9 +57,7 @@
       "message likely owner before moving, closing, rewriting, or deleting foreign rows"
     ]
   },
-  "local_open_ids": [
-    "bd-autopilot-ready"
-  ],
+  "local_open_ids": ["bd-autopilot-ready"],
   "local_open_rows": [
     {
       "id": "bd-autopilot-ready",
@@ -109,22 +97,14 @@
     "excluded_foreign_in_progress_count": 0,
     "excluded_foreign_stale_in_progress_count": 0,
     "excluded_foreign_stale_in_progress_ids": [],
-    "claimable_ids": [
-      "bd-autopilot-ready"
-    ],
+    "claimable_ids": ["bd-autopilot-ready"],
     "local_epic_ids": [],
     "blocked_local_ids": [],
     "permission_gated_ids": [],
     "local_nonclaimable_ids": [],
-    "local_in_progress_ids": [
-      "bd-autopilot-stale"
-    ],
-    "stale_in_progress_ids": [
-      "bd-autopilot-stale"
-    ],
-    "next_safe_actions": [
-      "claim one source_aware_ready row before creating fallback work"
-    ]
+    "local_in_progress_ids": ["bd-autopilot-stale"],
+    "stale_in_progress_ids": ["bd-autopilot-stale"],
+    "next_safe_actions": ["claim one source_aware_ready row before creating fallback work"]
   },
   "permission_gated_rows": [],
   "blocked_local_rows": [],

@@ -9,9 +9,30 @@
       "lane": "core_labruntime",
       "crash_taxonomy": "pre_commit_crash",
       "operation_trace": [
-        {"step": 1, "op": "create", "args": ["path=/staged"], "fsync_boundary": false, "fsyncdir_boundary": false, "commit_boundary": false},
-        {"step": 2, "op": "write", "args": ["offset=0", "len=4096"], "fsync_boundary": false, "fsyncdir_boundary": false, "commit_boundary": false},
-        {"step": 3, "op": "begin_commit", "args": [], "fsync_boundary": false, "fsyncdir_boundary": false, "commit_boundary": true}
+        {
+          "step": 1,
+          "op": "create",
+          "args": ["path=/staged"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false,
+          "commit_boundary": false
+        },
+        {
+          "step": 2,
+          "op": "write",
+          "args": ["offset=0", "len=4096"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false,
+          "commit_boundary": false
+        },
+        {
+          "step": 3,
+          "op": "begin_commit",
+          "args": [],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false,
+          "commit_boundary": true
+        }
       ],
       "crash_point_after_step": 3,
       "expected_survivor_kind": "exact_match_pre_crash",
@@ -30,10 +51,38 @@
       "lane": "core_labruntime",
       "crash_taxonomy": "post_commit_pre_flush_crash",
       "operation_trace": [
-        {"step": 1, "op": "create", "args": ["path=/durable"], "fsync_boundary": false, "fsyncdir_boundary": false, "commit_boundary": false},
-        {"step": 2, "op": "write", "args": ["offset=0", "len=4096"], "fsync_boundary": false, "fsyncdir_boundary": false, "commit_boundary": false},
-        {"step": 3, "op": "begin_commit", "args": [], "fsync_boundary": false, "fsyncdir_boundary": false, "commit_boundary": true},
-        {"step": 4, "op": "end_commit", "args": [], "fsync_boundary": false, "fsyncdir_boundary": false, "commit_boundary": true}
+        {
+          "step": 1,
+          "op": "create",
+          "args": ["path=/durable"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false,
+          "commit_boundary": false
+        },
+        {
+          "step": 2,
+          "op": "write",
+          "args": ["offset=0", "len=4096"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false,
+          "commit_boundary": false
+        },
+        {
+          "step": 3,
+          "op": "begin_commit",
+          "args": [],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false,
+          "commit_boundary": true
+        },
+        {
+          "step": 4,
+          "op": "end_commit",
+          "args": [],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false,
+          "commit_boundary": true
+        }
       ],
       "crash_point_after_step": 4,
       "expected_survivor_kind": "exact_match_post_commit",
@@ -52,11 +101,46 @@
       "lane": "core_labruntime",
       "crash_taxonomy": "replay_interruption",
       "operation_trace": [
-        {"step": 1, "op": "create", "args": ["path=/replay_target"], "fsync_boundary": false, "fsyncdir_boundary": false, "commit_boundary": false},
-        {"step": 2, "op": "write", "args": ["offset=0", "len=8192"], "fsync_boundary": false, "fsyncdir_boundary": false, "commit_boundary": false},
-        {"step": 3, "op": "begin_commit", "args": [], "fsync_boundary": false, "fsyncdir_boundary": false, "commit_boundary": true},
-        {"step": 4, "op": "end_commit", "args": [], "fsync_boundary": false, "fsyncdir_boundary": false, "commit_boundary": true},
-        {"step": 5, "op": "checkpoint_marker", "args": ["replay_resume_point"], "fsync_boundary": false, "fsyncdir_boundary": false, "commit_boundary": false}
+        {
+          "step": 1,
+          "op": "create",
+          "args": ["path=/replay_target"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false,
+          "commit_boundary": false
+        },
+        {
+          "step": 2,
+          "op": "write",
+          "args": ["offset=0", "len=8192"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false,
+          "commit_boundary": false
+        },
+        {
+          "step": 3,
+          "op": "begin_commit",
+          "args": [],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false,
+          "commit_boundary": true
+        },
+        {
+          "step": 4,
+          "op": "end_commit",
+          "args": [],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false,
+          "commit_boundary": true
+        },
+        {
+          "step": 5,
+          "op": "checkpoint_marker",
+          "args": ["replay_resume_point"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false,
+          "commit_boundary": false
+        }
       ],
       "crash_point_after_step": 5,
       "expected_survivor_kind": "exact_match_post_commit",
@@ -75,10 +159,38 @@
       "lane": "core_labruntime",
       "crash_taxonomy": "repair_interruption",
       "operation_trace": [
-        {"step": 1, "op": "create", "args": ["path=/repair_target"], "fsync_boundary": false, "fsyncdir_boundary": false, "commit_boundary": false},
-        {"step": 2, "op": "write", "args": ["offset=0", "len=8192"], "fsync_boundary": false, "fsyncdir_boundary": false, "commit_boundary": false},
-        {"step": 3, "op": "fsync", "args": [], "fsync_boundary": true, "fsyncdir_boundary": false, "commit_boundary": false},
-        {"step": 4, "op": "checkpoint_marker", "args": ["repair_planned"], "fsync_boundary": false, "fsyncdir_boundary": false, "commit_boundary": false}
+        {
+          "step": 1,
+          "op": "create",
+          "args": ["path=/repair_target"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false,
+          "commit_boundary": false
+        },
+        {
+          "step": 2,
+          "op": "write",
+          "args": ["offset=0", "len=8192"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false,
+          "commit_boundary": false
+        },
+        {
+          "step": 3,
+          "op": "fsync",
+          "args": [],
+          "fsync_boundary": true,
+          "fsyncdir_boundary": false,
+          "commit_boundary": false
+        },
+        {
+          "step": 4,
+          "op": "checkpoint_marker",
+          "args": ["repair_planned"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false,
+          "commit_boundary": false
+        }
       ],
       "crash_point_after_step": 4,
       "expected_survivor_kind": "allowed_repaired_divergence",
@@ -97,10 +209,38 @@
       "lane": "core_labruntime",
       "crash_taxonomy": "metadata_data_ordering_boundary",
       "operation_trace": [
-        {"step": 1, "op": "create", "args": ["path=/meta_data"], "fsync_boundary": false, "fsyncdir_boundary": false, "commit_boundary": false},
-        {"step": 2, "op": "write", "args": ["offset=0", "len=4096"], "fsync_boundary": false, "fsyncdir_boundary": false, "commit_boundary": false},
-        {"step": 3, "op": "begin_commit", "args": ["meta_only"], "fsync_boundary": false, "fsyncdir_boundary": false, "commit_boundary": true},
-        {"step": 4, "op": "fsyncdir", "args": ["dir=/"], "fsync_boundary": false, "fsyncdir_boundary": true, "commit_boundary": false}
+        {
+          "step": 1,
+          "op": "create",
+          "args": ["path=/meta_data"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false,
+          "commit_boundary": false
+        },
+        {
+          "step": 2,
+          "op": "write",
+          "args": ["offset=0", "len=4096"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false,
+          "commit_boundary": false
+        },
+        {
+          "step": 3,
+          "op": "begin_commit",
+          "args": ["meta_only"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false,
+          "commit_boundary": true
+        },
+        {
+          "step": 4,
+          "op": "fsyncdir",
+          "args": ["dir=/"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": true,
+          "commit_boundary": false
+        }
       ],
       "crash_point_after_step": 4,
       "expected_survivor_kind": "exact_match_post_commit",
@@ -136,10 +276,38 @@
       "lane": "core_labruntime",
       "crash_taxonomy": "concurrent_writer_conflict",
       "operation_trace": [
-        {"step": 1, "op": "create", "args": ["path=/concurrent"], "fsync_boundary": false, "fsyncdir_boundary": false, "commit_boundary": false},
-        {"step": 2, "op": "write", "args": ["offset=0", "len=4096", "writer=A"], "fsync_boundary": false, "fsyncdir_boundary": false, "commit_boundary": false},
-        {"step": 3, "op": "write", "args": ["offset=0", "len=4096", "writer=B"], "fsync_boundary": false, "fsyncdir_boundary": false, "commit_boundary": false},
-        {"step": 4, "op": "begin_commit", "args": [], "fsync_boundary": false, "fsyncdir_boundary": false, "commit_boundary": true}
+        {
+          "step": 1,
+          "op": "create",
+          "args": ["path=/concurrent"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false,
+          "commit_boundary": false
+        },
+        {
+          "step": 2,
+          "op": "write",
+          "args": ["offset=0", "len=4096", "writer=A"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false,
+          "commit_boundary": false
+        },
+        {
+          "step": 3,
+          "op": "write",
+          "args": ["offset=0", "len=4096", "writer=B"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false,
+          "commit_boundary": false
+        },
+        {
+          "step": 4,
+          "op": "begin_commit",
+          "args": [],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false,
+          "commit_boundary": true
+        }
       ],
       "crash_point_after_step": 4,
       "expected_survivor_kind": "allowed_repaired_divergence",

@@ -2,19 +2,13 @@
   "results": [
     {
       "command": "cargo bench --profile release-perf -p ffs-harness --bench metadata_parse -- metadata_parse",
-      "mean": 1.03880E-7,
-      "stddev": 7.24E-10,
-      "median": 1.03880E-7,
-      "min": 1.02550E-7,
-      "max": 1.05390E-7,
-      "times": [
-        1.02550E-7,
-        1.03880E-7,
-        1.05390E-7
-      ],
-      "exit_codes": [
-        0
-      ]
+      "mean": 1.0388e-7,
+      "stddev": 7.24e-10,
+      "median": 1.0388e-7,
+      "min": 1.0255e-7,
+      "max": 1.0539e-7,
+      "times": [1.0255e-7, 1.0388e-7, 1.0539e-7],
+      "exit_codes": [0]
     }
   ],
   "benchmark_mode": "criterion_once",

@@ -29,7 +29,7 @@
       "p50_us": 1833,
       "p95_us": 1833,
       "p99_us": 1833,
-      "throughput_ops_sec": 553.483590,
+      "throughput_ops_sec": 553.48359,
       "throughput_mb_sec": 0,
       "status": "measured"
     },
@@ -41,7 +41,7 @@
       "p50_us": 1090,
       "p95_us": 1090,
       "p99_us": 1090,
-      "throughput_ops_sec": 924.308620,
+      "throughput_ops_sec": 924.30862,
       "throughput_mb_sec": 0,
       "status": "measured"
     },
@@ -65,7 +65,7 @@
       "p50_us": 10534053,
       "p95_us": 10534053,
       "p99_us": 10534053,
-      "throughput_ops_sec": 0.092790,
+      "throughput_ops_sec": 0.09279,
       "throughput_mb_sec": 0,
       "status": "measured"
     },
@@ -113,7 +113,7 @@
       "p50_us": 11094934,
       "p95_us": 11094934,
       "p99_us": 11094934,
-      "throughput_ops_sec": 0.091500,
+      "throughput_ops_sec": 0.0915,
       "throughput_mb_sec": 0,
       "status": "measured"
     },
@@ -137,7 +137,7 @@
       "p50_us": 11099631,
       "p95_us": 11099631,
       "p99_us": 11099631,
-      "throughput_ops_sec": 0.089180,
+      "throughput_ops_sec": 0.08918,
       "throughput_mb_sec": 0,
       "status": "measured"
     },
@@ -173,7 +173,7 @@
       "p50_us": 11575897,
       "p95_us": 11575897,
       "p99_us": 11575897,
-      "throughput_ops_sec": 0.086950,
+      "throughput_ops_sec": 0.08695,
       "throughput_mb_sec": 0,
       "status": "measured"
     },
@@ -209,7 +209,7 @@
       "p50_us": 11120375,
       "p95_us": 11120375,
       "p99_us": 11120375,
-      "throughput_ops_sec": 0.089940,
+      "throughput_ops_sec": 0.08994,
       "throughput_mb_sec": 0.000351,
       "status": "measured"
     },
@@ -293,7 +293,7 @@
       "p50_us": 9512354,
       "p95_us": 9512354,
       "p99_us": 9512354,
-      "throughput_ops_sec": 0.105320,
+      "throughput_ops_sec": 0.10532,
       "throughput_mb_sec": 0,
       "status": "measured"
     },
@@ -317,7 +317,7 @@
       "p50_us": 10697389,
       "p95_us": 10697389,
       "p99_us": 10697389,
-      "throughput_ops_sec": 0.093580,
+      "throughput_ops_sec": 0.09358,
       "throughput_mb_sec": 0,
       "status": "measured"
     },

@@ -27,12 +27,8 @@
     "observed_p99_micros": 3600,
     "outcome": "helped"
   },
-  "artifact_paths": [
-    "artifacts/numa-placement/swarm_promotion.json"
-  ],
-  "raw_log_paths": [
-    "artifacts/numa-placement/swarm_promotion_hint.log"
-  ],
+  "artifact_paths": ["artifacts/numa-placement/swarm_promotion.json"],
+  "raw_log_paths": ["artifacts/numa-placement/swarm_promotion_hint.log"],
   "cleanup_status": "clean",
   "reproduction_command": "ffs-harness validate-numa-allocation-placement --report conformance/fixtures/numa_allocation_placement/swarm_promotion.json",
   "product_evidence_claim": "swarm.responsiveness",

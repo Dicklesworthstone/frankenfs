@@ -3,19 +3,55 @@
   "classification": "missing_run_id,missing_lane_id,duplicate_scenario_id,stale_schema,missing_raw_log_path,broken_artifact_hash,ambiguous_skip_reason,missing_cleanup_status,missing_artifact,missing_remediation_id,invalid_classification,missing_reproduction_command,redacted_reproduction_command",
   "expectation": "reject",
   "expected_diagnostics": [
-    {"code": "missing_run_id", "path": "$.manifest.run_id"},
-    {"code": "artifact_sha256_mismatch", "path": "$.manifest.artifacts[path=artifacts/shared/report.json].sha256"},
-    {"code": "missing_lane_id", "path": "$.manifest.readiness_events[event_id=negative_missing_lane_event].lane_id"},
-    {"code": "stale_schema_version", "path": "$.manifest.readiness_events[event_id=negative_stale_schema_event].envelope_version"},
-    {"code": "missing_raw_log_path", "path": "$.manifest.readiness_events[event_id=negative_missing_raw_log_event].raw_log_refs"},
-    {"code": "duplicate_scenario_id", "path": "$.manifest.readiness_events[event_id=artifact_schema_duplicate_scenario_case].scenario_id"},
-    {"code": "missing_artifact", "path": "$.manifest.operational_scenarios.artifact_schema_missing_artifact_case.artifact_refs[artifacts/shared/missing.json]"},
-    {"code": "ambiguous_skip_reason", "path": "$.manifest.operational_scenarios.artifact_schema_ambiguous_skip_case.classification"},
-    {"code": "missing_cleanup_status", "path": "$.manifest.operational_scenarios.artifact_schema_missing_cleanup_case"},
-    {"code": "invalid_classification", "path": "$.manifest.operational_scenarios.artifact_schema_invalid_classification_case.classification"},
-    {"code": "missing_remediation_id", "path": "$.manifest.readiness_events[event_id=negative_missing_remediation_event].remediation_id"},
-    {"code": "missing_reproduction_command", "path": "$.manifest.readiness_events[event_id=negative_missing_reproduction_event].reproduction_command"},
-    {"code": "redacted_reproduction_command", "path": "$.manifest.readiness_events[event_id=negative_redacted_reproduction_event].reproduction_command"}
+    { "code": "missing_run_id", "path": "$.manifest.run_id" },
+    {
+      "code": "artifact_sha256_mismatch",
+      "path": "$.manifest.artifacts[path=artifacts/shared/report.json].sha256"
+    },
+    {
+      "code": "missing_lane_id",
+      "path": "$.manifest.readiness_events[event_id=negative_missing_lane_event].lane_id"
+    },
+    {
+      "code": "stale_schema_version",
+      "path": "$.manifest.readiness_events[event_id=negative_stale_schema_event].envelope_version"
+    },
+    {
+      "code": "missing_raw_log_path",
+      "path": "$.manifest.readiness_events[event_id=negative_missing_raw_log_event].raw_log_refs"
+    },
+    {
+      "code": "duplicate_scenario_id",
+      "path": "$.manifest.readiness_events[event_id=artifact_schema_duplicate_scenario_case].scenario_id"
+    },
+    {
+      "code": "missing_artifact",
+      "path": "$.manifest.operational_scenarios.artifact_schema_missing_artifact_case.artifact_refs[artifacts/shared/missing.json]"
+    },
+    {
+      "code": "ambiguous_skip_reason",
+      "path": "$.manifest.operational_scenarios.artifact_schema_ambiguous_skip_case.classification"
+    },
+    {
+      "code": "missing_cleanup_status",
+      "path": "$.manifest.operational_scenarios.artifact_schema_missing_cleanup_case"
+    },
+    {
+      "code": "invalid_classification",
+      "path": "$.manifest.operational_scenarios.artifact_schema_invalid_classification_case.classification"
+    },
+    {
+      "code": "missing_remediation_id",
+      "path": "$.manifest.readiness_events[event_id=negative_missing_remediation_event].remediation_id"
+    },
+    {
+      "code": "missing_reproduction_command",
+      "path": "$.manifest.readiness_events[event_id=negative_missing_reproduction_event].reproduction_command"
+    },
+    {
+      "code": "redacted_reproduction_command",
+      "path": "$.manifest.readiness_events[event_id=negative_redacted_reproduction_event].reproduction_command"
+    }
   ],
   "manifest": {
     "schema_version": 1,
@@ -23,7 +59,7 @@
     "created_at": "2026-05-05T05:00:00Z",
     "gate_id": "artifact_schema_fixture_suite",
     "bead_id": "bd-jze2r",
-    "git_context": {"commit": "fixture-head", "branch": "main", "clean": true},
+    "git_context": { "commit": "fixture-head", "branch": "main", "clean": true },
     "environment": {
       "hostname": "fixture-host",
       "cpu_model": "fixture-cpu",
@@ -34,56 +70,471 @@
       "cargo_version": "cargo fixture"
     },
     "scenarios": {
-      "artifact_schema_missing_lane_case": {"scenario_id": "artifact_schema_missing_lane_case", "outcome": "PASS", "duration_secs": 0.1},
-      "artifact_schema_stale_schema_case": {"scenario_id": "artifact_schema_stale_schema_case", "outcome": "PASS", "duration_secs": 0.1},
-      "artifact_schema_missing_raw_log_case": {"scenario_id": "artifact_schema_missing_raw_log_case", "outcome": "PASS", "duration_secs": 0.1},
-      "artifact_schema_duplicate_scenario_case": {"scenario_id": "artifact_schema_duplicate_scenario_case", "outcome": "PASS", "duration_secs": 0.1},
-      "artifact_schema_missing_artifact_case": {"scenario_id": "artifact_schema_missing_artifact_case", "outcome": "PASS", "duration_secs": 0.1},
-      "artifact_schema_ambiguous_skip_case": {"scenario_id": "artifact_schema_ambiguous_skip_case", "outcome": "SKIP", "duration_secs": 0.1},
-      "artifact_schema_missing_cleanup_case": {"scenario_id": "artifact_schema_missing_cleanup_case", "outcome": "PASS", "duration_secs": 0.1},
-      "artifact_schema_invalid_classification_case": {"scenario_id": "artifact_schema_invalid_classification_case", "outcome": "FAIL", "duration_secs": 0.1},
-      "artifact_schema_missing_remediation_case": {"scenario_id": "artifact_schema_missing_remediation_case", "outcome": "PASS", "duration_secs": 0.1},
-      "artifact_schema_missing_reproduction_case": {"scenario_id": "artifact_schema_missing_reproduction_case", "outcome": "PASS", "duration_secs": 0.1},
-      "artifact_schema_redacted_reproduction_case": {"scenario_id": "artifact_schema_redacted_reproduction_case", "outcome": "PASS", "duration_secs": 0.1}
+      "artifact_schema_missing_lane_case": {
+        "scenario_id": "artifact_schema_missing_lane_case",
+        "outcome": "PASS",
+        "duration_secs": 0.1
+      },
+      "artifact_schema_stale_schema_case": {
+        "scenario_id": "artifact_schema_stale_schema_case",
+        "outcome": "PASS",
+        "duration_secs": 0.1
+      },
+      "artifact_schema_missing_raw_log_case": {
+        "scenario_id": "artifact_schema_missing_raw_log_case",
+        "outcome": "PASS",
+        "duration_secs": 0.1
+      },
+      "artifact_schema_duplicate_scenario_case": {
+        "scenario_id": "artifact_schema_duplicate_scenario_case",
+        "outcome": "PASS",
+        "duration_secs": 0.1
+      },
+      "artifact_schema_missing_artifact_case": {
+        "scenario_id": "artifact_schema_missing_artifact_case",
+        "outcome": "PASS",
+        "duration_secs": 0.1
+      },
+      "artifact_schema_ambiguous_skip_case": {
+        "scenario_id": "artifact_schema_ambiguous_skip_case",
+        "outcome": "SKIP",
+        "duration_secs": 0.1
+      },
+      "artifact_schema_missing_cleanup_case": {
+        "scenario_id": "artifact_schema_missing_cleanup_case",
+        "outcome": "PASS",
+        "duration_secs": 0.1
+      },
+      "artifact_schema_invalid_classification_case": {
+        "scenario_id": "artifact_schema_invalid_classification_case",
+        "outcome": "FAIL",
+        "duration_secs": 0.1
+      },
+      "artifact_schema_missing_remediation_case": {
+        "scenario_id": "artifact_schema_missing_remediation_case",
+        "outcome": "PASS",
+        "duration_secs": 0.1
+      },
+      "artifact_schema_missing_reproduction_case": {
+        "scenario_id": "artifact_schema_missing_reproduction_case",
+        "outcome": "PASS",
+        "duration_secs": 0.1
+      },
+      "artifact_schema_redacted_reproduction_case": {
+        "scenario_id": "artifact_schema_redacted_reproduction_case",
+        "outcome": "PASS",
+        "duration_secs": 0.1
+      }
     },
     "operational_context": {
       "command_line": ["scripts/e2e/ffs_artifact_schema_fixtures_e2e.sh"],
-      "worker": {"host": "fixture-host", "worker_id": "fixture-worker"},
+      "worker": { "host": "fixture-host", "worker_id": "fixture-worker" },
       "fuse_capability": "not_applicable",
       "stdout_path": "artifacts/shared/run.log",
       "stderr_path": "artifacts/shared/stderr.log"
     },
     "operational_scenarios": {
-      "artifact_schema_missing_lane_case": {"scenario_id": "artifact_schema_missing_lane_case", "filesystem": "not_applicable", "expected_outcome": "PASS", "actual_outcome": "PASS", "classification": "pass", "exit_status": 0, "stdout_path": "artifacts/shared/run.log", "stderr_path": "artifacts/shared/stderr.log", "artifact_refs": ["artifacts/shared/report.json"], "cleanup_status": "clean"},
-      "artifact_schema_stale_schema_case": {"scenario_id": "artifact_schema_stale_schema_case", "filesystem": "not_applicable", "expected_outcome": "PASS", "actual_outcome": "PASS", "classification": "pass", "exit_status": 0, "stdout_path": "artifacts/shared/run.log", "stderr_path": "artifacts/shared/stderr.log", "artifact_refs": ["artifacts/shared/report.json"], "cleanup_status": "clean"},
-      "artifact_schema_missing_raw_log_case": {"scenario_id": "artifact_schema_missing_raw_log_case", "filesystem": "not_applicable", "expected_outcome": "PASS", "actual_outcome": "PASS", "classification": "pass", "exit_status": 0, "stdout_path": "artifacts/shared/run.log", "stderr_path": "artifacts/shared/stderr.log", "artifact_refs": ["artifacts/shared/report.json"], "cleanup_status": "clean"},
-      "artifact_schema_duplicate_scenario_case": {"scenario_id": "artifact_schema_duplicate_scenario_case", "filesystem": "not_applicable", "expected_outcome": "PASS", "actual_outcome": "PASS", "classification": "pass", "exit_status": 0, "stdout_path": "artifacts/shared/run.log", "stderr_path": "artifacts/shared/stderr.log", "artifact_refs": ["artifacts/shared/report.json"], "cleanup_status": "clean"},
-      "artifact_schema_missing_artifact_case": {"scenario_id": "artifact_schema_missing_artifact_case", "filesystem": "not_applicable", "expected_outcome": "PASS", "actual_outcome": "PASS", "classification": "pass", "exit_status": 0, "stdout_path": "artifacts/shared/run.log", "stderr_path": "artifacts/shared/stderr.log", "artifact_refs": ["artifacts/shared/missing.json"], "cleanup_status": "clean"},
-      "artifact_schema_ambiguous_skip_case": {"scenario_id": "artifact_schema_ambiguous_skip_case", "filesystem": "ext4", "expected_outcome": "SKIP", "actual_outcome": "SKIP", "classification": "skip", "exit_status": 0, "stdout_path": "artifacts/shared/run.log", "stderr_path": "artifacts/shared/stderr.log", "artifact_refs": ["artifacts/shared/report.json"], "cleanup_status": "clean", "skip_reason": "not_applicable"},
-      "artifact_schema_missing_cleanup_case": {"scenario_id": "artifact_schema_missing_cleanup_case", "filesystem": "not_applicable", "expected_outcome": "PASS", "actual_outcome": "PASS", "classification": "pass", "exit_status": 0, "stdout_path": "artifacts/shared/run.log", "stderr_path": "artifacts/shared/stderr.log", "artifact_refs": ["artifacts/shared/report.json"], "cleanup_status": "not_run"},
-      "artifact_schema_invalid_classification_case": {"scenario_id": "artifact_schema_invalid_classification_case", "filesystem": "not_applicable", "expected_outcome": "FAIL", "actual_outcome": "FAIL", "classification": "pass", "exit_status": 1, "stdout_path": "artifacts/shared/run.log", "stderr_path": "artifacts/shared/stderr.log", "artifact_refs": ["artifacts/shared/report.json"], "cleanup_status": "clean"},
-      "artifact_schema_missing_remediation_case": {"scenario_id": "artifact_schema_missing_remediation_case", "filesystem": "not_applicable", "expected_outcome": "PASS", "actual_outcome": "PASS", "classification": "pass", "exit_status": 0, "stdout_path": "artifacts/shared/run.log", "stderr_path": "artifacts/shared/stderr.log", "artifact_refs": ["artifacts/shared/report.json"], "cleanup_status": "clean"},
-      "artifact_schema_missing_reproduction_case": {"scenario_id": "artifact_schema_missing_reproduction_case", "filesystem": "not_applicable", "expected_outcome": "PASS", "actual_outcome": "PASS", "classification": "pass", "exit_status": 0, "stdout_path": "artifacts/shared/run.log", "stderr_path": "artifacts/shared/stderr.log", "artifact_refs": ["artifacts/shared/report.json"], "cleanup_status": "clean"},
-      "artifact_schema_redacted_reproduction_case": {"scenario_id": "artifact_schema_redacted_reproduction_case", "filesystem": "not_applicable", "expected_outcome": "PASS", "actual_outcome": "PASS", "classification": "pass", "exit_status": 0, "stdout_path": "artifacts/shared/run.log", "stderr_path": "artifacts/shared/stderr.log", "artifact_refs": ["artifacts/shared/report.json"], "cleanup_status": "clean"}
+      "artifact_schema_missing_lane_case": {
+        "scenario_id": "artifact_schema_missing_lane_case",
+        "filesystem": "not_applicable",
+        "expected_outcome": "PASS",
+        "actual_outcome": "PASS",
+        "classification": "pass",
+        "exit_status": 0,
+        "stdout_path": "artifacts/shared/run.log",
+        "stderr_path": "artifacts/shared/stderr.log",
+        "artifact_refs": ["artifacts/shared/report.json"],
+        "cleanup_status": "clean"
+      },
+      "artifact_schema_stale_schema_case": {
+        "scenario_id": "artifact_schema_stale_schema_case",
+        "filesystem": "not_applicable",
+        "expected_outcome": "PASS",
+        "actual_outcome": "PASS",
+        "classification": "pass",
+        "exit_status": 0,
+        "stdout_path": "artifacts/shared/run.log",
+        "stderr_path": "artifacts/shared/stderr.log",
+        "artifact_refs": ["artifacts/shared/report.json"],
+        "cleanup_status": "clean"
+      },
+      "artifact_schema_missing_raw_log_case": {
+        "scenario_id": "artifact_schema_missing_raw_log_case",
+        "filesystem": "not_applicable",
+        "expected_outcome": "PASS",
+        "actual_outcome": "PASS",
+        "classification": "pass",
+        "exit_status": 0,
+        "stdout_path": "artifacts/shared/run.log",
+        "stderr_path": "artifacts/shared/stderr.log",
+        "artifact_refs": ["artifacts/shared/report.json"],
+        "cleanup_status": "clean"
+      },
+      "artifact_schema_duplicate_scenario_case": {
+        "scenario_id": "artifact_schema_duplicate_scenario_case",
+        "filesystem": "not_applicable",
+        "expected_outcome": "PASS",
+        "actual_outcome": "PASS",
+        "classification": "pass",
+        "exit_status": 0,
+        "stdout_path": "artifacts/shared/run.log",
+        "stderr_path": "artifacts/shared/stderr.log",
+        "artifact_refs": ["artifacts/shared/report.json"],
+        "cleanup_status": "clean"
+      },
+      "artifact_schema_missing_artifact_case": {
+        "scenario_id": "artifact_schema_missing_artifact_case",
+        "filesystem": "not_applicable",
+        "expected_outcome": "PASS",
+        "actual_outcome": "PASS",
+        "classification": "pass",
+        "exit_status": 0,
+        "stdout_path": "artifacts/shared/run.log",
+        "stderr_path": "artifacts/shared/stderr.log",
+        "artifact_refs": ["artifacts/shared/missing.json"],
+        "cleanup_status": "clean"
+      },
+      "artifact_schema_ambiguous_skip_case": {
+        "scenario_id": "artifact_schema_ambiguous_skip_case",
+        "filesystem": "ext4",
+        "expected_outcome": "SKIP",
+        "actual_outcome": "SKIP",
+        "classification": "skip",
+        "exit_status": 0,
+        "stdout_path": "artifacts/shared/run.log",
+        "stderr_path": "artifacts/shared/stderr.log",
+        "artifact_refs": ["artifacts/shared/report.json"],
+        "cleanup_status": "clean",
+        "skip_reason": "not_applicable"
+      },
+      "artifact_schema_missing_cleanup_case": {
+        "scenario_id": "artifact_schema_missing_cleanup_case",
+        "filesystem": "not_applicable",
+        "expected_outcome": "PASS",
+        "actual_outcome": "PASS",
+        "classification": "pass",
+        "exit_status": 0,
+        "stdout_path": "artifacts/shared/run.log",
+        "stderr_path": "artifacts/shared/stderr.log",
+        "artifact_refs": ["artifacts/shared/report.json"],
+        "cleanup_status": "not_run"
+      },
+      "artifact_schema_invalid_classification_case": {
+        "scenario_id": "artifact_schema_invalid_classification_case",
+        "filesystem": "not_applicable",
+        "expected_outcome": "FAIL",
+        "actual_outcome": "FAIL",
+        "classification": "pass",
+        "exit_status": 1,
+        "stdout_path": "artifacts/shared/run.log",
+        "stderr_path": "artifacts/shared/stderr.log",
+        "artifact_refs": ["artifacts/shared/report.json"],
+        "cleanup_status": "clean"
+      },
+      "artifact_schema_missing_remediation_case": {
+        "scenario_id": "artifact_schema_missing_remediation_case",
+        "filesystem": "not_applicable",
+        "expected_outcome": "PASS",
+        "actual_outcome": "PASS",
+        "classification": "pass",
+        "exit_status": 0,
+        "stdout_path": "artifacts/shared/run.log",
+        "stderr_path": "artifacts/shared/stderr.log",
+        "artifact_refs": ["artifacts/shared/report.json"],
+        "cleanup_status": "clean"
+      },
+      "artifact_schema_missing_reproduction_case": {
+        "scenario_id": "artifact_schema_missing_reproduction_case",
+        "filesystem": "not_applicable",
+        "expected_outcome": "PASS",
+        "actual_outcome": "PASS",
+        "classification": "pass",
+        "exit_status": 0,
+        "stdout_path": "artifacts/shared/run.log",
+        "stderr_path": "artifacts/shared/stderr.log",
+        "artifact_refs": ["artifacts/shared/report.json"],
+        "cleanup_status": "clean"
+      },
+      "artifact_schema_redacted_reproduction_case": {
+        "scenario_id": "artifact_schema_redacted_reproduction_case",
+        "filesystem": "not_applicable",
+        "expected_outcome": "PASS",
+        "actual_outcome": "PASS",
+        "classification": "pass",
+        "exit_status": 0,
+        "stdout_path": "artifacts/shared/run.log",
+        "stderr_path": "artifacts/shared/stderr.log",
+        "artifact_refs": ["artifacts/shared/report.json"],
+        "cleanup_status": "clean"
+      }
     },
     "readiness_events": [
-      {"envelope_version": 1, "event_id": "negative_missing_lane_event", "report_id": "negative_report", "run_id": "", "lane_id": "", "scenario_id": "artifact_schema_missing_lane_case", "artifact_id": "artifacts/shared/report.json", "parent_correlation_id": "negative_report", "classification": "pass", "severity": "info", "created_at": "2026-05-05T05:00:00Z", "git_commit": "fixture-head", "host_fingerprint": "fixture-host|Linux fixture|64cpu", "capability_fingerprint": "not_applicable", "raw_log_refs": ["artifacts/shared/run.log"], "controlling_evidence": ["artifacts/shared/report.json"], "remediation_id": "bd-jze2r:negative-missing-lane", "reproduction_command": "scripts/e2e/ffs_artifact_schema_fixtures_e2e.sh --fixture negative_matrix"},
-      {"envelope_version": 0, "event_id": "negative_stale_schema_event", "report_id": "negative_report", "run_id": "", "lane_id": "artifact_schema", "scenario_id": "artifact_schema_stale_schema_case", "artifact_id": "artifacts/shared/report.json", "parent_correlation_id": "negative_report", "classification": "pass", "severity": "info", "created_at": "2026-05-05T05:00:00Z", "git_commit": "fixture-head", "host_fingerprint": "fixture-host|Linux fixture|64cpu", "capability_fingerprint": "not_applicable", "raw_log_refs": ["artifacts/shared/run.log"], "controlling_evidence": ["artifacts/shared/report.json"], "remediation_id": "bd-jze2r:negative-stale-schema", "reproduction_command": "scripts/e2e/ffs_artifact_schema_fixtures_e2e.sh --fixture negative_matrix"},
-      {"envelope_version": 1, "event_id": "negative_missing_raw_log_event", "report_id": "negative_report", "run_id": "", "lane_id": "artifact_schema", "scenario_id": "artifact_schema_missing_raw_log_case", "artifact_id": "artifacts/shared/report.json", "parent_correlation_id": "negative_report", "classification": "pass", "severity": "info", "created_at": "2026-05-05T05:00:00Z", "git_commit": "fixture-head", "host_fingerprint": "fixture-host|Linux fixture|64cpu", "capability_fingerprint": "not_applicable", "raw_log_refs": [], "controlling_evidence": ["artifacts/shared/report.json"], "remediation_id": "bd-jze2r:negative-missing-raw-log", "reproduction_command": "scripts/e2e/ffs_artifact_schema_fixtures_e2e.sh --fixture negative_matrix"},
-      {"envelope_version": 1, "event_id": "negative_duplicate_event_a", "report_id": "negative_report", "run_id": "", "lane_id": "artifact_schema", "scenario_id": "artifact_schema_duplicate_scenario_case", "artifact_id": "artifacts/shared/report.json", "parent_correlation_id": "negative_report", "classification": "pass", "severity": "info", "created_at": "2026-05-05T05:00:00Z", "git_commit": "fixture-head", "host_fingerprint": "fixture-host|Linux fixture|64cpu", "capability_fingerprint": "not_applicable", "raw_log_refs": ["artifacts/shared/run.log"], "controlling_evidence": ["artifacts/shared/report.json"], "remediation_id": "bd-jze2r:negative-duplicate-a", "reproduction_command": "scripts/e2e/ffs_artifact_schema_fixtures_e2e.sh --fixture negative_matrix"},
-      {"envelope_version": 1, "event_id": "negative_duplicate_event_b", "report_id": "negative_report", "run_id": "", "lane_id": "artifact_schema", "scenario_id": "artifact_schema_duplicate_scenario_case", "artifact_id": "artifacts/shared/report.json", "parent_correlation_id": "negative_report", "classification": "pass", "severity": "info", "created_at": "2026-05-05T05:00:00Z", "git_commit": "fixture-head", "host_fingerprint": "fixture-host|Linux fixture|64cpu", "capability_fingerprint": "not_applicable", "raw_log_refs": ["artifacts/shared/run.log"], "controlling_evidence": ["artifacts/shared/report.json"], "remediation_id": "bd-jze2r:negative-duplicate-b", "reproduction_command": "scripts/e2e/ffs_artifact_schema_fixtures_e2e.sh --fixture negative_matrix"},
-      {"envelope_version": 1, "event_id": "negative_missing_artifact_event", "report_id": "negative_report", "run_id": "", "lane_id": "artifact_schema", "scenario_id": "artifact_schema_missing_artifact_case", "artifact_id": "artifacts/shared/report.json", "parent_correlation_id": "negative_report", "classification": "pass", "severity": "info", "created_at": "2026-05-05T05:00:00Z", "git_commit": "fixture-head", "host_fingerprint": "fixture-host|Linux fixture|64cpu", "capability_fingerprint": "not_applicable", "raw_log_refs": ["artifacts/shared/run.log"], "controlling_evidence": ["artifacts/shared/report.json"], "remediation_id": "bd-jze2r:negative-missing-artifact", "reproduction_command": "scripts/e2e/ffs_artifact_schema_fixtures_e2e.sh --fixture negative_matrix"},
-      {"envelope_version": 1, "event_id": "negative_ambiguous_skip_event", "report_id": "negative_report", "run_id": "", "lane_id": "artifact_schema", "scenario_id": "artifact_schema_ambiguous_skip_case", "artifact_id": "artifacts/shared/report.json", "parent_correlation_id": "negative_report", "classification": "skip", "severity": "warning", "created_at": "2026-05-05T05:00:00Z", "git_commit": "fixture-head", "host_fingerprint": "fixture-host|Linux fixture|64cpu", "capability_fingerprint": "not_applicable", "raw_log_refs": ["artifacts/shared/run.log"], "controlling_evidence": ["artifacts/shared/report.json"], "remediation_id": "bd-jze2r:negative-ambiguous-skip", "reproduction_command": "scripts/e2e/ffs_artifact_schema_fixtures_e2e.sh --fixture negative_matrix"},
-      {"envelope_version": 1, "event_id": "negative_missing_cleanup_event", "report_id": "negative_report", "run_id": "", "lane_id": "artifact_schema", "scenario_id": "artifact_schema_missing_cleanup_case", "artifact_id": "artifacts/shared/report.json", "parent_correlation_id": "negative_report", "classification": "pass", "severity": "info", "created_at": "2026-05-05T05:00:00Z", "git_commit": "fixture-head", "host_fingerprint": "fixture-host|Linux fixture|64cpu", "capability_fingerprint": "not_applicable", "raw_log_refs": ["artifacts/shared/run.log"], "controlling_evidence": ["artifacts/shared/report.json"], "remediation_id": "bd-jze2r:negative-missing-cleanup", "reproduction_command": "scripts/e2e/ffs_artifact_schema_fixtures_e2e.sh --fixture negative_matrix"},
-      {"envelope_version": 1, "event_id": "negative_invalid_classification_event", "report_id": "negative_report", "run_id": "", "lane_id": "artifact_schema", "scenario_id": "artifact_schema_invalid_classification_case", "artifact_id": "artifacts/shared/report.json", "parent_correlation_id": "negative_report", "classification": "fail", "severity": "error", "created_at": "2026-05-05T05:00:00Z", "git_commit": "fixture-head", "host_fingerprint": "fixture-host|Linux fixture|64cpu", "capability_fingerprint": "not_applicable", "raw_log_refs": ["artifacts/shared/run.log"], "controlling_evidence": ["artifacts/shared/report.json"], "remediation_id": "bd-jze2r:negative-invalid-classification", "reproduction_command": "scripts/e2e/ffs_artifact_schema_fixtures_e2e.sh --fixture negative_matrix"},
-      {"envelope_version": 1, "event_id": "negative_missing_remediation_event", "report_id": "negative_report", "run_id": "", "lane_id": "artifact_schema", "scenario_id": "artifact_schema_missing_remediation_case", "artifact_id": "artifacts/shared/report.json", "parent_correlation_id": "negative_report", "classification": "pass", "severity": "info", "created_at": "2026-05-05T05:00:00Z", "git_commit": "fixture-head", "host_fingerprint": "fixture-host|Linux fixture|64cpu", "capability_fingerprint": "not_applicable", "raw_log_refs": ["artifacts/shared/run.log"], "controlling_evidence": ["artifacts/shared/report.json"], "remediation_id": "", "reproduction_command": "scripts/e2e/ffs_artifact_schema_fixtures_e2e.sh --fixture negative_matrix"},
-      {"envelope_version": 1, "event_id": "negative_missing_reproduction_event", "report_id": "negative_report", "run_id": "", "lane_id": "artifact_schema", "scenario_id": "artifact_schema_missing_reproduction_case", "artifact_id": "artifacts/shared/report.json", "parent_correlation_id": "negative_report", "classification": "pass", "severity": "info", "created_at": "2026-05-05T05:00:00Z", "git_commit": "fixture-head", "host_fingerprint": "fixture-host|Linux fixture|64cpu", "capability_fingerprint": "not_applicable", "raw_log_refs": ["artifacts/shared/run.log"], "controlling_evidence": ["artifacts/shared/report.json"], "remediation_id": "bd-jze2r:negative-missing-reproduction", "reproduction_command": ""},
-      {"envelope_version": 1, "event_id": "negative_redacted_reproduction_event", "report_id": "negative_report", "run_id": "", "lane_id": "artifact_schema", "scenario_id": "artifact_schema_redacted_reproduction_case", "artifact_id": "artifacts/shared/report.json", "parent_correlation_id": "negative_report", "classification": "pass", "severity": "info", "created_at": "2026-05-05T05:00:00Z", "git_commit": "fixture-head", "host_fingerprint": "fixture-host|Linux fixture|64cpu", "capability_fingerprint": "not_applicable", "raw_log_refs": ["artifacts/shared/run.log"], "controlling_evidence": ["artifacts/shared/report.json"], "remediation_id": "bd-jze2r:negative-redacted-reproduction", "reproduction_command": "[REDACTED]"}
+      {
+        "envelope_version": 1,
+        "event_id": "negative_missing_lane_event",
+        "report_id": "negative_report",
+        "run_id": "",
+        "lane_id": "",
+        "scenario_id": "artifact_schema_missing_lane_case",
+        "artifact_id": "artifacts/shared/report.json",
+        "parent_correlation_id": "negative_report",
+        "classification": "pass",
+        "severity": "info",
+        "created_at": "2026-05-05T05:00:00Z",
+        "git_commit": "fixture-head",
+        "host_fingerprint": "fixture-host|Linux fixture|64cpu",
+        "capability_fingerprint": "not_applicable",
+        "raw_log_refs": ["artifacts/shared/run.log"],
+        "controlling_evidence": ["artifacts/shared/report.json"],
+        "remediation_id": "bd-jze2r:negative-missing-lane",
+        "reproduction_command": "scripts/e2e/ffs_artifact_schema_fixtures_e2e.sh --fixture negative_matrix"
+      },
+      {
+        "envelope_version": 0,
+        "event_id": "negative_stale_schema_event",
+        "report_id": "negative_report",
+        "run_id": "",
+        "lane_id": "artifact_schema",
+        "scenario_id": "artifact_schema_stale_schema_case",
+        "artifact_id": "artifacts/shared/report.json",
+        "parent_correlation_id": "negative_report",
+        "classification": "pass",
+        "severity": "info",
+        "created_at": "2026-05-05T05:00:00Z",
+        "git_commit": "fixture-head",
+        "host_fingerprint": "fixture-host|Linux fixture|64cpu",
+        "capability_fingerprint": "not_applicable",
+        "raw_log_refs": ["artifacts/shared/run.log"],
+        "controlling_evidence": ["artifacts/shared/report.json"],
+        "remediation_id": "bd-jze2r:negative-stale-schema",
+        "reproduction_command": "scripts/e2e/ffs_artifact_schema_fixtures_e2e.sh --fixture negative_matrix"
+      },
+      {
+        "envelope_version": 1,
+        "event_id": "negative_missing_raw_log_event",
+        "report_id": "negative_report",
+        "run_id": "",
+        "lane_id": "artifact_schema",
+        "scenario_id": "artifact_schema_missing_raw_log_case",
+        "artifact_id": "artifacts/shared/report.json",
+        "parent_correlation_id": "negative_report",
+        "classification": "pass",
+        "severity": "info",
+        "created_at": "2026-05-05T05:00:00Z",
+        "git_commit": "fixture-head",
+        "host_fingerprint": "fixture-host|Linux fixture|64cpu",
+        "capability_fingerprint": "not_applicable",
+        "raw_log_refs": [],
+        "controlling_evidence": ["artifacts/shared/report.json"],
+        "remediation_id": "bd-jze2r:negative-missing-raw-log",
+        "reproduction_command": "scripts/e2e/ffs_artifact_schema_fixtures_e2e.sh --fixture negative_matrix"
+      },
+      {
+        "envelope_version": 1,
+        "event_id": "negative_duplicate_event_a",
+        "report_id": "negative_report",
+        "run_id": "",
+        "lane_id": "artifact_schema",
+        "scenario_id": "artifact_schema_duplicate_scenario_case",
+        "artifact_id": "artifacts/shared/report.json",
+        "parent_correlation_id": "negative_report",
+        "classification": "pass",
+        "severity": "info",
+        "created_at": "2026-05-05T05:00:00Z",
+        "git_commit": "fixture-head",
+        "host_fingerprint": "fixture-host|Linux fixture|64cpu",
+        "capability_fingerprint": "not_applicable",
+        "raw_log_refs": ["artifacts/shared/run.log"],
+        "controlling_evidence": ["artifacts/shared/report.json"],
+        "remediation_id": "bd-jze2r:negative-duplicate-a",
+        "reproduction_command": "scripts/e2e/ffs_artifact_schema_fixtures_e2e.sh --fixture negative_matrix"
+      },
+      {
+        "envelope_version": 1,
+        "event_id": "negative_duplicate_event_b",
+        "report_id": "negative_report",
+        "run_id": "",
+        "lane_id": "artifact_schema",
+        "scenario_id": "artifact_schema_duplicate_scenario_case",
+        "artifact_id": "artifacts/shared/report.json",
+        "parent_correlation_id": "negative_report",
+        "classification": "pass",
+        "severity": "info",
+        "created_at": "2026-05-05T05:00:00Z",
+        "git_commit": "fixture-head",
+        "host_fingerprint": "fixture-host|Linux fixture|64cpu",
+        "capability_fingerprint": "not_applicable",
+        "raw_log_refs": ["artifacts/shared/run.log"],
+        "controlling_evidence": ["artifacts/shared/report.json"],
+        "remediation_id": "bd-jze2r:negative-duplicate-b",
+        "reproduction_command": "scripts/e2e/ffs_artifact_schema_fixtures_e2e.sh --fixture negative_matrix"
+      },
+      {
+        "envelope_version": 1,
+        "event_id": "negative_missing_artifact_event",
+        "report_id": "negative_report",
+        "run_id": "",
+        "lane_id": "artifact_schema",
+        "scenario_id": "artifact_schema_missing_artifact_case",
+        "artifact_id": "artifacts/shared/report.json",
+        "parent_correlation_id": "negative_report",
+        "classification": "pass",
+        "severity": "info",
+        "created_at": "2026-05-05T05:00:00Z",
+        "git_commit": "fixture-head",
+        "host_fingerprint": "fixture-host|Linux fixture|64cpu",
+        "capability_fingerprint": "not_applicable",
+        "raw_log_refs": ["artifacts/shared/run.log"],
+        "controlling_evidence": ["artifacts/shared/report.json"],
+        "remediation_id": "bd-jze2r:negative-missing-artifact",
+        "reproduction_command": "scripts/e2e/ffs_artifact_schema_fixtures_e2e.sh --fixture negative_matrix"
+      },
+      {
+        "envelope_version": 1,
+        "event_id": "negative_ambiguous_skip_event",
+        "report_id": "negative_report",
+        "run_id": "",
+        "lane_id": "artifact_schema",
+        "scenario_id": "artifact_schema_ambiguous_skip_case",
+        "artifact_id": "artifacts/shared/report.json",
+        "parent_correlation_id": "negative_report",
+        "classification": "skip",
+        "severity": "warning",
+        "created_at": "2026-05-05T05:00:00Z",
+        "git_commit": "fixture-head",
+        "host_fingerprint": "fixture-host|Linux fixture|64cpu",
+        "capability_fingerprint": "not_applicable",
+        "raw_log_refs": ["artifacts/shared/run.log"],
+        "controlling_evidence": ["artifacts/shared/report.json"],
+        "remediation_id": "bd-jze2r:negative-ambiguous-skip",
+        "reproduction_command": "scripts/e2e/ffs_artifact_schema_fixtures_e2e.sh --fixture negative_matrix"
+      },
+      {
+        "envelope_version": 1,
+        "event_id": "negative_missing_cleanup_event",
+        "report_id": "negative_report",
+        "run_id": "",
+        "lane_id": "artifact_schema",
+        "scenario_id": "artifact_schema_missing_cleanup_case",
+        "artifact_id": "artifacts/shared/report.json",
+        "parent_correlation_id": "negative_report",
+        "classification": "pass",
+        "severity": "info",
+        "created_at": "2026-05-05T05:00:00Z",
+        "git_commit": "fixture-head",
+        "host_fingerprint": "fixture-host|Linux fixture|64cpu",
+        "capability_fingerprint": "not_applicable",
+        "raw_log_refs": ["artifacts/shared/run.log"],
+        "controlling_evidence": ["artifacts/shared/report.json"],
+        "remediation_id": "bd-jze2r:negative-missing-cleanup",
+        "reproduction_command": "scripts/e2e/ffs_artifact_schema_fixtures_e2e.sh --fixture negative_matrix"
+      },
+      {
+        "envelope_version": 1,
+        "event_id": "negative_invalid_classification_event",
+        "report_id": "negative_report",
+        "run_id": "",
+        "lane_id": "artifact_schema",
+        "scenario_id": "artifact_schema_invalid_classification_case",
+        "artifact_id": "artifacts/shared/report.json",
+        "parent_correlation_id": "negative_report",
+        "classification": "fail",
+        "severity": "error",
+        "created_at": "2026-05-05T05:00:00Z",
+        "git_commit": "fixture-head",
+        "host_fingerprint": "fixture-host|Linux fixture|64cpu",
+        "capability_fingerprint": "not_applicable",
+        "raw_log_refs": ["artifacts/shared/run.log"],
+        "controlling_evidence": ["artifacts/shared/report.json"],
+        "remediation_id": "bd-jze2r:negative-invalid-classification",
+        "reproduction_command": "scripts/e2e/ffs_artifact_schema_fixtures_e2e.sh --fixture negative_matrix"
+      },
+      {
+        "envelope_version": 1,
+        "event_id": "negative_missing_remediation_event",
+        "report_id": "negative_report",
+        "run_id": "",
+        "lane_id": "artifact_schema",
+        "scenario_id": "artifact_schema_missing_remediation_case",
+        "artifact_id": "artifacts/shared/report.json",
+        "parent_correlation_id": "negative_report",
+        "classification": "pass",
+        "severity": "info",
+        "created_at": "2026-05-05T05:00:00Z",
+        "git_commit": "fixture-head",
+        "host_fingerprint": "fixture-host|Linux fixture|64cpu",
+        "capability_fingerprint": "not_applicable",
+        "raw_log_refs": ["artifacts/shared/run.log"],
+        "controlling_evidence": ["artifacts/shared/report.json"],
+        "remediation_id": "",
+        "reproduction_command": "scripts/e2e/ffs_artifact_schema_fixtures_e2e.sh --fixture negative_matrix"
+      },
+      {
+        "envelope_version": 1,
+        "event_id": "negative_missing_reproduction_event",
+        "report_id": "negative_report",
+        "run_id": "",
+        "lane_id": "artifact_schema",
+        "scenario_id": "artifact_schema_missing_reproduction_case",
+        "artifact_id": "artifacts/shared/report.json",
+        "parent_correlation_id": "negative_report",
+        "classification": "pass",
+        "severity": "info",
+        "created_at": "2026-05-05T05:00:00Z",
+        "git_commit": "fixture-head",
+        "host_fingerprint": "fixture-host|Linux fixture|64cpu",
+        "capability_fingerprint": "not_applicable",
+        "raw_log_refs": ["artifacts/shared/run.log"],
+        "controlling_evidence": ["artifacts/shared/report.json"],
+        "remediation_id": "bd-jze2r:negative-missing-reproduction",
+        "reproduction_command": ""
+      },
+      {
+        "envelope_version": 1,
+        "event_id": "negative_redacted_reproduction_event",
+        "report_id": "negative_report",
+        "run_id": "",
+        "lane_id": "artifact_schema",
+        "scenario_id": "artifact_schema_redacted_reproduction_case",
+        "artifact_id": "artifacts/shared/report.json",
+        "parent_correlation_id": "negative_report",
+        "classification": "pass",
+        "severity": "info",
+        "created_at": "2026-05-05T05:00:00Z",
+        "git_commit": "fixture-head",
+        "host_fingerprint": "fixture-host|Linux fixture|64cpu",
+        "capability_fingerprint": "not_applicable",
+        "raw_log_refs": ["artifacts/shared/run.log"],
+        "controlling_evidence": ["artifacts/shared/report.json"],
+        "remediation_id": "bd-jze2r:negative-redacted-reproduction",
+        "reproduction_command": "[REDACTED]"
+      }
     ],
     "artifacts": [
-      {"path": "artifacts/shared/run.log", "category": "raw_log", "content_type": "text/plain", "size_bytes": 28, "sha256": "724246c89c95fcb56f90d02c38b832cda02574daa6a81e9c0dedfa82baabca18", "redacted": false},
-      {"path": "artifacts/shared/stderr.log", "category": "raw_log", "content_type": "text/plain", "size_bytes": 31, "sha256": "16f1252e7a2cb67f9bbf648095c9e7df7b15e6a092e1bd530762adb69d0f086c", "redacted": false},
-      {"path": "artifacts/shared/report.json", "category": "summary_report", "content_type": "application/json", "size_bytes": 21, "sha256": "0000000000000000000000000000000000000000000000000000000000000000", "redacted": false}
+      {
+        "path": "artifacts/shared/run.log",
+        "category": "raw_log",
+        "content_type": "text/plain",
+        "size_bytes": 28,
+        "sha256": "724246c89c95fcb56f90d02c38b832cda02574daa6a81e9c0dedfa82baabca18",
+        "redacted": false
+      },
+      {
+        "path": "artifacts/shared/stderr.log",
+        "category": "raw_log",
+        "content_type": "text/plain",
+        "size_bytes": 31,
+        "sha256": "16f1252e7a2cb67f9bbf648095c9e7df7b15e6a092e1bd530762adb69d0f086c",
+        "redacted": false
+      },
+      {
+        "path": "artifacts/shared/report.json",
+        "category": "summary_report",
+        "content_type": "application/json",
+        "size_bytes": 21,
+        "sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+        "redacted": false
+      }
     ],
     "verdict": "FAIL",
     "duration_secs": 1.0

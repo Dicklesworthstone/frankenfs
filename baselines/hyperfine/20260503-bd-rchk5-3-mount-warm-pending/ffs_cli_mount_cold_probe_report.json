@@ -28,9 +28,6 @@
   "outcome": "fail",
   "probe_id": "mount_benchmark_probe",
   "reason": "Mounting ext4 image (block_size=4096, blocks=4096, ro, runtime=standard) at baselines/hyperfine/20260503-bd-rchk5-3-mount-warm-pending/mount_probe_mounts/cold error: FUSE mount failed at baselines/hyperfine/20260503-bd-rchk5-3-mount-warm-pending/mount_probe_mounts/cold: mount I/O error: fusermount3: mount failed: Permission denied : fusermount3: mount failed: Permission denied",
-  "required_capabilities": [
-    "benchmark_host",
-    "fuse"
-  ],
+  "required_capabilities": ["benchmark_host", "fuse"],
   "schema_version": 1
 }

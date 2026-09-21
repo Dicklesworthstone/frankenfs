@@ -1,8 +1,8 @@
 {
   "size": 32,
   "writes": [
-    {"offset": 0, "hex": "020000000c0001022e000000"},
-    {"offset": 12, "hex": "000000000c0000debebafeca"},
-    {"offset": 24, "hex": "01"}
+    { "offset": 0, "hex": "020000000c0001022e000000" },
+    { "offset": 12, "hex": "000000000c0000debebafeca" },
+    { "offset": 24, "hex": "01" }
   ]
 }

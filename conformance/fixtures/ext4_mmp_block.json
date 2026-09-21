@@ -2,12 +2,28 @@
   "description": "ext4 MMP (multi-mount protection) block in clean state",
   "size": 1024,
   "writes": [
-    {"offset":   0, "hex": "504d4d00", "_comment": "magic = 0x004D4D50 (MMP_MAGIC) little-endian"},
-    {"offset":   4, "hex": "504d4dff", "_comment": "seq = 0xFF4D4D50 (MMP_SEQ_CLEAN) little-endian"},
-    {"offset":   8, "hex": "00f1536500000000", "_comment": "time = 1700000000 (timestamp)"},
-    {"offset":  16, "hex": "6666732d6e6f64652d3031", "_comment": "nodename = 'ffs-node-01' (64 bytes, null-padded)"},
-    {"offset":  80, "hex": "2f6465762f6e766d65306e31", "_comment": "bdevname = '/dev/nvme0n1' (32 bytes, null-padded)"},
-    {"offset": 112, "hex": "0500", "_comment": "check_interval = 5 seconds"},
-    {"offset": 1020, "hex": "eb6bafb0", "_comment": "checksum = ext4_chksum(seed 0xAABBCCDD, bytes[0..0x3FC])"}
+    { "offset": 0, "hex": "504d4d00", "_comment": "magic = 0x004D4D50 (MMP_MAGIC) little-endian" },
+    {
+      "offset": 4,
+      "hex": "504d4dff",
+      "_comment": "seq = 0xFF4D4D50 (MMP_SEQ_CLEAN) little-endian"
+    },
+    { "offset": 8, "hex": "00f1536500000000", "_comment": "time = 1700000000 (timestamp)" },
+    {
+      "offset": 16,
+      "hex": "6666732d6e6f64652d3031",
+      "_comment": "nodename = 'ffs-node-01' (64 bytes, null-padded)"
+    },
+    {
+      "offset": 80,
+      "hex": "2f6465762f6e766d65306e31",
+      "_comment": "bdevname = '/dev/nvme0n1' (32 bytes, null-padded)"
+    },
+    { "offset": 112, "hex": "0500", "_comment": "check_interval = 5 seconds" },
+    {
+      "offset": 1020,
+      "hex": "eb6bafb0",
+      "_comment": "checksum = ext4_chksum(seed 0xAABBCCDD, bytes[0..0x3FC])"
+    }
   ]
 }

@@ -2,10 +2,7 @@
   "schema_version": 1,
   "catalog_id": "frankenfs_mounted_write_error_classes_v1",
   "bead_id": "bd-rchk0.3.4",
-  "catalog_owner_beads": [
-    "bd-rchk0.3.4",
-    "bd-6t32i"
-  ],
+  "catalog_owner_beads": ["bd-rchk0.3.4", "bd-6t32i"],
   "entries": [
     {
       "entry_id": "mwerr_ok_baseline_write_readback",
@@ -15,9 +12,7 @@
       "raw_errno": "0",
       "remediation_hint": "",
       "redaction_policy": "none",
-      "artifact_paths": [
-        "artifacts/mounted-write/ok_baseline.json"
-      ],
+      "artifact_paths": ["artifacts/mounted-write/ok_baseline.json"],
       "broad_fallback_justification": "",
       "follow_up_bead": ""
     },
@@ -29,9 +24,7 @@
       "raw_errno": "ENOTCONN",
       "remediation_hint": "load the FUSE kernel module (modprobe fuse) or rerun with FFS_MOUNTED_WRITE_EXECUTE=0 to capture a structured skip",
       "redaction_policy": "none",
-      "artifact_paths": [
-        "artifacts/mounted-write/host_skip.json"
-      ],
+      "artifact_paths": ["artifacts/mounted-write/host_skip.json"],
       "broad_fallback_justification": "",
       "follow_up_bead": ""
     },
@@ -43,9 +36,7 @@
       "raw_errno": "EACCES",
       "remediation_hint": "rerun the matrix as the directory owner or use a fixture image without DefaultPermissions",
       "redaction_policy": "redact_paths",
-      "artifact_paths": [
-        "artifacts/mounted-write/default_permissions_eacces.json"
-      ],
+      "artifact_paths": ["artifacts/mounted-write/default_permissions_eacces.json"],
       "broad_fallback_justification": "",
       "follow_up_bead": ""
     },
@@ -57,9 +48,7 @@
       "raw_errno": "EOPNOTSUPP",
       "remediation_hint": "device nodes are outside the V1 envelope; create regular files or escalate via bd-rchk0.3.4 follow-up",
       "redaction_policy": "redact_paths",
-      "artifact_paths": [
-        "artifacts/mounted-write/unsupported_mknod.json"
-      ],
+      "artifact_paths": ["artifacts/mounted-write/unsupported_mknod.json"],
       "broad_fallback_justification": "",
       "follow_up_bead": ""
     },
@@ -71,9 +60,7 @@
       "raw_errno": "ENAMETOOLONG",
       "remediation_hint": "shorten xattr name below the supported envelope or document the rejection in operator runbooks",
       "redaction_policy": "redact_paths_and_xattr_values",
-      "artifact_paths": [
-        "artifacts/mounted-write/unsupported_xattr_overlong.json"
-      ],
+      "artifact_paths": ["artifacts/mounted-write/unsupported_xattr_overlong.json"],
       "broad_fallback_justification": "",
       "follow_up_bead": ""
     },
@@ -85,9 +72,7 @@
       "raw_errno": "EBUSY",
       "remediation_hint": "rw background repair requires the serialization gate; retry once bd-rchk0.1 closes",
       "redaction_policy": "redact_paths",
-      "artifact_paths": [
-        "artifacts/mounted-write/repair_serialization_blocked.json"
-      ],
+      "artifact_paths": ["artifacts/mounted-write/repair_serialization_blocked.json"],
       "broad_fallback_justification": "",
       "follow_up_bead": ""
     },
@@ -99,9 +84,7 @@
       "raw_errno": "ECANCELED",
       "remediation_hint": "operator cancelled the write; rerun without cancellation to validate the full lifecycle",
       "redaction_policy": "redact_paths",
-      "artifact_paths": [
-        "artifacts/mounted-write/cancelled_by_caller.json"
-      ],
+      "artifact_paths": ["artifacts/mounted-write/cancelled_by_caller.json"],
       "broad_fallback_justification": "",
       "follow_up_bead": ""
     },
@@ -113,9 +96,7 @@
       "raw_errno": "ESTALE",
       "remediation_hint": "remount with a fresh snapshot before retrying; stale snapshots cannot accept new writes",
       "redaction_policy": "redact_paths",
-      "artifact_paths": [
-        "artifacts/mounted-write/stale_snapshot_refused.json"
-      ],
+      "artifact_paths": ["artifacts/mounted-write/stale_snapshot_refused.json"],
       "broad_fallback_justification": "",
       "follow_up_bead": ""
     },
@@ -127,9 +108,7 @@
       "raw_errno": "EIO",
       "remediation_hint": "treat EIO from the btrfs positive write/readback scenario as a product failure; preserve stdout/stderr, operation trace, image fixture hash, and mounted_write_workload_results.json before filing the concrete product bug",
       "redaction_policy": "redact_paths",
-      "artifact_paths": [
-        "artifacts/mounted-write/btrfs_write_readback_eio_product_failure.json"
-      ],
+      "artifact_paths": ["artifacts/mounted-write/btrfs_write_readback_eio_product_failure.json"],
       "broad_fallback_justification": "",
       "follow_up_bead": ""
     }

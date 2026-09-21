@@ -1,23 +1,12 @@
 {
   "catalog_version": "1.0.0",
   "scenario_id_regex": "^[a-z][a-z0-9]*(_[a-z0-9]+){2,}$",
-  "taxonomy": [
-    "happy",
-    "edge",
-    "error",
-    "corruption",
-    "recovery",
-    "degradation",
-    "unsupported_op"
-  ],
+  "taxonomy": ["happy", "edge", "error", "corruption", "recovery", "degradation", "unsupported_op"],
   "suites": [
     {
       "suite_id": "ffs_smoke",
       "script": "scripts/e2e/ffs_smoke.sh",
-      "required_categories": [
-        "happy",
-        "error"
-      ],
+      "required_categories": ["happy", "error"],
       "scenarios": [
         {
           "id": "cli_mount_runtime_help_contract",
@@ -72,10 +61,7 @@
     {
       "suite_id": "ffs_rch_proof_ledger",
       "script": "scripts/e2e/ffs_rch_proof_ledger_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge"
-      ],
+      "required_categories": ["happy", "edge"],
       "scenarios": [
         {
           "id": "rch_proof_ledger_cli_docs_wired",
@@ -130,11 +116,7 @@
     {
       "suite_id": "ffs_rch_capacity_preflight",
       "script": "scripts/e2e/ffs_rch_capacity_preflight_e2e.sh",
-      "required_categories": [
-        "happy",
-        "degradation",
-        "error"
-      ],
+      "required_categories": ["happy", "degradation", "error"],
       "scenarios": [
         {
           "id": "rch_capacity_status_json_parses",
@@ -201,11 +183,7 @@
     {
       "suite_id": "ffs_btrfs_rw_smoke",
       "script": "scripts/e2e/ffs_btrfs_rw_smoke.sh",
-      "required_categories": [
-        "happy",
-        "corruption",
-        "recovery"
-      ],
+      "required_categories": ["happy", "corruption", "recovery"],
       "scenarios": [
         {
           "id_pattern": "^btrfs_rw_[a-z0-9_]+$",
@@ -230,11 +208,7 @@
     {
       "suite_id": "ffs_btrfs_capability_drift",
       "script": "scripts/e2e/ffs_btrfs_capability_drift_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "btrfs_drift_module_exists",
@@ -313,12 +287,7 @@
     {
       "suite_id": "ffs_btrfs_rw_hardening_gate",
       "script": "scripts/e2e/ffs_btrfs_rw_hardening_gate_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error",
-        "corruption"
-      ],
+      "required_categories": ["happy", "edge", "error", "corruption"],
       "scenarios": [
         {
           "id": "hardening_eopnotsupp_contract",
@@ -379,13 +348,7 @@
     {
       "suite_id": "ffs_btrfs_write_churn",
       "script": "scripts/e2e/ffs_btrfs_write_churn_e2e.sh",
-      "required_categories": [
-        "happy",
-        "corruption",
-        "recovery",
-        "degradation",
-        "error"
-      ],
+      "required_categories": ["happy", "corruption", "recovery", "degradation", "error"],
       "scenarios": [
         {
           "id": "churn_tests_exist",
@@ -464,11 +427,7 @@
     {
       "suite_id": "ffs_btrfs_send_receive_corpus",
       "script": "scripts/e2e/ffs_btrfs_send_receive_corpus_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "btrfs_send_receive_corpus_cli_wired",
@@ -523,11 +482,7 @@
     {
       "suite_id": "ffs_btrfs_multidevice_corpus",
       "script": "scripts/e2e/ffs_btrfs_multidevice_corpus_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "btrfs_multidevice_corpus_cli_wired",
@@ -582,11 +537,7 @@
     {
       "suite_id": "ffs_casefold_corpus",
       "script": "scripts/e2e/ffs_casefold_corpus_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "casefold_corpus_cli_wired",
@@ -641,11 +592,7 @@
     {
       "suite_id": "ffs_fault_injection_corpus",
       "script": "scripts/e2e/ffs_fault_injection_corpus_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "fault_injection_corpus_cli_wired",
@@ -700,11 +647,7 @@
     {
       "suite_id": "ffs_repair_corpus",
       "script": "scripts/e2e/ffs_repair_corpus_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "repair_corpus_cli_wired",
@@ -759,11 +702,7 @@
     {
       "suite_id": "ffs_mounted_checkpoint_survivor",
       "script": "scripts/e2e/ffs_mounted_checkpoint_survivor_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "mounted_checkpoint_survivor_cli_wired",
@@ -818,11 +757,7 @@
     {
       "suite_id": "ffs_mounted_repair_mutation_boundary",
       "script": "scripts/e2e/ffs_mounted_repair_mutation_boundary_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "mounted_repair_mutation_boundary_cli_wired",
@@ -883,11 +818,7 @@
     {
       "suite_id": "ffs_low_privilege_demo",
       "script": "scripts/e2e/ffs_low_privilege_demo_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "low_privilege_demo_cli_wired",
@@ -942,11 +873,7 @@
     {
       "suite_id": "ffs_low_privilege_demo_sandbox",
       "script": "scripts/e2e/ffs_low_privilege_demo_sandbox_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "low_privilege_demo_sandbox_cli_wired",
@@ -1001,11 +928,7 @@
     {
       "suite_id": "ffs_remediation_catalog",
       "script": "scripts/e2e/ffs_remediation_catalog_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "remediation_catalog_cli_wired",
@@ -1060,11 +983,7 @@
     {
       "suite_id": "ffs_remediation_severity_gate",
       "script": "scripts/e2e/ffs_remediation_severity_gate_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "remediation_severity_gate_cli_wired",
@@ -1119,11 +1038,7 @@
     {
       "suite_id": "ffs_inventory_closeout_gate",
       "script": "scripts/e2e/ffs_inventory_closeout_gate_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "inventory_closeout_gate_cli_wired",
@@ -1178,11 +1093,7 @@
     {
       "suite_id": "ffs_report_schema_inventory",
       "script": "scripts/e2e/ffs_report_schema_inventory_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "report_schema_inventory_cli_docs_wired",
@@ -1243,11 +1154,7 @@
     {
       "suite_id": "ffs_chaos_replay_lab",
       "script": "scripts/e2e/ffs_chaos_replay_lab_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "chaos_replay_lab_cli_wired",
@@ -1302,11 +1209,7 @@
     {
       "suite_id": "ffs_cli_wal_telemetry",
       "script": "scripts/e2e/ffs_cli_wal_telemetry_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "wal_replay_info_fields",
@@ -1385,12 +1288,7 @@
     {
       "suite_id": "ffs_crash_matrix",
       "script": "scripts/e2e/ffs_crash_matrix_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "recovery",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "recovery", "error"],
       "scenarios": [
         {
           "id": "crash_matrix_module_exists",
@@ -1475,12 +1373,7 @@
     {
       "suite_id": "ffs_crash_promotion",
       "script": "scripts/e2e/ffs_crash_promotion_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error",
-        "recovery"
-      ],
+      "required_categories": ["happy", "edge", "error", "recovery"],
       "scenarios": [
         {
           "id": "promo_module_exists",
@@ -1559,12 +1452,7 @@
     {
       "suite_id": "ffs_fuzz_dashboard",
       "script": "scripts/e2e/ffs_fuzz_dashboard_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "degradation",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "degradation", "error"],
       "scenarios": [
         {
           "id": "dashboard_module_exists",
@@ -1643,12 +1531,7 @@
     {
       "suite_id": "ffs_fuzz_smoke",
       "script": "scripts/e2e/ffs_fuzz_smoke_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error",
-        "recovery"
-      ],
+      "required_categories": ["happy", "edge", "error", "recovery"],
       "scenarios": [
         {
           "id": "fuzz_smoke_manifest_path",
@@ -1727,12 +1610,7 @@
     {
       "suite_id": "ffs_fuzz_targets",
       "script": "scripts/e2e/ffs_fuzz_targets_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error",
-        "recovery"
-      ],
+      "required_categories": ["happy", "edge", "error", "recovery"],
       "scenarios": [
         {
           "id": "fuzz_list_all",
@@ -1811,13 +1689,7 @@
     {
       "suite_id": "ffs_fuzzing_gate",
       "script": "scripts/e2e/ffs_fuzzing_gate_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "degradation",
-        "recovery",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "degradation", "recovery", "error"],
       "scenarios": [
         {
           "id": "fuzzing_gate_subgate_scripts",
@@ -1896,10 +1768,7 @@
     {
       "suite_id": "ffs_fuse_production",
       "script": "scripts/e2e/ffs_fuse_production.sh",
-      "required_categories": [
-        "happy",
-        "edge"
-      ],
+      "required_categories": ["happy", "edge"],
       "scenarios": [
         {
           "id_pattern": "^fuse_prod_[a-z0-9_]+$",
@@ -1960,12 +1829,7 @@
     {
       "suite_id": "ffs_mount_mode",
       "script": "scripts/e2e/ffs_mount_mode_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error",
-        "unsupported_op"
-      ],
+      "required_categories": ["happy", "edge", "error", "unsupported_op"],
       "scenarios": [
         {
           "id": "mode_type_exists",
@@ -2038,13 +1902,7 @@
     {
       "suite_id": "ffs_mount_runtime_gate",
       "script": "scripts/e2e/ffs_mount_runtime_gate_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error",
-        "degradation",
-        "unsupported_op"
-      ],
+      "required_categories": ["happy", "edge", "error", "degradation", "unsupported_op"],
       "scenarios": [
         {
           "id": "cli_mount_unit_tests",
@@ -2105,12 +1963,7 @@
     {
       "suite_id": "ffs_mvcc_lifecycle",
       "script": "scripts/e2e/ffs_mvcc_lifecycle_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "recovery",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "recovery", "error"],
       "scenarios": [
         {
           "id": "open_options_wal_fields",
@@ -2177,13 +2030,7 @@
     {
       "suite_id": "ffs_mvcc_replay_gate",
       "script": "scripts/e2e/ffs_mvcc_replay_gate_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "corruption",
-        "recovery",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "corruption", "recovery", "error"],
       "scenarios": [
         {
           "id": "mvcc_replay_full_suite",
@@ -2262,11 +2109,7 @@
     {
       "suite_id": "ffs_oq_decision_integration",
       "script": "scripts/e2e/ffs_oq_decision_integration_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "oq_matrix_module_exists",
@@ -2345,11 +2188,7 @@
     {
       "suite_id": "ffs_performance_delta_closeout",
       "script": "scripts/e2e/ffs_performance_delta_closeout_e2e.sh",
-      "required_categories": [
-        "happy",
-        "error",
-        "recovery"
-      ],
+      "required_categories": ["happy", "error", "recovery"],
       "scenarios": [
         {
           "id": "performance_delta_closeout_cli_wired",
@@ -2404,12 +2243,7 @@
     {
       "suite_id": "ffs_program_gate",
       "script": "scripts/e2e/ffs_program_gate_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error",
-        "recovery"
-      ],
+      "required_categories": ["happy", "edge", "error", "recovery"],
       "scenarios": [
         {
           "id": "pgat_gate_scripts_exist",
@@ -2512,12 +2346,7 @@
     {
       "suite_id": "ffs_v12_program_gate",
       "script": "scripts/e2e/ffs_v12_program_gate_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error",
-        "recovery"
-      ],
+      "required_categories": ["happy", "edge", "error", "recovery"],
       "scenarios": [
         {
           "id_pattern": "^v12_program_gate_1$",
@@ -2632,10 +2461,7 @@
     {
       "suite_id": "ffs_verification_gate",
       "script": "scripts/e2e/ffs_verification_gate_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge"
-      ],
+      "required_categories": ["happy", "edge"],
       "scenarios": [
         {
           "id": "artifact_manifest_unit_tests",
@@ -2714,12 +2540,7 @@
     {
       "suite_id": "ffs_verification_runner",
       "script": "scripts/e2e/ffs_verification_runner_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error",
-        "recovery"
-      ],
+      "required_categories": ["happy", "edge", "error", "recovery"],
       "scenarios": [
         {
           "id": "runner_module_exists",
@@ -2888,13 +2709,7 @@
     {
       "suite_id": "ffs_version_store_format",
       "script": "scripts/e2e/ffs_version_store_format_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error",
-        "corruption",
-        "recovery"
-      ],
+      "required_categories": ["happy", "edge", "error", "corruption", "recovery"],
       "scenarios": [
         {
           "id": "vs_format_header",
@@ -2973,11 +2788,7 @@
     {
       "suite_id": "ffs_wal_group_commit_gate",
       "script": "scripts/e2e/ffs_wal_group_commit_gate_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "wal_group_commit_cli_wired",
@@ -3026,12 +2837,7 @@
     {
       "suite_id": "ffs_wal_replay",
       "script": "scripts/e2e/ffs_wal_replay_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error",
-        "recovery"
-      ],
+      "required_categories": ["happy", "edge", "error", "recovery"],
       "scenarios": [
         {
           "id": "wal_replay_engine_types",
@@ -3122,13 +2928,7 @@
     {
       "suite_id": "ffs_wal_writer",
       "script": "scripts/e2e/ffs_wal_writer_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error",
-        "recovery",
-        "degradation"
-      ],
+      "required_categories": ["happy", "edge", "error", "recovery", "degradation"],
       "scenarios": [
         {
           "id": "wal_writer_types",
@@ -3219,11 +3019,7 @@
     {
       "suite_id": "ffs_writeback",
       "script": "scripts/e2e/ffs_writeback_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "writeback_durability_unit_tests",
@@ -3254,12 +3050,7 @@
     {
       "suite_id": "ffs_refresh_policy",
       "script": "scripts/e2e/ffs_refresh_policy_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "recovery",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "recovery", "error"],
       "scenarios": [
         {
           "id": "refresh_policy_variants",
@@ -3338,12 +3129,7 @@
     {
       "suite_id": "ffs_repair_5pct",
       "script": "scripts/e2e/ffs_repair_5pct_e2e.sh",
-      "required_categories": [
-        "happy",
-        "corruption",
-        "recovery",
-        "error"
-      ],
+      "required_categories": ["happy", "corruption", "recovery", "error"],
       "scenarios": [
         {
           "id": "repair_5pct_remote_cargo_test",
@@ -3398,12 +3184,7 @@
     {
       "suite_id": "ffs_repair_exchange_loopback",
       "script": "scripts/e2e/ffs_repair_exchange_loopback_e2e.sh",
-      "required_categories": [
-        "happy",
-        "recovery",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "recovery", "edge", "error"],
       "scenarios": [
         {
           "id": "repair_exchange_unit_tests",
@@ -3440,11 +3221,7 @@
     {
       "suite_id": "ffs_scrub_repair_scheduler",
       "script": "scripts/e2e/ffs_scrub_repair_scheduler_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "scrub_repair_scheduler_cli_wired",
@@ -3493,11 +3270,7 @@
     {
       "suite_id": "ffs_support_state_accounting",
       "script": "scripts/e2e/ffs_support_state_accounting_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "support_state_wired",
@@ -3564,11 +3337,7 @@
     {
       "suite_id": "ffs_swarm_operator_report",
       "script": "scripts/e2e/ffs_swarm_operator_report_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "swarm_operator_report_cli_wired",
@@ -3623,11 +3392,7 @@
     {
       "suite_id": "ffs_swarm_cache_controller",
       "script": "scripts/e2e/ffs_swarm_cache_controller_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "swarm_cache_cli_wired",
@@ -3670,11 +3435,7 @@
     {
       "suite_id": "ffs_topology_runtime_advisor",
       "script": "scripts/e2e/ffs_topology_runtime_advisor_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "topology_advisor_permission_boundary",
@@ -3759,11 +3520,7 @@
     {
       "suite_id": "ffs_benchmark_taxonomy",
       "script": "scripts/e2e/ffs_benchmark_taxonomy_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "taxonomy_builds_clean",
@@ -3818,11 +3575,7 @@
     {
       "suite_id": "ffs_baseline_validation",
       "script": "scripts/e2e/ffs_baseline_validation_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "baseline_validation_bench_compile",
@@ -3889,11 +3642,7 @@
     {
       "suite_id": "ffs_benchmark_governance",
       "script": "scripts/e2e/ffs_benchmark_governance_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "governance_comparator_log_fields",
@@ -3972,11 +3721,7 @@
     {
       "suite_id": "ffs_artifact_schema_fixtures",
       "script": "scripts/e2e/ffs_artifact_schema_fixtures_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "artifact_schema_fixture_files_present",
@@ -4025,11 +3770,7 @@
     {
       "suite_id": "ffs_error_taxonomy",
       "script": "scripts/e2e/ffs_error_taxonomy_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "taxonomy_module_exists",
@@ -4108,11 +3849,7 @@
     {
       "suite_id": "ffs_health_consistency",
       "script": "scripts/e2e/ffs_health_consistency_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "health_consistency_module_exists",
@@ -4191,11 +3928,7 @@
     {
       "suite_id": "ffs_evidence_metrics_presets",
       "script": "scripts/e2e/ffs_evidence_metrics_presets_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "evidence_metrics_bundle",
@@ -4244,11 +3977,7 @@
     {
       "suite_id": "ffs_evidence_presets",
       "script": "scripts/e2e/ffs_evidence_presets_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "evidence_presets_all_defined",
@@ -4327,11 +4056,7 @@
     {
       "suite_id": "ffs_operator_tooling_gate",
       "script": "scripts/e2e/ffs_operator_tooling_gate_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "gate_subgate_scripts",
@@ -4410,10 +4135,7 @@
     {
       "suite_id": "ffs_runbooks",
       "script": "scripts/e2e/ffs_runbooks_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge"
-      ],
+      "required_categories": ["happy", "edge"],
       "scenarios": [
         {
           "id": "runbooks_all_present",
@@ -4474,11 +4196,7 @@
     {
       "suite_id": "ffs_tabletop_drill",
       "script": "scripts/e2e/ffs_tabletop_drill_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "drill_module_exists",
@@ -4557,11 +4275,7 @@
     {
       "suite_id": "ffs_operator_recovery_drill",
       "script": "scripts/e2e/ffs_operator_recovery_drill_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "operator_recovery_drill_cli_wired",
@@ -4616,11 +4330,7 @@
     {
       "suite_id": "ffs_adaptive_runtime_manifest",
       "script": "scripts/e2e/ffs_adaptive_runtime_manifest_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "adaptive_runtime_manifest_cli_wired",
@@ -4681,11 +4391,7 @@
     {
       "suite_id": "ffs_adaptive_runtime_runner",
       "script": "scripts/e2e/ffs_adaptive_runtime_runner_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "adaptive_runtime_runner_cli_wired",
@@ -4746,12 +4452,7 @@
     {
       "suite_id": "ffs_performance_manifest",
       "script": "scripts/e2e/ffs_performance_manifest_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error",
-        "recovery"
-      ],
+      "required_categories": ["happy", "edge", "error", "recovery"],
       "scenarios": [
         {
           "id": "performance_manifest_cli_wired",
@@ -4824,12 +4525,7 @@
     {
       "suite_id": "ffs_adversarial_threat_model",
       "script": "scripts/e2e/ffs_adversarial_threat_model_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error",
-        "recovery"
-      ],
+      "required_categories": ["happy", "edge", "error", "recovery"],
       "scenarios": [
         {
           "id": "adversarial_threat_model_cli_wired",
@@ -4878,13 +4574,7 @@
     {
       "suite_id": "ffs_soak_canary_campaign",
       "script": "scripts/e2e/ffs_soak_canary_campaign_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error",
-        "recovery",
-        "degradation"
-      ],
+      "required_categories": ["happy", "edge", "error", "recovery", "degradation"],
       "scenarios": [
         {
           "id": "soak_canary_cli_wired",
@@ -4939,12 +4629,7 @@
     {
       "suite_id": "ffs_repair_writeback_serialization",
       "script": "scripts/e2e/ffs_repair_writeback_serialization_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error",
-        "recovery"
-      ],
+      "required_categories": ["happy", "edge", "error", "recovery"],
       "scenarios": [
         {
           "id": "repair_writeback_cli_wired",
@@ -4999,12 +4684,7 @@
     {
       "suite_id": "ffs_repair_writeback_route",
       "script": "scripts/e2e/ffs_repair_writeback_route_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error",
-        "recovery"
-      ],
+      "required_categories": ["happy", "edge", "error", "recovery"],
       "scenarios": [
         {
           "id": "repair_writeback_mounted_request_scope",
@@ -5089,12 +4769,7 @@
     {
       "suite_id": "ffs_writeback_cache_audit",
       "script": "scripts/e2e/ffs_writeback_cache_audit_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error",
-        "recovery"
-      ],
+      "required_categories": ["happy", "edge", "error", "recovery"],
       "scenarios": [
         {
           "id": "writeback_cache_audit_cli_wired",
@@ -5353,12 +5028,7 @@
     {
       "suite_id": "ffs_xfstests",
       "script": "scripts/e2e/ffs_xfstests_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error",
-        "recovery"
-      ],
+      "required_categories": ["happy", "edge", "error", "recovery"],
       "scenarios": [
         {
           "id": "xfstests_mode_contract",
@@ -5437,11 +5107,7 @@
     {
       "suite_id": "ffs_xfstests_preflight",
       "script": "scripts/e2e/ffs_xfstests_preflight_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "xfstests_preflight_current_host",
@@ -5502,11 +5168,7 @@
     {
       "suite_id": "validate_br_dotted_id_roundtrip",
       "script": "scripts/e2e/validate_br_dotted_id_roundtrip.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "recovery"
-      ],
+      "required_categories": ["happy", "edge", "recovery"],
       "scenarios": [
         {
           "id": "br_dotted_no_db_exact_lookup",
@@ -5567,11 +5229,7 @@
     {
       "suite_id": "ffs_benchmark_expansion",
       "script": "scripts/e2e/ffs_benchmark_expansion_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "bench_mvcc_expansion_compiles",
@@ -5626,11 +5284,7 @@
     {
       "suite_id": "ffs_log_contract",
       "script": "scripts/e2e/ffs_log_contract_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "log_contract_builds_clean",
@@ -5745,11 +5399,7 @@
     {
       "suite_id": "ffs_perf_comparison",
       "script": "scripts/e2e/ffs_perf_comparison_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "perf_comparison_builds_clean",
@@ -5804,11 +5454,7 @@
     {
       "suite_id": "ffs_mounted_recovery_matrix",
       "script": "scripts/e2e/ffs_mounted_recovery_matrix_e2e.sh",
-      "required_categories": [
-        "happy",
-        "error",
-        "recovery"
-      ],
+      "required_categories": ["happy", "error", "recovery"],
       "scenarios": [
         {
           "id": "mounted_recovery_cli_wired",
@@ -5857,10 +5503,7 @@
     {
       "suite_id": "ffs_mounted_write_error_classes",
       "script": "scripts/e2e/ffs_mounted_write_error_classes_e2e.sh",
-      "required_categories": [
-        "happy",
-        "error"
-      ],
+      "required_categories": ["happy", "error"],
       "scenarios": [
         {
           "id": "mounted_write_error_classes_qa_artifact",
@@ -5879,11 +5522,7 @@
     {
       "suite_id": "ffs_proof_bundle",
       "script": "scripts/e2e/ffs_proof_bundle_e2e.sh",
-      "required_categories": [
-        "happy",
-        "error",
-        "recovery"
-      ],
+      "required_categories": ["happy", "error", "recovery"],
       "scenarios": [
         {
           "id": "proof_bundle_cli_wired",
@@ -5992,11 +5631,7 @@
     {
       "suite_id": "ffs_release_gate",
       "script": "scripts/e2e/ffs_release_gate_e2e.sh",
-      "required_categories": [
-        "happy",
-        "error",
-        "recovery"
-      ],
+      "required_categories": ["happy", "error", "recovery"],
       "scenarios": [
         {
           "id": "release_gate_cli_wired",
@@ -6087,11 +5722,7 @@
     {
       "suite_id": "ffs_invariant_oracle",
       "script": "scripts/e2e/ffs_invariant_oracle_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "invariant_oracle_wired",
@@ -6158,12 +5789,7 @@
     {
       "suite_id": "ffs_mounted_differential_oracle",
       "script": "scripts/e2e/ffs_mounted_differential_oracle_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error",
-        "unsupported_op"
-      ],
+      "required_categories": ["happy", "edge", "error", "unsupported_op"],
       "scenarios": [
         {
           "id": "mounted_diff_ext4_create_readback",
@@ -6236,11 +5862,7 @@
     {
       "suite_id": "ffs_cross_oracle_arbitration",
       "script": "scripts/e2e/ffs_cross_oracle_arbitration_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "cross_oracle_cli_wired",
@@ -6307,10 +5929,7 @@
     {
       "suite_id": "ffs_ambition_evidence_matrix",
       "script": "scripts/e2e/ffs_ambition_evidence_matrix_e2e.sh",
-      "required_categories": [
-        "happy",
-        "error"
-      ],
+      "required_categories": ["happy", "error"],
       "scenarios": [
         {
           "id": "ambition_matrix_wired",
@@ -6389,11 +6008,7 @@
     {
       "suite_id": "ffs_docs_status_drift",
       "script": "scripts/e2e/ffs_docs_status_drift_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "docs_status_wired",
@@ -6460,10 +6075,7 @@
     {
       "suite_id": "ffs_open_ended_inventory_scanner",
       "script": "scripts/e2e/ffs_open_ended_inventory_scanner_e2e.sh",
-      "required_categories": [
-        "happy",
-        "error"
-      ],
+      "required_categories": ["happy", "error"],
       "scenarios": [
         {
           "id": "open_ended_note_scanner_inputs_present",
@@ -6548,11 +6160,7 @@
     {
       "suite_id": "ffs_claimability_autopilot",
       "script": "scripts/e2e/ffs_claimability_autopilot_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "claimability_autopilot_transcripts_remote_only",
@@ -6643,10 +6251,7 @@
     {
       "suite_id": "ffs_tracker_source_hygiene",
       "script": "scripts/e2e/ffs_tracker_source_hygiene_e2e.sh",
-      "required_categories": [
-        "happy",
-        "error"
-      ],
+      "required_categories": ["happy", "error"],
       "scenarios": [
         {
           "id": "tracker_source_hygiene_jsonl_parses",
@@ -6749,10 +6354,7 @@
     {
       "suite_id": "ffs_readiness_lab",
       "script": "scripts/e2e/ffs_readiness_lab_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge"
-      ],
+      "required_categories": ["happy", "edge"],
       "scenarios": [
         {
           "id": "readiness_lab_permission_boundary",
@@ -6843,11 +6445,7 @@
     {
       "suite_id": "ffs_readiness_lab_contracts",
       "script": "scripts/e2e/ffs_readiness_lab_contracts_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "readiness_lab_cli_wired",
@@ -6962,11 +6560,7 @@
     {
       "suite_id": "ffs_readiness_dashboard",
       "script": "scripts/e2e/ffs_readiness_dashboard_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "readiness_dashboard_cli_wired",
@@ -7021,11 +6615,7 @@
     {
       "suite_id": "ffs_readiness_action_autopilot",
       "script": "scripts/e2e/ffs_readiness_action_autopilot_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "readiness_action_autopilot_cli_wired",
@@ -7092,11 +6682,7 @@
     {
       "suite_id": "ffs_permissioned_campaign_broker",
       "script": "scripts/e2e/ffs_permissioned_campaign_broker_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "permissioned_broker_cli_wired",
@@ -7181,11 +6767,7 @@
     {
       "suite_id": "ffs_operational_evidence_index",
       "script": "scripts/e2e/ffs_operational_evidence_index_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "evidence_fixture_conflict_tree",
@@ -7228,11 +6810,7 @@
     {
       "suite_id": "ffs_operational_readiness_report",
       "script": "scripts/e2e/ffs_operational_readiness_report_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "readiness_report_wired",
@@ -7287,11 +6865,7 @@
     {
       "suite_id": "ffs_proof_overhead_budget",
       "script": "scripts/e2e/ffs_proof_overhead_budget_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "proof_budget_cli_wired",
@@ -7352,11 +6926,7 @@
     {
       "suite_id": "ffs_workload_corpus",
       "script": "scripts/e2e/ffs_workload_corpus_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "workload_corpus_cli_wired",
@@ -7417,11 +6987,7 @@
     {
       "suite_id": "ffs_metamorphic_workload_seed_catalog",
       "script": "scripts/e2e/ffs_metamorphic_workload_seed_catalog_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "metamorphic_seed_catalog_cli_wired",
@@ -7482,11 +7048,7 @@
     {
       "suite_id": "ffs_swarm_tail_latency",
       "script": "scripts/e2e/ffs_swarm_tail_latency_e2e.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "swarm_tail_cli_wired",
@@ -7559,10 +7121,7 @@
     {
       "suite_id": "ffs_swarm_workload_harness",
       "script": "scripts/e2e/ffs_swarm_workload_harness_e2e.sh",
-      "required_categories": [
-        "happy",
-        "error"
-      ],
+      "required_categories": ["happy", "error"],
       "scenarios": [
         {
           "id": "swarm_workload_cli_wired",
@@ -7641,12 +7200,7 @@
     {
       "suite_id": "ffs_repair_confidence_lab",
       "script": "scripts/e2e/ffs_repair_confidence_lab_e2e.sh",
-      "required_categories": [
-        "happy",
-        "error",
-        "corruption",
-        "recovery"
-      ],
+      "required_categories": ["happy", "error", "corruption", "recovery"],
       "scenarios": [
         {
           "id": "repair_confidence_cli_wired",
@@ -7707,10 +7261,7 @@
     {
       "suite_id": "ffs_btrfs_ro_smoke",
       "script": "scripts/e2e/ffs_btrfs_ro_smoke.sh",
-      "required_categories": [
-        "happy",
-        "edge"
-      ],
+      "required_categories": ["happy", "edge"],
       "scenarios": [
         {
           "id": "btrfs_ro_cli_build",
@@ -7765,11 +7316,7 @@
     {
       "suite_id": "ffs_degradation_stress",
       "script": "scripts/e2e/ffs_degradation_stress.sh",
-      "required_categories": [
-        "happy",
-        "degradation",
-        "error"
-      ],
+      "required_categories": ["happy", "degradation", "error"],
       "scenarios": [
         {
           "id": "degradation_stress_cli_build",
@@ -7842,10 +7389,7 @@
     {
       "suite_id": "ffs_ext4_ro_roundtrip",
       "script": "scripts/e2e/ffs_ext4_ro_roundtrip.sh",
-      "required_categories": [
-        "happy",
-        "edge"
-      ],
+      "required_categories": ["happy", "edge"],
       "scenarios": [
         {
           "id": "ext4_ro_roundtrip_cli_build",
@@ -7888,10 +7432,7 @@
     {
       "suite_id": "ffs_ext4_rw_smoke",
       "script": "scripts/e2e/ffs_ext4_rw_smoke.sh",
-      "required_categories": [
-        "happy",
-        "recovery"
-      ],
+      "required_categories": ["happy", "recovery"],
       "scenarios": [
         {
           "id": "ext4_rw_smoke_build_cli",
@@ -7928,11 +7469,7 @@
     {
       "suite_id": "ffs_mounted_write_workload_matrix",
       "script": "scripts/e2e/ffs_mounted_write_workload_matrix.sh",
-      "required_categories": [
-        "happy",
-        "recovery",
-        "unsupported_op"
-      ],
+      "required_categories": ["happy", "recovery", "unsupported_op"],
       "scenarios": [
         {
           "id": "mounted_write_matrix_validates",
@@ -7969,12 +7506,7 @@
     {
       "suite_id": "ffs_repair_recovery_smoke",
       "script": "scripts/e2e/ffs_repair_recovery_smoke.sh",
-      "required_categories": [
-        "happy",
-        "corruption",
-        "recovery",
-        "error"
-      ],
+      "required_categories": ["happy", "corruption", "recovery", "error"],
       "scenarios": [
         {
           "id": "repair_recovery_fixture_image_prepared",
@@ -8029,12 +7561,7 @@
     {
       "suite_id": "ffs_self_healing_demo",
       "script": "scripts/e2e/ffs_self_healing_demo.sh",
-      "required_categories": [
-        "happy",
-        "corruption",
-        "recovery",
-        "error"
-      ],
+      "required_categories": ["happy", "corruption", "recovery", "error"],
       "scenarios": [
         {
           "id": "self_healing_demo_e2e_suite",
@@ -8083,11 +7610,7 @@
     {
       "suite_id": "ffs_xfstests_regression_gate",
       "script": "scripts/e2e/ffs_xfstests_regression_gate.sh",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ],
+      "required_categories": ["happy", "edge", "error"],
       "scenarios": [
         {
           "id": "xfstests_regression_existing_results",
@@ -8118,10 +7641,7 @@
     {
       "suite_id": "ffs_crash_replay_refinement",
       "script": "scripts/e2e/ffs_crash_replay_refinement_e2e.sh",
-      "required_categories": [
-        "happy",
-        "recovery"
-      ],
+      "required_categories": ["happy", "recovery"],
       "scenarios": [
         {
           "id": "crash_replay_minimized_artifacts",
@@ -8176,10 +7696,7 @@
     {
       "suite_id": "ffs_runtime_console",
       "script": "scripts/e2e/ffs_runtime_console_e2e.sh",
-      "required_categories": [
-        "happy",
-        "error"
-      ],
+      "required_categories": ["happy", "error"],
       "scenarios": [
         {
           "id": "runtime_console_managed_clean_shutdown",
@@ -8246,10 +7763,7 @@
     {
       "suite_id": "ffs_numa_allocation_placement",
       "script": "scripts/e2e/ffs_numa_allocation_placement_e2e.sh",
-      "required_categories": [
-        "happy",
-        "error"
-      ],
+      "required_categories": ["happy", "error"],
       "scenarios": [
         {
           "id": "numa_placement_balanced_numa_replay",
@@ -8317,69 +7831,31 @@
   "gate_minimums": [
     {
       "gate_id": "bd-h6nz.1",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error",
-        "corruption",
-        "recovery"
-      ]
+      "required_categories": ["happy", "edge", "error", "corruption", "recovery"]
     },
     {
       "gate_id": "bd-h6nz.2",
-      "required_categories": [
-        "happy",
-        "error",
-        "unsupported_op"
-      ]
+      "required_categories": ["happy", "error", "unsupported_op"]
     },
     {
       "gate_id": "bd-h6nz.3",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error",
-        "corruption",
-        "recovery",
-        "unsupported_op"
-      ]
+      "required_categories": ["happy", "edge", "error", "corruption", "recovery", "unsupported_op"]
     },
     {
       "gate_id": "bd-h6nz.4",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error",
-        "corruption",
-        "recovery",
-        "degradation"
-      ]
+      "required_categories": ["happy", "edge", "error", "corruption", "recovery", "degradation"]
     },
     {
       "gate_id": "bd-h6nz.5",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error",
-        "degradation"
-      ]
+      "required_categories": ["happy", "edge", "error", "degradation"]
     },
     {
       "gate_id": "bd-h6nz.6",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error"
-      ]
+      "required_categories": ["happy", "edge", "error"]
     },
     {
       "gate_id": "bd-h6nz.7",
-      "required_categories": [
-        "happy",
-        "edge",
-        "error",
-        "recovery"
-      ]
+      "required_categories": ["happy", "edge", "error", "recovery"]
     },
     {
       "gate_id": "bd-h6nz.9",

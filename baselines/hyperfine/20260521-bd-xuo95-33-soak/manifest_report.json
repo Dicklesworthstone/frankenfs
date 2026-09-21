@@ -4,11 +4,7 @@
   "valid": true,
   "profile_count": 4,
   "workload_count": 7,
-  "long_profile_ids": [
-    "nightly",
-    "stress",
-    "canary"
-  ],
+  "long_profile_ids": ["nightly", "stress", "canary"],
   "required_environment_fields": [
     "campaign_id",
     "git_sha",

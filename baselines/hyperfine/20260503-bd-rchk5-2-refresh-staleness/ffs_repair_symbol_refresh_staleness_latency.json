@@ -2,19 +2,13 @@
   "results": [
     {
       "command": "cargo bench --profile release-perf -p ffs-repair --bench scrub_codec -- repair_symbol_refresh_staleness_latency",
-      "mean": 6.5756E-8,
-      "stddev": 4.18E-10,
-      "median": 6.5756E-8,
-      "min": 6.4962E-8,
-      "max": 6.6601E-8,
-      "times": [
-        6.4962E-8,
-        6.5756E-8,
-        6.6601E-8
-      ],
-      "exit_codes": [
-        0
-      ]
+      "mean": 6.5756e-8,
+      "stddev": 4.18e-10,
+      "median": 6.5756e-8,
+      "min": 6.4962e-8,
+      "max": 6.6601e-8,
+      "times": [6.4962e-8, 6.5756e-8, 6.6601e-8],
+      "exit_codes": [0]
     }
   ],
   "benchmark_mode": "criterion_once",

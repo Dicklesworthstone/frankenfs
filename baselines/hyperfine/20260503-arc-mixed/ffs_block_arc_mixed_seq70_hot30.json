@@ -2,25 +2,19 @@
   "results": [
     {
       "command": "rch exec -- cargo bench --profile release-perf -p ffs-block --bench arc_cache -- block_cache_arc_mixed_seq70_hot30",
-      "mean": 0.014820000000,
+      "mean": 0.01482,
       "stddev": 0.000096683673,
-      "median": 0.014820000000,
-      "min": 0.014645000000,
-      "max": 0.015024000000,
-      "times": [
-        0.014645000000,
-        0.014820000000,
-        0.015024000000
-      ],
-      "exit_codes": [
-        0
-      ]
+      "median": 0.01482,
+      "min": 0.014645,
+      "max": 0.015024,
+      "times": [0.014645, 0.01482, 0.015024],
+      "exit_codes": [0]
     }
   ],
   "benchmark_mode": "criterion_once",
   "measurement_source": "criterion_estimate",
   "criterion_estimate_source": "baselines/hyperfine/20260503-arc-mixed/ffs_block_arc_mixed_seq70_hot30.stderr",
-  "wall_time_seconds": 20.053021440,
+  "wall_time_seconds": 20.05302144,
   "command_stdout": "baselines/hyperfine/20260503-arc-mixed/ffs_block_arc_mixed_seq70_hot30.stdout",
   "command_stderr": "baselines/hyperfine/20260503-arc-mixed/ffs_block_arc_mixed_seq70_hot30.stderr",
   "text_report": "baselines/hyperfine/20260503-arc-mixed/ffs_block_arc_mixed_seq70_hot30.txt",

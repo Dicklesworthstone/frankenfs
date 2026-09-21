@@ -7,9 +7,7 @@
     "filesystem_flavor": "generic",
     "v1_scope_mapping": "README.md#v1-filesystem-scope",
     "expected_operation_class": "directory_mutation",
-    "operation_class_tags": [
-      "rw_file_lifecycle"
-    ],
+    "operation_class_tags": ["rw_file_lifecycle"],
     "user_risk_category": "namespace_integrity",
     "expected_outcome": "expected_pass",
     "selection_decision": "selected",
@@ -22,10 +20,7 @@
       "junit.xml",
       "check.log"
     ],
-    "required_capabilities": [
-      "fuse_mount",
-      "xfstests_generic_case"
-    ],
+    "required_capabilities": ["fuse_mount", "xfstests_generic_case"],
     "classification": "product_actionable",
     "scope_reference": "README.md#v1-filesystem-scope",
     "tracker_id": "bd-rchk3.2.1",
@@ -39,22 +34,11 @@
       "test_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/generic-001.test.img",
       "scratch_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/generic-001.scratch.img",
       "image_hash": "sha256:plan-fixture-generic-001",
-      "helper_binaries": [
-        "xfstests/check",
-        "ffs-cli",
-        "fusermount3"
-      ],
-      "required_privileges": [
-        "none",
-        "fuse_mount"
-      ],
+      "helper_binaries": ["xfstests/check", "ffs-cli", "fusermount3"],
+      "required_privileges": ["none", "fuse_mount"],
       "mutation_surface": "dry-run command selection for a temp-root FUSE scratch mount",
       "cleanup_action": "umount temp mountpoint if mounted; remove temp scratch root",
-      "argv": [
-        "./check",
-        "-n",
-        "generic/001"
-      ],
+      "argv": ["./check", "-n", "generic/001"],
       "destructive": false,
       "expected_plan_outcome": "dry_run_only",
       "command_summary": "dry-run generic/001 xfstests command under temp-root FUSE placeholders"
@@ -81,11 +65,7 @@
       "junit.xml",
       "check.log"
     ],
-    "required_capabilities": [
-      "fuse_mount",
-      "readonly_remount",
-      "built_xfstests"
-    ],
+    "required_capabilities": ["fuse_mount", "readonly_remount", "built_xfstests"],
     "classification": "environment_blocked",
     "scope_reference": "README.md#v1-filesystem-scope",
     "tracker_id": "bd-rchk3.2.1",
@@ -99,23 +79,11 @@
       "test_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/generic-003.test.img",
       "scratch_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/generic-003.scratch.img",
       "image_hash": "sha256:plan-fixture-generic-003",
-      "helper_binaries": [
-        "xfstests/check",
-        "ffs-cli",
-        "mount"
-      ],
-      "required_privileges": [
-        "none",
-        "fuse_mount",
-        "host_tooling"
-      ],
+      "helper_binaries": ["xfstests/check", "ffs-cli", "mount"],
+      "required_privileges": ["none", "fuse_mount", "host_tooling"],
       "mutation_surface": "dry-run command selection for readonly remount preflight under temp root",
       "cleanup_action": "umount temp mountpoint if mounted; remove temp scratch root",
-      "argv": [
-        "./check",
-        "-n",
-        "generic/003"
-      ],
+      "argv": ["./check", "-n", "generic/003"],
       "destructive": false,
       "expected_plan_outcome": "host_skip",
       "command_summary": "host-skip generic/003 xfstests command until readonly remount prerequisites exist"
@@ -129,10 +97,7 @@
     "filesystem_flavor": "generic",
     "v1_scope_mapping": "README.md#v1-filesystem-scope",
     "expected_operation_class": "rw_file_lifecycle",
-    "operation_class_tags": [
-      "directory_mutation",
-      "rename_link_semantics"
-    ],
+    "operation_class_tags": ["directory_mutation", "rename_link_semantics"],
     "user_risk_category": "data_integrity",
     "expected_outcome": "expected_pass",
     "selection_decision": "selected",
@@ -145,10 +110,7 @@
       "junit.xml",
       "check.log"
     ],
-    "required_capabilities": [
-      "fuse_mount",
-      "xfstests_generic_case"
-    ],
+    "required_capabilities": ["fuse_mount", "xfstests_generic_case"],
     "classification": "product_actionable",
     "scope_reference": "README.md#v1-filesystem-scope",
     "tracker_id": "bd-rchk3.2.1",
@@ -162,22 +124,11 @@
       "test_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/generic-013.test.img",
       "scratch_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/generic-013.scratch.img",
       "image_hash": "sha256:plan-fixture-generic-013",
-      "helper_binaries": [
-        "xfstests/check",
-        "fsstress",
-        "fusermount3"
-      ],
-      "required_privileges": [
-        "none",
-        "fuse_mount"
-      ],
+      "helper_binaries": ["xfstests/check", "fsstress", "fusermount3"],
+      "required_privileges": ["none", "fuse_mount"],
       "mutation_surface": "dry-run command selection for fsstress lifecycle operations under temp root",
       "cleanup_action": "umount temp mountpoint if mounted; remove temp scratch root",
-      "argv": [
-        "./check",
-        "-n",
-        "generic/013"
-      ],
+      "argv": ["./check", "-n", "generic/013"],
       "destructive": false,
       "expected_plan_outcome": "dry_run_only",
       "command_summary": "dry-run generic/013 fsstress command under temp-root FUSE placeholders"
@@ -204,11 +155,7 @@
       "junit.xml",
       "check.log"
     ],
-    "required_capabilities": [
-      "fuse_mount",
-      "xfs_io_mremap",
-      "mmap_consistency"
-    ],
+    "required_capabilities": ["fuse_mount", "xfs_io_mremap", "mmap_consistency"],
     "classification": "product_actionable",
     "scope_reference": "README.md#v1-filesystem-scope",
     "tracker_id": "bd-rchk3.2.1",
@@ -222,23 +169,11 @@
       "test_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/generic-030.test.img",
       "scratch_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/generic-030.scratch.img",
       "image_hash": "sha256:plan-fixture-generic-030",
-      "helper_binaries": [
-        "xfstests/check",
-        "xfs_io",
-        "fusermount3"
-      ],
-      "required_privileges": [
-        "none",
-        "fuse_mount",
-        "host_tooling"
-      ],
+      "helper_binaries": ["xfstests/check", "xfs_io", "fusermount3"],
+      "required_privileges": ["none", "fuse_mount", "host_tooling"],
       "mutation_surface": "dry-run command selection for mmap consistency probe under temp root",
       "cleanup_action": "umount temp mountpoint if mounted; remove temp scratch root",
-      "argv": [
-        "./check",
-        "-n",
-        "generic/030"
-      ],
+      "argv": ["./check", "-n", "generic/030"],
       "destructive": false,
       "expected_plan_outcome": "product_failure",
       "command_summary": "dry-run generic/030 mmap consistency command with product-failure classification"
@@ -252,9 +187,7 @@
     "filesystem_flavor": "generic",
     "v1_scope_mapping": "README.md#v1-filesystem-scope",
     "expected_operation_class": "rename_link_semantics",
-    "operation_class_tags": [
-      "directory_mutation"
-    ],
+    "operation_class_tags": ["directory_mutation"],
     "user_risk_category": "namespace_integrity",
     "expected_outcome": "expected_pass",
     "selection_decision": "selected",
@@ -267,10 +200,7 @@
       "junit.xml",
       "check.log"
     ],
-    "required_capabilities": [
-      "fuse_mount",
-      "rename_overwrite"
-    ],
+    "required_capabilities": ["fuse_mount", "rename_overwrite"],
     "classification": "product_actionable",
     "scope_reference": "README.md#v1-filesystem-scope",
     "tracker_id": "bd-rchk3.2.1",
@@ -284,22 +214,11 @@
       "test_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/generic-035.test.img",
       "scratch_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/generic-035.scratch.img",
       "image_hash": "sha256:plan-fixture-generic-035",
-      "helper_binaries": [
-        "xfstests/check",
-        "ffs-cli",
-        "fusermount3"
-      ],
-      "required_privileges": [
-        "none",
-        "fuse_mount"
-      ],
+      "helper_binaries": ["xfstests/check", "ffs-cli", "fusermount3"],
+      "required_privileges": ["none", "fuse_mount"],
       "mutation_surface": "dry-run command selection for overwriting rename probe under temp root",
       "cleanup_action": "umount temp mountpoint if mounted; remove temp scratch root",
-      "argv": [
-        "./check",
-        "-n",
-        "generic/035"
-      ],
+      "argv": ["./check", "-n", "generic/035"],
       "destructive": false,
       "expected_plan_outcome": "dry_run_only",
       "command_summary": "dry-run generic/035 rename overwrite command under temp-root placeholders"
@@ -326,12 +245,7 @@
       "junit.xml",
       "check.log"
     ],
-    "required_capabilities": [
-      "fuse_mount",
-      "setfattr",
-      "getfattr",
-      "built_xfstests"
-    ],
+    "required_capabilities": ["fuse_mount", "setfattr", "getfattr", "built_xfstests"],
     "classification": "environment_blocked",
     "scope_reference": "README.md#v1-filesystem-scope",
     "tracker_id": "bd-rchk3.2.1",
@@ -345,23 +259,11 @@
       "test_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/generic-062.test.img",
       "scratch_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/generic-062.scratch.img",
       "image_hash": "sha256:plan-fixture-generic-062",
-      "helper_binaries": [
-        "xfstests/check",
-        "setfattr",
-        "getfattr"
-      ],
-      "required_privileges": [
-        "none",
-        "fuse_mount",
-        "host_tooling"
-      ],
+      "helper_binaries": ["xfstests/check", "setfattr", "getfattr"],
+      "required_privileges": ["none", "fuse_mount", "host_tooling"],
       "mutation_surface": "dry-run command selection for xattr helper probe under temp root",
       "cleanup_action": "umount temp mountpoint if mounted; remove temp scratch root",
-      "argv": [
-        "./check",
-        "-n",
-        "generic/062"
-      ],
+      "argv": ["./check", "-n", "generic/062"],
       "destructive": false,
       "expected_plan_outcome": "host_skip",
       "command_summary": "host-skip generic/062 xattr command until attr helpers are available"
@@ -388,10 +290,7 @@
       "junit.xml",
       "check.log"
     ],
-    "required_capabilities": [
-      "fuse_mount",
-      "fifreeze_ioctl"
-    ],
+    "required_capabilities": ["fuse_mount", "fifreeze_ioctl"],
     "classification": "unsupported_by_v1",
     "scope_reference": "README.md#allowed-deferrals-and-non-goals",
     "tracker_id": "bd-rchk3.2.1",
@@ -405,23 +304,11 @@
       "test_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/generic-068.test.img",
       "scratch_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/generic-068.scratch.img",
       "image_hash": "sha256:plan-fixture-generic-068",
-      "helper_binaries": [
-        "xfstests/check",
-        "xfs_freeze",
-        "fusermount3"
-      ],
-      "required_privileges": [
-        "none",
-        "fuse_mount",
-        "cap_sys_admin"
-      ],
+      "helper_binaries": ["xfstests/check", "xfs_freeze", "fusermount3"],
+      "required_privileges": ["none", "fuse_mount", "cap_sys_admin"],
       "mutation_surface": "no product mutation; unsupported FIFREEZE host capability is classified before execution",
       "cleanup_action": "skip without mount; remove temp scratch root",
-      "argv": [
-        "./check",
-        "-n",
-        "generic/068"
-      ],
+      "argv": ["./check", "-n", "generic/068"],
       "destructive": false,
       "expected_plan_outcome": "unsupported_by_scope",
       "command_summary": "scope-skip generic/068 freeze command before any host mutation"
@@ -448,11 +335,7 @@
       "junit.xml",
       "check.log"
     ],
-    "required_capabilities": [
-      "fuse_mount",
-      "aio_stress",
-      "preallocation"
-    ],
+    "required_capabilities": ["fuse_mount", "aio_stress", "preallocation"],
     "classification": "environment_blocked",
     "scope_reference": "README.md#whats-next",
     "tracker_id": "bd-rchk3.1",
@@ -466,23 +349,11 @@
       "test_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/generic-112.test.img",
       "scratch_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/generic-112.scratch.img",
       "image_hash": "sha256:plan-fixture-generic-112",
-      "helper_binaries": [
-        "xfstests/check",
-        "aio-stress",
-        "xfs_io"
-      ],
-      "required_privileges": [
-        "none",
-        "fuse_mount",
-        "host_tooling"
-      ],
+      "helper_binaries": ["xfstests/check", "aio-stress", "xfs_io"],
+      "required_privileges": ["none", "fuse_mount", "host_tooling"],
       "mutation_surface": "dry-run command selection for aio/preallocation host-helper probe under temp root",
       "cleanup_action": "umount temp mountpoint if mounted; remove temp scratch root",
-      "argv": [
-        "./check",
-        "-n",
-        "generic/112"
-      ],
+      "argv": ["./check", "-n", "generic/112"],
       "destructive": false,
       "expected_plan_outcome": "host_skip",
       "command_summary": "host-skip generic/112 aio/preallocation command until helpers are available"
@@ -509,10 +380,7 @@
       "junit.xml",
       "check.log"
     ],
-    "required_capabilities": [
-      "fuse_mount",
-      "kernel_quota_integration"
-    ],
+    "required_capabilities": ["fuse_mount", "kernel_quota_integration"],
     "classification": "unsupported_by_v1",
     "scope_reference": "README.md#allowed-deferrals-and-non-goals",
     "tracker_id": "bd-rchk3.2.1",
@@ -526,23 +394,11 @@
       "test_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/generic-231.test.img",
       "scratch_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/generic-231.scratch.img",
       "image_hash": "sha256:plan-fixture-generic-231",
-      "helper_binaries": [
-        "xfstests/check",
-        "quotaon",
-        "fusermount3"
-      ],
-      "required_privileges": [
-        "none",
-        "fuse_mount",
-        "root_required"
-      ],
+      "helper_binaries": ["xfstests/check", "quotaon", "fusermount3"],
+      "required_privileges": ["none", "fuse_mount", "root_required"],
       "mutation_surface": "no product mutation; kernel quota capability is classified before execution",
       "cleanup_action": "skip without mount; remove temp scratch root",
-      "argv": [
-        "./check",
-        "-n",
-        "generic/231"
-      ],
+      "argv": ["./check", "-n", "generic/231"],
       "destructive": false,
       "expected_plan_outcome": "unsupported_by_scope",
       "command_summary": "scope-skip generic/231 quota command before any host mutation"
@@ -556,9 +412,7 @@
     "filesystem_flavor": "generic",
     "v1_scope_mapping": "README.md#v1-filesystem-scope",
     "expected_operation_class": "fsync_boundary",
-    "operation_class_tags": [
-      "rename_link_semantics"
-    ],
+    "operation_class_tags": ["rename_link_semantics"],
     "user_risk_category": "data_integrity",
     "expected_outcome": "environment_blocked",
     "selection_decision": "selected",
@@ -571,11 +425,7 @@
       "junit.xml",
       "check.log"
     ],
-    "required_capabilities": [
-      "fuse_mount",
-      "xfs_io_fsync",
-      "built_xfstests"
-    ],
+    "required_capabilities": ["fuse_mount", "xfs_io_fsync", "built_xfstests"],
     "classification": "environment_blocked",
     "scope_reference": "README.md#v1-filesystem-scope",
     "tracker_id": "bd-rchk3.2.1",
@@ -589,23 +439,11 @@
       "test_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/generic-321.test.img",
       "scratch_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/generic-321.scratch.img",
       "image_hash": "sha256:plan-fixture-generic-321",
-      "helper_binaries": [
-        "xfstests/check",
-        "xfs_io",
-        "fusermount3"
-      ],
-      "required_privileges": [
-        "none",
-        "fuse_mount",
-        "host_tooling"
-      ],
+      "helper_binaries": ["xfstests/check", "xfs_io", "fusermount3"],
+      "required_privileges": ["none", "fuse_mount", "host_tooling"],
       "mutation_surface": "dry-run command selection for fsync boundary probe under temp root",
       "cleanup_action": "umount temp mountpoint if mounted; remove temp scratch root",
-      "argv": [
-        "./check",
-        "-n",
-        "generic/321"
-      ],
+      "argv": ["./check", "-n", "generic/321"],
       "destructive": false,
       "expected_plan_outcome": "host_skip",
       "command_summary": "host-skip generic/321 fsyncdir command until helpers are available"
@@ -632,11 +470,7 @@
       "junit.xml",
       "check.log"
     ],
-    "required_capabilities": [
-      "fuse_writeback_cache",
-      "xfs_io_fsync",
-      "page_writeback_race"
-    ],
+    "required_capabilities": ["fuse_writeback_cache", "xfs_io_fsync", "page_writeback_race"],
     "classification": "unsupported_by_v1",
     "scope_reference": "README.md#allowed-deferrals-and-non-goals",
     "tracker_id": "bd-rchk3.2.1",
@@ -650,23 +484,11 @@
       "test_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/generic-524.test.img",
       "scratch_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/generic-524.scratch.img",
       "image_hash": "sha256:plan-fixture-generic-524",
-      "helper_binaries": [
-        "xfstests/check",
-        "xfs_io",
-        "fusermount3"
-      ],
-      "required_privileges": [
-        "none",
-        "fuse_mount",
-        "host_tooling"
-      ],
+      "helper_binaries": ["xfstests/check", "xfs_io", "fusermount3"],
+      "required_privileges": ["none", "fuse_mount", "host_tooling"],
       "mutation_surface": "no product mutation; writeback-cache race is classified before execution",
       "cleanup_action": "skip without mount; remove temp scratch root",
-      "argv": [
-        "./check",
-        "-n",
-        "generic/524"
-      ],
+      "argv": ["./check", "-n", "generic/524"],
       "destructive": false,
       "expected_plan_outcome": "unsupported_by_scope",
       "command_summary": "scope-skip generic/524 writeback-cache command before any host mutation"
@@ -693,12 +515,7 @@
       "junit.xml",
       "check.log"
     ],
-    "required_capabilities": [
-      "fuse_mount",
-      "fallocate_zero_range",
-      "fiemap",
-      "built_xfstests"
-    ],
+    "required_capabilities": ["fuse_mount", "fallocate_zero_range", "fiemap", "built_xfstests"],
     "classification": "environment_blocked",
     "scope_reference": "README.md#v1-filesystem-scope",
     "tracker_id": "bd-rchk3.1",
@@ -712,23 +529,11 @@
       "test_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/ext4-001.test.img",
       "scratch_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/ext4-001.scratch.img",
       "image_hash": "sha256:plan-fixture-ext4-001",
-      "helper_binaries": [
-        "xfstests/check",
-        "xfs_io",
-        "filefrag"
-      ],
-      "required_privileges": [
-        "none",
-        "fuse_mount",
-        "host_tooling"
-      ],
+      "helper_binaries": ["xfstests/check", "xfs_io", "filefrag"],
+      "required_privileges": ["none", "fuse_mount", "host_tooling"],
       "mutation_surface": "dry-run command selection for zero-range and fiemap probe under temp root",
       "cleanup_action": "umount temp mountpoint if mounted; remove temp scratch root",
-      "argv": [
-        "./check",
-        "-n",
-        "ext4/001"
-      ],
+      "argv": ["./check", "-n", "ext4/001"],
       "destructive": false,
       "expected_plan_outcome": "host_skip",
       "command_summary": "host-skip ext4/001 ioctl command until ext4 xfstests helpers are available"
@@ -755,11 +560,7 @@
       "junit.xml",
       "check.log"
     ],
-    "required_capabilities": [
-      "fuse_mount",
-      "scratch_device",
-      "mkfs_ext4_bigalloc"
-    ],
+    "required_capabilities": ["fuse_mount", "scratch_device", "mkfs_ext4_bigalloc"],
     "classification": "environment_blocked",
     "scope_reference": "README.md#allowed-deferrals-and-non-goals",
     "tracker_id": "bd-rchk3.1",
@@ -773,24 +574,11 @@
       "test_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/ext4-003.test.img",
       "scratch_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/ext4-003.scratch.img",
       "image_hash": "sha256:plan-fixture-ext4-003",
-      "helper_binaries": [
-        "xfstests/check",
-        "mkfs.ext4",
-        "fusermount3"
-      ],
-      "required_privileges": [
-        "none",
-        "fuse_mount",
-        "scratch_device",
-        "root_required"
-      ],
+      "helper_binaries": ["xfstests/check", "mkfs.ext4", "fusermount3"],
+      "required_privileges": ["none", "fuse_mount", "scratch_device", "root_required"],
       "mutation_surface": "dry-run command selection for bigalloc scratch-device preflight under temp root",
       "cleanup_action": "skip without scratch device; remove temp scratch root",
-      "argv": [
-        "./check",
-        "-n",
-        "ext4/003"
-      ],
+      "argv": ["./check", "-n", "ext4/003"],
       "destructive": false,
       "expected_plan_outcome": "host_skip",
       "command_summary": "host-skip ext4/003 ioctl command until ext4 xfstests helpers are available"
@@ -817,11 +605,7 @@
       "junit.xml",
       "check.log"
     ],
-    "required_capabilities": [
-      "fuse_mount",
-      "chattr_extent_conversion",
-      "legacy_non_extent_format"
-    ],
+    "required_capabilities": ["fuse_mount", "chattr_extent_conversion", "legacy_non_extent_format"],
     "classification": "unsupported_by_v1",
     "scope_reference": "README.md#v1-filesystem-scope",
     "tracker_id": "bd-rchk3.2.1",
@@ -835,23 +619,11 @@
       "test_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/ext4-005.test.img",
       "scratch_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/ext4-005.scratch.img",
       "image_hash": "sha256:plan-fixture-ext4-005",
-      "helper_binaries": [
-        "xfstests/check",
-        "chattr",
-        "fusermount3"
-      ],
-      "required_privileges": [
-        "none",
-        "fuse_mount",
-        "host_tooling"
-      ],
+      "helper_binaries": ["xfstests/check", "chattr", "fusermount3"],
+      "required_privileges": ["none", "fuse_mount", "host_tooling"],
       "mutation_surface": "no product mutation; legacy non-extent conversion is classified before execution",
       "cleanup_action": "skip unsupported extent conversion; remove temp scratch root",
-      "argv": [
-        "./check",
-        "-n",
-        "ext4/005"
-      ],
+      "argv": ["./check", "-n", "ext4/005"],
       "destructive": false,
       "expected_plan_outcome": "unsupported_by_scope",
       "command_summary": "scope-skip ext4/005 extent-flag conversion command before host mutation"
@@ -878,11 +650,7 @@
       "junit.xml",
       "check.log"
     ],
-    "required_capabilities": [
-      "fuse_mount",
-      "debugfs",
-      "raw_device_corruption"
-    ],
+    "required_capabilities": ["fuse_mount", "debugfs", "raw_device_corruption"],
     "classification": "unsupported_by_v1",
     "scope_reference": "README.md#allowed-deferrals-and-non-goals",
     "tracker_id": "bd-rchk3.2.1",
@@ -896,24 +664,11 @@
       "test_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/ext4-013.test.img",
       "scratch_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/ext4-013.scratch.img",
       "image_hash": "sha256:plan-fixture-ext4-013",
-      "helper_binaries": [
-        "xfstests/check",
-        "debugfs",
-        "fusermount3"
-      ],
-      "required_privileges": [
-        "none",
-        "fuse_mount",
-        "scratch_device",
-        "root_required"
-      ],
+      "helper_binaries": ["xfstests/check", "debugfs", "fusermount3"],
+      "required_privileges": ["none", "fuse_mount", "scratch_device", "root_required"],
       "mutation_surface": "no product mutation; raw-device corruption helper is classified before execution",
       "cleanup_action": "skip raw-device corruption lane; remove temp scratch root",
-      "argv": [
-        "./check",
-        "-n",
-        "ext4/013"
-      ],
+      "argv": ["./check", "-n", "ext4/013"],
       "destructive": false,
       "expected_plan_outcome": "unsupported_by_scope",
       "command_summary": "scope-skip ext4/013 module-level command before host mutation"
@@ -927,10 +682,7 @@
     "filesystem_flavor": "btrfs",
     "v1_scope_mapping": "README.md#v1-filesystem-scope",
     "expected_operation_class": "directory_mutation",
-    "operation_class_tags": [
-      "read_only_mount",
-      "rw_file_lifecycle"
-    ],
+    "operation_class_tags": ["read_only_mount", "rw_file_lifecycle"],
     "user_risk_category": "namespace_integrity",
     "expected_outcome": "environment_blocked",
     "selection_decision": "selected",
@@ -962,24 +714,11 @@
       "test_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/btrfs-001.test.img",
       "scratch_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/btrfs-001.scratch.img",
       "image_hash": "sha256:plan-fixture-btrfs-001",
-      "helper_binaries": [
-        "xfstests/check",
-        "btrfs",
-        "ffs-cli",
-        "fusermount3"
-      ],
-      "required_privileges": [
-        "none",
-        "fuse_mount",
-        "host_tooling"
-      ],
+      "helper_binaries": ["xfstests/check", "btrfs", "ffs-cli", "fusermount3"],
+      "required_privileges": ["none", "fuse_mount", "host_tooling"],
       "mutation_surface": "dry-run command selection for btrfs subvolume and snapshot coverage under temp-root FUSE placeholders",
       "cleanup_action": "skip real btrfs utility mutation until permissioned lane; remove temp scratch root",
-      "argv": [
-        "./check",
-        "-n",
-        "btrfs/001"
-      ],
+      "argv": ["./check", "-n", "btrfs/001"],
       "destructive": false,
       "expected_plan_outcome": "host_skip",
       "command_summary": "host-skip btrfs/001 subvolume/snapshot command until btrfs scratch prerequisites exist"
@@ -993,10 +732,7 @@
     "filesystem_flavor": "btrfs",
     "v1_scope_mapping": "README.md#allowed-deferrals-and-non-goals",
     "expected_operation_class": "host_capability_skip",
-    "operation_class_tags": [
-      "directory_mutation",
-      "xattr_semantics"
-    ],
+    "operation_class_tags": ["directory_mutation", "xattr_semantics"],
     "user_risk_category": "unsupported_feature",
     "expected_outcome": "unsupported_by_v1",
     "selection_decision": "selected",
@@ -1009,12 +745,7 @@
       "junit.xml",
       "check.log"
     ],
-    "required_capabilities": [
-      "fuse_mount",
-      "btrfs_progs",
-      "btrfs_send_receive",
-      "built_xfstests"
-    ],
+    "required_capabilities": ["fuse_mount", "btrfs_progs", "btrfs_send_receive", "built_xfstests"],
     "classification": "unsupported_by_v1",
     "scope_reference": "README.md#allowed-deferrals-and-non-goals",
     "tracker_id": "bd-naww5",
@@ -1028,24 +759,11 @@
       "test_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/btrfs-008.test.img",
       "scratch_device": "${TMPDIR:-/tmp}/frankenfs-xfstests/devices/btrfs-008.scratch.img",
       "image_hash": "sha256:plan-fixture-btrfs-008",
-      "helper_binaries": [
-        "xfstests/check",
-        "btrfs",
-        "ffs-cli",
-        "fusermount3"
-      ],
-      "required_privileges": [
-        "none",
-        "fuse_mount",
-        "host_tooling"
-      ],
+      "helper_binaries": ["xfstests/check", "btrfs", "ffs-cli", "fusermount3"],
+      "required_privileges": ["none", "fuse_mount", "host_tooling"],
       "mutation_surface": "no product mutation; btrfs send/receive apply parity is classified before execution",
       "cleanup_action": "skip unsupported send/receive apply lane; remove temp scratch root",
-      "argv": [
-        "./check",
-        "-n",
-        "btrfs/008"
-      ],
+      "argv": ["./check", "-n", "btrfs/008"],
       "destructive": false,
       "expected_plan_outcome": "unsupported_by_scope",
       "command_summary": "scope-skip btrfs/008 send/receive command before host mutation"

@@ -1,21 +1,21 @@
 {
   "size": 64,
   "writes": [
-    {"offset":  0, "hex": "05000000"},
-    {"offset":  4, "hex": "06000000"},
-    {"offset":  8, "hex": "07000000"},
-    {"offset": 12, "hex": "c800"},
-    {"offset": 14, "hex": "e803"},
-    {"offset": 16, "hex": "0300"},
-    {"offset": 18, "hex": "0400"},
-    {"offset": 28, "hex": "f401"},
-    {"offset": 30, "hex": "5678"},
-    {"offset": 32, "hex": "01000000"},
-    {"offset": 36, "hex": "02000000"},
-    {"offset": 40, "hex": "03000000"},
-    {"offset": 44, "hex": "0a00"},
-    {"offset": 46, "hex": "1400"},
-    {"offset": 48, "hex": "0500"},
-    {"offset": 50, "hex": "6400"}
+    { "offset": 0, "hex": "05000000" },
+    { "offset": 4, "hex": "06000000" },
+    { "offset": 8, "hex": "07000000" },
+    { "offset": 12, "hex": "c800" },
+    { "offset": 14, "hex": "e803" },
+    { "offset": 16, "hex": "0300" },
+    { "offset": 18, "hex": "0400" },
+    { "offset": 28, "hex": "f401" },
+    { "offset": 30, "hex": "5678" },
+    { "offset": 32, "hex": "01000000" },
+    { "offset": 36, "hex": "02000000" },
+    { "offset": 40, "hex": "03000000" },
+    { "offset": 44, "hex": "0a00" },
+    { "offset": 46, "hex": "1400" },
+    { "offset": 48, "hex": "0500" },
+    { "offset": 50, "hex": "6400" }
   ]
 }

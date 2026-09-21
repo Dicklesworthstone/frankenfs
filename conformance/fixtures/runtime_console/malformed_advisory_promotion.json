@@ -39,9 +39,7 @@
     "report_id": "adaptive_runtime_runner_report",
     "runtime_controls_accepted": true
   },
-  "artifact_paths": [
-    "artifacts/runtime-console/malformed_advisory_promotion.json"
-  ],
+  "artifact_paths": ["artifacts/runtime-console/malformed_advisory_promotion.json"],
   "cleanup_status": "clean",
   "reproduction_command": "ffs mount image.img /mnt --runtime-mode per-core --read-write --console",
   "product_evidence_claim": "swarm.responsiveness",

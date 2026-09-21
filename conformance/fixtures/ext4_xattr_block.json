@@ -2,31 +2,47 @@
   "description": "ext4 external xattr block (4096 bytes) with user.mime and security.selinux attrs",
   "size": 4096,
   "writes": [
-    {"offset":   0, "hex": "000002ea", "_comment": "magic = 0xEA020000 little-endian"},
-    {"offset":   4, "hex": "01000000", "_comment": "refcount = 1"},
-    {"offset":   8, "hex": "01000000", "_comment": "blocks = 1"},
-    {"offset":  12, "hex": "00000000", "_comment": "hash = 0"},
-    {"offset":  16, "hex": "00000000000000000000000000000000", "_comment": "reserved (16 bytes)"},
+    { "offset": 0, "hex": "000002ea", "_comment": "magic = 0xEA020000 little-endian" },
+    { "offset": 4, "hex": "01000000", "_comment": "refcount = 1" },
+    { "offset": 8, "hex": "01000000", "_comment": "blocks = 1" },
+    { "offset": 12, "hex": "00000000", "_comment": "hash = 0" },
+    { "offset": 16, "hex": "00000000000000000000000000000000", "_comment": "reserved (16 bytes)" },
 
-    {"offset":  32, "hex": "04", "_comment": "entry[0]: name_len = 4 ('mime')"},
-    {"offset":  33, "hex": "01", "_comment": "entry[0]: name_index = 1 (EXT4_XATTR_INDEX_USER)"},
-    {"offset":  34, "hex": "f00f", "_comment": "entry[0]: value_offs = 4080 (near end of block)"},
-    {"offset":  36, "hex": "00000000", "_comment": "entry[0]: value_block = 0 (unused)"},
-    {"offset":  40, "hex": "0a000000", "_comment": "entry[0]: value_size = 10 ('text/plain')"},
-    {"offset":  44, "hex": "00000000", "_comment": "entry[0]: hash = 0"},
-    {"offset":  48, "hex": "6d696d65", "_comment": "entry[0]: name = 'mime'"},
+    { "offset": 32, "hex": "04", "_comment": "entry[0]: name_len = 4 ('mime')" },
+    { "offset": 33, "hex": "01", "_comment": "entry[0]: name_index = 1 (EXT4_XATTR_INDEX_USER)" },
+    { "offset": 34, "hex": "f00f", "_comment": "entry[0]: value_offs = 4080 (near end of block)" },
+    { "offset": 36, "hex": "00000000", "_comment": "entry[0]: value_block = 0 (unused)" },
+    { "offset": 40, "hex": "0a000000", "_comment": "entry[0]: value_size = 10 ('text/plain')" },
+    { "offset": 44, "hex": "00000000", "_comment": "entry[0]: hash = 0" },
+    { "offset": 48, "hex": "6d696d65", "_comment": "entry[0]: name = 'mime'" },
 
-    {"offset":  52, "hex": "07", "_comment": "entry[1]: name_len = 7 ('selinux')"},
-    {"offset":  53, "hex": "06", "_comment": "entry[1]: name_index = 6 (EXT4_XATTR_INDEX_SECURITY)"},
-    {"offset":  54, "hex": "d00f", "_comment": "entry[1]: value_offs = 4048"},
-    {"offset":  56, "hex": "00000000", "_comment": "entry[1]: value_block = 0"},
-    {"offset":  60, "hex": "20000000", "_comment": "entry[1]: value_size = 32 ('system_u:object_r:user_home_t:s0')"},
-    {"offset":  64, "hex": "00000000", "_comment": "entry[1]: hash = 0"},
-    {"offset":  68, "hex": "73656c696e7578", "_comment": "entry[1]: name = 'selinux'"},
+    { "offset": 52, "hex": "07", "_comment": "entry[1]: name_len = 7 ('selinux')" },
+    {
+      "offset": 53,
+      "hex": "06",
+      "_comment": "entry[1]: name_index = 6 (EXT4_XATTR_INDEX_SECURITY)"
+    },
+    { "offset": 54, "hex": "d00f", "_comment": "entry[1]: value_offs = 4048" },
+    { "offset": 56, "hex": "00000000", "_comment": "entry[1]: value_block = 0" },
+    {
+      "offset": 60,
+      "hex": "20000000",
+      "_comment": "entry[1]: value_size = 32 ('system_u:object_r:user_home_t:s0')"
+    },
+    { "offset": 64, "hex": "00000000", "_comment": "entry[1]: hash = 0" },
+    { "offset": 68, "hex": "73656c696e7578", "_comment": "entry[1]: name = 'selinux'" },
 
-    {"offset":  76, "hex": "0000", "_comment": "terminator: name_len=0, name_index=0"},
+    { "offset": 76, "hex": "0000", "_comment": "terminator: name_len=0, name_index=0" },
 
-    {"offset": 4048, "hex": "73797374656d5f753a6f626a6563745f723a757365725f686f6d655f743a7330", "_comment": "entry[1] value = 'system_u:object_r:user_home_t:s0' (32 bytes)"},
-    {"offset": 4080, "hex": "746578742f706c61696e", "_comment": "entry[0] value = 'text/plain' (10 bytes)"}
+    {
+      "offset": 4048,
+      "hex": "73797374656d5f753a6f626a6563745f723a757365725f686f6d655f743a7330",
+      "_comment": "entry[1] value = 'system_u:object_r:user_home_t:s0' (32 bytes)"
+    },
+    {
+      "offset": 4080,
+      "hex": "746578742f706c61696e",
+      "_comment": "entry[0] value = 'text/plain' (10 bytes)"
+    }
   ]
 }

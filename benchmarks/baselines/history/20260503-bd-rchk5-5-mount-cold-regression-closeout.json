@@ -44,18 +44,7 @@
     "runs": 10,
     "source_json": "baselines/hyperfine/20260503-bd-rchk5-5-after-final/ffs_cli_mount_cold_probe.json",
     "throughput_ops_sec": 13.030434,
-    "times_us": [
-      84602,
-      72789,
-      74106,
-      76579,
-      75664,
-      74707,
-      75833,
-      83108,
-      76067,
-      73977
-    ]
+    "times_us": [84602, 72789, 74106, 76579, 75664, 74707, 75833, 83108, 76067, 73977]
   },
   "fresh_local_before": {
     "diagnosis": "default read-only background scrub ran during the mount benchmark and inflated process completion time",
@@ -69,18 +58,7 @@
     "runs": 10,
     "source_json": "baselines/hyperfine/20260503-bd-rchk5-5-before/ffs_cli_mount_cold_probe.json",
     "throughput_ops_sec": 3.045682,
-    "times_us": [
-      341225,
-      418325,
-      378362,
-      346915,
-      490597,
-      192051,
-      243765,
-      275065,
-      232581,
-      364452
-    ]
+    "times_us": [341225, 418325, 378362, 346915, 490597, 192051, 243765, 275065, 232581, 364452]
   },
   "generated_at": "2026-05-03T22:02:10.339039Z",
   "isomorphism": {

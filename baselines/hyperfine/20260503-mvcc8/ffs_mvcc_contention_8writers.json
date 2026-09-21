@@ -2,19 +2,13 @@
   "results": [
     {
       "command": "rch exec -- cargo bench --profile release-perf -p ffs-mvcc --bench wal_throughput -- mvcc_contention_8writers",
-      "mean": 0.000010288000,
-      "stddev": 2.09056E-7,
-      "median": 0.000010288000,
-      "min": 0.000009911500,
-      "max": 0.000010731000,
-      "times": [
-        0.000009911500,
-        0.000010288000,
-        0.000010731000
-      ],
-      "exit_codes": [
-        0
-      ]
+      "mean": 0.000010288,
+      "stddev": 2.09056e-7,
+      "median": 0.000010288,
+      "min": 0.0000099115,
+      "max": 0.000010731,
+      "times": [0.0000099115, 0.000010288, 0.000010731],
+      "exit_codes": [0]
     }
   ],
   "benchmark_mode": "criterion_once",

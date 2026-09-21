@@ -66,12 +66,7 @@
     {
       "invariant_id": "I3_dirty_cache_before_repair",
       "description": "Repair writeback must not overwrite a block with dirty client data that has not crossed the fsync/fsyncdir durability boundary.",
-      "required_log_fields": [
-        "operation_id",
-        "scenario_id",
-        "snapshot_epoch",
-        "error_class"
-      ],
+      "required_log_fields": ["operation_id", "scenario_id", "snapshot_epoch", "error_class"],
       "failure_error_class": "dirty_cache_not_fsynced"
     },
     {
@@ -89,12 +84,7 @@
     {
       "invariant_id": "I5_repair_lease_exclusive",
       "description": "Mutating repair must hold an active per-image ownership lease before replacing source blocks or refreshing repair symbols.",
-      "required_log_fields": [
-        "operation_id",
-        "scenario_id",
-        "lease_id",
-        "error_class"
-      ],
+      "required_log_fields": ["operation_id", "scenario_id", "lease_id", "error_class"],
       "failure_error_class": "lease_expired_or_missing"
     },
     {
@@ -172,14 +162,14 @@
     },
     {
       "state_id": "repair_writeback_blocked_rw",
-        "description": "Historical bd-rchk0.1.1 state: read-write mounted repair requested mutation before the unified serializer existed, so the path failed closed.",
+      "description": "Historical bd-rchk0.1.1 state: read-write mounted repair requested mutation before the unified serializer existed, so the path failed closed.",
       "client_writes_allowed": true,
       "repair_writeback_allowed": false,
       "mutates_image": false
     },
     {
       "state_id": "repair_writeback_staged",
-        "description": "Decoded block writeback is staged behind the same serializer used by client writes.",
+      "description": "Decoded block writeback is staged behind the same serializer used by client writes.",
       "client_writes_allowed": false,
       "repair_writeback_allowed": true,
       "mutates_image": false
@@ -700,14 +690,9 @@
     {
       "scenario_id": "repair_writeback_rw_fail_closed",
       "title": "Historical missing-serializer gate fails closed while a client write is in flight",
-      "coverage_tags": [
-        "fail_closed_rw_repair",
-        "mvcc_snapshot_boundary"
-      ],
+      "coverage_tags": ["fail_closed_rw_repair", "mvcc_snapshot_boundary"],
       "initial_state": "client_write_in_flight",
-      "events": [
-        "repair_writeback_requested"
-      ],
+      "events": ["repair_writeback_requested"],
       "expected_final_state": "repair_writeback_blocked_rw",
       "expected_outcome": "rejected",
       "expected_error_class": "rw_repair_serialization_missing",
@@ -726,13 +711,9 @@
     {
       "scenario_id": "repair_writeback_mvcc_snapshot_boundary",
       "title": "Repair plan must name the MVCC snapshot epoch before any mutation decision",
-      "coverage_tags": [
-        "mvcc_snapshot_boundary"
-      ],
+      "coverage_tags": ["mvcc_snapshot_boundary"],
       "initial_state": "detection_only_scrub",
-      "events": [
-        "corruption_detected"
-      ],
+      "events": ["corruption_detected"],
       "expected_final_state": "repair_planning",
       "expected_outcome": "accepted",
       "expected_error_class": "none",
@@ -741,21 +722,15 @@
       "requires_symbol_freshness": false,
       "proves_no_lost_client_write": true,
       "preserves_reproduction_data": true,
-      "artifact_paths": [
-        "artifacts/repair-writeback/dry-run/mvcc_snapshot_boundary.json"
-      ],
+      "artifact_paths": ["artifacts/repair-writeback/dry-run/mvcc_snapshot_boundary.json"],
       "reproduction_command": "cargo run -p ffs-harness -- validate-repair-writeback-serialization --contract docs/repair-writeback-serialization-contract.json"
     },
     {
       "scenario_id": "repair_writeback_flush_non_durable",
       "title": "Flush cannot authorize repair writeback or symbol refresh",
-      "coverage_tags": [
-        "dirty_cache_flush"
-      ],
+      "coverage_tags": ["dirty_cache_flush"],
       "initial_state": "client_write_in_flight",
-      "events": [
-        "flush_observed"
-      ],
+      "events": ["flush_observed"],
       "expected_final_state": "client_write_in_flight",
       "expected_outcome": "rejected",
       "expected_error_class": "flush_non_durable",
@@ -764,23 +739,16 @@
       "requires_symbol_freshness": false,
       "proves_no_lost_client_write": true,
       "preserves_reproduction_data": true,
-      "artifact_paths": [
-        "artifacts/repair-writeback/dry-run/flush_non_durable.json"
-      ],
+      "artifact_paths": ["artifacts/repair-writeback/dry-run/flush_non_durable.json"],
       "reproduction_command": "cargo run -p ffs-harness -- validate-repair-writeback-serialization --contract docs/repair-writeback-serialization-contract.json",
       "follow_up_bead": "bd-rchk0.1.1.1"
     },
     {
       "scenario_id": "repair_writeback_fsync_boundary_required",
       "title": "Repair preflight rejects dirty client data that has not crossed fsync or fsyncdir",
-      "coverage_tags": [
-        "fsync_fsyncdir_boundary",
-        "dirty_cache_flush"
-      ],
+      "coverage_tags": ["fsync_fsyncdir_boundary", "dirty_cache_flush"],
       "initial_state": "repair_lease_held",
-      "events": [
-        "fsync_boundary_missing"
-      ],
+      "events": ["fsync_boundary_missing"],
       "expected_final_state": "repair_writeback_blocked_rw",
       "expected_outcome": "rejected",
       "expected_error_class": "dirty_cache_not_fsynced",
@@ -789,22 +757,16 @@
       "requires_symbol_freshness": true,
       "proves_no_lost_client_write": true,
       "preserves_reproduction_data": true,
-      "artifact_paths": [
-        "artifacts/repair-writeback/dry-run/fsync_boundary_required.json"
-      ],
+      "artifact_paths": ["artifacts/repair-writeback/dry-run/fsync_boundary_required.json"],
       "reproduction_command": "cargo run -p ffs-harness -- validate-repair-writeback-serialization --contract docs/repair-writeback-serialization-contract.json",
       "follow_up_bead": "bd-rchk0.1.1.1"
     },
     {
       "scenario_id": "repair_writeback_lease_required",
       "title": "Mutating repair refuses missing or expired ownership leases",
-      "coverage_tags": [
-        "repair_lease"
-      ],
+      "coverage_tags": ["repair_lease"],
       "initial_state": "repair_planning",
-      "events": [
-        "lease_missing_or_expired"
-      ],
+      "events": ["lease_missing_or_expired"],
       "expected_final_state": "cleanup_complete",
       "expected_outcome": "rejected",
       "expected_error_class": "lease_expired_or_missing",
@@ -813,22 +775,16 @@
       "requires_symbol_freshness": false,
       "proves_no_lost_client_write": true,
       "preserves_reproduction_data": true,
-      "artifact_paths": [
-        "artifacts/repair-writeback/dry-run/lease_required.json"
-      ],
+      "artifact_paths": ["artifacts/repair-writeback/dry-run/lease_required.json"],
       "reproduction_command": "cargo run -p ffs-harness -- validate-repair-writeback-serialization --contract docs/repair-writeback-serialization-contract.json",
       "follow_up_bead": "bd-rchk0.1.1.1"
     },
     {
       "scenario_id": "repair_writeback_stale_symbol_rejected",
       "title": "Stale repair symbols are rejected before source block writeback",
-      "coverage_tags": [
-        "stale_repair_symbol"
-      ],
+      "coverage_tags": ["stale_repair_symbol"],
       "initial_state": "repair_lease_held",
-      "events": [
-        "repair_symbol_stale"
-      ],
+      "events": ["repair_symbol_stale"],
       "expected_final_state": "repair_writeback_blocked_rw",
       "expected_outcome": "rejected",
       "expected_error_class": "stale_repair_symbol",
@@ -837,22 +793,16 @@
       "requires_symbol_freshness": true,
       "proves_no_lost_client_write": true,
       "preserves_reproduction_data": true,
-      "artifact_paths": [
-        "artifacts/repair-writeback/dry-run/stale_symbol_rejected.json"
-      ],
+      "artifact_paths": ["artifacts/repair-writeback/dry-run/stale_symbol_rejected.json"],
       "reproduction_command": "cargo run -p ffs-harness -- validate-repair-writeback-serialization --contract docs/repair-writeback-serialization-contract.json",
       "follow_up_bead": "bd-rchk0.1.3"
     },
     {
       "scenario_id": "repair_writeback_cancellation_cleanup",
       "title": "Cancellation preserves cleanup evidence and does not refresh repair symbols",
-      "coverage_tags": [
-        "cancellation"
-      ],
+      "coverage_tags": ["cancellation"],
       "initial_state": "repair_writeback_staged",
-      "events": [
-        "repair_cancelled"
-      ],
+      "events": ["repair_cancelled"],
       "expected_final_state": "cleanup_complete",
       "expected_outcome": "accepted",
       "expected_error_class": "cancelled_repair_cleanup",
@@ -861,23 +811,16 @@
       "requires_symbol_freshness": false,
       "proves_no_lost_client_write": true,
       "preserves_reproduction_data": true,
-      "artifact_paths": [
-        "artifacts/repair-writeback/dry-run/cancellation_cleanup.json"
-      ],
+      "artifact_paths": ["artifacts/repair-writeback/dry-run/cancellation_cleanup.json"],
       "reproduction_command": "cargo run -p ffs-harness -- validate-repair-writeback-serialization --contract docs/repair-writeback-serialization-contract.json",
       "follow_up_bead": "bd-rchk0.1.1.1"
     },
     {
       "scenario_id": "repair_writeback_halfway_failure",
       "title": "Halfway writeback failure refuses repair-symbol refresh",
-      "coverage_tags": [
-        "writeback_failure",
-        "halfway_recovery_failure"
-      ],
+      "coverage_tags": ["writeback_failure", "halfway_recovery_failure"],
       "initial_state": "repair_writeback_staged",
-      "events": [
-        "writeback_failed"
-      ],
+      "events": ["writeback_failed"],
       "expected_final_state": "writeback_failure",
       "expected_outcome": "error",
       "expected_error_class": "writeback_failure_no_refresh",
@@ -982,22 +925,12 @@
         ],
         "minimization": {
           "minimized": true,
-          "minimized_trace": [
-            "repair_writeback",
-            "client_write",
-            "fsync"
-          ],
+          "minimized_trace": ["repair_writeback", "client_write", "fsync"],
           "original_trace_len": 5,
           "minimized_trace_len": 3
         },
-        "expected_survivor_set": [
-          "repaired_block_42",
-          "client_write_block_42_after_repair"
-        ],
-        "observed_survivor_set": [
-          "repaired_block_42",
-          "client_write_block_42_after_repair"
-        ],
+        "expected_survivor_set": ["repaired_block_42", "client_write_block_42_after_repair"],
+        "observed_survivor_set": ["repaired_block_42", "client_write_block_42_after_repair"],
         "ledger_outcomes": [
           "repair_writeback_serialized",
           "client_write_committed_after_repair",
@@ -1035,20 +968,12 @@
         ],
         "minimization": {
           "minimized": true,
-          "minimized_trace": [
-            "client_write",
-            "fsync",
-            "repair_writeback"
-          ],
+          "minimized_trace": ["client_write", "fsync", "repair_writeback"],
           "original_trace_len": 5,
           "minimized_trace_len": 3
         },
-        "expected_survivor_set": [
-          "fsynced_client_block_42"
-        ],
-        "observed_survivor_set": [
-          "fsynced_client_block_42"
-        ],
+        "expected_survivor_set": ["fsynced_client_block_42"],
+        "observed_survivor_set": ["fsynced_client_block_42"],
         "ledger_outcomes": [
           "repair_snapshot_rebased",
           "stale_candidate_rejected",
@@ -1059,9 +984,7 @@
         "pruned_schedule_count": 87,
         "timeout_decision": "completed",
         "liveness_decision": "within_deadline",
-        "artifact_paths": [
-          "artifacts/repair-writeback/dry-run/races/write_before_repair.json"
-        ],
+        "artifact_paths": ["artifacts/repair-writeback/dry-run/races/write_before_repair.json"],
         "cleanup_status": "no_mutation_after_stale_candidate",
         "follow_up_bead": "bd-rchk0.1.3",
         "reproduction_command": "cargo run -p ffs-harness -- validate-repair-writeback-serialization --contract docs/repair-writeback-serialization-contract.json --schedule rw-repair-race-write-before-repair"
@@ -1070,12 +993,7 @@
         "schedule_id": "rw-repair-race-overlapping-writes",
         "coverage_case": "overlapping_writes",
         "seed": 9003,
-        "operation_trace": [
-          "client_write",
-          "repair_writeback",
-          "client_write",
-          "fsync"
-        ],
+        "operation_trace": ["client_write", "repair_writeback", "client_write", "fsync"],
         "yield_points": [
           "client_write_begin",
           "repair_writeback_requested",
@@ -1085,20 +1003,12 @@
         ],
         "minimization": {
           "minimized": true,
-          "minimized_trace": [
-            "client_write",
-            "repair_writeback",
-            "client_write"
-          ],
+          "minimized_trace": ["client_write", "repair_writeback", "client_write"],
           "original_trace_len": 4,
           "minimized_trace_len": 3
         },
-        "expected_survivor_set": [
-          "latest_client_write_block_42"
-        ],
-        "observed_survivor_set": [
-          "latest_client_write_block_42"
-        ],
+        "expected_survivor_set": ["latest_client_write_block_42"],
+        "observed_survivor_set": ["latest_client_write_block_42"],
         "ledger_outcomes": [
           "overlap_detected",
           "repair_writeback_rejected",
@@ -1109,9 +1019,7 @@
         "pruned_schedule_count": 121,
         "timeout_decision": "completed",
         "liveness_decision": "within_deadline",
-        "artifact_paths": [
-          "artifacts/repair-writeback/dry-run/races/overlapping_writes.json"
-        ],
+        "artifact_paths": ["artifacts/repair-writeback/dry-run/races/overlapping_writes.json"],
         "cleanup_status": "overlap_rejection_preserved",
         "follow_up_bead": "bd-rchk0.1.2",
         "reproduction_command": "cargo run -p ffs-harness -- validate-repair-writeback-serialization --contract docs/repair-writeback-serialization-contract.json --schedule rw-repair-race-overlapping-writes"
@@ -1140,14 +1048,8 @@
           "original_trace_len": 5,
           "minimized_trace_len": 5
         },
-        "expected_survivor_set": [
-          "client_write_block_10",
-          "repaired_block_20"
-        ],
-        "observed_survivor_set": [
-          "client_write_block_10",
-          "repaired_block_20"
-        ],
+        "expected_survivor_set": ["client_write_block_10", "repaired_block_20"],
+        "observed_survivor_set": ["client_write_block_10", "repaired_block_20"],
         "ledger_outcomes": [
           "disjoint_ranges_proven",
           "repair_writeback_serialized",
@@ -1158,9 +1060,7 @@
         "pruned_schedule_count": 48,
         "timeout_decision": "completed",
         "liveness_decision": "within_deadline",
-        "artifact_paths": [
-          "artifacts/repair-writeback/dry-run/races/disjoint_writes.json"
-        ],
+        "artifact_paths": ["artifacts/repair-writeback/dry-run/races/disjoint_writes.json"],
         "cleanup_status": "disjoint_survivors_verified",
         "reproduction_command": "cargo run -p ffs-harness -- validate-repair-writeback-serialization --contract docs/repair-writeback-serialization-contract.json --schedule rw-repair-race-disjoint-writes"
       },
@@ -1184,21 +1084,12 @@
         ],
         "minimization": {
           "minimized": true,
-          "minimized_trace": [
-            "repair_decode",
-            "client_write",
-            "fsync",
-            "repair_writeback"
-          ],
+          "minimized_trace": ["repair_decode", "client_write", "fsync", "repair_writeback"],
           "original_trace_len": 5,
           "minimized_trace_len": 4
         },
-        "expected_survivor_set": [
-          "fsynced_client_block_42"
-        ],
-        "observed_survivor_set": [
-          "fsynced_client_block_42"
-        ],
+        "expected_survivor_set": ["fsynced_client_block_42"],
+        "observed_survivor_set": ["fsynced_client_block_42"],
         "ledger_outcomes": [
           "fsync_boundary_observed",
           "repair_candidate_stale",
@@ -1209,9 +1100,7 @@
         "pruned_schedule_count": 150,
         "timeout_decision": "completed",
         "liveness_decision": "within_deadline",
-        "artifact_paths": [
-          "artifacts/repair-writeback/dry-run/races/fsync_during_repair.json"
-        ],
+        "artifact_paths": ["artifacts/repair-writeback/dry-run/races/fsync_during_repair.json"],
         "cleanup_status": "fsync_survivor_preserved",
         "follow_up_bead": "bd-rchk0.1.3",
         "reproduction_command": "cargo run -p ffs-harness -- validate-repair-writeback-serialization --contract docs/repair-writeback-serialization-contract.json --schedule rw-repair-race-fsync-during-repair"
@@ -1220,16 +1109,8 @@
         "schedule_id": "rw-repair-race-cancel-decode",
         "coverage_case": "cancellation_during_decode",
         "seed": 9006,
-        "operation_trace": [
-          "repair_detect_corruption",
-          "repair_decode",
-          "abort_repair"
-        ],
-        "yield_points": [
-          "repair_detected",
-          "repair_decode_started",
-          "cancellation_checkpoint"
-        ],
+        "operation_trace": ["repair_detect_corruption", "repair_decode", "abort_repair"],
+        "yield_points": ["repair_detected", "repair_decode_started", "cancellation_checkpoint"],
         "cancellation_injection": {
           "operation": "repair_decode",
           "yield_point": "repair_decode_started",
@@ -1237,24 +1118,13 @@
         },
         "minimization": {
           "minimized": true,
-          "minimized_trace": [
-            "repair_decode",
-            "abort_repair"
-          ],
+          "minimized_trace": ["repair_decode", "abort_repair"],
           "original_trace_len": 3,
           "minimized_trace_len": 2
         },
-        "expected_survivor_set": [
-          "pre_decode_source_block_42"
-        ],
-        "observed_survivor_set": [
-          "pre_decode_source_block_42"
-        ],
-        "ledger_outcomes": [
-          "decode_cancelled",
-          "cleanup_complete",
-          "no_symbol_refresh"
-        ],
+        "expected_survivor_set": ["pre_decode_source_block_42"],
+        "observed_survivor_set": ["pre_decode_source_block_42"],
+        "ledger_outcomes": ["decode_cancelled", "cleanup_complete", "no_symbol_refresh"],
         "classification": "accepted",
         "explored_schedule_count": 64,
         "pruned_schedule_count": 41,
@@ -1289,24 +1159,13 @@
         },
         "minimization": {
           "minimized": true,
-          "minimized_trace": [
-            "repair_writeback",
-            "abort_repair"
-          ],
+          "minimized_trace": ["repair_writeback", "abort_repair"],
           "original_trace_len": 4,
           "minimized_trace_len": 2
         },
-        "expected_survivor_set": [
-          "pre_writeback_source_block_42"
-        ],
-        "observed_survivor_set": [
-          "pre_writeback_source_block_42"
-        ],
-        "ledger_outcomes": [
-          "writeback_cancelled",
-          "staged_write_discarded",
-          "no_symbol_refresh"
-        ],
+        "expected_survivor_set": ["pre_writeback_source_block_42"],
+        "observed_survivor_set": ["pre_writeback_source_block_42"],
+        "ledger_outcomes": ["writeback_cancelled", "staged_write_discarded", "no_symbol_refresh"],
         "classification": "rejected",
         "explored_schedule_count": 88,
         "pruned_schedule_count": 57,
@@ -1323,12 +1182,7 @@
         "schedule_id": "rw-repair-race-symbol-refresh-client-write",
         "coverage_case": "symbol_refresh_races_client_write",
         "seed": 9008,
-        "operation_trace": [
-          "repair_writeback",
-          "client_write",
-          "symbol_refresh",
-          "fsync"
-        ],
+        "operation_trace": ["repair_writeback", "client_write", "symbol_refresh", "fsync"],
         "yield_points": [
           "repair_writeback_staged",
           "client_write_begin",
@@ -1337,21 +1191,12 @@
         ],
         "minimization": {
           "minimized": true,
-          "minimized_trace": [
-            "client_write",
-            "symbol_refresh"
-          ],
+          "minimized_trace": ["client_write", "symbol_refresh"],
           "original_trace_len": 4,
           "minimized_trace_len": 2
         },
-        "expected_survivor_set": [
-          "client_write_block_42",
-          "previous_symbol_generation"
-        ],
-        "observed_survivor_set": [
-          "client_write_block_42",
-          "previous_symbol_generation"
-        ],
+        "expected_survivor_set": ["client_write_block_42", "previous_symbol_generation"],
+        "observed_survivor_set": ["client_write_block_42", "previous_symbol_generation"],
         "ledger_outcomes": [
           "symbol_refresh_suppressed",
           "stale_symbol_rejected",
@@ -1387,19 +1232,12 @@
         ],
         "minimization": {
           "minimized": true,
-          "minimized_trace": [
-            "repair_writeback",
-            "unmount"
-          ],
+          "minimized_trace": ["repair_writeback", "unmount"],
           "original_trace_len": 4,
           "minimized_trace_len": 2
         },
-        "expected_survivor_set": [
-          "last_durable_client_state"
-        ],
-        "observed_survivor_set": [
-          "last_durable_client_state"
-        ],
+        "expected_survivor_set": ["last_durable_client_state"],
+        "observed_survivor_set": ["last_durable_client_state"],
         "ledger_outcomes": [
           "unmount_cancelled_pending_repair",
           "cleanup_complete",
@@ -1410,9 +1248,7 @@
         "pruned_schedule_count": 95,
         "timeout_decision": "completed",
         "liveness_decision": "within_deadline",
-        "artifact_paths": [
-          "artifacts/repair-writeback/dry-run/races/unmount_pending_repair.json"
-        ],
+        "artifact_paths": ["artifacts/repair-writeback/dry-run/races/unmount_pending_repair.json"],
         "cleanup_status": "unmount_cleanup_joined_pending_repair",
         "follow_up_bead": "bd-rchk0.1.4",
         "reproduction_command": "cargo run -p ffs-harness -- validate-repair-writeback-serialization --contract docs/repair-writeback-serialization-contract.json --schedule rw-repair-race-unmount-pending-repair"
@@ -1436,22 +1272,12 @@
         ],
         "minimization": {
           "minimized": true,
-          "minimized_trace": [
-            "repair_writeback",
-            "unmount",
-            "reopen"
-          ],
+          "minimized_trace": ["repair_writeback", "unmount", "reopen"],
           "original_trace_len": 5,
           "minimized_trace_len": 3
         },
-        "expected_survivor_set": [
-          "last_durable_client_state",
-          "failed_repair_ledger_record"
-        ],
-        "observed_survivor_set": [
-          "last_durable_client_state",
-          "failed_repair_ledger_record"
-        ],
+        "expected_survivor_set": ["last_durable_client_state", "failed_repair_ledger_record"],
+        "observed_survivor_set": ["last_durable_client_state", "failed_repair_ledger_record"],
         "ledger_outcomes": [
           "writeback_failure_no_refresh",
           "reopen_observed_failure_ledger",
@@ -1489,20 +1315,12 @@
         ],
         "minimization": {
           "minimized": true,
-          "minimized_trace": [
-            "abort_repair",
-            "retry_repair",
-            "repair_writeback"
-          ],
+          "minimized_trace": ["abort_repair", "retry_repair", "repair_writeback"],
           "original_trace_len": 5,
           "minimized_trace_len": 3
         },
-        "expected_survivor_set": [
-          "retried_repair_block_42"
-        ],
-        "observed_survivor_set": [
-          "retried_repair_block_42"
-        ],
+        "expected_survivor_set": ["retried_repair_block_42"],
+        "observed_survivor_set": ["retried_repair_block_42"],
         "ledger_outcomes": [
           "abort_record_preserved",
           "retry_rebased_on_current_epoch",
@@ -1513,9 +1331,7 @@
         "pruned_schedule_count": 109,
         "timeout_decision": "completed",
         "liveness_decision": "within_deadline",
-        "artifact_paths": [
-          "artifacts/repair-writeback/dry-run/races/retry_after_abort.json"
-        ],
+        "artifact_paths": ["artifacts/repair-writeback/dry-run/races/retry_after_abort.json"],
         "cleanup_status": "retry_ledger_preserved",
         "reproduction_command": "cargo run -p ffs-harness -- validate-repair-writeback-serialization --contract docs/repair-writeback-serialization-contract.json --schedule rw-repair-race-retry-after-abort"
       },
@@ -1523,12 +1339,7 @@
         "schedule_id": "rw-repair-race-unsupported-epoch-rewind",
         "coverage_case": "unsupported_nested_repair_epoch_rewind",
         "seed": 9012,
-        "operation_trace": [
-          "repair_writeback",
-          "symbol_refresh",
-          "client_write",
-          "fsync"
-        ],
+        "operation_trace": ["repair_writeback", "symbol_refresh", "client_write", "fsync"],
         "yield_points": [
           "repair_writeback_staged",
           "symbol_refresh",
@@ -1537,19 +1348,12 @@
         ],
         "minimization": {
           "minimized": true,
-          "minimized_trace": [
-            "symbol_refresh",
-            "client_write"
-          ],
+          "minimized_trace": ["symbol_refresh", "client_write"],
           "original_trace_len": 4,
           "minimized_trace_len": 2
         },
-        "expected_survivor_set": [
-          "pre_unsupported_interleaving_state"
-        ],
-        "observed_survivor_set": [
-          "pre_unsupported_interleaving_state"
-        ],
+        "expected_survivor_set": ["pre_unsupported_interleaving_state"],
+        "observed_survivor_set": ["pre_unsupported_interleaving_state"],
         "ledger_outcomes": [
           "unsupported_interleaving_classified",
           "no_readiness_upgrade",

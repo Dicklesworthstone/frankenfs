@@ -69,7 +69,7 @@
           "candidate_id": "segmented_pressure_guard",
           "hit_rate": 0.86,
           "p99_latency_us": 4550.0,
-          "dirty_ratio": 0.40,
+          "dirty_ratio": 0.4,
           "memory_overhead_gb": 14.0,
           "eviction_pressure": 0.24,
           "admission_decision": "admit",
@@ -86,12 +86,8 @@
       },
       "release_claim_state": "measured_authoritative",
       "reproduction_command": "ffs-harness validate-swarm-cache-controller --contract benchmarks/swarm_cache_controller_contract.json",
-      "raw_logs": [
-        "artifacts/performance/swarm-cache/large-host/run.log"
-      ],
-      "artifact_paths": [
-        "artifacts/performance/swarm-cache/large-host/report.json"
-      ]
+      "raw_logs": ["artifacts/performance/swarm-cache/large-host/run.log"],
+      "artifact_paths": ["artifacts/performance/swarm-cache/large-host/report.json"]
     },
     {
       "scenario_id": "cache_pressure_small_host_smoke",
@@ -137,12 +133,8 @@
       },
       "release_claim_state": "small_host_smoke",
       "reproduction_command": "ffs-harness validate-swarm-cache-controller --contract benchmarks/swarm_cache_controller_contract.json",
-      "raw_logs": [
-        "artifacts/performance/swarm-cache/small-host/run.log"
-      ],
-      "artifact_paths": [
-        "artifacts/performance/swarm-cache/small-host/report.json"
-      ]
+      "raw_logs": ["artifacts/performance/swarm-cache/small-host/run.log"],
+      "artifact_paths": ["artifacts/performance/swarm-cache/small-host/report.json"]
     }
   ],
   "required_log_fields": [
@@ -163,10 +155,5 @@
     "release_claim_state",
     "reproduction_command"
   ],
-  "release_gate_consumers": [
-    "bd-p2j3e",
-    "bd-rchk5",
-    "proof-bundle",
-    "release-gates"
-  ]
+  "release_gate_consumers": ["bd-p2j3e", "bd-rchk5", "proof-bundle", "release-gates"]
 }

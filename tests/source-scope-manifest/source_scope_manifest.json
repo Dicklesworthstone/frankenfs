@@ -72,11 +72,7 @@
     {
       "id": "architecture_design_docs",
       "source_family": "architecture_design_docs",
-      "included_globs": [
-        "docs/design-*.md",
-        "docs/oq*.md",
-        "docs/perf/README.md"
-      ],
+      "included_globs": ["docs/design-*.md", "docs/oq*.md", "docs/perf/README.md"],
       "excluded_globs": [
         "target/**",
         "**/.rch-target/**",
@@ -124,11 +120,7 @@
         "conformance/golden/*.txt",
         "conformance/golden/checksums.sha256"
       ],
-      "excluded_globs": [
-        "target/**",
-        "**/.rch-target/**",
-        "**/.rch-target-*/**"
-      ],
+      "excluded_globs": ["target/**", "**/.rch-target/**", "**/.rch-target-*/**"],
       "risk_category": "conformance",
       "owner": "harness",
       "status": "active",
@@ -141,14 +133,8 @@
     {
       "id": "conformance_generated_ext4_images",
       "source_family": "conformance_generated_image_artifacts",
-      "included_globs": [
-        "conformance/golden/*.ext4"
-      ],
-      "excluded_globs": [
-        "target/**",
-        "**/.rch-target/**",
-        "**/.rch-target-*/**"
-      ],
+      "included_globs": ["conformance/golden/*.ext4"],
+      "excluded_globs": ["target/**", "**/.rch-target/**", "**/.rch-target-*/**"],
       "risk_category": "conformance",
       "owner": "harness",
       "status": "non_applicable",
@@ -217,17 +203,8 @@
     {
       "id": "tests",
       "source_family": "tests",
-      "included_globs": [
-        "crates/*/src/**/*.rs",
-        "crates/*/tests/**/*.rs",
-        "tests/**/*.rs"
-      ],
-      "excluded_globs": [
-        "target/**",
-        "**/.rch-target/**",
-        "**/.rch-target-*/**",
-        "vendor/**"
-      ],
+      "included_globs": ["crates/*/src/**/*.rs", "crates/*/tests/**/*.rs", "tests/**/*.rs"],
+      "excluded_globs": ["target/**", "**/.rch-target/**", "**/.rch-target-*/**", "vendor/**"],
       "risk_category": "data_safety",
       "owner": "core",
       "status": "active",
@@ -294,12 +271,7 @@
         "crates/*/Cargo.toml",
         "crates/*/benches/*.rs"
       ],
-      "excluded_globs": [
-        "target/**",
-        "**/.rch-target/**",
-        "**/.rch-target-*/**",
-        "vendor/**"
-      ],
+      "excluded_globs": ["target/**", "**/.rch-target/**", "**/.rch-target-*/**", "vendor/**"],
       "risk_category": "performance",
       "owner": "harness",
       "status": "active",
@@ -336,15 +308,8 @@
     {
       "id": "fuzz_targets",
       "source_family": "fuzz_targets",
-      "included_globs": [
-        "fuzz/fuzz_targets/*.rs"
-      ],
-      "excluded_globs": [
-        "target/**",
-        "**/.rch-target/**",
-        "**/.rch-target-*/**",
-        "vendor/**"
-      ],
+      "included_globs": ["fuzz/fuzz_targets/*.rs"],
+      "excluded_globs": ["target/**", "**/.rch-target/**", "**/.rch-target-*/**", "vendor/**"],
       "risk_category": "fuzz",
       "owner": "harness",
       "status": "active",
@@ -357,16 +322,8 @@
     {
       "id": "fuzz_orchestration",
       "source_family": "fuzz_orchestration",
-      "included_globs": [
-        "fuzz/Cargo.toml",
-        "fuzz/scripts/*.sh"
-      ],
-      "excluded_globs": [
-        "target/**",
-        "**/.rch-target/**",
-        "**/.rch-target-*/**",
-        "vendor/**"
-      ],
+      "included_globs": ["fuzz/Cargo.toml", "fuzz/scripts/*.sh"],
+      "excluded_globs": ["target/**", "**/.rch-target/**", "**/.rch-target-*/**", "vendor/**"],
       "risk_category": "fuzz",
       "owner": "harness",
       "status": "active",
@@ -379,11 +336,7 @@
     {
       "id": "operational_scripts",
       "source_family": "operational_scripts",
-      "included_globs": [
-        "scripts/*.sh",
-        "scripts/*.py",
-        "scripts/fixtures/*.sh"
-      ],
+      "included_globs": ["scripts/*.sh", "scripts/*.py", "scripts/fixtures/*.sh"],
       "excluded_globs": [
         "target/**",
         "**/.rch-target/**",
@@ -403,11 +356,7 @@
     {
       "id": "harness_scripts",
       "source_family": "harness_scripts",
-      "included_globs": [
-        "scripts/e2e/**/*.sh",
-        "scripts/e2e/**/*.py",
-        "scripts/e2e/**/*.json"
-      ],
+      "included_globs": ["scripts/e2e/**/*.sh", "scripts/e2e/**/*.py", "scripts/e2e/**/*.json"],
       "excluded_globs": ["scripts/e2e/_artifacts/**"],
       "risk_category": "observability",
       "owner": "harness",
@@ -428,11 +377,7 @@
         "docs/tracker-hygiene.md",
         "docs/xfstests-known-failures.md"
       ],
-      "excluded_globs": [
-        "target/**",
-        "**/.rch-target/**",
-        "**/.rch-target-*/**"
-      ],
+      "excluded_globs": ["target/**", "**/.rch-target/**", "**/.rch-target-*/**"],
       "risk_category": "docs_only",
       "owner": "release",
       "status": "active",

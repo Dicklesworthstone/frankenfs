@@ -14,7 +14,7 @@
     "hostname": "thinkstation1",
     "cpu_model": "AMD Ryzen Threadripper PRO 5975WX 32-Cores",
     "kernel": "Linux 6.17.0-14-generic #14-Ubuntu SMP PREEMPT_DYNAMIC Fri Jan  9 17:01:16 UTC 2026 x86_64 GNU/Linux",
-    "memory_total_gib": 215.780,
+    "memory_total_gib": 215.78,
     "rustc": "rustc 1.97.0-nightly (37d85e592 2026-04-28)",
     "hyperfine": "hyperfine 1.19.0",
     "cargo_target_dir": "/data/tmp/rch_target_frankenfs_bd_xuo95_32",
@@ -70,16 +70,7 @@
     },
     {
       "command": "rch",
-      "args": [
-        "exec",
-        "--",
-        "cargo",
-        "build",
-        "--profile",
-        "release-perf",
-        "-p",
-        "ffs-cli"
-      ],
+      "args": ["exec", "--", "cargo", "build", "--profile", "release-perf", "-p", "ffs-cli"],
       "exit_code": 0,
       "stdout_sha256": "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855",
       "stderr_sha256": "8782aec0426217578694173fb5282e71f1a4fd4dfbdd65e9203e8d89972cf181",
@@ -190,7 +181,7 @@
       "command": "rch exec -- cargo bench --profile release-perf -p ffs-repair --bench scrub_codec",
       "benchmark_mode": "criterion",
       "source_stderr": "baselines/hyperfine/20260521-bd-xuo95-32/ffs_repair_scrub_codec.stderr",
-      "ci_low_us": 276.30,
+      "ci_low_us": 276.3,
       "mean_us": 278.68,
       "ci_high_us": 281.12,
       "throughput_ops_sec": 3588.345055,
@@ -202,7 +193,7 @@
       "command": "rch exec -- cargo bench --profile release-perf -p ffs-repair --bench scrub_codec",
       "benchmark_mode": "criterion",
       "source_stderr": "baselines/hyperfine/20260521-bd-xuo95-32/ffs_repair_scrub_codec.stderr",
-      "ci_low_us": 616.50,
+      "ci_low_us": 616.5,
       "mean_us": 625.09,
       "ci_high_us": 634.56,
       "throughput_ops_sec": 1599.769633,
@@ -217,7 +208,7 @@
       "ci_low_us": 613.69,
       "mean_us": 620.65,
       "ci_high_us": 628.14,
-      "throughput_ops_sec": 1611.214050,
+      "throughput_ops_sec": 1611.21405,
       "status": "measured"
     },
     {
@@ -286,7 +277,7 @@
       "p95_us": 117835.65174,
       "p99_us": 117835.65174,
       "cv": 0.031549,
-      "throughput_ops_sec": 8.867720,
+      "throughput_ops_sec": 8.86772,
       "cleanup_status": "unmounted",
       "status": "measured"
     },
