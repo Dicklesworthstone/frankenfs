@@ -24,7 +24,7 @@ locally (rch fail-open); single-host evidence, not a fleet claim.
 | `cargo fmt --check` | PASS | exit 0 |
 | `cargo clippy --workspace --all-targets -- -D warnings` | PASS | Finished 7m01s, zero lint errors; third-party future-incompat notes only (`nix` 0.29/0.31) |
 | `cargo test --workspace --no-fail-fast` | **FAIL** | 9,424 passed / 12 failed / 8+ ignored across 22 crates; all 12 failures in `ffs-harness` (table below). Every non-harness crate green, including `ffs-core`, `ffs-fuse`, `ffs-btrfs`, `ffs-journal` |
-| `ubs --only=rust .` | PARTIAL | rust module timed out at 300s under concurrent cargo load; no clean scan claimed. Sept-8 baseline was 244 critical findings; not re-measured here |
+| `ubs --only=rust .` | RED / PARTIAL | Rescan completed with a raised module timeout: 498 files scanned, **254 critical** findings (Sept-8 baseline: 244), 17,559 info; runner still reports `partial` (a module did not emit). No clean scan claimed; criticals include sampled false positives per the Sept-8 audit |
 | Static inventory vs README | PASS | 63 fuzz targets, 125 E2E scripts, 173 bench files, 226 snapshots, 21 `FfsError` variants, 22 workspace members, 5/678 ledger claims carrying live-incumbent ratios — all match README exactly |
 
 ### Failures, root-caused
