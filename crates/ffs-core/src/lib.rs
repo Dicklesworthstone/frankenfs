@@ -12531,10 +12531,7 @@ impl OpenFs {
                     return Ok(());
                 }
                 Err(error) => {
-                    if self
-                        .btrfs_read_logical_degraded(cx, ctx, devices, logical, out)
-                        .is_ok()
-                    {
+                    if Self::btrfs_read_logical_degraded(cx, ctx, devices, logical, out).is_ok() {
                         return Ok(());
                     }
                     return Err(btrfs_device_error_to_ffs(error));
@@ -12616,9 +12613,7 @@ impl OpenFs {
         Ok(())
     }
 
-    #[expect(clippy::cast_possible_truncation)]
     fn btrfs_read_logical_degraded(
-        &self,
         cx: &Cx,
         ctx: &BtrfsContext,
         devices: &BtrfsReadDevices,
@@ -12639,9 +12634,10 @@ impl OpenFs {
 
             let mut read_bytes: Option<Vec<u8>> = None;
             for stripe in &mapping.stripes {
-                if let Ok(bytes) = devices
-                    .readers
-                    .read_physical(cx, stripe.devid, stripe.physical, segment_len)
+                if let Ok(bytes) =
+                    devices
+                        .readers
+                        .read_physical(cx, stripe.devid, stripe.physical, segment_len)
                 {
                     read_bytes = Some(bytes);
                     break;
@@ -12654,7 +12650,7 @@ impl OpenFs {
                     ffs_ondisk::BtrfsRaidProfile::Raid5 | ffs_ondisk::BtrfsRaidProfile::Raid6
                 )
             {
-                read_bytes = self.btrfs_reconstruct_raid56_segment(
+                read_bytes = Self::btrfs_reconstruct_raid56_segment(
                     cx,
                     ctx,
                     devices,
@@ -12675,9 +12671,7 @@ impl OpenFs {
         Ok(())
     }
 
-    #[expect(clippy::cast_possible_truncation)]
     fn btrfs_reconstruct_raid56_segment(
-        &self,
         cx: &Cx,
         ctx: &BtrfsContext,
         devices: &BtrfsReadDevices,
@@ -12722,10 +12716,7 @@ impl OpenFs {
                         let weighted: Vec<u8> = partner
                             .iter()
                             .map(|b| {
-                                ffs_ondisk::btrfs_raid56_gmul(
-                                    ffs_ondisk::btrfs_raid56_gexp(j),
-                                    *b,
-                                )
+                                ffs_ondisk::btrfs_raid56_gmul(ffs_ondisk::btrfs_raid56_gexp(j), *b)
                             })
                             .collect();
                         g_xor_others = Some(match g_xor_others {
@@ -13279,14 +13270,14 @@ impl OpenFs {
                     detail: "data checksum sector crosses a stripe or chunk boundary".into(),
                 });
             }
-            let raid56_data_devid = mapping.stripes.first().map(|stripe| stripe.devid);
+            let _raid56_data_devid = mapping.stripes.first().map(|stripe| stripe.devid);
             let mut failure = FfsError::Corruption {
                 block: sector_start,
                 detail: "no readable btrfs data mirror".into(),
             };
             let mut corruption = None;
             let mut verified = None;
-            for stripe in mapping.stripes {
+            for stripe in &mapping.stripes {
                 let bytes = match devices.readers.read_physical(
                     cx,
                     stripe.devid,
@@ -13327,19 +13318,17 @@ impl OpenFs {
                     mapping.profile,
                     ffs_ondisk::BtrfsRaidProfile::Raid5 | ffs_ondisk::BtrfsRaidProfile::Raid6
                 )
-            {
-                if let Ok(Some(bytes)) = self.btrfs_reconstruct_raid56_segment(
+                && let Ok(Some(bytes)) = Self::btrfs_reconstruct_raid56_segment(
                     cx,
                     ctx,
                     devices,
                     &mapping,
                     sector_start,
                     sectorsize,
-                ) {
-                    if ffs_btrfs::btrfs_data_csum_matches(ctx.csum_type, &bytes, expected) {
-                        verified = Some(bytes);
-                    }
-                }
+                )
+                && ffs_btrfs::btrfs_data_csum_matches(ctx.csum_type, &bytes, expected)
+            {
+                verified = Some(bytes);
             }
             // A later absent mirror must not hide corruption observed in an
             // available copy. Cancellation still takes precedence above.
@@ -40212,6 +40201,22 @@ impl OpenFs {
         )
     }
 
+    /// Reclaim an orphaned (unlinked-but-open) inode whose last handle closed.
+    ///
+    /// Library-facing wrapper for [`FsOps::finalize_unlinked_inode`]; returns
+    /// `Ok(true)` when storage was reclaimed now. Transports call this via the
+    /// trait; library callers can drive it directly after their own handle
+    /// bookkeeping.
+    pub fn finalize_unlinked_inode_public(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+    ) -> ffs_error::Result<bool> {
+        self.with_latest_scope(|scope| {
+            <Self as FsOps>::finalize_unlinked_inode(self, cx, scope, ino)
+        })
+    }
+
     pub fn rmdir(&self, cx: &Cx, parent: InodeNumber, name: &OsStr) -> ffs_error::Result<()> {
         self.handle_ext4_write_result(
             "rmdir",
@@ -62386,6 +62391,98 @@ mod tests {
             fs.lookup(&cx, root, OsStr::new("rdst.bin")).is_ok(),
             "immutable target must survive a rejected rename"
         );
+    }
+
+    /// bd-90aey: with an open-handle oracle reporting a live handle, dropping
+    /// the last link must ORPHAN the inode (nlink 0, dirent gone, still on the
+    /// orphan list) until `finalize_unlinked_inode` reclaims it. Without the
+    /// oracle (library mode) the same unlink deletes immediately: the inode
+    /// slot is freed, never left orphaned. Assertions are namespace/inode
+    /// invariants — deliberately NOT free-block counters, which live in
+    /// different ledgers depending on the bhh0i_sharded_alloc build.
+    #[test]
+    fn ext4_orphan_on_unlink_defers_reclaim_until_finalize() {
+        let Some((fs, _tmp)) = open_writable_ext4_mkfs(16) else {
+            return; // mkfs.ext4 unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+
+        let ino = fs
+            .create(&cx, root, OsStr::new("orphan.bin"), 0o644, 0, 0)
+            .expect("create")
+            .ino;
+        let payload = vec![0xCD_u8; fs.block_size() as usize];
+        assert_eq!(
+            fs.write(&cx, ino, 0, &payload).expect("write") as usize,
+            payload.len()
+        );
+
+        // Install the transport oracle AFTER the inode number is known: one
+        // live handle pins this inode. The pin is RETRACTABLE — a real
+        // transport drops it at RELEASE, and finalize frees the number, so a
+        // later create may REUSE it without inheriting the stale pin.
+        let pinned = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let oracle_pin = std::sync::Arc::clone(&pinned);
+        fs.install_open_handle_oracle(std::sync::Arc::new(move |queried| {
+            u64::from(oracle_pin.load(std::sync::atomic::Ordering::Relaxed) && queried == ino)
+        }));
+
+        fs.unlink(&cx, root, OsStr::new("orphan.bin"))
+            .expect("unlink with a live handle must succeed");
+
+        // Dirent is gone; the inode survives orphaned: nlink 0, dtime 0
+        // (dtime doubles as the orphan-list next pointer and 0 = list tail;
+        // a deleted inode has dtime stamped).
+        assert!(fs.lookup(&cx, root, OsStr::new("orphan.bin")).is_err());
+        let orphaned = fs.read_inode(&cx, ino).expect("orphaned inode readable");
+        assert_eq!(orphaned.links_count, 0, "orphan carries nlink 0");
+        assert_eq!(orphaned.dtime, 0, "orphan is still on the deferred list");
+
+        // Finalize (what the transport does at last close) reclaims exactly
+        // once: the slot is freed and the orphan list no longer names it.
+        assert!(
+            fs.finalize_unlinked_inode_public(&cx, ino)
+                .expect("finalize orphan"),
+            "finalize must reclaim the orphaned inode"
+        );
+        assert!(
+            !fs.finalize_unlinked_inode_public(&cx, ino)
+                .expect("second finalize"),
+            "second finalize must report nothing to reclaim"
+        );
+        assert!(fs.lookup(&cx, root, OsStr::new("orphan.bin")).is_err());
+
+        // The transport released its (last) handle before finalize; retract the
+        // pin so the reused inode number starts unpinned, exactly like a real
+        // refcount map that removed the entry at RELEASE.
+        pinned.store(false, std::sync::atomic::Ordering::Relaxed);
+
+        // Control: without a pinning oracle, unlink deletes immediately — the
+        // slot is zeroed and its bitmap bit freed (bd-y2t0r), never left as an
+        // allocated orphan (non-zeroed inode with nlink 0 and dtime 0), which
+        // is the state mount-time recovery would free.
+        let ino2 = fs
+            .create(&cx, root, OsStr::new("immediate.bin"), 0o644, 0, 0)
+            .expect("create control")
+            .ino;
+        let _ = fs.write(&cx, ino2, 0, &payload).expect("write control");
+        fs.unlink(&cx, root, OsStr::new("immediate.bin"))
+            .expect("unlink without handles");
+        assert!(fs.lookup(&cx, root, OsStr::new("immediate.bin")).is_err());
+        match fs.read_inode(&cx, ino2) {
+            Err(_) => {}
+            Ok(freed) => assert!(
+                !((freed.links_count == 0 && freed.dtime == 0)
+                    && (freed.mode != 0 || freed.size != 0)),
+                "immediate unlink left inode {ino2} as an allocated orphan \
+                 (nlink {}, dtime {}, mode {:#o}, size {})",
+                freed.links_count,
+                freed.dtime,
+                freed.mode,
+                freed.size
+            ),
+        }
     }
 
     fn open_writable_ext4_mkfs(size_mb: u64) -> Option<(OpenFs, tempfile::TempDir)> {
