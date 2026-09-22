@@ -1,5 +1,96 @@
 # Reality-Check Bridge: Closing the Gap Between Claims and Code
 
+## Reality check — 2026-09-22, second run (HEAD `e9d1e7d1b`)
+
+**Verdict:** the workspace is **two-gate green and one-test red**. `cargo fmt
+--check` and `cargo clippy --workspace --all-targets -- -D warnings` pass at
+the final HEAD of this assessment; `cargo test --workspace --no-fail-fast`
+exits 101 with exactly one deterministic failure (`fuse_e2e`
+`gdt_eager_mounted_forensics_bd_d2hdc`, an environment-capability interaction
+root-caused below — not a demonstrated filesystem defect) and one
+concurrency-induced failure (`parity_adversarial_e2e`
+`real_suite_run_promotes_exactly_its_mapped_capability_rows`, "source changed
+during test execution", which **passes on isolated rerun**). Every README
+inventory claim checked this session verified by direct count. The day's
+notable process event: two sidecar commits landed `main` red on fmt+clippy and
+were repaired by a third commit two commits later — the four-gate merge rule
+was violated for a window on 2026-09-22.
+
+**Method.** AGENTS.md and README.md read in full (README 3,931 lines);
+canonical gates executed against the live tree (rch fleet, fail-open, with
+scoped reruns at pinned HEADs); every failure root-caused via `git log` to its
+introducing commit; README inventory claims verified by direct `git ls-files`
+counts and enum extraction, not by trusting prior audits; functional probes
+executed as non-destructive rch jobs. Single-host + rch-worker evidence, not a
+fleet claim. The tree moved under the audit (three peer commits during the
+session); every gate result is stamped with the HEAD it measured.
+
+### Tree motion during the audit
+
+| Time (2026-09-22) | HEAD | Event |
+|---|---|---|
+| session start | `7ed707ed3` | fmt FAIL (4 sidecar files), clippy FAIL (6 errors) |
+| mid-audit | `b64b5b82a` | peer lands sidecar group reconstruction **and repairs fmt+clippy**; adds `.github/workflows/repair-tests.yml` |
+| final | `e9d1e7d1b` | Cargo.lock sync; fmt PASS, workspace clippy PASS (rerun exit 0), scoped `ffs-repair` clippy PASS |
+
+### Executed gates
+
+| Gate | Result | Evidence |
+|---|---|---|
+| `cargo fmt --check` | FAIL at `7ed707ed3` → **PASS** at `e9d1e7d1b` | exit 0 after `b64b5b82a`; earlier run diffed `ffs-repair` `src/bin/ffs-image-repair.rs`, `src/sidecar.rs`, `src/sidecar_restore.rs`, `tests/sidecar_cli.rs` |
+| `cargo clippy --workspace --all-targets -- -D warnings` | FAIL at `7ed707ed3` → **PASS** at `e9d1e7d1b` | 6 errors at old HEAD (`similar_names`, `chunks_exact_to_as_chunks`, `cast_sign_loss` ×3, all in `sidecar.rs`/`sidecar_restore.rs`); full rerun exit 0, only third-party future-incompat notes (`nix` 0.29/0.31) |
+| `cargo test --workspace --no-fail-fast` | **FAIL exit 101** | rch remote run, 1,113 s. Observed greens include ffs-repair 507, ffs-mvcc-scale targets 711/522, conformance-class 280/133/142/125, `fuse_e2e` 244/245, `parity_adversarial_e2e` 1/2. Two failures, dispositioned below. Earlier target output was truncated by the capture filter; no total pass count is claimed beyond what was captured |
+| `br dep cycles` | **PASS** | "No dependency cycles detected" |
+| inventory counts | **PASS** | table below |
+
+### Inventory claims vs direct counts (all verified)
+
+| README claim | Claimed | Counted this session | Method |
+|---|---|---|---|
+| Workspace members | 22 | **22** (21 `crates/*` + `tools/ffs-ops`) | `[workspace].members` in `Cargo.toml` |
+| Fuzz targets | 63 | **63** | `git ls-files` `fuzz_targets/*.rs` |
+| Rust benchmark files | 173 | **173** | `git ls-files crates/*/benches` |
+| Tracked E2E scripts | 125 | **125** | `git ls-files scripts/e2e/*.sh` |
+| Tracked insta snapshots | 226 | **226** | `git ls-files '*.snap'` |
+| `FfsError` variants | 21 | **21** | enum extraction, `crates/ffs-error/src/lib.rs` |
+| Evidence-ledger event types | 23 | **23** | enum extraction, `crates/ffs-repair/src/evidence.rs` |
+| tokio dependencies | 0 | **0** | grep of all workspace `Cargo.toml`s |
+| `unsafe_code = "forbid"` | workspace-wide | **yes** | `[workspace.lints.rust]` in `Cargo.toml` + 20 crate-root attributes |
+| Release-gate policy + threat model | present | **present** | `tests/release-gates/release_gate_policy_v1.json` (22 KB), `security/adversarial_image_threat_model.json` (53 KB) |
+| Evidence CLI presets | 8 | **present** | `replay-anomalies`/`repair-live` et al. in `crates/ffs-cli/src/cmd_evidence.rs` |
+| Parity denominator 97/97 | 97 | 27+27+14+19+10 = **97** per `FEATURE_PARITY.md` §1 | static sum; live `ffs-harness parity` output recorded under Functional probes below |
+
+### Failures, root-caused
+
+| Failure | Root cause | Introduced by | Disposition |
+|---|---|---|---|
+| fmt + clippy red at session start | `e34655551` + `7ed707ed3` landed new sidecar modules without running the four gates | same commits (2026-09-22) | **Self-healed same day** by `b64b5b82a` (which also added a repair CI workflow). Main was red for a window measured in hours. Bead follow-up not filed: fixed state verified at `e9d1e7d1b`; recurrence risk addressed by the new workflow |
+| `gdt_eager_mounted_forensics_bd_d2hdc` (deterministic, 2/2 runs) | `TempDir::new()` honors the rch job's repo-anchored `TMPDIR`; fusermount3 refuses the FUSE mount at `.rch-tmp/.tmp*/mnt` on the worker (`fusermount3: mount failed: Permission denied`), the mount thread's `expect` at `fuse_e2e.rs:17951` fires, and the readiness assert at `:184` times out. Failure occurs in fusermount3 **before any FrankenFS filesystem logic runs**; 244/245 sibling tests in the same binary — including mounted read-write paths — pass on the same worker | `bd-d2hdc` characterization test (landed 2026-09-19→22; bead closed "not reproduced on current build; mounted characterization test landed") | **New bead `bd-9l7l8`.** The test needs a worker-local (`/tmp`) mountpoint or the standard capability-skip probe. Critically: the eager-GDT divergence question `bd-d2hdc` promised to answer **remains unproven** — the test cannot execute on this fleet configuration. Do not weaken or delete the characterization |
+| `real_suite_run_promotes_exactly_its_mapped_capability_rows` | "error: source changed during test execution" — the 136 s parity-promotion gate observed peer agents mutating the shared live tree mid-run | none (correct fail-closed behavior) | **Passes on isolated rerun** (170 s, exit 0, same session). No bead: this is the parity-honesty machinery refusing to certify under a moving source identity — exactly its contract. Environment-limited on a live swarm workspace only |
+
+### Functional probes (non-destructive, rch `--job` workers)
+
+- **Mounted surface:** `fuse_e2e` 244/245 passing in the full-suite run — RO+RW mounts, namespace operations, differential oracles — is itself the strongest live-mount evidence this session; the single failure is the environment-bound characterization test above.
+- Probe battery (`rc-probe.sh`: `ffs mkfs` fresh 64 MiB temp image → `inspect`/`info --groups --journal`/`dump dir`/`scrub` → `ffs-harness parity` → `check-fixtures` → `ffs-demo self-healing` → read-only FUSE mount + `fusermount3 -u`): **all probes exit 0** (rch `--job` worker, warm build, 59 s end-to-end). Highlights:
+  - `ffs-harness parity`: `overall_implemented: 97, overall_total: 97` — the README denominator prints from the live binary. Equally important, the honesty columns report `total_rows: 78, evidence_backed_rows: 0` and every contract row `"verified": false, "reason": "suite not executed"`: without `--verify`, zero capability rows carry executed evidence, exactly as the README's parity-honesty section declares. 97/97 is declared-contract accounting, not execution evidence — the machinery enforces its own honesty.
+  - `check-fixtures` PASS: ext4 fixture (block_size 4096, volume `frankenfs`) and btrfs fixture (nodesize 16384, label `ffs-lab`) both validate.
+  - `ffs-demo self-healing` **PASS**: 8 MiB image, 10 payload files / 40 blocks, 1 block corrupted (2%), RaptorQ repair recovered the block in 63 ms, all 10 files verified OK.
+  - Read-only FUSE mount of the fresh image listed root (`lost+found`) through the real kernel FUSE path and unmounted cleanly (`fusermount3 -u`, exit 0). Artifacts in `probe-out/` (untracked).
+
+### Operational observations (environment, not tree defects)
+
+1. **rch fleet saturation is now the primary gate-execution bottleneck.** During this session: direct `cargo test` was hook-refused repeatedly (`insufficient_total_slots`), two remote builds completed but failed artifact transfer (RCH-E309, exit 102), and one job hit `queue_timeout` after 300 s. The working pattern for evidence runs: `rch exec --job --result-dir <dir> -- bash <script>`, retry on refusal.
+2. **Stale peer FUSE mount at `.rch-tmp/.tmpSFpukJ/mnt` is still live** (root-owned `lost+found`, unreadable to ordinary agents; `mountpoint(1)` confirms). It pollutes `git status` with permission warnings. Left untouched per non-interference policy; the owner should `fusermount3 -u` it.
+3. Tracked Rust LOC has grown to **≈ 704K lines** (`git ls-files '*.rs'`: 642,110 in `crates/`, 23,495 in `tools/`, 21,745 in `fuzz/`) vs the 424K cited in the May bridge plan — the May architecture conclusions predate ~66% of the current code.
+
+### What moved since the 2026-09-21 check
+
+- The six `ffs-harness` failures from that check are gone from the captured output: checksum manifests, fuzz-smoke pins, module census, and the mounted-suite failures (`bd-90aey`) all pass in this run's `fuse_e2e` (244/245) and conformance-class targets — the delivery-progress header above is confirmed against fresh execution, not just prose.
+- New work landed during the window: ext4 orphan-on-unlink lifetime fix (`open_unlink_fd_lifetime`), profile-freshness gate repair (`bd-awvjj`), sidecar-protected offline image repair (`e34655551`, `b64b5b82a`, `7ed707ed3` + `docs/sidecar-recovery.md` + repair CI workflow).
+- Open beads: 5 (`bd-z5bav` delivery contract, `bd-j7a4e` mounted repair freshness, `bd-mjxxk` multi-device matrix, `bd-xmh5g` perf gaps, `bd-btrfs-verify-default-decision-v81jt`), none in progress; plus this session's `bd-kiw6c` (audit, closing) and `bd-9l7l8` (gdt characterization fleet-portability).
+
+**Bottom line:** at `e9d1e7d1b` the four-gate merge rule is satisfied on fmt and clippy; the workspace test suite is red only where a brand-new characterization test meets a fleet capability boundary — with the substantive eager-GDT divergence question still open behind it (`bd-9l7l8`). Every checked README inventory number is true. The delivery contract (`bd-z5bav`) remains the open acceptance gate, unchanged from the header above.
+
 ## Delivery progress — 2026-09-22
 
 Both harness-correctness gaps found by the 2026-09-21 check are closed on this
