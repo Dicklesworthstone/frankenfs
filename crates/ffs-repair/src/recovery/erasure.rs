@@ -537,7 +537,7 @@ mod tests {
         device.persistent_fault.store(true, Ordering::Relaxed);
         let result = recover(&device, layout, &[1]);
         assert!(!result.is_success());
-        assert!(result.repaired_blocks.is_empty());
+        assert_eq!(result.repaired_blocks, [] as [BlockNumber; 0]);
         assert_eq!(*device.writes.lock().expect("writes"), [BlockNumber(1)]);
     }
 
@@ -633,7 +633,7 @@ mod tests {
         let result = recover(&device, layout, &[1]);
         assert!(!result.is_success());
         assert_eq!(result.evidence.symbols_available, 0);
-        assert!(result.repaired_blocks.is_empty());
+        assert_eq!(result.repaired_blocks, [] as [BlockNumber; 0]);
         assert!(device.writes.lock().expect("writes").is_empty());
     }
 

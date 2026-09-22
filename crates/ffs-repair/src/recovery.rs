@@ -1764,7 +1764,7 @@ mod tests {
         let result = verified_recovery(&cx, &device);
         assert!(!result.is_success());
         assert_eq!(result.evidence.symbols_available, 0);
-        assert!(result.repaired_blocks.is_empty());
+        assert_eq!(result.repaired_blocks, [] as [BlockNumber; 0]);
         assert_eq!(device.writes.load(Ordering::Relaxed), 0);
     }
 
@@ -1802,7 +1802,7 @@ mod tests {
         let result = verified_recovery(&cx, &device);
         assert!(!result.is_success());
         assert_eq!(device.writes.load(Ordering::Relaxed), 0);
-        assert!(result.repaired_blocks.is_empty());
+        assert_eq!(result.repaired_blocks, [] as [BlockNumber; 0]);
         assert!(
             result
                 .evidence
