@@ -38,9 +38,6 @@
     }
   },
   "reason": "mounted benchmark probe completed",
-  "required_capabilities": [
-    "benchmark_host",
-    "fuse"
-  ],
+  "required_capabilities": ["benchmark_host", "fuse"],
   "schema_version": 1
 }
