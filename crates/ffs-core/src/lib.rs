@@ -12522,12 +12522,24 @@ impl OpenFs {
         if let Some(devices) = &self.btrfs_devices {
             // Attached-device mounts cannot enable writes or replay an MVCC WAL.
             // There is therefore no physical-address-only overlay to bypass here.
-            let bytes = devices
+            match devices
                 .readers
                 .read_logical(cx, &ctx.chunks, logical, out.len())
-                .map_err(btrfs_device_error_to_ffs)?;
-            out.copy_from_slice(&bytes);
-            return Ok(());
+            {
+                Ok(bytes) => {
+                    out.copy_from_slice(&bytes);
+                    return Ok(());
+                }
+                Err(error) => {
+                    if self
+                        .btrfs_read_logical_degraded(cx, ctx, devices, logical, out)
+                        .is_ok()
+                    {
+                        return Ok(());
+                    }
+                    return Err(btrfs_device_error_to_ffs(error));
+                }
+            }
         }
         let block_size = u64::from(self.block_size());
         let bs_usize = block_size as usize;
@@ -12602,6 +12614,215 @@ impl OpenFs {
         }
 
         Ok(())
+    }
+
+    #[expect(clippy::cast_possible_truncation)]
+    fn btrfs_read_logical_degraded(
+        &self,
+        cx: &Cx,
+        ctx: &BtrfsContext,
+        devices: &BtrfsReadDevices,
+        mut logical: u64,
+        mut out: &mut [u8],
+    ) -> Result<(), FfsError> {
+        while !out.is_empty() {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            let mapping = ffs_ondisk::map_logical_to_stripes(&ctx.chunks, logical)
+                .map_err(|error| parse_to_ffs_error(&error))?
+                .ok_or_else(|| FfsError::Corruption {
+                    block: logical,
+                    detail: "logical address is not covered by any btrfs chunk".into(),
+                })?;
+            let take = (out.len() as u64).min(mapping.contiguous_len);
+            let segment_len = usize::try_from(take)
+                .map_err(|_| FfsError::Format("btrfs segment length overflow".into()))?;
+
+            let mut read_bytes: Option<Vec<u8>> = None;
+            for stripe in &mapping.stripes {
+                if let Ok(bytes) = devices
+                    .readers
+                    .read_physical(cx, stripe.devid, stripe.physical, segment_len)
+                {
+                    read_bytes = Some(bytes);
+                    break;
+                }
+            }
+
+            if read_bytes.is_none()
+                && matches!(
+                    mapping.profile,
+                    ffs_ondisk::BtrfsRaidProfile::Raid5 | ffs_ondisk::BtrfsRaidProfile::Raid6
+                )
+            {
+                read_bytes = self.btrfs_reconstruct_raid56_segment(
+                    cx,
+                    ctx,
+                    devices,
+                    &mapping,
+                    logical,
+                    segment_len,
+                )?;
+            }
+
+            let bytes = read_bytes.ok_or_else(|| FfsError::Corruption {
+                block: logical,
+                detail: "no readable stripe or parity in degraded btrfs layout".into(),
+            })?;
+            out[..segment_len].copy_from_slice(&bytes);
+            logical += take;
+            out = &mut out[segment_len..];
+        }
+        Ok(())
+    }
+
+    #[expect(clippy::cast_possible_truncation)]
+    fn btrfs_reconstruct_raid56_segment(
+        &self,
+        cx: &Cx,
+        ctx: &BtrfsContext,
+        devices: &BtrfsReadDevices,
+        mapping: &ffs_ondisk::BtrfsStripeMapping,
+        logical: u64,
+        segment_len: usize,
+    ) -> Result<Option<Vec<u8>>, FfsError> {
+        let is_raid6 = matches!(mapping.profile, ffs_ondisk::BtrfsRaidProfile::Raid6);
+        let Some(row) = ffs_ondisk::resolve_raid56_row(&ctx.chunks, logical)
+            .map_err(|error| parse_to_ffs_error(&error))?
+        else {
+            return Ok(None);
+        };
+        let raid56_data_devid = mapping.stripes.first().map(|stripe| stripe.devid);
+        let mut xor_others: Option<Vec<u8>> = None;
+        let mut g_xor_others: Option<Vec<u8>> = None;
+        let mut others_failed: Vec<usize> = Vec::new();
+        let mut p_bytes: Option<Vec<u8>> = None;
+        let mut q_bytes: Option<Vec<u8>> = None;
+
+        for (j, slot) in row.data_slots.iter().enumerate() {
+            if Some(slot.devid) == raid56_data_devid {
+                continue;
+            }
+            match devices
+                .readers
+                .read_physical(cx, slot.devid, slot.physical, segment_len)
+            {
+                Ok(partner) => {
+                    let merged = xor_others.as_ref().map_or_else(
+                        || partner.clone(),
+                        |partial| {
+                            let mut merged = partial.clone();
+                            for (byte, other) in merged.iter_mut().zip(partner.iter()) {
+                                *byte ^= *other;
+                            }
+                            merged
+                        },
+                    );
+                    xor_others = Some(merged);
+                    if is_raid6 {
+                        let weighted: Vec<u8> = partner
+                            .iter()
+                            .map(|b| {
+                                ffs_ondisk::btrfs_raid56_gmul(
+                                    ffs_ondisk::btrfs_raid56_gexp(j),
+                                    *b,
+                                )
+                            })
+                            .collect();
+                        g_xor_others = Some(match g_xor_others {
+                            None => weighted,
+                            Some(mut partial) => {
+                                for (byte, other) in partial.iter_mut().zip(weighted.iter()) {
+                                    *byte ^= *other;
+                                }
+                                partial
+                            }
+                        });
+                    }
+                }
+                Err(ffs_btrfs::BtrfsDeviceError::Cancelled) => return Err(FfsError::Cancelled),
+                Err(_) => others_failed.push(j),
+            }
+        }
+
+        if let Some(p_slot) = row.parity_slots.first() {
+            match devices
+                .readers
+                .read_physical(cx, p_slot.devid, p_slot.physical, segment_len)
+            {
+                Ok(partner) => p_bytes = Some(partner),
+                Err(ffs_btrfs::BtrfsDeviceError::Cancelled) => return Err(FfsError::Cancelled),
+                Err(_) => {}
+            }
+        }
+        if is_raid6 && let Some(q_slot) = row.parity_slots.get(1) {
+            match devices
+                .readers
+                .read_physical(cx, q_slot.devid, q_slot.physical, segment_len)
+            {
+                Ok(partner) => q_bytes = Some(partner),
+                Err(ffs_btrfs::BtrfsDeviceError::Cancelled) => return Err(FfsError::Cancelled),
+                Err(_) => {}
+            }
+        }
+
+        let rebuilt: Option<Vec<u8>> = if others_failed.is_empty() {
+            match (p_bytes.as_ref(), xor_others.as_ref()) {
+                (Some(p), Some(xor)) => {
+                    Some(p.iter().zip(xor.iter()).map(|(a, b)| a ^ b).collect())
+                }
+                (Some(p), None) => Some(p.clone()),
+                _ => None,
+            }
+        } else if is_raid6
+            && others_failed.len() == 1
+            && let (Some(p), Some(q)) = (p_bytes.as_ref(), q_bytes.as_ref())
+        {
+            let failed_j = others_failed[0];
+            let j_star = row
+                .data_slots
+                .iter()
+                .position(|slot| Some(slot.devid) == raid56_data_devid)
+                .unwrap_or(0);
+            let g_p = ffs_ondisk::btrfs_raid56_gexp(j_star);
+            let g_k = ffs_ondisk::btrfs_raid56_gexp(failed_j);
+            let denominator = g_p ^ g_k;
+            if denominator == 0 {
+                None
+            } else {
+                let zeroes = vec![0_u8; segment_len];
+                let a_bytes: Vec<u8> = p
+                    .iter()
+                    .zip(xor_others.as_deref().unwrap_or(&zeroes))
+                    .map(|(p_byte, o)| p_byte ^ o)
+                    .collect();
+                let b_bytes: Vec<u8> = q
+                    .iter()
+                    .zip(g_xor_others.as_deref().unwrap_or(&zeroes))
+                    .map(|(q_byte, g)| q_byte ^ g)
+                    .collect();
+                let failed: Vec<u8> = a_bytes
+                    .iter()
+                    .zip(b_bytes.iter())
+                    .map(|(a_byte, b_byte)| {
+                        ffs_ondisk::btrfs_raid56_gdiv(
+                            b_byte ^ ffs_ondisk::btrfs_raid56_gmul(g_p, *a_byte),
+                            denominator,
+                        )
+                    })
+                    .collect();
+                Some(
+                    a_bytes
+                        .iter()
+                        .zip(failed.iter())
+                        .map(|(a, f)| a ^ f)
+                        .collect(),
+                )
+            }
+        } else {
+            None
+        };
+
+        Ok(rebuilt)
     }
 
     /// Decompress btrfs extent data based on the compression type field.
@@ -13106,163 +13327,18 @@ impl OpenFs {
                     mapping.profile,
                     ffs_ondisk::BtrfsRaidProfile::Raid5 | ffs_ondisk::BtrfsRaidProfile::Raid6
                 )
-                && let Ok(Some(row)) = ffs_ondisk::resolve_raid56_row(&ctx.chunks, sector_start)
             {
-                let is_raid6 = matches!(mapping.profile, ffs_ondisk::BtrfsRaidProfile::Raid6);
-                let mut xor_others: Option<Vec<u8>> = None;
-                let mut g_xor_others: Option<Vec<u8>> = None;
-                let mut others_failed: Vec<usize> = Vec::new();
-                let mut p_bytes: Option<Vec<u8>> = None;
-                let mut q_bytes: Option<Vec<u8>> = None;
-                for (j, slot) in row.data_slots.iter().enumerate() {
-                    if Some(slot.devid) == raid56_data_devid {
-                        continue;
-                    }
-                    match devices
-                        .readers
-                        .read_physical(cx, slot.devid, slot.physical, sectorsize)
-                    {
-                        Ok(partner) => {
-                            let merged = xor_others.as_ref().map_or_else(
-                                || partner.clone(),
-                                |partial| {
-                                    let mut merged = partial.clone();
-                                    for (byte, other) in merged.iter_mut().zip(partner.iter()) {
-                                        *byte ^= *other;
-                                    }
-                                    merged
-                                },
-                            );
-                            xor_others = Some(merged);
-                            if is_raid6 {
-                                let weighted: Vec<u8> = partner
-                                    .iter()
-                                    .map(|b| {
-                                        ffs_ondisk::btrfs_raid56_gmul(
-                                            ffs_ondisk::btrfs_raid56_gexp(j),
-                                            *b,
-                                        )
-                                    })
-                                    .collect();
-                                g_xor_others = Some(match g_xor_others {
-                                    None => weighted,
-                                    Some(mut partial) => {
-                                        for (byte, other) in partial.iter_mut().zip(weighted.iter())
-                                        {
-                                            *byte ^= *other;
-                                        }
-                                        partial
-                                    }
-                                });
-                            }
-                        }
-                        Err(ffs_btrfs::BtrfsDeviceError::Cancelled) => {
-                            return Err(FfsError::Cancelled);
-                        }
-                        Err(_) => others_failed.push(j),
-                    }
-                }
-                match devices.readers.read_physical(
+                if let Ok(Some(bytes)) = self.btrfs_reconstruct_raid56_segment(
                     cx,
-                    row.parity_slots[0].devid,
-                    row.parity_slots[0].physical,
+                    ctx,
+                    devices,
+                    &mapping,
+                    sector_start,
                     sectorsize,
                 ) {
-                    Ok(partner) => p_bytes = Some(partner),
-                    Err(ffs_btrfs::BtrfsDeviceError::Cancelled) => {
-                        return Err(FfsError::Cancelled);
+                    if ffs_btrfs::btrfs_data_csum_matches(ctx.csum_type, &bytes, expected) {
+                        verified = Some(bytes);
                     }
-                    Err(_) => {}
-                }
-                if is_raid6 && let Some(q_slot) = row.parity_slots.get(1) {
-                    match devices.readers.read_physical(
-                        cx,
-                        q_slot.devid,
-                        q_slot.physical,
-                        sectorsize,
-                    ) {
-                        Ok(partner) => q_bytes = Some(partner),
-                        Err(ffs_btrfs::BtrfsDeviceError::Cancelled) => {
-                            return Err(FfsError::Cancelled);
-                        }
-                        Err(_) => {}
-                    }
-                }
-
-                let rebuilt: Option<Vec<u8>> = if others_failed.is_empty() {
-                    // Single erasure: the primary slot. P is the XOR of the
-                    // row's data slots, so P ⊕ (surviving data slots) is the
-                    // primary — for RAID5 and RAID6 alike.
-                    match (p_bytes.as_ref(), xor_others.as_ref()) {
-                        (Some(p), Some(xor)) => {
-                            Some(p.iter().zip(xor.iter()).map(|(a, b)| a ^ b).collect())
-                        }
-                        (Some(p), None) => Some(p.clone()),
-                        _ => None,
-                    }
-                } else if is_raid6
-                    && others_failed.len() == 1
-                    && let (Some(p), Some(q)) = (p_bytes.as_ref(), q_bytes.as_ref())
-                {
-                    // Two erasures: the primary and one other data slot.
-                    // With A = P ⊕ readable-others = primary ⊕ failed and
-                    // B = Q ⊕ Σ g^j·readable-others = g^j*·primary ⊕ g^k·failed,
-                    // solve the 2x2 GF(256) system:
-                    //   failed = (B ⊕ g^j*·A) / (g^j* ⊕ g^k)
-                    //   primary = A ⊕ failed
-                    let failed_j = others_failed[0];
-                    let j_star = row
-                        .data_slots
-                        .iter()
-                        .position(|slot| Some(slot.devid) == raid56_data_devid)
-                        .expect("primary slot is a row data slot");
-                    let g_p = ffs_ondisk::btrfs_raid56_gexp(j_star);
-                    let g_k = ffs_ondisk::btrfs_raid56_gexp(failed_j);
-                    let denominator = g_p ^ g_k;
-                    if denominator == 0 {
-                        // Same generator exponent: the syndromes cannot
-                        // separate the two erasures. (Unreachable for
-                        // distinct logical slots of one row.)
-                        None
-                    } else {
-                        let zeroes = vec![0_u8; sectorsize];
-                        let a_bytes: Vec<u8> = p
-                            .iter()
-                            .zip(xor_others.as_deref().unwrap_or(&zeroes))
-                            .map(|(p_byte, o)| p_byte ^ o)
-                            .collect();
-                        let b_bytes: Vec<u8> = q
-                            .iter()
-                            .zip(g_xor_others.as_deref().unwrap_or(&zeroes))
-                            .map(|(q_byte, g)| q_byte ^ g)
-                            .collect();
-                        let failed: Vec<u8> = a_bytes
-                            .iter()
-                            .zip(b_bytes.iter())
-                            .map(|(a_byte, b_byte)| {
-                                ffs_ondisk::btrfs_raid56_gdiv(
-                                    b_byte ^ ffs_ondisk::btrfs_raid56_gmul(g_p, *a_byte),
-                                    denominator,
-                                )
-                            })
-                            .collect();
-                        Some(
-                            a_bytes
-                                .iter()
-                                .zip(failed.iter())
-                                .map(|(a, f)| a ^ f)
-                                .collect::<Vec<u8>>(),
-                        )
-                    }
-                } else {
-                    // Three-or-more erasures, or a lost parity with a lost
-                    // data slot: not recoverable from this row.
-                    None
-                };
-                if let Some(bytes) = rebuilt
-                    && ffs_btrfs::btrfs_data_csum_matches(ctx.csum_type, &bytes, expected)
-                {
-                    verified = Some(bytes);
                 }
             }
             // A later absent mirror must not hide corruption observed in an
