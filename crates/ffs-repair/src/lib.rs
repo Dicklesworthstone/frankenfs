@@ -17,5 +17,6 @@ pub mod pipeline;
 pub mod por;
 pub mod recovery;
 pub mod scrub;
+pub mod sidecar;
 pub mod storage;
 pub mod symbol;

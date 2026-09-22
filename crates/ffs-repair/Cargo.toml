@@ -16,10 +16,13 @@ ffs-block = { workspace = true }
 ffs-ondisk = { workspace = true }
 asupersync = { workspace = true }
 blake3 = { workspace = true }
+clap = { workspace = true }
 crc32c = { workspace = true }
+ctrlc = { workspace = true }
 rayon = { workspace = true }
 serde = { workspace = true }
 serde_json = { workspace = true }
+tempfile = { workspace = true }
 tracing = { workspace = true }
 
 [dev-dependencies]
@@ -84,6 +87,10 @@ harness = false
 [[bin]]
 name = "ffs-demo"
 path = "src/bin/ffs-demo.rs"
+
+[[bin]]
+name = "ffs-image-repair"
+path = "src/bin/ffs-image-repair.rs"
 
 [lints]
 workspace = true

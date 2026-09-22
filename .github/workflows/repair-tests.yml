@@ -1,0 +1,32 @@
+name: Repair Tests
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'crates/ffs-repair/**'
+      - 'crates/ffs-block/**'
+      - 'crates/ffs-types/**'
+      - 'crates/ffs-error/**'
+      - 'Cargo.toml'
+      - 'Cargo.lock'
+      - 'rust-toolchain.toml'
+      - '.github/workflows/repair-tests.yml'
+  pull_request:
+    branches: [main]
+
+jobs:
+  repair:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Compile and run repair tests
+        run: cargo test -p ffs-repair
+      - name: Repair Clippy
+        run: cargo clippy -p ffs-repair --all-targets -- -D warnings
+      - name: Repair formatting
+        run: cargo fmt -p ffs-repair --check
