@@ -1234,8 +1234,10 @@ version = "0.1.0"
 dependencies = [
  "asupersync",
  "blake3",
+ "clap",
  "crc32c",
  "criterion",
+ "ctrlc",
  "ffs-block",
  "ffs-error",
  "ffs-ondisk",
@@ -1247,6 +1249,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.11.0",
+ "tempfile",
  "tracing",
 ]
 
