@@ -2,32 +2,36 @@
   "description": "ext4 htree directory root block (DX root with 3 entries)",
   "size": 4096,
   "writes": [
-    {"offset":   0, "hex": "02000000", "_comment": "dot entry: inode = 2 (root)"},
-    {"offset":   4, "hex": "0c00", "_comment": "dot entry: rec_len = 12"},
-    {"offset":   6, "hex": "01", "_comment": "dot entry: name_len = 1"},
-    {"offset":   7, "hex": "02", "_comment": "dot entry: file_type = FT_DIR"},
-    {"offset":   8, "hex": "2e", "_comment": "dot entry: name = '.'"},
+    { "offset": 0, "hex": "02000000", "_comment": "dot entry: inode = 2 (root)" },
+    { "offset": 4, "hex": "0c00", "_comment": "dot entry: rec_len = 12" },
+    { "offset": 6, "hex": "01", "_comment": "dot entry: name_len = 1" },
+    { "offset": 7, "hex": "02", "_comment": "dot entry: file_type = FT_DIR" },
+    { "offset": 8, "hex": "2e", "_comment": "dot entry: name = '.'" },
 
-    {"offset":  12, "hex": "02000000", "_comment": "dotdot entry: inode = 2 (parent)"},
-    {"offset":  16, "hex": "0c00", "_comment": "dotdot entry: rec_len = 12"},
-    {"offset":  18, "hex": "02", "_comment": "dotdot entry: name_len = 2"},
-    {"offset":  19, "hex": "02", "_comment": "dotdot entry: file_type = FT_DIR"},
-    {"offset":  20, "hex": "2e2e", "_comment": "dotdot entry: name = '..'"},
+    { "offset": 12, "hex": "02000000", "_comment": "dotdot entry: inode = 2 (parent)" },
+    { "offset": 16, "hex": "0c00", "_comment": "dotdot entry: rec_len = 12" },
+    { "offset": 18, "hex": "02", "_comment": "dotdot entry: name_len = 2" },
+    { "offset": 19, "hex": "02", "_comment": "dotdot entry: file_type = FT_DIR" },
+    { "offset": 20, "hex": "2e2e", "_comment": "dotdot entry: name = '..'" },
 
-    {"offset":  24, "hex": "00000000", "_comment": "dx_root_info: reserved = 0"},
-    {"offset":  28, "hex": "01", "_comment": "dx_root_info: hash_version = 1 (half_md4)"},
-    {"offset":  29, "hex": "08", "_comment": "dx_root_info: info_length = 8"},
-    {"offset":  30, "hex": "00", "_comment": "dx_root_info: indirect_levels = 0 (single level)"},
-    {"offset":  31, "hex": "00", "_comment": "dx_root_info: unused_flags = 0"},
+    { "offset": 24, "hex": "00000000", "_comment": "dx_root_info: reserved = 0" },
+    { "offset": 28, "hex": "01", "_comment": "dx_root_info: hash_version = 1 (half_md4)" },
+    { "offset": 29, "hex": "08", "_comment": "dx_root_info: info_length = 8" },
+    { "offset": 30, "hex": "00", "_comment": "dx_root_info: indirect_levels = 0 (single level)" },
+    { "offset": 31, "hex": "00", "_comment": "dx_root_info: unused_flags = 0" },
 
-    {"offset":  32, "hex": "f401", "_comment": "dx_countlimit: limit = 500 (0x1f4)"},
-    {"offset":  34, "hex": "0300", "_comment": "dx_countlimit: count = 3"},
-    {"offset":  36, "hex": "01000000", "_comment": "dx_entry[0]: block = 1 (sentinel, hash implicitly 0)"},
+    { "offset": 32, "hex": "f401", "_comment": "dx_countlimit: limit = 500 (0x1f4)" },
+    { "offset": 34, "hex": "0300", "_comment": "dx_countlimit: count = 3" },
+    {
+      "offset": 36,
+      "hex": "01000000",
+      "_comment": "dx_entry[0]: block = 1 (sentinel, hash implicitly 0)"
+    },
 
-    {"offset":  40, "hex": "00100000", "_comment": "dx_entry[1]: hash = 0x1000"},
-    {"offset":  44, "hex": "02000000", "_comment": "dx_entry[1]: block = 2"},
+    { "offset": 40, "hex": "00100000", "_comment": "dx_entry[1]: hash = 0x1000" },
+    { "offset": 44, "hex": "02000000", "_comment": "dx_entry[1]: block = 2" },
 
-    {"offset":  48, "hex": "00800000", "_comment": "dx_entry[2]: hash = 0x8000"},
-    {"offset":  52, "hex": "03000000", "_comment": "dx_entry[2]: block = 3"}
+    { "offset": 48, "hex": "00800000", "_comment": "dx_entry[2]: hash = 0x8000" },
+    { "offset": 52, "hex": "03000000", "_comment": "dx_entry[2]: block = 3" }
   ]
 }

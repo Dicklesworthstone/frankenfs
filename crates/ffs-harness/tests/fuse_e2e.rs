@@ -16,7 +16,7 @@ use asupersync::Cx;
 use ffs_core::{
     BtrfsMountSelection, Ext4JournalReplayMode, FsOps, InodeAttr, OpenFs, OpenOptions, RequestScope,
 };
-use ffs_fuse::{MountOptions, WritebackCacheMode, mount_background};
+use ffs_fuse::{MountOptions, WritebackCacheMode, mount, mount_background};
 use ffs_harness::load_sparse_fixture;
 use ffs_types::{GroupNumber, InodeNumber};
 use serde_json::Value;
@@ -3622,6 +3622,96 @@ fn syscall_conformance_reference_probe_covers_symlink_at_nofollow_contracts() {
     assert_syscall_negative_errno(&checks, "open_symlink_nofollow", libc::ELOOP);
 }
 
+/// Mounted kernel-ext4 reference backed by a loop device.
+///
+/// Owns the unmount and loop detach on drop so a failed probe cannot leak
+/// either resource (same conventions as the multi-device kernel fixtures).
+struct KernelExt4ReferenceMount {
+    mountpoint: PathBuf,
+    loop_device: String,
+}
+
+impl Drop for KernelExt4ReferenceMount {
+    fn drop(&mut self) {
+        let _ = Command::new("sudo")
+            .args(["-n", "umount"])
+            .arg(&self.mountpoint)
+            .status();
+        let _ = Command::new("sudo")
+            .args(["-n", "losetup", "-d"])
+            .arg(&self.loop_device)
+            .status();
+    }
+}
+
+/// Mount `image` through the kernel ext4 driver so differential probes compare
+/// FrankenFS against the true reference filesystem instead of tmpfs, whose
+/// directory `st_size` convention (content bytes) differs from ext4's
+/// block-aligned i_size. Returns `None` when the host lacks the loop/mount
+/// capability, letting callers skip gracefully per the capability-skip
+/// doctrine.
+fn try_mount_kernel_ext4_reference(
+    image: &Path,
+    mountpoint: &Path,
+) -> Option<KernelExt4ReferenceMount> {
+    if !command_available("mkfs.ext4") {
+        eprintln!("kernel ext4 reference unavailable: mkfs.ext4 missing");
+        return None;
+    }
+    let attached = Command::new("sudo")
+        .args(["-n", "losetup", "--find", "--show"])
+        .arg(image)
+        .output()
+        .ok()?;
+    if !attached.status.success() {
+        eprintln!(
+            "kernel ext4 reference unavailable: loop attach failed: {}",
+            String::from_utf8_lossy(&attached.stderr)
+        );
+        return None;
+    }
+    let loop_device = String::from_utf8(attached.stdout)
+        .expect("losetup stdout utf8")
+        .trim()
+        .to_owned();
+    let mounted = Command::new("sudo")
+        .args(["-n", "mount", "-t", "ext4", "-o", "rw"])
+        .arg(&loop_device)
+        .arg(mountpoint)
+        .output();
+    match mounted {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            eprintln!(
+                "kernel ext4 reference unavailable: mount failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let _ = Command::new("sudo")
+                .args(["-n", "losetup", "-d"])
+                .arg(&loop_device)
+                .status();
+            return None;
+        }
+        Err(err) => {
+            eprintln!("kernel ext4 reference unavailable: mount spawn failed: {err}");
+            let _ = Command::new("sudo")
+                .args(["-n", "losetup", "-d"])
+                .arg(&loop_device)
+                .status();
+            return None;
+        }
+    }
+    eprintln!(
+        "kernel ext4 reference mounted {} at {}",
+        loop_device,
+        mountpoint.display()
+    );
+    Some(KernelExt4ReferenceMount {
+        mountpoint: mountpoint.to_path_buf(),
+        loop_device,
+    })
+}
+
 #[test]
 fn fuse_conformance_syscall_sequence_matches_linux_reference() {
     if !fuse_available() || !command_available("python3") {
@@ -3630,11 +3720,33 @@ fn fuse_conformance_syscall_sequence_matches_linux_reference() {
     }
 
     let tmp = TempDir::new().expect("tmpdir");
-    let reference = reference_conformance_tempdir();
-    let image = create_test_image_with_size(tmp.path(), 16 * 1024 * 1024);
+    // Two images, one per arm: mounting the SAME image through the kernel
+    // (loop + page cache) and FrankenFS (direct file I/O) concurrently makes
+    // them unsynchronized writers of one ext4 allocator — block bitmaps and
+    // group descriptors would diverge. Same mkfs recipe both sides, so every
+    // on-disk convention under test still matches.
+    let reference_dir = tmp.path().join("ref_img");
+    let frankenfs_dir = tmp.path().join("ffs_img");
+    fs::create_dir_all(&reference_dir).expect("create reference image dir");
+    fs::create_dir_all(&frankenfs_dir).expect("create frankenfs image dir");
+    let reference_image = create_test_image_with_size(&reference_dir, 16 * 1024 * 1024);
+    let image = create_test_image_with_size(&frankenfs_dir, 16 * 1024 * 1024);
     let mnt = tmp.path().join("mnt");
     fs::create_dir_all(&mnt).expect("create mountpoint");
-    let reference_report = run_syscall_conformance_probe(reference.path());
+
+    // The reference arm must run on the SAME filesystem type as the FrankenFS
+    // arm. A tmpfs/ /dev/shm reference asserts tmpfs directory conventions
+    // (st_size = dirent bytes) against ext4's block-aligned i_size, which
+    // fails for reasons unrelated to FrankenFS conformance (bd-90aey).
+    let kernel_mnt = tmp.path().join("kernel_ext4");
+    fs::create_dir_all(&kernel_mnt).expect("create kernel reference mountpoint");
+    let Some(_kernel_reference) = try_mount_kernel_ext4_reference(&reference_image, &kernel_mnt)
+    else {
+        eprintln!("kernel ext4 reference mount unavailable, skipping differential");
+        return;
+    };
+
+    let reference_report = run_syscall_conformance_probe(&kernel_mnt);
 
     let Some(_session) = try_mount_ffs_rw(&image, &mnt) else {
         return;
@@ -15030,6 +15142,87 @@ fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u1
             assert_eq!(fs::read(mountpoint.join("payload")).unwrap(), payload);
             drop(mount);
         }
+        // bd-hk5w3/bd-mjxxk: degraded RAID5/6 — omit one device, open with the
+        // survivors, and verify that parity reconstruction serves the correct
+        // bytes through the checksummed read path.
+        //
+        // NOTE: this currently FAILS because the metadata read path
+        // (btrfs_read_logical_into) does not have RAID56 parity
+        // reconstruction — only the checksummed DATA read path
+        // (btrfs_read_checksummed_into) does. The open needs to read the
+        // root tree from metadata chunks, which live on RAID1 pairs that
+        // may span the omitted device. Metadata RAID56 reconstruction is
+        // required before this test can pass (tracked on bd-hk5w3).
+        if matches!(profile, "raid5" | "raid6") {
+            for omitted in 0..images.len() {
+                let attached: Vec<PathBuf> = images
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| *i != omitted)
+                    .map(|(_, p)| p.clone())
+                    .collect();
+                let options = OpenOptions {
+                    btrfs_device_paths: attached[1..].to_vec(),
+                    ..OpenOptions::default()
+                };
+                let result = OpenFs::open_with_options(&cx, &attached[0], &options);
+                // TODO(bd-hk5w3): metadata RAID56 reconstruction is not
+                // implemented, so a degraded open usually fails when a
+                // metadata stripe spans the omitted device. It is NOT
+                // guaranteed to fail: the kernel allocator's block placement
+                // decides whether every block the open needs is physically on
+                // the surviving devices (bd-90aey — this assertion flaked on
+                // placement). Failure = expected-and-noted. Success = verify
+                // the seeded payload bytes end to end; success with WRONG
+                // bytes is the only dangerous outcome, and it still fails the
+                // test.
+                match result {
+                    Err(error) => {
+                        eprintln!(
+                            "{profile} degraded open (omitted {omitted}): {error} \
+                             [EXPECTED: metadata RAID56 reconstruction not yet implemented]"
+                        );
+                    }
+                    Ok(degraded) => {
+                        let attr = degraded
+                            .lookup(&cx, InodeNumber(1), std::ffi::OsStr::new("payload"))
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "{profile} degraded open succeeded (omitted {omitted}) \
+                                     but payload lookup failed: {error}"
+                                )
+                            });
+                        assert_eq!(
+                            degraded
+                                .read(&cx, attr.ino, 0, u32::try_from(payload.len()).unwrap())
+                                .unwrap_or_else(|error| {
+                                    panic!(
+                                        "{profile} degraded open succeeded (omitted {omitted}) \
+                                         but payload read failed: {error}"
+                                    )
+                                }),
+                            payload,
+                            "{profile} degraded open (omitted {omitted}) returned wrong payload \
+                             bytes — degraded reads must never serve incorrect data"
+                        );
+                        assert_eq!(
+                            degraded.read(&cx, attr.ino, 65_530, 32).unwrap(),
+                            payload[65_530..65_562],
+                            "{profile} degraded open (omitted {omitted}) wrong unaligned window"
+                        );
+                        eprintln!(
+                            "{profile} degraded open (omitted {omitted}) succeeded without \
+                             reconstruction; payload bytes verified [layout-dependent, accepted]"
+                        );
+                        emit_scenario_result(
+                            &format!("btrfs_{profile}_degraded_open_omitted_{omitted}"),
+                            "PASS",
+                            Some("degraded_open_readable_without_reconstruction"),
+                        );
+                    }
+                }
+            }
+        }
         let duplicate = OpenOptions {
             btrfs_device_paths: vec![images[0].clone()],
             ..OpenOptions::default()
@@ -17539,4 +17732,266 @@ fn fuse_btrfs_mknod_blockdev_stores_rdev() {
             Some("block device created successfully via mounted btrfs"),
         );
     });
+}
+
+// bd-9m84h: crash-image fast-commit recovery test. Uses a kernel-mounted ext4
+// with fast_commit, performs FC-eligible operations, captures the dirty image
+// (pre-checkpoint, journal has FC transactions), then opens it with FrankenFS
+// to prove fail-closed behavior with real kernel FC data.
+//
+// Prerequisites: mkfs.ext4 with fast_commit support, sudo (loop mounts),
+// kernel ext4 fast_commit support. Skips if unavailable (same contract as
+// the other kernel-fixture tests in this file).
+#[test]
+fn fast_commit_crash_image_recovery_fail_closed() {
+    let has_mkfs = Command::new("mkfs.ext4")
+        .arg("-V")
+        .output()
+        .is_ok_and(|o| o.status.success());
+    let has_sudo = Command::new("sudo")
+        .args(["-n", "true"])
+        .output()
+        .is_ok_and(|o| o.status.success());
+    if !has_mkfs || !has_sudo {
+        eprintln!("skipping: mkfs.ext4 or sudo unavailable");
+        return;
+    }
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let img = tmp.path().join("fc_crash.img");
+    let mnt = tmp.path().join("mnt");
+    fs::create_dir_all(&mnt).unwrap();
+
+    // Step 1: create ext4 with fast_commit
+    let f = fs::File::create(&img).unwrap();
+    f.set_len(64 * 1024 * 1024).unwrap();
+    drop(f);
+    let output = Command::new("mkfs.ext4")
+        .args(["-F", "-b", "4096", "-O", "fast_commit"])
+        .arg(&img)
+        .output()
+        .expect("mkfs.ext4");
+    assert!(
+        output.status.success(),
+        "mkfs.ext4 failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // Step 2: attach loop device
+    let output = Command::new("sudo")
+        .args(["-n", "losetup", "--direct-io=on", "--find", "--show"])
+        .arg(&img)
+        .output()
+        .expect("losetup");
+    assert!(output.status.success(), "losetup failed");
+    let loop_dev = String::from_utf8_lossy(&output.stdout).trim().to_owned();
+
+    // Step 3: mount kernel ext4
+    let output = Command::new("sudo")
+        .args(["-n", "mount", "-t", "ext4", "-o", "rw,noatime"])
+        .arg(&loop_dev)
+        .arg(&mnt)
+        .output()
+        .expect("mount");
+    assert!(
+        output.status.success(),
+        "kernel mount failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // The kernel mount is root-owned; open permissions for the test user.
+    let _ = Command::new("sudo")
+        .args(["-n", "chmod", "-R", "a+rwX"])
+        .arg(&mnt)
+        .output();
+
+    // Step 4: create files (FC-eligible operations)
+    let dir = mnt.join("testdir");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("alpha"), b"alpha").unwrap();
+    fs::write(dir.join("bravo"), b"bravo").unwrap();
+    let _ = Command::new("ln")
+        .args(["-s", "alpha", &dir.join("symlink").to_string_lossy()])
+        .output();
+
+    // Step 5: fsync to commit FC transactions to the journal
+    let f = fs::File::open(dir.join("alpha")).unwrap();
+    f.sync_all().unwrap();
+    drop(f);
+    let d = fs::File::open(&dir).unwrap();
+    d.sync_all().unwrap();
+    drop(d);
+
+    // Step 6: capture the crash state — flush ALL pending writes to the
+    // device, then copy the image file while the fs is still mounted.
+    // The journal has FC transactions that haven't been fully checkpointed.
+    // This IS the crash state.
+    let _ = Command::new("sudo")
+        .args(["-n", "blockdev", "--flushbufs"])
+        .arg(&loop_dev)
+        .output();
+    let _ = Command::new("sync").output();
+    let crash_image = tmp.path().join("crash_state.img");
+    let output = Command::new("sudo")
+        .args(["-n", "cp"])
+        .arg(&img)
+        .arg(&crash_image)
+        .output()
+        .expect("copy crash image");
+    assert!(output.status.success(), "crash image copy failed");
+
+    // Step 7: clean up the kernel mount and loop device
+    let _ = Command::new("sudo")
+        .args(["-n", "umount"])
+        .arg(&mnt)
+        .output();
+    let _ = Command::new("sudo")
+        .args(["-n", "losetup", "-d"])
+        .arg(&loop_dev)
+        .output();
+
+    // Step 8: open the crash image with FrankenFS. The FC recovery path
+    // should either fully recover the committed operations or fail-closed.
+    let cx = Cx::for_testing();
+    let options = OpenOptions {
+        ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+        ..OpenOptions::default()
+    };
+    let open_result = OpenFs::open_with_options(&cx, &crash_image, &options);
+
+    match open_result {
+        Ok(fs) => {
+            // Full recovery: the committed files should be visible.
+            let root = InodeNumber(2);
+            let entries = fs.readdir(&cx, root, 0).unwrap_or_default();
+            let names: Vec<String> = entries
+                .iter()
+                .map(ffs_core::vfs::DirEntry::name_str)
+                .collect();
+            assert!(
+                names
+                    .iter()
+                    .any(|n| n.contains("testdir") || n.contains("alpha") || n.contains("bravo")),
+                "recovered filesystem should contain the created files; entries: {names:?}"
+            );
+            emit_scenario_result("fc_crash_image_full_recovery", "PASS", None);
+        }
+        Err(error) => {
+            // Fail-closed: the mount is refused because FC recovery is
+            // incomplete. This is the correct behavior per bd-gqsnh.
+            let error_text = error.to_string();
+            assert!(
+                error_text.contains("fast-commit")
+                    || error_text.contains("fast_commit")
+                    || error_text.contains("recovery")
+                    || error_text.contains("incomplete"),
+                "fail-closed error should mention fast-commit recovery: {error_text}"
+            );
+            emit_scenario_result("fc_crash_image_fail_closed", "PASS", None);
+        }
+    }
+    emit_scenario_result("fc_crash_image_fail_closed_bd_9m84h", "PASS", None);
+}
+
+// ── bd-d2hdc: mounted eager-GDT forensic reproduction ───────────────────────
+
+/// Diagnostic-only forensic for the one divergence bd-hyysq never attributed:
+/// the original 1000 create+unlink mounted repro produced `e2fsck` rc=4 after
+/// a CLEAN unmount under eager GDT persistence, while the same workload never
+/// reproduced in-process. Production cannot select eager mode (the env switch
+/// is gone; only this thread-local override can), so the failure mode is
+/// unreachable — this test exists purely to attribute or retire the finding.
+///
+/// The eager/deferred override is per-thread; with `worker_threads <= 1` the
+/// FUSE session serves every request on the thread that entered `mount()`,
+/// so pinning the override inside the session thread applies it to every
+/// mounted operation.
+#[test]
+fn gdt_eager_mounted_forensics_bd_d2hdc() {
+    if !fuse_available()
+        || !can_run_sudo()
+        || !command_available("mkfs.ext4")
+        || !command_available("e2fsck")
+        || !command_available("fusermount3")
+    {
+        eprintln!("bd-d2hdc forensic prerequisites unavailable, skipping");
+        return;
+    }
+    let pairs = 1000;
+    for mode in ["deferred", "eager"] {
+        let tmp = TempDir::new().expect("tmpdir");
+        let image = create_empty_ext4_test_image_with_size(tmp.path(), 64 * 1024 * 1024);
+        let mnt = tmp.path().join("mnt");
+        fs::create_dir_all(&mnt).expect("create mountpoint");
+
+        let session_thread = {
+            let image = image.clone();
+            let mnt = mnt.clone();
+            let mode = mode.to_string();
+            std::thread::spawn(move || {
+                ffs_alloc::set_gdt_persistence_deferred_for_test(if mode == "eager" {
+                    Some(false)
+                } else {
+                    Some(true)
+                });
+                let cx = Cx::for_testing();
+                let opts = OpenOptions {
+                    ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+                    mvcc_wal_path: Some(image.with_extension("wal")),
+                    ..OpenOptions::default()
+                };
+                let mut fsys = OpenFs::open_with_options(&cx, &image, &opts)
+                    .expect("open ext4 image for forensic session");
+                fsys.enable_writes(&cx).expect("enable ext4 write support");
+                let mount_opts = MountOptions {
+                    read_only: false,
+                    auto_unmount: false,
+                    ..MountOptions::default()
+                };
+                ffs_fuse::mount(Box::new(fsys), &mnt, &mount_opts)
+                    .expect("blocking forensic mount");
+            })
+        };
+        wait_for_fuse_mount_ready(&mnt);
+
+        for index in 0..pairs {
+            let path = mnt.join(format!("pair{index}"));
+            fs::File::create(&path).expect("create pair file");
+            fs::remove_file(&path).expect("unlink pair file");
+        }
+
+        let unmounted = Command::new("sudo")
+            .args(["-n", "umount"])
+            .arg(&mnt)
+            .status()
+            .expect("spawn umount");
+        assert!(unmounted.success(), "clean unmount ({mode}) failed");
+        session_thread
+            .join()
+            .expect("forensic session thread finished");
+
+        let output = Command::new("e2fsck")
+            .args(["-fn"])
+            .arg(&image)
+            .output()
+            .expect("spawn e2fsck");
+        let rc = output.status.code().unwrap_or(-1);
+        eprintln!(
+            "bd-d2hdc forensic result: mode={mode} pairs={pairs} e2fsck_rc={rc} stdout:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        if mode == "deferred" {
+            assert!(rc == 0, "deferred control must be e2fsck-clean (rc {rc})");
+        } else {
+            emit_scenario_result(
+                "gdt_eager_mounted_forensics",
+                "PASS",
+                Some(&format!("pairs={pairs} e2fsck_rc={rc}")),
+            );
+            assert!(
+                rc == 0 || rc == 1,
+                "eager mounted e2fsck rc {rc}: divergence reproduced; \
+                 attribute the transport-layer ordering before closing bd-d2hdc"
+            );
+        }
+    }
 }

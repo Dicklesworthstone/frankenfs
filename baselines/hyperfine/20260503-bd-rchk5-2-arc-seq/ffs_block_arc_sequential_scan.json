@@ -2,19 +2,13 @@
   "results": [
     {
       "command": "cargo bench --profile release-perf -p ffs-block --bench arc_cache -- block_cache_arc_sequential_scan",
-      "mean": 0.014151000000,
+      "mean": 0.014151,
       "stddev": 0.000238010204,
-      "median": 0.014151000000,
-      "min": 0.013685000000,
-      "max": 0.014618000000,
-      "times": [
-        0.013685000000,
-        0.014151000000,
-        0.014618000000
-      ],
-      "exit_codes": [
-        0
-      ]
+      "median": 0.014151,
+      "min": 0.013685,
+      "max": 0.014618,
+      "times": [0.013685, 0.014151, 0.014618],
+      "exit_codes": [0]
     }
   ],
   "benchmark_mode": "criterion_once",

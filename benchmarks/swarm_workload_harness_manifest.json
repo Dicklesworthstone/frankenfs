@@ -230,13 +230,7 @@
         "scrub_repair_overlap_dry_run",
         "cache_pressure_dry_run"
       ],
-      "workload_seeds": [
-        10001,
-        10002,
-        10003,
-        10004,
-        10005
-      ],
+      "workload_seeds": [10001, 10002, 10003, 10004, 10005],
       "counters": {
         "max_queue_depth": 8192,
         "average_queue_depth": 768.0,
@@ -249,12 +243,8 @@
       "classification": "pass",
       "release_claim_state": "plan_ready",
       "reproduction_command": "cargo run -p ffs-harness -- validate-swarm-workload-harness --manifest benchmarks/swarm_workload_harness_manifest.json",
-      "raw_logs": [
-        "artifacts/performance/swarm-workload/large-host/run.log"
-      ],
-      "artifact_paths": [
-        "artifacts/performance/swarm-workload/large-host/report.json"
-      ]
+      "raw_logs": ["artifacts/performance/swarm-workload/large-host/run.log"],
+      "artifact_paths": ["artifacts/performance/swarm-workload/large-host/report.json"]
     },
     {
       "scenario_id": "swarm_workload_small_host_smoke",
@@ -278,12 +268,8 @@
         "rch_or_local_lane": "local",
         "worker_isolation_notes": "uses dry-run-only artifacts"
       },
-      "workload_profile_ids": [
-        "metadata_storm_dry_run"
-      ],
-      "workload_seeds": [
-        20001
-      ],
+      "workload_profile_ids": ["metadata_storm_dry_run"],
+      "workload_seeds": [20001],
       "counters": {
         "max_queue_depth": 128,
         "average_queue_depth": 4.0,
@@ -296,12 +282,8 @@
       "classification": "capability_skip",
       "release_claim_state": "small_host_smoke",
       "reproduction_command": "cargo run -p ffs-harness -- validate-swarm-workload-harness --manifest benchmarks/swarm_workload_harness_manifest.json",
-      "raw_logs": [
-        "artifacts/performance/swarm-workload/small-host/run.log"
-      ],
-      "artifact_paths": [
-        "artifacts/performance/swarm-workload/small-host/report.json"
-      ]
+      "raw_logs": ["artifacts/performance/swarm-workload/small-host/run.log"],
+      "artifact_paths": ["artifacts/performance/swarm-workload/small-host/report.json"]
     }
   ],
   "required_log_fields": [
@@ -324,11 +306,5 @@
     "release_claim_state",
     "reproduction_command"
   ],
-  "proof_consumers": [
-    "bd-p2j3e.2",
-    "bd-p2j3e",
-    "bd-rchk0.5.7",
-    "proof-bundle",
-    "release-gates"
-  ]
+  "proof_consumers": ["bd-p2j3e.2", "bd-p2j3e", "bd-rchk0.5.7", "proof-bundle", "release-gates"]
 }

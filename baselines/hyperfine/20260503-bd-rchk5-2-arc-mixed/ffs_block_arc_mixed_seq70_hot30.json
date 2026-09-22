@@ -2,25 +2,19 @@
   "results": [
     {
       "command": "cargo bench --profile release-perf -p ffs-block --bench arc_cache -- block_cache_arc_mixed_seq70_hot30",
-      "mean": 0.014650000000,
+      "mean": 0.01465,
       "stddev": 0.000235714286,
-      "median": 0.014650000000,
-      "min": 0.014205000000,
-      "max": 0.015129000000,
-      "times": [
-        0.014205000000,
-        0.014650000000,
-        0.015129000000
-      ],
-      "exit_codes": [
-        0
-      ]
+      "median": 0.01465,
+      "min": 0.014205,
+      "max": 0.015129,
+      "times": [0.014205, 0.01465, 0.015129],
+      "exit_codes": [0]
     }
   ],
   "benchmark_mode": "criterion_once",
   "measurement_source": "criterion_estimate",
   "criterion_estimate_source": "baselines/hyperfine/20260503-bd-rchk5-2-arc-mixed/ffs_block_arc_mixed_seq70_hot30.stdout",
-  "wall_time_seconds": 10.078608640,
+  "wall_time_seconds": 10.07860864,
   "command_stdout": "baselines/hyperfine/20260503-bd-rchk5-2-arc-mixed/ffs_block_arc_mixed_seq70_hot30.stdout",
   "command_stderr": "baselines/hyperfine/20260503-bd-rchk5-2-arc-mixed/ffs_block_arc_mixed_seq70_hot30.stderr",
   "text_report": "baselines/hyperfine/20260503-bd-rchk5-2-arc-mixed/ffs_block_arc_mixed_seq70_hot30.txt",

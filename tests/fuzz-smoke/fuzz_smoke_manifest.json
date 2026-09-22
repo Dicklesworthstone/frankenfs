@@ -231,7 +231,7 @@
       "provenance": "mounted write error class catalog produced by bd-rchk0.3.4 and added to fuzz-smoke parser coverage by bd-rchk0.75",
       "target": "mounted_write_error_classes_catalog",
       "expected_class": "accepted",
-      "corpus_checksum": "sha256:da70f8300fd2188e392dbce09b865ea3bdee2983a369075166cdbdbb822c07be",
+      "corpus_checksum": "sha256:878662fda1ecdf1eb06eac56e2c2c0c0193ce600e9457ee40478508782d9a765",
       "timeout_ms": 250,
       "resource_budget": {
         "max_input_bytes": 32768,

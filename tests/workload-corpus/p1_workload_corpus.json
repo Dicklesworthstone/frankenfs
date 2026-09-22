@@ -26,13 +26,7 @@
     "permission_boundary",
     "host_skip"
   ],
-  "filesystem_flavors": [
-    "ext4",
-    "btrfs",
-    "native",
-    "mixed",
-    "not_applicable"
-  ],
+  "filesystem_flavors": ["ext4", "btrfs", "native", "mixed", "not_applicable"],
   "capability_vocabulary": [
     "block_device_fixture",
     "fuse_mount",
@@ -348,11 +342,7 @@
           "required_fields": ["scenario_id", "reproduction_command", "user_risk"]
         }
       ],
-      "linked_proof_consumers": [
-        "mounted_differential_oracle",
-        "release_gate",
-        "proof_bundle"
-      ],
+      "linked_proof_consumers": ["mounted_differential_oracle", "release_gate", "proof_bundle"],
       "linked_e2e_suites": [
         "scripts/e2e/ffs_mounted_write_workload_matrix.sh",
         "scripts/e2e/ffs_release_gate_e2e.sh"

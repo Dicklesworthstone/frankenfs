@@ -2,19 +2,13 @@
   "results": [
     {
       "command": "cargo bench --profile release-perf -p ffs-mvcc --bench wal_throughput -- wal_commit_4k_sync",
-      "mean": 0.009763100000,
+      "mean": 0.0097631,
       "stddev": 0.000148239796,
-      "median": 0.009763100000,
-      "min": 0.009493900000,
-      "max": 0.010075000000,
-      "times": [
-        0.009493900000,
-        0.009763100000,
-        0.010075000000
-      ],
-      "exit_codes": [
-        0
-      ]
+      "median": 0.0097631,
+      "min": 0.0094939,
+      "max": 0.010075,
+      "times": [0.0094939, 0.0097631, 0.010075],
+      "exit_codes": [0]
     }
   ],
   "benchmark_mode": "criterion_once",

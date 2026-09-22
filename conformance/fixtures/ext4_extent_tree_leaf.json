@@ -2,25 +2,25 @@
   "description": "ext4 extent tree leaf node (depth=0) with 3 extents",
   "size": 60,
   "writes": [
-    {"offset":  0, "hex": "0af3", "_comment": "magic = EXT4_EXTENT_MAGIC (0xF30A)"},
-    {"offset":  2, "hex": "0300", "_comment": "entries = 3"},
-    {"offset":  4, "hex": "0400", "_comment": "max_entries = 4"},
-    {"offset":  6, "hex": "0000", "_comment": "depth = 0 (leaf)"},
-    {"offset":  8, "hex": "00000000", "_comment": "generation = 0"},
+    { "offset": 0, "hex": "0af3", "_comment": "magic = EXT4_EXTENT_MAGIC (0xF30A)" },
+    { "offset": 2, "hex": "0300", "_comment": "entries = 3" },
+    { "offset": 4, "hex": "0400", "_comment": "max_entries = 4" },
+    { "offset": 6, "hex": "0000", "_comment": "depth = 0 (leaf)" },
+    { "offset": 8, "hex": "00000000", "_comment": "generation = 0" },
 
-    {"offset": 12, "hex": "00000000", "_comment": "extent[0].logical_block = 0"},
-    {"offset": 16, "hex": "0800", "_comment": "extent[0].raw_len = 8 blocks"},
-    {"offset": 18, "hex": "0000", "_comment": "extent[0].start_hi = 0"},
-    {"offset": 20, "hex": "00010000", "_comment": "extent[0].start_lo = 256 (physical block)"},
+    { "offset": 12, "hex": "00000000", "_comment": "extent[0].logical_block = 0" },
+    { "offset": 16, "hex": "0800", "_comment": "extent[0].raw_len = 8 blocks" },
+    { "offset": 18, "hex": "0000", "_comment": "extent[0].start_hi = 0" },
+    { "offset": 20, "hex": "00010000", "_comment": "extent[0].start_lo = 256 (physical block)" },
 
-    {"offset": 24, "hex": "08000000", "_comment": "extent[1].logical_block = 8"},
-    {"offset": 28, "hex": "1000", "_comment": "extent[1].raw_len = 16 blocks"},
-    {"offset": 30, "hex": "0000", "_comment": "extent[1].start_hi = 0"},
-    {"offset": 32, "hex": "08010000", "_comment": "extent[1].start_lo = 264 (physical block)"},
+    { "offset": 24, "hex": "08000000", "_comment": "extent[1].logical_block = 8" },
+    { "offset": 28, "hex": "1000", "_comment": "extent[1].raw_len = 16 blocks" },
+    { "offset": 30, "hex": "0000", "_comment": "extent[1].start_hi = 0" },
+    { "offset": 32, "hex": "08010000", "_comment": "extent[1].start_lo = 264 (physical block)" },
 
-    {"offset": 36, "hex": "18000000", "_comment": "extent[2].logical_block = 24"},
-    {"offset": 40, "hex": "0480", "_comment": "extent[2].raw_len = 32772 (unwritten, actual=4)"},
-    {"offset": 42, "hex": "0000", "_comment": "extent[2].start_hi = 0"},
-    {"offset": 44, "hex": "18010000", "_comment": "extent[2].start_lo = 280 (physical block)"}
+    { "offset": 36, "hex": "18000000", "_comment": "extent[2].logical_block = 24" },
+    { "offset": 40, "hex": "0480", "_comment": "extent[2].raw_len = 32772 (unwritten, actual=4)" },
+    { "offset": 42, "hex": "0000", "_comment": "extent[2].start_hi = 0" },
+    { "offset": 44, "hex": "18010000", "_comment": "extent[2].start_lo = 280 (physical block)" }
   ]
 }

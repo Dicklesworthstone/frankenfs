@@ -2,19 +2,13 @@
   "results": [
     {
       "command": "rch exec -- cargo bench --profile release-perf -p ffs-mvcc --bench wal_throughput -- wal_write_amplification_1block",
-      "mean": 0.006648900000,
+      "mean": 0.0066489,
       "stddev": 0.000112117347,
-      "median": 0.006648900000,
-      "min": 0.006430800000,
-      "max": 0.006870300000,
-      "times": [
-        0.006430800000,
-        0.006648900000,
-        0.006870300000
-      ],
-      "exit_codes": [
-        0
-      ]
+      "median": 0.0066489,
+      "min": 0.0064308,
+      "max": 0.0068703,
+      "times": [0.0064308, 0.0066489, 0.0068703],
+      "exit_codes": [0]
     }
   ],
   "benchmark_mode": "criterion_once",

@@ -2,19 +2,13 @@
   "results": [
     {
       "command": "cargo bench --profile release-perf -p ffs-block --bench arc_cache -- block_cache_arc_concurrent_hot_read_64threads",
-      "mean": 0.288630000000,
+      "mean": 0.28863,
       "stddev": 0.007706632653,
-      "median": 0.288630000000,
-      "min": 0.273280000000,
-      "max": 0.303490000000,
-      "times": [
-        0.273280000000,
-        0.288630000000,
-        0.303490000000
-      ],
-      "exit_codes": [
-        0
-      ]
+      "median": 0.28863,
+      "min": 0.27328,
+      "max": 0.30349,
+      "times": [0.27328, 0.28863, 0.30349],
+      "exit_codes": [0]
     }
   ],
   "benchmark_mode": "criterion_once",

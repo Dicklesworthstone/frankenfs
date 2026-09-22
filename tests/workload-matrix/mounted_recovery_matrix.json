@@ -3,10 +3,7 @@
   "bead_id": "bd-rchk0.3.3",
   "runner": "scripts/e2e/ffs_mounted_recovery_matrix_e2e.sh",
   "results_contract": {
-    "formats": [
-      "json",
-      "csv"
-    ],
+    "formats": ["json", "csv"],
     "required_fields": [
       "scenario_id",
       "filesystem",
@@ -41,29 +38,19 @@
       "scenario_id": "mounted_recovery_ext4_clean_unmount_reopen",
       "filesystem": "ext4",
       "lifecycle_event": "clean_unmount",
-      "pre_crash_operations": [
-        "create_file",
-        "write_payload",
-        "fsync_file",
-        "fsync_dir"
-      ],
+      "pre_crash_operations": ["create_file", "write_payload", "fsync_file", "fsync_dir"],
       "crash_or_unmount_point": "after_directory_fsync_before_clean_unmount",
       "recovery_command": "ffs-cli mount --readonly ${image} ${mountpoint} && verify mounted_recovery_ext4_clean_unmount_reopen",
       "expected_survivors": [
         {
           "path": "/recovery/stable.bin",
           "kind": "file",
-          "checks": [
-            "size",
-            "blake3"
-          ]
+          "checks": ["size", "blake3"]
         },
         {
           "path": "/recovery",
           "kind": "directory",
-          "checks": [
-            "entry_present"
-          ]
+          "checks": ["entry_present"]
         }
       ],
       "actual_state_artifact": "actual_state/mounted_recovery_ext4_clean_unmount_reopen.json",
@@ -85,29 +72,19 @@
       "scenario_id": "mounted_recovery_btrfs_clean_unmount_reopen",
       "filesystem": "btrfs",
       "lifecycle_event": "clean_unmount",
-      "pre_crash_operations": [
-        "create_file",
-        "write_payload",
-        "fsync_file",
-        "fsync_dir"
-      ],
+      "pre_crash_operations": ["create_file", "write_payload", "fsync_file", "fsync_dir"],
       "crash_or_unmount_point": "after_directory_fsync_before_clean_unmount",
       "recovery_command": "ffs-cli mount --readonly ${image} ${mountpoint} && verify mounted_recovery_btrfs_clean_unmount_reopen",
       "expected_survivors": [
         {
           "path": "/recovery/stable.bin",
           "kind": "file",
-          "checks": [
-            "size",
-            "blake3"
-          ]
+          "checks": ["size", "blake3"]
         },
         {
           "path": "/recovery",
           "kind": "directory",
-          "checks": [
-            "entry_present"
-          ]
+          "checks": ["entry_present"]
         }
       ],
       "actual_state_artifact": "actual_state/mounted_recovery_btrfs_clean_unmount_reopen.json",
@@ -142,17 +119,12 @@
         {
           "path": "/recovery/fsynced-baseline.bin",
           "kind": "file",
-          "checks": [
-            "size",
-            "blake3"
-          ]
+          "checks": ["size", "blake3"]
         },
         {
           "path": "/recovery/inflight.bin",
           "kind": "metadata",
-          "checks": [
-            "either_absent_or_full_prefix_recorded"
-          ]
+          "checks": ["either_absent_or_full_prefix_recorded"]
         }
       ],
       "actual_state_artifact": "actual_state/mounted_recovery_ext4_forced_unmount_preserves_fsynced.json",
@@ -187,17 +159,12 @@
         {
           "path": "/recovery/fsynced-baseline.bin",
           "kind": "file",
-          "checks": [
-            "size",
-            "blake3"
-          ]
+          "checks": ["size", "blake3"]
         },
         {
           "path": "/recovery/inflight.bin",
           "kind": "metadata",
-          "checks": [
-            "either_absent_or_full_prefix_recorded"
-          ]
+          "checks": ["either_absent_or_full_prefix_recorded"]
         }
       ],
       "actual_state_artifact": "actual_state/mounted_recovery_btrfs_forced_unmount_preserves_fsynced.json",
@@ -231,17 +198,12 @@
         {
           "path": "/recovery/fsynced-baseline.bin",
           "kind": "file",
-          "checks": [
-            "size",
-            "blake3"
-          ]
+          "checks": ["size", "blake3"]
         },
         {
           "path": "/recovery/staged-writer.log",
           "kind": "file",
-          "checks": [
-            "last_complete_operation_recorded"
-          ]
+          "checks": ["last_complete_operation_recorded"]
         }
       ],
       "actual_state_artifact": "actual_state/mounted_recovery_ext4_process_termination_staged_write.json",
@@ -275,17 +237,12 @@
         {
           "path": "/recovery/fsynced-baseline.bin",
           "kind": "file",
-          "checks": [
-            "size",
-            "blake3"
-          ]
+          "checks": ["size", "blake3"]
         },
         {
           "path": "/recovery/staged-writer.log",
           "kind": "file",
-          "checks": [
-            "last_complete_operation_recorded"
-          ]
+          "checks": ["last_complete_operation_recorded"]
         }
       ],
       "actual_state_artifact": "actual_state/mounted_recovery_btrfs_process_termination_staged_write.json",
@@ -307,28 +264,19 @@
       "scenario_id": "mounted_recovery_ext4_fsync_file_boundary",
       "filesystem": "ext4",
       "lifecycle_event": "fsync_file_boundary",
-      "pre_crash_operations": [
-        "create_file",
-        "write_payload",
-        "fsync_file"
-      ],
+      "pre_crash_operations": ["create_file", "write_payload", "fsync_file"],
       "crash_or_unmount_point": "after_file_fsync_before_directory_fsync",
       "recovery_command": "ffs-cli mount --readonly ${image} ${mountpoint} && verify mounted_recovery_ext4_fsync_file_boundary",
       "expected_survivors": [
         {
           "path": "/recovery/file-fsynced.bin",
           "kind": "file",
-          "checks": [
-            "size",
-            "blake3"
-          ]
+          "checks": ["size", "blake3"]
         },
         {
           "path": "/recovery",
           "kind": "metadata",
-          "checks": [
-            "directory_entry_may_require_dir_fsync_recorded"
-          ]
+          "checks": ["directory_entry_may_require_dir_fsync_recorded"]
         }
       ],
       "actual_state_artifact": "actual_state/mounted_recovery_ext4_fsync_file_boundary.json",
@@ -350,30 +298,19 @@
       "scenario_id": "mounted_recovery_btrfs_fsync_dir_boundary",
       "filesystem": "btrfs",
       "lifecycle_event": "fsync_dir_boundary",
-      "pre_crash_operations": [
-        "create_file",
-        "write_payload",
-        "fsync_file",
-        "fsync_dir"
-      ],
+      "pre_crash_operations": ["create_file", "write_payload", "fsync_file", "fsync_dir"],
       "crash_or_unmount_point": "after_directory_fsync_before_reopen",
       "recovery_command": "ffs-cli mount --readonly ${image} ${mountpoint} && verify mounted_recovery_btrfs_fsync_dir_boundary",
       "expected_survivors": [
         {
           "path": "/recovery/dir-fsynced.bin",
           "kind": "file",
-          "checks": [
-            "size",
-            "blake3"
-          ]
+          "checks": ["size", "blake3"]
         },
         {
           "path": "/recovery",
           "kind": "directory",
-          "checks": [
-            "entry_present",
-            "metadata_stable"
-          ]
+          "checks": ["entry_present", "metadata_stable"]
         }
       ],
       "actual_state_artifact": "actual_state/mounted_recovery_btrfs_fsync_dir_boundary.json",
@@ -408,11 +345,7 @@
         {
           "path": "/recovery/reopen.bin",
           "kind": "file",
-          "checks": [
-            "size",
-            "blake3",
-            "mvcc_snapshot_visible"
-          ]
+          "checks": ["size", "blake3", "mvcc_snapshot_visible"]
         }
       ],
       "actual_state_artifact": "actual_state/mounted_recovery_ext4_reopen_verify_journal_mvcc.json",
@@ -447,10 +380,7 @@
         {
           "path": "/recovery/cleanup-marker",
           "kind": "metadata",
-          "checks": [
-            "artifact_index_present",
-            "cleanup_status_recorded"
-          ]
+          "checks": ["artifact_index_present", "cleanup_status_recorded"]
         }
       ],
       "actual_state_artifact": "actual_state/mounted_recovery_btrfs_cleanup_after_preserved_artifacts.json",

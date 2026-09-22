@@ -27,12 +27,8 @@
     "observed_p99_micros": 5020,
     "outcome": "neutral"
   },
-  "artifact_paths": [
-    "artifacts/numa-placement/skewed_metadata_hotshards.json"
-  ],
-  "raw_log_paths": [
-    "artifacts/numa-placement/skewed_metadata_hotshards_hint.log"
-  ],
+  "artifact_paths": ["artifacts/numa-placement/skewed_metadata_hotshards.json"],
+  "raw_log_paths": ["artifacts/numa-placement/skewed_metadata_hotshards_hint.log"],
   "cleanup_status": "clean",
   "reproduction_command": "ffs-harness validate-numa-allocation-placement --report conformance/fixtures/numa_allocation_placement/skewed_metadata_hotshards.json",
   "product_evidence_claim": "none",

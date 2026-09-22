@@ -11,11 +11,7 @@
     "failure_classification_stable",
     "tail_latency_order_invariant"
   ],
-  "execution_modes": [
-    "analysis_only",
-    "dry_run",
-    "permissioned"
-  ],
+  "execution_modes": ["analysis_only", "dry_run", "permissioned"],
   "proof_consumers": [
     "workload_corpus",
     "soak_canary_campaigns",
@@ -38,16 +34,10 @@
       "source_value_pointer": "/scenarios/3/reproduction_command",
       "relation_type": "replay_deterministic",
       "invariant": "Repeated crash-replay validation for the same append/truncate seed must produce the same survivor classification and log-replay outcome.",
-      "proof_consumers": [
-        "workload_corpus",
-        "crash_replay_lab",
-        "proof_bundle"
-      ],
+      "proof_consumers": ["workload_corpus", "crash_replay_lab", "proof_bundle"],
       "reproduction_command": "cargo run -p ffs-harness -- run-crash-replay --count 64 --seed 64001",
       "execution_mode": "dry_run",
-      "linked_workload_scenarios": [
-        "workload_append_truncate_log_churn"
-      ],
+      "linked_workload_scenarios": ["workload_append_truncate_log_churn"],
       "expected_artifacts": [
         {
           "path": "workload/append_truncate/replay_schedule.json",
@@ -65,11 +55,7 @@
       "source_value_pointer": "/workloads/0/seeds/0",
       "relation_type": "operation_reorder_commutes",
       "invariant": "Mount, probe, unmount, and reopen cycles with the same seed must preserve the final root metadata observation independent of heartbeat grouping.",
-      "proof_consumers": [
-        "soak_canary_campaigns",
-        "release_gate",
-        "operational_readiness_report"
-      ],
+      "proof_consumers": ["soak_canary_campaigns", "release_gate", "operational_readiness_report"],
       "reproduction_command": "scripts/e2e/ffs_soak_canary_campaign_e2e.sh --dry-run",
       "execution_mode": "dry_run",
       "expected_artifacts": [
@@ -89,11 +75,7 @@
       "source_value_pointer": "/scenarios/0/workload_seeds/0",
       "relation_type": "tail_latency_order_invariant",
       "invariant": "Dry-run expansion must preserve the same workload seed ordering and attribution lanes before any large-host campaign is permitted.",
-      "proof_consumers": [
-        "swarm_workload_harness",
-        "proof_bundle",
-        "release_gate"
-      ],
+      "proof_consumers": ["swarm_workload_harness", "proof_bundle", "release_gate"],
       "reproduction_command": "cargo run -p ffs-harness -- validate-swarm-workload-harness --manifest benchmarks/swarm_workload_harness_manifest.json",
       "execution_mode": "dry_run",
       "expected_artifacts": [
@@ -113,11 +95,7 @@
       "source_value_pointer": "/rows/0/workload_seed",
       "relation_type": "tail_latency_order_invariant",
       "invariant": "Authoritative p99 attribution for the same workload seed must not upgrade downgrade/blocker evidence into public readiness without the large-host ack.",
-      "proof_consumers": [
-        "swarm_tail_latency",
-        "swarm_workload_harness",
-        "release_gate"
-      ],
+      "proof_consumers": ["swarm_tail_latency", "swarm_workload_harness", "release_gate"],
       "reproduction_command": "FFS_ENABLE_PERMISSIONED_SWARM_WORKLOAD=1 FFS_SWARM_WORKLOAD_REAL_RUN_ACK=swarm-workload-may-use-permissioned-large-host cargo run -p ffs-harness -- validate-swarm-workload-harness --manifest benchmarks/swarm_workload_harness_manifest.json",
       "execution_mode": "permissioned",
       "ack_requirement": "FFS_SWARM_WORKLOAD_REAL_RUN_ACK=swarm-workload-may-use-permissioned-large-host",
@@ -138,11 +116,7 @@
       "source_value_pointer": "/seed",
       "relation_type": "replay_deterministic",
       "invariant": "LabRuntime replay for the recorded seed must keep the same operation trace, failure classification, and raw log identity.",
-      "proof_consumers": [
-        "crash_replay_lab",
-        "proof_bundle",
-        "release_gate"
-      ],
+      "proof_consumers": ["crash_replay_lab", "proof_bundle", "release_gate"],
       "reproduction_command": "rch exec -- cargo test -p ffs-harness --test crash_replay -- pre_commit_seed_42",
       "execution_mode": "dry_run",
       "expected_artifacts": [
@@ -162,11 +136,7 @@
       "source_value_pointer": "/race_schedule_manifest/schedules/0/seed",
       "relation_type": "repair_monotonic",
       "invariant": "Increasing available repair evidence for the same writeback schedule seed may improve acceptance, but must not hide duplicate targets or stale-symbol rejection.",
-      "proof_consumers": [
-        "repair_lab",
-        "proof_bundle",
-        "operational_readiness_report"
-      ],
+      "proof_consumers": ["repair_lab", "proof_bundle", "operational_readiness_report"],
       "reproduction_command": "cargo run -p ffs-harness -- validate-repair-writeback-serialization --contract docs/repair-writeback-serialization-contract.json",
       "execution_mode": "dry_run",
       "expected_artifacts": [
@@ -186,11 +156,7 @@
       "source_value_pointer": "/cases/0/seed",
       "relation_type": "failure_classification_stable",
       "invariant": "The same injected fault seed must retain its error class and operator remediation classification across proof-bundle rebuilds.",
-      "proof_consumers": [
-        "fault_injection_corpus",
-        "repair_lab",
-        "proof_bundle"
-      ],
+      "proof_consumers": ["fault_injection_corpus", "repair_lab", "proof_bundle"],
       "reproduction_command": "cargo run -p ffs-harness -- validate-repair-confidence-lab --spec docs/repair-confidence-mutation-safety.json",
       "execution_mode": "analysis_only",
       "expected_artifacts": [
@@ -210,11 +176,7 @@
       "source_value_pointer": "/calibration_corpus/0/seed",
       "relation_type": "repair_monotonic",
       "invariant": "Repair confidence for the same mutation seed must preserve the threshold decision and never convert detection-only evidence into mutation permission.",
-      "proof_consumers": [
-        "repair_lab",
-        "proof_bundle",
-        "release_gate"
-      ],
+      "proof_consumers": ["repair_lab", "proof_bundle", "release_gate"],
       "reproduction_command": "cargo run -p ffs-harness -- validate-repair-confidence-lab --spec docs/repair-confidence-mutation-safety.json",
       "execution_mode": "dry_run",
       "expected_artifacts": [

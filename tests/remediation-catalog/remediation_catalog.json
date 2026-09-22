@@ -75,9 +75,7 @@
       "immediate_action": "Use a regular file or a kernel-mounted filesystem if device nodes are required; otherwise treat the rejection as the documented contract.",
       "safe_retry_policy": "do_not_retry_unsupported",
       "reproduction_command": "scripts/e2e/ffs_mounted_write_workload_matrix.sh",
-      "artifact_links": [
-        "artifacts/qa/mounted_smoke/<run_id>/mounted_write_workload_results.json"
-      ],
+      "artifact_links": ["artifacts/qa/mounted_smoke/<run_id>/mounted_write_workload_results.json"],
       "owning_bead": "bd-rchk0.3.4",
       "escalation_path": "fuse@frankenfs",
       "docs_target": "docs/mounted/unsupported-operations.md"

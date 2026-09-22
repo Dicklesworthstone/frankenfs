@@ -19,7 +19,7 @@
     },
     {
       "artifact": "baselines/hyperfine/20260503-bd-rchk5-7-after-seqless/ffs_cli_mount_recovery_probe.json",
-      "mean_ms": 183.350,
+      "mean_ms": 183.35,
       "min_ms": 93.656,
       "max_ms": 273.751,
       "status": "rejected_candidate"

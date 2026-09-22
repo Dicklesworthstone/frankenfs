@@ -1,5 +1,123 @@
 # Reality-Check Bridge: Closing the Gap Between Claims and Code
 
+## Delivery progress — 2026-09-22
+
+Both harness-correctness gaps found by the 2026-09-21 check are closed on this
+build, plus one real POSIX bug they exposed:
+
+- **`bd-90aey` closed.** The syscall-conformance differential now runs its
+  reference arm on a live kernel-ext4 loop mount (same mkfs recipe, separate
+  image per arm) instead of tmpfs. Against that true reference the suite
+  exposed a masked real defect — `open_unlink_fd_lifetime` returned `ENOENT`
+  — which is now fixed: `ext4_unlink_impl` orphans an inode whose last link
+  drops while open handles pin it (`s_last_orphan` legacy list, deferred
+  storage reclaim), the FUSE adapter counts `OPEN`/`CREATE`/`RELEASE` and
+  finalizes at the last close (`finalize_unlinked_inode`), and mount-time
+  orphan recovery reclaims after a crash. The btrfs-attached flake was a
+  placement-dependent assertion over an over-permissive admission:
+  `validate_read_coverage` now refuses METADATA/SYSTEM RAID5/6 chunks missing
+  any stripe (data chunks keep their erasure tolerance). The
+  encryption-ioctl failure no longer reproduces. **Full `fuse_e2e`: 244
+  passed / 0 failed.**
+- **`bd-awvjj` closed.** The profile-freshness gate was repaired, not
+  weakened: the reference time is now the fixture's newest *parsed-content*
+  change (`serde_json::Value` equality over git history), so formatting-only
+  rewrites cannot invalidate genuine provenance (win) while any content
+  change still moves the reference (strict, never loose). Gate green with the
+  May provenance intact.
+- Gates on the final tree: fmt PASS; clippy `-D warnings` PASS (workspace,
+  all targets); `ffs-core` + `ffs-fuse` 2,074 passed / 0 failed.
+
+---
+
+## Reality check — 2026-09-21 (HEAD `1032ade4`)
+
+**Verdict:** the filesystem crates are green and the September delivery wave
+(JBD2 chain, RAID5/6 read reconstruction, FC crash-image e2e, parity execution
+binding) is real and committed. But **`main` is test-red**: six `ffs-harness`
+targets fail on the current clean tree, twelve tests in total. Five of the six
+failures are stale integrity manifests — a JSON-formatting commit
+(`1eaf7fe8`, 2026-09-21) and two comparator-bench commits (Sep 11/15) landed
+without refreshing the pins that exist to catch exactly this drift. One is a
+genuine evidence-staleness conflict (profile provenance vs. descriptor
+freshness) that cannot be fixed by editing artifacts.
+
+**Method.** AGENTS.md and README.md read in full; canonical gates executed on a
+clean tree at HEAD `1032ade4`; every failing gate traced to its introducing
+commit via `git log`; inventory claims verified by direct count. Executed
+locally (rch fail-open); single-host evidence, not a fleet claim.
+
+### Executed gates
+
+| Gate | Result | Evidence |
+|---|---|---|
+| `cargo fmt --check` | PASS | exit 0 |
+| `cargo clippy --workspace --all-targets -- -D warnings` | PASS | Finished 7m01s, zero lint errors; third-party future-incompat notes only (`nix` 0.29/0.31) |
+| `cargo test --workspace --no-fail-fast` | **FAIL** | 9,424 passed / 12 failed / 8+ ignored across 22 crates; all 12 failures in `ffs-harness` (table below). Every non-harness crate green, including `ffs-core`, `ffs-fuse`, `ffs-btrfs`, `ffs-journal` |
+| `ubs --only=rust .` | RED / PARTIAL | Rescan completed with a raised module timeout: 498 files scanned, **254 critical** findings (Sept-8 baseline: 244), 17,559 info; runner still reports `partial` (a module did not emit). No clean scan claimed; criticals include sampled false positives per the Sept-8 audit |
+| Static inventory vs README | PASS | 63 fuzz targets, 125 E2E scripts, 173 bench files, 226 snapshots, 21 `FfsError` variants, 22 workspace members, 5/678 ledger claims carrying live-incumbent ratios — all match README exactly |
+
+### Failures, root-caused
+
+| Target (all `ffs-harness`) | Tests | Root cause | Introduced by | Disposition |
+|---|---|---|---|---|
+| `conformance` — `fixture_checksum_manifest_is_complete` | 1 | 42/44 fixture digests stale vs `checksums.sha256` | `1eaf7fe8` (JSON pretty-print touched fixtures, not the manifest) | **Fixed this session**: digests regenerated; `sha256sum -c` now 44/44 |
+| `conformance` — `golden_checksum_manifest_is_complete` | 1 | 8/10 golden digests stale | `1eaf7fe8` | **Fixed**: 10/10 verify |
+| `conformance` — `full_conformance_gate_pass` | 1 | cascade of the two above | `1eaf7fe8` | **Fixed** (same manifest refresh) |
+| `--lib` — `fuzz_smoke` (3 tests) | 3 | `fuzz_smoke_manifest.json` pins pre-reformat digest of `mounted_write_error_classes.json` | `1eaf7fe8` | **Fixed**: seed `fs_mounted_write_error_classes_catalog` re-pinned to observed `sha256:878662fd…`; report snapshot updated (aggregate `sha256:a13536e9…`, `byte_len` 5541→5385, aggregate hash function replicated and validated bit-exact against the stored value before overwrite); other 9 seeds verified clean |
+| `module_census` | 1 | census pinned `ffs_mounted_kernel_bench.rs` at 14,058 LOC; file grew to 14,325 | `d30dde11`/`b84f35c7` (Sep 11/15) | **Fixed**: entry updated to 14,325; summary recomputed (total 171,722; conformance 43,737 = 25.47%) |
+| `profile_artifacts` | 1 | freshness invariant requires profile `started_at` (May 10 provenance) newer than the *descriptor's* last commit; `1eaf7fe8` touched `ext4_8mb_reference.json` (descriptor; the measured `.ext4` image is untracked and unchanged) | `1eaf7fe8` | **Open — not fixable by artifact edits**: metas carry genuine May provenance timestamps; `perf` is not installed on this host so re-profiling cannot produce replacements. Needs either a real re-profile on a perf-capable host or an explicitly argued gate repair (anchor freshness on the measured artifact, not its JSON descriptor). Tracked in a new bead; deliberately NOT edited here to avoid fabricating provenance |
+| `executed_evidence_compile_fail` | 1 | Deterministic mismatch reproduced and diffed: blessed stderr anchors the `serde_json::from_str` note at `$CARGO/serde_json-$VERSION/src/de.rs`, but RCH redirects `CARGO_HOME` into `$WORKSPACE/.rch-tmp/rch-cargo-cache-<worker>/registry/`, so the actual note resolves under `$WORKSPACE`. The rejection itself (E0277, no `Deserialize` impl) fires identically in both. Environment-vs-expectation artifact, not a tree defect | pre-existing (Sept-8 audit saw the same prefix disagreement) | **Confirmed**: rerun with stock `CARGO_HOME` passes 2/2. No code change; the gate's `$CARGO` placeholder is correct for stock environments — under rch's redirected cache the target is expected to read as environment-limited, not red |
+| `fuse_e2e` | 3 | dir-size syscall-sequence convention (4096 vs 40), encryption-ioctl policy version, `btrfs_attached_devices_read_seeded_files` ordering flake | pre-existing | Confirmed reproducing; owned by `bd-90aey` (full analysis already on that bead) |
+
+### What moved since the 2026-09-08 assessment
+
+- 176 commits; ~30 bead-closure commits. `bd-9m84h` (FC crash-image e2e:
+  kernel FC transactions, fail-closed mount proof) landed and closed.
+  `bd-hk5w3`'s RAID5/6 read reconstruction with forward rotation landed with
+  parity evidence; `FEATURE_PARITY.md` updated in the same commits.
+- JBD2 chain: write-phase abort-after-error, retry-through-replay regression,
+  and the remaining sequence/durability gaps split into `bd-rnzr5` with a
+  deterministic-evidence acceptance contract.
+- Parity honesty machinery shipped: `parity --verify` suites with
+  `ExecutedEvidence`, canonical-gate binding, `parity-honesty` self-checks.
+  The 97/97 number is now explicitly labeled declared-contract accounting.
+- Open beads: 7 (down from the Sept-8 bridge graph's 15 delivery tasks plus
+  carried items). No in-progress claims.
+
+### Structural observations
+
+1. **Integrity manifests drift silently and are maintained by hand.** Three
+   independent pin systems (fixture/golden sha256, fuzz-smoke corpus pins,
+   module census) each broke from *routine, intentional* commits. The pins
+   worked — they caught the drift — but nothing runs them at commit time, so
+   `main` stayed red until the next full workspace run. A single pre-commit
+   entry point that regenerates-or-rejects would close this class.
+2. **Formatting commits on fixture data carry manifest obligations.**
+   `1eaf7fe8`'s own message declared "parsed values unchanged", which is true
+   and irrelevant to byte-digest pins. Anyone reformatting fixtures must
+   refresh every pin in the same change set.
+3. **The profile-freshness gate binds provenance to the wrong artifact.** The
+   profiles measured `ext4_8mb_reference.ext4` (untracked, generated,
+   unchanged); the gate compares against the tracked JSON descriptor's commit
+   time. Any descriptor touch — including formatting — invalidates months of
+   genuine provenance. Same evidence standard as any gate repair applies
+   before changing it.
+
+**Bottom line:** with the manifest fixes applied and verified this session
+(fuzz_smoke 25/25, conformance 103/103, module_census green, trybuild green
+under stock `CARGO_HOME`), the remaining workspace redness is 4 tests in 2
+targets: `profile_artifacts` provenance staleness (`bd-awvjj` — needs a
+perf-capable host or an argued gate repair) and the 3 documented `bd-90aey`
+FUSE failures (membership varies per run between the encryption-ioctl case and
+the second `btrfs_attached` flake variant). None of the twelve observed
+failures touch filesystem correctness; all are harness-integrity signal. That
+is exactly what these gates are for — and the delivery contract (`bd-z5bav`)
+still requires a fully green current build plus the external closeouts before
+acceptance.
+
+---
+
 ## Delivery progress — 2026-09-08, 21:10 UTC
 
 The audit below is the starting point, not a claim that its diagnosed defects

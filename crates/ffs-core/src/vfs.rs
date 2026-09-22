@@ -14,6 +14,15 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::SystemTime;
 
+/// Oracle reporting how many live open handles pin an inode
+/// (bd-90aey orphan-on-unlink).
+///
+/// Transports that own handle lifetimes (the FUSE adapter, which counts
+/// `OPEN`/`CREATE` against `RELEASE`) install one at mount time via
+/// [`FsOps::install_open_handle_oracle`]. Library-mode callers install
+/// nothing; [`FsOps::unlink`] then keeps its immediate-reclaim behavior.
+pub type OpenHandleOracle = Arc<dyn Fn(InodeNumber) -> u64 + Send + Sync>;
+
 // ── VFS semantics layer ─────────────────────────────────────────────────────
 
 const COPY_FILE_RANGE_CHUNK_BYTES: u32 = 1024 * 1024;
@@ -2666,6 +2675,28 @@ pub trait FsOps: Send + Sync {
         _request: ReleaseRequest,
     ) -> ffs_error::Result<()> {
         Ok(())
+    }
+
+    /// Install the open-handle-count oracle (bd-90aey orphan-on-unlink).
+    ///
+    /// See [`OpenHandleOracle`]. Default: store nothing (stateless
+    /// implementations have no handle lifetimes to report).
+    fn install_open_handle_oracle(&self, _oracle: OpenHandleOracle) {}
+
+    /// Reclaim storage for an inode whose last directory link was dropped
+    /// while open handles still pinned it (POSIX orphan-on-unlink).
+    ///
+    /// Called by the transport when its last handle for `ino` closes.
+    /// Returns `Ok(true)` when storage was reclaimed now, `Ok(false)` when
+    /// `ino` is not an orphan awaiting reclaim (still linked, unknown, or
+    /// already final). Default: not subject to deferred reclaim.
+    fn finalize_unlinked_inode(
+        &self,
+        _cx: &Cx,
+        _scope: &mut RequestScope,
+        _ino: InodeNumber,
+    ) -> ffs_error::Result<bool> {
+        Ok(false)
     }
 
     /// Synchronize file data to stable storage.

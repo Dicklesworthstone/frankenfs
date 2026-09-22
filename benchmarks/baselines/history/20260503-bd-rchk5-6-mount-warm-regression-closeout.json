@@ -17,14 +17,8 @@
     "vs_reference_throughput_percent": -63.034
   },
   "final_after": {
-    "attempt_labels": [
-      "warm_prepare",
-      "warm_measure"
-    ],
-    "cleanup_statuses": [
-      "unmounted",
-      "unmounted"
-    ],
+    "attempt_labels": ["warm_prepare", "warm_measure"],
+    "cleanup_statuses": ["unmounted", "unmounted"],
     "max_us": 302981,
     "mean_us": 157845,
     "median_us": 137268,
@@ -44,18 +38,7 @@
     "runs": 10,
     "source_json": "baselines/hyperfine/20260503-bd-rchk5-6-after-rerun/ffs_cli_mount_warm_probe.json",
     "throughput_ops_sec": 6.335343,
-    "times_us": [
-      149865,
-      201211,
-      113701,
-      120587,
-      121330,
-      124671,
-      156524,
-      302981,
-      120533,
-      167044
-    ]
+    "times_us": [149865, 201211, 113701, 120587, 121330, 124671, 156524, 302981, 120533, 167044]
   },
   "generated_at": "2026-05-03T22:11:15.996214Z",
   "input_change_source": "bd-rchk5.5 updated scripts/mount_benchmark_probe.sh to disable background scrub and use 5 ms readiness polling",

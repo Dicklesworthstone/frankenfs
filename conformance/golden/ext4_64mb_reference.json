@@ -18,45 +18,48 @@
     {
       "path": "/",
       "entries": [
-        {"name": ".", "file_type": "directory"},
-        {"name": "..", "file_type": "directory"},
-        {"name": "lost+found", "file_type": "directory"},
-        {"name": "deep", "file_type": "directory"},
-        {"name": "readme64.txt", "file_type": "regular"}
+        { "name": ".", "file_type": "directory" },
+        { "name": "..", "file_type": "directory" },
+        { "name": "lost+found", "file_type": "directory" },
+        { "name": "deep", "file_type": "directory" },
+        { "name": "readme64.txt", "file_type": "regular" }
       ]
-    }
-,
+    },
     {
       "path": "/deep",
       "entries": [
-        {"name": ".", "file_type": "directory"},
-        {"name": "..", "file_type": "directory"},
-        {"name": "nested", "file_type": "directory"}
+        { "name": ".", "file_type": "directory" },
+        { "name": "..", "file_type": "directory" },
+        { "name": "nested", "file_type": "directory" }
       ]
-    }
-,
+    },
     {
       "path": "/deep/nested",
       "entries": [
-        {"name": ".", "file_type": "directory"},
-        {"name": "..", "file_type": "directory"},
-        {"name": "data.txt", "file_type": "regular"}
+        { "name": ".", "file_type": "directory" },
+        { "name": "..", "file_type": "directory" },
+        { "name": "data.txt", "file_type": "regular" }
       ]
     }
-
   ],
   "files": [
     {
       "path": "/deep/nested/data.txt",
       "size": 43,
-      "content": [104,101,108,108,111,32,102,114,111,109,32,70,114,97,110,107,101,110,70,83,32,54,52,109,98,32,103,101,111,109,101,116,114,121,32,118,97,114,105,97,110,116,10]
-    }
-,
+      "content": [
+        104, 101, 108, 108, 111, 32, 102, 114, 111, 109, 32, 70, 114, 97, 110, 107, 101, 110, 70,
+        83, 32, 54, 52, 109, 98, 32, 103, 101, 111, 109, 101, 116, 114, 121, 32, 118, 97, 114, 105,
+        97, 110, 116, 10
+      ]
+    },
     {
       "path": "/readme64.txt",
       "size": 43,
-      "content": [104,101,108,108,111,32,102,114,111,109,32,70,114,97,110,107,101,110,70,83,32,54,52,109,98,32,103,101,111,109,101,116,114,121,32,118,97,114,105,97,110,116,10]
+      "content": [
+        104, 101, 108, 108, 111, 32, 102, 114, 111, 109, 32, 70, 114, 97, 110, 107, 101, 110, 70,
+        83, 32, 54, 52, 109, 98, 32, 103, 101, 111, 109, 101, 116, 114, 121, 32, 118, 97, 114, 105,
+        97, 110, 116, 10
+      ]
     }
-
   ]
 }

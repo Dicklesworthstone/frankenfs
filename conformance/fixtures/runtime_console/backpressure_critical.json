@@ -34,9 +34,7 @@
     ],
     "imbalance_ratio": 1.4
   },
-  "artifact_paths": [
-    "artifacts/runtime-console/backpressure_critical.json"
-  ],
+  "artifact_paths": ["artifacts/runtime-console/backpressure_critical.json"],
   "cleanup_status": "preserved_artifacts",
   "reproduction_command": "ffs mount image.img /mnt --runtime-mode per-core --read-write --console --console-json artifacts/runtime-console/backpressure_critical.json",
   "product_evidence_claim": "none",

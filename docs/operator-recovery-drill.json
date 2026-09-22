@@ -3,11 +3,7 @@
   "drill_id": "operator_recovery_drill_v1",
   "bead_id": "bd-rchk0.5.8",
   "proof_bundle_lane": "operator_recovery_drill",
-  "release_gate_consumers": [
-    "proof_bundle",
-    "release_gate",
-    "operational_readiness_report"
-  ],
+  "release_gate_consumers": ["proof_bundle", "release_gate", "operational_readiness_report"],
   "required_log_fields": [
     "exact_commands",
     "image_hashes",
@@ -78,11 +74,7 @@
         "mutation_requested": false,
         "rollback_available": false,
         "operator_approval_required": false,
-        "plan_steps": [
-          "record scrub evidence",
-          "preserve ledger rows",
-          "do not mutate image"
-        ],
+        "plan_steps": ["record scrub evidence", "preserve ledger rows", "do not mutate image"],
         "refusal_reason": "detection_only"
       },
       "operator_warnings": [
@@ -106,19 +98,13 @@
           "path": "artifacts/operator-recovery/detect/manifest.json",
           "kind": "corruption_manifest",
           "required": true,
-          "consumers": [
-            "proof_bundle",
-            "release_gate"
-          ]
+          "consumers": ["proof_bundle", "release_gate"]
         },
         {
           "path": "artifacts/operator-recovery/detect/evidence-ledger.jsonl",
           "kind": "evidence_ledger",
           "required": true,
-          "consumers": [
-            "proof_bundle",
-            "operational_readiness_report"
-          ]
+          "consumers": ["proof_bundle", "operational_readiness_report"]
         }
       ],
       "expected_logs": [
@@ -231,19 +217,13 @@
           "path": "artifacts/operator-recovery/dry-run/plan.json",
           "kind": "dry_run_plan",
           "required": true,
-          "consumers": [
-            "proof_bundle",
-            "release_gate"
-          ]
+          "consumers": ["proof_bundle", "release_gate"]
         },
         {
           "path": "artifacts/operator-recovery/dry-run/summary.json",
           "kind": "operator_summary",
           "required": true,
-          "consumers": [
-            "proof_bundle",
-            "operational_readiness_report"
-          ]
+          "consumers": ["proof_bundle", "operational_readiness_report"]
         }
       ],
       "expected_logs": [
@@ -370,19 +350,13 @@
           "path": "artifacts/operator-recovery/mutate/plan.json",
           "kind": "mutating_repair_plan",
           "required": true,
-          "consumers": [
-            "proof_bundle",
-            "release_gate"
-          ]
+          "consumers": ["proof_bundle", "release_gate"]
         },
         {
           "path": "artifacts/operator-recovery/mutate/post-verify.json",
           "kind": "verification_report",
           "required": true,
-          "consumers": [
-            "proof_bundle",
-            "operational_readiness_report"
-          ]
+          "consumers": ["proof_bundle", "operational_readiness_report"]
         }
       ],
       "expected_logs": [
@@ -495,19 +469,13 @@
           "path": "artifacts/operator-recovery/refuse/refusal.json",
           "kind": "refusal_report",
           "required": true,
-          "consumers": [
-            "proof_bundle",
-            "release_gate"
-          ]
+          "consumers": ["proof_bundle", "release_gate"]
         },
         {
           "path": "artifacts/operator-recovery/refuse/manifest.json",
           "kind": "corruption_manifest",
           "required": true,
-          "consumers": [
-            "proof_bundle",
-            "operational_readiness_report"
-          ]
+          "consumers": ["proof_bundle", "operational_readiness_report"]
         }
       ],
       "expected_logs": [

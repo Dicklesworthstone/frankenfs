@@ -34,136 +34,14 @@
     "memory_bytes": 231687815168,
     "numa_nodes": 1,
     "online_cpus": [
-      0,
-      1,
-      2,
-      3,
-      4,
-      5,
-      6,
-      7,
-      8,
-      9,
-      10,
-      11,
-      12,
-      13,
-      14,
-      15,
-      16,
-      17,
-      18,
-      19,
-      20,
-      21,
-      22,
-      23,
-      24,
-      25,
-      26,
-      27,
-      28,
-      29,
-      30,
-      31,
-      32,
-      33,
-      34,
-      35,
-      36,
-      37,
-      38,
-      39,
-      40,
-      41,
-      42,
-      43,
-      44,
-      45,
-      46,
-      47,
-      48,
-      49,
-      50,
-      51,
-      52,
-      53,
-      54,
-      55,
-      56,
-      57,
-      58,
-      59,
-      60,
-      61,
-      62,
-      63
+      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+      26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
+      49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
     ],
     "pre_pin_allowed_cpus": [
-      0,
-      1,
-      2,
-      3,
-      4,
-      5,
-      6,
-      7,
-      8,
-      9,
-      10,
-      11,
-      12,
-      13,
-      14,
-      15,
-      16,
-      17,
-      18,
-      19,
-      20,
-      21,
-      22,
-      23,
-      24,
-      25,
-      26,
-      27,
-      28,
-      29,
-      30,
-      31,
-      32,
-      33,
-      34,
-      35,
-      36,
-      37,
-      38,
-      39,
-      40,
-      41,
-      42,
-      43,
-      44,
-      45,
-      46,
-      47,
-      48,
-      49,
-      50,
-      51,
-      52,
-      53,
-      54,
-      55,
-      56,
-      57,
-      58,
-      59,
-      60,
-      61,
-      62,
-      63
+      0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25,
+      26, 27, 28, 29, 30, 31, 32, 33, 34, 35, 36, 37, 38, 39, 40, 41, 42, 43, 44, 45, 46, 47, 48,
+      49, 50, 51, 52, 53, 54, 55, 56, 57, 58, 59, 60, 61, 62, 63
     ],
     "pre_pin_allowed_cpu_count": 64,
     "cgroup_cpuset_effective": null,
@@ -387,42 +265,15 @@
     "host_quiet_timeout_ms": 300000
   },
   "driver_cpu": 52,
-  "driver_cpus": [
-    52
-  ],
+  "driver_cpus": [52],
   "client_affinity_cpu_count": 1,
   "requested_client_threads_per_affinity_cpu": 1.0,
-  "fuse_cpus": [
-    23
-  ],
+  "fuse_cpus": [23],
   "requested_fuse_cpus": 1,
   "fuse_cpu_isolation": "private_physical_core_clients_placed_after",
-  "driver_guard_cpus": [
-    20,
-    52
-  ],
-  "fuse_guard_cpus": [
-    23,
-    55
-  ],
-  "last_level_cache_cpus": [
-    16,
-    17,
-    18,
-    19,
-    20,
-    21,
-    22,
-    23,
-    48,
-    49,
-    50,
-    51,
-    52,
-    53,
-    54,
-    55
-  ],
+  "driver_guard_cpus": [20, 52],
+  "fuse_guard_cpus": [23, 55],
+  "last_level_cache_cpus": [16, 17, 18, 19, 20, 21, 22, 23, 48, 49, 50, 51, 52, 53, 54, 55],
   "initial_cpu_busy_fractions": {
     "0": 0.031914893617021274,
     "1": 0.020202020202020204,
@@ -520,19 +371,9 @@
   "mount_contract": {
     "kernel": "real kernel filesystem on read-only loop device",
     "candidate": "FrankenFS FUSE",
-    "common": [
-      "ro",
-      "noatime",
-      "nodev",
-      "nosuid"
-    ],
-    "ext4_kernel_only": [
-      "noload"
-    ],
-    "fuse_only": [
-      "no_background_scrub",
-      "writeback_cache_disabled"
-    ],
+    "common": ["ro", "noatime", "nodev", "nosuid"],
+    "ext4_kernel_only": ["noload"],
+    "fuse_only": ["no_background_scrub", "writeback_cache_disabled"],
     "durability": "read_only_no_mutation"
   },
   "workload": "warm_stat",
@@ -577,19 +418,13 @@
         "candidate": {
           "name": "FrankenFS FUSE",
           "boundary": "Linux VFS through two independent FrankenFS FUSE mounts",
-          "physical_arms": [
-            "fuse_a",
-            "fuse_b"
-          ],
+          "physical_arms": ["fuse_a", "fuse_b"],
           "executing_elf_sha256": "b7bf06df66cb620b3d4ceaf9bb0b7c9a4236bf192ce88001f8a87a9df2a078ea"
         },
         "incumbent": {
           "name": "Linux kernel btrfs",
           "boundary": "Linux VFS through two independent in-kernel btrfs mounts",
-          "physical_arms": [
-            "kernel_a",
-            "kernel_b"
-          ],
+          "physical_arms": ["kernel_a", "kernel_b"],
           "release": "7.0.0-30-generic",
           "module": "btrfs",
           "artifact": "/lib/modules/7.0.0-30-generic/kernel/fs/btrfs/btrfs.ko.zst",
@@ -869,36 +704,18 @@
       "requested_client_threads": 1,
       "actual_observed_worker_threads": 1,
       "observed_worker_threads_by_arm": {
-        "kernel_a": [
-          1
-        ],
-        "kernel_b": [
-          1
-        ],
-        "fuse_a": [
-          1
-        ],
-        "fuse_b": [
-          1
-        ]
+        "kernel_a": [1],
+        "kernel_b": [1],
+        "fuse_a": [1],
+        "fuse_b": [1]
       },
       "timed_worker_cpu_binding": "one_fixed_cpu_per_timed_thread",
-      "timed_worker_bound_cpus": [
-        52
-      ],
+      "timed_worker_bound_cpus": [52],
       "observed_worker_cpus_by_arm": {
-        "kernel_a": [
-          52
-        ],
-        "kernel_b": [
-          52
-        ],
-        "fuse_a": [
-          52
-        ],
-        "fuse_b": [
-          52
-        ]
+        "kernel_a": [52],
+        "kernel_b": [52],
+        "fuse_a": [52],
+        "fuse_b": [52]
       },
       "worker_cpu_pinning_clear": true,
       "worker_thread_observation_method": "single Linux benchmark-driver TID observed before and after each timed batch",
@@ -910,9 +727,7 @@
       "client_affinity_mask": "00100000,00000000",
       "client_affinity_list": "52",
       "client_affinity_cpu_count": 1,
-      "client_affinity_cpus": [
-        52
-      ],
+      "client_affinity_cpus": [52],
       "client_physical_cores": 1,
       "client_smt_shared_cpus": 0,
       "client_cpu_mhz": {
@@ -938,12 +753,7 @@
       "crossover_blocks": 3,
       "estimator_block_rounds": 4,
       "physical_role_crossover_rounds": 2,
-      "measured_arms": [
-        "kernel_a",
-        "kernel_b",
-        "fuse_a",
-        "fuse_b"
-      ],
+      "measured_arms": ["kernel_a", "kernel_b", "fuse_a", "fuse_b"],
       "balanced_schedule": "four_arm_latin_square",
       "balanced_schedule_orders": 4,
       "balanced_schedule_period_rounds": 4,
@@ -965,12 +775,7 @@
           "mountpoint": "/tmp/frankenfs-mounted-kernel-mounts/run_1788288028_610503317_2509406/btrfs/kernel_a",
           "major_minor": "0:59",
           "root": "/",
-          "mount_options": [
-            "noatime",
-            "nodev",
-            "nosuid",
-            "ro"
-          ],
+          "mount_options": ["noatime", "nodev", "nosuid", "ro"],
           "filesystem_type": "btrfs",
           "source": "/dev/loop10",
           "super_options": [
@@ -988,12 +793,7 @@
           "mountpoint": "/tmp/frankenfs-mounted-kernel-mounts/run_1788288028_610503317_2509406/btrfs/kernel_b",
           "major_minor": "0:77",
           "root": "/",
-          "mount_options": [
-            "noatime",
-            "nodev",
-            "nosuid",
-            "ro"
-          ],
+          "mount_options": ["noatime", "nodev", "nosuid", "ro"],
           "filesystem_type": "btrfs",
           "source": "/dev/loop11",
           "super_options": [
@@ -1011,12 +811,7 @@
           "mountpoint": "/tmp/frankenfs-mounted-kernel-mounts/run_1788288028_610503317_2509406/btrfs/fuse_a",
           "major_minor": "0:79",
           "root": "/",
-          "mount_options": [
-            "noatime",
-            "nodev",
-            "nosuid",
-            "ro"
-          ],
+          "mount_options": ["noatime", "nodev", "nosuid", "ro"],
           "filesystem_type": "fuse.ffs",
           "source": "frankenfs",
           "super_options": [
@@ -1041,12 +836,7 @@
           "mountpoint": "/tmp/frankenfs-mounted-kernel-mounts/run_1788288028_610503317_2509406/btrfs/fuse_b",
           "major_minor": "0:80",
           "root": "/",
-          "mount_options": [
-            "noatime",
-            "nodev",
-            "nosuid",
-            "ro"
-          ],
+          "mount_options": ["noatime", "nodev", "nosuid", "ro"],
           "filesystem_type": "fuse.ffs",
           "source": "frankenfs",
           "super_options": [
@@ -1167,118 +957,38 @@
       "host_wide_quiescence": "not_applicable",
       "raw_wall_ns": {
         "kernel_a": [
-          4563166,
-          4669978,
-          4554980,
-          4701969,
-          4713490,
-          4586590,
-          4566442,
-          4680868,
-          4667613,
-          4673054,
-          5019310,
-          4682331
+          4563166, 4669978, 4554980, 4701969, 4713490, 4586590, 4566442, 4680868, 4667613, 4673054,
+          5019310, 4682331
         ],
         "kernel_b": [
-          4648817,
-          4650681,
-          4722949,
-          4425295,
-          4600817,
-          4615295,
-          4672162,
-          4585037,
-          4724411,
-          4538769,
-          4055133,
-          4575319
+          4648817, 4650681, 4722949, 4425295, 4600817, 4615295, 4672162, 4585037, 4724411, 4538769,
+          4055133, 4575319
         ],
         "fuse_a": [
-          21298353,
-          21274488,
-          21297231,
-          21296719,
-          21285689,
-          21346243,
-          21344290,
-          21231286,
-          21362725,
-          21252286,
-          21207831,
-          21389896
+          21298353, 21274488, 21297231, 21296719, 21285689, 21346243, 21344290, 21231286, 21362725,
+          21252286, 21207831, 21389896
         ],
         "fuse_b": [
-          23612537,
-          21317429,
-          21414022,
-          22317915,
-          21229202,
-          21177464,
-          21183946,
-          21309935,
-          21252847,
-          21319724,
-          21318962,
-          21725302
+          23612537, 21317429, 21414022, 22317915, 21229202, 21177464, 21183946, 21309935, 21252847,
+          21319724, 21318962, 21725302
         ]
       },
       "raw_physical_wall_ns": {
         "kernel_a": [
-          4563166,
-          4650681,
-          4554980,
-          4425295,
-          4713490,
-          4615295,
-          4566442,
-          4585037,
-          4667613,
-          4538769,
-          5019310,
-          4575319
+          4563166, 4650681, 4554980, 4425295, 4713490, 4615295, 4566442, 4585037, 4667613, 4538769,
+          5019310, 4575319
         ],
         "kernel_b": [
-          4648817,
-          4669978,
-          4722949,
-          4701969,
-          4600817,
-          4586590,
-          4672162,
-          4680868,
-          4724411,
-          4673054,
-          4055133,
-          4682331
+          4648817, 4669978, 4722949, 4701969, 4600817, 4586590, 4672162, 4680868, 4724411, 4673054,
+          4055133, 4682331
         ],
         "fuse_a": [
-          21298353,
-          21317429,
-          21297231,
-          22317915,
-          21285689,
-          21177464,
-          21344290,
-          21309935,
-          21362725,
-          21319724,
-          21207831,
-          21725302
+          21298353, 21317429, 21297231, 22317915, 21285689, 21177464, 21344290, 21309935, 21362725,
+          21319724, 21207831, 21725302
         ],
         "fuse_b": [
-          23612537,
-          21274488,
-          21414022,
-          21296719,
-          21229202,
-          21346243,
-          21183946,
-          21231286,
-          21252847,
-          21252286,
-          21318962,
-          21389896
+          23612537, 21274488, 21414022, 21296719, 21229202, 21346243, 21183946, 21231286, 21252847,
+          21252286, 21318962, 21389896
         ]
       },
       "diagnostic_side_throughput": {

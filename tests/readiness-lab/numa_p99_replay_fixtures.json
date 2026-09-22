@@ -15,16 +15,76 @@
       },
       "latency": {
         "attribution": [
-          { "component": "queueing", "detail": "balanced queueing replay", "p50_us": 120.0, "p95_us": 240.0, "p99_us": 480.0 },
-          { "component": "service", "detail": "dominant balanced service replay", "p50_us": 640.0, "p95_us": 1280.0, "p99_us": 2880.0 },
-          { "component": "io", "detail": "balanced local NVMe replay", "p50_us": 110.0, "p95_us": 220.0, "p99_us": 440.0 },
-          { "component": "synchronization", "detail": "balanced lock replay", "p50_us": 90.0, "p95_us": 180.0, "p99_us": 360.0 },
-          { "component": "allocator", "detail": "balanced allocator replay", "p50_us": 80.0, "p95_us": 160.0, "p99_us": 320.0 },
-          { "component": "repair_backlog", "detail": "balanced repair backlog replay", "p50_us": 70.0, "p95_us": 140.0, "p99_us": 280.0 },
-          { "component": "cache_pressure", "detail": "balanced cache pressure replay", "p50_us": 90.0, "p95_us": 180.0, "p99_us": 360.0 },
-          { "component": "rch_worker_contention", "detail": "balanced RCH worker replay", "p50_us": 70.0, "p95_us": 140.0, "p99_us": 280.0 },
-          { "component": "numa_remote_access", "detail": "balanced NUMA remote replay", "p50_us": 100.0, "p95_us": 200.0, "p99_us": 400.0 },
-          { "component": "memory_reclaim", "detail": "balanced memory reclaim replay", "p50_us": 80.0, "p95_us": 160.0, "p99_us": 320.0 }
+          {
+            "component": "queueing",
+            "detail": "balanced queueing replay",
+            "p50_us": 120.0,
+            "p95_us": 240.0,
+            "p99_us": 480.0
+          },
+          {
+            "component": "service",
+            "detail": "dominant balanced service replay",
+            "p50_us": 640.0,
+            "p95_us": 1280.0,
+            "p99_us": 2880.0
+          },
+          {
+            "component": "io",
+            "detail": "balanced local NVMe replay",
+            "p50_us": 110.0,
+            "p95_us": 220.0,
+            "p99_us": 440.0
+          },
+          {
+            "component": "synchronization",
+            "detail": "balanced lock replay",
+            "p50_us": 90.0,
+            "p95_us": 180.0,
+            "p99_us": 360.0
+          },
+          {
+            "component": "allocator",
+            "detail": "balanced allocator replay",
+            "p50_us": 80.0,
+            "p95_us": 160.0,
+            "p99_us": 320.0
+          },
+          {
+            "component": "repair_backlog",
+            "detail": "balanced repair backlog replay",
+            "p50_us": 70.0,
+            "p95_us": 140.0,
+            "p99_us": 280.0
+          },
+          {
+            "component": "cache_pressure",
+            "detail": "balanced cache pressure replay",
+            "p50_us": 90.0,
+            "p95_us": 180.0,
+            "p99_us": 360.0
+          },
+          {
+            "component": "rch_worker_contention",
+            "detail": "balanced RCH worker replay",
+            "p50_us": 70.0,
+            "p95_us": 140.0,
+            "p99_us": 280.0
+          },
+          {
+            "component": "numa_remote_access",
+            "detail": "balanced NUMA remote replay",
+            "p50_us": 100.0,
+            "p95_us": 200.0,
+            "p99_us": 400.0
+          },
+          {
+            "component": "memory_reclaim",
+            "detail": "balanced memory reclaim replay",
+            "p50_us": 80.0,
+            "p95_us": 160.0,
+            "p99_us": 320.0
+          }
         ],
         "p50_latency_us": 2250.0,
         "p95_latency_us": 4500.0,
@@ -59,16 +119,76 @@
       },
       "latency": {
         "attribution": [
-          { "component": "queueing", "detail": "skewed queueing replay", "p50_us": 200.0, "p95_us": 400.0, "p99_us": 900.0 },
-          { "component": "service", "detail": "skewed service replay", "p50_us": 180.0, "p95_us": 360.0, "p99_us": 780.0 },
-          { "component": "io", "detail": "skewed local NVMe replay", "p50_us": 150.0, "p95_us": 300.0, "p99_us": 650.0 },
-          { "component": "synchronization", "detail": "skewed lock replay", "p50_us": 220.0, "p95_us": 440.0, "p99_us": 960.0 },
-          { "component": "allocator", "detail": "skewed allocator replay", "p50_us": 140.0, "p95_us": 280.0, "p99_us": 600.0 },
-          { "component": "repair_backlog", "detail": "skewed repair backlog replay", "p50_us": 120.0, "p95_us": 240.0, "p99_us": 520.0 },
-          { "component": "cache_pressure", "detail": "skewed cache pressure replay", "p50_us": 210.0, "p95_us": 420.0, "p99_us": 880.0 },
-          { "component": "rch_worker_contention", "detail": "skewed RCH worker replay", "p50_us": 100.0, "p95_us": 200.0, "p99_us": 450.0 },
-          { "component": "numa_remote_access", "detail": "dominant skewed NUMA remote replay", "p50_us": 1200.0, "p95_us": 2400.0, "p99_us": 4800.0 },
-          { "component": "memory_reclaim", "detail": "skewed memory reclaim replay", "p50_us": 160.0, "p95_us": 320.0, "p99_us": 700.0 }
+          {
+            "component": "queueing",
+            "detail": "skewed queueing replay",
+            "p50_us": 200.0,
+            "p95_us": 400.0,
+            "p99_us": 900.0
+          },
+          {
+            "component": "service",
+            "detail": "skewed service replay",
+            "p50_us": 180.0,
+            "p95_us": 360.0,
+            "p99_us": 780.0
+          },
+          {
+            "component": "io",
+            "detail": "skewed local NVMe replay",
+            "p50_us": 150.0,
+            "p95_us": 300.0,
+            "p99_us": 650.0
+          },
+          {
+            "component": "synchronization",
+            "detail": "skewed lock replay",
+            "p50_us": 220.0,
+            "p95_us": 440.0,
+            "p99_us": 960.0
+          },
+          {
+            "component": "allocator",
+            "detail": "skewed allocator replay",
+            "p50_us": 140.0,
+            "p95_us": 280.0,
+            "p99_us": 600.0
+          },
+          {
+            "component": "repair_backlog",
+            "detail": "skewed repair backlog replay",
+            "p50_us": 120.0,
+            "p95_us": 240.0,
+            "p99_us": 520.0
+          },
+          {
+            "component": "cache_pressure",
+            "detail": "skewed cache pressure replay",
+            "p50_us": 210.0,
+            "p95_us": 420.0,
+            "p99_us": 880.0
+          },
+          {
+            "component": "rch_worker_contention",
+            "detail": "skewed RCH worker replay",
+            "p50_us": 100.0,
+            "p95_us": 200.0,
+            "p99_us": 450.0
+          },
+          {
+            "component": "numa_remote_access",
+            "detail": "dominant skewed NUMA remote replay",
+            "p50_us": 1200.0,
+            "p95_us": 2400.0,
+            "p99_us": 4800.0
+          },
+          {
+            "component": "memory_reclaim",
+            "detail": "skewed memory reclaim replay",
+            "p50_us": 160.0,
+            "p95_us": 320.0,
+            "p99_us": 700.0
+          }
         ],
         "p50_latency_us": 3750.0,
         "p95_latency_us": 7500.0,
@@ -103,16 +223,76 @@
       },
       "latency": {
         "attribution": [
-          { "component": "queueing", "detail": "metadata hot-shard queueing replay", "p50_us": 260.0, "p95_us": 520.0, "p99_us": 1100.0 },
-          { "component": "service", "detail": "metadata hot-shard service replay", "p50_us": 240.0, "p95_us": 480.0, "p99_us": 1000.0 },
-          { "component": "io", "detail": "metadata hot-shard local NVMe replay", "p50_us": 180.0, "p95_us": 360.0, "p99_us": 760.0 },
-          { "component": "synchronization", "detail": "dominant metadata hot-shard lock replay", "p50_us": 1440.0, "p95_us": 2880.0, "p99_us": 5760.0 },
-          { "component": "allocator", "detail": "metadata hot-shard allocator replay", "p50_us": 180.0, "p95_us": 360.0, "p99_us": 760.0 },
-          { "component": "repair_backlog", "detail": "metadata hot-shard repair backlog replay", "p50_us": 150.0, "p95_us": 300.0, "p99_us": 640.0 },
-          { "component": "cache_pressure", "detail": "metadata hot-shard cache pressure replay", "p50_us": 300.0, "p95_us": 600.0, "p99_us": 1200.0 },
-          { "component": "rch_worker_contention", "detail": "metadata hot-shard RCH worker replay", "p50_us": 120.0, "p95_us": 240.0, "p99_us": 520.0 },
-          { "component": "numa_remote_access", "detail": "metadata hot-shard NUMA remote replay", "p50_us": 280.0, "p95_us": 560.0, "p99_us": 1120.0 },
-          { "component": "memory_reclaim", "detail": "metadata hot-shard memory reclaim replay", "p50_us": 180.0, "p95_us": 360.0, "p99_us": 760.0 }
+          {
+            "component": "queueing",
+            "detail": "metadata hot-shard queueing replay",
+            "p50_us": 260.0,
+            "p95_us": 520.0,
+            "p99_us": 1100.0
+          },
+          {
+            "component": "service",
+            "detail": "metadata hot-shard service replay",
+            "p50_us": 240.0,
+            "p95_us": 480.0,
+            "p99_us": 1000.0
+          },
+          {
+            "component": "io",
+            "detail": "metadata hot-shard local NVMe replay",
+            "p50_us": 180.0,
+            "p95_us": 360.0,
+            "p99_us": 760.0
+          },
+          {
+            "component": "synchronization",
+            "detail": "dominant metadata hot-shard lock replay",
+            "p50_us": 1440.0,
+            "p95_us": 2880.0,
+            "p99_us": 5760.0
+          },
+          {
+            "component": "allocator",
+            "detail": "metadata hot-shard allocator replay",
+            "p50_us": 180.0,
+            "p95_us": 360.0,
+            "p99_us": 760.0
+          },
+          {
+            "component": "repair_backlog",
+            "detail": "metadata hot-shard repair backlog replay",
+            "p50_us": 150.0,
+            "p95_us": 300.0,
+            "p99_us": 640.0
+          },
+          {
+            "component": "cache_pressure",
+            "detail": "metadata hot-shard cache pressure replay",
+            "p50_us": 300.0,
+            "p95_us": 600.0,
+            "p99_us": 1200.0
+          },
+          {
+            "component": "rch_worker_contention",
+            "detail": "metadata hot-shard RCH worker replay",
+            "p50_us": 120.0,
+            "p95_us": 240.0,
+            "p99_us": 520.0
+          },
+          {
+            "component": "numa_remote_access",
+            "detail": "metadata hot-shard NUMA remote replay",
+            "p50_us": 280.0,
+            "p95_us": 560.0,
+            "p99_us": 1120.0
+          },
+          {
+            "component": "memory_reclaim",
+            "detail": "metadata hot-shard memory reclaim replay",
+            "p50_us": 180.0,
+            "p95_us": 360.0,
+            "p99_us": 760.0
+          }
         ],
         "p50_latency_us": 4500.0,
         "p95_latency_us": 9000.0,
@@ -147,16 +327,76 @@
       },
       "latency": {
         "attribution": [
-          { "component": "queueing", "detail": "repair scrub queueing replay", "p50_us": 320.0, "p95_us": 640.0, "p99_us": 1360.0 },
-          { "component": "service", "detail": "repair scrub service replay", "p50_us": 260.0, "p95_us": 520.0, "p99_us": 1120.0 },
-          { "component": "io", "detail": "repair scrub local NVMe replay", "p50_us": 300.0, "p95_us": 600.0, "p99_us": 1280.0 },
-          { "component": "synchronization", "detail": "repair scrub lock replay", "p50_us": 340.0, "p95_us": 680.0, "p99_us": 1440.0 },
-          { "component": "allocator", "detail": "repair scrub allocator replay", "p50_us": 160.0, "p95_us": 320.0, "p99_us": 720.0 },
-          { "component": "repair_backlog", "detail": "dominant repair scrub backlog replay", "p50_us": 1680.0, "p95_us": 3360.0, "p99_us": 6720.0 },
-          { "component": "cache_pressure", "detail": "repair scrub cache pressure replay", "p50_us": 300.0, "p95_us": 600.0, "p99_us": 1280.0 },
-          { "component": "rch_worker_contention", "detail": "repair scrub RCH worker replay", "p50_us": 140.0, "p95_us": 280.0, "p99_us": 600.0 },
-          { "component": "numa_remote_access", "detail": "repair scrub NUMA remote replay", "p50_us": 260.0, "p95_us": 520.0, "p99_us": 1100.0 },
-          { "component": "memory_reclaim", "detail": "repair scrub memory reclaim replay", "p50_us": 240.0, "p95_us": 480.0, "p99_us": 1000.0 }
+          {
+            "component": "queueing",
+            "detail": "repair scrub queueing replay",
+            "p50_us": 320.0,
+            "p95_us": 640.0,
+            "p99_us": 1360.0
+          },
+          {
+            "component": "service",
+            "detail": "repair scrub service replay",
+            "p50_us": 260.0,
+            "p95_us": 520.0,
+            "p99_us": 1120.0
+          },
+          {
+            "component": "io",
+            "detail": "repair scrub local NVMe replay",
+            "p50_us": 300.0,
+            "p95_us": 600.0,
+            "p99_us": 1280.0
+          },
+          {
+            "component": "synchronization",
+            "detail": "repair scrub lock replay",
+            "p50_us": 340.0,
+            "p95_us": 680.0,
+            "p99_us": 1440.0
+          },
+          {
+            "component": "allocator",
+            "detail": "repair scrub allocator replay",
+            "p50_us": 160.0,
+            "p95_us": 320.0,
+            "p99_us": 720.0
+          },
+          {
+            "component": "repair_backlog",
+            "detail": "dominant repair scrub backlog replay",
+            "p50_us": 1680.0,
+            "p95_us": 3360.0,
+            "p99_us": 6720.0
+          },
+          {
+            "component": "cache_pressure",
+            "detail": "repair scrub cache pressure replay",
+            "p50_us": 300.0,
+            "p95_us": 600.0,
+            "p99_us": 1280.0
+          },
+          {
+            "component": "rch_worker_contention",
+            "detail": "repair scrub RCH worker replay",
+            "p50_us": 140.0,
+            "p95_us": 280.0,
+            "p99_us": 600.0
+          },
+          {
+            "component": "numa_remote_access",
+            "detail": "repair scrub NUMA remote replay",
+            "p50_us": 260.0,
+            "p95_us": 520.0,
+            "p99_us": 1100.0
+          },
+          {
+            "component": "memory_reclaim",
+            "detail": "repair scrub memory reclaim replay",
+            "p50_us": 240.0,
+            "p95_us": 480.0,
+            "p99_us": 1000.0
+          }
         ],
         "p50_latency_us": 5250.0,
         "p95_latency_us": 10500.0,
@@ -191,16 +431,76 @@
       },
       "latency": {
         "attribution": [
-          { "component": "queueing", "detail": "RCH contention queueing replay", "p50_us": 420.0, "p95_us": 840.0, "p99_us": 1680.0 },
-          { "component": "service", "detail": "RCH contention service replay", "p50_us": 300.0, "p95_us": 600.0, "p99_us": 1240.0 },
-          { "component": "io", "detail": "RCH contention local NVMe replay", "p50_us": 240.0, "p95_us": 480.0, "p99_us": 1040.0 },
-          { "component": "synchronization", "detail": "RCH contention lock replay", "p50_us": 360.0, "p95_us": 720.0, "p99_us": 1500.0 },
-          { "component": "allocator", "detail": "RCH contention allocator replay", "p50_us": 180.0, "p95_us": 360.0, "p99_us": 760.0 },
-          { "component": "repair_backlog", "detail": "RCH contention repair backlog replay", "p50_us": 160.0, "p95_us": 320.0, "p99_us": 700.0 },
-          { "component": "cache_pressure", "detail": "RCH contention cache pressure replay", "p50_us": 340.0, "p95_us": 680.0, "p99_us": 1400.0 },
-          { "component": "rch_worker_contention", "detail": "dominant shared RCH worker replay", "p50_us": 1920.0, "p95_us": 3840.0, "p99_us": 7680.0 },
-          { "component": "numa_remote_access", "detail": "RCH contention NUMA remote replay", "p50_us": 260.0, "p95_us": 520.0, "p99_us": 1120.0 },
-          { "component": "memory_reclaim", "detail": "RCH contention memory reclaim replay", "p50_us": 280.0, "p95_us": 560.0, "p99_us": 1160.0 }
+          {
+            "component": "queueing",
+            "detail": "RCH contention queueing replay",
+            "p50_us": 420.0,
+            "p95_us": 840.0,
+            "p99_us": 1680.0
+          },
+          {
+            "component": "service",
+            "detail": "RCH contention service replay",
+            "p50_us": 300.0,
+            "p95_us": 600.0,
+            "p99_us": 1240.0
+          },
+          {
+            "component": "io",
+            "detail": "RCH contention local NVMe replay",
+            "p50_us": 240.0,
+            "p95_us": 480.0,
+            "p99_us": 1040.0
+          },
+          {
+            "component": "synchronization",
+            "detail": "RCH contention lock replay",
+            "p50_us": 360.0,
+            "p95_us": 720.0,
+            "p99_us": 1500.0
+          },
+          {
+            "component": "allocator",
+            "detail": "RCH contention allocator replay",
+            "p50_us": 180.0,
+            "p95_us": 360.0,
+            "p99_us": 760.0
+          },
+          {
+            "component": "repair_backlog",
+            "detail": "RCH contention repair backlog replay",
+            "p50_us": 160.0,
+            "p95_us": 320.0,
+            "p99_us": 700.0
+          },
+          {
+            "component": "cache_pressure",
+            "detail": "RCH contention cache pressure replay",
+            "p50_us": 340.0,
+            "p95_us": 680.0,
+            "p99_us": 1400.0
+          },
+          {
+            "component": "rch_worker_contention",
+            "detail": "dominant shared RCH worker replay",
+            "p50_us": 1920.0,
+            "p95_us": 3840.0,
+            "p99_us": 7680.0
+          },
+          {
+            "component": "numa_remote_access",
+            "detail": "RCH contention NUMA remote replay",
+            "p50_us": 260.0,
+            "p95_us": 520.0,
+            "p99_us": 1120.0
+          },
+          {
+            "component": "memory_reclaim",
+            "detail": "RCH contention memory reclaim replay",
+            "p50_us": 280.0,
+            "p95_us": 560.0,
+            "p99_us": 1160.0
+          }
         ],
         "p50_latency_us": 6000.0,
         "p95_latency_us": 12000.0,
@@ -235,16 +535,76 @@
       },
       "latency": {
         "attribution": [
-          { "component": "queueing", "detail": "memory pressure queueing replay", "p50_us": 500.0, "p95_us": 1000.0, "p99_us": 2000.0 },
-          { "component": "service", "detail": "memory pressure service replay", "p50_us": 320.0, "p95_us": 640.0, "p99_us": 1360.0 },
-          { "component": "io", "detail": "memory pressure local NVMe replay", "p50_us": 360.0, "p95_us": 720.0, "p99_us": 1480.0 },
-          { "component": "synchronization", "detail": "memory pressure lock replay", "p50_us": 380.0, "p95_us": 760.0, "p99_us": 1560.0 },
-          { "component": "allocator", "detail": "memory pressure allocator replay", "p50_us": 300.0, "p95_us": 600.0, "p99_us": 1240.0 },
-          { "component": "repair_backlog", "detail": "memory pressure repair backlog replay", "p50_us": 260.0, "p95_us": 520.0, "p99_us": 1120.0 },
-          { "component": "cache_pressure", "detail": "memory pressure cache pressure replay", "p50_us": 620.0, "p95_us": 1240.0, "p99_us": 2480.0 },
-          { "component": "rch_worker_contention", "detail": "memory pressure RCH worker replay", "p50_us": 220.0, "p95_us": 440.0, "p99_us": 960.0 },
-          { "component": "numa_remote_access", "detail": "memory pressure NUMA remote replay", "p50_us": 400.0, "p95_us": 800.0, "p99_us": 1640.0 },
-          { "component": "memory_reclaim", "detail": "dominant memory reclaim replay", "p50_us": 2160.0, "p95_us": 4320.0, "p99_us": 8640.0 }
+          {
+            "component": "queueing",
+            "detail": "memory pressure queueing replay",
+            "p50_us": 500.0,
+            "p95_us": 1000.0,
+            "p99_us": 2000.0
+          },
+          {
+            "component": "service",
+            "detail": "memory pressure service replay",
+            "p50_us": 320.0,
+            "p95_us": 640.0,
+            "p99_us": 1360.0
+          },
+          {
+            "component": "io",
+            "detail": "memory pressure local NVMe replay",
+            "p50_us": 360.0,
+            "p95_us": 720.0,
+            "p99_us": 1480.0
+          },
+          {
+            "component": "synchronization",
+            "detail": "memory pressure lock replay",
+            "p50_us": 380.0,
+            "p95_us": 760.0,
+            "p99_us": 1560.0
+          },
+          {
+            "component": "allocator",
+            "detail": "memory pressure allocator replay",
+            "p50_us": 300.0,
+            "p95_us": 600.0,
+            "p99_us": 1240.0
+          },
+          {
+            "component": "repair_backlog",
+            "detail": "memory pressure repair backlog replay",
+            "p50_us": 260.0,
+            "p95_us": 520.0,
+            "p99_us": 1120.0
+          },
+          {
+            "component": "cache_pressure",
+            "detail": "memory pressure cache pressure replay",
+            "p50_us": 620.0,
+            "p95_us": 1240.0,
+            "p99_us": 2480.0
+          },
+          {
+            "component": "rch_worker_contention",
+            "detail": "memory pressure RCH worker replay",
+            "p50_us": 220.0,
+            "p95_us": 440.0,
+            "p99_us": 960.0
+          },
+          {
+            "component": "numa_remote_access",
+            "detail": "memory pressure NUMA remote replay",
+            "p50_us": 400.0,
+            "p95_us": 800.0,
+            "p99_us": 1640.0
+          },
+          {
+            "component": "memory_reclaim",
+            "detail": "dominant memory reclaim replay",
+            "p50_us": 2160.0,
+            "p95_us": 4320.0,
+            "p99_us": 8640.0
+          }
         ],
         "p50_latency_us": 6750.0,
         "p95_latency_us": 13500.0,

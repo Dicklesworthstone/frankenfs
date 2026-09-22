@@ -57,11 +57,7 @@
       "max_flakes": 0,
       "max_iterations": 3,
       "profile_id": "smoke",
-      "required_capabilities": [
-        "cargo",
-        "artifact_aggregation",
-        "resource_monitor"
-      ],
+      "required_capabilities": ["cargo", "artifact_aggregation", "resource_monitor"],
       "resource_limits": {
         "max_artifact_mib": 64,
         "max_cpu_percent": 200,
@@ -75,11 +71,7 @@
       "duration_seconds": 14400,
       "heartbeat_interval_seconds": 300,
       "long_run_context": {
-        "intended_hosts": [
-          "rch",
-          "ci",
-          "manual_permissioned"
-        ],
+        "intended_hosts": ["rch", "ci", "manual_permissioned"],
         "operator_notes": "Nightly runs may skip mounted workloads only through structured host-capability artifacts; product failures and recurring flakes must preserve reproduction packs.",
         "records_environment_fields": [
           "kernel",
@@ -120,11 +112,7 @@
       "duration_seconds": 21600,
       "heartbeat_interval_seconds": 300,
       "long_run_context": {
-        "intended_hosts": [
-          "rch",
-          "ci",
-          "manual_permissioned"
-        ],
+        "intended_hosts": ["rch", "ci", "manual_permissioned"],
         "operator_notes": "Stress runs are opt-in for large workers; resource exhaustion is a campaign failure, not a flake, unless a linked reproduction pack proves host-only pressure.",
         "records_environment_fields": [
           "kernel",
@@ -144,13 +132,7 @@
       "max_flakes": 1,
       "max_iterations": 250,
       "profile_id": "stress",
-      "required_capabilities": [
-        "cargo",
-        "rch",
-        "fuse",
-        "repair_scrub",
-        "resource_monitor"
-      ],
+      "required_capabilities": ["cargo", "rch", "fuse", "repair_scrub", "resource_monitor"],
       "resource_limits": {
         "max_artifact_mib": 4096,
         "max_cpu_percent": 6400,
@@ -164,11 +146,7 @@
       "duration_seconds": 3600,
       "heartbeat_interval_seconds": 120,
       "long_run_context": {
-        "intended_hosts": [
-          "rch",
-          "ci",
-          "manual_permissioned"
-        ],
+        "intended_hosts": ["rch", "ci", "manual_permissioned"],
         "operator_notes": "Canary runs feed release gates directly; stale evidence or missing FUSE capability must downgrade public readiness claims.",
         "records_environment_fields": [
           "kernel",
@@ -261,21 +239,9 @@
         "content_type": "application/json",
         "path_template": "{artifact_dir}/{profile}/{workload_id}_summary.json"
       },
-      "profile_ids": [
-        "smoke",
-        "nightly",
-        "stress",
-        "canary"
-      ],
-      "required_capabilities": [
-        "cargo",
-        "ext4_fixture",
-        "fuse"
-      ],
-      "seeds": [
-        1001,
-        1002
-      ],
+      "profile_ids": ["smoke", "nightly", "stress", "canary"],
+      "required_capabilities": ["cargo", "ext4_fixture", "fuse"],
+      "seeds": [1001, 1002],
       "workload_id": "soak_mount_cycle_ext4_ro"
     },
     {
@@ -298,19 +264,9 @@
         "content_type": "application/json",
         "path_template": "{artifact_dir}/{profile}/{workload_id}_summary.json"
       },
-      "profile_ids": [
-        "nightly",
-        "stress",
-        "canary"
-      ],
-      "required_capabilities": [
-        "cargo",
-        "btrfs_fixture",
-        "fuse"
-      ],
-      "seeds": [
-        2001
-      ],
+      "profile_ids": ["nightly", "stress", "canary"],
+      "required_capabilities": ["cargo", "btrfs_fixture", "fuse"],
+      "seeds": [2001],
       "workload_id": "soak_mount_cycle_btrfs_ro"
     },
     {
@@ -333,20 +289,9 @@
         "content_type": "application/json",
         "path_template": "{artifact_dir}/{profile}/{workload_id}_summary.json"
       },
-      "profile_ids": [
-        "smoke",
-        "nightly",
-        "stress",
-        "canary"
-      ],
-      "required_capabilities": [
-        "cargo",
-        "ext4_fixture"
-      ],
-      "seeds": [
-        3001,
-        3002
-      ],
+      "profile_ids": ["smoke", "nightly", "stress", "canary"],
+      "required_capabilities": ["cargo", "ext4_fixture"],
+      "seeds": [3001, 3002],
       "workload_id": "soak_metadata_churn_ext4"
     },
     {
@@ -369,19 +314,9 @@
         "content_type": "application/json",
         "path_template": "{artifact_dir}/{profile}/{workload_id}_summary.json"
       },
-      "profile_ids": [
-        "nightly",
-        "stress",
-        "canary"
-      ],
-      "required_capabilities": [
-        "cargo",
-        "ext4_fixture",
-        "fuse"
-      ],
-      "seeds": [
-        4001
-      ],
+      "profile_ids": ["nightly", "stress", "canary"],
+      "required_capabilities": ["cargo", "ext4_fixture", "fuse"],
+      "seeds": [4001],
       "workload_id": "soak_read_write_verify_ext4"
     },
     {
@@ -404,20 +339,9 @@
         "content_type": "application/json",
         "path_template": "{artifact_dir}/{profile}/{workload_id}_ledger_summary.json"
       },
-      "profile_ids": [
-        "smoke",
-        "nightly",
-        "stress",
-        "canary"
-      ],
-      "required_capabilities": [
-        "cargo",
-        "repair_scrub"
-      ],
-      "seeds": [
-        5001,
-        5002
-      ],
+      "profile_ids": ["smoke", "nightly", "stress", "canary"],
+      "required_capabilities": ["cargo", "repair_scrub"],
+      "seeds": [5001, 5002],
       "workload_id": "soak_repair_scrub_dry_run"
     },
     {
@@ -440,18 +364,9 @@
         "content_type": "application/json",
         "path_template": "{artifact_dir}/{profile}/{workload_id}_gate_summary.json"
       },
-      "profile_ids": [
-        "nightly",
-        "canary"
-      ],
-      "required_capabilities": [
-        "cargo",
-        "writeback_cache_gate",
-        "release_gate"
-      ],
-      "seeds": [
-        6001
-      ],
+      "profile_ids": ["nightly", "canary"],
+      "required_capabilities": ["cargo", "writeback_cache_gate", "release_gate"],
+      "seeds": [6001],
       "workload_id": "soak_writeback_cache_gate"
     },
     {
@@ -474,12 +389,7 @@
         "content_type": "application/json",
         "path_template": "{artifact_dir}/{profile}/{workload_id}_summary.json"
       },
-      "profile_ids": [
-        "smoke",
-        "nightly",
-        "stress",
-        "canary"
-      ],
+      "profile_ids": ["smoke", "nightly", "stress", "canary"],
       "required_capabilities": [
         "cargo",
         "artifact_aggregation",
@@ -487,9 +397,7 @@
         "proof_bundle",
         "release_gate"
       ],
-      "seeds": [
-        7001
-      ],
+      "seeds": [7001],
       "workload_id": "soak_artifact_aggregation"
     }
   ]

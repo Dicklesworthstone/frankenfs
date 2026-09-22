@@ -11,9 +11,21 @@
       "pre_operation_image_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
       "post_operation_image_hash": "sha256:2222222222222222222222222222222222222222222222222222222222222222",
       "operation_trace": [
-        {"step": 1, "op": "create", "args": ["path=/file"], "fsync_boundary": false, "fsyncdir_boundary": false},
-        {"step": 2, "op": "write", "args": ["offset=0", "len=4096"], "fsync_boundary": false, "fsyncdir_boundary": false},
-        {"step": 3, "op": "fsync", "args": [], "fsync_boundary": true, "fsyncdir_boundary": false}
+        {
+          "step": 1,
+          "op": "create",
+          "args": ["path=/file"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false
+        },
+        {
+          "step": 2,
+          "op": "write",
+          "args": ["offset=0", "len=4096"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false
+        },
+        { "step": 3, "op": "fsync", "args": [], "fsync_boundary": true, "fsyncdir_boundary": false }
       ],
       "crash_or_unmount_point_step": 0,
       "expected_survivor_set": {
@@ -36,9 +48,27 @@
       "pre_operation_image_hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
       "post_operation_image_hash": "sha256:3333333333333333333333333333333333333333333333333333333333333333",
       "operation_trace": [
-        {"step": 1, "op": "create", "args": ["path=/staged"], "fsync_boundary": false, "fsyncdir_boundary": false},
-        {"step": 2, "op": "write", "args": ["offset=0", "len=8192"], "fsync_boundary": false, "fsyncdir_boundary": false},
-        {"step": 3, "op": "checkpoint_marker", "args": ["pre_fsync"], "fsync_boundary": false, "fsyncdir_boundary": false}
+        {
+          "step": 1,
+          "op": "create",
+          "args": ["path=/staged"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false
+        },
+        {
+          "step": 2,
+          "op": "write",
+          "args": ["offset=0", "len=8192"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false
+        },
+        {
+          "step": 3,
+          "op": "checkpoint_marker",
+          "args": ["pre_fsync"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false
+        }
       ],
       "crash_or_unmount_point_step": 3,
       "expected_survivor_set": {
@@ -64,10 +94,34 @@
       "pre_operation_image_hash": "sha256:4444444444444444444444444444444444444444444444444444444444444444",
       "post_operation_image_hash": "sha256:5555555555555555555555555555555555555555555555555555555555555555",
       "operation_trace": [
-        {"step": 1, "op": "create", "args": ["path=/durable"], "fsync_boundary": false, "fsyncdir_boundary": false},
-        {"step": 2, "op": "write", "args": ["offset=0", "len=4096"], "fsync_boundary": false, "fsyncdir_boundary": false},
-        {"step": 3, "op": "fsync", "args": [], "fsync_boundary": true, "fsyncdir_boundary": false},
-        {"step": 4, "op": "checkpoint_marker", "args": ["post_fsync"], "fsync_boundary": false, "fsyncdir_boundary": false}
+        {
+          "step": 1,
+          "op": "create",
+          "args": ["path=/durable"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false
+        },
+        {
+          "step": 2,
+          "op": "write",
+          "args": ["offset=0", "len=4096"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false
+        },
+        {
+          "step": 3,
+          "op": "fsync",
+          "args": [],
+          "fsync_boundary": true,
+          "fsyncdir_boundary": false
+        },
+        {
+          "step": 4,
+          "op": "checkpoint_marker",
+          "args": ["post_fsync"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false
+        }
       ],
       "crash_or_unmount_point_step": 4,
       "expected_survivor_set": {
@@ -93,9 +147,21 @@
       "pre_operation_image_hash": "sha256:6666666666666666666666666666666666666666666666666666666666666666",
       "post_operation_image_hash": "sha256:7777777777777777777777777777777777777777777777777777777777777777",
       "operation_trace": [
-        {"step": 1, "op": "create", "args": ["path=/persistent"], "fsync_boundary": false, "fsyncdir_boundary": false},
-        {"step": 2, "op": "write", "args": ["offset=0", "len=16384"], "fsync_boundary": false, "fsyncdir_boundary": false},
-        {"step": 3, "op": "fsync", "args": [], "fsync_boundary": true, "fsyncdir_boundary": false}
+        {
+          "step": 1,
+          "op": "create",
+          "args": ["path=/persistent"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false
+        },
+        {
+          "step": 2,
+          "op": "write",
+          "args": ["offset=0", "len=16384"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false
+        },
+        { "step": 3, "op": "fsync", "args": [], "fsync_boundary": true, "fsyncdir_boundary": false }
       ],
       "crash_or_unmount_point_step": 3,
       "expected_survivor_set": {
@@ -118,9 +184,27 @@
       "pre_operation_image_hash": "sha256:8888888888888888888888888888888888888888888888888888888888888888",
       "post_operation_image_hash": "sha256:9999999999999999999999999999999999999999999999999999999999999999",
       "operation_trace": [
-        {"step": 1, "op": "create", "args": ["path=/dir/a"], "fsync_boundary": false, "fsyncdir_boundary": false},
-        {"step": 2, "op": "fsyncdir", "args": ["dir=/dir"], "fsync_boundary": false, "fsyncdir_boundary": true},
-        {"step": 3, "op": "checkpoint_marker", "args": ["fsyncdir_complete"], "fsync_boundary": false, "fsyncdir_boundary": false}
+        {
+          "step": 1,
+          "op": "create",
+          "args": ["path=/dir/a"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false
+        },
+        {
+          "step": 2,
+          "op": "fsyncdir",
+          "args": ["dir=/dir"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": true
+        },
+        {
+          "step": 3,
+          "op": "checkpoint_marker",
+          "args": ["fsyncdir_complete"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false
+        }
       ],
       "crash_or_unmount_point_step": 3,
       "expected_survivor_set": {
@@ -143,8 +227,20 @@
       "pre_operation_image_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "post_operation_image_hash": "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
       "operation_trace": [
-        {"step": 1, "op": "create", "args": ["path=/probe"], "fsync_boundary": false, "fsyncdir_boundary": false},
-        {"step": 2, "op": "checkpoint_marker", "args": ["pre_refusal"], "fsync_boundary": false, "fsyncdir_boundary": false}
+        {
+          "step": 1,
+          "op": "create",
+          "args": ["path=/probe"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false
+        },
+        {
+          "step": 2,
+          "op": "checkpoint_marker",
+          "args": ["pre_refusal"],
+          "fsync_boundary": false,
+          "fsyncdir_boundary": false
+        }
       ],
       "crash_or_unmount_point_step": 2,
       "expected_survivor_set": {

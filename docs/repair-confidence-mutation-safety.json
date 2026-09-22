@@ -154,9 +154,7 @@
         "dry_run_validated": true,
         "mutation_requested": false,
         "rollback_available": true,
-        "changed_paths": [
-          "/blocks/42"
-        ],
+        "changed_paths": ["/blocks/42"],
         "pre_image_hash": "sha256:dryrunpre000000000000000000000000000000000000000000000000000000000001"
       },
       "evidence_ledger": {
@@ -228,9 +226,7 @@
         "dry_run_validated": true,
         "mutation_requested": true,
         "rollback_available": true,
-        "changed_paths": [
-          "/blocks/42"
-        ],
+        "changed_paths": ["/blocks/42"],
         "pre_image_hash": "sha256:mutatepre000000000000000000000000000000000000000000000000000000000001",
         "post_image_hash": "sha256:mutatepost00000000000000000000000000000000000000000000000000000000001"
       },
@@ -371,9 +367,7 @@
         "dry_run_validated": true,
         "mutation_requested": true,
         "rollback_available": true,
-        "changed_paths": [
-          "/blocks/42"
-        ],
+        "changed_paths": ["/blocks/42"],
         "pre_image_hash": "sha256:failedverifypre000000000000000000000000000000000000000000000000000001",
         "post_image_hash": "sha256:failedverifypost00000000000000000000000000000000000000000000000000001"
       },

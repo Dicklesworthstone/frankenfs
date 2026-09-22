@@ -61,9 +61,7 @@
   "foreign_group_summaries": [
     {
       "count": 22,
-      "owner_hints": [
-        "franken_networkx"
-      ],
+      "owner_hints": ["franken_networkx"],
       "prefix": "br-r37",
       "sample_ids": [
         "br-r37-c1-foreign01",
@@ -85,14 +83,9 @@
     },
     {
       "count": 2,
-      "owner_hints": [
-        "franken_numpy"
-      ],
+      "owner_hints": ["franken_numpy"],
       "prefix": "franken_numpy",
-      "sample_ids": [
-        "franken_numpy-fixture01",
-        "franken_numpy-fixture02"
-      ],
+      "sample_ids": ["franken_numpy-fixture01", "franken_numpy-fixture02"],
       "sample_titles": [
         "Fixture foreign NumPy diagnostics row",
         "Fixture foreign NumPy profiling row"
@@ -100,31 +93,17 @@
     },
     {
       "count": 1,
-      "owner_hints": [
-        "frankenredis"
-      ],
+      "owner_hints": ["frankenredis"],
       "prefix": "frankenredis",
-      "sample_ids": [
-        "frankenredis-fixture01"
-      ],
-      "sample_titles": [
-        "Fixture foreign Redis parity row"
-      ]
+      "sample_ids": ["frankenredis-fixture01"],
+      "sample_titles": ["Fixture foreign Redis parity row"]
     },
     {
       "count": 2,
-      "owner_hints": [
-        "frankentorch"
-      ],
+      "owner_hints": ["frankentorch"],
       "prefix": "frankentorch",
-      "sample_ids": [
-        "frankentorch-fixture01",
-        "frankentorch-fixture02"
-      ],
-      "sample_titles": [
-        "Fixture foreign Torch API row",
-        "Fixture foreign Torch nanmean row"
-      ]
+      "sample_ids": ["frankentorch-fixture01", "frankentorch-fixture02"],
+      "sample_titles": ["Fixture foreign Torch API row", "Fixture foreign Torch nanmean row"]
     }
   ],
   "foreign_in_progress": 2,
@@ -333,9 +312,7 @@
         "authorization_required": true,
         "conservation_rule": "before authorized mutation, preserve pre/post snapshots and prove total row conservation across affected stores",
         "count": 22,
-        "owner_hints": [
-          "franken_networkx"
-        ],
+        "owner_hints": ["franken_networkx"],
         "prefix": "br-r37",
         "proposed_action": "ask hinted owner project to confirm authority before any move, removal, rewrite, or project-field backfill",
         "recommended_subject": "[tracker-hygiene] Foreign row ownership check: br-r37",
@@ -357,48 +334,34 @@
         "authorization_required": true,
         "conservation_rule": "before authorized mutation, preserve pre/post snapshots and prove total row conservation across affected stores",
         "count": 2,
-        "owner_hints": [
-          "franken_numpy"
-        ],
+        "owner_hints": ["franken_numpy"],
         "prefix": "franken_numpy",
         "proposed_action": "ask hinted owner project to confirm authority before any move, removal, rewrite, or project-field backfill",
         "recommended_subject": "[tracker-hygiene] Foreign row ownership check: franken_numpy",
         "recommended_thread_id": "tracker-hygiene",
-        "sample_ids": [
-          "franken_numpy-fixture01",
-          "franken_numpy-fixture02"
-        ]
+        "sample_ids": ["franken_numpy-fixture01", "franken_numpy-fixture02"]
       },
       {
         "authorization_required": true,
         "conservation_rule": "before authorized mutation, preserve pre/post snapshots and prove total row conservation across affected stores",
         "count": 1,
-        "owner_hints": [
-          "frankenredis"
-        ],
+        "owner_hints": ["frankenredis"],
         "prefix": "frankenredis",
         "proposed_action": "ask hinted owner project to confirm authority before any move, removal, rewrite, or project-field backfill",
         "recommended_subject": "[tracker-hygiene] Foreign row ownership check: frankenredis",
         "recommended_thread_id": "tracker-hygiene",
-        "sample_ids": [
-          "frankenredis-fixture01"
-        ]
+        "sample_ids": ["frankenredis-fixture01"]
       },
       {
         "authorization_required": true,
         "conservation_rule": "before authorized mutation, preserve pre/post snapshots and prove total row conservation across affected stores",
         "count": 2,
-        "owner_hints": [
-          "frankentorch"
-        ],
+        "owner_hints": ["frankentorch"],
         "prefix": "frankentorch",
         "proposed_action": "ask hinted owner project to confirm authority before any move, removal, rewrite, or project-field backfill",
         "recommended_subject": "[tracker-hygiene] Foreign row ownership check: frankentorch",
         "recommended_thread_id": "tracker-hygiene",
-        "sample_ids": [
-          "frankentorch-fixture01",
-          "frankentorch-fixture02"
-        ]
+        "sample_ids": ["frankentorch-fixture01", "frankentorch-fixture02"]
       }
     ],
     "mutation_policy": "owner-handoff-required; this report never deletes, rewrites, closes, or moves tracker rows",
@@ -698,30 +661,17 @@
   "schema_version": 1,
   "source_aware_queue_state": {
     "blocked_local_count": 2,
-    "blocked_local_ids": [
-      "bd-fixture-permissioned-blocked",
-      "bd-fixture-blocked"
-    ],
+    "blocked_local_ids": ["bd-fixture-permissioned-blocked", "bd-fixture-blocked"],
     "claimable_count": 2,
-    "claimable_ids": [
-      "bd-fixture-ready",
-      "bd-fixture-blocker"
-    ],
+    "claimable_ids": ["bd-fixture-ready", "bd-fixture-blocker"],
     "excluded_foreign_in_progress_count": 2,
     "excluded_foreign_open_count": 27,
     "excluded_foreign_stale_in_progress_count": 1,
-    "excluded_foreign_stale_in_progress_ids": [
-      "frankenscipy-foreign-in-progress-stale"
-    ],
+    "excluded_foreign_stale_in_progress_ids": ["frankenscipy-foreign-in-progress-stale"],
     "local_epic_count": 1,
-    "local_epic_ids": [
-      "bd-fixture-epic"
-    ],
+    "local_epic_ids": ["bd-fixture-epic"],
     "local_in_progress_count": 2,
-    "local_in_progress_ids": [
-      "bd-fixture-in-progress-fresh",
-      "bd-fixture-in-progress-stale"
-    ],
+    "local_in_progress_ids": ["bd-fixture-in-progress-fresh", "bd-fixture-in-progress-stale"],
     "local_nonclaimable_count": 4,
     "local_nonclaimable_ids": [
       "bd-fixture-epic",
@@ -730,19 +680,12 @@
       "bd-fixture-blocked"
     ],
     "local_open_count": 6,
-    "next_safe_actions": [
-      "claim one source_aware_ready row before creating fallback work"
-    ],
+    "next_safe_actions": ["claim one source_aware_ready row before creating fallback work"],
     "permission_gated_count": 2,
-    "permission_gated_ids": [
-      "bd-fixture-permissioned",
-      "bd-fixture-permissioned-blocked"
-    ],
+    "permission_gated_ids": ["bd-fixture-permissioned", "bd-fixture-permissioned-blocked"],
     "schema_version": 1,
     "stale_in_progress_count": 1,
-    "stale_in_progress_ids": [
-      "bd-fixture-in-progress-stale"
-    ],
+    "stale_in_progress_ids": ["bd-fixture-in-progress-stale"],
     "verdict": "ready"
   },
   "source_aware_ready_rows": [

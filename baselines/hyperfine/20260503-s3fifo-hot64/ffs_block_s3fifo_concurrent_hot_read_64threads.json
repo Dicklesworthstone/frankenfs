@@ -2,19 +2,13 @@
   "results": [
     {
       "command": "cargo bench --profile release-perf -p ffs-block --features s3fifo --bench arc_cache -- block_cache_s3fifo_concurrent_hot_read_64threads",
-      "mean": 0.300630000000,
+      "mean": 0.30063,
       "stddev": 0.003418367347,
-      "median": 0.300630000000,
-      "min": 0.295430000000,
-      "max": 0.308830000000,
-      "times": [
-        0.295430000000,
-        0.300630000000,
-        0.308830000000
-      ],
-      "exit_codes": [
-        0
-      ]
+      "median": 0.30063,
+      "min": 0.29543,
+      "max": 0.30883,
+      "times": [0.29543, 0.30063, 0.30883],
+      "exit_codes": [0]
     }
   ],
   "benchmark_mode": "criterion_once",

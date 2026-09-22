@@ -27,12 +27,8 @@
     "observed_p99_micros": 3500,
     "outcome": "hurt"
   },
-  "artifact_paths": [
-    "artifacts/numa-placement/repair_scrub_interference.json"
-  ],
-  "raw_log_paths": [
-    "artifacts/numa-placement/repair_scrub_interference_hint.log"
-  ],
+  "artifact_paths": ["artifacts/numa-placement/repair_scrub_interference.json"],
+  "raw_log_paths": ["artifacts/numa-placement/repair_scrub_interference_hint.log"],
   "cleanup_status": "preserved_artifacts",
   "reproduction_command": "ffs-harness validate-numa-allocation-placement --report conformance/fixtures/numa_allocation_placement/repair_scrub_interference.json",
   "product_evidence_claim": "none",

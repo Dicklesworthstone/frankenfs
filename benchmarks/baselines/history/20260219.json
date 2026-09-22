@@ -29,7 +29,7 @@
       "p50_us": 1636,
       "p95_us": 1636,
       "p99_us": 1636,
-      "throughput_ops_sec": 611.303800,
+      "throughput_ops_sec": 611.3038,
       "throughput_mb_sec": 0,
       "status": "measured"
     },
@@ -77,7 +77,7 @@
       "p50_us": 44041,
       "p95_us": 44041,
       "p99_us": 44041,
-      "throughput_ops_sec": 22.705920,
+      "throughput_ops_sec": 22.70592,
       "throughput_mb_sec": 181.647361,
       "status": "measured"
     },
@@ -197,7 +197,7 @@
       "p50_us": 63453033,
       "p95_us": 63453033,
       "p99_us": 63453033,
-      "throughput_ops_sec": 0.015760,
+      "throughput_ops_sec": 0.01576,
       "throughput_mb_sec": 0,
       "status": "measured"
     },

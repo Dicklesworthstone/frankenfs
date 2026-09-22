@@ -2,25 +2,19 @@
   "results": [
     {
       "command": "cargo bench --profile release-perf -p ffs-mvcc --bench wal_throughput -- mvcc_contention_4writers",
-      "mean": 0.000007864500,
-      "stddev": 1.69694E-7,
-      "median": 0.000007864500,
-      "min": 0.000007568500,
-      "max": 0.000008233700,
-      "times": [
-        0.000007568500,
-        0.000007864500,
-        0.000008233700
-      ],
-      "exit_codes": [
-        0
-      ]
+      "mean": 0.0000078645,
+      "stddev": 1.69694e-7,
+      "median": 0.0000078645,
+      "min": 0.0000075685,
+      "max": 0.0000082337,
+      "times": [0.0000075685, 0.0000078645, 0.0000082337],
+      "exit_codes": [0]
     }
   ],
   "benchmark_mode": "criterion_once",
   "measurement_source": "criterion_estimate",
   "criterion_estimate_source": "baselines/hyperfine/20260503-bd-rchk5-2-mvcc4/ffs_mvcc_contention_4writers.stdout",
-  "wall_time_seconds": 16.856924160,
+  "wall_time_seconds": 16.85692416,
   "command_stdout": "baselines/hyperfine/20260503-bd-rchk5-2-mvcc4/ffs_mvcc_contention_4writers.stdout",
   "command_stderr": "baselines/hyperfine/20260503-bd-rchk5-2-mvcc4/ffs_mvcc_contention_4writers.stderr",
   "text_report": "baselines/hyperfine/20260503-bd-rchk5-2-mvcc4/ffs_mvcc_contention_4writers.txt",

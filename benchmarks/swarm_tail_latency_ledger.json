@@ -28,11 +28,7 @@
     "reproduction_command",
     "artifact_paths"
   ],
-  "release_gate_consumers": [
-    "bd-p2j3e.7",
-    "performance.baseline",
-    "proof_bundle.performance"
-  ],
+  "release_gate_consumers": ["bd-p2j3e.7", "performance.baseline", "proof_bundle.performance"],
   "rows": [
     {
       "workload_id": "metadata_storm_64c_sync_tail",
@@ -54,19 +50,79 @@
         "p95_latency_us": 6800.0,
         "p99_latency_us": 10000.0,
         "components": [
-          {"component": "queueing", "p50_us": 200.0, "p95_us": 700.0, "p99_us": 1200.0, "detail": "scheduler queue depth sampled from workload ledger"},
-          {"component": "service", "p50_us": 900.0, "p95_us": 2400.0, "p99_us": 2500.0, "detail": "metadata operation service time"},
-          {"component": "io", "p50_us": 150.0, "p95_us": 500.0, "p99_us": 800.0, "detail": "block read/write device time"},
-          {"component": "retries", "p50_us": 20.0, "p95_us": 120.0, "p99_us": 300.0, "detail": "retry and conflict retry time"},
-          {"component": "synchronization", "p50_us": 500.0, "p95_us": 1800.0, "p99_us": 2600.0, "detail": "MVCC shard and directory metadata synchronization"},
-          {"component": "allocator", "p50_us": 80.0, "p95_us": 300.0, "p99_us": 700.0, "detail": "allocator and extent placement time"},
-          {"component": "repair_backlog", "p50_us": 0.0, "p95_us": 80.0, "p99_us": 200.0, "detail": "background repair backlog interference"},
-          {"component": "cache_pressure", "p50_us": 100.0, "p95_us": 450.0, "p99_us": 900.0, "detail": "ARC/cache admission pressure"},
-          {"component": "wal_fsync", "p50_us": 100.0, "p95_us": 350.0, "p99_us": 600.0, "detail": "WAL fsync boundary attribution"},
-          {"component": "fuse_wrapper", "p50_us": 50.0, "p95_us": 250.0, "p99_us": 500.0, "detail": "FUSE wrapper overhead"}
+          {
+            "component": "queueing",
+            "p50_us": 200.0,
+            "p95_us": 700.0,
+            "p99_us": 1200.0,
+            "detail": "scheduler queue depth sampled from workload ledger"
+          },
+          {
+            "component": "service",
+            "p50_us": 900.0,
+            "p95_us": 2400.0,
+            "p99_us": 2500.0,
+            "detail": "metadata operation service time"
+          },
+          {
+            "component": "io",
+            "p50_us": 150.0,
+            "p95_us": 500.0,
+            "p99_us": 800.0,
+            "detail": "block read/write device time"
+          },
+          {
+            "component": "retries",
+            "p50_us": 20.0,
+            "p95_us": 120.0,
+            "p99_us": 300.0,
+            "detail": "retry and conflict retry time"
+          },
+          {
+            "component": "synchronization",
+            "p50_us": 500.0,
+            "p95_us": 1800.0,
+            "p99_us": 2600.0,
+            "detail": "MVCC shard and directory metadata synchronization"
+          },
+          {
+            "component": "allocator",
+            "p50_us": 80.0,
+            "p95_us": 300.0,
+            "p99_us": 700.0,
+            "detail": "allocator and extent placement time"
+          },
+          {
+            "component": "repair_backlog",
+            "p50_us": 0.0,
+            "p95_us": 80.0,
+            "p99_us": 200.0,
+            "detail": "background repair backlog interference"
+          },
+          {
+            "component": "cache_pressure",
+            "p50_us": 100.0,
+            "p95_us": 450.0,
+            "p99_us": 900.0,
+            "detail": "ARC/cache admission pressure"
+          },
+          {
+            "component": "wal_fsync",
+            "p50_us": 100.0,
+            "p95_us": 350.0,
+            "p99_us": 600.0,
+            "detail": "WAL fsync boundary attribution"
+          },
+          {
+            "component": "fuse_wrapper",
+            "p50_us": 50.0,
+            "p95_us": 250.0,
+            "p99_us": 500.0,
+            "detail": "FUSE wrapper overhead"
+          }
         ]
       },
-      "queue_depth": {"average": 18.0, "p99": 72.0, "max": 256},
+      "queue_depth": { "average": 18.0, "p99": 72.0, "max": 256 },
       "backpressure_state": "healthy",
       "classification": "pass",
       "release_claim_state": "measured_authoritative",
@@ -101,19 +157,79 @@
         "p95_latency_us": 8200.0,
         "p99_latency_us": 12000.0,
         "components": [
-          {"component": "queueing", "p50_us": 250.0, "p95_us": 850.0, "p99_us": 1500.0, "detail": "fsync workload queueing"},
-          {"component": "service", "p50_us": 700.0, "p95_us": 1500.0, "p99_us": 1900.0, "detail": "append path service time"},
-          {"component": "io", "p50_us": 400.0, "p95_us": 1100.0, "p99_us": 1600.0, "detail": "device write time"},
-          {"component": "retries", "p50_us": 25.0, "p95_us": 150.0, "p99_us": 300.0, "detail": "retry overhead"},
-          {"component": "synchronization", "p50_us": 350.0, "p95_us": 900.0, "p99_us": 1300.0, "detail": "commit serialization overhead"},
-          {"component": "allocator", "p50_us": 90.0, "p95_us": 250.0, "p99_us": 500.0, "detail": "extent allocation overhead"},
-          {"component": "repair_backlog", "p50_us": 0.0, "p95_us": 120.0, "p99_us": 250.0, "detail": "background repair backlog"},
-          {"component": "cache_pressure", "p50_us": 100.0, "p95_us": 350.0, "p99_us": 800.0, "detail": "writeback cache pressure"},
-          {"component": "wal_fsync", "p50_us": 680.0, "p95_us": 3000.0, "p99_us": 4200.0, "detail": "WAL fsync dominates append/fdatasync p99"},
-          {"component": "fuse_wrapper", "p50_us": 80.0, "p95_us": 220.0, "p99_us": 450.0, "detail": "FUSE wrapper overhead"}
+          {
+            "component": "queueing",
+            "p50_us": 250.0,
+            "p95_us": 850.0,
+            "p99_us": 1500.0,
+            "detail": "fsync workload queueing"
+          },
+          {
+            "component": "service",
+            "p50_us": 700.0,
+            "p95_us": 1500.0,
+            "p99_us": 1900.0,
+            "detail": "append path service time"
+          },
+          {
+            "component": "io",
+            "p50_us": 400.0,
+            "p95_us": 1100.0,
+            "p99_us": 1600.0,
+            "detail": "device write time"
+          },
+          {
+            "component": "retries",
+            "p50_us": 25.0,
+            "p95_us": 150.0,
+            "p99_us": 300.0,
+            "detail": "retry overhead"
+          },
+          {
+            "component": "synchronization",
+            "p50_us": 350.0,
+            "p95_us": 900.0,
+            "p99_us": 1300.0,
+            "detail": "commit serialization overhead"
+          },
+          {
+            "component": "allocator",
+            "p50_us": 90.0,
+            "p95_us": 250.0,
+            "p99_us": 500.0,
+            "detail": "extent allocation overhead"
+          },
+          {
+            "component": "repair_backlog",
+            "p50_us": 0.0,
+            "p95_us": 120.0,
+            "p99_us": 250.0,
+            "detail": "background repair backlog"
+          },
+          {
+            "component": "cache_pressure",
+            "p50_us": 100.0,
+            "p95_us": 350.0,
+            "p99_us": 800.0,
+            "detail": "writeback cache pressure"
+          },
+          {
+            "component": "wal_fsync",
+            "p50_us": 680.0,
+            "p95_us": 3000.0,
+            "p99_us": 4200.0,
+            "detail": "WAL fsync dominates append/fdatasync p99"
+          },
+          {
+            "component": "fuse_wrapper",
+            "p50_us": 80.0,
+            "p95_us": 220.0,
+            "p99_us": 450.0,
+            "detail": "FUSE wrapper overhead"
+          }
         ]
       },
-      "queue_depth": {"average": 21.0, "p99": 88.0, "max": 256},
+      "queue_depth": { "average": 21.0, "p99": 88.0, "max": 256 },
       "backpressure_state": "throttled",
       "classification": "warn",
       "release_claim_state": "measured_authoritative",
@@ -148,19 +264,79 @@
         "p95_latency_us": 220000.0,
         "p99_latency_us": 300000.0,
         "components": [
-          {"component": "queueing", "p50_us": 1000.0, "p95_us": 3500.0, "p99_us": 6000.0, "detail": "local sudo/FUSE queueing"},
-          {"component": "service", "p50_us": 25000.0, "p95_us": 45000.0, "p99_us": 62000.0, "detail": "mount service time"},
-          {"component": "io", "p50_us": 12000.0, "p95_us": 28000.0, "p99_us": 40000.0, "detail": "image probe I/O"},
-          {"component": "retries", "p50_us": 1000.0, "p95_us": 4000.0, "p99_us": 9000.0, "detail": "mount retry/polling loop"},
-          {"component": "synchronization", "p50_us": 3000.0, "p95_us": 9000.0, "p99_us": 12000.0, "detail": "daemon readiness synchronization"},
-          {"component": "allocator", "p50_us": 1000.0, "p95_us": 2500.0, "p99_us": 5000.0, "detail": "process/runtime allocator overhead"},
-          {"component": "repair_backlog", "p50_us": 0.0, "p95_us": 0.0, "p99_us": 0.0, "detail": "scrub disabled for latency probe"},
-          {"component": "cache_pressure", "p50_us": 2000.0, "p95_us": 6000.0, "p99_us": 9000.0, "detail": "page cache and cache-warm variance"},
-          {"component": "wal_fsync", "p50_us": 0.0, "p95_us": 0.0, "p99_us": 0.0, "detail": "no WAL fsync in read-only mount probe"},
-          {"component": "fuse_wrapper", "p50_us": 70000.0, "p95_us": 125000.0, "p99_us": 180000.0, "detail": "sudo/bash/FUSE lifecycle wrapper dominates local p99"}
+          {
+            "component": "queueing",
+            "p50_us": 1000.0,
+            "p95_us": 3500.0,
+            "p99_us": 6000.0,
+            "detail": "local sudo/FUSE queueing"
+          },
+          {
+            "component": "service",
+            "p50_us": 25000.0,
+            "p95_us": 45000.0,
+            "p99_us": 62000.0,
+            "detail": "mount service time"
+          },
+          {
+            "component": "io",
+            "p50_us": 12000.0,
+            "p95_us": 28000.0,
+            "p99_us": 40000.0,
+            "detail": "image probe I/O"
+          },
+          {
+            "component": "retries",
+            "p50_us": 1000.0,
+            "p95_us": 4000.0,
+            "p99_us": 9000.0,
+            "detail": "mount retry/polling loop"
+          },
+          {
+            "component": "synchronization",
+            "p50_us": 3000.0,
+            "p95_us": 9000.0,
+            "p99_us": 12000.0,
+            "detail": "daemon readiness synchronization"
+          },
+          {
+            "component": "allocator",
+            "p50_us": 1000.0,
+            "p95_us": 2500.0,
+            "p99_us": 5000.0,
+            "detail": "process/runtime allocator overhead"
+          },
+          {
+            "component": "repair_backlog",
+            "p50_us": 0.0,
+            "p95_us": 0.0,
+            "p99_us": 0.0,
+            "detail": "scrub disabled for latency probe"
+          },
+          {
+            "component": "cache_pressure",
+            "p50_us": 2000.0,
+            "p95_us": 6000.0,
+            "p99_us": 9000.0,
+            "detail": "page cache and cache-warm variance"
+          },
+          {
+            "component": "wal_fsync",
+            "p50_us": 0.0,
+            "p95_us": 0.0,
+            "p99_us": 0.0,
+            "detail": "no WAL fsync in read-only mount probe"
+          },
+          {
+            "component": "fuse_wrapper",
+            "p50_us": 70000.0,
+            "p95_us": 125000.0,
+            "p99_us": 180000.0,
+            "detail": "sudo/bash/FUSE lifecycle wrapper dominates local p99"
+          }
         ]
       },
-      "queue_depth": {"average": 2.0, "p99": 8.0, "max": 32},
+      "queue_depth": { "average": 2.0, "p99": 8.0, "max": 32 },
       "backpressure_state": "unknown",
       "classification": "noisy",
       "release_claim_state": "experimental",
@@ -193,19 +369,79 @@
         "p95_latency_us": 13000.0,
         "p99_latency_us": 18000.0,
         "components": [
-          {"component": "queueing", "p50_us": 500.0, "p95_us": 1800.0, "p99_us": 2400.0, "detail": "foreground queueing under scrub overlap"},
-          {"component": "service", "p50_us": 900.0, "p95_us": 2100.0, "p99_us": 2600.0, "detail": "foreground service time"},
-          {"component": "io", "p50_us": 450.0, "p95_us": 1300.0, "p99_us": 1900.0, "detail": "block I/O time"},
-          {"component": "retries", "p50_us": 80.0, "p95_us": 350.0, "p99_us": 700.0, "detail": "retry overhead"},
-          {"component": "synchronization", "p50_us": 600.0, "p95_us": 1700.0, "p99_us": 2500.0, "detail": "repair/client synchronization"},
-          {"component": "allocator", "p50_us": 80.0, "p95_us": 300.0, "p99_us": 650.0, "detail": "allocator pressure"},
-          {"component": "repair_backlog", "p50_us": 1800.0, "p95_us": 7000.0, "p99_us": 9000.0, "detail": "repair backlog dominates foreground p99"},
-          {"component": "cache_pressure", "p50_us": 200.0, "p95_us": 800.0, "p99_us": 1400.0, "detail": "cache pressure under scrub overlap"},
-          {"component": "wal_fsync", "p50_us": 200.0, "p95_us": 750.0, "p99_us": 1200.0, "detail": "WAL sync during repair overlap"},
-          {"component": "fuse_wrapper", "p50_us": 120.0, "p95_us": 350.0, "p99_us": 650.0, "detail": "FUSE wrapper overhead"}
+          {
+            "component": "queueing",
+            "p50_us": 500.0,
+            "p95_us": 1800.0,
+            "p99_us": 2400.0,
+            "detail": "foreground queueing under scrub overlap"
+          },
+          {
+            "component": "service",
+            "p50_us": 900.0,
+            "p95_us": 2100.0,
+            "p99_us": 2600.0,
+            "detail": "foreground service time"
+          },
+          {
+            "component": "io",
+            "p50_us": 450.0,
+            "p95_us": 1300.0,
+            "p99_us": 1900.0,
+            "detail": "block I/O time"
+          },
+          {
+            "component": "retries",
+            "p50_us": 80.0,
+            "p95_us": 350.0,
+            "p99_us": 700.0,
+            "detail": "retry overhead"
+          },
+          {
+            "component": "synchronization",
+            "p50_us": 600.0,
+            "p95_us": 1700.0,
+            "p99_us": 2500.0,
+            "detail": "repair/client synchronization"
+          },
+          {
+            "component": "allocator",
+            "p50_us": 80.0,
+            "p95_us": 300.0,
+            "p99_us": 650.0,
+            "detail": "allocator pressure"
+          },
+          {
+            "component": "repair_backlog",
+            "p50_us": 1800.0,
+            "p95_us": 7000.0,
+            "p99_us": 9000.0,
+            "detail": "repair backlog dominates foreground p99"
+          },
+          {
+            "component": "cache_pressure",
+            "p50_us": 200.0,
+            "p95_us": 800.0,
+            "p99_us": 1400.0,
+            "detail": "cache pressure under scrub overlap"
+          },
+          {
+            "component": "wal_fsync",
+            "p50_us": 200.0,
+            "p95_us": 750.0,
+            "p99_us": 1200.0,
+            "detail": "WAL sync during repair overlap"
+          },
+          {
+            "component": "fuse_wrapper",
+            "p50_us": 120.0,
+            "p95_us": 350.0,
+            "p99_us": 650.0,
+            "detail": "FUSE wrapper overhead"
+          }
         ]
       },
-      "queue_depth": {"average": 42.0, "p99": 180.0, "max": 256},
+      "queue_depth": { "average": 42.0, "p99": 180.0, "max": 256 },
       "backpressure_state": "critical",
       "classification": "fail",
       "release_claim_state": "blocked",
@@ -240,19 +476,79 @@
         "p95_latency_us": 9500.0,
         "p99_latency_us": 16000.0,
         "components": [
-          {"component": "queueing", "p50_us": 500.0, "p95_us": 1700.0, "p99_us": 2500.0, "detail": "cache pressure queueing"},
-          {"component": "service", "p50_us": 600.0, "p95_us": 1300.0, "p99_us": 1800.0, "detail": "service time"},
-          {"component": "io", "p50_us": 300.0, "p95_us": 900.0, "p99_us": 1400.0, "detail": "device I/O time"},
-          {"component": "retries", "p50_us": 40.0, "p95_us": 160.0, "p99_us": 300.0, "detail": "retry time"},
-          {"component": "synchronization", "p50_us": 450.0, "p95_us": 1500.0, "p99_us": 2200.0, "detail": "synchronization time"},
-          {"component": "allocator", "p50_us": 120.0, "p95_us": 500.0, "p99_us": 900.0, "detail": "allocator time"},
-          {"component": "repair_backlog", "p50_us": 0.0, "p95_us": 100.0, "p99_us": 200.0, "detail": "repair backlog"},
-          {"component": "cache_pressure", "p50_us": 1200.0, "p95_us": 4500.0, "p99_us": 6000.0, "detail": "cache admission/eviction pressure dominates but lacks reference"},
-          {"component": "wal_fsync", "p50_us": 100.0, "p95_us": 350.0, "p99_us": 600.0, "detail": "WAL fsync"},
-          {"component": "fuse_wrapper", "p50_us": 120.0, "p95_us": 450.0, "p99_us": 800.0, "detail": "FUSE wrapper overhead"}
+          {
+            "component": "queueing",
+            "p50_us": 500.0,
+            "p95_us": 1700.0,
+            "p99_us": 2500.0,
+            "detail": "cache pressure queueing"
+          },
+          {
+            "component": "service",
+            "p50_us": 600.0,
+            "p95_us": 1300.0,
+            "p99_us": 1800.0,
+            "detail": "service time"
+          },
+          {
+            "component": "io",
+            "p50_us": 300.0,
+            "p95_us": 900.0,
+            "p99_us": 1400.0,
+            "detail": "device I/O time"
+          },
+          {
+            "component": "retries",
+            "p50_us": 40.0,
+            "p95_us": 160.0,
+            "p99_us": 300.0,
+            "detail": "retry time"
+          },
+          {
+            "component": "synchronization",
+            "p50_us": 450.0,
+            "p95_us": 1500.0,
+            "p99_us": 2200.0,
+            "detail": "synchronization time"
+          },
+          {
+            "component": "allocator",
+            "p50_us": 120.0,
+            "p95_us": 500.0,
+            "p99_us": 900.0,
+            "detail": "allocator time"
+          },
+          {
+            "component": "repair_backlog",
+            "p50_us": 0.0,
+            "p95_us": 100.0,
+            "p99_us": 200.0,
+            "detail": "repair backlog"
+          },
+          {
+            "component": "cache_pressure",
+            "p50_us": 1200.0,
+            "p95_us": 4500.0,
+            "p99_us": 6000.0,
+            "detail": "cache admission/eviction pressure dominates but lacks reference"
+          },
+          {
+            "component": "wal_fsync",
+            "p50_us": 100.0,
+            "p95_us": 350.0,
+            "p99_us": 600.0,
+            "detail": "WAL fsync"
+          },
+          {
+            "component": "fuse_wrapper",
+            "p50_us": 120.0,
+            "p95_us": 450.0,
+            "p99_us": 800.0,
+            "detail": "FUSE wrapper overhead"
+          }
         ]
       },
-      "queue_depth": {"average": 35.0, "p99": 120.0, "max": 256},
+      "queue_depth": { "average": 35.0, "p99": 120.0, "max": 256 },
       "backpressure_state": "throttled",
       "classification": "missing_reference",
       "release_claim_state": "missing_reference",

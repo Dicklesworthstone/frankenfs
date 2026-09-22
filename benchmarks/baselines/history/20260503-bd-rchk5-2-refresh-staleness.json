@@ -8,7 +8,7 @@
     "cpu_model": "AMD Ryzen Threadripper PRO 5975WX 32-Cores",
     "kernel": "Linux 6.17.0-14-generic x86_64 GNU/Linux",
     "memory_total_kib": 226261604,
-    "memory_total_gib": 215.780,
+    "memory_total_gib": 215.78,
     "cargo_target_dir": "/data/tmp/frankenfs_bd_rchk5_2_bench",
     "rustc": "rustc 1.97.0-nightly (37d85e592 2026-04-28)",
     "cargo": "cargo 1.97.0-nightly (eb9b60f1f 2026-04-24)",
@@ -34,7 +34,7 @@
       "p50_us": 0,
       "p95_us": 0,
       "p99_us": 0,
-      "throughput_ops_sec": 15207737.696940,
+      "throughput_ops_sec": 15207737.69694,
       "throughput_mb_sec": 0,
       "status": "measured"
     }

@@ -10,14 +10,8 @@
     "cache_budget_controller",
     "scrub_repair_scheduler"
   ],
-  "proof_bundle_consumers": [
-    "proof-bundle",
-    "bd-rchk0.5.4.1"
-  ],
-  "release_gate_consumers": [
-    "release-gate",
-    "bd-rchk0.5.6.1"
-  ],
+  "proof_bundle_consumers": ["proof-bundle", "bd-rchk0.5.4.1"],
+  "release_gate_consumers": ["release-gate", "bd-rchk0.5.6.1"],
   "cards": [
     {
       "idea_id": "tail_latency_decomposition",
@@ -47,9 +41,7 @@
       "fallback": "Keep public performance claims experimental and route operators to component-level diagnostics.",
       "validation_command": "ffs-harness validate-swarm-tail-latency --ledger benchmarks/swarm_tail_latency_ledger.json --format markdown",
       "release_claim_state": "experimental",
-      "linked_bead_ids": [
-        "bd-p2j3e.1"
-      ]
+      "linked_bead_ids": ["bd-p2j3e.1"]
     },
     {
       "idea_id": "numa_shard_harness",
@@ -79,11 +71,7 @@
       "fallback": "Run fixture smoke only and preserve exact command plans for a permissioned large-host lane.",
       "validation_command": "ffs-harness validate-swarm-workload-harness --manifest benchmarks/swarm_workload_harness_manifest.json --format markdown",
       "release_claim_state": "small_host_smoke",
-      "linked_bead_ids": [
-        "bd-p2j3e.2",
-        "bd-rchk0.5.7.1",
-        "bd-w13fr"
-      ]
+      "linked_bead_ids": ["bd-p2j3e.2", "bd-rchk0.5.7.1", "bd-w13fr"]
     },
     {
       "idea_id": "rcu_qsbr_metadata",
@@ -100,9 +88,7 @@
         {
           "evidence_id": "bd-p2j3e.3-model-tests",
           "summary": "Design-only RCU/QSBR surface has model tests, no unsafe code, and an expected-loss comparison against the lock path.",
-          "artifact_paths": [
-            "crates/ffs-mvcc/src/rcu.rs"
-          ],
+          "artifact_paths": ["crates/ffs-mvcc/src/rcu.rs"],
           "validation_command": "cargo test -p ffs-mvcc rcu -- --nocapture",
           "linked_bead_id": "bd-p2j3e.3",
           "release_claim_state": "design_only"
@@ -112,9 +98,7 @@
       "fallback": "Keep the existing lock-based metadata path as the active implementation.",
       "validation_command": "cargo test -p ffs-mvcc rcu -- --nocapture",
       "release_claim_state": "design_only",
-      "linked_bead_ids": [
-        "bd-p2j3e.3"
-      ]
+      "linked_bead_ids": ["bd-p2j3e.3"]
     },
     {
       "idea_id": "parallel_wal_group_commit",
@@ -144,9 +128,7 @@
       "fallback": "Keep conservative WAL behavior and block claim upgrades when replay or fsync evidence is stale.",
       "validation_command": "ffs-harness validate-wal-group-commit-gate --manifest benchmarks/wal_group_commit_gate_manifest.json --format markdown",
       "release_claim_state": "experimental",
-      "linked_bead_ids": [
-        "bd-p2j3e.4"
-      ]
+      "linked_bead_ids": ["bd-p2j3e.4"]
     },
     {
       "idea_id": "cache_budget_controller",
@@ -176,9 +158,7 @@
       "fallback": "Fallback to current ARC when host memory, raw logs, or dirty pressure data are missing.",
       "validation_command": "ffs-harness validate-swarm-cache-controller --contract benchmarks/swarm_cache_controller_contract.json --format markdown",
       "release_claim_state": "experimental",
-      "linked_bead_ids": [
-        "bd-p2j3e.5"
-      ]
+      "linked_bead_ids": ["bd-p2j3e.5"]
     },
     {
       "idea_id": "scrub_repair_scheduler",
@@ -208,9 +188,7 @@
       "fallback": "Keep repair conservative and foreground-first until overlap evidence is current.",
       "validation_command": "ffs-harness validate-scrub-repair-scheduler --manifest benchmarks/scrub_repair_scheduler_manifest.json --format markdown",
       "release_claim_state": "experimental",
-      "linked_bead_ids": [
-        "bd-p2j3e.6"
-      ]
+      "linked_bead_ids": ["bd-p2j3e.6"]
     }
   ]
 }

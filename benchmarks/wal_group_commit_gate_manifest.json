@@ -120,12 +120,8 @@
           "storage_class": "nvme",
           "lane": "permissioned_large_host"
         },
-        "raw_logs": [
-          "artifacts/wal/reference/raw.log"
-        ],
-        "artifact_paths": [
-          "artifacts/wal/reference/report.json"
-        ]
+        "raw_logs": ["artifacts/wal/reference/raw.log"],
+        "artifact_paths": ["artifacts/wal/reference/report.json"]
       },
       "replay_proof_id": "proof_large_pass",
       "fsync_tail_slo": {
@@ -135,7 +131,7 @@
         "max_replay_risk_ppm": 1000.0,
         "max_memory_footprint_mb": 1024.0,
         "max_durable_publish_lag_us": 400.0,
-        "max_p99_latency_cv": 0.20,
+        "max_p99_latency_cv": 0.2,
         "max_order_violations": 0,
         "max_checksum_failures": 0,
         "max_boundary_violations": 0,
@@ -241,12 +237,8 @@
       ],
       "claim_state": "measured_authoritative",
       "reproduction_command": "ffs-harness validate-wal-group-commit-gate --manifest benchmarks/wal_group_commit_gate_manifest.json",
-      "raw_logs": [
-        "artifacts/wal/large-host/raw.log"
-      ],
-      "artifact_paths": [
-        "artifacts/wal/large-host/report.json"
-      ]
+      "raw_logs": ["artifacts/wal/large-host/raw.log"],
+      "artifact_paths": ["artifacts/wal/large-host/report.json"]
     },
     {
       "scenario_id": "wal_smoke_missing_reference",
@@ -268,7 +260,7 @@
         "max_replay_risk_ppm": 1000.0,
         "max_memory_footprint_mb": 1024.0,
         "max_durable_publish_lag_us": 400.0,
-        "max_p99_latency_cv": 0.20,
+        "max_p99_latency_cv": 0.2,
         "max_order_violations": 0,
         "max_checksum_failures": 0,
         "max_boundary_violations": 0,
@@ -298,12 +290,8 @@
       ],
       "claim_state": "missing_reference",
       "reproduction_command": "ffs-harness validate-wal-group-commit-gate --manifest benchmarks/wal_group_commit_gate_manifest.json",
-      "raw_logs": [
-        "artifacts/wal/smoke/raw.log"
-      ],
-      "artifact_paths": [
-        "artifacts/wal/smoke/report.json"
-      ]
+      "raw_logs": ["artifacts/wal/smoke/raw.log"],
+      "artifact_paths": ["artifacts/wal/smoke/report.json"]
     }
   ],
   "expected_loss": {
@@ -379,10 +367,5 @@
     "reproduction_command",
     "raw_log_path"
   ],
-  "release_gate_consumers": [
-    "bd-p2j3e",
-    "bd-rchk5",
-    "proof-bundle",
-    "release-gates"
-  ]
+  "release_gate_consumers": ["bd-p2j3e", "bd-rchk5", "proof-bundle", "release-gates"]
 }

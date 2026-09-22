@@ -38,9 +38,6 @@
     }
   },
   "reason": "Mounting ext4 image (block_size=4096, blocks=8192, ro, runtime=standard) at baselines/hyperfine/20260503-bd-rchk5-7-after/mount_probe_mounts/recovery error: FUSE mount failed at baselines/hyperfine/20260503-bd-rchk5-7-after/mount_probe_mounts/recovery: invalid mountpoint: mountpoint does not exist: baselines/hyperfine/20260503-bd-rchk5-7-after/mount_probe_mounts/recovery",
-  "required_capabilities": [
-    "benchmark_host",
-    "fuse"
-  ],
+  "required_capabilities": ["benchmark_host", "fuse"],
   "schema_version": 1
 }

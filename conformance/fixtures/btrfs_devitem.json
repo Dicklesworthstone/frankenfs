@@ -2,19 +2,35 @@
   "description": "btrfs device item (98 bytes) for a 1TB device with 500GB used",
   "size": 98,
   "writes": [
-    {"offset":  0, "hex": "0100000000000000", "_comment": "devid = 1"},
-    {"offset":  8, "hex": "0000000000010000", "_comment": "total_bytes = 1TB (0x100_0000_0000 = 1099511627776)"},
-    {"offset": 16, "hex": "0000000080000000", "_comment": "bytes_used = 512GB (0x80_0000_0000 = 549755813888)"},
-    {"offset": 24, "hex": "00100000", "_comment": "io_align = 4096"},
-    {"offset": 28, "hex": "00100000", "_comment": "io_width = 4096"},
-    {"offset": 32, "hex": "00100000", "_comment": "sector_size = 4096"},
-    {"offset": 36, "hex": "0000000000000000", "_comment": "dev_type = 0 (regular)"},
-    {"offset": 44, "hex": "6400000000000000", "_comment": "generation = 100"},
-    {"offset": 52, "hex": "0000100000000000", "_comment": "start_offset = 1MiB (0x100000)"},
-    {"offset": 60, "hex": "00000000", "_comment": "dev_group = 0"},
-    {"offset": 64, "hex": "00", "_comment": "seek_speed = 0"},
-    {"offset": 65, "hex": "00", "_comment": "bandwidth = 0"},
-    {"offset": 66, "hex": "0102030405060708090a0b0c0d0e0f10", "_comment": "uuid = 01020304-0506-0708-090a-0b0c0d0e0f10"},
-    {"offset": 82, "hex": "a1a2a3a4a5a6a7a8a9aaabacadaeafb0", "_comment": "fsid = a1a2a3a4-a5a6-a7a8-a9aa-abacadaeafb0"}
+    { "offset": 0, "hex": "0100000000000000", "_comment": "devid = 1" },
+    {
+      "offset": 8,
+      "hex": "0000000000010000",
+      "_comment": "total_bytes = 1TB (0x100_0000_0000 = 1099511627776)"
+    },
+    {
+      "offset": 16,
+      "hex": "0000000080000000",
+      "_comment": "bytes_used = 512GB (0x80_0000_0000 = 549755813888)"
+    },
+    { "offset": 24, "hex": "00100000", "_comment": "io_align = 4096" },
+    { "offset": 28, "hex": "00100000", "_comment": "io_width = 4096" },
+    { "offset": 32, "hex": "00100000", "_comment": "sector_size = 4096" },
+    { "offset": 36, "hex": "0000000000000000", "_comment": "dev_type = 0 (regular)" },
+    { "offset": 44, "hex": "6400000000000000", "_comment": "generation = 100" },
+    { "offset": 52, "hex": "0000100000000000", "_comment": "start_offset = 1MiB (0x100000)" },
+    { "offset": 60, "hex": "00000000", "_comment": "dev_group = 0" },
+    { "offset": 64, "hex": "00", "_comment": "seek_speed = 0" },
+    { "offset": 65, "hex": "00", "_comment": "bandwidth = 0" },
+    {
+      "offset": 66,
+      "hex": "0102030405060708090a0b0c0d0e0f10",
+      "_comment": "uuid = 01020304-0506-0708-090a-0b0c0d0e0f10"
+    },
+    {
+      "offset": 82,
+      "hex": "a1a2a3a4a5a6a7a8a9aaabacadaeafb0",
+      "_comment": "fsid = a1a2a3a4-a5a6-a7a8-a9aa-abacadaeafb0"
+    }
   ]
 }

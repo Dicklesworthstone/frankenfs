@@ -103,7 +103,15 @@
       "mount_flags": ["rw", "default_permissions"],
       "fs_specific_options": ["dir_index", "extent"],
       "workload": {
-        "operation_sequence": ["mkdir", "create", "write_readback", "hardlink", "symlink", "setattr", "rmdir"],
+        "operation_sequence": [
+          "mkdir",
+          "create",
+          "write_readback",
+          "hardlink",
+          "symlink",
+          "setattr",
+          "rmdir"
+        ],
         "write_sizes": [65536],
         "fsync_pattern": "metadata_only",
         "concurrency": 4,
@@ -149,7 +157,13 @@
       "mount_flags": ["rw", "default_permissions"],
       "fs_specific_options": ["user_xattr"],
       "workload": {
-        "operation_sequence": ["create", "fallocate_keep_size", "truncate_extend", "xattr_set_get", "fsync"],
+        "operation_sequence": [
+          "create",
+          "fallocate_keep_size",
+          "truncate_extend",
+          "xattr_set_get",
+          "fsync"
+        ],
         "write_sizes": [1048576],
         "fsync_pattern": "final_only",
         "concurrency": 1,
@@ -287,7 +301,15 @@
       "mount_flags": ["rw", "default_permissions"],
       "fs_specific_options": ["subvolume_root", "single_device"],
       "workload": {
-        "operation_sequence": ["mkdir", "create", "write_readback", "hardlink", "symlink", "setattr", "rmdir"],
+        "operation_sequence": [
+          "mkdir",
+          "create",
+          "write_readback",
+          "hardlink",
+          "symlink",
+          "setattr",
+          "rmdir"
+        ],
         "write_sizes": [65536],
         "fsync_pattern": "metadata_only",
         "concurrency": 4,
@@ -333,7 +355,13 @@
       "mount_flags": ["rw", "default_permissions"],
       "fs_specific_options": ["user_subvol_rm_allowed", "xattr"],
       "workload": {
-        "operation_sequence": ["create", "fallocate_keep_size", "truncate_extend", "xattr_set_get", "fsync"],
+        "operation_sequence": [
+          "create",
+          "fallocate_keep_size",
+          "truncate_extend",
+          "xattr_set_get",
+          "fsync"
+        ],
         "write_sizes": [1048576],
         "fsync_pattern": "final_only",
         "concurrency": 1,
@@ -425,7 +453,13 @@
       "mount_flags": ["rw", "default_permissions"],
       "fs_specific_options": ["user_xattr", "extent"],
       "workload": {
-        "operation_sequence": ["create", "xattr_create", "xattr_replace", "xattr_list_get", "fsync"],
+        "operation_sequence": [
+          "create",
+          "xattr_create",
+          "xattr_replace",
+          "xattr_list_get",
+          "fsync"
+        ],
         "write_sizes": [4096],
         "fsync_pattern": "final_only",
         "concurrency": 1,
@@ -517,7 +551,13 @@
       "mount_flags": ["rw", "default_permissions"],
       "fs_specific_options": ["single_device", "csum", "extent_data"],
       "workload": {
-        "operation_sequence": ["create", "fallocate_keep_size", "fallocate_zero_range", "fallocate_punch_hole", "fsync"],
+        "operation_sequence": [
+          "create",
+          "fallocate_keep_size",
+          "fallocate_zero_range",
+          "fallocate_punch_hole",
+          "fsync"
+        ],
         "write_sizes": [1048576],
         "fsync_pattern": "final_only",
         "concurrency": 1,
@@ -753,7 +793,12 @@
       "child_path_id": "path:/parent/new",
       "namespace_operation_kind": "rename_no_overwrite",
       "fsync_boundary": "data_fsync",
-      "operation_sequence": ["write /parent/src", "fsync /parent/src", "rename /parent/src /parent/new", "fsyncdir /parent"],
+      "operation_sequence": [
+        "write /parent/src",
+        "fsync /parent/src",
+        "rename /parent/src /parent/new",
+        "fsyncdir /parent"
+      ],
       "pre_directory_entries": ["/parent/src"],
       "post_directory_entries": ["/parent/new"],
       "expected_survivor_set": {
@@ -800,7 +845,13 @@
       "child_path_id": "path:/b/file",
       "namespace_operation_kind": "cross_directory_rename",
       "fsync_boundary": "clean_unmount",
-      "operation_sequence": ["rename /a/file /b/file", "fsyncdir /a", "fsyncdir /b", "clean_unmount", "image_reopen"],
+      "operation_sequence": [
+        "rename /a/file /b/file",
+        "fsyncdir /a",
+        "fsyncdir /b",
+        "clean_unmount",
+        "image_reopen"
+      ],
       "pre_directory_entries": ["/a/file", "/b"],
       "post_directory_entries": ["/a", "/b/file"],
       "expected_survivor_set": {
@@ -847,7 +898,11 @@
       "child_path_id": "path:/links/alias",
       "namespace_operation_kind": "hardlink_lifecycle",
       "fsync_boundary": "file_close",
-      "operation_sequence": ["link /links/original /links/alias", "close /links/original", "stat /links/alias"],
+      "operation_sequence": [
+        "link /links/original /links/alias",
+        "close /links/original",
+        "stat /links/alias"
+      ],
       "pre_directory_entries": ["/links/original"],
       "post_directory_entries": ["/links/original", "/links/alias"],
       "expected_survivor_set": {
@@ -941,7 +996,13 @@
       "child_path_id": "path:/open/live",
       "namespace_operation_kind": "unlink_open_handle",
       "fsync_boundary": "parent_fsyncdir",
-      "operation_sequence": ["open /open/live", "unlink /open/live", "fsyncdir /open", "read open handle", "close handle"],
+      "operation_sequence": [
+        "open /open/live",
+        "unlink /open/live",
+        "fsyncdir /open",
+        "read open handle",
+        "close handle"
+      ],
       "pre_directory_entries": ["/open/live"],
       "post_directory_entries": ["/open"],
       "expected_survivor_set": {
@@ -1035,7 +1096,12 @@
       "child_path_id": "path:/meta/file",
       "namespace_operation_kind": "xattr_namespace_update",
       "fsync_boundary": "parent_fsyncdir",
-      "operation_sequence": ["setxattr user.ffs_namespace /meta/file", "fsync /meta/file", "fsyncdir /meta", "image_reopen"],
+      "operation_sequence": [
+        "setxattr user.ffs_namespace /meta/file",
+        "fsync /meta/file",
+        "fsyncdir /meta",
+        "image_reopen"
+      ],
       "pre_directory_entries": ["/meta/file"],
       "post_directory_entries": ["/meta/file"],
       "expected_survivor_set": {
@@ -1082,7 +1148,11 @@
       "child_path_id": "path:/alloc/file",
       "namespace_operation_kind": "unsupported_fallocate_noop",
       "fsync_boundary": "unsupported_rejection",
-      "operation_sequence": ["fallocate unsupported-mode /alloc/file", "stat /alloc/file", "image_reopen"],
+      "operation_sequence": [
+        "fallocate unsupported-mode /alloc/file",
+        "stat /alloc/file",
+        "image_reopen"
+      ],
       "pre_directory_entries": ["/alloc/file"],
       "post_directory_entries": ["/alloc/file"],
       "expected_survivor_set": {
@@ -1176,14 +1246,42 @@
       "mount_flags": ["rw", "default_permissions"],
       "fs_specific_options": ["dir_index", "extent"],
       "handles": [
-        {"handle_id": "h_writer", "purpose": "write_then_fsync", "open_flags": ["O_RDWR"]},
-        {"handle_id": "h_reader", "purpose": "read_after_writer_fsync", "open_flags": ["O_RDONLY"]}
+        { "handle_id": "h_writer", "purpose": "write_then_fsync", "open_flags": ["O_RDWR"] },
+        {
+          "handle_id": "h_reader",
+          "purpose": "read_after_writer_fsync",
+          "open_flags": ["O_RDONLY"]
+        }
       ],
       "operation_trace": [
-        {"step": 1, "handle_id": "h_writer", "op": "write", "args": ["offset=0", "len=4096", "byte=0xAA"], "expected_result": "success"},
-        {"step": 2, "handle_id": "h_writer", "op": "fsync", "args": [], "expected_result": "success"},
-        {"step": 3, "handle_id": "h_reader", "op": "read", "args": ["offset=0", "len=4096"], "expected_result": "post_write_bytes"},
-        {"step": 4, "handle_id": "h_reader", "op": "fstat", "args": [], "expected_result": "size_at_least_4096"}
+        {
+          "step": 1,
+          "handle_id": "h_writer",
+          "op": "write",
+          "args": ["offset=0", "len=4096", "byte=0xAA"],
+          "expected_result": "success"
+        },
+        {
+          "step": 2,
+          "handle_id": "h_writer",
+          "op": "fsync",
+          "args": [],
+          "expected_result": "success"
+        },
+        {
+          "step": 3,
+          "handle_id": "h_reader",
+          "op": "read",
+          "args": ["offset=0", "len=4096"],
+          "expected_result": "post_write_bytes"
+        },
+        {
+          "step": 4,
+          "handle_id": "h_reader",
+          "op": "fstat",
+          "args": [],
+          "expected_result": "size_at_least_4096"
+        }
       ],
       "cache_visibility": {
         "other_handle_state": "post_fsync_writer_bytes",
@@ -1200,7 +1298,12 @@
         "xattr_state": []
       },
       "cleanup_policy": "teardown_image",
-      "artifact_requirements": ["scenario_id", "operation_trace_path", "expected_visibility", "observed_visibility"],
+      "artifact_requirements": [
+        "scenario_id",
+        "operation_trace_path",
+        "expected_visibility",
+        "observed_visibility"
+      ],
       "expected_outcome": {
         "outcome_class": "pass",
         "no_partial_mutation": false,
@@ -1215,13 +1318,35 @@
       "mount_flags": ["rw", "default_permissions"],
       "fs_specific_options": ["single_device", "csum"],
       "handles": [
-        {"handle_id": "h_writer", "purpose": "write_then_fsync", "open_flags": ["O_RDWR"]},
-        {"handle_id": "h_reader", "purpose": "read_after_writer_fsync", "open_flags": ["O_RDONLY"]}
+        { "handle_id": "h_writer", "purpose": "write_then_fsync", "open_flags": ["O_RDWR"] },
+        {
+          "handle_id": "h_reader",
+          "purpose": "read_after_writer_fsync",
+          "open_flags": ["O_RDONLY"]
+        }
       ],
       "operation_trace": [
-        {"step": 1, "handle_id": "h_writer", "op": "write", "args": ["offset=0", "len=8192", "byte=0xCC"], "expected_result": "success"},
-        {"step": 2, "handle_id": "h_writer", "op": "fsync", "args": [], "expected_result": "success"},
-        {"step": 3, "handle_id": "h_reader", "op": "read", "args": ["offset=0", "len=8192"], "expected_result": "post_write_bytes"}
+        {
+          "step": 1,
+          "handle_id": "h_writer",
+          "op": "write",
+          "args": ["offset=0", "len=8192", "byte=0xCC"],
+          "expected_result": "success"
+        },
+        {
+          "step": 2,
+          "handle_id": "h_writer",
+          "op": "fsync",
+          "args": [],
+          "expected_result": "success"
+        },
+        {
+          "step": 3,
+          "handle_id": "h_reader",
+          "op": "read",
+          "args": ["offset=0", "len=8192"],
+          "expected_result": "post_write_bytes"
+        }
       ],
       "cache_visibility": {
         "other_handle_state": "post_fsync_writer_bytes",
@@ -1238,7 +1363,12 @@
         "xattr_state": []
       },
       "cleanup_policy": "teardown_image",
-      "artifact_requirements": ["scenario_id", "operation_trace_path", "expected_visibility", "observed_visibility"],
+      "artifact_requirements": [
+        "scenario_id",
+        "operation_trace_path",
+        "expected_visibility",
+        "observed_visibility"
+      ],
       "expected_outcome": {
         "outcome_class": "pass",
         "no_partial_mutation": false,
@@ -1253,14 +1383,42 @@
       "mount_flags": ["rw", "default_permissions"],
       "fs_specific_options": ["dir_index"],
       "handles": [
-        {"handle_id": "h_holder", "purpose": "holds_unlinked_inode", "open_flags": ["O_RDWR"]},
-        {"handle_id": "h_remover", "purpose": "unlinks_directory_entry", "open_flags": ["O_DIRECTORY"]}
+        { "handle_id": "h_holder", "purpose": "holds_unlinked_inode", "open_flags": ["O_RDWR"] },
+        {
+          "handle_id": "h_remover",
+          "purpose": "unlinks_directory_entry",
+          "open_flags": ["O_DIRECTORY"]
+        }
       ],
       "operation_trace": [
-        {"step": 1, "handle_id": "h_remover", "op": "unlink", "args": ["path=/f1"], "expected_result": "success"},
-        {"step": 2, "handle_id": "h_holder", "op": "read", "args": ["offset=0", "len=4096"], "expected_result": "pre_unlink_bytes"},
-        {"step": 3, "handle_id": "h_holder", "op": "write", "args": ["offset=0", "len=4096", "byte=0x55"], "expected_result": "success"},
-        {"step": 4, "handle_id": "h_holder", "op": "fstat", "args": [], "expected_result": "nlink_zero"}
+        {
+          "step": 1,
+          "handle_id": "h_remover",
+          "op": "unlink",
+          "args": ["path=/f1"],
+          "expected_result": "success"
+        },
+        {
+          "step": 2,
+          "handle_id": "h_holder",
+          "op": "read",
+          "args": ["offset=0", "len=4096"],
+          "expected_result": "pre_unlink_bytes"
+        },
+        {
+          "step": 3,
+          "handle_id": "h_holder",
+          "op": "write",
+          "args": ["offset=0", "len=4096", "byte=0x55"],
+          "expected_result": "success"
+        },
+        {
+          "step": 4,
+          "handle_id": "h_holder",
+          "op": "fstat",
+          "args": [],
+          "expected_result": "nlink_zero"
+        }
       ],
       "cache_visibility": {
         "other_handle_state": "directory_entry_absent_inode_live",
@@ -1277,7 +1435,12 @@
         "xattr_state": []
       },
       "cleanup_policy": "teardown_image",
-      "artifact_requirements": ["scenario_id", "operation_trace_path", "expected_visibility", "observed_visibility"],
+      "artifact_requirements": [
+        "scenario_id",
+        "operation_trace_path",
+        "expected_visibility",
+        "observed_visibility"
+      ],
       "expected_outcome": {
         "outcome_class": "pass",
         "no_partial_mutation": false,
@@ -1292,13 +1455,35 @@
       "mount_flags": ["rw", "default_permissions"],
       "fs_specific_options": ["dir_index"],
       "handles": [
-        {"handle_id": "h_open_src", "purpose": "stays_open_across_rename", "open_flags": ["O_RDWR"]},
-        {"handle_id": "h_renamer", "purpose": "performs_rename", "open_flags": ["O_DIRECTORY"]}
+        {
+          "handle_id": "h_open_src",
+          "purpose": "stays_open_across_rename",
+          "open_flags": ["O_RDWR"]
+        },
+        { "handle_id": "h_renamer", "purpose": "performs_rename", "open_flags": ["O_DIRECTORY"] }
       ],
       "operation_trace": [
-        {"step": 1, "handle_id": "h_renamer", "op": "rename", "args": ["from=/src", "to=/dst"], "expected_result": "success"},
-        {"step": 2, "handle_id": "h_open_src", "op": "write", "args": ["offset=0", "len=2048", "byte=0xBB"], "expected_result": "success"},
-        {"step": 3, "handle_id": "h_open_src", "op": "fstat", "args": [], "expected_result": "size_at_least_2048"}
+        {
+          "step": 1,
+          "handle_id": "h_renamer",
+          "op": "rename",
+          "args": ["from=/src", "to=/dst"],
+          "expected_result": "success"
+        },
+        {
+          "step": 2,
+          "handle_id": "h_open_src",
+          "op": "write",
+          "args": ["offset=0", "len=2048", "byte=0xBB"],
+          "expected_result": "success"
+        },
+        {
+          "step": 3,
+          "handle_id": "h_open_src",
+          "op": "fstat",
+          "args": [],
+          "expected_result": "size_at_least_2048"
+        }
       ],
       "cache_visibility": {
         "other_handle_state": "renamed_path_visible_at_dst_open_handle_writes_to_same_inode",
@@ -1315,7 +1500,12 @@
         "xattr_state": []
       },
       "cleanup_policy": "teardown_image",
-      "artifact_requirements": ["scenario_id", "operation_trace_path", "expected_visibility", "observed_visibility"],
+      "artifact_requirements": [
+        "scenario_id",
+        "operation_trace_path",
+        "expected_visibility",
+        "observed_visibility"
+      ],
       "expected_outcome": {
         "outcome_class": "pass",
         "no_partial_mutation": false,
@@ -1330,14 +1520,42 @@
       "mount_flags": ["rw", "default_permissions"],
       "fs_specific_options": ["single_device"],
       "handles": [
-        {"handle_id": "h_owner", "purpose": "holds_file_during_truncate", "open_flags": ["O_RDWR"]},
-        {"handle_id": "h_truncater", "purpose": "performs_truncate", "open_flags": ["O_RDWR"]}
+        {
+          "handle_id": "h_owner",
+          "purpose": "holds_file_during_truncate",
+          "open_flags": ["O_RDWR"]
+        },
+        { "handle_id": "h_truncater", "purpose": "performs_truncate", "open_flags": ["O_RDWR"] }
       ],
       "operation_trace": [
-        {"step": 1, "handle_id": "h_truncater", "op": "ftruncate", "args": ["new_size=4096"], "expected_result": "success"},
-        {"step": 2, "handle_id": "h_owner", "op": "fstat", "args": [], "expected_result": "size_equals_4096"},
-        {"step": 3, "handle_id": "h_owner", "op": "read", "args": ["offset=0", "len=4096"], "expected_result": "post_truncate_bytes"},
-        {"step": 4, "handle_id": "h_owner", "op": "read", "args": ["offset=4096", "len=4096"], "expected_result": "ENXIO_or_short_read"}
+        {
+          "step": 1,
+          "handle_id": "h_truncater",
+          "op": "ftruncate",
+          "args": ["new_size=4096"],
+          "expected_result": "success"
+        },
+        {
+          "step": 2,
+          "handle_id": "h_owner",
+          "op": "fstat",
+          "args": [],
+          "expected_result": "size_equals_4096"
+        },
+        {
+          "step": 3,
+          "handle_id": "h_owner",
+          "op": "read",
+          "args": ["offset=0", "len=4096"],
+          "expected_result": "post_truncate_bytes"
+        },
+        {
+          "step": 4,
+          "handle_id": "h_owner",
+          "op": "read",
+          "args": ["offset=4096", "len=4096"],
+          "expected_result": "ENXIO_or_short_read"
+        }
       ],
       "cache_visibility": {
         "other_handle_state": "post_truncate_size_visible_to_other_handle",
@@ -1354,7 +1572,12 @@
         "xattr_state": []
       },
       "cleanup_policy": "teardown_image",
-      "artifact_requirements": ["scenario_id", "operation_trace_path", "expected_visibility", "observed_visibility"],
+      "artifact_requirements": [
+        "scenario_id",
+        "operation_trace_path",
+        "expected_visibility",
+        "observed_visibility"
+      ],
       "expected_outcome": {
         "outcome_class": "pass",
         "no_partial_mutation": false,
@@ -1369,13 +1592,31 @@
       "mount_flags": ["rw", "default_permissions"],
       "fs_specific_options": ["dir_index"],
       "handles": [
-        {"handle_id": "h_existing", "purpose": "open_before_chmod", "open_flags": ["O_RDWR"]},
-        {"handle_id": "h_chmod", "purpose": "applies_chmod", "open_flags": ["O_RDONLY"]}
+        { "handle_id": "h_existing", "purpose": "open_before_chmod", "open_flags": ["O_RDWR"] },
+        { "handle_id": "h_chmod", "purpose": "applies_chmod", "open_flags": ["O_RDONLY"] }
       ],
       "operation_trace": [
-        {"step": 1, "handle_id": "h_chmod", "op": "fchmod", "args": ["mode=0600"], "expected_result": "success"},
-        {"step": 2, "handle_id": "h_existing", "op": "fstat", "args": [], "expected_result": "mode_equals_0600"},
-        {"step": 3, "handle_id": "h_existing", "op": "write", "args": ["offset=0", "len=1024", "byte=0xEE"], "expected_result": "success"}
+        {
+          "step": 1,
+          "handle_id": "h_chmod",
+          "op": "fchmod",
+          "args": ["mode=0600"],
+          "expected_result": "success"
+        },
+        {
+          "step": 2,
+          "handle_id": "h_existing",
+          "op": "fstat",
+          "args": [],
+          "expected_result": "mode_equals_0600"
+        },
+        {
+          "step": 3,
+          "handle_id": "h_existing",
+          "op": "write",
+          "args": ["offset=0", "len=1024", "byte=0xEE"],
+          "expected_result": "success"
+        }
       ],
       "cache_visibility": {
         "other_handle_state": "post_chmod_mode_visible_existing_writes_still_allowed",
@@ -1392,7 +1633,12 @@
         "xattr_state": []
       },
       "cleanup_policy": "teardown_image",
-      "artifact_requirements": ["scenario_id", "operation_trace_path", "expected_visibility", "observed_visibility"],
+      "artifact_requirements": [
+        "scenario_id",
+        "operation_trace_path",
+        "expected_visibility",
+        "observed_visibility"
+      ],
       "expected_outcome": {
         "outcome_class": "pass",
         "no_partial_mutation": false,
@@ -1407,14 +1653,38 @@
       "mount_flags": ["rw", "default_permissions"],
       "fs_specific_options": ["user_xattr"],
       "handles": [
-        {"handle_id": "h_setter", "purpose": "writes_user_xattr", "open_flags": ["O_RDWR"]},
-        {"handle_id": "h_reader", "purpose": "reads_user_xattr", "open_flags": ["O_RDONLY"]}
+        { "handle_id": "h_setter", "purpose": "writes_user_xattr", "open_flags": ["O_RDWR"] },
+        { "handle_id": "h_reader", "purpose": "reads_user_xattr", "open_flags": ["O_RDONLY"] }
       ],
       "operation_trace": [
-        {"step": 1, "handle_id": "h_setter", "op": "xattr_set", "args": ["name=user.k1", "value=v1"], "expected_result": "success"},
-        {"step": 2, "handle_id": "h_reader", "op": "xattr_get", "args": ["name=user.k1"], "expected_result": "value_v1"},
-        {"step": 3, "handle_id": "h_setter", "op": "xattr_remove", "args": ["name=user.k1"], "expected_result": "success"},
-        {"step": 4, "handle_id": "h_reader", "op": "xattr_get", "args": ["name=user.k1"], "expected_result": "ENODATA"}
+        {
+          "step": 1,
+          "handle_id": "h_setter",
+          "op": "xattr_set",
+          "args": ["name=user.k1", "value=v1"],
+          "expected_result": "success"
+        },
+        {
+          "step": 2,
+          "handle_id": "h_reader",
+          "op": "xattr_get",
+          "args": ["name=user.k1"],
+          "expected_result": "value_v1"
+        },
+        {
+          "step": 3,
+          "handle_id": "h_setter",
+          "op": "xattr_remove",
+          "args": ["name=user.k1"],
+          "expected_result": "success"
+        },
+        {
+          "step": 4,
+          "handle_id": "h_reader",
+          "op": "xattr_get",
+          "args": ["name=user.k1"],
+          "expected_result": "ENODATA"
+        }
       ],
       "cache_visibility": {
         "other_handle_state": "xattr_set_and_remove_visible_to_other_handle",
@@ -1431,7 +1701,12 @@
         "xattr_state": ["user.k1=absent"]
       },
       "cleanup_policy": "teardown_image",
-      "artifact_requirements": ["scenario_id", "operation_trace_path", "expected_visibility", "observed_visibility"],
+      "artifact_requirements": [
+        "scenario_id",
+        "operation_trace_path",
+        "expected_visibility",
+        "observed_visibility"
+      ],
       "expected_outcome": {
         "outcome_class": "pass",
         "no_partial_mutation": false,
@@ -1446,13 +1721,35 @@
       "mount_flags": ["rw", "default_permissions"],
       "fs_specific_options": ["single_device"],
       "handles": [
-        {"handle_id": "h_dir", "purpose": "directory_iterator", "open_flags": ["O_DIRECTORY", "O_RDONLY"]},
-        {"handle_id": "h_mutator", "purpose": "unlinks_b", "open_flags": ["O_DIRECTORY"]}
+        {
+          "handle_id": "h_dir",
+          "purpose": "directory_iterator",
+          "open_flags": ["O_DIRECTORY", "O_RDONLY"]
+        },
+        { "handle_id": "h_mutator", "purpose": "unlinks_b", "open_flags": ["O_DIRECTORY"] }
       ],
       "operation_trace": [
-        {"step": 1, "handle_id": "h_dir", "op": "readdir", "args": ["pos=0"], "expected_result": "entries_a_b_c"},
-        {"step": 2, "handle_id": "h_mutator", "op": "unlink", "args": ["path=/dir/b"], "expected_result": "success"},
-        {"step": 3, "handle_id": "h_dir", "op": "readdir", "args": ["restart=true"], "expected_result": "entries_a_c"}
+        {
+          "step": 1,
+          "handle_id": "h_dir",
+          "op": "readdir",
+          "args": ["pos=0"],
+          "expected_result": "entries_a_b_c"
+        },
+        {
+          "step": 2,
+          "handle_id": "h_mutator",
+          "op": "unlink",
+          "args": ["path=/dir/b"],
+          "expected_result": "success"
+        },
+        {
+          "step": 3,
+          "handle_id": "h_dir",
+          "op": "readdir",
+          "args": ["restart=true"],
+          "expected_result": "entries_a_c"
+        }
       ],
       "cache_visibility": {
         "other_handle_state": "second_readdir_after_unlink_observes_b_absent",
@@ -1469,7 +1766,12 @@
         "xattr_state": []
       },
       "cleanup_policy": "teardown_image",
-      "artifact_requirements": ["scenario_id", "operation_trace_path", "expected_visibility", "observed_visibility"],
+      "artifact_requirements": [
+        "scenario_id",
+        "operation_trace_path",
+        "expected_visibility",
+        "observed_visibility"
+      ],
       "expected_outcome": {
         "outcome_class": "pass",
         "no_partial_mutation": false,
@@ -1484,14 +1786,46 @@
       "mount_flags": ["rw", "default_permissions"],
       "fs_specific_options": ["dir_index"],
       "handles": [
-        {"handle_id": "h_symlink_holder", "purpose": "holds_symlink_path_via_O_PATH", "open_flags": ["O_PATH", "O_NOFOLLOW"]},
-        {"handle_id": "h_renamer", "purpose": "renames_symlink_directory_entry", "open_flags": ["O_DIRECTORY"]}
+        {
+          "handle_id": "h_symlink_holder",
+          "purpose": "holds_symlink_path_via_O_PATH",
+          "open_flags": ["O_PATH", "O_NOFOLLOW"]
+        },
+        {
+          "handle_id": "h_renamer",
+          "purpose": "renames_symlink_directory_entry",
+          "open_flags": ["O_DIRECTORY"]
+        }
       ],
       "operation_trace": [
-        {"step": 1, "handle_id": "h_renamer", "op": "rename", "args": ["from=/sym", "to=/sym_renamed"], "expected_result": "success"},
-        {"step": 2, "handle_id": "h_symlink_holder", "op": "readlink", "args": [], "expected_result": "target_path_unchanged"},
-        {"step": 3, "handle_id": "h_renamer", "op": "readlink", "args": ["path=/sym_renamed"], "expected_result": "target_path_unchanged"},
-        {"step": 4, "handle_id": "h_renamer", "op": "readlink", "args": ["path=/sym"], "expected_result": "ENOENT"}
+        {
+          "step": 1,
+          "handle_id": "h_renamer",
+          "op": "rename",
+          "args": ["from=/sym", "to=/sym_renamed"],
+          "expected_result": "success"
+        },
+        {
+          "step": 2,
+          "handle_id": "h_symlink_holder",
+          "op": "readlink",
+          "args": [],
+          "expected_result": "target_path_unchanged"
+        },
+        {
+          "step": 3,
+          "handle_id": "h_renamer",
+          "op": "readlink",
+          "args": ["path=/sym_renamed"],
+          "expected_result": "target_path_unchanged"
+        },
+        {
+          "step": 4,
+          "handle_id": "h_renamer",
+          "op": "readlink",
+          "args": ["path=/sym"],
+          "expected_result": "ENOENT"
+        }
       ],
       "cache_visibility": {
         "other_handle_state": "renamed_symlink_target_unchanged",
@@ -1508,7 +1842,12 @@
         "xattr_state": []
       },
       "cleanup_policy": "teardown_image",
-      "artifact_requirements": ["scenario_id", "operation_trace_path", "expected_visibility", "observed_visibility"],
+      "artifact_requirements": [
+        "scenario_id",
+        "operation_trace_path",
+        "expected_visibility",
+        "observed_visibility"
+      ],
       "expected_outcome": {
         "outcome_class": "pass",
         "no_partial_mutation": false,
@@ -1523,13 +1862,39 @@
       "mount_flags": ["rw", "default_permissions"],
       "fs_specific_options": ["dir_index", "immutable_attr"],
       "handles": [
-        {"handle_id": "h_immut_reader", "purpose": "open_for_read_only", "open_flags": ["O_RDONLY"]},
-        {"handle_id": "h_writer_attempt", "purpose": "attempts_rejected_write", "open_flags": ["O_RDWR"]}
+        {
+          "handle_id": "h_immut_reader",
+          "purpose": "open_for_read_only",
+          "open_flags": ["O_RDONLY"]
+        },
+        {
+          "handle_id": "h_writer_attempt",
+          "purpose": "attempts_rejected_write",
+          "open_flags": ["O_RDWR"]
+        }
       ],
       "operation_trace": [
-        {"step": 1, "handle_id": "h_writer_attempt", "op": "write", "args": ["offset=0", "len=4096", "byte=0xFF"], "expected_result": "EPERM"},
-        {"step": 2, "handle_id": "h_immut_reader", "op": "read", "args": ["offset=0", "len=4096"], "expected_result": "pre_attempt_bytes"},
-        {"step": 3, "handle_id": "h_immut_reader", "op": "fstat", "args": [], "expected_result": "size_unchanged"}
+        {
+          "step": 1,
+          "handle_id": "h_writer_attempt",
+          "op": "write",
+          "args": ["offset=0", "len=4096", "byte=0xFF"],
+          "expected_result": "EPERM"
+        },
+        {
+          "step": 2,
+          "handle_id": "h_immut_reader",
+          "op": "read",
+          "args": ["offset=0", "len=4096"],
+          "expected_result": "pre_attempt_bytes"
+        },
+        {
+          "step": 3,
+          "handle_id": "h_immut_reader",
+          "op": "fstat",
+          "args": [],
+          "expected_result": "size_unchanged"
+        }
       ],
       "cache_visibility": {
         "other_handle_state": "rejected_write_does_not_alter_other_handle_view",
@@ -1546,7 +1911,12 @@
         "xattr_state": []
       },
       "cleanup_policy": "preserve_artifacts_on_failure",
-      "artifact_requirements": ["scenario_id", "operation_trace_path", "expected_visibility", "observed_visibility"],
+      "artifact_requirements": [
+        "scenario_id",
+        "operation_trace_path",
+        "expected_visibility",
+        "observed_visibility"
+      ],
       "expected_outcome": {
         "outcome_class": "unsupported_rejected",
         "no_partial_mutation": true,

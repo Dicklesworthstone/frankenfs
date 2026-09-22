@@ -208,9 +208,7 @@
       "threshold_value": 0.0,
       "unit": "claim_state",
       "suspected_subsystem": "long",
-      "raw_logs": [
-        "long_campaign_writeback_cache_smoke"
-      ],
+      "raw_logs": ["long_campaign_writeback_cache_smoke"],
       "validation_command": "cargo run -p ffs-harness -- validate-soak-canary-campaigns --manifest benchmarks/soak_canary_campaign_manifest.json"
     }
   ],
@@ -733,14 +731,10 @@
         "threshold_value": 0.0,
         "unit": "claim_state",
         "suspected_subsystem": "long",
-        "raw_logs": [
-          "long_campaign_writeback_cache_smoke"
-        ],
+        "raw_logs": ["long_campaign_writeback_cache_smoke"],
         "validation_command": "cargo run -p ffs-harness -- validate-soak-canary-campaigns --manifest benchmarks/soak_canary_campaign_manifest.json"
       },
-      "raw_logs": [
-        "long_campaign_writeback_cache_smoke"
-      ],
+      "raw_logs": ["long_campaign_writeback_cache_smoke"],
       "validation_command": "cargo run -p ffs-harness -- validate-soak-canary-campaigns --manifest benchmarks/soak_canary_campaign_manifest.json",
       "rationale": "Long-campaign writeback-cache performance remains deferred until soak stop conditions and flake root-cause classification are implemented.",
       "reproduction_command": "cargo run -p ffs-harness -- validate-soak-canary-campaigns --manifest benchmarks/soak_canary_campaign_manifest.json"

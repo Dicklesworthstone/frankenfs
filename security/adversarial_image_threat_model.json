@@ -446,19 +446,86 @@
       "expected_classification": "quarantined",
       "observed_classification": "quarantined",
       "resource_controls": [
-        {"resource_class": "input_bytes", "limit_value": 2097152, "limit_unit": "bytes", "enforcement_point": "btrfs_parser", "cleanup_policy": "quarantine_artifacts"},
-        {"resource_class": "cpu_time", "limit_value": 450, "limit_unit": "milliseconds", "enforcement_point": "btrfs_parser", "cleanup_policy": "quarantine_artifacts"},
-        {"resource_class": "wall_time", "limit_value": 500, "limit_unit": "milliseconds", "enforcement_point": "btrfs_parser", "cleanup_policy": "quarantine_artifacts"},
-        {"resource_class": "memory", "limit_value": 128, "limit_unit": "mib", "enforcement_point": "btrfs_parser", "cleanup_policy": "quarantine_artifacts"},
-        {"resource_class": "disk_space", "limit_value": 1048576, "limit_unit": "bytes", "enforcement_point": "btrfs_parser", "cleanup_policy": "quarantine_artifacts"},
-        {"resource_class": "artifact_space", "limit_value": 2097152, "limit_unit": "bytes", "enforcement_point": "btrfs_parser", "cleanup_policy": "quarantine_artifacts"},
-        {"resource_class": "log_output", "limit_value": 262144, "limit_unit": "bytes", "enforcement_point": "btrfs_parser", "cleanup_policy": "quarantine_artifacts"},
-        {"resource_class": "file_descriptors", "limit_value": 8, "limit_unit": "count", "enforcement_point": "btrfs_parser", "cleanup_policy": "quarantine_artifacts"}
+        {
+          "resource_class": "input_bytes",
+          "limit_value": 2097152,
+          "limit_unit": "bytes",
+          "enforcement_point": "btrfs_parser",
+          "cleanup_policy": "quarantine_artifacts"
+        },
+        {
+          "resource_class": "cpu_time",
+          "limit_value": 450,
+          "limit_unit": "milliseconds",
+          "enforcement_point": "btrfs_parser",
+          "cleanup_policy": "quarantine_artifacts"
+        },
+        {
+          "resource_class": "wall_time",
+          "limit_value": 500,
+          "limit_unit": "milliseconds",
+          "enforcement_point": "btrfs_parser",
+          "cleanup_policy": "quarantine_artifacts"
+        },
+        {
+          "resource_class": "memory",
+          "limit_value": 128,
+          "limit_unit": "mib",
+          "enforcement_point": "btrfs_parser",
+          "cleanup_policy": "quarantine_artifacts"
+        },
+        {
+          "resource_class": "disk_space",
+          "limit_value": 1048576,
+          "limit_unit": "bytes",
+          "enforcement_point": "btrfs_parser",
+          "cleanup_policy": "quarantine_artifacts"
+        },
+        {
+          "resource_class": "artifact_space",
+          "limit_value": 2097152,
+          "limit_unit": "bytes",
+          "enforcement_point": "btrfs_parser",
+          "cleanup_policy": "quarantine_artifacts"
+        },
+        {
+          "resource_class": "log_output",
+          "limit_value": 262144,
+          "limit_unit": "bytes",
+          "enforcement_point": "btrfs_parser",
+          "cleanup_policy": "quarantine_artifacts"
+        },
+        {
+          "resource_class": "file_descriptors",
+          "limit_value": 8,
+          "limit_unit": "count",
+          "enforcement_point": "btrfs_parser",
+          "cleanup_policy": "quarantine_artifacts"
+        }
       ],
-      "resource_limits": {"max_input_bytes": 2097152, "max_wall_ms": 500, "max_memory_mib": 128, "max_artifact_bytes": 2097152, "max_log_bytes": 262144, "max_file_descriptors": 8},
-      "observed_resource_counters": {"input_bytes": 524288, "wall_ms": 110, "cpu_ms": 104, "memory_mib": 80, "disk_bytes": 131072, "artifact_bytes": 262144, "log_bytes": 32768, "file_descriptors": 4},
+      "resource_limits": {
+        "max_input_bytes": 2097152,
+        "max_wall_ms": 500,
+        "max_memory_mib": 128,
+        "max_artifact_bytes": 2097152,
+        "max_log_bytes": 262144,
+        "max_file_descriptors": 8
+      },
+      "observed_resource_counters": {
+        "input_bytes": 524288,
+        "wall_ms": 110,
+        "cpu_ms": 104,
+        "memory_mib": 80,
+        "disk_bytes": 131072,
+        "artifact_bytes": 262144,
+        "log_bytes": 32768,
+        "file_descriptors": 4
+      },
       "cleanup_status": "quarantined",
-      "artifact_paths": ["artifacts/security/logs/cyclic_metadata_reference_quarantined.json", "artifacts/security/quarantine/cyclic_metadata_reference_quarantined.btrfs"],
+      "artifact_paths": [
+        "artifacts/security/logs/cyclic_metadata_reference_quarantined.json",
+        "artifacts/security/quarantine/cyclic_metadata_reference_quarantined.btrfs"
+      ],
       "release_gate_effect": "fail_closed",
       "remediation_id": "bd-0qx9b",
       "reproduction_command": "ffs-harness validate-adversarial-threat-model --model security/adversarial_image_threat_model.json",
@@ -481,16 +548,73 @@
       "expected_classification": "capped",
       "observed_classification": "capped",
       "resource_controls": [
-        {"resource_class": "input_bytes", "limit_value": 1048576, "limit_unit": "bytes", "enforcement_point": "ext4_parser", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "cpu_time", "limit_value": 250, "limit_unit": "milliseconds", "enforcement_point": "ext4_parser", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "wall_time", "limit_value": 300, "limit_unit": "milliseconds", "enforcement_point": "ext4_parser", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "memory", "limit_value": 96, "limit_unit": "mib", "enforcement_point": "ext4_parser", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "artifact_space", "limit_value": 1048576, "limit_unit": "bytes", "enforcement_point": "ext4_parser", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "log_output", "limit_value": 131072, "limit_unit": "bytes", "enforcement_point": "ext4_parser", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "file_descriptors", "limit_value": 8, "limit_unit": "count", "enforcement_point": "ext4_parser", "cleanup_policy": "preserve_evidence"}
+        {
+          "resource_class": "input_bytes",
+          "limit_value": 1048576,
+          "limit_unit": "bytes",
+          "enforcement_point": "ext4_parser",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "cpu_time",
+          "limit_value": 250,
+          "limit_unit": "milliseconds",
+          "enforcement_point": "ext4_parser",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "wall_time",
+          "limit_value": 300,
+          "limit_unit": "milliseconds",
+          "enforcement_point": "ext4_parser",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "memory",
+          "limit_value": 96,
+          "limit_unit": "mib",
+          "enforcement_point": "ext4_parser",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "artifact_space",
+          "limit_value": 1048576,
+          "limit_unit": "bytes",
+          "enforcement_point": "ext4_parser",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "log_output",
+          "limit_value": 131072,
+          "limit_unit": "bytes",
+          "enforcement_point": "ext4_parser",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "file_descriptors",
+          "limit_value": 8,
+          "limit_unit": "count",
+          "enforcement_point": "ext4_parser",
+          "cleanup_policy": "preserve_evidence"
+        }
       ],
-      "resource_limits": {"max_input_bytes": 1048576, "max_wall_ms": 300, "max_memory_mib": 96, "max_artifact_bytes": 1048576, "max_log_bytes": 131072, "max_file_descriptors": 8},
-      "observed_resource_counters": {"input_bytes": 262144, "wall_ms": 71, "cpu_ms": 68, "memory_mib": 48, "artifact_bytes": 131072, "log_bytes": 16384, "file_descriptors": 3},
+      "resource_limits": {
+        "max_input_bytes": 1048576,
+        "max_wall_ms": 300,
+        "max_memory_mib": 96,
+        "max_artifact_bytes": 1048576,
+        "max_log_bytes": 131072,
+        "max_file_descriptors": 8
+      },
+      "observed_resource_counters": {
+        "input_bytes": 262144,
+        "wall_ms": 71,
+        "cpu_ms": 68,
+        "memory_mib": 48,
+        "artifact_bytes": 131072,
+        "log_bytes": 16384,
+        "file_descriptors": 3
+      },
       "cleanup_status": "preserved_artifacts",
       "artifact_paths": ["artifacts/security/logs/deeply_nested_directory_capped.json"],
       "release_gate_effect": "fail_closed",
@@ -515,16 +639,73 @@
       "expected_classification": "capped",
       "observed_classification": "capped",
       "resource_controls": [
-        {"resource_class": "input_bytes", "limit_value": 1048576, "limit_unit": "bytes", "enforcement_point": "ext4_parser", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "cpu_time", "limit_value": 250, "limit_unit": "milliseconds", "enforcement_point": "ext4_parser", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "wall_time", "limit_value": 300, "limit_unit": "milliseconds", "enforcement_point": "ext4_parser", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "memory", "limit_value": 96, "limit_unit": "mib", "enforcement_point": "ext4_parser", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "artifact_space", "limit_value": 1048576, "limit_unit": "bytes", "enforcement_point": "ext4_parser", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "log_output", "limit_value": 131072, "limit_unit": "bytes", "enforcement_point": "ext4_parser", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "file_descriptors", "limit_value": 8, "limit_unit": "count", "enforcement_point": "ext4_parser", "cleanup_policy": "preserve_evidence"}
+        {
+          "resource_class": "input_bytes",
+          "limit_value": 1048576,
+          "limit_unit": "bytes",
+          "enforcement_point": "ext4_parser",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "cpu_time",
+          "limit_value": 250,
+          "limit_unit": "milliseconds",
+          "enforcement_point": "ext4_parser",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "wall_time",
+          "limit_value": 300,
+          "limit_unit": "milliseconds",
+          "enforcement_point": "ext4_parser",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "memory",
+          "limit_value": 96,
+          "limit_unit": "mib",
+          "enforcement_point": "ext4_parser",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "artifact_space",
+          "limit_value": 1048576,
+          "limit_unit": "bytes",
+          "enforcement_point": "ext4_parser",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "log_output",
+          "limit_value": 131072,
+          "limit_unit": "bytes",
+          "enforcement_point": "ext4_parser",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "file_descriptors",
+          "limit_value": 8,
+          "limit_unit": "count",
+          "enforcement_point": "ext4_parser",
+          "cleanup_policy": "preserve_evidence"
+        }
       ],
-      "resource_limits": {"max_input_bytes": 1048576, "max_wall_ms": 300, "max_memory_mib": 96, "max_artifact_bytes": 1048576, "max_log_bytes": 131072, "max_file_descriptors": 8},
-      "observed_resource_counters": {"input_bytes": 524288, "wall_ms": 66, "cpu_ms": 60, "memory_mib": 64, "artifact_bytes": 131072, "log_bytes": 16384, "file_descriptors": 3},
+      "resource_limits": {
+        "max_input_bytes": 1048576,
+        "max_wall_ms": 300,
+        "max_memory_mib": 96,
+        "max_artifact_bytes": 1048576,
+        "max_log_bytes": 131072,
+        "max_file_descriptors": 8
+      },
+      "observed_resource_counters": {
+        "input_bytes": 524288,
+        "wall_ms": 66,
+        "cpu_ms": 60,
+        "memory_mib": 64,
+        "artifact_bytes": 131072,
+        "log_bytes": 16384,
+        "file_descriptors": 3
+      },
       "cleanup_status": "preserved_artifacts",
       "artifact_paths": ["artifacts/security/logs/huge_xattr_payload_capped.json"],
       "release_gate_effect": "fail_closed",
@@ -549,15 +730,54 @@
       "expected_classification": "quarantined",
       "observed_classification": "quarantined",
       "resource_controls": [
-        {"resource_class": "input_bytes", "limit_value": 1048576, "limit_unit": "bytes", "enforcement_point": "repair_ledger_ingestion", "cleanup_policy": "quarantine_artifacts"},
-        {"resource_class": "wall_time", "limit_value": 250, "limit_unit": "milliseconds", "enforcement_point": "repair_ledger_ingestion", "cleanup_policy": "quarantine_artifacts"},
-        {"resource_class": "artifact_space", "limit_value": 1048576, "limit_unit": "bytes", "enforcement_point": "repair_ledger_ingestion", "cleanup_policy": "quarantine_artifacts"},
-        {"resource_class": "log_output", "limit_value": 262144, "limit_unit": "bytes", "enforcement_point": "repair_ledger_ingestion", "cleanup_policy": "quarantine_artifacts"}
+        {
+          "resource_class": "input_bytes",
+          "limit_value": 1048576,
+          "limit_unit": "bytes",
+          "enforcement_point": "repair_ledger_ingestion",
+          "cleanup_policy": "quarantine_artifacts"
+        },
+        {
+          "resource_class": "wall_time",
+          "limit_value": 250,
+          "limit_unit": "milliseconds",
+          "enforcement_point": "repair_ledger_ingestion",
+          "cleanup_policy": "quarantine_artifacts"
+        },
+        {
+          "resource_class": "artifact_space",
+          "limit_value": 1048576,
+          "limit_unit": "bytes",
+          "enforcement_point": "repair_ledger_ingestion",
+          "cleanup_policy": "quarantine_artifacts"
+        },
+        {
+          "resource_class": "log_output",
+          "limit_value": 262144,
+          "limit_unit": "bytes",
+          "enforcement_point": "repair_ledger_ingestion",
+          "cleanup_policy": "quarantine_artifacts"
+        }
       ],
-      "resource_limits": {"max_input_bytes": 1048576, "max_wall_ms": 250, "max_memory_mib": 64, "max_artifact_bytes": 1048576, "max_log_bytes": 262144, "max_file_descriptors": 8},
-      "observed_resource_counters": {"input_bytes": 16384, "wall_ms": 18, "artifact_bytes": 65536, "log_bytes": 8192},
+      "resource_limits": {
+        "max_input_bytes": 1048576,
+        "max_wall_ms": 250,
+        "max_memory_mib": 64,
+        "max_artifact_bytes": 1048576,
+        "max_log_bytes": 262144,
+        "max_file_descriptors": 8
+      },
+      "observed_resource_counters": {
+        "input_bytes": 16384,
+        "wall_ms": 18,
+        "artifact_bytes": 65536,
+        "log_bytes": 8192
+      },
       "cleanup_status": "quarantined",
-      "artifact_paths": ["artifacts/security/logs/truncated_repair_ledger_quarantined.json", "artifacts/security/quarantine/truncated_repair_ledger_quarantined.jsonl"],
+      "artifact_paths": [
+        "artifacts/security/logs/truncated_repair_ledger_quarantined.json",
+        "artifacts/security/quarantine/truncated_repair_ledger_quarantined.jsonl"
+      ],
       "release_gate_effect": "fail_closed",
       "remediation_id": "bd-0qx9b",
       "reproduction_command": "ffs repair --dry-run --ledger security/fixtures/truncated_repair_ledger.jsonl <image>",
@@ -580,15 +800,54 @@
       "expected_classification": "quarantined",
       "observed_classification": "quarantined",
       "resource_controls": [
-        {"resource_class": "input_bytes", "limit_value": 1048576, "limit_unit": "bytes", "enforcement_point": "repair_ledger_ingestion", "cleanup_policy": "quarantine_artifacts"},
-        {"resource_class": "wall_time", "limit_value": 250, "limit_unit": "milliseconds", "enforcement_point": "repair_ledger_ingestion", "cleanup_policy": "quarantine_artifacts"},
-        {"resource_class": "artifact_space", "limit_value": 1048576, "limit_unit": "bytes", "enforcement_point": "repair_ledger_ingestion", "cleanup_policy": "quarantine_artifacts"},
-        {"resource_class": "log_output", "limit_value": 262144, "limit_unit": "bytes", "enforcement_point": "repair_ledger_ingestion", "cleanup_policy": "quarantine_artifacts"}
+        {
+          "resource_class": "input_bytes",
+          "limit_value": 1048576,
+          "limit_unit": "bytes",
+          "enforcement_point": "repair_ledger_ingestion",
+          "cleanup_policy": "quarantine_artifacts"
+        },
+        {
+          "resource_class": "wall_time",
+          "limit_value": 250,
+          "limit_unit": "milliseconds",
+          "enforcement_point": "repair_ledger_ingestion",
+          "cleanup_policy": "quarantine_artifacts"
+        },
+        {
+          "resource_class": "artifact_space",
+          "limit_value": 1048576,
+          "limit_unit": "bytes",
+          "enforcement_point": "repair_ledger_ingestion",
+          "cleanup_policy": "quarantine_artifacts"
+        },
+        {
+          "resource_class": "log_output",
+          "limit_value": 262144,
+          "limit_unit": "bytes",
+          "enforcement_point": "repair_ledger_ingestion",
+          "cleanup_policy": "quarantine_artifacts"
+        }
       ],
-      "resource_limits": {"max_input_bytes": 1048576, "max_wall_ms": 250, "max_memory_mib": 64, "max_artifact_bytes": 1048576, "max_log_bytes": 262144, "max_file_descriptors": 8},
-      "observed_resource_counters": {"input_bytes": 24576, "wall_ms": 19, "artifact_bytes": 65536, "log_bytes": 8192},
+      "resource_limits": {
+        "max_input_bytes": 1048576,
+        "max_wall_ms": 250,
+        "max_memory_mib": 64,
+        "max_artifact_bytes": 1048576,
+        "max_log_bytes": 262144,
+        "max_file_descriptors": 8
+      },
+      "observed_resource_counters": {
+        "input_bytes": 24576,
+        "wall_ms": 19,
+        "artifact_bytes": 65536,
+        "log_bytes": 8192
+      },
       "cleanup_status": "quarantined",
-      "artifact_paths": ["artifacts/security/logs/corrupt_repair_ledger_quarantined.json", "artifacts/security/quarantine/corrupt_repair_ledger_quarantined.jsonl"],
+      "artifact_paths": [
+        "artifacts/security/logs/corrupt_repair_ledger_quarantined.json",
+        "artifacts/security/quarantine/corrupt_repair_ledger_quarantined.jsonl"
+      ],
       "release_gate_effect": "fail_closed",
       "remediation_id": "bd-0qx9b",
       "reproduction_command": "ffs repair --dry-run --ledger security/fixtures/corrupt_repair_ledger.jsonl <image>",
@@ -611,16 +870,73 @@
       "expected_classification": "capped",
       "observed_classification": "capped",
       "resource_controls": [
-        {"resource_class": "input_bytes", "limit_value": 1048576, "limit_unit": "bytes", "enforcement_point": "fuzz_corpus_smoke", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "cpu_time", "limit_value": 250, "limit_unit": "milliseconds", "enforcement_point": "fuzz_corpus_smoke", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "wall_time", "limit_value": 300, "limit_unit": "milliseconds", "enforcement_point": "fuzz_corpus_smoke", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "memory", "limit_value": 96, "limit_unit": "mib", "enforcement_point": "fuzz_corpus_smoke", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "artifact_space", "limit_value": 1048576, "limit_unit": "bytes", "enforcement_point": "fuzz_corpus_smoke", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "log_output", "limit_value": 65536, "limit_unit": "bytes", "enforcement_point": "fuzz_corpus_smoke", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "file_descriptors", "limit_value": 8, "limit_unit": "count", "enforcement_point": "fuzz_corpus_smoke", "cleanup_policy": "preserve_evidence"}
+        {
+          "resource_class": "input_bytes",
+          "limit_value": 1048576,
+          "limit_unit": "bytes",
+          "enforcement_point": "fuzz_corpus_smoke",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "cpu_time",
+          "limit_value": 250,
+          "limit_unit": "milliseconds",
+          "enforcement_point": "fuzz_corpus_smoke",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "wall_time",
+          "limit_value": 300,
+          "limit_unit": "milliseconds",
+          "enforcement_point": "fuzz_corpus_smoke",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "memory",
+          "limit_value": 96,
+          "limit_unit": "mib",
+          "enforcement_point": "fuzz_corpus_smoke",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "artifact_space",
+          "limit_value": 1048576,
+          "limit_unit": "bytes",
+          "enforcement_point": "fuzz_corpus_smoke",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "log_output",
+          "limit_value": 65536,
+          "limit_unit": "bytes",
+          "enforcement_point": "fuzz_corpus_smoke",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "file_descriptors",
+          "limit_value": 8,
+          "limit_unit": "count",
+          "enforcement_point": "fuzz_corpus_smoke",
+          "cleanup_policy": "preserve_evidence"
+        }
       ],
-      "resource_limits": {"max_input_bytes": 1048576, "max_wall_ms": 300, "max_memory_mib": 96, "max_artifact_bytes": 1048576, "max_log_bytes": 65536, "max_file_descriptors": 8},
-      "observed_resource_counters": {"input_bytes": 65536, "wall_ms": 40, "cpu_ms": 36, "memory_mib": 40, "artifact_bytes": 65536, "log_bytes": 65536, "file_descriptors": 3},
+      "resource_limits": {
+        "max_input_bytes": 1048576,
+        "max_wall_ms": 300,
+        "max_memory_mib": 96,
+        "max_artifact_bytes": 1048576,
+        "max_log_bytes": 65536,
+        "max_file_descriptors": 8
+      },
+      "observed_resource_counters": {
+        "input_bytes": 65536,
+        "wall_ms": 40,
+        "cpu_ms": 36,
+        "memory_mib": 40,
+        "artifact_bytes": 65536,
+        "log_bytes": 65536,
+        "file_descriptors": 3
+      },
       "cleanup_status": "preserved_artifacts",
       "artifact_paths": ["artifacts/security/logs/excessive_log_output_capped.json"],
       "release_gate_effect": "fail_closed",
@@ -645,17 +961,81 @@
       "expected_classification": "capped",
       "observed_classification": "capped",
       "resource_controls": [
-        {"resource_class": "input_bytes", "limit_value": 1048576, "limit_unit": "bytes", "enforcement_point": "proof_bundle_validation", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "cpu_time", "limit_value": 250, "limit_unit": "milliseconds", "enforcement_point": "proof_bundle_validation", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "wall_time", "limit_value": 300, "limit_unit": "milliseconds", "enforcement_point": "proof_bundle_validation", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "memory", "limit_value": 96, "limit_unit": "mib", "enforcement_point": "proof_bundle_validation", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "artifact_space", "limit_value": 1048576, "limit_unit": "bytes", "enforcement_point": "proof_bundle_validation", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "artifact_count", "limit_value": 32, "limit_unit": "count", "enforcement_point": "proof_bundle_validation", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "log_output", "limit_value": 65536, "limit_unit": "bytes", "enforcement_point": "proof_bundle_validation", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "file_descriptors", "limit_value": 8, "limit_unit": "count", "enforcement_point": "proof_bundle_validation", "cleanup_policy": "preserve_evidence"}
+        {
+          "resource_class": "input_bytes",
+          "limit_value": 1048576,
+          "limit_unit": "bytes",
+          "enforcement_point": "proof_bundle_validation",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "cpu_time",
+          "limit_value": 250,
+          "limit_unit": "milliseconds",
+          "enforcement_point": "proof_bundle_validation",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "wall_time",
+          "limit_value": 300,
+          "limit_unit": "milliseconds",
+          "enforcement_point": "proof_bundle_validation",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "memory",
+          "limit_value": 96,
+          "limit_unit": "mib",
+          "enforcement_point": "proof_bundle_validation",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "artifact_space",
+          "limit_value": 1048576,
+          "limit_unit": "bytes",
+          "enforcement_point": "proof_bundle_validation",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "artifact_count",
+          "limit_value": 32,
+          "limit_unit": "count",
+          "enforcement_point": "proof_bundle_validation",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "log_output",
+          "limit_value": 65536,
+          "limit_unit": "bytes",
+          "enforcement_point": "proof_bundle_validation",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "file_descriptors",
+          "limit_value": 8,
+          "limit_unit": "count",
+          "enforcement_point": "proof_bundle_validation",
+          "cleanup_policy": "preserve_evidence"
+        }
       ],
-      "resource_limits": {"max_input_bytes": 1048576, "max_wall_ms": 300, "max_memory_mib": 96, "max_artifact_bytes": 1048576, "max_log_bytes": 65536, "max_file_descriptors": 8},
-      "observed_resource_counters": {"input_bytes": 32768, "wall_ms": 35, "cpu_ms": 31, "memory_mib": 32, "artifact_bytes": 262144, "artifact_count": 32, "log_bytes": 8192, "file_descriptors": 4},
+      "resource_limits": {
+        "max_input_bytes": 1048576,
+        "max_wall_ms": 300,
+        "max_memory_mib": 96,
+        "max_artifact_bytes": 1048576,
+        "max_log_bytes": 65536,
+        "max_file_descriptors": 8
+      },
+      "observed_resource_counters": {
+        "input_bytes": 32768,
+        "wall_ms": 35,
+        "cpu_ms": 31,
+        "memory_mib": 32,
+        "artifact_bytes": 262144,
+        "artifact_count": 32,
+        "log_bytes": 8192,
+        "file_descriptors": 4
+      },
       "cleanup_status": "preserved_artifacts",
       "artifact_paths": ["artifacts/security/logs/excessive_artifact_count_capped.json"],
       "release_gate_effect": "fail_closed",
@@ -680,16 +1060,73 @@
       "expected_classification": "capped",
       "observed_classification": "capped",
       "resource_controls": [
-        {"resource_class": "input_bytes", "limit_value": 1048576, "limit_unit": "bytes", "enforcement_point": "fuzz_corpus_smoke", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "cpu_time", "limit_value": 250, "limit_unit": "milliseconds", "enforcement_point": "fuzz_corpus_smoke", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "wall_time", "limit_value": 300, "limit_unit": "milliseconds", "enforcement_point": "fuzz_corpus_smoke", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "memory", "limit_value": 96, "limit_unit": "mib", "enforcement_point": "fuzz_corpus_smoke", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "artifact_space", "limit_value": 1048576, "limit_unit": "bytes", "enforcement_point": "fuzz_corpus_smoke", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "log_output", "limit_value": 65536, "limit_unit": "bytes", "enforcement_point": "fuzz_corpus_smoke", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "file_descriptors", "limit_value": 8, "limit_unit": "count", "enforcement_point": "fuzz_corpus_smoke", "cleanup_policy": "preserve_evidence"}
+        {
+          "resource_class": "input_bytes",
+          "limit_value": 1048576,
+          "limit_unit": "bytes",
+          "enforcement_point": "fuzz_corpus_smoke",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "cpu_time",
+          "limit_value": 250,
+          "limit_unit": "milliseconds",
+          "enforcement_point": "fuzz_corpus_smoke",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "wall_time",
+          "limit_value": 300,
+          "limit_unit": "milliseconds",
+          "enforcement_point": "fuzz_corpus_smoke",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "memory",
+          "limit_value": 96,
+          "limit_unit": "mib",
+          "enforcement_point": "fuzz_corpus_smoke",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "artifact_space",
+          "limit_value": 1048576,
+          "limit_unit": "bytes",
+          "enforcement_point": "fuzz_corpus_smoke",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "log_output",
+          "limit_value": 65536,
+          "limit_unit": "bytes",
+          "enforcement_point": "fuzz_corpus_smoke",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "file_descriptors",
+          "limit_value": 8,
+          "limit_unit": "count",
+          "enforcement_point": "fuzz_corpus_smoke",
+          "cleanup_policy": "preserve_evidence"
+        }
       ],
-      "resource_limits": {"max_input_bytes": 1048576, "max_wall_ms": 300, "max_memory_mib": 96, "max_artifact_bytes": 1048576, "max_log_bytes": 65536, "max_file_descriptors": 8},
-      "observed_resource_counters": {"input_bytes": 65536, "wall_ms": 300, "cpu_ms": 240, "memory_mib": 40, "artifact_bytes": 65536, "log_bytes": 16384, "file_descriptors": 3},
+      "resource_limits": {
+        "max_input_bytes": 1048576,
+        "max_wall_ms": 300,
+        "max_memory_mib": 96,
+        "max_artifact_bytes": 1048576,
+        "max_log_bytes": 65536,
+        "max_file_descriptors": 8
+      },
+      "observed_resource_counters": {
+        "input_bytes": 65536,
+        "wall_ms": 300,
+        "cpu_ms": 240,
+        "memory_mib": 40,
+        "artifact_bytes": 65536,
+        "log_bytes": 16384,
+        "file_descriptors": 3
+      },
       "cleanup_status": "preserved_artifacts",
       "artifact_paths": ["artifacts/security/logs/timeout_capped.json"],
       "release_gate_effect": "fail_closed",
@@ -714,16 +1151,73 @@
       "expected_classification": "capped",
       "observed_classification": "capped",
       "resource_controls": [
-        {"resource_class": "input_bytes", "limit_value": 1048576, "limit_unit": "bytes", "enforcement_point": "proof_bundle_validation", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "cpu_time", "limit_value": 250, "limit_unit": "milliseconds", "enforcement_point": "proof_bundle_validation", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "wall_time", "limit_value": 300, "limit_unit": "milliseconds", "enforcement_point": "proof_bundle_validation", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "memory", "limit_value": 96, "limit_unit": "mib", "enforcement_point": "proof_bundle_validation", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "artifact_space", "limit_value": 1048576, "limit_unit": "bytes", "enforcement_point": "proof_bundle_validation", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "log_output", "limit_value": 65536, "limit_unit": "bytes", "enforcement_point": "proof_bundle_validation", "cleanup_policy": "preserve_evidence"},
-        {"resource_class": "file_descriptors", "limit_value": 8, "limit_unit": "count", "enforcement_point": "proof_bundle_validation", "cleanup_policy": "preserve_evidence"}
+        {
+          "resource_class": "input_bytes",
+          "limit_value": 1048576,
+          "limit_unit": "bytes",
+          "enforcement_point": "proof_bundle_validation",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "cpu_time",
+          "limit_value": 250,
+          "limit_unit": "milliseconds",
+          "enforcement_point": "proof_bundle_validation",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "wall_time",
+          "limit_value": 300,
+          "limit_unit": "milliseconds",
+          "enforcement_point": "proof_bundle_validation",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "memory",
+          "limit_value": 96,
+          "limit_unit": "mib",
+          "enforcement_point": "proof_bundle_validation",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "artifact_space",
+          "limit_value": 1048576,
+          "limit_unit": "bytes",
+          "enforcement_point": "proof_bundle_validation",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "log_output",
+          "limit_value": 65536,
+          "limit_unit": "bytes",
+          "enforcement_point": "proof_bundle_validation",
+          "cleanup_policy": "preserve_evidence"
+        },
+        {
+          "resource_class": "file_descriptors",
+          "limit_value": 8,
+          "limit_unit": "count",
+          "enforcement_point": "proof_bundle_validation",
+          "cleanup_policy": "preserve_evidence"
+        }
       ],
-      "resource_limits": {"max_input_bytes": 1048576, "max_wall_ms": 300, "max_memory_mib": 96, "max_artifact_bytes": 1048576, "max_log_bytes": 65536, "max_file_descriptors": 8},
-      "observed_resource_counters": {"input_bytes": 32768, "wall_ms": 32, "cpu_ms": 28, "memory_mib": 32, "artifact_bytes": 65536, "log_bytes": 8192, "file_descriptors": 8},
+      "resource_limits": {
+        "max_input_bytes": 1048576,
+        "max_wall_ms": 300,
+        "max_memory_mib": 96,
+        "max_artifact_bytes": 1048576,
+        "max_log_bytes": 65536,
+        "max_file_descriptors": 8
+      },
+      "observed_resource_counters": {
+        "input_bytes": 32768,
+        "wall_ms": 32,
+        "cpu_ms": 28,
+        "memory_mib": 32,
+        "artifact_bytes": 65536,
+        "log_bytes": 8192,
+        "file_descriptors": 8
+      },
       "cleanup_status": "preserved_artifacts",
       "artifact_paths": ["artifacts/security/logs/file_descriptor_exhaustion_capped.json"],
       "release_gate_effect": "fail_closed",
@@ -931,9 +1425,7 @@
         "log_bytes": 4096
       },
       "cleanup_status": "clean",
-      "artifact_paths": [
-        "artifacts/security/logs/unsafe_repair_operator_command_refused.json"
-      ],
+      "artifact_paths": ["artifacts/security/logs/unsafe_repair_operator_command_refused.json"],
       "release_gate_effect": "fail_closed",
       "remediation_id": "bd-x63b9",
       "reproduction_command": "ffs repair --yes --background-repair --rw <image>",

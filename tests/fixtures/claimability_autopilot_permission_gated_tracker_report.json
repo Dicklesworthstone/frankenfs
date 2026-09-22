@@ -30,10 +30,7 @@
     "groups": [],
     "next_steps": []
   },
-  "local_open_ids": [
-    "bd-autopilot-epic",
-    "bd-autopilot-permissioned"
-  ],
+  "local_open_ids": ["bd-autopilot-epic", "bd-autopilot-permissioned"],
   "local_open_rows": [
     {
       "id": "bd-autopilot-epic",
@@ -73,22 +70,13 @@
     "excluded_foreign_stale_in_progress_count": 0,
     "excluded_foreign_stale_in_progress_ids": [],
     "claimable_ids": [],
-    "local_epic_ids": [
-      "bd-autopilot-epic"
-    ],
+    "local_epic_ids": ["bd-autopilot-epic"],
     "blocked_local_ids": [],
-    "permission_gated_ids": [
-      "bd-autopilot-permissioned"
-    ],
-    "local_nonclaimable_ids": [
-      "bd-autopilot-epic",
-      "bd-autopilot-permissioned"
-    ],
+    "permission_gated_ids": ["bd-autopilot-permissioned"],
+    "local_nonclaimable_ids": ["bd-autopilot-epic", "bd-autopilot-permissioned"],
     "local_in_progress_ids": [],
     "stale_in_progress_ids": [],
-    "next_safe_actions": [
-      "do not run permission-gated rows without the exact required ACK"
-    ]
+    "next_safe_actions": ["do not run permission-gated rows without the exact required ACK"]
   },
   "permission_gated_rows": [
     {

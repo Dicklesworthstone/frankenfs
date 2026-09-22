@@ -2,19 +2,13 @@
   "results": [
     {
       "command": "rch exec -- cargo bench --profile release-perf -p ffs-repair --bench scrub_codec -- raptorq_decode_group_16blocks",
-      "mean": 0.001122100000,
-      "stddev": 0.000012525510,
-      "median": 0.001122100000,
-      "min": 0.001097100000,
-      "max": 0.001146200000,
-      "times": [
-        0.001097100000,
-        0.001122100000,
-        0.001146200000
-      ],
-      "exit_codes": [
-        0
-      ]
+      "mean": 0.0011221,
+      "stddev": 0.00001252551,
+      "median": 0.0011221,
+      "min": 0.0010971,
+      "max": 0.0011462,
+      "times": [0.0010971, 0.0011221, 0.0011462],
+      "exit_codes": [0]
     }
   ],
   "benchmark_mode": "criterion_once",

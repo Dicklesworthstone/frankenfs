@@ -7,10 +7,7 @@
       "scenario_id": "mounted_repair_default_ro_scrub_detect_only",
       "kind": "default_ro_scrub_detect_only",
       "mount_mode": "read_only",
-      "cli_flags": [
-        "--background-scrub-ledger",
-        "artifacts/repair/scrub-ledger.jsonl"
-      ],
+      "cli_flags": ["--background-scrub-ledger", "artifacts/repair/scrub-ledger.jsonl"],
       "ledger_present": false,
       "ledger_id": "",
       "pre_image_hash": "sha256:1111111111111111111111111111111111111111111111111111111111111111",

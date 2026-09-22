@@ -2,9 +2,7 @@
   "schema_version": 1,
   "catalog_id": "frankenfs_mounted_write_errno_budget_v1",
   "bead_id": "bd-6t32i",
-  "catalog_owner_beads": [
-    "bd-6t32i"
-  ],
+  "catalog_owner_beads": ["bd-6t32i"],
   "max_broad_fallback_budget_per_cell": 3,
   "cells": [
     {

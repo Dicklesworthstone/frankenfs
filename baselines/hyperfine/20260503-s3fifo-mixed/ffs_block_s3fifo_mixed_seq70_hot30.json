@@ -2,19 +2,13 @@
   "results": [
     {
       "command": "rch exec -- cargo bench --profile release-perf -p ffs-block --features s3fifo --bench arc_cache -- block_cache_s3fifo_mixed_seq70_hot30",
-      "mean": 0.016650000000,
+      "mean": 0.01665,
       "stddev": 0.000120663265,
-      "median": 0.016650000000,
-      "min": 0.016423000000,
-      "max": 0.016896000000,
-      "times": [
-        0.016423000000,
-        0.016650000000,
-        0.016896000000
-      ],
-      "exit_codes": [
-        0
-      ]
+      "median": 0.01665,
+      "min": 0.016423,
+      "max": 0.016896,
+      "times": [0.016423, 0.01665, 0.016896],
+      "exit_codes": [0]
     }
   ],
   "benchmark_mode": "criterion_once",
