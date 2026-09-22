@@ -16,7 +16,7 @@ use asupersync::Cx;
 use ffs_core::{
     BtrfsMountSelection, Ext4JournalReplayMode, FsOps, InodeAttr, OpenFs, OpenOptions, RequestScope,
 };
-use ffs_fuse::{MountOptions, WritebackCacheMode, mount_background};
+use ffs_fuse::{MountOptions, WritebackCacheMode, mount, mount_background};
 use ffs_harness::load_sparse_fixture;
 use ffs_types::{GroupNumber, InodeNumber};
 use serde_json::Value;
@@ -17890,4 +17890,108 @@ fn fast_commit_crash_image_recovery_fail_closed() {
         }
     }
     emit_scenario_result("fc_crash_image_fail_closed_bd_9m84h", "PASS", None);
+}
+
+// ── bd-d2hdc: mounted eager-GDT forensic reproduction ───────────────────────
+
+/// Diagnostic-only forensic for the one divergence bd-hyysq never attributed:
+/// the original 1000 create+unlink mounted repro produced `e2fsck` rc=4 after
+/// a CLEAN unmount under eager GDT persistence, while the same workload never
+/// reproduced in-process. Production cannot select eager mode (the env switch
+/// is gone; only this thread-local override can), so the failure mode is
+/// unreachable — this test exists purely to attribute or retire the finding.
+///
+/// The eager/deferred override is per-thread; with `worker_threads <= 1` the
+/// FUSE session serves every request on the thread that entered `mount()`,
+/// so pinning the override inside the session thread applies it to every
+/// mounted operation.
+#[test]
+fn gdt_eager_mounted_forensics_bd_d2hdc() {
+    if !fuse_available()
+        || !can_run_sudo()
+        || !command_available("mkfs.ext4")
+        || !command_available("e2fsck")
+        || !command_available("fusermount3")
+    {
+        eprintln!("bd-d2hdc forensic prerequisites unavailable, skipping");
+        return;
+    }
+    let pairs = 1000;
+    for mode in ["deferred", "eager"] {
+        let tmp = TempDir::new().expect("tmpdir");
+        let image = create_empty_ext4_test_image_with_size(tmp.path(), 64 * 1024 * 1024);
+        let mnt = tmp.path().join("mnt");
+        fs::create_dir_all(&mnt).expect("create mountpoint");
+
+        let session_thread = {
+            let image = image.clone();
+            let mnt = mnt.clone();
+            let mode = mode.to_string();
+            std::thread::spawn(move || {
+                ffs_alloc::set_gdt_persistence_deferred_for_test(if mode == "eager" {
+                    Some(false)
+                } else {
+                    Some(true)
+                });
+                let cx = Cx::for_testing();
+                let opts = OpenOptions {
+                    ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+                    mvcc_wal_path: Some(image.with_extension("wal")),
+                    ..OpenOptions::default()
+                };
+                let mut fsys = OpenFs::open_with_options(&cx, &image, &opts)
+                    .expect("open ext4 image for forensic session");
+                fsys.enable_writes(&cx).expect("enable ext4 write support");
+                let mount_opts = MountOptions {
+                    read_only: false,
+                    auto_unmount: false,
+                    ..MountOptions::default()
+                };
+                ffs_fuse::mount(Box::new(fsys), &mnt, &mount_opts)
+                    .expect("blocking forensic mount");
+            })
+        };
+        wait_for_fuse_mount_ready(&mnt);
+
+        for index in 0..pairs {
+            let path = mnt.join(format!("pair{index}"));
+            fs::File::create(&path).expect("create pair file");
+            fs::remove_file(&path).expect("unlink pair file");
+        }
+
+        let unmounted = Command::new("sudo")
+            .args(["-n", "umount"])
+            .arg(&mnt)
+            .status()
+            .expect("spawn umount");
+        assert!(unmounted.success(), "clean unmount ({mode}) failed");
+        session_thread
+            .join()
+            .expect("forensic session thread finished");
+
+        let output = Command::new("e2fsck")
+            .args(["-fn"])
+            .arg(&image)
+            .output()
+            .expect("spawn e2fsck");
+        let rc = output.status.code().unwrap_or(-1);
+        eprintln!(
+            "bd-d2hdc forensic result: mode={mode} pairs={pairs} e2fsck_rc={rc} stdout:\n{}",
+            String::from_utf8_lossy(&output.stdout)
+        );
+        if mode == "deferred" {
+            assert!(rc == 0, "deferred control must be e2fsck-clean (rc {rc})");
+        } else {
+            emit_scenario_result(
+                "gdt_eager_mounted_forensics",
+                "PASS",
+                Some(&format!("pairs={pairs} e2fsck_rc={rc}")),
+            );
+            assert!(
+                rc == 0 || rc == 1,
+                "eager mounted e2fsck rc {rc}: divergence reproduced; \
+                 attribute the transport-layer ordering before closing bd-d2hdc"
+            );
+        }
+    }
 }
