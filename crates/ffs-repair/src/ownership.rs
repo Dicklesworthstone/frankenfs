@@ -2,12 +2,20 @@
 
 //! Lease-based repair ownership for multi-host coordination.
 //!
-//! Implements optimistic ownership with deterministic tiebreak:
+//! Implements lease ownership with serialized record updates:
 //! - Hosts claim ownership by writing a coordination record with TTL
 //! - Expired leases can be claimed by any host
-//! - Conflicts resolved by lexicographic UUID comparison (lower wins)
+//! - Acquisition, renewal, and release hold a shared-filesystem advisory lock
+//! - Record publication syncs both the temporary file and its parent directory
+//!
+//! All writers must use this protocol and a filesystem that supports file
+//! locking. The lock serializes record mutations, not repair I/O: callers must
+//! still renew their lease and stop writing when ownership is lost. Legacy
+//! non-locking writers are not made safe by the retained conflict checks.
 //!
 //! See `docs/design-multi-host-repair.md` for the full protocol design.
+
+mod record_io;
 
 use asupersync::Cx;
 use serde::{Deserialize, Serialize};
@@ -29,7 +37,8 @@ static TEMP_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 /// Persistent coordination record for repair ownership.
 ///
 /// Stored as `.<image>.ffs-repair-owner.json` adjacent to the image file.
-/// Atomic updates via write-to-temp + rename.
+/// Durable atomic updates via sync-temp + rename + sync-parent, under a
+/// separate persistent lock file. Never unlink that lock file while in use.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CoordinationRecord {
     /// Record format version.
@@ -82,7 +91,8 @@ pub struct RepairOwnership {
     lease_ttl: Duration,
 }
 
-/// Guard representing active ownership. Release on drop or explicit release.
+/// Guard representing a lease incarnation. Release explicitly with
+/// [`RepairOwnership::release`]; dropping the guard leaves the lease to expire.
 #[derive(Debug)]
 pub struct OwnershipGuard {
     record_path: PathBuf,
@@ -153,19 +163,20 @@ impl RepairOwnership {
     /// Returns `Acquired` if ownership was successfully claimed,
     /// `OwnedByOther` if another process/host holds a valid lease, or
     /// `ConflictLost` if we lost a tiebreak.
+    ///
+    /// Returns `WouldBlock` while another record mutation holds the lock;
+    /// no unbounded lock wait hides cancellation. A publication error may
+    /// occur after rename, so re-read ownership before retrying repair work.
     pub fn try_acquire(&self, cx: &Cx, image_path: &Path) -> std::io::Result<AcquireResult> {
         cx_checkpoint(cx, "start ownership acquisition")?;
         let record_path = Self::record_path_for(image_path);
+        let transaction = record_io::RecordTransaction::begin(cx, &record_path)?;
         let now = SystemTime::now();
 
         // Read existing record
         cx_checkpoint(cx, "read existing ownership record")?;
-        match std::fs::read_to_string(&record_path) {
-            Ok(contents) => {
-                cx_checkpoint(cx, "parse existing ownership record")?;
-                let existing: CoordinationRecord = serde_json::from_str(&contents)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-
+        match Self::read_record(cx, &record_path) {
+            Ok(existing) => {
                 if !existing.is_expired(now) && !self.is_current_process_claim(&existing) {
                     // Another process or host owns it and the lease is valid.
                     let claimed =
@@ -193,15 +204,15 @@ impl RepairOwnership {
 
                 // Lease expired or we already own it — claim.
                 let (new_gen, new_lease_version) = next_claim_counters(&existing)?;
-                self.write_claim(cx, &record_path, new_gen, new_lease_version)?;
+                self.write_claim(cx, &transaction, new_gen, new_lease_version)?;
 
                 // Post-write verification: re-read to detect conflicts
-                self.verify_or_tiebreak(cx, &record_path, new_gen, new_lease_version)
+                self.verify_or_tiebreak(cx, &transaction, new_gen, new_lease_version)
             }
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
                 // No record — claim with generation 1
-                self.write_claim(cx, &record_path, 1, 1)?;
-                self.verify_or_tiebreak(cx, &record_path, 1, 1)
+                self.write_claim(cx, &transaction, 1, 1)?;
+                self.verify_or_tiebreak(cx, &transaction, 1, 1)
             }
             Err(e) => Err(e),
         }
@@ -211,7 +222,7 @@ impl RepairOwnership {
     fn write_claim(
         &self,
         cx: &Cx,
-        record_path: &Path,
+        transaction: &record_io::RecordTransaction,
         generation: u64,
         lease_version: u64,
     ) -> std::io::Result<()> {
@@ -228,15 +239,7 @@ impl RepairOwnership {
             groups_owned: Vec::new(),
         };
 
-        let json = serde_json::to_string_pretty(&record).map_err(std::io::Error::other)?;
-
-        // Atomic write: write to temp, then rename
-        cx_checkpoint(cx, "write temporary ownership claim")?;
-        let tmp_path = temp_record_path(record_path)?;
-        std::fs::write(&tmp_path, &json)?;
-        cx_checkpoint(cx, "commit ownership claim")?;
-        std::fs::rename(&tmp_path, record_path)?;
-        cx_checkpoint(cx, "finish ownership claim")?;
+        transaction.publish(cx, &record)?;
 
         debug!(
             target: "ffs::repair::ownership",
@@ -253,10 +256,11 @@ impl RepairOwnership {
     fn verify_or_tiebreak(
         &self,
         cx: &Cx,
-        record_path: &Path,
+        transaction: &record_io::RecordTransaction,
         expected_gen: u64,
         expected_lease_version: u64,
     ) -> std::io::Result<AcquireResult> {
+        let record_path = transaction.path();
         let current = Self::read_record(cx, record_path)?;
 
         if self.claim_matches(&current, expected_gen, expected_lease_version) {
@@ -267,7 +271,7 @@ impl RepairOwnership {
         }
 
         if self.should_rewrite_conflicting_claim(&current, expected_gen) {
-            self.write_claim(cx, record_path, expected_gen, expected_lease_version)?;
+            self.write_claim(cx, transaction, expected_gen, expected_lease_version)?;
             let record = Self::read_record(cx, record_path)?;
             return Ok(self.acquisition_result_for_current_claim(
                 record_path,
@@ -281,11 +285,7 @@ impl RepairOwnership {
     }
 
     fn read_record(cx: &Cx, record_path: &Path) -> std::io::Result<CoordinationRecord> {
-        cx_checkpoint(cx, "read ownership record")?;
-        let contents = std::fs::read_to_string(record_path)?;
-        cx_checkpoint(cx, "parse ownership record")?;
-        serde_json::from_str(&contents)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))
+        record_io::read_record(cx, record_path)
     }
 
     fn claim_matches(
@@ -365,6 +365,7 @@ impl RepairOwnership {
     /// Renew an existing lease.
     pub fn renew(&self, cx: &Cx, guard: &mut OwnershipGuard) -> std::io::Result<()> {
         cx_checkpoint(cx, "start ownership renewal")?;
+        let transaction = record_io::RecordTransaction::begin(cx, &guard.record_path)?;
         let current = Self::read_record(cx, &guard.record_path)?;
         if !Self::same_lease_incarnation(&current, &guard.record) {
             return Err(std::io::Error::new(
@@ -386,12 +387,7 @@ impl RepairOwnership {
         cx_checkpoint(cx, "prepare ownership renewal")?;
         let mut renewed = guard.record.clone();
         renewed.renew();
-        let json = serde_json::to_string_pretty(&renewed).map_err(std::io::Error::other)?;
-        let tmp_path = temp_record_path(&guard.record_path)?;
-        cx_checkpoint(cx, "write temporary ownership renewal")?;
-        std::fs::write(&tmp_path, &json)?;
-        cx_checkpoint(cx, "commit ownership renewal")?;
-        std::fs::rename(&tmp_path, &guard.record_path)?;
+        transaction.publish(cx, &renewed)?;
         guard.record = renewed;
         cx_checkpoint(cx, "finish ownership renewal")?;
         debug!(
@@ -407,14 +403,12 @@ impl RepairOwnership {
     #[allow(clippy::needless_pass_by_value)]
     pub fn release(cx: &Cx, guard: OwnershipGuard) -> std::io::Result<()> {
         cx_checkpoint(cx, "start ownership release")?;
-        let contents = match std::fs::read_to_string(&guard.record_path) {
-            Ok(contents) => contents,
+        let transaction = record_io::RecordTransaction::begin(cx, &guard.record_path)?;
+        let current = match Self::read_record(cx, &guard.record_path) {
+            Ok(current) => current,
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(e) => return Err(e),
         };
-        cx_checkpoint(cx, "parse ownership release record")?;
-        let current: CoordinationRecord = serde_json::from_str(&contents)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         if !Self::same_lease_incarnation(&current, &guard.record) {
             return Err(std::io::Error::new(
                 std::io::ErrorKind::PermissionDenied,
@@ -434,31 +428,21 @@ impl RepairOwnership {
 
         // Remove the coordination record so the next host can claim immediately
         // instead of waiting for TTL expiry.
-        cx_checkpoint(cx, "remove ownership record")?;
-        match std::fs::remove_file(&guard.record_path) {
-            Ok(()) => {
-                cx_checkpoint(cx, "finish ownership release")?;
-                info!(
-                    target: "ffs::repair::ownership",
-                    host_id = %guard.record.host_id,
-                    "ownership_released"
-                );
-                Ok(())
-            }
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
-            Err(e) => Err(e),
-        }
+        transaction.remove(cx)?;
+        info!(
+            target: "ffs::repair::ownership",
+            host_id = %guard.record.host_id,
+            "ownership_released"
+        );
+        Ok(())
     }
 
     /// Check if we currently own the image (without modifying the record).
     pub fn is_owned_by_us(&self, cx: &Cx, image_path: &Path) -> std::io::Result<bool> {
         cx_checkpoint(cx, "start ownership status check")?;
         let record_path = Self::record_path_for(image_path);
-        match std::fs::read_to_string(&record_path) {
-            Ok(contents) => {
-                cx_checkpoint(cx, "parse ownership status record")?;
-                let record: CoordinationRecord = serde_json::from_str(&contents)
-                    .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
+        match Self::read_record(cx, &record_path) {
+            Ok(record) => {
                 let now = SystemTime::now();
                 Ok(self.is_current_process_claim(&record) && !record.is_expired(now))
             }
