@@ -35,6 +35,10 @@ fn read_json(path: &Path) -> TestResult<Value> {
 }
 
 fn fixture_reference_time(path: &str) -> TestResult<i64> {
+    let semantic = fixture_semantic_commit_time(path)?;
+    if let Some(timestamp) = semantic {
+        return Ok(timestamp);
+    }
     let root = repo_root()?;
     let output = Command::new("git")
         .args(["log", "-n1", "--format=%ct", "--", path])
@@ -45,7 +49,7 @@ fn fixture_reference_time(path: &str) -> TestResult<i64> {
         let modified = fs::metadata(root.join(path))
             .map_err(|err| test_error(format!("metadata for {path}: {err}")))?
             .modified()
-            .map_err(|err| test_error(format!("modified time for {path}: {err}")))?;
+            .map_err(|err| test_error(format!("{path} modified before unix epoch: {err}")))?;
         return Ok(i64::try_from(
             modified
                 .duration_since(UNIX_EPOCH)
@@ -60,6 +64,67 @@ fn fixture_reference_time(path: &str) -> TestResult<i64> {
         .parse()
         .map_err(|err| test_error(format!("git timestamp for {path} should parse: {err}")))?;
     Ok(timestamp)
+}
+
+/// Newest commit at which `path`'s PARSED JSON content changed (bd-awvjj).
+///
+/// Formatting-only rewrites (pretty-printing, whitespace, key-independent
+/// layout) leave `serde_json::Value` equality intact, so they do not move the
+/// semantic reference time. The freshness invariant this test enforces —
+/// profile provenance must postdate the fixture content it was measured
+/// against — keeps its full strength against every content change while no
+/// longer false-firing on pure byte churn (win). The admitted cost: an edit
+/// that changes parsed content still counts even if semantically trivial
+/// (e.g. a number reformatted 1.0 -> 1) — the gate errs strict, never loose.
+fn fixture_semantic_commit_time(path: &str) -> TestResult<Option<i64>> {
+    let root = repo_root()?;
+    let log = Command::new("git")
+        .args(["log", "--format=%H %ct", "--", path])
+        .current_dir(&root)
+        .output()
+        .map_err(|err| test_error(format!("git log for {path}: {err}")))?;
+    if !log.status.success() {
+        return Ok(None);
+    }
+    let stdout = String::from_utf8(log.stdout)
+        .map_err(|err| test_error(format!("git log for {path} should be utf8: {err}")))?;
+    let commits: Vec<(&str, i64)> = stdout
+        .lines()
+        .filter_map(|line| line.split_once(' '))
+        .filter_map(|(hash, ts)| ts.parse::<i64>().ok().map(|t| (hash, t)))
+        .collect();
+    if commits.is_empty() {
+        return Ok(None);
+    }
+    let content_at = |hash: &str| -> TestResult<Option<serde_json::Value>> {
+        let blob = Command::new("git")
+            .args(["show", &format!("{hash}:{path}")])
+            .current_dir(&root)
+            .output()
+            .map_err(|err| test_error(format!("git show for {path}: {err}")))?;
+        if !blob.status.success() {
+            // File absent at this revision (creation or deletion boundary):
+            // treat as a content change.
+            return Ok(None);
+        }
+        Ok(serde_json::from_slice(&blob.stdout).ok())
+    };
+    let contents: Vec<Option<serde_json::Value>> = commits
+        .iter()
+        .map(|(hash, _)| content_at(hash))
+        .collect::<TestResult<Vec<_>>>()?;
+    // Walk newest -> oldest over adjacent pairs. The first pair whose parsed
+    // content differs attributes the last semantic change to the NEWER commit
+    // of the pair (the one that introduced the difference).
+    for index in 0..commits.len() - 1 {
+        match (&contents[index], &contents[index + 1]) {
+            (Some(newer), Some(older)) if newer == older => {}
+            _ => return Ok(Some(commits[index].1)),
+        }
+    }
+    // Every revision parsed identically: content was born once and only
+    // reformatted since. The semantic reference is the birth commit.
+    Ok(commits.last().map(|(_, ts)| *ts))
 }
 
 fn iso8601_to_epoch(timestamp: &str) -> TestResult<i64> {

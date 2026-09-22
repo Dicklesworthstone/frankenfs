@@ -1101,6 +1101,25 @@ impl FsOps for OpenFs {
         }
     }
 
+    fn install_open_handle_oracle(&self, oracle: crate::vfs::OpenHandleOracle) {
+        // Inherent method (same name): explicit path documents the intent.
+        Self::install_open_handle_oracle(self, oracle);
+    }
+
+    fn finalize_unlinked_inode(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+    ) -> ffs_error::Result<bool> {
+        match &self.flavor {
+            FsFlavor::Ext4(_) => self.ext4_finalize_unlinked_inode_impl(cx, ino),
+            // btrfs keeps its existing immediate-reclaim unlink behavior; the
+            // bd-90aey deferred-reclaim contract is ext4-scoped for now.
+            FsFlavor::Btrfs(_) => Ok(false),
+        }
+    }
+
     fn rename(
         &self,
         cx: &Cx,

@@ -705,8 +705,9 @@ impl BtrfsReadDevices {
     /// one copy in every mirrored stripe group. Other profiles need all devices.
     fn validate_read_coverage(&self, chunks: &[BtrfsChunkEntry]) -> Result<(), FfsError> {
         use ffs_ondisk::chunk_type_flags::{
-            BTRFS_BLOCK_GROUP_RAID1, BTRFS_BLOCK_GROUP_RAID1C3, BTRFS_BLOCK_GROUP_RAID1C4,
-            BTRFS_BLOCK_GROUP_RAID5, BTRFS_BLOCK_GROUP_RAID6, BTRFS_BLOCK_GROUP_RAID10, RAID_MASK,
+            BTRFS_BLOCK_GROUP_METADATA, BTRFS_BLOCK_GROUP_RAID1, BTRFS_BLOCK_GROUP_RAID1C3,
+            BTRFS_BLOCK_GROUP_RAID1C4, BTRFS_BLOCK_GROUP_RAID5, BTRFS_BLOCK_GROUP_RAID6,
+            BTRFS_BLOCK_GROUP_RAID10, BTRFS_BLOCK_GROUP_SYSTEM, RAID_MASK,
         };
         for chunk in chunks {
             let present = chunk
@@ -749,9 +750,27 @@ impl BtrfsReadDevices {
                 // bd-hk5w3: RAID5 tolerates one absent stripe and RAID6 two —
                 // reads on the degraded set are rebuilt from the surviving
                 // slots plus parity (XOR for a single erasure) and verified
-                // against the data checksum before they are served.
-                BTRFS_BLOCK_GROUP_RAID5 => present + 1 >= chunk.stripes.len(),
-                BTRFS_BLOCK_GROUP_RAID6 => present + 2 >= chunk.stripes.len(),
+                // against the data checksum before they are served. That
+                // tolerance is DATA-only: tree-node reads have no parity
+                // reconstruction yet, so a METADATA/SYSTEM chunk missing any
+                // stripe would admit a mount it cannot actually serve
+                // (bd-90aey — degraded open succeeded, then the first tree
+                // read failed with `insufficient data`). Refuse those.
+                BTRFS_BLOCK_GROUP_RAID5 | BTRFS_BLOCK_GROUP_RAID6 => {
+                    let erasures = if chunk.chunk_type & RAID_MASK == BTRFS_BLOCK_GROUP_RAID5 {
+                        1
+                    } else {
+                        2
+                    };
+                    let carries_tree_nodes = chunk.chunk_type
+                        & (BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_SYSTEM)
+                        != 0;
+                    if carries_tree_nodes {
+                        present == chunk.stripes.len()
+                    } else {
+                        present + erasures >= chunk.stripes.len()
+                    }
+                }
                 _ => present > 0 && present == chunk.stripes.len(),
             };
             if !readable {
@@ -1777,6 +1796,10 @@ pub struct OpenFs {
     pub numa_allocation_policy: NumaAllocationPolicy,
     /// Latched when an ext4 write I/O error forces a read-only remount.
     ext4_forced_read_only: AtomicBool,
+    /// Runtime oracle reporting how many open handles pin an inode
+    /// (bd-90aey orphan-on-unlink). Installed by the FUSE adapter at mount
+    /// time; empty in library mode, where unlink keeps immediate reclaim.
+    ext4_open_handle_oracle: std::sync::OnceLock<crate::vfs::OpenHandleOracle>,
     /// Block device for I/O operations.
     dev: Arc<dyn ByteDevice>,
     /// Explicitly attached btrfs devices; writable mounts use the single-device path.
@@ -6183,6 +6206,7 @@ impl OpenFs {
             ext4_data_err_policy: options.ext4_data_err_policy,
             numa_allocation_policy: options.numa_allocation_policy.clone(),
             ext4_forced_read_only: AtomicBool::new(false),
+            ext4_open_handle_oracle: std::sync::OnceLock::new(),
             dev,
             btrfs_devices,
             mvcc_store,
@@ -7161,6 +7185,56 @@ impl OpenFs {
         }
 
         Ok(inodes)
+    }
+
+    /// Read the on-disk orphan-list head (`s_last_orphan`) fresh from the
+    /// superblock block (bd-90aey).
+    ///
+    /// Runtime orphan mutations (push in unlink, splice in finalize) run under
+    /// the allocation lock and go straight to the device so the list stays
+    /// authoritative without touching the mount-time flavor snapshot that
+    /// `maybe_recover_ext4_orphans` consumes.
+    fn ext4_read_orphan_head(&self, cx: &Cx) -> Result<u32, FfsError> {
+        let (sb_block, sb_off) = self.ext4_superblock_location();
+        let block_dev = self.direct_block_device_adapter();
+        let block_data = block_dev.read_block(cx, sb_block)?.into_inner();
+        Ok(u32::from_le_bytes(
+            block_data[sb_off + 0xE8..sb_off + 0xEC]
+                .try_into()
+                .expect("s_last_orphan is a fixed 4-byte field"),
+        ))
+    }
+
+    /// Patch the on-disk orphan-list head (`s_last_orphan`) with checksum
+    /// refresh (bd-90aey). Callers hold the allocation lock so concurrent
+    /// orphan pushes/finalizes serialize.
+    ///
+    /// Takes `&self` and leaves the mount-time flavor snapshot untouched:
+    /// runtime paths re-read the head from the device (see
+    /// [`Self::ext4_read_orphan_head`]), and only mount-time recovery — which
+    /// runs before any transport is served and owns `&mut self` — rewrites the
+    /// cached copy via [`Self::clear_ext4_orphan_state`].
+    fn ext4_write_orphan_head(&self, cx: &Cx, new_head: u32) -> Result<(), FfsError> {
+        let (sb_block, sb_off) = self.ext4_superblock_location();
+        let has_metadata_csum = self
+            .ext4_superblock()
+            .is_some_and(ffs_ondisk::Ext4Superblock::has_metadata_csum);
+        let mut block_data = {
+            let block_dev = self.direct_block_device_adapter();
+            block_dev.read_block(cx, sb_block)?.into_inner()
+        };
+        block_data[sb_off + 0xE8..sb_off + 0xEC].copy_from_slice(&new_head.to_le_bytes());
+        if has_metadata_csum {
+            let csum = ffs_ondisk::ext4::ext4_chksum_skip_zero_tail(
+                !0u32,
+                &block_data[sb_off..sb_off + EXT4_SB_CHECKSUM_OFFSET],
+            );
+            block_data[sb_off + EXT4_SB_CHECKSUM_OFFSET..sb_off + EXT4_SB_CHECKSUM_OFFSET + 4]
+                .copy_from_slice(&csum.to_le_bytes());
+        }
+        let block_dev = self.direct_block_device_adapter();
+        block_dev.write_block(cx, sb_block, &block_data)?;
+        Ok(())
     }
 
     fn clear_ext4_orphan_state(&mut self, cx: &Cx) -> Result<(), FfsError> {
@@ -23106,6 +23180,22 @@ impl OpenFs {
         self.ext4_alloc_state.as_ref().ok_or(FfsError::ReadOnly)
     }
 
+    /// Install the transport's open-handle-count oracle (bd-90aey).
+    ///
+    /// See [`crate::vfs::OpenHandleOracle`]. Idempotent: the first install
+    /// wins; later calls are accepted and silently ignored so a re-mounted
+    /// adapter cannot silently swap counting state under in-flight unlinks.
+    pub fn install_open_handle_oracle(&self, oracle: crate::vfs::OpenHandleOracle) {
+        let _ = self.ext4_open_handle_oracle.set(oracle);
+    }
+
+    /// Live open-handle count for `ino` (0 when no oracle is installed).
+    fn ext4_open_handle_count(&self, ino: InodeNumber) -> u64 {
+        self.ext4_open_handle_oracle
+            .get()
+            .map_or(0, |oracle| (oracle)(ino))
+    }
+
     /// POSIX EEXIST pre-check for create/mkdir-style operations.
     ///
     /// For a hash-indexed (htree) directory the insert path (`ext4_add_dir_entry`
@@ -26075,7 +26165,66 @@ impl OpenFs {
                     persist_ctx,
                 } = &mut *alloc;
                 if child_upd.links_count == 0 {
-                    if sharded_inode_free {
+                    // bd-90aey orphan-on-unlink: POSIX (and kernel ext4) keeps an
+                    // unlinked-but-open inode fully alive until its LAST open
+                    // handle closes — `fstat`/`read`/`write` through the fd must
+                    // keep working with `nlink` 0, and only that final close
+                    // reclaims storage. When a transport oracle reports open
+                    // handles pinning `child_ino`, orphan instead of freeing:
+                    // write the inode with `nlink` 0 and splice it onto the
+                    // on-disk orphan list (`s_last_orphan` + `i_dtime` next
+                    // links, the legacy layout `maybe_recover_ext4_orphans`
+                    // walks). The transport finalizes at last close via
+                    // `finalize_unlinked_inode`; a crash leaves the inode to
+                    // mount-time recovery — never a dangling dirent (the
+                    // removal above already persisted first). Directories stay
+                    // on the immediate-free path: FUSE cannot hold an open
+                    // directory handle through rmdir here, and the recovery
+                    // walker would reclaim them identically anyway.
+                    let open_handles = if expect_dir {
+                        0
+                    } else {
+                        self.ext4_open_handle_count(child_ino)
+                    };
+                    if open_handles > 0 {
+                        // Read the list head from the on-disk superblock (the
+                        // alloc lock we hold serializes orphan mutations; the
+                        // flavor copy is only a mount-time snapshot).
+                        let head = self.ext4_read_orphan_head(cx)?;
+                        child_upd.dtime = head;
+                        if sharded_inode_free {
+                            let loc = ffs_inode::locate_inode(child_ino, geo, groups).ok_or_else(
+                                || FfsError::Corruption {
+                                    block: 0,
+                                    detail: format!(
+                                        "sharded unlink: inode {child_ino} out of range"
+                                    ),
+                                },
+                            )?;
+                            ffs_inode::write_inode_at_slot_scoped(
+                                cx,
+                                tx_dev,
+                                loc,
+                                usize::from(geo.inode_size),
+                                child_ino,
+                                &child_upd,
+                                csum_seed,
+                            )?;
+                        } else {
+                            ffs_inode::write_inode(
+                                cx, tx_dev, geo, groups, child_ino, &child_upd, csum_seed,
+                            )?;
+                        }
+                        self.ext4_write_orphan_head(
+                            cx,
+                            u32::try_from(child_ino.0).map_err(|_| FfsError::Corruption {
+                                block: 0,
+                                detail: format!(
+                                    "orphan push: inode {child_ino} exceeds ext4 range"
+                                ),
+                            })?,
+                        )?;
+                    } else if sharded_inode_free {
                         // Release storage WITHOUT the inode write-back, then stage
                         // the zeroed slot under a slot-scoped merge proof. The
                         // write-back is split out because `write_inode` rewrites
@@ -26220,6 +26369,182 @@ impl OpenFs {
 
             Ok(())
         })()
+    }
+
+    /// Reclaim storage for an orphaned inode whose last open handle just
+    /// closed (bd-90aey orphan-on-unlink).
+    ///
+    /// Splices `ino` off the on-disk orphan list, then runs the same
+    /// device-level free the unlink fast path uses for un-pinned inodes.
+    /// Returns `Ok(true)` when storage was reclaimed now; `Ok(false)` when
+    /// `ino` is not on the orphan list (still linked, never orphaned, or
+    /// already final). The allocation lock serializes the walk/splice against
+    /// unlink's push, and the superblock head patch against other finalizes.
+    #[allow(clippy::significant_drop_tightening, clippy::too_many_lines)]
+    fn ext4_finalize_unlinked_inode_impl(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+    ) -> ffs_error::Result<bool> {
+        if self.ext4_superblock().is_none() {
+            return Ok(false);
+        }
+        let ino_u32 = u32::try_from(ino.0).map_err(|_| FfsError::Corruption {
+            block: 0,
+            detail: format!("finalize: inode {ino} exceeds the ext4 32-bit inode range"),
+        })?;
+        let alloc_mutex = self.require_alloc_state()?;
+        let csum_seed = self
+            .ext4_superblock()
+            .map(ffs_ondisk::Ext4Superblock::csum_seed)
+            .unwrap_or_default();
+        let (tstamp_secs, _tstamp_nanos) = Self::now_timestamp();
+        let mut alloc = alloc_mutex.write();
+
+        // Walk the orphan list to find the victim and its predecessor. The
+        // dtime field of an orphan doubles as the next-pointer, mirroring the
+        // legacy layout `collect_ext4_orphan_list_lenient` walks at mount.
+        let mut prev: Option<u32> = None;
+        let mut next = self.ext4_read_orphan_head(cx)?;
+        let mut found = false;
+        let mut steps = 0_u64;
+        while next != 0 {
+            if next == ino_u32 {
+                found = true;
+                break;
+            }
+            prev = Some(next);
+            let link_inode = self.read_inode_raw(cx, InodeNumber(u64::from(next)))?;
+            next = link_inode.dtime;
+            steps = steps.saturating_add(1);
+            if steps > u64::from(u32::MAX) {
+                // Cycle guard in the spirit of the mount-time lenient walker.
+                break;
+            }
+        }
+        if !found {
+            return Ok(false);
+        }
+
+        let mut child_upd = self.read_inode(cx, ino)?;
+        let next_after = child_upd.dtime;
+        // Defensive: a zero-link orphan can never regain links through the
+        // namespace (its name is gone), so this is unreachable today. If it
+        // ever fires, splice the list but keep storage — recovery must not
+        // free a live inode.
+        let already_live = child_upd.links_count != 0;
+
+        let block_dev = self.block_device_adapter();
+        let tx_dev: &dyn ffs_block::BlockDevice = &block_dev;
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        let sharded_inode_free = self.bhh0i_sharded_ops_active();
+        #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+        let sharded_inode_free = false;
+
+        child_upd.dtime = 0;
+        let splice_result;
+        {
+            let Ext4AllocState {
+                geo,
+                groups,
+                persist_ctx,
+            } = &mut *alloc;
+            if !already_live {
+                if sharded_inode_free {
+                    let is_dir = ffs_inode::release_inode_storage_deferring_writeback(
+                        cx,
+                        tx_dev,
+                        geo,
+                        groups,
+                        ino,
+                        &mut child_upd,
+                        tstamp_secs,
+                        persist_ctx,
+                    )?;
+                    let loc = ffs_inode::locate_inode(ino, geo, groups).ok_or_else(|| {
+                        FfsError::Corruption {
+                            block: 0,
+                            detail: format!("finalize: inode {ino} out of range"),
+                        }
+                    })?;
+                    ffs_inode::write_inode_at_slot_scoped(
+                        cx,
+                        tx_dev,
+                        loc,
+                        usize::from(geo.inode_size),
+                        ino,
+                        &child_upd,
+                        csum_seed,
+                    )?;
+                    #[cfg(feature = "bhh0i_sharded_alloc")]
+                    self.ext4_sharded_free_inode(cx, tx_dev, ino, is_dir)?;
+                    #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+                    let _ = is_dir;
+                } else {
+                    ffs_inode::delete_inode(
+                        cx,
+                        tx_dev,
+                        geo,
+                        groups,
+                        ino,
+                        &mut child_upd,
+                        csum_seed,
+                        tstamp_secs,
+                        persist_ctx,
+                    )?;
+                }
+            }
+            // Splice the list while still holding the alloc guard so the whole
+            // finalize is serialized against unlink's push. After the free: a
+            // crash mid-finalize leaves an already-freed inode on the list,
+            // which mount recovery skips the same way it skips any freed slot.
+            splice_result =
+                self.ext4_splice_orphan_list(cx, prev, next_after, geo, groups, csum_seed);
+        }
+        splice_result?;
+
+        trace!(
+            target: "ffs::write",
+            op = "finalize_unlinked",
+            child = ino.0,
+            "deferred inode reclaimed after last open handle"
+        );
+        Ok(true)
+    }
+
+    /// Relink the orphan list around a removed entry (bd-90aey).
+    ///
+    /// `prev == None` means the victim was the head; otherwise the predecessor
+    /// orphan's `dtime` next-pointer is rewritten. Callers hold the allocation
+    /// lock and pass the guard-derived alloc state down — re-acquiring the
+    /// lock here would self-deadlock.
+    fn ext4_splice_orphan_list(
+        &self,
+        cx: &Cx,
+        prev: Option<u32>,
+        victim_next: u32,
+        geo: &FsGeometry,
+        groups: &[GroupStats],
+        csum_seed: u32,
+    ) -> ffs_error::Result<()> {
+        match prev {
+            None => self.ext4_write_orphan_head(cx, victim_next),
+            Some(prev_ino) => {
+                let mut prev_inode = self.read_inode_raw(cx, InodeNumber(u64::from(prev_ino)))?;
+                prev_inode.dtime = victim_next;
+                let block_dev = self.block_device_adapter();
+                ffs_inode::write_inode(
+                    cx,
+                    &block_dev,
+                    geo,
+                    groups,
+                    InodeNumber(u64::from(prev_ino)),
+                    &prev_inode,
+                    csum_seed,
+                )?;
+                Ok(())
+            }
+        }
     }
 
     /// Create a hard link in `new_parent/new_name` to existing inode `ino`.
@@ -54130,6 +54455,46 @@ mod tests {
                     "coverage for attached {attached:?}"
                 );
             }
+
+            // bd-90aey: a METADATA-flagged RAID5/6 chunk gets NO erasure
+            // tolerance — tree-node reads have no parity reconstruction, so a
+            // mounted set missing any stripe of a metadata chunk must be
+            // refused even when the same set is admitted for a data chunk.
+            let mut metadata_chunk = chunk.clone();
+            metadata_chunk.chunk_type |= ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_METADATA;
+            for attached in [vec![1, 2], vec![1]] {
+                if attached.iter().any(|d| *d > u64::from(num_stripes)) {
+                    continue;
+                }
+                let devices = make_devices(
+                    &attached,
+                    num_stripes,
+                    corrupt_primary,
+                    logical,
+                    Arc::clone(&slots),
+                );
+                assert!(
+                    !devices
+                        .validate_read_coverage(std::slice::from_ref(&metadata_chunk))
+                        .is_ok(),
+                    "degraded metadata chunk ({attached:?} of {num_stripes}) must be refused"
+                );
+            }
+            let mut system_chunk = chunk.clone();
+            system_chunk.chunk_type |= ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_SYSTEM;
+            let devices = make_devices(
+                &vec![1, 2][..num_stripes.min(2) as usize],
+                num_stripes,
+                corrupt_primary,
+                logical,
+                Arc::clone(&slots),
+            );
+            assert!(
+                !devices
+                    .validate_read_coverage(std::slice::from_ref(&system_chunk))
+                    .is_ok(),
+                "degraded SYSTEM chunk must be refused"
+            );
 
             // Degraded data read: the data slot's device is ABSENT and the
             // read must be rebuilt from the survivors plus parity.

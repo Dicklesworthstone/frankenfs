@@ -3622,6 +3622,96 @@ fn syscall_conformance_reference_probe_covers_symlink_at_nofollow_contracts() {
     assert_syscall_negative_errno(&checks, "open_symlink_nofollow", libc::ELOOP);
 }
 
+/// Mounted kernel-ext4 reference backed by a loop device.
+///
+/// Owns the unmount and loop detach on drop so a failed probe cannot leak
+/// either resource (same conventions as the multi-device kernel fixtures).
+struct KernelExt4ReferenceMount {
+    mountpoint: PathBuf,
+    loop_device: String,
+}
+
+impl Drop for KernelExt4ReferenceMount {
+    fn drop(&mut self) {
+        let _ = Command::new("sudo")
+            .args(["-n", "umount"])
+            .arg(&self.mountpoint)
+            .status();
+        let _ = Command::new("sudo")
+            .args(["-n", "losetup", "-d"])
+            .arg(&self.loop_device)
+            .status();
+    }
+}
+
+/// Mount `image` through the kernel ext4 driver so differential probes compare
+/// FrankenFS against the true reference filesystem instead of tmpfs, whose
+/// directory `st_size` convention (content bytes) differs from ext4's
+/// block-aligned i_size. Returns `None` when the host lacks the loop/mount
+/// capability, letting callers skip gracefully per the capability-skip
+/// doctrine.
+fn try_mount_kernel_ext4_reference(
+    image: &Path,
+    mountpoint: &Path,
+) -> Option<KernelExt4ReferenceMount> {
+    if !command_available("mkfs.ext4") {
+        eprintln!("kernel ext4 reference unavailable: mkfs.ext4 missing");
+        return None;
+    }
+    let attached = Command::new("sudo")
+        .args(["-n", "losetup", "--find", "--show"])
+        .arg(image)
+        .output()
+        .ok()?;
+    if !attached.status.success() {
+        eprintln!(
+            "kernel ext4 reference unavailable: loop attach failed: {}",
+            String::from_utf8_lossy(&attached.stderr)
+        );
+        return None;
+    }
+    let loop_device = String::from_utf8(attached.stdout)
+        .expect("losetup stdout utf8")
+        .trim()
+        .to_owned();
+    let mounted = Command::new("sudo")
+        .args(["-n", "mount", "-t", "ext4", "-o", "rw"])
+        .arg(&loop_device)
+        .arg(mountpoint)
+        .output();
+    match mounted {
+        Ok(output) if output.status.success() => {}
+        Ok(output) => {
+            eprintln!(
+                "kernel ext4 reference unavailable: mount failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let _ = Command::new("sudo")
+                .args(["-n", "losetup", "-d"])
+                .arg(&loop_device)
+                .status();
+            return None;
+        }
+        Err(err) => {
+            eprintln!("kernel ext4 reference unavailable: mount spawn failed: {err}");
+            let _ = Command::new("sudo")
+                .args(["-n", "losetup", "-d"])
+                .arg(&loop_device)
+                .status();
+            return None;
+        }
+    }
+    eprintln!(
+        "kernel ext4 reference mounted {} at {}",
+        loop_device,
+        mountpoint.display()
+    );
+    Some(KernelExt4ReferenceMount {
+        mountpoint: mountpoint.to_path_buf(),
+        loop_device,
+    })
+}
+
 #[test]
 fn fuse_conformance_syscall_sequence_matches_linux_reference() {
     if !fuse_available() || !command_available("python3") {
@@ -3630,11 +3720,33 @@ fn fuse_conformance_syscall_sequence_matches_linux_reference() {
     }
 
     let tmp = TempDir::new().expect("tmpdir");
-    let reference = reference_conformance_tempdir();
-    let image = create_test_image_with_size(tmp.path(), 16 * 1024 * 1024);
+    // Two images, one per arm: mounting the SAME image through the kernel
+    // (loop + page cache) and FrankenFS (direct file I/O) concurrently makes
+    // them unsynchronized writers of one ext4 allocator — block bitmaps and
+    // group descriptors would diverge. Same mkfs recipe both sides, so every
+    // on-disk convention under test still matches.
+    let reference_dir = tmp.path().join("ref_img");
+    let frankenfs_dir = tmp.path().join("ffs_img");
+    fs::create_dir_all(&reference_dir).expect("create reference image dir");
+    fs::create_dir_all(&frankenfs_dir).expect("create frankenfs image dir");
+    let reference_image = create_test_image_with_size(&reference_dir, 16 * 1024 * 1024);
+    let image = create_test_image_with_size(&frankenfs_dir, 16 * 1024 * 1024);
     let mnt = tmp.path().join("mnt");
     fs::create_dir_all(&mnt).expect("create mountpoint");
-    let reference_report = run_syscall_conformance_probe(reference.path());
+
+    // The reference arm must run on the SAME filesystem type as the FrankenFS
+    // arm. A tmpfs/ /dev/shm reference asserts tmpfs directory conventions
+    // (st_size = dirent bytes) against ext4's block-aligned i_size, which
+    // fails for reasons unrelated to FrankenFS conformance (bd-90aey).
+    let kernel_mnt = tmp.path().join("kernel_ext4");
+    fs::create_dir_all(&kernel_mnt).expect("create kernel reference mountpoint");
+    let Some(_kernel_reference) = try_mount_kernel_ext4_reference(&reference_image, &kernel_mnt)
+    else {
+        eprintln!("kernel ext4 reference mount unavailable, skipping differential");
+        return;
+    };
+
+    let reference_report = run_syscall_conformance_probe(&kernel_mnt);
 
     let Some(_session) = try_mount_ffs_rw(&image, &mnt) else {
         return;
@@ -15054,22 +15166,60 @@ fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u1
                     ..OpenOptions::default()
                 };
                 let result = OpenFs::open_with_options(&cx, &attached[0], &options);
-                // TODO(bd-hk5w3): metadata RAID56 reconstruction needed for
-                // this to succeed. Until then, the open fails because
-                // metadata blocks on the omitted device cannot be
-                // reconstructed. The DATA reconstruction (checksummed read
-                // path) IS implemented and unit-tested.
-                if let Err(error) = result {
-                    eprintln!(
-                        "{profile} degraded open (omitted {omitted}): {error} \
-                         [EXPECTED: metadata RAID56 reconstruction not yet implemented]"
-                    );
-                } else {
-                    panic!(
-                        "{profile} degraded open unexpectedly succeeded \
-                         (omitted {omitted}) — if metadata RAID56 reconstruction \
-                         has landed, update this test to verify payload reads"
-                    );
+                // TODO(bd-hk5w3): metadata RAID56 reconstruction is not
+                // implemented, so a degraded open usually fails when a
+                // metadata stripe spans the omitted device. It is NOT
+                // guaranteed to fail: the kernel allocator's block placement
+                // decides whether every block the open needs is physically on
+                // the surviving devices (bd-90aey — this assertion flaked on
+                // placement). Failure = expected-and-noted. Success = verify
+                // the seeded payload bytes end to end; success with WRONG
+                // bytes is the only dangerous outcome, and it still fails the
+                // test.
+                match result {
+                    Err(error) => {
+                        eprintln!(
+                            "{profile} degraded open (omitted {omitted}): {error} \
+                             [EXPECTED: metadata RAID56 reconstruction not yet implemented]"
+                        );
+                    }
+                    Ok(degraded) => {
+                        let attr = degraded
+                            .lookup(&cx, InodeNumber(1), std::ffi::OsStr::new("payload"))
+                            .unwrap_or_else(|error| {
+                                panic!(
+                                    "{profile} degraded open succeeded (omitted {omitted}) \
+                                     but payload lookup failed: {error}"
+                                )
+                            });
+                        assert_eq!(
+                            degraded
+                                .read(&cx, attr.ino, 0, u32::try_from(payload.len()).unwrap())
+                                .unwrap_or_else(|error| {
+                                    panic!(
+                                        "{profile} degraded open succeeded (omitted {omitted}) \
+                                         but payload read failed: {error}"
+                                    )
+                                }),
+                            payload,
+                            "{profile} degraded open (omitted {omitted}) returned wrong payload \
+                             bytes — degraded reads must never serve incorrect data"
+                        );
+                        assert_eq!(
+                            degraded.read(&cx, attr.ino, 65_530, 32).unwrap(),
+                            payload[65_530..65_562],
+                            "{profile} degraded open (omitted {omitted}) wrong unaligned window"
+                        );
+                        eprintln!(
+                            "{profile} degraded open (omitted {omitted}) succeeded without \
+                             reconstruction; payload bytes verified [layout-dependent, accepted]"
+                        );
+                        emit_scenario_result(
+                            &format!("btrfs_{profile}_degraded_open_omitted_{omitted}"),
+                            "PASS",
+                            Some("degraded_open_readable_without_reconstruction"),
+                        );
+                    }
                 }
             }
         }

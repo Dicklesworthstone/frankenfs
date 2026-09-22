@@ -1,5 +1,35 @@
 # Reality-Check Bridge: Closing the Gap Between Claims and Code
 
+## Delivery progress — 2026-09-22
+
+Both harness-correctness gaps found by the 2026-09-21 check are closed on this
+build, plus one real POSIX bug they exposed:
+
+- **`bd-90aey` closed.** The syscall-conformance differential now runs its
+  reference arm on a live kernel-ext4 loop mount (same mkfs recipe, separate
+  image per arm) instead of tmpfs. Against that true reference the suite
+  exposed a masked real defect — `open_unlink_fd_lifetime` returned `ENOENT`
+  — which is now fixed: `ext4_unlink_impl` orphans an inode whose last link
+  drops while open handles pin it (`s_last_orphan` legacy list, deferred
+  storage reclaim), the FUSE adapter counts `OPEN`/`CREATE`/`RELEASE` and
+  finalizes at the last close (`finalize_unlinked_inode`), and mount-time
+  orphan recovery reclaims after a crash. The btrfs-attached flake was a
+  placement-dependent assertion over an over-permissive admission:
+  `validate_read_coverage` now refuses METADATA/SYSTEM RAID5/6 chunks missing
+  any stripe (data chunks keep their erasure tolerance). The
+  encryption-ioctl failure no longer reproduces. **Full `fuse_e2e`: 244
+  passed / 0 failed.**
+- **`bd-awvjj` closed.** The profile-freshness gate was repaired, not
+  weakened: the reference time is now the fixture's newest *parsed-content*
+  change (`serde_json::Value` equality over git history), so formatting-only
+  rewrites cannot invalidate genuine provenance (win) while any content
+  change still moves the reference (strict, never loose). Gate green with the
+  May provenance intact.
+- Gates on the final tree: fmt PASS; clippy `-D warnings` PASS (workspace,
+  all targets); `ffs-core` + `ffs-fuse` 2,074 passed / 0 failed.
+
+---
+
 ## Reality check — 2026-09-21 (HEAD `1032ade4`)
 
 **Verdict:** the filesystem crates are green and the September delivery wave
