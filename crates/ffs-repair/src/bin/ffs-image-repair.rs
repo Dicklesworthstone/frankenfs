@@ -4,12 +4,16 @@ use asupersync::Cx;
 use clap::{Parser, Subcommand};
 use ffs_error::{FfsError, Result};
 use ffs_repair::sidecar::{SidecarOptions, protect, verify};
+use ffs_repair::sidecar_restore::restore;
 use serde::Serialize;
 use std::path::PathBuf;
 use std::process::ExitCode;
 
 #[derive(Parser)]
-#[command(name = "ffs-image-repair", about = "External RaptorQ protection for offline filesystem images")]
+#[command(
+    name = "ffs-image-repair",
+    about = "External RaptorQ protection for offline filesystem images"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -33,6 +37,15 @@ enum Command {
     },
     /// Compare the current image and parity with a saved protection point.
     Verify { image: PathBuf, sidecar: PathBuf },
+    /// Reconstruct the saved generation in a NEW file, preserving the source.
+    Restore {
+        image: PathBuf,
+        sidecar: PathBuf,
+        output: PathBuf,
+        /// Confirm the source is offline and restoration targets the saved generation.
+        #[arg(long, required = true)]
+        offline: bool,
+    },
 }
 
 fn emit(value: &impl Serialize) -> Result<()> {
@@ -71,6 +84,15 @@ fn run(cli: Cli) -> Result<u8> {
             emit(&report)?;
             Ok(if report.is_healthy() { 0 } else { 2 })
         }
+        Command::Restore {
+            image,
+            sidecar,
+            output,
+            offline: _,
+        } => {
+            emit(&restore(&cx, &image, &sidecar, &output)?)?;
+            Ok(0)
+        }
     }
 }
 
@@ -85,5 +107,26 @@ fn main() -> ExitCode {
                 4
             })
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn mutating_commands_require_an_explicit_offline_acknowledgement() {
+        assert!(Cli::try_parse_from(["ffs-image-repair", "protect", "a", "b"]).is_err());
+        assert!(Cli::try_parse_from(["ffs-image-repair", "restore", "a", "b", "c"]).is_err());
+        assert!(Cli::try_parse_from([
+            "ffs-image-repair",
+            "restore",
+            "a",
+            "b",
+            "c",
+            "--offline"
+        ])
+        .is_ok());
+        assert!(Cli::try_parse_from(["ffs-image-repair", "verify", "a", "b"]).is_ok());
     }
 }
