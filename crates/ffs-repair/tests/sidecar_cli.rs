@@ -137,7 +137,11 @@ fn sidecar_binary_restores_ext4_superblock_and_file_data_with_independent_fsck()
         .expect("independent file data block mapping");
     assert!(data_block > 1);
     let original = std::fs::read(&image).expect("original image");
-    assert_eq!(&original[1080..1082], &[0x53, 0xef], "ext4 superblock magic");
+    assert_eq!(
+        &original[1080..1082],
+        &[0x53, 0xef],
+        "ext4 superblock magic"
+    );
 
     assert_success(&run(&[
         OsStr::new("protect"),
@@ -152,8 +156,12 @@ fn sidecar_binary_restores_ext4_superblock_and_file_data_with_independent_fsck()
         OsStr::new("8"),
     ]));
     let damaged_file = File::options().write(true).open(&image).expect("image");
-    damaged_file.write_all_at(&[0, 0], 1080).expect("damage superblock magic");
-    damaged_file.write_all_at(&[255], data_block * 1024).expect("damage file data");
+    damaged_file
+        .write_all_at(&[0, 0], 1080)
+        .expect("damage superblock magic");
+    damaged_file
+        .write_all_at(&[255], data_block * 1024)
+        .expect("damage file data");
     let damaged = std::fs::read(&image).expect("damaged evidence");
     assert_ne!(damaged, original);
 

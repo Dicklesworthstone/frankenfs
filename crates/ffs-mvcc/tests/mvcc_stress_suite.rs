@@ -1305,4 +1305,3 @@ fn gate4_mvcc_concurrency() {
     stress_ssi_write_skew();
     stress_gc_under_load();
 }
-

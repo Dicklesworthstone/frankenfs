@@ -136,7 +136,8 @@ impl Header {
     }
 
     pub(crate) fn block_count(&self) -> u64 {
-        self.image_bytes.div_ceil(u64::from(self.options.block_size))
+        self.image_bytes
+            .div_ceil(u64::from(self.options.block_size))
     }
 
     pub(crate) fn group_geometry(&self, index: u32) -> Result<(u64, u32)> {
@@ -205,7 +206,9 @@ impl Header {
             || raw[120..].iter().any(|&byte| byte != 0)
             || raw[88..120] != blake3::hash(&raw[..88]).as_bytes()[..]
         {
-            return Err(corrupt("invalid, unsupported, or incomplete sidecar header"));
+            return Err(corrupt(
+                "invalid, unsupported, or incomplete sidecar header",
+            ));
         }
         let options = SidecarOptions {
             block_size: read_u32(raw, 12)?,
@@ -457,18 +460,17 @@ impl Archive {
         self.file.read_exact_at(&mut group_digest, offset)?;
         offset += DIGEST_BYTES as u64;
         if metadata[..GROUP_PREFIX_BYTES] != self.header.prefix(index)?
-            || group_digest != digest_parts(b"ffs-sidecar-group-v2", &[&self.header.seed, &metadata])
+            || group_digest
+                != digest_parts(b"ffs-sidecar-group-v2", &[&self.header.seed, &metadata])
         {
-            return Err(corrupt("sidecar group metadata checksum or geometry mismatch"));
+            return Err(corrupt(
+                "sidecar group metadata checksum or geometry mismatch",
+            ));
         }
         let hashes = metadata[GROUP_PREFIX_BYTES..]
-            .chunks_exact(DIGEST_BYTES)
-            .map(|bytes| {
-                let mut hash = [0; DIGEST_BYTES];
-                hash.copy_from_slice(bytes);
-                hash
-            })
-            .collect();
+            .as_chunks::<DIGEST_BYTES>()
+            .0
+            .to_vec();
         let mut symbols = Vec::with_capacity(self.header.options.repair_symbols as usize);
         let mut seen = BTreeSet::new();
         let mut invalid_symbols = 0;
@@ -639,12 +641,17 @@ pub fn verify(cx: &Cx, image_path: &Path, sidecar_path: &Path) -> Result<Sidecar
 mod tests {
     use super::*;
 
-    fn fixture() -> (tempfile::TempDir, std::path::PathBuf, std::path::PathBuf, Vec<u8>) {
+    fn fixture() -> (
+        tempfile::TempDir,
+        std::path::PathBuf,
+        std::path::PathBuf,
+        Vec<u8>,
+    ) {
         let dir = tempfile::tempdir().expect("directory");
         let image = dir.path().join("image.img");
         let sidecar = dir.path().join("image.ffs-rq");
-        let bytes: Vec<u8> = (0..19 * 512 + 37)
-            .map(|index| ((index * 31 + index / 512) % 251) as u8)
+        let bytes: Vec<u8> = (0_usize..19 * 512 + 37)
+            .map(|index| u8::try_from((index * 31 + index / 512) % 251).expect("fits u8"))
             .collect();
         std::fs::write(&image, &bytes).expect("image");
         (dir, image, sidecar, bytes)
@@ -728,7 +735,10 @@ mod tests {
         assert_ne!(first.header.snapshot_digest, second.header.snapshot_digest);
         let parity_offset = first.header.group_offset(1).expect("group") + 32 + 8 * 32 + 32;
         let mut stale = vec![0; 4 * (4 + 512 + 32)];
-        second.file.read_exact_at(&mut stale, parity_offset).expect("other parity");
+        second
+            .file
+            .read_exact_at(&mut stale, parity_offset)
+            .expect("other parity");
         drop(first);
         drop(second);
         File::options()
@@ -739,10 +749,16 @@ mod tests {
             .expect("transplant independently checksummed parity");
         std::fs::write(&image, original).expect("restore original source generation");
         let report = verify(&cx, &image, &sidecar).expect("verify mixed archive");
-        assert!(report.matches_snapshot, "the source still matches its protection point");
+        assert!(
+            report.matches_snapshot,
+            "the source still matches its protection point"
+        );
         assert_eq!(report.invalid_repair_symbols, 4);
         assert_eq!(report.valid_repair_symbols, 8);
-        assert!(!report.is_healthy(), "stale parity is not healthy redundancy");
+        assert!(
+            !report.is_healthy(),
+            "stale parity is not healthy redundancy"
+        );
     }
 
     #[test]
@@ -750,7 +766,11 @@ mod tests {
         let (_dir, image, sidecar, _) = fixture();
         let cx = Cx::for_testing();
         protect(&cx, &image, &sidecar, options()).expect("protect");
-        let file = File::options().read(true).write(true).open(&sidecar).expect("sidecar");
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .open(&sidecar)
+            .expect("sidecar");
         let mut raw = [0; HEADER_BYTES];
         file.read_exact_at(&mut raw, 0).expect("header");
         raw[..8].copy_from_slice(b"FFSRQSC1");
@@ -786,7 +806,10 @@ mod tests {
         std::fs::write(&sidecar, b"existing archive").expect("existing");
         let cx = Cx::for_testing();
         assert!(protect(&cx, &image, &sidecar, options()).is_err());
-        assert_eq!(std::fs::read(&sidecar).expect("retained"), b"existing archive");
+        assert_eq!(
+            std::fs::read(&sidecar).expect("retained"),
+            b"existing archive"
+        );
         cx.set_cancel_requested(true);
         let other = sidecar.with_extension("cancelled");
         assert!(matches!(

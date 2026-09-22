@@ -7564,4 +7564,3 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
         map_single_extent();
     }
 }
-

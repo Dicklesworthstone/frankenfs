@@ -3,9 +3,14 @@
 # under /tmp on the worker; the image is created fresh by ffs-cli itself.
 set -u
 cd "$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
-cargo build -p ffs-cli -p ffs-harness -p ffs-repair --bins 2>&1 | tail -1
 mkdir -p probe-out
-B=target/debug
+cargo build -p ffs-cli -p ffs-harness -p ffs-repair --bins > probe-out/build.log 2>&1
+echo "build_exit=$?"
+tail -2 probe-out/build.log
+B=.rch-target/debug
+[ -x "$B/ffs-cli" ] || B=target/debug
+echo "using B=$B"
+ls -la "$B/ffs-cli" "$B/ffs-harness" "$B/ffs-demo" || true
 IMG=/tmp/rc_probe.img
 rm -f "$IMG"
 

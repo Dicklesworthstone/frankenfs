@@ -2519,4 +2519,3 @@ fn gate7_full_conformance_and_tools() {
     cli_inspect_empty_file_reports_error();
     parity_default_reports_declarations_without_execution_credit();
 }
-

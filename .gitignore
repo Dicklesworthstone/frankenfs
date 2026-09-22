@@ -39,6 +39,8 @@ profiles/smoke-*/
 target-codex*/
 target_rch*/
 .rch-target-*/
+.rch-tmp/
+probe-out/
 
 # Local perf/PGO build trees. build-perf.sh refuses the host-wide shared cargo
 # target (bd-3yh5m) and falls back to a repo-local dir, so these are multi-GB

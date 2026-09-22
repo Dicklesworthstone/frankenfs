@@ -419,4 +419,3 @@ fn gate6_raptorq_self_healing() {
         "all 5% corrupted blocks must be repaired"
     );
 }
-

@@ -3672,4 +3672,3 @@ fn gate1_on_disk_format_parsing() {
     btrfs_sys_chunk_adversarial_samples_exercise_boundaries();
     btrfs_dev_item_adversarial_samples_exercise_boundaries();
 }
-
