@@ -229,3 +229,5 @@ rust_out
 __pycache__/
 *.pyc
 .pgo/
+.rch-target/
+rc-probe.sh
