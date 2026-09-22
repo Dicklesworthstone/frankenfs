@@ -5,15 +5,20 @@
 //! - [`RepairGroupDescExt`] (stored in dual descriptor slots)
 //! - repair symbol blocks ([`RepairBlockHeader`] + payload)
 //!
-//! Crash-safety rule:
+//! Framed-symbol publication rule:
 //! 1. Write all symbol blocks for generation `G`.
 //! 2. Sync device.
 //! 3. Publish descriptor with generation `G` to the inactive descriptor slot.
 //! 4. Sync device.
 //!
-//! On read, the storage picks the latest descriptor generation whose symbol
-//! blocks are fully valid, falling back to older generations if the newest is
-//! torn or corrupt.
+//! Full-block raw symbols instead use generation-bound BLAKE3 integrity tables
+//! in the existing descriptor blocks. Both slots are durably marked pending
+//! before an in-place refresh, so interrupted refreshes cannot masquerade as
+//! committed old parity. Invalid checksum buckets are excluded, never relabeled
+//! as an older generation. Regeneration requires independently trusted sources.
+//! Framed symbols retain their existing header/generation validation protocol.
+
+mod integrity;
 
 use asupersync::Cx;
 use ffs_block::{BlockBuf, BlockDevice};
@@ -147,16 +152,28 @@ impl<'a> RepairGroupStorage<'a> {
 
     /// Read the active group descriptor extension.
     ///
-    /// Chooses the newest descriptor generation whose symbol blocks validate.
+    /// Raw parity requires a committed integrity manifest for the newest
+    /// generation, without fallback to an older generation on parity damage.
+    /// Framed parity chooses the newest generation whose symbol blocks validate.
     /// If no symbol generation exists yet and the newest descriptor has
     /// generation 0, returns that bootstrap descriptor.
     pub fn read_group_desc_ext(&self, cx: &Cx) -> Result<RepairGroupDescExt> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let candidates = self.read_descriptor_candidates(cx)?;
         if candidates.is_empty() {
             return Err(FfsError::NotFound(format!(
                 "repair descriptor missing for group {}",
                 self.layout.group.0
             )));
+        }
+
+        let newest = &candidates[0].1;
+        if integrity::is_raw(self, newest)? {
+            self.validate_desc_layout(newest)?;
+            if newest.repair_generation == 0 {
+                return Ok(newest.clone());
+            }
+            return integrity::read_generation(self, cx, false).map(|(desc, _)| desc);
         }
 
         for (_slot, desc) in &candidates {
@@ -208,21 +225,38 @@ impl<'a> RepairGroupStorage<'a> {
 
         let mut block = vec![0_u8; block_size];
         block[..RepairGroupDescExt::SIZE].copy_from_slice(&new_ext.to_bytes());
+        if candidates
+            .iter()
+            .any(|(_, desc)| desc.to_bytes() == new_ext.to_bytes())
+        {
+            integrity::preserve_manifest(self, cx, new_ext, &mut block)?;
+        }
         self.device
             .write_block(cx, self.descriptor_block(target_slot)?, &block)
     }
 
     /// Read repair symbols for the active generation.
     ///
-    /// Chooses the newest descriptor whose symbols validate. If the newest
-    /// descriptor is torn, older generations are tried.
+    /// Raw parity excludes invalid checksum buckets while preserving physical
+    /// slot ESIs. A pending/unsealed newest generation fails closed. Framed
+    /// parity retains its header-validated older-generation fallback.
     pub fn read_repair_symbols(&self, cx: &Cx) -> Result<SymbolBatch> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let candidates = self.read_descriptor_candidates(cx)?;
         if candidates.is_empty() {
             return Err(FfsError::NotFound(format!(
                 "repair descriptor missing for group {}",
                 self.layout.group.0
             )));
+        }
+
+        let newest = &candidates[0].1;
+        if integrity::is_raw(self, newest)? {
+            self.validate_desc_layout(newest)?;
+            if newest.repair_generation == 0 {
+                return Ok(Vec::new());
+            }
+            return integrity::read_generation(self, cx, false).map(|(_, symbols)| symbols);
         }
 
         for (_slot, desc) in &candidates {
@@ -243,9 +277,46 @@ impl<'a> RepairGroupStorage<'a> {
         )))
     }
 
-    /// Atomically publish repair symbols for `generation`.
+    /// Read the descriptor high-water mark for explicit regeneration.
     ///
-    /// Sequence:
+    /// Unlike `read_group_desc_ext`, this does not authorize recovery. It can
+    /// return an interrupted/pending generation; regenerate from independently
+    /// trusted source data using a strictly higher generation, never reset to 0.
+    pub fn read_refresh_descriptor(&self, cx: &Cx) -> Result<RepairGroupDescExt> {
+        integrity::refresh_descriptor(self, cx)
+    }
+
+    /// Read one committed raw generation together with its verified symbols.
+    ///
+    /// Media-unreadable parity may be omitted only on an explicitly degraded
+    /// read. Checksummed buckets containing missing or damaged bytes are omitted
+    /// in their entirety. Permissions, cancellation and descriptor I/O fail.
+    pub fn read_verified_raw_generation(
+        &self,
+        cx: &Cx,
+        tolerate_media_errors: bool,
+    ) -> Result<(RepairGroupDescExt, SymbolBatch)> {
+        integrity::read_generation(self, cx, tolerate_media_errors)
+    }
+
+    /// Revalidate raw-generation authority after decoding and before writeback.
+    /// This is not exclusion against concurrent source or repair writers.
+    pub fn ensure_verified_raw_generation(
+        &self,
+        cx: &Cx,
+        expected: &RepairGroupDescExt,
+    ) -> Result<()> {
+        integrity::ensure_generation(self, cx, expected)
+    }
+
+    /// Durably publish repair symbols for `generation`.
+    ///
+    /// Raw parity first syncs a pending fence in both descriptor slots, writes
+    /// and syncs parity, verifies readback against supplied bytes, then publishes
+    /// and syncs both integrity manifests. A failed refresh stays unavailable
+    /// until explicit regeneration. No additional image blocks are consumed.
+    ///
+    /// Framed-symbol sequence:
     /// 1. Write all symbol blocks with header generation = `generation`.
     /// 2. `sync()`
     /// 3. Write descriptor extension with `repair_generation = generation` to
@@ -257,6 +328,13 @@ impl<'a> RepairGroupStorage<'a> {
         symbols: &[(u32, Vec<u8>)],
         generation: u64,
     ) -> Result<()> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let candidates = self.read_descriptor_candidates(cx)?;
+        if let Some((_, newest)) = candidates.first()
+            && integrity::is_raw(self, newest)?
+        {
+            return integrity::publish(self, cx, symbols, generation);
+        }
         let current = self.read_group_desc_ext(cx)?;
         if generation <= current.repair_generation {
             return Err(FfsError::RepairFailed(format!(
@@ -307,7 +385,7 @@ impl<'a> RepairGroupStorage<'a> {
 
     /// Read `blocks` across the rayon pool, returning per-block read results in
     /// the same order. The reads are independent; a blocking read parks its
-    /// worker so the access latencies overlap up to the pool size. Callers parse
+    /// worker so the access latencies overlap up to pool size. Callers parse
     /// the results serially in order to preserve error/ordering semantics.
     fn read_blocks_parallel(
         device: &dyn BlockDevice,
@@ -332,7 +410,13 @@ impl<'a> RepairGroupStorage<'a> {
             )));
         }
         if Self::raw_symbol_mode(block_size, symbol_size) {
-            return self.read_raw_symbols(cx, desc, block_size, symbol_size);
+            let (current, symbols) = integrity::read_generation(self, cx, false)?;
+            if current.to_bytes() != desc.to_bytes() {
+                return Err(FfsError::RepairFailed(
+                    "repair generation changed during symbol loading".to_owned(),
+                ));
+            }
+            return Ok(symbols);
         }
         if block_size <= RepairBlockHeader::SIZE {
             return Err(FfsError::RepairFailed(format!(
@@ -375,50 +459,6 @@ impl<'a> RepairGroupStorage<'a> {
             }
             out.append(&mut block_symbols);
             next_expected_esi = next_esi;
-        }
-
-        Ok(out)
-    }
-
-    fn read_raw_symbols(
-        &self,
-        cx: &Cx,
-        desc: &RepairGroupDescExt,
-        block_size: usize,
-        symbol_size: usize,
-    ) -> Result<SymbolBatch> {
-        if symbol_size > block_size {
-            return Err(FfsError::RepairFailed(format!(
-                "raw symbol_size {symbol_size} exceeds block_size {block_size}"
-            )));
-        }
-
-        // Independent reads → parallel I/O overlap; serial parse in block order
-        // preserves ESI assignment, zero-skip, and first-error order (bd-g5v1s).
-        let blocks = Self::repair_block_numbers(desc);
-        let reads = Self::read_blocks_parallel(self.device, cx, &blocks);
-
-        let mut out = Vec::new();
-        let base_esi = u32::from(desc.source_block_count);
-        for (block_index, (read, &block_num)) in
-            (0..desc.repair_block_count).zip(reads.into_iter().zip(blocks.iter()))
-        {
-            let bytes = read?;
-            let symbol = bytes.as_slice().get(..symbol_size).ok_or_else(|| {
-                FfsError::RepairFailed(format!(
-                    "raw symbol slice out of bounds at block {}",
-                    block_num.0
-                ))
-            })?;
-            // Avoid allocating/copying raw symbols that are already all-zero;
-            // scrub::is_all_zero keeps the prior 4-wide scan shape.
-            if crate::scrub::is_all_zero(symbol) {
-                continue;
-            }
-            let esi = base_esi
-                .checked_add(block_index)
-                .ok_or_else(|| FfsError::RepairFailed("raw ESI overflow".to_owned()))?;
-            out.push((esi, symbol.to_vec()));
         }
 
         Ok(out)

@@ -1,21 +1,18 @@
 //! Degraded reads of one committed, full-block repair generation.
 //!
-//! The ordinary storage reader validates every parity read before selecting a
-//! descriptor. That cannot recover a source read error together with a parity
-//! read error. Here a checksum-valid descriptor selects the generation first;
-//! unreadable raw parity blocks are omitted at their original ESI positions.
-//! Never substitute an older descriptor after a newer valid commit is observed.
-//! Raw parity has no per-payload checksum or generation header, so this retains
-//! the offline/exclusive-writer requirement; it does not certify payload damage
-//! or resolve interrupted, in-place symbol refreshes.
+//! A checksum-valid descriptor selects the generation before parity is read.
+//! The storage layer then verifies generation-bound BLAKE3 integrity buckets,
+//! excluding unreadable or damaged buckets without renumbering surviving ESIs.
+//! Pending or unsealed raw generations cannot authorize erasure recovery.
+//! This still requires exclusive repair ownership and independently established
+//! source freshness; parity integrity is not proof that client data is current.
 
-use super::{checkpoint, is_media_read_failure};
-use crate::storage::RepairGroupLayout;
+use super::checkpoint;
+use crate::storage::{RepairGroupLayout, RepairGroupStorage};
 use crate::symbol::RepairGroupDescExt;
 use asupersync::Cx;
 use ffs_block::BlockDevice;
 use ffs_error::{FfsError, Result};
-use ffs_types::BlockNumber;
 
 type SymbolBatch = Vec<(u32, Vec<u8>)>;
 
@@ -99,7 +96,7 @@ fn committed_descriptor(
     Ok(desc.clone())
 }
 
-/// Require the same checksum-valid descriptor after capture and after decode.
+/// Require the same committed, integrity-protected generation after decode.
 pub(super) fn ensure_generation(
     cx: &Cx,
     device: &dyn BlockDevice,
@@ -110,7 +107,7 @@ pub(super) fn ensure_generation(
     if committed_descriptor(cx, device, layout, source_count)? != *expected {
         return Err(invalid("repair generation changed during erasure recovery"));
     }
-    Ok(())
+    RepairGroupStorage::new(device, layout).ensure_verified_raw_generation(cx, expected)
 }
 
 pub(super) fn read_generation(
@@ -120,42 +117,12 @@ pub(super) fn read_generation(
     source_count: u32,
 ) -> Result<RepairGeneration> {
     let descriptor = committed_descriptor(cx, device, layout, source_count)?;
-    let mut symbols = Vec::new();
-    let mut unreadable = 0_u32;
-    for index in 0..descriptor.repair_block_count {
-        checkpoint(cx)?;
-        let block = BlockNumber(descriptor.repair_start_block.0 + u64::from(index));
-        let bytes = match device.read_block(cx, block) {
-            Ok(bytes) => bytes,
-            Err(error) if is_media_read_failure(&error) => {
-                unreadable += 1;
-                continue;
-            }
-            Err(error) => return Err(error),
-        };
-        if bytes.len() != usize::from(descriptor.symbol_size) {
-            return Err(invalid("short raw parity buffer without a media error"));
-        }
-        // The existing raw storage format reserves all-zero blocks as unused.
-        if crate::scrub::is_all_zero(bytes.as_slice()) {
-            continue;
-        }
-        let esi = source_count
-            .checked_add(index)
-            .ok_or_else(|| invalid("repair ESI overflow"))?;
-        symbols.push((esi, bytes.into_inner()));
+    let (verified, symbols) =
+        RepairGroupStorage::new(device, layout).read_verified_raw_generation(cx, true)?;
+    if verified != descriptor {
+        return Err(invalid("repair generation changed while loading erasure parity"));
     }
     ensure_generation(cx, device, layout, source_count, &descriptor)?;
-    if unreadable > 0 {
-        tracing::warn!(
-            target: "ffs::repair::recovery",
-            group = layout.group.0,
-            generation = descriptor.repair_generation,
-            unreadable_parity_blocks = unreadable,
-            available_symbols = symbols.len(),
-            "repair_generation_read_degraded"
-        );
-    }
     Ok(RepairGeneration {
         descriptor,
         symbols,
@@ -166,7 +133,7 @@ pub(super) fn read_generation(
 mod tests {
     use super::*;
     use ffs_block::BlockBuf;
-    use ffs_types::GroupNumber;
+    use ffs_types::{BlockNumber, GroupNumber};
     use std::collections::BTreeSet;
     use std::io::ErrorKind;
     use std::sync::Mutex;
@@ -193,8 +160,10 @@ mod tests {
             Ok(BlockBuf::new(blocks[block.0 as usize].clone()))
         }
 
-        fn write_block(&self, _cx: &Cx, _block: BlockNumber, _data: &[u8]) -> Result<()> {
-            Err(FfsError::ReadOnly)
+        fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
+            checkpoint(cx)?;
+            self.blocks.lock().expect("blocks")[block.0 as usize].copy_from_slice(data);
+            Ok(())
         }
 
         fn block_size(&self) -> u32 {
@@ -221,28 +190,25 @@ mod tests {
             symbol_alignment: 4,
             repair_start_block: layout.repair_start_block(),
             repair_block_count: 4,
-            repair_generation: 1,
+            repair_generation: 0,
             checksum: 0,
         };
-        let mut blocks = vec![vec![0; 256]; 64];
-        let bootstrap = RepairGroupDescExt {
-            repair_generation: 0,
-            ..desc.clone()
+        let device = Device {
+            blocks: Mutex::new(vec![vec![0; 256]; 64]),
+            failures: BTreeSet::new(),
+            error_kind: ErrorKind::UnexpectedEof,
+            change_on_parity_read: AtomicBool::new(false),
         };
-        blocks[62][..RepairGroupDescExt::SIZE].copy_from_slice(&bootstrap.to_bytes());
-        blocks[63][..RepairGroupDescExt::SIZE].copy_from_slice(&desc.to_bytes());
-        for (index, block) in blocks[58..62].iter_mut().enumerate() {
-            block.fill(index as u8 + 1);
-        }
-        (
-            Device {
-                blocks: Mutex::new(blocks),
-                failures: BTreeSet::new(),
-                error_kind: ErrorKind::UnexpectedEof,
-                change_on_parity_read: AtomicBool::new(false),
-            },
-            layout,
-        )
+        let cx = Cx::for_testing();
+        let storage = RepairGroupStorage::new(&device, layout);
+        storage.write_group_desc_ext(&cx, &desc).expect("bootstrap");
+        let symbols = (0_u32..4)
+            .map(|index| (8 + index, vec![index as u8 + 1; 256]))
+            .collect::<Vec<_>>();
+        storage
+            .write_repair_symbols(&cx, &symbols, 1)
+            .expect("sealed parity");
+        (device, layout)
     }
 
     #[test]
@@ -297,5 +263,26 @@ mod tests {
         let error =
             read_generation(&Cx::for_testing(), &device, layout, 8).expect_err("bootstrap");
         assert!(error.to_string().contains("not committed"));
+    }
+
+    #[test]
+    fn readable_parity_bitflips_are_erasures_not_decoder_inputs() {
+        let (device, layout) = fixture();
+        device.blocks.lock().expect("blocks")[59][20] ^= 0xff;
+        let generation = read_generation(&Cx::for_testing(), &device, layout, 8).expect("read");
+        assert_eq!(
+            generation.symbols,
+            vec![(8, vec![1; 256]), (10, vec![3; 256]), (11, vec![4; 256])]
+        );
+    }
+
+    #[test]
+    fn unsealed_descriptor_cannot_authorize_unreadable_source_recovery() {
+        let (device, layout) = fixture();
+        let mut blocks = device.blocks.lock().expect("blocks");
+        blocks[62][48..].fill(0);
+        blocks[63][48..].fill(0);
+        drop(blocks);
+        assert!(read_generation(&Cx::for_testing(), &device, layout, 8).is_err());
     }
 }
