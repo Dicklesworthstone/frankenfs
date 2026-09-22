@@ -102,7 +102,7 @@ impl RecordTransaction {
             ));
         }
         let mut retired = record.clone();
-        retired.claimed_at = RETIRED_AT.to_owned();
+        RETIRED_AT.clone_into(&mut retired.claimed_at);
         retired.lease_ttl_secs = 0;
         let bytes = serde_json::to_vec_pretty(&retired).map_err(io::Error::other)?;
         let path = retired_path(&self.record_path);
