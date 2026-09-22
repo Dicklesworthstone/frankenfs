@@ -63,13 +63,22 @@ there is no claim that a particular symbol count guarantees recovery.
 
 ## Integrity and publication
 
+The current format is version 2 (`FFSRQSC2`); JSON protection reports include
+`format_version`. Version 1 archives are deliberately refused: their parity
+checksums did not bind the parity to the saved source digest table, allowing
+parity from a different generation with the same image prefix to look healthy.
+Create a new version 2 sidecar from a known-good offline protection point.
+
 The archive header, group geometry and source digest tables are checksummed.
-Every repair symbol has its own checksum and encoding-symbol ID; corrupt or
-duplicate symbols are excluded independently. Recovery uses the existing
-FrankenFS/asupersync RaptorQ equations with the exact captured, validated source
-buffers. Every recovered block must match its saved BLAKE3 digest. The entire
-staged output is reread and must match the saved whole-image digest before
-publication. An unrecoverable later group never exposes a partial final image.
+Every repair symbol has its own checksum and encoding-symbol ID. Its checksum
+also covers the group's complete source-digest-table checksum, so stale parity
+transplanted from a different source generation is rejected even if the seed,
+block addresses, symbol IDs and lengths agree. Corrupt or duplicate symbols are
+excluded independently. Recovery uses the existing FrankenFS/asupersync RaptorQ
+equations with the exact captured, validated source buffers. Every recovered
+block must match its saved BLAKE3 digest. The entire staged output is reread and
+must match the saved whole-image digest before publication. An unrecoverable
+later group never exposes a partial final image.
 
 Checksums detect accidental corruption, not maliciously forged archives. This
 format does not authenticate a sidecar supplied by an adversary. It is a new,
@@ -77,3 +86,13 @@ explicit offline path; it does not enable default mounted self-healing, change
 `ffs-cli repair`'s on-image storage layout, certify native allocator reservations,
 or provide multi-device image-set recovery. Those remain separate work under
 `bd-11a8t` and `bd-hk5w3`.
+
+## Executable regressions
+
+`cargo test -p ffs-repair` includes real-file protection/restoration tests and
+subprocess CLI tests. The ext4 test requires `mkfs.ext4`, `debugfs`, and `e2fsck`
+from e2fsprogs: it creates and populates an ext4 image, damages its primary
+superblock magic and file data, restores a separate image, compares every byte,
+and runs read-only `e2fsck` plus `debugfs` payload readback. Missing prerequisites
+fail rather than count as executed recovery evidence. This is an offline-image
+test, not a mounted FUSE certification.

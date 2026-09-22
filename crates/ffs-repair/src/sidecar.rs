@@ -25,8 +25,8 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 use tempfile::NamedTempFile;
 
-const MAGIC: &[u8; 8] = b"FFSRQSC1";
-const VERSION: u32 = 1;
+const MAGIC: &[u8; 8] = b"FFSRQSC2";
+const VERSION: u32 = 2;
 pub(crate) const HEADER_BYTES: usize = 128;
 const GROUP_PREFIX_BYTES: usize = 32;
 const DIGEST_BYTES: usize = 32;
@@ -73,6 +73,7 @@ impl SidecarOptions {
 /// Identity of the saved protection point, independent of the current image.
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct ProtectionInfo {
+    pub format_version: u32,
     pub image_bytes: u64,
     pub block_size: u32,
     pub group_blocks: u32,
@@ -116,7 +117,9 @@ impl Header {
     fn new(options: SidecarOptions, image_bytes: u64, seed: [u8; 16]) -> Result<Self> {
         options.validate()?;
         if image_bytes == 0 {
-            return Err(FfsError::InvalidGeometry("cannot protect an empty image".to_owned()));
+            return Err(FfsError::InvalidGeometry(
+                "cannot protect an empty image".to_owned(),
+            ));
         }
         let blocks = image_bytes.div_ceil(u64::from(options.block_size));
         let groups = u32::try_from(blocks.div_ceil(u64::from(options.group_blocks)))
@@ -202,7 +205,7 @@ impl Header {
             || raw[120..].iter().any(|&byte| byte != 0)
             || raw[88..120] != blake3::hash(&raw[..88]).as_bytes()[..]
         {
-            return Err(corrupt("invalid or incomplete sidecar header"));
+            return Err(corrupt("invalid, unsupported, or incomplete sidecar header"));
         }
         let options = SidecarOptions {
             block_size: read_u32(raw, 12)?,
@@ -221,13 +224,16 @@ impl Header {
 
     pub(crate) fn info(&self) -> Result<ProtectionInfo> {
         Ok(ProtectionInfo {
+            format_version: VERSION,
             image_bytes: self.image_bytes,
             block_size: self.options.block_size,
             group_blocks: self.options.group_blocks,
             repair_symbols_per_group: self.options.repair_symbols,
             groups: self.groups,
             sidecar_bytes: self.expected_len()?,
-            snapshot_blake3: blake3::Hash::from_bytes(self.snapshot_digest).to_hex().to_string(),
+            snapshot_blake3: blake3::Hash::from_bytes(self.snapshot_digest)
+                .to_hex()
+                .to_string(),
         })
     }
 }
@@ -244,13 +250,21 @@ pub(crate) fn corrupt(message: &str) -> FfsError {
 }
 
 fn read_u32(raw: &[u8], offset: usize) -> Result<u32> {
-    let bytes = raw.get(offset..offset + 4).ok_or_else(|| corrupt("short u32"))?;
-    Ok(u32::from_le_bytes(bytes.try_into().map_err(|_| corrupt("short u32"))?))
+    let bytes = raw
+        .get(offset..offset + 4)
+        .ok_or_else(|| corrupt("short u32"))?;
+    Ok(u32::from_le_bytes(
+        bytes.try_into().map_err(|_| corrupt("short u32"))?,
+    ))
 }
 
 fn read_u64(raw: &[u8], offset: usize) -> Result<u64> {
-    let bytes = raw.get(offset..offset + 8).ok_or_else(|| corrupt("short u64"))?;
-    Ok(u64::from_le_bytes(bytes.try_into().map_err(|_| corrupt("short u64"))?))
+    let bytes = raw
+        .get(offset..offset + 8)
+        .ok_or_else(|| corrupt("short u64"))?;
+    Ok(u64::from_le_bytes(
+        bytes.try_into().map_err(|_| corrupt("short u64"))?,
+    ))
 }
 
 fn digest_parts(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
@@ -263,18 +277,38 @@ fn digest_parts(domain: &[u8], parts: &[&[u8]]) -> [u8; 32] {
 }
 
 pub(crate) fn source_digest(header: &Header, block: u64, bytes: &[u8]) -> [u8; 32] {
-    digest_parts(b"ffs-sidecar-source-v1", &[&header.seed, &block.to_le_bytes(), bytes])
+    digest_parts(
+        b"ffs-sidecar-source-v2",
+        &[&header.seed, &block.to_le_bytes(), bytes],
+    )
 }
 
-fn symbol_digest(header: &Header, group: u32, esi: u32, bytes: &[u8]) -> [u8; 32] {
+fn symbol_digest(
+    header: &Header,
+    group: u32,
+    group_digest: &[u8; 32],
+    esi: u32,
+    bytes: &[u8],
+) -> [u8; 32] {
+    // The seed may repeat when two generations share their image prefix.
+    // Bind parity to this group's complete source digest table, not just its
+    // address and ESI, so transplanted stale parity cannot verify as healthy.
     digest_parts(
-        b"ffs-sidecar-symbol-v1",
-        &[&header.seed, &group.to_le_bytes(), &esi.to_le_bytes(), bytes],
+        b"ffs-sidecar-symbol-v2",
+        &[
+            &header.seed,
+            &group.to_le_bytes(),
+            group_digest,
+            &esi.to_le_bytes(),
+            bytes,
+        ],
     )
 }
 
 pub(crate) fn parent_path(path: &Path) -> &Path {
-    path.parent().filter(|parent| !parent.as_os_str().is_empty()).unwrap_or_else(|| Path::new("."))
+    path.parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."))
 }
 
 /// Lock the actual image inode for the entire operation, including aliases.
@@ -283,7 +317,9 @@ pub(crate) fn open_image(cx: &Cx, path: &Path) -> Result<File> {
     checkpoint(cx)?;
     let image = File::open(path)?;
     if !image.metadata()?.is_file() {
-        return Err(FfsError::InvalidGeometry("sidecar operations require a regular offline image file".to_owned()));
+        return Err(FfsError::InvalidGeometry(
+            "sidecar operations require a regular offline image file".to_owned(),
+        ));
     }
     image.try_lock().map_err(io::Error::from)?;
     checkpoint(cx)?;
@@ -297,7 +333,9 @@ pub(crate) fn publish_new(cx: &Cx, staged: NamedTempFile, path: &Path) -> Result
     let parent = File::open(parent_path(path))?;
     staged.as_file().sync_all()?;
     checkpoint(cx)?;
-    let _published = staged.persist_noclobber(path).map_err(|error| FfsError::Io(error.error))?;
+    let _published = staged
+        .persist_noclobber(path)
+        .map_err(|error| FfsError::Io(error.error))?;
     // Publication has committed. Finish its durability barrier even if a
     // cancellation arrives now, rather than leaving a visible unsynced name.
     parent.sync_all()?;
@@ -314,7 +352,9 @@ pub(crate) struct MemoryGroup {
 impl BlockDevice for MemoryGroup {
     fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
         checkpoint(cx)?;
-        let bytes = block.0.checked_sub(self.first)
+        let bytes = block
+            .0
+            .checked_sub(self.first)
             .and_then(|index| usize::try_from(index).ok())
             .and_then(|index| self.blocks.get(index))
             .ok_or_else(|| corrupt("source block outside captured group"))?;
@@ -352,7 +392,10 @@ pub(crate) fn load_source(
         checkpoint(cx)?;
         let block = first + u64::from(relative);
         let mut bytes = vec![0; header.options.block_size as usize];
-        let read = image.read_exact_at(&mut bytes[..header.real_block_len(block)], block * u64::from(header.options.block_size));
+        let read = image.read_exact_at(
+            &mut bytes[..header.real_block_len(block)],
+            block * u64::from(header.options.block_size),
+        );
         checkpoint(cx)?;
         if let Err(error) = read {
             if !tolerate_errors {
@@ -363,7 +406,14 @@ pub(crate) fn load_source(
         }
         blocks.push(bytes);
     }
-    Ok((MemoryGroup { first, block_size: header.options.block_size, blocks }, unreadable))
+    Ok((
+        MemoryGroup {
+            first,
+            block_size: header.options.block_size,
+            blocks,
+        },
+        unreadable,
+    ))
 }
 
 pub(crate) struct GroupRecord {
@@ -403,20 +453,22 @@ impl Archive {
         let mut metadata = vec![0; GROUP_PREFIX_BYTES + count as usize * DIGEST_BYTES];
         self.file.read_exact_at(&mut metadata, offset)?;
         offset += metadata.len() as u64;
-        let mut digest = [0; DIGEST_BYTES];
-        self.file.read_exact_at(&mut digest, offset)?;
+        let mut group_digest = [0; DIGEST_BYTES];
+        self.file.read_exact_at(&mut group_digest, offset)?;
         offset += DIGEST_BYTES as u64;
         if metadata[..GROUP_PREFIX_BYTES] != self.header.prefix(index)?
-            || digest != digest_parts(b"ffs-sidecar-group-v1", &[&self.header.seed, &metadata])
+            || group_digest != digest_parts(b"ffs-sidecar-group-v2", &[&self.header.seed, &metadata])
         {
             return Err(corrupt("sidecar group metadata checksum or geometry mismatch"));
         }
-        let hashes = metadata[GROUP_PREFIX_BYTES..].chunks_exact(DIGEST_BYTES)
+        let hashes = metadata[GROUP_PREFIX_BYTES..]
+            .chunks_exact(DIGEST_BYTES)
             .map(|bytes| {
                 let mut hash = [0; DIGEST_BYTES];
                 hash.copy_from_slice(bytes);
                 hash
-            }).collect();
+            })
+            .collect();
         let mut symbols = Vec::with_capacity(self.header.options.repair_symbols as usize);
         let mut seen = BTreeSet::new();
         let mut invalid_symbols = 0;
@@ -429,16 +481,24 @@ impl Archive {
             let mut data = vec![0; self.header.options.block_size as usize];
             self.file.read_exact_at(&mut data, offset)?;
             offset += data.len() as u64;
+            let mut digest = [0; DIGEST_BYTES];
             self.file.read_exact_at(&mut digest, offset)?;
             offset += DIGEST_BYTES as u64;
-            if esi < count || digest != symbol_digest(&self.header, index, esi, &data) || !seen.insert(esi) {
+            if esi < count
+                || digest != symbol_digest(&self.header, index, &group_digest, esi, &data)
+                || !seen.insert(esi)
+            {
                 invalid_symbols += 1;
             } else {
                 symbols.push((esi, data));
             }
         }
         checkpoint(cx)?;
-        Ok(GroupRecord { hashes, symbols, invalid_symbols })
+        Ok(GroupRecord {
+            hashes,
+            symbols,
+            invalid_symbols,
+        })
     }
 }
 
@@ -459,13 +519,21 @@ fn hash_image(cx: &Cx, image: &File, bytes: u64) -> Result<[u8; 32]> {
 
 /// Create a new, durable sidecar for an offline image without changing the image
 /// or overwriting an existing archive. No partial archive is published on error.
-pub fn protect(cx: &Cx, image_path: &Path, sidecar_path: &Path, options: SidecarOptions) -> Result<ProtectionInfo> {
+pub fn protect(
+    cx: &Cx,
+    image_path: &Path,
+    sidecar_path: &Path,
+    options: SidecarOptions,
+) -> Result<ProtectionInfo> {
     options.validate()?;
     let image = open_image(cx, image_path)?;
     let image_bytes = image.metadata()?.len();
     let mut seed_input = vec![0; image_bytes.min(4096) as usize];
     image.read_exact_at(&mut seed_input, 0)?;
-    let digest = digest_parts(b"ffs-sidecar-seed-v1", &[&image_bytes.to_le_bytes(), &seed_input]);
+    let digest = digest_parts(
+        b"ffs-sidecar-seed-v2",
+        &[&image_bytes.to_le_bytes(), &seed_input],
+    );
     let mut seed = [0; 16];
     seed.copy_from_slice(&digest[..16]);
     let mut header = Header::new(options, image_bytes, seed)?;
@@ -480,22 +548,41 @@ pub fn protect(cx: &Cx, image_path: &Path, sidecar_path: &Path, options: Sidecar
             metadata.extend_from_slice(&source_digest(&header, block, data));
             snapshot.update(&data[..header.real_block_len(block)]);
         }
-        let encoded = encode_group(cx, &source, &header.seed, GroupNumber(index), BlockNumber(source.first), source.blocks.len() as u32, options.repair_symbols)?;
+        let encoded = encode_group(
+            cx,
+            &source,
+            &header.seed,
+            GroupNumber(index),
+            BlockNumber(source.first),
+            source.blocks.len() as u32,
+            options.repair_symbols,
+        )?;
         checkpoint(cx)?;
         if encoded.repair_symbols.len() != options.repair_symbols as usize {
             return Err(corrupt("encoder returned an incomplete repair symbol set"));
         }
+        let group_digest = digest_parts(b"ffs-sidecar-group-v2", &[&header.seed, &metadata]);
         staged.write_all(&metadata)?;
-        staged.write_all(&digest_parts(b"ffs-sidecar-group-v1", &[&header.seed, &metadata]))?;
+        staged.write_all(&group_digest)?;
         for symbol in encoded.repair_symbols {
             staged.write_all(&symbol.esi.to_le_bytes())?;
             staged.write_all(&symbol.data)?;
-            staged.write_all(&symbol_digest(&header, index, symbol.esi, &symbol.data))?;
+            staged.write_all(&symbol_digest(
+                &header,
+                index,
+                &group_digest,
+                symbol.esi,
+                &symbol.data,
+            ))?;
         }
     }
     header.snapshot_digest = *snapshot.finalize().as_bytes();
-    if image.metadata()?.len() != image_bytes || hash_image(cx, &image, image_bytes)? != header.snapshot_digest {
-        return Err(corrupt("image changed during protection; take the filesystem offline and retry"));
+    if image.metadata()?.len() != image_bytes
+        || hash_image(cx, &image, image_bytes)? != header.snapshot_digest
+    {
+        return Err(corrupt(
+            "image changed during protection; take the filesystem offline and retry",
+        ));
     }
     if staged.as_file().metadata()?.len() != header.expected_len()? {
         return Err(corrupt("encoded sidecar length disagrees with geometry"));
@@ -531,7 +618,9 @@ pub fn verify(cx: &Cx, image_path: &Path, sidecar_path: &Path) -> Result<Sidecar
         for (relative, (data, expected)) in source.blocks.iter().zip(&record.hashes).enumerate() {
             let block = source.first + relative as u64;
             report.checked_blocks += 1;
-            if unreadable.binary_search(&(relative as u32)).is_err() && source_digest(header, block, data) != *expected {
+            if unreadable.binary_search(&(relative as u32)).is_err()
+                && source_digest(header, block, data) != *expected
+            {
                 report.changed_blocks += 1;
             }
             snapshot.update(&data[..header.real_block_len(block)]);
@@ -554,13 +643,19 @@ mod tests {
         let dir = tempfile::tempdir().expect("directory");
         let image = dir.path().join("image.img");
         let sidecar = dir.path().join("image.ffs-rq");
-        let bytes: Vec<u8> = (0..19 * 512 + 37).map(|index| ((index * 31 + index / 512) % 251) as u8).collect();
+        let bytes: Vec<u8> = (0..19 * 512 + 37)
+            .map(|index| ((index * 31 + index / 512) % 251) as u8)
+            .collect();
         std::fs::write(&image, &bytes).expect("image");
         (dir, image, sidecar, bytes)
     }
 
     fn options() -> SidecarOptions {
-        SidecarOptions { block_size: 512, group_blocks: 8, repair_symbols: 4 }
+        SidecarOptions {
+            block_size: 512,
+            group_blocks: 8,
+            repair_symbols: 4,
+        }
     }
 
     #[test]
@@ -568,10 +663,14 @@ mod tests {
         let (_dir, image, sidecar, bytes) = fixture();
         let cx = Cx::for_testing();
         let info = protect(&cx, &image, &sidecar, options()).expect("protect");
+        assert_eq!(info.format_version, 2);
         assert_eq!(info.groups, 3);
         assert_eq!(info.image_bytes, bytes.len() as u64);
         assert_eq!(std::fs::read(&image).expect("unchanged"), bytes);
-        assert_eq!(info.sidecar_bytes, std::fs::metadata(&sidecar).expect("metadata").len());
+        assert_eq!(
+            info.sidecar_bytes,
+            std::fs::metadata(&sidecar).expect("metadata").len()
+        );
         let report = verify(&cx, &image, &sidecar).expect("verify");
         assert!(report.is_healthy());
         assert_eq!(report.checked_blocks, 20);
@@ -583,11 +682,20 @@ mod tests {
         let (_dir, image, sidecar, _) = fixture();
         let cx = Cx::for_testing();
         protect(&cx, &image, &sidecar, options()).expect("protect");
-        File::options().write(true).open(&image).expect("image").write_all_at(&[255], 513).expect("damage");
+        File::options()
+            .write(true)
+            .open(&image)
+            .expect("image")
+            .write_all_at(&[255], 513)
+            .expect("damage");
         let archive = Archive::open(&cx, &sidecar).expect("archive");
         let parity = archive.header.group_offset(0).expect("offset") + 32 + 8 * 32 + 32 + 4;
         drop(archive);
-        let file = File::options().read(true).write(true).open(&sidecar).expect("sidecar");
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .open(&sidecar)
+            .expect("sidecar");
         let mut byte = [0];
         file.read_exact_at(&mut byte, parity).expect("read");
         byte[0] ^= 1;
@@ -600,11 +708,69 @@ mod tests {
     }
 
     #[test]
-    fn sidecar_rejects_truncated_archive_and_corrupt_source_digest_table() {
+    fn sidecar_rejects_parity_transplanted_from_a_different_source_generation() {
+        let (_dir, image, sidecar, original) = fixture();
+        let cx = Cx::for_testing();
+        protect(&cx, &image, &sidecar, options()).expect("first protection point");
+        // Change a block AFTER the 4096-byte seed prefix. Both captures have
+        // exactly the same seed, group addresses, ESI values, and geometry.
+        File::options()
+            .write(true)
+            .open(&image)
+            .expect("image")
+            .write_all_at(&[255], 4096)
+            .expect("new generation");
+        let newer = sidecar.with_extension("newer");
+        protect(&cx, &image, &newer, options()).expect("second protection point");
+        let first = Archive::open(&cx, &sidecar).expect("first archive");
+        let second = Archive::open(&cx, &newer).expect("second archive");
+        assert_eq!(first.header.seed, second.header.seed);
+        assert_ne!(first.header.snapshot_digest, second.header.snapshot_digest);
+        let parity_offset = first.header.group_offset(1).expect("group") + 32 + 8 * 32 + 32;
+        let mut stale = vec![0; 4 * (4 + 512 + 32)];
+        second.file.read_exact_at(&mut stale, parity_offset).expect("other parity");
+        drop(first);
+        drop(second);
+        File::options()
+            .write(true)
+            .open(&sidecar)
+            .expect("first archive")
+            .write_all_at(&stale, parity_offset)
+            .expect("transplant independently checksummed parity");
+        std::fs::write(&image, original).expect("restore original source generation");
+        let report = verify(&cx, &image, &sidecar).expect("verify mixed archive");
+        assert!(report.matches_snapshot, "the source still matches its protection point");
+        assert_eq!(report.invalid_repair_symbols, 4);
+        assert_eq!(report.valid_repair_symbols, 8);
+        assert!(!report.is_healthy(), "stale parity is not healthy redundancy");
+    }
+
+    #[test]
+    fn sidecar_refuses_the_unbound_v1_format_even_with_a_valid_header_checksum() {
         let (_dir, image, sidecar, _) = fixture();
         let cx = Cx::for_testing();
         protect(&cx, &image, &sidecar, options()).expect("protect");
         let file = File::options().read(true).write(true).open(&sidecar).expect("sidecar");
+        let mut raw = [0; HEADER_BYTES];
+        file.read_exact_at(&mut raw, 0).expect("header");
+        raw[..8].copy_from_slice(b"FFSRQSC1");
+        raw[8..12].copy_from_slice(&1_u32.to_le_bytes());
+        let digest = blake3::hash(&raw[..88]);
+        raw[88..120].copy_from_slice(digest.as_bytes());
+        file.write_all_at(&raw, 0).expect("old header");
+        assert!(verify(&cx, &image, &sidecar).is_err());
+    }
+
+    #[test]
+    fn sidecar_rejects_truncated_archive_and_corrupt_source_digest_table() {
+        let (_dir, image, sidecar, _) = fixture();
+        let cx = Cx::for_testing();
+        protect(&cx, &image, &sidecar, options()).expect("protect");
+        let file = File::options()
+            .read(true)
+            .write(true)
+            .open(&sidecar)
+            .expect("sidecar");
         let mut byte = [0];
         file.read_exact_at(&mut byte, 160).expect("read");
         byte[0] ^= 1;
@@ -623,7 +789,10 @@ mod tests {
         assert_eq!(std::fs::read(&sidecar).expect("retained"), b"existing archive");
         cx.set_cancel_requested(true);
         let other = sidecar.with_extension("cancelled");
-        assert!(matches!(protect(&cx, &image, &other, options()), Err(FfsError::Cancelled)));
+        assert!(matches!(
+            protect(&cx, &image, &other, options()),
+            Err(FfsError::Cancelled)
+        ));
         assert!(!other.exists());
         assert_eq!(std::fs::read(image).expect("source retained"), bytes);
     }
@@ -632,7 +801,10 @@ mod tests {
     fn sidecar_rejects_unbounded_geometry_and_incomplete_header() {
         let (_dir, image, sidecar, _) = fixture();
         let cx = Cx::for_testing();
-        let bad = SidecarOptions { group_blocks: u32::MAX, ..options() };
+        let bad = SidecarOptions {
+            group_blocks: u32::MAX,
+            ..options()
+        };
         assert!(protect(&cx, &image, &sidecar, bad).is_err());
         assert!(!sidecar.exists());
         std::fs::write(&sidecar, [0; HEADER_BYTES]).expect("incomplete");

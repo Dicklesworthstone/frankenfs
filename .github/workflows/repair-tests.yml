@@ -15,11 +15,12 @@ on:
   pull_request:
     branches: [main]
 
+permissions:
+  contents: read
+
 jobs:
   repair:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
@@ -28,62 +29,31 @@ jobs:
         with:
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@v2
+      - name: Install independent ext4 recovery oracles
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y e2fsprogs
       - name: Compile and run repair tests
-        run: cargo test -p ffs-repair
+        run: cargo test -p ffs-repair --locked
       - name: Repair Clippy
-        run: cargo clippy -p ffs-repair --all-targets -- -D warnings
+        run: cargo clippy -p ffs-repair --locked --all-targets -- -D warnings
       - name: Repair formatting
         run: cargo fmt -p ffs-repair --check
-      # Temporary review export for the API-only editing session. This runs
-      # AFTER the gates and cannot turn a failure into a pass. It creates only
-      # unreachable Git blobs, never a commit, branch, or ref; applying any
-      # generated correction requires separate maintainer review and a commit.
-      - name: Export generated corrections for review
-        if: always() && github.event_name == 'push' && github.ref == 'refs/heads/main' && github.repository == 'Dicklesworthstone/frankenfs'
-        env:
-          GH_REVIEW_TOKEN: ${{ github.token }}
+      - name: Capture formatter diagnostics on failure
+        if: failure()
         run: |
           cargo fmt -p ffs-repair
           git diff --check
           git diff --stat
-          git diff -- Cargo.lock
-          python3 - <<'PY'
-          import base64
-          import json
-          import os
-          import pathlib
-          import subprocess
-          import urllib.request
-
-          allowed = [
-              'Cargo.lock',
-              'crates/ffs-repair/src/sidecar.rs',
-              'crates/ffs-repair/src/sidecar_restore.rs',
-              'crates/ffs-repair/src/bin/ffs-image-repair.rs',
-              'crates/ffs-repair/tests/sidecar_cli.rs',
-          ]
-          print('REVIEW_SOURCE', os.environ['GITHUB_SHA'])
-          for path in allowed:
-              diff = subprocess.run(['git', 'diff', '--quiet', '--', path], check=False)
-              if diff.returncode == 0:
-                  continue
-              if diff.returncode != 1:
-                  raise RuntimeError('git diff failed for ' + path)
-              data = pathlib.Path(path).read_bytes()
-              if len(data) > 200000:
-                  raise RuntimeError('unexpected review file size: ' + path)
-              request = urllib.request.Request(
-                  'https://api.github.com/repos/Dicklesworthstone/frankenfs/git/blobs',
-                  data=json.dumps({'encoding': 'base64', 'content': base64.b64encode(data).decode('ascii')}).encode('utf-8'),
-                  headers={
-                      'Authorization': 'Bearer ' + os.environ['GH_REVIEW_TOKEN'],
-                      'Accept': 'application/vnd.github+json',
-                      'Content-Type': 'application/json',
-                      'X-GitHub-Api-Version': '2022-11-28',
-                  },
-                  method='POST',
-              )
-              with urllib.request.urlopen(request, timeout=30) as response:
-                  result = json.load(response)
-              print('REVIEW_BLOB', path, result['sha'])
-          PY
+      - name: Upload repair diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: repair-source-diagnostics
+          retention-days: 7
+          path: |
+            Cargo.lock
+            crates/ffs-repair/src/sidecar.rs
+            crates/ffs-repair/src/sidecar_restore.rs
+            crates/ffs-repair/src/bin/ffs-image-repair.rs
+            crates/ffs-repair/tests/sidecar_cli.rs
