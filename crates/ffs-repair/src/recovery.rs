@@ -8,6 +8,10 @@
 //!
 //! V1 signal model: caller provides explicit corrupt block indices.
 
+mod erasure;
+
+pub use erasure::ErasureRecoveryWritebackBlock;
+
 use asupersync::Cx;
 use asupersync::raptorq::decoder::DecodeStats;
 use ffs_block::BlockDevice;
@@ -39,6 +43,29 @@ pub trait RecoveryWriteback: Send + Sync + std::fmt::Debug {
         device: &dyn BlockDevice,
         recovered: &[RecoveryWritebackBlock<'_>],
     ) -> Result<()>;
+
+    /// Opt in only when unreadability can be checked under this authority's
+    /// exclusion contract. Existing mounted serializers remain opted out.
+    fn supports_unreadable_targets(&self) -> bool {
+        false
+    }
+
+    /// Recover targets with explicit readable or unreadable before-images.
+    ///
+    /// The default must not bypass an existing mounted compare-and-write gate.
+    /// An implementation opting in must preflight the entire batch, preserve
+    /// readable before-images, and reject a formerly unreadable target that has
+    /// become readable before writing. Success requires sync and readback.
+    fn writeback_recovered_erasures(
+        &self,
+        _cx: &Cx,
+        _device: &dyn BlockDevice,
+        _recovered: &[ErasureRecoveryWritebackBlock<'_>],
+    ) -> Result<()> {
+        Err(FfsError::RepairFailed(
+            "writeback authority does not support unreadable repair targets".to_owned(),
+        ))
+    }
 
     fn authority_name(&self) -> &'static str;
 }
@@ -101,6 +128,19 @@ impl RecoveryWriteback for DirectDeviceRecoveryWriteback {
             outcome?;
         }
         Ok(())
+    }
+
+    fn supports_unreadable_targets(&self) -> bool {
+        true
+    }
+
+    fn writeback_recovered_erasures(
+        &self,
+        cx: &Cx,
+        device: &dyn BlockDevice,
+        recovered: &[ErasureRecoveryWritebackBlock<'_>],
+    ) -> Result<()> {
+        erasure::writeback_direct(cx, device, recovered)
     }
 
     fn authority_name(&self) -> &'static str {
@@ -307,6 +347,12 @@ impl<'a> GroupRecoveryOrchestrator<'a> {
 
         let expected_current = match self.capture_expected_current_blocks(cx, normalized) {
             Ok(expected_current) => expected_current,
+            Err(err)
+                if self.writeback.supports_unreadable_targets()
+                    && erasure::is_media_read_failure(&err) =>
+            {
+                return self.recover_unreadable_targets(cx, normalized);
+            }
             Err(err) => {
                 return self.failure_result(
                     0,
