@@ -5,6 +5,8 @@
 //! offline device or a client-read-only mount with exclusive repair ownership;
 //! its preflight is not an atomic compare-and-write primitive for live writers.
 
+mod symbols;
+
 use super::{
     GroupRecoveryOrchestrator, RecoveryAttemptResult, RecoveryDecoderStats, RecoveryEvidence,
     RecoveryOutcome,
@@ -123,24 +125,19 @@ impl GroupRecoveryOrchestrator<'_> {
             ));
         }
 
-        let desc = self.storage.read_group_desc_ext(cx)?;
+        // Select the committed descriptor independently of parity health. A
+        // known missing parity block is an erasure, not a reason to discard all
+        // surviving symbols or silently select an older source generation.
+        let snapshot = symbols::read_generation(
+            cx,
+            self.device,
+            self.storage.layout(),
+            self.source_block_count,
+        )?;
+        let desc = snapshot.descriptor;
+        let symbols = snapshot.symbols;
         evidence.generation = desc.repair_generation;
-        if u32::from(desc.source_block_count) != self.source_block_count
-            || u32::from(desc.symbol_size) != self.device.block_size()
-            || desc.transfer_length
-                != u64::from(self.source_block_count) * u64::from(self.device.block_size())
-        {
-            return Err(FfsError::RepairFailed(
-                "repair descriptor does not match the source geometry".to_owned(),
-            ));
-        }
-        let symbols = self.storage.read_repair_symbols(cx)?;
         evidence.symbols_available = symbols.len();
-        if self.storage.read_group_desc_ext(cx)? != desc {
-            return Err(FfsError::RepairFailed(
-                "repair generation changed while loading erasure recovery symbols".to_owned(),
-            ));
-        }
         evidence.symbols_used = symbols.len();
         let decode = decode_group_with_owned_repair_symbols(
             cx,
@@ -160,11 +157,13 @@ impl GroupRecoveryOrchestrator<'_> {
                 "decoder returned incomplete erasure recovery".to_owned(),
             ));
         }
-        if self.storage.read_group_desc_ext(cx)? != desc {
-            return Err(FfsError::RepairFailed(
-                "repair generation changed during erasure decoding".to_owned(),
-            ));
-        }
+        symbols::ensure_generation(
+            cx,
+            self.device,
+            self.storage.layout(),
+            self.source_block_count,
+            &desc,
+        )?;
         let mut writeback = Vec::with_capacity(indices.len());
         for ((&index, expected), recovered) in indices.iter().zip(&before).zip(&decode.recovered) {
             let block = BlockNumber(self.source_first_block.0 + u64::from(index));
@@ -590,6 +589,65 @@ mod tests {
         )
         .expect("orchestrator")
         .recover_from_indices(&Cx::for_testing(), &[1]);
+        assert!(!result.is_success());
+        assert!(
+            result
+                .evidence
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("source geometry")
+        );
+        assert!(device.writes.lock().expect("writes").is_empty());
+    }
+
+    #[test]
+    fn unreadable_source_and_parity_recover_with_surviving_equations() {
+        let (device, layout, originals) = fixture();
+        device
+            .file
+            .write_all_at(&[0xff; BLOCK_SIZE as usize], u64::from(BLOCK_SIZE))
+            .expect("damage");
+        device.fail_reads(1);
+        device.fail_reads(layout.repair_start_block().0);
+        let result = recover(&device, layout, &[1]);
+        assert!(result.is_success(), "{:?}", result.evidence);
+        assert_eq!(result.evidence.generation, 1);
+        assert_eq!(result.evidence.symbols_available, 3);
+        assert_eq!(result.repaired_blocks, [BlockNumber(1)]);
+        assert_eq!(device.raw_block(1), originals[1]);
+        assert_eq!(*device.writes.lock().expect("writes"), [BlockNumber(1)]);
+    }
+
+    #[test]
+    fn unreadable_source_with_no_surviving_parity_never_writes() {
+        let (device, layout, _) = fixture();
+        device.fail_reads(1);
+        for index in 0..layout.repair_block_count {
+            device.fail_reads(layout.repair_start_block().0 + u64::from(index));
+        }
+        let result = recover(&device, layout, &[1]);
+        assert!(!result.is_success());
+        assert_eq!(result.evidence.symbols_available, 0);
+        assert!(result.repaired_blocks.is_empty());
+        assert!(device.writes.lock().expect("writes").is_empty());
+    }
+
+    #[test]
+    fn newest_descriptor_mismatch_does_not_fall_back_to_old_parity() {
+        let (device, layout, _) = fixture();
+        let cx = Cx::for_testing();
+        let storage = RepairGroupStorage::new(&device, layout);
+        let mut incompatible = storage.read_group_desc_ext(&cx).expect("descriptor");
+        incompatible.source_block_count -= 1;
+        incompatible.transfer_length -= u64::from(BLOCK_SIZE);
+        incompatible.repair_generation += 1;
+        storage
+            .write_group_desc_ext(&cx, &incompatible)
+            .expect("newer descriptor");
+        device.writes.lock().expect("writes").clear();
+        device.fail_reads(1);
+        let result = recover(&device, layout, &[1]);
         assert!(!result.is_success());
         assert!(
             result
