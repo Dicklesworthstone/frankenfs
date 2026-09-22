@@ -2932,4 +2932,14 @@ mod tests {
             }
         }
     }
+
+    #[test]
+    #[ignore = "canonical spec §22.1 Gate 3: directory listing"]
+    fn gate3_directory_listing() {
+        init_dir_block_contains_dot_and_dotdot();
+        init_dir_block_with_tail();
+        representative_dir_block_mutation_exact_golden_contract();
+        reported_edit_span_encloses_every_mutated_byte_bd_4sull();
+    }
 }
+

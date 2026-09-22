@@ -3650,3 +3650,26 @@ fn fuzz_seed_corpus_covers_all_targets() {
         );
     }
 }
+
+#[test]
+#[ignore = "canonical spec §22.1 Gate 1: on-disk format parsing"]
+fn gate1_on_disk_format_parsing() {
+    // 1. Adversarial corpus is panic-free and exercises parse error variants
+    adversarial_corpus_is_panic_free_and_exercises_parse_error_variants();
+
+    // 2. Ext4 and Btrfs superblock parsing and validation boundaries
+    ext4_superblock_adversarial_samples_exercise_boundaries();
+    btrfs_superblock_adversarial_samples_exercise_boundaries();
+
+    // 3. 32-byte and 64-byte group descriptor parsing and checksum verification
+    ext4_group_desc_adversarial_samples_exercise_boundaries();
+
+    // 4. Inode parsing and checksum verification
+    ext4_inode_checksum_adversarial_samples_exercise_boundaries();
+
+    // 5. Tree block, sys chunk, and dev item parsing
+    btrfs_tree_block_adversarial_samples_exercise_boundaries();
+    btrfs_sys_chunk_adversarial_samples_exercise_boundaries();
+    btrfs_dev_item_adversarial_samples_exercise_boundaries();
+}
+

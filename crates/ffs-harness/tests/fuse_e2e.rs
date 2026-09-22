@@ -16,7 +16,7 @@ use asupersync::Cx;
 use ffs_core::{
     BtrfsMountSelection, Ext4JournalReplayMode, FsOps, InodeAttr, OpenFs, OpenOptions, RequestScope,
 };
-use ffs_fuse::{MountOptions, WritebackCacheMode, mount, mount_background};
+use ffs_fuse::{MountOptions, WritebackCacheMode, mount_background};
 use ffs_harness::load_sparse_fixture;
 use ffs_types::{GroupNumber, InodeNumber};
 use serde_json::Value;

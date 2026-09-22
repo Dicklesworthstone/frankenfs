@@ -49,8 +49,8 @@ enum Command {
 }
 
 fn emit(value: &impl Serialize) -> Result<()> {
-    let json = serde_json::to_string_pretty(value)
-        .map_err(|error| FfsError::Format(error.to_string()))?;
+    let json =
+        serde_json::to_string_pretty(value).map_err(|error| FfsError::Format(error.to_string()))?;
     println!("{json}");
     Ok(())
 }
@@ -118,15 +118,10 @@ mod tests {
     fn mutating_commands_require_an_explicit_offline_acknowledgement() {
         assert!(Cli::try_parse_from(["ffs-image-repair", "protect", "a", "b"]).is_err());
         assert!(Cli::try_parse_from(["ffs-image-repair", "restore", "a", "b", "c"]).is_err());
-        assert!(Cli::try_parse_from([
-            "ffs-image-repair",
-            "restore",
-            "a",
-            "b",
-            "c",
-            "--offline"
-        ])
-        .is_ok());
+        assert!(
+            Cli::try_parse_from(["ffs-image-repair", "restore", "a", "b", "c", "--offline"])
+                .is_ok()
+        );
         assert!(Cli::try_parse_from(["ffs-image-repair", "verify", "a", "b"]).is_ok());
     }
 }

@@ -7554,4 +7554,14 @@ ExtentMapping { logical_start: 5, physical_start: 134, count: 2, unwritten: true
             EXTENT_CACHE_SHARDS
         );
     }
+
+    #[test]
+    #[ignore = "canonical spec §22.1 Gate 2: extent resolution"]
+    fn gate2_extent_resolution() {
+        representative_extent_mapping_exact_golden_contract();
+        map_depth1_range_matches_repeated_search_and_reads_leaf_once();
+        map_empty_tree_returns_hole();
+        map_single_extent();
+    }
 }
+

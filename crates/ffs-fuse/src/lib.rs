@@ -25047,4 +25047,15 @@ AllowOther"#;
             }
         }
     }
+
+    #[test]
+    #[ignore = "canonical spec §22.1 Gate 5: FUSE mount and POSIX operations"]
+    fn gate5_fuse_posix_dispatch() {
+        should_shed_with_emergency_gate_sheds_writes();
+        should_shed_with_normal_gate_proceeds_all();
+        should_shed_with_degraded_gate_throttles_without_shedding();
+        access_predictor_backward_sequence_does_not_batch();
+        access_predictor_random_access_does_not_batch();
+    }
 }
+

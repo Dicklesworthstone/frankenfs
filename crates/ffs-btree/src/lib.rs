@@ -5316,4 +5316,11 @@ Hole { hole_len: 90 }
             }
         }
     }
+
+    #[test]
+    #[ignore = "canonical spec §22.1 Gate 2: extent resolution"]
+    fn gate2_btree_indexing() {
+        grow_root_index_reaches_depth2_bd_w9erb();
+    }
 }
+

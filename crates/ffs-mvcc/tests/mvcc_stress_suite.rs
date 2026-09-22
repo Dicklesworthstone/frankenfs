@@ -1296,3 +1296,13 @@ fn verification_gate_safe_merge_correctness_under_high_contention() {
          expected-loss SafeMerge ({loss_merge:.6}) <= Strict ({loss_strict:.6})"
     );
 }
+
+#[test]
+#[ignore = "canonical spec §22.1 Gate 4: MVCC concurrency"]
+fn gate4_mvcc_concurrency() {
+    stress_concurrent_rw();
+    stress_fcw_conflicts();
+    stress_ssi_write_skew();
+    stress_gc_under_load();
+}
+

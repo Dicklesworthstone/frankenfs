@@ -381,3 +381,42 @@ fn demo_output_lines_contain_expected_metrics() {
         "line 4 must contain all_ok=true"
     );
 }
+
+#[test]
+#[ignore = "canonical spec §22.1 Gate 6: RaptorQ self-healing"]
+fn gate6_raptorq_self_healing() {
+    let cx = Cx::for_testing();
+    // 1. Injected block corruption recovers 100% against known-good copy
+    let config_1pct = SelfHealDemoConfig {
+        corruption_percent: 1,
+        repair_symbol_count: 80,
+        ..SelfHealDemoConfig::default()
+    };
+    let result_1pct = run_self_heal_demo(&cx, &config_1pct).expect("gate6 1% demo run");
+    assert!(
+        result_1pct.all_ok,
+        "all payload checksums must verify after 1% repair"
+    );
+    assert_eq!(
+        result_1pct.corrupted_blocks, result_1pct.repaired_blocks,
+        "all corrupted blocks must be repaired"
+    );
+    assert_eq!(result_1pct.files_verified, 10);
+
+    // 2. 5% corruption test
+    let config_5pct = SelfHealDemoConfig {
+        corruption_percent: 5,
+        repair_symbol_count: 80,
+        ..SelfHealDemoConfig::default()
+    };
+    let result_5pct = run_self_heal_demo(&cx, &config_5pct).expect("gate6 5% demo run");
+    assert!(
+        result_5pct.all_ok,
+        "all payload checksums must verify after 5% repair"
+    );
+    assert_eq!(
+        result_5pct.corrupted_blocks, result_5pct.repaired_blocks,
+        "all 5% corrupted blocks must be repaired"
+    );
+}
+

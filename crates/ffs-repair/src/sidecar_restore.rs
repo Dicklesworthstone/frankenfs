@@ -55,7 +55,9 @@ fn install_recovered(
             || block.data.len() != header.options.block_size as usize
             || expected.get(index) != Some(&source_digest(header, block.block.0, &block.data))
         {
-            return Err(corrupt("reconstructed source block failed snapshot verification"));
+            return Err(corrupt(
+                "reconstructed source block failed snapshot verification",
+            ));
         }
         let destination = source
             .blocks
@@ -64,7 +66,9 @@ fn install_recovered(
         *destination = block.data;
     }
     if seen.len() != corrupt_indices.len() {
-        return Err(corrupt("decoder did not reconstruct every damaged source block"));
+        return Err(corrupt(
+            "decoder did not reconstruct every damaged source block",
+        ));
     }
     Ok(())
 }
@@ -105,16 +109,18 @@ fn decode_missing_group(
         })?;
         received.push(ReceivedSymbol::repair(esi, columns, coefficients, data));
     }
-    let decoded = decoder.decode_wavefront(&received, 4).map_err(|error| {
+    let reconstructed = decoder.decode_wavefront(&received, 4).map_err(|error| {
         FfsError::RepairFailed(format!(
             "sidecar group {group} full-source reconstruction failed: {error:?}"
         ))
     })?;
     checkpoint(cx)?;
-    if decoded.source.len() != source_count {
-        return Err(corrupt("full-source decoder returned the wrong block count"));
+    if reconstructed.source.len() != source_count {
+        return Err(corrupt(
+            "full-source decoder returned the wrong block count",
+        ));
     }
-    Ok(decoded
+    Ok(reconstructed
         .source
         .into_iter()
         .enumerate()
@@ -127,7 +133,9 @@ fn decode_missing_group(
 
 fn verify_staged_image(cx: &Cx, image: &File, header: &Header) -> Result<()> {
     if image.metadata()?.len() != header.image_bytes {
-        return Err(corrupt("restored image length differs from the saved generation"));
+        return Err(corrupt(
+            "restored image length differs from the saved generation",
+        ));
     }
     let mut hasher = blake3::Hasher::new();
     let mut buffer = vec![0; 1024 * 1024];
@@ -141,7 +149,9 @@ fn verify_staged_image(cx: &Cx, image: &File, header: &Header) -> Result<()> {
     }
     checkpoint(cx)?;
     if hasher.finalize().as_bytes() != &header.snapshot_digest {
-        return Err(corrupt("restored image does not match the saved whole-image digest"));
+        return Err(corrupt(
+            "restored image does not match the saved whole-image digest",
+        ));
     }
     Ok(())
 }
@@ -215,7 +225,13 @@ pub fn restore(
                 }
                 outcome.recovered
             };
-            install_recovered(header, &mut source, &corrupt_indices, &record.hashes, recovered)?;
+            install_recovered(
+                header,
+                &mut source,
+                &corrupt_indices,
+                &record.hashes,
+                recovered,
+            )?;
         }
 
         // Verify both reconstructed and originally intact buffers before any
@@ -261,8 +277,8 @@ mod tests {
             let image = dir.path().join("source.img");
             let sidecar = dir.path().join("source.ffs-rq");
             let output = dir.path().join("recovered.img");
-            let bytes: Vec<u8> = (0..19 * 512 + 37)
-                .map(|index| ((index * 17 + index / 512) % 251) as u8)
+            let bytes: Vec<u8> = (0_usize..19 * 512 + 37)
+                .map(|index| u8::try_from((index * 17 + index / 512) % 251).expect("fits in u8"))
                 .collect();
             std::fs::write(&image, &bytes).expect("image");
             let options = SidecarOptions {
@@ -281,7 +297,10 @@ mod tests {
         }
 
         fn damage(&self, blocks: &[u64]) {
-            let file = File::options().write(true).open(&self.image).expect("image");
+            let file = File::options()
+                .write(true)
+                .open(&self.image)
+                .expect("image");
             for &block in blocks {
                 file.write_all_at(&[255], block * 512).expect("damage");
             }
@@ -301,11 +320,16 @@ mod tests {
         assert_eq!(report.recovered_blocks, 4);
         assert_eq!(report.intact_blocks, 16);
         assert_eq!(report.output_bytes, fixture.bytes.len() as u64);
-        assert_eq!(std::fs::read(&fixture.output).expect("output"), fixture.bytes);
+        assert_eq!(
+            std::fs::read(&fixture.output).expect("output"),
+            fixture.bytes
+        );
         assert_eq!(std::fs::read(&fixture.image).expect("source"), damaged);
-        assert!(verify(&Cx::for_testing(), &fixture.output, &fixture.sidecar)
-            .expect("verify output")
-            .is_healthy());
+        assert!(
+            verify(&Cx::for_testing(), &fixture.output, &fixture.sidecar)
+                .expect("verify output")
+                .is_healthy()
+        );
     }
 
     #[test]
@@ -327,29 +351,47 @@ mod tests {
         let report = fixture.recover().expect("remaining parity must recover");
         assert_eq!(report.recovered_blocks, 1);
         assert_eq!(report.discarded_repair_symbols, 1);
-        assert_eq!(std::fs::read(&fixture.output).expect("output"), fixture.bytes);
+        assert_eq!(
+            std::fs::read(&fixture.output).expect("output"),
+            fixture.bytes
+        );
     }
 
     #[test]
     fn sidecar_restore_can_rebuild_a_truncated_tail_without_extending_the_source() {
         let fixture = Fixture::new();
-        let file = File::options().write(true).open(&fixture.image).expect("image");
+        let file = File::options()
+            .write(true)
+            .open(&fixture.image)
+            .expect("image");
         file.set_len(19 * 512).expect("truncate last partial block");
         let report = fixture.recover().expect("restore missing tail");
         assert_eq!(report.recovered_blocks, 1);
         assert_eq!(file.metadata().expect("source length").len(), 19 * 512);
-        assert_eq!(std::fs::read(&fixture.output).expect("output"), fixture.bytes);
+        assert_eq!(
+            std::fs::read(&fixture.output).expect("output"),
+            fixture.bytes
+        );
     }
 
     #[test]
     fn sidecar_restore_recovers_an_entire_missing_tail_group_from_parity() {
         let fixture = Fixture::new();
-        let file = File::options().write(true).open(&fixture.image).expect("image");
-        file.set_len(16 * 512).expect("remove entire four-block tail group");
-        let report = fixture.recover().expect("six parity equations recover four sources");
+        let file = File::options()
+            .write(true)
+            .open(&fixture.image)
+            .expect("image");
+        file.set_len(16 * 512)
+            .expect("remove entire four-block tail group");
+        let report = fixture
+            .recover()
+            .expect("six parity equations recover four sources");
         assert_eq!(report.recovered_blocks, 4);
         assert_eq!(file.metadata().expect("source length").len(), 16 * 512);
-        assert_eq!(std::fs::read(&fixture.output).expect("output"), fixture.bytes);
+        assert_eq!(
+            std::fs::read(&fixture.output).expect("output"),
+            fixture.bytes
+        );
     }
 
     #[test]
@@ -359,17 +401,27 @@ mod tests {
             let image = dir.path().join("source.img");
             let sidecar = dir.path().join("source.ffs-rq");
             let output = dir.path().join("recovered.img");
-            let bytes: Vec<u8> = (0..length).map(|index| (index % 251) as u8).collect();
+            let bytes: Vec<u8> = (0_usize..length)
+                .map(|index| u8::try_from(index % 251).expect("fits in u8"))
+                .collect();
             std::fs::write(&image, &bytes).expect("image");
             let cx = Cx::for_testing();
-            protect(&cx, &image, &sidecar, SidecarOptions {
-                block_size: 512,
-                group_blocks: 8,
-                repair_symbols: 6,
-            }).expect("protect tiny tail");
+            protect(
+                &cx,
+                &image,
+                &sidecar,
+                SidecarOptions {
+                    block_size: 512,
+                    group_blocks: 8,
+                    repair_symbols: 6,
+                },
+            )
+            .expect("protect tiny tail");
             let file = File::options().write(true).open(&image).expect("image");
-            file.set_len((length / 512 * 512) as u64).expect("lose final source block");
-            let report = restore(&cx, &image, &sidecar, &output).expect("recover single-source group");
+            file.set_len((length / 512 * 512) as u64)
+                .expect("lose final source block");
+            let report =
+                restore(&cx, &image, &sidecar, &output).expect("recover single-source group");
             assert_eq!(report.recovered_blocks, 1);
             assert_eq!(std::fs::read(output).expect("output"), bytes);
         }
@@ -383,7 +435,10 @@ mod tests {
         let damaged = std::fs::read(&fixture.image).expect("evidence");
         assert!(fixture.recover().is_err());
         assert!(!fixture.output.exists());
-        assert_eq!(std::fs::read(&fixture.image).expect("unchanged source"), damaged);
+        assert_eq!(
+            std::fs::read(&fixture.image).expect("unchanged source"),
+            damaged
+        );
     }
 
     #[test]
@@ -403,12 +458,19 @@ mod tests {
             std::fs::read(&fixture.output).expect("retained"),
             b"keep existing output"
         );
-        let file = File::options().write(true).open(&fixture.sidecar).expect("sidecar");
-        file.write_all_at(&[255; 32], 160).expect("corrupt source digest table");
+        let file = File::options()
+            .write(true)
+            .open(&fixture.sidecar)
+            .expect("sidecar");
+        file.write_all_at(&[255; 32], 160)
+            .expect("corrupt source digest table");
         let other = fixture.output.with_extension("new");
         assert!(restore(&Cx::for_testing(), &fixture.image, &fixture.sidecar, &other).is_err());
         assert!(!other.exists());
-        assert_eq!(std::fs::read(&fixture.image).expect("source"), fixture.bytes);
+        assert_eq!(
+            std::fs::read(&fixture.image).expect("source"),
+            fixture.bytes
+        );
     }
 
     #[test]
@@ -423,7 +485,10 @@ mod tests {
         assert!(!fixture.output.exists());
         std::fs::hard_link(&fixture.image, &fixture.output).expect("alias");
         assert!(fixture.recover().is_err());
-        assert_eq!(std::fs::read(&fixture.image).expect("source"), fixture.bytes);
+        assert_eq!(
+            std::fs::read(&fixture.image).expect("source"),
+            fixture.bytes
+        );
     }
 
     #[test]
@@ -435,10 +500,15 @@ mod tests {
         std::fs::hard_link(&fixture.image, &alias).expect("alias");
         let error = restore(&cx, &alias, &fixture.sidecar, &fixture.output)
             .expect_err("held source must refuse concurrent restore");
-        assert!(matches!(error, FfsError::Io(ref error) if error.kind() == std::io::ErrorKind::WouldBlock));
+        assert!(
+            matches!(error, FfsError::Io(ref error) if error.kind() == std::io::ErrorKind::WouldBlock)
+        );
         assert!(!fixture.output.exists());
         drop(held);
         fixture.recover().expect("retry after release");
-        assert_eq!(std::fs::read(&fixture.output).expect("output"), fixture.bytes);
+        assert_eq!(
+            std::fs::read(&fixture.output).expect("output"),
+            fixture.bytes
+        );
     }
 }

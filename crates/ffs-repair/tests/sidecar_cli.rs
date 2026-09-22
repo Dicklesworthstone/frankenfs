@@ -27,8 +27,8 @@ fn sidecar_binary_protect_verify_restore_round_trip_and_no_clobber() {
     let image = dir.path().join("image.img");
     let sidecar = dir.path().join("image.ffs-rq");
     let restored = dir.path().join("restored.img");
-    let bytes: Vec<u8> = (0..12 * 512 + 17)
-        .map(|index| ((index * 29 + index / 512) % 251) as u8)
+    let bytes: Vec<u8> = (0_usize..12 * 512 + 17)
+        .map(|index| u8::try_from((index * 29 + index / 512) % 251).expect("fits in u8"))
         .collect();
     std::fs::write(&image, &bytes).expect("image");
 
@@ -61,11 +61,7 @@ fn sidecar_binary_protect_verify_restore_round_trip_and_no_clobber() {
         .write_all_at(&[255], 516)
         .expect("corrupt image");
     let damaged = std::fs::read(&image).expect("damaged source");
-    let output = run(&[
-        OsStr::new("verify"),
-        image.as_os_str(),
-        sidecar.as_os_str(),
-    ]);
+    let output = run(&[OsStr::new("verify"), image.as_os_str(), sidecar.as_os_str()]);
     assert_eq!(output.status.code(), Some(2));
     let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("JSON");
     assert_eq!(report["changed_blocks"], 1);
