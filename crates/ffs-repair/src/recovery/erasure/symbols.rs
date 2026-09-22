@@ -80,7 +80,9 @@ fn committed_descriptor(
         || desc.repair_start_block != layout.repair_start_block()
         || desc.repair_block_count != layout.repair_block_count
     {
-        return Err(invalid("repair descriptor does not match the source geometry"));
+        return Err(invalid(
+            "repair descriptor does not match the source geometry",
+        ));
     }
     let end = desc
         .repair_start_block
@@ -91,7 +93,9 @@ fn committed_descriptor(
         || end > slots[0].0
         || end > device.block_count()
     {
-        return Err(invalid("repair symbols exceed the declared device geometry"));
+        return Err(invalid(
+            "repair symbols exceed the declared device geometry",
+        ));
     }
     Ok(desc.clone())
 }
@@ -120,7 +124,9 @@ pub(super) fn read_generation(
     let (verified, symbols) =
         RepairGroupStorage::new(device, layout).read_verified_raw_generation(cx, true)?;
     if verified != descriptor {
-        return Err(invalid("repair generation changed while loading erasure parity"));
+        return Err(invalid(
+            "repair generation changed while loading erasure parity",
+        ));
     }
     ensure_generation(cx, device, layout, source_count, &descriptor)?;
     Ok(RepairGeneration {
@@ -227,8 +233,7 @@ mod tests {
     fn parity_capture_rejects_generation_change_before_decode() {
         let (device, layout) = fixture();
         device.change_on_parity_read.store(true, Ordering::Relaxed);
-        let error =
-            read_generation(&Cx::for_testing(), &device, layout, 8).expect_err("changed");
+        let error = read_generation(&Cx::for_testing(), &device, layout, 8).expect_err("changed");
         assert!(error.to_string().contains("generation changed"));
     }
 
@@ -251,8 +256,7 @@ mod tests {
         conflicting.transfer_length += 256;
         blocks[62][..RepairGroupDescExt::SIZE].copy_from_slice(&conflicting.to_bytes());
         drop(blocks);
-        let error =
-            read_generation(&Cx::for_testing(), &device, layout, 8).expect_err("conflict");
+        let error = read_generation(&Cx::for_testing(), &device, layout, 8).expect_err("conflict");
         assert!(error.to_string().contains("ambiguous"));
         let mut blocks = device.blocks.lock().expect("blocks");
         conflicting.repair_generation = 0;
@@ -260,8 +264,7 @@ mod tests {
         blocks[62][..RepairGroupDescExt::SIZE].copy_from_slice(&conflicting.to_bytes());
         blocks[63].fill(0);
         drop(blocks);
-        let error =
-            read_generation(&Cx::for_testing(), &device, layout, 8).expect_err("bootstrap");
+        let error = read_generation(&Cx::for_testing(), &device, layout, 8).expect_err("bootstrap");
         assert!(error.to_string().contains("not committed"));
     }
 

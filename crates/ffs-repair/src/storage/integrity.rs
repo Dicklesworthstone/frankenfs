@@ -45,8 +45,8 @@ struct Manifest {
 fn bucket_geometry(storage: &RepairGroupStorage<'_>) -> Result<(usize, u32, usize)> {
     let block_size = storage.block_size_usize()?;
     let capacity = block_size.saturating_sub(TABLE_OFFSET) / HASH_BYTES;
-    let capacity = u32::try_from(capacity)
-        .map_err(|_| invalid("raw repair checksum capacity overflows"))?;
+    let capacity =
+        u32::try_from(capacity).map_err(|_| invalid("raw repair checksum capacity overflows"))?;
     if capacity == 0 || storage.layout.repair_block_count == 0 {
         return Err(invalid(
             "raw repair integrity requires descriptor blocks of at least 128 bytes",
@@ -155,7 +155,9 @@ fn decode_manifest(storage: &RepairGroupStorage<'_>, record: Record) -> Result<M
         || record.bytes[64..TABLE_OFFSET] != record_hash(storage, &record.bytes, table_end)
         || record.bytes[table_end..].iter().any(|&byte| byte != 0)
     {
-        return Err(invalid("raw repair integrity manifest checksum or geometry mismatch"));
+        return Err(invalid(
+            "raw repair integrity manifest checksum or geometry mismatch",
+        ));
     }
     Ok(Manifest {
         record,
@@ -177,7 +179,9 @@ fn committed_manifest(storage: &RepairGroupStorage<'_>, cx: &Cx) -> Result<Manif
             if let Some(previous) = &selected
                 && previous.record.bytes != manifest.record.bytes
             {
-                return Err(invalid("ambiguous integrity manifests for one repair generation"));
+                return Err(invalid(
+                    "ambiguous integrity manifests for one repair generation",
+                ));
             }
             selected = Some(manifest);
         }
@@ -243,7 +247,9 @@ pub(super) fn read_generation(
     let manifest = committed_manifest(storage, cx)?;
     let descriptor = &manifest.record.descriptor;
     if !is_raw(storage, descriptor)? {
-        return Err(invalid("verified raw generation requires full-block parity storage"));
+        return Err(invalid(
+            "verified raw generation requires full-block parity storage",
+        ));
     }
     let block_size = storage.block_size_usize()?;
     let mut symbols = Vec::new();
@@ -282,8 +288,7 @@ pub(super) fn read_generation(
         }
         let offset = TABLE_OFFSET + bucket * HASH_BYTES;
         if readable
-            && hash.finalize().as_bytes()[..]
-                == manifest.record.bytes[offset..offset + HASH_BYTES]
+            && hash.finalize().as_bytes()[..] == manifest.record.bytes[offset..offset + HASH_BYTES]
         {
             symbols.append(&mut captured);
         } else {
@@ -300,11 +305,15 @@ pub(super) fn read_generation(
     }
     checkpoint(cx)?;
     if refresh_descriptor(storage, cx)?.to_bytes() != descriptor.to_bytes() {
-        return Err(invalid("repair generation changed while loading verified parity"));
+        return Err(invalid(
+            "repair generation changed while loading verified parity",
+        ));
     }
     let current = committed_manifest(storage, cx)?;
     if current.record.bytes != manifest.record.bytes {
-        return Err(invalid("repair generation changed while loading verified parity"));
+        return Err(invalid(
+            "repair generation changed while loading verified parity",
+        ));
     }
     Ok((manifest.record.descriptor, symbols))
 }
@@ -318,7 +327,12 @@ pub(super) fn ensure_generation(
     if refresh_descriptor(storage, cx)?.to_bytes() != expected.to_bytes() {
         return Err(invalid("repair generation changed during recovery"));
     }
-    if committed_manifest(storage, cx)?.record.descriptor.to_bytes() != expected.to_bytes() {
+    if committed_manifest(storage, cx)?
+        .record
+        .descriptor
+        .to_bytes()
+        != expected.to_bytes()
+    {
         return Err(invalid("repair generation changed during recovery"));
     }
     checkpoint(cx)
@@ -344,10 +358,19 @@ pub(super) fn publish(
     let (block_size, width, count) = bucket_geometry(storage)?;
     let symbol_size = usize::from(descriptor.symbol_size);
     RepairGroupStorage::validate_symbol_input(&descriptor, symbols, symbol_size)?;
-    let symbol_count = u32::try_from(symbols.len())
-        .map_err(|_| invalid("raw repair symbol count overflows"))?;
-    if symbol_count > descriptor.repair_block_count || symbol_size > block_size {
-        return Err(invalid("raw repair symbols exceed reserved capacity"));
+    let symbol_count =
+        u32::try_from(symbols.len()).map_err(|_| invalid("raw repair symbol count overflows"))?;
+    if symbol_count > descriptor.repair_block_count {
+        return Err(FfsError::RepairFailed(format!(
+            "too many raw symbols for reserved region: symbols={} capacity={}",
+            symbols.len(),
+            descriptor.repair_block_count
+        )));
+    }
+    if symbol_size > block_size {
+        return Err(FfsError::RepairFailed(format!(
+            "raw symbol_size {symbol_size} exceeds block_size {block_size}"
+        )));
     }
     // Compute the manifest from the supplied bytes, NEVER from a potentially
     // damaged readback that would bless corruption as the intended generation.
@@ -403,7 +426,9 @@ pub(super) fn publish(
         }
         let number = BlockNumber(descriptor.repair_start_block.0 + u64::from(index));
         if storage.device.read_block(cx, number)?.as_slice() != block.as_slice() {
-            return Err(invalid("raw repair parity readback mismatch before publication"));
+            return Err(invalid(
+                "raw repair parity readback mismatch before publication",
+            ));
         }
     }
     for slot in 0..2 {
@@ -506,9 +531,8 @@ mod tests {
 
     fn fixture(repair_blocks: u32) -> (Device, RepairGroupLayout) {
         let device = Device::new(256);
-        let layout =
-            RepairGroupLayout::new(GroupNumber(7), BlockNumber(0), 64, 0, repair_blocks)
-                .expect("layout");
+        let layout = RepairGroupLayout::new(GroupNumber(7), BlockNumber(0), 64, 0, repair_blocks)
+            .expect("layout");
         let descriptor = RepairGroupDescExt {
             transfer_length: 8 * 256,
             symbol_size: 256,
@@ -557,7 +581,11 @@ mod tests {
         device.corrupt(BlockNumber(layout.repair_start_block().0 + 1), 17);
         assert_eq!(
             storage.read_repair_symbols(&cx).expect("degraded"),
-            vec![expected[0].clone(), expected[2].clone(), expected[3].clone()]
+            vec![
+                expected[0].clone(),
+                expected[2].clone(),
+                expected[3].clone()
+            ]
         );
     }
 
@@ -632,7 +660,11 @@ mod tests {
             state.events = 0;
             state.fail_at = Some(4);
         }
-        assert!(storage.write_repair_symbols(&cx, &symbols(4, 91), 2).is_err());
+        assert!(
+            storage
+                .write_repair_symbols(&cx, &symbols(4, 91), 2)
+                .is_err()
+        );
         device.crash();
         device.corrupt(layout.descriptor_blocks()[0], 0);
         assert!(storage.read_group_desc_ext(&cx).is_err());
@@ -648,7 +680,10 @@ mod tests {
         storage
             .write_repair_symbols(&cx, &expected, 3)
             .expect("explicit trusted regeneration");
-        assert_eq!(storage.read_repair_symbols(&cx).expect("generation 3"), expected);
+        assert_eq!(
+            storage.read_repair_symbols(&cx).expect("generation 3"),
+            expected
+        );
     }
 
     #[test]
@@ -700,7 +735,11 @@ mod tests {
             .write_repair_symbols(&cx, &expected, 1)
             .expect("publish");
         let before = device.0.lock().expect("state").live.clone();
-        assert!(storage.write_repair_symbols(&cx, &symbols(5, 8), 2).is_err());
+        assert!(
+            storage
+                .write_repair_symbols(&cx, &symbols(5, 8), 2)
+                .is_err()
+        );
         let mut malformed = symbols(4, 8);
         malformed[3].1.pop();
         assert!(storage.write_repair_symbols(&cx, &malformed, 2).is_err());

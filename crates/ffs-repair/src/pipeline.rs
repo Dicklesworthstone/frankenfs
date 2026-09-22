@@ -5024,7 +5024,6 @@ mod tests {
     #[test]
     fn scrub_daemon_respects_cancellation_promptly() {
         let cx = Cx::for_testing();
-        cx.set_cancel_requested(true);
 
         let block_size = 256;
         let device = MemBlockDevice::new(block_size, 128);
@@ -5053,6 +5052,9 @@ mod tests {
         );
         let mut daemon = ScrubDaemon::new(pipeline, ScrubDaemonConfig::default());
 
+        // Construct valid durable fixture state before testing daemon cancellation.
+        // Storage now correctly refuses writes through an already-cancelled Cx.
+        cx.set_cancel_requested(true);
         let metrics = daemon.run_until_cancelled(&cx).expect("cancelled stop");
         assert_eq!(metrics.blocks_scanned_total, 0);
         assert_eq!(metrics.scrub_rounds_completed, 0);

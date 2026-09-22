@@ -7,6 +7,10 @@
 //! - structured evidence ledger emission
 //!
 //! V1 signal model: caller provides explicit corrupt block indices.
+//! Full-block recovery loads one integrity-verified raw generation, including
+//! surviving parity from degraded reads, and revalidates that generation after
+//! decoding. Callers still establish source freshness and exclude concurrent
+//! writers; integrity and observation checks are not an atomic storage fence.
 
 mod erasure;
 
@@ -18,9 +22,11 @@ use ffs_block::BlockDevice;
 use ffs_error::{FfsError, Result};
 use ffs_types::{BlockNumber, GroupNumber};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
 
 use crate::codec::{DecodeOutcome, decode_group_with_owned_repair_symbols};
 use crate::storage::{RepairGroupLayout, RepairGroupStorage};
+use crate::symbol::RepairGroupDescExt;
 
 /// Recovered block plus the bytes observed when repair planning began.
 ///
@@ -83,6 +89,25 @@ impl RecoveryWriteback for DirectDeviceRecoveryWriteback {
     ) -> Result<()> {
         use rayon::prelude::{IntoParallelRefIterator, ParallelIterator};
 
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let block_size = device.block_size() as usize;
+        let mut seen = BTreeSet::new();
+        // Validate the complete batch before any I/O, not merely at each
+        // device write: a malformed later target must not partially apply an
+        // otherwise valid earlier target.
+        for block in recovered {
+            if block_size == 0
+                || block.block.0 >= device.block_count()
+                || block.expected_current.len() != block_size
+                || block.data.len() != block_size
+                || !seen.insert(block.block)
+            {
+                return Err(FfsError::RepairFailed(
+                    "invalid or duplicate recovery writeback target".to_owned(),
+                ));
+            }
+        }
+
         // Pre-write compare-and-write gate: confirm each block still matches the
         // scrub-time bytes. The reads are independent, so overlap them across the
         // rayon pool (a blocking read parks its worker); consume the per-block
@@ -91,6 +116,7 @@ impl RecoveryWriteback for DirectDeviceRecoveryWriteback {
         let gate: Vec<Result<()>> = recovered
             .par_iter()
             .map(|block| {
+                cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
                 let observed = device.read_block(cx, block.block)?;
                 if observed.as_slice() != block.expected_current {
                     return Err(FfsError::RepairFailed(format!(
@@ -107,8 +133,10 @@ impl RecoveryWriteback for DirectDeviceRecoveryWriteback {
         // Writes stay serial: the gate has passed, and write ordering / durability
         // semantics are left untouched.
         for block in recovered {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
             device.write_block(cx, block.block, block.data)?;
         }
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         device.sync(cx)?;
         // Post-repair verification: same independent-read overlap as the gate.
         let verify: Vec<Result<()>> = recovered
@@ -127,7 +155,7 @@ impl RecoveryWriteback for DirectDeviceRecoveryWriteback {
         for outcome in verify {
             outcome?;
         }
-        Ok(())
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)
     }
 
     fn supports_unreadable_targets(&self) -> bool {
@@ -341,6 +369,16 @@ impl<'a> GroupRecoveryOrchestrator<'a> {
         cx: &Cx,
         normalized: &[u32],
     ) -> RecoveryAttemptResult {
+        if cx.checkpoint().is_err() {
+            return self.failure_result(
+                0,
+                normalized.len(),
+                0,
+                0,
+                RecoveryDecoderStats::default(),
+                &FfsError::Cancelled,
+            );
+        }
         if normalized.is_empty() {
             return self.success_result(0, 0, 0, RecoveryDecoderStats::default(), Vec::new());
         }
@@ -365,8 +403,11 @@ impl<'a> GroupRecoveryOrchestrator<'a> {
             }
         };
 
-        let desc = match self.storage.read_group_desc_ext(cx) {
-            Ok(desc) => desc,
+        // Metadata and parity come from the SAME sealed generation. A media
+        // failure in parity is useful erasure information even when every
+        // source target remains readable but has a checksum mismatch.
+        let (desc, symbols) = match self.storage.read_verified_raw_generation(cx, true) {
+            Ok(generation) => generation,
             Err(err) => {
                 return self.failure_result(
                     0,
@@ -379,22 +420,17 @@ impl<'a> GroupRecoveryOrchestrator<'a> {
             }
         };
         let generation = desc.repair_generation;
-
-        let symbols = match self.storage.read_repair_symbols(cx) {
-            Ok(symbols) => symbols,
-            Err(err) => {
-                return self.failure_result(
-                    generation,
-                    normalized.len(),
-                    0,
-                    0,
-                    RecoveryDecoderStats::default(),
-                    &err,
-                );
-            }
-        };
-
         let symbols_available = symbols.len();
+        if let Err(err) = self.validate_recovery_geometry(&desc) {
+            return self.failure_result(
+                generation,
+                normalized.len(),
+                symbols_available,
+                0,
+                RecoveryDecoderStats::default(),
+                &err,
+            );
+        }
         let decode = match decode_group_with_owned_repair_symbols(
             cx,
             self.device,
@@ -418,6 +454,20 @@ impl<'a> GroupRecoveryOrchestrator<'a> {
             }
         };
 
+        // A refresh starting after symbol capture invalidates this plan, even
+        // when decoding succeeds. Never hand its reconstructed bytes to a
+        // writeback authority after observing a pending or newer generation.
+        if let Err(err) = self.storage.ensure_verified_raw_generation(cx, &desc) {
+            return self.failure_result(
+                generation,
+                normalized.len(),
+                symbols_available,
+                symbols_available,
+                RecoveryDecoderStats::from(&decode.stats),
+                &err,
+            );
+        }
+
         self.finish_decode(
             cx,
             generation,
@@ -426,6 +476,21 @@ impl<'a> GroupRecoveryOrchestrator<'a> {
             &decode,
             &expected_current,
         )
+    }
+
+    fn validate_recovery_geometry(&self, desc: &RepairGroupDescExt) -> Result<()> {
+        if u32::from(desc.source_block_count) != self.source_block_count
+            || u32::from(desc.symbol_size) != self.device.block_size()
+            || desc.transfer_length
+                != u64::from(self.source_block_count) * u64::from(self.device.block_size())
+            || desc.sub_blocks != 1
+            || desc.symbol_alignment != 4
+        {
+            return Err(FfsError::RepairFailed(
+                "repair descriptor does not match the source geometry".to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     /// Recover from absolute corrupt block numbers.
@@ -531,8 +596,14 @@ impl<'a> GroupRecoveryOrchestrator<'a> {
         let reads: Vec<Result<(BlockNumber, Vec<u8>)>> = blocks
             .into_par_iter()
             .map(|block| {
-                let bytes = self.device.read_block(cx, block)?.as_slice().to_vec();
-                Ok((block, bytes))
+                let bytes = self.device.read_block(cx, block)?;
+                if bytes.is_empty() || bytes.len() != self.device.block_size() as usize {
+                    return Err(FfsError::RepairFailed(format!(
+                        "short before-image at repair target {}",
+                        block.0
+                    )));
+                }
+                Ok((block, bytes.into_inner()))
             })
             .collect();
         let mut expected_current = Vec::with_capacity(reads.len());
@@ -546,11 +617,22 @@ impl<'a> GroupRecoveryOrchestrator<'a> {
         decode: &'b DecodeOutcome,
         expected_current: &'b [(BlockNumber, Vec<u8>)],
     ) -> Result<Vec<RecoveryWritebackBlock<'b>>> {
+        if decode.recovered.len() != expected_current.len() {
+            return Err(FfsError::RepairFailed(
+                "decoder output does not cover the exact recovery target set".to_owned(),
+            ));
+        }
         let mut writeback_blocks = Vec::with_capacity(decode.recovered.len());
+        let mut seen = BTreeSet::new();
         // Both inputs preserve the normalized corrupt-index order. Pair the
         // common path by ordinal position and retain the binary search as a
         // behavior-preserving fallback for an unexpectedly reordered decode.
         for (position, recovered) in decode.recovered.iter().enumerate() {
+            if !seen.insert(recovered.block) {
+                return Err(FfsError::RepairFailed(
+                    "decoder returned a duplicate recovery target".to_owned(),
+                ));
+            }
             let expected = if let Some((block, expected)) = expected_current.get(position)
                 && *block == recovered.block
             {
@@ -566,6 +648,11 @@ impl<'a> GroupRecoveryOrchestrator<'a> {
                 };
                 &expected_current[idx].1
             };
+            if expected.is_empty() || recovered.data.len() != expected.len() {
+                return Err(FfsError::RepairFailed(
+                    "decoder returned an invalid recovered block length".to_owned(),
+                ));
+            }
             writeback_blocks.push(RecoveryWritebackBlock {
                 block: recovered.block,
                 expected_current: expected.as_slice(),
@@ -668,6 +755,7 @@ mod tests {
     use ffs_block::BlockBuf;
     use std::collections::{HashMap, HashSet};
     use std::sync::Mutex;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct MemBlockDevice {
         blocks: Mutex<HashMap<u64, Vec<u8>>>,
@@ -1524,5 +1612,367 @@ mod tests {
             .map_corrupt_blocks_to_indices(&[BlockNumber(5), BlockNumber(5)])
             .expect("mapping");
         assert_eq!(indices.len(), 1, "duplicates should be deduplicated");
+    }
+
+    /// Faults are injected only after real encoding and sealed publication.
+    /// A source read during decoding can invalidate the generation or cancel
+    /// the caller, distinguishing symbol-capture checks from pre-write checks.
+    struct RecoveryFaultDevice {
+        inner: MemBlockDevice,
+        layout: RepairGroupLayout,
+        missing: HashSet<u64>,
+        invalidate_on_decode: AtomicBool,
+        cancel_on_decode: AtomicBool,
+        short_target: bool,
+        writes: AtomicUsize,
+    }
+
+    impl BlockDevice for RecoveryFaultDevice {
+        fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
+            if self.missing.contains(&block.0) {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "injected unreadable parity",
+                )
+                .into());
+            }
+            if block.0 == 0 {
+                if self.invalidate_on_decode.swap(false, Ordering::Relaxed) {
+                    for slot in self.layout.descriptor_blocks() {
+                        let mut bytes = self.inner.read_block(cx, slot)?.into_inner();
+                        let mut descriptor = RepairGroupDescExt::parse(&bytes).expect("descriptor");
+                        descriptor.repair_generation += 1;
+                        bytes[..RepairGroupDescExt::SIZE].copy_from_slice(&descriptor.to_bytes());
+                        self.inner.write_block(cx, slot, &bytes)?;
+                    }
+                }
+                if self.cancel_on_decode.swap(false, Ordering::Relaxed) {
+                    cx.set_cancel_requested(true);
+                }
+            }
+            if block.0 == 1 && self.short_target {
+                return Ok(BlockBuf::new(vec![0xee; 255]));
+            }
+            self.inner.read_block(cx, block)
+        }
+
+        fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
+            self.writes.fetch_add(1, Ordering::Relaxed);
+            self.inner.write_block(cx, block, data)
+        }
+
+        fn block_size(&self) -> u32 {
+            self.inner.block_size()
+        }
+
+        fn block_count(&self) -> u64 {
+            self.inner.block_count()
+        }
+
+        fn sync(&self, cx: &Cx) -> Result<()> {
+            self.inner.sync(cx)
+        }
+    }
+
+    fn verified_fixture(encoded_source_count: u32) -> (RecoveryFaultDevice, Vec<Vec<u8>>) {
+        let cx = Cx::for_testing();
+        let inner = MemBlockDevice::new(256, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout");
+        let originals = write_source_blocks(&cx, &inner, BlockNumber(0), 8, 256);
+        bootstrap_storage(&cx, &inner, layout, BlockNumber(0), encoded_source_count, 4);
+        inner
+            .write_block(&cx, BlockNumber(1), &[0xee; 256])
+            .expect("damage source");
+        (
+            RecoveryFaultDevice {
+                inner,
+                layout,
+                missing: HashSet::new(),
+                invalidate_on_decode: AtomicBool::new(false),
+                cancel_on_decode: AtomicBool::new(false),
+                short_target: false,
+                writes: AtomicUsize::new(0),
+            },
+            originals,
+        )
+    }
+
+    fn verified_recovery(cx: &Cx, device: &RecoveryFaultDevice) -> RecoveryAttemptResult {
+        GroupRecoveryOrchestrator::new(device, test_uuid(), device.layout, BlockNumber(0), 8)
+            .expect("orchestrator")
+            .recover_from_indices(cx, &[1])
+    }
+
+    #[test]
+    fn readable_source_corruption_recovers_despite_unreadable_parity() {
+        let cx = Cx::for_testing();
+        let (mut device, originals) = verified_fixture(8);
+        device.missing.insert(device.layout.repair_start_block().0);
+        let result = verified_recovery(&cx, &device);
+        assert!(result.is_success(), "{:?}", result.evidence);
+        assert_eq!(result.evidence.generation, 1);
+        assert_eq!(result.evidence.symbols_available, 3);
+        assert_eq!(device.writes.load(Ordering::Relaxed), 1);
+        for (index, original) in originals.iter().enumerate() {
+            assert_eq!(
+                device
+                    .inner
+                    .read_block(&cx, BlockNumber(index as u64))
+                    .expect("source")
+                    .as_slice(),
+                original.as_slice()
+            );
+        }
+    }
+
+    #[test]
+    fn readable_source_corruption_uses_only_checksum_verified_parity() {
+        let cx = Cx::for_testing();
+        let (device, originals) = verified_fixture(8);
+        let parity = BlockNumber(device.layout.repair_start_block().0 + 1);
+        let mut bytes = device
+            .inner
+            .read_block(&cx, parity)
+            .expect("parity")
+            .into_inner();
+        bytes[19] ^= 0x80;
+        device
+            .inner
+            .write_block(&cx, parity, &bytes)
+            .expect("damage parity");
+        let result = verified_recovery(&cx, &device);
+        assert!(result.is_success(), "{:?}", result.evidence);
+        assert_eq!(result.evidence.symbols_available, 3);
+        assert_eq!(device.writes.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            device
+                .inner
+                .read_block(&cx, BlockNumber(1))
+                .expect("source")
+                .as_slice(),
+            originals[1]
+        );
+    }
+
+    #[test]
+    fn loss_of_every_parity_bucket_never_writes_source_data() {
+        let cx = Cx::for_testing();
+        let (mut device, _) = verified_fixture(8);
+        let start = device.layout.repair_start_block().0;
+        device.missing.extend(start..start + 4);
+        let result = verified_recovery(&cx, &device);
+        assert!(!result.is_success());
+        assert_eq!(result.evidence.symbols_available, 0);
+        assert!(result.repaired_blocks.is_empty());
+        assert_eq!(device.writes.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn generation_change_during_decode_never_reaches_writeback() {
+        let cx = Cx::for_testing();
+        let (device, _) = verified_fixture(8);
+        device.invalidate_on_decode.store(true, Ordering::Relaxed);
+        let result = verified_recovery(&cx, &device);
+        assert!(!result.is_success(), "{:?}", result.evidence);
+        assert!(
+            result
+                .evidence
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("generation changed")
+        );
+        assert_eq!(device.writes.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            device
+                .inner
+                .read_block(&cx, BlockNumber(1))
+                .expect("source")
+                .as_slice(),
+            [0xee; 256]
+        );
+    }
+
+    #[test]
+    fn cancellation_during_decode_never_reaches_writeback() {
+        let cx = Cx::for_testing();
+        let (device, _) = verified_fixture(8);
+        device.cancel_on_decode.store(true, Ordering::Relaxed);
+        let result = verified_recovery(&cx, &device);
+        assert!(!result.is_success());
+        assert_eq!(device.writes.load(Ordering::Relaxed), 0);
+        assert!(result.repaired_blocks.is_empty());
+        assert!(
+            result
+                .evidence
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("cancelled")
+        );
+    }
+
+    #[test]
+    fn sealed_descriptor_with_wrong_source_geometry_never_decodes_or_writes() {
+        let cx = Cx::for_testing();
+        let (device, _) = verified_fixture(7);
+        let result = verified_recovery(&cx, &device);
+        assert!(!result.is_success());
+        assert_eq!(result.evidence.symbols_used, 0);
+        assert_eq!(device.writes.load(Ordering::Relaxed), 0);
+        assert!(
+            result
+                .evidence
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("source geometry")
+        );
+    }
+
+    #[test]
+    fn decoder_must_return_exact_unique_targets_with_full_length() {
+        use crate::codec::RecoveredBlock;
+
+        let expected = vec![
+            (BlockNumber(1), vec![1; 256]),
+            (BlockNumber(2), vec![2; 256]),
+        ];
+        let first = RecoveredBlock {
+            block: BlockNumber(1),
+            data: vec![3; 256],
+        };
+        let second = RecoveredBlock {
+            block: BlockNumber(2),
+            data: vec![4; 256],
+        };
+        for recovered in [
+            vec![first.clone()],
+            vec![first.clone(), first.clone()],
+            vec![
+                first.clone(),
+                RecoveredBlock {
+                    block: BlockNumber(2),
+                    data: vec![4; 255],
+                },
+            ],
+            vec![
+                first.clone(),
+                RecoveredBlock {
+                    block: BlockNumber(3),
+                    data: vec![4; 256],
+                },
+            ],
+        ] {
+            let outcome = DecodeOutcome {
+                recovered,
+                stats: DecodeStats::default(),
+                complete: true,
+            };
+            assert!(
+                GroupRecoveryOrchestrator::build_writeback_blocks(&outcome, &expected).is_err()
+            );
+        }
+        // Reordering is valid if the exact set and before-images still match.
+        let outcome = DecodeOutcome {
+            recovered: vec![second, first],
+            stats: DecodeStats::default(),
+            complete: true,
+        };
+        let blocks = GroupRecoveryOrchestrator::build_writeback_blocks(&outcome, &expected)
+            .expect("exact reordered set");
+        assert_eq!(blocks[0].expected_current, [2; 256]);
+        assert_eq!(blocks[1].expected_current, [1; 256]);
+    }
+
+    #[test]
+    fn invalid_later_writeback_target_cannot_partially_apply_earlier_target() {
+        let cx = Cx::for_testing();
+        let device = MemBlockDevice::new(256, 8);
+        let before = [0xaa; 256];
+        let after = [0xbb; 256];
+        for block in [BlockNumber(1), BlockNumber(2)] {
+            device.write_block(&cx, block, &before).expect("seed");
+        }
+        let first = RecoveryWritebackBlock {
+            block: BlockNumber(1),
+            expected_current: &before,
+            data: &after,
+        };
+        for invalid in [
+            RecoveryWritebackBlock {
+                block: BlockNumber(2),
+                expected_current: &before,
+                data: &[0; 3],
+            },
+            RecoveryWritebackBlock {
+                block: BlockNumber(8),
+                expected_current: &before,
+                data: &after,
+            },
+            first,
+        ] {
+            assert!(
+                DirectDeviceRecoveryWriteback
+                    .writeback_recovered(&cx, &device, &[first, invalid])
+                    .is_err()
+            );
+            assert_eq!(
+                device
+                    .read_block(&cx, BlockNumber(1))
+                    .expect("unchanged")
+                    .as_slice(),
+                before
+            );
+            assert_eq!(
+                device
+                    .read_block(&cx, BlockNumber(2))
+                    .expect("unchanged")
+                    .as_slice(),
+                before
+            );
+        }
+        DirectDeviceRecoveryWriteback
+            .writeback_recovered(&cx, &device, &[first])
+            .expect("valid write");
+        assert_eq!(
+            device
+                .read_block(&cx, BlockNumber(1))
+                .expect("updated")
+                .as_slice(),
+            after
+        );
+    }
+
+    #[test]
+    fn successful_short_before_image_is_not_a_media_erasure() {
+        let cx = Cx::for_testing();
+        let (mut device, _) = verified_fixture(8);
+        device.short_target = true;
+        let result = verified_recovery(&cx, &device);
+        assert!(!result.is_success());
+        assert_eq!(device.writes.load(Ordering::Relaxed), 0);
+        assert!(
+            result
+                .evidence
+                .reason
+                .as_deref()
+                .unwrap_or_default()
+                .contains("short before-image")
+        );
+    }
+
+    #[test]
+    fn cancelled_empty_recovery_is_not_reported_as_success() {
+        let (device, _) = verified_fixture(8);
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+        let result =
+            GroupRecoveryOrchestrator::new(&device, test_uuid(), device.layout, BlockNumber(0), 8)
+                .expect("orchestrator")
+                .recover_from_indices(&cx, &[]);
+        assert!(!result.is_success());
+        assert_eq!(device.writes.load(Ordering::Relaxed), 0);
     }
 }

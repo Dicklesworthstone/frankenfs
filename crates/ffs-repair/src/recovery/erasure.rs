@@ -278,7 +278,8 @@ mod tests {
     impl ReadFaultDevice {
         fn new() -> Self {
             let file = tempfile::tempfile().expect("temporary device");
-            file.set_len(64 * u64::from(BLOCK_SIZE)).expect("size device");
+            file.set_len(64 * u64::from(BLOCK_SIZE))
+                .expect("size device");
             Self {
                 file,
                 unreadable: Mutex::new(BTreeSet::new()),
@@ -305,7 +306,12 @@ mod tests {
 
     impl BlockDevice for ReadFaultDevice {
         fn read_block(&self, _cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
-            if self.unreadable.lock().expect("fault lock").contains(&block.0) {
+            if self
+                .unreadable
+                .lock()
+                .expect("fault lock")
+                .contains(&block.0)
+            {
                 let count = self.fault_reads.fetch_add(1, Ordering::Relaxed);
                 if count < self.become_readable_after {
                     let kind = if self.permission_fault.load(Ordering::Relaxed) {
@@ -324,7 +330,8 @@ mod tests {
 
         fn write_block(&self, _cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
             assert_eq!(data.len(), BLOCK_SIZE as usize);
-            self.file.write_all_at(data, block.0 * u64::from(BLOCK_SIZE))?;
+            self.file
+                .write_all_at(data, block.0 * u64::from(BLOCK_SIZE))?;
             self.writes.lock().expect("write log").push(block);
             if !self.persistent_fault.load(Ordering::Relaxed) {
                 self.unreadable.lock().expect("fault lock").remove(&block.0);
@@ -393,7 +400,9 @@ mod tests {
             .into_iter()
             .map(|symbol| (symbol.esi, symbol.data))
             .collect::<Vec<_>>();
-        storage.write_repair_symbols(&cx, &symbols, 1).expect("parity");
+        storage
+            .write_repair_symbols(&cx, &symbols, 1)
+            .expect("parity");
         device.writes.lock().expect("write log").clear();
         (device, layout, originals)
     }
@@ -580,15 +589,10 @@ mod tests {
     fn erasure_recovery_rejects_mismatched_descriptor_geometry() {
         let (device, layout, _) = fixture();
         device.fail_reads(1);
-        let result = GroupRecoveryOrchestrator::new(
-            &device,
-            UUID,
-            layout,
-            BlockNumber(0),
-            SOURCE_COUNT - 1,
-        )
-        .expect("orchestrator")
-        .recover_from_indices(&Cx::for_testing(), &[1]);
+        let result =
+            GroupRecoveryOrchestrator::new(&device, UUID, layout, BlockNumber(0), SOURCE_COUNT - 1)
+                .expect("orchestrator")
+                .recover_from_indices(&Cx::for_testing(), &[1]);
         assert!(!result.is_success());
         assert!(
             result
