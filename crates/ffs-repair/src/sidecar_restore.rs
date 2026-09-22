@@ -6,12 +6,14 @@
 //! Unrecoverable corruption, cancellation, or a pre-existing destination leaves
 //! the destination unpublished/unchanged and the original evidence untouched.
 
-use crate::codec::decode_group_with_owned_repair_symbols;
+use crate::codec::{RecoveredBlock, decode_group_with_owned_repair_symbols};
 use crate::sidecar::{
     Archive, Header, MemoryGroup, ProtectionInfo, checkpoint, corrupt, load_source, open_image,
     parent_path, publish_new, source_digest,
 };
+use crate::symbol::repair_seed;
 use asupersync::Cx;
+use asupersync::raptorq::decoder::{InactivationDecoder, ReceivedSymbol};
 use ffs_error::{FfsError, Result};
 use ffs_types::{BlockNumber, GroupNumber};
 use serde::Serialize;
@@ -37,7 +39,7 @@ fn install_recovered(
     source: &mut MemoryGroup,
     corrupt_indices: &[u32],
     expected: &[[u8; 32]],
-    recovered: Vec<crate::codec::RecoveredBlock>,
+    recovered: Vec<RecoveredBlock>,
 ) -> Result<()> {
     let mut seen = BTreeSet::new();
     for block in recovered {
@@ -65,6 +67,62 @@ fn install_recovered(
         return Err(corrupt("decoder did not reconstruct every damaged source block"));
     }
     Ok(())
+}
+
+/// The on-image recovery API deliberately refuses a group with no intact
+/// source. A sidecar has an independent digest for EVERY original source block
+/// plus a whole-image digest, and restores only to a new file, so it can safely
+/// solve this case without weakening that existing on-image policy. Use the
+/// same native RaptorQ equations/constraints as codec::decode_group, then let
+/// install_recovered verify the entire result against the saved generation.
+fn decode_missing_group(
+    cx: &Cx,
+    header: &Header,
+    group: u32,
+    source: &MemoryGroup,
+    symbols: Vec<(u32, Vec<u8>)>,
+) -> Result<Vec<RecoveredBlock>> {
+    checkpoint(cx)?;
+    let source_count = source.blocks.len();
+    if symbols.len() < source_count {
+        return Err(FfsError::RepairFailed(format!(
+            "sidecar group {group} lost all {source_count} source blocks but has only {} valid repair symbols",
+            symbols.len()
+        )));
+    }
+    let decoder = InactivationDecoder::new(
+        source_count,
+        header.options.block_size as usize,
+        repair_seed(&header.seed, GroupNumber(group)),
+    );
+    let mut received = decoder.constraint_symbols();
+    for (esi, data) in symbols {
+        checkpoint(cx)?;
+        let (columns, coefficients) = decoder.repair_equation(esi).map_err(|error| {
+            FfsError::RepairFailed(format!(
+                "sidecar group {group} repair equation {esi} failed: {error:?}"
+            ))
+        })?;
+        received.push(ReceivedSymbol::repair(esi, columns, coefficients, data));
+    }
+    let decoded = decoder.decode_wavefront(&received, 4).map_err(|error| {
+        FfsError::RepairFailed(format!(
+            "sidecar group {group} full-source reconstruction failed: {error:?}"
+        ))
+    })?;
+    checkpoint(cx)?;
+    if decoded.source.len() != source_count {
+        return Err(corrupt("full-source decoder returned the wrong block count"));
+    }
+    Ok(decoded
+        .source
+        .into_iter()
+        .enumerate()
+        .map(|(index, data)| RecoveredBlock {
+            block: BlockNumber(source.first + index as u64),
+            data,
+        })
+        .collect())
 }
 
 fn verify_staged_image(cx: &Cx, image: &File, header: &Header) -> Result<()> {
@@ -95,11 +153,10 @@ fn verify_staged_image(cx: &Cx, image: &File, header: &Header) -> Result<()> {
 /// was corruption or an intentional later write. This operation therefore
 /// requires an explicit new destination rather than rolling back the source.
 ///
-/// A corrupt parity symbol is discarded independently; surviving symbols are
-/// used when the codec can still recover the missing data. The current codec
-/// requires at least one intact source block per damaged group and may refuse
-/// a rank-deficient symbol set even when the symbol count appears sufficient.
-/// Such refusals never publish a partial output image.
+/// A corrupt parity symbol is discarded independently. Even an entirely lost
+/// source group can be reconstructed when the surviving parity equations have
+/// sufficient rank. A rank-deficient set or an exceeded redundancy budget is
+/// an error; no partial output image is published.
 pub fn restore(
     cx: &Cx,
     image_path: &Path,
@@ -137,29 +194,28 @@ pub fn restore(
         report.discarded_repair_symbols += record.invalid_symbols;
 
         if !corrupt_indices.is_empty() {
-            let outcome = decode_group_with_owned_repair_symbols(
-                cx,
-                &source,
-                &header.seed,
-                GroupNumber(group),
-                BlockNumber(source.first),
-                source.blocks.len() as u32,
-                &corrupt_indices,
-                record.symbols,
-            )?;
-            checkpoint(cx)?;
-            if !outcome.complete {
-                return Err(FfsError::RepairFailed(format!(
-                    "sidecar group {group} could not be completely reconstructed"
-                )));
-            }
-            install_recovered(
-                header,
-                &mut source,
-                &corrupt_indices,
-                &record.hashes,
-                outcome.recovered,
-            )?;
+            let recovered = if corrupt_indices.len() == source.blocks.len() {
+                decode_missing_group(cx, header, group, &source, record.symbols)?
+            } else {
+                let outcome = decode_group_with_owned_repair_symbols(
+                    cx,
+                    &source,
+                    &header.seed,
+                    GroupNumber(group),
+                    BlockNumber(source.first),
+                    source.blocks.len() as u32,
+                    &corrupt_indices,
+                    record.symbols,
+                )?;
+                checkpoint(cx)?;
+                if !outcome.complete {
+                    return Err(FfsError::RepairFailed(format!(
+                        "sidecar group {group} could not be completely reconstructed"
+                    )));
+                }
+                outcome.recovered
+            };
+            install_recovered(header, &mut source, &corrupt_indices, &record.hashes, recovered)?;
         }
 
         // Verify both reconstructed and originally intact buffers before any
@@ -286,6 +342,40 @@ mod tests {
     }
 
     #[test]
+    fn sidecar_restore_recovers_an_entire_missing_tail_group_from_parity() {
+        let fixture = Fixture::new();
+        let file = File::options().write(true).open(&fixture.image).expect("image");
+        file.set_len(16 * 512).expect("remove entire four-block tail group");
+        let report = fixture.recover().expect("six parity equations recover four sources");
+        assert_eq!(report.recovered_blocks, 4);
+        assert_eq!(file.metadata().expect("source length").len(), 16 * 512);
+        assert_eq!(std::fs::read(&fixture.output).expect("output"), fixture.bytes);
+    }
+
+    #[test]
+    fn sidecar_restore_recovers_a_lone_last_block_and_a_completely_truncated_tiny_image() {
+        for length in [37_usize, 8 * 512 + 37] {
+            let dir = tempfile::tempdir().expect("directory");
+            let image = dir.path().join("source.img");
+            let sidecar = dir.path().join("source.ffs-rq");
+            let output = dir.path().join("recovered.img");
+            let bytes: Vec<u8> = (0..length).map(|index| (index % 251) as u8).collect();
+            std::fs::write(&image, &bytes).expect("image");
+            let cx = Cx::for_testing();
+            protect(&cx, &image, &sidecar, SidecarOptions {
+                block_size: 512,
+                group_blocks: 8,
+                repair_symbols: 6,
+            }).expect("protect tiny tail");
+            let file = File::options().write(true).open(&image).expect("image");
+            file.set_len((length / 512 * 512) as u64).expect("lose final source block");
+            let report = restore(&cx, &image, &sidecar, &output).expect("recover single-source group");
+            assert_eq!(report.recovered_blocks, 1);
+            assert_eq!(std::fs::read(output).expect("output"), bytes);
+        }
+    }
+
+    #[test]
     fn sidecar_restore_refuses_excess_erasures_without_publishing_a_prefix() {
         let fixture = Fixture::new();
         // Group zero stages successfully; group one exceeds its parity budget.
@@ -294,6 +384,14 @@ mod tests {
         assert!(fixture.recover().is_err());
         assert!(!fixture.output.exists());
         assert_eq!(std::fs::read(&fixture.image).expect("unchanged source"), damaged);
+    }
+
+    #[test]
+    fn sidecar_restore_refuses_full_group_loss_when_parity_is_insufficient() {
+        let fixture = Fixture::new();
+        fixture.damage(&[8, 9, 10, 11, 12, 13, 14, 15]);
+        assert!(fixture.recover().is_err());
+        assert!(!fixture.output.exists());
     }
 
     #[test]

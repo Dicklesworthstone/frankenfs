@@ -54,21 +54,22 @@ symbols per group. `protect` accepts `--block-size`, `--group-blocks`, and
 `--repair-symbols`. Source buffers are capped at 4 MiB per group; codec working
 memory adds bounded overhead. These groups are protection units, not filesystem
 allocation groups. Damage concentrated in one group can exceed its redundancy
-even when total image damage is small. The current decoder requires at least
-one intact source block in each damaged group and may reject a rank-deficient
-set. The final partial group has the same repair-symbol budget but fewer source
-blocks, possibly only one; losing that entire group is not recoverable through
-the current decoder.
+even when total image damage is small. Recovery can also solve an entirely lost
+source group when the remaining parity equations have sufficient rank, including
+a final group containing just one block. Unlike the on-image recovery API, this
+path has an independent digest for every original source block and restores only
+to a separate output. Insufficient or rank-deficient parity still fails closed;
+there is no claim that a particular symbol count guarantees recovery.
 
 ## Integrity and publication
 
 The archive header, group geometry and source digest tables are checksummed.
 Every repair symbol has its own checksum and encoding-symbol ID; corrupt or
 duplicate symbols are excluded independently. Recovery uses the existing
-FrankenFS RaptorQ decoder with the exact captured, validated source buffers.
-Every recovered block must match its saved BLAKE3 digest. The entire staged
-output is reread and must match the saved whole-image digest before publication.
-An unrecoverable later group never exposes a partial final image.
+FrankenFS/asupersync RaptorQ equations with the exact captured, validated source
+buffers. Every recovered block must match its saved BLAKE3 digest. The entire
+staged output is reread and must match the saved whole-image digest before
+publication. An unrecoverable later group never exposes a partial final image.
 
 Checksums detect accidental corruption, not maliciously forged archives. This
 format does not authenticate a sidecar supplied by an adversary. It is a new,
