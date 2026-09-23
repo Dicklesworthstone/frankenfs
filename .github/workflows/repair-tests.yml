@@ -62,27 +62,85 @@ jobs:
             crates/ffs-repair/src/bin/ffs-image-repair.rs
             crates/ffs-repair/tests/sidecar_cli.rs
 
-  inspect-btrfs-source:
-    if: github.event_name == 'push'
+  prepare-raid56-source:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
     runs-on: ubuntu-24.04-arm
+    permissions:
+      contents: write
     steps:
       - uses: actions/checkout@v4
         with:
           persist-credentials: false
-      - name: Capture exact tracked sources and device-routing beads
-        run: |
-          git rev-parse HEAD
-          git archive --format=tar HEAD crates vendor Cargo.toml Cargo.lock rust-toolchain.toml .cargo .beads/issues.jsonl AGENTS.md PLAN_TO_PORT_FRANKENFS_TO_RUST.md COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md EXISTING_EXT4_BTRFS_STRUCTURE.md .github/workflows > "$RUNNER_TEMP/frankenfs-source.tar"
-          python3 - <<'PY'
-          import json
-          from pathlib import Path
-          for line in Path('.beads/issues.jsonl').read_text().splitlines():
-              item = json.loads(line)
-              if item['id'] in {'bd-j9k3y', 'bd-m5fwf', 'bd-6d4wn', 'bd-hk5w3', 'bd-j7a4e'}:
-                  print(json.dumps(item))
-          PY
-      - uses: actions/upload-artifact@v4
+      - uses: dtolnay/rust-toolchain@nightly
         with:
-          name: pinned-btrfs-source
+          components: rustfmt, clippy
+      - uses: Swatinem/rust-cache@v2
+      - name: Fetch reviewed immutable source
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/raid56-source"
+          for sha in 4f144bd1747fe16fb51f4042eb14e9fca91c98e5 eeb8e3c27067510787b263c0a28a5f81bc3004b8 c3da81c2fb61590faf016924b01f709e95d14482 1a0832b434f6266464dde4e0594e956c10455c84; do
+            gh api repos/Dicklesworthstone/frankenfs/git/blobs/$sha --jq .content | base64 --decode > "$RUNNER_TEMP/raid56-source/$sha"
+            test "$(git hash-object "$RUNNER_TEMP/raid56-source/$sha")" = "$sha"
+          done
+      - name: Apply to the exact baseline and format
+        id: prepare
+        run: |
+          set -euo pipefail
+          test "$(git hash-object crates/ffs-core/src/lib.rs)" = 1b46848fb3905d86788bdda6e571b998aaf757ff
+          test ! -e crates/ffs-core/src/btrfs_raid56.rs
+          git apply --check "$RUNNER_TEMP/raid56-source/4f144bd1747fe16fb51f4042eb14e9fca91c98e5"
+          git apply "$RUNNER_TEMP/raid56-source/4f144bd1747fe16fb51f4042eb14e9fca91c98e5"
+          test "$(git hash-object crates/ffs-core/src/lib.rs)" = 78e5ebacafa94047e42ba55aecb675f479eff859
+          mkdir -p crates/ffs-core/src/btrfs_raid56
+          cp "$RUNNER_TEMP/raid56-source/eeb8e3c27067510787b263c0a28a5f81bc3004b8" crates/ffs-core/src/btrfs_raid56.rs
+          cp "$RUNNER_TEMP/raid56-source/c3da81c2fb61590faf016924b01f709e95d14482" crates/ffs-core/src/btrfs_raid56/tests.rs
+          cp "$RUNNER_TEMP/raid56-source/1a0832b434f6266464dde4e0594e956c10455c84" .github/workflows/btrfs-reads.yml
+          cargo fmt -p ffs-core
+          git diff --check
+      - name: Export immutable formatted blobs without updating a ref
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          python3 - <<'PY'
+          import base64, hashlib, json, os, pathlib, urllib.request
+          paths = ['crates/ffs-core/src/lib.rs', 'crates/ffs-core/src/btrfs_raid56.rs', 'crates/ffs-core/src/btrfs_raid56/tests.rs', '.github/workflows/btrfs-reads.yml']
+          records = []
+          for path in paths:
+              data = pathlib.Path(path).read_bytes()
+              sha = hashlib.sha1(b'blob ' + str(len(data)).encode() + b'\0' + data).hexdigest()
+              request = urllib.request.Request('https://api.github.com/repos/Dicklesworthstone/frankenfs/git/blobs', data=json.dumps({'content':base64.b64encode(data).decode(), 'encoding':'base64'}).encode(), headers={'Authorization':'Bearer '+os.environ['GH_TOKEN'], 'Accept':'application/vnd.github+json', 'Content-Type':'application/json'}, method='POST')
+              with urllib.request.urlopen(request, timeout=30) as response:
+                  result = json.load(response)
+              assert result['sha'] == sha
+              records.append({'path':path, 'sha':sha, 'bytes':len(data)})
+          pathlib.Path('raid56-prepared.json').write_text(json.dumps(records, indent=2))
+          print(json.dumps(records))
+          PY
+      - name: Exercise the complete core library
+        id: tests
+        run: |
+          set -o pipefail
+          cargo test -p ffs-core --locked --lib 2>&1 | tee raid56-tests.log
+      - name: Check all core targets with Clippy
+        if: always() && steps.prepare.outcome == 'success'
+        run: |
+          set -o pipefail
+          cargo clippy -p ffs-core --locked --all-targets -- -D warnings 2>&1 | tee raid56-clippy.log
+      - name: Publish source and execution diagnostics
+        if: always() && steps.prepare.outcome == 'success'
+        uses: actions/upload-artifact@v4
+        with:
+          name: prepared-raid56-source
           retention-days: 1
-          path: ${{ runner.temp }}/frankenfs-source.tar
+          include-hidden-files: true
+          path: |
+            raid56-prepared.json
+            raid56-tests.log
+            raid56-clippy.log
+            crates/ffs-core/src/lib.rs
+            crates/ffs-core/src/btrfs_raid56.rs
+            crates/ffs-core/src/btrfs_raid56/tests.rs
+            .github/workflows/btrfs-reads.yml
