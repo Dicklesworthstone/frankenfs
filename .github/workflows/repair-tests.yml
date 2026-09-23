@@ -61,3 +61,28 @@ jobs:
             crates/ffs-repair/src/sidecar_restore.rs
             crates/ffs-repair/src/bin/ffs-image-repair.rs
             crates/ffs-repair/tests/sidecar_cli.rs
+
+  inspect-btrfs-source:
+    if: github.event_name == 'push'
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+      - name: Capture exact tracked sources and device-routing beads
+        run: |
+          git rev-parse HEAD
+          git archive --format=tar HEAD crates vendor Cargo.toml Cargo.lock rust-toolchain.toml .cargo .beads/issues.jsonl AGENTS.md PLAN_TO_PORT_FRANKENFS_TO_RUST.md COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md EXISTING_EXT4_BTRFS_STRUCTURE.md .github/workflows > "$RUNNER_TEMP/frankenfs-source.tar"
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+          for line in Path('.beads/issues.jsonl').read_text().splitlines():
+              item = json.loads(line)
+              if item['id'] in {'bd-j9k3y', 'bd-m5fwf', 'bd-6d4wn', 'bd-hk5w3', 'bd-j7a4e'}:
+                  print(json.dumps(item))
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: pinned-btrfs-source
+          retention-days: 1
+          path: ${{ runner.temp }}/frankenfs-source.tar
