@@ -12,6 +12,9 @@
 //! archive supplied by an adversary. A sidecar describes one saved generation,
 //! not permission to roll back subsequent legitimate filesystem writes.
 
+/// Mutable image I/O with external, restart-safe repair coverage.
+pub mod live;
+
 use crate::codec::encode_group;
 use asupersync::Cx;
 use ffs_block::{BlockBuf, BlockDevice};
