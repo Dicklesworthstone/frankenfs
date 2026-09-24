@@ -12,7 +12,7 @@ reviewer yet.
 |---|---|---|
 | `bd-38cj9` | `main` compiles again (dev-only dep used from lib code; fmt; clippy) | workspace clippy exit 0; full workspace `cargo test` could not complete (worker OOM, exit 137, twice) |
 | `bd-5elw6` | `enable_writes` refuses non-default subvolume/snapshot; README walkthrough fixed | test on a formatted btrfs image PASS. **Refusal only** — subvolume RW remains open |
-| `bd-0mcvt` | every rewritten tree block, free-space-tree block, data block and tree-log node goes to all DUP copies | both copies of the new root-tree root byte-identical with the committed generation on a default-formatted image: PASS |
+| `bd-0mcvt` | every rewritten tree block, free-space-tree block, data block and tree-log node goes to all DUP copies; tree reads (including the mount-time walk) fall back to the other copy on read/checksum failure | both copies byte-identical after commit; with copy 1 corrupted a fresh open reads copy 2 and the file is intact; with both corrupted the open fails: PASS |
 | `bd-xsu7s` | failed orphan recovery latches read-only; `enable_writes` refuses | synthetic fixture test |
 | `bd-plamw` | repair-symbol writes check the tail against the ext4 bitmap / btrfs extent tree; `--background-repair` refused on RW mounts | unit + CLI tests PASS. **Refusal only** — real reservation remains open |
 | `bd-34blv` | write-time data-chunk growth on by default (kernel-accepted in bd-a136s); metadata growth still opt-in | parser test PASS |
@@ -21,8 +21,13 @@ reviewer yet.
 | `bd-0r0kc` | hollow gate5/gate7 wrappers removed → `not_implemented`; FEATURE_PARITY notes partial gates | — |
 | `bd-53dub` | `oracle_unavailable` hook, CI installs btrfs-progs and sets `FFS_REQUIRE_ORACLES=1`, progs differential expects pass | 26 `*_passes_btrfs_check*` tests ran with the oracle REQUIRED: 26/26 PASS |
 | `bd-tmwe8` | btrfs scrub/snapshot/subvolume/defrag/move_ext ioctls no longer report success for work not done | test on a formatted btrfs image |
-| `bd-jufod` | `Ext4MetadataValidator`: offline and read-only mounted scrub verify group-descriptor and bitmap checksums | clean image scrubs clean; flipped bitmap/descriptor bytes detected (first slice; inode tables, extent/dir blocks and data remain) |
+| `bd-jufod` | `Ext4MetadataValidator`: offline and read-only mounted scrub verify group-descriptor, bitmap and live-inode checksums | clean image scrubs clean; flipped bitmap, descriptor and root-inode bytes detected (extent/dir blocks and data remain) |
+| `bd-7ssc7` | `ffs mount --mvcc-policy {strict,safe-merge,adaptive}` / `OpenFs::set_mvcc_conflict_policy`, surviving the JBD2 store switch | test PASS; mounted MVCC evidence ledger still open |
 | `bd-dax3o` | ~40 README claims corrected | diff reviewed |
+
+**Aggregate run** (rch, `FFS_REQUIRE_ORACLES=1`, `cargo test -p ffs-core -p ffs-journal -p ffs-cli -p ffs-repair`): 2,760 passed / 2 failed / 33 ignored at `af1bba31`. Neither failure came from this work: `bd_k115m` had never run (its 64 MiB fixture was below the btrfs formatter's ~109 MiB minimum, so it skipped silently; exposed by the new oracle contract, fixture fixed in `52b5a65b`, now passing), and the `bd_y2t0r` concurrent-create test now hits a retryable `MvccConflict` introduced by `f2b99486` (recorded on `bd-y2t0r`).
+
+**Workspace incident.** During this session a process in the shared workspace moved the branch back to `origin/main` with a hard reset (reflog: `reset: moving to origin/main`, twice), discarding uncommitted edits; they were re-applied from the verified content in `52b5a65b`.
 
 ## Reality check — 2026-09-23 (HEAD `75e0d3e8`)
 
