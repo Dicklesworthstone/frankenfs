@@ -23,14 +23,16 @@
 
 use crate::wal::{self, HEADER_SIZE, WalCommit, WalHeader};
 use crate::wal_replay::{ReplayOutcome, TailPolicy, WalReplayEngine};
-use crate::wal_writer::{SyncPolicy, WalWriter, WalWriterConfig};
+use crate::wal_writer::{SyncPolicy, WalWriter, WalWriterConfig, open_owned_wal};
 use crate::{BlockVersion, CommitError, MvccStore, Transaction};
 use asupersync::Cx;
 use ffs_error::{FfsError, Result};
 use ffs_types::{BlockNumber, CommitSeq};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(test)]
+use std::fs::OpenOptions;
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
@@ -174,6 +176,14 @@ const CHECKPOINT_HEADER_SIZE: usize = 28;
 /// The write path is backed by [`WalWriter`], which provides integrity checks,
 /// configurable sync policy, backpressure signaling, and structured logging.
 ///
+/// Every open entry point takes a nonblocking exclusive advisory lock on the
+/// WAL inode before checkpoint discovery, replay, or tail repair. The writer
+/// retains that lock through checkpoints and WAL truncation until the store is
+/// dropped. A conflicting open returns an I/O `WouldBlock` error, including
+/// through hard-link and symbolic-link aliases. These single-host locks do not
+/// protect against non-cooperating writers or external pathname replacement;
+/// callers must keep the WAL and its checkpoint namespace stable.
+///
 /// # Lock ordering invariant (bd-7zd94)
 ///
 /// The struct holds three [`parking_lot::RwLock`]s. Any code path that
@@ -232,20 +242,18 @@ impl PersistentMvccStore {
     ///
     /// Returns an error if the WAL file cannot be opened/created or if replay
     /// fails due to corruption (corruption at the tail is tolerated).
+    /// An already-owned WAL returns an I/O `WouldBlock` error without recovery
+    /// or mutation. Checkpoint discovery occurs only after acquiring ownership.
     pub fn open(cx: &Cx, wal_path: impl AsRef<Path>) -> Result<Self> {
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let wal_path = wal_path.as_ref();
         let checkpoint_path = wal_path.with_extension("ckpt");
-        if checkpoint_path.exists() {
-            Self::open_with_checkpoint_and_options(
-                cx,
-                wal_path,
-                checkpoint_path,
-                &PersistOptions::default(),
-            )
-        } else {
-            Self::open_with_options(cx, wal_path, &PersistOptions::default())
-        }
+        Self::open_with_checkpoint_and_options(
+            cx,
+            wal_path,
+            checkpoint_path,
+            &PersistOptions::default(),
+        )
     }
 
     /// Open a persistent MVCC store with a checkpoint.
@@ -277,12 +285,18 @@ impl PersistentMvccStore {
         let checkpoint_path = checkpoint_path.as_ref();
         let writer_config = options.to_writer_config();
 
+        // Ownership must precede even the checkpoint-existence probe: a prior
+        // owner may publish a checkpoint and truncate its WAL before releasing
+        // the inode. A decision made before admission could miss that snapshot.
+        let mut file = open_owned_wal(wal_path)?;
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+
         let mut store = MvccStore::new();
         let mut stats = WalStats::default();
         let mut recovery = WalRecoveryReport::default();
 
         // Try to load checkpoint first
-        if checkpoint_path.exists() {
+        if checkpoint_path.try_exists()? {
             load_checkpoint(checkpoint_path, &mut store)?;
             cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
             let ckpt_seq = store.next_commit.saturating_sub(1);
@@ -291,14 +305,8 @@ impl PersistentMvccStore {
             recovery.checkpoint_commit_seq = Some(ckpt_seq);
         }
 
-        // Open or create WAL
+        // The same owned descriptor covers checkpoint loading and WAL replay.
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(wal_path)?;
 
         let write_pos: u64;
 
@@ -346,6 +354,10 @@ impl PersistentMvccStore {
     }
 
     /// Open a persistent MVCC store with custom options.
+    ///
+    /// This is deliberately WAL-only, without automatic checkpoint discovery.
+    /// Like the checkpoint-based entry points, it acquires exclusive ownership
+    /// before examining or changing the WAL.
     pub fn open_with_options(
         cx: &Cx,
         wal_path: impl AsRef<Path>,
@@ -355,12 +367,8 @@ impl PersistentMvccStore {
         let path = wal_path.as_ref();
         let writer_config = options.to_writer_config();
 
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(path)?;
+        let mut file = open_owned_wal(path)?;
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
 
         let mut store = MvccStore::new();
         let mut stats = WalStats::default();
@@ -1248,6 +1256,10 @@ mod checkpoint_publication_tests;
 #[cfg(test)]
 #[path = "persist/recovery_tests.rs"]
 mod recovery_tests;
+
+#[cfg(test)]
+#[path = "persist/ownership_tests.rs"]
+mod ownership_tests;
 
 #[cfg(test)]
 mod tests {
