@@ -80,10 +80,11 @@ use cmd_inspect::inspect_ext4_output;
 use cmd_repair::{
     DEFAULT_REPAIR_OVERHEAD_RATIO, Ext4RepairStaleness, REPAIR_COORDINATION_SCENARIO_FSCK,
     RepairCoordinationOutput, append_btrfs_repair_detail, block_range_contains,
-    build_ext4_repair_group_specs, coordinate_repair_write_access,
+    btrfs_repair_tail_free, build_ext4_repair_group_specs, coordinate_repair_write_access,
     detect_flavor_with_optional_btrfs_bootstrap, discover_btrfs_repair_group_specs,
-    primary_btrfs_superblock_block, probe_btrfs_repair_staleness, probe_ext4_repair_staleness,
-    recover_btrfs_corrupt_blocks, recover_primary_btrfs_superblock_from_backup,
+    ext4_repair_tail_free, primary_btrfs_superblock_block, probe_btrfs_repair_staleness,
+    probe_ext4_repair_staleness, recover_btrfs_corrupt_blocks,
+    recover_primary_btrfs_superblock_from_backup,
     repair_corrupt_btrfs_superblock_mirrors_from_primary, report_has_error_or_higher_for_block,
     scrub_range_for_repair,
 };
@@ -7746,15 +7747,38 @@ impl Drop for MountBackgroundScrubGuard {
     }
 }
 
+/// bd-plamw: log and exclude a group whose repair tail cannot be proven free.
+fn mount_repair_tail_admitted(check: Result<()>) -> bool {
+    match check {
+        Ok(()) => true,
+        Err(error) => {
+            warn!(
+                target: "ffs::cli::mount",
+                reason = %format!("{error:#}"),
+                "mount_background_repair_group_excluded"
+            );
+            false
+        }
+    }
+}
+
 fn build_mount_background_scrub_plan(
     image_path: &Path,
     open_fs: &OpenFs,
+    repair_writes_enabled: bool,
 ) -> Result<MountBackgroundScrubPlan> {
+    let cx = cli_cx();
     if let Some(sb) = open_fs.ext4_superblock() {
         let specs = build_ext4_repair_group_specs(sb)
             .context("failed to compute ext4 repair group layout for mount background scrub")?;
         let groups = specs
             .iter()
+            .filter(|spec| {
+                // bd-plamw: symbols may only be (re)written into a provably
+                // free tail; groups whose tail holds data are left out.
+                !repair_writes_enabled
+                    || mount_repair_tail_admitted(ext4_repair_tail_free(&cx, open_fs, spec))
+            })
             .map(|spec| GroupConfig {
                 layout: spec.layout,
                 source_first_block: spec.source_first_block,
@@ -7787,6 +7811,12 @@ fn build_mount_background_scrub_plan(
             .context("failed to discover btrfs repair group layout for mount background scrub")?;
         let groups = specs
             .iter()
+            .filter(|spec| {
+                !repair_writes_enabled
+                    || mount_repair_tail_admitted(btrfs_repair_tail_free(
+                        &cx, open_fs, spec, block_size,
+                    ))
+            })
             .map(|spec| GroupConfig {
                 layout: spec.layout,
                 source_first_block: spec.physical_start_block,
@@ -7974,7 +8004,21 @@ fn start_mount_background_scrub(
         return Ok(None);
     }
 
-    let plan = match build_mount_background_scrub_plan(image_path, open_fs) {
+    if config.repair_writes_enabled && mounted_repair_writeback.is_some() {
+        // bd-plamw: repair-symbol tails are not reserved from the allocator, so
+        // on a read-write mount a new file can land in a tail after the
+        // start-time check and a later symbol refresh would overwrite it.
+        bail!(
+            "--background-repair is not supported on read-write mounts yet: repair-symbol \
+             storage is not reserved from the allocator (bd-plamw). Use a read-only mount \
+             for mounted repair, or --background-scrub for detection only"
+        );
+    }
+    let plan = match build_mount_background_scrub_plan(
+        image_path,
+        open_fs,
+        config.repair_writes_enabled,
+    ) {
         Ok(plan) => plan,
         Err(error) if !config.explicit => {
             warn!(
@@ -13351,6 +13395,47 @@ mod tests {
             err.to_string()
                 .contains("--background-repair requires --background-scrub-ledger")
         );
+    }
+
+    /// bd-plamw: repair-symbol tails are not reserved from the allocator, so a
+    /// read-write mount must refuse mounted repair rather than let a later
+    /// symbol refresh overwrite a block allocated during the mount.
+    #[test]
+    fn mount_background_repair_refused_on_read_write_mount_bd_plamw() {
+        const EXT4_VALID_FS: u16 = 0x0001;
+        let image = build_test_ext4_image_with_state(EXT4_VALID_FS);
+        with_temp_image_path(&image, |path| {
+            let cx = asupersync::Cx::for_testing();
+            let open_fs = Arc::new(
+                super::OpenFs::open_with_options(&cx, &path, &super::OpenOptions::default())
+                    .expect("test ext4 image should open"),
+            );
+            let ledger = path.with_extension("repair.jsonl");
+            let cfg = MountBackgroundScrubConfig::resolve(
+                MountBackgroundScrubRequest::new(
+                    MountAccessMode::ReadWrite,
+                    MountBackgroundScrubMode::Auto,
+                    MountBackgroundRepairMode::Enabled,
+                ),
+                Some(1),
+                Some(ledger),
+            )
+            .expect("read-write repair config with a ledger resolves");
+            let err = start_mount_background_scrub(
+                &path,
+                open_fs.as_ref(),
+                &cfg,
+                Some(Arc::clone(&open_fs)),
+                "mount-bg-repair-rw-test",
+                "cli_mount_background_repair_rw_refused",
+            )
+            .err()
+            .expect("read-write mounted repair must be refused");
+            assert!(
+                format!("{err:#}").contains("bd-plamw"),
+                "unexpected error: {err:#}"
+            );
+        });
     }
 
     #[test]

@@ -2513,9 +2513,8 @@ fn cli_inspect_empty_file_reports_error() {
     emit_scenario_result("cli_inspect_empty_file_error", "PASS", None);
 }
 
-#[test]
-#[ignore = "canonical spec §22.1 Gate 7: full conformance and user-facing tools"]
-fn gate7_full_conformance_and_tools() {
-    cli_inspect_empty_file_reports_error();
-    parity_default_reports_declarations_without_execution_credit();
-}
+// bd-0r0kc: there is deliberately no `gate7` test yet. Gate 7 (spec §22.1)
+// requires gates 1-6 in one run, a mount/info/scrub/umount/fsck CLI sequence,
+// TUI refresh and a leak soak; a wrapper around two unrelated CLI tests made
+// the gate report PASS. With no match, `ffs-harness gates` reports gate7 as
+// not_implemented until a real gate lands.

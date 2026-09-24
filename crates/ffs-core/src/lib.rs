@@ -2230,13 +2230,15 @@ pub struct OpenFs {
     /// cancel by construction (bd-b9dug class C). Default off (fast path enabled),
     /// so an unset environment is byte-identical to the shipped behaviour.
     btrfs_xattr_memo_disabled: std::sync::atomic::AtomicBool,
-    /// Whether on-demand chunk allocation is enabled for this mount (bd-a136s).
+    /// Whether commit-time metadata/system chunk growth is enabled (bd-a136s).
     ///
-    /// Read once at construction from `FFS_BTRFS_GROW_CHUNKS` rather than per
-    /// commit. Default OFF: growing writes on-disk structures `btrfs check` and
-    /// the kernel's mount path judge, and none of the path has ever run against
-    /// a real image.
+    /// Read once at construction from `FFS_BTRFS_GROW_CHUNKS` (see
+    /// [`BtrfsGrowthPolicy`]). Default OFF: that path has unit coverage but no
+    /// kernel-acceptance evidence yet.
     btrfs_grow_chunks: std::sync::atomic::AtomicBool,
+    /// Whether write-time DATA chunk growth is enabled (bd-a136s, bd-34blv).
+    /// Default ON: kernel-accepted (grown image mounts, payloads read back).
+    btrfs_grow_data_chunks: std::sync::atomic::AtomicBool,
     /// Consecutive floor descents that found the retained leaf unusable (bd-79li3).
     ///
     /// The memo's SIGN depends on the workload. A sweep over consecutive
@@ -2740,38 +2742,79 @@ fn btrfs_floor_memo_disabled_from_env() -> bool {
 /// single commit — while turning a runaway into a logged stop.
 const BTRFS_MAX_CHUNKS_PER_COMMIT: u32 = 8;
 
-/// Whether `FFS_BTRFS_GROW_CHUNKS` enables on-demand chunk allocation (bd-a136s).
+/// On-demand chunk growth policy from `FFS_BTRFS_GROW_CHUNKS` (bd-a136s, bd-34blv).
 ///
-/// ⚠️ OPT-IN, AND THE DEFAULT IS THE POINT. Growing a filesystem writes new
-/// CHUNK_ITEMs, DEV_EXTENTs, BLOCK_GROUP_ITEMs and a new `chunk_root` — on-disk
-/// structures `btrfs check` and the kernel's mount path judge, and which no
-/// amount of unit testing can validate. Every piece of the path is unit-tested
-/// and none of it has ever run against a real image, so it stays off until the
-/// acceptance gate on this bead passes: a kernel-verified fixture with a
-/// deliberately small metadata chunk, writes that today ENOSPC succeeding,
-/// `btrfs check` clean, and the KERNEL mounting the result and reading the files
-/// back.
+/// Two capabilities with different evidence behind them:
 ///
-/// Spelled the opposite way round from `FFS_BTRFS_FLOOR_MEMO` and
-/// `FFS_BTRFS_XATTR_MEMO` deliberately: those DISABLE a shipped fast path, so
-/// absent means on. This ENABLES an unproven one, so absent means off, and no
-/// value of it can turn a shipped behaviour off.
+/// * **write-time DATA chunk growth** (`btrfs_alloc_data_with_growth`): a data
+///   allocation that hits `NoSpace` grows one data chunk from unallocated device
+///   space and retries. bd-a136s closed on kernel acceptance of exactly this
+///   path — the grown image kernel-mounts and every payload reads back
+///   byte-identical — so it is ON by default (bd-34blv): without it a write
+///   returned ENOSPC while ~97% of the device was unallocated.
+/// * **commit-time metadata/system chunk growth** (the `'grow` block in
+///   `btrfs_full_transaction_commit`): no kernel-acceptance evidence yet, so it
+///   stays opt-in.
+///
+/// Values: unset -> data growth only; `1`/`true`/`on` -> both; `0`/`false`/
+/// `off` -> neither (kill switch).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BtrfsGrowthPolicy {
+    /// Grow a data chunk when a data allocation finds no free space.
+    pub data: bool,
+    /// Grow metadata/system chunks when a commit predicts a shortfall.
+    pub metadata: bool,
+}
+
+impl BtrfsGrowthPolicy {
+    /// Parse the `FFS_BTRFS_GROW_CHUNKS` value (`None` = unset).
+    #[must_use]
+    pub fn from_value(value: Option<&str>) -> Self {
+        match value.map(str::trim) {
+            None | Some("") => Self {
+                data: true,
+                metadata: false,
+            },
+            Some(v)
+                if v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on") =>
+            {
+                Self {
+                    data: true,
+                    metadata: true,
+                }
+            }
+            Some(v)
+                if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off") =>
+            {
+                Self {
+                    data: false,
+                    metadata: false,
+                }
+            }
+            // Unrecognized values keep the shipped default rather than silently
+            // enabling the unproven metadata path.
+            Some(_) => Self {
+                data: true,
+                metadata: false,
+            },
+        }
+    }
+}
+
 /// Public read of `FFS_BTRFS_GROW_CHUNKS` for the daemon's knob self-report.
 ///
 /// bd-cjqhh: without this the mount could not attest whether chunk growth was
 /// enabled, so a run that still hit ENOSPC was ambiguous between "the knob never
-/// reached the code" and "growth ran and declined to grow" — the exact ambiguity
-/// this campaign's knob-attestation rule exists to remove.
+/// reached the code" and "growth ran and declined to grow". Reports whether
+/// metadata growth (the opt-in half) is on; data growth is on unless the kill
+/// switch is set.
 #[must_use]
 pub fn btrfs_grow_chunks_from_env_public() -> bool {
-    btrfs_grow_chunks_from_env()
+    btrfs_growth_policy_from_env().metadata
 }
 
-fn btrfs_grow_chunks_from_env() -> bool {
-    std::env::var("FFS_BTRFS_GROW_CHUNKS").is_ok_and(|value| {
-        let value = value.trim();
-        value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on")
-    })
+fn btrfs_growth_policy_from_env() -> BtrfsGrowthPolicy {
+    BtrfsGrowthPolicy::from_value(std::env::var("FFS_BTRFS_GROW_CHUNKS").ok().as_deref())
 }
 
 /// Whether `FFS_BTRFS_XATTR_MEMO` disables the read-only getxattr fast path (bd-yu6jz).
@@ -6282,7 +6325,12 @@ impl OpenFs {
             btrfs_xattr_memo_disabled: std::sync::atomic::AtomicBool::new(
                 btrfs_xattr_memo_disabled_from_env(),
             ),
-            btrfs_grow_chunks: std::sync::atomic::AtomicBool::new(btrfs_grow_chunks_from_env()),
+            btrfs_grow_chunks: std::sync::atomic::AtomicBool::new(
+                btrfs_growth_policy_from_env().metadata,
+            ),
+            btrfs_grow_data_chunks: std::sync::atomic::AtomicBool::new(
+                btrfs_growth_policy_from_env().data,
+            ),
             btrfs_floor_memo_consecutive_misses: std::sync::atomic::AtomicU32::new(0),
             btrfs_floor_memo_suppressions: std::sync::atomic::AtomicU64::new(0),
             btrfs_dir_entry_cache: ShardedCache::new(),
@@ -30819,8 +30867,8 @@ impl OpenFs {
 
     /// bd-a136s: `alloc_data` with an on-demand data-chunk growth retry. A
     /// DATA `alloc_data` that returns `NoSpace` first attempts to grow one
-    /// data chunk from unallocated device space (when
-    /// `FFS_BTRFS_GROW_CHUNKS` is on) and retries once — the kernel-btrfs
+    /// data chunk from unallocated device space (on by default; disabled by
+    /// `FFS_BTRFS_GROW_CHUNKS=0`) and retries once — the kernel-btrfs
     /// behaviour of growing instead of refusing while device space remains.
     fn btrfs_alloc_data_with_growth(
         &self,
@@ -30830,7 +30878,7 @@ impl OpenFs {
         match alloc.extent_alloc.alloc_data(num_bytes) {
             Ok(allocation) => Ok(allocation),
             Err(nospace) => {
-                if !self.btrfs_grow_chunks_enabled() {
+                if !self.btrfs_grow_data_chunks_enabled() {
                     return Err(btrfs_mutation_to_ffs(&nospace));
                 }
                 let sb = match &self.flavor {
@@ -33878,10 +33926,10 @@ impl OpenFs {
         // same reason; a commit that discovers it is short half way through has
         // no good move left.
         //
-        // OPT-IN AND DEFAULT OFF (`FFS_BTRFS_GROW_CHUNKS`). Every piece below is
-        // unit-tested and none of it has ever run against a real image, so the
-        // shipped path is byte-identical to before until bd-a136s's acceptance
-        // gate passes.
+        // OPT-IN AND DEFAULT OFF (`FFS_BTRFS_GROW_CHUNKS=1`). Commit-time
+        // metadata/system growth is unit-tested but has no kernel-acceptance
+        // evidence yet; write-time DATA growth (kernel-accepted, bd-a136s) is
+        // the default and lives in `btrfs_alloc_data_with_growth`.
         //
         // Every failure here SKIPS growth rather than failing the commit. A
         // shortfall is a prediction; refusing the transaction on a prediction
@@ -40495,18 +40543,27 @@ impl OpenFs {
         out
     }
 
-    /// Whether this mount may grow the filesystem by allocating chunks
-    /// (bd-a136s). Default off; see `btrfs_grow_chunks_from_env`.
+    /// Whether commit-time metadata/system chunk growth is enabled
+    /// (bd-a136s). Default off; see [`BtrfsGrowthPolicy`].
     #[must_use]
     pub fn btrfs_grow_chunks_enabled(&self) -> bool {
         self.btrfs_grow_chunks
             .load(std::sync::atomic::Ordering::Relaxed)
     }
 
-    /// Test-only override for [`Self::btrfs_grow_chunks_enabled`], so the
-    /// acceptance gate can enable growth without an environment variable.
+    /// Whether write-time data chunk growth is enabled (bd-34blv). Default on.
+    #[must_use]
+    pub fn btrfs_grow_data_chunks_enabled(&self) -> bool {
+        self.btrfs_grow_data_chunks
+            .load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    /// Override both growth switches, so an acceptance gate can control growth
+    /// without an environment variable.
     pub fn set_btrfs_grow_chunks(&self, enabled: bool) {
         self.btrfs_grow_chunks
+            .store(enabled, std::sync::atomic::Ordering::Relaxed);
+        self.btrfs_grow_data_chunks
             .store(enabled, std::sync::atomic::Ordering::Relaxed);
     }
 
@@ -83596,6 +83653,37 @@ mod tests {
             ok,
             "btrfs check must accept a FrankenFS-created subvolume:\n{output}"
         );
+    }
+
+    /// bd-34blv: unset enables only the kernel-accepted data-growth path;
+    /// `1` enables both; `0` is a kill switch; junk keeps the default.
+    #[test]
+    fn btrfs_growth_policy_defaults_to_data_only_bd_34blv() {
+        let data_only = BtrfsGrowthPolicy {
+            data: true,
+            metadata: false,
+        };
+        assert_eq!(BtrfsGrowthPolicy::from_value(None), data_only);
+        assert_eq!(BtrfsGrowthPolicy::from_value(Some("")), data_only);
+        assert_eq!(BtrfsGrowthPolicy::from_value(Some("maybe")), data_only);
+        for on in ["1", "true", "ON"] {
+            assert_eq!(
+                BtrfsGrowthPolicy::from_value(Some(on)),
+                BtrfsGrowthPolicy {
+                    data: true,
+                    metadata: true
+                }
+            );
+        }
+        for off in ["0", "false", " off "] {
+            assert_eq!(
+                BtrfsGrowthPolicy::from_value(Some(off)),
+                BtrfsGrowthPolicy {
+                    data: false,
+                    metadata: false
+                }
+            );
+        }
     }
 
     /// bd-0mcvt: on a default single-device image the metadata profile is DUP,

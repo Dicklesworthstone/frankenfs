@@ -102,13 +102,18 @@ jobs:
         if: github.event_name == 'pull_request'
         run: cargo run -p ffs-ops -- harness-loc-growth-guard --base origin/${{ github.base_ref }} --head HEAD --format github
 
-      - name: Unit tests
-        run: cargo test --workspace
-
-      - name: Install ext4 tools for parity contracts
+      # bd-53dub: install the external oracles BEFORE the unit tests and require
+      # them, so e2fsck / btrfs check assertions cannot pass by silently
+      # returning when the tool is missing.
+      - name: Install ext4/btrfs oracle tools
         run: |
           sudo apt-get update
-          sudo apt-get install -y e2fsprogs
+          sudo apt-get install -y e2fsprogs btrfs-progs
+
+      - name: Unit tests
+        env:
+          FFS_REQUIRE_ORACLES: "1"
+        run: cargo test --workspace
 
       # The ext4 reference and kernel-differential suites compare against
       # mkfs.ext4/debugfs output. Without e2fsprogs those tests report a skip

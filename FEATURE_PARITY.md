@@ -21,8 +21,14 @@
 > `not_implemented`; a Cargo filter that selects zero tests is
 > `not_implemented` — never a pass — and `readiness_verified` requires every
 > capability row to carry executed evidence *and* every canonical gate to pass.
-> No `gateN` test exists in any owning crate yet, so all seven currently report
-> `not_implemented` together with the §22 criteria each one still has to prove.
+> **2026-09-23 (bd-0r0kc):** gate wrappers landed on 2026-09-22 (`526fd92a`).
+> gate1, gate2, gate3, gate4 and gate6 run relevant but *partial* subsets of
+> their §22.1 criteria (no kernel `ls -laR`/`debugfs` comparison, no thread
+> sanitizer, no 128 MB timing); a `passed` for them means "the mapped subset
+> passed", not "every criterion is met". The gate5 and gate7 wrappers only
+> called unrelated unit tests (load shedding; a CLI error path), so they were
+> removed and both gates report `not_implemented` until a real mounted gate
+> exists.
 > The gate commands, their packages and their filters are pinned to the spec text
 > by `canonical_gates::tests::catalog_commands_equal_the_spec_document`, so the
 > catalog cannot drift from §22 silently.
