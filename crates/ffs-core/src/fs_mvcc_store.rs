@@ -163,6 +163,35 @@ impl FsMvccStore {
         }
     }
 
+    /// Resolve a device fallback only while no newer version makes its ancestry
+    /// ambiguous. A missing snapshot version is not necessarily an untouched
+    /// block: an unregistered transaction can outlive that version's pruning.
+    /// Refuse with the same retryable error as an optimistic commit conflict,
+    /// rather than inventing a before-image from potentially stale disk bytes.
+    fn read_unversioned_base_at_snapshot<T>(
+        &self,
+        block: BlockNumber,
+        snapshot: Snapshot,
+        read_base: impl FnOnce() -> FfsResult<T>,
+    ) -> FfsResult<T> {
+        let check = || {
+            if self.latest_commit_seq(block) > snapshot.high {
+                Err(FfsError::MvccConflict {
+                    tx: 0,
+                    block: block.0,
+                })
+            } else {
+                Ok(())
+            }
+        };
+        check()?;
+        let base = read_base()?;
+        // The device read can yield while another writer commits and flushes.
+        // A check only before I/O could then accept post-snapshot disk content.
+        check()?;
+        Ok(base)
+    }
+
     pub(super) fn prune_safe(&self) -> CommitSeq {
         match self {
             Self::Single(lock) => lock.write().prune_safe(),
@@ -195,9 +224,9 @@ impl FsMvccStore {
     /// after `begin` forces `observed > snapshot.high` → the conflict/merge path,
     /// which overlays only this write's declared range onto the latest version
     /// (correct); with no intervening commit the read is current and the install is
-    /// fresh. `read_base` supplies the block bytes only when the store holds no
-    /// version at the snapshot (block still on the device); it must read the same
-    /// block (its snapshot is immaterial — no version means no concurrent overlay).
+    /// fresh. `read_base` must read the same block. A device fallback is accepted
+    /// only if no newer version appears before or during the read; otherwise its
+    /// ancestry is ambiguous and the caller receives a retryable conflict.
     #[cfg(feature = "bhh0i_sharded_alloc")]
     pub(super) fn rmw_commit_block_with_proof<R, P>(
         &self,
@@ -226,7 +255,7 @@ impl FsMvccStore {
         let (mut data, base) = if let Some(bytes) = self.read_visible(block, snapshot) {
             (bytes.clone(), Some(bytes))
         } else {
-            let device_base = read_base()?;
+            let device_base = self.read_unversioned_base_at_snapshot(block, snapshot, read_base)?;
             (device_base.clone(), Some(device_base))
         };
         patch(&mut data)?;
@@ -698,7 +727,10 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         let buf = if let Some(buf) = self.store.read_visible_block_buf(block, snapshot) {
             buf
         } else {
-            self.base.read_block(cx, block)?
+            self.store
+                .read_unversioned_base_at_snapshot(block, snapshot, || {
+                    self.base.read_block(cx, block)
+                })?
         };
         self.validate_read_buf(block, &buf)?;
         let base = buf.as_slice().to_vec();
@@ -913,6 +945,112 @@ mod block_device_tests {
                 .as_slice(),
             peer
         );
+        fixture.assert_image_unchanged();
+    }
+
+    #[test]
+    fn ancestor_pruned_before_capture_is_retryable_not_a_stale_disk_fallback() {
+        let fixture = Fixture::sharded();
+        let cx = Cx::for_testing();
+        fixture.commit(BLOCK, vec![0x11; BLOCK_SIZE as usize]);
+        let snapshot = fixture.store.current_snapshot();
+        fixture.commit(BLOCK, vec![0x22; BLOCK_SIZE as usize]);
+        fixture.store.prune_safe();
+        assert!(fixture.store.read_visible(BLOCK, snapshot).is_none());
+        let before = fixture.store.current_snapshot();
+        let error = fixture
+            .device
+            .read_merge_ancestor_at_snapshot(&cx, BLOCK, snapshot)
+            .expect_err("lost ancestor must not be replaced by stale disk bytes");
+        assert!(matches!(error, FfsError::MvccConflict { block: 1, .. }));
+        assert_eq!(error.to_errno(), libc::EAGAIN);
+        assert_eq!(fixture.store.current_snapshot(), before);
+        fixture.assert_image_unchanged();
+    }
+
+    #[test]
+    fn ambiguous_device_fallback_refuses_before_io() {
+        for store in [FsMvccStore::single(), FsMvccStore::sharded()] {
+            let fixture = Fixture::new(store);
+            let cx = Cx::for_testing();
+            let snapshot = fixture.store.current_snapshot();
+            fixture.commit(BLOCK, vec![0x22; BLOCK_SIZE as usize]);
+            let mut called = false;
+            let result = fixture.store.read_unversioned_base_at_snapshot(
+                BLOCK,
+                snapshot,
+                || {
+                    called = true;
+                    fixture.device.base.read_block(&cx, BLOCK)
+                },
+            );
+            assert!(matches!(result, Err(FfsError::MvccConflict { block: 1, .. })));
+            assert!(!called);
+            fixture.assert_image_unchanged();
+        }
+    }
+
+    #[test]
+    fn newer_commit_during_device_fallback_is_not_accepted_as_the_ancestor() {
+        for store in [FsMvccStore::single(), FsMvccStore::sharded()] {
+            let fixture = Fixture::new(store);
+            let cx = Cx::for_testing();
+            let snapshot = fixture.store.current_snapshot();
+            let result = fixture.store.read_unversioned_base_at_snapshot(
+                BLOCK,
+                snapshot,
+                || {
+                    let bytes = fixture.device.base.read_block(&cx, BLOCK)?;
+                    fixture.commit(BLOCK, vec![0x22; BLOCK_SIZE as usize]);
+                    Ok(bytes)
+                },
+            );
+            assert!(matches!(result, Err(FfsError::MvccConflict { block: 1, .. })));
+            assert_eq!(fixture.store.current_snapshot().high.0, snapshot.high.0 + 1);
+            assert_eq!(fixture.store.version_count(), 1);
+            fixture.assert_image_unchanged();
+        }
+    }
+
+    #[test]
+    fn untouched_device_block_still_supplies_an_owned_merge_ancestor() {
+        for store in [FsMvccStore::single(), FsMvccStore::sharded()] {
+            let fixture = Fixture::new(store);
+            let cx = Cx::for_testing();
+            let (bytes, base) = fixture
+                .device
+                .read_merge_ancestor_at_snapshot(&cx, BLOCK, fixture.store.current_snapshot())
+                .expect("untouched device ancestor");
+            let expected = vec![0xA5; BLOCK_SIZE as usize];
+            assert_eq!(bytes.as_slice(), expected);
+            assert_eq!(base.as_deref(), Some(expected.as_slice()));
+            assert_eq!(fixture.store.version_count(), 0);
+            fixture.assert_image_unchanged();
+        }
+    }
+
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[test]
+    fn inode_rmw_refuses_a_fallback_race_before_running_the_patch() {
+        let fixture = Fixture::sharded();
+        let cx = Cx::for_testing();
+        let mut patched = false;
+        let result = fixture.store.rmw_commit_block_with_proof(
+            BLOCK,
+            MergeProof::independent_keys(&[(0, 1)]),
+            || {
+                let bytes = fixture.device.base.read_block(&cx, BLOCK)?.into_inner();
+                fixture.commit(BLOCK, vec![0x22; BLOCK_SIZE as usize]);
+                Ok(bytes)
+            },
+            |_| {
+                patched = true;
+                Ok(())
+            },
+        );
+        assert!(matches!(result, Err(FfsError::MvccConflict { block: 1, .. })));
+        assert!(!patched);
+        assert_eq!(fixture.store.version_count(), 1);
         fixture.assert_image_unchanged();
     }
 
