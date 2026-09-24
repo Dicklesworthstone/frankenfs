@@ -34530,7 +34530,6 @@ impl OpenFs {
                 block,
                 level,
                 logical,
-                physical,
                 node_bytes,
                 nodes_written,
                 "node_written_to_disk"
