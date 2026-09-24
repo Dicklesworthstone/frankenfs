@@ -84222,6 +84222,40 @@ mod tests {
             "copy 2 must carry the committed generation, not a stale one"
         );
         assert!(first == second, "both DUP copies must be byte-identical");
+
+        // The redundancy must be USABLE: with copy 1 of the root-tree root
+        // corrupted, a fresh open reads copy 2 and the file is intact.
+        let mut damaged = bytes.clone();
+        let first_start = usize::try_from(mapping.stripes[0].physical).expect("fits");
+        damaged[first_start + 200] ^= 0xFF;
+        let reopened = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(damaged.clone())),
+            &OpenOptions::default(),
+        )
+        .expect("open must fall back to the second DUP copy");
+        let found = reopened
+            .lookup(&cx, InodeNumber(1), OsStr::new("dup.bin"))
+            .expect("lookup through the recovered root");
+        assert_eq!(
+            reopened.read(&cx, found.ino, 0, 8192).expect("read"),
+            vec![0x5A_u8; 8192],
+            "file content intact when served via the mirror copy"
+        );
+
+        // Negative control: with BOTH copies corrupted the open must fail
+        // rather than return garbage.
+        let second_start = usize::try_from(mapping.stripes[1].physical).expect("fits");
+        damaged[second_start + 200] ^= 0xFF;
+        assert!(
+            OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(damaged)),
+                &OpenOptions::default()
+            )
+            .is_err(),
+            "both copies corrupt: the open must fail"
+        );
     }
 
     /// bd-5elw6: the durable commit publishes the writable tree as the DEFAULT
