@@ -24,10 +24,10 @@ use std::sync::{Arc, Condvar, Mutex};
 
 /// Global monotonic epoch counter shared across all cores/threads.
 ///
-/// Each WAL entry is stamped with the epoch at append time. Epochs provide a
-/// total order across per-core buffers: entries within the same epoch are
-/// commutative (order doesn't matter), while entries in different epochs must
-/// be applied in epoch order.
+/// Each WAL entry is stamped with the epoch at append time. Epochs order groups
+/// of records across per-core buffers. Within an epoch, a transaction's append
+/// order still matters: writes must precede commit markers, and repeated writes
+/// must not be reordered.
 pub struct EpochCounter {
     value: AtomicU64,
 }
@@ -419,9 +419,9 @@ impl ExplicitWalPool {
 
     /// Drain all provided buffers, collecting entries sorted by epoch.
     ///
-    /// Within the same epoch, entries retain their per-buffer append order
-    /// (but inter-buffer ordering within an epoch is arbitrary — by design,
-    /// same-epoch entries are commutative).
+    /// Within the same epoch, entries retain their per-buffer append order.
+    /// Each transaction must stay in one buffer; transactions spanning buffers
+    /// need an externally preserved append order before they may be flushed.
     pub fn drain_all(&self, buffers: &mut [CoreWalBuffer]) -> (Vec<WalEntry>, FlushResult) {
         let mut all_entries = Vec::new();
         let mut result = FlushResult::default();
@@ -441,8 +441,9 @@ impl ExplicitWalPool {
             }
         }
 
-        // Sort by epoch for correct ordering; within same epoch, order is arbitrary.
-        all_entries.sort_unstable_by_key(|e| e.epoch);
+        // Preserve equal-epoch writes and commit markers in append order.
+        // Reordering them can change the state reconstructed during recovery.
+        all_entries.sort_by_key(|entry| entry.epoch);
 
         tracing::info!(
             target: "ffs::wal_buffer",
@@ -921,23 +922,70 @@ pub struct GroupCommitResult {
     pub fsyncs_issued: usize,
 }
 
+/// A failed flush together with every entry submitted by its caller.
+///
+/// Entries in the attempted batch and the future-epoch tail are both returned.
+/// Their order within an epoch is preserved. A writer may have persisted a
+/// prefix before failing: these entries are for recovery, not blind replay
+/// into the same log. Reopen/recover storage before constructing a new
+/// coordinator after an I/O failure.
+#[derive(Debug)]
+pub struct GroupCommitFailure {
+    pub error: FfsError,
+    pub entries: Vec<WalEntry>,
+}
+
+impl std::fmt::Display for GroupCommitFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        std::fmt::Display::fmt(&self.error, f)
+    }
+}
+
+impl std::error::Error for GroupCommitFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.error)
+    }
+}
+
+const GROUP_COMMIT_PANIC: &str = "group commit writer panicked; storage recovery is required";
+
+/// Wake existing waiters during unwinding, without waiting for another flush
+/// to discover the poisoned serialization lock.
+struct FlushPanicNotice<'a> {
+    notifier: &'a DurabilityNotifier,
+    first_unflushed: u64,
+}
+
+impl Drop for FlushPanicNotice<'_> {
+    fn drop(&mut self) {
+        if std::thread::panicking() {
+            self.notifier
+                .notify_failed(self.first_unflushed, GROUP_COMMIT_PANIC.to_owned());
+        }
+    }
+}
+
 /// Coordinates group commit: collects per-core WAL buffers for an epoch,
 /// writes them via a [`WalWriter`], issues a single fsync, and notifies
 /// waiting transactions.
 ///
-/// The flush protocol:
-/// 1. Collect entries from all per-core buffers (caller drains buffers and
-///    passes the collected entries).
-/// 2. Filter entries for the target epoch (and any earlier unflushed epochs).
-/// 3. Write all entries to storage via [`WalWriter::write_entries`].
-/// 4. Issue a single [`WalWriter::sync`] (with retries on failure).
-/// 5. On success: update `EpochManager` and `DurabilityNotifier`.
-/// 6. On failure: notify waiters of the failure.
+/// One mutex covers write, sync, and publication of the durability frontier.
+/// Permanent I/O failure seals this coordinator: later calls, including empty
+/// flushes, must not publish durability past the failed batch.
+///
+/// The caller must seal the target epoch and supply the complete drain of all
+/// unflushed entries through it. Serialization of I/O does not itself seal
+/// producer buffers. Use one coordinator per writer/epoch-manager pair, and
+/// submit closed epoch ranges in order; do not concurrently submit a higher
+/// range while an earlier range has not yet been handed to the coordinator.
 pub struct GroupCommitCoordinator<W: WalWriter> {
     epoch_manager: Arc<EpochManager>,
     notifier: Arc<DurabilityNotifier>,
     writer: W,
     config: GroupCommitConfig,
+    /// Held across storage I/O and durability publication. Once set, the
+    /// failure is permanent for this coordinator, including after a panic.
+    flush_failure: Mutex<Option<String>>,
 }
 
 impl<W: WalWriter> std::fmt::Debug for GroupCommitCoordinator<W> {
@@ -963,60 +1011,129 @@ impl<W: WalWriter> GroupCommitCoordinator<W> {
             notifier,
             writer,
             config,
+            flush_failure: Mutex::new(None),
         }
     }
 
     /// Flush all entries up to (and including) `epoch`.
     ///
-    /// `entries` should be the collected drain from all per-core buffers.
-    /// Only entries with epoch <= `epoch` are written. Entries with higher
-    /// epochs are returned (they belong to a future flush).
-    ///
-    /// On success, the `EpochManager` and `DurabilityNotifier` are updated.
-    /// On failure (after retries), waiters are notified of the failure.
+    /// On success, returns future entries and publishes durability. On I/O
+    /// failure, the coordinator is sealed and all unflushed epoch waiters fail.
+    /// This compatibility API consumes the entries on error; callers that need
+    /// to retain ownership must use [`Self::flush_epoch_recoverable`].
     pub fn flush_epoch(
         &self,
         entries: Vec<WalEntry>,
         epoch: u64,
     ) -> Result<(GroupCommitResult, Vec<WalEntry>), FfsError> {
-        // Retain the input allocation for the common, dominant flush set and
-        // move only future entries into the returned tail.
+        self.flush_epoch_recoverable(entries, epoch)
+            .map_err(|failure| failure.error)
+    }
+
+    /// Flush a closed epoch range without losing ownership on failure.
+    ///
+    /// The caller must supply every unflushed entry through `epoch`, after
+    /// sealing producer buffers. Entries are sorted stably by epoch; each
+    /// transaction's append order must already be represented in the input.
+    /// All future entries are returned on success; every submitted entry is
+    /// returned on error. Submitting a record for an already durable epoch is
+    /// rejected before I/O rather than appending an ambiguous duplicate.
+    pub fn flush_epoch_recoverable(
+        &self,
+        entries: Vec<WalEntry>,
+        epoch: u64,
+    ) -> Result<(GroupCommitResult, Vec<WalEntry>), GroupCommitFailure> {
+        let mut failure = match self.flush_failure.lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                let message = GROUP_COMMIT_PANIC;
+                self.notifier.notify_failed(
+                    self.epoch_manager.flushed_epoch().saturating_add(1),
+                    message.to_owned(),
+                );
+                return Err(GroupCommitFailure {
+                    error: FfsError::Io(std::io::Error::other(message)),
+                    entries,
+                });
+            }
+        };
+        if let Some(message) = failure.as_ref() {
+            return Err(GroupCommitFailure {
+                error: FfsError::Io(std::io::Error::other(message.clone())),
+                entries,
+            });
+        }
+
+        let frontier = self.epoch_manager.flushed_epoch();
+        if let Some(stale) = entries.iter().find(|entry| entry.epoch <= frontier) {
+            return Err(GroupCommitFailure {
+                error: FfsError::Format(format!(
+                    "WAL entry epoch {} is already durable through epoch {frontier}",
+                    stale.epoch
+                )),
+                entries,
+            });
+        }
+
         let mut to_flush = entries;
-        let remaining = to_flush
+        // Equal-epoch writes and commit markers are not interchangeable.
+        to_flush.sort_by_key(|entry| entry.epoch);
+        let remaining: Vec<_> = to_flush
             .extract_if(.., |entry| entry.epoch > epoch)
             .collect();
+        let panic_notice = FlushPanicNotice {
+            notifier: &self.notifier,
+            first_unflushed: frontier.saturating_add(1),
+        };
+        let result = self.flush_batch(&to_flush, epoch, &mut failure);
+        drop(panic_notice);
+        drop(failure);
+        match result {
+            Ok(result) => Ok((result, remaining)),
+            Err(error) => {
+                to_flush.extend(remaining);
+                Err(GroupCommitFailure {
+                    error,
+                    entries: to_flush,
+                })
+            }
+        }
+    }
 
+    /// The caller holds `flush_failure` through this entire protocol.
+    fn flush_batch(
+        &self,
+        to_flush: &[WalEntry],
+        epoch: u64,
+        failure: &mut Option<String>,
+    ) -> Result<GroupCommitResult, FfsError> {
         if to_flush.is_empty() {
-            // Nothing to flush — still mark the epoch as durable (it's vacuously true).
             self.epoch_manager.mark_epoch_flushed(epoch);
             self.notifier.notify_durable(epoch);
-
             tracing::debug!(
                 target: "ffs::group_commit",
                 epoch,
                 "group_commit_empty_epoch"
             );
-
-            return Ok((
-                GroupCommitResult {
-                    epoch,
-                    entries_written: 0,
-                    payload_bytes: 0,
-                    fsyncs_issued: 0,
-                },
-                remaining,
-            ));
+            return Ok(GroupCommitResult {
+                epoch,
+                entries_written: 0,
+                payload_bytes: 0,
+                fsyncs_issued: 0,
+            });
         }
 
-        // Compute payload bytes for the result.
         let payload_bytes: usize = to_flush
             .iter()
-            .map(|e| match &e.entry_type {
+            .map(|entry| match &entry.entry_type {
                 WalEntryType::Write { data, .. } => data.len(),
                 _ => 0,
             })
             .sum();
         let entries_written = to_flush.len();
+        // Failure affects the whole unacknowledged prefix, not just the last
+        // epoch of a multi-epoch batch. Earlier waiters must not wait forever.
+        let first_unflushed = self.epoch_manager.flushed_epoch().saturating_add(1);
 
         tracing::info!(
             target: "ffs::group_commit",
@@ -1025,31 +1142,27 @@ impl<W: WalWriter> GroupCommitCoordinator<W> {
             payload_bytes,
             "group_commit_write_start"
         );
-
-        // Write entries to storage.
-        if let Err(e) = self.writer.write_entries(&to_flush) {
-            let msg = format!("write_entries failed: {e}");
+        if let Err(error) = self.writer.write_entries(to_flush) {
+            let message = format!("write_entries failed: {error}");
             tracing::error!(
                 target: "ffs::group_commit",
                 epoch,
-                error = %e,
+                error = %error,
                 "group_commit_write_failed"
             );
-            self.notifier.notify_failed(epoch, msg);
-            return Err(e);
+            *failure = Some(message.clone());
+            self.notifier.notify_failed(first_unflushed, message);
+            return Err(error);
         }
 
-        // Fsync with retries.
         let mut fsyncs_issued = 0_usize;
         let mut last_err = None;
         for attempt in 0..=self.config.max_retries {
             fsyncs_issued += 1;
             match self.writer.sync() {
                 Ok(()) => {
-                    // Success — update epoch manager and notifier.
                     self.epoch_manager.mark_epoch_flushed(epoch);
                     self.notifier.notify_durable(epoch);
-
                     tracing::info!(
                         target: "ffs::group_commit",
                         epoch,
@@ -1058,43 +1171,39 @@ impl<W: WalWriter> GroupCommitCoordinator<W> {
                         fsyncs_issued,
                         "group_commit_success"
                     );
-
-                    return Ok((
-                        GroupCommitResult {
-                            epoch,
-                            entries_written,
-                            payload_bytes,
-                            fsyncs_issued,
-                        },
-                        remaining,
-                    ));
+                    return Ok(GroupCommitResult {
+                        epoch,
+                        entries_written,
+                        payload_bytes,
+                        fsyncs_issued,
+                    });
                 }
-                Err(e) => {
+                Err(error) => {
                     tracing::warn!(
                         target: "ffs::group_commit",
                         epoch,
                         attempt,
-                        error = %e,
+                        error = %error,
                         "group_commit_sync_retry"
                     );
-                    last_err = Some(e);
+                    last_err = Some(error);
                 }
             }
         }
 
-        // All retries exhausted.
-        let err = last_err
+        let error = last_err
             .unwrap_or_else(|| FfsError::Format("fsync loop failed to record an error".into()));
-        let msg = format!("fsync failed after {fsyncs_issued} attempts: {err}");
+        let message = format!("fsync failed after {fsyncs_issued} attempts: {error}");
         tracing::error!(
             target: "ffs::group_commit",
             epoch,
             fsyncs_issued,
-            error = %err,
+            error = %error,
             "group_commit_sync_exhausted"
         );
-        self.notifier.notify_failed(epoch, msg);
-        Err(err)
+        *failure = Some(message.clone());
+        self.notifier.notify_failed(first_unflushed, message);
+        Err(error)
     }
 
     /// Access the epoch manager.
@@ -1109,6 +1218,10 @@ impl<W: WalWriter> GroupCommitCoordinator<W> {
         &self.notifier
     }
 }
+
+#[cfg(test)]
+#[path = "wal_buffer/group_commit_regression.rs"]
+mod group_commit_regression;
 
 // ---------------------------------------------------------------------------
 // Tests
