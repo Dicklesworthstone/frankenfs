@@ -9557,7 +9557,6 @@ impl OpenFs {
     /// `s_sequence` of the journal superblock at the start of `segments`, if
     /// the region begins with a parseable jbd2 superblock (bd-cnmpm).
     fn dev_read_journal_superblock_sequence(
-        &self,
         cx: &Cx,
         dev: &dyn BlockDevice,
         segments: &[ffs_journal::JournalSegment],
@@ -9587,9 +9586,8 @@ impl OpenFs {
             // chain into a stale transaction left in the region; the kernel
             // likewise never reuses one. Start above the superblock's
             // s_sequence and above every transaction mount-time replay applied.
-            let sb_sequence = self
-                .dev_read_journal_superblock_sequence(cx, &direct, &segments)
-                .unwrap_or(0);
+            let sb_sequence =
+                Self::dev_read_journal_superblock_sequence(cx, &direct, &segments).unwrap_or(0);
             let replayed_next = self
                 .ext4_journal_replay
                 .as_ref()
@@ -63990,7 +63988,10 @@ mod tests {
             .expect_err("injected crash before the checkpoint");
         let crashed = dev.snapshot_bytes();
         let crashed_sb = journal_sb(&crashed);
-        assert_ne!(crashed_sb.start_block, 0, "crash image must carry a live log");
+        assert_ne!(
+            crashed_sb.start_block, 0,
+            "crash image must carry a live log"
+        );
         assert!(recover_set(&crashed), "crash image must say needs_recovery");
 
         let read_home = |image: &[u8]| {
@@ -64033,7 +64034,10 @@ mod tests {
             "e2fsck -fy must finish without uncorrected errors:\n{fix_out}"
         );
         let (clean_after, out_after) = run_e2fsck(&path).expect("e2fsck ran above");
-        assert!(clean_after, "e2fsck -fn must be clean after replay:\n{out_after}");
+        assert!(
+            clean_after,
+            "e2fsck -fn must be clean after replay:\n{out_after}"
+        );
         let replayed = std::fs::read(&path).expect("read replayed image");
         assert_eq!(
             read_home(&replayed),
