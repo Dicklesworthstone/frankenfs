@@ -15059,6 +15059,31 @@ fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u1
                 .success()
         );
         if matches!(profile, "raid1" | "raid10" | "raid1c3" | "raid1c4") {
+            // The property + defragment below still leave the codec to the
+            // kernel's compressibility heuristic, and the seeded extent was
+            // intermittently stored uncompressed (codec 0, expected zstd 3).
+            // compress-force skips the heuristic. Sync first so `payload`
+            // (expected uncompressed) is written back before the option applies;
+            // it is switched off again after the compressed copy is synced.
+            let remount = |option: &str| {
+                assert!(
+                    Command::new("sudo")
+                        .args(["-n", "sync"])
+                        .status()
+                        .unwrap()
+                        .success()
+                );
+                assert!(
+                    Command::new("sudo")
+                        .args(["-n", "mount", "-o", &format!("remount,{option}")])
+                        .arg(&kernel_mount)
+                        .status()
+                        .unwrap()
+                        .success(),
+                    "remount {option}"
+                );
+            };
+            remount("compress-force=zstd");
             let compressed = kernel_mount.join("compressed");
             assert!(
                 Command::new("sudo")
@@ -15097,6 +15122,7 @@ fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u1
                     .unwrap()
                     .success()
             );
+            remount("compress=no");
             assert!(
                 Command::new("sudo")
                     .args(["-n", "touch"])
