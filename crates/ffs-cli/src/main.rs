@@ -594,6 +594,27 @@ fn writeback_cache_runtime_kill_switch_enabled() -> bool {
     env_bool(WRITEBACK_CACHE_KILL_SWITCH_ENV, false).unwrap_or(true)
 }
 
+/// `--mvcc-policy` values (bd-7ssc7).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum MvccPolicyArg {
+    /// Pure first-committer-wins: any block-level conflict aborts the later writer.
+    Strict,
+    /// Merge when a valid merge proof exists; abort otherwise (default).
+    SafeMerge,
+    /// Choose Strict or SafeMerge per commit from observed contention.
+    Adaptive,
+}
+
+impl MvccPolicyArg {
+    const fn policy(self) -> ffs_mvcc::ConflictPolicy {
+        match self {
+            Self::Strict => ffs_mvcc::ConflictPolicy::Strict,
+            Self::SafeMerge => ffs_mvcc::ConflictPolicy::SafeMerge,
+            Self::Adaptive => ffs_mvcc::ConflictPolicy::Adaptive,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 struct MountCmdOptions {
@@ -610,6 +631,8 @@ struct MountCmdOptions {
     btrfs_verify_data_on_read: bool,
     /// Periodic commit interval override (bd-dj725); `None` = per-format default.
     commit_interval_secs: Option<u64>,
+    /// MVCC conflict policy override (bd-7ssc7); `None` = SafeMerge.
+    mvcc_policy: Option<MvccPolicyArg>,
     runtime: MountRuntimeConfig,
     adaptive_runtime: MountAdaptiveRuntimeConfig,
     adaptive_runtime_summary: MountAdaptiveRuntimeSummaryConfig,
@@ -1324,6 +1347,12 @@ enum Command {
         /// values: 5 for ext4 (`commit=5`), 30 for btrfs. `0` disables.
         #[arg(long = "commit-interval-secs", value_name = "SECS")]
         commit_interval_secs: Option<u64>,
+        /// MVCC conflict policy for commits (bd-7ssc7): `strict` aborts on any
+        /// same-block conflict, `safe-merge` (default) merges when a valid
+        /// merge proof exists, `adaptive` chooses per commit from observed
+        /// contention via the expected-loss model.
+        #[arg(long = "mvcc-policy", value_enum)]
+        mvcc_policy: Option<MvccPolicyArg>,
     },
     /// Run a read-only integrity scan (scrub) on a filesystem image.
     Scrub {
@@ -2460,6 +2489,7 @@ fn run() -> Result<()> {
             btrfs_verify_data_on_read,
             btrfs_device_paths,
             commit_interval_secs,
+            mvcc_policy,
         } => {
             let btrfs_mount_selection = parse_btrfs_mount_selection(subvol, snapshot)?;
             let background_scrub = MountBackgroundScrubConfig::resolve(
@@ -2499,6 +2529,7 @@ fn run() -> Result<()> {
                     btrfs_rw_ephemeral_ok,
                     btrfs_verify_data_on_read,
                     commit_interval_secs,
+                    mvcc_policy,
                     runtime: MountRuntimeConfig {
                         mode: runtime_mode,
                         managed_unmount_timeout_secs,
@@ -8435,6 +8466,9 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
             );
         }
     }
+    if let Some(policy) = options.mvcc_policy {
+        open_fs.set_mvcc_conflict_policy(policy.policy());
+    }
     let open_fs = Arc::new(open_fs);
     let mounted_repair_writeback = (options.read_write
         && options.background_scrub.repair_writes_enabled)
@@ -10050,6 +10084,7 @@ mod tests {
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: false,
             commit_interval_secs: None,
+            mvcc_policy: None,
             runtime: MountRuntimeConfig {
                 mode: MountRuntimeMode::Standard,
                 managed_unmount_timeout_secs: None,
@@ -13967,6 +14002,7 @@ mod tests {
                         btrfs_rw_ephemeral_ok: false,
                         btrfs_verify_data_on_read: false,
                         commit_interval_secs: None,
+                        mvcc_policy: None,
                         mount_mode: MountMode::Compat,
                         btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
                         btrfs_device_paths: Vec::new(),
@@ -14045,6 +14081,7 @@ mod tests {
                 btrfs_rw_ephemeral_ok: false,
                 btrfs_verify_data_on_read: false,
                 commit_interval_secs: None,
+                mvcc_policy: None,
                 mount_mode: MountMode::Compat,
                 btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
                 btrfs_device_paths: Vec::new(),
@@ -14083,6 +14120,7 @@ mod tests {
                 btrfs_rw_ephemeral_ok: false,
                 btrfs_verify_data_on_read: false,
                 commit_interval_secs: None,
+                mvcc_policy: None,
                 mount_mode: MountMode::Compat,
                 btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
                 btrfs_device_paths: Vec::new(),
@@ -14193,6 +14231,7 @@ mod tests {
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: false,
             commit_interval_secs: None,
+            mvcc_policy: None,
             mount_mode: MountMode::Compat,
             btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
             btrfs_device_paths: Vec::new(),
@@ -14282,6 +14321,7 @@ mod tests {
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: verify,
             commit_interval_secs: None,
+            mvcc_policy: None,
             mount_mode: MountMode::Compat,
             btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
             btrfs_device_paths: Vec::new(),
@@ -14320,6 +14360,7 @@ mod tests {
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: false,
             commit_interval_secs: None,
+            mvcc_policy: None,
             mount_mode: MountMode::Compat,
             btrfs_mount_selection: BtrfsMountSelection::Subvolume("home".to_owned()),
             btrfs_device_paths: Vec::new(),
@@ -14353,6 +14394,7 @@ mod tests {
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: false,
             commit_interval_secs: None,
+            mvcc_policy: None,
             mount_mode: MountMode::Native,
             btrfs_mount_selection: BtrfsMountSelection::Snapshot("snap-1".to_owned()),
             btrfs_device_paths: Vec::new(),
@@ -14390,6 +14432,7 @@ mod tests {
                     btrfs_rw_ephemeral_ok: false,
                     btrfs_verify_data_on_read: false,
                     commit_interval_secs: None,
+                    mvcc_policy: None,
                     mount_mode: MountMode::Compat,
                     btrfs_mount_selection: BtrfsMountSelection::Subvolume("missing".to_owned()),
                     btrfs_device_paths: Vec::new(),
@@ -14436,6 +14479,7 @@ mod tests {
                     btrfs_rw_ephemeral_ok: false,
                     btrfs_verify_data_on_read: false,
                     commit_interval_secs: None,
+                    mvcc_policy: None,
                     mount_mode: MountMode::Compat,
                     btrfs_mount_selection: BtrfsMountSelection::Snapshot(
                         "missing-snapshot".to_owned(),
@@ -14483,6 +14527,7 @@ mod tests {
                     btrfs_rw_ephemeral_ok: false,
                     btrfs_verify_data_on_read: false,
                     commit_interval_secs: None,
+                    mvcc_policy: None,
                     mount_mode: MountMode::Compat,
                     btrfs_mount_selection: BtrfsMountSelection::Subvolume("home".to_owned()),
                     btrfs_device_paths: Vec::new(),
@@ -14547,6 +14592,7 @@ mod tests {
                     btrfs_rw_ephemeral_ok: false,
                     btrfs_verify_data_on_read: false,
                     commit_interval_secs: None,
+                    mvcc_policy: None,
                     mount_mode: MountMode::Compat,
                     btrfs_mount_selection: BtrfsMountSelection::Snapshot("snap-home".to_owned()),
                     btrfs_device_paths: Vec::new(),

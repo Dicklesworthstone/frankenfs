@@ -2065,11 +2065,11 @@ An application that appends to many files concurrently (a message broker, a metr
 
 ```bash
 ffs mount log.img /mnt/log --rw --runtime-mode managed \
-    --managed-unmount-timeout-secs 60 \
+    --managed-unmount-timeout-secs 60 --mvcc-policy adaptive \
     --background-scrub --background-scrub-ledger scrub.jsonl
 ```
 
-Set `ConflictPolicy::Adaptive` in your library-mode embedder (CLI does not yet expose this flag); the policy switches to `SafeMerge` once contention warms up, and `MergeApplied` events dominate `MergeRejected` in the evidence ledger.
+`--mvcc-policy adaptive` (or `OpenFs::set_mvcc_conflict_policy` in a library embedder) selects the adaptive policy, which chooses between Strict and SafeMerge per commit once contention warms up. No mounted benchmark has yet measured whether it helps a real append workload, and MVCC merge events are not yet written to a mounted evidence ledger (bd-7ssc7).
 
 ### Storage engine research
 
@@ -2858,7 +2858,7 @@ The V1 surface (the tracked 97-row parity matrix) is implemented and tested. The
 | **Snapshot-based replication** | Stream MVCC snapshots between hosts to replicate filesystem state | Builds on the existing `Snapshot` + WAL infrastructure; needs network transport |
 | **Block-level dedup** | BLAKE3-keyed dedup table, COW reference counting | The native-mode BLAKE3 path already produces strong block identifiers |
 | **Compressed MVCC pages** | Per-page Zstd/Brotli compression *of MVCC metadata*, separate from version data | Version-data compression is done; metadata compression needs spec work |
-| **First-class CLI for adaptive conflict policy** | `--mvcc-policy {strict,safe-merge,adaptive}` on `ffs mount` | Currently library-only; CLI surface awaits broader operator experience |
+| **Mounted evidence for the conflict policies** | `--mvcc-policy {strict,safe-merge,adaptive}` exists on `ffs mount` (bd-7ssc7); what is missing is a mounted contention benchmark reporting merge/abort counts per policy | Needs the MVCC evidence ledger on the mounted store first |
 | **NUMA-aware allocator: authoritative large-host evidence** | Per-NUMA-node block group preference *proven* to improve `swarm.responsiveness` on a permissioned 64+ core / 256GB+ host | The opt-in allocator hook, contract, runtime topology propagation, and the advisory `numa_allocation_placement_report` evidence lane are implemented; authoritative large-host proof remains gated on the permissioned campaign `bd-rchk0.53.8` |
 
 These items are surfaced via the proof-bundle release-gate policy (`tests/release-gates/release_gate_policy_v1.json`) under explicit `non-goals` and `deferred` lists, so docs and release wording cannot accidentally claim coverage they don't have.

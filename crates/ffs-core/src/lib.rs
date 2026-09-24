@@ -1820,6 +1820,10 @@ pub struct OpenFs {
     /// Shared across all snapshots/transactions that operate on this filesystem.
     /// Writes stage versions here; reads check here before falling back to device.
     mvcc_store: Arc<FsMvccStore>,
+    /// Conflict policy requested for this mount (bd-7ssc7). Re-applied whenever
+    /// the store is replaced (e.g. the switch to the single-lock store when a
+    /// JBD2 writer attaches), so a policy set early is never silently dropped.
+    mvcc_conflict_policy: Mutex<ffs_mvcc::ConflictPolicy>,
     /// Highest MVCC commit sequence durably checkpointed to this filesystem's
     /// base device. The mutex serializes concurrent fsync/flush calls so an older
     /// checkpoint cannot overwrite a newer one after its watermark publishes.
@@ -5909,6 +5913,8 @@ impl OpenFs {
             ));
         }
         self.mvcc_store = Arc::new(FsMvccStore::sharded_with_publication_mode(mode));
+        self.mvcc_store
+            .set_conflict_policy(*self.mvcc_conflict_policy.lock());
         Ok(())
     }
 
@@ -6273,6 +6279,7 @@ impl OpenFs {
             dev,
             btrfs_devices,
             mvcc_store,
+            mvcc_conflict_policy: Mutex::new(ffs_mvcc::ConflictPolicy::default()),
             mvcc_flushed_through: Mutex::new(CommitSeq(0)),
             mutation_epoch: std::sync::atomic::AtomicU64::new(0),
             committed_mutation_epoch: std::sync::atomic::AtomicU64::new(0),
@@ -9536,6 +9543,8 @@ impl OpenFs {
             && self.mvcc_store.active_snapshot_count() == 0
         {
             self.mvcc_store = Arc::new(FsMvccStore::single());
+            self.mvcc_store
+                .set_conflict_policy(*self.mvcc_conflict_policy.lock());
         }
         self.jbd2_writer = Some(Mutex::new(writer));
     }
@@ -9914,6 +9923,22 @@ impl OpenFs {
             "metadata WAL compacted into base checkpoint"
         );
         Ok(())
+    }
+
+    /// Select the MVCC conflict policy for commits on this filesystem
+    /// (bd-7ssc7): `Strict` (pure first-committer-wins), `SafeMerge` (the
+    /// default: merge when a valid proof exists) or `Adaptive` (expected-loss
+    /// choice between the two from observed contention). Persists across
+    /// store replacement.
+    pub fn set_mvcc_conflict_policy(&self, policy: ffs_mvcc::ConflictPolicy) {
+        *self.mvcc_conflict_policy.lock() = policy;
+        self.mvcc_store.set_conflict_policy(policy);
+    }
+
+    /// The conflict policy the live MVCC store is using (bd-7ssc7).
+    #[must_use]
+    pub fn mvcc_conflict_policy(&self) -> ffs_mvcc::ConflictPolicy {
+        self.mvcc_store.conflict_policy()
     }
 
     /// Periodic durability commit (bd-dj725).
@@ -63972,6 +63997,36 @@ mod tests {
             return Err(format!("journal inode {inum} maps no blocks"));
         }
         Ok(segments)
+    }
+
+    /// bd-7ssc7: a requested conflict policy reaches the live store and
+    /// survives the store switch that attaching a JBD2 writer performs.
+    #[test]
+    fn mvcc_conflict_policy_survives_jbd2_store_switch_bd_7ssc7() {
+        let cx = Cx::for_testing();
+        let Some((mut fs, _dev, _tmp)) = open_writable_ext4_mkfs_with_device(64) else {
+            oracle_unavailable("ext4 image formatter");
+            return;
+        };
+        assert_eq!(
+            fs.mvcc_conflict_policy(),
+            ffs_mvcc::ConflictPolicy::SafeMerge,
+            "default policy"
+        );
+        fs.set_mvcc_conflict_policy(ffs_mvcc::ConflictPolicy::Adaptive);
+        assert_eq!(
+            fs.mvcc_conflict_policy(),
+            ffs_mvcc::ConflictPolicy::Adaptive
+        );
+        assert!(
+            fs.attach_ext4_internal_jbd2_writer(&cx)
+                .expect("attach journal")
+        );
+        assert_eq!(
+            fs.mvcc_conflict_policy(),
+            ffs_mvcc::ConflictPolicy::Adaptive,
+            "the policy must survive the switch to the single-lock store"
+        );
     }
 
     /// bd-dj725: the periodic commit makes un-fsynced ext4 writes durable, and

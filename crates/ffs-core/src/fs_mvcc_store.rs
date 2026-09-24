@@ -79,6 +79,23 @@ impl FsMvccStore {
         matches!(self, Self::Sharded(_))
     }
 
+    /// Set the commit-time conflict policy on whichever store variant is live
+    /// (bd-7ssc7).
+    pub(super) fn set_conflict_policy(&self, policy: ffs_mvcc::ConflictPolicy) {
+        match self {
+            Self::Single(lock) => lock.write().set_conflict_policy(policy),
+            Self::Sharded(store) => store.set_conflict_policy(policy),
+        }
+    }
+
+    /// The live store's conflict policy (bd-7ssc7).
+    pub(super) fn conflict_policy(&self) -> ffs_mvcc::ConflictPolicy {
+        match self {
+            Self::Single(lock) => lock.read().conflict_policy(),
+            Self::Sharded(store) => store.conflict_policy(),
+        }
+    }
+
     pub(super) fn begin(&self) -> Transaction {
         match self {
             Self::Single(lock) => lock.write().begin(),
