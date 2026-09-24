@@ -1043,19 +1043,16 @@ impl<W: WalWriter> GroupCommitCoordinator<W> {
         entries: Vec<WalEntry>,
         epoch: u64,
     ) -> Result<(GroupCommitResult, Vec<WalEntry>), GroupCommitFailure> {
-        let mut failure = match self.flush_failure.lock() {
-            Ok(guard) => guard,
-            Err(_) => {
-                let message = GROUP_COMMIT_PANIC;
-                self.notifier.notify_failed(
-                    self.epoch_manager.flushed_epoch().saturating_add(1),
-                    message.to_owned(),
-                );
-                return Err(GroupCommitFailure {
-                    error: FfsError::Io(std::io::Error::other(message)),
-                    entries,
-                });
-            }
+        let Ok(mut failure) = self.flush_failure.lock() else {
+            let message = GROUP_COMMIT_PANIC;
+            self.notifier.notify_failed(
+                self.epoch_manager.flushed_epoch().saturating_add(1),
+                message.to_owned(),
+            );
+            return Err(GroupCommitFailure {
+                error: FfsError::Io(std::io::Error::other(message)),
+                entries,
+            });
         };
         if let Some(message) = failure.as_ref() {
             return Err(GroupCommitFailure {

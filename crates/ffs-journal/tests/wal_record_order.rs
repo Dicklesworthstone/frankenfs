@@ -49,7 +49,11 @@ fn pooled_epoch_sort_preserves_each_transactions_write_and_commit_order() {
     assert_eq!(result.entries_flushed, 8 * 64 * 3);
     assert_eq!(result.buffers_drained, 8);
     assert!(buffers.iter().all(CoreWalBuffer::is_empty));
-    assert!(entries.windows(2).all(|pair| pair[0].epoch <= pair[1].epoch));
+    assert!(
+        entries
+            .windows(2)
+            .all(|pair| pair[0].epoch <= pair[1].epoch)
+    );
     for txn in 1..=512 {
         let actual: Vec<_> = entries
             .iter()

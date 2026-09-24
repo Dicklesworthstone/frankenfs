@@ -138,9 +138,9 @@ impl From<WalWriteError> for FfsError {
                 Self::Io(source)
             }
             WalWriteError::FormatViolation { detail } => Self::Format(detail),
-            WalWriteError::RecoveryRequired { detail } => {
-                Self::Io(std::io::Error::other(format!("WAL recovery required: {detail}")))
-            }
+            WalWriteError::RecoveryRequired { detail } => Self::Io(std::io::Error::other(format!(
+                "WAL recovery required: {detail}"
+            ))),
             WalWriteError::VerificationFailed {
                 expected_crc,
                 actual_crc,
@@ -806,17 +806,22 @@ impl WalWriter {
         let len_u64 = u64::try_from(data.len()).map_err(|_| WalWriteError::FormatViolation {
             detail: "data length exceeds u64".to_owned(),
         })?;
-        let next_pos = self.write_pos.checked_add(len_u64).ok_or_else(|| {
-            WalWriteError::FormatViolation {
-                detail: "write position overflowed".to_owned(),
-            }
-        })?;
+        let next_pos =
+            self.write_pos
+                .checked_add(len_u64)
+                .ok_or_else(|| WalWriteError::FormatViolation {
+                    detail: "write position overflowed".to_owned(),
+                })?;
         if let Err(source) = self.write_append_bytes(data) {
             let error = WalWriteError::AppendIo {
                 source,
                 bytes_attempted: data.len(),
             };
-            return Err(self.rollback_failed_append(self.write_pos, self.appends_since_sync, error));
+            return Err(self.rollback_failed_append(
+                self.write_pos,
+                self.appends_since_sync,
+                error,
+            ));
         }
         self.write_pos = next_pos;
         Ok(())
@@ -827,7 +832,9 @@ impl WalWriter {
         if let Some(limit) = self.fail_append_after {
             self.file
                 .write_all_at(&data[..limit.min(data.len())], self.write_pos)?;
-            return Err(std::io::Error::other("injected failure after partial append"));
+            return Err(std::io::Error::other(
+                "injected failure after partial append",
+            ));
         }
         self.file.write_all_at(data, self.write_pos)
     }

@@ -27,7 +27,9 @@ impl WalWriter for TestWriter {
         if state.fail_write {
             // A failed append may already have persisted a prefix.
             state.written.extend(entries.iter().take(1).cloned());
-            return Err(FfsError::Io(std::io::Error::other("injected write failure")));
+            return Err(FfsError::Io(std::io::Error::other(
+                "injected write failure",
+            )));
         }
         state.written.extend_from_slice(entries);
         Ok(())
@@ -125,11 +127,15 @@ fn a_failed_batch_does_not_invalidate_the_previously_durable_prefix() {
         .expect("first epoch");
     writer.0.lock().expect("writer state").fail_write = true;
     let entries = [2, 3].into_iter().flat_map(transaction).collect();
-    coordinator.flush_epoch(entries, 3).expect_err("later failure");
+    coordinator
+        .flush_epoch(entries, 3)
+        .expect_err("later failure");
     assert_eq!(coordinator.epoch_manager().flushed_epoch(), 1);
     assert_eq!(coordinator.notifier().durable_epoch(), 1);
     assert_eq!(
-        coordinator.notifier().await_epoch_timeout(1, Duration::ZERO),
+        coordinator
+            .notifier()
+            .await_epoch_timeout(1, Duration::ZERO),
         Some(DurabilityOutcome::Durable)
     );
     assert_failed(&coordinator, 2);
@@ -177,7 +183,9 @@ fn successful_sync_retry_writes_once_and_returns_future_entries() {
     assert_eq!(coordinator.epoch_manager().flushed_epoch(), 1);
     assert_eq!(coordinator.notifier().durable_epoch(), 1);
     assert_eq!(
-        coordinator.notifier().await_epoch_timeout(2, Duration::ZERO),
+        coordinator
+            .notifier()
+            .await_epoch_timeout(2, Duration::ZERO),
         None
     );
     let state = writer.0.lock().expect("writer state");
@@ -200,7 +208,9 @@ fn duplicate_durable_epoch_is_rejected_without_poisoning_a_healthy_writer() {
     assert!(matches!(failure.error, FfsError::Format(_)));
     assert_eq!(failure.entries, duplicate);
     assert_eq!(writer.0.lock().expect("writer state").writes, 1);
-    coordinator.flush_epoch(transaction(2), 2).expect("next epoch");
+    coordinator
+        .flush_epoch(transaction(2), 2)
+        .expect("next epoch");
     assert_eq!(coordinator.epoch_manager().flushed_epoch(), 2);
     assert_eq!(coordinator.notifier().durable_epoch(), 2);
 }
@@ -250,7 +260,9 @@ fn concurrent_flush_holds_serialization_through_sync_and_publication() {
         let coordinator = Arc::clone(&coordinator);
         std::thread::spawn(move || coordinator.flush_epoch(transaction(1), 1))
     };
-    observed_sync.recv_timeout(TEST_TIMEOUT).expect("first sync");
+    observed_sync
+        .recv_timeout(TEST_TIMEOUT)
+        .expect("first sync");
     assert_eq!(coordinator.epoch_manager().flushed_epoch(), 0);
     assert_eq!(coordinator.notifier().durable_epoch(), 0);
     // This is an explicit synchronization assertion, not a sleep-based guess
