@@ -2378,12 +2378,16 @@ impl FsOps for OpenFs {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_SCRUB is not supported on ext4 filesystems".to_owned(),
             )),
-            // V1.x: ioctl-based scrub is not implemented. The kernel btrfs scrub
-            // reads every block which can take hours on large filesystems.
-            // FrankenFS provides scrub/recovery via `ffs repair` command instead.
-            // Return empty progress struct = no ioctl-based scrub running (correct).
-            // See bd-f37vs for rationale (closed as wont_fix).
-            FsFlavor::Btrfs(_) => Ok(vec![0_u8; 1024]),
+            // bd-tmwe8: ioctl-driven scrub is not implemented. Returning a zeroed
+            // progress struct made `btrfs scrub start` report a clean, successful
+            // scrub that never read a block. Say so instead; scrub/repair is
+            // available via `ffs scrub`, `ffs repair` and mounted
+            // `--background-scrub`.
+            FsFlavor::Btrfs(_) => Err(FfsError::UnsupportedFeature(
+                "BTRFS_IOC_SCRUB is not implemented; use `ffs scrub` or a mount with \
+                 --background-scrub"
+                    .to_owned(),
+            )),
         }
     }
 
@@ -2409,10 +2413,11 @@ impl FsOps for OpenFs {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_SCRUB_PROGRESS is not supported on ext4 filesystems".to_owned(),
             )),
-            // No async scrub running via ioctl - return empty progress struct.
-            // Note: ScrubDaemon in ffs-repair can still verify/repair checksums,
-            // just not via this ioctl interface yet.
-            FsFlavor::Btrfs(_) => Ok(vec![0_u8; 1024]),
+            // bd-tmwe8: no ioctl-driven scrub can be running, so answer like the
+            // kernel does when there is no scrub: ENOTCONN (same as cancel).
+            FsFlavor::Btrfs(_) => Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                libc::ENOTCONN,
+            ))),
         }
     }
 
@@ -2429,9 +2434,16 @@ impl FsOps for OpenFs {
                 "BTRFS_IOC_DEFRAG_RANGE is not supported on ext4 filesystems".to_owned(),
             )),
             FsFlavor::Btrfs(_) => {
-                // Defrag requires extent tree manipulation - return EROFS for read-only mounts
-                // For RW mode, actual implementation would rewrite extents
-                Err(FfsError::ReadOnly)
+                // bd-tmwe8: EROFS only when the mount is read-only; on a writable
+                // mount the honest answer is "not implemented", not EROFS.
+                if self.is_writable() {
+                    Err(FfsError::UnsupportedFeature(
+                        "BTRFS_IOC_DEFRAG_RANGE is not implemented on FrankenFS btrfs mounts"
+                            .to_owned(),
+                    ))
+                } else {
+                    Err(FfsError::ReadOnly)
+                }
             }
         }
     }
@@ -2447,8 +2459,16 @@ impl FsOps for OpenFs {
                 "BTRFS_IOC_SNAP_CREATE_V2 is not supported on ext4 filesystems".to_owned(),
             )),
             FsFlavor::Btrfs(_) => {
-                // Snapshot creation requires ROOT_ITEM creation and tree cloning
-                Err(FfsError::ReadOnly)
+                // bd-tmwe8: OpenFs::create_snapshot exists but is not wired to
+                // this ioctl yet; EROFS only when the mount is read-only.
+                if self.is_writable() {
+                    Err(FfsError::UnsupportedFeature(
+                        "BTRFS_IOC_SNAP_CREATE_V2 is not implemented on FrankenFS btrfs mounts"
+                            .to_owned(),
+                    ))
+                } else {
+                    Err(FfsError::ReadOnly)
+                }
             }
         }
     }
@@ -2464,8 +2484,15 @@ impl FsOps for OpenFs {
                 "BTRFS_IOC_SNAP_DESTROY is not supported on ext4 filesystems".to_owned(),
             )),
             FsFlavor::Btrfs(_) => {
-                // Snapshot deletion requires orphan handling and tree removal
-                Err(FfsError::ReadOnly)
+                // bd-tmwe8: EROFS only when the mount is read-only.
+                if self.is_writable() {
+                    Err(FfsError::UnsupportedFeature(
+                        "BTRFS_IOC_SNAP_DESTROY is not implemented on FrankenFS btrfs mounts"
+                            .to_owned(),
+                    ))
+                } else {
+                    Err(FfsError::ReadOnly)
+                }
             }
         }
     }
@@ -2481,8 +2508,15 @@ impl FsOps for OpenFs {
                 "BTRFS_IOC_SNAP_DESTROY_V2 is not supported on ext4 filesystems".to_owned(),
             )),
             FsFlavor::Btrfs(_) => {
-                // V2 uses subvolid instead of name but still requires tree removal
-                Err(FfsError::ReadOnly)
+                // bd-tmwe8: EROFS only when the mount is read-only.
+                if self.is_writable() {
+                    Err(FfsError::UnsupportedFeature(
+                        "BTRFS_IOC_SNAP_DESTROY_V2 is not implemented on FrankenFS btrfs mounts"
+                            .to_owned(),
+                    ))
+                } else {
+                    Err(FfsError::ReadOnly)
+                }
             }
         }
     }
@@ -2790,8 +2824,14 @@ impl FsOps for OpenFs {
                 "BTRFS_IOC_DEFRAG is not supported on ext4 filesystems".to_owned(),
             )),
             FsFlavor::Btrfs(_) => {
-                // Defrag requires write access
-                Err(FfsError::ReadOnly)
+                // bd-tmwe8: EROFS only when the mount is read-only.
+                if self.is_writable() {
+                    Err(FfsError::UnsupportedFeature(
+                        "BTRFS_IOC_DEFRAG is not implemented on FrankenFS btrfs mounts".to_owned(),
+                    ))
+                } else {
+                    Err(FfsError::ReadOnly)
+                }
             }
         }
     }
@@ -3017,8 +3057,16 @@ impl FsOps for OpenFs {
                 "BTRFS_IOC_SUBVOL_CREATE_V2 is not supported on ext4 filesystems".to_owned(),
             )),
             FsFlavor::Btrfs(_) => {
-                // Subvolume creation requires ROOT_ITEM creation and tree initialization
-                Err(FfsError::ReadOnly)
+                // bd-tmwe8: OpenFs::create_subvolume exists but is not wired to
+                // this ioctl yet; EROFS only when the mount is read-only.
+                if self.is_writable() {
+                    Err(FfsError::UnsupportedFeature(
+                        "BTRFS_IOC_SUBVOL_CREATE_V2 is not implemented on FrankenFS btrfs mounts"
+                            .to_owned(),
+                    ))
+                } else {
+                    Err(FfsError::ReadOnly)
+                }
             }
         }
     }
@@ -3857,7 +3905,11 @@ impl FsOps for OpenFs {
                     .insert(donor_fd, Self::ext4_canonical_inode(donor_ino));
                 Ok(())
             }
-            FsFlavor::Btrfs(_) => Ok(()),
+            // bd-tmwe8: EXT4_IOC_MOVE_EXT has no btrfs meaning; registering a
+            // donor silently would let a later move report success.
+            FsFlavor::Btrfs(_) => Err(FfsError::UnsupportedFeature(
+                "EXT4_IOC_MOVE_EXT donor registration is ext4-only".to_owned(),
+            )),
         }
     }
 
@@ -4140,6 +4192,9 @@ impl FsOps for OpenFs {
 
     fn begin_request_scope(&self, _cx: &Cx, op: RequestOp) -> ffs_error::Result<RequestScope> {
         let (snapshot, tx) = if op.is_write() {
+            // bd-dj725: feeds the periodic commit's "anything changed?" check.
+            self.mutation_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             // Write operations must use a transaction for isolation and atomicity.
             let txn = self.mvcc_store.begin();
             let snapshot = txn.snapshot;

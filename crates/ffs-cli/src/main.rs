@@ -608,6 +608,8 @@ struct MountCmdOptions {
     btrfs_rw_ephemeral_ok: bool,
     /// Verify btrfs data checksums on every read, the way the kernel does.
     btrfs_verify_data_on_read: bool,
+    /// Periodic commit interval override (bd-dj725); `None` = per-format default.
+    commit_interval_secs: Option<u64>,
     runtime: MountRuntimeConfig,
     adaptive_runtime: MountAdaptiveRuntimeConfig,
     adaptive_runtime_summary: MountAdaptiveRuntimeSummaryConfig,
@@ -1316,6 +1318,12 @@ enum Command {
         /// Additional backing device for a clean, read-only btrfs filesystem (repeatable).
         #[arg(long = "btrfs-device", value_name = "PATH", conflicts_with = "rw")]
         btrfs_device_paths: Vec<PathBuf>,
+        /// Seconds between periodic durability commits on a read-write mount
+        /// (bd-dj725). Without them a write that is never fsynced is lost on a
+        /// crash no matter how long ago it happened. Defaults to the kernel's
+        /// values: 5 for ext4 (`commit=5`), 30 for btrfs. `0` disables.
+        #[arg(long = "commit-interval-secs", value_name = "SECS")]
+        commit_interval_secs: Option<u64>,
     },
     /// Run a read-only integrity scan (scrub) on a filesystem image.
     Scrub {
@@ -2451,6 +2459,7 @@ fn run() -> Result<()> {
             btrfs_rw_ephemeral_ok,
             btrfs_verify_data_on_read,
             btrfs_device_paths,
+            commit_interval_secs,
         } => {
             let btrfs_mount_selection = parse_btrfs_mount_selection(subvol, snapshot)?;
             let background_scrub = MountBackgroundScrubConfig::resolve(
@@ -2489,6 +2498,7 @@ fn run() -> Result<()> {
                     ext4_verify_journal_checksums: !ext4_nojournal_checksum,
                     btrfs_rw_ephemeral_ok,
                     btrfs_verify_data_on_read,
+                    commit_interval_secs,
                     runtime: MountRuntimeConfig {
                         mode: runtime_mode,
                         managed_unmount_timeout_secs,
@@ -7687,6 +7697,96 @@ struct MountBackgroundScrubPlan {
     block_size: u32,
     fs_uuid: [u8; 16],
     groups: Vec<GroupConfig>,
+    /// bd-jufod: the mount is not writable, so at-rest ext4 metadata checksums
+    /// are authoritative and the full metadata validator can be used.
+    static_metadata: bool,
+}
+
+/// Mount-owned periodic durability commit (bd-dj725). Stopped and joined on
+/// drop, i.e. when the mount returns, before the final unmount flush.
+struct PeriodicCommitGuard {
+    stop: Arc<std::sync::atomic::AtomicBool>,
+    handle: Option<JoinHandle<()>>,
+}
+
+impl Drop for PeriodicCommitGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Release);
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn start_periodic_commit(
+    open_fs: &Arc<OpenFs>,
+    interval: Duration,
+    operation_id: &str,
+) -> Option<PeriodicCommitGuard> {
+    if interval.is_zero() {
+        info!(
+            target: "ffs::cli::mount",
+            operation_id,
+            "periodic_commit_disabled"
+        );
+        return None;
+    }
+    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_stop = Arc::clone(&stop);
+    let fs = Arc::clone(open_fs);
+    let log_operation_id = operation_id.to_owned();
+    let operation_id = operation_id.to_owned();
+    let handle = std::thread::Builder::new()
+        .name("ffs-periodic-commit".to_owned())
+        .spawn(move || {
+            let cx = Cx::for_request();
+            let tick = Duration::from_millis(100);
+            let mut waited = Duration::ZERO;
+            while !thread_stop.load(std::sync::atomic::Ordering::Acquire) {
+                std::thread::sleep(tick);
+                waited += tick;
+                if waited < interval {
+                    continue;
+                }
+                waited = Duration::ZERO;
+                match fs.periodic_commit(&cx) {
+                    Ok(true) => debug!(
+                        target: "ffs::cli::mount",
+                        operation_id = %operation_id,
+                        "periodic_commit_applied"
+                    ),
+                    Ok(false) => {}
+                    Err(error) => warn!(
+                        target: "ffs::cli::mount",
+                        operation_id = %operation_id,
+                        error = %error,
+                        "periodic_commit_failed"
+                    ),
+                }
+            }
+        });
+    match handle {
+        Ok(handle) => {
+            info!(
+                target: "ffs::cli::mount",
+                operation_id = %log_operation_id,
+                interval_secs = interval.as_secs(),
+                "periodic_commit_started"
+            );
+            Some(PeriodicCommitGuard {
+                stop,
+                handle: Some(handle),
+            })
+        }
+        Err(error) => {
+            warn!(
+                target: "ffs::cli::mount",
+                error = %error,
+                "periodic_commit_spawn_failed"
+            );
+            None
+        }
+    }
 }
 
 struct MountBackgroundScrubGuard {
@@ -7790,6 +7890,7 @@ fn build_mount_background_scrub_plan(
             block_size: sb.block_size,
             fs_uuid: sb.uuid,
             groups,
+            static_metadata: !open_fs.is_writable(),
         });
     }
 
@@ -7828,6 +7929,7 @@ fn build_mount_background_scrub_plan(
             block_size,
             fs_uuid: sb.fsid,
             groups,
+            static_metadata: !open_fs.is_writable(),
         });
     }
 
@@ -7948,7 +8050,13 @@ fn run_mount_background_scrub_daemon(
             plan.block_size
         )
     })?;
-    let validator = scrub_validator(&plan.flavor, plan.block_size);
+    let validator = match &plan.flavor {
+        FsFlavor::Ext4(sb) if plan.static_metadata => Box::new(
+            ffs_repair::scrub::Ext4MetadataValidator::from_device(&cli_cx(), &block_dev, sb)
+                .context("failed to read ext4 group descriptors for background scrub")?,
+        ) as Box<dyn BlockValidator>,
+        _ => scrub_validator(&plan.flavor, plan.block_size),
+    };
     let ledger = open_mount_background_scrub_ledger(config.ledger_path)?;
     let repair_symbol_count =
         mount_background_repair_symbol_count(&plan.groups, repair_writes_enabled);
@@ -8340,6 +8448,17 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
         &operation_id,
         scenario_id,
     )?;
+    let _periodic_commit_guard = options
+        .read_write
+        .then(|| {
+            let default_secs = match &open_fs.flavor {
+                FsFlavor::Ext4(_) => 5,
+                FsFlavor::Btrfs(_) => 30,
+            };
+            let secs = options.commit_interval_secs.unwrap_or(default_secs);
+            start_periodic_commit(&open_fs, Duration::from_secs(secs), &operation_id)
+        })
+        .flatten();
 
     match runtime.mode {
         MountRuntimeMode::Standard => {
@@ -8675,7 +8794,16 @@ fn scrub_cmd(path: &PathBuf, json: bool) -> Result<()> {
     let block_dev = ByteBlockDevice::new(byte_dev, block_size)
         .with_context(|| format!("failed to create block device (block_size={block_size})"))?;
 
-    let validator = scrub_validator(&flavor, block_size);
+    // bd-jufod: an offline image is not being mutated, so ext4 descriptor and
+    // bitmap checksums are authoritative and are verified, not just the
+    // superblock.
+    let validator = match &flavor {
+        FsFlavor::Ext4(sb) => Box::new(
+            ffs_repair::scrub::Ext4MetadataValidator::from_device(&cx, &block_dev, sb)
+                .context("failed to read ext4 group descriptors for scrub")?,
+        ) as Box<dyn BlockValidator>,
+        FsFlavor::Btrfs(_) => scrub_validator(&flavor, block_size),
+    };
 
     if !json {
         let fs_name = match &flavor {
@@ -9921,6 +10049,7 @@ mod tests {
             ext4_verify_journal_checksums: true,
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: false,
+            commit_interval_secs: None,
             runtime: MountRuntimeConfig {
                 mode: MountRuntimeMode::Standard,
                 managed_unmount_timeout_secs: None,
@@ -13397,6 +13526,99 @@ mod tests {
         );
     }
 
+    /// bd-jufod: offline ext4 scrub verifies group descriptor and bitmap
+    /// checksums, not only the superblock. A freshly formatted image must scrub
+    /// clean (no false positives on free space), and a byte flipped in a block
+    /// bitmap or in a group descriptor must be reported as a checksum mismatch.
+    #[test]
+    fn ext4_metadata_scrub_detects_bitmap_and_descriptor_corruption_bd_jufod() {
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let image = dir.path().join("meta.ext4");
+        std::fs::File::create(&image)
+            .and_then(|f| f.set_len(32 * 1024 * 1024))
+            .expect("sparse image");
+        let formatted = std::process::Command::new("mke2fs")
+            .args([
+                "-q",
+                "-F",
+                "-t",
+                "ext4",
+                "-O",
+                "metadata_csum",
+                "-b",
+                "4096",
+            ])
+            .arg(&image)
+            .status();
+        if !formatted.is_ok_and(|s| s.success()) {
+            assert!(
+                std::env::var_os("FFS_REQUIRE_ORACLES").is_none_or(|v| v != "1"),
+                "FFS_REQUIRE_ORACLES=1 but mke2fs is unavailable"
+            );
+            eprintln!("SKIP bd-jufod: mke2fs unavailable");
+            return;
+        }
+        let cx = crate::cli_cx();
+        let scrub = |bytes: &[u8]| {
+            let path = dir.path().join("scrub.ext4");
+            std::fs::write(&path, bytes).expect("write scrub copy");
+            let byte_dev = ffs_block::FileByteDevice::open(&path).expect("open image");
+            let sb = ffs_ondisk::Ext4Superblock::parse_from_image(bytes).expect("superblock");
+            let block_dev =
+                ffs_block::ByteBlockDevice::new(byte_dev, sb.block_size).expect("block device");
+            let validator =
+                ffs_repair::scrub::Ext4MetadataValidator::from_device(&cx, &block_dev, &sb)
+                    .expect("validator");
+            ffs_repair::scrub::Scrubber::new(&block_dev, &validator)
+                .scrub_all(&cx)
+                .expect("scrub")
+        };
+        let clean = std::fs::read(&image).expect("read image");
+        let report = scrub(&clean);
+        assert_eq!(
+            report.blocks_corrupt, 0,
+            "a freshly formatted image must scrub clean: {:?}",
+            report.findings
+        );
+
+        let sb = ffs_ondisk::Ext4Superblock::parse_from_image(&clean).expect("superblock");
+        let bs = sb.block_size as usize;
+        let gdt_off = usize::try_from(
+            sb.group_desc_offset(ffs_types::GroupNumber(0))
+                .expect("gdt offset"),
+        )
+        .expect("fits");
+        let gd0 = ffs_ondisk::Ext4GroupDesc::parse_from_bytes(
+            &clean[gdt_off..gdt_off + usize::from(sb.group_desc_size())],
+            sb.group_desc_size(),
+        )
+        .expect("gd 0");
+
+        let mut bitmap_bad = clean.clone();
+        let bitmap_byte = usize::try_from(gd0.block_bitmap).expect("fits") * bs + 2000;
+        bitmap_bad[bitmap_byte] ^= 0x01;
+        let report = scrub(&bitmap_bad);
+        assert!(
+            report.findings.iter().any(|f| f.block.0 == gd0.block_bitmap
+                && f.kind == ffs_repair::scrub::CorruptionKind::ChecksumMismatch),
+            "a flipped block-bitmap bit must be reported: {:?}",
+            report.findings
+        );
+
+        let mut gd_bad = clean;
+        gd_bad[gdt_off + 0x0C] ^= 0x01; // bg_free_blocks_count_lo
+        let report = scrub(&gd_bad);
+        assert!(
+            report
+                .findings
+                .iter()
+                .any(|f| f.block.0 == (gdt_off / bs) as u64
+                    && f.kind == ffs_repair::scrub::CorruptionKind::ChecksumMismatch),
+            "a flipped descriptor byte must be reported: {:?}",
+            report.findings
+        );
+    }
+
     /// bd-plamw: repair-symbol tails are not reserved from the allocator, so a
     /// read-write mount must refuse mounted repair rather than let a later
     /// symbol refresh overwrite a block allocated during the mount.
@@ -13744,6 +13966,7 @@ mod tests {
                         read_write: true,
                         btrfs_rw_ephemeral_ok: false,
                         btrfs_verify_data_on_read: false,
+                        commit_interval_secs: None,
                         mount_mode: MountMode::Compat,
                         btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
                         btrfs_device_paths: Vec::new(),
@@ -13821,6 +14044,7 @@ mod tests {
                 read_write: false,
                 btrfs_rw_ephemeral_ok: false,
                 btrfs_verify_data_on_read: false,
+                commit_interval_secs: None,
                 mount_mode: MountMode::Compat,
                 btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
                 btrfs_device_paths: Vec::new(),
@@ -13858,6 +14082,7 @@ mod tests {
                 read_write: false,
                 btrfs_rw_ephemeral_ok: false,
                 btrfs_verify_data_on_read: false,
+                commit_interval_secs: None,
                 mount_mode: MountMode::Compat,
                 btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
                 btrfs_device_paths: Vec::new(),
@@ -13967,6 +14192,7 @@ mod tests {
             read_write: false,
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: false,
+            commit_interval_secs: None,
             mount_mode: MountMode::Compat,
             btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
             btrfs_device_paths: Vec::new(),
@@ -14055,6 +14281,7 @@ mod tests {
             read_write: false,
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: verify,
+            commit_interval_secs: None,
             mount_mode: MountMode::Compat,
             btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
             btrfs_device_paths: Vec::new(),
@@ -14092,6 +14319,7 @@ mod tests {
             read_write: true,
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: false,
+            commit_interval_secs: None,
             mount_mode: MountMode::Compat,
             btrfs_mount_selection: BtrfsMountSelection::Subvolume("home".to_owned()),
             btrfs_device_paths: Vec::new(),
@@ -14124,6 +14352,7 @@ mod tests {
             read_write: false,
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: false,
+            commit_interval_secs: None,
             mount_mode: MountMode::Native,
             btrfs_mount_selection: BtrfsMountSelection::Snapshot("snap-1".to_owned()),
             btrfs_device_paths: Vec::new(),
@@ -14160,6 +14389,7 @@ mod tests {
                     read_write: false,
                     btrfs_rw_ephemeral_ok: false,
                     btrfs_verify_data_on_read: false,
+                    commit_interval_secs: None,
                     mount_mode: MountMode::Compat,
                     btrfs_mount_selection: BtrfsMountSelection::Subvolume("missing".to_owned()),
                     btrfs_device_paths: Vec::new(),
@@ -14205,6 +14435,7 @@ mod tests {
                     read_write: false,
                     btrfs_rw_ephemeral_ok: false,
                     btrfs_verify_data_on_read: false,
+                    commit_interval_secs: None,
                     mount_mode: MountMode::Compat,
                     btrfs_mount_selection: BtrfsMountSelection::Snapshot(
                         "missing-snapshot".to_owned(),
@@ -14251,6 +14482,7 @@ mod tests {
                     read_write: false,
                     btrfs_rw_ephemeral_ok: false,
                     btrfs_verify_data_on_read: false,
+                    commit_interval_secs: None,
                     mount_mode: MountMode::Compat,
                     btrfs_mount_selection: BtrfsMountSelection::Subvolume("home".to_owned()),
                     btrfs_device_paths: Vec::new(),
@@ -14314,6 +14546,7 @@ mod tests {
                     read_write: false,
                     btrfs_rw_ephemeral_ok: false,
                     btrfs_verify_data_on_read: false,
+                    commit_interval_secs: None,
                     mount_mode: MountMode::Compat,
                     btrfs_mount_selection: BtrfsMountSelection::Snapshot("snap-home".to_owned()),
                     btrfs_device_paths: Vec::new(),

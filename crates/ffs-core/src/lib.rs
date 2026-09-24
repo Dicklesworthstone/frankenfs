@@ -1824,6 +1824,12 @@ pub struct OpenFs {
     /// base device. The mutex serializes concurrent fsync/flush calls so an older
     /// checkpoint cannot overwrite a newer one after its watermark publishes.
     mvcc_flushed_through: Mutex<CommitSeq>,
+    /// Count of mutating request scopes begun (bd-dj725). The periodic commit
+    /// compares it with [`Self::committed_mutation_epoch`] so an idle mount
+    /// never pays for a commit.
+    mutation_epoch: std::sync::atomic::AtomicU64,
+    /// `mutation_epoch` value covered by the last periodic commit (bd-dj725).
+    committed_mutation_epoch: std::sync::atomic::AtomicU64,
     /// Optional append-only metadata durability path.
     ///
     /// A sync batches every block newer than `logged_through`, adds the derived
@@ -6268,6 +6274,8 @@ impl OpenFs {
             btrfs_devices,
             mvcc_store,
             mvcc_flushed_through: Mutex::new(CommitSeq(0)),
+            mutation_epoch: std::sync::atomic::AtomicU64::new(0),
+            committed_mutation_epoch: std::sync::atomic::AtomicU64::new(0),
             metadata_log,
             metadata_compactor: Mutex::new(None),
             jbd2_writer: None,
@@ -9906,6 +9914,39 @@ impl OpenFs {
             "metadata WAL compacted into base checkpoint"
         );
         Ok(())
+    }
+
+    /// Periodic durability commit (bd-dj725).
+    ///
+    /// Kernel ext4 commits its journal every 5 s and kernel btrfs commits a
+    /// transaction every 30 s, so an application that never calls fsync loses
+    /// at most that window on a crash. FrankenFS used to make writes durable
+    /// only at fsync/unmount: a daemon crash lost everything written since
+    /// mount and dirty state grew without bound. A mount-owned timer calls
+    /// this; it runs the same durability boundary an fsync does, and returns
+    /// `Ok(false)` without touching the device when nothing changed.
+    ///
+    /// # Errors
+    /// Propagates the durability boundary's errors (same as fsync).
+    pub fn periodic_commit(&self, cx: &Cx) -> ffs_error::Result<bool> {
+        if !self.is_writable() {
+            return Ok(false);
+        }
+        let epoch = self.mutation_epoch.load(Ordering::Acquire);
+        let epoch_dirty = epoch != self.committed_mutation_epoch.load(Ordering::Acquire);
+        let mvcc_dirty = match &self.flavor {
+            FsFlavor::Ext4(_) => {
+                self.mvcc_store.current_snapshot().high > *self.mvcc_flushed_through.lock()
+            }
+            FsFlavor::Btrfs(_) => false,
+        };
+        if !epoch_dirty && !mvcc_dirty {
+            return Ok(false);
+        }
+        self.fsync(cx, InodeNumber(1), 0, false)?;
+        self.committed_mutation_epoch
+            .fetch_max(epoch, Ordering::AcqRel);
+        Ok(true)
     }
 
     /// Flush all committed MVCC block versions to the underlying image.
@@ -48896,8 +48937,8 @@ mod tests {
             "unexpected refusal: {err:?}"
         );
         assert!(
-            fs.read_inode(&cx, InodeNumber(2)).is_ok(),
-            "reads still work"
+            fs.read_inode(&cx, InodeNumber(11)).is_ok(),
+            "the image stays readable after the refusal"
         );
     }
 
@@ -63931,6 +63972,49 @@ mod tests {
             return Err(format!("journal inode {inum} maps no blocks"));
         }
         Ok(segments)
+    }
+
+    /// bd-dj725: the periodic commit makes un-fsynced ext4 writes durable, and
+    /// is a no-op when nothing changed (an idle mount must not pay for syncs).
+    #[test]
+    fn ext4_periodic_commit_persists_unsynced_writes_bd_dj725() {
+        let cx = Cx::for_testing();
+        let Some((mut fs, dev, _tmp)) = open_writable_ext4_mkfs_with_device(64) else {
+            oracle_unavailable("ext4 image formatter");
+            return;
+        };
+        assert!(
+            fs.attach_ext4_internal_jbd2_writer(&cx)
+                .expect("attach the image's own journal")
+        );
+        let attr = fs
+            .create(&cx, InodeNumber(2), OsStr::new("tick.bin"), 0o644, 0, 0)
+            .expect("create");
+        fs.write(&cx, attr.ino, 0, &[0x77_u8; 4096]).expect("write");
+        assert!(
+            fs.periodic_commit(&cx).expect("periodic commit"),
+            "un-fsynced writes must be committed by the tick"
+        );
+        assert!(
+            !fs.periodic_commit(&cx).expect("idle tick"),
+            "an idle tick must not commit again"
+        );
+
+        let opts = OpenOptions {
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+            ..OpenOptions::default()
+        };
+        let reopened = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(dev.snapshot_bytes())),
+            &opts,
+        )
+        .expect("reopen image as a crash would leave it");
+        assert_eq!(
+            reopened.read(&cx, attr.ino, 0, 4096).expect("read home"),
+            vec![0x77_u8; 4096],
+            "after the tick the bytes are at home without any fsync"
+        );
     }
 
     /// bd-cnmpm: a crash after the JBD2 commit record is durable but before the
@@ -83920,6 +84004,81 @@ mod tests {
                     data: false,
                     metadata: false
                 }
+            );
+        }
+    }
+
+    /// bd-tmwe8: btrfs ioctls FrankenFS does not implement must say so. A zeroed
+    /// scrub progress struct made `btrfs scrub start` report a clean scrub that
+    /// never ran, and EROFS on a writable mount misdescribed the refusal.
+    #[test]
+    fn btrfs_unimplemented_ioctls_do_not_report_success_bd_tmwe8() {
+        let Some((fs, _dev, _tmp, _image)) = open_writable_btrfs_mkfs(256) else {
+            eprintln!("SKIP bd-tmwe8: btrfs-progs unavailable");
+            return;
+        };
+        let cx = Cx::for_testing();
+        let mut scope = RequestScope::empty();
+        assert!(matches!(
+            <OpenFs as FsOps>::btrfs_scrub_start(&fs, &cx, &mut scope, 1),
+            Err(FfsError::UnsupportedFeature(_))
+        ));
+        assert!(matches!(
+            <OpenFs as FsOps>::btrfs_scrub_progress(&fs, &cx, &mut scope, 1),
+            Err(FfsError::Io(ref e)) if e.raw_os_error() == Some(libc::ENOTCONN)
+        ));
+        assert!(matches!(
+            <OpenFs as FsOps>::btrfs_subvol_create(&fs, &cx, &mut scope, &[0_u8; 4096]),
+            Err(FfsError::UnsupportedFeature(_))
+        ));
+    }
+
+    /// bd-dj725: on btrfs the periodic commit keys off mutating request scopes
+    /// (btrfs metadata lives in the CoW trees, not the MVCC overlay). A mutation
+    /// through a write scope must be committed by the tick; an idle tick must
+    /// not bump the generation.
+    #[test]
+    fn btrfs_periodic_commit_commits_only_after_mutation_bd_dj725() {
+        let Some((fs, dev, _tmp, image)) = open_writable_btrfs_mkfs(256) else {
+            eprintln!("SKIP bd-dj725: btrfs-progs unavailable");
+            return;
+        };
+        let cx = Cx::for_testing();
+        let generation = |bytes: &[u8]| {
+            BtrfsSuperblock::parse_from_image(bytes)
+                .expect("sb")
+                .generation
+        };
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let scope = <OpenFs as FsOps>::begin_request_scope(&fs, &cx, RequestOp::Write)
+            .expect("write scope");
+        let file = fs
+            .create(&cx, root, OsStr::new("tick.bin"), 0o644, 0, 0)
+            .expect("create");
+        fs.write(&cx, file.ino, 0, &[0x42_u8; 8192]).expect("write");
+        <OpenFs as FsOps>::end_request_scope(&fs, &cx, RequestOp::Write, scope).expect("end scope");
+
+        let before = generation(&dev.snapshot_bytes());
+        assert!(
+            fs.periodic_commit(&cx).expect("tick"),
+            "mutation must commit"
+        );
+        let after = generation(&dev.snapshot_bytes());
+        assert!(after > before, "the tick must publish a new generation");
+        assert!(
+            !fs.periodic_commit(&cx).expect("idle tick"),
+            "idle tick is a no-op"
+        );
+        assert_eq!(
+            generation(&dev.snapshot_bytes()),
+            after,
+            "an idle tick must not bump the generation"
+        );
+        std::fs::write(&image, dev.snapshot_bytes()).expect("write image");
+        if let Some((ok, output)) = run_btrfs_check(&image) {
+            assert!(
+                ok,
+                "btrfs check must accept a tick-committed image:\n{output}"
             );
         }
     }

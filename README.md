@@ -74,7 +74,7 @@ sudo cargo run -p ffs-cli -- mount /path/to/btrfs.img /mnt/ffs --rw
 cargo run -p ffs-harness -- check-fixtures
 cargo run -p ffs-harness -- parity
 
-# One-command self-healing demo (no FUSE, no sudo, runs against a temp raw image)
+# One-command RaptorQ repair demo on a synthetic raw 8 MiB image (no ext4/btrfs, no FUSE, no sudo)
 cargo run --bin ffs-demo -- self-healing
 
 # The four gates that must pass before any merge
@@ -98,11 +98,11 @@ FrankenFS does **not** translate C line-by-line. The porting doctrine:
 4. Validate via conformance harness against real filesystem images
 5. Track parity quantitatively in `FEATURE_PARITY.md`; the harness asserts the match in CI
 
-This produces code that is Rust-native rather than "C with Rust syntax", and typically 3–5× more concise than the original kernel C while covering the same behavioral surface.
+This produces code that is Rust-native rather than "C with Rust syntax".
 
 ### 2. No ambient authority
 
-Filesystem I/O APIs generally take an `&asupersync::Cx` capability context carrying budget, deadline, and cancellation information. This supports cooperative checks where callers propagate the context and callees consult it. It is not a Rust type-system prohibition on standard-library I/O, clocks, or threads. Ambient `Cx::current()` use in repair-flush notification and standard-thread workers remain gaps against the canonical explicit-context and structured-concurrency requirements.
+Filesystem I/O APIs generally take an `&asupersync::Cx` capability context carrying budget, deadline, and cancellation information. This supports cooperative checks where callers propagate the context and callees consult it. It is not a Rust type-system prohibition on standard-library I/O, clocks, or threads. Standard-thread workers and the unwired FUSE request context (see below) remain gaps against the canonical explicit-context and structured-concurrency requirements.
 
 ### 3. Proof over heuristic
 
@@ -126,7 +126,7 @@ Public readiness assertions are tied to machine-readable artifacts:
 - Tracked feature coverage lives in `FEATURE_PARITY.md` and is parsed by `ffs-harness::ParityReport::current()`; a CI test enforces the mapping.
 - Release-gate behavior lives in `tests/release-gates/release_gate_policy_v1.json` and is validated by `ffs-harness validate-proof-bundle`.
 - Public serialized `ffs-harness` report schemas (release-gate, writeback-cache audit, ordering oracle, crash-replay oracle, repair confidence, repair corpus, soak/canary, swarm tail latency, fuzz dashboard, mounted-lane decision, ...) are snapshot-pinned with `insta` against a checked-in schema inventory, and a drift detector catches silent shape changes. Crate-local human-output snapshots and exact-golden tests are tracked at their own test surfaces instead of being forced into that JSON schema inventory.
-- Every checksum, parser, and reporting surface has metamorphic-relation proptests.
+- Checksum and parser surfaces have metamorphic-relation proptests; reporting surfaces are snapshot-pinned instead.
 
 ### 6. Unsafe forbidden in first-party crates
 
@@ -144,11 +144,11 @@ Public readiness assertions are tied to machine-readable artifacts:
 | **ext4 support** | Read + experimental write | Full | n/a | Read-only | Read-write |
 | **btrfs support** | Read + guarded experimental write | n/a | Full | n/a | n/a |
 | **Both formats from one binary** | Yes | No | No | No | No |
-| **Concurrent writes** | MVCC with adaptive policy | JBD2 (global lock) | COW B-tree | n/a | Single-writer |
+| **Concurrent writes** | Block-level MVCC; 8-worker parallel metadata writes measured 1.51× slower than kernel ext4 | JBD2 (many handles join one running transaction) | COW B-tree | n/a | Single-writer |
 | **Self-healing** | RaptorQ + Bayesian autopilot | None (run fsck) | Scrub + mirrors | None | None |
 | **Conflict resolution** | Safe-merge proofs + expected-loss | n/a | n/a | n/a | n/a |
 | **Crash-consistency model** | 12-point crash matrix + 6 invariants | Journal | COW + log tree | n/a | n/a |
-| **Determinism for stress** | LabRuntime + DPOR | Thread scheduler | Thread scheduler | n/a | n/a |
+| **Determinism for stress** | LabRuntime (seeded, one schedule per seed) | Thread scheduler | Thread scheduler | n/a | n/a |
 | **Evidence trail** | 23-event JSONL ledger | dmesg | dmesg | n/a | n/a |
 | **Debuggable** | Standard userspace tools | printk + crash dump | printk + crash dump | gdb | gdb |
 
@@ -175,7 +175,7 @@ To avoid wasted reading, here is what this project is explicitly **not** trying 
 - **Not production-ready for irreplaceable data.** The tracked V1 feature denominator is complete according to `ParityReport::current()`, but the operational readiness lanes (xfstests, swarm.responsiveness, performance.baseline, soak/canary) are mid-evidence. Use this on data you can lose.
 - **Not a loose parser experiment.** Parsers are fixture-pinned, kernel-differential-validated, and metamorphic-relation-proptested. The aim is fidelity to the documented V1 surface.
 - **Not a multi-filesystem framework.** ext4 and btrfs are V1; XFS, ZFS, NTFS, etc. are out of scope. The structured-concurrency + repair-symbol architecture could generalize, but each format requires its own behavioral extraction effort and is not part of this roadmap.
-- **Not a tokio project.** The entire tokio ecosystem is explicitly forbidden by the workspace lints; asupersync is the runtime.
+- **Not a tokio project.** A CI dependency scan fails the build if `Cargo.lock` contains `tokio`, `hyper`, `reqwest`, `axum`, `tower`, `async-std`, `smol` or related packages; asupersync is the runtime.
 
 ---
 
@@ -240,7 +240,7 @@ Legacy extraction reference (retained, not on the runtime path):
 ```text
 userspace read(fd, buf, count)
   → kernel FUSE → fuser → ffs-fuse::read()
-    → begin_request_scope(cx, op): MVCC snapshot + backpressure check
+    → begin_request_scope(cx, op): MVCC snapshot (plus a transaction for write ops)
       → ffs-core FsOps (OpenFs): flavor dispatch (ext4 / btrfs)
         → extent/chunk mapping + block reads
           (ext4: ffs-extent/ffs-btree/ffs-block; btrfs: ffs-btrfs + ffs-block)
@@ -312,7 +312,7 @@ Operator         ffs-cli           ffs-fuse              ffs-core         ffs-on
    │                │                  │ session.run()  ── enters request loop ──               │
    │                │                  │ ╔══════════════════════════════════╗  │                 │
    │                │                  │ ║   begin_request_scope             ║  │                │
-   │                │                  │ ║     (snapshot + backpressure)    ║  │                │
+   │                │                  │ ║     (snapshot; txn for writes)   ║  │                │
    │                │                  │ ║   dispatch FsOps method          ║  │                │
    │                │                  │ ║   end_request_scope              ║  │                │
    │                │                  │ ╚══════════════════════════════════╝  │                │
@@ -468,7 +468,7 @@ Full details: [`docs/mount-runtime-modes.md`](docs/mount-runtime-modes.md).
 
 ## Deep Dive: MVCC Conflict Resolution
 
-Traditional FUSE filesystems serialize all writes through a single lock. FrankenFS eliminates this bottleneck with block-level MVCC and a structured safe-merge system that lets non-conflicting concurrent writes to the same block coexist.
+FrankenFS uses block-level MVCC and a structured safe-merge system that lets non-conflicting concurrent writes to the same block coexist. This is not a measured throughput advantage: on 8-worker parallel metadata writes the mounted ext4 path is 1.51× slower than kernel ext4 (`docs/MOUNTED_KERNEL_SCORECARD.md`).
 
 ### Version chains and snapshot isolation
 
@@ -679,7 +679,7 @@ The canonical concrete `ByteDevice` is `FileByteDevice`, which `OpenFs::open` co
 
 ### ARC cache (with optional S3-FIFO)
 
-`ArcCache<D>` wraps any `BlockDevice` with an Adaptive Replacement Cache (ARC), a self-tuning algorithm that balances recency and frequency via four LRU lists (T1, T2, B1, B2). The S3-FIFO variant is also available and is benchmarked side-by-side in `crates/ffs-block/benches/arc_cache.rs`. Two write policies:
+`ArcCache<D>` wraps any `BlockDevice` with a block cache whose eviction policy is chosen at compile time by the `ffs-block` `s3fifo` feature. That feature is on by default, so default builds use S3-FIFO small/main/ghost queues; building without it uses ARC's four lists (T1, T2, B1, B2). `crates/ffs-block/benches/arc_cache.rs` measures whichever policy was compiled in. Two write policies:
 
 | Policy | Behavior | Use case |
 |---|---|---|
@@ -746,6 +746,8 @@ When mounting an ext4 image with `needs_recovery` set, FrankenFS replays committ
 
 Replay is idempotent. V2/V3 checksums (CRC32C with optional UUID-seed) are verified end-to-end. Non-contiguous ext4 journal extents are supported.
 
+FrankenFS's own ext4 write path journals each durability boundary through JBD2 and follows the kernel's recovery contract (bd-cnmpm): before the commit record is durable the journal superblock records the live log (`s_start`, `s_sequence`) and the filesystem superblock carries `needs_recovery`; after the checkpoint both are cleared, and sequence numbers continue across mounts. A crash between commit and checkpoint therefore leaves an image that kernel `e2fsck` recognizes and replays — tested by injecting that crash and running `e2fsck -fy` then `e2fsck -fn` on the result. Periodic commits (`--commit-interval-secs`) bound how much un-fsynced data a crash can lose.
+
 ### Ext4 fast-commit replay
 
 `replay_fast_commit()` parses tag streams and buffers operations until `TAIL`. After JBD2 replay, `OpenFs` applies the supported committed inode, directory-entry, and extent operations and verifies the final range mappings. Unsupported operations and inconsistent targets fail the open instead of being logged as successful recovery. A malformed tail following committed operations also fails recovery when equivalent JBD2 recovery has not been established.
@@ -809,7 +811,7 @@ Library examples use `Cx::for_request()`; tests can construct contexts with expl
 
 ### Deterministic lab runtime
 
-`LabRuntime` provides a virtual-time executor where task scheduling is deterministic for a given seed, DPOR (Dynamic Partial Order Reduction) explores different interleavings, timeouts use virtual time (tests run instantly), and correctness oracles can assert invariants at every scheduling point. This is how the 120-writer merge-proof stress reproduces concurrency bugs deterministically across seeds.
+`LabRuntime` provides a virtual-time executor where task scheduling is deterministic for a given seed and timeouts use virtual time (tests run instantly). asupersync also ships a DPOR schedule explorer, but no FrankenFS crate calls it: the `LabRuntime` tests in `crates/ffs-mvcc/tests/mvcc_stress_suite.rs` run one seeded schedule each via `run_until_quiescent`. The 120-writer SafeMerge stress (`verification_gate_safe_merge_correctness_under_high_contention`) does not use `LabRuntime`; it commits its transactions sequentially on one thread.
 
 ---
 
@@ -817,7 +819,7 @@ Library examples use `Cx::for_request()`; tests can construct contexts with expl
 
 `ffs-alloc` manages free space with bitmap-based tracking and goal-directed placement, inspired by ext4's `mballoc` and reimplemented in safe Rust.
 
-- **Bitmap operations.** `bitmap_find_free`, `bitmap_find_contiguous`, `bitmap_count_free` are O(n) in group size but operate on L1-cacheable data (a 32K-block group's bitmap fits in 4KB). The `succinct/` module adds a rank/select structure for O(1) free-space queries on hot paths.
+- **Bitmap operations.** `bitmap_find_free`, `bitmap_find_contiguous`, `bitmap_count_free` are O(n) in group size but operate on L1-cacheable data (a 32K-block group's bitmap fits in 4KB). The `succinct` module adds a rank/select structure: O(1) rank (free-block counts) and O(log n) select / `find_free`.
 - **Goal-directed placement.** Three-tier strategy: goal group/block first, then nearby groups within a distance of 8, then full scan. Locality keeps related extents physically contiguous.
 - **Orlov directory spreading.** New directories bias toward groups with above-average free inodes and low existing directory density, spreading the namespace tree across the disk.
 - **Reserved-block protection.** Metadata blocks (superblock copies, group descriptor tables, inode tables, bitmap blocks) can never be allocated to file data. A two-phase validation marks reserved regions in a temporary bitmap before confirming any allocation.
@@ -988,12 +990,12 @@ Design details: [`docs/design-multi-host-repair.md`](docs/design-multi-host-repa
 ## Deep Dive: FUSE Request Lifecycle
 
 ```text
-1. begin_request_scope(cx, op)  →  acquire MVCC snapshot, check backpressure
+1. begin_request_scope(cx, op)  →  acquire MVCC snapshot (and open a txn for writes)
 2. execute operation             →  dispatch to ext4/btrfs handler in ffs-core
 3. end_request_scope(cx, scope)  →  release snapshot, update metrics
 ```
 
-`RequestScope` captures the MVCC snapshot at request start so all reads within a single FUSE callback see a consistent point-in-time view of the filesystem, even when concurrent writers are committing new versions.
+`RequestScope` captures the MVCC snapshot at request start so all reads within a single FUSE callback see a consistent point-in-time view of the filesystem, even when concurrent writers are committing new versions. Backpressure is not part of the scope: the FUSE adapter checks it before mutating ops (create, setattr, unlink, fsync, ...) only when a `BackpressureGate` is configured.
 
 ### Backpressure and graceful degradation
 
@@ -1003,7 +1005,7 @@ When the system is under pressure (high dirty-cache ratio, long GC pauses, or ex
 - **Write operations.** May be delayed when dirty ratio exceeds the high watermark.
 - **Metadata operations.** May be shed when system pressure reaches critical levels.
 
-`DegradationFsm` tracks pressure-level transitions (`Normal → Warning → Degraded → Critical → Emergency`) monotonically so degradation decisions don't oscillate.
+`DegradationFsm` tracks pressure-level transitions (`Normal → Warning → Degraded → Critical → Emergency`) with hysteresis: it escalates immediately under pressure and de-escalates only after sustained improvement, so degradation decisions don't oscillate.
 
 ### Mount tuning constants
 
@@ -1028,7 +1030,7 @@ btrfs uses copy-on-write B-trees addressed by logical block addresses that must 
 2. **Chunk lookup.** Find the chunk entry whose `[key.offset, key.offset + length)` range contains the target logical address.
 3. **Stripe calculation.** For single-device images, `physical = stripe.offset + (logical - chunk.key.offset)`.
 
-`--btrfs-device PATH` attaches additional devices for clean, read-only btrfs mounts. A clean multi-device image uses `BtrfsDeviceSet` even without extra paths: a surviving RAID1/C3/C4 device can open alone if every committed chunk has a supported readable copy. RAID10 requires a survivor in every mirrored stripe group; other profiles require all stripe devices. Nearby images are never discovered implicitly. Kernel-written RAID0, RAID1, RAID10, C3, C4, RAID5 and RAID6 images are tested through FUSE with each primary device. Metadata validates copies before caching; checksummed file reads validate each sector before copying its bytes or decompressing, retrying corrupt mirrors. RAID1/RAID10/C3/C4 corruption recovery is tested for metadata, ordinary data and zstd data, including recovery with only the last mirror healthy and refusal when all copies are corrupt. The remaining profile/degraded matrix and dirty-image recovery remain open. Multi-device writes are deferred and refused.
+`--btrfs-device PATH` attaches additional devices for clean, read-only btrfs mounts. A clean multi-device image uses `BtrfsDeviceSet` even without extra paths: a surviving RAID1/C3/C4 device can open alone if every committed chunk has a supported readable copy. RAID10 requires a survivor in every mirrored stripe group; RAID5/RAID6 data chunks may lack one/two stripe devices (reads are rebuilt from parity), while their metadata/system chunks and all other profiles require all stripe devices. Nearby images are never discovered implicitly. Clean kernel-written RAID0, RAID1, RAID10, C3, C4, RAID5 and RAID6 images are tested through FUSE with each primary device; the same test attempts degraded RAID5/6 opens but accepts failure, so degraded kernel-image reads are not established (bd-mjxxk). Metadata validates copies before caching; checksummed file reads validate each sector before copying its bytes or decompressing, retrying corrupt mirrors. RAID1/RAID10/C3/C4 corruption recovery is tested for metadata, ordinary data and zstd data, including recovery with only the last mirror healthy and refusal when all copies are corrupt. The remaining profile/degraded matrix and dirty-image recovery remain open. Multi-device writes are deferred and refused.
 
 ### Tree walk algorithm
 
@@ -1120,7 +1122,7 @@ Parse results are serialized to JSON and compared against golden files. If the p
 
 ### Metamorphic relations
 
-Every checksum, parser, and reporting surface has metamorphic-relation proptests:
+Checksum and parser surfaces have metamorphic-relation proptests (reporting surfaces are snapshot-pinned instead), including:
 
 - `crc32c_append` associativity
 - `ext4_chksum` associativity
@@ -1163,7 +1165,7 @@ Three metric types, all lock-free atomic:
 
 ## Deep Dive: The `Cx` Capability Context
 
-FrankenFS's target architecture passes explicit `Cx` capabilities through operations that can block or time out. Current propagation is incomplete: repair-flush notification can consult `Cx::current()`, and CLI/FUSE lifecycle code uses standard threads and clocks. Those paths require further integration before an ambient-authority-free runtime can be claimed.
+FrankenFS's target architecture passes explicit `Cx` capabilities through operations that can block or time out. Current propagation is incomplete: FUSE request contexts carry no deadline or interrupt hook (below), and CLI/FUSE lifecycle code uses standard threads and clocks. Those paths require further integration before an ambient-authority-free runtime can be claimed.
 
 **Important:** The public filesystem API is **synchronous Rust**. `Cx` is a capability handle; functions return results directly, and explicit checkpoints consult cancellation and budgets. A synchronous checkpoint is not an async scheduler yield. The runtime also exposes regions, task scheduling, channels, and `LabRuntime`; using them in selected paths does not establish structured ownership of every CLI/FUSE worker.
 
@@ -1185,9 +1187,9 @@ Filesystem methods generally borrow `Cx`. Rust checks the lifetime of that refer
 ### Why this matters for a filesystem
 
 1. **Pure parser convention.** `Ext4Superblock::parse_superblock_region(&[u8])` parses supplied bytes without I/O. Source review and tests protect this boundary; absence of a `Cx` parameter does not itself prohibit standard-library I/O.
-2. **Cancellation is universal.** When the FUSE layer cancels a request (kernel interrupt), every nested call sees the cancel at its next `checkpoint()`.
+2. **Cancellation is cooperative.** When a caller cancels a `Cx`, nested calls see the cancel at their next `checkpoint()`. Kernel FUSE interrupts are not yet wired to request contexts (bd-gk01h).
 3. **Deadlines compose.** A FUSE callback can install a 5-second deadline; a sub-operation can derive a tighter 1-second context; the lower limit wins.
-4. **Determinism in tests.** Under `LabRuntime`, every `Cx` checkpoint is a DPOR scheduling point. The runtime can reorder operations across these points to explore alternative schedules, making concurrency bugs reproducible across seeds.
+4. **Determinism in tests.** Under `LabRuntime`, scheduling is deterministic for a given seed, so a failing seed replays. FrankenFS tests run one schedule per seed; they do not invoke asupersync's DPOR explorer.
 5. **Budget-aware GC and flush.** Background workers consult `cx.budget()` and shrink their batch size when the quota is low, avoiding starvation of foreground requests.
 
 ### Common patterns (sync, as used in FrankenFS)
@@ -1221,14 +1223,9 @@ The asupersync runtime provides regions, task scheduling, and cancellation-aware
 
 ### How `Cx` interacts with FUSE
 
-The FUSE adapter (`ffs-fuse`) is the *root* of every `Cx` chain on the mount path. The kernel issues a FUSE request; the adapter wraps it in a new `Cx` with:
+The FUSE adapter (`ffs-fuse`) is the *root* of every `Cx` chain on the mount path. For each kernel request it creates a bare `Cx::for_request()`: no deadline, an unlimited budget, and no pressure observer. The vendored `fuser` answers `FUSE_INTERRUPT` with `ENOSYS`, so kernel interrupts do not cancel request contexts (tracked as bd-gk01h). Write backpressure is applied separately by the adapter's `BackpressureGate` when one is configured.
 
-- Budget seeded by the adapter's queue-tuning configuration.
-- Deadline derived from FUSE timeout policy.
-- Cancel hook installed for kernel interrupts.
-- Pressure observer linked to the dirty-cache watermark.
-
-Downstream filesystem calls receive the request context, but separate scrub/GC workers and ambient repair-flush notification paths need their own lifecycle review. An operation observes cancellation when it checks the corresponding context; this is not a bound on time spent inside blocking I/O or code between checkpoints.
+Downstream filesystem calls receive the request context, but separate scrub/GC workers need their own lifecycle review. An operation observes cancellation when it checks the corresponding context; this is not a bound on time spent inside blocking I/O or code between checkpoints.
 
 ---
 
@@ -1264,7 +1261,7 @@ This keeps fixtures under a few KB while covering the full parser surface, and l
 
 ### Decision 4: Evidence ledger as first-class output
 
-Every decision FrankenFS makes (every scrub, every commit, every policy switch, every backpressure activation) emits a JSONL record. The alternative would be `dmesg`-style printouts ("we did X") that humans read once and discard.
+Decisions are meant to be recorded as JSONL evidence rather than log prose. Today the repair/scrub ledger is written on mounted paths when `--background-scrub-ledger` is given; the MVCC commit/merge ledger exists only on the single-lock `MvccStore` via `enable_evidence_ledger`, which only tests call, so mounted commits and policy switches are not recorded (tracked as bd-7ssc7). The alternative would be `dmesg`-style printouts ("we did X") that humans read once and discard.
 
 Treating evidence as a first-class output buys us:
 - Structured operator queries (`jq`, `awk`, log shipping pipelines).
@@ -1301,7 +1298,7 @@ Translating C line-by-line would be faster initially and slower forever. Extract
 - A type system aligned with what the code does, not what C let us do.
 - A regression-test surface (the spec doc) independent of the implementation.
 
-The cost is a 94-KB spec document that has to stay current. The benefit is that `ffs-extent` is 300 lines of Rust where `fs/ext4/extents.c` is 3,000 lines of C, and the Rust version is more obviously correct.
+The cost is a 100-KB spec document that has to stay current. The benefit is that the Rust code is organized around the extracted behavioral contracts rather than the kernel's control flow.
 
 ### Decision 8: Vendor a `fuser` patch
 
@@ -1333,7 +1330,7 @@ Each E2E script is a single scenario class: writeback-cache audit, repair writeb
 
 ## Observability and Evidence
 
-FrankenFS maintains a machine-readable audit trail for every significant decision across all subsystems.
+FrankenFS defines a machine-readable evidence ledger shared across subsystems. On a mount, repair/scrub events are written when `--background-scrub-ledger` is given; MVCC transaction and merge events are not yet wired on the mounted path (bd-7ssc7).
 
 ### Evidence ledger (23 event types)
 
@@ -1712,7 +1709,7 @@ EMAs are sampled to the evidence ledger every 100 commits as `ContentionSample` 
 
 The split between T1 and T2 (parameter `p`) is tuned online: a hit in B1 grows T1 at the expense of T2, a hit in B2 does the opposite. This auto-tunes the recency-vs-frequency trade-off based on observed miss patterns, with no manual configuration. Worst-case cost is `O(1)` per access.
 
-For comparison, FrankenFS also includes an **S3-FIFO** implementation (Yang et al, SOSP '23, "FIFO Queues are All You Need for Cache Eviction"), which approximates ARC's hit rate with three simple FIFO queues. This is useful when ARC's hash-table overhead is undesirable on very large caches. The two are benchmarked head-to-head in `crates/ffs-block/benches/arc_cache.rs`.
+FrankenFS also includes an **S3-FIFO** implementation (Yang et al, SOSP '23, "FIFO Queues are All You Need for Cache Eviction"), which approximates ARC's hit rate with three simple FIFO queues. It is selected by the default-on `s3fifo` feature of `ffs-block`; ARC is used when that feature is disabled. `crates/ffs-block/benches/arc_cache.rs` measures whichever policy the build compiled in.
 
 ### Dynamic Partial Order Reduction (DPOR)
 
@@ -1720,7 +1717,7 @@ DPOR (Flanagan and Godefroid, POPL '05; refined by Abdulla, Aronis, Jonsson, Sag
 
 In `LabRuntime` terms: the runtime tracks the *happens-before* edges induced by `Cx::checkpoint()` calls, channel send/recv pairs, and `Mutex::lock` orderings. When exploring a new schedule, DPOR backtracks only at points where reordering could observe a different value, which dramatically reduces the explored schedule space while remaining sound.
 
-This is what makes the 120-writer SafeMerge stress test reproducible across seeds: every run with the same seed explores the same canonical schedule order, so concurrency bugs surface deterministically.
+FrankenFS does not currently use this exploration: its `LabRuntime` tests run a single seeded schedule, and the 120-writer SafeMerge stress test commits sequentially without `LabRuntime`.
 
 ### CRC32C (Castagnoli polynomial)
 
@@ -1787,7 +1784,7 @@ slot.commit().await?;                         // publishes; cancelling this is s
 
 ### Succinct rank/select bitmaps
 
-`ffs-alloc::succinct` provides `rank(i)` ("how many 1-bits in `bits[0..i]`?") and `select(j)` ("position of the j-th 1-bit?") in `O(1)` time and `o(n)` extra space, using Jacobson-style two-level indices (super-blocks + blocks). This collapses block-allocator hot paths (finding the next free block, counting free blocks in a range) from `O(n)` to `O(1)`.
+`ffs-alloc::succinct` provides `rank(i)` ("how many 1-bits in `bits[0..i]`?") and `select(j)` ("position of the j-th 1-bit?") with `o(n)` extra space, using Jacobson-style two-level indices (super-blocks + blocks). Rank is `O(1)`; select and `find_free` are `O(log n)` (binary search over the super-block index). Counting free blocks in a range drops from `O(n)` to `O(1)`, and finding the next free block from `O(n)` to `O(log n)`.
 
 The trade-off vs raw bitmaps is the cost of rebuilding the index when bits flip. For filesystem allocation, where bit flips are batched per transaction, the rebuild amortizes well.
 
@@ -1968,9 +1965,11 @@ the full per-subsystem win list and the reject ledger.
 
 ### Microbenchmark surface (11 criterion targets)
 
+These are 11 highlighted targets out of the 173 bench files under `crates/*/benches/`.
+
 | Crate | Benchmark | What it measures |
 |---|---|---|
-| `ffs-block` | `arc_cache` | ARC vs S3-FIFO hit-rate + throughput on canonical workloads |
+| `ffs-block` | `arc_cache` | Hit rate + throughput of the compiled-in policy (S3-FIFO by default, ARC without the `s3fifo` feature) on canonical workloads |
 | `ffs-btree` | `bwtree_vs_locked` | COW B-tree vs `RwLock`-guarded B-tree |
 | `ffs-alloc` | `bitmap_ops` | `find_free` / `find_contiguous` / `count_free` |
 | `ffs-alloc` | `batch_alloc` | Buddy-system batched allocation |
@@ -2062,7 +2061,7 @@ The Bayesian autopilot will have selected a per-group overhead at sealing time b
 
 ### High-concurrency log-append workload
 
-An application that appends to many files concurrently (a message broker, a metrics ingestion pipeline). The traditional `ext4 + JBD2` global lock serializes all writers; FrankenFS's `MergeProof::AppendOnly` resolves disjoint-tail merges without abort.
+An application that appends to many files concurrently (a message broker, a metrics ingestion pipeline). Kernel ext4's JBD2 is not a global writer lock (many handles join one running transaction); FrankenFS's `MergeProof::AppendOnly` resolves disjoint-tail merges on the same block without abort.
 
 ```bash
 ffs mount log.img /mnt/log --rw --runtime-mode managed \
@@ -2270,7 +2269,7 @@ fn list_root(image: &Path) -> Result<()> {
     let fs = OpenFs::open(&cx, image)?;
 
     // Convenience methods on OpenFs dispatch by flavor (ext4 + btrfs)
-    // and open a fresh RequestScope::empty() internally.
+    // and run inside a RequestScope pinned to the latest MVCC snapshot.
     let root_attr = fs.getattr(&cx, ROOT_INO)?;
     println!("root: perm={:o}  size={}", root_attr.perm, root_attr.size);
 
@@ -2337,7 +2336,7 @@ fn run_mount(image: &Path, mountpoint: &Path) -> Result<()> {
         auto_unmount:     true,
         writeback_cache:  WritebackCacheMode::Disabled,
         ioctl_trace_path: None,
-        worker_threads:   0,    // 0 = auto: min(available_parallelism, 8)
+        worker_threads:   0,    // 0 = one serial dispatch thread; N > 0 = N worker threads
     };
 
     // mount() blocks the calling thread until unmount.
@@ -2456,12 +2455,7 @@ RUST_LOG=ffs_core=info \
   cargo run -p ffs-cli -- --log-format json mount IMAGE MOUNT --rw 2> ffs.log.json
 ```
 
-Every async operation creates a `tracing` span carrying:
-- `op`: the operation name (`read`, `write`, `lookup`, ...)
-- `ino`: the inode number where applicable
-- `snapshot`: the MVCC snapshot id
-- `cx_budget_remaining`: poll-quota remaining when the span entered
-- `cx_deadline_ms`: milliseconds until deadline (if set)
+`ffs-core` and `ffs-fuse` emit structured `tracing` events, not per-operation spans. Events carry fields such as `op`, `ino`, `parent` and `txn_id` where applicable (for example the `ffs::mvcc` target's `mvcc_request_scope_begin_write`); no `Cx` budget or deadline fields are recorded.
 
 ### Flamegraph workflow
 
@@ -2659,7 +2653,7 @@ frankenfs/
 ├── Cargo.toml                  Workspace root (22 members, [patch.crates-io] for vendored fuser)
 ├── Cargo.lock
 ├── README.md                   This file
-├── CHANGELOG.md                Capability-area changelog (3,448 commits, 2026-02-09 → 2026-05-18)
+├── CHANGELOG.md                Capability-area changelog (covers 2026-02-09 → 2026-08-19)
 ├── AGENTS.md                   Operating doctrine for AI coding agents working here
 ├── LICENSE                     MIT (with OpenAI/Anthropic rider)
 ├── rust-toolchain.toml         Pinned nightly channel for edition 2024
@@ -2700,7 +2694,7 @@ frankenfs/
 │   ├── btrfs-send-receive-corpus/
 │   ├── casefold-corpus/
 │   ├── chaos-replay-lab/
-│   └── …                       (40+ subdirectories, one per scenario class)
+│   └── …                       (29 top-level subdirectories in total)
 │
 ├── fuzz/
 │   └── fuzz_targets/           63 libfuzzer targets
@@ -2724,7 +2718,6 @@ frankenfs/
 ├── security/                   adversarial_image_threat_model.json
 ├── vendor/                     vendor/fuser with ABI 7.42 enabled via [patch.crates-io]
 ├── .beads/                     issues.jsonl (source-aware tracker state; counts move with each close)
-├── beads_compliance_audit/     Cross-pass bead-completion audit artifacts
 └── ci-artifacts/               CI run outputs
 ```
 
@@ -2733,9 +2726,10 @@ frankenfs/
 | Binary | Crate | What it does |
 |---|---|---|
 | `ffs-cli` | `ffs-cli` | Operator, inspection, and benchmark commands; see `ffs-cli --help` |
-| `ffs-tui` | `ffs-tui` | Live TUI dashboard |
-| `ffs-demo` | `ffs-repair` (`src/bin/ffs-demo.rs`) | Self-healing adoption-wedge demo |
+| `ffs-demo` | `ffs-repair` (`src/bin/ffs-demo.rs`) | RaptorQ encode/corrupt/decode demo on a synthetic raw 8 MiB image (no ext4/btrfs, no FUSE) |
+| `ffs-image-repair` | `ffs-repair` (`src/bin/ffs-image-repair.rs`) | Offline sidecar RaptorQ protect / verify / restore for unmounted images |
 | `ffs-harness` | `ffs-harness` | Conformance + proof-bundle validation tool |
+| `ffs-mounted-kernel-bench` | `ffs-harness` (`src/bin/ffs_mounted_kernel_bench.rs`) | Mounted kernel-vs-FrankenFS FUSE latency comparator |
 | `ffs-ops` | `tools/ffs-ops` | Operational validation commands |
 
 ---
@@ -2779,6 +2773,7 @@ All 63 libfuzzer targets are in `fuzz/fuzz_targets/`. Each one is driven by `car
 | `fuzz_btrfs_inode_ref_payload` | INODE_REF payload structure |
 | `fuzz_btrfs_parse_inode_refs` | Multi-ref enumeration |
 | `fuzz_btrfs_send_stream` | Send-stream parsing with CRC32C-per-command + END terminator |
+| `fuzz_send_stream_builder_roundtrip` | `SendStreamBuilder` command construction followed by `parse_send_stream` round-trip |
 | `fuzz_cli_btrfs_parsers` | CLI-side btrfs parser entrypoints |
 
 ### Storage layer
@@ -2824,8 +2819,8 @@ All 63 libfuzzer targets are in `fuzz/fuzz_targets/`. Each one is driven by `car
 | `fuzz_repair_symbols` | RaptorQ repair-symbol generation + parsing |
 | `fuzz_repair_codec_roundtrip` | Encode-then-decode round-trip property |
 | `fuzz_repair_evidence_ledger` | Evidence-ledger JSONL parsing under malformed input |
-| `fuzz_por_authenticator` | Proof-of-Retrievability challenge-response correctness |
-| `fuzz_lrc_repair` | Local Reconstruction Code fallback |
+| `fuzz_por_authenticator` | Proof-of-Retrievability challenge-response correctness (library-only; not wired into audit paths) |
+| `fuzz_lrc_repair` | Local Reconstruction Code repair (library-only; not wired into the recovery path) |
 
 ### FUSE surface
 
@@ -2901,14 +2896,14 @@ These items are surfaced via the proof-bundle release-gate policy (`tests/releas
 | **MVCC (Multi-Version Concurrency Control)** | The concurrency model FrankenFS uses to allow concurrent readers/writers; block-level, snapshot-isolated. |
 | **`OpenFs`** | The single `FsOps` implementation that handles both ext4 and btrfs flavors. |
 | **Per-core mode** | `--runtime-mode per-core`: managed mode plus a thread-per-core dispatcher with idle stealing. |
-| **PoR (Proof of Retrievability)** | A cryptographic challenge-response protocol for durability auditing in `ffs-repair::por`. |
+| **PoR (Proof of Retrievability)** | A cryptographic challenge-response protocol for durability auditing, implemented in `ffs-repair::por` as a library; no mount or CLI audit path calls it yet. |
 | **Proof bundle** | The portable readiness artifact rooted at `artifacts/proof/bundle/manifest.json`; the 14-lane gating surface for public claims. |
 | **RaptorQ** | The fountain code from RFC 6330 used for self-healing repair symbols. |
 | **`rch`** | Remote Compilation Helper; offloads heavy `cargo` invocations to a remote build fleet, avoiding local resource contention. |
 | **Readiness lab** | The non-permissioned advisory generator that regenerates readiness artifacts without executing destructive evidence campaigns. |
 | **Refresh policy** | The trigger model for regenerating stale repair symbols: `Eager`, `Lazy`, `Adaptive`, or `Hybrid`. |
 | **`RequestScope`** | The per-FUSE-callback object that holds an MVCC snapshot and backpressure decisions. |
-| **S3-FIFO** | A modern cache eviction algorithm (Yang et al, SOSP '23) using three FIFO queues; available alongside ARC in `ffs-block`. |
+| **S3-FIFO** | A modern cache eviction algorithm (Yang et al, SOSP '23) using three FIFO queues; the default `ArcCache` policy in `ffs-block` (feature `s3fifo`), with ARC as the compile-time alternative. |
 | **Safe-merge** | Shorthand for the `MergeProof`-backed path that resolves non-conflicting concurrent writes without aborting. |
 | **Snapshot isolation (SI)** | The MVCC reading model: every reader observes a consistent point-in-time view, immune to in-flight writers. |
 | **Sparse fixture** | A JSON file containing only the non-zero byte regions of a filesystem image; used to keep conformance fixtures small. |
@@ -3001,7 +2996,7 @@ Filesystems fail in many ways; here is a structured map of what FrankenFS does w
 | **Dirty cache critical watermark** | Writeback can't keep up | New writes block until dirty ratio drops below high watermark | `BackpressureActivated`; caller sees write latency spike |
 | **Disk full** | Backing image cannot accept writes | `FfsError::NoSpace` → `ENOSPC` to caller | Write returns ENOSPC |
 | **WAL write failure mid-commit** | Backing image I/O error | Commit aborts; WAL writer logs error; no partial commit visible | `TxnAborted { reason: durability_failure }` |
-| **Kill -9 of the mount process** | Sudden process death | Kernel sees daemon disappear; mount becomes "transport endpoint not connected"; image is consistent (writes that completed `fsync` persist) | Caller must `fusermount3 -u` and remount |
+| **Kill -9 of the mount process** | Sudden process death | Kernel sees daemon disappear; mount becomes "transport endpoint not connected"; image is consistent. Writes that completed `fsync` persist, and so do un-fsynced writes older than the periodic commit interval (`--commit-interval-secs`, default 5 s ext4 / 30 s btrfs; bd-dj725) | Caller must `fusermount3 -u` and remount |
 | **OOM kill of the mount process** | Memory pressure on host | Same as kill -9 | Same |
 | **Backing image truncated externally** | Operator did something they shouldn't | Subsequent block reads beyond `block_count` return `EIO`; mount may fail to unmount cleanly | `EIO` on affected reads; ledger records `CorruptionDetected` with `severity: "critical"` |
 | **Backing image deleted while mounted** | Same as above | Open file descriptor keeps the inode alive on Unix; behavior is "the mount continues until process exit" | None until unmount |
@@ -3020,16 +3015,16 @@ The 21 variants of `FfsError` are the unified failure surface for every public A
 
 | Variant | errno | When it fires | Common cause |
 |---|---|---|---|
-| `Io(std::io::Error)` | `EIO` | OS-level I/O failure | Disk error, file descriptor problem, network filesystem hiccup |
+| `Io(std::io::Error)` | raw OS errno if present, else mapped from `ErrorKind`; `EIO` fallback | OS-level I/O failure | Disk error, file descriptor problem, network filesystem hiccup |
 | `Corruption { block, detail }` | `EIO` | Live metadata read produced invalid data at a known block | Checksum mismatch, truncated on-disk structure, out-of-range field |
 | `Format(String)` | `EINVAL` | Wrong filesystem type or unsupported format version | Bad superblock magic, image isn't ext4/btrfs |
 | `Parse(String)` | `EINVAL` | Higher-level surface lift of `ParseError` from `ffs-types` | Structure didn't decode; carrier for finer-grained parse errors |
 | `UnsupportedFeature(String)` | `EOPNOTSUPP` | Image declares a feature this build doesn't yet support | `lzv1` / `bzip2` / `lzrw3a` codec request, MMP unsafe state, unknown mount option |
-| `IncompatibleFeature(String)` | `EINVAL` | Image's compat bits cannot be satisfied | Missing required `FILETYPE` for ext4, or unknown incompat bit set |
-| `UnsupportedBlockSize(String)` | `EINVAL` | Block size outside 1 KB / 2 KB / 4 KB | Format is valid but build doesn't accept this block size |
+| `IncompatibleFeature(String)` | `EOPNOTSUPP` | Image's compat bits cannot be satisfied | Missing required `FILETYPE` for ext4, or unknown incompat bit set |
+| `UnsupportedBlockSize(String)` | `EOPNOTSUPP` | Block size outside 1 KB / 2 KB / 4 KB | Format is valid but build doesn't accept this block size |
 | `InvalidGeometry(String)` | `EINVAL` | Mount-time geometry parameter out of range | Zero `blocks_per_group`, impossible `bytes_used > total_bytes`, zero-capacity device |
 | `MvccConflict { tx, block }` | `EAGAIN` | Block-level FCW conflict at commit time | Concurrent writer modified the block since the snapshot; retry the transaction |
-| `Cancelled` | `EINTR` | `Cx::checkpoint()` saw cancellation or deadline expiry | FUSE-side interrupt, operator-set deadline, kernel-issued cancel |
+| `Cancelled` | `EINTR` | `Cx::checkpoint()` saw cancellation or deadline expiry | Caller-cancelled or deadline-expired `Cx` (FUSE interrupts are not wired, bd-gk01h) |
 | `NoSpace` | `ENOSPC` | No free blocks or inodes available | Disk full; allocator exhausted in target groups |
 | `NotFound(String)` | `ENOENT` | File / directory / object lookup failed | Path doesn't exist, missing inode, missing block-group descriptor |
 | `PermissionDenied` | `EACCES` | Insufficient permissions for the requested operation | Mode bits / owner / capabilities denied the op |
@@ -3100,7 +3095,7 @@ Step-by-step:
 
 6. **Backing-image flush.** The MVCC layer pins the block via `FlushPinToken` so the ARC cache cannot flush it before the transaction is fully visible. After visibility, the dirty page is unpinned and the flush daemon writes it (according to the configured watermarks).
 
-7. **Compression.** New versions written under a `CompressionPolicy { algo: CompressionAlgo::Zstd { level } }` (the default) land as `Zstd(Vec<u8>)` rather than `Full(Vec<u8>)`. Identical-version deduplication collapses unchanged "touched" entries to a one-byte marker.
+7. **Compression.** The default `CompressionPolicy` uses `CompressionAlgo::None`, so new versions land as `VersionData::Full`; under an explicit `CompressionAlgo::Zstd { level }` policy they can land as `VersionData::Zstd`. Identical-version deduplication collapses unchanged "touched" entries to a one-byte marker.
 
 8. **Repair-symbol refresh.** The block's group has a `RefreshPolicy`; on the relevant trigger (Eager / Lazy timeout / Adaptive risk threshold / Hybrid age-or-count), the group's RaptorQ repair symbols are regenerated. A `SymbolRefresh` event is logged.
 
@@ -3281,12 +3276,13 @@ fuser = { path = "vendor/fuser" }
 The workspace enables ABI 7.42 on the vendored `fuser` 0.17.0 patch. The transport's implemented extensions include:
 
 - **Forwards unrestricted ioctls** to FrankenFS userspace handlers. Upstream `fuser` filters ioctls based on a built-in allow-list; for FrankenFS parity tests against `FIEMAP`, `EXT4_IOC_GETFLAGS`, `EXT4_IOC_SETFLAGS`, `EXT4_IOC_GETSTATE`, `FS_IOC_GET_ENCRYPTION_POLICY`, `FS_IOC_GET_ENCRYPTION_POLICY_EX`, `FS_IOC_GETFSUUID`, `FS_IOC_GETFSSYSFSPATH`, `BTRFS_IOC_INO_LOOKUP`, `BTRFS_IOC_DEV_INFO`, `BTRFS_IOC_GET_SUBVOL_INFO`, `FIBMAP`, `FITRIM`, etc., we need full forwarding.
-- **Exposes `splice`/`sendfile` plumbing** that newer kernels rely on for zero-copy reads.
-- **Adds the FUSE 7.40 `STATX` reply path** so `getattr` can return high-precision timestamps and the post-2038 epoch range that FrankenFS already supports internally.
-- **Plumbs the `inotify` event delivery** path required for some mount-time integration tests.
+- **Adds the FUSE 7.40 `STATX` request and `ReplyStatx` reply path** so `statx` can return birth time and 64-bit-second timestamps.
+- **Adds concurrent dispatch transports:** multi-worker dispatch (`run_with_workers`, per-worker dispatch gate, bd-svhrq), CPU-keyed per-core request queues (`spawn_mount2_with_per_core_workers`), an experimental FUSE-over-io_uring transport, and per-opcode crossing counters (bd-xfe7z).
+
+Splice is not a vendored-transport change: `ffs-fuse` negotiates the upstream `FUSE_SPLICE_*` capability bits (disable with `FFS_FUSE_SPLICE=0`), and the kernel notifier used for entry/inode invalidation and deletion notices is upstream `fuser` API.
 - **Quiets dead-code warnings** in the vendored copy where upstream's `#[allow(dead_code)]` had decayed (bd-aw9l8).
 
-The vendored copy is included in `cargo vet`'s supply-chain audit, can be diffed against upstream cleanly, and is the explicit subject of a beads ticket (`bd-x4l3t`) tracking its lifecycle and eventual upstream PRs.
+The vendored copy can be diffed against upstream `fuser` 0.17.0.
 
 ---
 
@@ -3298,12 +3294,12 @@ read requirement remains open under `bd-hk5w3`; helper tests do not certify it.
 | Profile | Device-set read helper | Mounted read | Mounted write |
 |---|---|---|---|
 | `Single` | Linear, split at chunk boundaries | Implemented | Experimental |
-| `DUP` | Alternate copies on one device | Implemented using primary mapping | Experimental |
+| `DUP` | Alternate copies on one device | Implemented using primary mapping | Experimental; rewritten tree blocks are written to both copies (bd-0mcvt) |
 | `RAID0` | Split across data stripes | Clean two-device kernel image + FUSE verified | Deferred |
 | `RAID1` | Mirror fallback on read error | Kernel image + FUSE verified, including either lone surviving device and corrupt metadata/ordinary/zstd data recovery | Deferred |
 | `RAID10` | Split across mirrored stripe groups | Four-device kernel image + FUSE reads; degraded reads require a survivor in every group of every chunk | Deferred |
-| `RAID5` | Owning data stripe; no reconstruction | Clean three-device kernel image + core/FUSE reads with each primary | Deferred |
-| `RAID6` | Owning data stripe; no reconstruction | Clean four-device kernel image + core/FUSE reads with each primary | Deferred |
+| `RAID5` | Owning data stripe | Clean three-device kernel image + core/FUSE reads with each primary; data reads rebuild one missing stripe from P (core tests only; metadata/system chunks need every device; degraded kernel images not established, bd-mjxxk) | Deferred |
+| `RAID6` | Owning data stripe | Clean four-device kernel image + core/FUSE reads with each primary; data reads rebuild up to two missing stripes from P/Q (core tests only; metadata/system chunks need every device; degraded kernel images not established, bd-mjxxk) | Deferred |
 | `RAID1C3` | Three-copy mapping and read fallback | Clean kernel image + core/FUSE reads across all nonempty device subsets | Deferred |
 | `RAID1C4` | Four-copy mapping and read fallback | Clean kernel image + core/FUSE reads across all nonempty device subsets | Deferred |
 
@@ -3312,7 +3308,11 @@ The earlier parity-slot fix (`18bc6b0`) still selected data in device order;
 kernel-written RAID5 data exposed a checksum failure. The corrected mapper
 passes the same image test plus RAID6, with full-file and unaligned reads using
 every primary. Fixed unit vectors cover complete rotations at two data widths.
-Missing stripe devices are refused; parity reconstruction is not implemented.
+RAID5/6 metadata and system chunks with a missing stripe device are refused.
+For data chunks, `ffs-core` (`btrfs_raid56.rs`) rebuilds one missing RAID5
+stripe from P or up to two missing RAID6 stripes from P/Q and verifies the data
+checksum before serving; this is covered by core unit tests, while degraded
+kernel-written RAID5/6 images are not yet established (bd-mjxxk).
 The historical non-parity rank-selector microbenchmark does not measure this
 corrected mapping and provides no performance claim for it.
 Additional stripe-translation properties are validated via metamorphic relations:
@@ -3336,8 +3336,9 @@ refusal, verification opt-out, and NODATASUM behavior. Missing sector checksums
 retain the existing unchecked-read policy. Sector buffers bound recovery
 memory; this path still rereads data and makes no performance claim.
 Cross-stripe and cross-chunk helpers use independent device byte arrays. The
-`btrfs_attached_devices_read_seeded_files` test additionally reads kernel-written
-RAID0/RAID1 files through core and FUSE with either primary device. It also mounts
+`btrfs_attached_devices_read_seeded_files` test additionally reads clean kernel-written
+RAID0, RAID1, RAID10, RAID1C3, RAID1C4, RAID5 and RAID6 files through core and FUSE
+with each primary device. It also mounts
 each surviving RAID1 device alone and rejects missing RAID0 data even when all
 metadata is mirrored and readable. Admission checks every committed chunk;
 missing stripes are allowed for RAID1/C3/C4 with at least one attached copy and for
@@ -3374,7 +3375,7 @@ A few POSIX corners are worth calling out explicitly because they often surprise
 | **Post-2038 timestamps** | Fully supported via the 2-bit epoch extension in `_extra` fields. | Avoids the year-2038 overflow. |
 | **Hard-link count limit** | `EMLINK` returned at the format-specific maximum (`65000` for ext4 with the `dir_nlink` feature). | Tested in `ffs-harness::tests::emlink`. |
 | **`unlink` of an open file** | Inode `nlink` decrements; the inode and its blocks are reclaimed only after the last open handle closes (the standard Unix orphan-on-unlink rule). On crash, mount-time orphan recovery (`maybe_recover_ext4_orphans`) walks the orphan chain. | Standard Unix semantics; kernel ext4 stores the orphan in `s_last_orphan`. |
-| **`rename` overwrite atomicity** | A successful `rename(src, dst)` atomically replaces any existing `dst` with a single MVCC commit. | POSIX-required atomicity. |
+| **`rename` overwrite atomicity** | On ext4, `rename(src, dst)` currently writes each touched block as its own MVCC commit, so a concurrent reader can observe an intermediate state; on-disk atomicity comes from the next journalled durability boundary, which commits all of those blocks together (tracked as bd-9rutw). | POSIX requires atomic replacement; the in-memory gap is a known deviation. |
 | **Directory entry coalescing** | Deleted entries (`inode = 0`) have their `rec_len` merged into the previous entry; the directory block does not compact on every delete. | Matches kernel ext4 behavior; full compaction happens on directory restructure. |
 | **`fsync` of a directory** | `fsyncdir` is a separate FUSE op and is durable; data writes to files in that directory must be `fsync`'d separately. | Standard POSIX semantics; `fsync` of a dir doesn't promise file durability. |
 | **`flush` (close)** | Non-durable; equivalent to "the file descriptor is going away." Does NOT promise on-disk visibility. | This is the V1.x contract; `fsync` / `fsyncdir` are the durability boundaries. |
@@ -3601,7 +3602,7 @@ All knobs are struct fields. There are no hidden environment variables, except t
 | Parameter | Default | Effect |
 |---|---|---|
 | `MountOptions.read_only` | `true` | Safe default; `--rw` for experimental writes |
-| `MountOptions.worker_threads` | 0 (auto) | `min(available_parallelism, 8)` |
+| `MountOptions.worker_threads` | 0 | 0 runs one serial dispatch thread; N > 0 runs N worker threads |
 | `MountOptions.allow_other` | `false` | Multi-user FUSE access |
 | `--runtime-mode` | `standard` | `managed` or `per-core` for richer evidence |
 | Kernel `writeback_cache` | off | Opt-in only via three accepted artifacts + matching host manifest |
@@ -3614,7 +3615,7 @@ The porting doctrine is a concrete workflow with traceable artifacts at every st
 
 ### Step 1: Behavioral extraction
 
-Legacy C code (e.g., `fs/ext4/extents.c`) is read for its *behavioral contract*, not its implementation. The output is `EXISTING_EXT4_BTRFS_STRUCTURE.md` (94 KB) capturing what each function does, what invariants it maintains, what error conditions it handles, and what on-disk format constraints it enforces.
+Legacy C code (e.g., `fs/ext4/extents.c`) is read for its *behavioral contract*, not its implementation. The output is `EXISTING_EXT4_BTRFS_STRUCTURE.md` (100 KB) capturing what each function does, what invariants it maintains, what error conditions it handles, and what on-disk format constraints it enforces.
 
 ### Step 2: Architecture design
 
@@ -3630,7 +3631,7 @@ Code is written from the spec, not by translating C control flow. Rust's `?` and
 
 ### The result
 
-The ext4 extent-tree implementation handles the full 4-level tree structure in ~300 lines of Rust vs ~3,000 lines of kernel C, because Rust's type system, iterators, and error handling eliminate the boilerplate that dominates kernel code.
+The ext4 extent code is split between `ffs-btree` (extent B+tree search/insert/split/merge, about 1,900 lines before its test module) and `ffs-extent` (mapping, allocation, truncate, punch, collapse/insert range and the extent cache, about 2,000 lines before its test module; 7,566 lines in `src/lib.rs` including tests).
 
 ---
 
@@ -3647,9 +3648,11 @@ The ext4 extent-tree implementation handles the full 4-level tree structure in ~
 ### Feature parity accounting
 
 Both public `parity` commands now separate `declared_contracts` from current
-execution. Without `--verify`, verified contract coverage is zero. The initial
-exact mappings cover nine bounded ext4 contracts across `ext4-journal` and
-`ext4-reference`; remaining capability rows are reported as missing evidence.
+execution. Without `--verify`, verified contract coverage is zero. The exact
+mappings (`PARITY_CONTRACTS` in `crates/ffs-harness/src/lib.rs`) cover 62 bounded
+contracts across 15 test suites (for example `ext4-journal`, `ext4-reference`,
+`btrfs-lib`, `fuse-lib`, `mvcc-lib`); remaining capability rows are reported as
+missing evidence.
 `--verify` captures named libtest results, source revision and dirty-source
 digest, command/build settings, output hashes, and pass/fail/skip counts. Empty,
 failed, skipped, malformed or stale runs fail the selected-suite gate. Reports
@@ -3680,7 +3683,7 @@ Rows in the btrfs experimental RW contract can still be `partially supported` or
 ### What works today
 
 - **ext4.** Superblock, inode, extent header/entry, group descriptor, feature flag decoding, mount-time journal recovery (JBD2 + fast-commit + external-journal pairing), FUSE mount (RO default, experimental RW), `e2compr` read+write for gzip/LZO/none, casefold, encryption nokey mode, inline data, indirect block addressing, fallocate (KEEP_SIZE / PUNCH_HOLE / ZERO_RANGE / COLLAPSE_RANGE / INSERT_RANGE), POSIX ACL xattrs, MMP conservative rejection.
-- **btrfs.** Superblock, B-tree header, leaf item metadata, geometry validation, RAID mapping helpers, single-device Single/Dup mounts and clean multi-device read-only attachment with RAID0/RAID1 FUSE evidence, FUSE mount (RO default; experimental single-device RW with durable writeback via `btrfs_full_transaction_commit`), transparent ZLIB/LZO/ZSTD decompression, named subvolume/snapshot selection, tree-log replay, send/receive stream parsing, btrfs fallocate (KEEP_SIZE / PUNCH_HOLE / ZERO_RANGE / COLLAPSE_RANGE / INSERT_RANGE), backup superblock mirror repair, fragmentation-aware free-run reporting. The remaining mounted multi-device profile/degraded matrix is incomplete.
+- **btrfs.** Superblock, B-tree header, leaf item metadata, geometry validation, RAID mapping helpers, single-device Single/Dup mounts and clean multi-device read-only attachment with clean-image RAID0/1/10/1C3/1C4/5/6 FUSE read evidence, FUSE mount (RO default; experimental single-device RW with durable writeback via `btrfs_full_transaction_commit`), transparent ZLIB/LZO/ZSTD decompression, named subvolume/snapshot selection, tree-log replay, send/receive stream parsing, btrfs fallocate (KEEP_SIZE / PUNCH_HOLE / ZERO_RANGE / COLLAPSE_RANGE / INSERT_RANGE), backup superblock mirror repair, fragmentation-aware free-run reporting. The remaining mounted multi-device profile/degraded matrix is incomplete.
 - **MVCC.** Snapshot visibility, commit sequencing, FCW conflict detection, four same-block merge mechanisms behind semantic `MergeProof` labels, three conflict policies with adaptive expected-loss selection, EMA contention tracking, sharded concurrent store, Zstd/Brotli version compression, WAL persistence + crash recovery, SSI two-edge rw-antidependency detection.
 - **Self-healing.** Bayesian durability autopilot, RaptorQ symbol generation/recovery, four refresh policies (Eager/Lazy/Adaptive/Hybrid), stale-window SLO with percentile-based breach detection, multi-host repair-ownership coordination, expected-loss policy comparison, mounted automatic repair contract (read-only + read-write via MVCC repair-writeback serializer).
 - **Writeback-cache.** Epoch-based commit barriers with per-inode staged/visible/durable tracking, deferred visibility for MVCC isolation, dirty-page ordering oracle, 12-point crash/replay matrix artifact gate, runtime guard, and host/lane manifest checks. Kernel option default-off; explicit opt-in is evidence-gated.
@@ -3710,11 +3713,11 @@ See [`FEATURE_PARITY.md`](FEATURE_PARITY.md) for the full capability matrix and 
 
 **ext4.** Single-device images with block sizes 1K/2K/4K. Requires `FILETYPE`; `EXTENTS` is optional (indirect-block addressing is supported). FUSE mount defaults to read-only; `--rw` is available but experimental. All known incompat feature flags are accepted at mount time. `COMPRESSION` covers ext4 e2compr read/write for the implemented gzip/LZO/"none" method-table paths; rare legacy codecs (`lzv1`, `bzip2`, `lzrw3a`) reject deterministically with `EOPNOTSUPP`. `JOURNAL_DEV` images are detected; data filesystems referencing an external journal support paired-open replay through `OpenOptions::external_journal_path` (library API) with UUID/block-size validation. `ENCRYPT` shows filenames as raw bytes (nokey mode). `CASEFOLD` provides case-insensitive directory lookup. `INLINE_DATA` reads from inode block area + `system.data` xattr. MMP unsafe states are rejected with `EOPNOTSUPP`.
 
-**btrfs.** Mounted address translation supports single-device Single/Dup images and explicit clean multi-device read-only attachment, with kernel-written RAID0/RAID1 FUSE evidence and corrupt-mirror recovery for metadata and checksummed ordinary/zstd data. The remaining profile/degraded read matrix is incomplete; multi-device writes remain deferred. Metadata parsing + validation covers superblocks, leaf items, sys_chunk_array, chunk-tree walking, and device-tree walking. The operator-facing mount path is experimental and defaults to read-only. `--rw` enables durable single-device btrfs metadata mutation via `btrfs_full_transaction_commit()`. The `--btrfs-rw-ephemeral-ok` flag controls commit strategy (ephemeral tree-log vs full durable commit), not permission. Transparent ZLIB/LZO/ZSTD decompression, named subvolume/snapshot selection (`--subvol`, `--snapshot`), tree-log replay, and send/receive stream parsing are implemented in source; current compatibility evidence must identify the exercised paths.
+**btrfs.** Mounted address translation supports single-device Single/Dup images and explicit clean multi-device read-only attachment, with clean kernel-written RAID0/1/10/1C3/1C4/5/6 FUSE read evidence and corrupt-mirror recovery for metadata and checksummed ordinary/zstd data. The remaining profile/degraded read matrix is incomplete; multi-device writes remain deferred. Metadata parsing + validation covers superblocks, leaf items, sys_chunk_array, chunk-tree walking, and device-tree walking. The operator-facing mount path is experimental and defaults to read-only. `--rw` enables durable single-device btrfs metadata mutation via `btrfs_full_transaction_commit()`. The `--btrfs-rw-ephemeral-ok` flag controls commit strategy (ephemeral tree-log vs full durable commit), not permission. Transparent ZLIB/LZO/ZSTD decompression, named subvolume/snapshot selection (`--subvol`, `--snapshot`), tree-log replay, and send/receive stream parsing are implemented in source; current compatibility evidence must identify the exercised paths.
 
 ### btrfs RW contract
 
-Btrfs RW selects the **durable commit path by default** as of bd-jdo53. The commit sequence allocates real logical addresses from chunk-covered metadata block groups, rewrites internal child blockptrs, translates logical→physical via `map_logical_to_physical`, updates the FS_TREE ROOT_ITEM, commits EXTENT_TREE and ROOT_TREE, and patches the on-disk superblock in place. `scripts/e2e/ffs_btrfs_rw_durable_remount_e2e.sh` checks mutation survival across remount; its presence and historical results are not a fresh successful run. The statuses below describe intended implemented behavior, subject to current crash/remount verification.
+Btrfs RW selects the **durable commit path by default** as of bd-jdo53. Every rewritten tree block is written to both copies of a DUP chunk (bd-0mcvt), a data allocation that finds its block groups full grows a new data chunk from unallocated device space by default (bd-34blv; commit-time metadata chunk growth remains opt-in via `FFS_BTRFS_GROW_CHUNKS=1`, and `FFS_BTRFS_GROW_CHUNKS=0` disables both), and `--rw` is refused for any subvolume other than the default one (bd-5elw6). The commit sequence allocates real logical addresses from chunk-covered metadata block groups, rewrites internal child blockptrs, translates logical→physical via `map_logical_to_physical`, updates the FS_TREE ROOT_ITEM, commits EXTENT_TREE and ROOT_TREE, and patches the on-disk superblock in place. `scripts/e2e/ffs_btrfs_rw_durable_remount_e2e.sh` checks mutation survival across remount; its presence and historical results are not a fresh successful run. The statuses below describe intended implemented behavior, subject to current crash/remount verification.
 
 | Operation class | Status | Contract |
 |---|---|---|
@@ -3808,13 +3811,13 @@ A: Same on-disk format for the tracked V1 features, with different internals: MV
 
 | Document | Size | What it covers |
 |---|---|---|
-| [`COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md`](COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md) | 344 KB | Canonical specification, all subsystems |
-| [`EXISTING_EXT4_BTRFS_STRUCTURE.md`](EXISTING_EXT4_BTRFS_STRUCTURE.md) | 94 KB | Behavioral extraction from Linux kernel ext4/btrfs source |
+| [`COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md`](COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md) | 347 KB | Canonical specification, all subsystems |
+| [`EXISTING_EXT4_BTRFS_STRUCTURE.md`](EXISTING_EXT4_BTRFS_STRUCTURE.md) | 100 KB | Behavioral extraction from Linux kernel ext4/btrfs source |
 | [`PLAN_TO_PORT_FRANKENFS_TO_RUST.md`](PLAN_TO_PORT_FRANKENFS_TO_RUST.md) | 79 KB | 9-phase porting roadmap with scope and acceptance criteria |
-| [`PROPOSED_ARCHITECTURE.md`](PROPOSED_ARCHITECTURE.md) | 24 KB | 22-member architecture, trait hierarchy, data flow |
-| [`FEATURE_PARITY.md`](FEATURE_PARITY.md) | 72 KB | Quantitative implementation coverage |
-| [`CHANGELOG.md`](CHANGELOG.md) | n/a | Project history organized by capability area |
-| [`AGENTS.md`](AGENTS.md) | 43 KB | Guidelines for AI coding agents working in this codebase |
+| [`PROPOSED_ARCHITECTURE.md`](PROPOSED_ARCHITECTURE.md) | 33 KB | 22-member architecture, trait hierarchy, data flow |
+| [`FEATURE_PARITY.md`](FEATURE_PARITY.md) | 93 KB | Quantitative implementation coverage |
+| [`CHANGELOG.md`](CHANGELOG.md) | 123 KB | Project history organized by capability area |
+| [`AGENTS.md`](AGENTS.md) | 44 KB | Guidelines for AI coding agents working in this codebase |
 
 ### Design documents
 
@@ -3856,7 +3859,7 @@ A: Same on-disk format for the tracked V1 features, with different internals: MV
 
 ### Linux kernel sources
 
-The behavioral spec extracted in `EXISTING_EXT4_BTRFS_STRUCTURE.md` (94 KB) is rooted in the Linux v6.19 kernel sources:
+The behavioral spec extracted in `EXISTING_EXT4_BTRFS_STRUCTURE.md` (100 KB) is rooted in the Linux v6.19 kernel sources:
 
 ```text
 fs/ext4/super.c             ext4 superblock and mount behavior

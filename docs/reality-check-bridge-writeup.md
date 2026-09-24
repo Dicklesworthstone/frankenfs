@@ -1,5 +1,29 @@
 # Reality-Check Bridge: Closing the Gap Between Claims and Code
 
+## Delivery progress — 2026-09-23 (same session)
+
+Worked in bead order after the audit below. "Verified" means executed on an
+rch worker against the committed base plus the change, with
+`FFS_REQUIRE_ORACLES=1` (a missing `e2fsck` / `btrfs` / image formatter fails
+the test instead of skipping). Self-verified by the author; no independent
+reviewer yet.
+
+| Bead | Change | Evidence |
+|---|---|---|
+| `bd-38cj9` | `main` compiles again (dev-only dep used from lib code; fmt; clippy) | workspace clippy exit 0; full workspace `cargo test` could not complete (worker OOM, exit 137, twice) |
+| `bd-5elw6` | `enable_writes` refuses non-default subvolume/snapshot; README walkthrough fixed | test on a formatted btrfs image PASS. **Refusal only** — subvolume RW remains open |
+| `bd-0mcvt` | every rewritten tree block, free-space-tree block, data block and tree-log node goes to all DUP copies | both copies of the new root-tree root byte-identical with the committed generation on a default-formatted image: PASS |
+| `bd-xsu7s` | failed orphan recovery latches read-only; `enable_writes` refuses | synthetic fixture test |
+| `bd-plamw` | repair-symbol writes check the tail against the ext4 bitmap / btrfs extent tree; `--background-repair` refused on RW mounts | unit + CLI tests PASS. **Refusal only** — real reservation remains open |
+| `bd-34blv` | write-time data-chunk growth on by default (kernel-accepted in bd-a136s); metadata growth still opt-in | parser test PASS |
+| `bd-cnmpm` | JBD2 writer records `s_start`/`s_sequence`, sets/clears `needs_recovery`, continues sequences across mounts | injected crash between commit and checkpoint: real `e2fsck -fy` replays FrankenFS's journal, `e2fsck -fn` clean, new bytes at home: PASS |
+| `bd-dj725` | `OpenFs::periodic_commit` + `--commit-interval-secs` worker (5 s ext4 / 30 s btrfs) | ext4 and btrfs tests (see closing comments) |
+| `bd-0r0kc` | hollow gate5/gate7 wrappers removed → `not_implemented`; FEATURE_PARITY notes partial gates | — |
+| `bd-53dub` | `oracle_unavailable` hook, CI installs btrfs-progs and sets `FFS_REQUIRE_ORACLES=1`, progs differential expects pass | 26 `*_passes_btrfs_check*` tests ran with the oracle REQUIRED: 26/26 PASS |
+| `bd-tmwe8` | btrfs scrub/snapshot/subvolume/defrag/move_ext ioctls no longer report success for work not done | test on a formatted btrfs image |
+| `bd-jufod` | `Ext4MetadataValidator`: offline and read-only mounted scrub verify group-descriptor and bitmap checksums | clean image scrubs clean; flipped bitmap/descriptor bytes detected (first slice; inode tables, extent/dir blocks and data remain) |
+| `bd-dax3o` | ~40 README claims corrected | diff reviewed |
+
 ## Reality check — 2026-09-23 (HEAD `75e0d3e8`)
 
 **Verdict.** FrankenFS is a large, real filesystem implementation whose

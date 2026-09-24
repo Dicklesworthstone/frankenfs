@@ -407,7 +407,9 @@ impl<D: BlockDevice> FsMvccBlockDevice<D> {
 
     fn validate_range(&self, start: BlockNumber, count: u64) -> FfsResult<()> {
         if self.block_size() == 0 {
-            return Err(FfsError::Format("MVCC device has zero block size".to_owned()));
+            return Err(FfsError::Format(
+                "MVCC device has zero block size".to_owned(),
+            ));
         }
         let end = start
             .0
@@ -976,15 +978,16 @@ mod block_device_tests {
             let snapshot = fixture.store.current_snapshot();
             fixture.commit(BLOCK, vec![0x22; BLOCK_SIZE as usize]);
             let mut called = false;
-            let result = fixture.store.read_unversioned_base_at_snapshot(
-                BLOCK,
-                snapshot,
-                || {
+            let result = fixture
+                .store
+                .read_unversioned_base_at_snapshot(BLOCK, snapshot, || {
                     called = true;
                     fixture.device.base.read_block(&cx, BLOCK)
-                },
-            );
-            assert!(matches!(result, Err(FfsError::MvccConflict { block: 1, .. })));
+                });
+            assert!(matches!(
+                result,
+                Err(FfsError::MvccConflict { block: 1, .. })
+            ));
             assert!(!called);
             fixture.assert_image_unchanged();
         }
@@ -996,16 +999,17 @@ mod block_device_tests {
             let fixture = Fixture::new(store);
             let cx = Cx::for_testing();
             let snapshot = fixture.store.current_snapshot();
-            let result = fixture.store.read_unversioned_base_at_snapshot(
-                BLOCK,
-                snapshot,
-                || {
+            let result = fixture
+                .store
+                .read_unversioned_base_at_snapshot(BLOCK, snapshot, || {
                     let bytes = fixture.device.base.read_block(&cx, BLOCK)?;
                     fixture.commit(BLOCK, vec![0x22; BLOCK_SIZE as usize]);
                     Ok(bytes)
-                },
-            );
-            assert!(matches!(result, Err(FfsError::MvccConflict { block: 1, .. })));
+                });
+            assert!(matches!(
+                result,
+                Err(FfsError::MvccConflict { block: 1, .. })
+            ));
             assert_eq!(fixture.store.current_snapshot().high.0, snapshot.high.0 + 1);
             assert_eq!(fixture.store.version_count(), 1);
             fixture.assert_image_unchanged();
@@ -1048,7 +1052,10 @@ mod block_device_tests {
                 Ok(())
             },
         );
-        assert!(matches!(result, Err(FfsError::MvccConflict { block: 1, .. })));
+        assert!(matches!(
+            result,
+            Err(FfsError::MvccConflict { block: 1, .. })
+        ));
         assert!(!patched);
         assert_eq!(fixture.store.version_count(), 1);
         fixture.assert_image_unchanged();
@@ -1367,7 +1374,10 @@ mod block_device_tests {
                 .device
                 .read_contiguous_blocks(&cx, BlockNumber(0), &mut bufs)
                 .expect("buffers");
-            for (buf, bytes) in bufs.iter().zip(expected.chunks_exact(BLOCK_SIZE as usize)) {
+            for (buf, bytes) in bufs
+                .iter()
+                .zip(expected.as_chunks::<{ BLOCK_SIZE as usize }>().0)
+            {
                 assert_eq!(buf.as_slice(), bytes);
             }
             fixture.assert_image_unchanged();

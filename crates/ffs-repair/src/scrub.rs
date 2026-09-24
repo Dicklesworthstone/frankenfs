@@ -580,6 +580,195 @@ impl BlockValidator for Ext4SuperblockValidator {
     }
 }
 
+/// What a fixed-location ext4 metadata block holds (bd-jufod).
+#[derive(Debug, Clone)]
+enum Ext4MetaBlock {
+    /// Group descriptors: `(group, byte offset of its descriptor in the block)`.
+    GroupDescriptors(Vec<(u32, usize)>),
+    /// A group's block bitmap, checked against that group's descriptor.
+    BlockBitmap(ffs_ondisk::Ext4GroupDesc),
+    /// A group's inode bitmap, checked against that group's descriptor.
+    InodeBitmap(ffs_ondisk::Ext4GroupDesc),
+}
+
+/// Checksum validator for ext4's fixed-location metadata (bd-jufod): the
+/// superblock, every group descriptor, and every initialized block/inode
+/// bitmap.
+///
+/// The previous ext4 scrub validated ONLY the superblock block; a flipped bit in
+/// a descriptor or bitmap — the structures allocation trusts — went unnoticed.
+/// The bitmap checksums live in the descriptors, which are snapshotted at
+/// construction, so this validator is only correct while the image is not being
+/// mutated: offline scrub and read-only mounts. A read-write mount defers
+/// descriptor persistence, so its at-rest checksums legitimately lag.
+#[derive(Debug, Clone)]
+pub struct Ext4MetadataValidator {
+    superblock: Ext4SuperblockValidator,
+    sb: Ext4Superblock,
+    blocks: std::collections::HashMap<u64, Ext4MetaBlock>,
+}
+
+impl Ext4MetadataValidator {
+    /// Build from the superblock and every group's descriptor, in group order.
+    #[must_use]
+    pub fn new(sb: &Ext4Superblock, groups: &[Option<ffs_ondisk::Ext4GroupDesc>]) -> Self {
+        let block_size = u64::from(sb.block_size);
+        let mut blocks = std::collections::HashMap::new();
+        for (index, gd) in groups.iter().enumerate() {
+            let Ok(group) = u32::try_from(index) else {
+                break;
+            };
+            if let Some(byte) = sb.group_desc_offset(ffs_types::GroupNumber(group)) {
+                let entry = blocks
+                    .entry(byte / block_size)
+                    .or_insert_with(|| Ext4MetaBlock::GroupDescriptors(Vec::new()));
+                if let Ext4MetaBlock::GroupDescriptors(list) = entry
+                    && let Ok(off) = usize::try_from(byte % block_size)
+                {
+                    list.push((group, off));
+                }
+            }
+            let Some(gd) = gd else {
+                continue;
+            };
+            if !sb.has_metadata_csum() {
+                continue;
+            }
+            if gd.flags & ffs_ondisk::ext4::EXT4_BG_BLOCK_UNINIT == 0 && gd.block_bitmap != 0 {
+                blocks.insert(gd.block_bitmap, Ext4MetaBlock::BlockBitmap(gd.clone()));
+            }
+            if gd.flags & ffs_ondisk::ext4::EXT4_BG_INODE_UNINIT == 0 && gd.inode_bitmap != 0 {
+                blocks.insert(gd.inode_bitmap, Ext4MetaBlock::InodeBitmap(gd.clone()));
+            }
+        }
+        Self {
+            superblock: Ext4SuperblockValidator::new(sb.block_size),
+            sb: sb.clone(),
+            blocks,
+        }
+    }
+
+    /// Build by reading every group descriptor from `device`, WITHOUT verifying
+    /// them — verification is the scrub's job, and a descriptor with a bad
+    /// checksum must be reported, not make construction fail. A descriptor that
+    /// does not even parse contributes no bitmap entries; its GDT block is still
+    /// checksum-validated.
+    ///
+    /// # Errors
+    /// Device read failure on a GDT block.
+    pub fn from_device(cx: &Cx, device: &dyn BlockDevice, sb: &Ext4Superblock) -> Result<Self> {
+        let block_size = u64::from(sb.block_size);
+        let desc_size = sb.group_desc_size();
+        let mut cached: Option<(u64, BlockBuf)> = None;
+        let mut groups = Vec::new();
+        for group in 0..sb.groups_count() {
+            let Some(byte) = sb.group_desc_offset(ffs_types::GroupNumber(group)) else {
+                break;
+            };
+            let block = byte / block_size;
+            if cached.as_ref().is_none_or(|(b, _)| *b != block) {
+                cached = Some((block, device.read_block(cx, BlockNumber(block))?));
+            }
+            let data = cached
+                .as_ref()
+                .map(|(_, d)| d.as_slice())
+                .unwrap_or_default();
+            let off = usize::try_from(byte % block_size).unwrap_or(usize::MAX);
+            let gd = data
+                .get(off..off.saturating_add(usize::from(desc_size)))
+                .and_then(|raw| ffs_ondisk::Ext4GroupDesc::parse_from_bytes(raw, desc_size).ok());
+            groups.push(gd);
+        }
+        Ok(Self::new(sb, &groups))
+    }
+
+    fn checksum_issue(what: String) -> BlockVerdict {
+        BlockVerdict::Corrupt(vec![(
+            CorruptionKind::ChecksumMismatch,
+            Severity::Error,
+            what,
+        )])
+    }
+}
+
+impl BlockValidator for Ext4MetadataValidator {
+    fn validate(&self, block: BlockNumber, data: &BlockBuf) -> BlockVerdict {
+        let sb_verdict = self.superblock.validate(block, data);
+        let Some(kind) = self.blocks.get(&block.0) else {
+            return sb_verdict;
+        };
+        let bytes = data.as_slice();
+        let desc_size = self.sb.group_desc_size();
+        let seed = self.sb.csum_seed();
+        let verdict = match kind {
+            Ext4MetaBlock::GroupDescriptors(list) => {
+                let mut bad = Vec::new();
+                for &(group, off) in list {
+                    let Some(raw) = bytes.get(off..off + usize::from(desc_size)) else {
+                        bad.push(group);
+                        continue;
+                    };
+                    if ffs_ondisk::ext4::verify_group_desc_checksum(
+                        raw,
+                        &self.sb.uuid,
+                        seed,
+                        group,
+                        desc_size,
+                        self.sb.group_desc_checksum_kind(),
+                    )
+                    .is_err()
+                    {
+                        bad.push(group);
+                    }
+                }
+                if bad.is_empty() {
+                    BlockVerdict::Clean
+                } else {
+                    Self::checksum_issue(format!(
+                        "ext4 group descriptor checksum mismatch in block {block} for groups {bad:?}"
+                    ))
+                }
+            }
+            Ext4MetaBlock::BlockBitmap(gd) => {
+                match ffs_ondisk::ext4::verify_block_bitmap_checksum(
+                    bytes,
+                    seed,
+                    self.sb.clusters_per_group,
+                    gd,
+                    desc_size,
+                ) {
+                    Ok(()) => BlockVerdict::Clean,
+                    Err(_) => Self::checksum_issue(format!(
+                        "ext4 block bitmap checksum mismatch in block {block}"
+                    )),
+                }
+            }
+            Ext4MetaBlock::InodeBitmap(gd) => {
+                match ffs_ondisk::ext4::verify_inode_bitmap_checksum(
+                    bytes,
+                    seed,
+                    self.sb.inodes_per_group,
+                    gd,
+                    desc_size,
+                ) {
+                    Ok(()) => BlockVerdict::Clean,
+                    Err(_) => Self::checksum_issue(format!(
+                        "ext4 inode bitmap checksum mismatch in block {block}"
+                    )),
+                }
+            }
+        };
+        match (sb_verdict, verdict) {
+            (BlockVerdict::Corrupt(mut a), BlockVerdict::Corrupt(b)) => {
+                a.extend(b);
+                BlockVerdict::Corrupt(a)
+            }
+            (BlockVerdict::Corrupt(a), _) => BlockVerdict::Corrupt(a),
+            (_, v) => v,
+        }
+    }
+}
+
 /// Validator for the canonical btrfs primary superblock.
 ///
 /// Checks parseability and superblock checksum integrity.
