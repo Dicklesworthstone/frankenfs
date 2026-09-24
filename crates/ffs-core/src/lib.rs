@@ -23455,22 +23455,47 @@ impl OpenFs {
 
         // Patch only this inode's slot into the base block; the base is read at the
         // transaction's own snapshot inside the RMW helper (begin-then-read).
-        let proof = MergeProof::timestamp_only_inode_range(loc.byte_offset, inode_size);
-        self.mvcc_store.rmw_commit_block_with_proof(
-            loc.block,
-            proof,
-            || Ok(dev.read_block(cx, loc.block)?.as_slice().to_vec()),
-            |block_data| {
-                if loc.byte_offset + inode_size > block_data.len() {
-                    return Err(FfsError::Corruption {
-                        block: loc.block.0,
-                        detail: "inode extends beyond block boundary".into(),
-                    });
+        // bd-y2t0r: this is a single-block transaction that publishes nothing
+        // until its own commit, and the patch is idempotent ("this inode's slot
+        // holds these bytes"). A retryable MVCC conflict — a concurrent commit
+        // and prune can strand this unregistered snapshot's ancestor, which the
+        // f2b99486 guard correctly refuses to guess — is therefore resolved by
+        // re-running from a fresh snapshot instead of surfacing EAGAIN to an
+        // application that the kernel would never give one.
+        const MAX_ATTEMPTS: u32 = 16;
+        let mut attempt = 1;
+        loop {
+            let proof = MergeProof::timestamp_only_inode_range(loc.byte_offset, inode_size);
+            let result = self.mvcc_store.rmw_commit_block_with_proof(
+                loc.block,
+                proof,
+                || Ok(dev.read_block(cx, loc.block)?.as_slice().to_vec()),
+                |block_data| {
+                    if loc.byte_offset + inode_size > block_data.len() {
+                        return Err(FfsError::Corruption {
+                            block: loc.block.0,
+                            detail: "inode extends beyond block boundary".into(),
+                        });
+                    }
+                    block_data[loc.byte_offset..loc.byte_offset + inode_size].copy_from_slice(slot);
+                    Ok(())
+                },
+            );
+            match result {
+                Err(FfsError::MvccConflict { .. }) if attempt < MAX_ATTEMPTS => {
+                    trace!(
+                        target: "ffs::mvcc",
+                        block = loc.block.0,
+                        ino = ino.0,
+                        attempt,
+                        "inode_slot_rmw_retry_after_conflict"
+                    );
+                    attempt += 1;
+                    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
                 }
-                block_data[loc.byte_offset..loc.byte_offset + inode_size].copy_from_slice(slot);
-                Ok(())
-            },
-        )
+                other => return other,
+            }
+        }
     }
 
     /// Write an inode via the sharded (no-write-lock) path (bd-bhh0i cutover
@@ -26842,6 +26867,47 @@ impl OpenFs {
             "deferred inode reclaimed after last open handle"
         );
         Ok(true)
+    }
+
+    /// Reclaim every orphan still on the on-disk list at unmount (bd-iah1f).
+    ///
+    /// No handle can be open once the transport reaches destroy, so every
+    /// remaining orphan is garbage the per-handle finalize never got to. That
+    /// happens under multi-worker dispatch: the kernel sends RELEASE through its
+    /// background queue, so the last RELEASE of an unlinked file can reach the
+    /// daemon after DESTROY (fuser then drops it) or run on another worker while
+    /// destroy flushes. Measured on the concurrent create/unlink storm: the
+    /// "cleanly" unmounted image failed `e2fsck -fn` with "Deleted inode 41 has
+    /// zero dtime" — the orphan-list tail. Kernel ext4 never leaves an orphan
+    /// list behind a clean umount; this is the matching guarantee.
+    ///
+    /// Returns how many inodes were reclaimed.
+    pub(crate) fn ext4_finalize_orphans_on_destroy(&self, cx: &Cx) -> ffs_error::Result<usize> {
+        let Some(sb) = self.ext4_superblock() else {
+            return Ok(0);
+        };
+        // Each finalize pops the head, so a well-formed list ends within
+        // s_inodes_count steps; a corrupt cycle must not hang unmount.
+        let limit = usize::try_from(sb.inodes_count).unwrap_or(usize::MAX);
+        let mut reclaimed = 0_usize;
+        loop {
+            let head = self.ext4_read_orphan_head(cx)?;
+            if head == 0 {
+                return Ok(reclaimed);
+            }
+            if reclaimed >= limit
+                || !self.ext4_finalize_unlinked_inode_impl(cx, InodeNumber(u64::from(head)))?
+            {
+                return Err(FfsError::Corruption {
+                    block: 0,
+                    detail: format!(
+                        "destroy orphan drain: list head {head} could not be reclaimed \
+                         after {reclaimed} inodes"
+                    ),
+                });
+            }
+            reclaimed += 1;
+        }
     }
 
     /// Relink the orphan list around a removed entry (bd-90aey).
@@ -62878,6 +62944,66 @@ mod tests {
                 freed.size
             ),
         }
+    }
+
+    /// bd-iah1f: an orphan whose final RELEASE never reached finalize (lost
+    /// after DESTROY, or racing it on another dispatch worker) must still be
+    /// reclaimed by destroy. Before the drain, the unmounted image kept the
+    /// orphan list and failed `e2fsck -fn` with "Deleted inode N has zero
+    /// dtime" — the concurrent create/unlink storm in fuse_e2e found it.
+    #[test]
+    fn ext4_destroy_reclaims_orphans_whose_release_never_finalized_bd_iah1f() {
+        let Some((fs, tmp)) = open_writable_ext4_mkfs(16) else {
+            return; // mkfs.ext4 unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let payload = vec![0x5A_u8; fs.block_size() as usize];
+
+        // Three orphans, so the drain walks a real multi-entry list.
+        let mut orphans = Vec::new();
+        for name in ["o1.bin", "o2.bin", "o3.bin"] {
+            let ino = fs
+                .create(&cx, root, OsStr::new(name), 0o644, 0, 0)
+                .expect("create")
+                .ino;
+            let _ = fs.write(&cx, ino, 0, &payload).expect("write");
+            orphans.push(ino);
+        }
+        let pinned = orphans.clone();
+        fs.install_open_handle_oracle(std::sync::Arc::new(move |queried| {
+            u64::from(pinned.contains(&queried))
+        }));
+        for name in ["o1.bin", "o2.bin", "o3.bin"] {
+            fs.unlink(&cx, root, OsStr::new(name))
+                .expect("unlink pinned");
+        }
+        assert_ne!(
+            fs.ext4_read_orphan_head(&cx).expect("orphan head"),
+            0,
+            "precondition: the pinned unlinks must leave an orphan list"
+        );
+
+        // No finalize: the RELEASEs are "lost". Destroy alone must reclaim.
+        fs.flush_on_destroy(&cx).expect("flush_on_destroy");
+        assert_eq!(
+            fs.ext4_read_orphan_head(&cx).expect("orphan head"),
+            0,
+            "destroy must leave no orphan list behind a clean unmount"
+        );
+        for ino in &orphans {
+            assert!(
+                !fs.finalize_unlinked_inode_public(&cx, *ino)
+                    .expect("late finalize"),
+                "a RELEASE arriving after destroy finds inode {ino} already reclaimed"
+            );
+        }
+        drop(fs);
+
+        let Some((clean, output)) = run_e2fsck(&tmp.path().join("test.ext4")) else {
+            return;
+        };
+        assert!(clean, "the unmounted image must be e2fsck-clean:\n{output}");
     }
 
     fn open_writable_ext4_mkfs(size_mb: u64) -> Option<(OpenFs, tempfile::TempDir)> {

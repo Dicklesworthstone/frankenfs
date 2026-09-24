@@ -116,7 +116,33 @@ fn emit_scenario_result(scenario_id: &str, outcome: &str, detail: Option<&str>) 
     }
 }
 
+/// Read the ioctl trace once the off-thread writer has settled.
+///
+/// `IoctlTraceProbe::record` only enqueues; a writer thread appends later, so
+/// reading right after the ioctl returns raced it. Under load (a `TMPDIR=/tmp`
+/// REQUIRE run) successful GETFLAGS/SETFSLABEL calls read an EMPTY trace, and
+/// every negative "must not reach ffs-fuse::ioctl" check could pass vacuously.
+/// Wait until the file length is unchanged across a quiet window. This narrows
+/// the race rather than closing it: `MountGuard` wraps a bare
+/// `BackgroundSession`, so the real barrier (`MountHandle::flush_ioctl_trace`)
+/// is not reachable from these tests (bd-53dub follow-up).
 fn read_ioctl_trace(path: &Path) -> String {
+    const QUIET: Duration = Duration::from_millis(100);
+    const LIMIT: Duration = Duration::from_secs(3);
+    let len = || fs::metadata(path).map_or(0, |m| m.len());
+    let start = Instant::now();
+    let mut last = len();
+    let mut stable_since = Instant::now();
+    while start.elapsed() < LIMIT {
+        thread::sleep(Duration::from_millis(10));
+        let now = len();
+        if now != last {
+            last = now;
+            stable_since = Instant::now();
+        } else if stable_since.elapsed() >= QUIET {
+            break;
+        }
+    }
     fs::read_to_string(path).unwrap_or_default()
 }
 
@@ -1342,7 +1368,7 @@ fn try_mount_ffs_rw_with_options(
             ))
         }
         Err(e) => {
-            eprintln!("FUSE mount (rw) failed (skipping test): {e}");
+            require_fuse_or_skip(&format!("FUSE mount (rw) failed: {e}"));
             None
         }
     }
@@ -1361,6 +1387,101 @@ fn try_mount_ffs_rw(
         ..MountOptions::default()
     };
     try_mount_ffs_rw_with_options(image, mountpoint, &mount_opts)
+}
+
+/// bd-iah1f / bd-y2t0r: with 4 concurrent FUSE dispatch workers, four client
+/// threads creating, writing and unlinking files in ONE directory must all
+/// succeed (no EAGAIN leaking from MVCC conflicts), surviving files must read
+/// back exactly, and after unmount the image must be e2fsck-clean. This is the
+/// concurrent-namespace evidence the serial-by-default dispatch never gave.
+#[test]
+fn fuse_concurrent_create_unlink_multi_worker_keeps_image_clean_bd_iah1f() {
+    if !fuse_available() {
+        return;
+    }
+    if !command_available("e2fsck") {
+        require_fuse_or_skip("e2fsck unavailable for the post-unmount check");
+        return;
+    }
+    let tmp = TempDir::new().expect("tmpdir");
+    let image = create_test_image_with_size(tmp.path(), 64 * 1024 * 1024);
+    let mnt = tmp.path().join("mnt");
+    fs::create_dir_all(&mnt).expect("create mountpoint");
+    // Dispatch workers for this storm; FFS_E2E_STRESS_WORKERS=1 gives the
+    // serial-dispatch control arm with the same concurrent clients.
+    let workers = std::env::var("FFS_E2E_STRESS_WORKERS")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|&n| n > 0)
+        .unwrap_or(4);
+    let opts = MountOptions {
+        read_only: false,
+        auto_unmount: false,
+        worker_threads: workers,
+        ..MountOptions::default()
+    };
+    let Some(session) = try_mount_ffs_rw_with_options(&image, &mnt, &opts) else {
+        return;
+    };
+    let shared = mnt.join("shared");
+    fs::create_dir(&shared).expect("mkdir shared");
+    const WORKERS: u8 = 4;
+    const FILES: u32 = 100;
+    let errors: Vec<String> = std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..WORKERS)
+            .map(|w| {
+                let shared = shared.clone();
+                scope.spawn(move || {
+                    let mut errors = Vec::new();
+                    for i in 0..FILES {
+                        let path = shared.join(format!("w{w}-{i:03}"));
+                        if let Err(e) = fs::write(&path, vec![w; 4096]) {
+                            errors.push(format!("write {}: {e}", path.display()));
+                            continue;
+                        }
+                        if i % 2 == 0
+                            && let Err(e) = fs::remove_file(&path)
+                        {
+                            errors.push(format!("unlink {}: {e}", path.display()));
+                        }
+                    }
+                    errors
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|h| h.join().expect("worker thread"))
+            .collect()
+    });
+    assert!(
+        errors.is_empty(),
+        "{} concurrent namespace operations failed (first: {:?})",
+        errors.len(),
+        errors.first()
+    );
+    for w in 0..WORKERS {
+        for i in (1..FILES).step_by(2) {
+            let path = shared.join(format!("w{w}-{i:03}"));
+            assert_eq!(
+                fs::read(&path).expect("read surviving file"),
+                vec![w; 4096],
+                "{}",
+                path.display()
+            );
+        }
+    }
+    session.unmount_and_join();
+    let fsck = Command::new("e2fsck")
+        .args(["-fn", image.to_str().expect("utf8 path")])
+        .output()
+        .expect("run e2fsck");
+    assert!(
+        fsck.status.success(),
+        "e2fsck -fn must be clean after the concurrent storm:\n{}{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
 }
 
 /// Helper: create image, mount rw, run a closure, then drop the session.
@@ -11579,7 +11700,7 @@ fn try_mount_btrfs_rw_with_options(
     };
     let mut fs = OpenFs::open_with_options(&cx, image, &opts).expect("open btrfs image");
     if let Err(e) = fs.enable_writes(&cx) {
-        eprintln!("btrfs enable_writes failed (skipping test): {e}");
+        require_fuse_or_skip(&format!("btrfs enable_writes failed: {e}"));
         return None;
     }
     match mount_background(Box::new(fs), mountpoint, mount_opts) {
@@ -15954,7 +16075,7 @@ fn ext4_fuse_ioctl_setversion_roundtrips_via_mounted_path() {
     let session = match ffs_fuse::mount_managed(Box::new(filesystem), &mnt, &config) {
         Ok(session) => session,
         Err(error) => {
-            eprintln!("FUSE mount (rw) failed (skipping test): {error}");
+            require_fuse_or_skip(&format!("FUSE mount (rw, managed) failed: {error}"));
             return;
         }
     };

@@ -4356,6 +4356,18 @@ impl FsOps for OpenFs {
             return Ok(());
         }
 
+        // Reclaim orphans whose final RELEASE was lost or raced destroy
+        // (bd-iah1f) BEFORE the flush below, so the frees persist with it. A
+        // failure leaves them to mount-time recovery and must not skip the
+        // flush of everything else.
+        if matches!(self.flavor, FsFlavor::Ext4(_)) {
+            match self.ext4_finalize_orphans_on_destroy(cx) {
+                Ok(0) => {}
+                Ok(reclaimed) => info!(reclaimed, "flush_on_destroy: reclaimed pending orphans"),
+                Err(error) => warn!(%error, "flush_on_destroy: orphan drain failed"),
+            }
+        }
+
         // Drain and join the home-location compactor before the final full
         // checkpoint. The synchronous checkpoint remains authoritative even if
         // an earlier background batch failed, and the WAL is retained unless the

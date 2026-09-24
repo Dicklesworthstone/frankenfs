@@ -28,6 +28,7 @@ impl FrankenFuse {
                 worker_dispatch: options.worker_threads > 0,
                 parallel_dirops: options.worker_threads > 1,
                 read_only: options.read_only,
+                writeback_cache: options.writeback_cache.is_enabled(),
                 count_memoized_requests: count_memoized_requests_from_env(),
                 mountpoint: mountpoint.map(Path::to_path_buf),
                 kernel_notifier: Mutex::new(None),

@@ -4105,6 +4105,10 @@ struct FuseInner {
     worker_dispatch: bool,
     parallel_dirops: bool,
     read_only: bool,
+    /// Explicit `writeback_cache` opt-in: negotiated as `FUSE_WRITEBACK_CACHE`
+    /// at INIT. It is NOT a kernel mount option — passing it to mount(2) was
+    /// rejected with EINVAL, so the opt-in never worked until it moved here.
+    writeback_cache: bool,
     /// Whether a memo-served request increments `requests_total` (bd-d9378).
     ///
     /// A per-store field rather than a `cfg` so both A/B arms run from ONE ELF
@@ -5675,6 +5679,20 @@ impl Filesystem for FrankenFuse {
                 missing,
                 "kernel declined one or more FUSE readdirplus capabilities"
             ),
+        }
+
+        // Explicit `writeback_cache` opt-in. Fail the mount rather than silently
+        // run without it: the caller chose its durability contract (flush is
+        // non-durable; fsync/fsyncdir are the boundaries) by asking for it.
+        if self.inner.writeback_cache {
+            if let Err(missing) = config.add_capabilities(fuse_consts::FUSE_WRITEBACK_CACHE) {
+                warn!(
+                    missing,
+                    "kernel declined FUSE_WRITEBACK_CACHE; refusing mount"
+                );
+                return Err(libc::ENOSYS);
+            }
+            info!("FUSE_WRITEBACK_CACHE negotiated (explicit writeback_cache opt-in)");
         }
 
         // bd-biwl4: opt-in only. `add_capabilities(0)` is a no-op, so when the knob
@@ -7562,9 +7580,9 @@ fn build_mount_options(options: &MountOptions) -> Vec<MountOption> {
     if options.auto_unmount {
         opts.push(MountOption::AutoUnmount);
     }
-    if options.writeback_cache.is_enabled() {
-        opts.push(MountOption::CUSTOM("writeback_cache".to_owned()));
-    }
+    // `writeback_cache` is deliberately absent: it is an INIT capability
+    // (`FUSE_WRITEBACK_CACHE`, negotiated in `init`), and mount(2) rejects it
+    // as an unknown option with EINVAL.
 
     opts
 }
@@ -8412,6 +8430,7 @@ mod tests {
             worker_dispatch: false,
             parallel_dirops: false,
             read_only: false,
+            writeback_cache: false,
             count_memoized_requests: true,
             mountpoint: None,
             kernel_notifier: Mutex::new(None),
@@ -8455,6 +8474,7 @@ mod tests {
             worker_dispatch: false,
             parallel_dirops: false,
             read_only: false,
+            writeback_cache: false,
             count_memoized_requests: true,
             mountpoint: None,
             kernel_notifier: Mutex::new(None),
@@ -9652,6 +9672,7 @@ mod tests {
             worker_dispatch: false,
             parallel_dirops: false,
             read_only: false,
+            writeback_cache: false,
             count_memoized_requests: true,
             mountpoint: None,
             kernel_notifier: Mutex::new(None),
@@ -21950,6 +21971,7 @@ mod tests {
             worker_dispatch: true,
             parallel_dirops: true,
             read_only: true,
+            writeback_cache: false,
             count_memoized_requests: true,
             mountpoint: None,
             kernel_notifier: Mutex::new(None),
@@ -22588,8 +22610,12 @@ mod tests {
         assert!(opts.writeback_cache.is_enabled());
     }
 
+    /// The opt-in is an INIT capability, never a mount(2) option: this test used
+    /// to assert the opposite, pinning a mount string the kernel rejects with
+    /// EINVAL (the mounted `writeback_cache_ext4_opt_in_*` test only ever
+    /// skipped). The opt-in must instead reach the adapter that negotiates it.
     #[test]
-    fn build_mount_options_includes_writeback_cache_only_when_opted_in() {
+    fn writeback_cache_opt_in_is_negotiated_at_init_not_passed_to_mount() {
         let opts = MountOptions {
             read_only: false,
             writeback_cache: WritebackCacheMode::Enabled,
@@ -22601,8 +22627,20 @@ mod tests {
             labels.join(";")
         );
         assert!(
-            labels.iter().any(|label| label == "writeback_cache"),
-            "explicit writeback_cache opt-in should reach canonical mount labels: {labels:?}"
+            !labels.iter().any(|label| label.contains("writeback_cache")),
+            "writeback_cache must not reach mount(2), which rejects it: {labels:?}"
+        );
+        assert!(
+            FrankenFuse::with_options(Box::new(MinimalTestFs), &opts)
+                .inner
+                .writeback_cache,
+            "the opt-in must reach init, where FUSE_WRITEBACK_CACHE is negotiated"
+        );
+        assert!(
+            !FrankenFuse::with_options(Box::new(MinimalTestFs), &MountOptions::default())
+                .inner
+                .writeback_cache,
+            "writeback_cache stays off unless explicitly requested"
         );
     }
 
@@ -23918,6 +23956,7 @@ AllowOther"#;
             worker_dispatch: true,
             parallel_dirops: true,
             read_only: false,
+            writeback_cache: false,
             count_memoized_requests: true,
             mountpoint: None,
             kernel_notifier: Mutex::new(None),
