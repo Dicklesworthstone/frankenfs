@@ -9,10 +9,12 @@
 //!
 //! All write failures are returned as [`WalWriteError`], which distinguishes:
 //!
-//! - **Retryable** failures: I/O errors, backpressure — the caller may retry
-//!   after addressing the underlying condition.
+//! - **Retryable** failures: append I/O errors after successful durable rollback,
+//!   or backpressure — the caller may retry after addressing the condition.
 //! - **Fatal** failures: format violations, verification failures — these
 //!   indicate a bug or unrecoverable state.
+//! - **Recovery required**: rollback or an explicit flush failed. The writer
+//!   is sealed; reopen and recover the WAL before issuing further mutations.
 //!
 //! # Invariants Enforced
 //!
@@ -57,6 +59,9 @@ pub enum WalWriteError {
     },
     /// WAL size exceeds the configured backpressure threshold.
     Backpressure { wal_size: u64, threshold: u64 },
+    /// Storage may contain an unacknowledged record or an unsynced prefix.
+    /// Further mutations require reopening and recovering the WAL.
+    RecoveryRequired { detail: String },
 }
 
 impl WalWriteError {
@@ -71,7 +76,9 @@ impl WalWriteError {
     pub fn is_fatal(&self) -> bool {
         matches!(
             self,
-            Self::FormatViolation { .. } | Self::VerificationFailed { .. }
+            Self::FormatViolation { .. }
+                | Self::VerificationFailed { .. }
+                | Self::RecoveryRequired { .. }
         )
     }
 }
@@ -90,6 +97,7 @@ impl std::fmt::Display for WalWriteError {
             }
             Self::SyncIo { source } => write!(f, "WAL sync I/O error: {source}"),
             Self::FormatViolation { detail } => write!(f, "WAL format violation: {detail}"),
+            Self::RecoveryRequired { detail } => write!(f, "WAL recovery required: {detail}"),
             Self::VerificationFailed {
                 expected_crc,
                 actual_crc,
@@ -130,6 +138,9 @@ impl From<WalWriteError> for FfsError {
                 Self::Io(source)
             }
             WalWriteError::FormatViolation { detail } => Self::Format(detail),
+            WalWriteError::RecoveryRequired { detail } => {
+                Self::Io(std::io::Error::other(format!("WAL recovery required: {detail}")))
+            }
             WalWriteError::VerificationFailed {
                 expected_crc,
                 actual_crc,
@@ -239,12 +250,21 @@ pub struct WalWriter {
     last_commit_seq: u64,
     /// Monotonically increasing operation counter for structured logging.
     next_operation_id: u64,
+    /// An ambiguous storage failure permanently seals this writer instance.
+    recovery_required: Option<String>,
     /// Injected sync failure for testing.
     #[cfg(test)]
     pub(crate) fail_sync: bool,
     /// Injected append failure for testing.
     #[cfg(test)]
     pub(crate) fail_append: bool,
+    /// Inject failure after physically writing this many bytes of an append.
+    #[cfg(test)]
+    pub(crate) fail_append_after: Option<usize>,
+    #[cfg(test)]
+    pub(crate) fail_rollback_truncate: bool,
+    #[cfg(test)]
+    pub(crate) fail_rollback_sync: bool,
 }
 
 impl WalWriter {
@@ -260,10 +280,17 @@ impl WalWriter {
             appends_since_sync: 0,
             last_commit_seq: 0,
             next_operation_id: 1,
+            recovery_required: None,
             #[cfg(test)]
             fail_sync: false,
             #[cfg(test)]
             fail_append: false,
+            #[cfg(test)]
+            fail_append_after: None,
+            #[cfg(test)]
+            fail_rollback_truncate: false,
+            #[cfg(test)]
+            fail_rollback_sync: false,
         }
     }
 
@@ -309,27 +336,16 @@ impl WalWriter {
     ///   strictly greater than `last_commit_seq`. Equality is a
     ///   FormatViolation. Replay relies on this to detect WAL
     ///   tampering.
-    /// * **Atomic-rollback**: any failure path between the
-    ///   `raw_append` call (l. 391) and the `last_commit_seq =
-    ///   commit_seq` assignment (l. 425) MUST revert the partial
-    ///   append, otherwise a reader at the WAL tail would see a
-    ///   commit record whose in-memory state is unreachable. There
-    ///   are two rollback paths:
-    ///     1. **Verify failure** (`if self.config.verify_writes { ... }`):
-    ///        resets `self.write_pos` and truncates the file. Does
-    ///        NOT reset `appends_since_sync` because that counter is
-    ///        incremented AFTER verify; if you move verify past the
-    ///        increment, you MUST reset the counter here too.
-    ///     2. **Sync failure** (after
-    ///        `increment_pending_sync_count`): delegates to
-    ///        `rollback_failed_append`, which reverts
-    ///        `write_pos`, truncates the file, AND restores
-    ///        `appends_since_sync` to its pre-increment value.
+    /// * **Atomic-rollback**: append, verification, and sync failures all
+    ///   use `rollback_failed_append`. It truncates AND syncs the rollback
+    ///   before permitting another append. If either step fails, the
+    ///   writer is sealed with `RecoveryRequired`: a complete, CRC-valid
+    ///   record may remain on disk despite not being acknowledged in memory.
     ///
     /// Any new failure path inserted between `raw_append` and the
-    /// final assignment MUST call `rollback_failed_append` (or the
-    /// equivalent inline reset for pre-counter paths) before
-    /// returning Err.
+    /// final assignment MUST call `rollback_failed_append` before returning
+    /// Err. A failed rollback has an indeterminate commit outcome; only
+    /// reopening and replaying the WAL can resolve it.
     ///
     /// # Monotonicity (D1)
     ///
@@ -350,6 +366,7 @@ impl WalWriter {
         &mut self,
         commit: &WalCommit,
     ) -> std::result::Result<AppendResult, WalWriteError> {
+        self.ensure_ready()?;
         let op_id = self.next_op_id();
         let commit_seq = commit.commit_seq.0;
         let txn_id = commit.txn_id.0;
@@ -427,7 +444,7 @@ impl WalWriter {
             });
         }
 
-        self.raw_append(&encoded).map_err(|e| {
+        self.raw_append(&encoded).inspect_err(|e| {
             error!(
                 operation_id = op_id,
                 commit_seq,
@@ -436,21 +453,13 @@ impl WalWriter {
                 error = %e,
                 "wal_append_err"
             );
-            WalWriteError::AppendIo {
-                source: e,
-                bytes_attempted: bytes_len,
-            }
         })?;
 
         // ── Optional write verification ──────────────────────────────────
         if self.config.verify_writes
             && let Err(e) = self.verify_written_record(write_offset, &encoded, op_id)
         {
-            // Revert the write position and truncate the file to avoid leaving a "successful" record in the WAL
-            // that the caller will roll back in memory.
-            self.write_pos = write_offset;
-            let _ = self.file.set_len(write_offset);
-            return Err(e);
+            return Err(self.rollback_failed_append(write_offset, self.appends_since_sync, e));
         }
 
         // ── Sync policy ──────────────────────────────────────────────────
@@ -486,14 +495,32 @@ impl WalWriter {
     /// Returns the number of appends that were pending sync (0 if nothing was
     /// pending).
     pub fn flush(&mut self) -> std::result::Result<u32, WalWriteError> {
+        self.ensure_ready()?;
         let pending = self.appends_since_sync;
         if pending == 0 {
             return Ok(0);
         }
         let op_id = self.next_op_id();
-        self.do_sync(op_id)?;
+        if let Err(error) = self.do_sync(op_id) {
+            // These writes were already returned to callers. Unlike a failed
+            // append, an explicit flush must not discard their records.
+            return Err(self.require_recovery(format!("explicit flush failed: {error}")));
+        }
         info!(operation_id = op_id, flushed = pending, "wal_flush_ok");
         Ok(pending)
+    }
+
+    /// Reject use after an ambiguous storage failure. Check this before
+    /// checkpoint publication or direct mutation through the file accessors.
+    /// Resetting counters or fixing the underlying device does not unseal an
+    /// instance; reopening and replay are required to resolve the disk state.
+    pub fn ensure_ready(&self) -> std::result::Result<(), WalWriteError> {
+        match &self.recovery_required {
+            Some(detail) => Err(WalWriteError::RecoveryRequired {
+                detail: detail.clone(),
+            }),
+            None => Ok(()),
+        }
     }
 
     /// Current WAL file size (byte offset of the next write).
@@ -553,6 +580,7 @@ impl WalWriter {
         &mut self,
         commits: &[WalCommit],
     ) -> std::result::Result<Vec<AppendResult>, WalWriteError> {
+        self.ensure_ready()?;
         if commits.is_empty() {
             return Ok(Vec::new());
         }
@@ -597,7 +625,7 @@ impl WalWriter {
             });
         }
 
-        self.raw_append(&coalesced_buf).map_err(|e| {
+        self.raw_append(&coalesced_buf).inspect_err(|e| {
             error!(
                 operation_id = op_id,
                 bytes_attempted = total_bytes,
@@ -605,10 +633,6 @@ impl WalWriter {
                 error = %e,
                 "wal_coalesced_append_err"
             );
-            WalWriteError::AppendIo {
-                source: e,
-                bytes_attempted: total_bytes,
-            }
         })?;
 
         self.verify_or_rollback_coalesced_write(base_offset, &coalesced_buf, op_id)?;
@@ -663,46 +687,48 @@ impl WalWriter {
         self.appends_since_sync = self.appends_since_sync.saturating_add(delta);
     }
 
-    /// Reverse a partial WAL append when the post-append sync (or
-    /// any other post-counter step) fails. **This is the rollback
-    /// partner of the append-only/atomic-rollback contract documented
-    /// on [`Self::append_commit`].** (bd-chmw4)
-    ///
-    /// The rollback covers THREE state pieces. Forgetting any of
-    /// them leaves the WAL in a state where a tail reader sees a
-    /// commit record whose corresponding in-memory state is
-    /// unreachable:
-    ///
-    /// 1. **`write_pos`** — reset to the pre-append offset so the
-    ///    next append re-uses the slot.
-    /// 2. **File length** — `set_len(write_offset)` truncates the
-    ///    on-disk record. The `let _ =` is intentional best-effort:
-    ///    if the truncate itself fails (e.g., disk full, EROFS),
-    ///    the WAL is in an undefined state but no reader can
-    ///    legitimately observe partial commits because
-    ///    `last_commit_seq` was NOT yet bumped — replay sees the
-    ///    record as orphan and stops at the first decode error.
-    /// 3. **`appends_since_sync`** — restored to its pre-increment
-    ///    value so the next append's sync-policy decision is based
-    ///    on the correct count. This is the piece the verify-failure
-    ///    inline rollback in `append_commit` SKIPS, because verify
-    ///    runs BEFORE `increment_pending_sync_count`. Any reordering
-    ///    that puts the increment before verify MUST also start
-    ///    resetting this counter on verify failure.
-    ///
-    /// Note: `last_commit_seq` is NOT yet updated when this function
-    /// is reachable, so the strict-monotonic invariant is preserved
-    /// without explicit rollback of that field.
+    /// Remove a failed append durably before reusing its offset or sequence.
+    /// `last_commit_seq` is only an in-memory field: leaving it unchanged does
+    /// NOT prevent recovery from replaying a fully encoded record on disk.
+    /// A failed truncate or rollback sync therefore seals the writer instead
+    /// of pretending that the pre-append frontier has been restored.
     fn rollback_failed_append(
         &mut self,
         write_offset: u64,
         pending_before: u32,
         error: WalWriteError,
     ) -> WalWriteError {
-        self.write_pos = write_offset;
-        let _ = self.file.set_len(write_offset);
         self.appends_since_sync = pending_before;
+        if let Err(rollback_error) = self.truncate_and_sync_rollback(write_offset) {
+            return self.require_recovery(format!(
+                "{error}; rollback to offset {write_offset} failed: {rollback_error}"
+            ));
+        }
+        self.write_pos = write_offset;
         error
+    }
+
+    fn require_recovery(&mut self, detail: String) -> WalWriteError {
+        let reason = self.recovery_required.get_or_insert(detail);
+        error!(reason = %reason, "wal_recovery_required");
+        WalWriteError::RecoveryRequired {
+            detail: reason.clone(),
+        }
+    }
+
+    fn truncate_and_sync_rollback(&self, write_offset: u64) -> std::io::Result<()> {
+        #[cfg(test)]
+        if self.fail_rollback_truncate {
+            return Err(std::io::Error::other("injected rollback truncate failure"));
+        }
+        self.file.set_len(write_offset)?;
+        #[cfg(test)]
+        if self.fail_rollback_sync {
+            return Err(std::io::Error::other("injected rollback sync failure"));
+        }
+        // Mandatory even under Manual/EveryN: removing an unacknowledged
+        // record is a durability operation, not a deferred successful append.
+        self.file.sync_all()
     }
 
     fn validate_coalesced_commits(
@@ -757,9 +783,7 @@ impl WalWriter {
         op_id: u64,
     ) -> std::result::Result<(), WalWriteError> {
         if let Err(error) = self.maybe_verify_coalesced_write(base_offset, coalesced_buf, op_id) {
-            self.write_pos = base_offset;
-            let _ = self.file.set_len(base_offset);
-            return Err(error);
+            return Err(self.rollback_failed_append(base_offset, self.appends_since_sync, error));
         }
         Ok(())
     }
@@ -776,26 +800,36 @@ impl WalWriter {
         Ok(())
     }
 
-    fn raw_append(&mut self, data: &[u8]) -> std::io::Result<()> {
-        if let Err(e) = self.file.write_all_at(data, self.write_pos) {
-            // Truncate to write_pos to remove any partially written bytes.
-            let _ = self.file.set_len(self.write_pos);
-            return Err(e);
-        }
-        let Ok(len_u64) = u64::try_from(data.len()) else {
-            let _ = self.file.set_len(self.write_pos);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "data length exceeds u64",
-            ));
-        };
-        self.write_pos = self.write_pos.checked_add(len_u64).ok_or_else(|| {
-            std::io::Error::new(
-                std::io::ErrorKind::FileTooLarge,
-                "write position overflowed",
-            )
+    fn raw_append(&mut self, data: &[u8]) -> std::result::Result<(), WalWriteError> {
+        // Validate BEFORE I/O. A preflight error must not trigger a truncate
+        // to an invalid offset (which could extend, rather than shrink, a WAL).
+        let len_u64 = u64::try_from(data.len()).map_err(|_| WalWriteError::FormatViolation {
+            detail: "data length exceeds u64".to_owned(),
         })?;
+        let next_pos = self.write_pos.checked_add(len_u64).ok_or_else(|| {
+            WalWriteError::FormatViolation {
+                detail: "write position overflowed".to_owned(),
+            }
+        })?;
+        if let Err(source) = self.write_append_bytes(data) {
+            let error = WalWriteError::AppendIo {
+                source,
+                bytes_attempted: data.len(),
+            };
+            return Err(self.rollback_failed_append(self.write_pos, self.appends_since_sync, error));
+        }
+        self.write_pos = next_pos;
         Ok(())
+    }
+
+    fn write_append_bytes(&self, data: &[u8]) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(limit) = self.fail_append_after {
+            self.file
+                .write_all_at(&data[..limit.min(data.len())], self.write_pos)?;
+            return Err(std::io::Error::other("injected failure after partial append"));
+        }
+        self.file.write_all_at(data, self.write_pos)
     }
 
     fn verify_written_record(
@@ -891,6 +925,10 @@ impl WalWriter {
 }
 
 // ── Tests ────────────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+#[path = "wal_writer/rollback_tests.rs"]
+mod rollback_tests;
 
 #[cfg(test)]
 mod tests {
