@@ -64103,6 +64103,58 @@ mod tests {
         );
     }
 
+    /// bd-cnmpm: a checkpointed transaction must never be replayed again. The
+    /// old writer left `s_sequence` at its mkfs value and restarted at 1 every
+    /// mount, so the next open's replay found the last checkpointed transaction
+    /// at the head of the log and re-applied it — rolling back anything written
+    /// after it outside the journal. Now the clean boundary advances
+    /// `s_sequence` past it and the scan stops there.
+    #[test]
+    fn ext4_checkpointed_jbd2_transaction_is_not_replayed_again_bd_cnmpm() {
+        let cx = Cx::for_testing();
+        let Some((mut fs, dev, _tmp)) = open_writable_ext4_mkfs_with_device(64) else {
+            oracle_unavailable("ext4 image formatter");
+            return;
+        };
+        assert!(
+            fs.attach_ext4_internal_jbd2_writer(&cx)
+                .expect("attach journal")
+        );
+        let attr = fs
+            .create(&cx, InodeNumber(2), OsStr::new("stale.bin"), 0o644, 0, 0)
+            .expect("create");
+        fs.write(&cx, attr.ino, 0, &[0x11_u8; 4096])
+            .expect("journalled write");
+        fs.flush_mvcc_to_device(&cx).expect("journalled boundary");
+        drop(fs);
+
+        // Session 2: a writer that does not journal overwrites the file.
+        let second_dev = TestDevice::from_vec(dev.snapshot_bytes());
+        let mut second =
+            OpenFs::from_device(&cx, Box::new(second_dev.clone()), &OpenOptions::default())
+                .expect("reopen");
+        second.enable_writes(&cx).expect("enable writes");
+        second
+            .write(&cx, attr.ino, 0, &[0x33_u8; 4096])
+            .expect("unjournalled overwrite");
+        second.flush_mvcc_to_device(&cx).expect("direct boundary");
+        let after_second = second_dev.snapshot_bytes();
+        drop(second);
+
+        // Session 3: replay must not resurrect session 1's 0x11 bytes.
+        let third = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(after_second)),
+            &OpenOptions::default(),
+        )
+        .expect("reopen with replay");
+        assert_eq!(
+            third.read(&cx, attr.ino, 0, 4096).expect("read"),
+            vec![0x33_u8; 4096],
+            "a checkpointed transaction was replayed again and rolled the file back"
+        );
+    }
+
     /// bd-cnmpm: a crash after the JBD2 commit record is durable but before the
     /// checkpoint must leave a journal that the KERNEL's tools replay. Before the
     /// fix the writer never set `s_start` or needs_recovery, so e2fsck saw an
