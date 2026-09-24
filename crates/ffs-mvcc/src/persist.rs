@@ -30,8 +30,9 @@ use ffs_error::{FfsError, Result};
 use ffs_types::{BlockNumber, CommitSeq};
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
-use std::fs::{self, File, OpenOptions};
+use std::fs::{File, OpenOptions};
 use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
+use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
 /// Configuration options for persistent MVCC storage.
@@ -188,7 +189,7 @@ const CHECKPOINT_HEADER_SIZE: usize = 28;
 /// | Caller                | store | wal   | stats | Notes                |
 /// |-----------------------|-------|-------|-------|----------------------|
 /// | `commit_with_options` | W     | W     | W     | full commit pipeline |
-/// | `checkpoint`          | R     | -     | W     | stats nested in store|
+/// | `checkpoint`          | R     | R     | W     | publication guarded  |
 /// | `truncate_wal`        | R     | W     | R, W  | brief stats(R) gate  |
 ///
 /// Acquiring `wal` before `store` (e.g., a hypothetical `repack_wal`
@@ -464,6 +465,12 @@ impl PersistentMvccStore {
             .collect();
 
         let mut store_guard = self.store.write();
+        let mut wal_guard = self.wal.write();
+        wal_guard
+            .ensure_ready()
+            .map_err(|error| CommitError::DurabilityFailure {
+                detail: format!("WAL writer unavailable: {error}"),
+            })?;
         let writes: Vec<wal::WalWrite> = store_guard
             .resolved_writes_for_commit(&txn)?
             .into_iter()
@@ -481,7 +488,6 @@ impl PersistentMvccStore {
             writes,
         };
 
-        let mut wal_guard = self.wal.write();
         if let Err(error) = wal_guard.append_commit(&wal_commit) {
             rollback_in_memory_commit(
                 &mut store_guard,
@@ -578,14 +584,31 @@ impl PersistentMvccStore {
     ///
     /// Returns an error if the checkpoint cannot be written.
     pub fn checkpoint(&self, checkpoint_path: impl AsRef<Path>) -> Result<()> {
-        let path = checkpoint_path.as_ref();
+        self.checkpoint_with_directory_sync(checkpoint_path.as_ref(), File::sync_all)
+    }
 
-        // Hold the store read lock through snapshot collection AND stats update.
-        // This prevents a concurrent commit() from advancing next_commit between
-        // our snapshot and the stats.checkpoint_commit_seq write, which would let
-        // a subsequent truncate_wal() pass the staleness check against a stale
-        // checkpoint_commit_seq value.
+    /// Keep the real publication protocol shared with fault-injection tests.
+    /// Only the final directory-sync operation is replaceable by the test.
+    fn checkpoint_with_directory_sync(
+        &self,
+        path: &Path,
+        sync_directory: impl FnOnce(&File) -> std::io::Result<()>,
+    ) -> Result<()> {
+        // Both the snapshot and WAL health must remain stable until the
+        // checkpoint horizon is published. In particular, sync() can fail
+        // independently of commit(), so the store lock alone is insufficient.
         let store_guard = self.store.read();
+        let wal_guard = self.wal.read();
+        wal_guard.ensure_ready().map_err(FfsError::from)?;
+        validate_checkpoint_destination(path, wal_guard.file())?;
+        let parent = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."));
+        let directory = File::open(parent)?;
+        if !directory.metadata()?.is_dir() {
+            return Err(FfsError::Format("checkpoint parent is not a directory".to_owned()));
+        }
         let next_txn = store_guard.next_txn;
         let next_commit = store_guard.next_commit;
 
@@ -602,12 +625,14 @@ impl PersistentMvccStore {
             .collect();
         versions_snapshot.sort_unstable_by_key(|(block, _)| *block);
 
-        // Write to temp file first (still holding store read lock to block
-        // concurrent commits — the file I/O cost is acceptable because
-        // checkpoint() is an infrequent, explicitly requested operation).
-        let temp_path = path.with_extension("tmp");
+        // A fixed .tmp sibling collides with concurrent checkpoint calls and
+        // can even name the live WAL. Allocate exclusively in the destination
+        // directory; the encoded checkpoint format itself stays unchanged.
+        let temporary = tempfile::Builder::new()
+            .prefix(".ffs-checkpoint-")
+            .tempfile_in(parent)?;
         {
-            let file = File::create(&temp_path)?;
+            let file = temporary.as_file().try_clone()?;
             let mut writer = BufWriter::new(file);
             write_checkpoint(&mut writer, next_txn, next_commit, &versions_snapshot)?;
             writer.flush()?;
@@ -617,15 +642,10 @@ impl PersistentMvccStore {
                 .sync_all()?;
         }
 
-        // Atomic rename
-        fs::rename(&temp_path, path)?;
-
-        // Sync the parent directory to ensure the rename is durable.
-        if let Some(parent) = path.parent()
-            && let Ok(dir) = File::open(parent)
-        {
-            let _ = dir.sync_all();
-        }
+        temporary.persist(path).map_err(|error| FfsError::Io(error.error))?;
+        // A durable file is not yet a durable directory entry. Never authorize
+        // WAL truncation if rename publication could still be lost on restart.
+        sync_directory(&directory)?;
 
         // Update stats while still holding the store read lock, ensuring
         // checkpoint_commit_seq is consistent with the actual store state.
@@ -635,6 +655,7 @@ impl PersistentMvccStore {
             stats.checkpoint_commit_seq = next_commit.saturating_sub(1);
         }
 
+        drop(wal_guard);
         drop(store_guard);
 
         Ok(())
@@ -655,6 +676,11 @@ impl PersistentMvccStore {
         // store write lock) from sneaking in between the freshness check and the
         // destructive WAL rewrite.
         let store_guard = self.store.read();
+        let mut wal_guard = self.wal.write();
+        // An ambiguous append may have been rolled back only in memory. A
+        // previously valid checkpoint horizon must not permit discarding that
+        // unresolved WAL tail; recovery has to resolve it first.
+        wal_guard.ensure_ready().map_err(FfsError::from)?;
         let current_commit_seq = store_guard.next_commit.saturating_sub(1);
         let checkpoint_commit_seq = self.stats.read().checkpoint_commit_seq;
         if current_commit_seq > checkpoint_commit_seq {
@@ -664,7 +690,6 @@ impl PersistentMvccStore {
         }
 
         let header_size = {
-            let mut wal_guard = self.wal.write();
             let file = wal_guard.file_mut();
 
             // Rewrite just the header
@@ -689,16 +714,39 @@ impl PersistentMvccStore {
             header_size
         };
 
-        drop(store_guard);
-
         // Update stats
         {
             let mut stats = self.stats.write();
             stats.wal_size_bytes = header_size;
         }
 
+        drop(wal_guard);
+        drop(store_guard);
+
         Ok(())
     }
+}
+
+/// Reject direct paths, hard links and symlinks to the active recovery log.
+/// The caller holds the WAL lock and must exclude external path replacement
+/// for the duration of checkpoint publication.
+fn validate_checkpoint_destination(path: &Path, wal_file: &File) -> Result<()> {
+    if path.file_name().is_none() {
+        return Err(FfsError::Format("checkpoint destination must name a file".to_owned()));
+    }
+    match path.metadata() {
+        Ok(destination) => {
+            let wal = wal_file.metadata()?;
+            if destination.dev() == wal.dev() && destination.ino() == wal.ino() {
+                return Err(FfsError::Format(
+                    "checkpoint destination aliases the active WAL".to_owned(),
+                ));
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
 }
 
 /// Reverse an in-memory commit when the WAL append (or any other
@@ -1150,6 +1198,10 @@ pub fn apply_wal_commit(store: &mut MvccStore, commit: &WalCommit) {
         store.versions.entry(write.block).or_default().push(version);
     }
 }
+
+#[cfg(test)]
+#[path = "persist/checkpoint_publication_tests.rs"]
+mod checkpoint_publication_tests;
 
 #[cfg(test)]
 mod tests {
