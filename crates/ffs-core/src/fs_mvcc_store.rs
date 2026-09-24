@@ -702,17 +702,20 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         snapshot: Snapshot,
     ) -> FfsResult<(BlockBuf, Option<Vec<u8>>)> {
         // Resolve the ancestor at the CALLER's snapshot, independent of this
-        // device's own read-your-writes view. A version at `snapshot` → the store
-        // re-derives the base from its chain (record no base); otherwise the block
-        // is only on the raw base device → return its bytes AND record them as
-        // `staged_base` (mirrors the auto-commit rmw path).
-        if let Some(buf) = self.store.read_visible_block_buf(block, snapshot) {
-            Ok((buf, None))
+        // device's own read-your-writes view. Retain the exact before-image even
+        // when it came from MVCC: the caller can stage a batched transaction and
+        // lose this version to pruning before commit. Re-deriving the ancestor
+        // from that pruned chain would spuriously reject a disjoint merge. This
+        // has the same owned-base contract as the auto-commit RMW paths above;
+        // retaining bytes does not authorize overlapping changes or pin a read
+        // snapshot that the caller has not registered.
+        let buf = if let Some(buf) = self.store.read_visible_block_buf(block, snapshot) {
+            buf
         } else {
-            let device = self.base.read_block(cx, block)?;
-            let base = device.as_slice().to_vec();
-            Ok((device, Some(base)))
-        }
+            self.base.read_block(cx, block)?
+        };
+        let base = buf.as_slice().to_vec();
+        Ok((buf, Some(base)))
     }
 
     fn block_size(&self) -> u32 {
@@ -725,6 +728,165 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
 
     fn sync(&self, cx: &Cx) -> FfsResult<()> {
         self.base.sync(cx)
+    }
+}
+
+#[cfg(test)]
+mod block_device_tests {
+    use super::*;
+    use ffs_block::{ByteBlockDevice, FileByteDevice};
+    use ffs_mvcc::ConflictPolicy;
+    use tempfile::NamedTempFile;
+
+    const BLOCK_SIZE: u32 = 4096;
+    const BLOCK_COUNT: usize = 4;
+    const BLOCK: BlockNumber = BlockNumber(1);
+
+    struct Fixture {
+        image: NamedTempFile,
+        store: Arc<FsMvccStore>,
+        device: FsMvccBlockDevice<ByteBlockDevice<FileByteDevice>>,
+    }
+
+    impl Fixture {
+        fn new(store: FsMvccStore) -> Self {
+            let image = NamedTempFile::new().expect("image");
+            std::fs::write(image.path(), vec![0xA5; BLOCK_SIZE as usize * BLOCK_COUNT])
+                .expect("initialize image");
+            let base = ByteBlockDevice::new(
+                FileByteDevice::open(image.path()).expect("open image"),
+                BLOCK_SIZE,
+            )
+            .expect("block device");
+            let store = Arc::new(store);
+            let device = FsMvccBlockDevice::new_unregistered(
+                base,
+                Arc::clone(&store),
+                store.current_snapshot(),
+            )
+            .with_read_your_writes();
+            Self {
+                image,
+                store,
+                device,
+            }
+        }
+
+        fn sharded() -> Self {
+            let store = FsMvccStore::sharded();
+            if let FsMvccStore::Sharded(shards) = &store {
+                shards.set_conflict_policy(ConflictPolicy::SafeMerge);
+            }
+            Self::new(store)
+        }
+
+        fn commit(&self, block: BlockNumber, data: Vec<u8>) -> CommitSeq {
+            let mut txn = self.store.begin();
+            txn.stage_write(block, data);
+            self.store.commit(txn).expect("commit")
+        }
+
+        fn assert_image_unchanged(&self) {
+            assert_eq!(
+                std::fs::read(self.image.path()).expect("read image"),
+                vec![0xA5; BLOCK_SIZE as usize * BLOCK_COUNT]
+            );
+        }
+    }
+
+    #[test]
+    fn merge_ancestor_retains_the_callers_snapshot_not_the_latest_view() {
+        for store in [FsMvccStore::single(), FsMvccStore::sharded()] {
+            let fixture = Fixture::new(store);
+            let cx = Cx::for_testing();
+            let original = vec![0x11; BLOCK_SIZE as usize];
+            fixture.commit(BLOCK, original.clone());
+            let snapshot = fixture.store.current_snapshot();
+            fixture.commit(BLOCK, vec![0x22; BLOCK_SIZE as usize]);
+
+            let (bytes, base) = fixture
+                .device
+                .read_merge_ancestor_at_snapshot(&cx, BLOCK, snapshot)
+                .expect("snapshot ancestor");
+            assert_eq!(bytes.as_slice(), original);
+            assert_eq!(base.as_deref(), Some(original.as_slice()));
+            assert_eq!(
+                fixture.device.read_block(&cx, BLOCK).expect("latest").as_slice(),
+                vec![0x22; BLOCK_SIZE as usize]
+            );
+            fixture.assert_image_unchanged();
+        }
+    }
+
+    #[test]
+    fn captured_merge_ancestor_survives_pruning_before_batched_commit() {
+        let fixture = Fixture::sharded();
+        let cx = Cx::for_testing();
+        let original = vec![0x11; BLOCK_SIZE as usize];
+        fixture.commit(BLOCK, original.clone());
+        let mut delayed = fixture.store.begin();
+        let snapshot = delayed.snapshot();
+        let (bytes, base) = fixture
+            .device
+            .read_merge_ancestor_at_snapshot(&cx, BLOCK, snapshot)
+            .expect("capture ancestor");
+        let mut staged = bytes.into_inner();
+        staged[0] = 0x22;
+
+        let mut peer = original;
+        peer[1] = 0x33;
+        fixture.commit(BLOCK, peer.clone());
+        fixture.store.prune_safe();
+        assert!(fixture.store.read_visible(BLOCK, snapshot).is_none());
+        delayed.stage_write_with_proof_and_base(
+            BLOCK,
+            staged,
+            MergeProof::independent_keys(&[(0, 1)]),
+            base,
+        );
+        fixture.store.commit(delayed).expect("disjoint merge after prune");
+
+        peer[0] = 0x22;
+        assert_eq!(
+            fixture.device.read_block(&cx, BLOCK).expect("merged block").as_slice(),
+            peer
+        );
+        fixture.assert_image_unchanged();
+    }
+
+    #[test]
+    fn captured_merge_ancestor_still_rejects_overlapping_writes_after_prune() {
+        let fixture = Fixture::sharded();
+        let cx = Cx::for_testing();
+        fixture.commit(BLOCK, vec![0x11; BLOCK_SIZE as usize]);
+        let mut delayed = fixture.store.begin();
+        let (bytes, base) = fixture
+            .device
+            .read_merge_ancestor_at_snapshot(&cx, BLOCK, delayed.snapshot())
+            .expect("capture ancestor");
+        let mut staged = bytes.into_inner();
+        let mut peer = staged.clone();
+        staged[0] = 0x22;
+        peer[0] = 0x33;
+        fixture.commit(BLOCK, peer.clone());
+        fixture.store.prune_safe();
+        let before = fixture.store.current_snapshot();
+        delayed.stage_write_with_proof_and_base(
+            BLOCK,
+            staged,
+            MergeProof::independent_keys(&[(0, 1)]),
+            base,
+        );
+        assert!(matches!(
+            fixture.store.commit(delayed),
+            Err(CommitError::Conflict { .. })
+        ));
+        assert_eq!(fixture.store.current_snapshot(), before);
+        assert_eq!(
+            fixture.device.read_block(&cx, BLOCK).expect("peer block").as_slice(),
+            peer
+        );
+        fixture.assert_image_unchanged();
     }
 }
 #[cfg(test)]
