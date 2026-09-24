@@ -589,6 +589,13 @@ enum Ext4MetaBlock {
     BlockBitmap(ffs_ondisk::Ext4GroupDesc),
     /// A group's inode bitmap, checked against that group's descriptor.
     InodeBitmap(ffs_ondisk::Ext4GroupDesc),
+    /// One block of a group's inode table. Only slots whose inode-bitmap bit is
+    /// set are checksum-verified; free slots carry no valid checksum.
+    InodeTable {
+        group: u32,
+        first_index: u32,
+        inode_bitmap: std::sync::Arc<Vec<u8>>,
+    },
 }
 
 /// Checksum validator for ext4's fixed-location metadata (bd-jufod): the
@@ -679,7 +686,45 @@ impl Ext4MetadataValidator {
                 .and_then(|raw| ffs_ondisk::Ext4GroupDesc::parse_from_bytes(raw, desc_size).ok());
             groups.push(gd);
         }
-        Ok(Self::new(sb, &groups))
+        let mut validator = Self::new(sb, &groups);
+        if !sb.has_metadata_csum() || sb.inode_size < 128 {
+            return Ok(validator);
+        }
+        // Inode tables: snapshot each initialized group's inode bitmap so the
+        // per-block check knows which slots are live.
+        let inode_size = u64::from(sb.inode_size);
+        let table_bytes = u64::from(sb.inodes_per_group).saturating_mul(inode_size);
+        let table_blocks = table_bytes.div_ceil(block_size);
+        let slots_per_block = block_size / inode_size;
+        for (index, gd) in groups.iter().enumerate() {
+            let (Ok(group), Some(gd)) = (u32::try_from(index), gd) else {
+                continue;
+            };
+            if gd.flags & ffs_ondisk::ext4::EXT4_BG_INODE_UNINIT != 0
+                || gd.inode_bitmap == 0
+                || gd.inode_table == 0
+            {
+                continue;
+            }
+            let Ok(bitmap) = device.read_block(cx, BlockNumber(gd.inode_bitmap)) else {
+                continue;
+            };
+            let bitmap = std::sync::Arc::new(bitmap.as_slice().to_vec());
+            for n in 0..table_blocks {
+                let Ok(first_index) = u32::try_from(n.saturating_mul(slots_per_block)) else {
+                    break;
+                };
+                validator.blocks.insert(
+                    gd.inode_table.saturating_add(n),
+                    Ext4MetaBlock::InodeTable {
+                        group,
+                        first_index,
+                        inode_bitmap: std::sync::Arc::clone(&bitmap),
+                    },
+                );
+            }
+        }
+        Ok(validator)
     }
 
     fn checksum_issue(what: String) -> BlockVerdict {
@@ -741,6 +786,50 @@ impl BlockValidator for Ext4MetadataValidator {
                     Err(_) => Self::checksum_issue(format!(
                         "ext4 block bitmap checksum mismatch in block {block}"
                     )),
+                }
+            }
+            Ext4MetaBlock::InodeTable {
+                group,
+                first_index,
+                inode_bitmap,
+            } => {
+                let inode_size = usize::from(self.sb.inode_size);
+                let mut bad = Vec::new();
+                for (slot, raw) in bytes.chunks_exact(inode_size.max(1)).enumerate() {
+                    let Some(index) = u32::try_from(slot)
+                        .ok()
+                        .and_then(|slot| first_index.checked_add(slot))
+                    else {
+                        break;
+                    };
+                    if index >= self.sb.inodes_per_group {
+                        break;
+                    }
+                    let Ok(bit) = usize::try_from(index) else {
+                        break;
+                    };
+                    let live = inode_bitmap
+                        .get(bit / 8)
+                        .is_some_and(|byte| byte & (1 << (bit % 8)) != 0);
+                    if !live {
+                        continue;
+                    }
+                    let ino = group
+                        .saturating_mul(self.sb.inodes_per_group)
+                        .saturating_add(index)
+                        .saturating_add(1);
+                    if ffs_ondisk::ext4::verify_inode_checksum(raw, seed, ino, self.sb.inode_size)
+                        .is_err()
+                    {
+                        bad.push(ino);
+                    }
+                }
+                if bad.is_empty() {
+                    BlockVerdict::Clean
+                } else {
+                    Self::checksum_issue(format!(
+                        "ext4 inode checksum mismatch in block {block} for inodes {bad:?}"
+                    ))
                 }
             }
             Ext4MetaBlock::InodeBitmap(gd) => {

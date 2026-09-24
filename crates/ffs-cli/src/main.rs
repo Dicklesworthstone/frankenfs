@@ -13640,6 +13640,21 @@ mod tests {
             report.findings
         );
 
+        // The root inode (2) is slot 1 of group 0's inode table; flip a byte of
+        // its i_flags so its checksum no longer matches.
+        let mut inode_bad = clean.clone();
+        let root_inode_byte = usize::try_from(gd0.inode_table).expect("fits") * bs
+            + usize::from(sb.inode_size)
+            + 0x20;
+        inode_bad[root_inode_byte] ^= 0x01;
+        let report = scrub(&inode_bad);
+        assert!(
+            report.findings.iter().any(|f| f.block.0 == gd0.inode_table
+                && f.kind == ffs_repair::scrub::CorruptionKind::ChecksumMismatch),
+            "a corrupted live inode must be reported: {:?}",
+            report.findings
+        );
+
         let mut gd_bad = clean;
         gd_bad[gdt_off + 0x0C] ^= 0x01; // bg_free_blocks_count_lo
         let report = scrub(&gd_bad);
