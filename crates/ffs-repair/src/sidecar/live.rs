@@ -14,9 +14,9 @@
 //! advisory locks cannot exclude kernel mounts or non-cooperating writers.
 
 use super::{
-    Archive, DIGEST_BYTES, GROUP_PREFIX_BYTES, HEADER_BYTES, Header, MemoryGroup,
-    ProtectionInfo, checkpoint, corrupt, digest_parts, hash_image, load_source, parent_path,
-    source_digest, symbol_digest,
+    Archive, DIGEST_BYTES, GROUP_PREFIX_BYTES, HEADER_BYTES, Header, MemoryGroup, ProtectionInfo,
+    checkpoint, corrupt, digest_parts, hash_image, load_source, parent_path, source_digest,
+    symbol_digest,
 };
 use crate::codec::{decode_group_with_owned_repair_symbols, encode_group};
 use asupersync::Cx;
@@ -107,20 +107,26 @@ impl SidecarImageDevice {
         if !metadata.is_file()
             || (metadata.dev(), metadata.ino()) == (image_meta.dev(), image_meta.ino())
         {
-            return Err(corrupt("image and repair archive must be distinct regular files"));
+            return Err(corrupt(
+                "image and repair archive must be distinct regular files",
+            ));
         }
         file.try_lock().map_err(io::Error::from)?;
         let mut raw = [0; HEADER_BYTES];
         file.read_exact_at(&mut raw, 0)?;
         if &raw[..8] == PENDING_MAGIC {
-            return Err(corrupt("repair archive has an unfinished write epoch; reconcile offline"));
+            return Err(corrupt(
+                "repair archive has an unfinished write epoch; reconcile offline",
+            ));
         }
         let header = Header::decode(&raw)?;
         if metadata.len() != header.expected_len()? || image_meta.len() != header.image_bytes {
             return Err(corrupt("live repair image or archive length mismatch"));
         }
         if hash_image(cx, &image, header.image_bytes)? != header.snapshot_digest {
-            return Err(corrupt("image differs from its protection point; refusing implicit rollback"));
+            return Err(corrupt(
+                "image differs from its protection point; refusing implicit rollback",
+            ));
         }
         let archive = Archive { file, header };
         let mut tables = Vec::new();
@@ -137,7 +143,9 @@ impl SidecarImageDevice {
                 if source_digest(&archive.header, source.first + index as u64, bytes)
                     != record.hashes[index]
                 {
-                    return Err(corrupt("source digest table differs from the admitted image"));
+                    return Err(corrupt(
+                        "source digest table differs from the admitted image",
+                    ));
                 }
             }
             tables.push(Self::table_digest(&archive.header, group, &record.hashes)?);
@@ -168,7 +176,9 @@ impl SidecarImageDevice {
             if let Some(state) = self.state.try_lock_for(Duration::from_millis(10)) {
                 checkpoint(cx)?;
                 if matches!(state.phase, Phase::Poisoned) {
-                    return Err(corrupt("live repair device is poisoned after an I/O failure"));
+                    return Err(corrupt(
+                        "live repair device is poisoned after an I/O failure",
+                    ));
                 }
                 return Ok(state);
             }
@@ -176,7 +186,9 @@ impl SidecarImageDevice {
     }
 
     fn range_end(&self, offset: ByteOffset, length: usize) -> Result<u64> {
-        offset.0.checked_add(length as u64)
+        offset
+            .0
+            .checked_add(length as u64)
             .filter(|&end| end <= self.image_bytes)
             .ok_or_else(|| corrupt("live repair I/O exceeds fixed image geometry"))
     }
@@ -191,19 +203,26 @@ impl SidecarImageDevice {
     fn table_digest(header: &Header, group: u32, hashes: &[[u8; 32]]) -> Result<[u8; 32]> {
         let (_, count) = header.group_geometry(group)?;
         if hashes.len() != count as usize {
-            return Err(corrupt("source digest table has the wrong number of blocks"));
+            return Err(corrupt(
+                "source digest table has the wrong number of blocks",
+            ));
         }
         let mut metadata = header.prefix(group)?.to_vec();
         for hash in hashes {
             metadata.extend_from_slice(hash);
         }
-        Ok(digest_parts(b"ffs-sidecar-group-v2", &[&header.seed, &metadata]))
+        Ok(digest_parts(
+            b"ffs-sidecar-group-v2",
+            &[&header.seed, &metadata],
+        ))
     }
 
     fn check_table(state: &State, group: u32, hashes: &[[u8; 32]]) -> Result<()> {
         let actual = Self::table_digest(&state.archive.header, group, hashes)?;
         if state.tables.get(group as usize) != Some(&actual) {
-            return Err(corrupt("repair source table changed from the admitted generation"));
+            return Err(corrupt(
+                "repair source table changed from the admitted generation",
+            ));
         }
         Ok(())
     }
@@ -220,7 +239,10 @@ impl SidecarImageDevice {
             let offset = header.group_offset(group)?;
             state.archive.file.read_exact_at(&mut metadata, offset)?;
             let mut digest = [0; DIGEST_BYTES];
-            state.archive.file.read_exact_at(&mut digest, offset + metadata.len() as u64)?;
+            state
+                .archive
+                .file
+                .read_exact_at(&mut digest, offset + metadata.len() as u64)?;
             checkpoint(cx)?;
             if metadata[..GROUP_PREFIX_BYTES] != header.prefix(group)?
                 || digest != digest_parts(b"ffs-sidecar-group-v2", &[&header.seed, &metadata])
@@ -228,18 +250,29 @@ impl SidecarImageDevice {
             {
                 return Err(corrupt("live repair source digest metadata is corrupt"));
             }
-            state.cached_hashes = Some((group, metadata[GROUP_PREFIX_BYTES..]
-                .as_chunks::<DIGEST_BYTES>().0.to_vec()));
+            state.cached_hashes = Some((
+                group,
+                metadata[GROUP_PREFIX_BYTES..]
+                    .as_chunks::<DIGEST_BYTES>()
+                    .0
+                    .to_vec(),
+            ));
         }
         let relative = (block % u64::from(header.options.group_blocks)) as usize;
-        state.cached_hashes.as_ref().and_then(|(_, hashes)| hashes.get(relative)).copied()
+        state
+            .cached_hashes
+            .as_ref()
+            .and_then(|(_, hashes)| hashes.get(relative))
+            .copied()
             .ok_or_else(|| corrupt("live repair source digest is missing"))
     }
 
     fn read_source_block(&self, header: &Header, block: u64) -> Result<Vec<u8>> {
         let mut bytes = vec![0; header.options.block_size as usize];
-        self.image.read_exact_at(&mut bytes[..header.real_block_len(block)],
-            block * u64::from(header.options.block_size))?;
+        self.image.read_exact_at(
+            &mut bytes[..header.real_block_len(block)],
+            block * u64::from(header.options.block_size),
+        )?;
         Ok(bytes)
     }
 
@@ -252,17 +285,21 @@ impl SidecarImageDevice {
         checkpoint(cx)?;
         let expected = Self::expected_hash(cx, state, block)?;
         match self.read_source_block(&state.archive.header, block) {
-            Ok(bytes) if source_digest(&state.archive.header, block, &bytes) == expected => Ok(bytes),
-            Err(error) if !Self::media_error(&error) => Err(error),
-            _ if matches!(state.phase, Phase::Dirty) => {
-                Err(corrupt("source corruption during a dirty epoch; old parity is not current"))
+            Ok(bytes) if source_digest(&state.archive.header, block, &bytes) == expected => {
+                Ok(bytes)
             }
+            Err(error) if !Self::media_error(&error) => Err(error),
+            _ if matches!(state.phase, Phase::Dirty) => Err(corrupt(
+                "source corruption during a dirty epoch; old parity is not current",
+            )),
             _ => {
                 let group = (block / u64::from(state.archive.header.options.group_blocks)) as u32;
                 self.repair_group(cx, state, group)?;
                 let bytes = self.read_source_block(&state.archive.header, block)?;
                 if source_digest(&state.archive.header, block, &bytes) != expected {
-                    return Err(corrupt("live repair readback did not match the expected source"));
+                    return Err(corrupt(
+                        "live repair readback did not match the expected source",
+                    ));
                 }
                 Ok(bytes)
             }
@@ -296,25 +333,51 @@ impl SidecarImageDevice {
                 Err(error) => return Err(error),
             }
         }
-        if damaged.is_empty() { return Ok(0); }
-        let source = MemoryGroup { first, block_size: header.options.block_size, blocks };
-        let decoded = decode_group_with_owned_repair_symbols(cx, &source, &header.seed,
-            GroupNumber(group), BlockNumber(first), count, &damaged, record.symbols)?;
+        if damaged.is_empty() {
+            return Ok(0);
+        }
+        let source = MemoryGroup {
+            first,
+            block_size: header.options.block_size,
+            blocks,
+        };
+        let decoded = decode_group_with_owned_repair_symbols(
+            cx,
+            &source,
+            &header.seed,
+            GroupNumber(group),
+            BlockNumber(first),
+            count,
+            &damaged,
+            record.symbols,
+        )?;
         checkpoint(cx)?;
         let mut seen = BTreeSet::new();
         if !decoded.complete || decoded.recovered.len() != damaged.len() {
-            return Err(corrupt("live repair could not reconstruct every damaged block"));
+            return Err(corrupt(
+                "live repair could not reconstruct every damaged block",
+            ));
         }
         // Validate EVERY result and compare EVERY target before the first write.
         for recovered in &decoded.recovered {
-            let index = recovered.block.0.checked_sub(first)
+            let index = recovered
+                .block
+                .0
+                .checked_sub(first)
                 .filter(|&index| index < u64::from(count))
-                .ok_or_else(|| corrupt("live decoder returned a foreign target"))? as usize;
-            if !seen.insert(index) || damaged.binary_search(&(index as u32)).is_err()
+                .ok_or_else(|| corrupt("live decoder returned a foreign target"))?
+                as usize;
+            if !seen.insert(index)
+                || damaged.binary_search(&(index as u32)).is_err()
                 || recovered.data.len() != header.options.block_size as usize
                 || source_digest(header, recovered.block.0, &recovered.data) != record.hashes[index]
-            { return Err(corrupt("live decoder output failed source verification")); }
-            match (&before[index], self.read_source_block(header, recovered.block.0)) {
+            {
+                return Err(corrupt("live decoder output failed source verification"));
+            }
+            match (
+                &before[index],
+                self.read_source_block(header, recovered.block.0),
+            ) {
                 (Some(expected), Ok(current)) if *expected == current => {}
                 (None, Err(error)) if Self::media_error(&error) => {}
                 (_, Err(error)) => return Err(error),
@@ -323,8 +386,10 @@ impl SidecarImageDevice {
         }
         for recovered in &decoded.recovered {
             checkpoint(cx)?;
-            self.image.write_all_at(&recovered.data[..header.real_block_len(recovered.block.0)],
-                recovered.block.0 * u64::from(header.options.block_size))?;
+            self.image.write_all_at(
+                &recovered.data[..header.real_block_len(recovered.block.0)],
+                recovered.block.0 * u64::from(header.options.block_size),
+            )?;
         }
         self.image.sync_all()?;
         for recovered in &decoded.recovered {
@@ -336,8 +401,10 @@ impl SidecarImageDevice {
         Ok(damaged.len())
     }
 
-    fn fence(&self, cx: &Cx, state: &mut State) -> Result<()> {
-        if matches!(state.phase, Phase::Dirty) { return Ok(()); }
+    fn fence(cx: &Cx, state: &mut State) -> Result<()> {
+        if matches!(state.phase, Phase::Dirty) {
+            return Ok(());
+        }
         checkpoint(cx)?;
         let mut pending = state.archive.header.encode();
         pending[..8].copy_from_slice(PENDING_MAGIC);
@@ -349,14 +416,30 @@ impl SidecarImageDevice {
         checkpoint(cx)
     }
 
-    fn write_group(cx: &Cx, staged: &mut NamedTempFile, header: &Header,
-        group: u32, source: &MemoryGroup) -> Result<()> {
+    fn write_group(
+        cx: &Cx,
+        staged: &mut NamedTempFile,
+        header: &Header,
+        group: u32,
+        source: &MemoryGroup,
+    ) -> Result<()> {
         let mut metadata = header.prefix(group)?.to_vec();
         for (relative, bytes) in source.blocks.iter().enumerate() {
-            metadata.extend_from_slice(&source_digest(header, source.first + relative as u64, bytes));
+            metadata.extend_from_slice(&source_digest(
+                header,
+                source.first + relative as u64,
+                bytes,
+            ));
         }
-        let encoded = encode_group(cx, source, &header.seed, GroupNumber(group),
-            BlockNumber(source.first), source.blocks.len() as u32, header.options.repair_symbols)?;
+        let encoded = encode_group(
+            cx,
+            source,
+            &header.seed,
+            GroupNumber(group),
+            BlockNumber(source.first),
+            source.blocks.len() as u32,
+            header.options.repair_symbols,
+        )?;
         if encoded.repair_symbols.len() != header.options.repair_symbols as usize {
             return Err(corrupt("live encoder returned incomplete protection"));
         }
@@ -367,7 +450,13 @@ impl SidecarImageDevice {
             checkpoint(cx)?;
             staged.write_all(&symbol.esi.to_le_bytes())?;
             staged.write_all(&symbol.data)?;
-            staged.write_all(&symbol_digest(header, group, &digest, symbol.esi, &symbol.data))?;
+            staged.write_all(&symbol_digest(
+                header,
+                group,
+                &digest,
+                symbol.esi,
+                &symbol.data,
+            ))?;
         }
         Ok(())
     }
@@ -390,24 +479,35 @@ impl SidecarImageDevice {
             let mut hashes = Vec::with_capacity(source.blocks.len());
             for (relative, bytes) in source.blocks.iter().enumerate() {
                 let block = source.first + relative as u64;
-                let expected = state.changed.get(&block).unwrap_or(&record.hashes[relative]);
+                let expected = state
+                    .changed
+                    .get(&block)
+                    .unwrap_or(&record.hashes[relative]);
                 let actual = source_digest(&header, block, bytes);
                 if actual != *expected {
-                    return Err(corrupt("source changed outside the write epoch; refusing to bless corruption"));
+                    return Err(corrupt(
+                        "source changed outside the write epoch; refusing to bless corruption",
+                    ));
                 }
                 hashes.push(actual);
                 snapshot.update(&bytes[..header.real_block_len(block)]);
             }
             tables.push(Self::table_digest(&header, group, &hashes)?);
-            let changed = state.changed.range(source.first..source.first + source.blocks.len() as u64)
-                .next().is_some();
+            let changed = state
+                .changed
+                .range(source.first..source.first + source.blocks.len() as u64)
+                .next()
+                .is_some();
             if changed || record.invalid_symbols != 0 {
                 Self::write_group(cx, &mut staged, &header, group, &source)?;
             } else {
                 // Validated source/parity records can be copied without re-encoding.
                 let start = header.group_offset(group)?;
-                let end = if group + 1 < header.groups { header.group_offset(group + 1)? }
-                    else { header.expected_len()? };
+                let end = if group + 1 < header.groups {
+                    header.group_offset(group + 1)?
+                } else {
+                    header.expected_len()?
+                };
                 let mut raw = vec![0; (end - start) as usize];
                 state.archive.file.read_exact_at(&mut raw, start)?;
                 staged.write_all(&raw)?;
@@ -417,7 +517,9 @@ impl SidecarImageDevice {
         self.check_image_len()?;
         if hash_image(cx, &self.image, self.image_bytes)? != header.snapshot_digest
             || staged.as_file().metadata()?.len() != header.expected_len()?
-        { return Err(corrupt("live snapshot changed during refresh")); }
+        {
+            return Err(corrupt("live snapshot changed during refresh"));
+        }
         staged.as_file().write_all_at(&header.encode(), 0)?;
         staged.as_file().sync_all()?;
         let mut stored_header = [0; HEADER_BYTES];
@@ -426,7 +528,10 @@ impl SidecarImageDevice {
             return Err(corrupt("staged live protection header failed readback"));
         }
         // Read the staged archive back through the ordinary format validator.
-        let validation = Archive { file: staged.as_file().try_clone()?, header: header.clone() };
+        let validation = Archive {
+            file: staged.as_file().try_clone()?,
+            header: header.clone(),
+        };
         for group in 0..header.groups {
             let record = validation.read_group(cx, group)?;
             if record.invalid_symbols != 0
@@ -441,10 +546,14 @@ impl SidecarImageDevice {
         let old = state.archive.file.metadata()?;
         let named = std::fs::metadata(&self.sidecar_path)?;
         if (old.dev(), old.ino()) != (named.dev(), named.ino()) {
-            return Err(corrupt("repair archive path was replaced by another writer"));
+            return Err(corrupt(
+                "repair archive path was replaced by another writer",
+            ));
         }
         let parent = File::open(parent_path(&self.sidecar_path))?;
-        let file = staged.persist(&self.sidecar_path).map_err(|error| FfsError::Io(error.error))?;
+        let file = staged
+            .persist(&self.sidecar_path)
+            .map_err(|error| FfsError::Io(error.error))?;
         // Rename is committed. Finish the directory barrier despite cancellation.
         state.phase = Phase::Poisoned;
         state.archive = Archive { file, header };
@@ -484,12 +593,16 @@ impl SidecarImageDevice {
 }
 
 impl ByteDevice for SidecarImageDevice {
-    fn len_bytes(&self) -> u64 { self.image_bytes }
+    fn len_bytes(&self) -> u64 {
+        self.image_bytes
+    }
 
     fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
         checkpoint(cx)?;
         let end = self.range_end(offset, buf.len())?;
-        if buf.is_empty() { return Ok(()); }
+        if buf.is_empty() {
+            return Ok(());
+        }
         let mut state = self.lock(cx)?;
         self.check_image_len()?;
         let size = u64::from(state.archive.header.options.block_size);
@@ -498,8 +611,9 @@ impl ByteDevice for SidecarImageDevice {
             let bytes = self.verified_block(cx, &mut state, block)?;
             let start = offset.0.max(block * size);
             let stop = end.min((block + 1) * size);
-            result[(start - offset.0) as usize..(stop - offset.0) as usize]
-                .copy_from_slice(&bytes[(start - block * size) as usize..(stop - block * size) as usize]);
+            result[(start - offset.0) as usize..(stop - offset.0) as usize].copy_from_slice(
+                &bytes[(start - block * size) as usize..(stop - block * size) as usize],
+            );
         }
         checkpoint(cx)?;
         buf.copy_from_slice(&result);
@@ -509,7 +623,9 @@ impl ByteDevice for SidecarImageDevice {
     fn write_all_at(&self, cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<()> {
         checkpoint(cx)?;
         let end = self.range_end(offset, buf.len())?;
-        if buf.is_empty() { return Ok(()); }
+        if buf.is_empty() {
+            return Ok(());
+        }
         let mut state = self.lock(cx)?;
         self.check_image_len()?;
         let size = u64::from(state.archive.header.options.block_size);
@@ -523,7 +639,7 @@ impl ByteDevice for SidecarImageDevice {
                 .copy_from_slice(&buf[(start - offset.0) as usize..(stop - offset.0) as usize]);
             intended.push((block, source_digest(&state.archive.header, block, &bytes)));
         }
-        self.fence(cx, &mut state)?;
+        Self::fence(cx, &mut state)?;
         if let Err(error) = self.image.write_all_at(buf, offset.0) {
             state.phase = Phase::Poisoned;
             return Err(error.into());
@@ -564,12 +680,26 @@ mod tests {
             let image = dir.path().join("source.img");
             let sidecar = dir.path().join("source.ffs-rq");
             let original: Vec<u8> = (0_usize..16 * 512 + 37)
-                .map(|i| ((i * 31 + i / 512) % 251) as u8).collect();
+                .map(|i| ((i * 31 + i / 512) % 251) as u8)
+                .collect();
             std::fs::write(&image, &original).expect("source");
-            protect(&Cx::for_testing(), &image, &sidecar, SidecarOptions {
-                block_size: 512, group_blocks: 8, repair_symbols: 4,
-            }).expect("initial protection");
-            Self { _dir: dir, image, sidecar, original }
+            protect(
+                &Cx::for_testing(),
+                &image,
+                &sidecar,
+                SidecarOptions {
+                    block_size: 512,
+                    group_blocks: 8,
+                    repair_symbols: 4,
+                },
+            )
+            .expect("initial protection");
+            Self {
+                _dir: dir,
+                image,
+                sidecar,
+                original,
+            }
         }
 
         fn open(&self) -> SidecarImageDevice {
@@ -578,8 +708,12 @@ mod tests {
         }
 
         fn damage(&self, offset: u64, bytes: &[u8]) {
-            File::options().write(true).open(&self.image).expect("fault handle")
-                .write_all_at(bytes, offset).expect("injected damage");
+            File::options()
+                .write(true)
+                .open(&self.image)
+                .expect("fault handle")
+                .write_all_at(bytes, offset)
+                .expect("injected damage");
         }
     }
 
@@ -589,19 +723,31 @@ mod tests {
         let cx = Cx::for_testing();
         let mut expected = fixture.original.clone();
         let device = fixture.open();
-        device.write_all_at(&cx, ByteOffset(500), &[0x93; 90]).expect("cross-block write");
+        device
+            .write_all_at(&cx, ByteOffset(500), &[0x93; 90])
+            .expect("cross-block write");
         expected[500..590].fill(0x93);
-        device.write_all_at(&cx, ByteOffset(16 * 512 + 9), &[0x72; 28]).expect("partial tail");
+        device
+            .write_all_at(&cx, ByteOffset(16 * 512 + 9), &[0x72; 28])
+            .expect("partial tail");
         expected[16 * 512 + 9..].fill(0x72);
         assert!(device.protection(&cx).is_err());
         let mut read = [0; 90];
-        device.read_exact_at(&cx, ByteOffset(500), &mut read).expect("read own write");
+        device
+            .read_exact_at(&cx, ByteOffset(500), &mut read)
+            .expect("read own write");
         assert_eq!(read, [0x93; 90]);
         device.sync(&cx).expect("source and fresh parity ACK");
-        assert_eq!(device.protection(&cx).expect("fresh").snapshot_blake3,
-            blake3::hash(&expected).to_hex().to_string());
+        assert_eq!(
+            device.protection(&cx).expect("fresh").snapshot_blake3,
+            blake3::hash(&expected).to_hex().to_string()
+        );
         drop(device);
-        assert!(verify(&cx, &fixture.image, &fixture.sidecar).expect("latest archive").is_healthy());
+        assert!(
+            verify(&cx, &fixture.image, &fixture.sidecar)
+                .expect("latest archive")
+                .is_healthy()
+        );
         drop(fixture.open());
         fixture.damage(513, &[0xff; 90]);
         let output = fixture.image.with_extension("restored");
@@ -614,13 +760,18 @@ mod tests {
         let fixture = Fixture::new();
         let cx = Cx::for_testing();
         let device = fixture.open();
-        device.write_all_at(&cx, ByteOffset(20), &[0x91; 20]).expect("write");
+        device
+            .write_all_at(&cx, ByteOffset(20), &[0x91; 20])
+            .expect("write");
         drop(device);
         assert!(Archive::open(&cx, &fixture.sidecar).is_err());
         let error = SidecarImageDevice::open(&cx, &fixture.image, &fixture.sidecar)
             .expect_err("pending epoch");
         assert!(error.to_string().contains("unfinished"));
-        assert_eq!(&std::fs::read(&fixture.image).expect("source")[20..40], &[0x91; 20]);
+        assert_eq!(
+            &std::fs::read(&fixture.image).expect("source")[20..40],
+            &[0x91; 20]
+        );
         let output = fixture.image.with_extension("not-created");
         assert!(restore(&cx, &fixture.image, &fixture.sidecar, &output).is_err());
         assert!(!output.exists());
@@ -638,11 +789,16 @@ mod tests {
             let cut = std::env::var(CUT).expect("crash cut");
             if cut == "fence" {
                 let mut state = device.lock(&cx).expect("state");
-                device.fence(&cx, &mut state).expect("durable fence before source write");
+                SidecarImageDevice::fence(&cx, &mut state)
+                    .expect("durable fence before source write");
             } else {
-                device.write_all_at(&cx, ByteOffset(512), &[0x6d; 512]).expect("child write");
+                device
+                    .write_all_at(&cx, ByteOffset(512), &[0x6d; 512])
+                    .expect("child write");
                 if cut == "sync" {
-                    device.sync(&cx).expect("durable source and fresh protection");
+                    device
+                        .sync(&cx)
+                        .expect("durable source and fresh protection");
                 }
             }
             // No device drop, unmount, destructor or sync may repair this epoch.
@@ -651,9 +807,15 @@ mod tests {
         for cut in ["fence", "write", "sync"] {
             let fixture = Fixture::new();
             let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
-                .args(["--exact", "sidecar::live::tests::process_exit_before_sync_leaves_coverage_pending"])
-                .env(IMAGE, &fixture.image).env(ARCHIVE, &fixture.sidecar).env(CUT, cut)
-                .status().expect("child execution");
+                .args([
+                    "--exact",
+                    "sidecar::live::tests::process_exit_before_sync_leaves_coverage_pending",
+                ])
+                .env(IMAGE, &fixture.image)
+                .env(ARCHIVE, &fixture.sidecar)
+                .env(CUT, cut)
+                .status()
+                .expect("child execution");
             assert!(status.success(), "cut={cut}");
             let mut expected = fixture.original.clone();
             if cut != "fence" {
@@ -662,7 +824,11 @@ mod tests {
             assert_eq!(std::fs::read(&fixture.image).expect("source"), expected);
             let cx = Cx::for_testing();
             if cut == "sync" {
-                assert!(verify(&cx, &fixture.image, &fixture.sidecar).expect("committed").is_healthy());
+                assert!(
+                    verify(&cx, &fixture.image, &fixture.sidecar)
+                        .expect("committed")
+                        .is_healthy()
+                );
                 fixture.damage(512, &[0xff; 512]);
                 let output = fixture.image.with_extension("after-crash-restored");
                 restore(&cx, &fixture.image, &fixture.sidecar, &output).expect("latest epoch");
@@ -679,11 +845,25 @@ mod tests {
         let archive = std::fs::read(&fixture.sidecar).expect("archive");
         let device = fixture.open();
         let cx = Cx::for_testing();
-        assert!(device.write_all_at(&cx, ByteOffset(u64::MAX), &[1]).is_err());
-        assert!(device.write_all_at(&cx, ByteOffset(device.len_bytes() - 1), &[1; 2]).is_err());
+        assert!(
+            device
+                .write_all_at(&cx, ByteOffset(u64::MAX), &[1])
+                .is_err()
+        );
+        assert!(
+            device
+                .write_all_at(&cx, ByteOffset(device.len_bytes() - 1), &[1; 2])
+                .is_err()
+        );
         cx.set_cancel_requested(true);
-        assert!(matches!(device.write_all_at(&cx, ByteOffset(0), &[1]), Err(FfsError::Cancelled)));
-        assert_eq!(std::fs::read(&fixture.image).expect("source"), fixture.original);
+        assert!(matches!(
+            device.write_all_at(&cx, ByteOffset(0), &[1]),
+            Err(FfsError::Cancelled)
+        ));
+        assert_eq!(
+            std::fs::read(&fixture.image).expect("source"),
+            fixture.original
+        );
         assert_eq!(std::fs::read(&fixture.sidecar).expect("archive"), archive);
     }
 
@@ -692,13 +872,20 @@ mod tests {
         let fixture = Fixture::new();
         let device = fixture.open();
         let cx = Cx::for_testing();
-        device.write_all_at(&cx, ByteOffset(0), &[0x41; 100]).expect("write");
+        device
+            .write_all_at(&cx, ByteOffset(0), &[0x41; 100])
+            .expect("write");
         cx.set_cancel_requested(true);
         assert!(matches!(device.sync(&cx), Err(FfsError::Cancelled)));
-        device.sync(&Cx::for_testing()).expect("retry explicit sync");
+        device
+            .sync(&Cx::for_testing())
+            .expect("retry explicit sync");
         drop(device);
-        assert!(verify(&Cx::for_testing(), &fixture.image, &fixture.sidecar)
-            .expect("new protection").is_healthy());
+        assert!(
+            verify(&Cx::for_testing(), &fixture.image, &fixture.sidecar)
+                .expect("new protection")
+                .is_healthy()
+        );
     }
 
     #[test]
@@ -706,13 +893,24 @@ mod tests {
         let fixture = Fixture::new();
         let device = fixture.open();
         let cx = Cx::for_testing();
-        device.write_all_at(&cx, ByteOffset(0), &[0x41; 100]).expect("write");
+        device
+            .write_all_at(&cx, ByteOffset(0), &[0x41; 100])
+            .expect("write");
         fixture.damage(7 * 512, &[0x66; 512]);
-        assert!(device.sync(&cx).expect_err("unknown corruption").to_string().contains("bless"));
+        assert!(
+            device
+                .sync(&cx)
+                .expect_err("unknown corruption")
+                .to_string()
+                .contains("bless")
+        );
         assert!(device.protection(&cx).is_err());
         drop(device);
         assert!(Archive::open(&cx, &fixture.sidecar).is_err());
-        assert_eq!(&std::fs::read(&fixture.image).expect("source")[..100], &[0x41; 100]);
+        assert_eq!(
+            &std::fs::read(&fixture.image).expect("source")[..100],
+            &[0x41; 100]
+        );
     }
 
     #[test]
@@ -722,9 +920,14 @@ mod tests {
         fixture.damage(512, &[0xab; 512]);
         fixture.damage(5 * 512, &[0xcd; 512]);
         let mut bytes = [0; 200];
-        device.read_exact_at(&Cx::for_testing(), ByteOffset(520), &mut bytes).expect("self-healed read");
+        device
+            .read_exact_at(&Cx::for_testing(), ByteOffset(520), &mut bytes)
+            .expect("self-healed read");
         assert_eq!(&bytes, &fixture.original[520..720]);
-        assert_eq!(std::fs::read(&fixture.image).expect("both targets repaired"), fixture.original);
+        assert_eq!(
+            std::fs::read(&fixture.image).expect("both targets repaired"),
+            fixture.original
+        );
     }
 
     #[test]
@@ -732,13 +935,20 @@ mod tests {
         let fixture = Fixture::new();
         let device = fixture.open();
         let cx = Cx::for_testing();
-        device.write_all_at(&cx, ByteOffset(512), &[0xaa; 512]).expect("new write");
+        device
+            .write_all_at(&cx, ByteOffset(512), &[0xaa; 512])
+            .expect("new write");
         fixture.damage(512, &[0xbb; 512]);
         let mut buffer = [0x99; 10];
-        let error = device.read_exact_at(&cx, ByteOffset(512), &mut buffer).expect_err("stale parity");
+        let error = device
+            .read_exact_at(&cx, ByteOffset(512), &mut buffer)
+            .expect_err("stale parity");
         assert!(error.to_string().contains("old parity"));
         assert_eq!(buffer, [0x99; 10]);
-        assert_eq!(&std::fs::read(&fixture.image).expect("not rolled back")[512..1024], &[0xbb; 512]);
+        assert_eq!(
+            &std::fs::read(&fixture.image).expect("not rolled back")[512..1024],
+            &[0xbb; 512]
+        );
     }
 
     #[test]
@@ -748,7 +958,11 @@ mod tests {
         fixture.damage(0, &[0xfe; 5 * 512]);
         let before = std::fs::read(&fixture.image).expect("damaged image");
         let mut buffer = [0x99; 10];
-        assert!(device.read_exact_at(&Cx::for_testing(), ByteOffset(10), &mut buffer).is_err());
+        assert!(
+            device
+                .read_exact_at(&Cx::for_testing(), ByteOffset(10), &mut buffer)
+                .is_err()
+        );
         assert_eq!(buffer, [0x99; 10]);
         assert_eq!(std::fs::read(&fixture.image).expect("unchanged"), before);
     }
@@ -761,9 +975,15 @@ mod tests {
         let cx = Cx::for_testing();
         let device = fixture.open();
         assert!(SidecarImageDevice::open(&cx, &alias, &fixture.sidecar).is_err());
-        device.write_all_at(&cx, ByteOffset(0), &[7; 5]).expect("write");
+        device
+            .write_all_at(&cx, ByteOffset(0), &[7; 5])
+            .expect("write");
         device.sync(&cx).expect("publish replacement inode");
-        let other = File::options().read(true).write(true).open(&fixture.sidecar).expect("new inode");
+        let other = File::options()
+            .read(true)
+            .write(true)
+            .open(&fixture.sidecar)
+            .expect("new inode");
         assert!(other.try_lock().is_err());
         drop(device);
         other.try_lock().expect("released only at device drop");
@@ -775,9 +995,17 @@ mod tests {
         let archive = std::fs::read(&fixture.sidecar).expect("archive");
         fixture.damage(0, &[0x55; 5]);
         let before = std::fs::read(&fixture.image).expect("externally changed");
-        assert!(SidecarImageDevice::open(&Cx::for_testing(), &fixture.image, &fixture.sidecar).is_err());
-        assert_eq!(std::fs::read(&fixture.image).expect("not rolled back"), before);
-        assert_eq!(std::fs::read(&fixture.sidecar).expect("not changed"), archive);
+        assert!(
+            SidecarImageDevice::open(&Cx::for_testing(), &fixture.image, &fixture.sidecar).is_err()
+        );
+        assert_eq!(
+            std::fs::read(&fixture.image).expect("not rolled back"),
+            before
+        );
+        assert_eq!(
+            std::fs::read(&fixture.sidecar).expect("not changed"),
+            archive
+        );
     }
 
     fn alternate_generation(fixture: &Fixture) -> (PathBuf, Vec<u8>, u64) {
@@ -787,14 +1015,25 @@ mod tests {
         // locally, yet represents a different source generation.
         fixture.damage(10 * 512, &[0x83; 512]);
         let alternate = fixture.sidecar.with_extension("alternate");
-        protect(&cx, &fixture.image, &alternate, SidecarOptions {
-            block_size: 512, group_blocks: 8, repair_symbols: 4,
-        }).expect("alternate protection");
+        protect(
+            &cx,
+            &fixture.image,
+            &alternate,
+            SidecarOptions {
+                block_size: 512,
+                group_blocks: 8,
+                repair_symbols: 4,
+            },
+        )
+        .expect("alternate protection");
         let archive = Archive::open(&cx, &alternate).expect("alternate archive");
         let offset = archive.header.group_offset(1).expect("group offset");
         let end = archive.header.group_offset(2).expect("next group");
         let mut record = vec![0; (end - offset) as usize];
-        archive.file.read_exact_at(&mut record, offset).expect("valid alternate record");
+        archive
+            .file
+            .read_exact_at(&mut record, offset)
+            .expect("valid alternate record");
         drop(archive);
         (alternate, record, offset)
     }
@@ -806,15 +1045,25 @@ mod tests {
         let original = Archive::open(&Cx::for_testing(), &fixture.sidecar).expect("old archive");
         let end = original.header.group_offset(2).expect("next group");
         let mut old_record = vec![0; (end - offset) as usize];
-        original.file.read_exact_at(&mut old_record, offset).expect("old record");
+        original
+            .file
+            .read_exact_at(&mut old_record, offset)
+            .expect("old record");
         drop(original);
-        File::options().write(true).open(&alternate).expect("archive fault handle")
-            .write_all_at(&old_record, offset).expect("transplant old group");
+        File::options()
+            .write(true)
+            .open(&alternate)
+            .expect("archive fault handle")
+            .write_all_at(&old_record, offset)
+            .expect("transplant old group");
         let before = std::fs::read(&fixture.image).expect("current source");
         let error = SidecarImageDevice::open(&Cx::for_testing(), &fixture.image, &alternate)
             .expect_err("valid header and group checksums do not establish one snapshot");
         assert!(error.to_string().contains("source digest table"));
-        assert_eq!(std::fs::read(&fixture.image).expect("not rolled back"), before);
+        assert_eq!(
+            std::fs::read(&fixture.image).expect("not rolled back"),
+            before
+        );
     }
 
     #[test]
@@ -825,12 +1074,23 @@ mod tests {
         let device = fixture.open();
         // Model storage returning an internally valid record from a different
         // epoch, bypassing the advisory lock only for fault injection.
-        File::options().write(true).open(&fixture.sidecar).expect("archive fault handle")
-            .write_all_at(&alternate_record, offset).expect("transplant valid group");
+        File::options()
+            .write(true)
+            .open(&fixture.sidecar)
+            .expect("archive fault handle")
+            .write_all_at(&alternate_record, offset)
+            .expect("transplant valid group");
         let mut output = [0x99; 64];
-        assert!(device.read_exact_at(&Cx::for_testing(), ByteOffset(10 * 512), &mut output).is_err());
+        assert!(
+            device
+                .read_exact_at(&Cx::for_testing(), ByteOffset(10 * 512), &mut output)
+                .is_err()
+        );
         assert_eq!(output, [0x99; 64]);
-        assert_eq!(std::fs::read(&fixture.image).expect("unchanged source"), fixture.original);
+        assert_eq!(
+            std::fs::read(&fixture.image).expect("unchanged source"),
+            fixture.original
+        );
     }
 
     #[test]
@@ -840,14 +1100,22 @@ mod tests {
         let cx = Cx::for_testing();
         let mut expected = fixture.original.clone();
         for value in [0x27, 0x58, 0x83] {
-            device.write_all_at(&cx, ByteOffset(10 * 512), &[value; 512]).expect("next write");
+            device
+                .write_all_at(&cx, ByteOffset(10 * 512), &[value; 512])
+                .expect("next write");
             expected[10 * 512..11 * 512].fill(value);
             device.sync(&cx).expect("next source and parity ACK");
-            assert_eq!(device.protection(&cx).expect("protection").snapshot_blake3,
-                blake3::hash(&expected).to_hex().to_string());
+            assert_eq!(
+                device.protection(&cx).expect("protection").snapshot_blake3,
+                blake3::hash(&expected).to_hex().to_string()
+            );
         }
         drop(device);
-        assert!(verify(&cx, &fixture.image, &fixture.sidecar).expect("latest").is_healthy());
+        assert!(
+            verify(&cx, &fixture.image, &fixture.sidecar)
+                .expect("latest")
+                .is_healthy()
+        );
         drop(fixture.open());
     }
 
