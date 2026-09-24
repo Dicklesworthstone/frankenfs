@@ -148,9 +148,24 @@ fn fscrypt_policy_ex_transport_eio_is_expected(
 
 /// Check if FUSE E2E prerequisites are met.
 fn fuse_available() -> bool {
-    Path::new("/dev/fuse").exists()
+    let available = Path::new("/dev/fuse").exists()
         && command_available("mkfs.ext4")
-        && command_available("debugfs")
+        && command_available("debugfs");
+    if !available {
+        require_fuse_or_skip("FUSE prerequisites (/dev/fuse, mkfs.ext4, debugfs) missing");
+    }
+    available
+}
+
+/// bd-53dub: a mounted test that cannot mount used to return early and PASS.
+/// With `FFS_REQUIRE_FUSE=1` (set in lanes that claim mounted evidence) that is
+/// a failure; otherwise the skip is printed as a greppable `SKIP` line.
+fn require_fuse_or_skip(reason: &str) {
+    assert!(
+        std::env::var_os("FFS_REQUIRE_FUSE").is_none_or(|v| v != "1"),
+        "FFS_REQUIRE_FUSE=1 but the mounted test could not run: {reason}"
+    );
+    eprintln!("SKIP fuse_unavailable reason={reason}");
 }
 
 fn mountinfo_unescape(field: &str) -> Vec<u8> {
@@ -1075,7 +1090,7 @@ fn try_mount_ffs_with_options(
             ))
         }
         Err(e) => {
-            eprintln!("FUSE mount failed (skipping test): {e}");
+            require_fuse_or_skip(&format!("FUSE mount failed: {e}"));
             None
         }
     }
@@ -11575,7 +11590,7 @@ fn try_mount_btrfs_rw_with_options(
             ))
         }
         Err(e) => {
-            eprintln!("btrfs FUSE mount failed (skipping test): {e}");
+            require_fuse_or_skip(&format!("btrfs FUSE mount failed: {e}"));
             None
         }
     }
@@ -11756,7 +11771,7 @@ fn try_mount_btrfs_ro(
             ))
         }
         Err(e) => {
-            eprintln!("btrfs read-only FUSE mount failed (skipping test): {e}");
+            require_fuse_or_skip(&format!("btrfs read-only FUSE mount failed: {e}"));
             None
         }
     }
@@ -11785,7 +11800,7 @@ fn try_mount_btrfs_with_open_options(
             ))
         }
         Err(e) => {
-            eprintln!("btrfs FUSE mount failed: {e}");
+            require_fuse_or_skip(&format!("btrfs FUSE mount failed: {e}"));
             None
         }
     }
@@ -15157,7 +15172,7 @@ fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u1
                     let scenario_id =
                         format!("btrfs_attached_devices_read_seeded_files_{checksum}");
                     emit_scenario_result(&scenario_id, "SKIP", Some("fuse_mount_failed"));
-                    eprintln!("FUSE mount failed (skipping test): {error}");
+                    require_fuse_or_skip(&format!("FUSE mount failed: {error}"));
                     return;
                 }
             };
@@ -17997,7 +18012,7 @@ fn gdt_eager_mounted_forensics_bd_d2hdc() {
         let mut mounted = false;
         while start.elapsed() < FUSE_MOUNT_READY_TIMEOUT {
             if let Ok(Err(e)) = mount_rx.try_recv() {
-                eprintln!("forensic FUSE mount failed (skipping): {e}");
+                require_fuse_or_skip(&format!("forensic FUSE mount failed: {e}"));
                 let _ = session_thread.join();
                 return;
             }
@@ -18009,7 +18024,7 @@ fn gdt_eager_mounted_forensics_bd_d2hdc() {
         }
         if !mounted {
             if let Ok(Err(e)) = mount_rx.try_recv() {
-                eprintln!("forensic FUSE mount failed (skipping): {e}");
+                require_fuse_or_skip(&format!("forensic FUSE mount failed: {e}"));
             } else {
                 eprintln!("timed out waiting for forensic mount readiness, skipping");
             }

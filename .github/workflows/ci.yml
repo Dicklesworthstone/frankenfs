@@ -277,7 +277,13 @@ jobs:
       - name: Run relocated ops tests
         run: cargo test -p ffs-ops -- --nocapture
 
+      # bd-53dub: a mounted test that cannot mount fails here instead of
+      # passing vacuously (FUSE, fuse3, e2fsprogs and btrfs-progs are installed
+      # above, so a skip would mean the lane proved nothing).
       - name: Run FUSE E2E tests
+        env:
+          FFS_REQUIRE_FUSE: "1"
+          FFS_REQUIRE_ORACLES: "1"
         run: cargo test -p ffs-harness --test fuse_e2e -- --nocapture
 
       - name: Run shell E2E suites
