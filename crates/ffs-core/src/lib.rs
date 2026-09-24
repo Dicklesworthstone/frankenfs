@@ -11242,27 +11242,55 @@ impl OpenFs {
                 reason: "not covered by any chunk",
             })?
         };
-        let mut buf = vec![0_u8; ns];
-        self.dev
-            .read_exact_at(cx, ByteOffset(mapping.physical), &mut buf)
-            .map_err(|_| ParseError::InsufficientData {
-                needed: ns,
-                offset: 0,
-                actual: 0,
+        let read_copy = |physical: u64| -> Result<BtrfsParsedNode, ParseError> {
+            let mut buf = vec![0_u8; ns];
+            self.dev
+                .read_exact_at(cx, ByteOffset(physical), &mut buf)
+                .map_err(|_| ParseError::InsufficientData {
+                    needed: ns,
+                    offset: 0,
+                    actual: 0,
+                })?;
+            cx.checkpoint().map_err(|_| ParseError::InvalidField {
+                field: "btrfs_device_read",
+                reason: "metadata read cancelled",
             })?;
-        cx.checkpoint().map_err(|_| ParseError::InvalidField {
-            field: "btrfs_device_read",
-            reason: "metadata read cancelled",
-        })?;
-        // Verify + parse ONCE, before the node enters the cache, so every cached
-        // node is already-verified — a hit never skips a checksum that was not
-        // already checked.
-        let node = Arc::new(parse_btrfs_tree_node_owned(
-            buf,
-            ctx.csum_type,
-            logical,
-            nodesize,
-        )?);
+            // Verify + parse ONCE, before the node enters the cache, so every
+            // cached node is already-verified — a hit never skips a checksum
+            // that was not already checked.
+            parse_btrfs_tree_node_owned(buf, ctx.csum_type, logical, nodesize)
+        };
+        let node = match read_copy(mapping.physical) {
+            Ok(node) => node,
+            Err(primary_err) => {
+                // bd-0mcvt: a DUP chunk keeps a second copy on the same device.
+                // When the first copy fails its read, checksum or structural
+                // check, try the other copies before failing, as the kernel does.
+                // Only the failure path pays for this.
+                let stripes = ffs_ondisk::map_logical_to_stripes(&ctx.chunks, logical)
+                    .ok()
+                    .flatten()
+                    .map(|m| m.stripes)
+                    .unwrap_or_default();
+                let mut recovered = None;
+                for stripe in stripes.iter().filter(|s| s.physical != mapping.physical) {
+                    if let Ok(node) = read_copy(stripe.physical) {
+                        warn!(
+                            target: "ffs::btrfs::read",
+                            logical,
+                            bad_physical = mapping.physical,
+                            good_physical = stripe.physical,
+                            error = %primary_err,
+                            "btrfs_metadata_read_recovered_from_mirror"
+                        );
+                        recovered = Some(node);
+                        break;
+                    }
+                }
+                recovered.ok_or(primary_err)?
+            }
+        };
+        let node = Arc::new(node);
         if cacheable {
             self.btrfs_parsed_node_cache.insert_within(
                 logical,
@@ -83114,8 +83142,15 @@ mod tests {
             .output();
         match out {
             Ok(o) if o.status.success() => {}
-            _ => {
-                oracle_unavailable("btrfs image formatter (btrfs-progs)");
+            Ok(o) => {
+                oracle_unavailable(&format!(
+                    "btrfs image formatter (btrfs-progs) refused a {size_mb} MiB image: {}",
+                    String::from_utf8_lossy(&o.stderr).trim()
+                ));
+                return None;
+            }
+            Err(e) => {
+                oracle_unavailable(&format!("btrfs image formatter (btrfs-progs): {e}"));
                 return None;
             }
         }
