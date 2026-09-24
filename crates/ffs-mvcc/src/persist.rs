@@ -224,8 +224,8 @@ impl PersistentMvccStore {
     ///
     /// # Arguments
     ///
-    /// * `_cx` - Capability context for I/O (currently unused, reserved for
-    ///   future async I/O integration).
+    /// * `cx` - Cancellation context checked before opening files, during WAL
+    ///   replay, and before discarded-tail truncation.
     /// * `wal_path` - Path to the WAL file.
     ///
     /// # Errors
@@ -233,6 +233,7 @@ impl PersistentMvccStore {
     /// Returns an error if the WAL file cannot be opened/created or if replay
     /// fails due to corruption (corruption at the tail is tolerated).
     pub fn open(cx: &Cx, wal_path: impl AsRef<Path>) -> Result<Self> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let wal_path = wal_path.as_ref();
         let checkpoint_path = wal_path.with_extension("ckpt");
         if checkpoint_path.exists() {
@@ -266,11 +267,12 @@ impl PersistentMvccStore {
 
     /// Open a persistent MVCC store with a checkpoint and custom options.
     pub fn open_with_checkpoint_and_options(
-        _cx: &Cx,
+        cx: &Cx,
         wal_path: impl AsRef<Path>,
         checkpoint_path: impl AsRef<Path>,
         options: &PersistOptions,
     ) -> Result<Self> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let wal_path = wal_path.as_ref();
         let checkpoint_path = checkpoint_path.as_ref();
         let writer_config = options.to_writer_config();
@@ -282,6 +284,7 @@ impl PersistentMvccStore {
         // Try to load checkpoint first
         if checkpoint_path.exists() {
             load_checkpoint(checkpoint_path, &mut store)?;
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
             let ckpt_seq = store.next_commit.saturating_sub(1);
             stats.checkpoint_commit_seq = ckpt_seq;
             recovery.used_checkpoint = true;
@@ -289,7 +292,7 @@ impl PersistentMvccStore {
         }
 
         // Open or create WAL
-        let wal_exists = wal_path.exists();
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let mut file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -299,17 +302,15 @@ impl PersistentMvccStore {
 
         let write_pos: u64;
 
-        let wal_total_bytes = if wal_exists {
-            file.metadata()?.len()
-        } else {
-            0
-        };
+        // Use the opened file's length, not a racy path-existence probe.
+        let wal_total_bytes = file.metadata()?.len();
 
-        if wal_exists && wal_total_bytes > 0 {
+        if wal_total_bytes > 0 {
             // Replay WAL entries that are newer than the checkpoint
             let checkpoint_seq = store.next_commit.saturating_sub(1);
-            let (pos, replay_stats) = replay_wal_from_seq(&mut file, &mut store, checkpoint_seq)?;
-            truncate_wal_tail_if_needed(&file, pos, wal_total_bytes)?;
+            let (pos, replay_stats) =
+                replay_wal_from_seq(cx, &mut file, &mut store, checkpoint_seq, wal_total_bytes)?;
+            truncate_wal_tail_if_needed(cx, &file, pos, wal_total_bytes)?;
             write_pos = pos;
             stats.replayed_commits = replay_stats.commits_replayed;
             stats.replayed_versions = replay_stats.versions_replayed;
@@ -322,6 +323,7 @@ impl PersistentMvccStore {
             recovery.wal_total_bytes = wal_total_bytes;
         } else {
             // Write fresh WAL header
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
             let header = WalHeader::default();
             let header_bytes = wal::encode_header(&header);
             file.write_all(&header_bytes)?;
@@ -345,12 +347,12 @@ impl PersistentMvccStore {
 
     /// Open a persistent MVCC store with custom options.
     pub fn open_with_options(
-        _cx: &Cx,
+        cx: &Cx,
         wal_path: impl AsRef<Path>,
         options: &PersistOptions,
     ) -> Result<Self> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let path = wal_path.as_ref();
-        let exists = path.exists();
         let writer_config = options.to_writer_config();
 
         let mut file = OpenOptions::new()
@@ -365,12 +367,12 @@ impl PersistentMvccStore {
         let mut recovery = WalRecoveryReport::default();
         let write_pos: u64;
 
-        let wal_total_bytes = if exists { file.metadata()?.len() } else { 0 };
+        let wal_total_bytes = file.metadata()?.len();
 
-        if exists && wal_total_bytes > 0 {
+        if wal_total_bytes > 0 {
             // Replay existing WAL
-            let (pos, replay_stats) = replay_wal(&mut file, &mut store)?;
-            truncate_wal_tail_if_needed(&file, pos, wal_total_bytes)?;
+            let (pos, replay_stats) = replay_wal(cx, &mut file, &mut store, wal_total_bytes)?;
+            truncate_wal_tail_if_needed(cx, &file, pos, wal_total_bytes)?;
             write_pos = pos;
             stats.replayed_commits = replay_stats.commits_replayed;
             stats.replayed_versions = replay_stats.versions_replayed;
@@ -383,6 +385,7 @@ impl PersistentMvccStore {
             recovery.wal_total_bytes = wal_total_bytes;
         } else {
             // Write fresh header
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
             let header = WalHeader::default();
             let header_bytes = wal::encode_header(&header);
             file.write_all(&header_bytes)?;
@@ -607,7 +610,9 @@ impl PersistentMvccStore {
             .unwrap_or_else(|| Path::new("."));
         let directory = File::open(parent)?;
         if !directory.metadata()?.is_dir() {
-            return Err(FfsError::Format("checkpoint parent is not a directory".to_owned()));
+            return Err(FfsError::Format(
+                "checkpoint parent is not a directory".to_owned(),
+            ));
         }
         let next_txn = store_guard.next_txn;
         let next_commit = store_guard.next_commit;
@@ -642,7 +647,9 @@ impl PersistentMvccStore {
                 .sync_all()?;
         }
 
-        temporary.persist(path).map_err(|error| FfsError::Io(error.error))?;
+        temporary
+            .persist(path)
+            .map_err(|error| FfsError::Io(error.error))?;
         // A durable file is not yet a durable directory entry. Never authorize
         // WAL truncation if rename publication could still be lost on restart.
         sync_directory(&directory)?;
@@ -732,7 +739,9 @@ impl PersistentMvccStore {
 /// for the duration of checkpoint publication.
 fn validate_checkpoint_destination(path: &Path, wal_file: &File) -> Result<()> {
     if path.file_name().is_none() {
-        return Err(FfsError::Format("checkpoint destination must name a file".to_owned()));
+        return Err(FfsError::Format(
+            "checkpoint destination must name a file".to_owned(),
+        ));
     }
     match path.metadata() {
         Ok(destination) => {
@@ -1111,38 +1120,51 @@ struct ReplayStats {
 /// Replay WAL file into an MvccStore.
 ///
 /// Returns `(write_position, replay_stats)`.
-fn replay_wal(file: &mut File, store: &mut MvccStore) -> Result<(u64, ReplayStats)> {
-    replay_wal_from_seq(file, store, 0)
+fn replay_wal(
+    cx: &Cx,
+    file: &mut File,
+    store: &mut MvccStore,
+    total_bytes: u64,
+) -> Result<(u64, ReplayStats)> {
+    replay_wal_from_seq(cx, file, store, 0, total_bytes)
 }
 
 /// Replay WAL file into an MvccStore, skipping commits at or before `skip_up_to_seq`.
 ///
 /// Uses [`WalReplayEngine`] with [`TailPolicy::TruncateToLastGood`] for
 /// production recovery.  Returns `(write_position, replay_stats)`.
+/// Only one record is buffered at a time. The caller owns the WAL exclusively
+/// during startup; read/cancellation errors must never trigger tail trimming.
 fn replay_wal_from_seq(
+    cx: &Cx,
     file: &mut File,
     store: &mut MvccStore,
     skip_up_to_seq: u64,
+    total_bytes: u64,
 ) -> Result<(u64, ReplayStats)> {
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
     file.seek(SeekFrom::Start(0))?;
 
     // Read and validate header.
     let mut header_buf = [0_u8; HEADER_SIZE];
     file.read_exact(&mut header_buf)?;
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
     let _header = wal::decode_header(&header_buf)?;
-
-    // Read rest of file.
-    let mut data = Vec::new();
-    file.read_to_end(&mut data)?;
-
-    // Run through the replay engine.
-    let engine = WalReplayEngine::new(TailPolicy::TruncateToLastGood);
-    let report = engine.replay(&data, skip_up_to_seq, |commit| {
-        apply_wal_commit(store, commit);
-    })?;
 
     let header_size_u64 = u64::try_from(HEADER_SIZE)
         .map_err(|_| FfsError::Format("header size overflow".to_owned()))?;
+    let data_bytes = total_bytes
+        .checked_sub(header_size_u64)
+        .ok_or_else(|| FfsError::Format("captured WAL is shorter than its header".to_owned()))?;
+    // Bound even BufReader's read-ahead to the captured file range.
+    let mut reader = BufReader::new(file.take(data_bytes));
+
+    let engine = WalReplayEngine::new(TailPolicy::TruncateToLastGood);
+    let report = engine.replay_reader(cx, &mut reader, data_bytes, skip_up_to_seq, |commit| {
+        apply_wal_commit(store, commit);
+        Ok(())
+    })?;
+
     let write_pos = header_size_u64
         .checked_add(report.last_valid_offset)
         .ok_or_else(|| FfsError::Format("WAL position overflow".to_owned()))?;
@@ -1158,8 +1180,28 @@ fn replay_wal_from_seq(
     ))
 }
 
-fn truncate_wal_tail_if_needed(file: &File, valid_bytes: u64, total_bytes: u64) -> Result<()> {
+fn truncate_wal_tail_if_needed(
+    cx: &Cx,
+    file: &File,
+    valid_bytes: u64,
+    total_bytes: u64,
+) -> Result<()> {
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+    // Detect a changed range before trimming OR publishing the append cursor.
+    // This is a fail-closed check, not a replacement for exclusive WAL ownership.
+    let observed_bytes = file.metadata()?.len();
+    if observed_bytes != total_bytes {
+        return Err(FfsError::Io(std::io::Error::other(format!(
+            "WAL length changed during recovery: captured {total_bytes}, observed {observed_bytes}"
+        ))));
+    }
+    if valid_bytes < HEADER_SIZE as u64 || valid_bytes > total_bytes {
+        return Err(FfsError::Format("invalid WAL recovery boundary".to_owned()));
+    }
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
     if total_bytes > valid_bytes {
+        // Once truncation starts, finish its durability barrier even if the
+        // caller cancels. Never leave a successful truncate unsynced.
         file.set_len(valid_bytes)?;
         file.sync_all()?;
     }
@@ -1202,6 +1244,10 @@ pub fn apply_wal_commit(store: &mut MvccStore, commit: &WalCommit) {
 #[cfg(test)]
 #[path = "persist/checkpoint_publication_tests.rs"]
 mod checkpoint_publication_tests;
+
+#[cfg(test)]
+#[path = "persist/recovery_tests.rs"]
+mod recovery_tests;
 
 #[cfg(test)]
 mod tests {
