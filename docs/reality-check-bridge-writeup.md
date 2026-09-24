@@ -1,5 +1,105 @@
 # Reality-Check Bridge: Closing the Gap Between Claims and Code
 
+## Reality check — 2026-09-23 (HEAD `75e0d3e8`)
+
+**Verdict.** FrankenFS is a large, real filesystem implementation whose
+read side is strong and whose write side is durable only inside FrankenFS's
+own world. Prior checks (09-08, 09-21, 09-22) mostly measured gates and
+inventory counts; this one traced the README's promises through the mounted
+code paths. It found that the two headline innovations — MVCC concurrency
+and RaptorQ self-healing — are implemented as libraries but are not what a
+default mount delivers, plus five data-safety defects no bead covered. At
+the start of the audit `main` did not compile.
+
+**Method.** AGENTS.md and README.md (3,931 lines) read in full; canonical
+spec §0–§1, §3.7 and PLAN §2/§9 read as the yardstick. Seven parallel
+read-only code investigations (repair, btrfs, ext4 RW + MVCC, concurrency /
+FUSE runtime, evidence / CI machinery, README claim audit, performance vs
+kernel), each returning file:line evidence; every P0/P1 claim below was
+re-verified at source by the auditor. Gates executed on rch workers against
+the committed HEAD (clean overlay). No README/spec wording was changed.
+
+### Gates at HEAD `75e0d3e8`
+
+| Gate | Result | Cause |
+|---|---|---|
+| `cargo build --workspace` | **FAIL** | `sidecar/live.rs` (pub mod, lib code) imports `parking_lot`, which `ffs-repair/Cargo.toml` lists only under `[dev-dependencies]`; `ffs-mvcc`, `ffs-cli` (and via mvcc, `ffs-core` and everything above) cannot build |
+| `cargo fmt --check` | **FAIL** | 56 hunks in `ffs-repair/src/sidecar/live.rs` |
+| `cargo clippy -D warnings` | **FAIL** | the build error plus `unused_self` on `SidecarImageDevice::fence` |
+| Fix (this session, `bd-38cj9`) | see bead | dependency moved to `[dependencies]`, `fence` made associated, rustfmt; no logic change |
+
+This is the third red landing on `main` in two days from the same
+workstream (`e3465555`/`7ed707ed3` on 09-22, `75e0d3e8` on 09-23); all
+recent commits go directly to `main`, so PR-only CI steps never run first
+(`bd-ys3wb`). Note for auditors: a plain `rch exec --job` syncs the working
+tree onto the worker's *recorded* base, which can be stale (here `a3ff0a69`);
+use `--clean-overlay -b HEAD` for committed-identity results.
+
+### Vision vs reality (default mount behavior)
+
+| Promise (README / spec) | Reality at `75e0d3e8` | Evidence |
+|---|---|---|
+| RaptorQ is "not optional … the default substrate", scrub "always running" (spec §0.4) | Opt-in only; ext4 mounted scrub validates **only the superblock block** (all other blocks `Skip`); symbols never refreshed on RW mounts (`attach_repair_flush_lifecycle` has test-only callers) | `ffs-cli/src/main.rs` ~8552-8569; `ffs-core/src/lib.rs:9524` |
+| Repair blocks reserved in the bitmap, never allocatable (spec §3.7.1) | **Not reserved** — tail is arithmetic; `ffs repair --rebuild-symbols` and mounted repair can overwrite allocated file data | `cmd_repair.rs:1273-1311`, `1156-1178`; `bd-plamw` |
+| Block-level MVCC for concurrent writers | Data writes use per-request MVCC transactions; namespace ops are N independent commits; FUSE dispatch defaults to **one serial thread**; no mounted merge ever measured; ext4 parallel metadata writes measured 1.51× slower than kernel | `fs_mvcc_store.rs` ~527-542; `ffs-fuse/src/lib.rs` ~7710; `bd-9rutw`, `bd-iah1f` |
+| Mount-compatible ext4 with journal recovery | FrankenFS replays its own journal, but its JBD2 writer never writes `s_start`/`s_sequence` nor sets `INCOMPAT_RECOVER` → kernel/e2fsck see a clean journal after a crash in the commit→checkpoint window | `ffs-journal/src/lib.rs` ~1270-1310; `bd-cnmpm` |
+| Durable RW | Only at fsync/unmount; no periodic commit (ext4 or btrfs) → unbounded loss window and memory growth for non-fsyncing apps | `bd-dj725` |
+| btrfs RW incl. `--subvol` (Walkthrough A) | `--subvol X --rw` loads X's tree but commits it as the **default** subvolume root (objectid 5); no guard | `lib.rs:11476-11481` vs `34241`; `bd-5elw6` |
+| btrfs DUP metadata (mkfs default) | writes update only the first stripe | `ffs-ondisk/src/btrfs.rs:1116-1128`; `bd-0mcvt` |
+| Cancel-correct structured concurrency (asupersync) | FUSE_INTERRUPT → ENOSYS; request `Cx` has infinite budget; `test-internals` needed in production; every background worker is a std thread; no production region/channel use | `vendor/fuser/src/request.rs:515`; `bd-gk01h`, `bd-in31y` |
+| Evidence-gated claims | gate2/gate5/gate7 are unit-test wrappers (gate5 "FUSE mount" mounts nothing); ~30 btrfs-check tests and fuse_e2e soft-skip when the oracle/mount is missing; progs differential defaults to XFAIL; proof-bundle lane commands come from the bundle; no current proof bundle; xfstests never executed | `bd-0r0kc`, `bd-53dub`, `bd-jtk24`, `bd-vngdq` |
+| Performance | Slower than the kernel on every admissible same-transport mounted row (ext4 warm stat 4.90×, readdir+stat 3.67×, storm 2.86×, fsync 1.54×, xattr 5.8×; btrfs 1.14×–4.8×); read rows are dominated by the kernel's per-lookup `security.capability` round trip; no FUSE-passthrough arm separates transport from implementation; perf campaign stalled since ~09-01 with 50/55 beads stale | `docs/MOUNTED_*_SCORECARD.md`; `bd-risyk`, `bd-616mk` |
+
+**What genuinely works (verified in source, consistent with prior executed
+evidence):** ext4/btrfs parsing and inspection; RO mounts of both formats;
+ext4 RW with FrankenFS-side durability and e2fsck-witnessed tests; btrfs
+single-device RW with full-commit durability, EXTENT_ITEM/backref/csum
+accounting and ~30 `btrfs check` assertions (when the oracle is present);
+RAID0/1/10/C3/C4 reads and new RAID5/6 data reconstruction; fast-commit
+recovery now fails closed; FICLONE/FICLONERANGE; RaptorQ codec via
+asupersync with careful offline tooling (`ffs repair`, sidecar); no tokio
+anywhere (Cargo.lock verified); ~85 of ~125 checked README claims are true.
+
+**Evidence-to-implementation ratio.** ffs-harness `src` (171,722 LOC) is
+larger than ffs-core `src` (114,059); harness + ffs-ops + scripts ≈ 326k LOC
+vs ≈ 399k LOC in the 14 filesystem crates. Of 561 non-merge commits in the
+last 30 days, 29% touched filesystem crate source; 70% touched only ledgers,
+docs, scripts, tracker or harness.
+
+### Would finishing the open beads close the gap?
+
+No. Before this check the open/in-progress set was dominated by perf
+methodology (≈45 of 54 in-progress rows) and did not cover the five
+data-safety defects above, the hollow gates, the missing periodic commit,
+or the unreserved repair tail. Those now have beads (label
+`reality-check-20260923`), wired as blockers of the delivery aggregate
+`bd-z5bav`:
+
+| Priority | Bead | Gap |
+|---|---|---|
+| P0 | `bd-38cj9` | main does not compile / fmt / clippy (fix applied this session) |
+| P0 | `bd-5elw6` | btrfs `--subvol/--snapshot --rw` rewrites the default subvolume root |
+| P0 | `bd-plamw` | repair tail not reserved; repair can overwrite file data |
+| P1 | `bd-0mcvt` | btrfs DUP second copy never written |
+| P1 | `bd-cnmpm` | JBD2 not kernel/e2fsck-replayable |
+| P1 | `bd-xsu7s` | orphan-recovery failure does not force read-only |
+| P1 | `bd-jufod` | ext4 mounted scrub detects only superblock corruption |
+| P1 | `bd-0r0kc` | hollow canonical gates report PASS |
+| P1 | `bd-53dub` | oracle/mount soft-skips hide missing evidence |
+| P1 | `bd-34blv` | btrfs ENOSPC with free device space (growth default-off) |
+| P1 | `bd-dj725` | no periodic commit (ext4 and btrfs) |
+| P1 | `bd-ys3wb` | enforce the four gates before pushing to main |
+| P2 | `bd-gk01h`, `bd-iah1f`, `bd-9rutw`, `bd-tmwe8`, `bd-jtk24`, `bd-in31y`, `bd-7ssc7`, `bd-risyk`, `bd-616mk`, `bd-dax3o`, `bd-7zjfh` | cancellation, serial dispatch, namespace atomicity, lying btrfs ioctls, self-attested evidence, structured concurrency, MVCC observability/policy, transport baseline, tracker triage, README reconciliation (~40 items), sidecar-vs-on-image decision |
+| P3 | `bd-8adbm`, `bd-gmdcu` | AGENTS.md dangling Rule 0.5 references; 101k-line `ffs-core/src/lib.rs` and duplicated harness modules |
+
+**Recommended order.** Keep `main` compiling (`bd-38cj9`, `bd-ys3wb`); put
+interlocks on the data-loss paths before any feature work (`bd-5elw6` step 1,
+`bd-plamw`); make the oracles fail loudly (`bd-53dub`, `bd-0r0kc`) so later
+claims are measurable; then the ext4/btrfs durability semantics (`bd-cnmpm`,
+`bd-dj725`, `bd-0mcvt`, `bd-xsu7s`, `bd-34blv`); then make self-healing real
+on mounts (`bd-7zjfh` decision → `bd-jufod`, `bd-11a8t`, `bd-j7a4e`). Pause
+new perf-ledger work until `bd-risyk` gives a transport baseline.
+
 ## Reality check — 2026-09-22, second run (HEAD `e9d1e7d1b`)
 
 **Verdict:** the workspace is **two-gate green and one-test red**. `cargo fmt
