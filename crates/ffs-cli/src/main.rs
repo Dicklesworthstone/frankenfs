@@ -8746,6 +8746,103 @@ pub fn count_blocks_at_severity_or_higher(report: &ScrubReport, min: Severity) -
 }
 
 #[must_use]
+/// bd-jufod: inode-owned checksummed metadata of a static ext4 image — every
+/// extent-tree index/leaf block, directory data block and external xattr block
+/// of every readable allocated inode. Unreadable inodes are skipped (the inode
+/// table check reports them).
+fn ext4_inode_owned_blocks(cx: &Cx, fs: &OpenFs) -> Vec<(u64, ffs_repair::scrub::Ext4OwnedBlock)> {
+    use ffs_repair::scrub::Ext4OwnedBlock;
+    let Some(sb) = fs.ext4_superblock() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for group in 0..sb.groups_count() {
+        let Ok(bitmap) = fs.read_inode_bitmap(cx, GroupNumber(group)) else {
+            continue;
+        };
+        for index in 0..sb.inodes_per_group {
+            let Ok(bit) = usize::try_from(index) else {
+                break;
+            };
+            if bitmap
+                .get(bit / 8)
+                .is_none_or(|b| b & (1 << (bit % 8)) == 0)
+            {
+                continue;
+            }
+            let ino = group
+                .saturating_mul(sb.inodes_per_group)
+                .saturating_add(index)
+                .saturating_add(1);
+            if ino < sb.first_ino && ino != 2 {
+                continue;
+            }
+            let Ok(inode) = fs.read_inode(cx, InodeNumber(u64::from(ino))) else {
+                continue;
+            };
+            if inode.mode == 0 {
+                continue;
+            }
+            let generation = inode.generation;
+            if inode.file_acl != 0 {
+                out.push((inode.file_acl, Ext4OwnedBlock::Xattr));
+            }
+            if inode.flags & ffs_types::EXT4_EXTENTS_FL != 0 {
+                collect_ext4_extent_nodes(cx, fs, &inode.extent_bytes, 0, &mut |block| {
+                    out.push((block, Ext4OwnedBlock::ExtentNode { ino, generation }));
+                });
+            }
+            if inode.is_dir()
+                && let Ok(extents) = fs.collect_extents(cx, &inode)
+            {
+                for extent in extents {
+                    for n in 0..u64::from(extent.actual_len()) {
+                        out.push((
+                            extent.physical_start.saturating_add(n),
+                            Ext4OwnedBlock::DirLeaf { ino, generation },
+                        ));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
+/// Recursively report the index/leaf blocks below an extent node (the inode's
+/// in-inode root or an on-disk node). Bounded to ext4's maximum depth.
+fn collect_ext4_extent_nodes(
+    cx: &Cx,
+    fs: &OpenFs,
+    node: &[u8],
+    level: u32,
+    report: &mut dyn FnMut(u64),
+) {
+    const EXT4_EXTENT_MAGIC: u16 = 0xF30A;
+    if level > 5 || node.len() < 12 {
+        return;
+    }
+    let magic = u16::from_le_bytes([node[0], node[1]]);
+    let entries = usize::from(u16::from_le_bytes([node[2], node[3]]));
+    let depth = u16::from_le_bytes([node[6], node[7]]);
+    if magic != EXT4_EXTENT_MAGIC || depth == 0 {
+        return;
+    }
+    for i in 0..entries {
+        let off = 12 + i * 12;
+        let Some(entry) = node.get(off..off + 12) else {
+            break;
+        };
+        let lo = u64::from(u32::from_le_bytes([entry[4], entry[5], entry[6], entry[7]]));
+        let hi = u64::from(u16::from_le_bytes([entry[8], entry[9]]));
+        let child = lo | (hi << 32);
+        report(child);
+        if let Ok(bytes) = fs.read_block_vec(cx, BlockNumber(child)) {
+            collect_ext4_extent_nodes(cx, fs, &bytes, level + 1, report);
+        }
+    }
+}
+
 pub fn scrub_validator(flavor: &FsFlavor, block_size: u32) -> Box<dyn BlockValidator> {
     match flavor {
         // No blind `ZeroCheckValidator` here: a whole-image scrub has no
@@ -8832,10 +8929,25 @@ fn scrub_cmd(path: &PathBuf, json: bool) -> Result<()> {
     // bitmap checksums are authoritative and are verified, not just the
     // superblock.
     let validator = match &flavor {
-        FsFlavor::Ext4(sb) => Box::new(
-            ffs_repair::scrub::Ext4MetadataValidator::from_device(&cx, &block_dev, sb)
-                .context("failed to read ext4 group descriptors for scrub")?,
-        ) as Box<dyn BlockValidator>,
+        FsFlavor::Ext4(sb) => {
+            let mut validator =
+                ffs_repair::scrub::Ext4MetadataValidator::from_device(&cx, &block_dev, sb)
+                    .context("failed to read ext4 group descriptors for scrub")?;
+            // Inode-owned metadata needs an inode walk; an image that cannot be
+            // opened still gets the fixed-location checks.
+            if let Ok(fs) = OpenFs::open_with_options(
+                &cx,
+                path,
+                &OpenOptions {
+                    ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                    skip_validation: true,
+                    ..OpenOptions::default()
+                },
+            ) {
+                validator.add_owned_blocks(ext4_inode_owned_blocks(&cx, &fs));
+            }
+            Box::new(validator) as Box<dyn BlockValidator>
+        }
         FsFlavor::Btrfs(_) => scrub_validator(&flavor, block_size),
     };
 
@@ -13601,9 +13713,20 @@ mod tests {
             let sb = ffs_ondisk::Ext4Superblock::parse_from_image(bytes).expect("superblock");
             let block_dev =
                 ffs_block::ByteBlockDevice::new(byte_dev, sb.block_size).expect("block device");
-            let validator =
+            let mut validator =
                 ffs_repair::scrub::Ext4MetadataValidator::from_device(&cx, &block_dev, &sb)
                     .expect("validator");
+            let fs = super::OpenFs::open_with_options(
+                &cx,
+                &path,
+                &super::OpenOptions {
+                    ext4_journal_replay_mode: super::Ext4JournalReplayMode::Skip,
+                    skip_validation: true,
+                    ..super::OpenOptions::default()
+                },
+            )
+            .expect("open for inode walk");
+            validator.add_owned_blocks(super::ext4_inode_owned_blocks(&cx, &fs));
             ffs_repair::scrub::Scrubber::new(&block_dev, &validator)
                 .scrub_all(&cx)
                 .expect("scrub")
@@ -13652,6 +13775,35 @@ mod tests {
             report.findings.iter().any(|f| f.block.0 == gd0.inode_table
                 && f.kind == ffs_repair::scrub::CorruptionKind::ChecksumMismatch),
             "a corrupted live inode must be reported: {:?}",
+            report.findings
+        );
+
+        // The root directory's first data block is a leaf with a checksum tail
+        // on a metadata_csum image; corrupt a name byte inside it.
+        let root_dir_block = {
+            let path = dir.path().join("probe.ext4");
+            std::fs::write(&path, &clean).expect("write probe copy");
+            let fs = super::OpenFs::open_with_options(
+                &cx,
+                &path,
+                &super::OpenOptions {
+                    ext4_journal_replay_mode: super::Ext4JournalReplayMode::Skip,
+                    ..super::OpenOptions::default()
+                },
+            )
+            .expect("open probe");
+            let root = fs
+                .read_inode(&cx, ffs_types::InodeNumber(2))
+                .expect("root inode");
+            fs.collect_extents(&cx, &root).expect("root extents")[0].physical_start
+        };
+        let mut dir_bad = clean.clone();
+        dir_bad[usize::try_from(root_dir_block).expect("fits") * bs + 20] ^= 0x01;
+        let report = scrub(&dir_bad);
+        assert!(
+            report.findings.iter().any(|f| f.block.0 == root_dir_block
+                && f.kind == ffs_repair::scrub::CorruptionKind::ChecksumMismatch),
+            "a corrupted directory block must be reported: {:?}",
             report.findings
         );
 

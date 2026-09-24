@@ -580,6 +580,18 @@ impl BlockValidator for Ext4SuperblockValidator {
     }
 }
 
+/// A checksummed ext4 metadata block owned by an inode, found by walking the
+/// inodes of a static image (bd-jufod).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Ext4OwnedBlock {
+    /// An extent-tree index or leaf block (checksum seeded by owner ino + generation).
+    ExtentNode { ino: u32, generation: u32 },
+    /// A directory data block; verified only when it carries a checksum tail.
+    DirLeaf { ino: u32, generation: u32 },
+    /// An external extended-attribute block (checksum seeded by block number).
+    Xattr,
+}
+
 /// What a fixed-location ext4 metadata block holds (bd-jufod).
 #[derive(Debug, Clone)]
 enum Ext4MetaBlock {
@@ -589,6 +601,8 @@ enum Ext4MetaBlock {
     BlockBitmap(ffs_ondisk::Ext4GroupDesc),
     /// A group's inode bitmap, checked against that group's descriptor.
     InodeBitmap(ffs_ondisk::Ext4GroupDesc),
+    /// A metadata block owned by an inode (extent node, directory, xattr).
+    Owned(Ext4OwnedBlock),
     /// One block of a group's inode table. Only slots whose inode-bitmap bit is
     /// set are checksum-verified; free slots carry no valid checksum.
     InodeTable {
@@ -727,6 +741,20 @@ impl Ext4MetadataValidator {
         Ok(validator)
     }
 
+    /// Add inode-owned metadata blocks (from an inode walk of a static image).
+    /// Blocks already mapped as fixed metadata keep their fixed meaning. No-op
+    /// without `metadata_csum`, since these blocks then carry no checksum.
+    pub fn add_owned_blocks(&mut self, blocks: impl IntoIterator<Item = (u64, Ext4OwnedBlock)>) {
+        if !self.sb.has_metadata_csum() {
+            return;
+        }
+        for (block, kind) in blocks {
+            self.blocks
+                .entry(block)
+                .or_insert(Ext4MetaBlock::Owned(kind));
+        }
+    }
+
     fn checksum_issue(what: String) -> BlockVerdict {
         BlockVerdict::Corrupt(vec![(
             CorruptionKind::ChecksumMismatch,
@@ -836,6 +864,49 @@ impl BlockValidator for Ext4MetadataValidator {
                 } else {
                     Self::checksum_issue(format!(
                         "ext4 inode checksum mismatch in block {block} for inodes {bad:?}"
+                    ))
+                }
+            }
+            Ext4MetaBlock::Owned(Ext4OwnedBlock::ExtentNode { ino, generation }) => {
+                match ffs_ondisk::ext4::verify_extent_block_checksum(bytes, seed, *ino, *generation)
+                {
+                    Ok(()) => BlockVerdict::Clean,
+                    Err(_) => Self::checksum_issue(format!(
+                        "ext4 extent block checksum mismatch in block {block} (inode {ino})"
+                    )),
+                }
+            }
+            Ext4MetaBlock::Owned(Ext4OwnedBlock::DirLeaf { ino, generation }) => {
+                // Only a block ending in the 12-byte checksum tail dirent
+                // (inode 0, rec_len 12, name_len 0, type 0xDE) can be checked;
+                // htree index blocks carry a different tail and are skipped.
+                let tail = bytes.len().checked_sub(12).and_then(|t| bytes.get(t..));
+                let has_tail = tail.is_some_and(|t| {
+                    t[0..4] == [0, 0, 0, 0] && t[4..6] == [12, 0] && t[6] == 0 && t[7] == 0xDE
+                });
+                if !has_tail {
+                    BlockVerdict::Clean
+                } else if ffs_ondisk::ext4::verify_dir_block_checksum(
+                    bytes,
+                    seed,
+                    *ino,
+                    *generation,
+                )
+                .is_ok()
+                {
+                    BlockVerdict::Clean
+                } else {
+                    Self::checksum_issue(format!(
+                        "ext4 directory block checksum mismatch in block {block} (inode {ino})"
+                    ))
+                }
+            }
+            Ext4MetaBlock::Owned(Ext4OwnedBlock::Xattr) => {
+                if ffs_ondisk::ext4::verify_xattr_block_checksum(bytes, seed, block.0) {
+                    BlockVerdict::Clean
+                } else {
+                    Self::checksum_issue(format!(
+                        "ext4 xattr block checksum mismatch in block {block}"
                     ))
                 }
             }
