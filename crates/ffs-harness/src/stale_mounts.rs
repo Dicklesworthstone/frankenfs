@@ -221,6 +221,45 @@ fn probe_liveness(mountpoint: &Path, timeout: Duration) -> Liveness {
     }
 }
 
+/// Retry a NON-lazy unmount for up to `budget` while the mount is still
+/// present, returning whether it is gone.
+///
+/// The first attempt (dropping the session's `Mount`) has been seen to leave
+/// the mount in place right after a concurrent workload — once in roughly five
+/// full `fuse_e2e` runs, on the 4-worker create/unlink storm — which is the
+/// signature of a transient busy superblock. A lazy detach would hide whether
+/// the server's destroy-time flush ever ran, so only real unmounts are retried
+/// here; the caller still refuses to certify anything if this returns false.
+#[cfg(target_os = "linux")]
+fn retry_clean_unmount(mountpoint: &Path, budget: Duration) -> bool {
+    use std::process::{Command, Stdio};
+
+    let deadline = std::time::Instant::now() + budget;
+    while still_mounted(mountpoint) {
+        if std::time::Instant::now() >= deadline {
+            return false;
+        }
+        std::thread::sleep(Duration::from_millis(100));
+        for (cmd, args) in [
+            ("fusermount3", &["-u"][..]),
+            ("fusermount", &["-u"][..]),
+            ("umount", &[][..]),
+        ] {
+            let status = Command::new(cmd)
+                .args(args)
+                .arg(mountpoint)
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            if matches!(status, Ok(s) if s.success()) {
+                break;
+            }
+        }
+    }
+    true
+}
+
 /// Lazily detach a dead mount: `fusermount3 -uz`, then `fusermount -uz`,
 /// then `umount -l`, and finally — for a server thread wedged so hard the
 /// lazy detach cannot drain it — abort the FUSE connection directly via
@@ -438,7 +477,7 @@ impl MountGuard {
             // Fail before joining in that case; unwinding runs our Drop path.
             #[cfg(target_os = "linux")]
             assert!(
-                !still_mounted(&self.mountpoint),
+                retry_clean_unmount(&self.mountpoint, Duration::from_secs(5)),
                 "clean unmount failed for {}; cannot certify destroy-time persistence",
                 self.mountpoint.display()
             );

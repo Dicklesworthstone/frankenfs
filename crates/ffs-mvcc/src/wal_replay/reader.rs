@@ -53,9 +53,8 @@ impl<'a, R: Read> RecordReader<'a, R> {
                 None,
             ));
         }
-        let total = usize::try_from(u64::from(body_len) + 4).map_err(|_| {
-            FfsError::Format("WAL record exceeds process address space".to_owned())
-        })?;
+        let total = usize::try_from(u64::from(body_len) + 4)
+            .map_err(|_| FfsError::Format("WAL record exceeds process address space".to_owned()))?;
         if total < MIN_COMMIT_RECORD_SIZE {
             return Ok((
                 DecodeResult::Corrupted(format!(
@@ -95,7 +94,9 @@ impl<'a, R: Read> RecordReader<'a, R> {
     }
 
     fn read_tail(&mut self, cx: &Cx, check_zero: bool) -> Result<bool> {
-        let mut scratch = [0_u8; READ_CHUNK_BYTES];
+        // Heap, not stack: READ_CHUNK_BYTES exceeds clippy's large_stack_arrays
+        // bound, and a replay thread's stack is not the place for it.
+        let mut scratch = vec![0_u8; READ_CHUNK_BYTES];
         let mut all_zero = true;
         while self.remaining > 0 {
             let count = usize::try_from(self.remaining)
