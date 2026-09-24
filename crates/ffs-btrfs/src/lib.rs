@@ -2465,10 +2465,33 @@ fn byte_node_provider<'a>(
                 field: "logical_address",
                 reason: "not covered by any chunk",
             })?;
-        let block = read_physical(mapping.physical)?;
-        Ok(Arc::new(parse_btrfs_tree_node_owned(
-            block, csum_type, logical, nodesize,
-        )?))
+        let primary = read_physical(mapping.physical)
+            .and_then(|block| parse_btrfs_tree_node_owned(block, csum_type, logical, nodesize));
+        match primary {
+            Ok(node) => Ok(Arc::new(node)),
+            Err(primary_err) => {
+                // bd-0mcvt: a DUP chunk holds a second copy of this node on the
+                // same device. When the first copy fails its read, checksum or
+                // structural check, try the others before failing, as the
+                // kernel does. Only the failure path pays for this.
+                let stripes = ffs_ondisk::map_logical_to_stripes(chunks, logical)
+                    .ok()
+                    .flatten()
+                    .map(|m| m.stripes)
+                    .unwrap_or_default();
+                for stripe in stripes
+                    .iter()
+                    .filter(|s| s.devid == mapping.devid && s.physical != mapping.physical)
+                {
+                    if let Ok(node) = read_physical(stripe.physical).and_then(|block| {
+                        parse_btrfs_tree_node_owned(block, csum_type, logical, nodesize)
+                    }) {
+                        return Ok(Arc::new(node));
+                    }
+                }
+                Err(primary_err)
+            }
+        }
     }
 }
 

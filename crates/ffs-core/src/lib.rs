@@ -11273,7 +11273,10 @@ impl OpenFs {
                     .map(|m| m.stripes)
                     .unwrap_or_default();
                 let mut recovered = None;
-                for stripe in stripes.iter().filter(|s| s.physical != mapping.physical) {
+                for stripe in stripes
+                    .iter()
+                    .filter(|s| s.devid == mapping.devid && s.physical != mapping.physical)
+                {
                     if let Ok(node) = read_copy(stripe.physical) {
                         warn!(
                             target: "ffs::btrfs::read",
@@ -97009,7 +97012,7 @@ mod tests {
     /// READ-ONLY so `btrfs_lookup_child` takes the keyed on-disk path. Returns
     /// `None` when btrfs-progs is unavailable (test skips).
     fn btrfs_readonly_lookup_fixture(n: u32) -> Option<(OpenFs, Cx, InodeNumber, Vec<String>)> {
-        let (fs, dev, _tmp, _img) = open_writable_btrfs_mkfs(64)?;
+        let (fs, dev, _tmp, _img) = open_writable_btrfs_mkfs(256)?;
         let cx = Cx::for_testing();
         let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
         let mut names = Vec::new();
@@ -97021,6 +97024,12 @@ mod tests {
         }
         fs.flush_mvcc_to_device(&cx)
             .expect("flush writes to device");
+        // btrfs metadata lives in the CoW trees and reaches the image only
+        // through a transaction commit; without it the reopened image had none
+        // of these files. (The fixture used to skip silently because its 64 MiB
+        // image was below the formatter's minimum, so this never ran.)
+        fs.btrfs_full_transaction_commit(&cx, "k115m-fixture")
+            .expect("commit the created names");
         let bytes = dev.snapshot_bytes();
         let ro = OpenFs::from_device(
             &cx,

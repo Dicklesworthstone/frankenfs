@@ -818,6 +818,13 @@ impl BlockValidator for Ext4MetadataValidator {
                         .saturating_mul(self.sb.inodes_per_group)
                         .saturating_add(index)
                         .saturating_add(1);
+                    // Reserved inodes below s_first_ino are marked in-use by
+                    // mkfs, but the unused ones (i_mode == 0) carry no valid
+                    // checksum; e2fsck does not check them either. At or above
+                    // first_ino every live slot is verified.
+                    if ino < self.sb.first_ino && raw.get(..2).is_some_and(|mode| mode == [0, 0]) {
+                        continue;
+                    }
                     if ffs_ondisk::ext4::verify_inode_checksum(raw, seed, ino, self.sb.inode_size)
                         .is_err()
                     {
