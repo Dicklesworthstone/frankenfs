@@ -1428,27 +1428,28 @@ fn fuse_concurrent_create_unlink_multi_worker_keeps_image_clean_bd_iah1f() {
     const WORKERS: u8 = 4;
     const FILES: u32 = 100;
     let errors: Vec<String> = std::thread::scope(|scope| {
-        let handles: Vec<_> = (0..WORKERS)
-            .map(|w| {
-                let shared = shared.clone();
-                scope.spawn(move || {
-                    let mut errors = Vec::new();
-                    for i in 0..FILES {
-                        let path = shared.join(format!("w{w}-{i:03}"));
-                        if let Err(e) = fs::write(&path, vec![w; 4096]) {
-                            errors.push(format!("write {}: {e}", path.display()));
-                            continue;
-                        }
-                        if i % 2 == 0
-                            && let Err(e) = fs::remove_file(&path)
-                        {
-                            errors.push(format!("unlink {}: {e}", path.display()));
-                        }
+        // Spawn every client before joining any: a lazy map-then-join would
+        // run them one after another and test nothing concurrent.
+        let mut handles = Vec::new();
+        for w in 0..WORKERS {
+            let shared = shared.clone();
+            handles.push(scope.spawn(move || {
+                let mut errors = Vec::new();
+                for i in 0..FILES {
+                    let path = shared.join(format!("w{w}-{i:03}"));
+                    if let Err(e) = fs::write(&path, vec![w; 4096]) {
+                        errors.push(format!("write {}: {e}", path.display()));
+                        continue;
                     }
-                    errors
-                })
-            })
-            .collect();
+                    if i % 2 == 0
+                        && let Err(e) = fs::remove_file(&path)
+                    {
+                        errors.push(format!("unlink {}: {e}", path.display()));
+                    }
+                }
+                errors
+            }));
+        }
         handles
             .into_iter()
             .flat_map(|h| h.join().expect("worker thread"))

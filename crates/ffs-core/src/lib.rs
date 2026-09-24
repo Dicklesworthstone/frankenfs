@@ -1834,6 +1834,11 @@ pub struct OpenFs {
     mutation_epoch: std::sync::atomic::AtomicU64,
     /// `mutation_epoch` value covered by the last periodic commit (bd-dj725).
     committed_mutation_epoch: std::sync::atomic::AtomicU64,
+    /// Journal-pressure commit threshold in committed MVCC block writes
+    /// (bd-1o6tq); 0 while no JBD2 writer is attached.
+    jbd2_pressure_limit: std::sync::atomic::AtomicU64,
+    /// Store `committed_block_writes` covered by the last journaled boundary.
+    jbd2_block_writes_at_boundary: std::sync::atomic::AtomicU64,
     /// Optional append-only metadata durability path.
     ///
     /// A sync batches every block newer than `logged_through`, adds the derived
@@ -2007,6 +2012,21 @@ pub struct OpenFs {
     /// scaling, bd-par1). Validation-keyed so each shard self-invalidates and can
     /// never yield a wrong "absent" (bd-f8rd8).
     dir_name_index: Box<[Mutex<Option<DirNameIndex>>]>,
+    /// Count of namespace mutations STARTED (create/mknod/mkdir/unlink/rmdir/
+    /// rename/link/symlink), bumped before the directory is touched
+    /// (bd-xv5lz). A [`DirNameIndex`] records the value it was built or last
+    /// re-stamped at; validation (ctime/mtime/size) alone cannot say whether a
+    /// re-stamp skipped another mutation's added name.
+    namespace_gen: std::sync::atomic::AtomicU64,
+    /// JBD2-style mutation barrier (bd-9rutw): a mutation is several MVCC
+    /// commits (a rename adds the new entry, then removes the old one), and a
+    /// journaled boundary captures whatever is committed when it runs, so one
+    /// landing mid-mutation made HALF of it durable — measured: a post-boundary
+    /// image with the renamed inode at `links_count` 1 and two names. Kernel
+    /// JBD2 never lets a handle span transactions; the boundary here closes
+    /// this gate and waits for in-flight mutations before its capture.
+    mutation_gate: Mutex<MutationGateState>,
+    mutation_gate_cv: parking_lot::Condvar,
     /// When set, `readdir` skips the speculative inode-table prefetch
     /// ([`Self::prefetch_ext4_readdir_inode_table_blocks`]). The prefetch warms
     /// the getattr cache for a stat-heavy listing, but for a readdir-ONLY
@@ -2459,9 +2479,57 @@ struct ReaddirSnapshot {
 /// changes the validation, the match fails, and lookup safely rebuilds and
 /// scans. Built lazily on a negative miss; `OpenFs::create` keeps it current
 /// incrementally so a create-heavy directory stays O(1)/lookup (bd-f8rd8).
+/// State of [`OpenFs::mutation_gate`] (bd-9rutw).
+#[derive(Debug, Default)]
+struct MutationGateState {
+    /// Mutations between `enter_mutation_gate` and `leave_mutation_gate`.
+    in_flight: u64,
+    /// Boundaries waiting for, or holding, a quiescent capture. While
+    /// non-zero no new mutation enters, so `in_flight` drains.
+    closing: u32,
+}
+
+/// Library-path RAII for the mutation gate (FUSE requests enter and leave it
+/// in `begin_request_scope` / `end_request_scope`).
+pub(crate) struct MutationGateGuard<'a>(&'a OpenFs);
+
+impl Drop for MutationGateGuard<'_> {
+    fn drop(&mut self) {
+        self.0.leave_mutation_gate();
+    }
+}
+
+/// Held by a boundary for its capture; reopens the gate on drop.
+struct BoundaryGateGuard<'a>(&'a OpenFs);
+
+impl Drop for BoundaryGateGuard<'_> {
+    fn drop(&mut self) {
+        let mut state = self.0.mutation_gate.lock();
+        state.closing = state.closing.saturating_sub(1);
+        drop(state);
+        self.0.mutation_gate_cv.notify_all();
+    }
+}
+
+/// One in-flight namespace mutation; bumps `OpenFs::namespace_gen` again on
+/// drop (see [`OpenFs::begin_namespace_mutation`], bd-xv5lz).
+pub(crate) struct NamespaceMutation<'a>(&'a std::sync::atomic::AtomicU64);
+
+impl Drop for NamespaceMutation<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+    }
+}
+
 struct DirNameIndex {
     inode: u64,
     validation: ReaddirValidation,
+    /// `OpenFs::namespace_gen` when this set was built or last re-stamped.
+    /// The index answers only while no namespace mutation has started since
+    /// (bd-xv5lz): a rename-in followed by a create used to re-stamp the index
+    /// to the post-create validation without the renamed-in name, and lookup
+    /// then reported an existing entry absent.
+    ns_gen: u64,
     // FxHashSet (not the default SipHash): an internal, non-adversarial name set
     // where ~15% of parallel-create CPU was the default hasher (bd-bhh0i). FxHash
     // is a fast multiply-xor — safe here, the keys are our own entry names.
@@ -6283,6 +6351,8 @@ impl OpenFs {
             mvcc_flushed_through: Mutex::new(CommitSeq(0)),
             mutation_epoch: std::sync::atomic::AtomicU64::new(0),
             committed_mutation_epoch: std::sync::atomic::AtomicU64::new(0),
+            jbd2_pressure_limit: std::sync::atomic::AtomicU64::new(0),
+            jbd2_block_writes_at_boundary: std::sync::atomic::AtomicU64::new(0),
             metadata_log,
             metadata_compactor: Mutex::new(None),
             jbd2_writer: None,
@@ -6312,6 +6382,9 @@ impl OpenFs {
             dir_name_index: (0..DIR_NAME_INDEX_SHARDS)
                 .map(|_| Mutex::new(None))
                 .collect(),
+            namespace_gen: std::sync::atomic::AtomicU64::new(0),
+            mutation_gate: Mutex::new(MutationGateState::default()),
+            mutation_gate_cv: parking_lot::Condvar::new(),
             readdir_prefetch_disabled: std::sync::atomic::AtomicBool::new(false),
             readonly_lookup_cache_disabled: std::sync::atomic::AtomicBool::new(false),
             #[cfg(test)]
@@ -9546,7 +9619,63 @@ impl OpenFs {
             self.mvcc_store
                 .set_conflict_policy(*self.mvcc_conflict_policy.lock());
         }
+        // bd-1o6tq: a boundary journals every block dirtied since the last one
+        // as ONE transaction, and one that outgrows the log is refused
+        // (NoSpace) forever after. Kernel ext4 force-commits the running
+        // transaction as the journal fills; `ext4_commit_on_journal_pressure`
+        // does the same. Half the empty log leaves room for the request that
+        // crosses the limit (a 1 MiB FUSE write is ~260 blocks) plus
+        // descriptor, group-descriptor and superblock blocks.
+        let limit = (writer.free_blocks() / 2).saturating_sub(64).max(1);
+        self.jbd2_pressure_limit
+            .store(limit, std::sync::atomic::Ordering::Release);
+        self.jbd2_block_writes_at_boundary.store(
+            self.mvcc_store.committed_block_writes().unwrap_or(0),
+            std::sync::atomic::Ordering::Release,
+        );
         self.jbd2_writer = Some(Mutex::new(writer));
+    }
+
+    /// Run the journaled durability boundary early when the blocks committed
+    /// since the last one approach the journal's capacity (bd-1o6tq) — the
+    /// counterpart of kernel ext4 committing a transaction because the log is
+    /// filling, not because anyone asked. Called after every write request; a
+    /// cheap no-op while under the limit or without a JBD2 writer. A failure is
+    /// logged, not returned: the request itself already succeeded, and the
+    /// next fsync or unmount reports a boundary that still cannot be made.
+    pub(crate) fn ext4_commit_on_journal_pressure(&self, cx: &Cx) {
+        let limit = self
+            .jbd2_pressure_limit
+            .load(std::sync::atomic::Ordering::Acquire);
+        if limit == 0 {
+            return;
+        }
+        let Some(written) = self.mvcc_store.committed_block_writes() else {
+            return;
+        };
+        let pending = written.saturating_sub(
+            self.jbd2_block_writes_at_boundary
+                .load(std::sync::atomic::Ordering::Acquire),
+        );
+        if pending < limit {
+            return;
+        }
+        match self.flush_mvcc_to_device(cx) {
+            Ok(flushed) => info!(
+                target: "ffs::journal",
+                pending_block_writes = pending,
+                limit,
+                flushed_blocks = flushed,
+                "journal_pressure_commit"
+            ),
+            Err(error) => warn!(
+                target: "ffs::journal",
+                pending_block_writes = pending,
+                limit,
+                %error,
+                "journal_pressure_commit_failed"
+            ),
+        }
     }
 
     /// Whether a JBD2 writer is attached.
@@ -18114,12 +18243,18 @@ impl OpenFs {
             mtime: u64::from(dir_inode.mtime),
             size: dir_inode.size,
         };
+        // bd-xv5lz: read before the index is consulted or rebuilt; any
+        // namespace mutation starting after this moves it and retires both.
+        let ns_gen = self
+            .namespace_gen
+            .load(std::sync::atomic::Ordering::Acquire);
         let index_keyable = dir_inode.number != 0;
         if index_keyable {
             let guard = self.dir_name_index_shard(dir_inode.number).lock();
             if let Some(idx) = guard.as_ref()
                 && idx.inode == dir_inode.number
                 && idx.validation == dir_validation
+                && idx.ns_gen == ns_gen
             {
                 // A complete name->dirent snapshot (read-only mount, immutable
                 // dir) answers a PRESENT lookup in O(1) too — return the entry
@@ -18247,7 +18382,9 @@ impl OpenFs {
             let have_current = {
                 let guard = self.dir_name_index_shard(dir_inode.number).lock();
                 matches!(guard.as_ref(), Some(idx)
-                    if idx.inode == dir_inode.number && idx.validation == dir_validation)
+                    if idx.inode == dir_inode.number
+                        && idx.validation == dir_validation
+                        && idx.ns_gen == ns_gen)
             };
             if !have_current && let Ok(entries) = self.read_dir_with_scope(cx, scope, dir_inode) {
                 let names: rustc_hash::FxHashSet<Vec<u8>> =
@@ -18255,6 +18392,7 @@ impl OpenFs {
                 *self.dir_name_index_shard(dir_inode.number).lock() = Some(DirNameIndex {
                     inode: dir_inode.number,
                     validation: dir_validation,
+                    ns_gen,
                     names,
                     present: None,
                 });
@@ -22745,12 +22883,19 @@ impl OpenFs {
         // boundary's writes, not to shadow a metadata log.
         let capture =
             MetadataLogCaptureDevice::new(self.dev.as_ref(), self.block_size(), BTreeMap::new());
+        // bd-9rutw: capture a QUIESCENT state — no mutation half-applied. The
+        // gate is held only for this in-memory capture, not the journal I/O.
+        let gate = self.close_mutation_gate();
+        // bd-1o6tq: exact under the gate — every commit counted here is in the
+        // capture below.
+        let writes_before = self.mvcc_store.committed_block_writes();
         let (flushed, durable_through) =
             self.mvcc_store
                 .flush_to_device_after(cx, &capture, flushed_through)?;
         self.clear_ext4_writable_group_desc_cache();
         self.ext4_capture_group_descriptors(cx, &capture)?;
         self.ext4_sync_superblock_free_totals_to(cx, &capture)?;
+        drop(gate);
 
         let mut writes = capture.take_writes();
         if writes.is_empty() {
@@ -22875,6 +23020,10 @@ impl OpenFs {
         // as `ext4_persist_group_descriptors_from` does, so drop them.
         self.ext4_group_desc_cache.clear();
         self.ext4_base_block_cache.clear();
+        if let Some(writes) = writes_before {
+            self.jbd2_block_writes_at_boundary
+                .fetch_max(writes, std::sync::atomic::Ordering::AcqRel);
+        }
         Ok(Some((flushed, durable_through)))
     }
 
@@ -40354,6 +40503,10 @@ impl OpenFs {
     pub fn begin_writeback_batch_scope(&self, cx: &Cx) -> ffs_error::Result<RequestScope> {
         let mut scope = <Self as FsOps>::begin_request_scope(self, cx, RequestOp::Write)?;
         scope.defer_commit_until_flush();
+        // A batch spans many requests; holding the mutation gate across them
+        // could deadlock a waiting boundary against the writes that would end
+        // the batch. Its commit is one transaction anyway (bd-9rutw).
+        self.leave_mutation_gate();
         Ok(scope)
     }
 
@@ -40404,6 +40557,8 @@ impl OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        let _gate = self.mutation_gate_guard();
+        let gen_before = self.namespace_gen_now();
         let result = self.handle_ext4_write_result(
             "create",
             self.with_latest_scope(|scope| {
@@ -40418,7 +40573,7 @@ impl OpenFs {
             // the index validation is keyed on — is only visible once committed.
             // Best-effort + validation-keyed: on any error or mismatch the index
             // simply rebuilds on the next negative lookup (never a wrong answer).
-            self.note_dir_name_index_insert(cx, parent, name.as_encoded_bytes());
+            self.note_dir_name_index_insert(cx, parent, name.as_encoded_bytes(), gen_before);
         }
         result
     }
@@ -40429,10 +40584,27 @@ impl OpenFs {
     /// current across a create stream. A no-op unless the slot already holds
     /// this parent's index (a different dir, or none yet → the next negative
     /// lookup rebuilds). Read-only / non-ext4 / read failures are ignored.
-    fn note_dir_name_index_insert(&self, cx: &Cx, parent: InodeNumber, name: &[u8]) {
+    ///
+    /// `gen_before` is [`Self::namespace_gen`] read before the caller's own
+    /// mutation (bd-xv5lz). The re-stamp is sound only when that mutation was
+    /// the only one: it moved the counter by exactly 2 (start + end), and the
+    /// index was stamped just before it or while it ran. Anything else — a
+    /// concurrent mutation, or a mutation the index never saw (the rename-in
+    /// that used to be missing here) — drops the index instead.
+    fn note_dir_name_index_insert(
+        &self,
+        cx: &Cx,
+        parent: InodeNumber,
+        name: &[u8],
+        gen_before: u64,
+    ) {
         if !matches!(&self.flavor, FsFlavor::Ext4(_)) {
             return;
         }
+        let gen_after = self
+            .namespace_gen
+            .load(std::sync::atomic::Ordering::Acquire);
+        let sole_mutation = gen_after == gen_before.wrapping_add(2);
         let canonical = Self::ext4_canonical_inode(parent);
         // Metadata-only read: the index validation stamp needs only the parent's
         // ctime/mtime/size + number, never its xattrs, and this path never
@@ -40453,7 +40625,11 @@ impl OpenFs {
         };
         let mut guard = self.dir_name_index_shard(parent_inode.number).lock();
         match guard.as_mut() {
-            Some(idx) if idx.inode == parent_inode.number => {
+            Some(idx)
+                if sole_mutation
+                    && idx.inode == parent_inode.number
+                    && (idx.ns_gen == gen_before || idx.ns_gen == gen_before.wrapping_add(1)) =>
+            {
                 // A read-only present snapshot owns every existing name. Move
                 // those keys into the membership set before demoting it so the
                 // set remains complete without keeping duplicate allocations
@@ -40463,11 +40639,80 @@ impl OpenFs {
                 }
                 idx.names.insert(name.to_vec());
                 idx.validation = validation;
+                idx.ns_gen = gen_after;
             }
-            // No index for this dir yet (or a stale/other-dir slot): drop it so
-            // the next negative lookup rebuilds against the fresh state.
+            // No index for this dir yet, a stale/other-dir slot, or a mutation
+            // this index did not see: drop it so the next negative lookup
+            // rebuilds against the fresh state.
             _ => *guard = None,
         }
+    }
+
+    /// Mark the start of one namespace mutation (bd-xv5lz): bumps
+    /// [`Self::namespace_gen`] now and again when the returned guard drops, so
+    /// a name index stamped while the mutation was in flight is retired when
+    /// it ends, and one stamped before it is retired when it starts.
+    pub(crate) fn begin_namespace_mutation(&self) -> NamespaceMutation<'_> {
+        self.namespace_gen
+            .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
+        NamespaceMutation(&self.namespace_gen)
+    }
+
+    /// Enter the mutation gate (bd-9rutw), waiting while a boundary captures.
+    /// Every call must be paired with exactly one [`Self::leave_mutation_gate`];
+    /// library callers use [`Self::mutation_gate_guard`]. Never called from
+    /// inside a boundary, and no boundary runs while a thread is inside —
+    /// fsync, flush-on-destroy, the periodic and journal-pressure commits and
+    /// repair writeback are all outside the gated set.
+    pub(crate) fn enter_mutation_gate(&self) {
+        let mut state = self.mutation_gate.lock();
+        while state.closing > 0 {
+            self.mutation_gate_cv.wait(&mut state);
+        }
+        state.in_flight += 1;
+    }
+
+    pub(crate) fn leave_mutation_gate(&self) {
+        let mut state = self.mutation_gate.lock();
+        state.in_flight = state.in_flight.saturating_sub(1);
+        let drained = state.in_flight == 0;
+        drop(state);
+        if drained {
+            self.mutation_gate_cv.notify_all();
+        }
+    }
+
+    /// Request ops that run inside the mutation gate: every write EXCEPT the
+    /// ones that run a boundary themselves (fsync, fsyncdir) or write repaired
+    /// blocks through their own flush (repair writeback) — gating those would
+    /// make the boundary wait on itself.
+    pub(crate) const fn request_op_is_gated_mutation(op: RequestOp) -> bool {
+        op.is_write()
+            && !matches!(
+                op,
+                RequestOp::Fsync | RequestOp::Fsyncdir | RequestOp::RepairWriteback
+            )
+    }
+
+    pub(crate) fn mutation_gate_guard(&self) -> MutationGateGuard<'_> {
+        self.enter_mutation_gate();
+        MutationGateGuard(self)
+    }
+
+    /// Close the gate and wait until no mutation is in flight (bd-9rutw).
+    fn close_mutation_gate(&self) -> BoundaryGateGuard<'_> {
+        let mut state = self.mutation_gate.lock();
+        state.closing += 1;
+        while state.in_flight > 0 {
+            self.mutation_gate_cv.wait(&mut state);
+        }
+        drop(state);
+        BoundaryGateGuard(self)
+    }
+
+    fn namespace_gen_now(&self) -> u64 {
+        self.namespace_gen
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     /// The name-index shard for a directory inode (sharded by `inode % N` to
@@ -40494,6 +40739,8 @@ impl OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        let _gate = self.mutation_gate_guard();
+        let gen_before = self.namespace_gen_now();
         let result = self.handle_ext4_write_result(
             "mknod",
             self.with_latest_scope(|scope| {
@@ -40503,7 +40750,7 @@ impl OpenFs {
         if result.is_ok() {
             // bd-f8rd8: keep the parent's name index current across this add too,
             // so a mixed create/mknod stream keeps O(1) existence checks.
-            self.note_dir_name_index_insert(cx, parent, name.as_encoded_bytes());
+            self.note_dir_name_index_insert(cx, parent, name.as_encoded_bytes(), gen_before);
         }
         result
     }
@@ -40517,6 +40764,8 @@ impl OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        let _gate = self.mutation_gate_guard();
+        let gen_before = self.namespace_gen_now();
         let result = self.handle_ext4_write_result(
             "mkdir",
             self.with_latest_scope(|scope| {
@@ -40527,12 +40776,13 @@ impl OpenFs {
             // bd-f8rd8: keep the parent's name index current so a mkdir-heavy (or
             // mixed create+mkdir, e.g. tar-extract) directory keeps O(1)
             // existence checks instead of rebuilding the index on every mkdir.
-            self.note_dir_name_index_insert(cx, parent, name.as_encoded_bytes());
+            self.note_dir_name_index_insert(cx, parent, name.as_encoded_bytes(), gen_before);
         }
         result
     }
 
     pub fn unlink(&self, cx: &Cx, parent: InodeNumber, name: &OsStr) -> ffs_error::Result<()> {
+        let _gate = self.mutation_gate_guard();
         self.handle_ext4_write_result(
             "unlink",
             self.with_latest_scope(|scope| <Self as FsOps>::unlink(self, cx, scope, parent, name)),
@@ -40556,6 +40806,7 @@ impl OpenFs {
     }
 
     pub fn rmdir(&self, cx: &Cx, parent: InodeNumber, name: &OsStr) -> ffs_error::Result<()> {
+        let _gate = self.mutation_gate_guard();
         self.handle_ext4_write_result(
             "rmdir",
             self.with_latest_scope(|scope| <Self as FsOps>::rmdir(self, cx, scope, parent, name)),
@@ -40570,12 +40821,18 @@ impl OpenFs {
         new_parent: InodeNumber,
         new_name: &OsStr,
     ) -> ffs_error::Result<()> {
+        let _gate = self.mutation_gate_guard();
+        let gen_before = self.namespace_gen_now();
         self.handle_ext4_write_result(
             "rename",
             self.with_latest_scope(|scope| {
                 <Self as FsOps>::rename(self, cx, scope, parent, name, new_parent, new_name)
             }),
-        )
+        )?;
+        // bd-xv5lz: the rename ADDS `new_name` to `new_parent`, exactly like
+        // link. Without this a later create re-stamped the index without it.
+        self.note_dir_name_index_insert(cx, new_parent, new_name.as_encoded_bytes(), gen_before);
+        Ok(())
     }
 
     pub fn write(
@@ -40585,12 +40842,21 @@ impl OpenFs {
         offset: u64,
         data: &[u8],
     ) -> ffs_error::Result<u32> {
-        self.handle_ext4_write_result(
-            "write",
-            self.with_latest_scope(|scope| {
-                <Self as FsOps>::write(self, cx, scope, ino, offset, data)
-            }),
-        )
+        let written = {
+            // Dropped before the pressure commit below, which is a boundary and
+            // waits for the gate to drain (bd-9rutw).
+            let _gate = self.mutation_gate_guard();
+            self.handle_ext4_write_result(
+                "write",
+                self.with_latest_scope(|scope| {
+                    <Self as FsOps>::write(self, cx, scope, ino, offset, data)
+                }),
+            )?
+        };
+        // Library writes bypass `end_request_scope`, where the FUSE path runs
+        // this; data volume is what fills a journal (bd-1o6tq).
+        self.ext4_commit_on_journal_pressure(cx);
+        Ok(written)
     }
 
     pub fn setxattr(
@@ -40601,6 +40867,7 @@ impl OpenFs {
         value: &[u8],
         mode: XattrSetMode,
     ) -> ffs_error::Result<()> {
+        let _gate = self.mutation_gate_guard();
         self.handle_ext4_write_result(
             "setxattr",
             self.with_latest_scope(|scope| {
@@ -40610,6 +40877,7 @@ impl OpenFs {
     }
 
     pub fn removexattr(&self, cx: &Cx, ino: InodeNumber, name: &str) -> ffs_error::Result<bool> {
+        let _gate = self.mutation_gate_guard();
         self.handle_ext4_write_result(
             "removexattr",
             self.with_latest_scope(|scope| {
@@ -40658,6 +40926,7 @@ impl OpenFs {
         length: u64,
         mode: i32,
     ) -> ffs_error::Result<()> {
+        let _gate = self.mutation_gate_guard();
         self.handle_ext4_write_result(
             "fallocate",
             self.with_latest_scope(|scope| {
@@ -41076,6 +41345,8 @@ impl OpenFs {
         new_parent: InodeNumber,
         new_name: &OsStr,
     ) -> ffs_error::Result<InodeAttr> {
+        let _gate = self.mutation_gate_guard();
+        let gen_before = self.namespace_gen_now();
         let result = self.handle_ext4_write_result(
             "link",
             self.with_latest_scope(|scope| {
@@ -41084,7 +41355,12 @@ impl OpenFs {
         );
         if result.is_ok() {
             // bd-f8rd8: the new hardlink adds `new_name` into `new_parent`.
-            self.note_dir_name_index_insert(cx, new_parent, new_name.as_encoded_bytes());
+            self.note_dir_name_index_insert(
+                cx,
+                new_parent,
+                new_name.as_encoded_bytes(),
+                gen_before,
+            );
         }
         result
     }
@@ -41098,6 +41374,8 @@ impl OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        let _gate = self.mutation_gate_guard();
+        let gen_before = self.namespace_gen_now();
         let result = self.handle_ext4_write_result(
             "symlink",
             self.with_latest_scope(|scope| {
@@ -41106,7 +41384,7 @@ impl OpenFs {
         );
         if result.is_ok() {
             // bd-f8rd8: keep the parent's name index current across symlink adds.
-            self.note_dir_name_index_insert(cx, parent, name.as_encoded_bytes());
+            self.note_dir_name_index_insert(cx, parent, name.as_encoded_bytes(), gen_before);
         }
         result
     }
@@ -41121,6 +41399,7 @@ impl OpenFs {
         ino: InodeNumber,
         attrs: &SetAttrRequest,
     ) -> ffs_error::Result<InodeAttr> {
+        let _gate = self.mutation_gate_guard();
         self.handle_ext4_write_result(
             "setattr",
             self.with_latest_scope(|scope| <Self as FsOps>::setattr(self, cx, scope, ino, attrs)),
@@ -64226,6 +64505,286 @@ mod tests {
             reopened.read(&cx, attr.ino, 0, 4096).expect("read home"),
             vec![0x77_u8; 4096],
             "after the tick the bytes are at home without any fsync"
+        );
+    }
+
+    /// A durability boundary larger than the journal must still persist. The
+    /// JBD2 boundary journals every unflushed block as ONE transaction, and a
+    /// 64 MiB mkfs image has a 4 MiB (1024-block) journal, so 8 MiB written
+    /// without fsync exceeds it. Kernel ext4 never builds such a transaction —
+    /// it commits as the journal fills. If the boundary cannot split, the
+    /// preflight NoSpace makes this fsync (and every later one, and the unmount
+    /// flush) fail forever: the data is unpersistable.
+    #[test]
+    fn ext4_jbd2_boundary_larger_than_journal_still_persists() {
+        let cx = Cx::for_testing();
+        let Some((mut fs, dev, _tmp)) = open_writable_ext4_mkfs_with_device(64) else {
+            oracle_unavailable("ext4 image formatter");
+            return;
+        };
+        assert!(
+            fs.attach_ext4_internal_jbd2_writer(&cx)
+                .expect("attach the image's own journal")
+        );
+        let attr = fs
+            .create(&cx, InodeNumber(2), OsStr::new("big.bin"), 0o644, 0, 0)
+            .expect("create");
+        let chunk: Vec<u8> = (0..1024 * 1024_u32).map(|i| (i % 253) as u8).collect();
+        for mib in 0..8_u64 {
+            fs.write(&cx, attr.ino, mib * 1024 * 1024, &chunk)
+                .expect("un-fsynced write");
+        }
+        fs.fsync(&cx, attr.ino, 0, false)
+            .expect("fsync of a boundary larger than the journal must succeed");
+
+        let opts = OpenOptions {
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+            ..OpenOptions::default()
+        };
+        let reopened = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(dev.snapshot_bytes())),
+            &opts,
+        )
+        .expect("reopen the image as fsync left it");
+        for mib in 0..8_u64 {
+            assert_eq!(
+                reopened
+                    .read(&cx, attr.ino, mib * 1024 * 1024, 1024 * 1024)
+                    .expect("read home"),
+                chunk,
+                "MiB {mib} must be at home after fsync"
+            );
+        }
+    }
+
+    /// A name re-added by rename must stay findable by lookup as the directory
+    /// grows. Found by the bd-9rutw probe: after ~570 steps of rename a<->b plus
+    /// create/write/(unlink) churn, `readdir` listed "a" while `lookup("a")`
+    /// returned NotFound — on every run, at the same step. This is the same
+    /// workload with no concurrency and no journal, to separate a namespace
+    /// defect from the boundary race the probe was written for.
+    #[test]
+    fn ext4_rename_readd_stays_lookupable_as_directory_grows() {
+        let cx = Cx::for_testing();
+        let Some((fs, _tmp)) = open_writable_ext4_mkfs(32) else {
+            oracle_unavailable("ext4 image formatter");
+            return;
+        };
+        rename_readd_workload(&cx, &fs, None, "sharded");
+
+        // Same workload on the store a JBD2 mount uses, with and without
+        // journaled boundaries interleaved on the SAME thread (deterministic).
+        for (flush_every, label) in [(None, "jbd2"), (Some(7), "jbd2+boundary")] {
+            let Some((mut fs, _dev, _tmp)) = open_writable_ext4_mkfs_with_device(32) else {
+                oracle_unavailable("ext4 image formatter");
+                return;
+            };
+            assert!(
+                fs.attach_ext4_internal_jbd2_writer(&cx)
+                    .expect("attach journal")
+            );
+            rename_readd_workload(&cx, &fs, flush_every, label);
+        }
+    }
+
+    fn rename_readd_workload(cx: &Cx, fs: &OpenFs, flush_every: Option<u32>, label: &str) {
+        let root = InodeNumber(2);
+        let attr = fs
+            .create(cx, root, OsStr::new("a"), 0o644, 0, 0)
+            .expect("create");
+        fs.write(cx, attr.ino, 0, &[0x42_u8; 8192]).expect("write");
+        for i in 0..900_u32 {
+            let (from, to) = if i.is_multiple_of(2) {
+                ("a", "b")
+            } else {
+                ("b", "a")
+            };
+            fs.rename(cx, root, OsStr::new(from), root, OsStr::new(to))
+                .unwrap_or_else(|e| panic!("{label}: rename {from}->{to} at step {i}: {e:?}"));
+            assert!(
+                fs.lookup(cx, root, OsStr::new(to)).is_ok(),
+                "{label}: step {i}: `{to}` was just renamed into place but lookup cannot find it"
+            );
+            let name = format!("t{i}");
+            let tmp_attr = fs
+                .create(cx, root, OsStr::new(&name), 0o644, 0, 0)
+                .unwrap_or_else(|e| panic!("{label}: create {name}: {e:?}"));
+            fs.write(cx, tmp_attr.ino, 0, &[0x17_u8; 4096])
+                .unwrap_or_else(|e| panic!("{label}: write {name}: {e:?}"));
+            if !i.is_multiple_of(3) {
+                fs.unlink(cx, root, OsStr::new(&name))
+                    .unwrap_or_else(|e| panic!("{label}: unlink {name}: {e:?}"));
+            }
+            if flush_every.is_some_and(|every| i.is_multiple_of(every)) {
+                fs.flush_mvcc_to_device(cx)
+                    .unwrap_or_else(|e| panic!("{label}: boundary at step {i}: {e:?}"));
+            }
+        }
+    }
+
+    /// bd-9rutw: a durability boundary must never persist HALF of a namespace
+    /// operation. ext4 create/unlink/rename are several MVCC commits each, and
+    /// a boundary journals whatever is committed when it runs — so one landing
+    /// mid-operation (another thread's fsync, the periodic tick, the
+    /// journal-pressure commit) can make a partial rename or create durable.
+    /// Kernel JBD2 never splits a handle across transactions. Every snapshot
+    /// taken right after a boundary must be e2fsck-clean.
+    #[test]
+    fn ext4_boundary_never_persists_half_a_namespace_op_bd_9rutw() {
+        let cx = Cx::for_testing();
+        let Some((mut fs, dev, tmp)) = open_writable_ext4_mkfs_with_device(32) else {
+            oracle_unavailable("ext4 image formatter");
+            return;
+        };
+        assert!(
+            fs.attach_ext4_internal_jbd2_writer(&cx)
+                .expect("attach the image's own journal")
+        );
+        let root = InodeNumber(2);
+        let attr = fs
+            .create(&cx, root, OsStr::new("a"), 0o644, 0, 0)
+            .expect("create");
+        fs.write(&cx, attr.ino, 0, &[0x42_u8; 8192]).expect("write");
+        fs.fsync(&cx, attr.ino, 0, false).expect("initial fsync");
+
+        // One step of the workload: rename the file back and forth, and churn a
+        // temp file through create/write/(unlink). `phase` keeps names unique.
+        let step = |cx: &Cx, phase: &str, i: u32| {
+            let (from, to) = if i.is_multiple_of(2) {
+                ("a", "b")
+            } else {
+                ("b", "a")
+            };
+            if let Err(e) = fs.rename(cx, root, OsStr::new(from), root, OsStr::new(to)) {
+                // Diagnose: is the name gone for good (lost update) or was it a
+                // transiently stale read that a retry now resolves?
+                let names = || {
+                    fs.readdir(cx, root, 0).map(|entries| {
+                        entries
+                            .iter()
+                            .map(|entry| String::from_utf8_lossy(&entry.name).into_owned())
+                            .filter(|name| name == "a" || name == "b")
+                            .collect::<Vec<_>>()
+                    })
+                };
+                let now = (
+                    fs.lookup(cx, root, OsStr::new("a")).is_ok(),
+                    fs.lookup(cx, root, OsStr::new("b")).is_ok(),
+                    names(),
+                );
+                std::thread::sleep(std::time::Duration::from_millis(200));
+                let later = (
+                    fs.lookup(cx, root, OsStr::new("a")).is_ok(),
+                    fs.lookup(cx, root, OsStr::new("b")).is_ok(),
+                    names(),
+                );
+                let dir = fs.read_inode(cx, root).expect("root inode");
+                let dir_shape = (
+                    dir.has_htree_index(),
+                    dir.size,
+                    fs.collect_extents(cx, &dir).map(|e| e.len()),
+                );
+                // Which fast path answers "absent"? The negative name index
+                // (current validation, name missing) or the htree descent?
+                let validation = ReaddirValidation {
+                    ctime: (u64::from(dir.ctime) << 32) | u64::from(dir.ctime_extra),
+                    mtime: u64::from(dir.mtime),
+                    size: dir.size,
+                };
+                let name_index = fs
+                    .dir_name_index_shard(dir.number)
+                    .lock()
+                    .as_ref()
+                    .map(|idx| {
+                        (
+                            idx.inode == dir.number && idx.validation == validation,
+                            idx.names.contains(b"a".as_slice()),
+                            idx.names.len(),
+                        )
+                    });
+                let htree = match fs.htree_lookup_name_authoritative(
+                    cx,
+                    &RequestScope::empty(),
+                    &dir,
+                    b"a",
+                ) {
+                    HtreeNameProbe::Found(_) => "found",
+                    HtreeNameProbe::AuthoritativelyAbsent => "absent",
+                    HtreeNameProbe::Untrusted => "untrusted",
+                };
+                eprintln!(
+                    "DIAG name_index (current?, has a?, len) {name_index:?}; htree probe for a: {htree}"
+                );
+                let after_boundary = fs.flush_mvcc_to_device(cx).map(|_| {
+                    (
+                        fs.lookup(cx, root, OsStr::new("a")).is_ok(),
+                        fs.lookup(cx, root, OsStr::new("b")).is_ok(),
+                    )
+                });
+                panic!(
+                    "{phase} rename {from}->{to} at step {i}: {e:?}; \
+                     (a?, b?, readdir) now {now:?}, after 200ms {later:?}; \
+                     root (htree?, size, extents) {dir_shape:?}; \
+                     (a?, b?) after a fresh boundary {after_boundary:?}"
+                );
+            }
+            let name = format!("{phase}{i}");
+            let tmp_attr = fs
+                .create(cx, root, OsStr::new(&name), 0o644, 0, 0)
+                .unwrap_or_else(|e| panic!("{phase} create {name}: {e:?}"));
+            fs.write(cx, tmp_attr.ino, 0, &[0x17_u8; 4096])
+                .unwrap_or_else(|e| panic!("{phase} write {name}: {e:?}"));
+            if !i.is_multiple_of(3) {
+                fs.unlink(cx, root, OsStr::new(&name))
+                    .unwrap_or_else(|e| panic!("{phase} unlink {name}: {e:?}"));
+            }
+        };
+        // Control: the same workload with no concurrent boundary must work,
+        // so a failure below is attributable to the concurrency.
+        for i in 0..200_u32 {
+            step(&cx, "serial", i);
+        }
+
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let failures = std::sync::Mutex::new(Vec::<String>::new());
+        let checked = std::sync::atomic::AtomicUsize::new(0);
+        let snapshot_path = tmp.path().join("boundary-snapshot.ext4");
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let cx = Cx::for_testing();
+                // 200 serial steps left the file at "a" (even count).
+                for i in 0..1500_u32 {
+                    step(&cx, "concurrent", i);
+                }
+                stop.store(true, std::sync::atomic::Ordering::Release);
+            });
+            scope.spawn(|| {
+                let cx = Cx::for_testing();
+                while !stop.load(std::sync::atomic::Ordering::Acquire)
+                    && checked.load(std::sync::atomic::Ordering::Relaxed) < 40
+                {
+                    fs.flush_mvcc_to_device(&cx).expect("boundary");
+                    std::fs::write(&snapshot_path, dev.snapshot_bytes()).expect("snapshot");
+                    let n = checked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    if let Some((clean, output)) = run_e2fsck(&snapshot_path)
+                        && !clean
+                    {
+                        failures
+                            .lock()
+                            .expect("failures")
+                            .push(format!("snapshot {n}:\n{output}"));
+                    }
+                }
+            });
+        });
+        let failures = failures.into_inner().expect("failures");
+        assert!(
+            failures.is_empty(),
+            "{} of {} post-boundary snapshots were not e2fsck-clean; first:\n{}",
+            failures.len(),
+            checked.load(std::sync::atomic::Ordering::Relaxed),
+            failures.first().map_or("", String::as_str)
         );
     }
 

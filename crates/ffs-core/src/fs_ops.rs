@@ -358,6 +358,8 @@ impl OpenFs {
             *self.dir_name_index_shard(canonical.0).lock() = Some(DirNameIndex {
                 inode: canonical.0,
                 validation,
+                // Read-only: no namespace mutation can move this (bd-xv5lz).
+                ns_gen: self.namespace_gen_now(),
                 // `present` is complete and lookup consults it first, so
                 // cloning every key into `names` would only duplicate
                 // ownership. Demotion moves these keys into the set.
@@ -973,6 +975,7 @@ impl FsOps for OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
         match &self.flavor {
             FsFlavor::Ext4(_) => self
@@ -1004,6 +1007,7 @@ impl FsOps for OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
         match &self.flavor {
             FsFlavor::Ext4(_) => self
@@ -1035,6 +1039,7 @@ impl FsOps for OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
         match &self.flavor {
             FsFlavor::Ext4(_) => self
@@ -1062,6 +1067,7 @@ impl FsOps for OpenFs {
         parent: InodeNumber,
         name: &OsStr,
     ) -> ffs_error::Result<()> {
+        let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
         match &self.flavor {
             FsFlavor::Ext4(_) => self.ext4_unlink_impl(
@@ -1085,6 +1091,7 @@ impl FsOps for OpenFs {
         parent: InodeNumber,
         name: &OsStr,
     ) -> ffs_error::Result<()> {
+        let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
         match &self.flavor {
             FsFlavor::Ext4(_) => self.ext4_unlink_impl(
@@ -1129,6 +1136,7 @@ impl FsOps for OpenFs {
         new_parent: InodeNumber,
         new_name: &OsStr,
     ) -> ffs_error::Result<()> {
+        let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
         match &self.flavor {
             FsFlavor::Ext4(_) => self.ext4_rename(
@@ -1255,6 +1263,7 @@ impl FsOps for OpenFs {
         new_parent: InodeNumber,
         new_name: &OsStr,
     ) -> ffs_error::Result<InodeAttr> {
+        let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
         match &self.flavor {
             FsFlavor::Ext4(_) => self
@@ -1295,6 +1304,7 @@ impl FsOps for OpenFs {
                 "symlink target must not contain NUL".into(),
             ));
         }
+        let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
         match &self.flavor {
             FsFlavor::Ext4(_) => self
@@ -4191,6 +4201,13 @@ impl FsOps for OpenFs {
     }
 
     fn begin_request_scope(&self, _cx: &Cx, op: RequestOp) -> ffs_error::Result<RequestScope> {
+        // bd-9rutw: the whole request — its eager commits AND its scope commit —
+        // runs inside the mutation gate, so a journaled boundary never captures
+        // half of it. Nothing below can fail, so `end_request_scope` always
+        // pairs this.
+        if Self::request_op_is_gated_mutation(op) {
+            self.enter_mutation_gate();
+        }
         let (snapshot, tx) = if op.is_write() {
             // bd-dj725: feeds the periodic commit's "anything changed?" check.
             self.mutation_epoch
@@ -4240,10 +4257,11 @@ impl FsOps for OpenFs {
 
     fn end_request_scope(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         op: RequestOp,
         scope: RequestScope,
     ) -> ffs_error::Result<()> {
+        let deferred = scope.is_deferred_until_flush();
         // Only WRITE scopes register a snapshot (see begin_request_scope); read
         // scopes carry a snapshot value but never pin it in `active_snapshots`, so
         // there is nothing to release. Keyed on `op.is_write()` (symmetric with the
@@ -4280,6 +4298,18 @@ impl FsOps for OpenFs {
                 txn_id,
                 "mvcc_request_scope_end_write_aborted"
             );
+        }
+
+        // Leave the gate BEFORE the pressure commit: that is a boundary, and it
+        // waits for the gate to drain (bd-9rutw). A writeback batch left it at
+        // `begin_writeback_batch_scope`.
+        if Self::request_op_is_gated_mutation(op) && !deferred {
+            self.leave_mutation_gate();
+        }
+
+        // bd-1o6tq: commit early if the dirty set is outgrowing the journal.
+        if op.is_write() {
+            self.ext4_commit_on_journal_pressure(cx);
         }
 
         Ok(())

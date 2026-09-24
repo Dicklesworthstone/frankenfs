@@ -298,6 +298,16 @@ impl FsMvccStore {
         }
     }
 
+    /// Blocks installed by successful commits since the store was created
+    /// (bd-1o6tq). `None` for the sharded store, which never carries a JBD2
+    /// writer (attaching one switches to the single store).
+    pub(super) fn committed_block_writes(&self) -> Option<u64> {
+        match self {
+            Self::Single(lock) => Some(lock.read().committed_block_writes()),
+            Self::Sharded(_) => None,
+        }
+    }
+
     pub(super) fn version_count(&self) -> usize {
         match self {
             Self::Single(lock) => lock.read().version_count(),

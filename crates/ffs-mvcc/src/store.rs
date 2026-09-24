@@ -39,6 +39,10 @@ pub struct MvccStore {
     aborted_transactions: u64,
     /// Total number of SSI conflicts observed since store creation.
     ssi_conflicts: u64,
+    /// Blocks installed by successful commits since store creation (the sum of
+    /// write-set sizes). An upper bound on distinct dirty blocks, read by the
+    /// filesystem to force a journaled boundary before it outgrows the journal.
+    committed_block_writes: u64,
     /// Conflict resolution policy (Strict / SafeMerge / Adaptive).
     conflict_policy: ConflictPolicy,
     /// Configuration for the adaptive expected-loss decision model.
@@ -72,6 +76,7 @@ impl MvccStore {
             gc_throttled: false,
             aborted_transactions: 0,
             ssi_conflicts: 0,
+            committed_block_writes: 0,
             conflict_policy: ConflictPolicy::default(),
             adaptive_config: AdaptivePolicyConfig::default(),
             contention_metrics: ContentionMetrics::default(),
@@ -268,6 +273,13 @@ impl MvccStore {
             chain_cap,
             critical_chain_length,
         }
+    }
+
+    /// Blocks installed by successful commits since store creation (sum of
+    /// write-set sizes; a block rewritten twice counts twice).
+    #[must_use]
+    pub const fn committed_block_writes(&self) -> u64 {
+        self.committed_block_writes
     }
 
     /// Monotonic transaction outcome counters since store creation.
@@ -582,6 +594,9 @@ impl MvccStore {
     ) {
         let duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
         self.runtime_metrics.record_commit_success(duration_us);
+        self.committed_block_writes = self
+            .committed_block_writes
+            .saturating_add(u64::try_from(write_set_size).unwrap_or(u64::MAX));
         let Some(sink) = &self.evidence_sink else {
             return;
         };

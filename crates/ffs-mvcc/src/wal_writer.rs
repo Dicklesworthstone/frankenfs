@@ -515,12 +515,11 @@ impl WalWriter {
     /// Resetting counters or fixing the underlying device does not unseal an
     /// instance; reopening and replay are required to resolve the disk state.
     pub fn ensure_ready(&self) -> std::result::Result<(), WalWriteError> {
-        match &self.recovery_required {
-            Some(detail) => Err(WalWriteError::RecoveryRequired {
+        self.recovery_required.as_ref().map_or(Ok(()), |detail| {
+            Err(WalWriteError::RecoveryRequired {
                 detail: detail.clone(),
-            }),
-            None => Ok(()),
-        }
+            })
+        })
     }
 
     /// Current WAL file size (byte offset of the next write).

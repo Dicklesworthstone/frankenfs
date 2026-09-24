@@ -98,7 +98,7 @@ fn coordinator_orders_unsorted_epochs_without_reordering_equal_epoch_records() {
     let mut expected = entries.clone();
     expected.sort_by_key(|entry| entry.epoch);
     let (result, remaining) = coordinator.flush_epoch(entries, 64).expect("flush");
-    assert!(remaining.is_empty());
+    assert_eq!(remaining, Vec::new());
     assert_eq!(result.entries_written, expected.len());
     assert_eq!(*writer.0.lock().expect("recorded entries"), expected);
 }

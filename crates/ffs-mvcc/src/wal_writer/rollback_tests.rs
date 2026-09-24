@@ -125,7 +125,7 @@ fn complete_but_unacknowledged_record_is_removed_on_append_error() {
         .ensure_ready()
         .expect("rollback includes mandatory sync in Manual mode");
     drop(writer);
-    assert!(replay_file(&path).is_empty());
+    assert_eq!(replay_file(&path), Vec::new());
 }
 
 #[test]

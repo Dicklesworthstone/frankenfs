@@ -2418,6 +2418,197 @@ fn cli_mount_managed_unmount_timeout_rejected_in_standard_mode() {
     emit_scenario_result("cli_mount_standard_rejects_managed_timeout", "PASS", None);
 }
 
+/// bd-dj725: the periodic commit is the only thing between an un-fsynced
+/// write and its loss on a crash. Mount the real binary read-write, write
+/// without fsync, wait past the commit interval, SIGKILL the daemon, then replay
+/// the journal exactly as a kernel mount would (`e2fsck -E journal_only`): the
+/// file must be there byte-exact on an `e2fsck -fn`-clean image.
+///
+/// The control arm disables the tick (`--commit-interval-secs 0`) and must NOT
+/// keep the bytes — otherwise something other than the periodic commit made
+/// them durable and the positive arm would prove nothing.
+#[test]
+fn cli_mount_periodic_commit_survives_sigkill_bd_dj725() {
+    let require = std::env::var_os("FFS_REQUIRE_FUSE").is_some_and(|v| v == "1");
+    let prerequisites = Path::new("/dev/fuse").exists()
+        && ["mkfs.ext4", "e2fsck", "debugfs", "fusermount3"]
+            .iter()
+            .all(|tool| command_available(tool));
+    if !prerequisites {
+        assert!(
+            !require,
+            "FFS_REQUIRE_FUSE=1 but /dev/fuse, e2fsprogs or fusermount3 is missing"
+        );
+        emit_scenario_result(
+            "cli_mount_periodic_commit_sigkill",
+            "SKIP",
+            Some("fuse_or_e2fsprogs_unavailable"),
+        );
+        return;
+    }
+    let payload: Vec<u8> = (0..65_536_u32).map(|i| (i % 251) as u8).collect();
+
+    let kept = match periodic_commit_sigkill_arm(1, &payload, require) {
+        SigkillArm::Skipped => return,
+        SigkillArm::Missing => None,
+        SigkillArm::Bytes(bytes) => Some(bytes),
+    };
+    assert_eq!(
+        kept.as_deref(),
+        Some(payload.as_slice()),
+        "a write older than the commit interval must survive SIGKILL of the daemon"
+    );
+
+    let lost = match periodic_commit_sigkill_arm(0, &payload, require) {
+        SigkillArm::Skipped => return,
+        SigkillArm::Missing => None,
+        SigkillArm::Bytes(bytes) => Some(bytes),
+    };
+    assert_ne!(
+        lost.as_deref(),
+        Some(payload.as_slice()),
+        "control arm: with the tick disabled the un-fsynced bytes must not be durable, \
+         else this test cannot detect a missing periodic commit"
+    );
+    emit_scenario_result("cli_mount_periodic_commit_sigkill", "PASS", None);
+}
+
+/// Outcome of one SIGKILL arm.
+enum SigkillArm {
+    /// The mount could not start (a SKIP, only allowed without `FFS_REQUIRE_FUSE=1`).
+    Skipped,
+    /// After crash + journal replay the file does not exist on the image.
+    Missing,
+    /// The file's bytes after crash + journal replay.
+    Bytes(Vec<u8>),
+}
+
+/// One SIGKILL arm of [`cli_mount_periodic_commit_survives_sigkill_bd_dj725`].
+fn periodic_commit_sigkill_arm(interval_secs: u64, payload: &[u8], require: bool) -> SigkillArm {
+    use std::time::{Duration, Instant};
+
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let image = tmp.path().join("commit.ext4");
+    fs::File::create(&image)
+        .and_then(|file| file.set_len(64 << 20))
+        .expect("size image");
+    let format = Command::new("mkfs.ext4")
+        .args(["-F", "-q", "-b", "4096"])
+        .arg(&image)
+        .output()
+        .expect("run mkfs.ext4");
+    assert!(
+        format.status.success(),
+        "mkfs.ext4 failed: {}",
+        String::from_utf8_lossy(&format.stderr)
+    );
+    let mnt = tmp.path().join("mnt");
+    fs::create_dir(&mnt).expect("create mountpoint");
+    let mnt_key = mnt
+        .canonicalize()
+        .expect("canonical mountpoint")
+        .to_string_lossy()
+        .into_owned();
+
+    // A file, not a pipe: an unread pipe would block a chatty daemon.
+    let log_path = tmp.path().join("mount.log");
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ffs-cli"))
+        .args([
+            "mount",
+            "--rw",
+            "--commit-interval-secs",
+            &interval_secs.to_string(),
+        ])
+        .arg(&image)
+        .arg(&mnt)
+        // auto_unmount routes through fusermount3 even as root, and some CI
+        // workers deny it; this test unmounts the dead mount itself below.
+        .env("FFS_AUTO_UNMOUNT", "0")
+        .stdout(std::process::Stdio::null())
+        .stderr(fs::File::create(&log_path).expect("create mount log"))
+        .spawn()
+        .expect("spawn `ffs mount --rw`");
+
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mounted = fs::read_to_string("/proc/self/mountinfo")
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.split(' ').nth(4) == Some(mnt_key.as_str()));
+        if mounted {
+            break;
+        }
+        if let Some(status) = child.try_wait().expect("poll mount daemon") {
+            let stderr = fs::read_to_string(&log_path).unwrap_or_default();
+            assert!(
+                !require,
+                "FFS_REQUIRE_FUSE=1 but `ffs mount --rw` exited {status}: {stderr}"
+            );
+            emit_scenario_result(
+                "cli_mount_periodic_commit_sigkill",
+                "SKIP",
+                Some("mount_failed"),
+            );
+            return SigkillArm::Skipped;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("`ffs mount --rw` did not appear in mountinfo within 30s");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+
+    // No fsync, no close-time flush semantics relied on: fs::write only closes.
+    fs::write(mnt.join("durable.bin"), payload).expect("write through the mount");
+    // Both arms wait the same, well past a 1 s interval.
+    std::thread::sleep(Duration::from_secs(4));
+    child.kill().expect("SIGKILL the mount daemon");
+    let _ = child.wait();
+    let unmounted = Command::new("fusermount3")
+        .args(["-u", "-z"])
+        .arg(&mnt)
+        .status()
+        .is_ok_and(|status| status.success());
+    if !unmounted {
+        let _ = Command::new("umount").arg("-l").arg(&mnt).status();
+    }
+
+    let replay = Command::new("e2fsck")
+        .args(["-E", "journal_only", "-y"])
+        .arg(&image)
+        .output()
+        .expect("run e2fsck journal replay");
+    assert!(
+        replay.status.code().is_some_and(|code| code <= 1),
+        "journal replay must succeed after SIGKILL (interval {interval_secs}): {}{}",
+        String::from_utf8_lossy(&replay.stdout),
+        String::from_utf8_lossy(&replay.stderr)
+    );
+    let check = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(&image)
+        .output()
+        .expect("run e2fsck -fn");
+    assert!(
+        check.status.success(),
+        "image must be e2fsck-clean after SIGKILL + replay (interval {interval_secs}):\n{}{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+
+    let cat = Command::new("debugfs")
+        .args(["-R", "cat /durable.bin"])
+        .arg(&image)
+        .output()
+        .expect("run debugfs cat");
+    let stderr = String::from_utf8_lossy(&cat.stderr);
+    if stderr.contains("not found") {
+        return SigkillArm::Missing;
+    }
+    SigkillArm::Bytes(cat.stdout)
+}
+
 #[test]
 fn cli_inspect_unreadable_image_reports_permission_error() {
     use std::os::unix::fs::PermissionsExt;
