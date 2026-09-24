@@ -1798,6 +1798,10 @@ pub struct OpenFs {
     pub numa_allocation_policy: NumaAllocationPolicy,
     /// Latched when an ext4 write I/O error forces a read-only remount.
     ext4_forced_read_only: AtomicBool,
+    /// Set when mount-time ext4 orphan recovery failed (bd-xsu7s). The orphan
+    /// chain is then in an unknown state, so `enable_writes` refuses until the
+    /// image is repaired offline (e2fsck) instead of mutating on top of it.
+    ext4_orphan_recovery_error: Option<String>,
     /// Runtime oracle reporting how many open handles pin an inode
     /// (bd-90aey orphan-on-unlink). Installed by the FUSE adapter at mount
     /// time; empty in library mode, where unlink keeps immediate reclaim.
@@ -6208,6 +6212,7 @@ impl OpenFs {
             ext4_data_err_policy: options.ext4_data_err_policy,
             numa_allocation_policy: options.numa_allocation_policy.clone(),
             ext4_forced_read_only: AtomicBool::new(false),
+            ext4_orphan_recovery_error: None,
             ext4_open_handle_oracle: std::sync::OnceLock::new(),
             dev,
             btrfs_devices,
@@ -6386,6 +6391,8 @@ impl OpenFs {
                             error = %err,
                             "ext4 orphan recovery failed; filesystem remains read-only"
                         );
+                        fs.ext4_orphan_recovery_error = Some(err.to_string());
+                        fs.ext4_forced_read_only.store(true, Ordering::SeqCst);
                     }
                 }
             }
@@ -9879,6 +9886,13 @@ impl OpenFs {
     pub fn enable_writes(&mut self, cx: &Cx) -> Result<(), FfsError> {
         match &self.flavor {
             FsFlavor::Ext4(_) => {
+                if let Some(reason) = &self.ext4_orphan_recovery_error {
+                    return Err(FfsError::Format(format!(
+                        "ext4 orphan recovery failed at mount ({reason}); refusing \
+                         writes on an image whose orphan chain is in an unknown \
+                         state — repair it offline (e2fsck) first"
+                    )));
+                }
                 let alloc_state = self.load_ext4_alloc_state(cx)?;
                 // bd-bhh0i: pre-populate every group's reserved-set cache while the
                 // FULL group slice is still reachable. A flex_bg group's reserved
@@ -9929,6 +9943,24 @@ impl OpenFs {
                          multi-device and RAID mutation are not supported"
                             .to_owned(),
                     ));
+                }
+                // bd-5elw6: the durable commit publishes the writable fs tree
+                // under the DEFAULT subvolume's ROOT_ITEM (objectid 5) and files
+                // every rewritten node's backref against root 5. Enabling writes
+                // on a tree loaded from any other subvolume or snapshot would
+                // replace the default subvolume with that tree's contents on the
+                // first commit. Refuse until the commit is parameterized by the
+                // mounted root (and handles blocks shared with a snapshot source).
+                let mounted_root = self
+                    .btrfs_context
+                    .as_ref()
+                    .map_or(BTRFS_FS_TREE_OBJECTID, |ctx| ctx.subvol_objectid);
+                if mounted_root != BTRFS_FS_TREE_OBJECTID {
+                    return Err(FfsError::UnsupportedFeature(format!(
+                        "btrfs writes are only supported on the default subvolume \
+                         (objectid {BTRFS_FS_TREE_OBJECTID}); this mount selected \
+                         subvolume/snapshot objectid {mounted_root}"
+                    )));
                 }
                 // bd-btfeat: a read-only-compat feature is one a READER may
                 // ignore and a WRITER may not. The mount-time gate in
@@ -12453,7 +12485,10 @@ impl OpenFs {
 
         let mut data_remaining = data;
         while !data_remaining.is_empty() {
-            let mapping = map_logical_to_physical(&ctx.chunks, logical)
+            // bd-0mcvt: every copy of a DUP chunk receives the write; Single
+            // yields exactly one stripe. Other profiles are refused by
+            // `enable_writes` and by the mapping below.
+            let mapping = ffs_ondisk::map_logical_to_stripes(&ctx.chunks, logical)
                 .map_err(|e| {
                     warn!(
                         logical,
@@ -12464,44 +12499,61 @@ impl OpenFs {
                 })?
                 .or_else(|| {
                     // bd-cjqhh: grown chunks are absent from the mount-time list.
-                    self.btrfs_live_chunks()
-                        .and_then(|live| map_logical_to_physical(&live, logical).ok().flatten())
+                    self.btrfs_live_chunks().and_then(|live| {
+                        ffs_ondisk::map_logical_to_stripes(&live, logical)
+                            .ok()
+                            .flatten()
+                    })
                 })
                 .ok_or_else(|| FfsError::Corruption {
                     block: logical,
                     detail: "logical bytenr not covered by any btrfs chunk".into(),
                 })?;
+            if !matches!(
+                mapping.profile,
+                ffs_ondisk::BtrfsRaidProfile::Single | ffs_ondisk::BtrfsRaidProfile::Dup
+            ) {
+                return Err(FfsError::UnsupportedFeature(
+                    "btrfs writes support only Single/DUP chunks".to_owned(),
+                ));
+            }
 
             let chunk_end = self.btrfs_logical_chunk_end(logical)?;
             let available_in_chunk = Self::btrfs_checked_chunk_available(chunk_end, logical)?;
             let to_write = (data_remaining.len() as u64).min(available_in_chunk);
             let to_write_usize = to_write as usize;
 
-            let physical_offset = mapping.physical;
-            Self::btrfs_checked_physical_span(physical_offset, to_write_usize)?;
+            for stripe in &mapping.stripes {
+                let physical_offset = stripe.physical;
+                Self::btrfs_checked_physical_span(physical_offset, to_write_usize)?;
 
-            // Handle unaligned start/end via read-modify-write.
-            let mut pos = 0_usize;
-            while pos < to_write_usize {
-                let current_phys = Self::btrfs_checked_physical_offset(physical_offset, pos)?;
-                let block_num = BlockNumber(current_phys / block_size);
-                let block_offset = (current_phys % block_size) as usize;
-                let chunk_in_block = (to_write_usize - pos).min(bs_usize - block_offset);
+                // Handle unaligned start/end via read-modify-write.
+                let mut pos = 0_usize;
+                while pos < to_write_usize {
+                    let current_phys = Self::btrfs_checked_physical_offset(physical_offset, pos)?;
+                    let block_num = BlockNumber(current_phys / block_size);
+                    let block_offset = (current_phys % block_size) as usize;
+                    let chunk_in_block = (to_write_usize - pos).min(bs_usize - block_offset);
 
-                if block_offset == 0 && chunk_in_block == bs_usize {
-                    // Full block overwrite.
-                    block_dev.write_block(cx, block_num, &data_remaining[pos..pos + bs_usize])?;
-                } else {
-                    // Partial block overwrite: read-modify-write. The read buffer
-                    // is owned and sole-referenced here, so move its Vec out
-                    // (into_inner -> Arc::try_unwrap, O(1)) instead of copying the
-                    // whole block before patching the changed bytes.
-                    let mut block_data = block_dev.read_block(cx, block_num)?.into_inner();
-                    block_data[block_offset..block_offset + chunk_in_block]
-                        .copy_from_slice(&data_remaining[pos..pos + chunk_in_block]);
-                    block_dev.write_block(cx, block_num, &block_data)?;
+                    if block_offset == 0 && chunk_in_block == bs_usize {
+                        // Full block overwrite.
+                        block_dev.write_block(
+                            cx,
+                            block_num,
+                            &data_remaining[pos..pos + bs_usize],
+                        )?;
+                    } else {
+                        // Partial block overwrite: read-modify-write. The read buffer
+                        // is owned and sole-referenced here, so move its Vec out
+                        // (into_inner -> Arc::try_unwrap, O(1)) instead of copying the
+                        // whole block before patching the changed bytes.
+                        let mut block_data = block_dev.read_block(cx, block_num)?.into_inner();
+                        block_data[block_offset..block_offset + chunk_in_block]
+                            .copy_from_slice(&data_remaining[pos..pos + chunk_in_block]);
+                        block_dev.write_block(cx, block_num, &block_data)?;
+                    }
+                    pos += chunk_in_block;
                 }
-                pos += chunk_in_block;
             }
 
             logical = Self::btrfs_checked_logical_advance(logical, to_write)?;
@@ -15830,6 +15882,98 @@ impl OpenFs {
                 Ok(free_bytes / unit)
             }
         }
+    }
+
+    /// Count ext4 blocks in `[start, end)` (absolute block numbers, all inside
+    /// `group`) that the group's block bitmap marks allocated.
+    ///
+    /// bd-plamw: the repair-symbol tail at the end of each group is not
+    /// reserved in the bitmap, so callers that are about to write symbols there
+    /// use this to refuse when file data or metadata already occupies it. A
+    /// `BLOCK_UNINIT` group has no initialized bitmap and no allocations beyond
+    /// its fixed metadata, which never lies in the tail.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for non-ext4 images, a range outside the group, or an
+    /// unreadable/invalid bitmap.
+    pub fn ext4_allocated_blocks_in_range(
+        &self,
+        cx: &Cx,
+        group: GroupNumber,
+        start: u64,
+        end: u64,
+    ) -> Result<u64, FfsError> {
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let group_start = u64::from(sb.first_data_block)
+            .saturating_add(u64::from(group.0).saturating_mul(u64::from(sb.blocks_per_group)));
+        let group_end = group_start.saturating_add(u64::from(sb.blocks_per_group));
+        if start > end || start < group_start || end > group_end {
+            return Err(FfsError::InvalidGeometry(format!(
+                "block range [{start}, {end}) is not inside ext4 group {}",
+                group.0
+            )));
+        }
+        if start == end {
+            return Ok(0);
+        }
+        let gd = self.read_group_desc(cx, group)?;
+        if gd.flags & ffs_ondisk::ext4::EXT4_BG_BLOCK_UNINIT != 0 {
+            return Ok(0);
+        }
+        let bitmap = self.read_block_bitmap(cx, group)?;
+        let mut allocated = 0_u64;
+        for block in start..end {
+            let bit = usize::try_from(block - group_start)
+                .map_err(|_| FfsError::InvalidGeometry("bitmap index overflow".into()))?;
+            if bitmap
+                .get(bit / 8)
+                .is_some_and(|byte| byte & (1 << (bit % 8)) != 0)
+            {
+                allocated += 1;
+            }
+        }
+        Ok(allocated)
+    }
+
+    /// Bytes of btrfs extents (data `EXTENT_ITEM`s and tree blocks) that overlap
+    /// the logical range `[start, end)`, according to the extent tree.
+    ///
+    /// bd-plamw: used to refuse writing repair symbols into a chunk tail that
+    /// already holds allocated extents.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error for non-btrfs images or an unreadable extent tree.
+    pub fn btrfs_allocated_bytes_in_logical_range(
+        &self,
+        cx: &Cx,
+        start: u64,
+        end: u64,
+    ) -> Result<u64, FfsError> {
+        let sb = self
+            .btrfs_superblock()
+            .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?;
+        if start >= end {
+            return Ok(0);
+        }
+        let root = self.btrfs_fs_tree_root_bytenr(cx, BTRFS_EXTENT_TREE_OBJECTID)?;
+        let mut overlap = 0_u64;
+        for item in self.walk_btrfs_tree(cx, root)? {
+            let len = match item.key.item_type {
+                ffs_btrfs::BTRFS_ITEM_EXTENT_ITEM => item.key.offset,
+                ffs_btrfs::BTRFS_ITEM_METADATA_ITEM => u64::from(sb.nodesize),
+                _ => continue,
+            };
+            let extent_start = item.key.objectid;
+            let extent_end = extent_start.saturating_add(len);
+            if extent_start < end && extent_end > start {
+                overlap = overlap.saturating_add(extent_end.min(end) - extent_start.max(start));
+            }
+        }
+        Ok(overlap)
     }
 
     /// Count free inodes in a specific group by reading and analyzing the bitmap.
@@ -33292,14 +33436,17 @@ impl OpenFs {
                     detail: "btrfs tree-log node crosses chunk boundary".into(),
                 });
             }
-            let mapping = map_logical_to_physical(&ctx.chunks, *logical)
+            // bd-0mcvt: publish the log node on every DUP copy.
+            let mapping = ffs_ondisk::map_logical_to_stripes(&ctx.chunks, *logical)
                 .map_err(|e| parse_to_ffs_error(&e))?
                 .ok_or_else(|| FfsError::Corruption {
                     block: *logical,
                     detail: "tree-log logical bytenr not covered by any btrfs chunk".into(),
                 })?;
-            Self::btrfs_checked_physical_span(mapping.physical, bytes.len())?;
-            writes.push((ByteOffset(mapping.physical), bytes.as_slice()));
+            for stripe in &mapping.stripes {
+                Self::btrfs_checked_physical_span(stripe.physical, bytes.len())?;
+                writes.push((ByteOffset(stripe.physical), bytes.as_slice()));
+            }
         }
         let superblock_offset =
             ByteOffset(u64::try_from(BTRFS_SUPER_INFO_OFFSET).map_err(|_| {
@@ -34153,6 +34300,34 @@ impl OpenFs {
                 ))?;
             Ok(mapping.physical)
         };
+        // bd-0mcvt: a tree block must land on EVERY copy of its chunk. The
+        // default single-device metadata profile is DUP; writing only the first
+        // stripe leaves the second copy at an older generation, so any fallback
+        // read (kernel or ours) of that copy sees a stale, transid-mismatched
+        // node and DUP redundancy silently disappears.
+        let write_mirrored = |logical: u64, bytes: &[u8]| -> Result<(), BtrfsMutationError> {
+            let mapping = ffs_ondisk::map_logical_to_stripes(&chunks_for_writeback, logical)
+                .map_err(|_| {
+                    BtrfsMutationError::InvalidConfig("chunk map lookup failed for writeback")
+                })?
+                .ok_or(BtrfsMutationError::InvalidConfig(
+                    "writeback logical address not covered by any chunk",
+                ))?;
+            if !matches!(
+                mapping.profile,
+                ffs_ondisk::BtrfsRaidProfile::Single | ffs_ondisk::BtrfsRaidProfile::Dup
+            ) {
+                return Err(BtrfsMutationError::InvalidConfig(
+                    "writeback supports only Single/DUP chunks",
+                ));
+            }
+            for stripe in &mapping.stripes {
+                self.dev
+                    .write_all_at(cx, ByteOffset(stripe.physical), bytes)
+                    .map_err(|_| BtrfsMutationError::InvalidConfig("disk write failed"))?;
+            }
+            Ok(())
+        };
 
         let flush_result = executor.execute(|block, level| {
             // bd-42gtq: an unchanged block is already on disk at this address with
@@ -34169,10 +34344,7 @@ impl OpenFs {
             let node_bytes = serialized.len() as u64;
 
             let logical = disk_ctx.block_to_bytenr(block);
-            let physical = resolve_physical(logical)?;
-            self.dev
-                .write_all_at(cx, ByteOffset(physical), &serialized)
-                .map_err(|_| BtrfsMutationError::InvalidConfig("disk write failed"))?;
+            write_mirrored(logical, &serialized)?;
 
             bytes_written = bytes_written.saturating_add(node_bytes);
             nodes_written = nodes_written.saturating_add(1);
@@ -34337,10 +34509,7 @@ impl OpenFs {
                 let serialized = csum_disk_ctx.serialize_node(&alloc.csum_tree, block, level)?;
                 let node_bytes = serialized.len() as u64;
                 let logical = csum_disk_ctx.block_to_bytenr(block);
-                let physical = resolve_physical(logical)?;
-                self.dev
-                    .write_all_at(cx, ByteOffset(physical), &serialized)
-                    .map_err(|_| BtrfsMutationError::InvalidConfig("disk write failed"))?;
+                write_mirrored(logical, &serialized)?;
                 bytes_written = bytes_written.saturating_add(node_bytes);
                 nodes_written = nodes_written.saturating_add(1);
                 Ok(())
@@ -34453,10 +34622,7 @@ impl OpenFs {
                 let serialized = subvol_disk_ctx.serialize_node(subvol_tree, block, level)?;
                 let node_bytes = serialized.len() as u64;
                 let logical = subvol_disk_ctx.block_to_bytenr(block);
-                let physical = resolve_physical(logical)?;
-                self.dev
-                    .write_all_at(cx, ByteOffset(physical), &serialized)
-                    .map_err(|_| BtrfsMutationError::InvalidConfig("disk write failed"))?;
+                write_mirrored(logical, &serialized)?;
                 bytes_written = bytes_written.saturating_add(node_bytes);
                 nodes_written = nodes_written.saturating_add(1);
                 Ok(())
@@ -34770,10 +34936,7 @@ impl OpenFs {
                             dev_disk_ctx.serialize_node(&alloc.dev_tree, block, level)?;
                         let node_bytes = serialized.len() as u64;
                         let logical = dev_disk_ctx.block_to_bytenr(block);
-                        let physical = resolve_physical(logical)?;
-                        self.dev
-                            .write_all_at(cx, ByteOffset(physical), &serialized)
-                            .map_err(|_| BtrfsMutationError::InvalidConfig("disk write failed"))?;
+                        write_mirrored(logical, &serialized)?;
                         bytes_written = bytes_written.saturating_add(node_bytes);
                         nodes_written = nodes_written.saturating_add(1);
                         Ok(())
@@ -34857,10 +35020,7 @@ impl OpenFs {
                             chunk_disk_ctx.serialize_node(&alloc.chunk_tree, block, level)?;
                         let node_bytes = serialized.len() as u64;
                         let logical = chunk_disk_ctx.block_to_bytenr(block);
-                        let physical = resolve_physical(logical)?;
-                        self.dev
-                            .write_all_at(cx, ByteOffset(physical), &serialized)
-                            .map_err(|_| BtrfsMutationError::InvalidConfig("disk write failed"))?;
+                        write_mirrored(logical, &serialized)?;
                         bytes_written = bytes_written.saturating_add(node_bytes);
                         nodes_written = nodes_written.saturating_add(1);
                         Ok(())
@@ -34946,10 +35106,7 @@ impl OpenFs {
                 extent_disk_ctx.serialize_node(alloc.extent_alloc.extent_tree(), block, level)?;
             let node_bytes = serialized.len() as u64;
             let logical = extent_disk_ctx.block_to_bytenr(block);
-            let physical = resolve_physical(logical)?;
-            self.dev
-                .write_all_at(cx, ByteOffset(physical), &serialized)
-                .map_err(|_| BtrfsMutationError::InvalidConfig("disk write failed"))?;
+            write_mirrored(logical, &serialized)?;
             bytes_written = bytes_written.saturating_add(node_bytes);
             nodes_written = nodes_written.saturating_add(1);
             Ok(())
@@ -35043,10 +35200,7 @@ impl OpenFs {
             let serialized = root_disk_ctx.serialize_node(&alloc.root_tree, block, level)?;
             let node_bytes = serialized.len() as u64;
             let logical = root_disk_ctx.block_to_bytenr(block);
-            let physical = resolve_physical(logical)?;
-            self.dev
-                .write_all_at(cx, ByteOffset(physical), &serialized)
-                .map_err(|_| BtrfsMutationError::InvalidConfig("disk write failed"))?;
+            write_mirrored(logical, &serialized)?;
             bytes_written = bytes_written.saturating_add(node_bytes);
             nodes_written = nodes_written.saturating_add(1);
             Ok(())
@@ -35183,15 +35337,11 @@ impl OpenFs {
                     let serialized = fst_ctx
                         .serialize_node(&fst_tree, leaf_block, 0)
                         .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-                    let physical =
-                        resolve_physical(fst_addr).map_err(|e| btrfs_mutation_to_ffs(&e))?;
-                    self.dev
-                        .write_all_at(cx, ByteOffset(physical), &serialized)
-                        .map_err(|e| {
-                            FfsError::Io(std::io::Error::other(format!(
-                                "free-space tree write failed: {e}"
-                            )))
-                        })?;
+                    write_mirrored(fst_addr, &serialized).map_err(|e| {
+                        FfsError::Io(std::io::Error::other(format!(
+                            "free-space tree write failed: {e}"
+                        )))
+                    })?;
                     // Under `btrfs_commit_fst_early` this is the deferred
                     // barrier from above, now covering the tree nodes AND this
                     // leaf in one flush; otherwise it is the second of three.
@@ -48469,6 +48619,104 @@ mod tests {
 
         let orphan_list = fs.read_ext4_orphan_list(&cx).unwrap();
         assert!(orphan_list.inodes.is_empty());
+    }
+
+    /// bd-plamw: `ext4_allocated_blocks_in_range` must report exactly the
+    /// allocated bits of the queried range, so repair refuses tails that hold
+    /// data and accepts free ones.
+    #[test]
+    fn ext4_allocated_blocks_in_range_counts_bitmap_bits_bd_plamw() {
+        let mut image = build_ext4_image_with_extents();
+        let cx = Cx::for_testing();
+        let (bitmap_block, blocks_per_group, first_data_block) = {
+            let fs = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(image.clone())),
+                &OpenOptions::default(),
+            )
+            .expect("open fixture");
+            let sb = fs.ext4_superblock().expect("ext4").clone();
+            let gd = fs.read_group_desc(&cx, GroupNumber(0)).expect("gd 0");
+            assert_eq!(gd.flags & ffs_ondisk::ext4::EXT4_BG_BLOCK_UNINIT, 0);
+            (gd.block_bitmap, sb.blocks_per_group, sb.first_data_block)
+        };
+        let group_start = u64::from(first_data_block);
+        let group_end = group_start + u64::from(blocks_per_group);
+        let bitmap_off = usize::try_from(bitmap_block * 4096).expect("offset");
+        let tail_first = group_end - 8;
+
+        let count = |image: &[u8]| {
+            let fs = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(image.to_vec())),
+                &OpenOptions::default(),
+            )
+            .expect("open fixture");
+            fs.ext4_allocated_blocks_in_range(&cx, GroupNumber(0), tail_first, group_end)
+                .expect("count tail")
+        };
+        // Clear the tail bits so the baseline is provably free.
+        for block in tail_first..group_end {
+            let bit = usize::try_from(block - group_start).expect("bit");
+            image[bitmap_off + bit / 8] &= !(1 << (bit % 8));
+        }
+        assert_eq!(count(&image), 0, "free tail");
+        let bit = usize::try_from(tail_first + 3 - group_start).expect("bit");
+        image[bitmap_off + bit / 8] |= 1 << (bit % 8);
+        assert_eq!(count(&image), 1, "one allocated tail block");
+
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(image)),
+            &OpenOptions::default(),
+        )
+        .expect("open fixture");
+        assert!(
+            fs.ext4_allocated_blocks_in_range(&cx, GroupNumber(0), group_end - 1, group_end + 1)
+                .is_err(),
+            "a range crossing the group boundary is refused"
+        );
+    }
+
+    /// bd-xsu7s: when mount-time orphan recovery fails, the orphan chain is in
+    /// an unknown state; the mount must stay readable but `enable_writes` must
+    /// refuse instead of mutating on top of it. The trigger is a linked orphan
+    /// whose extent-mapped size (2^44 bytes = 2^32 blocks) cannot be truncated
+    /// because its logical end does not fit u32.
+    #[test]
+    fn open_fs_orphan_recovery_failure_refuses_writes_bd_xsu7s() {
+        let mut image = build_ext4_image_with_orphan_chain(&[11]);
+        set_test_ext4_state(&mut image, EXT4_VALID_FS | EXT4_ORPHAN_FS);
+        set_test_inode_links_count(&mut image, 11, 1);
+        let inode_off = test_inode_offset(11);
+        let flags = u32::from_le_bytes(
+            image[inode_off + 0x20..inode_off + 0x24]
+                .try_into()
+                .expect("4-byte flags"),
+        ) | ffs_types::EXT4_EXTENTS_FL;
+        image[inode_off + 0x20..inode_off + 0x24].copy_from_slice(&flags.to_le_bytes());
+        image[inode_off + 0x04..inode_off + 0x08].copy_from_slice(&0_u32.to_le_bytes());
+        image[inode_off + 0x6C..inode_off + 0x70].copy_from_slice(&0x1000_u32.to_le_bytes());
+
+        let dev = TestDevice::from_vec(image);
+        let cx = Cx::for_testing();
+        let mut fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default())
+            .expect("a failed orphan recovery must still allow a read-only open");
+        assert!(
+            fs.ext4_orphan_recovery_error.is_some(),
+            "fixture must make orphan recovery fail"
+        );
+        let err = fs
+            .enable_writes(&cx)
+            .expect_err("writes must be refused after failed orphan recovery");
+        assert!(
+            matches!(&err, FfsError::Format(msg) if msg.contains("orphan recovery failed")),
+            "unexpected refusal: {err:?}"
+        );
+        assert!(
+            fs.read_inode(&cx, InodeNumber(2)).is_ok(),
+            "reads still work"
+        );
     }
 
     #[test]
@@ -62873,12 +63121,28 @@ mod tests {
         }
     }
 
+    /// bd-53dub: an external oracle (e2fsck, btrfs check, image formatters) is
+    /// missing. Tests used to `return` silently here and report green without
+    /// the oracle ever running. With `FFS_REQUIRE_ORACLES=1` (set in CI and in
+    /// evidence lanes) a missing oracle is a test failure; otherwise the skip
+    /// is printed as a greppable `SKIP` line.
+    fn oracle_unavailable(tool: &str) {
+        assert!(
+            std::env::var_os("FFS_REQUIRE_ORACLES").is_none_or(|v| v != "1"),
+            "FFS_REQUIRE_ORACLES=1 but required oracle `{tool}` is unavailable"
+        );
+        eprintln!("SKIP oracle_unavailable tool={tool}");
+    }
+
     /// Run `e2fsck -fn` (force, read-only) on an image; returns (clean, output).
     fn run_e2fsck(image: &std::path::Path) -> Option<(bool, String)> {
-        let out = std::process::Command::new("e2fsck")
+        let Ok(out) = std::process::Command::new("e2fsck")
             .args(["-fn", image.to_str().unwrap()])
             .output()
-            .ok()?;
+        else {
+            oracle_unavailable("e2fsck");
+            return None;
+        };
         let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
         combined.push_str(&String::from_utf8_lossy(&out.stderr));
         // Exit 0 = clean. With -n, non-zero means errors were found (not fixed).
@@ -82416,7 +82680,10 @@ mod tests {
             .output();
         match out {
             Ok(o) if o.status.success() => {}
-            _ => return None, // btrfs-progs unavailable or refused — skip.
+            _ => {
+                oracle_unavailable("btrfs image formatter (btrfs-progs)");
+                return None;
+            }
         }
 
         let cx = Cx::for_testing();
@@ -82435,10 +82702,13 @@ mod tests {
 
     /// Run `btrfs check` on an image file; returns (success, combined output).
     fn run_btrfs_check(image: &std::path::Path) -> Option<(bool, String)> {
-        let out = std::process::Command::new("btrfs")
+        let Ok(out) = std::process::Command::new("btrfs")
             .args(["check", image.to_str().unwrap()])
             .output()
-            .ok()?;
+        else {
+            oracle_unavailable("btrfs check");
+            return None;
+        };
         let mut combined = String::from_utf8_lossy(&out.stdout).into_owned();
         combined.push_str(&String::from_utf8_lossy(&out.stderr));
         Some((out.status.success(), combined))
@@ -82487,7 +82757,10 @@ mod tests {
             .output();
         match out {
             Ok(o) if o.status.success() => {}
-            _ => return None, // e2fsprogs unavailable or refused — skip.
+            _ => {
+                oracle_unavailable("mke2fs (e2fsprogs)");
+                return None;
+            }
         }
 
         let cx = Cx::for_testing();
@@ -83323,6 +83596,111 @@ mod tests {
             ok,
             "btrfs check must accept a FrankenFS-created subvolume:\n{output}"
         );
+    }
+
+    /// bd-0mcvt: on a default single-device image the metadata profile is DUP,
+    /// and a commit must write every rewritten tree block to BOTH copies.
+    /// Before the fix only stripe 0 was written, so the second copy of the new
+    /// root-tree root still held the previous generation.
+    #[test]
+    fn btrfs_commit_writes_both_dup_metadata_copies_bd_0mcvt() {
+        let Some((fs, dev, _tmp, _image)) = open_writable_btrfs_mkfs(256) else {
+            eprintln!("SKIP bd-0mcvt: btrfs-progs unavailable");
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let file = fs
+            .create(&cx, root, OsStr::new("dup.bin"), 0o644, 0, 0)
+            .expect("create dup.bin");
+        fs.write(&cx, file.ino, 0, &[0x5A_u8; 8192])
+            .expect("write dup.bin");
+        let _ = fs.flush_mvcc_to_device(&cx);
+        fs.btrfs_full_transaction_commit(&cx, "dup-mirror-check")
+            .expect("btrfs full transaction commit");
+
+        let bytes = dev.snapshot_bytes();
+        let sb = BtrfsSuperblock::parse_from_image(&bytes).expect("parse committed superblock");
+        let chunks = fs.btrfs_live_chunks().expect("live chunk list");
+        let mapping = ffs_ondisk::map_logical_to_stripes(&chunks, sb.root)
+            .expect("map root-tree root")
+            .expect("root-tree root covered by a chunk");
+        assert_eq!(
+            mapping.profile,
+            ffs_ondisk::BtrfsRaidProfile::Dup,
+            "fixture must use DUP metadata for this test to mean anything"
+        );
+        assert_eq!(mapping.stripes.len(), 2, "DUP has exactly two copies");
+        let nodesize = usize::try_from(sb.nodesize).expect("nodesize fits usize");
+        let copy = |physical: u64| {
+            let start = usize::try_from(physical).expect("physical fits usize");
+            bytes[start..start + nodesize].to_vec()
+        };
+        let first = copy(mapping.stripes[0].physical);
+        let second = copy(mapping.stripes[1].physical);
+        let generation_of =
+            |node: &[u8]| u64::from_le_bytes(node[0x50..0x58].try_into().expect("8 bytes"));
+        assert_eq!(generation_of(&first), sb.generation, "copy 1 generation");
+        assert_eq!(
+            generation_of(&second),
+            sb.generation,
+            "copy 2 must carry the committed generation, not a stale one"
+        );
+        assert!(first == second, "both DUP copies must be byte-identical");
+    }
+
+    /// bd-5elw6: the durable commit publishes the writable tree as the DEFAULT
+    /// subvolume's root, so a mount of any other subvolume must refuse writes
+    /// rather than overwrite subvolume 5 with that subvolume's contents. The
+    /// refusal must leave the image untouched, and the default root must still
+    /// become writable. Refusal-only coverage: subvolume RW itself is not
+    /// supported yet.
+    #[test]
+    fn btrfs_non_default_subvolume_refuses_writes_bd_5elw6() {
+        let Some((fs, dev, _tmp, image)) = open_writable_btrfs_mkfs(256) else {
+            eprintln!("SKIP bd-5elw6: btrfs-progs unavailable");
+            return;
+        };
+        let cx = Cx::for_testing();
+        fs.create_subvolume(
+            &cx,
+            InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID)),
+            b"rwguard",
+            0,
+            0,
+        )
+        .expect("create_subvolume on a real image");
+        let _ = fs.flush_mvcc_to_device(&cx);
+        fs.btrfs_full_transaction_commit(&cx, "subvol-rw-guard")
+            .expect("btrfs full transaction commit");
+        std::fs::write(&image, dev.snapshot_bytes()).expect("write modified image");
+        drop(fs);
+        let before = std::fs::read(&image).expect("read image");
+
+        let subvol_opts = OpenOptions {
+            btrfs_mount_selection: BtrfsMountSelection::Subvolume("rwguard".to_owned()),
+            ..OpenOptions::default()
+        };
+        let mut subvol_fs =
+            OpenFs::open_with_options(&cx, &image, &subvol_opts).expect("open subvolume RO");
+        let err = subvol_fs
+            .enable_writes(&cx)
+            .expect_err("writes on a non-default subvolume must be refused");
+        assert!(
+            matches!(&err, FfsError::UnsupportedFeature(msg) if msg.contains("default subvolume")),
+            "unexpected refusal: {err:?}"
+        );
+        drop(subvol_fs);
+        assert!(
+            std::fs::read(&image).expect("reread image") == before,
+            "a refused enable_writes must not modify the image"
+        );
+
+        let mut default_fs = OpenFs::open_with_options(&cx, &image, &OpenOptions::default())
+            .expect("open default root");
+        default_fs
+            .enable_writes(&cx)
+            .expect("the default subvolume stays writable");
     }
 
     /// bd-jctlm: btrfs only inlines files BELOW the sector boundary; a file whose

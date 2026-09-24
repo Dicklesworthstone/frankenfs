@@ -62,9 +62,10 @@ cargo run -p ffs-cli -- info /path/to/fs.img --groups --mvcc --journal --json
 # Read-only mount (default, safe)
 sudo cargo run -p ffs-cli -- mount /path/to/fs.img /mnt/ffs
 
-# Read-write ext4 mount with mounted automatic repair + evidence ledger
+# Read-only mount with mounted automatic repair + evidence ledger
+# (mounted repair is refused on --rw mounts until repair storage is reserved, bd-plamw)
 sudo cargo run -p ffs-cli -- mount /path/to/fs.img /mnt/ffs \
-    --rw --background-repair --background-scrub-ledger repair.jsonl
+    --background-repair --background-scrub-ledger repair.jsonl
 
 # btrfs read-write mount (durable by default via full transaction commit)
 sudo cargo run -p ffs-cli -- mount /path/to/btrfs.img /mnt/ffs --rw
@@ -558,13 +559,13 @@ Repair symbols become stale when source blocks are modified.
 
 ```bash
 ffs mount IMAGE MOUNT --background-repair --background-scrub-ledger repair.jsonl
-ffs mount IMAGE MOUNT --rw --background-repair --background-scrub-ledger repair.jsonl
 ```
 
 - Read-only mounts run **detection-only** scrub by default. `--no-background-scrub` disables it; `--background-scrub` keeps detection without enabling writes.
-- Read-write mounts keep scrub disabled by default; `--background-scrub` opts into detection-only monitoring; `--background-repair` enables real block recovery + repair-symbol refresh.
+- Read-write mounts keep scrub disabled by default; `--background-scrub` opts into detection-only monitoring. `--background-repair` is **refused on read-write mounts**: repair symbols live in each group's tail, which is not reserved from the allocator, so a file created during the mount could later be overwritten by a symbol refresh (bd-plamw).
+- Before any symbols are written (`ffs repair --rebuild-symbols`, or a repair-enabled read-only mount), each group's tail is checked against the ext4 block bitmap or the btrfs extent tree; a group whose tail holds allocated blocks is refused/excluded with an explicit reason.
 - The mount lifecycle owns the `ScrubDaemon`: cancellation is wired to mount shutdown, and the worker is joined on unmount.
-- Read-only repair uses the direct backing-image authority. Read-write repair routes recovered source blocks through the mounted MVCC request-scope serializer so repair writes and client writes share the same conflict-resolution boundary; stale repair snapshots fail closed before mutation. The serialization contract is formalized in `docs/repair-writeback-serialization-contract.json` (57 KB) and `docs/design-repair-writeback-serialization.md`.
+- Read-only repair uses the direct backing-image authority. The read-write repair route (recovered source blocks through the mounted MVCC request-scope serializer, stale repair snapshots failing closed) is implemented and unit-tested but not reachable from the CLI until repair storage is reserved. The serialization contract is formalized in `docs/repair-writeback-serialization-contract.json` (57 KB) and `docs/design-repair-writeback-serialization.md`.
 
 ### Hostile-image safety (separate claim)
 
@@ -2161,12 +2162,14 @@ tail -F /var/log/ffs-home.scrub.jsonl | jq '
   select(.event_type == "corruption_detected" or .event_type == "scrub_cycle_complete")'
 
 # 6. To actually recover (requires --background-repair), unmount and remount with
-#    explicit repair permission:
+#    explicit repair permission. The mount stays read-only: repair on a read-only
+#    mount writes recovered blocks through the backing image directly. Writes
+#    (--rw) are refused for any subvolume other than the default one (bd-5elw6).
 sudo umount /mnt/home
 wait $MOUNT_PID 2>/dev/null
 
 sudo cargo run -p ffs-cli -- mount /data/btrfs.img /mnt/home \
-    --subvol home --rw \
+    --subvol home \
     --background-repair \
     --background-scrub-ledger /var/log/ffs-home.scrub.jsonl
 
@@ -2184,7 +2187,7 @@ What you've exercised:
 - btrfs subvolume selection via `--subvol`
 - The `ScrubDaemon` lifecycle owned by the mount process
 - Evidence ledger as the operator's source of truth (no `dmesg` required)
-- Mounted automatic repair through the MVCC repair-writeback serializer on a RW mount
+- Mounted automatic repair on a read-only mount (direct backing-image writeback)
 
 ### Walkthrough B: Forensic ext4 inspection without mounting (no FUSE, no sudo)
 
@@ -3467,8 +3470,6 @@ cargo run -p ffs-cli -- mount <image-path> <mountpoint> --rw
 
 # Mount with mounted automatic repair + evidence ledger
 cargo run -p ffs-cli -- mount <image-path> <mountpoint> \
-    --background-repair --background-scrub-ledger repair.jsonl
-cargo run -p ffs-cli -- mount <image-path> <mountpoint> --rw \
     --background-repair --background-scrub-ledger repair.jsonl
 
 # Mount with managed runtime + adaptive runtime evidence

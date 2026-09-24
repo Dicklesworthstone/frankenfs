@@ -1783,6 +1783,101 @@ pub fn recover_btrfs_corrupt_blocks(
 /// Re-encode RaptorQ repair symbols for the given btrfs block groups after
 /// recovery, mirroring the ext4 symbol-rebuild workflow.
 #[allow(clippy::too_many_lines)]
+/// bd-plamw: open an image purely to read its allocation state. Journal
+/// replay is skipped (which also skips orphan recovery), so this never
+/// mutates the image.
+fn open_for_repair_tail_check(cx: &Cx, path: &Path) -> Result<OpenFs> {
+    OpenFs::open_with_options(
+        cx,
+        path,
+        &OpenOptions {
+            ext4_journal_replay_mode: ffs_core::Ext4JournalReplayMode::Skip,
+            ..OpenOptions::default()
+        },
+    )
+    .with_context(|| {
+        format!(
+            "failed to open image for repair-tail check: {}",
+            path.display()
+        )
+    })
+}
+
+/// bd-plamw: the repair tail of an ext4 group, as absolute blocks
+/// `[first, end)`: everything after the protected source range up to the end
+/// of the group's scrub span (repair symbols plus descriptor slots).
+#[must_use]
+pub fn ext4_repair_tail_range(spec: &Ext4RepairGroupSpec) -> (u64, u64) {
+    let first = spec
+        .source_first_block
+        .0
+        .saturating_add(u64::from(spec.source_block_count));
+    let end = spec
+        .scrub_start_block
+        .0
+        .saturating_add(spec.scrub_block_count);
+    (first, end.max(first))
+}
+
+/// bd-plamw: refuse to place repair symbols over allocated ext4 blocks.
+///
+/// The tail is computed arithmetically and is NOT reserved in the block
+/// bitmap, so file data or metadata may already live there. Returns a
+/// human-readable refusal when any tail block is allocated (or the bitmap
+/// cannot be read); `Ok(())` only when the whole tail is provably free.
+pub fn ext4_repair_tail_free(cx: &Cx, fs: &OpenFs, spec: &Ext4RepairGroupSpec) -> Result<()> {
+    let (first, end) = ext4_repair_tail_range(spec);
+    let allocated = fs
+        .ext4_allocated_blocks_in_range(cx, GroupNumber(spec.group), first, end)
+        .with_context(|| {
+            format!(
+                "cannot verify that the ext4 group {} repair tail [{first}, {end}) is free",
+                spec.group
+            )
+        })?;
+    if allocated > 0 {
+        bail!(
+            "ext4 group {} repair tail [{first}, {end}) overlaps {allocated} allocated block(s); \
+             refusing to write repair symbols over live data (bd-plamw)",
+            spec.group
+        );
+    }
+    Ok(())
+}
+
+/// bd-plamw: btrfs counterpart of [`ext4_repair_tail_free`]. The tail is the
+/// end of the chunk's span after the protected source blocks; it is checked
+/// against the extent tree. The range starts one block early so an unaligned
+/// chunk start can only widen, never narrow, the checked range.
+pub fn btrfs_repair_tail_free(
+    cx: &Cx,
+    fs: &OpenFs,
+    spec: &BtrfsRepairGroupSpec,
+    block_size: u32,
+) -> Result<()> {
+    let source_bytes = u64::from(spec.source_block_count).saturating_mul(u64::from(block_size));
+    let first = spec
+        .logical_start
+        .saturating_add(source_bytes.saturating_sub(u64::from(block_size)));
+    let end = spec.logical_start.saturating_add(spec.logical_bytes);
+    let allocated = fs
+        .btrfs_allocated_bytes_in_logical_range(cx, first, end)
+        .with_context(|| {
+            format!(
+                "cannot verify that the btrfs group {} repair tail [{first}, {end}) is free",
+                spec.group
+            )
+        })?;
+    if allocated > 0 {
+        bail!(
+            "btrfs group {} repair tail [{first}, {end}) overlaps {allocated} allocated byte(s); \
+             refusing to write repair symbols over live extents (bd-plamw)",
+            spec.group
+        );
+    }
+    Ok(())
+}
+
 pub fn rebuild_btrfs_repair_symbols(
     path: &PathBuf,
     block_size: u32,
@@ -1796,6 +1891,7 @@ pub fn rebuild_btrfs_repair_symbols(
     }
 
     let cx = cli_cx();
+    let tail_fs = open_for_repair_tail_check(&cx, path)?;
     let byte_dev = FileByteDevice::open(path)
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     let block_dev = ByteBlockDevice::new(byte_dev, block_size)
@@ -1816,6 +1912,11 @@ pub fn rebuild_btrfs_repair_symbols(
             ));
             continue;
         };
+        if let Err(error) = btrfs_repair_tail_free(&cx, &tail_fs, spec, block_size) {
+            failed_groups = failed_groups.saturating_add(1);
+            limitations.push(format!("{error:#}"));
+            continue;
+        }
 
         let encoded = match encode_group(
             &cx,
@@ -1915,6 +2016,7 @@ pub fn rebuild_ext4_repair_symbols(
     }
 
     let cx = cli_cx();
+    let tail_fs = open_for_repair_tail_check(&cx, path)?;
     let byte_dev = FileByteDevice::open(path)
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     let block_dev = ByteBlockDevice::new(byte_dev, block_size)
@@ -1938,6 +2040,11 @@ pub fn rebuild_ext4_repair_symbols(
             ));
             continue;
         };
+        if let Err(error) = ext4_repair_tail_free(&cx, &tail_fs, &spec) {
+            failed_groups = failed_groups.saturating_add(1);
+            limitations.push(format!("{error:#}"));
+            continue;
+        }
 
         let encoded = match encode_group(
             &cx,
