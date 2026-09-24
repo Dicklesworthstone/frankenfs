@@ -23,9 +23,13 @@
 //! - `MonotonicityViolation` — non-increasing commit sequence detected.
 
 use crate::wal::{self, DecodeResult, WalCommit};
+use asupersync::Cx;
 use ffs_error::{FfsError, Result};
 use serde::{Deserialize, Serialize};
+use std::io::Read;
 use tracing::{debug, info, warn};
+
+mod reader;
 
 // ── Tail policy ──────────────────────────────────────────────────────────────
 
@@ -136,12 +140,83 @@ impl WalReplayEngine {
     /// Returns a [`ReplayReport`] describing what happened.  Under
     /// [`TailPolicy::FailFast`], returns `Err` on the first corrupt or
     /// truncated record instead of continuing.
-    #[expect(clippy::too_many_lines)]
     pub fn replay<F>(&self, data: &[u8], skip_up_to_seq: u64, mut apply: F) -> Result<ReplayReport>
     where
         F: FnMut(&WalCommit),
     {
         let total_data_bytes = u64::try_from(data.len()).unwrap_or(u64::MAX);
+        self.replay_records(
+            total_data_bytes,
+            skip_up_to_seq,
+            |offset| {
+                let offset = usize::try_from(offset)
+                    .map_err(|_| FfsError::Format("WAL offset exceeds address space".to_owned()))?;
+                let tail = &data[offset..];
+                Ok((wal::decode_commit(tail), wal::commit_byte_size(tail)))
+            },
+            |commit| {
+                apply(commit);
+                Ok(())
+            },
+            || Ok(()),
+        )
+    }
+
+    /// Replay a captured WAL range without loading the entire log into memory.
+    ///
+    /// `reader` must be positioned after the file header. `total_data_bytes`
+    /// captures the length of that range; bytes appended after it are not read.
+    /// Memory is proportional to the largest record, not the size of the log.
+    /// The caller must exclude concurrent changes to the captured bytes.
+    ///
+    /// Short reads and interruptions are handled with cancellation checkpoints
+    /// between bounded reads. I/O, allocation, cancellation, and apply errors
+    /// always return `Err`, even under `TruncateToLastGood`: none authorizes
+    /// discarding a WAL tail. A record longer than the captured remainder is a
+    /// torn tail; EOF before the captured length is instead an I/O failure.
+    ///
+    /// The apply closure must make each commit atomic. Earlier successful
+    /// applications are not rolled back on error; discard or recover the
+    /// destination before retrying. No file is modified by this method.
+    pub fn replay_reader<R, F>(
+        &self,
+        cx: &Cx,
+        reader: &mut R,
+        total_data_bytes: u64,
+        skip_up_to_seq: u64,
+        apply: F,
+    ) -> Result<ReplayReport>
+    where
+        R: Read,
+        F: FnMut(&WalCommit) -> Result<()>,
+    {
+        let mut source = reader::RecordReader::new(reader, total_data_bytes);
+        self.replay_records(
+            total_data_bytes,
+            skip_up_to_seq,
+            |_| source.next(cx),
+            apply,
+            || cx.checkpoint().map_err(|_| FfsError::Cancelled),
+        )
+    }
+
+    // Both sources share sentinel, monotonicity, checkpoint-skip, and tail
+    // policy handling. A framing change cannot silently bypass those checks.
+    #[expect(clippy::too_many_lines)]
+    fn replay_records<D, F, C>(
+        &self,
+        total_data_bytes: u64,
+        skip_up_to_seq: u64,
+        mut decode: D,
+        mut apply: F,
+        mut checkpoint: C,
+    ) -> Result<ReplayReport>
+    where
+        D: FnMut(u64) -> Result<(DecodeResult, Option<usize>)>,
+        F: FnMut(&WalCommit) -> Result<()>,
+        C: FnMut() -> Result<()>,
+    {
+        checkpoint()?;
         let operation_id = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX));
@@ -154,7 +229,7 @@ impl WalReplayEngine {
             "wal_replay_start"
         );
 
-        if data.is_empty() {
+        if total_data_bytes == 0 {
             info!(operation_id, "wal_replay_empty");
             return Ok(ReplayReport {
                 outcome: ReplayOutcome::EmptyLog,
@@ -167,36 +242,35 @@ impl WalReplayEngine {
             });
         }
 
-        let mut offset = 0_usize;
+        let mut offset = 0_u64;
         let mut commits_replayed = 0_u64;
         let mut versions_replayed = 0_u64;
         let mut records_discarded = 0_u64;
         let mut last_decoded_seq = 0_u64;
         let mut last_replayed_seq = skip_up_to_seq;
-        let mut last_valid_offset = 0_usize;
+        let mut last_valid_offset = 0_u64;
         let mut outcome = ReplayOutcome::Clean;
 
-        while offset < data.len() {
+        while offset < total_data_bytes {
+            checkpoint()?;
             let record_offset = offset;
+            let (decoded, size) = decode(offset)?;
+            checkpoint()?;
 
-            match wal::decode_commit(&data[offset..]) {
+            match decoded {
                 DecodeResult::Commit(commit) => {
-                    let Some(size) = wal::commit_byte_size(&data[offset..]) else {
-                        debug!(
-                            operation_id,
-                            offset = record_offset,
-                            "wal_replay_size_unknown"
-                        );
-                        records_discarded += 1;
-                        outcome = ReplayOutcome::TruncatedTail { records_discarded };
-                        break;
-                    };
+                    let size = size
+                        .and_then(|size| u64::try_from(size).ok())
+                        .filter(|&size| size > 0 && size <= total_data_bytes - offset)
+                        .ok_or_else(|| {
+                            FfsError::Format("WAL decoder returned invalid record size".to_owned())
+                        })?;
                     offset += size;
 
                     // D8: Reject sentinel values before checkpoint skipping so
                     // malformed covered prefixes cannot be reported clean.
                     if commit.commit_seq.0 == u64::MAX || commit.txn_id.0 == u64::MAX {
-                        let record_offset_u64 = u64::try_from(record_offset).unwrap_or(u64::MAX);
+                        let record_offset_u64 = record_offset;
 
                         if self.tail_policy == TailPolicy::FailFast {
                             warn!(
@@ -231,7 +305,7 @@ impl WalReplayEngine {
                     // record. `skip_up_to_seq` suppresses apply only; it must
                     // not hide malformed checkpoint-covered WAL prefixes.
                     if commit.commit_seq.0 <= last_decoded_seq {
-                        let record_offset_u64 = u64::try_from(record_offset).unwrap_or(u64::MAX);
+                        let record_offset_u64 = record_offset;
 
                         if self.tail_policy == TailPolicy::FailFast {
                             warn!(
@@ -278,7 +352,8 @@ impl WalReplayEngine {
                         writes = commit.writes.len(),
                         "wal_replay_apply"
                     );
-                    apply(&commit);
+                    apply(&commit)?;
+                    checkpoint()?;
                     last_replayed_seq = commit.commit_seq.0;
                     commits_replayed += 1;
                     versions_replayed += u64::try_from(commit.writes.len()).unwrap_or(u64::MAX);
@@ -290,7 +365,7 @@ impl WalReplayEngine {
                     break;
                 }
                 DecodeResult::NeedMore(needed) => {
-                    let record_offset_u64 = u64::try_from(record_offset).unwrap_or(u64::MAX);
+                    let record_offset_u64 = record_offset;
 
                     if self.tail_policy == TailPolicy::FailFast {
                         warn!(
@@ -316,7 +391,7 @@ impl WalReplayEngine {
                     break;
                 }
                 DecodeResult::Corrupted(msg) => {
-                    let record_offset_u64 = u64::try_from(record_offset).unwrap_or(u64::MAX);
+                    let record_offset_u64 = record_offset;
 
                     if self.tail_policy == TailPolicy::FailFast {
                         warn!(
@@ -347,14 +422,14 @@ impl WalReplayEngine {
             }
         }
 
-        let last_valid_offset_u64 = u64::try_from(last_valid_offset).unwrap_or(u64::MAX);
+        checkpoint()?;
 
         info!(
             operation_id,
             commits_replayed,
             versions_replayed,
             records_discarded,
-            last_valid_offset = last_valid_offset_u64,
+            last_valid_offset,
             outcome = ?outcome,
             "wal_replay_done"
         );
@@ -364,7 +439,7 @@ impl WalReplayEngine {
             commits_replayed,
             versions_replayed,
             records_discarded,
-            last_valid_offset: last_valid_offset_u64,
+            last_valid_offset,
             total_data_bytes,
             last_commit_seq: last_replayed_seq,
         })
