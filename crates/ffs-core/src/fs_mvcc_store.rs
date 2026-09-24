@@ -375,6 +375,87 @@ impl<D: BlockDevice> FsMvccBlockDevice<D> {
     fn reads_base_directly(&self) -> bool {
         matches!(self.ownership, SnapshotOwnership::Unregistered { .. }) && !self.read_your_writes
     }
+
+    fn validate_range(&self, start: BlockNumber, count: u64) -> FfsResult<()> {
+        if self.block_size() == 0 {
+            return Err(FfsError::Format("MVCC device has zero block size".to_owned()));
+        }
+        let end = start
+            .0
+            .checked_add(count)
+            .ok_or_else(|| FfsError::Format("block range overflow".to_owned()))?;
+        if end > self.block_count() {
+            return Err(FfsError::Format(format!(
+                "block range [{}, {end}) exceeds device block count {}",
+                start.0,
+                self.block_count()
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_write_access(&self, cx: &Cx, block: BlockNumber) -> FfsResult<()> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        if self.reads_base_directly() {
+            return Err(FfsError::UnsupportedFeature(
+                "unregistered MVCC block device is read-only".to_owned(),
+            ));
+        }
+        self.validate_range(block, 1)
+    }
+
+    fn validate_write_len(&self, actual: usize) -> FfsResult<()> {
+        if actual != self.block_size() as usize {
+            return Err(FfsError::Format(format!(
+                "MVCC write length {actual} does not match block size {}",
+                self.block_size()
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_read_buf(&self, block: BlockNumber, buf: &BlockBuf) -> FfsResult<()> {
+        if buf.as_slice().len() != self.block_size() as usize {
+            return Err(FfsError::Corruption {
+                block: block.0,
+                detail: format!(
+                    "MVCC read returned {} bytes for a {}-byte block",
+                    buf.as_slice().len(),
+                    self.block_size()
+                ),
+            });
+        }
+        Ok(())
+    }
+
+    fn rmw_with_proof(
+        &self,
+        cx: &Cx,
+        block: BlockNumber,
+        proof: MergeProof,
+        patch: &mut dyn FnMut(&mut Vec<u8>) -> FfsResult<()>,
+    ) -> FfsResult<()> {
+        self.validate_write_access(cx, block)?;
+        // Begin before reading, and retain the exact snapshot ancestor even if
+        // another writer commits and prunes while the callback runs. All three
+        // RMW variants use this gate so bitmap updates cannot bypass it.
+        let mut txn = self.store.begin();
+        let (buf, base) = self.read_merge_ancestor_at_snapshot(cx, block, txn.snapshot())?;
+        let mut data = buf.into_inner();
+        patch(&mut data)?;
+        // A callback can resize the Vec or request cancellation. Neither may
+        // publish a version; malformed data would otherwise panic a later read
+        // or poison the durable flush. There is no fallible check AFTER commit.
+        self.validate_write_len(data.len())?;
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        txn.stage_write_with_proof_and_base(block, data, proof, base);
+        let commit_seq = self
+            .store
+            .commit(txn)
+            .map_err(|error| commit_error_to_ffs(&error))?;
+        self.store.prune_after_commit_if_due(commit_seq);
+        Ok(())
+    }
 }
 
 impl<D: BlockDevice> Drop for FsMvccBlockDevice<D> {
@@ -391,16 +472,21 @@ impl<D: BlockDevice> Drop for FsMvccBlockDevice<D> {
 
 impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
     fn read_block(&self, cx: &Cx, block: BlockNumber) -> FfsResult<BlockBuf> {
-        if self.reads_base_directly() {
-            return self.base.read_block(cx, block);
-        }
-        if let Some(buf) = self
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        self.validate_range(block, 1)?;
+        let buf = if self.reads_base_directly() {
+            self.base.read_block(cx, block)?
+        } else if let Some(buf) = self
             .store
             .read_visible_block_buf(block, self.read_snapshot())
         {
-            return Ok(buf);
-        }
-        self.base.read_block(cx, block)
+            buf
+        } else {
+            self.base.read_block(cx, block)?
+        };
+        self.validate_read_buf(block, &buf)?;
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        Ok(buf)
     }
 
     fn supports_contiguous_reads(&self) -> bool {
@@ -413,26 +499,32 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         start: BlockNumber,
         bufs: &mut [BlockBuf],
     ) -> FfsResult<()> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         if bufs.is_empty() {
             return Ok(());
         }
         let count = u64::try_from(bufs.len())
             .map_err(|_| FfsError::Format("block count does not fit u64".to_owned()))?;
-        start
-            .0
-            .checked_add(count)
-            .ok_or_else(|| FfsError::Format("block range overflow".to_owned()))?;
+        self.validate_range(start, count)?;
         if self.reads_base_directly() {
-            return self.base.read_contiguous_blocks(cx, start, bufs);
+            self.base.read_contiguous_blocks(cx, start, bufs)?;
+            for (delta, buf) in bufs.iter().enumerate() {
+                self.validate_read_buf(BlockNumber(start.0 + delta as u64), buf)?;
+            }
+            return cx.checkpoint().map_err(|_| FfsError::Cancelled);
         }
 
         let snap = self.read_snapshot();
         let mut visible = Vec::with_capacity(bufs.len());
         let mut any_visible = false;
         for delta in 0..count {
+            if delta.is_multiple_of(64) {
+                cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            }
             let block = BlockNumber(start.0 + delta);
             match self.store.read_visible_block_buf(block, snap) {
                 Some(buf) => {
+                    self.validate_read_buf(block, &buf)?;
                     visible.push(Some(buf));
                     any_visible = true;
                 }
@@ -440,11 +532,16 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
             }
         }
         if !any_visible {
-            return self.base.read_contiguous_blocks(cx, start, bufs);
+            self.base.read_contiguous_blocks(cx, start, bufs)?;
+            for (delta, buf) in bufs.iter().enumerate() {
+                self.validate_read_buf(BlockNumber(start.0 + delta as u64), buf)?;
+            }
+            return cx.checkpoint().map_err(|_| FfsError::Cancelled);
         }
 
         let mut idx = 0usize;
         while idx < bufs.len() {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
             if let Some(buf) = visible[idx].take() {
                 bufs[idx] = buf;
                 idx += 1;
@@ -459,11 +556,15 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
             let run_block_start = BlockNumber(start.0 + run_start_u64);
             self.base
                 .read_contiguous_blocks(cx, run_block_start, &mut bufs[run_start..idx])?;
+            for (delta, buf) in bufs[run_start..idx].iter().enumerate() {
+                self.validate_read_buf(BlockNumber(run_block_start.0 + delta as u64), buf)?;
+            }
         }
-        Ok(())
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)
     }
 
     fn read_contiguous_into(&self, cx: &Cx, start: BlockNumber, dst: &mut [u8]) -> FfsResult<()> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let bs = self.block_size() as usize;
         if bs == 0 || !dst.len().is_multiple_of(bs) {
             return Err(FfsError::Format(
@@ -476,21 +577,23 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         let count = dst.len() / bs;
         let count_u64 = u64::try_from(count)
             .map_err(|_| FfsError::Format("block range exceeds u64".to_owned()))?;
-        start
-            .0
-            .checked_add(count_u64)
-            .ok_or_else(|| FfsError::Format("block range overflow".to_owned()))?;
+        self.validate_range(start, count_u64)?;
         if self.reads_base_directly() {
-            return self.base.read_contiguous_into(cx, start, dst);
+            self.base.read_contiguous_into(cx, start, dst)?;
+            return cx.checkpoint().map_err(|_| FfsError::Cancelled);
         }
 
         let snap = self.read_snapshot();
         let mut visible = Vec::with_capacity(count);
         let mut any_visible = false;
         for delta in 0..count_u64 {
+            if delta.is_multiple_of(64) {
+                cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            }
             let block = BlockNumber(start.0 + delta);
             match self.store.read_visible_block_buf(block, snap) {
                 Some(buf) => {
+                    self.validate_read_buf(block, &buf)?;
                     visible.push(Some(buf));
                     any_visible = true;
                 }
@@ -498,11 +601,13 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
             }
         }
         if !any_visible {
-            return self.base.read_contiguous_into(cx, start, dst);
+            self.base.read_contiguous_into(cx, start, dst)?;
+            return cx.checkpoint().map_err(|_| FfsError::Cancelled);
         }
 
         let mut idx = 0usize;
         while idx < count {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
             if let Some(buf) = visible[idx].take() {
                 dst[idx * bs..(idx + 1) * bs].copy_from_slice(buf.as_slice());
                 idx += 1;
@@ -521,18 +626,15 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
                 &mut dst[run_start * bs..idx * bs],
             )?;
         }
-        Ok(())
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)
     }
 
-    fn write_block(&self, _cx: &Cx, block: BlockNumber, data: &[u8]) -> FfsResult<()> {
-        if self.reads_base_directly() {
-            return Err(FfsError::UnsupportedFeature(
-                "unregistered MVCC block device is read-only".to_owned(),
-            ));
-        }
-
+    fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> FfsResult<()> {
+        self.validate_write_access(cx, block)?;
+        self.validate_write_len(data.len())?;
         let mut txn = self.store.begin();
         txn.stage_write(block, data.to_vec());
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let commit_seq = self
             .store
             .commit(txn)
@@ -548,41 +650,6 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         disjoint_ranges: &[(usize, usize)],
         patch: &mut dyn FnMut(&mut Vec<u8>) -> FfsResult<()>,
     ) -> FfsResult<()> {
-        if self.reads_base_directly() {
-            return Err(FfsError::UnsupportedFeature(
-                "unregistered MVCC block device is read-only".to_owned(),
-            ));
-        }
-        // Begin the transaction FIRST, then read the base block AT the transaction's
-        // snapshot (a read taken beforehand could observe an older version than the
-        // txn — see `rmw_commit_block_with_proof`'s contract). When the store holds
-        // no version at the snapshot, the block is still on the base device.
-        let mut txn = self.store.begin();
-        let snapshot = txn.snapshot();
-        // Record the base-device content when no version exists at the snapshot,
-        // so concurrent disjoint-range writers to the SAME freshly-allocated
-        // block (e.g. two creates touching different group descriptors of a new
-        // GDT block) merge instead of FCW-conflicting (bd-bhh0i; the version
-        // chain gives an empty base otherwise).
-        // Record the ancestor as `staged_base` ALWAYS, including when the store
-        // holds a version at the snapshot. Relying on the version chain to still
-        // hold it at commit time is what breaks: a concurrent
-        // `prune_after_commit_if_due` can drop it between stage and commit, the
-        // merge then resolves an EMPTY base, and a disjoint write is aborted on a
-        // spurious length mismatch. `rmw_commit_block_with_proof` above already
-        // records unconditionally for this exact reason (bd-bhh0i's inode-table
-        // pruning race); these three device-level RMW paths were left behind, and
-        // the gap only shows under enough load for a snapshot to age past a prune
-        // (bd-y2t0r, block 2085).
-        let (mut data, base) = if let Some(buf) = self.store.read_visible_block_buf(block, snapshot)
-        {
-            let resident = buf.as_slice().to_vec();
-            (resident.clone(), Some(resident))
-        } else {
-            let device_base = self.base.read_block(cx, block)?.into_inner();
-            (device_base.clone(), Some(device_base))
-        };
-        patch(&mut data)?;
         // Empty hint → identical to `write_block` (default `Unsafe` proof, no merge).
         // A non-empty hint stages a range-scoped `IndependentKeys` proof so writers
         // touching disjoint ranges of this block MERGE instead of FCW-conflicting.
@@ -591,13 +658,7 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         } else {
             MergeProof::independent_keys(disjoint_ranges)
         };
-        txn.stage_write_with_proof_and_base(block, data, proof, base);
-        let commit_seq = self
-            .store
-            .commit(txn)
-            .map_err(|error| commit_error_to_ffs(&error))?;
-        self.store.prune_after_commit_if_due(commit_seq);
-        Ok(())
+        self.rmw_with_proof(cx, block, proof, patch)
     }
 
     fn rmw_block_bitmap_or(
@@ -606,46 +667,7 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         block: BlockNumber,
         patch: &mut dyn FnMut(&mut Vec<u8>) -> FfsResult<()>,
     ) -> FfsResult<()> {
-        if self.reads_base_directly() {
-            return Err(FfsError::UnsupportedFeature(
-                "unregistered MVCC block device is read-only".to_owned(),
-            ));
-        }
-        // Same begin-first / read-base-at-snapshot contract as `rmw_block` (a
-        // read taken before `begin` could observe an older version and silently
-        // clobber a concurrent disjoint-bit writer). `patch` is the caller's
-        // set-only bit mutation (allocation); staging `MergeProof::BitmapOr`
-        // lets two concurrent allocators to disjoint blocks of the SAME group
-        // bitmap block merge (`latest | staged`) instead of first-committer-wins
-        // conflicting, even when their bits share a byte (bd-bhh0i BUG 4).
-        let mut txn = self.store.begin();
-        let snapshot = txn.snapshot();
-        // Record the ancestor as `staged_base` ALWAYS, including when the store
-        // holds a version at the snapshot. Relying on the version chain to still
-        // hold it at commit time is what breaks: a concurrent
-        // `prune_after_commit_if_due` can drop it between stage and commit, the
-        // merge then resolves an EMPTY base, and a disjoint write is aborted on a
-        // spurious length mismatch. `rmw_commit_block_with_proof` above already
-        // records unconditionally for this exact reason (bd-bhh0i's inode-table
-        // pruning race); these three device-level RMW paths were left behind, and
-        // the gap only shows under enough load for a snapshot to age past a prune
-        // (bd-y2t0r, block 2085).
-        let (mut data, base) = if let Some(buf) = self.store.read_visible_block_buf(block, snapshot)
-        {
-            let resident = buf.as_slice().to_vec();
-            (resident.clone(), Some(resident))
-        } else {
-            let device_base = self.base.read_block(cx, block)?.into_inner();
-            (device_base.clone(), Some(device_base))
-        };
-        patch(&mut data)?;
-        txn.stage_write_with_proof_and_base(block, data, MergeProof::BitmapOr, base);
-        let commit_seq = self
-            .store
-            .commit(txn)
-            .map_err(|error| commit_error_to_ffs(&error))?;
-        self.store.prune_after_commit_if_due(commit_seq);
-        Ok(())
+        self.rmw_with_proof(cx, block, MergeProof::BitmapOr, patch)
     }
 
     fn rmw_block_bitmap_delta(
@@ -654,45 +676,7 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         block: BlockNumber,
         patch: &mut dyn FnMut(&mut Vec<u8>) -> FfsResult<()>,
     ) -> FfsResult<()> {
-        if self.reads_base_directly() {
-            return Err(FfsError::UnsupportedFeature(
-                "unregistered MVCC block device is read-only".to_owned(),
-            ));
-        }
-        // Identical begin-first / read-base-at-snapshot contract as
-        // `rmw_block_bitmap_or`; only the staged proof differs. `patch` may set
-        // AND clear bits, so two threads whose create and unlink land in the same
-        // inode-bitmap block merge on disjoint bits instead of first-committer-wins
-        // conflicting (bd-y2t0r). Recording the base when no version exists at the
-        // snapshot is what lets the merge see the true common ancestor.
-        let mut txn = self.store.begin();
-        let snapshot = txn.snapshot();
-        // Record the ancestor as `staged_base` ALWAYS, including when the store
-        // holds a version at the snapshot. Relying on the version chain to still
-        // hold it at commit time is what breaks: a concurrent
-        // `prune_after_commit_if_due` can drop it between stage and commit, the
-        // merge then resolves an EMPTY base, and a disjoint write is aborted on a
-        // spurious length mismatch. `rmw_commit_block_with_proof` above already
-        // records unconditionally for this exact reason (bd-bhh0i's inode-table
-        // pruning race); these three device-level RMW paths were left behind, and
-        // the gap only shows under enough load for a snapshot to age past a prune
-        // (bd-y2t0r, block 2085).
-        let (mut data, base) = if let Some(buf) = self.store.read_visible_block_buf(block, snapshot)
-        {
-            let resident = buf.as_slice().to_vec();
-            (resident.clone(), Some(resident))
-        } else {
-            let device_base = self.base.read_block(cx, block)?.into_inner();
-            (device_base.clone(), Some(device_base))
-        };
-        patch(&mut data)?;
-        txn.stage_write_with_proof_and_base(block, data, MergeProof::BitmapDelta, base);
-        let commit_seq = self
-            .store
-            .commit(txn)
-            .map_err(|error| commit_error_to_ffs(&error))?;
-        self.store.prune_after_commit_if_due(commit_seq);
-        Ok(())
+        self.rmw_with_proof(cx, block, MergeProof::BitmapDelta, patch)
     }
 
     fn read_merge_ancestor_at_snapshot(
@@ -701,6 +685,8 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         block: BlockNumber,
         snapshot: Snapshot,
     ) -> FfsResult<(BlockBuf, Option<Vec<u8>>)> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        self.validate_range(block, 1)?;
         // Resolve the ancestor at the CALLER's snapshot, independent of this
         // device's own read-your-writes view. Retain the exact before-image even
         // when it came from MVCC: the caller can stage a batched transaction and
@@ -714,7 +700,9 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
         } else {
             self.base.read_block(cx, block)?
         };
+        self.validate_read_buf(block, &buf)?;
         let base = buf.as_slice().to_vec();
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         Ok((buf, Some(base)))
     }
 
@@ -727,6 +715,7 @@ impl<D: BlockDevice> BlockDevice for FsMvccBlockDevice<D> {
     }
 
     fn sync(&self, cx: &Cx) -> FfsResult<()> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         self.base.sync(cx)
     }
 }
@@ -741,6 +730,15 @@ mod block_device_tests {
     const BLOCK_SIZE: u32 = 4096;
     const BLOCK_COUNT: usize = 4;
     const BLOCK: BlockNumber = BlockNumber(1);
+
+    #[derive(Clone, Copy)]
+    enum RmwKind {
+        Ranges,
+        BitmapOr,
+        BitmapDelta,
+    }
+
+    const RMW_KINDS: [RmwKind; 3] = [RmwKind::Ranges, RmwKind::BitmapOr, RmwKind::BitmapDelta];
 
     struct Fixture {
         image: NamedTempFile,
@@ -791,6 +789,20 @@ mod block_device_tests {
                 std::fs::read(self.image.path()).expect("read image"),
                 vec![0xA5; BLOCK_SIZE as usize * BLOCK_COUNT]
             );
+        }
+
+        fn rmw(
+            &self,
+            kind: RmwKind,
+            cx: &Cx,
+            block: BlockNumber,
+            patch: &mut dyn FnMut(&mut Vec<u8>) -> FfsResult<()>,
+        ) -> FfsResult<()> {
+            match kind {
+                RmwKind::Ranges => self.device.rmw_block(cx, block, &[(0, 1)], patch),
+                RmwKind::BitmapOr => self.device.rmw_block_bitmap_or(cx, block, patch),
+                RmwKind::BitmapDelta => self.device.rmw_block_bitmap_delta(cx, block, patch),
+            }
         }
     }
 
@@ -902,6 +914,326 @@ mod block_device_tests {
             peer
         );
         fixture.assert_image_unchanged();
+    }
+
+    #[test]
+    fn invalid_full_block_writes_never_publish_versions() {
+        for store in [FsMvccStore::single(), FsMvccStore::sharded()] {
+            let fixture = Fixture::new(store);
+            let cx = Cx::for_testing();
+            let before = fixture.store.current_snapshot();
+            for len in [0, BLOCK_SIZE as usize - 1, BLOCK_SIZE as usize + 1] {
+                assert!(matches!(
+                    fixture.device.write_block(&cx, BLOCK, &vec![0x11; len]),
+                    Err(FfsError::Format(_))
+                ));
+            }
+            for block in [BlockNumber(BLOCK_COUNT as u64), BlockNumber(u64::MAX)] {
+                assert!(matches!(
+                    fixture
+                        .device
+                        .write_block(&cx, block, &vec![0x11; BLOCK_SIZE as usize]),
+                    Err(FfsError::Format(_))
+                ));
+            }
+            assert_eq!(fixture.store.current_snapshot(), before);
+            assert_eq!(fixture.store.version_count(), 0);
+            fixture.assert_image_unchanged();
+
+            let last = BlockNumber(BLOCK_COUNT as u64 - 1);
+            let data = vec![0x22; BLOCK_SIZE as usize];
+            fixture
+                .device
+                .write_block(&cx, last, &data)
+                .expect("valid write");
+            assert_eq!(
+                fixture
+                    .device
+                    .read_block(&cx, last)
+                    .expect("read")
+                    .as_slice(),
+                data
+            );
+            fixture.assert_image_unchanged();
+        }
+    }
+
+    #[test]
+    fn all_rmw_paths_reject_resized_buffers_without_publishing() {
+        for store in [FsMvccStore::single(), FsMvccStore::sharded()] {
+            let fixture = Fixture::new(store);
+            let cx = Cx::for_testing();
+            for kind in RMW_KINDS {
+                for len in [0, BLOCK_SIZE as usize - 1, BLOCK_SIZE as usize + 1] {
+                    let before = fixture.store.current_snapshot();
+                    assert!(matches!(
+                        fixture.rmw(kind, &cx, BLOCK, &mut |data| {
+                            data.resize(len, 0);
+                            Ok(())
+                        }),
+                        Err(FfsError::Format(_))
+                    ));
+                    assert_eq!(fixture.store.current_snapshot(), before);
+                    assert_eq!(fixture.store.version_count(), 0);
+                }
+            }
+            fixture.assert_image_unchanged();
+        }
+    }
+
+    #[test]
+    fn all_rmw_paths_stop_before_invalid_targets_and_after_callback_failure() {
+        for store in [FsMvccStore::single(), FsMvccStore::sharded()] {
+            let fixture = Fixture::new(store);
+            let cx = Cx::for_testing();
+            for kind in RMW_KINDS {
+                let mut called = false;
+                assert!(matches!(
+                    fixture.rmw(kind, &cx, BlockNumber(BLOCK_COUNT as u64), &mut |_| {
+                        called = true;
+                        Ok(())
+                    }),
+                    Err(FfsError::Format(_))
+                ));
+                assert!(!called);
+                assert!(matches!(
+                    fixture.rmw(kind, &cx, BLOCK, &mut |data| {
+                        data[0] = 0;
+                        Err(FfsError::NoSpace)
+                    }),
+                    Err(FfsError::NoSpace)
+                ));
+                assert_eq!(fixture.store.version_count(), 0);
+            }
+            fixture.assert_image_unchanged();
+        }
+    }
+
+    #[test]
+    fn all_rmw_paths_honor_callback_cancellation_before_commit() {
+        for store in [FsMvccStore::single(), FsMvccStore::sharded()] {
+            let fixture = Fixture::new(store);
+            fixture.commit(BLOCK, vec![0x11; BLOCK_SIZE as usize]);
+            for kind in RMW_KINDS {
+                let cx = Cx::for_testing();
+                let before = fixture.store.current_snapshot();
+                let versions = fixture.store.version_count();
+                assert!(matches!(
+                    fixture.rmw(kind, &cx, BLOCK, &mut |data| {
+                        data[0] |= 0x40;
+                        cx.set_cancel_requested(true);
+                        Ok(())
+                    }),
+                    Err(FfsError::Cancelled)
+                ));
+                assert_eq!(fixture.store.current_snapshot(), before);
+                assert_eq!(fixture.store.version_count(), versions);
+            }
+            fixture.assert_image_unchanged();
+        }
+    }
+
+    #[test]
+    fn valid_rmw_variants_publish_exactly_one_complete_block() {
+        for store in [FsMvccStore::single(), FsMvccStore::sharded()] {
+            let fixture = Fixture::new(store);
+            let cx = Cx::for_testing();
+            for kind in RMW_KINDS {
+                let before = fixture.store.current_snapshot();
+                fixture
+                    .rmw(kind, &cx, BLOCK, &mut |data| {
+                        data[0] |= 0x40;
+                        Ok(())
+                    })
+                    .expect("valid RMW");
+                assert_eq!(fixture.store.current_snapshot().high.0, before.high.0 + 1);
+                let mut expected = vec![0xA5; BLOCK_SIZE as usize];
+                expected[0] |= 0x40;
+                assert_eq!(
+                    fixture
+                        .device
+                        .read_block(&cx, BLOCK)
+                        .expect("read")
+                        .as_slice(),
+                    expected
+                );
+            }
+            fixture.assert_image_unchanged();
+        }
+    }
+
+    #[test]
+    fn cancelled_requests_cannot_use_resident_versions_or_publish_writes() {
+        for store in [FsMvccStore::single(), FsMvccStore::sharded()] {
+            let fixture = Fixture::new(store);
+            fixture.commit(BLOCK, vec![0x11; BLOCK_SIZE as usize]);
+            let cx = Cx::for_testing();
+            let mut bufs = vec![fixture.device.read_block(&cx, BLOCK).expect("seed buffer")];
+            let before = fixture.store.current_snapshot();
+            cx.set_cancel_requested(true);
+            assert!(matches!(
+                fixture.device.read_block(&cx, BLOCK),
+                Err(FfsError::Cancelled)
+            ));
+            assert!(matches!(
+                fixture
+                    .device
+                    .read_merge_ancestor_at_snapshot(&cx, BLOCK, before),
+                Err(FfsError::Cancelled)
+            ));
+            assert!(matches!(
+                fixture.device.read_contiguous_blocks(&cx, BLOCK, &mut bufs),
+                Err(FfsError::Cancelled)
+            ));
+            let mut dst = vec![0xCC; BLOCK_SIZE as usize];
+            assert!(matches!(
+                fixture.device.read_contiguous_into(&cx, BLOCK, &mut dst),
+                Err(FfsError::Cancelled)
+            ));
+            assert_eq!(dst, vec![0xCC; BLOCK_SIZE as usize]);
+            assert!(matches!(
+                fixture.device.write_block(&cx, BLOCK, &dst),
+                Err(FfsError::Cancelled)
+            ));
+            for kind in RMW_KINDS {
+                let mut called = false;
+                assert!(matches!(
+                    fixture.rmw(kind, &cx, BLOCK, &mut |_| {
+                        called = true;
+                        Ok(())
+                    }),
+                    Err(FfsError::Cancelled)
+                ));
+                assert!(!called);
+            }
+            assert_eq!(fixture.store.current_snapshot(), before);
+            fixture.assert_image_unchanged();
+        }
+    }
+
+    #[test]
+    fn malformed_overlay_buffers_fail_closed_before_copy_or_patch() {
+        for store in [FsMvccStore::single(), FsMvccStore::sharded()] {
+            let fixture = Fixture::new(store);
+            let cx = Cx::for_testing();
+            // Deliberately bypass the adapter to model invalid replay/staged state.
+            for len in [0, BLOCK_SIZE as usize - 1, BLOCK_SIZE as usize + 1] {
+                fixture.commit(BLOCK, vec![0x11; len]);
+                let before = fixture.store.current_snapshot();
+                assert!(matches!(
+                    fixture.device.read_block(&cx, BLOCK),
+                    Err(FfsError::Corruption { block: 1, .. })
+                ));
+                let mut dst = vec![0xCC; 2 * BLOCK_SIZE as usize];
+                assert!(matches!(
+                    fixture
+                        .device
+                        .read_contiguous_into(&cx, BlockNumber(0), &mut dst),
+                    Err(FfsError::Corruption { block: 1, .. })
+                ));
+                assert_eq!(dst, vec![0xCC; 2 * BLOCK_SIZE as usize]);
+                let seed = fixture
+                    .device
+                    .base
+                    .read_block(&cx, BlockNumber(0))
+                    .expect("base");
+                let mut bufs = vec![seed; 2];
+                assert!(matches!(
+                    fixture
+                        .device
+                        .read_contiguous_blocks(&cx, BlockNumber(0), &mut bufs),
+                    Err(FfsError::Corruption { block: 1, .. })
+                ));
+                let expected = vec![0xA5; BLOCK_SIZE as usize];
+                assert!(bufs.iter().all(|buf| buf.as_slice() == expected));
+                for kind in RMW_KINDS {
+                    let mut called = false;
+                    assert!(matches!(
+                        fixture.rmw(kind, &cx, BLOCK, &mut |_| {
+                            called = true;
+                            Ok(())
+                        }),
+                        Err(FfsError::Corruption { block: 1, .. })
+                    ));
+                    assert!(!called);
+                }
+                assert_eq!(fixture.store.current_snapshot(), before);
+            }
+            fixture.assert_image_unchanged();
+        }
+    }
+
+    #[test]
+    fn bulk_reads_validate_the_entire_range_before_modifying_output() {
+        for store in [FsMvccStore::single(), FsMvccStore::sharded()] {
+            let fixture = Fixture::new(store);
+            let cx = Cx::for_testing();
+            // An out-of-range overlay must not make an invalid device read succeed.
+            fixture.commit(
+                BlockNumber(BLOCK_COUNT as u64),
+                vec![0x11; BLOCK_SIZE as usize],
+            );
+            for start in [BlockNumber(BLOCK_COUNT as u64 - 1), BlockNumber(u64::MAX)] {
+                let mut dst = vec![0xCC; 2 * BLOCK_SIZE as usize];
+                assert!(matches!(
+                    fixture.device.read_contiguous_into(&cx, start, &mut dst),
+                    Err(FfsError::Format(_))
+                ));
+                assert_eq!(dst, vec![0xCC; 2 * BLOCK_SIZE as usize]);
+                let seed = fixture
+                    .device
+                    .base
+                    .read_block(&cx, BlockNumber(0))
+                    .expect("base");
+                let mut bufs = vec![seed; 2];
+                assert!(matches!(
+                    fixture.device.read_contiguous_blocks(&cx, start, &mut bufs),
+                    Err(FfsError::Format(_))
+                ));
+                let expected = vec![0xA5; BLOCK_SIZE as usize];
+                assert!(bufs.iter().all(|buf| buf.as_slice() == expected));
+            }
+            assert!(matches!(
+                fixture
+                    .device
+                    .read_block(&cx, BlockNumber(BLOCK_COUNT as u64)),
+                Err(FfsError::Format(_))
+            ));
+            fixture.assert_image_unchanged();
+        }
+    }
+
+    #[test]
+    fn valid_bulk_reads_preserve_mixed_overlay_and_device_bytes() {
+        for store in [FsMvccStore::single(), FsMvccStore::sharded()] {
+            let fixture = Fixture::new(store);
+            let cx = Cx::for_testing();
+            fixture.commit(BlockNumber(1), vec![0x11; BLOCK_SIZE as usize]);
+            fixture.commit(BlockNumber(3), vec![0x33; BLOCK_SIZE as usize]);
+            let mut expected = vec![0xA5; BLOCK_COUNT * BLOCK_SIZE as usize];
+            expected[BLOCK_SIZE as usize..2 * BLOCK_SIZE as usize].fill(0x11);
+            expected[3 * BLOCK_SIZE as usize..].fill(0x33);
+            let mut dst = vec![0; expected.len()];
+            fixture
+                .device
+                .read_contiguous_into(&cx, BlockNumber(0), &mut dst)
+                .expect("bulk read");
+            assert_eq!(dst, expected);
+            let seed = fixture
+                .device
+                .base
+                .read_block(&cx, BlockNumber(0))
+                .expect("base");
+            let mut bufs = vec![seed; BLOCK_COUNT];
+            fixture
+                .device
+                .read_contiguous_blocks(&cx, BlockNumber(0), &mut bufs)
+                .expect("buffers");
+            for (buf, bytes) in bufs.iter().zip(expected.chunks_exact(BLOCK_SIZE as usize)) {
+                assert_eq!(buf.as_slice(), bytes);
+            }
+            fixture.assert_image_unchanged();
+        }
     }
 }
 #[cfg(test)]
