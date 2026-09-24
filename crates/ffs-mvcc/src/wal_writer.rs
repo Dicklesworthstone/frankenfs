@@ -33,6 +33,28 @@ use tracing::{debug, error, info, warn};
 type CoalescedRecordOffsets = Vec<(usize, usize)>;
 type EncodedCoalescedBatch = (Vec<u8>, CoalescedRecordOffsets);
 
+/// Acquire the WAL inode before inspecting recovery state or changing bytes.
+/// The returned descriptor retains the advisory lock until its last clone is
+/// closed. Never use O_TRUNC here: a contending opener must not erase the log
+/// before discovering that another writer owns it. Path replacement and
+/// non-cooperating writers remain outside this single-host ownership protocol.
+pub(crate) fn open_owned_wal(path: &Path) -> Result<File> {
+    let file = OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    file.try_lock().map_err(|error| match error {
+        std::fs::TryLockError::WouldBlock => std::io::Error::new(
+            std::io::ErrorKind::WouldBlock,
+            format!("WAL is already owned by another writer: {}", path.display()),
+        ),
+        std::fs::TryLockError::Error(error) => error,
+    })?;
+    Ok(file)
+}
+
 // ── Error types ──────────────────────────────────────────────────────────────
 
 /// Classified error for WAL write operations.
@@ -271,6 +293,9 @@ impl WalWriter {
     /// Create a writer wrapping an already-open file at the given position.
     ///
     /// The file must already contain a valid WAL header at offset 0.
+    /// The caller must acquire exclusive ownership before replay or mutation,
+    /// and transfer the locked descriptor here. This low-level constructor does
+    /// not reacquire a lock: relocking an existing clone is platform dependent.
     #[must_use]
     pub fn new(file: File, write_pos: u64, config: WalWriterConfig) -> Self {
         Self {
@@ -295,13 +320,13 @@ impl WalWriter {
     }
 
     /// Create a fresh WAL file with header and return a writer positioned after it.
+    ///
+    /// Existing contents are discarded only after obtaining exclusive inode
+    /// ownership. A competing owner produces an I/O `WouldBlock` error without
+    /// modifying its log. Dropping the last descriptor releases ownership.
     pub fn create(path: &Path, config: WalWriterConfig) -> Result<Self> {
-        let mut file = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .open(path)?;
+        let mut file = open_owned_wal(path)?;
+        file.set_len(0)?;
 
         let header = WalHeader::default();
         let header_bytes = wal::encode_header(&header);
@@ -548,12 +573,14 @@ impl WalWriter {
     }
 
     /// Borrow the underlying file (for replay, truncation, etc.).
+    /// The caller must not unlock it while the writer is in use.
     #[must_use]
     pub fn file(&self) -> &File {
         &self.file
     }
 
     /// Mutably borrow the underlying file.
+    /// The caller must not unlock or replace it while the writer is in use.
     pub fn file_mut(&mut self) -> &mut File {
         &mut self.file
     }
