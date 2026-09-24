@@ -84122,6 +84122,69 @@ mod tests {
         );
     }
 
+    /// bd-34blv: with default settings a btrfs RW mount grows data chunks on
+    /// demand, so filling most of a 256 MiB image succeeds where the formatter's
+    /// small initial data chunk used to return ENOSPC after ~8 MiB. The result
+    /// must pass `btrfs check` and read back byte-exact after a reopen.
+    #[test]
+    fn btrfs_default_data_chunk_growth_fills_image_bd_34blv() {
+        let Some((fs, dev, _tmp, image)) = open_writable_btrfs_mkfs(256) else {
+            oracle_unavailable("btrfs image formatter");
+            return;
+        };
+        assert!(
+            fs.btrfs_grow_data_chunks_enabled(),
+            "data chunk growth must be on by default"
+        );
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let mib = 1024 * 1024;
+        let files = 150_u8;
+        let mut inos = Vec::new();
+        for i in 0..files {
+            let attr = fs
+                .create(
+                    &cx,
+                    root,
+                    OsStr::new(&format!("fill_{i:03}.bin")),
+                    0o644,
+                    0,
+                    0,
+                )
+                .expect("create");
+            fs.write(&cx, attr.ino, 0, &vec![i; mib])
+                .unwrap_or_else(|e| panic!("write #{i} (~{i} MiB in) failed: {e}"));
+            inos.push(attr.ino);
+            if i % 16 == 15 {
+                let _ = fs.flush_mvcc_to_device(&cx);
+                fs.btrfs_full_transaction_commit(&cx, "fill-checkpoint")
+                    .expect("periodic commit while filling");
+            }
+        }
+        let _ = fs.flush_mvcc_to_device(&cx);
+        fs.btrfs_full_transaction_commit(&cx, "fill-final")
+            .expect("final commit");
+        let bytes = dev.snapshot_bytes();
+        std::fs::write(&image, &bytes).expect("write image");
+        if let Some((ok, output)) = run_btrfs_check(&image) {
+            assert!(ok, "btrfs check must accept the grown image:\n{output}");
+        }
+        let reopened = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(bytes)),
+            &OpenOptions::default(),
+        )
+        .expect("reopen grown image");
+        for (i, ino) in inos.iter().enumerate().step_by(37) {
+            let expected = u8::try_from(i).expect("fits");
+            assert_eq!(
+                reopened.read(&cx, *ino, 0, 4096).expect("read back"),
+                vec![expected; 4096],
+                "file {i} content after reopen"
+            );
+        }
+    }
+
     /// bd-34blv: unset enables only the kernel-accepted data-growth path;
     /// `1` enables both; `0` is a kill switch; junk keeps the default.
     #[test]
