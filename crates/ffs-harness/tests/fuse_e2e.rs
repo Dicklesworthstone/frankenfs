@@ -16,7 +16,31 @@ use asupersync::Cx;
 use ffs_core::{
     BtrfsMountSelection, Ext4JournalReplayMode, FsOps, InodeAttr, OpenFs, OpenOptions, RequestScope,
 };
-use ffs_fuse::{MountOptions, WritebackCacheMode, mount_background};
+use ffs_fuse::{MountOptions, WritebackCacheMode};
+
+/// Every mount in this suite goes through this wrapper (bd-iah1f). With
+/// `FFS_E2E_FUSE_WORKERS=N` set, mounts that did not ask for a specific worker
+/// count run with N concurrent FUSE dispatch workers instead of the serial
+/// default, so the whole mounted correctness suite can be run under
+/// multi-worker dispatch before that default is changed.
+fn mount_background(
+    ops: Box<dyn FsOps>,
+    mountpoint: impl AsRef<Path>,
+    options: &MountOptions,
+) -> Result<fuser::BackgroundSession, ffs_fuse::FuseError> {
+    let workers = std::env::var("FFS_E2E_FUSE_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|&n| n > 0);
+    match workers {
+        Some(n) if options.worker_threads == 0 => {
+            let mut options = options.clone();
+            options.worker_threads = n;
+            ffs_fuse::mount_background(ops, mountpoint, &options)
+        }
+        _ => ffs_fuse::mount_background(ops, mountpoint, options),
+    }
+}
 use ffs_harness::load_sparse_fixture;
 use ffs_types::{GroupNumber, InodeNumber};
 use serde_json::Value;
