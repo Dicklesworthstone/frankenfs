@@ -884,15 +884,9 @@ impl BlockValidator for Ext4MetadataValidator {
                 let has_tail = tail.is_some_and(|t| {
                     t[0..4] == [0, 0, 0, 0] && t[4..6] == [12, 0] && t[6] == 0 && t[7] == 0xDE
                 });
-                if !has_tail {
-                    BlockVerdict::Clean
-                } else if ffs_ondisk::ext4::verify_dir_block_checksum(
-                    bytes,
-                    seed,
-                    *ino,
-                    *generation,
-                )
-                .is_ok()
+                if !has_tail
+                    || ffs_ondisk::ext4::verify_dir_block_checksum(bytes, seed, *ino, *generation)
+                        .is_ok()
                 {
                     BlockVerdict::Clean
                 } else {
