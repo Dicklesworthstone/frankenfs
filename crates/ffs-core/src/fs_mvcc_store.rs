@@ -811,7 +811,11 @@ mod block_device_tests {
             assert_eq!(bytes.as_slice(), original);
             assert_eq!(base.as_deref(), Some(original.as_slice()));
             assert_eq!(
-                fixture.device.read_block(&cx, BLOCK).expect("latest").as_slice(),
+                fixture
+                    .device
+                    .read_block(&cx, BLOCK)
+                    .expect("latest")
+                    .as_slice(),
                 vec![0x22; BLOCK_SIZE as usize]
             );
             fixture.assert_image_unchanged();
@@ -844,11 +848,18 @@ mod block_device_tests {
             MergeProof::independent_keys(&[(0, 1)]),
             base,
         );
-        fixture.store.commit(delayed).expect("disjoint merge after prune");
+        fixture
+            .store
+            .commit(delayed)
+            .expect("disjoint merge after prune");
 
         peer[0] = 0x22;
         assert_eq!(
-            fixture.device.read_block(&cx, BLOCK).expect("merged block").as_slice(),
+            fixture
+                .device
+                .read_block(&cx, BLOCK)
+                .expect("merged block")
+                .as_slice(),
             peer
         );
         fixture.assert_image_unchanged();
@@ -883,7 +894,11 @@ mod block_device_tests {
         ));
         assert_eq!(fixture.store.current_snapshot(), before);
         assert_eq!(
-            fixture.device.read_block(&cx, BLOCK).expect("peer block").as_slice(),
+            fixture
+                .device
+                .read_block(&cx, BLOCK)
+                .expect("peer block")
+                .as_slice(),
             peer
         );
         fixture.assert_image_unchanged();

@@ -59,6 +59,27 @@ const JBD2_TAG_HIGH_OFFSET_V3: usize = 8;
 const JBD2_TAG_CHECKSUM_OFFSET_V3: usize = 12;
 const JBD2_SUPERBLOCK_MIN_PARSE_SIZE: usize = 88;
 
+/// jbd2 superblock `s_sequence` / `s_start` (big-endian) and the v2/v3
+/// superblock checksum over the 1024-byte `journal_superblock_t`.
+const JBD2_SB_SEQUENCE_OFFSET: usize = 24;
+const JBD2_SB_START_OFFSET: usize = 28;
+const JBD2_SB_CHECKSUM_OFFSET: usize = 0xFC;
+const JBD2_SB_STRUCT_SIZE: usize = 1024;
+
+/// Stamp the jbd2 v2/v3 superblock checksum: CRC32C (kernel convention, seed
+/// `~0`) over the 1024-byte superblock with `s_checksum` zeroed.
+fn stamp_jbd2_superblock_checksum(raw: &mut [u8]) -> Result<()> {
+    if raw.len() < JBD2_SB_STRUCT_SIZE {
+        return Err(FfsError::Format(
+            "journal superblock block shorter than journal_superblock_t".to_owned(),
+        ));
+    }
+    raw[JBD2_SB_CHECKSUM_OFFSET..JBD2_SB_CHECKSUM_OFFSET + 4].copy_from_slice(&[0; 4]);
+    let csum = !crc32c::crc32c_append(0, &raw[..JBD2_SB_STRUCT_SIZE]);
+    raw[JBD2_SB_CHECKSUM_OFFSET..JBD2_SB_CHECKSUM_OFFSET + 4].copy_from_slice(&csum.to_be_bytes());
+    Ok(())
+}
+
 const JBD2_TAG_FLAG_ESCAPE: u32 = 0x0000_0001;
 const JBD2_TAG_FLAG_SAME_UUID: u32 = 0x0000_0002;
 const JBD2_TAG_FLAG_LAST: u32 = 0x0000_0008;
@@ -1343,6 +1364,66 @@ impl Jbd2Writer {
     #[must_use]
     pub fn base_head(&self) -> u64 {
         self.base_head
+    }
+
+    /// Record in the journal superblock that the log is LIVE from the current
+    /// head, with the sequence the next commit will carry (bd-cnmpm).
+    ///
+    /// Kernel jbd2 and e2fsck only replay a journal whose superblock `s_start`
+    /// is non-zero; with `s_start == 0` the journal is empty to them. The
+    /// writer used to leave `s_start` at 0 forever, so a crash between the
+    /// commit record and the checkpoint left torn home blocks that no kernel
+    /// tool would repair. Call this before writing a transaction; it must be
+    /// durable no later than the commit block (the caller's commit sync).
+    ///
+    /// # Errors
+    /// Device I/O failure, or a journal without a superblock region.
+    pub fn mark_log_live(&self, cx: &Cx, dev: &dyn BlockDevice) -> Result<()> {
+        let start = u32::try_from(self.head)
+            .map_err(|_| FfsError::Format("journal head exceeds u32".to_owned()))?;
+        self.write_log_tail(cx, dev, start, self.next_seq)
+    }
+
+    /// Record in the journal superblock that the log is EMPTY (`s_start = 0`)
+    /// and that the next transaction will carry `next_seq` (bd-cnmpm).
+    ///
+    /// Call only after every committed transaction is durable at its home
+    /// location. Advancing `s_sequence` past the checkpointed transactions is
+    /// also what stops a later scan from re-replaying a stale transaction left
+    /// in the region.
+    ///
+    /// # Errors
+    /// Device I/O failure, or a journal without a superblock region.
+    pub fn mark_log_empty(&self, cx: &Cx, dev: &dyn BlockDevice) -> Result<()> {
+        self.write_log_tail(cx, dev, 0, self.next_seq)
+    }
+
+    fn write_log_tail(
+        &self,
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        start: u32,
+        sequence: u32,
+    ) -> Result<()> {
+        if self.base_head == 0 {
+            return Err(FfsError::Format(
+                "journal has no superblock region to record the log tail in".to_owned(),
+            ));
+        }
+        let sb_block = resolve_segment_block(&self.segments, 0, self.total_blocks)?;
+        let mut raw = dev.read_block(cx, sb_block)?.as_slice().to_vec();
+        let sb = Jbd2Superblock::parse(&raw).ok_or_else(|| {
+            FfsError::Format("journal superblock no longer parses; refusing to patch it".to_owned())
+        })?;
+        raw[JBD2_SB_SEQUENCE_OFFSET..JBD2_SB_SEQUENCE_OFFSET + 4]
+            .copy_from_slice(&sequence.to_be_bytes());
+        raw[JBD2_SB_START_OFFSET..JBD2_SB_START_OFFSET + 4].copy_from_slice(&start.to_be_bytes());
+        if sb.feature_incompat & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3)
+            != 0
+        {
+            stamp_jbd2_superblock_checksum(&mut raw)?;
+        }
+        dev.write_block(cx, sb_block, &raw)
     }
 
     /// Begin a new transaction.

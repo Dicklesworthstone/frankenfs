@@ -1798,6 +1798,11 @@ pub struct OpenFs {
     pub numa_allocation_policy: NumaAllocationPolicy,
     /// Latched when an ext4 write I/O error forces a read-only remount.
     ext4_forced_read_only: AtomicBool,
+    /// Test fault injection (bd-cnmpm): stop the JBD2 durability boundary right
+    /// after the commit record is durable and before any home block is
+    /// written, leaving exactly the image a power loss at that point would.
+    #[cfg(test)]
+    jbd2_crash_after_commit_sync: AtomicBool,
     /// Set when mount-time ext4 orphan recovery failed (bd-xsu7s). The orphan
     /// chain is then in an unknown state, so `enable_writes` refuses until the
     /// image is repaired offline (e2fsck) instead of mutating on top of it.
@@ -6255,6 +6260,8 @@ impl OpenFs {
             ext4_data_err_policy: options.ext4_data_err_policy,
             numa_allocation_policy: options.numa_allocation_policy.clone(),
             ext4_forced_read_only: AtomicBool::new(false),
+            #[cfg(test)]
+            jbd2_crash_after_commit_sync: AtomicBool::new(false),
             ext4_orphan_recovery_error: None,
             ext4_open_handle_oracle: std::sync::OnceLock::new(),
             dev,
@@ -9547,6 +9554,19 @@ impl OpenFs {
     /// Propagates failures to read the journal inode or walk its extents. Those
     /// are hard errors rather than a `false`: an image that claims a journal we
     /// cannot map must not be mounted as if it had none.
+    /// `s_sequence` of the journal superblock at the start of `segments`, if
+    /// the region begins with a parseable jbd2 superblock (bd-cnmpm).
+    fn dev_read_journal_superblock_sequence(
+        &self,
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        segments: &[ffs_journal::JournalSegment],
+    ) -> Option<u32> {
+        let first = segments.first()?;
+        let raw = dev.read_block(cx, first.start).ok()?;
+        Jbd2Superblock::parse(raw.as_slice()).map(|sb| sb.start_sequence)
+    }
+
     pub fn attach_ext4_internal_jbd2_writer(&mut self, cx: &Cx) -> Result<bool, FfsError> {
         let Some(sb) = self.ext4_superblock() else {
             return Ok(false);
@@ -9562,10 +9582,24 @@ impl OpenFs {
         }
         let writer = {
             let direct = self.direct_block_device_adapter();
+            // bd-cnmpm: continue the journal's sequence instead of restarting
+            // at 1 every mount. Reusing a sequence number lets a later scan
+            // chain into a stale transaction left in the region; the kernel
+            // likewise never reuses one. Start above the superblock's
+            // s_sequence and above every transaction mount-time replay applied.
+            let sb_sequence = self
+                .dev_read_journal_superblock_sequence(cx, &direct, &segments)
+                .unwrap_or(0);
+            let replayed_next = self
+                .ext4_journal_replay
+                .as_ref()
+                .and_then(|replay| replay.committed_sequences.iter().max().copied())
+                .map_or(0, |max| max.wrapping_add(1));
+            let start_seq = sb_sequence.max(replayed_next).max(1);
             // `open_segmented` does not scan for a committed tail; its
             // precondition is that mount-time replay already drained the
             // journal, which `from_device` performs before writes are enabled.
-            ffs_journal::Jbd2Writer::open_segmented(cx, &direct, segments, 1)?
+            ffs_journal::Jbd2Writer::open_segmented(cx, &direct, segments, start_seq)?
         };
         self.attach_jbd2_writer(writer);
         Ok(true)
@@ -22271,6 +22305,57 @@ impl OpenFs {
     /// 1024-byte-block fs (bd-icebl). ext4's minimum block size is 1024, so the
     /// block always exists.
     #[allow(clippy::cast_possible_truncation)]
+    /// Set or clear the ext4 INCOMPAT_RECOVER (needs_recovery) bit in a block
+    /// holding the superblock at `sb_off`, restamping the metadata checksum.
+    /// Returns whether the bytes changed (bd-cnmpm).
+    fn ext4_patch_needs_recovery(
+        block_data: &mut [u8],
+        sb_off: usize,
+        has_csum: bool,
+        set: bool,
+    ) -> bool {
+        const INCOMPAT_OFFSET: usize = 0x60;
+        let field = &mut block_data[sb_off + INCOMPAT_OFFSET..sb_off + INCOMPAT_OFFSET + 4];
+        let before = u32::from_le_bytes([field[0], field[1], field[2], field[3]]);
+        let recover = ffs_ondisk::Ext4IncompatFeatures::RECOVER.0;
+        let after = if set {
+            before | recover
+        } else {
+            before & !recover
+        };
+        if after == before {
+            return false;
+        }
+        field.copy_from_slice(&after.to_le_bytes());
+        if has_csum {
+            let csum = ffs_ondisk::ext4::ext4_chksum_skip_zero_tail(
+                !0u32,
+                &block_data[sb_off..sb_off + EXT4_SB_CHECKSUM_OFFSET],
+            );
+            block_data[sb_off + EXT4_SB_CHECKSUM_OFFSET..sb_off + EXT4_SB_CHECKSUM_OFFSET + 4]
+                .copy_from_slice(&csum.to_le_bytes());
+        }
+        true
+    }
+
+    /// Persist the needs_recovery bit on the on-disk superblock (bd-cnmpm).
+    fn ext4_write_needs_recovery(
+        &self,
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        set: bool,
+    ) -> Result<(), FfsError> {
+        let (sb_block, sb_off) = self.ext4_superblock_location();
+        let has_csum = self
+            .ext4_superblock()
+            .is_some_and(Ext4Superblock::has_metadata_csum);
+        let mut block_data = dev.read_block(cx, sb_block)?.into_inner();
+        if Self::ext4_patch_needs_recovery(&mut block_data, sb_off, has_csum, set) {
+            dev.write_block(cx, sb_block, &block_data)?;
+        }
+        Ok(())
+    }
+
     fn ext4_superblock_location(&self) -> (BlockNumber, usize) {
         let bs = u64::from(self.block_size());
         let sb_byte = ffs_types::EXT4_SUPERBLOCK_OFFSET as u64;
@@ -22572,7 +22657,7 @@ impl OpenFs {
         self.ext4_capture_group_descriptors(cx, &capture)?;
         self.ext4_sync_superblock_free_totals_to(cx, &capture)?;
 
-        let writes = capture.take_writes();
+        let mut writes = capture.take_writes();
         if writes.is_empty() {
             return Ok(Some((flushed, durable_through)));
         }
@@ -22581,8 +22666,31 @@ impl OpenFs {
             dev: self.dev.as_ref(),
             block_size: self.block_size(),
         };
+        // bd-cnmpm: kernel ext4 WIPES the journal on mount when the
+        // superblock's needs_recovery (INCOMPAT_RECOVER) flag is clear, and
+        // e2fsck / jbd2 only replay a journal whose `s_start` is non-zero. Both
+        // must therefore say "live" before the commit record is durable and
+        // "clean" only after the checkpoint is. The captured superblock copy
+        // (if this boundary changed the free totals) is patched too, so the
+        // checkpoint itself cannot clear the flag while home blocks are
+        // half-written.
+        let (sb_block, sb_off) = self.ext4_superblock_location();
+        let has_csum = self
+            .ext4_superblock()
+            .is_some_and(Ext4Superblock::has_metadata_csum);
+        for (block, data) in &mut writes {
+            if *block == sb_block {
+                Self::ext4_patch_needs_recovery(data, sb_off, has_csum, true);
+            }
+        }
+        self.ext4_write_needs_recovery(cx, &direct, true)?;
         {
             let mut journal = jbd2_mutex.lock();
+            journal.mark_log_live(cx, &direct).map_err(|e| {
+                FfsError::Io(std::io::Error::other(format!(
+                    "jbd2 flush boundary could not mark the log live: {e}"
+                )))
+            })?;
             let mut txn = journal.begin_transaction();
             for (block, data) in &writes {
                 txn.add_write(*block, data.clone());
@@ -22617,6 +22725,15 @@ impl OpenFs {
                     "jbd2 flush boundary journal commit sync failed (commit record durability ambiguous): {e}"
                 ))));
             }
+            #[cfg(test)]
+            if self
+                .jbd2_crash_after_commit_sync
+                .load(std::sync::atomic::Ordering::SeqCst)
+            {
+                return Err(FfsError::Io(std::io::Error::other(
+                    "test fault: crash after jbd2 commit sync, before checkpoint",
+                )));
+            }
             // Phase 2 — checkpoint to home locations, then make THAT durable.
             for (block, data) in &writes {
                 if let Err(e) = direct.write_block(cx, *block, data) {
@@ -22646,7 +22763,18 @@ impl OpenFs {
             // Phase 3 — the home copies are durable, so the region is reclaimable.
             // Only correct because phase 2 completed; see `reset_after_checkpoint`.
             journal.reset_after_checkpoint();
+            // bd-cnmpm: the log is empty again. Order matters: `s_start = 0`
+            // first, then clear needs_recovery — a crash between the two leaves
+            // "flag set, journal empty", which the kernel and e2fsck treat as
+            // nothing to replay. These need no extra sync: replaying an already
+            // checkpointed transaction is idempotent until they land.
+            journal.mark_log_empty(cx, &direct).map_err(|e| {
+                FfsError::Io(std::io::Error::other(format!(
+                    "jbd2 flush boundary could not mark the log empty: {e}"
+                )))
+            })?;
         }
+        self.ext4_write_needs_recovery(cx, &direct, false)?;
 
         // The home writes bypassed the MVCC overlay and both read caches, exactly
         // as `ext4_persist_group_descriptors_from` does, so drop them.
@@ -63806,6 +63934,113 @@ mod tests {
             return Err(format!("journal inode {inum} maps no blocks"));
         }
         Ok(segments)
+    }
+
+    /// bd-cnmpm: a crash after the JBD2 commit record is durable but before the
+    /// checkpoint must leave a journal that the KERNEL's tools replay. Before the
+    /// fix the writer never set `s_start` or needs_recovery, so e2fsck saw an
+    /// empty journal and the home block kept the old bytes forever.
+    ///
+    /// The oracle is real `e2fsck`: `-fy` must recover the journal, `-fn` must
+    /// then be clean, and a FrankenFS open that skips its own replay must read
+    /// the new bytes from the home block e2fsck wrote.
+    #[test]
+    fn ext4_jbd2_crash_window_is_replayed_by_e2fsck_bd_cnmpm() {
+        let cx = Cx::for_testing();
+        let Some((mut fs, dev, tmp)) = open_writable_ext4_mkfs_with_device(64) else {
+            oracle_unavailable("ext4 image formatter");
+            return;
+        };
+        assert!(
+            fs.attach_ext4_internal_jbd2_writer(&cx)
+                .expect("attach the image's own journal"),
+            "a formatted ext4 image must carry an internal journal"
+        );
+        let segments = ext4_journal_segments_for_test(&fs, &cx).expect("journal segments");
+        let bs = fs.block_size() as usize;
+        let journal_sb = |image: &[u8]| {
+            let start = usize::try_from(segments[0].start.0).expect("block fits") * bs;
+            Jbd2Superblock::parse(&image[start..start + bs]).expect("journal superblock")
+        };
+        let recover_set = |image: &[u8]| {
+            let off = ffs_types::EXT4_SUPERBLOCK_OFFSET + 0x60;
+            let incompat = u32::from_le_bytes(image[off..off + 4].try_into().expect("4 bytes"));
+            incompat & ffs_ondisk::Ext4IncompatFeatures::RECOVER.0 != 0
+        };
+
+        let attr = fs
+            .create(&cx, InodeNumber(2), OsStr::new("crash.bin"), 0o644, 0, 0)
+            .expect("create");
+        fs.write(&cx, attr.ino, 0, &[0x11_u8; 4096])
+            .expect("write old bytes");
+        fs.flush_mvcc_to_device(&cx).expect("clean boundary");
+        let clean = dev.snapshot_bytes();
+        let clean_sb = journal_sb(&clean);
+        assert_eq!(clean_sb.start_block, 0, "a checkpointed journal is empty");
+        assert!(
+            clean_sb.start_sequence > 1,
+            "s_sequence must advance past the checkpointed transaction"
+        );
+        assert!(!recover_set(&clean), "needs_recovery clear at rest");
+
+        fs.write(&cx, attr.ino, 0, &[0x22_u8; 4096])
+            .expect("write new bytes");
+        fs.jbd2_crash_after_commit_sync
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        fs.flush_mvcc_to_device(&cx)
+            .expect_err("injected crash before the checkpoint");
+        let crashed = dev.snapshot_bytes();
+        let crashed_sb = journal_sb(&crashed);
+        assert_ne!(crashed_sb.start_block, 0, "crash image must carry a live log");
+        assert!(recover_set(&crashed), "crash image must say needs_recovery");
+
+        let read_home = |image: &[u8]| {
+            let opts = OpenOptions {
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                ..OpenOptions::default()
+            };
+            let reopened =
+                OpenFs::from_device(&cx, Box::new(TestDevice::from_vec(image.to_vec())), &opts)
+                    .expect("reopen without FrankenFS replay");
+            reopened.read(&cx, attr.ino, 0, 4096).expect("read home")
+        };
+        assert_eq!(
+            read_home(&crashed),
+            vec![0x11_u8; 4096],
+            "the crash window is real: the home block still holds the old bytes"
+        );
+
+        let path = tmp.path().join("crashed.ext4");
+        std::fs::write(&path, &crashed).expect("write crash image");
+        let Ok(fix) = std::process::Command::new("e2fsck")
+            .args(["-fy", path.to_str().expect("utf8 path")])
+            .output()
+        else {
+            oracle_unavailable("e2fsck");
+            return;
+        };
+        let fix_out = format!(
+            "{}{}",
+            String::from_utf8_lossy(&fix.stdout),
+            String::from_utf8_lossy(&fix.stderr)
+        );
+        eprintln!("bd-cnmpm e2fsck -fy rc={:?}:\n{fix_out}", fix.status.code());
+        assert!(
+            fix_out.to_ascii_lowercase().contains("recovering journal"),
+            "e2fsck must recognize and replay the FrankenFS journal:\n{fix_out}"
+        );
+        assert!(
+            matches!(fix.status.code(), Some(0 | 1)),
+            "e2fsck -fy must finish without uncorrected errors:\n{fix_out}"
+        );
+        let (clean_after, out_after) = run_e2fsck(&path).expect("e2fsck ran above");
+        assert!(clean_after, "e2fsck -fn must be clean after replay:\n{out_after}");
+        let replayed = std::fs::read(&path).expect("read replayed image");
+        assert_eq!(
+            read_home(&replayed),
+            vec![0x22_u8; 4096],
+            "e2fsck's replay must land the acknowledged new bytes at home"
+        );
     }
 
     /// bd-4zjkz: with a JBD2 writer attached, an ext4 durability boundary must
