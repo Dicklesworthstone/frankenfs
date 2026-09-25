@@ -118,6 +118,13 @@ jobs:
           sudo mkdir -p /data/tmp
           sudo chmod 1777 /data/tmp
 
+      # vendor/fuser is outside the workspace, so `--workspace` never runs its
+      # tests. The FUSE_INTERRUPT routing FrankenFS added there (bd-gk01h) is
+      # ours; run it with the ABI the workspace builds. (The filter skips
+      # upstream tests that still assume a pre-7.42 reply layout.)
+      - name: Vendored fuser interrupt tests
+        run: cargo test --manifest-path vendor/fuser/Cargo.toml --lib --features abi-7-42 -- interrupt
+
       - name: Unit tests
         env:
           FFS_REQUIRE_ORACLES: "1"
