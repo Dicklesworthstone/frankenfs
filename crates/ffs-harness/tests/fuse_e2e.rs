@@ -1546,6 +1546,184 @@ fn fuse_concurrent_create_unlink_multi_worker_keeps_image_clean_bd_iah1f() {
     );
 }
 
+/// bd-iah1f acceptance, with the DEFAULT dispatch (auto workers): 8 writers
+/// create/write/fsync/rename/unlink across four shared directories while 8
+/// readers list and read them, for a bounded time (`FFS_E2E_STORM_SECS`,
+/// default 10). No application may see an error except a reader losing a
+/// race to an unlink/rename (NotFound); every surviving file holds what its
+/// writer wrote; e2fsck is clean after unmount.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn fuse_default_dispatch_mixed_namespace_storm_keeps_image_clean_bd_iah1f() {
+    if !fuse_available() {
+        return;
+    }
+    if !command_available("e2fsck") {
+        require_fuse_or_skip("e2fsck unavailable for the post-unmount check");
+        return;
+    }
+    let tmp = TempDir::new().expect("tmpdir");
+    let image = create_test_image_with_size(tmp.path(), 128 * 1024 * 1024);
+    let mnt = tmp.path().join("mnt");
+    fs::create_dir_all(&mnt).expect("create mountpoint");
+    let opts = MountOptions {
+        read_only: false,
+        auto_unmount: false,
+        ..MountOptions::default()
+    };
+    eprintln!(
+        "storm: default dispatch resolves to {} worker(s)",
+        opts.resolved_thread_count()
+    );
+    let Some(session) = try_mount_ffs_rw_with_options(&image, &mnt, &opts) else {
+        return;
+    };
+    let secs = std::env::var("FFS_E2E_STORM_SECS")
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(10)
+        .clamp(1, 120);
+    let deadline = Instant::now() + Duration::from_secs(secs);
+    let dirs: Vec<PathBuf> = (0..4).map(|d| mnt.join(format!("d{d}"))).collect();
+    for dir in &dirs {
+        fs::create_dir(dir).expect("mkdir storm dir");
+    }
+    let content = |w: usize, i: usize| -> Vec<u8> {
+        vec![u8::try_from((w * 31 + i) % 251).expect("fits u8"); 1024 + (i % 8) * 512]
+    };
+
+    const WRITERS: usize = 8;
+    const READERS: usize = 8;
+    let (writer_results, reader_errors) = std::thread::scope(|scope| {
+        // Every thread is spawned before any join, or nothing runs concurrently.
+        let mut writers = Vec::with_capacity(WRITERS);
+        for w in 0..WRITERS {
+            let dirs = &dirs;
+            writers.push(scope.spawn(move || {
+                let mut errors = Vec::new();
+                let mut survivors = Vec::new();
+                let mut i = 0_usize;
+                while Instant::now() < deadline {
+                    let path = dirs[i % 4].join(format!("w{w}-{i}"));
+                    let bytes = content(w, i);
+                    match fs::write(&path, &bytes) {
+                        Ok(()) => {}
+                        Err(e) => {
+                            errors.push(format!("write {}: {e}", path.display()));
+                            i += 1;
+                            continue;
+                        }
+                    }
+                    if i.is_multiple_of(5)
+                        && let Err(e) = fs::File::open(&path).and_then(|f| f.sync_all())
+                    {
+                        errors.push(format!("fsync {}: {e}", path.display()));
+                    }
+                    let outcome = match i % 3 {
+                        0 => fs::remove_file(&path)
+                            .map(|()| None)
+                            .map_err(|e| format!("unlink {}: {e}", path.display())),
+                        1 => {
+                            let to = dirs[(i + 1) % 4].join(format!("w{w}-{i}-r"));
+                            fs::rename(&path, &to)
+                                .map(|()| Some(to))
+                                .map_err(|e| format!("rename {}: {e}", path.display()))
+                        }
+                        _ => Ok(Some(path)),
+                    };
+                    match outcome {
+                        Ok(Some(kept)) => survivors.push((kept, bytes)),
+                        Ok(None) => {}
+                        Err(e) => errors.push(e),
+                    }
+                    i += 1;
+                }
+                (errors, survivors, i)
+            }));
+        }
+        let mut readers = Vec::with_capacity(READERS);
+        for r in 0..READERS {
+            let dirs = &dirs;
+            readers.push(scope.spawn(move || {
+                let mut errors = Vec::new();
+                let mut round = r;
+                let racing = |e: &std::io::Error| e.kind() == std::io::ErrorKind::NotFound;
+                while Instant::now() < deadline {
+                    let dir = &dirs[round % 4];
+                    round += 1;
+                    let entries = match fs::read_dir(dir) {
+                        Ok(entries) => entries,
+                        Err(e) => {
+                            errors.push(format!("readdir {}: {e}", dir.display()));
+                            continue;
+                        }
+                    };
+                    for entry in entries {
+                        let entry = match entry {
+                            Ok(entry) => entry,
+                            Err(e) if racing(&e) => continue,
+                            Err(e) => {
+                                errors.push(format!("readdir entry: {e}"));
+                                continue;
+                            }
+                        };
+                        if let Err(e) = fs::read(entry.path())
+                            && !racing(&e)
+                        {
+                            errors.push(format!("read {}: {e}", entry.path().display()));
+                        }
+                    }
+                }
+                errors
+            }));
+        }
+        let writer_results: Vec<_> = writers
+            .into_iter()
+            .map(|h| h.join().expect("writer thread"))
+            .collect();
+        let reader_errors: Vec<String> = readers
+            .into_iter()
+            .flat_map(|h| h.join().expect("reader thread"))
+            .collect();
+        (writer_results, reader_errors)
+    });
+
+    let iterations: usize = writer_results.iter().map(|(_, _, n)| n).sum();
+    let writer_errors: Vec<&String> = writer_results.iter().flat_map(|(e, _, _)| e).collect();
+    eprintln!(
+        "storm: {secs}s, {iterations} writer iterations, {} writer errors, {} reader errors",
+        writer_errors.len(),
+        reader_errors.len()
+    );
+    assert!(
+        writer_errors.is_empty() && reader_errors.is_empty(),
+        "applications saw errors under default dispatch: writers {:?} readers {:?}",
+        writer_errors.iter().take(5).collect::<Vec<_>>(),
+        reader_errors.iter().take(5).collect::<Vec<_>>()
+    );
+    assert!(iterations >= WRITERS, "the storm did not run");
+    for (path, bytes) in writer_results.iter().flat_map(|(_, s, _)| s) {
+        assert_eq!(
+            &fs::read(path).unwrap_or_else(|e| panic!("survivor {}: {e}", path.display())),
+            bytes,
+            "{}",
+            path.display()
+        );
+    }
+    session.unmount_and_join();
+    let fsck = Command::new("e2fsck")
+        .args(["-fn", image.to_str().expect("utf8 path")])
+        .output()
+        .expect("run e2fsck");
+    assert!(
+        fsck.status.success(),
+        "e2fsck -fn must be clean after the default-dispatch storm:\n{}{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+    emit_scenario_result("fuse_default_dispatch_mixed_storm", "PASS", None);
+}
+
 /// What the kernel must find at one path of an interop image.
 enum InteropExpect {
     Dir,
