@@ -231,3 +231,5 @@ __pycache__/
 .pgo/
 .rch-target/
 rc-probe.sh
+# br doctor per-run artifacts
+.doctor/
