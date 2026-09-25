@@ -19,7 +19,7 @@ export FFS_USE_RCH="${FFS_USE_RCH:-1}"
 # Avoid implicit AllowOther injection from fuse3 auto-unmount in rootless test environments.
 export FFS_AUTO_UNMOUNT="${FFS_AUTO_UNMOUNT:-0}"
 FFS_SKIP_BUILD="${FFS_SKIP_BUILD:-0}"
-FFS_CLI_BIN="${FFS_CLI_BIN:-$REPO_ROOT/target/release/ffs-cli}"
+FFS_CLI_BIN="${FFS_CLI_BIN:-${CARGO_TARGET_DIR:-$REPO_ROOT/target}/release/ffs-cli}"
 
 e2e_init "ffs_ext4_rw_smoke"
 e2e_print_env
@@ -344,6 +344,19 @@ stop_mount "$MOUNT_RW"
 if mountpoint -q "$MOUNT_RW" 2>/dev/null; then
     e2e_fail "Failed to unmount RW mount point: $MOUNT_RW"
 fi
+
+# bd-53dub: the image FrankenFS just wrote must pass the reference checker,
+# not only read back through FrankenFS itself. A missing checker is a failure
+# here, not a skip: this lane claims journaled-image evidence.
+e2e_step "Phase 3.6: e2fsck -fn on the written image"
+if ! command -v e2fsck >/dev/null 2>&1; then
+    e2e_fail "e2fsck unavailable; cannot certify the written ext4 image"
+fi
+if ! e2fsck -fn "$WORK_IMAGE" >"$E2E_TEMP_DIR/e2fsck_after_rw.log" 2>&1; then
+    cat "$E2E_TEMP_DIR/e2fsck_after_rw.log"
+    e2e_fail "e2fsck -fn reported problems on the image written through the RW mount"
+fi
+e2e_log "e2fsck -fn clean after RW writes"
 
 e2e_step "Phase 4: remount read-only and verify persistence"
 MOUNT_RO="$E2E_TEMP_DIR/mnt_ro"

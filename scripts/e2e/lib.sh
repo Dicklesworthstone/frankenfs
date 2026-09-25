@@ -1383,6 +1383,13 @@ e2e_assert_dir() {
 #######################################
 e2e_skip() {
     local reason="$1"
+    # bd-53dub: a lane that claims mounted/oracle evidence must not turn a
+    # missing capability into a pass.
+    if [[ "${FFS_REQUIRE_FUSE:-}" == "1" || "${FFS_REQUIRE_ORACLES:-}" == "1" ]]; then
+        e2e_fail "FFS_REQUIRE_FUSE/FFS_REQUIRE_ORACLES=1 but the test would skip: $reason"
+    fi
+    # Recorded so result.json says SKIP, not PASS: a skipped run proved nothing.
+    E2E_SKIPPED_REASON="$reason"
     e2e_log ""
     e2e_log "${YELLOW}SKIPPED${RESET}: $reason"
     e2e_log ""
@@ -1896,6 +1903,8 @@ e2e_emit_json_summary() {
     fi
     if [[ "$script_exit_code" -ne 0 ]]; then
         verdict="FAIL"
+    elif [[ -n "${E2E_SKIPPED_REASON:-}" ]]; then
+        verdict="SKIP"
     fi
 
     local gate_id_json run_id_json created_at_json git_commit_json git_branch_json
