@@ -10,7 +10,7 @@ use ffs_ondisk::{
 use ffs_repair::codec::encode_group;
 use ffs_repair::ownership::{AcquireResult, OwnershipGuard, RepairOwnership};
 use ffs_repair::recovery::{GroupRecoveryOrchestrator, RecoveryOutcome};
-use ffs_repair::scrub::{ScrubReport, Scrubber, Severity};
+use ffs_repair::scrub::{BlockValidator, Ext4MetadataValidator, ScrubReport, Scrubber, Severity};
 use ffs_repair::storage::{REPAIR_DESC_SLOT_COUNT, RepairGroupLayout, RepairGroupStorage};
 use ffs_repair::symbol::RepairGroupDescExt;
 use ffs_types::{
@@ -26,6 +26,7 @@ use crate::{
     RepairActionOutput, RepairCommandOptions, RepairFlags, RepairOutput, RepairScopeOutput,
     RepairScrubOutput, choose_btrfs_scrub_block_size, cli_cx, count_blocks_at_severity_or_higher,
     ext4_appears_clean_state, ext4_group_scrub_scope, ext4_recovery_detail, filesystem_name,
+    offline_ext4_scrub_validator,
     repair_btrfs_parsers::{parse_btrfs_block_group_item, parse_btrfs_root_item_bytenr},
     run_ext4_mount_recovery, scrub_validator,
 };
@@ -1516,11 +1517,19 @@ pub fn scrub_ext4_groups_for_repair(
         });
     }
 
-    let block_size = match flavor {
-        FsFlavor::Ext4(sb) => sb.block_size,
-        FsFlavor::Btrfs(_) => {
-            bail!("ext4 repair helper called for non-ext4 flavor");
-        }
+    let FsFlavor::Ext4(sb) = flavor else {
+        bail!("ext4 repair helper called for non-ext4 flavor");
+    };
+    let block_size = sb.block_size;
+    // bd-jufod: repair detects with the same validator as `ffs scrub`, built
+    // once per pass from the image as it is now (the post-repair verification
+    // pass calls this again and so sees the repaired descriptors).
+    let validator = {
+        let byte_dev = FileByteDevice::open(path)
+            .with_context(|| format!("failed to open image: {}", path.display()))?;
+        let block_dev = ByteBlockDevice::new(byte_dev, block_size)
+            .with_context(|| format!("failed to create block device (block_size={block_size})"))?;
+        offline_ext4_scrub_validator(&cli_cx(), path, &block_dev, sb)?
     };
 
     let mut reports = Vec::with_capacity(groups.len());
@@ -1533,7 +1542,7 @@ pub fn scrub_ext4_groups_for_repair(
             })?;
         let report = scrub_range_for_repair(
             path,
-            flavor,
+            &*validator,
             block_size,
             spec.scrub_start_block,
             spec.scrub_block_count,
@@ -1577,7 +1586,7 @@ pub fn scrub_btrfs_groups_for_repair(
         })?;
         let report = scrub_range_for_repair(
             path,
-            flavor,
+            &*scrub_validator(flavor, block_size),
             block_size,
             spec.physical_start_block,
             spec.physical_block_count,
@@ -1625,16 +1634,25 @@ pub fn group_ext4_corrupt_blocks(
     (grouped, outside_source_ranges)
 }
 
-#[allow(clippy::too_many_arguments)]
 pub fn recover_ext4_corrupt_blocks(
     path: &PathBuf,
-    block_size: u32,
-    fs_uuid: [u8; 16],
+    sb: &Ext4Superblock,
     specs: &[Ext4RepairGroupSpec],
     report: &ScrubReport,
     limitations: &mut Vec<String>,
 ) -> Result<(u64, u64, Vec<u32>)> {
+    let block_size = sb.block_size;
     let cx = cli_cx();
+    // bd-jufod: every decoded block must pass the image's own metadata
+    // checksums before it is written. The validator is built over the image
+    // as it would be after the writeback, so a repaired descriptor block and
+    // the bitmaps it describes are judged together. Inode-owned blocks
+    // (extent/dir/xattr) are not covered here: identifying them needs an
+    // inode walk of that same view.
+    let validator_over_view =
+        |cx: &Cx, view: &dyn BlockDevice| -> ffs_error::Result<Box<dyn BlockValidator>> {
+            Ok(Box::new(Ext4MetadataValidator::from_device(cx, view, sb)?))
+        };
     let byte_dev = FileByteDevice::open(path)
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     let block_dev = ByteBlockDevice::new(byte_dev, block_size)
@@ -1661,12 +1679,13 @@ pub fn recover_ext4_corrupt_blocks(
             })?;
         let orchestrator = GroupRecoveryOrchestrator::new(
             &block_dev,
-            fs_uuid,
+            sb.uuid,
             spec.layout,
             spec.source_first_block,
             spec.source_block_count,
         )
-        .with_context(|| format!("failed to create recovery orchestrator for group {group}"))?;
+        .with_context(|| format!("failed to create recovery orchestrator for group {group}"))?
+        .with_decoded_view_validator(&validator_over_view);
 
         let outcome = orchestrator.recover_from_corrupt_blocks(&cx, &corrupt_blocks);
         let repaired = u64::try_from(outcome.repaired_blocks.len()).unwrap_or(u64::MAX);
@@ -2132,7 +2151,7 @@ pub fn rebuild_ext4_repair_symbols(
 
 pub fn scrub_range_for_repair(
     path: &PathBuf,
-    flavor: &FsFlavor,
+    validator: &dyn BlockValidator,
     block_size: u32,
     start: BlockNumber,
     count: u64,
@@ -2166,9 +2185,8 @@ pub fn scrub_range_for_repair(
     }
 
     if worker_limit <= 1 || effective_count <= 1 {
-        let validator = scrub_validator(flavor, block_size);
         let cx = cli_cx();
-        return Scrubber::new(&seed_block_dev, &*validator)
+        return Scrubber::new(&seed_block_dev, validator)
             .scrub_range(&cx, start, effective_count)
             .with_context(|| {
                 format!(
@@ -2186,7 +2204,6 @@ pub fn scrub_range_for_repair(
         let mut handles = Vec::with_capacity(ranges.len());
         for (worker_idx, (range_start, range_count)) in ranges.into_iter().enumerate() {
             let path = path.clone();
-            let shard_flavor = flavor.clone();
             handles.push(scope.spawn(move || -> Result<ScrubReport> {
                 let cx = cli_cx();
                 let byte_dev = FileByteDevice::open(&path)
@@ -2194,8 +2211,7 @@ pub fn scrub_range_for_repair(
                 let block_dev = ByteBlockDevice::new(byte_dev, block_size).with_context(|| {
                     format!("failed to create block device (block_size={block_size})")
                 })?;
-                let validator = scrub_validator(&shard_flavor, block_size);
-                Scrubber::new(&block_dev, &*validator)
+                Scrubber::new(&block_dev, validator)
                     .scrub_range(&cx, range_start, range_count)
                     .with_context(|| {
                         format!(
@@ -2381,8 +2397,7 @@ pub fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Res
             {
                 let (_recovered, unrecovered, repaired_groups) = recover_ext4_corrupt_blocks(
                     path,
-                    sb.block_size,
-                    sb.uuid,
+                    sb,
                     &selected_specs,
                     &report,
                     &mut limitations,
@@ -2539,7 +2554,7 @@ pub fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Res
             let mut report = if scoped_btrfs_groups.is_empty() {
                 scrub_range_for_repair(
                     path,
-                    &flavor,
+                    &*scrub_validator(&flavor, block_size),
                     block_size,
                     scrub_start,
                     scrub_count,
@@ -2731,7 +2746,7 @@ pub fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Res
                 report = if scoped_btrfs_groups.is_empty() {
                     scrub_range_for_repair(
                         path,
-                        &flavor,
+                        &*scrub_validator(&flavor, block_size),
                         block_size,
                         scrub_start,
                         scrub_count,

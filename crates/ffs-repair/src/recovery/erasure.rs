@@ -164,6 +164,7 @@ impl GroupRecoveryOrchestrator<'_> {
             self.source_block_count,
             &desc,
         )?;
+        self.reject_invalid_decoded_blocks(cx, &decode)?;
         let mut writeback = Vec::with_capacity(indices.len());
         for ((&index, expected), recovered) in indices.iter().zip(&before).zip(&decode.recovered) {
             let block = BlockNumber(self.source_first_block.0 + u64::from(index));

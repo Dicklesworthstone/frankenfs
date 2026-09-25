@@ -8851,6 +8851,34 @@ fn collect_ext4_extent_nodes(
     }
 }
 
+/// The ext4 validator for an image nothing is mutating (`ffs scrub`, `ffs
+/// fsck`, `ffs repair`): descriptor and bitmap checksums are authoritative
+/// there, so everything the image checksums is verified, not just the
+/// superblock (bd-jufod).
+pub fn offline_ext4_scrub_validator(
+    cx: &Cx,
+    path: &Path,
+    block_dev: &dyn BlockDevice,
+    sb: &Ext4Superblock,
+) -> Result<Box<dyn BlockValidator>> {
+    let mut validator = ffs_repair::scrub::Ext4MetadataValidator::from_device(cx, block_dev, sb)
+        .context("failed to read ext4 group descriptors for scrub")?;
+    // Inode-owned metadata needs an inode walk; an image that cannot be
+    // opened still gets the fixed-location checks.
+    if let Ok(fs) = OpenFs::open_with_options(
+        cx,
+        path,
+        &OpenOptions {
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+            skip_validation: true,
+            ..OpenOptions::default()
+        },
+    ) {
+        validator.add_owned_blocks(ext4_inode_owned_blocks(cx, &fs));
+    }
+    Ok(Box::new(validator))
+}
+
 pub fn scrub_validator(flavor: &FsFlavor, block_size: u32) -> Box<dyn BlockValidator> {
     match flavor {
         // No blind `ZeroCheckValidator` here: a whole-image scrub has no
@@ -8933,29 +8961,8 @@ fn scrub_cmd(path: &PathBuf, json: bool) -> Result<()> {
     let block_dev = ByteBlockDevice::new(byte_dev, block_size)
         .with_context(|| format!("failed to create block device (block_size={block_size})"))?;
 
-    // bd-jufod: an offline image is not being mutated, so ext4 descriptor and
-    // bitmap checksums are authoritative and are verified, not just the
-    // superblock.
     let validator = match &flavor {
-        FsFlavor::Ext4(sb) => {
-            let mut validator =
-                ffs_repair::scrub::Ext4MetadataValidator::from_device(&cx, &block_dev, sb)
-                    .context("failed to read ext4 group descriptors for scrub")?;
-            // Inode-owned metadata needs an inode walk; an image that cannot be
-            // opened still gets the fixed-location checks.
-            if let Ok(fs) = OpenFs::open_with_options(
-                &cx,
-                path,
-                &OpenOptions {
-                    ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
-                    skip_validation: true,
-                    ..OpenOptions::default()
-                },
-            ) {
-                validator.add_owned_blocks(ext4_inode_owned_blocks(&cx, &fs));
-            }
-            Box::new(validator) as Box<dyn BlockValidator>
-        }
+        FsFlavor::Ext4(sb) => offline_ext4_scrub_validator(&cx, path, &block_dev, sb)?,
         FsFlavor::Btrfs(_) => scrub_validator(&flavor, block_size),
     };
 
@@ -9155,7 +9162,8 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
             let block_dev = ByteBlockDevice::new(byte_dev, block_size).with_context(|| {
                 format!("failed to create block device (block_size={block_size})")
             })?;
-            let validator = scrub_validator(&flavor, block_size);
+            // Built only when a scrub runs: it walks every inode.
+            let validator = || offline_ext4_scrub_validator(&cx, path, &block_dev, sb);
 
             let skip_full_scrub = options.block_group.is_none()
                 && !flags.force()
@@ -9171,7 +9179,7 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
                         start.0.saturating_add(count).saturating_sub(1)
                     );
                 }
-                let report = Scrubber::new(&block_dev, &*validator)
+                let report = Scrubber::new(&block_dev, &*validator()?)
                     .scrub_range(&cx, start, count)
                     .with_context(|| format!("failed to scrub ext4 group {group}"))?;
                 (
@@ -9212,7 +9220,7 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
                         block_dev.block_count()
                     );
                 }
-                let report = Scrubber::new(&block_dev, &*validator)
+                let report = Scrubber::new(&block_dev, &*validator()?)
                     .scrub_all(&cx)
                     .context("failed to scrub ext4 image")?;
                 (FsckScopeOutput::Full, report, None)
@@ -9264,7 +9272,7 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
                 }
                 let report = scrub_range_for_repair(
                     path,
-                    &flavor,
+                    &*scrub_validator(&flavor, block_size),
                     block_size,
                     spec.physical_start_block,
                     spec.physical_block_count,
@@ -9443,7 +9451,7 @@ fn build_fsck_output(path: &PathBuf, options: FsckCommandOptions) -> Result<Fsck
                 if verify_after_repair_writes {
                     report = scrub_range_for_repair(
                         path,
-                        &flavor,
+                        &*scrub_validator(&flavor, block_size),
                         block_size,
                         scrub_start,
                         scrub_count,
@@ -17342,6 +17350,266 @@ mod tests {
         assert!(limitations.iter().any(|limitation| {
             limitation.contains("found no stale btrfs groups; running full scrub")
         }));
+    }
+
+    /// A metadata_csum ext4 image with repair symbols for one group, and where
+    /// that group's block bitmap lives.
+    struct ProtectedExt4 {
+        image: std::path::PathBuf,
+        bitmap_block: u64,
+        bitmap_off: usize,
+        block_size: usize,
+        /// A block of the group that its bitmap marks free.
+        free_block: u64,
+    }
+
+    /// Small groups on purpose: symbol encoding runs unoptimized in test
+    /// builds, and one 8192-block group took longer than the suite can afford.
+    /// No journal, so no journal sits in a repair tail (bd-plamw refuses
+    /// those), and no flex_bg, so each group's bitmaps live inside that group's
+    /// scrub and repair range. None when the formatter is unavailable (a failure under
+    /// FFS_REQUIRE_ORACLES=1).
+    fn protected_ext4_image_bd_jufod(dir: &tempfile::TempDir, group: u32) -> Option<ProtectedExt4> {
+        let image = dir.path().join("protected.ext4");
+        std::fs::File::create(&image)
+            .and_then(|f| f.set_len(4 * 1024 * 1024))
+            .expect("sparse image");
+        let formatted = std::process::Command::new("mke2fs")
+            .args([
+                "-q",
+                "-F",
+                "-t",
+                "ext4",
+                "-O",
+                "metadata_csum,^has_journal,^flex_bg",
+                "-b",
+                "1024",
+                "-g",
+                "1024",
+            ])
+            .arg(&image)
+            .status();
+        if !formatted.is_ok_and(|s| s.success()) {
+            assert!(
+                std::env::var_os("FFS_REQUIRE_ORACLES").is_none_or(|v| v != "1"),
+                "FFS_REQUIRE_ORACLES=1 but mke2fs is unavailable"
+            );
+            eprintln!("SKIP bd-jufod: mke2fs unavailable");
+            return None;
+        }
+        // mke2fs leaves groups whose only blocks are their own metadata
+        // BLOCK_UNINIT, and nothing checks (or writes) such a bitmap. Initialize
+        // the group so its bitmap is live: clear the flag and have debugfs write
+        // the bitmap with its checksum.
+        let bytes = std::fs::read(&image).expect("read image");
+        let sb = ffs_ondisk::Ext4Superblock::parse_from_image(&bytes).expect("superblock");
+        let gd_at = |bytes: &[u8]| {
+            let off = usize::try_from(
+                sb.group_desc_offset(ffs_types::GroupNumber(group))
+                    .expect("gdt"),
+            )
+            .expect("fits");
+            ffs_ondisk::Ext4GroupDesc::parse_from_bytes(
+                &bytes[off..off + usize::from(sb.group_desc_size())],
+                sb.group_desc_size(),
+            )
+            .expect("group descriptor")
+        };
+        let flags = gd_at(&bytes).flags;
+        if flags & ffs_ondisk::ext4::EXT4_BG_BLOCK_UNINIT != 0 {
+            let first =
+                u64::from(sb.first_data_block) + u64::from(group) * u64::from(sb.blocks_per_group);
+            let script = format!(
+                "set_bg {group} flags {}\nset_bg {group} checksum calc\nsetb {first}\n",
+                flags & !ffs_ondisk::ext4::EXT4_BG_BLOCK_UNINIT
+            );
+            let script_path = dir.path().join("init.debugfs");
+            std::fs::write(&script_path, script).expect("write debugfs script");
+            let initialized = std::process::Command::new("debugfs")
+                .args(["-w", "-f"])
+                .arg(&script_path)
+                .arg(&image)
+                .output();
+            if !initialized.is_ok_and(|o| o.status.success()) {
+                assert!(
+                    std::env::var_os("FFS_REQUIRE_ORACLES").is_none_or(|v| v != "1"),
+                    "FFS_REQUIRE_ORACLES=1 but debugfs is unavailable"
+                );
+                eprintln!("SKIP bd-jufod: debugfs unavailable");
+                return None;
+            }
+        }
+        let built = run_repair_with(&image, group, true);
+        assert_eq!(
+            built.exit_code,
+            0,
+            "symbol build: {}",
+            serde_json::to_string(&built).unwrap_or_default()
+        );
+        let bytes = std::fs::read(&image).expect("read image");
+        let gd = gd_at(&bytes);
+        assert_eq!(
+            gd.flags & ffs_ondisk::ext4::EXT4_BG_BLOCK_UNINIT,
+            0,
+            "setup: group {group}'s bitmap must be live"
+        );
+        let block_size = sb.block_size as usize;
+        let bitmap_off = usize::try_from(gd.block_bitmap).expect("fits") * block_size;
+        let bitmap = &bytes[bitmap_off..bitmap_off + block_size];
+        let free_bit = (0..sb.blocks_per_group as usize)
+            .find(|bit| bitmap[bit / 8] & (1 << (bit % 8)) == 0)
+            .expect("the group has a free block");
+        Some(ProtectedExt4 {
+            image,
+            bitmap_block: gd.block_bitmap,
+            bitmap_off,
+            block_size,
+            free_block: u64::from(sb.first_data_block)
+                + u64::from(group) * u64::from(sb.blocks_per_group)
+                + free_bit as u64,
+        })
+    }
+
+    fn flip_byte(path: &std::path::Path, offset: usize) {
+        let mut bytes = std::fs::read(path).expect("read image");
+        bytes[offset] ^= 0x01;
+        std::fs::write(path, bytes).expect("write image");
+    }
+
+    fn run_repair_with(
+        path: &std::path::Path,
+        group: u32,
+        rebuild_symbols: bool,
+    ) -> super::RepairOutput {
+        build_repair_output(
+            &path.to_path_buf(),
+            RepairCommandOptions {
+                flags: RepairFlags::empty().with_rebuild_symbols(rebuild_symbols),
+                block_group: Some(group),
+                max_threads: None,
+            },
+        )
+        .expect("repair")
+    }
+
+    /// bd-jufod: `ffs repair` detects with the same metadata validator as
+    /// `ffs scrub`. A flipped block-bitmap bit was invisible to it before (its
+    /// ext4 validator checked only the superblock); now it is detected and
+    /// restored byte-for-byte from the repair symbols.
+    #[test]
+    fn repair_detects_and_restores_a_corrupt_block_bitmap_bd_jufod() {
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let Some(ProtectedExt4 {
+            image,
+            bitmap_block,
+            bitmap_off,
+            block_size: bs,
+            ..
+        }) = protected_ext4_image_bd_jufod(&dir, 0)
+        else {
+            return;
+        };
+        let clean = std::fs::read(&image).expect("read protected image");
+        flip_byte(&image, bitmap_off + 100);
+        let flags_bitmap = || {
+            let cx = crate::cli_cx();
+            let sb = ffs_ondisk::Ext4Superblock::parse_from_image(&clean).expect("superblock");
+            let block_dev = ffs_block::ByteBlockDevice::new(
+                ffs_block::FileByteDevice::open(&image).expect("open image"),
+                sb.block_size,
+            )
+            .expect("block device");
+            let validator = super::offline_ext4_scrub_validator(&cx, &image, &block_dev, &sb)
+                .expect("validator");
+            let data = ffs_block::BlockDevice::read_block(
+                &block_dev,
+                &cx,
+                ffs_types::BlockNumber(bitmap_block),
+            )
+            .expect("read bitmap");
+            matches!(
+                validator.validate(ffs_types::BlockNumber(bitmap_block), &data),
+                ffs_repair::scrub::BlockVerdict::Corrupt(_)
+            )
+        };
+        assert!(
+            flags_bitmap(),
+            "the offline validator must flag bitmap {bitmap_block}"
+        );
+
+        // Repair only reconstructs blocks its scrub flagged, so a restored
+        // bitmap is the detection evidence. (`output.scrub` is the
+        // post-repair verification pass, clean after a successful repair.)
+        let output = run_repair_with(&image, 0, false);
+        let json = serde_json::to_string(&output).unwrap_or_default();
+        let after = std::fs::read(&image).expect("read repaired image");
+        assert_eq!(
+            after[bitmap_off..bitmap_off + bs],
+            clean[bitmap_off..bitmap_off + bs],
+            "block bitmap {bitmap_block} must be detected and restored exactly: {json}"
+        );
+        assert!(!flags_bitmap(), "the restored bitmap must validate");
+        assert_eq!(output.scrub.error_or_higher, 0, "{json}");
+        assert_eq!(output.exit_code, 0, "{json}");
+    }
+
+    /// bd-jufod: symbols older than the bitmap decode to the OLD bitmap, which
+    /// is well-formed but disagrees with the checksum the current descriptor
+    /// records. Writing it back would mark in-use blocks free. Repair must
+    /// refuse and leave the block as it found it.
+    ///
+    /// Group 2 on purpose: its descriptor lives in group 0's GDT block and it
+    /// carries no backup superblock/GDT, so the external write changes nothing
+    /// in group 2 but the bitmap itself and the decode really does succeed.
+    #[test]
+    fn repair_refuses_a_stale_decode_that_fails_the_descriptor_checksum_bd_jufod() {
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let Some(ProtectedExt4 {
+            image,
+            bitmap_block,
+            bitmap_off,
+            block_size: bs,
+            free_block,
+        }) = protected_ext4_image_bd_jufod(&dir, 2)
+        else {
+            return;
+        };
+        // An external writer the symbols do not know about: allocate a block,
+        // which rewrites the bitmap and its checksum in the group descriptor.
+        let allocated = std::process::Command::new("debugfs")
+            .args(["-w", "-R", &format!("setb {free_block}")])
+            .arg(&image)
+            .output();
+        if !allocated.is_ok_and(|o| o.status.success()) {
+            assert!(
+                std::env::var_os("FFS_REQUIRE_ORACLES").is_none_or(|v| v != "1"),
+                "FFS_REQUIRE_ORACLES=1 but debugfs is unavailable"
+            );
+            eprintln!("SKIP bd-jufod: debugfs unavailable");
+            return;
+        }
+        flip_byte(&image, bitmap_off + 100);
+        let corrupt = std::fs::read(&image).expect("read corrupt image");
+
+        let output = run_repair_with(&image, 2, false);
+        let json = serde_json::to_string(&output).unwrap_or_default();
+        let after = std::fs::read(&image).expect("read image after repair");
+        assert_eq!(
+            after[bitmap_off..bitmap_off + bs],
+            corrupt[bitmap_off..bitmap_off + bs],
+            "a stale decode of bitmap {bitmap_block} must not be written: {json}"
+        );
+        assert!(
+            output
+                .limitations
+                .iter()
+                .any(|limitation| limitation.contains("fails validation")),
+            "the refusal must be reported: {json}"
+        );
+        assert_ne!(
+            output.exit_code, 0,
+            "an unrepaired corruption is not success"
+        );
     }
 
     #[test]

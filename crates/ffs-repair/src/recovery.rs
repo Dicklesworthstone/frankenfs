@@ -18,13 +18,14 @@ pub use erasure::ErasureRecoveryWritebackBlock;
 
 use asupersync::Cx;
 use asupersync::raptorq::decoder::DecodeStats;
-use ffs_block::BlockDevice;
+use ffs_block::{BlockBuf, BlockDevice};
 use ffs_error::{FfsError, Result};
 use ffs_types::{BlockNumber, GroupNumber};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;
 
 use crate::codec::{DecodeOutcome, decode_group_with_owned_repair_symbols};
+use crate::scrub::{BlockValidator, BlockVerdict};
 use crate::storage::{RepairGroupLayout, RepairGroupStorage};
 use crate::symbol::RepairGroupDescExt;
 
@@ -249,9 +250,115 @@ pub struct GroupRecoveryOrchestrator<'a> {
     fs_uuid: [u8; 16],
     source_first_block: BlockNumber,
     source_block_count: u32,
+    decoded_block_check: Option<DecodedBlockCheck<'a>>,
+}
+
+/// Builds a validator over a device view. Used for decoded-block checks, where
+/// the view is the image as it would be after writeback.
+pub type DecodedViewValidatorFactory<'a> =
+    &'a (dyn Fn(&Cx, &dyn BlockDevice) -> Result<Box<dyn BlockValidator>> + Sync);
+
+#[derive(Clone, Copy)]
+enum DecodedBlockCheck<'a> {
+    /// A validator whose verdict depends only on the block itself.
+    Static(&'a dyn BlockValidator),
+    /// A validator built over the post-writeback view, for checks that read
+    /// other blocks (ext4 bitmap checksums live in the group descriptors).
+    OverDecodedView(DecodedViewValidatorFactory<'a>),
+}
+
+/// Read-only view of `inner` with the decoded blocks substituted.
+struct DecodedOverlay<'b> {
+    inner: &'b dyn BlockDevice,
+    decoded: std::collections::HashMap<u64, &'b [u8]>,
+}
+
+impl BlockDevice for DecodedOverlay<'_> {
+    fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
+        self.decoded.get(&block.0).map_or_else(
+            || self.inner.read_block(cx, block),
+            |data| Ok(BlockBuf::new(data.to_vec())),
+        )
+    }
+
+    fn write_block(&self, _cx: &Cx, _block: BlockNumber, _data: &[u8]) -> Result<()> {
+        Err(FfsError::RepairFailed(
+            "decoded-block validation view is read-only".to_owned(),
+        ))
+    }
+
+    fn block_size(&self) -> u32 {
+        self.inner.block_size()
+    }
+
+    fn block_count(&self) -> u64 {
+        self.inner.block_count()
+    }
+
+    fn sync(&self, _cx: &Cx) -> Result<()> {
+        Ok(())
+    }
 }
 
 impl<'a> GroupRecoveryOrchestrator<'a> {
+    /// Check every decoded block with `validator` before any writeback
+    /// (bd-jufod). A decode only proves agreement with the stored symbols;
+    /// damaged or tampered parity can still decode to bytes that fail the
+    /// block's own checksum, and those must never be written over the image.
+    #[must_use]
+    pub fn with_decoded_block_validator(mut self, validator: &'a dyn BlockValidator) -> Self {
+        self.decoded_block_check = Some(DecodedBlockCheck::Static(validator));
+        self
+    }
+
+    /// Like [`Self::with_decoded_block_validator`], for validators that read
+    /// other blocks: `factory` is handed the image as it would be after this
+    /// writeback, so a repaired descriptor block and the bitmap it describes
+    /// are judged together rather than against the corrupt copy.
+    #[must_use]
+    pub fn with_decoded_view_validator(mut self, factory: DecodedViewValidatorFactory<'a>) -> Self {
+        self.decoded_block_check = Some(DecodedBlockCheck::OverDecodedView(factory));
+        self
+    }
+
+    /// First decoded block the validator rejects, as a repair failure.
+    fn reject_invalid_decoded_blocks(&self, cx: &Cx, decode: &DecodeOutcome) -> Result<()> {
+        let Some(check) = self.decoded_block_check else {
+            return Ok(());
+        };
+        let built;
+        let validator: &dyn BlockValidator = match check {
+            DecodedBlockCheck::Static(validator) => validator,
+            DecodedBlockCheck::OverDecodedView(factory) => {
+                let overlay = DecodedOverlay {
+                    inner: self.device,
+                    decoded: decode
+                        .recovered
+                        .iter()
+                        .map(|recovered| (recovered.block.0, recovered.data.as_slice()))
+                        .collect(),
+                };
+                built = factory(cx, &overlay)?;
+                &*built
+            }
+        };
+        for recovered in &decode.recovered {
+            let data = BlockBuf::new(recovered.data.clone());
+            if let BlockVerdict::Corrupt(issues) = validator.validate(recovered.block, &data) {
+                let detail = issues
+                    .iter()
+                    .map(|(kind, _, message)| format!("{kind:?}: {message}"))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return Err(FfsError::RepairFailed(format!(
+                    "decoded block {} fails validation ({detail}); nothing written back",
+                    recovered.block.0
+                )));
+            }
+        }
+        Ok(())
+    }
+
     /// Create a recovery orchestrator for one source region within a group.
     pub fn new(
         device: &'a dyn BlockDevice,
@@ -310,6 +417,7 @@ impl<'a> GroupRecoveryOrchestrator<'a> {
             fs_uuid,
             source_first_block,
             source_block_count,
+            decoded_block_check: None,
         })
     }
 
@@ -534,6 +642,16 @@ impl<'a> GroupRecoveryOrchestrator<'a> {
             );
         }
 
+        if let Err(err) = self.reject_invalid_decoded_blocks(cx, decode) {
+            return self.failure_result(
+                generation,
+                corrupt_count,
+                symbols_available,
+                symbols_available,
+                stats,
+                &err,
+            );
+        }
         let recovered_blocks = decode.recovered.iter().map(|b| b.block).collect::<Vec<_>>();
         let writeback_blocks = match Self::build_writeback_blocks(decode, expected_current) {
             Ok(writeback_blocks) => writeback_blocks,
@@ -1039,6 +1157,151 @@ mod tests {
                 originals[idx as usize].as_slice(),
                 "block {} was not restored exactly",
                 block.0
+            );
+        }
+    }
+
+    /// Stands in for a block's own checksum: a block is valid only if it holds
+    /// the bytes recorded for it.
+    struct ExpectedBytesValidator(std::collections::HashMap<u64, Vec<u8>>);
+
+    impl BlockValidator for ExpectedBytesValidator {
+        fn validate(&self, block: BlockNumber, data: &BlockBuf) -> BlockVerdict {
+            match self.0.get(&block.0) {
+                Some(expected) if expected.as_slice() == data.as_slice() => BlockVerdict::Clean,
+                Some(_) => BlockVerdict::Corrupt(vec![(
+                    crate::scrub::CorruptionKind::ChecksumMismatch,
+                    crate::scrub::Severity::Error,
+                    "checksum mismatch".to_owned(),
+                )]),
+                None => BlockVerdict::Skip,
+            }
+        }
+    }
+
+    /// bd-jufod: symbols older than the block decode "successfully" to the old
+    /// bytes (see recovery_detects_stale_symbol_restore_via_blake3_mismatch).
+    /// With a decoded-block validator that knows the current checksum, the
+    /// decode is rejected and nothing is written.
+    #[test]
+    fn decoded_block_failing_validation_is_never_written_back_bd_jufod() {
+        let cx = Cx::for_testing();
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(8), BlockNumber(0), 64, 0, 6).expect("layout");
+        let source_first = BlockNumber(0);
+        let source_count = 8;
+        write_source_blocks(&cx, &device, source_first, source_count, block_size);
+        bootstrap_storage(&cx, &device, layout, source_first, source_count, 4);
+
+        let target = BlockNumber(2);
+        let latest = deterministic_block(10_000, block_size);
+        device
+            .write_block(&cx, target, &latest)
+            .expect("update after symbol generation");
+        let corrupt = vec![0xEE; block_size as usize];
+        device
+            .write_block(&cx, target, &corrupt)
+            .expect("inject corruption");
+
+        let validator = ExpectedBytesValidator(std::iter::once((target.0, latest)).collect());
+        let result = GroupRecoveryOrchestrator::new(
+            &device,
+            test_uuid(),
+            layout,
+            source_first,
+            source_count,
+        )
+        .expect("orchestrator")
+        .with_decoded_block_validator(&validator)
+        .recover_from_indices(&cx, &[2]);
+
+        assert_eq!(result.evidence.outcome, RecoveryOutcome::Failed);
+        assert!(
+            result
+                .evidence
+                .reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("fails validation")),
+            "the refusal must say why: {:?}",
+            result.evidence.reason
+        );
+        assert_eq!(result.repaired_blocks, Vec::<BlockNumber>::new());
+        assert_eq!(
+            device.read_block(&cx, target).expect("read").as_slice(),
+            corrupt.as_slice(),
+            "a rejected decode must leave the block untouched"
+        );
+    }
+
+    /// bd-jufod: a view validator is built over the image as it would be after
+    /// writeback — decoded bytes for the targets, the device for the rest — and
+    /// a correct decode passes it and is written.
+    #[test]
+    fn decoded_view_validator_sees_the_post_writeback_image_bd_jufod() {
+        let cx = Cx::for_testing();
+        let block_size = 256;
+        let device = MemBlockDevice::new(block_size, 128);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout");
+        let source_first = BlockNumber(0);
+        let source_count = 8;
+        let originals = write_source_blocks(&cx, &device, source_first, source_count, block_size);
+        bootstrap_storage(&cx, &device, layout, source_first, source_count, 4);
+        for idx in [1_u64, 5] {
+            device
+                .write_block(&cx, BlockNumber(idx), &vec![0xA5; block_size as usize])
+                .expect("inject corruption");
+        }
+
+        // The factory snapshots what the view shows for every source block;
+        // validation then requires each decoded block to match that snapshot.
+        let factory = |cx: &Cx, view: &dyn BlockDevice| -> Result<Box<dyn BlockValidator>> {
+            let mut seen = std::collections::HashMap::new();
+            for block in 0..u64::from(source_count) {
+                seen.insert(
+                    block,
+                    view.read_block(cx, BlockNumber(block))?.as_slice().to_vec(),
+                );
+            }
+            Ok(Box::new(ExpectedBytesValidator(seen)))
+        };
+        let observed = std::sync::Mutex::new(Vec::new());
+        let recording = |cx: &Cx, view: &dyn BlockDevice| -> Result<Box<dyn BlockValidator>> {
+            for block in 0..u64::from(source_count) {
+                observed
+                    .lock()
+                    .expect("lock")
+                    .push(view.read_block(cx, BlockNumber(block))?.as_slice().to_vec());
+            }
+            factory(cx, view)
+        };
+        let result = GroupRecoveryOrchestrator::new(
+            &device,
+            test_uuid(),
+            layout,
+            source_first,
+            source_count,
+        )
+        .expect("orchestrator")
+        .with_decoded_view_validator(&recording)
+        .recover_from_indices(&cx, &[1, 5]);
+
+        assert!(result.is_success(), "{:?}", result.evidence);
+        let observed = observed.into_inner().expect("lock");
+        for (index, original) in originals.iter().enumerate() {
+            assert_eq!(
+                observed[index].as_slice(),
+                original.as_slice(),
+                "view block {index} must be the post-writeback content"
+            );
+            assert_eq!(
+                device
+                    .read_block(&cx, BlockNumber(index as u64))
+                    .expect("read")
+                    .as_slice(),
+                original.as_slice()
             );
         }
     }
