@@ -64,6 +64,12 @@ const FILE_CONTENT: &[u8] = b"hello from FrankenFS reference test\n";
 const LARGE_FILE_CONTENT: &[u8] = b"hello from FrankenFS 64mb geometry variant\n";
 const DIR_INDEX_FILE_CONTENT: &[u8] = b"hello from FrankenFS dir_index variant\n";
 const HTREE_GOLDEN_FILE_CONTENT: &[u8] = b"x";
+/// Features the golden images were captured with that mke2fs defaults to only
+/// from some releases on: e2fsprogs 1.47.2's mke2fs.conf enables them, 1.47.0
+/// (GitHub's ubuntu-24.04 runner) does not, and `orphan_file` alone moved an
+/// 8 MiB image's free-block count by 32 (851 vs 883). Pinned so the layout
+/// does not depend on the host's mke2fs.conf.
+const EXT4_GOLDEN_FEATURE_PIN: &str = "orphan_file,metadata_csum_seed";
 const DIR_INDEX_HASH_SEED: &str = "11111111-2222-3333-4444-555555555555";
 const INLINE_XATTR_USER_VALUE: &str = "image/png";
 const INLINE_XATTR_SECURITY_VALUE: &str = "system_u:object_r:tmp_t:s0";
@@ -98,12 +104,13 @@ fn create_reference_image(image_path: &Path) -> PathBuf {
     // Format as ext4
     if trace_ext4_tools() {
         eprintln!(
-            "mkfs.ext4 params: -L ffs-ref -b 4096 -q {}",
+            "mkfs.ext4 params: -L ffs-ref -b 4096 -q -O {EXT4_GOLDEN_FEATURE_PIN} {}",
             image_path.display()
         );
     }
     let st = Command::new("mkfs.ext4")
         .args(["-L", "ffs-ref", "-b", "4096", "-q"])
+        .args(["-O", EXT4_GOLDEN_FEATURE_PIN])
         .arg(image_path)
         .stderr(std::process::Stdio::null())
         .status()
@@ -178,6 +185,7 @@ fn create_large_reference_image(image_path: &Path) -> PathBuf {
     }
     let st = Command::new("mkfs.ext4")
         .args(["-L", "ffs-ref-64", "-b", "4096", "-q"])
+        .args(["-O", EXT4_GOLDEN_FEATURE_PIN])
         .arg(image_path)
         .stderr(std::process::Stdio::null())
         .status()
@@ -216,6 +224,7 @@ fn create_dir_index_reference_image(image_path: &Path) -> PathBuf {
     }
     let st = Command::new("mkfs.ext4")
         .args(["-L", "ffs-ref-dx", "-b", "4096", "-q", "-O", "dir_index"])
+        .args(["-O", EXT4_GOLDEN_FEATURE_PIN])
         .arg(image_path)
         .stderr(std::process::Stdio::null())
         .status()
@@ -262,6 +271,7 @@ fn create_sparse_super_golden_image(image_path: &Path) -> PathBuf {
     }
     let st = Command::new("mkfs.ext4")
         .args(["-L", "ffs-64mb", "-b", "4096", "-q", "-O", "sparse_super"])
+        .args(["-O", EXT4_GOLDEN_FEATURE_PIN])
         .arg(image_path)
         .stderr(std::process::Stdio::null())
         .status()
@@ -321,6 +331,7 @@ fn create_htree_dirindex_golden_image(image_path: &Path) -> PathBuf {
     }
     let st = Command::new("mkfs.ext4")
         .args(["-L", "ffs-htree", "-b", "4096", "-q", "-O", "dir_index"])
+        .args(["-O", EXT4_GOLDEN_FEATURE_PIN])
         .arg(image_path)
         .stderr(std::process::Stdio::null())
         .status()
@@ -1131,19 +1142,40 @@ fn parse_dx_hash_line(line: &str) -> Option<KernelDxHash> {
     })
 }
 
+/// Algorithm AND seed are always passed: debugfs's defaults for both changed
+/// between e2fsprogs releases (1.47.0 hashes with a zero seed unless `-s` is
+/// given), which made the seeded algorithms disagree on CI's 1.47.0 while
+/// passing on 1.47.2.
 fn capture_dx_hash_batch(
     image: &Path,
-    hash_alg: Option<&str>,
+    hash_alg: &str,
+    hash_seed: &[u32; 4],
     names: &[String],
 ) -> Vec<KernelDxHash> {
+    // debugfs parses the seed as a UUID string into the raw 16 on-disk bytes.
+    let seed: Vec<u8> = hash_seed
+        .iter()
+        .flat_map(|word| word.to_le_bytes())
+        .collect();
+    let hex = |range: std::ops::Range<usize>| -> String {
+        use std::fmt::Write as _;
+        seed[range].iter().fold(String::new(), |mut out, byte| {
+            let _ = write!(out, "{byte:02x}");
+            out
+        })
+    };
+    let seed_uuid = format!(
+        "{}-{}-{}-{}-{}",
+        hex(0..4),
+        hex(4..6),
+        hex(6..8),
+        hex(8..10),
+        hex(10..16)
+    );
     let mut commands = NamedTempFile::new().expect("create temp debugfs command file");
     for name in names {
-        match hash_alg {
-            Some(hash_alg) => {
-                writeln!(commands, "dx_hash -h {hash_alg} {name}").expect("write dx_hash command");
-            }
-            None => writeln!(commands, "dx_hash {name}").expect("write dx_hash command"),
-        }
+        writeln!(commands, "dx_hash -h {hash_alg} -s {seed_uuid} {name}")
+            .expect("write dx_hash command");
     }
     commands.flush().expect("flush temp debugfs command file");
 
@@ -2348,7 +2380,7 @@ fn ext4_kernel_vs_ffs_dx_hash_reference() {
     let corpus = dx_hash_reference_corpus();
 
     for (hash_alg, version) in [("legacy", 0_u8), ("half_md4", 1_u8), ("tea", 2_u8)] {
-        let kernel_hashes = capture_dx_hash_batch(&tmp, Some(hash_alg), &corpus);
+        let kernel_hashes = capture_dx_hash_batch(&tmp, hash_alg, &reader.sb.hash_seed, &corpus);
         for (name, kernel_hash) in corpus.iter().zip(kernel_hashes.iter()) {
             let actual = dx_hash(version, name.as_bytes(), &reader.sb.hash_seed);
             assert_eq!(
@@ -2359,7 +2391,14 @@ fn ext4_kernel_vs_ffs_dx_hash_reference() {
         }
     }
 
-    let default_hashes = capture_dx_hash_batch(&tmp, None, &corpus);
+    // The image's own default algorithm and seed, named explicitly.
+    let default_alg = match reader.sb.def_hash_version {
+        0 => "legacy",
+        1 => "half_md4",
+        2 => "tea",
+        other => panic!("unexpected default hash version {other} on a mkfs image"),
+    };
+    let default_hashes = capture_dx_hash_batch(&tmp, default_alg, &reader.sb.hash_seed, &corpus);
     for (name, kernel_hash) in corpus.iter().zip(default_hashes.iter()) {
         let actual = dx_hash(
             reader.sb.def_hash_version,
