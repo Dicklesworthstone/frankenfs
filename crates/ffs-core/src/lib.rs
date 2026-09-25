@@ -10382,6 +10382,32 @@ impl OpenFs {
                          subvolume/snapshot objectid {mounted_root}"
                     )));
                 }
+                // bd-5elw6: a kernel snapshot of the default subvolume shares its
+                // tree blocks, and the kernel counts those lazily — the extent
+                // tree still says refs == 1 (or carries only root 5's backref)
+                // until the block's first copy-on-write, which must then bump
+                // the children's refs and move the backrefs. The commit here
+                // rewrites root 5's path without doing that, leaving stale
+                // backrefs and wrong counts that `btrfs check` rejects and that
+                // endanger the snapshot. The root item's last_snapshot says
+                // whether any snapshot was ever taken of this tree.
+                let last_snapshot = self
+                    .walk_btrfs_root_tree(cx)?
+                    .iter()
+                    .find(|item| {
+                        item.key.objectid == BTRFS_FS_TREE_OBJECTID
+                            && item.key.item_type == BTRFS_ITEM_ROOT_ITEM
+                    })
+                    .and_then(|item| ffs_btrfs::parse_root_item(&item.data).ok())
+                    .map_or(0, |root| root.last_snapshot);
+                if last_snapshot != 0 {
+                    return Err(FfsError::UnsupportedFeature(format!(
+                        "btrfs writes are not supported on a subvolume that has been \
+                         snapshotted (default subvolume last_snapshot={last_snapshot}): \
+                         its tree blocks may be shared with the snapshot, and FrankenFS \
+                         cannot yet copy-on-write shared tree blocks. Mount read-only."
+                    )));
+                }
                 // bd-btfeat: a read-only-compat feature is one a READER may
                 // ignore and a WRITER may not. The mount-time gate in
                 // `validate_btrfs_superblock` deliberately lets these through so
@@ -37122,6 +37148,7 @@ impl OpenFs {
             bytenr: 0,
             level: 0,
             generation: alloc.generation,
+            last_snapshot: 0,
             root_dirid: root_dir_oid,
             flags: 0,
             refs: 1,

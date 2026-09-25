@@ -848,6 +848,7 @@ const BTRFS_ROOT_ITEM_LEGACY_SIZE: usize = 239;
 const BTRFS_ROOT_ITEM_GENERATION_OFFSET: usize = 160;
 const BTRFS_ROOT_ITEM_ROOT_DIRID_OFFSET: usize = 168;
 const BTRFS_ROOT_ITEM_BYTENR_OFFSET: usize = 176;
+const BTRFS_ROOT_ITEM_LAST_SNAPSHOT_OFFSET: usize = 200;
 const BTRFS_ROOT_ITEM_FLAGS_OFFSET: usize = 208;
 const BTRFS_ROOT_ITEM_REFS_OFFSET: usize = 216;
 const BTRFS_ROOT_ITEM_LEVEL_OFFSET: usize = 238;
@@ -896,6 +897,11 @@ pub struct BtrfsRootItem {
     pub level: u8,
     /// Generation when this root was last modified.
     pub generation: u64,
+    /// Transid of the last snapshot taken OF this root (0 = never). Tree blocks
+    /// with a generation at or below it may be shared with that snapshot even
+    /// though the extent tree still counts them once: the kernel refcounts
+    /// snapshot-shared tree blocks lazily, on their first copy-on-write.
+    pub last_snapshot: u64,
     /// Directory inode for the root of this subvolume (typically 256).
     pub root_dirid: u64,
     /// Flags (bit 0 = read-only subvolume).
@@ -993,6 +999,9 @@ impl BtrfsRootItem {
         // bytenr at offset 176
         buf[BTRFS_ROOT_ITEM_BYTENR_OFFSET..BTRFS_ROOT_ITEM_BYTENR_OFFSET + 8]
             .copy_from_slice(&self.bytenr.to_le_bytes());
+        // last_snapshot at offset 200
+        buf[BTRFS_ROOT_ITEM_LAST_SNAPSHOT_OFFSET..BTRFS_ROOT_ITEM_LAST_SNAPSHOT_OFFSET + 8]
+            .copy_from_slice(&self.last_snapshot.to_le_bytes());
         // flags at offset 208
         buf[BTRFS_ROOT_ITEM_FLAGS_OFFSET..BTRFS_ROOT_ITEM_FLAGS_OFFSET + 8]
             .copy_from_slice(&self.flags.to_le_bytes());
@@ -1670,6 +1679,11 @@ pub fn parse_root_item(data: &[u8]) -> Result<BtrfsRootItem, ParseError> {
         "root_item.root_dirid",
     )?;
     let bytenr = read_u64(data, BTRFS_ROOT_ITEM_BYTENR_OFFSET, "root_item.bytenr")?;
+    let last_snapshot = read_u64(
+        data,
+        BTRFS_ROOT_ITEM_LAST_SNAPSHOT_OFFSET,
+        "root_item.last_snapshot",
+    )?;
     let flags = read_u64(data, BTRFS_ROOT_ITEM_FLAGS_OFFSET, "root_item.flags")?;
     let refs = u64::from(read_u32(
         data,
@@ -1740,6 +1754,7 @@ pub fn parse_root_item(data: &[u8]) -> Result<BtrfsRootItem, ParseError> {
         bytenr,
         level,
         generation,
+        last_snapshot,
         root_dirid,
         flags,
         refs,
@@ -11993,6 +12008,7 @@ pub fn tree_log_root_item(log_tree_bytenr: u64, level: u8, generation: u64) -> V
         bytenr: log_tree_bytenr,
         level,
         generation,
+        last_snapshot: 0,
         root_dirid: 0,
         flags: 0,
         refs: 1,
@@ -17306,6 +17322,7 @@ mod tests {
             bytenr: 0x1234_0000,
             level: 2,
             generation: 500,
+            last_snapshot: 450,
             root_dirid: 256,
             flags: 0,
             refs: 1,
@@ -17321,6 +17338,12 @@ mod tests {
         assert_eq!(parsed.bytenr, item.bytenr);
         assert_eq!(parsed.level, item.level);
         assert_eq!(parsed.generation, item.generation);
+        assert_eq!(parsed.last_snapshot, item.last_snapshot);
+        assert_eq!(
+            serialized[200..208],
+            450_u64.to_le_bytes(),
+            "last_snapshot lives at offset 200 (after byte_limit and bytes_used)"
+        );
         assert_eq!(parsed.root_dirid, item.root_dirid);
         assert_eq!(parsed.flags, item.flags);
         assert_eq!(parsed.refs, item.refs);
@@ -17334,6 +17357,7 @@ mod tests {
             bytenr: 0x1000,
             level: 0,
             generation: 100,
+            last_snapshot: 0,
             root_dirid: 256,
             flags: 0,
             refs: 1,
@@ -17356,6 +17380,7 @@ mod tests {
             bytenr: 0x1000,
             level: 0,
             generation: 100,
+            last_snapshot: 0,
             root_dirid: 256,
             flags: 0,
             refs: 1,
@@ -28048,6 +28073,7 @@ mod tests {
             bytenr: 0x1000,
             level: 0,
             generation: 50,
+            last_snapshot: 0,
             root_dirid: 256,
             flags: 0,
             refs: 1,
