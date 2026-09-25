@@ -2544,6 +2544,30 @@ fn spawn_cli_rw_mount(
     }
 }
 
+/// Size and format `image` as ext4 with the root directory owned by THIS
+/// process: CI runs tests as an unprivileged user, and a root-owned 0755 root
+/// directory makes every create through a `default_permissions` mount EACCES
+/// (the rch workers run as root, which hid it).
+fn format_ext4_owned_by_caller(image: &Path, size: u64) {
+    use std::os::unix::fs::MetadataExt as _;
+
+    fs::File::create(image)
+        .and_then(|file| file.set_len(size))
+        .expect("size image");
+    let me = fs::metadata(image).expect("stat image");
+    let root_owner = format!("root_owner={}:{}", me.uid(), me.gid());
+    let format = Command::new("mkfs.ext4")
+        .args(["-F", "-q", "-b", "4096", "-E", &root_owner])
+        .arg(image)
+        .output()
+        .expect("run mkfs.ext4");
+    assert!(
+        format.status.success(),
+        "mkfs.ext4 failed: {}",
+        String::from_utf8_lossy(&format.stderr)
+    );
+}
+
 /// SIGKILL a CLI mount daemon and detach its now-dead mount.
 fn sigkill_cli_mount(child: &mut std::process::Child, mnt: &Path) {
     child.kill().expect("SIGKILL the mount daemon");
@@ -2584,15 +2608,7 @@ fn cli_mount_rss_stays_bounded_without_fsync_bd_dj725() {
     let arm = |envs: &[(&str, &str)]| -> Option<[u64; 2]> {
         let tmp = tempfile::tempdir().expect("create temp dir");
         let image = tmp.path().join("rss.ext4");
-        fs::File::create(&image)
-            .and_then(|file| file.set_len(2 << 30))
-            .expect("size image");
-        let format = Command::new("mkfs.ext4")
-            .args(["-F", "-q", "-b", "4096"])
-            .arg(&image)
-            .output()
-            .expect("run mkfs.ext4");
-        assert!(format.status.success(), "mkfs.ext4 failed");
+        format_ext4_owned_by_caller(&image, 2 << 30);
         let mnt = tmp.path().join("mnt");
         fs::create_dir(&mnt).expect("create mountpoint");
         let mut child = spawn_cli_rw_mount(
@@ -2677,19 +2693,7 @@ fn periodic_commit_sigkill_arm(interval_secs: u64, payload: &[u8], require: bool
 
     let tmp = tempfile::tempdir().expect("create temp dir");
     let image = tmp.path().join("commit.ext4");
-    fs::File::create(&image)
-        .and_then(|file| file.set_len(64 << 20))
-        .expect("size image");
-    let format = Command::new("mkfs.ext4")
-        .args(["-F", "-q", "-b", "4096"])
-        .arg(&image)
-        .output()
-        .expect("run mkfs.ext4");
-    assert!(
-        format.status.success(),
-        "mkfs.ext4 failed: {}",
-        String::from_utf8_lossy(&format.stderr)
-    );
+    format_ext4_owned_by_caller(&image, 64 << 20);
     let mnt = tmp.path().join("mnt");
     fs::create_dir(&mnt).expect("create mountpoint");
     let interval = interval_secs.to_string();
