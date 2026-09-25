@@ -1869,21 +1869,38 @@ fn btrfs_tree_block_checksum_tamper_detection_conforms() {
     let root_logical = sb.root;
 
     let ctx = fs.btrfs_context().expect("btrfs context");
-    let mapping = fs.btrfs_context().expect("btrfs context");
-    let mapping = ffs_ondisk::map_logical_to_physical(&mapping.chunks, root_logical)
+    let mapping = ffs_ondisk::map_logical_to_stripes(&ctx.chunks, root_logical)
         .expect("map root logical")
         .expect("root logical covered");
-
-    let mut data = std::fs::read(&image_path).unwrap();
-    let offset = usize::try_from(mapping.physical).expect("physical offset should fit usize");
-    let corrupt_offset = offset + usize::try_from(ctx.nodesize.min(0x80)).expect("nodesize usize");
-    data[corrupt_offset] ^= 0xFF;
-    std::fs::write(&image_path, data).unwrap();
-
+    let corrupt_in_node = usize::try_from(ctx.nodesize.min(0x80)).expect("nodesize usize");
+    let corrupt_copy = |physical: u64| {
+        let mut data = std::fs::read(&image_path).unwrap();
+        let offset = usize::try_from(physical).expect("physical offset should fit usize");
+        data[offset + corrupt_in_node] ^= 0xFF;
+        std::fs::write(&image_path, data).unwrap();
+    };
     let opts = OpenOptions {
         ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
         ..OpenOptions::default()
     };
+
+    // mkfs's single-device metadata profile is DUP. With one copy damaged the
+    // read falls back to the other copy, as the kernel does: no error.
+    if mapping.stripes.len() > 1 {
+        corrupt_copy(mapping.stripes[0].physical);
+        let reopen = OpenFs::open_with_options(&cx, &image_path, &opts)
+            .expect("one damaged DUP copy must not prevent the open");
+        reopen
+            .readdir(&cx, InodeNumber(1), 0)
+            .expect("one damaged DUP copy must be served from the other copy");
+        for stripe in &mapping.stripes[1..] {
+            corrupt_copy(stripe.physical);
+        }
+    } else {
+        corrupt_copy(mapping.stripes[0].physical);
+    }
+
+    // Every copy damaged: the checksum failure must surface.
     let reopen = OpenFs::open_with_options(&cx, &image_path, &opts);
 
     match reopen {
