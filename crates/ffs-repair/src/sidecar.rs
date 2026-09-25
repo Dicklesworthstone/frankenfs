@@ -640,16 +640,36 @@ pub fn verify(cx: &Cx, image_path: &Path, sidecar_path: &Path) -> Result<Sidecar
     Ok(report)
 }
 
+/// Tests that spawn a child process hold this exclusively while the child
+/// runs; tests that hold flocked image or archive descriptors hold it shared.
+/// A spawned child inherits every test thread's open descriptors until it
+/// execs, and a flock belongs to the open file description, so a lock a
+/// sibling test had just released stayed held by the child and the sibling's
+/// reopen failed with WouldBlock (two sidecar tests per run, never the same
+/// two).
+#[cfg(test)]
+pub(crate) static TEST_CHILD_PROCESS_GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+/// Shared side of [`TEST_CHILD_PROCESS_GATE`], held for a test's lifetime.
+#[cfg(test)]
+pub(crate) fn test_flock_holder() -> std::sync::RwLockReadGuard<'static, ()> {
+    TEST_CHILD_PROCESS_GATE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    fn fixture() -> (
-        tempfile::TempDir,
-        std::path::PathBuf,
-        std::path::PathBuf,
-        Vec<u8>,
-    ) {
+    /// The fixture's directory plus the flock guard, released together.
+    struct FixtureDir {
+        _dir: tempfile::TempDir,
+        _flocks: std::sync::RwLockReadGuard<'static, ()>,
+    }
+
+    fn fixture() -> (FixtureDir, std::path::PathBuf, std::path::PathBuf, Vec<u8>) {
+        let flocks = test_flock_holder();
         let dir = tempfile::tempdir().expect("directory");
         let image = dir.path().join("image.img");
         let sidecar = dir.path().join("image.ffs-rq");
@@ -657,7 +677,15 @@ mod tests {
             .map(|index| u8::try_from((index * 31 + index / 512) % 251).expect("fits u8"))
             .collect();
         std::fs::write(&image, &bytes).expect("image");
-        (dir, image, sidecar, bytes)
+        (
+            FixtureDir {
+                _dir: dir,
+                _flocks: flocks,
+            },
+            image,
+            sidecar,
+            bytes,
+        )
     }
 
     fn options() -> SidecarOptions {

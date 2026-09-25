@@ -269,10 +269,13 @@ mod tests {
         sidecar: PathBuf,
         output: PathBuf,
         bytes: Vec<u8>,
+        /// See `crate::sidecar::TEST_CHILD_PROCESS_GATE`.
+        _flocks: std::sync::RwLockReadGuard<'static, ()>,
     }
 
     impl Fixture {
         fn new() -> Self {
+            let flocks = crate::sidecar::test_flock_holder();
             let dir = tempfile::tempdir().expect("directory");
             let image = dir.path().join("source.img");
             let sidecar = dir.path().join("source.ffs-rq");
@@ -293,6 +296,7 @@ mod tests {
                 sidecar,
                 output,
                 bytes,
+                _flocks: flocks,
             }
         }
 
@@ -396,6 +400,7 @@ mod tests {
 
     #[test]
     fn sidecar_restore_recovers_a_lone_last_block_and_a_completely_truncated_tiny_image() {
+        let _flocks = crate::sidecar::test_flock_holder();
         for length in [37_usize, 8 * 512 + 37] {
             let dir = tempfile::tempdir().expect("directory");
             let image = dir.path().join("source.img");

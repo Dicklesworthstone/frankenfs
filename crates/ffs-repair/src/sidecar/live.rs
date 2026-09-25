@@ -672,10 +672,17 @@ mod tests {
         image: PathBuf,
         sidecar: PathBuf,
         original: Vec<u8>,
+        /// See `crate::sidecar::TEST_CHILD_PROCESS_GATE`.
+        _flocks: Option<std::sync::RwLockReadGuard<'static, ()>>,
     }
 
     impl Fixture {
         fn new() -> Self {
+            Self::build(Some(crate::sidecar::test_flock_holder()))
+        }
+
+        /// For a test already holding the gate exclusively.
+        fn build(flocks: Option<std::sync::RwLockReadGuard<'static, ()>>) -> Self {
             let dir = tempfile::tempdir().expect("directory");
             let image = dir.path().join("source.img");
             let sidecar = dir.path().join("source.ffs-rq");
@@ -699,6 +706,7 @@ mod tests {
                 image,
                 sidecar,
                 original,
+                _flocks: flocks,
             }
         }
 
@@ -804,8 +812,13 @@ mod tests {
             // No device drop, unmount, destructor or sync may repair this epoch.
             std::process::exit(0);
         }
+        // Exclusive while children exist: they inherit sibling tests' flocked
+        // descriptors until exec (crate::sidecar::TEST_CHILD_PROCESS_GATE).
+        let _no_flock_holders = crate::sidecar::TEST_CHILD_PROCESS_GATE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         for cut in ["fence", "write", "sync"] {
-            let fixture = Fixture::new();
+            let fixture = Fixture::build(None);
             let status = std::process::Command::new(std::env::current_exe().expect("test binary"))
                 .args([
                     "--exact",
