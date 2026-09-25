@@ -1,0 +1,14 @@
+# Project-level rch settings for FrankenFS.
+#
+# rch forwards no environment variables unless they are allowlisted, so the
+# test-lane switches below never reached remote test runs: FFS_REQUIRE_FUSE=1
+# and FFS_REQUIRE_ORACLES=1 did not turn skips into failures, and the dispatch
+# knobs silently fell back to their defaults. These only steer tests.
+[environment]
+allowlist = [
+    "FFS_REQUIRE_FUSE",
+    "FFS_REQUIRE_ORACLES",
+    "FFS_E2E_FUSE_WORKERS",
+    "FFS_E2E_STRESS_WORKERS",
+    "FFS_E2E_STORM_SECS",
+]
