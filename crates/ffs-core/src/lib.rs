@@ -1541,6 +1541,10 @@ struct BtrfsAllocState {
     /// legitimate root-5 ref that the snapshot depends on. It releases exactly
     /// the blocks FrankenFS itself wrote instead.
     fs_tree_released_at_enable: bool,
+    /// Objectid of the subvolume this writable tree belongs to: 5 for the
+    /// default subvolume, otherwise the `--subvol`/`--snapshot` selection.
+    /// Owner of every tree block and root of every data backref it writes.
+    fs_root_objectid: u64,
 }
 
 impl BtrfsAllocState {
@@ -10371,41 +10375,50 @@ impl OpenFs {
                             .to_owned(),
                     ));
                 }
-                // bd-5elw6: the durable commit publishes the writable fs tree
-                // under the DEFAULT subvolume's ROOT_ITEM (objectid 5) and files
-                // every rewritten node's backref against root 5. Enabling writes
-                // on a tree loaded from any other subvolume or snapshot would
-                // replace the default subvolume with that tree's contents on the
-                // first commit. Refuse until the commit is parameterized by the
-                // mounted root (and handles blocks shared with a snapshot source).
+                // bd-5elw6: the commit publishes the writable tree under the
+                // MOUNTED subvolume's ROOT_ITEM and files its backrefs against
+                // that root.
                 let mounted_root = self
                     .btrfs_context
                     .as_ref()
                     .map_or(BTRFS_FS_TREE_OBJECTID, |ctx| ctx.subvol_objectid);
-                if mounted_root != BTRFS_FS_TREE_OBJECTID {
-                    return Err(FfsError::UnsupportedFeature(format!(
-                        "btrfs writes are only supported on the default subvolume \
-                         (objectid {BTRFS_FS_TREE_OBJECTID}); this mount selected \
-                         subvolume/snapshot objectid {mounted_root}"
-                    )));
-                }
-                // bd-5elw6: a kernel snapshot or relocation (`btrfs balance`) of
-                // the default subvolume shares its tree blocks and data, with
-                // lazily counted or parent-keyed references. The root item's
-                // last_snapshot says whether that ever happened; if so, the old
-                // tree is released reference by reference below instead of by
-                // the commit's root-5 filter.
                 let fs_root = self
                     .walk_btrfs_root_tree(cx)?
                     .iter()
                     .find(|item| {
-                        item.key.objectid == BTRFS_FS_TREE_OBJECTID
+                        item.key.objectid == mounted_root
                             && item.key.item_type == BTRFS_ITEM_ROOT_ITEM
                     })
-                    .and_then(|item| ffs_btrfs::parse_root_item(&item.data).ok());
+                    .map(|item| ffs_btrfs::parse_root_item(&item.data))
+                    .transpose()
+                    .map_err(|e| parse_to_ffs_error(&e))?;
+                if fs_root.is_none() && mounted_root != BTRFS_FS_TREE_OBJECTID {
+                    return Err(FfsError::Format(format!(
+                        "btrfs: no ROOT_ITEM for the mounted subvolume {mounted_root}"
+                    )));
+                }
+                if fs_root
+                    .as_ref()
+                    .is_some_and(|root| root.flags & ffs_btrfs::BTRFS_ROOT_SUBVOL_RDONLY != 0)
+                {
+                    return Err(FfsError::UnsupportedFeature(format!(
+                        "btrfs subvolume {mounted_root} is a read-only snapshot; \
+                         it cannot be mounted read-write"
+                    )));
+                }
+                // bd-5elw6: a kernel snapshot or relocation (`btrfs balance`)
+                // shares tree blocks and data, with lazily counted or
+                // parent-keyed references. For the default subvolume the root
+                // item's last_snapshot says whether that ever happened; if so,
+                // the old tree is released reference by reference below instead
+                // of by the commit's owner filter. Any other subvolume is always
+                // released that way: a kernel snapshot's blocks are owned by its
+                // source, which an owner filter would never find.
                 let shared_fs_root = fs_root
                     .as_ref()
-                    .filter(|root| root.last_snapshot != 0)
+                    .filter(|root| {
+                        mounted_root != BTRFS_FS_TREE_OBJECTID || root.last_snapshot != 0
+                    })
                     .map(|root| root.bytenr);
                 // bd-btfeat: a read-only-compat feature is one a READER may
                 // ignore and a WRITER may not. The mount-time gate in
@@ -11003,6 +11016,10 @@ impl OpenFs {
             // id in it corresponds to anything on disk yet (bd-42gtq).
             written_tree_blocks: std::collections::HashMap::new(),
             fs_tree_released_at_enable: false,
+            fs_root_objectid: self
+                .btrfs_context
+                .as_ref()
+                .map_or(BTRFS_FS_TREE_OBJECTID, |ctx| ctx.subvol_objectid),
             // No fsync has been logged in this mount yet (bd-dm01m).
             btrfs_logged_inodes: std::collections::BTreeSet::new(),
             btrfs_logged_dir_keys: std::collections::BTreeSet::new(),
@@ -11444,30 +11461,33 @@ impl OpenFs {
         result.map_err(|e| parse_to_ffs_error(&e))
     }
 
-    /// bd-5elw6: release the on-disk default-subvolume tree at `old_root` when
-    /// a kernel snapshot or relocation shares it.
+    /// bd-5elw6: release the mounted subvolume's on-disk tree at `old_root`
+    /// when a kernel snapshot or relocation may share it.
     ///
     /// FrankenFS rewrites every FS-tree node on its first commit, so the old
-    /// tree is dropped as a whole, the way the kernel drops a snapshot:
+    /// tree is dropped as a whole, the way the kernel drops a snapshot. "Root
+    /// M" below is the mounted subvolume (5 for the default one):
     ///
     /// 1. First add the new tree's own data references: one root-keyed
     ///    `EXTENT_DATA_REF` per regular file extent item it holds (at this
     ///    point the in-memory tree equals the on-disk one). Done first so no
     ///    data extent's refcount passes through zero in step 2.
     /// 2. Walk the old tree top-down from `old_root`. A block reached on root
-    ///    5's path with refs == 1 is released (item deleted, space pinned until
+    ///    M's path with refs == 1 is released (item deleted, space pinned until
     ///    the superblock stops pointing at it) and its children's references
     ///    (root-keyed, or parent-keyed if it was `FULL_BACKREF`) are dropped in
     ///    turn. A block that survives, because another root still reaches it,
-    ///    only loses root 5's reference, and if root 5 owns it and it is not
+    ///    only loses root M's reference, and if root M owns it and it is not
     ///    yet `FULL_BACKREF`, its children (tree blocks, or a leaf's data
     ///    extents) are re-referenced by its bytenr and it is flagged
     ///    `FULL_BACKREF`. Every block below a surviving one survives too and
-    ///    gets the same conversion: `btrfs check` accepts a root-5 keyed ref
-    ///    only if tree 5 itself holds the referencing item, and the new tree
-    ///    holds none of the old blocks (found by a 4 KiB-node, 3000-file
-    ///    snapshot test where stopping at the first shared node left every
-    ///    leaf below it with unbacked root-5 refs).
+    ///    gets the same conversion: `btrfs check` accepts a root-keyed ref
+    ///    only if that root's tree itself holds the referencing item, and the
+    ///    new tree holds none of the old blocks (found by a 4 KiB-node,
+    ///    3000-file snapshot test where stopping at the first shared node left
+    ///    every leaf below it with unbacked root-5 refs). Blocks a kernel
+    ///    snapshot shares from its source are owned by the source, so they only
+    ///    lose root M's reference.
     fn btrfs_release_shared_fs_tree(
         &self,
         cx: &Cx,
@@ -11496,7 +11516,7 @@ impl OpenFs {
                 _ => None,
             }
         }
-        let root5 = BTRFS_FS_TREE_OBJECTID;
+        let mounted = alloc.fs_root_objectid;
         let err = |e: &BtrfsMutationError| btrfs_mutation_to_ffs(e);
 
         let lo = BtrfsKey {
@@ -11514,7 +11534,7 @@ impl OpenFs {
             if let Some((bytenr, num_bytes, offset)) = data_ref(key, data) {
                 alloc
                     .extent_alloc
-                    .add_data_extent_ref(bytenr, num_bytes, root5, key.objectid, offset)
+                    .add_data_extent_ref(bytenr, num_bytes, mounted, key.objectid, offset)
                     .map_err(|e| err(&e))?;
             }
         }
@@ -11525,10 +11545,10 @@ impl OpenFs {
                 .nodesize,
         )
         .map_err(|_| FfsError::Format("nodesize does not fit usize".into()))?;
-        // `Some(via)`: root 5's path reaches this block through `via`, which is
+        // `Some(via)`: the mounted root's path reaches this block through `via`, which is
         // dropped. `None`: the block survives (another root reaches it) and
         // only needs its references made parent-keyed.
-        let mut stack = vec![(old_root, Some(TreeBlockBackref::Root(root5)))];
+        let mut stack = vec![(old_root, Some(TreeBlockBackref::Root(mounted)))];
         let mut converted = std::collections::HashSet::new();
         while let Some((bytenr, via)) = stack.pop() {
             cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
@@ -11541,7 +11561,7 @@ impl OpenFs {
                 .map_err(|e| err(&e))?
                 .ok_or_else(|| {
                     FfsError::Format(format!(
-                        "btrfs tree block {bytenr} of the default subvolume has no extent item"
+                        "btrfs tree block {bytenr} of subvolume {mounted} has no extent item"
                     ))
                 })?;
             let mut block = vec![0_u8; nodesize];
@@ -11571,12 +11591,12 @@ impl OpenFs {
 
             // A block survives when another root still reaches it. The new tree
             // references none of the old blocks, and `btrfs check` requires a
-            // root-5 keyed ref to be backed by tree 5 itself, so EVERY surviving
-            // block root 5 owns becomes FULL_BACKREF (its children and data are
+            // root-keyed ref to be backed by that root's own tree, so EVERY
+            // surviving block the mounted root owns becomes FULL_BACKREF (its children and data are
             // then referenced by its bytenr), all the way down.
             let survives = via.is_none() || state.refs > 1;
             if survives {
-                if header.owner == root5 && !state.full_backref() {
+                if header.owner == mounted && !state.full_backref() {
                     for &child in &child_blocks {
                         alloc
                             .extent_alloc
@@ -11584,7 +11604,7 @@ impl OpenFs {
                             .map_err(|e| err(&e))?;
                         alloc
                             .extent_alloc
-                            .remove_tree_block_backref(child, TreeBlockBackref::Root(root5))
+                            .remove_tree_block_backref(child, TreeBlockBackref::Root(mounted))
                             .map_err(|e| err(&e))?;
                     }
                     for &(db, dn, objectid, offset) in &child_data {
@@ -11594,7 +11614,7 @@ impl OpenFs {
                             .map_err(|e| err(&e))?;
                         alloc
                             .extent_alloc
-                            .remove_data_extent_ref(db, dn, root5, objectid, offset)
+                            .remove_data_extent_ref(db, dn, mounted, objectid, offset)
                             .map_err(|e| err(&e))?;
                     }
                     alloc
@@ -11618,7 +11638,7 @@ impl OpenFs {
             let child_via = if state.full_backref() {
                 TreeBlockBackref::Parent(bytenr)
             } else {
-                TreeBlockBackref::Root(root5)
+                TreeBlockBackref::Root(mounted)
             };
             stack.extend(child_blocks.iter().map(|&child| (child, Some(child_via))));
             for &(db, dn, objectid, offset) in &child_data {
@@ -11630,14 +11650,14 @@ impl OpenFs {
                 } else {
                     alloc
                         .extent_alloc
-                        .remove_data_extent_ref(db, dn, root5, objectid, offset)
+                        .remove_data_extent_ref(db, dn, mounted, objectid, offset)
                         .map_err(|e| err(&e))?;
                     1
                 };
                 if remaining == 0 {
                     return Err(FfsError::Format(format!(
                         "btrfs data extent {db} lost its last reference while releasing \
-                         the shared default-subvolume tree"
+                         the shared tree of subvolume {mounted}"
                     )));
                 }
             }
@@ -32156,12 +32176,13 @@ impl OpenFs {
                 // into the extent, so extent_offset can exceed file_offset —
                 // btrfs check validates the wrapped value).
                 let ref_offset = key.offset.wrapping_sub(extent_offset);
+                let root = alloc.fs_root_objectid;
                 alloc
                     .extent_alloc
                     .add_data_extent_ref(
                         disk_bytenr,
                         disk_num_bytes,
-                        BTRFS_FS_TREE_OBJECTID,
+                        root,
                         dst_canonical,
                         ref_offset,
                     )
@@ -32386,15 +32407,10 @@ impl OpenFs {
                 .fs_tree
                 .insert(dst_key, &new_data)
                 .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            let root = alloc.fs_root_objectid;
             alloc
                 .extent_alloc
-                .add_data_extent_ref(
-                    disk_bytenr,
-                    disk_num_bytes,
-                    BTRFS_FS_TREE_OBJECTID,
-                    dst_canonical,
-                    ref_offset,
-                )
+                .add_data_extent_ref(disk_bytenr, disk_num_bytes, root, dst_canonical, ref_offset)
                 .map_err(|e| btrfs_mutation_to_ffs(&e))?;
         }
         // Copy carved inline bytes into dst as fresh regular extents (bd-iypb9).
@@ -32477,8 +32493,7 @@ impl OpenFs {
     /// for it. `free_extent` removes the item again, so writes and frees stay
     /// symmetric. `file_offset` is the extent's start offset within the file (the
     /// `EXTENT_DATA` key offset for a fresh, unsplit extent). The owning root is
-    /// the default subvolume (`BTRFS_FS_TREE_OBJECTID`), matching the fs_tree
-    /// owner FrankenFS commits.
+    /// the mounted subvolume, matching the fs_tree owner FrankenFS commits.
     fn btrfs_register_data_extent_backref(
         alloc: &mut BtrfsAllocState,
         disk_bytenr: u64,
@@ -32486,12 +32501,13 @@ impl OpenFs {
         canonical: u64,
         file_offset: u64,
     ) -> ffs_error::Result<()> {
+        let root = alloc.fs_root_objectid;
         alloc
             .extent_alloc
             .insert_data_extent_item(
                 disk_bytenr,
                 disk_num_bytes,
-                BTRFS_FS_TREE_OBJECTID,
+                root,
                 canonical,
                 file_offset,
                 alloc.generation,
@@ -32679,15 +32695,10 @@ impl OpenFs {
             .map_err(|e| btrfs_mutation_to_ffs(&e))?
             .unwrap_or(1);
         if refs > 1 {
+            let root = alloc.fs_root_objectid;
             alloc
                 .extent_alloc
-                .remove_data_extent_ref(
-                    disk_bytenr,
-                    disk_num_bytes,
-                    BTRFS_FS_TREE_OBJECTID,
-                    objectid,
-                    ref_offset,
-                )
+                .remove_data_extent_ref(disk_bytenr, disk_num_bytes, root, objectid, ref_offset)
                 .map_err(|e| btrfs_mutation_to_ffs(&e))?;
         } else {
             alloc
@@ -32854,12 +32865,13 @@ impl OpenFs {
                     } = extent
                 {
                     let ref_offset = key.offset.wrapping_sub(extent_offset);
+                    let root = alloc.fs_root_objectid;
                     alloc
                         .extent_alloc
                         .add_data_extent_ref(
                             disk_bytenr,
                             disk_num_bytes,
-                            BTRFS_FS_TREE_OBJECTID,
+                            root,
                             canonical,
                             ref_offset,
                         )
@@ -34664,6 +34676,25 @@ impl OpenFs {
         }
     }
 
+    /// The ROOT_ITEM of subvolume `objectid`. Found by range rather than by an
+    /// exact key: a subvolume's is keyed at offset 0, but a snapshot's at the
+    /// transid it was taken in.
+    fn btrfs_find_root_item(
+        root_tree: &InMemoryCowBtrfsTree,
+        objectid: u64,
+    ) -> Result<Option<(BtrfsKey, Vec<u8>)>, FfsError> {
+        let key_at = |offset| BtrfsKey {
+            objectid,
+            item_type: BTRFS_ITEM_ROOT_ITEM,
+            offset,
+        };
+        Ok(root_tree
+            .range(&key_at(0), &key_at(u64::MAX))
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?
+            .into_iter()
+            .next())
+    }
+
     // ── Btrfs durable writeback (bd-jdo53) ───────────────────────────────
 
     /// Fixpoint iteration cap for the extent tree's self-description pass in
@@ -34693,6 +34724,8 @@ impl OpenFs {
     ) -> ffs_error::Result<BtrfsWritebackStats> {
         let alloc_mutex = self.require_btrfs_alloc_state()?;
         let mut alloc = alloc_mutex.write();
+        // The subvolume this commit publishes (5 unless --subvol/--snapshot).
+        let fs_root = alloc.fs_root_objectid;
 
         // Extract superblock for serialization parameters
         let sb: &BtrfsSuperblock = match &self.flavor {
@@ -34739,7 +34772,7 @@ impl OpenFs {
         if !purge_fs_tree_by_filter {
             let previously_written: Vec<u64> = alloc
                 .written_tree_blocks
-                .get(&BTRFS_FS_TREE_OBJECTID)
+                .get(&fs_root)
                 .map(|blocks| blocks.values().map(|&(bytenr, _)| bytenr).collect())
                 .unwrap_or_default();
             for bytenr in previously_written {
@@ -34747,7 +34780,7 @@ impl OpenFs {
                     .extent_alloc
                     .remove_tree_block_backref(
                         bytenr,
-                        ffs_btrfs::backrefs::TreeBlockBackref::Root(BTRFS_FS_TREE_OBJECTID),
+                        ffs_btrfs::backrefs::TreeBlockBackref::Root(fs_root),
                     )
                     .map_err(|e| btrfs_mutation_to_ffs(&e))?;
             }
@@ -34778,7 +34811,7 @@ impl OpenFs {
             BTRFS_TREE_LOG_OBJECTID,
         ];
         if purge_fs_tree_by_filter {
-            purged_roots.push(BTRFS_FS_TREE_OBJECTID);
+            purged_roots.push(fs_root);
         }
         alloc
             .extent_alloc
@@ -35132,7 +35165,7 @@ impl OpenFs {
         // filesystem (bd-73bi2, open_ctree -5).
         let retained_fs = alloc
             .written_tree_blocks
-            .get(&BTRFS_FS_TREE_OBJECTID)
+            .get(&fs_root)
             .cloned()
             .unwrap_or_default();
         let mut allocated_addrs = std::collections::BTreeMap::new();
@@ -35158,13 +35191,13 @@ impl OpenFs {
                 // otherwise is a backref generation mismatch (bd-qxo5x).
                 alloc
                     .extent_alloc
-                    .ensure_self_metadata_item(bytenr, level, BTRFS_FS_TREE_OBJECTID, block_gen)
+                    .ensure_self_metadata_item(bytenr, level, fs_root, block_gen)
                     .map_err(|e| btrfs_mutation_to_ffs(&e))?;
                 continue;
             }
             let allocation = alloc
                 .extent_alloc
-                .alloc_metadata_for_tree(u64::from(nodesize), BTRFS_FS_TREE_OBJECTID, level)
+                .alloc_metadata_for_tree(u64::from(nodesize), fs_root, level)
                 .map_err(|e| btrfs_mutation_to_ffs(&e))?;
             allocated_addrs.insert(block, allocation.bytenr);
             fs_blocks_to_write.insert(block);
@@ -35189,7 +35222,7 @@ impl OpenFs {
             sb.fsid,
             sb.fsid, // chunk_tree_uuid = fsid for single-device
             new_gen,
-            BTRFS_FS_TREE_OBJECTID,
+            fs_root,
             nodesize,
             sb.csum_type,
             alloc.sectorsize,
@@ -35335,9 +35368,7 @@ impl OpenFs {
                     (block, (bytenr, block_gen))
                 })
                 .collect();
-            alloc
-                .written_tree_blocks
-                .insert(BTRFS_FS_TREE_OBJECTID, recorded);
+            alloc.written_tree_blocks.insert(fs_root, recorded);
         }
 
         // Get fs_tree root location for ROOT_ITEM update
@@ -35354,19 +35385,16 @@ impl OpenFs {
         // blocks would be orphaned — every mutation in this transaction
         // would silently revert on the next mount. Refuse the commit
         // instead so the caller (and the operator) sees the inconsistency.
-        let fs_root_key = BtrfsKey {
-            objectid: BTRFS_FS_TREE_OBJECTID,
-            item_type: BTRFS_ITEM_ROOT_ITEM,
-            offset: 0,
-        };
-        let mut root_item_data = alloc.root_tree.get(&fs_root_key).ok_or_else(|| {
-            FfsError::Format(
-                "btrfs commit: FS_TREE ROOT_ITEM (objectid=5, type=ROOT_ITEM, offset=0) \
-                 is missing from in-memory root_tree — refusing to commit a transaction \
-                 that would orphan the new fs_tree at allocated logical address"
-                    .into(),
-            )
-        })?;
+        // A snapshot's ROOT_ITEM is keyed at offset = the transid it was taken
+        // in, a subvolume's at 0, so the key is found rather than assumed.
+        let (fs_root_key, mut root_item_data) =
+            Self::btrfs_find_root_item(&alloc.root_tree, fs_root)?.ok_or_else(|| {
+                FfsError::Format(format!(
+                    "btrfs commit: ROOT_ITEM for subvolume {fs_root} is missing from \
+                     in-memory root_tree — refusing to commit a transaction that would \
+                     orphan the new fs_tree at allocated logical address"
+                ))
+            })?;
         // bd-42gtq: the generation the ROOT_ITEM publishes must be the one the
         // root BLOCK actually carries. COW propagates to the root, so a reused
         // root means this transaction changed nothing in the tree at all — and
@@ -35408,7 +35436,7 @@ impl OpenFs {
         if root_item_data == root_item_before {
             trace!(
                 target: "ffs::btrfs::writeback",
-                objectid = BTRFS_FS_TREE_OBJECTID,
+                objectid = fs_root,
                 "root_item_unchanged_update_skipped"
             );
         } else {
@@ -37428,7 +37456,7 @@ impl OpenFs {
         // (child_key_type = ROOT_ITEM; readdir emits it as a directory named
         // `name`). No INODE_REF — a subvolume is not an inode in the parent tree;
         // the back-link is the ROOT_BACKREF.
-        let parent_root_objectid = BTRFS_FS_TREE_OBJECTID;
+        let parent_root_objectid = alloc.fs_root_objectid;
         let dir_item = BtrfsDirItem {
             child_objectid: subvol_id,
             child_key_type: BTRFS_ITEM_ROOT_ITEM,
@@ -37596,19 +37624,15 @@ impl OpenFs {
             return Err(FfsError::Exists);
         }
 
-        // Source is the default subvolume (FS_TREE). Its uuid (ROOT_ITEM bytes
-        // offset 247, 16 bytes) becomes the snapshot's parent_uuid.
+        // Source is the mounted subvolume. Its uuid (ROOT_ITEM bytes offset
+        // 247, 16 bytes) becomes the snapshot's parent_uuid.
         let source_uuid = {
-            let fs_root_key = BtrfsKey {
-                objectid: BTRFS_FS_TREE_OBJECTID,
-                item_type: BTRFS_ITEM_ROOT_ITEM,
-                offset: 0,
-            };
-            let data = alloc.root_tree.get(&fs_root_key).ok_or_else(|| {
-                FfsError::Format("FS_TREE ROOT_ITEM missing — cannot snapshot".into())
+            let (_, data) = Self::btrfs_find_root_item(&alloc.root_tree, alloc.fs_root_objectid)?
+                .ok_or_else(|| {
+                FfsError::Format("source ROOT_ITEM missing — cannot snapshot".into())
             })?;
             if data.len() < 263 {
-                return Err(FfsError::Format("FS_TREE ROOT_ITEM too short".into()));
+                return Err(FfsError::Format("source ROOT_ITEM too short".into()));
             }
             let mut u = [0_u8; 16];
             u.copy_from_slice(&data[247..263]);
@@ -40495,12 +40519,13 @@ impl OpenFs {
                 } => {
                     // Shared extent: drop only this inode's reference. The space
                     // and its csums stay live for the remaining references.
+                    let root = alloc.fs_root_objectid;
                     alloc
                         .extent_alloc
                         .remove_data_extent_ref(
                             disk_bytenr,
                             disk_num_bytes,
-                            BTRFS_FS_TREE_OBJECTID,
+                            root,
                             objectid,
                             ref_offset,
                         )
@@ -86240,14 +86265,13 @@ mod tests {
         );
     }
 
-    /// bd-5elw6: the durable commit publishes the writable tree as the DEFAULT
-    /// subvolume's root, so a mount of any other subvolume must refuse writes
-    /// rather than overwrite subvolume 5 with that subvolume's contents. The
-    /// refusal must leave the image untouched, and the default root must still
-    /// become writable. Refusal-only coverage: subvolume RW itself is not
-    /// supported yet.
+    /// bd-5elw6: a write through a non-default subvolume mount lands in THAT
+    /// subvolume. The commit publishes the tree under the mounted root's
+    /// ROOT_ITEM and files its backrefs against that root; before, it
+    /// published under subvolume 5 and would have replaced the default
+    /// subvolume with the mounted one's contents.
     #[test]
-    fn btrfs_non_default_subvolume_refuses_writes_bd_5elw6() {
+    fn btrfs_non_default_subvolume_writes_land_in_that_subvolume_bd_5elw6() {
         let Some((fs, dev, _tmp, image)) = open_writable_btrfs_mkfs(256) else {
             eprintln!("SKIP bd-5elw6: btrfs-progs unavailable");
             return;
@@ -86266,32 +86290,61 @@ mod tests {
             .expect("btrfs full transaction commit");
         std::fs::write(&image, dev.snapshot_bytes()).expect("write modified image");
         drop(fs);
-        let before = std::fs::read(&image).expect("read image");
 
         let subvol_opts = OpenOptions {
             btrfs_mount_selection: BtrfsMountSelection::Subvolume("rwguard".to_owned()),
+            btrfs_rw_ephemeral_ok: true,
             ..OpenOptions::default()
         };
-        let mut subvol_fs =
-            OpenFs::open_with_options(&cx, &image, &subvol_opts).expect("open subvolume RO");
-        let err = subvol_fs
+        let subvol_dev = TestDevice::from_vec(std::fs::read(&image).expect("read image"));
+        let mut subvol_fs = OpenFs::from_device(&cx, Box::new(subvol_dev.clone()), &subvol_opts)
+            .expect("open subvolume");
+        subvol_fs
             .enable_writes(&cx)
-            .expect_err("writes on a non-default subvolume must be refused");
-        assert!(
-            matches!(&err, FfsError::UnsupportedFeature(msg) if msg.contains("default subvolume")),
-            "unexpected refusal: {err:?}"
-        );
+            .expect("a non-default subvolume becomes writable");
+        let created = subvol_fs
+            .create(
+                &cx,
+                InodeNumber(1),
+                OsStr::new("in_subvol.bin"),
+                0o644,
+                0,
+                0,
+            )
+            .expect("create in subvolume");
+        subvol_fs
+            .write(&cx, created.ino, 0, &[0x5E_u8; 20_000])
+            .expect("write in subvolume");
+        let _ = subvol_fs.flush_mvcc_to_device(&cx);
+        subvol_fs
+            .btrfs_full_transaction_commit(&cx, "subvol-rw")
+            .expect("commit the subvolume");
+        std::fs::write(&image, subvol_dev.snapshot_bytes()).expect("write image");
         drop(subvol_fs);
-        assert!(
-            std::fs::read(&image).expect("reread image") == before,
-            "a refused enable_writes must not modify the image"
-        );
 
-        let mut default_fs = OpenFs::open_with_options(&cx, &image, &OpenOptions::default())
-            .expect("open default root");
-        default_fs
-            .enable_writes(&cx)
-            .expect("the default subvolume stays writable");
+        if let Some((ok, output)) = run_btrfs_check(&image) {
+            assert!(ok, "btrfs check after a subvolume write:\n{output}");
+        }
+        let default_fs =
+            OpenFs::open_with_options(&cx, &image, &OpenOptions::default()).expect("open default");
+        assert!(
+            matches!(
+                default_fs.lookup(&cx, InodeNumber(1), OsStr::new("in_subvol.bin")),
+                Err(FfsError::NotFound(_))
+            ),
+            "the file must not appear in the default subvolume"
+        );
+        drop(default_fs);
+        // Opening by name resolves `rwguard` through the root tree's ROOT_REF,
+        // so this also shows the subvolume's link survived the commit.
+        let reopened = OpenFs::open_with_options(&cx, &image, &subvol_opts).expect("reopen");
+        let found = reopened
+            .lookup(&cx, InodeNumber(1), OsStr::new("in_subvol.bin"))
+            .expect("the file is in the subvolume");
+        assert_eq!(
+            reopened.read(&cx, found.ino, 0, 20_000).expect("read"),
+            vec![0x5E_u8; 20_000]
+        );
     }
 
     /// bd-jctlm: btrfs only inlines files BELOW the sector boundary; a file whose

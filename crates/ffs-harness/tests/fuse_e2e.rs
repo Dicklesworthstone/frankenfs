@@ -1990,6 +1990,18 @@ fn ffs_written_images_mount_and_read_under_the_linux_kernel() {
     emit_scenario_result("ffs_written_btrfs_dup_copy2_kernel_read", "PASS", None);
 }
 
+/// Which subvolume the FrankenFS read-write session mounts.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SharedBtrfsTarget {
+    /// The default subvolume (5).
+    Default,
+    /// The kernel snapshot `snap` of the default subvolume.
+    Snapshot,
+    /// A subvolume `sv` the kernel created and filled with a copy of the
+    /// workspace.
+    Subvolume,
+}
+
 /// How the kernel prepares the image for a shared-tree scenario.
 struct SharedBtrfsScenario {
     name: &'static str,
@@ -1997,14 +2009,16 @@ struct SharedBtrfsScenario {
     nodesize: Option<u32>,
     snapshot: bool,
     balance: bool,
+    target: SharedBtrfsTarget,
 }
 
 /// bd-5elw6: seed `files` files with mkfs, let the kernel snapshot and/or
-/// balance the default subvolume (both leave shared, lazily counted or
-/// parent-keyed references), then rewrite 3/4 and delete 1/4 of the files
-/// and create new ones through a FrankenFS read-write FUSE mount. Afterwards
-/// `btrfs check` must be clean, the kernel must read the snapshot's original
-/// bytes and the default subvolume's new ones.
+/// balance (both leave shared, lazily counted or parent-keyed references),
+/// then rewrite 3/4 and delete 1/4 of the files and create new ones through a
+/// FrankenFS read-write FUSE mount of `target`. Afterwards `btrfs check` must
+/// be clean, and the kernel must read the new bytes in the target and the
+/// original ones in the subvolume the session did not mount.
+#[allow(clippy::too_many_lines)]
 fn run_shared_btrfs_rw_scenario(scenario: &SharedBtrfsScenario) {
     // A failing commit reaches the caller as EIO through FUSE; its cause is
     // only in the daemon's warnings.
@@ -2077,17 +2091,62 @@ fn run_shared_btrfs_rw_scenario(scenario: &SharedBtrfsScenario) {
             .output()
             .expect("spawn mount");
         assert!(mounted.status.success(), "kernel rw mount");
-        if scenario.snapshot {
-            let snap = Command::new("sudo")
-                .args(["-n", "btrfs", "subvolume", "snapshot"])
-                .arg(&kmnt)
-                .arg(kmnt.join("snap"))
+        let sudo = |args: &[&std::ffi::OsStr], what: &str| {
+            let out = Command::new("sudo")
+                .arg("-n")
+                .args(args)
                 .output()
-                .expect("spawn snapshot");
+                .unwrap_or_else(|e| panic!("spawn {what}: {e}"));
             assert!(
-                snap.status.success(),
-                "kernel snapshot: {}",
-                String::from_utf8_lossy(&snap.stderr)
+                out.status.success(),
+                "{what}: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        };
+        if scenario.target == SharedBtrfsTarget::Subvolume {
+            let sv = kmnt.join("sv");
+            sudo(
+                &[
+                    "btrfs".as_ref(),
+                    "subvolume".as_ref(),
+                    "create".as_ref(),
+                    sv.as_os_str(),
+                ],
+                "kernel subvolume create",
+            );
+            sudo(
+                &[
+                    "cp".as_ref(),
+                    "-a".as_ref(),
+                    kmnt.join(BTRFS_TEST_WORKSPACE).as_os_str(),
+                    sv.as_os_str(),
+                ],
+                "copy the workspace into the subvolume",
+            );
+        }
+        if scenario.snapshot {
+            let snap = kmnt.join("snap");
+            sudo(
+                &[
+                    "btrfs".as_ref(),
+                    "subvolume".as_ref(),
+                    "snapshot".as_ref(),
+                    kmnt.as_os_str(),
+                    snap.as_os_str(),
+                ],
+                "kernel snapshot",
+            );
+            let snap_ro = kmnt.join("snap-ro");
+            sudo(
+                &[
+                    "btrfs".as_ref(),
+                    "subvolume".as_ref(),
+                    "snapshot".as_ref(),
+                    "-r".as_ref(),
+                    kmnt.as_os_str(),
+                    snap_ro.as_os_str(),
+                ],
+                "kernel read-only snapshot",
             );
         }
         if scenario.balance {
@@ -2118,6 +2177,23 @@ fn run_shared_btrfs_rw_scenario(scenario: &SharedBtrfsScenario) {
         text.matches("FULL_BACKREF").count(),
     );
 
+    if scenario.snapshot {
+        // A read-only snapshot stays read-only.
+        let cx = Cx::for_testing();
+        let opts = OpenOptions {
+            btrfs_mount_selection: BtrfsMountSelection::Snapshot("snap-ro".to_owned()),
+            ..OpenOptions::default()
+        };
+        let mut ro_snap = OpenFs::open_with_options(&cx, &image, &opts).expect("open snap-ro");
+        let refused = ro_snap
+            .enable_writes(&cx)
+            .expect_err("a read-only snapshot must refuse writes");
+        assert!(
+            refused.to_string().contains("read-only snapshot"),
+            "unexpected refusal: {refused}"
+        );
+    }
+
     let mnt = tmp.path().join("mnt");
     fs::create_dir_all(&mnt).expect("mountpoint");
     let rw = MountOptions {
@@ -2125,7 +2201,12 @@ fn run_shared_btrfs_rw_scenario(scenario: &SharedBtrfsScenario) {
         auto_unmount: false,
         ..MountOptions::default()
     };
-    let Some(session) = try_mount_btrfs_rw_with_options(&image, &mnt, &rw) else {
+    let selection = match scenario.target {
+        SharedBtrfsTarget::Default => BtrfsMountSelection::DefaultRoot,
+        SharedBtrfsTarget::Snapshot => BtrfsMountSelection::Snapshot("snap".to_owned()),
+        SharedBtrfsTarget::Subvolume => BtrfsMountSelection::Subvolume("sv".to_owned()),
+    };
+    let Some(session) = try_mount_btrfs_rw_selection(&image, &mnt, &rw, selection) else {
         return;
     };
     let workspace = mnt.join(BTRFS_TEST_WORKSPACE);
@@ -2166,15 +2247,30 @@ fn run_shared_btrfs_rw_scenario(scenario: &SharedBtrfsScenario) {
     let Some(kernel) = kernel_ro_mount(&image, "btrfs", &kmnt) else {
         return;
     };
-    let live = kmnt.join(BTRFS_TEST_WORKSPACE);
+    // The subvolume the session wrote, and the one holding the originals.
+    let (live, pristine) = match scenario.target {
+        SharedBtrfsTarget::Default => (kmnt.clone(), scenario.snapshot.then(|| kmnt.join("snap"))),
+        SharedBtrfsTarget::Snapshot => (kmnt.join("snap"), Some(kmnt.clone())),
+        SharedBtrfsTarget::Subvolume => (kmnt.join("sv"), Some(kmnt.clone())),
+    };
+    let live = live.join(BTRFS_TEST_WORKSPACE);
     for index in 0..scenario.files {
         let name = format!("f{index:04}");
+        if let Some(pristine) = &pristine {
+            assert_eq!(
+                fs::read(pristine.join(BTRFS_TEST_WORKSPACE).join(&name))
+                    .unwrap_or_else(|e| panic!("untouched {name}: {e}")),
+                content(index, 0),
+                "{}: {name} changed in the subvolume the session did not mount",
+                scenario.name
+            );
+        }
         if scenario.snapshot {
             assert_eq!(
-                fs::read(kmnt.join("snap").join(BTRFS_TEST_WORKSPACE).join(&name))
-                    .unwrap_or_else(|e| panic!("snapshot {name}: {e}")),
+                fs::read(kmnt.join("snap-ro").join(BTRFS_TEST_WORKSPACE).join(&name))
+                    .unwrap_or_else(|e| panic!("read-only snapshot {name}: {e}")),
                 content(index, 0),
-                "{}: the snapshot's {name} changed",
+                "{}: the read-only snapshot's {name} changed",
                 scenario.name
             );
         }
@@ -2184,7 +2280,7 @@ fn run_shared_btrfs_rw_scenario(scenario: &SharedBtrfsScenario) {
             assert_eq!(
                 fs::read(live.join(&name)).unwrap_or_else(|e| panic!("live {name}: {e}")),
                 content(index, 101),
-                "{}: the default subvolume's {name}",
+                "{}: the mounted subvolume's {name}",
                 scenario.name
             );
         }
@@ -2207,6 +2303,7 @@ fn btrfs_rw_on_a_kernel_snapshotted_default_subvolume_bd_5elw6() {
         nodesize: None,
         snapshot: true,
         balance: false,
+        target: SharedBtrfsTarget::Default,
     });
 }
 
@@ -2220,6 +2317,7 @@ fn btrfs_rw_on_a_kernel_balanced_image_bd_5elw6() {
         nodesize: None,
         snapshot: false,
         balance: true,
+        target: SharedBtrfsTarget::Default,
     });
 }
 
@@ -2234,6 +2332,7 @@ fn btrfs_rw_on_a_tall_snapshotted_tree_bd_5elw6() {
         nodesize: Some(4096),
         snapshot: true,
         balance: false,
+        target: SharedBtrfsTarget::Default,
     });
 }
 
@@ -2245,6 +2344,61 @@ fn btrfs_rw_on_a_snapshotted_then_balanced_image_bd_5elw6() {
         nodesize: None,
         snapshot: true,
         balance: true,
+        target: SharedBtrfsTarget::Default,
+    });
+}
+
+/// A writable kernel snapshot mounted read-write: its blocks are owned by the
+/// default subvolume, which must keep every original byte.
+#[test]
+fn btrfs_rw_on_a_writable_kernel_snapshot_bd_5elw6() {
+    run_shared_btrfs_rw_scenario(&SharedBtrfsScenario {
+        name: "btrfs_rw_writable_snapshot",
+        files: 400,
+        nodesize: None,
+        snapshot: true,
+        balance: false,
+        target: SharedBtrfsTarget::Snapshot,
+    });
+}
+
+/// The tall-tree variant: shared blocks below shared nodes, owned by the source.
+#[test]
+fn btrfs_rw_on_a_tall_writable_kernel_snapshot_bd_5elw6() {
+    run_shared_btrfs_rw_scenario(&SharedBtrfsScenario {
+        name: "btrfs_rw_tall_writable_snapshot",
+        files: 3000,
+        nodesize: Some(4096),
+        snapshot: true,
+        balance: false,
+        target: SharedBtrfsTarget::Snapshot,
+    });
+}
+
+/// A kernel-created subvolume (`--subvol`), never snapshotted.
+#[test]
+fn btrfs_rw_on_a_kernel_created_subvolume_bd_5elw6() {
+    run_shared_btrfs_rw_scenario(&SharedBtrfsScenario {
+        name: "btrfs_rw_kernel_subvolume",
+        files: 400,
+        nodesize: None,
+        snapshot: false,
+        balance: false,
+        target: SharedBtrfsTarget::Subvolume,
+    });
+}
+
+/// A kernel-created subvolume that a balance relocated (reloc trees leave it
+/// FULL_BACKREF blocks and parent-keyed data refs).
+#[test]
+fn btrfs_rw_on_a_balanced_kernel_subvolume_bd_5elw6() {
+    run_shared_btrfs_rw_scenario(&SharedBtrfsScenario {
+        name: "btrfs_rw_balanced_kernel_subvolume",
+        files: 400,
+        nodesize: None,
+        snapshot: false,
+        balance: true,
+        target: SharedBtrfsTarget::Subvolume,
     });
 }
 
@@ -12512,10 +12666,26 @@ fn try_mount_btrfs_rw_with_options(
     mountpoint: &Path,
     mount_opts: &MountOptions,
 ) -> Option<ffs_harness::stale_mounts::MountGuard> {
+    try_mount_btrfs_rw_selection(
+        image,
+        mountpoint,
+        mount_opts,
+        BtrfsMountSelection::DefaultRoot,
+    )
+}
+
+/// Read-write FrankenFS mount of the subvolume or snapshot `selection` names.
+fn try_mount_btrfs_rw_selection(
+    image: &Path,
+    mountpoint: &Path,
+    mount_opts: &MountOptions,
+    selection: BtrfsMountSelection,
+) -> Option<ffs_harness::stale_mounts::MountGuard> {
     let cx = Cx::for_testing();
     let opts = OpenOptions {
         skip_validation: false,
         ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
+        btrfs_mount_selection: selection,
         ..OpenOptions::default()
     };
     let mut fs = OpenFs::open_with_options(&cx, image, &opts).expect("open btrfs image");

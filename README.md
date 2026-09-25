@@ -2165,7 +2165,7 @@ tail -F /var/log/ffs-home.scrub.jsonl | jq '
 # 6. To actually recover (requires --background-repair), unmount and remount with
 #    explicit repair permission. The mount stays read-only: repair on a read-only
 #    mount writes recovered blocks through the backing image directly. Writes
-#    (--rw) are refused for any subvolume other than the default one (bd-5elw6).
+#    (--rw) go to the selected subvolume; a read-only (-r) snapshot refuses them.
 sudo umount /mnt/home
 wait $MOUNT_PID 2>/dev/null
 
@@ -3719,7 +3719,7 @@ See [`FEATURE_PARITY.md`](FEATURE_PARITY.md) for the full capability matrix and 
 
 ### btrfs RW contract
 
-Btrfs RW selects the **durable commit path by default** as of bd-jdo53. Every rewritten tree block is written to both copies of a DUP chunk (bd-0mcvt), a data allocation that finds its block groups full grows a new data chunk from unallocated device space by default (bd-34blv; commit-time metadata chunk growth remains opt-in via `FFS_BTRFS_GROW_CHUNKS=1`, and `FFS_BTRFS_GROW_CHUNKS=0` disables both), and `--rw` is refused for any subvolume other than the default one (bd-5elw6). The commit sequence allocates real logical addresses from chunk-covered metadata block groups, rewrites internal child blockptrs, translates logical→physical via `map_logical_to_physical`, updates the FS_TREE ROOT_ITEM, commits EXTENT_TREE and ROOT_TREE, and patches the on-disk superblock in place. `scripts/e2e/ffs_btrfs_rw_durable_remount_e2e.sh` checks mutation survival across remount; its presence and historical results are not a fresh successful run. The statuses below describe intended implemented behavior, subject to current crash/remount verification.
+Btrfs RW selects the **durable commit path by default** as of bd-jdo53. Every rewritten tree block is written to both copies of a DUP chunk (bd-0mcvt), a data allocation that finds its block groups full grows a new data chunk from unallocated device space by default (bd-34blv; commit-time metadata chunk growth remains opt-in via `FFS_BTRFS_GROW_CHUNKS=1`, and `FFS_BTRFS_GROW_CHUNKS=0` disables both), and `--rw` works on the default subvolume, a `--subvol`, or a writable `--snapshot`, including ones the kernel snapshotted or balanced; a read-only snapshot refuses it (bd-5elw6). The commit sequence allocates real logical addresses from chunk-covered metadata block groups, rewrites internal child blockptrs, translates logical→physical via `map_logical_to_physical`, updates the FS_TREE ROOT_ITEM, commits EXTENT_TREE and ROOT_TREE, and patches the on-disk superblock in place. `scripts/e2e/ffs_btrfs_rw_durable_remount_e2e.sh` checks mutation survival across remount; its presence and historical results are not a fresh successful run. The statuses below describe intended implemented behavior, subject to current crash/remount verification.
 
 | Operation class | Status | Contract |
 |---|---|---|
