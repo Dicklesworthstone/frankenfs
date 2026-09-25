@@ -338,7 +338,17 @@ pub fn write_dx_root(
 
     // dx_root_info @ 0x18..0x20
     block[0x18..0x1C].copy_from_slice(&0_u32.to_le_bytes()); // reserved_zero
-    block[0x1C] = hash_version;
+    // The on-disk field holds the base algorithm only. The unsigned variants
+    // are a runtime resolution of the superblock's UNSIGNED_HASH flag (set by
+    // mkfs on unsigned-char hosts such as arm64); e2fsck rejects them on disk
+    // as "unsupported hash version". Callers hash with the effective version,
+    // so fold it back here.
+    block[0x1C] = match hash_version {
+        DX_HASH_LEGACY_UNSIGNED => DX_HASH_LEGACY,
+        DX_HASH_HALF_MD4_UNSIGNED => DX_HASH_HALF_MD4,
+        DX_HASH_TEA_UNSIGNED => DX_HASH_TEA,
+        base => base,
+    };
     block[0x1D] = 8; // info_length (parser-required)
     block[0x1E] = indirect_levels;
     block[0x1F] = 0; // unused_flags

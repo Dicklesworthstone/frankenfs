@@ -84699,6 +84699,106 @@ mod tests {
         );
     }
 
+    /// mke2fs on an unsigned-char host (arm64) sets the superblock's
+    /// UNSIGNED_HASH flag. Directories FrankenFS converted to htree stored the
+    /// runtime-resolved unsigned version (4) in dx_root, which e2fsck rejects
+    /// ("unsupported hash version (4)") — found by the arm64 CI runner. The
+    /// flag is set here by hand so the case runs on any host.
+    #[test]
+    fn ext4_htree_on_unsigned_hash_image_stores_the_base_hash_version() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let image = tmp.path().join("unsigned.ext4");
+        std::fs::File::create(&image)
+            .and_then(|f| f.set_len(64 * 1024 * 1024))
+            .expect("size image");
+        let made = std::process::Command::new("mke2fs")
+            .args(["-q", "-t", "ext4", "-b", "4096", "-F"])
+            .arg(&image)
+            .output();
+        if !made.is_ok_and(|o| o.status.success()) {
+            oracle_unavailable("mke2fs (e2fsprogs)");
+            return;
+        }
+        let flagged = std::process::Command::new("debugfs")
+            .args(["-w", "-R", "ssv flags 2"])
+            .arg(&image)
+            .output();
+        if !flagged.is_ok_and(|o| o.status.success()) {
+            oracle_unavailable("debugfs");
+            return;
+        }
+
+        let cx = Cx::for_testing();
+        let dev = TestDevice::from_vec(std::fs::read(&image).expect("read image"));
+        let mut fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default())
+            .expect("open image");
+        assert!(
+            fs.ext4_superblock()
+                .expect("sb")
+                .has_super_flag(ffs_ondisk::ext4::Ext4SuperFlags::UNSIGNED_HASH),
+            "setup: the image must carry UNSIGNED_HASH"
+        );
+        fs.enable_writes(&cx).expect("enable writes");
+        let dir = fs
+            .mkdir(&cx, InodeNumber(2), OsStr::new("big"), 0o755, 0, 0)
+            .expect("mkdir");
+        for index in 0..400 {
+            fs.create(
+                &cx,
+                dir.ino,
+                OsStr::new(&format!("entry-{index:04}")),
+                0o644,
+                0,
+                0,
+            )
+            .expect("create");
+        }
+        fs.fsync(&cx, dir.ino, 0, false).expect("fsyncdir");
+        drop(fs);
+        let bytes = dev.snapshot_bytes();
+
+        let reopened = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(bytes.clone())),
+            &OpenOptions::default(),
+        )
+        .expect("reopen");
+        let big = reopened
+            .lookup(&cx, InodeNumber(2), OsStr::new("big"))
+            .expect("lookup big");
+        let big_inode = reopened.read_inode(&cx, big.ino).expect("read big");
+        assert!(
+            big_inode.flags & ffs_types::EXT4_INDEX_FL != 0,
+            "setup: 400 entries must have converted the directory to htree"
+        );
+        let dx_root_block = reopened
+            .collect_extents(&cx, &big_inode)
+            .expect("collect extents")
+            .iter()
+            .find(|extent| extent.logical_block == 0)
+            .map(|extent| extent.physical_start)
+            .expect("logical block 0 is mapped");
+        let root_block = reopened
+            .read_block_vec(&cx, BlockNumber(dx_root_block))
+            .expect("read dx_root block");
+        assert_eq!(
+            root_block[0x1C], 1,
+            "dx_root must store half_md4 (1), not the unsigned variant"
+        );
+        for index in [0, 199, 399] {
+            reopened
+                .lookup(&cx, big.ino, OsStr::new(&format!("entry-{index:04}")))
+                .expect("htree lookup must resolve with the unsigned hash");
+        }
+        drop(reopened);
+
+        std::fs::write(&image, bytes).expect("write result");
+        let Some((clean, output)) = run_e2fsck(&image) else {
+            return;
+        };
+        assert!(clean, "e2fsck must accept the htree directory:\n{output}");
+    }
+
     fn open_ext4_mke2fs(
         size_mb: u64,
         with_csum: bool,
