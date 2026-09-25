@@ -3,6 +3,7 @@
 //! evidence of a power-loss test or a mounted filesystem certification.
 
 use super::*;
+use crate::compression::VersionData;
 use std::path::PathBuf;
 use std::sync::Arc;
 use tempfile::{TempDir, tempdir};
@@ -43,7 +44,10 @@ fn checkpoint_directory_sync_precedes_horizon_and_holds_both_guards() {
                 store.store.try_write().is_none(),
                 "snapshot must stay pinned"
             );
-            assert!(store.wal.try_write().is_none(), "WAL health must stay pinned");
+            assert!(
+                store.wal.try_write().is_none(),
+                "WAL health must stay pinned"
+            );
             directory.sync_all()
         })
         .expect("durable checkpoint");
@@ -302,4 +306,223 @@ fn concurrent_checkpoint_publication_keeps_a_valid_complete_snapshot() {
         reopened.read_visible(BlockNumber(1), reopened.current_snapshot()),
         Some(vec![1; 128])
     );
+}
+
+fn checkpoint_version(seq: u64, data: VersionData) -> BlockVersion {
+    BlockVersion {
+        block: BlockNumber(7),
+        commit_seq: CommitSeq(seq),
+        writer: ffs_types::TxnId(seq),
+        data,
+    }
+}
+
+#[test]
+fn corrupt_history_cannot_replace_a_checkpoint_or_authorize_wal_truncation() {
+    for invalid in [
+        VersionData::Zstd(vec![0xFF, 0, 0x12, 0x34, 0x56, 0x78]),
+        VersionData::Brotli(vec![0xFF; 8]),
+        VersionData::Identical,
+    ] {
+        let (_directory, wal, checkpoint, store) = fixture();
+        commit_block(&store, 7, 7);
+        store.checkpoint(&checkpoint).expect("valid checkpoint");
+        commit_block(&store, 7, 8);
+        let old_checkpoint = std::fs::read(&checkpoint).unwrap();
+        let old_wal = std::fs::read(&wal).unwrap();
+        // Keep the latest version valid: an unreadable historical version is
+        // still part of the checkpoint and must not be silently replaced.
+        {
+            let mut guard = store.store.write();
+            guard.versions.get_mut(&BlockNumber(7)).unwrap()[0].data = invalid;
+        }
+        let mut reached_publication = false;
+        let error = store
+            .checkpoint_with_directory_sync(&checkpoint, |_| {
+                reached_publication = true;
+                Ok(())
+            })
+            .expect_err("invalid data must fail before publication");
+        assert!(matches!(error, FfsError::Corruption { block: 7, .. }));
+        assert!(!reached_publication);
+        assert_eq!(store.wal_stats().checkpoints_created, 1);
+        assert_eq!(store.wal_stats().checkpoint_commit_seq, 1);
+        store.truncate_wal().expect_err("checkpoint is still stale");
+        assert_eq!(std::fs::read(&checkpoint).unwrap(), old_checkpoint);
+        assert_eq!(std::fs::read(&wal).unwrap(), old_wal);
+        drop(store);
+
+        let restored = PersistentMvccStore::open(&Cx::for_testing(), &wal).unwrap();
+        let mut snapshot = restored.current_snapshot();
+        assert_eq!(snapshot.high, CommitSeq(2));
+        assert_eq!(
+            restored.read_visible(BlockNumber(7), snapshot),
+            Some(vec![8; 128])
+        );
+        snapshot.high = CommitSeq(1);
+        assert_eq!(
+            restored.read_visible(BlockNumber(7), snapshot),
+            Some(vec![7; 128])
+        );
+    }
+}
+
+#[test]
+fn checkpoint_stream_roundtrips_compression_dedup_and_genuinely_empty_versions() {
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("mixed.ckpt");
+    let payload = vec![0x5A; 512];
+    let compressed = zstd::encode_all(payload.as_slice(), 1).unwrap();
+    let mut brotli = Vec::new();
+    brotli::CompressorReader::new(payload.as_slice(), 4096, 4, 22)
+        .read_to_end(&mut brotli)
+        .unwrap();
+    let chain = vec![
+        checkpoint_version(1, VersionData::full(payload.clone())),
+        checkpoint_version(2, VersionData::Identical),
+        checkpoint_version(3, VersionData::full(Vec::new())),
+        checkpoint_version(4, VersionData::Identical),
+        checkpoint_version(5, VersionData::Zstd(compressed)),
+        checkpoint_version(6, VersionData::Brotli(brotli)),
+    ];
+    let mut bytes = Vec::new();
+    write_checkpoint(&mut bytes, 7, 7, &[(BlockNumber(7), &chain)]).unwrap();
+    std::fs::write(&path, bytes).unwrap();
+    let mut restored = MvccStore::new();
+    load_checkpoint(&path, &mut restored).unwrap();
+    assert_eq!(restored.version_count(), 6);
+    assert_eq!(restored.next_txn, 7);
+    assert_eq!(restored.current_snapshot().high, CommitSeq(6));
+    for seq in 1..=6 {
+        let mut snapshot = restored.current_snapshot();
+        snapshot.high = CommitSeq(seq);
+        let expected = if (3..=4).contains(&seq) {
+            &[][..]
+        } else {
+            &payload[..]
+        };
+        assert_eq!(
+            restored.read_visible(BlockNumber(7), snapshot).as_deref(),
+            Some(expected)
+        );
+    }
+}
+
+struct ShortCheckpointSink {
+    bytes: Vec<u8>,
+    fail_at: usize,
+}
+
+impl Write for ShortCheckpointSink {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        assert!(bytes.len() <= CHECKPOINT_IO_CHUNK_BYTES);
+        if self.bytes.len() >= self.fail_at {
+            return Err(std::io::Error::other("injected checkpoint write failure"));
+        }
+        let count = bytes.len().min(17).min(self.fail_at - self.bytes.len());
+        self.bytes.extend_from_slice(&bytes[..count]);
+        Ok(count)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+#[test]
+fn checkpoint_stream_bounds_write_requests_and_handles_short_writes() {
+    let payload = vec![0xA7; 3 * CHECKPOINT_IO_CHUNK_BYTES + 17];
+    let chain = vec![checkpoint_version(1, VersionData::full(payload.clone()))];
+    let mut sink = ShortCheckpointSink {
+        bytes: Vec::new(),
+        fail_at: usize::MAX,
+    };
+    write_checkpoint(&mut sink, 2, 2, &[(BlockNumber(7), &chain)]).unwrap();
+    let crc_offset = sink.bytes.len() - 4;
+    let stored_crc = u32::from_le_bytes(sink.bytes[crc_offset..].try_into().unwrap());
+    assert_eq!(stored_crc, crc32c::crc32c(&sink.bytes[..crc_offset]));
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("large.ckpt");
+    std::fs::write(&path, sink.bytes).unwrap();
+    let mut restored = MvccStore::new();
+    load_checkpoint(&path, &mut restored).unwrap();
+    assert_eq!(
+        restored
+            .read_visible(BlockNumber(7), restored.current_snapshot())
+            .as_deref(),
+        Some(payload.as_slice())
+    );
+}
+
+#[test]
+fn checkpoint_stream_propagates_write_failure_at_every_byte_boundary() {
+    let chain = vec![
+        checkpoint_version(1, VersionData::full(vec![0xA7; 31])),
+        checkpoint_version(2, VersionData::Identical),
+    ];
+    let versions = [(BlockNumber(7), chain.as_slice())];
+    let mut expected = Vec::new();
+    write_checkpoint(&mut expected, 3, 3, &versions).unwrap();
+    for fail_at in 0..expected.len() {
+        let mut sink = ShortCheckpointSink {
+            bytes: Vec::new(),
+            fail_at,
+        };
+        let error = write_checkpoint(&mut sink, 3, 3, &versions).unwrap_err();
+        assert!(matches!(error, FfsError::Io(_)));
+        assert_eq!(sink.bytes, expected[..fail_at]);
+    }
+}
+
+#[test]
+fn checkpoint_writer_refuses_invalid_identity_order_and_counter_horizons() {
+    let valid = checkpoint_version(1, VersionData::full(vec![7]));
+    let mut wrong_block = valid.clone();
+    wrong_block.block = BlockNumber(8);
+    let mut wrong_writer = valid.clone();
+    wrong_writer.writer = ffs_types::TxnId(3);
+    for (next_txn, next_commit, chain) in [
+        (0, 3, vec![valid.clone()]),
+        (3, 0, vec![valid.clone()]),
+        (3, 1, vec![valid.clone()]),
+        (1, 3, vec![valid.clone()]),
+        (3, 3, vec![wrong_block]),
+        (3, 3, vec![wrong_writer]),
+        (3, 3, vec![valid.clone(), valid.clone()]),
+        (3, 3, vec![checkpoint_version(0, VersionData::full(vec![7]))]),
+        (3, 3, vec![checkpoint_version(1, VersionData::Identical)]),
+        (3, 3, Vec::new()),
+    ] {
+        let error = write_checkpoint(
+            &mut Vec::new(),
+            next_txn,
+            next_commit,
+            &[(BlockNumber(7), &chain)],
+        )
+        .unwrap_err();
+        assert!(matches!(error, FfsError::Corruption { .. }));
+    }
+    let chain = [valid];
+    let duplicate = [(BlockNumber(7), chain.as_slice()); 2];
+    assert!(write_checkpoint(&mut Vec::new(), 3, 3, &duplicate).is_err());
+}
+
+#[test]
+fn checkpoint_publication_borrows_pinned_version_data_instead_of_cloning_it() {
+    let (_directory, _wal, checkpoint, store) = fixture();
+    commit_block(&store, 7, 7);
+    let bytes = {
+        let guard = store.store.read();
+        let VersionData::Full(bytes) = &guard.versions[&BlockNumber(7)][0].data else {
+            panic!("default policy stores full data");
+        };
+        Arc::clone(bytes)
+    };
+    let owners_before = Arc::strong_count(&bytes);
+    store
+        .checkpoint_with_directory_sync(&checkpoint, |directory| {
+            assert_eq!(Arc::strong_count(&bytes), owners_before);
+            directory.sync_all()
+        })
+        .unwrap();
 }

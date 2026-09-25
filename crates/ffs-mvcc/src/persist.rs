@@ -167,6 +167,9 @@ const CHECKPOINT_VERSION: u16 = 1;
 /// Checkpoint file header size in bytes.
 const CHECKPOINT_HEADER_SIZE: usize = 28;
 
+/// Bound individual checkpoint reads/writes without buffering a whole snapshot.
+const CHECKPOINT_IO_CHUNK_BYTES: usize = 64 * 1024;
+
 /// Persistent MVCC store with WAL durability.
 ///
 /// This wrapper adds durability to `MvccStore` by writing committed versions
@@ -631,10 +634,12 @@ impl PersistentMvccStore {
         // the golden checkpoint + any cross-run/replay comparison depend on it.
         // (93ee0569 added the flush-path sort but missed this checkpoint one,
         // leaving `checkpoint_golden_report` failing on main. bd-mvcckptsort.)
-        let mut versions_snapshot: Vec<(BlockNumber, Vec<BlockVersion>)> = store_guard
+        // The read guard pins the chains through publication. Borrow them:
+        // cloning compressed histories duplicates their payloads for no benefit.
+        let mut versions_snapshot: Vec<(BlockNumber, &[BlockVersion])> = store_guard
             .versions
             .iter()
-            .map(|(k, v)| (*k, v.clone()))
+            .map(|(k, v)| (*k, v.as_slice()))
             .collect();
         versions_snapshot.sort_unstable_by_key(|(block, _)| *block);
 
@@ -670,6 +675,7 @@ impl PersistentMvccStore {
             stats.checkpoint_commit_seq = next_commit.saturating_sub(1);
         }
 
+        drop(versions_snapshot);
         drop(wal_guard);
         drop(store_guard);
 
@@ -855,14 +861,17 @@ fn rollback_in_memory_commit(
     store.next_commit = commit_seq.0;
 }
 
-/// Write a checkpoint to a writer.
+/// Stream the existing v1 format. Only the currently materialized version is
+/// owned; the sorted chain references and caller's output buffer are separate.
+/// Failed decoding must never become a valid, checksummed empty block.
 fn write_checkpoint(
-    writer: &mut BufWriter<File>,
+    writer: &mut impl Write,
     next_txn: u64,
     next_commit: u64,
-    versions: &[(BlockNumber, Vec<BlockVersion>)],
+    versions: &[(BlockNumber, &[BlockVersion])],
 ) -> Result<()> {
-    let mut checkpoint = Vec::with_capacity(checkpoint_payload_capacity(versions));
+    validate_checkpoint_counters(next_txn, next_commit)?;
+    let mut hasher = Crc32cHasher::new();
 
     // Header
     let mut header = [0_u8; CHECKPOINT_HEADER_SIZE];
@@ -875,65 +884,108 @@ fn write_checkpoint(
         .map_err(|_| FfsError::Format("too many blocks for checkpoint".to_owned()))?;
     header[24..28].copy_from_slice(&num_blocks.to_le_bytes());
 
-    checkpoint.extend_from_slice(&header);
+    hasher.write_all(writer, &header)?;
 
     // Each block and its versions
+    let mut previous_block = None;
     for (block, block_versions) in versions {
-        let block_bytes = block.0.to_le_bytes();
-        checkpoint.extend_from_slice(&block_bytes);
+        if previous_block.is_some_and(|previous| previous >= *block) {
+            return Err(checkpoint_corruption(
+                *block,
+                "duplicate or unordered block entry",
+            ));
+        }
+        previous_block = Some(*block);
+        if block_versions.is_empty() {
+            return Err(checkpoint_corruption(*block, "empty version chain"));
+        }
+        hasher.write_all(writer, &block.0.to_le_bytes())?;
 
         let num_versions = u32::try_from(block_versions.len())
             .map_err(|_| FfsError::Format("too many versions for block".to_owned()))?;
-        let num_versions_bytes = num_versions.to_le_bytes();
-        checkpoint.extend_from_slice(&num_versions_bytes);
+        hasher.write_all(writer, &num_versions.to_le_bytes())?;
 
+        let mut previous_seq = None;
         for (vi, version) in block_versions.iter().enumerate() {
-            let commit_seq_bytes = version.commit_seq.0.to_le_bytes();
-            checkpoint.extend_from_slice(&commit_seq_bytes);
-
-            let txn_id_bytes = version.writer.0.to_le_bytes();
-            checkpoint.extend_from_slice(&txn_id_bytes);
+            validate_checkpoint_version(
+                *block,
+                version,
+                previous_seq,
+                next_txn,
+                next_commit,
+            )?;
+            previous_seq = Some(version.commit_seq.0);
+            hasher.write_all(writer, &version.commit_seq.0.to_le_bytes())?;
+            hasher.write_all(writer, &version.writer.0.to_le_bytes())?;
 
             if version.data.is_identical() {
-                let data_len_bytes = u32::MAX.to_le_bytes();
-                checkpoint.extend_from_slice(&data_len_bytes);
+                // Validation rejects a root marker. Every preceding concrete
+                // version has already been decoded successfully by this loop.
+                hasher.write_all(writer, &u32::MAX.to_le_bytes())?;
                 continue;
             }
 
-            // Materialize compressed data: resolve Identical markers before writing.
             let materialized =
                 crate::compression::resolve_data_with(block_versions, vi, |v| &v.data)
-                    .unwrap_or(std::borrow::Cow::Borrowed(&[]));
+                    .ok_or_else(|| checkpoint_corruption(*block, "version decompression failed"))?;
 
             let data_len = u32::try_from(materialized.len())
                 .map_err(|_| FfsError::Format("version data too large".to_owned()))?;
-            let data_len_bytes = data_len.to_le_bytes();
-            checkpoint.extend_from_slice(&data_len_bytes);
-
-            checkpoint.extend_from_slice(&materialized);
+            if data_len == u32::MAX {
+                return Err(checkpoint_corruption(
+                    *block,
+                    "data length uses the dedup marker",
+                ));
+            }
+            hasher.write_all(writer, &data_len.to_le_bytes())?;
+            hasher.write_all(writer, &materialized)?;
         }
     }
 
-    // Trailing CRC
-    let crc = crc32c::crc32c(&checkpoint);
-    checkpoint.extend_from_slice(&crc.to_le_bytes());
-    writer.write_all(&checkpoint)?;
-
+    writer.write_all(&hasher.finalize().to_le_bytes())?;
     Ok(())
 }
 
-fn checkpoint_payload_capacity(versions: &[(BlockNumber, Vec<BlockVersion>)]) -> usize {
-    let mut capacity = CHECKPOINT_HEADER_SIZE + 4;
-    for (_, block_versions) in versions {
-        capacity = capacity.saturating_add(12);
-        for version in block_versions {
-            capacity = capacity.saturating_add(20);
-            if !version.data.is_identical() {
-                capacity = capacity.saturating_add(version.data.memory_bytes());
-            }
-        }
+fn checkpoint_corruption(block: BlockNumber, detail: &str) -> FfsError {
+    FfsError::Corruption {
+        block: block.0,
+        detail: format!("invalid checkpoint: {detail}"),
     }
-    capacity
+}
+
+fn validate_checkpoint_counters(next_txn: u64, next_commit: u64) -> Result<()> {
+    // MAX is a valid exhausted next-counter, but never a stored version ID.
+    if next_txn == 0 || next_commit == 0 {
+        return Err(checkpoint_corruption(BlockNumber(0), "zero next-counter"));
+    }
+    Ok(())
+}
+
+fn validate_checkpoint_version(
+    block: BlockNumber,
+    version: &BlockVersion,
+    previous_seq: Option<u64>,
+    next_txn: u64,
+    next_commit: u64,
+) -> Result<()> {
+    if version.block != block
+        || version.commit_seq.0 == 0
+        || version.commit_seq.0 >= next_commit
+        || version.writer.0 >= next_txn
+        || previous_seq.is_some_and(|seq| seq >= version.commit_seq.0)
+    {
+        return Err(checkpoint_corruption(
+            block,
+            "invalid version identity or sequence",
+        ));
+    }
+    if previous_seq.is_none() && version.data.is_identical() {
+        return Err(checkpoint_corruption(
+            block,
+            "dedup marker without a base version",
+        ));
+    }
+    Ok(())
 }
 
 /// Read a single block version from a checkpoint stream.
@@ -1110,6 +1162,14 @@ impl Crc32cHasher {
 
     fn update(&mut self, data: &[u8]) {
         self.crc = crc32c::crc32c_append(self.crc, data);
+    }
+
+    fn write_all(&mut self, writer: &mut impl Write, data: &[u8]) -> Result<()> {
+        for chunk in data.chunks(CHECKPOINT_IO_CHUNK_BYTES) {
+            writer.write_all(chunk)?;
+            self.update(chunk);
+        }
+        Ok(())
     }
 
     fn finalize(self) -> u32 {
