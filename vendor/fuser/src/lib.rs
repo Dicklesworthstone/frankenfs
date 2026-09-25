@@ -20,6 +20,7 @@ use std::time::SystemTime;
 use std::{convert::AsRef, io::ErrorKind};
 
 pub use crate::affinity::pin_current_thread_to_one_cpu;
+pub use crate::interrupt::{RequestInterrupt, current_read_request_interrupt};
 pub use crate::ll::fuse_abi::FUSE_ROOT_ID;
 use crate::ll::fuse_abi::consts::*;
 pub use crate::ll::{TimeOrNow, fuse_abi::consts};
@@ -56,6 +57,7 @@ use std::cmp::min;
 pub mod affinity;
 /// The `/dev/fuse` character-device request channel.
 pub mod channel;
+mod interrupt;
 #[cfg(target_os = "linux")]
 mod io_uring;
 mod ll;
@@ -814,7 +816,7 @@ pub trait Filesystem {
 
     /// Acquire, modify or release a POSIX file lock.
     /// For POSIX threads (NPTL) there's a 1-1 relation between pid and owner, but
-    /// otherwise this is not always the case.  For checking lock ownership,
+    /// otherwise this is not always the case. For checking lock ownership,
     /// 'fi->owner' must be used. The l_pid field in 'struct flock' should only be
     /// used to fill in this field in getlk(). Note: if the locking methods are not
     /// implemented, the kernel will still allow file locking to work locally.

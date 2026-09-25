@@ -24,6 +24,7 @@ use std::{
 
 use crate::Filesystem;
 use crate::MountOption;
+use crate::interrupt::InterruptRegistry;
 use crate::ll::fuse_abi as abi;
 use crate::request::Request;
 use crate::{channel::Channel, mnt::Mount};
@@ -420,6 +421,8 @@ pub struct Session<FS: Filesystem> {
     pub(crate) destroyed: bool,
     /// One-shot destroy guard shared by classic and io_uring workers.
     pub(crate) destroy_called: Arc<AtomicBool>,
+    /// Original requests still awaiting replies on this connection.
+    pub(crate) interrupts: Arc<InterruptRegistry>,
     /// Only the mount-owning session runs `Filesystem::destroy` from `Drop`.
     destroy_on_drop: bool,
     /// Serialize filesystem callbacks when transport workers are concurrent.
@@ -496,6 +499,7 @@ impl<FS: Filesystem> Session<FS> {
             initialized: false,
             destroyed: false,
             destroy_called: Arc::new(AtomicBool::new(false)),
+            interrupts: Arc::new(InterruptRegistry::default()),
             destroy_on_drop: true,
             dispatch_lock: None,
             dispatch_gate: None,
@@ -522,6 +526,7 @@ impl<FS: Filesystem> Session<FS> {
             initialized: false,
             destroyed: false,
             destroy_called: Arc::new(AtomicBool::new(false)),
+            interrupts: Arc::new(InterruptRegistry::default()),
             destroy_on_drop: true,
             dispatch_lock: None,
             dispatch_gate: None,
@@ -534,6 +539,14 @@ impl<FS: Filesystem> Session<FS> {
     }
 
     fn dispatch_request(&mut self, req: &Request<'_>) {
+        if !req.register_interrupt(&self.interrupts) {
+            return;
+        }
+        // Waiting for a gate held by the original request would prevent the
+        // cancellation notification from ever reaching that request.
+        if req.is_interrupt() {
+            return req.dispatch(self);
+        }
         let dispatch_lock = self.dispatch_lock.clone();
         if let Some(lock) = dispatch_lock {
             let _guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -614,8 +627,15 @@ impl<FS: Filesystem> Session<FS> {
         match self.ch.receive(buf) {
             Ok(size) => {
                 let bytes = buf[..size].to_vec();
-                let file_handle = Request::new(self.ch.sender(), &bytes)
-                    .and_then(|request| request.ordering_file_handle());
+                let Some(request) = Request::new(self.ch.sender(), &bytes) else {
+                    return Ok(false);
+                };
+                if request.is_interrupt() {
+                    self.dispatch_request(&request);
+                    return Ok(true);
+                }
+                let file_handle = request.ordering_file_handle();
+                drop(request);
                 let requesting_lane = scheduler.lane_for_cpu(self.current_cpu());
                 scheduler.enqueue(requesting_lane, bytes, file_handle);
                 Ok(true)
@@ -805,6 +825,7 @@ impl<FS: Filesystem> Session<FS> {
             initialized: self.initialized,
             destroyed: self.destroyed,
             destroy_called: Arc::clone(&self.destroy_called),
+            interrupts: Arc::clone(&self.interrupts),
             destroy_on_drop: false,
             dispatch_lock: self.dispatch_lock.clone(),
             dispatch_gate: self.dispatch_gate.clone(),
@@ -866,6 +887,7 @@ impl<FS: Filesystem> Session<FS> {
             initialized: self.initialized,
             destroyed: self.destroyed,
             destroy_called: Arc::clone(&self.destroy_called),
+            interrupts: Arc::clone(&self.interrupts),
             destroy_on_drop: false,
             dispatch_lock: self.dispatch_lock.clone(),
             dispatch_gate: self.dispatch_gate.clone(),
@@ -899,6 +921,10 @@ impl<FS: Filesystem> Session<FS> {
         Notifier::new(self.ch.sender())
     }
 }
+
+#[cfg(test)]
+#[path = "interrupt_dispatch_tests.rs"]
+mod interrupt_dispatch_tests;
 
 #[derive(Clone, Debug)]
 /// A thread-safe object that can be used to unmount a Filesystem
