@@ -586,8 +586,11 @@ impl BlockValidator for Ext4SuperblockValidator {
 pub enum Ext4OwnedBlock {
     /// An extent-tree index or leaf block (checksum seeded by owner ino + generation).
     ExtentNode { ino: u32, generation: u32 },
-    /// A directory data block; verified only when it carries a checksum tail.
+    /// A directory data block: a leaf ending in the checksum-tail dirent, or an
+    /// htree interior node (one inode-0 dirent spanning the block, `dx_tail`).
     DirLeaf { ino: u32, generation: u32 },
+    /// Logical block 0 of an htree (`EXT4_INDEX_FL`) directory: the dx_root.
+    DxRoot { ino: u32, generation: u32 },
     /// An external extended-attribute block (checksum seeded by block number).
     Xattr,
 }
@@ -877,21 +880,61 @@ impl BlockValidator for Ext4MetadataValidator {
                 }
             }
             Ext4MetaBlock::Owned(Ext4OwnedBlock::DirLeaf { ino, generation }) => {
-                // Only a block ending in the 12-byte checksum tail dirent
-                // (inode 0, rec_len 12, name_len 0, type 0xDE) can be checked;
-                // htree index blocks carry a different tail and are skipped.
+                // On metadata_csum every directory block is checksummed: a leaf
+                // ends in the 12-byte tail dirent (inode 0, rec_len 12, name_len
+                // 0, type 0xDE); an htree interior node is one inode-0 dirent
+                // spanning the whole block with a dx_tail. A block that is
+                // neither lost its checksum — damage, not an exemption.
                 let tail = bytes.len().checked_sub(12).and_then(|t| bytes.get(t..));
                 let has_tail = tail.is_some_and(|t| {
                     t[0..4] == [0, 0, 0, 0] && t[4..6] == [12, 0] && t[6] == 0 && t[7] == 0xDE
                 });
-                if !has_tail
-                    || ffs_ondisk::ext4::verify_dir_block_checksum(bytes, seed, *ino, *generation)
+                let dx_node = bytes.len() >= 12
+                    && bytes[0..4] == [0, 0, 0, 0]
+                    && usize::from(u16::from_le_bytes([bytes[4], bytes[5]])) == bytes.len()
+                    && bytes[6] == 0;
+                if has_tail {
+                    if ffs_ondisk::ext4::verify_dir_block_checksum(bytes, seed, *ino, *generation)
                         .is_ok()
-                {
+                    {
+                        BlockVerdict::Clean
+                    } else {
+                        Self::checksum_issue(format!(
+                            "ext4 directory block checksum mismatch in block {block} (inode {ino})"
+                        ))
+                    }
+                } else if dx_node {
+                    if ffs_ondisk::ext4::verify_dx_block_checksum(
+                        bytes,
+                        seed,
+                        *ino,
+                        *generation,
+                        ffs_ondisk::ext4::DX_NODE_COUNT_OFFSET,
+                    ) {
+                        BlockVerdict::Clean
+                    } else {
+                        Self::checksum_issue(format!(
+                            "ext4 htree node checksum mismatch in block {block} (inode {ino})"
+                        ))
+                    }
+                } else {
+                    Self::checksum_issue(format!(
+                        "ext4 directory block {block} (inode {ino}) has no checksum tail"
+                    ))
+                }
+            }
+            Ext4MetaBlock::Owned(Ext4OwnedBlock::DxRoot { ino, generation }) => {
+                if ffs_ondisk::ext4::verify_dx_block_checksum(
+                    bytes,
+                    seed,
+                    *ino,
+                    *generation,
+                    ffs_ondisk::ext4::DX_ROOT_COUNT_OFFSET,
+                ) {
                     BlockVerdict::Clean
                 } else {
                     Self::checksum_issue(format!(
-                        "ext4 directory block checksum mismatch in block {block} (inode {ino})"
+                        "ext4 htree root checksum mismatch in block {block} (inode {ino})"
                     ))
                 }
             }

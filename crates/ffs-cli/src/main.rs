@@ -8806,12 +8806,16 @@ fn ext4_inode_owned_blocks(cx: &Cx, fs: &OpenFs) -> Vec<(u64, ffs_repair::scrub:
             if inode.is_dir()
                 && let Ok(extents) = fs.collect_extents(cx, &inode)
             {
+                let indexed = inode.flags & ffs_types::EXT4_INDEX_FL != 0;
                 for extent in extents {
                     for n in 0..u64::from(extent.actual_len()) {
-                        out.push((
-                            extent.physical_start.saturating_add(n),
-                            Ext4OwnedBlock::DirLeaf { ino, generation },
-                        ));
+                        let logical = u64::from(extent.logical_block).saturating_add(n);
+                        let kind = if indexed && logical == 0 {
+                            Ext4OwnedBlock::DxRoot { ino, generation }
+                        } else {
+                            Ext4OwnedBlock::DirLeaf { ino, generation }
+                        };
+                        out.push((extent.physical_start.saturating_add(n), kind));
                     }
                 }
             }
@@ -17353,6 +17357,200 @@ mod tests {
         assert!(limitations.iter().any(|limitation| {
             limitation.contains("found no stale btrfs groups; running full scrub")
         }));
+    }
+
+    /// Scrub an image file with the offline ext4 validator (what `ffs scrub`,
+    /// `ffs fsck` and `ffs repair` use).
+    fn offline_scrub_bd_jufod(path: &std::path::Path) -> ffs_repair::scrub::ScrubReport {
+        let cx = crate::cli_cx();
+        let bytes = std::fs::read(path).expect("read image");
+        let sb = ffs_ondisk::Ext4Superblock::parse_from_image(&bytes).expect("superblock");
+        let block_dev = ffs_block::ByteBlockDevice::new(
+            ffs_block::FileByteDevice::open(path).expect("open image"),
+            sb.block_size,
+        )
+        .expect("block device");
+        let validator =
+            super::offline_ext4_scrub_validator(&cx, path, &block_dev, &sb).expect("validator");
+        ffs_repair::scrub::Scrubber::new(&block_dev, &*validator)
+            .scrub_all(&cx)
+            .expect("scrub")
+    }
+
+    /// bd-jufod: htree directories are fully checksum-verified. The dx_root
+    /// (logical block 0 of an indexed directory) and interior nodes carry a
+    /// dx_tail; before, both were skipped, and so was any leaf whose tail
+    /// dirent was itself damaged. An e2fsprogs-indexed directory must scrub
+    /// clean, damage to its root or to a leaf's tail marker must be reported,
+    /// and a directory FrankenFS itself converted to htree must scrub clean.
+    #[test]
+    fn ext4_scrub_verifies_htree_root_nodes_and_leaf_tails_bd_jufod() {
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(src.join("big")).expect("src tree");
+        for index in 0..600 {
+            std::fs::write(src.join("big").join(format!("entry-{index:04}.dat")), b"x")
+                .expect("seed file");
+        }
+        let image = dir.path().join("htree.ext4");
+        std::fs::File::create(&image)
+            .and_then(|f| f.set_len(32 * 1024 * 1024))
+            .expect("sparse image");
+        let formatted = std::process::Command::new("mke2fs")
+            .args([
+                "-q",
+                "-F",
+                "-t",
+                "ext4",
+                "-O",
+                "metadata_csum",
+                "-b",
+                "4096",
+                "-d",
+            ])
+            .arg(&src)
+            .arg(&image)
+            .status();
+        let indexed = std::process::Command::new("e2fsck")
+            .args(["-fyD"])
+            .arg(&image)
+            .status();
+        if !formatted.is_ok_and(|s| s.success()) || indexed.is_err() {
+            assert!(
+                std::env::var_os("FFS_REQUIRE_ORACLES").is_none_or(|v| v != "1"),
+                "FFS_REQUIRE_ORACLES=1 but mke2fs/e2fsck is unavailable"
+            );
+            eprintln!("SKIP bd-jufod: e2fsprogs unavailable");
+            return;
+        }
+        let cx = crate::cli_cx();
+        // Locate the indexed directory's root and a leaf block.
+        let (root_block, leaf_block) = {
+            let fs = super::OpenFs::open_with_options(
+                &cx,
+                &image,
+                &super::OpenOptions {
+                    ext4_journal_replay_mode: super::Ext4JournalReplayMode::Skip,
+                    ..super::OpenOptions::default()
+                },
+            )
+            .expect("open image");
+            let big = fs
+                .lookup(&cx, ffs_types::InodeNumber(2), std::ffi::OsStr::new("big"))
+                .expect("lookup big");
+            let inode = fs.read_inode(&cx, big.ino).expect("read big");
+            assert!(
+                inode.flags & ffs_types::EXT4_INDEX_FL != 0,
+                "setup: e2fsck -D must have indexed the directory"
+            );
+            let extents = fs.collect_extents(&cx, &inode).expect("extents");
+            let physical = |logical: u32| {
+                extents
+                    .iter()
+                    .find(|e| {
+                        logical >= e.logical_block
+                            && logical < e.logical_block + u32::from(e.actual_len())
+                    })
+                    .map(|e| e.physical_start + u64::from(logical - e.logical_block))
+                    .expect("mapped block")
+            };
+            (physical(0), physical(1))
+        };
+        let clean = std::fs::read(&image).expect("read image");
+        let report = offline_scrub_bd_jufod(&image);
+        assert_eq!(
+            report.blocks_corrupt, 0,
+            "an e2fsprogs-indexed directory must scrub clean: {:?}",
+            report.findings
+        );
+
+        let bs = 4096_usize;
+        let damage = |block: u64, offset: usize| {
+            let mut bytes = clean.clone();
+            bytes[usize::try_from(block).expect("fits") * bs + offset] ^= 0x01;
+            std::fs::write(&image, bytes).expect("write damaged image");
+            offline_scrub_bd_jufod(&image)
+        };
+        // A hash in the dx_root's entry array (entries start at 0x28).
+        let report = damage(root_block, 0x2C);
+        assert!(
+            report.findings.iter().any(|f| f.block.0 == root_block),
+            "a damaged htree root must be reported: {:?}",
+            report.findings
+        );
+        // The 0xDE marker of the leaf's checksum tail dirent.
+        let report = damage(leaf_block, bs - 12 + 7);
+        assert!(
+            report.findings.iter().any(|f| f.block.0 == leaf_block),
+            "a leaf whose checksum tail is damaged must be reported: {:?}",
+            report.findings
+        );
+
+        // FrankenFS's own htree conversion must produce valid dx checksums.
+        let ffs_image = dir.path().join("ffs-htree.ext4");
+        std::fs::File::create(&ffs_image)
+            .and_then(|f| f.set_len(32 * 1024 * 1024))
+            .expect("sparse image");
+        let formatted = std::process::Command::new("mke2fs")
+            .args([
+                "-q",
+                "-F",
+                "-t",
+                "ext4",
+                "-O",
+                "metadata_csum",
+                "-b",
+                "4096",
+            ])
+            .arg(&ffs_image)
+            .status();
+        assert!(formatted.is_ok_and(|s| s.success()), "mke2fs");
+        {
+            let mut fs = super::OpenFs::open_with_options(
+                &cx,
+                &ffs_image,
+                &super::OpenOptions {
+                    ext4_journal_replay_mode: super::Ext4JournalReplayMode::Apply,
+                    ..super::OpenOptions::default()
+                },
+            )
+            .expect("open for writes");
+            fs.enable_writes(&cx).expect("enable writes");
+            let big = fs
+                .mkdir(
+                    &cx,
+                    ffs_types::InodeNumber(2),
+                    std::ffi::OsStr::new("big"),
+                    0o755,
+                    0,
+                    0,
+                )
+                .expect("mkdir");
+            for index in 0..600 {
+                fs.create(
+                    &cx,
+                    big.ino,
+                    std::ffi::OsStr::new(&format!("entry-{index:04}.dat")),
+                    0o644,
+                    0,
+                    0,
+                )
+                .expect("create");
+            }
+            fs.fsync(&cx, big.ino, 0, false).expect("fsyncdir");
+            fs.sync_all_to_device(&cx).expect("persist to the image");
+            let inode = fs.read_inode(&cx, big.ino).expect("read big");
+            assert!(
+                inode.flags & ffs_types::EXT4_INDEX_FL != 0,
+                "setup: 600 FrankenFS creates must convert the directory to htree"
+            );
+        }
+        let report = offline_scrub_bd_jufod(&ffs_image);
+        assert_eq!(
+            report.blocks_corrupt, 0,
+            "a FrankenFS-written htree directory must scrub clean: {:?}",
+            report.findings
+        );
     }
 
     /// A metadata_csum ext4 image with repair symbols for one group, and where
