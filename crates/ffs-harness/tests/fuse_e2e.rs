@@ -1990,12 +1990,15 @@ fn ffs_written_images_mount_and_read_under_the_linux_kernel() {
     emit_scenario_result("ffs_written_btrfs_dup_copy2_kernel_read", "PASS", None);
 }
 
-/// bd-5elw6: relocation (`btrfs balance`) can leave shared/full backrefs in
-/// the extent tree without any snapshot, which the last_snapshot refusal does
-/// not see. A FrankenFS read-write session on a kernel-balanced image must
-/// leave it `btrfs check` clean and every file readable by the kernel.
+/// bd-5elw6: relocation (`btrfs balance`) works through snapshot-like reloc
+/// trees, so with no user snapshot at all it leaves FULL_BACKREF tree blocks
+/// and shared (parent-keyed) data backrefs, and sets the default subvolume's
+/// `last_snapshot`. FrankenFS's commit keys tree-block release on root-5
+/// backrefs and its data-ref updates on root-keyed refs, so it cannot write
+/// such an image correctly yet. Pinned here: a balanced image carries those
+/// refs, read-write is refused, and the refusal changes nothing.
 #[test]
-fn btrfs_rw_after_kernel_balance_keeps_the_image_clean_bd_5elw6() {
+fn btrfs_rw_refuses_a_kernel_balanced_image_bd_5elw6() {
     for tool in ["mkfs.btrfs", "btrfs", "losetup"] {
         if !command_available(tool) {
             require_fuse_or_skip(&format!("{tool} unavailable for the balance check"));
@@ -2076,64 +2079,61 @@ fn btrfs_rw_after_kernel_balance_keeps_the_image_clean_bd_5elw6() {
         .output()
         .expect("dump extent tree");
     let text = String::from_utf8_lossy(&dump.stdout);
+    let shared_data = text.matches("shared data backref").count();
+    let full_backref = text.matches("FULL_BACKREF").count();
     eprintln!(
-        "balance: extent tree has {} shared block backrefs, {} shared data backrefs, {} FULL_BACKREF flags",
+        "balance: extent tree has {} shared block backrefs, {shared_data} shared data backrefs, {full_backref} FULL_BACKREF flags",
         text.matches("shared block backref").count(),
-        text.matches("shared data backref").count(),
-        text.matches("FULL_BACKREF").count()
+    );
+    assert!(
+        shared_data + full_backref > 0,
+        "setup: a full balance should leave parent-keyed refs (the case this pins)"
     );
 
-    let mnt = tmp.path().join("mnt");
-    fs::create_dir_all(&mnt).expect("mountpoint");
-    let rw = MountOptions {
-        read_only: false,
-        auto_unmount: false,
-        ..MountOptions::default()
-    };
-    let Some(session) = try_mount_btrfs_rw_with_options(&image, &mnt, &rw) else {
-        return;
-    };
-    let workspace = mnt.join(BTRFS_TEST_WORKSPACE);
-    for index in 0..FILES {
-        let path = workspace.join(format!("f{index:04}"));
-        if index % 4 == 3 {
-            fs::remove_file(&path).expect("remove through FrankenFS");
-        } else {
-            fs::write(&path, content(index, 101)).expect("rewrite through FrankenFS");
-        }
-    }
-    session.unmount_and_join();
-
+    let before = fs::read(&image).expect("read balanced image");
+    let cx = Cx::for_testing();
+    let mut fs = OpenFs::open_with_options(
+        &cx,
+        &image,
+        &OpenOptions {
+            ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
+            ..OpenOptions::default()
+        },
+    )
+    .expect("a balanced image still opens read-only");
+    assert!(
+        matches!(
+            fs.enable_writes(&cx),
+            Err(ffs_error::FfsError::UnsupportedFeature(_))
+        ),
+        "read-write must be refused on a balanced image"
+    );
+    drop(fs);
+    assert!(
+        fs::read(&image).expect("read image") == before,
+        "a refused enable_writes must not change a byte"
+    );
     let check = Command::new("btrfs")
         .args(["check", "--readonly"])
         .arg(&image)
         .output()
         .expect("run btrfs check");
-    assert!(
-        check.status.success(),
-        "btrfs check after a FrankenFS rw session on a balanced image:\n{}{}",
-        String::from_utf8_lossy(&check.stdout),
-        String::from_utf8_lossy(&check.stderr)
-    );
+    assert!(check.status.success(), "btrfs check on the balanced image");
     let kmnt = tmp.path().join("kernel-ro");
     let Some(kernel) = kernel_ro_mount(&image, "btrfs", &kmnt) else {
         return;
     };
     for index in 0..FILES {
         let path = kmnt.join(BTRFS_TEST_WORKSPACE).join(format!("f{index:04}"));
-        if index % 4 == 3 {
-            assert!(!path.exists(), "{} was removed", path.display());
-        } else {
-            assert_eq!(
-                fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())),
-                content(index, 101),
-                "{}",
-                path.display()
-            );
-        }
+        assert_eq!(
+            fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())),
+            content(index, 0),
+            "{}",
+            path.display()
+        );
     }
     drop(kernel);
-    emit_scenario_result("btrfs_rw_after_balance_clean", "PASS", None);
+    emit_scenario_result("btrfs_rw_refuses_balanced_image", "PASS", None);
 }
 
 /// bd-5elw6: a kernel snapshot shares the default subvolume's tree blocks,
