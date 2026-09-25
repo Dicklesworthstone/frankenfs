@@ -841,10 +841,18 @@ impl FrankenFuse {
 
     /// Create a `Cx` for a FUSE request.
     ///
-    /// In the future this could inherit deadlines or tracing spans from the
-    /// fuser `Request`, but for now we use a plain request context.
+    /// Read-only dispatch inherits the original kernel request's interrupt.
+    /// The transport deliberately masks this bridge for mutations, handle
+    /// lifecycle operations, and ioctls: interrupting those before their
+    /// cancellation/rollback boundaries are audited could strand partial work.
+    /// Calls made outside a live dispatch retain an independent context.
     fn cx_for_request() -> Cx {
-        Cx::for_request()
+        let cx = Cx::for_request();
+        if let Some(interrupt) = fuser::current_read_request_interrupt() {
+            let request_cx = cx.clone();
+            interrupt.on_interrupt(move || request_cx.set_cancel_requested(true));
+        }
+        cx
     }
 
     fn reply_error_attr(ctx: &FuseErrorContext<'_>, reply: ReplyAttr) {
@@ -3112,8 +3120,13 @@ impl FrankenFuse {
         // bd-2i2ez: everything that is not a WRITE observes, so it commits the
         // outstanding batch first. `has_outstanding` makes this one relaxed load
         // when batching is off or nothing is staged.
-        if op != RequestOp::Write {
-            self.flush_writeback_batch(cx)?;
+        if op != RequestOp::Write && self.inner.writeback.has_outstanding() {
+            // Earlier writes have already returned success. A read interrupt
+            // must not cancel their mandatory commit after taking the batch
+            // out of its slot. This adapter-owned context deliberately does
+            // not inherit the new observer's cancellation or deadline.
+            let flush_cx = Cx::for_request();
+            self.flush_writeback_batch(&flush_cx)?;
         }
         // Only read the clock when something will read the counter (bd-xfe7z).
         let started = crate::dispatch_timing_enabled().then(Instant::now);
