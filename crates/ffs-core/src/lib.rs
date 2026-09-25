@@ -115,6 +115,13 @@ const BTRFS_COMPRESSED_EXTENT_BYTE_LIMIT: usize = 128 * 1024 * 1024;
 /// size (kernel `fs/btrfs/lzo.c`). FrankenFS assumes the default 4 KiB sector
 /// (the same assumption already baked into the per-segment output cap).
 const BTRFS_LZO_SECTOR_SIZE: usize = 4096;
+thread_local! {
+    /// How many gated mutations (bd-9rutw) the current thread is inside. A
+    /// boundary started at depth > 0 — a sync write's fsync runs inside its own
+    /// write request — must not wait for the gate to drain: it would wait on
+    /// its own thread.
+    static MUTATION_GATE_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
 #[cfg(test)]
 thread_local! {
     /// Test fault: make [`OpenFs::ext4_journal_and_checkpoint`] on THIS thread
@@ -9716,9 +9723,12 @@ impl OpenFs {
     /// now, so no in-flight mutation can still hold an older unregistered
     /// snapshot, then evict up to the durable watermark. Must not be called
     /// while holding a lock a gated mutation may wait on (the btrfs allocator
-    /// lock), or from inside a gated mutation.
+    /// lock). From inside a gated mutation (a sync write's fsync) the gate
+    /// cannot be closed, so eviction is skipped; the next boundary does it.
     fn evict_durable_mvcc_chains_quiesced(&self) {
-        let _gate = self.close_mutation_gate();
+        let Some(_gate) = self.close_mutation_gate() else {
+            return;
+        };
         let durable_through = *self.mvcc_flushed_through.lock();
         self.evict_durable_mvcc_chains(durable_through);
     }
@@ -23020,7 +23030,11 @@ impl OpenFs {
             MetadataLogCaptureDevice::new(self.dev.as_ref(), self.block_size(), BTreeMap::new());
         // bd-9rutw: capture a QUIESCENT state — no mutation half-applied. The
         // gate is held only for this in-memory capture, not the journal I/O.
+        // `None` from inside a gated mutation (a sync write's own fsync): the
+        // capture then proceeds unquiesced, as before the gate, and the
+        // eviction below — which relies on quiescence — is skipped.
         let gate = self.close_mutation_gate();
+        let quiesced = gate.is_some();
         // bd-1o6tq: exact under the gate — every commit counted here is in the
         // capture below.
         let writes_before = self.mvcc_store.committed_block_writes();
@@ -23046,7 +23060,9 @@ impl OpenFs {
         // as `ext4_persist_group_descriptors_from` does, so drop them.
         self.ext4_group_desc_cache.clear();
         self.ext4_base_block_cache.clear();
-        self.evict_durable_mvcc_chains(durable_through);
+        if quiesced {
+            self.evict_durable_mvcc_chains(durable_through);
+        }
         if let Some(writes) = writes_before {
             self.jbd2_block_writes_at_boundary
                 .fetch_max(writes, std::sync::atomic::Ordering::AcqRel);
@@ -40847,20 +40863,24 @@ impl OpenFs {
     }
 
     /// Enter the mutation gate (bd-9rutw), waiting while a boundary captures.
-    /// Every call must be paired with exactly one [`Self::leave_mutation_gate`];
-    /// library callers use [`Self::mutation_gate_guard`]. Never called from
-    /// inside a boundary, and no boundary runs while a thread is inside —
-    /// fsync, flush-on-destroy, the periodic and journal-pressure commits and
-    /// repair writeback are all outside the gated set.
+    /// Every call must be paired with exactly one [`Self::leave_mutation_gate`]
+    /// ON THE SAME THREAD; library callers use [`Self::mutation_gate_guard`].
     pub(crate) fn enter_mutation_gate(&self) {
         let mut state = self.mutation_gate.lock();
-        while state.closing > 0 {
-            self.mutation_gate_cv.wait(&mut state);
+        // A thread already inside must not wait for a closing boundary: that
+        // boundary is waiting for this thread's own in-flight mutation.
+        if MUTATION_GATE_DEPTH.get() == 0 {
+            while state.closing > 0 {
+                self.mutation_gate_cv.wait(&mut state);
+            }
         }
         state.in_flight += 1;
+        drop(state);
+        MUTATION_GATE_DEPTH.set(MUTATION_GATE_DEPTH.get() + 1);
     }
 
     pub(crate) fn leave_mutation_gate(&self) {
+        MUTATION_GATE_DEPTH.set(MUTATION_GATE_DEPTH.get().saturating_sub(1));
         let mut state = self.mutation_gate.lock();
         state.in_flight = state.in_flight.saturating_sub(1);
         let drained = state.in_flight == 0;
@@ -40888,14 +40908,24 @@ impl OpenFs {
     }
 
     /// Close the gate and wait until no mutation is in flight (bd-9rutw).
-    fn close_mutation_gate(&self) -> BoundaryGateGuard<'_> {
+    ///
+    /// `None` when the calling thread is itself inside a gated mutation — an
+    /// O_SYNC/O_DSYNC/RWF_SYNC write runs its fsync inside its own write
+    /// request. Waiting there would wait on the thread itself (a hang, found by
+    /// the pwritev2 RWF_SYNC mounted tests); such a boundary captures without
+    /// quiescing, exactly as before the gate existed, and callers must not
+    /// evict on its strength.
+    fn close_mutation_gate(&self) -> Option<BoundaryGateGuard<'_>> {
+        if MUTATION_GATE_DEPTH.get() > 0 {
+            return None;
+        }
         let mut state = self.mutation_gate.lock();
         state.closing += 1;
         while state.in_flight > 0 {
             self.mutation_gate_cv.wait(&mut state);
         }
         drop(state);
-        BoundaryGateGuard(self)
+        Some(BoundaryGateGuard(self))
     }
 
     fn namespace_gen_now(&self) -> u64 {
@@ -64943,6 +64973,60 @@ mod tests {
         );
     }
 
+    /// A sync write runs its fsync INSIDE its own gated write request (the FUSE
+    /// adapter does this for O_SYNC / O_DSYNC / RWF_SYNC). The boundary must
+    /// not wait for the mutation gate to drain — it would wait on its own
+    /// thread. Found as a hang in the mounted pwritev2 RWF_SYNC/RWF_DSYNC
+    /// tests. Checked on the direct path and the JBD2 path, with the resident
+    /// cap at 0 so the eviction step is attempted every time.
+    #[test]
+    fn sync_write_boundary_inside_its_own_write_request_does_not_hang() {
+        for jbd2 in [false, true] {
+            let Some((mut fs, _dev, _tmp)) = open_writable_ext4_mkfs_with_device(32) else {
+                oracle_unavailable("ext4 image formatter");
+                return;
+            };
+            let cx = Cx::for_testing();
+            if jbd2 {
+                assert!(fs.attach_ext4_internal_jbd2_writer(&cx).expect("attach"));
+            }
+            fs.set_mvcc_resident_block_cap(0);
+            let fs = std::sync::Arc::new(fs);
+            let worker_fs = std::sync::Arc::clone(&fs);
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let fs = worker_fs;
+                let cx = Cx::for_testing();
+                let attr = OpenFs::create(
+                    &fs,
+                    &cx,
+                    InodeNumber(2),
+                    OsStr::new("sync.bin"),
+                    0o644,
+                    0,
+                    0,
+                )
+                .expect("create");
+                let mut scope = <OpenFs as FsOps>::begin_request_scope(&fs, &cx, RequestOp::Write)
+                    .expect("begin write scope");
+                <OpenFs as FsOps>::write(&fs, &cx, &mut scope, attr.ino, 0, &[0x5E_u8; 4096])
+                    .expect("write");
+                <OpenFs as FsOps>::commit_request_scope(&fs, &cx, &mut scope).expect("commit");
+                <OpenFs as FsOps>::fsync(&fs, &cx, &mut scope, attr.ino, 0, false)
+                    .expect("fsync inside the write request");
+                <OpenFs as FsOps>::end_request_scope(&fs, &cx, RequestOp::Write, scope)
+                    .expect("end write scope");
+                let _ = done_tx.send(());
+            });
+            assert!(
+                done_rx
+                    .recv_timeout(std::time::Duration::from_secs(30))
+                    .is_ok(),
+                "a sync write's in-request fsync deadlocked on the mutation gate (jbd2={jbd2})"
+            );
+        }
+    }
+
     /// bd-dj725 memory bound without a JBD2 writer: the sharded store and the
     /// direct flush path evict durable chains too, with reads, overwrites and
     /// the on-disk image staying exact.
@@ -71248,6 +71332,13 @@ mod tests {
                 .expect("sparse write");
             model[logical * BS..(logical + 1) * BS].copy_from_slice(&payload);
         }
+        let inode_after_fill = fs.read_inode(&cx, attr.ino).expect("read inode");
+        let placement_after_fill: Vec<(u32, u64)> = fs
+            .collect_extents(&cx, &inode_after_fill)
+            .expect("collect extents after fill")
+            .iter()
+            .map(|extent| (extent.logical_block, extent.physical_start))
+            .collect();
 
         for i in 0..BLOCKS {
             let logical = i * 2;
@@ -71281,12 +71372,26 @@ mod tests {
         let extents = fs
             .collect_extents(&cx, &inode_after_overwrite)
             .expect("collect extents");
+        // Pure overwrites must land in place: every block keeps the physical
+        // address the fill pass gave it.
+        let placement_after_overwrite: Vec<(u32, u64)> = extents
+            .iter()
+            .map(|extent| (extent.logical_block, extent.physical_start))
+            .collect();
+        assert_eq!(
+            placement_after_overwrite, placement_after_fill,
+            "cross-call overwrites moved blocks"
+        );
+        // The golden covers the data and the logical extent shape. Absolute
+        // physical addresses are left out: they follow the mkfs layout, which
+        // differs between e2fsprogs releases (1.47.0 on CI, 1.47.2 on the build
+        // workers), so hashing them made the golden environment-specific. The
+        // placement check above covers the physical side.
         let mut hasher = Sha256::new();
         hasher.update(&readback);
         for extent in &extents {
             hasher.update(extent.logical_block.to_le_bytes());
             hasher.update(extent.actual_len().to_le_bytes());
-            hasher.update(extent.physical_start.to_le_bytes());
             hasher.update([u8::from(extent.is_unwritten())]);
         }
         let digest = hasher
@@ -71296,8 +71401,9 @@ mod tests {
             .collect::<String>();
         println!("bd_pqzev_ext4_write_cross_call_golden_sha256={digest}");
         assert_eq!(
-            digest,
-            "791b273880e57a4958d5ebb2d0ed53cb5944cddcadc143e6b1dd99442a62bf18"
+            digest, "a1b0428b90126b00231de167cd8ff72af2e67d090a7e92fa25c07cbf8797eb1e",
+            "golden = sha256(model data, then per extent: logical u32 LE, len u16 LE, \
+             unwritten u8) for 16 one-block extents at logical 0,2,..,30"
         );
 
         fs.setattr(
