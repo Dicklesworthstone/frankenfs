@@ -34,7 +34,14 @@ CHECKSUMS_ONLY=0
 SELF_CHECK=0
 
 cargo_exec() {
-    rch exec -- cargo "$@"
+    # Offload through rch where it exists (dev hosts). GitHub runners have no
+    # rch, and every cargo-backed check here failed with "rch: command not
+    # found" the first time CI reached this job.
+    if command -v rch >/dev/null 2>&1; then
+        rch exec -- cargo "$@"
+    else
+        cargo "$@"
+    fi
 }
 
 usage() {
