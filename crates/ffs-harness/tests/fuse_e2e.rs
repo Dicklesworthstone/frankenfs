@@ -185,6 +185,10 @@ fn emit_scenario_result(scenario_id: &str, outcome: &str, detail: Option<&str>) 
 /// is not reachable from these tests (bd-53dub follow-up).
 fn read_ioctl_trace(path: &Path) -> String {
     const QUIET: Duration = Duration::from_millis(100);
+    // The trace worker writes asynchronously. A file still EMPTY after 100 ms
+    // is not settled: on a GitHub runner the first line arrived later than
+    // that and a v2 policy test read an empty trace (CI run 36132608863).
+    const QUIET_EMPTY: Duration = Duration::from_secs(1);
     const LIMIT: Duration = Duration::from_secs(3);
     let len = || fs::metadata(path).map_or(0, |m| m.len());
     let start = Instant::now();
@@ -196,7 +200,7 @@ fn read_ioctl_trace(path: &Path) -> String {
         if now != last {
             last = now;
             stable_since = Instant::now();
-        } else if stable_since.elapsed() >= QUIET {
+        } else if stable_since.elapsed() >= if now == 0 { QUIET_EMPTY } else { QUIET } {
             break;
         }
     }
