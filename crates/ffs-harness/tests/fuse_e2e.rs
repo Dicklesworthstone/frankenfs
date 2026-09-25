@@ -2402,6 +2402,97 @@ fn btrfs_rw_on_a_balanced_kernel_subvolume_bd_5elw6() {
     });
 }
 
+/// bd-uxh7t: a 4 KiB write+fsync on a btrfs filesystem holding ~20,000 files
+/// returned ENOSPC with free device space. Every fsync must succeed, many
+/// times over, and the image must stay kernel-consistent.
+#[test]
+fn btrfs_write_fsync_on_a_20k_file_filesystem_bd_uxh7t() {
+    const FILES: usize = 20_050;
+    const ROUNDS: usize = 20;
+    for tool in ["mkfs.btrfs", "btrfs"] {
+        if !command_available(tool) {
+            require_fuse_or_skip(&format!("{tool} unavailable for bd-uxh7t"));
+            return;
+        }
+    }
+    if !fuse_available() {
+        return;
+    }
+    let tmp = TempDir::new().expect("tmpdir");
+    let seed_root = tmp.path().join("seed_root");
+    let seed_workspace = seed_root.join(BTRFS_TEST_WORKSPACE);
+    fs::create_dir_all(&seed_workspace).expect("seed workspace");
+    for dir in [&seed_root, &seed_workspace] {
+        fs::set_permissions(dir, fs::Permissions::from_mode(0o777)).expect("chmod seed dir");
+    }
+    for index in 0..FILES {
+        fs::File::create(seed_workspace.join(format!("s{index:05}"))).expect("seed file");
+    }
+    let image = tmp.path().join("20k.btrfs");
+    fs::File::create(&image)
+        .and_then(|f| f.set_len(512 * 1024 * 1024))
+        .expect("size image");
+    let made = Command::new("mkfs.btrfs")
+        .args(["-f", "--rootdir"])
+        .arg(&seed_root)
+        .arg(&image)
+        .output()
+        .expect("run mkfs.btrfs");
+    assert!(
+        made.status.success(),
+        "mkfs.btrfs: {}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+
+    let mnt = tmp.path().join("mnt");
+    fs::create_dir_all(&mnt).expect("mountpoint");
+    let rw = MountOptions {
+        read_only: false,
+        auto_unmount: false,
+        ..MountOptions::default()
+    };
+    let Some(session) = try_mount_btrfs_rw_with_options(&image, &mnt, &rw) else {
+        return;
+    };
+    let payload = |round: usize| vec![u8::try_from(round % 251).expect("fits u8"); 4096];
+    for round in 0..ROUNDS {
+        let path = mnt
+            .join(BTRFS_TEST_WORKSPACE)
+            .join(format!("fsync{round:02}"));
+        let mut file = fs::File::create(&path).expect("create through FrankenFS");
+        file.write_all(&payload(round)).expect("write 4 KiB");
+        file.sync_all()
+            .unwrap_or_else(|e| panic!("fsync round {round} on a {FILES}-file filesystem: {e}"));
+    }
+    session.unmount_and_join();
+
+    let check = Command::new("btrfs")
+        .args(["check", "--readonly"])
+        .arg(&image)
+        .output()
+        .expect("run btrfs check");
+    assert!(
+        check.status.success(),
+        "btrfs check after {ROUNDS} fsyncs:\n{}{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let kmnt = tmp.path().join("kernel-ro");
+    let Some(kernel) = kernel_ro_mount(&image, "btrfs", &kmnt) else {
+        return;
+    };
+    let workspace = kmnt.join(BTRFS_TEST_WORKSPACE);
+    for round in 0..ROUNDS {
+        assert_eq!(
+            fs::read(workspace.join(format!("fsync{round:02}"))).expect("kernel read"),
+            payload(round)
+        );
+    }
+    assert!(workspace.join(format!("s{:05}", FILES - 1)).exists());
+    drop(kernel);
+    emit_scenario_result("btrfs_write_fsync_20k_files", "PASS", None);
+}
+
 /// Corrupt the first DUP copy of the FS_TREE root node on a single-device
 /// btrfs image, after checking both copies are present and identical.
 fn corrupt_first_dup_copy_of_fs_root(image: &Path) {
