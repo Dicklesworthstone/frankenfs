@@ -2670,15 +2670,22 @@ fn cli_mount_rss_stays_bounded_without_fsync_bd_dj725() {
     // for the same 1 GiB (per-block overhead, the boundary's transient block
     // copies and allocator retention make the absolute level workload- and
     // allocator-dependent, so the test asserts the TREND, not a number).
+    // Compared with the control's growth over the same second 512 MiB, not an
+    // absolute allowance: 13 runs on identical daemon code (2026-09-25) grew
+    // 33..139 MiB with eviction, so a 64 MiB bound failed ~40% of runs on
+    // noise, while the control grew ~650 MiB.
+    let bounded_growth = bounded_second.saturating_sub(bounded_first);
+    let unbounded_growth = unbounded_second.saturating_sub(unbounded_first);
     assert!(
-        bounded_second <= bounded_first + 64 * 1024,
-        "daemon RSS kept growing with the default resident cap: \
-         {bounded_first} KiB after 512 MiB, {bounded_second} KiB after 1 GiB"
-    );
-    assert!(
-        unbounded_second > unbounded_first + 256 * 1024,
+        unbounded_growth > 256 * 1024,
         "control arm (no eviction) did not grow ({unbounded_first} -> {unbounded_second} \
          KiB): the test is not detecting the growth eviction prevents"
+    );
+    assert!(
+        bounded_growth * 3 < unbounded_growth,
+        "daemon RSS kept growing with the default resident cap: +{bounded_growth} KiB over \
+         the second 512 MiB vs +{unbounded_growth} KiB without eviction \
+         ({bounded_first} -> {bounded_second} KiB)"
     );
     assert!(
         bounded_second * 2 < unbounded_second,
