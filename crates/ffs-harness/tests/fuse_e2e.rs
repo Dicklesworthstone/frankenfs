@@ -1990,25 +1990,37 @@ fn ffs_written_images_mount_and_read_under_the_linux_kernel() {
     emit_scenario_result("ffs_written_btrfs_dup_copy2_kernel_read", "PASS", None);
 }
 
-/// bd-5elw6: relocation (`btrfs balance`) works through snapshot-like reloc
-/// trees, so with no user snapshot at all it leaves FULL_BACKREF tree blocks
-/// and shared (parent-keyed) data backrefs, and sets the default subvolume's
-/// `last_snapshot`. FrankenFS's commit keys tree-block release on root-5
-/// backrefs and its data-ref updates on root-keyed refs, so it cannot write
-/// such an image correctly yet. Pinned here: a balanced image carries those
-/// refs, read-write is refused, and the refusal changes nothing.
-#[test]
-fn btrfs_rw_refuses_a_kernel_balanced_image_bd_5elw6() {
+/// How the kernel prepares the image for a shared-tree scenario.
+struct SharedBtrfsScenario {
+    name: &'static str,
+    files: usize,
+    nodesize: Option<u32>,
+    snapshot: bool,
+    balance: bool,
+}
+
+/// bd-5elw6: seed `files` files with mkfs, let the kernel snapshot and/or
+/// balance the default subvolume (both leave shared, lazily counted or
+/// parent-keyed references), then rewrite 3/4 and delete 1/4 of the files
+/// and create new ones through a FrankenFS read-write FUSE mount. Afterwards
+/// `btrfs check` must be clean, the kernel must read the snapshot's original
+/// bytes and the default subvolume's new ones.
+fn run_shared_btrfs_rw_scenario(scenario: &SharedBtrfsScenario) {
+    // A failing commit reaches the caller as EIO through FUSE; its cause is
+    // only in the daemon's warnings.
+    let _ = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::WARN)
+        .with_writer(std::io::stderr)
+        .try_init();
     for tool in ["mkfs.btrfs", "btrfs", "losetup"] {
         if !command_available(tool) {
-            require_fuse_or_skip(&format!("{tool} unavailable for the balance check"));
+            require_fuse_or_skip(&format!("{tool} unavailable for {}", scenario.name));
             return;
         }
     }
     if !fuse_available() {
         return;
     }
-    const FILES: usize = 400;
     let content = |index: usize, salt: usize| -> Vec<u8> {
         (0..5000_usize)
             .map(|i| u8::try_from((i * 7 + index * 13 + salt) % 251).expect("fits u8"))
@@ -2020,24 +2032,28 @@ fn btrfs_rw_refuses_a_kernel_balanced_image_bd_5elw6() {
     for dir in [tmp.path().join("seed_root"), seed_workspace.clone()] {
         fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).expect("chmod seed dir");
     }
-    for index in 0..FILES {
+    for index in 0..scenario.files {
         let path = seed_workspace.join(format!("f{index:04}"));
         fs::write(&path, content(index, 0)).expect("seed file");
         fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).expect("chmod seed file");
     }
-    let image = tmp.path().join("balanced.btrfs");
+    let image = tmp.path().join("shared.btrfs");
     fs::File::create(&image)
-        .and_then(|f| f.set_len(256 * 1024 * 1024))
+        .and_then(|f| f.set_len(512 * 1024 * 1024))
         .expect("size image");
-    let made = Command::new("mkfs.btrfs")
-        .args(["-f", "--rootdir"])
-        .arg(tmp.path().join("seed_root"))
-        .arg(&image)
-        .output()
-        .expect("run mkfs.btrfs");
-    assert!(made.status.success(), "mkfs.btrfs");
+    let mut mkfs = Command::new("mkfs.btrfs");
+    mkfs.args(["-f", "--rootdir"])
+        .arg(tmp.path().join("seed_root"));
+    if let Some(nodesize) = scenario.nodesize {
+        mkfs.args(["--nodesize", &nodesize.to_string()]);
+    }
+    let made = mkfs.arg(&image).output().expect("run mkfs.btrfs");
+    assert!(
+        made.status.success(),
+        "mkfs.btrfs: {}",
+        String::from_utf8_lossy(&made.stderr)
+    );
 
-    // The kernel relocates every chunk.
     {
         let attached = Command::new("sudo")
             .args(["-n", "losetup", "--find", "--show"])
@@ -2061,16 +2077,31 @@ fn btrfs_rw_refuses_a_kernel_balanced_image_bd_5elw6() {
             .output()
             .expect("spawn mount");
         assert!(mounted.status.success(), "kernel rw mount");
-        let balanced = Command::new("sudo")
-            .args(["-n", "btrfs", "balance", "start", "--full-balance"])
-            .arg(&kmnt)
-            .output()
-            .expect("spawn balance");
-        assert!(
-            balanced.status.success(),
-            "kernel balance: {}",
-            String::from_utf8_lossy(&balanced.stderr)
-        );
+        if scenario.snapshot {
+            let snap = Command::new("sudo")
+                .args(["-n", "btrfs", "subvolume", "snapshot"])
+                .arg(&kmnt)
+                .arg(kmnt.join("snap"))
+                .output()
+                .expect("spawn snapshot");
+            assert!(
+                snap.status.success(),
+                "kernel snapshot: {}",
+                String::from_utf8_lossy(&snap.stderr)
+            );
+        }
+        if scenario.balance {
+            let balanced = Command::new("sudo")
+                .args(["-n", "btrfs", "balance", "start", "--full-balance"])
+                .arg(&kmnt)
+                .output()
+                .expect("spawn balance");
+            assert!(
+                balanced.status.success(),
+                "kernel balance: {}",
+                String::from_utf8_lossy(&balanced.stderr)
+            );
+        }
         drop(guard);
     }
     let dump = Command::new("btrfs")
@@ -2079,182 +2110,45 @@ fn btrfs_rw_refuses_a_kernel_balanced_image_bd_5elw6() {
         .output()
         .expect("dump extent tree");
     let text = String::from_utf8_lossy(&dump.stdout);
-    let shared_data = text.matches("shared data backref").count();
-    let full_backref = text.matches("FULL_BACKREF").count();
     eprintln!(
-        "balance: extent tree has {} shared block backrefs, {shared_data} shared data backrefs, {full_backref} FULL_BACKREF flags",
+        "{}: before FrankenFS: {} shared block backrefs, {} shared data backrefs, {} FULL_BACKREF flags",
+        scenario.name,
         text.matches("shared block backref").count(),
-    );
-    assert!(
-        shared_data + full_backref > 0,
-        "setup: a full balance should leave parent-keyed refs (the case this pins)"
+        text.matches("shared data backref").count(),
+        text.matches("FULL_BACKREF").count(),
     );
 
-    let before = fs::read(&image).expect("read balanced image");
-    let cx = Cx::for_testing();
-    let mut fs = OpenFs::open_with_options(
-        &cx,
-        &image,
-        &OpenOptions {
-            ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
-            ..OpenOptions::default()
-        },
-    )
-    .expect("a balanced image still opens read-only");
-    assert!(
-        matches!(
-            fs.enable_writes(&cx),
-            Err(ffs_error::FfsError::UnsupportedFeature(_))
-        ),
-        "read-write must be refused on a balanced image"
-    );
-    drop(fs);
-    assert!(
-        fs::read(&image).expect("read image") == before,
-        "a refused enable_writes must not change a byte"
-    );
-    let check = Command::new("btrfs")
-        .args(["check", "--readonly"])
-        .arg(&image)
-        .output()
-        .expect("run btrfs check");
-    assert!(check.status.success(), "btrfs check on the balanced image");
-    let kmnt = tmp.path().join("kernel-ro");
-    let Some(kernel) = kernel_ro_mount(&image, "btrfs", &kmnt) else {
+    let mnt = tmp.path().join("mnt");
+    fs::create_dir_all(&mnt).expect("mountpoint");
+    let rw = MountOptions {
+        read_only: false,
+        auto_unmount: false,
+        ..MountOptions::default()
+    };
+    let Some(session) = try_mount_btrfs_rw_with_options(&image, &mnt, &rw) else {
         return;
     };
-    for index in 0..FILES {
-        let path = kmnt.join(BTRFS_TEST_WORKSPACE).join(format!("f{index:04}"));
-        assert_eq!(
-            fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())),
-            content(index, 0),
-            "{}",
-            path.display()
-        );
-    }
-    drop(kernel);
-    emit_scenario_result("btrfs_rw_refuses_balanced_image", "PASS", None);
-}
-
-/// bd-5elw6: a kernel snapshot shares the default subvolume's tree blocks,
-/// and btrfs refcounts shared tree blocks lazily (only the root item's
-/// `last_snapshot` marks them). FrankenFS's commit cannot yet COW such blocks
-/// correctly: without this refusal, rewriting files of a snapshotted default
-/// subvolume left stale root-5 backrefs and wrong extent refcounts across the
-/// shared nodes, which `btrfs check` rejected. Read-write must be refused, and
-/// the refusal must leave the image, the checker's verdict and the snapshot
-/// exactly as they were.
-#[test]
-fn btrfs_rw_refuses_a_kernel_snapshotted_default_subvolume_bd_5elw6() {
-    for tool in ["mkfs.btrfs", "btrfs", "losetup"] {
-        if !command_available(tool) {
-            require_fuse_or_skip(&format!("{tool} unavailable for the snapshot check"));
-            return;
+    let workspace = mnt.join(BTRFS_TEST_WORKSPACE);
+    for index in 0..scenario.files {
+        let path = workspace.join(format!("f{index:04}"));
+        if index % 4 == 3 {
+            fs::remove_file(&path).expect("remove through FrankenFS");
+        } else {
+            fs::write(&path, content(index, 101)).expect("rewrite through FrankenFS");
+        }
+        // A durable boundary halfway: the unmount's commit then releases
+        // blocks FrankenFS itself wrote, not only the shared on-disk tree.
+        if index == scenario.files / 2 {
+            fs::File::open(workspace.join("f0000"))
+                .and_then(|file| file.sync_all())
+                .expect("fsync mid-session");
         }
     }
-    const FILES: usize = 400;
-    let original = |index: usize| -> Vec<u8> {
-        (0..5000_usize)
-            .map(|i| u8::try_from((i * 7 + index * 13) % 251).expect("fits u8"))
-            .collect()
-    };
-
-    // Seed enough files that the fs tree has interior nodes.
-    let tmp = TempDir::new().expect("tmpdir");
-    let seed_workspace = tmp.path().join("seed_root").join(BTRFS_TEST_WORKSPACE);
-    fs::create_dir_all(&seed_workspace).expect("seed workspace");
-    for dir in [tmp.path().join("seed_root"), seed_workspace.clone()] {
-        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).expect("chmod seed dir");
+    for index in 0..scenario.files / 4 {
+        fs::write(workspace.join(format!("new{index:04}")), content(index, 57))
+            .expect("create through FrankenFS");
     }
-    for index in 0..FILES {
-        let path = seed_workspace.join(format!("f{index:04}"));
-        fs::write(&path, original(index)).expect("seed file");
-        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).expect("chmod seed file");
-    }
-    let image = tmp.path().join("snap.btrfs");
-    fs::File::create(&image)
-        .and_then(|f| f.set_len(256 * 1024 * 1024))
-        .expect("size image");
-    let made = Command::new("mkfs.btrfs")
-        .args(["-f", "--rootdir"])
-        .arg(tmp.path().join("seed_root"))
-        .arg(&image)
-        .output()
-        .expect("run mkfs.btrfs");
-    assert!(
-        made.status.success(),
-        "mkfs.btrfs: {}",
-        String::from_utf8_lossy(&made.stderr)
-    );
-
-    // The kernel takes a snapshot of the default subvolume.
-    {
-        let attached = Command::new("sudo")
-            .args(["-n", "losetup", "--find", "--show"])
-            .arg(&image)
-            .output()
-            .expect("spawn losetup");
-        if !attached.status.success() {
-            require_fuse_or_skip(&format!(
-                "kernel loop attach unavailable: {}",
-                String::from_utf8_lossy(&attached.stderr)
-            ));
-            return;
-        }
-        let kmnt = tmp.path().join("kernel-rw");
-        fs::create_dir_all(&kmnt).expect("kernel mountpoint");
-        let guard = KernelRoMount {
-            mountpoint: kmnt.clone(),
-            loop_device: String::from_utf8_lossy(&attached.stdout).trim().to_owned(),
-        };
-        let mounted = Command::new("sudo")
-            .args(["-n", "mount", "-t", "btrfs"])
-            .arg(&guard.loop_device)
-            .arg(&kmnt)
-            .output()
-            .expect("spawn mount");
-        assert!(
-            mounted.status.success(),
-            "kernel rw mount: {}",
-            String::from_utf8_lossy(&mounted.stderr)
-        );
-        let snap = Command::new("sudo")
-            .args(["-n", "btrfs", "subvolume", "snapshot"])
-            .arg(&kmnt)
-            .arg(kmnt.join("snap"))
-            .output()
-            .expect("spawn btrfs subvolume snapshot");
-        assert!(
-            snap.status.success(),
-            "kernel snapshot: {}",
-            String::from_utf8_lossy(&snap.stderr)
-        );
-        drop(guard);
-    }
-
-    let before = fs::read(&image).expect("read snapshotted image");
-    let cx = Cx::for_testing();
-    let mut fs = OpenFs::open_with_options(
-        &cx,
-        &image,
-        &OpenOptions {
-            ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
-            ..OpenOptions::default()
-        },
-    )
-    .expect("a snapshotted image still opens read-only");
-    match fs.enable_writes(&cx) {
-        Err(ffs_error::FfsError::UnsupportedFeature(reason)) => assert!(
-            reason.contains("snapshotted"),
-            "the refusal must name the snapshot: {reason}"
-        ),
-        other => panic!("read-write must be refused on a snapshotted subvolume, got {other:?}"),
-    }
-    drop(fs);
-    assert!(
-        fs::read(&image).expect("read image") == before,
-        "a refused enable_writes must not change a byte"
-    );
+    session.unmount_and_join();
 
     let check = Command::new("btrfs")
         .args(["check", "--readonly"])
@@ -2263,7 +2157,8 @@ fn btrfs_rw_refuses_a_kernel_snapshotted_default_subvolume_bd_5elw6() {
         .expect("run btrfs check");
     assert!(
         check.status.success(),
-        "btrfs check on the kernel-snapshotted image:\n{}{}",
+        "{}: btrfs check after the FrankenFS session:\n{}{}",
+        scenario.name,
         String::from_utf8_lossy(&check.stdout),
         String::from_utf8_lossy(&check.stderr)
     );
@@ -2271,17 +2166,86 @@ fn btrfs_rw_refuses_a_kernel_snapshotted_default_subvolume_bd_5elw6() {
     let Some(kernel) = kernel_ro_mount(&image, "btrfs", &kmnt) else {
         return;
     };
-    for index in 0..FILES {
+    let live = kmnt.join(BTRFS_TEST_WORKSPACE);
+    for index in 0..scenario.files {
         let name = format!("f{index:04}");
-        let path = kmnt.join("snap").join(BTRFS_TEST_WORKSPACE).join(&name);
+        if scenario.snapshot {
+            assert_eq!(
+                fs::read(kmnt.join("snap").join(BTRFS_TEST_WORKSPACE).join(&name))
+                    .unwrap_or_else(|e| panic!("snapshot {name}: {e}")),
+                content(index, 0),
+                "{}: the snapshot's {name} changed",
+                scenario.name
+            );
+        }
+        if index % 4 == 3 {
+            assert!(!live.join(&name).exists(), "{name} was removed");
+        } else {
+            assert_eq!(
+                fs::read(live.join(&name)).unwrap_or_else(|e| panic!("live {name}: {e}")),
+                content(index, 101),
+                "{}: the default subvolume's {name}",
+                scenario.name
+            );
+        }
+    }
+    for index in 0..scenario.files / 4 {
         assert_eq!(
-            fs::read(&path).unwrap_or_else(|e| panic!("snapshot {name}: {e}")),
-            original(index),
-            "the snapshot's {name}"
+            fs::read(live.join(format!("new{index:04}"))).expect("created file"),
+            content(index, 57)
         );
     }
     drop(kernel);
-    emit_scenario_result("btrfs_rw_refuses_snapshotted_subvolume", "PASS", None);
+    emit_scenario_result(scenario.name, "PASS", None);
+}
+
+#[test]
+fn btrfs_rw_on_a_kernel_snapshotted_default_subvolume_bd_5elw6() {
+    run_shared_btrfs_rw_scenario(&SharedBtrfsScenario {
+        name: "btrfs_rw_snapshotted_subvolume",
+        files: 400,
+        nodesize: None,
+        snapshot: true,
+        balance: false,
+    });
+}
+
+/// `btrfs balance` alone (no user snapshot) leaves FULL_BACKREF blocks and
+/// parent-keyed data refs and sets last_snapshot.
+#[test]
+fn btrfs_rw_on_a_kernel_balanced_image_bd_5elw6() {
+    run_shared_btrfs_rw_scenario(&SharedBtrfsScenario {
+        name: "btrfs_rw_balanced_image",
+        files: 400,
+        nodesize: None,
+        snapshot: false,
+        balance: true,
+    });
+}
+
+/// 4 KiB nodes and 3000 files make a tree of height >= 2, so blocks below a
+/// shared node are reachable from the snapshot only through it and keep a
+/// root-5 reference; the commit must not release them.
+#[test]
+fn btrfs_rw_on_a_tall_snapshotted_tree_bd_5elw6() {
+    run_shared_btrfs_rw_scenario(&SharedBtrfsScenario {
+        name: "btrfs_rw_tall_snapshotted_tree",
+        files: 3000,
+        nodesize: Some(4096),
+        snapshot: true,
+        balance: false,
+    });
+}
+
+#[test]
+fn btrfs_rw_on_a_snapshotted_then_balanced_image_bd_5elw6() {
+    run_shared_btrfs_rw_scenario(&SharedBtrfsScenario {
+        name: "btrfs_rw_snapshotted_then_balanced",
+        files: 400,
+        nodesize: None,
+        snapshot: true,
+        balance: true,
+    });
 }
 
 /// Corrupt the first DUP copy of the FS_TREE root node on a single-device

@@ -4,6 +4,7 @@
 //! Builds on `ffs_ondisk::btrfs` parsing primitives. I/O-agnostic —
 //! callers provide a read callback for physical byte access.
 
+pub mod backrefs;
 pub mod crash_consistency;
 pub mod writeback;
 
@@ -8317,12 +8318,17 @@ impl BtrfsExtentAllocator {
             let mut found = false;
             while cursor < value.len() {
                 if value[cursor] != BTRFS_ITEM_EXTENT_DATA_REF {
-                    // SHARED_DATA_REF / other inline forms aren't produced by
-                    // FrankenFS; refuse rather than mis-parse (atomic, no change
-                    // committed yet).
-                    return Err(BtrfsMutationError::BrokenInvariant(
-                        "unsupported inline backref type in extent item",
-                    ));
+                    // A kernel-written extent can carry other inline refs
+                    // (SHARED_DATA_REF after a snapshot or balance, bd-5elw6):
+                    // step over them by their encoded size. An unknown type is
+                    // refused rather than mis-parsed (no change committed yet).
+                    let len = backrefs::inline_ref_len(value[cursor]).ok_or(
+                        BtrfsMutationError::BrokenInvariant(
+                            "unsupported inline backref type in extent item",
+                        ),
+                    )?;
+                    cursor += len;
+                    continue;
                 }
                 let payload_start = cursor + 1;
                 let payload_end = payload_start + DATA_REF_PAYLOAD;
