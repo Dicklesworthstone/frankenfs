@@ -8099,7 +8099,10 @@ fn run_mount_background_scrub_daemon(
         ledger,
         repair_symbol_count,
     )
-    .with_repair_writes_enabled(repair_writes_enabled);
+    .with_repair_writes_enabled(repair_writes_enabled)
+    // bd-jufod: every validator chosen above judges block content, so a
+    // decoded block it rejects (stale or damaged symbols) is never written.
+    .with_decoded_block_verification(true);
     if let Some(open_fs) = config.mounted_repair_writeback {
         pipeline = pipeline.with_recovery_writeback(Arc::new(MountedRecoveryWriteback { open_fs }));
     }

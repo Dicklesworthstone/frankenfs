@@ -850,6 +850,8 @@ pub struct ScrubWithRecovery<'a, W: Write> {
     recovery_writeback: Arc<dyn RecoveryWriteback>,
     /// Whether this pipeline may mutate the device for recovery or symbol refresh.
     repair_writes_enabled: bool,
+    /// Run `validator` over every decoded block before writeback (bd-jufod).
+    verify_decoded_blocks: bool,
 }
 
 impl<'a, W: Write> ScrubWithRecovery<'a, W> {
@@ -907,7 +909,19 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             atomic_metrics: None,
             recovery_writeback: Arc::new(DirectDeviceRecoveryWriteback),
             repair_writes_enabled: true,
+            verify_decoded_blocks: false,
         }
+    }
+
+    /// Check every decoded block with the scrub validator before it is written
+    /// back (bd-jufod): a decode that disagrees with the block's own checksum
+    /// (stale or damaged symbols) fails the attempt instead of overwriting the
+    /// image. Needs a validator that judges block CONTENT; one that flags block
+    /// numbers regardless of their bytes would reject every repair.
+    #[must_use]
+    pub fn with_decoded_block_verification(mut self, enabled: bool) -> Self {
+        self.verify_decoded_blocks = enabled;
+        self
     }
 
     /// Attach thread-safe atomic metrics for concurrent external observation.
@@ -2026,6 +2040,12 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
                     repaired_blocks: Vec::new(),
                 };
             }
+        };
+
+        let orchestrator = if self.verify_decoded_blocks {
+            orchestrator.with_decoded_block_validator(self.validator)
+        } else {
+            orchestrator
         };
 
         debug!(
@@ -3281,6 +3301,88 @@ mod tests {
         assert_eq!(count_event(&records, EvidenceEventType::RepairAttempted), 1);
         assert_eq!(count_event(&records, EvidenceEventType::RepairSucceeded), 1);
         assert_eq!(count_event(&records, EvidenceEventType::RepairFailed), 0);
+    }
+
+    /// A block is valid only if it holds the bytes recorded for it: a stand-in
+    /// for a checksum the block carries.
+    struct ExpectedContentValidator(BTreeMap<u64, Vec<u8>>);
+
+    impl BlockValidator for ExpectedContentValidator {
+        fn validate(&self, block: BlockNumber, data: &BlockBuf) -> BlockVerdict {
+            match self.0.get(&block.0) {
+                Some(expected) if expected.as_slice() == data.as_slice() => BlockVerdict::Clean,
+                Some(_) => BlockVerdict::Corrupt(vec![(
+                    CorruptionKind::ChecksumMismatch,
+                    Severity::Error,
+                    format!("block {} fails its checksum", block.0),
+                )]),
+                None => BlockVerdict::Skip,
+            }
+        }
+    }
+
+    /// bd-jufod: an external write after symbol generation leaves the symbols
+    /// stale, so a decode "succeeds" with the OLD bytes. Without decoded-block
+    /// verification the pipeline writes them back (control arm); with it, the
+    /// attempt fails and the block is left as found.
+    #[test]
+    fn pipeline_refuses_a_decode_that_fails_the_validator_bd_jufod() {
+        let cx = Cx::for_testing();
+        let block_size = 256;
+        for verify in [false, true] {
+            let device = MemBlockDevice::new(block_size, 128);
+            let layout =
+                RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout");
+            let originals = write_source_blocks(&cx, &device, BlockNumber(0), 8);
+            bootstrap_storage(&cx, &device, layout, BlockNumber(0), 8, 4);
+
+            let latest = vec![0x5A; block_size as usize];
+            device
+                .write_block(&cx, BlockNumber(3), &latest)
+                .expect("external write the symbols never saw");
+            let corrupt = vec![0xDE; block_size as usize];
+            device
+                .write_block(&cx, BlockNumber(3), &corrupt)
+                .expect("inject corruption");
+
+            let validator = ExpectedContentValidator(BTreeMap::from([(3, latest.clone())]));
+            let mut ledger_buf = Vec::new();
+            let mut pipeline = ScrubWithRecovery::new(
+                &device,
+                &validator,
+                test_uuid(),
+                vec![GroupConfig {
+                    layout,
+                    source_first_block: BlockNumber(0),
+                    source_block_count: 8,
+                }],
+                &mut ledger_buf,
+                4,
+            )
+            .with_decoded_block_verification(verify);
+            let report = pipeline.scrub_and_recover(&cx).expect("pipeline");
+            let block3 = device.read_block(&cx, BlockNumber(3)).expect("read");
+            if verify {
+                assert_eq!(report.total_recovered, 0, "{report:?}");
+                assert_eq!(
+                    report.block_outcomes.get(&3),
+                    Some(&BlockOutcome::Unrecoverable)
+                );
+                assert_eq!(
+                    block3.as_slice(),
+                    corrupt.as_slice(),
+                    "a decode failing verification must not be written"
+                );
+                let records = crate::evidence::parse_evidence_ledger(pipeline.into_ledger());
+                assert_eq!(count_event(&records, EvidenceEventType::RepairFailed), 1);
+            } else {
+                assert_eq!(
+                    block3.as_slice(),
+                    originals[3].as_slice(),
+                    "control: without verification the stale decode is written"
+                );
+            }
+        }
     }
 
     #[test]
