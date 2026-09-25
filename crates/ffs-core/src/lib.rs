@@ -115,6 +115,15 @@ const BTRFS_COMPRESSED_EXTENT_BYTE_LIMIT: usize = 128 * 1024 * 1024;
 /// size (kernel `fs/btrfs/lzo.c`). FrankenFS assumes the default 4 KiB sector
 /// (the same assumption already baked into the per-segment output cap).
 const BTRFS_LZO_SECTOR_SIZE: usize = 4096;
+#[cfg(test)]
+thread_local! {
+    /// Test fault: make [`OpenFs::ext4_journal_and_checkpoint`] on THIS thread
+    /// stop after the commit record is durable, before the checkpoint — a
+    /// crash in that window. Thread-scoped (unlike the per-fs flag) so it can
+    /// reach journaling that runs inside `open`, e.g. orphan recovery.
+    static JBD2_CRASH_AFTER_COMMIT_SYNC_ON_THIS_THREAD: std::cell::Cell<bool> =
+        const { std::cell::Cell::new(false) };
+}
 thread_local! {
     static BTRFS_ZSTD_DECOMPRESSOR: std::cell::RefCell<Option<zstd::bulk::Decompressor<'static>>> =
         const { std::cell::RefCell::new(None) };
@@ -7116,8 +7125,19 @@ impl OpenFs {
         let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
         let mut stats = Ext4OrphanRecoveryStats::default();
 
-        {
-            let block_dev = self.direct_block_device_adapter();
+        // bd-xsu7s: every write of the cleanup — bitmaps, descriptors, inodes,
+        // truncated extent blocks, and finally the superblock's cleared orphan
+        // list — is CAPTURED (read-your-writes) and committed below as one
+        // journaled transaction when the image has a journal, as kernel ext4
+        // does. Written straight to the device, a crash part-way left some of
+        // it applied with the orphan list still naming the inodes, and the next
+        // mount would free their blocks a second time.
+        let (new_state, new_checksum, mut writes) = {
+            let block_dev = MetadataLogCaptureDevice::new(
+                self.dev.as_ref(),
+                self.block_size(),
+                BTreeMap::new(),
+            );
             for ino in orphans {
                 stats.scanned = stats.scanned.saturating_add(1);
 
@@ -7265,9 +7285,42 @@ impl OpenFs {
                     "ext4 orphan recovered"
                 );
             }
-        }
+            // Group descriptor persistence is DEFERRED to durability boundaries
+            // (ffs_alloc::gdt_persistence_deferred), and none runs at mount: the
+            // frees above updated the bitmaps and this local `alloc` but never
+            // the descriptors or superblock totals, so every recovery left
+            // "free blocks count wrong" + stale bitmap checksums behind (found
+            // by e2fsck in the bd-xsu7s tests). Write both from `alloc`, inside
+            // the same transaction.
+            Self::ext4_write_group_descriptors_to(cx, &alloc, &block_dev)?;
+            let (free_blocks, free_inodes) = Self::ext4_fold_group_free_totals(&alloc);
+            self.ext4_write_superblock_free_totals(cx, &block_dev, free_blocks, free_inodes)?;
+            let (new_state, new_checksum) =
+                self.ext4_write_cleared_orphan_superblock(cx, &block_dev)?;
+            (new_state, new_checksum, block_dev.take_writes())
+        };
 
-        self.clear_ext4_orphan_state(cx)?;
+        if let Some(mut journal) = self.open_ext4_internal_jbd2_writer(cx)? {
+            self.ext4_journal_and_checkpoint(cx, &mut journal, &mut writes)?;
+            info!(
+                blocks = writes.len(),
+                "ext4 orphan cleanup committed as one journaled transaction"
+            );
+        } else {
+            // No journal: the kernel has no atomicity to offer here either.
+            let direct = self.direct_block_device_adapter();
+            for (block, data) in &writes {
+                direct.write_block(cx, *block, data)?;
+            }
+            self.dev.sync(cx)?;
+        }
+        if let FsFlavor::Ext4(sb) = &mut self.flavor {
+            sb.state = new_state;
+            sb.last_orphan = 0;
+            if let Some(checksum) = new_checksum {
+                sb.checksum = checksum;
+            }
+        }
 
         // Orphan recovery reads inodes through the read-only inode-table /
         // group-descriptor caches (the fs is not yet writable during open, so
@@ -7401,46 +7454,43 @@ impl OpenFs {
         Ok(())
     }
 
-    fn clear_ext4_orphan_state(&mut self, cx: &Cx) -> Result<(), FfsError> {
+    /// Write the superblock with the orphan list cleared (`s_last_orphan = 0`,
+    /// `EXT4_ORPHAN_FS` off, checksum restamped) through `dev`, returning the
+    /// new state and, on a metadata_csum filesystem, the new checksum, for the
+    /// caller to mirror into the in-memory superblock once the write is
+    /// durable (bd-xsu7s: `dev` is orphan recovery's capture, so this lands in
+    /// the same journaled transaction as the cleanup itself).
+    fn ext4_write_cleared_orphan_superblock(
+        &self,
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+    ) -> Result<(u16, Option<u32>), FfsError> {
         // The superblock lives at byte 1024. For block sizes <= 1024 (e.g. a
         // 1024-byte-block fs) that is a *later* block, not block 0, and the
         // in-block offset is 0 — so block 0 + offset 1024 would read/index out
         // of bounds (bd-icebl). Compute the block and in-block offset instead.
         let (sb_block, sb_off) = self.ext4_superblock_location();
-
-        // Phase 1: Read the current superblock.
-        let mut block_data = {
-            let block_dev = self.direct_block_device_adapter();
-            block_dev.read_block(cx, sb_block)?.into_inner()
-        };
+        let mut block_data = dev.read_block(cx, sb_block)?.into_inner();
 
         let old_state = u16::from_le_bytes([block_data[sb_off + 0x3A], block_data[sb_off + 0x3B]]);
         let new_state = old_state & !EXT4_ORPHAN_FS;
         block_data[sb_off + 0x3A..sb_off + 0x3C].copy_from_slice(&new_state.to_le_bytes());
         block_data[sb_off + 0xE8..sb_off + 0xEC].copy_from_slice(&0_u32.to_le_bytes());
 
-        // Phase 2: Update in-memory flavor cache.
-        if let FsFlavor::Ext4(sb) = &mut self.flavor {
-            if sb.has_metadata_csum() {
+        let checksum = self
+            .ext4_superblock()
+            .is_some_and(Ext4Superblock::has_metadata_csum)
+            .then(|| {
                 let csum = ffs_ondisk::ext4::ext4_chksum_skip_zero_tail(
                     !0u32,
                     &block_data[sb_off..sb_off + EXT4_SB_CHECKSUM_OFFSET],
                 );
                 block_data[sb_off + EXT4_SB_CHECKSUM_OFFSET..sb_off + EXT4_SB_CHECKSUM_OFFSET + 4]
                     .copy_from_slice(&csum.to_le_bytes());
-                sb.checksum = csum;
-            }
-            sb.state = new_state;
-            sb.last_orphan = 0;
-        }
-
-        // Phase 3: Write back the updated superblock.
-        {
-            let block_dev = self.direct_block_device_adapter();
-            block_dev.write_block(cx, sb_block, &block_data)?;
-        }
-
-        Ok(())
+                csum
+            });
+        dev.write_block(cx, sb_block, &block_data)?;
+        Ok((new_state, checksum))
     }
 
     /// Probe an external journal device image for UUID pairing validation.
@@ -9775,17 +9825,29 @@ impl OpenFs {
     }
 
     pub fn attach_ext4_internal_jbd2_writer(&mut self, cx: &Cx) -> Result<bool, FfsError> {
-        let Some(sb) = self.ext4_superblock() else {
+        let Some(writer) = self.open_ext4_internal_jbd2_writer(cx)? else {
             return Ok(false);
+        };
+        self.attach_jbd2_writer(writer);
+        Ok(true)
+    }
+
+    /// Open a JBD2 writer over the image's own internal journal, or `None`
+    /// when it has none (`s_journal_inum == 0`, or the inode maps no blocks).
+    /// Shared by [`Self::attach_ext4_internal_jbd2_writer`] and mount-time
+    /// orphan recovery, which journals its cleanup (bd-xsu7s).
+    fn open_ext4_internal_jbd2_writer(&self, cx: &Cx) -> Result<Option<Jbd2Writer>, FfsError> {
+        let Some(sb) = self.ext4_superblock() else {
+            return Ok(None);
         };
         let inum = sb.journal_inum;
         if inum == 0 {
-            return Ok(false);
+            return Ok(None);
         }
         let inode = self.read_inode(cx, InodeNumber(u64::from(inum)))?;
         let segments = self.collect_ext4_journal_segments(cx, &inode)?;
         if segments.is_empty() {
-            return Ok(false);
+            return Ok(None);
         }
         let writer = {
             let direct = self.direct_block_device_adapter();
@@ -9807,8 +9869,7 @@ impl OpenFs {
             // journal, which `from_device` performs before writes are enabled.
             ffs_journal::Jbd2Writer::open_segmented(cx, &direct, segments, start_seq)?
         };
-        self.attach_jbd2_writer(writer);
-        Ok(true)
+        Ok(Some(writer))
     }
 
     /// Attach a repair flush lifecycle for spec §12.1.3 compliance.
@@ -22964,6 +23025,36 @@ impl OpenFs {
             return Ok(Some((flushed, durable_through)));
         }
 
+        {
+            let mut journal = jbd2_mutex.lock();
+            self.ext4_journal_and_checkpoint(cx, &mut journal, &mut writes)?;
+        }
+
+        // The home writes bypassed the MVCC overlay and both read caches, exactly
+        // as `ext4_persist_group_descriptors_from` does, so drop them.
+        self.ext4_group_desc_cache.clear();
+        self.ext4_base_block_cache.clear();
+        self.ext4_evict_durable_mvcc_chains(durable_through);
+        if let Some(writes) = writes_before {
+            self.jbd2_block_writes_at_boundary
+                .fetch_max(writes, std::sync::atomic::Ordering::AcqRel);
+        }
+        Ok(Some((flushed, durable_through)))
+    }
+
+    /// Journal `writes` as ONE JBD2 transaction, then checkpoint them to their
+    /// home locations, following the kernel's recovery contract: the log is
+    /// marked live and `needs_recovery` set before the commit record can be
+    /// durable, and both are cleared only after the checkpoint is (bd-cnmpm).
+    /// A crash anywhere in between leaves an image the kernel and `e2fsck`
+    /// replay to the post-transaction state. Shared by the durability
+    /// boundary and mount-time orphan recovery (bd-xsu7s).
+    fn ext4_journal_and_checkpoint(
+        &self,
+        cx: &Cx,
+        journal: &mut Jbd2Writer,
+        writes: &mut BTreeMap<BlockNumber, Vec<u8>>,
+    ) -> Result<(), FfsError> {
         let direct = ByteDeviceBlockAdapter {
             dev: self.dev.as_ref(),
             block_size: self.block_size(),
@@ -22980,21 +23071,20 @@ impl OpenFs {
         let has_csum = self
             .ext4_superblock()
             .is_some_and(Ext4Superblock::has_metadata_csum);
-        for (block, data) in &mut writes {
+        for (block, data) in writes.iter_mut() {
             if *block == sb_block {
                 Self::ext4_patch_needs_recovery(data, sb_off, has_csum, true);
             }
         }
         self.ext4_write_needs_recovery(cx, &direct, true)?;
         {
-            let mut journal = jbd2_mutex.lock();
             journal.mark_log_live(cx, &direct).map_err(|e| {
                 FfsError::Io(std::io::Error::other(format!(
                     "jbd2 flush boundary could not mark the log live: {e}"
                 )))
             })?;
             let mut txn = journal.begin_transaction();
-            for (block, data) in &writes {
+            for (block, data) in writes.iter() {
                 txn.add_write(*block, data.clone());
             }
             // Phase 1a — journal. The writer classifies its own failures: a
@@ -23031,13 +23121,14 @@ impl OpenFs {
             if self
                 .jbd2_crash_after_commit_sync
                 .load(std::sync::atomic::Ordering::SeqCst)
+                || JBD2_CRASH_AFTER_COMMIT_SYNC_ON_THIS_THREAD.get()
             {
                 return Err(FfsError::Io(std::io::Error::other(
                     "test fault: crash after jbd2 commit sync, before checkpoint",
                 )));
             }
             // Phase 2 — checkpoint to home locations, then make THAT durable.
-            for (block, data) in &writes {
+            for (block, data) in writes.iter() {
                 if let Err(e) = direct.write_block(cx, *block, data) {
                     warn!(
                         target: "ffs::journal",
@@ -23077,17 +23168,7 @@ impl OpenFs {
             })?;
         }
         self.ext4_write_needs_recovery(cx, &direct, false)?;
-
-        // The home writes bypassed the MVCC overlay and both read caches, exactly
-        // as `ext4_persist_group_descriptors_from` does, so drop them.
-        self.ext4_group_desc_cache.clear();
-        self.ext4_base_block_cache.clear();
-        self.ext4_evict_durable_mvcc_chains(durable_through);
-        if let Some(writes) = writes_before {
-            self.jbd2_block_writes_at_boundary
-                .fetch_max(writes, std::sync::atomic::Ordering::AcqRel);
-        }
-        Ok(Some((flushed, durable_through)))
+        Ok(())
     }
 
     fn ext4_capture_group_descriptors(
@@ -23208,10 +23289,9 @@ impl OpenFs {
         cx: &Cx,
         block_dev: &dyn BlockDevice,
     ) -> Result<(), FfsError> {
-        let (has_csum, is_64bit) = match &self.flavor {
-            FsFlavor::Ext4(sb) => (sb.has_metadata_csum(), sb.is_64bit()),
-            FsFlavor::Btrfs(_) => return Ok(()),
-        };
+        if !matches!(self.flavor, FsFlavor::Ext4(_)) {
+            return Ok(());
+        }
         let Ok(alloc_mutex) = self.require_alloc_state() else {
             return Ok(()); // read-only fs — nothing to sync
         };
@@ -23246,7 +23326,22 @@ impl OpenFs {
             let alloc = alloc_mutex.read();
             Self::ext4_fold_group_free_totals(&alloc)
         };
+        self.ext4_write_superblock_free_totals(cx, block_dev, total_free_blocks, total_free_inodes)
+    }
 
+    /// Patch the superblock's free block/inode totals (restamping its
+    /// checksum) through `block_dev`, skipping the write when nothing changes.
+    fn ext4_write_superblock_free_totals(
+        &self,
+        cx: &Cx,
+        block_dev: &dyn BlockDevice,
+        total_free_blocks: u64,
+        total_free_inodes: u64,
+    ) -> Result<(), FfsError> {
+        let (has_csum, is_64bit) = match &self.flavor {
+            FsFlavor::Ext4(sb) => (sb.has_metadata_csum(), sb.is_64bit()),
+            FsFlavor::Btrfs(_) => return Ok(()),
+        };
         let (sb_block, sb_off) = self.ext4_superblock_location();
         let mut block_data = block_dev.read_block(cx, sb_block)?.into_inner();
         // bd-fv9tc: the bytes as they stand on disk, so the write below can be
@@ -63286,6 +63381,113 @@ mod tests {
                 freed.size
             ),
         }
+    }
+
+    /// Build a journaled image whose on-disk orphan list names a 3-block file,
+    /// as a crash with the file still open would leave it (bd-xsu7s). Returns
+    /// the image bytes and the orphan's inode number.
+    fn ext4_image_with_pending_orphan() -> Option<(Vec<u8>, InodeNumber)> {
+        let cx = Cx::for_testing();
+        let (mut fs, dev, _tmp) = open_writable_ext4_mkfs_with_device(32)?;
+        assert!(fs.attach_ext4_internal_jbd2_writer(&cx).expect("attach"));
+        let root = InodeNumber(2);
+        let ino = fs
+            .create(&cx, root, OsStr::new("open-at-crash"), 0o644, 0, 0)
+            .expect("create")
+            .ino;
+        fs.write(&cx, ino, 0, &vec![0x3C_u8; 3 * fs.block_size() as usize])
+            .expect("write");
+        fs.install_open_handle_oracle(std::sync::Arc::new(move |queried| {
+            u64::from(queried == ino)
+        }));
+        fs.unlink(&cx, root, OsStr::new("open-at-crash"))
+            .expect("unlink while open");
+        // Persist the orphaned state WITHOUT destroy (which would reclaim it).
+        fs.flush_mvcc_to_device(&cx).expect("boundary");
+        assert_ne!(
+            fs.ext4_read_orphan_head(&cx).expect("orphan head"),
+            0,
+            "precondition: the image carries an orphan list"
+        );
+        Some((dev.snapshot_bytes(), ino))
+    }
+
+    /// bd-xsu7s: mount-time orphan cleanup is ONE journaled transaction. Crash
+    /// it right after the commit record is durable (before any home write)
+    /// and the image must still come out clean from a journal replay alone —
+    /// all of the cleanup applied, not part of it.
+    #[test]
+    fn ext4_orphan_cleanup_crash_after_commit_replays_clean_bd_xsu7s() {
+        let Some((image, _ino)) = ext4_image_with_pending_orphan() else {
+            oracle_unavailable("ext4 image formatter");
+            return;
+        };
+        let cx = Cx::for_testing();
+        let dev = TestDevice::from_vec(image);
+        JBD2_CRASH_AFTER_COMMIT_SYNC_ON_THIS_THREAD.set(true);
+        let reopened = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default());
+        JBD2_CRASH_AFTER_COMMIT_SYNC_ON_THIS_THREAD.set(false);
+        let reopened = reopened.expect("open latches the failed recovery instead of failing");
+        assert!(
+            reopened.ext4_orphan_recovery_error.is_some(),
+            "the injected crash must surface as a recovery error"
+        );
+        drop(reopened);
+
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let path = tmp.path().join("crashed.ext4");
+        std::fs::write(&path, dev.snapshot_bytes()).expect("write crashed image");
+        let replay = std::process::Command::new("e2fsck")
+            .args(["-E", "journal_only", "-y"])
+            .arg(&path)
+            .output();
+        let Ok(replay) = replay else {
+            oracle_unavailable("e2fsck");
+            return;
+        };
+        assert!(
+            replay.status.code().is_some_and(|code| code <= 1),
+            "journal replay: {}{}",
+            String::from_utf8_lossy(&replay.stdout),
+            String::from_utf8_lossy(&replay.stderr)
+        );
+        let Some((clean, output)) = run_e2fsck(&path) else {
+            return;
+        };
+        assert!(
+            clean,
+            "after replaying the committed cleanup the image must be clean:\n{output}"
+        );
+    }
+
+    /// bd-xsu7s: without a crash the journaled orphan cleanup leaves a clean
+    /// image with the orphan freed and the list empty.
+    #[test]
+    fn ext4_orphan_cleanup_is_journaled_and_clean_bd_xsu7s() {
+        let Some((image, ino)) = ext4_image_with_pending_orphan() else {
+            oracle_unavailable("ext4 image formatter");
+            return;
+        };
+        let cx = Cx::for_testing();
+        let dev = TestDevice::from_vec(image);
+        let reopened = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default())
+            .expect("reopen");
+        assert!(reopened.ext4_orphan_recovery_error.is_none());
+        assert_eq!(reopened.ext4_read_orphan_head(&cx).expect("head"), 0);
+        assert!(
+            reopened
+                .read_inode(&cx, ino)
+                .map_or(true, |inode| inode.links_count == 0 && inode.dtime != 0),
+            "the orphan must be deleted"
+        );
+        drop(reopened);
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let path = tmp.path().join("recovered.ext4");
+        std::fs::write(&path, dev.snapshot_bytes()).expect("write image");
+        let Some((clean, output)) = run_e2fsck(&path) else {
+            return;
+        };
+        assert!(clean, "recovered image must be e2fsck-clean:\n{output}");
     }
 
     /// bd-iah1f: an orphan whose final RELEASE never reached finalize (lost

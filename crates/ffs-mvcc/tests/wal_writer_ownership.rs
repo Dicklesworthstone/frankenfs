@@ -190,7 +190,7 @@ fn subprocess_owner_blocks_creation_and_process_death_releases_the_inode() {
     );
     let stdout = child.0.stdout.take().expect("child stdout");
     let (ready, observed) = mpsc::sync_channel(1);
-    let observer = std::thread::spawn(move || {
+    let readiness_thread = std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
             if line.expect("read child output").contains(READY) {
                 let _ = ready.send(());
@@ -208,7 +208,7 @@ fn subprocess_owner_blocks_creation_and_process_death_releases_the_inode() {
     assert_eq!(fs::read(&path).expect("read after conflict"), before);
     child.0.kill().expect("simulate owner termination");
     child.0.wait().expect("reap terminated owner");
-    observer.join().expect("readiness observer");
+    readiness_thread.join().expect("readiness observer");
 
     let file = File::options()
         .read(true)

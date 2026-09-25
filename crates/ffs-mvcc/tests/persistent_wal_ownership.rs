@@ -320,7 +320,7 @@ fn process_death_releases_ownership_for_checkpoint_plus_wal_recovery() {
     );
     let stdout = child.0.stdout.take().expect("child stdout");
     let (ready, observed) = mpsc::sync_channel(1);
-    let observer = std::thread::spawn(move || {
+    let readiness_thread = std::thread::spawn(move || {
         for line in BufReader::new(stdout).lines() {
             if line.expect("read child output").contains(READY) {
                 let _ = ready.send(());
@@ -347,7 +347,7 @@ fn process_death_releases_ownership_for_checkpoint_plus_wal_recovery() {
         .kill()
         .expect("terminate owner without graceful close");
     child.0.wait().expect("reap child");
-    observer.join().expect("readiness observer");
+    readiness_thread.join().expect("readiness observer");
 
     let recovered =
         open_mode(0, &path, &checkpoint).expect("no stale owner survives process death");
