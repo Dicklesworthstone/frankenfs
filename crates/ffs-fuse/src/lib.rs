@@ -20760,13 +20760,22 @@ mod tests {
                     data: b"abc".to_vec(),
                 },
                 MutationCall::Commit,
+                MutationCall::End {
+                    op: RequestOp::Write,
+                },
+                // bd-9rutw: the boundary is its own request, never nested in
+                // the gated write request.
+                MutationCall::Begin {
+                    op: RequestOp::Fsync,
+                },
                 MutationCall::Fsync {
                     ino: InodeNumber(42),
                     fh: 9001,
                     datasync: true,
                 },
+                MutationCall::Commit,
                 MutationCall::End {
-                    op: RequestOp::Write,
+                    op: RequestOp::Fsync,
                 },
             ]
         );

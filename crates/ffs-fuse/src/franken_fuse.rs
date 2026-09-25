@@ -3431,15 +3431,6 @@ impl FrankenFuse {
                         .write(cx, scope, InodeNumber(ino), write_offset, data)?;
                 let seq = self.inner.ops.commit_request_scope(cx, scope)?;
                 self.inner.readahead.invalidate_inode(InodeNumber(ino));
-                if let Some(sync_mode) = intent.sync_mode() {
-                    self.inner.ops.fsync(
-                        cx,
-                        scope,
-                        InodeNumber(ino),
-                        intent.fh,
-                        sync_mode.datasync(),
-                    )?;
-                }
                 Ok((bytes, seq))
             })
         }
@@ -3447,6 +3438,29 @@ impl FrankenFuse {
             error,
             offset: Some(operation_offset),
         })?;
+        // The sync boundary runs as its own Fsync request, after the write
+        // request (and its inode guard) is gone. Inside the write request it
+        // could not quiesce the mutation gate, which this thread was holding
+        // (bd-9rutw), so the boundary was neither atomic against other writers
+        // nor allowed to evict. The write is already committed; the fsync makes
+        // it durable before the reply, as O_SYNC/O_DSYNC require.
+        if let Some(sync_mode) = intent.sync_mode() {
+            self.with_request_scope(&cx, RequestOp::Fsync, |cx, scope| {
+                self.inner.ops.fsync(
+                    cx,
+                    scope,
+                    InodeNumber(ino),
+                    intent.fh,
+                    sync_mode.datasync(),
+                )?;
+                self.inner.ops.commit_request_scope(cx, scope)?;
+                Ok(())
+            })
+            .map_err(|error| MutationDispatchError::Operation {
+                error,
+                offset: Some(operation_offset),
+            })?;
+        }
         // Update writeback barrier if enabled.
         Ok(written)
     }
