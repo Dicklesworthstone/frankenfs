@@ -5,6 +5,7 @@
 //!
 //! TODO: This module is meant to go away soon in favor of `ll::Request`.
 
+use crate::interrupt::{DispatchInterruptScope, InterruptRegistry, RequestInterrupt};
 use crate::ll::{Errno, Response, fuse_abi as abi};
 use log::{debug, error, warn};
 use std::convert::TryFrom;
@@ -12,8 +13,8 @@ use std::io::IoSlice;
 #[cfg(feature = "abi-7-40")]
 use std::os::fd::BorrowedFd;
 use std::path::Path;
-use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use std::sync::{Arc, OnceLock};
 
 use crate::Filesystem;
 use crate::PollHandle;
@@ -50,6 +51,33 @@ impl ReplySender for RequestSender {
     }
 }
 
+/// Keep registration until the transport sends the original reply, not merely
+/// until the filesystem callback returns. Replies may be held asynchronously.
+struct InterruptReplySender {
+    sender: RequestSender,
+    interrupt: RequestInterrupt,
+}
+
+struct CompleteReplyOnDrop<'a>(&'a RequestInterrupt);
+
+impl Drop for CompleteReplyOnDrop<'_> {
+    fn drop(&mut self) {
+        self.0.complete();
+    }
+}
+
+impl ReplySender for InterruptReplySender {
+    fn send(&self, data: &[IoSlice<'_>]) -> std::io::Result<()> {
+        let _completion = CompleteReplyOnDrop(&self.interrupt);
+        self.sender.send(data)
+    }
+
+    #[cfg(feature = "abi-7-40")]
+    fn open_backing(&self, fd: BorrowedFd<'_>) -> std::io::Result<BackingId> {
+        self.sender.open_backing(fd)
+    }
+}
+
 /// Request data structure
 pub struct Request<'a> {
     /// Transport used to send this request's reply.
@@ -59,6 +87,8 @@ pub struct Request<'a> {
     data: &'a [u8],
     /// Parsed request
     request: ll::AnyRequest<'a>,
+    /// Registered before waiting for the session dispatch gate.
+    interrupt: OnceLock<RequestInterrupt>,
 }
 
 /// Per-opcode counts of requests that crossed the FUSE boundary (bd-xfe7z).
@@ -153,6 +183,31 @@ fn operation_is_concurrency_safe(operation: &ll::Operation<'_>) -> bool {
         | ll::Operation::OpenDir(_)
         | ll::Operation::Release(_)
         | ll::Operation::ReleaseDir(_) => true,
+        #[cfg(feature = "abi-7-21")]
+        ll::Operation::ReadDirPlus(_) => true,
+        #[cfg(feature = "abi-7-24")]
+        ll::Operation::Lseek(_) => true,
+        #[cfg(feature = "abi-7-40")]
+        ll::Operation::Statx(_) => true,
+        _ => false,
+    }
+}
+
+/// Deliberately independent of concurrency-safe dispatch and its measurement
+/// override. A shared dispatch slot is not proof that cancellation can abandon
+/// a mutation, an open/close lifecycle, or an arbitrary ioctl safely.
+fn operation_is_cancel_safe(operation: &ll::Operation<'_>) -> bool {
+    match operation {
+        ll::Operation::Lookup(_)
+        | ll::Operation::GetAttr(_)
+        | ll::Operation::ReadLink(_)
+        | ll::Operation::Read(_)
+        | ll::Operation::StatFs(_)
+        | ll::Operation::GetXAttr(_)
+        | ll::Operation::ListXAttr(_)
+        | ll::Operation::ReadDir(_)
+        | ll::Operation::Access(_)
+        | ll::Operation::BMap(_) => true,
         #[cfg(feature = "abi-7-21")]
         ll::Operation::ReadDirPlus(_) => true,
         #[cfg(feature = "abi-7-24")]
@@ -265,6 +320,7 @@ impl<'a> Request<'a> {
             sender,
             data,
             request,
+            interrupt: OnceLock::new(),
         })
     }
 
@@ -356,10 +412,68 @@ impl<'a> Request<'a> {
         Some(u64::from(handle))
     }
 
+    /// An interrupt is a control message, never a filesystem mutation barrier.
+    pub(crate) fn is_interrupt(&self) -> bool {
+        matches!(self.request.operation(), Ok(ll::Operation::Interrupt(_)))
+    }
+
+    /// Register before any dispatch lock can block this worker. Deferred reply
+    /// senders retain the registration when the callback itself has returned.
+    pub(crate) fn register_interrupt(&self, registry: &Arc<InterruptRegistry>) -> bool {
+        if self.interrupt.get().is_some() {
+            return true;
+        }
+        if matches!(
+            self.request.operation(),
+            Ok(ll::Operation::Interrupt(_)
+                | ll::Operation::Forget(_)
+                | ll::Operation::BatchForget(_)
+                | ll::Operation::NotifyReply(_))
+        ) {
+            return true;
+        }
+        let Some(interrupt) = registry.register(self.unique()) else {
+            error!("duplicate outstanding FUSE request ID {}", self.unique());
+            return false;
+        };
+        self.interrupt.set(interrupt).is_ok()
+    }
+
+    /// Cooperatively observe an interrupt to this request.
+    ///
+    /// The observer runs at most once and must not block or send a reply. The
+    /// handler owns the original reply, including the decision whether it is
+    /// safe to return EINTR. A notification never rolls back a completed write.
+    pub fn on_interrupt(&self, callback: impl FnOnce() + Send + 'static) {
+        if let Some(interrupt) = self.interrupt.get() {
+            interrupt.on_interrupt(callback);
+        }
+    }
+
+    fn reply_sender(&self) -> RequestSender {
+        match self.interrupt.get() {
+            Some(interrupt) => RequestSender::Shared(Arc::new(InterruptReplySender {
+                sender: self.sender.clone(),
+                interrupt: interrupt.clone(),
+            })),
+            None => self.sender.clone(),
+        }
+    }
+
     /// Dispatch request to the given filesystem.
     /// This calls the appropriate filesystem operation method for the
     /// request and sends back the returned reply to the kernel
     pub(crate) fn dispatch<FS: Filesystem>(&self, se: &mut Session<FS>) {
+        if !self.register_interrupt(&se.interrupts) {
+            return;
+        }
+        let read_interrupt = self
+            .request
+            .operation()
+            .ok()
+            .filter(operation_is_cancel_safe)
+            .and_then(|_| self.interrupt.get().cloned());
+        let _interrupt_scope = DispatchInterruptScope::enter(read_interrupt);
         debug!("{}", self.request);
         // bd-xfe7z: count the crossing HERE -- before dispatch_req, before any
         // handler, memo, cache or early return. A request that reached this
@@ -383,7 +497,7 @@ impl<'a> Request<'a> {
             Ok(None) => return,
             Err(errno) => self.request.reply_err(errno),
         }
-        .with_iovec(unique, |iov| self.sender.send(iov));
+        .with_iovec(unique, |iov| self.reply_sender().send(iov));
 
         if let Err(err) = res {
             warn!("Request {unique:?}: Failed to send reply: {err}");
@@ -407,6 +521,7 @@ impl<'a> Request<'a> {
                     // Only allow operations that the kernel may issue without a uid set
                     ll::Operation::Init(_)
                     | ll::Operation::Destroy(_)
+                    | ll::Operation::Interrupt(_)
                     | ll::Operation::Read(_)
                     | ll::Operation::ReadDir(_)
                     | ll::Operation::ReadDirPlus(_)
@@ -428,6 +543,7 @@ impl<'a> Request<'a> {
                     // Only allow operations that the kernel may issue without a uid set
                     ll::Operation::Init(_)
                     | ll::Operation::Destroy(_)
+                    | ll::Operation::Interrupt(_)
                     | ll::Operation::Read(_)
                     | ll::Operation::ReadDir(_)
                     | ll::Operation::BatchForget(_)
@@ -512,9 +628,19 @@ impl<'a> Request<'a> {
                 return Err(Errno::EIO);
             }
 
-            ll::Operation::Interrupt(_) => {
-                // TODO: handle FUSE_INTERRUPT
-                return Err(Errno::ENOSYS);
+            ll::Operation::Interrupt(interrupt) => {
+                let target = u64::from(interrupt.unique());
+                if se.interrupts.interrupt(target) {
+                    return Ok(None);
+                }
+                // Another worker may have received, but not registered, the
+                // original. Give it a scheduling opportunity without holding
+                // any dispatch/registry lock, then ask the kernel to retry.
+                std::thread::sleep(std::time::Duration::from_millis(1));
+                if se.interrupts.interrupt(target) {
+                    return Ok(None);
+                }
+                return Err(Errno::EAGAIN);
             }
 
             ll::Operation::Lookup(x) => {
@@ -707,7 +833,7 @@ impl<'a> Request<'a> {
                     x.offset(),
                     ReplyDirectory::new(
                         self.request.unique().into(),
-                        self.sender.clone(),
+                        self.reply_sender(),
                         x.size() as usize,
                     ),
                 );
@@ -885,7 +1011,7 @@ impl<'a> Request<'a> {
                     x.offset(),
                     ReplyDirectoryPlus::new(
                         self.request.unique().into(),
-                        self.sender.clone(),
+                        self.reply_sender(),
                         x.size() as usize,
                     ),
                 );
@@ -962,7 +1088,7 @@ impl<'a> Request<'a> {
     /// Create a reply object for this request that can be passed to the filesystem
     /// implementation and makes sure that a request is replied exactly once
     fn reply<T: Reply>(&self) -> T {
-        Reply::new(self.request.unique().into(), self.sender.clone())
+        Reply::new(self.request.unique().into(), self.reply_sender())
     }
 
     /// Returns the unique identifier of this request
