@@ -105,6 +105,63 @@ fn command_available(name: &str) -> bool {
         .is_ok_and(|o| o.status.success())
 }
 
+/// bd-53dub: `FFS_REQUIRE_FUSE=1` must be able to FAIL. Re-run this test with
+/// an empty PATH (no `which`, `mkfs.ext4` or `debugfs`, so `fuse_available`
+/// cannot pass): with the contract the child must fail naming the reason;
+/// without it the child must pass and print the greppable SKIP line.
+#[test]
+fn require_fuse_turns_missing_prerequisites_into_a_failure_bd_53dub() {
+    if std::env::var_os("FFS_FUSE_PROBE_CHILD").is_some() {
+        assert!(
+            !fuse_available(),
+            "PATH is empty, so the prerequisites cannot be found"
+        );
+        return;
+    }
+    let empty_path = TempDir::new().expect("empty PATH dir");
+    let run_child = |require: bool| {
+        let mut child = Command::new(std::env::current_exe().expect("test executable"));
+        child
+            .args([
+                "--exact",
+                "require_fuse_turns_missing_prerequisites_into_a_failure_bd_53dub",
+                "--nocapture",
+                "--test-threads=1",
+            ])
+            .env("PATH", empty_path.path())
+            .env("FFS_FUSE_PROBE_CHILD", "1")
+            .env_remove("FFS_REQUIRE_FUSE");
+        if require {
+            child.env("FFS_REQUIRE_FUSE", "1");
+        }
+        let out = child.output().expect("run child test");
+        let text = format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        (out.status.success(), text)
+    };
+    let (required_ok, required_text) = run_child(true);
+    assert!(
+        !required_ok,
+        "missing FUSE prerequisites under FFS_REQUIRE_FUSE=1 must FAIL:\n{required_text}"
+    );
+    assert!(
+        required_text.contains("FFS_REQUIRE_FUSE=1 but the mounted test could not run"),
+        "the failure must state the contract:\n{required_text}"
+    );
+    let (optional_ok, optional_text) = run_child(false);
+    assert!(
+        optional_ok,
+        "without the contract missing prerequisites are a skip:\n{optional_text}"
+    );
+    assert!(
+        optional_text.contains("SKIP fuse_unavailable"),
+        "the skip must print its greppable SKIP line:\n{optional_text}"
+    );
+}
+
 fn emit_scenario_result(scenario_id: &str, outcome: &str, detail: Option<&str>) {
     match detail {
         Some(detail) => {

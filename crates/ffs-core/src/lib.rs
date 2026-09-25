@@ -64098,6 +64098,63 @@ mod tests {
         Some((out.status.success(), combined))
     }
 
+    /// bd-53dub: the oracle contract must be able to FAIL. This test re-runs
+    /// itself with an empty PATH, so `e2fsck` cannot be found: under
+    /// `FFS_REQUIRE_ORACLES=1` the child must fail naming the missing oracle;
+    /// without it the child must pass and print the greppable SKIP line.
+    #[test]
+    fn require_oracles_turns_a_missing_oracle_into_a_failure_bd_53dub() {
+        if std::env::var_os("FFS_ORACLE_PROBE_CHILD").is_some() {
+            let tmp = tempfile::TempDir::new().expect("tmpdir");
+            let _ = run_e2fsck(&tmp.path().join("absent.img"));
+            return;
+        }
+        let empty_path = tempfile::TempDir::new().expect("empty PATH dir");
+        let run_child = |require: bool| {
+            let mut child =
+                std::process::Command::new(std::env::current_exe().expect("test executable"));
+            child
+                .args([
+                    "--exact",
+                    "tests::require_oracles_turns_a_missing_oracle_into_a_failure_bd_53dub",
+                    "--nocapture",
+                    "--test-threads=1",
+                ])
+                .env("PATH", empty_path.path())
+                .env("FFS_ORACLE_PROBE_CHILD", "1")
+                .env_remove("FFS_REQUIRE_ORACLES");
+            if require {
+                child.env("FFS_REQUIRE_ORACLES", "1");
+            }
+            let out = child.output().expect("run child test");
+            let text = format!(
+                "{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            (out.status.success(), text)
+        };
+
+        let (required_ok, required_text) = run_child(true);
+        assert!(
+            !required_ok,
+            "a missing oracle under FFS_REQUIRE_ORACLES=1 must FAIL the test:\n{required_text}"
+        );
+        assert!(
+            required_text.contains("required oracle `e2fsck` is unavailable"),
+            "the failure must name the missing oracle:\n{required_text}"
+        );
+        let (optional_ok, optional_text) = run_child(false);
+        assert!(
+            optional_ok,
+            "without the contract a missing oracle is a skip, not a failure:\n{optional_text}"
+        );
+        assert!(
+            optional_text.contains("SKIP oracle_unavailable tool=e2fsck"),
+            "the skip must print its greppable SKIP line:\n{optional_text}"
+        );
+    }
+
     /// Validate FrankenFS's ext4 write path against real `e2fsck` (the ext4
     /// analog of the btrfs-check harness): create a file, write data, persist,
     /// and require e2fsck to report the image clean.
