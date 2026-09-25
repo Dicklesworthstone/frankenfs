@@ -145,17 +145,15 @@ fn btrfs_create_batch_threshold_probe_bd_giw9n() {
 /// bd-a136s: a full initial metadata chunk is not the end of a btrfs device.
 ///
 /// The control arm is deliberately non-vacuous: it fills a small, single-device
-/// image until the ordinary (growth-disabled) transaction commit returns ENOSPC.
+/// image until a transaction commit with growth turned off returns ENOSPC.
 /// The candidate starts from a fresh image, performs exactly the same creates
-/// and data write, enables the production chunk-growth path, then must commit,
-/// pass `btrfs check`, and be readable through the kernel btrfs driver.
-///
-/// This is ignored because it intentionally writes enough metadata to exhaust a
-/// real chunk and requires passwordless sudo for the kernel mount. Run it on the
-/// live builder with `--ignored --exact`; do not reduce CREATE_COUNT merely to
-/// make a green test, since that would make the ENOSPC control vacuous.
+/// and data write with the shipped default (growth on), then must commit,
+/// pass `btrfs check`, and be readable through the kernel btrfs driver. This is
+/// the kernel-acceptance evidence behind that default (bd-uxh7t), so it runs by
+/// default; it needs passwordless sudo and btrfs-progs. Do not reduce
+/// CREATE_COUNT merely to make a green test, since that would make the ENOSPC
+/// control vacuous.
 #[test]
-#[ignore = "bd-a136s: requires sudo + btrfs-progs and deliberately exhausts a metadata chunk"]
 fn btrfs_chunk_growth_turns_real_enospc_into_kernel_readable_image_bd_a136s() {
     const IMAGE_MIB: u64 = 128;
     const CREATE_COUNT: u32 = 60_000;
@@ -165,14 +163,22 @@ fn btrfs_chunk_growth_turns_real_enospc_into_kernel_readable_image_bd_a136s() {
         .args(["-n", "true"])
         .output()
         .expect("run sudo availability probe");
+    // A skip must not pass silently where the oracles are required (bd-53dub).
+    let skip = |reason: &str| {
+        assert!(
+            std::env::var_os("FFS_REQUIRE_ORACLES").is_none_or(|v| v != "1"),
+            "FFS_REQUIRE_ORACLES=1 but the bd-a136s kernel gate cannot run: {reason}"
+        );
+        eprintln!("SKIP bd-a136s kernel gate: {reason}");
+    };
     if !sudo.status.success() {
-        eprintln!("passwordless sudo unavailable; skipping bd-a136s kernel gate");
+        skip("passwordless sudo unavailable");
         return;
     }
 
     let tmp = tempfile::TempDir::new().expect("tmpdir");
     let Some(control_image) = mkfs_btrfs_image(tmp.path(), IMAGE_MIB) else {
-        eprintln!("btrfs-progs unavailable; skipping bd-a136s kernel gate");
+        skip("btrfs-progs unavailable");
         return;
     };
     let candidate_image = tmp.path().join("a136s-growth.btrfs");
@@ -207,10 +213,7 @@ fn btrfs_chunk_growth_turns_real_enospc_into_kernel_readable_image_bd_a136s() {
 
     {
         let control = open_rw(&cx, &control_image).expect("open growth-disabled control");
-        assert!(
-            !control.btrfs_grow_chunks_enabled(),
-            "the control must exercise the shipping-disabled growth policy"
-        );
+        control.set_btrfs_grow_chunks(false);
         populate(&control);
         let error = FsOps::flush_on_destroy(&control, &cx)
             .expect_err("fixture must exhaust the initial metadata chunk with growth disabled");
@@ -223,7 +226,10 @@ fn btrfs_chunk_growth_turns_real_enospc_into_kernel_readable_image_bd_a136s() {
 
     {
         let candidate = open_rw(&cx, &candidate_image).expect("open growth-enabled candidate");
-        candidate.set_btrfs_grow_chunks(true);
+        assert!(
+            candidate.btrfs_grow_chunks_enabled(),
+            "metadata chunk growth is the shipped default (bd-uxh7t)"
+        );
         populate(&candidate);
         FsOps::flush_on_destroy(&candidate, &cx)
             .expect("chunk growth must make the identical workload commit");

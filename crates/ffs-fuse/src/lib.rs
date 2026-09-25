@@ -5739,15 +5739,17 @@ impl Filesystem for FrankenFuse {
         // is byte-identical to before. Contrast splice above, which is opt-OUT
         // because the bank was measured with it on; nothing was ever measured with
         // this, so defaulting it on would make new rows non-comparable.
-        // MEASUREMENT ONLY, default OFF — see `zero_message_open_measurement_enabled`.
-        // The rejection above is retained verbatim; this exists so the trade it
-        // describes can be counted from one ELF instead of argued.
+        // DEFAULT ON since 2026-08-27 (`FFS_FUSE_ZERO_MESSAGE_OPEN=0` opts out).
+        // The zero-message-open rejection above is kept for history but was
+        // REFUTED by measurement: the page cache is not dropped and O_DIRECT is
+        // still honoured — see `zero_message_open_measurement_enabled`.
         if zero_message_open_measurement_enabled() {
             match config.add_capabilities(fuse_consts::FUSE_NO_OPEN_SUPPORT) {
+                // WARN, not info: the perf scripts count this line under
+                // RUST_LOG=warn to attest the configuration of each run.
                 Ok(()) => warn!(
-                    "FUSE_NO_OPEN_SUPPORT negotiated (FFS_FUSE_ZERO_MESSAGE_OPEN): \
-                     MEASUREMENT ONLY — open/release become zero-message and \
-                     FOPEN_KEEP_CACHE is no longer sent"
+                    "FUSE_NO_OPEN_SUPPORT negotiated: open/release are zero-message \
+                     (FFS_FUSE_ZERO_MESSAGE_OPEN=0 disables)"
                 ),
                 Err(missing) => debug!(
                     missing,
@@ -6018,12 +6020,13 @@ impl Filesystem for FrankenFuse {
     }
 
     fn open(&mut self, _req: &Request<'_>, ino: u64, flags: i32, reply: ReplyOpen) {
-        // MEASUREMENT ONLY, default OFF. Setting FUSE_NO_OPEN_SUPPORT at INIT is
+        // Zero-message open, default ON. Setting FUSE_NO_OPEN_SUPPORT at INIT is
         // NECESSARY BUT NOT SUFFICIENT — measured 2026-08-27: with the capability
         // negotiated and this branch absent, `crossings_open` stayed at 12,544 of
         // 12,544, byte-identical to the control. The kernel only stops sending OPEN
         // once the daemon answers one with ENOSYS, exactly as `opendir` does below.
-        // See `zero_message_open_measurement_enabled` for why this is not shippable.
+        // See `zero_message_open_measurement_enabled` for the measurements behind
+        // the default.
         if zero_message_open_measurement_enabled() {
             reply.error(libc::ENOSYS);
             return;

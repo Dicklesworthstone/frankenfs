@@ -2300,8 +2300,7 @@ pub struct OpenFs {
     /// Whether commit-time metadata/system chunk growth is enabled (bd-a136s).
     ///
     /// Read once at construction from `FFS_BTRFS_GROW_CHUNKS` (see
-    /// [`BtrfsGrowthPolicy`]). Default OFF: that path has unit coverage but no
-    /// kernel-acceptance evidence yet.
+    /// [`BtrfsGrowthPolicy`]). Default ON since bd-uxh7t (kernel-accepted).
     btrfs_grow_chunks: std::sync::atomic::AtomicBool,
     /// Whether write-time DATA chunk growth is enabled (bd-a136s, bd-34blv).
     /// Default ON: kernel-accepted (grown image mounts, payloads read back).
@@ -2872,11 +2871,17 @@ const BTRFS_MAX_CHUNKS_PER_COMMIT: u32 = 8;
 ///   byte-identical — so it is ON by default (bd-34blv): without it a write
 ///   returned ENOSPC while ~97% of the device was unallocated.
 /// * **commit-time metadata/system chunk growth** (the `'grow` block in
-///   `btrfs_full_transaction_commit`): no kernel-acceptance evidence yet, so it
-///   stays opt-in.
+///   `btrfs_full_transaction_commit`): ON by default since 2026-09-25
+///   (bd-uxh7t). Its kernel-acceptance gate,
+///   `btrfs_chunk_growth_turns_real_enospc_into_kernel_readable_image_bd_a136s`,
+///   passed with its output visible: the same 60,000-create workload fails with
+///   ENOSPC without it, commits with it, and the grown image passes `btrfs
+///   check` and kernel-mounts with the written bytes intact. Without it a
+///   filesystem whose metadata block group fills returns ENOSPC to fsync while
+///   the device has unallocated space.
 ///
-/// Values: unset -> data growth only; `1`/`true`/`on` -> both; `0`/`false`/
-/// `off` -> neither (kill switch).
+/// Values: unset/`1`/`true`/`on` -> both; `data` -> data growth only;
+/// `0`/`false`/`off` -> neither (kill switch).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BtrfsGrowthPolicy {
     /// Grow a data chunk when a data allocation finds no free space.
@@ -2890,18 +2895,6 @@ impl BtrfsGrowthPolicy {
     #[must_use]
     pub fn from_value(value: Option<&str>) -> Self {
         match value.map(str::trim) {
-            None | Some("") => Self {
-                data: true,
-                metadata: false,
-            },
-            Some(v)
-                if v == "1" || v.eq_ignore_ascii_case("true") || v.eq_ignore_ascii_case("on") =>
-            {
-                Self {
-                    data: true,
-                    metadata: true,
-                }
-            }
             Some(v)
                 if v == "0" || v.eq_ignore_ascii_case("false") || v.eq_ignore_ascii_case("off") =>
             {
@@ -2910,11 +2903,15 @@ impl BtrfsGrowthPolicy {
                     metadata: false,
                 }
             }
-            // Unrecognized values keep the shipped default rather than silently
-            // enabling the unproven metadata path.
-            Some(_) => Self {
+            Some(v) if v.eq_ignore_ascii_case("data") => Self {
                 data: true,
                 metadata: false,
+            },
+            // Unset, on-values and unrecognized values all get the shipped
+            // default: both.
+            _ => Self {
+                data: true,
+                metadata: true,
             },
         }
     }
@@ -34856,10 +34853,9 @@ impl OpenFs {
         // same reason; a commit that discovers it is short half way through has
         // no good move left.
         //
-        // OPT-IN AND DEFAULT OFF (`FFS_BTRFS_GROW_CHUNKS=1`). Commit-time
-        // metadata/system growth is unit-tested but has no kernel-acceptance
-        // evidence yet; write-time DATA growth (kernel-accepted, bd-a136s) is
-        // the default and lives in `btrfs_alloc_data_with_growth`.
+        // DEFAULT ON since bd-uxh7t (kernel-accepted: see `BtrfsGrowthPolicy`);
+        // `FFS_BTRFS_GROW_CHUNKS=data` or `=0` turns it off. Write-time DATA
+        // growth lives in `btrfs_alloc_data_with_growth`.
         //
         // Every failure here SKIPS growth rather than failing the commit. A
         // shortfall is a prediction; refusing the transaction on a prediction
@@ -86074,24 +86070,32 @@ mod tests {
         }
     }
 
-    /// bd-34blv: unset enables only the kernel-accepted data-growth path;
-    /// `1` enables both; `0` is a kill switch; junk keeps the default.
+    /// bd-uxh7t: unset enables both growth paths (both kernel-accepted); `data`
+    /// keeps only data growth; `0` is a kill switch; junk keeps the default.
     #[test]
-    fn btrfs_growth_policy_defaults_to_data_only_bd_34blv() {
-        let data_only = BtrfsGrowthPolicy {
-            data: true,
-            metadata: false,
-        };
-        assert_eq!(BtrfsGrowthPolicy::from_value(None), data_only);
-        assert_eq!(BtrfsGrowthPolicy::from_value(Some("")), data_only);
-        assert_eq!(BtrfsGrowthPolicy::from_value(Some("maybe")), data_only);
-        for on in ["1", "true", "ON"] {
+    fn btrfs_growth_policy_defaults_to_both_bd_uxh7t() {
+        assert_eq!(
+            BtrfsGrowthPolicy::from_value(Some(" Data ")),
+            BtrfsGrowthPolicy {
+                data: true,
+                metadata: false
+            }
+        );
+        for on in [
+            None,
+            Some(""),
+            Some("maybe"),
+            Some("1"),
+            Some("true"),
+            Some("ON"),
+        ] {
             assert_eq!(
-                BtrfsGrowthPolicy::from_value(Some(on)),
+                BtrfsGrowthPolicy::from_value(on),
                 BtrfsGrowthPolicy {
                     data: true,
                     metadata: true
-                }
+                },
+                "{on:?}"
             );
         }
         for off in ["0", "false", " off "] {
