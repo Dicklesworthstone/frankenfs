@@ -9705,31 +9705,41 @@ impl OpenFs {
             .store(blocks, std::sync::atomic::Ordering::Release);
     }
 
-    /// Blocks with a resident MVCC version, when the store can say cheaply
-    /// (the single store a JBD2 mount uses).
+    /// Blocks with a resident MVCC version.
     #[must_use]
-    pub fn mvcc_tracked_block_count(&self) -> Option<usize> {
+    pub fn mvcc_tracked_block_count(&self) -> usize {
         self.mvcc_store.tracked_block_count()
     }
 
+    /// Eviction for a boundary whose flush did NOT capture under a closed
+    /// mutation gate (the direct ext4 paths and the btrfs commit): close it
+    /// now, so no in-flight mutation can still hold an older unregistered
+    /// snapshot, then evict up to the durable watermark. Must not be called
+    /// while holding a lock a gated mutation may wait on (the btrfs allocator
+    /// lock), or from inside a gated mutation.
+    fn evict_durable_mvcc_chains_quiesced(&self) {
+        let _gate = self.close_mutation_gate();
+        let durable_through = *self.mvcc_flushed_through.lock();
+        self.evict_durable_mvcc_chains(durable_through);
+    }
+
     /// Called at the end of a successful journaled boundary, after its home
-    /// checkpoint is durable and the base-block cache is cleared (bd-dj725).
+    /// checkpoint is durable and the base-block cache is cleared, and by
+    /// [`Self::evict_durable_mvcc_chains_quiesced`] (bd-dj725).
     ///
     /// Sound for the eviction contract because the boundary drained the
-    /// mutation gate before capturing: every transaction that began before
-    /// the capture has finished, and every one that begins after it holds a
-    /// snapshot at or past `durable_through`, so none can miss a
+    /// mutation gate before capturing (or the caller holds it closed): every
+    /// transaction that began before has finished, and every one that begins
+    /// after holds a snapshot at or past `durable_through`, so none can miss a
     /// first-committer-wins conflict on a dropped chain. Each dropped block's
     /// base-cache entry is removed while the store is still exclusively held,
     /// because that cache sits BELOW the MVCC overlay and can hold device
     /// bytes older than the version being dropped.
-    fn ext4_evict_durable_mvcc_chains(&self, durable_through: CommitSeq) {
+    fn evict_durable_mvcc_chains(&self, durable_through: CommitSeq) {
         let cap = self
             .mvcc_resident_block_cap
             .load(std::sync::atomic::Ordering::Acquire);
-        let Some(resident) = self.mvcc_store.tracked_block_count() else {
-            return;
-        };
+        let resident = self.mvcc_store.tracked_block_count();
         if resident <= cap {
             return;
         }
@@ -10269,6 +10279,8 @@ impl OpenFs {
                     self.dev.sync(cx)?;
                     info!(flushed_blocks = flushed, "flush_mvcc_to_device");
                 }
+                // bd-dj725: the memory bound for mounts without a JBD2 writer.
+                self.evict_durable_mvcc_chains_quiesced();
                 Ok(flushed)
             })(),
         )
@@ -23034,7 +23046,7 @@ impl OpenFs {
         // as `ext4_persist_group_descriptors_from` does, so drop them.
         self.ext4_group_desc_cache.clear();
         self.ext4_base_block_cache.clear();
-        self.ext4_evict_durable_mvcc_chains(durable_through);
+        self.evict_durable_mvcc_chains(durable_through);
         if let Some(writes) = writes_before {
             self.jbd2_block_writes_at_boundary
                 .fetch_max(writes, std::sync::atomic::Ordering::AcqRel);
@@ -23250,11 +23262,21 @@ impl OpenFs {
                 } else {
                     None
                 };
-            let block_bitmap = if gs.free_blocks < alloc.geo.blocks_in_group(group) {
-                Some(device.read_block(cx, gs.block_bitmap_block)?.into_inner())
-            } else {
-                None
-            };
+            // A BLOCK_UNINIT group has an undefined bitmap block (a lazy mkfs
+            // leaves it zeroed), and a group holding a superblock backup is
+            // always below full capacity, so the bare count test used to feed
+            // that zeroed block in as the group's bitmap and clear
+            // BLOCK_UNINIT — dropping the backup superblock/GDT bits (e2fsck on
+            // e2fsprogs 1.47.0 images: "Block bitmap differences +(24577--24835)").
+            // Only a materialised bitmap is persisted; allocating into a
+            // BLOCK_UNINIT group materialises it (ffs_alloc synthesizes the
+            // initial bitmap and marks the group initialized).
+            let block_bitmap =
+                if !gs.block_bitmap_uninit() && gs.free_blocks < alloc.geo.blocks_in_group(group) {
+                    Some(device.read_block(cx, gs.block_bitmap_block)?.into_inner())
+                } else {
+                    None
+                };
             entries.push((group, gs.clone(), block_bitmap, inode_bitmap));
         }
         ffs_alloc::persist_group_descs_batched(cx, device, &alloc.persist_ctx, &entries)
@@ -33410,6 +33432,8 @@ impl OpenFs {
                     flushed_blocks = flushed,
                     "ext4_sync_applied"
                 );
+                // bd-dj725: memory bound on the unjournaled fsync path.
+                self.evict_durable_mvcc_chains_quiesced();
                 Ok(())
             }
             Err(err) => {
@@ -36260,6 +36284,12 @@ impl OpenFs {
 
         // Record superblock commit (for crash point tracking)
         executor.commit_superblock();
+
+        // bd-dj725: the data this commit flushed is durable; drop it from the
+        // MVCC store once over the resident cap. The allocator lock is no
+        // longer held here, so closing the mutation gate cannot deadlock
+        // against a gated btrfs mutation waiting for that lock.
+        self.evict_durable_mvcc_chains_quiesced();
 
         info!(
             target: "ffs::btrfs::writeback",
@@ -64858,7 +64888,7 @@ mod tests {
                 .expect("write");
         }
         fs.fsync(&cx, attr.ino, 0, false).expect("fsync");
-        let resident = fs.mvcc_tracked_block_count().expect("single store");
+        let resident = fs.mvcc_tracked_block_count();
         assert!(
             resident <= 64,
             "after a boundary above the cap only non-durable chains may stay \
@@ -64911,6 +64941,57 @@ mod tests {
             clean,
             "image after eviction must be e2fsck-clean:\n{output}"
         );
+    }
+
+    /// bd-dj725 memory bound without a JBD2 writer: the sharded store and the
+    /// direct flush path evict durable chains too, with reads, overwrites and
+    /// the on-disk image staying exact.
+    #[test]
+    fn ext4_unjournaled_flush_evicts_durable_chains_bd_dj725() {
+        let cx = Cx::for_testing();
+        let Some((fs, dev, tmp)) = open_writable_ext4_mkfs_with_device(64) else {
+            oracle_unavailable("ext4 image formatter");
+            return;
+        };
+        fs.set_mvcc_resident_block_cap(64);
+        let attr = fs
+            .create(&cx, InodeNumber(2), OsStr::new("bulk.bin"), 0o644, 0, 0)
+            .expect("create");
+        let mib: Vec<u8> = (0..1024 * 1024_u32).map(|i| (i % 249) as u8).collect();
+        for m in 0..8_u64 {
+            fs.write(&cx, attr.ino, m * 1024 * 1024, &mib)
+                .expect("write");
+        }
+        fs.flush_mvcc_to_device(&cx).expect("direct boundary");
+        let resident = fs.mvcc_tracked_block_count();
+        assert!(
+            resident <= 64,
+            "2048 data blocks written; {resident} remain resident after the boundary"
+        );
+        for m in 0..8_u64 {
+            assert_eq!(
+                fs.read(&cx, attr.ino, m * 1024 * 1024, 1024 * 1024)
+                    .expect("read"),
+                mib,
+                "MiB {m} after eviction"
+            );
+        }
+        fs.write(&cx, attr.ino, 5 * 1024 * 1024 + 7, &[0xD1_u8; 9000])
+            .expect("overwrite");
+        fs.flush_mvcc_to_device(&cx).expect("second boundary");
+        let mut expected = mib.clone();
+        expected[7..9007].fill(0xD1);
+        assert_eq!(
+            fs.read(&cx, attr.ino, 5 * 1024 * 1024, 1024 * 1024)
+                .expect("read overwritten"),
+            expected
+        );
+        let path = tmp.path().join("unjournaled-evicted.ext4");
+        std::fs::write(&path, dev.snapshot_bytes()).expect("write image");
+        let Some((clean, output)) = run_e2fsck(&path) else {
+            return;
+        };
+        assert!(clean, "image must be e2fsck-clean:\n{output}");
     }
 
     /// A durability boundary larger than the journal must still persist. The
@@ -84268,6 +84349,60 @@ mod tests {
         );
     }
 
+    /// bd-dj725 memory bound on btrfs: a full transaction commit drops the data
+    /// chains it made durable once the store is over the resident cap, and
+    /// reads, the committed image and `btrfs check` stay exact.
+    #[test]
+    fn btrfs_commit_evicts_durable_data_chains_bd_dj725() {
+        let cx = Cx::for_testing();
+        let Some((fs, dev, tmp, _image)) = open_writable_btrfs_mkfs(256) else {
+            return;
+        };
+        fs.set_mvcc_resident_block_cap(64);
+        let attr = fs
+            .create(&cx, InodeNumber(1), OsStr::new("bulk.bin"), 0o644, 0, 0)
+            .expect("create");
+        let mib: Vec<u8> = (0..1024 * 1024_u32).map(|i| (i % 241) as u8).collect();
+        for m in 0..8_u64 {
+            fs.write(&cx, attr.ino, m * 1024 * 1024, &mib)
+                .expect("write");
+        }
+        fs.btrfs_full_transaction_commit(&cx, "bd-dj725-evict")
+            .expect("commit");
+        let resident = fs.mvcc_tracked_block_count();
+        assert!(
+            resident <= 64,
+            "2048 data blocks committed; {resident} remain resident"
+        );
+        for m in 0..8_u64 {
+            assert_eq!(
+                fs.read(&cx, attr.ino, m * 1024 * 1024, 1024 * 1024)
+                    .expect("read"),
+                mib,
+                "MiB {m} after eviction"
+            );
+        }
+        let image = dev.snapshot_bytes();
+        let reopened = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(image.clone())),
+            &OpenOptions::default(),
+        )
+        .expect("reopen committed image");
+        assert_eq!(
+            reopened
+                .read(&cx, attr.ino, 7 * 1024 * 1024, 1024 * 1024)
+                .expect("reopened read"),
+            mib
+        );
+        let path = tmp.path().join("evicted.btrfs");
+        std::fs::write(&path, image).expect("write image");
+        let Some((clean, output)) = run_btrfs_check(&path) else {
+            return;
+        };
+        assert!(clean, "btrfs check after eviction:\n{output}");
+    }
+
     /// Format a real btrfs image with btrfs-progs and open it writable. Returns
     /// `None` only when the format tool is unavailable (test skips); if the tool
     /// runs but FrankenFS cannot open the resulting image, this panics so the
@@ -84337,6 +84472,127 @@ mod tests {
     /// individual inode fields without also recomputing the inode checksum, and
     /// by returning the device + image path. Reuses the existing `run_e2fsck`.
     /// Returns None when e2fsprogs is unavailable.
+    /// e2fsprogs 1.47.0 (Ubuntu 24.04) leaves the block bitmap of a lazily
+    /// initialized BLOCK_UNINIT group ZEROED, even for a group holding a
+    /// superblock backup; 1.47.2 writes it. FrankenFS treated that zeroed block
+    /// as the group's bitmap, so the descriptor flush cleared BLOCK_UNINIT over
+    /// a bitmap without the backup superblock/GDT bits — CI (e2fsprogs 1.47.0):
+    /// "Block bitmap differences: +(24577--24835) ... Free blocks count wrong".
+    /// This recreates that layout on any e2fsprogs with debugfs, checks the
+    /// recreated image is itself e2fsck-clean, then runs the create/delete
+    /// storm plus block allocations and requires a clean image.
+    #[test]
+    fn ext4_block_uninit_backup_groups_keep_their_metadata_bits() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let image = tmp.path().join("lazy.ext4");
+        std::fs::File::create(&image)
+            .and_then(|f| f.set_len(256 * 1024 * 1024))
+            .expect("size image");
+        let made = std::process::Command::new("mke2fs")
+            .args([
+                "-q",
+                "-t",
+                "ext4",
+                "-O",
+                "extent,fast_commit",
+                "-b",
+                "1024",
+                "-F",
+            ])
+            .arg(&image)
+            .output();
+        if !made.is_ok_and(|o| o.status.success()) {
+            oracle_unavailable("mke2fs (e2fsprogs)");
+            return;
+        }
+        let cx = Cx::for_testing();
+        let probe = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(std::fs::read(&image).expect("read"))),
+            &OpenOptions::default(),
+        )
+        .expect("open probe");
+        let mut script = String::new();
+        for group in [3_u32, 5, 7, 9, 25, 27] {
+            let gd = probe.read_group_desc(&cx, GroupNumber(group)).expect("gd");
+            script.push_str(&format!(
+                "set_bg {group} flags {}\nzap_block {}\nset_bg {group} checksum calc\n",
+                gd.flags | 0x2,
+                gd.block_bitmap
+            ));
+        }
+        drop(probe);
+        let script_path = tmp.path().join("lazy.debugfs");
+        std::fs::write(&script_path, script).expect("write debugfs script");
+        let lazied = std::process::Command::new("debugfs")
+            .args(["-w", "-f"])
+            .arg(&script_path)
+            .arg(&image)
+            .output();
+        if !lazied.is_ok_and(|o| o.status.success()) {
+            oracle_unavailable("debugfs");
+            return;
+        }
+        let Some((clean, output)) = run_e2fsck(&image) else {
+            return;
+        };
+        assert!(
+            clean,
+            "the recreated lazy-init layout must itself be valid before FrankenFS \
+             touches it:\n{output}"
+        );
+
+        let dev = TestDevice::from_vec(std::fs::read(&image).expect("read lazy image"));
+        let mut fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default())
+            .expect("open lazy image");
+        fs.enable_writes(&cx).expect("enable writes");
+        let root = InodeNumber(2);
+        // Directories spread over groups (Orlov), each with data, so block
+        // allocations land in BLOCK_UNINIT groups too.
+        for d in 0..24_u32 {
+            let dir = fs
+                .mkdir(&cx, root, OsStr::new(&format!("d{d}")), 0o755, 0, 0)
+                .expect("mkdir");
+            let file = fs
+                .create(&cx, dir.ino, OsStr::new("data.bin"), 0o644, 0, 0)
+                .expect("create data");
+            fs.write(&cx, file.ino, 0, &vec![0x6B_u8; 64 * 1024])
+                .expect("write data");
+        }
+        let storm = fs
+            .mkdir(&cx, root, OsStr::new("storm"), 0o755, 0, 0)
+            .expect("mkdir storm");
+        for index in 0..600 {
+            fs.create(
+                &cx,
+                storm.ino,
+                OsStr::new(&format!("s{index}")),
+                0o644,
+                0,
+                0,
+            )
+            .expect("create");
+        }
+        fs.fsync(&cx, storm.ino, 0, false)
+            .expect("fsyncdir after creates");
+        for index in 0..600 {
+            fs.unlink(&cx, storm.ino, OsStr::new(&format!("s{index}")))
+                .expect("unlink");
+        }
+        fs.fsync(&cx, storm.ino, 0, false)
+            .expect("fsyncdir after deletes");
+        drop(fs);
+
+        std::fs::write(&image, dev.snapshot_bytes()).expect("write result");
+        let Some((clean, output)) = run_e2fsck(&image) else {
+            return;
+        };
+        assert!(
+            clean,
+            "BLOCK_UNINIT backup groups must keep their superblock/GDT bits:\n{output}"
+        );
+    }
+
     fn open_ext4_mke2fs(
         size_mb: u64,
         with_csum: bool,

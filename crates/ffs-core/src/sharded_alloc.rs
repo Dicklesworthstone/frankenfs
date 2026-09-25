@@ -194,6 +194,9 @@ impl PerGroupAlloc {
             stats.free_blocks = apply_delta(stats.free_blocks, seed.free_blocks, live.free_blocks);
             stats.free_inodes = apply_delta(stats.free_inodes, seed.free_inodes, live.free_inodes);
             stats.used_dirs = apply_delta(stats.used_dirs, seed.used_dirs, live.used_dirs);
+            if live.block_bitmap_initialized {
+                stats.mark_block_bitmap_initialized();
+            }
         }
         out
     }
@@ -498,6 +501,12 @@ pub struct SeedCounts {
     pub(crate) free_blocks: u32,
     pub(crate) free_inodes: u32,
     pub(crate) used_dirs: u32,
+    /// The single-lock group's block bitmap has been materialised (block
+    /// allocations go through that structure). The descriptor flush persists a
+    /// block bitmap only for such a group, so the reconciled stats must carry
+    /// it or an allocated-into BLOCK_UNINIT group would keep the flag on disk
+    /// over real allocations.
+    pub(crate) block_bitmap_initialized: bool,
 }
 
 impl SeedCounts {
@@ -506,6 +515,7 @@ impl SeedCounts {
             free_blocks: stats.free_blocks,
             free_inodes: stats.free_inodes,
             used_dirs: stats.used_dirs,
+            block_bitmap_initialized: !stats.block_bitmap_uninit(),
         }
     }
 

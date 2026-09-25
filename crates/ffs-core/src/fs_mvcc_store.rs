@@ -308,18 +308,16 @@ impl FsMvccStore {
         }
     }
 
-    /// Blocks with a resident version: O(1) on the single store (the one a
-    /// JBD2 mount uses), `None` on the sharded store.
-    pub(super) fn tracked_block_count(&self) -> Option<usize> {
+    /// Blocks with a resident version (O(1) single store, O(shards) sharded).
+    pub(super) fn tracked_block_count(&self) -> usize {
         match self {
-            Self::Single(lock) => Some(lock.read().tracked_block_count()),
-            Self::Sharded(_) => None,
+            Self::Single(lock) => lock.read().tracked_block_count(),
+            Self::Sharded(store) => store.block_count_versioned(),
         }
     }
 
     /// Drop durable block chains (bd-dj725); see
     /// [`ffs_mvcc::MvccStore::evict_durable_chains`] for the caller contract.
-    /// The sharded store never carries a JBD2 writer and is left untouched.
     pub(super) fn evict_durable_chains(
         &self,
         durable_through: CommitSeq,
@@ -327,7 +325,7 @@ impl FsMvccStore {
     ) -> usize {
         match self {
             Self::Single(lock) => lock.write().evict_durable_chains(durable_through, on_evict),
-            Self::Sharded(_) => 0,
+            Self::Sharded(store) => store.evict_durable_chains(durable_through, on_evict),
         }
     }
 

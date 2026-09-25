@@ -2038,6 +2038,43 @@ impl ShardedMvccStore {
         self.shards.iter().map(|s| s.read().versions.len()).sum()
     }
 
+    /// Drop every block chain whose newest version is durable at its home
+    /// location and visible to every registered snapshot (bd-dj725); the
+    /// sharded counterpart of [`crate::MvccStore::evict_durable_chains`], with
+    /// the same caller contract. This store has no physical remapping, so
+    /// every chain lives at its home location. `on_evict` runs while the
+    /// block's shard is exclusively held. Returns the number of blocks dropped.
+    pub fn evict_durable_chains(
+        &self,
+        durable_through: CommitSeq,
+        mut on_evict: impl FnMut(BlockNumber),
+    ) -> usize {
+        let bound = self
+            .watermark()
+            .map_or(durable_through, |wm| wm.min(durable_through));
+        let mut evicted = 0_usize;
+        for shard in &self.shards {
+            let mut guard = shard.write();
+            let MvccShard {
+                versions,
+                prune_candidates,
+                ..
+            } = &mut *guard;
+            versions.retain(|block, chain| {
+                let durable = chain
+                    .last()
+                    .is_some_and(|newest| newest.commit_seq <= bound);
+                if durable {
+                    on_evict(*block);
+                    prune_candidates.remove(block);
+                    evicted += 1;
+                }
+                !durable
+            });
+        }
+        evicted
+    }
+
     // ── Internals ───────────────────────────────────────────────────────
 
     /// Sorted, deduplicated shard indices touched by a transaction's writes.

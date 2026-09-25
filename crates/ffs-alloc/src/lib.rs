@@ -1008,6 +1008,13 @@ impl GroupStats {
         self.flags & GD_FLAG_BLOCK_UNINIT != 0
     }
 
+    /// Record that this group's block bitmap has been materialised (written
+    /// with real content), so later reads use the device copy and the
+    /// descriptor flush persists it and clears `BLOCK_UNINIT` on disk.
+    pub fn mark_block_bitmap_initialized(&mut self) {
+        self.flags &= !GD_FLAG_BLOCK_UNINIT;
+    }
+
     /// Return the cached largest free block run for this group, if known.
     #[must_use]
     pub fn cached_block_largest_free_run(&self) -> Option<u32> {
@@ -1770,6 +1777,44 @@ fn is_power_of(mut value: u32, factor: u32) -> bool {
         value /= factor;
     }
     value == 1
+}
+
+/// Read a group's block bitmap for modification.
+///
+/// A `BLOCK_UNINIT` group's on-disk bitmap block is UNDEFINED — a lazily
+/// initialized mkfs (e2fsprogs 1.47.0, Ubuntu 24.04's) leaves it zeroed, and
+/// the kernel never reads it: `ext4_init_block_bitmap` builds it from the
+/// layout. Taking the zeroed block as authoritative lost the group's backup
+/// superblock/GDT blocks the moment the bitmap was written back (e2fsck:
+/// "Block bitmap differences: +(24577--24835)", "Free blocks count wrong").
+/// For such a group this synthesizes the initial bitmap instead: every
+/// reserved block (`reserved`, from [`reserved_blocks_in_group`]) set, plus
+/// the padding past the group's last block. The caller must
+/// [`GroupStats::mark_block_bitmap_initialized`] once it writes the result.
+pub fn read_block_bitmap_for_update(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    geo: &FsGeometry,
+    stats: &GroupStats,
+    group: GroupNumber,
+    reserved: &[u32],
+) -> Result<Vec<u8>> {
+    if !stats.block_bitmap_uninit() {
+        return Ok(dev
+            .read_block(cx, stats.block_bitmap_block)?
+            .as_slice()
+            .to_vec());
+    }
+    let len = usize::try_from(geo.block_size)
+        .map_err(|_| FfsError::Format("block size exceeds usize".into()))?;
+    let mut bitmap = vec![0_u8; len];
+    for &rel in reserved {
+        bitmap_set(&mut bitmap, rel);
+    }
+    let bits = u32::try_from(len.saturating_mul(8)).unwrap_or(u32::MAX);
+    let used = geo.blocks_in_group(group).min(bits);
+    bitmap_set_range(&mut bitmap, used, bits - used);
+    Ok(bitmap)
 }
 
 /// Determine which relative block offsets within a group are reserved metadata
@@ -2563,11 +2608,9 @@ fn try_alloc_in_group(
 
     let blocks_in_group = geo.blocks_in_group(group);
 
-    // Read the block bitmap.
-    let bitmap_buf = dev.read_block(cx, gs.block_bitmap_block)?;
-    let mut bitmap = bitmap_buf.as_slice().to_vec();
-
+    // Read the block bitmap (synthesized for a BLOCK_UNINIT group).
     let reserved = reserved_blocks_in_group(geo, groups, group);
+    let mut bitmap = read_block_bitmap_for_update(cx, dev, geo, gs, group, &reserved)?;
     for &r in reserved.iter() {
         bitmap_set(&mut bitmap, r);
     }
@@ -2593,6 +2636,7 @@ fn try_alloc_in_group(
         dev.write_block(cx, gs.block_bitmap_block, &bitmap)?;
 
         // Update group stats.
+        groups[gidx].mark_block_bitmap_initialized();
         groups[gidx].free_blocks = groups[gidx].free_blocks.saturating_sub(alloc_count);
         groups[gidx].refresh_block_largest_free_run(&bitmap, blocks_in_group);
 
@@ -2802,8 +2846,11 @@ pub fn try_alloc_blocks_in_group(
 
     let blocks_in_group = geo.blocks_in_group(group);
 
-    let bitmap_buf = dev.read_block(cx, stats.block_bitmap_block)?;
-    let mut bitmap = bitmap_buf.as_slice().to_vec();
+    // A BLOCK_UNINIT group's bitmap is synthesized (its device block is
+    // undefined), so it must be written WHOLE: the incremental OR-merge below
+    // would re-apply only this op's bits onto the undefined base.
+    let synthesized = stats.block_bitmap_uninit();
+    let mut bitmap = read_block_bitmap_for_update(cx, dev, geo, stats, group, reserved)?;
     let mut rollback_clear_bits = Vec::with_capacity(reserved.len() + count as usize);
 
     // Ensure all reserved blocks are marked as allocated in the bitmap. Once a
@@ -2855,7 +2902,7 @@ pub fn try_alloc_blocks_in_group(
         // contiguous, so the alloc range itself is the rollback undo (cleared
         // below) — no per-bit undo push needed here.
         bitmap_set_range(&mut bitmap, rel_start, alloc_count);
-        let block_bitmap_override = if rollback_clear_bits.is_empty() {
+        let block_bitmap_override = if rollback_clear_bits.is_empty() && !synthesized {
             BitmapOverride::from_flipped_bit_range(
                 &bitmap,
                 rel_start,
@@ -2878,7 +2925,7 @@ pub fn try_alloc_blocks_in_group(
         // unconfirmed-reserved path keeps the plain write. Default (non-sharded)
         // builds are byte-identical.
         #[cfg(feature = "bhh0i_sharded_alloc")]
-        if rollback_clear_bits.is_empty() {
+        if rollback_clear_bits.is_empty() && !synthesized {
             dev.rmw_block_bitmap_or(cx, stats.block_bitmap_block, &mut |base_bitmap| {
                 bitmap_set_range(base_bitmap, rel_start, alloc_count);
                 Ok(())
@@ -2888,6 +2935,7 @@ pub fn try_alloc_blocks_in_group(
         }
         #[cfg(not(feature = "bhh0i_sharded_alloc"))]
         dev.write_block(cx, stats.block_bitmap_block, &bitmap)?;
+        stats.mark_block_bitmap_initialized();
         let previous_free_blocks = stats.free_blocks;
         let previous_largest_free_run = stats.block_largest_free_run;
         stats.free_blocks = previous_free_blocks.saturating_sub(alloc_count);
@@ -3345,8 +3393,7 @@ fn try_alloc_batch_in_group(
     let blocks_in_group = geo.blocks_in_group(group);
     let reserved = reserved_blocks_in_group(geo, groups, group);
 
-    let bitmap_buf = dev.read_block(cx, groups[gidx].block_bitmap_block)?;
-    let mut bitmap = bitmap_buf.as_slice().to_vec();
+    let mut bitmap = read_block_bitmap_for_update(cx, dev, geo, &groups[gidx], group, &reserved)?;
     let mut rollback_clear_bits = Vec::with_capacity(reserved.len() + max_count as usize);
 
     // Mark reserved blocks.
@@ -3378,6 +3425,7 @@ fn try_alloc_batch_in_group(
 
     // Single bitmap write for all allocations in this group.
     dev.write_block(cx, groups[gidx].block_bitmap_block, &bitmap)?;
+    groups[gidx].mark_block_bitmap_initialized();
     let count_allocated = u32::try_from(allocated.len()).map_err(|_| FfsError::Corruption {
         block: 0,
         detail: "group allocation count is bounded by u32 request".into(),
