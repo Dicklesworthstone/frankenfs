@@ -56,7 +56,9 @@ fn competing_create_preserves_a_live_wal_and_its_append_position() {
         );
         assert_eq!(fs::read(&path).expect("read after conflict"), before);
     }
-    owner.append_commit(&commit(2)).expect("owner remains usable");
+    owner
+        .append_commit(&commit(2))
+        .expect("owner remains usable");
     assert_eq!(replayed_sequences(&path), [1, 2]);
 }
 
@@ -160,7 +162,9 @@ fn subprocess_owner_blocks_creation_and_process_death_releases_the_inode() {
     if let Some(path) = std::env::var_os(CHILD_PATH) {
         let mut owner = WalWriter::create(Path::new(&path), WalWriterConfig::default())
             .expect("child owns WAL");
-        owner.append_commit(&commit(1)).expect("child durable commit");
+        owner
+            .append_commit(&commit(1))
+            .expect("child durable commit");
         println!("{READY}");
         std::io::stdout().flush().expect("publish readiness");
         let mut stop = [0_u8; 1];
@@ -211,10 +215,13 @@ fn subprocess_owner_blocks_creation_and_process_death_releases_the_inode() {
         .write(true)
         .open(&path)
         .expect("recovery descriptor");
-    file.try_lock().expect("no stale process-owned lock remains");
+    file.try_lock()
+        .expect("no stale process-owned lock remains");
     let size = file.metadata().expect("size").len();
     let mut recovered = WalWriter::new(file, size, WalWriterConfig::default());
     recovered.set_last_commit_seq(1);
-    recovered.append_commit(&commit(2)).expect("next durable commit");
+    recovered
+        .append_commit(&commit(2))
+        .expect("next durable commit");
     assert_eq!(replayed_sequences(&path), [1, 2]);
 }

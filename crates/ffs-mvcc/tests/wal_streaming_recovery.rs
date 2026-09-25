@@ -134,7 +134,10 @@ fn streaming_validates_zero_padding_across_chunk_boundaries() {
 #[test]
 fn streaming_preserves_invariants_in_checkpoint_covered_prefixes() {
     for sequences in [[1, 3, 2], [1, 1, 2], [1, 2, u64::MAX], [0, 1, 2]] {
-        let data: Vec<_> = sequences.into_iter().flat_map(|seq| record(seq, 9)).collect();
+        let data: Vec<_> = sequences
+            .into_iter()
+            .flat_map(|seq| record(seq, 9))
+            .collect();
         for policy in [TailPolicy::TruncateToLastGood, TailPolicy::FailFast] {
             assert_equivalent(&data, u64::MAX, policy);
         }
@@ -196,13 +199,9 @@ fn io_failures_never_become_truncation_permission() {
                     eof,
                 };
                 let error = WalReplayEngine::new(policy)
-                    .replay_reader(
-                        &Cx::for_testing(),
-                        &mut reader,
-                        byte_count(data),
-                        0,
-                        |_| panic!("incomplete read must never apply"),
-                    )
+                    .replay_reader(&Cx::for_testing(), &mut reader, byte_count(data), 0, |_| {
+                        panic!("incomplete read must never apply")
+                    })
                     .unwrap_err();
                 assert!(matches!(error, FfsError::Io(_)));
             }

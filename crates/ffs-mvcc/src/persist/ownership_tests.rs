@@ -35,7 +35,11 @@ fn sealed_writer_retains_ownership_until_the_store_is_dropped() {
     ));
     assert_eq!(owner.current_snapshot().high, CommitSeq(1));
     let bytes = std::fs::read(&path).expect("uncertain on-disk record");
-    owner.wal.read().ensure_ready().expect_err("writer is sealed");
+    owner
+        .wal
+        .read()
+        .ensure_ready()
+        .expect_err("writer is sealed");
     assert_busy(&PersistentMvccStore::open(&cx, &path).expect_err("sealed owner still owns WAL"));
     assert_busy(
         &WalWriter::create(&path, WalWriterConfig::default())
@@ -54,7 +58,10 @@ fn sealed_writer_retains_ownership_until_the_store_is_dropped() {
     );
     let mut next = recovered.begin();
     next.stage_write(BlockNumber(3), vec![3; 32]);
-    assert_eq!(recovered.commit(next).expect("new owner commit"), CommitSeq(3));
+    assert_eq!(
+        recovered.commit(next).expect("new owner commit"),
+        CommitSeq(3)
+    );
 }
 
 #[test]
@@ -84,7 +91,9 @@ fn checkpoint_publication_never_releases_the_wal_inode() {
         })
         .expect("complete checkpoint publication");
     assert_eq!(owner.wal_stats().checkpoint_commit_seq, 1);
-    owner.truncate_wal().expect("truncate without replacing inode");
+    owner
+        .truncate_wal()
+        .expect("truncate without replacing inode");
     assert_busy(&PersistentMvccStore::open(&cx, &path).expect_err("ownership survives truncation"));
     drop(owner);
     let recovered = PersistentMvccStore::open(&cx, &path).expect("checkpoint recovery");

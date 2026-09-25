@@ -489,7 +489,11 @@ fn checkpoint_writer_refuses_invalid_identity_order_and_counter_horizons() {
         (3, 3, vec![wrong_block]),
         (3, 3, vec![wrong_writer]),
         (3, 3, vec![valid.clone(), valid.clone()]),
-        (3, 3, vec![checkpoint_version(0, VersionData::full(vec![7]))]),
+        (
+            3,
+            3,
+            vec![checkpoint_version(0, VersionData::full(vec![7]))],
+        ),
         (3, 3, vec![checkpoint_version(1, VersionData::Identical)]),
         (3, 3, Vec::new()),
     ] {

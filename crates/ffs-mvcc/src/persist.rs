@@ -907,13 +907,7 @@ fn write_checkpoint(
 
         let mut previous_seq = None;
         for (vi, version) in block_versions.iter().enumerate() {
-            validate_checkpoint_version(
-                *block,
-                version,
-                previous_seq,
-                next_txn,
-                next_commit,
-            )?;
+            validate_checkpoint_version(*block, version, previous_seq, next_txn, next_commit)?;
             previous_seq = Some(version.commit_seq.0);
             hasher.write_all(writer, &version.commit_seq.0.to_le_bytes())?;
             hasher.write_all(writer, &version.writer.0.to_le_bytes())?;

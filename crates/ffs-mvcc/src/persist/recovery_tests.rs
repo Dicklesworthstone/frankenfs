@@ -178,7 +178,10 @@ fn streamed_open_restores_large_records_and_resumes_durable_commits() {
     assert_eq!(reopened.recovery_report().commits_replayed, 2);
     assert_eq!(reopened.recovery_report().records_discarded, 0);
     let snapshot = reopened.current_snapshot();
-    assert_eq!(reopened.read_visible(BlockNumber(7), snapshot), Some(payload));
+    assert_eq!(
+        reopened.read_visible(BlockNumber(7), snapshot),
+        Some(payload)
+    );
     assert_eq!(
         reopened.read_visible(BlockNumber(8), snapshot),
         Some(vec![8; 128])

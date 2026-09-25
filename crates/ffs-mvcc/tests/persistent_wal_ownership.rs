@@ -207,7 +207,10 @@ fn unsuccessful_recovery_releases_ownership_and_preserves_existing_bytes() {
     fs::write(&checkpoint, b"invalid checkpoint").expect("bad checkpoint");
     for mode in [0, 2, 3] {
         open_mode(mode, &path, &checkpoint).expect_err("bad checkpoint rejected");
-        assert_eq!(fs::read(&path).expect("WAL not changed by failed load"), bytes);
+        assert_eq!(
+            fs::read(&path).expect("WAL not changed by failed load"),
+            bytes
+        );
         probe_released(&path);
     }
     fs::remove_file(&checkpoint).expect("remove bad checkpoint");
@@ -339,7 +342,10 @@ fn process_death_releases_ownership_for_checkpoint_plus_wal_recovery() {
         fs::read(&checkpoint).expect("untouched checkpoint"),
         checkpoint_before
     );
-    child.0.kill().expect("terminate owner without graceful close");
+    child
+        .0
+        .kill()
+        .expect("terminate owner without graceful close");
     child.0.wait().expect("reap child");
     observer.join().expect("readiness observer");
 
