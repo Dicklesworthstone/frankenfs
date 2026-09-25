@@ -2338,7 +2338,7 @@ fn run_mount(image: &Path, mountpoint: &Path) -> Result<()> {
         auto_unmount:     true,
         writeback_cache:  WritebackCacheMode::Disabled,
         ioctl_trace_path: None,
-        worker_threads:   0,    // 0 = one serial dispatch thread; N > 0 = N worker threads
+        worker_threads:   0,    // 0 = auto: min(available CPUs, 8) workers; 1 = serial; N = N workers
     };
 
     // mount() blocks the calling thread until unmount.
@@ -3604,7 +3604,7 @@ All knobs are struct fields. There are no hidden environment variables, except t
 | Parameter | Default | Effect |
 |---|---|---|
 | `MountOptions.read_only` | `true` | Safe default; `--rw` for experimental writes |
-| `MountOptions.worker_threads` | 0 | 0 runs one serial dispatch thread; N > 0 runs N worker threads |
+| `MountOptions.worker_threads` | 0 | 0 = auto, `min(available_parallelism, 8)` dispatch workers (spec §1.7); 1 = one serial dispatch thread; N = N workers. CLI: `FFS_FUSE_WORKERS` |
 | `MountOptions.allow_other` | `false` | Multi-user FUSE access |
 | `--runtime-mode` | `standard` | `managed` or `per-core` for richer evidence |
 | Kernel `writeback_cache` | off | Opt-in only via three accepted artifacts + matching host manifest |

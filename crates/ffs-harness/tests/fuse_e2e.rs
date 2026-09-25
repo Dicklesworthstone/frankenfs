@@ -1614,6 +1614,17 @@ impl Drop for KernelRoMount {
         let _ = Command::new("sudo")
             .args(["-n", "losetup", "-d", &self.loop_device])
             .status();
+        // Detach can complete asynchronously; until it does, tools such as
+        // `btrfs check` see the backing image as mounted and refuse it.
+        let deadline = std::time::Instant::now() + Duration::from_secs(5);
+        while std::time::Instant::now() < deadline
+            && Command::new("sudo")
+                .args(["-n", "losetup", &self.loop_device])
+                .output()
+                .is_ok_and(|out| out.status.success())
+        {
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 

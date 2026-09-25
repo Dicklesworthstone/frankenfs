@@ -7725,7 +7725,9 @@ pub fn mount(
             "FUSE-over-io_uring transport requested"
         );
         session.run_with_io_uring(depth, payload)?;
-    } else if options.worker_threads > 0 {
+    } else if options.resolved_thread_count() > 1 {
+        // bd-iah1f: `worker_threads == 0` is auto (spec 1.7: multi-threaded
+        // dispatch); only an explicit 1, or a one-CPU host, dispatches serially.
         session.run_with_workers(options.resolved_thread_count())?;
     } else {
         // bd-svhrq: serial dispatch is ONE thread. A wider cpuset cannot be used
@@ -7735,7 +7737,7 @@ pub fn mount(
         session.run()?;
     }
     #[cfg(not(target_os = "linux"))]
-    if options.worker_threads > 0 {
+    if options.resolved_thread_count() > 1 {
         session.run_with_workers(options.resolved_thread_count())?;
     } else {
         session.run()?;
@@ -7774,7 +7776,7 @@ pub fn mount_background(
     let fs = FrankenFuse::with_inner(ops, options, Some(mountpoint), None);
     resolve_xattr_suppression(&fs);
     let notifier_owner = fs.shared_handle();
-    let session = if options.worker_threads > 0 {
+    let session = if options.resolved_thread_count() > 1 {
         fuser::spawn_mount2_with_workers(
             fs,
             mountpoint,
@@ -8050,7 +8052,7 @@ pub fn mount_managed(
     let metrics_ref = Arc::clone(&fs.inner.metrics);
     let notifier_owner = fs.shared_handle();
 
-    let session = if config.options.worker_threads > 0 {
+    let session = if thread_count > 1 {
         fuser::spawn_mount2_with_workers(
             fs,
             mountpoint,
