@@ -2484,8 +2484,196 @@ enum SigkillArm {
 }
 
 /// One SIGKILL arm of [`cli_mount_periodic_commit_survives_sigkill_bd_dj725`].
-fn periodic_commit_sigkill_arm(interval_secs: u64, payload: &[u8], require: bool) -> SigkillArm {
+/// Spawn `ffs mount --rw <extra_args> image mnt` and wait for it to appear in
+/// mountinfo. `None` is a SKIP (the mount could not start), which is a
+/// failure under `FFS_REQUIRE_FUSE=1`.
+fn spawn_cli_rw_mount(
+    image: &Path,
+    mnt: &Path,
+    log_path: &Path,
+    extra_args: &[&str],
+    envs: &[(&str, &str)],
+    scenario: &str,
+    require: bool,
+) -> Option<std::process::Child> {
     use std::time::{Duration, Instant};
+
+    let mnt_key = mnt
+        .canonicalize()
+        .expect("canonical mountpoint")
+        .to_string_lossy()
+        .into_owned();
+    // A file, not a pipe: an unread pipe would block a chatty daemon.
+    let mut child = Command::new(env!("CARGO_BIN_EXE_ffs-cli"))
+        .args(["mount", "--rw"])
+        .args(extra_args)
+        .arg(image)
+        .arg(mnt)
+        // auto_unmount routes through fusermount3 even as root, and some CI
+        // workers deny it; callers unmount the (dead) mount themselves.
+        .env("FFS_AUTO_UNMOUNT", "0")
+        .envs(envs.iter().copied())
+        .stdout(std::process::Stdio::null())
+        .stderr(fs::File::create(log_path).expect("create mount log"))
+        .spawn()
+        .expect("spawn `ffs mount --rw`");
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let mounted = fs::read_to_string("/proc/self/mountinfo")
+            .unwrap_or_default()
+            .lines()
+            .any(|line| line.split(' ').nth(4) == Some(mnt_key.as_str()));
+        if mounted {
+            return Some(child);
+        }
+        if let Some(status) = child.try_wait().expect("poll mount daemon") {
+            let stderr = fs::read_to_string(log_path).unwrap_or_default();
+            assert!(
+                !require,
+                "FFS_REQUIRE_FUSE=1 but `ffs mount --rw` exited {status}: {stderr}"
+            );
+            emit_scenario_result(scenario, "SKIP", Some("mount_failed"));
+            return None;
+        }
+        if Instant::now() > deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("`ffs mount --rw` did not appear in mountinfo within 30s");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// SIGKILL a CLI mount daemon and detach its now-dead mount.
+fn sigkill_cli_mount(child: &mut std::process::Child, mnt: &Path) {
+    child.kill().expect("SIGKILL the mount daemon");
+    let _ = child.wait();
+    let unmounted = Command::new("fusermount3")
+        .args(["-u", "-z"])
+        .arg(mnt)
+        .status()
+        .is_ok_and(|status| status.success());
+    if !unmounted {
+        let _ = Command::new("umount").arg("-l").arg(mnt).status();
+    }
+}
+
+/// bd-dj725 memory bound, measured on the real daemon: 1 GiB written through
+/// `ffs mount --rw` without any fsync. Before durable MVCC chains were evicted
+/// the store kept every block ever written, so the daemon's RSS grew past the
+/// data size; with journal-pressure commits and eviction it stays bounded by
+/// the resident cap (128 MiB) plus working overhead.
+#[test]
+fn cli_mount_rss_stays_bounded_without_fsync_bd_dj725() {
+    use std::io::Write as _;
+
+    let require = std::env::var_os("FFS_REQUIRE_FUSE").is_some_and(|v| v == "1");
+    let prerequisites = Path::new("/dev/fuse").exists()
+        && ["mkfs.ext4", "fusermount3"]
+            .iter()
+            .all(|tool| command_available(tool));
+    if !prerequisites {
+        assert!(
+            !require,
+            "FFS_REQUIRE_FUSE=1 but FUSE prerequisites are missing"
+        );
+        emit_scenario_result("cli_mount_rss_bound", "SKIP", Some("fuse_unavailable"));
+        return;
+    }
+    // One arm: mount, write 1 GiB without fsync, return the peak VmRSS (KiB).
+    let arm = |envs: &[(&str, &str)]| -> Option<[u64; 2]> {
+        let tmp = tempfile::tempdir().expect("create temp dir");
+        let image = tmp.path().join("rss.ext4");
+        fs::File::create(&image)
+            .and_then(|file| file.set_len(2 << 30))
+            .expect("size image");
+        let format = Command::new("mkfs.ext4")
+            .args(["-F", "-q", "-b", "4096"])
+            .arg(&image)
+            .output()
+            .expect("run mkfs.ext4");
+        assert!(format.status.success(), "mkfs.ext4 failed");
+        let mnt = tmp.path().join("mnt");
+        fs::create_dir(&mnt).expect("create mountpoint");
+        let mut child = spawn_cli_rw_mount(
+            &image,
+            &mnt,
+            &tmp.path().join("mount.log"),
+            &[],
+            envs,
+            "cli_mount_rss_bound",
+            require,
+        )?;
+        let rss_kib = |pid: u32| -> u64 {
+            fs::read_to_string(format!("/proc/{pid}/status"))
+                .unwrap_or_default()
+                .lines()
+                .find_map(|line| line.strip_prefix("VmRSS:"))
+                .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
+                .unwrap_or(0)
+        };
+        let pid = child.id();
+        let chunk: Vec<u8> = (0..1024 * 1024_u32).map(|i| (i % 253) as u8).collect();
+        // Peak VmRSS over the first and second 512 MiB written.
+        let mut halves = [0_u64; 2];
+        {
+            let mut file = fs::File::create(mnt.join("big.bin")).expect("create big.bin");
+            for mib in 0..1024_u32 {
+                file.write_all(&chunk)
+                    .unwrap_or_else(|e| panic!("write MiB {mib}: {e}"));
+                if mib % 16 == 15 {
+                    let half = usize::from(mib >= 512);
+                    halves[half] = halves[half].max(rss_kib(pid));
+                }
+            }
+        }
+        sigkill_cli_mount(&mut child, &mnt);
+        assert!(
+            halves[0] > 0 && halves[1] > 0,
+            "could not read the daemon's VmRSS; the bound was not measured"
+        );
+        Some(halves)
+    };
+
+    let Some([bounded_first, bounded_second]) = arm(&[]) else {
+        return;
+    };
+    // Control: eviction disabled. It must show the growth the bound prevents,
+    // or this test could pass without measuring anything.
+    let Some([unbounded_first, unbounded_second]) =
+        arm(&[("FFS_MVCC_RESIDENT_CAP_BLOCKS", "18446744073709551615")])
+    else {
+        return;
+    };
+    eprintln!(
+        "RSS_BOUND|written_mib=1024|default_cap_kib={bounded_first},{bounded_second}\
+         |no_eviction_kib={unbounded_first},{unbounded_second}"
+    );
+    // "Bounded" = memory stops growing with the data written. Measured
+    // 2026-09-25: ~0.5 GiB with the default cap vs ~1.9 GiB without eviction
+    // for the same 1 GiB (per-block overhead, the boundary's transient block
+    // copies and allocator retention make the absolute level workload- and
+    // allocator-dependent, so the test asserts the TREND, not a number).
+    assert!(
+        bounded_second <= bounded_first + 64 * 1024,
+        "daemon RSS kept growing with the default resident cap: \
+         {bounded_first} KiB after 512 MiB, {bounded_second} KiB after 1 GiB"
+    );
+    assert!(
+        unbounded_second > unbounded_first + 256 * 1024,
+        "control arm (no eviction) did not grow ({unbounded_first} -> {unbounded_second} \
+         KiB): the test is not detecting the growth eviction prevents"
+    );
+    assert!(
+        bounded_second * 2 < unbounded_second,
+        "eviction must at least halve the daemon's memory for 1 GiB written: \
+         {bounded_second} KiB vs {unbounded_second} KiB without it"
+    );
+    emit_scenario_result("cli_mount_rss_bound", "PASS", None);
+}
+
+fn periodic_commit_sigkill_arm(interval_secs: u64, payload: &[u8], require: bool) -> SigkillArm {
+    use std::time::Duration;
 
     let tmp = tempfile::tempdir().expect("create temp dir");
     let image = tmp.path().join("commit.ext4");
@@ -2504,75 +2692,24 @@ fn periodic_commit_sigkill_arm(interval_secs: u64, payload: &[u8], require: bool
     );
     let mnt = tmp.path().join("mnt");
     fs::create_dir(&mnt).expect("create mountpoint");
-    let mnt_key = mnt
-        .canonicalize()
-        .expect("canonical mountpoint")
-        .to_string_lossy()
-        .into_owned();
-
-    // A file, not a pipe: an unread pipe would block a chatty daemon.
-    let log_path = tmp.path().join("mount.log");
-    let mut child = Command::new(env!("CARGO_BIN_EXE_ffs-cli"))
-        .args([
-            "mount",
-            "--rw",
-            "--commit-interval-secs",
-            &interval_secs.to_string(),
-        ])
-        .arg(&image)
-        .arg(&mnt)
-        // auto_unmount routes through fusermount3 even as root, and some CI
-        // workers deny it; this test unmounts the dead mount itself below.
-        .env("FFS_AUTO_UNMOUNT", "0")
-        .stdout(std::process::Stdio::null())
-        .stderr(fs::File::create(&log_path).expect("create mount log"))
-        .spawn()
-        .expect("spawn `ffs mount --rw`");
-
-    let deadline = Instant::now() + Duration::from_secs(30);
-    loop {
-        let mounted = fs::read_to_string("/proc/self/mountinfo")
-            .unwrap_or_default()
-            .lines()
-            .any(|line| line.split(' ').nth(4) == Some(mnt_key.as_str()));
-        if mounted {
-            break;
-        }
-        if let Some(status) = child.try_wait().expect("poll mount daemon") {
-            let stderr = fs::read_to_string(&log_path).unwrap_or_default();
-            assert!(
-                !require,
-                "FFS_REQUIRE_FUSE=1 but `ffs mount --rw` exited {status}: {stderr}"
-            );
-            emit_scenario_result(
-                "cli_mount_periodic_commit_sigkill",
-                "SKIP",
-                Some("mount_failed"),
-            );
-            return SigkillArm::Skipped;
-        }
-        if Instant::now() > deadline {
-            let _ = child.kill();
-            let _ = child.wait();
-            panic!("`ffs mount --rw` did not appear in mountinfo within 30s");
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
+    let interval = interval_secs.to_string();
+    let Some(mut child) = spawn_cli_rw_mount(
+        &image,
+        &mnt,
+        &tmp.path().join("mount.log"),
+        &["--commit-interval-secs", &interval],
+        &[],
+        "cli_mount_periodic_commit_sigkill",
+        require,
+    ) else {
+        return SigkillArm::Skipped;
+    };
 
     // No fsync, no close-time flush semantics relied on: fs::write only closes.
     fs::write(mnt.join("durable.bin"), payload).expect("write through the mount");
     // Both arms wait the same, well past a 1 s interval.
     std::thread::sleep(Duration::from_secs(4));
-    child.kill().expect("SIGKILL the mount daemon");
-    let _ = child.wait();
-    let unmounted = Command::new("fusermount3")
-        .args(["-u", "-z"])
-        .arg(&mnt)
-        .status()
-        .is_ok_and(|status| status.success());
-    if !unmounted {
-        let _ = Command::new("umount").arg("-l").arg(&mnt).status();
-    }
+    sigkill_cli_mount(&mut child, &mnt);
 
     let replay = Command::new("e2fsck")
         .args(["-E", "journal_only", "-y"])

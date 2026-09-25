@@ -326,6 +326,10 @@ impl MvccStore {
         if !retired.is_empty() {
             self.runtime_metrics.record_versions_pruned(retired.len());
             self.ebr_reclaimer.retire_versions(retired);
+            // Retirement only DEFERS the drop; nothing on the mount path runs
+            // the GC batch that would flush it, so an eviction's worth of
+            // block data stayed allocated across boundaries. Collect now.
+            self.ebr_reclaimer.collect();
         }
         evicted
     }

@@ -746,7 +746,9 @@ When mounting an ext4 image with `needs_recovery` set, FrankenFS replays committ
 
 Replay is idempotent. V2/V3 checksums (CRC32C with optional UUID-seed) are verified end-to-end. Non-contiguous ext4 journal extents are supported.
 
-FrankenFS's own ext4 write path journals each durability boundary through JBD2 and follows the kernel's recovery contract (bd-cnmpm): before the commit record is durable the journal superblock records the live log (`s_start`, `s_sequence`) and the filesystem superblock carries `needs_recovery`; after the checkpoint both are cleared, and sequence numbers continue across mounts. A crash between commit and checkpoint therefore leaves an image that kernel `e2fsck` recognizes and replays — tested by injecting that crash and running `e2fsck -fy` then `e2fsck -fn` on the result. Periodic commits (`--commit-interval-secs`) bound how much un-fsynced data a crash can lose.
+FrankenFS's own ext4 write path journals each durability boundary through JBD2 and follows the kernel's recovery contract (bd-cnmpm): before the commit record is durable the journal superblock records the live log (`s_start`, `s_sequence`) and the filesystem superblock carries `needs_recovery`; after the checkpoint both are cleared, and sequence numbers continue across mounts. A crash between commit and checkpoint therefore leaves an image that kernel `e2fsck` recognizes and replays — tested by injecting that crash and running `e2fsck -fy` then `e2fsck -fn` on the result. Periodic commits (`--commit-interval-secs`) bound how much un-fsynced data a crash can lose (tested by SIGKILLing a real `ffs mount --rw` daemon: data older than the interval survives, and with the tick disabled it does not). A boundary is also forced once the blocks dirtied since the last one approach half of the journal, because a transaction larger than the log is refused (bd-1o6tq). A boundary never captures a half-applied mutation: it waits for in-flight ones first (bd-9rutw). Once more than 32768 blocks (`FFS_MVCC_RESIDENT_CAP_BLOCKS`) are resident in the MVCC store, each boundary evicts the versions it just made durable (bd-dj725). Measured on a 1 GiB un-fsynced write (cli_e2e, one run):
+- with eviction, daemon RSS went from 426 MiB after the first 512 MiB to 476 MiB after 1 GiB;
+- without eviction, it went from 1.19 GiB to 1.75 GiB.
 
 ### Ext4 fast-commit replay
 
@@ -3294,7 +3296,7 @@ read requirement remains open under `bd-hk5w3`; helper tests do not certify it.
 | Profile | Device-set read helper | Mounted read | Mounted write |
 |---|---|---|---|
 | `Single` | Linear, split at chunk boundaries | Implemented | Experimental |
-| `DUP` | Alternate copies on one device | Implemented using primary mapping | Experimental; rewritten tree blocks are written to both copies (bd-0mcvt) |
+| `DUP` | Alternate copies on one device | Implemented; a corrupt primary copy falls back to the second (core test) | Experimental; rewritten tree blocks are written to both copies. A FrankenFS-written image passes `btrfs check` and mounts read-only under the Linux kernel, including with DUP copy 1 of the new fs-tree root corrupted (fuse_e2e interop test, bd-0mcvt) |
 | `RAID0` | Split across data stripes | Clean two-device kernel image + FUSE verified | Deferred |
 | `RAID1` | Mirror fallback on read error | Kernel image + FUSE verified, including either lone surviving device and corrupt metadata/ordinary/zstd data recovery | Deferred |
 | `RAID10` | Split across mirrored stripe groups | Four-device kernel image + FUSE reads; degraded reads require a survivor in every group of every chunk | Deferred |

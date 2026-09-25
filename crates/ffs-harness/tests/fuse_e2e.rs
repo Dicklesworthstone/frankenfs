@@ -1601,7 +1601,7 @@ fn assert_interop_tree(root: &Path, expected: &[(&'static str, InteropExpect)], 
         let path = root.join(rel);
         match want {
             InteropExpect::Dir => {
-                assert!(path.is_dir(), "{fstype}: kernel must see directory {rel}")
+                assert!(path.is_dir(), "{fstype}: kernel must see directory {rel}");
             }
             InteropExpect::File(bytes) => assert_eq!(
                 &fs::read(&path).unwrap_or_else(|e| panic!("{fstype}: kernel read {rel}: {e}")),
@@ -1711,6 +1711,89 @@ fn ffs_written_images_mount_and_read_under_the_linux_kernel() {
     assert_interop_tree(&kmnt.join(BTRFS_TEST_WORKSPACE), &expected, "btrfs");
     drop(kernel);
     emit_scenario_result("ffs_written_btrfs_kernel_interop", "PASS", None);
+
+    // bd-0mcvt: the fs-tree root FrankenFS wrote must exist twice (DUP), and
+    // with copy 1 corrupted the kernel must still mount and read everything
+    // through copy 2.
+    corrupt_first_dup_copy_of_fs_root(&image);
+    let check = Command::new("btrfs")
+        .args(["check", "--readonly"])
+        .arg(&image)
+        .output()
+        .expect("run btrfs check");
+    assert!(
+        check.status.success(),
+        "btrfs check with DUP copy 1 of the fs-tree root corrupted:\n{}{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let kmnt = tmp.path().join("kernel-copy1-corrupt");
+    let Some(kernel) = kernel_ro_mount(&image, "btrfs", &kmnt) else {
+        return;
+    };
+    assert_interop_tree(
+        &kmnt.join(BTRFS_TEST_WORKSPACE),
+        &expected,
+        "btrfs (DUP copy 1 corrupt)",
+    );
+    drop(kernel);
+    emit_scenario_result("ffs_written_btrfs_dup_copy2_kernel_read", "PASS", None);
+}
+
+/// Corrupt the first DUP copy of the FS_TREE root node on a single-device
+/// btrfs image, after checking both copies are present and identical.
+fn corrupt_first_dup_copy_of_fs_root(image: &Path) {
+    let cx = Cx::for_testing();
+    let filesystem = OpenFs::open(&cx, image).expect("open btrfs image");
+    let nodesize = usize::try_from(filesystem.btrfs_superblock().expect("btrfs").nodesize)
+        .expect("nodesize fits");
+    let chunks = filesystem.btrfs_context().expect("btrfs").chunks.clone();
+    let roots = filesystem.walk_btrfs_root_tree(&cx).expect("root tree");
+    let fs_root = roots
+        .iter()
+        .find(|item| {
+            item.key.objectid == 5 && item.key.item_type == ffs_btrfs::BTRFS_ITEM_ROOT_ITEM
+        })
+        .expect("FS_TREE root item");
+    let logical = ffs_btrfs::parse_root_item(&fs_root.data)
+        .expect("root item")
+        .bytenr;
+    drop(filesystem);
+    let mapping = ffs_ondisk::map_logical_to_stripes(&chunks, logical)
+        .expect("map")
+        .expect("fs-tree root is chunk-mapped");
+    assert_eq!(
+        mapping.stripes.len(),
+        2,
+        "mkfs's default single-device metadata profile is DUP"
+    );
+    let read_copy = |physical: u64| -> Vec<u8> {
+        let mut file = fs::File::open(image).expect("open image");
+        file.seek(SeekFrom::Start(physical)).expect("seek");
+        let mut node = vec![0; nodesize];
+        file.read_exact(&mut node).expect("read node");
+        node
+    };
+    let first = read_copy(mapping.stripes[0].physical);
+    let second = read_copy(mapping.stripes[1].physical);
+    assert_eq!(
+        u64::from_le_bytes(first[48..56].try_into().expect("8 bytes")),
+        logical,
+        "copy 1 holds the fs-tree root"
+    );
+    assert_eq!(
+        first, second,
+        "FrankenFS must write BOTH DUP copies of a tree block (bd-0mcvt)"
+    );
+    let mut file = fs::OpenOptions::new()
+        .write(true)
+        .open(image)
+        .expect("open image rw");
+    file.seek(SeekFrom::Start(mapping.stripes[0].physical))
+        .expect("seek copy 1");
+    file.write_all(&[first[0] ^ 0xFF])
+        .expect("corrupt copy 1 checksum");
+    file.sync_all().expect("sync corruption");
 }
 
 /// Helper: create image, mount rw, run a closure, then drop the session.

@@ -8469,6 +8469,14 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
     if let Some(policy) = options.mvcc_policy {
         open_fs.set_mvcc_conflict_policy(policy.policy());
     }
+    // bd-dj725: resident MVCC blocks above which a journaled boundary evicts
+    // what it made durable (default ffs_core::DEFAULT_MVCC_RESIDENT_BLOCK_CAP).
+    if let Ok(raw) = std::env::var("FFS_MVCC_RESIDENT_CAP_BLOCKS") {
+        let blocks: usize = raw.trim().parse().with_context(|| {
+            format!("invalid FFS_MVCC_RESIDENT_CAP_BLOCKS={raw:?}; expected a block count")
+        })?;
+        open_fs.set_mvcc_resident_block_cap(blocks);
+    }
     let open_fs = Arc::new(open_fs);
     let mounted_repair_writeback = (options.read_write
         && options.background_scrub.repair_writes_enabled)
