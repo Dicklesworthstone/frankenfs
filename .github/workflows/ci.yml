@@ -110,6 +110,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y e2fsprogs btrfs-progs
 
+      # The mounted comparator's scratch-root guard only accepts paths under
+      # /data/tmp (the offload hosts' scratch volume), and its unit tests
+      # exercise that guard in place. Give the runner the same root.
+      - name: Provide the /data/tmp scratch root
+        run: |
+          sudo mkdir -p /data/tmp
+          sudo chmod 1777 /data/tmp
+
       - name: Unit tests
         env:
           FFS_REQUIRE_ORACLES: "1"

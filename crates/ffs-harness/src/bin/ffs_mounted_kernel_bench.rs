@@ -10232,8 +10232,16 @@ mod tests {
         CURRENT_PHASE.store(0, Ordering::Relaxed);
     }
 
+    /// The arm registry is process-global and the test harness runs tests in
+    /// parallel: the empty-registry test counted the other test's record on a
+    /// CI runner (left 1, right 0). Tests that touch the registry hold this.
+    static LIVE_ARMS_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn watchdog_reap_kills_registered_daemons_and_best_effort_unmounts_bd_xtnk1() {
+        let _registry = LIVE_ARMS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let mut child = Command::new("sleep")
             .arg("30")
             .spawn()
@@ -10262,6 +10270,9 @@ mod tests {
 
     #[test]
     fn watchdog_reap_of_empty_registry_is_a_no_op_bd_xtnk1() {
+        let _registry = LIVE_ARMS_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         unregister_live_arm(Path::new("/nonexistent/bd-xtnk1-mountpoint"));
         assert_eq!(reap_live_arm_records(), 0);
     }
@@ -13384,22 +13395,32 @@ mod tests {
     #[test]
     fn physical_core_occupancy_separates_8_on_8_from_8_on_4_bd_client_core_distinctness() {
         let cores = host_physical_cores();
-        assert!(
-            cores.len() >= 8,
-            "host exposes {} physical cores; this case needs 8 — the HOST cannot \
-             express it, the code under test is not implicated",
-            cores.len()
-        );
+        assert!(!cores.is_empty(), "sysfs must expose at least one core");
 
-        // Eight threads on eight distinct cores: nothing shared.
+        // N threads on N distinct cores: nothing shared. N is eight where the
+        // host has eight cores; smaller hosts (a GitHub runner exposes two)
+        // assert the same property at their own width instead of failing on a
+        // precondition the code under test has nothing to do with.
+        let width = cores.len().min(8);
+        if width < 8 {
+            eprintln!(
+                "bd-client-core-distinctness: host exposes {} physical cores; the \
+                 distinct-core half runs {width}-on-{width} instead of 8-on-8",
+                cores.len()
+            );
+        }
         let ideal: BTreeSet<usize> = cores
             .iter()
-            .take(8)
+            .take(width)
             .filter_map(|core| core.iter().next().copied())
             .collect();
-        assert_eq!(ideal.len(), 8, "one CPU from each of eight distinct cores");
+        assert_eq!(
+            ideal.len(),
+            width,
+            "one CPU from each of {width} distinct cores"
+        );
         let (seen, shared) = physical_core_occupancy(&ideal).expect("occupancy");
-        assert_eq!(seen, 8, "eight distinct cores");
+        assert_eq!(seen, width, "{width} distinct cores");
         assert_eq!(shared, 0, "no thread shares a core with another");
 
         // The worst case actually observed: 8 threads on 4 cores, every one paired.
