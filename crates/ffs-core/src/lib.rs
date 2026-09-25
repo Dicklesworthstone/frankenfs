@@ -64185,6 +64185,20 @@ mod tests {
         Some((out.status.success(), combined))
     }
 
+    /// A spawned child shares every test thread's open descriptors until it
+    /// execs, and a flock belongs to the open file description, so a WAL a
+    /// sibling test had just released could still be held by the child (the
+    /// same race failed ffs-mvcc's WAL ownership tests and the sidecar tests on
+    /// CI). Spawning tests hold this exclusively for `spawn()`, which returns
+    /// once the child has exec'd; tests that reopen a flocked WAL hold it shared.
+    static TEST_CHILD_SPAWN_GATE: std::sync::RwLock<()> = std::sync::RwLock::new(());
+
+    fn wal_flock_holder() -> std::sync::RwLockReadGuard<'static, ()> {
+        TEST_CHILD_SPAWN_GATE
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
     /// bd-53dub: the oracle contract must be able to FAIL. This test re-runs
     /// itself with an empty PATH, so `e2fsck` cannot be found: under
     /// `FFS_REQUIRE_ORACLES=1` the child must fail naming the missing oracle;
@@ -64213,7 +64227,17 @@ mod tests {
             if require {
                 child.env("FFS_REQUIRE_ORACLES", "1");
             }
-            let out = child.output().expect("run child test");
+            let spawned = {
+                let _no_flock_holders = TEST_CHILD_SPAWN_GATE
+                    .write()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                child
+                    .stdout(std::process::Stdio::piped())
+                    .stderr(std::process::Stdio::piped())
+                    .spawn()
+                    .expect("spawn child test")
+            };
+            let out = spawned.wait_with_output().expect("run child test");
             let text = format!(
                 "{}{}",
                 String::from_utf8_lossy(&out.stdout),
@@ -79799,6 +79823,7 @@ mod tests {
 
     #[test]
     fn append_only_metadata_log_replays_then_checkpoints_clean() {
+        let _flocks = wal_flock_holder();
         let tmp = tempfile::TempDir::new().expect("tempdir");
         let image = tmp.path().join("metadata-log.ext4");
         let wal = tmp.path().join("metadata-log.wal");
@@ -102518,6 +102543,7 @@ mod tests {
 
     #[test]
     fn mvcc_wal_replays_committed_data() {
+        let _flocks = wal_flock_holder();
         use ffs_mvcc::wal::{self, WalCommit, WalHeader, WalWrite};
         use ffs_types::{BlockNumber, CommitSeq, TxnId};
 
@@ -102577,6 +102603,7 @@ mod tests {
 
     #[test]
     fn mvcc_wal_truncated_tail_tolerant_policy() {
+        let _flocks = wal_flock_holder();
         use ffs_mvcc::wal::{self, WalCommit, WalHeader, WalWrite};
         use ffs_types::{BlockNumber, CommitSeq, TxnId};
 
@@ -102626,6 +102653,7 @@ mod tests {
 
     #[test]
     fn mvcc_wal_fail_fast_falls_back_to_empty_store() {
+        let _flocks = wal_flock_holder();
         use ffs_mvcc::wal::{self, WalCommit, WalHeader, WalWrite};
         use ffs_types::{BlockNumber, CommitSeq, TxnId};
 
