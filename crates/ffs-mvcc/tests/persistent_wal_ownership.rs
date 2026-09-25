@@ -11,8 +11,22 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Barrier, mpsc};
+use std::sync::{Arc, Barrier, RwLock, RwLockReadGuard, mpsc};
 use std::time::Duration;
+
+/// A spawned child shares every test thread's open descriptors until it
+/// execs, and a flock belongs to the open file description, so a lock a
+/// sibling test had just released could still be held by the child (seen in
+/// the sibling file wal_writer_ownership.rs on CI). The spawning test holds
+/// this exclusively for the spawn (`spawn` returns after the child's exec);
+/// every other test holds it shared.
+static CHILD_SPAWN_GATE: RwLock<()> = RwLock::new(());
+
+fn flock_holder() -> RwLockReadGuard<'static, ()> {
+    CHILD_SPAWN_GATE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 fn open_mode(mode: u8, path: &Path, checkpoint: &Path) -> Result<PersistentMvccStore> {
     let cx = Cx::for_testing();
@@ -69,6 +83,7 @@ fn probe_released(path: &Path) {
 
 #[test]
 fn every_open_entrypoint_keeps_ownership_through_checkpoint_and_truncation() {
+    let _flocks = flock_holder();
     for owner_mode in 0..4 {
         let directory = tempfile::tempdir().expect("directory");
         let path = directory.path().join("state.wal");
@@ -101,6 +116,7 @@ fn every_open_entrypoint_keeps_ownership_through_checkpoint_and_truncation() {
 
 #[test]
 fn standalone_writer_and_persistent_store_exclude_each_other() {
+    let _flocks = flock_holder();
     let directory = tempfile::tempdir().expect("directory");
     let path = directory.path().join("state.wal");
     let checkpoint = path.with_extension("ckpt");
@@ -126,6 +142,7 @@ fn standalone_writer_and_persistent_store_exclude_each_other() {
 
 #[test]
 fn inode_aliases_cannot_admit_a_second_store() {
+    let _flocks = flock_holder();
     let directory = tempfile::tempdir().expect("directory");
     let path = directory.path().join("state.wal");
     let checkpoint = path.with_extension("ckpt");
@@ -156,6 +173,7 @@ fn inode_aliases_cannot_admit_a_second_store() {
 
 #[test]
 fn admission_precedes_checkpoint_errors_and_any_tail_repair() {
+    let _flocks = flock_holder();
     for tail in [vec![1, 2, 3], vec![0; 128 * 1024]] {
         let directory = tempfile::tempdir().expect("directory");
         let path = directory.path().join("state.wal");
@@ -188,6 +206,7 @@ fn admission_precedes_checkpoint_errors_and_any_tail_repair() {
 
 #[test]
 fn unsuccessful_recovery_releases_ownership_and_preserves_existing_bytes() {
+    let _flocks = flock_holder();
     let directory = tempfile::tempdir().expect("directory");
     let path = directory.path().join("state.wal");
     let checkpoint = path.with_extension("ckpt");
@@ -220,6 +239,7 @@ fn unsuccessful_recovery_releases_ownership_and_preserves_existing_bytes() {
 
 #[test]
 fn checkpoint_discovery_errors_are_not_treated_as_absence() {
+    let _flocks = flock_holder();
     let directory = tempfile::tempdir().expect("directory");
     let path = directory.path().join("state.wal");
     let checkpoint = path.with_extension("ckpt");
@@ -241,6 +261,7 @@ fn checkpoint_discovery_errors_are_not_treated_as_absence() {
 
 #[test]
 fn simultaneous_recovery_admits_exactly_one_owner() {
+    let _flocks = flock_holder();
     let directory = tempfile::tempdir().expect("directory");
     let path = directory.path().join("state.wal");
     fs::write(&path, one_commit_wal()).expect("existing WAL");
@@ -305,7 +326,10 @@ fn process_death_releases_ownership_for_checkpoint_plus_wal_recovery() {
     let directory = tempfile::tempdir().expect("directory");
     let path = directory.path().join("state.wal");
     let checkpoint = path.with_extension("ckpt");
-    let mut child = ChildOwner(
+    let spawned = {
+        let _no_flock_holders = CHILD_SPAWN_GATE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Command::new(std::env::current_exe().expect("test executable"))
             .args([
                 "--exact",
@@ -316,8 +340,9 @@ fn process_death_releases_ownership_for_checkpoint_plus_wal_recovery() {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
-            .expect("independent process"),
-    );
+            .expect("independent process")
+    };
+    let mut child = ChildOwner(spawned);
     let stdout = child.0.stdout.take().expect("child stdout");
     let (ready, observed) = mpsc::sync_channel(1);
     let readiness_thread = std::thread::spawn(move || {

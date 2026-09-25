@@ -10,8 +10,23 @@ use std::fs::{self, File};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 use std::process::{Child, Command, Stdio};
-use std::sync::{Arc, Barrier, mpsc};
+use std::sync::{Arc, Barrier, RwLock, RwLockReadGuard, mpsc};
 use std::time::Duration;
+
+/// A spawned child shares every open descriptor of every test thread until it
+/// execs, and a flock belongs to the open file description, so a WAL a
+/// sibling test had just released stayed owned and the sibling's next create
+/// failed with WouldBlock (CI, last_descriptor_not_writer_drop_controls_
+/// ownership_release). The spawning test holds this exclusively for the
+/// spawn (`spawn` returns only after the child has exec'd); every other test
+/// holds it shared.
+static CHILD_SPAWN_GATE: RwLock<()> = RwLock::new(());
+
+fn flock_holder() -> RwLockReadGuard<'static, ()> {
+    CHILD_SPAWN_GATE
+        .read()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 fn commit(sequence: u64) -> WalCommit {
     WalCommit {
@@ -44,6 +59,7 @@ fn replayed_sequences(path: &Path) -> Vec<u64> {
 
 #[test]
 fn competing_create_preserves_a_live_wal_and_its_append_position() {
+    let _flocks = flock_holder();
     let directory = tempfile::tempdir().expect("directory");
     let path = directory.path().join("state.wal");
     let mut owner = WalWriter::create(&path, WalWriterConfig::default()).expect("owner");
@@ -64,6 +80,7 @@ fn competing_create_preserves_a_live_wal_and_its_append_position() {
 
 #[test]
 fn hardlink_and_symlink_names_do_not_bypass_inode_ownership() {
+    let _flocks = flock_holder();
     let directory = tempfile::tempdir().expect("directory");
     let path = directory.path().join("state.wal");
     let hardlink = directory.path().join("alias.wal");
@@ -87,6 +104,7 @@ fn hardlink_and_symlink_names_do_not_bypass_inode_ownership() {
 
 #[test]
 fn last_descriptor_not_writer_drop_controls_ownership_release() {
+    let _flocks = flock_holder();
     let directory = tempfile::tempdir().expect("directory");
     let path = directory.path().join("state.wal");
     let owner = WalWriter::create(&path, WalWriterConfig::default()).expect("owner");
@@ -102,6 +120,7 @@ fn last_descriptor_not_writer_drop_controls_ownership_release() {
 
 #[test]
 fn a_cooperating_external_owner_is_respected_before_any_header_write() {
+    let _flocks = flock_holder();
     let directory = tempfile::tempdir().expect("directory");
     let path = directory.path().join("state.wal");
     let sentinel = b"not yet initialized by this process";
@@ -123,6 +142,7 @@ fn a_cooperating_external_owner_is_respected_before_any_header_write() {
 
 #[test]
 fn concurrent_creators_cannot_both_own_the_same_wal() {
+    let _flocks = flock_holder();
     let directory = tempfile::tempdir().expect("directory");
     let path = directory.path().join("state.wal");
     let barrier = Arc::new(Barrier::new(8));
@@ -175,7 +195,10 @@ fn subprocess_owner_blocks_creation_and_process_death_releases_the_inode() {
 
     let directory = tempfile::tempdir().expect("directory");
     let path = directory.path().join("state.wal");
-    let mut child = ChildOwner(
+    let spawned = {
+        let _no_flock_holders = CHILD_SPAWN_GATE
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Command::new(std::env::current_exe().expect("test executable"))
             .args([
                 "--exact",
@@ -186,8 +209,9 @@ fn subprocess_owner_blocks_creation_and_process_death_releases_the_inode() {
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()
-            .expect("child process"),
-    );
+            .expect("child process")
+    };
+    let mut child = ChildOwner(spawned);
     let stdout = child.0.stdout.take().expect("child stdout");
     let (ready, observed) = mpsc::sync_channel(1);
     let readiness_thread = std::thread::spawn(move || {
