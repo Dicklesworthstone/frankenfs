@@ -1839,6 +1839,11 @@ pub struct OpenFs {
     jbd2_pressure_limit: std::sync::atomic::AtomicU64,
     /// Store `committed_block_writes` covered by the last journaled boundary.
     jbd2_block_writes_at_boundary: std::sync::atomic::AtomicU64,
+    /// Resident MVCC blocks above which a journaled boundary drops the chains
+    /// it just made durable (bd-dj725). Below it the store doubles as a
+    /// write-back cache; above it memory would otherwise grow with every block
+    /// the mount ever wrote.
+    mvcc_resident_block_cap: std::sync::atomic::AtomicUsize,
     /// Optional append-only metadata durability path.
     ///
     /// A sync batches every block newer than `logged_through`, adds the derived
@@ -2479,6 +2484,10 @@ struct ReaddirSnapshot {
 /// changes the validation, the match fails, and lookup safely rebuilds and
 /// scans. Built lazily on a negative miss; `OpenFs::create` keeps it current
 /// incrementally so a create-heavy directory stays O(1)/lookup (bd-f8rd8).
+/// Default [`OpenFs::set_mvcc_resident_block_cap`]: 32768 blocks, 128 MiB at
+/// a 4 KiB block size (bd-dj725).
+pub const DEFAULT_MVCC_RESIDENT_BLOCK_CAP: usize = 32_768;
+
 /// State of [`OpenFs::mutation_gate`] (bd-9rutw).
 #[derive(Debug, Default)]
 struct MutationGateState {
@@ -6353,6 +6362,9 @@ impl OpenFs {
             committed_mutation_epoch: std::sync::atomic::AtomicU64::new(0),
             jbd2_pressure_limit: std::sync::atomic::AtomicU64::new(0),
             jbd2_block_writes_at_boundary: std::sync::atomic::AtomicU64::new(0),
+            mvcc_resident_block_cap: std::sync::atomic::AtomicUsize::new(
+                DEFAULT_MVCC_RESIDENT_BLOCK_CAP,
+            ),
             metadata_log,
             metadata_compactor: Mutex::new(None),
             jbd2_writer: None,
@@ -9634,6 +9646,56 @@ impl OpenFs {
             std::sync::atomic::Ordering::Release,
         );
         self.jbd2_writer = Some(Mutex::new(writer));
+    }
+
+    /// Cap on resident MVCC blocks before a journaled boundary evicts the
+    /// chains it made durable (bd-dj725). `usize::MAX` disables eviction.
+    pub fn set_mvcc_resident_block_cap(&self, blocks: usize) {
+        self.mvcc_resident_block_cap
+            .store(blocks, std::sync::atomic::Ordering::Release);
+    }
+
+    /// Blocks with a resident MVCC version, when the store can say cheaply
+    /// (the single store a JBD2 mount uses).
+    #[must_use]
+    pub fn mvcc_tracked_block_count(&self) -> Option<usize> {
+        self.mvcc_store.tracked_block_count()
+    }
+
+    /// Called at the end of a successful journaled boundary, after its home
+    /// checkpoint is durable and the base-block cache is cleared (bd-dj725).
+    ///
+    /// Sound for the eviction contract because the boundary drained the
+    /// mutation gate before capturing: every transaction that began before
+    /// the capture has finished, and every one that begins after it holds a
+    /// snapshot at or past `durable_through`, so none can miss a
+    /// first-committer-wins conflict on a dropped chain. Each dropped block's
+    /// base-cache entry is removed while the store is still exclusively held,
+    /// because that cache sits BELOW the MVCC overlay and can hold device
+    /// bytes older than the version being dropped.
+    fn ext4_evict_durable_mvcc_chains(&self, durable_through: CommitSeq) {
+        let cap = self
+            .mvcc_resident_block_cap
+            .load(std::sync::atomic::Ordering::Acquire);
+        let Some(resident) = self.mvcc_store.tracked_block_count() else {
+            return;
+        };
+        if resident <= cap {
+            return;
+        }
+        let evicted = self
+            .mvcc_store
+            .evict_durable_chains(durable_through, |block| {
+                self.ext4_base_block_cache.remove(&block);
+            });
+        debug!(
+            target: "ffs::mvcc",
+            resident,
+            cap,
+            evicted,
+            durable_through = durable_through.0,
+            "mvcc_durable_chains_evicted"
+        );
     }
 
     /// Run the journaled durability boundary early when the blocks committed
@@ -23020,6 +23082,7 @@ impl OpenFs {
         // as `ext4_persist_group_descriptors_from` does, so drop them.
         self.ext4_group_desc_cache.clear();
         self.ext4_base_block_cache.clear();
+        self.ext4_evict_durable_mvcc_chains(durable_through);
         if let Some(writes) = writes_before {
             self.jbd2_block_writes_at_boundary
                 .fetch_max(writes, std::sync::atomic::Ordering::AcqRel);
@@ -64508,6 +64571,89 @@ mod tests {
         );
     }
 
+    /// bd-dj725 memory bound: a journaled boundary above the resident cap drops
+    /// the chains it made durable, so the store stops growing with every block
+    /// ever written — and reads, overwrites and the on-disk image stay exact.
+    #[test]
+    fn ext4_boundary_evicts_durable_chains_above_the_resident_cap_bd_dj725() {
+        let cx = Cx::for_testing();
+        let Some((mut fs, dev, tmp)) = open_writable_ext4_mkfs_with_device(64) else {
+            oracle_unavailable("ext4 image formatter");
+            return;
+        };
+        assert!(
+            fs.attach_ext4_internal_jbd2_writer(&cx)
+                .expect("attach the image's own journal")
+        );
+        fs.set_mvcc_resident_block_cap(64);
+        let attr = fs
+            .create(&cx, InodeNumber(2), OsStr::new("bulk.bin"), 0o644, 0, 0)
+            .expect("create");
+        let mib = |seed: u8| -> Vec<u8> {
+            (0..1024 * 1024_u32)
+                .map(|i| (i % 251) as u8 ^ seed)
+                .collect()
+        };
+        for m in 0..8_u64 {
+            fs.write(&cx, attr.ino, m * 1024 * 1024, &mib(0))
+                .expect("write");
+        }
+        fs.fsync(&cx, attr.ino, 0, false).expect("fsync");
+        let resident = fs.mvcc_tracked_block_count().expect("single store");
+        assert!(
+            resident <= 64,
+            "after a boundary above the cap only non-durable chains may stay \
+             resident; 2048 data blocks were written, {resident} remain"
+        );
+
+        // Reads now come from the device and must be exact.
+        for m in 0..8_u64 {
+            assert_eq!(
+                fs.read(&cx, attr.ino, m * 1024 * 1024, 1024 * 1024)
+                    .expect("read"),
+                mib(0),
+                "MiB {m} after eviction"
+            );
+        }
+        // Overwrite evicted blocks (read-modify-write from the device) and
+        // persist again.
+        fs.write(&cx, attr.ino, 3 * 1024 * 1024 + 100, &[0xEE_u8; 5000])
+            .expect("overwrite");
+        fs.fsync(&cx, attr.ino, 0, false).expect("second fsync");
+        let mut expected = mib(0);
+        expected[100..5100].fill(0xEE);
+        assert_eq!(
+            fs.read(&cx, attr.ino, 3 * 1024 * 1024, 1024 * 1024)
+                .expect("read overwritten"),
+            expected
+        );
+
+        // The image the boundaries left behind is exact and fsck-clean.
+        let opts = OpenOptions {
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+            ..OpenOptions::default()
+        };
+        let image = dev.snapshot_bytes();
+        let reopened =
+            OpenFs::from_device(&cx, Box::new(TestDevice::from_vec(image.clone())), &opts)
+                .expect("reopen");
+        assert_eq!(
+            reopened
+                .read(&cx, attr.ino, 3 * 1024 * 1024, 1024 * 1024)
+                .expect("reopened read"),
+            expected
+        );
+        let path = tmp.path().join("evicted.ext4");
+        std::fs::write(&path, image).expect("write image");
+        let Some((clean, output)) = run_e2fsck(&path) else {
+            return;
+        };
+        assert!(
+            clean,
+            "image after eviction must be e2fsck-clean:\n{output}"
+        );
+    }
+
     /// A durability boundary larger than the journal must still persist. The
     /// JBD2 boundary journals every unflushed block as ONE transaction, and a
     /// 64 MiB mkfs image has a 4 MiB (1024-block) journal, so 8 MiB written
@@ -64647,6 +64793,9 @@ mod tests {
             .expect("create");
         fs.write(&cx, attr.ino, 0, &[0x42_u8; 8192]).expect("write");
         fs.fsync(&cx, attr.ino, 0, false).expect("initial fsync");
+        // bd-dj725: every boundary also evicts the chains it made durable, so
+        // eviction runs concurrently with the mutations below.
+        fs.set_mvcc_resident_block_cap(16);
 
         // One step of the workload: rename the file back and forth, and churn a
         // temp file through create/write/(unlink). `phase` keeps names unique.

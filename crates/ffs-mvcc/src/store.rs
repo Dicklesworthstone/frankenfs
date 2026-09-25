@@ -275,6 +275,61 @@ impl MvccStore {
         }
     }
 
+    /// Number of blocks with at least one resident version (O(1)).
+    #[must_use]
+    pub fn tracked_block_count(&self) -> usize {
+        self.versions.len()
+    }
+
+    /// Drop every block chain whose newest version is already durable at its
+    /// home location and visible to every registered snapshot, calling
+    /// `on_evict` for each dropped block while the store is still exclusively
+    /// held (bd-dj725).
+    ///
+    /// Without this nothing ever leaves the store: pruning keeps the newest
+    /// version of every block, so a mount's memory grows with every block it
+    /// has written, fsync or not. After eviction a read of the block falls
+    /// through to the device, which holds exactly the dropped newest version.
+    ///
+    /// Soundness is the CALLER's contract: `durable_through` must be a commit
+    /// sequence whose newest-version-per-block state is on the device, and no
+    /// transaction that could still commit may hold an UNREGISTERED snapshot
+    /// older than a dropped chain's newest version (its first-committer-wins
+    /// check would find no version and miss the conflict). Blocks with
+    /// physical (COW-remapped) versions are never dropped: their data does not
+    /// live at the home location.
+    ///
+    /// Returns the number of blocks dropped.
+    pub fn evict_durable_chains(
+        &mut self,
+        durable_through: CommitSeq,
+        mut on_evict: impl FnMut(BlockNumber),
+    ) -> usize {
+        let bound = self
+            .watermark()
+            .map_or(durable_through, |wm| wm.min(durable_through));
+        let physical = &self.physical_versions;
+        let mut retired = Vec::new();
+        let mut evicted = 0_usize;
+        self.versions.retain(|block, versions| {
+            let durable = !physical.contains_key(block)
+                && versions
+                    .last()
+                    .is_some_and(|newest| newest.commit_seq <= bound);
+            if durable {
+                on_evict(*block);
+                retired.append(versions);
+                evicted += 1;
+            }
+            !durable
+        });
+        if !retired.is_empty() {
+            self.runtime_metrics.record_versions_pruned(retired.len());
+            self.ebr_reclaimer.retire_versions(retired);
+        }
+        evicted
+    }
+
     /// Blocks installed by successful commits since store creation (sum of
     /// write-set sizes; a block rewritten twice counts twice).
     #[must_use]

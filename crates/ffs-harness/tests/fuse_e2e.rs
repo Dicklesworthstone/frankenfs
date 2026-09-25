@@ -1485,6 +1485,234 @@ fn fuse_concurrent_create_unlink_multi_worker_keeps_image_clean_bd_iah1f() {
     );
 }
 
+/// What the kernel must find at one path of an interop image.
+enum InteropExpect {
+    Dir,
+    File(Vec<u8>),
+    Symlink(&'static str),
+    Absent,
+}
+
+/// Write a varied namespace + data workload through a FrankenFS FUSE mount
+/// and return what a reader must find afterwards (paths relative to `base`).
+fn interop_workload(base: &Path) -> Vec<(&'static str, InteropExpect)> {
+    let pattern = |len: usize, seed: u8| -> Vec<u8> {
+        (0..len)
+            .map(|i| u8::try_from(i % 251).expect("fits") ^ seed)
+            .collect()
+    };
+    fs::create_dir_all(base.join("d1/d2")).expect("mkdir d1/d2");
+    fs::write(base.join("empty"), b"").expect("write empty");
+    fs::write(base.join("one"), b"1").expect("write one");
+    fs::write(base.join("b4095"), pattern(4095, 1)).expect("write b4095");
+    fs::write(base.join("b4096"), pattern(4096, 2)).expect("write b4096");
+    fs::write(base.join("b4097"), pattern(4097, 3)).expect("write b4097");
+    // A multi-extent file written out of order, then patched in the middle.
+    let mut big = pattern(1024 * 1024 + 7, 4);
+    {
+        let mut file = fs::File::create(base.join("d1/d2/big")).expect("create big");
+        file.seek(SeekFrom::Start(512 * 1024)).expect("seek");
+        file.write_all(&big[512 * 1024..]).expect("write tail");
+        file.seek(SeekFrom::Start(0)).expect("rewind");
+        file.write_all(&big[..512 * 1024]).expect("write head");
+        file.seek(SeekFrom::Start(300_000)).expect("seek patch");
+        file.write_all(&[0xAB; 10_000]).expect("patch");
+        file.sync_all().expect("fsync big");
+    }
+    big[300_000..310_000].fill(0xAB);
+    fs::rename(base.join("b4097"), base.join("d1/renamed")).expect("rename");
+    fs::write(base.join("doomed"), b"gone").expect("write doomed");
+    fs::remove_file(base.join("doomed")).expect("remove doomed");
+    std::os::unix::fs::symlink("d1/renamed", base.join("link")).expect("symlink");
+    fs::hard_link(base.join("one"), base.join("d1/hard")).expect("hard link");
+    vec![
+        ("d1", InteropExpect::Dir),
+        ("d1/d2", InteropExpect::Dir),
+        ("empty", InteropExpect::File(Vec::new())),
+        ("one", InteropExpect::File(b"1".to_vec())),
+        ("d1/hard", InteropExpect::File(b"1".to_vec())),
+        ("b4095", InteropExpect::File(pattern(4095, 1))),
+        ("b4096", InteropExpect::File(pattern(4096, 2))),
+        ("d1/renamed", InteropExpect::File(pattern(4097, 3))),
+        ("d1/d2/big", InteropExpect::File(big)),
+        ("link", InteropExpect::Symlink("d1/renamed")),
+        ("b4097", InteropExpect::Absent),
+        ("doomed", InteropExpect::Absent),
+    ]
+}
+
+/// A read-only kernel mount of an image through a loop device; unmounted and
+/// detached on drop.
+struct KernelRoMount {
+    mountpoint: PathBuf,
+    loop_device: String,
+}
+
+impl Drop for KernelRoMount {
+    fn drop(&mut self) {
+        let _ = Command::new("sudo")
+            .args(["-n", "umount"])
+            .arg(&self.mountpoint)
+            .status();
+        let _ = Command::new("sudo")
+            .args(["-n", "losetup", "-d", &self.loop_device])
+            .status();
+    }
+}
+
+/// Mount `image` read-only with the kernel's own `fstype` driver. The kernel
+/// is the reference reader here, so a mount it REFUSES is a test failure,
+/// while a host without loop/mount capability is a capability skip.
+fn kernel_ro_mount(image: &Path, fstype: &str, mountpoint: &Path) -> Option<KernelRoMount> {
+    let attached = Command::new("sudo")
+        .args(["-n", "losetup", "--find", "--show", "--read-only"])
+        .arg(image)
+        .output()
+        .ok()?;
+    if !attached.status.success() {
+        require_fuse_or_skip(&format!(
+            "kernel loop attach unavailable: {}",
+            String::from_utf8_lossy(&attached.stderr)
+        ));
+        return None;
+    }
+    let loop_device = String::from_utf8_lossy(&attached.stdout).trim().to_owned();
+    fs::create_dir_all(mountpoint).expect("create kernel mountpoint");
+    let mounted = Command::new("sudo")
+        .args(["-n", "mount", "-t", fstype, "-o", "ro"])
+        .arg(&loop_device)
+        .arg(mountpoint)
+        .output()
+        .expect("spawn mount");
+    let guard = KernelRoMount {
+        mountpoint: mountpoint.to_path_buf(),
+        loop_device,
+    };
+    assert!(
+        mounted.status.success(),
+        "the kernel {fstype} driver refused a FrankenFS-written image: {}",
+        String::from_utf8_lossy(&mounted.stderr)
+    );
+    Some(guard)
+}
+
+fn assert_interop_tree(root: &Path, expected: &[(&'static str, InteropExpect)], fstype: &str) {
+    for (rel, want) in expected {
+        let path = root.join(rel);
+        match want {
+            InteropExpect::Dir => {
+                assert!(path.is_dir(), "{fstype}: kernel must see directory {rel}")
+            }
+            InteropExpect::File(bytes) => assert_eq!(
+                &fs::read(&path).unwrap_or_else(|e| panic!("{fstype}: kernel read {rel}: {e}")),
+                bytes,
+                "{fstype}: kernel read different bytes for {rel}"
+            ),
+            InteropExpect::Symlink(target) => assert_eq!(
+                fs::read_link(&path)
+                    .unwrap_or_else(|e| panic!("{fstype}: kernel readlink {rel}: {e}")),
+                Path::new(target),
+                "{fstype}: symlink target of {rel}"
+            ),
+            InteropExpect::Absent => assert!(
+                fs::symlink_metadata(&path).is_err(),
+                "{fstype}: {rel} was removed but the kernel still sees it"
+            ),
+        }
+    }
+    let one = fs::metadata(root.join("one")).expect("stat one");
+    let hard = fs::metadata(root.join("d1/hard")).expect("stat hard");
+    assert_eq!(
+        one.ino(),
+        hard.ino(),
+        "{fstype}: hard link must share the inode"
+    );
+    assert_eq!(
+        one.nlink(),
+        2,
+        "{fstype}: hard-linked inode must have nlink 2"
+    );
+}
+
+/// The compatibility promise end to end: images FrankenFS wrote through its
+/// FUSE read-write path must pass the format's own checker AND mount and read
+/// back exactly under the Linux kernel driver. ext4 and btrfs (the latter
+/// with mkfs's default DUP metadata, the bd-0mcvt kernel-mount item).
+#[test]
+fn ffs_written_images_mount_and_read_under_the_linux_kernel() {
+    if !fuse_available() {
+        return;
+    }
+    for tool in ["e2fsck", "mkfs.btrfs", "btrfs", "losetup"] {
+        if !command_available(tool) {
+            require_fuse_or_skip(&format!("{tool} unavailable for the kernel interop check"));
+            return;
+        }
+    }
+    let rw = MountOptions {
+        read_only: false,
+        auto_unmount: false,
+        ..MountOptions::default()
+    };
+
+    // ext4
+    let tmp = TempDir::new().expect("tmpdir");
+    let image = create_test_image_with_size(tmp.path(), 64 * 1024 * 1024);
+    let mnt = tmp.path().join("mnt");
+    fs::create_dir_all(&mnt).expect("create mountpoint");
+    let Some(session) = try_mount_ffs_rw_with_options(&image, &mnt, &rw) else {
+        return;
+    };
+    let expected = interop_workload(&mnt.join("testdir"));
+    session.unmount_and_join();
+    let fsck = Command::new("e2fsck")
+        .args(["-fn", image.to_str().expect("utf8")])
+        .output()
+        .expect("run e2fsck");
+    assert!(
+        fsck.status.success(),
+        "e2fsck -fn on the FrankenFS-written ext4 image:\n{}{}",
+        String::from_utf8_lossy(&fsck.stdout),
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+    let kmnt = tmp.path().join("kernel");
+    let Some(kernel) = kernel_ro_mount(&image, "ext4", &kmnt) else {
+        return;
+    };
+    assert_interop_tree(&kmnt.join("testdir"), &expected, "ext4");
+    drop(kernel);
+    emit_scenario_result("ffs_written_ext4_kernel_interop", "PASS", None);
+
+    // btrfs
+    let tmp = TempDir::new().expect("tmpdir");
+    let image = create_btrfs_test_image(tmp.path());
+    let mnt = tmp.path().join("mnt");
+    fs::create_dir_all(&mnt).expect("create mountpoint");
+    let Some(session) = try_mount_btrfs_rw_with_options(&image, &mnt, &rw) else {
+        return;
+    };
+    let expected = interop_workload(&mnt.join(BTRFS_TEST_WORKSPACE));
+    session.unmount_and_join();
+    let check = Command::new("btrfs")
+        .args(["check", "--readonly"])
+        .arg(&image)
+        .output()
+        .expect("run btrfs check");
+    assert!(
+        check.status.success(),
+        "btrfs check on the FrankenFS-written btrfs image:\n{}{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let kmnt = tmp.path().join("kernel");
+    let Some(kernel) = kernel_ro_mount(&image, "btrfs", &kmnt) else {
+        return;
+    };
+    assert_interop_tree(&kmnt.join(BTRFS_TEST_WORKSPACE), &expected, "btrfs");
+    drop(kernel);
+    emit_scenario_result("ffs_written_btrfs_kernel_interop", "PASS", None);
+}
+
 /// Helper: create image, mount rw, run a closure, then drop the session.
 fn with_rw_mount(f: impl FnOnce(&Path)) {
     with_rw_mount_sized(4 * 1024 * 1024, f);
