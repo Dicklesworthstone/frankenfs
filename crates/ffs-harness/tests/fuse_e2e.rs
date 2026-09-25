@@ -1990,6 +1990,152 @@ fn ffs_written_images_mount_and_read_under_the_linux_kernel() {
     emit_scenario_result("ffs_written_btrfs_dup_copy2_kernel_read", "PASS", None);
 }
 
+/// bd-5elw6: relocation (`btrfs balance`) can leave shared/full backrefs in
+/// the extent tree without any snapshot, which the last_snapshot refusal does
+/// not see. A FrankenFS read-write session on a kernel-balanced image must
+/// leave it `btrfs check` clean and every file readable by the kernel.
+#[test]
+fn btrfs_rw_after_kernel_balance_keeps_the_image_clean_bd_5elw6() {
+    for tool in ["mkfs.btrfs", "btrfs", "losetup"] {
+        if !command_available(tool) {
+            require_fuse_or_skip(&format!("{tool} unavailable for the balance check"));
+            return;
+        }
+    }
+    if !fuse_available() {
+        return;
+    }
+    const FILES: usize = 400;
+    let content = |index: usize, salt: usize| -> Vec<u8> {
+        (0..5000_usize)
+            .map(|i| u8::try_from((i * 7 + index * 13 + salt) % 251).expect("fits u8"))
+            .collect()
+    };
+    let tmp = TempDir::new().expect("tmpdir");
+    let seed_workspace = tmp.path().join("seed_root").join(BTRFS_TEST_WORKSPACE);
+    fs::create_dir_all(&seed_workspace).expect("seed workspace");
+    for dir in [tmp.path().join("seed_root"), seed_workspace.clone()] {
+        fs::set_permissions(&dir, fs::Permissions::from_mode(0o777)).expect("chmod seed dir");
+    }
+    for index in 0..FILES {
+        let path = seed_workspace.join(format!("f{index:04}"));
+        fs::write(&path, content(index, 0)).expect("seed file");
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o666)).expect("chmod seed file");
+    }
+    let image = tmp.path().join("balanced.btrfs");
+    fs::File::create(&image)
+        .and_then(|f| f.set_len(256 * 1024 * 1024))
+        .expect("size image");
+    let made = Command::new("mkfs.btrfs")
+        .args(["-f", "--rootdir"])
+        .arg(tmp.path().join("seed_root"))
+        .arg(&image)
+        .output()
+        .expect("run mkfs.btrfs");
+    assert!(made.status.success(), "mkfs.btrfs");
+
+    // The kernel relocates every chunk.
+    {
+        let attached = Command::new("sudo")
+            .args(["-n", "losetup", "--find", "--show"])
+            .arg(&image)
+            .output()
+            .expect("spawn losetup");
+        if !attached.status.success() {
+            require_fuse_or_skip("kernel loop attach unavailable");
+            return;
+        }
+        let kmnt = tmp.path().join("kernel-rw");
+        fs::create_dir_all(&kmnt).expect("kernel mountpoint");
+        let guard = KernelRoMount {
+            mountpoint: kmnt.clone(),
+            loop_device: String::from_utf8_lossy(&attached.stdout).trim().to_owned(),
+        };
+        let mounted = Command::new("sudo")
+            .args(["-n", "mount", "-t", "btrfs"])
+            .arg(&guard.loop_device)
+            .arg(&kmnt)
+            .output()
+            .expect("spawn mount");
+        assert!(mounted.status.success(), "kernel rw mount");
+        let balanced = Command::new("sudo")
+            .args(["-n", "btrfs", "balance", "start", "--full-balance"])
+            .arg(&kmnt)
+            .output()
+            .expect("spawn balance");
+        assert!(
+            balanced.status.success(),
+            "kernel balance: {}",
+            String::from_utf8_lossy(&balanced.stderr)
+        );
+        drop(guard);
+    }
+    let dump = Command::new("btrfs")
+        .args(["inspect-internal", "dump-tree", "-t", "extent"])
+        .arg(&image)
+        .output()
+        .expect("dump extent tree");
+    let text = String::from_utf8_lossy(&dump.stdout);
+    eprintln!(
+        "balance: extent tree has {} shared block backrefs, {} shared data backrefs, {} FULL_BACKREF flags",
+        text.matches("shared block backref").count(),
+        text.matches("shared data backref").count(),
+        text.matches("FULL_BACKREF").count()
+    );
+
+    let mnt = tmp.path().join("mnt");
+    fs::create_dir_all(&mnt).expect("mountpoint");
+    let rw = MountOptions {
+        read_only: false,
+        auto_unmount: false,
+        ..MountOptions::default()
+    };
+    let Some(session) = try_mount_btrfs_rw_with_options(&image, &mnt, &rw) else {
+        return;
+    };
+    let workspace = mnt.join(BTRFS_TEST_WORKSPACE);
+    for index in 0..FILES {
+        let path = workspace.join(format!("f{index:04}"));
+        if index % 4 == 3 {
+            fs::remove_file(&path).expect("remove through FrankenFS");
+        } else {
+            fs::write(&path, content(index, 101)).expect("rewrite through FrankenFS");
+        }
+    }
+    session.unmount_and_join();
+
+    let check = Command::new("btrfs")
+        .args(["check", "--readonly"])
+        .arg(&image)
+        .output()
+        .expect("run btrfs check");
+    assert!(
+        check.status.success(),
+        "btrfs check after a FrankenFS rw session on a balanced image:\n{}{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let kmnt = tmp.path().join("kernel-ro");
+    let Some(kernel) = kernel_ro_mount(&image, "btrfs", &kmnt) else {
+        return;
+    };
+    for index in 0..FILES {
+        let path = kmnt.join(BTRFS_TEST_WORKSPACE).join(format!("f{index:04}"));
+        if index % 4 == 3 {
+            assert!(!path.exists(), "{} was removed", path.display());
+        } else {
+            assert_eq!(
+                fs::read(&path).unwrap_or_else(|e| panic!("{}: {e}", path.display())),
+                content(index, 101),
+                "{}",
+                path.display()
+            );
+        }
+    }
+    drop(kernel);
+    emit_scenario_result("btrfs_rw_after_balance_clean", "PASS", None);
+}
+
 /// bd-5elw6: a kernel snapshot shares the default subvolume's tree blocks,
 /// and btrfs refcounts shared tree blocks lazily (only the root item's
 /// `last_snapshot` marks them). FrankenFS's commit cannot yet COW such blocks
