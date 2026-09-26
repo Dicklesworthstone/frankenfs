@@ -773,6 +773,8 @@ The native WAL in `ffs-mvcc`:
 
 `replay_tree_log()` walks the tree-log when `log_root != 0`, returns items for FS-tree merge, and is wired into the mount path. Fuzz coverage includes multilevel synthesized trees, absent log roots, and equivalent chunk mappings.
 
+This replays tree logs FrankenFS itself wrote. A log the **kernel** wrote (its log-root-tree format) is not replayed: the mount stays read-only to preserve it and shows the filesystem as of the last full commit — what the kernel's `nologreplay` shows — so anything made durable only by an `fsync` recorded in that log is not visible until a kernel mount replays it.
+
 ---
 
 ## Deep Dive: Structured Concurrency with asupersync
