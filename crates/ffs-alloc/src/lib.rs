@@ -5165,6 +5165,50 @@ mod tests {
         assert_eq!(groups[1].free_inodes, 2048);
     }
 
+    /// Recovery marks an inode a replayed record created: once, with the
+    /// directory count, and a second claim (a rerun replay) changes nothing.
+    #[test]
+    fn claim_inode_marks_once_and_counts_directories() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let ino = InodeNumber(u64::from(geo.inodes_per_group) + 5);
+
+        assert!(claim_inode(&cx, &dev, &geo, &mut groups, ino, true).unwrap());
+        assert_eq!(groups[1].free_inodes, 2047);
+        assert_eq!(groups[1].used_dirs, 1);
+        assert!(!claim_inode(&cx, &dev, &geo, &mut groups, ino, true).unwrap());
+        assert_eq!(groups[1].free_inodes, 2047);
+        assert_eq!(groups[1].used_dirs, 1);
+
+        // The claimed inode is allocated as far as the allocator is concerned.
+        free_inode(&cx, &dev, &geo, &mut groups, ino).unwrap();
+        assert_eq!(groups[1].free_inodes, 2048);
+    }
+
+    /// Only bits not yet set count, so overlapping or repeated claims keep the
+    /// free count exact.
+    #[test]
+    fn claim_blocks_counts_only_newly_marked_blocks() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let geo = make_geometry();
+        let mut groups = make_groups(&geo);
+        let start = u64::from(geo.blocks_per_group) + 1000;
+
+        let claimed = claim_blocks(&cx, &dev, &geo, &mut groups, BlockNumber(start), 10).unwrap();
+        assert_eq!(claimed, 10);
+        assert_eq!(groups[1].free_blocks, geo.blocks_per_group - 10);
+        let claimed =
+            claim_blocks(&cx, &dev, &geo, &mut groups, BlockNumber(start + 5), 10).unwrap();
+        assert_eq!(claimed, 5);
+        assert_eq!(groups[1].free_blocks, geo.blocks_per_group - 15);
+
+        free_blocks(&cx, &dev, &geo, &mut groups, BlockNumber(start), 15).unwrap();
+        assert_eq!(groups[1].free_blocks, geo.blocks_per_group);
+    }
+
     #[test]
     fn freed_lower_inode_rewinds_search_cursor() {
         let cx = test_cx();
