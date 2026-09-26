@@ -19340,6 +19340,161 @@ fn run_fc_kernel_scenario(
     emit_scenario_result(scenario, "PASS", None);
 }
 
+/// A kernel btrfs crash image whose last changes are durable only through the
+/// kernel's tree log (fsyncs after a synced baseline, `commit=600` so no
+/// transaction commit intervenes). The kernel recovers one copy (a mount
+/// replays the log); FrankenFS's view of the other must equal it.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn btrfs_kernel_tree_log_crash_image_matches_kernel() {
+    for tool in ["mkfs.btrfs", "btrfs"] {
+        if !command_available(tool) {
+            require_fuse_or_skip(&format!("{tool} unavailable for the tree-log test"));
+            return;
+        }
+    }
+    if !can_run_sudo() {
+        require_fuse_or_skip("sudo unavailable for the tree-log test");
+        return;
+    }
+    let tmp = tempfile::TempDir::new().unwrap();
+    let img = tmp.path().join("log.btrfs");
+    fs::File::create(&img)
+        .and_then(|f| f.set_len(256 * 1024 * 1024))
+        .unwrap();
+    let made = Command::new("mkfs.btrfs")
+        .args(["-q", "-f"])
+        .arg(&img)
+        .output()
+        .expect("mkfs.btrfs");
+    assert!(made.status.success(), "mkfs.btrfs");
+    let attached = Command::new("sudo")
+        .args(["-n", "losetup", "--direct-io=on", "--find", "--show"])
+        .arg(&img)
+        .output()
+        .expect("losetup");
+    assert!(attached.status.success(), "losetup");
+    let mnt = tmp.path().join("mnt");
+    fs::create_dir_all(&mnt).unwrap();
+    let live = KernelRoMount {
+        mountpoint: mnt.clone(),
+        loop_device: String::from_utf8_lossy(&attached.stdout).trim().to_owned(),
+    };
+    let mounted = Command::new("sudo")
+        .args(["-n", "mount", "-t", "btrfs", "-o", "commit=600"])
+        .arg(&live.loop_device)
+        .arg(&mnt)
+        .output()
+        .expect("mount");
+    assert!(mounted.status.success(), "kernel mount");
+    let _ = Command::new("sudo")
+        .args(["-n", "chmod", "-R", "a+rwX"])
+        .arg(&mnt)
+        .output();
+    let dir = mnt.join("d");
+    fs::create_dir_all(&dir).unwrap();
+    fs::write(dir.join("base"), b"base").unwrap();
+    let synced = Command::new("sync").output().expect("sync");
+    assert!(synced.status.success(), "baseline sync");
+    fc_fsynced_write(&dir, "new1", &[0x6E_u8; 9000], false);
+    fc_fsynced_write(&dir, "new2", b"second file after the commit", false);
+    fc_fsynced_write(&dir, "base", b" appended", true);
+    let crash_image = tmp.path().join("crash.btrfs");
+    let kernel_image = tmp.path().join("crash_kernel.btrfs");
+    for copy in [&crash_image, &kernel_image] {
+        let output = Command::new("sudo")
+            .args(["-n", "cp"])
+            .arg(&img)
+            .arg(copy)
+            .output()
+            .expect("copy crash image");
+        assert!(output.status.success(), "crash image copy");
+        let _ = Command::new("sudo")
+            .args(["-n", "chmod", "a+rw"])
+            .arg(copy)
+            .output();
+    }
+    drop(live);
+    let log_root = Command::new("btrfs")
+        .args(["inspect-internal", "dump-super"])
+        .arg(&crash_image)
+        .output()
+        .expect("dump-super");
+    let super_text = String::from_utf8_lossy(&log_root.stdout);
+    assert!(
+        super_text
+            .lines()
+            .any(|line| line.starts_with("log_root") && !line.trim_end().ends_with("\t0")),
+        "the crash image must carry a kernel tree log:\n{super_text}"
+    );
+
+    // The oracle: a kernel mount replays the log (a writable loop device:
+    // replay writes).
+    let attached = Command::new("sudo")
+        .args(["-n", "losetup", "--find", "--show"])
+        .arg(&kernel_image)
+        .output()
+        .expect("losetup oracle");
+    assert!(attached.status.success(), "losetup oracle");
+    let kmnt = tmp.path().join("kernel-recovered");
+    fs::create_dir_all(&kmnt).unwrap();
+    let oracle = KernelRoMount {
+        mountpoint: kmnt.clone(),
+        loop_device: String::from_utf8_lossy(&attached.stdout).trim().to_owned(),
+    };
+    let mounted = Command::new("sudo")
+        .args(["-n", "mount", "-t", "btrfs"])
+        .arg(&oracle.loop_device)
+        .arg(&kmnt)
+        .output()
+        .expect("mount oracle");
+    assert!(
+        mounted.status.success(),
+        "kernel recovery mount: {}",
+        String::from_utf8_lossy(&mounted.stderr)
+    );
+    let mut kernel_view = std::collections::BTreeMap::new();
+    for entry in fs::read_dir(kmnt.join("d")).expect("kernel readdir") {
+        let entry = entry.expect("kernel dirent");
+        kernel_view.insert(
+            entry.file_name().to_string_lossy().into_owned(),
+            fs::read(entry.path()).expect("kernel read"),
+        );
+    }
+    drop(oracle);
+    assert_eq!(
+        kernel_view.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["base", "new1", "new2"],
+        "kernel-recovered names"
+    );
+
+    let cx = Cx::for_testing();
+    let fs = OpenFs::open_with_options(&cx, &crash_image, &OpenOptions::default())
+        .unwrap_or_else(|e| panic!("FrankenFS must open the tree-log crash image: {e}"));
+    let d = fs
+        .lookup(&cx, InodeNumber(1), std::ffi::OsStr::new("d"))
+        .expect("lookup d");
+    let mut ffs_view = std::collections::BTreeMap::new();
+    for entry in readdir_all(&cx, &fs, d.ino) {
+        let name = entry.name_str();
+        if name == "." || name == ".." {
+            continue;
+        }
+        let attr = fs
+            .lookup(&cx, d.ino, std::ffi::OsStr::new(&name))
+            .unwrap_or_else(|e| panic!("FrankenFS lookup {name}: {e}"));
+        let bytes = fs
+            .read(&cx, attr.ino, 0, u32::try_from(attr.size).expect("fits"))
+            .unwrap_or_else(|e| panic!("FrankenFS read {name}: {e}"));
+        ffs_view.insert(name, bytes);
+    }
+    assert_eq!(
+        ffs_view, kernel_view,
+        "FrankenFS's view of a kernel tree-log crash image must equal the kernel's recovery"
+    );
+    emit_scenario_result("btrfs_kernel_tree_log_matches_kernel", "PASS", None);
+}
+
 /// Every entry of a directory: `readdir` returns one page, continued from the
 /// last entry's offset cookie.
 fn readdir_all(cx: &Cx, fs: &OpenFs, dir: InodeNumber) -> Vec<ffs_core::vfs::DirEntry> {

@@ -773,7 +773,7 @@ The native WAL in `ffs-mvcc`:
 
 `replay_tree_log()` walks the tree-log when `log_root != 0`, returns items for FS-tree merge, and is wired into the mount path. Fuzz coverage includes multilevel synthesized trees, absent log roots, and equivalent chunk mappings.
 
-This replays tree logs FrankenFS itself wrote. A log the **kernel** wrote (its log-root-tree format) is not replayed: the mount stays read-only to preserve it and shows the filesystem as of the last full commit — what the kernel's `nologreplay` shows — so anything made durable only by an `fsync` recorded in that log is not visible until a kernel mount replays it.
+A **kernel**-written log (its log root tree: one ROOT_ITEM per subvolume pointing at that subvolume's log) is followed to the mounted subvolume's log and overlaid as a read view. A kernel log names a file created and fsynced since the last commit only through its INODE_REF items, so replay synthesizes the DIR_INDEX and DIR_ITEM entries those imply, as the kernel's `add_inode_ref` does; before 2026-09-26 such files were replayed as inodes with no name. `btrfs_kernel_tree_log_crash_image_matches_kernel` checks the result against the kernel: a crash image with new files and an append made durable only through the tree log, recovered by a kernel mount, must read the same in FrankenFS. Only additive log contents are covered; a kernel log that records removals (its directory log ranges) is not interpreted. Writes are refused while an unreplayable log is present.
 
 ---
 

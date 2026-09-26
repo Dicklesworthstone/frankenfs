@@ -11953,7 +11953,8 @@ fn tree_log_replay_result(entries: Vec<BtrfsLeafEntry>) -> Result<TreeLogReplayR
             foreign_format: true,
         });
     }
-    let (items, deleted_keys) = split_tree_log_deletion_records(entries)?;
+    let (mut items, deleted_keys) = split_tree_log_deletion_records(entries)?;
+    synthesize_tree_log_dir_entries(&mut items)?;
     Ok(TreeLogReplayResult {
         items,
         deleted_keys,
@@ -11961,6 +11962,108 @@ fn tree_log_replay_result(entries: Vec<BtrfsLeafEntry>) -> Result<TreeLogReplayR
         replayed: true,
         foreign_format: false,
     })
+}
+
+/// The directory-entry type of an inode mode.
+fn btrfs_file_type_from_mode(mode: u32) -> u8 {
+    match mode & 0o170_000 {
+        0o040_000 => BTRFS_FT_DIR,
+        0o020_000 => BTRFS_FT_CHRDEV,
+        0o060_000 => BTRFS_FT_BLKDEV,
+        0o010_000 => BTRFS_FT_FIFO,
+        0o140_000 => BTRFS_FT_SOCK,
+        0o120_000 => BTRFS_FT_SYMLINK,
+        0o100_000 => BTRFS_FT_REG_FILE,
+        _ => BTRFS_FT_UNKNOWN,
+    }
+}
+
+/// A kernel tree log names a logged inode only through its INODE_REF items;
+/// the kernel's replay (`add_inode_ref`) inserts the directory entries they
+/// imply. Synthesize each logged name's DIR_INDEX and DIR_ITEM in its parent
+/// so an overlay of the log shows the file — without them a file created and
+/// fsynced since the last commit had its inode replayed but no name. Entries
+/// the log already carries are kept. Names whose inode the log does not
+/// describe (or describes in a record too short to parse) are skipped: their
+/// type is unknown here, and the overlay itself stays as it was.
+fn synthesize_tree_log_dir_entries(items: &mut Vec<BtrfsLeafEntry>) -> Result<(), ParseError> {
+    let file_types: std::collections::HashMap<u64, u8> = items
+        .iter()
+        .filter(|item| item.key.item_type == BTRFS_ITEM_INODE_ITEM && item.key.offset == 0)
+        .filter_map(|item| {
+            parse_inode_item(&item.data)
+                .ok()
+                .map(|inode| (item.key.objectid, btrfs_file_type_from_mode(inode.mode)))
+        })
+        .collect();
+    let mut synthesized: Vec<BtrfsLeafEntry> = Vec::new();
+    for item in items
+        .iter()
+        .filter(|item| item.key.item_type == BTRFS_ITEM_INODE_REF)
+    {
+        let child = item.key.objectid;
+        let parent = item.key.offset;
+        let Some(&file_type) = file_types.get(&child) else {
+            continue;
+        };
+        let Ok(inode_refs) = parse_inode_refs(&item.data) else {
+            continue;
+        };
+        for inode_ref in inode_refs {
+            let entry = BtrfsDirItem {
+                child_objectid: child,
+                child_key_type: BTRFS_ITEM_INODE_ITEM,
+                child_key_offset: 0,
+                file_type,
+                name: inode_ref.name,
+            }
+            .try_to_bytes()?;
+            let index_key = BtrfsKey {
+                objectid: parent,
+                item_type: BTRFS_ITEM_DIR_INDEX,
+                offset: inode_ref.index,
+            };
+            if !items.iter().any(|existing| existing.key == index_key)
+                && !synthesized.iter().any(|existing| existing.key == index_key)
+            {
+                synthesized.push(BtrfsLeafEntry {
+                    key: index_key,
+                    data: entry.clone(),
+                });
+            }
+            let name = &entry[30..];
+            let item_key = BtrfsKey {
+                objectid: parent,
+                item_type: BTRFS_ITEM_DIR_ITEM,
+                offset: u64::from(btrfs_name_hash(name)),
+            };
+            let bucket = synthesized
+                .iter_mut()
+                .find(|existing| existing.key == item_key);
+            if items.iter().any(|existing| existing.key == item_key) {
+                continue; // the log's own DIR_ITEM for this hash wins
+            }
+            match bucket {
+                Some(bucket) => {
+                    if !parse_dir_items(&bucket.data)?
+                        .iter()
+                        .any(|present| present.name == name)
+                    {
+                        bucket.data.extend_from_slice(&entry);
+                    }
+                }
+                None => synthesized.push(BtrfsLeafEntry {
+                    key: item_key,
+                    data: entry,
+                }),
+            }
+        }
+    }
+    if !synthesized.is_empty() {
+        items.extend(synthesized);
+        items.sort_by(|lhs, rhs| key_cmp(&lhs.key, &rhs.key));
+    }
+    Ok(())
 }
 
 /// Result of scanning the btrfs tree-log.
@@ -21624,6 +21727,87 @@ mod tests {
         let mut dirid = [0_u8; 8];
         dirid.copy_from_slice(&item[168..176]);
         assert_eq!(u64::from_le_bytes(dirid), 0);
+    }
+
+    /// A kernel tree log names a file created and fsynced since the last
+    /// commit only through its INODE_REF: replay synthesizes the parent's
+    /// DIR_INDEX and DIR_ITEM for it, typed from the logged inode. A name
+    /// whose inode the log does not describe gets none.
+    #[test]
+    fn tree_log_replay_synthesizes_dir_entries_from_inode_refs() {
+        let inode = BtrfsInodeItem {
+            generation: 10,
+            size: 9000,
+            nbytes: 12288,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            mode: 0o100_644,
+            rdev: 0,
+            flags: 0,
+            atime_sec: 0,
+            atime_nsec: 0,
+            ctime_sec: 0,
+            ctime_nsec: 0,
+            mtime_sec: 0,
+            mtime_nsec: 0,
+            otime_sec: 0,
+            otime_nsec: 0,
+        };
+        let entry = |objectid, item_type, offset, data: Vec<u8>| BtrfsLeafEntry {
+            key: BtrfsKey {
+                objectid,
+                item_type,
+                offset,
+            },
+            data,
+        };
+        let inode_ref = |index, name: &[u8]| {
+            BtrfsInodeRef {
+                index,
+                name: name.to_vec(),
+            }
+            .try_to_bytes()
+            .expect("inode ref")
+        };
+        let items = vec![
+            entry(259, BTRFS_ITEM_INODE_ITEM, 0, inode.to_bytes()),
+            entry(259, BTRFS_ITEM_INODE_REF, 257, inode_ref(3, b"new1")),
+            entry(260, BTRFS_ITEM_INODE_REF, 257, inode_ref(4, b"orphan")),
+        ];
+        let result = tree_log_replay_result(items).expect("replay");
+        let find = |item_type, offset| {
+            result.items.iter().find(|item| {
+                item.key
+                    == BtrfsKey {
+                        objectid: 257,
+                        item_type,
+                        offset,
+                    }
+            })
+        };
+        for (item_type, offset) in [
+            (BTRFS_ITEM_DIR_INDEX, 3),
+            (BTRFS_ITEM_DIR_ITEM, u64::from(btrfs_name_hash(b"new1"))),
+        ] {
+            let dir = find(item_type, offset).expect("synthesized entry");
+            let entries = parse_dir_items(&dir.data).expect("dir item");
+            assert_eq!(entries.len(), 1);
+            assert_eq!(entries[0].child_objectid, 259);
+            assert_eq!(entries[0].file_type, BTRFS_FT_REG_FILE);
+            assert_eq!(entries[0].name, b"new1");
+        }
+        assert!(
+            find(BTRFS_ITEM_DIR_INDEX, 4).is_none(),
+            "no inode, no entry"
+        );
+        assert!(
+            result
+                .items
+                .windows(2)
+                .all(|pair| key_cmp(&pair[0].key, &pair[1].key) != Ordering::Greater),
+            "items stay in key order"
+        );
     }
 
     #[test]
