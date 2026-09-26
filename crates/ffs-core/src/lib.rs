@@ -36123,119 +36123,6 @@ impl OpenFs {
         // reason: those are same-size `update`s of items that already exist, so
         // the root tree's shape — and therefore its positional order — is fixed
         // from here on.
-        let mut extent_pool: Vec<u64> = Vec::new();
-        let mut root_pool: Vec<u64> = Vec::new();
-        let mut self_describe_converged = false;
-        for _pass in 0..Self::SELF_DESCRIBE_MAX_PASSES {
-            let mut changed = false;
-
-            // extent_tree first, matching the pre-bd-k74ef allocation order so
-            // an unchanged single-leaf filesystem lands on the same addresses.
-            let extent_order =
-                WriteDependencyDag::from_cow_tree(alloc.extent_alloc.extent_tree(), new_gen)
-                    .map_err(|e| btrfs_mutation_to_ffs(&e))?
-                    .reverse_topological_order_with_levels();
-            while extent_pool.len() < extent_order.len() {
-                let allocation = alloc
-                    .extent_alloc
-                    .alloc_metadata_for_extent_tree(u64::from(nodesize), 0)
-                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-                extent_pool.push(allocation.bytenr);
-                changed = true;
-            }
-            // The tree can also SHRINK during a pass (the COW tree rebalances
-            // as items are rewritten). A surplus address was reserved and
-            // described but will never hold a block: give it back, or the
-            // positional binding below disagrees by one and the commit refuses
-            // (seen at 192 blocks vs 193 addresses on a 3000-file,
-            // 4 KiB-node image, bd-5elw6).
-            while extent_pool.len() > extent_order.len() {
-                let surplus = extent_pool.pop().expect("pool is longer than order");
-                alloc
-                    .extent_alloc
-                    .free_extent(surplus, u64::from(nodesize), true)
-                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-                changed = true;
-            }
-            for (index, (_block, level)) in extent_order.iter().enumerate() {
-                if alloc
-                    .extent_alloc
-                    .ensure_self_metadata_item(
-                        extent_pool[index],
-                        *level,
-                        BTRFS_EXTENT_TREE_OBJECTID,
-                        new_gen,
-                    )
-                    .map_err(|e| btrfs_mutation_to_ffs(&e))?
-                {
-                    changed = true;
-                }
-            }
-
-            // root_tree: its item set is final by now (everything remaining is a
-            // same-size ROOT_ITEM patch), so only COW moves its blocks around.
-            let root_order = WriteDependencyDag::from_cow_tree(&alloc.root_tree, new_gen)
-                .map_err(|e| btrfs_mutation_to_ffs(&e))?
-                .reverse_topological_order_with_levels();
-            while root_pool.len() < root_order.len() {
-                let allocation = alloc
-                    .extent_alloc
-                    .alloc_metadata_for_root_tree(u64::from(nodesize), 0)
-                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-                root_pool.push(allocation.bytenr);
-                changed = true;
-            }
-            while root_pool.len() > root_order.len() {
-                let surplus = root_pool.pop().expect("pool is longer than order");
-                alloc
-                    .extent_alloc
-                    .free_extent(surplus, u64::from(nodesize), true)
-                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-                changed = true;
-            }
-            for (index, (_block, level)) in root_order.iter().enumerate() {
-                if alloc
-                    .extent_alloc
-                    .ensure_self_metadata_item(
-                        root_pool[index],
-                        *level,
-                        BTRFS_ROOT_TREE_OBJECTID,
-                        new_gen,
-                    )
-                    .map_err(|e| btrfs_mutation_to_ffs(&e))?
-                {
-                    changed = true;
-                }
-            }
-
-            if !changed {
-                self_describe_converged = true;
-                break;
-            }
-        }
-        if !self_describe_converged {
-            return Err(FfsError::Io(std::io::Error::other(format!(
-                "bd-k74ef: extent-tree self-description did not converge in {} passes; \
-                 refusing to write an image whose extent tree does not describe its own blocks",
-                Self::SELF_DESCRIBE_MAX_PASSES
-            ))));
-        }
-
-        // bd-qxo5x: the reused FREE_SPACE_TREE block is rewritten below, so bump
-        // its loaded extent-item generation to match (else btrfs check reports a
-        // backref generation mismatch for it). Gated exactly as the rewrite is,
-        // so a free-space tree we do NOT rewrite keeps the generation its block
-        // still carries. In-place update of an existing item: no shape change,
-        // so the fixpoint above stays converged.
-        if let Some((fst_addr, fst_level)) = fst_reuse
-            && alloc.extent_alloc.extent_tree_root_is_leaf()
-        {
-            alloc
-                .extent_alloc
-                .set_tree_block_generation(fst_addr, fst_level, new_gen)
-                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-        }
-
         // ── CHUNK_TREE + DEV_TREE commit (bd-a136s) ─────────────────────────────
         //
         // Only when a chunk was ALLOCATED this transaction. Every other commit
@@ -36250,9 +36137,14 @@ impl OpenFs {
         // amplification bd-42gtq and bd-uxh7t are about — for a tree that did not
         // change. btrfs COWs what changed; so do we.
         //
-        // Ordered with the csum tree and before extent_tree for the same reason:
-        // the EXTENT_ITEMs these allocations add must be serialized into
-        // extent_tree below.
+        // ⚠️ BEFORE THE SELF-DESCRIPTION FIXPOINT BELOW, NOT AFTER IT. Allocating
+        // these trees' blocks INSERTS their extent items, so it changes the
+        // extent tree's shape; after the fixpoint that broke the positional
+        // binding ("extent tree has 3 blocks but 1 addresses were reserved"), on
+        // every commit that grew a chunk while the extent tree was one full
+        // leaf — found by btrfs_node_cache_serves_repeated_descents once chunk
+        // growth became the default (bd-uxh7t). The DEV_TREE ROOT_ITEM patch is
+        // a same-size update the fixpoint's root-tree pass absorbs.
         //
         // ⚠️ THE SHORTFALL PRE-CHECK MUST COUNT THESE NODES. Serializing the
         // chunk tree ALLOCATES metadata, so a commit that grows the filesystem
@@ -36393,6 +36285,121 @@ impl OpenFs {
                     alloc.chunk_tree.root_level(),
                 ));
             }
+        }
+
+        // The self-description fixpoint (explained above the CHUNK_TREE +
+        // DEV_TREE commit, which must precede it).
+        let mut extent_pool: Vec<u64> = Vec::new();
+        let mut root_pool: Vec<u64> = Vec::new();
+        let mut self_describe_converged = false;
+        for _pass in 0..Self::SELF_DESCRIBE_MAX_PASSES {
+            let mut changed = false;
+
+            // extent_tree first, matching the pre-bd-k74ef allocation order so
+            // an unchanged single-leaf filesystem lands on the same addresses.
+            let extent_order =
+                WriteDependencyDag::from_cow_tree(alloc.extent_alloc.extent_tree(), new_gen)
+                    .map_err(|e| btrfs_mutation_to_ffs(&e))?
+                    .reverse_topological_order_with_levels();
+            while extent_pool.len() < extent_order.len() {
+                let allocation = alloc
+                    .extent_alloc
+                    .alloc_metadata_for_extent_tree(u64::from(nodesize), 0)
+                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                extent_pool.push(allocation.bytenr);
+                changed = true;
+            }
+            // The tree can also SHRINK during a pass (the COW tree rebalances
+            // as items are rewritten). A surplus address was reserved and
+            // described but will never hold a block: give it back, or the
+            // positional binding below disagrees by one and the commit refuses
+            // (seen at 192 blocks vs 193 addresses on a 3000-file,
+            // 4 KiB-node image, bd-5elw6).
+            while extent_pool.len() > extent_order.len() {
+                let surplus = extent_pool.pop().expect("pool is longer than order");
+                alloc
+                    .extent_alloc
+                    .free_extent(surplus, u64::from(nodesize), true)
+                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                changed = true;
+            }
+            for (index, (_block, level)) in extent_order.iter().enumerate() {
+                if alloc
+                    .extent_alloc
+                    .ensure_self_metadata_item(
+                        extent_pool[index],
+                        *level,
+                        BTRFS_EXTENT_TREE_OBJECTID,
+                        new_gen,
+                    )
+                    .map_err(|e| btrfs_mutation_to_ffs(&e))?
+                {
+                    changed = true;
+                }
+            }
+
+            // root_tree: its item set is final by now (everything remaining is a
+            // same-size ROOT_ITEM patch), so only COW moves its blocks around.
+            let root_order = WriteDependencyDag::from_cow_tree(&alloc.root_tree, new_gen)
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?
+                .reverse_topological_order_with_levels();
+            while root_pool.len() < root_order.len() {
+                let allocation = alloc
+                    .extent_alloc
+                    .alloc_metadata_for_root_tree(u64::from(nodesize), 0)
+                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                root_pool.push(allocation.bytenr);
+                changed = true;
+            }
+            while root_pool.len() > root_order.len() {
+                let surplus = root_pool.pop().expect("pool is longer than order");
+                alloc
+                    .extent_alloc
+                    .free_extent(surplus, u64::from(nodesize), true)
+                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                changed = true;
+            }
+            for (index, (_block, level)) in root_order.iter().enumerate() {
+                if alloc
+                    .extent_alloc
+                    .ensure_self_metadata_item(
+                        root_pool[index],
+                        *level,
+                        BTRFS_ROOT_TREE_OBJECTID,
+                        new_gen,
+                    )
+                    .map_err(|e| btrfs_mutation_to_ffs(&e))?
+                {
+                    changed = true;
+                }
+            }
+
+            if !changed {
+                self_describe_converged = true;
+                break;
+            }
+        }
+        if !self_describe_converged {
+            return Err(FfsError::Io(std::io::Error::other(format!(
+                "bd-k74ef: extent-tree self-description did not converge in {} passes; \
+                 refusing to write an image whose extent tree does not describe its own blocks",
+                Self::SELF_DESCRIBE_MAX_PASSES
+            ))));
+        }
+
+        // bd-qxo5x: the reused FREE_SPACE_TREE block is rewritten below, so bump
+        // its loaded extent-item generation to match (else btrfs check reports a
+        // backref generation mismatch for it). Gated exactly as the rewrite is,
+        // so a free-space tree we do NOT rewrite keeps the generation its block
+        // still carries. In-place update of an existing item: no shape change,
+        // so the fixpoint above stays converged.
+        if let Some((fst_addr, fst_level)) = fst_reuse
+            && alloc.extent_alloc.extent_tree_root_is_leaf()
+        {
+            alloc
+                .extent_alloc
+                .set_tree_block_generation(fst_addr, fst_level, new_gen)
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
         }
 
         // bd-4cxkd: every extent item this transaction touches is now in the
