@@ -19340,13 +19340,54 @@ fn run_fc_kernel_scenario(
     emit_scenario_result(scenario, "PASS", None);
 }
 
-/// A kernel btrfs crash image whose last changes are durable only through the
-/// kernel's tree log (fsyncs after a synced baseline, `commit=600` so no
-/// transaction commit intervenes). The kernel recovers one copy (a mount
-/// replays the log); FrankenFS's view of the other must equal it.
+/// Files created and appended, durable only through the kernel's tree log.
 #[test]
-#[allow(clippy::too_many_lines)]
 fn btrfs_kernel_tree_log_crash_image_matches_kernel() {
+    run_btrfs_tree_log_scenario(
+        "btrfs_kernel_tree_log_matches_kernel",
+        &|dir| fs::write(dir.join("base"), b"base").unwrap(),
+        &|dir| {
+            fc_fsynced_write(dir, "new1", &[0x6E_u8; 9000], false);
+            fc_fsynced_write(dir, "new2", b"second file after the commit", false);
+            fc_fsynced_write(dir, "base", b" appended", true);
+        },
+        &["base", "new1", "new2"],
+    );
+}
+
+/// A removal the kernel records in its tree log: the directory is logged with
+/// DIR_LOG_INDEX ranges, and an entry in a range that the log lacks was
+/// removed (the kernel's replay_dir_deletes).
+#[test]
+fn btrfs_kernel_tree_log_removal_matches_kernel() {
+    run_btrfs_tree_log_scenario(
+        "btrfs_kernel_tree_log_removal_matches_kernel",
+        &|dir| {
+            fs::write(dir.join("base"), b"base").unwrap();
+            fs::write(dir.join("other"), b"other").unwrap();
+        },
+        &|dir| {
+            fs::remove_file(dir.join("base")).expect("remove base");
+            fc_fsynced_write(dir, "kept", b"created with the removal", false);
+            fs::File::open(dir)
+                .and_then(|d| d.sync_all())
+                .expect("fsync dir");
+        },
+        &["kept", "other"],
+    );
+}
+
+/// A kernel btrfs crash image whose last changes are durable only through the
+/// kernel's tree log (`baseline`, a sync, then `changes` made durable by fsync;
+/// `commit=600` so no transaction commit intervenes). The kernel recovers one
+/// copy (a mount replays the log); FrankenFS's view of the other must equal it.
+#[allow(clippy::too_many_lines)]
+fn run_btrfs_tree_log_scenario(
+    scenario: &str,
+    baseline: &dyn Fn(&Path),
+    changes: &dyn Fn(&Path),
+    expected_names: &[&str],
+) {
     for tool in ["mkfs.btrfs", "btrfs"] {
         if !command_available(tool) {
             require_fuse_or_skip(&format!("{tool} unavailable for the tree-log test"));
@@ -19393,12 +19434,10 @@ fn btrfs_kernel_tree_log_crash_image_matches_kernel() {
         .output();
     let dir = mnt.join("d");
     fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("base"), b"base").unwrap();
+    baseline(&dir);
     let synced = Command::new("sync").output().expect("sync");
     assert!(synced.status.success(), "baseline sync");
-    fc_fsynced_write(&dir, "new1", &[0x6E_u8; 9000], false);
-    fc_fsynced_write(&dir, "new2", b"second file after the commit", false);
-    fc_fsynced_write(&dir, "base", b" appended", true);
+    changes(&dir);
     let crash_image = tmp.path().join("crash.btrfs");
     let kernel_image = tmp.path().join("crash_kernel.btrfs");
     for copy in [&crash_image, &kernel_image] {
@@ -19464,8 +19503,8 @@ fn btrfs_kernel_tree_log_crash_image_matches_kernel() {
     drop(oracle);
     assert_eq!(
         kernel_view.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["base", "new1", "new2"],
-        "kernel-recovered names"
+        expected_names,
+        "{scenario}: kernel-recovered names"
     );
 
     let cx = Cx::for_testing();
@@ -19490,9 +19529,10 @@ fn btrfs_kernel_tree_log_crash_image_matches_kernel() {
     }
     assert_eq!(
         ffs_view, kernel_view,
-        "FrankenFS's view of a kernel tree-log crash image must equal the kernel's recovery"
+        "{scenario}: FrankenFS's view of a kernel tree-log crash image must equal the kernel's \
+         recovery"
     );
-    emit_scenario_result("btrfs_kernel_tree_log_matches_kernel", "PASS", None);
+    emit_scenario_result(scenario, "PASS", None);
 }
 
 /// Every entry of a directory: `readdir` returns one page, continued from the

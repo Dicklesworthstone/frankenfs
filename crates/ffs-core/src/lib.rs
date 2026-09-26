@@ -1769,6 +1769,16 @@ pub struct ExternalJournalInfo {
     pub journal_max_len: u32,
 }
 
+/// FS-tree directory entries a kernel btrfs tree log removed: DIR_INDEX keys
+/// inside a logged range that the log lacks, and those entries' names, which
+/// the overlay also strips from their directory's DIR_ITEM buckets.
+#[derive(Debug, Default)]
+struct BtrfsTreeLogHidden {
+    index_keys: Vec<BtrfsKey>,
+    /// (directory, name)
+    names: Vec<(u64, Vec<u8>)>,
+}
+
 /// One recovered physical block to write through the mounted mutation path.
 #[derive(Debug, Clone, Copy)]
 pub struct RepairWritebackBlock<'a> {
@@ -2002,6 +2012,10 @@ pub struct OpenFs {
     /// Read-only remounts overlay these items onto the FS tree so the fsynced
     /// inode is visible without requiring a full transaction commit.
     btrfs_tree_log_items: Vec<BtrfsLeafEntry>,
+    /// Directory index ranges a kernel tree log covers (bd-9m84h follow-up).
+    btrfs_tree_log_dir_ranges: Vec<ffs_btrfs::BtrfsDirLogRange>,
+    /// FS-tree entries those ranges show the log removed, resolved at mount.
+    btrfs_tree_log_hidden: BtrfsTreeLogHidden,
     /// Whether the mount must still overlay [`Self::btrfs_tree_log_items`].
     ///
     /// A successful full transaction commit folds the replayed items into the
@@ -6109,6 +6123,7 @@ impl OpenFs {
         };
 
         let mut btrfs_tree_log_items = Vec::new();
+        let mut btrfs_tree_log_dir_ranges = Vec::new();
         let mut btrfs_foreign_tree_log = false;
         let (ext4_geometry, btrfs_context) = match &flavor {
             FsFlavor::Ext4(sb) => {
@@ -6327,6 +6342,7 @@ impl OpenFs {
                                 result.items_count
                             );
                             btrfs_tree_log_items = result.items;
+                            btrfs_tree_log_dir_ranges = result.dir_log_ranges;
                         }
                         Ok(result) if result.foreign_format => {
                             // Not ours, and not ignorable: see the field's doc.
@@ -6389,8 +6405,12 @@ impl OpenFs {
             flavor,
             ext4_geometry,
             btrfs_context,
-            btrfs_tree_log_overlay_active: AtomicBool::new(!btrfs_tree_log_items.is_empty()),
+            btrfs_tree_log_overlay_active: AtomicBool::new(
+                !btrfs_tree_log_items.is_empty() || !btrfs_tree_log_dir_ranges.is_empty(),
+            ),
             btrfs_tree_log_items,
+            btrfs_tree_log_dir_ranges,
+            btrfs_tree_log_hidden: BtrfsTreeLogHidden::default(),
             btrfs_foreign_tree_log,
             ext4_journal_replay: None,
             ext4_fast_commit_replay: None,
@@ -6525,6 +6545,10 @@ impl OpenFs {
                 }
                 devices.validate_read_coverage(&ctx.chunks)?;
             }
+        }
+
+        if !fs.btrfs_tree_log_dir_ranges.is_empty() {
+            fs.btrfs_tree_log_hidden = fs.resolve_btrfs_tree_log_removals(cx)?;
         }
 
         if fs.is_ext4() && !options.skip_validation {
@@ -12502,7 +12526,98 @@ impl OpenFs {
                 items.push(logged.clone());
             }
         }
+        self.btrfs_hide_tree_log_removals(items);
         items.sort_by(|lhs, rhs| Self::btrfs_key_order(&lhs.key, &rhs.key));
+    }
+
+    /// Resolve what a kernel tree log removed (the kernel's
+    /// `replay_dir_deletes`): every FS-tree DIR_INDEX entry inside a logged
+    /// directory range that the log does not carry. A name the log re-adds
+    /// under another index (a rename within the directory) stays visible.
+    fn resolve_btrfs_tree_log_removals(&self, cx: &Cx) -> Result<BtrfsTreeLogHidden, FfsError> {
+        let subvol = self
+            .btrfs_context()
+            .map_or(BTRFS_FS_TREE_OBJECTID, |ctx| ctx.subvol_objectid);
+        let root = self.btrfs_fs_tree_root_bytenr(cx, subvol)?;
+        let mut hidden = BtrfsTreeLogHidden::default();
+        for range in &self.btrfs_tree_log_dir_ranges {
+            let key_at = |item_type, offset| BtrfsKey {
+                objectid: range.dir,
+                item_type,
+                offset,
+            };
+            let lo = key_at(BTRFS_ITEM_DIR_INDEX, range.start);
+            let hi = range.end.checked_add(1).map_or_else(
+                || key_at(BTRFS_ITEM_DIR_INDEX + 1, 0),
+                |next| key_at(BTRFS_ITEM_DIR_INDEX, next),
+            );
+            let logged_names: Vec<Vec<u8>> = self
+                .btrfs_tree_log_items
+                .iter()
+                .filter(|item| {
+                    item.key.objectid == range.dir && item.key.item_type == BTRFS_ITEM_DIR_INDEX
+                })
+                .filter_map(|item| parse_dir_items(&item.data).ok())
+                .flatten()
+                .map(|entry| entry.name)
+                .collect();
+            for item in self.walk_btrfs_tree_range(cx, root, lo, hi)? {
+                if self
+                    .btrfs_tree_log_items
+                    .iter()
+                    .any(|logged| logged.key == item.key)
+                {
+                    continue;
+                }
+                hidden.index_keys.push(item.key);
+                for entry in parse_dir_items(&item.data).map_err(|e| parse_to_ffs_error(&e))? {
+                    if !logged_names.contains(&entry.name) {
+                        hidden.names.push((range.dir, entry.name));
+                    }
+                }
+            }
+        }
+        if !hidden.index_keys.is_empty() {
+            info!(
+                removed = hidden.index_keys.len(),
+                "btrfs tree-log removals hidden from the read view"
+            );
+        }
+        Ok(hidden)
+    }
+
+    /// Hide what the kernel tree log removed: the DIR_INDEX entries, and their
+    /// names in the directory's DIR_ITEM buckets (an emptied bucket goes).
+    fn btrfs_hide_tree_log_removals(&self, items: &mut Vec<BtrfsLeafEntry>) {
+        let hidden = &self.btrfs_tree_log_hidden;
+        if hidden.index_keys.is_empty() && hidden.names.is_empty() {
+            return;
+        }
+        items.retain(|item| !hidden.index_keys.contains(&item.key));
+        for item in items.iter_mut() {
+            if item.key.item_type != BTRFS_ITEM_DIR_ITEM
+                || !hidden
+                    .names
+                    .iter()
+                    .any(|(dir, _)| *dir == item.key.objectid)
+            {
+                continue;
+            }
+            let Ok(entries) = parse_dir_items(&item.data) else {
+                continue;
+            };
+            item.data = entries
+                .iter()
+                .filter(|entry| {
+                    !hidden
+                        .names
+                        .iter()
+                        .any(|(dir, name)| *dir == item.key.objectid && *name == entry.name)
+                })
+                .flat_map(BtrfsDirItem::to_bytes)
+                .collect();
+        }
+        items.retain(|item| item.key.item_type != BTRFS_ITEM_DIR_ITEM || !item.data.is_empty());
     }
 
     /// Range-restricted counterpart to
@@ -12541,6 +12656,7 @@ impl OpenFs {
                 items.push(logged.clone());
             }
         }
+        self.btrfs_hide_tree_log_removals(items);
         items.sort_by(|lhs, rhs| Self::btrfs_key_order(&lhs.key, &rhs.key));
     }
 

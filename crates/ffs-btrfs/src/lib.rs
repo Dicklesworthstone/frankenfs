@@ -113,6 +113,10 @@ pub const BTRFS_ITEM_INODE_ITEM: u8 = 1;
 pub const BTRFS_ITEM_DIR_ITEM: u8 = 84;
 pub const BTRFS_ITEM_DIR_INDEX: u8 = 96;
 pub const BTRFS_ITEM_INODE_REF: u8 = 12;
+/// Kernel tree-log record: a directory's DIR_ITEM hash range the log covers.
+pub const BTRFS_ITEM_DIR_LOG_ITEM: u8 = 60;
+/// Kernel tree-log record: a directory's DIR_INDEX range the log covers.
+pub const BTRFS_ITEM_DIR_LOG_INDEX: u8 = 72;
 pub const BTRFS_ITEM_XATTR_ITEM: u8 = 24;
 pub const BTRFS_ITEM_EXTENT_DATA: u8 = 108;
 pub const BTRFS_ITEM_ROOT_ITEM: u8 = 132;
@@ -11946,22 +11950,63 @@ fn tree_log_replay_result(entries: Vec<BtrfsLeafEntry>) -> Result<TreeLogReplayR
     // crash rather than pretending an unlink or rename did not happen.
     if has_deletions && !cfg!(feature = "tree-log-deletion-replay") {
         return Ok(TreeLogReplayResult {
-            items: Vec::new(),
-            deleted_keys: Vec::new(),
-            items_count: 0,
             replayed: false,
             foreign_format: true,
+            ..TreeLogReplayResult::default()
         });
     }
     let (mut items, deleted_keys) = split_tree_log_deletion_records(entries)?;
+    let dir_log_ranges = take_tree_log_dir_ranges(&mut items)?;
     synthesize_tree_log_dir_entries(&mut items)?;
     Ok(TreeLogReplayResult {
         items,
         deleted_keys,
+        dir_log_ranges,
         items_count,
         replayed: true,
         foreign_format: false,
     })
+}
+
+/// A directory index range a kernel tree log covers: within it, the log's
+/// DIR_INDEX entries are the directory's complete set, so an FS-tree entry in
+/// the range that the log lacks was removed (the kernel's `replay_dir_deletes`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BtrfsDirLogRange {
+    pub dir: u64,
+    pub start: u64,
+    /// Inclusive.
+    pub end: u64,
+}
+
+/// Pull the kernel's DIR_LOG_INDEX range records out of `items` (they are
+/// log metadata, not FS-tree items). DIR_LOG_ITEM records (hash ranges, from
+/// older kernels) are dropped as well: the index ranges carry the same
+/// deletions and are what this replay interprets.
+fn take_tree_log_dir_ranges(
+    items: &mut Vec<BtrfsLeafEntry>,
+) -> Result<Vec<BtrfsDirLogRange>, ParseError> {
+    let mut ranges = Vec::new();
+    for item in items
+        .iter()
+        .filter(|item| item.key.item_type == BTRFS_ITEM_DIR_LOG_INDEX)
+    {
+        let end = item.data.get(..8).ok_or(ParseError::InsufficientData {
+            needed: 8,
+            offset: 0,
+            actual: item.data.len(),
+        })?;
+        ranges.push(BtrfsDirLogRange {
+            dir: item.key.objectid,
+            start: item.key.offset,
+            end: u64::from_le_bytes(end.try_into().expect("8 bytes")),
+        });
+    }
+    items.retain(|item| {
+        item.key.item_type != BTRFS_ITEM_DIR_LOG_INDEX
+            && item.key.item_type != BTRFS_ITEM_DIR_LOG_ITEM
+    });
+    Ok(ranges)
 }
 
 /// The directory-entry type of an inode mode.
@@ -12078,6 +12123,9 @@ pub struct TreeLogReplayResult {
     pub items: Vec<BtrfsLeafEntry>,
     /// Exact FS-tree keys that replay must remove before overlaying `items`.
     pub deleted_keys: Vec<BtrfsKey>,
+    /// Directory index ranges a kernel log covers (see [`BtrfsDirLogRange`]):
+    /// FS-tree entries inside them that `items` lacks were removed.
+    pub dir_log_ranges: Vec<BtrfsDirLogRange>,
     /// Number of items replayed.
     pub items_count: usize,
     /// Whether a valid tree-log was found and replayed.
@@ -12204,11 +12252,9 @@ pub fn replay_tree_log(
                 "btrfs log root tree holds no log for this subvolume"
             );
             return Ok(TreeLogReplayResult {
-                items: Vec::new(),
-                deleted_keys: Vec::new(),
-                items_count: 0,
                 replayed: false,
                 foreign_format: true,
+                ..TreeLogReplayResult::default()
             });
         };
         if entry.data.len() < BTRFS_ROOT_ITEM_SIZE {
