@@ -19001,16 +19001,19 @@ fn fuse_btrfs_mknod_blockdev_stores_rdev() {
     });
 }
 
-// bd-9m84h: crash-image fast-commit recovery test. Uses a kernel-mounted ext4
-// with fast_commit, performs FC-eligible operations, captures the dirty image
-// (pre-checkpoint, journal has FC transactions), then opens it with FrankenFS
-// to prove fail-closed behavior with real kernel FC data.
+// bd-9m84h: crash-image fast-commit recovery, certified against the kernel.
+// A kernel-mounted ext4 with fast_commit takes a fully committed baseline,
+// then makes FC-eligible changes made durable ONLY by fsync (no sync, no
+// buffer flush: either forces a full JBD2 commit and leaves nothing for fast
+// commit to recover). The image is copied while still mounted. The kernel
+// recovers one copy; FrankenFS replays the other and must report fast-commit
+// transactions and operations, and show exactly the kernel's names and bytes.
 //
 // Prerequisites: mkfs.ext4 with fast_commit support, sudo (loop mounts),
-// kernel ext4 fast_commit support. Skips if unavailable (same contract as
-// the other kernel-fixture tests in this file).
+// kernel ext4 fast_commit support.
 #[test]
-fn fast_commit_crash_image_recovery_fail_closed() {
+#[allow(clippy::too_many_lines)]
+fn fast_commit_crash_image_recovery_matches_kernel_bd_9m84h() {
     let has_mkfs = Command::new("mkfs.ext4")
         .arg("-V")
         .output()
@@ -19020,7 +19023,7 @@ fn fast_commit_crash_image_recovery_fail_closed() {
         .output()
         .is_ok_and(|o| o.status.success());
     if !has_mkfs || !has_sudo {
-        eprintln!("skipping: mkfs.ext4 or sudo unavailable");
+        require_fuse_or_skip("mkfs.ext4 or sudo unavailable for bd-9m84h");
         return;
     }
 
@@ -19071,40 +19074,48 @@ fn fast_commit_crash_image_recovery_fail_closed() {
         .arg(&mnt)
         .output();
 
-    // Step 4: create files (FC-eligible operations)
+    // Step 4: a fully committed baseline.
     let dir = mnt.join("testdir");
     fs::create_dir_all(&dir).unwrap();
     fs::write(dir.join("alpha"), b"alpha").unwrap();
-    fs::write(dir.join("bravo"), b"bravo").unwrap();
-    let _ = Command::new("ln")
-        .args(["-s", "alpha", &dir.join("symlink").to_string_lossy()])
-        .output();
+    let synced = Command::new("sync").output().expect("sync");
+    assert!(synced.status.success(), "baseline sync");
 
-    // Step 5: fsync to commit FC transactions to the journal
-    let f = fs::File::open(dir.join("alpha")).unwrap();
-    f.sync_all().unwrap();
-    drop(f);
-    let d = fs::File::open(&dir).unwrap();
-    d.sync_all().unwrap();
-    drop(d);
+    // Step 5: FC-eligible changes, each made durable only by its fsync.
+    let fsynced = |name: &str, bytes: &[u8], append: bool| {
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .append(append)
+            .truncate(!append)
+            .open(dir.join(name))
+            .unwrap_or_else(|e| panic!("open {name}: {e}"));
+        file.write_all(bytes).expect("write");
+        file.sync_all()
+            .unwrap_or_else(|e| panic!("fsync {name}: {e}"));
+    };
+    fsynced("bravo", &[0xB5_u8; 9000], false);
+    fsynced("charlie", b"charlie after the baseline", false);
+    fsynced("alpha", b" appended after the baseline", true);
 
-    // Step 6: capture the crash state — flush ALL pending writes to the
-    // device, then copy the image file while the fs is still mounted.
-    // The journal has FC transactions that haven't been fully checkpointed.
-    // This IS the crash state.
-    let _ = Command::new("sudo")
-        .args(["-n", "blockdev", "--flushbufs"])
-        .arg(&loop_dev)
-        .output();
-    let _ = Command::new("sync").output();
+    // Step 6: the crash state — two copies of the image taken while it is
+    // still mounted. The loop device uses direct I/O, so everything the
+    // fsyncs made durable is already in the backing file.
     let crash_image = tmp.path().join("crash_state.img");
-    let output = Command::new("sudo")
-        .args(["-n", "cp"])
-        .arg(&img)
-        .arg(&crash_image)
-        .output()
-        .expect("copy crash image");
-    assert!(output.status.success(), "crash image copy failed");
+    let kernel_image = tmp.path().join("crash_state_kernel.img");
+    for copy in [&crash_image, &kernel_image] {
+        let output = Command::new("sudo")
+            .args(["-n", "cp"])
+            .arg(&img)
+            .arg(copy)
+            .output()
+            .expect("copy crash image");
+        assert!(output.status.success(), "crash image copy failed");
+        let _ = Command::new("sudo")
+            .args(["-n", "chmod", "a+rw"])
+            .arg(copy)
+            .output();
+    }
 
     // Step 7: clean up the kernel mount and loop device
     let _ = Command::new("sudo")
@@ -19116,47 +19127,322 @@ fn fast_commit_crash_image_recovery_fail_closed() {
         .arg(&loop_dev)
         .output();
 
-    // Step 8: open the crash image with FrankenFS. The FC recovery path
-    // should either fully recover the committed operations or fail-closed.
+    // Step 8: the oracle — the kernel recovers its copy (a writable loop
+    // device: a read-only one cannot replay).
+    let attached = Command::new("sudo")
+        .args(["-n", "losetup", "--find", "--show"])
+        .arg(&kernel_image)
+        .output()
+        .expect("losetup oracle");
+    assert!(attached.status.success(), "losetup oracle");
+    let kmnt = tmp.path().join("kernel-recovered");
+    fs::create_dir_all(&kmnt).unwrap();
+    let guard = KernelRoMount {
+        mountpoint: kmnt.clone(),
+        loop_device: String::from_utf8_lossy(&attached.stdout).trim().to_owned(),
+    };
+    let mounted = Command::new("sudo")
+        .args(["-n", "mount", "-t", "ext4"])
+        .arg(&guard.loop_device)
+        .arg(&kmnt)
+        .output()
+        .expect("mount oracle");
+    assert!(
+        mounted.status.success(),
+        "kernel recovery mount: {}",
+        String::from_utf8_lossy(&mounted.stderr)
+    );
+    let mut kernel_view = std::collections::BTreeMap::new();
+    for entry in fs::read_dir(kmnt.join("testdir")).expect("kernel readdir") {
+        let entry = entry.expect("kernel dirent");
+        let name = entry.file_name().to_string_lossy().into_owned();
+        let bytes = fs::read(entry.path()).expect("kernel read");
+        kernel_view.insert(name, bytes);
+    }
+    drop(guard);
+    // The fixture must actually exercise fast commit: every post-baseline
+    // change is visible to the kernel only through its recovery.
+    assert_eq!(
+        kernel_view.keys().map(String::as_str).collect::<Vec<_>>(),
+        ["alpha", "bravo", "charlie"],
+        "kernel-recovered names"
+    );
+
+    // Step 9: FrankenFS replays its copy and must match the kernel.
     let cx = Cx::for_testing();
     let options = OpenOptions {
         ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
         ..OpenOptions::default()
     };
-    let open_result = OpenFs::open_with_options(&cx, &crash_image, &options);
-
-    match open_result {
-        Ok(fs) => {
-            // Full recovery: the committed files should be visible.
-            let root = InodeNumber(2);
-            let entries = fs.readdir(&cx, root, 0).unwrap_or_default();
-            let names: Vec<String> = entries
-                .iter()
-                .map(ffs_core::vfs::DirEntry::name_str)
-                .collect();
-            assert!(
-                names
-                    .iter()
-                    .any(|n| n.contains("testdir") || n.contains("alpha") || n.contains("bravo")),
-                "recovered filesystem should contain the created files; entries: {names:?}"
-            );
-            emit_scenario_result("fc_crash_image_full_recovery", "PASS", None);
+    let fs = OpenFs::open_with_options(&cx, &crash_image, &options)
+        .unwrap_or_else(|e| panic!("FrankenFS must recover the fast-commit crash image: {e}"));
+    report_jbd2_replay("bd-9m84h", &fs);
+    let evidence = fs
+        .ext4_fast_commit_replay()
+        .expect("fast-commit replay evidence");
+    eprintln!(
+        "bd-9m84h: fc transactions={} operations={} blocks_scanned={} incomplete={} fallback={}",
+        evidence.replay.transactions_found,
+        evidence.replay.operations.len(),
+        evidence.replay.blocks_scanned,
+        evidence.replay.incomplete_transactions,
+        evidence.replay.fallback_required,
+    );
+    assert!(
+        evidence.replay.transactions_found > 0 && !evidence.replay.operations.is_empty(),
+        "the crash image must carry fast-commit transactions for this test to mean anything"
+    );
+    let testdir = fs
+        .lookup(&cx, InodeNumber(1), std::ffi::OsStr::new("testdir"))
+        .expect("lookup testdir");
+    let mut ffs_view = std::collections::BTreeMap::new();
+    for entry in fs.readdir(&cx, testdir.ino, 0).expect("FrankenFS readdir") {
+        let name = entry.name_str();
+        if name == "." || name == ".." {
+            continue;
         }
-        Err(error) => {
-            // Fail-closed: the mount is refused because FC recovery is
-            // incomplete. This is the correct behavior per bd-gqsnh.
-            let error_text = error.to_string();
-            assert!(
-                error_text.contains("fast-commit")
-                    || error_text.contains("fast_commit")
-                    || error_text.contains("recovery")
-                    || error_text.contains("incomplete"),
-                "fail-closed error should mention fast-commit recovery: {error_text}"
-            );
-            emit_scenario_result("fc_crash_image_fail_closed", "PASS", None);
+        let attr = fs
+            .lookup(&cx, testdir.ino, std::ffi::OsStr::new(&name))
+            .expect("FrankenFS lookup");
+        let bytes = fs
+            .read(&cx, attr.ino, 0, u32::try_from(attr.size).expect("fits"))
+            .expect("FrankenFS read");
+        ffs_view.insert(name, bytes);
+    }
+    assert_eq!(
+        ffs_view, kernel_view,
+        "FrankenFS fast-commit recovery must match the kernel's"
+    );
+    emit_scenario_result("fc_crash_image_matches_kernel_bd_9m84h", "PASS", None);
+}
+
+/// What FrankenFS's JBD2 replay committed, for crash-image test logs.
+fn report_jbd2_replay(label: &str, fs: &OpenFs) {
+    match fs.ext4_journal_replay() {
+        Some(outcome) => eprintln!(
+            "{label}: jbd2 replay committed {} transactions (first {:?}, last {:?}), \
+             replayed {} blocks, scanned {}, incomplete {}",
+            outcome.committed_sequences.len(),
+            outcome.committed_sequences.first(),
+            outcome.committed_sequences.last(),
+            outcome.stats.replayed_blocks,
+            outcome.stats.scanned_blocks,
+            outcome.stats.incomplete_transactions,
+        ),
+        None => eprintln!("{label}: no jbd2 replay"),
+    }
+}
+
+/// A kernel ext4 crash image whose live JBD2 log runs past the end of the
+/// journal and continues at `s_first`. The replay used to wrap to index 0 (the
+/// JBD2 superblock) and stop, silently dropping every transaction written
+/// after the wrap. The kernel recovers one copy; FrankenFS must replay the
+/// other to the same file set, byte for byte.
+#[test]
+#[allow(clippy::too_many_lines)]
+fn jbd2_wrapped_log_crash_image_recovery_matches_kernel() {
+    const FILES: usize = 700;
+    for tool in ["mkfs.ext4", "debugfs"] {
+        if !command_available(tool) {
+            require_fuse_or_skip(&format!("{tool} unavailable for the wrapped-log test"));
+            return;
         }
     }
-    emit_scenario_result("fc_crash_image_fail_closed_bd_9m84h", "PASS", None);
+    if !can_run_sudo() {
+        require_fuse_or_skip("sudo unavailable for the wrapped-log test");
+        return;
+    }
+    let tmp = tempfile::TempDir::new().unwrap();
+    let img = tmp.path().join("wrap.img");
+    let mnt = tmp.path().join("mnt");
+    fs::create_dir_all(&mnt).unwrap();
+    fs::File::create(&img)
+        .and_then(|f| f.set_len(128 * 1024 * 1024))
+        .unwrap();
+    // The smallest journal the kernel accepts (1024 blocks), so a few
+    // hundred small fsync'd transactions wrap it.
+    let made = Command::new("mkfs.ext4")
+        .args([
+            "-q",
+            "-F",
+            "-b",
+            "4096",
+            "-O",
+            "^fast_commit",
+            "-J",
+            "size=4",
+        ])
+        .arg(&img)
+        .output()
+        .expect("mkfs.ext4");
+    assert!(
+        made.status.success(),
+        "mkfs.ext4: {}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    let attached = Command::new("sudo")
+        .args(["-n", "losetup", "--direct-io=on", "--find", "--show"])
+        .arg(&img)
+        .output()
+        .expect("losetup");
+    assert!(attached.status.success(), "losetup");
+    let live = KernelRoMount {
+        mountpoint: mnt.clone(),
+        loop_device: String::from_utf8_lossy(&attached.stdout).trim().to_owned(),
+    };
+    let mounted = Command::new("sudo")
+        .args(["-n", "mount", "-t", "ext4", "-o", "rw,noatime,commit=600"])
+        .arg(&live.loop_device)
+        .arg(&mnt)
+        .output()
+        .expect("mount");
+    assert!(
+        mounted.status.success(),
+        "kernel mount: {}",
+        String::from_utf8_lossy(&mounted.stderr)
+    );
+    let _ = Command::new("sudo")
+        .args(["-n", "chmod", "-R", "a+rwX"])
+        .arg(&mnt)
+        .output();
+    let dir = mnt.join("w");
+    fs::create_dir_all(&dir).unwrap();
+    let payload = |i: usize| format!("payload {i} ").repeat(50).into_bytes();
+    for i in 0..FILES {
+        let mut file = fs::File::create(dir.join(format!("f{i:05}"))).expect("create");
+        file.write_all(&payload(i)).expect("write");
+        file.sync_all().expect("fsync");
+    }
+    let crash_image = tmp.path().join("crash.img");
+    let kernel_image = tmp.path().join("crash_kernel.img");
+    for copy in [&crash_image, &kernel_image] {
+        let output = Command::new("sudo")
+            .args(["-n", "cp"])
+            .arg(&img)
+            .arg(copy)
+            .output()
+            .expect("copy crash image");
+        assert!(output.status.success(), "crash image copy");
+        let _ = Command::new("sudo")
+            .args(["-n", "chmod", "a+rw"])
+            .arg(copy)
+            .output();
+    }
+    drop(live);
+
+    // The fixture must actually wrap: the log ends at a lower block than it
+    // starts.
+    let logdump = Command::new("debugfs")
+        .args(["-R", "logdump"])
+        .arg(&crash_image)
+        .output()
+        .expect("debugfs logdump");
+    let text = String::from_utf8_lossy(&logdump.stdout);
+    let block_after = |marker: &str| -> Option<u64> {
+        let rest = &text[text.find(marker)? + marker.len()..];
+        rest.split(|c: char| !c.is_ascii_digit())
+            .next()?
+            .parse()
+            .ok()
+    };
+    let start = block_after("Journal starts at block ").expect("logdump start");
+    let end = block_after("No magic number at block ").expect("logdump end");
+    eprintln!("jbd2 wrapped-log fixture: live log starts at {start}, ends at {end}");
+    assert!(
+        end < start,
+        "the fixture's live log did not wrap (start {start}, end {end})"
+    );
+
+    // The oracle: the kernel recovers its copy.
+    let attached = Command::new("sudo")
+        .args(["-n", "losetup", "--find", "--show"])
+        .arg(&kernel_image)
+        .output()
+        .expect("losetup oracle");
+    assert!(attached.status.success(), "losetup oracle");
+    let kmnt = tmp.path().join("kernel-recovered");
+    fs::create_dir_all(&kmnt).unwrap();
+    let oracle = KernelRoMount {
+        mountpoint: kmnt.clone(),
+        loop_device: String::from_utf8_lossy(&attached.stdout).trim().to_owned(),
+    };
+    let mounted = Command::new("sudo")
+        .args(["-n", "mount", "-t", "ext4"])
+        .arg(&oracle.loop_device)
+        .arg(&kmnt)
+        .output()
+        .expect("mount oracle");
+    assert!(
+        mounted.status.success(),
+        "kernel recovery mount: {}",
+        String::from_utf8_lossy(&mounted.stderr)
+    );
+    let mut kernel_view = std::collections::BTreeMap::new();
+    for entry in fs::read_dir(kmnt.join("w")).expect("kernel readdir") {
+        let entry = entry.expect("kernel dirent");
+        kernel_view.insert(
+            entry.file_name().to_string_lossy().into_owned(),
+            fs::read(entry.path()).expect("kernel read"),
+        );
+    }
+    drop(oracle);
+    assert_eq!(kernel_view.len(), FILES, "every fsync'd file survives");
+
+    let cx = Cx::for_testing();
+    let options = OpenOptions {
+        ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+        ..OpenOptions::default()
+    };
+    let fs = OpenFs::open_with_options(&cx, &crash_image, &options)
+        .unwrap_or_else(|e| panic!("FrankenFS must recover the wrapped-log crash image: {e}"));
+    report_jbd2_replay("jbd2 wrapped-log", &fs);
+    let wdir = fs
+        .lookup(&cx, InodeNumber(1), std::ffi::OsStr::new("w"))
+        .expect("lookup w");
+    let mut ffs_view = std::collections::BTreeMap::new();
+    for entry in fs.readdir(&cx, wdir.ino, 0).expect("FrankenFS readdir") {
+        let name = entry.name_str();
+        if name == "." || name == ".." {
+            continue;
+        }
+        let attr = fs
+            .lookup(&cx, wdir.ino, std::ffi::OsStr::new(&name))
+            .expect("FrankenFS lookup");
+        let bytes = fs
+            .read(&cx, attr.ino, 0, u32::try_from(attr.size).expect("fits"))
+            .expect("FrankenFS read");
+        ffs_view.insert(name, bytes);
+    }
+    let missing: Vec<&String> = kernel_view
+        .keys()
+        .filter(|name| !ffs_view.contains_key(*name))
+        .collect();
+    if !missing.is_empty() {
+        // Apply mode replayed into the image itself: tell a wrong replay from
+        // a wrong read of a correct one.
+        drop(fs);
+        let listed = Command::new("debugfs")
+            .args(["-R", "ls /w"])
+            .arg(&crash_image)
+            .output()
+            .expect("debugfs ls");
+        let names = String::from_utf8_lossy(&listed.stdout)
+            .split_whitespace()
+            .filter(|word| word.starts_with('f'))
+            .count();
+        eprintln!("jbd2 wrapped-log: debugfs lists {names} names in the FrankenFS-replayed /w");
+    }
+    assert!(
+        missing.is_empty(),
+        "{} of {FILES} kernel-recovered files missing after FrankenFS replay, first: {:?}",
+        missing.len(),
+        missing.first()
+    );
+    assert_eq!(
+        ffs_view, kernel_view,
+        "FrankenFS replay must match the kernel's"
+    );
+    emit_scenario_result("jbd2_wrapped_log_matches_kernel", "PASS", None);
 }
 
 // ── bd-d2hdc: mounted eager-GDT forensic reproduction ───────────────────────

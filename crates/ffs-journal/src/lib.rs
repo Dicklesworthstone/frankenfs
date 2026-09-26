@@ -174,8 +174,13 @@ impl Jbd2Superblock {
         if (self.feature_incompat & (JBD2_FEATURE_INCOMPAT_CSUM_V2 | JBD2_FEATURE_INCOMPAT_CSUM_V3))
             != 0
         {
-            // JBD2 checksum-v2/v3: seed is crc32c(!0, uuid).
-            !crc32c::crc32c_append(!0u32, &self.uuid)
+            // JBD2 checksum-v2/v3: j_csum_seed = jbd2_chksum(~0, s_uuid), the
+            // raw crc32c update starting from ~0. `crc32c_append(x, d)` is
+            // `!raw(!x, d)`, so that is `!crc32c_append(0, uuid)`. This used to
+            // be `!crc32c_append(!0, uuid)` = raw(0, uuid): every checksummed
+            // kernel journal failed verification at its first descriptor and
+            // replayed nothing (found by a kernel crash image, bd-9m84h).
+            !crc32c::crc32c_append(0, &self.uuid)
         } else {
             // Older JBD2 checksum modes use 0 as seed.
             0
@@ -655,11 +660,36 @@ fn replay_jbd2_inner(
         }
     }
 
-    let wrap_idx = |raw: u64| -> u64 { raw % total_blocks };
+    // The log occupies [s_first, j_last) and wraps from j_last back to
+    // s_first — jbd2's `wrap()` — where j_last is s_maxlen, less the
+    // fast-commit area when there is one. Wrapping to index 0 instead read the
+    // JBD2 superblock as the next log block, whose sequence never matches, so
+    // every transaction the kernel wrote after the log wrapped was silently
+    // dropped (and a descriptor's data blocks past the end resolved to the
+    // wrong blocks). A journal without a superblock keeps [0, total_blocks).
+    let (log_first, log_last) = journal_sb.map_or((0, total_blocks), |sb| {
+        let first = u64::from(sb.first_log_block);
+        let mut last = u64::from(sb.max_len).min(total_blocks);
+        if sb.has_fast_commit() {
+            last = last.saturating_sub(u64::from(sb.num_fc_blocks));
+        }
+        if first < last {
+            (first, last)
+        } else {
+            (0, total_blocks)
+        }
+    });
+    let wrap_idx = |raw: u64| -> u64 {
+        if raw < log_last {
+            raw
+        } else {
+            log_first + (raw - log_first) % (log_last - log_first)
+        }
+    };
 
     let mut blocks_scanned = 0_u64;
     while blocks_scanned < total_blocks {
-        let current_idx = idx % total_blocks;
+        let current_idx = wrap_idx(idx);
         let absolute = resolve_block(current_idx)?;
         let raw = dev.read_block(cx, absolute)?;
         stats.scanned_blocks = stats.scanned_blocks.saturating_add(1);
@@ -2211,6 +2241,17 @@ pub fn replay_fast_commit(data: &[u8], inode_size: u16) -> Result<FcReplayResult
     let mut result = FcReplayResult::default();
     let mut pos = 0;
     let mut pending = PendingFcTransaction::default();
+    // Mirrors ext4_fc_replay_scan. Only the first fast commit after a full
+    // commit carries a HEAD (with the cycle's tid); later ones follow the
+    // previous TAIL directly. A TAIL commits its transaction only if its tid
+    // is the HEAD's and its crc — raw crc32c from 0 over every tag since the
+    // previous TAIL, plus this TAIL's header and tid — matches. The first TAIL
+    // that fails either, or a HEAD with another tid, ends the stream: what
+    // follows is a torn block or a stale one from an earlier cycle, not a
+    // reason to fall back.
+    let mut head_tid: Option<u32> = None;
+    let mut crc = 0_u32;
+    let crc_update = |crc: u32, bytes: &[u8]| !crc32c::crc32c_append(!crc, bytes);
 
     while pos + 4 <= data.len() {
         let tag_offset = pos;
@@ -2263,27 +2304,46 @@ pub fn replay_fast_commit(data: &[u8], inode_size: u16) -> Result<FcReplayResult
                     result.fallback_required = true;
                     continue;
                 }
+                let tid = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                if head_tid.is_some_and(|head| head != tid) {
+                    // A stale block from an earlier cycle.
+                    return Ok(result);
+                }
                 discard_pending_fc_transaction(&mut result, &mut pending);
+                head_tid = Some(tid);
+                crc = crc_update(0, &data[tag_offset..pos]);
                 pending.active = true;
                 result.record_block_scanned();
             }
             FcTag::Tail => {
-                if !pending.active {
+                let Some(head) = head_tid else {
                     result.fallback_required = true;
                     continue;
+                };
+                // Header plus tid: the crc field itself is not covered.
+                crc = crc_update(crc, &data[tag_offset..tag_offset + 8]);
+                let tid = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                let stored = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                if tid != head || stored != crc {
+                    // Torn or stale: the stream ends at the last valid TAIL.
+                    return Ok(result);
                 }
-                result.last_tid =
-                    u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                result.last_tid = tid;
                 result.record_transaction_found();
                 result.operations.append(&mut pending.operations);
                 pending.active = false;
+                crc = 0;
             }
-            FcTag::Pad => {}
+            FcTag::Pad => {
+                crc = crc_update(crc, &data[tag_offset..pos]);
+            }
             _ => {
-                if !pending.active {
+                if head_tid.is_none() {
                     result.fallback_required = true;
                     continue;
                 }
+                crc = crc_update(crc, &data[tag_offset..pos]);
+                pending.active = true;
                 if let Some(operation) = parse_fc_operation(tag, payload) {
                     pending.operations.push(operation);
                 } else {
@@ -2321,6 +2381,38 @@ mod fc_tests {
         let mut payload = ino.to_le_bytes().to_vec();
         payload.extend_from_slice(&[0; 128]);
         payload
+    }
+
+    /// A HEAD tag (no feature bits) for fast-commit cycle `tid`.
+    fn fc_head(tid: u32) -> Vec<u8> {
+        let mut payload = [0_u8; 8];
+        payload[4..].copy_from_slice(&tid.to_le_bytes());
+        build_fc_tag(0x09, &payload)
+    }
+
+    /// The TAIL that commits the transaction `stream` ends with, as the
+    /// kernel writes it: tid, then the raw crc32c (from 0) of every tag since
+    /// the previous TAIL plus this TAIL's header and tid, then `payload_len - 8`
+    /// bytes of padding.
+    fn fc_tail(stream: &[u8], tid: u32, payload_len: usize) -> Vec<u8> {
+        let raw = |crc: u32, bytes: &[u8]| !crc32c::crc32c_append(!crc, bytes);
+        let mut crc = 0;
+        let mut pos = 0;
+        while pos + 4 <= stream.len() {
+            let tag = u16::from_le_bytes([stream[pos], stream[pos + 1]]);
+            let len = usize::from(u16::from_le_bytes([stream[pos + 2], stream[pos + 3]]));
+            crc = if tag == 0x08 {
+                0
+            } else {
+                raw(crc, &stream[pos..pos + 4 + len])
+            };
+            pos += 4 + len;
+        }
+        let mut tail = build_fc_tag(0x08, &vec![0; payload_len]);
+        tail[4..8].copy_from_slice(&tid.to_le_bytes());
+        crc = raw(crc, &tail[..8]);
+        tail[8..12].copy_from_slice(&crc.to_le_bytes());
+        tail
     }
 
     #[test]
@@ -2365,8 +2457,7 @@ mod fc_tests {
         let mut inode = 42_u32.to_le_bytes().to_vec();
         inode.extend_from_slice(&[0; 128]);
         stream.extend(build_fc_tag(0x06, &inode));
-        stream.extend(build_fc_tag(0x08, &[0; 8]));
-        stream.extend(build_fc_tag(0x09, &[0; 8]));
+        stream.extend(fc_tail(&stream, 0, 8));
         stream.extend(build_fc_tag(0x06, &42_u32.to_le_bytes()));
         stream.extend(build_fc_tag(0x08, &[0; 8]));
 
@@ -2386,7 +2477,7 @@ mod fc_tests {
                 payload.extend_from_slice(&raw);
                 let mut stream = build_fc_tag(0x09, &[0; 8]);
                 stream.extend(build_fc_tag(0x06, &payload));
-                stream.extend(build_fc_tag(0x08, &[0; 8]));
+                stream.extend(fc_tail(&stream, 0, 8));
 
                 let result = replay_fast_commit(&stream, inode_size).unwrap();
                 assert_eq!(result.transactions_found, 1);
@@ -2434,7 +2525,7 @@ mod fc_tests {
                 payload.extend_from_slice(&name);
                 let mut stream = build_fc_tag(0x09, &[0; 8]);
                 stream.extend(build_fc_tag(tag, &payload));
-                stream.extend(build_fc_tag(0x08, &[0; 8]));
+                stream.extend(fc_tail(&stream, 0, 8));
                 let result = replay_fast_commit(&stream, 256).unwrap();
                 let dentry = FcDentry {
                     parent_ino: 2,
@@ -2457,12 +2548,12 @@ mod fc_tests {
     fn g10_padded_tail_and_arbitrary_pad_preserve_committed_operation() {
         for tail_len in [8, 9, 4096, usize::from(u16::MAX)] {
             for pad_len in [0, 1, usize::from(u16::MAX)] {
-                let mut stream = build_fc_tag(0x09, &[0; 8]);
+                let mut stream = fc_head(7);
                 stream.extend(build_fc_tag(0x06, &build_fc_inode_payload(42)));
                 stream.extend(build_fc_tag(0x07, &vec![0xA5; pad_len]));
-                let mut tail = vec![0xA5; tail_len];
-                tail[..4].copy_from_slice(&7_u32.to_le_bytes());
-                stream.extend(build_fc_tag(0x08, &tail));
+                let mut tail = fc_tail(&stream, 7, tail_len);
+                tail[12..].fill(0xA5); // padding bytes are not checked
+                stream.extend(tail);
                 let result = replay_fast_commit(&stream, 128).unwrap();
                 assert_eq!(result.transactions_found, 1);
                 assert_eq!(result.last_tid, 7);
@@ -2539,12 +2630,9 @@ mod fc_tests {
         assert_eq!(result.transactions_found, 0);
         // A zero fc_features HEAD is still accepted (regression guard).
         let mut ok = Vec::new();
-        ok.extend(build_fc_tag(0x09, &[0_u8; 8])); // HEAD, fc_features = 0
+        ok.extend(fc_head(3)); // HEAD, fc_features = 0
         ok.extend(build_fc_tag(0x06, &build_fc_inode_payload(7))); // INODE
-        let mut tail2 = Vec::new();
-        tail2.extend_from_slice(&3_u32.to_le_bytes());
-        tail2.extend_from_slice(&0_u32.to_le_bytes());
-        ok.extend(build_fc_tag(0x08, &tail2)); // TAIL
+        ok.extend(fc_tail(&ok, 3, 8)); // TAIL
         let ok_result = replay_fast_commit(&ok, 256).unwrap();
         assert_eq!(ok_result.transactions_found, 1);
         assert_eq!(
@@ -2566,12 +2654,9 @@ mod fc_tests {
         payload.extend_from_slice(&raw_inode); // raw ext4_inode
 
         let mut stream = Vec::new();
-        stream.extend(build_fc_tag(0x09, &[0_u8; 8])); // HEAD
+        stream.extend(fc_head(5)); // HEAD
         stream.extend(build_fc_tag(0x06, &payload)); // INODE + body
-        let mut tail = Vec::new();
-        tail.extend_from_slice(&5_u32.to_le_bytes());
-        tail.extend_from_slice(&0_u32.to_le_bytes());
-        stream.extend(build_fc_tag(0x08, &tail)); // TAIL
+        stream.extend(fc_tail(&stream, 5, 8)); // TAIL
 
         let result = replay_fast_commit(&stream, 256).unwrap();
         assert_eq!(
@@ -2640,14 +2725,11 @@ mod fc_tests {
     #[test]
     fn replay_add_range() {
         let mut data = Vec::new();
-        data.extend(build_fc_tag(0x09, &[0; 8])); // HEAD
+        data.extend(fc_head(1)); // HEAD
         // Written extent: ino 42, logical 100, 10 blocks, physical 5000.
         let payload = build_fc_add_range_payload(42, 100, 10, 5000);
         data.extend(build_fc_tag(0x01, &payload)); // ADD_RANGE
-        let mut tail = Vec::new();
-        tail.extend_from_slice(&1_u32.to_le_bytes()); // tid
-        tail.extend_from_slice(&0_u32.to_le_bytes()); // crc (ignored in replay)
-        data.extend(build_fc_tag(0x08, &tail)); // TAIL
+        data.extend(fc_tail(&data, 1, 8)); // TAIL
 
         let result = replay_fast_commit(&data, 256).unwrap();
         assert_eq!(result.operations.len(), 1);
@@ -2674,16 +2756,13 @@ mod fc_tests {
     #[test]
     fn replay_add_range_decodes_unwritten_and_48bit_physical_bd_6nwjx() {
         let mut data = Vec::new();
-        data.extend(build_fc_tag(0x09, &[0; 8])); // HEAD
+        data.extend(fc_head(1)); // HEAD
         // Unwritten extent of 10 blocks: ee_len = 32768 + 10. Physical block
         // 0x3_0000_5000 needs ee_start_hi = 3 (the high 16 bits).
         let physical = 0x3_0000_5000_u64;
         let payload = build_fc_add_range_payload(42, 100, (1 << 15) + 10, physical);
         data.extend(build_fc_tag(0x01, &payload)); // ADD_RANGE
-        let mut tail = Vec::new();
-        tail.extend_from_slice(&1_u32.to_le_bytes());
-        tail.extend_from_slice(&0_u32.to_le_bytes());
-        data.extend(build_fc_tag(0x08, &tail)); // TAIL
+        data.extend(fc_tail(&data, 1, 8)); // TAIL
 
         let result = replay_fast_commit(&data, 256).unwrap();
         let r = match &result.operations[0] {
@@ -2706,7 +2785,7 @@ mod fc_tests {
     fn replay_create_with_tail() {
         let mut data = Vec::new();
         // HEAD tag
-        data.extend(build_fc_tag(0x09, &[0; 8]));
+        data.extend(fc_head(7));
         // CREAT tag: ext4_fc_dentry_info = parent_ino(4) + ino(4) + dname[]
         let mut creat = Vec::new();
         creat.extend_from_slice(&2_u32.to_le_bytes()); // parent_ino
@@ -2714,10 +2793,7 @@ mod fc_tests {
         creat.extend_from_slice(b"hello"); // name (no length prefix — length from tag)
         data.extend(build_fc_tag(0x03, &creat));
         // TAIL tag
-        let mut tail = Vec::new();
-        tail.extend_from_slice(&7_u32.to_le_bytes()); // tid
-        tail.extend_from_slice(&0_u32.to_le_bytes()); // crc (ignored in replay)
-        data.extend(build_fc_tag(0x08, &tail));
+        data.extend(fc_tail(&data, 7, 8));
 
         let result = replay_fast_commit(&data, 256).unwrap();
         assert_eq!(result.transactions_found, 1);
@@ -2738,16 +2814,13 @@ mod fc_tests {
     #[test]
     fn replay_del_range() {
         let mut data = Vec::new();
-        data.extend(build_fc_tag(0x09, &[0; 8])); // HEAD
+        data.extend(fc_head(2)); // HEAD
         let mut payload = Vec::new();
         payload.extend_from_slice(&99_u32.to_le_bytes());
         payload.extend_from_slice(&50_u32.to_le_bytes());
         payload.extend_from_slice(&20_u32.to_le_bytes());
         data.extend(build_fc_tag(0x02, &payload));
-        let mut tail = Vec::new();
-        tail.extend_from_slice(&2_u32.to_le_bytes()); // tid
-        tail.extend_from_slice(&0_u32.to_le_bytes()); // crc (ignored in replay)
-        data.extend(build_fc_tag(0x08, &tail)); // TAIL
+        data.extend(fc_tail(&data, 2, 8)); // TAIL
 
         let result = replay_fast_commit(&data, 256).unwrap();
         assert_eq!(result.operations.len(), 1);
@@ -2886,12 +2959,9 @@ mod fc_tests {
     #[test]
     fn replay_truncated_tag_after_committed_transaction_requires_fallback() {
         let mut data = Vec::new();
-        data.extend(build_fc_tag(0x09, &[0; 8])); // HEAD
+        data.extend(fc_head(3)); // HEAD
         data.extend(build_fc_tag(0x06, &build_fc_inode_payload(42))); // INODE
-        let mut tail = Vec::new();
-        tail.extend_from_slice(&3_u32.to_le_bytes()); // tid
-        tail.extend_from_slice(&0_u32.to_le_bytes()); // crc (ignored in replay)
-        data.extend(build_fc_tag(0x08, &tail)); // TAIL
+        data.extend(fc_tail(&data, 3, 8)); // TAIL
         data.extend_from_slice(&0x07_u16.to_le_bytes()); // next tag type
         data.extend_from_slice(&16_u16.to_le_bytes()); // truncated next tag len
         data.extend_from_slice(&[1, 2, 3]); // not enough payload bytes
@@ -2910,12 +2980,9 @@ mod fc_tests {
     #[test]
     fn replay_trailing_nonzero_bytes_require_fallback() {
         let mut data = Vec::new();
-        data.extend(build_fc_tag(0x09, &[0; 8])); // HEAD
+        data.extend(fc_head(3)); // HEAD
         data.extend(build_fc_tag(0x06, &build_fc_inode_payload(42))); // INODE
-        let mut tail = Vec::new();
-        tail.extend_from_slice(&3_u32.to_le_bytes()); // tid
-        tail.extend_from_slice(&0_u32.to_le_bytes()); // crc (ignored in replay)
-        data.extend(build_fc_tag(0x08, &tail)); // TAIL
+        data.extend(fc_tail(&data, 3, 8)); // TAIL
         data.extend_from_slice(&[0xAB, 0xCD, 0xEF]); // stray nonzero tail bytes
 
         let result = replay_fast_commit(&data, 256).unwrap();
@@ -2932,12 +2999,9 @@ mod fc_tests {
     #[test]
     fn replay_zero_padding_after_tail_stops_cleanly() {
         let mut data = Vec::new();
-        data.extend(build_fc_tag(0x09, &[0; 8])); // HEAD
+        data.extend(fc_head(3)); // HEAD
         data.extend(build_fc_tag(0x06, &build_fc_inode_payload(42))); // INODE
-        let mut tail = Vec::new();
-        tail.extend_from_slice(&3_u32.to_le_bytes()); // tid
-        tail.extend_from_slice(&0_u32.to_le_bytes()); // crc (ignored in replay)
-        data.extend(build_fc_tag(0x08, &tail)); // TAIL
+        data.extend(fc_tail(&data, 3, 8)); // TAIL
         data.extend_from_slice(&[0_u8; 64]); // zero-filled unused tail space
 
         let result = replay_fast_commit(&data, 256).unwrap();
@@ -2948,6 +3012,103 @@ mod fc_tests {
             vec![FcOperation::InodeUpdate(42, vec![0; 128])]
         );
         assert_eq!(result.incomplete_transactions, 0);
+        assert!(!result.fallback_required);
+    }
+
+    /// The fast-commit area of a Linux 7.0 ext4 crash image (mkfs -O
+    /// fast_commit, a synced baseline, then three fsyncs: create bravo, create
+    /// charlie, append to alpha). Each block holds one fast commit: tags, then
+    /// a TAIL whose length runs to the end of the block. Only the first starts
+    /// with HEAD. The rest of every block is zero, so only the prefix is kept.
+    const KERNEL_FC_BLOCKS: [&str; 3] = [
+        "0900080000000000030000000600a4000f000000a481e80328230000e8fcb66ae8fcb66ae8fcb66a00000000e80301001800000000000800010000000af3010004000000000000000000000003000000420a00000000000000000000000000000000000000000000000000000000000000000000000000005e7c9f270000000000000000000000000000000000000000ec7c0000200041c6387ac7a3387ac7a3387ac7a3e8fcb66a387ac7a30000000000000000010010000f0000000000000003000000420a000003000d000d0000000f000000627261766f0600a4000f000000a481e80328230000e8fcb66ae8fcb66ae8fcb66a00000000e80301001800000000000800010000000af3010004000000000000000000000003000000420a00000000000000000000000000000000000000000000000000000000000000000000000000005e7c9f270000000000000000000000000000000000000000ec7c0000200041c6387ac7a3387ac7a3387ac7a3e8fcb66a387ac7a3000000000000000008007b0e030000003a046038",
+        "0600a40010000000a481e8031a000000e8fcb66ae8fcb66ae8fcb66a00000000e80301000800000000000800010000000af3010004000000000000000000000001000000450a0000000000000000000000000000000000000000000000000000000000000000000000000000f864ec120000000000000000000000000000000000000000979a00002000e099ac9ebba4ac9ebba4ac9ebba4e8fcb66aac9ebba4000000000000000001001000100000000000000001000000450a000003000f000d00000010000000636861726c69650600a40010000000a481e8031a000000e8fcb66ae8fcb66ae8fcb66a00000000e80301000800000000000800010000000af3010004000000000000000000000001000000450a0000000000000000000000000000000000000000000000000000000000000000000000000000f864ec120000000000000000000000000000000000000000979a00002000e099ac9ebba4ac9ebba4ac9ebba4e8fcb66aac9ebba400000000000000000800850e03000000adf27174",
+        "0600a4000e000000b481e80321000000e8fcb66ae8fcb66ae8fcb66a00000000e80301000800000000000800030000000af301000400000000000000000000000100000042080000000000000000000000000000000000000000000000000000000000000000000000000000cbe2abea0000000000000000000000000000000000000000f0b700002000947808ba72a508ba72a554721a96e8fcb66a54721a9600000000000000000800540f0300000091a1cfe4",
+    ];
+
+    fn kernel_fc_area() -> Vec<u8> {
+        let mut area = Vec::new();
+        for hex in KERNEL_FC_BLOCKS {
+            let start = area.len();
+            area.extend(
+                (0..hex.len())
+                    .step_by(2)
+                    .map(|i| u8::from_str_radix(&hex[i..i + 2], 16).expect("hex fixture")),
+            );
+            area.resize(start + 4096, 0);
+        }
+        area
+    }
+
+    fn op_summary(op: &FcOperation) -> String {
+        match op {
+            FcOperation::InodeUpdate(ino, _) => format!("inode {ino}"),
+            FcOperation::AddRange(r) => format!("add {} {}+{}", r.ino, r.logical_block, r.len),
+            FcOperation::Create(d) => {
+                format!(
+                    "create {}/{}",
+                    d.parent_ino,
+                    String::from_utf8_lossy(&d.name)
+                )
+            }
+            other => format!("{other:?}"),
+        }
+    }
+
+    #[test]
+    fn replay_kernel_fast_commit_area_bd_9m84h() {
+        let result = replay_fast_commit(&kernel_fc_area(), 256).unwrap();
+        assert_eq!(result.transactions_found, 3);
+        assert_eq!(result.last_tid, 3);
+        assert_eq!(result.incomplete_transactions, 0);
+        assert!(!result.fallback_required);
+        assert_eq!(
+            result.operations.iter().map(op_summary).collect::<Vec<_>>(),
+            [
+                "inode 15",
+                "add 15 0+3",
+                "create 13/bravo",
+                "inode 15",
+                "inode 16",
+                "add 16 0+1",
+                "create 13/charlie",
+                "inode 16",
+                "inode 14",
+            ]
+        );
+    }
+
+    /// A torn second block ends the stream at the first commit (its crc no
+    /// longer matches), and a stale block from an earlier cycle after the live
+    /// ones is ignored. Neither asks for a fallback: what is committed is
+    /// committed, as in ext4_fc_replay_scan.
+    #[test]
+    fn replay_stops_at_torn_or_stale_fast_commit_blocks_bd_9m84h() {
+        let mut torn = kernel_fc_area();
+        torn[4096 + 30] ^= 0x01;
+        let result = replay_fast_commit(&torn, 256).unwrap();
+        assert_eq!(result.transactions_found, 1);
+        assert_eq!(result.operations.len(), 4);
+        assert_eq!(result.incomplete_transactions, 0);
+        assert!(!result.fallback_required);
+
+        let mut stale = kernel_fc_area();
+        let mut old = fc_head(2);
+        old.extend(build_fc_tag(0x06, &build_fc_inode_payload(99)));
+        old.extend(fc_tail(&old, 2, 8));
+        stale.extend(old);
+        let result = replay_fast_commit(&stale, 256).unwrap();
+        assert_eq!(result.transactions_found, 3);
+        assert_eq!(result.operations.len(), 9);
+        assert!(!result.fallback_required);
+
+        // A HEAD-less transaction from another cycle: its TAIL's tid differs.
+        let mut stale_tail = kernel_fc_area();
+        let mut old = build_fc_tag(0x06, &build_fc_inode_payload(99));
+        old.extend(fc_tail(&old, 2, 8));
+        stale_tail.extend(old);
+        let result = replay_fast_commit(&stale_tail, 256).unwrap();
+        assert_eq!(result.transactions_found, 3);
         assert!(!result.fallback_required);
     }
 }
@@ -4262,14 +4423,18 @@ mod tests {
         "  checksum=0xef1b9c26\n",
         "  verify=true\n",
         "  bytes=[c0, 3b, 39, 98, 00, 00, 00, 05, 11, 22, 33, 44, 00, 00, 00, 1c, 00, 00, 00, 07, 00, 00, 00, 09, 00, 00, 00, 0f, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, ef, 1b, 9c, 26]\n",
+        // The commit values follow the kernel's j_csum_seed = raw crc32c(~0,
+        // uuid). They were computed independently of this crate (a plain
+        // bitwise crc32c), which also reproduced the previous values from the
+        // old, wrong raw crc32c(0, uuid) seed (bd-9m84h).
         "commit\n",
         "  seq=0x55667788\n",
-        "  checksum=0x1c8f2bdd\n",
-        "  good_seed=0x2c78fa30\n",
-        "  bad_seed=0xbf86a461\n",
+        "  checksum=0xc345363e\n",
+        "  good_seed=0x91f79f25\n",
+        "  bad_seed=0x0209c174\n",
         "  verify_good=true\n",
         "  verify_bad=false\n",
-        "  bytes=[c0, 3b, 39, 98, 00, 00, 00, 02, 55, 66, 77, 88, 00, 00, 00, 00, 1c, 8f, 2b, dd, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00]"
+        "  bytes=[c0, 3b, 39, 98, 00, 00, 00, 02, 55, 66, 77, 88, 00, 00, 00, 00, c3, 45, 36, 3e, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00, 00]"
     );
 
     fn representative_jbd2_checksum_block_golden_contract_actual() -> String {
@@ -5047,6 +5212,97 @@ mod tests {
             &[0x22; 512],
             "Wrapped sequence 0 should win over u32::MAX"
         );
+    }
+
+    /// A live log that runs past the end of the journal continues at
+    /// `s_first`, not at index 0 (the JBD2 superblock). Both a commit block
+    /// and a descriptor's data block that wrapped must be found there — a
+    /// kernel ext4 image with a wrapped live log (start 921 of 1024, end 489)
+    /// arises from a few hundred fsyncs.
+    #[test]
+    fn replay_jbd2_log_wraps_to_s_first_not_the_superblock() {
+        let cx = test_cx();
+        let region = JournalRegion {
+            start: BlockNumber(10),
+            blocks: 8,
+        };
+        let journal_sb = |start_block: u32, start_sequence: u32| {
+            let mut sb = jbd2_superblock_block(512, start_sequence, start_block, 0, 0, [0; 16]);
+            sb[16..20].copy_from_slice(&8_u32.to_be_bytes()); // s_maxlen
+            sb[20..24].copy_from_slice(&1_u32.to_be_bytes()); // s_first
+            sb
+        };
+
+        // Transaction 10 starts at index 6; its COMMIT block wrapped to index
+        // 1. Transaction 11 follows at index 2.
+        let dev = MemBlockDevice::new(512, 64);
+        dev.raw_write(BlockNumber(10), journal_sb(6, 10));
+        dev.raw_write(
+            BlockNumber(16),
+            descriptor_block(512, 10, &[(3, JBD2_TAG_FLAG_LAST)]),
+        );
+        dev.raw_write(BlockNumber(17), vec![0xA1; 512]);
+        dev.raw_write(BlockNumber(11), commit_block(512, 10));
+        dev.raw_write(
+            BlockNumber(12),
+            descriptor_block(512, 11, &[(4, JBD2_TAG_FLAG_LAST)]),
+        );
+        dev.raw_write(BlockNumber(13), vec![0xB2; 512]);
+        dev.raw_write(BlockNumber(14), commit_block(512, 11));
+        let outcome = replay_jbd2(&cx, &dev, region).expect("replay");
+        assert_eq!(outcome.committed_sequences, vec![10, 11]);
+        assert_eq!(
+            dev.read_block(&cx, BlockNumber(3))
+                .expect("read")
+                .as_slice(),
+            &[0xA1; 512]
+        );
+        assert_eq!(
+            dev.read_block(&cx, BlockNumber(4))
+                .expect("read")
+                .as_slice(),
+            &[0xB2; 512]
+        );
+
+        // Transaction 20's descriptor is the last log block; its DATA block
+        // wrapped to index 1, its commit to index 2.
+        let dev = MemBlockDevice::new(512, 64);
+        dev.raw_write(BlockNumber(10), journal_sb(7, 20));
+        dev.raw_write(
+            BlockNumber(17),
+            descriptor_block(512, 20, &[(3, JBD2_TAG_FLAG_LAST)]),
+        );
+        dev.raw_write(BlockNumber(11), vec![0xC3; 512]);
+        dev.raw_write(BlockNumber(12), commit_block(512, 20));
+        let outcome = replay_jbd2(&cx, &dev, region).expect("replay");
+        assert_eq!(outcome.committed_sequences, vec![20]);
+        assert_eq!(
+            dev.read_block(&cx, BlockNumber(3))
+                .expect("read")
+                .as_slice(),
+            &[0xC3; 512],
+            "the wrapped data block, not the JBD2 superblock, is replayed"
+        );
+    }
+
+    /// The checksum seed of a Linux 7.0 ext4 journal (mkfs.ext4 1.47, csum v3,
+    /// uuid below): 0x23a364c6 is the seed under which its first descriptor
+    /// block's stored tail checksum verifies. The previous seed (raw crc32c
+    /// from 0) failed that block, so FrankenFS replayed no transaction of any
+    /// checksummed kernel journal (bd-9m84h).
+    #[test]
+    fn jbd2_csum_seed_matches_a_kernel_journal_bd_9m84h() {
+        let mut uuid = [0_u8; 16];
+        for (i, byte) in uuid.iter_mut().enumerate() {
+            *byte = u8::from_str_radix(&"28bddc74c4914d02971d545aeac44998"[2 * i..2 * i + 2], 16)
+                .expect("hex");
+        }
+        let sb = Jbd2Superblock {
+            feature_incompat: 0x32,
+            uuid,
+            ..checksum_v3_superblock(uuid)
+        };
+        assert_eq!(sb.csum_seed(), 0x23a3_64c6);
     }
 
     #[test]

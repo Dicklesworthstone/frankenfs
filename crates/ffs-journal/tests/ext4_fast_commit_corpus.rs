@@ -126,8 +126,9 @@ fn corpus_inode_bytes() -> Vec<u8> {
 
 fn length_valid_stream() -> Vec<u8> {
     // A constructed parser regression, not a kernel-generated crash image.
-    // Tag IDs/layouts come from Linux v6.19 fast_commit.h; CRC verification
-    // remains outside this parser's current contract.
+    // Tag IDs/layouts come from Linux v6.19 fast_commit.h. The TAIL carries
+    // the kernel's crc: raw crc32c from 0 over every tag since the HEAD plus
+    // the TAIL's own header and tid.
     let mut bytes = Vec::new();
     let mut tag = |id: u16, payload: &[u8]| {
         bytes.extend_from_slice(&id.to_le_bytes());
@@ -143,7 +144,9 @@ fn length_valid_stream() -> Vec<u8> {
         &[42, 0, 0, 0, 100, 0, 0, 0, 10, 0, 0, 0, 0x88, 0x13, 0, 0],
     );
     tag(3, &[2, 0, 0, 0, 11, 0, 0, 0, b'h', b'e', b'l', b'l', b'o']);
-    tag(8, &[7, 0, 0, 0, 0, 0, 0, 0]);
+    bytes.extend_from_slice(&[8, 0, 8, 0, 7, 0, 0, 0]);
+    let crc = !crc32c::crc32c_append(!0, &bytes);
+    bytes.extend_from_slice(&crc.to_le_bytes());
     bytes
 }
 

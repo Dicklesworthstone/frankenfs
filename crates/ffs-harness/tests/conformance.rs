@@ -3158,15 +3158,20 @@ fn build_fc_tag(tag_type: u16, payload: &[u8]) -> Vec<u8> {
     bytes
 }
 
+/// HEAD (tid) + INODE + a TAIL carrying the kernel's crc: raw crc32c from 0
+/// over the HEAD and INODE tags plus the TAIL's header and tid.
 fn build_fc_inode_update_transaction(ino: u32, tid: u32, raw_inode: &[u8]) -> Vec<u8> {
-    let mut bytes = Vec::new();
-    bytes.extend(build_fc_tag(0x09, &[0; 8]));
+    let mut head = [0_u8; 8];
+    head[4..].copy_from_slice(&tid.to_le_bytes());
+    let mut bytes = build_fc_tag(0x09, &head);
     let mut inode_payload = ino.to_le_bytes().to_vec();
     inode_payload.extend_from_slice(raw_inode);
     bytes.extend(build_fc_tag(0x06, &inode_payload));
-    let mut tail = [0_u8; 8];
-    tail[..4].copy_from_slice(&tid.to_le_bytes());
-    bytes.extend(build_fc_tag(0x08, &tail));
+    let mut tail = build_fc_tag(0x08, &[0; 8]);
+    tail[4..8].copy_from_slice(&tid.to_le_bytes());
+    let crc = !crc32c::crc32c_append(crc32c::crc32c_append(!0, &bytes), &tail[..8]);
+    tail[8..12].copy_from_slice(&crc.to_le_bytes());
+    bytes.extend(tail);
     bytes
 }
 
@@ -3235,20 +3240,32 @@ fn build_ext4_fast_commit_test_image() -> Vec<u8> {
     let ino11_off = 4 * 4096 + 10 * 256;
     let mut raw_inode = image[ino11_off..ino11_off + 256].to_vec();
     raw_inode[0x10..0x14].copy_from_slice(&1_700_000_123_u32.to_le_bytes());
-    let fc_payload = build_fc_inode_update_transaction(11, 1, &raw_inode);
-    let fc_block = 24 * 4096;
+    let fc_payload = build_fc_inode_update_transaction(11, FC_TEST_TID, &raw_inode);
+    let fc_block = FC_TEST_AREA_OFFSET;
     image[fc_block..fc_block + fc_payload.len()].copy_from_slice(&fc_payload);
 
     image
 }
 
+/// The fast-commit area of `build_ext4_fast_commit_test_image`: journal block
+/// `maxlen (6) - num_fc_blocks (2) + 1` = fs block 25. The kernel's area starts
+/// one block after the log's end (jbd2_journal_initialize_fast_commit).
+const FC_TEST_AREA_OFFSET: usize = 25 * 4096;
+
+/// Its fast-commit cycle: the transaction after the one its JBD2 log commits
+/// (sequence 1), as the kernel requires.
+const FC_TEST_TID: u32 = 2;
+
 #[allow(clippy::cast_possible_truncation)]
 fn build_ext4_truncated_fast_commit_test_image() -> Vec<u8> {
     let mut image = build_ext4_fast_commit_test_image();
-    let fc_block = 24 * 4096;
+    let fc_block = FC_TEST_AREA_OFFSET;
     let inode_offset = 4 * 4096 + 10 * 256;
-    let mut truncated =
-        build_fc_inode_update_transaction(11, 1, &image[inode_offset..inode_offset + 256]);
+    let mut truncated = build_fc_inode_update_transaction(
+        11,
+        FC_TEST_TID,
+        &image[inode_offset..inode_offset + 256],
+    );
     truncated.truncate(truncated.len() - 12); // Remove only the final TAIL TLV.
     image[fc_block..fc_block + 4096].fill(0);
     image[fc_block..fc_block + truncated.len()].copy_from_slice(&truncated);
@@ -3854,7 +3871,7 @@ fn ext4_fast_commit_replay_openfs_evidence_conforms() {
     assert_eq!(fc.reserved_fc_blocks, 2);
     assert!(fc.bytes_collected >= 32);
     assert_eq!(fc.replay.transactions_found, 1);
-    assert_eq!(fc.replay.last_tid, 1);
+    assert_eq!(fc.replay.last_tid, FC_TEST_TID);
     assert_eq!(fc.replay.operations.len(), 1);
     let original_image = build_ext4_extent_test_image();
     let ino11_off = 4 * 4096 + 10 * 256;
@@ -3884,8 +3901,8 @@ fn ext4_fast_commit_replay_openfs_evidence_conforms() {
 fn ext4_fast_commit_empty_inode_record_rejects_without_mutating_overlay_source() {
     let cx = Cx::for_testing();
     let mut image = build_ext4_fast_commit_test_image();
-    let fc_block = 24 * 4096;
-    let payload = build_fc_inode_update_transaction(11, 1, &[]);
+    let fc_block = FC_TEST_AREA_OFFSET;
+    let payload = build_fc_inode_update_transaction(11, FC_TEST_TID, &[]);
     image[fc_block..fc_block + 4096].fill(0);
     image[fc_block..fc_block + payload.len()].copy_from_slice(&payload);
     let temp = tempfile::TempDir::new().expect("temporary image directory");

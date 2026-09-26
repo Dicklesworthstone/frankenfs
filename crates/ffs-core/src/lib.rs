@@ -4496,6 +4496,34 @@ impl BlockDevice for CachedByteDeviceBlockAdapter<'_> {
     }
 }
 
+/// Reads through to `base` and drops every write, so the JBD2 replay can walk
+/// a log to learn which transactions it committed without changing anything.
+struct DiscardWritesBlockDevice<'a> {
+    base: &'a dyn BlockDevice,
+}
+
+impl BlockDevice for DiscardWritesBlockDevice<'_> {
+    fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf, FfsError> {
+        self.base.read_block(cx, block)
+    }
+
+    fn write_block(&self, _cx: &Cx, _block: BlockNumber, _data: &[u8]) -> Result<(), FfsError> {
+        Ok(())
+    }
+
+    fn block_size(&self) -> u32 {
+        self.base.block_size()
+    }
+
+    fn block_count(&self) -> u64 {
+        self.base.block_count()
+    }
+
+    fn sync(&self, _cx: &Cx) -> Result<(), FfsError> {
+        Ok(())
+    }
+}
+
 impl BlockDevice for ExternalJournalReplayAdapter<'_> {
     fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf, FfsError> {
         let expected = usize::try_from(self.block_size)
@@ -7590,6 +7618,26 @@ impl OpenFs {
         }))
     }
 
+    /// Drop every ext4 read cache after recovery wrote the device beneath it.
+    ///
+    /// Opening reads the journal inode (and so its inode-table block) before
+    /// replay. A kernel that kept a block in every transaction never
+    /// checkpointed it, so that cached pre-replay copy can hold zeroed inodes
+    /// the replay just restored: a kernel crash image's directory read as
+    /// "inode 13 not found" after a correct replay (bd-9m84h).
+    fn invalidate_ext4_read_caches_after_recovery(&self) {
+        self.extent_cache.invalidate_all();
+        self.invalidate_all_ext4_write_extent_snapshots();
+        self.ext4_inode_table_block_cache.clear();
+        self.ext4_group_desc_cache.clear();
+        self.ext4_file_data_block_cache.clear();
+        self.ext4_file_data_extent_cache.clear();
+        self.ext4_inode_attr_cache.clear();
+        self.ext4_inode_xattr_block_cache.clear();
+        self.ext4_inode_xattr_cache.clear();
+        self.ext4_base_block_cache.clear();
+    }
+
     fn maybe_replay_ext4_journal(
         &mut self,
         cx: &Cx,
@@ -7681,7 +7729,7 @@ impl OpenFs {
             **sb = Ext4Superblock::parse_superblock_region(&sb_region)
                 .map_err(|e| parse_to_ffs_error(&e))?;
         }
-        self.ext4_base_block_cache.clear();
+        self.invalidate_ext4_read_caches_after_recovery();
 
         info!(
             journal_inum,
@@ -7788,7 +7836,7 @@ impl OpenFs {
             **cache = Ext4Superblock::parse_superblock_region(&sb_region)
                 .map_err(|e| parse_to_ffs_error(&e))?;
         }
-        self.ext4_base_block_cache.clear();
+        self.invalidate_ext4_read_caches_after_recovery();
 
         info!(
             journal_dev,
@@ -7832,6 +7880,15 @@ impl OpenFs {
         if !journal_sb.has_fast_commit() {
             return Ok(None);
         }
+        // The kernel replays fast commits only while recovering a journal that
+        // needs it (s_start != 0), and only the cycle whose tid is the
+        // transaction after the log's last full commit (jbd2's next_commit_ID,
+        // checked by ext4_fc_replay_scan). Anything else in the area is stale:
+        // it survives clean unmounts and full commits, and replaying it would
+        // roll newer metadata back.
+        if journal_sb.start_block == 0 {
+            return Ok(None);
+        }
 
         let fc_bytes = self.read_ext4_fast_commit_tail(cx, block_size, &segments, journal_sb)?;
         if fc_bytes.is_empty() {
@@ -7839,6 +7896,33 @@ impl OpenFs {
         }
 
         let replay = replay_fast_commit(&fc_bytes, inode_size)?;
+        if replay.transactions_found > 0 {
+            let reader = ByteDeviceBlockAdapter {
+                dev: &*self.dev,
+                block_size,
+            };
+            let log = replay_jbd2_segments_with_options(
+                cx,
+                &DiscardWritesBlockDevice { base: &reader },
+                &segments,
+                ReplayOptions {
+                    verify_checksums: true,
+                },
+            )?;
+            let expected_tid = log
+                .committed_sequences
+                .last()
+                .map_or(journal_sb.start_sequence, |seq| seq.wrapping_add(1));
+            if replay.last_tid != expected_tid {
+                info!(
+                    journal_inum,
+                    fc_tid = replay.last_tid,
+                    expected_tid,
+                    "ext4 fast-commit area is stale; not replayed"
+                );
+                return Ok(None);
+            }
+        }
         let evidence = Ext4FastCommitReplayEvidence {
             reserved_fc_blocks: journal_sb.num_fc_blocks,
             bytes_collected: u64::try_from(fc_bytes.len()).unwrap_or(u64::MAX),
@@ -9327,7 +9411,14 @@ impl OpenFs {
             return Ok(Vec::new());
         }
 
-        let fc_start = journal_blocks - fc_blocks;
+        // The kernel's layout (jbd2_journal_initialize_fast_commit):
+        // j_fc_last = s_maxlen, j_last = j_fc_last - num_fc_blks,
+        // j_fc_first = j_last + 1. So the area is the last num_fc_blks - 1
+        // blocks, and block `maxlen - num_fc_blks` belongs to neither the log
+        // nor the area. Starting one block early made every kernel-written
+        // fast commit unreadable: that block is zero, so the first "FC block"
+        // parsed as nothing and recovery fell back (bd-9m84h).
+        let fc_start = journal_blocks - fc_blocks + 1;
         let block_len = usize::try_from(block_size)
             .map_err(|_| FfsError::Format("block size does not fit usize".to_owned()))?;
         let mut bytes = Vec::with_capacity(
@@ -48545,11 +48636,11 @@ mod tests {
 
         assert_eq!(replay.committed_sequences, [] as [u32; 0]);
         assert_eq!(replay.stats.replayed_blocks, 0);
-        assert_eq!(fc.reserved_fc_blocks, 2);
+        assert_eq!(fc.reserved_fc_blocks, 3);
         assert!(fc.bytes_collected >= 32);
         assert_eq!(fc.verified_operations, 0);
         assert_eq!(fc.replay.transactions_found, 1);
-        assert_eq!(fc.replay.last_tid, 1);
+        assert_eq!(fc.replay.last_tid, TEST_FC_TID);
         assert_eq!(fc.replay.operations.len(), 1);
         assert_eq!(fc.replay.incomplete_transactions, 0);
         assert!(!fc.replay.fallback_required);
@@ -49137,8 +49228,8 @@ mod tests {
             }
         }
         assert!(full, "fixture must exhaust directory slack");
-        let payload = build_fc_create_transaction(2, 11, b"recovered-name.txt", 1);
-        let fc_block = &mut image[24 * 4096..25 * 4096];
+        let payload = build_fc_create_transaction(2, 11, b"recovered-name.txt", TEST_FC_TID);
+        let fc_block = &mut image[TEST_FC_AREA_OFFSET..TEST_FC_AREA_OFFSET + 4096];
         fc_block.fill(0);
         fc_block[..payload.len()].copy_from_slice(&payload);
         image
@@ -49185,18 +49276,20 @@ mod tests {
         for raw_len in [0, 1, 127, 257] {
             for committed_prefix in [false, true] {
                 let mut image = build_ext4_image_with_fast_commit_create_evidence();
+                // With a committed prefix the malformed commit follows it in
+                // the same cycle, so without a HEAD (the kernel layout).
                 let mut stream = if committed_prefix {
-                    build_fc_create_transaction(2, 11, b"hello.txt", 1)
+                    build_fc_create_transaction(2, 11, b"hello.txt", TEST_FC_TID)
                 } else {
-                    Vec::new()
+                    build_fc_head(TEST_FC_TID)
                 };
-                stream.extend(build_fc_tag(9, &[0; 8]));
                 let mut inode = 11_u32.to_le_bytes().to_vec();
                 inode.resize(4 + raw_len, 0);
                 stream.extend(build_fc_tag(6, &inode));
                 stream.extend(build_fc_tag(8, &[1, 0, 0, 0, 0, 0, 0, 0]));
-                image[24 * 4096..26 * 4096].fill(0);
-                image[24 * 4096..24 * 4096 + stream.len()].copy_from_slice(&stream);
+                image[TEST_FC_AREA_OFFSET..TEST_FC_AREA_OFFSET + 2 * 4096].fill(0);
+                image[TEST_FC_AREA_OFFSET..TEST_FC_AREA_OFFSET + stream.len()]
+                    .copy_from_slice(&stream);
                 for mode in [
                     Ext4JournalReplayMode::Apply,
                     Ext4JournalReplayMode::SimulateOverlay,
@@ -49212,7 +49305,8 @@ mod tests {
                             .expect_err("a complete malformed inode TLV must stop recovery");
                         assert!(matches!(error, FfsError::Corruption { .. }));
                         let after = view.snapshot_bytes();
-                        assert_eq!(&after[24 * 4096..26 * 4096], &image[24 * 4096..26 * 4096]);
+                        let fc_area = TEST_FC_AREA_OFFSET..TEST_FC_AREA_OFFSET + 2 * 4096;
+                        assert_eq!(&after[fc_area.clone()], &image[fc_area]);
                         assert_eq!(&after[4 * 4096..5 * 4096], &image[4 * 4096..5 * 4096]);
                         if mode == Ext4JournalReplayMode::SimulateOverlay {
                             assert_eq!(after, image);
@@ -49226,8 +49320,8 @@ mod tests {
     #[test]
     fn fast_commit_apply_rejects_fallback_that_would_discard_committed_prefix() {
         let mut image = build_ext4_image_with_fast_commit_create_evidence();
-        let payload = build_fc_create_transaction(2, 11, b"hello.txt", 1);
-        let tail = &mut image[24 * 4096..25 * 4096];
+        let payload = build_fc_create_transaction(2, 11, b"hello.txt", TEST_FC_TID);
+        let tail = &mut image[TEST_FC_AREA_OFFSET..TEST_FC_AREA_OFFSET + 4096];
         tail.fill(0);
         tail[..payload.len()].copy_from_slice(&payload);
         // An unsupported tag after a valid TAIL must not erase the recovery
@@ -49272,8 +49366,8 @@ mod tests {
                 assert!(matches!(error, FfsError::UnsupportedFeature(_)));
                 assert!(error.to_string().contains("CREATE recovery incomplete"));
                 assert_eq!(
-                    data.lock().unwrap()[24 * 4096..25 * 4096],
-                    before[24 * 4096..25 * 4096],
+                    data.lock().unwrap()[TEST_FC_AREA_OFFSET..TEST_FC_AREA_OFFSET + 4096],
+                    before[TEST_FC_AREA_OFFSET..TEST_FC_AREA_OFFSET + 4096],
                     "failed recovery must preserve its committed FC records"
                 );
                 if mode == Ext4JournalReplayMode::SimulateOverlay {
@@ -49419,7 +49513,7 @@ mod tests {
             .ext4_fast_commit_replay()
             .expect("fast-commit evidence should be present");
 
-        assert_eq!(fc.reserved_fc_blocks, 2);
+        assert_eq!(fc.reserved_fc_blocks, 3);
         assert_eq!(fc.verified_operations, 0);
         assert_eq!(fc.replay.transactions_found, 0);
         assert_eq!(fc.replay.last_tid, 0);
@@ -49427,6 +49521,60 @@ mod tests {
         assert_eq!(fc.replay.incomplete_transactions, 1);
         assert!(fc.replay.fallback_required);
         assert_eq!(fc.replay.blocks_scanned, 1);
+    }
+
+    /// bd-9m84h: the fast-commit area outlives clean unmounts and full commits.
+    /// The kernel replays it only while recovering a journal that needs it,
+    /// and only the cycle after the log's last full commit; anything else is
+    /// stale and must not be applied (it would roll newer metadata back).
+    #[test]
+    fn stale_fast_commit_areas_are_not_replayed_bd_9m84h() {
+        let cx = Cx::for_testing();
+        let evidence_of = |image: Vec<u8>| {
+            let options = OpenOptions {
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                ..OpenOptions::default()
+            };
+            OpenFs::from_device(&cx, Box::new(TestDevice::from_vec(image)), &options)
+                .expect("open")
+                .ext4_fast_commit_replay()
+                .cloned()
+        };
+        assert!(
+            evidence_of(build_ext4_image_with_fast_commit_evidence()).is_some(),
+            "control: the live cycle is collected"
+        );
+
+        // A clean journal (s_start = 0).
+        let mut clean = build_ext4_image_with_fast_commit_evidence();
+        clean[20 * 4096 + 28..20 * 4096 + 32].fill(0);
+        assert!(evidence_of(clean.clone()).is_none());
+
+        // A cycle whose tid is not the transaction after the log's last commit.
+        let mut stale = build_ext4_image_with_fast_commit_evidence();
+        let old = build_fc_inode_update_transaction(42, TEST_FC_TID - 1);
+        stale[TEST_FC_AREA_OFFSET..TEST_FC_AREA_OFFSET + 4096].fill(0);
+        stale[TEST_FC_AREA_OFFSET..TEST_FC_AREA_OFFSET + old.len()].copy_from_slice(&old);
+        assert!(evidence_of(stale.clone()).is_none());
+
+        // With no live cycle, a recovering open applies nothing from the area
+        // (the live one names an unreadable inode and must refuse the open).
+        for image in [clean, stale] {
+            OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(image)),
+                &OpenOptions::default(),
+            )
+            .expect("a stale fast-commit area is ignored, not replayed");
+        }
+        OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(
+                build_ext4_image_with_fast_commit_evidence(),
+            )),
+            &OpenOptions::default(),
+        )
+        .expect_err("control: the live cycle is replayed and refuses the unreadable inode");
     }
 
     #[test]
@@ -49446,15 +49594,17 @@ mod tests {
             .ext4_fast_commit_replay()
             .expect("fast-commit evidence should be present");
 
-        assert_eq!(fc.reserved_fc_blocks, 2);
+        assert_eq!(fc.reserved_fc_blocks, 3);
         assert_eq!(fc.bytes_collected, 8192);
         assert_eq!(fc.verified_operations, 0);
+        // Two commits of one cycle: both carry its tid, and only the first
+        // block starts with a HEAD (what blocks_scanned counts).
         assert_eq!(fc.replay.transactions_found, 2);
-        assert_eq!(fc.replay.last_tid, 2);
+        assert_eq!(fc.replay.last_tid, TEST_FC_TID);
         assert_eq!(fc.replay.operations.len(), 2);
         assert_eq!(fc.replay.incomplete_transactions, 0);
         assert!(!fc.replay.fallback_required);
-        assert_eq!(fc.replay.blocks_scanned, 2);
+        assert_eq!(fc.replay.blocks_scanned, 1);
         assert_eq!(
             fc.replay.operations,
             vec![
@@ -49475,10 +49625,10 @@ mod tests {
             .ext4_fast_commit_replay()
             .expect("fast-commit evidence should be present");
 
-        assert_eq!(fc.reserved_fc_blocks, 2);
+        assert_eq!(fc.reserved_fc_blocks, 3);
         assert_eq!(fc.verified_operations, 1);
         assert_eq!(fc.replay.transactions_found, 1);
-        assert_eq!(fc.replay.last_tid, 1);
+        assert_eq!(fc.replay.last_tid, TEST_FC_TID);
         assert_eq!(fc.replay.operations.len(), 1);
         assert_eq!(fc.replay.incomplete_transactions, 0);
         assert!(!fc.replay.fallback_required);
@@ -51057,8 +51207,9 @@ mod tests {
         descriptor_block[tag_offset + 12..tag_offset + 16].copy_from_slice(&checksum.to_be_bytes());
     }
 
+    /// The kernel's j_csum_seed: raw crc32c from ~0 over the journal uuid.
     fn jbd2_v3_seed(uuid: [u8; 16]) -> u32 {
-        !ffs_types::crc32c_append(!0u32, &uuid)
+        !ffs_types::crc32c_append(0, &uuid)
     }
 
     fn build_fc_tag(tag_type: u16, payload: &[u8]) -> Vec<u8> {
@@ -51073,44 +51224,59 @@ mod tests {
         bytes
     }
 
-    fn build_fc_inode_update_transaction(ino: u32, tid: u32) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend(build_fc_tag(0x09, &[0; 8]));
+    /// A HEAD tag (no feature bits) for fast-commit cycle `tid`.
+    fn build_fc_head(tid: u32) -> Vec<u8> {
+        let mut head = [0_u8; 8];
+        head[4..].copy_from_slice(&tid.to_le_bytes());
+        build_fc_tag(0x09, &head)
+    }
+
+    /// Append the TAIL that commits `txn` (every tag since the previous TAIL)
+    /// as the kernel writes it: tid, then the raw crc32c from 0 over `txn`
+    /// plus this TAIL's header and tid.
+    fn seal_fc_transaction(txn: &mut Vec<u8>, tid: u32) {
+        seal_fc_transaction_to(txn, tid, txn.len() + 12);
+    }
+
+    /// Like [`seal_fc_transaction`], but the TAIL's payload runs to byte
+    /// `end` of the stream, as the kernel fills the rest of a block.
+    fn seal_fc_transaction_to(txn: &mut Vec<u8>, tid: u32, end: usize) {
+        let mut tail = build_fc_tag(0x08, &vec![0; end - txn.len() - 4]);
+        tail[4..8].copy_from_slice(&tid.to_le_bytes());
+        let crc = !ffs_types::crc32c_append(ffs_types::crc32c_append(!0, txn), &tail[..8]);
+        tail[8..12].copy_from_slice(&crc.to_le_bytes());
+        txn.extend(tail);
+    }
+
+    fn build_fc_inode_tag(ino: u32) -> Vec<u8> {
         let mut payload = ino.to_le_bytes().to_vec();
         payload.extend_from_slice(&[0; 128]);
-        bytes.extend(build_fc_tag(0x06, &payload));
-        let mut tail = [0_u8; 8];
-        tail[..4].copy_from_slice(&tid.to_le_bytes());
-        bytes.extend(build_fc_tag(0x08, &tail));
+        build_fc_tag(0x06, &payload)
+    }
+
+    fn build_fc_inode_update_transaction(ino: u32, tid: u32) -> Vec<u8> {
+        let mut bytes = build_fc_head(tid);
+        bytes.extend(build_fc_inode_tag(ino));
+        seal_fc_transaction(&mut bytes, tid);
+        bytes
+    }
+
+    /// A later fast commit of the same cycle: the kernel writes no HEAD.
+    fn build_fc_inode_update_continuation(ino: u32, tid: u32) -> Vec<u8> {
+        let mut bytes = build_fc_inode_tag(ino);
+        seal_fc_transaction(&mut bytes, tid);
         bytes
     }
 
     fn build_fc_create_transaction(parent_ino: u32, ino: u32, name: &[u8], tid: u32) -> Vec<u8> {
-        let mut bytes = Vec::new();
-        bytes.extend(build_fc_tag(0x09, &[0; 8]));
+        let mut bytes = build_fc_head(tid);
         let mut payload = Vec::with_capacity(8 + name.len());
         payload.extend_from_slice(&parent_ino.to_le_bytes());
         payload.extend_from_slice(&ino.to_le_bytes());
         payload.extend_from_slice(name);
         bytes.extend(build_fc_tag(0x03, &payload));
-        let mut tail = [0_u8; 8];
-        tail[..4].copy_from_slice(&tid.to_le_bytes());
-        bytes.extend(build_fc_tag(0x08, &tail));
+        seal_fc_transaction(&mut bytes, tid);
         bytes
-    }
-
-    fn pad_fc_stream_to_block_boundary(bytes: &mut Vec<u8>, block_len: usize) {
-        let used = bytes.len() % block_len;
-        if used == 0 {
-            return;
-        }
-
-        let remaining = block_len - used;
-        let pad_tag = build_fc_tag(0x07, &[]);
-        debug_assert_eq!(pad_tag.len(), 4);
-        for _ in 0..(remaining / pad_tag.len()) {
-            bytes.extend_from_slice(&pad_tag);
-        }
     }
 
     fn set_test_journal_uuid(image: &mut [u8], uuid: [u8; 16]) {
@@ -51341,6 +51507,14 @@ mod tests {
         image
     }
 
+    /// Byte offset of the fast-commit area in the fast-commit fixtures: fs
+    /// block 25, i.e. journal block `maxlen (7) - num_fc_blocks (3) + 1`.
+    const TEST_FC_AREA_OFFSET: usize = 25 * 4096;
+
+    /// The fast-commit cycle of those fixtures: the transaction after the one
+    /// their JBD2 log commits (sequence 1), as the kernel requires.
+    const TEST_FC_TID: u32 = 2;
+
     #[allow(clippy::cast_possible_truncation)]
     fn build_ext4_image_with_fast_commit_evidence() -> Vec<u8> {
         const JBD2_FEATURE_INCOMPAT_FAST_COMMIT: u32 = 0x0000_0020;
@@ -51359,10 +51533,12 @@ mod tests {
             .copy_from_slice(&(compat | 0x0004 | EXT4_COMPAT_FAST_COMMIT).to_le_bytes());
         image[sb_off + 0xE0..sb_off + 0xE4].copy_from_slice(&8_u32.to_le_bytes());
 
-        // Inode #8 -> journal extent [20..=25].
+        // Inode #8 -> journal extent [20..=26]: JBD2 superblock at 20, log
+        // blocks 21..=23, block 24 unused, fast-commit area 25..=26 (the
+        // kernel layout; see `TEST_FC_AREA_OFFSET`).
         let ino8_off: usize = 4 * 4096 + 7 * 256;
         image[ino8_off..ino8_off + 2].copy_from_slice(&0o100_600_u16.to_le_bytes());
-        image[ino8_off + 4..ino8_off + 8].copy_from_slice(&(6_u32 * 4096).to_le_bytes());
+        image[ino8_off + 4..ino8_off + 8].copy_from_slice(&(7_u32 * 4096).to_le_bytes());
         image[ino8_off + 0x1A..ino8_off + 0x1C].copy_from_slice(&1_u16.to_le_bytes());
         image[ino8_off + 0x20..ino8_off + 0x24].copy_from_slice(&0x0008_0000_u32.to_le_bytes());
         image[ino8_off + 0x80..ino8_off + 0x82].copy_from_slice(&32_u16.to_le_bytes());
@@ -51373,7 +51549,7 @@ mod tests {
         image[e + 4..e + 6].copy_from_slice(&4_u16.to_le_bytes());
         image[e + 6..e + 8].copy_from_slice(&0_u16.to_le_bytes());
         image[e + 12..e + 16].copy_from_slice(&0_u32.to_le_bytes());
-        image[e + 16..e + 18].copy_from_slice(&6_u16.to_le_bytes());
+        image[e + 16..e + 18].copy_from_slice(&7_u16.to_le_bytes());
         image[e + 18..e + 20].copy_from_slice(&0_u16.to_le_bytes());
         image[e + 20..e + 24].copy_from_slice(&20_u32.to_le_bytes());
 
@@ -51381,11 +51557,11 @@ mod tests {
         write_jbd2_superblock_v2(
             &mut image[journal_sb..journal_sb + 4096],
             4096,
-            6,
+            7,
             1,
             1,
             1,
-            2,
+            3,
             JBD2_FEATURE_INCOMPAT_FAST_COMMIT,
         );
 
@@ -51400,8 +51576,8 @@ mod tests {
         let j_commit = 23 * 4096;
         write_jbd2_header(&mut image[j_commit..j_commit + 4096], 2, 1);
 
-        let fc_payload = build_fc_inode_update_transaction(42, 1);
-        let fc_block = 24 * 4096;
+        let fc_payload = build_fc_inode_update_transaction(42, TEST_FC_TID);
+        let fc_block = TEST_FC_AREA_OFFSET;
         image[fc_block..fc_block + fc_payload.len()].copy_from_slice(&fc_payload);
 
         image
@@ -51410,8 +51586,8 @@ mod tests {
     #[allow(clippy::cast_possible_truncation)]
     fn build_ext4_image_with_truncated_fast_commit_evidence() -> Vec<u8> {
         let mut image = build_ext4_image_with_fast_commit_evidence();
-        let fc_block = 24 * 4096;
-        let mut truncated = build_fc_inode_update_transaction(42, 1);
+        let fc_block = TEST_FC_AREA_OFFSET;
+        let mut truncated = build_fc_inode_update_transaction(42, TEST_FC_TID);
         truncated.truncate(truncated.len() - 12); // Remove only the TAIL TLV.
         image[fc_block..fc_block + 4096].fill(0);
         image[fc_block..fc_block + truncated.len()].copy_from_slice(&truncated);
@@ -51421,15 +51597,18 @@ mod tests {
     #[allow(clippy::cast_possible_truncation)]
     fn build_ext4_image_with_multi_block_fast_commit_evidence() -> Vec<u8> {
         let mut image = build_ext4_image_with_fast_commit_evidence();
-        let fc_block = 24 * 4096;
-        let mut first_fc_payload = build_fc_inode_update_transaction(42, 1);
-        pad_fc_stream_to_block_boundary(&mut first_fc_payload, 4096);
-        image[fc_block..fc_block + 4096].fill(0);
+        let fc_block = TEST_FC_AREA_OFFSET;
+        // One fast-commit cycle (tid 1), one commit per block as the kernel
+        // writes it: HEAD only in the first, each TAIL running to its block's
+        // end, the second commit following without a HEAD.
+        let mut first_fc_payload = build_fc_head(TEST_FC_TID);
+        first_fc_payload.extend(build_fc_inode_tag(42));
+        seal_fc_transaction_to(&mut first_fc_payload, TEST_FC_TID, 4096);
         image[fc_block..fc_block + 4096].copy_from_slice(&first_fc_payload);
 
-        let second_fc_payload = build_fc_inode_update_transaction(43, 2);
+        let second_fc_payload = build_fc_inode_update_continuation(43, TEST_FC_TID);
 
-        let second_fc_block = 25 * 4096;
+        let second_fc_block = TEST_FC_AREA_OFFSET + 4096;
         image[second_fc_block..second_fc_block + second_fc_payload.len()]
             .copy_from_slice(&second_fc_payload);
         image
@@ -51478,8 +51657,8 @@ mod tests {
         image[hello + 7] = 1;
         image[hello + 8..hello + 17].copy_from_slice(b"hello.txt");
 
-        let fc_block = 24 * 4096;
-        let fc_payload = build_fc_create_transaction(2, 11, b"hello.txt", 1);
+        let fc_block = TEST_FC_AREA_OFFSET;
+        let fc_payload = build_fc_create_transaction(2, 11, b"hello.txt", TEST_FC_TID);
         image[fc_block..fc_block + 4096].fill(0);
         image[fc_block..fc_block + fc_payload.len()].copy_from_slice(&fc_payload);
         image
