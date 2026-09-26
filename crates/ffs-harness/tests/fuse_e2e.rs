@@ -19196,7 +19196,7 @@ fn fast_commit_crash_image_recovery_matches_kernel_bd_9m84h() {
         .lookup(&cx, InodeNumber(1), std::ffi::OsStr::new("testdir"))
         .expect("lookup testdir");
     let mut ffs_view = std::collections::BTreeMap::new();
-    for entry in fs.readdir(&cx, testdir.ino, 0).expect("FrankenFS readdir") {
+    for entry in readdir_all(&cx, &fs, testdir.ino) {
         let name = entry.name_str();
         if name == "." || name == ".." {
             continue;
@@ -19233,6 +19233,21 @@ fn fast_commit_crash_image_recovery_matches_kernel_bd_9m84h() {
         require_fuse_or_skip("e2fsck unavailable for bd-9m84h");
     }
     emit_scenario_result("fc_crash_image_matches_kernel_bd_9m84h", "PASS", None);
+}
+
+/// Every entry of a directory: `readdir` returns one page, continued from the
+/// last entry's offset cookie.
+fn readdir_all(cx: &Cx, fs: &OpenFs, dir: InodeNumber) -> Vec<ffs_core::vfs::DirEntry> {
+    let mut all = Vec::new();
+    let mut offset = 0;
+    loop {
+        let page = fs.readdir(cx, dir, offset).expect("FrankenFS readdir");
+        let Some(last) = page.last() else {
+            return all;
+        };
+        offset = last.offset;
+        all.extend(page);
+    }
 }
 
 /// What FrankenFS's JBD2 replay committed, for crash-image test logs.
@@ -19419,7 +19434,7 @@ fn jbd2_wrapped_log_crash_image_recovery_matches_kernel() {
         .lookup(&cx, InodeNumber(1), std::ffi::OsStr::new("w"))
         .expect("lookup w");
     let mut ffs_view = std::collections::BTreeMap::new();
-    for entry in fs.readdir(&cx, wdir.ino, 0).expect("FrankenFS readdir") {
+    for entry in readdir_all(&cx, &fs, wdir.ino) {
         let name = entry.name_str();
         if name == "." || name == ".." {
             continue;
