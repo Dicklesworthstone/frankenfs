@@ -7985,7 +7985,7 @@ impl OpenFs {
             BTreeSet::new()
         };
         let mut applied = 0_usize;
-        for op in operations {
+        for (index, op) in operations.iter().enumerate() {
             match op {
                 ffs_journal::FcOperation::Create(dentry) => {
                     if self.verify_fast_commit_dentry_target(cx, dentry, "create") {
@@ -8016,14 +8016,28 @@ impl OpenFs {
                 ffs_journal::FcOperation::Unlink(dentry) => {
                     if self.verify_fast_commit_parent_directory(cx, dentry, "unlink") {
                         // Apply (bd-w6fxn): remove the dir entry so the unlinked
-                        // name does not survive the crash. The inode's link count
-                        // is handled by the accompanying InodeUpdate. Only mutate
-                        // the base device in Apply mode.
+                        // name does not survive the crash. Only mutate the base
+                        // device in Apply mode.
+                        let removes_a_name =
+                            writes_allowed && self.fast_commit_dentry_present(cx, dentry)?;
                         if writes_allowed && !self.apply_fast_commit_remove_dentry(cx, dentry)? {
                             return Err(FfsError::UnsupportedFeature(format!(
                                 "fast-commit UNLINK recovery incomplete for inode {} in parent {}",
                                 dentry.ino, dentry.parent_ino
                             )));
+                        }
+                        // A later INODE record of the same inode carries its
+                        // link count. Without one (the name was its last link)
+                        // the drop is ours — once, and only if this replay
+                        // removed the name (bd-9m84h).
+                        let later_inode_record = operations[index + 1..].iter().any(|later| {
+                            matches!(
+                                later,
+                                ffs_journal::FcOperation::InodeUpdate(ino, _) if *ino == dentry.ino
+                            )
+                        });
+                        if removes_a_name && !later_inode_record {
+                            self.drop_fast_commit_unlinked_link(cx, dentry.ino)?;
                         }
                         applied += 1;
                     }
@@ -8481,6 +8495,73 @@ impl OpenFs {
     /// path — no alloc_state needed at mount). Shared by the fast-commit
     /// InodeUpdate and AddRange applies (bd-6nwjx). Writes only as many bytes as
     /// `raw_inode` carries, preserving any trailing on-disk inode bytes.
+    /// The on-disk bytes of inode `ino`'s table slot.
+    fn recovery_read_inode_raw(&self, cx: &Cx, ino: u32) -> Result<Vec<u8>, FfsError> {
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let scope = RequestScope::empty();
+        let loc = sb
+            .locate_inode(InodeNumber(u64::from(ino)))
+            .map_err(|e| parse_to_ffs_error(&e))?;
+        let table = self.ext4_inode_table_location(cx, &scope, loc.group)?;
+        let bs = u64::from(sb.block_size);
+        let abs_offset = table
+            .checked_mul(bs)
+            .and_then(|start| start.checked_add(u64::from(loc.index) * u64::from(sb.inode_size)))
+            .ok_or_else(|| FfsError::Corruption {
+                block: table,
+                detail: "inode table offset overflow".into(),
+            })?;
+        let offset = usize::try_from(abs_offset % bs).map_err(|_| {
+            FfsError::InvalidGeometry("inode offset within block exceeds addressable range".into())
+        })?;
+        let block =
+            self.read_ext4_inode_table_block_with_scope(cx, &scope, BlockNumber(abs_offset / bs))?;
+        block
+            .as_slice()
+            .get(offset..offset + usize::from(sb.inode_size))
+            .map(<[u8]>::to_vec)
+            .ok_or_else(|| FfsError::Corruption {
+                block: abs_offset / bs,
+                detail: "inode crosses block boundary or truncated block".into(),
+            })
+    }
+
+    /// A fast-committed DEL_ENTRY that no later INODE record of the same inode
+    /// follows: the kernel writes none when the name was the file's last link,
+    /// and its replay (ext4_fc_replay_unlink) drops the link and, at zero,
+    /// frees the inode and its blocks. Without this the inode stays allocated
+    /// with nothing referring to it (e2fsck: "Unattached inode").
+    /// Whether `dentry`'s name still names its inode in its parent.
+    fn fast_commit_dentry_present(
+        &self,
+        cx: &Cx,
+        dentry: &ffs_journal::FcDentry,
+    ) -> Result<bool, FfsError> {
+        let parent = self.read_inode(cx, InodeNumber(u64::from(dentry.parent_ino)))?;
+        Ok(parent.is_dir()
+            && self
+                .lookup_name(cx, &parent, &dentry.name)?
+                .is_some_and(|entry| entry.inode == dentry.ino))
+    }
+
+    fn drop_fast_commit_unlinked_link(&self, cx: &Cx, ino: u32) -> Result<(), FfsError> {
+        let mut raw = self.recovery_read_inode_raw(cx, ino)?;
+        if raw.len() < 0x1C {
+            return Err(FfsError::Corruption {
+                block: 0,
+                detail: format!("inode {ino} record too short to hold a link count"),
+            });
+        }
+        let links = u16::from_le_bytes([raw[0x1A], raw[0x1B]]);
+        if links <= 1 {
+            return self.free_fast_commit_deleted_inode(cx, ino);
+        }
+        raw[0x1A..0x1C].copy_from_slice(&(links - 1).to_le_bytes());
+        self.recovery_write_inode_raw(cx, ino, &raw)
+    }
+
     fn recovery_write_inode_raw(
         &self,
         cx: &Cx,

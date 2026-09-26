@@ -19001,19 +19001,126 @@ fn fuse_btrfs_mknod_blockdev_stores_rdev() {
     });
 }
 
-// bd-9m84h: crash-image fast-commit recovery, certified against the kernel.
-// A kernel-mounted ext4 with fast_commit takes a fully committed baseline,
-// then makes FC-eligible changes made durable ONLY by fsync (no sync, no
-// buffer flush: either forces a full JBD2 commit and leaves nothing for fast
-// commit to recover). The image is copied while still mounted. The kernel
-// recovers one copy; FrankenFS replays the other and must report fast-commit
-// transactions and operations, and show exactly the kernel's names and bytes.
-//
-// Prerequisites: mkfs.ext4 with fast_commit support, sudo (loop mounts),
-// kernel ext4 fast_commit support.
+/// Write `bytes` to `dir/name` and make it durable with that file's fsync only.
+fn fc_fsynced_write(dir: &Path, name: &str, bytes: &[u8], append: bool) {
+    let mut file = fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .append(append)
+        .truncate(!append)
+        .open(dir.join(name))
+        .unwrap_or_else(|e| panic!("open {name}: {e}"));
+    file.write_all(bytes).expect("write");
+    file.sync_all()
+        .unwrap_or_else(|e| panic!("fsync {name}: {e}"));
+}
+
+// bd-9m84h: fast-commit recovery, created files and an append.
 #[test]
-#[allow(clippy::too_many_lines)]
 fn fast_commit_crash_image_recovery_matches_kernel_bd_9m84h() {
+    run_fc_kernel_scenario(
+        "fc_crash_image_matches_kernel_bd_9m84h",
+        &|dir| fs::write(dir.join("alpha"), b"alpha").unwrap(),
+        &|dir| {
+            fc_fsynced_write(dir, "bravo", &[0xB5_u8; 9000], false);
+            fc_fsynced_write(dir, "charlie", b"charlie after the baseline", false);
+            fc_fsynced_write(dir, "alpha", b" appended after the baseline", true);
+        },
+        &["alpha", "bravo", "charlie"],
+        true,
+    );
+}
+
+// bd-9m84h: fast-commit recovery of a hard link and an unlink (link counts).
+#[test]
+fn fast_commit_crash_image_link_unlink_matches_kernel_bd_9m84h() {
+    run_fc_kernel_scenario(
+        "fc_crash_image_link_unlink_bd_9m84h",
+        &|dir| {
+            for name in ["alpha", "beta", "gamma"] {
+                fs::write(dir.join(name), name.repeat(100)).unwrap();
+            }
+        },
+        // One fsync fast-commits every tracked change: the kernel writes
+        // ADD_ENTRY alpha_link, DEL_ENTRY beta and the inodes.
+        &|dir| {
+            fs::hard_link(dir.join("alpha"), dir.join("alpha_link")).expect("link");
+            fs::remove_file(dir.join("beta")).expect("remove beta");
+            fc_fsynced_write(dir, "gamma", b" gamma grows", true);
+        },
+        &["alpha", "alpha_link", "gamma"],
+        true,
+    );
+}
+
+// bd-9m84h: a fast commit that a later full commit subsumed. A directory
+// fsync makes the kernel commit the whole transaction, so the fast-commit
+// area holds the earlier cycle: FrankenFS must leave it unreplayed and still
+// match the kernel's recovery (the real-image case of the stale-area gate).
+#[test]
+fn fast_commit_crash_image_subsumed_by_full_commit_bd_9m84h() {
+    run_fc_kernel_scenario(
+        "fc_crash_image_subsumed_by_full_commit_bd_9m84h",
+        &|dir| {
+            for name in ["alpha", "beta", "gamma"] {
+                fs::write(dir.join(name), name.repeat(100)).unwrap();
+            }
+        },
+        &|dir| {
+            fs::hard_link(dir.join("alpha"), dir.join("alpha_link")).expect("link");
+            fs::remove_file(dir.join("beta")).expect("remove beta");
+            fs::File::open(dir.join("alpha"))
+                .and_then(|f| f.sync_all())
+                .expect("fsync alpha");
+            fs::File::open(dir)
+                .and_then(|d| d.sync_all())
+                .expect("fsync dir");
+        },
+        &["alpha", "alpha_link", "gamma"],
+        false,
+    );
+}
+
+// bd-9m84h: fast-commit recovery of a truncate and an in-place overwrite.
+#[test]
+fn fast_commit_crash_image_truncate_matches_kernel_bd_9m84h() {
+    run_fc_kernel_scenario(
+        "fc_crash_image_truncate_bd_9m84h",
+        &|dir| fs::write(dir.join("big"), vec![0x42_u8; 40_000]).unwrap(),
+        &|dir| {
+            let mut file = fs::OpenOptions::new()
+                .write(true)
+                .open(dir.join("big"))
+                .expect("open big");
+            file.set_len(5000).expect("truncate");
+            file.write_all(&[0x7E_u8; 100]).expect("overwrite");
+            file.sync_all().expect("fsync big");
+        },
+        &["big"],
+        true,
+    );
+}
+
+/// bd-9m84h: fast-commit recovery certified against the kernel. A
+/// kernel-mounted ext4 with fast_commit takes a fully committed baseline
+/// (`baseline`, then sync), then `changes` makes FC-eligible changes durable
+/// ONLY by fsync (a sync or buffer flush would force a full JBD2 commit and
+/// leave nothing for fast commit to recover). The image is copied while still
+/// mounted. The kernel recovers one copy; FrankenFS replays the other and must
+/// report a live fast-commit cycle exactly when `expect_fast_commit`, show
+/// exactly the kernel's names, bytes and link counts in `testdir`, and leave
+/// an e2fsck-clean image.
+///
+/// Prerequisites: mkfs.ext4 with fast_commit support, sudo (loop mounts),
+/// kernel ext4 fast_commit support.
+#[allow(clippy::too_many_lines)]
+fn run_fc_kernel_scenario(
+    scenario: &str,
+    baseline: &dyn Fn(&Path),
+    changes: &dyn Fn(&Path),
+    expected_names: &[&str],
+    expect_fast_commit: bool,
+) {
     let has_mkfs = Command::new("mkfs.ext4")
         .arg("-V")
         .output()
@@ -19077,26 +19184,12 @@ fn fast_commit_crash_image_recovery_matches_kernel_bd_9m84h() {
     // Step 4: a fully committed baseline.
     let dir = mnt.join("testdir");
     fs::create_dir_all(&dir).unwrap();
-    fs::write(dir.join("alpha"), b"alpha").unwrap();
+    baseline(&dir);
     let synced = Command::new("sync").output().expect("sync");
     assert!(synced.status.success(), "baseline sync");
 
-    // Step 5: FC-eligible changes, each made durable only by its fsync.
-    let fsynced = |name: &str, bytes: &[u8], append: bool| {
-        let mut file = fs::OpenOptions::new()
-            .create(true)
-            .write(true)
-            .append(append)
-            .truncate(!append)
-            .open(dir.join(name))
-            .unwrap_or_else(|e| panic!("open {name}: {e}"));
-        file.write_all(bytes).expect("write");
-        file.sync_all()
-            .unwrap_or_else(|e| panic!("fsync {name}: {e}"));
-    };
-    fsynced("bravo", &[0xB5_u8; 9000], false);
-    fsynced("charlie", b"charlie after the baseline", false);
-    fsynced("alpha", b" appended after the baseline", true);
+    // Step 5: FC-eligible changes, each made durable only by fsync.
+    changes(&dir);
 
     // Step 6: the crash state — two copies of the image taken while it is
     // still mounted. The loop device uses direct I/O, so everything the
@@ -19157,15 +19250,16 @@ fn fast_commit_crash_image_recovery_matches_kernel_bd_9m84h() {
         let entry = entry.expect("kernel dirent");
         let name = entry.file_name().to_string_lossy().into_owned();
         let bytes = fs::read(entry.path()).expect("kernel read");
-        kernel_view.insert(name, bytes);
+        let nlink = u32::try_from(entry.metadata().expect("kernel stat").nlink()).expect("nlink");
+        kernel_view.insert(name, (bytes, nlink));
     }
     drop(guard);
     // The fixture must actually exercise fast commit: every post-baseline
     // change is visible to the kernel only through its recovery.
     assert_eq!(
         kernel_view.keys().map(String::as_str).collect::<Vec<_>>(),
-        ["alpha", "bravo", "charlie"],
-        "kernel-recovered names"
+        expected_names,
+        "{scenario}: kernel-recovered names"
     );
 
     // Step 9: FrankenFS replays its copy and must match the kernel.
@@ -19174,24 +19268,35 @@ fn fast_commit_crash_image_recovery_matches_kernel_bd_9m84h() {
         ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
         ..OpenOptions::default()
     };
-    let fs = OpenFs::open_with_options(&cx, &crash_image, &options)
-        .unwrap_or_else(|e| panic!("FrankenFS must recover the fast-commit crash image: {e}"));
-    report_jbd2_replay("bd-9m84h", &fs);
-    let evidence = fs
-        .ext4_fast_commit_replay()
-        .expect("fast-commit replay evidence");
-    eprintln!(
-        "bd-9m84h: fc transactions={} operations={} blocks_scanned={} incomplete={} fallback={}",
-        evidence.replay.transactions_found,
-        evidence.replay.operations.len(),
-        evidence.replay.blocks_scanned,
-        evidence.replay.incomplete_transactions,
-        evidence.replay.fallback_required,
-    );
-    assert!(
-        evidence.replay.transactions_found > 0 && !evidence.replay.operations.is_empty(),
-        "the crash image must carry fast-commit transactions for this test to mean anything"
-    );
+    let fs = OpenFs::open_with_options(&cx, &crash_image, &options).unwrap_or_else(|e| {
+        panic!("{scenario}: FrankenFS must recover the fast-commit crash image: {e}")
+    });
+    report_jbd2_replay(scenario, &fs);
+    if let Some(evidence) = fs.ext4_fast_commit_replay() {
+        eprintln!(
+            "{scenario}: fc transactions={} operations={} blocks_scanned={} incomplete={} \
+             fallback={}",
+            evidence.replay.transactions_found,
+            evidence.replay.operations.len(),
+            evidence.replay.blocks_scanned,
+            evidence.replay.incomplete_transactions,
+            evidence.replay.fallback_required,
+        );
+        assert!(
+            expect_fast_commit
+                && evidence.replay.transactions_found > 0
+                && !evidence.replay.operations.is_empty(),
+            "{scenario}: the crash image must carry a live fast-commit cycle exactly when \
+             expected ({expect_fast_commit})"
+        );
+    } else {
+        eprintln!("{scenario}: no live fast-commit cycle");
+        assert!(
+            !expect_fast_commit,
+            "{scenario}: the crash image must carry fast-commit transactions for this test \
+             to mean anything"
+        );
+    }
     let testdir = fs
         .lookup(&cx, InodeNumber(1), std::ffi::OsStr::new("testdir"))
         .expect("lookup testdir");
@@ -19207,11 +19312,11 @@ fn fast_commit_crash_image_recovery_matches_kernel_bd_9m84h() {
         let bytes = fs
             .read(&cx, attr.ino, 0, u32::try_from(attr.size).expect("fits"))
             .expect("FrankenFS read");
-        ffs_view.insert(name, bytes);
+        ffs_view.insert(name, (bytes, attr.nlink));
     }
     assert_eq!(
         ffs_view, kernel_view,
-        "FrankenFS fast-commit recovery must match the kernel's"
+        "{scenario}: FrankenFS fast-commit recovery must match the kernel's"
     );
     // Apply mode recovered into the image itself: what the fast commits
     // allocated must be marked in the bitmaps and counters, or e2fsck finds
@@ -19225,14 +19330,14 @@ fn fast_commit_crash_image_recovery_matches_kernel_bd_9m84h() {
             .expect("e2fsck");
         assert!(
             fsck.status.success(),
-            "e2fsck -fn after FrankenFS fast-commit recovery:\n{}{}",
+            "{scenario}: e2fsck -fn after FrankenFS fast-commit recovery:\n{}{}",
             String::from_utf8_lossy(&fsck.stdout),
             String::from_utf8_lossy(&fsck.stderr)
         );
     } else {
         require_fuse_or_skip("e2fsck unavailable for bd-9m84h");
     }
-    emit_scenario_result("fc_crash_image_matches_kernel_bd_9m84h", "PASS", None);
+    emit_scenario_result(scenario, "PASS", None);
 }
 
 /// Every entry of a directory: `readdir` returns one page, continued from the
