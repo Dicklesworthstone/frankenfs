@@ -2740,6 +2740,46 @@ pub fn free_blocks(
     Ok(())
 }
 
+/// Mark `count` blocks from `start` allocated, as journal recovery must when it
+/// replays a record that allocated them (the kernel's
+/// `ext4_fc_set_bitmaps_and_counters`). Bits already set are left alone, so a
+/// replay that is run again changes nothing. Returns how many were newly set.
+pub fn claim_blocks(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    geo: &FsGeometry,
+    groups: &mut [GroupStats],
+    start: BlockNumber,
+    count: u32,
+) -> Result<u32> {
+    cx_checkpoint(cx)?;
+
+    let segments = split_free_block_segments(geo, groups.len(), start, count, "claim_blocks")?;
+    let mut claimed = 0_u32;
+    for segment in segments {
+        let gidx = segment.group.0 as usize;
+        let reserved = reserved_blocks_in_group(geo, groups, segment.group);
+        let mut bitmap =
+            read_block_bitmap_for_update(cx, dev, geo, &groups[gidx], segment.group, &reserved)?;
+        let mut newly = 0_u32;
+        for rel in segment.rel_start..segment.rel_start + segment.count {
+            if !bitmap_get(&bitmap, rel) {
+                bitmap_set(&mut bitmap, rel);
+                newly += 1;
+            }
+        }
+        if newly == 0 && !groups[gidx].block_bitmap_uninit() {
+            continue;
+        }
+        dev.write_block(cx, groups[gidx].block_bitmap_block, &bitmap)?;
+        groups[gidx].free_blocks = groups[gidx].free_blocks.saturating_sub(newly);
+        groups[gidx].mark_block_bitmap_initialized();
+        groups[gidx].invalidate_block_largest_free_run();
+        claimed += newly;
+    }
+    Ok(claimed)
+}
+
 // ── Persistent block allocator ──────────────────────────────────────────────
 
 /// Allocate `count` contiguous data blocks with full on-disk accounting.
@@ -3926,6 +3966,71 @@ pub fn free_inode(
     groups[gidx].free_inodes = groups[gidx].free_inodes.saturating_add(1);
     groups[gidx].mark_inode_bitmap_initialized();
     Ok(())
+}
+
+/// Mark inode `ino` allocated, as journal recovery must when it replays a
+/// record that created it (the kernel's `ext4_fc_set_bitmaps_and_counters`).
+/// An already-set bit changes nothing, so a replay run again is a no-op.
+/// Returns whether the bit was newly set.
+pub fn claim_inode(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    geo: &FsGeometry,
+    groups: &mut [GroupStats],
+    ino: InodeNumber,
+    is_dir: bool,
+) -> Result<bool> {
+    cx_checkpoint(cx)?;
+    if geo.inodes_per_group == 0 {
+        return Err(FfsError::Format(
+            "claim_inode: inodes_per_group is zero".into(),
+        ));
+    }
+    let ino_zero = ino.0.checked_sub(1).ok_or_else(|| FfsError::Corruption {
+        block: 0,
+        detail: "inode number 0 is invalid".into(),
+    })?;
+    if ino.0 > u64::from(geo.total_inodes) {
+        return Err(FfsError::Corruption {
+            block: 0,
+            detail: format!("inode {} exceeds total inode count", ino.0),
+        });
+    }
+    let group_idx = u32::try_from(ino_zero / u64::from(geo.inodes_per_group)).map_err(|_| {
+        FfsError::Corruption {
+            block: 0,
+            detail: format!("claim_inode: inode {} group exceeds u32", ino.0),
+        }
+    })?;
+    let gidx = group_idx as usize;
+    if gidx >= groups.len() {
+        return Err(FfsError::Corruption {
+            block: 0,
+            detail: format!("claim_inode: group {group_idx} out of range"),
+        });
+    }
+    #[expect(clippy::cast_possible_truncation)]
+    let bit_idx = (ino_zero % u64::from(geo.inodes_per_group)) as u32;
+    let group = GroupNumber(group_idx);
+    let mut bitmap = dev
+        .read_block(cx, groups[gidx].inode_bitmap_block)?
+        .as_slice()
+        .to_vec();
+    for r in 0..reserved_inode_count_in_group(geo, group) {
+        bitmap_set(&mut bitmap, r);
+    }
+    if bitmap_get(&bitmap, bit_idx) {
+        return Ok(false);
+    }
+    bitmap_set(&mut bitmap, bit_idx);
+    fill_inode_bitmap_padding(&mut bitmap, geo.inodes_per_group);
+    dev.write_block(cx, groups[gidx].inode_bitmap_block, &bitmap)?;
+    groups[gidx].free_inodes = groups[gidx].free_inodes.saturating_sub(1);
+    if is_dir {
+        groups[gidx].used_dirs = groups[gidx].used_dirs.saturating_add(1);
+    }
+    groups[gidx].mark_inode_bitmap_initialized();
+    Ok(true)
 }
 
 /// Free an inode with full on-disk accounting.

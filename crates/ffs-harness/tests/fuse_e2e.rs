@@ -19213,6 +19213,25 @@ fn fast_commit_crash_image_recovery_matches_kernel_bd_9m84h() {
         ffs_view, kernel_view,
         "FrankenFS fast-commit recovery must match the kernel's"
     );
+    // Apply mode recovered into the image itself: what the fast commits
+    // allocated must be marked in the bitmaps and counters, or e2fsck finds
+    // in-use inodes and blocks that the allocator would hand out again.
+    drop(fs);
+    if command_available("e2fsck") {
+        let fsck = Command::new("e2fsck")
+            .args(["-fn"])
+            .arg(&crash_image)
+            .output()
+            .expect("e2fsck");
+        assert!(
+            fsck.status.success(),
+            "e2fsck -fn after FrankenFS fast-commit recovery:\n{}{}",
+            String::from_utf8_lossy(&fsck.stdout),
+            String::from_utf8_lossy(&fsck.stderr)
+        );
+    } else {
+        require_fuse_or_skip("e2fsck unavailable for bd-9m84h");
+    }
     emit_scenario_result("fc_crash_image_matches_kernel_bd_9m84h", "PASS", None);
 }
 

@@ -8058,7 +8058,13 @@ impl OpenFs {
                     // just verify the inode is readable. Apply writes to the
                     // base; SimulateOverlay writes only to its private overlay.
                     // Empty bodies are permitted only in diagnostic Skip mode.
-                    if self.verify_fast_commit_inode(cx, *ino) {
+                    // A full body is the inode itself — for a file the fast
+                    // commit created, its only record — so, as in the kernel's
+                    // ext4_fc_replay_inode, it needs no readable predecessor.
+                    let creates = writes_allowed
+                        && raw_inode.len() >= 2
+                        && u16::from_le_bytes([raw_inode[0], raw_inode[1]]) != 0;
+                    if creates || self.verify_fast_commit_inode(cx, *ino) {
                         if writes_allowed && !recovered_external_inodes.contains(ino) {
                             self.apply_fast_commit_inode_update(cx, *ino, raw_inode)?;
                         }
@@ -8077,9 +8083,80 @@ impl OpenFs {
             });
         }
         if writes_allowed {
+            self.claim_fast_commit_allocations(cx, operations)?;
             self.verify_fast_commit_recovered_ranges(cx, operations)?;
         }
         Ok(applied)
+    }
+
+    /// Mark what the replayed fast commits allocated — each live inode and the
+    /// blocks its ADD_RANGE records map — in the bitmaps and group counters,
+    /// as the kernel's ext4_fc_set_bitmaps_and_counters does. Without it a
+    /// file the fast commit created is readable but its inode and blocks are
+    /// still free, and the next allocation hands them out again.
+    fn claim_fast_commit_allocations(
+        &self,
+        cx: &Cx,
+        operations: &[ffs_journal::FcOperation],
+    ) -> Result<(), FfsError> {
+        // The last record per inode is its recovered state.
+        let mut live: BTreeMap<u32, bool> = BTreeMap::new();
+        for op in operations {
+            if let ffs_journal::FcOperation::InodeUpdate(ino, raw) = op
+                && raw.len() >= 0x1C
+            {
+                let mode = u16::from_le_bytes([raw[0], raw[1]]);
+                let links = u16::from_le_bytes([raw[0x1A], raw[0x1B]]);
+                if mode != 0 && links != 0 {
+                    live.insert(*ino, mode & 0xF000 == 0x4000);
+                } else {
+                    live.remove(ino);
+                }
+            }
+        }
+        if live.is_empty() {
+            return Ok(());
+        }
+        let mut alloc = self.load_ext4_alloc_state(cx)?;
+        let counts_before = Self::ext4_snapshot_group_counts(&alloc);
+        let block_dev = self.direct_block_device_adapter();
+        let mut changed = false;
+        for (&ino, &is_dir) in &live {
+            changed |= ffs_alloc::claim_inode(
+                cx,
+                &block_dev,
+                &alloc.geo,
+                &mut alloc.groups,
+                InodeNumber(u64::from(ino)),
+                is_dir,
+            )?;
+        }
+        for op in operations {
+            if let ffs_journal::FcOperation::AddRange(range) = op
+                && live.contains_key(&range.ino)
+            {
+                changed |= ffs_alloc::claim_blocks(
+                    cx,
+                    &block_dev,
+                    &alloc.geo,
+                    &mut alloc.groups,
+                    BlockNumber(range.physical_block),
+                    range.len,
+                )? > 0;
+            }
+        }
+        if changed {
+            // Same persistence as the DEL_RANGE / deleted-inode paths: the
+            // transient alloc holds the only up-to-date counts.
+            self.ext4_persist_group_descriptors_from(cx, &alloc)?;
+            self.ext4_merge_recovery_alloc_into_live(&counts_before, &alloc);
+            self.invalidate_ext4_read_caches_after_recovery();
+            debug!(
+                inodes = live.len(),
+                "fc_apply: claimed recovered allocations"
+            );
+        }
+        Ok(())
     }
 
     /// Check final mappings, rather than merely checking whether the inode is
@@ -9102,7 +9179,13 @@ impl OpenFs {
         extents: &[Ext4Extent],
         inode_raw: &[u8],
     ) -> Result<bool, FfsError> {
-        let inode = self.read_inode(cx, InodeNumber(u64::from(ino)))?;
+        // A file the fast commit created has no on-disk predecessor (its inode
+        // slot is zero); the main pass writes its recovered inode whole.
+        let inode = match self.read_inode(cx, InodeNumber(u64::from(ino))) {
+            Ok(inode) => inode,
+            Err(FfsError::NotFound(_)) => return Ok(false),
+            Err(error) => return Err(error),
+        };
         if inode.flags & EXT4_EXTENTS_FL == 0 {
             return Ok(false);
         }
