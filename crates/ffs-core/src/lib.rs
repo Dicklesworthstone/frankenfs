@@ -216,6 +216,11 @@ const BTRFS_TREE_LOG_OBJECTID: u64 = ffs_btrfs::BTRFS_TREE_LOG_OBJECTID;
 /// implicit "." and ".." entries.
 const BTRFS_DIR_START_INDEX: u64 = 2;
 
+/// Tag bit of the synthetic VFS inode presented for a nested-subvolume link
+/// (`OpenFs::btrfs_dir_child_ino`). fs-tree inode objectids are allocated
+/// upward from `BTRFS_FIRST_FREE_OBJECTID` and never reach 2^63.
+const BTRFS_SUBVOL_LINK_INO_BIT: u64 = 1 << 63;
+
 /// Adler-32 checksum with a 32-bit seed, matching the e2compr convention.
 ///
 /// The seed is split into `s1 = seed & 0xFFFF` and `s2 = seed >> 16`,
@@ -12572,6 +12577,60 @@ impl OpenFs {
         }
     }
 
+    /// VFS inode number presented for a directory entry.
+    ///
+    /// A `DIR_ITEM`/`DIR_INDEX` whose child key is a `ROOT_ITEM` links a
+    /// nested subvolume: its `child_objectid` is the SUBVOLUME id, not an
+    /// inode of the tree being read, so presenting it as an inode would alias
+    /// whatever inode happens to share that number (subvolume 257 vs the
+    /// tree's first file, objectid 257). Such links get a synthetic inode in
+    /// [`BTRFS_SUBVOL_LINK_INO_BIT`] space instead.
+    const fn btrfs_dir_child_ino(child_key_type: u8, child_objectid: u64) -> InodeNumber {
+        if child_key_type == BTRFS_ITEM_ROOT_ITEM {
+            InodeNumber(BTRFS_SUBVOL_LINK_INO_BIT | child_objectid)
+        } else {
+            InodeNumber(child_objectid)
+        }
+    }
+
+    /// Attributes of a nested-subvolume link (see [`Self::btrfs_dir_child_ino`]).
+    ///
+    /// FrankenFS does not yet cross into another subvolume's tree, so the link
+    /// is presented the way the kernel presents a subvolume it cannot reach
+    /// (`new_simple_dir`): an empty `S_IFDIR` 0755 directory owned by root.
+    fn btrfs_subvol_link_attr(&self, ino: InodeNumber) -> InodeAttr {
+        InodeAttr {
+            ino,
+            size: 0,
+            blocks: 0,
+            atime: UNIX_EPOCH,
+            mtime: UNIX_EPOCH,
+            ctime: UNIX_EPOCH,
+            crtime: UNIX_EPOCH,
+            kind: FileType::Directory,
+            perm: 0o755,
+            nlink: 1,
+            uid: 0,
+            gid: 0,
+            rdev: 0,
+            blksize: self.block_size(),
+            generation: 0,
+        }
+    }
+
+    /// Refuse to mutate through a nested-subvolume link.
+    ///
+    /// The link's `child_objectid` is a subvolume id; every unlink/rename step
+    /// that treats it as an inode of this tree would edit an unrelated inode.
+    /// Subvolume deletion/move is not implemented, so fail with EPERM before
+    /// any tree edit.
+    fn btrfs_refuse_subvol_link(entry: &BtrfsDirItem) -> ffs_error::Result<()> {
+        if entry.child_key_type == BTRFS_ITEM_ROOT_ITEM {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
+        }
+        Ok(())
+    }
+
     /// Translate VFS inode numbers to ext4 on-disk inode numbers.
     ///
     /// FsOps is consumed by FUSE, where inode `1` is the synthetic VFS root.
@@ -13046,6 +13105,9 @@ impl OpenFs {
     fn btrfs_read_inode_attr(&self, cx: &Cx, ino: InodeNumber) -> Result<InodeAttr, FfsError> {
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let canonical = self.btrfs_canonical_inode(ino)?;
+        if canonical & BTRFS_SUBVOL_LINK_INO_BIT != 0 {
+            return Ok(self.btrfs_subvol_link_attr(ino));
+        }
 
         // When writes are enabled the COW tree holds all items (seeded from
         // on-disk at enable_writes time and updated by mutations).  Read from
@@ -13145,6 +13207,12 @@ impl OpenFs {
     ) -> Result<InodeAttr, FfsError> {
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let canonical_parent = self.btrfs_canonical_inode(parent)?;
+        if canonical_parent & BTRFS_SUBVOL_LINK_INO_BIT != 0 {
+            // A nested-subvolume link is presented as an empty directory.
+            return Err(FfsError::NotFound(
+                String::from_utf8_lossy(name).into_owned(),
+            ));
+        }
 
         // When writes are enabled, look up via the COW tree so mutations are
         // visible (the write-path helper already handles hash-collision
@@ -13156,7 +13224,8 @@ impl OpenFs {
             }
             let alloc = alloc_mutex.read();
             let dir_item = Self::btrfs_lookup_dir_entry(&alloc, canonical_parent, name)?;
-            let child_ino = InodeNumber(dir_item.child_objectid);
+            let child_ino =
+                Self::btrfs_dir_child_ino(dir_item.child_key_type, dir_item.child_objectid);
             drop(alloc);
             return self.btrfs_read_inode_attr(cx, child_ino);
         }
@@ -13228,7 +13297,8 @@ impl OpenFs {
             let dir_items = parse_dir_items(&item.data).map_err(|e| parse_to_ffs_error(&e))?;
             for dir_item in dir_items {
                 if dir_item.name == name {
-                    let child_ino = InodeNumber(dir_item.child_objectid);
+                    let child_ino =
+                        Self::btrfs_dir_child_ino(dir_item.child_key_type, dir_item.child_objectid);
                     return self.btrfs_read_inode_attr(cx, child_ino);
                 }
             }
@@ -13254,7 +13324,8 @@ impl OpenFs {
             let dir_items = parse_dir_items(&item.data).map_err(|e| parse_to_ffs_error(&e))?;
             for dir_item in dir_items {
                 if dir_item.name == name {
-                    let child_ino = InodeNumber(dir_item.child_objectid);
+                    let child_ino =
+                        Self::btrfs_dir_child_ino(dir_item.child_key_type, dir_item.child_objectid);
                     return self.btrfs_read_inode_attr(cx, child_ino);
                 }
             }
@@ -13307,6 +13378,31 @@ impl OpenFs {
         trace!(inode = %ino, "btrfs readdir_start");
 
         let canonical_dir = self.btrfs_canonical_inode(ino)?;
+        if canonical_dir & BTRFS_SUBVOL_LINK_INO_BIT != 0 {
+            // A nested-subvolume link is presented as an empty directory. Its
+            // parent is not recoverable from the synthetic inode, so ".."
+            // names the link itself, as for any directory with no INODE_REF.
+            return Ok(vec![
+                (
+                    0,
+                    DirEntry {
+                        ino,
+                        offset: 0,
+                        kind: FileType::Directory,
+                        name: b".".to_vec(),
+                    },
+                ),
+                (
+                    1,
+                    DirEntry {
+                        ino,
+                        offset: 0,
+                        kind: FileType::Directory,
+                        name: b"..".to_vec(),
+                    },
+                ),
+            ]);
+        }
         let mut rows: Vec<(u64, DirEntry)> = Vec::new();
 
         // Parent objectid for the synthetic ".." entry, captured from the same
@@ -13513,7 +13609,10 @@ impl OpenFs {
             rows.push((
                 base.saturating_add(local_idx),
                 DirEntry {
-                    ino: InodeNumber(dir_item.child_objectid),
+                    ino: Self::btrfs_dir_child_ino(
+                        dir_item.child_key_type,
+                        dir_item.child_objectid,
+                    ),
                     offset: 0,
                     kind: Self::btrfs_dir_type_to_file_type(dir_item.file_type),
                     name: dir_item.name.to_vec(),
@@ -38387,6 +38486,7 @@ impl OpenFs {
 
         // Lookup the child entry in the parent directory.
         let child = Self::btrfs_lookup_dir_entry(&alloc, parent_oid, name)?;
+        Self::btrfs_refuse_subvol_link(&child)?;
         let child_oid = child.child_objectid;
 
         // Validate file type.
@@ -38518,6 +38618,7 @@ impl OpenFs {
             Err(FfsError::NotFound(_)) => return Ok(false),
             Err(err) => return Err(err),
         };
+        Self::btrfs_refuse_subvol_link(&target)?;
 
         let target_oid = target.child_objectid;
         let target_is_dir = target.file_type == BTRFS_FT_DIR;
@@ -38764,6 +38865,7 @@ impl OpenFs {
         self.btrfs_require_directory_inode(&alloc, new_parent_oid)?;
 
         let child = Self::btrfs_lookup_dir_entry(&alloc, parent_oid, name)?;
+        Self::btrfs_refuse_subvol_link(&child)?;
         let child_is_dir = child.file_type == BTRFS_FT_DIR;
         let child_dir_index =
             Self::btrfs_require_inode_ref_index(&alloc, child.child_objectid, parent_oid, name)?;
@@ -38912,6 +39014,8 @@ impl OpenFs {
         // half-way through after the dir entries are already gone.
         let src = Self::btrfs_lookup_dir_entry(&alloc, parent_oid, name)?;
         let dst = Self::btrfs_lookup_dir_entry(&alloc, new_parent_oid, new_name)?;
+        Self::btrfs_refuse_subvol_link(&src)?;
+        Self::btrfs_refuse_subvol_link(&dst)?;
         let src_dir_index =
             Self::btrfs_require_inode_ref_index(&alloc, src.child_objectid, parent_oid, name)?;
         let dst_dir_index = Self::btrfs_require_inode_ref_index(
@@ -86923,6 +87027,108 @@ mod tests {
             reopened.read(&cx, found.ino, 0, 20_000).expect("read"),
             vec![0x5E_u8; 20_000]
         );
+    }
+
+    /// A nested-subvolume link (DIR_ITEM whose child key is a ROOT_ITEM) names
+    /// a subvolume id, not an inode of the tree being read. It used to be
+    /// resolved as an inode of the parent tree, so `lookup` returned whatever
+    /// inode shared that number (on a fresh mkfs the first subvolume is 256 —
+    /// the root directory itself) and rename/rmdir walked the wrong inode.
+    /// The link must present as its own empty directory, on the writable COW
+    /// path and on a read-only remount, and mutations through it must refuse
+    /// before touching the tree.
+    #[test]
+    fn btrfs_nested_subvolume_link_is_not_aliased_to_a_parent_tree_inode() {
+        let Some((fs, dev, _tmp, image)) = open_writable_btrfs_mkfs(256) else {
+            eprintln!("SKIP: btrfs-progs unavailable");
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let file = fs
+            .create(&cx, root, OsStr::new("f0"), 0o644, 0, 0)
+            .expect("create f0");
+        fs.mkdir(&cx, root, OsStr::new("empty"), 0o755, 0, 0)
+            .expect("mkdir empty");
+        let subvol_id = fs
+            .create_subvolume(&cx, root, b"nested", 0, 0)
+            .expect("create_subvolume");
+
+        let check_reads = |fs: &OpenFs, label: &str| {
+            let link = fs
+                .lookup(&cx, InodeNumber(1), OsStr::new("nested"))
+                .unwrap_or_else(|e| panic!("{label}: lookup nested: {e:?}"));
+            assert_eq!(
+                link.ino,
+                InodeNumber(BTRFS_SUBVOL_LINK_INO_BIT | subvol_id),
+                "{label}: the link gets its own inode, not objectid {subvol_id} of this tree"
+            );
+            assert_eq!(link.kind, FileType::Directory, "{label}");
+            assert_eq!(link.nlink, 1, "{label}");
+            let listed = fs.readdir(&cx, InodeNumber(1), 0).expect("readdir root");
+            let row = listed
+                .iter()
+                .find(|e| e.name == b"nested")
+                .unwrap_or_else(|| panic!("{label}: readdir lists nested"));
+            assert_eq!(row.ino, link.ino, "{label}: readdir and lookup agree");
+            let inside: Vec<Vec<u8>> = fs
+                .readdir(&cx, link.ino, 0)
+                .expect("readdir the link")
+                .into_iter()
+                .map(|e| e.name)
+                .collect();
+            assert_eq!(inside, vec![b".".to_vec(), b"..".to_vec()], "{label}");
+            assert!(
+                matches!(
+                    fs.lookup(&cx, link.ino, OsStr::new("f0")),
+                    Err(FfsError::NotFound(_))
+                ),
+                "{label}: the placeholder holds no names"
+            );
+            assert_eq!(
+                fs.getattr(&cx, link.ino).expect("getattr link").ino,
+                link.ino,
+                "{label}"
+            );
+        };
+        check_reads(&fs, "writable");
+
+        let eperm = |r: ffs_error::Result<()>, what: &str| {
+            let err = r.expect_err(what);
+            assert_eq!(err.to_errno(), libc::EPERM, "{what}: {err:?}");
+        };
+        eperm(fs.rmdir(&cx, root, OsStr::new("nested")), "rmdir nested");
+        eperm(
+            fs.rename(&cx, root, OsStr::new("nested"), root, OsStr::new("moved")),
+            "rename nested away",
+        );
+        eperm(
+            fs.rename(&cx, root, OsStr::new("empty"), root, OsStr::new("nested")),
+            "rename a dir onto nested",
+        );
+        assert!(
+            fs.lookup(&cx, root, OsStr::new("empty")).is_ok(),
+            "empty untouched"
+        );
+        assert!(
+            fs.lookup(&cx, root, OsStr::new("moved")).is_err(),
+            "no half rename"
+        );
+        assert_eq!(
+            fs.lookup(&cx, root, OsStr::new("f0")).expect("f0").ino,
+            file.ino
+        );
+
+        let _ = fs.flush_mvcc_to_device(&cx);
+        fs.btrfs_full_transaction_commit(&cx, "nested-subvol-link")
+            .expect("commit");
+        std::fs::write(&image, dev.snapshot_bytes()).expect("write image");
+        drop(fs);
+        if let Some((ok, output)) = run_btrfs_check(&image) {
+            assert!(ok, "btrfs check after refused mutations:\n{output}");
+        }
+        let ro = OpenFs::open_with_options(&cx, &image, &OpenOptions::default()).expect("open ro");
+        check_reads(&ro, "read-only");
     }
 
     /// bd-jctlm: btrfs only inlines files BELOW the sector boundary; a file whose
