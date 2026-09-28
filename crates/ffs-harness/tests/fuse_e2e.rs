@@ -19053,6 +19053,25 @@ fn fast_commit_crash_image_link_unlink_matches_kernel_bd_9m84h() {
     );
 }
 
+// bd-9m84h: fast-commit recovery of a rename within one directory (the kernel
+// writes DEL_ENTRY for the old name and ADD_ENTRY for the new one).
+#[test]
+fn fast_commit_crash_image_rename_matches_kernel_bd_9m84h() {
+    run_fc_kernel_scenario(
+        "fc_crash_image_rename_bd_9m84h",
+        &|dir| {
+            fs::write(dir.join("alpha"), b"alpha").unwrap();
+            fs::write(dir.join("gamma"), b"gamma").unwrap();
+        },
+        &|dir| {
+            fs::rename(dir.join("alpha"), dir.join("renamed")).expect("rename");
+            fc_fsynced_write(dir, "gamma", b" gamma grows", true);
+        },
+        &["gamma", "renamed"],
+        true,
+    );
+}
+
 // bd-9m84h: a fast commit that a later full commit subsumed. A directory
 // fsync makes the kernel commit the whole transaction, so the fast-commit
 // area holds the earlier cycle: FrankenFS must leave it unreplayed and still
@@ -19374,6 +19393,30 @@ fn btrfs_kernel_tree_log_removal_matches_kernel() {
                 .expect("fsync dir");
         },
         &["kept", "other"],
+    );
+}
+
+/// A rename within one directory, durable through the kernel's tree log: the
+/// directory is logged with its ranges (the old name goes) and the file with
+/// its new INODE_REF (the new name comes).
+#[test]
+fn btrfs_kernel_tree_log_rename_matches_kernel() {
+    run_btrfs_tree_log_scenario(
+        "btrfs_kernel_tree_log_rename_matches_kernel",
+        &|dir| {
+            fs::write(dir.join("base"), b"base").unwrap();
+            fs::write(dir.join("other"), b"other").unwrap();
+        },
+        &|dir| {
+            fs::rename(dir.join("base"), dir.join("renamed")).expect("rename");
+            fs::File::open(dir.join("renamed"))
+                .and_then(|f| f.sync_all())
+                .expect("fsync renamed");
+            fs::File::open(dir)
+                .and_then(|d| d.sync_all())
+                .expect("fsync dir");
+        },
+        &["other", "renamed"],
     );
 }
 
