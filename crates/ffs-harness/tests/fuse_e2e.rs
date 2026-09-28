@@ -19208,7 +19208,10 @@ fn run_fc_kernel_scenario(
 
     // Step 3: mount kernel ext4
     let output = Command::new("sudo")
-        .args(["-n", "mount", "-t", "ext4", "-o", "rw,noatime"])
+        // commit=600: the default 5 s journal commit could fire between the
+        // baseline and the fsyncs and make the changes a full commit instead
+        // of a fast one (seen as a flaky "must carry fast-commit transactions").
+        .args(["-n", "mount", "-t", "ext4", "-o", "rw,noatime,commit=600"])
         .arg(&loop_dev)
         .arg(&mnt)
         .output()
@@ -19228,7 +19231,14 @@ fn run_fc_kernel_scenario(
     let dir = mnt.join("testdir");
     fs::create_dir_all(&dir).unwrap();
     baseline(&dir);
-    let synced = Command::new("sync").output().expect("sync");
+    // syncfs of THIS filesystem only: a global sync from a scenario running in
+    // parallel would force a full commit on another scenario's mount between
+    // its fsyncs and its copy, and that scenario would see no fast commit.
+    let synced = Command::new("sync")
+        .arg("-f")
+        .arg(&dir)
+        .output()
+        .expect("sync");
     assert!(synced.status.success(), "baseline sync");
 
     // Step 5: FC-eligible changes, each made durable only by fsync.
@@ -19298,7 +19308,16 @@ fn run_fc_kernel_scenario(
         } else {
             fs::read(entry.path()).expect("kernel read")
         };
-        let nlink = u32::try_from(meta.nlink()).expect("nlink");
+        // A directory's link count is left out of the kernel comparison: the
+        // kernel's own fast-commit replay of a mkdir leaves the new directory
+        // at 1 and its parent one short (e2fsck on the kernel-recovered image:
+        // "Directories count wrong"). e2fsck -fn on FrankenFS's recovery,
+        // below, judges directory link counts instead.
+        let nlink = if meta.is_dir() {
+            0
+        } else {
+            u32::try_from(meta.nlink()).expect("nlink")
+        };
         kernel_view.insert(name, (bytes, nlink));
     }
     drop(guard);
@@ -19364,7 +19383,12 @@ fn run_fc_kernel_scenario(
             fs.read(&cx, attr.ino, 0, u32::try_from(attr.size).expect("fits"))
                 .expect("FrankenFS read")
         };
-        ffs_view.insert(name, (bytes, attr.nlink));
+        let nlink = if attr.kind == ffs_core::FileType::Directory {
+            0 // see the kernel view above
+        } else {
+            attr.nlink
+        };
+        ffs_view.insert(name, (bytes, nlink));
     }
     assert_eq!(
         ffs_view, kernel_view,
@@ -19511,7 +19535,12 @@ fn run_btrfs_tree_log_scenario(
     let dir = mnt.join("d");
     fs::create_dir_all(&dir).unwrap();
     baseline(&dir);
-    let synced = Command::new("sync").output().expect("sync");
+    // syncfs of this filesystem only (see run_fc_kernel_scenario).
+    let synced = Command::new("sync")
+        .arg("-f")
+        .arg(&dir)
+        .output()
+        .expect("sync");
     assert!(synced.status.success(), "baseline sync");
     changes(&dir);
     let crash_image = tmp.path().join("crash.btrfs");

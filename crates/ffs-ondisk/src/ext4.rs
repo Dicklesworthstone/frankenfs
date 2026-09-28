@@ -2107,19 +2107,14 @@ const INODE_CHECKSUM_LO_OFFSET: usize = 0x7C;
 /// Offset of `i_checksum_hi` within an ext4 inode (extended area, 2 bytes).
 const INODE_CHECKSUM_HI_OFFSET: usize = 0x82;
 
-/// Verify an inode's CRC32C checksum (metadata_csum mode).
-///
-/// `raw_inode` is the raw on-disk inode bytes (inode_size bytes).
-/// `csum_seed` comes from `Ext4Superblock::csum_seed()`.
-/// `ino` is the inode number.
-/// `inode_size` is from the superblock.
-#[allow(clippy::cast_possible_truncation)] // checksum is 32-bit
-pub fn verify_inode_checksum(
+/// An inode's CRC32C checksum (metadata_csum mode), computed over `raw_inode`
+/// with both checksum fields treated as zero.
+fn compute_inode_checksum(
     raw_inode: &[u8],
     csum_seed: u32,
     ino: u32,
     inode_size: u16,
-) -> Result<(), ParseError> {
+) -> Result<u32, ParseError> {
     let is = usize::from(inode_size);
     if raw_inode.len() < is || is < 128 {
         return Err(ParseError::InsufficientData {
@@ -2171,23 +2166,62 @@ pub fn verify_inode_checksum(
         }
     }
 
-    // Extract stored checksum (lo + hi)
-    let stored_lo = u32::from(read_le_u16(raw_inode, INODE_CHECKSUM_LO_OFFSET)?);
-    let stored_hi = if is >= INODE_CHECKSUM_HI_OFFSET + 2 {
-        // Need at least 130 bytes to read extra_isize at 0x80
-        let extra_isize = read_le_u16(raw_inode, 0x80)?;
-        let extra_end = 128 + usize::from(extra_isize);
-        if extra_end >= INODE_CHECKSUM_HI_OFFSET + 2 {
-            u32::from(read_le_u16(raw_inode, INODE_CHECKSUM_HI_OFFSET)?)
-        } else {
-            0
-        }
-    } else {
-        0
-    };
-    let stored = stored_lo | (stored_hi << 16);
+    Ok(csum)
+}
 
-    if csum != stored {
+/// Whether `raw_inode` has room for `i_checksum_hi` (per `i_extra_isize`).
+fn inode_has_checksum_hi(raw_inode: &[u8], inode_size: u16) -> Result<bool, ParseError> {
+    if usize::from(inode_size) < INODE_CHECKSUM_HI_OFFSET + 2 {
+        return Ok(false);
+    }
+    let extra_end = 128 + usize::from(read_le_u16(raw_inode, 0x80)?);
+    Ok(extra_end >= INODE_CHECKSUM_HI_OFFSET + 2)
+}
+
+/// Recompute and store an inode's checksum after its raw bytes were edited
+/// (e.g. a recovery that adjusts a link count in place).
+#[allow(clippy::cast_possible_truncation)] // checksum halves are 16-bit
+pub fn stamp_inode_checksum(
+    raw_inode: &mut [u8],
+    csum_seed: u32,
+    ino: u32,
+    inode_size: u16,
+) -> Result<(), ParseError> {
+    let csum = compute_inode_checksum(raw_inode, csum_seed, ino, inode_size)?;
+    raw_inode[INODE_CHECKSUM_LO_OFFSET..INODE_CHECKSUM_LO_OFFSET + 2]
+        .copy_from_slice(&(csum as u16).to_le_bytes());
+    if inode_has_checksum_hi(raw_inode, inode_size)? {
+        raw_inode[INODE_CHECKSUM_HI_OFFSET..INODE_CHECKSUM_HI_OFFSET + 2]
+            .copy_from_slice(&((csum >> 16) as u16).to_le_bytes());
+    }
+    Ok(())
+}
+
+/// Verify an inode's CRC32C checksum (metadata_csum mode).
+///
+/// `raw_inode` is the raw on-disk inode bytes (inode_size bytes).
+/// `csum_seed` comes from `Ext4Superblock::csum_seed()`.
+/// `ino` is the inode number.
+/// `inode_size` is from the superblock.
+pub fn verify_inode_checksum(
+    raw_inode: &[u8],
+    csum_seed: u32,
+    ino: u32,
+    inode_size: u16,
+) -> Result<(), ParseError> {
+    let csum = compute_inode_checksum(raw_inode, csum_seed, ino, inode_size)?;
+    let stored_lo = u32::from(read_le_u16(raw_inode, INODE_CHECKSUM_LO_OFFSET)?);
+    // Without an i_checksum_hi the checksum is only its low 16 bits, as in
+    // the kernel's ext4_inode_csum_verify ("calculated &= 0xFFFF"). Comparing
+    // all 32 bits rejected every valid 128-byte inode.
+    let (stored, calculated) = if inode_has_checksum_hi(raw_inode, inode_size)? {
+        let stored_hi = u32::from(read_le_u16(raw_inode, INODE_CHECKSUM_HI_OFFSET)?);
+        (stored_lo | (stored_hi << 16), csum)
+    } else {
+        (stored_lo, csum & 0xFFFF)
+    };
+
+    if calculated != stored {
         return Err(ParseError::InvalidField {
             field: "i_checksum",
             reason: "inode CRC32C mismatch",
@@ -12145,6 +12179,31 @@ mod tests {
         // Corrupt one byte and verify it fails
         raw[0x10] ^= 0x01;
         assert!(verify_inode_checksum(&raw, csum_seed, ino, inode_size).is_err());
+    }
+
+    /// An inode edited in place (a link count, as recovery does) verifies
+    /// again once restamped, for both the 128- and 256-byte layouts.
+    #[test]
+    fn stamp_inode_checksum_makes_an_edited_inode_verify() {
+        let csum_seed = ext4_chksum(!0u32, &[0x5A_u8; 16]);
+        for inode_size in [128_u16, 256] {
+            let mut raw = vec![0_u8; usize::from(inode_size)];
+            raw[0x00..0x02].copy_from_slice(&0o040_755_u16.to_le_bytes());
+            raw[0x1A..0x1C].copy_from_slice(&2_u16.to_le_bytes());
+            raw[0x64..0x68].copy_from_slice(&7_u32.to_le_bytes());
+            if inode_size > 128 {
+                raw[0x80..0x82].copy_from_slice(&32_u16.to_le_bytes());
+            }
+            stamp_inode_checksum(&mut raw, csum_seed, 13, inode_size).expect("stamp");
+            verify_inode_checksum(&raw, csum_seed, 13, inode_size).expect("stamped");
+            raw[0x1A..0x1C].copy_from_slice(&3_u16.to_le_bytes());
+            assert!(
+                verify_inode_checksum(&raw, csum_seed, 13, inode_size).is_err(),
+                "the edit invalidates the old checksum"
+            );
+            stamp_inode_checksum(&mut raw, csum_seed, 13, inode_size).expect("restamp");
+            verify_inode_checksum(&raw, csum_seed, 13, inode_size).expect("restamped");
+        }
     }
 
     fn set_bitmap_bit(bitmap: &mut [u8], bit: u32) {

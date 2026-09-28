@@ -8013,15 +8013,32 @@ impl OpenFs {
             match op {
                 ffs_journal::FcOperation::Create(dentry) => {
                     if self.verify_fast_commit_dentry_target(cx, dentry, "create") {
-                        if writes_allowed {
-                            self.fast_commit_init_new_dir(cx, dentry.ino, dentry.parent_ino)?;
-                        }
+                        let creates_a_dir = writes_allowed
+                            && self.fast_commit_init_new_dir(cx, dentry.ino, dentry.parent_ino)?;
+                        let adds_a_name =
+                            writes_allowed && !self.fast_commit_dentry_present(cx, dentry)?;
                         // A readable target alone does not recover its name.
                         if writes_allowed && !self.apply_fast_commit_add_dentry(cx, dentry)? {
                             return Err(FfsError::UnsupportedFeature(format!(
                                 "fast-commit CREATE recovery incomplete for inode {} in parent {}",
                                 dentry.ino, dentry.parent_ino
                             )));
+                        }
+                        // A new subdirectory's ".." is a link to its parent. The
+                        // kernel writes no INODE record for the parent here and
+                        // its own replay leaves the parent one short (e2fsck:
+                        // "ref count is 2, should be 3"); raise it — once, and
+                        // only if this replay added the name — unless a later
+                        // record of the parent carries its count.
+                        let later_parent_record = operations[index + 1..].iter().any(|later| {
+                            matches!(
+                                later,
+                                ffs_journal::FcOperation::InodeUpdate(ino, _)
+                                    if *ino == dentry.parent_ino
+                            )
+                        });
+                        if creates_a_dir && adds_a_name && !later_parent_record {
+                            self.raise_fast_commit_link(cx, dentry.parent_ino)?;
                         }
                         applied += 1;
                     }
@@ -8172,19 +8189,38 @@ impl OpenFs {
                 is_dir,
             )?;
         }
-        for op in operations {
-            if let ffs_journal::FcOperation::AddRange(range) = op
-                && live.contains_key(&range.ino)
-            {
-                changed |= ffs_alloc::claim_blocks(
-                    cx,
-                    &block_dev,
-                    &alloc.geo,
-                    &mut alloc.groups,
-                    BlockNumber(range.physical_block),
-                    range.len,
-                )? > 0;
+        // Every block each live inode now maps, as ext4_fc_set_bitmaps_and_
+        // counters marks them: its ADD_RANGE records AND what its recovered
+        // inode maps directly — a directory the fast commit created carries
+        // its block only in its INODE record.
+        let mut ranges: Vec<(u64, u32)> = operations
+            .iter()
+            .filter_map(|op| match op {
+                ffs_journal::FcOperation::AddRange(range) if live.contains_key(&range.ino) => {
+                    Some((range.physical_block, range.len))
+                }
+                _ => None,
+            })
+            .collect();
+        for &ino in live.keys() {
+            let inode = self.read_inode(cx, InodeNumber(u64::from(ino)))?;
+            if inode.flags & EXT4_EXTENTS_FL != 0 {
+                ranges.extend(
+                    self.collect_extents(cx, &inode)?
+                        .iter()
+                        .map(|extent| (extent.physical_start, u32::from(extent.actual_len()))),
+                );
             }
+        }
+        for (start, len) in ranges {
+            changed |= ffs_alloc::claim_blocks(
+                cx,
+                &block_dev,
+                &alloc.geo,
+                &mut alloc.groups,
+                BlockNumber(start),
+                len,
+            )? > 0;
         }
         if changed {
             // Same persistence as the DEL_RANGE / deleted-inode paths: the
@@ -8555,21 +8591,17 @@ impl OpenFs {
             })
     }
 
-    /// A fast-committed DEL_ENTRY that no later INODE record of the same inode
-    /// follows: the kernel writes none when the name was the file's last link,
-    /// and its replay (ext4_fc_replay_unlink) drops the link and, at zero,
-    /// frees the inode and its blocks. Without this the inode stays allocated
-    /// with nothing referring to it (e2fsck: "Unattached inode").
     /// A fast-committed CREATE of a directory: the kernel never wrote the new
     /// directory's block (only a full commit journals it), so its replay
     /// (`ext4_fc_replay_create` -> `ext4_init_new_dir`) writes a fresh first
     /// block holding "." and ".." before later CREATEs add entries to it. Do
     /// the same; without it the block is whatever the disk held and adding
     /// the directory's first entry fails ("invalid directory entry rec_len").
-    fn fast_commit_init_new_dir(&self, cx: &Cx, ino: u32, parent: u32) -> Result<(), FfsError> {
+    /// Returns whether the target was a directory.
+    fn fast_commit_init_new_dir(&self, cx: &Cx, ino: u32, parent: u32) -> Result<bool, FfsError> {
         let inode = self.read_inode(cx, InodeNumber(u64::from(ino)))?;
         if !inode.is_dir() {
-            return Ok(());
+            return Ok(false);
         }
         let first = self
             .collect_extents(cx, &inode)?
@@ -8595,6 +8627,35 @@ impl OpenFs {
             block = target.0,
             "fc_apply: new directory initialized"
         );
+        Ok(true)
+    }
+
+    /// Raise inode `ino`'s link count by one (a recovered subdirectory's "..").
+    fn raise_fast_commit_link(&self, cx: &Cx, ino: u32) -> Result<(), FfsError> {
+        let mut raw = self.recovery_read_inode_raw(cx, ino)?;
+        if raw.len() < 0x1C {
+            return Err(FfsError::Corruption {
+                block: 0,
+                detail: format!("inode {ino} record too short to hold a link count"),
+            });
+        }
+        let links = u16::from_le_bytes([raw[0x1A], raw[0x1B]]);
+        raw[0x1A..0x1C].copy_from_slice(&links.saturating_add(1).to_le_bytes());
+        self.restamp_recovery_inode(ino, &mut raw)?;
+        self.recovery_write_inode_raw(cx, ino, &raw)
+    }
+
+    /// Re-stamp the checksum of a raw inode record recovery edited in place.
+    /// (A fast-commit INODE record arrives with the kernel's valid checksum;
+    /// an edited one does not.)
+    fn restamp_recovery_inode(&self, ino: u32, raw: &mut [u8]) -> Result<(), FfsError> {
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        if sb.has_metadata_csum() {
+            ffs_ondisk::ext4::stamp_inode_checksum(raw, sb.csum_seed(), ino, sb.inode_size)
+                .map_err(|e| parse_to_ffs_error(&e))?;
+        }
         Ok(())
     }
 
@@ -8611,6 +8672,11 @@ impl OpenFs {
                 .is_some_and(|entry| entry.inode == dentry.ino))
     }
 
+    /// A fast-committed DEL_ENTRY that no later INODE record of the same inode
+    /// follows: the kernel writes none when the name was the file's last link,
+    /// and its replay (ext4_fc_replay_unlink) drops the link and, at zero,
+    /// frees the inode and its blocks. Without this the inode stays allocated
+    /// with nothing referring to it (e2fsck: "Unattached inode").
     fn drop_fast_commit_unlinked_link(&self, cx: &Cx, ino: u32) -> Result<(), FfsError> {
         let mut raw = self.recovery_read_inode_raw(cx, ino)?;
         if raw.len() < 0x1C {
@@ -8624,6 +8690,7 @@ impl OpenFs {
             return self.free_fast_commit_deleted_inode(cx, ino);
         }
         raw[0x1A..0x1C].copy_from_slice(&(links - 1).to_le_bytes());
+        self.restamp_recovery_inode(ino, &mut raw)?;
         self.recovery_write_inode_raw(cx, ino, &raw)
     }
 
