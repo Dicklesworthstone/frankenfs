@@ -19072,6 +19072,30 @@ fn fast_commit_crash_image_rename_matches_kernel_bd_9m84h() {
     );
 }
 
+// bd-9m84h: fast-commit recovery of a new directory holding a new file (new
+// directory inode, the parent's link count, the directory's own entries).
+#[test]
+fn fast_commit_crash_image_mkdir_matches_kernel_bd_9m84h() {
+    run_fc_kernel_scenario(
+        "fc_crash_image_mkdir_bd_9m84h",
+        &|dir| fs::write(dir.join("alpha"), b"alpha").unwrap(),
+        &|dir| {
+            // No directory fsync: that makes the kernel commit in full. The
+            // file's fsync fast-commits every tracked change, the new
+            // directory's entry included.
+            fs::create_dir(dir.join("sub")).expect("mkdir");
+            fc_fsynced_write(
+                &dir.join("sub"),
+                "inner",
+                b"inside the new directory",
+                false,
+            );
+        },
+        &["alpha", "sub"],
+        true,
+    );
+}
+
 // bd-9m84h: a fast commit that a later full commit subsumed. A directory
 // fsync makes the kernel commit the whole transaction, so the fast-commit
 // area holds the earlier cycle: FrankenFS must leave it unreplayed and still
@@ -19268,8 +19292,13 @@ fn run_fc_kernel_scenario(
     for entry in fs::read_dir(kmnt.join("testdir")).expect("kernel readdir") {
         let entry = entry.expect("kernel dirent");
         let name = entry.file_name().to_string_lossy().into_owned();
-        let bytes = fs::read(entry.path()).expect("kernel read");
-        let nlink = u32::try_from(entry.metadata().expect("kernel stat").nlink()).expect("nlink");
+        let meta = entry.metadata().expect("kernel stat");
+        let bytes = if meta.is_dir() {
+            Vec::new()
+        } else {
+            fs::read(entry.path()).expect("kernel read")
+        };
+        let nlink = u32::try_from(meta.nlink()).expect("nlink");
         kernel_view.insert(name, (bytes, nlink));
     }
     drop(guard);
@@ -19328,9 +19357,13 @@ fn run_fc_kernel_scenario(
         let attr = fs
             .lookup(&cx, testdir.ino, std::ffi::OsStr::new(&name))
             .expect("FrankenFS lookup");
-        let bytes = fs
-            .read(&cx, attr.ino, 0, u32::try_from(attr.size).expect("fits"))
-            .expect("FrankenFS read");
+        // A directory contributes its link count only.
+        let bytes = if attr.kind == ffs_core::FileType::Directory {
+            Vec::new()
+        } else {
+            fs.read(&cx, attr.ino, 0, u32::try_from(attr.size).expect("fits"))
+                .expect("FrankenFS read")
+        };
         ffs_view.insert(name, (bytes, attr.nlink));
     }
     assert_eq!(

@@ -8013,6 +8013,9 @@ impl OpenFs {
             match op {
                 ffs_journal::FcOperation::Create(dentry) => {
                     if self.verify_fast_commit_dentry_target(cx, dentry, "create") {
+                        if writes_allowed {
+                            self.fast_commit_init_new_dir(cx, dentry.ino, dentry.parent_ino)?;
+                        }
                         // A readable target alone does not recover its name.
                         if writes_allowed && !self.apply_fast_commit_add_dentry(cx, dentry)? {
                             return Err(FfsError::UnsupportedFeature(format!(
@@ -8557,6 +8560,44 @@ impl OpenFs {
     /// and its replay (ext4_fc_replay_unlink) drops the link and, at zero,
     /// frees the inode and its blocks. Without this the inode stays allocated
     /// with nothing referring to it (e2fsck: "Unattached inode").
+    /// A fast-committed CREATE of a directory: the kernel never wrote the new
+    /// directory's block (only a full commit journals it), so its replay
+    /// (`ext4_fc_replay_create` -> `ext4_init_new_dir`) writes a fresh first
+    /// block holding "." and ".." before later CREATEs add entries to it. Do
+    /// the same; without it the block is whatever the disk held and adding
+    /// the directory's first entry fails ("invalid directory entry rec_len").
+    fn fast_commit_init_new_dir(&self, cx: &Cx, ino: u32, parent: u32) -> Result<(), FfsError> {
+        let inode = self.read_inode(cx, InodeNumber(u64::from(ino)))?;
+        if !inode.is_dir() {
+            return Ok(());
+        }
+        let first = self
+            .collect_extents(cx, &inode)?
+            .into_iter()
+            .find(|extent| extent.logical_block == 0)
+            .ok_or_else(|| FfsError::Corruption {
+                block: 0,
+                detail: format!("fast-commit directory {ino} has no block at offset 0"),
+            })?;
+        let block_size = usize::try_from(self.block_size())
+            .map_err(|_| FfsError::Format("block size exceeds usize".into()))?;
+        let mut block = vec![0_u8; block_size];
+        ffs_dir::init_dir_block(&mut block, ino, parent, self.ext4_dir_reserved_tail())?;
+        self.stamp_ext4_dir_block(&mut block, ino, inode.generation);
+        let target = BlockNumber(first.physical_start);
+        self.direct_block_device_adapter()
+            .write_block(cx, target, &block)?;
+        self.ext4_file_data_block_cache.remove(&target);
+        self.ext4_base_block_cache.remove(&target);
+        debug!(
+            ino,
+            parent,
+            block = target.0,
+            "fc_apply: new directory initialized"
+        );
+        Ok(())
+    }
+
     /// Whether `dentry`'s name still names its inode in its parent.
     fn fast_commit_dentry_present(
         &self,
