@@ -232,6 +232,46 @@ jobs:
       - name: Run smoke E2E
         run: ./scripts/e2e/ffs_smoke.sh
 
+      # The xfstests steps fail closed unless the prerequisite preflight
+      # (scripts/e2e/ffs_xfstests_preflight_e2e.sh) finds a built xfstests
+      # tree, xfs/libaio headers, fsstress, FUSE and writable TEST_DIR /
+      # SCRATCH_MNT. Provide them for real instead of relaxing the gate. The
+      # tag is pinned so the curated subset is checked against a fixed tree.
+      - name: Install xfstests build prerequisites
+        run: |
+          sudo apt-get install -y \
+            build-essential autoconf automake libtool libtool-bin pkg-config \
+            uuid-dev libacl1-dev libattr1-dev libaio-dev libgdbm-dev \
+            libgdbm-compat-dev liburing-dev libcap-dev xfslibs-dev xfsprogs \
+            fuse3 acl attr psmisc
+
+      - name: Cache xfstests build
+        id: xfstests-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/xfstests-dev
+          key: xfstests-dev-v2026.03.20-${{ runner.os }}-v1
+
+      - name: Build xfstests
+        if: steps.xfstests-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v2026.03.20 \
+            https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git ~/xfstests-dev
+          make -C ~/xfstests-dev -j"$(nproc)"
+
+      - name: Expose xfstests tree and scratch directories
+        run: |
+          set -euo pipefail
+          test -x ~/xfstests-dev/check
+          test -x ~/xfstests-dev/ltp/fsstress
+          mkdir -p "$RUNNER_TEMP/xfstests/test" "$RUNNER_TEMP/xfstests/scratch"
+          {
+            echo "XFSTESTS_DIR=$HOME/xfstests-dev"
+            echo "TEST_DIR=$RUNNER_TEMP/xfstests/test"
+            echo "SCRATCH_MNT=$RUNNER_TEMP/xfstests/scratch"
+          } >>"$GITHUB_ENV"
+
       - name: Run xfstests subset planning (bd-32yn.7)
         env:
           XFSTESTS_MODE: plan
