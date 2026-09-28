@@ -2768,7 +2768,7 @@ All 63 libfuzzer targets are in `fuzz/fuzz_targets/`. Each one is driven by `car
 |---|---|
 | `fuzz_btrfs_metadata` | Superblock + B-tree header decoding |
 | `fuzz_btrfs_verify_superblock_checksum` | Superblock CRC32C validation |
-| `fuzz_btrfs_tree_items` | Declared btrfs item-type constants in B-tree leaves (22 currently) |
+| `fuzz_btrfs_tree_items` | Declared btrfs item-type constants in B-tree leaves (24 currently) |
 | `fuzz_btrfs_tree_log` | Tree-log replay (`replay_tree_log` over synthesized log trees) |
 | `fuzz_btrfs_chunk_mapping` | `sys_chunk_array` + chunk-tree resolution |
 | `fuzz_btrfs_raid_profile` | Single / DUP / RAID0/1/5/6/10 stripe selection |
