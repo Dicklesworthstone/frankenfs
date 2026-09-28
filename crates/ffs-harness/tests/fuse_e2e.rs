@@ -19477,6 +19477,55 @@ fn btrfs_kernel_tree_log_rename_matches_kernel() {
     );
 }
 
+/// A rename across directories, durable through the kernel's tree log: the
+/// file's new INODE_REF names the destination directory, and the source
+/// directory's logged ranges drop the old name.
+#[test]
+fn btrfs_kernel_tree_log_cross_dir_rename_matches_kernel() {
+    run_btrfs_tree_log_scenario(
+        "btrfs_kernel_tree_log_cross_dir_rename_matches_kernel",
+        &|dir| {
+            fs::create_dir(dir.join("src")).unwrap();
+            fs::create_dir(dir.join("dst")).unwrap();
+            fs::write(dir.join("src/moved"), b"moved across directories").unwrap();
+            fs::write(dir.join("src/stays"), b"stays").unwrap();
+        },
+        &|dir| {
+            fs::rename(dir.join("src/moved"), dir.join("dst/moved")).expect("rename");
+            fs::File::open(dir.join("dst/moved"))
+                .and_then(|f| f.sync_all())
+                .expect("fsync moved");
+        },
+        &["dst/", "dst/moved", "src/", "src/stays"],
+    );
+}
+
+/// Hard links beyond what one INODE_REF item holds: with long names the kernel
+/// spills the extra names into INODE_EXTREF items (extref is a mkfs default),
+/// and the tree log carries them. Replay must give every name its entry.
+#[test]
+fn btrfs_kernel_tree_log_extref_links_match_kernel() {
+    const LINKS: usize = 120;
+    let link_name = |i: usize| format!("{i:03}{}", "x".repeat(200));
+    let mut expected: Vec<String> = (0..LINKS).map(link_name).collect();
+    expected.push("target".to_owned());
+    expected.sort();
+    let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+    run_btrfs_tree_log_scenario(
+        "btrfs_kernel_tree_log_extref_links_match_kernel",
+        &|dir| fs::write(dir.join("target"), b"one inode, many names").unwrap(),
+        &|dir| {
+            for i in 0..LINKS {
+                fs::hard_link(dir.join("target"), dir.join(link_name(i))).expect("link");
+            }
+            fs::File::open(dir.join("target"))
+                .and_then(|f| f.sync_all())
+                .expect("fsync target");
+        },
+        &expected,
+    );
+}
+
 /// A kernel btrfs crash image whose last changes are durable only through the
 /// kernel's tree log (`baseline`, a sync, then `changes` made durable by fsync;
 /// `commit=600` so no transaction commit intervenes). The kernel recovers one
@@ -19597,14 +19646,52 @@ fn run_btrfs_tree_log_scenario(
         "kernel recovery mount: {}",
         String::from_utf8_lossy(&mounted.stderr)
     );
-    let mut kernel_view = std::collections::BTreeMap::new();
-    for entry in fs::read_dir(kmnt.join("d")).expect("kernel readdir") {
-        let entry = entry.expect("kernel dirent");
-        kernel_view.insert(
-            entry.file_name().to_string_lossy().into_owned(),
-            fs::read(entry.path()).expect("kernel read"),
-        );
+    // Both views are the tree under `d`: relative paths, a directory as
+    // "name/" with no bytes, a file with its contents.
+    fn kernel_tree(
+        dir: &Path,
+        prefix: &str,
+        view: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    ) {
+        for entry in fs::read_dir(dir).expect("kernel readdir") {
+            let entry = entry.expect("kernel dirent");
+            let name = format!("{prefix}{}", entry.file_name().to_string_lossy());
+            if entry.file_type().expect("kernel file type").is_dir() {
+                view.insert(format!("{name}/"), Vec::new());
+                kernel_tree(&entry.path(), &format!("{name}/"), view);
+            } else {
+                view.insert(name, fs::read(entry.path()).expect("kernel read"));
+            }
+        }
     }
+    fn ffs_tree(
+        cx: &Cx,
+        fs: &OpenFs,
+        dir: InodeNumber,
+        prefix: &str,
+        view: &mut std::collections::BTreeMap<String, Vec<u8>>,
+    ) {
+        for entry in readdir_all(cx, fs, dir) {
+            let name = entry.name_str();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let attr = fs
+                .lookup(cx, dir, std::ffi::OsStr::new(&name))
+                .unwrap_or_else(|e| panic!("FrankenFS lookup {prefix}{name}: {e}"));
+            if attr.kind == ffs_core::FileType::Directory {
+                view.insert(format!("{prefix}{name}/"), Vec::new());
+                ffs_tree(cx, fs, attr.ino, &format!("{prefix}{name}/"), view);
+            } else {
+                let bytes = fs
+                    .read(cx, attr.ino, 0, u32::try_from(attr.size).expect("fits"))
+                    .unwrap_or_else(|e| panic!("FrankenFS read {prefix}{name}: {e}"));
+                view.insert(format!("{prefix}{name}"), bytes);
+            }
+        }
+    }
+    let mut kernel_view = std::collections::BTreeMap::new();
+    kernel_tree(&kmnt.join("d"), "", &mut kernel_view);
     drop(oracle);
     assert_eq!(
         kernel_view.keys().map(String::as_str).collect::<Vec<_>>(),
@@ -19619,19 +19706,7 @@ fn run_btrfs_tree_log_scenario(
         .lookup(&cx, InodeNumber(1), std::ffi::OsStr::new("d"))
         .expect("lookup d");
     let mut ffs_view = std::collections::BTreeMap::new();
-    for entry in readdir_all(&cx, &fs, d.ino) {
-        let name = entry.name_str();
-        if name == "." || name == ".." {
-            continue;
-        }
-        let attr = fs
-            .lookup(&cx, d.ino, std::ffi::OsStr::new(&name))
-            .unwrap_or_else(|e| panic!("FrankenFS lookup {name}: {e}"));
-        let bytes = fs
-            .read(&cx, attr.ino, 0, u32::try_from(attr.size).expect("fits"))
-            .unwrap_or_else(|e| panic!("FrankenFS read {name}: {e}"));
-        ffs_view.insert(name, bytes);
-    }
+    ffs_tree(&cx, &fs, d.ino, "", &mut ffs_view);
     assert_eq!(
         ffs_view, kernel_view,
         "{scenario}: FrankenFS's view of a kernel tree-log crash image must equal the kernel's \
