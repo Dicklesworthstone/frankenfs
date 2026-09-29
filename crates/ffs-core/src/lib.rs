@@ -1774,12 +1774,14 @@ pub struct ExternalJournalInfo {
     pub journal_max_len: u32,
 }
 
-/// FS-tree directory entries a kernel btrfs tree log removed: DIR_INDEX keys
-/// inside a logged range that the log lacks, and those entries' names, which
-/// the overlay also strips from their directory's DIR_ITEM buckets.
+/// FS-tree items a kernel btrfs tree log removed: DIR_INDEX keys inside a
+/// logged range that the log lacks, the DIR_INDEX and INODE_REF keys of a
+/// logged inode's names the log no longer carries, and the removed entries'
+/// names, which the overlay also strips from their directory's DIR_ITEM
+/// buckets.
 #[derive(Debug, Default)]
 struct BtrfsTreeLogHidden {
-    index_keys: Vec<BtrfsKey>,
+    keys: Vec<BtrfsKey>,
     /// (directory, name)
     names: Vec<(u64, Vec<u8>)>,
 }
@@ -6552,7 +6554,7 @@ impl OpenFs {
             }
         }
 
-        if !fs.btrfs_tree_log_dir_ranges.is_empty() {
+        if !fs.btrfs_tree_log_items.is_empty() {
             fs.btrfs_tree_log_hidden = fs.resolve_btrfs_tree_log_removals(cx)?;
         }
 
@@ -12736,7 +12738,7 @@ impl OpenFs {
                 {
                     continue;
                 }
-                hidden.index_keys.push(item.key);
+                hidden.keys.push(item.key);
                 for entry in parse_dir_items(&item.data).map_err(|e| parse_to_ffs_error(&e))? {
                     if !logged_names.contains(&entry.name) {
                         hidden.names.push((range.dir, entry.name));
@@ -12744,23 +12746,87 @@ impl OpenFs {
                 }
             }
         }
-        if !hidden.index_keys.is_empty() {
+
+        // The kernel's `unlink_old_inode_refs`: a logged inode's log carries
+        // every name it still has, so a committed INODE_REF name the log lacks
+        // was unlinked — how a rename into another directory drops the old
+        // name, which no logged range of the old directory need cover.
+        let mut logged_inodes: Vec<u64> = self
+            .btrfs_tree_log_items
+            .iter()
+            .filter(|item| item.key.item_type == BTRFS_ITEM_INODE_REF)
+            .map(|item| item.key.objectid)
+            .collect();
+        logged_inodes.sort_unstable();
+        logged_inodes.dedup();
+        for ino in logged_inodes {
+            let lo = BtrfsKey {
+                objectid: ino,
+                item_type: BTRFS_ITEM_INODE_REF,
+                offset: 0,
+            };
+            let hi = BtrfsKey {
+                objectid: ino,
+                item_type: BTRFS_ITEM_INODE_REF + 1,
+                offset: 0,
+            };
+            for committed in self.walk_btrfs_tree_range(cx, root, lo, hi)? {
+                let parent = committed.key.offset;
+                let logged = self
+                    .btrfs_tree_log_items
+                    .iter()
+                    .find(|item| item.key == committed.key);
+                let logged_names: Vec<Vec<u8>> = logged
+                    .and_then(|item| ffs_btrfs::parse_inode_refs(&item.data).ok())
+                    .unwrap_or_default()
+                    .into_iter()
+                    .map(|r| r.name)
+                    .collect();
+                if logged.is_none() {
+                    hidden.keys.push(committed.key);
+                }
+                let refs = ffs_btrfs::parse_inode_refs(&committed.data)
+                    .map_err(|e| parse_to_ffs_error(&e))?;
+                for r in refs {
+                    if logged_names.contains(&r.name) {
+                        continue;
+                    }
+                    let index_key = BtrfsKey {
+                        objectid: parent,
+                        item_type: BTRFS_ITEM_DIR_INDEX,
+                        offset: r.index,
+                    };
+                    // A logged DIR_INDEX at that key re-adds another name there.
+                    if !self
+                        .btrfs_tree_log_items
+                        .iter()
+                        .any(|item| item.key == index_key)
+                    {
+                        hidden.keys.push(index_key);
+                    }
+                    hidden.names.push((parent, r.name));
+                }
+            }
+        }
+
+        if !hidden.keys.is_empty() {
             info!(
-                removed = hidden.index_keys.len(),
+                removed = hidden.keys.len(),
                 "btrfs tree-log removals hidden from the read view"
             );
         }
         Ok(hidden)
     }
 
-    /// Hide what the kernel tree log removed: the DIR_INDEX entries, and their
-    /// names in the directory's DIR_ITEM buckets (an emptied bucket goes).
+    /// Hide what the kernel tree log removed: the DIR_INDEX and INODE_REF
+    /// items, and the names in their directory's DIR_ITEM buckets (an emptied
+    /// bucket goes).
     fn btrfs_hide_tree_log_removals(&self, items: &mut Vec<BtrfsLeafEntry>) {
         let hidden = &self.btrfs_tree_log_hidden;
-        if hidden.index_keys.is_empty() && hidden.names.is_empty() {
+        if hidden.keys.is_empty() && hidden.names.is_empty() {
             return;
         }
-        items.retain(|item| !hidden.index_keys.contains(&item.key));
+        items.retain(|item| !hidden.keys.contains(&item.key));
         for item in items.iter_mut() {
             if item.key.item_type != BTRFS_ITEM_DIR_ITEM
                 || !hidden

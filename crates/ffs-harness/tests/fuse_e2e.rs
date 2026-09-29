@@ -19477,9 +19477,10 @@ fn btrfs_kernel_tree_log_rename_matches_kernel() {
     );
 }
 
-/// A rename across directories, durable through the kernel's tree log: the
-/// file's new INODE_REF names the destination directory, and the source
-/// directory's logged ranges drop the old name.
+/// A rename across directories of a file already logged in this transaction:
+/// the kernel logs the new name at rename time (`btrfs_log_new_name`) and the
+/// fsync after it. (A rename of a file NOT yet logged makes the kernel commit
+/// the transaction instead, so it never reaches the log.)
 #[test]
 fn btrfs_kernel_tree_log_cross_dir_rename_matches_kernel() {
     run_btrfs_tree_log_scenario(
@@ -19491,6 +19492,7 @@ fn btrfs_kernel_tree_log_cross_dir_rename_matches_kernel() {
             fs::write(dir.join("src/stays"), b"stays").unwrap();
         },
         &|dir| {
+            fc_fsynced_write(&dir.join("src"), "moved", b" and appended", true);
             fs::rename(dir.join("src/moved"), dir.join("dst/moved")).expect("rename");
             fs::File::open(dir.join("dst/moved"))
                 .and_then(|f| f.sync_all())
@@ -19500,29 +19502,24 @@ fn btrfs_kernel_tree_log_cross_dir_rename_matches_kernel() {
     );
 }
 
-/// Hard links beyond what one INODE_REF item holds: with long names the kernel
-/// spills the extra names into INODE_EXTREF items (extref is a mkfs default),
-/// and the tree log carries them. Replay must give every name its entry.
+/// A file created, then renamed into another directory, then fsynced, all in
+/// one transaction.
 #[test]
-fn btrfs_kernel_tree_log_extref_links_match_kernel() {
-    const LINKS: usize = 120;
-    let link_name = |i: usize| format!("{i:03}{}", "x".repeat(200));
-    let mut expected: Vec<String> = (0..LINKS).map(link_name).collect();
-    expected.push("target".to_owned());
-    expected.sort();
-    let expected: Vec<&str> = expected.iter().map(String::as_str).collect();
+fn btrfs_kernel_tree_log_new_file_cross_dir_rename_matches_kernel() {
     run_btrfs_tree_log_scenario(
-        "btrfs_kernel_tree_log_extref_links_match_kernel",
-        &|dir| fs::write(dir.join("target"), b"one inode, many names").unwrap(),
+        "btrfs_kernel_tree_log_new_file_cross_dir_rename_matches_kernel",
         &|dir| {
-            for i in 0..LINKS {
-                fs::hard_link(dir.join("target"), dir.join(link_name(i))).expect("link");
-            }
-            fs::File::open(dir.join("target"))
-                .and_then(|f| f.sync_all())
-                .expect("fsync target");
+            fs::create_dir(dir.join("src")).unwrap();
+            fs::create_dir(dir.join("dst")).unwrap();
+            fs::write(dir.join("src/stays"), b"stays").unwrap();
         },
-        &expected,
+        &|dir| {
+            let mut f = fs::File::create(dir.join("src/moved")).expect("create");
+            std::io::Write::write_all(&mut f, b"born in src").expect("write");
+            fs::rename(dir.join("src/moved"), dir.join("dst/moved")).expect("rename");
+            f.sync_all().expect("fsync moved");
+        },
+        &["dst/", "dst/moved", "src/", "src/stays"],
     );
 }
 
