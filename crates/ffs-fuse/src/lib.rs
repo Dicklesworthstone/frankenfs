@@ -4061,38 +4061,41 @@ impl ReaddirplusAttrMemo {
 // references for no behavioural or readability gain, so the lint is answered
 // here rather than obeyed (bd-g9l54). If this type ever becomes public, or
 // gains a positional constructor, do the refactor instead of widening this.
-/// Per-inode live open-handle counts (bd-90aey orphan-on-unlink).
+/// The kernel's lookup count per inode (bd-90aey orphan-on-unlink).
 ///
-/// The FUSE adapter owns handle lifetimes: the kernel sends exactly one
-/// `OPEN`/`CREATE` per open instance and exactly one `RELEASE` when the last
-/// descriptor from that instance closes. Counting those pairs per inode gives
-/// the transport-side pin count that `unlink` consults (through the installed
-/// oracle) to decide between immediate reclaim and orphan deferral, and that
-/// `release` uses to finalize a deferred reclaim at the last close.
+/// Every entry reply (LOOKUP, CREATE, MKNOD, MKDIR, SYMLINK, LINK, and each
+/// READDIRPLUS entry other than `.`/`..`) takes one kernel reference, and
+/// FORGET/BATCH_FORGET return them. While the count is non-zero the kernel
+/// may still reach the inode — through an open fd, a cwd, an mmap — even after
+/// its last name is gone, so an unlinked inode must stay alive until FORGET
+/// brings the count to zero. This replaced counting OPEN/RELEASE, which never
+/// arrive once zero-message open is negotiated (the default), leaving every
+/// open-then-unlinked inode to be freed under its open fd.
 ///
 /// Clones share one counter map: the oracle closure installed into `FsOps`
 /// and the `FuseInner` field must observe the same state.
 #[derive(Clone, Default)]
-struct OpenRefcounts {
+struct LookupRefcounts {
     counts: Arc<Mutex<std::collections::HashMap<u64, u64>>>,
 }
 
-impl OpenRefcounts {
+impl LookupRefcounts {
     fn retain(&self, ino: u64) {
-        let mut counts = self.counts.lock().expect("open refcounts poisoned");
+        let mut counts = self.counts.lock().expect("lookup refcounts poisoned");
         *counts.entry(ino).or_insert(0) += 1;
     }
 
-    /// Drop one handle reference; returns `true` when the last handle closed.
-    fn release(&self, ino: u64) -> bool {
-        let mut counts = self.counts.lock().expect("open refcounts poisoned");
+    /// Return `nlookup` kernel references; `true` when the count reached zero.
+    fn forget(&self, ino: u64, nlookup: u64) -> bool {
+        let mut counts = self.counts.lock().expect("lookup refcounts poisoned");
         match counts.entry(ino) {
             std::collections::hash_map::Entry::Occupied(mut slot) => {
-                *slot.get_mut() -= 1;
-                if *slot.get() == 0 {
+                let left = slot.get().saturating_sub(nlookup);
+                if left == 0 {
                     slot.remove();
                     true
                 } else {
+                    *slot.get_mut() = left;
                     false
                 }
             }
@@ -4103,7 +4106,7 @@ impl OpenRefcounts {
     fn count(&self, ino: u64) -> u64 {
         self.counts
             .lock()
-            .expect("open refcounts poisoned")
+            .expect("lookup refcounts poisoned")
             .get(&ino)
             .copied()
             .unwrap_or(0)
@@ -4155,9 +4158,10 @@ struct FuseInner {
     inode_locks: Arc<FuseInodeLocks>,
     /// bd-2i2ez: stage a run of WRITEs into one MVCC transaction. Default OFF.
     writeback: WritebackBatch,
-    /// bd-90aey: per-inode open-handle counts feeding the unlink orphan oracle
-    /// and the last-close finalize. Clones share one map.
-    open_refcounts: OpenRefcounts,
+    /// bd-90aey: the kernel's per-inode lookup counts, feeding the orphan
+    /// oracle (unlink/rmdir/rename-overwrite) and the finalize at the last
+    /// FORGET. Clones share one map.
+    lookup_refcounts: LookupRefcounts,
 }
 
 impl FuseInner {
@@ -5509,14 +5513,14 @@ fn check_access_permission(
 }
 
 impl FrankenFuse {
-    /// Finalize a deferred unlink reclaim when this was the last open handle
-    /// (bd-90aey orphan-on-unlink).
+    /// Return `nlookup` kernel references to `ino`, and finalize a deferred
+    /// reclaim when that was the last one (bd-90aey orphan-on-unlink).
     ///
-    /// Called from `release` after the reply. Best-effort: a failed finalize
-    /// leaves the inode on the on-disk orphan list, where mount-time recovery
-    /// reclaims it — the same fallback the kernel's orphan facility provides.
-    fn finalize_if_last_handle(&self, ino: u64) {
-        if !self.inner.open_refcounts.release(ino) {
+    /// Called from FORGET/BATCH_FORGET. Best-effort: a failed finalize leaves
+    /// the inode on the on-disk orphan list, where mount-time recovery reclaims
+    /// it — the same fallback the kernel's orphan facility provides.
+    fn forget_and_finalize(&self, ino: u64, nlookup: u64) {
+        if !self.inner.lookup_refcounts.forget(ino, nlookup) {
             return;
         }
         let cx = Self::cx_for_request();
@@ -5525,7 +5529,10 @@ impl FrankenFuse {
             &mut RequestScope::empty(),
             InodeNumber(ino),
         ) {
-            Ok(true) => debug!(ino, "reclaimed unlinked inode after final release"),
+            Ok(true) => debug!(
+                ino,
+                "reclaimed unlinked inode after the last kernel reference"
+            ),
             Ok(false) => {}
             Err(error) => warn!(ino, %error, "deferred unlink reclaim failed"),
         }
@@ -5871,7 +5878,7 @@ impl Filesystem for FrankenFuse {
         }
     }
 
-    fn forget(&mut self, _req: &Request<'_>, ino: u64, _nlookup: u64) {
+    fn forget(&mut self, _req: &Request<'_>, ino: u64, nlookup: u64) {
         // bd-i353e: a FORGET is a boundary crossing. It opens no request scope, so
         // before this it was invisible to every counter including requests_total.
         self.inner.metrics.record_forget_nodes(1);
@@ -5885,6 +5892,7 @@ impl Filesystem for FrankenFuse {
         // and missed this seam.
         self.inner.missing_capability_xattr.forget(inode);
         self.inner.readdirplus_attr_memo.forget(inode);
+        self.forget_and_finalize(ino, nlookup);
     }
 
     fn batch_forget(&mut self, _req: &Request<'_>, nodes: &[fuse_forget_one]) {
@@ -5900,6 +5908,7 @@ impl Filesystem for FrankenFuse {
             self.inner.access_predictor.invalidate_inode(inode);
             self.inner.missing_capability_xattr.forget(inode);
             self.inner.readdirplus_attr_memo.forget(inode);
+            self.forget_and_finalize(node.nodeid, node.nlookup);
         }
     }
 
@@ -6050,7 +6059,6 @@ impl Filesystem for FrankenFuse {
             self.inner.ops.open(cx, scope, InodeNumber(ino), flags)
         }) {
             Ok((fh, open_flags)) => {
-                self.inner.open_refcounts.retain(ino);
                 reply.opened(fh, Self::kernel_open_flags(flags, open_flags));
             }
             Err(e) => {
@@ -6336,6 +6344,11 @@ impl Filesystem for FrankenFuse {
                     if full {
                         break;
                     }
+                    // An entry the reply carried takes a kernel lookup
+                    // reference, except "." and ".." (bd-90aey).
+                    if entry.name != b"." && entry.name != b".." {
+                        self.inner.lookup_refcounts.retain(entry.ino.0);
+                    }
                 }
                 // bd-xfe7z: teach the next call how many entries this reply
                 // actually held. This is the whole bound: it is measured, not
@@ -6418,6 +6431,7 @@ impl Filesystem for FrankenFuse {
             Ok(attr)
         }) {
             Ok(attr) => {
+                self.inner.lookup_refcounts.retain(attr.ino.0);
                 reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
                 self.notify_created_entry_invalidation(parent, name);
                 self.notify_parent_invalidation(parent);
@@ -6639,6 +6653,7 @@ impl Filesystem for FrankenFuse {
     ) {
         match self.dispatch_mknod(parent, name, mode, rdev, req.uid(), req.gid()) {
             Ok(attr) => {
+                self.inner.lookup_refcounts.retain(attr.ino.0);
                 reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
                 self.notify_created_entry_invalidation(parent, name);
                 self.notify_parent_invalidation(parent);
@@ -6670,6 +6685,7 @@ impl Filesystem for FrankenFuse {
     ) {
         match self.dispatch_mkdir(parent, name, mode as u16, req.uid(), req.gid()) {
             Ok(attr) => {
+                self.inner.lookup_refcounts.retain(attr.ino.0);
                 reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
                 self.notify_created_entry_invalidation(parent, name);
                 self.notify_parent_invalidation(parent);
@@ -6816,6 +6832,7 @@ impl Filesystem for FrankenFuse {
             Ok(attr)
         }) {
             Ok(attr) => {
+                self.inner.lookup_refcounts.retain(attr.ino.0);
                 reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
                 self.notify_created_entry_invalidation(newparent, newname);
                 self.notify_parent_invalidation(newparent);
@@ -7133,11 +7150,6 @@ impl Filesystem for FrankenFuse {
                 );
             }
         }
-        // bd-90aey: run after the reply either way — the kernel never resends
-        // RELEASE, so the handle is gone from its view even if the backend
-        // flush failed. When this was the last handle for an unlinked inode,
-        // reclaim what unlink deferred.
-        self.finalize_if_last_handle(ino);
     }
 
     fn fsync(&mut self, _req: &Request<'_>, ino: u64, fh: u64, datasync: bool, reply: ReplyEmpty) {
@@ -7312,7 +7324,7 @@ impl Filesystem for FrankenFuse {
             Ok(attr)
         }) {
             Ok(attr) => {
-                self.inner.open_refcounts.retain(attr.ino.0);
+                self.inner.lookup_refcounts.retain(attr.ino.0);
                 reply.created(&ATTR_TTL, &to_file_attr(&attr), attr.generation, 0, 0);
                 self.notify_created_entry_invalidation(parent, name);
                 self.notify_parent_invalidation(parent);
@@ -7352,7 +7364,10 @@ impl FrankenFuse {
         match self.with_request_scope(&cx, RequestOp::Lookup, |cx, scope| {
             self.inner.ops.lookup(cx, scope, InodeNumber(parent), name)
         }) {
-            Ok(attr) => reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation),
+            Ok(attr) => {
+                self.inner.lookup_refcounts.retain(attr.ino.0);
+                reply.entry(&ATTR_TTL, &to_file_attr(&attr), attr.generation);
+            }
             Err(FfsError::NotFound(_)) => {
                 if crate::entry_invalidation_enabled()
                     && let Some(notifier) = self.kernel_notifier()
@@ -8474,7 +8489,7 @@ mod tests {
             inode_locks: Arc::new(FuseInodeLocks::default()),
             writeback: WritebackBatch::from_env(),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
-            open_refcounts: OpenRefcounts::default(),
+            lookup_refcounts: LookupRefcounts::default(),
         };
         let ino = InodeNumber(404);
         let mut stale = make_test_attr(FfsFileType::RegularFile, 4096);
@@ -8515,7 +8530,7 @@ mod tests {
             inode_locks: Arc::new(FuseInodeLocks::default()),
             writeback: WritebackBatch::from_env(),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
-            open_refcounts: OpenRefcounts::default(),
+            lookup_refcounts: LookupRefcounts::default(),
         };
         let fuse = FrankenFuse {
             inner: Arc::new(inner),
@@ -9711,7 +9726,7 @@ mod tests {
             readdirplus_attr_memo: ReaddirplusAttrMemo::from_env(),
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
-            open_refcounts: OpenRefcounts::default(),
+            lookup_refcounts: LookupRefcounts::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
             writeback: WritebackBatch::from_env(),
         };
@@ -22022,7 +22037,7 @@ mod tests {
             ),
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
-            open_refcounts: OpenRefcounts::default(),
+            lookup_refcounts: LookupRefcounts::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
             writeback: WritebackBatch::from_env(),
         });
@@ -24069,7 +24084,7 @@ AllowOther"#;
             ),
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
-            open_refcounts: OpenRefcounts::default(),
+            lookup_refcounts: LookupRefcounts::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
             writeback: WritebackBatch::from_env(),
         };

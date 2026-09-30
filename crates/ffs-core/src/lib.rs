@@ -1855,6 +1855,12 @@ pub struct OpenFs {
     /// (bd-90aey orphan-on-unlink). Installed by the FUSE adapter at mount
     /// time; empty in library mode, where unlink keeps immediate reclaim.
     ext4_open_handle_oracle: std::sync::OnceLock<crate::vfs::OpenHandleOracle>,
+    /// Inodes this mount orphaned because the oracle reported them pinned
+    /// (bd-90aey). `finalize_unlinked_inode` runs on every last kernel
+    /// reference, so it answers "not ours" from this set instead of taking
+    /// the allocation lock and walking the on-disk orphan list each time.
+    /// Orphans from an earlier mount are mount-time recovery's, not this set's.
+    ext4_pending_orphans: Mutex<rustc_hash::FxHashSet<u64>>,
     /// Block device for I/O operations.
     dev: Arc<dyn ByteDevice>,
     /// Explicitly attached btrfs devices; writable mounts use the single-device path.
@@ -6432,6 +6438,7 @@ impl OpenFs {
             jbd2_crash_after_commit_sync: AtomicBool::new(false),
             ext4_orphan_recovery_error: None,
             ext4_open_handle_oracle: std::sync::OnceLock::new(),
+            ext4_pending_orphans: Mutex::new(rustc_hash::FxHashSet::default()),
             dev,
             btrfs_devices,
             mvcc_store,
@@ -7525,6 +7532,55 @@ impl OpenFs {
         }
         let block_dev = self.direct_block_device_adapter();
         block_dev.write_block(cx, sb_block, &block_data)?;
+        Ok(())
+    }
+
+    /// Orphan a zero-link inode the kernel still references instead of
+    /// freeing it (bd-90aey): write it with `nlink` 0 and push it onto the
+    /// on-disk orphan list (`s_last_orphan` + `i_dtime` next links, the legacy
+    /// layout `maybe_recover_ext4_orphans` walks), and remember it so the last
+    /// kernel reference finalizes it. `fstat`/`read`/`write` through an open
+    /// fd, a cwd or an mmap keep working until then; a crash leaves it to
+    /// mount-time recovery. The caller holds the allocation lock, which
+    /// serializes orphan-list mutations.
+    #[allow(clippy::too_many_arguments)]
+    fn ext4_orphan_pinned_inode(
+        &self,
+        cx: &Cx,
+        tx_dev: &dyn BlockDevice,
+        geo: &FsGeometry,
+        groups: &[GroupStats],
+        ino: InodeNumber,
+        inode: &mut Ext4Inode,
+        csum_seed: u32,
+        slot_scoped: bool,
+    ) -> ffs_error::Result<()> {
+        let ino_u32 = u32::try_from(ino.0).map_err(|_| FfsError::Corruption {
+            block: 0,
+            detail: format!("orphan push: inode {ino} exceeds ext4 range"),
+        })?;
+        // The on-disk head, not the flavor copy (a mount-time snapshot).
+        inode.dtime = self.ext4_read_orphan_head(cx)?;
+        if slot_scoped {
+            let loc =
+                ffs_inode::locate_inode(ino, geo, groups).ok_or_else(|| FfsError::Corruption {
+                    block: 0,
+                    detail: format!("orphan push: inode {ino} out of range"),
+                })?;
+            ffs_inode::write_inode_at_slot_scoped(
+                cx,
+                tx_dev,
+                loc,
+                usize::from(geo.inode_size),
+                ino,
+                inode,
+                csum_seed,
+            )?;
+        } else {
+            ffs_inode::write_inode(cx, tx_dev, geo, groups, ino, inode, csum_seed)?;
+        }
+        self.ext4_write_orphan_head(cx, ino_u32)?;
+        self.ext4_pending_orphans.lock().insert(ino.0);
         Ok(())
     }
 
@@ -27766,63 +27822,24 @@ impl OpenFs {
                 } = &mut *alloc;
                 if child_upd.links_count == 0 {
                     // bd-90aey orphan-on-unlink: POSIX (and kernel ext4) keeps an
-                    // unlinked-but-open inode fully alive until its LAST open
-                    // handle closes — `fstat`/`read`/`write` through the fd must
-                    // keep working with `nlink` 0, and only that final close
-                    // reclaims storage. When a transport oracle reports open
-                    // handles pinning `child_ino`, orphan instead of freeing:
-                    // write the inode with `nlink` 0 and splice it onto the
-                    // on-disk orphan list (`s_last_orphan` + `i_dtime` next
-                    // links, the legacy layout `maybe_recover_ext4_orphans`
-                    // walks). The transport finalizes at last close via
-                    // `finalize_unlinked_inode`; a crash leaves the inode to
-                    // mount-time recovery — never a dangling dirent (the
-                    // removal above already persisted first). Directories stay
-                    // on the immediate-free path: FUSE cannot hold an open
-                    // directory handle through rmdir here, and the recovery
-                    // walker would reclaim them identically anyway.
-                    let open_handles = if expect_dir {
-                        0
-                    } else {
-                        self.ext4_open_handle_count(child_ino)
-                    };
-                    if open_handles > 0 {
-                        // Read the list head from the on-disk superblock (the
-                        // alloc lock we hold serializes orphan mutations; the
-                        // flavor copy is only a mount-time snapshot).
-                        let head = self.ext4_read_orphan_head(cx)?;
-                        child_upd.dtime = head;
-                        if sharded_inode_free {
-                            let loc = ffs_inode::locate_inode(child_ino, geo, groups).ok_or_else(
-                                || FfsError::Corruption {
-                                    block: 0,
-                                    detail: format!(
-                                        "sharded unlink: inode {child_ino} out of range"
-                                    ),
-                                },
-                            )?;
-                            ffs_inode::write_inode_at_slot_scoped(
-                                cx,
-                                tx_dev,
-                                loc,
-                                usize::from(geo.inode_size),
-                                child_ino,
-                                &child_upd,
-                                csum_seed,
-                            )?;
-                        } else {
-                            ffs_inode::write_inode(
-                                cx, tx_dev, geo, groups, child_ino, &child_upd, csum_seed,
-                            )?;
-                        }
-                        self.ext4_write_orphan_head(
+                    // unlinked inode fully alive while anything still holds it —
+                    // an open fd, a cwd, an mmap: `fstat`/`read`/`write` must keep
+                    // working with `nlink` 0 and only the last reference reclaims
+                    // storage. When the transport oracle reports kernel
+                    // references pinning `child_ino` (file or directory), orphan
+                    // instead of freeing; the last FORGET finalizes. The removal
+                    // above already persisted first, so a crash never leaves a
+                    // dangling dirent.
+                    if self.ext4_open_handle_count(child_ino) > 0 {
+                        self.ext4_orphan_pinned_inode(
                             cx,
-                            u32::try_from(child_ino.0).map_err(|_| FfsError::Corruption {
-                                block: 0,
-                                detail: format!(
-                                    "orphan push: inode {child_ino} exceeds ext4 range"
-                                ),
-                            })?,
+                            tx_dev,
+                            geo,
+                            groups,
+                            child_ino,
+                            &mut child_upd,
+                            csum_seed,
+                            sharded_inode_free,
                         )?;
                     } else if sharded_inode_free {
                         // Release storage WITHOUT the inode write-back, then stage
@@ -27987,6 +28004,12 @@ impl OpenFs {
         ino: InodeNumber,
     ) -> ffs_error::Result<bool> {
         if self.ext4_superblock().is_none() {
+            return Ok(false);
+        }
+        // Called on every last kernel reference: only an inode this mount
+        // orphaned has work to do. Taken out of the set up front; a failure
+        // below leaves it on the on-disk list for mount-time recovery.
+        if !self.ext4_pending_orphans.lock().remove(&ino.0) {
             return Ok(false);
         }
         let ino_u32 = u32::try_from(ino.0).map_err(|_| FfsError::Corruption {
@@ -30783,7 +30806,21 @@ impl OpenFs {
                     #[cfg(not(feature = "bhh0i_sharded_alloc"))]
                     let sharded_inode_free = false;
 
-                    if sharded_inode_free {
+                    if self.ext4_open_handle_count(existing_ino) > 0 {
+                        // bd-90aey: the clobbered target may still be open (or a
+                        // cwd): it stays alive with nlink 0 until the last kernel
+                        // reference, exactly as unlink's victim does.
+                        self.ext4_orphan_pinned_inode(
+                            cx,
+                            &block_dev,
+                            geo,
+                            groups,
+                            existing_ino,
+                            &mut ex_upd,
+                            csum_seed,
+                            sharded_inode_free,
+                        )?;
+                    } else if sharded_inode_free {
                         let is_dir = ffs_inode::release_inode_storage_deferring_writeback(
                             cx,
                             &block_dev,
@@ -64489,6 +64526,75 @@ mod tests {
                 freed.mode,
                 freed.size
             ),
+        }
+    }
+
+    /// bd-90aey (xfstests generic/035): the victim of a rename-overwrite, and a
+    /// directory removed by rmdir, may still be open (or a cwd). While the
+    /// oracle reports them pinned they must survive with nlink 0 — the client
+    /// fstat()s them — until finalize reclaims them. Before this, both were
+    /// freed at once and fstat on the open fd returned ENOENT.
+    #[test]
+    fn ext4_pinned_rename_victim_and_rmdir_dir_are_orphaned_until_finalize() {
+        let Some((fs, _tmp)) = open_writable_ext4_mkfs(16) else {
+            return; // mkfs.ext4 unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let src = fs
+            .create(&cx, root, OsStr::new("src"), 0o644, 0, 0)
+            .expect("create src")
+            .ino;
+        let victim = fs
+            .create(&cx, root, OsStr::new("victim"), 0o644, 0, 0)
+            .expect("create victim")
+            .ino;
+        fs.mkdir(&cx, root, OsStr::new("dsrc"), 0o755, 0, 0)
+            .expect("mkdir dsrc");
+        let dvictim = fs
+            .mkdir(&cx, root, OsStr::new("dvictim"), 0o755, 0, 0)
+            .expect("mkdir dvictim")
+            .ino;
+        let gone = fs
+            .mkdir(&cx, root, OsStr::new("gone"), 0o755, 0, 0)
+            .expect("mkdir gone")
+            .ino;
+        fs.install_open_handle_oracle(std::sync::Arc::new(move |queried| {
+            u64::from(queried == victim || queried == dvictim || queried == gone)
+        }));
+
+        fs.rename(&cx, root, OsStr::new("src"), root, OsStr::new("victim"))
+            .expect("rename over a pinned file");
+        fs.rename(&cx, root, OsStr::new("dsrc"), root, OsStr::new("dvictim"))
+            .expect("rename over a pinned empty directory");
+        fs.rmdir(&cx, root, OsStr::new("gone"))
+            .expect("rmdir a pinned directory");
+
+        assert_eq!(
+            fs.lookup(&cx, root, OsStr::new("victim"))
+                .expect("victim")
+                .ino,
+            src,
+            "the name now resolves to the renamed source"
+        );
+        for (ino, what) in [
+            (victim, "file victim"),
+            (dvictim, "dir victim"),
+            (gone, "rmdir'd dir"),
+        ] {
+            let attr = fs
+                .getattr(&cx, ino)
+                .unwrap_or_else(|e| panic!("{what}: fstat of a pinned orphan: {e:?}"));
+            assert_eq!(attr.nlink, 0, "{what}: an orphan has nlink 0");
+            assert!(
+                fs.finalize_unlinked_inode_public(&cx, ino)
+                    .unwrap_or_else(|e| panic!("{what}: finalize: {e:?}")),
+                "{what}: the last reference reclaims it"
+            );
+            assert!(
+                !fs.finalize_unlinked_inode_public(&cx, ino).expect("again"),
+                "{what}: reclaimed exactly once"
+            );
         }
     }
 

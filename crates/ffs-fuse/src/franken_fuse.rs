@@ -11,14 +11,15 @@ impl FrankenFuse {
         } else {
             info!(thread_count, "FrankenFuse initialized");
         }
-        // bd-90aey: the adapter owns open-handle lifetimes, so it installs the
-        // count oracle BEFORE `ops` is wrapped — `unlink` consults it to pick
-        // orphan deferral over immediate reclaim, and `release` finalizes a
-        // deferred reclaim at the last close.
-        let open_refcounts = OpenRefcounts::default();
+        // bd-90aey: the adapter sees the kernel's inode references (entry
+        // replies and FORGETs), so it installs the pin-count oracle BEFORE
+        // `ops` is wrapped — unlink/rmdir/rename-overwrite consult it to pick
+        // orphan deferral over immediate reclaim, and the last FORGET finalizes
+        // a deferred reclaim.
+        let lookup_refcounts = LookupRefcounts::default();
         ops.install_open_handle_oracle(Arc::new({
-            let open_refcounts = open_refcounts.clone();
-            move |ino| open_refcounts.count(ino.0)
+            let lookup_refcounts = lookup_refcounts.clone();
+            move |ino| lookup_refcounts.count(ino.0)
         }));
         Self {
             inner: Arc::new(FuseInner {
@@ -53,7 +54,7 @@ impl FrankenFuse {
                 // ffs-fuse and everything downstream of it (ffs-cli, and so the
                 // mounted instruments).
                 zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
-                open_refcounts,
+                lookup_refcounts,
             }),
             final_flush_errno: Arc::new(std::sync::atomic::AtomicI32::new(0)),
         }

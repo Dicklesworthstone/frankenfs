@@ -2839,6 +2839,22 @@ impl<T: FsOps + ?Sized> FsOps for Arc<T> {
         (**self).xattr_presence(cx)
     }
 
+    // bd-90aey: unforwarded, the transport's pin-count oracle was dropped by
+    // the trait default and every mounted unlink/rename freed an inode the
+    // client still held open (xfstests generic/035: fstat on the fd ENOENT).
+    fn install_open_handle_oracle(&self, oracle: OpenHandleOracle) {
+        (**self).install_open_handle_oracle(oracle);
+    }
+
+    fn finalize_unlinked_inode(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+    ) -> ffs_error::Result<bool> {
+        (**self).finalize_unlinked_inode(cx, scope, ino)
+    }
+
     fn getattr(
         &self,
         cx: &Cx,
@@ -4045,9 +4061,27 @@ mod getattr_batch_tests {
     #[derive(Default)]
     struct CountingFs {
         batches: std::sync::atomic::AtomicUsize,
+        oracles: std::sync::atomic::AtomicUsize,
+        finalizes: std::sync::atomic::AtomicUsize,
     }
 
     impl FsOps for CountingFs {
+        fn install_open_handle_oracle(&self, _oracle: OpenHandleOracle) {
+            self.oracles
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+
+        fn finalize_unlinked_inode(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<bool> {
+            self.finalizes
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            Ok(true)
+        }
+
         fn getattr(
             &self,
             _cx: &Cx,
@@ -4238,5 +4272,21 @@ mod getattr_batch_tests {
             "Arc must forward to the implementor's getattr_batch; 0 means it fell \
              through to the trait default and the override is dead in production"
         );
+    }
+
+    /// bd-90aey, the same trap: the orphan-on-unlink oracle and its finalize
+    /// were not forwarded through `Arc`, so on the production mount unlink and
+    /// rename-overwrite freed inodes the client still held open.
+    #[test]
+    fn arc_forwards_the_orphan_oracle_and_finalize_bd_90aey() {
+        let cx = Cx::for_testing();
+        let fs = std::sync::Arc::new(CountingFs::default());
+        FsOps::install_open_handle_oracle(&fs, std::sync::Arc::new(|_| 1));
+        assert!(
+            FsOps::finalize_unlinked_inode(&fs, &cx, &mut RequestScope::default(), InodeNumber(12))
+                .expect("finalize")
+        );
+        assert_eq!(fs.oracles.load(std::sync::atomic::Ordering::Relaxed), 1);
+        assert_eq!(fs.finalizes.load(std::sync::atomic::Ordering::Relaxed), 1);
     }
 }
