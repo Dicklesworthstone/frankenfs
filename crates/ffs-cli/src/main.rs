@@ -620,6 +620,8 @@ impl MvccPolicyArg {
 struct MountCmdOptions {
     allow_other: bool,
     read_write: bool,
+    /// FUSE fsname (the /proc/mounts source); `None` = `frankenfs`.
+    fsname: Option<String>,
     mount_mode: MountMode,
     btrfs_mount_selection: BtrfsMountSelection,
     btrfs_device_paths: Vec<PathBuf>,
@@ -1233,6 +1235,11 @@ enum Command {
         /// Mount read-write (default is read-only).
         #[arg(long)]
         rw: bool,
+        /// Mount source shown in /proc/mounts (FUSE fsname; default `frankenfs`).
+        /// Tools that identify a mount by its source, such as xfstests matching
+        /// TEST_DEV/SCRATCH_DEV, need a distinct name per mount.
+        #[arg(long)]
+        fsname: Option<String>,
         /// Opt into kernel FUSE writeback_cache after the safety gate accepts.
         ///
         /// Requires `--rw`, `--writeback-cache-gate`,
@@ -2471,6 +2478,7 @@ fn run() -> Result<()> {
             console_summary,
             allow_other,
             rw,
+            fsname,
             writeback_cache,
             writeback_cache_gate,
             writeback_cache_ordering_oracle,
@@ -2513,6 +2521,7 @@ fn run() -> Result<()> {
                 &MountCmdOptions {
                     allow_other,
                     read_write: rw,
+                    fsname,
                     mount_mode: if native {
                         MountMode::Native
                     } else {
@@ -7153,6 +7162,7 @@ fn mount_with_fuse(
     read_write: bool,
     allow_other: bool,
     auto_unmount: bool,
+    fsname: Option<&str>,
     writeback_cache: WritebackCacheMode,
 ) -> Result<ffs_fuse::MetricsSnapshot> {
     let opts = MountOptions {
@@ -7162,6 +7172,7 @@ fn mount_with_fuse(
         writeback_cache,
         ioctl_trace_path: None,
         worker_threads: fuse_dispatch_workers_from_env()?,
+        fsname: fsname.map(str::to_owned),
     };
 
     // bd-bhh0i mounted cutover. `ext4_create` otherwise takes
@@ -7234,6 +7245,7 @@ struct ManagedMountParams<'a> {
     read_write: bool,
     allow_other: bool,
     auto_unmount: bool,
+    fsname: Option<&'a str>,
     writeback_cache: WritebackCacheMode,
     backpressure: Option<Arc<BackpressureGate>>,
     adaptive_runtime_plan: Option<&'a MountAdaptiveRuntimePlan>,
@@ -7349,6 +7361,7 @@ fn mount_with_managed_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_>
             writeback_cache: params.writeback_cache,
             ioctl_trace_path: None,
             worker_threads: fuse_dispatch_workers_from_env()?,
+            fsname: params.fsname.map(str::to_owned),
         },
         backpressure: params.backpressure.clone(),
         unmount_timeout: std::time::Duration::from_secs(params.unmount_timeout_secs),
@@ -7548,6 +7561,7 @@ fn mount_with_per_core_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_
             writeback_cache: params.writeback_cache,
             ioctl_trace_path: None,
             worker_threads: worker_count as usize,
+            fsname: params.fsname.map(str::to_owned),
         },
         backpressure: params.backpressure.clone(),
         unmount_timeout: std::time::Duration::from_secs(params.unmount_timeout_secs),
@@ -8513,6 +8527,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
                 options.read_write,
                 options.allow_other,
                 auto_unmount,
+                options.fsname.as_deref(),
                 WritebackCacheMode::from_enabled(options.writeback_cache.enabled),
             )?;
             // bd-viil0: emit the same shutdown metrics line the managed runtime emits.
@@ -8558,6 +8573,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
                 read_write: options.read_write,
                 allow_other: options.allow_other,
                 auto_unmount,
+                fsname: options.fsname.as_deref(),
                 writeback_cache: WritebackCacheMode::from_enabled(options.writeback_cache.enabled),
                 backpressure: adaptive_runtime_plan
                     .as_ref()
@@ -10210,6 +10226,7 @@ mod tests {
     ) -> MountCmdOptions {
         MountCmdOptions {
             allow_other: false,
+            fsname: None,
             read_write,
             mount_mode: MountMode::Compat,
             btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
@@ -14188,6 +14205,7 @@ mod tests {
                     &PathBuf::from("/definitely/not-used"),
                     &MountCmdOptions {
                         allow_other: false,
+                        fsname: None,
                         read_write: true,
                         btrfs_rw_ephemeral_ok: false,
                         btrfs_verify_data_on_read: false,
@@ -14267,6 +14285,7 @@ mod tests {
             &PathBuf::from("/definitely/missing-mountpoint"),
             &MountCmdOptions {
                 allow_other: false,
+                fsname: None,
                 read_write: false,
                 btrfs_rw_ephemeral_ok: false,
                 btrfs_verify_data_on_read: false,
@@ -14306,6 +14325,7 @@ mod tests {
             &PathBuf::from("/definitely/missing-mountpoint"),
             &MountCmdOptions {
                 allow_other: false,
+                fsname: None,
                 read_write: false,
                 btrfs_rw_ephemeral_ok: false,
                 btrfs_verify_data_on_read: false,
@@ -14417,6 +14437,7 @@ mod tests {
     fn build_mount_open_options_defaults_to_btrfs_root_selection() {
         let open_options = build_mount_open_options(&MountCmdOptions {
             allow_other: false,
+            fsname: None,
             read_write: false,
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: false,
@@ -14507,6 +14528,7 @@ mod tests {
     fn build_mount_open_options_threads_btrfs_read_verification_both_ways() {
         let options = |verify: bool| MountCmdOptions {
             allow_other: false,
+            fsname: None,
             read_write: false,
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: verify,
@@ -14546,6 +14568,7 @@ mod tests {
     fn build_mount_open_options_threads_explicit_btrfs_subvolume_selection() {
         let open_options = build_mount_open_options(&MountCmdOptions {
             allow_other: false,
+            fsname: None,
             read_write: true,
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: false,
@@ -14580,6 +14603,7 @@ mod tests {
     fn build_mount_open_options_threads_explicit_btrfs_snapshot_selection() {
         let open_options = build_mount_open_options(&MountCmdOptions {
             allow_other: false,
+            fsname: None,
             read_write: false,
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: false,
@@ -14618,6 +14642,7 @@ mod tests {
                 &PathBuf::from("/definitely/not-used"),
                 &MountCmdOptions {
                     allow_other: false,
+                    fsname: None,
                     read_write: false,
                     btrfs_rw_ephemeral_ok: false,
                     btrfs_verify_data_on_read: false,
@@ -14665,6 +14690,7 @@ mod tests {
                 &PathBuf::from("/definitely/not-used"),
                 &MountCmdOptions {
                     allow_other: false,
+                    fsname: None,
                     read_write: false,
                     btrfs_rw_ephemeral_ok: false,
                     btrfs_verify_data_on_read: false,
@@ -14713,6 +14739,7 @@ mod tests {
                 &path,
                 &MountCmdOptions {
                     allow_other: false,
+                    fsname: None,
                     read_write: false,
                     btrfs_rw_ephemeral_ok: false,
                     btrfs_verify_data_on_read: false,
@@ -14778,6 +14805,7 @@ mod tests {
                 &path,
                 &MountCmdOptions {
                     allow_other: false,
+                    fsname: None,
                     read_write: false,
                     btrfs_rw_ephemeral_ok: false,
                     btrfs_verify_data_on_read: false,

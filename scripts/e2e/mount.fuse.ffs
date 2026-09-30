@@ -1,0 +1,59 @@
+#!/usr/bin/env bash
+# mount(8) helper for `mount -t fuse.ffs <image> <dir> [-o opts]`.
+#
+# Installed as /sbin/mount.fuse.ffs it lets tools that mount through mount(8)
+# drive FrankenFS; xfstests does so with FSTYP=fuse FUSE_SUBTYP=.ffs, passing
+# TEST_DEV/SCRATCH_DEV (image paths) as the source. The image path is also the
+# FUSE fsname, so /proc/mounts shows it as the mount source, which is how
+# xfstests recognises an already-mounted device.
+#
+# Env: FFS_CLI_BIN (default /usr/local/bin/ffs-cli), FFS_MOUNT_LOG_DIR
+# (default /tmp) for the daemon's log, one file per mountpoint.
+set -euo pipefail
+
+if [[ $# -lt 2 ]]; then
+    echo "usage: mount.fuse.ffs <image> <mountpoint> [-o options]" >&2
+    exit 1
+fi
+image=$1
+dir=$2
+shift 2
+opts=""
+while [[ $# -gt 0 ]]; do
+    case $1 in
+        -o) opts=$2; shift 2 ;;
+        *) shift ;;
+    esac
+done
+
+args=(mount --rw --fsname "$image")
+IFS=, read -ra parts <<<"$opts"
+for part in "${parts[@]}"; do
+    case $part in
+        ro) args=(mount --fsname "$image") ;;
+    esac
+done
+for part in "${parts[@]}"; do
+    [[ $part == allow_other ]] && args+=(--allow-other)
+done
+
+bin=${FFS_CLI_BIN:-/usr/local/bin/ffs-cli}
+log="${FFS_MOUNT_LOG_DIR:-/tmp}/ffs-mount-$(basename "$dir").log"
+echo "== $(date -u +%FT%TZ) $bin ${args[*]} $image $dir" >>"$log"
+setsid "$bin" "${args[@]}" "$image" "$dir" >>"$log" 2>&1 </dev/null &
+pid=$!
+
+# mount(8) must not return before the mount is live.
+for _ in $(seq 1 600); do
+    if findmnt -rn --mountpoint "$dir" >/dev/null 2>&1; then
+        exit 0
+    fi
+    if ! kill -0 "$pid" 2>/dev/null; then
+        echo "mount.fuse.ffs: ffs-cli exited before mounting $dir (log: $log)" >&2
+        tail -n 20 "$log" >&2
+        exit 1
+    fi
+    sleep 0.1
+done
+echo "mount.fuse.ffs: timed out waiting for $dir (log: $log)" >&2
+exit 1

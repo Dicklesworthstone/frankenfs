@@ -1,0 +1,129 @@
+name: xfstests
+
+# Runs the curated generic xfstests subset against a real FrankenFS FUSE mount
+# (FSTYP=fuse, FUSE_SUBTYP=.ffs via scripts/e2e/mount.fuse.ffs) and publishes
+# per-test pass/fail/not-run results. TEST_DEV/SCRATCH_DEV are throwaway ext4
+# image files on this ephemeral runner, which is what makes the destructive
+# XFSTESTS_REAL_RUN_ACK appropriate here and nowhere else.
+#
+# Kept outside the main CI workflow until a baseline exists: a failing case is
+# a product finding to triage, not a merge gate yet.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  xfstests-fuse:
+    name: xfstests generic subset on FrankenFS (FUSE)
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install FUSE, ext4 and xfstests prerequisites
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y \
+            fuse3 libfuse3-dev e2fsprogs \
+            build-essential autoconf automake libtool libtool-bin pkg-config \
+            uuid-dev libacl1-dev libattr1-dev libaio-dev libgdbm-dev \
+            libgdbm-compat-dev liburing-dev libcap-dev xfslibs-dev xfsprogs \
+            acl attr psmisc bc dbench fio gawk quota sqlite3 uuid-runtime
+
+      - name: Cache xfstests build
+        id: xfstests-cache
+        uses: actions/cache@v4
+        with:
+          path: ~/xfstests-dev
+          key: xfstests-dev-v2026.03.20-${{ runner.os }}-v1
+
+      - name: Build xfstests
+        if: steps.xfstests-cache.outputs.cache-hit != 'true'
+        run: |
+          set -euo pipefail
+          git clone --depth 1 --branch v2026.03.20 \
+            https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git ~/xfstests-dev
+          make -C ~/xfstests-dev -j"$(nproc)"
+
+      - name: Build FrankenFS
+        run: cargo build -p ffs-cli -p ffs-harness
+
+      - name: Install the mount helper and test images
+        run: |
+          set -euo pipefail
+          sudo install -m 0755 target/debug/ffs-cli /usr/local/bin/ffs-cli
+          sudo install -m 0755 scripts/e2e/mount.fuse.ffs /sbin/mount.fuse.ffs
+          # xfstests' permission tests run as these users.
+          sudo useradd -m fsgqa || true
+          sudo useradd -m fsgqa2 || true
+          sudo useradd 123456-fsgqa || true
+          img="$RUNNER_TEMP/xfstests-images"
+          mkdir -p "$img"
+          truncate -s 2G "$img/test.ext4" "$img/scratch.ext4"
+          mkfs.ext4 -q -F "$img/test.ext4"
+          mkfs.ext4 -q -F "$img/scratch.ext4"
+          # fusermount3 mountpoints must be in an AppArmor-allowed location.
+          sudo mkdir -p /mnt/ffs-test /mnt/ffs-scratch
+          {
+            echo "XFSTESTS_DIR=$HOME/xfstests-dev"
+            echo "TEST_DEV=$img/test.ext4"
+            echo "SCRATCH_DEV=$img/scratch.ext4"
+            echo "TEST_DIR=/mnt/ffs-test"
+            echo "SCRATCH_MNT=/mnt/ffs-scratch"
+          } >>"$GITHUB_ENV"
+
+      - name: Run xfstests generic subset against FrankenFS
+        env:
+          FSTYP: fuse
+          FUSE_SUBTYP: .ffs
+          XFSTESTS_MODE: run
+          XFSTESTS_FILTER: generic
+          XFSTESTS_DRY_RUN: 0
+          XFSTESTS_STRICT: 0
+          XFSTESTS_REAL_RUN_ACK: xfstests-may-mutate-test-and-scratch-devices
+          FFS_MOUNT_LOG_DIR: ${{ runner.temp }}
+        run: sudo -E env "PATH=$PATH" ./scripts/e2e/ffs_xfstests_e2e.sh
+
+      - name: Summarize results
+        if: always()
+        run: |
+          shopt -s nullglob
+          for f in artifacts/e2e/*_ffs_xfstests_e2e*/xfstests/results.json; do
+            python3 - "$f" <<'PY' >>"$GITHUB_STEP_SUMMARY"
+          import json, sys, collections
+          data = json.load(open(sys.argv[1]))
+          tests = data.get("tests", [])
+          counts = collections.Counter(t.get("status") for t in tests)
+          print("### xfstests on FrankenFS (FUSE)\n")
+          print("| status | count |\n|---|---|")
+          for status, n in sorted(counts.items()):
+              print(f"| {status} | {n} |")
+          print("\n| test | status |\n|---|---|")
+          for t in tests:
+              print(f"| {t.get('id')} | {t.get('status')} |")
+          PY
+          done
+
+      - name: Upload artifacts
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: xfstests-fuse
+          if-no-files-found: warn
+          path: |
+            artifacts/e2e/**/xfstests/**
+            ${{ runner.temp }}/ffs-mount-*.log
+            ~/xfstests-dev/results/**

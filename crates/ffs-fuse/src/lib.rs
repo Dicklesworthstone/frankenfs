@@ -2204,6 +2204,10 @@ pub struct MountOptions {
     /// tuning (`max_background` and `congestion_threshold`) so mount behavior
     /// changes under load. A value of `0` means "auto" and uses defaults.
     pub worker_threads: usize,
+    /// Mount source shown in `/proc/mounts` (FUSE `fsname`); `None` means
+    /// `frankenfs`. Tools that find a mount by its source (xfstests matches
+    /// `TEST_DEV`/`SCRATCH_DEV` against it) need distinct names per mount.
+    pub fsname: Option<String>,
 }
 
 impl Default for MountOptions {
@@ -2215,6 +2219,7 @@ impl Default for MountOptions {
             writeback_cache: WritebackCacheMode::Disabled,
             ioctl_trace_path: None,
             worker_threads: 0,
+            fsname: None,
         }
     }
 }
@@ -2342,7 +2347,10 @@ fn apply_mount_option(
         "worker_threads" | "threads" => {
             options.worker_threads = parse_mount_usize(key, value)?;
         }
-        "fsname" | "subtype" => {
+        "fsname" => {
+            options.fsname = Some(require_mount_option_value(key, value)?.to_owned());
+        }
+        "subtype" => {
             let _ = require_mount_option_value(key, value)?;
         }
         "max_read" | "max_background" | "congestion_threshold" => {
@@ -7567,7 +7575,12 @@ impl FrankenFuse {
 /// Build a list of `fuser::MountOption` from our `MountOptions`.
 fn build_mount_options(options: &MountOptions) -> Vec<MountOption> {
     let mut opts = vec![
-        MountOption::FSName("frankenfs".to_owned()),
+        MountOption::FSName(
+            options
+                .fsname
+                .clone()
+                .unwrap_or_else(|| "frankenfs".to_owned()),
+        ),
         MountOption::Subtype("ffs".to_owned()),
         MountOption::DefaultPermissions,
         MountOption::NoAtime,
@@ -22435,6 +22448,7 @@ mod tests {
             writeback_cache: WritebackCacheMode::Disabled,
             ioctl_trace_path: None,
             worker_threads: 0,
+            fsname: None,
         };
         let mount_opts = build_mount_options(&opts);
         // Should NOT contain RO
@@ -22451,12 +22465,34 @@ mod tests {
             writeback_cache: WritebackCacheMode::Disabled,
             ioctl_trace_path: None,
             worker_threads: 0,
+            fsname: None,
         };
         let mount_opts = build_mount_options(&opts);
         let has_allow = mount_opts
             .iter()
             .any(|o| matches!(o, MountOption::AllowOther));
         assert!(has_allow, "AllowOther should be present");
+    }
+
+    #[test]
+    fn build_mount_options_uses_the_requested_fsname() {
+        let fsname_of = |opts: &MountOptions| {
+            build_mount_options(opts)
+                .into_iter()
+                .find_map(|o| match o {
+                    MountOption::FSName(name) => Some(name),
+                    _ => None,
+                })
+                .expect("an FSName option")
+        };
+        assert_eq!(fsname_of(&MountOptions::default()), "frankenfs");
+        let named = MountOptions {
+            fsname: Some("/images/test.ext4".to_owned()),
+            ..MountOptions::default()
+        };
+        assert_eq!(fsname_of(&named), "/images/test.ext4");
+        let parsed = parse_mount_option_text("rw,fsname=ffs-scratch").expect("parse");
+        assert_eq!(parsed.fsname.as_deref(), Some("ffs-scratch"));
     }
 
     #[test]
@@ -22468,6 +22504,7 @@ mod tests {
             writeback_cache: WritebackCacheMode::Disabled,
             ioctl_trace_path: None,
             worker_threads: 8,
+            fsname: None,
         };
         let mount_opts = build_mount_options(&opts);
         assert!(mount_opts.iter().all(|option| {
@@ -22516,6 +22553,7 @@ mod tests {
             writeback_cache: WritebackCacheMode::Disabled,
             ioctl_trace_path: None,
             worker_threads: 0,
+            fsname: None,
         };
         let mount_opts = build_mount_options(&opts);
         assert!(
@@ -22581,6 +22619,7 @@ mod tests {
                     writeback_cache: WritebackCacheMode::Disabled,
                     ioctl_trace_path: None,
                     worker_threads: 8,
+                    fsname: None,
                 },
             ),
         ];
@@ -23340,6 +23379,7 @@ AllowOther"#;
             writeback_cache: WritebackCacheMode::Disabled,
             ioctl_trace_path: None,
             worker_threads: 4,
+            fsname: None,
         };
         let mount_opts = build_mount_options(&opts);
         let actual = mount_option_debug_lines(&mount_opts);
@@ -23372,6 +23412,7 @@ AllowOther"#;
             writeback_cache: WritebackCacheMode::Disabled,
             ioctl_trace_path: None,
             worker_threads: 0,
+            fsname: None,
         };
         let labels = mount_option_labels_for_fuzzing(&opts);
         assert!(labels.contains(&"ro".to_owned()));
