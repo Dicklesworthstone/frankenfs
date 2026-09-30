@@ -1779,15 +1779,34 @@ pub fn parse_check_output(
 
     for line in check_log.lines() {
         let lower = line.to_ascii_lowercase();
+        let tokens: Vec<&str> = line.split_whitespace().collect();
         for case in &mut cases {
             if !line_mentions_test_id(line, case.id.as_str()) {
                 continue;
             }
+            // Upstream `check` prints `<id>  <secs>s` for a pass (optionally
+            // `<prev>s ...  <secs>s`), `<id>  - output mismatch (...)` or
+            // `<id>  [failed, exit status N]` for a failure, and a closing
+            // `Failures: <ids>` summary.
+            let is_result_line = tokens.first() == Some(&case.id.as_str());
+            let only_durations = tokens.len() > 1
+                && tokens[1..]
+                    .iter()
+                    .all(|t| *t == "..." || parse_duration_secs(t).is_some());
 
-            let candidate = if lower.contains("not run") || lower.contains("notrun") {
+            let candidate = if tokens.first() == Some(&"Failures:") {
+                Some(XfstestsStatus::Failed)
+            } else if lower.contains("not run") || lower.contains("notrun") {
                 Some(XfstestsStatus::NotRun)
-            } else if lower.contains("skipped") {
+            } else if lower.contains("skipped") || (is_result_line && lower.contains("[expunged]"))
+            {
                 Some(XfstestsStatus::Skipped)
+            } else if is_result_line
+                && (lower.contains("output mismatch") || lower.contains("[failed"))
+            {
+                Some(XfstestsStatus::Failed)
+            } else if is_result_line && only_durations {
+                Some(XfstestsStatus::Passed)
             } else if contains_word(&lower, "fail")
                 || contains_word(&lower, "failed")
                 || contains_word(&lower, "error")
@@ -3152,6 +3171,54 @@ generic/030  skipped: needs root\n";
         assert_eq!(run.passed, 0);
         assert_eq!(run.tests[0].status, XfstestsStatus::NotRun);
         assert_eq!(run.tests[1].status, XfstestsStatus::Skipped);
+    }
+
+    /// The upstream `check` output format, as printed by the first real run
+    /// against a FrankenFS mount (xfstests v2026.03.20, CI 2026-09-30). The
+    /// earlier keyword-only parser reported every row here except the two
+    /// `[failed, exit status 1]` ones as `not_run`: passes carry only a
+    /// duration and most failures only "output mismatch".
+    #[test]
+    fn parse_check_output_reads_upstream_check_format() {
+        let ids = [
+            "generic/001",
+            "generic/003",
+            "generic/013",
+            "generic/062",
+            "generic/068",
+            "generic/524",
+        ];
+        let selected: Vec<String> = ids.iter().map(|s| (*s).to_owned()).collect();
+        let log = "\
+FSTYP         -- fuse\n\
+generic/001         6s\n\
+generic/003        - output mismatch (see /r/raw_xfstests/generic/003.out.bad)\n\
+    --- tests/generic/003.out\t2026-09-28 22:10:43 +0000\n\
+    +ERROR: access time has not been updated after accessing file1 first time\n\
+generic/013        - output mismatch (see /r/raw_xfstests/generic/013.out.bad)\n\
+generic/062        [failed, exit status 1]- output mismatch (see /r/generic/062.out.bad)\n\
+generic/068        [not run] fuse does not support freezing\n\
+generic/524  40s ...  42s\n\
+Ran: generic/001 generic/003 generic/013 generic/062 generic/068 generic/524\n\
+Not run: generic/068\n\
+Failures: generic/003 generic/013 generic/062\n\
+Failed 3 of 6 tests\n";
+
+        let run = parse_check_output(&selected, log, 1, false);
+        let status: Vec<XfstestsStatus> = run.tests.iter().map(|t| t.status).collect();
+        assert_eq!(
+            status,
+            vec![
+                XfstestsStatus::Passed,
+                XfstestsStatus::Failed,
+                XfstestsStatus::Failed,
+                XfstestsStatus::Failed,
+                XfstestsStatus::NotRun,
+                XfstestsStatus::Passed,
+            ]
+        );
+        assert_eq!((run.passed, run.failed, run.not_run), (2, 3, 1));
+        assert_eq!(run.tests[0].duration_secs, Some(6.0));
     }
 
     #[test]

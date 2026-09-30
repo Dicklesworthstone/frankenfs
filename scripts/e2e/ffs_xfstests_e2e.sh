@@ -2285,7 +2285,12 @@ run_xfstests_subset() {
     generate_results_from_check_log "$rc"
 
     if [[ $rc -ne 0 ]]; then
-        if grep -qiE "not found or executable|must be run as root|Permission denied" "$CHECK_LOG"; then
+        # Only a check that never started a test is a prerequisite problem. Once
+        # xfstests prints its "Ran:" summary, a "Permission denied" in the log is
+        # test output (e.g. a failing setfattr), and treating it as a skip
+        # would report real product failures as a green skip.
+        if ! grep -q '^Ran:' "$CHECK_LOG" \
+            && grep -qiE "not found or executable|must be run as root|Permission denied" "$CHECK_LOG"; then
             skip_or_fail "xfstests prerequisites unavailable for execution (see $CHECK_LOG)"
         fi
         e2e_log "xfstests check failed; tailing log:"

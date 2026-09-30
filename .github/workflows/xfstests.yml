@@ -6,8 +6,10 @@ name: xfstests
 # image files on this ephemeral runner, which is what makes the destructive
 # XFSTESTS_REAL_RUN_ACK appropriate here and nowhere else.
 #
-# Kept outside the main CI workflow until a baseline exists: a failing case is
-# a product finding to triage, not a merge gate yet.
+# First baseline (2026-09-30, run 36749010714): generic/001 and generic/524
+# pass; 003, 013, 030, 035, 062 and 112 fail (each a tracked bead); 068, 231
+# and 321 do not apply to FUSE. Kept outside the main CI workflow while the
+# known failures are open.
 
 on:
   push:
@@ -97,7 +99,12 @@ jobs:
           FFS_MOUNT_LOG_DIR: ${{ runner.temp }}
           # No FUSE subtype: the mount type must read as plain `fuse`.
           FFS_FUSE_SUBTYPE: ""
-        run: sudo -E env "PATH=$PATH" ./scripts/e2e/ffs_xfstests_e2e.sh
+        # The regression gate runs the subset and compares each test with
+        # scripts/e2e/xfstests_baseline.json (the first measured run): a
+        # baseline pass that no longer passes fails the job; the known
+        # failures are tracked beads (bd-wl17e, bd-55gzo, bd-tqa7z, bd-2cgl5,
+        # bd-uyo9k, bd-msbk2) and a new pass is reported as progress.
+        run: sudo -E env "PATH=$PATH" ./scripts/e2e/ffs_xfstests_regression_gate.sh
 
       - name: Make root-owned artifacts readable
         if: always()
