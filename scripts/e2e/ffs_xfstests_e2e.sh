@@ -71,14 +71,21 @@ declare -a SELECTED_TESTS=()
 EFFECTIVE_MODE="$XFSTESTS_MODE"
 LAST_CHECK_RC="null"
 
+# Capture the help text before matching: `help | grep -q` under pipefail
+# fails whenever grep exits at the first match and the harness takes SIGPIPE
+# writing the rest, which silently selected the fallback parser.
 harness_supports_xfstests_report() {
     [[ -x "$FFS_HARNESS_BIN" ]] || return 1
-    "$FFS_HARNESS_BIN" help 2>&1 | grep -Fq "xfstests-report"
+    local usage
+    usage="$("$FFS_HARNESS_BIN" help 2>&1)" || true
+    [[ "$usage" == *"xfstests-report"* ]]
 }
 
 harness_supports_xfstests_failure_triage() {
     [[ -x "$FFS_HARNESS_BIN" ]] || return 1
-    "$FFS_HARNESS_BIN" help 2>&1 | grep -Fq "xfstests-failure-triage"
+    local usage
+    usage="$("$FFS_HARNESS_BIN" help 2>&1)" || true
+    [[ "$usage" == *"xfstests-failure-triage"* ]]
 }
 
 resolve_xfstests_dir() {
@@ -2153,11 +2160,25 @@ if check_log.exists():
         for tid in selected:
             if not line_mentions_test_id(line, tid):
                 continue
+            # Same rules as ffs-harness parse_check_output: upstream check
+            # prints a pass as "<id>  6s", a failure as "- output mismatch" or
+            # "[failed, ...]", and closes with "Failures: <ids>".
+            parts = line.split()
+            result_line = bool(parts) and parts[0] == tid
+            only_durations = len(parts) > 1 and all(
+                p == "..." or re.fullmatch(r"[0-9]+(\.[0-9]+)?s", p) for p in parts[1:]
+            )
             candidate = None
-            if "not run" in low or "notrun" in low:
+            if parts and parts[0] == "Failures:":
+                candidate = "failed"
+            elif "not run" in low or "notrun" in low:
                 candidate = "not_run"
-            elif "skipped" in low:
+            elif "skipped" in low or (result_line and "[expunged]" in low):
                 candidate = "skipped"
+            elif result_line and ("output mismatch" in low or "[failed" in low):
+                candidate = "failed"
+            elif result_line and only_durations:
+                candidate = "passed"
             elif re.search(r"\b(fail|failed|error)\b", low):
                 candidate = "failed"
             elif re.search(r"\b(pass|passed|ok|success)\b", low):
