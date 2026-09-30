@@ -95,7 +95,13 @@ jobs:
           XFSTESTS_STRICT: 0
           XFSTESTS_REAL_RUN_ACK: xfstests-may-mutate-test-and-scratch-devices
           FFS_MOUNT_LOG_DIR: ${{ runner.temp }}
+          # No FUSE subtype: the mount type must read as plain `fuse`.
+          FFS_FUSE_SUBTYPE: ""
         run: sudo -E env "PATH=$PATH" ./scripts/e2e/ffs_xfstests_e2e.sh
+
+      - name: Make root-owned artifacts readable
+        if: always()
+        run: sudo chmod -R a+rX artifacts "$RUNNER_TEMP" || true
 
       - name: Summarize results
         if: always()

@@ -8,7 +8,8 @@
 # xfstests recognises an already-mounted device.
 #
 # Env: FFS_CLI_BIN (default /usr/local/bin/ffs-cli), FFS_MOUNT_LOG_DIR
-# (default /tmp) for the daemon's log, one file per mountpoint.
+# (default /tmp) for the daemon's log, one file per mountpoint,
+# FFS_FUSE_SUBTYPE (unset: `ffs`, mount type `fuse.ffs`).
 set -euo pipefail
 
 if [[ $# -lt 2 ]]; then
@@ -36,6 +37,11 @@ done
 for part in "${parts[@]}"; do
     [[ $part == allow_other ]] && args+=(--allow-other)
 done
+# An empty FFS_FUSE_SUBTYPE mounts with no subtype, so the kernel reports the
+# type as plain `fuse` (xfstests FSTYP=fuse compares against that).
+if [[ -n ${FFS_FUSE_SUBTYPE+set} ]]; then
+    args+=(--subtype "$FFS_FUSE_SUBTYPE")
+fi
 
 bin=${FFS_CLI_BIN:-/usr/local/bin/ffs-cli}
 log="${FFS_MOUNT_LOG_DIR:-/tmp}/ffs-mount-$(basename "$dir").log"

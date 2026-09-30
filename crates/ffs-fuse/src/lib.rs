@@ -2208,6 +2208,10 @@ pub struct MountOptions {
     /// `frankenfs`. Tools that find a mount by its source (xfstests matches
     /// `TEST_DEV`/`SCRATCH_DEV` against it) need distinct names per mount.
     pub fsname: Option<String>,
+    /// FUSE `subtype`; the kernel reports the mount type as `fuse.<subtype>`.
+    /// `None` means `ffs`; an empty string sets no subtype, so the type is plain
+    /// `fuse` (what xfstests' `FSTYP=fuse` checks for).
+    pub subtype: Option<String>,
 }
 
 impl Default for MountOptions {
@@ -2220,6 +2224,7 @@ impl Default for MountOptions {
             ioctl_trace_path: None,
             worker_threads: 0,
             fsname: None,
+            subtype: None,
         }
     }
 }
@@ -2351,7 +2356,7 @@ fn apply_mount_option(
             options.fsname = Some(require_mount_option_value(key, value)?.to_owned());
         }
         "subtype" => {
-            let _ = require_mount_option_value(key, value)?;
+            options.subtype = Some(require_mount_option_value(key, value)?.to_owned());
         }
         "max_read" | "max_background" | "congestion_threshold" => {
             let _ = parse_mount_usize(key, value)?;
@@ -7581,11 +7586,15 @@ fn build_mount_options(options: &MountOptions) -> Vec<MountOption> {
                 .clone()
                 .unwrap_or_else(|| "frankenfs".to_owned()),
         ),
-        MountOption::Subtype("ffs".to_owned()),
         MountOption::DefaultPermissions,
         MountOption::NoAtime,
         MountOption::CUSTOM(format!("max_read={FUSE_MAX_READ_BYTES}")),
     ];
+    match options.subtype.as_deref() {
+        None => opts.insert(1, MountOption::Subtype("ffs".to_owned())),
+        Some("") => {}
+        Some(subtype) => opts.insert(1, MountOption::Subtype(subtype.to_owned())),
+    }
 
     if options.read_only {
         opts.push(MountOption::RO);
@@ -22449,6 +22458,7 @@ mod tests {
             ioctl_trace_path: None,
             worker_threads: 0,
             fsname: None,
+            subtype: None,
         };
         let mount_opts = build_mount_options(&opts);
         // Should NOT contain RO
@@ -22466,6 +22476,7 @@ mod tests {
             ioctl_trace_path: None,
             worker_threads: 0,
             fsname: None,
+            subtype: None,
         };
         let mount_opts = build_mount_options(&opts);
         let has_allow = mount_opts
@@ -22496,6 +22507,33 @@ mod tests {
     }
 
     #[test]
+    fn build_mount_options_subtype_defaults_to_ffs_and_can_be_omitted() {
+        let subtypes_of = |opts: &MountOptions| -> Vec<String> {
+            build_mount_options(opts)
+                .into_iter()
+                .filter_map(|o| match o {
+                    MountOption::Subtype(s) => Some(s),
+                    _ => None,
+                })
+                .collect()
+        };
+        assert_eq!(subtypes_of(&MountOptions::default()), vec!["ffs"]);
+        let plain = MountOptions {
+            subtype: Some(String::new()),
+            ..MountOptions::default()
+        };
+        assert!(
+            subtypes_of(&plain).is_empty(),
+            "empty subtype: plain `fuse`"
+        );
+        let custom = MountOptions {
+            subtype: Some("frankenfs".to_owned()),
+            ..MountOptions::default()
+        };
+        assert_eq!(subtypes_of(&custom), vec!["frankenfs"]);
+    }
+
+    #[test]
     fn build_mount_options_moves_worker_queue_tuning_to_the_init_handshake() {
         let opts = MountOptions {
             read_only: true,
@@ -22505,6 +22543,7 @@ mod tests {
             ioctl_trace_path: None,
             worker_threads: 8,
             fsname: None,
+            subtype: None,
         };
         let mount_opts = build_mount_options(&opts);
         assert!(mount_opts.iter().all(|option| {
@@ -22554,6 +22593,7 @@ mod tests {
             ioctl_trace_path: None,
             worker_threads: 0,
             fsname: None,
+            subtype: None,
         };
         let mount_opts = build_mount_options(&opts);
         assert!(
@@ -22620,6 +22660,7 @@ mod tests {
                     ioctl_trace_path: None,
                     worker_threads: 8,
                     fsname: None,
+                    subtype: None,
                 },
             ),
         ];
@@ -23380,6 +23421,7 @@ AllowOther"#;
             ioctl_trace_path: None,
             worker_threads: 4,
             fsname: None,
+            subtype: None,
         };
         let mount_opts = build_mount_options(&opts);
         let actual = mount_option_debug_lines(&mount_opts);
@@ -23413,6 +23455,7 @@ AllowOther"#;
             ioctl_trace_path: None,
             worker_threads: 0,
             fsname: None,
+            subtype: None,
         };
         let labels = mount_option_labels_for_fuzzing(&opts);
         assert!(labels.contains(&"ro".to_owned()));
