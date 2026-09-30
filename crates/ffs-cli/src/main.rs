@@ -7167,22 +7167,18 @@ fn validate_mount_adaptive_runtime_request_with_config(
 fn mount_with_fuse(
     open_fs: Arc<OpenFs>,
     mountpoint: &Path,
-    read_write: bool,
-    allow_other: bool,
+    options: &MountCmdOptions,
     auto_unmount: bool,
-    fsname: Option<&str>,
-    subtype: Option<&str>,
-    writeback_cache: WritebackCacheMode,
 ) -> Result<ffs_fuse::MetricsSnapshot> {
     let opts = MountOptions {
-        read_only: !read_write,
-        allow_other,
+        read_only: !options.read_write,
+        allow_other: options.allow_other,
         auto_unmount,
-        writeback_cache,
+        writeback_cache: WritebackCacheMode::from_enabled(options.writeback_cache.enabled),
         ioctl_trace_path: None,
         worker_threads: fuse_dispatch_workers_from_env()?,
-        fsname: fsname.map(str::to_owned),
-        subtype: subtype.map(str::to_owned),
+        fsname: options.fsname.clone(),
+        subtype: options.subtype.clone(),
     };
 
     // bd-bhh0i mounted cutover. `ext4_create` otherwise takes
@@ -7197,7 +7193,7 @@ fn mount_with_fuse(
     // the single-lock block-accounting delta. The default is therefore ON; set
     // FFS_BHH0I_SHARDED=0 for the explicit operational rollback switch.
     #[cfg(feature = "bhh0i_sharded_alloc")]
-    if read_write
+    if options.read_write
         && sharded_create_enabled_from_env(std::env::var("FFS_BHH0I_SHARDED").ok().as_deref())?
     {
         let previously = open_fs.set_bhh0i_sharded_ops(true);
@@ -8534,16 +8530,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
 
     match runtime.mode {
         MountRuntimeMode::Standard => {
-            let metrics = mount_with_fuse(
-                Arc::clone(&open_fs),
-                mountpoint,
-                options.read_write,
-                options.allow_other,
-                auto_unmount,
-                options.fsname.as_deref(),
-                options.subtype.as_deref(),
-                WritebackCacheMode::from_enabled(options.writeback_cache.enabled),
-            )?;
+            let metrics = mount_with_fuse(Arc::clone(&open_fs), mountpoint, options, auto_unmount)?;
             // bd-viil0: emit the same shutdown metrics line the managed runtime emits.
             // Without this the standard runtime — the one the mounted comparator
             // actually uses — produced no `mount_dispatch_metrics` at all, so every
