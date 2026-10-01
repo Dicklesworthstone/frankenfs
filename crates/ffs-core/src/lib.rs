@@ -24392,7 +24392,7 @@ impl OpenFs {
         if !matches!(self.flavor, FsFlavor::Ext4(_)) {
             return Ok(());
         }
-        let Ok(alloc_mutex) = self.require_alloc_state() else {
+        let Some((total_free_blocks, total_free_inodes)) = self.ext4_live_free_totals() else {
             return Ok(()); // read-only fs — nothing to sync
         };
         // bd-bhh0i: when the sharded create path is active the single-lock
@@ -24408,18 +24408,19 @@ impl OpenFs {
         // (bd-y2t0r). Folding the bare sharded totals here while the descriptors
         // carried the reconciled counts would make the superblock disagree with
         // its own group descriptors.
-        let (total_free_blocks, total_free_inodes) = self.ext4_live_free_totals(alloc_mutex);
         self.ext4_write_superblock_free_totals(cx, block_dev, total_free_blocks, total_free_inodes)
     }
 
-    /// Current `(free_blocks, free_inodes)` of a writable ext4 mount, from
-    /// whichever allocator state is live: the reconciled sharded records plus
-    /// single-lock movement when the sharded path is active, else the
-    /// single-lock array. Backs both the persisted superblock totals and
-    /// `statfs`, so `df` reports what the next boundary will persist (sharded
-    /// inode allocations and frees never touch the single-lock array, so
-    /// `statfs` summing it alone missed every mounted create and delete).
-    fn ext4_live_free_totals(&self, alloc_mutex: &RwLock<Ext4AllocState>) -> (u64, u64) {
+    /// Current `(free_blocks, free_inodes)` of a writable ext4 mount (`None`
+    /// when read-only), from whichever allocator state is live: the
+    /// reconciled sharded records plus single-lock movement when the sharded
+    /// path is active, else the single-lock array. Backs both the persisted
+    /// superblock totals and `statfs`, so `df` reports what the next boundary
+    /// will persist (sharded inode allocations and frees never touch the
+    /// single-lock array, so `statfs` summing it alone missed every mounted
+    /// create and delete).
+    fn ext4_live_free_totals(&self) -> Option<(u64, u64)> {
+        let alloc_mutex = self.require_alloc_state().ok()?;
         #[cfg(feature = "bhh0i_sharded_alloc")]
         if self.bhh0i_sharded_ops_active() {
             let live = self.ext4_single_lock_group_counts();
@@ -24428,10 +24429,10 @@ impl OpenFs {
                 .as_ref()
                 .expect("sharded active implies present")
                 .reconciled_total_free(&live);
-            return (t.blocks, t.inodes);
+            return Some((t.blocks, t.inodes));
         }
         let alloc = alloc_mutex.read();
-        Self::ext4_fold_group_free_totals(&alloc)
+        Some(Self::ext4_fold_group_free_totals(&alloc))
     }
 
     /// Patch the superblock's free block/inode totals (restamping its

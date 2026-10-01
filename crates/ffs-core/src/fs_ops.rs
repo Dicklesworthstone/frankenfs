@@ -770,10 +770,10 @@ impl FsOps for OpenFs {
                 // This is the exact aggregation ext4_sync_superblock_free_totals
                 // persists, so the totals are identical (bd-qsmav). A read-only
                 // fs has no alloc state and falls back to the descriptor read.
-                let (mut blocks_free, mut files_free) = if let Ok(alloc_mutex) =
-                    self.require_alloc_state()
+                let (mut blocks_free, mut files_free) = if let Some(totals) =
+                    self.ext4_live_free_totals()
                 {
-                    self.ext4_live_free_totals(alloc_mutex)
+                    totals
                 } else if let Some(&cached) = self.ext4_ro_statfs_totals.get() {
                     // Read-only mount: the group descriptors are immutable, so the
                     // summed totals are constant — serve the memoized O(1) value
