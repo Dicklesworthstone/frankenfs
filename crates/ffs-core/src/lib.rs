@@ -24786,6 +24786,7 @@ impl OpenFs {
             now_nsec,
         );
         self.ext4_sharded_stage_inode_slot(cx, dev, loc, inode_size, ino, &inode, csum_seed)?;
+        self.forget_ext4_inode_caches(ino);
         Ok((ino, inode))
     }
 
@@ -25035,6 +25036,7 @@ impl OpenFs {
             tstamp_nanos,
             persist_ctx,
         )?;
+        self.forget_ext4_inode_caches(ino);
 
         let attr = inode_to_attr(sb, ino, &new_inode);
 
@@ -25324,6 +25326,7 @@ impl OpenFs {
             tstamp_nanos,
             persist_ctx,
         )?;
+        self.forget_ext4_inode_caches(ino);
 
         // Devices + FIFOs + sockets do not own data extents. Strip the
         // EXT4_EXTENTS_FL flag the create_inode helper unconditionally
@@ -25519,6 +25522,8 @@ impl OpenFs {
                 persist_ctx,
             )?
         };
+
+        self.forget_ext4_inode_caches(ino);
 
         // Re-acquire the block device adapter so subsequent metadata reads and writes observe
         // the newly committed inode-table state from create_inode().
@@ -28505,6 +28510,7 @@ impl OpenFs {
                     tstamp_nanos,
                     persist_ctx,
                 )?;
+                self.forget_ext4_inode_caches(ino);
                 if fast_storage {
                     inode.flags &= !EXT4_EXTENTS_FL;
                     inode
@@ -31527,6 +31533,19 @@ impl OpenFs {
 
     /// Drop the cached external xattr block after a successful xattr mutation.
     fn invalidate_ext4_xattr_block_cache(&self, ino: InodeNumber) {
+        self.ext4_inode_xattr_block_cache.remove(&ino.0);
+    }
+
+    /// Forget every per-inode xattr cache entry for a freshly allocated inode.
+    ///
+    /// The caches are keyed by inode NUMBER, and a number is reused once its
+    /// inode is freed: without this a new file listed and read back the deleted
+    /// file's xattrs, both inline and external-block ones (xfstests generic/062:
+    /// a re-created file carried trusted.* attributes it was never given).
+    /// Called at every inode allocation, which is the one point a number
+    /// changes owner.
+    fn forget_ext4_inode_caches(&self, ino: InodeNumber) {
+        self.ext4_inode_xattr_cache.remove(&ino.0);
         self.ext4_inode_xattr_block_cache.remove(&ino.0);
     }
 
@@ -74740,6 +74759,40 @@ mod tests {
             .getxattr(&cx, f.ino, "trusted.overlay.metacopy")
             .expect("getxattr metacopy");
         assert_eq!(value.as_deref(), Some(b"" as &[u8]));
+    }
+
+    /// A file created under a reused inode number must not inherit the deleted
+    /// file's xattrs: the per-inode xattr caches are keyed by number and used
+    /// to survive the delete (xfstests generic/062's restore comparison saw a
+    /// re-created file carrying trusted.* attributes it was never given).
+    #[test]
+    fn ext4_reused_inode_number_does_not_inherit_cached_xattrs() {
+        let Some(fs) = open_writable_ext4() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let old = fs
+            .create(&cx, root, OsStr::new("old"), 0o644, 0, 0)
+            .expect("create old")
+            .ino;
+        fs.setxattr(&cx, old, "user.small", b"inline", XattrSetMode::Set)
+            .expect("set inline xattr");
+        fs.setxattr(&cx, old, "user.big", &[0x42; 3000], XattrSetMode::Set)
+            .expect("set external-block xattr");
+        assert_eq!(fs.listxattr(&cx, old).expect("list old").len(), 2);
+        fs.unlink(&cx, root, OsStr::new("old")).expect("unlink old");
+
+        let new = fs
+            .create(&cx, root, OsStr::new("new"), 0o644, 0, 0)
+            .expect("create new")
+            .ino;
+        assert_eq!(new, old, "precondition: the inode number is reused");
+        assert!(
+            fs.listxattr(&cx, new).expect("list new").is_empty(),
+            "a new inode must start with no xattrs"
+        );
+        assert_eq!(fs.getxattr(&cx, new, "user.big").expect("get"), None);
     }
 
     #[test]
