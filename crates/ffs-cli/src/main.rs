@@ -8260,6 +8260,38 @@ fn start_mount_background_scrub(
 }
 
 #[allow(clippy::too_many_lines)]
+/// Take an exclusive advisory lock on the image for a read-write mount.
+///
+/// A FUSE `umount` returns before the daemon has run its final flush in
+/// DESTROY, so `umount; mount` of the same image could start a second daemon
+/// that read the image while the first was still writing it (xfstests
+/// generic/030 in CI: after a cycle mount the file was absent to lookup yet
+/// "File exists" to create). The lock makes the new mount wait for the old
+/// daemon to exit, and refuses — rather than corrupts — an image another
+/// read-write mount still holds.
+fn lock_image_for_rw_mount(image_path: &Path) -> Result<std::fs::File> {
+    const WAIT: Duration = Duration::from_secs(30);
+    let file = std::fs::File::open(image_path)
+        .with_context(|| format!("open {} to lock it for the mount", image_path.display()))?;
+    let deadline = Instant::now() + WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => bail!(
+                "{} is still held by another read-write FrankenFS mount after {}s",
+                image_path.display(),
+                WAIT.as_secs()
+            ),
+            Err(std::fs::TryLockError::Error(err)) => {
+                return Err(err).with_context(|| format!("lock {}", image_path.display()));
+            }
+        }
+    }
+}
+
 fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) -> Result<()> {
     if env_bool("FFS_MOUNT_BENCH_EVIDENCE", false)? {
         let sha = elf_self_sha256().context("self-hash executing mounted benchmark ELF")?;
@@ -8391,6 +8423,12 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
         scenario_id,
         "mount_start"
     );
+    // Held until this process exits (the OS drops the lock with the fd).
+    let _image_lock = if options.read_write {
+        Some(lock_image_for_rw_mount(image_path)?)
+    } else {
+        None
+    };
 
     let runtime = match requested_runtime.validate() {
         Ok(runtime) => runtime,
