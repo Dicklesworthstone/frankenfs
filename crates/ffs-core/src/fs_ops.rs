@@ -992,8 +992,7 @@ impl FsOps for OpenFs {
             FsFlavor::Ext4(_) => {
                 self.ext4_touch_atime(cx, scope, Self::ext4_canonical_inode(ino), now, strict)
             }
-            // btrfs atime maintenance is not implemented; reads leave it as is.
-            FsFlavor::Btrfs(_) => Ok(false),
+            FsFlavor::Btrfs(_) => self.btrfs_touch_atime(ino, now, strict),
         }
     }
 

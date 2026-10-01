@@ -48,15 +48,15 @@ use ffs_btrfs::{
     BTRFS_EXTENT_TREE_OBJECTID, BTRFS_FILE_EXTENT_PREALLOC, BTRFS_FILE_EXTENT_REG,
     BTRFS_FIRST_FREE_OBJECTID, BTRFS_FS_TREE_OBJECTID, BTRFS_FT_BLKDEV, BTRFS_FT_CHRDEV,
     BTRFS_FT_DIR, BTRFS_FT_FIFO, BTRFS_FT_REG_FILE, BTRFS_FT_SOCK, BTRFS_FT_SYMLINK,
-    BTRFS_INODE_APPEND, BTRFS_INODE_IMMUTABLE, BTRFS_INODE_NODATASUM, BTRFS_ITEM_DIR_INDEX,
-    BTRFS_ITEM_DIR_ITEM, BTRFS_ITEM_EXTENT_DATA, BTRFS_ITEM_INODE_ITEM, BTRFS_ITEM_INODE_REF,
-    BTRFS_ITEM_ROOT_ITEM, BTRFS_ITEM_ROOT_REF, BTRFS_ITEM_XATTR_ITEM, BTRFS_ROOT_SUBVOL_RDONLY,
-    BTRFS_ROOT_TREE_OBJECTID, BTRFS_USER_SETTABLE_FSFLAGS, BTRFS_USER_SETTABLE_XFLAGS, BtrfsBTree,
-    BtrfsBlockGroupItem, BtrfsCowNode, BtrfsDirItem, BtrfsExtentAllocator, BtrfsExtentData,
-    BtrfsInodeItem, BtrfsKey, BtrfsLeafEntry, BtrfsMutationError, BtrfsNodeSerializeParams,
-    BtrfsParsedNode, BtrfsRootItem, BtrfsTreeItem, InMemoryCowBtrfsTree,
-    btrfs_inode_flags_to_fsflags, btrfs_inode_flags_to_xflags, enumerate_snapshots,
-    enumerate_subvolumes, find_xattr_item_value, fsflags_to_btrfs_inode_flags,
+    BTRFS_INODE_APPEND, BTRFS_INODE_IMMUTABLE, BTRFS_INODE_NOATIME, BTRFS_INODE_NODATASUM,
+    BTRFS_ITEM_DIR_INDEX, BTRFS_ITEM_DIR_ITEM, BTRFS_ITEM_EXTENT_DATA, BTRFS_ITEM_INODE_ITEM,
+    BTRFS_ITEM_INODE_REF, BTRFS_ITEM_ROOT_ITEM, BTRFS_ITEM_ROOT_REF, BTRFS_ITEM_XATTR_ITEM,
+    BTRFS_ROOT_SUBVOL_RDONLY, BTRFS_ROOT_TREE_OBJECTID, BTRFS_USER_SETTABLE_FSFLAGS,
+    BTRFS_USER_SETTABLE_XFLAGS, BtrfsBTree, BtrfsBlockGroupItem, BtrfsCowNode, BtrfsDirItem,
+    BtrfsExtentAllocator, BtrfsExtentData, BtrfsInodeItem, BtrfsKey, BtrfsLeafEntry,
+    BtrfsMutationError, BtrfsNodeSerializeParams, BtrfsParsedNode, BtrfsRootItem, BtrfsTreeItem,
+    InMemoryCowBtrfsTree, btrfs_inode_flags_to_fsflags, btrfs_inode_flags_to_xflags,
+    enumerate_snapshots, enumerate_subvolumes, find_xattr_item_value, fsflags_to_btrfs_inode_flags,
     generate_send_stream, lookup_data_block_csum, map_logical_to_physical,
     parse_btrfs_tree_node_owned, parse_dir_items, parse_extent_data, parse_inode_item,
     parse_root_item, parse_xattr_item_names, parse_xattr_items, visit_dir_items, walk_chunk_tree,
@@ -39385,6 +39385,9 @@ impl OpenFs {
                 self.btrfs_apply_rename_per_op(&mut alloc, &ctx, target_will_be_purged)?;
             }
         }
+        // The renamed inode's directory linkage changed, so its ctime moves, as
+        // kernel btrfs does (xfstests generic/003 "after changing file1").
+        self.btrfs_touch_inode_ctime(&mut alloc, child.child_objectid, secs, nanos)?;
         drop(alloc);
 
         Ok(())
@@ -41974,6 +41977,52 @@ impl OpenFs {
             .update(&key, &inode.to_bytes())
             .map_err(|e| btrfs_mutation_to_ffs(&e))?;
         Ok(())
+    }
+
+    /// btrfs twin of [`Self::ext4_touch_atime`]: set atime only (never ctime),
+    /// under relatime unless `strict`. A mount that cannot write (read-only,
+    /// a refused commit) reports no update rather than failing the READ.
+    fn btrfs_touch_atime(
+        &self,
+        ino: InodeNumber,
+        now: SystemTime,
+        strict: bool,
+    ) -> ffs_error::Result<bool> {
+        const RELATIME_MAX_AGE: Duration = Duration::from_hours(24);
+        let Ok(alloc_mutex) = self.require_btrfs_alloc_state() else {
+            return Ok(false);
+        };
+        if self.require_btrfs_rw_allowed("touch_atime").is_err() {
+            return Ok(false);
+        }
+        let objectid = self.btrfs_canonical_inode(ino)?;
+        let mut alloc = alloc_mutex.write();
+        let mut inode = self.btrfs_read_inode_from_tree(&alloc, objectid)?;
+        if inode.flags & (BTRFS_INODE_NOATIME | BTRFS_INODE_IMMUTABLE) != 0 {
+            return Ok(false);
+        }
+        let atime = (inode.atime_sec, inode.atime_nsec);
+        let now_dur = now.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
+        let age = now_dur.saturating_sub(Duration::new(inode.atime_sec, inode.atime_nsec));
+        if !strict
+            && atime > (inode.mtime_sec, inode.mtime_nsec)
+            && atime > (inode.ctime_sec, inode.ctime_nsec)
+            && age < RELATIME_MAX_AGE
+        {
+            return Ok(false);
+        }
+        inode.atime_sec = now_dur.as_secs();
+        inode.atime_nsec = now_dur.subsec_nanos();
+        let key = BtrfsKey {
+            objectid,
+            item_type: BTRFS_ITEM_INODE_ITEM,
+            offset: 0,
+        };
+        alloc
+            .fs_tree
+            .update(&key, &inode.to_bytes())
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        Ok(true)
     }
 
     fn ext4_dir_reserved_tail(&self) -> usize {
@@ -85776,6 +85825,55 @@ mod tests {
     fn open_writable_btrfs() -> (OpenFs, Cx) {
         let (fs, cx, _) = open_writable_btrfs_with_device();
         (fs, cx)
+    }
+
+    /// xfstests generic/003 on btrfs: an access sets atime under relatime and
+    /// never ctime, and a rename moves the renamed inode's ctime.
+    #[test]
+    fn btrfs_touch_atime_relatime_and_rename_bumps_ctime() {
+        let (fs, cx) = open_writable_btrfs();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let ino = fs
+            .create(&cx, root, OsStr::new("atime_probe"), 0o644, 0, 0)
+            .expect("create")
+            .ino;
+        let created = fs.getattr(&cx, ino).expect("getattr");
+        let touch = |at: SystemTime, strict: bool| {
+            fs.with_latest_scope(|scope| {
+                <OpenFs as FsOps>::touch_atime(&fs, &cx, scope, ino, at, strict)
+            })
+            .expect("touch_atime")
+        };
+        let later = created.mtime + Duration::from_secs(5);
+        assert!(
+            touch(later, false),
+            "atime not after mtime: relatime updates"
+        );
+        let after = fs.getattr(&cx, ino).expect("getattr");
+        assert_eq!(after.atime, later);
+        assert_eq!(after.ctime, created.ctime, "an access never moves ctime");
+        assert!(
+            !touch(later + Duration::from_secs(5), false),
+            "fresh atime: relatime leaves it"
+        );
+        assert!(touch(later + Duration::from_secs(10), true), "strictatime");
+
+        std::thread::sleep(Duration::from_millis(20));
+        fs.rename(
+            &cx,
+            root,
+            OsStr::new("atime_probe"),
+            root,
+            OsStr::new("atime_probe_renamed"),
+        )
+        .expect("rename");
+        let renamed = fs.getattr(&cx, ino).expect("getattr");
+        assert!(
+            renamed.ctime > created.ctime,
+            "rename must move the inode's ctime ({:?} !> {:?})",
+            renamed.ctime,
+            created.ctime
+        );
     }
 
     /// bd-72tn8: a partial-block write into a REFLINKED region must preserve the
