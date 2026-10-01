@@ -1861,6 +1861,10 @@ pub struct OpenFs {
     /// the allocation lock and walking the on-disk orphan list each time.
     /// Orphans from an earlier mount are mount-time recovery's, not this set's.
     ext4_pending_orphans: Mutex<rustc_hash::FxHashSet<u64>>,
+    /// btrfs objectids this mount kept as ORPHAN_ITEMs because the oracle
+    /// reported them pinned when their last link went (the btrfs side of
+    /// bd-90aey); reclaimed by `finalize_unlinked_inode` or the destroy drain.
+    btrfs_pending_orphans: Mutex<rustc_hash::FxHashSet<u64>>,
     /// Runtime orphan-list head (`s_last_orphan`), authoritative once set
     /// (bd-90aey). It reaches disk only inside the superblock the free-count
     /// sync writes at each durability boundary — never by a direct write,
@@ -6447,6 +6451,7 @@ impl OpenFs {
             ext4_orphan_recovery_error: None,
             ext4_open_handle_oracle: std::sync::OnceLock::new(),
             ext4_pending_orphans: Mutex::new(rustc_hash::FxHashSet::default()),
+            btrfs_pending_orphans: Mutex::new(rustc_hash::FxHashSet::default()),
             ext4_orphan_head: std::sync::atomic::AtomicU64::new(u64::MAX),
             dev,
             btrfs_devices,
@@ -38960,6 +38965,10 @@ impl OpenFs {
         // (same 4 keys removed, same final parent value; remove_many is byte-
         // identical to sequential delete).
 
+        // A pinned last link becomes an orphan, not a purge, which the batch
+        // (it removes the INODE_ITEM) cannot express.
+        let child_pinned =
+            child_will_be_purged && self.ext4_open_handle_count(InodeNumber(child_oid)) > 0;
         if let Some([dir_item_key, dir_index_key, ref_key, inode_key]) =
             Self::btrfs_unlink_batchable_keys(
                 &alloc,
@@ -38968,7 +38977,7 @@ impl OpenFs {
                 &child,
                 name,
                 dir_index,
-                child_will_be_purged,
+                child_will_be_purged && !child_pinned,
             )?
         {
             let mut parent_inode = self.btrfs_read_inode_from_tree(&alloc, parent_oid)?;
@@ -39014,7 +39023,7 @@ impl OpenFs {
             // The pre-mutation nlink decision is the exact post-adjustment
             // zero-link predicate, so avoid a third child inode B-tree lookup.
             if child_will_be_purged {
-                self.btrfs_purge_inode(&mut alloc, child_oid)?;
+                self.btrfs_purge_or_orphan(&mut alloc, child_oid)?;
             }
 
             self.btrfs_touch_inode_times(&mut alloc, parent_oid, secs, nanos)?;
@@ -39230,7 +39239,7 @@ impl OpenFs {
             let target_inode = self.btrfs_read_inode_from_tree(alloc, target_oid)?;
             if target_inode.nlink == 0 {
                 debug_assert!(target_will_be_purged);
-                self.btrfs_purge_inode(alloc, target_oid)?;
+                self.btrfs_purge_or_orphan(alloc, target_oid)?;
             }
         }
 
@@ -41558,6 +41567,77 @@ impl OpenFs {
     ) -> ffs_error::Result<()> {
         let purge_plan = Self::btrfs_collect_purge_plan(alloc, objectid)?;
         Self::btrfs_execute_purge_plan(alloc, purge_plan)
+    }
+
+    /// `objectid`'s last link is gone. Free it now, unless the transport still
+    /// references it (an open fd, a cwd): then keep its items with nlink 0
+    /// and an ORPHAN_ITEM (`(-5, 48, objectid)`, the layout of the kernel's
+    /// `btrfs_orphan_add`, which kernel btrfs cleans up at mount after a crash)
+    /// until [`Self::btrfs_finalize_unlinked_inode`] reclaims it. Before this a
+    /// rename over, or unlink of, an open file freed it under the open fd
+    /// (xfstests generic/035: fstat ENOENT).
+    fn btrfs_purge_or_orphan(
+        &self,
+        alloc: &mut BtrfsAllocState,
+        objectid: u64,
+    ) -> ffs_error::Result<()> {
+        if self.ext4_open_handle_count(InodeNumber(objectid)) == 0 {
+            return self.btrfs_purge_inode(alloc, objectid);
+        }
+        alloc
+            .fs_tree
+            .upsert(Self::btrfs_orphan_item_key(objectid), &[])
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        self.btrfs_pending_orphans.lock().insert(objectid);
+        Ok(())
+    }
+
+    const fn btrfs_orphan_item_key(objectid: u64) -> BtrfsKey {
+        const BTRFS_ORPHAN_OBJECTID: u64 = (-5_i64).cast_unsigned();
+        const BTRFS_ORPHAN_ITEM_KEY: u8 = 48;
+        BtrfsKey {
+            objectid: BTRFS_ORPHAN_OBJECTID,
+            item_type: BTRFS_ORPHAN_ITEM_KEY,
+            offset: objectid,
+        }
+    }
+
+    /// Reclaim a btrfs inode this mount orphaned, at the transport's last
+    /// reference. `Ok(false)` when `ino` is not one of ours, or regained a
+    /// link (never, today: a zero-link btrfs inode has no name to link from).
+    fn btrfs_finalize_unlinked_inode(&self, ino: InodeNumber) -> ffs_error::Result<bool> {
+        if !self.btrfs_pending_orphans.lock().contains(&ino.0) {
+            return Ok(false);
+        }
+        let _gate = self.mutation_gate_guard();
+        if !self.btrfs_pending_orphans.lock().remove(&ino.0) {
+            return Ok(false);
+        }
+        let alloc_mutex = self.require_btrfs_alloc_state()?;
+        let mut alloc = alloc_mutex.write();
+        let inode = self.btrfs_read_inode_from_tree(&alloc, ino.0)?;
+        alloc
+            .fs_tree
+            .delete(&Self::btrfs_orphan_item_key(ino.0))
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        if inode.nlink != 0 {
+            return Ok(false);
+        }
+        self.btrfs_purge_inode(&mut alloc, ino.0)?;
+        Ok(true)
+    }
+
+    /// The btrfs side of the destroy drain (bd-iah1f): reclaim every orphan
+    /// whose last reference never reached finalize. Returns how many.
+    fn btrfs_finalize_orphans_on_destroy(&self) -> ffs_error::Result<usize> {
+        let pending: Vec<u64> = self.btrfs_pending_orphans.lock().iter().copied().collect();
+        let mut reclaimed = 0;
+        for objectid in pending {
+            if self.btrfs_finalize_unlinked_inode(InodeNumber(objectid))? {
+                reclaimed += 1;
+            }
+        }
+        Ok(reclaimed)
     }
 
     /// Insert an INODE_REF item linking `child_oid` back to `parent_oid`.
@@ -85825,6 +85905,85 @@ mod tests {
     fn open_writable_btrfs() -> (OpenFs, Cx) {
         let (fs, cx, _) = open_writable_btrfs_with_device();
         (fs, cx)
+    }
+
+    /// xfstests generic/035 on btrfs: unlinking a pinned file, or renaming over
+    /// one, keeps it (nlink 0, ORPHAN_ITEM) until finalize reclaims it.
+    #[test]
+    fn btrfs_pinned_unlink_and_rename_victim_are_orphaned_until_finalize() {
+        let (fs, cx) = open_writable_btrfs();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let gone = fs
+            .create(&cx, root, OsStr::new("gone"), 0o644, 0, 0)
+            .expect("create gone")
+            .ino;
+        let _ = fs.write(&cx, gone, 0, b"still readable").expect("write");
+        let victim = fs
+            .create(&cx, root, OsStr::new("victim"), 0o644, 0, 0)
+            .expect("create victim")
+            .ino;
+        fs.create(&cx, root, OsStr::new("src"), 0o644, 0, 0)
+            .expect("create src");
+        let free = fs
+            .create(&cx, root, OsStr::new("free"), 0o644, 0, 0)
+            .expect("create free")
+            .ino;
+        fs.install_open_handle_oracle(std::sync::Arc::new(move |q| {
+            u64::from(q == gone || q == victim)
+        }));
+
+        fs.unlink(&cx, root, OsStr::new("gone"))
+            .expect("unlink pinned");
+        fs.rename(&cx, root, OsStr::new("src"), root, OsStr::new("victim"))
+            .expect("rename over pinned");
+        fs.unlink(&cx, root, OsStr::new("free"))
+            .expect("unlink unpinned");
+
+        for (ino, what) in [(gone, "unlinked"), (victim, "rename victim")] {
+            let attr = fs
+                .getattr(&cx, ino)
+                .unwrap_or_else(|e| panic!("{what}: fstat of a pinned orphan: {e:?}"));
+            assert_eq!(attr.nlink, 0, "{what}: an orphan has nlink 0");
+        }
+        assert_eq!(
+            fs.read(&cx, gone, 0, 64).expect("read orphan"),
+            b"still readable"
+        );
+        assert!(
+            fs.getattr(&cx, free).is_err(),
+            "unpinned inode is freed at once"
+        );
+        {
+            let alloc = fs.require_btrfs_alloc_state().expect("alloc").read();
+            assert!(
+                alloc
+                    .fs_tree
+                    .get(&OpenFs::btrfs_orphan_item_key(gone.0))
+                    .is_some(),
+                "an ORPHAN_ITEM records the pinned inode for crash cleanup"
+            );
+        }
+
+        for (ino, what) in [(gone, "unlinked"), (victim, "rename victim")] {
+            assert!(
+                fs.finalize_unlinked_inode_public(&cx, ino)
+                    .unwrap_or_else(|e| panic!("{what}: finalize: {e:?}")),
+                "{what}: the last reference reclaims it"
+            );
+            assert!(
+                !fs.finalize_unlinked_inode_public(&cx, ino).expect("again"),
+                "{what}: reclaimed exactly once"
+            );
+            assert!(fs.getattr(&cx, ino).is_err(), "{what}: gone after finalize");
+        }
+        let alloc = fs.require_btrfs_alloc_state().expect("alloc").read();
+        assert!(
+            alloc
+                .fs_tree
+                .get(&OpenFs::btrfs_orphan_item_key(gone.0))
+                .is_none(),
+            "finalize removes the ORPHAN_ITEM"
+        );
     }
 
     /// xfstests generic/003 on btrfs: an access sets atime under relatime and

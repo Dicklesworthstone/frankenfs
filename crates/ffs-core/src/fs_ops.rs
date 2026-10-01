@@ -1138,9 +1138,7 @@ impl FsOps for OpenFs {
     ) -> ffs_error::Result<bool> {
         match &self.flavor {
             FsFlavor::Ext4(_) => self.ext4_finalize_unlinked_inode_impl(cx, ino),
-            // btrfs keeps its existing immediate-reclaim unlink behavior; the
-            // bd-90aey deferred-reclaim contract is ext4-scoped for now.
-            FsFlavor::Btrfs(_) => Ok(false),
+            FsFlavor::Btrfs(_) => self.btrfs_finalize_unlinked_inode(ino),
         }
     }
 
@@ -4407,12 +4405,14 @@ impl FsOps for OpenFs {
         // (bd-iah1f) BEFORE the flush below, so the frees persist with it. A
         // failure leaves them to mount-time recovery and must not skip the
         // flush of everything else.
-        if matches!(self.flavor, FsFlavor::Ext4(_)) {
-            match self.ext4_finalize_orphans_on_destroy(cx) {
-                Ok(0) => {}
-                Ok(reclaimed) => info!(reclaimed, "flush_on_destroy: reclaimed pending orphans"),
-                Err(error) => warn!(%error, "flush_on_destroy: orphan drain failed"),
-            }
+        let drained = match &self.flavor {
+            FsFlavor::Ext4(_) => self.ext4_finalize_orphans_on_destroy(cx),
+            FsFlavor::Btrfs(_) => self.btrfs_finalize_orphans_on_destroy(),
+        };
+        match drained {
+            Ok(0) => {}
+            Ok(reclaimed) => info!(reclaimed, "flush_on_destroy: reclaimed pending orphans"),
+            Err(error) => warn!(%error, "flush_on_destroy: orphan drain failed"),
         }
 
         // Drain and join the home-location compactor before the final full
