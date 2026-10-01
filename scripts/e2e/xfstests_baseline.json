@@ -1,7 +1,10 @@
 [
   { "test_id": "generic/001", "expected_status": "passed" },
-  { "test_id": "generic/003", "expected_status": "failed" },
+  { "test_id": "generic/003", "expected_status": "passed" },
+  { "test_id": "generic/004", "expected_status": "passed" },
   { "test_id": "generic/013", "expected_status": "passed" },
+  { "test_id": "generic/028", "expected_status": "passed" },
+  { "test_id": "generic/029", "expected_status": "passed" },
   { "test_id": "generic/030", "expected_status": "passed" },
   { "test_id": "generic/035", "expected_status": "passed" },
   { "test_id": "generic/062", "expected_status": "passed" },
