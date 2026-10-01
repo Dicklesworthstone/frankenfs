@@ -31946,10 +31946,16 @@ impl OpenFs {
             external_block = Some(buf);
         }
 
+        // Same posture as `ext4_setxattr`: under `default_permissions` the
+        // kernel has already checked ownership and CAP_SYS_ADMIN before it
+        // forwards the request. Removal alone used to pass owner-only access, so
+        // root could set trusted.*/security.* but never remove them (xfstests
+        // generic/062: EACCES; overlayfs cannot clear trusted.overlay.* on its
+        // upper layer).
         let access = XattrWriteAccess {
             is_owner: true,
-            has_cap_fowner: false,
-            has_cap_sys_admin: false,
+            has_cap_fowner: true,
+            has_cap_sys_admin: true,
         };
 
         let removed =
@@ -74737,7 +74743,6 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "bd-cc6ua: removexattr of a trusted.* xattr requires CAP_SYS_ADMIN, unavailable in the test context; passes against a committed fixture/privileged run"]
     fn ext4_trusted_overlay_xattr_remove_round_trip() {
         let Some(fs) = open_writable_ext4() else {
             return;
