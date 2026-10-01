@@ -1861,6 +1861,14 @@ pub struct OpenFs {
     /// the allocation lock and walking the on-disk orphan list each time.
     /// Orphans from an earlier mount are mount-time recovery's, not this set's.
     ext4_pending_orphans: Mutex<rustc_hash::FxHashSet<u64>>,
+    /// Runtime orphan-list head (`s_last_orphan`), authoritative once set
+    /// (bd-90aey). It reaches disk only inside the superblock the free-count
+    /// sync writes at each durability boundary — never by a direct write,
+    /// because a direct write raced the JBD2 boundary's captured superblock,
+    /// whose checkpoint restored a stale head naming an already-reclaimed
+    /// inode (xfstests CI: mount-time recovery "double-free"). `u64::MAX` =
+    /// unset: fall back to the mount-time superblock copy.
+    ext4_orphan_head: std::sync::atomic::AtomicU64,
     /// Block device for I/O operations.
     dev: Arc<dyn ByteDevice>,
     /// Explicitly attached btrfs devices; writable mounts use the single-device path.
@@ -6439,6 +6447,7 @@ impl OpenFs {
             ext4_orphan_recovery_error: None,
             ext4_open_handle_oracle: std::sync::OnceLock::new(),
             ext4_pending_orphans: Mutex::new(rustc_hash::FxHashSet::default()),
+            ext4_orphan_head: std::sync::atomic::AtomicU64::new(u64::MAX),
             dev,
             btrfs_devices,
             mvcc_store,
@@ -7485,54 +7494,29 @@ impl OpenFs {
         Ok(inodes)
     }
 
-    /// Read the on-disk orphan-list head (`s_last_orphan`) fresh from the
-    /// superblock block (bd-90aey).
-    ///
-    /// Runtime orphan mutations (push in unlink, splice in finalize) run under
-    /// the allocation lock and go straight to the device so the list stays
-    /// authoritative without touching the mount-time flavor snapshot that
-    /// `maybe_recover_ext4_orphans` consumes.
-    fn ext4_read_orphan_head(&self, cx: &Cx) -> Result<u32, FfsError> {
-        let (sb_block, sb_off) = self.ext4_superblock_location();
-        let block_dev = self.direct_block_device_adapter();
-        let block_data = block_dev.read_block(cx, sb_block)?.into_inner();
-        Ok(u32::from_le_bytes(
-            block_data[sb_off + 0xE8..sb_off + 0xEC]
-                .try_into()
-                .expect("s_last_orphan is a fixed 4-byte field"),
-        ))
+    /// The runtime orphan-list head (`s_last_orphan`, bd-90aey): the in-memory
+    /// value once a push/splice set it, else the mount-time superblock copy
+    /// (which orphan recovery has already cleared). Callers hold the
+    /// allocation lock, which serializes pushes and splices.
+    fn ext4_read_orphan_head(&self) -> u32 {
+        let head = self
+            .ext4_orphan_head
+            .load(std::sync::atomic::Ordering::Acquire);
+        if head != u64::MAX {
+            return u32::try_from(head).unwrap_or(0);
+        }
+        self.ext4_superblock().map_or(0, |sb| sb.last_orphan)
     }
 
-    /// Patch the on-disk orphan-list head (`s_last_orphan`) with checksum
-    /// refresh (bd-90aey). Callers hold the allocation lock so concurrent
-    /// orphan pushes/finalizes serialize.
-    ///
-    /// Takes `&self` and leaves the mount-time flavor snapshot untouched:
-    /// runtime paths re-read the head from the device (see
-    /// [`Self::ext4_read_orphan_head`]), and only mount-time recovery — which
-    /// runs before any transport is served and owns `&mut self` — rewrites the
-    /// cached copy via [`Self::clear_ext4_orphan_state`].
-    fn ext4_write_orphan_head(&self, cx: &Cx, new_head: u32) -> Result<(), FfsError> {
-        let (sb_block, sb_off) = self.ext4_superblock_location();
-        let has_metadata_csum = self
-            .ext4_superblock()
-            .is_some_and(ffs_ondisk::Ext4Superblock::has_metadata_csum);
-        let mut block_data = {
-            let block_dev = self.direct_block_device_adapter();
-            block_dev.read_block(cx, sb_block)?.into_inner()
-        };
-        block_data[sb_off + 0xE8..sb_off + 0xEC].copy_from_slice(&new_head.to_le_bytes());
-        if has_metadata_csum {
-            let csum = ffs_ondisk::ext4::ext4_chksum_skip_zero_tail(
-                !0u32,
-                &block_data[sb_off..sb_off + EXT4_SB_CHECKSUM_OFFSET],
-            );
-            block_data[sb_off + EXT4_SB_CHECKSUM_OFFSET..sb_off + EXT4_SB_CHECKSUM_OFFSET + 4]
-                .copy_from_slice(&csum.to_le_bytes());
-        }
-        let block_dev = self.direct_block_device_adapter();
-        block_dev.write_block(cx, sb_block, &block_data)?;
-        Ok(())
+    /// Set the runtime orphan-list head (bd-90aey). It is persisted by the
+    /// superblock free-count sync at the next durability boundary
+    /// ([`Self::ext4_write_superblock_free_totals`]), in the same boundary as
+    /// the inode `i_dtime` links it depends on. It is NOT written to the
+    /// device here: a direct write raced the JBD2 boundary, whose captured
+    /// superblock checkpoint restored a stale head.
+    fn ext4_write_orphan_head(&self, new_head: u32) {
+        self.ext4_orphan_head
+            .store(u64::from(new_head), std::sync::atomic::Ordering::Release);
     }
 
     /// Orphan a zero-link inode the kernel still references instead of
@@ -7560,7 +7544,7 @@ impl OpenFs {
             detail: format!("orphan push: inode {ino} exceeds ext4 range"),
         })?;
         // The on-disk head, not the flavor copy (a mount-time snapshot).
-        inode.dtime = self.ext4_read_orphan_head(cx)?;
+        inode.dtime = self.ext4_read_orphan_head();
         if slot_scoped {
             let loc =
                 ffs_inode::locate_inode(ino, geo, groups).ok_or_else(|| FfsError::Corruption {
@@ -7579,7 +7563,7 @@ impl OpenFs {
         } else {
             ffs_inode::write_inode(cx, tx_dev, geo, groups, ino, inode, csum_seed)?;
         }
-        self.ext4_write_orphan_head(cx, ino_u32)?;
+        self.ext4_write_orphan_head(ino_u32);
         self.ext4_pending_orphans.lock().insert(ino.0);
         Ok(())
     }
@@ -18713,6 +18697,29 @@ impl OpenFs {
     /// delta to `i_blocks` keeps directory `i_blocks` correct once the tree
     /// grows past its inline depth-0 root, the same way the file write/fallocate
     /// path does it (bd-kyp2q; file analog bd-zpe9s).
+    /// Extent-tree metadata blocks as fallocate sees them: the modes stage
+    /// tree nodes into the request transaction (preallocation) or write them
+    /// through `block_dev` (punch/collapse/insert), so count through the view
+    /// that sees both — staged first, then `block_dev`. The request scope's
+    /// snapshot sees neither of this request's new nodes.
+    fn ext4_fallocate_extent_meta_blocks(
+        cx: &Cx,
+        scope: &mut RequestScope,
+        block_dev: &dyn BlockDevice,
+        root_bytes: &[u8; 60],
+    ) -> Result<u64, FfsError> {
+        scope.tx.as_mut().map_or_else(
+            || Self::ext4_count_extent_tree_meta_blocks_via_dev(cx, block_dev, root_bytes),
+            |tx| {
+                let tx_dev = TransactionBlockAdapter {
+                    base: block_dev,
+                    tx: Mutex::new(tx),
+                };
+                Self::ext4_count_extent_tree_meta_blocks_via_dev(cx, &tx_dev, root_bytes)
+            },
+        )
+    }
+
     fn ext4_count_extent_tree_meta_blocks_via_dev(
         cx: &Cx,
         dev: &dyn BlockDevice,
@@ -24241,12 +24248,18 @@ impl OpenFs {
             // Only a materialised bitmap is persisted; allocating into a
             // BLOCK_UNINIT group materialises it (ffs_alloc synthesizes the
             // initial bitmap and marks the group initialized).
-            let block_bitmap =
-                if !gs.block_bitmap_uninit() && gs.free_blocks < alloc.geo.blocks_in_group(group) {
-                    Some(device.read_block(cx, gs.block_bitmap_block)?.into_inner())
-                } else {
-                    None
-                };
+            //
+            // A materialised group whose blocks have ALL been freed again must
+            // still be re-stamped, exactly as the inode side above: gating on
+            // `free_blocks < capacity` passed no bitmap for it, so its
+            // descriptor kept the checksum of its last partly-used state and
+            // e2fsck reported "Group N block bitmap does not match checksum"
+            // after `rm -rf` emptied a group.
+            let block_bitmap = if !gs.block_bitmap_uninit() {
+                Some(device.read_block(cx, gs.block_bitmap_block)?.into_inner())
+            } else {
+                None
+            };
             entries.push((group, gs.clone(), block_bitmap, inode_bitmap));
         }
         ffs_alloc::persist_group_descs_batched(cx, device, &alloc.persist_ctx, &entries)
@@ -24350,6 +24363,16 @@ impl OpenFs {
         block_data[sb_off + 0x10..sb_off + 0x14].copy_from_slice(&fi.to_le_bytes());
         if is_64bit {
             block_data[sb_off + 0x158..sb_off + 0x15C].copy_from_slice(&fb_hi.to_le_bytes());
+        }
+        // The runtime orphan-list head rides in the same superblock write, so it
+        // reaches disk in the boundary that also carries the inode links it
+        // names (bd-90aey). Unset = nothing changed it since mount: keep disk.
+        let orphan_head = self
+            .ext4_orphan_head
+            .load(std::sync::atomic::Ordering::Acquire);
+        if orphan_head != u64::MAX {
+            let head = u32::try_from(orphan_head).unwrap_or(0);
+            block_data[sb_off + 0xE8..sb_off + 0xEC].copy_from_slice(&head.to_le_bytes());
         }
         if has_csum {
             let csum = ffs_ondisk::ext4::ext4_chksum_skip_zero_tail(
@@ -28007,8 +28030,21 @@ impl OpenFs {
             return Ok(false);
         }
         // Called on every last kernel reference: only an inode this mount
-        // orphaned has work to do. Taken out of the set up front; a failure
-        // below leaves it on the on-disk list for mount-time recovery.
+        // orphaned has work to do (cheap check, no gate, for every other FORGET).
+        if !self.ext4_pending_orphans.lock().contains(&ino.0) {
+            return Ok(false);
+        }
+        // A finalize arrives from FORGET, outside any request scope, yet it
+        // frees storage and re-links the orphan list: a durability boundary
+        // must see all of it or none (a captured head naming an inode whose
+        // blocks the same capture freed is a double free at next mount).
+        let _gate = self.mutation_gate_guard();
+        // Claim the inode only INSIDE the gate. Claimed before it, a finalize
+        // blocked behind the unmount flush still owned the inode, so the destroy
+        // drain could not reclaim it and its frees landed after the final flush
+        // (a later flush then wrote freed bitmap bits under a stale descriptor
+        // checksum). A failure below leaves it on the on-disk list for
+        // mount-time recovery.
         if !self.ext4_pending_orphans.lock().remove(&ino.0) {
             return Ok(false);
         }
@@ -28028,7 +28064,7 @@ impl OpenFs {
         // dtime field of an orphan doubles as the next-pointer, mirroring the
         // legacy layout `collect_ext4_orphan_list_lenient` walks at mount.
         let mut prev: Option<u32> = None;
-        let mut next = self.ext4_read_orphan_head(cx)?;
+        let mut next = self.ext4_read_orphan_head();
         let mut found = false;
         let mut steps = 0_u64;
         while next != 0 {
@@ -28157,7 +28193,7 @@ impl OpenFs {
         let limit = usize::try_from(sb.inodes_count).unwrap_or(usize::MAX);
         let mut reclaimed = 0_usize;
         loop {
-            let head = self.ext4_read_orphan_head(cx)?;
+            let head = self.ext4_read_orphan_head();
             if head == 0 {
                 return Ok(reclaimed);
             }
@@ -28192,7 +28228,10 @@ impl OpenFs {
         csum_seed: u32,
     ) -> ffs_error::Result<()> {
         match prev {
-            None => self.ext4_write_orphan_head(cx, victim_next),
+            None => {
+                self.ext4_write_orphan_head(victim_next);
+                Ok(())
+            }
             Some(prev_ino) => {
                 let mut prev_inode = self.read_inode_raw(cx, InodeNumber(u64::from(prev_ino)))?;
                 prev_inode.dtime = victim_next;
@@ -28654,8 +28693,14 @@ impl OpenFs {
         // Snapshot extent-tree metadata blocks before any mode mutates the tree
         // (prealloc grows it, punch/collapse can shrink it); the net change is
         // charged to i_blocks at the common writeback below (bd-zpe9s).
+        // Counted through the view the modes below mutate the tree through
+        // (`ext4_fallocate_extent_meta_blocks`) — NOT the request scope's
+        // snapshot, which predates the nodes a growing tree allocates here.
+        // Reading a just-grown leaf through that snapshot returned the block's
+        // previous contents ("invalid magic 0xabab" on a punch that grew the
+        // root), failing the op after its allocations had landed.
         let fallocate_meta_before =
-            self.ext4_count_extent_tree_meta_blocks(cx, scope, &root_bytes)?;
+            Self::ext4_fallocate_extent_meta_blocks(cx, scope, &block_dev, &root_bytes)?;
 
         if punch_hole {
             // Unaligned ranges are supported (bd-xnel9): deallocate the fully
@@ -29267,8 +29312,12 @@ impl OpenFs {
         // Charge the net change in extent-tree metadata blocks across whichever
         // mode ran (prealloc growth, punch/collapse shrink) to i_blocks — the
         // per-mode data accounting above counts only data blocks (bd-zpe9s).
-        let fallocate_meta_after =
-            self.ext4_count_extent_tree_meta_blocks(cx, scope, &Self::extent_root(&inode))?;
+        let fallocate_meta_after = Self::ext4_fallocate_extent_meta_blocks(
+            cx,
+            scope,
+            &block_dev,
+            &Self::extent_root(&inode),
+        )?;
         Self::ext4_apply_extent_meta_delta(
             &mut inode,
             ino,
@@ -64620,7 +64669,7 @@ mod tests {
         // Persist the orphaned state WITHOUT destroy (which would reclaim it).
         fs.flush_mvcc_to_device(&cx).expect("boundary");
         assert_ne!(
-            fs.ext4_read_orphan_head(&cx).expect("orphan head"),
+            fs.ext4_read_orphan_head(),
             0,
             "precondition: the image carries an orphan list"
         );
@@ -64688,7 +64737,7 @@ mod tests {
         let reopened = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default())
             .expect("reopen");
         assert!(reopened.ext4_orphan_recovery_error.is_none());
-        assert_eq!(reopened.ext4_read_orphan_head(&cx).expect("head"), 0);
+        assert_eq!(reopened.ext4_read_orphan_head(), 0);
         assert!(
             reopened
                 .read_inode(&cx, ino)
@@ -64738,7 +64787,7 @@ mod tests {
                 .expect("unlink pinned");
         }
         assert_ne!(
-            fs.ext4_read_orphan_head(&cx).expect("orphan head"),
+            fs.ext4_read_orphan_head(),
             0,
             "precondition: the pinned unlinks must leave an orphan list"
         );
@@ -64746,7 +64795,7 @@ mod tests {
         // No finalize: the RELEASEs are "lost". Destroy alone must reclaim.
         fs.flush_on_destroy(&cx).expect("flush_on_destroy");
         assert_eq!(
-            fs.ext4_read_orphan_head(&cx).expect("orphan head"),
+            fs.ext4_read_orphan_head(),
             0,
             "destroy must leave no orphan list behind a clean unmount"
         );
@@ -86030,6 +86079,93 @@ mod tests {
         fs.enable_writes(&cx)
             .expect("FrankenFS must enable writes on a real mke2fs image");
         Some((fs, dev, tmp, image))
+    }
+
+    /// A block group that fills and then empties completely must have its
+    /// block-bitmap checksum re-stamped at the flush. The flush passed a bitmap
+    /// override only while `free_blocks < capacity`, so an emptied group kept
+    /// the checksum of its last partly-used state (e2fsck: "Group 2 block
+    /// bitmap does not match checksum" after deleting the files in it).
+    #[test]
+    fn emptied_block_group_bitmap_checksum_is_restamped_at_flush() {
+        let Some((mut fs, dev, _tmp, image)) = open_ext4_mke2fs(32, true) else {
+            return; // e2fsprogs unavailable
+        };
+        let cx = Cx::for_testing();
+        // As a mount does: descriptors are captured at the JBD2 boundary.
+        assert!(
+            fs.attach_ext4_internal_jbd2_writer(&cx)
+                .expect("attach jbd2")
+        );
+        let bs = u64::from(fs.ext4_superblock().expect("sb").block_size);
+        // 1 KiB blocks, 8192 per group: 20 MiB of data runs through groups 1
+        // and 2; group 2 holds no superblock backup, so it can empty fully.
+        let ino = fs
+            .create(&cx, InodeNumber(2), OsStr::new("big.bin"), 0o644, 0, 0)
+            .expect("create")
+            .ino;
+        let chunk = vec![0x5A_u8; usize::try_from(1024 * bs).unwrap()];
+        for i in 0..20_u64 {
+            fs.write(&cx, ino, i * 1024 * bs, &chunk).expect("write");
+        }
+        fs.flush_mvcc_to_device(&cx)
+            .expect("flush with group 2 in use");
+        fs.unlink(&cx, InodeNumber(2), OsStr::new("big.bin"))
+            .expect("delete the file");
+        fs.flush_mvcc_to_device(&cx)
+            .expect("flush with group 2 empty");
+        std::fs::write(&image, dev.snapshot_bytes()).expect("write image");
+        if let Some((clean, output)) = run_e2fsck(&image) {
+            assert!(clean, "e2fsck after emptying a block group:\n{output}");
+        }
+    }
+
+    #[test]
+    fn fallocate_punches_that_grow_the_extent_root_succeed_and_pass_e2fsck() {
+        // Five alternate-block punches of a 10-block file: the fifth splits the
+        // last extent into a fifth one, which the 4-entry inode root cannot hold,
+        // so the tree grows two external leaf blocks. fallocate counted extent
+        // metadata through the request scope's snapshot, older than those
+        // leaves, read one back as file data ("invalid magic 0xabab"), and
+        // failed with EINVAL after the leaf allocations had landed: e2fsck
+        // then saw leaked blocks and a freed block still mapped.
+        const PUNCH_HOLE_KEEP_SIZE: i32 = 0x02 | 0x01;
+        let Some((fs, dev, _tmp, image)) = open_ext4_mke2fs(16, true) else {
+            return; // e2fsprogs unavailable
+        };
+        let cx = Cx::for_testing();
+        let bs = u64::from(fs.ext4_superblock().expect("sb").block_size);
+        let ino = fs
+            .create(&cx, InodeNumber(2), OsStr::new("frag.bin"), 0o644, 0, 0)
+            .expect("create")
+            .ino;
+        fs.write(
+            &cx,
+            ino,
+            0,
+            &vec![0xAB_u8; usize::try_from(10 * bs).unwrap()],
+        )
+        .expect("write 10 blocks");
+        for hole in 0..5_u64 {
+            fs.fallocate(&cx, ino, hole * 2 * bs, bs, PUNCH_HOLE_KEEP_SIZE)
+                .unwrap_or_else(|e| panic!("punch {hole}: {e:?}"));
+        }
+        let data = fs
+            .read(&cx, ino, 0, u32::try_from(10 * bs).unwrap())
+            .expect("read back");
+        for block in 0..10_usize {
+            let chunk = &data[block * bs as usize..(block + 1) * bs as usize];
+            let want = if block % 2 == 0 { 0 } else { 0xAB };
+            assert!(
+                chunk.iter().all(|b| *b == want),
+                "block {block} != {want:#x}"
+            );
+        }
+        fs.flush_mvcc_to_device(&cx).expect("flush");
+        std::fs::write(&image, dev.snapshot_bytes()).expect("write image");
+        if let Some((clean, output)) = run_e2fsck(&image) {
+            assert!(clean, "e2fsck after root-growing punches:\n{output}");
+        }
     }
 
     /// Applying a fast-commit DEL_RANGE at recovery must punch the logical range,
