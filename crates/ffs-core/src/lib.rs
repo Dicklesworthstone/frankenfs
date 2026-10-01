@@ -24255,10 +24255,10 @@ impl OpenFs {
             // descriptor kept the checksum of its last partly-used state and
             // e2fsck reported "Group N block bitmap does not match checksum"
             // after `rm -rf` emptied a group.
-            let block_bitmap = if !gs.block_bitmap_uninit() {
-                Some(device.read_block(cx, gs.block_bitmap_block)?.into_inner())
-            } else {
+            let block_bitmap = if gs.block_bitmap_uninit() {
                 None
+            } else {
+                Some(device.read_block(cx, gs.block_bitmap_block)?.into_inner())
             };
             entries.push((group, gs.clone(), block_bitmap, inode_bitmap));
         }
