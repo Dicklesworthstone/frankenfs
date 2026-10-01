@@ -34,9 +34,15 @@ for part in "${parts[@]}"; do
         ro) args=(mount --fsname "$image") ;;
     esac
 done
+atime=""
 for part in "${parts[@]}"; do
-    [[ $part == allow_other ]] && args+=(--allow-other)
+    case $part in
+        allow_other) args+=(--allow-other) ;;
+        # FUSE inodes are S_NOATIME, so the daemon applies the atime policy.
+        noatime | relatime | strictatime) atime=$part ;;
+    esac
 done
+[[ -n $atime ]] && args+=(--atime "$atime")
 # An empty FFS_FUSE_SUBTYPE mounts with no subtype, so the kernel reports the
 # type as plain `fuse` (xfstests FSTYP=fuse compares against that).
 if [[ -n ${FFS_FUSE_SUBTYPE+set} ]]; then

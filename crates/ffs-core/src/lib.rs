@@ -7568,6 +7568,101 @@ impl OpenFs {
         Ok(())
     }
 
+    /// `O_TMPFILE`: allocate a regular-file inode that no directory names.
+    ///
+    /// Like kernel ext4 (`ext4_tmpfile` + `d_tmpfile`), the inode starts with no
+    /// links and sits on the orphan list: the last kernel reference reclaims it
+    /// (or mount-time recovery after a crash), and a later `link` that names it
+    /// takes it back off ([`Self::ext4_unorphan_inode`]). `parent` only places
+    /// the inode near its directory.
+    fn ext4_tmpfile(
+        &self,
+        cx: &Cx,
+        parent: InodeNumber,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> ffs_error::Result<InodeAttr> {
+        let alloc_mutex = self.require_alloc_state()?;
+        let block_dev = self.block_device_adapter();
+        let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let csum_seed = sb.csum_seed();
+        if !self.read_inode(cx, parent)?.is_dir() {
+            return Err(FfsError::NotDirectory);
+        }
+
+        // Single-lock path in both allocator modes, like `ext4_mknod`.
+        let mut alloc = alloc_mutex.write();
+        let Ext4AllocState {
+            geo,
+            groups,
+            persist_ctx,
+        } = &mut *alloc;
+        let parent_group = GroupNumber(
+            u32::try_from(parent.0.saturating_sub(1) / u64::from(geo.inodes_per_group))
+                .map_err(|_| FfsError::Format("parent inode group index exceeds u32".into()))?,
+        );
+        let (ino, mut inode) = ffs_inode::create_inode(
+            cx,
+            &block_dev,
+            geo,
+            groups,
+            mode | 0o100_000, // S_IFREG
+            uid,
+            gid,
+            parent_group,
+            csum_seed,
+            tstamp_secs,
+            tstamp_nanos,
+            persist_ctx,
+        )?;
+        self.forget_ext4_inode_caches(ino);
+        inode.links_count = 0;
+        self.ext4_orphan_pinned_inode(
+            cx, &block_dev, geo, groups, ino, &mut inode, csum_seed, false,
+        )?;
+        Ok(inode_to_attr(sb, ino, &inode))
+    }
+
+    /// Take a zero-link inode back off the orphan list once `link` names it
+    /// again (`O_TMPFILE` + `linkat`; kernel `ext4_link` -> `ext4_orphan_del`).
+    /// `victim_next` is the inode's old `i_dtime` (its orphan-list next link);
+    /// the caller has already written the inode with `dtime` 0. The caller
+    /// holds the allocation lock.
+    fn ext4_unorphan_inode(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        victim_next: u32,
+        geo: &FsGeometry,
+        groups: &[GroupStats],
+        csum_seed: u32,
+    ) -> ffs_error::Result<()> {
+        let ino_u32 = u32::try_from(ino.0).map_err(|_| FfsError::Corruption {
+            block: 0,
+            detail: format!("unorphan: inode {ino} exceeds the ext4 32-bit inode range"),
+        })?;
+        let mut prev: Option<u32> = None;
+        let mut next = self.ext4_read_orphan_head();
+        let mut steps = 0_u64;
+        while next != 0 && next != ino_u32 {
+            prev = Some(next);
+            next = self.read_inode_raw(cx, InodeNumber(u64::from(next)))?.dtime;
+            steps = steps.saturating_add(1);
+            if steps > u64::from(u32::MAX) {
+                break; // cycle guard, as in the finalize walk
+            }
+        }
+        if next == ino_u32 {
+            self.ext4_splice_orphan_list(cx, prev, victim_next, geo, groups, csum_seed)?;
+        }
+        self.ext4_pending_orphans.lock().remove(&ino.0);
+        Ok(())
+    }
+
     /// Write the superblock with the orphan list cleared (`s_last_orphan = 0`,
     /// `EXT4_ORPHAN_FS` off, checksum restamped) through `dev`, returning the
     /// new state and, on a metadata_csum filesystem, the new checksum, for the
@@ -24313,25 +24408,30 @@ impl OpenFs {
         // (bd-y2t0r). Folding the bare sharded totals here while the descriptors
         // carried the reconciled counts would make the superblock disagree with
         // its own group descriptors.
+        let (total_free_blocks, total_free_inodes) = self.ext4_live_free_totals(alloc_mutex);
+        self.ext4_write_superblock_free_totals(cx, block_dev, total_free_blocks, total_free_inodes)
+    }
+
+    /// Current `(free_blocks, free_inodes)` of a writable ext4 mount, from
+    /// whichever allocator state is live: the reconciled sharded records plus
+    /// single-lock movement when the sharded path is active, else the
+    /// single-lock array. Backs both the persisted superblock totals and
+    /// `statfs`, so `df` reports what the next boundary will persist (sharded
+    /// inode allocations and frees never touch the single-lock array, so
+    /// `statfs` summing it alone missed every mounted create and delete).
+    fn ext4_live_free_totals(&self, alloc_mutex: &RwLock<Ext4AllocState>) -> (u64, u64) {
         #[cfg(feature = "bhh0i_sharded_alloc")]
-        let (total_free_blocks, total_free_inodes) = if self.bhh0i_sharded_ops_active() {
+        if self.bhh0i_sharded_ops_active() {
             let live = self.ext4_single_lock_group_counts();
             let t = self
                 .ext4_sharded_alloc
                 .as_ref()
                 .expect("sharded active implies present")
                 .reconciled_total_free(&live);
-            (t.blocks, t.inodes)
-        } else {
-            let alloc = alloc_mutex.read();
-            Self::ext4_fold_group_free_totals(&alloc)
-        };
-        #[cfg(not(feature = "bhh0i_sharded_alloc"))]
-        let (total_free_blocks, total_free_inodes) = {
-            let alloc = alloc_mutex.read();
-            Self::ext4_fold_group_free_totals(&alloc)
-        };
-        self.ext4_write_superblock_free_totals(cx, block_dev, total_free_blocks, total_free_inodes)
+            return (t.blocks, t.inodes);
+        }
+        let alloc = alloc_mutex.read();
+        Self::ext4_fold_group_free_totals(&alloc)
     }
 
     /// Patch the superblock's free block/inode totals (restamping its
@@ -28376,6 +28476,13 @@ impl OpenFs {
 
         let mut src_upd = src_inode.clone();
 
+        // A zero-link source is an O_TMPFILE inode (the VFS refuses to link any
+        // other unlinked inode): it sits on the orphan list, linked through
+        // `i_dtime`, and leaves it once it has a name again.
+        let was_orphan = src_inode.links_count == 0;
+        if was_orphan {
+            src_upd.dtime = 0;
+        }
         src_upd.links_count = Self::ext4_checked_links_count_delta(src_upd.links_count, ino, 1)?;
         ffs_inode::touch_ctime(&mut src_upd, tstamp_secs, tstamp_nanos);
         ffs_inode::write_inode(
@@ -28417,6 +28524,16 @@ impl OpenFs {
                 csum_seed,
             )?;
             return Err(err);
+        }
+        if was_orphan {
+            self.ext4_unorphan_inode(
+                cx,
+                ino,
+                src_inode.dtime,
+                &alloc.geo,
+                &alloc.groups,
+                csum_seed,
+            )?;
         }
 
         debug!(
@@ -31479,6 +31596,70 @@ impl OpenFs {
         );
 
         Ok(attr)
+    }
+
+    /// Record an access: set atime to `now` and nothing else (no ctime bump,
+    /// unlike `setattr`). With `strict` false this is relatime, the kernel
+    /// default: only when atime is not after mtime or ctime, or is at least a
+    /// day old. Returns whether atime was written. FUSE inodes carry
+    /// `S_NOATIME`, so the kernel never does this for us.
+    fn ext4_touch_atime(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        now: SystemTime,
+        strict: bool,
+    ) -> ffs_error::Result<bool> {
+        const RELATIME_MAX_AGE: Duration = Duration::from_hours(24);
+        let alloc_mutex = self.require_alloc_state()?;
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let mut inode = self.read_inode_with_scope(cx, scope, ino)?;
+        if inode.flags & (ffs_types::EXT4_NOATIME_FL | ffs_types::EXT4_IMMUTABLE_FL) != 0 {
+            return Ok(false);
+        }
+        let attr = inode_to_attr(sb, ino, &inode);
+        if !strict
+            && attr.atime > attr.mtime
+            && attr.atime > attr.ctime
+            && now
+                .duration_since(attr.atime)
+                .is_ok_and(|age| age < RELATIME_MAX_AGE)
+        {
+            return Ok(false);
+        }
+        let dur = now.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
+        ffs_inode::touch_atime(&mut inode, dur.as_secs(), dur.subsec_nanos());
+        let block_dev = self.block_device_adapter();
+        let alloc = alloc_mutex.read();
+        if let Some(tx) = &mut scope.tx {
+            let tx_dev = TransactionBlockAdapter {
+                base: &block_dev,
+                tx: Mutex::new(tx),
+            };
+            ffs_inode::write_inode(
+                cx,
+                &tx_dev,
+                &alloc.geo,
+                &alloc.groups,
+                ino,
+                &inode,
+                sb.csum_seed(),
+            )?;
+        } else {
+            ffs_inode::write_inode(
+                cx,
+                &block_dev,
+                &alloc.geo,
+                &alloc.groups,
+                ino,
+                &inode,
+                sb.csum_seed(),
+            )?;
+        }
+        Ok(true)
     }
 
     /// Stamp the ext4 external xattr block CRC32C checksum in place when the
@@ -64729,6 +64910,127 @@ mod tests {
                 "{what}: reclaimed exactly once"
             );
         }
+    }
+
+    /// O_TMPFILE (xfstests generic/004): the nameless inode lives on the orphan
+    /// list with nlink 0; `link` names it and takes it off the list, while an
+    /// unnamed one is reclaimed by its last reference. The result is e2fsck-clean.
+    #[test]
+    fn ext4_tmpfile_link_names_it_and_unlinked_tmpfile_is_reclaimed() {
+        let Some((fs, dev, tmp)) = open_writable_ext4_mkfs_with_device(16) else {
+            return; // format tool unavailable
+        };
+        let image = tmp.path().join("test.ext4");
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let free_before = fs.statfs(&cx, root).expect("statfs").files_free;
+
+        let kept = fs.ext4_tmpfile(&cx, root, 0o600, 0, 0).expect("tmpfile");
+        assert_eq!(kept.nlink, 0, "a tmpfile has no name");
+        assert_eq!(kept.perm & 0o7777, 0o600);
+        let payload = vec![0x5A_u8; 3 * fs.block_size() as usize];
+        assert_eq!(
+            fs.write(&cx, kept.ino, 0, &payload).expect("write") as usize,
+            payload.len()
+        );
+        let dropped = fs.ext4_tmpfile(&cx, root, 0o644, 0, 0).expect("tmpfile 2");
+        let _ = fs.write(&cx, dropped.ino, 0, &payload).expect("write 2");
+        assert_eq!(
+            u64::from(fs.ext4_read_orphan_head()),
+            dropped.ino.0,
+            "the newest tmpfile heads the orphan list"
+        );
+
+        // linkat(fd, "", root, "named", AT_EMPTY_PATH). `kept` sits mid-list,
+        // behind `dropped`, so the splice rewrites `dropped`'s next link.
+        let named = fs
+            .link(&cx, kept.ino, root, OsStr::new("named"))
+            .expect("link the tmpfile");
+        assert_eq!(named.nlink, 1);
+        let on_disk = fs.read_inode(&cx, kept.ino).expect("read named");
+        assert_eq!(on_disk.dtime, 0, "a named inode is off the orphan list");
+        assert_eq!(
+            fs.read_inode(&cx, dropped.ino).expect("read dropped").dtime,
+            0,
+            "the remaining orphan is now the list tail"
+        );
+        assert!(!fs.ext4_pending_orphans.lock().contains(&kept.ino.0));
+        assert!(
+            !fs.finalize_unlinked_inode_public(&cx, kept.ino)
+                .expect("finalize named"),
+            "the last reference to a named tmpfile must not reclaim it"
+        );
+        assert_eq!(
+            fs.lookup(&cx, root, OsStr::new("named"))
+                .expect("lookup")
+                .ino,
+            kept.ino
+        );
+        assert_eq!(
+            fs.read(&cx, kept.ino, 0, u32::try_from(payload.len()).unwrap())
+                .expect("read"),
+            payload
+        );
+
+        assert!(
+            fs.finalize_unlinked_inode_public(&cx, dropped.ino)
+                .expect("finalize dropped"),
+            "the last reference reclaims an unnamed tmpfile"
+        );
+        assert_eq!(fs.ext4_read_orphan_head(), 0, "the orphan list is empty");
+        assert_eq!(
+            fs.statfs(&cx, root).expect("statfs").files_free,
+            free_before - 1,
+            "only the named tmpfile still holds an inode"
+        );
+
+        fs.flush_mvcc_to_device(&cx).expect("flush mvcc to device");
+        std::fs::write(&image, dev.snapshot_bytes()).expect("write modified image");
+        let Some((clean, output)) = run_e2fsck(&image) else {
+            return; // e2fsck unavailable
+        };
+        assert!(clean, "e2fsck after tmpfile + link + reclaim:\n{output}");
+    }
+
+    /// Access-time maintenance (xfstests generic/003): relatime updates atime
+    /// only while it is not after mtime/ctime, strictatime on every access, and
+    /// neither ever moves ctime.
+    #[test]
+    fn ext4_touch_atime_applies_relatime_and_never_moves_ctime() {
+        let Some((fs, _tmp)) = open_writable_ext4_mkfs(16) else {
+            return; // mkfs.ext4 unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let ino = fs
+            .create(&cx, root, OsStr::new("a"), 0o644, 0, 0)
+            .expect("create")
+            .ino;
+        let created = fs.getattr(&cx, ino).expect("getattr");
+        let touch = |at: SystemTime, strict: bool| {
+            fs.with_latest_scope(|scope| {
+                <OpenFs as FsOps>::touch_atime(&fs, &cx, scope, ino, at, strict)
+            })
+            .expect("touch_atime")
+        };
+        let later = created.mtime + Duration::from_secs(5);
+        assert!(touch(later, false), "atime == mtime: relatime updates");
+        let after = fs.getattr(&cx, ino).expect("getattr");
+        assert_eq!(after.atime, later);
+        assert_eq!(after.ctime, created.ctime, "an access never moves ctime");
+        assert_eq!(after.mtime, created.mtime);
+
+        assert!(
+            !touch(later + Duration::from_secs(5), false),
+            "atime already after mtime and ctime: relatime leaves it"
+        );
+        assert!(
+            touch(later + Duration::from_hours(25), false),
+            "a day-old atime is refreshed even under relatime"
+        );
+        let strict_at = later + Duration::from_hours(26);
+        assert!(touch(strict_at, true), "strictatime updates every access");
+        assert_eq!(fs.getattr(&cx, ino).expect("getattr").atime, strict_at);
     }
 
     /// Build a journaled image whose on-disk orphan list names a 3-block file,

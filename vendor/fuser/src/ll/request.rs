@@ -344,6 +344,33 @@ mod op {
         }
     }
 
+    /// Create an unnamed file in the parent directory and open it (`O_TMPFILE`).
+    ///
+    /// Carries a `fuse_create_in` with no name; the reply is a [Create]-style
+    /// entry + open. The new inode has no links until a later `linkat`.
+    #[cfg(feature = "abi-7-40")]
+    #[derive(Debug)]
+    pub struct Tmpfile<'a> {
+        header: &'a fuse_in_header,
+        arg: &'a fuse_create_in,
+    }
+    #[cfg(feature = "abi-7-40")]
+    impl_request!(Tmpfile<'_>);
+
+    #[cfg(feature = "abi-7-40")]
+    impl Tmpfile<'_> {
+        pub fn mode(&self) -> u32 {
+            self.arg.mode
+        }
+        /// Flags as passed to the open() call
+        pub fn flags(&self) -> i32 {
+            self.arg.flags
+        }
+        pub fn umask(&self) -> u32 {
+            self.arg.umask
+        }
+    }
+
     /// Get extended file attributes through the Linux statx-compatible opcode.
     #[cfg(feature = "abi-7-40")]
     #[derive(Debug)]
@@ -1853,6 +1880,11 @@ mod op {
                 arg: data.fetch()?,
             }),
             #[cfg(feature = "abi-7-40")]
+            fuse_opcode::FUSE_TMPFILE => Operation::Tmpfile(Tmpfile {
+                header,
+                arg: data.fetch()?,
+            }),
+            #[cfg(feature = "abi-7-40")]
             fuse_opcode::FUSE_STATX => Operation::Statx(Statx {
                 header,
                 arg: data.fetch()?,
@@ -1940,6 +1972,8 @@ pub enum Operation<'a> {
     Lseek(Lseek<'a>),
     #[cfg(feature = "abi-7-28")]
     CopyFileRange(CopyFileRange<'a>),
+    #[cfg(feature = "abi-7-40")]
+    Tmpfile(Tmpfile<'a>),
     #[cfg(feature = "abi-7-40")]
     Statx(Statx<'a>),
 
@@ -2127,6 +2161,14 @@ impl fmt::Display for Operation<'_> {
                 x.src(),
                 x.dest(),
                 x.len()
+            ),
+            #[cfg(feature = "abi-7-40")]
+            Operation::Tmpfile(x) => write!(
+                f,
+                "TMPFILE mode {:#05o}, umask {:#05o}, flags {:#x}",
+                x.mode(),
+                x.umask(),
+                x.flags()
             ),
             #[cfg(feature = "abi-7-40")]
             Operation::Statx(x) => write!(

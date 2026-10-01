@@ -664,6 +664,17 @@ impl<'a> Request<'a> {
                 );
             }
             #[cfg(feature = "abi-7-40")]
+            ll::Operation::Tmpfile(x) => {
+                se.filesystem.tmpfile(
+                    self,
+                    self.request.nodeid().into(),
+                    x.mode(),
+                    x.umask(),
+                    x.flags(),
+                    self.reply(),
+                );
+            }
+            #[cfg(feature = "abi-7-40")]
             ll::Operation::Statx(x) => {
                 se.filesystem.statx(
                     self,

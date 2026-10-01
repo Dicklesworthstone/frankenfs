@@ -1002,6 +1002,39 @@ pub trait FsOps: Send + Sync {
         Err(FfsError::ReadOnly)
     }
 
+    /// Record an access to `ino` at `now`: atime only, never ctime. With
+    /// `strict` false the backend applies relatime (update only when atime is
+    /// not after mtime/ctime or is a day old). Returns whether atime changed.
+    /// Default: atime is not maintained.
+    fn touch_atime(
+        &self,
+        _cx: &Cx,
+        _scope: &mut RequestScope,
+        _ino: InodeNumber,
+        _now: SystemTime,
+        _strict: bool,
+    ) -> ffs_error::Result<bool> {
+        Ok(false)
+    }
+
+    /// `O_TMPFILE`: create an unnamed regular file near directory `parent`.
+    ///
+    /// The inode starts with no links and is reclaimed when the transport's
+    /// last reference goes ([`Self::finalize_unlinked_inode`]) unless `link`
+    /// names it first. Default: `EOPNOTSUPP`, which the kernel reports to
+    /// `open(O_TMPFILE)` callers as "not supported".
+    fn tmpfile(
+        &self,
+        _cx: &Cx,
+        _scope: &mut RequestScope,
+        _parent: InodeNumber,
+        _mode: u16,
+        _uid: u32,
+        _gid: u32,
+    ) -> ffs_error::Result<InodeAttr> {
+        Err(FfsError::UnsupportedFeature("O_TMPFILE".into()))
+    }
+
     /// Create a directory in `parent` with name `name`.
     #[allow(clippy::too_many_arguments)]
     fn mkdir(
@@ -2970,6 +3003,29 @@ impl<T: FsOps + ?Sized> FsOps for Arc<T> {
     ) -> ffs_error::Result<InodeAttr> {
         self.as_ref()
             .create(cx, scope, parent, name, mode, uid, gid)
+    }
+
+    fn tmpfile(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> ffs_error::Result<InodeAttr> {
+        self.as_ref().tmpfile(cx, scope, parent, mode, uid, gid)
+    }
+
+    fn touch_atime(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        now: SystemTime,
+        strict: bool,
+    ) -> ffs_error::Result<bool> {
+        self.as_ref().touch_atime(cx, scope, ino, now, strict)
     }
 
     fn mkdir(

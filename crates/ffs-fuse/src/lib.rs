@@ -2183,6 +2183,21 @@ impl WritebackCacheMode {
     }
 }
 
+/// When a READ records the access in atime. The kernel marks every FUSE inode
+/// `S_NOATIME`, so the daemon owns atime: without this a FUSE mount never
+/// updates it whatever the mount options say.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AtimePolicy {
+    /// `noatime`: reads never touch atime.
+    NoAtime,
+    /// `relatime` (the kernel default): update when atime is not after
+    /// mtime/ctime, or is at least a day old.
+    #[default]
+    Relatime,
+    /// `strictatime`: every read updates atime.
+    StrictAtime,
+}
+
 #[derive(Debug, Clone)]
 pub struct MountOptions {
     pub read_only: bool,
@@ -2212,6 +2227,8 @@ pub struct MountOptions {
     /// `None` means `ffs`; an empty string sets no subtype, so the type is plain
     /// `fuse` (what xfstests' `FSTYP=fuse` checks for).
     pub subtype: Option<String>,
+    /// Access-time maintenance on READ (ignored on read-only mounts).
+    pub atime: AtimePolicy,
 }
 
 impl Default for MountOptions {
@@ -2225,6 +2242,7 @@ impl Default for MountOptions {
             worker_threads: 0,
             fsname: None,
             subtype: None,
+            atime: AtimePolicy::Relatime,
         }
     }
 }
@@ -2361,7 +2379,19 @@ fn apply_mount_option(
         "max_read" | "max_background" | "congestion_threshold" => {
             let _ = parse_mount_usize(key, value)?;
         }
-        "default_permissions" | "noatime" => {
+        "noatime" => {
+            reject_mount_option_value(key, value)?;
+            options.atime = AtimePolicy::NoAtime;
+        }
+        "relatime" | "atime" => {
+            reject_mount_option_value(key, value)?;
+            options.atime = AtimePolicy::Relatime;
+        }
+        "strictatime" => {
+            reject_mount_option_value(key, value)?;
+            options.atime = AtimePolicy::StrictAtime;
+        }
+        "default_permissions" => {
             reject_mount_option_value(key, value)?;
         }
         _ => {
@@ -4113,6 +4143,41 @@ impl LookupRefcounts {
     }
 }
 
+/// Inodes whose atime relatime would leave alone (it is already after mtime
+/// and ctime), with when that was established, so a READ skips the backend
+/// check. Any mutation of the inode, and its FORGET, drops the entry; an entry
+/// older than relatime's one-day horizon is ignored.
+#[derive(Default)]
+struct AtimeFresh {
+    since: Mutex<std::collections::HashMap<u64, Instant>>,
+}
+
+impl AtimeFresh {
+    const HORIZON: Duration = Duration::from_hours(24);
+
+    fn is_fresh(&self, ino: u64) -> bool {
+        self.since
+            .lock()
+            .expect("atime freshness poisoned")
+            .get(&ino)
+            .is_some_and(|at| at.elapsed() < Self::HORIZON)
+    }
+
+    fn mark(&self, ino: u64) {
+        self.since
+            .lock()
+            .expect("atime freshness poisoned")
+            .insert(ino, Instant::now());
+    }
+
+    fn forget(&self, ino: u64) {
+        self.since
+            .lock()
+            .expect("atime freshness poisoned")
+            .remove(&ino);
+    }
+}
+
 #[allow(clippy::struct_excessive_bools)]
 struct FuseInner {
     ops: Arc<dyn FsOps>,
@@ -4121,6 +4186,9 @@ struct FuseInner {
     worker_dispatch: bool,
     parallel_dirops: bool,
     read_only: bool,
+    /// What READ does to atime ([`AtimePolicy`]).
+    atime: AtimePolicy,
+    atime_fresh: AtimeFresh,
     /// Explicit `writeback_cache` opt-in: negotiated as `FUSE_WRITEBACK_CACHE`
     /// at INIT. It is NOT a kernel mount option — passing it to mount(2) was
     /// rejected with EINVAL, so the opt-in never worked until it moved here.
@@ -5763,7 +5831,7 @@ impl Filesystem for FrankenFuse {
         // The zero-message-open rejection above is kept for history but was
         // REFUTED by measurement: the page cache is not dropped and O_DIRECT is
         // still honoured — see `zero_message_open_measurement_enabled`.
-        if zero_message_open_measurement_enabled() {
+        if zero_message_open_measurement_enabled() && !self.every_open_drops_page_cache() {
             match config.add_capabilities(fuse_consts::FUSE_NO_OPEN_SUPPORT) {
                 // WARN, not info: the perf scripts count this line under
                 // RUST_LOG=warn to attest the configuration of each run.
@@ -5892,6 +5960,7 @@ impl Filesystem for FrankenFuse {
         // and missed this seam.
         self.inner.missing_capability_xattr.forget(inode);
         self.inner.readdirplus_attr_memo.forget(inode);
+        self.inner.atime_fresh.forget(ino);
         self.forget_and_finalize(ino, nlookup);
     }
 
@@ -5908,6 +5977,7 @@ impl Filesystem for FrankenFuse {
             self.inner.access_predictor.invalidate_inode(inode);
             self.inner.missing_capability_xattr.forget(inode);
             self.inner.readdirplus_attr_memo.forget(inode);
+            self.inner.atime_fresh.forget(node.nodeid);
             self.forget_and_finalize(node.nodeid, node.nlookup);
         }
     }
@@ -6049,7 +6119,7 @@ impl Filesystem for FrankenFuse {
         // once the daemon answers one with ENOSYS, exactly as `opendir` does below.
         // See `zero_message_open_measurement_enabled` for the measurements behind
         // the default.
-        if zero_message_open_measurement_enabled() {
+        if zero_message_open_measurement_enabled() && !self.every_open_drops_page_cache() {
             reply.error(libc::ENOSYS);
             return;
         }
@@ -6059,7 +6129,11 @@ impl Filesystem for FrankenFuse {
             self.inner.ops.open(cx, scope, InodeNumber(ino), flags)
         }) {
             Ok((fh, open_flags)) => {
-                reply.opened(fh, Self::kernel_open_flags(flags, open_flags));
+                let mut kernel_flags = Self::kernel_open_flags(flags, open_flags);
+                if self.every_open_drops_page_cache() {
+                    kernel_flags &= !fuse_consts::FOPEN_KEEP_CACHE;
+                }
+                reply.opened(fh, kernel_flags);
             }
             Err(e) => {
                 let ctx = FuseErrorContext {
@@ -6130,6 +6204,9 @@ impl Filesystem for FrankenFuse {
                 self.inner
                     .metrics
                     .record_bytes_read(u64::try_from(data.len()).unwrap_or(u64::MAX));
+                // Before the reply: the kernel drops its cached atime when the
+                // READ completes, and the GETATTR that follows must see ours.
+                self.record_access(&cx, ino);
                 reply.data(&data);
             }
             Err(e) => {
@@ -6880,6 +6957,9 @@ impl Filesystem for FrankenFuse {
         ) {
             Ok(written) => {
                 reply.written(written);
+                // Unconditional, unlike the kernel notification below: the new
+                // mtime makes relatime due again on the next READ.
+                self.inner.atime_fresh.forget(ino);
                 // bd-pmjvd: counted at exactly 1.000 enqueue per write, and it is the
                 // ONLY notification this workload produces (entry_sends=1,
                 // inode_sends=502 over 501 ops). Each one costs a futex wake plus a
@@ -7342,6 +7422,59 @@ impl Filesystem for FrankenFuse {
             }
         }
     }
+
+    /// `open(dir, O_TMPFILE)`. The reply's entry reference is the only thing
+    /// keeping the nameless inode alive: its FORGET finalizes it unless a
+    /// `linkat` named it in between.
+    #[allow(clippy::cast_possible_truncation)] // FUSE mode u32 → ext4 u16
+    fn tmpfile(
+        &mut self,
+        req: &Request<'_>,
+        parent: u64,
+        mode: u32,
+        _umask: u32,
+        _flags: i32,
+        reply: ReplyCreate,
+    ) {
+        if self.inner.read_only {
+            reply.error(libc::EROFS);
+            return;
+        }
+        let cx = Self::cx_for_request();
+        if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Create) {
+            warn!(parent, "backpressure: shedding tmpfile");
+            reply.error(errno);
+            return;
+        }
+        match self.with_request_scope(&cx, RequestOp::Create, |cx, scope| {
+            let attr = self.inner.ops.tmpfile(
+                cx,
+                scope,
+                InodeNumber(parent),
+                (mode & 0o7777) as u16,
+                req.uid(),
+                req.gid(),
+            )?;
+            self.inner.ops.commit_request_scope(cx, scope)?;
+            Ok(attr)
+        }) {
+            Ok(attr) => {
+                self.inner.lookup_refcounts.retain(attr.ino.0);
+                reply.created(&ATTR_TTL, &to_file_attr(&attr), attr.generation, 0, 0);
+            }
+            Err(e) => {
+                Self::reply_error_create(
+                    &FuseErrorContext {
+                        error: &e,
+                        operation: "tmpfile",
+                        ino: parent,
+                        offset: None,
+                    },
+                    reply,
+                );
+            }
+        }
+    }
 }
 
 /// Handler bodies split out of the `Filesystem` impl so tests can drive them.
@@ -7355,6 +7488,45 @@ impl Filesystem for FrankenFuse {
 /// method with the same name and signature is valid Rust. Only a live mount
 /// could see it.
 impl FrankenFuse {
+    /// `strictatime` on a writable mount: every access must reach READ, so
+    /// OPEN is a real round trip answered without `FOPEN_KEEP_CACHE`, and the
+    /// kernel drops the file's cached pages at each open. Otherwise a re-read
+    /// is served from the page cache and records no access. This costs the
+    /// zero-message-open and keep-cache wins, which is what strictatime asks
+    /// for; the relatime default keeps both.
+    fn every_open_drops_page_cache(&self) -> bool {
+        self.inner.atime == AtimePolicy::StrictAtime && !self.inner.read_only
+    }
+
+    /// Apply the mount's [`AtimePolicy`] to a READ of `ino`. A failure only
+    /// costs the atime update, so it is logged, not returned.
+    fn record_access(&self, cx: &Cx, ino: u64) {
+        let strict = match self.inner.atime {
+            AtimePolicy::NoAtime => return,
+            AtimePolicy::Relatime => false,
+            AtimePolicy::StrictAtime => true,
+        };
+        if self.inner.read_only || (!strict && self.inner.atime_fresh.is_fresh(ino)) {
+            return;
+        }
+        let now = SystemTime::now();
+        let result = self.with_request_scope(cx, RequestOp::Setattr, |cx, scope| {
+            let touched = self
+                .inner
+                .ops
+                .touch_atime(cx, scope, InodeNumber(ino), now, strict)?;
+            if touched {
+                self.inner.ops.commit_request_scope(cx, scope)?;
+            }
+            Ok(touched)
+        });
+        match result {
+            Ok(_) if !strict => self.inner.atime_fresh.mark(ino),
+            Ok(_) => {}
+            Err(error) => debug!(ino, %error, "atime update failed"),
+        }
+    }
+
     /// The `lookup` handler body, minus the `Request` it never reads.
     ///
     /// Kept separately so the FUSE protocol reply for a negative dentry can be
@@ -8472,6 +8644,8 @@ mod tests {
             worker_dispatch: false,
             parallel_dirops: false,
             read_only: false,
+            atime: AtimePolicy::NoAtime,
+            atime_fresh: AtimeFresh::default(),
             writeback_cache: false,
             count_memoized_requests: true,
             mountpoint: None,
@@ -8516,6 +8690,8 @@ mod tests {
             worker_dispatch: false,
             parallel_dirops: false,
             read_only: false,
+            atime: AtimePolicy::NoAtime,
+            atime_fresh: AtimeFresh::default(),
             writeback_cache: false,
             count_memoized_requests: true,
             mountpoint: None,
@@ -9714,6 +9890,8 @@ mod tests {
             worker_dispatch: false,
             parallel_dirops: false,
             read_only: false,
+            atime: AtimePolicy::NoAtime,
+            atime_fresh: AtimeFresh::default(),
             writeback_cache: false,
             count_memoized_requests: true,
             mountpoint: None,
@@ -10369,6 +10547,7 @@ mod tests {
             "fn read(",
             "fn write(",
             "fn create(",
+            "fn tmpfile(",
             "fn mknod(",
             "fn mkdir(",
             "fn unlink(",
@@ -22022,6 +22201,8 @@ mod tests {
             worker_dispatch: true,
             parallel_dirops: true,
             read_only: true,
+            atime: AtimePolicy::NoAtime,
+            atime_fresh: AtimeFresh::default(),
             writeback_cache: false,
             count_memoized_requests: true,
             mountpoint: None,
@@ -22474,6 +22655,7 @@ mod tests {
             worker_threads: 0,
             fsname: None,
             subtype: None,
+            atime: AtimePolicy::Relatime,
         };
         let mount_opts = build_mount_options(&opts);
         // Should NOT contain RO
@@ -22492,6 +22674,7 @@ mod tests {
             worker_threads: 0,
             fsname: None,
             subtype: None,
+            atime: AtimePolicy::Relatime,
         };
         let mount_opts = build_mount_options(&opts);
         let has_allow = mount_opts
@@ -22559,6 +22742,7 @@ mod tests {
             worker_threads: 8,
             fsname: None,
             subtype: None,
+            atime: AtimePolicy::Relatime,
         };
         let mount_opts = build_mount_options(&opts);
         assert!(mount_opts.iter().all(|option| {
@@ -22609,6 +22793,7 @@ mod tests {
             worker_threads: 0,
             fsname: None,
             subtype: None,
+            atime: AtimePolicy::Relatime,
         };
         let mount_opts = build_mount_options(&opts);
         assert!(
@@ -22676,6 +22861,7 @@ mod tests {
                     worker_threads: 8,
                     fsname: None,
                     subtype: None,
+                    atime: AtimePolicy::Relatime,
                 },
             ),
         ];
@@ -22717,6 +22903,20 @@ mod tests {
             .expect("explicit rw writeback_cache option should parse");
         assert!(!opts.read_only);
         assert!(opts.writeback_cache.is_enabled());
+    }
+
+    #[test]
+    fn parse_mount_options_maps_atime_tokens_last_one_wins() {
+        let policy = |csv: &[u8]| {
+            parse_mount_options_for_fuzzing(csv)
+                .expect("atime option should parse")
+                .atime
+        };
+        assert_eq!(policy(b"rw"), AtimePolicy::Relatime, "relatime by default");
+        assert_eq!(policy(b"rw,noatime"), AtimePolicy::NoAtime);
+        assert_eq!(policy(b"rw,strictatime"), AtimePolicy::StrictAtime);
+        assert_eq!(policy(b"rw,noatime,relatime"), AtimePolicy::Relatime);
+        assert!(parse_mount_options_for_fuzzing(b"rw,strictatime=1").is_err());
     }
 
     /// The opt-in is an INIT capability, never a mount(2) option: this test used
@@ -23437,6 +23637,7 @@ AllowOther"#;
             worker_threads: 4,
             fsname: None,
             subtype: None,
+            atime: AtimePolicy::Relatime,
         };
         let mount_opts = build_mount_options(&opts);
         let actual = mount_option_debug_lines(&mount_opts);
@@ -23471,6 +23672,7 @@ AllowOther"#;
             worker_threads: 0,
             fsname: None,
             subtype: None,
+            atime: AtimePolicy::Relatime,
         };
         let labels = mount_option_labels_for_fuzzing(&opts);
         assert!(labels.contains(&"ro".to_owned()));
@@ -24069,6 +24271,8 @@ AllowOther"#;
             worker_dispatch: true,
             parallel_dirops: true,
             read_only: false,
+            atime: AtimePolicy::NoAtime,
+            atime_fresh: AtimeFresh::default(),
             writeback_cache: false,
             count_memoized_requests: true,
             mountpoint: None,

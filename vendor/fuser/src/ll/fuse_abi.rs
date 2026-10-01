@@ -398,6 +398,10 @@ pub enum fuse_opcode {
     FUSE_LSEEK = 46,
     #[cfg(feature = "abi-7-28")]
     FUSE_COPY_FILE_RANGE = 47,
+    // FrankenFS: O_TMPFILE (protocol 7.37); gated with the newest ABI feature
+    // this crate defines.
+    #[cfg(feature = "abi-7-40")]
+    FUSE_TMPFILE = 51,
     #[cfg(feature = "abi-7-40")]
     FUSE_STATX = 52,
 
@@ -466,6 +470,8 @@ impl TryFrom<u32> for fuse_opcode {
             46 => Ok(fuse_opcode::FUSE_LSEEK),
             #[cfg(feature = "abi-7-28")]
             47 => Ok(fuse_opcode::FUSE_COPY_FILE_RANGE),
+            #[cfg(feature = "abi-7-40")]
+            51 => Ok(fuse_opcode::FUSE_TMPFILE),
             #[cfg(feature = "abi-7-40")]
             52 => Ok(fuse_opcode::FUSE_STATX),
 

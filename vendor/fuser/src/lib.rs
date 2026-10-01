@@ -794,6 +794,27 @@ pub trait Filesystem {
         reply.error(ENOSYS);
     }
 
+    /// Create an unnamed regular file in directory `parent` and open it
+    /// (`O_TMPFILE`). Reply like [`Filesystem::create`]; the inode has no link
+    /// count until a later `linkat` names it. ENOSYS makes the kernel answer
+    /// `O_TMPFILE` with EOPNOTSUPP from then on.
+    #[cfg(feature = "abi-7-40")]
+    fn tmpfile(
+        &mut self,
+        _req: &Request<'_>,
+        parent: u64,
+        mode: u32,
+        umask: u32,
+        flags: i32,
+        reply: ReplyCreate,
+    ) {
+        warn!(
+            "[Not Implemented] tmpfile(parent: {parent:#x?}, mode: {mode}, \
+            umask: {umask:#x?}, flags: {flags:#x?})"
+        );
+        reply.error(ENOSYS);
+    }
+
     /// Test for a POSIX file lock.
     fn getlk(
         &mut self,

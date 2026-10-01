@@ -103,8 +103,8 @@ use ffs_core::{
     detect_filesystem_at_path,
 };
 use ffs_fuse::{
-    MountConfig, MountOptions, PerCoreTransportMetrics, WritebackCacheMode, mount_managed,
-    mount_managed_per_core,
+    AtimePolicy, MountConfig, MountOptions, PerCoreTransportMetrics, WritebackCacheMode,
+    mount_managed, mount_managed_per_core,
 };
 use ffs_harness::{
     ExecutionGatedParityReport, ParityExecutor,
@@ -615,6 +615,24 @@ impl MvccPolicyArg {
     }
 }
 
+/// `--atime` values: the mount's access-time policy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+enum AtimeArg {
+    Relatime,
+    Strictatime,
+    Noatime,
+}
+
+impl AtimeArg {
+    const fn policy(self) -> AtimePolicy {
+        match self {
+            Self::Relatime => AtimePolicy::Relatime,
+            Self::Strictatime => AtimePolicy::StrictAtime,
+            Self::Noatime => AtimePolicy::NoAtime,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[allow(clippy::struct_excessive_bools)]
 struct MountCmdOptions {
@@ -624,6 +642,7 @@ struct MountCmdOptions {
     fsname: Option<String>,
     /// FUSE subtype; `None` = `ffs`, empty = none (plain `fuse` type).
     subtype: Option<String>,
+    atime: AtimePolicy,
     mount_mode: MountMode,
     btrfs_mount_selection: BtrfsMountSelection,
     btrfs_device_paths: Vec<PathBuf>,
@@ -1246,6 +1265,11 @@ enum Command {
         /// `ffs`). An empty value sets none, so the type is plain `fuse`.
         #[arg(long)]
         subtype: Option<String>,
+        /// When reads update atime: `relatime` (default, as the kernel),
+        /// `strictatime` (every read) or `noatime` (never). FUSE leaves atime
+        /// to the filesystem, so this replaces the usual mount flags.
+        #[arg(long, value_enum, default_value_t = AtimeArg::Relatime)]
+        atime: AtimeArg,
         /// Opt into kernel FUSE writeback_cache after the safety gate accepts.
         ///
         /// Requires `--rw`, `--writeback-cache-gate`,
@@ -2486,6 +2510,7 @@ fn run() -> Result<()> {
             rw,
             fsname,
             subtype,
+            atime,
             writeback_cache,
             writeback_cache_gate,
             writeback_cache_ordering_oracle,
@@ -2530,6 +2555,7 @@ fn run() -> Result<()> {
                     read_write: rw,
                     fsname,
                     subtype,
+                    atime: atime.policy(),
                     mount_mode: if native {
                         MountMode::Native
                     } else {
@@ -7179,6 +7205,7 @@ fn mount_with_fuse(
         worker_threads: fuse_dispatch_workers_from_env()?,
         fsname: options.fsname.clone(),
         subtype: options.subtype.clone(),
+        atime: options.atime,
     };
 
     // bd-bhh0i mounted cutover. `ext4_create` otherwise takes
@@ -7253,6 +7280,7 @@ struct ManagedMountParams<'a> {
     auto_unmount: bool,
     fsname: Option<&'a str>,
     subtype: Option<&'a str>,
+    atime: AtimePolicy,
     writeback_cache: WritebackCacheMode,
     backpressure: Option<Arc<BackpressureGate>>,
     adaptive_runtime_plan: Option<&'a MountAdaptiveRuntimePlan>,
@@ -7370,6 +7398,7 @@ fn mount_with_managed_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_>
             worker_threads: fuse_dispatch_workers_from_env()?,
             fsname: params.fsname.map(str::to_owned),
             subtype: params.subtype.map(str::to_owned),
+            atime: params.atime,
         },
         backpressure: params.backpressure.clone(),
         unmount_timeout: std::time::Duration::from_secs(params.unmount_timeout_secs),
@@ -7571,6 +7600,7 @@ fn mount_with_per_core_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_
             worker_threads: worker_count as usize,
             fsname: params.fsname.map(str::to_owned),
             subtype: params.subtype.map(str::to_owned),
+            atime: params.atime,
         },
         backpressure: params.backpressure.clone(),
         unmount_timeout: std::time::Duration::from_secs(params.unmount_timeout_secs),
@@ -8614,6 +8644,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
                 auto_unmount,
                 fsname: options.fsname.as_deref(),
                 subtype: options.subtype.as_deref(),
+                atime: options.atime,
                 writeback_cache: WritebackCacheMode::from_enabled(options.writeback_cache.enabled),
                 backpressure: adaptive_runtime_plan
                     .as_ref()
@@ -10137,14 +10168,14 @@ fn mkfs_cmd_with_program(
 #[cfg(test)]
 mod tests {
     use super::{
-        BTRFS_FS_TREE_OBJECTID, BTRFS_ITEM_INODE_ITEM, BTRFS_ITEM_ROOT_ITEM, BtrfsInodeItem,
-        BtrfsMountSelection, Cli, Command, DumpCommand, Ext4DataErrPolicy, Ext4JournalReplayMode,
-        Ext4RecoveryOutput, FsckCommandOptions, FsckFlags, InfoCommandOptions, InfoSections,
-        LogFormat, MAX_EXT4_INFO_GROUPS, MountAccessMode, MountAdaptiveRuntimeConfig,
-        MountAdaptiveRuntimeSummaryConfig, MountBackgroundRepairMode, MountBackgroundScrubConfig,
-        MountBackgroundScrubMode, MountBackgroundScrubRequest, MountCmdOptions, MountConsoleConfig,
-        MountMode, MountRuntimeConfig, MountRuntimeMode, MountWritebackCacheConfig,
-        PerCoreTransportMetrics, RepairCommandOptions, RepairFlags,
+        AtimePolicy, BTRFS_FS_TREE_OBJECTID, BTRFS_ITEM_INODE_ITEM, BTRFS_ITEM_ROOT_ITEM,
+        BtrfsInodeItem, BtrfsMountSelection, Cli, Command, DumpCommand, Ext4DataErrPolicy,
+        Ext4JournalReplayMode, Ext4RecoveryOutput, FsckCommandOptions, FsckFlags,
+        InfoCommandOptions, InfoSections, LogFormat, MAX_EXT4_INFO_GROUPS, MountAccessMode,
+        MountAdaptiveRuntimeConfig, MountAdaptiveRuntimeSummaryConfig, MountBackgroundRepairMode,
+        MountBackgroundScrubConfig, MountBackgroundScrubMode, MountBackgroundScrubRequest,
+        MountCmdOptions, MountConsoleConfig, MountMode, MountRuntimeConfig, MountRuntimeMode,
+        MountWritebackCacheConfig, PerCoreTransportMetrics, RepairCommandOptions, RepairFlags,
         WRITEBACK_CACHE_KILL_SWITCH_ENV, btrfs_checksum_type_name, btrfs_chunk_type_flag_names,
         build_ext4_group_info, build_fsck_output, build_info_output, build_mount_open_options,
         choose_btrfs_scrub_block_size, count_blocks_at_severity_or_higher,
@@ -10268,6 +10299,7 @@ mod tests {
             allow_other: false,
             fsname: None,
             subtype: None,
+            atime: AtimePolicy::Relatime,
             read_write,
             mount_mode: MountMode::Compat,
             btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
@@ -14248,6 +14280,7 @@ mod tests {
                         allow_other: false,
                         fsname: None,
                         subtype: None,
+                        atime: AtimePolicy::Relatime,
                         read_write: true,
                         btrfs_rw_ephemeral_ok: false,
                         btrfs_verify_data_on_read: false,
@@ -14329,6 +14362,7 @@ mod tests {
                 allow_other: false,
                 fsname: None,
                 subtype: None,
+                atime: AtimePolicy::Relatime,
                 read_write: false,
                 btrfs_rw_ephemeral_ok: false,
                 btrfs_verify_data_on_read: false,
@@ -14370,6 +14404,7 @@ mod tests {
                 allow_other: false,
                 fsname: None,
                 subtype: None,
+                atime: AtimePolicy::Relatime,
                 read_write: false,
                 btrfs_rw_ephemeral_ok: false,
                 btrfs_verify_data_on_read: false,
@@ -14483,6 +14518,7 @@ mod tests {
             allow_other: false,
             fsname: None,
             subtype: None,
+            atime: AtimePolicy::Relatime,
             read_write: false,
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: false,
@@ -14575,6 +14611,7 @@ mod tests {
             allow_other: false,
             fsname: None,
             subtype: None,
+            atime: AtimePolicy::Relatime,
             read_write: false,
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: verify,
@@ -14616,6 +14653,7 @@ mod tests {
             allow_other: false,
             fsname: None,
             subtype: None,
+            atime: AtimePolicy::Relatime,
             read_write: true,
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: false,
@@ -14652,6 +14690,7 @@ mod tests {
             allow_other: false,
             fsname: None,
             subtype: None,
+            atime: AtimePolicy::Relatime,
             read_write: false,
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: false,
@@ -14692,6 +14731,7 @@ mod tests {
                     allow_other: false,
                     fsname: None,
                     subtype: None,
+                    atime: AtimePolicy::Relatime,
                     read_write: false,
                     btrfs_rw_ephemeral_ok: false,
                     btrfs_verify_data_on_read: false,
@@ -14741,6 +14781,7 @@ mod tests {
                     allow_other: false,
                     fsname: None,
                     subtype: None,
+                    atime: AtimePolicy::Relatime,
                     read_write: false,
                     btrfs_rw_ephemeral_ok: false,
                     btrfs_verify_data_on_read: false,
@@ -14791,6 +14832,7 @@ mod tests {
                     allow_other: false,
                     fsname: None,
                     subtype: None,
+                    atime: AtimePolicy::Relatime,
                     read_write: false,
                     btrfs_rw_ephemeral_ok: false,
                     btrfs_verify_data_on_read: false,
@@ -14858,6 +14900,7 @@ mod tests {
                     allow_other: false,
                     fsname: None,
                     subtype: None,
+                    atime: AtimePolicy::Relatime,
                     read_write: false,
                     btrfs_rw_ephemeral_ok: false,
                     btrfs_verify_data_on_read: false,

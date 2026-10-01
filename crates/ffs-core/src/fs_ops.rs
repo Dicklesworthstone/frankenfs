@@ -773,23 +773,7 @@ impl FsOps for OpenFs {
                 let (mut blocks_free, mut files_free) = if let Ok(alloc_mutex) =
                     self.require_alloc_state()
                 {
-                    let alloc = alloc_mutex.read();
-                    // One fused pass over the group array (same aggregation as
-                    // ext4_sync_superblock_free_totals): two separate `.sum()`
-                    // passes reload every ~96-byte group struct a second time
-                    // from memory on a large fs; free_blocks + free_inodes share a
-                    // cache line, so fold both totals at once.
-                    let totals = alloc
-                        .groups
-                        .iter()
-                        .fold((0_u64, 0_u64), |(blocks, inodes), g| {
-                            (
-                                blocks + u64::from(g.free_blocks),
-                                inodes + u64::from(g.free_inodes),
-                            )
-                        });
-                    drop(alloc);
-                    totals
+                    self.ext4_live_free_totals(alloc_mutex)
                 } else if let Some(&cached) = self.ext4_ro_statfs_totals.get() {
                     // Read-only mount: the group descriptors are immutable, so the
                     // summed totals are constant — serve the memoized O(1) value
@@ -993,6 +977,40 @@ impl FsOps for OpenFs {
                 self.check_btrfs_mutation_allowed("create")?;
                 self.btrfs_create(cx, parent, name.as_encoded_bytes(), mode, uid, gid)
             }
+        }
+    }
+
+    fn touch_atime(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        now: std::time::SystemTime,
+        strict: bool,
+    ) -> ffs_error::Result<bool> {
+        match &self.flavor {
+            FsFlavor::Ext4(_) => {
+                self.ext4_touch_atime(cx, scope, Self::ext4_canonical_inode(ino), now, strict)
+            }
+            // btrfs atime maintenance is not implemented; reads leave it as is.
+            FsFlavor::Btrfs(_) => Ok(false),
+        }
+    }
+
+    fn tmpfile(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        parent: InodeNumber,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> ffs_error::Result<InodeAttr> {
+        match &self.flavor {
+            FsFlavor::Ext4(_) => self
+                .ext4_tmpfile(cx, Self::ext4_canonical_inode(parent), mode, uid, gid)
+                .map(Self::ext4_present_attr),
+            FsFlavor::Btrfs(_) => Err(FfsError::UnsupportedFeature("O_TMPFILE on btrfs".into())),
         }
     }
 

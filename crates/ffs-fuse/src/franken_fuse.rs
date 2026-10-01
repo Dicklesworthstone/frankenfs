@@ -29,6 +29,8 @@ impl FrankenFuse {
                 worker_dispatch: options.worker_threads > 0,
                 parallel_dirops: options.worker_threads > 1,
                 read_only: options.read_only,
+                atime: options.atime,
+                atime_fresh: crate::AtimeFresh::default(),
                 writeback_cache: options.writeback_cache.is_enabled(),
                 count_memoized_requests: count_memoized_requests_from_env(),
                 mountpoint: mountpoint.map(Path::to_path_buf),
@@ -236,6 +238,7 @@ impl FrankenFuse {
         // whether a live kernel notifier has been installed; the kernel cache
         // and our own hand-off must have the same mutation boundary.
         self.inner.invalidate_readdirplus_attrs(InodeNumber(ino));
+        self.inner.atime_fresh.forget(ino);
         let Some(notifier) = self.kernel_notifier() else {
             return;
         };
