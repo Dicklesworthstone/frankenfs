@@ -277,8 +277,44 @@ impl PerGroupAlloc {
         count: u32,
         pctx: &ffs_alloc::PersistCtx,
     ) -> Result<Option<ffs_alloc::BlockAlloc>, ffs_error::FfsError> {
+        self.alloc_blocks_coherent(cx, dev, geo, hint, count, pctx, None)
+    }
+
+    /// [`Self::alloc_blocks`] kept coherent with the single-lock group array.
+    ///
+    /// `BLOCK_UNINIT` lives in BOTH copies (these records and the single-lock
+    /// `Ext4AllocState.groups`), and an allocator that finds its own copy
+    /// uninitialized synthesizes an empty bitmap instead of reading the device.
+    /// So a group initialized by one allocator and still flagged in the other's
+    /// copy got its first block handed out twice (xfstests generic/013: a
+    /// directory block reused as an xattr block). With
+    /// `single_lock_initialized` (group -> whether the single-lock copy has it
+    /// initialized), a group the single-lock side initialized is marked
+    /// initialized here before use, and a group BOTH copies still flag is
+    /// skipped: initialization belongs to the single-lock allocator (the
+    /// caller's fallback), never to this parallel path.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn alloc_blocks_coherent(
+        &self,
+        cx: &asupersync::Cx,
+        dev: &dyn ffs_block::BlockDevice,
+        geo: &ffs_alloc::FsGeometry,
+        hint: &ffs_alloc::AllocHint,
+        count: u32,
+        pctx: &ffs_alloc::PersistCtx,
+        single_lock_initialized: Option<&dyn Fn(usize) -> bool>,
+    ) -> Result<Option<ffs_alloc::BlockAlloc>, ffs_error::FfsError> {
         let order = ffs_alloc::allocation_group_order(geo, hint)?;
         self.alloc_in_scan_order(order.iter().map(|g| g.0 as usize), |g, stats| {
+            if let Some(initialized) = single_lock_initialized
+                && stats.block_bitmap_uninit()
+            {
+                if initialized(g) {
+                    stats.mark_block_bitmap_initialized();
+                } else {
+                    return None;
+                }
+            }
             // Read this locked group's own pre-populated reserved set. The Arc
             // clone releases the `reserved_cache` borrow before the `&mut stats`
             // call below; empty only if unpopulated (never, under the feature).
@@ -326,6 +362,7 @@ impl PerGroupAlloc {
         start: ffs_types::BlockNumber,
         count: u32,
         pctx: &ffs_alloc::PersistCtx,
+        single_lock_initialized: Option<&dyn Fn(usize) -> bool>,
     ) -> Result<(), ffs_error::FfsError> {
         if count == 0 {
             return Ok(());
@@ -358,7 +395,16 @@ impl PerGroupAlloc {
         // as `alloc_blocks`.
         // The `None` arm is unreachable: the single-group scan always yields
         // `Some`, and `gidx < groups.len()` was checked above.
-        self.alloc_in_scan_order(std::iter::once(gidx), |_g, stats| {
+        self.alloc_in_scan_order(std::iter::once(gidx), |g, stats| {
+            // See `alloc_blocks_coherent`: freeing into a record still flagged
+            // uninitialized would rewrite a synthesized bitmap over the group's
+            // real one, so take the single-lock copy's initialization first.
+            if let Some(initialized) = single_lock_initialized
+                && stats.block_bitmap_uninit()
+                && initialized(g)
+            {
+                stats.mark_block_bitmap_initialized();
+            }
             let reserved = stats.reserved_cache.get().cloned().unwrap_or_default();
             Some(ffs_alloc::free_blocks_in_group(
                 cx, dev, geo, stats, group, rel_start, count, pctx, &reserved,

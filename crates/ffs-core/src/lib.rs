@@ -24532,7 +24532,57 @@ impl OpenFs {
         // bitmap bit + group free-count commit eagerly (like the inode bit).
         let _ = dev;
         let alloc_dev = self.block_device_adapter();
-        sharded.alloc_blocks(cx, &alloc_dev, &geo, hint, count, &pctx)
+        // The single-lock paths (file data, xattr blocks, unlink/rmdir/orphan
+        // frees) read-modify-write the SAME bitmap blocks under the alloc WRITE
+        // lock, while this path holds only a per-group lock: a single-lock free
+        // that read a bitmap before this pick and wrote it back after erased the
+        // pick, and the block was handed out again (xfstests generic/013:
+        // multiply-claimed blocks, EIO). Holding the read side keeps the two
+        // allocator families from interleaving and sharded picks parallel.
+        let alloc_lock = self.require_alloc_state()?;
+        {
+            let single_lock = alloc_lock.read_recursive();
+            let initialized = |g: usize| {
+                single_lock
+                    .groups
+                    .get(g)
+                    .is_some_and(|stats| !stats.block_bitmap_uninit())
+            };
+            if let Some(found) = sharded.alloc_blocks_coherent(
+                cx,
+                &alloc_dev,
+                &geo,
+                hint,
+                count,
+                &pctx,
+                Some(&initialized),
+            )? {
+                return Ok(Some(found));
+            }
+        }
+        // Every group with room is still BLOCK_UNINIT in the single-lock copy:
+        // initialize through the single-lock allocator (the authoritative copy,
+        // under the write lock); the sharded record picks the initialization up
+        // on its next visit to that group.
+        let mut single_lock = alloc_lock.write();
+        let Ext4AllocState {
+            geo: lock_geo,
+            groups,
+            persist_ctx,
+        } = &mut *single_lock;
+        match ffs_alloc::alloc_blocks_persist(
+            cx,
+            &alloc_dev,
+            lock_geo,
+            groups,
+            count,
+            hint,
+            persist_ctx,
+        ) {
+            Ok(found) => Ok(Some(found)),
+            Err(FfsError::NoSpace) => Ok(None),
+            Err(err) => Err(err),
+        }
     }
 
     /// Sharded (no-write-lock) block FREE for the bd-bhh0i parallel-create cutover
@@ -24559,7 +24609,16 @@ impl OpenFs {
         let pctx = self.ext4_persist_ctx_lockfree().ok_or_else(|| {
             FfsError::Format("sharded block free: persist ctx unavailable".into())
         })?;
-        sharded.free_blocks(cx, dev, &geo, start, count, &pctx)
+        // Same exclusion as `ext4_sharded_alloc_blocks`: never interleave a
+        // bitmap read-modify-write with a single-lock writer's.
+        let single_lock = self.require_alloc_state()?.read_recursive();
+        let initialized = |g: usize| {
+            single_lock
+                .groups
+                .get(g)
+                .is_some_and(|stats| !stats.block_bitmap_uninit())
+        };
+        sharded.free_blocks(cx, dev, &geo, start, count, &pctx, Some(&initialized))
     }
 
     /// Sharded (no-write-lock) inode FREE for the bd-bhh0i cutover rollback — the
