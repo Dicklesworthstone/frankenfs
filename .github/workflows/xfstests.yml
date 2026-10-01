@@ -2,8 +2,8 @@ name: xfstests
 
 # Runs the curated generic xfstests subset against a real FrankenFS FUSE mount
 # (FSTYP=fuse, FUSE_SUBTYP=.ffs via scripts/e2e/mount.fuse.ffs) and publishes
-# per-test pass/fail/not-run results. TEST_DEV/SCRATCH_DEV are throwaway ext4
-# image files on this ephemeral runner, which is what makes the destructive
+# per-test pass/fail/not-run results, once per format (ext4, btrfs).
+# TEST_DEV/SCRATCH_DEV are throwaway image files on this ephemeral runner, which is what makes the destructive
 # XFSTESTS_REAL_RUN_ACK appropriate here and nowhere else.
 #
 # First baseline (2026-09-30, run 36749010714): generic/001 and generic/524
@@ -22,9 +22,21 @@ env:
 
 jobs:
   xfstests-fuse:
-    name: xfstests generic subset on FrankenFS (FUSE)
+    name: xfstests generic subset on FrankenFS (FUSE, ${{ matrix.fs }})
     runs-on: ubuntu-latest
     timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        # Same curated list on both formats; each format has its own baseline
+        # (the btrfs one starts empty: its first runs are the measurement).
+        include:
+          - fs: ext4
+            mkfs: mkfs.ext4 -q -F
+            baseline: scripts/e2e/xfstests_baseline.json
+          - fs: btrfs
+            mkfs: mkfs.btrfs -q -f
+            baseline: scripts/e2e/xfstests_baseline_btrfs.json
     steps:
       - name: Checkout
         uses: actions/checkout@v4
@@ -39,7 +51,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y \
-            fuse3 libfuse3-dev e2fsprogs \
+            fuse3 libfuse3-dev e2fsprogs btrfs-progs \
             build-essential autoconf automake libtool libtool-bin pkg-config \
             uuid-dev libacl1-dev libattr1-dev libaio-dev libgdbm-dev \
             libgdbm-compat-dev liburing-dev libcap-dev xfslibs-dev xfsprogs \
@@ -74,15 +86,15 @@ jobs:
           sudo useradd 123456-fsgqa || true
           img="$RUNNER_TEMP/xfstests-images"
           mkdir -p "$img"
-          truncate -s 2G "$img/test.ext4" "$img/scratch.ext4"
-          mkfs.ext4 -q -F "$img/test.ext4"
-          mkfs.ext4 -q -F "$img/scratch.ext4"
+          truncate -s 2G "$img/test.img" "$img/scratch.img"
+          ${{ matrix.mkfs }} "$img/test.img"
+          ${{ matrix.mkfs }} "$img/scratch.img"
           # fusermount3 mountpoints must be in an AppArmor-allowed location.
           sudo mkdir -p /mnt/ffs-test /mnt/ffs-scratch
           {
             echo "XFSTESTS_DIR=$HOME/xfstests-dev"
-            echo "TEST_DEV=$img/test.ext4"
-            echo "SCRATCH_DEV=$img/scratch.ext4"
+            echo "TEST_DEV=$img/test.img"
+            echo "SCRATCH_DEV=$img/scratch.img"
             echo "TEST_DIR=/mnt/ffs-test"
             echo "SCRATCH_MNT=/mnt/ffs-scratch"
           } >>"$GITHUB_ENV"
@@ -96,6 +108,7 @@ jobs:
           XFSTESTS_DRY_RUN: 0
           XFSTESTS_STRICT: 0
           XFSTESTS_REAL_RUN_ACK: xfstests-may-mutate-test-and-scratch-devices
+          XFSTESTS_BASELINE_JSON: ${{ github.workspace }}/${{ matrix.baseline }}
           FFS_MOUNT_LOG_DIR: ${{ runner.temp }}
           # No FUSE subtype: the mount type must read as plain `fuse`.
           FFS_FUSE_SUBTYPE: ""
@@ -120,7 +133,7 @@ jobs:
           data = json.load(open(sys.argv[1]))
           tests = data.get("tests", [])
           counts = collections.Counter(t.get("status") for t in tests)
-          print("### xfstests on FrankenFS (FUSE)\n")
+          print("### xfstests on FrankenFS (FUSE, ${{ matrix.fs }})\n")
           print("| status | count |\n|---|---|")
           for status, n in sorted(counts.items()):
               print(f"| {status} | {n} |")
@@ -134,7 +147,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: xfstests-fuse
+          name: xfstests-fuse-${{ matrix.fs }}
           if-no-files-found: warn
           path: |
             artifacts/e2e/**/xfstests/**
