@@ -19254,7 +19254,9 @@ fn run_fc_kernel_scenario(
     // fsyncs made durable is already in the backing file.
     let crash_image = tmp.path().join("crash_state.img");
     let kernel_image = tmp.path().join("crash_state_kernel.img");
-    for copy in [&crash_image, &kernel_image] {
+    // Untouched copy for SimulateOverlay recovery, which must not write it.
+    let overlay_image = tmp.path().join("crash_state_overlay.img");
+    for copy in [&crash_image, &kernel_image, &overlay_image] {
         let output = Command::new("sudo")
             .args(["-n", "cp"])
             .arg(&img)
@@ -19369,32 +19371,37 @@ fn run_fc_kernel_scenario(
              to mean anything"
         );
     }
-    let testdir = fs
-        .lookup(&cx, InodeNumber(1), std::ffi::OsStr::new("testdir"))
-        .expect("lookup testdir");
-    let mut ffs_view = std::collections::BTreeMap::new();
-    for entry in readdir_all(&cx, &fs, testdir.ino) {
-        let name = entry.name_str();
-        if name == "." || name == ".." {
-            continue;
+    // testdir as FrankenFS recovered it: name -> (bytes, link count).
+    fn fc_view(cx: &Cx, fs: &OpenFs) -> std::collections::BTreeMap<String, (Vec<u8>, u32)> {
+        let testdir = fs
+            .lookup(cx, InodeNumber(1), std::ffi::OsStr::new("testdir"))
+            .expect("lookup testdir");
+        let mut view = std::collections::BTreeMap::new();
+        for entry in readdir_all(cx, fs, testdir.ino) {
+            let name = entry.name_str();
+            if name == "." || name == ".." {
+                continue;
+            }
+            let attr = fs
+                .lookup(cx, testdir.ino, std::ffi::OsStr::new(&name))
+                .expect("FrankenFS lookup");
+            // A directory contributes its link count only.
+            let bytes = if attr.kind == ffs_core::FileType::Directory {
+                Vec::new()
+            } else {
+                fs.read(cx, attr.ino, 0, u32::try_from(attr.size).expect("fits"))
+                    .expect("FrankenFS read")
+            };
+            let nlink = if attr.kind == ffs_core::FileType::Directory {
+                0 // see the kernel view above
+            } else {
+                attr.nlink
+            };
+            view.insert(name, (bytes, nlink));
         }
-        let attr = fs
-            .lookup(&cx, testdir.ino, std::ffi::OsStr::new(&name))
-            .expect("FrankenFS lookup");
-        // A directory contributes its link count only.
-        let bytes = if attr.kind == ffs_core::FileType::Directory {
-            Vec::new()
-        } else {
-            fs.read(&cx, attr.ino, 0, u32::try_from(attr.size).expect("fits"))
-                .expect("FrankenFS read")
-        };
-        let nlink = if attr.kind == ffs_core::FileType::Directory {
-            0 // see the kernel view above
-        } else {
-            attr.nlink
-        };
-        ffs_view.insert(name, (bytes, nlink));
+        view
     }
+    let ffs_view = fc_view(&cx, &fs);
     assert_eq!(
         ffs_view, kernel_view,
         "{scenario}: FrankenFS fast-commit recovery must match the kernel's"
@@ -19418,6 +19425,99 @@ fn run_fc_kernel_scenario(
     } else {
         require_fuse_or_skip("e2fsck unavailable for bd-9m84h");
     }
+
+    // Recovery is idempotent: opening the recovered image again shows the
+    // same tree.
+    let again = OpenFs::open_with_options(&cx, &crash_image, &options)
+        .unwrap_or_else(|e| panic!("{scenario}: reopen after recovery: {e}"));
+    assert_eq!(
+        fc_view(&cx, &again),
+        kernel_view,
+        "{scenario}: second open after recovery"
+    );
+    drop(again);
+
+    // Changes made after recovery survive the next mount: whatever the
+    // journal and fast-commit area still hold must not be replayed over them
+    // (a file removed since must stay removed). Mounted as `ffs mount --rw`
+    // does: Apply recovery, writes, the image's own JBD2 journal.
+    let rw_mnt = tmp.path().join("ffs-rw");
+    fs::create_dir_all(&rw_mnt).unwrap();
+    let mut rw_fs = OpenFs::open_with_options(&cx, &crash_image, &options)
+        .unwrap_or_else(|e| panic!("{scenario}: RW open after recovery: {e}"));
+    rw_fs.enable_writes(&cx).expect("enable writes");
+    rw_fs
+        .attach_ext4_internal_jbd2_writer(&cx)
+        .expect("attach the image's JBD2 journal");
+    let rw_opts = MountOptions {
+        read_only: false,
+        auto_unmount: false,
+        ..MountOptions::default()
+    };
+    let session = match mount_background(Box::new(rw_fs), &rw_mnt, &rw_opts) {
+        Ok(session) => {
+            wait_for_fuse_mount_ready(&rw_mnt);
+            ffs_harness::stale_mounts::MountGuard::new(session, &rw_mnt)
+        }
+        Err(e) => {
+            require_fuse_or_skip(&format!("{scenario}: FUSE mount (rw) failed: {e}"));
+            return;
+        }
+    };
+    let mut expected_after = kernel_view.clone();
+    // A regular file with a single name, so no other entry's link count moves.
+    let removed = expected_names
+        .iter()
+        .find(|name| {
+            expected_after
+                .get(**name)
+                .is_some_and(|(_, nlink)| *nlink == 1)
+        })
+        .map(|name| (*name).to_owned());
+    if let Some(name) = &removed {
+        fs::remove_file(rw_mnt.join("testdir").join(name))
+            .unwrap_or_else(|e| panic!("{scenario}: remove {name}: {e}"));
+        expected_after.remove(name);
+    }
+    fc_fsynced_write(
+        &rw_mnt.join("testdir"),
+        "after_recovery",
+        b"written after recovery",
+        false,
+    );
+    expected_after.insert(
+        "after_recovery".to_owned(),
+        (b"written after recovery".to_vec(), 1),
+    );
+    session.unmount_and_join();
+    let remounted = OpenFs::open_with_options(&cx, &crash_image, &options)
+        .unwrap_or_else(|e| panic!("{scenario}: open after the RW session: {e}"));
+    assert_eq!(
+        fc_view(&cx, &remounted),
+        expected_after,
+        "{scenario}: changes made after recovery (removed {removed:?}, created after_recovery) \
+         must survive the next mount"
+    );
+    drop(remounted);
+
+    // SimulateOverlay recovers the same view without writing the image.
+    let pristine = fs::read(&overlay_image).expect("read overlay image");
+    let overlay_options = OpenOptions {
+        ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
+        ..OpenOptions::default()
+    };
+    let overlay = OpenFs::open_with_options(&cx, &overlay_image, &overlay_options)
+        .unwrap_or_else(|e| panic!("{scenario}: SimulateOverlay recovery: {e}"));
+    assert_eq!(
+        fc_view(&cx, &overlay),
+        kernel_view,
+        "{scenario}: SimulateOverlay recovery must match the kernel's"
+    );
+    drop(overlay);
+    assert!(
+        fs::read(&overlay_image).expect("reread overlay image") == pristine,
+        "{scenario}: SimulateOverlay recovery modified the image"
+    );
     emit_scenario_result(scenario, "PASS", None);
 }
 
