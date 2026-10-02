@@ -1068,6 +1068,8 @@ btrfs uses copy-on-write B-trees addressed by logical block addresses that must 
 
 `BTRFS_IOC_INO_LOOKUP` follows the requested `treeid` contract: `treeid=0` reports the mounted subvolume objectid; explicit tree IDs walk their matching `ROOT_ITEM` fs tree; root-object lookups return a NUL-terminated empty path. `--subvol NAME` and `--snapshot NAME` select named trees through the mount open path, including FUSE E2E coverage for root scoping and `NotFound` errors.
 
+Subvolumes nested in the mounted tree are entered as the kernel enters them. A directory entry that links a subvolume is that subvolume's root directory, read from its own tree. This works for any depth of nesting: a subvolume inside a nested subvolume gets its own tree too. Each nested subvolume is served by a read-only instance opened on first use, and its inodes appear as `slot << 48 | objectid`. The `..` of a nested root is the directory holding the link. Nested trees are read-only through the mount: create, write, unlink and the like inside them return `EROFS`. Unlike the kernel, a nested subvolume has no `st_dev` of its own, because FUSE gives a mount one device number. A subvolume created on the same writable mount shows as an empty directory until it is committed. Tests: `btrfs_nested_subvolumes_present_their_own_trees_bd_2ryx9` (btrfs-progs `--subvol` image, read-only and writable instances) and the kernel-oracle FUSE test `btrfs_nested_subvolumes_read_like_the_kernel_bd_2ryx9`.
+
 ### Send/receive parsing
 
 `parse_send_stream()` parses the btrfs send-stream format (magic, version, per-command CRC32C, required `END` terminator, 23 command variants, attribute TLV encoding). Differential validation runs against upstream `btrfs receive --dump` on a CRC-valid synthetic stream.

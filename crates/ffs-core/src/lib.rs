@@ -221,6 +221,24 @@ const BTRFS_DIR_START_INDEX: u64 = 2;
 /// upward from `BTRFS_FIRST_FREE_OBJECTID` and never reach 2^63.
 const BTRFS_SUBVOL_LINK_INO_BIT: u64 = 1 << 63;
 
+/// VFS inodes of a nested subvolume (bd-2ryx9) carry its slot in bits 48..62:
+/// `slot << 48 | objectid`. Slot 0 is the mounted subvolume itself, and bit 63
+/// stays free for [`BTRFS_SUBVOL_LINK_INO_BIT`].
+const BTRFS_NESTED_SLOT_SHIFT: u32 = 48;
+const BTRFS_NESTED_OBJECTID_MASK: u64 = (1 << BTRFS_NESTED_SLOT_SHIFT) - 1;
+const BTRFS_NESTED_MAX_SLOTS: usize = (1 << 15) - 1;
+
+/// A nested subvolume presented through a mount (bd-2ryx9).
+struct BtrfsNestedSlot {
+    subvol_id: u64,
+    /// Read-only instance mounted on that subvolume.
+    fs: Arc<OpenFs>,
+    /// Its root directory's objectid (`ROOT_ITEM.root_dirid`).
+    root_dirid: u64,
+    /// VFS inode of the directory holding the link: the root's `..`.
+    parent: InodeNumber,
+}
+
 /// Highest objectid an inode can have (-256). Above it are reserved
 /// objectids: orphan items (-5), logged csum items (-10). The next free inode
 /// number is computed below it; counting those made it wrap into them, and
@@ -989,6 +1007,9 @@ pub enum BtrfsMountSelection {
     Subvolume(String),
     /// Mount the named snapshot.
     Snapshot(String),
+    /// Mount the subvolume with this root-tree objectid (how a mount presents
+    /// a nested subvolume it reaches through a directory entry, bd-2ryx9).
+    SubvolumeId(u64),
 }
 
 impl BtrfsMountSelection {
@@ -998,13 +1019,14 @@ impl BtrfsMountSelection {
             Self::DefaultRoot => "default_root",
             Self::Subvolume(_) => "subvolume",
             Self::Snapshot(_) => "snapshot",
+            Self::SubvolumeId(_) => "subvolume_id",
         }
     }
 
     #[must_use]
     pub fn requested_name(&self) -> Option<&str> {
         match self {
-            Self::DefaultRoot => None,
+            Self::DefaultRoot | Self::SubvolumeId(_) => None,
             Self::Subvolume(name) | Self::Snapshot(name) => Some(name),
         }
     }
@@ -2062,6 +2084,14 @@ pub struct OpenFs {
     /// silently. Staying read-only preserves the log for a kernel mount, which
     /// can replay it.
     btrfs_foreign_tree_log: bool,
+    /// Nested subvolumes this mount presents (bd-2ryx9): slot `i` is a
+    /// read-only instance of one subvolume reached through a directory entry,
+    /// and its inodes appear as `(i + 1) << 48 | objectid`. Only the instance
+    /// a mount was opened as presents them; nested instances report their own
+    /// subvolume links upward, so a subvolume nested inside a nested one gets
+    /// a slot here too.
+    btrfs_nested: Mutex<Vec<BtrfsNestedSlot>>,
+    btrfs_nested_enabled: bool,
     /// LRU cache for extent tree lookups, avoiding repeated tree traversals
     /// for sequential reads. Invalidated on write/truncate/punch_hole.
     extent_cache: ffs_extent::ExtentCache,
@@ -4100,6 +4130,68 @@ struct OverlayWrite {
 ///
 /// Reads merge overlay writes on top of the underlying device, while writes
 /// are captured in-memory only.
+/// Another view of an already-open device, for the read-only instances that
+/// present nested btrfs subvolumes (bd-2ryx9). Every call goes to the shared
+/// device unchanged.
+struct SharedByteDevice(Arc<dyn ByteDevice>);
+
+impl ByteDevice for SharedByteDevice {
+    fn len_bytes(&self) -> u64 {
+        self.0.len_bytes()
+    }
+
+    fn supports_vectored_reads(&self) -> bool {
+        self.0.supports_vectored_reads()
+    }
+
+    fn preserves_read_exact_at_destination_on_error(&self) -> bool {
+        self.0.preserves_read_exact_at_destination_on_error()
+    }
+
+    fn preserves_read_vectored_destinations_on_error(&self) -> bool {
+        self.0.preserves_read_vectored_destinations_on_error()
+    }
+
+    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<(), FfsError> {
+        self.0.read_exact_at(cx, offset, buf)
+    }
+
+    fn read_exact_at_volatile(
+        &self,
+        cx: &Cx,
+        offset: ByteOffset,
+        buf: &mut [u8],
+    ) -> Result<(), FfsError> {
+        self.0.read_exact_at_volatile(cx, offset, buf)
+    }
+
+    fn read_vectored_exact_at(
+        &self,
+        cx: &Cx,
+        offset: ByteOffset,
+        bufs: &mut [std::io::IoSliceMut<'_>],
+    ) -> Result<(), FfsError> {
+        self.0.read_vectored_exact_at(cx, offset, bufs)
+    }
+
+    fn write_all_at(&self, cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<(), FfsError> {
+        self.0.write_all_at(cx, offset, buf)
+    }
+
+    fn write_vectored_all_at(
+        &self,
+        cx: &Cx,
+        offset: ByteOffset,
+        bufs: &[&[u8]],
+    ) -> Result<(), FfsError> {
+        self.0.write_vectored_all_at(cx, offset, bufs)
+    }
+
+    fn sync(&self, cx: &Cx) -> Result<(), FfsError> {
+        self.0.sync(cx)
+    }
+}
+
 struct OverlayByteDevice {
     inner: Box<dyn ByteDevice>,
     writes: RwLock<Vec<OverlayWrite>>,
@@ -6521,6 +6613,8 @@ impl OpenFs {
             extent_cache: ffs_extent::ExtentCache::new(),
             ext4_write_extent_snapshot: Mutex::new(None),
             readdir_snapshot: Mutex::new(None),
+            btrfs_nested: Mutex::new(Vec::new()),
+            btrfs_nested_enabled: true,
             dir_name_index: (0..DIR_NAME_INDEX_SHARDS)
                 .map(|_| Mutex::new(None))
                 .collect(),
@@ -6705,6 +6799,7 @@ impl OpenFs {
             BtrfsMountSelection::Snapshot(name) => {
                 Self::resolve_named_btrfs_snapshot(root_tree_items, name)?
             }
+            BtrfsMountSelection::SubvolumeId(id) => *id,
         };
 
         let root_item_entry = root_tree_items
@@ -13042,6 +13137,11 @@ impl OpenFs {
     /// root inode objectid so root getattr/readdir/lookup calls can work
     /// through the VFS root inode contract.
     fn btrfs_canonical_inode(&self, ino: InodeNumber) -> Result<u64, FfsError> {
+        // Reads of a nested subvolume are routed to its own instance before
+        // they get here; anything else on one (every mutation) is refused.
+        if self.btrfs_nested_enabled && Self::btrfs_nested_split(ino).0 != 0 {
+            return Err(FfsError::ReadOnly);
+        }
         if ino.0 == 1 {
             self.btrfs_context()
                 .map(|ctx| ctx.subvol_root_dirid)
@@ -13065,6 +13165,189 @@ impl OpenFs {
         } else {
             InodeNumber(child_objectid)
         }
+    }
+
+    /// (slot, inode within that subvolume) of a VFS inode; slot 0 is the
+    /// mounted subvolume (bd-2ryx9).
+    const fn btrfs_nested_split(ino: InodeNumber) -> (usize, InodeNumber) {
+        if ino.0 & BTRFS_SUBVOL_LINK_INO_BIT != 0 {
+            return (0, ino);
+        }
+        (
+            (ino.0 >> BTRFS_NESTED_SLOT_SHIFT) as usize,
+            InodeNumber(ino.0 & BTRFS_NESTED_OBJECTID_MASK),
+        )
+    }
+
+    const fn btrfs_nested_tag(slot: usize, ino: InodeNumber) -> InodeNumber {
+        if slot == 0 {
+            ino
+        } else {
+            InodeNumber(
+                ((slot as u64) << BTRFS_NESTED_SLOT_SHIFT) | (ino.0 & BTRFS_NESTED_OBJECTID_MASK),
+            )
+        }
+    }
+
+    /// The nested-subvolume instance serving VFS inode `ino`, with the inode
+    /// as that instance knows it, or `None` for this mount's own inodes.
+    fn btrfs_nested_route(
+        &self,
+        ino: InodeNumber,
+    ) -> Result<Option<(usize, Arc<Self>, InodeNumber)>, FfsError> {
+        if !self.btrfs_nested_enabled || !self.is_btrfs() {
+            return Ok(None);
+        }
+        let (slot, inner) = Self::btrfs_nested_split(ino);
+        if slot == 0 {
+            return Ok(None);
+        }
+        let slots = self.btrfs_nested.lock();
+        let entry = slots
+            .get(slot - 1)
+            .ok_or_else(|| FfsError::NotFound(format!("nested btrfs subvolume slot {slot}")))?;
+        Ok(Some((slot, Arc::clone(&entry.fs), inner)))
+    }
+
+    /// Slot and root objectid of nested subvolume `subvol_id`, opening a
+    /// read-only instance on it the first time it is reached.
+    fn btrfs_nested_slot_for(
+        &self,
+        cx: &Cx,
+        subvol_id: u64,
+        parent: InodeNumber,
+    ) -> Result<(usize, u64), FfsError> {
+        let mut slots = self.btrfs_nested.lock();
+        if let Some(index) = slots.iter().position(|slot| slot.subvol_id == subvol_id) {
+            return Ok((index + 1, slots[index].root_dirid));
+        }
+        if slots.len() >= BTRFS_NESTED_MAX_SLOTS {
+            return Err(FfsError::UnsupportedFeature(format!(
+                "more than {BTRFS_NESTED_MAX_SLOTS} nested btrfs subvolumes in one mount"
+            )));
+        }
+        let options = OpenOptions {
+            btrfs_mount_selection: BtrfsMountSelection::SubvolumeId(subvol_id),
+            ..OpenOptions::default()
+        };
+        let mut nested = Self::from_device(
+            cx,
+            Box::new(SharedByteDevice(Arc::clone(&self.dev))),
+            &options,
+        )?;
+        nested.btrfs_nested_enabled = false;
+        let root_dirid = nested
+            .btrfs_context()
+            .map_or(BTRFS_FIRST_FREE_OBJECTID, |ctx| ctx.subvol_root_dirid);
+        slots.push(BtrfsNestedSlot {
+            subvol_id,
+            fs: Arc::new(nested),
+            root_dirid,
+            parent,
+        });
+        Ok((slots.len(), root_dirid))
+    }
+
+    /// The VFS inode for an inode reported by slot `slot` (0 = this mount)
+    /// while listing or looking up in directory `dir`: a subvolume link
+    /// becomes the root of that subvolume's slot, and a nested instance's
+    /// root alias (inode 1) its root objectid.
+    fn btrfs_nested_present(
+        &self,
+        cx: &Cx,
+        slot: usize,
+        ino: InodeNumber,
+        dir: InodeNumber,
+    ) -> InodeNumber {
+        if !self.btrfs_nested_enabled {
+            return ino;
+        }
+        if ino.0 & BTRFS_SUBVOL_LINK_INO_BIT != 0 {
+            let subvol_id = ino.0 & !BTRFS_SUBVOL_LINK_INO_BIT;
+            return match self.btrfs_nested_slot_for(cx, subvol_id, dir) {
+                Ok((child, root)) => Self::btrfs_nested_tag(child, InodeNumber(root)),
+                // Not readable as a tree on the device (a subvolume created
+                // on this writable mount and not yet committed): it stays the
+                // empty placeholder.
+                Err(err) => {
+                    debug!(subvol_id, error = %err, "nested btrfs subvolume not presented");
+                    ino
+                }
+            };
+        }
+        if slot != 0 && ino.0 == 1 {
+            let root = self.btrfs_nested.lock()[slot - 1].root_dirid;
+            return Self::btrfs_nested_tag(slot, InodeNumber(root));
+        }
+        Self::btrfs_nested_tag(slot, ino)
+    }
+
+    /// `..` of a nested subvolume's root: the directory holding its link.
+    fn btrfs_nested_root_parent(&self, slot: usize, inner_dir: InodeNumber) -> Option<InodeNumber> {
+        if slot == 0 {
+            return None;
+        }
+        let slots = self.btrfs_nested.lock();
+        let entry = slots.get(slot - 1)?;
+        (inner_dir.0 == entry.root_dirid || inner_dir.0 == 1).then_some(entry.parent)
+    }
+
+    /// btrfs lookup as the mount presents it (bd-2ryx9): in a nested
+    /// subvolume through its instance, and a subvolume link as the root
+    /// directory of that subvolume.
+    fn btrfs_lookup_presented(
+        &self,
+        cx: &Cx,
+        parent: InodeNumber,
+        name: &[u8],
+    ) -> Result<InodeAttr, FfsError> {
+        let (slot, mut attr) = match self.btrfs_nested_route(parent)? {
+            Some((slot, nested, inner)) => (slot, nested.btrfs_lookup_child(cx, inner, name)?),
+            None => (0, self.btrfs_lookup_child(cx, parent, name)?),
+        };
+        if self.btrfs_nested_enabled && attr.ino.0 & BTRFS_SUBVOL_LINK_INO_BIT != 0 {
+            let root = self.btrfs_nested_present(cx, slot, attr.ino, parent);
+            let Some((_, nested, inner)) = self.btrfs_nested_route(root)? else {
+                return Ok(attr); // still the placeholder
+            };
+            let mut root_attr = nested.btrfs_read_inode_attr(cx, inner)?;
+            root_attr.ino = root;
+            return Ok(root_attr);
+        }
+        attr.ino = self.btrfs_nested_present(cx, slot, attr.ino, parent);
+        Ok(attr)
+    }
+
+    /// A readdir page from slot `slot` as the mount presents it: subvolume
+    /// links become nested roots, a nested root's `..` the directory holding
+    /// its link, and every other inode is tagged with the slot.
+    fn btrfs_nested_present_page(
+        &self,
+        cx: &Cx,
+        slot: usize,
+        inner_dir: InodeNumber,
+        dir: InodeNumber,
+        page: crate::vfs::ReaddirPage,
+    ) -> crate::vfs::ReaddirPage {
+        if !self.btrfs_nested_enabled
+            || (slot == 0
+                && !page
+                    .iter()
+                    .any(|entry| entry.ino.0 & BTRFS_SUBVOL_LINK_INO_BIT != 0))
+        {
+            return page;
+        }
+        let mut entries = page.to_vec();
+        for entry in &mut entries {
+            if entry.name == b".."
+                && let Some(parent) = self.btrfs_nested_root_parent(slot, inner_dir)
+            {
+                entry.ino = parent;
+                continue;
+            }
+            entry.ino = self.btrfs_nested_present(cx, slot, entry.ino, dir);
+        }
+        crate::vfs::ReaddirPage::new(entries)
     }
 
     /// Attributes of a nested-subvolume link (see [`Self::btrfs_dir_child_ino`]).
@@ -89065,13 +89348,17 @@ mod tests {
             .create_subvolume(&cx, root, b"nested", 0, 0)
             .expect("create_subvolume");
 
-        let check_reads = |fs: &OpenFs, label: &str| {
+        // Uncommitted, the subvolume is not a tree on the device yet and the
+        // link presents as an empty placeholder. Once committed, a mount
+        // presents it as the root of its own tree (bd-2ryx9): slot 1, root
+        // directory 256, empty here. Either way it is its own inode, never
+        // objectid `subvol_id` of the parent tree.
+        let check_reads = |fs: &OpenFs, label: &str, expected: InodeNumber| {
             let link = fs
                 .lookup(&cx, InodeNumber(1), OsStr::new("nested"))
                 .unwrap_or_else(|e| panic!("{label}: lookup nested: {e:?}"));
             assert_eq!(
-                link.ino,
-                InodeNumber(BTRFS_SUBVOL_LINK_INO_BIT | subvol_id),
+                link.ino, expected,
                 "{label}: the link gets its own inode, not objectid {subvol_id} of this tree"
             );
             assert_eq!(link.kind, FileType::Directory, "{label}");
@@ -89102,7 +89389,11 @@ mod tests {
                 "{label}"
             );
         };
-        check_reads(&fs, "writable");
+        check_reads(
+            &fs,
+            "writable",
+            InodeNumber(BTRFS_SUBVOL_LINK_INO_BIT | subvol_id),
+        );
 
         let eperm = |r: ffs_error::Result<()>, what: &str| {
             let err = r.expect_err(what);
@@ -89139,7 +89430,177 @@ mod tests {
             assert!(ok, "btrfs check after refused mutations:\n{output}");
         }
         let ro = OpenFs::open_with_options(&cx, &image, &OpenOptions::default()).expect("open ro");
-        check_reads(&ro, "read-only");
+        check_reads(
+            &ro,
+            "read-only",
+            InodeNumber((1 << BTRFS_NESTED_SLOT_SHIFT) | u64::from(BTRFS_FIRST_FREE_OBJECTID)),
+        );
+    }
+
+    /// bd-2ryx9: a nested subvolume is entered like the kernel enters it: its
+    /// link in the parent directory is the root directory of the subvolume's
+    /// own tree, and what is inside (files, directories, a subvolume nested in
+    /// it) reads as the kernel shows it. Before, it was an empty placeholder
+    /// directory. The image comes from btrfs-progs (`--rootdir` + `--subvol`).
+    /// A nested root's `..` is the directory holding its link, and the nested
+    /// trees are read-only through this mount, on a read-only and on a
+    /// writable instance alike.
+    #[test]
+    fn btrfs_nested_subvolumes_present_their_own_trees_bd_2ryx9() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let tree = tmp.path().join("tree");
+        let payload: Vec<u8> = (0..20_000_u32).map(|i| (i % 253) as u8).collect();
+        std::fs::create_dir_all(tree.join("sv/dir")).expect("mkdir sv/dir");
+        std::fs::create_dir_all(tree.join("sv/inner")).expect("mkdir sv/inner");
+        std::fs::create_dir_all(tree.join("plain")).expect("mkdir plain");
+        std::fs::write(tree.join("top.txt"), b"top").expect("write");
+        std::fs::write(tree.join("plain/p.txt"), b"plain").expect("write");
+        std::fs::write(tree.join("sv/a.txt"), b"in sv").expect("write");
+        std::fs::write(tree.join("sv/dir/b.bin"), &payload).expect("write");
+        std::fs::write(tree.join("sv/inner/c.txt"), b"in inner").expect("write");
+
+        let image = tmp.path().join("nested.btrfs");
+        std::fs::File::create(&image)
+            .and_then(|f| f.set_len(256 * 1024 * 1024))
+            .expect("create image");
+        let fmt_tool = format!("mk{}.btrfs", "fs");
+        let made = std::process::Command::new(fmt_tool)
+            .args(["-q", "-f", "--rootdir"])
+            .arg(&tree)
+            .args(["--subvol", "rw:sv", "--subvol", "rw:sv/inner"])
+            .arg(&image)
+            .output();
+        match made {
+            Ok(out) if out.status.success() => {}
+            Ok(out) => {
+                eprintln!(
+                    "SKIP: btrfs-progs cannot build nested subvolumes: {}",
+                    String::from_utf8_lossy(&out.stderr).trim()
+                );
+                return;
+            }
+            Err(e) => {
+                eprintln!("SKIP: btrfs-progs unavailable: {e}");
+                return;
+            }
+        }
+
+        fn walk(
+            cx: &Cx,
+            fs: &OpenFs,
+            dir: InodeNumber,
+            prefix: &str,
+            view: &mut std::collections::BTreeMap<String, Vec<u8>>,
+        ) {
+            for entry in fs.readdir(cx, dir, 0).expect("readdir") {
+                let name = String::from_utf8(entry.name.clone()).expect("utf8 name");
+                if name == "." || name == ".." {
+                    continue;
+                }
+                let attr = fs
+                    .lookup(cx, dir, OsStr::new(&name))
+                    .unwrap_or_else(|e| panic!("lookup {prefix}{name}: {e:?}"));
+                assert_eq!(
+                    attr.ino, entry.ino,
+                    "readdir and lookup agree on {prefix}{name}"
+                );
+                if attr.kind == FileType::Directory {
+                    view.insert(format!("{prefix}{name}/"), Vec::new());
+                    walk(cx, fs, attr.ino, &format!("{prefix}{name}/"), view);
+                } else {
+                    let bytes = fs
+                        .read(cx, attr.ino, 0, u32::try_from(attr.size).expect("fits"))
+                        .unwrap_or_else(|e| panic!("read {prefix}{name}: {e:?}"));
+                    view.insert(format!("{prefix}{name}"), bytes);
+                }
+            }
+        }
+        let expected: std::collections::BTreeMap<String, Vec<u8>> = [
+            ("plain/", Vec::new()),
+            ("plain/p.txt", b"plain".to_vec()),
+            ("sv/", Vec::new()),
+            ("sv/a.txt", b"in sv".to_vec()),
+            ("sv/dir/", Vec::new()),
+            ("sv/dir/b.bin", payload.clone()),
+            ("sv/inner/", Vec::new()),
+            ("sv/inner/c.txt", b"in inner".to_vec()),
+            ("top.txt", b"top".to_vec()),
+        ]
+        .into_iter()
+        .map(|(path, bytes)| (path.to_owned(), bytes))
+        .collect();
+        let cx = Cx::for_testing();
+        let dotdot = |fs: &OpenFs, dir: InodeNumber| {
+            fs.readdir(&cx, dir, 0)
+                .expect("readdir")
+                .into_iter()
+                .find(|entry| entry.name == b"..")
+                .expect("..")
+                .ino
+        };
+
+        let bytes = std::fs::read(&image).expect("read image");
+        for writable in [false, true] {
+            let label = if writable { "writable" } else { "read-only" };
+            let opts = OpenOptions {
+                btrfs_rw_ephemeral_ok: true,
+                ..OpenOptions::default()
+            };
+            let mut fs =
+                OpenFs::from_device(&cx, Box::new(TestDevice::from_vec(bytes.clone())), &opts)
+                    .expect("open nested image");
+            if writable {
+                fs.enable_writes(&cx).expect("enable writes");
+            }
+            let mut view = std::collections::BTreeMap::new();
+            walk(&cx, &fs, InodeNumber(1), "", &mut view);
+            assert_eq!(
+                view, expected,
+                "{label}: the tree through nested subvolumes"
+            );
+
+            let sv = fs
+                .lookup(&cx, InodeNumber(1), OsStr::new("sv"))
+                .expect("sv");
+            let inner = fs.lookup(&cx, sv.ino, OsStr::new("inner")).expect("inner");
+            assert_ne!(
+                sv.ino.0 >> BTRFS_NESTED_SLOT_SHIFT,
+                0,
+                "{label}: sv is nested"
+            );
+            assert_ne!(
+                inner.ino.0 >> BTRFS_NESTED_SLOT_SHIFT,
+                sv.ino.0 >> BTRFS_NESTED_SLOT_SHIFT,
+                "{label}: inner is a subvolume of its own"
+            );
+            assert_eq!(fs.getattr(&cx, sv.ino).expect("getattr sv").ino, sv.ino);
+            assert_eq!(dotdot(&fs, sv.ino), InodeNumber(1), "{label}: .. of sv");
+            assert_eq!(dotdot(&fs, inner.ino), sv.ino, "{label}: .. of inner");
+
+            let erofs = |r: ffs_error::Result<()>, what: &str| {
+                let err = r.expect_err(what);
+                assert_eq!(err.to_errno(), libc::EROFS, "{label}: {what}: {err:?}");
+            };
+            let a = fs.lookup(&cx, sv.ino, OsStr::new("a.txt")).expect("a.txt");
+            erofs(
+                fs.create(&cx, sv.ino, OsStr::new("new"), 0o644, 0, 0)
+                    .map(|_| ()),
+                "create in a nested subvolume",
+            );
+            erofs(
+                fs.write(&cx, a.ino, 0, b"x").map(|_| ()),
+                "write a nested file",
+            );
+            erofs(
+                fs.unlink(&cx, inner.ino, OsStr::new("c.txt")),
+                "unlink in a nested-in-nested subvolume",
+            );
+            assert_eq!(
+                fs.read(&cx, a.ino, 0, 64).expect("read a.txt"),
+                b"in sv",
+                "{label}: refused writes changed nothing"
+            );
+        }
     }
 
     /// bd-jctlm: btrfs only inlines files BELOW the sector boundary; a file whose

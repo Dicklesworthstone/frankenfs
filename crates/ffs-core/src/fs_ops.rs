@@ -568,7 +568,14 @@ impl FsOps for OpenFs {
             FsFlavor::Ext4(_) => self
                 .read_inode_attr_with_scope(cx, scope, Self::ext4_canonical_inode(ino))
                 .map(Self::ext4_present_attr),
-            FsFlavor::Btrfs(_) => self.btrfs_read_inode_attr(cx, ino),
+            FsFlavor::Btrfs(_) => {
+                if let Some((slot, nested, inner)) = self.btrfs_nested_route(ino)? {
+                    let mut attr = nested.btrfs_read_inode_attr(cx, inner)?;
+                    attr.ino = self.btrfs_nested_present(cx, slot, attr.ino, ino);
+                    return Ok(attr);
+                }
+                self.btrfs_read_inode_attr(cx, ino)
+            }
         }
     }
 
@@ -628,7 +635,7 @@ impl FsOps for OpenFs {
                 self.read_inode_attr_with_scope(cx, scope, child_ino)
                     .map(Self::ext4_present_attr)
             }
-            FsFlavor::Btrfs(_) => self.btrfs_lookup_child(cx, parent, name.as_encoded_bytes()),
+            FsFlavor::Btrfs(_) => self.btrfs_lookup_presented(cx, parent, name.as_encoded_bytes()),
         }
     }
 
@@ -641,7 +648,14 @@ impl FsOps for OpenFs {
     ) -> ffs_error::Result<ReaddirPage> {
         match &self.flavor {
             FsFlavor::Ext4(_) => self.ext4_readdir(cx, scope, ino, offset),
-            FsFlavor::Btrfs(_) => self.btrfs_readdir(cx, scope, ino, offset),
+            FsFlavor::Btrfs(_) => {
+                if let Some((slot, nested, inner)) = self.btrfs_nested_route(ino)? {
+                    let page = nested.btrfs_readdir(cx, &RequestScope::empty(), inner, offset)?;
+                    return Ok(self.btrfs_nested_present_page(cx, slot, inner, ino, page));
+                }
+                let page = self.btrfs_readdir(cx, scope, ino, offset)?;
+                Ok(self.btrfs_nested_present_page(cx, 0, ino, ino, page))
+            }
         }
     }
 
@@ -653,6 +667,9 @@ impl FsOps for OpenFs {
         offset: u64,
         size: u32,
     ) -> ffs_error::Result<Vec<u8>> {
+        if let Some((_, nested, inner)) = self.btrfs_nested_route(ino)? {
+            return nested.read(cx, &mut RequestScope::empty(), inner, offset, size);
+        }
         match &self.flavor {
             FsFlavor::Ext4(_) => {
                 let inode =
@@ -711,6 +728,9 @@ impl FsOps for OpenFs {
         scope: &mut RequestScope,
         ino: InodeNumber,
     ) -> ffs_error::Result<Vec<u8>> {
+        if let Some((_, nested, inner)) = self.btrfs_nested_route(ino)? {
+            return nested.readlink(cx, &mut RequestScope::empty(), inner);
+        }
         match &self.flavor {
             FsFlavor::Ext4(_) => {
                 let inode =
@@ -852,6 +872,9 @@ impl FsOps for OpenFs {
     }
 
     fn listxattr(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<Vec<String>> {
+        if let Some((_, nested, inner)) = self.btrfs_nested_route(ino)? {
+            return nested.listxattr(cx, inner);
+        }
         match &self.flavor {
             FsFlavor::Ext4(_) => {
                 let entries =
@@ -871,6 +894,9 @@ impl FsOps for OpenFs {
         // An over-long name is ERANGE (kernel pre-fs check), not a spurious
         // not-found.
         Self::xattr_name_within_limit_or_erange(name)?;
+        if let Some((_, nested, inner)) = self.btrfs_nested_route(ino)? {
+            return nested.getxattr(cx, inner, name);
+        }
         match &self.flavor {
             FsFlavor::Ext4(_) => {
                 let entries =
@@ -1010,6 +1036,10 @@ impl FsOps for OpenFs {
         now: std::time::SystemTime,
         strict: bool,
     ) -> ffs_error::Result<bool> {
+        // A nested subvolume is presented read-only (bd-2ryx9): no atime.
+        if self.btrfs_nested_route(ino)?.is_some() {
+            return Ok(false);
+        }
         match &self.flavor {
             FsFlavor::Ext4(_) => {
                 self.ext4_touch_atime(cx, scope, Self::ext4_canonical_inode(ino), now, strict)
@@ -1394,6 +1424,9 @@ impl FsOps for OpenFs {
         start: u64,
         length: u64,
     ) -> ffs_error::Result<Vec<FiemapExtent>> {
+        if let Some((_, nested, inner)) = self.btrfs_nested_route(ino)? {
+            return nested.fiemap(cx, &mut RequestScope::empty(), inner, start, length);
+        }
         match &self.flavor {
             FsFlavor::Ext4(_) => self.ext4_fiemap(cx, scope, ino, start, length),
             FsFlavor::Btrfs(_) => self.btrfs_fiemap(cx, ino, start, length),
@@ -1408,6 +1441,9 @@ impl FsOps for OpenFs {
         offset: u64,
         whence: SeekWhence,
     ) -> ffs_error::Result<u64> {
+        if let Some((_, nested, inner)) = self.btrfs_nested_route(ino)? {
+            return nested.lseek(cx, &mut RequestScope::empty(), inner, offset, whence);
+        }
         match whence {
             SeekWhence::Data => match &self.flavor {
                 FsFlavor::Ext4(_) => self.ext4_lseek_data(cx, scope, ino, offset),
@@ -1432,6 +1468,9 @@ impl FsOps for OpenFs {
         scope: &mut RequestScope,
         ino: InodeNumber,
     ) -> ffs_error::Result<u32> {
+        if let Some((_, nested, inner)) = self.btrfs_nested_route(ino)? {
+            return nested.get_inode_flags(cx, &mut RequestScope::empty(), inner);
+        }
         match &self.flavor {
             FsFlavor::Ext4(_) => {
                 let inode =
@@ -1459,6 +1498,9 @@ impl FsOps for OpenFs {
         scope: &mut RequestScope,
         ino: InodeNumber,
     ) -> ffs_error::Result<u32> {
+        if let Some((_, nested, inner)) = self.btrfs_nested_route(ino)? {
+            return nested.get_inode_state(cx, &mut RequestScope::empty(), inner);
+        }
         // EXT4_STATE_FLAG_* bits are kernel-side transient flags
         // (EXT_PRECACHED is a per-mount cache flag, NEW/NEWENTRY are
         // kernel allocator hints, DA_ALLOC_CLOSE is a delayed-alloc
@@ -1483,6 +1525,9 @@ impl FsOps for OpenFs {
         scope: &mut RequestScope,
         ino: InodeNumber,
     ) -> ffs_error::Result<FsxattrInfo> {
+        if let Some((_, nested, inner)) = self.btrfs_nested_route(ino)? {
+            return nested.get_inode_fsxattr(cx, &mut RequestScope::empty(), inner);
+        }
         match &self.flavor {
             FsFlavor::Ext4(_) => {
                 let canonical = Self::ext4_canonical_inode(ino);
@@ -1738,6 +1783,9 @@ impl FsOps for OpenFs {
         scope: &mut RequestScope,
         ino: InodeNumber,
     ) -> ffs_error::Result<u32> {
+        if let Some((_, nested, inner)) = self.btrfs_nested_route(ino)? {
+            return nested.get_inode_generation(cx, &mut RequestScope::empty(), inner);
+        }
         match &self.flavor {
             FsFlavor::Ext4(_) => {
                 let inode =

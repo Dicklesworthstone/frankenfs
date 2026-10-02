@@ -19521,6 +19521,154 @@ fn run_fc_kernel_scenario(
     emit_scenario_result(scenario, "PASS", None);
 }
 
+/// bd-2ryx9: subvolumes the kernel created inside the default root (one
+/// nested in another) read through a FrankenFS mount exactly as through the
+/// kernel's, and stay read-only there: a create or unlink inside them is
+/// EROFS, and the image is still `btrfs check`-clean afterwards.
+#[test]
+fn btrfs_nested_subvolumes_read_like_the_kernel_bd_2ryx9() {
+    for tool in ["mkfs.btrfs", "btrfs"] {
+        if !command_available(tool) {
+            require_fuse_or_skip(&format!("{tool} unavailable for the nested-subvolume test"));
+            return;
+        }
+    }
+    if !can_run_sudo() {
+        require_fuse_or_skip("sudo unavailable for the nested-subvolume test");
+        return;
+    }
+    fn tree(dir: &Path, prefix: &str, view: &mut std::collections::BTreeMap<String, Vec<u8>>) {
+        for entry in fs::read_dir(dir).expect("readdir") {
+            let entry = entry.expect("dirent");
+            let name = format!("{prefix}{}", entry.file_name().to_string_lossy());
+            if entry.file_type().expect("file type").is_dir() {
+                view.insert(format!("{name}/"), Vec::new());
+                tree(&entry.path(), &format!("{name}/"), view);
+            } else {
+                view.insert(name, fs::read(entry.path()).expect("read"));
+            }
+        }
+    }
+    let sudo = |args: &[&str]| {
+        let out = Command::new("sudo")
+            .arg("-n")
+            .args(args)
+            .output()
+            .expect("sudo");
+        assert!(
+            out.status.success(),
+            "sudo {args:?}: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+        out
+    };
+
+    let tmp = tempfile::TempDir::new().unwrap();
+    let img = tmp.path().join("nested.btrfs");
+    fs::File::create(&img)
+        .and_then(|f| f.set_len(256 * 1024 * 1024))
+        .unwrap();
+    let made = Command::new("mkfs.btrfs")
+        .args(["-q", "-f"])
+        .arg(&img)
+        .output()
+        .expect("mkfs.btrfs");
+    assert!(made.status.success(), "mkfs.btrfs");
+    let attached = sudo(&["losetup", "--find", "--show", img.to_str().unwrap()]);
+    let kmnt = tmp.path().join("kernel");
+    fs::create_dir_all(&kmnt).unwrap();
+    let live = KernelRoMount {
+        mountpoint: kmnt.clone(),
+        loop_device: String::from_utf8_lossy(&attached.stdout).trim().to_owned(),
+    };
+    sudo(&[
+        "mount",
+        "-t",
+        "btrfs",
+        &live.loop_device,
+        kmnt.to_str().unwrap(),
+    ]);
+    sudo(&["chmod", "a+rwx", kmnt.to_str().unwrap()]);
+    let payload: Vec<u8> = (0..30_000_u32).map(|i| (i % 251) as u8).collect();
+    fs::write(kmnt.join("top.txt"), b"top").unwrap();
+    sudo(&[
+        "btrfs",
+        "-q",
+        "subvolume",
+        "create",
+        kmnt.join("sv").to_str().unwrap(),
+    ]);
+    sudo(&["chmod", "a+rwx", kmnt.join("sv").to_str().unwrap()]);
+    fs::write(kmnt.join("sv/a.txt"), b"in sv").unwrap();
+    fs::create_dir(kmnt.join("sv/dir")).unwrap();
+    fs::write(kmnt.join("sv/dir/b.bin"), &payload).unwrap();
+    sudo(&[
+        "btrfs",
+        "-q",
+        "subvolume",
+        "create",
+        kmnt.join("sv/inner").to_str().unwrap(),
+    ]);
+    sudo(&["chmod", "a+rwx", kmnt.join("sv/inner").to_str().unwrap()]);
+    fs::write(kmnt.join("sv/inner/c.txt"), b"in inner").unwrap();
+    let mut kernel_view = std::collections::BTreeMap::new();
+    tree(&kmnt, "", &mut kernel_view);
+    drop(live); // unmount and detach
+    assert!(
+        kernel_view.contains_key("sv/inner/c.txt"),
+        "the kernel view reaches into the nested subvolumes: {:?}",
+        kernel_view.keys().collect::<Vec<_>>()
+    );
+
+    let mnt = tmp.path().join("ffs");
+    fs::create_dir_all(&mnt).unwrap();
+    let Some(session) = try_mount_btrfs_rw(&img, &mnt) else {
+        return;
+    };
+    let mut ffs_view = std::collections::BTreeMap::new();
+    tree(&mnt, "", &mut ffs_view);
+    let refused = |result: std::io::Result<()>, what: &str| {
+        let err = result.expect_err(what);
+        assert_eq!(err.raw_os_error(), Some(libc::EROFS), "{what}: {err}");
+    };
+    refused(
+        fs::write(mnt.join("sv/new.txt"), b"x"),
+        "create in a nested subvolume",
+    );
+    refused(
+        fs::remove_file(mnt.join("sv/inner/c.txt")),
+        "unlink in a nested-in-nested subvolume",
+    );
+    refused(
+        fs::OpenOptions::new()
+            .write(true)
+            .open(mnt.join("sv/a.txt"))
+            .and_then(|mut f| std::io::Write::write_all(&mut f, b"!")),
+        "write a nested file",
+    );
+    session.unmount_and_join();
+    assert_eq!(
+        ffs_view, kernel_view,
+        "FrankenFS must read the nested subvolumes as the kernel does"
+    );
+    let check = Command::new("btrfs")
+        .args(["check", "--readonly"])
+        .arg(&img)
+        .output()
+        .expect("btrfs check");
+    assert!(
+        check.status.success(),
+        "btrfs check after refused writes into nested subvolumes:\n{}{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+    emit_scenario_result(
+        "btrfs_nested_subvolumes_read_like_the_kernel_bd_2ryx9",
+        "PASS",
+        None,
+    );
+}
+
 /// Files created and appended, durable only through the kernel's tree log.
 #[test]
 fn btrfs_kernel_tree_log_crash_image_matches_kernel() {

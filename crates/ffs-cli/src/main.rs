@@ -8801,6 +8801,7 @@ fn btrfs_mount_selection_flag(selection: &BtrfsMountSelection) -> &'static str {
         BtrfsMountSelection::DefaultRoot => "(default btrfs root)",
         BtrfsMountSelection::Subvolume(_) => "--subvol",
         BtrfsMountSelection::Snapshot(_) => "--snapshot",
+        BtrfsMountSelection::SubvolumeId(_) => "(subvolume id)",
     }
 }
 
