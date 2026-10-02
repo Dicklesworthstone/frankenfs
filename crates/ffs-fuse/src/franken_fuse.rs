@@ -713,7 +713,7 @@ impl FrankenFuse {
         #[cfg(not(unix))]
         let new_name = owned_newname.as_os_str();
 
-        self.dispatch_rename(parent, name, newparent, new_name, 0)
+        self.dispatch_rename(parent, name, newparent, new_name, 0, (0, 0))
             .map_err(|error| match error {
                 MutationDispatchError::Errno(errno) => errno,
                 MutationDispatchError::Operation { error, .. } => error.to_errno(),
@@ -3394,9 +3394,17 @@ impl FrankenFuse {
         newparent: u64,
         newname: &OsStr,
         flags: u32,
+        owner: (u32, u32),
     ) -> Result<(), MutationDispatchError> {
         let cx = Self::cx_for_request();
         self.enforce_mutation_guards(&cx, RequestOp::Rename, parent)?;
+        // RENAME_WHITEOUT (overlayfs): rename, then leave a whiteout — a 0:0
+        // character device owned by the caller — under the old name, as
+        // ext4_whiteout_for_rename does. It cannot be combined with EXCHANGE.
+        let whiteout = flags & libc::RENAME_WHITEOUT != 0;
+        if whiteout && flags & libc::RENAME_EXCHANGE != 0 {
+            return Err(MutationDispatchError::Errno(libc::EINVAL));
+        }
         let result = {
             let _inode_guards =
                 self.acquire_mutation_inode_guards(&[InodeNumber(parent), InodeNumber(newparent)]);
@@ -3408,8 +3416,21 @@ impl FrankenFuse {
                     name,
                     InodeNumber(newparent),
                     newname,
-                    flags,
+                    flags & !libc::RENAME_WHITEOUT,
                 )?;
+                if whiteout {
+                    #[allow(clippy::cast_possible_truncation)]
+                    self.inner.ops.mknod(
+                        cx,
+                        scope,
+                        InodeNumber(parent),
+                        name,
+                        libc::S_IFCHR as u16,
+                        0,
+                        owner.0,
+                        owner.1,
+                    )?;
+                }
                 self.inner.ops.commit_request_scope(cx, scope)?;
                 Ok(())
             })

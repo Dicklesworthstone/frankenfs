@@ -6864,7 +6864,7 @@ impl Filesystem for FrankenFuse {
 
     fn rename(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         parent: u64,
         name: &OsStr,
         newparent: u64,
@@ -6872,10 +6872,17 @@ impl Filesystem for FrankenFuse {
         flags: u32,
         reply: ReplyEmpty,
     ) {
-        // RENAME_NOREPLACE and RENAME_EXCHANGE are honoured atomically
-        // (see OpenFs::rename2). RENAME_WHITEOUT still returns EINVAL inside
-        // FsOps::rename2; we no longer pre-reject every non-zero flag.
-        match self.dispatch_rename(parent, name, newparent, newname, flags) {
+        // RENAME_NOREPLACE and RENAME_EXCHANGE are honoured atomically (see
+        // OpenFs::rename2); RENAME_WHITEOUT leaves a whiteout owned by the
+        // caller (dispatch_rename).
+        match self.dispatch_rename(
+            parent,
+            name,
+            newparent,
+            newname,
+            flags,
+            (req.uid(), req.gid()),
+        ) {
             Ok(()) => {
                 reply.ok();
                 self.notify_entry_invalidation(parent, name);
@@ -21709,7 +21716,7 @@ mod tests {
             &options,
         );
 
-        fuse.dispatch_rename(8, OsStr::new("old"), 9, OsStr::new("new"), 0)
+        fuse.dispatch_rename(8, OsStr::new("old"), 9, OsStr::new("new"), 0, (0, 0))
             .expect("dispatch rename");
         assert_eq!(
             calls.lock().expect("lock calls").as_slice(),
@@ -21720,6 +21727,60 @@ mod tests {
                 new_name: "new".to_owned(),
             }]
         );
+    }
+
+    #[test]
+    fn dispatch_rename_whiteout_leaves_a_char_device_owned_by_the_caller() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let options = MountOptions {
+            read_only: false,
+            ..MountOptions::default()
+        };
+        let fuse = FrankenFuse::with_options(
+            Box::new(MutationRecordingFs::new(Arc::clone(&calls))),
+            &options,
+        );
+        fuse.dispatch_rename(
+            8,
+            OsStr::new("old"),
+            9,
+            OsStr::new("new"),
+            libc::RENAME_WHITEOUT,
+            (1000, 1001),
+        )
+        .expect("whiteout rename");
+        #[allow(clippy::cast_possible_truncation)]
+        let char_device = libc::S_IFCHR as u16;
+        assert_eq!(
+            calls.lock().expect("lock calls").as_slice(),
+            &[
+                MutationCall::Rename {
+                    parent: InodeNumber(8),
+                    name: "old".to_owned(),
+                    new_parent: InodeNumber(9),
+                    new_name: "new".to_owned(),
+                },
+                MutationCall::Mknod {
+                    parent: InodeNumber(8),
+                    name: "old".to_owned(),
+                    mode: char_device,
+                    rdev: 0,
+                    uid: 1000,
+                    gid: 1001,
+                },
+            ]
+        );
+        assert!(matches!(
+            fuse.dispatch_rename(
+                8,
+                OsStr::new("a"),
+                9,
+                OsStr::new("b"),
+                libc::RENAME_WHITEOUT | libc::RENAME_EXCHANGE,
+                (0, 0),
+            ),
+            Err(MutationDispatchError::Errno(libc::EINVAL))
+        ));
     }
 
     #[test]
@@ -21746,6 +21807,7 @@ mod tests {
                         new_parent,
                         OsStr::new(new_name),
                         0,
+                        (0, 0),
                     )
                     .expect("dispatch rename");
                 });
@@ -21779,6 +21841,7 @@ mod tests {
                         new_parent,
                         OsStr::new(new_name),
                         0,
+                        (0, 0),
                     )
                     .expect("dispatch rename");
                 });
@@ -21917,7 +21980,7 @@ mod tests {
             Err(MutationDispatchError::Errno(libc::EROFS))
         ));
         assert!(matches!(
-            fuse.dispatch_rename(1, OsStr::new("a"), 2, OsStr::new("b"), 0),
+            fuse.dispatch_rename(1, OsStr::new("a"), 2, OsStr::new("b"), 0, (0, 0)),
             Err(MutationDispatchError::Errno(libc::EROFS))
         ));
         assert!(calls.lock().expect("lock calls").is_empty());
