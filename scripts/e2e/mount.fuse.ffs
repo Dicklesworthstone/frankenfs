@@ -83,12 +83,24 @@ fi
 bin=${FFS_CLI_BIN:-/usr/local/bin/ffs-cli}
 log="${FFS_MOUNT_LOG_DIR:-/tmp}/ffs-mount-$(basename "$dir").log"
 echo "== $(date -u +%FT%TZ) $bin ${args[*]} $image $dir" >>"$log"
+# PROBE (bd-e94tv): who calls, with what, and what is mounted there already.
+{
+    echo "PROBE opts=[$opts] caller=[$(ps -o args= -p $PPID 2>/dev/null)] grand=[$(ps -o args= -p "$(ps -o ppid= -p $PPID | tr -d ' ')" 2>/dev/null)]"
+    echo "PROBE before: $(grep " $dir " /proc/self/mountinfo | tr '\n' '|')"
+    echo "PROBE before stat: $(stat -c '%F dev=%d ino=%i' "$dir" 2>&1)"
+} >>"$log"
 setsid "$bin" "${args[@]}" "$image" "$dir" >>"$log" 2>&1 </dev/null &
 pid=$!
 
 # mount(8) must not return before the mount is live.
 for _ in $(seq 1 600); do
     if findmnt -rn --mountpoint "$dir" >/dev/null 2>&1; then
+        {
+            echo "PROBE after: $(grep " $dir " /proc/self/mountinfo | tr '\n' '|')"
+            echo "PROBE after stat: $(stat -c '%F dev=%d ino=%i' "$dir" 2>&1)"
+            sleep 0.3
+            echo "PROBE +0.3s stat: $(stat -c '%F dev=%d ino=%i' "$dir" 2>&1) df: $(df -T -P 2>&1 | grep -F "$image" | tr -s ' ')"
+        } >>"$log"
         exit 0
     fi
     if ! kill -0 "$pid" 2>/dev/null; then
