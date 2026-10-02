@@ -7207,7 +7207,17 @@ impl Filesystem for FrankenFuse {
     ) {
         self.record_ioctl_probe(ino, cmd, in_data.len(), out_size);
         match self.dispatch_ioctl(req.pid(), ino, fh, cmd, in_data, out_size) {
-            IoctlResult::Data(data) => reply.ioctl(0, &data),
+            IoctlResult::Data(data) => {
+                // A flags change moves ctime, and the kernel keeps the inode's
+                // attributes cached across a FUSE ioctl: drop them, or stat
+                // shows the old ctime (xfstests generic/277).
+                if matches!(cmd, EXT4_IOC_SETFLAGS | FS_IOC_FSSETXATTR)
+                    && let Some(notifier) = self.kernel_notifier()
+                {
+                    notifier.inode(ino);
+                }
+                reply.ioctl(0, &data);
+            }
             IoctlResult::Error(errno) => {
                 if errno == libc::ENOTTY {
                     debug!(ino, cmd, "ioctl: unsupported command");
