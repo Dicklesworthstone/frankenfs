@@ -69,5 +69,16 @@
   { "test_id": "generic/099", "expected_status": "passed" },
   { "test_id": "generic/105", "expected_status": "passed" },
   { "test_id": "generic/212", "expected_status": "passed" },
-  { "test_id": "generic/247", "expected_status": "passed" }
+  { "test_id": "generic/247", "expected_status": "passed" },
+  { "test_id": "generic/288", "expected_status": "passed" },
+  { "test_id": "generic/294", "expected_status": "passed" },
+  { "test_id": "generic/307", "expected_status": "passed" },
+  { "test_id": "generic/309", "expected_status": "passed" },
+  { "test_id": "generic/313", "expected_status": "passed" },
+  { "test_id": "generic/315", "expected_status": "passed" },
+  { "test_id": "generic/318", "expected_status": "passed" },
+  { "test_id": "generic/319", "expected_status": "passed" },
+  { "test_id": "generic/360", "expected_status": "passed" },
+  { "test_id": "generic/389", "expected_status": "passed" },
+  { "test_id": "generic/393", "expected_status": "passed" }
 ]
