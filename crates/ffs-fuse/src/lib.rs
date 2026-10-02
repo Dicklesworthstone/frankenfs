@@ -7462,7 +7462,7 @@ impl Filesystem for FrankenFuse {
         req: &Request<'_>,
         parent: u64,
         mode: u32,
-        _umask: u32,
+        umask: u32,
         _flags: i32,
         reply: ReplyCreate,
     ) {
@@ -7471,6 +7471,7 @@ impl Filesystem for FrankenFuse {
             return;
         }
         let cx = Self::cx_for_request();
+        let mode = self.create_mode(&cx, parent, mode, umask);
         if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Create) {
             warn!(parent, "backpressure: shedding tmpfile");
             reply.error(errno);

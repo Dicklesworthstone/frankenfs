@@ -1208,18 +1208,21 @@ impl FsOps for OpenFs {
     fn tmpfile(
         &self,
         cx: &Cx,
-        _scope: &mut RequestScope,
+        scope: &mut RequestScope,
         parent: InodeNumber,
         mode: u16,
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
-        match &self.flavor {
+        let attr = match &self.flavor {
             FsFlavor::Ext4(_) => self
                 .ext4_tmpfile(cx, Self::ext4_canonical_inode(parent), mode, uid, gid)
                 .map(Self::ext4_present_attr),
             FsFlavor::Btrfs(_) => self.btrfs_tmpfile(parent, mode, uid, gid),
-        }
+        }?;
+        // An O_TMPFILE inherits the directory's default ACL like any create
+        // (xfstests generic/389).
+        self.inherit_default_acl(cx, scope, parent, attr)
     }
 
     fn mknod(
