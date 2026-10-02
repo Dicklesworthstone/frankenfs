@@ -19185,6 +19185,37 @@ fn fast_commit_crash_image_htree_growth_matches_kernel_bd_9m84h() {
     );
 }
 
+// bd-9m84h: fast-commit recovery into a linear directory whose one block
+// fills up: the kernel's replay indexes it (make_indexed_dir), and so must
+// FrankenFS's.
+#[test]
+fn fast_commit_crash_image_linear_dir_fills_and_is_indexed_bd_9m84h() {
+    let names: Vec<String> = (0..80)
+        .map(|i| format!("entry_{i:04}_{}", "y".repeat(40)))
+        .collect();
+    let (old, new) = names.split_at(55);
+    let mut expected: Vec<&str> = names.iter().map(String::as_str).collect();
+    expected.push("alpha");
+    expected.sort_unstable();
+    run_fc_kernel_scenario(
+        "fc_crash_image_linear_dir_indexed_bd_9m84h",
+        &|dir| {
+            fs::write(dir.join("alpha"), b"alpha").unwrap();
+            for name in old {
+                fs::write(dir.join(name), name.as_bytes()).unwrap();
+            }
+        },
+        &|dir| {
+            for name in new {
+                fs::write(dir.join(name), name.as_bytes()).unwrap();
+            }
+            fc_fsynced_write(dir, "alpha", b" grows", true);
+        },
+        &expected,
+        true,
+    );
+}
+
 // bd-9m84h: a fast commit too big for the fast-commit area. The kernel falls
 // back to a full commit and leaves a lone HEAD naming that commit's tid in the
 // area; recovery must treat it as stale (as the kernel does), not as an

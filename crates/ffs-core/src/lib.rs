@@ -9192,10 +9192,20 @@ impl OpenFs {
             }
         }
 
+        // Every block is full. With dir_index the kernel's replay indexes the
+        // directory (make_indexed_dir); do the same. Without it the directory
+        // would grow linearly, which recovery does not do yet.
+        let has_dir_index = self
+            .ext4_superblock()
+            .is_some_and(|sb| sb.has_compat(ffs_ondisk::ext4::Ext4CompatFeatures::DIR_INDEX));
+        if has_dir_index {
+            self.fast_commit_grow_directory(cx, &parent, dentry, file_type, excluded, None)?;
+            return Ok(true);
+        }
         warn!(
             parent_ino,
             ino = dentry.ino,
-            "fc_apply: CREAT/LINK skipped — no directory block with room (needs allocation)"
+            "fc_apply: CREAT/LINK skipped — full linear directory without dir_index"
         );
         Ok(false)
     }
@@ -9278,11 +9288,32 @@ impl OpenFs {
         }
 
         // The hash-correct leaf is full: split it (or rebuild the index), as
-        // the kernel's replay does through ext4_add_entry, with the write
-        // path's own helpers, allocating only blocks no recovered inode names.
-        let csum_seed = sb.csum_seed();
+        // the kernel's replay does through ext4_add_entry.
+        let split = (!casefold).then_some((target_logical, phys));
+        self.fast_commit_grow_directory(cx, parent, dentry, file_type, excluded, split)?;
+        Ok(true)
+    }
+
+    /// Add `dentry` to a directory with no room for it, with the write path's
+    /// own growth helpers: split the full htree leaf `split` names, else
+    /// rebuild the index (which also turns a full linear directory into an
+    /// htree, like the kernel's make_indexed_dir). Blocks come from a
+    /// transient recovery allocator that first claims every block a live
+    /// recovered inode names (`excluded`), and its counts are persisted.
+    fn fast_commit_grow_directory(
+        &self,
+        cx: &Cx,
+        parent: &Ext4Inode,
+        dentry: &ffs_journal::FcDentry,
+        file_type: Ext4FileType,
+        excluded: &[(u64, u32)],
+        split: Option<(u32, u64)>,
+    ) -> Result<(), FfsError> {
+        let csum_seed = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?
+            .csum_seed();
         let extents = self.collect_extents(cx, parent)?;
-        let leaf = self.read_block_vec(cx, BlockNumber(phys))?;
         let block_dev = self.direct_block_device_adapter();
         let mut alloc = self.load_ext4_alloc_state(cx)?;
         let counts_before = Self::ext4_snapshot_group_counts(&alloc);
@@ -9297,12 +9328,11 @@ impl OpenFs {
             )?;
         }
         let (secs, nanos) = Self::now_timestamp();
-        let parent_n = InodeNumber(u64::from(parent_ino));
+        let parent_n = InodeNumber(u64::from(dentry.parent_ino));
         {
             let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
-            let split = if casefold {
-                None
-            } else {
+            let done = if let Some((target_logical, phys)) = split {
+                let leaf = self.read_block_vec(cx, BlockNumber(phys))?;
                 self.ext4_split_htree_leaf_and_add(
                     cx,
                     &block_dev,
@@ -9320,8 +9350,11 @@ impl OpenFs {
                     secs,
                     nanos,
                 )?
+                .is_some()
+            } else {
+                false
             };
-            if split.is_none() {
+            if !done {
                 self.ext4_rebuild_htree_dir(
                     cx,
                     &block_dev,
@@ -9342,11 +9375,12 @@ impl OpenFs {
         self.ext4_merge_recovery_alloc_into_live(&counts_before, &alloc);
         self.invalidate_ext4_read_caches_after_recovery();
         debug!(
-            parent_ino,
+            parent_ino = dentry.parent_ino,
             ino = dentry.ino,
-            "fc_apply: htree leaf full — split at recovery"
+            split = split.is_some(),
+            "fc_apply: directory grown at recovery"
         );
-        Ok(true)
+        Ok(())
     }
 
     /// Splice `dentry` into the directory block at `phys` and persist it the
