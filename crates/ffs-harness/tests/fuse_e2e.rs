@@ -19276,6 +19276,48 @@ fn fast_commit_crash_image_linear_dir_grows_without_dir_index_bd_9m84h() {
     );
 }
 
+// bd-9m84h: fast-commit recovery into a casefold (+F) directory that the
+// baseline makes an htree, with mixed-case ASCII names: entries must land in
+// the leaf the casefolded hash picks, as the kernel's replay puts them.
+#[test]
+fn fast_commit_crash_image_casefold_dir_matches_kernel_bd_9m84h() {
+    let names: Vec<String> = (0..400)
+        .map(|i| format!("Entry_{i:04}_{}", "Xy".repeat(20)))
+        .collect();
+    let (old, new) = names.split_at(300);
+    let mut expected: Vec<&str> = names.iter().map(String::as_str).collect();
+    expected.push("Alpha");
+    expected.sort_unstable();
+    run_fc_kernel_scenario_with(
+        "fast_commit,casefold",
+        "fc_crash_image_casefold_dir_bd_9m84h",
+        &|dir| {
+            let chattr = Command::new("sudo")
+                .args(["-n", "chattr", "+F"])
+                .arg(dir)
+                .output()
+                .expect("chattr");
+            assert!(
+                chattr.status.success(),
+                "chattr +F: {}",
+                String::from_utf8_lossy(&chattr.stderr)
+            );
+            fs::write(dir.join("Alpha"), b"alpha").unwrap();
+            for name in old {
+                fs::write(dir.join(name), name.as_bytes()).unwrap();
+            }
+        },
+        &|dir| {
+            for name in new {
+                fs::write(dir.join(name), name.as_bytes()).unwrap();
+            }
+            fc_fsynced_write(dir, "Alpha", b" grows", true);
+        },
+        &expected,
+        true,
+    );
+}
+
 // bd-9m84h: a fast commit too big for the fast-commit area. The kernel falls
 // back to a full commit and leaves a lone HEAD naming that commit's tid in the
 // area; recovery must treat it as stale (as the kernel does), not as an
