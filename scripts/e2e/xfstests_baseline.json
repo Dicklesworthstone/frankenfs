@@ -87,6 +87,7 @@
   { "test_id": "generic/391", "expected_status": "passed" },
   { "test_id": "generic/401", "expected_status": "passed" },
   { "test_id": "generic/406", "expected_status": "passed" },
+  { "test_id": "generic/078", "expected_status": "passed" },
   { "test_id": "ext4/001", "expected_status": "skipped" },
   { "test_id": "ext4/003", "expected_status": "skipped" },
   { "test_id": "ext4/005", "expected_status": "skipped" },
