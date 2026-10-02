@@ -5813,6 +5813,10 @@ impl Filesystem for FrankenFuse {
                             .dont_mask
                             .store(true, std::sync::atomic::Ordering::Relaxed);
                     }
+                    // Setting an access ACL must clear SGID for a caller
+                    // outside the group; the kernel asks for that through
+                    // FUSE_SETXATTR_ACL_KILL_SGID only with this extension.
+                    let _ = config.add_capabilities(fuse_consts::FUSE_SETXATTR_EXT);
                 }
                 Err(missing) => debug!(missing, "kernel declined FUSE_POSIX_ACL"),
             }
@@ -6611,7 +6615,7 @@ impl Filesystem for FrankenFuse {
 
     fn setxattr(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         ino: u64,
         name: &OsStr,
         value: &[u8],
@@ -6619,7 +6623,8 @@ impl Filesystem for FrankenFuse {
         position: u32,
         reply: ReplyEmpty,
     ) {
-        self.setxattr_impl(ino, name, value, flags, position, reply);
+        let kill_sgid = req.setxattr_acl_kill_sgid();
+        self.setxattr_impl(ino, name, value, flags, position, kill_sgid, reply);
     }
 
     fn removexattr(&mut self, _req: &Request<'_>, ino: u64, name: &OsStr, reply: ReplyEmpty) {
@@ -7161,9 +7166,10 @@ impl Filesystem for FrankenFuse {
             return;
         };
 
-        // Convert offset to u64 (SEEK_DATA/SEEK_HOLE require non-negative offset).
+        // A negative offset is past no data and no hole: ENXIO, as the
+        // kernel's iomap SEEK_DATA/SEEK_HOLE answer it (xfstests generic/448).
         let Ok(offset_u64) = u64::try_from(offset) else {
-            reply.error(libc::EINVAL);
+            reply.error(libc::ENXIO);
             return;
         };
 
@@ -7665,6 +7671,29 @@ impl FrankenFuse {
     /// tests at all -- which is why the refusal below had no test until now, and
     /// why `auto` stayed restricted to read-only mounts on an argument nobody
     /// could check.
+    /// FUSE_SETXATTR_ACL_KILL_SGID: setting an access ACL by a caller outside
+    /// the owning group (without CAP_FSETID) clears S_ISGID, as
+    /// posix_acl_update_mode does in the kernel; with FUSE_SETXATTR_EXT the
+    /// kernel only tells the filesystem to (xfstests generic/375).
+    fn kill_sgid_after_acl(&self, cx: &Cx, ino: u64) -> ffs_error::Result<()> {
+        let _inode_guards = self.acquire_mutation_inode_guards(&[InodeNumber(ino)]);
+        self.with_request_scope(cx, RequestOp::Setattr, |cx, scope| {
+            let attr = self.inner.ops.getattr(cx, scope, InodeNumber(ino))?;
+            if attr.perm & 0o2000 != 0 {
+                let attrs = SetAttrRequest {
+                    mode: Some(attr.perm & !0o2000),
+                    ..SetAttrRequest::default()
+                };
+                self.inner
+                    .ops
+                    .setattr(cx, scope, InodeNumber(ino), &attrs)?;
+                self.inner.ops.commit_request_scope(cx, scope)?;
+            }
+            Ok(())
+        })
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn setxattr_impl(
         &self,
         ino: u64,
@@ -7672,6 +7701,7 @@ impl FrankenFuse {
         value: &[u8],
         flags: i32,
         position: u32,
+        kill_sgid: bool,
         reply: ReplyEmpty,
     ) {
         if self.inner.read_only {
@@ -7705,6 +7735,13 @@ impl FrankenFuse {
         self.inner.readdirplus_attr_memo.forget(InodeNumber(ino));
         match self.dispatch_setxattr(&cx, ino, name, value, flags, position) {
             Ok(_) => {
+                if kill_sgid
+                    && name == "system.posix_acl_access"
+                    && let Err(error) = self.kill_sgid_after_acl(&cx, ino)
+                {
+                    reply.error(error.to_errno());
+                    return;
+                }
                 reply.ok();
                 self.notify_inode_invalidation(ino);
             }
@@ -9613,6 +9650,7 @@ mod tests {
                 b"capability",
                 0,
                 0,
+                false,
                 <ReplyEmpty as fuser::Reply>::new(1, sender),
             );
             assert!(
@@ -10644,6 +10682,7 @@ mod tests {
                 b"1",
                 0,
                 0,
+                false,
                 reply,
             );
         });
@@ -10678,7 +10717,7 @@ mod tests {
         let sender = RecordingSender::default();
         let reply = <ReplyEmpty as fuser::Reply>::new(3, sender.clone());
         with_switch(false, || {
-            writable_fuse().setxattr_impl(1, OsStr::new("user.ok"), b"1", 0, 0, reply);
+            writable_fuse().setxattr_impl(1, OsStr::new("user.ok"), b"1", 0, 0, false, reply);
         });
         assert_ne!(
             sender.errno(),
@@ -11724,6 +11763,7 @@ mod tests {
                 b"capability-bytes",
                 0,
                 0,
+                false,
                 <ReplyEmpty as fuser::Reply>::new(1, set_sender.clone()),
             );
             assert_eq!(set_sender.errno(), None, "setxattr must still succeed");

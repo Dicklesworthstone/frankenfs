@@ -247,6 +247,15 @@ pub mod consts {
     // which is why this is cfg'd rather than sitting with the others.
     #[cfg(all(feature = "abi-7-31", not(target_os = "macos")))]
     pub const FUSE_HANDLE_KILLPRIV_V2: u64 = 1 << 28;
+    // setxattr requests carry `setxattr_flags` (fuse_setxattr_in grows from 8
+    // to 16 bytes); Linux 5.16+. Linux-only: bit 29 is FUSE_CASE_INSENSITIVE
+    // on macOS.
+    #[cfg(all(feature = "abi-7-36", not(target_os = "macos")))]
+    pub const FUSE_SETXATTR_EXT: u64 = 1 << 29;
+    // setxattr_flags: clear SGID when system.posix_acl_access is set (the
+    // caller is not in the owning group and lacks CAP_FSETID).
+    #[cfg(all(feature = "abi-7-36", not(target_os = "macos")))]
+    pub const FUSE_SETXATTR_ACL_KILL_SGID: u32 = 1 << 0;
     #[cfg(feature = "abi-7-36")]
     pub const FUSE_INIT_EXT: u64 = 1 << 30; // extended fuse_init_in request
     #[cfg(feature = "abi-7-36")]

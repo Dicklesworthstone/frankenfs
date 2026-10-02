@@ -861,16 +861,34 @@ mod op {
     pub struct SetXAttr<'a> {
         header: &'a fuse_in_header,
         arg: &'a fuse_setxattr_in,
-        name: &'a OsStr,
-        value: &'a [u8],
+        /// Everything after the 8-byte `fuse_setxattr_in`. With
+        /// FUSE_SETXATTR_EXT negotiated, `setxattr_flags` and padding come
+        /// first; then the NUL-terminated name and the value.
+        rest: &'a [u8],
     }
     impl_request!(SetXAttr<'a>);
     impl<'a> SetXAttr<'a> {
-        pub fn name(&self) -> &'a OsStr {
-            self.name
+        /// The value's length in bytes.
+        pub fn size(&self) -> u32 {
+            self.arg.size
         }
-        pub fn value(&self) -> &'a [u8] {
-            self.value
+        /// `(setxattr_flags, name, value)`, decoded for whether the session
+        /// negotiated FUSE_SETXATTR_EXT. `None` when the request is malformed.
+        pub fn decode(&self, ext: bool) -> Option<(u32, &'a OsStr, &'a [u8])> {
+            use std::os::unix::ffi::OsStrExt;
+            let (setxattr_flags, tail) = if ext {
+                let head = self.rest.get(..8)?;
+                (
+                    u32::from_ne_bytes(head[..4].try_into().ok()?),
+                    &self.rest[8..],
+                )
+            } else {
+                (0, self.rest)
+            };
+            let nul = tail.iter().position(|&byte| byte == 0)?;
+            let value = &tail[nul + 1..];
+            (value.len() == self.arg.size as usize)
+                .then(|| (setxattr_flags, OsStr::from_bytes(&tail[..nul]), value))
         }
         // TODO: Document what are valid flags
         pub fn flags(&self) -> i32 {
@@ -1753,15 +1771,10 @@ mod op {
                 header,
                 arg: data.fetch()?,
             }),
-            fuse_opcode::FUSE_SETXATTR => Operation::SetXAttr({
-                let out = SetXAttr {
-                    header,
-                    arg: data.fetch()?,
-                    name: data.fetch_str()?,
-                    value: data.fetch_all(),
-                };
-                assert!(out.value.len() == out.arg.size as usize);
-                out
+            fuse_opcode::FUSE_SETXATTR => Operation::SetXAttr(SetXAttr {
+                header,
+                arg: data.fetch()?,
+                rest: data.fetch_all(),
             }),
             fuse_opcode::FUSE_GETXATTR => Operation::GetXAttr(GetXAttr {
                 header,
@@ -2047,13 +2060,9 @@ impl fmt::Display for Operation<'_> {
                 x.file_handle(),
                 x.fdatasync()
             ),
-            Operation::SetXAttr(x) => write!(
-                f,
-                "SETXATTR name {:?}, size {}, flags {:#x}",
-                x.name(),
-                x.value().len(),
-                x.flags()
-            ),
+            Operation::SetXAttr(x) => {
+                write!(f, "SETXATTR size {}, flags {:#x}", x.size(), x.flags())
+            }
             Operation::GetXAttr(x) => {
                 write!(f, "GETXATTR name {:?}, size {:?}", x.name(), x.size())
             }
@@ -2306,6 +2315,52 @@ mod tests {
         0xed, 0x01, 0x00, 0x00, 0xe7, 0x03, 0x00, 0x00, // umask, padding
         0x66, 0x6f, 0x6f, 0x2e, 0x74, 0x78, 0x74, 0x00, // name
     ]);
+
+    // SETXATTR "a.b" = "xy", without and with FUSE_SETXATTR_EXT (whose
+    // setxattr_flags = FUSE_SETXATTR_ACL_KILL_SGID precede the name).
+    #[cfg(target_endian = "little")]
+    const SETXATTR_REQUEST: AlignedData<[u8; 54]> = AlignedData([
+        0x36, 0x00, 0x00, 0x00, 0x15, 0x00, 0x00, 0x00, // len, opcode
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // unique
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // nodeid
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // uid, gid
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // pid, padding
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // size, flags
+        0x61, 0x2e, 0x62, 0x00, 0x78, 0x79, // name, value
+    ]);
+
+    #[cfg(target_endian = "little")]
+    const SETXATTR_EXT_REQUEST: AlignedData<[u8; 62]> = AlignedData([
+        0x3e, 0x00, 0x00, 0x00, 0x15, 0x00, 0x00, 0x00, // len, opcode
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // unique
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // nodeid
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // uid, gid
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // pid, padding
+        0x02, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // size, flags
+        0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, // setxattr_flags, padding
+        0x61, 0x2e, 0x62, 0x00, 0x78, 0x79, // name, value
+    ]);
+
+    #[test]
+    #[cfg(target_endian = "little")]
+    fn setxattr_decodes_both_header_layouts() {
+        for (bytes, ext, flags) in [
+            (&SETXATTR_REQUEST[..], false, 0),
+            (&SETXATTR_EXT_REQUEST[..], true, 1),
+        ] {
+            let req = AnyRequest::try_from(bytes).unwrap();
+            let Some(Operation::SetXAttr(x)) = req.operation().ok() else {
+                panic!("not a SETXATTR");
+            };
+            assert_eq!(x.decode(ext), Some((flags, OsStr::new("a.b"), &b"xy"[..])));
+        }
+        // The extended layout read as the plain one does not decode.
+        let req = AnyRequest::try_from(&SETXATTR_EXT_REQUEST[..]).unwrap();
+        let Some(Operation::SetXAttr(x)) = req.operation().ok() else {
+            panic!("not a SETXATTR");
+        };
+        assert_eq!(x.decode(false), None);
+    }
 
     #[test]
     fn short_read_header() {

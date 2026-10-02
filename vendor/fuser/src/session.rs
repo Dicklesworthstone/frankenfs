@@ -417,6 +417,9 @@ pub struct Session<FS: Filesystem> {
     pub(crate) proto_minor: u32,
     /// True if the filesystem is initialized (init operation done)
     pub(crate) initialized: bool,
+    /// True once INIT negotiated FUSE_SETXATTR_EXT: setxattr requests then
+    /// carry `setxattr_flags` ahead of the name.
+    pub(crate) setxattr_ext: bool,
     /// True if the filesystem was destroyed (destroy operation done)
     pub(crate) destroyed: bool,
     /// One-shot destroy guard shared by classic and io_uring workers.
@@ -497,6 +500,7 @@ impl<FS: Filesystem> Session<FS> {
             proto_major: 0,
             proto_minor: 0,
             initialized: false,
+            setxattr_ext: false,
             destroyed: false,
             destroy_called: Arc::new(AtomicBool::new(false)),
             interrupts: Arc::new(InterruptRegistry::default()),
@@ -524,6 +528,7 @@ impl<FS: Filesystem> Session<FS> {
             proto_major: 0,
             proto_minor: 0,
             initialized: false,
+            setxattr_ext: false,
             destroyed: false,
             destroy_called: Arc::new(AtomicBool::new(false)),
             interrupts: Arc::new(InterruptRegistry::default()),
@@ -823,6 +828,7 @@ impl<FS: Filesystem> Session<FS> {
             proto_major: self.proto_major,
             proto_minor: self.proto_minor,
             initialized: self.initialized,
+            setxattr_ext: self.setxattr_ext,
             destroyed: self.destroyed,
             destroy_called: Arc::clone(&self.destroy_called),
             interrupts: Arc::clone(&self.interrupts),
@@ -885,6 +891,7 @@ impl<FS: Filesystem> Session<FS> {
             proto_major: self.proto_major,
             proto_minor: self.proto_minor,
             initialized: self.initialized,
+            setxattr_ext: self.setxattr_ext,
             destroyed: self.destroyed,
             destroy_called: Arc::clone(&self.destroy_called),
             interrupts: Arc::clone(&self.interrupts),

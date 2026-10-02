@@ -13,7 +13,7 @@ use std::io::IoSlice;
 #[cfg(feature = "abi-7-40")]
 use std::os::fd::BorrowedFd;
 use std::path::Path;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::{Arc, OnceLock};
 
 use crate::Filesystem;
@@ -89,6 +89,8 @@ pub struct Request<'a> {
     request: ll::AnyRequest<'a>,
     /// Registered before waiting for the session dispatch gate.
     interrupt: OnceLock<RequestInterrupt>,
+    /// A SETXATTR's `setxattr_flags` (FUSE_SETXATTR_EXT), set at dispatch.
+    setxattr_flags: AtomicU32,
 }
 
 /// Per-opcode counts of requests that crossed the FUSE boundary (bd-xfe7z).
@@ -321,6 +323,7 @@ impl<'a> Request<'a> {
             data,
             request,
             interrupt: OnceLock::new(),
+            setxattr_flags: AtomicU32::new(0),
         })
     }
 
@@ -606,6 +609,11 @@ impl<'a> Request<'a> {
                     config.max_readahead,
                     config.max_write
                 );
+                #[cfg(all(feature = "abi-7-36", not(target_os = "macos")))]
+                {
+                    se.setxattr_ext =
+                        x.capabilities() & config.requested & abi::consts::FUSE_SETXATTR_EXT != 0;
+                }
                 se.initialized = true;
                 return Ok(Some(x.reply(&config)));
             }
@@ -872,11 +880,15 @@ impl<'a> Request<'a> {
                     .statfs(self, self.request.nodeid().into(), self.reply());
             }
             ll::Operation::SetXAttr(x) => {
+                let Some((setxattr_flags, name, value)) = x.decode(se.setxattr_ext) else {
+                    return Err(Errno::EINVAL);
+                };
+                self.setxattr_flags.store(setxattr_flags, Ordering::Relaxed);
                 se.filesystem.setxattr(
                     self,
                     self.request.nodeid().into(),
-                    x.name(),
-                    x.value(),
+                    name,
+                    value,
                     x.flags(),
                     x.position(),
                     self.reply(),
@@ -1112,6 +1124,14 @@ impl<'a> Request<'a> {
     #[inline]
     pub fn uid(&self) -> u32 {
         self.request.uid()
+    }
+
+    /// For a SETXATTR: whether the kernel asks the filesystem to clear SGID
+    /// along with setting `system.posix_acl_access` (FUSE_SETXATTR_EXT's
+    /// FUSE_SETXATTR_ACL_KILL_SGID). Always false without that extension.
+    #[inline]
+    pub fn setxattr_acl_kill_sgid(&self) -> bool {
+        self.setxattr_flags.load(Ordering::Relaxed) & 1 != 0
     }
 
     /// Returns the gid of this request
