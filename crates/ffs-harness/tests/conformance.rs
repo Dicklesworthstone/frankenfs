@@ -2132,7 +2132,7 @@ fn assert_mounted_fscrypt_legacy_policy(golden: &Value, tmp_path: &Path, image_p
         ioctl_trace_path: Some(ioctl_trace_path.clone()),
         ..MountOptions::default()
     };
-    let Some(_session) = try_mount_ffs_with_options(image_path, &mnt, &mount_opts) else {
+    let Some(session) = try_mount_ffs_with_options(image_path, &mnt, &mount_opts) else {
         eprintln!("Skipping mounted-path fscrypt transport probe: FUSE mount failed.");
         return;
     };
@@ -2140,6 +2140,11 @@ fn assert_mounted_fscrypt_legacy_policy(golden: &Value, tmp_path: &Path, image_p
     let report = ext4_get_encryption_policy_ioctl(
         &mnt.join(golden["path"].as_str().expect("golden policy path")),
     );
+    // The trace is appended by a writer thread; reading it right after the
+    // ioctl raced that thread and found it empty (bd-csvc8, CI runs
+    // 36971847542 and 37004805344). Joining the session drops the filesystem,
+    // which joins the writer: everything recorded is on disk after this.
+    session.unmount_and_join();
     let ioctl_trace = read_ioctl_trace(&ioctl_trace_path);
     if matches!(
         report["errno"].as_i64(),
