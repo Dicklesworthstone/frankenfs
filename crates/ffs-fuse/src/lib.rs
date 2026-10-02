@@ -1705,7 +1705,7 @@ const EXT4_IOC_GETSTATE_SIZE: u32 = 4;
 /// `FS_IOC_FSGETXATTR` = `_IOR('X', 31, struct fsxattr)` on x86_64.
 /// `struct fsxattr` is 28 bytes: u32 xflags + u32 extsize + u32 nextents
 /// + u32 projid + u32 cowextsize + 8-byte pad.
-const FS_IOC_FSGETXATTR: u32 = 0x801C_5821;
+const FS_IOC_FSGETXATTR: u32 = 0x801C_581F;
 const FS_IOC_FSGETXATTR_SIZE: u32 = 28;
 /// `FIBMAP` = `_IO(0, 1)` = `0x0000_0001`. Legacy ioctl used by
 /// `filefrag -B`, e2fsck, and e2image. Userspace passes a u32 input
