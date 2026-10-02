@@ -1009,7 +1009,7 @@ impl FsOps for OpenFs {
             FsFlavor::Ext4(_) => self
                 .ext4_tmpfile(cx, Self::ext4_canonical_inode(parent), mode, uid, gid)
                 .map(Self::ext4_present_attr),
-            FsFlavor::Btrfs(_) => Err(FfsError::UnsupportedFeature("O_TMPFILE on btrfs".into())),
+            FsFlavor::Btrfs(_) => self.btrfs_tmpfile(parent, mode, uid, gid),
         }
     }
 

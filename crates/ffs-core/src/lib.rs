@@ -39601,10 +39601,73 @@ impl OpenFs {
         Self::btrfs_insert_inode_ref(&mut alloc, target_oid, parent_oid, new_name, dir_index_seq)?;
         self.btrfs_adjust_nlink(&mut alloc, target_oid, 1, secs, nanos)?;
         self.btrfs_touch_inode_times(&mut alloc, parent_oid, secs, nanos)?;
+        // A zero-link source is an O_TMPFILE inode (the VFS refuses to link
+        // any other unlinked one): named now, it leaves the orphan list.
+        if self.btrfs_pending_orphans.lock().remove(&target_oid) {
+            alloc
+                .fs_tree
+                .delete(&Self::btrfs_orphan_item_key(target_oid))
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        }
 
         let updated = self.btrfs_read_inode_from_tree(&alloc, target_oid)?;
         drop(alloc);
         Ok(self.btrfs_inode_to_attr(target_oid, &updated))
+    }
+
+    /// `O_TMPFILE` on btrfs: a regular-file inode with no name, nlink 0 and an
+    /// ORPHAN_ITEM from the start (kernel `btrfs_tmpfile`), reclaimed at the
+    /// last reference unless `link` names it first.
+    fn btrfs_tmpfile(
+        &self,
+        parent: InodeNumber,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> ffs_error::Result<InodeAttr> {
+        self.require_btrfs_rw_allowed("tmpfile")?;
+        let alloc_mutex = self.require_btrfs_alloc_state()?;
+        let parent_oid = self.btrfs_canonical_inode(parent)?;
+        let (secs, nanos) = Self::btrfs_now_timestamp();
+        let mut alloc = alloc_mutex.write();
+        self.btrfs_require_directory_inode(&alloc, parent_oid)?;
+        let new_oid = alloc.next_objectid;
+        alloc.next_objectid = alloc.next_objectid.saturating_add(1);
+        let inode = BtrfsInodeItem {
+            generation: alloc.generation,
+            size: 0,
+            nbytes: 0,
+            nlink: 0,
+            uid,
+            gid,
+            mode: u32::from(mode) | 0o100_000, // S_IFREG
+            rdev: 0,
+            flags: 0,
+            atime_sec: secs,
+            atime_nsec: nanos,
+            ctime_sec: secs,
+            ctime_nsec: nanos,
+            mtime_sec: secs,
+            mtime_nsec: nanos,
+            otime_sec: secs,
+            otime_nsec: nanos,
+        };
+        let inode_key = BtrfsKey {
+            objectid: new_oid,
+            item_type: BTRFS_ITEM_INODE_ITEM,
+            offset: 0,
+        };
+        alloc
+            .fs_tree
+            .insert(inode_key, &inode.to_bytes())
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        alloc
+            .fs_tree
+            .upsert(Self::btrfs_orphan_item_key(new_oid), &[])
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        self.btrfs_pending_orphans.lock().insert(new_oid);
+        drop(alloc);
+        Ok(self.btrfs_inode_to_attr(new_oid, &inode))
     }
 
     /// Create a symbolic link in a btrfs filesystem.
@@ -86068,6 +86131,56 @@ mod tests {
                 .all(|&b| b == 0),
             "preallocated space reads as zeroes"
         );
+    }
+
+    /// O_TMPFILE on btrfs (xfstests generic/004): nameless with nlink 0 and an
+    /// ORPHAN_ITEM; `link` names it and drops the orphan item; an unnamed one
+    /// is reclaimed at its last reference.
+    #[test]
+    fn btrfs_tmpfile_link_names_it_and_unlinked_tmpfile_is_reclaimed() {
+        let (fs, cx) = open_writable_btrfs();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let tmpfile = |mode| {
+            fs.with_latest_scope(|scope| {
+                <OpenFs as FsOps>::tmpfile(&fs, &cx, scope, root, mode, 0, 0)
+            })
+            .expect("tmpfile")
+        };
+        let orphan_item = |ino: InodeNumber| {
+            let alloc = fs.require_btrfs_alloc_state().expect("alloc").read();
+            alloc
+                .fs_tree
+                .get(&OpenFs::btrfs_orphan_item_key(ino.0))
+                .is_some()
+        };
+
+        let kept = tmpfile(0o600);
+        assert_eq!(kept.nlink, 0);
+        assert!(orphan_item(kept.ino), "a tmpfile starts on the orphan list");
+        let _ = fs.write(&cx, kept.ino, 0, b"named later").expect("write");
+        let named = fs
+            .link(&cx, kept.ino, root, OsStr::new("named"))
+            .expect("link the tmpfile");
+        assert_eq!(named.nlink, 1);
+        assert!(
+            !orphan_item(kept.ino),
+            "a named tmpfile leaves the orphan list"
+        );
+        assert!(
+            !fs.finalize_unlinked_inode_public(&cx, kept.ino)
+                .expect("finalize named"),
+            "the last reference to a named tmpfile must not reclaim it"
+        );
+        assert_eq!(fs.read(&cx, kept.ino, 0, 64).expect("read"), b"named later");
+
+        let dropped = tmpfile(0o644);
+        assert!(
+            fs.finalize_unlinked_inode_public(&cx, dropped.ino)
+                .expect("finalize dropped"),
+            "the last reference reclaims an unnamed tmpfile"
+        );
+        assert!(!orphan_item(dropped.ino));
+        assert!(fs.getattr(&cx, dropped.ino).is_err());
     }
 
     /// xfstests generic/035 on btrfs: unlinking a pinned file, or renaming over
