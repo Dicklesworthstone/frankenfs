@@ -8348,6 +8348,38 @@ fn lock_image_for_rw_mount(image_path: &Path) -> Result<std::fs::File> {
     }
 }
 
+/// Before a read-only mount opens the image, wait for a read-write daemon
+/// that is still running its final DESTROY flush to exit (the same `umount;
+/// mount` race as [`lock_image_for_rw_mount`]; xfstests generic/003 in CI
+/// cycled to `ro` and read the atime of the commit before the last). The
+/// shared lock is released at once: a read-only mount does not keep a later
+/// read-write mount out. A writer still holding the image after the wait is a
+/// live concurrent mount, which this has never refused; it is only logged.
+fn wait_for_image_writer_to_exit(image_path: &Path) -> Result<()> {
+    const WAIT: Duration = Duration::from_secs(30);
+    let file = std::fs::File::open(image_path)
+        .with_context(|| format!("open {} to wait for its writer", image_path.display()))?;
+    let deadline = Instant::now() + WAIT;
+    loop {
+        match file.try_lock_shared() {
+            Ok(()) => return Ok(()),
+            Err(std::fs::TryLockError::WouldBlock) if Instant::now() < deadline => {
+                std::thread::sleep(Duration::from_millis(50));
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                warn!(
+                    image = %image_path.display(),
+                    "a read-write FrankenFS mount still holds the image; mounting read-only anyway"
+                );
+                return Ok(());
+            }
+            Err(std::fs::TryLockError::Error(err)) => {
+                return Err(err).with_context(|| format!("lock {}", image_path.display()));
+            }
+        }
+    }
+}
+
 fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) -> Result<()> {
     if env_bool("FFS_MOUNT_BENCH_EVIDENCE", false)? {
         let sha = elf_self_sha256().context("self-hash executing mounted benchmark ELF")?;
@@ -8483,6 +8515,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
     let _image_lock = if options.read_write {
         Some(lock_image_for_rw_mount(image_path)?)
     } else {
+        wait_for_image_writer_to_exit(image_path)?;
         None
     };
 
@@ -10255,6 +10288,36 @@ mod tests {
     use std::path::{Path, PathBuf};
     use std::sync::{Arc, Mutex};
     use std::time::{SystemTime, UNIX_EPOCH};
+
+    #[test]
+    fn read_only_mount_waits_for_the_previous_writer_to_exit() {
+        let tmp = tempfile::tempdir().expect("tmpdir");
+        let image = tmp.path().join("image");
+        std::fs::write(&image, b"image").expect("image");
+        // No writer: no wait.
+        let start = std::time::Instant::now();
+        super::wait_for_image_writer_to_exit(&image).expect("no writer");
+        assert!(start.elapsed() < std::time::Duration::from_millis(500));
+        // Another reader's shared lock does not hold a read-only mount back.
+        let reader = std::fs::File::open(&image).expect("open");
+        reader.lock_shared().expect("shared");
+        super::wait_for_image_writer_to_exit(&image).expect("reader present");
+        drop(reader);
+        // A writer finishing its final flush: wait until it lets go.
+        let writer = std::fs::File::open(&image).expect("open");
+        writer.lock().expect("exclusive");
+        let release = std::thread::spawn(move || {
+            std::thread::sleep(std::time::Duration::from_millis(300));
+            drop(writer);
+        });
+        let start = std::time::Instant::now();
+        super::wait_for_image_writer_to_exit(&image).expect("writer exits");
+        assert!(
+            start.elapsed() >= std::time::Duration::from_millis(250),
+            "returned while the writer still held the image"
+        );
+        release.join().expect("join");
+    }
 
     #[test]
     fn benchmark_rate_truncation_preserves_saturation_and_boundaries() {
