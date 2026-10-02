@@ -2229,6 +2229,12 @@ pub struct MountOptions {
     pub subtype: Option<String>,
     /// Access-time maintenance on READ (ignored on read-only mounts).
     pub atime: AtimePolicy,
+    /// Honour device nodes on the mount (`dev`). FUSE mounts default to
+    /// `nodev`; only root may lift it (fusermount3 refuses it for users).
+    pub dev: bool,
+    /// Honour set-user/group-ID bits on the mount (`suid`); default `nosuid`,
+    /// root only, like [`Self::dev`].
+    pub suid: bool,
 }
 
 impl Default for MountOptions {
@@ -2243,6 +2249,8 @@ impl Default for MountOptions {
             fsname: None,
             subtype: None,
             atime: AtimePolicy::Relatime,
+            dev: false,
+            suid: false,
         }
     }
 }
@@ -7789,8 +7797,19 @@ fn build_mount_options(options: &MountOptions) -> Vec<MountOption> {
     if options.allow_other {
         opts.push(MountOption::AllowOther);
     }
-    if options.auto_unmount {
+    // fuser mounts nodev,nosuid unless Dev/Suid are present. AutoUnmount makes
+    // fuser mount through fusermount3, and distributions confine that binary
+    // to nodev,nosuid mounts even for root (Ubuntu's AppArmor profile denies
+    // anything else with EACCES). So a dev/suid mount, which only root may
+    // make, goes through mount(2) directly and forgoes auto-unmount.
+    if options.auto_unmount && !options.dev && !options.suid {
         opts.push(MountOption::AutoUnmount);
+    }
+    if options.dev {
+        opts.push(MountOption::Dev);
+    }
+    if options.suid {
+        opts.push(MountOption::Suid);
     }
     // `writeback_cache` is deliberately absent: it is an INIT capability
     // (`FUSE_WRITEBACK_CACHE`, negotiated in `init`), and mount(2) rejects it
@@ -22749,6 +22768,8 @@ mod tests {
             fsname: None,
             subtype: None,
             atime: AtimePolicy::Relatime,
+            dev: false,
+            suid: false,
         };
         let mount_opts = build_mount_options(&opts);
         // Should NOT contain RO
@@ -22768,12 +22789,42 @@ mod tests {
             fsname: None,
             subtype: None,
             atime: AtimePolicy::Relatime,
+            dev: false,
+            suid: false,
         };
         let mount_opts = build_mount_options(&opts);
         let has_allow = mount_opts
             .iter()
             .any(|o| matches!(o, MountOption::AllowOther));
         assert!(has_allow, "AllowOther should be present");
+    }
+
+    /// bd-e94tv: fuser mounts nodev,nosuid unless Dev/Suid are passed, so a
+    /// root mount could not open its device nodes (xfstests generic/184).
+    #[test]
+    fn build_mount_options_passes_dev_and_suid_only_when_asked() {
+        let has =
+            |opts: &MountOptions, want: &MountOption| build_mount_options(opts).contains(want);
+        let plain = MountOptions::default();
+        assert!(!has(&plain, &MountOption::Dev));
+        assert!(!has(&plain, &MountOption::Suid));
+        assert!(has(&plain, &MountOption::AutoUnmount));
+        let both = MountOptions {
+            dev: true,
+            suid: true,
+            ..MountOptions::default()
+        };
+        assert!(has(&both, &MountOption::Dev));
+        assert!(has(&both, &MountOption::Suid));
+        let dev_only = MountOptions {
+            dev: true,
+            ..MountOptions::default()
+        };
+        assert!(has(&dev_only, &MountOption::Dev));
+        assert!(!has(&dev_only, &MountOption::Suid));
+        // fusermount3 (taken for AutoUnmount) is confined to nodev,nosuid.
+        assert!(!has(&both, &MountOption::AutoUnmount));
+        assert!(!has(&dev_only, &MountOption::AutoUnmount));
     }
 
     #[test]
@@ -22836,6 +22887,8 @@ mod tests {
             fsname: None,
             subtype: None,
             atime: AtimePolicy::Relatime,
+            dev: false,
+            suid: false,
         };
         let mount_opts = build_mount_options(&opts);
         assert!(mount_opts.iter().all(|option| {
@@ -22887,6 +22940,8 @@ mod tests {
             fsname: None,
             subtype: None,
             atime: AtimePolicy::Relatime,
+            dev: false,
+            suid: false,
         };
         let mount_opts = build_mount_options(&opts);
         assert!(
@@ -22955,6 +23010,8 @@ mod tests {
                     fsname: None,
                     subtype: None,
                     atime: AtimePolicy::Relatime,
+                    dev: false,
+                    suid: false,
                 },
             ),
         ];
@@ -23731,6 +23788,8 @@ AllowOther"#;
             fsname: None,
             subtype: None,
             atime: AtimePolicy::Relatime,
+            dev: false,
+            suid: false,
         };
         let mount_opts = build_mount_options(&opts);
         let actual = mount_option_debug_lines(&mount_opts);
@@ -23766,6 +23825,8 @@ AllowOther"#;
             fsname: None,
             subtype: None,
             atime: AtimePolicy::Relatime,
+            dev: false,
+            suid: false,
         };
         let labels = mount_option_labels_for_fuzzing(&opts);
         assert!(labels.contains(&"ro".to_owned()));

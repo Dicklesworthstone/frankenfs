@@ -49,15 +49,27 @@ atime=""
 # kernel filesystem. Without allow_other, fuser answers other users itself
 # with EACCES (xfstests generic/087's owner utime ran as uid 99 and failed).
 allow_other=""
-[[ $EUID -eq 0 ]] && allow_other=yes
+# mount(8) by root defaults to dev,suid; FUSE defaults to nodev,nosuid, which
+# made device nodes on the mount unopenable (xfstests generic/184: EACCES).
+dev=""
+suid=""
+if [[ $EUID -eq 0 ]]; then
+    allow_other=yes
+    dev=yes
+    suid=yes
+fi
 for part in "${parts[@]}"; do
     case $part in
         allow_other) allow_other=yes ;;
         # FUSE inodes are S_NOATIME, so the daemon applies the atime policy.
         noatime | relatime | strictatime) atime=$part ;;
+        nodev) dev="" ;;
+        nosuid) suid="" ;;
     esac
 done
 [[ -n $allow_other ]] && args+=(--allow-other)
+[[ -n $dev ]] && args+=(--dev)
+[[ -n $suid ]] && args+=(--suid)
 [[ -n $atime ]] && args+=(--atime "$atime")
 # An empty FFS_FUSE_SUBTYPE mounts with no subtype, so the kernel reports the
 # type as plain `fuse` (xfstests FSTYP=fuse compares against that).

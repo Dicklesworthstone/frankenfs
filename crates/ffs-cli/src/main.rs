@@ -643,6 +643,9 @@ struct MountCmdOptions {
     /// FUSE subtype; `None` = `ffs`, empty = none (plain `fuse` type).
     subtype: Option<String>,
     atime: AtimePolicy,
+    /// Mount `dev` / `suid` instead of FUSE's `nodev` / `nosuid`.
+    dev: bool,
+    suid: bool,
     mount_mode: MountMode,
     btrfs_mount_selection: BtrfsMountSelection,
     btrfs_device_paths: Vec<PathBuf>,
@@ -1270,6 +1273,17 @@ enum Command {
         /// to the filesystem, so this replaces the usual mount flags.
         #[arg(long, value_enum, default_value_t = AtimeArg::Relatime)]
         atime: AtimeArg,
+        /// Honour device nodes on the mount. FUSE mounts are `nodev` by
+        /// default; a kernel filesystem mounted by root is `dev`. Root only;
+        /// `--dev`/`--suid` mounts use mount(2) directly (fusermount3 is
+        /// confined to nodev,nosuid), so they are not auto-unmounted if the
+        /// daemon dies.
+        #[arg(long)]
+        dev: bool,
+        /// Honour set-user/group-ID bits on the mount (FUSE default `nosuid`).
+        /// Root only.
+        #[arg(long)]
+        suid: bool,
         /// Opt into kernel FUSE writeback_cache after the safety gate accepts.
         ///
         /// Requires `--rw`, `--writeback-cache-gate`,
@@ -2511,6 +2525,8 @@ fn run() -> Result<()> {
             fsname,
             subtype,
             atime,
+            dev,
+            suid,
             writeback_cache,
             writeback_cache_gate,
             writeback_cache_ordering_oracle,
@@ -2556,6 +2572,8 @@ fn run() -> Result<()> {
                     fsname,
                     subtype,
                     atime: atime.policy(),
+                    dev,
+                    suid,
                     mount_mode: if native {
                         MountMode::Native
                     } else {
@@ -7206,6 +7224,8 @@ fn mount_with_fuse(
         fsname: options.fsname.clone(),
         subtype: options.subtype.clone(),
         atime: options.atime,
+        dev: options.dev,
+        suid: options.suid,
     };
 
     // bd-bhh0i mounted cutover. `ext4_create` otherwise takes
@@ -7281,6 +7301,8 @@ struct ManagedMountParams<'a> {
     fsname: Option<&'a str>,
     subtype: Option<&'a str>,
     atime: AtimePolicy,
+    dev: bool,
+    suid: bool,
     writeback_cache: WritebackCacheMode,
     backpressure: Option<Arc<BackpressureGate>>,
     adaptive_runtime_plan: Option<&'a MountAdaptiveRuntimePlan>,
@@ -7399,6 +7421,8 @@ fn mount_with_managed_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_>
             fsname: params.fsname.map(str::to_owned),
             subtype: params.subtype.map(str::to_owned),
             atime: params.atime,
+            dev: params.dev,
+            suid: params.suid,
         },
         backpressure: params.backpressure.clone(),
         unmount_timeout: std::time::Duration::from_secs(params.unmount_timeout_secs),
@@ -7601,6 +7625,8 @@ fn mount_with_per_core_fuse(open_fs: Arc<OpenFs>, params: &ManagedMountParams<'_
             fsname: params.fsname.map(str::to_owned),
             subtype: params.subtype.map(str::to_owned),
             atime: params.atime,
+            dev: params.dev,
+            suid: params.suid,
         },
         backpressure: params.backpressure.clone(),
         unmount_timeout: std::time::Duration::from_secs(params.unmount_timeout_secs),
@@ -8645,6 +8671,8 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
                 fsname: options.fsname.as_deref(),
                 subtype: options.subtype.as_deref(),
                 atime: options.atime,
+                dev: options.dev,
+                suid: options.suid,
                 writeback_cache: WritebackCacheMode::from_enabled(options.writeback_cache.enabled),
                 backpressure: adaptive_runtime_plan
                     .as_ref()
@@ -10300,6 +10328,8 @@ mod tests {
             fsname: None,
             subtype: None,
             atime: AtimePolicy::Relatime,
+            dev: false,
+            suid: false,
             read_write,
             mount_mode: MountMode::Compat,
             btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
@@ -14281,6 +14311,8 @@ mod tests {
                         fsname: None,
                         subtype: None,
                         atime: AtimePolicy::Relatime,
+                        dev: false,
+                        suid: false,
                         read_write: true,
                         btrfs_rw_ephemeral_ok: false,
                         btrfs_verify_data_on_read: false,
@@ -14363,6 +14395,8 @@ mod tests {
                 fsname: None,
                 subtype: None,
                 atime: AtimePolicy::Relatime,
+                dev: false,
+                suid: false,
                 read_write: false,
                 btrfs_rw_ephemeral_ok: false,
                 btrfs_verify_data_on_read: false,
@@ -14405,6 +14439,8 @@ mod tests {
                 fsname: None,
                 subtype: None,
                 atime: AtimePolicy::Relatime,
+                dev: false,
+                suid: false,
                 read_write: false,
                 btrfs_rw_ephemeral_ok: false,
                 btrfs_verify_data_on_read: false,
@@ -14519,6 +14555,8 @@ mod tests {
             fsname: None,
             subtype: None,
             atime: AtimePolicy::Relatime,
+            dev: false,
+            suid: false,
             read_write: false,
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: false,
@@ -14612,6 +14650,8 @@ mod tests {
             fsname: None,
             subtype: None,
             atime: AtimePolicy::Relatime,
+            dev: false,
+            suid: false,
             read_write: false,
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: verify,
@@ -14654,6 +14694,8 @@ mod tests {
             fsname: None,
             subtype: None,
             atime: AtimePolicy::Relatime,
+            dev: false,
+            suid: false,
             read_write: true,
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: false,
@@ -14691,6 +14733,8 @@ mod tests {
             fsname: None,
             subtype: None,
             atime: AtimePolicy::Relatime,
+            dev: false,
+            suid: false,
             read_write: false,
             btrfs_rw_ephemeral_ok: false,
             btrfs_verify_data_on_read: false,
@@ -14732,6 +14776,8 @@ mod tests {
                     fsname: None,
                     subtype: None,
                     atime: AtimePolicy::Relatime,
+                    dev: false,
+                    suid: false,
                     read_write: false,
                     btrfs_rw_ephemeral_ok: false,
                     btrfs_verify_data_on_read: false,
@@ -14782,6 +14828,8 @@ mod tests {
                     fsname: None,
                     subtype: None,
                     atime: AtimePolicy::Relatime,
+                    dev: false,
+                    suid: false,
                     read_write: false,
                     btrfs_rw_ephemeral_ok: false,
                     btrfs_verify_data_on_read: false,
@@ -14833,6 +14881,8 @@ mod tests {
                     fsname: None,
                     subtype: None,
                     atime: AtimePolicy::Relatime,
+                    dev: false,
+                    suid: false,
                     read_write: false,
                     btrfs_rw_ephemeral_ok: false,
                     btrfs_verify_data_on_read: false,
@@ -14901,6 +14951,8 @@ mod tests {
                     fsname: None,
                     subtype: None,
                     atime: AtimePolicy::Relatime,
+                    dev: false,
+                    suid: false,
                     read_write: false,
                     btrfs_rw_ephemeral_ok: false,
                     btrfs_verify_data_on_read: false,
