@@ -11366,10 +11366,15 @@ struct FileStateSnapshot {
     mtime_nsec: i64,
 }
 
+/// Read, THEN stat: the read is an access, and under the mount's default
+/// relatime it moves atime the first time after a write. Stat-then-read let
+/// the snapshot's own read change the atime the next snapshot sees; read-then-
+/// stat makes a repeated snapshot stable, so a difference is the operation's.
 fn snapshot_file_state(path: &Path) -> FileStateSnapshot {
+    let bytes = fs::read(path).expect("read file state");
     let meta = fs::metadata(path).expect("stat file state");
     FileStateSnapshot {
-        bytes: fs::read(path).expect("read file state"),
+        bytes,
         mode: meta.permissions().mode() & 0o7777,
         len: meta.len(),
         atime: meta.atime(),
@@ -11383,7 +11388,7 @@ fn assert_file_state_unchanged(path: &Path, before: &FileStateSnapshot, context:
     let after = snapshot_file_state(path);
     assert_eq!(
         after, *before,
-        "{context} must not change file contents or metadata on a read-only mount"
+        "{context} must not change file contents or metadata"
     );
 }
 
