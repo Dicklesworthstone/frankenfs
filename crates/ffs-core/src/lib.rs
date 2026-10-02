@@ -8191,8 +8191,11 @@ impl OpenFs {
             return Ok(None);
         }
 
-        let replay = replay_fast_commit(&fc_bytes, inode_size)?;
-        if replay.transactions_found > 0 {
+        let replay = replay_fast_commit(&fc_bytes, block_size as usize, inode_size)?;
+        // The gate reads the HEAD's tid, not the last committed one: a cycle
+        // with no complete transaction (a lone HEAD left when the kernel fell
+        // back to a full commit) is equally stale, not an incomplete fast commit.
+        if let Some(cycle_tid) = replay.head_tid {
             let reader = ByteDeviceBlockAdapter {
                 dev: &*self.dev,
                 block_size,
@@ -8209,10 +8212,10 @@ impl OpenFs {
                 .committed_sequences
                 .last()
                 .map_or(journal_sb.start_sequence, |seq| seq.wrapping_add(1));
-            if replay.last_tid != expected_tid {
+            if cycle_tid != expected_tid {
                 info!(
                     journal_inum,
-                    fc_tid = replay.last_tid,
+                    fc_tid = cycle_tid,
                     expected_tid,
                     "ext4 fast-commit area is stale; not replayed"
                 );
@@ -75851,6 +75854,71 @@ mod tests {
         let bytes = <OpenFs as FsOps>::trim_range(&fs, &cx, &mut scope, 0, u64::MAX, 0)
             .expect("len = u64::MAX must saturate, not overflow");
         assert_eq!(bytes, 0);
+    }
+
+    #[test]
+    fn ext4_trim_range_rejects_what_ext4_trim_fs_rejects() {
+        // xfstests generic/288: `fstrim -l0` and `fstrim -l100` must fail.
+        let Some(fs) = open_writable_ext4() else {
+            return;
+        };
+        let FsFlavor::Ext4(sb) = &fs.flavor else {
+            panic!("ext4 fixture");
+        };
+        let block = u64::from(sb.block_size);
+        let end = sb.blocks_count * block;
+        let group = u64::from(sb.clusters_per_group) * block;
+        let cx = Cx::for_testing();
+        let mut scope = RequestScope::empty();
+        let mut trim = |start, len, min_len| {
+            <OpenFs as FsOps>::trim_range(&fs, &cx, &mut scope, start, len, min_len)
+        };
+        for (start, len, min_len) in [
+            (0, 0, 0),
+            (0, 100, 0),
+            (0, block - 1, 0),
+            (end, u64::MAX, 0),
+            (0, u64::MAX, group + block),
+        ] {
+            let err = trim(start, len, min_len).expect_err("kernel rejects this range");
+            assert_eq!(
+                err.to_errno(),
+                libc::EINVAL,
+                "start={start} len={len} minlen={min_len}"
+            );
+        }
+        // One block, the last block, and a group-sized minimum are accepted.
+        trim(0, block, 0).expect("one block");
+        trim(end - block, u64::MAX, 0).expect("last block");
+        trim(0, u64::MAX, group).expect("group-sized minlen");
+    }
+
+    #[test]
+    fn btrfs_trim_range_rejects_what_btrfs_trim_fs_rejects() {
+        // xfstests generic/260 + 288 on btrfs: logical addresses span u64, so
+        // only a sub-sector length, start == U64_MAX and an overflowing
+        // start + len fail; a start past the device is a valid (empty) trim.
+        let (fs, cx) = open_writable_btrfs();
+        let FsFlavor::Btrfs(sb) = &fs.flavor else {
+            panic!("btrfs fixture");
+        };
+        let sector = u64::from(sb.sectorsize);
+        let mut scope = RequestScope::empty();
+        let mut trim =
+            |start, len| <OpenFs as FsOps>::trim_range(&fs, &cx, &mut scope, start, len, 0);
+        for (start, len) in [
+            (0, 0),
+            (0, 100),
+            (u64::MAX, u64::MAX),
+            (u64::MAX, 1 << 20),
+            (u64::MAX - (1 << 19), 1 << 20),
+        ] {
+            let err = trim(start, len).expect_err("kernel rejects this range");
+            assert_eq!(err.to_errno(), libc::EINVAL, "start={start} len={len}");
+        }
+        trim(0, sector).expect("one sector");
+        trim(0, u64::MAX).expect("whole fs");
+        trim(1 << 50, u64::MAX).expect("start past the device");
     }
 
     // ── bd-9llzj: FS_IOC_GETFSUUID (struct fsuuid2) ───────────────────────

@@ -19154,6 +19154,90 @@ fn fast_commit_crash_image_truncate_matches_kernel_bd_9m84h() {
     );
 }
 
+// bd-9m84h: fast-commit recovery into an htree directory whose leaves fill
+// up: the baseline makes a multi-leaf htree, the fast commit adds a hundred
+// more entries (ADD_ENTRY records replayed through leaf splits).
+#[test]
+#[ignore = "bd-9m84h: FC apply cannot split a full htree leaf yet (no recovery-time allocator); open fails closed"]
+fn fast_commit_crash_image_htree_growth_matches_kernel_bd_9m84h() {
+    let names: Vec<String> = (0..400)
+        .map(|i| format!("entry_{i:04}_{}", "x".repeat(40)))
+        .collect();
+    let (old, new) = names.split_at(300);
+    let mut expected: Vec<&str> = names.iter().map(String::as_str).collect();
+    expected.push("alpha");
+    expected.sort_unstable();
+    run_fc_kernel_scenario(
+        "fc_crash_image_htree_growth_bd_9m84h",
+        &|dir| {
+            fs::write(dir.join("alpha"), b"alpha").unwrap();
+            for name in old {
+                fs::write(dir.join(name), name.as_bytes()).unwrap();
+            }
+        },
+        &|dir| {
+            for name in new {
+                fs::write(dir.join(name), name.as_bytes()).unwrap();
+            }
+            fc_fsynced_write(dir, "alpha", b" grows", true);
+        },
+        &expected,
+        true,
+    );
+}
+
+// bd-9m84h: a fast commit too big for the fast-commit area. The kernel falls
+// back to a full commit and leaves a lone HEAD naming that commit's tid in the
+// area; recovery must treat it as stale (as the kernel does), not as an
+// incomplete fast commit, and still match the kernel.
+#[test]
+fn fast_commit_crash_image_overflow_falls_back_to_full_commit_bd_9m84h() {
+    let names: Vec<String> = (0..400)
+        .map(|i| format!("entry_{i:04}_{}", "x".repeat(40)))
+        .collect();
+    let mut expected: Vec<&str> = names.iter().map(String::as_str).collect();
+    expected.push("alpha");
+    expected.sort_unstable();
+    run_fc_kernel_scenario(
+        "fc_crash_image_overflow_bd_9m84h",
+        &|dir| fs::write(dir.join("alpha"), b"alpha").unwrap(),
+        &|dir| {
+            for name in &names {
+                fs::write(dir.join(name), name.as_bytes()).unwrap();
+            }
+            fc_fsynced_write(dir, "alpha", b" grows", true);
+        },
+        &expected,
+        false,
+    );
+}
+
+// bd-9m84h: fast-commit recovery of a file whose extents no longer fit in the
+// inode (more than four), so recovery has to grow an external extent block.
+#[test]
+#[ignore = "bd-9m84h: FC apply cannot grow an inline extent root into a leaf yet (no recovery-time allocator); open fails closed"]
+fn fast_commit_crash_image_extent_tree_growth_matches_kernel_bd_9m84h() {
+    use std::os::unix::fs::FileExt;
+    run_fc_kernel_scenario(
+        "fc_crash_image_extent_tree_growth_bd_9m84h",
+        &|dir| fs::write(dir.join("sparse"), b"head").unwrap(),
+        &|dir| {
+            let file = fs::OpenOptions::new()
+                .write(true)
+                .open(dir.join("sparse"))
+                .expect("open sparse");
+            // Twelve one-block islands a MiB apart: twelve extents.
+            for i in 1..=12_u8 {
+                file.write_all_at(&[i; 4096], u64::from(i) << 20)
+                    .expect("write island");
+            }
+            file.sync_all().expect("fsync sparse");
+        },
+        &["sparse"],
+        true,
+    );
+}
+
 /// bd-9m84h: fast-commit recovery certified against the kernel. A
 /// kernel-mounted ext4 with fast_commit takes a fully committed baseline
 /// (`baseline`, then sync), then `changes` makes FC-eligible changes durable

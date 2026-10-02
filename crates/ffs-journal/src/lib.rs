@@ -2102,6 +2102,9 @@ pub struct FcReplayResult {
     pub operations: Vec<FcOperation>,
     /// Transaction ID of the last committed FC transaction.
     pub last_tid: u32,
+    /// The cycle tid named by the stream's HEAD, if one was read. The kernel
+    /// replays a cycle only when this is the commit after the log's last.
+    pub head_tid: Option<u32>,
     /// Number of FC blocks scanned.
     pub blocks_scanned: u64,
     /// Number of FC transactions found.
@@ -2237,9 +2240,12 @@ fn parse_fc_operation(tag: FcTag, payload: &[u8]) -> Option<FcOperation> {
 ///
 /// Returns `Ok(FcReplayResult)` with the extracted operations, or `Err` if
 /// the fast commit region is corrupted beyond recovery.
-pub fn replay_fast_commit(data: &[u8], inode_size: u16) -> Result<FcReplayResult> {
+pub fn replay_fast_commit(
+    data: &[u8],
+    block_size: usize,
+    inode_size: u16,
+) -> Result<FcReplayResult> {
     let mut result = FcReplayResult::default();
-    let mut pos = 0;
     let mut pending = PendingFcTransaction::default();
     // Mirrors ext4_fc_replay_scan. Only the first fast commit after a full
     // commit carries a HEAD (with the cycle's tid); later ones follow the
@@ -2253,111 +2259,123 @@ pub fn replay_fast_commit(data: &[u8], inode_size: u16) -> Result<FcReplayResult
     let mut crc = 0_u32;
     let crc_update = |crc: u32, bytes: &[u8]| !crc32c::crc32c_append(!crc, bytes);
 
-    while pos + 4 <= data.len() {
-        let tag_offset = pos;
-        // Parse tag header: tag_type (u16 LE), tag_len (u16 LE).
-        let tag_type = u16::from_le_bytes([data[pos], data[pos + 1]]);
-        let tag_len = u16::from_le_bytes([data[pos + 2], data[pos + 3]]) as usize;
-        if tag_type == 0 && tag_len == 0 {
-            break;
-        }
-        pos += 4;
-
-        if pos + tag_len > data.len() {
-            discard_pending_fc_transaction(&mut result, &mut pending);
-            result.fallback_required = true;
-            break; // Truncated tag — stop scanning and force fallback.
-        }
-
-        let payload = &data[pos..pos + tag_len];
-        pos += tag_len;
-
-        let Some(tag) = FcTag::from_u16(tag_type) else {
-            // Unknown tags mean we cannot safely replay this stream without
-            // understanding the omitted semantics. Force the caller to fall
-            // back to full recovery instead of applying a partial transaction.
-            discard_pending_fc_transaction(&mut result, &mut pending);
-            result.fallback_required = true;
-            break;
-        };
-
-        if !tag.valid_payload_len(tag_len, inode_size) {
-            return Err(FfsError::Corruption {
-                block: 0,
-                detail: format!(
-                    "fast-commit tag {tag:?} ({tag_type:#06x}) has invalid payload length \
-                     {tag_len} at stream byte offset {tag_offset}; configured inode size {inode_size}"
-                ),
-            });
-        }
-
-        match tag {
-            FcTag::Head => {
-                // Mirror ext4_fc_replay_scan: an FC stream advertising any
-                // feature bit outside EXT4_FC_SUPPORTED_FEATURES cannot be
-                // safely interpreted, so fall back to full JBD2 recovery
-                // rather than misreading feature-gated semantics.
-                let fc_features =
-                    u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                if fc_features & !EXT4_FC_SUPPORTED_FEATURES != 0 {
+    // Tags never cross a block: the kernel scans each fast-commit block on its
+    // own, and its PAD tag ends one byte short of the block (ext4_fc_reserve_
+    // space: pad_len = bsize - off - 1 - tag header), so the bytes after the
+    // last tag that fits are not a tag.
+    let block_size = block_size.max(1);
+    'blocks: for block_start in (0..data.len()).step_by(block_size) {
+        let end = (block_start + block_size).min(data.len());
+        let mut pos = block_start;
+        while pos + 4 <= end {
+            let tag_offset = pos;
+            // Parse tag header: tag_type (u16 LE), tag_len (u16 LE).
+            let tag_type = u16::from_le_bytes([data[pos], data[pos + 1]]);
+            let tag_len = u16::from_le_bytes([data[pos + 2], data[pos + 3]]) as usize;
+            if tag_type == 0 && tag_len == 0 {
+                // The end of the written area: anything after it is garbage.
+                if data[pos..].iter().any(|&byte| byte != 0) {
                     discard_pending_fc_transaction(&mut result, &mut pending);
                     result.fallback_required = true;
-                    continue;
                 }
-                let tid = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-                if head_tid.is_some_and(|head| head != tid) {
-                    // A stale block from an earlier cycle.
-                    return Ok(result);
-                }
+                break 'blocks;
+            }
+            pos += 4;
+
+            if pos + tag_len > end {
                 discard_pending_fc_transaction(&mut result, &mut pending);
-                head_tid = Some(tid);
-                crc = crc_update(0, &data[tag_offset..pos]);
-                pending.active = true;
-                result.record_block_scanned();
+                result.fallback_required = true;
+                break 'blocks; // Truncated tag — stop scanning and force fallback.
             }
-            FcTag::Tail => {
-                let Some(head) = head_tid else {
-                    result.fallback_required = true;
-                    continue;
-                };
-                // Header plus tid: the crc field itself is not covered.
-                crc = crc_update(crc, &data[tag_offset..tag_offset + 8]);
-                let tid = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
-                let stored = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
-                if tid != head || stored != crc {
-                    // Torn or stale: the stream ends at the last valid TAIL.
-                    return Ok(result);
-                }
-                result.last_tid = tid;
-                result.record_transaction_found();
-                result.operations.append(&mut pending.operations);
-                pending.active = false;
-                crc = 0;
+
+            let payload = &data[pos..pos + tag_len];
+            pos += tag_len;
+
+            let Some(tag) = FcTag::from_u16(tag_type) else {
+                // Unknown tags mean we cannot safely replay this stream without
+                // understanding the omitted semantics. Force the caller to fall
+                // back to full recovery instead of applying a partial transaction.
+                discard_pending_fc_transaction(&mut result, &mut pending);
+                result.fallback_required = true;
+                break 'blocks;
+            };
+
+            if !tag.valid_payload_len(tag_len, inode_size) {
+                return Err(FfsError::Corruption {
+                    block: 0,
+                    detail: format!(
+                        "fast-commit tag {tag:?} ({tag_type:#06x}) has invalid payload length \
+                     {tag_len} at stream byte offset {tag_offset}; configured inode size {inode_size}"
+                    ),
+                });
             }
-            FcTag::Pad => {
-                crc = crc_update(crc, &data[tag_offset..pos]);
-            }
-            _ => {
-                if head_tid.is_none() {
-                    result.fallback_required = true;
-                    continue;
-                }
-                crc = crc_update(crc, &data[tag_offset..pos]);
-                pending.active = true;
-                if let Some(operation) = parse_fc_operation(tag, payload) {
-                    pending.operations.push(operation);
-                } else {
+
+            match tag {
+                FcTag::Head => {
+                    // Mirror ext4_fc_replay_scan: an FC stream advertising any
+                    // feature bit outside EXT4_FC_SUPPORTED_FEATURES cannot be
+                    // safely interpreted, so fall back to full JBD2 recovery
+                    // rather than misreading feature-gated semantics.
+                    let fc_features =
+                        u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                    if fc_features & !EXT4_FC_SUPPORTED_FEATURES != 0 {
+                        discard_pending_fc_transaction(&mut result, &mut pending);
+                        result.fallback_required = true;
+                        continue;
+                    }
+                    let tid = u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                    if head_tid.is_some_and(|head| head != tid) {
+                        // A stale block from an earlier cycle.
+                        return Ok(result);
+                    }
                     discard_pending_fc_transaction(&mut result, &mut pending);
-                    result.fallback_required = true;
+                    head_tid = Some(tid);
+                    result.head_tid = Some(tid);
+                    crc = crc_update(0, &data[tag_offset..pos]);
+                    pending.active = true;
+                    result.record_block_scanned();
+                }
+                FcTag::Tail => {
+                    let Some(head) = head_tid else {
+                        result.fallback_required = true;
+                        continue;
+                    };
+                    // Header plus tid: the crc field itself is not covered.
+                    crc = crc_update(crc, &data[tag_offset..tag_offset + 8]);
+                    let tid = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]);
+                    let stored =
+                        u32::from_le_bytes([payload[4], payload[5], payload[6], payload[7]]);
+                    if tid != head || stored != crc {
+                        // Torn or stale: the stream ends at the last valid TAIL.
+                        return Ok(result);
+                    }
+                    result.last_tid = tid;
+                    result.record_transaction_found();
+                    result.operations.append(&mut pending.operations);
+                    pending.active = false;
+                    crc = 0;
+                }
+                FcTag::Pad => {
+                    crc = crc_update(crc, &data[tag_offset..pos]);
+                }
+                _ => {
+                    if head_tid.is_none() {
+                        result.fallback_required = true;
+                        continue;
+                    }
+                    crc = crc_update(crc, &data[tag_offset..pos]);
+                    pending.active = true;
+                    if let Some(operation) = parse_fc_operation(tag, payload) {
+                        pending.operations.push(operation);
+                    } else {
+                        discard_pending_fc_transaction(&mut result, &mut pending);
+                        result.fallback_required = true;
+                    }
                 }
             }
         }
     }
 
-    if pos < data.len() && data[pos..].iter().any(|&byte| byte != 0) {
-        discard_pending_fc_transaction(&mut result, &mut pending);
-        result.fallback_required = true;
-    }
     discard_pending_fc_transaction(&mut result, &mut pending);
     Ok(result)
 }
@@ -2443,7 +2461,7 @@ mod fc_tests {
             let mut stream = build_fc_tag(0x09, &[0; 8]);
             stream.extend(build_fc_tag(tag, &vec![0; length]));
             stream.extend(build_fc_tag(0x08, &[0; 8]));
-            let result = replay_fast_commit(&stream, 256);
+            let result = replay_fast_commit(&stream, 4096, 256);
             assert!(
                 matches!(result, Err(FfsError::Corruption { .. })),
                 "complete tag {tag:#x} with payload length {length} must reject recovery: {result:?}"
@@ -2461,7 +2479,7 @@ mod fc_tests {
         stream.extend(build_fc_tag(0x06, &42_u32.to_le_bytes()));
         stream.extend(build_fc_tag(0x08, &[0; 8]));
 
-        let result = replay_fast_commit(&stream, 256);
+        let result = replay_fast_commit(&stream, 4096, 256);
         assert!(
             matches!(result, Err(FfsError::Corruption { .. })),
             "committed prefix must not hide a malformed complete inode: {result:?}"
@@ -2479,7 +2497,7 @@ mod fc_tests {
                 stream.extend(build_fc_tag(0x06, &payload));
                 stream.extend(fc_tail(&stream, 0, 8));
 
-                let result = replay_fast_commit(&stream, inode_size).unwrap();
+                let result = replay_fast_commit(&stream, 4096, inode_size).unwrap();
                 assert_eq!(result.transactions_found, 1);
                 assert_eq!(result.blocks_scanned, 1);
                 assert_eq!(result.incomplete_transactions, 0);
@@ -2499,7 +2517,7 @@ mod fc_tests {
                 stream.extend(build_fc_tag(0x06, &payload));
                 stream.extend(build_fc_tag(0x08, &[0; 8]));
 
-                let err = replay_fast_commit(&stream, inode_size)
+                let err = replay_fast_commit(&stream, 4096, inode_size)
                     .expect_err("invalid inode body must be corruption");
                 let detail = match err {
                     FfsError::Corruption { detail, .. } => detail,
@@ -2526,7 +2544,7 @@ mod fc_tests {
                 let mut stream = build_fc_tag(0x09, &[0; 8]);
                 stream.extend(build_fc_tag(tag, &payload));
                 stream.extend(fc_tail(&stream, 0, 8));
-                let result = replay_fast_commit(&stream, 256).unwrap();
+                let result = replay_fast_commit(&stream, 4096, 256).unwrap();
                 let dentry = FcDentry {
                     parent_ino: 2,
                     ino: 42,
@@ -2554,7 +2572,9 @@ mod fc_tests {
                 let mut tail = fc_tail(&stream, 7, tail_len);
                 tail[12..].fill(0xA5); // padding bytes are not checked
                 stream.extend(tail);
-                let result = replay_fast_commit(&stream, 128).unwrap();
+                // A block big enough for the u16::MAX-long tags: no tag
+                // crosses a block, so this checks padding, not block bounds.
+                let result = replay_fast_commit(&stream, 1 << 18, 128).unwrap();
                 assert_eq!(result.transactions_found, 1);
                 assert_eq!(result.last_tid, 7);
                 assert_eq!(result.incomplete_transactions, 0);
@@ -2573,7 +2593,7 @@ mod fc_tests {
         stream.extend_from_slice(&0x06_u16.to_le_bytes());
         stream.extend_from_slice(&132_u16.to_le_bytes());
         stream.extend_from_slice(&42_u32.to_le_bytes());
-        let result = replay_fast_commit(&stream, 128).unwrap();
+        let result = replay_fast_commit(&stream, 4096, 128).unwrap();
         assert!(result.fallback_required);
         assert_eq!(result.transactions_found, 0);
         assert_eq!(result.incomplete_transactions, 1);
@@ -2621,7 +2641,7 @@ mod fc_tests {
         tail.extend_from_slice(&0_u32.to_le_bytes());
         data.extend(build_fc_tag(0x08, &tail)); // TAIL
 
-        let result = replay_fast_commit(&data, 256).unwrap();
+        let result = replay_fast_commit(&data, 4096, 256).unwrap();
         assert!(
             result.fallback_required,
             "an unknown FC feature bit must force JBD2 fallback"
@@ -2633,7 +2653,7 @@ mod fc_tests {
         ok.extend(fc_head(3)); // HEAD, fc_features = 0
         ok.extend(build_fc_tag(0x06, &build_fc_inode_payload(7))); // INODE
         ok.extend(fc_tail(&ok, 3, 8)); // TAIL
-        let ok_result = replay_fast_commit(&ok, 256).unwrap();
+        let ok_result = replay_fast_commit(&ok, 4096, 256).unwrap();
         assert_eq!(ok_result.transactions_found, 1);
         assert_eq!(
             ok_result.operations,
@@ -2658,7 +2678,7 @@ mod fc_tests {
         stream.extend(build_fc_tag(0x06, &payload)); // INODE + body
         stream.extend(fc_tail(&stream, 5, 8)); // TAIL
 
-        let result = replay_fast_commit(&stream, 256).unwrap();
+        let result = replay_fast_commit(&stream, 4096, 256).unwrap();
         assert_eq!(
             result.operations,
             vec![FcOperation::InodeUpdate(42, raw_inode)],
@@ -2669,7 +2689,7 @@ mod fc_tests {
 
     #[test]
     fn replay_empty_data() {
-        let result = replay_fast_commit(&[], 256).unwrap();
+        let result = replay_fast_commit(&[], 4096, 256).unwrap();
         assert_eq!(result.operations, [] as [FcOperation; 0]);
         assert_eq!(result.transactions_found, 0);
         assert_eq!(result.incomplete_transactions, 0);
@@ -2731,7 +2751,7 @@ mod fc_tests {
         data.extend(build_fc_tag(0x01, &payload)); // ADD_RANGE
         data.extend(fc_tail(&data, 1, 8)); // TAIL
 
-        let result = replay_fast_commit(&data, 256).unwrap();
+        let result = replay_fast_commit(&data, 4096, 256).unwrap();
         assert_eq!(result.operations.len(), 1);
         assert!(
             matches!(result.operations[0], FcOperation::AddRange(_)),
@@ -2764,7 +2784,7 @@ mod fc_tests {
         data.extend(build_fc_tag(0x01, &payload)); // ADD_RANGE
         data.extend(fc_tail(&data, 1, 8)); // TAIL
 
-        let result = replay_fast_commit(&data, 256).unwrap();
+        let result = replay_fast_commit(&data, 4096, 256).unwrap();
         let r = match &result.operations[0] {
             FcOperation::AddRange(r) => r,
             other => {
@@ -2795,7 +2815,7 @@ mod fc_tests {
         // TAIL tag
         data.extend(fc_tail(&data, 7, 8));
 
-        let result = replay_fast_commit(&data, 256).unwrap();
+        let result = replay_fast_commit(&data, 4096, 256).unwrap();
         assert_eq!(result.transactions_found, 1);
         assert_eq!(result.last_tid, 7);
         assert_eq!(result.operations.len(), 1);
@@ -2822,7 +2842,7 @@ mod fc_tests {
         data.extend(build_fc_tag(0x02, &payload));
         data.extend(fc_tail(&data, 2, 8)); // TAIL
 
-        let result = replay_fast_commit(&data, 256).unwrap();
+        let result = replay_fast_commit(&data, 4096, 256).unwrap();
         assert_eq!(result.operations.len(), 1);
         assert!(
             matches!(result.operations[0], FcOperation::DelRange(_)),
@@ -2847,7 +2867,7 @@ mod fc_tests {
         tail.extend_from_slice(&0_u32.to_le_bytes()); // crc (ignored in replay)
         data.extend(build_fc_tag(0x08, &tail)); // TAIL
 
-        let result = replay_fast_commit(&data, 256).unwrap();
+        let result = replay_fast_commit(&data, 4096, 256).unwrap();
         assert_eq!(result.operations, [] as [FcOperation; 0]);
         assert_eq!(result.transactions_found, 0);
         assert_eq!(result.incomplete_transactions, 1);
@@ -2859,7 +2879,7 @@ mod fc_tests {
         let mut data = Vec::new();
         data.extend(build_fc_tag(0x06, &build_fc_inode_payload(42))); // INODE without HEAD
 
-        let result = replay_fast_commit(&data, 256).unwrap();
+        let result = replay_fast_commit(&data, 4096, 256).unwrap();
         assert_eq!(result.operations, [] as [FcOperation; 0]);
         assert!(result.fallback_required);
     }
@@ -2874,7 +2894,7 @@ mod fc_tests {
         tail.extend_from_slice(&0_u32.to_le_bytes()); // crc (ignored in replay)
         data.extend(build_fc_tag(0x08, &tail)); // TAIL
 
-        let result = replay_fast_commit(&data, 256);
+        let result = replay_fast_commit(&data, 4096, 256);
         assert!(matches!(result, Err(FfsError::Corruption { .. })));
     }
 
@@ -2882,7 +2902,7 @@ mod fc_tests {
     fn replay_complete_short_add_range_is_corruption() {
         let mut data = Vec::new();
         data.extend(build_fc_tag(0x01, &[1, 2, 3])); // ADD_RANGE with payload too short
-        let result = replay_fast_commit(&data, 256);
+        let result = replay_fast_commit(&data, 4096, 256);
         assert!(matches!(result, Err(FfsError::Corruption { .. })));
     }
 
@@ -2896,7 +2916,7 @@ mod fc_tests {
         tail.extend_from_slice(&0_u32.to_le_bytes()); // crc (ignored in replay)
         data.extend(build_fc_tag(0x08, &tail)); // TAIL
 
-        let result = replay_fast_commit(&data, 256);
+        let result = replay_fast_commit(&data, 4096, 256);
         assert!(matches!(result, Err(FfsError::Corruption { .. })));
     }
 
@@ -2907,7 +2927,7 @@ mod fc_tests {
         data.extend(build_fc_tag(0x06, &build_fc_inode_payload(42))); // INODE
         data.extend(build_fc_tag(0x08, &[1, 2, 3])); // TAIL too short for tid
 
-        let result = replay_fast_commit(&data, 256);
+        let result = replay_fast_commit(&data, 4096, 256);
         assert!(matches!(result, Err(FfsError::Corruption { .. })));
     }
 
@@ -2924,7 +2944,7 @@ mod fc_tests {
             tail.extend_from_slice(&0_u32.to_le_bytes()); // crc (ignored in replay)
             data.extend(build_fc_tag(0x08, &tail)); // TAIL
 
-            let result = replay_fast_commit(&data, 256);
+            let result = replay_fast_commit(&data, 4096, 256);
             assert!(
                 matches!(result, Err(FfsError::Corruption { .. })),
                 "tag {tag:#x}: complete short payload must reject recovery: {result:?}",
@@ -2939,7 +2959,7 @@ mod fc_tests {
         data.extend(build_fc_tag(0x06, &build_fc_inode_payload(42))); // INODE
         data.extend(build_fc_tag(0x08, &3_u32.to_le_bytes())); // TAIL missing crc
 
-        let result = replay_fast_commit(&data, 256);
+        let result = replay_fast_commit(&data, 4096, 256);
         assert!(matches!(result, Err(FfsError::Corruption { .. })));
     }
 
@@ -2949,7 +2969,7 @@ mod fc_tests {
         data.extend(build_fc_tag(0x09, &[0; 8])); // HEAD
         data.extend(build_fc_tag(0x06, &build_fc_inode_payload(42))); // INODE
 
-        let result = replay_fast_commit(&data, 256).unwrap();
+        let result = replay_fast_commit(&data, 4096, 256).unwrap();
         assert_eq!(result.operations, [] as [FcOperation; 0]);
         assert_eq!(result.transactions_found, 0);
         assert_eq!(result.incomplete_transactions, 1);
@@ -2966,7 +2986,7 @@ mod fc_tests {
         data.extend_from_slice(&16_u16.to_le_bytes()); // truncated next tag len
         data.extend_from_slice(&[1, 2, 3]); // not enough payload bytes
 
-        let result = replay_fast_commit(&data, 256).unwrap();
+        let result = replay_fast_commit(&data, 4096, 256).unwrap();
         assert_eq!(result.transactions_found, 1);
         assert_eq!(result.last_tid, 3);
         assert_eq!(
@@ -2983,9 +3003,18 @@ mod fc_tests {
         data.extend(fc_head(3)); // HEAD
         data.extend(build_fc_tag(0x06, &build_fc_inode_payload(42))); // INODE
         data.extend(fc_tail(&data, 3, 8)); // TAIL
-        data.extend_from_slice(&[0xAB, 0xCD, 0xEF]); // stray nonzero tail bytes
+        // Fewer bytes than a tag header at the end of a block are not a tag:
+        // the kernel's TAIL and PAD end one byte short of the block, and that
+        // byte is never written (ext4_fc_replay_scan stops before it).
+        let mut short = data.clone();
+        short.extend_from_slice(&[0xAB, 0xCD, 0xEF]);
+        let result = replay_fast_commit(&short, 4096, 256).unwrap();
+        assert_eq!(result.transactions_found, 1);
+        assert!(!result.fallback_required);
+        // A whole garbage tag after the TAIL is not understood: fall back.
+        data.extend_from_slice(&[0xAB, 0xCD, 0xEF, 0x01]);
 
-        let result = replay_fast_commit(&data, 256).unwrap();
+        let result = replay_fast_commit(&data, 4096, 256).unwrap();
         assert_eq!(result.transactions_found, 1);
         assert_eq!(result.last_tid, 3);
         assert_eq!(
@@ -3004,7 +3033,7 @@ mod fc_tests {
         data.extend(fc_tail(&data, 3, 8)); // TAIL
         data.extend_from_slice(&[0_u8; 64]); // zero-filled unused tail space
 
-        let result = replay_fast_commit(&data, 256).unwrap();
+        let result = replay_fast_commit(&data, 4096, 256).unwrap();
         assert_eq!(result.transactions_found, 1);
         assert_eq!(result.last_tid, 3);
         assert_eq!(
@@ -3025,6 +3054,43 @@ mod fc_tests {
         "0600a40010000000a481e8031a000000e8fcb66ae8fcb66ae8fcb66a00000000e80301000800000000000800010000000af3010004000000000000000000000001000000450a0000000000000000000000000000000000000000000000000000000000000000000000000000f864ec120000000000000000000000000000000000000000979a00002000e099ac9ebba4ac9ebba4ac9ebba4e8fcb66aac9ebba4000000000000000001001000100000000000000001000000450a000003000f000d00000010000000636861726c69650600a40010000000a481e8031a000000e8fcb66ae8fcb66ae8fcb66a00000000e80301000800000000000800010000000af3010004000000000000000000000001000000450a0000000000000000000000000000000000000000000000000000000000000000000000000000f864ec120000000000000000000000000000000000000000979a00002000e099ac9ebba4ac9ebba4ac9ebba4e8fcb66aac9ebba400000000000000000800850e03000000adf27174",
         "0600a4000e000000b481e80321000000e8fcb66ae8fcb66ae8fcb66a00000000e80301000800000000000800030000000af301000400000000000000000000000100000042080000000000000000000000000000000000000000000000000000000000000000000000000000cbe2abea0000000000000000000000000000000000000000f0b700002000947808ba72a508ba72a554721a96e8fcb66a54721a9600000000000000000800540f0300000091a1cfe4",
     ];
+
+    #[test]
+    fn fc_tags_never_cross_a_block_and_the_kernel_pad_leaves_one_byte() {
+        // A fast commit bigger than one block (seen on a kernel crash image
+        // with hundreds of new entries): ext4_fc_reserve_space ends a full
+        // block with a PAD one byte short of the block end and continues in
+        // the next block. The leftover byte is never written.
+        const BLOCK: usize = 256;
+        let raw = |crc: u32, bytes: &[u8]| !crc32c::crc32c_append(!crc, bytes);
+        let mut data = fc_head(7);
+        data.extend(build_fc_tag(0x06, &build_fc_inode_payload(42)));
+        let pad_len = BLOCK - data.len() - 1 - 4;
+        data.extend(build_fc_tag(0x07, &vec![0; pad_len]));
+        let mut crc = raw(0, &data);
+        data.push(0xA5);
+        assert_eq!(data.len(), BLOCK);
+        let inode = build_fc_tag(0x06, &build_fc_inode_payload(43));
+        crc = raw(crc, &inode);
+        data.extend(inode);
+        let mut tail = build_fc_tag(0x08, &[0; 8]);
+        tail[4..8].copy_from_slice(&7_u32.to_le_bytes());
+        crc = raw(crc, &tail[..8]);
+        tail[8..12].copy_from_slice(&crc.to_le_bytes());
+        data.extend(tail);
+
+        let result = replay_fast_commit(&data, BLOCK, 256).unwrap();
+        assert_eq!(result.transactions_found, 1);
+        assert_eq!(result.incomplete_transactions, 0);
+        assert!(!result.fallback_required);
+        assert_eq!(
+            result.operations,
+            vec![
+                FcOperation::InodeUpdate(42, vec![0; 128]),
+                FcOperation::InodeUpdate(43, vec![0; 128]),
+            ]
+        );
+    }
 
     fn kernel_fc_area() -> Vec<u8> {
         let mut area = Vec::new();
@@ -3057,7 +3123,7 @@ mod fc_tests {
 
     #[test]
     fn replay_kernel_fast_commit_area_bd_9m84h() {
-        let result = replay_fast_commit(&kernel_fc_area(), 256).unwrap();
+        let result = replay_fast_commit(&kernel_fc_area(), 4096, 256).unwrap();
         assert_eq!(result.transactions_found, 3);
         assert_eq!(result.last_tid, 3);
         assert_eq!(result.incomplete_transactions, 0);
@@ -3086,7 +3152,7 @@ mod fc_tests {
     fn replay_stops_at_torn_or_stale_fast_commit_blocks_bd_9m84h() {
         let mut torn = kernel_fc_area();
         torn[4096 + 30] ^= 0x01;
-        let result = replay_fast_commit(&torn, 256).unwrap();
+        let result = replay_fast_commit(&torn, 4096, 256).unwrap();
         assert_eq!(result.transactions_found, 1);
         assert_eq!(result.operations.len(), 4);
         assert_eq!(result.incomplete_transactions, 0);
@@ -3097,7 +3163,7 @@ mod fc_tests {
         old.extend(build_fc_tag(0x06, &build_fc_inode_payload(99)));
         old.extend(fc_tail(&old, 2, 8));
         stale.extend(old);
-        let result = replay_fast_commit(&stale, 256).unwrap();
+        let result = replay_fast_commit(&stale, 4096, 256).unwrap();
         assert_eq!(result.transactions_found, 3);
         assert_eq!(result.operations.len(), 9);
         assert!(!result.fallback_required);
@@ -3107,7 +3173,7 @@ mod fc_tests {
         let mut old = build_fc_tag(0x06, &build_fc_inode_payload(99));
         old.extend(fc_tail(&old, 2, 8));
         stale_tail.extend(old);
-        let result = replay_fast_commit(&stale_tail, 256).unwrap();
+        let result = replay_fast_commit(&stale_tail, 4096, 256).unwrap();
         assert_eq!(result.transactions_found, 3);
         assert!(!result.fallback_required);
     }

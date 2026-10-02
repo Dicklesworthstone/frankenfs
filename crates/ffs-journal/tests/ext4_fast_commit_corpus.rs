@@ -111,7 +111,7 @@ fn fast_commit_historical_malformed_fixtures_are_rejected() {
         let fixture = load_fixture(name);
         let bytes = decode_hex_string(&fixture.fast_commit_hex);
         assert_eq!(&bytes[..4], &[9, 0, 16, 0]);
-        let error = replay_fast_commit(&bytes, 256)
+        let error = replay_fast_commit(&bytes, 4096, 256)
             .expect_err("historical oversized HEAD must not be accepted");
         assert!(matches!(error, ffs_error::FfsError::Corruption { .. }));
     }
@@ -154,7 +154,7 @@ fn length_valid_stream() -> Vec<u8> {
 fn fast_commit_length_valid_stream_preserves_operations() {
     let fixture = load_fixture("ext4_fast_commit_clean_replay.json");
     let bytes = length_valid_stream();
-    let replay = replay_fast_commit(&bytes, 256).expect("replay should succeed");
+    let replay = replay_fast_commit(&bytes, 4096, 256).expect("replay should succeed");
 
     assert_eq!(fixture.scenario_id, "ext4_fast_commit_clean_replay");
     assert!(
@@ -185,7 +185,7 @@ fn fast_commit_missing_tail_fixture_forces_fallback() {
     let mut bytes = length_valid_stream();
     // Remove exactly the final TAIL TLV, leaving the same complete operations.
     bytes.truncate(bytes.len() - 12);
-    let replay = replay_fast_commit(&bytes, 256).expect("replay should succeed");
+    let replay = replay_fast_commit(&bytes, 4096, 256).expect("replay should succeed");
 
     assert_eq!(
         fixture.scenario_id,
