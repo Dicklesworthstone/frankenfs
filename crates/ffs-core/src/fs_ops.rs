@@ -1769,7 +1769,7 @@ impl FsOps for OpenFs {
 
     fn trim_range(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         _scope: &mut RequestScope,
         start: u64,
         len: u64,
@@ -1802,12 +1802,20 @@ impl FsOps for OpenFs {
             )));
         }
 
-        // FrankenFS sits over an opaque BlockDevice trait that has no
-        // discard syscall, so no physical bytes are released. Return 0
-        // — userspace fstrim(8) will report "0 bytes were trimmed"
-        // which is the correct outcome for a discard-incapable
-        // backing device.
-        Ok(0)
+        match &self.flavor {
+            // ext4_trim_fs's range: start and length in whole blocks, the end
+            // clamped to the last block, a minimum of at least one block.
+            FsFlavor::Ext4(sb) => {
+                let block = u64::from(sb.block_size);
+                let first = start / block;
+                let last = first.saturating_add(len / block).saturating_sub(1);
+                let min_blocks = (min_len / block).max(1);
+                self.ext4_trim_free_blocks(cx, first, last, min_blocks)
+            }
+            // Not released yet on btrfs (bd-3fmbr): nothing is discarded and
+            // 0 bytes are reported.
+            FsFlavor::Btrfs(_) => Ok(0),
+        }
     }
 
     fn set_inode_fsxattr(
@@ -4095,6 +4103,10 @@ impl FsOps for OpenFs {
                     new_flags = inode.flags;
                 }
                 inode.flags = new_flags;
+                // ext4_ioctl_setflags stamps ctime on every successful call
+                // (xfstests generic/277), as btrfs below does.
+                let (secs, nanos) = Self::now_timestamp();
+                ffs_inode::touch_ctime(&mut inode, secs, nanos);
 
                 if let Some(tx) = &mut scope.tx {
                     let tx_dev = TransactionBlockAdapter {

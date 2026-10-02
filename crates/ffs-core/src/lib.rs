@@ -4211,8 +4211,18 @@ impl ByteDevice for SharedByteDevice {
     fn sync(&self, cx: &Cx) -> Result<(), FfsError> {
         self.0.sync(cx)
     }
+
+    fn supports_discard(&self) -> bool {
+        self.0.supports_discard()
+    }
+
+    fn discard(&self, cx: &Cx, offset: ByteOffset, len: u64) -> Result<(), FfsError> {
+        self.0.discard(cx, offset, len)
+    }
 }
 
+// OverlayByteDevice keeps the default (no discard): the overlay must never
+// release the base image's storage.
 struct OverlayByteDevice {
     inner: Box<dyn ByteDevice>,
     writes: RwLock<Vec<OverlayWrite>>,
@@ -26037,6 +26047,115 @@ impl OpenFs {
             return Err(FfsError::ReadOnly);
         }
         self.ext4_alloc_state.as_ref().ok_or(FfsError::ReadOnly)
+    }
+
+    /// FITRIM on ext4 (bd-3fmbr): release the storage behind every run of at
+    /// least `min_blocks` free blocks within `[first, last]` (filesystem
+    /// blocks, inclusive) and return the bytes released, as the kernel's
+    /// ext4_trim_fs reports them.
+    ///
+    /// A block is released only when it is free both now and in the durable
+    /// image: each journal boundary writes every dirty block (data included)
+    /// as one transaction and checkpoints it home, so the on-device bitmap is
+    /// what a crash recovers to. A block freed since the last boundary is
+    /// still allocated there and is left alone. The allocator write lock
+    /// stops both allocator families (the sharded one takes its read side)
+    /// for the duration, and the journal lock keeps a boundary from
+    /// checkpointing a bitmap between the read and the release.
+    fn ext4_trim_free_blocks(
+        &self,
+        cx: &Cx,
+        first: u64,
+        last: u64,
+        min_blocks: u64,
+    ) -> Result<u64, FfsError> {
+        let errno = |code| FfsError::Io(std::io::Error::from_raw_os_error(code));
+        if !self.dev.supports_discard() {
+            return Err(errno(libc::EOPNOTSUPP));
+        }
+        let alloc_lock = self
+            .require_alloc_state()
+            .map_err(|_| errno(libc::EOPNOTSUPP))?;
+        let alloc = alloc_lock.write();
+        let geo = &alloc.geo;
+        if geo
+            .feature_ro_compat
+            .contains(ffs_ondisk::Ext4RoCompatFeatures::BIGALLOC)
+        {
+            // Bitmap bits are clusters there; not handled yet.
+            return Err(errno(libc::EOPNOTSUPP));
+        }
+        let _journal = self.jbd2_writer.as_ref().map(|journal| journal.lock());
+        let current_dev = self.block_device_adapter();
+        let bs = u64::from(geo.block_size);
+        let bs_usize = usize::try_from(geo.block_size)
+            .map_err(|_| FfsError::Format("block size exceeds usize".into()))?;
+        let first_data = u64::from(geo.first_data_block);
+        let per_group = u64::from(geo.blocks_per_group);
+        let first = first.max(first_data);
+        let last = last.min(geo.total_blocks.saturating_sub(1));
+        if per_group == 0 || first > last {
+            return Ok(0);
+        }
+        let mut released = 0_u64;
+        let mut durable_buf = vec![0_u8; bs_usize];
+        for group in (first - first_data) / per_group..=(last - first_data) / per_group {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            let group_no = GroupNumber(
+                u32::try_from(group).map_err(|_| FfsError::Format("group overflow".into()))?,
+            );
+            let Some(stats) = alloc
+                .groups
+                .get(usize::try_from(group).unwrap_or(usize::MAX))
+            else {
+                break;
+            };
+            let reserved = ffs_alloc::reserved_blocks_in_group(geo, &alloc.groups, group_no);
+            let current = ffs_alloc::read_block_bitmap_for_update(
+                cx,
+                &current_dev,
+                geo,
+                stats,
+                group_no,
+                &reserved,
+            )?;
+            // An uninitialized group has no bitmap in the durable image either:
+            // its free blocks are free there too.
+            let durable = if stats.block_bitmap_uninit() {
+                &current
+            } else {
+                self.dev.read_exact_at(
+                    cx,
+                    ByteOffset(stats.block_bitmap_block.0.saturating_mul(bs)),
+                    &mut durable_buf,
+                )?;
+                &durable_buf
+            };
+            let group_start = first_data + group * per_group;
+            let lo = first.saturating_sub(group_start);
+            let hi = (last - group_start + 1).min(u64::from(geo.blocks_in_group(group_no)));
+            let mut run_start: Option<u64> = None;
+            for rel in lo..=hi {
+                let idx = u32::try_from(rel).unwrap_or(u32::MAX);
+                let free = rel < hi
+                    && !ffs_alloc::bitmap_get(&current, idx)
+                    && !ffs_alloc::bitmap_get(durable, idx);
+                match (free, run_start) {
+                    (true, None) => run_start = Some(rel),
+                    (false, Some(start)) => {
+                        let count = rel - start;
+                        if count >= min_blocks {
+                            let offset = (group_start + start) * bs;
+                            self.dev.discard(cx, ByteOffset(offset), count * bs)?;
+                            released += count * bs;
+                        }
+                        run_start = None;
+                    }
+                    _ => {}
+                }
+            }
+        }
+        Ok(released)
     }
 
     /// Install the transport's open-handle-count oracle (bd-90aey).
@@ -55975,6 +56094,30 @@ mod tests {
     }
 
     #[test]
+    fn set_inode_flags_stamps_ctime_on_ext4_even_when_unchanged() {
+        // ext4_ioctl_setflags stamps ctime on every successful call
+        // (xfstests generic/277: chattr +A then -A must move ctime).
+        let Some((fs, _tmp)) = open_writable_ext4_mkfs(64) else {
+            eprintln!("mkfs.ext4 not available, skipping");
+            return;
+        };
+        let cx = Cx::for_testing();
+        let created = fs
+            .create(&cx, InodeNumber(2), OsStr::new("ctime.txt"), 0o644, 0, 0)
+            .expect("create");
+        let mut scope = RequestScope::empty();
+        let flags = fs
+            .get_inode_flags(&cx, &mut scope, created.ino)
+            .expect("flags");
+        let before = fs.getattr(&cx, created.ino).expect("getattr").ctime;
+        std::thread::sleep(std::time::Duration::from_millis(20));
+        fs.set_inode_flags(&cx, &mut scope, created.ino, flags)
+            .expect("set the same flags");
+        let after = fs.getattr(&cx, created.ino).expect("getattr").ctime;
+        assert!(after > before, "ctime {before:?} -> {after:?}");
+    }
+
+    #[test]
     fn set_inode_flags_persists_user_settable_bits_on_ext4() {
         let Some((fs, _tmp)) = open_writable_ext4_mkfs(64) else {
             eprintln!("mkfs.ext4 not available, skipping");
@@ -76571,27 +76714,131 @@ mod tests {
         );
     }
 
-    // ── bd-vwzei: FITRIM (fstrim(8) compat) ───────────────────────────────
+    // ── bd-vwzei / bd-3fmbr: FITRIM (fstrim(8) compat) ────────────────────
     //
-    // FITRIM lets fstrim(8) ask a mounted FS to discard freed blocks.
-    // FrankenFS sits over an opaque BlockDevice with no discard
-    // syscall, so ext4_trim_fs equivalent is a validate-and-return-0
-    // — matches Linux's behaviour on filesystems backed by devices
-    // without discard support. The bytes-discarded return value lets
-    // userspace report "0 bytes discarded" without an error.
+    // FITRIM asks a mounted FS to discard its free blocks. On an image-file
+    // backend ext4 punches them (the image gives the space back to the
+    // host) and reports the bytes released; a backend that cannot discard
+    // answers EOPNOTSUPP, as the kernel does for such a device.
+
+    /// A writable, journaled ext4 on a real image file (FITRIM needs a
+    /// backend that can discard).
+    fn open_file_backed_ext4(
+        size_mb: u64,
+    ) -> Option<(OpenFs, tempfile::TempDir, std::path::PathBuf)> {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let image = tmp.path().join("trim.ext4");
+        std::fs::File::create(&image)
+            .and_then(|f| f.set_len(size_mb * 1024 * 1024))
+            .expect("create image");
+        let made = std::process::Command::new("mkfs.ext4")
+            .args(["-q", "-F", "-b", "4096"])
+            .arg(&image)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            return None;
+        }
+        let cx = Cx::for_testing();
+        let dev = FileByteDevice::open(&image).expect("open image");
+        let mut fs =
+            OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).expect("open ext4");
+        fs.enable_writes(&cx).expect("enable writes");
+        assert!(
+            fs.attach_ext4_internal_jbd2_writer(&cx)
+                .expect("attach jbd2")
+        );
+        Some((fs, tmp, image))
+    }
+
+    fn read_image_block(image: &Path, block: u64) -> Vec<u8> {
+        use std::os::unix::fs::FileExt;
+        let mut buf = vec![0_u8; 4096];
+        std::fs::File::open(image)
+            .and_then(|f| f.read_exact_at(&mut buf, block * 4096))
+            .expect("read image block");
+        buf
+    }
 
     #[test]
-    fn ext4_trim_range_within_device_returns_zero_discarded() {
+    fn ext4_trim_answers_eopnotsupp_without_a_discarding_backend() {
         let Some(fs) = open_writable_ext4() else {
             return;
         };
         let cx = Cx::for_testing();
         let mut scope = RequestScope::empty();
-        let bytes = <OpenFs as FsOps>::trim_range(&fs, &cx, &mut scope, 0, 16 * 1024 * 1024, 4096)
-            .expect("trim_range must succeed on a discard-incapable backing device");
+        let err = <OpenFs as FsOps>::trim_range(&fs, &cx, &mut scope, 0, u64::MAX, 0)
+            .expect_err("an in-memory device cannot discard");
+        assert_eq!(err.to_errno(), libc::EOPNOTSUPP);
+    }
+
+    #[test]
+    fn ext4_trim_releases_only_blocks_free_in_the_durable_image_bd_3fmbr() {
+        use std::os::unix::fs::MetadataExt;
+        let Some((fs, _tmp, image)) = open_file_backed_ext4(64) else {
+            oracle_unavailable("ext4 image formatter");
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let keep = fs
+            .create(&cx, root, OsStr::new("keep"), 0o644, 0, 0)
+            .expect("create keep");
+        fs.write(&cx, keep.ino, 0, &[0xAB; 65536])
+            .expect("write keep");
+        let gone = fs
+            .create(&cx, root, OsStr::new("gone"), 0o644, 0, 0)
+            .expect("create gone");
+        fs.write(&cx, gone.ino, 0, &[0xCD; 65536])
+            .expect("write gone");
+        fs.fsync(&cx, keep.ino, 0, false).expect("boundary");
+        let phys = |ino| {
+            let inode = fs.read_inode(&cx, ino).expect("read inode");
+            fs.resolve_extent(&cx, &RequestScope::empty(), &inode, 0)
+                .expect("map")
+                .expect("mapped")
+                .0
+        };
+        let (keep_block, gone_block) = (phys(keep.ino), phys(gone.ino));
+        assert_eq!(read_image_block(&image, gone_block), vec![0xCD; 4096]);
+
+        // Freed in memory only: a crash would recover "gone", so its blocks
+        // must survive this trim.
+        fs.unlink(&cx, root, OsStr::new("gone")).expect("unlink");
+        let mut scope = RequestScope::empty();
+        let released =
+            <OpenFs as FsOps>::trim_range(&fs, &cx, &mut scope, 0, u64::MAX, 0).expect("trim");
+        assert!(
+            released > 32 * 1024 * 1024,
+            "released {released} of a 64 MiB image"
+        );
+        assert_eq!(read_image_block(&image, gone_block), vec![0xCD; 4096]);
+        assert_eq!(read_image_block(&image, keep_block), vec![0xAB; 4096]);
+
+        // Once a boundary makes the unlink durable, the blocks are released
+        // and the image gives their space back to the host.
+        fs.fsync(&cx, keep.ino, 0, false).expect("boundary");
+        let allocated_before = std::fs::metadata(&image).unwrap().blocks() * 512;
+        let again = <OpenFs as FsOps>::trim_range(&fs, &cx, &mut scope, 0, u64::MAX, 0)
+            .expect("trim again");
+        let allocated_after = std::fs::metadata(&image).unwrap().blocks() * 512;
+        assert!(again >= 65536, "the freed file's blocks: {again}");
+        assert!(
+            allocated_before - allocated_after >= 65536,
+            "the image must give the freed file's space back ({allocated_before} -> {allocated_after})"
+        );
+        assert_eq!(read_image_block(&image, gone_block), vec![0; 4096]);
+        assert_eq!(read_image_block(&image, keep_block), vec![0xAB; 4096]);
         assert_eq!(
-            bytes, 0,
-            "FrankenFS over a non-discard BlockDevice reports 0 bytes discarded"
+            fs.read(&cx, keep.ino, 0, 65536).expect("read keep"),
+            vec![0xAB; 65536]
+        );
+        // A minimum run longer than any free run releases nothing.
+        let group = 32768 * 4096;
+        assert_eq!(
+            <OpenFs as FsOps>::trim_range(&fs, &cx, &mut scope, 0, u64::MAX, group)
+                .expect("trim with a group-sized minimum"),
+            0
         );
     }
 
@@ -76613,20 +76860,25 @@ mod tests {
         // Pass len = u64::MAX (the documented "trim everything past
         // start" idiom that fstrim -o 0 -l 0 / fstrim --all use). Must
         // not overflow internal arithmetic and must succeed.
-        let Some(fs) = open_writable_ext4() else {
+        let Some((fs, _tmp, _image)) = open_file_backed_ext4(32) else {
+            oracle_unavailable("ext4 image formatter");
             return;
         };
         let cx = Cx::for_testing();
         let mut scope = RequestScope::empty();
         let bytes = <OpenFs as FsOps>::trim_range(&fs, &cx, &mut scope, 0, u64::MAX, 0)
             .expect("len = u64::MAX must saturate, not overflow");
-        assert_eq!(bytes, 0);
+        assert!(bytes > 0);
+        // From a start inside the filesystem, also to the end.
+        <OpenFs as FsOps>::trim_range(&fs, &cx, &mut scope, 10 << 20, u64::MAX, 0)
+            .expect("start inside the fs, length past its end");
     }
 
     #[test]
     fn ext4_trim_range_rejects_what_ext4_trim_fs_rejects() {
         // xfstests generic/288: `fstrim -l0` and `fstrim -l100` must fail.
-        let Some(fs) = open_writable_ext4() else {
+        let Some((fs, _tmp, _image)) = open_file_backed_ext4(32) else {
+            oracle_unavailable("ext4 image formatter");
             return;
         };
         let FsFlavor::Ext4(sb) = &fs.flavor else {

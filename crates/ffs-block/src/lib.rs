@@ -472,6 +472,19 @@ pub trait ByteDevice: Send + Sync {
 
     /// Flush pending writes to stable storage.
     fn sync(&self, cx: &Cx) -> Result<()>;
+
+    /// Whether [`discard`](Self::discard) releases storage (FITRIM).
+    fn supports_discard(&self) -> bool {
+        false
+    }
+
+    /// Release the storage behind `[offset, offset + len)`; the range then
+    /// reads as zeros. Only called when [`supports_discard`](Self::supports_discard).
+    fn discard(&self, _cx: &Cx, _offset: ByteOffset, _len: u64) -> Result<()> {
+        Err(FfsError::Io(std::io::Error::from_raw_os_error(
+            nix::errno::Errno::EOPNOTSUPP as i32,
+        )))
+    }
 }
 
 /// File-backed byte device using Linux `pread`/`pwrite` style I/O.
@@ -1052,6 +1065,38 @@ impl ByteDevice for FileByteDevice {
         self.sync_state.write_epoch.fetch_add(1, Ordering::Release);
         result?;
         cx_checkpoint(cx)?;
+        Ok(())
+    }
+
+    /// A writable regular file: discard punches holes, so a trimmed image
+    /// gives its free space back to the host. A block special would need
+    /// BLKDISCARD, which has no safe binding here.
+    fn supports_discard(&self) -> bool {
+        self.writable && !self.block_device
+    }
+
+    fn discard(&self, cx: &Cx, offset: ByteOffset, len: u64) -> Result<()> {
+        use std::os::unix::io::AsRawFd;
+        cx_checkpoint(cx)?;
+        let end = offset
+            .0
+            .checked_add(len)
+            .filter(|&end| end <= self.len)
+            .ok_or_else(|| FfsError::Format("discard range past the device end".into()))?;
+        let off = i64::try_from(offset.0)
+            .map_err(|_| FfsError::Format("discard offset exceeds off_t".into()))?;
+        let length = i64::try_from(end - offset.0)
+            .map_err(|_| FfsError::Format("discard length exceeds off_t".into()))?;
+        nix::fcntl::fallocate(
+            self.file.as_raw_fd(),
+            nix::fcntl::FallocateFlags::FALLOC_FL_PUNCH_HOLE
+                | nix::fcntl::FallocateFlags::FALLOC_FL_KEEP_SIZE,
+            off,
+            length,
+        )
+        .map_err(|errno| FfsError::Io(std::io::Error::from_raw_os_error(errno as i32)))?;
+        // A punched range changes what the file holds, like a write.
+        self.sync_state.write_epoch.fetch_add(1, Ordering::Release);
         Ok(())
     }
 
@@ -4594,6 +4639,43 @@ mod tests {
             4,
             "length is still stable after a successful sync"
         );
+    }
+
+    #[test]
+    fn file_byte_device_discard_punches_and_keeps_the_length() {
+        use std::os::unix::fs::MetadataExt;
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("discard.img");
+        std::fs::write(&path, vec![0xAB_u8; 1 << 20]).expect("seed file");
+        let dev = FileByteDevice::open(&path).expect("device");
+        assert!(dev.supports_discard());
+        let allocated = |p: &Path| std::fs::metadata(p).expect("metadata").blocks() * 512;
+        let before = allocated(&path);
+
+        dev.discard(&cx, ByteOffset(256 << 10), 512 << 10)
+            .expect("discard the middle half");
+        let data = std::fs::read(&path).expect("read");
+        assert_eq!(data.len(), 1 << 20, "the length is kept");
+        assert!(data[..256 << 10].iter().all(|&b| b == 0xAB));
+        assert!(data[256 << 10..768 << 10].iter().all(|&b| b == 0));
+        assert!(data[768 << 10..].iter().all(|&b| b == 0xAB));
+        assert!(
+            before - allocated(&path) >= 256 << 10,
+            "the host gets the space back ({before} -> {})",
+            allocated(&path)
+        );
+        // A range past the end is refused, not silently clipped.
+        assert!(dev.discard(&cx, ByteOffset(1 << 20), 1).is_err());
+
+        // A read-only device does not discard.
+        let mut perms = std::fs::metadata(&path).expect("metadata").permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).expect("chmod");
+        let ro = FileByteDevice::open(&path).expect("read-only device");
+        if !ro.writable {
+            assert!(!ro.supports_discard());
+        }
     }
 
     #[test]
