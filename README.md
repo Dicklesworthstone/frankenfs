@@ -914,6 +914,15 @@ Extended attributes (xattrs) provide per-file key-value metadata outside the sta
 
 POSIX ACL namespaces (`system.posix_acl_access` / `system.posix_acl_default`) are differentially validated against `debugfs`, and the FUSE E2E suite covers mounted-path list/get behavior plus the missing-default `ENODATA` contract on regular files.
 
+ACLs behave as on kernel ext4/btrfs (bd-rnwd7, xfstests generic/099):
+- Setting an access ACL sets the mode's permission bits. The group bits come from the mask if there is one. An ACL that says no more than the mode is not stored.
+- chmod rewrites the stored ACL's owner, mask and other entries.
+- What is created in a directory with a default ACL inherits it, limited by the create mode. A new subdirectory also takes it as its own default.
+- A default ACL on a non-directory is `EACCES`.
+- ext4 stores ACLs in its own on-disk form (version 1), which a kernel mount reads. Before, the generic form was stored verbatim, so a kernel mount could not read FrankenFS-written ACLs.
+- The FUSE mount negotiates `FUSE_POSIX_ACL` by default (`FFS_FUSE_POSIX_ACL=0` turns it off). The kernel then enforces ACLs in permission checks and caches them; without it, it ignores ACLs entirely.
+- With it, `FUSE_DONT_MASK` leaves the umask to the daemon, so a default ACL can replace the umask as it does on ext4.
+
 ### Hybrid storage
 
 1. **Inline.** Stored directly in the inode after `extra_isize`, sharing the inode's block I/O. Limited by remaining inode space (~100–200 bytes for a 256-byte inode).

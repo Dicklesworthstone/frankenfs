@@ -107,6 +107,163 @@ impl OpenFs {
 /// one node is ever live, and the scan stops at the FIRST `XATTR_ITEM` it sees.
 const XATTR_SCAN_BTRFS_NODE_LIMIT: usize = 262_144;
 
+/// POSIX ACL semantics on top of the stored xattrs (bd-rnwd7). Kernel FUSE
+/// with FUSE_POSIX_ACL only passes ACLs through as xattrs; what ext4 does in
+/// `ext4_set_acl` / `posix_acl_chmod` / `posix_acl_create` is up to us.
+impl OpenFs {
+    fn setxattr_stored(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        name: &str,
+        value: &[u8],
+        mode: XattrSetMode,
+    ) -> ffs_error::Result<()> {
+        match &self.flavor {
+            FsFlavor::Ext4(_) => self.ext4_setxattr(
+                cx,
+                scope,
+                Self::ext4_canonical_inode(ino),
+                name,
+                value,
+                mode,
+            ),
+            FsFlavor::Btrfs(_) => {
+                self.check_btrfs_mutation_allowed("setxattr")?;
+                self.btrfs_setxattr(cx, scope, ino, name, value, mode)
+            }
+        }
+    }
+
+    fn setattr_stored(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        attrs: &SetAttrRequest,
+    ) -> ffs_error::Result<InodeAttr> {
+        match &self.flavor {
+            FsFlavor::Ext4(_) => self
+                .ext4_setattr(cx, scope, Self::ext4_canonical_inode(ino), attrs)
+                .map(Self::ext4_present_attr),
+            FsFlavor::Btrfs(_) => {
+                self.check_btrfs_mutation_allowed("setattr")?;
+                self.btrfs_setattr(cx, ino, attrs)
+            }
+        }
+    }
+
+    /// Set an access ACL as ext4 does (`posix_acl_update_mode`): the mode's
+    /// permission bits follow the ACL, and an ACL that says no more than the
+    /// mode is not kept at all.
+    fn set_access_acl(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        value: &[u8],
+        mode: XattrSetMode,
+    ) -> ffs_error::Result<()> {
+        let entries = super::posix_acl_parse(value)?;
+        let (bits, equivalent) = super::posix_acl_equiv_mode(&entries);
+        let attr = <Self as FsOps>::getattr(self, cx, scope, ino)?;
+        if equivalent {
+            match <Self as FsOps>::removexattr(self, cx, scope, ino, super::POSIX_ACL_ACCESS_XATTR)
+            {
+                Ok(_) => {}
+                Err(err) if err.to_errno() == libc::ENODATA => {}
+                Err(err) => return Err(err),
+            }
+        } else {
+            self.setxattr_stored(cx, scope, ino, super::POSIX_ACL_ACCESS_XATTR, value, mode)?;
+        }
+        if attr.perm & 0o777 != bits {
+            let request = SetAttrRequest {
+                mode: Some((attr.perm & !0o777) | bits),
+                ..SetAttrRequest::default()
+            };
+            // Directly, like the xattr write before it (see setattr).
+            self.setattr_stored(cx, &mut RequestScope::empty(), ino, &request)?;
+        }
+        Ok(())
+    }
+
+    /// After a chmod, the stored access ACL's base entries follow the new
+    /// permission bits (`posix_acl_chmod`).
+    fn chmod_access_acl(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        perm: u16,
+    ) -> ffs_error::Result<()> {
+        let Some(value) = self.getxattr(cx, ino, super::POSIX_ACL_ACCESS_XATTR)? else {
+            return Ok(());
+        };
+        let mut entries = super::posix_acl_parse(&value)?;
+        super::posix_acl_chmod(&mut entries, perm);
+        self.setxattr_stored(
+            cx,
+            scope,
+            ino,
+            super::POSIX_ACL_ACCESS_XATTR,
+            &super::posix_acl_encode(&entries),
+            XattrSetMode::Set,
+        )
+    }
+
+    /// A new inode under a directory with a default ACL inherits it
+    /// (`posix_acl_create`): a directory keeps it as its own default, and
+    /// the access ACL is the default limited by the create mode, which also
+    /// sets the inode's permission bits.
+    fn inherit_default_acl(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+        attr: InodeAttr,
+    ) -> ffs_error::Result<InodeAttr> {
+        if attr.kind == FileType::Symlink {
+            return Ok(attr);
+        }
+        let Some(default) = self.getxattr(cx, parent, super::POSIX_ACL_DEFAULT_XATTR)? else {
+            return Ok(attr);
+        };
+        let mut entries = super::posix_acl_parse(&default)?;
+        if attr.kind == FileType::Directory {
+            self.setxattr_stored(
+                cx,
+                scope,
+                attr.ino,
+                super::POSIX_ACL_DEFAULT_XATTR,
+                &default,
+                XattrSetMode::Set,
+            )?;
+        }
+        let bits = super::posix_acl_create_masq(&mut entries, attr.perm);
+        if !super::posix_acl_equiv_mode(&entries).1 {
+            self.setxattr_stored(
+                cx,
+                scope,
+                attr.ino,
+                super::POSIX_ACL_ACCESS_XATTR,
+                &super::posix_acl_encode(&entries),
+                XattrSetMode::Set,
+            )?;
+        }
+        if attr.perm & 0o777 == bits {
+            return Ok(attr);
+        }
+        let request = SetAttrRequest {
+            mode: Some((attr.perm & !0o777) | bits),
+            ..SetAttrRequest::default()
+        };
+        // Directly, like the create and xattr writes before it (see setattr).
+        self.setattr_stored(cx, &mut RequestScope::empty(), attr.ino, &request)
+    }
+}
+
 impl OpenFs {
     /// Decide whether ANY btrfs `XATTR_ITEM` exists in the fs tree.
     ///
@@ -959,20 +1116,19 @@ impl FsOps for OpenFs {
         if value.len() > XATTR_SIZE_MAX {
             return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::E2BIG)));
         }
-        match &self.flavor {
-            FsFlavor::Ext4(_) => self.ext4_setxattr(
-                cx,
-                scope,
-                Self::ext4_canonical_inode(ino),
-                name,
-                value,
-                mode,
-            ),
-            FsFlavor::Btrfs(_) => {
-                self.check_btrfs_mutation_allowed("setxattr")?;
-                self.btrfs_setxattr(cx, scope, ino, name, value, mode)
+        if name == super::POSIX_ACL_ACCESS_XATTR {
+            return self.set_access_acl(cx, scope, ino, value, mode);
+        }
+        if name == super::POSIX_ACL_DEFAULT_XATTR {
+            super::posix_acl_parse(value)?;
+            // Only a directory has a default ACL (kernel: EACCES otherwise).
+            if <Self as FsOps>::getattr(self, cx, scope, ino)?.kind != FileType::Directory {
+                return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                    libc::EACCES,
+                )));
             }
         }
+        self.setxattr_stored(cx, scope, ino, name, value, mode)
     }
 
     fn removexattr(
@@ -1009,7 +1165,7 @@ impl FsOps for OpenFs {
     ) -> ffs_error::Result<InodeAttr> {
         let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
-        match &self.flavor {
+        let attr = match &self.flavor {
             FsFlavor::Ext4(_) => self
                 .ext4_create(
                     cx,
@@ -1025,7 +1181,8 @@ impl FsOps for OpenFs {
                 self.check_btrfs_mutation_allowed("create")?;
                 self.btrfs_create(cx, parent, name.as_encoded_bytes(), mode, uid, gid)
             }
-        }
+        }?;
+        self.inherit_default_acl(cx, scope, parent, attr)
     }
 
     fn touch_atime(
@@ -1078,7 +1235,7 @@ impl FsOps for OpenFs {
     ) -> ffs_error::Result<InodeAttr> {
         let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
-        match &self.flavor {
+        let attr = match &self.flavor {
             FsFlavor::Ext4(_) => self
                 .ext4_mknod(
                     cx,
@@ -1095,7 +1252,8 @@ impl FsOps for OpenFs {
                 self.check_btrfs_mutation_allowed("mknod")?;
                 self.btrfs_mknod(cx, parent, name.as_encoded_bytes(), mode, rdev, uid, gid)
             }
-        }
+        }?;
+        self.inherit_default_acl(cx, scope, parent, attr)
     }
 
     fn mkdir(
@@ -1110,7 +1268,7 @@ impl FsOps for OpenFs {
     ) -> ffs_error::Result<InodeAttr> {
         let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
-        match &self.flavor {
+        let attr = match &self.flavor {
             FsFlavor::Ext4(_) => self
                 .ext4_mkdir(
                     cx,
@@ -1126,7 +1284,8 @@ impl FsOps for OpenFs {
                 self.check_btrfs_mutation_allowed("mkdir")?;
                 self.btrfs_mkdir(cx, parent, name.as_encoded_bytes(), mode, uid, gid)
             }
-        }
+        }?;
+        self.inherit_default_acl(cx, scope, parent, attr)
     }
 
     fn unlink(
@@ -4142,15 +4301,21 @@ impl FsOps for OpenFs {
         ino: InodeNumber,
         attrs: &SetAttrRequest,
     ) -> ffs_error::Result<InodeAttr> {
-        match &self.flavor {
-            FsFlavor::Ext4(_) => self
-                .ext4_setattr(cx, scope, Self::ext4_canonical_inode(ino), attrs)
-                .map(Self::ext4_present_attr),
-            FsFlavor::Btrfs(_) => {
-                self.check_btrfs_mutation_allowed("setattr")?;
-                self.btrfs_setattr(cx, ino, attrs)
-            }
+        // A chmod of an inode with an access ACL rewrites that ACL too. ext4
+        // writes xattrs straight to the device, so the mode change goes the
+        // same way: through the request's transaction it would commit over a
+        // block the xattr write changed after its snapshot (EAGAIN).
+        if attrs.mode.is_some()
+            && self
+                .getxattr(cx, ino, super::POSIX_ACL_ACCESS_XATTR)?
+                .is_some()
+        {
+            let direct = &mut RequestScope::empty();
+            let attr = self.setattr_stored(cx, direct, ino, attrs)?;
+            self.chmod_access_acl(cx, direct, ino, attr.perm)?;
+            return Ok(attr);
         }
+        self.setattr_stored(cx, scope, ino, attrs)
     }
 
     fn flush(

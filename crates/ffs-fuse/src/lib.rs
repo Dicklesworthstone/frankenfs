@@ -732,22 +732,21 @@ const READDIRPLUS_CAPABILITIES_FORCED: u64 = fuse_consts::FUSE_DO_READDIRPLUS;
 /// still costs a boundary crossing (bd-2pq73 cut format-level work 40x with
 /// `requests_total` unchanged), whereas this removes the crossing.
 ///
-/// ⚠️ DEFAULT OFF, and for a correctness reason rather than caution. This flag is
-/// a CLAIM: it tells the kernel the filesystem supports POSIX ACLs, after which
-/// the kernel performs its own ACL-based permission checks from its cache instead
-/// of deferring to us. If our `getxattr` does not report ACLs faithfully, access
-/// decisions change — that is a semantic change, not a speed change, so it must
-/// not ride in as a default on the strength of a latency argument. It is a knob so
-/// the A/B runs on ONE ELF (ISA and PGO cancel, bd-b9dug class C), and so the
-/// permission-semantics question can be gated separately from the round-trip one.
+/// DEFAULT ON since bd-rnwd7. The flag is a CLAIM: it tells the kernel the
+/// filesystem supports POSIX ACLs, after which the kernel performs its own
+/// ACL-based permission checks from its cache. It stayed opt-in while the
+/// claim was not true: ACLs were stored but never synced with the mode or
+/// inherited, so enforcing them would have changed access decisions. With
+/// that implemented (core `set_access_acl` / `chmod_access_acl` /
+/// `inherit_default_acl`, plus FUSE_DONT_MASK so a default ACL replaces the
+/// umask) the kernel's ext4 behaviour needs it: without it the kernel ignores
+/// ACLs altogether, granting access an ACL mask denies and denying access an
+/// ACL grants (xfstests generic/099). `FFS_FUSE_POSIX_ACL=0` still turns it off.
 const POSIX_ACL_CAPABILITY: u64 = fuse_consts::FUSE_POSIX_ACL;
 
 /// Resolve the POSIX-ACL capability from `FFS_FUSE_POSIX_ACL`.
 ///
-/// `1`, `true` or `on` negotiates `FUSE_POSIX_ACL`; anything else, including
-/// unset, keeps today's behaviour of not claiming ACL support. Opt-IN, the
-/// opposite polarity to the readdirplus knob, because enabling it changes
-/// permission semantics rather than only performance.
+/// Negotiated unless the variable is `0`, `false` or `off` (bd-rnwd7).
 fn posix_acl_capability_from_env() -> u64 {
     posix_acl_capability_from_value(std::env::var("FFS_FUSE_POSIX_ACL").ok().as_deref())
 }
@@ -756,11 +755,11 @@ fn posix_acl_capability_from_env() -> u64 {
 /// testable without mutating process-global environment state — which races
 /// under the parallel test harness and is `unsafe` from edition 2024 onward.
 fn posix_acl_capability_from_value(value: Option<&str>) -> u64 {
-    let enabled = value.is_some_and(|value| {
+    let disabled = value.is_some_and(|value| {
         let value = value.trim();
-        value == "1" || value.eq_ignore_ascii_case("true") || value.eq_ignore_ascii_case("on")
+        value == "0" || value.eq_ignore_ascii_case("false") || value.eq_ignore_ascii_case("off")
     });
-    if enabled { POSIX_ACL_CAPABILITY } else { 0 }
+    if disabled { 0 } else { POSIX_ACL_CAPABILITY }
 }
 
 /// Resolve the one-way xattr switch ONCE, before the first request can reach a
@@ -4230,6 +4229,10 @@ struct FuseInner {
     /// `Clone` — one clone per dispatch worker — and `init` runs on exactly one of
     /// them. A flag on the outer struct would be invisible to every other worker.
     zero_message_opendir: std::sync::atomic::AtomicBool,
+    /// FUSE_DONT_MASK negotiated (with FUSE_POSIX_ACL, bd-rnwd7): the kernel
+    /// sends create modes without the caller's umask, and we apply it unless
+    /// the parent directory has a default ACL, which replaces the umask.
+    dont_mask: std::sync::atomic::AtomicBool,
     missing_capability_xattr: LastMissingCapabilityXattr,
     inode_locks: Arc<FuseInodeLocks>,
     /// bd-2i2ez: stage a run of WRITEs into one MVCC transaction. Default OFF.
@@ -5791,18 +5794,26 @@ impl Filesystem for FrankenFuse {
             info!("FUSE_WRITEBACK_CACHE negotiated (explicit writeback_cache opt-in)");
         }
 
-        // bd-biwl4: opt-in only. `add_capabilities(0)` is a no-op, so when the knob
-        // is unset this call cannot change negotiation — the default path is
-        // byte-identical to before. Logged at info when it IS on, because it
-        // changes permission semantics and must be visible in a run's own evidence
-        // rather than inferred from the environment the run was launched with.
+        // bd-biwl4 / bd-rnwd7: on unless FFS_FUSE_POSIX_ACL=0 (see
+        // POSIX_ACL_CAPABILITY). Logged at info when on, because it decides
+        // permission semantics and must be visible in a run's own evidence.
         let posix_acl = posix_acl_capability_from_env();
         if posix_acl != 0 {
             match config.add_capabilities(posix_acl) {
-                Ok(()) => info!(
-                    "FUSE_POSIX_ACL negotiated (FFS_FUSE_POSIX_ACL): the kernel now \
-                     caches and enforces POSIX ACLs for this mount"
-                ),
+                Ok(()) => {
+                    info!(
+                        "FUSE_POSIX_ACL negotiated (FFS_FUSE_POSIX_ACL): the kernel now \
+                         caches and enforces POSIX ACLs for this mount"
+                    );
+                    // A default ACL replaces the umask for what is created
+                    // under it, which only works if the kernel leaves the
+                    // umask to us.
+                    if config.add_capabilities(fuse_consts::FUSE_DONT_MASK).is_ok() {
+                        self.inner
+                            .dont_mask
+                            .store(true, std::sync::atomic::Ordering::Relaxed);
+                    }
+                }
                 Err(missing) => debug!(missing, "kernel declined FUSE_POSIX_ACL"),
             }
         }
@@ -6732,10 +6743,11 @@ impl Filesystem for FrankenFuse {
         parent: u64,
         name: &OsStr,
         mode: u32,
-        _umask: u32,
+        umask: u32,
         rdev: u32,
         reply: ReplyEntry,
     ) {
+        let mode = self.create_mode(&Self::cx_for_request(), parent, mode, umask);
         match self.dispatch_mknod(parent, name, mode, rdev, req.uid(), req.gid()) {
             Ok(attr) => {
                 self.inner.lookup_refcounts.retain(attr.ino.0);
@@ -6765,9 +6777,10 @@ impl Filesystem for FrankenFuse {
         parent: u64,
         name: &OsStr,
         mode: u32,
-        _umask: u32,
+        umask: u32,
         reply: ReplyEntry,
     ) {
+        let mode = self.create_mode(&Self::cx_for_request(), parent, mode, umask);
         match self.dispatch_mkdir(parent, name, mode as u16, req.uid(), req.gid()) {
             Ok(attr) => {
                 self.inner.lookup_refcounts.retain(attr.ino.0);
@@ -7392,7 +7405,7 @@ impl Filesystem for FrankenFuse {
         parent: u64,
         name: &OsStr,
         mode: u32,
-        _umask: u32,
+        umask: u32,
         _flags: i32,
         reply: ReplyCreate,
     ) {
@@ -7401,6 +7414,7 @@ impl Filesystem for FrankenFuse {
             return;
         }
         let cx = Self::cx_for_request();
+        let mode = self.create_mode(&cx, parent, mode, umask);
         if let Some(errno) = self.backpressure_errno(&cx, RequestOp::Create) {
             warn!(parent, "backpressure: shedding create");
             reply.error(errno);
@@ -8690,6 +8704,7 @@ mod tests {
             inode_locks: Arc::new(FuseInodeLocks::default()),
             writeback: WritebackBatch::from_env(),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
+            dont_mask: std::sync::atomic::AtomicBool::new(false),
             lookup_refcounts: LookupRefcounts::default(),
         };
         let ino = InodeNumber(404);
@@ -8733,6 +8748,7 @@ mod tests {
             inode_locks: Arc::new(FuseInodeLocks::default()),
             writeback: WritebackBatch::from_env(),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
+            dont_mask: std::sync::atomic::AtomicBool::new(false),
             lookup_refcounts: LookupRefcounts::default(),
         };
         let fuse = FrankenFuse {
@@ -9931,6 +9947,7 @@ mod tests {
             readdirplus_attr_memo: ReaddirplusAttrMemo::from_env(),
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
+            dont_mask: std::sync::atomic::AtomicBool::new(false),
             lookup_refcounts: LookupRefcounts::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
             writeback: WritebackBatch::from_env(),
@@ -10684,28 +10701,29 @@ mod tests {
         );
     }
 
+    /// bd-biwl4 made FUSE_POSIX_ACL opt-in while ACL semantics were missing;
+    /// bd-rnwd7 implemented them and made it the default (the kernel ignores
+    /// ACLs for access decisions without it). Only an explicit 0/false/off
+    /// turns it off; anything else, including a typo, keeps the default.
     #[test]
-    fn posix_acl_knob_is_opt_in_and_inert_when_unset_bd_biwl4() {
+    fn posix_acl_knob_is_on_unless_explicitly_off_bd_rnwd7() {
         assert_eq!(
             posix_acl_capability_from_value(None),
-            0,
-            "unset must negotiate no capability at all: this flag changes permission \
-             semantics, so it must never arrive by default"
+            fuse_consts::FUSE_POSIX_ACL,
+            "unset negotiates FUSE_POSIX_ACL"
         );
-        for off in ["0", "false", "off", "", "  ", "yes", "2", "enabled", "ON!"] {
+        for off in ["0", "false", "off", "FALSE", "Off", " 0 ", "\tfalse\n"] {
             assert_eq!(
                 posix_acl_capability_from_value(Some(off)),
                 0,
-                "{off:?} must not enable FUSE_POSIX_ACL; only an explicit \
-                 1/true/on may, so a typo fails CLOSED rather than silently \
-                 changing access decisions"
+                "{off:?} must turn FUSE_POSIX_ACL off"
             );
         }
-        for on in ["1", "true", "on", "TRUE", "On", " 1 ", "\ttrue\n"] {
+        for on in ["1", "true", "on", "", "  ", "yes", "2", "enabled", "ON!"] {
             assert_eq!(
                 posix_acl_capability_from_value(Some(on)),
                 fuse_consts::FUSE_POSIX_ACL,
-                "{on:?} must negotiate exactly FUSE_POSIX_ACL"
+                "{on:?} keeps the default"
             );
         }
         assert_eq!(
@@ -22338,6 +22356,7 @@ mod tests {
             ),
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
+            dont_mask: std::sync::atomic::AtomicBool::new(false),
             lookup_refcounts: LookupRefcounts::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
             writeback: WritebackBatch::from_env(),
@@ -24450,6 +24469,7 @@ AllowOther"#;
             ),
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
+            dont_mask: std::sync::atomic::AtomicBool::new(false),
             lookup_refcounts: LookupRefcounts::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
             writeback: WritebackBatch::from_env(),

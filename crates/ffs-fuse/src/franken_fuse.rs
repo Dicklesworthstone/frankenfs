@@ -56,6 +56,7 @@ impl FrankenFuse {
                 // ffs-fuse and everything downstream of it (ffs-cli, and so the
                 // mounted instruments).
                 zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
+                dont_mask: std::sync::atomic::AtomicBool::new(false),
                 lookup_refcounts,
             }),
             final_flush_errno: Arc::new(std::sync::atomic::AtomicI32::new(0)),
@@ -857,6 +858,30 @@ impl FrankenFuse {
             interrupt.on_interrupt(move || request_cx.set_cancel_requested(true));
         }
         cx
+    }
+
+    /// The mode a create/mkdir/mknod gets once the umask is accounted for
+    /// (bd-rnwd7). With FUSE_DONT_MASK the kernel leaves the umask to us: it
+    /// applies unless the parent has a default ACL, which replaces it (the
+    /// default ACL then limits the mode instead). Without it the kernel has
+    /// already applied the umask.
+    fn create_mode(&self, cx: &Cx, parent: u64, mode: u32, umask: u32) -> u32 {
+        if !self
+            .inner
+            .dont_mask
+            .load(std::sync::atomic::Ordering::Relaxed)
+        {
+            return mode;
+        }
+        let default_acl =
+            self.inner
+                .ops
+                .getxattr(cx, InodeNumber(parent), "system.posix_acl_default");
+        if matches!(default_acl, Ok(Some(_))) {
+            mode
+        } else {
+            mode & !umask
+        }
     }
 
     fn reply_error_attr(ctx: &FuseErrorContext<'_>, reply: ReplyAttr) {
@@ -3143,13 +3168,12 @@ impl FrankenFuse {
                 // generic/308 before f8fb93ef). Release builds abort on panic
                 // and never get here; unwinding builds now answer EIO, keep
                 // the worker, and stay mountable.
-                let op_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-                    f(cx, &mut scope)
-                }))
-                .unwrap_or_else(|_| {
-                    error!(?op, "FUSE handler panicked; request answered EIO");
-                    Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EIO)))
-                });
+                let op_result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| f(cx, &mut scope)))
+                        .unwrap_or_else(|_| {
+                            error!(?op, "FUSE handler panicked; request answered EIO");
+                            Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EIO)))
+                        });
                 let end_result = self.inner.ops.end_request_scope(cx, op, scope);
 
                 match (op_result, end_result) {

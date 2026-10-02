@@ -32514,6 +32514,14 @@ impl OpenFs {
         value: &[u8],
         mode: XattrSetMode,
     ) -> ffs_error::Result<()> {
+        // ACLs are exchanged in the generic form and stored in ext4's own.
+        let compacted;
+        let value = if name == POSIX_ACL_ACCESS_XATTR || name == POSIX_ACL_DEFAULT_XATTR {
+            compacted = ext4_compact_posix_acl_xattr_value(value)?;
+            compacted.as_slice()
+        } else {
+            value
+        };
         let alloc_mutex = self.require_alloc_state()?;
         let block_dev = self.block_device_adapter();
         let (tstamp_secs, tstamp_nanos) = Self::now_timestamp();
@@ -45808,9 +45816,162 @@ struct Ext4MoveExtRequest {
 
 const EXT4_POSIX_ACL_STORAGE_VERSION: u32 = 0x0001;
 const POSIX_ACL_XATTR_VERSION: u32 = 0x0002;
+const POSIX_ACL_TAG_USER_OBJ: u16 = 0x0001;
 const POSIX_ACL_TAG_USER: u16 = 0x0002;
+const POSIX_ACL_TAG_GROUP_OBJ: u16 = 0x0004;
 const POSIX_ACL_TAG_GROUP: u16 = 0x0008;
+const POSIX_ACL_TAG_MASK: u16 = 0x0010;
+const POSIX_ACL_TAG_OTHER: u16 = 0x0020;
 const POSIX_ACL_UNDEFINED_ID: u32 = u32::MAX;
+const POSIX_ACL_ACCESS_XATTR: &str = "system.posix_acl_access";
+const POSIX_ACL_DEFAULT_XATTR: &str = "system.posix_acl_default";
+
+/// One entry of a POSIX ACL in the generic xattr form (`posix_acl_xattr`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct PosixAclEntry {
+    tag: u16,
+    perm: u16,
+    id: u32,
+}
+
+/// Parse a `system.posix_acl_*` value in the form userspace and the kernel's
+/// FUSE layer exchange (version 2 header, 8-byte entries). A malformed value
+/// is EINVAL, as the kernel's `posix_acl_from_xattr` reports it.
+fn posix_acl_parse(value: &[u8]) -> ffs_error::Result<Vec<PosixAclEntry>> {
+    let einval = || FfsError::Io(std::io::Error::from_raw_os_error(libc::EINVAL));
+    if value.len() < 4 || !(value.len() - 4).is_multiple_of(8) {
+        return Err(einval());
+    }
+    if u32::from_le_bytes([value[0], value[1], value[2], value[3]]) != POSIX_ACL_XATTR_VERSION {
+        return Err(einval());
+    }
+    let (raw_entries, _) = value[4..].as_chunks::<8>();
+    let entries: Vec<PosixAclEntry> = raw_entries
+        .iter()
+        .map(|raw| PosixAclEntry {
+            tag: u16::from_le_bytes([raw[0], raw[1]]),
+            perm: u16::from_le_bytes([raw[2], raw[3]]),
+            id: u32::from_le_bytes([raw[4], raw[5], raw[6], raw[7]]),
+        })
+        .collect();
+    let known = |tag: u16| {
+        matches!(
+            tag,
+            POSIX_ACL_TAG_USER_OBJ
+                | POSIX_ACL_TAG_USER
+                | POSIX_ACL_TAG_GROUP_OBJ
+                | POSIX_ACL_TAG_GROUP
+                | POSIX_ACL_TAG_MASK
+                | POSIX_ACL_TAG_OTHER
+        )
+    };
+    if entries
+        .iter()
+        .any(|entry| !known(entry.tag) || entry.perm & !0o7 != 0)
+    {
+        return Err(einval());
+    }
+    Ok(entries)
+}
+
+fn posix_acl_encode(entries: &[PosixAclEntry]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + entries.len() * 8);
+    out.extend_from_slice(&POSIX_ACL_XATTR_VERSION.to_le_bytes());
+    for entry in entries {
+        out.extend_from_slice(&entry.tag.to_le_bytes());
+        out.extend_from_slice(&entry.perm.to_le_bytes());
+        out.extend_from_slice(&entry.id.to_le_bytes());
+    }
+    out
+}
+
+/// The permission bits an access ACL implies, and whether the ACL says no
+/// more than they do (kernel `posix_acl_equiv_mode`): owner from USER_OBJ,
+/// group from MASK when there is one (else GROUP_OBJ), other from OTHER.
+fn posix_acl_equiv_mode(entries: &[PosixAclEntry]) -> (u16, bool) {
+    let perm_of = |tag| {
+        entries
+            .iter()
+            .find(|entry| entry.tag == tag)
+            .map_or(0, |entry| entry.perm & 0o7)
+    };
+    let group = if entries.iter().any(|entry| entry.tag == POSIX_ACL_TAG_MASK) {
+        perm_of(POSIX_ACL_TAG_MASK)
+    } else {
+        perm_of(POSIX_ACL_TAG_GROUP_OBJ)
+    };
+    let bits = (perm_of(POSIX_ACL_TAG_USER_OBJ) << 6) | (group << 3) | perm_of(POSIX_ACL_TAG_OTHER);
+    let equivalent = entries.iter().all(|entry| {
+        matches!(
+            entry.tag,
+            POSIX_ACL_TAG_USER_OBJ | POSIX_ACL_TAG_GROUP_OBJ | POSIX_ACL_TAG_OTHER
+        )
+    });
+    (bits, equivalent)
+}
+
+/// Rewrite an access ACL's base entries for a chmod (kernel
+/// `posix_acl_chmod`): the group class goes to MASK when there is one.
+fn posix_acl_chmod(entries: &mut [PosixAclEntry], mode: u16) {
+    let has_mask = entries.iter().any(|entry| entry.tag == POSIX_ACL_TAG_MASK);
+    for entry in entries.iter_mut() {
+        match entry.tag {
+            POSIX_ACL_TAG_USER_OBJ => entry.perm = (mode >> 6) & 0o7,
+            POSIX_ACL_TAG_MASK => entry.perm = (mode >> 3) & 0o7,
+            POSIX_ACL_TAG_GROUP_OBJ if !has_mask => entry.perm = (mode >> 3) & 0o7,
+            POSIX_ACL_TAG_OTHER => entry.perm = mode & 0o7,
+            _ => {}
+        }
+    }
+}
+
+/// A new inode's access ACL from its directory's default ACL (kernel
+/// `posix_acl_create_masq`): every class is limited by the create mode, and
+/// the returned permission bits are what the inode's mode becomes.
+fn posix_acl_create_masq(entries: &mut [PosixAclEntry], mode: u16) -> u16 {
+    let has_mask = entries.iter().any(|entry| entry.tag == POSIX_ACL_TAG_MASK);
+    let mut bits = mode & 0o777;
+    for entry in entries.iter_mut() {
+        match entry.tag {
+            POSIX_ACL_TAG_USER_OBJ => {
+                entry.perm &= (mode >> 6) & 0o7;
+                bits = (bits & !0o700) | (entry.perm << 6);
+            }
+            POSIX_ACL_TAG_MASK => {
+                entry.perm &= (mode >> 3) & 0o7;
+                bits = (bits & !0o070) | (entry.perm << 3);
+            }
+            POSIX_ACL_TAG_GROUP_OBJ if !has_mask => {
+                entry.perm &= (mode >> 3) & 0o7;
+                bits = (bits & !0o070) | (entry.perm << 3);
+            }
+            POSIX_ACL_TAG_OTHER => {
+                entry.perm &= mode & 0o7;
+                bits = (bits & !0o007) | entry.perm;
+            }
+            _ => {}
+        }
+    }
+    bits
+}
+
+/// The generic form of an ACL as ext4 stores it on disk (kernel
+/// `ext4_acl_to_disk`): version 1 header, 4-byte entries for the base
+/// classes and 8 bytes for named users and groups. Storing the generic form
+/// verbatim left ACLs a kernel mount could not read.
+fn ext4_compact_posix_acl_xattr_value(generic: &[u8]) -> ffs_error::Result<Vec<u8>> {
+    let entries = posix_acl_parse(generic)?;
+    let mut out = Vec::with_capacity(4 + entries.len() * 8);
+    out.extend_from_slice(&EXT4_POSIX_ACL_STORAGE_VERSION.to_le_bytes());
+    for entry in &entries {
+        out.extend_from_slice(&entry.tag.to_le_bytes());
+        out.extend_from_slice(&entry.perm.to_le_bytes());
+        if entry.tag == POSIX_ACL_TAG_USER || entry.tag == POSIX_ACL_TAG_GROUP {
+            out.extend_from_slice(&entry.id.to_le_bytes());
+        }
+    }
+    Ok(out)
+}
 
 fn ext4_present_xattr_value(xattr: Ext4Xattr) -> ffs_error::Result<Vec<u8>> {
     if xattr.name_index == ffs_types::EXT4_XATTR_INDEX_POSIX_ACL_ACCESS
@@ -91167,6 +91328,171 @@ mod tests {
             return; // btrfs check tool unavailable
         };
         assert!(ok, "btrfs check must accept split preallocation:\n{output}");
+    }
+
+    /// bd-rnwd7 (xfstests generic/099): POSIX ACLs behave as on ext4. An access
+    /// ACL sets the mode's permission bits (group from the mask) and is not
+    /// kept when the mode says it all; chmod rewrites the stored ACL's base
+    /// entries; a directory's default ACL is inherited by what is created in
+    /// it, limited by the create mode; a default ACL on a file is EACCES; and
+    /// ext4 stores ACLs in its own on-disk form (version 1), which is what a
+    /// kernel mount reads.
+    #[test]
+    fn posix_acls_sync_with_the_mode_and_are_inherited_bd_rnwd7() {
+        fn acl(entries: &[(u16, u16, u32)]) -> Vec<u8> {
+            posix_acl_encode(
+                &entries
+                    .iter()
+                    .map(|&(tag, perm, id)| PosixAclEntry { tag, perm, id })
+                    .collect::<Vec<_>>(),
+            )
+        }
+        const U: u16 = POSIX_ACL_TAG_USER_OBJ;
+        const NU: u16 = POSIX_ACL_TAG_USER;
+        const G: u16 = POSIX_ACL_TAG_GROUP_OBJ;
+        const M: u16 = POSIX_ACL_TAG_MASK;
+        const O: u16 = POSIX_ACL_TAG_OTHER;
+        const X: u32 = POSIX_ACL_UNDEFINED_ID;
+
+        let check = |fs: &OpenFs, root: InodeNumber, label: &str| {
+            let cx = Cx::for_testing();
+            let ops: &dyn FsOps = fs;
+            let scope = || RequestScope::empty();
+            let perm = |ino| ops.getattr(&cx, &mut scope(), ino).expect("getattr").perm & 0o777;
+            let get_acl = |ino, name| ops.getxattr(&cx, ino, name).expect("getxattr");
+
+            let file = ops
+                .create(&cx, &mut scope(), root, OsStr::new("file1"), 0o764, 0, 0)
+                .expect("create");
+            // Equivalent to a mode: only the mode changes, nothing is stored.
+            ops.setxattr(
+                &cx,
+                &mut scope(),
+                file.ino,
+                POSIX_ACL_ACCESS_XATTR,
+                &acl(&[(U, 4, X), (G, 7, X), (O, 6, X)]),
+                XattrSetMode::Set,
+            )
+            .expect("set equivalent ACL");
+            assert_eq!(perm(file.ino), 0o476, "{label}: mode follows the ACL");
+            assert_eq!(
+                get_acl(file.ino, POSIX_ACL_ACCESS_XATTR),
+                None,
+                "{label}: not kept"
+            );
+
+            // A named user needs the ACL kept; the group class is the mask.
+            let named = acl(&[(U, 6, X), (NU, 4, 1000), (G, 4, X), (M, 6, X), (O, 0, X)]);
+            ops.setxattr(
+                &cx,
+                &mut scope(),
+                file.ino,
+                POSIX_ACL_ACCESS_XATTR,
+                &named,
+                XattrSetMode::Set,
+            )
+            .expect("set named ACL");
+            assert_eq!(
+                perm(file.ino),
+                0o660,
+                "{label}: owner rw, mask rw, other none"
+            );
+            assert_eq!(
+                get_acl(file.ino, POSIX_ACL_ACCESS_XATTR),
+                Some(named.clone()),
+                "{label}: the ACL reads back as set"
+            );
+
+            // chmod rewrites owner, mask and other; the named entry stays.
+            ops.setattr(
+                &cx,
+                &mut scope(),
+                file.ino,
+                &SetAttrRequest {
+                    mode: Some(0o640),
+                    ..SetAttrRequest::default()
+                },
+            )
+            .expect("chmod");
+            assert_eq!(
+                get_acl(file.ino, POSIX_ACL_ACCESS_XATTR),
+                Some(acl(&[
+                    (U, 6, X),
+                    (NU, 4, 1000),
+                    (G, 4, X),
+                    (M, 4, X),
+                    (O, 0, X)
+                ])),
+                "{label}: chmod updates the ACL"
+            );
+
+            // Default ACLs: only on directories, and inherited.
+            let err = ops
+                .setxattr(
+                    &cx,
+                    &mut scope(),
+                    file.ino,
+                    POSIX_ACL_DEFAULT_XATTR,
+                    &acl(&[(U, 4, X), (G, 4, X), (O, 0, X)]),
+                    XattrSetMode::Set,
+                )
+                .expect_err("default ACL on a file");
+            assert_eq!(err.to_errno(), libc::EACCES, "{label}: {err:?}");
+            let dir = ops
+                .mkdir(&cx, &mut scope(), root, OsStr::new("acldir"), 0o755, 0, 0)
+                .expect("mkdir");
+            let default = acl(&[(U, 4, X), (G, 4, X), (O, 0, X)]);
+            ops.setxattr(
+                &cx,
+                &mut scope(),
+                dir.ino,
+                POSIX_ACL_DEFAULT_XATTR,
+                &default,
+                XattrSetMode::Set,
+            )
+            .expect("set default ACL");
+            let child = ops
+                .create(&cx, &mut scope(), dir.ino, OsStr::new("file2"), 0o666, 0, 0)
+                .expect("create in acldir");
+            assert_eq!(
+                child.perm & 0o777,
+                0o440,
+                "{label}: create mode limited by the default ACL"
+            );
+            assert_eq!(perm(child.ino), 0o440, "{label}");
+            let sub = ops
+                .mkdir(&cx, &mut scope(), dir.ino, OsStr::new("sub"), 0o755, 0, 0)
+                .expect("mkdir in acldir");
+            assert_eq!(
+                get_acl(sub.ino, POSIX_ACL_DEFAULT_XATTR),
+                Some(default.clone()),
+                "{label}: a subdirectory inherits the default ACL"
+            );
+            assert_eq!(perm(sub.ino), 0o440, "{label}");
+            file.ino
+        };
+
+        let Some((ext4, _tmp)) = open_writable_ext4_mkfs(64) else {
+            return; // mkfs.ext4 unavailable on this host — skip like sibling tests.
+        };
+        let file = check(&ext4, InodeNumber(2), "ext4");
+        let cx = Cx::for_testing();
+        let stored = ext4
+            .ext4_cached_inode_xattr_entries(&cx, file)
+            .expect("raw xattrs");
+        let raw = stored
+            .iter()
+            .find(|(xattr, _)| xattr.name_index == ffs_types::EXT4_XATTR_INDEX_POSIX_ACL_ACCESS)
+            .expect("stored access ACL");
+        assert_eq!(
+            &raw.0.value[..4],
+            &EXT4_POSIX_ACL_STORAGE_VERSION.to_le_bytes(),
+            "ext4 stores its own ACL form"
+        );
+
+        if let Some((btrfs, _dev, _btmp, _image)) = open_writable_btrfs_mkfs(256) {
+            check(&btrfs, InodeNumber(1), "btrfs");
+        }
     }
 
     /// What statfs calls available must be what a data write can get:

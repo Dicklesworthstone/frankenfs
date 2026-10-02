@@ -83,6 +83,7 @@ const POSIX_ACL_XATTR_VERSION: u32 = 0x0002;
 const ACL_USER_OBJ_TAG: u16 = 0x0001;
 const ACL_GROUP_OBJ_TAG: u16 = 0x0004;
 const ACL_OTHER_TAG: u16 = 0x0020;
+const ACL_MASK_TAG: u16 = 0x0010;
 const ACL_UNDEFINED_ID: u32 = u32::MAX;
 const FUSE_MOUNT_STATE_POLL_INTERVAL: Duration = Duration::from_millis(10);
 const FUSE_MOUNT_READY_TIMEOUT: Duration = Duration::from_secs(1);
@@ -16741,9 +16742,13 @@ fn btrfs_fuse_xattr_posix_acl_list_and_get() {
         fs::write(&file_path, b"POSIX ACL test content\n").expect("create test file for ACL");
         fs::create_dir(&dir_path).expect("create test dir for ACL");
 
+        // With a mask entry, so it says more than the mode: an access ACL of
+        // only owner/group/other just sets the mode and is not stored, as on
+        // kernel ext4/btrfs (posix_acl_update_mode, bd-rnwd7).
         let access_acl = build_posix_acl_xattr(&[
             (ACL_USER_OBJ_TAG, 0o6),
             (ACL_GROUP_OBJ_TAG, 0o4),
+            (ACL_MASK_TAG, 0o4),
             (ACL_OTHER_TAG, 0),
         ]);
         let default_acl = build_posix_acl_xattr(&[
