@@ -8277,8 +8277,16 @@ impl OpenFs {
         // InodeUpdate applied together; do that coordinated pass first (bd-6nwjx
         // incr 3b). The per-op loop skips only InodeUpdate records completed by
         // that pass. Final range checks verify the resulting mappings.
+        // Taken before anything is replayed: which directories already exist
+        // decides which blocks the records name for real.
+        let excluded = if writes_allowed {
+            self.fast_commit_excluded_blocks(cx, operations)?
+        } else {
+            Vec::new()
+        };
         let recovered_external_inodes = if writes_allowed {
-            let recovered = self.apply_fast_commit_external_extent_recovery(cx, operations)?;
+            let recovered =
+                self.apply_fast_commit_external_extent_recovery(cx, operations, &excluded)?;
             // DEL_RANGE pre-pass (bd-w6fxn): punch the removed logical ranges and
             // FREE their blocks BEFORE the per-op loop applies any InodeUpdate —
             // the punch must read the pre-recovery (on-device) extent tree to know
@@ -8300,7 +8308,9 @@ impl OpenFs {
                         let adds_a_name =
                             writes_allowed && !self.fast_commit_dentry_present(cx, dentry)?;
                         // A readable target alone does not recover its name.
-                        if writes_allowed && !self.apply_fast_commit_add_dentry(cx, dentry)? {
+                        if writes_allowed
+                            && !self.apply_fast_commit_add_dentry(cx, dentry, &excluded)?
+                        {
                             return Err(FfsError::UnsupportedFeature(format!(
                                 "fast-commit CREATE recovery incomplete for inode {} in parent {}",
                                 dentry.ino, dentry.parent_ino
@@ -8330,7 +8340,9 @@ impl OpenFs {
                         // A hard link is the same directory-entry insertion as a
                         // create (the target inode already exists); reuse the
                         // same recovery splice (bd-6nwjx/bd-w6fxn).
-                        if writes_allowed && !self.apply_fast_commit_add_dentry(cx, dentry)? {
+                        if writes_allowed
+                            && !self.apply_fast_commit_add_dentry(cx, dentry, &excluded)?
+                        {
                             return Err(FfsError::UnsupportedFeature(format!(
                                 "fast-commit LINK recovery incomplete for inode {} in parent {}",
                                 dentry.ino, dentry.parent_ino
@@ -8720,6 +8732,36 @@ impl OpenFs {
                 return self.free_fast_commit_deleted_inode(cx, ino);
             }
         }
+        // An existing directory keeps its on-disk layout — i_block, size,
+        // blocks and the htree flag — and takes the rest from the record, as
+        // ext4_fc_replay_inode keeps i_block: the record's root names directory
+        // blocks the fast commit never wrote, while recovery replayed this
+        // directory's entries (splitting leaves as needed) into its own blocks.
+        let record_is_dir = raw_inode.len() >= 0x76
+            && u16::from_le_bytes([raw_inode[0], raw_inode[1]]) & 0xF000 == 0x4000;
+        if record_is_dir && self.fast_commit_existing_dir(cx, ino)? {
+            let disk = self.recovery_read_inode_raw(cx, ino)?;
+            if disk.len() < raw_inode.len() {
+                return Err(FfsError::Corruption {
+                    block: 0,
+                    detail: format!("fast-commit inode {ino} record exceeds the inode size"),
+                });
+            }
+            let mut raw = disk.clone();
+            raw[..raw_inode.len()].copy_from_slice(raw_inode);
+            // i_size_lo, i_blocks_lo, i_block, i_size_high, l_i_blocks_high.
+            for (at, len) in [(0x04, 4), (0x1C, 4), (0x28, 60), (0x6C, 4), (0x74, 2)] {
+                raw[at..at + len].copy_from_slice(&disk[at..at + len]);
+            }
+            let flag = |bytes: &[u8]| {
+                u32::from_le_bytes([bytes[0x20], bytes[0x21], bytes[0x22], bytes[0x23]])
+            };
+            let flags =
+                (flag(&raw) & !ffs_types::EXT4_INDEX_FL) | (flag(&disk) & ffs_types::EXT4_INDEX_FL);
+            raw[0x20..0x24].copy_from_slice(&flags.to_le_bytes());
+            self.restamp_recovery_inode(ino, &mut raw)?;
+            return self.recovery_write_inode_raw(cx, ino, &raw);
+        }
         // External extent roots must be applied with their recovered leaves.
         // The dispatcher bypasses this helper for inodes already completed by
         // the coordinated pass; any remaining external inode is unsupported.
@@ -9045,8 +9087,8 @@ impl OpenFs {
     /// **htree** (hash-indexed) directory it descends the DX index to the leaf
     /// whose hash range covers `name` ([`ffs_ondisk::htree_target_leaf_block`])
     /// and adds there — the same leaf [`ffs_ondisk::htree_find_entry`] would
-    /// navigate to, so the index stays consistent without any dx surgery (no new
-    /// leaf is created).
+    /// navigate to. A full leaf is split (or the index rebuilt) with the write
+    /// path's helpers, allocating only blocks no recovered inode names.
     ///
     /// Conservative — returns `Ok(false)` (leaving the record verify-only) when:
     /// - the parent is not a directory;
@@ -9055,9 +9097,8 @@ impl OpenFs {
     ///   (bd-owt2r);
     /// - the htree index is unreadable — refusing to mutate beats a linear write
     ///   into the dx_root;
-    /// - no directory block (or the target htree leaf) has room — growing the
-    ///   directory / splitting a leaf needs the writable-path block allocator,
-    ///   unavailable at mount recovery.
+    /// - a linear directory has no block with room — growing it is not done
+    ///   at recovery yet (a full htree leaf is split, see above).
     ///
     /// Returns `Ok(true)` when the entry was spliced in, or when it is already
     /// present (idempotent: the create may also have been captured by JBD2 replay
@@ -9068,8 +9109,9 @@ impl OpenFs {
         &self,
         cx: &Cx,
         dentry: &ffs_journal::FcDentry,
+        excluded: &[(u64, u32)],
     ) -> Result<bool, FfsError> {
-        let result = self.apply_fast_commit_add_dentry_inner(cx, dentry);
+        let result = self.apply_fast_commit_add_dentry_inner(cx, dentry, excluded);
         // bd-f8rd8: a fast-commit add splices an entry into block slack WITHOUT
         // bumping the parent's ctime/mtime/size (replay preserves timestamps), so
         // the negative-lookup name index's validation key cannot detect it — and
@@ -9087,6 +9129,7 @@ impl OpenFs {
         &self,
         cx: &Cx,
         dentry: &ffs_journal::FcDentry,
+        excluded: &[(u64, u32)],
     ) -> Result<bool, FfsError> {
         let parent_ino = dentry.parent_ino;
         let parent = self.read_inode(cx, InodeNumber(u64::from(parent_ino)))?;
@@ -9123,7 +9166,9 @@ impl OpenFs {
 
         // htree (hash-indexed) directory: add into the hash-correct leaf only.
         if parent.has_htree_index() {
-            return self.apply_fast_commit_add_dentry_htree(cx, &scope, &parent, dentry, file_type);
+            return self.apply_fast_commit_add_dentry_htree(
+                cx, &scope, &parent, dentry, file_type, excluded,
+            );
         }
 
         // Linear directory: splice into the first block with room.
@@ -9157,8 +9202,7 @@ impl OpenFs {
 
     /// htree branch of [`Self::apply_fast_commit_add_dentry`]: descend the DX
     /// index to the leaf whose hash range covers `name` and splice the entry
-    /// there. Adding to the existing hash-correct leaf keeps the index valid
-    /// without creating a new leaf, so no dx surgery (or allocation) is needed.
+    /// there; a full leaf is split (bd-9m84h), allocating outside `excluded`.
     fn apply_fast_commit_add_dentry_htree(
         &self,
         cx: &Cx,
@@ -9166,6 +9210,7 @@ impl OpenFs {
         parent: &Ext4Inode,
         dentry: &ffs_journal::FcDentry,
         file_type: Ext4FileType,
+        excluded: &[(u64, u32)],
     ) -> Result<bool, FfsError> {
         let parent_ino = dentry.parent_ino;
         // Non-ASCII casefold folds may diverge from the kernel's; the write side
@@ -9231,12 +9276,77 @@ impl OpenFs {
         )? {
             return Ok(true);
         }
-        warn!(
+
+        // The hash-correct leaf is full: split it (or rebuild the index), as
+        // the kernel's replay does through ext4_add_entry, with the write
+        // path's own helpers, allocating only blocks no recovered inode names.
+        let csum_seed = sb.csum_seed();
+        let extents = self.collect_extents(cx, parent)?;
+        let leaf = self.read_block_vec(cx, BlockNumber(phys))?;
+        let block_dev = self.direct_block_device_adapter();
+        let mut alloc = self.load_ext4_alloc_state(cx)?;
+        let counts_before = Self::ext4_snapshot_group_counts(&alloc);
+        for &(start, len) in excluded {
+            ffs_alloc::claim_blocks(
+                cx,
+                &block_dev,
+                &alloc.geo,
+                &mut alloc.groups,
+                BlockNumber(start),
+                len,
+            )?;
+        }
+        let (secs, nanos) = Self::now_timestamp();
+        let parent_n = InodeNumber(u64::from(parent_ino));
+        {
+            let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
+            let split = if casefold {
+                None
+            } else {
+                self.ext4_split_htree_leaf_and_add(
+                    cx,
+                    &block_dev,
+                    &mut backend,
+                    parent_n,
+                    parent,
+                    &extents,
+                    target_logical,
+                    BlockNumber(phys),
+                    &leaf,
+                    &dentry.name,
+                    dentry.ino,
+                    file_type,
+                    csum_seed,
+                    secs,
+                    nanos,
+                )?
+            };
+            if split.is_none() {
+                self.ext4_rebuild_htree_dir(
+                    cx,
+                    &block_dev,
+                    &mut backend,
+                    parent_n,
+                    parent,
+                    &extents,
+                    &dentry.name,
+                    dentry.ino,
+                    file_type,
+                    csum_seed,
+                    secs,
+                    nanos,
+                )?;
+            }
+        }
+        self.ext4_persist_group_descriptors_from(cx, &alloc)?;
+        self.ext4_merge_recovery_alloc_into_live(&counts_before, &alloc);
+        self.invalidate_ext4_read_caches_after_recovery();
+        debug!(
             parent_ino,
             ino = dentry.ino,
-            "fc_apply: CREAT/LINK skipped — htree leaf full (split needs allocation)"
+            "fc_apply: htree leaf full — split at recovery"
         );
-        Ok(false)
+        Ok(true)
     }
 
     /// Splice `dentry` into the directory block at `phys` and persist it the
@@ -9607,10 +9717,78 @@ impl OpenFs {
     /// ADD_RANGE records and an InodeUpdate, attempts a single-leaf recovery
     /// (see `try_recover_single_leaf_inode`). Inline-extent inodes (no ADD_RANGE)
     /// are left to the main loop, which applies their InodeUpdate directly.
+    /// ext4_fc_replay_check_excluded: the blocks a live recovered inode names
+    /// — its ADD_RANGE records, and the inline extents of its INODE record —
+    /// which recovery must never hand out to grow a tree or a directory. An
+    /// existing directory's record is left out: recovery keeps that
+    /// directory's on-disk layout (see `fast_commit_existing_dir`), so the
+    /// blocks its record names are not used and must not be claimed.
+    fn fast_commit_excluded_blocks(
+        &self,
+        cx: &Cx,
+        operations: &[ffs_journal::FcOperation],
+    ) -> Result<Vec<(u64, u32)>, FfsError> {
+        let mut live: BTreeMap<u32, &[u8]> = BTreeMap::new();
+        for op in operations {
+            if let ffs_journal::FcOperation::InodeUpdate(ino, raw) = op
+                && raw.len() >= 0x1C
+            {
+                if raw[0..2] != [0, 0] && raw[0x1A..0x1C] != [0, 0] {
+                    live.insert(*ino, raw);
+                } else {
+                    live.remove(ino);
+                }
+            }
+        }
+        let mut excluded: Vec<(u64, u32)> = operations
+            .iter()
+            .filter_map(|op| match op {
+                ffs_journal::FcOperation::AddRange(r) if live.contains_key(&r.ino) => {
+                    Some((r.physical_block, r.len))
+                }
+                _ => None,
+            })
+            .collect();
+        for (&ino, raw) in &live {
+            let is_dir = u16::from_le_bytes([raw[0], raw[1]]) & 0xF000 == 0x4000;
+            if is_dir && self.fast_commit_existing_dir(cx, ino)? {
+                continue;
+            }
+            if raw.len() >= 0x28 + 60
+                && let Ok((header, ffs_ondisk::ext4::ExtentTree::Leaf(leaf))) =
+                    ffs_ondisk::ext4::parse_extent_tree(&raw[0x28..0x28 + 60])
+                && header.depth == 0
+            {
+                excluded.extend(
+                    leaf.iter()
+                        .map(|e| (e.physical_start, u32::from(e.actual_len()))),
+                );
+            }
+        }
+        Ok(excluded)
+    }
+
+    /// Whether `ino` is, on disk, a live extent-mapped directory. Recovery
+    /// keeps such a directory's layout (i_block, size, blocks, htree flag)
+    /// when its INODE record arrives, as ext4_fc_replay_inode keeps i_block:
+    /// the record's root names directory blocks a fast commit never wrote.
+    fn fast_commit_existing_dir(&self, cx: &Cx, ino: u32) -> Result<bool, FfsError> {
+        match self.read_inode(cx, InodeNumber(u64::from(ino))) {
+            Ok(inode) => Ok(inode.is_dir()
+                && inode.links_count > 0
+                && inode.flags & EXT4_EXTENTS_FL != 0
+                && inode.extent_bytes.len() >= 2
+                && u16::from_le_bytes([inode.extent_bytes[0], inode.extent_bytes[1]]) == 0xF30A),
+            Err(FfsError::NotFound(_)) => Ok(false),
+            Err(error) => Err(error),
+        }
+    }
+
     fn apply_fast_commit_external_extent_recovery(
         &self,
         cx: &Cx,
         operations: &[ffs_journal::FcOperation],
+        excluded: &[(u64, u32)],
     ) -> Result<BTreeSet<u32>, FfsError> {
         let mut by_inode: BTreeMap<u32, (Vec<FcRangeOp>, Option<Vec<u8>>)> = BTreeMap::new();
         for op in operations {
@@ -9650,43 +9828,6 @@ impl OpenFs {
                 _ => {}
             }
         }
-        // ext4_fc_replay_check_excluded: a block a live inode's recovered state
-        // names (its ADD_RANGE records, or the inline extents of its INODE
-        // record) is never handed out to grow a tree during recovery.
-        let mut live: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
-        for op in operations {
-            if let ffs_journal::FcOperation::InodeUpdate(ino, raw) = op
-                && raw.len() >= 0x1C
-            {
-                if raw[0..2] != [0, 0] && raw[0x1A..0x1C] != [0, 0] {
-                    live.insert(*ino, raw.clone());
-                } else {
-                    live.remove(ino);
-                }
-            }
-        }
-        let mut excluded: Vec<(u64, u32)> = Vec::new();
-        for (ino, (ranges, _)) in &by_inode {
-            if live.contains_key(ino) {
-                excluded.extend(ranges.iter().filter_map(|range| match range {
-                    FcRangeOp::Add(e) => Some((e.physical_start, u32::from(e.actual_len()))),
-                    FcRangeOp::Del { .. } => None,
-                }));
-            }
-        }
-        for raw in live.values() {
-            if raw.len() >= 0x28 + 60
-                && let Ok((header, ffs_ondisk::ext4::ExtentTree::Leaf(leaf))) =
-                    ffs_ondisk::ext4::parse_extent_tree(&raw[0x28..0x28 + 60])
-                && header.depth == 0
-            {
-                excluded.extend(
-                    leaf.iter()
-                        .map(|e| (e.physical_start, u32::from(e.actual_len()))),
-                );
-            }
-        }
-
         let mut recovered = BTreeSet::new();
         for (ino, (ranges, maybe_inode)) in by_inode {
             if ranges.is_empty() {
@@ -9705,7 +9846,7 @@ impl OpenFs {
                 // Publishing a recovered root first could strand those blocks.
                 continue;
             }
-            if self.recover_fast_commit_extent_tree(cx, ino, &ranges, &inode_raw, &excluded)? {
+            if self.recover_fast_commit_extent_tree(cx, ino, &ranges, &inode_raw, excluded)? {
                 recovered.insert(ino);
             }
         }
@@ -51799,7 +51940,7 @@ mod tests {
             name: b"hello.txt".to_vec(),
         };
         let applied = fs
-            .apply_fast_commit_add_dentry(&cx, &dentry)
+            .apply_fast_commit_add_dentry(&cx, &dentry, &[])
             .expect("apply create");
         assert!(applied, "already-present entry is an idempotent success");
 
@@ -64445,7 +64586,7 @@ mod tests {
             name: b"zzz_recovered.bin".to_vec(),
         };
         let applied = fs2
-            .apply_fast_commit_add_dentry(&cx, &dentry)
+            .apply_fast_commit_add_dentry(&cx, &dentry, &[])
             .expect("apply htree create");
         assert!(applied, "entry should splice into the hash-correct leaf");
 

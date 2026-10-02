@@ -19158,7 +19158,6 @@ fn fast_commit_crash_image_truncate_matches_kernel_bd_9m84h() {
 // up: the baseline makes a multi-leaf htree, the fast commit adds a hundred
 // more entries (ADD_ENTRY records replayed through leaf splits).
 #[test]
-#[ignore = "bd-9m84h: FC apply cannot split a full htree leaf yet (no recovery-time allocator); open fails closed"]
 fn fast_commit_crash_image_htree_growth_matches_kernel_bd_9m84h() {
     let names: Vec<String> = (0..400)
         .map(|i| format!("entry_{i:04}_{}", "x".repeat(40)))
