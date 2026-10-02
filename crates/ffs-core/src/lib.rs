@@ -2813,6 +2813,30 @@ fn systemtime_nanos(t: std::time::SystemTime) -> u64 {
         .map_or(0, |d| u64::try_from(d.as_nanos()).unwrap_or(u64::MAX))
 }
 
+/// A `SystemTime` as signed `(seconds, nanoseconds)` since the Unix epoch,
+/// nanoseconds always in `0..1e9` (so 0.25 s before the epoch is `(-1,
+/// 750_000_000)`), the form on-disk timestamps store. Saturates far outside
+/// the i64 range.
+fn system_time_to_signed(t: std::time::SystemTime) -> (i64, u32) {
+    match t.duration_since(std::time::UNIX_EPOCH) {
+        Ok(after) => (
+            i64::try_from(after.as_secs()).unwrap_or(i64::MAX),
+            after.subsec_nanos(),
+        ),
+        Err(before) => {
+            let before = before.duration();
+            let secs = i64::try_from(before.as_secs()).unwrap_or(i64::MAX);
+            match before.subsec_nanos() {
+                0 => (secs.saturating_neg(), 0),
+                nanos => (
+                    secs.saturating_neg().saturating_sub(1),
+                    1_000_000_000 - nanos,
+                ),
+            }
+        }
+    }
+}
+
 /// Csum-tree items `(key, packed crc32c values)` used by the read-verify path.
 type BtrfsCsumItems = Vec<(BtrfsKey, Vec<u8>)>;
 
@@ -13223,10 +13247,19 @@ impl OpenFs {
         Ok(root_item.bytenr)
     }
 
+    /// A btrfs timespec as `SystemTime`. The on-disk seconds are a signed
+    /// `__le64` (kept as raw bits in the `u64` field), so pre-1970 times are
+    /// negative.
     fn btrfs_timespec(sec: u64, nsec: u32) -> SystemTime {
         let clamped_nsec = nsec.min(999_999_999);
-        UNIX_EPOCH
-            .checked_add(Duration::new(sec, clamped_nsec))
+        let secs = sec.cast_signed();
+        let whole = Duration::from_secs(secs.unsigned_abs());
+        let at = if secs >= 0 {
+            UNIX_EPOCH.checked_add(whole)
+        } else {
+            UNIX_EPOCH.checked_sub(whole)
+        };
+        at.and_then(|t| t.checked_add(Duration::new(0, clamped_nsec)))
             .unwrap_or(UNIX_EPOCH)
     }
 
@@ -31317,13 +31350,15 @@ impl OpenFs {
         if let Some(gid) = attrs.gid {
             inode.gid = gid;
         }
+        // Explicit times may predate 1970 (xfstests generic/258); ctime is
+        // stamped with "now" below either way.
         if let Some(atime) = attrs.atime {
-            let dur = atime.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
-            ffs_inode::touch_atime(&mut inode, dur.as_secs(), dur.subsec_nanos());
+            let (secs, nsec) = system_time_to_signed(atime);
+            ffs_inode::set_atime(&mut inode, secs, nsec);
         }
         if let Some(mtime) = attrs.mtime {
-            let dur = mtime.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
-            ffs_inode::touch_mtime_ctime(&mut inode, dur.as_secs(), dur.subsec_nanos());
+            let (secs, nsec) = system_time_to_signed(mtime);
+            ffs_inode::set_mtime(&mut inode, secs, nsec);
         }
 
         // Handle truncation.
@@ -39942,15 +39977,17 @@ impl OpenFs {
 
             inode.nbytes = Self::btrfs_recompute_inode_nbytes(&alloc, canonical)?;
         }
+        // Explicit times may predate 1970 (xfstests generic/258): the on-disk
+        // seconds are a signed __le64, stored here as raw bits.
         if let Some(atime) = attrs.atime {
-            let dur = atime.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
-            inode.atime_sec = dur.as_secs();
-            inode.atime_nsec = dur.subsec_nanos();
+            let (secs, nsec) = system_time_to_signed(atime);
+            inode.atime_sec = secs.cast_unsigned();
+            inode.atime_nsec = nsec;
         }
         if let Some(mtime) = attrs.mtime {
-            let dur = mtime.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
-            inode.mtime_sec = dur.as_secs();
-            inode.mtime_nsec = dur.subsec_nanos();
+            let (secs, nsec) = system_time_to_signed(mtime);
+            inode.mtime_sec = secs.cast_unsigned();
+            inode.mtime_nsec = nsec;
         }
         let (secs, nanos) = Self::btrfs_now_timestamp();
         inode.ctime_sec = secs;
@@ -40977,9 +41014,7 @@ impl OpenFs {
     /// getattr/readdir/lookup on a malformed image must not crash. Mirrors the
     /// ext4 `Ext4Inode::to_system_time` checked conversion.
     fn btrfs_inode_timestamp(secs: u64, nsec: u32) -> std::time::SystemTime {
-        UNIX_EPOCH
-            .checked_add(Duration::new(secs, nsec.min(999_999_999)))
-            .unwrap_or(UNIX_EPOCH)
+        Self::btrfs_timespec(secs, nsec)
     }
 
     fn validate_single_path_component(name: &[u8]) -> ffs_error::Result<()> {
@@ -42264,12 +42299,16 @@ impl OpenFs {
         if inode.flags & (BTRFS_INODE_NOATIME | BTRFS_INODE_IMMUTABLE) != 0 {
             return Ok(false);
         }
-        let atime = (inode.atime_sec, inode.atime_nsec);
+        // Compared as the signed seconds they are on disk (pre-1970 is negative).
+        let stamp = |sec: u64, nsec: u32| (sec.cast_signed(), nsec);
+        let atime = stamp(inode.atime_sec, inode.atime_nsec);
         let now_dur = now.duration_since(UNIX_EPOCH).unwrap_or(Duration::ZERO);
-        let age = now_dur.saturating_sub(Duration::new(inode.atime_sec, inode.atime_nsec));
+        let age = now
+            .duration_since(Self::btrfs_timespec(inode.atime_sec, inode.atime_nsec))
+            .unwrap_or(Duration::ZERO);
         if !strict
-            && atime > (inode.mtime_sec, inode.mtime_nsec)
-            && atime > (inode.ctime_sec, inode.ctime_nsec)
+            && atime > stamp(inode.mtime_sec, inode.mtime_nsec)
+            && atime > stamp(inode.ctime_sec, inode.ctime_nsec)
             && age < RELATIME_MAX_AGE
         {
             return Ok(false);
@@ -86402,6 +86441,47 @@ mod tests {
         );
     }
 
+    /// xfstests generic/258: explicit pre-1970 times, and 2038-2106 times
+    /// (ext4's base field has bit 31 set there), read back exactly on both
+    /// formats.
+    #[test]
+    fn explicit_pre_1970_and_post_2038_times_round_trip() {
+        use std::time::{Duration, UNIX_EPOCH};
+        let before = UNIX_EPOCH - Duration::from_secs(10 * 365 * 86_400) + Duration::new(0, 250);
+        let after_2038 = UNIX_EPOCH + Duration::new((1_u64 << 31) + 12_345, 678);
+        let check = |fs: &OpenFs, cx: &Cx, root: InodeNumber, what: &str| {
+            let ino = fs
+                .create(cx, root, OsStr::new("old_times"), 0o644, 0, 0)
+                .expect("create")
+                .ino;
+            for t in [before, after_2038] {
+                fs.setattr(
+                    cx,
+                    ino,
+                    &SetAttrRequest {
+                        atime: Some(t),
+                        mtime: Some(t),
+                        ..SetAttrRequest::default()
+                    },
+                )
+                .expect("setattr");
+                let attr = fs.getattr(cx, ino).expect("getattr");
+                assert_eq!(attr.atime, t, "{what}: atime {t:?}");
+                assert_eq!(attr.mtime, t, "{what}: mtime {t:?}");
+            }
+        };
+        if let Some(fs) = open_writable_ext4() {
+            check(&fs, &Cx::for_testing(), InodeNumber(2), "ext4");
+        }
+        let (fs, cx) = open_writable_btrfs();
+        check(
+            &fs,
+            &cx,
+            InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID)),
+            "btrfs",
+        );
+    }
+
     /// xfstests generic/003 on btrfs: an access sets atime under relatime and
     /// never ctime, and a rename moves the renamed inode's ctime.
     #[test]
@@ -100973,9 +101053,14 @@ mod tests {
             inode.atime_nsec = 999_999_999;
             inode
         };
-        // Must not panic; the out-of-range atime saturates to UNIX_EPOCH.
+        // Must not panic. The on-disk seconds are a signed __le64, so
+        // u64::MAX is -1: one second before the epoch, as kernel btrfs shows it.
         let attr = fs.btrfs_inode_to_attr(created.ino.0, &inode);
-        assert_eq!(attr.atime, std::time::UNIX_EPOCH);
+        assert_eq!(
+            attr.atime,
+            std::time::UNIX_EPOCH - std::time::Duration::from_secs(1)
+                + std::time::Duration::from_nanos(999_999_999)
+        );
     }
 
     #[test]
@@ -100991,12 +101076,17 @@ mod tests {
             OpenFs::btrfs_inode_timestamp(0, u32::MAX),
             UNIX_EPOCH + Duration::new(0, 999_999_999)
         );
-        // Out-of-range seconds saturate to UNIX_EPOCH instead of panicking.
-        assert_eq!(OpenFs::btrfs_inode_timestamp(u64::MAX, 0), UNIX_EPOCH);
+        // The seconds are a signed __le64: u64::MAX is -1 s (pre-1970, not an
+        // overflow), and the most negative value must not panic.
+        assert_eq!(
+            OpenFs::btrfs_inode_timestamp(u64::MAX, 0),
+            UNIX_EPOCH - Duration::from_secs(1)
+        );
         assert_eq!(
             OpenFs::btrfs_inode_timestamp(u64::MAX, u32::MAX),
-            UNIX_EPOCH
+            UNIX_EPOCH - Duration::from_secs(1) + Duration::new(0, 999_999_999)
         );
+        let _ = OpenFs::btrfs_inode_timestamp(i64::MIN.cast_unsigned(), u32::MAX);
     }
 
     #[test]

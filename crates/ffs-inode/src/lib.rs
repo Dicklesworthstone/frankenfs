@@ -455,7 +455,7 @@ pub fn build_fresh_inode(
     extent_bytes[4] = 4; // max_entries = 4.
     // depth = 0 (already zero).
 
-    let extra_time = encode_extra_timestamp(now_secs, now_nsec);
+    let extra_time = encode_extra_timestamp(now_secs_signed(now_secs), now_nsec);
 
     #[allow(clippy::cast_possible_truncation)]
     let now_lo = now_secs as u32;
@@ -1236,13 +1236,20 @@ pub fn write_inode_at_slot_scoped(
 
 /// Encode nanoseconds and epoch extension into the `_extra` timestamp field.
 ///
-/// Layout: bits 0-1 = epoch extension (seconds >> 32), bits 2-31 = nanoseconds.
+/// Layout: bits 0-1 = epoch extension, bits 2-31 = nanoseconds. The base
+/// field holds the low 32 bits of `secs`, which readers sign-extend, so the
+/// epoch is what must be added back: `((secs - (s32)secs) >> 32) & 3`, the
+/// kernel's `ext4_encode_extra_time`. That makes pre-1970 times (negative
+/// `secs`, epoch 0) and 2038-2106 times (base bit 31 set, epoch 1) round-trip;
+/// taking `secs >> 32` unsigned instead clamped the first and decoded the
+/// second as ~1901.
 ///
 /// Nanoseconds must be in `[0, 999_999_999]`. Values exceeding this range
 /// are clamped to prevent bit-shift overflow.
 #[must_use]
-pub fn encode_extra_timestamp(secs: u64, nsec: u32) -> u32 {
-    let epoch = ((secs >> 32) & 0x3) as u32; // upper 2 bits of seconds
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn encode_extra_timestamp(secs: i64, nsec: u32) -> u32 {
+    let epoch = ((secs.wrapping_sub(i64::from(secs as i32)) >> 32) & 0x3) as u32;
     // Clamp nsec to valid range to prevent bit-shift overflow.
     // Max valid: 999_999_999 << 2 = 3_999_999_996, fits in u32.
     let clamped_nsec = nsec.min(999_999_999);
@@ -1250,20 +1257,40 @@ pub fn encode_extra_timestamp(secs: u64, nsec: u32) -> u32 {
     epoch | nsec_bits
 }
 
-/// Touch atime on an inode.
-#[allow(clippy::cast_possible_truncation)]
-pub fn touch_atime(inode: &mut Ext4Inode, secs: u64, nsec: u32) {
-    inode.atime = secs as u32; // lower 32 bits per ext4 spec
+/// "Now" seconds (always after 1970) as the signed seconds the encoder takes.
+fn now_secs_signed(secs: u64) -> i64 {
+    i64::try_from(secs).unwrap_or(i64::MAX)
+}
+
+/// Set atime to an arbitrary (possibly pre-1970) time.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn set_atime(inode: &mut Ext4Inode, secs: i64, nsec: u32) {
+    inode.atime = secs as u32; // low 32 bits per ext4 spec; readers sign-extend
     inode.atime_extra = encode_extra_timestamp(secs, nsec);
+}
+
+/// Set mtime to an arbitrary (possibly pre-1970) time and bump the NFS
+/// version counter; the caller stamps ctime.
+#[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+pub fn set_mtime(inode: &mut Ext4Inode, secs: i64, nsec: u32) {
+    inode.mtime = secs as u32;
+    inode.mtime_extra = encode_extra_timestamp(secs, nsec);
+    bump_inode_version(inode);
+}
+
+/// Touch atime on an inode.
+pub fn touch_atime(inode: &mut Ext4Inode, secs: u64, nsec: u32) {
+    set_atime(inode, now_secs_signed(secs), nsec);
 }
 
 /// Touch mtime and ctime on an inode, and bump the NFS version counter.
 #[allow(clippy::cast_possible_truncation)]
 pub fn touch_mtime_ctime(inode: &mut Ext4Inode, secs: u64, nsec: u32) {
+    let signed = now_secs_signed(secs);
     inode.mtime = secs as u32;
-    inode.mtime_extra = encode_extra_timestamp(secs, nsec);
+    inode.mtime_extra = encode_extra_timestamp(signed, nsec);
     inode.ctime = secs as u32;
-    inode.ctime_extra = encode_extra_timestamp(secs, nsec);
+    inode.ctime_extra = encode_extra_timestamp(signed, nsec);
     bump_inode_version(inode);
 }
 
@@ -1284,7 +1311,7 @@ pub fn bump_inode_version(inode: &mut Ext4Inode) {
 #[allow(clippy::cast_possible_truncation)]
 pub fn touch_ctime(inode: &mut Ext4Inode, secs: u64, nsec: u32) {
     inode.ctime = secs as u32;
-    inode.ctime_extra = encode_extra_timestamp(secs, nsec);
+    inode.ctime_extra = encode_extra_timestamp(now_secs_signed(secs), nsec);
     bump_inode_version(inode);
 }
 
@@ -1618,6 +1645,32 @@ mod tests {
         );
     }
 
+    /// Signed times round-trip through the encoder and the sign-extending
+    /// decoder (`Ext4Inode::*_full`, the kernel's rule): pre-1970 times
+    /// (xfstests generic/258) and 2038-2106 times, where the base field's
+    /// bit 31 is set and the epoch must be 1, not 0.
+    #[test]
+    fn signed_timestamps_round_trip_like_the_kernel() {
+        let year = 365 * 86_400_i64;
+        for secs in [
+            -1,
+            -10 * year,
+            -(1_i64 << 31),
+            0,
+            i64::from(i32::MAX),
+            i64::from(i32::MAX) + 1,
+            (1_i64 << 32) - 1,
+            1_i64 << 32,
+            (3_i64 << 32) + 12_345,
+        ] {
+            let mut inode = representative_inode();
+            set_atime(&mut inode, secs, 7);
+            set_mtime(&mut inode, secs, 9);
+            assert_eq!(inode.atime_full(), (secs, 7), "atime {secs}");
+            assert_eq!(inode.mtime_full(), (secs, 9), "mtime {secs}");
+        }
+    }
+
     fn representative_inode() -> Ext4Inode {
         Ext4Inode {
             mode: 0o100_755,
@@ -1634,11 +1687,11 @@ mod tests {
             ctime: 1_700_000_001,
             mtime: 1_700_000_002,
             dtime: 0,
-            atime_extra: encode_extra_timestamp(u64::from(u32::MAX) + 2, 123_456_789),
-            ctime_extra: encode_extra_timestamp(u64::from(u32::MAX) + 1, 222_222_222),
-            mtime_extra: encode_extra_timestamp(u64::from(u32::MAX), 333_333_333),
+            atime_extra: encode_extra_timestamp(i64::from(u32::MAX) + 2, 123_456_789),
+            ctime_extra: encode_extra_timestamp(i64::from(u32::MAX) + 1, 222_222_222),
+            mtime_extra: encode_extra_timestamp(i64::from(u32::MAX), 333_333_333),
             crtime: 1_650_000_000,
-            crtime_extra: encode_extra_timestamp(u64::from(u32::MAX) + 3, 444_444_444),
+            crtime_extra: encode_extra_timestamp(i64::from(u32::MAX) + 3, 444_444_444),
             extra_isize: 32,
             checksum: 0,
             version_hi: 9,
@@ -1695,7 +1748,9 @@ mod tests {
         "encoded_timestamps\n",
         "  atime_extra=0x1d6f3455\n",
         "  ctime_extra=0x34fb5e39\n",
-        "  mtime_extra=0x4f790d54\n",
+        // mtime = u32::MAX s (2106): the base field reads back as -1, so the
+        // kernel encodes epoch 1 (…55), not the epoch-0 …54 this used to pin.
+        "  mtime_extra=0x4f790d55\n",
         "  crtime_extra=0x69f6bc71\n",
         "serialized_fields\n",
         "  mode=0x81ed\n",
@@ -1712,8 +1767,8 @@ mod tests {
         "  projid=0x55667788\n",
         "  extent_prefix=[00, 01, 02, 03, 04, 05, 06, 07]\n",
         "checksum\n",
-        "  lo=0x39ca\n",
-        "  hi=0xd38c"
+        "  lo=0x5958\n",
+        "  hi=0xdeb7"
     );
 
     fn representative_inode_golden_contract_actual() -> String {
@@ -2670,7 +2725,7 @@ mod tests {
             (1_u64 << 33, 2_u32),           // upper bits = 0b10
             ((1_u64 << 33) | (1 << 32), 3), // upper bits = 0b11
         ] {
-            let extra = encode_extra_timestamp(secs, 0);
+            let extra = encode_extra_timestamp(i64::try_from(secs).unwrap(), 0);
             assert_eq!(
                 extra & 0x3,
                 expected_epoch,
@@ -2682,7 +2737,7 @@ mod tests {
         // (c) Non-overlap invariant: nsec must NOT touch the low 2
         // bits, AND epoch must NOT touch bits 2..32. Test by
         // combining a non-trivial nsec with a non-trivial epoch.
-        let extra = encode_extra_timestamp((1_u64 << 33) | (1 << 32), 999_999_999);
+        let extra = encode_extra_timestamp((1_i64 << 33) | (1 << 32), 999_999_999);
         assert_eq!(extra & 0x3, 3, "epoch=3 (bits 0..2)");
         assert_eq!(extra >> 2, 999_999_999, "nsec=999_999_999 (bits 2..32)");
 
@@ -3115,20 +3170,20 @@ mod tests {
     fn encode_extra_timestamp_epoch_extension() {
         // Timestamp at 2^32 (epoch 1): after Feb 2106.
         let secs: u64 = 1 << 32; // 4_294_967_296
-        let extra = encode_extra_timestamp(secs, 0);
+        let extra = encode_extra_timestamp(i64::try_from(secs).unwrap(), 0);
         // Epoch bits (bits 0-1) should be 1, nsec bits should be 0.
         assert_eq!(extra & 0x3, 1);
         assert_eq!(extra >> 2, 0);
 
         // Timestamp at 2^33 (epoch 2).
         let secs: u64 = 1 << 33;
-        let extra = encode_extra_timestamp(secs, 123_456_788);
+        let extra = encode_extra_timestamp(i64::try_from(secs).unwrap(), 123_456_788);
         assert_eq!(extra & 0x3, 2);
         assert_eq!(extra >> 2, 123_456_788);
 
         // Timestamp at 3 * 2^32 (epoch 3).
         let secs: u64 = 3 << 32;
-        let extra = encode_extra_timestamp(secs, 0);
+        let extra = encode_extra_timestamp(i64::try_from(secs).unwrap(), 0);
         assert_eq!(extra & 0x3, 3);
     }
 
@@ -4145,7 +4200,7 @@ mod tests {
     fn encode_extra_timestamp_epoch_activates_above_u32_max() {
         // Seconds just above u32::MAX → epoch bits should be 1.
         let secs = u64::from(u32::MAX) + 1; // 0x1_0000_0000
-        let extra = encode_extra_timestamp(secs, 0);
+        let extra = encode_extra_timestamp(i64::try_from(secs).unwrap(), 0);
         let epoch = extra & 0x3;
         assert_eq!(epoch, 1, "epoch extension should be 1 for secs > u32::MAX");
     }
@@ -4164,15 +4219,20 @@ mod tests {
     proptest! {
         #![proptest_config(ProptestConfig::with_cases(128))]
 
-        /// encode_extra_timestamp preserves epoch bits (lower 2 bits of secs >> 32).
+        /// The epoch is what the sign-extending decoder must add back to the
+        /// low 32 bits (kernel `ext4_encode_extra_time`), so every time ext4
+        /// can represent — 1901-12-13 through 2446-05-10 — round-trips. The
+        /// old `secs >> 32` rule failed for every base with bit 31 set.
         #[test]
         fn proptest_encode_extra_timestamp_epoch_bits(
-            secs in 0_u64..=0x3_FFFF_FFFF_u64,
+            secs in -(1_i64 << 31)..(3_i64 << 32) + (1_i64 << 31),
             nsec in 0_u32..1_000_000_000,
         ) {
             let extra = encode_extra_timestamp(secs, nsec);
-            let epoch = ((secs >> 32) & 0x3) as u32;
-            prop_assert_eq!(extra & 0x3, epoch, "epoch bits mismatch");
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let base = secs as u32;
+            let decoded = i64::from(base.cast_signed()) + (i64::from(extra & 0x3) << 32);
+            prop_assert_eq!(decoded, secs, "sign-extended base + epoch must give back secs");
         }
 
         /// encode_extra_timestamp preserves nanoseconds in bits 2-31.
@@ -4181,7 +4241,7 @@ mod tests {
             secs in 0_u64..=0x3_FFFF_FFFF_u64,
             nsec in 0_u32..1_000_000_000,
         ) {
-            let extra = encode_extra_timestamp(secs, nsec);
+            let extra = encode_extra_timestamp(i64::try_from(secs).unwrap(), nsec);
             let decoded_nsec = extra >> 2;
             prop_assert_eq!(decoded_nsec, nsec, "nanoseconds not preserved");
         }
@@ -4199,10 +4259,13 @@ mod tests {
             secs in 0_u64..=0x3_FFFF_FFFF_u64,
             nsec in 0_u32..1_000_000_000,
         ) {
-            let extra = encode_extra_timestamp(secs, nsec);
+            let extra = encode_extra_timestamp(i64::try_from(secs).unwrap(), nsec);
             let decoded_nsec = Ext4Inode::extra_nsec(extra);
             let decoded_epoch = Ext4Inode::extra_epoch(extra);
-            let expected_epoch = ((secs >> 32) & 0x3) as u32;
+            // Kernel rule: the epoch compensates for the decoder sign-extending
+            // the low 32 bits, i.e. it is one higher when bit 31 is set.
+            #[allow(clippy::cast_possible_truncation)]
+            let expected_epoch = (((secs >> 32) + u64::from((secs as u32) >> 31)) & 0x3) as u32;
             prop_assert_eq!(
                 decoded_nsec, nsec,
                 "ffs_inode encoder ↔ ffs_ondisk Ext4Inode::extra_nsec must agree on nsec"
@@ -4512,7 +4575,11 @@ mod tests {
             prop_assert_eq!(inode.mtime, init_mtime, "mtime must not change");
             prop_assert_eq!(inode.mtime_extra, init_mtime_extra, "mtime_extra must not change");
             prop_assert_eq!(inode.ctime, secs as u32, "ctime lower 32 bits");
-            prop_assert_eq!(inode.ctime_extra, encode_extra_timestamp(secs, nsec), "ctime_extra");
+            prop_assert_eq!(
+                inode.ctime_extra,
+                encode_extra_timestamp(i64::try_from(secs).unwrap(), nsec),
+                "ctime_extra"
+            );
         }
 
         /// serialize → parse roundtrip preserves 48-bit file_acl field.
@@ -4973,20 +5040,20 @@ mod tests {
         assert_eq!(extra & 0x3, 0); // epoch = 0
 
         // Epoch extension = 1 (seconds bit 32 set).
-        let extra = encode_extra_timestamp(1u64 << 32, 0);
+        let extra = encode_extra_timestamp(1_i64 << 32, 0);
         assert_eq!(extra & 0x3, 1); // epoch bits
         assert_eq!(extra >> 2, 0); // no nsec
 
         // Epoch extension = 2.
-        let extra = encode_extra_timestamp(2u64 << 32, 0);
+        let extra = encode_extra_timestamp(2_i64 << 32, 0);
         assert_eq!(extra & 0x3, 2);
 
         // Epoch extension = 3.
-        let extra = encode_extra_timestamp(3u64 << 32, 0);
+        let extra = encode_extra_timestamp(3_i64 << 32, 0);
         assert_eq!(extra & 0x3, 3);
 
         // Combined.
-        let extra = encode_extra_timestamp((1u64 << 32) + 100, 500_000);
+        let extra = encode_extra_timestamp((1_i64 << 32) + 100, 500_000);
         assert_eq!(extra & 0x3, 1); // epoch
         assert_eq!(extra >> 2, 500_000); // nsec
     }
@@ -5346,7 +5413,7 @@ mod tests {
         assert_eq!(inode.mtime, now as u32);
         assert_eq!(inode.crtime, now as u32);
         // Extra timestamp should encode the nsec.
-        let expected_extra = encode_extra_timestamp(now, nsec);
+        let expected_extra = encode_extra_timestamp(i64::try_from(now).unwrap(), nsec);
         assert_eq!(inode.atime_extra, expected_extra);
         assert_eq!(inode.ctime_extra, expected_extra);
         assert_eq!(inode.mtime_extra, expected_extra);
@@ -5414,7 +5481,7 @@ mod tests {
         // Seconds > 2^32: the low 2 bits of the extra field store epoch extension.
         let secs = (1_u64 << 33) + 42; // epoch bit 1 set
         let nsec = 500_000_000; // 0.5s
-        let extra = encode_extra_timestamp(secs, nsec);
+        let extra = encode_extra_timestamp(i64::try_from(secs).unwrap(), nsec);
         // epoch extension = (secs >> 32) & 0x3 = 2
         let epoch_bits = extra & 0x3;
         assert_eq!(epoch_bits, 2, "epoch extension should be 2");
@@ -5787,7 +5854,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(inode.atime, 1); // low 32 bits of 0x1_0000_0001
-        let expected_extra = encode_extra_timestamp(future_secs, nsec);
+        let expected_extra = encode_extra_timestamp(i64::try_from(future_secs).unwrap(), nsec);
         assert_eq!(inode.atime_extra, expected_extra);
         assert_eq!(inode.ctime_extra, expected_extra);
         assert_eq!(inode.mtime_extra, expected_extra);
@@ -5873,11 +5940,13 @@ mod tests {
             number: 0,
         };
 
-        let future_secs: u64 = 0x3_FFFF_FFFE; // epoch bits = 3 (max)
+        // The latest time ext4 can represent (2446-05-10): epoch 3 plus the
+        // largest base the decoder does not sign-extend negative.
+        let future_secs: u64 = (3 << 32) + 0x7FFF_FFFF;
         touch_mtime_ctime(&mut inode, future_secs, 999_999_999);
 
-        assert_eq!(inode.mtime, 0xFFFF_FFFE);
-        assert_eq!(inode.ctime, 0xFFFF_FFFE);
+        assert_eq!(inode.mtime, 0x7FFF_FFFF);
+        assert_eq!(inode.ctime, 0x7FFF_FFFF);
         let extra = inode.mtime_extra;
         assert_eq!(extra & 0x3, 3, "epoch extension should be 3 (max)");
         assert_eq!(extra >> 2, 999_999_999, "max nsec preserved");
