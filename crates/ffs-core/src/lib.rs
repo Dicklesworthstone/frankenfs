@@ -29276,8 +29276,9 @@ impl OpenFs {
                     // ZERO_RANGE actually reserves the space the kernel promises.
                     let mut remaining = mapping.count;
                     let mut logical = mapping.logical_start;
+                    let mut want = MAX_EXTENT_COUNT;
                     while remaining > 0 {
-                        let chunk = remaining.min(MAX_EXTENT_COUNT);
+                        let chunk = remaining.min(want);
                         let hint = self.numa_allocation_hint(
                             &alloc.geo,
                             AllocHint {
@@ -29287,7 +29288,7 @@ impl OpenFs {
                             "ext4_fallocate",
                             Some(ino),
                         );
-                        let alloc_mapping = {
+                        let attempt = {
                             let Ext4AllocState {
                                 geo,
                                 groups,
@@ -29312,7 +29313,7 @@ impl OpenFs {
                                         ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
                                         generation: inode.generation,
                                     },
-                                )?
+                                )
                             } else {
                                 ffs_extent::allocate_unwritten_extent(
                                     cx,
@@ -29328,8 +29329,18 @@ impl OpenFs {
                                         ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
                                         generation: inode.generation,
                                     },
-                                )?
+                                )
                             }
+                        };
+                        let alloc_mapping = match attempt {
+                            Ok(mapping) => mapping,
+                            // Fragmented, not full: take a smaller extent
+                            // (see the preallocation loop below).
+                            Err(FfsError::NoSpace) if chunk > 1 => {
+                                want = chunk / 2;
+                                continue;
+                            }
+                            Err(err) => return Err(err),
                         };
                         self.extent_cache.invalidate_all();
                         self.invalidate_all_ext4_write_extent_snapshots();
@@ -29337,8 +29348,8 @@ impl OpenFs {
                         goal_block = Some(BlockNumber(
                             alloc_mapping.physical_start + u64::from(alloc_mapping.count),
                         ));
-                        logical = logical.saturating_add(chunk);
-                        remaining -= chunk;
+                        logical = logical.saturating_add(alloc_mapping.count);
+                        remaining -= alloc_mapping.count;
                     }
                     continue;
                 }
@@ -29448,8 +29459,9 @@ impl OpenFs {
 
                 let mut remaining = mapping.count;
                 let mut logical = mapping.logical_start;
+                let mut want = MAX_EXTENT_COUNT;
                 while remaining > 0 {
-                    let chunk = remaining.min(MAX_EXTENT_COUNT);
+                    let chunk = remaining.min(want);
                     let hint = self.numa_allocation_hint(
                         &alloc.geo,
                         AllocHint {
@@ -29459,7 +29471,7 @@ impl OpenFs {
                         "ext4_fallocate",
                         Some(ino),
                     );
-                    let alloc_mapping = {
+                    let attempt = {
                         let Ext4AllocState {
                             geo,
                             groups,
@@ -29484,7 +29496,7 @@ impl OpenFs {
                                     ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
                                     generation: inode.generation,
                                 },
-                            )?
+                            )
                         } else {
                             ffs_extent::allocate_unwritten_extent(
                                 cx,
@@ -29500,8 +29512,21 @@ impl OpenFs {
                                     ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
                                     generation: inode.generation,
                                 },
-                            )?
+                            )
                         }
+                    };
+                    let alloc_mapping = match attempt {
+                        Ok(mapping) => mapping,
+                        // No group holds `chunk` contiguous free blocks:
+                        // fragmented, not full. Ask for less, as kernel ext4
+                        // takes whatever extent it can find (xfstests
+                        // generic/213 failed a 1 GiB fallocate with ~1.5 GiB
+                        // free once every group held some data).
+                        Err(FfsError::NoSpace) if chunk > 1 => {
+                            want = chunk / 2;
+                            continue;
+                        }
+                        Err(err) => return Err(err),
                     };
                     self.extent_cache.invalidate_all();
                     self.invalidate_all_ext4_write_extent_snapshots();
@@ -29510,8 +29535,8 @@ impl OpenFs {
                     goal_block = Some(BlockNumber(
                         alloc_mapping.physical_start + u64::from(alloc_mapping.count),
                     ));
-                    logical = logical.saturating_add(chunk);
-                    remaining -= chunk;
+                    logical = logical.saturating_add(alloc_mapping.count);
+                    remaining -= alloc_mapping.count;
                 }
             }
 
@@ -33104,60 +33129,96 @@ impl OpenFs {
     }
 
     fn btrfs_insert_prealloc_extent_segment(
+        &self,
         alloc: &mut BtrfsAllocState,
         canonical: u64,
         logical_offset: u64,
         length: u64,
     ) -> ffs_error::Result<u64> {
+        // Kernel btrfs (btrfs_prealloc_file_range) preallocates in extents of
+        // at most 256 MiB and lets each reservation shrink to one sector when
+        // free space is fragmented, growing data chunks from unallocated
+        // device space as writes do. Preallocation used to call `alloc_data`
+        // directly for the whole range: no chunk growth and one extent that
+        // had to fit a single block group, so a 1 GiB fallocate failed ENOSPC
+        // on a device with plenty unallocated (xfstests generic/213).
+        const MAX_PREALLOC_EXTENT: u64 = 256 * 1024 * 1024;
+        // A failure part-way (ENOSPC once the device is really full) removes
+        // the extents this call already placed, so the range stays all-or-
+        // nothing as with a single extent and the caller's nbytes holds.
+        fn undo(alloc: &mut BtrfsAllocState, placed: &[(BtrfsKey, u64, u64)]) {
+            for (key, bytenr, size) in placed.iter().rev() {
+                let _ = alloc.fs_tree.delete(key);
+                let _ = alloc.extent_alloc.free_extent(*bytenr, *size, false);
+            }
+        }
+
         if length == 0 {
             return Ok(0);
         }
-
         let sectorsize = u64::from(alloc.sectorsize);
-        let alloc_size = length
-            .checked_add(sectorsize - 1)
-            .ok_or_else(|| FfsError::InvalidGeometry("prealloc length overflow".into()))?
-            & !(sectorsize - 1);
-        let allocation = alloc
-            .extent_alloc
-            .alloc_data(alloc_size)
-            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        let mut placed: Vec<(BtrfsKey, u64, u64)> = Vec::new();
+        let mut done = 0_u64;
+        let mut want = MAX_PREALLOC_EXTENT;
+        while done < length {
+            let piece = (length - done).min(want);
+            let alloc_size = piece
+                .checked_add(sectorsize - 1)
+                .ok_or_else(|| FfsError::InvalidGeometry("prealloc length overflow".into()))?
+                & !(sectorsize - 1);
+            let allocation = match self.btrfs_alloc_data_with_growth(alloc, alloc_size) {
+                Ok(allocation) => allocation,
+                Err(FfsError::NoSpace) if alloc_size > sectorsize => {
+                    want = ((alloc_size / 2) & !(sectorsize - 1)).max(sectorsize);
+                    continue;
+                }
+                Err(e) => {
+                    undo(alloc, &placed);
+                    return Err(e);
+                }
+            };
+            let piece_offset = logical_offset + done;
 
-        let extent = BtrfsExtentData::Regular {
-            generation: alloc.generation,
-            ram_bytes: length,
-            extent_type: BTRFS_FILE_EXTENT_PREALLOC,
-            compression: 0,
-            disk_bytenr: allocation.bytenr,
-            disk_num_bytes: alloc_size,
-            extent_offset: 0,
-            num_bytes: length,
-        };
-        let extent_key = BtrfsKey {
-            objectid: canonical,
-            item_type: BTRFS_ITEM_EXTENT_DATA,
-            offset: logical_offset,
-        };
-        if let Err(e) = alloc.fs_tree.insert(extent_key, &extent.to_bytes()) {
-            let _ = alloc
-                .extent_alloc
-                .free_extent(allocation.bytenr, alloc_size, false);
-            return Err(btrfs_mutation_to_ffs(&e));
-        }
-        // A prealloc extent is still a data extent: register its EXTENT_ITEM +
-        // EXTENT_DATA_REF backref (bd-x3fcu).
-        if let Err(e) = Self::btrfs_register_data_extent_backref(
-            alloc,
-            allocation.bytenr,
-            alloc_size,
-            canonical,
-            logical_offset,
-        ) {
-            let _ = alloc.fs_tree.delete(&extent_key);
-            let _ = alloc
-                .extent_alloc
-                .free_extent(allocation.bytenr, alloc_size, false);
-            return Err(e);
+            let extent = BtrfsExtentData::Regular {
+                generation: alloc.generation,
+                ram_bytes: piece,
+                extent_type: BTRFS_FILE_EXTENT_PREALLOC,
+                compression: 0,
+                disk_bytenr: allocation.bytenr,
+                disk_num_bytes: alloc_size,
+                extent_offset: 0,
+                num_bytes: piece,
+            };
+            let extent_key = BtrfsKey {
+                objectid: canonical,
+                item_type: BTRFS_ITEM_EXTENT_DATA,
+                offset: piece_offset,
+            };
+            if let Err(e) = alloc.fs_tree.insert(extent_key, &extent.to_bytes()) {
+                let _ = alloc
+                    .extent_alloc
+                    .free_extent(allocation.bytenr, alloc_size, false);
+                undo(alloc, &placed);
+                return Err(btrfs_mutation_to_ffs(&e));
+            }
+            // A prealloc extent is still a data extent: register its
+            // EXTENT_ITEM + EXTENT_DATA_REF backref (bd-x3fcu).
+            if let Err(e) = Self::btrfs_register_data_extent_backref(
+                alloc,
+                allocation.bytenr,
+                alloc_size,
+                canonical,
+                piece_offset,
+            ) {
+                let _ = alloc.fs_tree.delete(&extent_key);
+                let _ = alloc
+                    .extent_alloc
+                    .free_extent(allocation.bytenr, alloc_size, false);
+                undo(alloc, &placed);
+                return Err(e);
+            }
+            placed.push((extent_key, allocation.bytenr, alloc_size));
+            done += piece;
         }
         Ok(length)
     }
@@ -33953,14 +34014,14 @@ impl OpenFs {
                     continue;
                 }
             } else if is_prealloc {
-                let left_nbytes = Self::btrfs_insert_prealloc_extent_segment(
+                let left_nbytes = self.btrfs_insert_prealloc_extent_segment(
                     alloc,
                     canonical,
                     key.offset,
                     overlap_start - key.offset,
                 )?;
                 Self::btrfs_accumulate_nbytes_delta(&mut nbytes_delta, i128::from(left_nbytes))?;
-                let right_nbytes = Self::btrfs_insert_prealloc_extent_segment(
+                let right_nbytes = self.btrfs_insert_prealloc_extent_segment(
                     alloc,
                     canonical,
                     overlap_end,
@@ -34343,7 +34404,7 @@ impl OpenFs {
                     logical_offset,
                     length,
                 } => {
-                    Self::btrfs_insert_prealloc_extent_segment(
+                    self.btrfs_insert_prealloc_extent_segment(
                         alloc,
                         canonical,
                         logical_offset,
@@ -40448,7 +40509,7 @@ impl OpenFs {
             }
 
             for (gap_offset, gap_len) in prealloc_gaps {
-                Self::btrfs_insert_prealloc_extent_segment(
+                self.btrfs_insert_prealloc_extent_segment(
                     &mut alloc, canonical, gap_offset, gap_len,
                 )?;
             }
@@ -82401,6 +82462,57 @@ mod tests {
         assert!(data.iter().all(|&b| b == 0), "prealloc should be zeroed");
     }
 
+    /// xfstests generic/213: `df` showed ~1.5 GiB free yet a 1 GiB fallocate
+    /// failed ENOSPC, because preallocation asked the allocator for 32767
+    /// contiguous blocks and no group had such a run. Groups of 1024 blocks
+    /// make that true from mkfs on: preallocating a range several groups long
+    /// must take smaller extents instead of failing.
+    #[test]
+    fn fallocate_larger_than_any_free_run_takes_smaller_extents() {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let image = tmp.path().join("small_groups.ext4");
+        let f = std::fs::File::create(&image).expect("create image");
+        f.set_len(16 * 1024 * 1024).expect("set image size");
+        drop(f);
+        let made = std::process::Command::new("mkfs.ext4")
+            .args([
+                "-F",
+                "-q",
+                "-b",
+                "1024",
+                "-g",
+                "1024",
+                "-E",
+                "root_owner=0:0",
+            ])
+            .arg(&image)
+            .status();
+        if !matches!(made, Ok(s) if s.success()) {
+            return; // mkfs.ext4 unavailable on this host — skip like sibling tests.
+        }
+        let cx = Cx::for_testing();
+        let dev = TestDevice::from_vec(std::fs::read(&image).expect("read image"));
+        let opts = OpenOptions {
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Apply,
+            ..OpenOptions::default()
+        };
+        let mut fs = OpenFs::from_device(&cx, Box::new(dev), &opts).expect("open ext4");
+        fs.enable_writes(&cx).expect("enable writes");
+
+        let attr = fs
+            .create(&cx, InodeNumber(2), OsStr::new("big.bin"), 0o644, 0, 0)
+            .expect("create");
+        let len: u64 = 4 * 1024 * 1024; // 4096 blocks, four groups' worth
+        fs.fallocate(&cx, attr.ino, 0, len, 0)
+            .expect("fallocate spanning several groups");
+        let after = fs.getattr(&cx, attr.ino).expect("getattr");
+        assert_eq!(after.size, len);
+        // st_blocks counts 512-byte sectors; extent-tree blocks may add more.
+        assert!(after.blocks >= len / 512, "blocks={}", after.blocks);
+        let data = fs.read(&cx, attr.ino, len - 4096, 4096).expect("read tail");
+        assert!(data.iter().all(|&b| b == 0));
+    }
+
     #[test]
     fn write_fallocate_keep_size_does_not_extend_size() {
         let Some(fs) = open_writable_ext4() else {
@@ -90147,6 +90259,61 @@ mod tests {
             ok,
             "btrfs check must accept a FrankenFS fallocate-churned file:\n{output}"
         );
+    }
+
+    /// xfstests generic/213: preallocation took ONE extent for the whole
+    /// range, so a 1 GiB fallocate needed 1 GiB contiguous in one data block
+    /// group and failed ENOSPC with ~1.5 GiB free. mkfs.btrfs starts with an
+    /// 8 MiB data group; a 48 MiB fallocate on a used filesystem must now be
+    /// split into extents that fit, and an impossible one must fail ENOSPC
+    /// leaving free space and the trees exactly as before.
+    #[test]
+    fn btrfs_fallocate_larger_than_any_free_run_takes_smaller_extents() {
+        let Some((fs, dev, _tmp, image)) = open_writable_btrfs_mkfs(256) else {
+            return; // btrfs-progs unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let small = fs
+            .create(&cx, root, OsStr::new("small.bin"), 0o644, 0, 0)
+            .expect("create small");
+        fs.write(&cx, small.ino, 0, &[0x5a_u8; 3 * 4096])
+            .expect("write small");
+
+        let big = fs
+            .create(&cx, root, OsStr::new("big.bin"), 0o644, 0, 0)
+            .expect("create big");
+        let len: u64 = 48 * 1024 * 1024;
+        fs.fallocate(&cx, big.ino, 0, len, 0)
+            .expect("fallocate larger than the data block group");
+        let attr = fs.getattr(&cx, big.ino).expect("getattr");
+        assert_eq!(attr.size, len);
+        assert_eq!(attr.blocks, len / 512);
+        let tail = fs.read(&cx, big.ino, len - 4096, 4096).expect("read tail");
+        assert!(tail.iter().all(|&b| b == 0));
+
+        let free_before = fs.statfs(&cx, root).expect("statfs").blocks_free;
+        let huge = fs
+            .create(&cx, root, OsStr::new("huge.bin"), 0o644, 0, 0)
+            .expect("create huge");
+        let err = fs
+            .fallocate(&cx, huge.ino, 0, 1024 * 1024 * 1024, 0)
+            .expect_err("1 GiB cannot fit in a 256 MiB filesystem");
+        assert_eq!(err.to_errno(), libc::ENOSPC, "{err:?}");
+        assert_eq!(fs.getattr(&cx, huge.ino).expect("getattr huge").blocks, 0);
+        assert_eq!(
+            fs.statfs(&cx, root).expect("statfs").blocks_free,
+            free_before
+        );
+
+        let _ = fs.flush_mvcc_to_device(&cx);
+        fs.btrfs_full_transaction_commit(&cx, "fallocate-split-check")
+            .expect("btrfs full transaction commit");
+        std::fs::write(&image, dev.snapshot_bytes()).expect("write modified image");
+        let Some((ok, output)) = run_btrfs_check(&image) else {
+            return; // btrfs check tool unavailable
+        };
+        assert!(ok, "btrfs check must accept split preallocation:\n{output}");
     }
 
     /// bd-x3fcu / bd-4cxkd: a file whose DATA is written + committed by FrankenFS
