@@ -13739,6 +13739,34 @@ fn btrfs_fuse_rename() {
     });
 }
 
+/// xfstests generic/736: renaming every entry as it is listed gives each one a
+/// new, higher DIR_INDEX; the listing must still end, having returned each name
+/// about once, as the kernel's btrfs readdir does.
+#[test]
+fn btrfs_fuse_readdir_while_renaming_each_entry_ends() {
+    with_btrfs_rw_mount(|mnt| {
+        const FILES: usize = 2000;
+        let dir = mnt.join("renames");
+        fs::create_dir(&dir).expect("mkdir");
+        for i in 1..=FILES {
+            fs::write(dir.join(i.to_string()), b"").expect("create");
+        }
+        let mut seen = 0_usize;
+        for entry in fs::read_dir(&dir).expect("opendir") {
+            let name = entry.expect("readdir").file_name();
+            seen += 1;
+            assert!(
+                seen <= 3 * FILES,
+                "listing did not end: {seen} entries for {FILES} files"
+            );
+            fs::rename(dir.join(&name), dir.join("TEMPFILE")).expect("rename away");
+            fs::rename(dir.join("TEMPFILE"), dir.join(&name)).expect("rename back");
+        }
+        assert!(seen >= FILES, "only {seen} of {FILES} entries listed");
+        assert_eq!(fs::read_dir(&dir).expect("relist").count(), FILES);
+    });
+}
+
 #[test]
 fn btrfs_fuse_rename_same_name_is_noop() {
     with_btrfs_rw_mount(|mnt| {
