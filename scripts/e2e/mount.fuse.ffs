@@ -27,6 +27,15 @@ while [[ $# -gt 0 ]]; do
     esac
 done
 
+# A remount changes flags on the live mount; starting a second daemon would
+# stack a fresh read-write mount on top (xfstests generic/306's remount,ro
+# then let a create succeed). The kernel handles it: FUSE accepts
+# MS_REMOUNT|MS_RDONLY, after which the VFS refuses writes with EROFS.
+# `-i` keeps mount(8) from calling this helper again.
+if [[ ,$opts, == *,remount,* ]]; then
+    exec mount -i -o "$opts" "$dir"
+fi
+
 args=(mount --rw --fsname "$image")
 IFS=, read -ra parts <<<"$opts"
 for part in "${parts[@]}"; do
