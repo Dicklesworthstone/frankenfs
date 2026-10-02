@@ -29543,8 +29543,15 @@ impl OpenFs {
     /// The largest ext4 file size addressable by the 32-bit logical block
     /// numbering: every byte offset must map to a block index <= u32::MAX, so
     /// the cap is `2^32 * block_size` (16 TiB at 4 KiB blocks).
+    /// s_maxbytes for an extent-mapped file: `((1 << 32) - 1) << blkbits`, as
+    /// kernel `ext4_max_size` computes it. The kernel lowers it by one block so
+    /// a 32-bit `ee_block` plus `ee_len` can always describe the last extent;
+    /// block 2^32-1 itself is never addressable. Allowing it (2^32 blocks)
+    /// let a write reach that block and overflow a `u32` end-of-run sum
+    /// (xfstests generic/308: a panic that, unwinding, wedged the mutation
+    /// gate and hung every later fsync).
     fn ext4_max_file_size(block_size: u64) -> u64 {
-        (1_u64 << 32).saturating_mul(block_size)
+        ((1_u64 << 32) - 1).saturating_mul(block_size)
     }
 
     /// Reject a write/fallocate/truncate that would extend a file past the
@@ -29870,7 +29877,10 @@ impl OpenFs {
                     Self::set_extent_root(&mut inode, &root_bytes);
                     cached_extents = None; // tree mutated by allocate_extent
                     inode.blocks = blocks_after_alloc;
-                    fresh_run = Some((logical_block, logical_block + mapping.count));
+                    let run_end = logical_block.checked_add(mapping.count).ok_or_else(|| {
+                        FfsError::Io(std::io::Error::from_raw_os_error(libc::EFBIG))
+                    })?;
+                    fresh_run = Some((logical_block, run_end));
                     (BlockNumber(mapping.physical_start), true, false)
                 }
             };
@@ -78738,17 +78748,44 @@ mod tests {
 
     #[test]
     fn ext4_max_file_size_scales_with_block_size_and_rejects_above() {
-        // The extent tree addresses 2^32 logical blocks, so the max file size
-        // is 2^32 * block_size: 4 TiB / 8 TiB / 16 TiB for 1K / 2K / 4K blocks.
-        assert_eq!(OpenFs::ext4_max_file_size(1024), 1_u64 << 42);
-        assert_eq!(OpenFs::ext4_max_file_size(2048), 1_u64 << 43);
-        assert_eq!(OpenFs::ext4_max_file_size(4096), 1_u64 << 44);
+        // Kernel ext4_max_size: ((1 << 32) - 1) << blkbits, one block short
+        // of 2^32 blocks (4 TiB / 8 TiB / 16 TiB minus one block).
+        assert_eq!(OpenFs::ext4_max_file_size(1024), (1_u64 << 42) - 1024);
+        assert_eq!(OpenFs::ext4_max_file_size(2048), (1_u64 << 43) - 2048);
+        assert_eq!(OpenFs::ext4_max_file_size(4096), (1_u64 << 44) - 4096);
 
         // A file ending exactly at the max is allowed; one byte over is EFBIG.
         let max = OpenFs::ext4_max_file_size(4096);
         assert!(OpenFs::ext4_reject_oversized_file(max, 4096).is_ok());
         let err = OpenFs::ext4_reject_oversized_file(max + 1, 4096).unwrap_err();
         assert_eq!(err.to_errno(), libc::EFBIG);
+    }
+
+    /// xfstests generic/308: the last addressable block (2^32 - 2) takes a
+    /// write; the next one (2^32 - 1) is EFBIG, not a u32 overflow panic.
+    #[test]
+    fn ext4_write_at_the_last_logical_block_and_one_past_it() {
+        let Some(fs) = open_writable_ext4() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let bs = u64::from(fs.ext4_superblock().expect("sb").block_size);
+        let ino = fs
+            .create(&cx, InodeNumber(2), OsStr::new("edge"), 0o644, 0, 0)
+            .expect("create")
+            .ino;
+        let block = usize::try_from(bs).unwrap();
+        let last = ((1_u64 << 32) - 2) * bs;
+        assert_eq!(
+            fs.write(&cx, ino, last, &vec![0x5A; block])
+                .expect("last block") as usize,
+            block
+        );
+        let err = fs
+            .write(&cx, ino, last + bs, &vec![0x5A; block])
+            .expect_err("block 2^32 - 1 is past s_maxbytes");
+        assert_eq!(err.to_errno(), libc::EFBIG);
+        assert_eq!(fs.getattr(&cx, ino).expect("getattr").size, last + bs);
     }
 
     #[test]
