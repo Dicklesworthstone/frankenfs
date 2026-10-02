@@ -172,6 +172,9 @@ pub struct ReaddirPage {
     entries: Arc<Vec<DirEntry>>,
     start: usize,
     end: usize,
+    /// Cookie of the last entry in the whole listing this page was cut from,
+    /// when the page knows it (see [`Self::end_cookie`]).
+    end_cookie: Option<u64>,
 }
 
 impl ReaddirPage {
@@ -183,6 +186,7 @@ impl ReaddirPage {
             entries: Arc::new(entries),
             start: 0,
             end,
+            end_cookie: None,
         }
     }
 
@@ -191,11 +195,35 @@ impl ReaddirPage {
     pub(crate) fn from_shared(entries: Arc<Vec<DirEntry>>, start: usize, end: usize) -> Self {
         debug_assert!(start <= end);
         debug_assert!(end <= entries.len());
+        let end_cookie = Some(entries.last().map_or(0, |e| e.offset));
         Self {
             entries,
             start,
             end,
+            end_cookie,
         }
+    }
+
+    /// Cookie of the last entry of the whole directory listing, past this
+    /// page's end (`Some(0)` for an empty directory), or `None` when the page
+    /// was built without the full listing.
+    ///
+    /// A directory handle caps later reads at the value its first page
+    /// reported, as the kernel's btrfs readdir caps at the last index present
+    /// at opendir: an entry renamed during the listing gets a new, higher
+    /// cookie, and without the cap a reader that renames each entry it sees
+    /// never reaches the end (xfstests generic/736).
+    #[must_use]
+    pub const fn end_cookie(&self) -> Option<u64> {
+        self.end_cookie
+    }
+
+    /// The same page with `end_cookie` set, for a caller that rebuilds a page
+    /// from a full-listing one.
+    #[must_use]
+    pub const fn with_end_cookie(mut self, end_cookie: Option<u64>) -> Self {
+        self.end_cookie = end_cookie;
+        self
     }
 
     /// Return the visible page slice.

@@ -4185,6 +4185,60 @@ impl AtimeFresh {
     }
 }
 
+/// Directory handles and the end-of-listing cap each one took on its first read.
+///
+/// A listing reads only the entries present when it started (or was rewound):
+/// a read from offset 0 records the cookie of the directory's last entry, and
+/// later reads through the same handle stop there. btrfs gives a renamed entry
+/// a new, higher DIR_INDEX cookie, so a reader that renames every entry it sees
+/// otherwise keeps finding them again past the end and never finishes; the
+/// kernel caps its btrfs readdir at the last index present at opendir for the
+/// same reason (xfstests generic/736). POSIX leaves entries added after
+/// opendir/rewinddir unspecified, so the cap is valid on every format.
+///
+/// Handle 0 is the zero-message opendir handle shared by every listing; it is
+/// never capped.
+#[derive(Default)]
+struct DirHandles {
+    next: std::sync::atomic::AtomicU64,
+    caps: Mutex<std::collections::HashMap<u64, u64>>,
+}
+
+impl DirHandles {
+    fn open(&self) -> u64 {
+        self.next
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_add(1)
+            .max(1)
+    }
+
+    /// How many leading entries of `page`, read at `offset` through `fh`, the
+    /// listing may return.
+    fn visible_len(&self, fh: u64, offset: u64, page: &ffs_core::ReaddirPage) -> usize {
+        if fh == 0 {
+            return page.len();
+        }
+        let mut caps = self.caps.lock().expect("dir handle caps poisoned");
+        if offset == 0 {
+            match page.end_cookie() {
+                Some(cap) => caps.insert(fh, cap),
+                None => caps.remove(&fh),
+            };
+            return page.len();
+        }
+        caps.get(&fh).map_or(page.len(), |&cap| {
+            page.iter().take_while(|entry| entry.offset <= cap).count()
+        })
+    }
+
+    fn release(&self, fh: u64) {
+        self.caps
+            .lock()
+            .expect("dir handle caps poisoned")
+            .remove(&fh);
+    }
+}
+
 #[allow(clippy::struct_excessive_bools)]
 struct FuseInner {
     ops: Arc<dyn FsOps>,
@@ -4229,6 +4283,8 @@ struct FuseInner {
     /// `Clone` — one clone per dispatch worker — and `init` runs on exactly one of
     /// them. A flag on the outer struct would be invisible to every other worker.
     zero_message_opendir: std::sync::atomic::AtomicBool,
+    /// Per-opendir end-of-listing caps (generic/736), see [`DirHandles`].
+    dir_handles: DirHandles,
     /// FUSE_DONT_MASK negotiated (with FUSE_POSIX_ACL, bd-rnwd7): the kernel
     /// sends create modes without the caller's umask, and we apply it unless
     /// the parent directory has a default ACL, which replaces the umask.
@@ -5833,8 +5889,9 @@ impl Filesystem for FrankenFuse {
         // ⛔ DO NOT ADD FUSE_NO_OPEN_SUPPORT HERE. The same trick for FILES looks
         // symmetric and is not, and the asymmetry is in what the reply carries:
         //
-        //   dispatch_opendir  returns (0, 0) — no open flags at all, so handing
-        //                     OPENDIR to the kernel gives up nothing.
+        //   dispatch_opendir  returns no open flags at all, so handing OPENDIR
+        //                     to the kernel gives up only the listing cap
+        //                     (`DirHandles`, generic/736).
         //   kernel_open_flags returns FOPEN_KEEP_CACHE for an ordinary O_RDONLY
         //                     open, which tells the kernel to KEEP its page cache
         //                     for the file across opens.
@@ -6187,8 +6244,9 @@ impl Filesystem for FrankenFuse {
         //
         // Skipping the type check this would otherwise do is not a hole: the
         // kernel already knows the inode's type from the attributes we returned
-        // and does not issue readdir against a non-directory. `releasedir` is
-        // already a no-op here and readdir resolves by inode, so no state is lost.
+        // and does not issue readdir against a non-directory. readdir resolves
+        // by inode; the one thing lost is the per-handle listing cap, since
+        // every listing then shares handle 0 (see `DirHandles`).
         if self
             .inner
             .zero_message_opendir
@@ -6258,7 +6316,7 @@ impl Filesystem for FrankenFuse {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         mut reply: ReplyDirectory,
     ) {
@@ -6285,7 +6343,8 @@ impl Filesystem for FrankenFuse {
                 .readdir(cx, scope, InodeNumber(ino), fs_offset)
         }) {
             Ok(entries) => {
-                for entry in &entries {
+                let visible = self.inner.dir_handles.visible_len(fh, fs_offset, &entries);
+                for entry in entries.iter().take(visible) {
                     #[cfg(unix)]
                     let name = OsStr::from_bytes(&entry.name);
                     #[cfg(not(unix))]
@@ -6338,7 +6397,7 @@ impl Filesystem for FrankenFuse {
         &mut self,
         _req: &Request<'_>,
         ino: u64,
-        _fh: u64,
+        fh: u64,
         offset: i64,
         mut reply: ReplyDirectoryPlus,
     ) {
@@ -6384,7 +6443,8 @@ impl Filesystem for FrankenFuse {
                 // cost is per REPLY rather than per directory entry.
                 let mut census_served: u64 = 0;
                 let mut census_inline: u64 = 0;
-                for (index, entry) in entries.iter().enumerate() {
+                let visible = self.inner.dir_handles.visible_len(fh, fs_offset, &entries);
+                for (index, entry) in entries.iter().take(visible).enumerate() {
                     // bd-xfe7z: time the whole loop body so loop_ns - scope_ns -
                     // reply_ns attributes the 46.2% that is neither the attribute
                     // fetch nor the reply. Declared first so it covers every path
@@ -7359,12 +7419,12 @@ impl Filesystem for FrankenFuse {
         &mut self,
         _req: &Request<'_>,
         _ino: u64,
-        _fh: u64,
+        fh: u64,
         _flags: i32,
         reply: ReplyEmpty,
     ) {
-        // Directory handles are stateless in this adapter, so there is no
-        // backend resource to release.
+        // The handle's only state is its listing cap (see `DirHandles`).
+        self.inner.dir_handles.release(fh);
         reply.ok();
     }
 
@@ -8788,6 +8848,7 @@ mod tests {
             inode_locks: Arc::new(FuseInodeLocks::default()),
             writeback: WritebackBatch::from_env(),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
+            dir_handles: DirHandles::default(),
             dont_mask: std::sync::atomic::AtomicBool::new(false),
             lookup_refcounts: LookupRefcounts::default(),
         };
@@ -8832,6 +8893,7 @@ mod tests {
             inode_locks: Arc::new(FuseInodeLocks::default()),
             writeback: WritebackBatch::from_env(),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
+            dir_handles: DirHandles::default(),
             dont_mask: std::sync::atomic::AtomicBool::new(false),
             lookup_refcounts: LookupRefcounts::default(),
         };
@@ -10032,6 +10094,7 @@ mod tests {
             readdirplus_attr_memo: ReaddirplusAttrMemo::from_env(),
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
+            dir_handles: DirHandles::default(),
             dont_mask: std::sync::atomic::AtomicBool::new(false),
             lookup_refcounts: LookupRefcounts::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
@@ -13301,11 +13364,60 @@ mod tests {
         }));
         let cx = Cx::for_testing();
 
-        let result = fuse
+        let (fh, flags) = fuse
             .dispatch_opendir(&cx, InodeNumber(7))
             .expect("directory opendir");
+        let (fh2, _) = fuse
+            .dispatch_opendir(&cx, InodeNumber(7))
+            .expect("second directory opendir");
 
-        assert_eq!(result, (0, 0));
+        assert_eq!(flags, 0);
+        // Each open gets its own handle, never the shared zero-message one.
+        assert_ne!(fh, 0);
+        assert_ne!(fh, fh2);
+    }
+
+    fn cookie_page(cookies: &[u64]) -> ReaddirPage {
+        let entries: Vec<FfsDirEntry> = cookies
+            .iter()
+            .map(|&offset| FfsDirEntry {
+                ino: InodeNumber(100 + offset),
+                offset,
+                kind: FfsFileType::RegularFile,
+                name: format!("f{offset}").into_bytes(),
+            })
+            .collect();
+        ReaddirPage::new(entries)
+    }
+
+    #[test]
+    fn a_dir_handle_stops_at_the_end_its_first_read_saw_generic_736() {
+        let handles = DirHandles::default();
+        let fh = handles.open();
+        // First page of a 3-entry listing whose last cookie is 3.
+        let first = cookie_page(&[1, 2]).with_end_cookie(Some(3));
+        assert_eq!(handles.visible_len(fh, 0, &first), 2);
+        // Entries renamed meanwhile came back with cookies 4 and 5: the listing
+        // ends at 3, as it did when it started.
+        let rest = cookie_page(&[3, 4, 5]);
+        assert_eq!(handles.visible_len(fh, 2, &rest), 1);
+        // Another handle on the same directory is not affected...
+        let other = handles.open();
+        assert_eq!(handles.visible_len(other, 2, &rest), 3);
+        // ...nor is the shared zero-message handle.
+        assert_eq!(handles.visible_len(0, 0, &first), 2);
+        assert_eq!(handles.visible_len(0, 2, &rest), 3);
+        // A rewind takes a fresh cap.
+        let rewound = cookie_page(&[1, 2]).with_end_cookie(Some(5));
+        assert_eq!(handles.visible_len(fh, 0, &rewound), 2);
+        assert_eq!(handles.visible_len(fh, 2, &rest), 3);
+        // Released handles keep no cap.
+        handles.release(fh);
+        assert_eq!(handles.visible_len(fh, 2, &rest), 3);
+        // A first page that does not know the listing's end leaves it uncapped.
+        let fh3 = handles.open();
+        assert_eq!(handles.visible_len(fh3, 0, &cookie_page(&[1, 2])), 2);
+        assert_eq!(handles.visible_len(fh3, 2, &rest), 3);
     }
 
     #[test]
@@ -22499,6 +22611,7 @@ mod tests {
             ),
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
+            dir_handles: DirHandles::default(),
             dont_mask: std::sync::atomic::AtomicBool::new(false),
             lookup_refcounts: LookupRefcounts::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),
@@ -24612,6 +24725,7 @@ AllowOther"#;
             ),
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
+            dir_handles: DirHandles::default(),
             dont_mask: std::sync::atomic::AtomicBool::new(false),
             lookup_refcounts: LookupRefcounts::default(),
             inode_locks: Arc::new(FuseInodeLocks::default()),

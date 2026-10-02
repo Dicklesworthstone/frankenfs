@@ -13683,6 +13683,7 @@ impl OpenFs {
         {
             return page;
         }
+        let end_cookie = page.end_cookie();
         let mut entries = page.to_vec();
         for entry in &mut entries {
             if entry.name == b".."
@@ -13693,7 +13694,7 @@ impl OpenFs {
             }
             entry.ino = self.btrfs_nested_present(cx, slot, entry.ino, dir);
         }
-        crate::vfs::ReaddirPage::new(entries)
+        crate::vfs::ReaddirPage::new(entries).with_end_cookie(end_cookie)
     }
 
     /// Attributes of a nested-subvolume link (see [`Self::btrfs_dir_child_ino`]).

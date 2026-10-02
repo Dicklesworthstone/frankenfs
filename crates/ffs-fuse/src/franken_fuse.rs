@@ -56,6 +56,7 @@ impl FrankenFuse {
                 // ffs-fuse and everything downstream of it (ffs-cli, and so the
                 // mounted instruments).
                 zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
+                dir_handles: crate::DirHandles::default(),
                 dont_mask: std::sync::atomic::AtomicBool::new(false),
                 lookup_refcounts,
             }),
@@ -3211,7 +3212,7 @@ impl FrankenFuse {
         self.with_request_scope(cx, RequestOp::Opendir, |cx, scope| {
             let attr = self.inner.ops.getattr(cx, scope, ino)?;
             Self::validate_opendir_attr(&attr)?;
-            Ok((0, 0))
+            Ok((self.inner.dir_handles.open(), 0))
         })
     }
 

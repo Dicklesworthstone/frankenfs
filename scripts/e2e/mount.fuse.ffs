@@ -36,6 +36,23 @@ if [[ ,$opts, == *,remount,* ]]; then
     exec mount -i -o "$opts" "$dir"
 fi
 
+# The image is already mounted: a kernel filesystem mounted twice shares one
+# superblock, so both mountpoints see the same files. A second daemon on the
+# same image would wait for the first's lock and give up (xfstests
+# generic/732 mounts one device at two places and renames across them).
+# Bind the live mount instead.
+existing=$({ findmnt -rn -S "$image" -o TARGET,FSTYPE 2>/dev/null || true; } |
+    awk '$2 ~ /^fuse/ { print $1; exit }')
+if [[ -n $existing ]]; then
+    # findmnt escapes spaces etc. as \x20; undo it for mount(8).
+    existing=$(printf '%b' "$existing")
+    mount -i --bind "$existing" "$dir"
+    if [[ ,$opts, == *,ro,* ]]; then
+        exec mount -i -o remount,bind,ro "$dir"
+    fi
+    exit 0
+fi
+
 args=(mount --rw --fsname "$image")
 IFS=, read -ra parts <<<"$opts"
 for part in "${parts[@]}"; do
