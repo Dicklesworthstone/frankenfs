@@ -8627,62 +8627,15 @@ impl BtrfsExtentAllocator {
         )
     }
 
-    /// Core allocation logic.
-    ///
-    /// If `skip_extent_item` is true, the allocation reserves space but does
-    /// NOT insert EXTENT_ITEM/METADATA_ITEM into the extent tree. This breaks
-    /// the recursion when allocating extent_tree's own nodes during commit.
-    #[allow(clippy::too_many_lines)]
-    fn alloc_extent(
-        &mut self,
+    /// Where `num_bytes` fits in block group `bg_start`, plus whether the
+    /// placement ends at the group's verified tail (the bump-pointer fast
+    /// path stays valid). `None` when no gap is large enough. Never returns
+    /// bytenr 0, the hole sentinel (bd-5aybu).
+    fn find_gap_in_block_group(
+        &self,
+        bg_start: u64,
         num_bytes: u64,
-        required_flags: u64,
-        is_metadata: bool,
-        ref_root: u64,
-        ref_level: u8,
-        skip_extent_item: bool,
-    ) -> Result<ExtentAllocation, BtrfsMutationError> {
-        if num_bytes == 0 {
-            return Err(BtrfsMutationError::InvalidConfig(
-                "extent size must be non-zero",
-            ));
-        }
-
-        // Find a block group with enough free space.
-        let bg_start = self
-            .block_groups
-            .values()
-            .find(|bg| (bg.item.flags & required_flags) != 0 && bg.item.free_bytes() >= num_bytes)
-            .map(|bg| bg.start);
-
-        let Some(bg_start) = bg_start else {
-            // bd-uxh7t: a bare ENOSPC at the client says nothing about which
-            // resource ran out. Report used-vs-pinned, which is what separates
-            // "these groups are full and the filesystem needs another chunk"
-            // from "the previous tree is pinned for the duration of this commit".
-            let report = self.describe_no_space(num_bytes, required_flags);
-            warn!(
-                target: "ffs::btrfs::alloc",
-                needed = num_bytes,
-                required_flags,
-                matching_groups = report.matching_groups,
-                total = report.total_bytes,
-                used = report.used_bytes,
-                pinned = report.pinned_bytes,
-                largest_free = report.largest_free,
-                pin_bound = report.is_pin_bound(),
-                "alloc_no_space_no_block_group"
-            );
-            return Err(BtrfsMutationError::NoSpace);
-        };
-
-        debug!(
-            target: "ffs::btrfs::alloc",
-            block_group = bg_start,
-            size_needed = num_bytes,
-            "alloc_search_start"
-        );
-
+    ) -> Result<(Option<u64>, bool), BtrfsMutationError> {
         let (bg_base, bg_total, alloc_offset, min_usable_offset, tail_verified) = {
             let bg = &self.block_groups[&bg_start];
             (
@@ -8713,83 +8666,158 @@ impl BtrfsExtentAllocator {
             && cursor
                 .checked_add(num_bytes)
                 .is_some_and(|end| end <= bg_end);
-        let (found, tail_verified_after_alloc) = if direct_tail {
-            (Some(cursor), true)
-        } else {
-            // Find a gap in this block group by scanning allocation items in
-            // range. We must include both EXTENT_ITEM (168) and METADATA_ITEM
-            // (169) as both represent physical space allocations.
-            let range_start = BtrfsKey {
-                objectid: bg_base,
-                item_type: BTRFS_ITEM_EXTENT_ITEM, // 168
-                offset: 0,
-            };
-            let range_end = BtrfsKey {
-                objectid: bg_end,
-                item_type: BTRFS_ITEM_METADATA_ITEM, // 169
-                offset: u64::MAX,
-            };
-            let extents = self.extent_tree.range(&range_start, &range_end)?;
-
-            let mut allocated_ranges: Vec<(u64, u64)> = extents
-                .iter()
-                .filter_map(|(key, _)| allocation_extent_range(*key, self.nodesize))
-                .collect();
-
-            // Pinned extents are occupied even though no extent item says so:
-            // the blocks of the trees the committed superblock still points at,
-            // and this transaction's own extent/root-tree nodes (bd-mqb9t).
-            // Merging them here is what keeps the gap finder — and, through
-            // `last_extent_end` below, the tail-cursor fast path — from handing
-            // out space that is still in use. `first_gap_at_or_after` requires a
-            // sorted, non-overlapping list, so re-sort and coalesce after the
-            // merge; both inputs are individually sorted but interleave.
-            let pinned_here: Vec<(u64, u64)> = self
-                .pinned
-                .range(bg_base..bg_end)
-                .map(|(start, pin)| (*start, pin.num_bytes))
-                .collect();
-            if !pinned_here.is_empty() {
-                allocated_ranges.extend(pinned_here);
-                allocated_ranges.sort_unstable();
-                allocated_ranges = coalesce_ranges(allocated_ranges);
-            }
-
-            // Forward search from the bump-pointer offset; if that finds
-            // nothing and we started mid-group, wrap around to the
-            // reserved-prefix floor. Both searches binary-search past the no-op
-            // prefix below their start cursor (bd-8fbka).
-            let mut found = first_gap_at_or_after(&allocated_ranges, cursor, num_bytes, bg_end)?;
-            if found.is_none() && alloc_offset > 0 {
-                found = first_gap_at_or_after(&allocated_ranges, min_usable, num_bytes, bg_end)?;
-            }
-
-            let mut last_extent_end = min_usable;
-            for &(ext_start, ext_size) in &allocated_ranges {
-                let ext_end = ext_start
-                    .checked_add(ext_size)
-                    .ok_or(BtrfsMutationError::AddressOverflow)?;
-                if ext_end > last_extent_end {
-                    last_extent_end = ext_end;
-                }
-            }
-            let tail_verified = found.is_some_and(|bytenr| bytenr >= last_extent_end);
-            (found, tail_verified)
+        if direct_tail {
+            return Ok((Some(cursor), true));
+        }
+        // Find a gap in this block group by scanning allocation items in
+        // range. We must include both EXTENT_ITEM (168) and METADATA_ITEM
+        // (169) as both represent physical space allocations.
+        let range_start = BtrfsKey {
+            objectid: bg_base,
+            item_type: BTRFS_ITEM_EXTENT_ITEM, // 168
+            offset: 0,
         };
+        let range_end = BtrfsKey {
+            objectid: bg_end,
+            item_type: BTRFS_ITEM_METADATA_ITEM, // 169
+            offset: u64::MAX,
+        };
+        let extents = self.extent_tree.range(&range_start, &range_end)?;
 
+        let mut allocated_ranges: Vec<(u64, u64)> = extents
+            .iter()
+            .filter_map(|(key, _)| allocation_extent_range(*key, self.nodesize))
+            .collect();
+
+        // Pinned extents are occupied even though no extent item says so:
+        // the blocks of the trees the committed superblock still points at,
+        // and this transaction's own extent/root-tree nodes (bd-mqb9t).
+        // Merging them here is what keeps the gap finder — and, through
+        // `last_extent_end` below, the tail-cursor fast path — from handing
+        // out space that is still in use. `first_gap_at_or_after` requires a
+        // sorted, non-overlapping list, so re-sort and coalesce after the
+        // merge; both inputs are individually sorted but interleave.
+        let pinned_here: Vec<(u64, u64)> = self
+            .pinned
+            .range(bg_base..bg_end)
+            .map(|(start, pin)| (*start, pin.num_bytes))
+            .collect();
+        if !pinned_here.is_empty() {
+            allocated_ranges.extend(pinned_here);
+            allocated_ranges.sort_unstable();
+            allocated_ranges = coalesce_ranges(allocated_ranges);
+        }
+
+        // Forward search from the bump-pointer offset; if that finds
+        // nothing and we started mid-group, wrap around to the
+        // reserved-prefix floor. Both searches binary-search past the no-op
+        // prefix below their start cursor (bd-8fbka).
+        let mut found = first_gap_at_or_after(&allocated_ranges, cursor, num_bytes, bg_end)?;
+        if found.is_none() && alloc_offset > 0 {
+            found = first_gap_at_or_after(&allocated_ranges, min_usable, num_bytes, bg_end)?;
+        }
+
+        let mut last_extent_end = min_usable;
+        for &(ext_start, ext_size) in &allocated_ranges {
+            let ext_end = ext_start
+                .checked_add(ext_size)
+                .ok_or(BtrfsMutationError::AddressOverflow)?;
+            if ext_end > last_extent_end {
+                last_extent_end = ext_end;
+            }
+        }
         // bytenr 0 is the btrfs hole/none sentinel and must never back a real
         // extent; refuse it defensively rather than corrupt data (bd-5aybu).
-        let Some(bytenr) = found.filter(|&b| b != 0) else {
-            // Distinct from the case above and more informative: a group WAS
-            // selected on its accounting, so `free_bytes()` said there was room,
-            // and the gap search still could not place the extent. That is
-            // fragmentation or pinning, never a plain "disk full" (bd-uxh7t).
+        let found = found.filter(|&b| b != 0);
+        let tail_verified = found.is_some_and(|bytenr| bytenr >= last_extent_end);
+        Ok((found, tail_verified))
+    }
+
+    /// Core allocation logic.
+    ///
+    /// If `skip_extent_item` is true, the allocation reserves space but does
+    /// NOT insert EXTENT_ITEM/METADATA_ITEM into the extent tree. This breaks
+    /// the recursion when allocating extent_tree's own nodes during commit.
+    #[allow(clippy::too_many_lines)]
+    fn alloc_extent(
+        &mut self,
+        num_bytes: u64,
+        required_flags: u64,
+        is_metadata: bool,
+        ref_root: u64,
+        ref_level: u8,
+        skip_extent_item: bool,
+    ) -> Result<ExtentAllocation, BtrfsMutationError> {
+        if num_bytes == 0 {
+            return Err(BtrfsMutationError::InvalidConfig(
+                "extent size must be non-zero",
+            ));
+        }
+
+        // Candidate block groups in address order: every group of the right
+        // type whose accounting has room. Accounting is not contiguity, so a
+        // group whose free space is too fragmented for this extent falls
+        // through to the next candidate. Taking only the first match returned
+        // ENOSPC from a nearly full 8 MiB data group while a grown one held
+        // 209 MB free (xfstests generic/001 on btrfs, bd-ntgko).
+        let candidates: Vec<u64> = self
+            .block_groups
+            .values()
+            .filter(|bg| (bg.item.flags & required_flags) != 0 && bg.item.free_bytes() >= num_bytes)
+            .map(|bg| bg.start)
+            .collect();
+
+        if candidates.is_empty() {
+            // bd-uxh7t: a bare ENOSPC at the client says nothing about which
+            // resource ran out. Report used-vs-pinned, which is what separates
+            // "these groups are full and the filesystem needs another chunk"
+            // from "the previous tree is pinned for the duration of this commit".
             let report = self.describe_no_space(num_bytes, required_flags);
             warn!(
                 target: "ffs::btrfs::alloc",
                 needed = num_bytes,
                 required_flags,
+                matching_groups = report.matching_groups,
+                total = report.total_bytes,
+                used = report.used_bytes,
+                pinned = report.pinned_bytes,
+                largest_free = report.largest_free,
+                pin_bound = report.is_pin_bound(),
+                "alloc_no_space_no_block_group"
+            );
+            return Err(BtrfsMutationError::NoSpace);
+        }
+
+        let mut placed = None;
+        let mut last_group = candidates[0];
+        for bg_start in candidates {
+            debug!(
+                target: "ffs::btrfs::alloc",
                 block_group = bg_start,
+                size_needed = num_bytes,
+                "alloc_search_start"
+            );
+            last_group = bg_start;
+            if let (Some(bytenr), tail_verified) =
+                self.find_gap_in_block_group(bg_start, num_bytes)?
+            {
+                placed = Some((bg_start, bytenr, tail_verified));
+                break;
+            }
+        }
+
+        let Some((bg_start, bytenr, tail_verified_after_alloc)) = placed else {
+            // Distinct from the case above and more informative: groups WERE
+            // selected on their accounting, so `free_bytes()` said there was
+            // room, and the gap search still could not place the extent in any
+            // of them. That is fragmentation or pinning, never a plain "disk
+            // full" (bd-uxh7t).
+            let report = self.describe_no_space(num_bytes, required_flags);
+            warn!(
+                target: "ffs::btrfs::alloc",
+                needed = num_bytes,
+                required_flags,
+                block_group = last_group,
                 total = report.total_bytes,
                 used = report.used_bytes,
                 pinned = report.pinned_bytes,
@@ -8808,7 +8836,6 @@ impl BtrfsExtentAllocator {
             extent_size = num_bytes,
             "alloc_found"
         );
-
         // Insert EXTENT_ITEM into extent tree (unless skipped for self-allocation).
         if !skip_extent_item {
             let extent_item = BtrfsExtentItem {
@@ -20420,6 +20447,46 @@ mod tests {
             sys_chunk_array_size: 0,
             sys_chunk_array: vec![],
         }
+    }
+
+    /// bd-ntgko: a block group whose accounting has room but whose free space
+    /// is fragmented must not end the search; the allocation lands in the next
+    /// group that can hold it.
+    #[test]
+    fn a_fragmented_first_group_falls_through_to_the_next_group() {
+        const KB: u64 = 1024;
+        const MB: u64 = 1024 * KB;
+        let mut alloc = BtrfsExtentAllocator::new(7).expect("allocator");
+        alloc.set_nodesize(16384);
+        let data = |total| BtrfsBlockGroupItem {
+            total_bytes: total,
+            used_bytes: 0,
+            flags: BTRFS_BLOCK_GROUP_DATA,
+        };
+        alloc.add_block_group(MB, data(MB));
+        alloc.add_block_group(4 * MB, data(4 * MB));
+
+        // Fill the first group with four 256 KiB extents, then free two that
+        // are not adjacent: 512 KiB free by accounting, no 512 KiB gap.
+        let pieces: Vec<u64> = (0..4)
+            .map(|_| alloc.alloc_data(256 * KB).expect("fill").bytenr)
+            .collect();
+        assert!(pieces.iter().all(|&b| (MB..2 * MB).contains(&b)));
+        alloc
+            .free_extent(pieces[0], 256 * KB, false)
+            .expect("free 0");
+        alloc
+            .free_extent(pieces[2], 256 * KB, false)
+            .expect("free 2");
+
+        let big = alloc
+            .alloc_data(512 * KB)
+            .expect("the second group has room: a fragmented first group must not ENOSPC");
+        assert!(
+            (4 * MB..8 * MB).contains(&big.bytenr),
+            "512 KiB cannot fit in the first group's 256 KiB holes, got {}",
+            big.bytenr
+        );
     }
 
     /// bd-a136s. THE POINT OF THE WHOLE BEAD, as an assertion: an allocation that
