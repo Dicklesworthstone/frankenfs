@@ -1748,22 +1748,34 @@ impl FsOps for OpenFs {
         _scope: &mut RequestScope,
         start: u64,
         len: u64,
-        _min_len: u64,
+        min_len: u64,
     ) -> ffs_error::Result<u64> {
-        // Validate the range fits inside the device's byte span.
-        // ext4_trim_fs and btrfs_trim_fs both reject out-of-bounds
-        // calls with EINVAL — match that behaviour rather than
-        // silently truncating the request.
-        let device_bytes = self.dev.len_bytes();
-        if start >= device_bytes {
+        // Reject exactly the ranges the kernel rejects, so fstrim(8)
+        // fails where it fails on ext4/btrfs (xfstests generic/260, 288).
+        let invalid = match &self.flavor {
+            // ext4_trim_fs: a range shorter than one block, a start at or
+            // past the last block, or a minimum extent longer than a group.
+            // A length past the end is clamped, not rejected.
+            FsFlavor::Ext4(sb) => {
+                let block = u64::from(sb.block_size);
+                len < block
+                    || start / block >= sb.blocks_count
+                    || min_len / block > u64::from(sb.clusters_per_group)
+            }
+            // btrfs_ioctl_fitrim + btrfs_trim_fs: block-group addresses are
+            // logical and may lie anywhere in u64, so only a sub-sector length,
+            // start == U64_MAX and an overflowing start + len are rejected.
+            FsFlavor::Btrfs(sb) => {
+                len < u64::from(sb.sectorsize)
+                    || start == u64::MAX
+                    || (len != u64::MAX && start.checked_add(len).is_none())
+            }
+        };
+        if invalid {
             return Err(FfsError::Io(std::io::Error::from_raw_os_error(
                 libc::EINVAL,
             )));
         }
-        // Length saturates against the tail of the device; the kernel
-        // does the same so a user passing fstrim_range.len = u64::MAX
-        // (the documented "trim everything past start") works.
-        let _effective = len.min(device_bytes - start);
 
         // FrankenFS sits over an opaque BlockDevice trait that has no
         // discard syscall, so no physical bytes are released. Return 0
