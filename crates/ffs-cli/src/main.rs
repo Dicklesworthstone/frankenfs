@@ -8357,8 +8357,11 @@ fn lock_image_for_rw_mount(image_path: &Path) -> Result<std::fs::File> {
 /// live concurrent mount, which this has never refused; it is only logged.
 fn wait_for_image_writer_to_exit(image_path: &Path) -> Result<()> {
     const WAIT: Duration = Duration::from_secs(30);
-    let file = std::fs::File::open(image_path)
-        .with_context(|| format!("open {} to wait for its writer", image_path.display()))?;
+    // Nothing to wait for on an image this cannot open; the mount's own
+    // open reports why.
+    let Ok(file) = std::fs::File::open(image_path) else {
+        return Ok(());
+    };
     let deadline = Instant::now() + WAIT;
     loop {
         match file.try_lock_shared() {
@@ -10294,6 +10297,8 @@ mod tests {
         let tmp = tempfile::tempdir().expect("tmpdir");
         let image = tmp.path().join("image");
         std::fs::write(&image, b"image").expect("image");
+        // A missing image is left to the mount's own open to report.
+        super::wait_for_image_writer_to_exit(&tmp.path().join("missing")).expect("missing");
         // No writer: no wait.
         let start = std::time::Instant::now();
         super::wait_for_image_writer_to_exit(&image).expect("no writer");
