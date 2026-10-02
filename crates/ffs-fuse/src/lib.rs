@@ -7604,11 +7604,17 @@ impl FrankenFuse {
             }
             if name == ".." {
                 let page = self.inner.ops.readdir(cx, scope, InodeNumber(parent), 0)?;
-                let up = page
+                let mut up = page
                     .iter()
                     .find(|entry| entry.name == b"..")
                     .map(|entry| entry.ino)
                     .ok_or_else(|| FfsError::NotFound("..".into()))?;
+                // A listing names the root by the number stat reports for it
+                // (btrfs: objectid 256) so readdir and stat agree; the kernel
+                // knows the root only as nodeid 1.
+                if up == self.inner.ops.getattr(cx, scope, InodeNumber(1))?.ino {
+                    up = InodeNumber(1);
+                }
                 return entry_for(scope, up);
             }
             self.inner.ops.lookup(cx, scope, InodeNumber(parent), name)

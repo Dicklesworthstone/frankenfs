@@ -14711,12 +14711,13 @@ impl OpenFs {
 
         // Add synthetic "." and ".." for VFS compatibility.
         // Resolve parent via INODE_REF when COW tree is available.
-        // Reverse-map the mounted tree's root directory back to FUSE inode 1
-        // (its objectid, e.g. 256 — not the superblock's root_dir_objectid,
-        // which names the root tree's default dir item). Presenting 256 made
-        // ".." of every top-level directory a stranger the kernel could not
-        // reconnect when decoding a file handle (open_by_handle_at: ESTALE).
-        let root_oid = self.btrfs_context().map(|ctx| ctx.subvol_root_dirid);
+        // Reverse-map root objectid back to FUSE inode 1. (Note: this compares
+        // against the superblock's root_dir_objectid, so a top-level
+        // directory's ".." keeps the root's objectid, 256 — the same number
+        // getattr reports for the root, which readdir/stat consistency
+        // (xfstests generic/257) relies on. The FUSE lookup of ".." maps it
+        // to nodeid 1 for handle decoding.)
+        let root_oid = self.btrfs_superblock().map(|sb| sb.root_dir_objectid);
         #[allow(clippy::option_if_let_else)]
         let parent_ino = if let Some(alloc_mutex) = self.btrfs_alloc_state.as_ref() {
             let alloc = alloc_mutex.read();
@@ -62733,11 +62734,12 @@ mod tests {
         assert_eq!(entries[2].kind, FileType::RegularFile);
     }
 
-    /// ".." of a top-level directory is the mount root, presented as inode 1
-    /// (not its objectid 256): the kernel reconnects decoded file handles by
-    /// walking ".." up to a nodeid it knows (open_by_handle_at, bd-674qe).
+    /// ".." of a top-level directory (and of the root) names the root with the
+    /// inode number stat reports for it, so readdir and stat agree (xfstests
+    /// generic/257); the FUSE ".." lookup maps that number to nodeid 1 for
+    /// handle decoding (bd-674qe).
     #[test]
-    fn btrfs_top_level_dir_dotdot_is_presented_as_the_root() {
+    fn btrfs_dotdot_inode_matches_the_roots_stat_inode() {
         let Some((fs, _dev, _tmp, _image)) = open_writable_btrfs_mkfs(256) else {
             return;
         };
@@ -62761,12 +62763,16 @@ mod tests {
             .iter()
             .find(|entry| entry.name == b"..")
             .expect("..");
-        assert_eq!(dotdot.ino, InodeNumber(1), "{:?}", entries.to_vec());
+        let root_stat_ino = ops
+            .getattr(&cx, &mut RequestScope::empty(), InodeNumber(1))
+            .expect("getattr root")
+            .ino;
+        assert_eq!(dotdot.ino, root_stat_ino, "{:?}", entries.to_vec());
         let root = ops
             .readdir(&cx, &mut RequestScope::empty(), InodeNumber(1), 0)
             .expect("readdir root");
         let root_dotdot = root.iter().find(|entry| entry.name == b"..").expect("..");
-        assert_eq!(root_dotdot.ino, InodeNumber(1));
+        assert_eq!(root_dotdot.ino, root_stat_ino);
     }
 
     /// A fallocate that converts a small file's inline extent to a regular one
