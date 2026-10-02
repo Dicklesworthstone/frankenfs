@@ -37396,6 +37396,32 @@ impl OpenFs {
             "btrfs commit reached the superblock with its write set unflushed"
         );
 
+        // Every DEV_ITEM's bytes_used as this commit leaves the chunk tree; the
+        // superblock's embedded copy of its own device item is patched from it
+        // below.
+        let dev_bytes_used: Vec<(u64, u64)> = alloc
+            .chunk_tree
+            .range(
+                &BtrfsKey {
+                    objectid: ffs_ondisk::btrfs::BTRFS_DEV_ITEMS_OBJECTID,
+                    item_type: ffs_ondisk::btrfs::BTRFS_DEV_ITEM_KEY,
+                    offset: 0,
+                },
+                &BtrfsKey {
+                    objectid: ffs_ondisk::btrfs::BTRFS_DEV_ITEMS_OBJECTID,
+                    item_type: ffs_ondisk::btrfs::BTRFS_DEV_ITEM_KEY,
+                    offset: u64::MAX,
+                },
+            )
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?
+            .into_iter()
+            .filter_map(|(key, data)| {
+                ffs_ondisk::parse_dev_item(&data)
+                    .ok()
+                    .map(|dev| (key.offset, dev.bytes_used))
+            })
+            .collect();
+
         drop(alloc);
 
         // bd-73bi2: before the superblock makes this transaction live, read the
@@ -37555,6 +37581,15 @@ impl OpenFs {
         // leaves the existing value (and its accounting) untouched.
         if let Some(bytes_used) = recomputed_bytes_used {
             sb_bytes[0x78..0x80].copy_from_slice(&bytes_used.to_le_bytes());
+        }
+
+        // The superblock embeds its own device's DEV_ITEM (0xC9: devid u64,
+        // total_bytes u64, bytes_used u64 at 0xD9). Chunk growth raises
+        // bytes_used in the chunk tree's DEV_ITEM; left stale here, btrfs check
+        // warns "device N's bytes_used was X in tree but Y in superblock".
+        let sb_devid = u64::from_le_bytes(sb_bytes[0xC9..0xD1].try_into().expect("8 bytes"));
+        if let Some(&(_, bytes_used)) = dev_bytes_used.iter().find(|(id, _)| *id == sb_devid) {
+            sb_bytes[0xD9..0xE1].copy_from_slice(&bytes_used.to_le_bytes());
         }
 
         // bd-qxo5x: now that the FREE_SPACE_TREE has been rewritten to match the
@@ -88060,7 +88095,33 @@ mod tests {
         std::fs::write(&image, &bytes).expect("write image");
         if let Some((ok, output)) = run_btrfs_check(&image) {
             assert!(ok, "btrfs check must accept the grown image:\n{output}");
+            assert!(
+                !output.contains("bytes_used was"),
+                "the superblock's dev_item must follow the chunk tree's after growth:\n{output}"
+            );
         }
+        // The same invariant from the bytes: superblock dev_item.bytes_used
+        // (0x10000 + 0xD9) equals the chunk tree DEV_ITEM's.
+        let sb_dev_bytes_used = u64::from_le_bytes(
+            bytes[0x10000 + 0xD9..0x10000 + 0xE1]
+                .try_into()
+                .expect("8 bytes"),
+        );
+        let tree_dev_bytes_used = {
+            let alloc = fs.require_btrfs_alloc_state().expect("alloc").read();
+            let key = BtrfsKey {
+                objectid: ffs_ondisk::btrfs::BTRFS_DEV_ITEMS_OBJECTID,
+                item_type: ffs_ondisk::btrfs::BTRFS_DEV_ITEM_KEY,
+                offset: 1,
+            };
+            ffs_ondisk::parse_dev_item(&alloc.chunk_tree.get(&key).expect("dev item"))
+                .expect("parse dev item")
+                .bytes_used
+        };
+        assert_eq!(
+            sb_dev_bytes_used, tree_dev_bytes_used,
+            "superblock dev_item.bytes_used after chunk growth"
+        );
         let reopened = OpenFs::from_device(
             &cx,
             Box::new(TestDevice::from_vec(bytes)),
