@@ -7064,14 +7064,22 @@ impl Filesystem for FrankenFuse {
             return;
         };
         match self.with_request_scope(&cx, RequestOp::Fallocate, |cx, scope| {
-            self.inner.ops.fallocate(
+            let result = self.inner.ops.fallocate(
                 cx,
                 scope,
                 InodeNumber(ino),
                 byte_offset,
                 byte_length,
                 mode,
-            )?;
+            );
+            // Preallocation that ran out of space keeps what it allocated,
+            // recorded in the inode (kernel semantics). Commit that before
+            // reporting ENOSPC; dropping the request's transaction would
+            // separate the allocation from its owner.
+            if matches!(result, Err(FfsError::NoSpace)) {
+                self.inner.ops.commit_request_scope(cx, scope)?;
+            }
+            result?;
             self.inner.ops.commit_request_scope(cx, scope)?;
             Ok(())
         }) {

@@ -28091,6 +28091,27 @@ impl OpenFs {
         }
     }
 
+    /// `inode.blocks` after charging `count` newly allocated data blocks: in
+    /// filesystem blocks for a huge_file inode, else 512-byte sectors.
+    fn ext4_blocks_after_adding_data(
+        inode: &Ext4Inode,
+        ino: InodeNumber,
+        count: u64,
+        sectors_per_block: u64,
+    ) -> ffs_error::Result<u64> {
+        let units = if inode.is_huge_file() {
+            count
+        } else {
+            count
+                .checked_mul(sectors_per_block)
+                .ok_or_else(|| FfsError::Corruption {
+                    block: 0,
+                    detail: format!("inode {} added sectors overflow", ino.0),
+                })?
+        };
+        Self::ext4_checked_inode_blocks_delta(inode.blocks, ino, i128::from(units))
+    }
+
     fn ext4_checked_inode_blocks_delta(
         current: u64,
         ino: InodeNumber,
@@ -29230,6 +29251,13 @@ impl OpenFs {
         // root), failing the op after its allocations had landed.
         let fallocate_meta_before =
             Self::ext4_fallocate_extent_meta_blocks(cx, scope, &block_dev, &root_bytes)?;
+        // Preallocation that runs out of space part-way keeps what it got and
+        // still records it in the inode, as kernel ext4 does; returning
+        // straight from the allocation loop dropped the updated extent root,
+        // leaving every block allocated so far marked in use with no owner
+        // (a fallocate of twice the free space filled the filesystem for
+        // good). The error is reported after the inode is written.
+        let mut prealloc_error: Option<FfsError> = None;
 
         if punch_hole {
             // Unaligned ranges are supported (bd-xnel9): deallocate the fully
@@ -29570,7 +29598,7 @@ impl OpenFs {
 
             let mut goal_block = None;
             let mut newly_allocated_blocks = 0_u64;
-            for mapping in mappings {
+            'zero: for mapping in mappings {
                 // Unwritten extents already read back as zero; keep them as-is.
                 if mapping.unwritten {
                     if mapping.physical_start != 0 {
@@ -29649,6 +29677,10 @@ impl OpenFs {
                                 want = chunk / 2;
                                 continue;
                             }
+                            Err(FfsError::NoSpace) => {
+                                prealloc_error = Some(FfsError::NoSpace);
+                                break 'zero;
+                            }
                             Err(err) => return Err(err),
                         };
                         self.extent_cache.invalidate_all();
@@ -29701,16 +29733,26 @@ impl OpenFs {
             self.invalidate_all_ext4_write_extent_snapshots();
 
             if newly_allocated_blocks > 0 {
-                inode.blocks = blocks_after_zero.ok_or_else(|| FfsError::Corruption {
-                    block: 0,
-                    detail: "planned block delta missing but blocks allocated during zero_range"
-                        .into(),
-                })?;
+                inode.blocks = if prealloc_error.is_none() {
+                    blocks_after_zero.ok_or_else(|| FfsError::Corruption {
+                        block: 0,
+                        detail:
+                            "planned block delta missing but blocks allocated during zero_range"
+                                .into(),
+                    })?
+                } else {
+                    Self::ext4_blocks_after_adding_data(
+                        &inode,
+                        ino,
+                        newly_allocated_blocks,
+                        sectors_per_block,
+                    )?
+                };
                 self.invalidate_ext4_write_extent_snapshot(&inode);
                 Self::set_extent_root(&mut inode, &root_bytes);
             }
 
-            if !keep_size && end > inode.size {
+            if prealloc_error.is_none() && !keep_size && end > inode.size {
                 inode.size = end;
             }
         } else {
@@ -29758,7 +29800,7 @@ impl OpenFs {
             };
             let mut goal_block = None;
             let mut newly_allocated_blocks = 0_u64;
-            for mapping in mappings {
+            'prealloc: for mapping in mappings {
                 if mapping.physical_start != 0 {
                     goal_block = Some(BlockNumber(
                         mapping.physical_start + u64::from(mapping.count),
@@ -29835,6 +29877,10 @@ impl OpenFs {
                             want = chunk / 2;
                             continue;
                         }
+                        Err(FfsError::NoSpace) => {
+                            prealloc_error = Some(FfsError::NoSpace);
+                            break 'prealloc;
+                        }
                         Err(err) => return Err(err),
                     };
                     self.extent_cache.invalidate_all();
@@ -29850,15 +29896,24 @@ impl OpenFs {
             }
 
             if newly_allocated_blocks > 0 {
-                inode.blocks = blocks_after_prealloc.ok_or_else(|| FfsError::Corruption {
-                    block: 0,
-                    detail: "planned block delta missing but blocks allocated".into(),
-                })?;
+                inode.blocks = if prealloc_error.is_none() {
+                    blocks_after_prealloc.ok_or_else(|| FfsError::Corruption {
+                        block: 0,
+                        detail: "planned block delta missing but blocks allocated".into(),
+                    })?
+                } else {
+                    Self::ext4_blocks_after_adding_data(
+                        &inode,
+                        ino,
+                        newly_allocated_blocks,
+                        sectors_per_block,
+                    )?
+                };
                 self.invalidate_ext4_write_extent_snapshot(&inode);
                 Self::set_extent_root(&mut inode, &root_bytes);
             }
 
-            if !keep_size && end > inode.size {
+            if prealloc_error.is_none() && !keep_size && end > inode.size {
                 inode.size = end;
             }
         }
@@ -29904,7 +29959,7 @@ impl OpenFs {
             "fallocate completed"
         );
 
-        Ok(())
+        prealloc_error.map_or(Ok(()), Err)
     }
 
     /// The largest ext4 file size addressable by the 32-bit logical block
@@ -82820,6 +82875,34 @@ mod tests {
         assert!(after.blocks >= len / 512, "blocks={}", after.blocks);
         let data = fs.read(&cx, attr.ino, len - 4096, 4096).expect("read tail");
         assert!(data.iter().all(|&b| b == 0));
+    }
+
+    /// xfstests generic/213's last step preallocates twice the free space and
+    /// expects ENOSPC. Taking smaller extents (above) must not turn that into
+    /// a filled filesystem: what was allocated before ENOSPC has to be given
+    /// back, or the blocks stay marked in use with no owner.
+    #[test]
+    fn fallocate_beyond_free_space_fails_without_leaking_blocks() {
+        let Some((fs, _tmp)) = open_writable_ext4_mkfs(64) else {
+            return; // mkfs.ext4 unavailable on this host — skip like sibling tests.
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let free_before = fs.statfs(&cx, root).expect("statfs").blocks_free;
+        let attr = fs
+            .create(&cx, root, OsStr::new("toobig.bin"), 0o644, 0, 0)
+            .expect("create");
+        let err = fs
+            .fallocate(&cx, attr.ino, 0, 2 * free_before * 4096, 0)
+            .expect_err("twice the free space cannot be preallocated");
+        assert_eq!(err.to_errno(), libc::ENOSPC, "{err:?}");
+        fs.unlink(&cx, root, OsStr::new("toobig.bin"))
+            .expect("unlink");
+        assert_eq!(
+            fs.statfs(&cx, root).expect("statfs").blocks_free,
+            free_before,
+            "a failed fallocate must not leave blocks allocated"
+        );
     }
 
     #[test]
