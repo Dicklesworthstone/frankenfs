@@ -32559,6 +32559,34 @@ impl OpenFs {
         format!("btrfs-fallocate-{}-{offset}-{length}-{mode}", ino.0)
     }
 
+    /// End (exclusive file offset) of `objectid`'s last EXTENT_DATA item, or 0
+    /// when it has none. File extents never overlap, so the item with the
+    /// largest key offset also ends last; one floor descent finds it.
+    fn btrfs_last_extent_end(alloc: &BtrfsAllocState, objectid: u64) -> ffs_error::Result<u64> {
+        let probe = BtrfsKey {
+            objectid,
+            item_type: BTRFS_ITEM_EXTENT_DATA,
+            offset: u64::MAX,
+        };
+        let Some(key) = alloc
+            .fs_tree
+            .floor_key(&probe)
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?
+        else {
+            return Ok(0);
+        };
+        if key.objectid != objectid || key.item_type != BTRFS_ITEM_EXTENT_DATA {
+            return Ok(0);
+        }
+        let Some(bytes) = alloc.fs_tree.get(&key) else {
+            return Ok(0);
+        };
+        let extent = parse_extent_data(&bytes).map_err(|e| parse_to_ffs_error(&e))?;
+        key.offset
+            .checked_add(Self::btrfs_extent_logical_len(&extent)?)
+            .ok_or_else(|| FfsError::InvalidGeometry("extent logical end overflow".into()))
+    }
+
     fn btrfs_extent_logical_len(extent: &BtrfsExtentData) -> ffs_error::Result<u64> {
         match extent {
             BtrfsExtentData::Inline {
@@ -37926,12 +37954,15 @@ impl OpenFs {
             let reserved_bytenr = self
                 .btrfs_alloc_data_with_growth(&mut alloc, merged_len)?
                 .bytenr;
-            let removed_nbytes_delta = if aligned_start >= inode.size && inode.nbytes <= inode.size
+            let removed_nbytes_delta = if aligned_start >= inode.size
+                && Self::btrfs_last_extent_end(&alloc, canonical)? <= aligned_start
             {
-                // Pure append with no KEEP_SIZE/prealloc reservation past
-                // old EOF: no existing EXTENT_DATA item can overlap the
-                // aligned write range, so the removal query would only
-                // prove an empty intersection.
+                // Pure append: no EXTENT_DATA item reaches the aligned write
+                // range, so the removal query would only prove an empty
+                // intersection. Decided from the inode's last extent, not
+                // from `nbytes > size`: holes earlier in the file lower
+                // nbytes and hid a KEEP_SIZE preallocation past EOF, and the
+                // write then overlapped it (fsx, xfstests generic/091).
                 0
             } else {
                 match self.btrfs_remove_overlapping_extent_data(
@@ -86061,6 +86092,43 @@ mod tests {
     fn open_writable_btrfs() -> (OpenFs, Cx) {
         let (fs, cx, _) = open_writable_btrfs_with_device();
         (fs, cx)
+    }
+
+    /// fsx seed 1 (xfstests generic/091 on btrfs), reduced: a KEEP_SIZE zero
+    /// range reaching past EOF leaves preallocated extents beyond i_size; a
+    /// later write over them must replace them, not overlap them.
+    #[test]
+    fn btrfs_write_past_eof_over_keep_size_prealloc_does_not_overlap() {
+        let Some((fs, _dev, _tmp, _image)) = open_writable_btrfs_mkfs(256) else {
+            return; // btrfs-progs unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let ino = fs
+            .create(&cx, root, OsStr::new("fsx"), 0o644, 0, 0)
+            .expect("create")
+            .ino;
+        // A hole at the front keeps nbytes below i_size even with the
+        // preallocation below: the shape the old append shortcut misread.
+        fs.write(&cx, ino, 0x20000, &vec![0x11_u8; 0x46000])
+            .expect("fill [0x20000, 0x66000)");
+        fs.fallocate(
+            &cx,
+            ino,
+            0x64a2c,
+            0xd365,
+            libc::FALLOC_FL_ZERO_RANGE | libc::FALLOC_FL_KEEP_SIZE,
+        )
+        .expect("zero range past EOF, keep size");
+        assert_eq!(fs.getattr(&cx, ino).expect("getattr").size, 0x66000);
+        fs.write(&cx, ino, 0x6a000, &vec![0x22_u8; 0x7000])
+            .expect("write past EOF over the prealloc");
+        let data = fs.read(&cx, ino, 0, 0x71000).expect("read back whole file");
+        assert_eq!(data.len(), 0x71000);
+        assert!(data[..0x20000].iter().all(|&b| b == 0), "front hole");
+        assert!(data[0x20000..0x64a2c].iter().all(|&b| b == 0x11));
+        assert!(data[0x64a2c..0x6a000].iter().all(|&b| b == 0));
+        assert!(data[0x6a000..].iter().all(|&b| b == 0x22));
     }
 
     /// Unaligned fallocate on btrfs (xfstests generic/008, 014): punch and
