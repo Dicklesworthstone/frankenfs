@@ -86,7 +86,11 @@ jobs:
           sudo useradd 123456-fsgqa || true
           img="$RUNNER_TEMP/xfstests-images"
           mkdir -p "$img"
-          truncate -s 2G "$img/test.img" "$img/scratch.img"
+          # 4G (sparse): generic/213 needs df to report 1 GiB + 1 MiB
+          # available on TEST after the tests before it. btrfs reports only
+          # data-usable space (as the kernel does), which a 2G image no longer
+          # has once metadata chunks and earlier tests' files take their share.
+          truncate -s 4G "$img/test.img" "$img/scratch.img"
           ${{ matrix.mkfs }} "$img/test.img"
           ${{ matrix.mkfs }} "$img/scratch.img"
           # fusermount3 mountpoints must be in an AppArmor-allowed location.
