@@ -217,6 +217,26 @@ impl OpenFs {
     /// (`posix_acl_create`): a directory keeps it as its own default, and
     /// the access ACL is the default limited by the create mode, which also
     /// sets the inode's permission bits.
+    /// inode_init_owner: a new inode in a set-group-ID directory takes the
+    /// directory's group, and a new directory inherits S_ISGID too. FUSE
+    /// calls no inode_init_owner, so the filesystem has to (the VFS has
+    /// already applied mode_strip_sgid to `mode`; xfstests generic/444).
+    fn setgid_dir_owner(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+        mode: u16,
+        gid: u32,
+        is_dir: bool,
+    ) -> ffs_error::Result<(u16, u32)> {
+        let dir = <Self as FsOps>::getattr(self, cx, scope, parent)?;
+        if dir.perm & 0o2000 == 0 {
+            return Ok((mode, gid));
+        }
+        Ok((if is_dir { mode | 0o2000 } else { mode }, dir.gid))
+    }
+
     fn inherit_default_acl(
         &self,
         cx: &Cx,
@@ -1163,6 +1183,7 @@ impl FsOps for OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        let (mode, gid) = self.setgid_dir_owner(cx, scope, parent, mode, gid, false)?;
         let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
         let attr = match &self.flavor {
@@ -1214,6 +1235,7 @@ impl FsOps for OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        let (mode, gid) = self.setgid_dir_owner(cx, scope, parent, mode, gid, false)?;
         let attr = match &self.flavor {
             FsFlavor::Ext4(_) => self
                 .ext4_tmpfile(cx, Self::ext4_canonical_inode(parent), mode, uid, gid)
@@ -1236,6 +1258,7 @@ impl FsOps for OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        let (mode, gid) = self.setgid_dir_owner(cx, scope, parent, mode, gid, false)?;
         let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
         let attr = match &self.flavor {
@@ -1269,6 +1292,7 @@ impl FsOps for OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        let (mode, gid) = self.setgid_dir_owner(cx, scope, parent, mode, gid, true)?;
         let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
         let attr = match &self.flavor {
@@ -1514,13 +1538,14 @@ impl FsOps for OpenFs {
     fn symlink(
         &self,
         cx: &Cx,
-        _scope: &mut RequestScope,
+        scope: &mut RequestScope,
         parent: InodeNumber,
         name: &OsStr,
         target: &Path,
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        let (_, gid) = self.setgid_dir_owner(cx, scope, parent, 0, gid, false)?;
         let target_bytes = target.as_os_str().as_encoded_bytes();
         let target_len = target_bytes.len();
         let target_len_exceeds_max =
