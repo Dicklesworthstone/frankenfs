@@ -14711,8 +14711,12 @@ impl OpenFs {
 
         // Add synthetic "." and ".." for VFS compatibility.
         // Resolve parent via INODE_REF when COW tree is available.
-        // Reverse-map root objectid back to FUSE inode 1.
-        let root_oid = self.btrfs_superblock().map(|sb| sb.root_dir_objectid);
+        // Reverse-map the mounted tree's root directory back to FUSE inode 1
+        // (its objectid, e.g. 256 — not the superblock's root_dir_objectid,
+        // which names the root tree's default dir item). Presenting 256 made
+        // ".." of every top-level directory a stranger the kernel could not
+        // reconnect when decoding a file handle (open_by_handle_at: ESTALE).
+        let root_oid = self.btrfs_context().map(|ctx| ctx.subvol_root_dirid);
         #[allow(clippy::option_if_let_else)]
         let parent_ino = if let Some(alloc_mutex) = self.btrfs_alloc_state.as_ref() {
             let alloc = alloc_mutex.read();
@@ -62719,6 +62723,42 @@ mod tests {
         assert_eq!(entries[1].kind, FileType::Directory);
         assert_eq!(entries[2].name, b"hello.txt");
         assert_eq!(entries[2].kind, FileType::RegularFile);
+    }
+
+    /// ".." of a top-level directory is the mount root, presented as inode 1
+    /// (not its objectid 256): the kernel reconnects decoded file handles by
+    /// walking ".." up to a nodeid it knows (open_by_handle_at, bd-674qe).
+    #[test]
+    fn btrfs_top_level_dir_dotdot_is_presented_as_the_root() {
+        let Some((fs, _dev, _tmp, _image)) = open_writable_btrfs_mkfs(256) else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let ops: &dyn FsOps = &fs;
+        let dir = ops
+            .mkdir(
+                &cx,
+                &mut RequestScope::empty(),
+                InodeNumber(1),
+                OsStr::new("d"),
+                0o755,
+                0,
+                0,
+            )
+            .expect("mkdir");
+        let entries = ops
+            .readdir(&cx, &mut RequestScope::empty(), dir.ino, 0)
+            .expect("readdir");
+        let dotdot = entries
+            .iter()
+            .find(|entry| entry.name == b"..")
+            .expect("..");
+        assert_eq!(dotdot.ino, InodeNumber(1), "{:?}", entries.to_vec());
+        let root = ops
+            .readdir(&cx, &mut RequestScope::empty(), InodeNumber(1), 0)
+            .expect("readdir root");
+        let root_dotdot = root.iter().find(|entry| entry.name == b"..").expect("..");
+        assert_eq!(root_dotdot.ino, InodeNumber(1));
     }
 
     #[test]

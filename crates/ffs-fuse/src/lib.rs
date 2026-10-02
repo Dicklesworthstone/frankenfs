@@ -5822,6 +5822,14 @@ impl Filesystem for FrankenFuse {
             }
         }
 
+        // name_to_handle_at / open_by_handle_at and NFS export: without this
+        // the kernel answers ESTALE for any handle whose inode it has
+        // dropped; with it, it asks us via LOOKUP of "." and ".." (handled
+        // in lookup_impl). xfstests generic/426, 467, 477.
+        if let Err(missing) = config.add_capabilities(fuse_consts::FUSE_EXPORT_SUPPORT) {
+            debug!(missing, "kernel declined FUSE_EXPORT_SUPPORT");
+        }
+
         // ⛔ DO NOT ADD FUSE_NO_OPEN_SUPPORT HERE. The same trick for FILES looks
         // symmetric and is not, and the asymmetry is in what the reply carries:
         //
@@ -7578,6 +7586,31 @@ impl FrankenFuse {
     fn lookup_impl(&self, parent: u64, name: &OsStr, reply: ReplyEntry) {
         let cx = Self::cx_for_request();
         match self.with_request_scope(&cx, RequestOp::Lookup, |cx, scope| {
+            // FUSE_EXPORT_SUPPORT: the kernel turns a file handle back into an
+            // inode with LOOKUP(nodeid, ".") and finds a directory's parent
+            // with LOOKUP(dir, ".."). Answer both for either format: "." is
+            // the inode itself, ".." is what the directory's own listing
+            // names as its parent (btrfs has no ".." entry on disk).
+            // The entry's nodeid must be the one asked about: a getattr may
+            // report the format's own number (btrfs's root is objectid 256,
+            // presented as inode 1).
+            let entry_for = |scope: &mut RequestScope, ino: InodeNumber| {
+                let mut attr = self.inner.ops.getattr(cx, scope, ino)?;
+                attr.ino = ino;
+                Ok(attr)
+            };
+            if name == "." {
+                return entry_for(scope, InodeNumber(parent));
+            }
+            if name == ".." {
+                let page = self.inner.ops.readdir(cx, scope, InodeNumber(parent), 0)?;
+                let up = page
+                    .iter()
+                    .find(|entry| entry.name == b"..")
+                    .map(|entry| entry.ino)
+                    .ok_or_else(|| FfsError::NotFound("..".into()))?;
+                return entry_for(scope, up);
+            }
             self.inner.ops.lookup(cx, scope, InodeNumber(parent), name)
         }) {
             Ok(attr) => {
