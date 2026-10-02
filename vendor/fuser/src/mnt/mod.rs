@@ -96,7 +96,15 @@ fn is_mounted(fuse_device: &File) -> bool {
         let res = unsafe { poll(&mut poll_result, 1, 0) };
         break match res {
             0 => true,
-            1 => (poll_result.revents & libc::POLLERR) != 0,
+            // With no events requested, poll can only report an error
+            // condition, and /dev/fuse reports POLLERR once the connection is
+            // gone (unmounted). This used to read `!= 0`, i.e. "mounted" in
+            // exactly that case, so Mount::drop unmounted the PATH again after
+            // the kernel had unmounted it: with a direct mount(2) (no
+            // fusermount3 auto-unmount) that detached whatever had been
+            // mounted there since (FrankenFS bd-e94tv; seen as "Unmount
+            // failed: Invalid argument" when nothing had been).
+            1 => (poll_result.revents & libc::POLLERR) == 0,
             -1 => {
                 let err = io::Error::last_os_error();
                 if err.kind() == io::ErrorKind::Interrupted {
