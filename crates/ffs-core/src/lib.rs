@@ -39842,6 +39842,72 @@ impl OpenFs {
 
     /// Preallocate extents in a btrfs filesystem.
     #[allow(clippy::too_many_lines)]
+    /// An fallocate over `[offset, end)` that is not block aligned, the way
+    /// kernel btrfs does it: whole blocks through the aligned path, partial
+    /// edge blocks by writing zeroes (punch / zero range; punch and KEEP_SIZE
+    /// never write past EOF), and a plain preallocation rounded out to whole
+    /// blocks with i_size then extended to exactly `end`. It used to return
+    /// EOPNOTSUPP (xfstests generic/008, 014 and fsx on btrfs).
+    #[allow(clippy::too_many_arguments)]
+    fn btrfs_fallocate_unaligned(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        offset: u64,
+        end: u64,
+        mode: i32,
+        sectorsize: u64,
+        size_before: u64,
+    ) -> ffs_error::Result<()> {
+        let (keep_size, punch_hole, _, zero_range, _, _) = Self::btrfs_fallocate_flags(mode);
+        if !(punch_hole || zero_range) {
+            let start = offset - offset % sectorsize;
+            let stop = end.next_multiple_of(sectorsize);
+            self.btrfs_fallocate(
+                cx,
+                ino,
+                start,
+                stop - start,
+                mode | Self::BTRFS_FALLOC_FL_KEEP_SIZE,
+            )?;
+            if !keep_size && end > size_before {
+                self.btrfs_setattr(
+                    cx,
+                    ino,
+                    &SetAttrRequest {
+                        size: Some(end),
+                        ..SetAttrRequest::default()
+                    },
+                )?;
+            }
+            return Ok(());
+        }
+        let limit = if punch_hole || keep_size {
+            size_before.min(end)
+        } else {
+            end
+        };
+        let zero = |from: u64, to: u64| -> ffs_error::Result<()> {
+            let to = to.min(limit);
+            if from < to {
+                let len = usize::try_from(to - from)
+                    .map_err(|_| FfsError::InvalidGeometry("zero span exceeds usize".into()))?;
+                self.btrfs_write(cx, ino, from, &vec![0_u8; len])?;
+            }
+            Ok(())
+        };
+        let inner_start = offset.next_multiple_of(sectorsize);
+        let inner_end = end - end % sectorsize;
+        if inner_start < inner_end {
+            zero(offset, inner_start)?;
+            self.btrfs_fallocate(cx, ino, inner_start, inner_end - inner_start, mode)?;
+            zero(inner_end, end)?;
+        } else {
+            zero(offset, end)?;
+        }
+        Ok(())
+    }
+
     fn btrfs_fallocate(
         &self,
         cx: &Cx,
@@ -39916,9 +39982,17 @@ impl OpenFs {
                     libc::EINVAL,
                 )));
             }
-            return Err(FfsError::UnsupportedFeature(
-                "btrfs fallocate currently requires sector-aligned offset/length".to_owned(),
-            ));
+            let size_before = inode.size;
+            drop(alloc);
+            return self.btrfs_fallocate_unaligned(
+                cx,
+                ino,
+                offset,
+                new_end,
+                mode,
+                sectorsize,
+                size_before,
+            );
         }
 
         if collapse_range {
@@ -85924,6 +85998,76 @@ mod tests {
     fn open_writable_btrfs() -> (OpenFs, Cx) {
         let (fs, cx, _) = open_writable_btrfs_with_device();
         (fs, cx)
+    }
+
+    /// Unaligned fallocate on btrfs (xfstests generic/008, 014): punch and
+    /// zero range zero exactly the requested bytes and keep the neighbours,
+    /// punch never moves i_size, and a plain preallocation extends i_size to
+    /// exactly offset + len.
+    #[test]
+    fn btrfs_unaligned_fallocate_matches_kernel_semantics() {
+        let (fs, cx) = open_writable_btrfs();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let bs = 4096_u64;
+        let total = usize::try_from(bs * 5).unwrap();
+        let file = |name: &str| {
+            let ino = fs
+                .create(&cx, root, OsStr::new(name), 0o644, 0, 0)
+                .expect("create")
+                .ino;
+            fs.write(&cx, ino, 0, &vec![0xAB_u8; total]).expect("write");
+            ino
+        };
+        let expect_zeroed = |ino: InodeNumber, off: u64, len: u64, what: &str| {
+            let got = fs
+                .read(&cx, ino, 0, u32::try_from(total).unwrap())
+                .expect("read");
+            assert_eq!(got.len(), total, "{what}: size");
+            for (i, b) in got.iter().enumerate() {
+                let i = i as u64;
+                let want = if (off..off + len).contains(&i) {
+                    0
+                } else {
+                    0xAB
+                };
+                assert_eq!(*b, want, "{what}: byte {i}");
+            }
+        };
+
+        let punched = file("punch");
+        fs.fallocate(
+            &cx,
+            punched,
+            bs / 2,
+            3 * bs,
+            libc::FALLOC_FL_KEEP_SIZE | libc::FALLOC_FL_PUNCH_HOLE,
+        )
+        .expect("unaligned punch");
+        expect_zeroed(punched, bs / 2, 3 * bs, "punch across blocks");
+
+        let zeroed = file("zero");
+        fs.fallocate(&cx, zeroed, 100, 300, libc::FALLOC_FL_ZERO_RANGE)
+            .expect("unaligned zero range inside one block");
+        expect_zeroed(zeroed, 100, 300, "zero range in one block");
+
+        let grown = fs
+            .create(&cx, root, OsStr::new("grow"), 0o644, 0, 0)
+            .expect("create")
+            .ino;
+        fs.fallocate(&cx, grown, 1000, 5000, 0)
+            .expect("unaligned preallocation");
+        assert_eq!(
+            fs.getattr(&cx, grown).expect("getattr").size,
+            6000,
+            "mode 0 extends i_size to exactly offset + len"
+        );
+        assert!(
+            fs.read(&cx, grown, 0, 6000)
+                .expect("read")
+                .iter()
+                .all(|&b| b == 0),
+            "preallocated space reads as zeroes"
+        );
     }
 
     /// xfstests generic/035 on btrfs: unlinking a pinned file, or renaming over
