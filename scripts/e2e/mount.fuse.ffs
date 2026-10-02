@@ -50,12 +50,15 @@ atime=""
 # with EACCES (xfstests generic/087's owner utime ran as uid 99 and failed).
 allow_other=""
 [[ $EUID -eq 0 ]] && allow_other=yes
-# FUSE mounts are nodev,nosuid; -o dev / -o suid ask for ffs mount --dev /
-# --suid. Not yet the default for root as with a kernel filesystem: such a
-# mount bypasses fusermount3, and making it the default broke xfstests' mount
-# cycling (generic/003 -> 004 -> 005 left TEST_DIR unusable; bd-e94tv).
+# mount(8) by root defaults to dev,suid, as for a kernel filesystem; FUSE
+# defaults to nodev,nosuid, which made device nodes on the mount unopenable
+# (xfstests generic/184: EACCES). -o nodev / -o nosuid opt out.
 dev=""
 suid=""
+if [[ $EUID -eq 0 ]]; then
+    dev=yes
+    suid=yes
+fi
 for part in "${parts[@]}"; do
     case $part in
         allow_other) allow_other=yes ;;
