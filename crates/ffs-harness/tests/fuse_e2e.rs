@@ -19244,6 +19244,38 @@ fn fast_commit_crash_image_linear_dir_fills_and_is_indexed_bd_9m84h() {
     );
 }
 
+// bd-9m84h: the same on a filesystem without dir_index: the kernel's replay
+// appends a block to the full linear directory (ext4_append), and so must
+// FrankenFS's.
+#[test]
+fn fast_commit_crash_image_linear_dir_grows_without_dir_index_bd_9m84h() {
+    let names: Vec<String> = (0..80)
+        .map(|i| format!("entry_{i:04}_{}", "y".repeat(40)))
+        .collect();
+    let (old, new) = names.split_at(55);
+    let mut expected: Vec<&str> = names.iter().map(String::as_str).collect();
+    expected.push("alpha");
+    expected.sort_unstable();
+    run_fc_kernel_scenario_with(
+        "fast_commit,^dir_index",
+        "fc_crash_image_linear_dir_no_dir_index_bd_9m84h",
+        &|dir| {
+            fs::write(dir.join("alpha"), b"alpha").unwrap();
+            for name in old {
+                fs::write(dir.join(name), name.as_bytes()).unwrap();
+            }
+        },
+        &|dir| {
+            for name in new {
+                fs::write(dir.join(name), name.as_bytes()).unwrap();
+            }
+            fc_fsynced_write(dir, "alpha", b" grows", true);
+        },
+        &expected,
+        true,
+    );
+}
+
 // bd-9m84h: a fast commit too big for the fast-commit area. The kernel falls
 // back to a full commit and leaves a lone HEAD naming that commit's tid in the
 // area; recovery must treat it as stale (as the kernel does), not as an
@@ -19307,8 +19339,27 @@ fn fast_commit_crash_image_extent_tree_growth_matches_kernel_bd_9m84h() {
 ///
 /// Prerequisites: mkfs.ext4 with fast_commit support, sudo (loop mounts),
 /// kernel ext4 fast_commit support.
-#[allow(clippy::too_many_lines)]
 fn run_fc_kernel_scenario(
+    scenario: &str,
+    baseline: &dyn Fn(&Path),
+    changes: &dyn Fn(&Path),
+    expected_names: &[&str],
+    expect_fast_commit: bool,
+) {
+    run_fc_kernel_scenario_with(
+        "fast_commit",
+        scenario,
+        baseline,
+        changes,
+        expected_names,
+        expect_fast_commit,
+    );
+}
+
+/// [`run_fc_kernel_scenario`] on an image made with `mkfs.ext4 -O features`.
+#[allow(clippy::too_many_lines)]
+fn run_fc_kernel_scenario_with(
+    features: &str,
     scenario: &str,
     baseline: &dyn Fn(&Path),
     changes: &dyn Fn(&Path),
@@ -19338,7 +19389,7 @@ fn run_fc_kernel_scenario(
     f.set_len(64 * 1024 * 1024).unwrap();
     drop(f);
     let output = Command::new("mkfs.ext4")
-        .args(["-F", "-b", "4096", "-O", "fast_commit"])
+        .args(["-F", "-b", "4096", "-O", features])
         .arg(&img)
         .output()
         .expect("mkfs.ext4");

@@ -3723,16 +3723,31 @@ impl std::fmt::Debug for OpenFs {
     }
 }
 
-/// A `ffs_btree::BlockAllocator` that refuses to allocate (bd-6nwjx). Used by
-/// fast-commit ADD_RANGE recovery so an extent insert succeeds only when it
-/// fits an existing leaf with no tree growth — growth needs the writable-path
-/// block allocator, which is not available during mount recovery.
+/// How fast-commit recovery grows a directory with no room for a replayed
+/// entry, mirroring the kernel's replay through ext4_add_entry (bd-9m84h).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FcDirGrowth {
+    /// Split the full htree leaf at `target_logical` (block `phys`); falls back
+    /// to `Rebuild` when the split declines.
+    Split { target_logical: u32, phys: u64 },
+    /// Rebuild the htree index; also how a full linear directory on a
+    /// dir_index filesystem becomes indexed (make_indexed_dir).
+    Rebuild,
+    /// Append a block to a full linear directory without dir_index
+    /// (ext4_append).
+    AppendLinear,
+}
+
 /// One fast-commit range record of an inode, kept in log order.
 enum FcRangeOp {
     Add(Ext4Extent),
     Del { logical_block: u32, len: u32 },
 }
 
+/// A `ffs_btree::BlockAllocator` that refuses to allocate (bd-6nwjx). Used by
+/// fast-commit ADD_RANGE recovery so an extent insert succeeds only when it
+/// fits an existing leaf with no tree growth — growth needs the writable-path
+/// block allocator, which is not available during mount recovery.
 struct NoGrowBlockAllocator {
     has_metadata_csum: bool,
     csum_seed: u32,
@@ -9096,9 +9111,10 @@ impl OpenFs {
     ///   the kernel's normalization, and the write side has no linear safety net
     ///   (bd-owt2r);
     /// - the htree index is unreadable — refusing to mutate beats a linear write
-    ///   into the dx_root;
-    /// - a linear directory has no block with room — growing it is not done
-    ///   at recovery yet (a full htree leaf is split, see above).
+    ///   into the dx_root.
+    ///
+    /// A directory with no room grows as the kernel's replay grows it (see
+    /// [`FcDirGrowth`]).
     ///
     /// Returns `Ok(true)` when the entry was spliced in, or when it is already
     /// present (idempotent: the create may also have been captured by JBD2 replay
@@ -9193,21 +9209,18 @@ impl OpenFs {
         }
 
         // Every block is full. With dir_index the kernel's replay indexes the
-        // directory (make_indexed_dir); do the same. Without it the directory
-        // would grow linearly, which recovery does not do yet.
+        // directory (make_indexed_dir); without it, it appends a block
+        // (ext4_append). Do the same.
         let has_dir_index = self
             .ext4_superblock()
             .is_some_and(|sb| sb.has_compat(ffs_ondisk::ext4::Ext4CompatFeatures::DIR_INDEX));
-        if has_dir_index {
-            self.fast_commit_grow_directory(cx, &parent, dentry, file_type, excluded, None)?;
-            return Ok(true);
-        }
-        warn!(
-            parent_ino,
-            ino = dentry.ino,
-            "fc_apply: CREAT/LINK skipped — full linear directory without dir_index"
-        );
-        Ok(false)
+        let growth = if has_dir_index {
+            FcDirGrowth::Rebuild
+        } else {
+            FcDirGrowth::AppendLinear
+        };
+        self.fast_commit_grow_directory(cx, &parent, dentry, file_type, excluded, growth)?;
+        Ok(true)
     }
 
     /// htree branch of [`Self::apply_fast_commit_add_dentry`]: descend the DX
@@ -9289,17 +9302,22 @@ impl OpenFs {
 
         // The hash-correct leaf is full: split it (or rebuild the index), as
         // the kernel's replay does through ext4_add_entry.
-        let split = (!casefold).then_some((target_logical, phys));
-        self.fast_commit_grow_directory(cx, parent, dentry, file_type, excluded, split)?;
+        let growth = if casefold {
+            FcDirGrowth::Rebuild
+        } else {
+            FcDirGrowth::Split {
+                target_logical,
+                phys,
+            }
+        };
+        self.fast_commit_grow_directory(cx, parent, dentry, file_type, excluded, growth)?;
         Ok(true)
     }
 
     /// Add `dentry` to a directory with no room for it, with the write path's
-    /// own growth helpers: split the full htree leaf `split` names, else
-    /// rebuild the index (which also turns a full linear directory into an
-    /// htree, like the kernel's make_indexed_dir). Blocks come from a
-    /// transient recovery allocator that first claims every block a live
-    /// recovered inode names (`excluded`), and its counts are persisted.
+    /// own growth helpers (see [`FcDirGrowth`]). Blocks come from a transient
+    /// recovery allocator that first claims every block a live recovered
+    /// inode names (`excluded`), and its counts are persisted.
     fn fast_commit_grow_directory(
         &self,
         cx: &Cx,
@@ -9307,7 +9325,7 @@ impl OpenFs {
         dentry: &ffs_journal::FcDentry,
         file_type: Ext4FileType,
         excluded: &[(u64, u32)],
-        split: Option<(u32, u64)>,
+        growth: FcDirGrowth,
     ) -> Result<(), FfsError> {
         let csum_seed = self
             .ext4_superblock()
@@ -9331,7 +9349,11 @@ impl OpenFs {
         let parent_n = InodeNumber(u64::from(dentry.parent_ino));
         {
             let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
-            let done = if let Some((target_logical, phys)) = split {
+            let done = if let FcDirGrowth::Split {
+                target_logical,
+                phys,
+            } = growth
+            {
                 let leaf = self.read_block_vec(cx, BlockNumber(phys))?;
                 self.ext4_split_htree_leaf_and_add(
                     cx,
@@ -9351,6 +9373,22 @@ impl OpenFs {
                     nanos,
                 )?
                 .is_some()
+            } else if growth == FcDirGrowth::AppendLinear {
+                self.ext4_append_linear_dir_block(
+                    cx,
+                    &block_dev,
+                    &mut backend,
+                    parent_n,
+                    parent,
+                    &extents,
+                    &dentry.name,
+                    dentry.ino,
+                    file_type,
+                    csum_seed,
+                    secs,
+                    nanos,
+                )?;
+                true
             } else {
                 false
             };
@@ -9377,7 +9415,7 @@ impl OpenFs {
         debug!(
             parent_ino = dentry.parent_ino,
             ino = dentry.ino,
-            split = split.is_some(),
+            ?growth,
             "fc_apply: directory grown at recovery"
         );
         Ok(())
@@ -27549,157 +27587,197 @@ impl OpenFs {
             }
 
             // No dir_index feature: keep the directory linear (kernel behaviour
-            // without dir_index). Allocate a new directory block.
-            // bd-bhh0i: the linear append uses d's single backend; the `geo`
-            // snapshot avoids borrowing the backend across its &mut calls.
-            let geo = backend.dir_geo();
-            let parent_new_size = parent_inode
-                .size
-                .checked_add(u64::from(geo.block_size))
-                .ok_or_else(|| FfsError::Corruption {
-                    block: 0,
-                    detail: format!(
-                        "inode {} directory size overflow on block expansion",
-                        parent.0
-                    ),
-                })?;
-            let added_sectors = if parent_inode.is_huge_file() {
-                1
-            } else {
-                u64::from(geo.block_size / EXT4_SECTOR_SIZE)
-            };
-            let parent_blocks_after_alloc = Self::ext4_checked_inode_blocks_delta(
-                parent_inode.blocks,
-                parent,
-                i128::from(added_sectors),
-            )?;
-            let hint = self.numa_allocation_hint(
-                &geo,
-                AllocHint {
-                    goal_block: extents.last().map(Self::extent_end_hint),
-                    ..AllocHint::default()
-                },
-                "ext4_dir_growth",
-                Some(parent),
-            );
-            let new_alloc = backend.dir_alloc_blocks(cx, dev, 1, &hint)?;
-
-            let block_size = usize::try_from(geo.block_size)
-                .map_err(|_| FfsError::Format("block size does not fit usize".into()))?;
-            let mut new_block = vec![0u8; block_size];
-            // Write a single empty dir entry spanning the whole block (minus tail), then add our entry.
-            // Initialize with a single unused entry spanning the usable area.
-            {
-                // rec_len covers the usable area
-                let rec_len =
-                    u16::try_from(block_size.saturating_sub(reserved_tail)).map_err(|_| {
-                        FfsError::Format("directory block size exceeds 16-bit rec_len field".into())
-                    })?;
-                new_block[4..6].copy_from_slice(&rec_len.to_le_bytes());
-                // inode=0, name_len=0, file_type=0 ⇒ unused entry
-            }
-            // Initialize the checksum tail (if present) so that
-            // parse_dir_block does not misinterpret the trailing zeros
-            // as an entry with rec_len = block_size (rec_len_from_disk
-            // treats raw=0 as block_size).
-            if reserved_tail >= 12 {
-                let tail_off = block_size - reserved_tail;
-                // inode=0 (already zero)
-                // rec_len=12
-                new_block[tail_off + 4..tail_off + 6].copy_from_slice(&12_u16.to_le_bytes());
-                // name_len=0 (already zero)
-                // file_type = 0xDE (EXT4_FT_DIR_CSUM)
-                new_block[tail_off + 7] = 0xDE;
-            }
-            ffs_dir::add_entry(
-                &mut new_block,
-                child_ino_u32,
-                name,
-                file_type,
-                reserved_tail,
-            )?;
-            self.stamp_ext4_dir_block(&mut new_block, parent_ino_u32, parent_generation);
-            dev.write_block(cx, new_alloc.start, &new_block)?;
-
-            // Insert extent for the new directory block and update parent metadata.
-            let mut parent_upd = parent_inode.clone();
-            let logical_end = extents
-                .iter()
-                .map(|e| e.logical_block + u32::from(e.actual_len()))
-                .max()
-                .unwrap_or(0);
-            let extent = Ext4Extent {
-                logical_block: logical_end,
-                raw_len: 1,
-                physical_start: new_alloc.start.0,
-            };
-            let mut root_bytes = Self::extent_root(&parent_upd);
-            let tree_hint = self.numa_allocation_hint(
-                &geo,
-                AllocHint {
-                    goal_block: Some(new_alloc.start),
-                    ..AllocHint::default()
-                },
-                "ext4_dir_extent_tree",
-                Some(parent),
-            );
-            // Snapshot the cache namespace from the pre-mutation inode: the
-            // extent cache keys entries by FNV(extent_root_bytes), which shifts
-            // once `set_extent_root` rewrites i_block below. Invalidating under
-            // the post-mutation namespace would target a different key and leave
-            // this directory's previously-cached entries orphaned under the old
-            // namespace (the stale-hole window tracked by bd-j6ljg). Capture the
-            // namespace the entries were actually cached under, matching the
-            // pre-mutation invalidation order used on the file write-allocate
-            // path. (bd-j6ljg's proper fix is a stable (ino,generation) key.)
-            let parent_extent_ns = extent_cache_namespace(&parent_upd);
-            // Charge any extent-tree metadata blocks this insert allocates (once
-            // the directory's tree grows past its inline depth-0 root) to the dir
-            // i_blocks, or e2fsck reports it short — the data-block delta above
-            // counts only the new directory data block. Read via `dev` so the
-            // freshly-staged tree blocks in this txn are visible (bd-kyp2q). The
-            // common case (tree still inline) costs no device reads (depth 0 → 0).
-            let dir_meta_before =
-                Self::ext4_count_extent_tree_meta_blocks_via_dev(cx, dev, &root_bytes)?;
-            backend.dir_insert_extent(
+            // without dir_index).
+            self.ext4_append_linear_dir_block(
                 cx,
                 dev,
-                &mut root_bytes,
-                extent,
-                u32::try_from(parent.0).unwrap_or(u32::MAX),
-                parent_upd.generation,
-                tree_hint,
-            )?;
-            let dir_meta_after =
-                Self::ext4_count_extent_tree_meta_blocks_via_dev(cx, dev, &root_bytes)?;
-            self.invalidate_ext4_write_extent_snapshot(&parent_upd);
-            Self::set_extent_root(&mut parent_upd, &root_bytes);
-            self.extent_cache.invalidate_range(
-                parent_extent_ns,
-                logical_end,
-                u64::from(u32::MAX - logical_end),
-            );
-            parent_upd.size = parent_new_size;
-            parent_upd.blocks = parent_blocks_after_alloc;
-            Self::ext4_apply_extent_meta_delta(
-                &mut parent_upd,
+                &mut *backend,
                 parent,
-                dir_meta_before,
-                dir_meta_after,
-                u64::from(geo.block_size / EXT4_SECTOR_SIZE),
-            )?;
-            if file_type == Ext4FileType::Dir {
-                parent_upd.links_count = Self::ext4_dir_link_inc(
-                    parent_upd.links_count,
-                    parent,
-                    parent_upd.flags & ffs_types::EXT4_INDEX_FL != 0,
-                )?;
-            }
-            ffs_inode::touch_mtime_ctime(&mut parent_upd, tstamp_secs, tstamp_nanos);
-            backend.dir_write_inode(cx, dev, parent, &parent_upd, csum_seed)?;
-
-            Ok(())
+                parent_inode,
+                &extents,
+                name,
+                child_ino_u32,
+                file_type,
+                csum_seed,
+                tstamp_secs,
+                tstamp_nanos,
+            )
         })()
+    }
+
+    /// Grow a full linear directory by one block holding the new entry: the
+    /// directory's next logical block, its extent, i_size and i_blocks, as the
+    /// kernel's ext4_append does without dir_index. All writes go through
+    /// `dev`; fast-commit recovery passes the direct device (bd-9m84h).
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    fn ext4_append_linear_dir_block(
+        &self,
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        backend: &mut dyn DirAllocBackend,
+        parent: InodeNumber,
+        parent_inode: &Ext4Inode,
+        extents: &[Ext4Extent],
+        name: &[u8],
+        child_ino_u32: u32,
+        file_type: Ext4FileType,
+        csum_seed: u32,
+        tstamp_secs: u64,
+        tstamp_nanos: u32,
+    ) -> ffs_error::Result<()> {
+        let parent_ino_u32 = u32::try_from(parent.0)
+            .map_err(|_| FfsError::Format("inode number exceeds ext4 32-bit limit".into()))?;
+        let parent_generation = parent_inode.generation;
+        let reserved_tail = self.ext4_dir_reserved_tail();
+        // bd-bhh0i: the linear append uses d's single backend; the `geo`
+        // snapshot avoids borrowing the backend across its &mut calls.
+        let geo = backend.dir_geo();
+        let parent_new_size = parent_inode
+            .size
+            .checked_add(u64::from(geo.block_size))
+            .ok_or_else(|| FfsError::Corruption {
+                block: 0,
+                detail: format!(
+                    "inode {} directory size overflow on block expansion",
+                    parent.0
+                ),
+            })?;
+        let added_sectors = if parent_inode.is_huge_file() {
+            1
+        } else {
+            u64::from(geo.block_size / EXT4_SECTOR_SIZE)
+        };
+        let parent_blocks_after_alloc = Self::ext4_checked_inode_blocks_delta(
+            parent_inode.blocks,
+            parent,
+            i128::from(added_sectors),
+        )?;
+        let hint = self.numa_allocation_hint(
+            &geo,
+            AllocHint {
+                goal_block: extents.last().map(Self::extent_end_hint),
+                ..AllocHint::default()
+            },
+            "ext4_dir_growth",
+            Some(parent),
+        );
+        let new_alloc = backend.dir_alloc_blocks(cx, dev, 1, &hint)?;
+
+        let block_size = usize::try_from(geo.block_size)
+            .map_err(|_| FfsError::Format("block size does not fit usize".into()))?;
+        let mut new_block = vec![0u8; block_size];
+        // Write a single empty dir entry spanning the whole block (minus tail), then add our entry.
+        // Initialize with a single unused entry spanning the usable area.
+        {
+            // rec_len covers the usable area
+            let rec_len =
+                u16::try_from(block_size.saturating_sub(reserved_tail)).map_err(|_| {
+                    FfsError::Format("directory block size exceeds 16-bit rec_len field".into())
+                })?;
+            new_block[4..6].copy_from_slice(&rec_len.to_le_bytes());
+            // inode=0, name_len=0, file_type=0 ⇒ unused entry
+        }
+        // Initialize the checksum tail (if present) so that
+        // parse_dir_block does not misinterpret the trailing zeros
+        // as an entry with rec_len = block_size (rec_len_from_disk
+        // treats raw=0 as block_size).
+        if reserved_tail >= 12 {
+            let tail_off = block_size - reserved_tail;
+            // inode=0 (already zero)
+            // rec_len=12
+            new_block[tail_off + 4..tail_off + 6].copy_from_slice(&12_u16.to_le_bytes());
+            // name_len=0 (already zero)
+            // file_type = 0xDE (EXT4_FT_DIR_CSUM)
+            new_block[tail_off + 7] = 0xDE;
+        }
+        ffs_dir::add_entry(
+            &mut new_block,
+            child_ino_u32,
+            name,
+            file_type,
+            reserved_tail,
+        )?;
+        self.stamp_ext4_dir_block(&mut new_block, parent_ino_u32, parent_generation);
+        dev.write_block(cx, new_alloc.start, &new_block)?;
+
+        // Insert extent for the new directory block and update parent metadata.
+        let mut parent_upd = parent_inode.clone();
+        let logical_end = extents
+            .iter()
+            .map(|e| e.logical_block + u32::from(e.actual_len()))
+            .max()
+            .unwrap_or(0);
+        let extent = Ext4Extent {
+            logical_block: logical_end,
+            raw_len: 1,
+            physical_start: new_alloc.start.0,
+        };
+        let mut root_bytes = Self::extent_root(&parent_upd);
+        let tree_hint = self.numa_allocation_hint(
+            &geo,
+            AllocHint {
+                goal_block: Some(new_alloc.start),
+                ..AllocHint::default()
+            },
+            "ext4_dir_extent_tree",
+            Some(parent),
+        );
+        // Snapshot the cache namespace from the pre-mutation inode: the
+        // extent cache keys entries by FNV(extent_root_bytes), which shifts
+        // once `set_extent_root` rewrites i_block below. Invalidating under
+        // the post-mutation namespace would target a different key and leave
+        // this directory's previously-cached entries orphaned under the old
+        // namespace (the stale-hole window tracked by bd-j6ljg). Capture the
+        // namespace the entries were actually cached under, matching the
+        // pre-mutation invalidation order used on the file write-allocate
+        // path. (bd-j6ljg's proper fix is a stable (ino,generation) key.)
+        let parent_extent_ns = extent_cache_namespace(&parent_upd);
+        // Charge any extent-tree metadata blocks this insert allocates (once
+        // the directory's tree grows past its inline depth-0 root) to the dir
+        // i_blocks, or e2fsck reports it short — the data-block delta above
+        // counts only the new directory data block. Read via `dev` so the
+        // freshly-staged tree blocks in this txn are visible (bd-kyp2q). The
+        // common case (tree still inline) costs no device reads (depth 0 → 0).
+        let dir_meta_before =
+            Self::ext4_count_extent_tree_meta_blocks_via_dev(cx, dev, &root_bytes)?;
+        backend.dir_insert_extent(
+            cx,
+            dev,
+            &mut root_bytes,
+            extent,
+            u32::try_from(parent.0).unwrap_or(u32::MAX),
+            parent_upd.generation,
+            tree_hint,
+        )?;
+        let dir_meta_after =
+            Self::ext4_count_extent_tree_meta_blocks_via_dev(cx, dev, &root_bytes)?;
+        self.invalidate_ext4_write_extent_snapshot(&parent_upd);
+        Self::set_extent_root(&mut parent_upd, &root_bytes);
+        self.extent_cache.invalidate_range(
+            parent_extent_ns,
+            logical_end,
+            u64::from(u32::MAX - logical_end),
+        );
+        parent_upd.size = parent_new_size;
+        parent_upd.blocks = parent_blocks_after_alloc;
+        Self::ext4_apply_extent_meta_delta(
+            &mut parent_upd,
+            parent,
+            dir_meta_before,
+            dir_meta_after,
+            u64::from(geo.block_size / EXT4_SECTOR_SIZE),
+        )?;
+        if file_type == Ext4FileType::Dir {
+            parent_upd.links_count = Self::ext4_dir_link_inc(
+                parent_upd.links_count,
+                parent,
+                parent_upd.flags & ffs_types::EXT4_INDEX_FL != 0,
+            )?;
+        }
+        ffs_inode::touch_mtime_ctime(&mut parent_upd, tstamp_secs, tstamp_nanos);
+        backend.dir_write_inode(cx, dev, parent, &parent_upd, csum_seed)?;
+
+        Ok(())
     }
 
     /// Incrementally split one full htree leaf and add the new entry, the O(log N)
@@ -51732,10 +51810,72 @@ mod tests {
         image
     }
 
+    /// A committed CREATE into a root directory flagged INDEX_FL whose block 0
+    /// is a plain linear block, not a dx_root: an entry recovery cannot place
+    /// (it refuses rather than write linearly into what claims to be an index).
+    fn build_unreadable_htree_fast_commit_image() -> Vec<u8> {
+        let mut image = build_ext4_image_with_fast_commit_create_evidence();
+        let root_flags = 4 * 4096 + 256 + 0x20;
+        let flags = 0x0008_0000_u32 | ffs_types::EXT4_INDEX_FL;
+        image[root_flags..root_flags + 4].copy_from_slice(&flags.to_le_bytes());
+        let payload = build_fc_create_transaction(2, 11, b"recovered-name.txt", TEST_FC_TID);
+        let fc_block = &mut image[TEST_FC_AREA_OFFSET..TEST_FC_AREA_OFFSET + 4096];
+        fc_block.fill(0);
+        fc_block[..payload.len()].copy_from_slice(&payload);
+        image
+    }
+
     #[test]
-    fn fast_commit_apply_rejects_full_directory_without_mutation() {
+    fn fast_commit_apply_grows_a_full_linear_directory_without_dir_index_bd_9m84h() {
         for create in [true, false] {
             let image = build_full_directory_fast_commit_image();
+            let data = std::sync::Arc::new(std::sync::Mutex::new(image));
+            let dev = TestDevice {
+                data: std::sync::Arc::clone(&data),
+            };
+            let cx = Cx::for_testing();
+            let options = OpenOptions {
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                ..OpenOptions::default()
+            };
+            let fs =
+                OpenFs::from_device(&cx, Box::new(dev), &options).expect("open diagnostic image");
+            assert!(
+                !fs.ext4_superblock()
+                    .unwrap()
+                    .has_compat(ffs_ondisk::ext4::Ext4CompatFeatures::DIR_INDEX),
+                "fixture must lack dir_index"
+            );
+            let size_before = fs.read_inode(&cx, InodeNumber(2)).unwrap().size;
+            let dentry = ffs_journal::FcDentry {
+                parent_ino: 2,
+                ino: 11,
+                name: b"recovered-name.txt".to_vec(),
+            };
+            let op = if create {
+                ffs_journal::FcOperation::Create(dentry)
+            } else {
+                ffs_journal::FcOperation::Link(dentry)
+            };
+            fs.apply_fast_commit_operations(&cx, &[op], true)
+                .expect("a full linear directory grows by a block (ext4_append)");
+            let root = fs.read_inode(&cx, InodeNumber(2)).unwrap();
+            assert_eq!(root.size, size_before + 4096);
+            assert!(!root.has_htree_index(), "the directory stays linear");
+            for name in [&b"recovered-name.txt"[..], b"entry-0000", b"hello.txt"] {
+                let entry = fs
+                    .lookup_name(&cx, &root, name)
+                    .unwrap()
+                    .unwrap_or_else(|| panic!("{} lost", String::from_utf8_lossy(name)));
+                assert_eq!(entry.inode, 11);
+            }
+        }
+    }
+
+    #[test]
+    fn fast_commit_apply_rejects_an_unplaceable_entry_without_mutation() {
+        for create in [true, false] {
+            let image = build_unreadable_htree_fast_commit_image();
             let data = std::sync::Arc::new(std::sync::Mutex::new(image));
             let dev = TestDevice {
                 data: std::sync::Arc::clone(&data),
@@ -51761,7 +51901,10 @@ mod tests {
             let error = fs
                 .apply_fast_commit_operations(&cx, &[op], true)
                 .expect_err("a skipped insertion must not be reported as recovery");
-            assert!(matches!(error, FfsError::UnsupportedFeature(_)));
+            assert!(
+                matches!(error, FfsError::UnsupportedFeature(_)),
+                "unexpected error: {error:?}"
+            );
             assert!(error.to_string().contains("recovery incomplete"));
             assert_eq!(*data.lock().unwrap(), before);
         }
@@ -51848,7 +51991,7 @@ mod tests {
             Ext4JournalReplayMode::Apply,
             Ext4JournalReplayMode::SimulateOverlay,
         ] {
-            let before = build_full_directory_fast_commit_image();
+            let before = build_unreadable_htree_fast_commit_image();
             let data = std::sync::Arc::new(std::sync::Mutex::new(before.clone()));
             let options = OpenOptions {
                 ext4_journal_replay_mode: mode,
@@ -51860,7 +52003,10 @@ mod tests {
                 };
                 let error = OpenFs::from_device(&cx, Box::new(dev), &options)
                     .expect_err("initial open and retry must reject incomplete recovery");
-                assert!(matches!(error, FfsError::UnsupportedFeature(_)));
+                assert!(
+                    matches!(error, FfsError::UnsupportedFeature(_)),
+                    "unexpected error: {error:?}"
+                );
                 assert!(error.to_string().contains("CREATE recovery incomplete"));
                 assert_eq!(
                     data.lock().unwrap()[TEST_FC_AREA_OFFSET..TEST_FC_AREA_OFFSET + 4096],
