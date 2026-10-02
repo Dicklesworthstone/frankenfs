@@ -89,7 +89,12 @@ echo "== $(date -u +%FT%TZ) $bin ${args[*]} $image $dir" >>"$log"
     echo "PROBE before: $(grep " $dir " /proc/self/mountinfo | tr '\n' '|')"
     echo "PROBE before stat: $(stat -c '%F dev=%d ino=%i' "$dir" 2>&1)"
 } >>"$log"
-setsid "$bin" "${args[@]}" "$image" "$dir" >>"$log" 2>&1 </dev/null &
+launch=(setsid)
+if [[ $EUID -eq 0 && -d /run/systemd/system ]] && command -v systemd-run >/dev/null; then
+    launch=(systemd-run --quiet --scope --collect
+        --unit "ffs-mount-$(basename "$dir")-$$" setsid)
+fi
+"${launch[@]}" "$bin" "${args[@]}" "$image" "$dir" >>"$log" 2>&1 </dev/null &
 pid=$!
 
 # mount(8) must not return before the mount is live.
