@@ -1618,16 +1618,15 @@ enum BtrfsExtentDisposition {
     /// The item owns no freeable data extent (a non-`EXTENT_DATA` item, or an
     /// inline / hole / unallocated extent).
     Keep,
-    /// Sole reference (`refs == 1`): free the extent's space and remove its
-    /// checksums — the existing, refcount-unaware path.
-    Free {
-        disk_bytenr: u64,
-        disk_num_bytes: u64,
-    },
-    /// Shared extent (`refs > 1`, reflink / snapshot / CoW): drop only this
-    /// inode's `EXTENT_DATA_REF`, leaving the space (and csums) live for the
-    /// other references. The inverse of the validated reflink share.
-    DropRef {
+    /// Release this item's reference to a data extent: drop the
+    /// `EXTENT_DATA_REF` while other references remain (reflink / snapshot /
+    /// CoW, or another file extent of the same inode after a split), free the
+    /// space and its checksums on the last one. Decided against the LIVE
+    /// refcount when the action runs, not when the plan is built: two split
+    /// pieces of one extent both saw refs 2 at plan time, both dropped a ref,
+    /// and left an EXTENT_ITEM with refs 0 and no backref (`btrfs check`:
+    /// "owner ref check failed").
+    Release {
         disk_bytenr: u64,
         disk_num_bytes: u64,
         objectid: u64,
@@ -41472,28 +41471,13 @@ impl OpenFs {
                         disk_num_bytes,
                         extent_offset,
                         ..
-                    } if disk_bytenr > 0 => {
-                        let refs = alloc
-                            .extent_alloc
-                            .extent_item_refs(disk_bytenr, disk_num_bytes)
-                            .map_err(|e| btrfs_mutation_to_ffs(&e))?
-                            .unwrap_or(1);
-                        if refs > 1 {
-                            // u64-wrapping backref offset (matches the clone path).
-                            let ref_offset = key.offset.wrapping_sub(extent_offset);
-                            BtrfsExtentDisposition::DropRef {
-                                disk_bytenr,
-                                disk_num_bytes,
-                                objectid,
-                                ref_offset,
-                            }
-                        } else {
-                            BtrfsExtentDisposition::Free {
-                                disk_bytenr,
-                                disk_num_bytes,
-                            }
-                        }
-                    }
+                    } if disk_bytenr > 0 => BtrfsExtentDisposition::Release {
+                        disk_bytenr,
+                        disk_num_bytes,
+                        objectid,
+                        // u64-wrapping backref offset (matches the clone path).
+                        ref_offset: key.offset.wrapping_sub(extent_offset),
+                    },
                     _ => BtrfsExtentDisposition::Keep,
                 }
             } else {
@@ -41520,36 +41504,19 @@ impl OpenFs {
         for (key, disposition) in purge_plan {
             match disposition {
                 BtrfsExtentDisposition::Keep => {}
-                BtrfsExtentDisposition::Free {
-                    disk_bytenr,
-                    disk_num_bytes,
-                } => {
-                    alloc
-                        .extent_alloc
-                        .free_extent(disk_bytenr, disk_num_bytes, false)
-                        .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-                    Self::btrfs_remove_extent_csums(alloc, disk_bytenr, disk_num_bytes)?;
-                }
-                BtrfsExtentDisposition::DropRef {
+                BtrfsExtentDisposition::Release {
                     disk_bytenr,
                     disk_num_bytes,
                     objectid,
                     ref_offset,
-                } => {
-                    // Shared extent: drop only this inode's reference. The space
-                    // and its csums stay live for the remaining references.
-                    let root = alloc.fs_root_objectid;
-                    alloc
-                        .extent_alloc
-                        .remove_data_extent_ref(
-                            disk_bytenr,
-                            disk_num_bytes,
-                            root,
-                            objectid,
-                            ref_offset,
-                        )
-                        .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-                }
+                } => Self::btrfs_free_or_drop_extent_ref(
+                    alloc,
+                    disk_bytenr,
+                    disk_num_bytes,
+                    objectid,
+                    ref_offset,
+                    true,
+                )?,
             }
             alloc
                 .fs_tree
@@ -89867,6 +89834,56 @@ mod tests {
     /// clean — the refcount-aware free dropped only dst's reference (refs 2 ->
     /// 1) rather than freeing the still-live extent — and src must still read
     /// its data. Pairs with the bd-vh8p9 reflink E2E. Skips without btrfs-progs.
+    #[test]
+    fn btrfs_unlink_of_a_split_extent_frees_it_and_passes_btrfs_check() {
+        let Some((fs, dev, _tmp, image)) = open_writable_btrfs_mkfs(256) else {
+            return; // btrfs-progs unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let file = fs
+            .create(&cx, root, OsStr::new("split.dat"), 0o644, 0, 0)
+            .expect("create");
+        let fs_ops: &dyn FsOps = &fs;
+        fs_ops
+            .write(&cx, &mut RequestScope::empty(), file.ino, 0, &[0x11; 65536])
+            .expect("write");
+        let _ = fs.flush_mvcc_to_device(&cx);
+        fs.btrfs_full_transaction_commit(&cx, "split-base")
+            .expect("commit base");
+        // Overwrite the middle: the head and tail pieces now both reference
+        // the original extent (refs 2), from the same inode.
+        fs_ops
+            .write(
+                &cx,
+                &mut RequestScope::empty(),
+                file.ino,
+                16384,
+                &[0x22; 16384],
+            )
+            .expect("overwrite middle");
+        fs_ops
+            .unlink(
+                &cx,
+                &mut RequestScope::empty(),
+                root,
+                OsStr::new("split.dat"),
+            )
+            .expect("unlink");
+        let _ = fs.flush_mvcc_to_device(&cx);
+        fs.btrfs_full_transaction_commit(&cx, "split-unlink")
+            .expect("commit after unlink");
+        std::fs::write(&image, dev.snapshot_bytes()).expect("write image");
+        let Some((ok, output)) = run_btrfs_check(&image) else {
+            return; // btrfs check tool unavailable
+        };
+        assert!(
+            ok,
+            "deleting a file whose extent was split by an overwrite must free \
+             the extent, not leave a refs-0 EXTENT_ITEM:\n{output}"
+        );
+    }
+
     #[test]
     fn btrfs_unlink_shared_extent_passes_btrfs_check_bd_xkvcm() {
         let Some((fs, dev, _tmp, image)) = open_writable_btrfs_mkfs(256) else {
