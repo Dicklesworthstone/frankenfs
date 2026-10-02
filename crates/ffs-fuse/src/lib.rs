@@ -11200,6 +11200,99 @@ mod tests {
         }
     }
 
+    /// Counts request-scope begins and ends (bd-q3960).
+    #[derive(Default)]
+    struct ScopeCountingFs {
+        begins: Arc<AtomicUsize>,
+        ends: Arc<AtomicUsize>,
+    }
+    impl FsOps for ScopeCountingFs {
+        fn getattr(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<InodeAttr> {
+            Err(FfsError::NotFound("test fs miss".into()))
+        }
+        fn lookup(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _parent: InodeNumber,
+            _name: &OsStr,
+        ) -> ffs_error::Result<InodeAttr> {
+            Err(FfsError::NotFound("test fs miss".into()))
+        }
+        fn readdir(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _offset: u64,
+        ) -> ffs_error::Result<ReaddirPage> {
+            Ok(ReaddirPage::new(vec![]))
+        }
+        fn read(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+            _offset: u64,
+            _size: u32,
+        ) -> ffs_error::Result<Vec<u8>> {
+            Ok(vec![])
+        }
+        fn readlink(
+            &self,
+            _cx: &Cx,
+            _scope: &mut RequestScope,
+            _ino: InodeNumber,
+        ) -> ffs_error::Result<Vec<u8>> {
+            Ok(vec![])
+        }
+        fn begin_request_scope(&self, _cx: &Cx, _op: RequestOp) -> ffs_error::Result<RequestScope> {
+            self.begins.fetch_add(1, Ordering::SeqCst);
+            Ok(RequestScope::empty())
+        }
+        fn end_request_scope(
+            &self,
+            _cx: &Cx,
+            _op: RequestOp,
+            _scope: RequestScope,
+        ) -> ffs_error::Result<()> {
+            self.ends.fetch_add(1, Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    /// bd-q3960: a handler that panics still ends its request scope (which
+    /// releases the mutation gate in OpenFs), answers EIO, and leaves the
+    /// adapter serving the next request.
+    #[test]
+    fn a_panicking_handler_still_ends_its_request_scope_bd_q3960() {
+        let fs = ScopeCountingFs::default();
+        let (begins, ends) = (Arc::clone(&fs.begins), Arc::clone(&fs.ends));
+        let fuse = FrankenFuse::new(Box::new(fs));
+        let cx = Cx::for_testing();
+        let panicked: ffs_error::Result<()> =
+            fuse.with_request_scope(&cx, RequestOp::Write, |_, _| panic!("handler bug"));
+        assert_eq!(
+            panicked.expect_err("a panic is an error").to_errno(),
+            libc::EIO
+        );
+        assert_eq!(begins.load(Ordering::SeqCst), 1);
+        assert_eq!(
+            ends.load(Ordering::SeqCst),
+            1,
+            "the scope ended despite the panic"
+        );
+        let next: ffs_error::Result<u8> =
+            fuse.with_request_scope(&cx, RequestOp::Write, |_, _| Ok(7));
+        assert_eq!(next.expect("the adapter still serves"), 7);
+        assert_eq!(ends.load(Ordering::SeqCst), 2);
+    }
+
     /// A backend whose only failure is the durability boundary FUSE invokes
     /// after the kernel has already accepted ordinary operations.
     struct FinalFlushFailsTestFs;

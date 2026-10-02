@@ -3136,7 +3136,20 @@ impl FrankenFuse {
         let started = crate::dispatch_timing_enabled().then(Instant::now);
         let result = match self.inner.ops.begin_request_scope(cx, op) {
             Ok(mut scope) => {
-                let op_result = f(cx, &mut scope);
+                // bd-q3960: the scope MUST end even if the handler panics. A
+                // gated mutation that unwound past end_request_scope left the
+                // mutation gate's in-flight count raised, and every later
+                // fsync waited in close_mutation_gate forever (xfstests
+                // generic/308 before f8fb93ef). Release builds abort on panic
+                // and never get here; unwinding builds now answer EIO, keep
+                // the worker, and stay mountable.
+                let op_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    f(cx, &mut scope)
+                }))
+                .unwrap_or_else(|_| {
+                    error!(?op, "FUSE handler panicked; request answered EIO");
+                    Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EIO)))
+                });
                 let end_result = self.inner.ops.end_request_scope(cx, op, scope);
 
                 match (op_result, end_result) {
