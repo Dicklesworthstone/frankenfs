@@ -221,6 +221,13 @@ const BTRFS_DIR_START_INDEX: u64 = 2;
 /// upward from `BTRFS_FIRST_FREE_OBJECTID` and never reach 2^63.
 const BTRFS_SUBVOL_LINK_INO_BIT: u64 = 1 << 63;
 
+/// Highest objectid an inode can have (-256). Above it are reserved
+/// objectids: orphan items (-5), logged csum items (-10). The next free inode
+/// number is computed below it; counting those made it wrap into them, and
+/// the kernel's tree-checker rejected the extent tree ("invalid data ref
+/// objectid") of an image FrankenFS wrote after replaying a tree log.
+const BTRFS_LAST_FREE_OBJECTID: u64 = (-256_i64).cast_unsigned();
+
 /// Adler-32 checksum with a 32-bit seed, matching the e2compr convention.
 ///
 /// The seed is split into `s1 = seed & 0xFFFF` and `s2 = seed >> 16`,
@@ -11003,11 +11010,16 @@ impl OpenFs {
                 // the log intact for a kernel mount, which can replay it.
                 if self.btrfs_foreign_tree_log {
                     return Err(FfsError::Format(
-                        "btrfs: this image carries a tree log in the kernel's                          log-root-tree format, which this implementation cannot                          replay. Enabling writes would discard the fsyncs it                          records. Mount it read-only, or let a kernel mount replay                          and clear the log first."
+                        "btrfs: this image carries a tree log in the kernel's \
+                         log-root-tree format, which this implementation cannot \
+                         replay. Enabling writes would discard the fsyncs it \
+                         records. Mount it read-only, or let a kernel mount replay \
+                         and clear the log first."
                             .into(),
                     ));
                 }
                 let mut alloc_state = self.load_btrfs_alloc_state(cx)?;
+                self.btrfs_materialize_tree_log(cx, &mut alloc_state)?;
                 if let Some(old_root) = shared_fs_root {
                     // Edits only the local state: an error leaves writes off and
                     // nothing installed.
@@ -11018,6 +11030,302 @@ impl OpenFs {
             }
         }
         Ok(())
+    }
+
+    /// bd-pgnsk: the COW FS tree is seeded through the tree-log overlay, so
+    /// the first commit makes the log's items permanent and clears
+    /// `log_root`. The rest of what kernel replay does has to happen here,
+    /// before anything allocates, or that commit writes an inconsistent
+    /// filesystem:
+    /// - logged EXTENT_CSUM items (objectid -10) belong in the csum tree, not
+    ///   the FS tree they were seeded into;
+    /// - a logged file extent can point at a data extent allocated after the
+    ///   last commit, which the extent tree does not know: left so, the
+    ///   allocator hands its blocks out again and overwrites logged data.
+    ///   It is claimed (EXTENT_ITEM + backref), and the extent a replaced
+    ///   item referenced loses that reference;
+    /// - a logged INODE_ITEM's `nbytes`, and a directory's `size`, are not
+    ///   authoritative: kernel replay keeps the existing values
+    ///   (`overwrite_item`) and adds what the replayed extents and names
+    ///   bring. Both are recomputed from the tree.
+    fn btrfs_materialize_tree_log(
+        &self,
+        cx: &Cx,
+        alloc: &mut BtrfsAllocState,
+    ) -> Result<(), FfsError> {
+        if !self.btrfs_tree_log_overlay_active.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let subvol = self
+            .btrfs_context()
+            .map_or(BTRFS_FS_TREE_OBJECTID, |ctx| ctx.subvol_objectid);
+        // What the log replaces, as committed.
+        let tuple = |key: &BtrfsKey| (key.objectid, key.item_type, key.offset);
+        let logged_keys: std::collections::HashSet<(u64, u8, u64)> = self
+            .btrfs_tree_log_items
+            .iter()
+            .map(|item| tuple(&item.key))
+            .collect();
+        let committed_root = self.btrfs_fs_tree_root_bytenr(cx, subvol)?;
+        let hidden_dirs: std::collections::HashSet<u64> = self
+            .btrfs_tree_log_hidden
+            .names
+            .iter()
+            .map(|(dir, _)| *dir)
+            .collect();
+        let mut committed: std::collections::HashMap<(u64, u8, u64), Vec<u8>> =
+            std::collections::HashMap::new();
+        // (directory, name) -> inode, for the names the log removes.
+        let mut committed_names: std::collections::HashMap<(u64, Vec<u8>), u64> =
+            std::collections::HashMap::new();
+        for item in self.walk_btrfs_tree(cx, committed_root)? {
+            if item.key.item_type == BTRFS_ITEM_DIR_INDEX
+                && hidden_dirs.contains(&item.key.objectid)
+            {
+                for entry in parse_dir_items(&item.data).map_err(|e| parse_to_ffs_error(&e))? {
+                    if entry.child_key_type == BTRFS_ITEM_INODE_ITEM {
+                        committed_names
+                            .insert((item.key.objectid, entry.name), entry.child_objectid);
+                    }
+                }
+            }
+            if logged_keys.contains(&tuple(&item.key)) {
+                committed.insert(tuple(&item.key), item.data);
+            }
+        }
+        // (disk_bytenr, disk_num_bytes, backref offset) of a file extent that
+        // references a data extent.
+        let data_ref = |key: &BtrfsKey, data: &[u8]| -> Result<Option<(u64, u64, u64)>, FfsError> {
+            match parse_extent_data(data).map_err(|e| parse_to_ffs_error(&e))? {
+                BtrfsExtentData::Regular {
+                    disk_bytenr,
+                    disk_num_bytes,
+                    extent_offset,
+                    ..
+                } if disk_bytenr != 0 => Ok(Some((
+                    disk_bytenr,
+                    disk_num_bytes,
+                    key.offset.wrapping_sub(extent_offset),
+                ))),
+                _ => Ok(None),
+            }
+        };
+        let root = alloc.fs_root_objectid;
+        let generation = alloc.generation;
+        for logged in &self.btrfs_tree_log_items {
+            let key = logged.key;
+            if key.objectid == ffs_btrfs::BTRFS_EXTENT_CSUM_OBJECTID {
+                let _ = alloc.fs_tree.delete(&key);
+                alloc
+                    .csum_tree
+                    .update(&key, &logged.data)
+                    .or_else(|err| match err {
+                        ffs_btrfs::BtrfsMutationError::KeyNotFound => {
+                            alloc.csum_tree.insert(key, &logged.data)
+                        }
+                        other => Err(other),
+                    })
+                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                continue;
+            }
+            if key.item_type != BTRFS_ITEM_EXTENT_DATA {
+                continue;
+            }
+            let new_ref = data_ref(&key, &logged.data)?;
+            let old_ref = match committed.get(&tuple(&key)) {
+                Some(data) => data_ref(&key, data)?,
+                None => None,
+            };
+            if new_ref == old_ref {
+                continue;
+            }
+            if let Some((bytenr, num_bytes, ref_offset)) = new_ref {
+                let claimed = alloc
+                    .extent_alloc
+                    .claim_data_extent(
+                        bytenr,
+                        num_bytes,
+                        root,
+                        key.objectid,
+                        ref_offset,
+                        generation,
+                    )
+                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                if !claimed {
+                    alloc
+                        .extent_alloc
+                        .add_data_extent_ref(bytenr, num_bytes, root, key.objectid, ref_offset)
+                        .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                }
+            }
+            if let Some((bytenr, num_bytes, ref_offset)) = old_ref {
+                Self::btrfs_free_or_drop_extent_ref(
+                    alloc,
+                    bytenr,
+                    num_bytes,
+                    key.objectid,
+                    ref_offset,
+                    true,
+                )?;
+            }
+        }
+        // A name the log removes (replay_dir_deletes) unlinks its inode: the
+        // dir entries are already gone from the seeded tree, the INODE_REF
+        // is not. Link counts are then recounted from the refs, as the
+        // kernel's fixup_inode_link_counts does; an inode left with none is
+        // deleted.
+        let mut affected: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
+        for (dir, name) in &self.btrfs_tree_log_hidden.names {
+            let Some(&child) = committed_names.get(&(*dir, name.clone())) else {
+                continue;
+            };
+            affected.insert(child);
+            let still_named = Self::btrfs_inode_ref_names(alloc, child, *dir)?
+                .iter()
+                .any(|existing| existing == name);
+            if still_named {
+                Self::btrfs_remove_inode_ref(alloc, child, *dir, name)?;
+            }
+        }
+        let mut dirs: std::collections::BTreeSet<u64> = hidden_dirs.iter().copied().collect();
+        for logged in &self.btrfs_tree_log_items {
+            match logged.key.item_type {
+                BTRFS_ITEM_INODE_ITEM => {
+                    affected.insert(logged.key.objectid);
+                }
+                BTRFS_ITEM_DIR_ITEM | BTRFS_ITEM_DIR_INDEX => {
+                    dirs.insert(logged.key.objectid);
+                }
+                _ => {}
+            }
+        }
+        for canonical in affected {
+            let Ok(mut inode) = self.btrfs_read_inode_from_tree(alloc, canonical) else {
+                continue;
+            };
+            if inode.mode & 0o170_000 == 0o040_000 {
+                dirs.insert(canonical);
+                continue;
+            }
+            let links = Self::btrfs_count_inode_refs(alloc, canonical)?;
+            if links == 0 {
+                self.btrfs_purge_inode(alloc, canonical)?;
+                continue;
+            }
+            let nbytes = Self::btrfs_recompute_inode_nbytes(alloc, canonical)?;
+            if (inode.nlink, inode.nbytes) != (links, nbytes) {
+                inode.nlink = links;
+                inode.nbytes = nbytes;
+                Self::btrfs_store_inode_item(alloc, canonical, &inode)?;
+            }
+        }
+        for dir in dirs {
+            let Ok(mut inode) = self.btrfs_read_inode_from_tree(alloc, dir) else {
+                continue;
+            };
+            let size = Self::btrfs_dir_isize_from_tree(alloc, dir)?;
+            if inode.size != size {
+                inode.size = size;
+                Self::btrfs_store_inode_item(alloc, dir, &inode)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn btrfs_store_inode_item(
+        alloc: &mut BtrfsAllocState,
+        objectid: u64,
+        inode: &BtrfsInodeItem,
+    ) -> Result<(), FfsError> {
+        let key = BtrfsKey {
+            objectid,
+            item_type: BTRFS_ITEM_INODE_ITEM,
+            offset: 0,
+        };
+        alloc
+            .fs_tree
+            .update(&key, &inode.to_bytes())
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        Ok(())
+    }
+
+    /// Names in the INODE_REF linking `child` to `parent` (empty if none).
+    fn btrfs_inode_ref_names(
+        alloc: &BtrfsAllocState,
+        child: u64,
+        parent: u64,
+    ) -> Result<Vec<Vec<u8>>, FfsError> {
+        let key = BtrfsKey {
+            objectid: child,
+            item_type: BTRFS_ITEM_INODE_REF,
+            offset: parent,
+        };
+        let found = alloc
+            .fs_tree
+            .range(&key, &key)
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        let Some((_, payload)) = found.first() else {
+            return Ok(Vec::new());
+        };
+        Ok(Self::btrfs_parse_inode_ref_payload(payload)?
+            .into_iter()
+            .map(|(_, name)| name)
+            .collect())
+    }
+
+    /// How many names link to `child`, over its INODE_REF and INODE_EXTREF
+    /// items.
+    fn btrfs_count_inode_refs(alloc: &BtrfsAllocState, child: u64) -> Result<u32, FfsError> {
+        let lo = BtrfsKey {
+            objectid: child,
+            item_type: BTRFS_ITEM_INODE_REF,
+            offset: 0,
+        };
+        let hi = BtrfsKey {
+            objectid: child,
+            item_type: BTRFS_ITEM_INODE_EXTREF,
+            offset: u64::MAX,
+        };
+        let mut links = 0_u32;
+        for (key, payload) in alloc
+            .fs_tree
+            .range(&lo, &hi)
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?
+        {
+            let names = match key.item_type {
+                BTRFS_ITEM_INODE_REF => Self::btrfs_parse_inode_ref_payload(&payload)?.len(),
+                BTRFS_ITEM_INODE_EXTREF => Self::btrfs_parse_inode_extref_payload(&payload)?.len(),
+                _ => 0,
+            };
+            links = links.saturating_add(u32::try_from(names).unwrap_or(u32::MAX));
+        }
+        Ok(links)
+    }
+
+    /// A btrfs directory's `size`: every name counted once for its DIR_ITEM
+    /// and once for its DIR_INDEX.
+    fn btrfs_dir_isize_from_tree(alloc: &BtrfsAllocState, dir: u64) -> Result<u64, FfsError> {
+        let lo = BtrfsKey {
+            objectid: dir,
+            item_type: BTRFS_ITEM_DIR_INDEX,
+            offset: 0,
+        };
+        let hi = BtrfsKey {
+            objectid: dir,
+            item_type: BTRFS_ITEM_DIR_INDEX,
+            offset: u64::MAX,
+        };
+        let mut size = 0_u64;
+        for (_, data) in alloc
+            .fs_tree
+            .range(&lo, &hi)
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?
+        {
+            for entry in parse_dir_items(&data).map_err(|e| parse_to_ffs_error(&e))? {
+                size = size.saturating_add(2 * entry.name.len() as u64);
+            }
+        }
+        Ok(size)
     }
 
     fn load_ext4_alloc_state(&self, cx: &Cx) -> Result<Ext4AllocState, FfsError> {
@@ -11180,9 +11488,10 @@ impl OpenFs {
             .with_node_byte_budget((nodesize as usize).saturating_sub(101));
 
         // Find the highest objectid in use so we can mint new ones.
+        // Only inode numbers count: see BTRFS_LAST_FREE_OBJECTID.
         let mut max_objectid = BTRFS_FIRST_FREE_OBJECTID;
         for item in &items {
-            if item.key.objectid > max_objectid {
+            if item.key.objectid > max_objectid && item.key.objectid <= BTRFS_LAST_FREE_OBJECTID {
                 max_objectid = item.key.objectid;
             }
             let tree_item = BtrfsTreeItem {
@@ -90314,6 +90623,35 @@ mod tests {
             return; // btrfs check tool unavailable
         };
         assert!(ok, "btrfs check must accept split preallocation:\n{output}");
+    }
+
+    /// What statfs calls available must be what a data write can get:
+    /// xfstests generic/213 checks `df` before a 1 GiB fallocate and failed
+    /// ENOSPC once free space inside metadata groups was counted as
+    /// available. Available space less a little slack must be fallocatable,
+    /// and blocks_available never exceeds blocks_free.
+    #[test]
+    fn btrfs_statfs_available_space_is_fallocatable() {
+        let Some((fs, _dev, _tmp, _image)) = open_writable_btrfs_mkfs(256) else {
+            return; // btrfs-progs unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let some = fs
+            .create(&cx, root, OsStr::new("some.bin"), 0o644, 0, 0)
+            .expect("create");
+        fs.write(&cx, some.ino, 0, &[0x33_u8; 64 * 1024])
+            .expect("write");
+        let stat = fs.statfs(&cx, root).expect("statfs");
+        assert!(stat.blocks_available <= stat.blocks_free);
+        let available = stat.blocks_available * u64::from(stat.block_size);
+        let slack = 8 * 1024 * 1024;
+        assert!(available > slack, "available={available}");
+        let big = fs
+            .create(&cx, root, OsStr::new("big.bin"), 0o644, 0, 0)
+            .expect("create big");
+        fs.fallocate(&cx, big.ino, 0, available - slack, 0)
+            .unwrap_or_else(|e| panic!("statfs said {available} bytes were available: {e:?}"));
     }
 
     /// bd-x3fcu / bd-4cxkd: a file whose DATA is written + committed by FrankenFS

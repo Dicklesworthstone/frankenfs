@@ -8119,6 +8119,53 @@ impl BtrfsExtentAllocator {
         Ok(())
     }
 
+    /// Record a data extent that is already in use but missing from the extent
+    /// tree: a kernel tree log references extents allocated after the last
+    /// commit, and log replay must enter them before anything else allocates
+    /// (bd-pgnsk). Inserts the `EXTENT_ITEM` with its inline backref and
+    /// charges the owning block group. Returns `false`, changing nothing, when
+    /// the extent item already exists.
+    pub fn claim_data_extent(
+        &mut self,
+        bytenr: u64,
+        num_bytes: u64,
+        root: u64,
+        objectid: u64,
+        offset: u64,
+        generation: u64,
+    ) -> Result<bool, BtrfsMutationError> {
+        if self.extent_item_refs(bytenr, num_bytes)?.is_some() {
+            return Ok(false);
+        }
+        let extent_end = bytenr
+            .checked_add(num_bytes)
+            .ok_or(BtrfsMutationError::AddressOverflow)?;
+        let bg = self
+            .block_groups
+            .values_mut()
+            .find(|bg| {
+                bg.item.flags & BTRFS_BLOCK_GROUP_DATA != 0
+                    && bytenr >= bg.start
+                    && bg
+                        .start
+                        .checked_add(bg.item.total_bytes)
+                        .is_some_and(|end| extent_end <= end)
+            })
+            .ok_or(BtrfsMutationError::BrokenInvariant(
+                "claimed data extent has no owning data block group",
+            ))?;
+        bg.item.used_bytes = bg
+            .item
+            .used_bytes
+            .checked_add(num_bytes)
+            .ok_or(BtrfsMutationError::AddressOverflow)?;
+        // The tail fast path trusts that nothing is allocated past the
+        // cursor; this extent may be.
+        bg.tail_verified = false;
+        self.insert_data_extent_item(bytenr, num_bytes, root, objectid, offset, generation)?;
+        Ok(true)
+    }
+
     /// Add another reference to an existing data extent (reflink / shared
     /// extent): increment the `EXTENT_ITEM` refcount by one and insert a *keyed*
     /// `EXTENT_DATA_REF` backref for the new `(root, objectid, offset)`. The
@@ -20452,6 +20499,49 @@ mod tests {
     /// bd-ntgko: a block group whose accounting has room but whose free space
     /// is fragmented must not end the search; the allocation lands in the next
     /// group that can hold it.
+    #[test]
+    fn a_claimed_extent_is_never_allocated_again() {
+        // bd-pgnsk: a tree log can reference an extent allocated after the
+        // last commit; replay claims it, after which the allocator must
+        // route around it, including the bump-pointer fast path.
+        const KB: u64 = 1024;
+        const MB: u64 = 1024 * KB;
+        let mut alloc = BtrfsExtentAllocator::new(7).expect("allocator");
+        alloc.set_nodesize(16384);
+        alloc.add_block_group(
+            MB,
+            BtrfsBlockGroupItem {
+                total_bytes: MB,
+                used_bytes: 0,
+                flags: BTRFS_BLOCK_GROUP_DATA,
+            },
+        );
+        let first = alloc.alloc_data(64 * KB).expect("first").bytenr;
+        let claimed = first + 64 * KB;
+        assert!(
+            alloc
+                .claim_data_extent(claimed, 128 * KB, 5, 257, 0, 7)
+                .expect("claim")
+        );
+        assert!(
+            !alloc
+                .claim_data_extent(claimed, 128 * KB, 5, 257, 0, 7)
+                .expect("claim again"),
+            "an extent that exists is not claimed twice"
+        );
+        assert_eq!(
+            alloc.extent_item_refs(claimed, 128 * KB).expect("refs"),
+            Some(1)
+        );
+        for _ in 0..12 {
+            let got = alloc.alloc_data(64 * KB).expect("room remains").bytenr;
+            assert!(
+                got + 64 * KB <= claimed || got >= claimed + 128 * KB,
+                "allocation at {got} overlaps the claimed extent at {claimed}"
+            );
+        }
+    }
+
     #[test]
     fn a_fragmented_first_group_falls_through_to_the_next_group() {
         const KB: u64 = 1024;

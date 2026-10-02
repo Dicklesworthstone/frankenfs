@@ -815,10 +815,32 @@ impl FsOps for OpenFs {
                     });
                 let total_bytes = sb.total_bytes;
                 let free_bytes = total_bytes.saturating_sub(used_bytes);
+                // Available = what a data write can still get, as kernel
+                // btrfs reports f_bavail: free space in DATA block groups plus
+                // unallocated device space a data chunk can grow into. Free
+                // space inside metadata and system groups is not, and counting
+                // it let `df` promise space fallocate then refused with
+                // ENOSPC (xfstests generic/213 on a used filesystem).
+                let available_bytes =
+                    self.btrfs_alloc_state
+                        .as_ref()
+                        .map_or(free_bytes, |alloc_mutex| {
+                            let alloc = alloc_mutex.read();
+                            let data_free = alloc
+                                .extent_alloc
+                                .allocatable_bytes(super::BTRFS_BLOCK_GROUP_DATA);
+                            let unallocated = if self.btrfs_grow_data_chunks_enabled() {
+                                ffs_btrfs::GrowthDevice::from_chunk_tree(&alloc.chunk_tree, sb.fsid)
+                                    .map_or(0, |dev| dev.total_bytes.saturating_sub(dev.bytes_used))
+                            } else {
+                                0
+                            };
+                            data_free.saturating_add(unallocated).min(free_bytes)
+                        });
                 Ok(FsStat {
                     blocks: total_bytes / unit_u64,
                     blocks_free: free_bytes / unit_u64,
-                    blocks_available: free_bytes / unit_u64,
+                    blocks_available: available_bytes / unit_u64,
                     files: 1_000_000_000,
                     files_free: 1_000_000_000,
                     block_size: unit,

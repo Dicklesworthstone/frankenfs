@@ -19714,6 +19714,45 @@ fn run_btrfs_tree_log_scenario(
         "{scenario}: FrankenFS's view of a kernel tree-log crash image must equal the kernel's \
          recovery"
     );
+    drop(fs);
+
+    // bd-pgnsk: a read-write mount of the crash image replays the log for
+    // good. Its first commit clears log_root, so the logged changes must be in
+    // the trees by then, consistent enough for btrfs check, and a kernel mount
+    // afterwards must show them plus what was written through FrankenFS.
+    let rw_mnt = tmp.path().join("ffs-rw");
+    fs::create_dir_all(&rw_mnt).unwrap();
+    let Some(session) = try_mount_btrfs_rw(&crash_image, &rw_mnt) else {
+        return;
+    };
+    let written: Vec<u8> = (0..300_000_u32).map(|i| (i % 251) as u8).collect();
+    fc_fsynced_write(&rw_mnt.join("d"), "written_after_replay", &written, false);
+    session.unmount_and_join();
+    let check = Command::new("btrfs")
+        .args(["check", "--readonly"])
+        .arg(&crash_image)
+        .output()
+        .expect("run btrfs check");
+    assert!(
+        check.status.success(),
+        "{scenario}: btrfs check after a FrankenFS read-write mount of the crash image:\n{}{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let after_mnt = tmp.path().join("kernel-after-rw");
+    let Some(after) = kernel_ro_mount(&crash_image, "btrfs", &after_mnt) else {
+        return;
+    };
+    let mut after_view = std::collections::BTreeMap::new();
+    kernel_tree(&after_mnt.join("d"), "", &mut after_view);
+    drop(after);
+    let mut expected_after = kernel_view;
+    expected_after.insert("written_after_replay".to_owned(), written);
+    assert_eq!(
+        after_view, expected_after,
+        "{scenario}: after a FrankenFS read-write mount, the kernel must see the replayed log \
+         and the new write"
+    );
     emit_scenario_result(scenario, "PASS", None);
 }
 
