@@ -41380,11 +41380,19 @@ impl OpenFs {
                             .extent_alloc
                             .alloc_data(prev_alloc_size)
                             .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-                        if let Err(e) = self.dev.write_all_at(
-                            cx,
-                            ByteOffset(prev_allocation.bytenr),
-                            &prev_data,
-                        ) {
+                        // `bytenr` is a btrfs LOGICAL address: write through
+                        // the chunk map like every other data write. Writing
+                        // the device at that number (as this did) put the
+                        // bytes wherever the logical value happened to point
+                        // physically, and left the new extent holding whatever
+                        // was on disk there (bd-zx0fk: fsx read a deleted
+                        // file's data back after a fallocate converted a
+                        // small file's inline extent).
+                        let mut padded = prev_data;
+                        padded.resize(usize::try_from(prev_alloc_size).unwrap_or(usize::MAX), 0);
+                        if let Err(e) =
+                            self.btrfs_write_logical(cx, prev_allocation.bytenr, &padded)
+                        {
                             let _ = alloc.extent_alloc.free_extent(
                                 prev_allocation.bytenr,
                                 prev_alloc_size,
@@ -62759,6 +62767,229 @@ mod tests {
             .expect("readdir root");
         let root_dotdot = root.iter().find(|entry| entry.name == b"..").expect("..");
         assert_eq!(root_dotdot.ino, InodeNumber(1));
+    }
+
+    /// A fallocate that converts a small file's inline extent to a regular one
+    /// must carry the file's bytes into the new extent: the conversion wrote
+    /// them at the extent's LOGICAL address as if it were a device offset, so
+    /// the file read back whatever the mapped block held (bd-zx0fk).
+    #[test]
+    fn btrfs_fallocate_inline_conversion_keeps_the_data_bd_zx0fk() {
+        let Some((fs, _dev, _tmp, _image)) = open_writable_btrfs_mkfs(256) else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let ops: &dyn FsOps = &fs;
+        let mut scope = RequestScope::empty();
+        // Fill the data area with a deleted file's bytes first, so a block the
+        // conversion forgets to write is not zero by luck.
+        let junk = ops
+            .create(
+                &cx,
+                &mut scope,
+                InodeNumber(1),
+                OsStr::new("junk"),
+                0o644,
+                0,
+                0,
+            )
+            .expect("create junk");
+        ops.write(&cx, &mut scope, junk.ino, 0, &vec![0xEE; 8 << 20])
+            .expect("write junk");
+        ops.unlink(&cx, &mut scope, InodeNumber(1), OsStr::new("junk"))
+            .expect("unlink junk");
+        let f = ops
+            .create(
+                &cx,
+                &mut scope,
+                InodeNumber(1),
+                OsStr::new("f"),
+                0o644,
+                0,
+                0,
+            )
+            .expect("create");
+        let data: Vec<u8> = (0..0xf5d_u32)
+            .map(|i| u8::try_from(i % 251).unwrap() + 1)
+            .collect();
+        ops.write(&cx, &mut scope, f.ino, 0, &data).expect("write");
+        let before = ops
+            .fiemap(&cx, &mut scope, f.ino, 0, 0x1000)
+            .expect("fiemap");
+        assert!(
+            before.iter().any(|e| e.flags & 0x200 != 0),
+            "precondition: a small file is stored inline: {before:?}"
+        );
+        // KEEP_SIZE preallocation past the data: converts the inline extent.
+        ops.fallocate(&cx, &mut scope, f.ino, 1 << 20, 0x8000, 0x1)
+            .expect("fallocate");
+        let after = ops
+            .fiemap(&cx, &mut scope, f.ino, 0, 0x1000)
+            .expect("fiemap");
+        assert!(
+            after.iter().all(|e| e.flags & 0x200 == 0),
+            "the inline extent was converted: {after:?}"
+        );
+        let got = ops.read(&cx, &mut scope, f.ino, 0, 0xf5d).expect("read");
+        assert_eq!(
+            got,
+            data[..0xf5d],
+            "the converted extent must hold the file's bytes"
+        );
+    }
+
+    /// Replay an fsx op log (the `.fsxops` file xfstests keeps next to a
+    /// failure) against a writable btrfs `OpenFs`, with no kernel page cache
+    /// in between, checking every read against a byte model; panics at the
+    /// first read that differs (bd-zx0fk). Data patterns are never zero, so a
+    /// punched or zeroed range that comes back is caught.
+    /// `FFS_FSX_OPS=/path/112.2.fsxops cargo test -p ffs-core --lib fsx_ops_replay -- --ignored`
+    #[test]
+    #[ignore = "debugging aid; needs FFS_FSX_OPS"]
+    fn fsx_ops_replay_btrfs_bd_zx0fk() {
+        let Ok(path) = std::env::var("FFS_FSX_OPS") else {
+            return;
+        };
+        let Some((fs, _dev, _tmp, _image)) = open_writable_btrfs_mkfs(1024) else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let ops: &dyn FsOps = &fs;
+        let hex = |s: &str| u64::from_str_radix(s.trim_start_matches("0x"), 16).expect("hex");
+        let text = std::fs::read_to_string(&path).expect("ops file");
+        // FFS_FSX_REPEAT=N replays N times in one filesystem, unlinking the
+        // file between rounds, as `rm -f f; fsx --replay-ops` in a loop does.
+        let repeat: usize = std::env::var("FFS_FSX_REPEAT")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1);
+        for round in 1..=repeat {
+            if round > 1 {
+                ops.unlink(
+                    &cx,
+                    &mut RequestScope::empty(),
+                    InodeNumber(1),
+                    OsStr::new("f"),
+                )
+                .expect("unlink");
+            }
+            let ino = ops
+                .create(
+                    &cx,
+                    &mut RequestScope::empty(),
+                    InodeNumber(1),
+                    OsStr::new("f"),
+                    0o644,
+                    0,
+                    0,
+                )
+                .expect("create")
+                .ino;
+            let mut model: Vec<u8> = Vec::new();
+            for (n, line) in text.lines().enumerate() {
+                let p: Vec<&str> = line.split_whitespace().collect();
+                if p.len() < 3 || p[0] == "skip" {
+                    continue;
+                }
+                let (a, b) = (hex(p[1]), hex(p[2]));
+                let (au, bu) = (usize::try_from(a).unwrap(), usize::try_from(b).unwrap());
+                let keep = p.contains(&"keep_size");
+                let mut scope = ops
+                    .begin_request_scope(&cx, RequestOp::Write)
+                    .expect("scope");
+                match p[0] {
+                    "write" | "mapwrite" => {
+                        let data: Vec<u8> = (0..bu)
+                            .map(|i| u8::try_from((n * 31 + au + i) % 251).unwrap() + 1)
+                            .collect();
+                        ops.write(&cx, &mut scope, ino, a, &data).expect("write");
+                        if model.len() < au + bu {
+                            model.resize(au + bu, 0);
+                        }
+                        model[au..au + bu].copy_from_slice(&data);
+                    }
+                    "read" | "mapread" => {
+                        if au < model.len() {
+                            let len = bu.min(model.len() - au);
+                            let got = ops
+                                .read(&cx, &mut scope, ino, a, u32::try_from(len).unwrap())
+                                .expect("read");
+                            if let Some(i) = (0..len).find(|&i| got.get(i) != Some(&model[au + i]))
+                            {
+                                panic!(
+                                    "round {round} op {} ({line}): byte {:#x}: got {:?} want {:#04x} (file {:#x})",
+                                    n + 1,
+                                    au + i,
+                                    got.get(i),
+                                    model[au + i],
+                                    model.len()
+                                );
+                            }
+                        }
+                    }
+                    "truncate" => {
+                        let attrs = SetAttrRequest {
+                            size: Some(b),
+                            ..SetAttrRequest::default()
+                        };
+                        ops.setattr(&cx, &mut scope, ino, &attrs).expect("truncate");
+                        model.resize(bu, 0);
+                    }
+                    "punch_hole" => {
+                        ops.fallocate(&cx, &mut scope, ino, a, b, 0x3)
+                            .expect("punch");
+                        let end = (au + bu).min(model.len());
+                        if au < end {
+                            model[au..end].fill(0);
+                        }
+                    }
+                    "zero_range" | "fallocate" => {
+                        let zero = p[0] == "zero_range";
+                        let mode = (i32::from(zero) * 0x10) | i32::from(keep);
+                        ops.fallocate(&cx, &mut scope, ino, a, b, mode).expect(p[0]);
+                        if !keep && model.len() < au + bu {
+                            model.resize(au + bu, 0);
+                        }
+                        if zero {
+                            let end = (au + bu).min(model.len());
+                            if au < end {
+                                model[au..end].fill(0);
+                            }
+                        }
+                    }
+                    "copy_range" => {
+                        let dst = usize::try_from(hex(p[3])).unwrap();
+                        let len = bu.min(model.len().saturating_sub(au));
+                        ops.copy_file_range(&cx, &mut scope, ino, a, ino, dst as u64, len as u64)
+                            .expect("copy_range");
+                        let src = model[au..au + len].to_vec();
+                        if model.len() < dst + len {
+                            model.resize(dst + len, 0);
+                        }
+                        model[dst..dst + len].copy_from_slice(&src);
+                    }
+                    other => panic!("op {}: unknown fsx op {other}", n + 1),
+                }
+                ops.commit_request_scope(&cx, &mut scope).expect("commit");
+                // FFS_FSX_WATCH=<hex offset>: check those 16 bytes after every
+                // op, to name the op that first corrupts them.
+                if let Some(w) = std::env::var("FFS_FSX_WATCH").ok().map(|v| hex(&v)) {
+                    let wu = usize::try_from(w).unwrap();
+                    if wu < model.len() {
+                        let len = 16.min(model.len() - wu);
+                        let got = ops
+                            .read(&cx, &mut RequestScope::empty(), ino, w, len as u32)
+                            .expect("watch read");
+                        assert_eq!(
+                            got[..],
+                            model[wu..wu + len],
+                            "round {round}: op {} ({line}) corrupted {w:#x}",
+                            n + 1
+                        );
+                    }
+                }
+            }
+        }
     }
 
     #[test]
