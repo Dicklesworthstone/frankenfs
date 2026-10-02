@@ -19215,7 +19215,6 @@ fn fast_commit_crash_image_overflow_falls_back_to_full_commit_bd_9m84h() {
 // bd-9m84h: fast-commit recovery of a file whose extents no longer fit in the
 // inode (more than four), so recovery has to grow an external extent block.
 #[test]
-#[ignore = "bd-9m84h: FC apply cannot grow an inline extent root into a leaf yet (no recovery-time allocator); open fails closed"]
 fn fast_commit_crash_image_extent_tree_growth_matches_kernel_bd_9m84h() {
     use std::os::unix::fs::FileExt;
     run_fc_kernel_scenario(

@@ -3727,6 +3727,12 @@ impl std::fmt::Debug for OpenFs {
 /// fast-commit ADD_RANGE recovery so an extent insert succeeds only when it
 /// fits an existing leaf with no tree growth — growth needs the writable-path
 /// block allocator, which is not available during mount recovery.
+/// One fast-commit range record of an inode, kept in log order.
+enum FcRangeOp {
+    Add(Ext4Extent),
+    Del { logical_block: u32, len: u32 },
+}
+
 struct NoGrowBlockAllocator {
     has_metadata_csum: bool,
     csum_seed: u32,
@@ -8278,7 +8284,8 @@ impl OpenFs {
             // the punch must read the pre-recovery (on-device) extent tree to know
             // which physical blocks to release; once an InodeUpdate rewrites the
             // inode to its post-truncate extent root, those blocks would leak.
-            self.apply_fast_commit_del_range_ops(cx, operations)?;
+            // Inodes the external pass recovered already had theirs, in order.
+            self.apply_fast_commit_del_range_ops(cx, operations, &recovered)?;
             recovered
         } else {
             BTreeSet::new()
@@ -9404,11 +9411,14 @@ impl OpenFs {
         &self,
         cx: &Cx,
         operations: &[ffs_journal::FcOperation],
+        already_recovered: &BTreeSet<u32>,
     ) -> Result<(), FfsError> {
         let del_ranges: Vec<&ffs_journal::FcDelRange> = operations
             .iter()
             .filter_map(|op| match op {
-                ffs_journal::FcOperation::DelRange(r) => Some(r),
+                ffs_journal::FcOperation::DelRange(r) if !already_recovered.contains(&r.ino) => {
+                    Some(r)
+                }
                 _ => None,
             })
             .collect();
@@ -9602,7 +9612,7 @@ impl OpenFs {
         cx: &Cx,
         operations: &[ffs_journal::FcOperation],
     ) -> Result<BTreeSet<u32>, FfsError> {
-        let mut by_inode: BTreeMap<u32, (Vec<Ext4Extent>, Option<Vec<u8>>)> = BTreeMap::new();
+        let mut by_inode: BTreeMap<u32, (Vec<FcRangeOp>, Option<Vec<u8>>)> = BTreeMap::new();
         for op in operations {
             match op {
                 ffs_journal::FcOperation::AddRange(r) => {
@@ -9618,10 +9628,20 @@ impl OpenFs {
                     }
                     // ee_len > 32768 encodes an unwritten extent (actual = ee_len - 32768).
                     let raw_len = if r.unwritten { len16 + 0x8000 } else { len16 };
-                    by_inode.entry(r.ino).or_default().0.push(Ext4Extent {
+                    by_inode
+                        .entry(r.ino)
+                        .or_default()
+                        .0
+                        .push(FcRangeOp::Add(Ext4Extent {
+                            logical_block: r.logical_block,
+                            raw_len,
+                            physical_start: r.physical_block,
+                        }));
+                }
+                ffs_journal::FcOperation::DelRange(r) => {
+                    by_inode.entry(r.ino).or_default().0.push(FcRangeOp::Del {
                         logical_block: r.logical_block,
-                        raw_len,
-                        physical_start: r.physical_block,
+                        len: r.len,
                     });
                 }
                 ffs_journal::FcOperation::InodeUpdate(ino, raw) if !raw.is_empty() => {
@@ -9630,12 +9650,52 @@ impl OpenFs {
                 _ => {}
             }
         }
+        // ext4_fc_replay_check_excluded: a block a live inode's recovered state
+        // names (its ADD_RANGE records, or the inline extents of its INODE
+        // record) is never handed out to grow a tree during recovery.
+        let mut live: BTreeMap<u32, Vec<u8>> = BTreeMap::new();
+        for op in operations {
+            if let ffs_journal::FcOperation::InodeUpdate(ino, raw) = op
+                && raw.len() >= 0x1C
+            {
+                if raw[0..2] != [0, 0] && raw[0x1A..0x1C] != [0, 0] {
+                    live.insert(*ino, raw.clone());
+                } else {
+                    live.remove(ino);
+                }
+            }
+        }
+        let mut excluded: Vec<(u64, u32)> = Vec::new();
+        for (ino, (ranges, _)) in &by_inode {
+            if live.contains_key(ino) {
+                excluded.extend(ranges.iter().filter_map(|range| match range {
+                    FcRangeOp::Add(e) => Some((e.physical_start, u32::from(e.actual_len()))),
+                    FcRangeOp::Del { .. } => None,
+                }));
+            }
+        }
+        for raw in live.values() {
+            if raw.len() >= 0x28 + 60
+                && let Ok((header, ffs_ondisk::ext4::ExtentTree::Leaf(leaf))) =
+                    ffs_ondisk::ext4::parse_extent_tree(&raw[0x28..0x28 + 60])
+                && header.depth == 0
+            {
+                excluded.extend(
+                    leaf.iter()
+                        .map(|e| (e.physical_start, u32::from(e.actual_len()))),
+                );
+            }
+        }
+
         let mut recovered = BTreeSet::new();
-        for (ino, (extents, maybe_inode)) in by_inode {
-            if extents.is_empty() {
+        for (ino, (ranges, maybe_inode)) in by_inode {
+            if ranges.is_empty() {
                 continue; // pure InodeUpdate → the main loop's guard handles it
             }
             let Some(inode_raw) = maybe_inode else {
+                if ranges.iter().all(|r| matches!(r, FcRangeOp::Del { .. })) {
+                    continue; // the DEL_RANGE pass punches it in place
+                }
                 return Err(FfsError::UnsupportedFeature(format!(
                     "fast-commit ADD_RANGE inode {ino} lacks its inode update"
                 )));
@@ -9645,96 +9705,204 @@ impl OpenFs {
                 // Publishing a recovered root first could strand those blocks.
                 continue;
             }
-            if self.try_recover_single_leaf_inode(cx, ino, &extents, &inode_raw)? {
+            if self.recover_fast_commit_extent_tree(cx, ino, &ranges, &inode_raw, &excluded)? {
                 recovered.insert(ino);
             }
         }
         Ok(recovered)
     }
 
-    /// Recover one external-extent-tree inode whose tree is a single-leaf
-    /// depth-1 tree: insert every ADD_RANGE extent into the one leaf and, only
-    /// if they ALL fit without tree growth, apply the InodeUpdate too. The leaf
-    /// is snapshotted and restored if any insert would need growth (the
-    /// recovery-time no-grow allocator cannot allocate), so the inode is never
-    /// left half-recovered — a partial ADD_RANGE without its InodeUpdate would
-    /// be an e2fsck i_blocks mismatch. Multi-leaf / deeper / non-extent inodes
-    /// are left at their JBD2-committed state.
-    fn try_recover_single_leaf_inode(
+    /// Recover an inode whose fast-commit INODE record has an external
+    /// (depth > 0) extent root, as ext4_fc_replay_inode + ext4_fc_replay_add_
+    /// range do. The record's root names tree blocks whose contents never
+    /// reached the disk (a fast commit logs ranges, not tree blocks), so:
+    /// keep the on-disk root (a fresh empty one when the slot has none),
+    /// insert every ADD_RANGE into it, growing the tree with blocks no
+    /// recovered inode names (`excluded`), then write the record's other
+    /// fields with that root and i_blocks recounted from the result
+    /// (ext4_ext_replay_set_iblocks). Records with an inline root carry their
+    /// whole mapping and are left to the main pass (`Ok(false)`).
+    fn recover_fast_commit_extent_tree(
         &self,
         cx: &Cx,
         ino: u32,
-        extents: &[Ext4Extent],
+        ranges: &[FcRangeOp],
         inode_raw: &[u8],
+        excluded: &[(u64, u32)],
     ) -> Result<bool, FfsError> {
-        // A file the fast commit created has no on-disk predecessor (its inode
-        // slot is zero); the main pass writes its recovered inode whole.
-        let inode = match self.read_inode(cx, InodeNumber(u64::from(ino))) {
-            Ok(inode) => inode,
-            Err(FfsError::NotFound(_)) => return Ok(false),
+        const I_BLOCK: usize = 0x28;
+        const EXT4_HUGE_FILE_FL: u32 = 0x0004_0000;
+        if inode_raw.len() < 0x76 {
+            return Ok(false);
+        }
+        let flags = u32::from_le_bytes([
+            inode_raw[0x20],
+            inode_raw[0x21],
+            inode_raw[0x22],
+            inode_raw[0x23],
+        ]);
+        let record_depth = u16::from_le_bytes([inode_raw[I_BLOCK + 6], inode_raw[I_BLOCK + 7]]);
+        let record_magic = u16::from_le_bytes([inode_raw[I_BLOCK], inode_raw[I_BLOCK + 1]]);
+        if flags & EXT4_EXTENTS_FL == 0 || record_magic != 0xF30A || record_depth == 0 {
+            return Ok(false);
+        }
+
+        // The on-disk root, when the slot holds one (the kernel keeps
+        // i_block whenever it carries the extent magic).
+        let mut root_bytes = [0_u8; 60];
+        match self.read_inode(cx, InodeNumber(u64::from(ino))) {
+            Ok(inode) => root_bytes = Self::extent_root(&inode),
+            Err(FfsError::NotFound(_)) => {}
             Err(error) => return Err(error),
-        };
-        if inode.flags & EXT4_EXTENTS_FL == 0 {
-            return Ok(false);
         }
-        let root = Self::extent_root(&inode);
-        let eh_magic = u16::from_le_bytes([root[0], root[1]]);
-        let eh_entries = u16::from_le_bytes([root[2], root[3]]);
-        let eh_depth = u16::from_le_bytes([root[6], root[7]]);
-        // Only the single-leaf depth-1 case (one index entry → one leaf block).
-        if eh_magic != 0xF30A || eh_depth != 1 || eh_entries != 1 {
-            return Ok(false);
+        if u16::from_le_bytes([root_bytes[0], root_bytes[1]]) != 0xF30A {
+            root_bytes = [0_u8; 60];
+            root_bytes[0..2].copy_from_slice(&0xF30A_u16.to_le_bytes());
+            root_bytes[4..6].copy_from_slice(&4_u16.to_le_bytes()); // eh_max
         }
-        // First index entry (i_block + 12): ei_block@12, ei_leaf_lo@16, ei_leaf_hi@20.
-        let leaf_lo = u32::from_le_bytes([root[16], root[17], root[18], root[19]]);
-        let leaf_hi = u16::from_le_bytes([root[20], root[21]]);
-        let leaf_bn = BlockNumber(u64::from(leaf_lo) | (u64::from(leaf_hi) << 32));
 
         let sb = self
             .ext4_superblock()
             .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
         let block_dev = self.direct_block_device_adapter();
-        let mut no_grow = NoGrowBlockAllocator {
-            has_metadata_csum: sb.has_metadata_csum(),
-            csum_seed: sb.csum_seed(),
-            ino,
-            generation: inode.generation,
-        };
-
-        // Snapshot the leaf so a partial insert run can be rolled back.
-        let leaf_before = self.read_block_vec(cx, leaf_bn)?;
-
-        let mut root_bytes = root;
-        let mut recovery_error = None;
-        for ext in extents {
-            // A single-leaf insert mutates only the leaf via the device; the
-            // index root is unchanged unless the leaf splits (which needs growth
-            // → the no-grow allocator errors and we roll back).
-            if let Err(error) =
-                ffs_btree::insert(cx, &block_dev, &mut root_bytes, *ext, &mut no_grow)
+        let mut alloc = self.load_ext4_alloc_state(cx)?;
+        let counts_before = Self::ext4_snapshot_group_counts(&alloc);
+        for &(start, len) in excluded {
+            ffs_alloc::claim_blocks(
+                cx,
+                &block_dev,
+                &alloc.geo,
+                &mut alloc.groups,
+                BlockNumber(start),
+                len,
+            )?;
+        }
+        let generation = u32::from_le_bytes([
+            inode_raw[0x64],
+            inode_raw[0x65],
+            inode_raw[0x66],
+            inode_raw[0x67],
+        ]);
+        // In log order, as the kernel replays them: a later DEL_RANGE may
+        // punch what an earlier ADD_RANGE mapped, and the reverse.
+        for range in ranges {
+            let ext = match range {
+                FcRangeOp::Add(ext) => ext,
+                &FcRangeOp::Del { logical_block, len } => {
+                    if len > 0 {
+                        ffs_extent::punch_hole(
+                            cx,
+                            &block_dev,
+                            &mut root_bytes,
+                            &alloc.geo,
+                            &mut alloc.groups,
+                            logical_block,
+                            u64::from(len),
+                            &alloc.persist_ctx,
+                            ffs_extent::ExtentOwner { ino, generation },
+                        )?;
+                    }
+                    continue;
+                }
+            };
+            let mut tree_alloc = ffs_extent::GroupBlockAllocator {
+                cx,
+                dev: &block_dev,
+                geo: &alloc.geo,
+                groups: &mut alloc.groups,
+                hint: ffs_alloc::AllocHint::default(),
+                pctx: &alloc.persist_ctx,
+                ino,
+                generation,
+            };
             {
-                recovery_error = Some(error);
-                break;
+                match ffs_btree::search(cx, &block_dev, &root_bytes, ext.logical_block)? {
+                    // Already recovered (JBD2 replay, or an earlier apply).
+                    ffs_btree::SearchResult::Found {
+                        extent,
+                        offset_in_extent,
+                    } if extent.physical_start + u64::from(offset_in_extent)
+                        == ext.physical_start
+                        && extent.is_unwritten() == ext.is_unwritten()
+                        && u32::from(extent.actual_len()) - offset_in_extent
+                            >= u32::from(ext.actual_len()) => {}
+                    ffs_btree::SearchResult::Found { .. } => {
+                        return Err(FfsError::UnsupportedFeature(format!(
+                            "fast-commit ADD_RANGE remaps inode {ino} block {} (needs \
+                             branch replacement)",
+                            ext.logical_block
+                        )));
+                    }
+                    ffs_btree::SearchResult::Hole { hole_len }
+                        if hole_len >= u64::from(ext.actual_len()) =>
+                    {
+                        ffs_btree::insert(cx, &block_dev, &mut root_bytes, *ext, &mut tree_alloc)?;
+                    }
+                    ffs_btree::SearchResult::Hole { .. } => {
+                        return Err(FfsError::UnsupportedFeature(format!(
+                            "fast-commit ADD_RANGE partly overlaps inode {ino}'s mapping at \
+                             block {}",
+                            ext.logical_block
+                        )));
+                    }
+                }
             }
         }
-        // The cached copy (if any) of the rewritten leaf is now stale.
-        self.ext4_file_data_block_cache.remove(&leaf_bn);
 
-        if let Some(error) = recovery_error {
-            // Preserve the pre-recovery leaf, but do not disguise the failed
-            // transaction as a successful replay.
-            block_dev.write_block(cx, leaf_bn, &leaf_before)?;
-            self.ext4_file_data_block_cache.remove(&leaf_bn);
-            return Err(error);
+        // i_blocks: every mapped block plus every external tree node.
+        let mut blocks = 0_u64;
+        ffs_btree::walk(cx, &block_dev, &root_bytes, &mut |e: &Ext4Extent| {
+            blocks += u64::from(e.actual_len());
+            Ok(())
+        })?;
+        let mut pending: Vec<(u64, u16)> = Vec::new();
+        if let (header, ffs_ondisk::ext4::ExtentTree::Index(indexes)) =
+            ffs_ondisk::ext4::parse_extent_tree(&root_bytes).map_err(|e| parse_to_ffs_error(&e))?
+        {
+            pending.extend(indexes.iter().map(|i| (i.leaf_block, header.depth - 1)));
         }
-        // Leaves recovered → the inode (i_size/i_blocks/root) is now safe to
-        // apply, bypassing the depth>0 consistency guard.
-        self.recovery_write_inode_raw(cx, ino, inode_raw)?;
+        while let Some((node, depth)) = pending.pop() {
+            blocks += 1;
+            if depth > 0 {
+                let buf = block_dev.read_block(cx, BlockNumber(node))?;
+                if let (_, ffs_ondisk::ext4::ExtentTree::Index(indexes)) =
+                    ffs_ondisk::ext4::parse_extent_tree(buf.as_slice())
+                        .map_err(|e| parse_to_ffs_error(&e))?
+                {
+                    pending.extend(indexes.iter().map(|i| (i.leaf_block, depth - 1)));
+                }
+            }
+        }
+        let units = if flags & EXT4_HUGE_FILE_FL != 0 {
+            blocks
+        } else {
+            blocks * u64::from(sb.block_size / 512)
+        };
+
+        // A kernel record carries 128 + i_extra_isize bytes; like
+        // ext4_fc_replay_inode, lay it over the slot's own bytes, so the
+        // checksum is stamped over the whole on-disk inode.
+        let mut raw = self.recovery_read_inode_raw(cx, ino)?;
+        if raw.len() < inode_raw.len() {
+            return Err(FfsError::Corruption {
+                block: 0,
+                detail: format!("fast-commit inode {ino} record exceeds the inode size"),
+            });
+        }
+        raw[..inode_raw.len()].copy_from_slice(inode_raw);
+        raw[I_BLOCK..I_BLOCK + 60].copy_from_slice(&root_bytes);
+        raw[0x1C..0x20].copy_from_slice(&((units & 0xFFFF_FFFF) as u32).to_le_bytes());
+        raw[0x74..0x76].copy_from_slice(&(((units >> 32) & 0xFFFF) as u16).to_le_bytes());
+        self.restamp_recovery_inode(ino, &mut raw)?;
+        self.recovery_write_inode_raw(cx, ino, &raw)?;
+        self.ext4_persist_group_descriptors_from(cx, &alloc)?;
+        self.ext4_merge_recovery_alloc_into_live(&counts_before, &alloc);
+        self.invalidate_ext4_read_caches_after_recovery();
         info!(
             ino,
-            leaf = leaf_bn.0,
-            extents = extents.len(),
-            "fc_apply: recovered external single-leaf extent-tree inode"
+            ranges = ranges.len(),
+            blocks,
+            "fc_apply: recovered external extent-tree inode"
         );
         Ok(true)
     }
@@ -51043,11 +51211,11 @@ mod tests {
         );
     }
 
-    /// bd-6nwjx SAFETY: when the ADD_RANGE extents would overflow the single
-    /// leaf (forcing tree growth, which recovery cannot allocate for), the WHOLE
-    /// inode recovery is skipped ATOMICALLY — the inode is left at its pre-FC
-    /// state and no extents are half-applied (a partial apply would be an e2fsck
-    /// i_blocks mismatch). Guards the no-grow allocator's rollback path.
+    /// bd-6nwjx SAFETY: ADD_RANGE records naming blocks outside the filesystem
+    /// (here 500 ranges at blocks 50_000+ of a 64-block image) fail recovery
+    /// before anything is written — the inode is left at its pre-FC state and
+    /// no extents are half-applied. (Tree growth itself is recoverable; see
+    /// fast_commit_extent_tree_growth_recovers_with_a_fresh_leaf_bd_9m84h.)
     #[test]
     fn fast_commit_external_grow_needed_skips_atomically_bd_6nwjx() {
         let dev = TestDevice::from_vec(build_ext4_image_with_extents());
@@ -88606,6 +88774,132 @@ mod tests {
             clean,
             "e2fsck must accept the image after a DEL_RANGE punch apply:\n{output}"
         );
+    }
+
+    /// bd-9m84h: a fast commit that pushed a file past four extents. Its INODE
+    /// record carries a depth-1 root naming a leaf the kernel never wrote (a
+    /// fast commit logs ranges, not tree blocks); recovery keeps the on-disk
+    /// inline root, inserts the ADD_RANGEs, grows the tree with a block no
+    /// recovered range names, and recounts i_blocks — then e2fsck agrees.
+    #[test]
+    fn fast_commit_extent_tree_growth_recovers_with_a_fresh_leaf_bd_9m84h() {
+        let Some((fs, dev, _tmp, image)) = open_ext4_mke2fs(8, true) else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let sb = fs.ext4_superblock().expect("sb").clone();
+        let bs = u64::from(sb.block_size);
+        let attr = fs
+            .create(&cx, InodeNumber(2), OsStr::new("grow.dat"), 0o644, 0, 0)
+            .expect("create");
+        fs.write(
+            &cx,
+            attr.ino,
+            0,
+            &vec![0x11_u8; usize::try_from(bs).unwrap()],
+        )
+        .expect("write head");
+        fs.flush_mvcc_to_device(&cx).expect("flush");
+        let ino = u32::try_from(attr.ino.0).expect("ino");
+
+        // Six one-block islands the fast commit mapped; their data is on disk
+        // (data reaches the disk before the fast commit), their tree is not.
+        let mut bytes = dev.snapshot_bytes();
+        let top = sb.blocks_count - 64;
+        let islands: Vec<(u32, u64)> = (1..=6_u32)
+            .map(|k| (k * 10, top + 2 * u64::from(k)))
+            .collect();
+        for &(_, phys) in &islands {
+            let at = usize::try_from(phys * bs).unwrap();
+            bytes[at..at + usize::try_from(bs).unwrap()].fill(0xC0 + (phys & 0xF) as u8);
+        }
+        let recov = std::sync::Arc::new(std::sync::Mutex::new(bytes));
+        let fs2 = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice {
+                data: std::sync::Arc::clone(&recov),
+            }),
+            &OpenOptions::default(),
+        )
+        .expect("reopen");
+
+        // The record: size past the last island, a depth-1 root whose leaf
+        // (`ghost`) holds garbage on disk.
+        let ghost = top + 40;
+        let mut raw = fs2.recovery_read_inode_raw(&cx, ino).expect("raw inode");
+        raw[0x04..0x08].copy_from_slice(&u32::try_from(61 * bs).unwrap().to_le_bytes());
+        let mut root = [0_u8; 60];
+        root[0..2].copy_from_slice(&0xF30A_u16.to_le_bytes());
+        root[2..4].copy_from_slice(&1_u16.to_le_bytes());
+        root[4..6].copy_from_slice(&4_u16.to_le_bytes());
+        root[6..8].copy_from_slice(&1_u16.to_le_bytes());
+        root[16..20].copy_from_slice(&u32::try_from(ghost).unwrap().to_le_bytes());
+        raw[0x28..0x28 + 60].copy_from_slice(&root);
+        fs2.restamp_recovery_inode(ino, &mut raw).expect("stamp");
+        let mut ops: Vec<ffs_journal::FcOperation> = islands
+            .iter()
+            .map(|&(logical, phys)| {
+                ffs_journal::FcOperation::AddRange(ffs_journal::FcExtentRange {
+                    ino,
+                    logical_block: logical,
+                    len: 1,
+                    physical_block: phys,
+                    unwritten: false,
+                })
+            })
+            .collect();
+        ops.push(ffs_journal::FcOperation::InodeUpdate(ino, raw));
+        fs2.apply_fast_commit_operations(&cx, &ops, true)
+            .expect("extent-tree growth recovers");
+
+        let inode = fs2.read_inode(&cx, attr.ino).expect("recovered inode");
+        let root_depth = u16::from_le_bytes([inode.extent_bytes[6], inode.extent_bytes[7]]);
+        assert_eq!(root_depth, 1, "seven extents need an external leaf");
+        let leaf_count = u16::from_le_bytes([inode.extent_bytes[2], inode.extent_bytes[3]]);
+        let leaves: Vec<u64> = (0..usize::from(leaf_count))
+            .map(|i| {
+                let at = 12 + 12 * i + 4;
+                u64::from(u32::from_le_bytes(
+                    inode.extent_bytes[at..at + 4].try_into().unwrap(),
+                ))
+            })
+            .collect();
+        assert!(
+            !leaves.contains(&ghost),
+            "the record's unwritten leaf must not be used"
+        );
+        assert!(
+            islands.iter().all(|&(_, phys)| !leaves.contains(&phys)),
+            "new leaves must avoid every block the fast commit named: {leaves:?}"
+        );
+        let extents = fs2
+            .collect_extents_with_scope(&cx, &RequestScope::empty(), &inode)
+            .expect("extents");
+        assert_eq!(extents.len(), 7, "{extents:?}");
+        for &(logical, phys) in &islands {
+            let data = fs2
+                .read(&cx, attr.ino, u64::from(logical) * bs, 16)
+                .expect("read island");
+            assert_eq!(
+                data,
+                vec![0xC0 + (phys & 0xF) as u8; 16],
+                "island {logical}"
+            );
+        }
+        let sectors = bs / 512;
+        let data_blocks: u64 = extents.iter().map(|e| u64::from(e.actual_len())).sum();
+        assert_eq!(
+            inode.blocks,
+            (data_blocks + u64::from(leaf_count)) * sectors,
+            "i_blocks counts data blocks plus the leaves: {extents:?}"
+        );
+
+        fs2.flush_mvcc_to_device(&cx).expect("flush after replay");
+        std::fs::write(&image, recov.lock().unwrap().clone()).expect("write image");
+        let Some((clean, output)) = run_e2fsck(&image) else {
+            return;
+        };
+        assert!(clean, "e2fsck after extent-tree growth recovery:\n{output}");
     }
 
     /// bd-w6fxn: a fast-committed UNLINK must, on recovery, remove the directory
