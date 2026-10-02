@@ -19636,7 +19636,114 @@ fn run_fc_kernel_scenario(
         fs::read(&overlay_image).expect("reread overlay image") == pristine,
         "{scenario}: SimulateOverlay recovery modified the image"
     );
+
+    // Recovery cut short by an I/O error part-way, then run again on the
+    // half-recovered image: the failure must surface, and the second
+    // recovery must still end exactly where the kernel's does (bd-9m84h).
+    let probe = tmp.path().join("crash_state_probe.img");
+    fs::write(&probe, &pristine).expect("probe copy");
+    let (probe_dev, probe_writes) = WriteBudgetDevice::open(&probe, usize::MAX);
+    drop(
+        OpenFs::from_device(&cx, Box::new(probe_dev), &options)
+            .unwrap_or_else(|e| panic!("{scenario}: recovery through the counting device: {e}")),
+    );
+    let total = probe_writes.load(std::sync::atomic::Ordering::SeqCst);
+    let mut budgets = vec![1, total / 3, 2 * total / 3, total.saturating_sub(1)];
+    budgets.retain(|&b| b > 0 && b < total);
+    budgets.dedup();
+    eprintln!("{scenario}: recovery makes {total} writes; interrupting at {budgets:?}");
+    for budget in budgets {
+        let image = tmp.path().join(format!("crash_state_cut_{budget}.img"));
+        fs::write(&image, &pristine).expect("interrupted copy");
+        let (dev, _) = WriteBudgetDevice::open(&image, budget);
+        assert!(
+            OpenFs::from_device(&cx, Box::new(dev), &options).is_err(),
+            "{scenario}: recovery with its write #{} failing reported success",
+            budget + 1
+        );
+        let rerun = OpenFs::open_with_options(&cx, &image, &options).unwrap_or_else(|e| {
+            panic!("{scenario}: recovery after an interruption at write {budget}/{total}: {e}")
+        });
+        assert_eq!(
+            fc_view(&cx, &rerun),
+            kernel_view,
+            "{scenario}: recovery after an interruption at write {budget}/{total} must match \
+             the kernel's"
+        );
+        drop(rerun);
+        if command_available("e2fsck") {
+            let fsck = Command::new("e2fsck")
+                .args(["-fn"])
+                .arg(&image)
+                .output()
+                .expect("e2fsck");
+            assert!(
+                fsck.status.success(),
+                "{scenario}: e2fsck -fn after recovery interrupted at write {budget}/{total}:\n{}{}",
+                String::from_utf8_lossy(&fsck.stdout),
+                String::from_utf8_lossy(&fsck.stderr)
+            );
+        }
+    }
     emit_scenario_result(scenario, "PASS", None);
+}
+
+/// A file device whose writes fail with EIO once `budget` of them have been
+/// made: interrupts a recovery part-way (bd-9m84h). The counter returned with
+/// it records how many writes went through.
+struct WriteBudgetDevice {
+    inner: ffs_block::FileByteDevice,
+    budget: usize,
+    writes: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl WriteBudgetDevice {
+    fn open(path: &Path, budget: usize) -> (Self, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        let writes = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let device = Self {
+            inner: ffs_block::FileByteDevice::open(path).expect("open image"),
+            budget,
+            writes: std::sync::Arc::clone(&writes),
+        };
+        (device, writes)
+    }
+}
+
+impl ffs_block::ByteDevice for WriteBudgetDevice {
+    fn len_bytes(&self) -> u64 {
+        self.inner.len_bytes()
+    }
+
+    fn read_exact_at(
+        &self,
+        cx: &Cx,
+        offset: ffs_types::ByteOffset,
+        buf: &mut [u8],
+    ) -> ffs_error::Result<()> {
+        self.inner.read_exact_at(cx, offset, buf)
+    }
+
+    fn write_all_at(
+        &self,
+        cx: &Cx,
+        offset: ffs_types::ByteOffset,
+        buf: &[u8],
+    ) -> ffs_error::Result<()> {
+        let made = self.writes.load(std::sync::atomic::Ordering::SeqCst);
+        if made >= self.budget {
+            return Err(ffs_error::FfsError::Io(std::io::Error::from_raw_os_error(
+                libc::EIO,
+            )));
+        }
+        self.inner.write_all_at(cx, offset, buf)?;
+        self.writes
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+
+    fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+        self.inner.sync(cx)
+    }
 }
 
 /// bd-2ryx9: subvolumes the kernel created inside the default root (one
