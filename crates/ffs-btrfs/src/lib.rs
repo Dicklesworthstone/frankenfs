@@ -235,6 +235,9 @@ pub const BTRFS_FT_BLKDEV: u8 = 4;
 pub const BTRFS_FT_FIFO: u8 = 5;
 pub const BTRFS_FT_SOCK: u8 = 6;
 pub const BTRFS_FT_SYMLINK: u8 = 7;
+/// The dir-item type of every XATTR_ITEM; the kernel's tree checker rejects
+/// any other value and refuses to mount.
+pub const BTRFS_FT_XATTR: u8 = 8;
 
 /// File extent type values in EXTENT_DATA payloads.
 pub const BTRFS_FILE_EXTENT_INLINE: u8 = 0;

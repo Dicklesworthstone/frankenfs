@@ -40477,7 +40477,10 @@ impl OpenFs {
         let name_len = u16::try_from(name.len()).map_err(|_| FfsError::NameTooLong)?;
         payload.extend_from_slice(&value_len.to_le_bytes());
         payload.extend_from_slice(&name_len.to_le_bytes());
-        payload.push(0);
+        // Type 0 here made every image FrankenFS set an xattr on unmountable
+        // by the kernel ("corrupt leaf ... invalid dir item type, have 0");
+        // btrfs check does not look at it.
+        payload.push(ffs_btrfs::BTRFS_FT_XATTR);
         payload.extend_from_slice(name);
         payload.extend_from_slice(value);
         Ok(payload)
@@ -73534,6 +73537,55 @@ mod tests {
             .setxattr(&cx, ino, "user.big", &too_large, XattrSetMode::Set)
             .expect_err("an oversized xattr value must be rejected");
         assert_eq!(err.to_errno(), libc::E2BIG);
+    }
+
+    /// Kernel tree-checker contract: every dir item inside an XATTR_ITEM
+    /// carries type BTRFS_FT_XATTR, or the kernel refuses to mount the image.
+    #[test]
+    fn btrfs_xattr_items_carry_ft_xattr_type_for_the_kernel() {
+        let (fs, cx) = open_writable_btrfs();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let ino = fs
+            .create(&cx, root, OsStr::new("xattr_type"), 0o644, 0, 0)
+            .expect("create")
+            .ino;
+        fs.setxattr(&cx, ino, "user.a", b"one", XattrSetMode::Set)
+            .expect("set a");
+        fs.setxattr(&cx, ino, "user.b", b"two", XattrSetMode::Set)
+            .expect("set b");
+        let alloc = fs.require_btrfs_alloc_state().expect("alloc").read();
+        let lo = BtrfsKey {
+            objectid: ino.0,
+            item_type: BTRFS_ITEM_XATTR_ITEM,
+            offset: 0,
+        };
+        let hi = BtrfsKey {
+            offset: u64::MAX,
+            ..lo
+        };
+        let items = alloc.fs_tree.range(&lo, &hi).expect("xattr range");
+        assert!(!items.is_empty(), "setxattr must store XATTR_ITEMs");
+        for (key, payload) in &items {
+            // btrfs_dir_item: location(17) transid(8) data_len(2) name_len(2) type(1)
+            let mut at = 0;
+            while at < payload.len() {
+                let data_len =
+                    usize::from(u16::from_le_bytes([payload[at + 25], payload[at + 26]]));
+                let name_len =
+                    usize::from(u16::from_le_bytes([payload[at + 27], payload[at + 28]]));
+                assert_eq!(
+                    payload[at + 29],
+                    ffs_btrfs::BTRFS_FT_XATTR,
+                    "XATTR_ITEM {key:?} entry at {at} has the wrong dir-item type"
+                );
+                at += 30 + name_len + data_len;
+            }
+        }
+        drop(alloc);
+        assert_eq!(
+            fs.getxattr(&cx, ino, "user.b").expect("get").as_deref(),
+            Some(&b"two"[..])
+        );
     }
 
     #[test]
