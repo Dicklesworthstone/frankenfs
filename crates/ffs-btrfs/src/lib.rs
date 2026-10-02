@@ -8729,12 +8729,15 @@ impl BtrfsExtentAllocator {
             item_type: BTRFS_ITEM_METADATA_ITEM, // 169
             offset: u64::MAX,
         };
-        let extents = self.extent_tree.range(&range_start, &range_end)?;
-
-        let mut allocated_ranges: Vec<(u64, u64)> = extents
-            .iter()
-            .filter_map(|(key, _)| allocation_extent_range(*key, self.nodesize))
-            .collect();
+        // Keys only: the item bodies are not needed, so borrow instead of
+        // cloning every item in the group on every off-tail allocation.
+        let mut allocated_ranges: Vec<(u64, u64)> = Vec::new();
+        self.extent_tree
+            .range_with(&range_start, &range_end, |key, _| {
+                if let Some(range) = allocation_extent_range(key, self.nodesize) {
+                    allocated_ranges.push(range);
+                }
+            })?;
 
         // Pinned extents are occupied even though no extent item says so:
         // the blocks of the trees the committed superblock still points at,
