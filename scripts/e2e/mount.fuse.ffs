@@ -35,13 +35,20 @@ for part in "${parts[@]}"; do
     esac
 done
 atime=""
+# A filesystem root mounts through mount(8) is for every user, with access
+# decided by permission bits (the mount uses default_permissions), like any
+# kernel filesystem. Without allow_other, fuser answers other users itself
+# with EACCES (xfstests generic/087's owner utime ran as uid 99 and failed).
+allow_other=""
+[[ $EUID -eq 0 ]] && allow_other=yes
 for part in "${parts[@]}"; do
     case $part in
-        allow_other) args+=(--allow-other) ;;
+        allow_other) allow_other=yes ;;
         # FUSE inodes are S_NOATIME, so the daemon applies the atime policy.
         noatime | relatime | strictatime) atime=$part ;;
     esac
 done
+[[ -n $allow_other ]] && args+=(--allow-other)
 [[ -n $atime ]] && args+=(--atime "$atime")
 # An empty FFS_FUSE_SUBTYPE mounts with no subtype, so the kernel reports the
 # type as plain `fuse` (xfstests FSTYP=fuse compares against that).
