@@ -80,6 +80,14 @@ jobs:
           set -euo pipefail
           sudo install -m 0755 target/debug/ffs-cli /usr/local/bin/ffs-cli
           sudo install -m 0755 scripts/e2e/mount.fuse.ffs /sbin/mount.fuse.ffs
+          # Core dumps to a plain file, so a test's own `ulimit -c 0` holds.
+          # With the runner's systemd-coredump pipe the kernel ignores
+          # RLIMIT_CORE=0, and xfstests fails whichever test's window the
+          # asynchronously recorded core lands in: generic/564, 394 and 749
+          # kill their own tool on purpose (SIGXFSZ/SIGBUS), and 564's core
+          # was once charged to 565 (bd-6ljdy). A tool that crashes without
+          # the ulimit still leaves a `core` file that check reports.
+          sudo sysctl -w kernel.core_pattern=core
           # xfstests' permission tests run as these users.
           sudo useradd -m fsgqa || true
           sudo useradd -m fsgqa2 || true
