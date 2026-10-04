@@ -45729,6 +45729,54 @@ impl OpenFs {
         }
     }
 
+    /// Visit the inode's EXTENT_DATA items from the one covering `from_offset`
+    /// onward, in file order, until `f` breaks. SEEK_DATA/SEEK_HOLE want the
+    /// first item that answers them; [`Self::btrfs_fiemap_extent_items`]
+    /// parses every item to the end of the file first, which made a
+    /// seek-driven copy of a fragmented file quadratic (xfstests generic/286).
+    /// A writable mount walks the in-memory tree and stops early; a read-only
+    /// one walks the collected suffix.
+    fn btrfs_for_each_extent_from(
+        &self,
+        cx: &Cx,
+        canonical: u64,
+        from_offset: u64,
+        mut f: impl FnMut(u64, &BtrfsExtentData) -> std::ops::ControlFlow<()>,
+    ) -> ffs_error::Result<()> {
+        let Some(alloc_mutex) = self.btrfs_alloc_state.as_ref() else {
+            for (offset, extent) in self.btrfs_fiemap_extent_items(cx, canonical, from_offset)? {
+                if f(offset, &extent).is_break() {
+                    break;
+                }
+            }
+            return Ok(());
+        };
+        let alloc = alloc_mutex.read();
+        let lo = Self::btrfs_extent_window_floor(&alloc, canonical, from_offset)?;
+        let start = BtrfsKey {
+            objectid: canonical,
+            item_type: BTRFS_ITEM_EXTENT_DATA,
+            offset: lo,
+        };
+        let end = BtrfsKey {
+            objectid: canonical,
+            item_type: BTRFS_ITEM_EXTENT_DATA,
+            offset: u64::MAX,
+        };
+        let mut parse_err = None;
+        alloc
+            .fs_tree
+            .range_until(&start, &end, |key, value| match parse_extent_data(value) {
+                Ok(extent) => f(key.offset, &extent),
+                Err(e) => {
+                    parse_err = Some(parse_to_ffs_error(&e));
+                    std::ops::ControlFlow::Break(())
+                }
+            })
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        parse_err.map_or(Ok(()), Err)
+    }
+
     /// Read-only counterpart to `extent_alloc.extent_item_refs`: read the
     /// EXTENT_ITEM refcount for (`disk_bytenr`, `disk_num_bytes`) directly from
     /// the on-disk extent tree (resolved from the superblock's root tree).
@@ -46029,33 +46077,34 @@ impl OpenFs {
             return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::ENXIO)));
         }
 
-        // Explicit hole extents (disk_bytenr == 0) are NOT data — drop them so
+        // Explicit hole extents (disk_bytenr == 0) are NOT data — skip them so
         // they read as gaps, matching btrfs_read_file and the kernel (bd-pb6bs).
-        let extents: Vec<_> = self
-            .btrfs_fiemap_extent_items(cx, canonical, offset)?
-            .into_iter()
-            .filter(|(_, extent)| !Self::btrfs_extent_is_hole(extent))
-            .collect();
-
-        for (file_offset, extent) in &extents {
-            let ext_len = Self::btrfs_extent_logical_len(extent)?;
-            let ext_end = file_offset.saturating_add(ext_len);
-
-            // If extent ends before offset, skip.
-            if ext_end <= offset {
-                continue;
+        // The walk stops at the first data extent ending past `offset`.
+        let mut found = None;
+        let mut failure = None;
+        self.btrfs_for_each_extent_from(cx, canonical, offset, |file_offset, extent| {
+            if Self::btrfs_extent_is_hole(extent) {
+                return std::ops::ControlFlow::Continue(());
             }
-
-            // If extent starts after offset, return start of this extent.
-            // If extent contains offset, return offset.
-            if *file_offset <= offset {
-                return Ok(offset);
+            let ext_len = match Self::btrfs_extent_logical_len(extent) {
+                Ok(len) => len,
+                Err(e) => {
+                    failure = Some(e);
+                    return std::ops::ControlFlow::Break(());
+                }
+            };
+            if file_offset.saturating_add(ext_len) <= offset {
+                return std::ops::ControlFlow::Continue(());
             }
-            return Ok(*file_offset);
+            // Containing `offset`: offset itself; after it: its start.
+            found = Some(offset.max(file_offset));
+            std::ops::ControlFlow::Break(())
+        })?;
+        if let Some(e) = failure {
+            return Err(e);
         }
-
         // No data found after offset.
-        Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::ENXIO)))
+        found.ok_or_else(|| FfsError::Io(std::io::Error::from_raw_os_error(libc::ENXIO)))
     }
 
     /// btrfs SEEK_HOLE: find the next hole at or after `offset`.
@@ -46070,32 +46119,41 @@ impl OpenFs {
         }
 
         // Explicit hole extents (disk_bytenr == 0) are NOT data, so they must
-        // count as holes, not advance the covered-data cursor (bd-pb6bs).
-        let extents: Vec<_> = self
-            .btrfs_fiemap_extent_items(cx, canonical, offset)?
-            .into_iter()
-            .filter(|(_, extent)| !Self::btrfs_extent_is_hole(extent))
-            .collect();
-
-        // Track where we've seen contiguous data.
+        // count as holes, not advance the covered-data cursor (bd-pb6bs). The
+        // walk stops at the first gap that answers.
         let mut covered_until = 0_u64;
-
-        for (file_offset, extent) in &extents {
-            let ext_len = Self::btrfs_extent_logical_len(extent)?;
-
+        let mut answer = None;
+        let mut failure = None;
+        self.btrfs_for_each_extent_from(cx, canonical, offset, |file_offset, extent| {
+            if Self::btrfs_extent_is_hole(extent) {
+                return std::ops::ControlFlow::Continue(());
+            }
+            let ext_len = match Self::btrfs_extent_logical_len(extent) {
+                Ok(len) => len,
+                Err(e) => {
+                    failure = Some(e);
+                    return std::ops::ControlFlow::Break(());
+                }
+            };
             // Gap before this extent?
-            if *file_offset > covered_until && *file_offset > offset {
-                return Ok(covered_until.max(offset));
+            if file_offset > covered_until && file_offset > offset {
+                answer = Some(covered_until.max(offset));
+                return std::ops::ControlFlow::Break(());
             }
-
             // If offset is in a gap before this extent.
-            if offset < *file_offset && offset >= covered_until {
-                return Ok(offset);
+            if offset < file_offset && offset >= covered_until {
+                answer = Some(offset);
+                return std::ops::ControlFlow::Break(());
             }
-
             covered_until = file_offset.saturating_add(ext_len);
+            std::ops::ControlFlow::Continue(())
+        })?;
+        if let Some(e) = failure {
+            return Err(e);
         }
-
+        if let Some(hole) = answer {
+            return Ok(hole);
+        }
         // After all extents, the virtual hole at EOF.
         if offset >= covered_until {
             return Ok(offset);
@@ -88340,6 +88398,79 @@ mod tests {
     fn open_writable_btrfs() -> (OpenFs, Cx) {
         let (fs, cx, _) = open_writable_btrfs_with_device();
         (fs, cx)
+    }
+
+    /// generic/286: btrfs SEEK_DATA/SEEK_HOLE stop at the first extent that
+    /// answers. At every block offset of a fragmented file (data, punched
+    /// holes, preallocation, an explicit hole extent) they must equal the
+    /// answer computed from the full extent list.
+    #[test]
+    fn btrfs_seek_data_hole_early_exit_matches_the_full_extent_list() {
+        let Some((fs, _dev, _tmp, _image)) = open_writable_btrfs_mkfs(256) else {
+            return; // btrfs-progs unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let ino = fs
+            .create(&cx, root, OsStr::new("sparse"), 0o644, 0, 0)
+            .expect("create")
+            .ino;
+        let block = 4096_u64;
+        fs.write(&cx, ino, 0, &vec![0x11; 64 * 4096])
+            .expect("write");
+        for (i, punch) in [3_u64, 4, 9, 17, 18, 19, 30, 41, 50, 63].iter().enumerate() {
+            let mode = if i % 3 == 2 {
+                libc::FALLOC_FL_ZERO_RANGE | libc::FALLOC_FL_KEEP_SIZE
+            } else {
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE
+            };
+            fs.btrfs_fallocate(&cx, ino, punch * block, block, mode)
+                .expect("punch");
+        }
+        let canonical = fs.btrfs_canonical_inode(ino).expect("canonical");
+        let size = 64 * block;
+        let extents: Vec<(u64, BtrfsExtentData)> = fs
+            .btrfs_fiemap_extent_items(&cx, canonical, 0)
+            .expect("extents")
+            .into_iter()
+            .filter(|(_, e)| !OpenFs::btrfs_extent_is_hole(e))
+            .collect();
+        let data_ref = |offset: u64| -> Option<u64> {
+            extents.iter().find_map(|(start, e)| {
+                let end = start + OpenFs::btrfs_extent_logical_len(e).unwrap();
+                (end > offset).then(|| offset.max(*start))
+            })
+        };
+        let hole_ref = |offset: u64| -> u64 {
+            let mut covered = 0_u64;
+            for (start, e) in &extents {
+                let len = OpenFs::btrfs_extent_logical_len(e).unwrap();
+                if *start > covered && *start > offset {
+                    return covered.max(offset);
+                }
+                if offset < *start && offset >= covered {
+                    return offset;
+                }
+                covered = start + len;
+            }
+            if offset >= covered {
+                offset
+            } else {
+                covered.max(offset).min(size)
+            }
+        };
+        for offset in (0..size).step_by(2048) {
+            assert_eq!(
+                fs.btrfs_lseek_data(&cx, ino, offset).ok(),
+                data_ref(offset),
+                "SEEK_DATA at {offset}"
+            );
+            assert_eq!(
+                fs.btrfs_lseek_hole(&cx, ino, offset).expect("SEEK_HOLE"),
+                hole_ref(offset),
+                "SEEK_HOLE at {offset}"
+            );
+        }
     }
 
     /// generic/610: fallocate keeps nbytes by the change in the window it

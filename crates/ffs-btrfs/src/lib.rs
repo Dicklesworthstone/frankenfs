@@ -5862,6 +5862,68 @@ impl InMemoryCowBtrfsTree {
         self.for_each_in_range(self.root, start, end, &mut |item| f(item.key, &item.data))
     }
 
+    /// [`Self::range_with`] that stops as soon as `f` returns
+    /// `ControlFlow::Break`: a caller after the first item that satisfies
+    /// something (SEEK_DATA, SEEK_HOLE) pays for the items up to it, not for
+    /// the rest of the range.
+    pub fn range_until<F>(
+        &self,
+        start: &BtrfsKey,
+        end: &BtrfsKey,
+        mut f: F,
+    ) -> Result<(), BtrfsMutationError>
+    where
+        F: FnMut(BtrfsKey, &[u8]) -> std::ops::ControlFlow<()>,
+    {
+        if key_cmp(start, end) == Ordering::Greater {
+            return Err(BtrfsMutationError::InvalidRange);
+        }
+        self.for_each_in_range_until(self.root, start, end, &mut f)
+            .map(|_| ())
+    }
+
+    /// [`Self::for_each_in_range`] with early exit; `Ok(true)` once stopped.
+    fn for_each_in_range_until<F>(
+        &self,
+        node_id: u64,
+        start: &BtrfsKey,
+        end: &BtrfsKey,
+        f: &mut F,
+    ) -> Result<bool, BtrfsMutationError>
+    where
+        F: FnMut(BtrfsKey, &[u8]) -> std::ops::ControlFlow<()>,
+    {
+        match self.node_ref(node_id)? {
+            BtrfsCowNode::Leaf { items } => {
+                let lo = items.partition_point(|item| key_cmp(&item.key, start).is_lt());
+                for item in &items[lo..] {
+                    if key_cmp(&item.key, end).is_gt() {
+                        break;
+                    }
+                    if f(item.key, &item.data).is_break() {
+                        return Ok(true);
+                    }
+                }
+            }
+            BtrfsCowNode::Internal { keys, children } => {
+                for (i, child) in children.iter().enumerate() {
+                    if let Some(high) = keys.get(i)
+                        && key_cmp(high, start) != Ordering::Greater
+                    {
+                        continue;
+                    }
+                    if i > 0 && key_cmp(&keys[i - 1], end).is_gt() {
+                        break;
+                    }
+                    if self.for_each_in_range_until(*child, start, end, f)? {
+                        return Ok(true);
+                    }
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// The largest key in the tree that is `<= target` (predecessor-or-equal), or
     /// `None` if every key is greater. O(log N) B-tree descent — the dual of
     /// [`Self::collect_range_from`]. Lets a caller seek directly to the item
