@@ -2137,6 +2137,26 @@ fn to_fuser_file_type(ft: FfsFileType) -> FileType {
 }
 
 /// Convert an `ffs_core::InodeAttr` to `fuser::FileAttr`.
+/// Whether a caller (uid, primary gid, pid) is in group `gid` or privileged,
+/// for the S_ISGID kill rule (bd-fvd78). FUSE passes only the primary gid, so
+/// supplementary groups are read from the caller's /proc status; an unreadable
+/// one counts as outside the group, which errs toward clearing the bit.
+fn caller_in_group(uid: u32, caller_gid: u32, pid: u32, gid: u32) -> bool {
+    if uid == 0 || caller_gid == gid {
+        return true;
+    }
+    std::fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(|status| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("Groups:"))
+            .is_some_and(|groups| {
+                groups
+                    .split_whitespace()
+                    .any(|group| group.parse::<u32>() == Ok(gid))
+            })
+    })
+}
+
 fn to_file_attr(attr: &InodeAttr) -> FileAttr {
     FileAttr {
         ino: attr.ino.0,
@@ -5962,13 +5982,15 @@ impl Filesystem for FrankenFuse {
             }
         }
 
-        // bd-ha71t: FUSE_HANDLE_KILLPRIV_V2 was negotiated here experimentally and
-        // is MEASURED INERT against the per-path-op `security.capability` probe —
-        // 4000 probes for 2000 path stats with the kernel reporting the capability
-        // ENABLED, identical to the 4000 without it. Experimental wiring reverted;
-        // the constant remains in the vendored ABI so the next kernel can be
-        // re-tested without rediscovering that it was missing. Do not re-negotiate
-        // it here expecting a probe reduction on this kernel.
+        // bd-fvd78: the filesystem clears set-ID bits and capabilities itself
+        // (kill_suidgid), on write, truncate, fallocate and chown. Without it the
+        // kernel's FUSE setattr clears S_ISGID only from a group-executable file,
+        // the pre-6.2 rule (xfstests generic/683-685). (bd-ha71t measured this
+        // inert for the per-path `security.capability` getxattr probe count;
+        // correctness, not that probe, is why it is negotiated.)
+        if let Err(missing) = config.add_capabilities(fuse_consts::FUSE_HANDLE_KILLPRIV_V2) {
+            debug!(missing, "kernel declined FUSE_HANDLE_KILLPRIV_V2");
+        }
         match config.set_max_stack_depth(1) {
             Ok(_) => match config.add_capabilities(fuse_consts::FUSE_PASSTHROUGH) {
                 Ok(()) => debug!("FUSE passthrough capability enabled"),
@@ -6790,7 +6812,16 @@ impl Filesystem for FrankenFuse {
             atime: atime.map(resolve_time),
             mtime: mtime.map(resolve_time),
         };
-        match self.dispatch_setattr(&cx, ino, &attrs, req.uid()) {
+        let result = self.dispatch_setattr(&cx, ino, &attrs, req.uid()).and_then(|attr| {
+            if !req.setattr_kill_suidgid() {
+                return Ok(attr);
+            }
+            self.kill_suidgid(&cx, ino, (req.uid(), req.gid(), req.pid()))?;
+            self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
+                self.inner.ops.getattr(cx, scope, InodeNumber(ino))
+            })
+        });
+        match result {
             Ok(attr) => {
                 reply.attr(&ATTR_TTL, &to_file_attr(&attr));
                 self.notify_inode_invalidation(ino);
@@ -7032,7 +7063,7 @@ impl Filesystem for FrankenFuse {
 
     fn write(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         ino: u64,
         fh: u64,
         offset: i64,
@@ -7050,6 +7081,19 @@ impl Filesystem for FrankenFuse {
             flags,
             "FUSE write"
         );
+        // FUSE_HANDLE_KILLPRIV_V2: the writer lacks CAP_FSETID, so the set-ID
+        // bits and capabilities go before the data changes (bd-fvd78).
+        if write_flags & fuse_consts::FUSE_WRITE_KILL_SUIDGID != 0
+            && !self.inner.read_only
+            && let Err(error) = self.kill_suidgid(
+                &Self::cx_for_request(),
+                ino,
+                (req.uid(), req.gid(), req.pid()),
+            )
+        {
+            reply.error(error.to_errno());
+            return;
+        }
         match self.dispatch_write_with_intent(
             ino,
             offset,
@@ -7780,6 +7824,51 @@ impl FrankenFuse {
     /// tests at all -- which is why the refusal below had no test until now, and
     /// why `auto` stayed restricted to read-only mounts on an argument nobody
     /// could check.
+    /// FUSE_HANDLE_KILLPRIV_V2 (bd-fvd78): the kernel leaves clearing the
+    /// set-ID bits and file capabilities to the filesystem on a write by a
+    /// caller without CAP_FSETID (FUSE_WRITE_KILL_SUIDGID), and on a truncate,
+    /// an fallocate or a chown of a non-directory (FATTR_KILL_SUIDGID). Do it
+    /// as the VFS does: S_ISUID always; S_ISGID when the file is
+    /// group-executable or the caller is outside its group
+    /// (setattr_should_drop_sgid); security.capability always. Without v2 the
+    /// kernel's FUSE path kept the old rule and left S_ISGID on a
+    /// non-group-executable file (xfstests generic/683-685).
+    fn kill_suidgid(&self, cx: &Cx, ino: u64, caller: (u32, u32, u32)) -> ffs_error::Result<()> {
+        let _inode_guards = self.acquire_mutation_inode_guards(&[InodeNumber(ino)]);
+        self.with_request_scope(cx, RequestOp::Setattr, |cx, scope| {
+            let attr = self.inner.ops.getattr(cx, scope, InodeNumber(ino))?;
+            if attr.kind == FfsFileType::Directory {
+                return Ok(());
+            }
+            let (uid, gid, pid) = caller;
+            let mut perm = attr.perm & !0o4000;
+            if attr.perm & 0o2000 != 0
+                && (attr.perm & 0o010 != 0 || !caller_in_group(uid, gid, pid, attr.gid))
+            {
+                perm &= !0o2000;
+            }
+            if perm != attr.perm {
+                let attrs = SetAttrRequest {
+                    mode: Some(perm),
+                    ..SetAttrRequest::default()
+                };
+                self.inner
+                    .ops
+                    .setattr(cx, scope, InodeNumber(ino), &attrs)?;
+            }
+            match self
+                .inner
+                .ops
+                .removexattr(cx, scope, InodeNumber(ino), "security.capability")
+            {
+                Err(e) if e.to_errno() != libc::ENODATA => return Err(e),
+                _ => {}
+            }
+            self.inner.ops.commit_request_scope(cx, scope)?;
+            Ok(())
+        })
+    }
+
     /// FUSE_SETXATTR_ACL_KILL_SGID: setting an access ACL by a caller outside
     /// the owning group (without CAP_FSETID) clears S_ISGID, as
     /// posix_acl_update_mode does in the kernel; with FUSE_SETXATTR_EXT the
