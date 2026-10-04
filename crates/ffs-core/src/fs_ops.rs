@@ -1026,9 +1026,25 @@ impl FsOps for OpenFs {
                             let data_free = alloc
                                 .extent_alloc
                                 .allocatable_bytes(super::BTRFS_BLOCK_GROUP_DATA);
+                            // Only what the growth planner can actually place:
+                            // not the reserved head, the superblock mirrors, or
+                            // runs too short for a chunk (generic/103, bd-5cf5p).
                             let unallocated = if self.btrfs_grow_data_chunks_enabled() {
-                                ffs_btrfs::GrowthDevice::from_chunk_tree(&alloc.chunk_tree, sb.fsid)
-                                    .map_or(0, |dev| dev.total_bytes.saturating_sub(dev.bytes_used))
+                                match (
+                                    ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree),
+                                    ffs_btrfs::GrowthDevice::from_chunk_tree(
+                                        &alloc.chunk_tree,
+                                        sb.fsid,
+                                    ),
+                                ) {
+                                    (Ok(chunks), Ok(dev)) => ffs_btrfs::growable_chunk_bytes(
+                                        &chunks,
+                                        ffs_btrfs::ChunkKind::Data,
+                                        &dev,
+                                        &ffs_btrfs::ChunkSizePolicy::default(),
+                                    ),
+                                    _ => 0,
+                                }
                             } else {
                                 0
                             };
