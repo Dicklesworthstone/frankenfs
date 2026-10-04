@@ -3098,6 +3098,13 @@ impl FrankenFuse {
         // Non-blocking enqueue onto the writer thread's bounded channel.
         // Backpressure is recorded inside the probe and surfaced on shutdown.
         trace.record(ino, cmd, in_len, out_size);
+        // Then wait for the line to be written, so a reader that runs after
+        // the ioctl returns sees it: the out-of-process mounted tests cannot
+        // flush the writer themselves, and on a busy runner the line once
+        // landed after the reader had settled (CI run 37048324144). A traced
+        // mount is a diagnostic one; the wait costs only it. A flush error
+        // (dropped events, writer gone) is already counted by the probe.
+        let _ = trace.flush_sync();
     }
 
     /// Commit any outstanding writeback batch (bd-2i2ez).
