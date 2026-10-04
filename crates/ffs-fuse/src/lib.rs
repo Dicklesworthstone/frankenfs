@@ -2137,6 +2137,53 @@ fn to_fuser_file_type(ft: FfsFileType) -> FileType {
 }
 
 /// Convert an `ffs_core::InodeAttr` to `fuser::FileAttr`.
+/// The permission bits after a kill of set-ID privileges (bd-fvd78): S_ISUID
+/// always goes; S_ISGID goes from a group-executable file, or when the caller
+/// is outside the file's group (setattr_should_drop_sgid). `in_group` is only
+/// asked when it decides the answer.
+fn killpriv_perm(perm: u16, in_group: impl FnOnce() -> bool) -> u16 {
+    let mut out = perm & !0o4000;
+    if perm & 0o2000 != 0 && (perm & 0o010 != 0 || !in_group()) {
+        out &= !0o2000;
+    }
+    out
+}
+
+/// Whether the caller lacks CAP_FSETID in its effective set (bd-fvd78), read
+/// from its /proc status; when that is unreadable, any uid but root lacks it.
+fn caller_lacks_fsetid(uid: u32, pid: u32) -> bool {
+    const CAP_FSETID: u32 = 4;
+    std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .ok()
+        .and_then(|status| {
+            status
+                .lines()
+                .find_map(|line| line.strip_prefix("CapEff:"))
+                .and_then(|caps| u64::from_str_radix(caps.trim(), 16).ok())
+        })
+        .map_or(uid != 0, |caps| caps & (1 << CAP_FSETID) == 0)
+}
+
+/// Whether a caller (uid, primary gid, pid) is in group `gid` or privileged,
+/// for the S_ISGID kill rule (bd-fvd78). FUSE passes only the primary gid, so
+/// supplementary groups are read from the caller's /proc status; an unreadable
+/// one counts as outside the group, which errs toward clearing the bit.
+fn caller_in_group(uid: u32, caller_gid: u32, pid: u32, gid: u32) -> bool {
+    if caller_gid == gid || !caller_lacks_fsetid(uid, pid) {
+        return true;
+    }
+    std::fs::read_to_string(format!("/proc/{pid}/status")).is_ok_and(|status| {
+        status
+            .lines()
+            .find_map(|line| line.strip_prefix("Groups:"))
+            .is_some_and(|groups| {
+                groups
+                    .split_whitespace()
+                    .any(|group| group.parse::<u32>() == Ok(gid))
+            })
+    })
+}
+
 fn to_file_attr(attr: &InodeAttr) -> FileAttr {
     FileAttr {
         ino: attr.ino.0,
@@ -5962,13 +6009,15 @@ impl Filesystem for FrankenFuse {
             }
         }
 
-        // bd-ha71t: FUSE_HANDLE_KILLPRIV_V2 was negotiated here experimentally and
-        // is MEASURED INERT against the per-path-op `security.capability` probe —
-        // 4000 probes for 2000 path stats with the kernel reporting the capability
-        // ENABLED, identical to the 4000 without it. Experimental wiring reverted;
-        // the constant remains in the vendored ABI so the next kernel can be
-        // re-tested without rediscovering that it was missing. Do not re-negotiate
-        // it here expecting a probe reduction on this kernel.
+        // bd-fvd78: the filesystem clears set-ID bits and capabilities itself
+        // (kill_suidgid), on write, truncate, fallocate and chown. Without it the
+        // kernel's FUSE setattr clears S_ISGID only from a group-executable file,
+        // the pre-6.2 rule (xfstests generic/683-685). (bd-ha71t measured this
+        // inert for the per-path `security.capability` getxattr probe count;
+        // correctness, not that probe, is why it is negotiated.)
+        if let Err(missing) = config.add_capabilities(fuse_consts::FUSE_HANDLE_KILLPRIV_V2) {
+            debug!(missing, "kernel declined FUSE_HANDLE_KILLPRIV_V2");
+        }
         match config.set_max_stack_depth(1) {
             Ok(_) => match config.add_capabilities(fuse_consts::FUSE_PASSTHROUGH) {
                 Ok(()) => debug!("FUSE passthrough capability enabled"),
@@ -6790,7 +6839,18 @@ impl Filesystem for FrankenFuse {
             atime: atime.map(resolve_time),
             mtime: mtime.map(resolve_time),
         };
-        match self.dispatch_setattr(&cx, ino, &attrs, req.uid()) {
+        let result = self
+            .dispatch_setattr(&cx, ino, &attrs, req.uid())
+            .and_then(|attr| {
+                if !req.setattr_kill_suidgid() {
+                    return Ok(attr);
+                }
+                self.kill_suidgid(&cx, ino, (req.uid(), req.gid(), req.pid()))?;
+                self.with_request_scope(&cx, RequestOp::Getattr, |cx, scope| {
+                    self.inner.ops.getattr(cx, scope, InodeNumber(ino))
+                })
+            });
+        match result {
             Ok(attr) => {
                 reply.attr(&ATTR_TTL, &to_file_attr(&attr));
                 self.notify_inode_invalidation(ino);
@@ -7032,7 +7092,7 @@ impl Filesystem for FrankenFuse {
 
     fn write(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         ino: u64,
         fh: u64,
         offset: i64,
@@ -7050,6 +7110,19 @@ impl Filesystem for FrankenFuse {
             flags,
             "FUSE write"
         );
+        // FUSE_HANDLE_KILLPRIV_V2: the writer lacks CAP_FSETID, so the set-ID
+        // bits and capabilities go before the data changes (bd-fvd78).
+        if write_flags & fuse_consts::FUSE_WRITE_KILL_SUIDGID != 0
+            && !self.inner.read_only
+            && let Err(error) = self.kill_suidgid(
+                &Self::cx_for_request(),
+                ino,
+                (req.uid(), req.gid(), req.pid()),
+            )
+        {
+            reply.error(error.to_errno());
+            return;
+        }
         match self.dispatch_write_with_intent(
             ino,
             offset,
@@ -7129,7 +7202,7 @@ impl Filesystem for FrankenFuse {
 
     fn fallocate(
         &mut self,
-        _req: &Request<'_>,
+        req: &Request<'_>,
         ino: u64,
         _fh: u64,
         offset: i64,
@@ -7156,6 +7229,16 @@ impl Filesystem for FrankenFuse {
             reply.error(libc::EINVAL);
             return;
         };
+        // FUSE_HANDLE_KILLPRIV_V2 leaves fallocate's file_modified to the
+        // filesystem and sends no flag for it (only truncate and chown carry
+        // FATTR_KILL_SUIDGID): kill here, before the change, as ext4_fallocate
+        // does, unless the caller has CAP_FSETID (xfstests generic/683-685).
+        if caller_lacks_fsetid(req.uid(), req.pid())
+            && let Err(error) = self.kill_suidgid(&cx, ino, (req.uid(), req.gid(), req.pid()))
+        {
+            reply.error(error.to_errno());
+            return;
+        }
         match self.with_request_scope(&cx, RequestOp::Fallocate, |cx, scope| {
             let result = self.inner.ops.fallocate(
                 cx,
@@ -7780,6 +7863,46 @@ impl FrankenFuse {
     /// tests at all -- which is why the refusal below had no test until now, and
     /// why `auto` stayed restricted to read-only mounts on an argument nobody
     /// could check.
+    /// FUSE_HANDLE_KILLPRIV_V2 (bd-fvd78): the kernel leaves clearing the
+    /// set-ID bits and file capabilities to the filesystem on a write by a
+    /// caller without CAP_FSETID (FUSE_WRITE_KILL_SUIDGID), and on a truncate,
+    /// an fallocate or a chown of a non-directory (FATTR_KILL_SUIDGID). Do it
+    /// as the VFS does: S_ISUID always; S_ISGID when the file is
+    /// group-executable or the caller is outside its group
+    /// (setattr_should_drop_sgid); security.capability always. Without v2 the
+    /// kernel's FUSE path kept the old rule and left S_ISGID on a
+    /// non-group-executable file (xfstests generic/683-685).
+    fn kill_suidgid(&self, cx: &Cx, ino: u64, caller: (u32, u32, u32)) -> ffs_error::Result<()> {
+        let _inode_guards = self.acquire_mutation_inode_guards(&[InodeNumber(ino)]);
+        self.with_request_scope(cx, RequestOp::Setattr, |cx, scope| {
+            let attr = self.inner.ops.getattr(cx, scope, InodeNumber(ino))?;
+            if attr.kind == FfsFileType::Directory {
+                return Ok(());
+            }
+            let (uid, gid, pid) = caller;
+            let perm = killpriv_perm(attr.perm, || caller_in_group(uid, gid, pid, attr.gid));
+            if perm != attr.perm {
+                let attrs = SetAttrRequest {
+                    mode: Some(perm),
+                    ..SetAttrRequest::default()
+                };
+                self.inner
+                    .ops
+                    .setattr(cx, scope, InodeNumber(ino), &attrs)?;
+            }
+            match self
+                .inner
+                .ops
+                .removexattr(cx, scope, InodeNumber(ino), "security.capability")
+            {
+                Err(e) if e.to_errno() != libc::ENODATA => return Err(e),
+                _ => {}
+            }
+            self.inner.ops.commit_request_scope(cx, scope)?;
+            Ok(())
+        })
+    }
+
     /// FUSE_SETXATTR_ACL_KILL_SGID: setting an access ACL by a caller outside
     /// the owning group (without CAP_FSETID) clears S_ISGID, as
     /// posix_acl_update_mode does in the kernel; with FUSE_SETXATTR_EXT the
@@ -13428,6 +13551,56 @@ mod tests {
         let fh3 = handles.open();
         assert_eq!(handles.visible_len(fh3, 0, &cookie_page(&[1, 2])), 2);
         assert_eq!(handles.visible_len(fh3, 2, &rest), 3);
+    }
+
+    #[test]
+    fn killpriv_drops_sgid_by_the_modern_vfs_rule_bd_fvd78() {
+        // generic/683-685: 6666 -> 666 and 6766 -> 766 for a caller outside
+        // the group; the old FUSE rule kept S_ISGID on both.
+        assert_eq!(killpriv_perm(0o6666, || false), 0o0666);
+        assert_eq!(killpriv_perm(0o6766, || false), 0o0766);
+        // In the group: S_ISGID stays on a non-group-executable file...
+        assert_eq!(killpriv_perm(0o6666, || true), 0o2666);
+        // ...and goes from a group-executable one regardless.
+        assert_eq!(killpriv_perm(0o6676, || true), 0o0676);
+        assert_eq!(killpriv_perm(0o2676, || panic!("not needed")), 0o0676);
+        // Nothing to kill.
+        assert_eq!(killpriv_perm(0o0644, || panic!("not needed")), 0o0644);
+    }
+
+    #[test]
+    fn caller_in_group_reads_supplementary_groups_bd_fvd78() {
+        let pid = std::process::id();
+        // CAP_FSETID decides; with no readable status, uid 0 stands in for it.
+        assert!(caller_in_group(0, 1, u32::MAX, 4242), "root is privileged");
+        assert!(caller_lacks_fsetid(1000, u32::MAX));
+        assert!(!caller_lacks_fsetid(0, u32::MAX));
+        assert!(caller_in_group(1000, 4242, pid, 4242), "primary group");
+        // This process's own supplementary groups are in its /proc status.
+        let status = std::fs::read_to_string(format!("/proc/{pid}/status")).expect("status");
+        let groups: Vec<u32> = status
+            .lines()
+            .find_map(|line| line.strip_prefix("Groups:"))
+            .map(|g| {
+                g.split_whitespace()
+                    .filter_map(|x| x.parse().ok())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if let Some(&group) = groups.iter().find(|&&g| g != 4_000_000) {
+            assert!(
+                caller_in_group(1000, 4_000_000, pid, group),
+                "supplementary group"
+            );
+        }
+        assert!(
+            !caller_in_group(1000, 1000, pid, 4_000_001),
+            "outside the group"
+        );
+        assert!(
+            !caller_in_group(1000, 1000, u32::MAX, 4_000_001),
+            "an unreadable caller counts as outside"
+        );
     }
 
     #[test]

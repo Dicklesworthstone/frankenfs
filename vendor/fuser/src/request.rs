@@ -91,6 +91,8 @@ pub struct Request<'a> {
     interrupt: OnceLock<RequestInterrupt>,
     /// A SETXATTR's `setxattr_flags` (FUSE_SETXATTR_EXT), set at dispatch.
     setxattr_flags: AtomicU32,
+    /// A SETATTR's FATTR_KILL_SUIDGID, set at dispatch.
+    setattr_kill_suidgid: std::sync::atomic::AtomicBool,
 }
 
 /// Per-opcode counts of requests that crossed the FUSE boundary (bd-xfe7z).
@@ -324,6 +326,7 @@ impl<'a> Request<'a> {
             request,
             interrupt: OnceLock::new(),
             setxattr_flags: AtomicU32::new(0),
+            setattr_kill_suidgid: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -694,6 +697,8 @@ impl<'a> Request<'a> {
                 );
             }
             ll::Operation::SetAttr(x) => {
+                self.setattr_kill_suidgid
+                    .store(x.kill_suidgid(), Ordering::Relaxed);
                 se.filesystem.setattr(
                     self,
                     self.request.nodeid().into(),
@@ -1132,6 +1137,14 @@ impl<'a> Request<'a> {
     #[inline]
     pub fn setxattr_acl_kill_sgid(&self) -> bool {
         self.setxattr_flags.load(Ordering::Relaxed) & 1 != 0
+    }
+
+    /// For a SETATTR: whether the kernel asks the filesystem to clear suid
+    /// and sgid (FATTR_KILL_SUIDGID; only sent once FUSE_HANDLE_KILLPRIV_V2
+    /// is negotiated).
+    #[inline]
+    pub fn setattr_kill_suidgid(&self) -> bool {
+        self.setattr_kill_suidgid.load(Ordering::Relaxed)
     }
 
     /// Returns the gid of this request

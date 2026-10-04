@@ -172,6 +172,9 @@ pub mod consts {
     pub const FATTR_LOCKOWNER: u32 = 1 << 9;
     #[cfg(feature = "abi-7-23")]
     pub const FATTR_CTIME: u32 = 1 << 10;
+    // Kill suid/sgid in the filesystem (FUSE_HANDLE_KILLPRIV_V2): sent with a
+    // truncate, an fallocate's file_modified, or a chown of a non-directory.
+    pub const FATTR_KILL_SUIDGID: u32 = 1 << 11;
 
     #[cfg(target_os = "macos")]
     pub const FATTR_CRTIME: u32 = 1 << 28;

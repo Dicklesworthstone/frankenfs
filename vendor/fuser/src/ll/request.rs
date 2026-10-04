@@ -408,6 +408,11 @@ mod op {
     }
     impl_request!(SetAttr<'_>);
     impl SetAttr<'_> {
+        /// The kernel asks the filesystem to clear suid/sgid
+        /// (`FATTR_KILL_SUIDGID`, FUSE_HANDLE_KILLPRIV_V2).
+        pub fn kill_suidgid(&self) -> bool {
+            self.arg.valid & FATTR_KILL_SUIDGID != 0
+        }
         pub fn mode(&self) -> Option<u32> {
             match self.arg.valid & FATTR_MODE {
                 0 => None,
