@@ -7307,6 +7307,44 @@ pub fn plan_growth_for_commit(
 ///
 /// # Errors
 /// As [`plan_growth_for_commit`].
+/// Bytes of new `kind` chunks the growth planner could still place on
+/// `device`: [`plan_growth_for_shortfall`]'s own model — the chunk map's
+/// occupancy, the superblock mirrors, the reserved head below `min_offset`
+/// and the chunk-size policy — applied chunk after chunk until none fits.
+///
+/// This, not `total_bytes - bytes_used`, is the unallocated space a data
+/// write can grow into. The raw difference also counts the reserved first
+/// MiB and runs too short for a chunk, so `df` promised space fallocate then
+/// refused (xfstests generic/103, bd-5cf5p).
+#[must_use]
+pub fn growable_chunk_bytes(
+    chunks: &[BtrfsChunkEntry],
+    kind: ChunkKind,
+    device: &GrowthDevice,
+    policy: &ChunkSizePolicy,
+) -> u64 {
+    let Ok(mut occupancy) = DeviceOccupancy::from_chunks(device.devid, chunks) else {
+        return 0;
+    };
+    occupancy.reserve_superblock_mirrors(device.total_bytes);
+    let mut total = 0_u64;
+    // Each pass places one chunk; a device holds at most total/min_chunk.
+    let max_chunks = device.total_bytes / policy.min_chunk.max(1) + 1;
+    for _ in 0..max_chunks {
+        let free_run = occupancy.largest_free_run(device.min_offset, device.total_bytes);
+        let Some(length) = policy.decide(kind, device.total_bytes, free_run) else {
+            break;
+        };
+        let Some(physical) = occupancy.find_free(length, device.min_offset, device.total_bytes)
+        else {
+            break;
+        };
+        occupancy.reserve(physical, length);
+        total = total.saturating_add(length);
+    }
+    total
+}
+
 pub fn plan_growth_for_shortfall(
     chunks: &[BtrfsChunkEntry],
     kind: ChunkKind,

@@ -92989,6 +92989,42 @@ mod tests {
             .unwrap_or_else(|e| panic!("statfs said {available} bytes were available: {e:?}"));
     }
 
+    /// bd-5cf5p (xfstests generic/103): on a larger filesystem that has to
+    /// grow data chunks, fallocating all of `df`'s available space but 512 KiB
+    /// must still succeed.
+    #[test]
+    fn btrfs_statfs_available_space_is_fallocatable_to_512k_bd_5cf5p() {
+        let Some((fs, _dev, _tmp, _image)) = open_writable_btrfs_mkfs(1024) else {
+            return; // btrfs-progs unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        for i in 0..64 {
+            fs.create(&cx, root, OsStr::new(&format!("f{i}")), 0o644, 0, 0)
+                .expect("create");
+        }
+        let val = fs
+            .create(&cx, root, OsStr::new("attrval"), 0o644, 0, 0)
+            .expect("create attrval");
+        fs.write(&cx, val.ino, 0, &[0x33_u8; 64 * 1024])
+            .expect("write");
+        let stat = fs.statfs(&cx, root).expect("statfs");
+        let available = stat.blocks_available * u64::from(stat.block_size);
+        let want = (available / 1024 - 512) * 1024;
+        let spc = fs
+            .create(&cx, root, OsStr::new("spc"), 0o644, 0, 0)
+            .expect("create spc");
+        fs.fallocate(&cx, spc.ino, 0, want, 0).unwrap_or_else(|e| {
+            let after = fs.statfs(&cx, root).expect("statfs");
+            panic!(
+                "statfs said {available} bytes were available; fallocate of {want} failed: \
+                 {e:?} (free now {} available {})",
+                after.blocks_free * u64::from(after.block_size),
+                after.blocks_available * u64::from(after.block_size)
+            )
+        });
+    }
+
     /// bd-x3fcu / bd-4cxkd: a file whose DATA is written + committed by FrankenFS
     /// on a REAL btrfs image must be `btrfs check`-clean. This exercises both
     /// halves of bd-4cxkd: (1) the data extent carries its `EXTENT_ITEM` + inline
