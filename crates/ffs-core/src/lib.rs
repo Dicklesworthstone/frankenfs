@@ -35766,6 +35766,80 @@ impl OpenFs {
         Ok(total_nbytes)
     }
 
+    /// File offset of the EXTENT_DATA item covering (or last preceding)
+    /// `offset`, or 0 when none precedes it: the lowest key an operation on
+    /// `[offset, ..)` can touch.
+    fn btrfs_extent_window_floor(
+        alloc: &BtrfsAllocState,
+        canonical: u64,
+        offset: u64,
+    ) -> ffs_error::Result<u64> {
+        let seek = BtrfsKey {
+            objectid: canonical,
+            item_type: BTRFS_ITEM_EXTENT_DATA,
+            offset,
+        };
+        Ok(
+            match alloc
+                .fs_tree
+                .floor_key(&seek)
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?
+            {
+                Some(k) if k.objectid == canonical && k.item_type == BTRFS_ITEM_EXTENT_DATA => {
+                    k.offset
+                }
+                _ => 0,
+            },
+        )
+    }
+
+    /// The nbytes contribution of the inode's EXTENT_DATA items keyed in
+    /// `[lo, hi]`. fallocate changes only items there, so the difference of
+    /// this sum before and after it is the inode's nbytes delta, without the
+    /// whole-file walk of [`Self::btrfs_recompute_inode_nbytes`] (which made
+    /// punching every other block of a file quadratic: xfstests generic/610).
+    fn btrfs_window_nbytes(
+        alloc: &BtrfsAllocState,
+        canonical: u64,
+        lo: u64,
+        hi: u64,
+    ) -> ffs_error::Result<u64> {
+        let start = BtrfsKey {
+            objectid: canonical,
+            item_type: BTRFS_ITEM_EXTENT_DATA,
+            offset: lo,
+        };
+        let end = BtrfsKey {
+            objectid: canonical,
+            item_type: BTRFS_ITEM_EXTENT_DATA,
+            offset: hi,
+        };
+        let mut total = 0_u64;
+        let mut failure: Option<FfsError> = None;
+        alloc
+            .fs_tree
+            .range_with(&start, &end, |_, value| {
+                if failure.is_some() {
+                    return;
+                }
+                match parse_extent_data(value) {
+                    Ok(extent) => {
+                        match total.checked_add(Self::btrfs_extent_nbytes_contribution(&extent)) {
+                            Some(sum) => total = sum,
+                            None => {
+                                failure = Some(FfsError::InvalidGeometry(
+                                    "btrfs inode nbytes overflow".into(),
+                                ));
+                            }
+                        }
+                    }
+                    Err(e) => failure = Some(parse_to_ffs_error(&e)),
+                }
+            })
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        failure.map_or(Ok(total), Err)
+    }
+
     fn btrfs_extent_nbytes_contribution(extent: &BtrfsExtentData) -> u64 {
         match extent {
             BtrfsExtentData::Regular { disk_bytenr: 0, .. } => 0,
@@ -41436,6 +41510,19 @@ impl OpenFs {
             );
         }
 
+        // Every mode but collapse/insert (which shift every later extent)
+        // changes only EXTENT_DATA items keyed in [window_lo, new_end]; nbytes
+        // is then adjusted by that window's change instead of re-walked.
+        let window = if collapse_range || insert_range {
+            None
+        } else {
+            let lo = Self::btrfs_extent_window_floor(&alloc, canonical, offset)?;
+            Some((
+                lo,
+                Self::btrfs_window_nbytes(&alloc, canonical, lo, new_end)?,
+            ))
+        };
+
         if collapse_range {
             if new_end >= inode.size {
                 return Err(FfsError::Io(std::io::Error::from_raw_os_error(
@@ -41459,15 +41546,16 @@ impl OpenFs {
                 .checked_add(length)
                 .ok_or_else(|| FfsError::InvalidGeometry("insert size overflow".into()))?;
         } else if punch_hole || zero_range {
+            // Only items keyed in [window_lo, new_end] can overlap the range.
             let ext_start = BtrfsKey {
                 objectid: canonical,
                 item_type: BTRFS_ITEM_EXTENT_DATA,
-                offset: 0,
+                offset: window.map_or(0, |(lo, _)| lo),
             };
             let ext_end = BtrfsKey {
                 objectid: canonical,
                 item_type: BTRFS_ITEM_EXTENT_DATA,
-                offset: u64::MAX,
+                offset: new_end,
             };
             let extents = alloc
                 .fs_tree
@@ -41730,7 +41818,21 @@ impl OpenFs {
         if !keep_size && !collapse_range && !insert_range && new_end > inode.size {
             inode.size = new_end;
         }
-        inode.nbytes = Self::btrfs_recompute_inode_nbytes(&alloc, canonical)?;
+        inode.nbytes = match window {
+            Some((lo, before)) => {
+                let after = Self::btrfs_window_nbytes(&alloc, canonical, lo, new_end)?;
+                // A stale nbytes on entry would underflow: re-walk instead.
+                match inode
+                    .nbytes
+                    .checked_add(after)
+                    .and_then(|sum| sum.checked_sub(before))
+                {
+                    Some(nbytes) => nbytes,
+                    None => Self::btrfs_recompute_inode_nbytes(&alloc, canonical)?,
+                }
+            }
+            None => Self::btrfs_recompute_inode_nbytes(&alloc, canonical)?,
+        };
         // fallocate(2): a successful allocation marks the file modified, so the
         // kernel (via file_modified) bumps both mtime and ctime — for every mode
         // (default prealloc, KEEP_SIZE, PUNCH_HOLE, ZERO_RANGE, COLLAPSE/INSERT).
@@ -88238,6 +88340,59 @@ mod tests {
     fn open_writable_btrfs() -> (OpenFs, Cx) {
         let (fs, cx, _) = open_writable_btrfs_with_device();
         (fs, cx)
+    }
+
+    /// generic/610: fallocate keeps nbytes by the change in the window it
+    /// touches, not by re-walking the file. Through a seeded mix of punch,
+    /// zero-range and preallocation (aligned, overlapping, past EOF), the kept
+    /// nbytes must always equal a full recompute.
+    #[test]
+    fn btrfs_fallocate_incremental_nbytes_matches_a_full_recompute() {
+        let Some((fs, _dev, _tmp, _image)) = open_writable_btrfs_mkfs(256) else {
+            return; // btrfs-progs unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let ino = fs
+            .create(&cx, root, OsStr::new("f"), 0o644, 0, 0)
+            .expect("create")
+            .ino;
+        fs.write(&cx, ino, 0, &vec![0x5A; 1 << 20])
+            .expect("write 1 MiB");
+        let modes = [
+            libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE,
+            libc::FALLOC_FL_ZERO_RANGE,
+            libc::FALLOC_FL_ZERO_RANGE | libc::FALLOC_FL_KEEP_SIZE,
+            libc::FALLOC_FL_KEEP_SIZE,
+            0,
+        ];
+        let mut seed = 0x9E37_79B9_7F4A_7C15_u64;
+        let mut next = || {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            seed
+        };
+        for step in 0..150 {
+            let offset = (next() % 320) * 4096;
+            let length = (next() % 24 + 1) * 4096;
+            let mode = modes[usize::try_from(next() % 5).unwrap()];
+            fs.btrfs_fallocate(&cx, ino, offset, length, mode)
+                .unwrap_or_else(|e| {
+                    panic!("step {step}: fallocate {offset}+{length} mode {mode}: {e}")
+                });
+            let alloc = fs.require_btrfs_alloc_state().expect("alloc").read();
+            let canonical = fs.btrfs_canonical_inode(ino).expect("canonical");
+            let kept = fs
+                .btrfs_read_inode_from_tree(&alloc, canonical)
+                .expect("inode")
+                .nbytes;
+            let full = OpenFs::btrfs_recompute_inode_nbytes(&alloc, canonical).expect("recompute");
+            assert_eq!(
+                kept, full,
+                "step {step}: fallocate {offset}+{length} mode {mode:#x}"
+            );
+        }
     }
 
     /// bd-xfh0k: a btrfs read resolves its extents, drops the allocator guard,
