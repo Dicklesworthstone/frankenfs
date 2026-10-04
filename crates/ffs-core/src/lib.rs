@@ -88240,6 +88240,103 @@ mod tests {
         (fs, cx)
     }
 
+    /// bd-xfh0k: a btrfs read resolves its extents, drops the allocator guard,
+    /// then reads the blocks. If an overwrite of the same file frees those
+    /// extents and another file's write reuses them in between, the read
+    /// returns that file's bytes. Readers of A must only ever see A's bytes.
+    #[test]
+    fn btrfs_read_never_returns_another_files_bytes_under_overwrite_bd_xfh0k() {
+        let Some((fs, _dev, _tmp, _image)) = open_writable_btrfs_mkfs(256) else {
+            return; // btrfs-progs unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let a = fs
+            .create(&cx, root, OsStr::new("a"), 0o644, 0, 0)
+            .expect("create a")
+            .ino;
+        let b = fs
+            .create(&cx, root, OsStr::new("b"), 0o644, 0, 0)
+            .expect("create b")
+            .ino;
+        const LEN: usize = 64 * 1024;
+        fs.write(&cx, a, 0, &[0xA0; LEN]).expect("seed a");
+        fs.write(&cx, b, 0, &[0xB0; LEN]).expect("seed b");
+        let stop = std::sync::atomic::AtomicBool::new(false);
+        let foreign = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|scope| {
+            scope.spawn(|| {
+                let cx = Cx::for_testing();
+                for round in 0_u8..200 {
+                    let v = round % 8;
+                    fs.write(&cx, a, 0, &[0xA0 + v; LEN]).expect("overwrite a");
+                    fs.write(&cx, b, 0, &[0xB0 + v; LEN]).expect("overwrite b");
+                }
+                stop.store(true, std::sync::atomic::Ordering::Release);
+            });
+            for _ in 0..2 {
+                scope.spawn(|| {
+                    let cx = Cx::for_testing();
+                    while !stop.load(std::sync::atomic::Ordering::Acquire) {
+                        let data = fs.read(&cx, a, 0, LEN as u32).expect("read a");
+                        if data.iter().any(|&byte| !(0xA0..=0xA7).contains(&byte)) {
+                            foreign.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        }
+                    }
+                });
+            }
+        });
+        assert_eq!(
+            foreign.load(std::sync::atomic::Ordering::Relaxed),
+            0,
+            "a read of A returned bytes that were never A's"
+        );
+    }
+
+    /// bd-xfh0k, crash side: an overwrite frees A's committed data extent in
+    /// memory. If B's write reuses it and reaches the device before the next
+    /// commit, a crash recovers A pointing at B's bytes. The image as it
+    /// stands (the committed superblock) must still read A's committed data.
+    #[test]
+    fn btrfs_crash_before_commit_keeps_a_files_committed_data_bd_xfh0k() {
+        let Some((fs, dev, _tmp, _image)) = open_writable_btrfs_mkfs(256) else {
+            return; // btrfs-progs unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        const LEN: usize = 64 * 1024;
+        let a = fs
+            .create(&cx, root, OsStr::new("a"), 0o644, 0, 0)
+            .expect("create a")
+            .ino;
+        fs.write(&cx, a, 0, &[0xA1; LEN]).expect("write a");
+        fs.fsync(&cx, a, 0, false).expect("commit a");
+        // Not committed from here on.
+        fs.write(&cx, a, 0, &[0xA2; LEN]).expect("overwrite a");
+        let b = fs
+            .create(&cx, root, OsStr::new("b"), 0o644, 0, 0)
+            .expect("create b")
+            .ino;
+        fs.write(&cx, b, 0, &[0xB1; LEN]).expect("write b");
+
+        // Crash: reopen whatever is on the device now.
+        let crashed = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(dev.snapshot_bytes())),
+            &OpenOptions::default(),
+        )
+        .expect("reopen the crash image");
+        let attr = crashed
+            .lookup(&cx, root, OsStr::new("a"))
+            .expect("a was committed");
+        let data = crashed.read(&cx, attr.ino, 0, LEN as u32).expect("read a");
+        assert!(
+            data.iter().all(|&byte| byte == 0xA1),
+            "after a crash A must read its committed bytes, got {:#x?}",
+            &data[..16]
+        );
+    }
+
     /// fsx seed 1 (xfstests generic/091 on btrfs), reduced: a KEEP_SIZE zero
     /// range reaching past EOF leaves preallocated extents beyond i_size; a
     /// later write over them must replace them, not overlap them.
