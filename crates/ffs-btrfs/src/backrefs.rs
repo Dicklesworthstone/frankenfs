@@ -910,8 +910,8 @@ mod tests {
                         Ok(()) => reached_success = true,
                         Err(BtrfsMutationError::NoSpace) => {
                             assert_eq!(tree_state(&alloc.extent_tree), before);
-                            assert!(alloc.extent_tree.staged_allocations.is_empty());
-                            assert!(alloc.extent_tree.staged_deferred_frees.is_empty());
+                            assert_eq!(alloc.extent_tree.staged_allocations, Vec::<u64>::new());
+                            assert_eq!(alloc.extent_tree.staged_deferred_frees, Vec::<u64>::new());
                             assert_eq!(returned.load(Ordering::Relaxed), budget);
                             assert!(!alloc.is_pinned(2 << 20));
                             late_failures += usize::from(budget > 0);
@@ -962,8 +962,8 @@ mod tests {
                 .expect_err("missing final update");
                 assert_eq!(error, BtrfsMutationError::KeyNotFound);
                 assert_eq!(tree_state(&alloc.extent_tree), before);
-                assert!(alloc.extent_tree.staged_allocations.is_empty());
-                assert!(alloc.extent_tree.staged_deferred_frees.is_empty());
+                assert_eq!(alloc.extent_tree.staged_allocations, Vec::<u64>::new());
+                assert_eq!(alloc.extent_tree.staged_deferred_frees, Vec::<u64>::new());
                 alloc
                     .extent_tree
                     .validate_invariants()
