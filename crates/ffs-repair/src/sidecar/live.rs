@@ -19,6 +19,7 @@ use super::{
     symbol_digest,
 };
 use crate::codec::{decode_group_with_owned_repair_symbols, encode_group};
+use crate::sidecar_restore::decode_missing_group;
 use asupersync::Cx;
 use ffs_block::ByteDevice;
 use ffs_error::{FfsError, Result};
@@ -64,9 +65,10 @@ struct State {
 ///
 /// Reads verify complete source blocks. When no writes are outstanding, detected
 /// corruption within the available redundancy is reconstructed and verified
-/// before read data is returned. During a dirty epoch, reads still verify but
-/// never decode against the old parity. Recovery from complete group loss remains
-/// available through the offline restore API.
+/// before read data is returned, including complete group loss when the surviving
+/// parity equations have sufficient rank. During a dirty epoch, reads still
+/// verify but never decode against the old parity. Opening a mismatched image
+/// still requires explicit offline reconciliation rather than implicit rollback.
 ///
 /// This initial implementation scans the image at each dirty sync, and re-encodes
 /// only changed groups or groups with damaged parity. It favors correctness over
@@ -341,25 +343,38 @@ impl SidecarImageDevice {
             block_size: header.options.block_size,
             blocks,
         };
-        let decoded = decode_group_with_owned_repair_symbols(
-            cx,
-            &source,
-            &header.seed,
-            GroupNumber(group),
-            BlockNumber(first),
-            count,
-            &damaged,
-            record.symbols,
-        )?;
+        let recovered_blocks = if damaged.len() == count as usize {
+            // The archived digest table is already bound to this admitted
+            // generation. Complete group loss, including a one-block tail,
+            // can therefore use parity alone without trusting damaged source.
+            decode_missing_group(cx, header, group, &source, record.symbols)?
+        } else {
+            let decoded = decode_group_with_owned_repair_symbols(
+                cx,
+                &source,
+                &header.seed,
+                GroupNumber(group),
+                BlockNumber(first),
+                count,
+                &damaged,
+                record.symbols,
+            )?;
+            if !decoded.complete {
+                return Err(corrupt(
+                    "live repair could not reconstruct every damaged block",
+                ));
+            }
+            decoded.recovered
+        };
         checkpoint(cx)?;
         let mut seen = BTreeSet::new();
-        if !decoded.complete || decoded.recovered.len() != damaged.len() {
+        if recovered_blocks.len() != damaged.len() {
             return Err(corrupt(
                 "live repair could not reconstruct every damaged block",
             ));
         }
         // Validate EVERY result and compare EVERY target before the first write.
-        for recovered in &decoded.recovered {
+        for recovered in &recovered_blocks {
             let index = recovered
                 .block
                 .0
@@ -384,7 +399,7 @@ impl SidecarImageDevice {
                 _ => return Err(corrupt("live repair target changed before writeback")),
             }
         }
-        for recovered in &decoded.recovered {
+        for recovered in &recovered_blocks {
             checkpoint(cx)?;
             self.image.write_all_at(
                 &recovered.data[..header.real_block_len(recovered.block.0)],
@@ -392,7 +407,7 @@ impl SidecarImageDevice {
             )?;
         }
         self.image.sync_all()?;
-        for recovered in &decoded.recovered {
+        for recovered in &recovered_blocks {
             checkpoint(cx)?;
             if self.read_source_block(header, recovered.block.0)? != recovered.data {
                 return Err(corrupt("live repair failed post-write readback"));
@@ -941,6 +956,85 @@ mod tests {
             std::fs::read(&fixture.image).expect("both targets repaired"),
             fixture.original
         );
+    }
+
+    #[test]
+    fn clean_reads_repair_a_completely_erased_partial_tail_group() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+        let archive = std::fs::read(&fixture.sidecar).expect("saved parity");
+        fixture.damage(16 * 512, &[0xfe; 37]);
+        let mut bytes = [0x99; 23];
+        device
+            .read_exact_at(&cx, ByteOffset(16 * 512 + 7), &mut bytes)
+            .expect("parity-only recovery of the sole tail block");
+        assert_eq!(&bytes, &fixture.original[16 * 512 + 7..16 * 512 + 30]);
+        assert_eq!(std::fs::read(&fixture.image).expect("repaired image"), fixture.original);
+        assert_eq!(std::fs::read(&fixture.sidecar).expect("unchanged parity"), archive);
+        drop(device);
+        drop(fixture.open());
+    }
+
+    #[test]
+    fn clean_scrub_reconstructs_a_completely_erased_multiblock_tail_group() {
+        let mut fixture = Fixture::new();
+        fixture.original.resize(19 * 512 + 37, 0x46);
+        std::fs::write(&fixture.image, &fixture.original).expect("longer source");
+        let sidecar = fixture.sidecar.with_extension("six-parity");
+        let cx = Cx::for_testing();
+        protect(
+            &cx,
+            &fixture.image,
+            &sidecar,
+            SidecarOptions {
+                block_size: 512,
+                group_blocks: 8,
+                repair_symbols: 6,
+            },
+        )
+        .expect("six equations protect the four-block tail");
+        let device = SidecarImageDevice::open(&cx, &fixture.image, &sidecar).expect("admit");
+        fixture.damage(16 * 512, &[0xfe; 3 * 512 + 37]);
+        assert_eq!(device.scrub(&cx).expect("recover all four sources"), 4);
+        assert_eq!(std::fs::read(&fixture.image).expect("repaired image"), fixture.original);
+        drop(device);
+        assert!(verify(&cx, &fixture.image, &sidecar).expect("verify").is_healthy());
+    }
+
+    #[test]
+    fn partial_write_recovers_a_completely_erased_tail_before_preserving_its_bytes() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+        let mut expected = fixture.original.clone();
+        fixture.damage(16 * 512, &[0xfe; 37]);
+        device
+            .write_all_at(&cx, ByteOffset(16 * 512 + 9), &[0x27; 11])
+            .expect("repair the bytes outside the partial write first");
+        expected[16 * 512 + 9..16 * 512 + 20].fill(0x27);
+        device.sync(&cx).expect("acknowledge repaired source and new parity");
+        assert_eq!(std::fs::read(&fixture.image).expect("new image"), expected);
+        drop(device);
+        drop(fixture.open());
+        assert!(verify(&cx, &fixture.image, &fixture.sidecar).expect("verify").is_healthy());
+    }
+
+    #[test]
+    fn complete_group_loss_beyond_parity_budget_preserves_source_and_destination() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        fixture.damage(0, &[0xfe; 8 * 512]);
+        let before = std::fs::read(&fixture.image).expect("damaged source");
+        let archive = std::fs::read(&fixture.sidecar).expect("saved parity");
+        let mut output = [0x99; 64];
+        assert!(matches!(
+            device.read_exact_at(&Cx::for_testing(), ByteOffset(7), &mut output),
+            Err(FfsError::RepairFailed(_))
+        ));
+        assert_eq!(output, [0x99; 64]);
+        assert_eq!(std::fs::read(&fixture.image).expect("unchanged source"), before);
+        assert_eq!(std::fs::read(&fixture.sidecar).expect("unchanged parity"), archive);
     }
 
     #[test]
