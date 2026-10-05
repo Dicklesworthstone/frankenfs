@@ -19728,6 +19728,31 @@ impl OpenFs {
         Ok(count)
     }
 
+    /// A leaf child of an index node, for the metadata-block counts: it
+    /// contributes no blocks of its own children, so only its header is
+    /// checked (magic, depth 0) and its entries are not parsed. Parsing every
+    /// leaf in full made each count O(extents) and, because the write and
+    /// fallocate paths count before and after every allocation, writes
+    /// scattered through a fragmented file quadratic (xfstests generic/074
+    /// ran past 20 minutes in its mmap phase, parse_extent_leaf at the top of
+    /// the profile).
+    fn ext4_extent_leaf_depth_ok(bytes: &[u8], block: u64) -> Result<(), FfsError> {
+        let corrupt = |detail: &str| FfsError::Corruption {
+            block,
+            detail: detail.into(),
+        };
+        let header = bytes
+            .get(..8)
+            .ok_or_else(|| corrupt("extent node shorter than its header"))?;
+        if u16::from_le_bytes([header[0], header[1]]) != 0xF30A {
+            return Err(corrupt("bad extent node magic"));
+        }
+        if u16::from_le_bytes([header[6], header[7]]) != 0 {
+            return Err(corrupt("child extent tree depth inconsistency"));
+        }
+        Ok(())
+    }
+
     fn count_extent_tree_meta_recursive(
         &self,
         cx: &Cx,
@@ -19760,6 +19785,10 @@ impl OpenFs {
                     scope,
                     BlockNumber(idx.leaf_block),
                 )?;
+                if remaining_depth == 1 {
+                    Self::ext4_extent_leaf_depth_ok(&child_data, idx.leaf_block)?;
+                    continue;
+                }
                 let (child_header, child_tree) =
                     parse_extent_tree(&child_data).map_err(|e| parse_to_ffs_error(&e))?;
                 if child_header.depth + 1 != remaining_depth {
@@ -19890,6 +19919,13 @@ impl OpenFs {
             })?;
             for idx in indexes {
                 let child = dev.read_block(cx, BlockNumber(idx.leaf_block))?;
+                if remaining_depth == 1 {
+                    // A leaf has no child blocks: check its depth from the
+                    // header and skip parsing its entries (see
+                    // ext4_extent_leaf_depth_ok).
+                    Self::ext4_extent_leaf_depth_ok(child.as_slice(), idx.leaf_block)?;
+                    continue;
+                }
                 let (child_header, child_tree) =
                     parse_extent_tree(child.as_slice()).map_err(|e| parse_to_ffs_error(&e))?;
                 if child_header.depth + 1 != remaining_depth {
