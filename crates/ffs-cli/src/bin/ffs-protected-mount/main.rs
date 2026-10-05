@@ -10,8 +10,7 @@ use asupersync::Cx;
 use clap::Parser;
 use ffs_block::ByteDevice;
 use ffs_core::{
-    Ext4JournalReplayMode, FsFlavor, FsOps, OpenFs, OpenOptions, RequestScope,
-    detect_filesystem,
+    Ext4JournalReplayMode, FsFlavor, FsOps, OpenFs, OpenOptions, RequestScope, detect_filesystem,
 };
 use ffs_error::FfsError;
 use ffs_fuse::{MountConfig, MountOptions, mount_managed};
@@ -20,7 +19,7 @@ use ffs_repair::sidecar::live::SidecarImageDevice;
 use ffs_types::{ByteOffset, InodeNumber};
 use serde::Serialize;
 use std::io::Write;
-use std::path::{PathBuf};
+use std::path::PathBuf;
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -250,8 +249,9 @@ fn run(args: &Args) -> Result<()> {
     let handle = mount_managed(Box::new(Arc::clone(&prepared.fs)), mountpoint, &config)
         .context("mount protected filesystem")?;
     let flag = Arc::clone(handle.shutdown_flag());
-    *shutdown.lock().map_err(|_| anyhow::anyhow!("shutdown state poisoned"))? =
-        Some(Arc::clone(&flag));
+    *shutdown
+        .lock()
+        .map_err(|_| anyhow::anyhow!("shutdown state poisoned"))? = Some(Arc::clone(&flag));
     if stopped.load(Ordering::Acquire) {
         flag.store(true, Ordering::Release);
     }
@@ -271,15 +271,17 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
             eprintln!("ffs-protected-mount: {error:#}");
-            ExitCode::from(if error.chain().any(|cause| {
-                cause
-                    .downcast_ref::<FfsError>()
-                    .is_some_and(|error| matches!(error, FfsError::Cancelled))
-            }) {
-                130
-            } else {
-                4
-            })
+            ExitCode::from(
+                if error.chain().any(|cause| {
+                    cause
+                        .downcast_ref::<FfsError>()
+                        .is_some_and(|error| matches!(error, FfsError::Cancelled))
+                }) {
+                    130
+                } else {
+                    4
+                },
+            )
         }
     }
 }

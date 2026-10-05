@@ -870,7 +870,10 @@ mod tests {
             .expect("recover both untouched groups without a preparatory read");
         assert_eq!(std::fs::read(&fixture.image).expect("source"), expected);
         assert_eq!(
-            device.protection(&cx).expect("fresh coverage").snapshot_blake3,
+            device
+                .protection(&cx)
+                .expect("fresh coverage")
+                .snapshot_blake3,
             blake3::hash(&expected).to_hex().to_string()
         );
         drop(device);
