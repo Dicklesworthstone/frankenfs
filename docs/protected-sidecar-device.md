@@ -34,6 +34,19 @@ rechecks the whole image, reads back the staged header, source tables and parity
 locks the new archive inode before publication, atomically replaces the archive,
 and synchronizes its parent directory. Only then is the epoch clean.
 
+When dirty-sync verification encounters checksum corruption or an explicit media
+read failure in an unaffected group, it uses the same whole-group generation guard
+as read repair. Every intended digest in that group must still match its admitted
+protection point. Recovery is attempted once, followed by a fresh load and complete
+verification against the intended bytes; a changed peer cannot be rolled back.
+Healthy modified groups are verified directly and receive new parity, without
+trying to decode their old generation. No preparatory read or scrub is required.
+
+Repairs completed before a later group fails may remain in the source image, but
+they do not publish any pending writes. Failed refresh retains the pending header
+and intended digests for an explicit retry. Cancellation and non-media I/O errors
+do not trigger recovery. A clean `sync` remains a durability barrier, not a scrub.
+
 An interrupted or failed epoch remains unavailable for automatic recovery. The
 ordinary sidecar reader rejects its pending header; it cannot revive old parity
 as fresh coverage after process restart. There is no automatic reconciliation of
@@ -68,7 +81,7 @@ parity, including for an unchanged block; writes in other groups do not. Partial
 writes can likewise recover preserved bytes in an unaffected group before
 recording their new intended digests. Repair never clears the pending header or
 publishes outstanding writes: only a successful explicit `sync` does that.
-Insufficient redundancy, changed tables, unknown corruption during refresh,
+Insufficient redundancy, changed tables, corruption in a changed repair group,
 permission failures and cancellation are errors. Failed reads preserve the
 caller's destination. Partial write failures poison the handle rather than
 silently acknowledging uncertain state.
@@ -99,6 +112,11 @@ restoration, repeated refresh epochs, metadata transplantation, read repair,
 insufficient redundancy, cancellation and inode-lock lifetime. Added regressions
 cover complete group corruption, parity/header replenishment, full-block and
 short-tail replacement, and refusal to preserve corrupt partial-write bytes.
+Dirty-sync regressions cover cross-group and short-tail recovery, changed-target
+and changed-peer refusal, exhausted parity, explicit retry, cancellation,
+rewriting a group to its admitted generation, truncation, cached-table substitution,
+and a later-group failure after successful earlier recovery. The sync-recovery
+extension still requires execution of these Rust tests with the pinned toolchain.
 Process exit is not a hardware power-loss simulation.
 
 For the 2026-10-04 changes, Rust/Cargo and RCH were unavailable in the implementation
