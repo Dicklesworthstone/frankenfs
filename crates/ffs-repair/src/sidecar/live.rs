@@ -71,8 +71,10 @@ struct GroupRepair {
 /// Reads verify complete source blocks. When no writes are outstanding, detected
 /// corruption within the available redundancy is reconstructed and verified
 /// before read data is returned, including complete group loss when the surviving
-/// parity equations have sufficient rank. During a dirty epoch, reads still
-/// verify but never decode against the old parity. Opening a mismatched image
+/// parity equations have sufficient rank. During a dirty epoch, recovery remains
+/// available for groups whose intended source digests still match the admitted
+/// protection point. A changed digest anywhere in a group forbids using that
+/// group's old parity, even to recover an unchanged block. Opening a mismatched image
 /// still requires explicit offline reconciliation rather than implicit rollback.
 ///
 /// Partial writes verify the bytes they preserve. Complete replacement of a
@@ -300,9 +302,6 @@ impl SidecarImageDevice {
                 Ok(bytes)
             }
             Err(error) if !Self::media_error(&error) => Err(error),
-            _ if matches!(state.phase, Phase::Dirty) => Err(corrupt(
-                "source corruption during a dirty epoch; old parity is not current",
-            )),
             _ => {
                 let group = (block / u64::from(state.archive.header.options.group_blocks)) as u32;
                 self.repair_group(cx, state, group)?;
@@ -322,6 +321,21 @@ impl SidecarImageDevice {
         let record = state.archive.read_group(cx, group)?;
         Self::check_table(state, group, &record.hashes)?;
         let (first, count) = header.group_geometry(group)?;
+        // Parity covers the entire group, not only the requested block. Check
+        // every intended digest before decoding or touching any repair target.
+        // Writes in other groups cannot invalidate these equations. Rewriting
+        // a block back to its admitted bytes also makes its old parity current.
+        // Keep this check in the shared repair entry point so no caller can
+        // accidentally restore a changed peer while repairing an unchanged one.
+        if state
+            .changed
+            .range(first..first + u64::from(count))
+            .any(|(&block, expected)| record.hashes[(block - first) as usize] != *expected)
+        {
+            return Err(corrupt(
+                "source corruption during a dirty epoch; old parity is not current for this group",
+            ));
+        }
         let mut blocks = Vec::with_capacity(count as usize);
         let mut before = Vec::with_capacity(count as usize);
         let mut damaged = Vec::new();
@@ -838,6 +852,272 @@ mod tests {
         let output = fixture.image.with_extension("restored");
         restore(&cx, &fixture.image, &fixture.sidecar, &output).expect("recover latest ACK");
         assert_eq!(std::fs::read(output).expect("restored"), expected);
+    }
+
+    #[test]
+    fn dirty_read_repairs_another_group_without_publishing_pending_writes() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+        // The final block of group zero must not invalidate group one's parity.
+        device
+            .write_all_at(&cx, ByteOffset(7 * 512), &[0x27; 512])
+            .expect("write at group boundary");
+        let mut expected = fixture.original.clone();
+        expected[7 * 512..8 * 512].fill(0x27);
+        let pending = std::fs::read(&fixture.sidecar).expect("pending archive");
+        assert_eq!(&pending[..8], PENDING_MAGIC);
+        fixture.damage(8 * 512, &[0xfe; 512]);
+        let mut bytes = [0; 512];
+        device
+            .read_exact_at(&cx, ByteOffset(8 * 512), &mut bytes)
+            .expect("unmodified group remains recoverable");
+        assert_eq!(bytes.as_slice(), &expected[8 * 512..9 * 512]);
+        assert_eq!(
+            std::fs::read(&fixture.image).expect("repaired source"),
+            expected
+        );
+        assert_eq!(
+            std::fs::read(&fixture.sidecar).expect("still pending"),
+            pending
+        );
+        assert!(device.protection(&cx).is_err());
+        assert!(Archive::open(&cx, &fixture.sidecar).is_err());
+        device
+            .sync(&cx)
+            .expect("commit the actual intended generation");
+        drop(device);
+        assert!(
+            verify(&cx, &fixture.image, &fixture.sidecar)
+                .expect("fresh coverage")
+                .is_healthy()
+        );
+        drop(fixture.open());
+        fixture.damage(7 * 512, &[0xfe; 512]);
+        let output = fixture.image.with_extension("dirty-read-restored");
+        restore(&cx, &fixture.image, &fixture.sidecar, &output)
+            .expect("new parity protects the pending write, not its predecessor");
+        assert_eq!(
+            std::fs::read(output).expect("restored new generation"),
+            expected
+        );
+    }
+
+    #[test]
+    fn dirty_read_repairs_a_short_tail_without_extending_the_image() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+        device
+            .write_all_at(&cx, ByteOffset(0), &[0x27; 512])
+            .expect("pending write elsewhere");
+        fixture.damage(16 * 512, &[0xfe; 37]);
+        let pending = std::fs::read(&fixture.sidecar).expect("pending archive");
+        let mut bytes = [0; 37];
+        device
+            .read_exact_at(&cx, ByteOffset(16 * 512), &mut bytes)
+            .expect("recover complete tail group from parity");
+        assert_eq!(bytes.as_slice(), &fixture.original[16 * 512..]);
+        let mut expected = fixture.original.clone();
+        expected[..512].fill(0x27);
+        assert_eq!(
+            std::fs::read(&fixture.image).expect("fixed-size source"),
+            expected
+        );
+        assert_eq!(
+            std::fs::read(&fixture.sidecar).expect("still pending"),
+            pending
+        );
+        assert!(device.protection(&cx).is_err());
+        device.sync(&cx).expect("publish padded-tail protection");
+    }
+
+    #[test]
+    fn dirty_partial_write_repairs_preserved_bytes_in_another_group() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+        device
+            .write_all_at(&cx, ByteOffset(0), &[0x27; 512])
+            .expect("first dirty group");
+        fixture.damage(8 * 512, &[0xfe; 512]);
+        let pending = std::fs::read(&fixture.sidecar).expect("pending archive");
+        device
+            .write_all_at(&cx, ByteOffset(8 * 512 + 13), &[0x58; 20])
+            .expect("recover preserved bytes before editing the second group");
+        let mut expected = fixture.original.clone();
+        expected[..512].fill(0x27);
+        expected[8 * 512 + 13..8 * 512 + 33].fill(0x58);
+        assert_eq!(
+            std::fs::read(&fixture.image).expect("intended source"),
+            expected
+        );
+        assert_eq!(
+            std::fs::read(&fixture.sidecar).expect("still pending"),
+            pending
+        );
+        let mut bytes = [0; 512];
+        device
+            .read_exact_at(&cx, ByteOffset(8 * 512), &mut bytes)
+            .expect("read newly intended block");
+        assert_eq!(bytes.as_slice(), &expected[8 * 512..9 * 512]);
+        device.sync(&cx).expect("protect both changed groups");
+        drop(device);
+        assert!(
+            verify(&cx, &fixture.image, &fixture.sidecar)
+                .expect("updated parity")
+                .is_healthy()
+        );
+    }
+
+    #[test]
+    fn dirty_repair_rejects_a_changed_peer_before_touching_any_source() {
+        for damaged in [0, 512] {
+            let fixture = Fixture::new();
+            let device = fixture.open();
+            let cx = Cx::for_testing();
+            device
+                .write_all_at(&cx, ByteOffset(0), &[0x27; 512])
+                .expect("changed first block");
+            fixture.damage(damaged, &[0xfe; 512]);
+            let source = std::fs::read(&fixture.image).expect("damaged source");
+            let pending = std::fs::read(&fixture.sidecar).expect("pending archive");
+            // Exercise the common entry point directly: checking only a read's
+            // target would wrongly allow recovery when its peer was written.
+            {
+                let state = device.lock(&cx).expect("state");
+                assert!(device.repair_group(&cx, &state, 0).is_err());
+            }
+            let mut bytes = [0xa5; 512];
+            let error = device
+                .read_exact_at(&cx, ByteOffset(damaged), &mut bytes)
+                .expect_err("old parity cannot restore this group");
+            assert!(error.to_string().contains("old parity"));
+            assert_eq!(bytes, [0xa5; 512]);
+            assert_eq!(std::fs::read(&fixture.image).expect("no rollback"), source);
+            assert_eq!(
+                std::fs::read(&fixture.sidecar).expect("no publication"),
+                pending
+            );
+        }
+    }
+
+    #[test]
+    fn dirty_repair_accepts_a_group_rewritten_to_its_admitted_generation() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+        device
+            .write_all_at(&cx, ByteOffset(0), &[0x27; 512])
+            .expect("temporary new bytes");
+        device
+            .write_all_at(&cx, ByteOffset(0), &fixture.original[..512])
+            .expect("explicitly restore the original intended bytes");
+        let pending = std::fs::read(&fixture.sidecar).expect("still a dirty epoch");
+        fixture.damage(512, &[0xfe; 512]);
+        let mut bytes = [0; 512];
+        device
+            .read_exact_at(&cx, ByteOffset(512), &mut bytes)
+            .expect("all intended digests again agree with the saved parity");
+        assert_eq!(bytes.as_slice(), &fixture.original[512..1024]);
+        assert_eq!(
+            std::fs::read(&fixture.image).expect("restored source"),
+            fixture.original
+        );
+        assert_eq!(
+            std::fs::read(&fixture.sidecar).expect("no early commit"),
+            pending
+        );
+        assert!(device.protection(&cx).is_err());
+        device.sync(&cx).expect("finish the epoch explicitly");
+    }
+
+    #[test]
+    fn dirty_read_with_insufficient_parity_preserves_the_entire_output() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+        device
+            .write_all_at(&cx, ByteOffset(0), &[0x27; 512])
+            .expect("pending write in the other group");
+        fixture.damage(8 * 512, &[0xfe; 8 * 512]);
+        let source = std::fs::read(&fixture.image).expect("unrecoverable group");
+        let pending = std::fs::read(&fixture.sidecar).expect("pending archive");
+        // A valid prefix is read before the unrecoverable group. Neither that
+        // prefix nor a partially reconstructed suffix may reach the caller.
+        let mut bytes = [0xa5; 1024];
+        assert!(
+            device
+                .read_exact_at(&cx, ByteOffset(7 * 512), &mut bytes)
+                .is_err()
+        );
+        assert_eq!(bytes, [0xa5; 1024]);
+        assert_eq!(
+            std::fs::read(&fixture.image).expect("no partial repair"),
+            source
+        );
+        assert_eq!(
+            std::fs::read(&fixture.sidecar).expect("no publication"),
+            pending
+        );
+        assert!(device.protection(&cx).is_err());
+    }
+
+    #[test]
+    fn dirty_read_rejects_a_transplanted_table_even_with_cached_source_hashes() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+        device
+            .write_all_at(&cx, ByteOffset(0), &[0x27; 512])
+            .expect("pending write elsewhere");
+        let mut bytes = [0; 512];
+        device
+            .read_exact_at(&cx, ByteOffset(8 * 512), &mut bytes)
+            .expect("cache the admitted table");
+        fixture.damage(8 * 512, &[0xfe; 512]);
+        {
+            let state = device.lock(&cx).expect("state");
+            let header = &state.archive.header;
+            let (_, count) = header.group_geometry(1).expect("second group");
+            let offset = header.group_offset(1).expect("group offset");
+            let mut metadata = vec![0; GROUP_PREFIX_BYTES + count as usize * DIGEST_BYTES];
+            state
+                .archive
+                .file
+                .read_exact_at(&mut metadata, offset)
+                .expect("group metadata");
+            let forged = source_digest(header, 8, &[0xfe; 512]);
+            metadata[GROUP_PREFIX_BYTES..GROUP_PREFIX_BYTES + DIGEST_BYTES]
+                .copy_from_slice(&forged);
+            let digest = digest_parts(b"ffs-sidecar-group-v2", &[&header.seed, &metadata]);
+            state
+                .archive
+                .file
+                .write_all_at(&metadata, offset)
+                .expect("inject another internally consistent table");
+            state
+                .archive
+                .file
+                .write_all_at(&digest, offset + metadata.len() as u64)
+                .expect("matching local table checksum");
+        }
+        let source = std::fs::read(&fixture.image).expect("damaged source");
+        let archive = std::fs::read(&fixture.sidecar).expect("transplanted archive");
+        bytes.fill(0xa5);
+        let error = device
+            .read_exact_at(&cx, ByteOffset(8 * 512), &mut bytes)
+            .expect_err("a locally valid table is not an admitted generation");
+        assert!(error.to_string().contains("admitted generation"));
+        assert_eq!(bytes, [0xa5; 512]);
+        assert_eq!(
+            std::fs::read(&fixture.image).expect("unchanged source"),
+            source
+        );
+        assert_eq!(
+            std::fs::read(&fixture.sidecar).expect("no publication"),
+            archive
+        );
     }
 
     #[test]
