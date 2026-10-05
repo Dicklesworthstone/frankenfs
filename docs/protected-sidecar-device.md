@@ -61,7 +61,13 @@ number of recovered source blocks, not regenerated symbols. Corrupt source-diges
 metadata or unrecoverable source data is an error, not permission to create new
 protection from unknown bytes.
 
-Dirty-epoch reads still verify intended bytes but never use preceding parity.
+Dirty-epoch reads still verify intended bytes. Recovery remains available for a
+group only when every intended source digest in that group matches the admitted
+protection point. A changed digest anywhere in the group forbids using its old
+parity, including for an unchanged block; writes in other groups do not. Partial
+writes can likewise recover preserved bytes in an unaffected group before
+recording their new intended digests. Repair never clears the pending header or
+publishes outstanding writes: only a successful explicit `sync` does that.
 Insufficient redundancy, changed tables, unknown corruption during refresh,
 permission failures and cancellation are errors. Failed reads preserve the
 caller's destination. Partial write failures poison the handle rather than
