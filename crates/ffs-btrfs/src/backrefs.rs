@@ -1518,20 +1518,24 @@ mod tests {
                         parent: peer_key.offset,
                         count: 1,
                     }),
-                    2 => alloc
-                        .extent_tree
-                        .insert(
-                            BtrfsKey {
-                                item_type: BTRFS_ITEM_EXTENT_DATA_REF,
-                                ..peer_key
-                            },
-                            &data_ref.to_bytes(),
-                        )
-                        .expect("keyed file reference"),
-                    _ => alloc
-                        .extent_tree
-                        .insert(peer_key, &1_u32.to_le_bytes())
-                        .expect("keyed parent reference"),
+                    2 => {
+                        alloc
+                            .extent_tree
+                            .insert(
+                                BtrfsKey {
+                                    item_type: BTRFS_ITEM_EXTENT_DATA_REF,
+                                    ..peer_key
+                                },
+                                &data_ref.to_bytes(),
+                            )
+                            .expect("keyed file reference");
+                    }
+                    _ => {
+                        alloc
+                            .extent_tree
+                            .insert(peer_key, &1_u32.to_le_bytes())
+                            .expect("keyed parent reference");
+                    }
                 }
                 alloc
                     .extent_tree
