@@ -73,13 +73,13 @@ fn install_recovered(
     Ok(())
 }
 
-/// The on-image recovery API deliberately refuses a group with no intact
-/// source. A sidecar has an independent digest for EVERY original source block
-/// plus a whole-image digest, and restores only to a new file, so it can safely
-/// solve this case without weakening that existing on-image policy. Use the
-/// same native RaptorQ equations/constraints as codec::decode_group, then let
-/// install_recovered verify the entire result against the saved generation.
-fn decode_missing_group(
+/// Reconstruct an entirely erased sidecar group without relaxing the on-image
+/// codec's requirement for an intact source. Sidecars carry an independent
+/// digest for every source block. Callers MUST verify every decoded block against
+/// the saved generation before publishing an offline output or writing repairs
+/// to an admitted, clean live image. This function only solves the equations;
+/// it does not authorize a generation, validate source digests, or write data.
+pub(crate) fn decode_missing_group(
     cx: &Cx,
     header: &Header,
     group: u32,
