@@ -853,7 +853,9 @@ mod tests {
             .expect("explicit replacement needs none of the discarded bytes");
         expected[..8 * 512].fill(0x27);
         assert!(device.protection(&cx).is_err());
-        device.sync(&cx).expect("commit replacement and fresh parity");
+        device
+            .sync(&cx)
+            .expect("commit replacement and fresh parity");
         assert_eq!(std::fs::read(&fixture.image).expect("new source"), expected);
         drop(device);
         assert!(
@@ -865,7 +867,10 @@ mod tests {
         fixture.damage(512, &[0xfe; 512]);
         let output = fixture.image.with_extension("replacement-restored");
         restore(&cx, &fixture.image, &fixture.sidecar, &output).expect("recover new generation");
-        assert_eq!(std::fs::read(output).expect("restored replacement"), expected);
+        assert_eq!(
+            std::fs::read(output).expect("restored replacement"),
+            expected
+        );
     }
 
     #[test]
@@ -906,8 +911,13 @@ mod tests {
             .expect("replace every real byte of the partial final block");
         let mut expected = fixture.original.clone();
         expected[16 * 512..].fill(0x58);
-        device.sync(&cx).expect("regenerate padded source protection");
-        assert_eq!(std::fs::read(&fixture.image).expect("fixed-size image"), expected);
+        device
+            .sync(&cx)
+            .expect("regenerate padded source protection");
+        assert_eq!(
+            std::fs::read(&fixture.image).expect("fixed-size image"),
+            expected
+        );
         drop(device);
         assert!(
             verify(&cx, &fixture.image, &fixture.sidecar)
@@ -932,8 +942,14 @@ mod tests {
                 .write_all_at(&cx, ByteOffset(0), &[0x58; 8 * 512 + 1])
                 .is_err()
         );
-        assert_eq!(std::fs::read(&fixture.image).expect("no prefix written"), source);
-        assert_eq!(std::fs::read(&fixture.sidecar).expect("no new epoch"), archive);
+        assert_eq!(
+            std::fs::read(&fixture.image).expect("no prefix written"),
+            source
+        );
+        assert_eq!(
+            std::fs::read(&fixture.sidecar).expect("no new epoch"),
+            archive
+        );
     }
 
     #[test]

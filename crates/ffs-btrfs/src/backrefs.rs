@@ -779,7 +779,10 @@ mod tests {
             }
             assert!(alloc.extent_tree.height().expect("height") > 2);
         }
-        alloc.extent_tree.validate_invariants().expect("valid input");
+        alloc
+            .extent_tree
+            .validate_invariants()
+            .expect("valid input");
         alloc
     }
 
@@ -871,7 +874,10 @@ mod tests {
             alloc.is_pinned(2 << 20),
             matches!(operation, Operation::RemoveLastTree)
         );
-        alloc.extent_tree.validate_invariants().expect("valid output");
+        alloc
+            .extent_tree
+            .validate_invariants()
+            .expect("valid output");
     }
 
     #[test]
@@ -937,7 +943,10 @@ mod tests {
             let key = metadata_key(2 << 20, 1);
             let absent = metadata_key(1000 << 20, 1);
             for edits in [
-                [BackrefEdit::Insert(absent, &[1]), BackrefEdit::Remove(absent)],
+                [
+                    BackrefEdit::Insert(absent, &[1]),
+                    BackrefEdit::Remove(absent),
+                ],
                 [BackrefEdit::Replace(key, &[2]), BackrefEdit::Remove(key)],
                 [BackrefEdit::Remove(key), BackrefEdit::Insert(key, &[3])],
             ] {
