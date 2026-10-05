@@ -75,6 +75,10 @@ struct GroupRepair {
 /// verify but never decode against the old parity. Opening a mismatched image
 /// still requires explicit offline reconciliation rather than implicit rollback.
 ///
+/// Partial writes verify the bytes they preserve. Complete replacement of a
+/// block's real bytes does not need the discarded contents to be recoverable;
+/// the caller's replacement is tracked as a new write, never as a parity repair.
+///
 /// This initial implementation scans the image at each dirty sync, and re-encodes
 /// only changed groups or groups with damaged parity. It favors correctness over
 /// low fsync latency; it is not the default filesystem mount path. Working memory
@@ -671,11 +675,21 @@ impl ByteDevice for SidecarImageDevice {
         let size = u64::from(state.archive.header.options.block_size);
         let mut intended = Vec::new();
         for block in offset.0 / size..end.div_ceil(size) {
-            // A partial write must not preserve corrupt bytes outside its range.
-            let mut bytes = self.verified_block(cx, &mut state, block)?;
-            let start = offset.0.max(block * size);
-            let stop = end.min((block + 1) * size);
-            bytes[(start - block * size) as usize..(stop - block * size) as usize]
+            checkpoint(cx)?;
+            let block_start = block * size;
+            let real_len = state.archive.header.real_block_len(block);
+            let start = offset.0.max(block_start);
+            let stop = end.min(block_start + real_len as u64);
+            let mut bytes = if start == block_start && stop - start == real_len as u64 {
+                // Every real byte comes from the caller. Do not require old
+                // data that will be discarded to be readable or recoverable.
+                // A short final block still hashes with zero virtual padding.
+                vec![0; size as usize]
+            } else {
+                // A partial write must not preserve corrupt bytes outside its range.
+                self.verified_block(cx, &mut state, block)?
+            };
+            bytes[(start - block_start) as usize..(stop - block_start) as usize]
                 .copy_from_slice(&buf[(start - offset.0) as usize..(stop - offset.0) as usize]);
             intended.push((block, source_digest(&state.archive.header, block, &bytes)));
         }
@@ -824,6 +838,122 @@ mod tests {
         let output = fixture.image.with_extension("restored");
         restore(&cx, &fixture.image, &fixture.sidecar, &output).expect("recover latest ACK");
         assert_eq!(std::fs::read(output).expect("restored"), expected);
+    }
+
+    #[test]
+    fn complete_group_overwrite_does_not_require_recovering_discarded_bytes() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+        let mut expected = fixture.original.clone();
+        // Eight damaged sources exceed this group's four-symbol repair budget.
+        fixture.damage(0, &[0xfe; 8 * 512]);
+        device
+            .write_all_at(&cx, ByteOffset(0), &[0x27; 8 * 512])
+            .expect("explicit replacement needs none of the discarded bytes");
+        expected[..8 * 512].fill(0x27);
+        assert!(device.protection(&cx).is_err());
+        device.sync(&cx).expect("commit replacement and fresh parity");
+        assert_eq!(std::fs::read(&fixture.image).expect("new source"), expected);
+        drop(device);
+        assert!(
+            verify(&cx, &fixture.image, &fixture.sidecar)
+                .expect("new protection")
+                .is_healthy()
+        );
+        drop(fixture.open());
+        fixture.damage(512, &[0xfe; 512]);
+        let output = fixture.image.with_extension("replacement-restored");
+        restore(&cx, &fixture.image, &fixture.sidecar, &output).expect("recover new generation");
+        assert_eq!(std::fs::read(output).expect("restored replacement"), expected);
+    }
+
+    #[test]
+    fn complete_overwrite_replaces_a_damaged_dirty_epoch_block() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+        device
+            .write_all_at(&cx, ByteOffset(0), &[0x27; 512])
+            .expect("first write");
+        fixture.damage(0, &[0xfe; 512]);
+        device
+            .write_all_at(&cx, ByteOffset(0), &[0x58; 512])
+            .expect("replace without using stale parity");
+        let mut expected = fixture.original.clone();
+        expected[..512].fill(0x58);
+        device.sync(&cx).expect("commit latest intended bytes");
+        assert_eq!(std::fs::read(&fixture.image).expect("source"), expected);
+        drop(device);
+        assert!(
+            verify(&cx, &fixture.image, &fixture.sidecar)
+                .expect("latest protection")
+                .is_healthy()
+        );
+    }
+
+    #[test]
+    fn complete_short_tail_overwrite_needs_no_parity_and_keeps_zero_padding() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+        for symbol in 0..4 {
+            fixture.damage_parity(&device, 2, symbol);
+        }
+        fixture.damage(16 * 512, &[0xfe; 37]);
+        device
+            .write_all_at(&cx, ByteOffset(16 * 512), &[0x58; 37])
+            .expect("replace every real byte of the partial final block");
+        let mut expected = fixture.original.clone();
+        expected[16 * 512..].fill(0x58);
+        device.sync(&cx).expect("regenerate padded source protection");
+        assert_eq!(std::fs::read(&fixture.image).expect("fixed-size image"), expected);
+        drop(device);
+        assert!(
+            verify(&cx, &fixture.image, &fixture.sidecar)
+                .expect("padded digest and parity")
+                .is_healthy()
+        );
+        drop(fixture.open());
+    }
+
+    #[test]
+    fn mixed_write_does_not_publish_full_blocks_before_a_bad_partial_suffix() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+        // The full-block prefix is replaceable, but the one-byte suffix must
+        // preserve source bytes from an entirely unrecoverable second group.
+        fixture.damage(8 * 512, &[0xfe; 8 * 512]);
+        let source = std::fs::read(&fixture.image).expect("damaged source");
+        let archive = std::fs::read(&fixture.sidecar).expect("saved archive");
+        assert!(
+            device
+                .write_all_at(&cx, ByteOffset(0), &[0x58; 8 * 512 + 1])
+                .is_err()
+        );
+        assert_eq!(std::fs::read(&fixture.image).expect("no prefix written"), source);
+        assert_eq!(std::fs::read(&fixture.sidecar).expect("no new epoch"), archive);
+    }
+
+    #[test]
+    fn partial_overwrite_still_refuses_corrupt_dirty_epoch_bytes() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+        device
+            .write_all_at(&cx, ByteOffset(0), &[0x27; 512])
+            .expect("start dirty epoch");
+        fixture.damage(512, &[0xfe; 512]);
+        let source = std::fs::read(&fixture.image).expect("damaged source");
+        let archive = std::fs::read(&fixture.sidecar).expect("pending archive");
+        let error = device
+            .write_all_at(&cx, ByteOffset(515), &[0x58; 20])
+            .expect_err("partial write must not preserve unknown bytes");
+        assert!(error.to_string().contains("old parity"));
+        assert_eq!(std::fs::read(&fixture.image).expect("source"), source);
+        assert_eq!(std::fs::read(&fixture.sidecar).expect("archive"), archive);
+        assert!(device.protection(&cx).is_err());
     }
 
     #[test]
