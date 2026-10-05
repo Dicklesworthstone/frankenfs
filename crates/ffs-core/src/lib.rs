@@ -88400,6 +88400,79 @@ mod tests {
         (fs, cx)
     }
 
+    /// generic/286: btrfs SEEK_DATA/SEEK_HOLE stop at the first extent that
+    /// answers. At every block offset of a fragmented file (data, punched
+    /// holes, preallocation, an explicit hole extent) they must equal the
+    /// answer computed from the full extent list.
+    #[test]
+    fn btrfs_seek_data_hole_early_exit_matches_the_full_extent_list() {
+        let Some((fs, _dev, _tmp, _image)) = open_writable_btrfs_mkfs(256) else {
+            return; // btrfs-progs unavailable
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let ino = fs
+            .create(&cx, root, OsStr::new("sparse"), 0o644, 0, 0)
+            .expect("create")
+            .ino;
+        let block = 4096_u64;
+        fs.write(&cx, ino, 0, &vec![0x11; 64 * 4096])
+            .expect("write");
+        for (i, punch) in [3_u64, 4, 9, 17, 18, 19, 30, 41, 50, 63].iter().enumerate() {
+            let mode = if i % 3 == 2 {
+                libc::FALLOC_FL_ZERO_RANGE | libc::FALLOC_FL_KEEP_SIZE
+            } else {
+                libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE
+            };
+            fs.btrfs_fallocate(&cx, ino, punch * block, block, mode)
+                .expect("punch");
+        }
+        let canonical = fs.btrfs_canonical_inode(ino).expect("canonical");
+        let size = 64 * block;
+        let extents: Vec<(u64, BtrfsExtentData)> = fs
+            .btrfs_fiemap_extent_items(&cx, canonical, 0)
+            .expect("extents")
+            .into_iter()
+            .filter(|(_, e)| !OpenFs::btrfs_extent_is_hole(e))
+            .collect();
+        let data_ref = |offset: u64| -> Option<u64> {
+            extents.iter().find_map(|(start, e)| {
+                let end = start + OpenFs::btrfs_extent_logical_len(e).unwrap();
+                (end > offset).then(|| offset.max(*start))
+            })
+        };
+        let hole_ref = |offset: u64| -> u64 {
+            let mut covered = 0_u64;
+            for (start, e) in &extents {
+                let len = OpenFs::btrfs_extent_logical_len(e).unwrap();
+                if *start > covered && *start > offset {
+                    return covered.max(offset);
+                }
+                if offset < *start && offset >= covered {
+                    return offset;
+                }
+                covered = start + len;
+            }
+            if offset >= covered {
+                offset
+            } else {
+                covered.max(offset).min(size)
+            }
+        };
+        for offset in (0..size).step_by(2048) {
+            assert_eq!(
+                fs.btrfs_lseek_data(&cx, ino, offset).ok(),
+                data_ref(offset),
+                "SEEK_DATA at {offset}"
+            );
+            assert_eq!(
+                fs.btrfs_lseek_hole(&cx, ino, offset).expect("SEEK_HOLE"),
+                hole_ref(offset),
+                "SEEK_HOLE at {offset}"
+            );
+        }
+    }
+
     /// generic/610: fallocate keeps nbytes by the change in the window it
     /// touches, not by re-walking the file. Through a seeded mix of punch,
     /// zero-range and preallocation (aligned, overlapping, past EOF), the kept
