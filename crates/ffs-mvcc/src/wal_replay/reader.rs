@@ -3,6 +3,8 @@
 //! Payloads are read directly into their final allocations. The encoded record
 //! is never retained alongside its decoded copy, and CRC work is checkpointed
 //! in bounded chunks. No commit escapes before its complete CRC is verified.
+//! Checkpoint-covered records retain their sequence metadata only; all write
+//! framing and payload checksums are still validated using fixed scratch space.
 
 use crate::wal::{DecodeResult, MIN_COMMIT_RECORD_SIZE, RECORD_TYPE_COMMIT, WalCommit, WalWrite};
 use asupersync::Cx;
@@ -18,11 +20,24 @@ const WRITE_HEADER_BYTES: usize = 12;
 pub(super) struct RecordReader<'a, R> {
     reader: &'a mut R,
     remaining: u64,
+    checkpoint_seq: Option<u64>,
 }
 
 impl<'a, R: Read> RecordReader<'a, R> {
     pub(super) fn new(reader: &'a mut R, remaining: u64) -> Self {
-        Self { reader, remaining }
+        Self {
+            reader,
+            remaining,
+            checkpoint_seq: None,
+        }
+    }
+
+    /// Elide covered payloads, not validation. The caller must never apply a
+    /// commit at or below this sequence: its returned write vector is empty.
+    #[must_use]
+    pub(super) fn with_checkpoint(mut self, seq: u64) -> Self {
+        self.checkpoint_seq = Some(seq);
+        self
     }
 
     pub(super) fn next(&mut self, cx: &Cx) -> Result<(DecodeResult, Option<usize>)> {
@@ -78,7 +93,7 @@ impl<'a, R: Read> RecordReader<'a, R> {
             remaining: total - 8, // Neither the length prefix nor stored CRC.
             crc: 0,
         };
-        let decoded = body.decode(cx)?;
+        let decoded = body.decode(cx, self.checkpoint_seq)?;
         let decoded = body.finish(cx, decoded)?;
         self.remaining -= u64::from(body_len);
         checkpoint(cx)?;
@@ -127,7 +142,7 @@ impl<R: Read> RecordBody<'_, R> {
         Ok(())
     }
 
-    fn decode(&mut self, cx: &Cx) -> Result<DecodeResult> {
+    fn decode(&mut self, cx: &Cx, checkpoint_seq: Option<u64>) -> Result<DecodeResult> {
         let crc_offset = self.remaining;
         let mut header = [0_u8; COMMIT_HEADER_BYTES];
         self.read(cx, &mut header)?;
@@ -139,6 +154,7 @@ impl<R: Read> RecordBody<'_, R> {
         }
         let commit_seq = CommitSeq(u64::from_le_bytes(fixed_array(&header[1..9])?));
         let txn_id = TxnId(u64::from_le_bytes(fixed_array(&header[9..17])?));
+        let covered = checkpoint_seq.is_some_and(|seq| commit_seq.0 <= seq);
         let num_writes = usize::try_from(u32::from_le_bytes(fixed_array(&header[17..21])?))
             .map_err(|_| FfsError::Format("WAL write count exceeds address space".to_owned()))?;
         let max_writes = self.remaining / WRITE_HEADER_BYTES;
@@ -165,6 +181,10 @@ impl<R: Read> RecordBody<'_, R> {
                 return Ok(DecodeResult::Corrupted(format!(
                     "write {index} data extends past CRC: offset={offset}, len={len}, crc_offset={crc_offset}"
                 )));
+            }
+            if covered {
+                self.discard(cx, len)?;
+                continue;
             }
             // Payload and write-index allocations are fallible. Do not
             // allocate a second copy of these bytes for CRC verification.
@@ -194,12 +214,21 @@ impl<R: Read> RecordBody<'_, R> {
         }))
     }
 
-    fn finish(mut self, cx: &Cx, decoded: DecodeResult) -> Result<DecodeResult> {
-        let mut scratch = [0_u8; SCRATCH_BYTES];
-        while self.remaining > 0 {
-            let count = self.remaining.min(scratch.len());
-            self.read(cx, &mut scratch[..count])?;
+    fn discard(&mut self, cx: &Cx, mut len: usize) -> Result<()> {
+        if len > self.remaining {
+            return Err(FfsError::Format("WAL discard crosses its CRC".to_owned()));
         }
+        let mut scratch = [0_u8; SCRATCH_BYTES];
+        while len > 0 {
+            let count = len.min(scratch.len());
+            self.read(cx, &mut scratch[..count])?;
+            len -= count;
+        }
+        checkpoint(cx)
+    }
+
+    fn finish(mut self, cx: &Cx, decoded: DecodeResult) -> Result<DecodeResult> {
+        self.discard(cx, self.remaining)?;
         let mut stored = [0_u8; 4];
         read_exact(cx, self.reader, &mut stored)?;
         let stored_crc = u32::from_le_bytes(stored);
@@ -254,6 +283,7 @@ fn read_exact<R: Read>(cx: &Cx, reader: &mut R, mut buffer: &mut [u8]) -> Result
 mod tests {
     use super::*;
     use crate::wal;
+    use crate::wal_replay::{TailPolicy, WalReplayEngine};
     use std::io::Cursor;
 
     fn record(lengths: &[usize]) -> Vec<u8> {
@@ -297,6 +327,134 @@ mod tests {
         let end = bytes.len() - 4;
         let crc = crc32c::crc32c(&bytes[4..end]);
         bytes[end..].copy_from_slice(&crc.to_le_bytes());
+    }
+
+    struct BoundedRead<'a> {
+        input: Cursor<&'a [u8]>,
+        limit: usize,
+    }
+
+    impl Read for BoundedRead<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            assert!(buffer.len() <= self.limit, "covered payload was materialized");
+            self.input.read(buffer)
+        }
+    }
+
+    #[test]
+    fn covered_records_retain_neither_payloads_nor_write_entries() {
+        let mut lengths = vec![0; 4096];
+        lengths.extend([SCRATCH_BYTES * 20, 0, READ_CHUNK_BYTES * 2 + 1]);
+        let bytes = record(&lengths);
+        let DecodeResult::Commit(expected) = wal::decode_commit(&bytes) else {
+            panic!("expected commit");
+        };
+        for cutoff in [6, 7, u64::MAX] {
+            let mut input = BoundedRead {
+                input: Cursor::new(&bytes),
+                limit: if cutoff < 7 {
+                    READ_CHUNK_BYTES
+                } else {
+                    SCRATCH_BYTES
+                },
+            };
+            let (decoded, size) = RecordReader::new(&mut input, u64::try_from(bytes.len()).unwrap())
+                .with_checkpoint(cutoff)
+                .next(&Cx::for_testing())
+                .unwrap();
+            let DecodeResult::Commit(commit) = decoded else {
+                panic!("expected commit");
+            };
+            assert_eq!(commit.commit_seq, expected.commit_seq);
+            assert_eq!(commit.txn_id, expected.txn_id);
+            assert_eq!(size, Some(bytes.len()));
+            if cutoff < 7 {
+                assert_eq!(commit, expected);
+            } else {
+                assert!(commit.writes.is_empty());
+                assert_eq!(commit.writes.capacity(), 0);
+            }
+            assert_eq!(input.input.position(), u64::try_from(bytes.len()).unwrap());
+        }
+    }
+
+    #[test]
+    fn covered_payload_corruption_and_malformed_later_writes_are_rejected() {
+        let base = record(&[8, 8]);
+        let mut corrupt_payload = base.clone();
+        corrupt_payload[37] ^= 0xFF;
+        let mut long_second_write = base.clone();
+        long_second_write[53..57].copy_from_slice(&u32::MAX.to_le_bytes());
+        restamp(&mut long_second_write);
+        let mut missing_second_header = base.clone();
+        missing_second_header[33..37].copy_from_slice(&20_u32.to_le_bytes());
+        restamp(&mut missing_second_header);
+        let mut trailing = base;
+        trailing[21..25].copy_from_slice(&1_u32.to_le_bytes());
+        restamp(&mut trailing);
+        for bytes in [
+            corrupt_payload,
+            long_second_write,
+            missing_second_header,
+            trailing,
+        ] {
+            let mut input = Cursor::new(&bytes);
+            let decoded = RecordReader::new(&mut input, u64::try_from(bytes.len()).unwrap())
+                .with_checkpoint(7)
+                .next(&Cx::for_testing())
+                .unwrap()
+                .0;
+            assert!(matches!(decoded, DecodeResult::Corrupted(_)));
+            assert!(matches!(wal::decode_commit(&bytes), DecodeResult::Corrupted(_)));
+            assert_eq!(input.position(), u64::try_from(bytes.len()).unwrap());
+        }
+    }
+
+    #[test]
+    fn public_checkpoint_replay_preserves_reports_and_uncovered_payloads() {
+        let mut bytes = record(&[READ_CHUNK_BYTES * 2 + 1]);
+        let mut next = record(&[0, 13, 7]);
+        next[5..13].copy_from_slice(&8_u64.to_le_bytes());
+        restamp(&mut next);
+        bytes.extend(next);
+        for cutoff in [0, 7, 8, u64::MAX] {
+            for policy in [TailPolicy::FailFast, TailPolicy::TruncateToLastGood] {
+                let engine = WalReplayEngine::new(policy);
+                let mut expected_commits = Vec::new();
+                let expected = engine
+                    .replay(&bytes, cutoff, |commit| expected_commits.push(commit.clone()))
+                    .unwrap();
+                let mut input = BoundedRead {
+                    input: Cursor::new(&bytes),
+                    limit: if cutoff < 7 {
+                        READ_CHUNK_BYTES
+                    } else {
+                        SCRATCH_BYTES
+                    },
+                };
+                let mut actual_commits = Vec::new();
+                let actual = engine
+                    .replay_reader(
+                        &Cx::for_testing(),
+                        &mut input,
+                        u64::try_from(bytes.len()).unwrap(),
+                        cutoff,
+                        |commit| {
+                            actual_commits.push(commit.clone());
+                            Ok(())
+                        },
+                    )
+                    .unwrap();
+                assert_eq!(actual_commits, expected_commits);
+                assert_eq!(actual.outcome, expected.outcome);
+                assert_eq!(actual.commits_replayed, expected.commits_replayed);
+                assert_eq!(actual.versions_replayed, expected.versions_replayed);
+                assert_eq!(actual.records_discarded, expected.records_discarded);
+                assert_eq!(actual.last_valid_offset, expected.last_valid_offset);
+                assert_eq!(actual.total_data_bytes, expected.total_data_bytes);
+                assert_eq!(actual.last_commit_seq, expected.last_commit_seq);
+            }
+        }
     }
 
     #[test]
@@ -465,6 +623,36 @@ mod tests {
             }
             Ok(count)
         }
+    }
+
+    #[test]
+    fn covered_payloads_propagate_late_io_failure_and_cancellation() {
+        let bytes = record(&[READ_CHUNK_BYTES * 3]);
+        let total = u64::try_from(bytes.len()).unwrap();
+        for fail_at in [37, 10_000, total - 1] {
+            let mut input = FailingRead {
+                input: Cursor::new(&bytes),
+                fail_at,
+            };
+            let error = RecordReader::new(&mut input, total)
+                .with_checkpoint(7)
+                .next(&Cx::for_testing())
+                .unwrap_err();
+            assert!(matches!(error, FfsError::Io(_)));
+        }
+        let cx = Cx::for_testing();
+        let mut input = CancelAfterRead {
+            input: Cursor::new(&bytes),
+            cx: &cx,
+            cancel_at: 10_000,
+            calls: 0,
+        };
+        let error = RecordReader::new(&mut input, total)
+            .with_checkpoint(7)
+            .next(&cx)
+            .unwrap_err();
+        assert!(matches!(error, FfsError::Cancelled));
+        assert!(input.input.position() < total);
     }
 
     #[test]

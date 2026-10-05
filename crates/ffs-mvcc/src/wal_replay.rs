@@ -166,7 +166,9 @@ impl WalReplayEngine {
     ///
     /// `reader` must be positioned after the file header. `total_data_bytes`
     /// captures the length of that range; bytes appended after it are not read.
-    /// Memory is proportional to the largest record, not the size of the log.
+    /// Memory is proportional to the largest replayed commit, not the log.
+    /// Records at or below `skip_up_to_seq` are fully validated with fixed
+    /// scratch storage, without retaining their write entries or payloads.
     /// The caller must exclude concurrent changes to the captured bytes.
     ///
     /// Short reads and interruptions are handled with cancellation checkpoints
@@ -190,7 +192,8 @@ impl WalReplayEngine {
         R: Read,
         F: FnMut(&WalCommit) -> Result<()>,
     {
-        let mut source = reader::RecordReader::new(reader, total_data_bytes);
+        let mut source =
+            reader::RecordReader::new(reader, total_data_bytes).with_checkpoint(skip_up_to_seq);
         self.replay_records(
             total_data_bytes,
             skip_up_to_seq,
