@@ -1604,7 +1604,10 @@ mod tests {
             let key = metadata_key(bytenr, 1);
             let mut item = alloc.load_extent_item(key).expect("tree extent");
             item.flags = flags;
-            alloc.extent_tree.update(&key, &item.encode()).expect("flags");
+            alloc
+                .extent_tree
+                .update(&key, &item.encode())
+                .expect("flags");
             let before = tree_state(&alloc.extent_tree);
             assert!(matches!(
                 alloc.remove_tree_block_backref(bytenr, TreeBlockBackref::Root(5)),
