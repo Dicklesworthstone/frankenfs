@@ -13,11 +13,14 @@
 //! Removals find the ref wherever it lives (inline or keyed).
 //! Count and keyed-payload validation happens before the first tree edit, so
 //! rejected arithmetic or malformed keyed payloads cannot skew live refcounts.
+//! Multi-item edits share one COW publication boundary: allocation or tree
+//! errors discard the entire staged change, and only a committed last-reference
+//! removal may pin the released extent.
 
 use crate::{
     BTRFS_ITEM_EXTENT_DATA_REF, BTRFS_ITEM_EXTENT_ITEM, BTRFS_ITEM_METADATA_ITEM,
     BTRFS_ITEM_TREE_BLOCK_REF, BtrfsBTree, BtrfsExtentAllocator, BtrfsExtentDataRef, BtrfsKey,
-    BtrfsMutationError,
+    BtrfsMutationError, InMemoryCowBtrfsTree,
 };
 
 /// Parent-keyed tree block backref (`BTRFS_SHARED_BLOCK_REF_KEY`).
@@ -235,6 +238,54 @@ fn tree_ref_key(bytenr: u64, backref: TreeBlockBackref) -> BtrfsKey {
     }
 }
 
+#[derive(Debug)]
+enum BackrefEdit<'a> {
+    Insert(BtrfsKey, &'a [u8]),
+    Replace(BtrfsKey, &'a [u8]),
+    Remove(BtrfsKey),
+}
+
+/// Publish an extent item and its keyed references together. Thread a PRIVATE
+/// root through the existing COW primitives, not the independently committing
+/// public insert/update/delete methods. Only this batch's nodes may be changed
+/// in place; rollback removes them without changing the committed root or its
+/// retirement generation. This is in-memory error atomicity, not a disk commit.
+fn edit_backref_items(
+    tree: &mut InMemoryCowBtrfsTree,
+    edits: &[BackrefEdit<'_>],
+) -> Result<(), BtrfsMutationError> {
+    if edits.is_empty() {
+        return Ok(());
+    }
+    if !tree.staged_allocations.is_empty() || !tree.staged_deferred_frees.is_empty() {
+        return Err(BtrfsMutationError::BrokenInvariant(
+            "backref edit cannot nest inside a staged tree mutation",
+        ));
+    }
+    let mut root = tree.root;
+    for edit in edits {
+        let result = match edit {
+            BackrefEdit::Insert(key, value) => {
+                tree.apply_staged_inserts(&mut root, &[(*key, value)])
+            }
+            BackrefEdit::Replace(key, value) => tree
+                .replace_existing_in_root(root, key, value)
+                .map(|updated| root = updated),
+            BackrefEdit::Remove(key) => {
+                tree.apply_staged_removals(&mut root, std::slice::from_ref(key))
+            }
+        };
+        if let Err(error) = result {
+            tree.rollback_mutation();
+            return Err(error);
+        }
+    }
+    tree.root = root;
+    tree.commit_allocated_nodes();
+    tree.commit_retired_nodes();
+    Ok(())
+}
+
 impl BtrfsExtentAllocator {
     /// Key of the extent item describing the tree block at `bytenr`: a skinny
     /// `METADATA_ITEM` (offset = level) or a classic `EXTENT_ITEM`.
@@ -320,9 +371,13 @@ impl BtrfsExtentAllocator {
             .refs
             .checked_add(1)
             .ok_or(BtrfsMutationError::AddressOverflow)?;
-        self.extent_tree.update(&key, &item.encode())?;
-        self.extent_tree.insert(ref_key, &[])?;
-        Ok(())
+        edit_backref_items(
+            &mut self.extent_tree,
+            &[
+                BackrefEdit::Insert(ref_key, &[]),
+                BackrefEdit::Replace(key, &item.encode()),
+            ],
+        )
     }
 
     /// Drop one reference to the tree block at `bytenr`. Returns the remaining
@@ -353,8 +408,9 @@ impl BtrfsExtentAllocator {
             (InlineRef::TreeParent(p), TreeBlockBackref::Parent(want)) => *p == want,
             _ => false,
         });
-        if let Some(position) = position {
+        let keyed_ref = if let Some(position) = position {
             item.inline.remove(position);
+            None
         } else {
             let ref_key = tree_ref_key(bytenr, backref);
             if self.extent_tree.get(&ref_key).is_none() {
@@ -362,14 +418,25 @@ impl BtrfsExtentAllocator {
                     "tree block backref to remove is not present",
                 ));
             }
-            self.extent_tree.delete(&ref_key)?;
+            Some(ref_key)
+        };
+        let encoded = item.encode();
+        let extent_edit = if item.refs == 0 {
+            BackrefEdit::Remove(key)
+        } else {
+            BackrefEdit::Replace(key, &encoded)
+        };
+        if let Some(ref_key) = keyed_ref {
+            edit_backref_items(
+                &mut self.extent_tree,
+                &[BackrefEdit::Remove(ref_key), extent_edit],
+            )?;
+        } else {
+            edit_backref_items(&mut self.extent_tree, &[extent_edit])?;
         }
         if item.refs == 0 {
-            self.extent_tree.delete(&key)?;
             self.pin_extent(bytenr, self.nodesize, false);
             self.invalidate_tail_cursors();
-        } else {
-            self.extent_tree.update(&key, &item.encode())?;
         }
         Ok(item.refs)
     }
@@ -395,8 +462,8 @@ impl BtrfsExtentAllocator {
     /// # Errors
     /// `KeyNotFound` without an extent item, `BrokenInvariant` for a zero
     /// count or malformed keyed reference, `AddressOverflow` if either count
-    /// overflows, or an extent-tree error. Count/encoding errors do not edit
-    /// the extent tree.
+    /// overflows, or an extent-tree error. Errors leave both the extent item
+    /// and the keyed reference unchanged.
     pub fn add_shared_data_backref(
         &mut self,
         bytenr: u64,
@@ -444,15 +511,17 @@ impl BtrfsExtentAllocator {
                 .ok_or(BtrfsMutationError::AddressOverflow)?,
             None => count,
         };
-        let has_ref = existing.is_some();
         // Both the u64 extent total and the u32 keyed count are now valid.
-        self.extent_tree.update(&key, &item.encode())?;
-        if has_ref {
-            self.extent_tree.update(&ref_key, &merged.to_le_bytes())?;
+        let encoded_count = merged.to_le_bytes();
+        let ref_edit = if existing.is_some() {
+            BackrefEdit::Replace(ref_key, &encoded_count)
         } else {
-            self.extent_tree.insert(ref_key, &merged.to_le_bytes())?;
-        }
-        Ok(())
+            BackrefEdit::Insert(ref_key, &encoded_count)
+        };
+        edit_backref_items(
+            &mut self.extent_tree,
+            &[ref_edit, BackrefEdit::Replace(key, &item.encode())],
+        )
     }
 
     /// Remove `count` parent-keyed references (parent = `parent`) from the
@@ -462,7 +531,8 @@ impl BtrfsExtentAllocator {
     /// # Errors
     /// `KeyNotFound` without an extent item, `BrokenInvariant` for a zero
     /// count, malformed keyed reference, or either count underflow, or an
-    /// extent-tree error. Count/encoding errors do not edit the extent tree.
+    /// extent-tree error. Errors leave both the extent item and the keyed
+    /// reference unchanged.
     pub fn remove_shared_data_backref(
         &mut self,
         bytenr: u64,
@@ -511,24 +581,29 @@ impl BtrfsExtentAllocator {
                 item_type: BTRFS_ITEM_SHARED_DATA_REF,
                 offset: parent,
             };
-            let value = self
-                .extent_tree
-                .get(&ref_key)
-                .ok_or(BtrfsMutationError::BrokenInvariant(
-                    "shared data backref to remove is not present",
-                ))?;
+            let value =
+                self.extent_tree
+                    .get(&ref_key)
+                    .ok_or(BtrfsMutationError::BrokenInvariant(
+                        "shared data backref to remove is not present",
+                    ))?;
             let have = shared_data_ref_count(&value)?;
             if have < count {
                 return Err(BtrfsMutationError::BrokenInvariant(
                     "shared data backref count underflow",
                 ));
             }
-            if have == count {
-                self.extent_tree.delete(&ref_key)?;
+            let encoded_count = (have - count).to_le_bytes();
+            let ref_edit = if have == count {
+                BackrefEdit::Remove(ref_key)
             } else {
-                self.extent_tree
-                    .update(&ref_key, &(have - count).to_le_bytes())?;
-            }
+                BackrefEdit::Replace(ref_key, &encoded_count)
+            };
+            edit_backref_items(
+                &mut self.extent_tree,
+                &[ref_edit, BackrefEdit::Replace(key, &item.encode())],
+            )?;
+            return Ok(item.refs);
         }
         self.extent_tree.update(&key, &item.encode())?;
         Ok(item.refs)
@@ -551,6 +626,8 @@ pub(crate) fn inline_ref_len(kind: u8) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     const NODE: u64 = 16384;
 
@@ -622,6 +699,285 @@ mod tests {
                 bytes.to_vec()
             })
         })
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    struct TreeState {
+        root: u64,
+        nodes: crate::FxHashMap<u64, crate::BtrfsCowNode>,
+        deferred: Vec<u64>,
+        previous: Vec<u64>,
+    }
+
+    fn tree_state(tree: &InMemoryCowBtrfsTree) -> TreeState {
+        TreeState {
+            root: tree.root,
+            nodes: tree.nodes.clone(),
+            deferred: tree.deferred_frees.clone(),
+            previous: tree.prev_committed_retired.clone(),
+        }
+    }
+
+    #[derive(Debug)]
+    struct BudgetAllocator {
+        next: u64,
+        remaining: Arc<AtomicUsize>,
+        returned: Arc<AtomicUsize>,
+    }
+
+    impl crate::BtrfsAllocator for BudgetAllocator {
+        fn alloc_block(&mut self) -> Result<u64, BtrfsMutationError> {
+            if self.remaining.load(Ordering::Relaxed) == 0 {
+                return Err(BtrfsMutationError::NoSpace);
+            }
+            self.remaining.fetch_sub(1, Ordering::Relaxed);
+            let block = self.next;
+            self.next += 1;
+            Ok(block)
+        }
+
+        fn defer_free(&mut self, _block: u64) {
+            self.returned.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[derive(Debug, Clone, Copy)]
+    enum Operation {
+        AddTree,
+        RemoveTree,
+        RemoveLastTree,
+        RemoveInlineTree,
+        AddShared,
+        IncrementShared,
+        DecrementShared,
+        RemoveShared,
+    }
+
+    fn fault_fixture(wide: bool, operation: Operation) -> BtrfsExtentAllocator {
+        let mut alloc = allocator();
+        if wide {
+            alloc.extent_tree = InMemoryCowBtrfsTree::new(3).expect("small nodes");
+        }
+        insert_tree_block(&mut alloc, 2 << 20, vec![InlineRef::TreeRoot(5)]);
+        alloc
+            .add_tree_block_backref(2 << 20, TreeBlockBackref::Parent(9 << 20))
+            .expect("initial parent");
+        if matches!(operation, Operation::RemoveLastTree) {
+            alloc
+                .remove_tree_block_backref(2 << 20, TreeBlockBackref::Root(5))
+                .expect("leave only the keyed parent");
+        }
+        insert_keyed_data_ref(&mut alloc, 2, &2_u32.to_le_bytes());
+        if wide {
+            for index in 0..64 {
+                let key = BtrfsKey {
+                    objectid: (index << 20) + 123,
+                    item_type: 1,
+                    offset: 0,
+                };
+                alloc.extent_tree.insert(key, &[0x5a; 32]).expect("filler");
+            }
+            assert!(alloc.extent_tree.height().expect("height") > 2);
+        }
+        alloc.extent_tree.validate_invariants().expect("valid input");
+        alloc
+    }
+
+    fn perform(
+        alloc: &mut BtrfsExtentAllocator,
+        operation: Operation,
+    ) -> Result<(), BtrfsMutationError> {
+        match operation {
+            Operation::AddTree => {
+                alloc.add_tree_block_backref(2 << 20, TreeBlockBackref::Root(256))
+            }
+            Operation::RemoveTree | Operation::RemoveLastTree => alloc
+                .remove_tree_block_backref(2 << 20, TreeBlockBackref::Parent(9 << 20))
+                .map(|_| ()),
+            Operation::RemoveInlineTree => alloc
+                .remove_tree_block_backref(2 << 20, TreeBlockBackref::Root(5))
+                .map(|_| ()),
+            Operation::AddShared => {
+                alloc.add_shared_data_backref(40 << 20, 4096, (200 << 20) + NODE, 1)
+            }
+            Operation::IncrementShared => {
+                alloc.add_shared_data_backref(40 << 20, 4096, 200 << 20, 1)
+            }
+            Operation::DecrementShared => alloc
+                .remove_shared_data_backref(40 << 20, 4096, 200 << 20, 1)
+                .map(|_| ()),
+            Operation::RemoveShared => alloc
+                .remove_shared_data_backref(40 << 20, 4096, 200 << 20, 2)
+                .map(|_| ()),
+        }
+    }
+
+    fn assert_operation_committed(alloc: &BtrfsExtentAllocator, operation: Operation) {
+        let tree_refs = alloc.tree_block_ref_state(2 << 20).expect("tree state");
+        let data_key = BtrfsKey {
+            objectid: 40 << 20,
+            item_type: BTRFS_ITEM_EXTENT_ITEM,
+            offset: 4096,
+        };
+        let data_refs = alloc.load_extent_item(data_key).expect("data extent").refs;
+        let (expected_tree, expected_data) = match operation {
+            Operation::AddTree => (Some(3), 2),
+            Operation::RemoveTree | Operation::RemoveInlineTree => (Some(1), 2),
+            Operation::RemoveLastTree => (None, 2),
+            Operation::AddShared | Operation::IncrementShared => (Some(2), 3),
+            Operation::DecrementShared => (Some(2), 1),
+            Operation::RemoveShared => (Some(2), 0),
+        };
+        assert_eq!(tree_refs.map(|state| state.refs), expected_tree);
+        assert_eq!(data_refs, expected_data);
+        let parent_key = tree_ref_key(2 << 20, TreeBlockBackref::Parent(9 << 20));
+        let new_root_key = tree_ref_key(2 << 20, TreeBlockBackref::Root(256));
+        assert_eq!(
+            alloc.extent_tree.get(&parent_key),
+            if matches!(operation, Operation::RemoveTree | Operation::RemoveLastTree) {
+                None
+            } else {
+                Some(Vec::new())
+            }
+        );
+        assert_eq!(
+            alloc.extent_tree.get(&new_root_key),
+            matches!(operation, Operation::AddTree).then(Vec::new)
+        );
+        let shared_key = BtrfsKey {
+            item_type: BTRFS_ITEM_SHARED_DATA_REF,
+            offset: 200 << 20,
+            ..data_key
+        };
+        let expected_count: Option<u32> = match operation {
+            Operation::IncrementShared => Some(3),
+            Operation::DecrementShared => Some(1),
+            Operation::RemoveShared => None,
+            _ => Some(2),
+        };
+        assert_eq!(
+            alloc.extent_tree.get(&shared_key),
+            expected_count.map(|count| count.to_le_bytes().to_vec())
+        );
+        let new_shared_key = BtrfsKey {
+            offset: shared_key.offset + NODE,
+            ..shared_key
+        };
+        assert_eq!(
+            alloc.extent_tree.get(&new_shared_key),
+            matches!(operation, Operation::AddShared).then(|| 1_u32.to_le_bytes().to_vec())
+        );
+        assert_eq!(
+            alloc.is_pinned(2 << 20),
+            matches!(operation, Operation::RemoveLastTree)
+        );
+        alloc.extent_tree.validate_invariants().expect("valid output");
+    }
+
+    #[test]
+    fn allocation_failures_preserve_backrefs_and_support_retry() {
+        let mut late_failures = 0;
+        for wide in [false, true] {
+            for operation in [
+                Operation::AddTree,
+                Operation::RemoveTree,
+                Operation::RemoveLastTree,
+                Operation::RemoveInlineTree,
+                Operation::AddShared,
+                Operation::IncrementShared,
+                Operation::DecrementShared,
+                Operation::RemoveShared,
+            ] {
+                let mut reached_success = false;
+                for budget in 0..64 {
+                    let mut alloc = fault_fixture(wide, operation);
+                    let before = tree_state(&alloc.extent_tree);
+                    let remaining = Arc::new(AtomicUsize::new(budget));
+                    let returned = Arc::new(AtomicUsize::new(0));
+                    let next = alloc.extent_tree.nodes.keys().copied().max().unwrap() + 1;
+                    alloc.extent_tree.allocator = Box::new(BudgetAllocator {
+                        next,
+                        remaining: Arc::clone(&remaining),
+                        returned: Arc::clone(&returned),
+                    });
+                    match perform(&mut alloc, operation) {
+                        Ok(()) => reached_success = true,
+                        Err(BtrfsMutationError::NoSpace) => {
+                            assert_eq!(tree_state(&alloc.extent_tree), before);
+                            assert!(alloc.extent_tree.staged_allocations.is_empty());
+                            assert!(alloc.extent_tree.staged_deferred_frees.is_empty());
+                            assert_eq!(returned.load(Ordering::Relaxed), budget);
+                            assert!(!alloc.is_pinned(2 << 20));
+                            late_failures += usize::from(budget > 0);
+                            remaining.store(usize::MAX, Ordering::Relaxed);
+                            perform(&mut alloc, operation).expect("retry after rollback");
+                        }
+                        Err(error) => panic!("unexpected {operation:?} failure: {error}"),
+                    }
+                    assert_operation_committed(&alloc, operation);
+                    let previous_root = alloc
+                        .extent_tree
+                        .node_snapshot(before.root)
+                        .expect("old root");
+                    assert_eq!(previous_root, before.nodes[&before.root]);
+                    if reached_success {
+                        break;
+                    }
+                }
+                assert!(reached_success, "allocation sweep exhausted: {operation:?}");
+            }
+        }
+        assert!(late_failures > 0, "must fail after staging real COW nodes");
+    }
+
+    #[test]
+    fn late_key_errors_discard_all_staged_backref_edits() {
+        for wide in [false, true] {
+            let mut alloc = fault_fixture(wide, Operation::AddTree);
+            let key = metadata_key(2 << 20, 1);
+            let absent = metadata_key(1000 << 20, 1);
+            for edits in [
+                [BackrefEdit::Insert(absent, &[1]), BackrefEdit::Remove(absent)],
+                [BackrefEdit::Replace(key, &[2]), BackrefEdit::Remove(key)],
+                [BackrefEdit::Remove(key), BackrefEdit::Insert(key, &[3])],
+            ] {
+                let before = tree_state(&alloc.extent_tree);
+                // Both preceding edits are valid against the PRIVATE root.
+                // Only this final update is invalid, after actual COW work.
+                let missing = metadata_key(1001 << 20, 1);
+                let [first, second] = edits;
+                let error = edit_backref_items(
+                    &mut alloc.extent_tree,
+                    &[first, second, BackrefEdit::Replace(missing, &[4])],
+                )
+                .expect_err("missing final update");
+                assert_eq!(error, BtrfsMutationError::KeyNotFound);
+                assert_eq!(tree_state(&alloc.extent_tree), before);
+                assert!(alloc.extent_tree.staged_allocations.is_empty());
+                assert!(alloc.extent_tree.staged_deferred_frees.is_empty());
+                alloc
+                    .extent_tree
+                    .validate_invariants()
+                    .expect("unchanged tree");
+            }
+        }
+    }
+
+    #[test]
+    fn backref_batch_does_not_consume_another_staged_transaction() {
+        let mut alloc = fault_fixture(false, Operation::AddTree);
+        let tree = &mut alloc.extent_tree;
+        let staged = tree
+            .alloc_node(crate::BtrfsCowNode::Leaf { items: Vec::new() })
+            .expect("existing staged node");
+        let before = tree_state(tree);
+        assert!(matches!(
+            edit_backref_items(tree, &[BackrefEdit::Remove(metadata_key(2 << 20, 1))]),
+            Err(BtrfsMutationError::BrokenInvariant(_))
+        ));
+        assert_eq!(tree_state(tree), before);
+        assert_eq!(tree.staged_allocations, vec![staged]);
+        tree.rollback_mutation();
     }
 
     #[test]
