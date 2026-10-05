@@ -11,6 +11,8 @@
 //! New references are always added as keyed items, which btrfs accepts for
 //! every ref type and which avoids re-sorting an item's inline list.
 //! Removals find the ref wherever it lives (inline or keyed).
+//! Count and keyed-payload validation happens before the first tree edit, so
+//! rejected arithmetic or malformed keyed payloads cannot skew live refcounts.
 
 use crate::{
     BTRFS_ITEM_EXTENT_DATA_REF, BTRFS_ITEM_EXTENT_ITEM, BTRFS_ITEM_METADATA_ITEM,
@@ -110,6 +112,19 @@ fn read_u64(bytes: &[u8], at: usize) -> Result<u64, BtrfsMutationError> {
         .get(at..at + 8)
         .map(|b| u64::from_le_bytes(b.try_into().expect("8 bytes")))
         .ok_or(BtrfsMutationError::BrokenInvariant("truncated extent item"))
+}
+
+fn shared_data_ref_count(value: &[u8]) -> Result<u32, BtrfsMutationError> {
+    let bytes = value
+        .try_into()
+        .map_err(|_| BtrfsMutationError::BrokenInvariant("invalid keyed SHARED_DATA_REF size"))?;
+    let count = u32::from_le_bytes(bytes);
+    if count == 0 {
+        return Err(BtrfsMutationError::BrokenInvariant(
+            "zero keyed SHARED_DATA_REF count",
+        ));
+    }
+    Ok(count)
 }
 
 impl ExtentItem {
@@ -326,6 +341,13 @@ impl BtrfsExtentAllocator {
             .tree_block_item_key(bytenr)?
             .ok_or(BtrfsMutationError::KeyNotFound)?;
         let mut item = self.load_extent_item(key)?;
+        // Validate the extent-wide count before deleting a keyed reference.
+        item.refs = item
+            .refs
+            .checked_sub(1)
+            .ok_or(BtrfsMutationError::BrokenInvariant(
+                "tree block refcount underflow",
+            ))?;
         let position = item.inline.iter().position(|entry| match (entry, backref) {
             (InlineRef::TreeRoot(r), TreeBlockBackref::Root(want)) => *r == want,
             (InlineRef::TreeParent(p), TreeBlockBackref::Parent(want)) => *p == want,
@@ -342,12 +364,6 @@ impl BtrfsExtentAllocator {
             }
             self.extent_tree.delete(&ref_key)?;
         }
-        item.refs = item
-            .refs
-            .checked_sub(1)
-            .ok_or(BtrfsMutationError::BrokenInvariant(
-                "tree block refcount underflow",
-            ))?;
         if item.refs == 0 {
             self.extent_tree.delete(&key)?;
             self.pin_extent(bytenr, self.nodesize, false);
@@ -377,7 +393,10 @@ impl BtrfsExtentAllocator {
     /// `parent`) to the data extent `bytenr`/`num_bytes`.
     ///
     /// # Errors
-    /// `KeyNotFound` without an extent item, or an extent-tree error.
+    /// `KeyNotFound` without an extent item, `BrokenInvariant` for a zero
+    /// count or malformed keyed reference, `AddressOverflow` if either count
+    /// overflows, or an extent-tree error. Count/encoding errors do not edit
+    /// the extent tree.
     pub fn add_shared_data_backref(
         &mut self,
         bytenr: u64,
@@ -385,6 +404,11 @@ impl BtrfsExtentAllocator {
         parent: u64,
         count: u32,
     ) -> Result<(), BtrfsMutationError> {
+        if count == 0 {
+            return Err(BtrfsMutationError::BrokenInvariant(
+                "shared data backref increment must be nonzero",
+            ));
+        }
         let key = BtrfsKey {
             objectid: bytenr,
             item_type: BTRFS_ITEM_EXTENT_ITEM,
@@ -408,21 +432,22 @@ impl BtrfsExtentAllocator {
             self.extent_tree.update(&key, &item.encode())?;
             return Ok(());
         }
-        self.extent_tree.update(&key, &item.encode())?;
         let ref_key = BtrfsKey {
             objectid: bytenr,
             item_type: BTRFS_ITEM_SHARED_DATA_REF,
             offset: parent,
         };
-        let merged = match self.extent_tree.get(&ref_key) {
-            Some(existing) if existing.len() >= 4 => {
-                u32::from_le_bytes(existing[0..4].try_into().expect("4 bytes"))
-                    .checked_add(count)
-                    .ok_or(BtrfsMutationError::AddressOverflow)?
-            }
-            _ => count,
+        let existing = self.extent_tree.get(&ref_key);
+        let merged = match &existing {
+            Some(value) => shared_data_ref_count(value)?
+                .checked_add(count)
+                .ok_or(BtrfsMutationError::AddressOverflow)?,
+            None => count,
         };
-        if self.extent_tree.get(&ref_key).is_some() {
+        let has_ref = existing.is_some();
+        // Both the u64 extent total and the u32 keyed count are now valid.
+        self.extent_tree.update(&key, &item.encode())?;
+        if has_ref {
             self.extent_tree.update(&ref_key, &merged.to_le_bytes())?;
         } else {
             self.extent_tree.insert(ref_key, &merged.to_le_bytes())?;
@@ -435,8 +460,9 @@ impl BtrfsExtentAllocator {
     /// at zero (this does not touch its space or checksums).
     ///
     /// # Errors
-    /// `KeyNotFound` without an extent item, `BrokenInvariant` if fewer than
-    /// `count` such references exist, or an extent-tree error.
+    /// `KeyNotFound` without an extent item, `BrokenInvariant` for a zero
+    /// count, malformed keyed reference, or either count underflow, or an
+    /// extent-tree error. Count/encoding errors do not edit the extent tree.
     pub fn remove_shared_data_backref(
         &mut self,
         bytenr: u64,
@@ -444,12 +470,25 @@ impl BtrfsExtentAllocator {
         parent: u64,
         count: u32,
     ) -> Result<u64, BtrfsMutationError> {
+        if count == 0 {
+            return Err(BtrfsMutationError::BrokenInvariant(
+                "shared data backref decrement must be nonzero",
+            ));
+        }
         let key = BtrfsKey {
             objectid: bytenr,
             item_type: BTRFS_ITEM_EXTENT_ITEM,
             offset: num_bytes,
         };
         let mut item = self.load_extent_item(key)?;
+        // A keyed ref may be decremented or deleted below. Reject a corrupt
+        // extent total before publishing either change to the live tree.
+        item.refs =
+            item.refs
+                .checked_sub(u64::from(count))
+                .ok_or(BtrfsMutationError::BrokenInvariant(
+                    "data extent refcount underflow",
+                ))?;
         let position = item.inline.iter().position(
             |entry| matches!(entry, InlineRef::SharedData { parent: p, .. } if *p == parent),
         );
@@ -472,14 +511,13 @@ impl BtrfsExtentAllocator {
                 item_type: BTRFS_ITEM_SHARED_DATA_REF,
                 offset: parent,
             };
-            let have = self
+            let value = self
                 .extent_tree
                 .get(&ref_key)
-                .filter(|v| v.len() >= 4)
-                .map(|v| u32::from_le_bytes(v[0..4].try_into().expect("4 bytes")))
                 .ok_or(BtrfsMutationError::BrokenInvariant(
                     "shared data backref to remove is not present",
                 ))?;
+            let have = shared_data_ref_count(&value)?;
             if have < count {
                 return Err(BtrfsMutationError::BrokenInvariant(
                     "shared data backref count underflow",
@@ -492,12 +530,6 @@ impl BtrfsExtentAllocator {
                     .update(&ref_key, &(have - count).to_le_bytes())?;
             }
         }
-        item.refs =
-            item.refs
-                .checked_sub(u64::from(count))
-                .ok_or(BtrfsMutationError::BrokenInvariant(
-                    "data extent refcount underflow",
-                ))?;
         self.extent_tree.update(&key, &item.encode())?;
         Ok(item.refs)
     }
@@ -548,6 +580,180 @@ mod tests {
             .extent_tree
             .insert(metadata_key(bytenr, 1), &item.encode())
             .expect("insert metadata item");
+    }
+
+    fn insert_keyed_data_ref(
+        alloc: &mut BtrfsExtentAllocator,
+        refs: u64,
+        payload: &[u8],
+    ) -> [BtrfsKey; 2] {
+        let key = BtrfsKey {
+            objectid: 40 << 20,
+            item_type: BTRFS_ITEM_EXTENT_ITEM,
+            offset: 4096,
+        };
+        let ref_key = BtrfsKey {
+            objectid: key.objectid,
+            item_type: BTRFS_ITEM_SHARED_DATA_REF,
+            offset: 200 << 20,
+        };
+        let item = ExtentItem {
+            refs,
+            generation: 5,
+            flags: 1,
+            tree_block_info: None,
+            inline: Vec::new(),
+        };
+        alloc
+            .extent_tree
+            .insert(key, &item.encode())
+            .expect("insert data extent");
+        alloc
+            .extent_tree
+            .insert(ref_key, payload)
+            .expect("insert keyed data ref");
+        [key, ref_key]
+    }
+
+    fn backref_state(alloc: &BtrfsExtentAllocator, keys: [BtrfsKey; 2]) -> [Option<Vec<u8>>; 2] {
+        keys.map(|key| {
+            alloc.extent_tree.get(&key).map(|value| {
+                let bytes: &[u8] = &value;
+                bytes.to_vec()
+            })
+        })
+    }
+
+    #[test]
+    fn keyed_tree_ref_underflow_preserves_both_items_and_does_not_pin() {
+        for backref in [TreeBlockBackref::Root(5), TreeBlockBackref::Parent(9 << 20)] {
+            let mut alloc = allocator();
+            let bytenr = 2 << 20;
+            // A corrupt zero total must not cause deletion of a live keyed ref.
+            insert_tree_block(&mut alloc, bytenr, Vec::new());
+            let ref_key = tree_ref_key(bytenr, backref);
+            alloc.extent_tree.insert(ref_key, &[]).expect("keyed ref");
+            let keys = [metadata_key(bytenr, 1), ref_key];
+            let before = backref_state(&alloc, keys);
+            assert!(matches!(
+                alloc.remove_tree_block_backref(bytenr, backref),
+                Err(BtrfsMutationError::BrokenInvariant(_))
+            ));
+            assert_eq!(backref_state(&alloc, keys), before);
+            assert!(!alloc.is_pinned(bytenr));
+        }
+    }
+
+    #[test]
+    fn keyed_shared_ref_overflow_preserves_extent_total() {
+        let mut alloc = allocator();
+        let keys = insert_keyed_data_ref(&mut alloc, u64::from(u32::MAX), &u32::MAX.to_le_bytes());
+        let before = backref_state(&alloc, keys);
+        assert!(matches!(
+            alloc.add_shared_data_backref(keys[0].objectid, 4096, keys[1].offset, 1),
+            Err(BtrfsMutationError::AddressOverflow)
+        ));
+        assert_eq!(backref_state(&alloc, keys), before);
+    }
+
+    #[test]
+    fn shared_ref_total_underflow_precedes_keyed_update_or_deletion() {
+        // Exercise both a partial keyed decrement and removal of the last
+        // keyed count when the extent-wide total is already inconsistent.
+        for (total, decrement) in [(0, 1), (1, 2)] {
+            let mut alloc = allocator();
+            let keys = insert_keyed_data_ref(&mut alloc, total, &2_u32.to_le_bytes());
+            let before = backref_state(&alloc, keys);
+            assert!(matches!(
+                alloc.remove_shared_data_backref(keys[0].objectid, 4096, keys[1].offset, decrement),
+                Err(BtrfsMutationError::BrokenInvariant(_))
+            ));
+            assert_eq!(backref_state(&alloc, keys), before);
+            assert!(!alloc.is_pinned(keys[0].objectid));
+        }
+    }
+
+    #[test]
+    fn malformed_keyed_shared_refs_are_not_replaced_or_truncated() {
+        for payload in [
+            vec![],
+            vec![1],
+            vec![1, 0, 0],
+            vec![1, 0, 0, 0, 0],
+            vec![0; 4],
+        ] {
+            let mut alloc = allocator();
+            let keys = insert_keyed_data_ref(&mut alloc, 2, &payload);
+            let before = backref_state(&alloc, keys);
+            assert!(matches!(
+                alloc.add_shared_data_backref(keys[0].objectid, 4096, keys[1].offset, 1),
+                Err(BtrfsMutationError::BrokenInvariant(_))
+            ));
+            assert_eq!(backref_state(&alloc, keys), before);
+            assert!(matches!(
+                alloc.remove_shared_data_backref(keys[0].objectid, 4096, keys[1].offset, 1),
+                Err(BtrfsMutationError::BrokenInvariant(_))
+            ));
+            assert_eq!(backref_state(&alloc, keys), before);
+        }
+    }
+
+    #[test]
+    fn zero_count_requests_neither_create_nor_edit_shared_refs() {
+        let mut alloc = allocator();
+        let keys = insert_keyed_data_ref(&mut alloc, 2, &2_u32.to_le_bytes());
+        for parent in [keys[1].offset, keys[1].offset + NODE] {
+            let before = backref_state(&alloc, keys);
+            assert!(
+                alloc
+                    .add_shared_data_backref(keys[0].objectid, 4096, parent, 0)
+                    .is_err()
+            );
+            assert!(
+                alloc
+                    .remove_shared_data_backref(keys[0].objectid, 4096, parent, 0)
+                    .is_err()
+            );
+            assert_eq!(backref_state(&alloc, keys), before);
+            if parent != keys[1].offset {
+                assert!(
+                    alloc
+                        .extent_tree
+                        .get(&BtrfsKey {
+                            offset: parent,
+                            ..keys[1]
+                        })
+                        .is_none()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn maximum_valid_shared_ref_count_round_trips() {
+        let mut alloc = allocator();
+        let initial = u32::MAX - 1;
+        let keys = insert_keyed_data_ref(&mut alloc, u64::from(initial), &initial.to_le_bytes());
+        let before = backref_state(&alloc, keys);
+        alloc
+            .add_shared_data_backref(keys[0].objectid, 4096, keys[1].offset, 1)
+            .expect("u32::MAX is a valid count");
+        assert_eq!(
+            alloc.load_extent_item(keys[0]).expect("extent").refs,
+            u64::from(u32::MAX)
+        );
+        assert_eq!(
+            shared_data_ref_count(&alloc.extent_tree.get(&keys[1]).expect("keyed ref"))
+                .expect("valid payload"),
+            u32::MAX
+        );
+        assert_eq!(
+            alloc
+                .remove_shared_data_backref(keys[0].objectid, 4096, keys[1].offset, 1)
+                .expect("decrement"),
+            u64::from(initial)
+        );
+        assert_eq!(backref_state(&alloc, keys), before);
     }
 
     /// A kernel-snapshotted block: refs 2, inline [root 256, root 5]. Dropping
