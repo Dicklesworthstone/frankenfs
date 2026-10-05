@@ -8824,7 +8824,7 @@ fn fuse_ioctl_ext4_getflags_setflags_roundtrip_preserves_system_bits() {
         ioctl_trace_path: Some(ioctl_trace_path.clone()),
         ..MountOptions::default()
     };
-    let Some(session) = try_mount_ffs_rw_with_options(&image, &mnt, &mount_opts) else {
+    let Some(_session) = try_mount_ffs_rw_with_options(&image, &mnt, &mount_opts) else {
         return;
     };
 
@@ -8833,9 +8833,6 @@ fn fuse_ioctl_ext4_getflags_setflags_roundtrip_preserves_system_bits() {
     fs::write(&path, b"ext4 ioctl flags payload\n").expect("write ext4 ioctl seed file");
 
     let original_report = ext4_inode_flags_ioctl(&path, "get", None);
-    // The trace is written off-thread; flush it so the read sees this ioctl
-    // (CI run 37048324144 read a trace still missing the SETFLAGS line).
-    session.flush_ioctl_trace().expect("flush ioctl trace");
     let get_trace = read_ioctl_trace(&ioctl_trace_path);
     if original_report["errno"].as_i64() == Some(EOPNOTSUPP_ERRNO) {
         assert!(
@@ -8870,7 +8867,6 @@ fn fuse_ioctl_ext4_getflags_setflags_roundtrip_preserves_system_bits() {
         | ffs_types::EXT4_HUGE_FILE_FL)
         & !ffs_types::EXT4_EXTENTS_FL;
     let set_report = ext4_inode_flags_ioctl(&path, "set", Some(requested));
-    session.flush_ioctl_trace().expect("flush ioctl trace");
     let set_trace = read_ioctl_trace(&ioctl_trace_path);
     if set_report["errno"].as_i64() == Some(i64::from(libc::ENOTTY)) {
         assert!(
@@ -8946,7 +8942,6 @@ fn fuse_ioctl_ext4_setfslabel_updates_label_and_survives_remount() {
     let requested = "ffs-renamed";
 
     let set_report = fs_label_ioctl(&path, "set", Some(requested));
-    session.flush_ioctl_trace().expect("flush ioctl trace");
     let set_trace = read_ioctl_trace(&ioctl_trace_path);
     if let Some(errno) = set_report["errno"].as_i64()
         && (errno == i64::from(libc::EPERM)
@@ -9057,7 +9052,7 @@ fn fuse_ioctl_ext4_setflags_enables_compr_and_roundtrips_data_on_mounted_path() 
         ioctl_trace_path: Some(ioctl_trace_path.clone()),
         ..MountOptions::default()
     };
-    let Some(session) = try_mount_ffs_rw_with_options(&image, &mnt, &mount_opts) else {
+    let Some(_session) = try_mount_ffs_rw_with_options(&image, &mnt, &mount_opts) else {
         return;
     };
 
@@ -9066,9 +9061,6 @@ fn fuse_ioctl_ext4_setflags_enables_compr_and_roundtrips_data_on_mounted_path() 
     fs::write(&path, b"").expect("create empty file for COMPR enable");
 
     let original_report = ext4_inode_flags_ioctl(&path, "get", None);
-    // The trace is written off-thread; flush it so the read sees this ioctl
-    // (CI run 37048324144 read a trace still missing the SETFLAGS line).
-    session.flush_ioctl_trace().expect("flush ioctl trace");
     let get_trace = read_ioctl_trace(&ioctl_trace_path);
     if original_report["errno"].as_i64() == Some(EOPNOTSUPP_ERRNO) {
         assert!(
@@ -9099,7 +9091,6 @@ fn fuse_ioctl_ext4_setflags_enables_compr_and_roundtrips_data_on_mounted_path() 
 
     let set_report =
         ext4_inode_flags_ioctl(&path, "set", Some(original | ffs_types::EXT4_COMPR_FL));
-    session.flush_ioctl_trace().expect("flush ioctl trace");
     let set_trace = read_ioctl_trace(&ioctl_trace_path);
     if set_report["errno"].as_i64() == Some(i64::from(libc::ENOTTY)) {
         assert!(
@@ -9185,7 +9176,7 @@ fn fuse_ioctl_ext4_setflags_rejects_compr_without_compression_feature() {
         ioctl_trace_path: Some(ioctl_trace_path.clone()),
         ..MountOptions::default()
     };
-    let Some(session) = try_mount_ffs_rw_with_options(&image, &mnt, &mount_opts) else {
+    let Some(_session) = try_mount_ffs_rw_with_options(&image, &mnt, &mount_opts) else {
         return;
     };
 
@@ -9194,9 +9185,6 @@ fn fuse_ioctl_ext4_setflags_rejects_compr_without_compression_feature() {
     fs::write(&path, b"").expect("create empty file for COMPR rejection");
 
     let original_report = ext4_inode_flags_ioctl(&path, "get", None);
-    // The trace is written off-thread; flush it so the read sees this ioctl
-    // (CI run 37048324144 read a trace still missing the SETFLAGS line).
-    session.flush_ioctl_trace().expect("flush ioctl trace");
     let get_trace = read_ioctl_trace(&ioctl_trace_path);
     if original_report["errno"].as_i64() == Some(EOPNOTSUPP_ERRNO) {
         assert!(
@@ -9222,7 +9210,6 @@ fn fuse_ioctl_ext4_setflags_rejects_compr_without_compression_feature() {
 
     let set_report =
         ext4_inode_flags_ioctl(&path, "set", Some(original | ffs_types::EXT4_COMPR_FL));
-    session.flush_ioctl_trace().expect("flush ioctl trace");
     let set_trace = read_ioctl_trace(&ioctl_trace_path);
     if set_report["errno"].as_i64() == Some(i64::from(libc::ENOTTY)) {
         assert!(
@@ -17245,9 +17232,6 @@ fn ext4_fuse_ioctl_setversion_roundtrips_via_mounted_path() {
 
     let original_report = ext4_inode_generation_ioctl(&path, "get", None);
     session.flush_ioctl_trace().expect("flush GETVERSION trace");
-    // The trace is written off-thread; flush it so the read sees this ioctl
-    // (CI run 37048324144 read a trace still missing the SETFLAGS line).
-    session.flush_ioctl_trace().expect("flush ioctl trace");
     let get_trace = read_ioctl_trace(&ioctl_trace_path);
     if let Some(errno) = original_report["errno"].as_i64() {
         let transport_errno = errno == i64::from(libc::ENOTTY)
@@ -17283,7 +17267,6 @@ fn ext4_fuse_ioctl_setversion_roundtrips_via_mounted_path() {
 
     let set_report = ext4_inode_generation_ioctl(&path, "set", Some(requested));
     session.flush_ioctl_trace().expect("flush SETVERSION trace");
-    session.flush_ioctl_trace().expect("flush ioctl trace");
     let set_trace = read_ioctl_trace(&ioctl_trace_path);
     if let Some(errno) = set_report["errno"].as_i64() {
         let transport_errno = errno == i64::from(libc::ENOTTY) || errno == i64::from(libc::EINVAL);
