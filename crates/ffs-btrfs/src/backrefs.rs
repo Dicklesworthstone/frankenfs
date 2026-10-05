@@ -16,6 +16,9 @@
 //! Multi-item edits share one COW publication boundary: allocation or tree
 //! errors discard the entire staged change, and only a committed last-reference
 //! removal may pin the released extent.
+//! Before a tree/shared-data removal reaches zero, reconcile its full inline
+//! and keyed reference inventory. A corrupt total must not release space that
+//! still belongs to another snapshot, parent, file, or file offset.
 
 use crate::{
     BTRFS_ITEM_EXTENT_DATA_REF, BTRFS_ITEM_EXTENT_ITEM, BTRFS_ITEM_METADATA_ITEM,
@@ -34,6 +37,7 @@ pub const BTRFS_ITEM_EXTENT_OWNER_REF: u8 = 172;
 pub const BTRFS_EXTENT_FLAG_FULL_BACKREF: u64 = 1 << 8;
 /// Extent item flag: the item describes a tree block.
 const BTRFS_EXTENT_FLAG_TREE_BLOCK: u64 = 2;
+const BTRFS_EXTENT_FLAG_DATA: u64 = 1;
 
 const EXTENT_ITEM_HEADER: usize = 24;
 const TREE_BLOCK_INFO: usize = 18;
@@ -97,6 +101,27 @@ impl InlineRef {
             }
         }
     }
+
+    fn reference_count(&self, tree_block: bool) -> Result<u64, BtrfsMutationError> {
+        let count = match self {
+            // Simple-quota attribution is not an additional live reference.
+            Self::Owner(_) => return Ok(0),
+            Self::TreeRoot(_) | Self::TreeParent(_) if tree_block => 1,
+            Self::Data(data_ref) if !tree_block => u64::from(data_ref.count),
+            Self::SharedData { count, .. } if !tree_block => u64::from(*count),
+            _ => {
+                return Err(BtrfsMutationError::BrokenInvariant(
+                    "inline backref does not match extent kind",
+                ));
+            }
+        };
+        if count == 0 {
+            return Err(BtrfsMutationError::BrokenInvariant(
+                "zero inline data backref count",
+            ));
+        }
+        Ok(count)
+    }
 }
 
 /// An `EXTENT_ITEM` / `METADATA_ITEM` value split into its parts.
@@ -128,6 +153,41 @@ fn shared_data_ref_count(value: &[u8]) -> Result<u32, BtrfsMutationError> {
         ));
     }
     Ok(count)
+}
+
+fn keyed_reference_count(
+    kind: u8,
+    value: &[u8],
+    tree_block: bool,
+) -> Result<u64, BtrfsMutationError> {
+    match kind {
+        BTRFS_ITEM_TREE_BLOCK_REF | BTRFS_ITEM_SHARED_BLOCK_REF
+            if tree_block && value.is_empty() =>
+        {
+            Ok(1)
+        }
+        BTRFS_ITEM_EXTENT_DATA_REF if !tree_block && value.len() == DATA_REF_PAYLOAD => {
+            BtrfsExtentDataRef::from_bytes(value)
+                .filter(|data_ref| data_ref.count != 0)
+                .map(|data_ref| u64::from(data_ref.count))
+                .ok_or(BtrfsMutationError::BrokenInvariant(
+                    "invalid keyed EXTENT_DATA_REF count",
+                ))
+        }
+        BTRFS_ITEM_SHARED_DATA_REF if !tree_block => shared_data_ref_count(value).map(u64::from),
+        _ => Err(BtrfsMutationError::BrokenInvariant(
+            "invalid keyed backref or ambiguous extent item at final release",
+        )),
+    }
+}
+
+fn add_inventory_count(total: u64, count: u64, expected: u64) -> Result<u64, BtrfsMutationError> {
+    total
+        .checked_add(count)
+        .filter(|&sum| sum <= expected)
+        .ok_or(BtrfsMutationError::BrokenInvariant(
+            "extent total is smaller than its backrefs",
+        ))
 }
 
 impl ExtentItem {
@@ -320,6 +380,68 @@ impl BtrfsExtentAllocator {
         ExtentItem::parse(key, &value)
     }
 
+    /// Check the admitted inventory BEFORE a removal that would reach zero.
+    /// Non-final decrements retain their existing lookup cost. Range bounds
+    /// name only this bytenr (without bytenr + 1 overflow); a second extent
+    /// descriptor at the same address is ambiguous and cannot authorize free.
+    /// The caller still verifies that its particular reference exists and can
+    /// satisfy the decrement. This check is not a whole-filesystem fsck.
+    fn validate_final_backref(
+        &self,
+        key: BtrfsKey,
+        item: &ExtentItem,
+        tree_block: bool,
+    ) -> Result<(), BtrfsMutationError> {
+        let expected_kind = if tree_block {
+            BTRFS_EXTENT_FLAG_TREE_BLOCK
+        } else {
+            BTRFS_EXTENT_FLAG_DATA
+        };
+        if item.flags & (BTRFS_EXTENT_FLAG_DATA | BTRFS_EXTENT_FLAG_TREE_BLOCK) != expected_kind
+            || (!tree_block && key.item_type == BTRFS_ITEM_METADATA_ITEM)
+        {
+            return Err(BtrfsMutationError::BrokenInvariant(
+                "extent kind does not match final backref removal",
+            ));
+        }
+        let mut total = item.inline.iter().try_fold(0, |total, entry| {
+            add_inventory_count(total, entry.reference_count(tree_block)?, item.refs)
+        })?;
+        let lo = BtrfsKey {
+            objectid: key.objectid,
+            item_type: BTRFS_ITEM_EXTENT_ITEM,
+            offset: 0,
+        };
+        let hi = BtrfsKey {
+            objectid: key.objectid,
+            // Include every shared-ref offset, even u64::MAX, under either
+            // inclusive or half-open range traversal contracts.
+            item_type: BTRFS_ITEM_SHARED_DATA_REF + 1,
+            offset: 0,
+        };
+        let mut invalid = None;
+        self.extent_tree.range_with(&lo, &hi, |other, value| {
+            if invalid.is_some() || other == key {
+                return;
+            }
+            let result = keyed_reference_count(other.item_type, value, tree_block)
+                .and_then(|count| add_inventory_count(total, count, item.refs));
+            match result {
+                Ok(count) => total = count,
+                Err(error) => invalid = Some(error),
+            }
+        })?;
+        if let Some(error) = invalid {
+            return Err(error);
+        }
+        if total != item.refs {
+            return Err(BtrfsMutationError::BrokenInvariant(
+                "extent total does not match its backrefs",
+            ));
+        }
+        Ok(())
+    }
+
     /// Refcount and flags of the tree block at `bytenr`, if it has an item.
     ///
     /// # Errors
@@ -386,7 +508,8 @@ impl BtrfsExtentAllocator {
     ///
     /// # Errors
     /// `KeyNotFound` without an extent item, `BrokenInvariant` if the reference
-    /// is not present, or an extent-tree error.
+    /// is not present or the final-reference inventory is inconsistent, or an
+    /// extent-tree error.
     pub fn remove_tree_block_backref(
         &mut self,
         bytenr: u64,
@@ -396,6 +519,9 @@ impl BtrfsExtentAllocator {
             .tree_block_item_key(bytenr)?
             .ok_or(BtrfsMutationError::KeyNotFound)?;
         let mut item = self.load_extent_item(key)?;
+        if item.refs == 1 {
+            self.validate_final_backref(key, &item, true)?;
+        }
         // Validate the extent-wide count before deleting a keyed reference.
         item.refs = item
             .refs
@@ -530,9 +656,9 @@ impl BtrfsExtentAllocator {
     ///
     /// # Errors
     /// `KeyNotFound` without an extent item, `BrokenInvariant` for a zero
-    /// count, malformed keyed reference, or either count underflow, or an
-    /// extent-tree error. Errors leave both the extent item and the keyed
-    /// reference unchanged.
+    /// count, malformed keyed reference, either count underflow, or an
+    /// inconsistent final-reference inventory, or an extent-tree error.
+    /// Errors leave both the extent item and the keyed reference unchanged.
     pub fn remove_shared_data_backref(
         &mut self,
         bytenr: u64,
@@ -551,6 +677,9 @@ impl BtrfsExtentAllocator {
             offset: num_bytes,
         };
         let mut item = self.load_extent_item(key)?;
+        if item.refs == u64::from(count) {
+            self.validate_final_backref(key, &item, false)?;
+        }
         // A keyed ref may be decremented or deleted below. Reject a corrupt
         // extent total before publishing either change to the live tree.
         item.refs =
@@ -1274,6 +1403,326 @@ mod tests {
                 .remove_shared_data_backref(40 << 20, 4096, 200 << 20, 1)
                 .is_err()
         );
+    }
+
+    #[test]
+    fn final_tree_release_rejects_surviving_inline_and_keyed_owners() {
+        for target in [TreeBlockBackref::Root(5), TreeBlockBackref::Parent(9 << 20)] {
+            for target_inline in [false, true] {
+                for peer_inline in [false, true] {
+                    for skinny in [false, true] {
+                        let mut alloc = allocator();
+                        let bytenr = 2 << 20;
+                        let key = if skinny {
+                            metadata_key(bytenr, 1)
+                        } else {
+                            BtrfsKey {
+                                objectid: bytenr,
+                                item_type: BTRFS_ITEM_EXTENT_ITEM,
+                                offset: NODE,
+                            }
+                        };
+                        let mut item = ExtentItem {
+                            refs: 1, // Corrupt total: two distinct holders below.
+                            generation: 5,
+                            flags: BTRFS_EXTENT_FLAG_TREE_BLOCK,
+                            tree_block_info: (!skinny).then(|| vec![0; TREE_BLOCK_INFO]),
+                            inline: Vec::new(),
+                        };
+                        for (backref, inline) in [
+                            (target, target_inline),
+                            (TreeBlockBackref::Root(256), peer_inline),
+                        ] {
+                            if inline {
+                                item.inline.push(match backref {
+                                    TreeBlockBackref::Root(root) => InlineRef::TreeRoot(root),
+                                    TreeBlockBackref::Parent(p) => InlineRef::TreeParent(p),
+                                });
+                            } else {
+                                alloc
+                                    .extent_tree
+                                    .insert(tree_ref_key(bytenr, backref), &[])
+                                    .expect("keyed holder");
+                            }
+                        }
+                        alloc.extent_tree.insert(key, &item.encode()).expect("item");
+                        let before = tree_state(&alloc.extent_tree);
+                        assert!(matches!(
+                            alloc.remove_tree_block_backref(bytenr, target),
+                            Err(BtrfsMutationError::BrokenInvariant(_))
+                        ));
+                        assert_eq!(tree_state(&alloc.extent_tree), before);
+                        assert!(!alloc.is_pinned(bytenr));
+                    }
+                }
+            }
+        }
+    }
+
+    fn move_shared_ref_inline(alloc: &mut BtrfsExtentAllocator, keys: [BtrfsKey; 2], count: u32) {
+        let mut item = alloc.load_extent_item(keys[0]).expect("data extent");
+        item.inline.push(InlineRef::SharedData {
+            parent: keys[1].offset,
+            count,
+        });
+        alloc.extent_tree.delete(&keys[1]).expect("move keyed ref");
+        alloc
+            .extent_tree
+            .update(&keys[0], &item.encode())
+            .expect("inline ref");
+    }
+
+    #[test]
+    fn final_data_release_rejects_a_retained_count_in_the_selected_backref() {
+        for inline in [false, true] {
+            let mut alloc = allocator();
+            let keys = insert_keyed_data_ref(&mut alloc, 1, &2_u32.to_le_bytes());
+            if inline {
+                move_shared_ref_inline(&mut alloc, keys, 2);
+            }
+            let before = tree_state(&alloc.extent_tree);
+            // Arithmetic fits both counts, but returning zero would free an
+            // extent whose selected reference still has one use remaining.
+            assert!(matches!(
+                alloc.remove_shared_data_backref(keys[0].objectid, 4096, keys[1].offset, 1),
+                Err(BtrfsMutationError::BrokenInvariant(_))
+            ));
+            assert_eq!(tree_state(&alloc.extent_tree), before);
+            assert!(!alloc.is_pinned(keys[0].objectid));
+        }
+    }
+
+    #[test]
+    fn final_data_release_rejects_all_surviving_data_reference_forms() {
+        for target_inline in [false, true] {
+            for peer_kind in 0..4 {
+                let mut alloc = allocator();
+                let keys = insert_keyed_data_ref(&mut alloc, 1, &1_u32.to_le_bytes());
+                if target_inline {
+                    move_shared_ref_inline(&mut alloc, keys, 1);
+                }
+                let mut item = alloc.load_extent_item(keys[0]).expect("data extent");
+                let data_ref = BtrfsExtentDataRef {
+                    root: 256,
+                    objectid: 257,
+                    offset: 4096,
+                    count: 1,
+                };
+                let peer_key = BtrfsKey {
+                    offset: 100 << 20,
+                    ..keys[1]
+                };
+                match peer_kind {
+                    0 => item.inline.push(InlineRef::Data(data_ref)),
+                    1 => item.inline.push(InlineRef::SharedData {
+                        parent: peer_key.offset,
+                        count: 1,
+                    }),
+                    2 => alloc
+                        .extent_tree
+                        .insert(
+                            BtrfsKey {
+                                item_type: BTRFS_ITEM_EXTENT_DATA_REF,
+                                ..peer_key
+                            },
+                            &data_ref.to_bytes(),
+                        )
+                        .expect("keyed file reference"),
+                    _ => alloc
+                        .extent_tree
+                        .insert(peer_key, &1_u32.to_le_bytes())
+                        .expect("keyed parent reference"),
+                }
+                alloc
+                    .extent_tree
+                    .update(&keys[0], &item.encode())
+                    .expect("inconsistent total");
+                let before = tree_state(&alloc.extent_tree);
+                assert!(matches!(
+                    alloc.remove_shared_data_backref(keys[0].objectid, 4096, keys[1].offset, 1),
+                    Err(BtrfsMutationError::BrokenInvariant(_))
+                ));
+                assert_eq!(tree_state(&alloc.extent_tree), before);
+            }
+        }
+    }
+
+    #[test]
+    fn final_data_inventory_includes_the_maximum_key_offset() {
+        for inline in [false, true] {
+            let mut alloc = allocator();
+            let keys = insert_keyed_data_ref(&mut alloc, 1, &1_u32.to_le_bytes());
+            if inline {
+                move_shared_ref_inline(&mut alloc, keys, 1);
+            }
+            let peer = BtrfsKey {
+                offset: u64::MAX,
+                ..keys[1]
+            };
+            alloc
+                .extent_tree
+                .insert(peer, &1_u32.to_le_bytes())
+                .expect("reference at the final possible offset");
+            let before = tree_state(&alloc.extent_tree);
+            assert!(matches!(
+                alloc.remove_shared_data_backref(keys[0].objectid, 4096, keys[1].offset, 1),
+                Err(BtrfsMutationError::BrokenInvariant(_))
+            ));
+            assert_eq!(tree_state(&alloc.extent_tree), before);
+        }
+    }
+
+    #[test]
+    fn final_release_refuses_malformed_or_wrong_kind_inventory() {
+        for (kind, payload) in [
+            (BTRFS_ITEM_EXTENT_DATA_REF, vec![0; DATA_REF_PAYLOAD]),
+            (BTRFS_ITEM_EXTENT_DATA_REF, vec![0; DATA_REF_PAYLOAD - 1]),
+            (BTRFS_ITEM_EXTENT_DATA_REF, vec![0; DATA_REF_PAYLOAD + 1]),
+            (BTRFS_ITEM_SHARED_DATA_REF, vec![0; 4]),
+            (BTRFS_ITEM_TREE_BLOCK_REF, Vec::new()),
+            (BTRFS_ITEM_EXTENT_OWNER_REF, 256_u64.to_le_bytes().to_vec()),
+        ] {
+            let mut alloc = allocator();
+            let keys = insert_keyed_data_ref(&mut alloc, 1, &1_u32.to_le_bytes());
+            let peer = BtrfsKey {
+                item_type: kind,
+                offset: 100 << 20,
+                ..keys[0]
+            };
+            alloc.extent_tree.insert(peer, &payload).expect("bad peer");
+            let before = tree_state(&alloc.extent_tree);
+            assert!(matches!(
+                alloc.remove_shared_data_backref(keys[0].objectid, 4096, keys[1].offset, 1),
+                Err(BtrfsMutationError::BrokenInvariant(_))
+            ));
+            assert_eq!(tree_state(&alloc.extent_tree), before);
+        }
+        for flags in [0, BTRFS_EXTENT_FLAG_DATA, 3] {
+            let mut alloc = allocator();
+            let bytenr = 2 << 20;
+            insert_tree_block(&mut alloc, bytenr, vec![InlineRef::TreeRoot(5)]);
+            let key = metadata_key(bytenr, 1);
+            let mut item = alloc.load_extent_item(key).expect("tree extent");
+            item.flags = flags;
+            alloc.extent_tree.update(&key, &item.encode()).expect("flags");
+            let before = tree_state(&alloc.extent_tree);
+            assert!(matches!(
+                alloc.remove_tree_block_backref(bytenr, TreeBlockBackref::Root(5)),
+                Err(BtrfsMutationError::BrokenInvariant(_))
+            ));
+            assert_eq!(tree_state(&alloc.extent_tree), before);
+            assert!(!alloc.is_pinned(bytenr));
+        }
+    }
+
+    #[test]
+    fn final_release_rejects_ambiguous_extent_descriptors() {
+        let mut alloc = allocator();
+        let bytenr = 2 << 20;
+        insert_tree_block(&mut alloc, bytenr, vec![InlineRef::TreeRoot(5)]);
+        let mut classic = alloc.load_extent_item(metadata_key(bytenr, 1)).unwrap();
+        classic.tree_block_info = Some(vec![0; TREE_BLOCK_INFO]);
+        let key = BtrfsKey {
+            objectid: bytenr,
+            item_type: BTRFS_ITEM_EXTENT_ITEM,
+            offset: NODE,
+        };
+        alloc
+            .extent_tree
+            .insert(key, &classic.encode())
+            .expect("second descriptor");
+        let before = tree_state(&alloc.extent_tree);
+        assert!(matches!(
+            alloc.remove_tree_block_backref(bytenr, TreeBlockBackref::Root(5)),
+            Err(BtrfsMutationError::BrokenInvariant(_))
+        ));
+        assert_eq!(tree_state(&alloc.extent_tree), before);
+        assert!(!alloc.is_pinned(bytenr));
+
+        let keys = insert_keyed_data_ref(&mut alloc, 1, &1_u32.to_le_bytes());
+        let data = alloc.extent_tree.get(&keys[0]).expect("data item");
+        alloc
+            .extent_tree
+            .insert(
+                BtrfsKey {
+                    offset: 8192,
+                    ..keys[0]
+                },
+                &data,
+            )
+            .expect("conflicting data length");
+        let before = tree_state(&alloc.extent_tree);
+        assert!(matches!(
+            alloc.remove_shared_data_backref(keys[0].objectid, 4096, keys[1].offset, 1),
+            Err(BtrfsMutationError::BrokenInvariant(_))
+        ));
+        assert_eq!(tree_state(&alloc.extent_tree), before);
+    }
+
+    #[test]
+    fn quota_owners_and_neighboring_extents_do_not_prevent_valid_final_release() {
+        let mut alloc = allocator();
+        let bytenr = 2 << 20;
+        insert_tree_block(&mut alloc, bytenr, vec![InlineRef::TreeRoot(5)]);
+        let key = metadata_key(bytenr, 1);
+        let mut item = alloc.load_extent_item(key).expect("tree extent");
+        item.inline.insert(0, InlineRef::Owner(256));
+        alloc
+            .extent_tree
+            .update(&key, &item.encode())
+            .expect("quota attribution");
+        let neighbors = [
+            tree_ref_key(bytenr - NODE, TreeBlockBackref::Root(5)),
+            tree_ref_key(bytenr + NODE, TreeBlockBackref::Root(5)),
+        ];
+        for neighbor in neighbors {
+            alloc
+                .extent_tree
+                .insert(neighbor, &[0xff])
+                .expect("unrelated item");
+        }
+        assert_eq!(
+            alloc
+                .remove_tree_block_backref(bytenr, TreeBlockBackref::Root(5))
+                .unwrap(),
+            0
+        );
+        assert!(alloc.is_pinned(bytenr));
+        for neighbor in neighbors {
+            assert_eq!(alloc.extent_tree.get(&neighbor), Some(vec![0xff]));
+        }
+
+        let keys = insert_keyed_data_ref(&mut alloc, 3, &1_u32.to_le_bytes());
+        let mut item = alloc.load_extent_item(keys[0]).expect("data extent");
+        item.inline = vec![
+            InlineRef::Owner(256),
+            InlineRef::SharedData {
+                parent: 100 << 20,
+                count: 2,
+            },
+        ];
+        alloc
+            .extent_tree
+            .update(&keys[0], &item.encode())
+            .expect("mixed refs");
+        assert_eq!(
+            alloc
+                .remove_shared_data_backref(keys[0].objectid, 4096, 100 << 20, 2)
+                .unwrap(),
+            1
+        );
+        assert_eq!(
+            alloc
+                .remove_shared_data_backref(keys[0].objectid, 4096, keys[1].offset, 1)
+                .unwrap(),
+            0
+        );
+        let item = alloc
+            .load_extent_item(keys[0])
+            .expect("caller owns data release");
+        assert_eq!(item.refs, 0);
+        assert_eq!(item.inline, vec![InlineRef::Owner(256)]);
+        assert!(alloc.extent_tree.get(&keys[1]).is_none());
     }
 
     #[test]
