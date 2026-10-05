@@ -31128,8 +31128,44 @@ impl OpenFs {
                         alloc_blocks,
                     );
                     self.invalidate_ext4_write_extent_snapshot(&inode);
+                    // The new run covers blocks no extent mapped, so the list
+                    // stays a correct logical->physical map with it inserted in
+                    // order (on disk it may have merged into a neighbour; same
+                    // blocks either way). Re-collecting the whole tree instead
+                    // made every hole-filling write O(extents): writes scattered
+                    // through a sparse file went quadratic (xfstests generic/074
+                    // ran past 20 minutes on mmap writeback).
+                    let updated: Arc<[Ext4Extent]> = {
+                        let inserted = Ext4Extent {
+                            logical_block,
+                            raw_len: u16::try_from(mapping.count)
+                                .ok()
+                                .and_then(|len| {
+                                    if mapping.unwritten {
+                                        len.checked_add(ffs_ondisk::ext4::EXT_INIT_MAX_LEN)
+                                    } else {
+                                        Some(len)
+                                    }
+                                })
+                                .ok_or_else(|| {
+                                    FfsError::Format("allocated run exceeds an extent".into())
+                                })?,
+                            physical_start: mapping.physical_start,
+                        };
+                        let at = extents.partition_point(|e| e.logical_block < logical_block);
+                        let mut list = Vec::with_capacity(extents.len() + 1);
+                        list.extend_from_slice(&extents[..at]);
+                        list.push(inserted);
+                        list.extend_from_slice(&extents[at..]);
+                        list.into()
+                    };
                     Self::set_extent_root(&mut inode, &root_bytes);
-                    cached_extents = None; // tree mutated by allocate_extent
+                    *self.ext4_write_extent_snapshot.lock() = Some(Ext4WriteExtentSnapshot {
+                        namespace: extent_cache_namespace(&inode),
+                        root_namespace: extent_root_namespace(&inode),
+                        extents: Arc::clone(&updated),
+                    });
+                    cached_extents = Some(updated);
                     inode.blocks = blocks_after_alloc;
                     let run_end = logical_block.checked_add(mapping.count).ok_or_else(|| {
                         FfsError::Io(std::io::Error::from_raw_os_error(libc::EFBIG))
@@ -56251,6 +56287,71 @@ mod tests {
         assert!(quota.user_quota_inum.is_none());
         assert!(quota.group_quota_inum.is_none());
         assert!(quota.project_quota_inum.is_none());
+    }
+
+    /// generic/074: a write that allocates no longer re-collects the whole
+    /// extent tree; it inserts the new run into the cached list. Through
+    /// scattered one-block writes into a sparse file (no two adjacent, so the
+    /// file fragments), the cached list must map every block exactly as a
+    /// fresh collect does, and the data must read back.
+    #[test]
+    fn ext4_write_extent_snapshot_tracks_allocations_without_recollecting() {
+        let Some((fs, _tmp)) = open_writable_ext4_mkfs(64) else {
+            eprintln!("mkfs.ext4 not available, skipping");
+            return;
+        };
+        let cx = Cx::for_testing();
+        let ino = fs
+            .create(&cx, InodeNumber(2), OsStr::new("sparse"), 0o644, 0, 0)
+            .expect("create")
+            .ino;
+        let blocks = 600_u32;
+        // A permutation of the even blocks, so no two writes are adjacent.
+        let mut order: Vec<u32> = (0..blocks / 2).map(|i| i * 2).collect();
+        let mut seed = 0x2545_F491_4F6C_DD1D_u64;
+        for i in (1..order.len()).rev() {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            order.swap(i, usize::try_from(seed % (i as u64 + 1)).unwrap());
+        }
+        let map = |extents: &[Ext4Extent], block: u32| {
+            let at = extents.partition_point(|e| e.logical_block <= block);
+            at.checked_sub(1).and_then(|i| {
+                let e = extents[i];
+                (block < e.logical_block + u32::from(e.actual_len())).then(|| {
+                    (
+                        e.physical_start + u64::from(block - e.logical_block),
+                        e.is_unwritten(),
+                    )
+                })
+            })
+        };
+        for (step, &block) in order.iter().enumerate() {
+            let byte = u8::try_from(block % 251).unwrap();
+            fs.write(&cx, ino, u64::from(block) * 4096, &[byte; 4096])
+                .expect("write");
+            if step % 25 != 24 {
+                continue;
+            }
+            let inode = fs.read_inode(&cx, ino).expect("inode");
+            let cached = fs
+                .ext4_write_extents_with_scope(&cx, &RequestScope::empty(), &inode)
+                .expect("cached extents");
+            let fresh = fs.collect_extents(&cx, &inode).expect("fresh extents");
+            for b in 0..blocks {
+                assert_eq!(map(&cached, b), map(&fresh, b), "step {step} block {b}");
+            }
+        }
+        for &block in &order {
+            let byte = u8::try_from(block % 251).unwrap();
+            assert_eq!(
+                fs.read(&cx, ino, u64::from(block) * 4096, 4096)
+                    .expect("read"),
+                vec![byte; 4096],
+                "block {block}"
+            );
+        }
     }
 
     #[test]
