@@ -174,8 +174,10 @@ impl<R: Read> RecordBody<'_, R> {
             let mut header = [0_u8; WRITE_HEADER_BYTES];
             self.read(cx, &mut header)?;
             let block = BlockNumber(u64::from_le_bytes(fixed_array(&header[..8])?));
-            let len = usize::try_from(u32::from_le_bytes(fixed_array(&header[8..])?))
-                .map_err(|_| FfsError::Format("WAL data length exceeds address space".to_owned()))?;
+            let len =
+                usize::try_from(u32::from_le_bytes(fixed_array(&header[8..])?)).map_err(|_| {
+                    FfsError::Format("WAL data length exceeds address space".to_owned())
+                })?;
             if len > self.remaining {
                 let offset = crc_offset - self.remaining;
                 return Ok(DecodeResult::Corrupted(format!(
@@ -189,9 +191,10 @@ impl<R: Read> RecordBody<'_, R> {
             // Payload and write-index allocations are fallible. Do not
             // allocate a second copy of these bytes for CRC verification.
             // Allocation failure is an error, never a discardable WAL tail.
-            writes.try_reserve(1).map_err(allocation_error)?;
+            writes.try_reserve(1).map_err(|e| allocation_error(&e))?;
             let mut data = Vec::new();
-            data.try_reserve_exact(len).map_err(allocation_error)?;
+            data.try_reserve_exact(len)
+                .map_err(|e| allocation_error(&e))?;
             while data.len() < len {
                 checkpoint(cx)?;
                 let start = data.len();
@@ -249,7 +252,7 @@ fn fixed_array<const N: usize>(bytes: &[u8]) -> Result<[u8; N]> {
         .map_err(|_| FfsError::Format("invalid fixed WAL field width".to_owned()))
 }
 
-fn allocation_error(error: std::collections::TryReserveError) -> FfsError {
+fn allocation_error(error: &std::collections::TryReserveError) -> FfsError {
     FfsError::Io(std::io::Error::other(format!(
         "cannot allocate WAL replay payload: {error}"
     )))
@@ -336,7 +339,10 @@ mod tests {
 
     impl Read for BoundedRead<'_> {
         fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
-            assert!(buffer.len() <= self.limit, "covered payload was materialized");
+            assert!(
+                buffer.len() <= self.limit,
+                "covered payload was materialized"
+            );
             self.input.read(buffer)
         }
     }
@@ -358,10 +364,11 @@ mod tests {
                     SCRATCH_BYTES
                 },
             };
-            let (decoded, size) = RecordReader::new(&mut input, u64::try_from(bytes.len()).unwrap())
-                .with_checkpoint(cutoff)
-                .next(&Cx::for_testing())
-                .unwrap();
+            let (decoded, size) =
+                RecordReader::new(&mut input, u64::try_from(bytes.len()).unwrap())
+                    .with_checkpoint(cutoff)
+                    .next(&Cx::for_testing())
+                    .unwrap();
             let DecodeResult::Commit(commit) = decoded else {
                 panic!("expected commit");
             };
@@ -371,7 +378,7 @@ mod tests {
             if cutoff < 7 {
                 assert_eq!(commit, expected);
             } else {
-                assert!(commit.writes.is_empty());
+                assert_eq!(commit.writes.len(), 0);
                 assert_eq!(commit.writes.capacity(), 0);
             }
             assert_eq!(input.input.position(), u64::try_from(bytes.len()).unwrap());
@@ -405,7 +412,10 @@ mod tests {
                 .unwrap()
                 .0;
             assert!(matches!(decoded, DecodeResult::Corrupted(_)));
-            assert!(matches!(wal::decode_commit(&bytes), DecodeResult::Corrupted(_)));
+            assert!(matches!(
+                wal::decode_commit(&bytes),
+                DecodeResult::Corrupted(_)
+            ));
             assert_eq!(input.position(), u64::try_from(bytes.len()).unwrap());
         }
     }
@@ -422,7 +432,9 @@ mod tests {
                 let engine = WalReplayEngine::new(policy);
                 let mut expected_commits = Vec::new();
                 let expected = engine
-                    .replay(&bytes, cutoff, |commit| expected_commits.push(commit.clone()))
+                    .replay(&bytes, cutoff, |commit| {
+                        expected_commits.push(commit.clone());
+                    })
                     .unwrap();
                 let mut input = BoundedRead {
                     input: Cursor::new(&bytes),
