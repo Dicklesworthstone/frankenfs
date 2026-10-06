@@ -37013,6 +37013,115 @@ impl OpenFs {
         Ok(total_nbytes)
     }
 
+    /// Without the NO_HOLES feature every byte below `i_size` must be covered
+    /// by an EXTENT_DATA item, holes by an item whose `disk_bytenr` is 0;
+    /// `btrfs check` reports a gap as "file extent discount". The kernel keeps
+    /// that true as it goes (`btrfs_cont_expand` / `maybe_insert_hole`, and
+    /// `fill_holes` on punch). After a mutation of `canonical` that may have
+    /// opened gaps at or after `from` (a write or extension past the old EOF, a
+    /// punch, a shrink that left the EOF sector a hole, and an overwrite, which
+    /// drops the hole items it overlaps whole), insert a hole item into each
+    /// gap of `[from, round_up(size, sectorsize))`. The scan stops at the first
+    /// item keyed at or past `upto`, the end of the mutated range: beyond it
+    /// nothing changed. A no-op on a NO_HOLES filesystem — the mkfs default
+    /// since btrfs-progs 5.15 — and on an inline file, whose single inline
+    /// item is the whole file.
+    fn btrfs_fill_implicit_holes(
+        &self,
+        alloc: &mut BtrfsAllocState,
+        canonical: u64,
+        from: u64,
+        upto: u64,
+        size: u64,
+    ) -> ffs_error::Result<()> {
+        let no_holes = self.btrfs_superblock().is_none_or(|sb| {
+            sb.incompat_features()
+                .contains(ffs_ondisk::BtrfsIncompatFeatures::NO_HOLES)
+        });
+        if no_holes {
+            return Ok(());
+        }
+        let sector = u64::from(alloc.sectorsize.max(1));
+        let end = size
+            .div_ceil(sector)
+            .checked_mul(sector)
+            .ok_or_else(|| FfsError::InvalidGeometry("btrfs hole fill end overflow".into()))?;
+        // Start at the item covering the byte before `from`'s sector: an item
+        // keyed there (a write emits at its sector-aligned start) would hide a
+        // gap before it.
+        let from = from - from % sector;
+        let mut cursor = Self::btrfs_extent_window_floor(alloc, canonical, from.saturating_sub(1))?;
+        if cursor >= end {
+            return Ok(());
+        }
+        let items = alloc
+            .fs_tree
+            .range(
+                &BtrfsKey {
+                    objectid: canonical,
+                    item_type: BTRFS_ITEM_EXTENT_DATA,
+                    offset: cursor,
+                },
+                &BtrfsKey {
+                    objectid: canonical,
+                    item_type: BTRFS_ITEM_EXTENT_DATA,
+                    offset: end,
+                },
+            )
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        // The cursor is that item's offset (the first in range), or 0 when none
+        // precedes it, so a leading gap is found too.
+        let mut gaps = Vec::new();
+        for (key, bytes) in &items {
+            let extent = parse_extent_data(bytes).map_err(|e| parse_to_ffs_error(&e))?;
+            if matches!(extent, BtrfsExtentData::Inline { .. }) {
+                return Ok(());
+            }
+            if key.offset > cursor {
+                gaps.push((cursor, key.offset.min(end) - cursor));
+            }
+            if key.offset >= upto {
+                cursor = end;
+                break;
+            }
+            let item_end = key
+                .offset
+                .checked_add(Self::btrfs_extent_logical_len(&extent)?)
+                .ok_or_else(|| FfsError::InvalidGeometry("extent logical end overflow".into()))?;
+            cursor = cursor.max(item_end);
+            if cursor >= end {
+                break;
+            }
+        }
+        if cursor < end {
+            gaps.push((cursor, end - cursor));
+        }
+        for (offset, len) in gaps {
+            let hole = BtrfsExtentData::Regular {
+                generation: alloc.generation,
+                ram_bytes: len,
+                extent_type: BTRFS_FILE_EXTENT_REG,
+                compression: 0,
+                disk_bytenr: 0,
+                disk_num_bytes: 0,
+                extent_offset: 0,
+                num_bytes: len,
+            };
+            alloc
+                .fs_tree
+                .insert(
+                    BtrfsKey {
+                        objectid: canonical,
+                        item_type: BTRFS_ITEM_EXTENT_DATA,
+                        offset,
+                    },
+                    &hole.to_bytes(),
+                )
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        }
+        Ok(())
+    }
+
     /// File offset of the EXTENT_DATA item covering (or last preceding)
     /// `offset`, or 0 when none precedes it: the lowest key an operation on
     /// `[offset, ..)` can touch.
@@ -40757,9 +40866,19 @@ impl OpenFs {
         };
 
         // Update inode metadata.
+        let size_before = inode.size;
         if end > inode.size {
             inode.size = end;
         }
+        // A write past EOF skips [size_before, offset); one into a hole item
+        // drops that whole item.
+        self.btrfs_fill_implicit_holes(
+            &mut alloc,
+            canonical,
+            offset.min(size_before),
+            end,
+            inode.size,
+        )?;
 
         inode.nbytes = nbytes_after_write;
 
@@ -42648,6 +42767,13 @@ impl OpenFs {
                 }
             }
 
+            self.btrfs_fill_implicit_holes(
+                &mut alloc,
+                canonical,
+                old_size.min(size),
+                u64::MAX,
+                size,
+            )?;
             inode.nbytes = Self::btrfs_recompute_inode_nbytes(&alloc, canonical)?;
         }
         // Explicit times may predate 1970 (xfstests generic/258): the on-disk
@@ -43149,9 +43275,17 @@ impl OpenFs {
             }
         }
 
+        let size_before = inode.size;
         if !keep_size && !collapse_range && !insert_range && new_end > inode.size {
             inode.size = new_end;
         }
+        self.btrfs_fill_implicit_holes(
+            &mut alloc,
+            canonical,
+            offset.min(size_before),
+            new_end,
+            inode.size,
+        )?;
         inode.nbytes = match window {
             Some((lo, before)) => {
                 let after = Self::btrfs_window_nbytes(&alloc, canonical, lo, new_end)?;
@@ -60912,6 +61046,10 @@ mod tests {
         image[sb_off + 0x90..sb_off + 0x94].copy_from_slice(&4096_u32.to_le_bytes()); // sectorsize
         image[sb_off + 0x94..sb_off + 0x98].copy_from_slice(&4096_u32.to_le_bytes()); // nodesize
         image[sb_off + 0x9C..sb_off + 0xA0].copy_from_slice(&4096_u32.to_le_bytes()); // stripesize
+        // NO_HOLES, as every mkfs.btrfs image since btrfs-progs 5.15: holes are
+        // implicit, so a file's gaps need no hole extent items.
+        image[sb_off + 0xBC..sb_off + 0xC4]
+            .copy_from_slice(&ffs_ondisk::BtrfsIncompatFeatures::NO_HOLES.0.to_le_bytes());
         image[sb_off + 0xC6] = 0; // root_level
 
         // sys_chunk_array: one identity chunk [0, image_size) → [0, image_size)
@@ -91544,6 +91682,14 @@ mod tests {
     fn open_writable_btrfs_mkfs(
         size_mb: u64,
     ) -> Option<(OpenFs, TestDevice, tempfile::TempDir, std::path::PathBuf)> {
+        open_writable_btrfs_mkfs_args(size_mb, &[])
+    }
+
+    /// [`open_writable_btrfs_mkfs`] with extra `mkfs.btrfs` arguments.
+    fn open_writable_btrfs_mkfs_args(
+        size_mb: u64,
+        mkfs_args: &[&str],
+    ) -> Option<(OpenFs, TestDevice, tempfile::TempDir, std::path::PathBuf)> {
         let tmp = tempfile::TempDir::new().expect("tmpdir");
         let image = tmp.path().join("test.btrfs");
         let f = std::fs::File::create(&image).expect("create image");
@@ -91554,6 +91700,7 @@ mod tests {
         // literal that the dev sandbox command-guard rejects.
         let fmt_tool = format!("mk{}.btrfs", "fs");
         let out = std::process::Command::new(fmt_tool)
+            .args(mkfs_args)
             .args(["-f", image.to_str().unwrap()])
             .output();
         match out {
@@ -92761,6 +92908,73 @@ mod tests {
     /// result against the authoritative tool (any orphan csum, dangling backref,
     /// stale bg accounting, or nbytes drift surfaces as a btrfs check error).
     /// Skips when btrfs-progs is unavailable.
+    /// Without NO_HOLES (`mkfs.btrfs -O ^no-holes`, how images made before
+    /// btrfs-progs 5.15 are laid out) every gap below i_size needs an explicit
+    /// hole extent item, or `btrfs check` reports "file extent discount". A
+    /// sparse write, an extend, an unaligned overwrite inside a hole (which
+    /// drops the whole hole item), a punch and a mid-sector shrink each open
+    /// gaps; all must be filled, and the bytes must read back unchanged.
+    #[test]
+    fn btrfs_without_no_holes_keeps_explicit_hole_extents() {
+        let Some((fs, dev, _tmp, image)) = open_writable_btrfs_mkfs_args(256, &["-O", "^no-holes"])
+        else {
+            return; // btrfs-progs unavailable
+        };
+        let cx = Cx::for_testing();
+        let ops: &dyn FsOps = &fs;
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let scope = &mut RequestScope::empty();
+        let attr = ops
+            .create(&cx, scope, root, OsStr::new("sparse.bin"), 0o644, 0, 0)
+            .expect("create");
+        let mut shadow = vec![0_u8; 0];
+        let write = |offset: u64, data: &[u8], shadow: &mut Vec<u8>| {
+            ops.write(&cx, &mut RequestScope::empty(), attr.ino, offset, data)
+                .expect("write");
+            let end = usize::try_from(offset).unwrap() + data.len();
+            if shadow.len() < end {
+                shadow.resize(end, 0);
+            }
+            shadow[usize::try_from(offset).unwrap()..end].copy_from_slice(data);
+        };
+        let truncate = |size: u64, shadow: &mut Vec<u8>| {
+            ops.setattr(
+                &cx,
+                &mut RequestScope::empty(),
+                attr.ino,
+                &SetAttrRequest {
+                    size: Some(size),
+                    ..Default::default()
+                },
+            )
+            .expect("truncate");
+            shadow.resize(usize::try_from(size).unwrap(), 0);
+        };
+        write(65_536, &[0xA1; 4096], &mut shadow); // gap [0, 64K)
+        truncate(1 << 20, &mut shadow); // gap up to 1 MiB
+        write(300_001, &[0xB2; 100], &mut shadow); // inside the hole, unaligned
+        ops.fallocate(&cx, scope, attr.ino, 65_536, 4096, 0x03)
+            .expect("punch");
+        shadow[65_536..69_632].fill(0);
+        truncate(70_000, &mut shadow); // EOF sector head is all zero
+        truncate(2 << 20, &mut shadow);
+
+        let len = u32::try_from(shadow.len()).unwrap();
+        assert_eq!(
+            ops.read(&cx, &mut RequestScope::empty(), attr.ino, 0, len)
+                .expect("read"),
+            shadow
+        );
+        let _ = fs.flush_mvcc_to_device(&cx);
+        fs.btrfs_full_transaction_commit(&cx, "no-holes-off")
+            .expect("btrfs full transaction commit");
+        std::fs::write(&image, dev.snapshot_bytes()).expect("write modified image");
+        let Some((ok, output)) = run_btrfs_check(&image) else {
+            return; // btrfs check tool unavailable
+        };
+        assert!(ok, "btrfs check must accept the hole extents:\n{output}");
+    }
+
     #[test]
     fn btrfs_truncate_down_frees_datasum_extent_passes_btrfs_check() {
         let Some((fs, dev, _tmp, image)) = open_writable_btrfs_mkfs(256) else {
