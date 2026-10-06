@@ -420,12 +420,29 @@ pub fn prepare_inode(
         new_generation,
         "inode_generation_bump"
     );
-    let inode = build_fresh_inode(mode, uid, gid, is_dir, new_generation, now_secs, now_nsec);
+    let extents = geo.feature_incompat.0 & ffs_ondisk::Ext4IncompatFeatures::EXTENTS.0 != 0;
+    let inode = build_fresh_inode(
+        mode,
+        uid,
+        gid,
+        is_dir,
+        extents,
+        new_generation,
+        now_secs,
+        now_nsec,
+    );
 
     Ok((alloc.ino, inode))
 }
 
 /// Build a fresh regular-file / directory [`Ext4Inode`] body — NO allocation, NO I/O.
+///
+/// `extents` is whether the filesystem has the EXTENTS feature. With it the
+/// inode gets `EXT4_EXTENTS_FL` and an empty extent-tree root, as kernel
+/// `__ext4_new_inode` does; without it (an ext2/ext3 image) the inode keeps a
+/// zeroed legacy `i_block` pointer map — an extent inode on a filesystem
+/// without the feature is corruption to e2fsck ("in extent format, but
+/// superblock is missing EXTENTS feature").
 ///
 /// This is the pure construction half of [`prepare_inode`], extracted
 /// verbatim so the sharded parallel-create path (bd-bhh0i) can reuse the EXACT
@@ -434,11 +451,13 @@ pub fn prepare_inode(
 /// already-bumped NFS generation counter (`old + 1`); the caller reads the old
 /// value and logs the bump.
 #[must_use]
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 pub fn build_fresh_inode(
     mode: u16,
     uid: u32,
     gid: u32,
     is_dir: bool,
+    extents: bool,
     generation: u32,
     now_secs: u64,
     now_nsec: u32,
@@ -449,11 +468,13 @@ pub fn build_fresh_inode(
     // inline copy — the small-alloc + buffer-reuse beats copying 60B inline
     // (see benches/serialize_inode.rs prepare_inode_extent_bytes; bd-cc-prepare-inode-inline REFUTED).
     let mut extent_bytes = vec![0u8; 60];
-    extent_bytes[0] = (EXT4_EXTENT_MAGIC & 0xFF) as u8;
-    extent_bytes[1] = (EXT4_EXTENT_MAGIC >> 8) as u8;
-    // entries = 0.
-    extent_bytes[4] = 4; // max_entries = 4.
-    // depth = 0 (already zero).
+    if extents {
+        extent_bytes[0] = (EXT4_EXTENT_MAGIC & 0xFF) as u8;
+        extent_bytes[1] = (EXT4_EXTENT_MAGIC >> 8) as u8;
+        // entries = 0.
+        extent_bytes[4] = 4; // max_entries = 4.
+        // depth = 0 (already zero).
+    }
 
     let extra_time = encode_extra_timestamp(now_secs_signed(now_secs), now_nsec);
 
@@ -466,7 +487,7 @@ pub fn build_fresh_inode(
         size: 0,
         links_count: if is_dir { 2 } else { 1 },
         blocks: 0,
-        flags: EXT4_EXTENTS_FL,
+        flags: if extents { EXT4_EXTENTS_FL } else { 0 },
         version: 0,
         generation,
         file_acl: 0,
@@ -1516,7 +1537,7 @@ mod tests {
             desc_size: 32,
             reserved_gdt_blocks: 0,
             feature_compat: ffs_ondisk::Ext4CompatFeatures(0),
-            feature_incompat: ffs_ondisk::Ext4IncompatFeatures(0),
+            feature_incompat: ffs_ondisk::Ext4IncompatFeatures::EXTENTS,
             feature_ro_compat: ffs_ondisk::Ext4RoCompatFeatures(0),
             log_groups_per_flex: 0,
             backup_bgs: [0, 0],
@@ -5349,6 +5370,38 @@ mod tests {
             "directory starts with 2 links (. and parent)"
         );
         assert!(inode.is_dir());
+    }
+
+    /// Without the EXTENTS feature (an ext2/ext3 image) a new inode keeps the
+    /// legacy pointer map: no `EXTENTS_FL` and a zeroed `i_block`, as kernel
+    /// `__ext4_new_inode` leaves it. An extent root there is corruption to
+    /// e2fsck ("in extent format, but superblock is missing EXTENTS feature").
+    #[test]
+    fn create_inode_without_extents_feature_uses_pointer_map() {
+        let cx = test_cx();
+        let dev = MemBlockDevice::new(4096);
+        let mut geo = make_geometry();
+        geo.feature_incompat = ffs_ondisk::Ext4IncompatFeatures(0);
+        let mut groups = make_groups(&geo);
+        for mode in [0o100_644, 0o040_755] {
+            let (_, inode) = create_inode(
+                &cx,
+                &dev,
+                &geo,
+                &mut groups,
+                mode,
+                0,
+                0,
+                GroupNumber(0),
+                0,
+                0,
+                0,
+                &mock_pctx(),
+            )
+            .unwrap();
+            assert_eq!(inode.flags & EXT4_EXTENTS_FL, 0, "mode {mode:o}");
+            assert!(inode.extent_bytes.iter().all(|b| *b == 0), "mode {mode:o}");
+        }
     }
 
     #[test]

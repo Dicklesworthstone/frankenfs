@@ -1118,6 +1118,17 @@ trait DirAllocBackend {
         ino: u32,
         generation: u32,
     ) -> Result<u64, FfsError>;
+
+    /// Free `count` blocks starting at `start` through this backend's
+    /// allocator. Used by the legacy indirect block map (ext2/ext3 directories),
+    /// which has no extent tree for [`Self::dir_truncate_extents`] to walk.
+    fn dir_free_blocks(
+        &mut self,
+        cx: &Cx,
+        dev: &dyn ffs_block::BlockDevice,
+        start: BlockNumber,
+        count: u32,
+    ) -> Result<(), FfsError>;
 }
 
 /// [`DirAllocBackend`] over the single-lock `Ext4AllocState` — byte-identical to
@@ -1215,6 +1226,23 @@ impl DirAllocBackend for SingleLockDirAlloc<'_> {
             ffs_extent::ExtentOwner { ino, generation },
         )
     }
+    fn dir_free_blocks(
+        &mut self,
+        cx: &Cx,
+        dev: &dyn ffs_block::BlockDevice,
+        start: BlockNumber,
+        count: u32,
+    ) -> Result<(), FfsError> {
+        ffs_alloc::free_blocks_persist(
+            cx,
+            dev,
+            &self.alloc.geo,
+            &mut self.alloc.groups,
+            start,
+            count,
+            &self.alloc.persist_ctx,
+        )
+    }
 }
 
 /// [`DirAllocBackend`] over the sharded per-group allocator — the lock-free
@@ -1296,6 +1324,15 @@ impl DirAllocBackend for ShardedDirAlloc<'_> {
         )
         .ok_or_else(|| FfsError::Format("sharded dir truncate: not an ext4 filesystem".into()))?;
         ffs_extent::truncate_extents_with(cx, dev, root_bytes, keep_blocks, &mut tree_alloc)
+    }
+    fn dir_free_blocks(
+        &mut self,
+        cx: &Cx,
+        dev: &dyn ffs_block::BlockDevice,
+        start: BlockNumber,
+        count: u32,
+    ) -> Result<(), FfsError> {
+        self.fs.ext4_sharded_free_blocks(cx, dev, start, count)
     }
 }
 
@@ -19746,6 +19783,14 @@ impl OpenFs {
         scope: &RequestScope,
         inode: &Ext4Inode,
     ) -> Result<Arc<[Ext4Extent]>, FfsError> {
+        // An indirect block map grows inside its pointer blocks without
+        // changing `i_block`, so the root-keyed snapshot cannot tell its
+        // versions apart: always re-walk it.
+        if Self::ext4_inode_block_map_is_indirect(inode) {
+            return Ok(Arc::from(
+                self.collect_extents_with_scope(cx, scope, inode)?,
+            ));
+        }
         let namespace = extent_cache_namespace(inode);
         let root_namespace = extent_root_namespace(inode);
 
@@ -19801,6 +19846,11 @@ impl OpenFs {
         inode: &Ext4Inode,
         from_block: u32,
     ) -> Result<Vec<Ext4Extent>, FfsError> {
+        if Self::ext4_inode_block_map_is_indirect(inode) {
+            let mut runs = self.ext4_indirect_runs(cx, scope, inode)?;
+            runs.retain(|run| run.logical_block + u32::from(run.actual_len()) > from_block);
+            return Ok(runs);
+        }
         let (header, tree) = parse_inode_extent_tree(inode).map_err(|e| parse_to_ffs_error(&e))?;
         let mut result = Vec::new();
         self.collect_extents_recursive(cx, scope, &tree, header.depth, from_block, &mut result)?;
@@ -23017,6 +23067,460 @@ impl OpenFs {
         Ok(())
     }
 
+    /// Whether `inode` maps its data through legacy `i_block` pointers (kernel
+    /// `ext4_ind_map_blocks`) instead of an extent tree: a regular file,
+    /// directory or slow symlink without `EXTENTS_FL`, inline data or e2compr
+    /// (whose `i_block` slots hold a compressed-cluster sentinel). A device
+    /// node's or fast symlink's `i_block` is not a block map at all.
+    fn ext4_inode_block_map_is_indirect(inode: &Ext4Inode) -> bool {
+        const NOT_POINTERS: u32 = ffs_types::EXT4_EXTENTS_FL
+            | ffs_types::EXT4_INLINE_DATA_FL
+            | ffs_types::EXT4_COMPR_FL
+            | ffs_types::EXT4_COMPRBLK_FL;
+        if inode.flags & NOT_POINTERS != 0 {
+            return false;
+        }
+        match inode.mode & 0xF000 {
+            0x8000 | 0x4000 => true,
+            0xA000 => !inode.is_fast_symlink(),
+            _ => false,
+        }
+    }
+
+    /// The `i_block` slot and the per-level indices that address logical block
+    /// `logical` in the legacy pointer tree: slots 0..12 are direct, slot 12 a
+    /// single-, 13 a double- and 14 a triple-indirect block. `None` past the
+    /// triple-indirect range.
+    fn ext4_ind_path(logical: u32, block_size: u32) -> Option<(usize, SmallVec<[usize; 3]>)> {
+        let ppb = u64::from(block_size / 4);
+        let mut lb = u64::from(logical);
+        if lb < 12 {
+            return Some((usize::try_from(lb).ok()?, SmallVec::new()));
+        }
+        lb -= 12;
+        if lb < ppb {
+            return Some((12, smallvec::smallvec![usize::try_from(lb).ok()?]));
+        }
+        lb -= ppb;
+        if lb < ppb * ppb {
+            let path = [lb / ppb, lb % ppb];
+            return Some((13, path.iter().map(|i| *i as usize).collect()));
+        }
+        lb -= ppb * ppb;
+        if lb < ppb * ppb * ppb {
+            let path = [lb / (ppb * ppb), (lb / ppb) % ppb, lb % ppb];
+            return Some((14, path.iter().map(|i| *i as usize).collect()));
+        }
+        None
+    }
+
+    fn ext4_ind_root_slot(root: &[u8; 60], slot: usize) -> u32 {
+        let off = slot * 4;
+        u32::from_le_bytes([root[off], root[off + 1], root[off + 2], root[off + 3]])
+    }
+
+    fn ext4_ind_block_slot(data: &[u8], index: usize) -> u32 {
+        let off = index * 4;
+        u32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]])
+    }
+
+    /// Allocate one zero-filled pointer block through `backend`.
+    fn ext4_ind_alloc_pointer_block(
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        backend: &mut dyn DirAllocBackend,
+        hint: &AllocHint,
+    ) -> Result<u32, FfsError> {
+        let block = backend.dir_alloc_blocks(cx, dev, 1, hint)?.start;
+        let block_size = usize::try_from(backend.dir_geo().block_size)
+            .map_err(|_| FfsError::Format("block size does not fit usize".into()))?;
+        dev.write_block(cx, block, &vec![0_u8; block_size])?;
+        u32::try_from(block.0).map_err(|_| {
+            FfsError::InvalidGeometry(format!(
+                "indirect pointer block {} exceeds the 32-bit pointer range",
+                block.0
+            ))
+        })
+    }
+
+    /// Map logical block `logical` of a legacy indirect-mapped inode, whose
+    /// `i_block` is `root`, to physical block `phys`, allocating (zero-filled)
+    /// single/double/triple-indirect blocks through `backend` as the kernel's
+    /// `ext4_ind_map_blocks` would. All reads and writes go through `dev`, so
+    /// this composes with the caller's transaction. Returns how many pointer
+    /// blocks it allocated: block-map metadata, charged to `i_blocks`.
+    fn ext4_ind_map_block(
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        backend: &mut dyn DirAllocBackend,
+        root: &mut [u8; 60],
+        logical: u32,
+        phys: u64,
+        hint: &AllocHint,
+    ) -> Result<u32, FfsError> {
+        let ptr = u32::try_from(phys).map_err(|_| {
+            FfsError::InvalidGeometry(format!(
+                "block {phys} exceeds the 32-bit range of an indirect block map"
+            ))
+        })?;
+        let block_size = backend.dir_geo().block_size;
+        let (slot, path) = Self::ext4_ind_path(logical, block_size).ok_or_else(|| {
+            FfsError::Format(format!(
+                "logical block {logical} is beyond the triple-indirect range"
+            ))
+        })?;
+        let off = slot * 4;
+        if path.is_empty() {
+            root[off..off + 4].copy_from_slice(&ptr.to_le_bytes());
+            return Ok(0);
+        }
+        let mut allocated = 0_u32;
+        let mut block = Self::ext4_ind_root_slot(root, slot);
+        if block == 0 {
+            block = Self::ext4_ind_alloc_pointer_block(cx, dev, backend, hint)?;
+            root[off..off + 4].copy_from_slice(&block.to_le_bytes());
+            allocated += 1;
+        }
+        for (depth, &index) in path.iter().enumerate() {
+            let block_num = BlockNumber(u64::from(block));
+            let mut data = dev.read_block(cx, block_num)?.as_slice().to_vec();
+            let slot = Self::indirect_pointer_slot(
+                &data,
+                block_num,
+                index,
+                "indirect block too small for pointer",
+            )?;
+            if depth + 1 == path.len() {
+                data[slot].copy_from_slice(&ptr.to_le_bytes());
+                dev.write_block(cx, block_num, &data)?;
+                break;
+            }
+            let mut child = Self::ext4_ind_block_slot(&data, index);
+            if child == 0 {
+                child = Self::ext4_ind_alloc_pointer_block(cx, dev, backend, hint)?;
+                data[slot].copy_from_slice(&child.to_le_bytes());
+                dev.write_block(cx, block_num, &data)?;
+                allocated += 1;
+            }
+            block = child;
+        }
+        Ok(allocated)
+    }
+
+    /// Pointer blocks (single/double/triple-indirect) reachable from `root`:
+    /// the block-map metadata `i_blocks` counts besides the data blocks.
+    fn ext4_ind_meta_blocks(
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        root: &[u8; 60],
+        block_size: u32,
+    ) -> Result<u64, FfsError> {
+        fn count(
+            cx: &Cx,
+            dev: &dyn BlockDevice,
+            block: u32,
+            level: u32,
+            ppb: usize,
+        ) -> Result<u64, FfsError> {
+            if block == 0 {
+                return Ok(0);
+            }
+            if level == 1 {
+                return Ok(1);
+            }
+            let data = dev.read_block(cx, BlockNumber(u64::from(block)))?;
+            let mut total = 1_u64;
+            for index in 0..ppb.min(data.as_slice().len() / 4) {
+                let child = OpenFs::ext4_ind_block_slot(data.as_slice(), index);
+                total = total.saturating_add(count(cx, dev, child, level - 1, ppb)?);
+            }
+            Ok(total)
+        }
+        let ppb = usize::try_from(block_size / 4)
+            .map_err(|_| FfsError::Format("block size does not fit usize".into()))?;
+        let mut total = 0_u64;
+        for (slot, level) in [(12, 1), (13, 2), (14, 3)] {
+            total = total.saturating_add(count(
+                cx,
+                dev,
+                Self::ext4_ind_root_slot(root, slot),
+                level,
+                ppb,
+            )?);
+        }
+        Ok(total)
+    }
+
+    /// Unmap every logical block at or past `keep` from a legacy indirect block
+    /// map, freeing the data blocks and every pointer block left empty through
+    /// `backend` (kernel `ext4_ind_truncate`). Returns the DATA blocks freed;
+    /// freed pointer blocks show up in [`Self::ext4_ind_meta_blocks`].
+    fn ext4_ind_truncate(
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        backend: &mut dyn DirAllocBackend,
+        root: &mut [u8; 60],
+        keep: u32,
+    ) -> Result<u64, FfsError> {
+        /// Truncate the subtree under pointer block `block` (`level` 1 holds
+        /// data pointers) whose first entry maps logical block `base`.
+        /// Returns (data blocks freed, whether `block` itself was freed).
+        #[allow(clippy::too_many_arguments)]
+        fn trunc(
+            cx: &Cx,
+            dev: &dyn BlockDevice,
+            backend: &mut dyn DirAllocBackend,
+            block: u32,
+            level: u32,
+            base: u64,
+            keep: u64,
+            ppb: u64,
+        ) -> Result<(u64, bool), FfsError> {
+            let block_num = BlockNumber(u64::from(block));
+            let mut data = dev.read_block(cx, block_num)?.as_slice().to_vec();
+            let span = ppb.pow(level - 1);
+            let entries = usize::try_from(ppb.min(data.len() as u64 / 4))
+                .map_err(|_| FfsError::Format("pointer count does not fit usize".into()))?;
+            let mut freed = 0_u64;
+            let mut changed = false;
+            for index in 0..entries {
+                let child = OpenFs::ext4_ind_block_slot(&data, index);
+                if child == 0 {
+                    continue;
+                }
+                let start = base + index as u64 * span;
+                if start + span <= keep {
+                    continue; // entirely kept
+                }
+                let child_gone = if level == 1 {
+                    backend.dir_free_blocks(cx, dev, BlockNumber(u64::from(child)), 1)?;
+                    freed += 1;
+                    true
+                } else {
+                    let (n, gone) = trunc(cx, dev, backend, child, level - 1, start, keep, ppb)?;
+                    freed += n;
+                    gone
+                };
+                if child_gone {
+                    data[index * 4..index * 4 + 4].fill(0);
+                    changed = true;
+                }
+            }
+            if data.iter().all(|b| *b == 0) {
+                backend.dir_free_blocks(cx, dev, block_num, 1)?;
+                return Ok((freed, true));
+            }
+            if changed {
+                dev.write_block(cx, block_num, &data)?;
+            }
+            Ok((freed, false))
+        }
+
+        let ppb = u64::from(backend.dir_geo().block_size / 4);
+        let keep = u64::from(keep);
+        let mut freed = 0_u64;
+        for slot in usize::try_from(keep.min(12)).unwrap_or(12)..12 {
+            let ptr = Self::ext4_ind_root_slot(root, slot);
+            if ptr != 0 {
+                backend.dir_free_blocks(cx, dev, BlockNumber(u64::from(ptr)), 1)?;
+                root[slot * 4..slot * 4 + 4].fill(0);
+                freed += 1;
+            }
+        }
+        let mut base = 12_u64;
+        for (slot, level) in [(12_usize, 1_u32), (13, 2), (14, 3)] {
+            let span = ppb.pow(level);
+            let ptr = Self::ext4_ind_root_slot(root, slot);
+            if ptr != 0 && base + span > keep {
+                let (n, gone) = trunc(cx, dev, backend, ptr, level, base, keep, ppb)?;
+                freed += n;
+                if gone {
+                    root[slot * 4..slot * 4 + 4].fill(0);
+                }
+            }
+            base += span;
+        }
+        Ok(freed)
+    }
+
+    /// The block map of a legacy indirect-mapped inode as the runs of
+    /// contiguous logical-to-physical blocks an extent tree would hold, so code
+    /// written against extents (directory insert/remove, seek, rename) serves
+    /// ext2/ext3 inodes too. Holes are absent; runs are in logical order.
+    fn ext4_indirect_runs(
+        &self,
+        cx: &Cx,
+        scope: &RequestScope,
+        inode: &Ext4Inode,
+    ) -> Result<Vec<Ext4Extent>, FfsError> {
+        fn push(runs: &mut Vec<Ext4Extent>, logical: u64, phys: u32) -> Result<(), FfsError> {
+            let logical = u32::try_from(logical)
+                .map_err(|_| FfsError::Format("indirect logical block exceeds u32".into()))?;
+            if let Some(last) = runs.last_mut() {
+                let len = u32::from(last.raw_len);
+                if last.logical_block + len == logical
+                    && last.physical_start + u64::from(len) == u64::from(phys)
+                    && len < 32_768
+                {
+                    last.raw_len += 1;
+                    return Ok(());
+                }
+            }
+            runs.push(Ext4Extent {
+                logical_block: logical,
+                raw_len: 1,
+                physical_start: u64::from(phys),
+            });
+            Ok(())
+        }
+        #[allow(clippy::too_many_arguments)]
+        fn walk(
+            fs: &OpenFs,
+            cx: &Cx,
+            scope: &RequestScope,
+            block: u32,
+            level: u32,
+            base: u64,
+            ppb: u64,
+            total_blocks: u64,
+            runs: &mut Vec<Ext4Extent>,
+        ) -> Result<(), FfsError> {
+            if u64::from(block) >= total_blocks {
+                return Err(FfsError::Corruption {
+                    block: u64::from(block),
+                    detail: "indirect pointer block beyond the end of the filesystem".into(),
+                });
+            }
+            let data = fs.read_block_with_scope(cx, scope, BlockNumber(u64::from(block)))?;
+            let span = ppb.pow(level - 1);
+            for (index, raw) in data
+                .as_chunks::<4>()
+                .0
+                .iter()
+                .take(ppb as usize)
+                .enumerate()
+            {
+                let child = u32::from_le_bytes(*raw);
+                if child == 0 {
+                    continue;
+                }
+                let logical = base + index as u64 * span;
+                if level == 1 {
+                    if u64::from(child) >= total_blocks {
+                        return Err(FfsError::Corruption {
+                            block: u64::from(child),
+                            detail: "indirect data pointer beyond the end of the filesystem".into(),
+                        });
+                    }
+                    push(runs, logical, child)?;
+                } else {
+                    walk(
+                        fs,
+                        cx,
+                        scope,
+                        child,
+                        level - 1,
+                        logical,
+                        ppb,
+                        total_blocks,
+                        runs,
+                    )?;
+                }
+            }
+            Ok(())
+        }
+
+        let sb = self
+            .ext4_superblock()
+            .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
+        let total_blocks = sb.blocks_count;
+        let ppb = u64::from(sb.block_size / 4);
+        let mut root = [0_u8; 60];
+        let len = inode.extent_bytes.len().min(60);
+        root[..len].copy_from_slice(&inode.extent_bytes[..len]);
+        let mut runs = Vec::new();
+        for slot in 0..12 {
+            let ptr = Self::ext4_ind_root_slot(&root, slot);
+            if ptr != 0 {
+                if u64::from(ptr) >= total_blocks {
+                    return Err(FfsError::Corruption {
+                        block: u64::from(ptr),
+                        detail: "direct block pointer beyond the end of the filesystem".into(),
+                    });
+                }
+                push(&mut runs, slot as u64, ptr)?;
+            }
+        }
+        let mut base = 12_u64;
+        for (slot, level) in [(12_usize, 1_u32), (13, 2), (14, 3)] {
+            let ptr = Self::ext4_ind_root_slot(&root, slot);
+            if ptr != 0 {
+                walk(
+                    self,
+                    cx,
+                    scope,
+                    ptr,
+                    level,
+                    base,
+                    ppb,
+                    total_blocks,
+                    &mut runs,
+                )?;
+            }
+            base += ppb.pow(level);
+        }
+        Ok(runs)
+    }
+
+    /// Map `extent` into a directory's block map: its extent tree through
+    /// `backend`, or, for a legacy indirect-mapped directory, its `i_block`
+    /// pointer tree (pointer blocks allocated through `backend`).
+    #[allow(clippy::too_many_arguments)]
+    fn ext4_dir_map_extent(
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        backend: &mut dyn DirAllocBackend,
+        indirect: bool,
+        root_bytes: &mut [u8; 60],
+        extent: Ext4Extent,
+        ino: u32,
+        generation: u32,
+        tree_hint: AllocHint,
+    ) -> Result<(), FfsError> {
+        if !indirect {
+            return backend
+                .dir_insert_extent(cx, dev, root_bytes, extent, ino, generation, tree_hint);
+        }
+        for i in 0..u32::from(extent.actual_len()) {
+            Self::ext4_ind_map_block(
+                cx,
+                dev,
+                backend,
+                root_bytes,
+                extent.logical_block + i,
+                extent.physical_start + u64::from(i),
+                &tree_hint,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Block-map metadata blocks of a directory: extent-tree index/leaf nodes,
+    /// or the pointer blocks of a legacy indirect-mapped directory.
+    fn ext4_dir_map_meta_blocks(
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        indirect: bool,
+        root_bytes: &[u8; 60],
+        block_size: u32,
+    ) -> Result<u64, FfsError> {
+        if indirect {
+            Self::ext4_ind_meta_blocks(cx, dev, root_bytes, block_size)
+        } else {
+            Self::ext4_count_extent_tree_meta_blocks_via_dev(cx, dev, root_bytes)
+        }
+    }
+
     /// Free a single filesystem block back to the allocator (bitmap + group
     /// descriptor counts), persisting the update.
     fn free_one_block(
@@ -26201,6 +26705,7 @@ impl OpenFs {
             uid,
             gid,
             is_directory,
+            sb.has_incompat(ffs_ondisk::Ext4IncompatFeatures::EXTENTS),
             new_generation,
             now_secs,
             now_nsec,
@@ -27277,7 +27782,21 @@ impl OpenFs {
         };
         let mut root_bytes = Self::extent_root(&new_inode);
         block_dev = self.block_device_adapter();
-        {
+        if Self::ext4_inode_block_map_is_indirect(&new_inode) {
+            // No EXTENTS feature: the first block is direct pointer i_block[0].
+            let mut backend = SingleLockDirAlloc { alloc: &mut alloc };
+            Self::ext4_dir_map_extent(
+                cx,
+                &block_dev,
+                &mut backend,
+                true,
+                &mut root_bytes,
+                extent,
+                u32::try_from(ino.0).unwrap_or(u32::MAX),
+                new_inode.generation,
+                AllocHint::default(),
+            )?;
+        } else {
             let Ext4AllocState {
                 geo,
                 groups,
@@ -27510,9 +28029,12 @@ impl OpenFs {
             "ext4_mkdir_sharded_extent_tree",
             Some(ino),
         );
-        if let Err(err) = backend.dir_insert_extent(
+        let indirect = Self::ext4_inode_block_map_is_indirect(&new_inode);
+        if let Err(err) = Self::ext4_dir_map_extent(
             cx,
             &dev,
+            &mut backend,
+            indirect,
             &mut root_bytes,
             extent,
             ino_u32,
@@ -28320,11 +28842,14 @@ impl OpenFs {
         // counts only the new directory data block. Read via `dev` so the
         // freshly-staged tree blocks in this txn are visible (bd-kyp2q). The
         // common case (tree still inline) costs no device reads (depth 0 → 0).
+        let indirect = Self::ext4_inode_block_map_is_indirect(&parent_upd);
         let dir_meta_before =
-            Self::ext4_count_extent_tree_meta_blocks_via_dev(cx, dev, &root_bytes)?;
-        backend.dir_insert_extent(
+            Self::ext4_dir_map_meta_blocks(cx, dev, indirect, &root_bytes, geo.block_size)?;
+        Self::ext4_dir_map_extent(
             cx,
             dev,
+            backend,
+            indirect,
             &mut root_bytes,
             extent,
             u32::try_from(parent.0).unwrap_or(u32::MAX),
@@ -28332,7 +28857,7 @@ impl OpenFs {
             tree_hint,
         )?;
         let dir_meta_after =
-            Self::ext4_count_extent_tree_meta_blocks_via_dev(cx, dev, &root_bytes)?;
+            Self::ext4_dir_map_meta_blocks(cx, dev, indirect, &root_bytes, geo.block_size)?;
         self.invalidate_ext4_write_extent_snapshot(&parent_upd);
         Self::set_extent_root(&mut parent_upd, &root_bytes);
         self.extent_cache.invalidate_range(
@@ -28563,11 +29088,14 @@ impl OpenFs {
             Some(parent),
         );
         let parent_extent_ns = extent_cache_namespace(&parent_upd);
+        let indirect = Self::ext4_inode_block_map_is_indirect(&parent_upd);
         let dir_meta_before =
-            Self::ext4_count_extent_tree_meta_blocks_via_dev(cx, dev, &root_bytes)?;
-        backend.dir_insert_extent(
+            Self::ext4_dir_map_meta_blocks(cx, dev, indirect, &root_bytes, geo.block_size)?;
+        Self::ext4_dir_map_extent(
             cx,
             dev,
+            backend,
+            indirect,
             &mut root_bytes,
             extent,
             parent_ino_u32,
@@ -28575,7 +29103,7 @@ impl OpenFs {
             tree_hint,
         )?;
         let dir_meta_after =
-            Self::ext4_count_extent_tree_meta_blocks_via_dev(cx, dev, &root_bytes)?;
+            Self::ext4_dir_map_meta_blocks(cx, dev, indirect, &root_bytes, geo.block_size)?;
         self.invalidate_ext4_write_extent_snapshot(&parent_upd);
         Self::set_extent_root(&mut parent_upd, &root_bytes);
         self.extent_cache.invalidate_range(
@@ -28785,11 +29313,14 @@ impl OpenFs {
             Some(parent),
         );
         let parent_extent_ns = extent_cache_namespace(&parent_upd);
+        let indirect = Self::ext4_inode_block_map_is_indirect(&parent_upd);
         let dir_meta_before =
-            Self::ext4_count_extent_tree_meta_blocks_via_dev(cx, dev, &root_bytes)?;
-        backend.dir_insert_extent(
+            Self::ext4_dir_map_meta_blocks(cx, dev, indirect, &root_bytes, geo.block_size)?;
+        Self::ext4_dir_map_extent(
             cx,
             dev,
+            backend,
+            indirect,
             &mut root_bytes,
             extent,
             parent_ino_u32,
@@ -28797,7 +29328,7 @@ impl OpenFs {
             tree_hint,
         )?;
         let dir_meta_after =
-            Self::ext4_count_extent_tree_meta_blocks_via_dev(cx, dev, &root_bytes)?;
+            Self::ext4_dir_map_meta_blocks(cx, dev, indirect, &root_bytes, geo.block_size)?;
         self.invalidate_ext4_write_extent_snapshot(&parent_upd);
         Self::set_extent_root(&mut parent_upd, &root_bytes);
         self.extent_cache.invalidate_range(
@@ -29049,8 +29580,9 @@ impl OpenFs {
         // directory: the per-logical-block inserts below grow the tree and the
         // tail truncate may shrink it, neither charged by the data-block delta.
         // Read via `dev` so the txn-staged tree blocks are visible (bd-kyp2q).
+        let indirect = Self::ext4_inode_block_map_is_indirect(&parent_upd);
         let dir_meta_before =
-            Self::ext4_count_extent_tree_meta_blocks_via_dev(cx, dev, &root_bytes)?;
+            Self::ext4_dir_map_meta_blocks(cx, dev, indirect, &root_bytes, geo.block_size)?;
         let mut allocated: u32 = 0;
         for (i, blk) in new_blocks.iter().enumerate() {
             let logical =
@@ -29065,9 +29597,11 @@ impl OpenFs {
                     raw_len: 1,
                     physical_start: ba.start.0,
                 };
-                backend.dir_insert_extent(
+                Self::ext4_dir_map_extent(
                     cx,
                     dev,
+                    backend,
+                    indirect,
                     &mut root_bytes,
                     extent,
                     parent_ino_u32,
@@ -29078,7 +29612,9 @@ impl OpenFs {
             }
         }
 
-        let freed: u64 = if m_blocks < n_blocks {
+        let freed: u64 = if m_blocks < n_blocks && indirect {
+            Self::ext4_ind_truncate(cx, dev, backend, &mut root_bytes, m_blocks)?
+        } else if m_blocks < n_blocks {
             backend.dir_truncate_extents(
                 cx,
                 dev,
@@ -29108,7 +29644,7 @@ impl OpenFs {
         // — the data-block delta above counts only the rebuilt data blocks
         // (bd-kyp2q).
         let dir_meta_after =
-            Self::ext4_count_extent_tree_meta_blocks_via_dev(cx, dev, &root_bytes)?;
+            Self::ext4_dir_map_meta_blocks(cx, dev, indirect, &root_bytes, geo.block_size)?;
         Self::ext4_apply_extent_meta_delta(
             &mut parent_upd,
             parent,
@@ -30299,6 +30835,42 @@ impl OpenFs {
                     inode.extent_bytes.fill(0);
                     inode.extent_bytes[..target_bytes.len()].copy_from_slice(target_bytes);
                     inode.blocks = 0;
+                } else if inode.flags & EXT4_EXTENTS_FL == 0 {
+                    // No EXTENTS feature (ext2/ext3): the target block is
+                    // direct pointer i_block[0], as ext4_symlink maps it.
+                    let hint = self.numa_allocation_hint(
+                        geo,
+                        AllocHint::default(),
+                        "ext4_symlink",
+                        Some(ino),
+                    );
+                    let block = ffs_alloc::alloc_blocks_persist(
+                        cx,
+                        &tx_dev,
+                        geo,
+                        groups,
+                        1,
+                        &hint,
+                        persist_ctx,
+                    )?
+                    .start;
+                    let mut data = vec![0; block_size];
+                    data[..target_bytes.len()].copy_from_slice(target_bytes);
+                    tx_dev.write_block(cx, block, &data)?;
+                    let ptr = u32::try_from(block.0).map_err(|_| {
+                        FfsError::InvalidGeometry(format!(
+                            "symlink block {} exceeds the 32-bit pointer range",
+                            block.0
+                        ))
+                    })?;
+                    inode.extent_bytes.resize(60, 0);
+                    inode.extent_bytes.fill(0);
+                    inode.extent_bytes[..4].copy_from_slice(&ptr.to_le_bytes());
+                    inode.blocks = Self::ext4_checked_inode_blocks_delta(
+                        0,
+                        ino,
+                        i128::from(sb.block_size / EXT4_SECTOR_SIZE),
+                    )?;
                 } else {
                     let mut root_bytes = Self::extent_root(&inode);
                     let hint = self.numa_allocation_hint(
@@ -70541,6 +71113,168 @@ mod tests {
             clean,
             "e2fsck must accept a file whose extent tree grew to depth >= 1:\n{output}"
         );
+    }
+
+    /// A writable FrankenFS over a fresh 1 KiB-block `mke2fs -t <fs_type>`
+    /// image (ext2/ext3 have no EXTENTS feature). `None` without e2fsprogs.
+    fn open_legacy_mke2fs(
+        size_mb: u64,
+        fs_type: &str,
+        features: Option<&str>,
+    ) -> Option<(OpenFs, TestDevice, tempfile::TempDir, std::path::PathBuf)> {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let image = tmp.path().join("legacy.img");
+        std::fs::File::create(&image)
+            .and_then(|f| f.set_len(size_mb << 20))
+            .expect("create image");
+        let mut cmd = std::process::Command::new("mke2fs");
+        cmd.args(["-q", "-t", fs_type, "-b", "1024", "-F"]);
+        if let Some(features) = features {
+            cmd.args(["-O", features]);
+        }
+        if !matches!(cmd.arg(&image).output(), Ok(o) if o.status.success()) {
+            oracle_unavailable("mke2fs (e2fsprogs)");
+            return None;
+        }
+        let cx = Cx::for_testing();
+        let dev = TestDevice::from_vec(std::fs::read(&image).expect("read image"));
+        let mut fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default())
+            .expect("open legacy image");
+        fs.enable_writes(&cx).expect("enable writes");
+        Some((fs, dev, tmp, image))
+    }
+
+    /// ext2/ext3 have no EXTENTS feature, so the kernel maps every inode through
+    /// legacy `i_block` pointers. FrankenFS gave new inodes an extent root and
+    /// could not insert into a pointer-mapped directory: on a read-write mount
+    /// of an ext3 image every create failed with "invalid magic: expected
+    /// 0xf30a" after allocating its inode, leaving e2fsck reporting inodes "in
+    /// extent format, but superblock is missing EXTENTS feature" and
+    /// unattached inodes. Exercise the namespace on both formats: a file whose
+    /// data reaches the double-indirect range, fast and slow symlinks,
+    /// subdirectories, rename, unlink and rmdir.
+    #[test]
+    fn ext2_ext3_namespace_uses_pointer_maps_and_passes_e2fsck() {
+        for fs_type in ["ext2", "ext3"] {
+            let Some((fs, dev, _tmp, image)) = open_legacy_mke2fs(32, fs_type, None) else {
+                return;
+            };
+            let cx = Cx::for_testing();
+            let root = InodeNumber(2);
+            let dir = fs
+                .mkdir(&cx, root, OsStr::new("dir"), 0o755, 0, 0)
+                .expect("mkdir");
+            let file = fs
+                .create(&cx, dir.ino, OsStr::new("data.bin"), 0o644, 0, 0)
+                .expect("create");
+            // 300 KiB = 300 blocks: past the 12 direct and 256 single-indirect.
+            let payload: Vec<u8> = (0..300 * 1024_u32).map(|i| (i % 251) as u8).collect();
+            fs.write(&cx, file.ino, 0, &payload).expect("write");
+            let slow_target = "t".repeat(200);
+            fs.symlink(
+                &cx,
+                dir.ino,
+                OsStr::new("slow"),
+                Path::new(&slow_target),
+                0,
+                0,
+            )
+            .expect("slow symlink");
+            fs.symlink(&cx, dir.ino, OsStr::new("fast"), Path::new("short"), 0, 0)
+                .expect("fast symlink");
+            fs.mkdir(&cx, dir.ino, OsStr::new("sub"), 0o755, 0, 0)
+                .expect("subdir");
+            fs.rename(&cx, dir.ino, OsStr::new("sub"), root, OsStr::new("moved"))
+                .expect("rename directory");
+            fs.create(&cx, root, OsStr::new("gone"), 0o644, 0, 0)
+                .expect("create");
+            fs.unlink(&cx, root, OsStr::new("gone")).expect("unlink");
+            fs.rmdir(&cx, root, OsStr::new("moved")).expect("rmdir");
+
+            for ino in [dir.ino, file.ino] {
+                let inode = fs.read_inode(&cx, ino).expect("inode");
+                assert_eq!(inode.flags & EXT4_EXTENTS_FL, 0, "{fs_type}: ino {ino:?}");
+            }
+            let len = u32::try_from(payload.len()).unwrap();
+            assert_eq!(fs.read(&cx, file.ino, 0, len).expect("read"), payload);
+            let slow = fs.lookup(&cx, dir.ino, OsStr::new("slow")).expect("lookup");
+            assert_eq!(
+                fs.readlink(&cx, slow.ino).expect("readlink"),
+                slow_target.as_bytes()
+            );
+
+            fs.flush_mvcc_to_device(&cx).expect("flush mvcc");
+            std::fs::write(&image, dev.snapshot_bytes()).expect("write image");
+            let Some((clean, output)) = run_e2fsck(&image) else {
+                return;
+            };
+            assert!(clean, "{fs_type}: e2fsck must accept the image:\n{output}");
+        }
+    }
+
+    /// A pointer-mapped directory grows through the 12 direct pointers and
+    /// the single-indirect block into a double-indirect block (1 KiB blocks:
+    /// logical block >= 268), both hashed (dir_index, rebuilt as it grows) and
+    /// linear; then loses a third of its entries and is renamed into. Every
+    /// name must stay reachable and e2fsck must accept the block map and the
+    /// i_blocks count, which includes the pointer blocks.
+    #[test]
+    fn ext3_pointer_mapped_directory_grows_into_double_indirect() {
+        for features in ["dir_index", "^dir_index"] {
+            let Some((fs, dev, _tmp, image)) = open_legacy_mke2fs(64, "ext3", Some(features))
+            else {
+                return;
+            };
+            let cx = Cx::for_testing();
+            let root = InodeNumber(2);
+            let dir = fs
+                .mkdir(&cx, root, OsStr::new("big"), 0o755, 0, 0)
+                .expect("mkdir");
+            // 56-byte names: rec_len 64, 16 entries per 1 KiB block, so 4600
+            // entries need > 268 blocks.
+            let name = |i: u32| format!("{i:0>8}-a-reasonably-long-name-to-fill-blocks-fast-xx");
+            let count = 4600_u32;
+            for i in 0..count {
+                fs.create(&cx, dir.ino, OsStr::new(&name(i)), 0o644, 0, 0)
+                    .unwrap_or_else(|e| panic!("{features}: create {i}: {e}"));
+            }
+            let inode = fs.read_inode(&cx, dir.ino).expect("dir inode");
+            assert_eq!(inode.flags & EXT4_EXTENTS_FL, 0);
+            assert_ne!(
+                u32::from_le_bytes(inode.extent_bytes[52..56].try_into().unwrap()),
+                0,
+                "{features}: the directory must reach its double-indirect block"
+            );
+            for i in (0..count).step_by(3) {
+                fs.unlink(&cx, dir.ino, OsStr::new(&name(i)))
+                    .expect("unlink");
+            }
+            for i in (1..count).step_by(97).filter(|i| i % 3 != 0) {
+                fs.rename(
+                    &cx,
+                    dir.ino,
+                    OsStr::new(&name(i)),
+                    dir.ino,
+                    OsStr::new(&format!("r{i}")),
+                )
+                .expect("rename");
+            }
+            for i in 0..count {
+                let found = fs.lookup(&cx, dir.ino, OsStr::new(&name(i))).is_ok();
+                let expected = i % 3 != 0 && i % 97 != 1;
+                assert_eq!(found, expected, "{features}: lookup {i}");
+            }
+
+            fs.flush_mvcc_to_device(&cx).expect("flush mvcc");
+            std::fs::write(&image, dev.snapshot_bytes()).expect("write image");
+            let Some((clean, output)) = run_e2fsck(&image) else {
+                return;
+            };
+            assert!(
+                clean,
+                "{features}: e2fsck must accept the directory:\n{output}"
+            );
+        }
     }
 
     /// Read-only-compatible features this writer cannot maintain keep the image
