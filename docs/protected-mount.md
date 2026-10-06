@@ -107,8 +107,49 @@ the verified source-byte count and `consistency: "per_read_not_snapshot"`. Foreg
 writes may advance the intended generation between batches. This is **not** a
 point-in-time filesystem integrity proof or parity-health attestation: intact source
 bytes do not force a scan or regeneration of every repair symbol. No repair count is
-inferred from the byte count. Replenishing damaged parity remains the device's separate
-clean-boundary scrub/refresh operation.
+inferred from the byte count. Add the separate parity option below to maintain repair
+symbols as well as scanning source bytes.
+
+### Background parity maintenance
+
+`--scrub-parity` adds clean-boundary source/parity maintenance to the same joined
+worker. It requires `--scrub-interval-secs` and conflicts with `--check`; source-only
+scrubbing and ordinary mount defaults do not change.
+
+```sh
+cargo run -p ffs-cli --bin ffs-protected-mount -- \
+  image.ext4 image.ffsrq /path/to/empty/mountpoint \
+  --exclusive-image --allow-repair --rw \
+  --scrub-interval-secs 300 --scrub-parity
+```
+
+After each completed source pass, maintenance attempts at most 64 device steps.
+Ordinary steps check one source group, its admitted digest table and every repair
+symbol, releasing the serializer between groups. A busy device or pending caller
+writes defer maintenance without touching bytes or reporting a completed parity
+pass. Progress resumes after the next source pass; large images can therefore need
+multiple source passes for one parity pass. Every successful archive publication
+restarts that progress at group zero, even when its bytes are identical. Sustained
+writes may postpone parity completion; the worker never forces a write epoch clean
+to make maintenance progress, and repeated restarts cannot consume unbounded steps
+within one source pass.
+
+After all groups verify, damaged parity or header bytes trigger the existing
+verified atomic archive replacement. **This exceptional final step rescans the
+whole image under the serializer and may block foreground I/O.** It is not a
+low-latency operation. Clean admission and finalization use the actual source-write
+lock, so a write cannot race a separate cleanliness check. Unrecoverable source
+data, transplanted metadata, I/O and publication failures remain errors, not
+permission to regenerate protection from unknown bytes.
+
+A completed maintenance pass emits `protected_parity_scrub_pass` on stderr with
+`consistency: "per_group_not_snapshot"`, group and real-byte counts,
+`invalid_repair_symbols_observed`, and `archive_rebuilt`. The
+`source_blocks_recovered_during_steps` count covers only successful group steps in
+that pass, excluding interrupted/restarted passes and final-refresh repairs. Neither
+event claims point-in-time consistency or durable publication of pending filesystem
+writes. A parity repair or reporting failure requests managed unmount just like a
+source-scan failure; the same guard joins the worker before filesystem cleanup.
 
 An unrecoverable read, evidence-output failure, or unwinding worker panic requests
 managed unmount and is returned as an error. Panic-abort builds terminate the process
@@ -184,3 +225,16 @@ cargo test -p ffs-cli --bin ffs-protected-mount scrub::
 
 The implementation environment lacked Rust/Cargo/rustfmt/RCH for this extension too.
 These are added regression cases, not claimed executed tests or mounted acceptance.
+
+Parity-maintenance regressions cover pending/busy deferral, bounded restart work,
+epoch and reopen identity, late header damage, cancellation and publication errors.
+The CLI worker cases damage all repair symbols for a tail group, replenish them,
+reopen the image/archive, and recover newly injected source damage using the new
+symbols. They also preserve the source-only mode and reject completion claims on
+deferral or reporting failure. The new cases require Rust execution; they were not
+run in the implementation environment, which still lacks the Rust/RCH toolchain.
+
+```sh
+cargo test -p ffs-repair incremental_scrub
+cargo test -p ffs-cli --bin ffs-protected-mount scrub::tests::parity_
+```

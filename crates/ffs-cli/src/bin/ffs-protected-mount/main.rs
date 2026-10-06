@@ -299,6 +299,7 @@ fn serve(
                     Arc::clone(&prepared.device),
                     Arc::clone(&flag),
                     std::time::Duration::from_secs(seconds),
+                    args.scrub.parity,
                 )
             })
             .transpose()

@@ -479,14 +479,16 @@ fn command_scrub_option_is_explicit_bounded_and_requires_a_mount() {
     );
     assert!(
         Options {
-            interval_secs: Some(300)
+            interval_secs: Some(300),
+            ..Options::default()
         }
         .validate(true)
         .is_err()
     );
     assert!(
         Options {
-            interval_secs: Some(0)
+            interval_secs: Some(0),
+            ..Options::default()
         }
         .validate(false)
         .is_err()
@@ -522,4 +524,285 @@ fn background_worker_repairs_real_sidecar_source_without_a_foreground_read() {
     assert_eq!(Arc::strong_count(&device), 1);
     assert_eq!(std::fs::read(&fixture.image).unwrap(), fixture.original);
     assert_eq!(std::fs::read(&fixture.sidecar).unwrap(), archive);
+}
+
+#[test]
+fn parity_option_requires_an_explicit_source_schedule_and_never_changes_defaults() {
+    let base = [
+        "ffs-protected-mount", "image", "archive", "mountpoint",
+        "--exclusive-image", "--allow-repair",
+    ];
+    assert!(!crate::Args::try_parse_from(base).unwrap().scrub.parity);
+    assert!(crate::Args::try_parse_from(base.into_iter().chain(["--scrub-parity"])).is_err());
+    for rw in [false, true] {
+        let mut argv = base.to_vec();
+        argv.extend(["--scrub-parity", "--scrub-interval-secs", "300"]);
+        if rw {
+            argv.push("--rw");
+        }
+        let args = crate::Args::try_parse_from(argv).unwrap();
+        assert!(args.scrub.parity);
+        args.scrub.validate(false).unwrap();
+        assert!(args.scrub.validate(true).is_err());
+        assert_eq!(crate::mount_options(&args).read_only, !rw);
+    }
+    assert!(Options { parity: true, ..Options::default() }.validate(false).is_err());
+    assert!(crate::Args::try_parse_from([
+        "ffs-protected-mount", "image", "archive", "--check",
+        "--exclusive-image", "--allow-repair", "--scrub-parity",
+        "--scrub-interval-secs", "300",
+    ]).is_err());
+}
+
+#[test]
+fn parity_deferrals_never_count_as_success_or_spin_inside_a_source_pass() {
+    for deferred in [ProtectionScrubStep::Busy, ProtectionScrubStep::PendingWrites] {
+        let mut maintenance = ProtectionMaintenance::default();
+        let mut calls = 0;
+        maintenance.batch(
+            &Cx::for_testing(),
+            &AtomicBool::new(false),
+            |_| {
+                calls += 1;
+                Ok(deferred)
+            },
+            |_| panic!("deferral is not a completed protection pass"),
+        ).unwrap();
+        assert_eq!(calls, 1);
+        assert_eq!(maintenance.completed_passes, 0);
+    }
+}
+
+#[test]
+fn parity_epoch_restarts_cannot_starve_the_next_source_pass() {
+    let mut maintenance = ProtectionMaintenance::default();
+    let mut calls = 0;
+    for _ in 0..2 {
+        maintenance.batch(
+            &Cx::for_testing(),
+            &AtomicBool::new(false),
+            |_| {
+                calls += 1;
+                // A writer could publish a new epoch before every step, so
+                // each admitted step could restart at group zero indefinitely.
+                Ok(ProtectionScrubStep::GroupVerified { group: 0 })
+            },
+            |_| panic!("repeated restarts do not prove complete coverage"),
+        ).unwrap();
+    }
+    assert_eq!(calls, 2 * PROTECTION_STEPS_PER_PASS);
+    assert_eq!(maintenance.completed_passes, 0);
+}
+
+#[test]
+fn parity_shutdown_and_preexisting_cancellation_do_not_touch_storage() {
+    for cancelled in [false, true] {
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(cancelled);
+        let mut maintenance = ProtectionMaintenance::default();
+        let result = maintenance.batch(
+            &cx,
+            &AtomicBool::new(!cancelled),
+            |_| panic!("stopped worker must do no storage work"),
+            |_| panic!("stopped worker must not report completion"),
+        );
+        if cancelled {
+            assert!(matches!(result.unwrap_err().downcast_ref::<FfsError>(), Some(FfsError::Cancelled)));
+        } else {
+            result.unwrap();
+        }
+        assert_eq!(maintenance.completed_passes, 0);
+    }
+}
+
+#[test]
+fn parity_io_and_report_errors_survive_a_racing_shutdown() {
+    for io_error in [false, true] {
+        let shutdown = AtomicBool::new(false);
+        let mut maintenance = ProtectionMaintenance::default();
+        let error = maintenance.batch(
+            &Cx::for_testing(),
+            &shutdown,
+            |_| {
+                if io_error {
+                    shutdown.store(true, Ordering::Release);
+                    Err(FfsError::Io(std::io::Error::other("parity read failure")))
+                } else {
+                    Ok(ProtectionScrubStep::Complete(ProtectionScrubReport::default()))
+                }
+            },
+            |_| {
+                shutdown.store(true, Ordering::Release);
+                bail!("parity evidence failure")
+            },
+        ).unwrap_err();
+        let expected = if io_error { "parity read failure" } else { "parity evidence failure" };
+        assert!(format!("{error:#}").contains(expected));
+    }
+}
+
+impl Fixture {
+    fn damage_tail_parity(&self) {
+        // The FFSRQSC2 fixture ends with four (u32 ESI, 512-byte symbol,
+        // 32-byte digest) records. Corrupt each digest, not source metadata.
+        let file = File::options().read(true).write(true).open(&self.sidecar).unwrap();
+        let length = file.metadata().unwrap().len();
+        for index in 0..4_u64 {
+            let offset = length - 1 - index * (4 + 512 + 32);
+            let mut byte = [0];
+            file.read_exact_at(&mut byte, offset).unwrap();
+            byte[0] ^= 1;
+            file.write_all_at(&byte, offset).unwrap();
+        }
+        file.sync_all().unwrap();
+    }
+}
+
+#[test]
+fn parity_worker_replenishes_symbols_that_source_only_reads_do_not_inspect() {
+    let fixture = Fixture::new();
+    let device = Arc::new(fixture.open());
+    fixture.damage_tail_parity();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let finish = Arc::clone(&shutdown);
+    let source_passes = Arc::new(AtomicU64::new(0));
+    let source_count = Arc::clone(&source_passes);
+    let (sent, reports) = mpsc::sync_channel(1);
+    let mut guard = ScrubGuard::start_with_reports(
+        &Cx::for_testing(),
+        Arc::clone(&device),
+        shutdown,
+        Duration::from_secs(86_400),
+        true,
+        move |report| {
+            source_count.store(report.completed_passes, Ordering::Release);
+            Ok(())
+        },
+        move |report| {
+            sent.send(serde_json::to_value(report)?).unwrap();
+            finish.store(true, Ordering::Release);
+            Ok(())
+        },
+    ).unwrap();
+    let report = reports.recv_timeout(Duration::from_secs(30)).unwrap();
+    guard.stop().unwrap();
+    assert_eq!(source_passes.load(Ordering::Acquire), 1);
+    assert_eq!(report["event"], "protected_parity_scrub_pass");
+    assert_eq!(report["consistency"], "per_group_not_snapshot");
+    assert_eq!(report["groups_verified"].as_u64(), Some(33));
+    assert_eq!(report["source_bytes_verified"].as_u64(), Some(u64::try_from(fixture.original.len()).unwrap()));
+    assert_eq!(report["invalid_repair_symbols_observed"].as_u64(), Some(4));
+    assert_eq!(report["source_blocks_recovered_during_steps"].as_u64(), Some(0));
+    assert_eq!(report["archive_rebuilt"].as_bool(), Some(true));
+    assert_eq!(Arc::strong_count(&device), 1, "worker retained the device after join");
+    assert_eq!(std::fs::read(&fixture.image).unwrap(), fixture.original);
+    drop(device);
+    assert!(verify(&Cx::for_testing(), &fixture.image, &fixture.sidecar).unwrap().is_healthy());
+    let reopened = fixture.open();
+    // The sole source block in the final group must recover using the symbols
+    // that were completely unusable before the worker replenished them.
+    fixture.damage(READ_BYTES * 2, 37);
+    let mut tail = [0; 37];
+    reopened.read_exact_at(&Cx::for_testing(), ByteOffset(u64::try_from(READ_BYTES * 2).unwrap()), &mut tail).unwrap();
+    assert_eq!(tail.as_slice(), &fixture.original[READ_BYTES * 2..]);
+}
+
+#[test]
+fn parity_disabled_worker_does_not_republish_damaged_protection() {
+    let fixture = Fixture::new();
+    let device = Arc::new(fixture.open());
+    fixture.damage_tail_parity();
+    let archive = std::fs::read(&fixture.sidecar).unwrap();
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let finish = Arc::clone(&shutdown);
+    let (sent, reports) = mpsc::sync_channel(1);
+    let mut guard = ScrubGuard::start_with_reports(
+        &Cx::for_testing(),
+        Arc::clone(&device),
+        shutdown,
+        Duration::ZERO,
+        false,
+        move |report| {
+            // Leave shutdown false after the first pass. An accidentally
+            // enabled parity path must not be masked by early cancellation.
+            if report.completed_passes == 2 {
+                sent.send(()).unwrap();
+                finish.store(true, Ordering::Release);
+            }
+            Ok(())
+        },
+        |_| panic!("parity mode was not authorized"),
+    ).unwrap();
+    reports.recv_timeout(Duration::from_secs(30)).unwrap();
+    guard.stop().unwrap();
+    assert_eq!(Arc::strong_count(&device), 1);
+    assert_eq!(std::fs::read(&fixture.sidecar).unwrap(), archive);
+    drop(device);
+    let report = verify(&Cx::for_testing(), &fixture.image, &fixture.sidecar).unwrap();
+    assert_eq!(report.invalid_repair_symbols, 4);
+    assert!(report.matches_snapshot);
+}
+
+#[test]
+fn parity_maintenance_defers_real_pending_writes_until_the_writer_syncs() {
+    let fixture = Fixture::new();
+    let device = fixture.open();
+    let cx = Cx::for_testing();
+    device.write_all_at(&cx, ByteOffset(0), &[0x65; 512]).unwrap();
+    fixture.damage_tail_parity();
+    let source = std::fs::read(&fixture.image).unwrap();
+    let pending = std::fs::read(&fixture.sidecar).unwrap();
+    let mut maintenance = ProtectionMaintenance::default();
+    maintenance.batch(
+        &cx,
+        &AtomicBool::new(false),
+        |cursor| device.scrub_step(&cx, cursor),
+        |_| panic!("pending writes cannot be published by maintenance"),
+    ).unwrap();
+    assert!(device.protection(&cx).is_err());
+    assert_eq!(maintenance.completed_passes, 0);
+    assert_eq!(std::fs::read(&fixture.image).unwrap(), source);
+    assert_eq!(std::fs::read(&fixture.sidecar).unwrap(), pending);
+    device.sync(&cx).unwrap(); // The WRITER explicitly publishes its epoch.
+    let mut reports = 0;
+    maintenance.batch(
+        &cx,
+        &AtomicBool::new(false),
+        |cursor| device.scrub_step(&cx, cursor),
+        |report| {
+            reports += 1;
+            assert_eq!(report.invalid_repair_symbols_observed, 0);
+            assert!(!report.archive_rebuilt);
+            assert_eq!(report.completed_passes, 1);
+            Ok(())
+        },
+    ).unwrap();
+    assert_eq!(reports, 1);
+    drop(device);
+    assert!(verify(&cx, &fixture.image, &fixture.sidecar).unwrap().is_healthy());
+}
+
+#[test]
+fn parity_report_failure_requests_unmount_and_is_not_hidden_by_join() {
+    let fixture = Fixture::new();
+    let device = Arc::new(fixture.open());
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let (sent, reports) = mpsc::sync_channel(1);
+    let mut guard = ScrubGuard::start_with_reports(
+        &Cx::for_testing(),
+        Arc::clone(&device),
+        Arc::clone(&shutdown),
+        Duration::from_secs(86_400),
+        true,
+        |_| Ok(()),
+        move |_| {
+            sent.send(()).unwrap();
+            bail!("injected parity report failure")
+        },
+    ).unwrap();
+    reports.recv_timeout(Duration::from_secs(30)).unwrap();
+    let error = guard.stop().unwrap_err();
+    assert!(format!("{error:#}").contains("injected parity report failure"));
+    assert!(shutdown.load(Ordering::Acquire));
+    assert_eq!(Arc::strong_count(&device), 1);
 }

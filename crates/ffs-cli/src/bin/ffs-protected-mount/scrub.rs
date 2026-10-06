@@ -1,15 +1,18 @@
-//! Mount-owned source scrubbing through the admitted repair device.
+//! Mount-owned source and optional parity scrubbing through the admitted device.
 //!
 //! Never calls `sync`, writes caller data, or opens the image independently.
 //! Each read verifies the device's current intended bytes and may perform its
-//! existing generation-checked repair. A pass is not a filesystem snapshot and
-//! does not attest parity health or publish outstanding filesystem writes.
+//! existing generation-checked repair. Optional parity maintenance uses clean,
+//! resumable device steps; it never publishes outstanding filesystem writes.
+//! Reports describe source reads or protection-group observations, not snapshots.
 
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
 use ffs_block::ByteDevice;
 use ffs_error::FfsError;
-use ffs_repair::sidecar::live::SidecarImageDevice;
+use ffs_repair::sidecar::live::{
+    ProtectionScrubCursor, ProtectionScrubReport, ProtectionScrubStep, SidecarImageDevice,
+};
 use ffs_types::ByteOffset;
 use serde::Serialize;
 use std::io::Write;
@@ -21,6 +24,9 @@ use std::time::{Duration, Instant};
 const READ_BYTES: usize = 64 * 1024;
 const STOP_POLL: Duration = Duration::from_millis(20);
 const BETWEEN_READS: Duration = Duration::from_millis(1);
+// A busy writer can continually replace the protection epoch and restart a
+// cursor. Bound work per source pass even when every step reports progress.
+const PROTECTION_STEPS_PER_PASS: usize = 64;
 
 #[derive(Debug, Default, clap::Args)]
 pub(super) struct Options {
@@ -31,10 +37,20 @@ pub(super) struct Options {
         value_parser = clap::value_parser!(u64).range(1..=86_400)
     )]
     pub(super) interval_secs: Option<u64>,
+    /// Also check and replenish repair symbols at clean device boundaries.
+    #[arg(
+        long = "scrub-parity",
+        requires = "interval_secs",
+        conflicts_with = "check"
+    )]
+    pub(super) parity: bool,
 }
 
 impl Options {
     pub(super) fn validate(&self, check: bool) -> Result<()> {
+        if self.parity && self.interval_secs.is_none() {
+            bail!("--scrub-parity requires --scrub-interval-secs");
+        }
         if let Some(seconds) = self.interval_secs {
             if check {
                 bail!("--scrub-interval-secs requires a mount, not --check");
@@ -98,13 +114,83 @@ struct PassReport {
     consistency: &'static str,
 }
 
-fn emit(report: &PassReport) -> Result<()> {
+fn emit(report: &impl Serialize) -> Result<()> {
     // Keep mount lifecycle events on stdout; scrub evidence is JSONL on stderr.
     let mut out = std::io::stderr().lock();
     serde_json::to_writer(&mut out, report)?;
     writeln!(out)?;
     out.flush()?;
     Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct ProtectionPassReport {
+    event: &'static str,
+    completed_passes: u64,
+    groups_verified: u32,
+    source_bytes_verified: u64,
+    source_blocks_recovered_during_steps: u64,
+    invalid_repair_symbols_observed: u64,
+    archive_rebuilt: bool,
+    consistency: &'static str,
+}
+
+impl ProtectionPassReport {
+    const fn new(completed_passes: u64, report: ProtectionScrubReport) -> Self {
+        Self {
+            event: "protected_parity_scrub_pass",
+            completed_passes,
+            groups_verified: report.groups_verified,
+            source_bytes_verified: report.source_bytes_verified,
+            source_blocks_recovered_during_steps: report.source_blocks_recovered,
+            invalid_repair_symbols_observed: report.invalid_repair_symbols,
+            archive_rebuilt: report.archive_rebuilt,
+            consistency: "per_group_not_snapshot",
+        }
+    }
+}
+
+#[derive(Default)]
+struct ProtectionMaintenance {
+    cursor: ProtectionScrubCursor,
+    completed_passes: u64,
+}
+
+impl ProtectionMaintenance {
+    /// Resume one bounded batch after a complete source scan. Deferral retains
+    /// the cursor but does not count as a completed parity pass. The library
+    /// restarts this private cursor if a foreground sync publishes a new epoch.
+    fn batch(
+        &mut self,
+        cx: &Cx,
+        shutdown: &AtomicBool,
+        mut step: impl FnMut(&mut ProtectionScrubCursor) -> ffs_error::Result<ProtectionScrubStep>,
+        mut report: impl FnMut(&ProtectionPassReport) -> Result<()>,
+    ) -> Result<()> {
+        // The worker's stop() cancels this same Cx. Managed/external unmount
+        // sets shutdown; no independent unjoined task or cleanup Cx is used.
+        let stop = AtomicBool::new(false);
+        for _ in 0..PROTECTION_STEPS_PER_PASS {
+            if shutdown.load(Ordering::Acquire) {
+                return Ok(());
+            }
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            match step(&mut self.cursor).context("protected parity scrub")? {
+                ProtectionScrubStep::Busy | ProtectionScrubStep::PendingWrites => return Ok(()),
+                ProtectionScrubStep::GroupVerified { .. } => {
+                    if !wait(cx, &stop, shutdown, BETWEEN_READS)? {
+                        return Ok(());
+                    }
+                }
+                ProtectionScrubStep::Complete(observed) => {
+                    self.completed_passes = self.completed_passes.saturating_add(1);
+                    report(&ProtectionPassReport::new(self.completed_passes, observed))?;
+                    return Ok(());
+                }
+            }
+        }
+        Ok(())
+    }
 }
 
 /// A joined blocking-I/O worker with the same Cx cancellation authority as
@@ -123,8 +209,38 @@ impl ScrubGuard {
         device: Arc<SidecarImageDevice>,
         shutdown: Arc<AtomicBool>,
         interval: Duration,
+        parity: bool,
     ) -> Result<Self> {
-        Self::spawn(cx, device, shutdown, interval, emit)
+        Self::start_with_reports(cx, device, shutdown, interval, parity, emit, emit)
+    }
+
+    // Both production and worker tests use this exact integration. Report
+    // failure stays inside the existing unmount-on-failure and joined lifetime.
+    fn start_with_reports(
+        cx: &Cx,
+        device: Arc<SidecarImageDevice>,
+        shutdown: Arc<AtomicBool>,
+        interval: Duration,
+        parity: bool,
+        mut source_report: impl FnMut(&PassReport) -> Result<()> + Send + 'static,
+        mut parity_report: impl FnMut(&ProtectionPassReport) -> Result<()> + Send + 'static,
+    ) -> Result<Self> {
+        let maintenance_cx = cx.clone();
+        let maintenance_device = Arc::clone(&device);
+        let maintenance_shutdown = Arc::clone(&shutdown);
+        let mut maintenance = ProtectionMaintenance::default();
+        Self::spawn(cx, device, shutdown, interval, move |source| {
+            source_report(source)?;
+            if parity {
+                maintenance.batch(
+                    &maintenance_cx,
+                    &maintenance_shutdown,
+                    |cursor| maintenance_device.scrub_step(&maintenance_cx, cursor),
+                    &mut parity_report,
+                )?;
+            }
+            Ok(())
+        })
     }
 
     fn spawn(
