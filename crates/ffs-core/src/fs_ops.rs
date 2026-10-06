@@ -987,7 +987,13 @@ impl FsOps for OpenFs {
                 };
                 blocks_free = blocks_free.min(sb.blocks_count);
                 files_free = files_free.min(u64::from(sb.inodes_count));
-                let blocks_available = blocks_free.saturating_sub(sb.reserved_blocks_count);
+                // As ext4_statfs: available leaves out the root reserve AND the
+                // metadata reserve file data may not take (bd-rohtt).
+                let blocks_available = blocks_free
+                    .saturating_sub(sb.reserved_blocks_count)
+                    .saturating_sub(ffs_alloc::reserved_metadata_blocks(
+                        &FsGeometry::from_superblock(sb),
+                    ));
                 Ok(FsStat {
                     blocks: sb.blocks_count,
                     blocks_free,
