@@ -114,8 +114,15 @@ impl Prepared {
             // Device sync alone cannot drain committed MVCC writes or publish
             // btrfs CoW roots. Use the filesystem's durable full-commit path
             // first, while the filesystem still exists and dispatch is quiescent.
-            FsOps::fsyncdir(&fs, cx, &mut RequestScope::empty(), InodeNumber(1), 0, false)
-                .context("checkpoint protected filesystem before shutdown")?;
+            FsOps::fsyncdir(
+                &fs,
+                cx,
+                &mut RequestScope::empty(),
+                InodeNumber(1),
+                0,
+                false,
+            )
+            .context("checkpoint protected filesystem before shutdown")?;
         }
         drop(fs);
         self.device.sync(cx).context("final protected-device sync")

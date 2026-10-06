@@ -78,7 +78,11 @@ impl SourcePass {
         }
         let count = usize::try_from(remaining.min(u64::try_from(READ_BYTES)?))?;
         device
-            .read_exact_at(cx, ByteOffset(self.verified_bytes), &mut self.buffer[..count])
+            .read_exact_at(
+                cx,
+                ByteOffset(self.verified_bytes),
+                &mut self.buffer[..count],
+            )
             .with_context(|| format!("protected source scrub at byte {}", self.verified_bytes))?;
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         self.verified_bytes += u64::try_from(count)?;
@@ -259,7 +263,10 @@ fn run(
             if stopping(stop, shutdown)
                 && error.chain().any(|cause| {
                     matches!(cause.downcast_ref::<FfsError>(), Some(FfsError::Cancelled))
-                }) => Ok(()),
+                }) =>
+        {
+            Ok(())
+        }
         other => other,
     }
 }

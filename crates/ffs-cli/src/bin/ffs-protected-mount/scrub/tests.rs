@@ -199,8 +199,14 @@ fn worker_reports_complete_passes_and_restarts_from_zero() {
         },
     )
     .unwrap();
-    assert_eq!(reports.recv_timeout(Duration::from_secs(5)).unwrap(), (1, 1));
-    assert_eq!(reports.recv_timeout(Duration::from_secs(5)).unwrap(), (2, 1));
+    assert_eq!(
+        reports.recv_timeout(Duration::from_secs(5)).unwrap(),
+        (1, 1)
+    );
+    assert_eq!(
+        reports.recv_timeout(Duration::from_secs(5)).unwrap(),
+        (2, 1)
+    );
     guard.stop().unwrap();
     assert_eq!(*device.reads.lock().unwrap(), [(0, 1), (0, 1)]);
 }
@@ -454,10 +460,8 @@ fn command_scrub_option_is_explicit_bounded_and_requires_a_mount() {
     }
     for seconds in ["0", "86401", "18446744073709551615", "invalid"] {
         assert!(
-            crate::Args::try_parse_from(
-                base.into_iter().chain(["--scrub-interval-secs", seconds])
-            )
-            .is_err()
+            crate::Args::try_parse_from(base.into_iter().chain(["--scrub-interval-secs", seconds]))
+                .is_err()
         );
     }
     assert!(
