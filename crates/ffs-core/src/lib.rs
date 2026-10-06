@@ -2114,6 +2114,14 @@ pub struct OpenFs {
     /// writable tree and retires `log_root`; applying the retained vector after
     /// that point would mask newer mutations with stale values (bd-jhuob).
     btrfs_tree_log_overlay_active: AtomicBool,
+    /// Set while the last full commit failed for lack of space: until one
+    /// lands, operations that consume space get ENOSPC instead of being
+    /// acknowledged into a transaction that cannot commit (the kernel refuses
+    /// them up front through its metadata reservations). Deletes, renames and
+    /// attribute changes stay allowed, so freeing space can recover. Without
+    /// it, xfstests generic/027 created ~2M "successful" 1 KiB files on a 256
+    /// MiB btrfs while every periodic commit failed with ENOSPC.
+    btrfs_commit_out_of_space: AtomicBool,
     /// True when `log_root` held a tree log this implementation cannot replay —
     /// the kernel's log ROOT TREE shape rather than our single leaf (bd-jhuob).
     ///
@@ -6625,6 +6633,7 @@ impl OpenFs {
             btrfs_tree_log_overlay_active: AtomicBool::new(
                 !btrfs_tree_log_items.is_empty() || !btrfs_tree_log_dir_ranges.is_empty(),
             ),
+            btrfs_commit_out_of_space: AtomicBool::new(false),
             btrfs_tree_log_items,
             btrfs_tree_log_dir_ranges,
             btrfs_tree_log_hidden: BtrfsTreeLogHidden::default(),
@@ -23747,6 +23756,29 @@ const BTRFS_FEATURE_COMPAT_RO_SAFE_CLEAR: u64 = 0;
 /// never runs the superblock commit. It is reachable from the full-commit path
 /// -- `sync`, unmount, or an fsync that cannot use the log -- which is exactly
 /// where a refusal originates.
+/// The btrfs mutations (by their `require_btrfs_rw_allowed` name) that add
+/// items or data, refused while the last commit failed for lack of space.
+/// Deletes, renames and attribute changes are not: they are how space comes
+/// back.
+fn btrfs_operation_consumes_space(operation: &str) -> bool {
+    matches!(
+        operation,
+        "create"
+            | "mkdir"
+            | "mknod"
+            | "symlink"
+            | "link"
+            | "tmpfile"
+            | "write"
+            | "fallocate"
+            | "setxattr"
+            | "clone_file"
+            | "clone_file_range"
+            | "create_subvolume"
+            | "create_snapshot"
+    )
+}
+
 const fn btrfs_mutation_permitted(writable: bool, commit_refused: bool) -> bool {
     writable && !commit_refused
 }
@@ -36178,6 +36210,11 @@ impl OpenFs {
             );
             return Err(FfsError::ReadOnly);
         }
+        if btrfs_operation_consumes_space(operation)
+            && self.btrfs_commit_out_of_space.load(Ordering::Acquire)
+        {
+            return Err(FfsError::NoSpace);
+        }
         Ok(())
     }
 
@@ -37393,9 +37430,34 @@ impl OpenFs {
     /// - **WB-I1:** At every crash point, the set of durable nodes is prefix-closed
     ///   under references (no durable parent points at a non-durable child).
     /// - **WB-I2:** After crash, a reader observes generation `g` or `g+1`, never torn.
+    fn btrfs_full_transaction_commit(
+        &self,
+        cx: &Cx,
+        operation_id: &str,
+    ) -> ffs_error::Result<BtrfsWritebackStats> {
+        let result = self.btrfs_full_transaction_commit_once(cx, operation_id);
+        match &result {
+            Ok(_) => self
+                .btrfs_commit_out_of_space
+                .store(false, Ordering::Release),
+            Err(err) if err.to_errno() == libc::ENOSPC => {
+                if !self.btrfs_commit_out_of_space.swap(true, Ordering::AcqRel) {
+                    warn!(
+                        target: "ffs::btrfs::rw",
+                        operation_id,
+                        "btrfs_commit_out_of_space: refusing space-consuming operations \
+                         with ENOSPC until a commit lands"
+                    );
+                }
+            }
+            Err(_) => {}
+        }
+        result
+    }
+
     #[expect(clippy::too_many_lines)]
     #[allow(clippy::similar_names)]
-    fn btrfs_full_transaction_commit(
+    fn btrfs_full_transaction_commit_once(
         &self,
         cx: &Cx,
         operation_id: &str,
@@ -77482,6 +77544,58 @@ mod tests {
             OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).expect("open btrfs");
         fs.enable_writes(&cx).expect("enable writes");
         Some((fs, tmp, image))
+    }
+
+    /// xfstests generic/027 on btrfs: once commits fail for lack of space, new
+    /// files must get ENOSPC instead of being acknowledged forever into a
+    /// transaction that never lands. (Recovering after deletes needs a failed
+    /// commit to give back what it allocated, which it does not yet: bd-x4h1q.)
+    #[test]
+    fn btrfs_creates_get_enospc_once_commits_run_out_of_space() {
+        let Some((fs, _tmp, _image)) = open_file_backed_btrfs(128) else {
+            oracle_unavailable("btrfs image formatter (btrfs-progs)");
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let dir = fs
+            .mkdir(&cx, root, OsStr::new("d"), 0o755, 0, 0)
+            .expect("mkdir")
+            .ino;
+        let mut created = Vec::new();
+        let mut refused = None;
+        for i in 0..200_000_u32 {
+            let name = format!("f{i}");
+            let step = fs
+                .create(&cx, dir, OsStr::new(&name), 0o644, 0, 0)
+                .and_then(|attr| fs.write(&cx, attr.ino, 0, &[0x5A; 1024]).map(|_| attr.ino));
+            match step {
+                Ok(_) => created.push(name),
+                Err(err) => {
+                    refused = Some((i, err.to_errno()));
+                    break;
+                }
+            }
+            if i % 2000 == 1999 {
+                // A failed commit is the condition under test, not an error.
+                let _ = fs.fsync(&cx, dir, 0, false);
+            }
+        }
+        let (at, errno) = refused.expect("200k 1 KiB files cannot fit a 128 MiB btrfs");
+        assert_eq!(
+            errno,
+            libc::ENOSPC,
+            "refused at file {at} with errno {errno}"
+        );
+
+        // Still refused: nothing has committed since.
+        let err = fs
+            .create(&cx, dir, OsStr::new("again"), 0o644, 0, 0)
+            .expect_err("no commit has landed since");
+        assert_eq!(err.to_errno(), libc::ENOSPC);
+        // Freeing space stays allowed.
+        fs.unlink(&cx, dir, OsStr::new(&created[0]))
+            .expect("unlink is not refused");
     }
 
     /// Offsets of every 4 KiB image block filled entirely with `byte`.
