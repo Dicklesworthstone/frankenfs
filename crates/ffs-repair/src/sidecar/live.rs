@@ -30,6 +30,7 @@ use std::fs::File;
 use std::io::{self, Write};
 use std::os::unix::fs::{FileExt, MetadataExt};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 use tempfile::NamedTempFile;
 
@@ -44,6 +45,9 @@ enum Phase {
 struct State {
     archive: Archive,
     phase: Phase,
+    /// Allocation identity changes on every successful archive publication.
+    /// Cursors keep only this token alive, never an image/archive descriptor.
+    protection_epoch: Arc<()>,
     /// Digests of intended complete blocks, including partial-write preservation.
     /// Unchanged blocks retain the checksums in the previous archive.
     changed: BTreeMap<u64, [u8; 32]>,
@@ -58,6 +62,50 @@ struct State {
 struct GroupRepair {
     recovered_blocks: u64,
     invalid_symbols: u64,
+}
+
+/// Progress for an opportunistic, group-at-a-time protection scrub.
+///
+/// Create with `Default`. A cursor resumes only on the same device and archive
+/// publication; any intervening successful refresh restarts it at group zero,
+/// even when the new snapshot has identical bytes. It retains no file locks.
+#[derive(Debug, Default)]
+pub struct ProtectionScrubCursor {
+    epoch: Option<Arc<()>>,
+    next_group: u32,
+    rebuild_archive: bool,
+    report: ProtectionScrubReport,
+}
+
+/// Observations from successfully completed group steps in one protection epoch.
+/// This is not a point-in-time filesystem snapshot or a lifetime repair counter.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ProtectionScrubReport {
+    /// Groups whose source tables, source bytes and repair symbols were checked.
+    pub groups_verified: u32,
+    /// Real source bytes checked; virtual padding in a short tail is excluded.
+    pub source_bytes_verified: u64,
+    /// Source blocks recovered by successful group steps in this pass.
+    /// Repairs from an interrupted/restarted pass or the final refresh are excluded.
+    pub source_blocks_recovered: u64,
+    /// Invalid repair symbols observed during those group steps.
+    pub invalid_repair_symbols: u64,
+    /// A replacement archive was verified, published and directory-synced.
+    pub archive_rebuilt: bool,
+}
+
+/// One non-waiting admission attempt for a protection scrub step.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProtectionScrubStep {
+    /// Another operation holds the device serializer. No I/O or progress change.
+    Busy,
+    /// Caller writes await an explicit sync. No I/O or progress change.
+    PendingWrites,
+    /// One group completed. The serializer is released before returning.
+    GroupVerified { group: u32 },
+    /// The entire pass completed, including any required archive replacement.
+    /// The cursor is reset and can be reused for the next pass.
+    Complete(ProtectionScrubReport),
 }
 
 /// A fixed-size, writable compatibility image protected by an external sidecar.
@@ -176,6 +224,7 @@ impl SidecarImageDevice {
             state: Mutex::new(State {
                 archive,
                 phase: Phase::Clean,
+                protection_epoch: Arc::new(()),
                 changed: BTreeMap::new(),
                 tables,
                 cached_hashes: None,
@@ -640,6 +689,7 @@ impl SidecarImageDevice {
         state.changed.clear();
         state.tables = tables;
         state.cached_hashes = None;
+        state.protection_epoch = Arc::new(());
         state.phase = Phase::Clean;
         Ok(())
     }
@@ -672,6 +722,88 @@ impl SidecarImageDevice {
         }
         checkpoint(cx)?;
         Ok(repaired)
+    }
+
+    /// Check one source/parity group without waiting for foreground ownership.
+    ///
+    /// Busy and dirty devices defer without changing bytes or cursor progress.
+    /// Poisoning, I/O errors, corruption and cancellation remain errors. Clean
+    /// admission, epoch comparison and the entire step share the source-write
+    /// serializer, so a writer cannot race a separate cleanliness check.
+    ///
+    /// After all groups verify, a separate final step replenishes damaged parity
+    /// or header bytes through the existing verified atomic replacement path.
+    /// That exceptional step rescans the entire image under the serializer and
+    /// can block foreground I/O; only ordinary scan steps are group-bounded.
+    /// No step calls `sync` to finish a caller's outstanding write epoch.
+    ///
+    /// Source repairs from successful earlier steps may remain after a later
+    /// failure. Each step revalidates the admitted source table before repair;
+    /// the cursor is scheduling state, never authority to skip verification.
+    pub fn scrub_step(
+        &self,
+        cx: &Cx,
+        cursor: &mut ProtectionScrubCursor,
+    ) -> Result<ProtectionScrubStep> {
+        checkpoint(cx)?;
+        let Some(mut state) = self.state.try_lock() else {
+            checkpoint(cx)?;
+            return Ok(ProtectionScrubStep::Busy);
+        };
+        checkpoint(cx)?;
+        match state.phase {
+            Phase::Dirty => return Ok(ProtectionScrubStep::PendingWrites),
+            Phase::Poisoned => {
+                return Err(corrupt("live repair device is poisoned after an I/O failure"));
+            }
+            Phase::Clean => {}
+        }
+        self.check_image_len()?;
+        if !cursor
+            .epoch
+            .as_ref()
+            .is_some_and(|epoch| Arc::ptr_eq(epoch, &state.protection_epoch))
+        {
+            *cursor = ProtectionScrubCursor {
+                epoch: Some(Arc::clone(&state.protection_epoch)),
+                ..ProtectionScrubCursor::default()
+            };
+        }
+        let header = &state.archive.header;
+        if cursor.next_group < header.groups {
+            let group = cursor.next_group;
+            let (first, count) = header.group_geometry(group)?;
+            let first_byte = first
+                .checked_mul(u64::from(header.options.block_size))
+                .ok_or_else(|| corrupt("protection scrub source offset overflow"))?;
+            let bytes = self
+                .image_bytes
+                .checked_sub(first_byte)
+                .ok_or_else(|| corrupt("protection scrub group exceeds image"))?
+                .min(u64::from(count) * u64::from(header.options.block_size));
+            let outcome = self.repair_group(cx, &state, group)?;
+            checkpoint(cx)?;
+            cursor.rebuild_archive |= outcome.invalid_symbols != 0;
+            cursor.report.groups_verified += 1;
+            cursor.report.source_bytes_verified += bytes;
+            cursor.report.source_blocks_recovered += outcome.recovered_blocks;
+            cursor.report.invalid_repair_symbols += outcome.invalid_symbols;
+            cursor.next_group += 1;
+            return Ok(ProtectionScrubStep::GroupVerified { group });
+        }
+        // Re-read the header at completion, including damage that occurred
+        // after the final group. Never restore a pending header: Phase::Dirty
+        // was excluded while holding the very lock that protects the fence.
+        let mut stored_header = [0; HEADER_BYTES];
+        state.archive.file.read_exact_at(&mut stored_header, 0)?;
+        if cursor.rebuild_archive || stored_header != state.archive.header.encode() {
+            self.refresh(cx, &mut state)?;
+            cursor.report.archive_rebuilt = true;
+        }
+        checkpoint(cx)?;
+        let report = cursor.report;
+        *cursor = ProtectionScrubCursor::default();
+        Ok(ProtectionScrubStep::Complete(report))
     }
 
     /// Last committed protection point. An outstanding epoch is reported as an
@@ -769,6 +901,303 @@ mod tests {
     use super::*;
     use crate::sidecar::{SidecarOptions, protect, verify};
     use crate::sidecar_restore::restore;
+
+    fn finish_incremental_scrub(
+        device: &SidecarImageDevice,
+        cursor: &mut ProtectionScrubCursor,
+    ) -> ProtectionScrubReport {
+        let groups = device.state.lock().archive.header.groups;
+        for _ in 0..=groups {
+            match device.scrub_step(&Cx::for_testing(), cursor).expect("scrub step") {
+                ProtectionScrubStep::GroupVerified { .. } => {}
+                ProtectionScrubStep::Complete(report) => return report,
+                other => panic!("unexpected deferral: {other:?}"),
+            }
+        }
+        panic!("a quiescent scrub must finish in groups + 1 steps");
+    }
+
+    #[test]
+    fn incremental_scrub_is_group_bounded_and_healthy_passes_do_not_republish() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let archive = std::fs::read(&fixture.sidecar).unwrap();
+        let cx = Cx::for_testing();
+        let mut cursor = ProtectionScrubCursor::default();
+        for _ in 0..2 {
+            for group in 0..3 {
+                assert_eq!(
+                    device.scrub_step(&cx, &mut cursor).unwrap(),
+                    ProtectionScrubStep::GroupVerified { group }
+                );
+                assert!(device.state.try_lock().is_some(), "step retained its lock");
+            }
+            assert_eq!(
+                device.scrub_step(&cx, &mut cursor).unwrap(),
+                ProtectionScrubStep::Complete(ProtectionScrubReport {
+                    groups_verified: 3,
+                    source_bytes_verified: 16 * 512 + 37,
+                    ..ProtectionScrubReport::default()
+                })
+            );
+            assert!(cursor.epoch.is_none());
+            assert_eq!(std::fs::read(&fixture.sidecar).unwrap(), archive);
+        }
+    }
+
+    #[test]
+    fn incremental_scrub_replenishes_lost_parity_and_recovers_a_short_tail() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+        let saved = device.protection(&cx).unwrap();
+        for symbol in 0..4 {
+            fixture.damage_parity(&device, 0, symbol);
+        }
+        fixture.damage_parity(&device, 2, 0);
+        fixture.damage(16 * 512, &[0xfe; 37]);
+        let mut cursor = ProtectionScrubCursor::default();
+        assert_eq!(
+            device.scrub_step(&cx, &mut cursor).unwrap(),
+            ProtectionScrubStep::GroupVerified { group: 0 }
+        );
+        assert_eq!(
+            &std::fs::read(&fixture.image).unwrap()[16 * 512..],
+            &[0xfe; 37],
+            "a step must not visit later groups"
+        );
+        let report = finish_incremental_scrub(&device, &mut cursor);
+        assert_eq!(report.groups_verified, 3);
+        assert_eq!(report.source_bytes_verified, 16 * 512 + 37);
+        assert_eq!(report.source_blocks_recovered, 1);
+        assert_eq!(report.invalid_repair_symbols, 5);
+        assert!(report.archive_rebuilt);
+        assert_eq!(device.protection(&cx).unwrap(), saved);
+        assert_eq!(std::fs::read(&fixture.image).unwrap(), fixture.original);
+        let named = File::options().read(true).write(true).open(&fixture.sidecar).unwrap();
+        assert!(named.try_lock().is_err(), "replacement inode must remain owned");
+        drop(named);
+        drop(device);
+        assert!(verify(&cx, &fixture.image, &fixture.sidecar).unwrap().is_healthy());
+        // Recovery after reopening proves new symbols are usable, not merely
+        // an optimistic report from the preceding maintenance cursor.
+        let reopened = fixture.open();
+        fixture.damage(0, &[0xfe; 512]);
+        let mut bytes = [0; 512];
+        reopened.read_exact_at(&cx, ByteOffset(0), &mut bytes).unwrap();
+        assert_eq!(bytes.as_slice(), &fixture.original[..512]);
+    }
+
+    #[test]
+    fn incremental_scrub_busy_admission_does_not_wait_or_advance() {
+        let fixture = Fixture::new();
+        let device = Arc::new(fixture.open());
+        let cx = Cx::for_testing();
+        let mut cursor = ProtectionScrubCursor::default();
+        device.scrub_step(&cx, &mut cursor).unwrap();
+        let before = cursor.report;
+        let held = device.state.lock();
+        let worker_device = Arc::clone(&device);
+        let (send, receive) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let result = worker_device.scrub_step(&cx, &mut cursor);
+            send.send(result).unwrap();
+            cursor
+        });
+        let result = receive.recv_timeout(Duration::from_secs(2));
+        // Release before asserting/joining even if a broken implementation waits.
+        drop(held);
+        let cursor = worker.join().unwrap();
+        assert_eq!(result.expect("maintenance must not wait").unwrap(), ProtectionScrubStep::Busy);
+        assert_eq!(cursor.next_group, 1);
+        assert_eq!(cursor.report, before);
+        assert_eq!(std::fs::read(&fixture.image).unwrap(), fixture.original);
+    }
+
+    #[test]
+    fn incremental_scrub_defers_a_pending_finalization_and_restarts_after_sync() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+        fixture.damage_parity(&device, 0, 0);
+        let mut cursor = ProtectionScrubCursor::default();
+        for _ in 0..3 {
+            device.scrub_step(&cx, &mut cursor).unwrap();
+        }
+        let before = cursor.report;
+        device.write_all_at(&cx, ByteOffset(0), &[0x51; 512]).unwrap();
+        let source = std::fs::read(&fixture.image).unwrap();
+        let archive = std::fs::read(&fixture.sidecar).unwrap();
+        assert_eq!(&archive[..8], PENDING_MAGIC);
+        assert_eq!(
+            device.scrub_step(&cx, &mut cursor).unwrap(),
+            ProtectionScrubStep::PendingWrites
+        );
+        assert_eq!(cursor.next_group, 3);
+        assert_eq!(cursor.report, before);
+        assert_eq!(std::fs::read(&fixture.image).unwrap(), source);
+        assert_eq!(std::fs::read(&fixture.sidecar).unwrap(), archive);
+        assert!(device.protection(&cx).is_err());
+        device.sync(&cx).unwrap();
+        assert_eq!(
+            device.scrub_step(&cx, &mut cursor).unwrap(),
+            ProtectionScrubStep::GroupVerified { group: 0 }
+        );
+        let report = finish_incremental_scrub(&device, &mut cursor);
+        assert_eq!(report.invalid_repair_symbols, 0, "do not carry old observations");
+        assert!(!report.archive_rebuilt, "the explicit sync already rebuilt it");
+        assert_eq!(std::fs::read(&fixture.image).unwrap(), source);
+    }
+
+    #[test]
+    fn incremental_scrub_restarts_even_after_an_identical_byte_publication() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+        let mut cursor = ProtectionScrubCursor::default();
+        device.scrub_step(&cx, &mut cursor).unwrap();
+        let old_epoch = Arc::clone(cursor.epoch.as_ref().unwrap());
+        let old_header = device.state.lock().archive.header.encode();
+        device.write_all_at(&cx, ByteOffset(0), &fixture.original[..512]).unwrap();
+        device.sync(&cx).unwrap();
+        assert_eq!(device.state.lock().archive.header.encode(), old_header);
+        assert_eq!(
+            device.scrub_step(&cx, &mut cursor).unwrap(),
+            ProtectionScrubStep::GroupVerified { group: 0 }
+        );
+        assert!(!Arc::ptr_eq(cursor.epoch.as_ref().unwrap(), &old_epoch));
+    }
+
+    #[test]
+    fn incremental_scrub_cursor_neither_keeps_file_locks_nor_crosses_device_opens() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+        let mut cursor = ProtectionScrubCursor::default();
+        device.scrub_step(&cx, &mut cursor).unwrap();
+        drop(device);
+        let reopened = fixture.open();
+        assert_eq!(
+            reopened.scrub_step(&cx, &mut cursor).unwrap(),
+            ProtectionScrubStep::GroupVerified { group: 0 }
+        );
+    }
+
+    #[test]
+    fn incremental_scrub_cancelled_finalization_preserves_the_archive_for_retry() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        fixture.damage_parity(&device, 0, 0);
+        let cx = Cx::for_testing();
+        let mut cursor = ProtectionScrubCursor::default();
+        for _ in 0..3 {
+            device.scrub_step(&cx, &mut cursor).unwrap();
+        }
+        let archive = std::fs::read(&fixture.sidecar).unwrap();
+        let before = cursor.report;
+        cx.set_cancel_requested(true);
+        assert!(matches!(device.scrub_step(&cx, &mut cursor), Err(FfsError::Cancelled)));
+        assert_eq!(std::fs::read(&fixture.sidecar).unwrap(), archive);
+        assert_eq!(cursor.report, before);
+        assert_eq!(cursor.next_group, 3);
+        assert!(finish_incremental_scrub(&device, &mut cursor).archive_rebuilt);
+    }
+
+    #[test]
+    fn incremental_scrub_refuses_transplanted_source_tables() {
+        let fixture = Fixture::new();
+        let (_, record, offset) = alternate_generation(&fixture);
+        std::fs::write(&fixture.image, &fixture.original).unwrap();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+        let mut cursor = ProtectionScrubCursor::default();
+        device.scrub_step(&cx, &mut cursor).unwrap();
+        File::options().write(true).open(&fixture.sidecar).unwrap()
+            .write_all_at(&record, offset).unwrap();
+        let archive = std::fs::read(&fixture.sidecar).unwrap();
+        let error = device.scrub_step(&cx, &mut cursor).unwrap_err();
+        assert!(error.to_string().contains("admitted generation"));
+        assert_eq!(cursor.next_group, 1);
+        assert_eq!(std::fs::read(&fixture.image).unwrap(), fixture.original);
+        assert_eq!(std::fs::read(&fixture.sidecar).unwrap(), archive);
+    }
+
+    #[test]
+    fn incremental_scrub_cannot_rebuild_from_an_unrecoverable_later_group() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+        fixture.damage_parity(&device, 0, 0);
+        for symbol in 0..4 {
+            fixture.damage_parity(&device, 2, symbol);
+        }
+        fixture.damage(16 * 512, &[0xfe; 37]);
+        let source = std::fs::read(&fixture.image).unwrap();
+        let archive = std::fs::read(&fixture.sidecar).unwrap();
+        let mut cursor = ProtectionScrubCursor::default();
+        for _ in 0..2 {
+            device.scrub_step(&cx, &mut cursor).unwrap();
+        }
+        assert!(device.scrub_step(&cx, &mut cursor).is_err());
+        assert_eq!(cursor.next_group, 2);
+        assert!(cursor.rebuild_archive);
+        assert_eq!(std::fs::read(&fixture.image).unwrap(), source);
+        assert_eq!(std::fs::read(&fixture.sidecar).unwrap(), archive);
+    }
+
+    #[test]
+    fn incremental_scrub_publication_failure_is_not_completion() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+        fixture.damage_parity(&device, 0, 0);
+        let mut cursor = ProtectionScrubCursor::default();
+        for _ in 0..3 {
+            device.scrub_step(&cx, &mut cursor).unwrap();
+        }
+        let archive = std::fs::read(&fixture.sidecar).unwrap();
+        let retained = fixture.sidecar.with_extension("retained");
+        std::fs::rename(&fixture.sidecar, &retained).unwrap();
+        std::fs::create_dir(&fixture.sidecar).unwrap();
+        assert!(device.scrub_step(&cx, &mut cursor).is_err());
+        assert_eq!(cursor.next_group, 3);
+        assert!(!cursor.report.archive_rebuilt);
+        assert_eq!(std::fs::read(&retained).unwrap(), archive);
+        assert_eq!(std::fs::read(&fixture.image).unwrap(), fixture.original);
+    }
+
+    #[test]
+    fn incremental_scrub_rechecks_header_damage_after_the_last_group() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+        let mut cursor = ProtectionScrubCursor::default();
+        for _ in 0..3 {
+            device.scrub_step(&cx, &mut cursor).unwrap();
+        }
+        File::options().write(true).open(&fixture.sidecar).unwrap()
+            .write_all_at(b"BADHDR!!", 0).unwrap();
+        let report = finish_incremental_scrub(&device, &mut cursor);
+        assert!(report.archive_rebuilt);
+        assert_eq!(report.invalid_repair_symbols, 0);
+        drop(device);
+        assert!(verify(&cx, &fixture.image, &fixture.sidecar).unwrap().is_healthy());
+    }
+
+    #[test]
+    fn incremental_scrub_poisoning_and_io_errors_are_not_deferrals() {
+        let fixture = Fixture::new();
+        let device = fixture.open();
+        let cx = Cx::for_testing();
+        let mut cursor = ProtectionScrubCursor::default();
+        device.state.lock().phase = Phase::Poisoned;
+        assert!(device.scrub_step(&cx, &mut cursor).unwrap_err().to_string().contains("poisoned"));
+        assert!(cursor.epoch.is_none());
+        device.state.lock().phase = Phase::Clean; // test-only injected state
+        device.state.lock().archive.file.set_len(HEADER_BYTES as u64).unwrap();
+        assert!(matches!(device.scrub_step(&cx, &mut cursor), Err(FfsError::Io(_))));
+        assert_eq!(cursor.next_group, 0);
+    }
 
     struct Fixture {
         _dir: tempfile::TempDir,
