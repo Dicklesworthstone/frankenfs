@@ -15744,6 +15744,62 @@ impl OpenFs {
         Ok(arc)
     }
 
+    /// The csum items a read of the disk ranges `(bytenr, len)` can consult:
+    /// for each range, the EXTENT_CSUM item at or before its start and every
+    /// item starting inside it. [`lookup_data_block_csum`] picks the last item
+    /// at or below a block, so on these items it answers exactly as on the
+    /// whole tree. A writable mount used to copy the ENTIRE csum tree on every
+    /// verified read, O(filesystem) per read: copying files on btrfs spent
+    /// half its time there (xfstests generic/273, 1178 s against 89 s on
+    /// ext4). A read-only mount keeps its cached whole-tree walk.
+    fn btrfs_read_csum_items_covering(
+        &self,
+        cx: &Cx,
+        ranges: &[(u64, u64)],
+    ) -> ffs_error::Result<std::sync::Arc<BtrfsCsumItems>> {
+        let Some(alloc_mutex) = self.btrfs_alloc_state.as_ref() else {
+            return self.btrfs_read_csum_items(cx);
+        };
+        let alloc = alloc_mutex.read();
+        let csum_key = |offset| BtrfsKey {
+            objectid: ffs_btrfs::BTRFS_EXTENT_CSUM_OBJECTID,
+            item_type: ffs_btrfs::BTRFS_ITEM_EXTENT_CSUM,
+            offset,
+        };
+        // Keyed by the key's sort tuple (BtrfsKey itself is not Ord): ranges
+        // can share their floor item, and the result must stay sorted.
+        let mut items: std::collections::BTreeMap<(u64, u8, u64), (BtrfsKey, Vec<u8>)> =
+            std::collections::BTreeMap::new();
+        for &(bytenr, len) in ranges {
+            if len == 0 {
+                continue;
+            }
+            let start = match alloc
+                .csum_tree
+                .floor_key(&csum_key(bytenr))
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?
+            {
+                Some(key)
+                    if key.objectid == ffs_btrfs::BTRFS_EXTENT_CSUM_OBJECTID
+                        && key.item_type == ffs_btrfs::BTRFS_ITEM_EXTENT_CSUM =>
+                {
+                    key
+                }
+                _ => csum_key(bytenr),
+            };
+            let end = csum_key(bytenr.saturating_add(len - 1));
+            alloc
+                .csum_tree
+                .range_with(&start, &end, |key, value| {
+                    items
+                        .entry((key.objectid, key.item_type, key.offset))
+                        .or_insert_with(|| (key, value.to_vec()));
+                })
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        }
+        Ok(std::sync::Arc::new(items.into_values().collect()))
+    }
+
     /// Read attached-device data through whole-sector checksum validation.
     /// Only bytes from the validated copy reach the destination, including
     /// unaligned windows and compressed on-disk data. Missing checksums keep
@@ -16630,7 +16686,24 @@ impl OpenFs {
                 .and_then(|sb| usize::try_from(sb.sectorsize).ok())
                 .filter(|s| *s != 0)
                 .ok_or_else(|| FfsError::Format("invalid btrfs sectorsize".into()))?;
-            let csum_items = self.btrfs_read_csum_items(cx)?;
+            let disk_ranges: Vec<(u64, u64)> = extents
+                .iter()
+                .filter_map(|(logical_start, extent)| match extent {
+                    BtrfsExtentData::Regular {
+                        disk_bytenr,
+                        disk_num_bytes,
+                        num_bytes,
+                        ..
+                    } if *disk_bytenr != 0
+                        && *logical_start < read_end
+                        && logical_start.saturating_add(*num_bytes) > offset =>
+                    {
+                        Some((*disk_bytenr, *disk_num_bytes))
+                    }
+                    _ => None,
+                })
+                .collect();
+            let csum_items = self.btrfs_read_csum_items_covering(cx, &disk_ranges)?;
             for (logical_start, extent) in extents.iter() {
                 let BtrfsExtentData::Regular {
                     extent_type,
@@ -78070,6 +78143,87 @@ mod tests {
         for writer in writers {
             writer.join().expect("writer");
         }
+    }
+
+    /// The csum items a read gathers for its disk ranges answer every sector
+    /// lookup exactly as the whole csum tree does (the read path used to copy
+    /// the whole tree per read).
+    #[test]
+    fn btrfs_covering_csum_items_answer_like_the_whole_tree() {
+        let Some((fs, _tmp, _image)) = open_file_backed_btrfs(256) else {
+            oracle_unavailable("btrfs image formatter (btrfs-progs)");
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let mut inos = Vec::new();
+        for (i, len) in [12_288_usize, 200_000, 4096, 1 << 20]
+            .into_iter()
+            .enumerate()
+        {
+            let ino = fs
+                .create(&cx, root, OsStr::new(&format!("f{i}")), 0o644, 0, 0)
+                .expect("create")
+                .ino;
+            let data: Vec<u8> = (0..len)
+                .map(|b| u8::try_from((b * 7 + i) % 251).unwrap())
+                .collect();
+            fs.write(&cx, ino, 0, &data).expect("write");
+            // Overwrite a middle piece so files have several extents.
+            fs.write(&cx, ino, 4096, &[0xEE; 4096]).expect("overwrite");
+            inos.push(ino);
+        }
+        fs.fsync(&cx, root, 0, false).expect("commit");
+        let full = fs.btrfs_read_csum_items(&cx).expect("whole tree");
+        assert!(!full.is_empty(), "data checksums were written");
+        let sector = 4096_usize;
+        let csum_size = 4;
+        let mut checked = 0;
+        for ino in inos {
+            let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+            let items = alloc
+                .fs_tree
+                .range(
+                    &BtrfsKey {
+                        objectid: ino.0,
+                        item_type: BTRFS_ITEM_EXTENT_DATA,
+                        offset: 0,
+                    },
+                    &BtrfsKey {
+                        objectid: ino.0,
+                        item_type: BTRFS_ITEM_EXTENT_DATA,
+                        offset: u64::MAX,
+                    },
+                )
+                .expect("extents");
+            drop(alloc);
+            for (_, value) in items {
+                let Ok(BtrfsExtentData::Regular {
+                    disk_bytenr,
+                    disk_num_bytes,
+                    ..
+                }) = parse_extent_data(&value)
+                else {
+                    continue;
+                };
+                if disk_bytenr == 0 {
+                    continue;
+                }
+                let covering = fs
+                    .btrfs_read_csum_items_covering(&cx, &[(disk_bytenr, disk_num_bytes)])
+                    .expect("covering");
+                assert!(covering.len() <= full.len());
+                for block in (disk_bytenr..disk_bytenr + disk_num_bytes).step_by(sector) {
+                    assert_eq!(
+                        ffs_btrfs::lookup_data_block_csum(&covering, block, sector, csum_size),
+                        ffs_btrfs::lookup_data_block_csum(&full, block, sector, csum_size),
+                        "block {block}"
+                    );
+                    checked += 1;
+                }
+            }
+        }
+        assert!(checked > 100, "checked {checked} sectors");
     }
 
     /// Offsets of every 4 KiB image block filled entirely with `byte`.
