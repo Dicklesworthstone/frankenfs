@@ -26258,6 +26258,31 @@ impl OpenFs {
     /// the kernel's `btrfs_trim_free_extents` does. Refused (EOPNOTSUPP) on an
     /// ephemeral tree-log mount, whose log can reference data that is freed
     /// after the fsync that logged it.
+    /// The "end of the filesystem" for a FITRIM start: its size, or the end
+    /// of the highest chunk's logical range (chunks grown during this mount
+    /// included) when that lies further out. Not the chunk end alone: on a
+    /// fresh image the chunks cover only part of `[0, size)`, and fstrim(8)
+    /// callers pick starts anywhere below the size df reports (generic/251).
+    pub(crate) fn btrfs_logical_end(&self) -> u64 {
+        let chunk_end = |chunks: &[BtrfsChunkEntry]| {
+            chunks
+                .iter()
+                .map(|chunk| chunk.key.offset.saturating_add(chunk.length))
+                .max()
+                .unwrap_or(0)
+        };
+        let mounted = self.btrfs_context().map_or(0, |ctx| chunk_end(&ctx.chunks));
+        let grown = self
+            .btrfs_alloc_state
+            .as_ref()
+            .and_then(|state| {
+                ffs_btrfs::chunk_entries_from_chunk_tree(&state.read().chunk_tree).ok()
+            })
+            .map_or(0, |chunks| chunk_end(&chunks));
+        let size = self.btrfs_superblock().map_or(0, |sb| sb.total_bytes);
+        mounted.max(grown).max(size)
+    }
+
     fn btrfs_trim_free_space(
         &self,
         cx: &Cx,
@@ -77300,14 +77325,17 @@ mod tests {
 
     #[test]
     fn btrfs_trim_range_rejects_what_btrfs_trim_fs_rejects() {
-        // xfstests generic/260 + 288 on btrfs: logical addresses span u64, so
-        // only a sub-sector length, start == U64_MAX and an overflowing
-        // start + len fail; a start past the device is a valid (empty) trim.
+        // xfstests generic/260 + 288 on btrfs: a sub-sector length,
+        // start == U64_MAX and an overflowing start + len fail as in the
+        // kernel, and (the generic contract a FUSE mount presents) so does a
+        // start at or past the end of the last chunk.
         let (fs, cx) = open_writable_btrfs();
         let FsFlavor::Btrfs(sb) = &fs.flavor else {
             panic!("btrfs fixture");
         };
         let sector = u64::from(sb.sectorsize);
+        let end = fs.btrfs_logical_end();
+        assert!(end > 0, "the fixture has chunks");
         let mut scope = RequestScope::empty();
         let mut trim =
             |start, len| <OpenFs as FsOps>::trim_range(&fs, &cx, &mut scope, start, len, 0);
@@ -77317,6 +77345,9 @@ mod tests {
             (u64::MAX, u64::MAX),
             (u64::MAX, 1 << 20),
             (u64::MAX - (1 << 19), 1 << 20),
+            (end, u64::MAX),
+            (end, 1 << 20),
+            (1 << 50, u64::MAX),
         ] {
             let err = trim(start, len).expect_err("kernel rejects this range");
             assert_eq!(err.to_errno(), libc::EINVAL, "start={start} len={len}");
@@ -77324,7 +77355,7 @@ mod tests {
         // Accepted ranges reach the backend, which (in memory) cannot discard;
         // btrfs_trim_discards_only_space_free_in_the_committed_image_bd_3fmbr
         // covers the discard itself.
-        for (start, len) in [(0, sector), (0, u64::MAX), (1 << 50, u64::MAX)] {
+        for (start, len) in [(0, sector), (0, u64::MAX), (end - sector, u64::MAX)] {
             let err = trim(start, len).expect_err("an in-memory device cannot discard");
             assert_eq!(err.to_errno(), libc::EOPNOTSUPP, "start={start} len={len}");
         }

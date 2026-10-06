@@ -1803,13 +1803,20 @@ impl FsOps for OpenFs {
                     || start / block >= sb.blocks_count
                     || min_len / block > u64::from(sb.clusters_per_group)
             }
-            // btrfs_ioctl_fitrim + btrfs_trim_fs: block-group addresses are
-            // logical and may lie anywhere in u64, so only a sub-sector length,
-            // start == U64_MAX and an overflowing start + len are rejected.
+            // btrfs_ioctl_fitrim + btrfs_trim_fs reject a sub-sector length,
+            // start == U64_MAX and an overflowing start + len. The kernel then
+            // accepts any other start (block-group addresses are logical), but
+            // through FUSE the mount is fstype "fuse" and callers get the
+            // generic contract ext4/xfs give, where a start past the end of the
+            // filesystem is EINVAL (xfstests generic/260 skips that check only
+            // for FSTYP=btrfs). The end is the larger of the size and the last
+            // chunk's end; past it no block group exists, so this only turns
+            // a 0-byte success into EINVAL.
             FsFlavor::Btrfs(sb) => {
                 len < u64::from(sb.sectorsize)
                     || start == u64::MAX
                     || (len != u64::MAX && start.checked_add(len).is_none())
+                    || start >= self.btrfs_logical_end()
             }
         };
         if invalid {
