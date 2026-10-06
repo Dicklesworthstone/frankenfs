@@ -3742,6 +3742,23 @@ pub struct InMemoryCowBtrfsTree {
     /// superseded version for the life of the tree (bd-btrcow-evict).
     prev_committed_retired: Vec<u64>,
     nodes: FxHashMap<u64, BtrfsCowNode>,
+    /// Open [`Self::checkpoint`]: the node ids allocated since it, and the
+    /// retired nodes held back from eviction so its root stays complete.
+    checkpoint: Option<CheckpointLog>,
+}
+
+#[derive(Debug, Default)]
+struct CheckpointLog {
+    allocated: Vec<u64>,
+    held_retired: Vec<u64>,
+}
+
+/// What [`InMemoryCowBtrfsTree::rollback_to`] restores (bd-x4h1q).
+#[derive(Debug, Clone)]
+pub struct CowCheckpoint {
+    root: u64,
+    prev_committed_retired: Vec<u64>,
+    deferred_frees_len: usize,
 }
 
 impl InMemoryCowBtrfsTree {
@@ -3778,7 +3795,54 @@ impl InMemoryCowBtrfsTree {
             staged_deferred_frees: Vec::new(),
             prev_committed_retired: Vec::new(),
             nodes,
+            checkpoint: None,
         })
+    }
+
+    /// Open a checkpoint the tree can later be rolled back to with
+    /// [`Self::rollback_to`] or kept with [`Self::release_checkpoint`]
+    /// (bd-x4h1q: a commit that fails partway must give back what it did).
+    ///
+    /// A root id alone cannot be restored: every later mutation evicts the
+    /// nodes the one before it retired, which after two mutations includes
+    /// the old root's path. So while a checkpoint is open nothing is evicted,
+    /// and every node allocated is logged. Restoring is then O(changes), with
+    /// no copy of the tree. One checkpoint at a time; take it between
+    /// mutations.
+    pub fn checkpoint(&mut self) -> CowCheckpoint {
+        debug_assert!(self.checkpoint.is_none(), "nested checkpoint");
+        debug_assert_eq!(self.staged_allocations, [] as [u64; 0]);
+        self.checkpoint = Some(CheckpointLog::default());
+        CowCheckpoint {
+            root: self.root,
+            prev_committed_retired: self.prev_committed_retired.clone(),
+            deferred_frees_len: self.deferred_frees.len(),
+        }
+    }
+
+    /// Return the tree to `checkpoint`: its root again, every node allocated
+    /// since dropped. Nodes retired since are part of that root again and
+    /// were held, so the tree is complete. (Their ids also went to the
+    /// allocator's deferred list; allocators never reuse ids, so that is
+    /// harmless.)
+    pub fn rollback_to(&mut self, checkpoint: CowCheckpoint) {
+        let log = self.checkpoint.take().unwrap_or_default();
+        for block in log.allocated {
+            self.nodes.remove(&block);
+        }
+        self.root = checkpoint.root;
+        self.prev_committed_retired = checkpoint.prev_committed_retired;
+        self.deferred_frees.truncate(checkpoint.deferred_frees_len);
+    }
+
+    /// Keep everything done since the checkpoint and resume eviction: the
+    /// nodes it held back are two or more versions old and unreachable.
+    pub fn release_checkpoint(&mut self) {
+        if let Some(log) = self.checkpoint.take() {
+            for block in log.held_retired {
+                self.nodes.remove(&block);
+            }
+        }
     }
 
     /// Set the per-node serialized-byte budget (`nodesize - BTRFS_HEADER_SIZE`)
@@ -3908,6 +3972,9 @@ impl InMemoryCowBtrfsTree {
         let block = self.allocator.alloc_block()?;
         self.nodes.insert(block, node);
         self.staged_allocations.push(block);
+        if let Some(log) = &mut self.checkpoint {
+            log.allocated.push(block);
+        }
         trace!(block, "btrfs_cow_alloc_node");
         Ok(block)
     }
@@ -3935,8 +4002,13 @@ impl InMemoryCowBtrfsTree {
         // unreachable from `root`. The rollback path keeps retired nodes (it
         // clears `staged_deferred_frees` via `discard_retired_nodes` WITHOUT
         // removing them), so eviction is correct only here, post-commit.
-        for block in self.prev_committed_retired.drain(..) {
-            self.nodes.remove(&block);
+        if let Some(log) = &mut self.checkpoint {
+            // Held, not evicted: they may be the checkpoint root's nodes.
+            log.held_retired.append(&mut self.prev_committed_retired);
+        } else {
+            for block in self.prev_committed_retired.drain(..) {
+                self.nodes.remove(&block);
+            }
         }
         self.prev_committed_retired
             .extend_from_slice(&self.staged_deferred_frees);
@@ -6760,6 +6832,17 @@ pub struct BtrfsExtentAllocator {
     pinned: BTreeMap<u64, PinnedExtent>,
 }
 
+/// What [`BtrfsExtentAllocator::restore`] puts back (bd-x4h1q).
+#[derive(Debug)]
+pub struct ExtentAllocatorSnapshot {
+    extent_tree: CowCheckpoint,
+    block_groups: BTreeMap<u64, BlockGroupState>,
+    pinned: BTreeMap<u64, PinnedExtent>,
+    extent_refcounts: BTreeMap<ExtentKey, u64>,
+    delayed_ref_queue: DelayedRefQueue,
+    generation: u64,
+}
+
 /// An extent held out of allocation by `BtrfsExtentAllocator::pinned`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PinnedExtent {
@@ -7964,6 +8047,42 @@ impl BtrfsExtentAllocator {
         // it just handed out, which the bump pointer has already moved past.
         // Only RELEASING pins frees space behind the cursor, and that path
         // invalidates.
+    }
+
+    /// Snapshot everything a commit changes in the allocator, to give it all
+    /// back if the commit fails before its superblock is written (bd-x4h1q):
+    /// the extent tree as a [`CowCheckpoint`] (no copy), the rest cloned.
+    /// Pair with [`Self::restore`] or [`Self::release_snapshot`].
+    pub fn snapshot(&mut self) -> ExtentAllocatorSnapshot {
+        ExtentAllocatorSnapshot {
+            extent_tree: self.extent_tree.checkpoint(),
+            block_groups: self.block_groups.clone(),
+            pinned: self.pinned.clone(),
+            extent_refcounts: self.extent_refcounts.clone(),
+            delayed_ref_queue: self.delayed_ref_queue.clone(),
+            generation: self.generation,
+        }
+    }
+
+    /// Put the allocator back to `snapshot`: every extent item, pin, block
+    /// group accounting change and delayed ref made since is gone. Space the
+    /// failed commit allocated is free again; the pins of the committed
+    /// trees, which it must keep, were in the snapshot.
+    pub fn restore(&mut self, snapshot: ExtentAllocatorSnapshot) {
+        self.extent_tree.rollback_to(snapshot.extent_tree);
+        self.block_groups = snapshot.block_groups;
+        self.pinned = snapshot.pinned;
+        self.extent_refcounts = snapshot.extent_refcounts;
+        self.delayed_ref_queue = snapshot.delayed_ref_queue;
+        self.generation = snapshot.generation;
+        // Tail cursors may point past space that is free again.
+        self.invalidate_tail_cursors();
+    }
+
+    /// Keep everything since [`Self::snapshot`].
+    pub fn release_snapshot(&mut self, snapshot: ExtentAllocatorSnapshot) {
+        drop(snapshot);
+        self.extent_tree.release_checkpoint();
     }
 
     /// Rotate the pinned set one generation. **Call only after the new
@@ -15117,6 +15236,125 @@ mod tests {
             snapshot
         );
         tree.validate_invariants().expect("invariants");
+    }
+
+    fn tree_items(tree: &InMemoryCowBtrfsTree) -> Vec<(BtrfsKey, Vec<u8>)> {
+        let lo = BtrfsKey {
+            objectid: 0,
+            item_type: 0,
+            offset: 0,
+        };
+        let hi = BtrfsKey {
+            objectid: u64::MAX,
+            item_type: u8::MAX,
+            offset: u64::MAX,
+        };
+        tree.range(&lo, &hi).expect("range")
+    }
+
+    /// bd-x4h1q: after hundreds of mutations (enough that every node of the
+    /// checkpoint's root would have been evicted), rolling back restores the
+    /// exact tree and frees every node allocated since; releasing instead
+    /// keeps the mutations and lets eviction catch up.
+    #[test]
+    fn cow_checkpoint_rolls_back_many_mutations_exactly_bd_x4h1q() {
+        let mut tree = InMemoryCowBtrfsTree::new(6).expect("tree");
+        for i in 0..300 {
+            tree.insert(test_key(i * 2), &[1; 20]).expect("seed");
+        }
+        assert!(tree.height().expect("height") > 2);
+        let before_items = tree_items(&tree);
+        let before_nodes = tree.nodes.len();
+
+        let checkpoint = tree.checkpoint();
+        let mut state = 0x2545_F491_4F6C_DD1D_u64;
+        for step in 0..600_u64 {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            let key = test_key(state % 700);
+            let _ = match step % 3 {
+                0 => tree.insert(key, &[2; 30]),
+                1 => tree.update(&key, &[3; 10]),
+                _ => tree.delete(&key),
+            };
+        }
+        assert_ne!(
+            tree_items(&tree),
+            before_items,
+            "the mutations changed something"
+        );
+        tree.rollback_to(checkpoint);
+        tree.validate_invariants()
+            .expect("invariants after rollback");
+        assert_eq!(tree_items(&tree), before_items);
+        assert_eq!(tree.nodes.len(), before_nodes, "no node leaked or lost");
+
+        // The same mutations, kept this time.
+        let _kept = tree.checkpoint();
+        for i in 0..200 {
+            tree.delete(&test_key(i * 2)).expect("delete");
+        }
+        tree.release_checkpoint();
+        tree.insert(test_key(10_001), b"x")
+            .expect("one more mutation");
+        tree.validate_invariants()
+            .expect("invariants after release");
+        assert_eq!(tree_items(&tree).len(), 101);
+        assert!(
+            tree.nodes.len() < before_nodes * 3,
+            "eviction resumed: {} nodes",
+            tree.nodes.len()
+        );
+    }
+
+    /// bd-x4h1q: what a failed commit did to the allocator (metadata
+    /// allocations with their items, pins, a free) is all undone by restore.
+    #[test]
+    fn extent_allocator_restore_gives_back_a_failed_commits_space_bd_x4h1q() {
+        const MB: u64 = 1024 * 1024;
+        let mut alloc = BtrfsExtentAllocator::new(5).expect("allocator");
+        alloc.set_nodesize(16384);
+        alloc.add_block_group(
+            MB,
+            BtrfsBlockGroupItem {
+                total_bytes: 16 * MB,
+                used_bytes: 0,
+                flags: BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_DATA,
+            },
+        );
+        let data = alloc.alloc_data(64 * 1024).expect("data extent");
+        alloc
+            .insert_data_extent_item(data.bytenr, data.num_bytes, 5, 257, 0, 5)
+            .expect("extent item");
+        let free_before = alloc.allocatable_bytes(BTRFS_BLOCK_GROUP_METADATA);
+        let items_before = tree_items(&alloc.extent_tree);
+        let pins_before = alloc.pinned_extent_count();
+
+        let snapshot = alloc.snapshot();
+        alloc.set_generation(6);
+        for level in 0..40 {
+            alloc
+                .alloc_metadata_for_tree(16384, BTRFS_FS_TREE_OBJECTID, u8::from(level % 3 == 0))
+                .expect("metadata");
+        }
+        alloc.pin_live_tree_block(8 * MB, 16384);
+        alloc
+            .free_extent(data.bytenr, data.num_bytes, false)
+            .expect("free");
+        assert!(alloc.allocatable_bytes(BTRFS_BLOCK_GROUP_METADATA) < free_before);
+
+        alloc.restore(snapshot);
+        assert_eq!(
+            alloc.allocatable_bytes(BTRFS_BLOCK_GROUP_METADATA),
+            free_before
+        );
+        assert_eq!(tree_items(&alloc.extent_tree), items_before);
+        assert_eq!(alloc.pinned_extent_count(), pins_before);
+        // And the allocator works on afterwards.
+        alloc
+            .alloc_metadata_for_tree(16384, BTRFS_FS_TREE_OBJECTID, 0)
+            .expect("allocate after restore");
     }
 
     #[test]
