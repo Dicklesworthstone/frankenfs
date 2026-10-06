@@ -2954,7 +2954,7 @@ On mount, FrankenFS validates the image against a strict compatibility contract:
 - All known incompat feature flags are accepted (`COMPRESSION`, `JOURNAL_DEV`, `ENCRYPT`, `CASEFOLD`, `INLINE_DATA`, etc.).
 - Unknown incompat bits cause rejection.
 - Geometry parameters must be within supported ranges.
-- Superblock checksum must validate (ext4 CRC32C; btrfs CRC32C).
+- Superblock checksum must validate (ext4 CRC32C; btrfs under its `csum_type`: CRC32C, XXHASH64, SHA256 or BLAKE2b-256, the same algorithm then checks every tree block and data sector).
 - ext4 MMP state is conservatively rejected (`fsck`-active, active-writer, or unsafe/unknown states reject deterministically).
 
 Images that fail validation are rejected with a specific `FfsError` variant. FrankenFS will not "best-effort" parse a potentially incompatible image.

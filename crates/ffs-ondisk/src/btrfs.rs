@@ -496,14 +496,14 @@ fn validate_superblock_tree_level(field: &'static str, level: u8) -> Result<(), 
 }
 
 fn validate_supported_csum_type(csum_type: u16) -> Result<(), ParseError> {
-    match csum_type {
-        ffs_types::BTRFS_CSUM_TYPE_CRC32C | ffs_types::BTRFS_CSUM_TYPE_XXHASH64 => Ok(()),
-        _ => Err(ParseError::InvalidField {
-            field: "csum_type",
-            reason: "unsupported btrfs checksum type: CRC32C (0) and XXHASH64 (1) are implemented, \
-                     SHA256 (2) and BLAKE2b (3) are not",
-        }),
+    if btrfs_csum_size(csum_type).is_some() {
+        return Ok(());
     }
+    Err(ParseError::InvalidField {
+        field: "csum_type",
+        reason: "unknown btrfs checksum type: CRC32C (0), XXHASH64 (1), SHA256 (2) and \
+                 BLAKE2b (3) are the algorithms btrfs defines",
+    })
 }
 
 /// Width of the on-disk `csum` field at the front of a btrfs superblock and of
@@ -511,22 +511,24 @@ fn validate_supported_csum_type(csum_type: u16) -> Result<(), ParseError> {
 /// it and the remaining bytes are zero.
 pub const BTRFS_CSUM_FIELD_SIZE: usize = 32;
 
-/// On-disk digest width for `csum_type`, or `None` when FrankenFS does not
-/// implement that algorithm.
+/// On-disk digest width for `csum_type`, or `None` for a value that is not a
+/// btrfs checksum algorithm.
 ///
 /// btrfs has carried four checksum algorithms since kernel 5.5. The width is not
 /// merely how many bytes to compare: in the csum tree it is the STRIDE of the
 /// packed per-sector array, so a reader that assumes 4 bytes on an xxhash64
 /// filesystem indexes into the middle of a neighbouring sector's checksum.
+/// SHA256 and BLAKE2b-256 fill the whole 32-byte field.
 ///
-/// SHA256 (2) and BLAKE2b (3) return `None`. FrankenFS refuses them rather than
-/// guessing, because computing the wrong digest and reporting the resulting
-/// mismatch as corruption is worse than declining to read the filesystem.
+/// An unknown value returns `None` and is refused rather than guessed, because
+/// computing the wrong digest and reporting the resulting mismatch as
+/// corruption is worse than declining to read the filesystem.
 #[must_use]
 pub const fn btrfs_csum_size(csum_type: u16) -> Option<usize> {
     match csum_type {
         ffs_types::BTRFS_CSUM_TYPE_CRC32C => Some(4),
         ffs_types::BTRFS_CSUM_TYPE_XXHASH64 => Some(8),
+        ffs_types::BTRFS_CSUM_TYPE_SHA256 | ffs_types::BTRFS_CSUM_TYPE_BLAKE2B => Some(32),
         _ => None,
     }
 }
@@ -549,6 +551,18 @@ pub fn btrfs_csum(csum_type: u16, bytes: &[u8]) -> Option<[u8; BTRFS_CSUM_FIELD_
         ffs_types::BTRFS_CSUM_TYPE_XXHASH64 => {
             // btrfs seeds xxh64 with 0.
             out[..8].copy_from_slice(&xxhash_rust::xxh64::xxh64(bytes, 0).to_le_bytes());
+        }
+        ffs_types::BTRFS_CSUM_TYPE_SHA256 => {
+            use sha2::Digest as _;
+            out.copy_from_slice(&sha2::Sha256::digest(bytes));
+        }
+        ffs_types::BTRFS_CSUM_TYPE_BLAKE2B => {
+            // The kernel's "blake2b-256": unkeyed BLAKE2b with a 32-byte
+            // digest length in its parameter block (not a truncated -512).
+            use blake2::Digest as _;
+            out.copy_from_slice(&blake2::Blake2b::<blake2::digest::consts::U32>::digest(
+                bytes,
+            ));
         }
         _ => return None,
     }
@@ -4419,11 +4433,7 @@ mod tests {
         sb[0x90..0x94].copy_from_slice(&4096_u32.to_le_bytes());
         sb[0x94..0x98].copy_from_slice(&16384_u32.to_le_bytes());
 
-        for csum_type in [
-            ffs_types::BTRFS_CSUM_TYPE_SHA256,
-            ffs_types::BTRFS_CSUM_TYPE_BLAKE2B,
-            9, // not an algorithm at all
-        ] {
+        for csum_type in [4, 9, u16::MAX] {
             sb[0xC4..0xC6].copy_from_slice(&csum_type.to_le_bytes());
             let err = BtrfsSuperblock::parse_superblock_region(&sb).unwrap_err();
             assert!(
@@ -4441,6 +4451,8 @@ mod tests {
         for csum_type in [
             ffs_types::BTRFS_CSUM_TYPE_CRC32C,
             ffs_types::BTRFS_CSUM_TYPE_XXHASH64,
+            ffs_types::BTRFS_CSUM_TYPE_SHA256,
+            ffs_types::BTRFS_CSUM_TYPE_BLAKE2B,
         ] {
             sb[0xC4..0xC6].copy_from_slice(&csum_type.to_le_bytes());
             let parsed = BtrfsSuperblock::parse_superblock_region(&sb)
@@ -5978,10 +5990,7 @@ mod tests {
     /// before that algorithm was implemented (bd-csum-parity).
     #[test]
     fn verify_superblock_checksum_unsupported_type() {
-        for csum_type in [
-            ffs_types::BTRFS_CSUM_TYPE_SHA256,
-            ffs_types::BTRFS_CSUM_TYPE_BLAKE2B,
-        ] {
+        for csum_type in [4_u16, 9] {
             let mut sb = make_checksummed_sb();
             sb[0xC4..0xC6].copy_from_slice(&csum_type.to_le_bytes());
             let err = verify_superblock_checksum(&sb).unwrap_err();
@@ -6103,19 +6112,55 @@ mod tests {
         );
     }
 
-    /// The unimplemented algorithms must still fail CLOSED and say so.
+    /// SHA256 and BLAKE2b-256 (kernel "sha256" and "blake2b-256") fill the
+    /// whole 32-byte field, and a tree block checksummed with either verifies.
+    /// Known answers for "abc" are the FIPS 180-2 SHA-256 vector and the
+    /// BLAKE2b-256 vector (32-byte digest length, unkeyed).
     #[test]
-    fn sha256_and_blake2b_are_refused_not_guessed_bd_csum_parity() {
-        let mut block = vec![0_u8; 16384];
-        block[0x64] = 0;
-        let crc = crc32c::crc32c(&block[0x20..]);
-        block[0..4].copy_from_slice(&crc.to_le_bytes());
+    fn sha256_and_blake2b_match_known_answers() {
+        let hex = |bytes: &[u8]| {
+            bytes.iter().fold(String::new(), |mut out, b| {
+                use std::fmt::Write as _;
+                let _ = write!(out, "{b:02x}");
+                out
+            })
+        };
+        let sha = btrfs_csum(ffs_types::BTRFS_CSUM_TYPE_SHA256, b"abc").expect("sha256");
+        assert_eq!(
+            hex(&sha),
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad"
+        );
+        let b2 = btrfs_csum(ffs_types::BTRFS_CSUM_TYPE_BLAKE2B, b"abc").expect("blake2b");
+        assert_eq!(
+            hex(&b2),
+            "bddd813c634239723171ef3fee98579b94964e3bb1cb3e427262c8c068d52319"
+        );
         for csum_type in [
             ffs_types::BTRFS_CSUM_TYPE_SHA256,
             ffs_types::BTRFS_CSUM_TYPE_BLAKE2B,
         ] {
+            assert_eq!(btrfs_csum_size(csum_type), Some(32));
+            let mut block = vec![0x5A_u8; 16384];
+            let csum = btrfs_csum(csum_type, &block[0x20..]).expect("digest");
+            block[..32].copy_from_slice(&csum);
+            verify_tree_block_checksum(&block, csum_type).expect("checksummed block verifies");
+            block[100] ^= 1;
+            assert!(verify_tree_block_checksum(&block, csum_type).is_err());
+        }
+    }
+
+    /// A value that is not a btrfs checksum algorithm must still fail CLOSED
+    /// and say so (SHA256 and BLAKE2b, refused here before they were
+    /// implemented, are covered by `sha256_and_blake2b_match_known_answers`).
+    #[test]
+    fn unknown_csum_types_are_refused_not_guessed_bd_csum_parity() {
+        let mut block = vec![0_u8; 16384];
+        block[0x64] = 0;
+        let crc = crc32c::crc32c(&block[0x20..]);
+        block[0..4].copy_from_slice(&crc.to_le_bytes());
+        for csum_type in [4, 9] {
             let err = verify_tree_block_checksum(&block, csum_type)
-                .expect_err("unimplemented checksum types must be refused, never assumed CRC32C");
+                .expect_err("unknown checksum types must be refused, never assumed CRC32C");
             assert!(
                 matches!(
                     err,

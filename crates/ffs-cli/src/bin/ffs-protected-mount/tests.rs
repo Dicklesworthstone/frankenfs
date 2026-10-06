@@ -12,9 +12,9 @@ use tempfile::TempDir;
 // until it execs, and a flock belongs to the open file description: a
 // sibling test's mkfs/debugfs child could still hold an image or sidecar
 // lock a test had just released, and its re-open failed with WouldBlock
-// (flaky on CI and locally). Spawns are counted until `spawn` returns, which
-// is after the child has exec'd; re-opens wait until none is in progress.
-// Spawns never wait, so a test holding a device can still run a command.
+// (flaky on CI and locally). Spawns are counted until the child has exited
+// (see `command`); re-opens wait until none is in progress. Spawns never
+// wait, so a test holding a device can still run a command.
 static SPAWNS_IN_PROGRESS: Mutex<usize> = Mutex::new(0);
 static SPAWNS_DONE: Condvar = Condvar::new();
 
@@ -71,10 +71,15 @@ pub fn command(command: &mut Command) -> Output {
     *SPAWNS_IN_PROGRESS
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
-    let spawned = command
+    let output = command
         .stdout(std::process::Stdio::piped())
         .stderr(std::process::Stdio::piped())
-        .spawn();
+        .spawn()
+        .and_then(std::process::Child::wait_with_output);
+    // Released only once the child has EXITED: `spawn` returns when execve
+    // releases the parent (exec_mmap), before the kernel closes the child's
+    // close-on-exec descriptors, so for a moment after `spawn` the child
+    // can still hold a sibling test's just-released lock (bd-hi96g).
     {
         let mut count = SPAWNS_IN_PROGRESS
             .lock()
@@ -84,9 +89,7 @@ pub fn command(command: &mut Command) -> Output {
             SPAWNS_DONE.notify_all();
         }
     }
-    let output = spawned
-        .and_then(std::process::Child::wait_with_output)
-        .expect("required filesystem oracle must be installed");
+    let output = output.expect("required filesystem oracle must be installed");
     assert!(
         output.status.success(),
         "oracle failed: {command:?}\nstdout: {}\nstderr: {}",

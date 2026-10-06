@@ -79,6 +79,7 @@ doc_markdown = { level = "allow", priority = 1 }
 anyhow = "1.0.104"
 arc-swap = "1.9.2"
 bitflags = "2.13.1"
+blake2 = "0.10.6"
 blake3 = "1.8.5"
 clap = { version = "4.6.4", features = ["derive"] }
 crc32c = "0.6.8"
