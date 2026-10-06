@@ -1,9 +1,9 @@
 #![forbid(unsafe_code)]
 //! Explicitly authorized, sidecar-protected FUSE mounts.
 //!
-//! All format reads go through the same admitted repair device. The ordinary
-//! mount command is unchanged; this entry point never creates protection from
-//! an unknown image or treats startup differences as repairable corruption.
+//! All format reads and writes go through the same admitted repair device.
+//! Caller writes require --rw; read-only remains the default. The ordinary
+//! mount command is unchanged, and startup differences never authorize rollback.
 
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
@@ -27,7 +27,7 @@ use std::sync::{Arc, Mutex};
 #[derive(Debug, Parser)]
 #[command(
     name = "ffs-protected-mount",
-    about = "Mount a clean image read-only with explicitly authorized RaptorQ read repair"
+    about = "Mount a clean image with RaptorQ protection (read-only unless --rw)"
 )]
 struct Args {
     image: PathBuf,
@@ -40,6 +40,9 @@ struct Args {
     /// Validate admission and filesystem opening without mounting or enabling writes.
     #[arg(long, conflicts_with = "mountpoint")]
     check: bool,
+    /// Allow filesystem writes. Durability barriers also refresh sidecar protection.
+    #[arg(long, conflicts_with = "check")]
+    rw: bool,
     /// Let other users access the mount, subject to normal file permissions.
     #[arg(long, conflicts_with = "check")]
     allow_other: bool,
@@ -55,27 +58,37 @@ struct Authority {
     allow_repair: bool,
 }
 
-/// The filesystem cannot write through this adapter. Read repair belongs to
-/// the device itself and is permitted only by the explicit CLI authority.
+/// Caller-write authority is independent of read-repair authority. Both modes
+/// retain the same device and inode locks for every format I/O operation.
 #[derive(Debug)]
-struct ProtectedReadOnly(Arc<SidecarImageDevice>);
+struct ProtectedDevice {
+    inner: Arc<SidecarImageDevice>,
+    writable: bool,
+}
 
-impl ByteDevice for ProtectedReadOnly {
+impl ByteDevice for ProtectedDevice {
     fn len_bytes(&self) -> u64 {
-        self.0.len_bytes()
+        self.inner.len_bytes()
     }
 
     fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, out: &mut [u8]) -> ffs_error::Result<()> {
-        self.0.read_exact_at(cx, offset, out)
+        self.inner.read_exact_at(cx, offset, out)
     }
 
-    fn write_all_at(&self, cx: &Cx, _offset: ByteOffset, _data: &[u8]) -> ffs_error::Result<()> {
+    fn write_all_at(&self, cx: &Cx, offset: ByteOffset, data: &[u8]) -> ffs_error::Result<()> {
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
-        Err(FfsError::ReadOnly)
+        if !self.writable {
+            return Err(FfsError::ReadOnly);
+        }
+        // The device durably fences the old protection before the first source
+        // mutation and tracks the intended bytes until a successful sync.
+        self.inner.write_all_at(cx, offset, data)
     }
 
     fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
-        self.0.sync(cx)
+        // Do not reduce this to source-file fsync: success must also mean that
+        // the current repair archive was verified and durably published.
+        self.inner.sync(cx)
     }
 }
 
@@ -93,6 +106,13 @@ impl Prepared {
         let fs = Arc::try_unwrap(self.fs).map_err(|_| {
             anyhow::anyhow!("FUSE still owns the filesystem after unmount; shutdown is incomplete")
         })?;
+        if fs.is_writable() {
+            // Device sync alone cannot drain committed MVCC writes or publish
+            // btrfs CoW roots. Use the filesystem's durable full-commit path
+            // first, while the filesystem still exists and dispatch is quiescent.
+            FsOps::fsyncdir(&fs, cx, &mut RequestScope::empty(), InodeNumber(1), 0, false)
+                .context("checkpoint protected filesystem before shutdown")?;
+        }
         drop(fs);
         self.device.sync(cx).context("final protected-device sync")
     }
@@ -101,6 +121,9 @@ impl Prepared {
 fn checked_paths(args: &Args) -> Result<(PathBuf, PathBuf, Option<PathBuf>)> {
     if !args.authority.exclusive_image || !args.authority.allow_repair {
         bail!("--exclusive-image and --allow-repair are required");
+    }
+    if args.check && args.rw {
+        bail!("--check cannot enable filesystem writes; omit --rw");
     }
     if args.check == args.mountpoint.is_some() {
         bail!("choose a mountpoint or --check, but not both");
@@ -139,8 +162,8 @@ fn clean_single_image(cx: &Cx, device: &dyn ByteDevice) -> Result<&'static str> 
     match detect_filesystem(&probe).context("detect protected filesystem")? {
         FsFlavor::Ext4(sb) => {
             // RECOVER and the orphan/error states require filesystem recovery,
-            // not RaptorQ rollback. The companion mount initially admits only
-            // clean protection points; Skip below is never a dirty-mount bypass.
+            // not RaptorQ rollback. Admit only clean protection points, including
+            // for --rw; Skip below is never a dirty-mount bypass.
             if sb.has_incompat(ffs_ondisk::Ext4IncompatFeatures::RECOVER)
                 || sb.state != EXT4_VALID_FS
                 || sb.last_orphan != 0
@@ -170,15 +193,24 @@ fn prepare(cx: &Cx, args: &Args) -> Result<Prepared> {
         ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
         ..OpenOptions::default()
     };
-    let fs = OpenFs::from_device(
+    let mut fs = OpenFs::from_device(
         cx,
-        Box::new(ProtectedReadOnly(Arc::clone(&device))),
+        Box::new(ProtectedDevice {
+            inner: Arc::clone(&device),
+            writable: args.rw,
+        }),
         &options,
     )
     .context("open filesystem through the protected device")?;
-    // Exercise the actual FUSE root alias before exposing the mount.
+    // Exercise the actual FUSE root alias before enabling caller writes.
     FsOps::getattr(&fs, cx, &mut RequestScope::empty(), InodeNumber(1))
         .context("read protected filesystem root")?;
+    if args.rw {
+        // Preserve all ordinary format/profile/feature write-admission checks.
+        // No ephemeral btrfs mode or kernel writeback cache is enabled here.
+        fs.enable_writes(cx)
+            .context("enable protected filesystem writes")?;
+    }
     Ok(Prepared {
         fs: Arc::new(fs),
         device,
@@ -189,7 +221,7 @@ fn prepare(cx: &Cx, args: &Args) -> Result<Prepared> {
 
 fn mount_options(args: &Args) -> MountOptions {
     MountOptions {
-        read_only: true,
+        read_only: !args.rw,
         allow_other: args.allow_other,
         auto_unmount: true,
         ..MountOptions::default()
@@ -210,7 +242,7 @@ fn emit(event: &str, prepared: &Prepared) -> Result<()> {
         event,
         filesystem: prepared.filesystem,
         image_bytes: prepared.device.len_bytes(),
-        read_only: true,
+        read_only: !prepared.fs.is_writable(),
         repair_writes_authorized: true,
     };
     let mut out = std::io::stdout().lock();
@@ -218,6 +250,39 @@ fn emit(event: &str, prepared: &Prepared) -> Result<()> {
     writeln!(out)?;
     out.flush()?;
     Ok(())
+}
+
+fn serve(
+    cx: &Cx,
+    args: &Args,
+    prepared: &Prepared,
+    stopped: &AtomicBool,
+    shutdown: &Mutex<Option<Arc<AtomicBool>>>,
+) -> Result<()> {
+    if args.check {
+        return emit("checked_not_mounted", prepared);
+    }
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+    let mountpoint = prepared.mountpoint.as_ref().context("missing mountpoint")?;
+    let config = MountConfig {
+        options: mount_options(args),
+        ..MountConfig::default()
+    };
+    let handle = mount_managed(Box::new(Arc::clone(&prepared.fs)), mountpoint, &config)
+        .context("mount protected filesystem")?;
+    let flag = Arc::clone(handle.shutdown_flag());
+    *shutdown
+        .lock()
+        .map_err(|_| anyhow::anyhow!("shutdown state poisoned"))? = Some(Arc::clone(&flag));
+    if stopped.load(Ordering::Acquire) {
+        flag.store(true, Ordering::Release);
+    }
+    let announce = emit("mounted", prepared);
+    if announce.is_err() {
+        flag.store(true, Ordering::Release);
+    }
+    let _metrics = handle.wait();
+    announce
 }
 
 fn run(args: &Args) -> Result<()> {
@@ -239,34 +304,18 @@ fn run(args: &Args) -> Result<()> {
     .context("install shutdown handler")?;
 
     let prepared = prepare(&cx, args)?;
-    if args.check {
-        emit("checked_not_mounted", &prepared)?;
-        return prepared.finish(&cx);
+    let operation = serve(&cx, args, &prepared, &stopped, &shutdown);
+    // Every exit after successful preparation attempts cleanup, including
+    // mount failure, announcement failure and startup cancellation. Cleanup
+    // has its own capability; Ctrl-C must not cancel the durability barrier.
+    let cleanup = prepared.finish(&Cx::for_request());
+    match (operation, cleanup) {
+        (Ok(()), cleanup) => cleanup,
+        (Err(operation), Ok(())) => Err(operation),
+        (Err(operation), Err(cleanup)) => {
+            Err(cleanup).context(format!("protected operation also failed: {operation:#}"))
+        }
     }
-    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
-    let mountpoint = prepared.mountpoint.as_ref().context("missing mountpoint")?;
-    let config = MountConfig {
-        options: mount_options(args),
-        ..MountConfig::default()
-    };
-    let handle = mount_managed(Box::new(Arc::clone(&prepared.fs)), mountpoint, &config)
-        .context("mount protected filesystem")?;
-    let flag = Arc::clone(handle.shutdown_flag());
-    *shutdown
-        .lock()
-        .map_err(|_| anyhow::anyhow!("shutdown state poisoned"))? = Some(Arc::clone(&flag));
-    if stopped.load(Ordering::Acquire) {
-        flag.store(true, Ordering::Release);
-    }
-    let announce = emit("mounted", &prepared);
-    if announce.is_err() {
-        flag.store(true, Ordering::Release);
-    }
-    let _metrics = handle.wait();
-    // Shutdown is not performed with the cancelled startup context. We own a
-    // separate cleanup capability and retain the device until it completes.
-    prepared.finish(&Cx::for_request())?;
-    announce
 }
 
 fn main() -> ExitCode {
