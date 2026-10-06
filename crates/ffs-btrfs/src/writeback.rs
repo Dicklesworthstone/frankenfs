@@ -912,17 +912,85 @@ impl DiskWritebackContext {
         }
     }
 
+    /// Resolve a complete, sector-aligned node range before serialization.
+    ///
+    /// An allocation map is authoritative, not a hint. In particular, a missing
+    /// entry must never fall through to a simulator address that could name an
+    /// unrelated block on the real filesystem. Synthetic addressing is allowed
+    /// only when the entire context is explicitly in simulator mode.
+    fn serialization_bytenr(&self, block: u64) -> Result<u64, BtrfsMutationError> {
+        if !self.nodesize.is_power_of_two()
+            || !self.sector_size.is_power_of_two()
+            || self.sector_size > self.nodesize
+        {
+            return Err(BtrfsMutationError::InvalidConfig(
+                "invalid writeback node or sector size",
+            ));
+        }
+        let bytenr = match &self.allocated_addrs {
+            Some(addrs) => {
+                let bytenr = addrs.get(&block).copied().ok_or(
+                    BtrfsMutationError::BrokenInvariant("missing allocated writeback address"),
+                )?;
+                if bytenr == 0 {
+                    return Err(BtrfsMutationError::BrokenInvariant(
+                        "allocated writeback address is zero",
+                    ));
+                }
+                bytenr
+            }
+            None => block.checked_mul(u64::from(self.nodesize)).ok_or(
+                BtrfsMutationError::BrokenInvariant("synthetic writeback address overflows"),
+            )?,
+        };
+        if bytenr & (u64::from(self.sector_size) - 1) != 0 {
+            return Err(BtrfsMutationError::BrokenInvariant(
+                "writeback address is not sector aligned",
+            ));
+        }
+        bytenr.checked_add(u64::from(self.nodesize)).ok_or(
+            BtrfsMutationError::BrokenInvariant("writeback node range overflows"),
+        )?;
+        Ok(bytenr)
+    }
+
+    /// A parent and its direct children must occupy disjoint node ranges.
+    ///
+    /// This is a local serialization invariant, not an allocator ownership or
+    /// whole-tree alias proof. The allocator still owns admission of every
+    /// range to its chunk and exclusion from all other live tree extents.
+    fn validate_serialized_ranges(
+        &self,
+        bytenr: u64,
+        child_bytenrs: &[u64],
+    ) -> Result<(), BtrfsMutationError> {
+        if child_bytenrs.is_empty() {
+            return Ok(());
+        }
+        let mut starts = Vec::with_capacity(child_bytenrs.len() + 1);
+        starts.push(bytenr);
+        starts.extend_from_slice(child_bytenrs);
+        starts.sort_unstable();
+        if starts
+            .windows(2)
+            .any(|pair| pair[1] - pair[0] < u64::from(self.nodesize))
+        {
+            return Err(BtrfsMutationError::BrokenInvariant(
+                "writeback node references overlapping node ranges",
+            ));
+        }
+        Ok(())
+    }
+
     /// Serialize a node and return the bytes ready for disk write.
     ///
     /// `level` is the node's level in the tree (0 for leaf, 1+ for internal).
     ///
-    /// For internal nodes, child blockptrs in the serialized bytes are
-    /// resolved through the allocation map (when present) so that the
-    /// on-disk node references its children by their allocated logical
-    /// addresses — not by the in-memory block numbers the CoW tree uses
-    /// internally. When the context has no allocation map (test mode),
-    /// children fall back to the legacy `block * nodesize` mapping via
-    /// `block_to_bytenr`, which is what the simulator expects.
+    /// An allocated context requires an explicit address for this node and
+    /// every direct child. Missing, overflowing, unaligned, or overlapping
+    /// ranges are rejected before returning serialized bytes. An explicitly
+    /// synthetic context retains checked `block * nodesize` addressing.
+    /// These checks do not replace allocator ownership or chunk-map validation.
     pub fn serialize_node(
         &self,
         tree: &InMemoryCowBtrfsTree,
@@ -930,6 +998,7 @@ impl DiskWritebackContext {
         level: u8,
     ) -> Result<Vec<u8>, BtrfsMutationError> {
         let node = tree.node_snapshot(block)?;
+        let bytenr = self.serialization_bytenr(block)?;
 
         let (child_generations, child_bytenrs, child_min_keys) = match &node {
             BtrfsCowNode::Leaf { .. } => (Vec::new(), Vec::new(), Vec::new()),
@@ -944,7 +1013,11 @@ impl DiskWritebackContext {
                     .iter()
                     .map(|c| self.generation_of_block(*c))
                     .collect();
-                let bytenrs = children.iter().map(|c| self.block_to_bytenr(*c)).collect();
+                let bytenrs = children
+                    .iter()
+                    .map(|child| self.serialization_bytenr(*child))
+                    .collect::<Result<Vec<_>, _>>()?;
+                self.validate_serialized_ranges(bytenr, &bytenrs)?;
                 // Each key_ptr must carry the child's true subtree minimum key,
                 // not the CoW separator (bd-6uyto).
                 let mut mins = Vec::with_capacity(children.len());
@@ -958,14 +1031,227 @@ impl DiskWritebackContext {
             }
         };
 
-        let params = self.params_for_block(
+        let mut params = self.params_for_block(
             block,
             level,
             child_generations,
             child_bytenrs,
             child_min_keys,
         );
+        // Do not let the unchecked simulator convenience helper determine the
+        // address in the serialized header. It must match the admitted range.
+        params.bytenr = bytenr;
         node.serialize(&params)
+    }
+}
+
+#[cfg(test)]
+mod strict_writeback_mapping_tests {
+    use super::*;
+    use crate::{BtrfsBTree, BtrfsKey};
+    use ffs_ondisk::{BtrfsHeader, verify_btrfs_tree_block_checksum};
+
+    fn fixture() -> (InMemoryCowBtrfsTree, DiskWritebackContext, Vec<u64>) {
+        let mut tree = InMemoryCowBtrfsTree::new(4).expect("tree");
+        for index in 0..16_u64 {
+            tree.insert(
+                BtrfsKey {
+                    objectid: index + 256,
+                    item_type: 0x84,
+                    offset: index * 4096,
+                },
+                &index.to_le_bytes(),
+            )
+            .expect("insert");
+        }
+        let dag = WriteDependencyDag::from_cow_tree(&tree, 100).expect("dag");
+        let addrs = dag
+            .blocks()
+            .enumerate()
+            .map(|(index, block)| (block, 0x10_0000 + u64::try_from(index).unwrap() * 0x8000))
+            .collect();
+        let ctx = DiskWritebackContext::with_allocated_addresses(
+            [0x11; 16],
+            [0x22; 16],
+            100,
+            5,
+            16384,
+            ffs_types::BTRFS_CSUM_TYPE_CRC32C,
+            4096,
+            addrs,
+        );
+        let BtrfsCowNode::Internal { children, .. } =
+            tree.node_snapshot(tree.root_block()).expect("root")
+        else {
+            panic!("fixture must exercise an internal node");
+        };
+        assert!(children.len() >= 2);
+        ctx.serialize_node(&tree, tree.root_block(), tree.root_level())
+            .expect("unmodified fixture must serialize");
+        (tree, ctx, children)
+    }
+
+    fn expect_mapping_error(
+        tree: &InMemoryCowBtrfsTree,
+        ctx: &DiskWritebackContext,
+        expected: &str,
+    ) {
+        let error = ctx
+            .serialize_node(tree, tree.root_block(), tree.root_level())
+            .expect_err("invalid mapping must not return writable bytes");
+        assert!(
+            matches!(error, BtrfsMutationError::BrokenInvariant(message) if message == expected),
+            "expected mapping rejection: {expected}"
+        );
+    }
+
+    #[test]
+    fn missing_parent_mapping_does_not_use_a_synthetic_address() {
+        let (tree, mut ctx, _) = fixture();
+        ctx.allocated_addrs.as_mut().unwrap().remove(&tree.root_block());
+        expect_mapping_error(&tree, &ctx, "missing allocated writeback address");
+    }
+
+    #[test]
+    fn missing_child_mapping_does_not_publish_a_synthetic_pointer() {
+        let (tree, mut ctx, children) = fixture();
+        ctx.allocated_addrs.as_mut().unwrap().remove(&children[0]);
+        expect_mapping_error(&tree, &ctx, "missing allocated writeback address");
+    }
+
+    #[test]
+    fn empty_allocated_map_does_not_enable_simulator_mode() {
+        let (tree, mut ctx, _) = fixture();
+        ctx.allocated_addrs = Some(BTreeMap::new());
+        expect_mapping_error(&tree, &ctx, "missing allocated writeback address");
+    }
+
+    #[test]
+    fn invalid_parent_and_child_ranges_are_rejected() {
+        let (tree, mut ctx, children) = fixture();
+        let original = ctx.allocated_addrs.clone();
+        for block in [tree.root_block(), children[0]] {
+            for (address, message) in [
+                (0, "allocated writeback address is zero"),
+                (0x10_0001, "writeback address is not sector aligned"),
+                (u64::MAX - 4095, "writeback node range overflows"),
+            ] {
+                ctx.allocated_addrs = original.clone();
+                ctx.allocated_addrs.as_mut().unwrap().insert(block, address);
+                expect_mapping_error(&tree, &ctx, message);
+            }
+        }
+    }
+
+    #[test]
+    fn parent_child_and_sibling_overlaps_are_rejected() {
+        let (tree, mut ctx, children) = fixture();
+        let original = ctx.allocated_addrs.clone();
+        for (left, right) in [
+            (tree.root_block(), children[0]),
+            (children[0], children[1]),
+        ] {
+            for delta in [0, 4096, 12288] {
+                ctx.allocated_addrs = original.clone();
+                let addrs = ctx.allocated_addrs.as_mut().unwrap();
+                addrs.insert(left, 0x80_0000);
+                addrs.insert(right, 0x80_0000 + delta);
+                expect_mapping_error(
+                    &tree,
+                    &ctx,
+                    "writeback node references overlapping node ranges",
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn adjacent_ranges_remain_valid_without_nodesize_alignment() {
+        let (_, ctx, _) = fixture();
+        let base = 0x80_1000;
+        assert!(
+            ctx.validate_serialized_ranges(base, &[base + 16384, base + 32768])
+                .is_ok()
+        );
+        let mut ctx = ctx;
+        ctx.allocated_addrs = Some(BTreeMap::from([(7, base)]));
+        assert_eq!(ctx.serialization_bytenr(7).unwrap(), base);
+    }
+
+    #[test]
+    fn invalid_geometry_is_rejected_without_panicking() {
+        let (tree, mut ctx, _) = fixture();
+        for (nodesize, sector_size) in [(0, 4096), (16384, 0), (12288, 4096), (4096, 8192)] {
+            ctx.nodesize = nodesize;
+            ctx.sector_size = sector_size;
+            let error = ctx
+                .serialize_node(&tree, tree.root_block(), tree.root_level())
+                .expect_err("invalid geometry");
+            assert!(matches!(error, BtrfsMutationError::InvalidConfig(_)));
+        }
+    }
+
+    #[test]
+    fn synthetic_mapping_is_explicit_and_checked() {
+        let (tree, mut ctx, _) = fixture();
+        ctx.allocated_addrs = None;
+        assert_eq!(ctx.serialization_bytenr(0).unwrap(), 0);
+        assert_eq!(ctx.serialization_bytenr(7).unwrap(), 7 * 16384);
+        assert!(matches!(
+            ctx.serialization_bytenr(u64::MAX),
+            Err(BtrfsMutationError::BrokenInvariant(
+                "synthetic writeback address overflows"
+            ))
+        ));
+        let last_aligned_block = u64::MAX / 16384;
+        assert!(matches!(
+            ctx.serialization_bytenr(last_aligned_block),
+            Err(BtrfsMutationError::BrokenInvariant(
+                "writeback node range overflows"
+            ))
+        ));
+        let bytes = ctx
+            .serialize_node(&tree, tree.root_block(), tree.root_level())
+            .expect("valid synthetic tree");
+        let header = BtrfsHeader::parse_from_block(&bytes).unwrap();
+        assert_eq!(header.bytenr, tree.root_block() * 16384);
+    }
+
+    #[test]
+    fn valid_mapping_preserves_bytes_and_reused_child_generations() {
+        let (tree, mut ctx, children) = fixture();
+        ctx.block_generations = Some(BTreeMap::from([(children[0], 41)]));
+        let addrs = ctx.allocated_addrs.as_ref().unwrap();
+        let child_addrs = children.iter().map(|child| addrs[child]).collect();
+        let child_gens = children
+            .iter()
+            .map(|child| if *child == children[0] { 41 } else { 100 })
+            .collect();
+        let child_keys = children
+            .iter()
+            .map(|child| tree.subtree_min_key(*child).unwrap().unwrap())
+            .collect();
+        let params = ctx.params_for_block(
+            tree.root_block(),
+            tree.root_level(),
+            child_gens,
+            child_addrs,
+            child_keys,
+        );
+        let expected = tree
+            .node_snapshot(tree.root_block())
+            .unwrap()
+            .serialize(&params)
+            .expect("existing serializer");
+        let actual = ctx
+            .serialize_node(&tree, tree.root_block(), tree.root_level())
+            .expect("checked serializer");
+        assert_eq!(actual, expected);
+        let header = BtrfsHeader::parse_from_block(&actual).unwrap();
+        assert_eq!(header.bytenr, addrs[&tree.root_block()]);
+        assert_eq!(header.generation, 100);
+        verify_btrfs_tree_block_checksum(&actual, ffs_types::BTRFS_CSUM_TYPE_CRC32C)
+            .expect("checksum");
     }
 }
 
