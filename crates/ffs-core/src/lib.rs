@@ -34264,21 +34264,39 @@ impl OpenFs {
         let range_end = range_start
             .checked_add(buf_len)
             .ok_or_else(|| FfsError::InvalidGeometry("rmw range end overflow".into()))?;
+        // Only the items from the one covering `range_start` up to `range_end`
+        // can overlap (EXTENT_DATA items never overlap). Walking and copying
+        // every item of the file instead made each small read-modify-write
+        // O(extents), so 256 threads writing pages into a hole went quadratic
+        // (xfstests generic/344 on btrfs: >30 min against 2 min on ext4).
+        let lo = Self::btrfs_extent_window_floor(alloc, canonical, range_start)?;
         let ext_start = BtrfsKey {
             objectid: canonical,
             item_type: BTRFS_ITEM_EXTENT_DATA,
-            offset: 0,
+            offset: lo,
         };
         let ext_end = BtrfsKey {
             objectid: canonical,
             item_type: BTRFS_ITEM_EXTENT_DATA,
             offset: u64::MAX,
         };
-        for (key, edata) in alloc
+        let mut window: Vec<(u64, Vec<u8>)> = Vec::new();
+        alloc
             .fs_tree
-            .range(&ext_start, &ext_end)
-            .map_err(|e| btrfs_mutation_to_ffs(&e))?
-        {
+            .range_until(&ext_start, &ext_end, |key, value| {
+                if key.offset >= range_end {
+                    return std::ops::ControlFlow::Break(());
+                }
+                window.push((key.offset, value.to_vec()));
+                std::ops::ControlFlow::Continue(())
+            })
+            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        for (offset, edata) in window {
+            let key = BtrfsKey {
+                objectid: canonical,
+                item_type: BTRFS_ITEM_EXTENT_DATA,
+                offset,
+            };
             let extent = parse_extent_data(&edata).map_err(|e| parse_to_ffs_error(&e))?;
             let logical_len = Self::btrfs_extent_logical_len(&extent)?;
             let ext_end_off = key.offset.saturating_add(logical_len);
