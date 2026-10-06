@@ -3742,6 +3742,10 @@ pub struct InMemoryCowBtrfsTree {
     /// superseded version for the life of the tree (bd-btrcow-evict).
     prev_committed_retired: Vec<u64>,
     nodes: FxHashMap<u64, BtrfsCowNode>,
+    /// Nodes allocated since the last [`Self::seal`], which a standalone
+    /// insert or update may change in place (bd-dysiw). `None`, the default,
+    /// keeps every mutation a pure COW.
+    fresh: Option<FxHashSet<u64>>,
 }
 
 impl InMemoryCowBtrfsTree {
@@ -3778,6 +3782,7 @@ impl InMemoryCowBtrfsTree {
             staged_deferred_frees: Vec::new(),
             prev_committed_retired: Vec::new(),
             nodes,
+            fresh: None,
         })
     }
 
@@ -3908,6 +3913,9 @@ impl InMemoryCowBtrfsTree {
         let block = self.allocator.alloc_block()?;
         self.nodes.insert(block, node);
         self.staged_allocations.push(block);
+        if let Some(fresh) = &mut self.fresh {
+            fresh.insert(block);
+        }
         trace!(block, "btrfs_cow_alloc_node");
         Ok(block)
     }
@@ -3937,6 +3945,9 @@ impl InMemoryCowBtrfsTree {
         // removing them), so eviction is correct only here, post-commit.
         for block in self.prev_committed_retired.drain(..) {
             self.nodes.remove(&block);
+            if let Some(fresh) = &mut self.fresh {
+                fresh.remove(&block);
+            }
         }
         self.prev_committed_retired
             .extend_from_slice(&self.staged_deferred_frees);
@@ -3957,6 +3968,9 @@ impl InMemoryCowBtrfsTree {
     fn rollback_allocated_nodes(&mut self) {
         for block in self.staged_allocations.drain(..).rev() {
             self.nodes.remove(&block);
+            if let Some(fresh) = &mut self.fresh {
+                fresh.remove(&block);
+            }
             self.allocator.defer_free(block);
             trace!(block, "btrfs_cow_rollback_alloc");
         }
@@ -3983,6 +3997,10 @@ impl InMemoryCowBtrfsTree {
     ) -> Result<u64, BtrfsMutationError> {
         debug_assert_eq!(self.staged_allocations, [] as [u64; 0]);
         debug_assert_eq!(self.staged_deferred_frees, [] as [u64; 0]);
+        let entry = match self.try_insert_in_place(entry, allow_replace) {
+            Ok(root) => return Ok(root),
+            Err(entry) => entry,
+        };
         let old_root = self.root;
         trace!(
             root = old_root,
@@ -4676,16 +4694,115 @@ impl InMemoryCowBtrfsTree {
     }
 
     fn leaf_exceeds_capacity(&self, items: &[BtrfsTreeItem]) -> bool {
+        Self::leaf_over(items, self.max_items, self.leaf_byte_budget)
+    }
+
+    fn leaf_over(items: &[BtrfsTreeItem], max_items: usize, byte_budget: usize) -> bool {
         if items.len() <= 1 {
             return false;
         }
-        if items.len() > self.max_items {
+        if items.len() > max_items {
             return true;
         }
-        if self.leaf_byte_budget == usize::MAX {
+        if byte_budget == usize::MAX {
             return false;
         }
-        Self::leaf_serialized_bytes(items) > self.leaf_byte_budget
+        Self::leaf_serialized_bytes(items) > byte_budget
+    }
+
+    /// The in-place fast path of `insert_entry` (bd-dysiw).
+    ///
+    /// When every node on the root-to-leaf path was allocated since the last
+    /// [`Self::seal`] and the leaf stays within capacity, the leaf itself is
+    /// changed: the items are exactly those the COW path would build into a
+    /// copy, and no node is allocated or retired. Nothing fallible runs after
+    /// the leaf changes, so the mutation stays atomic. Gives the entry back
+    /// when the COW path must run instead (including a duplicate key without
+    /// `allow_replace`, whose error that path reports).
+    fn try_insert_in_place(
+        &mut self,
+        entry: BtrfsTreeItem,
+        allow_replace: bool,
+    ) -> Result<u64, BtrfsTreeItem> {
+        let Some(fresh) = self.fresh.as_ref() else {
+            return Err(entry);
+        };
+        let mut block = self.root;
+        loop {
+            if !fresh.contains(&block) {
+                return Err(entry);
+            }
+            match self.nodes.get(&block) {
+                Some(BtrfsCowNode::Internal { keys, children }) => {
+                    let Some(&child) = children.get(Self::child_slot(keys, &entry.key)) else {
+                        return Err(entry);
+                    };
+                    block = child;
+                }
+                Some(BtrfsCowNode::Leaf { .. }) => break,
+                None => return Err(entry),
+            }
+        }
+        let (max_items, byte_budget) = (self.max_items, self.leaf_byte_budget);
+        let Some(BtrfsCowNode::Leaf { items }) = self.nodes.get_mut(&block) else {
+            return Err(entry);
+        };
+        let idx = items.partition_point(|existing| key_cmp(&existing.key, &entry.key).is_lt());
+        let replacing = items
+            .get(idx)
+            .is_some_and(|existing| key_cmp(&existing.key, &entry.key) == Ordering::Equal);
+        if replacing && !allow_replace {
+            return Err(entry);
+        }
+        let replaced = if replacing {
+            Some(std::mem::replace(&mut items[idx].data, entry.data))
+        } else {
+            items.insert(idx, entry);
+            None
+        };
+        if Self::leaf_over(items, max_items, byte_budget) {
+            // Undo; the COW path splits.
+            let entry = match replaced {
+                Some(old) => BtrfsTreeItem {
+                    key: items[idx].key,
+                    data: std::mem::replace(&mut items[idx].data, old),
+                },
+                None => items.remove(idx),
+            };
+            return Err(entry);
+        }
+        trace!(
+            root = self.root,
+            leaf = block,
+            replacing,
+            "btrfs_cow_in_place"
+        );
+        Ok(self.root)
+    }
+
+    /// Let standalone inserts and updates change nodes allocated since the
+    /// last [`Self::seal`] in place instead of copying the whole root-to-leaf
+    /// path (bd-dysiw), as kernel btrfs COWs a block once per transaction.
+    ///
+    /// ⚠️ Only for an owner that calls `seal` whenever node ids become
+    /// meaningful outside the tree (e.g. recorded as written to disk), and
+    /// that never reads a superseded root through `node_snapshot`: an
+    /// in-place change is visible through every root that reaches the node.
+    pub fn enable_in_place_mutation(&mut self) {
+        self.fresh.get_or_insert_with(FxHashSet::default);
+    }
+
+    /// Back to a pure COW of every mutated path.
+    pub fn disable_in_place_mutation(&mut self) {
+        self.fresh = None;
+    }
+
+    /// Freeze every current node: the next mutation of any of them copies it
+    /// first. No-op unless in-place mutation is enabled.
+    pub fn seal(&mut self) {
+        if let Some(fresh) = &mut self.fresh {
+            fresh.clear();
+        }
     }
 
     fn try_insert_then_update_root_leaf(
@@ -15011,6 +15128,118 @@ mod tests {
             snapshot
         );
         tree.validate_invariants().expect("invariants");
+    }
+
+    fn all_items(tree: &InMemoryCowBtrfsTree) -> Vec<(BtrfsKey, Vec<u8>)> {
+        let lo = BtrfsKey {
+            objectid: 0,
+            item_type: 0,
+            offset: 0,
+        };
+        let hi = BtrfsKey {
+            objectid: u64::MAX,
+            item_type: u8::MAX,
+            offset: u64::MAX,
+        };
+        tree.range(&lo, &hi).expect("range")
+    }
+
+    /// bd-dysiw: an update of nodes copied since the last seal reuses them
+    /// (same root, no allocation); after `seal` the next update copies again
+    /// and the sealed version stays intact, which is what writeback's
+    /// block-id reuse depends on.
+    #[test]
+    fn in_place_mutation_reuses_fresh_nodes_and_never_sealed_ones_bd_dysiw() {
+        let mut tree = InMemoryCowBtrfsTree::new(8).expect("tree");
+        tree.enable_in_place_mutation();
+        for i in 0..40 {
+            tree.insert(test_key(i * 10), b"v0").expect("insert");
+        }
+        assert!(tree.height().expect("height") > 1, "a multi-level path");
+        tree.seal();
+
+        let sealed_root = tree.root_block();
+        let sealed = tree.node_snapshot(sealed_root).expect("sealed root");
+        tree.update(&test_key(70), b"v1")
+            .expect("first update copies");
+        let fresh_root = tree.root_block();
+        assert_ne!(fresh_root, sealed_root, "a sealed path is copied");
+        assert_eq!(tree.node_snapshot(sealed_root).expect("sealed"), sealed);
+
+        let nodes_before = tree.nodes.len();
+        tree.update(&test_key(70), b"v2").expect("second update");
+        tree.update(&test_key(80), b"v2").expect("same leaf");
+        tree.insert(test_key(75), b"new")
+            .expect("insert into a half-full middle leaf");
+        assert_eq!(tree.root_block(), fresh_root, "fresh path changed in place");
+        assert_eq!(tree.nodes.len(), nodes_before, "nothing allocated");
+        assert_eq!(tree.get(&test_key(70)).as_deref(), Some(&b"v2"[..]));
+        assert_eq!(tree.get(&test_key(75)).as_deref(), Some(&b"new"[..]));
+
+        tree.seal();
+        let resealed = tree.node_snapshot(fresh_root).expect("resealed root");
+        tree.update(&test_key(70), b"v3")
+            .expect("update after seal");
+        assert_ne!(tree.root_block(), fresh_root);
+        assert_eq!(tree.node_snapshot(fresh_root).expect("resealed"), resealed);
+        tree.validate_invariants().expect("invariants");
+    }
+
+    /// bd-dysiw: with in-place mutation enabled and seals at arbitrary points,
+    /// a long random mix of inserts, updates, upserts and deletes leaves exactly
+    /// the items, errors and invariants of a pure-COW twin, including leaves
+    /// that must split (the in-place path backs out of those).
+    #[test]
+    fn in_place_mutation_matches_pure_cow_on_random_sequences_bd_dysiw() {
+        for seed in 1..=8_u64 {
+            let mut fast = InMemoryCowBtrfsTree::new(6)
+                .expect("tree")
+                .with_node_byte_budget(400);
+            fast.enable_in_place_mutation();
+            let mut cow = InMemoryCowBtrfsTree::new(6)
+                .expect("tree")
+                .with_node_byte_budget(400);
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let mut next = |bound: u64| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state % bound
+            };
+            for step in 0..3000 {
+                let key = test_key(next(200));
+                let len = usize::try_from(next(60)).expect("len") + 1;
+                let data = vec![u8::try_from(step % 251).expect("byte"); len];
+                let (a, b) = match next(5) {
+                    0 => (fast.insert(key, &data), cow.insert(key, &data)),
+                    1 => (fast.update(&key, &data), cow.update(&key, &data)),
+                    2 => (fast.upsert(key, &data), cow.upsert(key, &data)),
+                    3 => (fast.delete(&key), cow.delete(&key)),
+                    _ => {
+                        fast.seal();
+                        continue;
+                    }
+                };
+                assert_eq!(
+                    a.is_ok(),
+                    b.is_ok(),
+                    "seed {seed} step {step}: {a:?} vs {b:?}"
+                );
+                if let (Err(a), Err(b)) = (&a, &b) {
+                    assert_eq!(
+                        format!("{a:?}"),
+                        format!("{b:?}"),
+                        "seed {seed} step {step}"
+                    );
+                }
+                if step % 97 == 0 {
+                    fast.validate_invariants().expect("invariants");
+                    assert_eq!(all_items(&fast), all_items(&cow), "seed {seed} step {step}");
+                }
+            }
+            fast.validate_invariants().expect("invariants");
+            assert_eq!(all_items(&fast), all_items(&cow), "seed {seed}");
+        }
     }
 
     #[test]
