@@ -25,13 +25,16 @@
 use crate::wal::{self, HEADER_SIZE, WalCommit, WalHeader};
 use ffs_error::{FfsError, Result};
 use std::fs::{File, OpenOptions};
-use std::io::{Read, Seek, SeekFrom, Write};
+use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use tracing::{debug, error, info, warn};
 
 type CoalescedRecordOffsets = Vec<(usize, usize)>;
 type EncodedCoalescedBatch = (Vec<u8>, CoalescedRecordOffsets);
+
+/// Bound readback memory independently of record and coalesced-batch size.
+const WAL_VERIFY_CHUNK_BYTES: usize = 64 * 1024;
 
 /// Acquire the WAL inode before inspecting recovery state or changing bytes.
 /// The returned descriptor retains the advisory lock until its last clone is
@@ -73,7 +76,8 @@ pub enum WalWriteError {
     SyncIo { source: std::io::Error },
     /// Encoding or invariant violation — fatal, likely indicates a bug.
     FormatViolation { detail: String },
-    /// Read-back verification failed: written data does not match expected CRC.
+    /// Read-back bytes differ from the write. CRC values are diagnostic only:
+    /// distinct valid records can have identical whole-record CRC residues.
     VerificationFailed {
         expected_crc: u32,
         actual_crc: u32,
@@ -127,7 +131,7 @@ impl std::fmt::Display for WalWriteError {
             } => {
                 write!(
                     f,
-                    "WAL write verification failed at offset {offset}: \
+                    "WAL write verification failed at offset {offset}: bytes differ; \
                      expected CRC {expected_crc:#010x}, got {actual_crc:#010x}"
                 )
             }
@@ -170,7 +174,7 @@ impl From<WalWriteError> for FfsError {
             } => Self::Corruption {
                 block: 0,
                 detail: format!(
-                    "WAL write verification failed at offset {offset}: \
+                    "WAL write verification failed at offset {offset}: bytes differ; \
                      expected CRC {expected_crc:#010x}, got {actual_crc:#010x}"
                 ),
             },
@@ -211,10 +215,10 @@ pub enum SyncPolicy {
 pub struct WalWriterConfig {
     /// Sync policy (default: `Immediate`).
     pub sync_policy: SyncPolicy,
-    /// Verify writes by reading back and checking CRC (default: `false`).
+    /// Verify writes by reading back and comparing every byte (default: `false`).
     ///
-    /// Enabling this adds one seek + read per append. Useful for paranoid
-    /// durability or debugging, not recommended for hot paths.
+    /// Enabling this adds bounded positional reads per append. Useful for
+    /// paranoid durability or debugging, not recommended for hot paths.
     pub verify_writes: bool,
     /// WAL size threshold in bytes for backpressure signaling (0 = disabled).
     ///
@@ -871,24 +875,41 @@ impl WalWriter {
         expected: &[u8],
         op_id: u64,
     ) -> std::result::Result<(), WalWriteError> {
-        let mut readback = vec![0_u8; expected.len()];
-        self.file
-            .seek(SeekFrom::Start(offset))
-            .map_err(|e| WalWriteError::AppendIo {
-                source: e,
-                bytes_attempted: expected.len(),
+        let expected_len =
+            u64::try_from(expected.len()).map_err(|_| WalWriteError::FormatViolation {
+                detail: "verification length exceeds u64".to_owned(),
             })?;
-        self.file
-            .read_exact(&mut readback)
-            .map_err(|e| WalWriteError::AppendIo {
-                source: e,
-                bytes_attempted: expected.len(),
-            })?;
+        let end = offset.checked_add(expected_len).ok_or_else(|| {
+            WalWriteError::FormatViolation {
+                detail: "verification range overflowed".to_owned(),
+            }
+        })?;
 
+        // The encoding includes its own CRC. Different valid records of the
+        // same length have the same whole-record CRC residue, so hashing the
+        // encoded buffers cannot establish that the intended bytes were written.
+        // Compare every byte; retain the CRCs only for error/log compatibility.
+        // Positional reads also leave the shared file cursor untouched.
+        let mut buffer = vec![0_u8; expected.len().min(WAL_VERIFY_CHUNK_BYTES)];
+        let mut actual_crc = 0;
+        let mut bytes_match = true;
+        for (read_offset, expected_chunk) in (offset..end)
+            .step_by(WAL_VERIFY_CHUNK_BYTES)
+            .zip(expected.chunks(WAL_VERIFY_CHUNK_BYTES))
+        {
+            let readback = &mut buffer[..expected_chunk.len()];
+            self.file
+                .read_exact_at(readback, read_offset)
+                .map_err(|source| WalWriteError::AppendIo {
+                    source,
+                    bytes_attempted: expected.len(),
+                })?;
+            bytes_match &= readback == expected_chunk;
+            actual_crc = crc32c::crc32c_append(actual_crc, readback);
+        }
         let expected_crc = crc32c::crc32c(expected);
-        let actual_crc = crc32c::crc32c(&readback);
 
-        if expected_crc != actual_crc {
+        if !bytes_match {
             error!(
                 operation_id = op_id,
                 offset,
@@ -1682,5 +1703,160 @@ mod tests {
         );
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn verification_rejects_different_valid_records_with_identical_crc_residues() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("verify.wal");
+        let mut writer = WalWriter::create(&path, WalWriterConfig::default()).unwrap();
+        let expected = wal::encode_commit(&make_commit(1, 1, &[(10, &[0xAA; 128])])).unwrap();
+        let actual = wal::encode_commit(&make_commit(999, 7, &[(42, &[0xBB; 128])])).unwrap();
+        assert_ne!(expected, actual);
+        assert_eq!(expected.len(), actual.len());
+        assert_eq!(crc32c::crc32c(&expected), crc32c::crc32c(&actual));
+        assert!(matches!(decode_commit(&actual), DecodeResult::Commit(_)));
+
+        let offset = writer.size();
+        writer.raw_append(&actual).unwrap();
+        let error = writer
+            .verify_written_record(offset, &expected, 0)
+            .expect_err("a valid but different record is not the requested write");
+        match error {
+            WalWriteError::VerificationFailed {
+                expected_crc,
+                actual_crc,
+                offset: failed_offset,
+            } => {
+                assert_eq!(expected_crc, actual_crc);
+                assert_eq!(failed_offset, offset);
+            }
+            other => panic!("expected byte mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verification_of_substituted_batch_durably_rolls_back_before_retry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("batch.wal");
+        let mut writer = WalWriter::create(
+            &path,
+            WalWriterConfig {
+                verify_writes: true,
+                ..WalWriterConfig::default()
+            },
+        )
+        .unwrap();
+        let first = make_commit(1, 1, &[(1, &[1; 8])]);
+        writer.append_commit(&first).unwrap();
+        let prefix = std::fs::read(&path).unwrap();
+        let offset = writer.size();
+        let expected = [
+            make_commit(2, 2, &[(2, &[2; 128])]),
+            make_commit(3, 3, &[(3, &[3; 128])]),
+        ];
+        let substituted = [
+            make_commit(20, 20, &[(20, &[20; 128])]),
+            make_commit(30, 30, &[(30, &[30; 128])]),
+        ];
+        let (expected_bytes, _) = WalWriter::encode_coalesced_commits(&expected).unwrap();
+        let (actual_bytes, _) = WalWriter::encode_coalesced_commits(&substituted).unwrap();
+        assert_ne!(expected_bytes, actual_bytes);
+        assert_eq!(
+            crc32c::crc32c(&expected_bytes),
+            crc32c::crc32c(&actual_bytes)
+        );
+        writer.raw_append(&actual_bytes).unwrap();
+        assert!(matches!(
+            writer.verify_or_rollback_coalesced_write(offset, &expected_bytes, 0),
+            Err(WalWriteError::VerificationFailed { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), prefix);
+        assert_eq!(writer.size(), offset);
+        assert_eq!(writer.last_commit_seq(), 1);
+        assert_eq!(writer.pending_sync_count(), 0);
+        writer.ensure_ready().unwrap();
+        writer.append_commits_coalesced(&expected).unwrap();
+        drop(writer);
+
+        let bytes = std::fs::read(&path).unwrap();
+        let mut replayed = Vec::new();
+        let report = crate::wal_replay::WalReplayEngine::new(
+            crate::wal_replay::TailPolicy::FailFast,
+        )
+        .replay(&bytes[HEADER_SIZE..], 0, |commit| replayed.push(commit.clone()))
+        .unwrap();
+        assert!(report.outcome.is_clean());
+        assert_eq!(replayed, vec![first, expected[0].clone(), expected[1].clone()]);
+    }
+
+    #[test]
+    fn verification_checks_all_chunks_without_moving_the_file_cursor() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("chunks.wal");
+        let mut writer = WalWriter::create(&path, WalWriterConfig::default()).unwrap();
+        let expected = vec![0xA5; WAL_VERIFY_CHUNK_BYTES * 2 + 7];
+        let offset = writer.size();
+        writer.raw_append(&expected).unwrap();
+        std::io::Seek::seek(writer.file_mut(), std::io::SeekFrom::Start(3)).unwrap();
+        writer.verify_written_record(offset, &expected, 0).unwrap();
+        assert_eq!(std::io::Seek::stream_position(writer.file_mut()).unwrap(), 3);
+
+        for index in [
+            0,
+            WAL_VERIFY_CHUNK_BYTES - 1,
+            WAL_VERIFY_CHUNK_BYTES,
+            WAL_VERIFY_CHUNK_BYTES + 1,
+            expected.len() - 1,
+        ] {
+            let physical = offset + u64::try_from(index).unwrap();
+            writer.file().write_all_at(&[0x5A], physical).unwrap();
+            assert!(matches!(
+                writer.verify_written_record(offset, &expected, 0),
+                Err(WalWriteError::VerificationFailed { .. })
+            ));
+            assert_eq!(std::io::Seek::stream_position(writer.file_mut()).unwrap(), 3);
+            writer.file().write_all_at(&[0xA5], physical).unwrap();
+        }
+        writer.verify_written_record(offset, &expected, 0).unwrap();
+    }
+
+    #[test]
+    fn verification_short_read_rolls_back_the_unacknowledged_tail() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("short.wal");
+        let mut writer = WalWriter::create(
+            &path,
+            WalWriterConfig {
+                verify_writes: true,
+                ..WalWriterConfig::default()
+            },
+        )
+        .unwrap();
+        let prefix = std::fs::read(&path).unwrap();
+        let offset = writer.size();
+        let expected = vec![0xA5; WAL_VERIFY_CHUNK_BYTES + 1];
+        writer.raw_append(&expected[..expected.len() - 1]).unwrap();
+        assert!(matches!(
+            writer.verify_or_rollback_coalesced_write(offset, &expected, 0),
+            Err(WalWriteError::AppendIo { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), prefix);
+        assert_eq!(writer.size(), offset);
+        writer.ensure_ready().unwrap();
+    }
+
+    #[test]
+    fn verification_range_overflow_is_rejected_before_readback() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("overflow.wal");
+        let mut writer = WalWriter::create(&path, WalWriterConfig::default()).unwrap();
+        let prefix = std::fs::read(&path).unwrap();
+        assert!(matches!(
+            writer.verify_written_record(u64::MAX, &[1], 0),
+            Err(WalWriteError::FormatViolation { .. })
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), prefix);
+        writer.ensure_ready().unwrap();
     }
 }
