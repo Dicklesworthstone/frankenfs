@@ -929,9 +929,13 @@ impl DiskWritebackContext {
         }
         let bytenr = match &self.allocated_addrs {
             Some(addrs) => {
-                let bytenr = addrs.get(&block).copied().ok_or(
-                    BtrfsMutationError::BrokenInvariant("missing allocated writeback address"),
-                )?;
+                let bytenr =
+                    addrs
+                        .get(&block)
+                        .copied()
+                        .ok_or(BtrfsMutationError::BrokenInvariant(
+                            "missing allocated writeback address",
+                        ))?;
                 if bytenr == 0 {
                     return Err(BtrfsMutationError::BrokenInvariant(
                         "allocated writeback address is zero",
@@ -948,9 +952,11 @@ impl DiskWritebackContext {
                 "writeback address is not sector aligned",
             ));
         }
-        bytenr.checked_add(u64::from(self.nodesize)).ok_or(
-            BtrfsMutationError::BrokenInvariant("writeback node range overflows"),
-        )?;
+        bytenr
+            .checked_add(u64::from(self.nodesize))
+            .ok_or(BtrfsMutationError::BrokenInvariant(
+                "writeback node range overflows",
+            ))?;
         Ok(bytenr)
     }
 
@@ -1108,7 +1114,10 @@ mod strict_writeback_mapping_tests {
     #[test]
     fn missing_parent_mapping_does_not_use_a_synthetic_address() {
         let (tree, mut ctx, _) = fixture();
-        ctx.allocated_addrs.as_mut().unwrap().remove(&tree.root_block());
+        ctx.allocated_addrs
+            .as_mut()
+            .unwrap()
+            .remove(&tree.root_block());
         expect_mapping_error(&tree, &ctx, "missing allocated writeback address");
     }
 
@@ -1147,10 +1156,7 @@ mod strict_writeback_mapping_tests {
     fn parent_child_and_sibling_overlaps_are_rejected() {
         let (tree, mut ctx, children) = fixture();
         let original = ctx.allocated_addrs.clone();
-        for (left, right) in [
-            (tree.root_block(), children[0]),
-            (children[0], children[1]),
-        ] {
+        for (left, right) in [(tree.root_block(), children[0]), (children[0], children[1])] {
             for delta in [0, 4096, 12288] {
                 ctx.allocated_addrs = original.clone();
                 let addrs = ctx.allocated_addrs.as_mut().unwrap();
