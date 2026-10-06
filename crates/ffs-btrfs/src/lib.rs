@@ -8845,71 +8845,174 @@ impl BtrfsExtentAllocator {
         if direct_tail {
             return Ok((Some(cursor), true));
         }
-        // Find a gap in this block group by scanning allocation items in
-        // range. We must include both EXTENT_ITEM (168) and METADATA_ITEM
-        // (169) as both represent physical space allocations.
-        let range_start = BtrfsKey {
-            objectid: bg_base,
-            item_type: BTRFS_ITEM_EXTENT_ITEM, // 168
-            offset: 0,
-        };
-        let range_end = BtrfsKey {
-            objectid: bg_end,
-            item_type: BTRFS_ITEM_METADATA_ITEM, // 169
-            offset: u64::MAX,
-        };
-        // Keys only: the item bodies are not needed, so borrow instead of
-        // cloning every item in the group on every off-tail allocation.
-        let mut allocated_ranges: Vec<(u64, u64)> = Vec::new();
-        self.extent_tree
-            .range_with(&range_start, &range_end, |key, _| {
-                if let Some(range) = allocation_extent_range(key, self.nodesize) {
-                    allocated_ranges.push(range);
-                }
-            })?;
-
-        // Pinned extents are occupied even though no extent item says so:
-        // the blocks of the trees the committed superblock still points at,
-        // and this transaction's own extent/root-tree nodes (bd-mqb9t).
-        // Merging them here is what keeps the gap finder — and, through
-        // `last_extent_end` below, the tail-cursor fast path — from handing
-        // out space that is still in use. `first_gap_at_or_after` requires a
-        // sorted, non-overlapping list, so re-sort and coalesce after the
-        // merge; both inputs are individually sorted but interleave.
-        let pinned_here: Vec<(u64, u64)> = self
-            .pinned
-            .range(bg_base..bg_end)
-            .map(|(start, pin)| (*start, pin.num_bytes))
-            .collect();
-        if !pinned_here.is_empty() {
-            allocated_ranges.extend(pinned_here);
-            allocated_ranges.sort_unstable();
-            allocated_ranges = coalesce_ranges(allocated_ranges);
-        }
-
         // Forward search from the bump-pointer offset; if that finds
         // nothing and we started mid-group, wrap around to the
-        // reserved-prefix floor. Both searches binary-search past the no-op
-        // prefix below their start cursor (bd-8fbka).
-        let mut found = first_gap_at_or_after(&allocated_ranges, cursor, num_bytes, bg_end)?;
+        // reserved-prefix floor. Each search walks the group's allocations
+        // only from the one covering its start, and stops at the first gap
+        // (bd-dysiw: collecting every allocation of the group per off-tail
+        // allocation made an overwrite workload, which frees and so drops
+        // the tail fast path on every write, quadratic; generic/344).
+        let mut found = self.first_gap_from(bg_base, bg_end, cursor, num_bytes)?;
         if found.is_none() && alloc_offset > 0 {
-            found = first_gap_at_or_after(&allocated_ranges, min_usable, num_bytes, bg_end)?;
+            found = self.first_gap_from(bg_base, bg_end, min_usable, num_bytes)?;
         }
-
-        let mut last_extent_end = min_usable;
-        for &(ext_start, ext_size) in &allocated_ranges {
-            let ext_end = ext_start
-                .checked_add(ext_size)
-                .ok_or(BtrfsMutationError::AddressOverflow)?;
-            if ext_end > last_extent_end {
-                last_extent_end = ext_end;
-            }
-        }
+        let last_extent_end = self.last_allocation_end(bg_base, bg_end)?.max(min_usable);
         // bytenr 0 is the btrfs hole/none sentinel and must never back a real
         // extent; refuse it defensively rather than corrupt data (bd-5aybu).
         let found = found.filter(|&b| b != 0);
         let tail_verified = found.is_some_and(|bytenr| bytenr >= last_extent_end);
         Ok((found, tail_verified))
+    }
+
+    /// First-fit gap of `num_bytes` at or after `start` in the block group
+    /// `[bg_base, bg_end)`: [`first_gap_at_or_after`] over the group's
+    /// allocations (extent items plus pinned extents), visiting only those
+    /// from the one covering `start` and stopping at the first fit.
+    ///
+    /// The walk begins at the lowest key sharing the objectid of the last
+    /// key at or below `start`: backrefs and the block-group item share an
+    /// extent's objectid and sort after its EXTENT_ITEM, and extents never
+    /// overlap, so no earlier item can reach past `start`. Pinned extents
+    /// are merged in start order; overlaps are harmless because the cursor
+    /// only moves forward, which is also why no coalescing is needed.
+    fn first_gap_from(
+        &self,
+        bg_base: u64,
+        bg_end: u64,
+        start: u64,
+        num_bytes: u64,
+    ) -> Result<Option<u64>, BtrfsMutationError> {
+        let floor = self.extent_tree.floor_key(&BtrfsKey {
+            objectid: start,
+            item_type: BTRFS_ITEM_METADATA_ITEM,
+            offset: u64::MAX,
+        })?;
+        let walk_from = BtrfsKey {
+            objectid: floor.map_or(bg_base, |key| key.objectid.max(bg_base)),
+            item_type: 0,
+            offset: 0,
+        };
+        let range_end = BtrfsKey {
+            objectid: bg_end,
+            item_type: BTRFS_ITEM_METADATA_ITEM,
+            offset: u64::MAX,
+        };
+        let mut pinned = self
+            .pinned
+            .range(bg_base..bg_end)
+            .map(|(pin_start, pin)| (*pin_start, pin.num_bytes))
+            .peekable();
+        let mut cursor = start;
+        let mut found = None;
+        let mut overflow = false;
+        // `first_gap_at_or_after`'s step for one occupied range.
+        let mut feed = |(ext_start, ext_size): (u64, u64)| {
+            let Some(ext_end) = ext_start.checked_add(ext_size) else {
+                overflow = true;
+                return std::ops::ControlFlow::Break(());
+            };
+            if cursor < ext_start && ext_start - cursor >= num_bytes {
+                found = Some(cursor);
+                return std::ops::ControlFlow::Break(());
+            }
+            cursor = cursor.max(ext_end);
+            std::ops::ControlFlow::Continue(())
+        };
+        let mut stopped = false;
+        self.extent_tree
+            .range_until(&walk_from, &range_end, |key, _| {
+                let Some(range) = allocation_extent_range(key, self.nodesize) else {
+                    return std::ops::ControlFlow::Continue(());
+                };
+                while let Some(&pin) = pinned.peek() {
+                    if pin.0 > range.0 {
+                        break;
+                    }
+                    pinned.next();
+                    if feed(pin).is_break() {
+                        stopped = true;
+                        return std::ops::ControlFlow::Break(());
+                    }
+                }
+                let flow = feed(range);
+                stopped = flow.is_break();
+                flow
+            })?;
+        if !stopped {
+            for pin in pinned {
+                if feed(pin).is_break() {
+                    break;
+                }
+            }
+        }
+        if overflow {
+            return Err(BtrfsMutationError::AddressOverflow);
+        }
+        if found.is_some() {
+            return Ok(found);
+        }
+        // The gap after the last allocation.
+        Ok(cursor
+            .checked_add(num_bytes)
+            .filter(|&end| end <= bg_end)
+            .map(|_| cursor))
+    }
+
+    /// End of the highest allocation (extent item or pinned extent) in the
+    /// block group `[bg_base, bg_end)`, or 0 when it holds none. Extents never
+    /// overlap, so the extent item with the highest start ends last.
+    fn last_allocation_end(&self, bg_base: u64, bg_end: u64) -> Result<u64, BtrfsMutationError> {
+        let pinned_end = self
+            .pinned
+            .range(bg_base..bg_end)
+            .map(|(pin_start, pin)| pin_start.saturating_add(pin.num_bytes))
+            .max()
+            .unwrap_or(0);
+        let Some(last) = self.extent_tree.floor_key(&BtrfsKey {
+            objectid: bg_end,
+            item_type: BTRFS_ITEM_METADATA_ITEM,
+            offset: u64::MAX,
+        })?
+        else {
+            return Ok(pinned_end);
+        };
+        if last.objectid < bg_base {
+            return Ok(pinned_end);
+        }
+        let mut extent_end = None;
+        self.extent_tree.range_with(
+            &BtrfsKey {
+                objectid: last.objectid,
+                item_type: 0,
+                offset: 0,
+            },
+            &last,
+            |key, _| {
+                if let Some((ext_start, ext_size)) = allocation_extent_range(key, self.nodesize) {
+                    extent_end = Some(ext_start.saturating_add(ext_size));
+                }
+            },
+        )?;
+        if let Some(end) = extent_end {
+            return Ok(end.max(pinned_end));
+        }
+        // The highest objectid carries no extent item (an empty group's own
+        // block-group item): fall back to the full walk.
+        let mut end = pinned_end;
+        self.extent_tree.range_with(
+            &BtrfsKey {
+                objectid: bg_base,
+                item_type: BTRFS_ITEM_EXTENT_ITEM,
+                offset: 0,
+            },
+            &last,
+            |key, _| {
+                if let Some((ext_start, ext_size)) = allocation_extent_range(key, self.nodesize) {
+                    end = end.max(ext_start.saturating_add(ext_size));
+                }
+            },
+        )?;
+        Ok(end)
     }
 
     /// Core allocation logic.
@@ -9983,7 +10086,9 @@ fn allocation_extent_range(key: BtrfsKey, metadata_nodesize: u64) -> Option<(u64
 /// `partition_point` predicate is only monotonic then). Extent items are
 /// naturally disjoint, but unioning them with the pinned set can produce
 /// duplicates and overlaps — a pinned block whose extent item still exists
-/// appears in both (bd-mqb9t).
+/// appears in both (bd-mqb9t). The reference oracle for
+/// `BtrfsExtentAllocator::first_gap_from`, which streams instead.
+#[cfg(test)]
 fn coalesce_ranges(sorted: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
     let mut out: Vec<(u64, u64)> = Vec::with_capacity(sorted.len());
     for (start, len) in sorted {
@@ -10002,6 +10107,7 @@ fn coalesce_ranges(sorted: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
     out
 }
 
+#[cfg(test)]
 fn first_gap_at_or_after(
     allocated_ranges: &[(u64, u64)],
     mut cursor: u64,
@@ -25549,6 +25655,108 @@ mod tests {
             "two-generations-old blocks must be reclaimed, or the pin leaks space"
         );
         assert!(alloc.is_pinned(root_b), "generation 2 is still live");
+    }
+
+    /// bd-dysiw: the streaming gap search answers exactly what collecting
+    /// every allocation of the group (extent items with their backrefs,
+    /// skinny metadata items, pinned extents overlapping them or not) and
+    /// running `first_gap_at_or_after` over the coalesced list answers, for
+    /// every start and size, and `last_allocation_end` is that list's end.
+    #[test]
+    fn streaming_gap_search_matches_the_collected_list_bd_dysiw() {
+        const MB: u64 = 1024 * 1024;
+        const SECTOR: u64 = 4096;
+        let bg_base = MB;
+        let bg_end = bg_base + 64 * MB;
+        for seed in 1..=6_u64 {
+            let mut alloc = BtrfsExtentAllocator::new(1).expect("allocator");
+            alloc.set_nodesize(16384);
+            alloc.add_block_group(
+                bg_base,
+                BtrfsBlockGroupItem {
+                    total_bytes: 64 * MB,
+                    used_bytes: 0,
+                    flags: BTRFS_BLOCK_GROUP_DATA | BTRFS_BLOCK_GROUP_METADATA,
+                },
+            );
+            let mut state = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15);
+            let mut next = |bound: u64| {
+                state ^= state << 13;
+                state ^= state >> 7;
+                state ^= state << 17;
+                state % bound
+            };
+            // Disjoint allocations laid out left to right with random gaps.
+            let mut at = bg_base + next(8) * SECTOR;
+            let mut i = 0_u64;
+            while at < bg_end - 2 * MB {
+                if next(4) == 0 {
+                    alloc
+                        .insert_self_metadata_item(at, 0, 5, 1)
+                        .expect("metadata item");
+                    at += 16384;
+                } else {
+                    let len = (next(16) + 1) * SECTOR;
+                    alloc
+                        .insert_data_extent_item(at, len, 5, 257 + i, 0, 1)
+                        .expect("data extent");
+                    at += len;
+                }
+                at += next(6) * SECTOR;
+                i += 1;
+            }
+            for _ in 0..12 {
+                alloc
+                    .pin_live_tree_block(bg_base + next(64 * 256) * SECTOR, (next(8) + 1) * SECTOR);
+            }
+
+            let mut reference: Vec<(u64, u64)> = Vec::new();
+            alloc
+                .extent_tree
+                .range_with(
+                    &BtrfsKey {
+                        objectid: bg_base,
+                        item_type: BTRFS_ITEM_EXTENT_ITEM,
+                        offset: 0,
+                    },
+                    &BtrfsKey {
+                        objectid: bg_end,
+                        item_type: BTRFS_ITEM_METADATA_ITEM,
+                        offset: u64::MAX,
+                    },
+                    |key, _| {
+                        if let Some(range) = allocation_extent_range(key, 16384) {
+                            reference.push(range);
+                        }
+                    },
+                )
+                .expect("range");
+            reference.extend(
+                alloc
+                    .pinned
+                    .range(bg_base..bg_end)
+                    .map(|(start, pin)| (*start, pin.num_bytes)),
+            );
+            reference.sort_unstable();
+            let reference = coalesce_ranges(reference);
+            let reference_end = reference.iter().map(|&(s, l)| s + l).max().unwrap_or(0);
+            assert_eq!(
+                alloc.last_allocation_end(bg_base, bg_end).expect("end"),
+                reference_end,
+                "seed {seed}"
+            );
+            for _ in 0..400 {
+                let start = bg_base + next(64 * 256 + 64) * SECTOR;
+                let need = (next(40) + 1) * SECTOR;
+                assert_eq!(
+                    alloc
+                        .first_gap_from(bg_base, bg_end, start, need)
+                        .expect("streaming"),
+                    first_gap_at_or_after(&reference, start, need, bg_end).expect("reference"),
+                    "seed {seed} start {start} need {need}"
+                );
+            }
+        }
     }
 
     /// The gap finder needs a sorted, DISJOINT range list; unioning extent items
