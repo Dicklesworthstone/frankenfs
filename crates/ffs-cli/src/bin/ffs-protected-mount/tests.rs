@@ -46,11 +46,7 @@ pub fn verify(
 }
 
 /// `SidecarImageDevice::open`, after any in-flight child spawn has exec'd.
-pub fn open_device(
-    cx: &Cx,
-    image: &Path,
-    sidecar: &Path,
-) -> ffs_error::Result<SidecarImageDevice> {
+pub fn open_device(cx: &Cx, image: &Path, sidecar: &Path) -> ffs_error::Result<SidecarImageDevice> {
     wait_for_spawns();
     SidecarImageDevice::open(cx, image, sidecar)
 }
