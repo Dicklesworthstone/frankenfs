@@ -8676,6 +8676,82 @@ impl BtrfsExtentAllocator {
         Ok(())
     }
 
+    /// Whether every reference to the data extent `(bytenr, num_bytes)` is an
+    /// `EXTENT_DATA_REF` from `root` / `objectid`: no other file, subvolume or
+    /// parent-keyed (`SHARED_DATA_REF`) reference, and the per-ref counts add
+    /// up to the item's `refs`. The explicit-reference half of kernel btrfs's
+    /// NOCOW test (`btrfs_cross_ref_exist`); a caller must still rule out
+    /// sharing through a snapshot of the whole tree (bd-a5lko).
+    ///
+    /// # Errors
+    /// A truncated or unparseable extent item.
+    pub fn data_extent_owned_only_by(
+        &self,
+        bytenr: u64,
+        num_bytes: u64,
+        root: u64,
+        objectid: u64,
+    ) -> Result<bool, BtrfsMutationError> {
+        const EXTENT_ITEM_HEADER: usize = 24; // refs(8) + generation(8) + flags(8)
+        const DATA_REF_PAYLOAD: usize = 28;
+        let Some(value) = self.extent_tree.get(&BtrfsKey {
+            objectid: bytenr,
+            item_type: BTRFS_ITEM_EXTENT_ITEM,
+            offset: num_bytes,
+        }) else {
+            return Ok(false);
+        };
+        if value.len() < EXTENT_ITEM_HEADER {
+            return Err(BtrfsMutationError::BrokenInvariant(
+                "extent item value too short for header",
+            ));
+        }
+        let refs = u64::from_le_bytes(value[0..8].try_into().expect("8 bytes"));
+        let mut counted = 0_u64;
+        let owned = |dr: &BtrfsExtentDataRef| dr.root == root && dr.objectid == objectid;
+
+        let mut cursor = EXTENT_ITEM_HEADER;
+        while cursor < value.len() {
+            if value[cursor] != BTRFS_ITEM_EXTENT_DATA_REF {
+                return Ok(false); // SHARED_DATA_REF or another kind of ref
+            }
+            let payload = value.get(cursor + 1..cursor + 1 + DATA_REF_PAYLOAD).ok_or(
+                BtrfsMutationError::BrokenInvariant("truncated inline EXTENT_DATA_REF"),
+            )?;
+            match BtrfsExtentDataRef::from_bytes(payload) {
+                Some(dr) if owned(&dr) => counted = counted.saturating_add(u64::from(dr.count)),
+                _ => return Ok(false),
+            }
+            cursor += 1 + DATA_REF_PAYLOAD;
+        }
+
+        // Keyed refs sort right after the extent item: EXTENT_DATA_REF (178)
+        // and SHARED_DATA_REF (184) for this bytenr.
+        let mut keyed_ok = true;
+        self.extent_tree.range_with(
+            &BtrfsKey {
+                objectid: bytenr,
+                item_type: BTRFS_ITEM_EXTENT_DATA_REF,
+                offset: 0,
+            },
+            &BtrfsKey {
+                objectid: bytenr,
+                item_type: backrefs::BTRFS_ITEM_SHARED_DATA_REF,
+                offset: u64::MAX,
+            },
+            |key, data| match (key.item_type, BtrfsExtentDataRef::from_bytes(data)) {
+                (BTRFS_ITEM_EXTENT_DATA_REF, Some(dr)) if owned(&dr) => {
+                    counted = counted.saturating_add(u64::from(dr.count));
+                }
+                (BTRFS_ITEM_EXTENT_DATA_REF | backrefs::BTRFS_ITEM_SHARED_DATA_REF, _) => {
+                    keyed_ok = false;
+                }
+                _ => {}
+            },
+        )?;
+        Ok(keyed_ok && counted == refs)
+    }
+
     /// Stamp `generation` into the existing skinny `METADATA_ITEM` extent item
     /// for the tree block at `bytenr` / `level`, leaving its refs and inline
     /// backref untouched. Returns `true` if the item was present and patched.
