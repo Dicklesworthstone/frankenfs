@@ -1,11 +1,59 @@
 use super::*;
-use ffs_repair::sidecar::{SidecarOptions, protect, verify};
+use ffs_repair::sidecar::{SidecarOptions, protect};
 use std::ffi::OsStr;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
 use std::process::{Command, Output};
+use std::sync::Condvar;
 use tempfile::TempDir;
+
+// A spawned child holds a copy of every open descriptor of this process
+// until it execs, and a flock belongs to the open file description: a
+// sibling test's mkfs/debugfs child could still hold an image or sidecar
+// lock a test had just released, and its re-open failed with WouldBlock
+// (flaky on CI and locally). Spawns are counted until `spawn` returns, which
+// is after the child has exec'd; re-opens wait until none is in progress.
+// Spawns never wait, so a test holding a device can still run a command.
+static SPAWNS_IN_PROGRESS: Mutex<usize> = Mutex::new(0);
+static SPAWNS_DONE: Condvar = Condvar::new();
+
+fn wait_for_spawns() {
+    let mut count = SPAWNS_IN_PROGRESS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    while *count > 0 {
+        count = SPAWNS_DONE
+            .wait(count)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+    }
+}
+
+/// `prepare`, after any in-flight child spawn has exec'd (see above).
+pub fn prepare(cx: &Cx, args: &Args) -> Result<Prepared> {
+    wait_for_spawns();
+    super::prepare(cx, args)
+}
+
+/// `ffs_repair::sidecar::verify`, after any in-flight child spawn has exec'd.
+pub fn verify(
+    cx: &Cx,
+    image: &Path,
+    sidecar: &Path,
+) -> ffs_error::Result<ffs_repair::sidecar::SidecarReport> {
+    wait_for_spawns();
+    ffs_repair::sidecar::verify(cx, image, sidecar)
+}
+
+/// `SidecarImageDevice::open`, after any in-flight child spawn has exec'd.
+pub fn open_device(
+    cx: &Cx,
+    image: &Path,
+    sidecar: &Path,
+) -> ffs_error::Result<SidecarImageDevice> {
+    wait_for_spawns();
+    SidecarImageDevice::open(cx, image, sidecar)
+}
 
 fn check_args(image: &Path, sidecar: &Path) -> Args {
     Args {
@@ -23,9 +71,25 @@ fn check_args(image: &Path, sidecar: &Path) -> Args {
     }
 }
 
-fn command(command: &mut Command) -> Output {
-    let output = command
-        .output()
+pub fn command(command: &mut Command) -> Output {
+    *SPAWNS_IN_PROGRESS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) += 1;
+    let spawned = command
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn();
+    {
+        let mut count = SPAWNS_IN_PROGRESS
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *count -= 1;
+        if *count == 0 {
+            SPAWNS_DONE.notify_all();
+        }
+    }
+    let output = spawned
+        .and_then(std::process::Child::wait_with_output)
         .expect("required filesystem oracle must be installed");
     assert!(
         output.status.success(),
@@ -247,7 +311,7 @@ fn startup_difference_is_not_silently_rolled_back() {
 fn pending_epoch_is_not_admitted_or_relabelled_clean() {
     let fixture = Fixture::ext4();
     let cx = Cx::for_testing();
-    let device = SidecarImageDevice::open(&cx, &fixture.image, &fixture.sidecar).unwrap();
+    let device = open_device(&cx, &fixture.image, &fixture.sidecar).unwrap();
     device
         .write_all_at(&cx, ByteOffset(device.len_bytes() - 4096), &[0x5A; 4096])
         .unwrap();
@@ -305,9 +369,9 @@ fn unfinished_dispatch_cannot_be_reported_as_completed_shutdown() {
     let in_flight = Arc::clone(&prepared.fs);
     let error = prepared.finish(&cx).unwrap_err();
     assert!(error.to_string().contains("shutdown is incomplete"));
-    assert!(SidecarImageDevice::open(&cx, &fixture.image, &fixture.sidecar).is_err());
+    assert!(open_device(&cx, &fixture.image, &fixture.sidecar).is_err());
     drop(in_flight);
-    let device = SidecarImageDevice::open(&cx, &fixture.image, &fixture.sidecar).unwrap();
+    let device = open_device(&cx, &fixture.image, &fixture.sidecar).unwrap();
     device.sync(&cx).unwrap();
 }
 
@@ -510,7 +574,7 @@ fn rw_still_refuses_startup_mismatch_and_pending_epochs_without_mutation() {
         let cx = Cx::for_testing();
         let block = fixture.first_block("/payload");
         if pending {
-            let device = SidecarImageDevice::open(&cx, &fixture.image, &fixture.sidecar).unwrap();
+            let device = open_device(&cx, &fixture.image, &fixture.sidecar).unwrap();
             device
                 .write_all_at(&cx, ByteOffset(block * 4096), &[0x5A; 4096])
                 .unwrap();
@@ -557,7 +621,7 @@ fn archive_publication_failure_is_a_failed_filesystem_shutdown() {
     std::fs::create_dir(&fixture.sidecar).unwrap();
     let error = prepared.finish(&cx).unwrap_err();
     assert!(format!("{error:#}").contains("checkpoint protected filesystem"));
-    assert!(SidecarImageDevice::open(&cx, &fixture.image, &retained).is_err());
+    assert!(open_device(&cx, &fixture.image, &retained).is_err());
 }
 
 #[test]
@@ -573,7 +637,7 @@ fn writable_shutdown_does_not_flush_while_dispatch_still_owns_the_filesystem() {
     assert!(error.to_string().contains("shutdown is incomplete"));
     assert_eq!(std::fs::read(&fixture.image).unwrap(), image);
     assert_eq!(std::fs::read(&fixture.sidecar).unwrap(), archive);
-    assert!(SidecarImageDevice::open(&cx, &fixture.image, &fixture.sidecar).is_err());
+    assert!(open_device(&cx, &fixture.image, &fixture.sidecar).is_err());
     // The surviving dispatcher, not finish(), owns any subsequent persistence.
     FsOps::fsyncdir(
         in_flight.as_ref(),

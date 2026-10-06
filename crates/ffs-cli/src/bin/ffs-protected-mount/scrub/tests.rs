@@ -1,6 +1,9 @@
 use super::*;
 use clap::Parser;
-use ffs_repair::sidecar::{SidecarOptions, protect, verify};
+// The gated verify (see crate::tests): a sibling test's child process may
+// still hold a lock this test just released.
+use crate::tests::verify;
+use ffs_repair::sidecar::{SidecarOptions, protect};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::PathBuf;
@@ -318,7 +321,7 @@ impl Fixture {
     }
 
     fn open(&self) -> SidecarImageDevice {
-        SidecarImageDevice::open(&Cx::for_testing(), &self.image, &self.sidecar).unwrap()
+        crate::tests::open_device(&Cx::for_testing(), &self.image, &self.sidecar).unwrap()
     }
 
     fn damage(&self, offset: usize, len: usize) {
@@ -378,7 +381,7 @@ fn dirty_epoch_scan_repairs_only_unchanged_groups_and_never_publishes_writes() {
     assert_eq!(std::fs::read(&fixture.sidecar).unwrap(), pending);
     assert!(device.protection(&cx).is_err());
     drop(device);
-    assert!(SidecarImageDevice::open(&cx, &fixture.image, &fixture.sidecar).is_err());
+    assert!(crate::tests::open_device(&cx, &fixture.image, &fixture.sidecar).is_err());
 }
 
 #[test]
