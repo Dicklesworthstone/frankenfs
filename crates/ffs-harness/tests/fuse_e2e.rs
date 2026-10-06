@@ -14608,8 +14608,9 @@ fn btrfs_fuse_statfs() {
             "available blocks ({blocks_avail}) should be <= total ({blocks})"
         );
 
-        // Total inodes should be non-zero.
-        assert!(files > 0, "total inodes should be > 0");
+        // btrfs has no inode table: like the kernel's btrfs_statfs, FrankenFS
+        // reports no inode counts (df -i shows 0) instead of a made-up one.
+        assert_eq!(files, 0, "btrfs reports no total inode count");
 
         // Max filename length: btrfs is 255.
         assert_eq!(namelen, 255, "btrfs max filename length should be 255");
