@@ -37741,6 +37741,14 @@ impl OpenFs {
         } else {
             snapshot.release(&mut alloc);
         }
+        drop(alloc);
+        // bd-dj725: drop the data this commit made durable from the MVCC
+        // store once over the resident cap. Only with the allocator lock
+        // released: this closes the mutation gate, and a gated mutation
+        // waiting for the lock would never drain.
+        if result.is_ok() {
+            self.evict_durable_mvcc_chains_quiesced();
+        }
         result
     }
 
@@ -39684,11 +39692,11 @@ impl OpenFs {
         // Record superblock commit (for crash point tracking)
         executor.commit_superblock();
 
-        // bd-dj725: the data this commit flushed is durable; drop it from the
-        // MVCC store once over the resident cap. The allocator lock is no
-        // longer held here, so closing the mutation gate cannot deadlock
-        // against a gated btrfs mutation waiting for that lock.
-        self.evict_durable_mvcc_chains_quiesced();
+        // bd-dj725's eviction of the data this commit made durable runs in
+        // btrfs_full_transaction_commit_once AFTER the allocator lock is
+        // released: it closes the mutation gate, and a gated btrfs mutation
+        // waiting for that lock would never drain (deadlock seen in CI with
+        // xfstests generic/273's 50 writers).
 
         info!(
             target: "ffs::btrfs::writeback",
@@ -78004,6 +78012,63 @@ mod tests {
                 clean,
                 "btrfs check after in-place prealloc writes:\n{output}"
             );
+        }
+    }
+
+    /// A btrfs commit's MVCC eviction closes the mutation gate; done while the
+    /// commit still held the allocator lock, it waited forever for a gated
+    /// writer that was itself waiting for that lock (CI: xfstests generic/273,
+    /// 50 writers, daemon silent from the first commit on). Commits racing
+    /// gated writes must keep completing.
+    #[test]
+    fn btrfs_commits_do_not_deadlock_against_concurrent_writers() {
+        let Some((fs, _tmp, _image)) = open_file_backed_btrfs(256) else {
+            oracle_unavailable("btrfs image formatter (btrfs-progs)");
+            return;
+        };
+        // Force the eviction path on every commit.
+        fs.set_mvcc_resident_block_cap(1);
+        let fs = std::sync::Arc::new(fs);
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let stop = std::sync::Arc::new(AtomicBool::new(false));
+        let mut writers = Vec::new();
+        for w in 0..4_u8 {
+            // `OpenFs::` explicitly: on an `Arc<OpenFs>` the `FsOps` methods
+            // (which take a request scope) would be picked.
+            let ino = OpenFs::create(&fs, &cx, root, OsStr::new(&format!("w{w}")), 0o644, 0, 0)
+                .expect("create")
+                .ino;
+            let (fs, stop) = (std::sync::Arc::clone(&fs), std::sync::Arc::clone(&stop));
+            writers.push(std::thread::spawn(move || {
+                let cx = Cx::for_testing();
+                let mut i = 0_u64;
+                while !stop.load(Ordering::Acquire) {
+                    OpenFs::write(&fs, &cx, ino, (i % 64) * 8192, &[w; 8192]).expect("write");
+                    i += 1;
+                }
+            }));
+        }
+        let (done_tx, done_rx) = std::sync::mpsc::channel();
+        let committer = {
+            let fs = std::sync::Arc::clone(&fs);
+            std::thread::spawn(move || {
+                let cx = Cx::for_testing();
+                for _ in 0..40 {
+                    OpenFs::fsync(&fs, &cx, InodeNumber(1), 0, false).expect("commit");
+                }
+                let _ = done_tx.send(());
+            })
+        };
+        let finished = done_rx.recv_timeout(std::time::Duration::from_secs(60));
+        stop.store(true, Ordering::Release);
+        assert!(
+            finished.is_ok(),
+            "40 commits racing 4 writers did not finish in 60 s: deadlock"
+        );
+        committer.join().expect("committer");
+        for writer in writers {
+            writer.join().expect("writer");
         }
     }
 
