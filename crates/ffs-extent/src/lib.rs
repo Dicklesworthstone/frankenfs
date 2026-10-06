@@ -481,7 +481,9 @@ fn allocate_extent_inner(
     }
     validate_root_header("allocate_extent", root_bytes)?;
 
-    // Allocate physical blocks.
+    // Allocate physical blocks, leaving the metadata reserve to the tree
+    // splits below and to later writes into preallocated space (bd-rohtt).
+    let count = ffs_alloc::data_alloc_budget(geo, groups, count)?;
     let BlockAlloc {
         start,
         count: allocated,
@@ -550,6 +552,9 @@ pub fn allocate_unwritten_extent(
     }
     validate_root_header("allocate_unwritten_extent", root_bytes)?;
 
+    // Preallocated data is file data too: it may not take the metadata
+    // reserve its own later conversion depends on (bd-rohtt).
+    let count = ffs_alloc::data_alloc_budget(geo, groups, count)?;
     let BlockAlloc {
         start,
         count: allocated,

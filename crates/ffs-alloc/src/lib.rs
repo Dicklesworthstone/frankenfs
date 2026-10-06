@@ -2782,6 +2782,31 @@ pub fn claim_blocks(
 
 // ── Persistent block allocator ──────────────────────────────────────────────
 
+/// Blocks file data may not take, so the metadata a write into preallocated
+/// (unwritten) space, a punch or a truncate needs for extent-tree splits can
+/// still be allocated on an otherwise full filesystem: ext4's
+/// `s_resv_clusters`, 2% of the filesystem capped at 4096
+/// (`ext4_calculate_resv_clusters`). Extent-tree node allocations are not
+/// held to it (the kernel's `EXT4_MB_USE_RESERVED`).
+#[must_use]
+pub fn reserved_metadata_blocks(geo: &FsGeometry) -> u64 {
+    (geo.total_blocks / 50).min(4096)
+}
+
+/// How many of `count` blocks a file-data allocation may take without
+/// dipping into [`reserved_metadata_blocks`].
+///
+/// # Errors
+/// [`FfsError::NoSpace`] when the free blocks outside the reserve are gone.
+pub fn data_alloc_budget(geo: &FsGeometry, groups: &[GroupStats], count: u32) -> Result<u32> {
+    let free: u64 = groups.iter().map(|g| u64::from(g.free_blocks)).sum();
+    let available = free.saturating_sub(reserved_metadata_blocks(geo));
+    if available == 0 {
+        return Err(FfsError::NoSpace);
+    }
+    Ok(count.min(u32::try_from(available).unwrap_or(u32::MAX)))
+}
+
 /// Allocate `count` contiguous data blocks with full on-disk accounting.
 ///
 /// Like [`alloc_blocks`], but additionally:
