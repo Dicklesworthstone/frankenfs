@@ -26311,7 +26311,6 @@ impl OpenFs {
             .collect();
         committed_extents.sort_unstable();
         let committed_extents = coalesce_half_open(committed_extents);
-        let committed_extents: Vec<(u64, u64)> = { let _ = committed_extents; Vec::new() }; // PLANTED NEGATIVE
 
         let chunks = ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree)
             .map_err(|e| FfsError::Format(format!("btrfs chunk tree: {e}")))?;
