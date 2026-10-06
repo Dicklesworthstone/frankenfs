@@ -754,7 +754,9 @@ impl SidecarImageDevice {
         match state.phase {
             Phase::Dirty => return Ok(ProtectionScrubStep::PendingWrites),
             Phase::Poisoned => {
-                return Err(corrupt("live repair device is poisoned after an I/O failure"));
+                return Err(corrupt(
+                    "live repair device is poisoned after an I/O failure",
+                ));
             }
             Phase::Clean => {}
         }
@@ -908,7 +910,10 @@ mod tests {
     ) -> ProtectionScrubReport {
         let groups = device.state.lock().archive.header.groups;
         for _ in 0..=groups {
-            match device.scrub_step(&Cx::for_testing(), cursor).expect("scrub step") {
+            match device
+                .scrub_step(&Cx::for_testing(), cursor)
+                .expect("scrub step")
+            {
                 ProtectionScrubStep::GroupVerified { .. } => {}
                 ProtectionScrubStep::Complete(report) => return report,
                 other => panic!("unexpected deferral: {other:?}"),
@@ -974,17 +979,30 @@ mod tests {
         assert!(report.archive_rebuilt);
         assert_eq!(device.protection(&cx).unwrap(), saved);
         assert_eq!(std::fs::read(&fixture.image).unwrap(), fixture.original);
-        let named = File::options().read(true).write(true).open(&fixture.sidecar).unwrap();
-        assert!(named.try_lock().is_err(), "replacement inode must remain owned");
+        let named = File::options()
+            .read(true)
+            .write(true)
+            .open(&fixture.sidecar)
+            .unwrap();
+        assert!(
+            named.try_lock().is_err(),
+            "replacement inode must remain owned"
+        );
         drop(named);
         drop(device);
-        assert!(verify(&cx, &fixture.image, &fixture.sidecar).unwrap().is_healthy());
+        assert!(
+            verify(&cx, &fixture.image, &fixture.sidecar)
+                .unwrap()
+                .is_healthy()
+        );
         // Recovery after reopening proves new symbols are usable, not merely
         // an optimistic report from the preceding maintenance cursor.
         let reopened = fixture.open();
         fixture.damage(0, &[0xfe; 512]);
         let mut bytes = [0; 512];
-        reopened.read_exact_at(&cx, ByteOffset(0), &mut bytes).unwrap();
+        reopened
+            .read_exact_at(&cx, ByteOffset(0), &mut bytes)
+            .unwrap();
         assert_eq!(bytes.as_slice(), &fixture.original[..512]);
     }
 
@@ -1008,7 +1026,10 @@ mod tests {
         // Release before asserting/joining even if a broken implementation waits.
         drop(held);
         let cursor = worker.join().unwrap();
-        assert_eq!(result.expect("maintenance must not wait").unwrap(), ProtectionScrubStep::Busy);
+        assert_eq!(
+            result.expect("maintenance must not wait").unwrap(),
+            ProtectionScrubStep::Busy
+        );
         assert_eq!(cursor.next_group, 1);
         assert_eq!(cursor.report, before);
         assert_eq!(std::fs::read(&fixture.image).unwrap(), fixture.original);
@@ -1025,7 +1046,9 @@ mod tests {
             device.scrub_step(&cx, &mut cursor).unwrap();
         }
         let before = cursor.report;
-        device.write_all_at(&cx, ByteOffset(0), &[0x51; 512]).unwrap();
+        device
+            .write_all_at(&cx, ByteOffset(0), &[0x51; 512])
+            .unwrap();
         let source = std::fs::read(&fixture.image).unwrap();
         let archive = std::fs::read(&fixture.sidecar).unwrap();
         assert_eq!(&archive[..8], PENDING_MAGIC);
@@ -1044,8 +1067,14 @@ mod tests {
             ProtectionScrubStep::GroupVerified { group: 0 }
         );
         let report = finish_incremental_scrub(&device, &mut cursor);
-        assert_eq!(report.invalid_repair_symbols, 0, "do not carry old observations");
-        assert!(!report.archive_rebuilt, "the explicit sync already rebuilt it");
+        assert_eq!(
+            report.invalid_repair_symbols, 0,
+            "do not carry old observations"
+        );
+        assert!(
+            !report.archive_rebuilt,
+            "the explicit sync already rebuilt it"
+        );
         assert_eq!(std::fs::read(&fixture.image).unwrap(), source);
     }
 
@@ -1058,7 +1087,9 @@ mod tests {
         device.scrub_step(&cx, &mut cursor).unwrap();
         let old_epoch = Arc::clone(cursor.epoch.as_ref().unwrap());
         let old_header = device.state.lock().archive.header.encode();
-        device.write_all_at(&cx, ByteOffset(0), &fixture.original[..512]).unwrap();
+        device
+            .write_all_at(&cx, ByteOffset(0), &fixture.original[..512])
+            .unwrap();
         device.sync(&cx).unwrap();
         assert_eq!(device.state.lock().archive.header.encode(), old_header);
         assert_eq!(
@@ -1096,7 +1127,10 @@ mod tests {
         let archive = std::fs::read(&fixture.sidecar).unwrap();
         let before = cursor.report;
         cx.set_cancel_requested(true);
-        assert!(matches!(device.scrub_step(&cx, &mut cursor), Err(FfsError::Cancelled)));
+        assert!(matches!(
+            device.scrub_step(&cx, &mut cursor),
+            Err(FfsError::Cancelled)
+        ));
         assert_eq!(std::fs::read(&fixture.sidecar).unwrap(), archive);
         assert_eq!(cursor.report, before);
         assert_eq!(cursor.next_group, 3);
@@ -1112,8 +1146,12 @@ mod tests {
         let cx = Cx::for_testing();
         let mut cursor = ProtectionScrubCursor::default();
         device.scrub_step(&cx, &mut cursor).unwrap();
-        File::options().write(true).open(&fixture.sidecar).unwrap()
-            .write_all_at(&record, offset).unwrap();
+        File::options()
+            .write(true)
+            .open(&fixture.sidecar)
+            .unwrap()
+            .write_all_at(&record, offset)
+            .unwrap();
         let archive = std::fs::read(&fixture.sidecar).unwrap();
         let error = device.scrub_step(&cx, &mut cursor).unwrap_err();
         assert!(error.to_string().contains("admitted generation"));
@@ -1175,13 +1213,21 @@ mod tests {
         for _ in 0..3 {
             device.scrub_step(&cx, &mut cursor).unwrap();
         }
-        File::options().write(true).open(&fixture.sidecar).unwrap()
-            .write_all_at(b"BADHDR!!", 0).unwrap();
+        File::options()
+            .write(true)
+            .open(&fixture.sidecar)
+            .unwrap()
+            .write_all_at(b"BADHDR!!", 0)
+            .unwrap();
         let report = finish_incremental_scrub(&device, &mut cursor);
         assert!(report.archive_rebuilt);
         assert_eq!(report.invalid_repair_symbols, 0);
         drop(device);
-        assert!(verify(&cx, &fixture.image, &fixture.sidecar).unwrap().is_healthy());
+        assert!(
+            verify(&cx, &fixture.image, &fixture.sidecar)
+                .unwrap()
+                .is_healthy()
+        );
     }
 
     #[test]
@@ -1191,11 +1237,26 @@ mod tests {
         let cx = Cx::for_testing();
         let mut cursor = ProtectionScrubCursor::default();
         device.state.lock().phase = Phase::Poisoned;
-        assert!(device.scrub_step(&cx, &mut cursor).unwrap_err().to_string().contains("poisoned"));
+        assert!(
+            device
+                .scrub_step(&cx, &mut cursor)
+                .unwrap_err()
+                .to_string()
+                .contains("poisoned")
+        );
         assert!(cursor.epoch.is_none());
         device.state.lock().phase = Phase::Clean; // test-only injected state
-        device.state.lock().archive.file.set_len(HEADER_BYTES as u64).unwrap();
-        assert!(matches!(device.scrub_step(&cx, &mut cursor), Err(FfsError::Io(_))));
+        device
+            .state
+            .lock()
+            .archive
+            .file
+            .set_len(HEADER_BYTES as u64)
+            .unwrap();
+        assert!(matches!(
+            device.scrub_step(&cx, &mut cursor),
+            Err(FfsError::Io(_))
+        ));
         assert_eq!(cursor.next_group, 0);
     }
 
