@@ -29,7 +29,7 @@ const BETWEEN_READS: Duration = Duration::from_millis(1);
 const PROTECTION_STEPS_PER_PASS: usize = 64;
 
 #[derive(Debug, Default, clap::Args)]
-pub(super) struct Options {
+pub struct Options {
     /// Scan protected source bytes in the background; seconds between full passes.
     #[arg(
         long = "scrub-interval-secs",
@@ -169,7 +169,7 @@ impl ProtectionMaintenance {
     ) -> Result<()> {
         // The worker's stop() cancels this same Cx. Managed/external unmount
         // sets shutdown; no independent unjoined task or cleanup Cx is used.
-        let stop = AtomicBool::new(false);
+        let never_stopped = AtomicBool::new(false);
         for _ in 0..PROTECTION_STEPS_PER_PASS {
             if shutdown.load(Ordering::Acquire) {
                 return Ok(());
@@ -178,7 +178,7 @@ impl ProtectionMaintenance {
             match step(&mut self.cursor).context("protected parity scrub")? {
                 ProtectionScrubStep::Busy | ProtectionScrubStep::PendingWrites => return Ok(()),
                 ProtectionScrubStep::GroupVerified { .. } => {
-                    if !wait(cx, &stop, shutdown, BETWEEN_READS)? {
+                    if !wait(cx, &never_stopped, shutdown, BETWEEN_READS)? {
                         return Ok(());
                     }
                 }
@@ -197,7 +197,7 @@ impl ProtectionMaintenance {
 /// startup. As in the ordinary mount's scrub guard, drop requests cancellation
 /// and joins; the worker releases its device ownership before stop returns.
 /// Final filesystem cleanup uses its separate, uncancelled context.
-pub(super) struct ScrubGuard {
+pub struct ScrubGuard {
     cx: Cx,
     stop: Arc<AtomicBool>,
     handle: Option<JoinHandle<Result<()>>>,

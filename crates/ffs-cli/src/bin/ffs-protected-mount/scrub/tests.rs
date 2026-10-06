@@ -159,7 +159,7 @@ fn worker_error_and_panic_request_unmount_and_survive_join() {
             &Cx::for_testing(),
             Arc::new(device),
             Arc::clone(&shutdown),
-            Duration::from_secs(86_400),
+            Duration::from_hours(24),
             |_| panic!("failed scan must not emit a complete pass"),
         )
         .unwrap();
@@ -219,7 +219,7 @@ fn failed_report_requests_unmount_instead_of_silent_scrub_loss() {
         &Cx::for_testing(),
         Arc::new(ProbeDevice::new(1)),
         Arc::clone(&shutdown),
-        Duration::from_secs(86_400),
+        Duration::from_hours(24),
         move |_| {
             sent.send(()).unwrap();
             bail!("injected evidence failure")
@@ -249,7 +249,7 @@ fn dropping_worker_cancels_inflight_io_and_releases_ownership_before_returning()
         &Cx::for_testing(),
         device.clone(),
         Arc::clone(&shutdown),
-        Duration::from_secs(86_400),
+        Duration::from_hours(24),
         |_| panic!("cancelled read must not emit a completed pass"),
     )
     .unwrap();
@@ -268,7 +268,7 @@ fn stopping_after_a_pass_does_not_wait_for_the_next_scan_interval() {
         &Cx::for_testing(),
         device.clone(),
         Arc::clone(&shutdown),
-        Duration::from_secs(86_400),
+        Duration::from_hours(24),
         move |_| {
             sent.send(()).unwrap();
             Ok(())
@@ -449,12 +449,12 @@ fn command_scrub_option_is_explicit_bounded_and_requires_a_mount() {
     let defaults = crate::Args::try_parse_from(base).unwrap();
     assert!(defaults.scrub.interval_secs.is_none());
     for rw in [false, true] {
-        let mut argv = base.to_vec();
-        argv.extend(["--scrub-interval-secs", "300"]);
+        let mut cli = base.to_vec();
+        cli.extend(["--scrub-interval-secs", "300"]);
         if rw {
-            argv.push("--rw");
+            cli.push("--rw");
         }
-        let args = crate::Args::try_parse_from(argv).unwrap();
+        let args = crate::Args::try_parse_from(cli).unwrap();
         assert_eq!(args.scrub.interval_secs, Some(300));
         args.scrub.validate(args.check).unwrap();
     }
@@ -508,7 +508,7 @@ fn background_worker_repairs_real_sidecar_source_without_a_foreground_read() {
         &Cx::for_testing(),
         device.clone(),
         shutdown,
-        Duration::from_secs(86_400),
+        Duration::from_hours(24),
         move |report| {
             sent.send(report.source_bytes_verified).unwrap();
             finish.store(true, Ordering::Release);
@@ -539,12 +539,12 @@ fn parity_option_requires_an_explicit_source_schedule_and_never_changes_defaults
     assert!(!crate::Args::try_parse_from(base).unwrap().scrub.parity);
     assert!(crate::Args::try_parse_from(base.into_iter().chain(["--scrub-parity"])).is_err());
     for rw in [false, true] {
-        let mut argv = base.to_vec();
-        argv.extend(["--scrub-parity", "--scrub-interval-secs", "300"]);
+        let mut cli = base.to_vec();
+        cli.extend(["--scrub-parity", "--scrub-interval-secs", "300"]);
         if rw {
-            argv.push("--rw");
+            cli.push("--rw");
         }
-        let args = crate::Args::try_parse_from(argv).unwrap();
+        let args = crate::Args::try_parse_from(cli).unwrap();
         assert!(args.scrub.parity);
         args.scrub.validate(false).unwrap();
         assert!(args.scrub.validate(true).is_err());
@@ -714,7 +714,7 @@ fn parity_worker_replenishes_symbols_that_source_only_reads_do_not_inspect() {
         &Cx::for_testing(),
         Arc::clone(&device),
         shutdown,
-        Duration::from_secs(86_400),
+        Duration::from_hours(24),
         true,
         move |report| {
             source_count.store(report.completed_passes, Ordering::Release);
@@ -866,7 +866,7 @@ fn parity_report_failure_requests_unmount_and_is_not_hidden_by_join() {
         &Cx::for_testing(),
         Arc::clone(&device),
         Arc::clone(&shutdown),
-        Duration::from_secs(86_400),
+        Duration::from_hours(24),
         true,
         |_| Ok(()),
         move |_| {
