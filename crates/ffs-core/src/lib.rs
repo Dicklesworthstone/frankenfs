@@ -2824,18 +2824,6 @@ pub fn btrfs_commit_fst_early() -> bool {
     })
 }
 
-/// Whether the writable FS tree changes nodes it already copied this
-/// transaction in place (bd-dysiw). On by default; `FFS_BTRFS_IN_PLACE_COW=0`
-/// restores a full root-to-leaf copy per mutation, the incumbent for A/B runs.
-pub fn btrfs_in_place_cow_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| match std::env::var("FFS_BTRFS_IN_PLACE_COW") {
-        Ok(v) => !matches!(v.trim(), "0" | "false" | "off" | "no"),
-        Err(std::env::VarError::NotUnicode(_)) => false,
-        Err(std::env::VarError::NotPresent) => true,
-    })
-}
-
 fn readdir_snapshot_serve(
     slot: &Mutex<Option<ReaddirSnapshot>>,
     ino: u64,
@@ -12026,10 +12014,6 @@ impl OpenFs {
         let mut fs_tree = InMemoryCowBtrfsTree::new(max_items)
             .map_err(|e| btrfs_mutation_to_ffs(&e))?
             .with_node_byte_budget((nodesize as usize).saturating_sub(101));
-        // The commit seals the tree when it snapshots block ids for writeback.
-        if btrfs_in_place_cow_enabled() {
-            fs_tree.enable_in_place_mutation();
-        }
 
         // Find the highest objectid in use so we can mint new ones.
         // Only inode numbers count: see BTRFS_LAST_FREE_OBJECTID.
@@ -37472,10 +37456,6 @@ impl OpenFs {
         // Build the write-dependency DAG from the in-memory FS tree
         let dag = WriteDependencyDag::from_cow_tree(&alloc.fs_tree, new_gen)
             .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-        // From here its block ids name what this commit writes (and what
-        // `written_tree_blocks` will reuse), so no node may change in place
-        // any more (bd-dysiw).
-        alloc.fs_tree.seal();
 
         let node_count = dag.node_count();
         if node_count == 0 {
@@ -77373,70 +77353,6 @@ mod tests {
             OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).expect("open btrfs");
         fs.enable_writes(&cx).expect("enable writes");
         Some((fs, tmp, image))
-    }
-
-    /// bd-dysiw same-invocation A/B: a generic/129-style loop of small
-    /// overwrites + read-backs (fsync every 500) with the FS tree copying the
-    /// whole path per mutation (incumbent) vs changing fresh nodes in place.
-    /// Arms alternate on fresh images; both must leave identical contents.
-    /// `cargo test -p ffs-core --lib -- --ignored small_overwrite_ab --nocapture`
-    #[test]
-    #[ignore = "timing A/B, run on demand"]
-    fn btrfs_small_overwrite_ab_bd_dysiw() {
-        const IO: usize = 8192;
-        const ITERS: u64 = 4000;
-        let run = |in_place: bool| -> Option<(std::time::Duration, Vec<u8>)> {
-            let (fs, _tmp, _image) = open_file_backed_btrfs(256)?;
-            if !in_place {
-                fs.require_btrfs_alloc_state()
-                    .expect("writable")
-                    .write()
-                    .fs_tree
-                    .disable_in_place_mutation();
-            }
-            let cx = Cx::for_testing();
-            let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
-            let ino = fs
-                .create(&cx, root, OsStr::new("f"), 0o644, 0, 0)
-                .expect("create")
-                .ino;
-            fs.write(&cx, ino, 0, &vec![0; 128 * IO]).expect("fill");
-            fs.fsync(&cx, ino, 0, false).expect("commit");
-            let start = std::time::Instant::now();
-            for i in 0..ITERS {
-                let offset = (i * 7919 % 128) * IO as u64;
-                let byte = u8::try_from(i % 251).expect("byte");
-                fs.write(&cx, ino, offset, &[byte; IO]).expect("overwrite");
-                assert_eq!(
-                    fs.read(&cx, ino, offset, IO as u32).expect("read back"),
-                    vec![byte; IO]
-                );
-                if i % 500 == 499 {
-                    fs.fsync(&cx, ino, 0, false).expect("commit");
-                }
-            }
-            let elapsed = start.elapsed();
-            let contents = fs.read(&cx, ino, 0, (128 * IO) as u32).expect("read all");
-            Some((elapsed, contents))
-        };
-        let mut times = [Vec::new(), Vec::new()];
-        let mut reference = None;
-        for round in 0..3 {
-            for in_place in [false, true] {
-                let Some((elapsed, contents)) = run(in_place) else {
-                    oracle_unavailable("btrfs image formatter (btrfs-progs)");
-                    return;
-                };
-                let reference = reference.get_or_insert_with(|| contents.clone());
-                assert_eq!(&contents, reference, "arms must agree byte for byte");
-                eprintln!("round {round} in_place={in_place} {elapsed:?}");
-                times[usize::from(in_place)].push(elapsed);
-            }
-        }
-        for (arm, mut t) in times.into_iter().enumerate() {
-            t.sort();
-            eprintln!("AB in_place={} median {:?} all {t:?}", arm == 1, t[1]);
-        }
     }
 
     /// Offsets of every 4 KiB image block filled entirely with `byte`.
