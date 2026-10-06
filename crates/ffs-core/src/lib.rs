@@ -58188,7 +58188,9 @@ mod tests {
         assert_eq!(stats.fragment_size, sb.block_size);
         assert_eq!(stats.blocks, sb.blocks_count);
         assert_eq!(stats.blocks_free, 42);
-        assert_eq!(stats.blocks_available, 39);
+        // Free minus the root reserve (3) and the metadata reserve (bd-rohtt).
+        let reserve = ffs_alloc::reserved_metadata_blocks(&FsGeometry::from_superblock(sb));
+        assert_eq!(stats.blocks_available, 39 - reserve);
         assert_eq!(stats.files, u64::from(sb.inodes_count));
         assert_eq!(stats.files_free, 17);
         assert_eq!(stats.name_max, 255);
@@ -58231,7 +58233,11 @@ mod tests {
         let stats = fs.statfs(&cx, InodeNumber(2)).expect("statfs");
         assert_eq!(stats.blocks_free, 42);
         assert_eq!(stats.files_free, 20);
-        assert_eq!(stats.blocks_available, 42);
+        // No root reserve here; only the metadata reserve (bd-rohtt).
+        let reserve = ffs_alloc::reserved_metadata_blocks(&FsGeometry::from_superblock(
+            fs.ext4_superblock().expect("ext4 superblock"),
+        ));
+        assert_eq!(stats.blocks_available, 42 - reserve);
     }
 
     #[test]
@@ -75275,16 +75281,25 @@ mod tests {
             .unwrap();
         let block_size = u64::from(fs.ext4_superblock().unwrap().block_size);
         let available = fs.free_space_summary(&cx).unwrap().free_blocks_total;
-        // Fill real blocks with one contiguous file. The symlink target itself
+        // Fill real blocks with one contiguous file until file data is refused.
+        // What is left is at most the metadata reserve (bd-rohtt), which a
+        // symlink's target block may not take either. The symlink target itself
         // stays valid; an oversized target tests ENAMETOOLONG, not rollback.
+        let reserve = ffs_alloc::reserved_metadata_blocks(&FsGeometry::from_superblock(
+            fs.ext4_superblock().unwrap(),
+        ));
         for block in 0..available {
-            if fs.free_space_summary(&cx).unwrap().free_blocks_total == 0 {
-                break;
+            match fs.fallocate(&cx, filler.ino, block * block_size, block_size, 0) {
+                Ok(()) => {}
+                Err(err) if err.to_errno() == libc::ENOSPC => break,
+                Err(err) => panic!("preallocate remaining space: {err}"),
             }
-            fs.fallocate(&cx, filler.ino, block * block_size, block_size, 0)
-                .expect("preallocate remaining space including extent metadata");
         }
-        assert_eq!(fs.free_space_summary(&cx).unwrap().free_blocks_total, 0);
+        let free_full = fs.free_space_summary(&cx).unwrap().free_blocks_total;
+        assert!(
+            free_full <= reserve,
+            "file data stopped at the reserve: {free_full} free, reserve {reserve}"
+        );
         let free_before = fs
             .count_free_inodes_in_group(&cx, GroupNumber(0))
             .expect("free inode count before slow symlink failure");
@@ -75305,7 +75320,10 @@ mod tests {
         assert_eq!(err.to_errno(), libc::ENOSPC);
         assert_eq!(fs.current_snapshot(), before);
         assert_eq!(dev.snapshot_bytes(), before_device);
-        assert_eq!(fs.free_space_summary(&cx).unwrap().free_blocks_total, 0);
+        assert_eq!(
+            fs.free_space_summary(&cx).unwrap().free_blocks_total,
+            free_full
+        );
 
         let lookup_err = fs
             .lookup(&cx, root, OsStr::new("slow_link_enospc"))
@@ -77178,6 +77196,68 @@ mod tests {
                 .expect("attach jbd2")
         );
         Some((fs, tmp, image))
+    }
+
+    /// bd-rohtt (xfstests generic/274, scaled down): a write into space
+    /// preallocated past EOF needs no new data block, so it must succeed after
+    /// the rest of the filesystem has been filled to ENOSPC.
+    #[test]
+    fn ext4_write_into_preallocated_space_succeeds_on_a_full_filesystem_bd_rohtt() {
+        const K64: usize = 64 * 1024;
+        let Some((fs, _tmp, _image)) = open_file_backed_ext4(128) else {
+            oracle_unavailable("ext4 image formatter");
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let test = fs
+            .create(&cx, root, OsStr::new("test"), 0o644, 0, 0)
+            .expect("create test")
+            .ino;
+        fs.write(&cx, test, 0, &[0x11; K64]).expect("pwrite 0 64k");
+        // falloc -k 64k 16m
+        fs.fallocate(&cx, test, K64 as u64, 16 << 20, 1)
+            .expect("preallocate past EOF");
+
+        let mut fill = |name: &str, chunk: usize| {
+            let ino = fs
+                .create(&cx, root, OsStr::new(name), 0o644, 0, 0)
+                .expect("create filler")
+                .ino;
+            let mut offset = 0_u64;
+            loop {
+                match fs.write(&cx, ino, offset, &vec![0x55; chunk]) {
+                    Ok(0) => break,
+                    Ok(n) => offset += u64::from(n),
+                    Err(err) => {
+                        assert_eq!(err.to_errno(), libc::ENOSPC, "filler {name}: {err}");
+                        break;
+                    }
+                }
+            }
+        };
+        fill("tmp1", 1 << 20);
+        fill("tmp2", 4096);
+        fs.fsync(&cx, test, 0, false).expect("commit the fill");
+
+        for i in (1..256_u64).step_by(2) {
+            fs.write(&cx, test, i * K64 as u64, &[0xAB; K64])
+                .unwrap_or_else(|err| panic!("write into preallocation at 64k*{i}: {err}"));
+        }
+        for i in (2..256_u64).step_by(2) {
+            fs.write(&cx, test, i * K64 as u64, &[0xCD; K64])
+                .unwrap_or_else(|err| panic!("fill hole in preallocation at 64k*{i}: {err}"));
+        }
+        assert_eq!(
+            fs.read(&cx, test, 5 * K64 as u64, K64 as u32)
+                .expect("read back"),
+            vec![0xAB; K64]
+        );
+        assert_eq!(
+            fs.read(&cx, test, 6 * K64 as u64, K64 as u32)
+                .expect("read back"),
+            vec![0xCD; K64]
+        );
     }
 
     fn read_image_block(image: &Path, block: u64) -> Vec<u8> {
@@ -85529,7 +85609,8 @@ mod tests {
                 geo.group_count,
                 sb.blocks_count,
                 u64::from(sb.inodes_count),
-                sb.reserved_blocks_count,
+                // Root reserve plus the metadata reserve, as ext4_statfs.
+                sb.reserved_blocks_count + ffs_alloc::reserved_metadata_blocks(&geo),
             )
         };
         let (gd_blocks, gd_inodes) = fs
