@@ -177,9 +177,10 @@ pub const BTRFS_EXTENT_CSUM_OBJECTID: u64 = 0xFFFF_FFFF_FFFF_FFF6;
 pub const BTRFS_CRC32C_CSUM_SIZE: usize = 4;
 /// On-disk size of a single xxhash64 data checksum.
 pub const BTRFS_XXHASH64_CSUM_SIZE: usize = 8;
-/// Widest digest FrankenFS produces for a data sector, so a single checksum can
-/// travel by value instead of by allocation.
-pub const BTRFS_MAX_IMPL_CSUM_SIZE: usize = BTRFS_XXHASH64_CSUM_SIZE;
+/// Widest digest FrankenFS produces for a data sector (SHA256 and BLAKE2b-256
+/// fill the whole 32-byte field), so a single checksum can travel by value
+/// instead of by allocation.
+pub const BTRFS_MAX_IMPL_CSUM_SIZE: usize = ffs_ondisk::BTRFS_CSUM_FIELD_SIZE;
 
 /// On-disk width of one data checksum under `csum_type`, or `None` when
 /// FrankenFS does not implement that algorithm.
@@ -13416,11 +13417,16 @@ mod tests {
             "16258 bytes holds 4064 crc32c digests or exactly half that many xxh64"
         );
 
-        // An algorithm with no implemented width cannot yield an honest bound.
-        assert_eq!(
-            max_data_csums_per_item(16384, ffs_types::BTRFS_CSUM_TYPE_SHA256),
-            1
-        );
+        // SHA256 and BLAKE2b digests fill 32 bytes each.
+        for wide in [
+            ffs_types::BTRFS_CSUM_TYPE_SHA256,
+            ffs_types::BTRFS_CSUM_TYPE_BLAKE2B,
+        ] {
+            assert_eq!(max_data_csums_per_item(16384, wide), (16384 - 126) / 32);
+        }
+
+        // A value that is not an algorithm cannot yield an honest bound.
+        assert_eq!(max_data_csums_per_item(16384, 9), 1);
     }
 
     #[test]
@@ -13488,16 +13494,10 @@ mod tests {
             verify_extent_csum(&[0u8; 8192], 4096, &[0u8; 4], crc),
             Err(Err(BtrfsMutationError::InvalidConfig(_)))
         ));
-        // An unimplemented algorithm is refused, never verified with another's
-        // digest: 32 bytes of "sha256" over one sector is a well-formed csum run
-        // for a filesystem FrankenFS cannot check.
+        // A value that is not an algorithm is refused, never verified with
+        // another's digest.
         assert!(matches!(
-            verify_extent_csum(
-                &[0u8; 4096],
-                4096,
-                &[0u8; 32],
-                ffs_types::BTRFS_CSUM_TYPE_SHA256
-            ),
+            verify_extent_csum(&[0u8; 4096], 4096, &[0u8; 32], 9),
             Err(Err(BtrfsMutationError::InvalidConfig(_)))
         ));
     }
@@ -13887,16 +13887,43 @@ mod tests {
         }
     }
 
-    /// SHA256 and BLAKE2b fail CLOSED at every layer rather than being checked
-    /// with an algorithm FrankenFS happens to have.
+    /// SHA256 and BLAKE2b-256 data checksums: 32 bytes per sector, packed at
+    /// that stride, verified per sector, and a flipped byte is reported as a
+    /// mismatch of the right sector with the full 32-byte digests.
     #[test]
-    fn unimplemented_csum_types_are_refused_not_guessed_bd_csum_parity() {
+    fn sha256_and_blake2b_data_checksums_round_trip() {
         let sectorsize = 4096_usize;
-        let data = vec![0x11_u8; sectorsize];
+        let mut data: Vec<u8> = (0..3 * sectorsize).map(|i| (i % 253) as u8).collect();
         for csum_type in [
             ffs_types::BTRFS_CSUM_TYPE_SHA256,
             ffs_types::BTRFS_CSUM_TYPE_BLAKE2B,
         ] {
+            assert_eq!(btrfs_data_csum_size(csum_type), Some(32));
+            let (_, csums) = build_extent_csum_item(0x1000, &data, sectorsize, csum_type)
+                .expect("build csum item");
+            assert_eq!(csums.len(), 3 * 32);
+            verify_extent_csum(&data, sectorsize, &csums, csum_type).expect("clean data verifies");
+            data[sectorsize + 7] ^= 0x80;
+            match verify_extent_csum(&data, sectorsize, &csums, csum_type) {
+                Err(Ok(mismatch)) => {
+                    assert_eq!(mismatch.sector_index, 1);
+                    assert_eq!(mismatch.expected_digest().len(), 32);
+                    assert_ne!(mismatch.expected_digest(), mismatch.actual_digest());
+                }
+                other => panic!("expected a sector-1 mismatch, got {other:?}"),
+            }
+            data[sectorsize + 7] ^= 0x80;
+        }
+    }
+
+    /// A value that is not a btrfs checksum algorithm fails CLOSED at every
+    /// layer rather than being checked with an algorithm FrankenFS happens to
+    /// have.
+    #[test]
+    fn unknown_csum_types_are_refused_not_guessed_bd_csum_parity() {
+        let sectorsize = 4096_usize;
+        let data = vec![0x11_u8; sectorsize];
+        for csum_type in [4_u16, 9] {
             assert_eq!(btrfs_data_csum_size(csum_type), None);
             assert_eq!(btrfs_data_csum(csum_type, &data), None);
             assert!(!btrfs_data_csum_matches(csum_type, &data, &[0_u8; 32]));
