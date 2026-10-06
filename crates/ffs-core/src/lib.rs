@@ -77219,7 +77219,7 @@ mod tests {
         fs.fallocate(&cx, test, K64 as u64, 16 << 20, 1)
             .expect("preallocate past EOF");
 
-        let mut fill = |name: &str, chunk: usize| {
+        let fill = |name: &str, chunk: usize| {
             let ino = fs
                 .create(&cx, root, OsStr::new(name), 0o644, 0, 0)
                 .expect("create filler")
