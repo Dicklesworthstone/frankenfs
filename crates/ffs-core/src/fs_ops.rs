@@ -1828,9 +1828,11 @@ impl FsOps for OpenFs {
                 let min_blocks = (min_len / block).max(1);
                 self.ext4_trim_free_blocks(cx, first, last, min_blocks)
             }
-            // Not released yet on btrfs (bd-3fmbr): nothing is discarded and
-            // 0 bytes are reported.
-            FsFlavor::Btrfs(_) => Ok(0),
+            // btrfs_trim_fs's range: logical addresses, the end saturating
+            // (len == U64_MAX means "to the end").
+            FsFlavor::Btrfs(_) => {
+                self.btrfs_trim_free_space(cx, start, start.saturating_add(len), min_len)
+            }
         }
     }
 

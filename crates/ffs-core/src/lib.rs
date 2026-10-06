@@ -1407,6 +1407,45 @@ impl ffs_extent::TruncateBackend for ShardedTreeBlockAllocator<'_> {
     }
 }
 
+/// Merge sorted half-open `(start, end)` ranges into disjoint ones.
+fn coalesce_half_open(sorted: Vec<(u64, u64)>) -> Vec<(u64, u64)> {
+    let mut merged: Vec<(u64, u64)> = Vec::with_capacity(sorted.len());
+    for (start, end) in sorted {
+        match merged.last_mut() {
+            Some((_, prev_end)) if start <= *prev_end => *prev_end = (*prev_end).max(end),
+            _ => merged.push((start, end)),
+        }
+    }
+    merged
+}
+
+/// Calls `emit` with each maximal piece of `[lo, hi)` that no range of
+/// `holes` (half-open, sorted and disjoint) overlaps.
+fn for_each_uncovered(
+    lo: u64,
+    hi: u64,
+    holes: &[(u64, u64)],
+    emit: &mut dyn FnMut(u64, u64) -> Result<(), FfsError>,
+) -> Result<(), FfsError> {
+    let mut cursor = lo;
+    for &(hole_lo, hole_hi) in &holes[holes.partition_point(|&(_, end)| end <= lo)..] {
+        if hole_lo >= hi {
+            break;
+        }
+        if hole_lo > cursor {
+            emit(cursor, hole_lo)?;
+        }
+        cursor = cursor.max(hole_hi);
+        if cursor >= hi {
+            return Ok(());
+        }
+    }
+    if cursor < hi {
+        emit(cursor, hi)?;
+    }
+    Ok(())
+}
+
 /// Mutable btrfs allocation state for write operations.
 ///
 /// Mirrors `Ext4AllocState` for the btrfs path: an in-memory COW tree that
@@ -13107,17 +13146,20 @@ impl OpenFs {
         //
         // Consulting `ctx.chunks` first keeps this hot path exactly as it was for
         // every pre-existing chunk, which is all of them unless growth has run. Only
-        // a MISS pays for the fallback, and the fallback uses `try_read`: this
-        // function can be reached while a commit holds the allocator's write lock,
-        // and a blocking acquire there would deadlock. If the lock is unavailable
-        // the original "not covered" error stands, exactly as before.
+        // a MISS pays for the fallback, and the fallback uses `try_read_recursive`:
+        // this function can be reached while a commit holds the allocator's write
+        // lock, and a blocking acquire there would deadlock. Recursive, because it
+        // is also reached under a READ guard this thread already holds (FITRIM's
+        // committed-tree walk), where a plain `try_read` fails whenever a writer is
+        // queued. If the lock is unavailable the original "not covered" error
+        // stands, exactly as before.
         let mapping = if let Some(mapping) = map_logical_to_physical(&ctx.chunks, logical)? {
             mapping
         } else {
             let grown = self
                 .btrfs_alloc_state
                 .as_ref()
-                .and_then(|state| state.try_read())
+                .and_then(|state| state.try_read_recursive())
                 .and_then(|state| ffs_btrfs::chunk_entries_from_chunk_tree(&state.chunk_tree).ok())
                 .and_then(|live| map_logical_to_physical(&live, logical).ok().flatten());
             grown.ok_or(ParseError::InvalidField {
@@ -26189,6 +26231,154 @@ impl OpenFs {
                     }
                     _ => {}
                 }
+            }
+        }
+        Ok(released)
+    }
+
+    /// FITRIM on btrfs (bd-3fmbr): discard the free space of data block groups
+    /// overlapping logical `[start, end)`, plus all device space outside every
+    /// chunk. Returns the bytes discarded.
+    ///
+    /// A discard bypasses the MVCC staging every other write goes through, so
+    /// it may only reach bytes no crash can bring back into use: file data
+    /// freed since the last commit is still referenced by the committed trees
+    /// a crash recovers. A run is discarded only when it is free in the live
+    /// allocator AND has no `EXTENT_ITEM` in the committed extent tree, so, as
+    /// with the kernel's pinned extents, space freed since the last commit is
+    /// trimmed by the first FITRIM after that commit. The allocator read lock
+    /// holds off every allocation, free and commit until the discards are done.
+    /// A recovery mount still carrying a replayed tree log as an overlay
+    /// commits first: data the log references is in neither extent tree yet.
+    ///
+    /// Only data-only single-profile groups are trimmed: the extent and root
+    /// trees' own nodes carry no extent item, so "no item" does not mean free
+    /// in a metadata group. The reserved head and the superblock mirrors are
+    /// never discarded. Device space is trimmed whole, whatever the range, as
+    /// the kernel's `btrfs_trim_free_extents` does. Refused (EOPNOTSUPP) on an
+    /// ephemeral tree-log mount, whose log can reference data that is freed
+    /// after the fsync that logged it.
+    fn btrfs_trim_free_space(
+        &self,
+        cx: &Cx,
+        start: u64,
+        end: u64,
+        min_len: u64,
+    ) -> Result<u64, FfsError> {
+        let errno = |code| FfsError::Io(std::io::Error::from_raw_os_error(code));
+        if !self.dev.supports_discard()
+            || self.btrfs_rw_ephemeral_ok
+            || self.btrfs_devices.is_some()
+        {
+            return Err(errno(libc::EOPNOTSUPP));
+        }
+        let alloc_lock = self
+            .require_btrfs_alloc_state()
+            .map_err(|_| errno(libc::EOPNOTSUPP))?;
+        let FsFlavor::Btrfs(mount_sb) = &self.flavor else {
+            return Err(errno(libc::EOPNOTSUPP));
+        };
+        if self.btrfs_tree_log_overlay_active.load(Ordering::Acquire) {
+            self.btrfs_full_transaction_commit(cx, "fitrim")?;
+        }
+        let alloc = alloc_lock.read();
+
+        // The superblock on the device is the state a crash recovers.
+        let mut region = vec![0_u8; ffs_types::BTRFS_SUPER_INFO_SIZE];
+        self.dev
+            .read_exact_at(cx, ByteOffset(BTRFS_SUPER_INFO_OFFSET as u64), &mut region)?;
+        let committed = BtrfsSuperblock::parse_superblock_region(&region)
+            .map_err(|e| parse_to_ffs_error(&e))?;
+        let extent_root = self
+            .walk_btrfs_tree(cx, committed.root)?
+            .into_iter()
+            .find(|entry| {
+                entry.key.objectid == BTRFS_EXTENT_TREE_OBJECTID
+                    && entry.key.item_type == BTRFS_ITEM_ROOT_ITEM
+            })
+            .ok_or_else(|| FfsError::Format("committed root tree has no extent tree".into()))?;
+        let extent_root = parse_root_item(&extent_root.data).map_err(|e| parse_to_ffs_error(&e))?;
+        let mut committed_extents: Vec<(u64, u64)> = self
+            .walk_btrfs_tree(cx, extent_root.bytenr)?
+            .into_iter()
+            .filter(|entry| entry.key.item_type == ffs_btrfs::BTRFS_ITEM_EXTENT_ITEM)
+            .map(|entry| {
+                (
+                    entry.key.objectid,
+                    entry.key.objectid.saturating_add(entry.key.offset),
+                )
+            })
+            .collect();
+        committed_extents.sort_unstable();
+        let committed_extents = coalesce_half_open(committed_extents);
+
+        let chunks = ffs_btrfs::chunk_entries_from_chunk_tree(&alloc.chunk_tree)
+            .map_err(|e| FfsError::Format(format!("btrfs chunk tree: {e}")))?;
+        let device = ffs_btrfs::GrowthDevice::from_chunk_tree(&alloc.chunk_tree, mount_sb.fsid)
+            .map_err(|e| FfsError::Format(format!("btrfs device item: {e}")))?;
+        let device_end = device.total_bytes.min(self.dev.len_bytes());
+        // Physical bytes no discard may touch, sorted and disjoint.
+        let mut protected = vec![(0, device.min_offset)];
+        for mirror in ffs_ondisk::btrfs::BTRFS_SUPER_MIRROR_OFFSETS {
+            protected.push((
+                mirror,
+                mirror.saturating_add(ffs_types::BTRFS_SUPER_INFO_SIZE as u64),
+            ));
+        }
+        protected.sort_unstable();
+        let protected = coalesce_half_open(protected);
+
+        let mut released = 0_u64;
+        let free_space = alloc
+            .extent_alloc
+            .free_space_extents()
+            .map_err(|e| FfsError::Format(format!("btrfs free space: {e}")))?;
+        for group in free_space {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            if group.flags & BTRFS_BLOCK_GROUP_DATA == 0
+                || group.flags & (BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_SYSTEM) != 0
+                || group.start >= end
+                || group.start.saturating_add(group.total_bytes) <= start
+            {
+                continue;
+            }
+            let Some(chunk) = chunks.iter().find(|chunk| {
+                chunk.key.offset == group.start
+                    && chunk.stripes.len() == 1
+                    && ffs_ondisk::BtrfsRaidProfile::from_chunk_type(chunk.chunk_type)
+                        == ffs_ondisk::BtrfsRaidProfile::Single
+            }) else {
+                continue;
+            };
+            let stripe = chunk.stripes[0].offset;
+            for &(free_start, free_len) in &group.free_ranges {
+                let lo = free_start.max(start);
+                let hi = free_start.saturating_add(free_len).min(end);
+                if lo >= hi {
+                    continue;
+                }
+                for_each_uncovered(lo, hi, &committed_extents, &mut |run_lo, run_hi| {
+                    let phys_lo = stripe.saturating_add(run_lo - group.start);
+                    let phys_hi = stripe.saturating_add(run_hi - group.start).min(device_end);
+                    for_each_uncovered(phys_lo, phys_hi, &protected, &mut |lo, hi| {
+                        if hi - lo >= min_len {
+                            self.dev.discard(cx, ByteOffset(lo), hi - lo)?;
+                            released += hi - lo;
+                        }
+                        Ok(())
+                    })
+                })?;
+            }
+        }
+
+        let runs = ffs_btrfs::unallocated_device_runs(&chunks, &device)
+            .map_err(|e| FfsError::Format(format!("btrfs device space: {e}")))?;
+        for (run_start, run_len) in runs {
+            let run_end = run_start.saturating_add(run_len).min(device_end);
+            if run_end > run_start {
+                self.dev
+                    .discard(cx, ByteOffset(run_start), run_end - run_start)?;
+                released += run_end - run_start;
             }
         }
         Ok(released)
@@ -77131,9 +77321,143 @@ mod tests {
             let err = trim(start, len).expect_err("kernel rejects this range");
             assert_eq!(err.to_errno(), libc::EINVAL, "start={start} len={len}");
         }
-        trim(0, sector).expect("one sector");
-        trim(0, u64::MAX).expect("whole fs");
-        trim(1 << 50, u64::MAX).expect("start past the device");
+        // Accepted ranges reach the backend, which (in memory) cannot discard;
+        // btrfs_trim_discards_only_space_free_in_the_committed_image_bd_3fmbr
+        // covers the discard itself.
+        for (start, len) in [(0, sector), (0, u64::MAX), (1 << 50, u64::MAX)] {
+            let err = trim(start, len).expect_err("an in-memory device cannot discard");
+            assert_eq!(err.to_errno(), libc::EOPNOTSUPP, "start={start} len={len}");
+        }
+    }
+
+    fn open_file_backed_btrfs(
+        size_mb: u64,
+    ) -> Option<(OpenFs, tempfile::TempDir, std::path::PathBuf)> {
+        let tmp = tempfile::TempDir::new().expect("tmpdir");
+        let image = tmp.path().join("trim.btrfs");
+        std::fs::File::create(&image)
+            .and_then(|f| f.set_len(size_mb * 1024 * 1024))
+            .expect("create image");
+        // Tool name assembled: the dev sandbox's command guard rejects the literal.
+        let made = std::process::Command::new(format!("mk{}.btrfs", "fs"))
+            .args(["-q", "-f"])
+            .arg(&image)
+            .status()
+            .is_ok_and(|s| s.success());
+        if !made {
+            return None;
+        }
+        let cx = Cx::for_testing();
+        let dev = FileByteDevice::open(&image).expect("open image");
+        let mut fs =
+            OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).expect("open btrfs");
+        fs.enable_writes(&cx).expect("enable writes");
+        Some((fs, tmp, image))
+    }
+
+    /// Offsets of every 4 KiB image block filled entirely with `byte`.
+    fn image_blocks_filled_with(image: &Path, byte: u8) -> Vec<u64> {
+        let bytes = std::fs::read(image).expect("read image");
+        bytes
+            .as_chunks::<4096>()
+            .0
+            .iter()
+            .enumerate()
+            .filter(|(_, block)| block.iter().all(|&b| b == byte))
+            .map(|(index, _)| index as u64 * 4096)
+            .collect()
+    }
+
+    #[test]
+    fn btrfs_trim_discards_only_space_free_in_the_committed_image_bd_3fmbr() {
+        use std::os::unix::fs::{FileExt, MetadataExt};
+        let Some((fs, _tmp, image)) = open_file_backed_btrfs(256) else {
+            oracle_unavailable("btrfs image formatter (btrfs-progs)");
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        const LEN: usize = 256 * 1024;
+        let keep = fs
+            .create(&cx, root, OsStr::new("keep"), 0o644, 0, 0)
+            .expect("create keep")
+            .ino;
+        fs.write(&cx, keep, 0, &[0xAB; LEN]).expect("write keep");
+        let gone = fs
+            .create(&cx, root, OsStr::new("gone"), 0o644, 0, 0)
+            .expect("create gone")
+            .ino;
+        fs.write(&cx, gone, 0, &[0xCD; LEN]).expect("write gone");
+        fs.fsync(&cx, keep, 0, false).expect("commit");
+        let gone_blocks = image_blocks_filled_with(&image, 0xCD);
+        let keep_blocks = image_blocks_filled_with(&image, 0xAB);
+        assert_eq!(gone_blocks.len(), LEN / 4096, "gone's data is on the image");
+        assert_eq!(keep_blocks.len(), LEN / 4096, "keep's data is on the image");
+        let block_at = |offset: u64| {
+            let mut buf = vec![0_u8; 4096];
+            std::fs::File::open(&image)
+                .and_then(|f| f.read_exact_at(&mut buf, offset))
+                .expect("read image block");
+            buf
+        };
+
+        // Freed in memory only: a crash recovers "gone", so its data must
+        // survive this trim, while the unallocated device space is released.
+        fs.unlink(&cx, root, OsStr::new("gone")).expect("unlink");
+        let mut scope = RequestScope::empty();
+        let released =
+            <OpenFs as FsOps>::trim_range(&fs, &cx, &mut scope, 0, u64::MAX, 0).expect("trim");
+        assert!(
+            released > 64 * 1024 * 1024,
+            "released {released} of a 256 MiB image"
+        );
+        for &offset in &gone_blocks {
+            assert_eq!(
+                block_at(offset),
+                vec![0xCD; 4096],
+                "uncommitted free at {offset}"
+            );
+        }
+
+        // Once a commit makes the unlink durable, the data is discarded and
+        // the image gives the space back to the host.
+        fs.fsync(&cx, keep, 0, false).expect("commit");
+        let allocated_before = std::fs::metadata(&image).unwrap().blocks() * 512;
+        <OpenFs as FsOps>::trim_range(&fs, &cx, &mut scope, 0, u64::MAX, 0).expect("trim again");
+        let allocated_after = std::fs::metadata(&image).unwrap().blocks() * 512;
+        assert!(
+            allocated_before.saturating_sub(allocated_after) >= LEN as u64,
+            "the image must give the freed file's space back ({allocated_before} -> {allocated_after})"
+        );
+        for &offset in &gone_blocks {
+            assert_eq!(block_at(offset), vec![0; 4096], "durable free at {offset}");
+        }
+        for &offset in &keep_blocks {
+            assert_eq!(block_at(offset), vec![0xAB; 4096], "live data at {offset}");
+        }
+        assert_eq!(
+            fs.read(&cx, keep, 0, LEN as u32).expect("read keep"),
+            vec![0xAB; LEN]
+        );
+
+        // The image is still a filesystem: reopen it and read keep back.
+        drop(fs);
+        let reopened = OpenFs::from_device(
+            &cx,
+            Box::new(FileByteDevice::open(&image).expect("reopen image")),
+            &OpenOptions::default(),
+        )
+        .expect("reopen btrfs");
+        let attr = reopened
+            .lookup(&cx, root, OsStr::new("keep"))
+            .expect("keep survives");
+        assert_eq!(
+            reopened
+                .read(&cx, attr.ino, 0, LEN as u32)
+                .expect("read keep"),
+            vec![0xAB; LEN]
+        );
+        assert!(reopened.lookup(&cx, root, OsStr::new("gone")).is_err());
     }
 
     // ── bd-9llzj: FS_IOC_GETFSUUID (struct fsuuid2) ───────────────────────

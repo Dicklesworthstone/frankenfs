@@ -7353,22 +7353,6 @@ pub fn plan_growth_for_commit(
     plan_growth_for_shortfall(chunks, ChunkKind::Metadata, shortfall, device, policy)
 }
 
-/// [`plan_growth_for_commit`] for an arbitrary chunk kind and an already-computed
-/// shortfall in BYTES.
-///
-/// Split out for the SYSTEM case (bd-a136s). Serializing the chunk tree allocates
-/// from SYSTEM space — it must, or the chunk root is unmappable at bootstrap —
-/// so a commit that grows can exhaust the system chunk, and that shortfall is
-/// counted in bytes of tree blocks rather than in a DAG node count.
-///
-/// ⚠️ A SYSTEM chunk is the one kind that must ALSO reach the superblock's
-/// `sys_chunk_array`, because the kernel bootstraps from that array alone. The
-/// plan says so via `needs_sys_chunk_array`, and `apply_chunk_allocation` refuses
-/// to create one without a superblock to record it in. Growth must therefore hand
-/// it a superblock, not `None`, or the allocation is correctly rejected.
-///
-/// # Errors
-/// As [`plan_growth_for_commit`].
 /// Bytes of new `kind` chunks the growth planner could still place on
 /// `device`: [`plan_growth_for_shortfall`]'s own model — the chunk map's
 /// occupancy, the superblock mirrors, the reserved head below `min_offset`
@@ -7407,6 +7391,51 @@ pub fn growable_chunk_bytes(
     total
 }
 
+/// Physical `(start, len)` runs of `device` that no chunk occupies, above
+/// the reserved head and clear of the superblock mirrors: the device space
+/// FITRIM may discard outside every block group (`btrfs_trim_free_extents`).
+///
+/// # Errors
+/// A chunk layout [`DeviceOccupancy::from_chunks`] does not model (striped
+/// profiles). Guessing there would discard bytes a chunk occupies.
+pub fn unallocated_device_runs(
+    chunks: &[BtrfsChunkEntry],
+    device: &GrowthDevice,
+) -> Result<Vec<(u64, u64)>, BtrfsMutationError> {
+    let mut occupancy = DeviceOccupancy::from_chunks(device.devid, chunks)
+        .map_err(|_| BtrfsMutationError::InvalidConfig("chunk layout is not modelled"))?;
+    occupancy.reserve_superblock_mirrors(device.total_bytes);
+    let mut runs = Vec::new();
+    let mut cursor = device.min_offset;
+    for &(start, len) in occupancy.ranges() {
+        let start = start.min(device.total_bytes);
+        if start > cursor {
+            runs.push((cursor, start - cursor));
+        }
+        cursor = cursor.max(start.saturating_add(len));
+    }
+    if device.total_bytes > cursor {
+        runs.push((cursor, device.total_bytes - cursor));
+    }
+    Ok(runs)
+}
+
+/// [`plan_growth_for_commit`] for an arbitrary chunk kind and an already-computed
+/// shortfall in BYTES.
+///
+/// Split out for the SYSTEM case (bd-a136s). Serializing the chunk tree allocates
+/// from SYSTEM space — it must, or the chunk root is unmappable at bootstrap —
+/// so a commit that grows can exhaust the system chunk, and that shortfall is
+/// counted in bytes of tree blocks rather than in a DAG node count.
+///
+/// ⚠️ A SYSTEM chunk is the one kind that must ALSO reach the superblock's
+/// `sys_chunk_array`, because the kernel bootstraps from that array alone. The
+/// plan says so via `needs_sys_chunk_array`, and `apply_chunk_allocation` refuses
+/// to create one without a superblock to record it in. Growth must therefore hand
+/// it a superblock, not `None`, or the allocation is correctly rejected.
+///
+/// # Errors
+/// As [`plan_growth_for_commit`].
 pub fn plan_growth_for_shortfall(
     chunks: &[BtrfsChunkEntry],
     kind: ChunkKind,
@@ -21133,6 +21162,44 @@ mod tests {
             chunk_tree_uuid: [0x11; 16],
             dev_uuid: [0x22; 16],
         }
+    }
+
+    /// bd-3fmbr: FITRIM's device space is everything above the reserved head
+    /// that no chunk stripe (DUP: both) covers, minus the 64 MiB mirror.
+    #[test]
+    fn unallocated_device_runs_skip_chunks_head_and_mirrors_bd_3fmbr() {
+        const MB: u64 = 1024 * 1024;
+        let chunks = vec![
+            logical_chunk(
+                0,
+                8 * MB,
+                BTRFS_BLOCK_GROUP_METADATA,
+                &[(1, MB), (1, 9 * MB)],
+            ),
+            logical_chunk(8 * MB, 16 * MB, BTRFS_BLOCK_GROUP_DATA, &[(1, 32 * MB)]),
+            // Another device's stripe frees nothing and occupies nothing here.
+            logical_chunk(24 * MB, 8 * MB, BTRFS_BLOCK_GROUP_DATA, &[(2, 17 * MB)]),
+        ];
+        let runs = unallocated_device_runs(&chunks, &growth_device(100 * MB, 0)).expect("runs");
+        let mirror = 64 * MB;
+        let sb = ffs_types::BTRFS_SUPER_INFO_SIZE as u64;
+        assert_eq!(
+            runs,
+            vec![
+                (17 * MB, 15 * MB),
+                (48 * MB, mirror - 48 * MB),
+                (mirror + sb, 100 * MB - mirror - sb),
+            ]
+        );
+
+        // A striped profile is refused, never approximated.
+        let raid0 = vec![logical_chunk(
+            0,
+            8 * MB,
+            BTRFS_BLOCK_GROUP_DATA | ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_RAID0,
+            &[(1, MB), (1, 5 * MB)],
+        )];
+        assert!(unallocated_device_runs(&raid0, &growth_device(100 * MB, 0)).is_err());
     }
 
     /// bd-a136s / bd-uxh7t, end to end at the pure level: a filesystem whose
