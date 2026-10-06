@@ -141,7 +141,10 @@ fn clean_single_image(cx: &Cx, device: &dyn ByteDevice) -> Result<&'static str> 
             // RECOVER and the orphan/error states require filesystem recovery,
             // not RaptorQ rollback. The companion mount initially admits only
             // clean protection points; Skip below is never a dirty-mount bypass.
-            if sb.has_incompat(0x0004) || sb.state != EXT4_VALID_FS || sb.last_orphan != 0 {
+            if sb.has_incompat(ffs_ondisk::Ext4IncompatFeatures::RECOVER)
+                || sb.state != EXT4_VALID_FS
+                || sb.last_orphan != 0
+            {
                 bail!("ext4 needs recovery; reconcile offline and create fresh protection");
             }
             Ok("ext4")

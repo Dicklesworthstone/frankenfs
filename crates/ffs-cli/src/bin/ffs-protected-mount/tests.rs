@@ -186,19 +186,23 @@ fn filesystem_read_repairs_corrupt_data_before_returning_it() {
     let cx = Cx::for_testing();
     let block = fixture.first_block("/payload");
     let prepared = prepare(&cx, &fixture.args()).expect("open protected filesystem");
-    let inode = prepared
-        .fs
-        .lookup(&cx, InodeNumber(2), OsStr::new("payload"))
+    // `OpenFs::` explicitly: `Arc<OpenFs>` also implements `FsOps`, whose
+    // scope-taking methods method resolution would otherwise pick.
+    let inode = OpenFs::lookup(&prepared.fs, &cx, InodeNumber(2), OsStr::new("payload"))
         .unwrap()
         .ino;
     let original = fixture.read_block(block);
     fixture.damage_block(block);
     assert_ne!(fixture.read_block(block), original);
     assert_eq!(
-        prepared
-            .fs
-            .read(&cx, inode, 0, u32::try_from(fixture.payload.len()).unwrap())
-            .unwrap(),
+        OpenFs::read(
+            &prepared.fs,
+            &cx,
+            inode,
+            0,
+            u32::try_from(fixture.payload.len()).unwrap()
+        )
+        .unwrap(),
         fixture.payload,
     );
     assert_eq!(
@@ -218,10 +222,7 @@ fn filesystem_lookup_repairs_directory_metadata_before_parsing_it() {
     let prepared = prepare(&cx, &fixture.args()).unwrap();
     let original = fixture.read_block(block);
     fixture.damage_block(block);
-    let attr = prepared
-        .fs
-        .lookup(&cx, InodeNumber(2), OsStr::new("payload"))
-        .unwrap();
+    let attr = OpenFs::lookup(&prepared.fs, &cx, InodeNumber(2), OsStr::new("payload")).unwrap();
     assert_eq!(attr.size, u64::try_from(fixture.payload.len()).unwrap());
     assert_eq!(fixture.read_block(block), original);
     prepared.finish(&cx).unwrap();
@@ -268,10 +269,16 @@ fn readonly_filesystem_and_adapter_cannot_write_caller_data() {
         device.write_all_at(&cx, ByteOffset(4096), &[1]),
         Err(FfsError::ReadOnly)
     ));
-    let error = prepared
-        .fs
-        .create(&cx, InodeNumber(2), OsStr::new("no-write"), 0o600, 0, 0)
-        .unwrap_err();
+    let error = OpenFs::create(
+        &prepared.fs,
+        &cx,
+        InodeNumber(2),
+        OsStr::new("no-write"),
+        0o600,
+        0,
+        0,
+    )
+    .unwrap_err();
     assert_eq!(error.to_errno(), libc::EROFS);
     let cancelled = Cx::for_testing();
     cancelled.set_cancel_requested(true);
