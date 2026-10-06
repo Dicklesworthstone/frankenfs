@@ -1446,6 +1446,70 @@ fn for_each_uncovered(
     Ok(())
 }
 
+/// Everything a btrfs commit changes in memory before its superblock write,
+/// restored if it fails there (bd-x4h1q). Trees are COW checkpoints (no
+/// copy); the rest is small and cloned. The FS tree is only read by a commit.
+struct BtrfsCommitSnapshot {
+    extent_alloc: ffs_btrfs::ExtentAllocatorSnapshot,
+    root_tree: ffs_btrfs::CowCheckpoint,
+    csum_tree: ffs_btrfs::CowCheckpoint,
+    chunk_tree: ffs_btrfs::CowCheckpoint,
+    dev_tree: ffs_btrfs::CowCheckpoint,
+    chunk_trees_dirty: bool,
+    generation: u64,
+    written_tree_blocks:
+        std::collections::HashMap<u64, std::collections::BTreeMap<u64, (u64, u64)>>,
+    logged_inodes: std::collections::BTreeSet<u64>,
+    logged_dir_keys: std::collections::BTreeSet<(u64, u8, u64)>,
+    tree_log_has_deletions: bool,
+    live_log_blocks: Vec<(u64, u64, bool)>,
+    grown_chunks: Option<std::sync::Arc<Vec<BtrfsChunkEntry>>>,
+}
+
+impl BtrfsCommitSnapshot {
+    fn take(alloc: &mut BtrfsAllocState, fs: &OpenFs) -> Self {
+        Self {
+            extent_alloc: alloc.extent_alloc.snapshot(),
+            root_tree: alloc.root_tree.checkpoint(),
+            csum_tree: alloc.csum_tree.checkpoint(),
+            chunk_tree: alloc.chunk_tree.checkpoint(),
+            dev_tree: alloc.dev_tree.checkpoint(),
+            chunk_trees_dirty: alloc.chunk_trees_dirty,
+            generation: alloc.generation,
+            written_tree_blocks: alloc.written_tree_blocks.clone(),
+            logged_inodes: alloc.btrfs_logged_inodes.clone(),
+            logged_dir_keys: alloc.btrfs_logged_dir_keys.clone(),
+            tree_log_has_deletions: alloc.btrfs_tree_log_has_deletions,
+            live_log_blocks: alloc.btrfs_live_log_blocks.clone(),
+            grown_chunks: fs.btrfs_grown_chunks.load_full(),
+        }
+    }
+
+    fn restore(self, alloc: &mut BtrfsAllocState, fs: &OpenFs) {
+        alloc.extent_alloc.restore(self.extent_alloc);
+        alloc.root_tree.rollback_to(self.root_tree);
+        alloc.csum_tree.rollback_to(self.csum_tree);
+        alloc.chunk_tree.rollback_to(self.chunk_tree);
+        alloc.dev_tree.rollback_to(self.dev_tree);
+        alloc.chunk_trees_dirty = self.chunk_trees_dirty;
+        alloc.generation = self.generation;
+        alloc.written_tree_blocks = self.written_tree_blocks;
+        alloc.btrfs_logged_inodes = self.logged_inodes;
+        alloc.btrfs_logged_dir_keys = self.logged_dir_keys;
+        alloc.btrfs_tree_log_has_deletions = self.tree_log_has_deletions;
+        alloc.btrfs_live_log_blocks = self.live_log_blocks;
+        fs.btrfs_grown_chunks.store(self.grown_chunks);
+    }
+
+    fn release(self, alloc: &mut BtrfsAllocState) {
+        alloc.extent_alloc.release_snapshot(self.extent_alloc);
+        alloc.root_tree.release_checkpoint();
+        alloc.csum_tree.release_checkpoint();
+        alloc.chunk_tree.release_checkpoint();
+        alloc.dev_tree.release_checkpoint();
+    }
+}
+
 /// Mutable btrfs allocation state for write operations.
 ///
 /// Mirrors `Ext4AllocState` for the btrfs path: an in-memory COW tree that
@@ -37455,8 +37519,14 @@ impl OpenFs {
         result
     }
 
-    #[expect(clippy::too_many_lines)]
-    #[allow(clippy::similar_names)]
+    /// One commit, transactional in memory (bd-x4h1q): the allocator lock is
+    /// held throughout, so nothing else interleaves, and if the commit fails
+    /// before its superblock write everything it changed in memory is
+    /// restored, so a retry starts from the same state instead of leaking
+    /// the space the failed attempt allocated. Its device writes went to
+    /// freshly allocated addresses that are free again after the restore.
+    /// (The free-space-tree leaf rewritten in place is the exception,
+    /// bd-x4h1q note.)
     fn btrfs_full_transaction_commit_once(
         &self,
         cx: &Cx,
@@ -37464,6 +37534,32 @@ impl OpenFs {
     ) -> ffs_error::Result<BtrfsWritebackStats> {
         let alloc_mutex = self.require_btrfs_alloc_state()?;
         let mut alloc = alloc_mutex.write();
+        let snapshot = BtrfsCommitSnapshot::take(&mut alloc, self);
+        // Not mutated by the commit, only written out: handed back intact if
+        // it fails (they used to be dropped, losing new subvolumes).
+        let subvol_trees = std::mem::take(&mut alloc.extra_subvol_trees);
+        let mut durable = false;
+        let result =
+            self.btrfs_commit_locked(cx, operation_id, &mut alloc, &subvol_trees, &mut durable);
+        if result.is_err() && !durable {
+            snapshot.restore(&mut alloc, self);
+            alloc.extra_subvol_trees = subvol_trees;
+        } else {
+            snapshot.release(&mut alloc);
+        }
+        result
+    }
+
+    #[expect(clippy::too_many_lines)]
+    #[allow(clippy::similar_names)]
+    fn btrfs_commit_locked(
+        &self,
+        cx: &Cx,
+        operation_id: &str,
+        alloc: &mut BtrfsAllocState,
+        subvol_trees: &[(u64, InMemoryCowBtrfsTree)],
+        durable: &mut bool,
+    ) -> ffs_error::Result<BtrfsWritebackStats> {
         // The subvolume this commit publishes (5 unless --subvol/--snapshot).
         let fs_root = alloc.fs_root_objectid;
 
@@ -38303,8 +38399,7 @@ impl OpenFs {
         // root bytenr into the matching ROOT_ITEM in root_tree. Drained out of
         // `alloc` first so the per-node serialize can borrow each tree while
         // `alloc.extent_alloc` / `alloc.root_tree` are mutated.
-        let subvol_trees = std::mem::take(&mut alloc.extra_subvol_trees);
-        for (subvol_objectid, subvol_tree) in &subvol_trees {
+        for (subvol_objectid, subvol_tree) in subvol_trees {
             let subvol_dag = WriteDependencyDag::from_cow_tree(subvol_tree, new_gen)
                 .map_err(|e| btrfs_mutation_to_ffs(&e))?;
             if subvol_dag.node_count() == 0 {
@@ -39137,7 +39232,10 @@ impl OpenFs {
             })
             .collect();
 
-        drop(alloc);
+        // The allocator lock stays held through the superblock write
+        // (bd-x4h1q): released here, another commit could interleave, and a
+        // failed commit could no longer be rolled back without discarding
+        // other writers' changes.
 
         // bd-73bi2: before the superblock makes this transaction live, read the
         // free-space tree block BACK OFF DISK and check it against the pointer
@@ -39165,9 +39263,7 @@ impl OpenFs {
                 // Latch read-only for the same reason the sibling refusal does:
                 // otherwise the caller takes one error and keeps writing into a
                 // transaction that can never land.
-                if let Some(state) = self.btrfs_alloc_state.as_ref() {
-                    state.write().commit_refused = true;
-                }
+                alloc.commit_refused = true;
                 return Err(FfsError::Io(std::io::Error::other(format!(
                     "bd-73bi2: refusing to advance the superblock — the FREE_SPACE_TREE \
                      ROOT_ITEM publishes generation {fst_generation} but its block at \
@@ -39351,7 +39447,10 @@ impl OpenFs {
             .ok_or_else(|| FfsError::Format("btrfs superblock checksum failed".into()))?;
         sb_bytes[..csum_size].copy_from_slice(&csum[..csum_size]);
 
-        // Write superblock to primary location (0x10000 = 64 KiB)
+        // Write superblock to primary location (0x10000 = 64 KiB). From here
+        // the new generation may be on disk, partly or wholly, so a failure
+        // must not roll memory back to the old one.
+        *durable = true;
         self.dev
             .write_all_at(cx, ByteOffset(BTRFS_SUPER_INFO_OFFSET as u64), &sb_bytes)
             .map_err(|e| {
@@ -39376,10 +39475,8 @@ impl OpenFs {
         // blocks pinned, which is what makes a commit that fails part-way a
         // no-op against the on-disk filesystem rather than the thing that
         // destroys it. This call must stay AFTER the superblock write+sync and
-        // must not run on any error path. The allocation lock was released above
-        // for the superblock I/O, so retake it just for the rotation.
+        // must not run on any error path. The allocation lock is still held.
         {
-            let mut alloc = alloc_mutex.write();
             let released = alloc.extent_alloc.release_pinned_after_superblock_commit();
             debug!(
                 target: "ffs::btrfs::writeback",
@@ -77548,8 +77645,9 @@ mod tests {
 
     /// xfstests generic/027 on btrfs: once commits fail for lack of space, new
     /// files must get ENOSPC instead of being acknowledged forever into a
-    /// transaction that never lands. (Recovering after deletes needs a failed
-    /// commit to give back what it allocated, which it does not yet: bd-x4h1q.)
+    /// transaction that never lands; deleting files must let a commit land
+    /// and creation resume (bd-x4h1q: a failed commit gives back what it
+    /// allocated).
     #[test]
     fn btrfs_creates_get_enospc_once_commits_run_out_of_space() {
         let Some((fs, _tmp, _image)) = open_file_backed_btrfs(128) else {
@@ -77593,9 +77691,25 @@ mod tests {
             .create(&cx, dir, OsStr::new("again"), 0o644, 0, 0)
             .expect_err("no commit has landed since");
         assert_eq!(err.to_errno(), libc::ENOSPC);
-        // Freeing space stays allowed.
-        fs.unlink(&cx, dir, OsStr::new(&created[0]))
-            .expect("unlink is not refused");
+        // Freeing space stays allowed, and because a failed commit now gives
+        // back what it allocated (bd-x4h1q), a commit lands once the files
+        // are gone and creation resumes.
+        for name in &created {
+            fs.unlink(&cx, dir, OsStr::new(name))
+                .expect("unlink is not refused");
+        }
+        fs.fsync(&cx, dir, 0, false)
+            .expect("a commit lands once the files are gone");
+        let attr = fs
+            .create(&cx, dir, OsStr::new("after"), 0o644, 0, 0)
+            .expect("create resumes after a successful commit");
+        fs.write(&cx, attr.ino, 0, &[0x6B; 1024]).expect("write");
+        fs.fsync(&cx, attr.ino, 0, false)
+            .expect("commit the new file");
+        assert_eq!(
+            fs.read(&cx, attr.ino, 0, 1024).expect("read"),
+            vec![0x6B; 1024]
+        );
     }
 
     /// Offsets of every 4 KiB image block filled entirely with `byte`.
