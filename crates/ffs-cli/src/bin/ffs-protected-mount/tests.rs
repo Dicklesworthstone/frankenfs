@@ -12,6 +12,7 @@ fn check_args(image: &Path, sidecar: &Path) -> Args {
         image: image.to_owned(),
         sidecar: sidecar.to_owned(),
         mountpoint: None,
+        scrub: scrub::Options::default(),
         authority: Authority {
             exclusive_image: true,
             allow_repair: true,

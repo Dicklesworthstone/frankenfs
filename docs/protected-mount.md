@@ -79,8 +79,44 @@ See `protected-sidecar-device.md` for the device-level recovery contract.
 ## Runtime and shutdown
 
 Reads that reach the device use its admitted hashes and bounded RaptorQ recovery.
-I/O and cancellation errors retain their original meaning. This is read-triggered
-recovery, not a background whole-image scrub.
+I/O and cancellation errors retain their original meaning. Without the explicit
+scrub option below, recovery remains read-triggered.
+
+### Background source scrub
+
+`--scrub-interval-secs N` enables a mount-owned source scanner, in either read-only
+or `--rw` mode. It starts after mounting and announcing the mount, scans immediately,
+then waits N seconds after each complete pass. N must be 1 through 86400. The option
+is disabled by default and conflicts with `--check`.
+
+```sh
+cargo run -p ffs-cli --bin ffs-protected-mount -- \
+  image.ext4 image.ffsrq /path/to/empty/mountpoint \
+  --exclusive-image --allow-repair --rw --scrub-interval-secs 300
+```
+
+The scanner reads at most 64 KiB per request through the **same admitted device**,
+including source blocks no application reads and the short final block. It releases
+the device lock between requests and pauses between batches. Corrupt bytes use the
+device's ordinary verified repair path; a changed peer still forbids stale parity.
+The scanner never calls device sync, publishes a write epoch, or writes caller data.
+An explicit filesystem barrier remains responsible for publishing outstanding writes.
+
+Each complete pass emits a `protected_source_scrub_pass` JSON line on stderr with
+the verified source-byte count and `consistency: "per_read_not_snapshot"`. Foreground
+writes may advance the intended generation between batches. This is **not** a
+point-in-time filesystem integrity proof or parity-health attestation: intact source
+bytes do not force a scan or regeneration of every repair symbol. No repair count is
+inferred from the byte count. Replenishing damaged parity remains the device's separate
+clean-boundary scrub/refresh operation.
+
+An unrecoverable read, evidence-output failure, or unwinding worker panic requests
+managed unmount and is returned as an error. Panic-abort builds terminate the process
+on panic instead. Shutdown cancels and joins the worker before
+filesystem cleanup; dropping the guard also joins rather than leaving an orphan
+thread holding image locks. I/O errors racing cancellation are not hidden as success.
+Cancellation is checked between reads and while waiting; blocking system calls and
+the device's existing group-recovery work do not carry a hard latency guarantee.
 
 Ctrl-C cancels startup or requests managed unmount. Shutdown retains device
 ownership until the managed filesystem relinquishes its operations. For a writable
@@ -135,3 +171,16 @@ been executed in that environment.
 This integration is experimental. It does not close `bd-11a8t` / `bd-j7a4e`,
 change default repair policy, reserve native on-image repair space, enable
 multi-device recovery, or certify crash recovery across an unfinished epoch.
+
+The source-scrub regressions additionally exercise exact batch coverage, cancellation,
+failure-triggered unmount, joined ownership, and real RaptorQ repair of unread source
+bytes. They check that dirty-epoch scans preserve the pending archive, refuse changed
+peers, and observe an explicitly refreshed generation between batches. They do not
+need filesystem oracle binaries when selected separately:
+
+```sh
+cargo test -p ffs-cli --bin ffs-protected-mount scrub::
+```
+
+The implementation environment lacked Rust/Cargo/rustfmt/RCH for this extension too.
+These are added regression cases, not claimed executed tests or mounted acceptance.

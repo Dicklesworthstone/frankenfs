@@ -5,6 +5,8 @@
 //! Caller writes require --rw; read-only remains the default. The ordinary
 //! mount command is unchanged, and startup differences never authorize rollback.
 
+mod scrub;
+
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
 use clap::Parser;
@@ -37,6 +39,8 @@ struct Args {
     mountpoint: Option<PathBuf>,
     #[command(flatten)]
     authority: Authority,
+    #[command(flatten)]
+    scrub: scrub::Options,
     /// Validate admission and filesystem opening without mounting or enabling writes.
     #[arg(long, conflicts_with = "mountpoint")]
     check: bool,
@@ -119,6 +123,7 @@ impl Prepared {
 }
 
 fn checked_paths(args: &Args) -> Result<(PathBuf, PathBuf, Option<PathBuf>)> {
+    args.scrub.validate(args.check)?;
     if !args.authority.exclusive_image || !args.authority.allow_repair {
         bail!("--exclusive-image and --allow-repair are required");
     }
@@ -278,11 +283,35 @@ fn serve(
         flag.store(true, Ordering::Release);
     }
     let announce = emit("mounted", prepared);
-    if announce.is_err() {
+    let background = if announce.is_ok() && !flag.load(Ordering::Acquire) {
+        args.scrub
+            .interval_secs
+            .map(|seconds| {
+                scrub::ScrubGuard::start(
+                    cx,
+                    Arc::clone(&prepared.device),
+                    Arc::clone(&flag),
+                    std::time::Duration::from_secs(seconds),
+                )
+            })
+            .transpose()
+    } else {
+        Ok(None)
+    };
+    if announce.is_err() || background.is_err() {
         flag.store(true, Ordering::Release);
     }
     let _metrics = handle.wait();
-    announce
+    // A failed worker requests managed unmount. Join it before the caller can
+    // begin filesystem cleanup; never silently lose its error or device lease.
+    let scrub_result = match background {
+        Ok(Some(mut guard)) => guard.stop(),
+        Ok(None) => Ok(()),
+        Err(error) => Err(error),
+    };
+    // No worker was started if announcement failed, so this preserves all
+    // possible errors rather than dropping a concurrent scrub failure.
+    announce.and(scrub_result)
 }
 
 fn run(args: &Args) -> Result<()> {
