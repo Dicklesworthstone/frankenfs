@@ -237,6 +237,54 @@ impl OpenFs {
         Ok((if is_dir { mode | 0o2000 } else { mode }, dir.gid))
     }
 
+    /// The VFS rules for `chattr +i` / `+a` directories (kernel `may_create`,
+    /// whose `inode_permission(MAY_WRITE)` fails on an immutable inode, and
+    /// `may_delete`): no entry may be added to or removed from an immutable
+    /// directory, and none removed from an append-only one. A FUSE inode never
+    /// carries S_IMMUTABLE/S_APPEND, so the VFS cannot apply them for us
+    /// (xfstests generic/079).
+    fn reject_dir_entry_change(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        dir: InodeNumber,
+        removes_entry: bool,
+    ) -> ffs_error::Result<()> {
+        let flags = <Self as FsOps>::get_inode_flags(self, cx, scope, dir)?;
+        let forbidden = if removes_entry {
+            ffs_types::EXT4_IMMUTABLE_FL | ffs_types::EXT4_APPEND_FL
+        } else {
+            ffs_types::EXT4_IMMUTABLE_FL
+        };
+        if flags & forbidden != 0 {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
+        }
+        Ok(())
+    }
+
+    /// [`Self::reject_dir_entry_change`] for a rename: it removes an entry
+    /// from `parent`, adds one to `new_parent`, and removes one there too when
+    /// it replaces an existing name (kernel `vfs_rename`: `may_delete` on the
+    /// source, `may_create` or `may_delete` on the target).
+    fn reject_rename_dir_change(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+        new_parent: InodeNumber,
+        new_name: &OsStr,
+    ) -> ffs_error::Result<()> {
+        self.reject_dir_entry_change(cx, scope, parent, true)?;
+        self.reject_dir_entry_change(cx, scope, new_parent, false)?;
+        let flags = <Self as FsOps>::get_inode_flags(self, cx, scope, new_parent)?;
+        if flags & ffs_types::EXT4_APPEND_FL != 0
+            && <Self as FsOps>::lookup(self, cx, scope, new_parent, new_name).is_ok()
+        {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
+        }
+        Ok(())
+    }
+
     fn inherit_default_acl(
         &self,
         cx: &Cx,
@@ -1210,6 +1258,7 @@ impl FsOps for OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        self.reject_dir_entry_change(cx, scope, parent, false)?;
         let (mode, gid) = self.setgid_dir_owner(cx, scope, parent, mode, gid, false)?;
         let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
@@ -1262,6 +1311,7 @@ impl FsOps for OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        self.reject_dir_entry_change(cx, scope, parent, false)?;
         let (mode, gid) = self.setgid_dir_owner(cx, scope, parent, mode, gid, false)?;
         let attr = match &self.flavor {
             FsFlavor::Ext4(_) => self
@@ -1285,6 +1335,7 @@ impl FsOps for OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        self.reject_dir_entry_change(cx, scope, parent, false)?;
         let (mode, gid) = self.setgid_dir_owner(cx, scope, parent, mode, gid, false)?;
         let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
@@ -1319,6 +1370,7 @@ impl FsOps for OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        self.reject_dir_entry_change(cx, scope, parent, false)?;
         let (mode, gid) = self.setgid_dir_owner(cx, scope, parent, mode, gid, true)?;
         let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
@@ -1349,6 +1401,7 @@ impl FsOps for OpenFs {
         parent: InodeNumber,
         name: &OsStr,
     ) -> ffs_error::Result<()> {
+        self.reject_dir_entry_change(cx, scope, parent, true)?;
         let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
         match &self.flavor {
@@ -1373,6 +1426,7 @@ impl FsOps for OpenFs {
         parent: InodeNumber,
         name: &OsStr,
     ) -> ffs_error::Result<()> {
+        self.reject_dir_entry_change(cx, scope, parent, true)?;
         let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
         match &self.flavor {
@@ -1416,6 +1470,7 @@ impl FsOps for OpenFs {
         new_parent: InodeNumber,
         new_name: &OsStr,
     ) -> ffs_error::Result<()> {
+        self.reject_rename_dir_change(cx, scope, parent, new_parent, new_name)?;
         let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
         match &self.flavor {
@@ -1496,6 +1551,9 @@ impl FsOps for OpenFs {
         }
 
         if flags & RENAME_EXCHANGE != 0 {
+            // Both names are removed and re-added.
+            self.reject_dir_entry_change(cx, scope, parent, true)?;
+            self.reject_dir_entry_change(cx, scope, new_parent, true)?;
             clear_readdir_snapshot(&self.readdir_snapshot);
             return match &self.flavor {
                 FsFlavor::Ext4(_) => {
@@ -1543,6 +1601,7 @@ impl FsOps for OpenFs {
         new_parent: InodeNumber,
         new_name: &OsStr,
     ) -> ffs_error::Result<InodeAttr> {
+        self.reject_dir_entry_change(cx, scope, new_parent, false)?;
         let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
         match &self.flavor {
@@ -1572,6 +1631,7 @@ impl FsOps for OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        self.reject_dir_entry_change(cx, scope, parent, false)?;
         let (_, gid) = self.setgid_dir_owner(cx, scope, parent, 0, gid, false)?;
         let target_bytes = target.as_os_str().as_encoded_bytes();
         let target_len = target_bytes.len();

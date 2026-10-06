@@ -68344,6 +68344,98 @@ mod tests {
         );
     }
 
+    /// `chattr +i` / `+a` on a DIRECTORY (kernel `may_create` / `may_delete`):
+    /// nothing may be added to or removed from an immutable directory, and
+    /// nothing removed from (or renamed out of, or replaced in) an append-only
+    /// one, while creating in an append-only directory is allowed. FUSE inodes
+    /// never carry S_IMMUTABLE/S_APPEND, so before these checks every one of
+    /// these operations succeeded on a mount (xfstests generic/079).
+    #[test]
+    fn immutable_and_append_only_directories_guard_their_entries() {
+        let Some((fs, _tmp)) = open_writable_ext4_mkfs(8) else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let set_flag = |ino: InodeNumber, flag: u32| {
+            let mut inode = fs.read_inode(&cx, ino).expect("read inode");
+            inode.flags &= !(ffs_types::EXT4_IMMUTABLE_FL | ffs_types::EXT4_APPEND_FL);
+            inode.flags |= flag;
+            fs.persist_ext4_inode_for_testing(&cx, ino, &inode)
+                .expect("persist flag");
+        };
+        let eperm = |result: ffs_error::Result<()>, what: &str| {
+            assert_eq!(
+                result.expect_err(what).to_errno(),
+                libc::EPERM,
+                "{what} must be EPERM"
+            );
+        };
+
+        let imm = fs
+            .mkdir(&cx, root, OsStr::new("imm.d"), 0o755, 0, 0)
+            .expect("mkdir");
+        let kept = fs
+            .create(&cx, imm.ino, OsStr::new("file"), 0o644, 0, 0)
+            .expect("create");
+        fs.mkdir(&cx, imm.ino, OsStr::new("sub"), 0o755, 0, 0)
+            .expect("mkdir sub");
+        set_flag(imm.ino, ffs_types::EXT4_IMMUTABLE_FL);
+        let name = OsStr::new;
+        eperm(
+            fs.create(&cx, imm.ino, name("new"), 0o644, 0, 0).map(drop),
+            "create",
+        );
+        eperm(
+            fs.mkdir(&cx, imm.ino, name("newdir"), 0o755, 0, 0)
+                .map(drop),
+            "mkdir",
+        );
+        eperm(
+            fs.symlink(&cx, imm.ino, name("ln"), Path::new("file"), 0, 0)
+                .map(drop),
+            "symlink",
+        );
+        eperm(
+            fs.link(&cx, kept.ino, imm.ino, name("hard")).map(drop),
+            "link",
+        );
+        eperm(fs.unlink(&cx, imm.ino, name("file")), "unlink");
+        eperm(fs.rmdir(&cx, imm.ino, name("sub")), "rmdir");
+        eperm(
+            fs.rename(&cx, imm.ino, name("file"), root, name("out")),
+            "rename out",
+        );
+        assert!(fs.lookup(&cx, imm.ino, name("file")).is_ok());
+
+        let app = fs
+            .mkdir(&cx, root, OsStr::new("app.d"), 0o755, 0, 0)
+            .expect("mkdir");
+        fs.create(&cx, app.ino, OsStr::new("old"), 0o644, 0, 0)
+            .expect("create");
+        let outside = fs
+            .create(&cx, root, OsStr::new("outside"), 0o644, 0, 0)
+            .expect("create");
+        set_flag(app.ino, ffs_types::EXT4_APPEND_FL);
+        fs.create(&cx, app.ino, name("added"), 0o644, 0, 0)
+            .expect("creating in an append-only directory is allowed");
+        fs.link(&cx, outside.ino, app.ino, name("linked"))
+            .expect("linking into an append-only directory is allowed");
+        eperm(
+            fs.unlink(&cx, app.ino, name("old")),
+            "unlink in append-only dir",
+        );
+        eperm(
+            fs.rename(&cx, app.ino, name("old"), root, name("moved")),
+            "rename out of append-only dir",
+        );
+        eperm(
+            fs.rename(&cx, root, name("outside"), app.ino, name("old")),
+            "rename replacing an entry of an append-only dir",
+        );
+        assert!(fs.lookup(&cx, app.ino, name("old")).is_ok());
+    }
+
     #[test]
     fn ext4_rename_onto_immutable_target_is_eperm_bd_85rav() {
         let Some(fs) = open_writable_ext4() else {

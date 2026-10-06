@@ -3146,6 +3146,47 @@ impl FrankenFuse {
         Ok(())
     }
 
+    /// The `notify_change` rules for `chattr +i` / `+a` inodes: neither an
+    /// immutable nor an append-only inode accepts a mode, ownership or
+    /// explicit-time change, nor a size change (`vfs_truncate`,
+    /// `do_sys_ftruncate`); an immutable one also refuses a touch to "now".
+    /// A FUSE inode never carries S_IMMUTABLE/S_APPEND, so the VFS leaves
+    /// these to the filesystem (xfstests generic/079).
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn check_setattr_inode_attributes(
+        &self,
+        cx: &Cx,
+        ino: u64,
+        mode: Option<u32>,
+        uid: Option<u32>,
+        gid: Option<u32>,
+        size: Option<u64>,
+        atime: Option<fuser::TimeOrNow>,
+        mtime: Option<fuser::TimeOrNow>,
+    ) -> ffs_error::Result<()> {
+        use fuser::TimeOrNow;
+        let times_set = matches!(atime, Some(TimeOrNow::SpecificTime(_)))
+            || matches!(mtime, Some(TimeOrNow::SpecificTime(_)));
+        let touch =
+            matches!(atime, Some(TimeOrNow::Now)) || matches!(mtime, Some(TimeOrNow::Now));
+        let guarded_by_both =
+            mode.is_some() || uid.is_some() || gid.is_some() || size.is_some() || times_set;
+        if !guarded_by_both && !touch {
+            return Ok(());
+        }
+        let flags = self.with_request_scope(cx, RequestOp::Getattr, |cx, scope| {
+            self.inner.ops.get_inode_flags(cx, scope, InodeNumber(ino))
+        })?;
+        let immutable = flags & ffs_types::EXT4_IMMUTABLE_FL != 0;
+        let append = flags & ffs_types::EXT4_APPEND_FL != 0;
+        if (guarded_by_both && (immutable || append)) || (touch && immutable) {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                libc::EPERM,
+            )));
+        }
+        Ok(())
+    }
+
     fn with_request_scope<T, F>(&self, cx: &Cx, op: RequestOp, f: F) -> ffs_error::Result<T>
     where
         F: FnOnce(&Cx, &mut RequestScope) -> ffs_error::Result<T>,

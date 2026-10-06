@@ -6824,6 +6824,20 @@ impl Filesystem for FrankenFuse {
             reply.error(errno);
             return;
         }
+        if let Err(error) =
+            self.check_setattr_inode_attributes(&cx, ino, mode, uid, gid, size, atime, mtime)
+        {
+            Self::reply_error_attr(
+                &FuseErrorContext {
+                    error: &error,
+                    operation: "setattr",
+                    ino,
+                    offset: None,
+                },
+                reply,
+            );
+            return;
+        }
         let resolve_time = |t: TimeOrNow| -> SystemTime {
             match t {
                 TimeOrNow::SpecificTime(st) => st,
@@ -15881,6 +15895,36 @@ mod tests {
             matches!(response, IoctlResult::Error(libc::EINVAL)),
             "short out_size must surface EINVAL, got {response:?}"
         );
+    }
+
+    /// `notify_change` for `chattr +i` / `+a` inodes: mode, ownership, size
+    /// and explicit times are refused for both, a touch to "now" only for an
+    /// immutable inode, and an inode without either flag is untouched — the
+    /// flags are only read when the request could be refused (generic/079).
+    #[test]
+    fn setattr_refuses_what_notify_change_refuses_on_immutable_and_append_only() {
+        use fuser::TimeOrNow;
+        let now = Some(TimeOrNow::Now);
+        let epoch = Some(TimeOrNow::SpecificTime(SystemTime::UNIX_EPOCH));
+        let check = |flags: u32, mode, size, atime| {
+            let fuse = FrankenFuse::new(Box::new(IoctlRecordingFs::new(
+                flags,
+                Arc::new(Mutex::new(Vec::new())),
+            )));
+            let cx = Cx::for_testing();
+            fuse.check_setattr_inode_attributes(&cx, 11, mode, None, None, size, atime, None)
+                .map_err(|e| e.to_errno())
+        };
+        let immutable = ffs_types::EXT4_IMMUTABLE_FL;
+        let append = ffs_types::EXT4_APPEND_FL;
+        for flags in [immutable, append] {
+            assert_eq!(check(flags, Some(0o600), None, None), Err(libc::EPERM));
+            assert_eq!(check(flags, None, Some(0), None), Err(libc::EPERM));
+            assert_eq!(check(flags, None, None, epoch), Err(libc::EPERM));
+        }
+        assert_eq!(check(immutable, None, None, now), Err(libc::EPERM));
+        assert_eq!(check(append, None, None, now), Ok(()));
+        assert_eq!(check(0, Some(0o600), Some(0), epoch), Ok(()));
     }
 
     #[test]
