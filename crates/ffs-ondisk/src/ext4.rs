@@ -1180,15 +1180,89 @@ impl Ext4Superblock {
         self.group_desc_blocks_for_groups(self.groups_count())
     }
 
+    /// Group descriptors per GDT block (kernel `EXT4_DESC_PER_BLOCK`).
+    #[must_use]
+    pub fn desc_per_block(&self) -> u32 {
+        let desc_size = u32::from(self.group_desc_size());
+        if desc_size == 0 {
+            return 0;
+        }
+        self.block_size / desc_size
+    }
+
+    /// Whether `group` belongs to a META_BG metagroup, i.e. its descriptor
+    /// block lives inside its own metagroup rather than in the old contiguous
+    /// GDT after the superblock. `s_first_meta_bg` counts DESCRIPTOR BLOCKS
+    /// (metagroups), not groups: kernel `ext4_bg_num_gdb` compares
+    /// `group / EXT4_DESC_PER_BLOCK` against it.
+    #[must_use]
+    pub fn group_in_meta_bg(&self, group: GroupNumber) -> bool {
+        let desc_per_block = self.desc_per_block();
+        self.has_incompat(Ext4IncompatFeatures::META_BG)
+            && desc_per_block != 0
+            && group.0 / desc_per_block >= self.first_meta_bg
+    }
+
+    /// GDT blocks (primary or backup) stored in `group` — kernel
+    /// `ext4_bg_num_gdb`. A META_BG group carries one descriptor block when it
+    /// is the first, second or last group of its metagroup; an old-layout
+    /// group carries the whole old GDT (`s_first_meta_bg` blocks once META_BG
+    /// is on) when it holds a superblock copy.
+    #[must_use]
+    pub fn group_gdt_blocks(&self, group: GroupNumber) -> u32 {
+        if self.group_in_meta_bg(group) {
+            let desc_per_block = self.desc_per_block();
+            let first = (group.0 / desc_per_block) * desc_per_block;
+            let last = first.saturating_add(desc_per_block - 1);
+            return u32::from(group.0 == first || group.0 == first + 1 || group.0 == last);
+        }
+        if !self.has_backup_superblock(group) {
+            return 0;
+        }
+        if self.has_incompat(Ext4IncompatFeatures::META_BG) {
+            self.first_meta_bg
+        } else {
+            self.group_desc_blocks_count()
+        }
+    }
+
     #[must_use]
     pub fn reserved_gdt_blocks_in_group(&self, group: GroupNumber) -> u32 {
         if !self.has_resize_inode() || !self.has_backup_superblock(group) {
             return 0;
         }
-        if self.has_incompat(Ext4IncompatFeatures::META_BG) && group.0 >= self.first_meta_bg {
+        if self.group_in_meta_bg(group) {
             return 0;
         }
         u32::from(self.reserved_gdt_blocks)
+    }
+
+    /// Absolute block number of the GDT block holding `group`'s descriptor —
+    /// kernel `descriptor_loc`. Without META_BG (or below `s_first_meta_bg`)
+    /// the descriptor blocks follow the superblock contiguously; a META_BG
+    /// descriptor block sits at the start of the first group of its
+    /// metagroup, after that group's superblock copy if it has one.
+    #[must_use]
+    pub fn group_desc_block(&self, group: GroupNumber) -> Option<u64> {
+        let desc_per_block = self.desc_per_block();
+        if desc_per_block == 0 {
+            return None;
+        }
+        let index = group.0 / desc_per_block;
+        if !self.group_in_meta_bg(group) {
+            // The block holding the superblock: 1 for 1 KiB blocks, else 0.
+            let sb_block = u64::from(self.block_size == 1024);
+            return sb_block.checked_add(u64::from(index))?.checked_add(1);
+        }
+        let first_group = index.checked_mul(desc_per_block)?;
+        let mut offset = u64::from(self.has_backup_superblock(GroupNumber(first_group)));
+        if self.block_size == 1024 && index == 0 && self.first_data_block == 0 {
+            offset += 1;
+        }
+        u64::from(first_group)
+            .checked_mul(u64::from(self.blocks_per_group))?
+            .checked_add(u64::from(self.first_data_block))?
+            .checked_add(offset)
     }
 
     #[must_use]
@@ -1222,18 +1296,21 @@ impl Ext4Superblock {
         })
     }
 
+    /// Blocks at the start of `group` taken by its superblock copy and GDT
+    /// blocks — kernel `ext4_num_base_meta_clusters` (in blocks). They are a
+    /// contiguous prefix of the group: superblock first, then descriptors.
     #[must_use]
     pub fn base_meta_blocks_in_group(&self, group: GroupNumber) -> u32 {
-        if !self.has_backup_superblock(group) {
+        let has_super = u32::from(self.has_backup_superblock(group));
+        if self.group_in_meta_bg(group) {
+            return has_super + self.group_gdt_blocks(group);
+        }
+        if has_super == 0 {
             return 0;
         }
-        let mut blocks = 1_u32; // superblock copy
-        if !self.has_incompat(Ext4IncompatFeatures::META_BG) || group.0 < self.first_meta_bg {
-            blocks = blocks
-                .saturating_add(self.group_desc_blocks_count())
-                .saturating_add(self.reserved_gdt_blocks_in_group(group));
-        }
-        blocks
+        1_u32
+            .saturating_add(self.group_gdt_blocks(group))
+            .saturating_add(self.reserved_gdt_blocks_in_group(group))
     }
 
     /// Compute the crc32c checksum seed used for metadata checksums.
@@ -1497,20 +1574,18 @@ impl Ext4Superblock {
         }
     }
 
-    /// Compute the byte offset of a group descriptor within the GDT.
+    /// Compute the absolute byte offset of a group descriptor on the device.
     ///
-    /// The group descriptor table starts at the block after the superblock
-    /// (block `first_data_block + 1` for 1K blocks, block 1 for >= 2K blocks).
+    /// The descriptor block comes from [`Self::group_desc_block`] (the old
+    /// contiguous GDT after the superblock, or the group's META_BG metagroup);
+    /// within it the descriptor is slot `group % desc_per_block`.
     #[must_use]
     pub fn group_desc_offset(&self, group: ffs_types::GroupNumber) -> Option<u64> {
-        let gdt_start_block = if self.block_size == 1024 {
-            2_u64
-        } else {
-            1_u64
-        };
-        let gdt_start_byte = gdt_start_block.checked_mul(u64::from(self.block_size))?;
-        let desc_offset = u64::from(group.0).checked_mul(u64::from(self.group_desc_size()))?;
-        gdt_start_byte.checked_add(desc_offset)
+        let block = self.group_desc_block(group)?;
+        let slot = u64::from(group.0 % self.desc_per_block());
+        block
+            .checked_mul(u64::from(self.block_size))?
+            .checked_add(slot.checked_mul(u64::from(self.group_desc_size()))?)
     }
 
     /// Compute the byte offset of an inode within the inode table.
@@ -7340,23 +7415,75 @@ mod tests {
         assert_extended_superblock_fields(&parsed);
     }
 
+    /// META_BG layout, as the kernel computes it (`ext4_bg_num_gdb`,
+    /// `ext4_num_base_meta_clusters`, `descriptor_loc`): `s_first_meta_bg`
+    /// counts DESCRIPTOR BLOCKS, not groups. Groups of the metagroups below it
+    /// keep the old contiguous GDT (`s_first_meta_bg` blocks, plus the
+    /// reserved GDT) beside each superblock copy; in a META_BG metagroup only
+    /// the first, second and last group carry its one descriptor block, which
+    /// is also where that metagroup's descriptors are read and written.
+    ///
+    /// The previous implementation compared `s_first_meta_bg` against the
+    /// group number and gave META_BG groups no descriptor block at all, so the
+    /// allocator handed out the backup descriptor block of group 1 on a
+    /// `mkfs.ext4 -O meta_bg` image (e2fsck: multiply-claimed block 32769).
     #[test]
-    fn base_meta_blocks_in_group_skips_reserved_gdt_after_first_meta_bg() {
+    fn base_meta_blocks_follow_kernel_meta_bg_layout() {
         let mut sb = make_valid_sb();
         sb[0x5C..0x60].copy_from_slice(&Ext4CompatFeatures::RESIZE_INODE.0.to_le_bytes());
         sb[0x60..0x64].copy_from_slice(&Ext4IncompatFeatures::META_BG.0.to_le_bytes());
-        sb[0xCE..0xD0].copy_from_slice(&4_u16.to_le_bytes());
-        sb[0x104..0x108].copy_from_slice(&2_u32.to_le_bytes());
-        sb[0x04..0x08].copy_from_slice(&131_072_u32.to_le_bytes()); // 4 groups at 32k blocks/group
+        sb[0xCE..0xD0].copy_from_slice(&4_u16.to_le_bytes()); // reserved_gdt_blocks
+        sb[0x104..0x108].copy_from_slice(&1_u32.to_le_bytes()); // first_meta_bg
+        // 300 groups of 32768 blocks; 4 KiB blocks and 32-byte descriptors give
+        // 128 descriptors per block: metagroup 0 (groups 0..128) is old-layout,
+        // metagroups 1 (128..256) and 2 (256..300) are META_BG. No sparse_super,
+        // so every group holds a superblock copy.
+        sb[0x04..0x08].copy_from_slice(&(300_u32 * 32768).to_le_bytes());
 
         let parsed = Ext4Superblock::parse_superblock_region(&sb).expect("parse meta_bg sb");
-        let full_copy_blocks =
-            1 + parsed.group_desc_blocks_count() + u32::from(parsed.reserved_gdt_blocks);
+        assert_eq!(parsed.desc_per_block(), 128);
+
+        // Old layout: superblock + s_first_meta_bg GDT blocks + reserved GDT.
+        assert!(!parsed.group_in_meta_bg(GroupNumber(127)));
+        assert_eq!(parsed.group_gdt_blocks(GroupNumber(1)), 1);
+        assert_eq!(parsed.reserved_gdt_blocks_in_group(GroupNumber(1)), 4);
+        assert_eq!(parsed.base_meta_blocks_in_group(GroupNumber(1)), 6);
+
+        // META_BG: one descriptor block in the first, second and last group.
+        assert!(parsed.group_in_meta_bg(GroupNumber(128)));
+        for (group, gdt) in [(128, 1), (129, 1), (130, 0), (254, 0), (255, 1), (256, 1)] {
+            assert_eq!(
+                parsed.group_gdt_blocks(GroupNumber(group)),
+                gdt,
+                "group {group}"
+            );
+            assert_eq!(parsed.reserved_gdt_blocks_in_group(GroupNumber(group)), 0);
+            assert_eq!(
+                parsed.base_meta_blocks_in_group(GroupNumber(group)),
+                1 + gdt,
+                "group {group}"
+            );
+        }
+
+        // Descriptor locations: old GDT right after the superblock; META_BG
+        // descriptors after the superblock copy of the metagroup's first group.
+        assert_eq!(parsed.group_desc_block(GroupNumber(5)), Some(1));
         assert_eq!(
-            parsed.base_meta_blocks_in_group(GroupNumber(1)),
-            full_copy_blocks
+            parsed.group_desc_block(GroupNumber(130)),
+            Some(128 * 32768 + 1)
         );
-        assert_eq!(parsed.base_meta_blocks_in_group(GroupNumber(3)), 1);
+        assert_eq!(
+            parsed.group_desc_block(GroupNumber(260)),
+            Some(256 * 32768 + 1)
+        );
+        assert_eq!(
+            parsed.group_desc_offset(GroupNumber(130)),
+            Some((128 * 32768 + 1) * 4096 + 2 * 32)
+        );
+        assert_eq!(
+            parsed.group_desc_offset(GroupNumber(3)),
+            Some(4096 + 3 * 32)
+        );
     }
 
     #[test]

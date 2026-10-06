@@ -11476,9 +11476,44 @@ impl OpenFs {
     /// in-memory group statistics cache.
     /// For btrfs: walks the FS tree and extent tree to build an in-memory COW
     /// tree and extent allocator.
+    /// Read-only-compatible ext4 features a READER may ignore but a WRITER
+    /// must maintain, which this implementation does not (kernel
+    /// `ext4_feature_set_ok` refuses a read-write mount for the ones it does
+    /// not know, and honours `READONLY`). Writing such an image would leave it
+    /// inconsistent: without quota maintenance e2fsck reports quota usage
+    /// differences after any write; without cluster allocation a bigalloc
+    /// write took inode-table blocks for file data. `None` when writes are safe.
+    fn ext4_writer_unsupported_features(sb: &Ext4Superblock) -> Option<String> {
+        use ffs_ondisk::Ext4RoCompatFeatures as Ro;
+        let ro = sb.feature_ro_compat;
+        let mut reasons = Vec::new();
+        if ro.unknown_bits() != 0 {
+            reasons.push(format!(
+                "unknown read-only-compatible features {:#x}",
+                ro.unknown_bits()
+            ));
+        }
+        if ro.contains(Ro::READONLY) {
+            reasons.push("READONLY (the image is marked read-only)".to_owned());
+        }
+        if ro.contains(Ro::BIGALLOC) {
+            reasons.push("BIGALLOC (cluster allocation is not implemented)".to_owned());
+        }
+        if ro.contains(Ro::QUOTA) || ro.contains(Ro::PROJECT) {
+            reasons.push("QUOTA/PROJECT (quota usage is not maintained)".to_owned());
+        }
+        (!reasons.is_empty()).then(|| reasons.join(", "))
+    }
+
     pub fn enable_writes(&mut self, cx: &Cx) -> Result<(), FfsError> {
         match &self.flavor {
-            FsFlavor::Ext4(_) => {
+            FsFlavor::Ext4(sb) => {
+                if let Some(reason) = Self::ext4_writer_unsupported_features(sb) {
+                    return Err(FfsError::UnsupportedFeature(format!(
+                        "ext4 image uses features this build cannot maintain across a \
+                         write: {reason}. The filesystem is readable; mount it read-only."
+                    )));
+                }
                 if let Some(reason) = &self.ext4_orphan_recovery_error {
                     return Err(FfsError::Format(format!(
                         "ext4 orphan recovery failed at mount ({reason}); refusing \
@@ -11976,7 +12011,11 @@ impl OpenFs {
         }
 
         let persist_ctx = PersistCtx {
-            gdt_block: BlockNumber(u64::from(sb.first_data_block) + 1),
+            gdt_block: BlockNumber(
+                sb.group_desc_block(GroupNumber(0))
+                    .unwrap_or_else(|| u64::from(sb.first_data_block) + 1),
+            ),
+            gdt_blocks: ffs_alloc::gdt_block_map(sb),
             desc_size: geom.group_desc_size,
             has_metadata_csum: geom.has_metadata_csum,
             csum_seed: geom.csum_seed,
@@ -25860,7 +25899,11 @@ impl OpenFs {
         let geom = self.ext4_geometry.as_ref()?;
         let geo = FsGeometry::from_superblock(sb);
         Some(PersistCtx {
-            gdt_block: BlockNumber(u64::from(sb.first_data_block) + 1),
+            gdt_block: BlockNumber(
+                sb.group_desc_block(GroupNumber(0))
+                    .unwrap_or_else(|| u64::from(sb.first_data_block) + 1),
+            ),
+            gdt_blocks: ffs_alloc::gdt_block_map(sb),
             desc_size: geom.group_desc_size,
             has_metadata_csum: geom.has_metadata_csum,
             csum_seed: geom.csum_seed,
@@ -70497,6 +70540,111 @@ mod tests {
         assert!(
             clean,
             "e2fsck must accept a file whose extent tree grew to depth >= 1:\n{output}"
+        );
+    }
+
+    /// Read-only-compatible features this writer cannot maintain keep the image
+    /// read-only: the open (a read) succeeds, `enable_writes` refuses with
+    /// `UnsupportedFeature`, and nothing is written. Before this gate a
+    /// read-write mount of a quota image left e2fsck reporting quota usage
+    /// differences after the first write, and a bigalloc write put file data
+    /// into the inode table.
+    #[test]
+    fn ext4_enable_writes_refuses_features_the_writer_cannot_maintain() {
+        for (features, expected) in [
+            ("quota", "QUOTA"),
+            ("bigalloc", "BIGALLOC"),
+            ("extent", ""), // control: writable
+        ] {
+            let tmp = tempfile::TempDir::new().expect("tmpdir");
+            let image = tmp.path().join("gate.ext4");
+            std::fs::File::create(&image)
+                .and_then(|f| f.set_len(64 << 20))
+                .expect("create image");
+            let out = std::process::Command::new("mke2fs")
+                .args(["-q", "-t", "ext4", "-O", features, "-F"])
+                .arg(&image)
+                .output();
+            if !matches!(&out, Ok(o) if o.status.success()) {
+                oracle_unavailable("mke2fs (e2fsprogs)");
+                return;
+            }
+            let cx = Cx::for_testing();
+            let bytes = std::fs::read(&image).expect("read image");
+            let dev = TestDevice::from_vec(bytes.clone());
+            let mut fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default())
+                .expect("the image stays readable");
+            let result = fs.enable_writes(&cx);
+            if expected.is_empty() {
+                result.expect("a plain extent image is writable");
+                continue;
+            }
+            match result {
+                Err(FfsError::UnsupportedFeature(reason)) => {
+                    assert!(reason.contains(expected), "{features}: {reason}");
+                }
+                other => panic!("{features}: expected UnsupportedFeature, got {other:?}"),
+            }
+            assert!(!fs.is_writable(), "{features}: writes stay off");
+            assert!(
+                dev.snapshot_bytes() == bytes,
+                "{features}: a refused enable_writes must not touch the image"
+            );
+        }
+    }
+
+    /// META_BG layout (kernel `descriptor_loc`, `ext4_bg_num_gdb`). With 1 KiB
+    /// blocks and 64-byte descriptors, 16 groups share a descriptor block, so a
+    /// 300 MiB `meta_bg` image spans three metagroups, each holding its own
+    /// descriptor block in its first, second and last group. Opening it must
+    /// read every descriptor from its metagroup — the contiguous-GDT reader
+    /// failed the descriptor checksum of group 16 — and data allocation must
+    /// skip the META_BG descriptor blocks: the old reserved-block rule left the
+    /// copy in group 1 allocatable (e2fsck: "multiply-claimed block" shared
+    /// with filesystem metadata) and its free counts wrong.
+    #[test]
+    fn ext4_meta_bg_descriptors_are_located_and_never_allocated() {
+        let Some((fs, dev, _tmp, image)) =
+            open_ext4_mke2fs_features(300, "extent,meta_bg,^resize_inode")
+        else {
+            return; // e2fsprogs unavailable
+        };
+        let cx = Cx::for_testing();
+        let sb = fs.ext4_superblock().expect("sb").clone();
+        assert!(
+            sb.desc_per_block() < sb.groups_count(),
+            "image must span metagroups"
+        );
+        for group in 0..sb.groups_count() {
+            fs.read_group_desc(&cx, GroupNumber(group))
+                .expect("every descriptor reads from its metagroup");
+        }
+
+        // 24 MiB of data fills groups 0..3, including group 1, whose second
+        // block is a META_BG descriptor copy.
+        for i in 0..24_u8 {
+            let attr = fs
+                .create(
+                    &cx,
+                    InodeNumber(2),
+                    OsStr::new(&format!("f{i}")),
+                    0o644,
+                    0,
+                    0,
+                )
+                .expect("create");
+            fs.write(&cx, attr.ino, 0, &vec![i; 1 << 20])
+                .expect("write");
+        }
+
+        fs.flush_mvcc_to_device(&cx).expect("flush mvcc");
+        std::fs::write(&image, dev.snapshot_bytes()).expect("write image");
+        let Some((clean, output)) = run_e2fsck(&image) else {
+            return; // e2fsck unavailable
+        };
+        assert!(
+            clean,
+            "e2fsck must accept a FrankenFS-written meta_bg image:\n{output}"
         );
     }
 

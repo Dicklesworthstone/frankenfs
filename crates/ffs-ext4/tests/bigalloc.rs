@@ -116,6 +116,7 @@ fn make_groups(geo: &FsGeometry) -> Vec<GroupStats> {
 fn make_persist_ctx(geo: &FsGeometry) -> PersistCtx {
     PersistCtx {
         gdt_block: BlockNumber(50),
+        gdt_blocks: None,
         desc_size: 32,
         has_metadata_csum: false,
         csum_seed: 0,
@@ -129,6 +130,7 @@ fn make_persist_ctx(geo: &FsGeometry) -> PersistCtx {
 fn make_metadata_csum_persist_ctx(geo: &FsGeometry) -> PersistCtx {
     PersistCtx {
         gdt_block: BlockNumber(50),
+        gdt_blocks: None,
         desc_size: 64,
         has_metadata_csum: true,
         csum_seed: 0x1234_5678,

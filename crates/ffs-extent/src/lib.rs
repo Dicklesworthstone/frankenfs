@@ -2171,6 +2171,7 @@ mod tests {
         ffs_alloc::PersistCtx {
             // Keep GDT writes off the group-0 block bitmap block (1) used by this fixture.
             gdt_block: BlockNumber(50),
+            gdt_blocks: None,
             desc_size: 32,
             has_metadata_csum: false,
             uuid: [0; 16],

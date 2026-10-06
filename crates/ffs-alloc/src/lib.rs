@@ -1651,35 +1651,75 @@ impl FsGeometry {
         self.group_count.div_ceil(desc_per_block)
     }
 
+    fn has_meta_bg(&self) -> bool {
+        self.feature_incompat.0 & ffs_ondisk::Ext4IncompatFeatures::META_BG.0 != 0
+    }
+
+    /// Group descriptors per GDT block (kernel `EXT4_DESC_PER_BLOCK`).
+    #[must_use]
+    pub fn desc_per_block(&self) -> u32 {
+        let desc_size = u32::from(self.desc_size);
+        if desc_size == 0 {
+            return 0;
+        }
+        self.block_size / desc_size
+    }
+
+    /// Whether `group` is in a META_BG metagroup. `s_first_meta_bg` counts
+    /// descriptor blocks (metagroups), not groups — see
+    /// `Ext4Superblock::group_in_meta_bg`, which this mirrors.
+    #[must_use]
+    pub fn group_in_meta_bg(&self, group: GroupNumber) -> bool {
+        let desc_per_block = self.desc_per_block();
+        self.has_meta_bg() && desc_per_block != 0 && group.0 / desc_per_block >= self.first_meta_bg
+    }
+
+    /// GDT blocks stored in `group` (kernel `ext4_bg_num_gdb`); mirrors
+    /// `Ext4Superblock::group_gdt_blocks`.
+    #[must_use]
+    pub fn group_gdt_blocks(&self, group: GroupNumber) -> u32 {
+        if self.group_in_meta_bg(group) {
+            let desc_per_block = self.desc_per_block();
+            let first = (group.0 / desc_per_block) * desc_per_block;
+            let last = first.saturating_add(desc_per_block - 1);
+            return u32::from(group.0 == first || group.0 == first + 1 || group.0 == last);
+        }
+        if !self.has_backup_superblock(group) {
+            return 0;
+        }
+        if self.has_meta_bg() {
+            self.first_meta_bg
+        } else {
+            self.gdt_blocks_count()
+        }
+    }
+
     #[must_use]
     pub fn reserved_gdt_blocks_in_group(&self, group: GroupNumber) -> u32 {
         if self.feature_compat.0 & ffs_ondisk::Ext4CompatFeatures::RESIZE_INODE.0 == 0
             || !self.has_backup_superblock(group)
-        {
-            return 0;
-        }
-        if self.feature_incompat.0 & ffs_ondisk::Ext4IncompatFeatures::META_BG.0 != 0
-            && group.0 >= self.first_meta_bg
+            || self.group_in_meta_bg(group)
         {
             return 0;
         }
         u32::from(self.reserved_gdt_blocks)
     }
 
+    /// Superblock copy plus GDT blocks at the start of `group` (kernel
+    /// `ext4_num_base_meta_clusters`, in blocks); mirrors
+    /// `Ext4Superblock::base_meta_blocks_in_group`.
     #[must_use]
     pub fn base_meta_blocks_in_group(&self, group: GroupNumber) -> u32 {
-        if !self.has_backup_superblock(group) {
+        let has_super = u32::from(self.has_backup_superblock(group));
+        if self.group_in_meta_bg(group) {
+            return has_super + self.group_gdt_blocks(group);
+        }
+        if has_super == 0 {
             return 0;
         }
-        let mut blocks = 1_u32; // superblock copy
-        if self.feature_incompat.0 & ffs_ondisk::Ext4IncompatFeatures::META_BG.0 == 0
-            || group.0 < self.first_meta_bg
-        {
-            blocks = blocks
-                .saturating_add(self.gdt_blocks_count())
-                .saturating_add(self.reserved_gdt_blocks_in_group(group));
-        }
-        blocks
+        1_u32
+            .saturating_add(self.group_gdt_blocks(group))
+            .saturating_add(self.reserved_gdt_blocks_in_group(group))
     }
 
     /// Number of blocks in a specific group (last group may be shorter).
@@ -1747,8 +1787,14 @@ impl FsGeometry {
 #[derive(Debug, Clone)]
 pub struct PersistCtx {
     /// Block number of the first group descriptor table block.
-    /// Group descriptors are packed contiguously starting here.
+    /// Without a [`Self::gdt_blocks`] map, group descriptors are packed
+    /// contiguously starting here.
     pub gdt_block: BlockNumber,
+    /// Location of every descriptor block, indexed by `group / desc_per_block`,
+    /// for a META_BG filesystem, whose descriptor blocks live inside their
+    /// metagroups instead of after the superblock (kernel `descriptor_loc`).
+    /// `None` for the contiguous layout.
+    pub gdt_blocks: Option<Arc<[BlockNumber]>>,
     /// On-disk group descriptor size (32 or 64).
     pub desc_size: u16,
     /// Whether metadata_csum is enabled (triggers checksum stamping).
@@ -1763,6 +1809,44 @@ pub struct PersistCtx {
     pub blocks_per_group: u32,
     /// Inodes per group — needed for inode bitmap checksum length.
     pub inodes_per_group: u32,
+}
+
+/// The [`PersistCtx::gdt_blocks`] map for `sb`: `Some` only on a META_BG
+/// filesystem, where descriptor blocks are not contiguous.
+#[must_use]
+pub fn gdt_block_map(sb: &Ext4Superblock) -> Option<Arc<[BlockNumber]>> {
+    if !sb.has_incompat(ffs_ondisk::Ext4IncompatFeatures::META_BG) {
+        return None;
+    }
+    let desc_per_block = sb.desc_per_block();
+    if desc_per_block == 0 {
+        return None;
+    }
+    let blocks: Option<Vec<BlockNumber>> = (0..sb.groups_count().div_ceil(desc_per_block))
+        .map(|index| {
+            let first_group = GroupNumber(index.checked_mul(desc_per_block)?);
+            sb.group_desc_block(first_group).map(BlockNumber)
+        })
+        .collect();
+    blocks.map(Arc::from)
+}
+
+impl PersistCtx {
+    /// The GDT block holding descriptor block `index` (`group / desc_per_block`).
+    pub fn gdt_block_at(&self, index: usize) -> Result<BlockNumber> {
+        if let Some(map) = &self.gdt_blocks {
+            return map.get(index).copied().ok_or_else(|| {
+                FfsError::InvalidGeometry(format!(
+                    "group descriptor block {index} is outside the META_BG descriptor map"
+                ))
+            });
+        }
+        self.gdt_block
+            .0
+            .checked_add(index as u64)
+            .map(BlockNumber)
+            .ok_or_else(|| FfsError::InvalidGeometry("GDT block number overflow".into()))
+    }
 }
 
 fn is_power_of(mut value: u32, factor: u32) -> bool {
@@ -2248,12 +2332,7 @@ fn persist_group_desc_force_with_bitmap_overrides(
     let gdt_block_idx = group.0 as usize / descs_per_block;
     let offset_in_block = (group.0 as usize % descs_per_block) * ds;
 
-    let block_num = BlockNumber(
-        pctx.gdt_block
-            .0
-            .checked_add(gdt_block_idx as u64)
-            .ok_or_else(|| FfsError::InvalidGeometry("GDT block number overflow".into()))?,
-    );
+    let block_num = pctx.gdt_block_at(gdt_block_idx)?;
 
     // The GDT block is SHARED across every group whose descriptor lives in it: a
     // group descriptor is a `ds`-byte slot at `offset_in_block`, and this call
@@ -2404,12 +2483,7 @@ fn group_desc_location(
             "block_size smaller than desc_size".into(),
         ));
     }
-    let block = BlockNumber(
-        pctx.gdt_block
-            .0
-            .checked_add((group.0 as usize / descs_per_block) as u64)
-            .ok_or_else(|| FfsError::InvalidGeometry("GDT block number overflow".into()))?,
-    );
+    let block = pctx.gdt_block_at(group.0 as usize / descs_per_block)?;
     Ok((block, (group.0 as usize % descs_per_block) * ds, ds))
 }
 
@@ -5013,15 +5087,22 @@ mod tests {
                 proptest::prop_assert_eq!(base_meta, 0);
             }
 
+            // META_BG from the first metagroup: no reserved GDT, and one
+            // descriptor block in the first, second and last group of each
+            // metagroup, after the superblock copy (kernel ext4_bg_num_gdb).
             let mut meta_bg_geo = geo;
             meta_bg_geo.feature_incompat = ffs_ondisk::Ext4IncompatFeatures(
                 ffs_ondisk::Ext4IncompatFeatures::META_BG.0,
             );
             meta_bg_geo.first_meta_bg = 0;
+            let per_block = meta_bg_geo.desc_per_block();
+            let in_metagroup = group % per_block;
+            let carries_gdt =
+                in_metagroup == 0 || in_metagroup == 1 || in_metagroup == per_block - 1;
             proptest::prop_assert_eq!(meta_bg_geo.reserved_gdt_blocks_in_group(g), 0);
             proptest::prop_assert_eq!(
                 meta_bg_geo.base_meta_blocks_in_group(g),
-                u32::from(meta_bg_geo.has_backup_superblock(g))
+                u32::from(meta_bg_geo.has_backup_superblock(g)) + u32::from(carries_gdt)
             );
         }
     }
@@ -5384,6 +5465,7 @@ mod tests {
     fn make_persist_ctx() -> PersistCtx {
         PersistCtx {
             gdt_block: BlockNumber(50), // arbitrary GDT location
+            gdt_blocks: None,
             desc_size: 32,
             has_metadata_csum: false,
             csum_seed: 0,
@@ -5447,6 +5529,7 @@ mod tests {
         let cx = test_cx();
         let pctx = PersistCtx {
             gdt_block: BlockNumber(50),
+            gdt_blocks: None,
             desc_size: 64,
             has_metadata_csum: true,
             csum_seed: 0x1357_2468,
@@ -5533,6 +5616,7 @@ mod tests {
         let cx = test_cx();
         let pctx = PersistCtx {
             gdt_block: BlockNumber(50),
+            gdt_blocks: None,
             desc_size: 64,
             has_metadata_csum: true,
             csum_seed: 0x1357_2468,
@@ -5699,6 +5783,7 @@ mod tests {
     fn make_batch_equivalence_persist_ctx(geo: &FsGeometry) -> PersistCtx {
         PersistCtx {
             gdt_block: BlockNumber(200),
+            gdt_blocks: None,
             desc_size: geo.desc_size,
             has_metadata_csum: false,
             csum_seed: 0,
@@ -6447,6 +6532,7 @@ mod tests {
                 geo.desc_size = 64;
                 PersistCtx {
                     gdt_block: BlockNumber(50),
+                    gdt_blocks: None,
                     desc_size: 64,
                     has_metadata_csum: true,
                     csum_seed: 0x1357_2468,
@@ -6565,6 +6651,7 @@ mod tests {
                 geo.desc_size = 64;
                 PersistCtx {
                     gdt_block: BlockNumber(50),
+                    gdt_blocks: None,
                     desc_size: 64,
                     has_metadata_csum: true,
                     csum_seed: 0x1357_2468,
@@ -6679,6 +6766,7 @@ mod tests {
         let mut groups = make_groups(&geo);
         let pctx = PersistCtx {
             gdt_block: BlockNumber(50),
+            gdt_blocks: None,
             desc_size: 64,
             has_metadata_csum: true,
             csum_seed: 0x1357_2468,
@@ -7498,6 +7586,7 @@ mod tests {
     fn persist_ctx_debug_clone() {
         let pctx = PersistCtx {
             gdt_block: BlockNumber(1),
+            gdt_blocks: None,
             desc_size: 32,
             has_metadata_csum: false,
             csum_seed: 0,
@@ -7623,60 +7712,56 @@ mod tests {
         );
     }
 
+    /// META_BG reserved blocks follow the kernel (`ext4_num_base_meta_clusters`):
+    /// `first_meta_bg` counts descriptor blocks, so with 16 descriptors per
+    /// block and `first_meta_bg = 1`, groups 0..16 keep the old layout
+    /// (superblock + `first_meta_bg` GDT blocks + reserved GDT), while in each
+    /// later metagroup only the first, second and last group hold a descriptor
+    /// block, right after their superblock copy. The old code compared
+    /// `first_meta_bg` with the GROUP number and reserved no META_BG
+    /// descriptor block at all, which let a data allocation overwrite one.
     #[test]
-    fn reserved_blocks_skip_reserved_gdt_after_first_meta_bg() {
+    fn reserved_blocks_follow_kernel_meta_bg_layout() {
         let mut geo = make_geometry();
+        geo.block_size = 1024;
+        geo.desc_size = 64; // 16 descriptors per GDT block
+        geo.first_data_block = 1;
         geo.feature_compat =
             ffs_ondisk::Ext4CompatFeatures(ffs_ondisk::Ext4CompatFeatures::RESIZE_INODE.0);
         geo.feature_incompat =
             ffs_ondisk::Ext4IncompatFeatures(ffs_ondisk::Ext4IncompatFeatures::META_BG.0);
-        geo.first_meta_bg = 2;
+        geo.first_meta_bg = 1;
         geo.reserved_gdt_blocks = 2;
-        geo.group_count = 4;
-        geo.total_blocks = u64::from(geo.blocks_per_group) * u64::from(geo.group_count);
+        geo.group_count = 40;
+        geo.total_blocks = u64::from(geo.first_data_block)
+            + u64::from(geo.blocks_per_group) * u64::from(geo.group_count);
         let mut groups = make_groups(&geo);
-        for group in [GroupNumber(1), GroupNumber(3)] {
-            let gidx = group.0 as usize;
-            groups[gidx].block_bitmap_block = geo.group_block_to_absolute(group, 100);
-            groups[gidx].inode_bitmap_block = geo.group_block_to_absolute(group, 101);
-            groups[gidx].inode_table_block = geo.group_block_to_absolute(group, 102);
+        for (gidx, stats) in groups.iter_mut().enumerate() {
+            let group = GroupNumber(u32::try_from(gidx).unwrap());
+            stats.block_bitmap_block = geo.group_block_to_absolute(group, 100);
+            stats.inode_bitmap_block = geo.group_block_to_absolute(group, 101);
+            stats.inode_table_block = geo.group_block_to_absolute(group, 102);
         }
+        let prefix = |group: u32| -> Vec<u32> {
+            reserved_blocks_in_group(&geo, &groups, GroupNumber(group))
+                .iter()
+                .copied()
+                .filter(|rel| *rel < 100)
+                .collect()
+        };
 
-        let early_reserved = reserved_blocks_in_group(&geo, &groups, GroupNumber(1));
-        assert!(
-            early_reserved.contains(&0),
-            "backup superblock copy should remain reserved"
-        );
-        assert!(
-            early_reserved.contains(&1),
-            "early META_BG groups still carry backup GDT blocks"
-        );
-        assert!(
-            early_reserved.contains(&2),
-            "early META_BG groups still reserve resize GDT slots"
-        );
-        assert!(
-            early_reserved.contains(&3),
-            "early META_BG groups still reserve all backup-GDT prefix blocks"
-        );
-
-        let late_reserved = reserved_blocks_in_group(&geo, &groups, GroupNumber(3));
-        assert!(
-            late_reserved.contains(&0),
-            "backup superblock copy should remain reserved"
-        );
-        assert!(
-            !late_reserved.contains(&1),
-            "groups at or after first_meta_bg must not reserve contiguous backup GDT blocks",
-        );
-        assert!(
-            !late_reserved.contains(&2),
-            "groups at or after first_meta_bg must not reserve resize GDT slots",
-        );
-        assert!(
-            !late_reserved.contains(&3),
-            "groups at or after first_meta_bg must not reserve backup-GDT prefix blocks",
-        );
+        // Old layout: superblock, one GDT block (first_meta_bg = 1), two
+        // reserved GDT blocks.
+        assert_eq!(prefix(1), vec![0, 1, 2, 3]);
+        assert_eq!(prefix(15), vec![0, 1, 2, 3]);
+        // META_BG metagroup 1 (groups 16..32): descriptor block in 16, 17, 31.
+        assert_eq!(prefix(16), vec![0, 1]);
+        assert_eq!(prefix(17), vec![0, 1]);
+        assert_eq!(prefix(18), vec![0], "no descriptor block mid-metagroup");
+        assert_eq!(prefix(31), vec![0, 1]);
+        // Metagroup 2 (groups 32..48, only 32..40 exist).
+        assert_eq!(prefix(32), vec![0, 1]);
+        assert_eq!(prefix(39), vec![0]);
     }
 
     #[test]

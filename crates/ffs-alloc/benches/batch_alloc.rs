@@ -118,6 +118,7 @@ fn make_skip_geometry(group_count: u32) -> FsGeometry {
 fn make_persist_ctx() -> PersistCtx {
     PersistCtx {
         gdt_block: BlockNumber(50),
+        gdt_blocks: None,
         desc_size: 32,
         has_metadata_csum: false,
         uuid: [0; 16],

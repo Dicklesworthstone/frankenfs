@@ -1491,6 +1491,7 @@ mod tests {
     fn mock_pctx() -> ffs_alloc::PersistCtx {
         ffs_alloc::PersistCtx {
             gdt_block: BlockNumber(1),
+            gdt_blocks: None,
             desc_size: 32,
             has_metadata_csum: false,
             uuid: [0; 16],
