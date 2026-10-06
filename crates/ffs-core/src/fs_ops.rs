@@ -1060,8 +1060,13 @@ impl FsOps for OpenFs {
                     blocks: total_bytes / unit_u64,
                     blocks_free: free_bytes / unit_u64,
                     blocks_available: available_bytes / unit_u64,
-                    files: 1_000_000_000,
-                    files_free: 1_000_000_000,
+                    // btrfs has no inode table: like the kernel's btrfs_statfs,
+                    // report no inode counts (df -i shows 0) rather than a
+                    // made-up number. Callers then see "no inode limit"; with
+                    // 1e9 here, xfstests generic/558 set out to create a
+                    // billion files and ran for the whole CI job.
+                    files: 0,
+                    files_free: 0,
                     block_size: unit,
                     name_max: 255,
                     fragment_size: unit,

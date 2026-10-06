@@ -58710,8 +58710,9 @@ mod tests {
         assert_eq!(stats.blocks, sb.total_bytes / unit_u64);
         assert_eq!(stats.blocks_free, free_bytes / unit_u64);
         assert_eq!(stats.blocks_available, free_bytes / unit_u64);
-        assert_eq!(stats.files, 1_000_000_000);
-        assert_eq!(stats.files_free, 1_000_000_000);
+        // No inode table on btrfs: no inode counts, as the kernel reports.
+        assert_eq!(stats.files, 0);
+        assert_eq!(stats.files_free, 0);
         assert_eq!(stats.name_max, 255);
     }
 
