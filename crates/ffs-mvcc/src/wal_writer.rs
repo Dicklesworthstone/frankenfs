@@ -539,6 +539,55 @@ impl WalWriter {
         Ok(pending)
     }
 
+    /// Discard a durably checkpointed prefix without rewriting its valid header.
+    /// The caller must pin the store and checkpoint horizon while holding the
+    /// writer lock. The same descriptor retains inode ownership throughout.
+    ///
+    /// Truncation always has its own durability barrier, even with zero pending
+    /// appends or Manual sync. Publish the new cursor and counters only after
+    /// that barrier succeeds. Any uncertain storage failure seals this writer;
+    /// it is not safe to resume appending after merely clearing the I/O error.
+    pub(crate) fn truncate_after_checkpoint(
+        &mut self,
+        checkpoint_commit_seq: u64,
+    ) -> std::result::Result<u64, WalWriteError> {
+        self.ensure_ready()?;
+        if checkpoint_commit_seq == u64::MAX || checkpoint_commit_seq < self.last_commit_seq {
+            return Err(WalWriteError::FormatViolation {
+                detail: "invalid or stale checkpoint horizon for WAL truncation".to_owned(),
+            });
+        }
+        let header_size =
+            u64::try_from(HEADER_SIZE).map_err(|_| WalWriteError::FormatViolation {
+                detail: "header size exceeds u64".to_owned(),
+            })?;
+        let observed_size = match self.file.metadata() {
+            Ok(metadata) => metadata.len(),
+            Err(error) => {
+                return Err(self.require_recovery(format!(
+                    "cannot inspect WAL before checkpoint truncation: {error}"
+                )));
+            }
+        };
+        // Never manufacture a header by extending a shortened file, or discard
+        // an unexpected tail that was not covered by the checkpoint horizon.
+        if self.write_pos < header_size || observed_size != self.write_pos {
+            return Err(self.require_recovery(format!(
+                "WAL length changed before checkpoint truncation: expected {}, observed {observed_size}",
+                self.write_pos
+            )));
+        }
+        if let Err(error) = self.truncate_and_sync_rollback(header_size) {
+            return Err(self.require_recovery(format!(
+                "checkpoint WAL truncation failed: {error}"
+            )));
+        }
+        self.write_pos = header_size;
+        self.last_commit_seq = checkpoint_commit_seq;
+        self.appends_since_sync = 0;
+        Ok(header_size)
+    }
+
     /// Reject use after an ambiguous storage failure. Check this before
     /// checkpoint publication or direct mutation through the file accessors.
     /// Resetting counters or fixing the underlying device does not unseal an
@@ -756,8 +805,8 @@ impl WalWriter {
         if self.fail_rollback_sync {
             return Err(std::io::Error::other("injected rollback sync failure"));
         }
-        // Mandatory even under Manual/EveryN: removing an unacknowledged
-        // record is a durability operation, not a deferred successful append.
+        // Mandatory even under Manual/EveryN and with zero pending appends:
+        // removing WAL records is a durability operation, not a deferred append.
         self.file.sync_all()
     }
 
@@ -794,12 +843,12 @@ impl WalWriter {
         let mut record_offsets = CoalescedRecordOffsets::with_capacity(commits.len());
 
         for commit in commits {
-            let offset_in_buf = coalesced_buf.len();
+            let offset = coalesced_buf.len();
             let encoded =
                 wal::encode_commit(commit).map_err(|e| WalWriteError::FormatViolation {
                     detail: format!("failed to encode commit in coalesced batch: {e}"),
                 })?;
-            record_offsets.push((offset_in_buf, encoded.len()));
+            record_offsets.push((offset, encoded.len()));
             coalesced_buf.extend_from_slice(&encoded);
         }
 

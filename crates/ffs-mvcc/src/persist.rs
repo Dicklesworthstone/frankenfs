@@ -42,7 +42,7 @@ use std::path::Path;
 pub struct PersistOptions {
     /// Whether to sync after each commit (default: true).
     pub sync_on_commit: bool,
-    /// Whether to verify writes by reading back and checking CRC (default: false).
+    /// Whether to verify writes by reading back and comparing every byte (default: false).
     pub verify_writes: bool,
     /// WAL size threshold in bytes for backpressure signaling (0 = disabled).
     pub backpressure_threshold_bytes: u64,
@@ -684,18 +684,15 @@ impl PersistentMvccStore {
 
     /// Truncate the WAL after a checkpoint.
     ///
-    /// This resets the WAL to just the header, reducing disk space usage.
-    /// Should only be called after a successful checkpoint.
-    ///
-    /// # Warning
-    ///
-    /// If called without a valid checkpoint, or if newer commits landed after
-    /// the checkpoint snapshot, committed WAL data will be lost.
+    /// This retains the existing header and inode, reducing disk space usage.
+    /// The checkpoint must cover every committed version. A stale checkpoint
+    /// is rejected before I/O. An uncertain truncate or sync failure seals the
+    /// writer until the store is reopened with its durable checkpoint and WAL.
     pub fn truncate_wal(&self) -> Result<()> {
         // Hold a shared store lock while checking the checkpoint horizon and
         // truncating the WAL. This blocks concurrent commits (which require the
         // store write lock) from sneaking in between the freshness check and the
-        // destructive WAL rewrite.
+        // destructive WAL truncation.
         let store_guard = self.store.read();
         let mut wal_guard = self.wal.write();
         // An ambiguous append may have been rolled back only in memory. A
@@ -710,32 +707,14 @@ impl PersistentMvccStore {
             )));
         }
 
-        let header_size = {
-            let file = wal_guard.file_mut();
+        // The writer owns the destructive I/O and its fail-closed transition.
+        // Never bypass that transition with a raw file sync when no appends
+        // happen to be pending; truncation itself still needs a durable barrier.
+        let header_size = wal_guard
+            .truncate_after_checkpoint(current_commit_seq)
+            .map_err(FfsError::from)?;
 
-            // Rewrite just the header
-            file.seek(SeekFrom::Start(0))?;
-            let header = WalHeader::default();
-            let header_bytes = wal::encode_header(&header);
-            file.write_all(&header_bytes)?;
-
-            // Truncate to header size
-            let header_size = u64::try_from(HEADER_SIZE)
-                .map_err(|_| FfsError::Format("header size overflow".to_owned()))?;
-            file.set_len(header_size)?;
-            wal_guard.write_pos = header_size;
-            wal_guard.set_last_commit_seq(current_commit_seq);
-
-            if wal_guard.pending_sync_count() > 0 {
-                wal_guard.flush().map(|_| ()).map_err(FfsError::from)?;
-            } else {
-                wal_guard.file_mut().sync_all()?;
-            }
-
-            header_size
-        };
-
-        // Update stats
+        // Update stats only after the new append frontier is durable.
         {
             let mut stats = self.stats.write();
             stats.wal_size_bytes = header_size;
@@ -1314,6 +1293,10 @@ mod recovery_tests;
 #[cfg(test)]
 #[path = "persist/ownership_tests.rs"]
 mod ownership_tests;
+
+#[cfg(test)]
+#[path = "persist/truncation_tests.rs"]
+mod truncation_tests;
 
 #[cfg(test)]
 mod tests {
