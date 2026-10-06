@@ -72,6 +72,24 @@ jobs:
             https://git.kernel.org/pub/scm/fs/xfs/xfstests-dev.git ~/xfstests-dev
           make -C ~/xfstests-dev -j"$(nproc)"
 
+      # Upstream _scratch_mkfs_sized refuses FSTYP=fuse, which marks ~50
+      # generic tests (mostly ENOSPC and small-filesystem behaviour) "not
+      # run". FrankenFS's scratch device is an image file, so the patch
+      # re-creates it at the requested size with the format's own mkfs and
+      # restores the full-size image at the next _require_scratch. It only
+      # acts when FFS_XFSTESTS_IMAGE_FORMAT is set. Idempotent on a cached
+      # tree.
+      - name: Teach xfstests to size a FrankenFS scratch image
+        run: |
+          set -euo pipefail
+          p="$GITHUB_WORKSPACE/scripts/e2e/xfstests-fuse-sized-scratch.patch"
+          cd ~/xfstests-dev
+          if patch -p1 -R -s -f --dry-run <"$p" >/dev/null 2>&1; then
+            echo "already applied"
+          else
+            patch -p1 --forward <"$p"
+          fi
+
       - name: Build FrankenFS
         run: cargo build -p ffs-cli -p ffs-harness
 
@@ -115,6 +133,7 @@ jobs:
         env:
           FSTYP: fuse
           FUSE_SUBTYP: .ffs
+          FFS_XFSTESTS_IMAGE_FORMAT: ${{ matrix.fs }}
           XFSTESTS_MODE: run
           XFSTESTS_FILTER: generic
           XFSTESTS_DRY_RUN: 0

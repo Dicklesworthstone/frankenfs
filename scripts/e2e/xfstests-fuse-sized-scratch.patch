@@ -1,0 +1,82 @@
+--- a/common/rc
++++ b/common/rc
+@@ -1394,12 +1394,71 @@
+ 	bcachefs)
+ 		$MKFS_BCACHEFS_PROG $MKFS_OPTIONS --fs_size=$fssize $blocksize_opt "$@" $SCRATCH_DEV
+ 		;;
++	fuse)
++		_ffs_mkfs_sized_image "$fssize" "$blocksize" "$blocks"
++		;;
+ 	*)
+ 		_notrun "Filesystem $FSTYP not supported in _scratch_mkfs_sized"
+ 		;;
+ 	esac
+ }
+ 
++# FrankenFS (FSTYP=fuse with FFS_XFSTESTS_IMAGE_FORMAT=ext4|btrfs): the
++# scratch "device" is an image file the FUSE daemon mounts, so a sized
++# filesystem is the image re-created at that size by the format's own mkfs.
++# The original size is kept in $SCRATCH_DEV.ffs-full-size, and the next
++# _require_scratch restores a full-size image, so no later test sees it shrunk.
++# A FUSE umount returns before the daemon's final flush, so a daemon from the
++# previous mount can still be writing the image. Re-creating it then would
++# have the old daemon write into the new filesystem. A read-write FrankenFS
++# daemon holds an exclusive flock on its image until it exits, so wait for
++# that lock (bounded; a stuck daemon fails the test instead).
++_ffs_wait_scratch_released()
++{
++	flock -w 60 "$SCRATCH_DEV" true ||
++		{ echo "scratch image still locked after 60 s: $SCRATCH_DEV" >&2; return 1; }
++}
++
++_ffs_mkfs_sized_image()
++{
++	local fssize=$1 blocksize=$2 blocks=$3
++	if [ ! -f "$SCRATCH_DEV" ] || [ -z "$FFS_XFSTESTS_IMAGE_FORMAT" ]; then
++		_notrun "Filesystem $FSTYP not supported in _scratch_mkfs_sized"
++	fi
++	_ffs_wait_scratch_released || return 1
++	[ -f "$SCRATCH_DEV.ffs-full-size" ] ||
++		stat -c %s "$SCRATCH_DEV" > "$SCRATCH_DEV.ffs-full-size" || return 1
++	truncate -s 0 "$SCRATCH_DEV" && truncate -s "$fssize" "$SCRATCH_DEV" || return 1
++	case $FFS_XFSTESTS_IMAGE_FORMAT in
++	ext4)
++		mkfs.ext4 -q -F -b "$blocksize" "$SCRATCH_DEV" "$blocks"
++		;;
++	btrfs)
++		local mixed_opt=
++		(( fssize < $((256 * 1024 * 1024)) )) && mixed_opt='--mixed'
++		mkfs.btrfs -q -f $mixed_opt -b "$fssize" "$SCRATCH_DEV"
++		;;
++	*)
++		_notrun "FFS_XFSTESTS_IMAGE_FORMAT=$FFS_XFSTESTS_IMAGE_FORMAT not supported"
++		;;
++	esac
++}
++
++_ffs_restore_full_scratch_image()
++{
++	[ "$FSTYP" = fuse ] && [ -f "$SCRATCH_DEV.ffs-full-size" ] || return 0
++	local size
++	size=$(cat "$SCRATCH_DEV.ffs-full-size")
++	_scratch_unmount 2>/dev/null
++	_ffs_wait_scratch_released &&
++		truncate -s 0 "$SCRATCH_DEV" && truncate -s "$size" "$SCRATCH_DEV" &&
++		case $FFS_XFSTESTS_IMAGE_FORMAT in
++		ext4) mkfs.ext4 -q -F "$SCRATCH_DEV" ;;
++		btrfs) mkfs.btrfs -q -f "$SCRATCH_DEV" ;;
++		esac &&
++		rm -f "$SCRATCH_DEV.ffs-full-size"
++}
++
+ _scratch_mkfs_sized()
+ {
+ 	_try_scratch_mkfs_sized "$@" || _notrun "_scratch_mkfs_sized failed with ($*)"
+@@ -1990,6 +2049,7 @@
+ 		if [ ! -d "$SCRATCH_MNT" ]; then
+ 			_notrun "this test requires a valid \$SCRATCH_MNT"
+ 		fi
++		_ffs_restore_full_scratch_image
+ 		;;
+ 	nfs*)
+ 		echo $SCRATCH_DEV | grep -q ":/" > /dev/null 2>&1
