@@ -175,7 +175,8 @@ impl<R: Read> Decoder<'_, R> {
         while data.len() < len {
             checkpoint(self.cx)?;
             let step = (len - data.len()).min(CHECKPOINT_IO_CHUNK_BYTES);
-            data.try_reserve(step).map_err(allocation_error)?;
+            data.try_reserve(step)
+                .map_err(|error| allocation_error(&error))?;
             let start = data.len();
             data.resize(start + step, 0);
             self.read_into(&mut data[start..])?;
@@ -207,7 +208,7 @@ impl<R: Read> Decoder<'_, R> {
     }
 }
 
-fn allocation_error(error: std::collections::TryReserveError) -> FfsError {
+fn allocation_error(error: &std::collections::TryReserveError) -> FfsError {
     FfsError::Io(std::io::Error::other(format!(
         "checkpoint allocation failed: {error}"
     )))
@@ -283,7 +284,9 @@ fn decode_checkpoint(
             future_blocks,
             dedup,
         )?;
-        blocks.try_reserve(1).map_err(allocation_error)?;
+        blocks
+            .try_reserve(1)
+            .map_err(|error| allocation_error(&error))?;
         blocks.push((block, versions));
     }
     decoder.finish()?;
@@ -341,9 +344,7 @@ fn decode_chain(
             let data = decoder.payload(block, data_len, reserved)?;
             // Resolve only the last concrete version. Walking backward over
             // an ever-growing run of dedup markers would be quadratic.
-            let identical = if dedup
-                && let Some(last) = last_concrete
-            {
+            let identical = if dedup && let Some(last) = last_concrete {
                 let previous = resolve_data_with(&versions, last, |v: &BlockVersion| &v.data)
                     .ok_or_else(|| checkpoint_corruption(block, "dedup base is unreadable"))?;
                 same_payload(decoder.cx, &previous, &data)?
@@ -359,7 +360,9 @@ fn decode_chain(
         if !version.data.is_identical() {
             last_concrete = Some(versions.len());
         }
-        versions.try_reserve(1).map_err(allocation_error)?;
+        versions
+            .try_reserve(1)
+            .map_err(|error| allocation_error(&error))?;
         versions.push(version);
     }
     Ok(versions)

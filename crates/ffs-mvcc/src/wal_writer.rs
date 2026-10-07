@@ -562,9 +562,7 @@ impl WalWriter {
             )));
         }
         if let Err(error) = self.truncate_and_sync_rollback(header_size) {
-            return Err(self.require_recovery(format!(
-                "checkpoint WAL truncation failed: {error}"
-            )));
+            return Err(self.require_recovery(format!("checkpoint WAL truncation failed: {error}")));
         }
         self.write_pos = header_size;
         self.last_commit_seq = checkpoint_commit_seq;
@@ -903,7 +901,7 @@ impl WalWriter {
     }
 
     fn verify_written_record(
-        &mut self,
+        &self,
         offset: u64,
         expected: &[u8],
         op_id: u64,
@@ -912,11 +910,12 @@ impl WalWriter {
             u64::try_from(expected.len()).map_err(|_| WalWriteError::FormatViolation {
                 detail: "verification length exceeds u64".to_owned(),
             })?;
-        let end = offset.checked_add(expected_len).ok_or_else(|| {
-            WalWriteError::FormatViolation {
-                detail: "verification range overflowed".to_owned(),
-            }
-        })?;
+        let end =
+            offset
+                .checked_add(expected_len)
+                .ok_or_else(|| WalWriteError::FormatViolation {
+                    detail: "verification range overflowed".to_owned(),
+                })?;
 
         // The encoding includes its own CRC. Different valid records of the
         // same length have the same whole-record CRC residue, so hashing the
@@ -1814,13 +1813,17 @@ mod tests {
 
         let bytes = std::fs::read(&path).unwrap();
         let mut replayed = Vec::new();
-        let report = crate::wal_replay::WalReplayEngine::new(
-            crate::wal_replay::TailPolicy::FailFast,
-        )
-        .replay(&bytes[HEADER_SIZE..], 0, |commit| replayed.push(commit.clone()))
-        .unwrap();
+        let report =
+            crate::wal_replay::WalReplayEngine::new(crate::wal_replay::TailPolicy::FailFast)
+                .replay(&bytes[HEADER_SIZE..], 0, |commit| {
+                    replayed.push(commit.clone())
+                })
+                .unwrap();
         assert!(report.outcome.is_clean());
-        assert_eq!(replayed, vec![first, expected[0].clone(), expected[1].clone()]);
+        assert_eq!(
+            replayed,
+            vec![first, expected[0].clone(), expected[1].clone()]
+        );
     }
 
     #[test]
@@ -1833,7 +1836,10 @@ mod tests {
         writer.raw_append(&expected).unwrap();
         std::io::Seek::seek(writer.file_mut(), std::io::SeekFrom::Start(3)).unwrap();
         writer.verify_written_record(offset, &expected, 0).unwrap();
-        assert_eq!(std::io::Seek::stream_position(writer.file_mut()).unwrap(), 3);
+        assert_eq!(
+            std::io::Seek::stream_position(writer.file_mut()).unwrap(),
+            3
+        );
 
         for index in [
             0,
@@ -1848,7 +1854,10 @@ mod tests {
                 writer.verify_written_record(offset, &expected, 0),
                 Err(WalWriteError::VerificationFailed { .. })
             ));
-            assert_eq!(std::io::Seek::stream_position(writer.file_mut()).unwrap(), 3);
+            assert_eq!(
+                std::io::Seek::stream_position(writer.file_mut()).unwrap(),
+                3
+            );
             writer.file().write_all_at(&[0xA5], physical).unwrap();
         }
         writer.verify_written_record(offset, &expected, 0).unwrap();

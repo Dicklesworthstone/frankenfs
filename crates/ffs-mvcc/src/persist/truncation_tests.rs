@@ -48,7 +48,9 @@ fn assert_store_sealed(store: &PersistentMvccStore, wal_path: &Path, unused_chec
     for error in [
         store.sync().expect_err("sealed sync"),
         store.truncate_wal().expect_err("sealed maintenance retry"),
-        store.checkpoint(unused_checkpoint).expect_err("sealed publication"),
+        store
+            .checkpoint(unused_checkpoint)
+            .expect_err("sealed publication"),
     ] {
         assert!(matches!(&error, FfsError::Io(_)));
         assert!(error.to_string().contains("recovery required"));
@@ -59,7 +61,10 @@ fn assert_store_sealed(store: &PersistentMvccStore, wal_path: &Path, unused_chec
     assert_eq!(store.read_visible(BlockNumber(99), snapshot), None);
     assert_eq!(store.wal_stats().wal_size_bytes, stats.wal_size_bytes);
     assert_eq!(store.wal_stats().commits_written, stats.commits_written);
-    assert_eq!(store.wal_stats().checkpoints_created, stats.checkpoints_created);
+    assert_eq!(
+        store.wal_stats().checkpoints_created,
+        stats.checkpoints_created
+    );
     assert_eq!(std::fs::read(wal_path).unwrap(), bytes);
     assert!(matches!(
         PersistentMvccStore::open(&Cx::for_testing(), wal_path),
@@ -96,7 +101,11 @@ fn checkpoint_truncation_sync_failure_seals_even_without_pending_appends() {
         store.wal.write().fail_rollback_sync = true;
 
         let error = store.truncate_wal().expect_err("post-truncate sync fails");
-        assert!(error.to_string().contains("checkpoint WAL truncation failed"));
+        assert!(
+            error
+                .to_string()
+                .contains("checkpoint WAL truncation failed")
+        );
         // set_len succeeded, but neither the cursor nor zero-pending fast path
         // may pretend the new append frontier is durably established.
         assert_eq!(std::fs::read(&wal_path).unwrap(), prefix[..HEADER_SIZE]);
@@ -110,7 +119,10 @@ fn checkpoint_truncation_sync_failure_seals_even_without_pending_appends() {
         let recovered = PersistentMvccStore::open(&cx, &wal_path).unwrap();
         let snapshot = recovered.current_snapshot();
         assert_eq!(snapshot.high, CommitSeq(1));
-        assert_eq!(recovered.read_visible(BlockNumber(7), snapshot), Some(vec![0xA5; 128]));
+        assert_eq!(
+            recovered.read_visible(BlockNumber(7), snapshot),
+            Some(vec![0xA5; 128])
+        );
         assert!(recovered.recovery_report().used_checkpoint);
         let mut txn = recovered.begin();
         txn.stage_write(BlockNumber(8), vec![8; 16]);
@@ -120,8 +132,14 @@ fn checkpoint_truncation_sync_failure_seals_even_without_pending_appends() {
         let reopened = PersistentMvccStore::open(&cx, &wal_path).unwrap();
         let snapshot = reopened.current_snapshot();
         assert_eq!(snapshot.high, CommitSeq(2));
-        assert_eq!(reopened.read_visible(BlockNumber(7), snapshot), Some(vec![0xA5; 128]));
-        assert_eq!(reopened.read_visible(BlockNumber(8), snapshot), Some(vec![8; 16]));
+        assert_eq!(
+            reopened.read_visible(BlockNumber(7), snapshot),
+            Some(vec![0xA5; 128])
+        );
+        assert_eq!(
+            reopened.read_visible(BlockNumber(8), snapshot),
+            Some(vec![8; 16])
+        );
     }
 }
 
@@ -141,12 +159,17 @@ fn checkpoint_truncation_set_len_error_seals_without_modifying_storage() {
     file.try_lock().unwrap();
     let mut writer = WalWriter::new(file, previous_size, WalWriterConfig::default());
     writer.set_last_commit_seq(1);
-    let error = writer.truncate_after_checkpoint(1).expect_err("read-only truncate");
+    let error = writer
+        .truncate_after_checkpoint(1)
+        .expect_err("read-only truncate");
     assert!(matches!(error, WalWriteError::RecoveryRequired { .. }));
     assert_eq!(std::fs::read(&path).unwrap(), prefix);
     assert_eq!(writer.size(), previous_size);
     assert_eq!(writer.last_commit_seq(), 1);
-    assert!(matches!(writer.flush(), Err(WalWriteError::RecoveryRequired { .. })));
+    assert!(matches!(
+        writer.flush(),
+        Err(WalWriteError::RecoveryRequired { .. })
+    ));
     assert!(matches!(
         writer.append_commit(&record(2)),
         Err(WalWriteError::RecoveryRequired { .. })
@@ -176,7 +199,12 @@ fn checkpoint_truncation_success_preserves_header_inode_and_file_cursor() {
         store.checkpoint(&checkpoint_path).unwrap();
         let before = std::fs::metadata(&wal_path).unwrap();
         let prefix = std::fs::read(&wal_path).unwrap();
-        store.wal.write().file_mut().seek(SeekFrom::Start(3)).unwrap();
+        store
+            .wal
+            .write()
+            .file_mut()
+            .seek(SeekFrom::Start(3))
+            .unwrap();
         store.truncate_wal().unwrap();
         let after = std::fs::metadata(&wal_path).unwrap();
         assert_eq!((before.dev(), before.ino()), (after.dev(), after.ino()));
@@ -202,8 +230,14 @@ fn checkpoint_truncation_success_preserves_header_inode_and_file_cursor() {
         let reopened = PersistentMvccStore::open(&cx, &wal_path).unwrap();
         let snapshot = reopened.current_snapshot();
         assert_eq!(snapshot.high, CommitSeq(2));
-        assert_eq!(reopened.read_visible(BlockNumber(7), snapshot), Some(vec![7; 16]));
-        assert_eq!(reopened.read_visible(BlockNumber(8), snapshot), Some(vec![8; 16]));
+        assert_eq!(
+            reopened.read_visible(BlockNumber(7), snapshot),
+            Some(vec![7; 16])
+        );
+        assert_eq!(
+            reopened.read_visible(BlockNumber(8), snapshot),
+            Some(vec![8; 16])
+        );
     }
 }
 
@@ -239,7 +273,9 @@ fn checkpoint_truncation_rejects_unexpected_file_length_without_further_io() {
         let changed_size = short_length.unwrap_or(previous_size + 1);
         writer.file().set_len(changed_size).unwrap();
         let bytes = std::fs::read(&path).unwrap();
-        let error = writer.truncate_after_checkpoint(1).expect_err("changed WAL length");
+        let error = writer
+            .truncate_after_checkpoint(1)
+            .expect_err("changed WAL length");
         assert!(matches!(error, WalWriteError::RecoveryRequired { .. }));
         assert_eq!(writer.size(), previous_size);
         assert_eq!(writer.last_commit_seq(), 1);

@@ -401,7 +401,10 @@ fn invalid_checkpoint_cannot_authorize_wal_tail_repair_or_skip_commits() {
     // A valid replacement allows normal recovery, tail repair and durable writes.
     std::fs::write(&checkpoint_path, Fixture::valid().bytes()).unwrap();
     let store = PersistentMvccStore::open(&cx, &path).unwrap();
-    assert_eq!(std::fs::metadata(&path).unwrap().len(), valid_wal_len as u64);
+    assert_eq!(
+        std::fs::metadata(&path).unwrap().len(),
+        valid_wal_len as u64
+    );
     assert_eq!(store.recovery_report().commits_replayed, 1);
     assert_eq!(store.recovery_report().records_discarded, 1);
     assert_eq!(store.current_snapshot().high, CommitSeq(4));
@@ -477,7 +480,10 @@ struct BoundaryReader<'a> {
 
 impl Read for BoundaryReader<'_> {
     fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
-        assert!(!self.fired, "recovery performed another read after cancellation");
+        assert!(
+            !self.fired,
+            "recovery performed another read after cancellation"
+        );
         assert!(output.len() <= CHECKPOINT_IO_CHUNK_BYTES);
         if self.position == self.stop {
             return match self.action {
@@ -571,7 +577,10 @@ fn cancellation_after_every_byte_boundary_never_publishes_partial_state() {
         let mut store = seed_store();
         let error = restore_from_reader(&cx, &mut reader, &file, bytes.len() as u64, &mut store)
             .expect_err("cancelled transport must not publish");
-        assert!(matches!(error, FfsError::Cancelled), "stop={stop}: {error:?}");
+        assert!(
+            matches!(error, FfsError::Cancelled),
+            "stop={stop}: {error:?}"
+        );
         assert_eq!(reader.position, stop);
         assert!(reader.fired);
         assert_seed_unchanged(&store);
@@ -627,8 +636,9 @@ fn transport_errors_and_eof_at_every_byte_are_not_discardable_tails() {
                 fired: false,
             };
             let mut store = seed_store();
-            let error = restore_from_reader(&cx, &mut reader, &file, bytes.len() as u64, &mut store)
-                .expect_err("transport failure must remain an error");
+            let error =
+                restore_from_reader(&cx, &mut reader, &file, bytes.len() as u64, &mut store)
+                    .expect_err("transport failure must remain an error");
             let FfsError::Io(error) = error else {
                 panic!("expected original I/O classification at {stop}, got {error:?}");
             };

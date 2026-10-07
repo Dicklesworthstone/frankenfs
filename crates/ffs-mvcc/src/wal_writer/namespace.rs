@@ -17,7 +17,7 @@ use std::path::Path;
 /// Acquire ownership and establish durability before recovery or publication.
 /// Neither a competing opener nor a failed barrier changes WAL bytes.
 /// The returned descriptor retains ownership until its last clone is closed.
-pub(crate) fn open_owned_wal(path: &Path) -> Result<File> {
+pub fn open_owned_wal(path: &Path) -> Result<File> {
     open_with_barriers(path, File::sync_all, File::sync_all)
 }
 
@@ -120,7 +120,11 @@ mod tests {
     use std::os::unix::fs::{FileExt, symlink};
 
     fn assert_owned(path: &Path) {
-        let contender = OpenOptions::new().read(true).write(true).open(path).unwrap();
+        let contender = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(path)
+            .unwrap();
         assert!(matches!(
             contender.try_lock(),
             Err(std::fs::TryLockError::WouldBlock)
@@ -185,7 +189,11 @@ mod tests {
             })
             .unwrap_err();
             assert!(matches!(&error, FfsError::Io(_)));
-            assert!(error.to_string().contains("injected directory sync failure"));
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected directory sync failure")
+            );
             assert_eq!(failed_barriers, 1);
             assert_eq!(std::fs::read(&path).unwrap(), bytes);
 
@@ -300,7 +308,10 @@ mod tests {
             parent.sync_all()
         })
         .unwrap();
-        assert_eq!(barriers, vec![identity(&Path::new(".").metadata().unwrap())]);
+        assert_eq!(
+            barriers,
+            vec![identity(&Path::new(".").metadata().unwrap())]
+        );
         assert_eq!(
             identity(&file.metadata().unwrap()),
             identity(&temporary.as_file().metadata().unwrap())
@@ -357,10 +368,7 @@ mod tests {
                     assert_eq!(phase.get(), 0);
                     assert_owned(&target);
                     assert_owned(&alias);
-                    assert_eq!(
-                        identity(&owned.metadata()?),
-                        identity(&target.metadata()?)
-                    );
+                    assert_eq!(identity(&owned.metadata()?), identity(&target.metadata()?));
                     owned.sync_all()?;
                     phase.set(1);
                     Ok(())
@@ -424,7 +432,9 @@ mod tests {
             file.read_exact_at(&mut bytes, 0).unwrap();
             let mut replayed = Vec::new();
             let report = WalReplayEngine::new(TailPolicy::FailFast)
-                .replay(&bytes[HEADER_SIZE..], 0, |record| replayed.push(record.clone()))
+                .replay(&bytes[HEADER_SIZE..], 0, |record| {
+                    replayed.push(record.clone())
+                })
                 .unwrap();
             assert!(report.outcome.is_clean());
             assert_eq!(replayed, records);
@@ -444,7 +454,12 @@ mod tests {
             assert_eq!(store.current_snapshot().high, CommitSeq(3));
             for (seq, byte) in [(1, 11), (2, 22), (3, 33)] {
                 assert_eq!(
-                    store.read_visible(BlockNumber(7), Snapshot { high: CommitSeq(seq) }),
+                    store.read_visible(
+                        BlockNumber(7),
+                        Snapshot {
+                            high: CommitSeq(seq)
+                        }
+                    ),
                     Some(vec![byte; 128])
                 );
             }
