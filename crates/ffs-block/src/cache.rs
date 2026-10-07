@@ -330,6 +330,15 @@ impl DirtyTracker {
         }
     }
 
+    /// Restore the committed obligation hidden by a staged write. Keep its
+    /// original identity and age: aborting a transaction is not a new write.
+    fn restore_entry(&mut self, block: BlockNumber, entry: DirtyEntry) {
+        self.clear_dirty_unconditional(block);
+        self.by_block.insert(block, entry);
+        self.by_age.insert((entry.seq, block));
+        self.dirty_bytes = self.dirty_bytes.saturating_add(entry.bytes);
+    }
+
     fn is_dirty(&self, block: BlockNumber) -> bool {
         self.by_block.contains_key(&block)
     }
@@ -695,6 +704,9 @@ struct ArcState {
     staged_txn_writes: HashMap<TxnId, HashMap<BlockNumber, Vec<u8>>>,
     /// Reverse map for staged payload ownership checks.
     staged_block_owner: HashMap<BlockNumber, TxnId>,
+    /// Committed dirty state temporarily hidden by an in-flight write. The
+    /// resident bytes remain the committed version until staging commits.
+    staged_previous_dirty: HashMap<BlockNumber, DirtyEntry>,
     /// Monotonic hit counter (resident data found).
     hits: u64,
     /// Monotonic miss counter (device read required).
@@ -782,6 +794,7 @@ impl ArcState {
             pending_flush: Vec::new(),
             staged_txn_writes: HashMap::new(),
             staged_block_owner: HashMap::new(),
+            staged_previous_dirty: HashMap::new(),
             hits: 0,
             misses: 0,
             evictions: 0,
@@ -2066,6 +2079,18 @@ impl ArcState {
             )));
         }
 
+        // Staging must not erase the obligation to flush the resident version.
+        // Repeated staging retains the saved entry, unless a direct write has
+        // since installed a newer committed resident (or made it clean).
+        match self.dirty.entry(block) {
+            Some(entry) if entry.is_flushable() => {
+                self.staged_previous_dirty.insert(block, entry);
+            }
+            None => {
+                self.staged_previous_dirty.remove(&block);
+            }
+            Some(_) => {}
+        }
         let payload = data.to_vec();
         self.staged_txn_writes
             .entry(txn_id)
@@ -3062,26 +3087,40 @@ impl<D: BlockDevice> ArcCache<D> {
         commit_seq: CommitSeq,
     ) -> Result<usize> {
         cx_checkpoint(cx)?;
-        let staged = {
-            let mut guard = self.state.lock();
-            guard.take_staged_txn(txn_id)
-        };
+        // Release staged ownership and publish every resident in one critical
+        // section. Another stager must not slip between those two transitions.
+        let mut guard = self.state.lock();
+        let staged = guard.take_staged_txn(txn_id);
         if staged.is_empty() {
             return Ok(0);
         }
 
+        #[cfg(feature = "s3fifo")]
+        let mutation_guard = self.begin_s3_fast_mutation();
+        #[cfg(feature = "s3fifo")]
+        let mut fast_inserts = Vec::with_capacity(staged.len());
         let mut enforce_backpressure = false;
         let mut committed_blocks = 0_usize;
-        let mut guard = self.state.lock();
         for (block, data) in staged {
+            guard.staged_previous_dirty.remove(&block);
             let payload = BlockBuf::new(data);
             let payload_len = payload.len();
             if guard.resident.contains_key(&block) {
-                guard.resident.insert(block, payload);
+                // Old fast entries may be waiting to publish outside the state
+                // lock. Revoke their identity, not only the current table slot.
+                #[cfg(feature = "s3fifo")]
+                if let Some(old) = guard.access_count.remove(&block) {
+                    old.invalidate();
+                    guard
+                        .access_count
+                        .insert(block, S3AccessHandle::new(old.load_count()));
+                    guard.fast_invalidations.push(block);
+                }
+                guard.resident.insert(block, payload.clone_ref());
                 guard.on_hit(block);
             } else {
                 guard.on_miss_or_ghost_hit(block);
-                guard.resident.insert(block, payload);
+                guard.resident.insert(block, payload.clone_ref());
             }
             guard.mark_dirty(
                 block,
@@ -3097,6 +3136,10 @@ impl<D: BlockDevice> ArcCache<D> {
                 commit_seq_opt = commit_seq.0,
                 state = "committed"
             );
+            #[cfg(feature = "s3fifo")]
+            if let Some(entry) = self.s3_fast_entry_for(&guard, block, &payload) {
+                fast_inserts.push((block, entry));
+            }
             committed_blocks += 1;
         }
 
@@ -3142,7 +3185,19 @@ impl<D: BlockDevice> ArcCache<D> {
         }
 
         let pending_flush = guard.take_pending_flush();
+        #[cfg(feature = "s3fifo")]
+        {
+            // Publish while the same state lock still pins these identities.
+            // Fast readers are excluded by mutation_guard until all are ready.
+            let invalidations = guard.take_fast_invalidations();
+            self.apply_s3_fast_resident_updates(invalidations, None);
+            for (block, entry) in fast_inserts {
+                self.s3_fast_residents.insert(block, entry);
+            }
+        }
         drop(guard);
+        #[cfg(feature = "s3fifo")]
+        drop(mutation_guard);
         self.flush_pending_evictions(cx, pending_flush)?;
 
         if enforce_backpressure {
@@ -3168,11 +3223,16 @@ impl<D: BlockDevice> ArcCache<D> {
             let staged = guard.take_staged_txn(txn_id);
             let mut discarded = Vec::new();
             for block in staged.keys() {
+                let previous = guard.staged_previous_dirty.remove(block);
                 let is_same_txn_inflight = guard.dirty.entry(*block).is_some_and(|entry| {
                     entry.txn_id == txn_id && matches!(entry.state, DirtyState::InFlight)
                 });
                 if is_same_txn_inflight {
-                    guard.clear_dirty_unconditional(*block);
+                    if let Some(previous) = previous {
+                        guard.dirty.restore_entry(*block, previous);
+                    } else {
+                        guard.clear_dirty_unconditional(*block);
+                    }
                     discarded.push(block.0);
                 }
             }
@@ -4061,3 +4121,7 @@ impl<D: BlockDevice> ArcCache<D> {
         self.state.lock().dirty_blocks()
     }
 }
+
+#[cfg(test)]
+#[path = "cache_transaction_tests.rs"]
+mod cache_transaction_tests;
