@@ -37,6 +37,10 @@ use std::io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::os::unix::fs::MetadataExt;
 use std::path::Path;
 
+#[path = "persist/checkpoint_reader.rs"]
+mod checkpoint_reader;
+use checkpoint_reader::load_checkpoint;
+
 /// Configuration options for persistent MVCC storage.
 #[derive(Debug, Clone)]
 pub struct PersistOptions {
@@ -141,8 +145,8 @@ impl Default for WalRecoveryReport {
 // | magic            | 4 bytes| = 0x4D56_4350 ("MVCP" LE scrambled)
 // | version          | 2 bytes| = 1
 // | reserved         | 2 bytes| = 0
-// | next_txn         | 8 bytes| next transaction ID
-// | next_commit      | 8 bytes| next commit sequence
+// | next_txn         | 8 bytes|
+// | next_commit      | 8 bytes|
 // | num_blocks       | 4 bytes| number of distinct blocks
 // +------------------+--------+
 // | For each block:           |
@@ -300,7 +304,7 @@ impl PersistentMvccStore {
 
         // Try to load checkpoint first
         if checkpoint_path.try_exists()? {
-            load_checkpoint(checkpoint_path, &mut store)?;
+            load_checkpoint(cx, checkpoint_path, &mut store)?;
             cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
             let ckpt_seq = store.next_commit.saturating_sub(1);
             stats.checkpoint_commit_seq = ckpt_seq;
@@ -958,168 +962,6 @@ fn validate_checkpoint_version(
             "dedup marker without a base version",
         ));
     }
-    Ok(())
-}
-
-/// Read a single block version from a checkpoint stream.
-fn read_block_version(
-    reader: &mut BufReader<File>,
-    hasher: &mut Crc32cHasher,
-    file_len: u64,
-    block: BlockNumber,
-    dedup: bool,
-    versions: &[BlockVersion],
-) -> Result<BlockVersion> {
-    let mut commit_seq_bytes = [0_u8; 8];
-    reader.read_exact(&mut commit_seq_bytes)?;
-    hasher.update(&commit_seq_bytes);
-    let commit_seq = CommitSeq(u64::from_le_bytes(commit_seq_bytes));
-
-    let mut txn_id_bytes = [0_u8; 8];
-    reader.read_exact(&mut txn_id_bytes)?;
-    hasher.update(&txn_id_bytes);
-    let txn_id = ffs_types::TxnId(u64::from_le_bytes(txn_id_bytes));
-
-    let mut data_len_bytes = [0_u8; 4];
-    reader.read_exact(&mut data_len_bytes)?;
-    hasher.update(&data_len_bytes);
-    let data_len_u32 = u32::from_le_bytes(data_len_bytes);
-
-    if data_len_u32 == u32::MAX {
-        return Ok(BlockVersion {
-            block,
-            commit_seq,
-            writer: txn_id,
-            data: crate::compression::VersionData::Identical,
-        });
-    }
-
-    let data_len = data_len_u32 as usize;
-
-    if data_len as u64 > file_len {
-        return Err(FfsError::Corruption {
-            block: 0,
-            detail: format!("checkpoint data_len {data_len} exceeds file size"),
-        });
-    }
-
-    let mut data = vec![0_u8; data_len];
-    reader.read_exact(&mut data)?;
-    hasher.update(&data);
-
-    let version_data = if dedup && !versions.is_empty() {
-        let last_idx = versions.len() - 1;
-        let is_identical =
-            crate::compression::resolve_data_with(versions, last_idx, |v: &BlockVersion| &v.data)
-                .as_deref()
-                == Some(data.as_slice());
-        if is_identical {
-            crate::compression::VersionData::Identical
-        } else {
-            crate::compression::VersionData::full(data)
-        }
-    } else {
-        crate::compression::VersionData::full(data)
-    };
-
-    Ok(BlockVersion {
-        block,
-        commit_seq,
-        writer: txn_id,
-        data: version_data,
-    })
-}
-
-/// Load a checkpoint from a file into an MvccStore.
-fn load_checkpoint(path: &Path, store: &mut MvccStore) -> Result<()> {
-    let file = File::open(path)?;
-    let file_len = file.metadata()?.len();
-    let mut reader = BufReader::new(file);
-    let mut hasher = Crc32cHasher::new();
-
-    // Read and validate header
-    let mut header = [0_u8; CHECKPOINT_HEADER_SIZE];
-    reader.read_exact(&mut header)?;
-    hasher.update(&header);
-
-    let magic = u32::from_le_bytes([header[0], header[1], header[2], header[3]]);
-    if magic != CHECKPOINT_MAGIC {
-        return Err(FfsError::Format(format!(
-            "checkpoint magic mismatch: expected {CHECKPOINT_MAGIC:#010x}, got {magic:#010x}"
-        )));
-    }
-
-    let version = u16::from_le_bytes([header[4], header[5]]);
-    if version != CHECKPOINT_VERSION {
-        return Err(FfsError::Format(format!(
-            "unsupported checkpoint version: {version}"
-        )));
-    }
-
-    let next_txn = u64::from_le_bytes([
-        header[8], header[9], header[10], header[11], header[12], header[13], header[14],
-        header[15],
-    ]);
-    let next_commit = u64::from_le_bytes([
-        header[16], header[17], header[18], header[19], header[20], header[21], header[22],
-        header[23],
-    ]);
-    let num_blocks = u32::from_le_bytes([header[24], header[25], header[26], header[27]]);
-
-    store.advance_counters(next_commit.saturating_sub(1), next_txn.saturating_sub(1));
-
-    let dedup = store.compression_policy().dedup_identical;
-
-    // Read blocks
-    for _ in 0..num_blocks {
-        let mut block_bytes = [0_u8; 8];
-        reader.read_exact(&mut block_bytes)?;
-        hasher.update(&block_bytes);
-        let block = BlockNumber(u64::from_le_bytes(block_bytes));
-
-        let mut num_versions_bytes = [0_u8; 4];
-        reader.read_exact(&mut num_versions_bytes)?;
-        hasher.update(&num_versions_bytes);
-        let num_versions = u32::from_le_bytes(num_versions_bytes);
-
-        let mut versions = Vec::with_capacity((num_versions as usize).min(1024));
-        for _ in 0..num_versions {
-            versions.push(read_block_version(
-                &mut reader,
-                &mut hasher,
-                file_len,
-                block,
-                dedup,
-                &versions,
-            )?);
-        }
-
-        store.insert_versions(block, versions);
-    }
-
-    // Verify CRC
-    let mut crc_bytes = [0_u8; 4];
-    reader.read_exact(&mut crc_bytes)?;
-    let stored_crc = u32::from_le_bytes(crc_bytes);
-    let computed_crc = hasher.finalize();
-
-    if stored_crc != computed_crc {
-        return Err(FfsError::Corruption {
-            block: 0,
-            detail: format!(
-                "checkpoint CRC mismatch: stored {stored_crc:#010x}, computed {computed_crc:#010x}"
-            ),
-        });
-    }
-
-    let mut trailing = [0_u8; 1];
-    if reader.read(&mut trailing)? != 0 {
-        return Err(FfsError::Corruption {
-            block: 0,
-            detail: "checkpoint has trailing bytes after CRC".to_owned(),
-        });
-    }
-
     Ok(())
 }
 
