@@ -36,7 +36,8 @@ fn checkpoint_directory_sync_precedes_horizon_and_holds_both_guards() {
             // The real file has been encoded, fsynced and renamed, but the
             // checkpoint must not yet authorize truncating its source WAL.
             let mut loaded = MvccStore::new();
-            load_checkpoint(&checkpoint, &mut loaded).expect("published checkpoint decodes");
+            load_checkpoint(&Cx::for_testing(), &checkpoint, &mut loaded)
+                .expect("published checkpoint decodes");
             assert_eq!(loaded.current_snapshot().high, CommitSeq(1));
             assert_eq!(store.wal_stats().checkpoint_commit_seq, 0);
             assert_eq!(store.wal_stats().checkpoints_created, 0);
@@ -249,7 +250,7 @@ fn checkpoint_preserves_an_unrelated_tmp_sibling() {
     store.checkpoint(&checkpoint).expect("checkpoint");
     assert_eq!(std::fs::read(&unrelated).unwrap(), sentinel);
     let mut loaded = MvccStore::new();
-    load_checkpoint(&checkpoint, &mut loaded).expect("valid checkpoint");
+    load_checkpoint(&Cx::for_testing(), &checkpoint, &mut loaded).expect("valid checkpoint");
     assert_eq!(loaded.current_snapshot().high, CommitSeq(1));
 }
 
@@ -272,7 +273,7 @@ fn bare_checkpoint_filename_uses_and_syncs_the_current_directory() {
         })
         .expect("bare filename must not silently skip directory sync");
     let mut loaded = MvccStore::new();
-    load_checkpoint(basename, &mut loaded).expect("read back local checkpoint");
+    load_checkpoint(&Cx::for_testing(), basename, &mut loaded).expect("read back local checkpoint");
     assert_eq!(loaded.current_snapshot().high, CommitSeq(1));
     assert_eq!(store.wal_stats().checkpoints_created, 1);
 }
@@ -389,7 +390,7 @@ fn checkpoint_stream_roundtrips_compression_dedup_and_genuinely_empty_versions()
     write_checkpoint(&mut bytes, 7, 7, &[(BlockNumber(7), &chain)]).unwrap();
     std::fs::write(&path, bytes).unwrap();
     let mut restored = MvccStore::new();
-    load_checkpoint(&path, &mut restored).unwrap();
+    load_checkpoint(&Cx::for_testing(), &path, &mut restored).unwrap();
     assert_eq!(restored.version_count(), 6);
     assert_eq!(restored.next_txn, 7);
     assert_eq!(restored.current_snapshot().high, CommitSeq(6));
@@ -445,7 +446,7 @@ fn checkpoint_stream_bounds_write_requests_and_handles_short_writes() {
     let path = directory.path().join("large.ckpt");
     std::fs::write(&path, sink.bytes).unwrap();
     let mut restored = MvccStore::new();
-    load_checkpoint(&path, &mut restored).unwrap();
+    load_checkpoint(&Cx::for_testing(), &path, &mut restored).unwrap();
     assert_eq!(
         restored
             .read_visible(BlockNumber(7), restored.current_snapshot())
