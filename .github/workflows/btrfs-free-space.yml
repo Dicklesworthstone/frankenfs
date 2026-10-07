@@ -14,7 +14,12 @@ permissions:
 jobs:
   validate:
     if: github.repository == 'Dicklesworthstone/frankenfs'
-    runs-on: ubuntu-latest
+    name: validate (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner: [ubuntu-latest, ubuntu-24.04-arm]
+    runs-on: ${{ matrix.runner }}
     timeout-minutes: 40
     # During this two-step integration, upload candidate Git blobs ONLY. The
     # reviewed source is published separately with a leased main-ref update.
@@ -142,7 +147,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: btrfs-cow-${{ github.sha }}
+          name: btrfs-cow-${{ github.sha }}-${{ matrix.runner }}
           if-no-files-found: warn
           path: |
             ${{ runner.temp }}/fst-*.json
