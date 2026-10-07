@@ -424,3 +424,307 @@ fn invalid_checkpoint_cannot_authorize_wal_tail_repair_or_skip_commits() {
         Some(vec![1; 128])
     );
 }
+
+// Inject transport events into the production decoder, then use the same
+// publication boundary as load_checkpoint against a real captured file.
+fn restore_from_reader(
+    cx: &Cx,
+    reader: &mut impl Read,
+    file: &File,
+    len: u64,
+    store: &mut MvccStore,
+) -> Result<()> {
+    let decoded = decode_checkpoint(cx, reader, len, false)?;
+    publish_checkpoint(cx, file, len, decoded, store)
+}
+
+struct FragmentedReader<'a> {
+    inner: Cursor<&'a [u8]>,
+    calls: usize,
+    max_request: usize,
+}
+
+impl Read for FragmentedReader<'_> {
+    fn read(&mut self, bytes: &mut [u8]) -> std::io::Result<usize> {
+        self.calls += 1;
+        self.max_request = self.max_request.max(bytes.len());
+        assert!(bytes.len() <= CHECKPOINT_IO_CHUNK_BYTES);
+        if self.calls.is_multiple_of(7) {
+            return Err(std::io::ErrorKind::Interrupted.into());
+        }
+        let len = bytes.len().min(17);
+        self.inner.read(&mut bytes[..len])
+    }
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum BoundaryAction {
+    CancelAfterRead,
+    CancelOnInterrupt,
+    IoError,
+    Eof,
+}
+
+struct BoundaryReader<'a> {
+    bytes: &'a [u8],
+    position: usize,
+    stop: usize,
+    max_read: usize,
+    action: BoundaryAction,
+    cx: &'a Cx,
+    fired: bool,
+}
+
+impl Read for BoundaryReader<'_> {
+    fn read(&mut self, output: &mut [u8]) -> std::io::Result<usize> {
+        assert!(!self.fired, "recovery performed another read after cancellation");
+        assert!(output.len() <= CHECKPOINT_IO_CHUNK_BYTES);
+        if self.position == self.stop {
+            return match self.action {
+                BoundaryAction::CancelOnInterrupt => {
+                    self.fired = true;
+                    self.cx.set_cancel_requested(true);
+                    Err(std::io::ErrorKind::Interrupted.into())
+                }
+                BoundaryAction::IoError => Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected checkpoint transport failure",
+                )),
+                BoundaryAction::Eof => Ok(0),
+                BoundaryAction::CancelAfterRead => {
+                    panic!("cancellation should have been observed before another read")
+                }
+            };
+        }
+        let count = output
+            .len()
+            .min(self.max_read)
+            .min(self.stop - self.position)
+            .min(self.bytes.len() - self.position);
+        output[..count].copy_from_slice(&self.bytes[self.position..self.position + count]);
+        self.position += count;
+        if self.position == self.stop && self.action == BoundaryAction::CancelAfterRead {
+            self.fired = true;
+            self.cx.set_cancel_requested(true);
+        }
+        Ok(count)
+    }
+}
+
+#[test]
+fn streamed_recovery_handles_short_reads_and_repeated_interruptions() {
+    let mut fixture = Fixture::valid();
+    let payload = vec![0x5A; 3 * CHECKPOINT_IO_CHUNK_BYTES + 17];
+    fixture.blocks[0].versions[0].data = Some(payload.clone());
+    let bytes = fixture.bytes();
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("fragmented.ckpt");
+    std::fs::write(&path, &bytes).unwrap();
+    let file = File::open(&path).unwrap();
+    let cx = Cx::for_testing();
+    let mut reader = FragmentedReader {
+        inner: Cursor::new(bytes.as_slice()),
+        calls: 0,
+        max_request: 0,
+    };
+    let mut store = MvccStore::new();
+    restore_from_reader(&cx, &mut reader, &file, bytes.len() as u64, &mut store).unwrap();
+    assert_eq!(reader.inner.position(), bytes.len() as u64);
+    assert_eq!(reader.max_request, CHECKPOINT_IO_CHUNK_BYTES);
+    assert!(reader.calls > bytes.len() / 17);
+    assert_eq!(store.current_snapshot().high, CommitSeq(3));
+    assert_eq!(store.version_count(), 3);
+    assert_eq!(
+        store
+            .read_visible(BlockNumber(7), Snapshot { high: CommitSeq(1) })
+            .as_deref(),
+        Some(payload.as_slice())
+    );
+    assert_eq!(
+        store
+            .read_visible(BlockNumber(8), store.current_snapshot())
+            .as_deref(),
+        Some(&[3; 128][..])
+    );
+}
+
+#[test]
+fn cancellation_after_every_byte_boundary_never_publishes_partial_state() {
+    let bytes = Fixture::valid().bytes();
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("cancel.ckpt");
+    std::fs::write(&path, &bytes).unwrap();
+    let file = File::open(&path).unwrap();
+    // Include the last CRC byte: even a fully decoded file must not publish
+    // after cancellation. No scheduler races or sleeps are needed here.
+    for stop in 1..=bytes.len() {
+        let cx = Cx::for_testing();
+        let mut reader = BoundaryReader {
+            bytes: &bytes,
+            position: 0,
+            stop,
+            max_read: 17,
+            action: BoundaryAction::CancelAfterRead,
+            cx: &cx,
+            fired: false,
+        };
+        let mut store = seed_store();
+        let error = restore_from_reader(&cx, &mut reader, &file, bytes.len() as u64, &mut store)
+            .expect_err("cancelled transport must not publish");
+        assert!(matches!(error, FfsError::Cancelled), "stop={stop}: {error:?}");
+        assert_eq!(reader.position, stop);
+        assert!(reader.fired);
+        assert_seed_unchanged(&store);
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn cancelled_interrupted_read_is_not_retried() {
+    let bytes = Fixture::valid().bytes();
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("interrupted.ckpt");
+    std::fs::write(&path, &bytes).unwrap();
+    let file = File::open(&path).unwrap();
+    for stop in [0, 1, 28, 60, 188, bytes.len() - 4, bytes.len() - 1] {
+        let cx = Cx::for_testing();
+        let mut reader = BoundaryReader {
+            bytes: &bytes,
+            position: 0,
+            stop,
+            max_read: CHECKPOINT_IO_CHUNK_BYTES,
+            action: BoundaryAction::CancelOnInterrupt,
+            cx: &cx,
+            fired: false,
+        };
+        let mut store = seed_store();
+        let error = restore_from_reader(&cx, &mut reader, &file, bytes.len() as u64, &mut store)
+            .expect_err("EINTR retry must observe cancellation");
+        assert!(matches!(error, FfsError::Cancelled));
+        assert_eq!(reader.position, stop);
+        assert!(reader.fired);
+        assert_seed_unchanged(&store);
+    }
+}
+
+#[test]
+fn transport_errors_and_eof_at_every_byte_are_not_discardable_tails() {
+    let bytes = Fixture::valid().bytes();
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("io.ckpt");
+    std::fs::write(&path, &bytes).unwrap();
+    let file = File::open(&path).unwrap();
+    for action in [BoundaryAction::IoError, BoundaryAction::Eof] {
+        for stop in 0..bytes.len() {
+            let cx = Cx::for_testing();
+            let mut reader = BoundaryReader {
+                bytes: &bytes,
+                position: 0,
+                stop,
+                max_read: 17,
+                action,
+                cx: &cx,
+                fired: false,
+            };
+            let mut store = seed_store();
+            let error = restore_from_reader(&cx, &mut reader, &file, bytes.len() as u64, &mut store)
+                .expect_err("transport failure must remain an error");
+            let FfsError::Io(error) = error else {
+                panic!("expected original I/O classification at {stop}, got {error:?}");
+            };
+            assert_eq!(
+                error.kind(),
+                if action == BoundaryAction::IoError {
+                    std::io::ErrorKind::PermissionDenied
+                } else {
+                    std::io::ErrorKind::UnexpectedEof
+                }
+            );
+            assert_eq!(reader.position, stop);
+            assert_seed_unchanged(&store);
+        }
+    }
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+}
+
+#[test]
+fn large_payload_cancellation_stops_at_chunk_and_trailer_boundaries() {
+    let mut fixture = Fixture::valid();
+    fixture.blocks[0].versions[0].data = Some(vec![0x5A; 3 * CHECKPOINT_IO_CHUNK_BYTES + 17]);
+    let bytes = fixture.bytes();
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("large-cancel.ckpt");
+    std::fs::write(&path, &bytes).unwrap();
+    let file = File::open(&path).unwrap();
+    for stop in [
+        60 + CHECKPOINT_IO_CHUNK_BYTES - 1,
+        60 + CHECKPOINT_IO_CHUNK_BYTES,
+        60 + CHECKPOINT_IO_CHUNK_BYTES + 1,
+        60 + 2 * CHECKPOINT_IO_CHUNK_BYTES,
+        bytes.len() - 4,
+        bytes.len(),
+    ] {
+        let cx = Cx::for_testing();
+        let mut reader = BoundaryReader {
+            bytes: &bytes,
+            position: 0,
+            stop,
+            max_read: CHECKPOINT_IO_CHUNK_BYTES,
+            action: BoundaryAction::CancelAfterRead,
+            cx: &cx,
+            fired: false,
+        };
+        let mut store = seed_store();
+        assert!(matches!(
+            restore_from_reader(&cx, &mut reader, &file, bytes.len() as u64, &mut store),
+            Err(FfsError::Cancelled)
+        ));
+        assert_eq!(reader.position, stop);
+        assert_seed_unchanged(&store);
+    }
+}
+
+#[test]
+fn cancellation_between_decode_and_publication_keeps_the_history_private() {
+    let bytes = Fixture::valid().bytes();
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("publication-cancel.ckpt");
+    std::fs::write(&path, &bytes).unwrap();
+    let file = File::open(&path).unwrap();
+    let cx = Cx::for_testing();
+    let decoded = decode_checkpoint(&cx, &mut bytes.as_slice(), bytes.len() as u64, false).unwrap();
+    cx.set_cancel_requested(true);
+    let mut store = seed_store();
+    assert!(matches!(
+        publish_checkpoint(&cx, &file, bytes.len() as u64, decoded, &mut store),
+        Err(FfsError::Cancelled)
+    ));
+    assert_seed_unchanged(&store);
+}
+
+#[test]
+fn changed_checkpoint_length_blocks_publication_without_state_changes() {
+    let bytes = Fixture::valid().bytes();
+    let directory = tempdir().unwrap();
+    let path = directory.path().join("changed.ckpt");
+    let captured = bytes.len() as u64;
+    for changed_len in [0, captured - 1, captured + 1] {
+        std::fs::write(&path, &bytes).unwrap();
+        let file = File::open(&path).unwrap();
+        let cx = Cx::for_testing();
+        let decoded = decode_checkpoint(&cx, &mut bytes.as_slice(), captured, false).unwrap();
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_len(changed_len)
+            .unwrap();
+        let changed = std::fs::read(&path).unwrap();
+        let mut store = seed_store();
+        let error = publish_checkpoint(&cx, &file, captured, decoded, &mut store).unwrap_err();
+        assert!(matches!(&error, FfsError::Io(_)));
+        assert!(error.to_string().contains("length changed during recovery"));
+        assert_seed_unchanged(&store);
+        assert_eq!(std::fs::read(&path).unwrap(), changed);
+    }
+}

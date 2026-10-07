@@ -27,6 +27,50 @@ fn checkpoint(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FfsError::Cancelled)
 }
 
+/// Do not hide retries inside Read::read_exact: an interrupted device may keep
+/// returning EINTR after cancellation. Check the caller before every retry and
+/// after every successful read, including the final checksum bytes.
+fn read_checkpoint_exact(cx: &Cx, reader: &mut impl Read, mut bytes: &mut [u8]) -> Result<()> {
+    while !bytes.is_empty() {
+        checkpoint(cx)?;
+        let requested = bytes.len().min(CHECKPOINT_IO_CHUNK_BYTES);
+        match reader.read(&mut bytes[..requested]) {
+            Ok(0) => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::UnexpectedEof,
+                    "checkpoint ended during recovery",
+                )
+                .into());
+            }
+            Ok(count) => {
+                checkpoint(cx)?;
+                bytes = &mut bytes[count..];
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    checkpoint(cx)
+}
+
+fn same_payload(cx: &Cx, left: &[u8], right: &[u8]) -> Result<bool> {
+    checkpoint(cx)?;
+    if left.len() != right.len() {
+        return Ok(false);
+    }
+    for (left, right) in left
+        .chunks(CHECKPOINT_IO_CHUNK_BYTES)
+        .zip(right.chunks(CHECKPOINT_IO_CHUNK_BYTES))
+    {
+        checkpoint(cx)?;
+        if left != right {
+            return Ok(false);
+        }
+    }
+    checkpoint(cx)?;
+    Ok(true)
+}
+
 pub(super) fn load_checkpoint(cx: &Cx, path: &Path, store: &mut MvccStore) -> Result<()> {
     checkpoint(cx)?;
     let file = File::open(path)?;
@@ -82,6 +126,7 @@ fn publish_checkpoint(
 /// Counts are bounded by their minimum encoded sizes before reserving memory.
 /// The trailer is never part of the available payload budget.
 struct Decoder<'a, R> {
+    cx: &'a Cx,
     reader: &'a mut R,
     remaining: u64,
     hasher: Crc32cHasher,
@@ -95,6 +140,7 @@ impl<R: Read> Decoder<'_, R> {
     }
 
     fn read_into(&mut self, bytes: &mut [u8]) -> Result<()> {
+        checkpoint(self.cx)?;
         let len = u64::try_from(bytes.len())
             .map_err(|_| checkpoint_corruption(BlockNumber(0), "read size overflow"))?;
         if len > self.remaining {
@@ -103,13 +149,14 @@ impl<R: Read> Decoder<'_, R> {
                 "fields exceed checkpoint body",
             ));
         }
-        self.reader.read_exact(bytes)?;
+        read_checkpoint_exact(self.cx, self.reader, bytes)?;
         self.hasher.update(bytes);
         self.remaining -= len;
         Ok(())
     }
 
     fn payload(&mut self, block: BlockNumber, len: u32, reserved: u64) -> Result<Vec<u8>> {
+        checkpoint(self.cx)?;
         if self
             .remaining
             .checked_sub(reserved)
@@ -126,6 +173,7 @@ impl<R: Read> Decoder<'_, R> {
         // untrusted length field up front. Memory still holds the decoded state.
         let mut data = Vec::new();
         while data.len() < len {
+            checkpoint(self.cx)?;
             let step = (len - data.len()).min(CHECKPOINT_IO_CHUNK_BYTES);
             data.try_reserve(step).map_err(allocation_error)?;
             let start = data.len();
@@ -136,6 +184,7 @@ impl<R: Read> Decoder<'_, R> {
     }
 
     fn finish(self) -> Result<()> {
+        checkpoint(self.cx)?;
         if self.remaining != 0 {
             return Err(checkpoint_corruption(
                 BlockNumber(0),
@@ -143,7 +192,7 @@ impl<R: Read> Decoder<'_, R> {
             ));
         }
         let mut bytes = [0; 4];
-        self.reader.read_exact(&mut bytes)?;
+        read_checkpoint_exact(self.cx, self.reader, &mut bytes)?;
         let stored = u32::from_le_bytes(bytes);
         let computed = self.hasher.finalize();
         if stored != computed {
@@ -181,6 +230,7 @@ fn decode_checkpoint(
             )
         })?;
     let mut decoder = Decoder {
+        cx,
         reader,
         remaining: body_len,
         hasher: Crc32cHasher::new(),
@@ -291,11 +341,15 @@ fn decode_chain(
             let data = decoder.payload(block, data_len, reserved)?;
             // Resolve only the last concrete version. Walking backward over
             // an ever-growing run of dedup markers would be quadratic.
-            let identical = dedup
-                && last_concrete.is_some_and(|last| {
-                    resolve_data_with(&versions, last, |v: &BlockVersion| &v.data).as_deref()
-                        == Some(data.as_slice())
-                });
+            let identical = if dedup
+                && let Some(last) = last_concrete
+            {
+                let previous = resolve_data_with(&versions, last, |v: &BlockVersion| &v.data)
+                    .ok_or_else(|| checkpoint_corruption(block, "dedup base is unreadable"))?;
+                same_payload(decoder.cx, &previous, &data)?
+            } else {
+                false
+            };
             version.data = if identical {
                 VersionData::Identical
             } else {
