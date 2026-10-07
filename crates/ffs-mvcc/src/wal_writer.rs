@@ -850,7 +850,7 @@ impl WalWriter {
     }
 
     fn maybe_verify_coalesced_write(
-        &mut self,
+        &self,
         base_offset: u64,
         coalesced_buf: &[u8],
         op_id: u64,
@@ -1816,7 +1816,7 @@ mod tests {
         let report =
             crate::wal_replay::WalReplayEngine::new(crate::wal_replay::TailPolicy::FailFast)
                 .replay(&bytes[HEADER_SIZE..], 0, |commit| {
-                    replayed.push(commit.clone())
+                    replayed.push(commit.clone());
                 })
                 .unwrap();
         assert!(report.outcome.is_clean());
@@ -1892,7 +1892,7 @@ mod tests {
     fn verification_range_overflow_is_rejected_before_readback() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("overflow.wal");
-        let mut writer = WalWriter::create(&path, WalWriterConfig::default()).unwrap();
+        let writer = WalWriter::create(&path, WalWriterConfig::default()).unwrap();
         let prefix = std::fs::read(&path).unwrap();
         assert!(matches!(
             writer.verify_written_record(u64::MAX, &[1], 0),

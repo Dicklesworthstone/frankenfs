@@ -433,7 +433,7 @@ mod tests {
             let mut replayed = Vec::new();
             let report = WalReplayEngine::new(TailPolicy::FailFast)
                 .replay(&bytes[HEADER_SIZE..], 0, |record| {
-                    replayed.push(record.clone())
+                    replayed.push(record.clone());
                 })
                 .unwrap();
             assert!(report.outcome.is_clean());
