@@ -49,8 +49,9 @@ jobs:
           test "$(git hash-object crates/ffs-core/tests/btrfs_commit_crash_window.rs)" = dd65296f369eef052755e19cf3c8aab7c51ced08
           gh api "repos/$GITHUB_REPOSITORY/git/blobs/$PATCH_SHA" --jq .content | base64 --decode > "$RUNNER_TEMP/fst.patch"
           test "$(git hash-object "$RUNNER_TEMP/fst.patch")" = "$PATCH_SHA"
-          git apply --check --index "$RUNNER_TEMP/fst.patch"
-          git apply --index "$RUNNER_TEMP/fst.patch"
+          # This exact, hash-bound patch has hunks without trailing context.
+          git apply --check --index --unidiff-zero "$RUNNER_TEMP/fst.patch"
+          git apply --index --unidiff-zero "$RUNNER_TEMP/fst.patch"
           git diff --cached --check
           git diff --cached --stat
 
