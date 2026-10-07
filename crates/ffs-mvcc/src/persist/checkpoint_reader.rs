@@ -366,4 +366,5 @@ fn decode_chain(
 }
 
 #[cfg(test)]
+#[path = "checkpoint_reader/tests.rs"]
 mod tests;
