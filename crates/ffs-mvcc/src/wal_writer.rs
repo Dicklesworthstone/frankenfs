@@ -1,9 +1,9 @@
 //! Append-only WAL writer with integrity checks, sync policy, and backpressure.
 //!
 //! This module provides [`WalWriter`], the write-path counterpart to the WAL
-//! replay engine in [`crate::persist`].  It encodes commit records, appends
-//! them atomically, optionally verifies the written data by reading back, and
-//! manages durability boundaries according to a configurable [`SyncPolicy`].
+//! replay engine in [`crate::persist`]. It streams commit records through bounded
+//! buffers, optionally verifies every written byte, and manages durability
+//! boundaries according to a configurable [`SyncPolicy`].
 //!
 //! # Error Classification
 //!
@@ -20,7 +20,7 @@
 //!
 //! - **D1:** Commit sequence is strictly increasing (monotonicity).
 //! - **D8:** Reserved sentinel values (`u64::MAX`) are rejected.
-//! - Per-record CRC32C integrity (via [`crate::wal::encode_commit`]).
+//! - Per-record CRC32C integrity, byte-compatible with [`crate::wal::encode_commit`].
 
 use crate::wal::{self, HEADER_SIZE, WalCommit, WalHeader};
 use ffs_error::{FfsError, Result};
@@ -28,26 +28,34 @@ use std::fs::File;
 #[cfg(test)]
 use std::fs::OpenOptions;
 use std::io::Write;
+#[cfg(test)]
 use std::os::unix::fs::FileExt;
 use std::path::Path;
-use tracing::{debug, error, info, warn};
+#[cfg(test)]
+use tracing::debug;
+use tracing::{error, info};
 
+#[cfg(test)]
 type CoalescedRecordOffsets = Vec<(usize, usize)>;
+#[cfg(test)]
 type EncodedCoalescedBatch = (Vec<u8>, CoalescedRecordOffsets);
 
 /// Bound readback memory independently of record and coalesced-batch size.
+#[cfg(test)]
 const WAL_VERIFY_CHUNK_BYTES: usize = 64 * 1024;
 
 #[path = "wal_writer/namespace.rs"]
 mod namespace;
 pub(crate) use namespace::open_owned_wal;
+#[path = "wal_writer/stream.rs"]
+mod stream;
 
 // ── Error types ──────────────────────────────────────────────────────────────
 
 /// Classified error for WAL write operations.
 ///
 /// Each variant carries enough context to decide whether to retry, abort, or
-/// escalate.  Use [`is_retryable`](WalWriteError::is_retryable) and
+/// escalate. Use [`is_retryable`](WalWriteError::is_retryable) and
 /// [`is_fatal`](WalWriteError::is_fatal) for programmatic triage.
 #[derive(Debug)]
 pub enum WalWriteError {
@@ -246,7 +254,7 @@ pub struct AppendResult {
 ///
 /// # Thread safety
 ///
-/// `WalWriter` is **not** `Sync`.  In [`crate::persist::PersistentMvccStore`],
+/// `WalWriter` is **not** `Sync`. In [`crate::persist::PersistentMvccStore`],
 /// it is wrapped in `RwLock<WalWriter>` so that only one writer can append at
 /// a time while readers can query metadata concurrently.
 #[derive(Debug)]
@@ -329,178 +337,22 @@ impl WalWriter {
 
     /// Append a commit record to the WAL.
     ///
-    /// The record is encoded with CRC32C integrity, appended at the current
-    /// write position, and optionally synced according to the configured
-    /// [`SyncPolicy`].
+    /// Preflight all wire widths and the final offset before I/O, then stream
+    /// the v1 encoding through at most 64 KiB of scratch. Verification uses one
+    /// additional bounded buffer and compares every byte after all writes.
     ///
-    /// # Reasoning mode: append-only + strict-monotonic + atomic-rollback (bd-chmw4)
-    ///
-    /// This function implements an **append-only WAL with a strict-
-    /// monotonic sequence check and atomic-rollback on any failure
-    /// between encoded write and synced state**. The three modes
-    /// compose as follows:
-    ///
-    /// * **Append-only**: writes always go to `self.write_pos`; the
-    ///   file is never overwritten in place. The only function that
-    ///   reduces `write_pos` is rollback (here and in
-    ///   `rollback_failed_append`) or the explicit
-    ///   `truncate_wal` after a successful checkpoint.
-    /// * **Strict monotonic**: D1 below — `commit_seq` MUST be
-    ///   strictly greater than `last_commit_seq`. Equality is a
-    ///   FormatViolation. Replay relies on this to detect WAL
-    ///   tampering.
-    /// * **Atomic-rollback**: append, verification, and sync failures all
-    ///   use `rollback_failed_append`. It truncates AND syncs the rollback
-    ///   before permitting another append. If either step fails, the
-    ///   writer is sealed with `RecoveryRequired`: a complete, CRC-valid
-    ///   record may remain on disk despite not being acknowledged in memory.
-    ///
-    /// Any new failure path inserted between `raw_append` and the
-    /// final assignment MUST call `rollback_failed_append` before returning
-    /// Err. A failed rollback has an indeterminate commit outcome; only
-    /// reopening and replaying the WAL can resolve it.
-    ///
-    /// # Monotonicity (D1)
-    ///
-    /// The commit's `commit_seq` must be strictly greater than any previously
-    /// appended commit (unless this is the first append).  Violations return
-    /// [`WalWriteError::FormatViolation`].
-    ///
-    /// # Sentinel rejection (D8)
-    ///
-    /// `commit_seq == u64::MAX` or `txn_id == u64::MAX` are rejected.
-    ///
-    /// # Errors
+    /// Commit sequence must increase strictly and neither sequence nor
+    /// transaction ID may be `u64::MAX`. Append, verification, and sync failures
+    /// durably roll back the WHOLE record, not merely its most recent chunk.
+    /// A failed rollback seals the writer until reopen and recovery.
     ///
     /// Returns a classified [`WalWriteError`] distinguishing retryable I/O
     /// failures from fatal format/invariant violations.
-    #[expect(clippy::too_many_lines)]
     pub fn append_commit(
         &mut self,
         commit: &WalCommit,
     ) -> std::result::Result<AppendResult, WalWriteError> {
-        self.ensure_ready()?;
-        let op_id = self.next_op_id();
-        let commit_seq = commit.commit_seq.0;
-        let txn_id = commit.txn_id.0;
-        let num_writes = commit.writes.len();
-
-        debug!(
-            operation_id = op_id,
-            commit_seq, txn_id, num_writes, "wal_append_start"
-        );
-
-        // ── D8: reject reserved sentinels ────────────────────────────────
-        if commit_seq == u64::MAX || txn_id == u64::MAX {
-            error!(
-                operation_id = op_id,
-                commit_seq,
-                txn_id,
-                error_class = "format_violation",
-                "wal_append_rejected_sentinel"
-            );
-            return Err(WalWriteError::FormatViolation {
-                detail: "reserved sentinel value (u64::MAX) in commit_seq or txn_id".to_owned(),
-            });
-        }
-
-        // ── D1: enforce strict monotonicity ──────────────────────────────
-        if commit_seq <= self.last_commit_seq {
-            error!(
-                operation_id = op_id,
-                commit_seq,
-                last_commit_seq = self.last_commit_seq,
-                error_class = "format_violation",
-                "wal_append_rejected_monotonicity"
-            );
-            return Err(WalWriteError::FormatViolation {
-                detail: format!(
-                    "commit_seq {commit_seq} is not strictly greater than last appended {}",
-                    self.last_commit_seq,
-                ),
-            });
-        }
-
-        // ── Backpressure check ───────────────────────────────────────────
-        if self.config.backpressure_threshold_bytes > 0
-            && self.write_pos >= self.config.backpressure_threshold_bytes
-        {
-            warn!(
-                operation_id = op_id,
-                wal_size = self.write_pos,
-                threshold = self.config.backpressure_threshold_bytes,
-                "wal_backpressure"
-            );
-            return Err(WalWriteError::Backpressure {
-                wal_size: self.write_pos,
-                threshold: self.config.backpressure_threshold_bytes,
-            });
-        }
-
-        // ── Encode ───────────────────────────────────────────────────────
-        let encoded = wal::encode_commit(commit).map_err(|e| WalWriteError::FormatViolation {
-            detail: format!("failed to encode commit: {e}"),
-        })?;
-        let bytes_len = encoded.len();
-        let bytes_written =
-            u64::try_from(bytes_len).map_err(|_| WalWriteError::FormatViolation {
-                detail: "commit length exceeds u64 capacity".into(),
-            })?;
-        let write_offset = self.write_pos;
-
-        // ── Append ───────────────────────────────────────────────────────
-        #[cfg(test)]
-        if self.fail_append {
-            return Err(WalWriteError::AppendIo {
-                source: std::io::Error::other("injected append failure"),
-                bytes_attempted: bytes_len,
-            });
-        }
-
-        self.raw_append(&encoded).inspect_err(|e| {
-            error!(
-                operation_id = op_id,
-                commit_seq,
-                bytes_attempted = bytes_len,
-                error_class = "append_io",
-                error = %e,
-                "wal_append_err"
-            );
-        })?;
-
-        // ── Optional write verification ──────────────────────────────────
-        if self.config.verify_writes
-            && let Err(e) = self.verify_written_record(write_offset, &encoded, op_id)
-        {
-            return Err(self.rollback_failed_append(write_offset, self.appends_since_sync, e));
-        }
-
-        // ── Sync policy ──────────────────────────────────────────────────
-        let pending_before = self.appends_since_sync;
-        self.increment_pending_sync_count(1);
-        let synced = match self.maybe_sync(op_id, commit_seq) {
-            Ok(s) => s,
-            Err(e) => return Err(self.rollback_failed_append(write_offset, pending_before, e)),
-        };
-
-        self.last_commit_seq = commit_seq;
-
-        info!(
-            operation_id = op_id,
-            commit_seq,
-            txn_id,
-            bytes_written,
-            offset = write_offset,
-            synced,
-            "wal_append_ok"
-        );
-
-        Ok(AppendResult {
-            offset: write_offset,
-            bytes_written,
-            synced,
-            pending_sync_count: if synced { 0 } else { self.appends_since_sync },
-        })
+        self.append_one_streamed(commit)
     }
 
     /// Force-sync all pending writes to disk.
@@ -625,109 +477,22 @@ impl WalWriter {
         self.last_commit_seq = seq;
     }
 
-    /// Append multiple commit records as a single coalesced write + sync.
+    /// Append multiple commit records with coalesced bounded writes and one
+    /// sync-policy decision. Small batches still use one contiguous write;
+    /// larger batches no longer allocate a copy of the entire encoded batch.
     ///
-    /// Encodes all commits, writes them as a single contiguous I/O, and
-    /// syncs once. This amortizes the per-commit overhead of separate
-    /// `write_all` and `fsync` calls.
-    ///
-    /// All invariants (D1 monotonicity, D8 sentinel rejection, backpressure)
-    /// are checked per-commit before any bytes are written. If any commit
-    /// fails validation, no commits are written.
+    /// All record invariants, wire widths, offsets, and result allocations are
+    /// validated before I/O. Any append, verification, or sync failure rolls
+    /// back the entire batch. Failed rollback requires reopen and recovery.
     ///
     /// Returns one `AppendResult` per commit, all sharing the same `synced`
-    /// status.
+    /// status. Scratch space is bounded independently of payload size; record
+    /// layout and result metadata remain proportional to the number of commits.
     pub fn append_commits_coalesced(
         &mut self,
         commits: &[WalCommit],
     ) -> std::result::Result<Vec<AppendResult>, WalWriteError> {
-        self.ensure_ready()?;
-        if commits.is_empty() {
-            return Ok(Vec::new());
-        }
-
-        // For a single commit, delegate to the standard path.
-        if commits.len() == 1 {
-            return self.append_commit(&commits[0]).map(|r| vec![r]);
-        }
-
-        let op_id = self.next_op_id();
-
-        let prev_seq = self.validate_coalesced_commits(commits)?;
-
-        // ── Backpressure check ────────────────────────────────────────────
-        if self.config.backpressure_threshold_bytes > 0
-            && self.write_pos >= self.config.backpressure_threshold_bytes
-        {
-            return Err(WalWriteError::Backpressure {
-                wal_size: self.write_pos,
-                threshold: self.config.backpressure_threshold_bytes,
-            });
-        }
-
-        let (coalesced_buf, record_offsets) = Self::encode_coalesced_commits(commits)?;
-
-        let total_bytes = coalesced_buf.len();
-        let base_offset = self.write_pos;
-
-        debug!(
-            operation_id = op_id,
-            num_commits = commits.len(),
-            total_bytes,
-            "wal_coalesced_append_start"
-        );
-
-        // ── Single coalesced write ────────────────────────────────────────
-        #[cfg(test)]
-        if self.fail_append {
-            return Err(WalWriteError::AppendIo {
-                source: std::io::Error::other("injected append failure"),
-                bytes_attempted: total_bytes,
-            });
-        }
-
-        self.raw_append(&coalesced_buf).inspect_err(|e| {
-            error!(
-                operation_id = op_id,
-                bytes_attempted = total_bytes,
-                error_class = "append_io",
-                error = %e,
-                "wal_coalesced_append_err"
-            );
-        })?;
-
-        self.verify_or_rollback_coalesced_write(base_offset, &coalesced_buf, op_id)?;
-
-        // ── Single sync ───────────────────────────────────────────────────
-        let pending_before = self.appends_since_sync;
-        self.increment_pending_sync_count(u32::try_from(commits.len()).unwrap_or(u32::MAX));
-        let synced = match self.maybe_sync(op_id, prev_seq) {
-            Ok(s) => s,
-            Err(e) => return Err(self.rollback_failed_append(base_offset, pending_before, e)),
-        };
-
-        self.last_commit_seq = prev_seq;
-
-        // ── Build per-commit results ──────────────────────────────────────
-        let results = record_offsets
-            .iter()
-            .map(|&(rel_offset, bytes_len)| AppendResult {
-                offset: base_offset + rel_offset as u64,
-                bytes_written: bytes_len as u64,
-                synced,
-                pending_sync_count: if synced { 0 } else { self.appends_since_sync },
-            })
-            .collect();
-
-        info!(
-            operation_id = op_id,
-            num_commits = commits.len(),
-            total_bytes,
-            synced,
-            "wal_coalesced_append_ok"
-        );
-
-        Ok(results)
+        self.append_many_streamed(commits)
     }
 
     /// Borrow the writer configuration.
@@ -818,6 +583,9 @@ impl WalWriter {
         Ok(prev_seq)
     }
 
+    // Retain the original Vec-based helpers only as independent regression
+    // oracles and fault-injection entry points. Production uses stream.rs.
+    #[cfg(test)]
     fn encode_coalesced_commits(
         commits: &[WalCommit],
     ) -> std::result::Result<EncodedCoalescedBatch, WalWriteError> {
@@ -837,6 +605,7 @@ impl WalWriter {
         Ok((coalesced_buf, record_offsets))
     }
 
+    #[cfg(test)]
     fn verify_or_rollback_coalesced_write(
         &mut self,
         base_offset: u64,
@@ -849,6 +618,7 @@ impl WalWriter {
         Ok(())
     }
 
+    #[cfg(test)]
     fn maybe_verify_coalesced_write(
         &self,
         base_offset: u64,
@@ -861,6 +631,7 @@ impl WalWriter {
         Ok(())
     }
 
+    #[cfg(test)]
     fn raw_append(&mut self, data: &[u8]) -> std::result::Result<(), WalWriteError> {
         // Validate BEFORE I/O. A preflight error must not trigger a truncate
         // to an invalid offset (which could extend, rather than shrink, a WAL).
@@ -888,8 +659,8 @@ impl WalWriter {
         Ok(())
     }
 
+    #[cfg(test)]
     fn write_append_bytes(&self, data: &[u8]) -> std::io::Result<()> {
-        #[cfg(test)]
         if let Some(limit) = self.fail_append_after {
             self.file
                 .write_all_at(&data[..limit.min(data.len())], self.write_pos)?;
@@ -900,6 +671,7 @@ impl WalWriter {
         self.file.write_all_at(data, self.write_pos)
     }
 
+    #[cfg(test)]
     fn verify_written_record(
         &self,
         offset: u64,
