@@ -24,7 +24,9 @@
 
 use crate::wal::{self, HEADER_SIZE, WalCommit, WalHeader};
 use ffs_error::{FfsError, Result};
-use std::fs::{File, OpenOptions};
+use std::fs::File;
+#[cfg(test)]
+use std::fs::OpenOptions;
 use std::io::Write;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
@@ -36,27 +38,9 @@ type EncodedCoalescedBatch = (Vec<u8>, CoalescedRecordOffsets);
 /// Bound readback memory independently of record and coalesced-batch size.
 const WAL_VERIFY_CHUNK_BYTES: usize = 64 * 1024;
 
-/// Acquire the WAL inode before inspecting recovery state or changing bytes.
-/// The returned descriptor retains the advisory lock until its last clone is
-/// closed. Never use O_TRUNC here: a contending opener must not erase the log
-/// before discovering that another writer owns it. Path replacement and
-/// non-cooperating writers remain outside this single-host ownership protocol.
-pub(crate) fn open_owned_wal(path: &Path) -> Result<File> {
-    let file = OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(path)?;
-    file.try_lock().map_err(|error| match error {
-        std::fs::TryLockError::WouldBlock => std::io::Error::new(
-            std::io::ErrorKind::WouldBlock,
-            format!("WAL is already owned by another writer: {}", path.display()),
-        ),
-        std::fs::TryLockError::Error(error) => error,
-    })?;
-    Ok(file)
-}
+#[path = "wal_writer/namespace.rs"]
+mod namespace;
+pub(crate) use namespace::open_owned_wal;
 
 // ── Error types ──────────────────────────────────────────────────────────────
 
