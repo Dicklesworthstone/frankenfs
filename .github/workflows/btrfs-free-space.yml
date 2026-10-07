@@ -1,0 +1,154 @@
+name: Btrfs free-space CoW
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/btrfs-free-space.yml'
+      - 'crates/ffs-core/src/btrfs_free_space.rs'
+      - 'crates/ffs-core/src/btrfs_free_space/**'
+
+permissions:
+  contents: read
+
+jobs:
+  validate:
+    if: github.repository == 'Dicklesworthstone/frankenfs'
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    # During this two-step integration, upload candidate Git blobs ONLY. The
+    # reviewed source is published separately with a leased main-ref update.
+    # This job never creates a commit, changes a ref, or opens a pull request.
+    permissions:
+      contents: write
+    env:
+      CARGO_TERM_COLOR: never
+      CARGO_BUILD_JOBS: '2'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      RUST_BACKTRACE: '1'
+      FFS_REQUIRE_ORACLES: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Apply the reviewed commit-path integration to exact input blobs
+        env:
+          GH_TOKEN: ${{ github.token }}
+          PATCH_SHA: 0add37f38cbc2d4a429fc53289706bc9a12dfec6
+        shell: bash
+        run: |
+          set -euo pipefail
+          test "$(git hash-object crates/ffs-core/src/lib.rs)" = 1ad941d65c05ddb2a5caac95556003a38fcf3111
+          test "$(git hash-object crates/ffs-core/tests/btrfs_commit_crash_window.rs)" = dd65296f369eef052755e19cf3c8aab7c51ced08
+          gh api "repos/$GITHUB_REPOSITORY/git/blobs/$PATCH_SHA" --jq .content | base64 --decode > "$RUNNER_TEMP/fst.patch"
+          test "$(git hash-object "$RUNNER_TEMP/fst.patch")" = "$PATCH_SHA"
+          git apply --check --index "$RUNNER_TEMP/fst.patch"
+          git apply --index "$RUNNER_TEMP/fst.patch"
+          git diff --cached --check
+          git diff --cached --stat
+
+      - name: Install the repository Rust toolchain
+        shell: bash
+        run: |
+          set -euo pipefail
+          toolchain="$(python3 -c 'import tomllib; print(tomllib.load(open("rust-toolchain.toml", "rb"))["toolchain"]["channel"])')"
+          rustup toolchain install "$toolchain" --profile minimal --component rustfmt --component clippy
+          rustc -Vv
+          cargo -V
+
+      - name: Format only the four changed Rust files
+        shell: bash
+        run: |
+          set -euo pipefail
+          rustfmt --edition 2024 --config skip_children=true \
+            crates/ffs-core/src/lib.rs \
+            crates/ffs-core/src/btrfs_free_space.rs \
+            crates/ffs-core/src/btrfs_free_space/tests.rs \
+            crates/ffs-core/tests/btrfs_commit_crash_window.rs
+          git add -- crates/ffs-core/src/lib.rs crates/ffs-core/src/btrfs_free_space.rs \
+            crates/ffs-core/src/btrfs_free_space/tests.rs crates/ffs-core/tests/btrfs_commit_crash_window.rs
+          git diff --cached --check
+          git diff --cached --stat
+          git diff --cached > "$RUNNER_TEMP/fst-reviewed.diff"
+
+      - name: Record candidate blob identities without publishing them
+        env:
+          GH_TOKEN: ${{ github.token }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 - <<'PY'
+          import base64
+          import json
+          import os
+          import pathlib
+          import subprocess
+          paths = [
+              "crates/ffs-core/src/lib.rs",
+              "crates/ffs-core/src/btrfs_free_space.rs",
+              "crates/ffs-core/src/btrfs_free_space/tests.rs",
+              "crates/ffs-core/tests/btrfs_commit_crash_window.rs",
+          ]
+          changed = subprocess.check_output(["git", "diff", "--cached", "--name-only", "-z"]).decode().split("\0")
+          assert set(filter(None, changed)) <= set(paths), changed
+          entries = []
+          for path in paths:
+              data = pathlib.Path(path).read_bytes()
+              local_sha = subprocess.check_output(["git", "hash-object", path], text=True).strip()
+              request = json.dumps({"content": base64.b64encode(data).decode(), "encoding": "base64"})
+              response = subprocess.check_output(
+                  ["gh", "api", "--method", "POST", f"repos/{os.environ['GITHUB_REPOSITORY']}/git/blobs", "--input", "-"],
+                  input=request, text=True,
+              )
+              sha = json.loads(response)["sha"]
+              assert sha == local_sha, (path, sha, local_sha)
+              entries.append({"path": path, "mode": "100644", "type": "blob", "sha": sha})
+          result = {"base": os.environ["GITHUB_SHA"], "validation": "pending; inspect the completed job", "entries": entries}
+          pathlib.Path(os.environ["RUNNER_TEMP"], "fst-candidate-blobs.json").write_text(json.dumps(result, indent=2) + "\n")
+          print("BTRFS_COW_CANDIDATE_BLOBS=" + json.dumps(result))
+          PY
+
+      - name: Install required filesystem oracles
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y btrfs-progs e2fsprogs pkg-config libfuse3-dev
+          command -v mkfs.btrfs
+          command -v btrfs
+
+      - name: Reservation unit regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p ffs-core --lib btrfs_free_space::tests -- --nocapture 2>&1 | tee "$RUNNER_TEMP/fst-unit.log"
+          grep -Eq 'test result: ok\. ([1-9][0-9]+) passed;' "$RUNNER_TEMP/fst-unit.log"
+
+      - name: Real-image crash-window and publication regressions
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo test -p ffs-core --test btrfs_commit_crash_window -- --nocapture 2>&1 | tee "$RUNNER_TEMP/fst-crash.log"
+          ! grep -Eiq 'skipping|unavailable' "$RUNNER_TEMP/fst-crash.log"
+          grep -Eq 'test result: ok\. ([3-9]|[1-9][0-9]+) passed;' "$RUNNER_TEMP/fst-crash.log"
+
+      - name: Check all core targets
+        run: cargo check -p ffs-core --all-targets
+
+      - name: Core Clippy
+        run: cargo clippy -p ffs-core --all-targets -- -D warnings
+
+      - name: Preserve exact source and validation evidence
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: btrfs-cow-${{ github.sha }}
+          if-no-files-found: warn
+          path: |
+            ${{ runner.temp }}/fst-*.json
+            ${{ runner.temp }}/fst-*.diff
+            ${{ runner.temp }}/fst-*.log
+            crates/ffs-core/src/lib.rs
+            crates/ffs-core/src/btrfs_free_space.rs
+            crates/ffs-core/src/btrfs_free_space/tests.rs
+            crates/ffs-core/tests/btrfs_commit_crash_window.rs
