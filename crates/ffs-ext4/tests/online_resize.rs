@@ -115,7 +115,11 @@ fn resize_inode_reserved_gdt_blocks_require_feature_and_stop_at_first_meta_bg() 
     let mut sb = make_online_resize_superblock();
     assert_eq!(sb.resize_inode_number(), Some(EXT4_RESIZE_INO));
     assert_eq!(sb.reserved_gdt_blocks_in_group(GroupNumber(1)), 2);
-    assert_eq!(sb.reserved_gdt_blocks_in_group(GroupNumber(3)), 0);
+    // `first_meta_bg` counts descriptor blocks (16 descriptors each here), so
+    // META_BG starts at group 32: backup group 3 still has the reserve and
+    // backup group 49 (7^2, metagroup 3) does not.
+    assert_eq!(sb.reserved_gdt_blocks_in_group(GroupNumber(3)), 2);
+    assert_eq!(sb.reserved_gdt_blocks_in_group(GroupNumber(49)), 0);
 
     sb.feature_compat = Ext4CompatFeatures(0);
     assert_eq!(sb.resize_inode_number(), None);
