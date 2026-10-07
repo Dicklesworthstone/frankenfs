@@ -79258,6 +79258,39 @@ mod tests {
         }
     }
 
+    /// Commits must not carry the allocator's delayed refs forward: nothing on
+    /// a mount flushes them, so they piled up with every allocation ever made
+    /// and each commit's rollback snapshot cloned the whole pile (bd-dysiw:
+    /// ~70% of daemon CPU in xfstests generic/127).
+    #[test]
+    fn btrfs_commits_leave_no_delayed_refs_behind() {
+        let Some((fs, _tmp, _image)) = open_file_backed_btrfs(256) else {
+            oracle_unavailable("btrfs image formatter (btrfs-progs)");
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let ino = fs
+            .create(&cx, root, OsStr::new("f"), 0o644, 0, 0)
+            .expect("create")
+            .ino;
+        let pending = || {
+            fs.btrfs_alloc_state
+                .as_ref()
+                .unwrap()
+                .read()
+                .extent_alloc
+                .delayed_ref_count()
+        };
+        for round in 0..20_u64 {
+            fs.write(&cx, ino, (round % 8) * 8192, &[0x5A; 8192])
+                .expect("write");
+            assert!(pending() > 0, "round {round}: a write queues delayed refs");
+            fs.fsync(&cx, ino, 0, false).expect("commit");
+            assert_eq!(pending(), 0, "round {round}: delayed refs after commit");
+        }
+    }
+
     /// The csum items a read gathers for its disk ranges answer every sector
     /// lookup exactly as the whole csum tree does (the read path used to copy
     /// the whole tree per read).

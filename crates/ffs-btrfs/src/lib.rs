@@ -6367,6 +6367,12 @@ impl DelayedRefQueue {
         drained.sort_by_key(|entry| entry.sequence);
         drained
     }
+
+    /// Drop every queued entry, keeping the sequence counter monotonic.
+    pub fn clear(&mut self) {
+        self.refs.clear();
+        self.pending_count = 0;
+    }
 }
 
 /// Logical tree identifier for btrfs roots.
@@ -8099,6 +8105,12 @@ impl BtrfsExtentAllocator {
     /// exists to prevent, so the failure path deliberately leaves the pins in
     /// place: the old trees are still the filesystem.
     pub fn release_pinned_after_superblock_commit(&mut self) -> usize {
+        // The committed transaction's refs are durable in the extent tree,
+        // which alloc/free update directly; nothing flushes this queue on a
+        // mount, so without this it grows with every allocation ever made and
+        // each commit's `snapshot` clones all of it (bd-dysiw: ~70% of daemon
+        // CPU under generic/127's fsync load).
+        self.delayed_ref_queue.clear();
         let before = self.pinned.len();
         self.pinned.retain(|_, pin| pin.live_after_commit);
         for pin in self.pinned.values_mut() {
