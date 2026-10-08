@@ -40,7 +40,7 @@ fn replay(bytes: &[u8]) -> Vec<WalCommit> {
     let mut commits = Vec::new();
     let report = WalReplayEngine::new(TailPolicy::FailFast)
         .replay(&bytes[HEADER_SIZE..], 0, |commit| {
-            commits.push(commit.clone())
+            commits.push(commit.clone());
         })
         .unwrap();
     assert!(report.outcome.is_clean());
@@ -72,7 +72,7 @@ fn stream_is_byte_identical_to_v1_across_all_field_and_chunk_boundaries() {
         let mut buffer = vec![0; size];
         let mut actual = Vec::new();
         emit_chunks(&records, &mut buffer, |bytes| {
-            assert!(!bytes.is_empty());
+            assert_ne!(bytes, []);
             assert!(bytes.len() <= size);
             actual.extend_from_slice(bytes);
             Ok(())

@@ -17,7 +17,7 @@ use crossbeam_epoch as epoch;
 use ffs_block::{BlockBuf, BlockDevice, FlushPinToken, MvccFlushLifecycle};
 use ffs_error::{FfsError, Result as FfsResult};
 pub use ffs_repair::evidence::TxnAbortReason;
-use ffs_repair::evidence::{
+pub use ffs_repair::evidence::{
     ContentionSampleDetail, EvidenceRecord, MergeAppliedDetail, MergeProofCheckedDetail,
     MergeRejectedDetail, PolicySwitchedDetail, SerializationConflictDetail,
     TransactionCommitDetail, TxnAbortedDetail,
@@ -2065,19 +2065,19 @@ impl EbrVersionReclaimer {
 }
 
 #[derive(Debug, Clone)]
-struct MvccEvidenceSink {
+pub struct MvccEvidenceSink {
     file: Arc<Mutex<File>>,
 }
 
 impl MvccEvidenceSink {
-    fn open(path: &Path) -> FfsResult<Self> {
+    pub fn open(path: &Path) -> FfsResult<Self> {
         let file = OpenOptions::new().create(true).append(true).open(path)?;
         Ok(Self {
             file: Arc::new(Mutex::new(file)),
         })
     }
 
-    fn append(&self, record: &EvidenceRecord, txn_id: u64) {
+    pub fn append(&self, record: &EvidenceRecord, txn_id: u64) {
         let start = Instant::now();
         let append_result = {
             let mut file = self.file.lock();

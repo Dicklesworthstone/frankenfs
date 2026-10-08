@@ -151,6 +151,12 @@ impl MvccStore {
         self.evidence_sink = None;
     }
 
+    /// Returns true if an evidence ledger sink is currently configured.
+    #[must_use]
+    pub fn has_evidence_ledger(&self) -> bool {
+        self.evidence_sink.is_some()
+    }
+
     /// Returns the current compression policy.
     #[must_use]
     pub fn compression_policy(&self) -> &CompressionPolicy {
