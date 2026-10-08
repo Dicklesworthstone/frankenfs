@@ -1,0 +1,21 @@
+splice-test: count the bytes a pipe read returned, not the bytes asked for
+
+read_from_pipe() subtracts the requested size from the remaining count, so
+a short pipe read (any read of a 76800-byte buffer from a 64 KiB pipe) makes
+the reader believe it consumed more than it did; it exits early and the
+writer's next splice gets EPIPE unless it wins the race. A kernel page-cache
+splice usually wins; a FUSE O_DIRECT splice (one daemon round trip) usually
+loses, so generic/591 failed on FrankenFS for the test program's reason, not
+the filesystem's (bd-hryzs).
+
+--- a/src/splice-test.c
++++ b/src/splice-test.c
+@@ -40,7 +40,7 @@
+ 			fprintf(stderr, "read: %s: unexpected EOF\n", filename);
+ 			exit(1);
+ 		}
+-		size -= sz;
++		size -= ret;
+ 	}
+ 	free(buffer);
+ }

@@ -90,6 +90,20 @@ jobs:
             patch -p1 --forward <"$p"
           fi
 
+      # generic/591's splice-test miscounts short pipe reads and races its own
+      # writer (bd-hryzs). Rebuild src/ after patching: the build is cached.
+      - name: Fix splice-test's short-read accounting
+        run: |
+          set -euo pipefail
+          p="$GITHUB_WORKSPACE/scripts/e2e/xfstests-splice-test-short-read.patch"
+          cd ~/xfstests-dev
+          if patch -p1 -R -s -f --dry-run <"$p" >/dev/null 2>&1; then
+            echo "already applied"
+          else
+            patch -p1 --forward <"$p"
+          fi
+          make -C src
+
       - name: Build FrankenFS
         run: cargo build -p ffs-cli -p ffs-harness
 
