@@ -10,8 +10,9 @@ use ffs_block::{BlockBuf, BlockDevice};
 use ffs_error::{FfsError, Result as FfsResult};
 use ffs_mvcc::sharded::{PublicationMode, ShardedMvccStore};
 use ffs_mvcc::{
-    BlockVersionStats, CommitError, EbrVersionStats, MergeProof, MvccStore, Transaction,
-    TransactionOutcomeStats, TxnAbortReason,
+    BlockVersionStats, CommitError, EbrVersionStats, EvidenceRecord, MergeProof, MvccEvidenceSink,
+    MvccStore, Transaction, TransactionCommitDetail, TransactionOutcomeStats, TxnAbortReason,
+    TxnAbortedDetail,
 };
 use ffs_types::{BlockNumber, CommitSeq, Snapshot};
 use parking_lot::RwLock;
@@ -48,7 +49,10 @@ pub enum FsMvccStore {
     /// Single store behind a `RwLock`: legacy, JBD2, and MVCC-WAL configured path.
     Single(RwLock<MvccStore>),
     /// Sharded store: default in-memory parallel-write path.
-    Sharded(ShardedMvccStore),
+    Sharded {
+        store: ShardedMvccStore,
+        evidence_sink: RwLock<Option<MvccEvidenceSink>>,
+    },
 }
 
 impl FsMvccStore {
@@ -65,18 +69,58 @@ impl FsMvccStore {
         // semantics) and the documented preferred high-core constructor. The
         // residual parallel-write gap (bd-bhh0i) is the global active_snapshots
         // lock, not shard count (docs/NEGATIVE_EVIDENCE.md).
-        Self::Sharded(ShardedMvccStore::for_host_parallelism())
+        Self::Sharded {
+            store: ShardedMvccStore::for_host_parallelism(),
+            evidence_sink: RwLock::new(None),
+        }
     }
 
     pub(super) fn sharded_with_publication_mode(mode: PublicationMode) -> Self {
-        Self::Sharded(ShardedMvccStore::with_publication_mode(
-            ShardedMvccStore::host_parallelism_shard_count(),
-            mode,
-        ))
+        Self::Sharded {
+            store: ShardedMvccStore::with_publication_mode(
+                ShardedMvccStore::host_parallelism_shard_count(),
+                mode,
+            ),
+            evidence_sink: RwLock::new(None),
+        }
     }
 
     pub(super) const fn is_sharded(&self) -> bool {
-        matches!(self, Self::Sharded(_))
+        matches!(self, Self::Sharded { .. })
+    }
+
+    /// Enable append-only evidence recording to a JSONL ledger path (bd-7ssc7).
+    pub(super) fn enable_evidence_ledger(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> FfsResult<()> {
+        match self {
+            Self::Single(lock) => lock.write().enable_evidence_ledger(path),
+            Self::Sharded { evidence_sink, .. } => {
+                let sink = MvccEvidenceSink::open(path.as_ref())?;
+                *evidence_sink.write() = Some(sink);
+                Ok(())
+            }
+        }
+    }
+
+    /// Disable evidence recording.
+    pub(super) fn disable_evidence_ledger(&self) {
+        match self {
+            Self::Single(lock) => lock.write().disable_evidence_ledger(),
+            Self::Sharded { evidence_sink, .. } => {
+                *evidence_sink.write() = None;
+            }
+        }
+    }
+
+    /// Returns true if an evidence ledger sink is currently configured (bd-7ssc7).
+    #[must_use]
+    pub(super) fn has_evidence_ledger(&self) -> bool {
+        match self {
+            Self::Single(lock) => lock.read().has_evidence_ledger(),
+            Self::Sharded { evidence_sink, .. } => evidence_sink.read().is_some(),
+        }
     }
 
     /// Set the commit-time conflict policy on whichever store variant is live
@@ -84,7 +128,7 @@ impl FsMvccStore {
     pub(super) fn set_conflict_policy(&self, policy: ffs_mvcc::ConflictPolicy) {
         match self {
             Self::Single(lock) => lock.write().set_conflict_policy(policy),
-            Self::Sharded(store) => store.set_conflict_policy(policy),
+            Self::Sharded { store, .. } => store.set_conflict_policy(policy),
         }
     }
 
@@ -92,35 +136,149 @@ impl FsMvccStore {
     pub(super) fn conflict_policy(&self) -> ffs_mvcc::ConflictPolicy {
         match self {
             Self::Single(lock) => lock.read().conflict_policy(),
-            Self::Sharded(store) => store.conflict_policy(),
+            Self::Sharded { store, .. } => store.conflict_policy(),
         }
     }
 
     pub(super) fn begin(&self) -> Transaction {
         match self {
             Self::Single(lock) => lock.write().begin(),
-            Self::Sharded(store) => store.begin(),
+            Self::Sharded { store, .. } => store.begin(),
         }
     }
 
     pub(super) fn commit(&self, txn: Transaction) -> Result<CommitSeq, CommitError> {
         match self {
             Self::Single(lock) => lock.write().commit(txn),
-            Self::Sharded(store) => store.commit(txn).map_err(|(error, _txn)| error),
+            Self::Sharded {
+                store,
+                evidence_sink,
+            } => {
+                let started = std::time::Instant::now();
+                let txn_id = txn.id().0;
+                let write_set_size = txn.pending_writes();
+                let read_set_size = txn.read_set().len();
+                match store.commit(txn) {
+                    Ok(commit_seq) => {
+                        let duration_us =
+                            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                        if let Some(sink) = evidence_sink.read().as_ref() {
+                            sink.append(
+                                &EvidenceRecord::transaction_commit(TransactionCommitDetail {
+                                    txn_id,
+                                    commit_seq: commit_seq.0,
+                                    write_set_size,
+                                    duration_us,
+                                }),
+                                txn_id,
+                            );
+                        }
+                        Ok(commit_seq)
+                    }
+                    Err((error, _txn)) => {
+                        if let Some(sink) = evidence_sink.read().as_ref() {
+                            let reason = match &error {
+                                CommitError::Conflict { .. } => TxnAbortReason::FcwConflict,
+                                CommitError::SsiConflict { .. } => TxnAbortReason::SsiCycle,
+                                CommitError::ChainBackpressure { .. } => TxnAbortReason::Timeout,
+                                CommitError::DurabilityFailure { .. } => {
+                                    TxnAbortReason::DurabilityFailure
+                                }
+                            };
+                            sink.append(
+                                &EvidenceRecord::txn_aborted(TxnAbortedDetail {
+                                    txn_id,
+                                    reason,
+                                    detail: Some(error.to_string()),
+                                    read_set_size,
+                                    write_set_size,
+                                }),
+                                txn_id,
+                            );
+                        }
+                        Err(error)
+                    }
+                }
+            }
         }
     }
 
     pub(super) fn commit_ssi(&self, txn: Transaction) -> Result<CommitSeq, CommitError> {
         match self {
             Self::Single(lock) => lock.write().commit_ssi(txn),
-            Self::Sharded(store) => store.commit_ssi(txn).map_err(|(error, _txn)| error),
+            Self::Sharded {
+                store,
+                evidence_sink,
+            } => {
+                let started = std::time::Instant::now();
+                let txn_id = txn.id().0;
+                let write_set_size = txn.pending_writes();
+                let read_set_size = txn.read_set().len();
+                match store.commit_ssi(txn) {
+                    Ok(commit_seq) => {
+                        let duration_us =
+                            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
+                        if let Some(sink) = evidence_sink.read().as_ref() {
+                            sink.append(
+                                &EvidenceRecord::transaction_commit(TransactionCommitDetail {
+                                    txn_id,
+                                    commit_seq: commit_seq.0,
+                                    write_set_size,
+                                    duration_us,
+                                }),
+                                txn_id,
+                            );
+                        }
+                        Ok(commit_seq)
+                    }
+                    Err((error, _txn)) => {
+                        if let Some(sink) = evidence_sink.read().as_ref() {
+                            let reason = match &error {
+                                CommitError::Conflict { .. } => TxnAbortReason::FcwConflict,
+                                CommitError::SsiConflict { .. } => TxnAbortReason::SsiCycle,
+                                CommitError::ChainBackpressure { .. } => TxnAbortReason::Timeout,
+                                CommitError::DurabilityFailure { .. } => {
+                                    TxnAbortReason::DurabilityFailure
+                                }
+                            };
+                            sink.append(
+                                &EvidenceRecord::txn_aborted(TxnAbortedDetail {
+                                    txn_id,
+                                    reason,
+                                    detail: Some(error.to_string()),
+                                    read_set_size,
+                                    write_set_size,
+                                }),
+                                txn_id,
+                            );
+                        }
+                        Err(error)
+                    }
+                }
+            }
         }
     }
 
     pub(super) fn abort(&self, txn: Transaction, reason: TxnAbortReason, detail: Option<String>) {
         match self {
             Self::Single(lock) => lock.write().abort(txn, reason, detail),
-            Self::Sharded(_) => drop((txn, reason, detail)),
+            Self::Sharded { evidence_sink, .. } => {
+                if let Some(sink) = evidence_sink.read().as_ref() {
+                    let txn_id = txn.id().0;
+                    let write_set_size = txn.pending_writes();
+                    let read_set_size = txn.read_set().len();
+                    sink.append(
+                        &EvidenceRecord::txn_aborted(TxnAbortedDetail {
+                            txn_id,
+                            reason,
+                            detail,
+                            read_set_size,
+                            write_set_size,
+                        }),
+                        txn_id,
+                    );
+                }
+            }
         }
     }
 
@@ -130,7 +288,7 @@ impl FsMvccStore {
                 .read()
                 .read_visible(block, snapshot)
                 .map(std::borrow::Cow::into_owned),
-            Self::Sharded(store) => store.read_visible(block, snapshot),
+            Self::Sharded { store, .. } => store.read_visible(block, snapshot),
         }
     }
 
@@ -141,42 +299,42 @@ impl FsMvccStore {
     ) -> Option<BlockBuf> {
         match self {
             Self::Single(lock) => lock.read().read_visible_block_buf(block, snapshot),
-            Self::Sharded(store) => store.read_visible_block_buf(block, snapshot),
+            Self::Sharded { store, .. } => store.read_visible_block_buf(block, snapshot),
         }
     }
 
     pub(super) fn current_snapshot(&self) -> Snapshot {
         match self {
             Self::Single(lock) => lock.read().current_snapshot(),
-            Self::Sharded(store) => store.current_snapshot(),
+            Self::Sharded { store, .. } => store.current_snapshot(),
         }
     }
 
     pub(super) fn register_snapshot(&self, snapshot: Snapshot) {
         match self {
             Self::Single(lock) => lock.write().register_snapshot(snapshot),
-            Self::Sharded(store) => store.register_snapshot(snapshot),
+            Self::Sharded { store, .. } => store.register_snapshot(snapshot),
         }
     }
 
     pub(super) fn release_snapshot(&self, snapshot: Snapshot) -> bool {
         match self {
             Self::Single(lock) => lock.write().release_snapshot(snapshot),
-            Self::Sharded(store) => store.release_snapshot(snapshot),
+            Self::Sharded { store, .. } => store.release_snapshot(snapshot),
         }
     }
 
     pub(super) fn watermark(&self) -> Option<CommitSeq> {
         match self {
             Self::Single(lock) => lock.read().watermark(),
-            Self::Sharded(store) => store.watermark(),
+            Self::Sharded { store, .. } => store.watermark(),
         }
     }
 
     pub(super) fn latest_commit_seq(&self, block: BlockNumber) -> CommitSeq {
         match self {
             Self::Single(lock) => lock.read().latest_commit_seq(block),
-            Self::Sharded(store) => store.latest_commit_seq(block),
+            Self::Sharded { store, .. } => store.latest_commit_seq(block),
         }
     }
 
@@ -212,7 +370,7 @@ impl FsMvccStore {
     pub(super) fn prune_safe(&self) -> CommitSeq {
         match self {
             Self::Single(lock) => lock.write().prune_safe(),
-            Self::Sharded(store) => store.prune_safe(),
+            Self::Sharded { store, .. } => store.prune_safe(),
         }
     }
 
@@ -294,7 +452,7 @@ impl FsMvccStore {
             Self::Single(lock) => lock
                 .read()
                 .flush_to_device_after(cx, device, flushed_through),
-            Self::Sharded(store) => store.flush_to_device_after(cx, device, flushed_through),
+            Self::Sharded { store, .. } => store.flush_to_device_after(cx, device, flushed_through),
         }
     }
 
@@ -304,7 +462,7 @@ impl FsMvccStore {
     pub(super) fn committed_block_writes(&self) -> Option<u64> {
         match self {
             Self::Single(lock) => Some(lock.read().committed_block_writes()),
-            Self::Sharded(_) => None,
+            Self::Sharded { .. } => None,
         }
     }
 
@@ -312,7 +470,7 @@ impl FsMvccStore {
     pub(super) fn tracked_block_count(&self) -> usize {
         match self {
             Self::Single(lock) => lock.read().tracked_block_count(),
-            Self::Sharded(store) => store.block_count_versioned(),
+            Self::Sharded { store, .. } => store.block_count_versioned(),
         }
     }
 
@@ -325,28 +483,28 @@ impl FsMvccStore {
     ) -> usize {
         match self {
             Self::Single(lock) => lock.write().evict_durable_chains(durable_through, on_evict),
-            Self::Sharded(store) => store.evict_durable_chains(durable_through, on_evict),
+            Self::Sharded { store, .. } => store.evict_durable_chains(durable_through, on_evict),
         }
     }
 
     pub(super) fn version_count(&self) -> usize {
         match self {
             Self::Single(lock) => lock.read().version_count(),
-            Self::Sharded(store) => store.version_count(),
+            Self::Sharded { store, .. } => store.version_count(),
         }
     }
 
     pub(super) fn active_snapshot_count(&self) -> usize {
         match self {
             Self::Single(lock) => lock.read().active_snapshot_count(),
-            Self::Sharded(store) => store.active_snapshot_count(),
+            Self::Sharded { store, .. } => store.active_snapshot_count(),
         }
     }
 
     pub(super) fn block_version_stats(&self) -> BlockVersionStats {
         match self {
             Self::Single(lock) => lock.read().block_version_stats(),
-            Self::Sharded(store) => BlockVersionStats {
+            Self::Sharded { store, .. } => BlockVersionStats {
                 tracked_blocks: store.version_count(),
                 max_chain_length: 0,
                 chains_over_cap: 0,
@@ -360,21 +518,21 @@ impl FsMvccStore {
     pub(super) fn ebr_stats(&self) -> EbrVersionStats {
         match self {
             Self::Single(lock) => lock.read().ebr_stats(),
-            Self::Sharded(_) => EbrVersionStats::default(),
+            Self::Sharded { .. } => EbrVersionStats::default(),
         }
     }
 
     pub(super) fn transaction_outcome_stats(&self) -> TransactionOutcomeStats {
         match self {
             Self::Single(lock) => lock.read().transaction_outcome_stats(),
-            Self::Sharded(_) => TransactionOutcomeStats::default(),
+            Self::Sharded { .. } => TransactionOutcomeStats::default(),
         }
     }
 
     pub(super) fn as_single(&self) -> Option<&RwLock<MvccStore>> {
         match self {
             Self::Single(lock) => Some(lock),
-            Self::Sharded(_) => None,
+            Self::Sharded { .. } => None,
         }
     }
 }
@@ -854,9 +1012,7 @@ mod block_device_tests {
 
         fn sharded() -> Self {
             let store = FsMvccStore::sharded();
-            if let FsMvccStore::Sharded(shards) = &store {
-                shards.set_conflict_policy(ConflictPolicy::SafeMerge);
-            }
+            store.set_conflict_policy(ConflictPolicy::SafeMerge);
             Self::new(store)
         }
 
@@ -1434,9 +1590,9 @@ mod block_device_tests {
 }
 #[cfg(test)]
 mod commit_error_mapping_tests {
-    use super::commit_error_to_ffs;
+    use super::*;
     use ffs_error::FfsError;
-    use ffs_mvcc::CommitError;
+    use ffs_mvcc::{CommitError, TxnAbortReason};
     use ffs_types::{BlockNumber, CommitSeq};
 
     /// bd-y2t0r: a first-committer-wins conflict must surface as `EAGAIN`, and
@@ -1484,5 +1640,68 @@ mod commit_error_mapping_tests {
             detail: "wal write failed".to_owned(),
         };
         assert!(matches!(commit_error_to_ffs(&other), FfsError::Format(_)));
+    }
+
+    #[test]
+    fn sharded_mvcc_store_evidence_ledger_records_commits_and_aborts_bd_7ssc7() {
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("mvcc_evidence.jsonl");
+
+        let store = FsMvccStore::sharded();
+        assert!(!store.has_evidence_ledger());
+
+        store
+            .enable_evidence_ledger(&ledger_path)
+            .expect("enable ledger");
+        assert!(store.has_evidence_ledger());
+
+        // Commit a write
+        let mut txn = store.begin();
+        txn.stage_write(BlockNumber(10), vec![0xAB; 4096]);
+        let commit_seq = store.commit(txn).expect("commit succeeds");
+        assert!(commit_seq.0 > 0);
+
+        // Abort a transaction
+        let abort_txn = store.begin();
+        store.abort(
+            abort_txn,
+            TxnAbortReason::UserAbort,
+            Some("test abort".to_owned()),
+        );
+
+        // Verify the ledger contents
+        let content = std::fs::read_to_string(&ledger_path).expect("read ledger");
+        let lines: Vec<&str> = content.lines().collect();
+        assert_eq!(lines.len(), 2, "expected 2 records (commit + abort)");
+
+        let commit_json: serde_json::Value =
+            serde_json::from_str(lines[0]).expect("parse commit line");
+        assert_eq!(commit_json["event_type"], "transaction_commit");
+        assert_eq!(
+            commit_json["transaction_commit"]["commit_seq"],
+            commit_seq.0
+        );
+        assert_eq!(commit_json["transaction_commit"]["write_set_size"], 1);
+
+        let abort_json: serde_json::Value =
+            serde_json::from_str(lines[1]).expect("parse abort line");
+        assert_eq!(abort_json["event_type"], "txn_aborted");
+        assert_eq!(abort_json["txn_aborted"]["reason"], "user_abort");
+        assert_eq!(abort_json["txn_aborted"]["detail"], "test abort");
+
+        // Disable and ensure no more writes occur
+        store.disable_evidence_ledger();
+        assert!(!store.has_evidence_ledger());
+
+        let mut txn2 = store.begin();
+        txn2.stage_write(BlockNumber(11), vec![0xCD; 4096]);
+        store.commit(txn2).expect("commit succeeds");
+
+        let content_after = std::fs::read_to_string(&ledger_path).expect("read ledger after");
+        assert_eq!(
+            content_after.lines().count(),
+            2,
+            "no lines added after disable"
+        );
     }
 }

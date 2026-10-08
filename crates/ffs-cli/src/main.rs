@@ -659,6 +659,8 @@ struct MountCmdOptions {
     commit_interval_secs: Option<u64>,
     /// MVCC conflict policy override (bd-7ssc7); `None` = SafeMerge.
     mvcc_policy: Option<MvccPolicyArg>,
+    /// MVCC evidence ledger path (bd-7ssc7); `None` = disabled.
+    mvcc_evidence_ledger: Option<PathBuf>,
     runtime: MountRuntimeConfig,
     adaptive_runtime: MountAdaptiveRuntimeConfig,
     adaptive_runtime_summary: MountAdaptiveRuntimeSummaryConfig,
@@ -1404,6 +1406,10 @@ enum Command {
         /// contention via the expected-loss model.
         #[arg(long = "mvcc-policy", value_enum)]
         mvcc_policy: Option<MvccPolicyArg>,
+        /// Append-only evidence ledger for MVCC commits and aborts (bd-7ssc7).
+        /// Emits `transaction_commit` and `txn_aborted` records as JSONL.
+        #[arg(long = "mvcc-evidence-ledger", value_name = "PATH")]
+        mvcc_evidence_ledger: Option<PathBuf>,
     },
     /// Run a read-only integrity scan (scrub) on a filesystem image.
     Scrub {
@@ -2546,6 +2552,7 @@ fn run() -> Result<()> {
             btrfs_device_paths,
             commit_interval_secs,
             mvcc_policy,
+            mvcc_evidence_ledger,
         } => {
             let btrfs_mount_selection = parse_btrfs_mount_selection(subvol, snapshot)?;
             let background_scrub = MountBackgroundScrubConfig::resolve(
@@ -2591,6 +2598,7 @@ fn run() -> Result<()> {
                     btrfs_verify_data_on_read,
                     commit_interval_secs,
                     mvcc_policy,
+                    mvcc_evidence_ledger,
                     runtime: MountRuntimeConfig {
                         mode: runtime_mode,
                         managed_unmount_timeout_secs,
@@ -8625,6 +8633,11 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
     if let Some(policy) = options.mvcc_policy {
         open_fs.set_mvcc_conflict_policy(policy.policy());
     }
+    if let Some(ref path) = options.mvcc_evidence_ledger {
+        open_fs.enable_mvcc_evidence_ledger(path).with_context(|| {
+            format!("failed to open MVCC evidence ledger at {}", path.display())
+        })?;
+    }
     // bd-dj725: resident MVCC blocks above which a journaled boundary evicts
     // what it made durable (default ffs_core::DEFAULT_MVCC_RESIDENT_BLOCK_CAP).
     if let Ok(raw) = std::env::var("FFS_MVCC_RESIDENT_CAP_BLOCKS") {
@@ -10240,17 +10253,17 @@ mod tests {
         MountAdaptiveRuntimeConfig, MountAdaptiveRuntimeSummaryConfig, MountBackgroundRepairMode,
         MountBackgroundScrubConfig, MountBackgroundScrubMode, MountBackgroundScrubRequest,
         MountCmdOptions, MountConsoleConfig, MountMode, MountRuntimeConfig, MountRuntimeMode,
-        MountWritebackCacheConfig, PerCoreTransportMetrics, RepairCommandOptions, RepairFlags,
-        WRITEBACK_CACHE_KILL_SWITCH_ENV, btrfs_checksum_type_name, btrfs_chunk_type_flag_names,
-        build_ext4_group_info, build_fsck_output, build_info_output, build_mount_open_options,
-        choose_btrfs_scrub_block_size, count_blocks_at_severity_or_higher,
-        ext4_appears_clean_state, ext4_group_flag_names, ext4_group_scrub_scope,
-        ext4_mount_replay_mode, ext4_recovery_detail, ext4_state_flag_names, filesystem_name,
-        format_ext4_quota_inodes, format_ratio_thousandths, format_uuid,
-        log_mount_runtime_rejected, log_mount_runtime_selected, mount_cmd, mount_operation_id,
-        open_filesystem_for_mount, parse_btrfs_mount_selection, parse_fuse_dispatch_workers,
-        read_ext4_group_desc_from_path, read_ext4_inode_from_path, read_file_region,
-        require_jbd2_durability_for_mount, start_mount_background_scrub,
+        MountWritebackCacheConfig, MvccPolicyArg, PerCoreTransportMetrics, RepairCommandOptions,
+        RepairFlags, WRITEBACK_CACHE_KILL_SWITCH_ENV, btrfs_checksum_type_name,
+        btrfs_chunk_type_flag_names, build_ext4_group_info, build_fsck_output, build_info_output,
+        build_mount_open_options, choose_btrfs_scrub_block_size,
+        count_blocks_at_severity_or_higher, ext4_appears_clean_state, ext4_group_flag_names,
+        ext4_group_scrub_scope, ext4_mount_replay_mode, ext4_recovery_detail,
+        ext4_state_flag_names, filesystem_name, format_ext4_quota_inodes, format_ratio_thousandths,
+        format_uuid, log_mount_runtime_rejected, log_mount_runtime_selected, mount_cmd,
+        mount_operation_id, open_filesystem_for_mount, parse_btrfs_mount_selection,
+        parse_fuse_dispatch_workers, read_ext4_group_desc_from_path, read_ext4_inode_from_path,
+        read_file_region, require_jbd2_durability_for_mount, start_mount_background_scrub,
         summarize_repair_staleness, unavailable_repair_info,
         validate_mount_adaptive_runtime_request_with_config,
         validate_mount_writeback_cache_request,
@@ -10409,6 +10422,7 @@ mod tests {
             btrfs_verify_data_on_read: false,
             commit_interval_secs: None,
             mvcc_policy: None,
+            mvcc_evidence_ledger: None,
             runtime: MountRuntimeConfig {
                 mode: MountRuntimeMode::Standard,
                 managed_unmount_timeout_secs: None,
@@ -14387,6 +14401,7 @@ mod tests {
                         btrfs_verify_data_on_read: false,
                         commit_interval_secs: None,
                         mvcc_policy: None,
+                        mvcc_evidence_ledger: None,
                         mount_mode: MountMode::Compat,
                         btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
                         btrfs_device_paths: Vec::new(),
@@ -14471,6 +14486,7 @@ mod tests {
                 btrfs_verify_data_on_read: false,
                 commit_interval_secs: None,
                 mvcc_policy: None,
+                mvcc_evidence_ledger: None,
                 mount_mode: MountMode::Compat,
                 btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
                 btrfs_device_paths: Vec::new(),
@@ -14515,6 +14531,7 @@ mod tests {
                 btrfs_verify_data_on_read: false,
                 commit_interval_secs: None,
                 mvcc_policy: None,
+                mvcc_evidence_ledger: None,
                 mount_mode: MountMode::Compat,
                 btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
                 btrfs_device_paths: Vec::new(),
@@ -14583,6 +14600,34 @@ mod tests {
     }
 
     #[test]
+    fn cli_mount_mvcc_evidence_ledger_flag_parses_and_wires_bd_7ssc7() {
+        let cli = Cli::try_parse_from([
+            "ffs",
+            "mount",
+            "test.img",
+            "/mnt/ffs",
+            "--mvcc-evidence-ledger",
+            "/tmp/test_mvcc_ledger.jsonl",
+            "--mvcc-policy",
+            "adaptive",
+        ])
+        .unwrap();
+        let Command::Mount {
+            mvcc_evidence_ledger,
+            mvcc_policy,
+            ..
+        } = cli.command
+        else {
+            panic!("expected mount command");
+        };
+        assert_eq!(
+            mvcc_evidence_ledger,
+            Some(PathBuf::from("/tmp/test_mvcc_ledger.jsonl"))
+        );
+        assert_eq!(mvcc_policy, Some(MvccPolicyArg::Adaptive));
+    }
+
+    #[test]
     fn parse_btrfs_mount_selection_defaults_to_root() {
         let selection =
             parse_btrfs_mount_selection(None, None).expect("default selection should parse");
@@ -14631,6 +14676,7 @@ mod tests {
             btrfs_verify_data_on_read: false,
             commit_interval_secs: None,
             mvcc_policy: None,
+            mvcc_evidence_ledger: None,
             mount_mode: MountMode::Compat,
             btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
             btrfs_device_paths: Vec::new(),
@@ -14726,6 +14772,7 @@ mod tests {
             btrfs_verify_data_on_read: verify,
             commit_interval_secs: None,
             mvcc_policy: None,
+            mvcc_evidence_ledger: None,
             mount_mode: MountMode::Compat,
             btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
             btrfs_device_paths: Vec::new(),
@@ -14770,6 +14817,7 @@ mod tests {
             btrfs_verify_data_on_read: false,
             commit_interval_secs: None,
             mvcc_policy: None,
+            mvcc_evidence_ledger: None,
             mount_mode: MountMode::Compat,
             btrfs_mount_selection: BtrfsMountSelection::Subvolume("home".to_owned()),
             btrfs_device_paths: Vec::new(),
@@ -14809,6 +14857,7 @@ mod tests {
             btrfs_verify_data_on_read: false,
             commit_interval_secs: None,
             mvcc_policy: None,
+            mvcc_evidence_ledger: None,
             mount_mode: MountMode::Native,
             btrfs_mount_selection: BtrfsMountSelection::Snapshot("snap-1".to_owned()),
             btrfs_device_paths: Vec::new(),
@@ -14852,6 +14901,7 @@ mod tests {
                     btrfs_verify_data_on_read: false,
                     commit_interval_secs: None,
                     mvcc_policy: None,
+                    mvcc_evidence_ledger: None,
                     mount_mode: MountMode::Compat,
                     btrfs_mount_selection: BtrfsMountSelection::Subvolume("missing".to_owned()),
                     btrfs_device_paths: Vec::new(),
@@ -14904,6 +14954,7 @@ mod tests {
                     btrfs_verify_data_on_read: false,
                     commit_interval_secs: None,
                     mvcc_policy: None,
+                    mvcc_evidence_ledger: None,
                     mount_mode: MountMode::Compat,
                     btrfs_mount_selection: BtrfsMountSelection::Snapshot(
                         "missing-snapshot".to_owned(),
@@ -14957,6 +15008,7 @@ mod tests {
                     btrfs_verify_data_on_read: false,
                     commit_interval_secs: None,
                     mvcc_policy: None,
+                    mvcc_evidence_ledger: None,
                     mount_mode: MountMode::Compat,
                     btrfs_mount_selection: BtrfsMountSelection::Subvolume("home".to_owned()),
                     btrfs_device_paths: Vec::new(),
@@ -15027,6 +15079,7 @@ mod tests {
                     btrfs_verify_data_on_read: false,
                     commit_interval_secs: None,
                     mvcc_policy: None,
+                    mvcc_evidence_ledger: None,
                     mount_mode: MountMode::Compat,
                     btrfs_mount_selection: BtrfsMountSelection::Snapshot("snap-home".to_owned()),
                     btrfs_device_paths: Vec::new(),
@@ -15153,6 +15206,57 @@ mod tests {
         match cli.command {
             Command::Mount { native, .. } => {
                 assert!(native, "--native flag should set native to true");
+            }
+            other => assert!(
+                matches!(other, Command::Mount { .. }),
+                "expected mount command"
+            ),
+        }
+    }
+
+    #[test]
+    fn cli_parses_mount_mvcc_policy_and_evidence_ledger_bd_7ssc7() {
+        let cli = Cli::try_parse_from([
+            "ffs",
+            "mount",
+            "--mvcc-policy",
+            "adaptive",
+            "--mvcc-evidence-ledger",
+            "/tmp/mvcc_ledger.jsonl",
+            "/img",
+            "/mnt",
+        ])
+        .expect("mount with mvcc policy and evidence ledger should parse");
+
+        match cli.command {
+            Command::Mount {
+                mvcc_policy,
+                mvcc_evidence_ledger,
+                ..
+            } => {
+                assert_eq!(mvcc_policy, Some(super::MvccPolicyArg::Adaptive));
+                assert_eq!(
+                    mvcc_evidence_ledger,
+                    Some(PathBuf::from("/tmp/mvcc_ledger.jsonl"))
+                );
+            }
+            other => assert!(
+                matches!(other, Command::Mount { .. }),
+                "expected mount command"
+            ),
+        }
+
+        // Test defaults
+        let default_cli = Cli::try_parse_from(["ffs", "mount", "/img", "/mnt"])
+            .expect("mount default should parse");
+        match default_cli.command {
+            Command::Mount {
+                mvcc_policy,
+                mvcc_evidence_ledger,
+                ..
+            } => {
+                assert_eq!(mvcc_policy, None);
+                assert_eq!(mvcc_evidence_ledger, None);
             }
             other => assert!(
                 matches!(other, Command::Mount { .. }),

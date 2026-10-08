@@ -2069,6 +2069,9 @@ pub struct OpenFs {
     /// the store is replaced (e.g. the switch to the single-lock store when a
     /// JBD2 writer attaches), so a policy set early is never silently dropped.
     mvcc_conflict_policy: Mutex<ffs_mvcc::ConflictPolicy>,
+    /// Evidence ledger path requested for this mount (bd-7ssc7). Re-applied whenever
+    /// the store is replaced so evidence tracking is never silently dropped.
+    mvcc_evidence_ledger_path: Mutex<Option<std::path::PathBuf>>,
     /// Highest MVCC commit sequence durably checkpointed to this filesystem's
     /// base device. The mutex serializes concurrent fsync/flush calls so an older
     /// checkpoint cannot overwrite a newer one after its watermark publishes.
@@ -6399,6 +6402,9 @@ impl OpenFs {
         self.mvcc_store = Arc::new(FsMvccStore::sharded_with_publication_mode(mode));
         self.mvcc_store
             .set_conflict_policy(*self.mvcc_conflict_policy.lock());
+        if let Some(ref path) = *self.mvcc_evidence_ledger_path.lock() {
+            let _ = self.mvcc_store.enable_evidence_ledger(path);
+        }
         Ok(())
     }
 
@@ -6774,6 +6780,7 @@ impl OpenFs {
             btrfs_devices,
             mvcc_store,
             mvcc_conflict_policy: Mutex::new(ffs_mvcc::ConflictPolicy::default()),
+            mvcc_evidence_ledger_path: Mutex::new(None),
             mvcc_flushed_through: Mutex::new(CommitSeq(0)),
             mutation_epoch: std::sync::atomic::AtomicU64::new(0),
             committed_mutation_epoch: std::sync::atomic::AtomicU64::new(0),
@@ -10912,6 +10919,9 @@ impl OpenFs {
             self.mvcc_store = Arc::new(FsMvccStore::single());
             self.mvcc_store
                 .set_conflict_policy(*self.mvcc_conflict_policy.lock());
+            if let Some(ref path) = *self.mvcc_evidence_ledger_path.lock() {
+                let _ = self.mvcc_store.enable_evidence_ledger(path);
+            }
         }
         // bd-1o6tq: a boundary journals every block dirtied since the last one
         // as ONE transaction, and one that outgrows the log is refused
@@ -11436,6 +11446,31 @@ impl OpenFs {
     #[must_use]
     pub fn mvcc_conflict_policy(&self) -> ffs_mvcc::ConflictPolicy {
         self.mvcc_store.conflict_policy()
+    }
+
+    /// Enable append-only evidence recording for MVCC commits and aborts (bd-7ssc7).
+    ///
+    /// Persists across store replacement.
+    pub fn enable_mvcc_evidence_ledger(
+        &self,
+        path: impl AsRef<std::path::Path>,
+    ) -> ffs_error::Result<()> {
+        let path = path.as_ref();
+        self.mvcc_store.enable_evidence_ledger(path)?;
+        *self.mvcc_evidence_ledger_path.lock() = Some(path.to_path_buf());
+        Ok(())
+    }
+
+    /// Disable append-only evidence recording for MVCC commits and aborts.
+    pub fn disable_mvcc_evidence_ledger(&self) {
+        *self.mvcc_evidence_ledger_path.lock() = None;
+        self.mvcc_store.disable_evidence_ledger();
+    }
+
+    /// Whether an MVCC evidence ledger is enabled on the live store (bd-7ssc7).
+    #[must_use]
+    pub fn has_mvcc_evidence_ledger(&self) -> bool {
+        self.mvcc_store.has_evidence_ledger()
     }
 
     /// Periodic durability commit (bd-dj725).
@@ -70347,6 +70382,30 @@ mod tests {
         );
     }
 
+    /// bd-7ssc7: an enabled evidence ledger reaches the live store and
+    /// survives the store switch that attaching a JBD2 writer performs.
+    #[test]
+    fn mvcc_evidence_ledger_survives_jbd2_store_switch_bd_7ssc7() {
+        let cx = Cx::for_testing();
+        let Some((mut fs, _dev, tmp)) = open_writable_ext4_mkfs_with_device(64) else {
+            oracle_unavailable("ext4 image formatter");
+            return;
+        };
+        let ledger_path = tmp.path().join("mvcc_evidence.jsonl");
+        assert!(!fs.has_mvcc_evidence_ledger());
+        fs.enable_mvcc_evidence_ledger(&ledger_path)
+            .expect("enable ledger");
+        assert!(fs.has_mvcc_evidence_ledger());
+        assert!(
+            fs.attach_ext4_internal_jbd2_writer(&cx)
+                .expect("attach journal")
+        );
+        assert!(
+            fs.has_mvcc_evidence_ledger(),
+            "the evidence ledger must survive the switch to the single-lock store"
+        );
+    }
+
     /// bd-dj725: the periodic commit makes un-fsynced ext4 writes durable, and
     /// is a no-op when nothing changed (an idle mount must not pay for syncs).
     #[test]
@@ -112665,6 +112724,20 @@ mod tests {
             "no inodes should reference non-existent extent"
         );
         assert_eq!(elem_missed, 0);
+    }
+
+    #[test]
+    fn open_fs_mvcc_evidence_ledger_lifecycle_bd_7ssc7() {
+        let (fs, _cx) = open_writable_btrfs();
+        let dir = tempfile::tempdir().unwrap();
+        let ledger_path = dir.path().join("ledger.jsonl");
+
+        assert!(!fs.has_mvcc_evidence_ledger());
+        fs.enable_mvcc_evidence_ledger(&ledger_path).unwrap();
+        assert!(fs.has_mvcc_evidence_ledger());
+
+        fs.disable_mvcc_evidence_ledger();
+        assert!(!fs.has_mvcc_evidence_ledger());
     }
 }
 
