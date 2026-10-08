@@ -8142,6 +8142,34 @@ impl BtrfsExtentAllocator {
         self.invalidate_tail_cursors();
     }
 
+    /// Hold a data extent whose last reference this transaction dropped out of
+    /// allocation until the superblock that drops it lands (bd-xfh0k), as
+    /// kernel btrfs pins freed extents. The committed trees may still point at
+    /// it, and a commit writes new data before its superblock: handing the
+    /// space out now lets a crash in that window, or a read that resolved the
+    /// old mapping, see another file's bytes. Released by
+    /// `release_pinned_after_superblock_commit`.
+    pub fn pin_freed_extent(&mut self, bytenr: u64, num_bytes: u64) {
+        self.pin_extent(bytenr, num_bytes, false);
+    }
+
+    /// Pinned bytes inside block groups carrying any of `flags` (e.g.
+    /// `BTRFS_BLOCK_GROUP_DATA`): space a commit would give back.
+    #[must_use]
+    pub fn pinned_bytes_in(&self, flags: u64) -> u64 {
+        self.block_groups
+            .values()
+            .filter(|bg| bg.item.flags & flags != 0)
+            .map(|bg| {
+                let end = bg.start.saturating_add(bg.item.total_bytes);
+                self.pinned
+                    .range(bg.start..end)
+                    .map(|(_, pin)| pin.num_bytes)
+                    .sum::<u64>()
+            })
+            .sum()
+    }
+
     /// Number of extents currently pinned. Test/diagnostic accessor.
     #[must_use]
     pub fn pinned_extent_count(&self) -> usize {

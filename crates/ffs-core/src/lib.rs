@@ -35123,6 +35123,39 @@ impl OpenFs {
         Ok(())
     }
 
+    /// bd-xfh0k: freed data extents stay pinned until the next superblock
+    /// lands, so a request can run out of space that a commit would give back.
+    /// Kernel btrfs commits to unpin before it fails an allocation; this runs
+    /// `op`, and on ENOSPC with pinned data bytes commits and runs it once
+    /// more. Only for requests that change nothing before their allocation
+    /// fails, or that repeat idempotently (write reserves first, bd-72tn8;
+    /// fallocate skips ranges it already preallocated).
+    fn btrfs_retry_after_unpin<T>(
+        &self,
+        cx: &Cx,
+        mut op: impl FnMut() -> ffs_error::Result<T>,
+    ) -> ffs_error::Result<T> {
+        match op() {
+            Err(FfsError::NoSpace) => {
+                let pinned = self.btrfs_alloc_state.as_ref().map_or(0, |alloc| {
+                    alloc
+                        .read()
+                        .extent_alloc
+                        .pinned_bytes_in(BTRFS_BLOCK_GROUP_DATA)
+                });
+                if pinned == 0
+                    || self
+                        .btrfs_full_transaction_commit(cx, "btrfs-enospc-unpin")
+                        .is_err()
+                {
+                    return Err(FfsError::NoSpace);
+                }
+                op()
+            }
+            other => other,
+        }
+    }
+
     /// bd-a136s: `alloc_data` with an on-demand data-chunk growth retry. A
     /// DATA `alloc_data` that returns `NoSpace` first attempts to grow one
     /// data chunk from unallocated device space (on by default; disabled by
@@ -36296,6 +36329,10 @@ impl OpenFs {
                 .extent_alloc
                 .free_extent(disk_bytenr, disk_num_bytes, false)
                 .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            // bd-xfh0k: not reusable until this transaction's superblock lands.
+            alloc
+                .extent_alloc
+                .pin_freed_extent(disk_bytenr, disk_num_bytes);
             if remove_csums {
                 Self::btrfs_remove_extent_csums(alloc, disk_bytenr, disk_num_bytes)?;
             }
@@ -79105,6 +79142,134 @@ mod tests {
                 "{profile} with only {} devices must be refused",
                 too_few.len()
             );
+        }
+    }
+
+    /// Regular data extents `(disk_bytenr, disk_num_bytes)` of `ino`.
+    fn btrfs_data_extents_of(fs: &OpenFs, ino: InodeNumber) -> Vec<(u64, u64)> {
+        let canonical = fs.btrfs_canonical_inode(ino).expect("canonical");
+        let alloc = fs.btrfs_alloc_state.as_ref().unwrap().read();
+        OpenFs::btrfs_extent_data_items(&alloc, canonical)
+            .expect("extent items")
+            .into_iter()
+            .filter_map(|(_, extent)| match extent {
+                BtrfsExtentData::Regular {
+                    disk_bytenr,
+                    disk_num_bytes,
+                    ..
+                } if disk_bytenr != 0 => Some((disk_bytenr, disk_num_bytes)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// bd-xfh0k: a data extent whose last reference is dropped stays out of
+    /// allocation until the superblock that drops it lands. The committed
+    /// trees still point at it, and a commit writes new data before its
+    /// superblock, so reusing it within the transaction let a crash (or a
+    /// read that resolved the old mapping) see another file's bytes.
+    #[test]
+    fn btrfs_freed_data_extents_are_not_reused_before_the_commit() {
+        let Some((fs, _tmp, _image)) = open_file_backed_btrfs(128) else {
+            oracle_unavailable("btrfs image formatter (btrfs-progs)");
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let chunk = vec![0x5A_u8; 1 << 20];
+        let victim = fs
+            .create(&cx, root, OsStr::new("victim"), 0o644, 0, 0)
+            .expect("create victim")
+            .ino;
+        for i in 0..8_u64 {
+            fs.write(&cx, victim, i << 20, &chunk)
+                .expect("write victim");
+        }
+        fs.fsync(&cx, victim, 0, false).expect("commit victim");
+        let committed = btrfs_data_extents_of(&fs, victim);
+        assert!(!committed.is_empty(), "victim has data extents");
+        // Fill the rest, so the victim's space is the only space left.
+        let fill = fs
+            .create(&cx, root, OsStr::new("fill"), 0o644, 0, 0)
+            .expect("create fill")
+            .ino;
+        let mut offset = 0_u64;
+        while fs.write(&cx, fill, offset, &chunk).is_ok() {
+            offset += 1 << 20;
+            assert!(offset < 1 << 30, "a 128 MiB image never fills");
+        }
+        fs.fsync(&cx, fill, 0, false).expect("commit the fill");
+
+        let generation = |fs: &OpenFs| fs.btrfs_alloc_state.as_ref().unwrap().read().generation;
+        let before = generation(&fs);
+        fs.unlink(&cx, root, OsStr::new("victim"))
+            .expect("unlink victim");
+        let fresh = fs
+            .create(&cx, root, OsStr::new("fresh"), 0o644, 0, 0)
+            .expect("create fresh")
+            .ino;
+        fs.write(&cx, fresh, 0, &chunk).expect("write fresh");
+        let reused = btrfs_data_extents_of(&fs, fresh)
+            .iter()
+            .any(|&(start, len)| {
+                committed
+                    .iter()
+                    .any(|&(old, old_len)| start < old + old_len && old < start + len)
+            });
+        // The space may come back only through a commit that dropped the
+        // victim from the durable trees (the ENOSPC retry), never within the
+        // transaction that freed it.
+        assert!(
+            !reused || generation(&fs) > before,
+            "fresh data landed on the committed victim's extent with no commit in between"
+        );
+        assert_eq!(fs.read(&cx, fresh, 0, 1 << 20).unwrap(), chunk);
+    }
+
+    /// bd-xfh0k: with freed data pinned until the next commit, a write that
+    /// runs out of space while a commit would give space back commits and
+    /// retries instead of failing, as kernel btrfs does.
+    #[test]
+    fn btrfs_writes_reclaim_pinned_space_instead_of_failing() {
+        // Filled to ENOSPC first, so chunk growth has nothing left to add.
+        let Some((fs, _tmp, _image)) = open_file_backed_btrfs(128) else {
+            oracle_unavailable("btrfs image formatter (btrfs-progs)");
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let fill = fs
+            .create(&cx, root, OsStr::new("fill"), 0o644, 0, 0)
+            .expect("create fill")
+            .ino;
+        let chunk = vec![0x11_u8; 1 << 20];
+        let mut written = 0_u64;
+        loop {
+            match fs.write(&cx, fill, written, &chunk) {
+                Ok(_) => written += 1 << 20,
+                Err(err) => {
+                    assert_eq!(err.to_errno(), libc::ENOSPC, "filling: {err}");
+                    break;
+                }
+            }
+            assert!(written < 1 << 30, "a 128 MiB image never fills");
+        }
+        fs.fsync(&cx, fill, 0, false).expect("commit the fill");
+        assert!(written >= 16 << 20, "filled only {written} bytes");
+
+        // Free it all (pinned until a commit), then write half as much again
+        // with no commit in between: only the retry's commit makes room.
+        fs.unlink(&cx, root, OsStr::new("fill"))
+            .expect("unlink fill");
+        let again = fs
+            .create(&cx, root, OsStr::new("again"), 0o644, 0, 0)
+            .expect("create again")
+            .ino;
+        let mut offset = 0_u64;
+        while offset < written / 2 {
+            fs.write(&cx, again, offset, &chunk)
+                .unwrap_or_else(|err| panic!("write at {offset} of {}: {err}", written / 2));
+            offset += 1 << 20;
         }
     }
 

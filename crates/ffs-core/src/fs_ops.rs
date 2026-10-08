@@ -1588,7 +1588,7 @@ impl FsOps for OpenFs {
             }
             FsFlavor::Btrfs(_) => {
                 self.check_btrfs_mutation_allowed("write")?;
-                self.btrfs_write(cx, ino, offset, data)
+                self.btrfs_retry_after_unpin(cx, || self.btrfs_write(cx, ino, offset, data))
             }
         }
     }
@@ -1685,7 +1685,15 @@ impl FsOps for OpenFs {
             ),
             FsFlavor::Btrfs(_) => {
                 self.check_btrfs_mutation_allowed("fallocate")?;
-                self.btrfs_fallocate(cx, ino, offset, length, mode)
+                // Only plain preallocation repeats idempotently (bd-xfh0k);
+                // a second collapse/insert/punch would move data again.
+                if mode & !libc::FALLOC_FL_KEEP_SIZE == 0 {
+                    self.btrfs_retry_after_unpin(cx, || {
+                        self.btrfs_fallocate(cx, ino, offset, length, mode)
+                    })
+                } else {
+                    self.btrfs_fallocate(cx, ino, offset, length, mode)
+                }
             }
         }
     }
