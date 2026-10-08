@@ -39,7 +39,9 @@ fn prepared(commits: &[WalCommit]) -> Vec<PreparedRecord<'_>> {
 fn replay(bytes: &[u8]) -> Vec<WalCommit> {
     let mut commits = Vec::new();
     let report = WalReplayEngine::new(TailPolicy::FailFast)
-        .replay(&bytes[HEADER_SIZE..], 0, |commit| commits.push(commit.clone()))
+        .replay(&bytes[HEADER_SIZE..], 0, |commit| {
+            commits.push(commit.clone())
+        })
         .unwrap();
     assert!(report.outcome.is_clean());
     commits
@@ -62,7 +64,10 @@ fn stream_is_byte_identical_to_v1_across_all_field_and_chunk_boundaries() {
     commits[3].writes[2].block = BlockNumber(1);
     let expected = legacy_bytes(&commits);
     let records = prepared(&commits);
-    assert_eq!(records.iter().map(|record| record.bytes).sum::<usize>(), expected.len());
+    assert_eq!(
+        records.iter().map(|record| record.bytes).sum::<usize>(),
+        expected.len()
+    );
     for size in [1, 3, 4, 7, 12, 13, 21, 25, 29, 4096, CHUNK_BYTES] {
         let mut buffer = vec![0; size];
         let mut actual = Vec::new();
@@ -79,15 +84,20 @@ fn stream_is_byte_identical_to_v1_across_all_field_and_chunk_boundaries() {
 
 #[test]
 fn large_inputs_never_emit_an_unbounded_payload_or_batch_chunk() {
-    let commits = [commit(1, &[CHUNK_BYTES * 17 + 13]), commit(2, &[CHUNK_BYTES * 3])];
+    let commits = [
+        commit(1, &[CHUNK_BYTES * 17 + 13]),
+        commit(2, &[CHUNK_BYTES * 3]),
+    ];
     let records = prepared(&commits);
     for record in &records {
         let mut emitted = 0;
-        record.emit(|bytes| {
-            assert!(bytes.len() <= CHUNK_BYTES);
-            emitted += bytes.len();
-            Ok(())
-        }).unwrap();
+        record
+            .emit(|bytes| {
+                assert!(bytes.len() <= CHUNK_BYTES);
+                emitted += bytes.len();
+                Ok(())
+            })
+            .unwrap();
         assert_eq!(emitted, record.bytes);
     }
     let total = records.iter().map(|record| record.bytes).sum::<usize>();
@@ -95,9 +105,14 @@ fn large_inputs_never_emit_an_unbounded_payload_or_batch_chunk() {
     emit_chunks(&records, &mut scratch(CHUNK_BYTES).unwrap(), |bytes| {
         chunks.push(bytes.len());
         Ok(())
-    }).unwrap();
+    })
+    .unwrap();
     assert_eq!(chunks.len(), total.div_ceil(CHUNK_BYTES));
-    assert!(chunks[..chunks.len() - 1].iter().all(|&len| len == CHUNK_BYTES));
+    assert!(
+        chunks[..chunks.len() - 1]
+            .iter()
+            .all(|&len| len == CHUNK_BYTES)
+    );
     assert_eq!(chunks.iter().sum::<usize>(), total);
 }
 
@@ -109,7 +124,8 @@ fn tiny_batch_still_coalesces_into_one_write() {
     emit_chunks(&records, &mut scratch(CHUNK_BYTES).unwrap(), |_| {
         calls += 1;
         Ok(())
-    }).unwrap();
+    })
+    .unwrap();
     assert_eq!(calls, 1);
 }
 
@@ -158,15 +174,23 @@ fn sink_failure_stops_emission_and_never_flushes_from_drop() {
 
 #[test]
 fn public_single_and_batch_appends_preserve_bytes_results_and_sync_policies() {
-    for policy in [SyncPolicy::Immediate, SyncPolicy::EveryN(3), SyncPolicy::Manual] {
+    for policy in [
+        SyncPolicy::Immediate,
+        SyncPolicy::EveryN(3),
+        SyncPolicy::Manual,
+    ] {
         for verify in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("stream.wal");
-            let mut writer = WalWriter::create(&path, WalWriterConfig {
-                sync_policy: policy,
-                verify_writes: verify,
-                ..WalWriterConfig::default()
-            }).unwrap();
+            let mut writer = WalWriter::create(
+                &path,
+                WalWriterConfig {
+                    sync_policy: policy,
+                    verify_writes: verify,
+                    ..WalWriterConfig::default()
+                },
+            )
+            .unwrap();
             let commits = [
                 commit(1, &[CHUNK_BYTES + 7]),
                 commit(2, &[0, CHUNK_BYTES * 2]),
@@ -200,24 +224,46 @@ fn public_single_and_batch_appends_preserve_bytes_results_and_sync_policies() {
 #[test]
 fn multichunk_append_failure_rolls_back_whole_batch_and_allows_exact_retry() {
     let first = commit(1, &[8]);
-    let commits = [commit(2, &[CHUNK_BYTES + 1]), commit(3, &[CHUNK_BYTES + 13])];
+    let commits = [
+        commit(2, &[CHUNK_BYTES + 1]),
+        commit(3, &[CHUNK_BYTES + 13]),
+    ];
     let total = legacy_bytes(&commits).len();
     let first_boundary = wal::encode_commit(&commits[0]).unwrap().len();
-    for limit in [0, 1, 4, 25, 37, CHUNK_BYTES - 1, CHUNK_BYTES, CHUNK_BYTES + 1,
-        first_boundary, first_boundary + 1, total - 1, total, total + 100] {
+    for limit in [
+        0,
+        1,
+        4,
+        25,
+        37,
+        CHUNK_BYTES - 1,
+        CHUNK_BYTES,
+        CHUNK_BYTES + 1,
+        first_boundary,
+        first_boundary + 1,
+        total - 1,
+        total,
+        total + 100,
+    ] {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("rollback.wal");
-        let mut writer = WalWriter::create(&path, WalWriterConfig {
-            sync_policy: SyncPolicy::Manual,
-            verify_writes: true,
-            ..WalWriterConfig::default()
-        }).unwrap();
+        let mut writer = WalWriter::create(
+            &path,
+            WalWriterConfig {
+                sync_policy: SyncPolicy::Manual,
+                verify_writes: true,
+                ..WalWriterConfig::default()
+            },
+        )
+        .unwrap();
         writer.append_commit(&first).unwrap();
         let prefix = std::fs::read(&path).unwrap();
         let base = writer.size();
         writer.fail_append_after = Some(limit);
         let error = writer.append_commits_coalesced(&commits).unwrap_err();
-        assert!(matches!(error, WalWriteError::AppendIo { bytes_attempted, .. } if bytes_attempted == total));
+        assert!(
+            matches!(error, WalWriteError::AppendIo { bytes_attempted, .. } if bytes_attempted == total)
+        );
         assert_eq!(std::fs::read(&path).unwrap(), prefix, "limit {limit}");
         assert_eq!(writer.size(), base);
         assert_eq!(writer.last_commit_seq(), 1);
@@ -225,8 +271,10 @@ fn multichunk_append_failure_rolls_back_whole_batch_and_allows_exact_retry() {
         writer.ensure_ready().unwrap();
         writer.fail_append_after = None;
         writer.append_commits_coalesced(&commits).unwrap();
-        assert_eq!(replay(&std::fs::read(&path).unwrap()),
-            [first.clone(), commits[0].clone(), commits[1].clone()]);
+        assert_eq!(
+            replay(&std::fs::read(&path).unwrap()),
+            [first.clone(), commits[0].clone(), commits[1].clone()]
+        );
     }
 }
 
@@ -234,23 +282,36 @@ fn multichunk_append_failure_rolls_back_whole_batch_and_allows_exact_retry() {
 fn sync_failure_after_all_chunks_restores_prior_pending_state() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("sync.wal");
-    let mut writer = WalWriter::create(&path, WalWriterConfig {
-        sync_policy: SyncPolicy::EveryN(3),
-        ..WalWriterConfig::default()
-    }).unwrap();
+    let mut writer = WalWriter::create(
+        &path,
+        WalWriterConfig {
+            sync_policy: SyncPolicy::EveryN(3),
+            ..WalWriterConfig::default()
+        },
+    )
+    .unwrap();
     writer.append_commit(&commit(1, &[8])).unwrap();
     let prefix = std::fs::read(&path).unwrap();
     let base = writer.size();
     let commits = [commit(2, &[CHUNK_BYTES * 2]), commit(3, &[CHUNK_BYTES + 7])];
     writer.fail_sync = true;
-    assert!(matches!(writer.append_commits_coalesced(&commits), Err(WalWriteError::SyncIo { .. })));
+    assert!(matches!(
+        writer.append_commits_coalesced(&commits),
+        Err(WalWriteError::SyncIo { .. })
+    ));
     assert_eq!(std::fs::read(&path).unwrap(), prefix);
     assert_eq!(writer.size(), base);
     assert_eq!(writer.last_commit_seq(), 1);
     assert_eq!(writer.pending_sync_count(), 1);
     writer.ensure_ready().unwrap();
     writer.fail_sync = false;
-    assert!(writer.append_commits_coalesced(&commits).unwrap().iter().all(|result| result.synced));
+    assert!(
+        writer
+            .append_commits_coalesced(&commits)
+            .unwrap()
+            .iter()
+            .all(|result| result.synced)
+    );
 }
 
 #[test]
@@ -263,15 +324,26 @@ fn uncertain_multichunk_rollback_seals_writer_without_an_implicit_retry() {
         writer.fail_append_after = Some(CHUNK_BYTES + 3);
         writer.fail_rollback_truncate = fail_truncate;
         writer.fail_rollback_sync = !fail_truncate;
-        assert!(matches!(writer.append_commit(&commit(2, &[CHUNK_BYTES * 3])),
-            Err(WalWriteError::RecoveryRequired { .. })));
+        assert!(matches!(
+            writer.append_commit(&commit(2, &[CHUNK_BYTES * 3])),
+            Err(WalWriteError::RecoveryRequired { .. })
+        ));
         let before_retry = std::fs::read(&path).unwrap();
         writer.fail_append_after = None;
         writer.fail_rollback_truncate = false;
         writer.fail_rollback_sync = false;
-        assert!(matches!(writer.append_commit(&commit(3, &[])), Err(WalWriteError::RecoveryRequired { .. })));
-        assert!(matches!(writer.append_commits_coalesced(&[]), Err(WalWriteError::RecoveryRequired { .. })));
-        assert!(matches!(writer.flush(), Err(WalWriteError::RecoveryRequired { .. })));
+        assert!(matches!(
+            writer.append_commit(&commit(3, &[])),
+            Err(WalWriteError::RecoveryRequired { .. })
+        ));
+        assert!(matches!(
+            writer.append_commits_coalesced(&[]),
+            Err(WalWriteError::RecoveryRequired { .. })
+        ));
+        assert!(matches!(
+            writer.flush(),
+            Err(WalWriteError::RecoveryRequired { .. })
+        ));
         assert_eq!(std::fs::read(&path).unwrap(), before_retry);
     }
 }
@@ -284,12 +356,21 @@ fn late_invalid_record_and_position_overflow_do_not_write_or_truncate() {
     let before = std::fs::read(&path).unwrap();
     let mut commits = [commit(1, &[CHUNK_BYTES * 2]), commit(2, &[])];
     commits[1].txn_id = TxnId(u64::MAX);
-    assert!(matches!(writer.append_commits_coalesced(&commits), Err(WalWriteError::FormatViolation { .. })));
+    assert!(matches!(
+        writer.append_commits_coalesced(&commits),
+        Err(WalWriteError::FormatViolation { .. })
+    ));
     assert_eq!(std::fs::read(&path).unwrap(), before);
     commits[1].txn_id = TxnId(3);
     writer.write_pos = u64::MAX - 4;
-    assert!(matches!(writer.append_commits_coalesced(&commits), Err(WalWriteError::FormatViolation { .. })));
-    assert!(matches!(writer.append_commit(&commits[0]), Err(WalWriteError::FormatViolation { .. })));
+    assert!(matches!(
+        writer.append_commits_coalesced(&commits),
+        Err(WalWriteError::FormatViolation { .. })
+    ));
+    assert!(matches!(
+        writer.append_commit(&commits[0]),
+        Err(WalWriteError::FormatViolation { .. })
+    ));
     assert_eq!(std::fs::read(&path).unwrap(), before);
     assert_eq!(writer.write_pos, u64::MAX - 4);
     writer.ensure_ready().unwrap();
@@ -310,16 +391,40 @@ fn streaming_verification_rejects_crc_valid_substitution_without_moving_cursor()
     assert_eq!(crc32c::crc32c(&actual), crc32c::crc32c(&wanted));
     writer.file.write_all_at(&actual, writer.write_pos).unwrap();
     writer.file_mut().seek(SeekFrom::Start(3)).unwrap();
-    let error = writer.verify_streamed(&prepared(&expected), &mut scratch(CHUNK_BYTES).unwrap(),
-        &mut scratch(CHUNK_BYTES).unwrap(), actual.len()).unwrap_err();
-    assert!(matches!(error, WalWriteError::VerificationFailed { expected_crc, actual_crc, offset }
-        if expected_crc == actual_crc && offset == u64::try_from(HEADER_SIZE).unwrap()));
+    let error = writer
+        .verify_streamed(
+            &prepared(&expected),
+            &mut scratch(CHUNK_BYTES).unwrap(),
+            &mut scratch(CHUNK_BYTES).unwrap(),
+            actual.len(),
+        )
+        .unwrap_err();
+    assert!(
+        matches!(error, WalWriteError::VerificationFailed { expected_crc, actual_crc, offset }
+        if expected_crc == actual_crc && offset == u64::try_from(HEADER_SIZE).unwrap())
+    );
     assert_eq!(writer.file_mut().stream_position().unwrap(), 3);
     writer.file.write_all_at(&wanted, writer.write_pos).unwrap();
-    writer.verify_streamed(&prepared(&expected), &mut scratch(CHUNK_BYTES).unwrap(),
-        &mut scratch(CHUNK_BYTES).unwrap(), wanted.len()).unwrap();
-    writer.file.set_len(writer.write_pos + u64::try_from(wanted.len()).unwrap() - 1).unwrap();
-    assert!(matches!(writer.verify_streamed(&prepared(&expected), &mut scratch(CHUNK_BYTES).unwrap(),
-        &mut scratch(CHUNK_BYTES).unwrap(), wanted.len()), Err(WalWriteError::AppendIo { .. })));
+    writer
+        .verify_streamed(
+            &prepared(&expected),
+            &mut scratch(CHUNK_BYTES).unwrap(),
+            &mut scratch(CHUNK_BYTES).unwrap(),
+            wanted.len(),
+        )
+        .unwrap();
+    writer
+        .file
+        .set_len(writer.write_pos + u64::try_from(wanted.len()).unwrap() - 1)
+        .unwrap();
+    assert!(matches!(
+        writer.verify_streamed(
+            &prepared(&expected),
+            &mut scratch(CHUNK_BYTES).unwrap(),
+            &mut scratch(CHUNK_BYTES).unwrap(),
+            wanted.len()
+        ),
+        Err(WalWriteError::AppendIo { .. })
+    ));
     assert_eq!(writer.file_mut().stream_position().unwrap(), 3);
 }

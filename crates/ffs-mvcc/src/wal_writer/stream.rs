@@ -389,4 +389,5 @@ impl WalWriter {
 }
 
 #[cfg(test)]
+#[path = "stream/tests.rs"]
 mod tests;
