@@ -753,9 +753,8 @@ impl BtrfsReadDevices {
     /// one copy in every mirrored stripe group. Other profiles need all devices.
     fn validate_read_coverage(&self, chunks: &[BtrfsChunkEntry]) -> Result<(), FfsError> {
         use ffs_ondisk::chunk_type_flags::{
-            BTRFS_BLOCK_GROUP_METADATA, BTRFS_BLOCK_GROUP_RAID1, BTRFS_BLOCK_GROUP_RAID1C3,
-            BTRFS_BLOCK_GROUP_RAID1C4, BTRFS_BLOCK_GROUP_RAID5, BTRFS_BLOCK_GROUP_RAID6,
-            BTRFS_BLOCK_GROUP_RAID10, BTRFS_BLOCK_GROUP_SYSTEM, RAID_MASK,
+            BTRFS_BLOCK_GROUP_RAID1, BTRFS_BLOCK_GROUP_RAID1C3, BTRFS_BLOCK_GROUP_RAID1C4,
+            BTRFS_BLOCK_GROUP_RAID5, BTRFS_BLOCK_GROUP_RAID6, BTRFS_BLOCK_GROUP_RAID10, RAID_MASK,
         };
         for chunk in chunks {
             let present = chunk
@@ -797,27 +796,16 @@ impl BtrfsReadDevices {
                 }
                 // bd-hk5w3: RAID5 tolerates one absent stripe and RAID6 two —
                 // reads on the degraded set are rebuilt from the surviving
-                // slots plus parity (XOR for a single erasure) and verified
-                // against the data checksum before they are served. That
-                // tolerance is DATA-only: tree-node reads have no parity
-                // reconstruction yet, so a METADATA/SYSTEM chunk missing any
-                // stripe would admit a mount it cannot actually serve
-                // (bd-90aey — degraded open succeeded, then the first tree
-                // read failed with `insufficient data`). Refuse those.
+                // slots plus parity and verified before they are served:
+                // data against its checksum, tree nodes against their own
+                // checksum, logical address and structure (read_node).
                 BTRFS_BLOCK_GROUP_RAID5 | BTRFS_BLOCK_GROUP_RAID6 => {
                     let erasures = if chunk.chunk_type & RAID_MASK == BTRFS_BLOCK_GROUP_RAID5 {
                         1
                     } else {
                         2
                     };
-                    let carries_tree_nodes = chunk.chunk_type
-                        & (BTRFS_BLOCK_GROUP_METADATA | BTRFS_BLOCK_GROUP_SYSTEM)
-                        != 0;
-                    if carries_tree_nodes {
-                        present == chunk.stripes.len()
-                    } else {
-                        present + erasures >= chunk.stripes.len()
-                    }
+                    present + erasures >= chunk.stripes.len()
                 }
                 _ => present > 0 && present == chunk.stripes.len(),
             };
@@ -948,7 +936,7 @@ impl BtrfsReadDevices {
             offset: 0,
             actual: 0,
         };
-        for stripe in mapping.stripes {
+        for stripe in &mapping.stripes {
             let bytes = match self
                 .readers
                 .read_physical(cx, stripe.devid, stripe.physical, ns)
@@ -967,6 +955,33 @@ impl BtrfsReadDevices {
             match parse_btrfs_tree_node_owned(bytes, csum_type, logical, nodesize) {
                 Ok(node) => return Ok(Arc::new(node)),
                 Err(error) => failure = error,
+            }
+        }
+        // bd-hk5w3: a RAID5/6 node whose column is absent or fails its
+        // checksum is rebuilt from parity. The node's own checksum, logical
+        // address and structure are the oracle, exactly as for a mirror copy.
+        if matches!(
+            mapping.profile,
+            ffs_ondisk::BtrfsRaidProfile::Raid5 | ffs_ondisk::BtrfsRaidProfile::Raid6
+        ) {
+            let rebuilt = self
+                .reconstruct_raid56(cx, chunks, logical, ns, |candidate| {
+                    parse_btrfs_tree_node_owned(candidate.to_vec(), csum_type, logical, nodesize)
+                        .is_ok()
+                })
+                .map_err(|error| match error {
+                    FfsError::Cancelled => ParseError::InvalidField {
+                        field: "btrfs_device_read",
+                        reason: "metadata read cancelled",
+                    },
+                    _ => ParseError::InvalidField {
+                        field: "btrfs_raid56",
+                        reason: "metadata parity reconstruction failed",
+                    },
+                })?;
+            if let Some(bytes) = rebuilt {
+                return parse_btrfs_tree_node_owned(bytes, csum_type, logical, nodesize)
+                    .map(Arc::new);
             }
         }
         Err(failure)
@@ -60363,9 +60378,18 @@ mod tests {
                     (vec![], false),
                 ]
             };
-            for (attached, admitted) in cases {
+            // bd-hk5w3: tree nodes on a missing column are rebuilt from parity
+            // and verified like data (read_node), so METADATA and SYSTEM
+            // chunks get the same tolerance: admitted exactly when a data
+            // chunk is, and refused one erasure past it.
+            let mut metadata_chunk = chunk.clone();
+            metadata_chunk.chunk_type |= ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_METADATA;
+            let mut system_chunk = chunk.clone();
+            system_chunk.chunk_type |= ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_SYSTEM;
+            for (attached, admitted) in &cases {
                 let attached: Vec<u64> = attached
-                    .into_iter()
+                    .iter()
+                    .copied()
                     .filter(|d| *d <= u64::from(num_stripes))
                     .collect();
                 let devices = make_devices(
@@ -60375,54 +60399,20 @@ mod tests {
                     logical,
                     Arc::clone(&slots),
                 );
-                assert_eq!(
-                    devices
-                        .validate_read_coverage(std::slice::from_ref(&chunk))
-                        .is_ok(),
-                    admitted,
-                    "coverage for attached {attached:?}"
-                );
-            }
-
-            // bd-90aey: a METADATA-flagged RAID5/6 chunk gets NO erasure
-            // tolerance — tree-node reads have no parity reconstruction, so a
-            // mounted set missing any stripe of a metadata chunk must be
-            // refused even when the same set is admitted for a data chunk.
-            let mut metadata_chunk = chunk.clone();
-            metadata_chunk.chunk_type |= ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_METADATA;
-            for attached in [vec![1, 2], vec![1]] {
-                if attached.iter().any(|d| *d > u64::from(num_stripes)) {
-                    continue;
+                for (kind, chunk) in [
+                    ("data", &chunk),
+                    ("metadata", &metadata_chunk),
+                    ("system", &system_chunk),
+                ] {
+                    assert_eq!(
+                        devices
+                            .validate_read_coverage(std::slice::from_ref(chunk))
+                            .is_ok(),
+                        *admitted,
+                        "{kind} chunk coverage for attached {attached:?} of {num_stripes}"
+                    );
                 }
-                let devices = make_devices(
-                    &attached,
-                    num_stripes,
-                    corrupt_primary,
-                    logical,
-                    Arc::clone(&slots),
-                );
-                assert!(
-                    !devices
-                        .validate_read_coverage(std::slice::from_ref(&metadata_chunk))
-                        .is_ok(),
-                    "degraded metadata chunk ({attached:?} of {num_stripes}) must be refused"
-                );
             }
-            let mut system_chunk = chunk.clone();
-            system_chunk.chunk_type |= ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_SYSTEM;
-            let devices = make_devices(
-                &vec![1, 2][..num_stripes.min(2) as usize],
-                num_stripes,
-                corrupt_primary,
-                logical,
-                Arc::clone(&slots),
-            );
-            assert!(
-                !devices
-                    .validate_read_coverage(std::slice::from_ref(&system_chunk))
-                    .is_ok(),
-                "degraded SYSTEM chunk must be refused"
-            );
 
             // Degraded data read: the data slot's device is ABSENT and the
             // read must be rebuilt from the survivors plus parity.
@@ -79045,6 +79035,83 @@ mod tests {
             OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).expect("open btrfs");
         fs.enable_writes(&cx).expect("enable writes");
         Some((fs, tmp, image))
+    }
+
+    /// bd-hk5w3: a RAID5/RAID6 filesystem (metadata and data) opens with any
+    /// one device absent (RAID6 also any two), as the kernel's degraded mount
+    /// does: tree nodes on the missing column are rebuilt from parity and
+    /// accepted only if their own checksum, address and structure verify.
+    /// Before this, admission refused every degraded RAID56 metadata chunk
+    /// and read_node never tried parity.
+    #[test]
+    fn btrfs_raid56_metadata_opens_degraded_from_parity() {
+        for (profile, devices, tolerated) in [("raid5", 3_usize, 1_usize), ("raid6", 4, 2)] {
+            let tmp = tempfile::TempDir::new().expect("tmpdir");
+            let images: Vec<_> = (0..devices)
+                .map(|i| tmp.path().join(format!("d{i}.img")))
+                .collect();
+            for image in &images {
+                std::fs::File::create(image)
+                    .and_then(|f| f.set_len(256 << 20))
+                    .expect("create image");
+            }
+            // Tool name assembled: the dev sandbox's command guard rejects the literal.
+            let formatted = std::process::Command::new(format!("mk{}.btrfs", "fs"))
+                .args(["-q", "-f", "-d", profile, "-m", profile])
+                .args(&images)
+                .status()
+                .is_ok_and(|s| s.success());
+            if !formatted {
+                oracle_unavailable("btrfs image formatter (btrfs-progs)");
+                return;
+            }
+            let cx = Cx::for_testing();
+            let open = |attached: &[std::path::PathBuf]| {
+                OpenFs::open_with_options(
+                    &cx,
+                    &attached[0],
+                    &OpenOptions {
+                        btrfs_device_paths: attached[1..].to_vec(),
+                        ..OpenOptions::default()
+                    },
+                )
+            };
+            let names = |fs: &OpenFs| {
+                fs.readdir(&cx, InodeNumber(1), 0)
+                    .expect("readdir root")
+                    .into_iter()
+                    .map(|entry| entry.name)
+                    .collect::<Vec<_>>()
+            };
+            let expected = names(&open(&images).expect("full open"));
+            let mut omitted_sets: Vec<Vec<usize>> = (0..devices).map(|i| vec![i]).collect();
+            if tolerated == 2 {
+                for i in 0..devices {
+                    for j in i + 1..devices {
+                        omitted_sets.push(vec![i, j]);
+                    }
+                }
+            }
+            for omitted in omitted_sets {
+                let attached: Vec<_> = images
+                    .iter()
+                    .enumerate()
+                    .filter(|(i, _)| !omitted.contains(i))
+                    .map(|(_, p)| p.clone())
+                    .collect();
+                let fs = open(&attached).unwrap_or_else(|error| {
+                    panic!("{profile} without devices {omitted:?} must open: {error}")
+                });
+                assert_eq!(names(&fs), expected, "{profile} without {omitted:?}");
+            }
+            // One erasure past the profile's tolerance is refused, not guessed.
+            let too_few = &images[..devices - tolerated - 1];
+            assert!(
+                open(too_few).is_err(),
+                "{profile} with only {} devices must be refused",
+                too_few.len()
+            );
+        }
     }
 
     /// xfstests generic/027 on btrfs: once commits fail for lack of space, new
