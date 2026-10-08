@@ -35701,14 +35701,8 @@ impl OpenFs {
     /// dst. Finally dst's `size`/`nbytes` are set to match src.
     ///
     /// The `EXTENT_DATA_REF` offset is `key.offset - extent_offset` (the disk
-    /// extent's logical start in the file), matching btrfs. This is the inode-
-    /// level core; the FUSE `clone_file`/`clone_file_range` plumbing (fd→inode
-    /// resolution) and the on-disk `btrfs check` validation are bd-vh8p9's next
-    /// increment.
-    // Unwired pending the FUSE clone_file/clone_file_range fd->inode plumbing
-    // and the on-disk btrfs-check E2E (bd-vh8p9 next increment); exercised by
-    // btrfs_clone_file_data_shares_extent_and_sets_size.
-    #[allow(dead_code)]
+    /// extent's logical start in the file), matching btrfs. Reached from FUSE
+    /// FICLONE through `FsOps::clone_file`.
     fn btrfs_clone_file_data(
         &self,
         alloc: &mut BtrfsAllocState,
