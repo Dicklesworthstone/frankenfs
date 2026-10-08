@@ -1,5 +1,77 @@
 # Reality-Check Bridge: Closing the Gap Between Claims and Code
 
+## Reality check — 2026-10-08 (HEAD 7edae28c)
+
+**Verdict.** FrankenFS has made major strides over the 443 commits since the 2026-09-23 audit (`75e0d3e8` → `7edae28c`). Headline progress includes: empirical xfstests test suite execution on CI with real passes (generic/273, 320, 591, 619, 626, 747), btrfs degraded RAID5/RAID6 tree rebuilding from parity (`bd-hk5w3`, `00025d42`), whole-file reflink dispatch (`1cb18d10`), SHA256 and BLAKE2b-256 btrfs checksums (`aea133c3`), btrfs transactional free-space-tree reservations (`8d8e62cf`), pinned freed data across commits (`7edae28c`), chattr +i/+a VFS enforcement (`80ebab63`), and streaming WAL appends (`3fc2767c`).
+
+However, the core friction points remain:
+1. **Red Main Landings Recur:** The repo continues to suffer from unverified commits pushed directly to `main`. Commit `3fc2767c` landed with a missing `#[path = "stream/tests.rs"] mod tests;` annotation and unformatted code, breaking `cargo check --all-targets` and `cargo fmt --check` workspace-wide. This was fixed during this session.
+2. **Mounted MVCC vs. Default FUSE Concurrency:** While `MountOptions::default()` was flipped to pool-based multi-threading (`bd-iah1f`), namespace mutations remain uncoordinated independent commits (`bd-9rutw`), and the MVCC evidence ledger is disconnected from the default sharded store (`bd-7ssc7`).
+3. **Mounted Self-Healing Safety Interlock:** Automatic background repair symbol generation remains intentionally refused on RW mounts (`bd-plamw`) because the tail allocation is not reserved in the ext4/btrfs allocator bitmap/tree.
+4. **Structured Concurrency Boundaries:** Daemon background workers continue to run on `std::thread` rather than `asupersync` scoped regions (`bd-in31y`), and `FUSE_INTERRUPT` returns `ENOSYS` (`bd-gk01h`).
+5. **Tracker Debt:** 54 in-progress beads remain open, mostly stale performance measurement rows dating back to August, which are physically bounded by the Linux FUSE userspace context-switch floor (`bd-warm-stat-is-the-fuse-floor-4wxw9`).
+
+### Gates Executed at HEAD 7edae28c
+
+| Gate | Result | Evidence / Details |
+|---|---|---|
+| `cargo fmt --check` | **PASS** (after fix) | Fixed missing `#[path]` in `crates/ffs-mvcc/src/wal_writer/stream.rs` and formatted test suite |
+| `cargo check --workspace --all-targets` | **PASS** | Clean exit 0 across all 22 workspace crates and targets on RCH worker `ovh-a` |
+| `cargo clippy --workspace --all-targets -- -D warnings` | **PASS** | Clean exit 0 with zero warnings across workspace |
+| `cargo test -p ffs-types -p ffs-error -p ffs-ondisk --lib` | **PASS** | 901 passed, 0 failed (142 types, 46 error, 713 ondisk proptest/crc/geometry) |
+| `cargo run -p ffs-harness -- parity` | **PASS** | Reports 97/97 declared contracts across 5 domains (100% contract coverage) |
+| `git status --porcelain` | Clean code | Only the compiler fix in `crates/ffs-mvcc/src/wal_writer/` |
+
+### Vision vs. Reality (Default Mounted Behavior & Subsystems)
+
+| Subsystem | Stated Vision (README / Spec) | Observed Reality at `7edae28c` | Status | Evidence |
+|---|---|---|---|---|
+| **1. Ext4 On-Disk Parsing & Inspection** | Pure, clean-room, memory-safe parsing of ext4 format | Robust parser, verified with 17/17 kernel differential tests against debugfs/dumpe2fs, 64-bit & META_BG supported | `WORKING` | `crates/ffs-ondisk`, 713 tests pass |
+| **2. Ext4 Read-Write & Journaling** | Full JBD2 journaling, crash recovery, metadata durability | Durable write path, JBD2 sequences continue across mounts, e2fsck accepts crash replay (`bd-cnmpm`), periodic commit active (`bd-dj725`) | `WORKING` | `crates/ffs-journal`, `ffs-core` |
+| **3. Btrfs On-Disk Parsing & Inspection** | Support all chunk RAID profiles, trees, compression, checksums | Chunk mapping, RAID0/1/10/1C3/1C4/5/6 parity rebuild, ZLIB/LZO/ZSTD, CRC32C/XXHASH/SHA256/BLAKE2b | `WORKING` | `00025d42`, `aea133c3`, `crates/ffs-btrfs` |
+| **4. Btrfs Read-Write & COW / Transactions** | COW transactions, atomic generation advance, durable writeback | Full transaction commit, DUP stripe replication (`bd-0mcvt`), freed data pinned through commit (`7edae28c`), subvolume write refused (`bd-5elw6`) | `WORKING` (single-dev/default-subvol), `PARTIAL` (multi-device writes) | `crates/ffs-btrfs`, `crates/ffs-core` |
+| **5. MVCC Snapshot Engine & Concurrency** | Block-level MVCC for concurrent writers, SSI conflict detection, 9.5x loss reduction | Primitives and merge proofs exist (`bd-5lyoy`), but namespace ops are N independent commits (`bd-9rutw`), and ledger is disconnected from sharded store (`bd-7ssc7`) | `PARTIAL` | `crates/ffs-mvcc`, `crates/ffs-core/src/fs_mvcc_store.rs` |
+| **6. Self-Healing Durability (RaptorQ)** | Default substrate, continuous background repair symbols | Offline repair & sidecar (`FFSRQSC2`) fully functional; mounted background repair is refused on RW mounts (`bd-plamw`) pending allocator reservation | `PARTIAL` | `crates/ffs-repair`, `cmd_repair.rs` |
+| **7. FUSE Userspace Mount Surface** | Seamless Linux userspace mount, high-performance VFS dispatch | Multi-worker default flipped in `e503da33` (`bd-iah1f`), chattr +i/+a supported (`bd-teynk`), zero-message open; `FUSE_INTERRUPT` returns `ENOSYS` (`bd-gk01h`) | `WORKING` / `PARTIAL` | `crates/ffs-fuse`, `vendor/fuser` |
+| **8. Conformance & Harness** | 97/97 parity backed by execution, kernel differential, xfstests | Parity report counts declared contracts; real xfstests running on CI (generic/273, 320, 591, 619, 626, 747 pass); generic/310 hung and isolated (`bd-uu90b`) | `WORKING` / `PARTIAL` | `crates/ffs-harness`, CI workflow |
+| **9. Structured Concurrency (asupersync)** | Exclusively asupersync, cancel-correct, zero tokio | Zero tokio verified. But production background workers (flush, scrub, commit) use `std::thread`, not `asupersync::Scope` regions (`bd-in31y`) | `PARTIAL` | `Cargo.lock`, `crates/ffs-core/src/lib.rs` |
+| **10. Performance vs. Kernel** | Match or exceed native kernel ext4/btrfs | Slower on mounted benchmarks (stat 4.9x, readdir 3.7x-8.3x, fsync 1.5x-2.0x); dominated by FUSE userspace context switch and `security.capability` probes | `UNPROVEN` vs kernel | `docs/MOUNTED_*_SCORECARD.md` |
+
+### The Five Reality-Check Questions
+
+#### 1. What specifically IS working right now?
+- **Ext4 and Btrfs on-disk parsers:** Memory-safe, clean-room parsing of superblocks, inodes, extents, chunk mappings, btrees, directory hash trees (dx_hash), and checksum trees.
+- **Ext4 Read-Write Durability:** Full write paths with JBD2 journaling. Injected crash testing confirms `e2fsck` accepts FrankenFS journals and replays committed transactions.
+- **Btrfs Read-Write Durability (Single Device):** Mutations persist across unmount/remount via `WritebackExecutor` and atomic root commits. DUP stripes receive two copies. Freed data is safely pinned through superblock publication (`7edae28c`).
+- **btrfs Advanced Format Features:** Degraded RAID5/6 node rebuilding from parity (`00025d42`), whole-file reflink (`1cb18d10`), SHA256 and BLAKE2b-256 checksums (`aea133c3`), and ZLIB/LZO/ZSTD transparent decompression.
+- **FUSE Mounting:** Read-only and read-write mounts for both ext4 and single-device btrfs. Multi-threaded worker pool is default (`min(available_parallelism, 8)`).
+- **xfstests Execution:** Real kernel-level filesystem tests running in CI with passing evidence on both ext4 and btrfs (generic/273, 320, 591, 619, 626, 747).
+- **Zero Tokio:** Verified 100% pure asupersync / parking_lot / std async primitives across the entire workspace.
+- **Compiler and Code Quality Gates:** Clean `cargo fmt`, `cargo check --workspace --all-targets`, and `cargo clippy --workspace --all-targets -- -D warnings`.
+
+#### 2. What is NOT working or not yet implemented?
+- **Mounted Concurrent MVCC Benefit:** MVCC is implemented as an in-memory library, but ext4 directory and namespace operations (create, unlink, rename) still execute as individual independent commits rather than a unified ACID transaction (`bd-9rutw`). The adaptive conflict policy and evidence ledger are not connected to the default sharded store (`bd-7ssc7`).
+- **Continuous Mounted Self-Healing:** The README's promise of "continuous, always-running self-healing repair" does not hold on mounted RW filesystems. Because the allocator does not reserve repair-symbol blocks in the ext4 bitmap or btrfs extent tree, `--background-repair` is refused on RW mounts to prevent data corruption (`bd-plamw`).
+- **btrfs Multi-Device Writes:** Writes to multi-device RAID arrays (RAID1/RAID10/RAID5/RAID6) are not complete; writes are restricted to single-device / DUP images.
+- **Structured Async Concurrency for Daemons:** The filesystem background daemons (periodic commit, flush, scrub) are spawned using standard OS threads (`std::thread::Builder`), without `asupersync` regions or cancel-correct two-phase channels (`bd-in31y`). `FUSE_INTERRUPT` returns `ENOSYS` (`bd-gk01h`).
+- **Competitive Mounted Performance:** FrankenFS cannot beat native kernel VFS on small-op metadata workloads due to the FUSE kernel-userspace round-trip floor and the mandatory `security.capability` VFS probe on every lookup.
+
+#### 3. What is blocking us from getting there?
+- **Red Main Commit Discipline:** Commits pushed directly to `main` without pre-merge gate validation periodically break the tree, disrupting all agents (`bd-ys3wb`).
+- **Allocator Reservation for Repair Symbols:** To safely run mounted self-healing on RW images without risk of the ext4/btrfs allocator allocating over repair symbols, the tail space must be registered as allocated blocks in the filesystem metadata structures.
+- **FUSE Transport Context-Switch Floor:** FUSE requires a context switch per I/O request. Without kernel bypass (e.g. io_uring zero-copy passthrough) or specialized memoization, userspace daemons cannot match in-kernel VFS speed on metadata traversals.
+
+#### 4. If we were to implement all open and in-progress beads, would we close the gap completely?
+No. The open and in-progress backlog is skewed:
+- Out of 59 in-progress beads, ~45 are stale performance measurement rows from August/September attempting to optimize individual micro-benchmarks against the kernel.
+- The open beads (`bd-ys3wb`, `bd-7ssc7`, `bd-in31y`, `bd-9rutw`, `bd-plamw`, `bd-mjxxk`) correctly target the major architectural gaps, but completing them requires disciplined prioritization: fixing gate enforcement (`bd-ys3wb`), wiring the MVCC ledger (`bd-7ssc7`), and reserving repair blocks (`bd-plamw`).
+
+#### 5. What goals from the vision are NOT covered by ANY existing bead?
+- **Full ext4 namespace atomic transactions:** Multi-operation POSIX syscalls (like `rename` overwriting a file) that require atomic cross-inode/block commit in ext4 JBD2 are partially tracked under `bd-9rutw`, but full transactional VFS orchestration lacks a dedicated bead.
+- **FUSE io_uring zero-copy passthrough:** Outperforming the kernel on warm stat and readdir requires FUSE-over-io_uring passthrough to bypass the kernel context switch floor.
+
+---
+
 ## Delivery progress — 2026-09-23 (same session)
 
 Worked in bead order after the audit below. "Verified" means executed on an
