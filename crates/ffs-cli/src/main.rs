@@ -8169,10 +8169,25 @@ fn run_mount_background_scrub_daemon(
         )
     })?;
     let validator = match &plan.flavor {
-        FsFlavor::Ext4(sb) if plan.static_metadata => Box::new(
-            ffs_repair::scrub::Ext4MetadataValidator::from_device(&cli_cx(), &block_dev, sb)
-                .context("failed to read ext4 group descriptors for background scrub")?,
-        ) as Box<dyn BlockValidator>,
+        FsFlavor::Ext4(sb) if plan.static_metadata => {
+            let mut validator =
+                ffs_repair::scrub::Ext4MetadataValidator::from_device(cx, &block_dev, sb)
+                    .context("failed to read ext4 group descriptors for background scrub")?;
+            if let Some(ref open_fs) = config.mounted_repair_writeback {
+                validator.add_owned_blocks(ext4_inode_owned_blocks(cx, open_fs));
+            } else if let Ok(fs) = OpenFs::open_with_options(
+                cx,
+                image_path,
+                &OpenOptions {
+                    ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                    skip_validation: true,
+                    ..OpenOptions::default()
+                },
+            ) {
+                validator.add_owned_blocks(ext4_inode_owned_blocks(cx, &fs));
+            }
+            Box::new(validator) as Box<dyn BlockValidator>
+        }
         _ => scrub_validator(&plan.flavor, plan.block_size),
     };
     let ledger = open_mount_background_scrub_ledger(config.ledger_path)?;
@@ -14043,6 +14058,123 @@ mod tests {
                 .any(|f| f.block.0 == (gdt_off / bs) as u64
                     && f.kind == ffs_repair::scrub::CorruptionKind::ChecksumMismatch),
             "a flipped descriptor byte must be reported: {:?}",
+            report.findings
+        );
+    }
+
+    /// bd-jufod: mounted background scrub on static ext4 images includes all
+    /// inode-owned blocks (extent nodes, directory blocks, external xattrs)
+    /// via `ext4_inode_owned_blocks` on the validator, detecting corruption in
+    /// directory data blocks.
+    #[test]
+    fn mounted_ext4_scrub_detects_inode_owned_blocks_bd_jufod() {
+        let dir = tempfile::TempDir::new().expect("tmpdir");
+        let image = dir.path().join("meta.ext4");
+        std::fs::File::create(&image)
+            .and_then(|f| f.set_len(32 * 1024 * 1024))
+            .expect("sparse image");
+        let formatted = std::process::Command::new("mke2fs")
+            .args([
+                "-q",
+                "-F",
+                "-t",
+                "ext4",
+                "-O",
+                "metadata_csum",
+                "-b",
+                "4096",
+            ])
+            .arg(&image)
+            .status();
+        if !formatted.is_ok_and(|s| s.success()) {
+            if std::env::var_os("FFS_REQUIRE_ORACLES").is_some_and(|v| v == "1") {
+                panic!("FFS_REQUIRE_ORACLES=1 but mke2fs is unavailable");
+            }
+            eprintln!("SKIP bd-jufod: mke2fs unavailable");
+            return;
+        }
+        let cx = crate::cli_cx();
+        let clean = std::fs::read(&image).expect("read image");
+        let sb = ffs_ondisk::Ext4Superblock::parse_from_image(&clean).expect("superblock");
+        let bs = sb.block_size as usize;
+
+        let root_dir_block = {
+            let path = dir.path().join("probe.ext4");
+            std::fs::write(&path, &clean).expect("write probe copy");
+            let fs = super::OpenFs::open_with_options(
+                &cx,
+                &path,
+                &super::OpenOptions {
+                    ext4_journal_replay_mode: super::Ext4JournalReplayMode::Skip,
+                    ..super::OpenOptions::default()
+                },
+            )
+            .expect("open probe");
+            let root = fs
+                .read_inode(&cx, ffs_types::InodeNumber(2))
+                .expect("root inode");
+            fs.collect_extents(&cx, &root).expect("root extents")[0].physical_start
+        };
+
+        let mut dir_bad = clean;
+        dir_bad[usize::try_from(root_dir_block).expect("fits") * bs + 20] ^= 0x01;
+        let bad_path = dir.path().join("bad.ext4");
+        std::fs::write(&bad_path, &dir_bad).expect("write bad image");
+
+        let open_fs = Arc::new(
+            super::OpenFs::open_with_options(
+                &cx,
+                &bad_path,
+                &super::OpenOptions {
+                    skip_validation: true,
+                    ext4_journal_replay_mode: super::Ext4JournalReplayMode::Skip,
+                    ..super::OpenOptions::default()
+                },
+            )
+            .expect("open bad image"),
+        );
+
+        let cfg = MountBackgroundScrubConfig::resolve(
+            MountBackgroundScrubRequest::new(
+                MountAccessMode::ReadOnly,
+                MountBackgroundScrubMode::Enabled,
+                MountBackgroundRepairMode::Disabled,
+            ),
+            Some(1),
+            None,
+        )
+        .expect("background scrub config should resolve");
+
+        let plan = super::build_mount_background_scrub_plan(
+            &bad_path,
+            &open_fs,
+            cfg.repair_writes_enabled,
+        )
+        .expect("build scrub plan");
+        assert!(
+            plan.static_metadata,
+            "read-only mount must have static_metadata"
+        );
+
+        let byte_dev = ffs_block::FileByteDevice::open(&bad_path).expect("open byte device");
+        let block_dev =
+            ffs_block::ByteBlockDevice::new(byte_dev, plan.block_size).expect("block dev");
+
+        let ffs_core::FsFlavor::Ext4(ref sb) = plan.flavor else {
+            panic!("expected ext4");
+        };
+        let mut validator =
+            ffs_repair::scrub::Ext4MetadataValidator::from_device(&cx, &block_dev, sb)
+                .expect("ext4 metadata validator");
+        validator.add_owned_blocks(super::ext4_inode_owned_blocks(&cx, &open_fs));
+
+        let report = ffs_repair::scrub::Scrubber::new(&block_dev, &validator)
+            .scrub_all(&cx)
+            .expect("scrub");
+        assert!(
+            report.findings.iter().any(|f| f.block.0 == root_dir_block
+                && f.kind == ffs_repair::scrub::CorruptionKind::ChecksumMismatch),
+            "mounted background scrub validator must detect corrupted directory block {root_dir_block}: {:?}",
             report.findings
         );
     }
