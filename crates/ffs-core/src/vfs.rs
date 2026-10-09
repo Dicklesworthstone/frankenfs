@@ -3534,6 +3534,16 @@ impl<T: FsOps + ?Sized> FsOps for Arc<T> {
         self.as_ref().btrfs_snap_destroy_v2(cx, scope, vol_args)
     }
 
+    fn btrfs_encoded_read(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: u64,
+        args: &[u8],
+    ) -> ffs_error::Result<Vec<u8>> {
+        self.as_ref().btrfs_encoded_read(cx, scope, ino, args)
+    }
+
     fn btrfs_add_dev(
         &self,
         cx: &Cx,

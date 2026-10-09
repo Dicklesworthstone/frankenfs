@@ -94571,6 +94571,12 @@ mod tests {
                     "different subvolume inode aliases"
                 );
                 assert_eq!(fs.read(&cx, file.ino, 0, 128).unwrap(), payload);
+                let mut encoded_args = [0_u8; 64];
+                encoded_args[32..40].copy_from_slice(&128_u64.to_le_bytes());
+                let encoded = fs
+                    .btrfs_encoded_read(&cx, &mut RequestScope::empty(), file.ino.0, &encoded_args)
+                    .expect("encoded read from the attached nested device");
+                assert_eq!(&encoded[32..], payload);
                 assert_eq!(
                     fs.read(&cx, parent_file.ino, 0, 128).unwrap(),
                     b"hello from btrfs fsops"
@@ -113356,6 +113362,7 @@ mod tests {
             let mut args = [0_u8; 64];
             args[16..24].copy_from_slice(&3_u64.to_le_bytes());
             args[32..40].copy_from_slice(&7_u64.to_le_bytes());
+            let fs = Arc::new(fs);
             let result = fs.btrfs_encoded_read(&cx, &mut RequestScope::empty(), 257, &args);
             if all_bad {
                 assert!(matches!(result, Err(FfsError::Corruption { .. })));
