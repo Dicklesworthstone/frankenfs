@@ -14087,9 +14087,10 @@ mod tests {
             .arg(&image)
             .status();
         if !formatted.is_ok_and(|s| s.success()) {
-            if std::env::var_os("FFS_REQUIRE_ORACLES").is_some_and(|v| v == "1") {
-                panic!("FFS_REQUIRE_ORACLES=1 but mke2fs is unavailable");
-            }
+            assert!(
+                !std::env::var_os("FFS_REQUIRE_ORACLES").is_some_and(|v| v == "1"),
+                "FFS_REQUIRE_ORACLES=1 but mke2fs is unavailable"
+            );
             eprintln!("SKIP bd-jufod: mke2fs unavailable");
             return;
         }
