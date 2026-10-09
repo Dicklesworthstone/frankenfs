@@ -206,6 +206,30 @@ files, and does not enable cross-device reads. Seed-device inventories with
 different filesystem UUIDs are not yet supported. The allocator lock stabilizes writable accounting,
 but full commit releases it before superblock publication; serializing that
 publication with device-info reads remains open (`bd-hk5w3`).
+
+The remaining `bd-hk5w3` admission work must resolve the inventory before
+walking ROOT_TREE or any selected subvolume. A raw `num_devices = 1` cannot
+select the single-image reader: committed DEV_ITEMs may include another
+device, even when that device owns no chunks. Bootstrap reads must honor
+stripe device identities, and the verified CHUNK_TREE pass must retain its
+device records alongside the expanded chunk map. Its inventory selects the
+reader used for subsequent metadata and data, and its corrected count feeds
+write and background-scrub admission. A count correction in `FS_INFO` alone
+would leave those decisions exposed to the stale superblock value.
+
+Seed support also requires explicit per-device filesystem identity and seed
+generation, anchored to the sprout's committed DEV_ITEMs. Seed handles remain
+read-only; ordinary same-filesystem attachments retain their existing
+generation/root/geometry validation. Nested opens must revalidate each role.
+The total inventory used for routing includes seed lists, while `FS_INFO`
+reports the mounted filesystem's own list as described in the extracted
+Linux contract. Neither `skip_validation` nor ephemeral tree-log commit mode
+can establish singleton write authority when inventory validation is absent
+or fails. Required regression cases include under/overstated counts, an
+unused extra device, Single chunks owned by another device, a wrong seed
+generation, an unrelated seed, and attempted writes to a lone seed. These
+are implementation requirements; no new execution or parity claim is made.
+
 Mount initialization preserves DATA, METADATA, and SYSTEM block-group types.
 Chunk-tree COW allocates from SYSTEM space so the superblock's bootstrap map
 can resolve the new root. When growth dirties CHUNK_TREE and DEV_TREE, full

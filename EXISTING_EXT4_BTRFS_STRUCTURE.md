@@ -2552,15 +2552,29 @@ For metadata blocks, verification includes:
     their committed byte accounting. Read-only mounts therefore also use
     CHUNK_TREE accounting; the embedded superblock copy is not a substitute
     for a missing committed record.
-13. `BTRFS_IOC_FS_INFO.max_id` is the maximum ID in the filesystem's device
-    inventory, not `num_devices`. Linux v6.19 `btrfs_ioctl_fs_info` computes
-    it across the device list. A single device with ID 7 therefore reports
+13. `BTRFS_IOC_FS_INFO.max_id` is the maximum ID in the filesystem's
+    own device list, not `num_devices`. Linux v6.19 `btrfs_ioctl_fs_info` computes
+    it across that list. A single device with ID 7 therefore reports
     `max_id = 7` and `num_devices = 1`; callers must tolerate holes in IDs.
     Enumeration includes all `(1, DEV_ITEM, devid)` entries in CHUNK_TREE,
     even devices with no allocated chunks. DEV_TREE contains device extents,
     not that inventory. Linux v6.19 `btrfs_read_chunk_tree` counts DEV_ITEMs
     and repairs a disagreeing superblock device count in memory for the next
     commit; the two counts are not independent sources of device identity.
+    For a sprout, distinguish that total inventory from `FS_INFO`: the ioctl
+    counts only the sprout's own device list, excluding its separate seed lists.
+    See [`btrfs_ioctl_fs_info`](https://github.com/torvalds/linux/blob/v6.19/fs/btrfs/ioctl.c#L2555-L2577)
+    and [`btrfs_read_chunk_tree`](https://github.com/torvalds/linux/blob/v6.19/fs/btrfs/volumes.c#L6978-L7038).
+14. A CHUNK_TREE DEV_ITEM whose filesystem UUID differs from the mounted
+    filesystem's metadata UUID can identify a seed device. Linux opens that
+    seed group read-only, requires its seeding flag, and requires the device's
+    superblock generation to equal the committed DEV_ITEM generation. The
+    seed need not share the sprout's current roots or generation. Identity
+    lookup still uses device ID, device UUID and filesystem UUID; a foreign
+    device is not accepted merely because it is marked as a seed. See
+    [`open_seed_devices` / `read_one_dev`](https://github.com/torvalds/linux/blob/v6.19/fs/btrfs/volumes.c#L6651-L6797).
+    These are extracted kernel contracts, not evidence of implemented
+    FrankenFS seed support (`bd-hk5w3`).
 
 ### 16.3 Key Implementation Patterns
 
