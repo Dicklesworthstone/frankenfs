@@ -16030,6 +16030,17 @@ fn btrfs_attached_devices_read_seeded_files_xxhash64() {
 }
 
 fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u16) {
+    fn check_encoded_prefix(filesystem: &OpenFs, cx: &Cx, ino: InodeNumber, payload: &[u8]) {
+        let mut args = [0_u8; 64];
+        args[32..40].copy_from_slice(&4096_u64.to_le_bytes());
+        let encoded = filesystem
+            .btrfs_encoded_read(cx, &mut RequestScope::empty(), ino.0, &args)
+            .expect("encoded read through attached devices");
+        assert_eq!(u64::from_le_bytes(encoded[..8].try_into().unwrap()), 4096);
+        assert_eq!(u32::from_le_bytes(encoded[24..28].try_into().unwrap()), 0);
+        assert_eq!(&encoded[32..], &payload[..4096]);
+    }
+
     // Kernel-seeded multi-device fixtures need loop attachment (root) and the
     // evidence read needs a real FUSE mount. Where either capability is
     // absent the run is a skip, not a failure — the same contract as the
@@ -16041,6 +16052,7 @@ fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u1
             "SKIP",
             Some("attached_device_prerequisites_unavailable"),
         );
+        require_fuse_or_skip("attached-device prerequisites unavailable");
         eprintln!("attached-device prerequisites unavailable, skipping");
         return;
     }
@@ -16167,6 +16179,23 @@ fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u1
         fs::write(&input, &payload).unwrap();
         assert!(
             Command::new("sudo")
+                .args(["-n", "btrfs", "subvolume", "create"])
+                .arg(kernel_mount.join("nested"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("sudo")
+                .args(["-n", "cp", "--reflink=never"])
+                .arg(&input)
+                .arg(kernel_mount.join("nested/payload"))
+                .status()
+                .unwrap()
+                .success()
+        );
+        assert!(
+            Command::new("sudo")
                 .args(["-n", "cp"])
                 .arg(&input)
                 .arg(kernel_mount.join("payload"))
@@ -16286,6 +16315,10 @@ fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u1
         }
         kernel.loops.clear();
         drop(kernel);
+        let initial_hashes: Vec<_> = images
+            .iter()
+            .map(|image| blake3::hash(&fs::read(image).unwrap()))
+            .collect();
         let cx = Cx::for_testing();
         if profile == "raid1" {
             for (primary, image) in images.iter().enumerate() {
@@ -16401,6 +16434,25 @@ fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u1
                 filesystem.read(&cx, attr.ino, 65_530, 32).unwrap(),
                 payload[65_530..65_562]
             );
+            check_encoded_prefix(&filesystem, &cx, attr.ino, &payload);
+            let nested = filesystem
+                .lookup(&cx, InodeNumber(1), std::ffi::OsStr::new("nested"))
+                .expect("attached nested subvolume");
+            let nested_file = filesystem
+                .lookup(&cx, nested.ino, std::ffi::OsStr::new("payload"))
+                .expect("file in attached nested subvolume");
+            assert_eq!(
+                filesystem
+                    .read(
+                        &cx,
+                        nested_file.ino,
+                        0,
+                        u32::try_from(payload.len()).unwrap()
+                    )
+                    .unwrap(),
+                payload
+            );
+            check_encoded_prefix(&filesystem, &cx, nested_file.ino, &payload);
             assert!(filesystem.enable_writes(&cx).is_err());
             assert!(!filesystem.is_writable());
             for ssi in [false, true] {
@@ -16442,87 +16494,85 @@ fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u1
             let mount = ffs_harness::stale_mounts::MountGuard::new(session, &mountpoint);
             wait_for_fuse_mount_ready(&mountpoint);
             assert_eq!(fs::read(mountpoint.join("payload")).unwrap(), payload);
+            assert_eq!(
+                fs::read(mountpoint.join("nested/payload")).unwrap(),
+                payload
+            );
             drop(mount);
         }
-        // bd-hk5w3/bd-mjxxk: degraded RAID5/6 — omit one device, open with the
-        // survivors, and verify that parity reconstruction serves the correct
-        // bytes through the checksummed read path.
-        //
-        // NOTE: this currently FAILS because the metadata read path
-        // (btrfs_read_logical_into) does not have RAID56 parity
-        // reconstruction — only the checksummed DATA read path
-        // (btrfs_read_checksummed_into) does. The open needs to read the
-        // root tree from metadata chunks, which live on RAID1 pairs that
-        // may span the omitted device. Metadata RAID56 reconstruction is
-        // required before this test can pass (tracked on bd-hk5w3).
+        // Every tolerated erasure set must open and serve the kernel-seeded
+        // bytes, including nested subvolumes, through core and mounted FUSE.
         if matches!(profile, "raid5" | "raid6") {
-            for omitted in 0..images.len() {
+            let mut missing_sets: Vec<Vec<usize>> =
+                (0..images.len()).map(|index| vec![index]).collect();
+            if profile == "raid6" {
+                for first in 0..images.len() {
+                    for second in first + 1..images.len() {
+                        missing_sets.push(vec![first, second]);
+                    }
+                }
+            }
+            for omitted in missing_sets {
                 let attached: Vec<PathBuf> = images
                     .iter()
                     .enumerate()
-                    .filter(|(i, _)| *i != omitted)
+                    .filter(|(i, _)| !omitted.contains(i))
                     .map(|(_, p)| p.clone())
                     .collect();
                 let options = OpenOptions {
                     btrfs_device_paths: attached[1..].to_vec(),
                     ..OpenOptions::default()
                 };
-                let result = OpenFs::open_with_options(&cx, &attached[0], &options);
-                // TODO(bd-hk5w3): metadata RAID56 reconstruction is not
-                // implemented, so a degraded open usually fails when a
-                // metadata stripe spans the omitted device. It is NOT
-                // guaranteed to fail: the kernel allocator's block placement
-                // decides whether every block the open needs is physically on
-                // the surviving devices (bd-90aey — this assertion flaked on
-                // placement). Failure = expected-and-noted. Success = verify
-                // the seeded payload bytes end to end; success with WRONG
-                // bytes is the only dangerous outcome, and it still fails the
-                // test.
-                match result {
-                    Err(error) => {
-                        eprintln!(
-                            "{profile} degraded open (omitted {omitted}): {error} \
-                             [EXPECTED: metadata RAID56 reconstruction not yet implemented]"
-                        );
-                    }
-                    Ok(degraded) => {
-                        let attr = degraded
-                            .lookup(&cx, InodeNumber(1), std::ffi::OsStr::new("payload"))
-                            .unwrap_or_else(|error| {
-                                panic!(
-                                    "{profile} degraded open succeeded (omitted {omitted}) \
-                                     but payload lookup failed: {error}"
-                                )
-                            });
-                        assert_eq!(
-                            degraded
-                                .read(&cx, attr.ino, 0, u32::try_from(payload.len()).unwrap())
-                                .unwrap_or_else(|error| {
-                                    panic!(
-                                        "{profile} degraded open succeeded (omitted {omitted}) \
-                                         but payload read failed: {error}"
-                                    )
-                                }),
-                            payload,
-                            "{profile} degraded open (omitted {omitted}) returned wrong payload \
-                             bytes — degraded reads must never serve incorrect data"
-                        );
-                        assert_eq!(
-                            degraded.read(&cx, attr.ino, 65_530, 32).unwrap(),
-                            payload[65_530..65_562],
-                            "{profile} degraded open (omitted {omitted}) wrong unaligned window"
-                        );
-                        eprintln!(
-                            "{profile} degraded open (omitted {omitted}) succeeded without \
-                             reconstruction; payload bytes verified [layout-dependent, accepted]"
-                        );
-                        emit_scenario_result(
-                            &format!("btrfs_{profile}_degraded_open_omitted_{omitted}"),
-                            "PASS",
-                            Some("degraded_open_readable_without_reconstruction"),
-                        );
-                    }
+                let mut degraded = OpenFs::open_with_options(&cx, &attached[0], &options)
+                    .unwrap_or_else(|error| {
+                        panic!("{profile} degraded open (omitted {omitted:?}): {error}")
+                    });
+                let nested = degraded
+                    .lookup(&cx, InodeNumber(1), std::ffi::OsStr::new("nested"))
+                    .expect("degraded nested subvolume");
+                for parent in [InodeNumber(1), nested.ino] {
+                    let attr = degraded
+                        .lookup(&cx, parent, std::ffi::OsStr::new("payload"))
+                        .unwrap();
+                    assert_eq!(
+                        degraded
+                            .read(&cx, attr.ino, 0, u32::try_from(payload.len()).unwrap())
+                            .unwrap(),
+                        payload,
+                        "{profile} omitted {omitted:?}, parent {parent:?}"
+                    );
+                    assert_eq!(
+                        degraded.read(&cx, attr.ino, 65_530, 32).unwrap(),
+                        payload[65_530..65_562]
+                    );
+                    check_encoded_prefix(&degraded, &cx, attr.ino, &payload);
                 }
+                assert!(degraded.enable_writes(&cx).is_err());
+                let mountpoint = tmp.path().join(format!("degraded-{omitted:?}"));
+                fs::create_dir(&mountpoint).unwrap();
+                let session = mount_background(
+                    Box::new(degraded),
+                    &mountpoint,
+                    &MountOptions {
+                        read_only: true,
+                        auto_unmount: false,
+                        ..MountOptions::default()
+                    },
+                )
+                .expect("mount degraded attached devices");
+                let mount = ffs_harness::stale_mounts::MountGuard::new(session, &mountpoint);
+                wait_for_fuse_mount_ready(&mountpoint);
+                assert_eq!(fs::read(mountpoint.join("payload")).unwrap(), payload);
+                assert_eq!(
+                    fs::read(mountpoint.join("nested/payload")).unwrap(),
+                    payload
+                );
+                drop(mount);
+                emit_scenario_result(
+                    &format!("btrfs_{profile}_degraded_open_omitted_{omitted:?}"),
+                    "PASS",
+                    Some("core_and_fuse_reads_match_kernel_seed"),
+                );
             }
         }
         let duplicate = OpenOptions {
@@ -16565,6 +16615,14 @@ fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u1
             OpenFs::open_with_options(&cancelled, &images[0], &valid),
             Err(ffs_error::FfsError::Cancelled)
         ));
+        for (image, expected) in images.iter().zip(&initial_hashes) {
+            assert_eq!(
+                blake3::hash(&fs::read(image).unwrap()),
+                *expected,
+                "attached reads and rejected writes changed {}",
+                image.display()
+            );
+        }
         if matches!(profile, "raid1" | "raid10" | "raid1c3" | "raid1c4") {
             assert_btrfs_metadata_mirror_recovery(&cx, &images, &payload, profile);
             assert_btrfs_data_mirror_recovery(&cx, &images, &payload, "payload", 0, true, profile);

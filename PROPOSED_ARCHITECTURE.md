@@ -147,8 +147,9 @@ a directory page, inline bytes, or an empty/EOF read as a normal result.
 Clean multi-device images use this routing even with no extra
 paths: a lone RAID1 survivor is admitted only after every committed chunk has
 device coverage. RAID1/C3/C4 need a surviving copy; RAID10 needs one survivor in each
-adjacent `sub_stripes` mirror group, after validating stripe geometry. Other
-chunk profiles require all stripe devices. A four-device kernel RAID10 fixture
+adjacent `sub_stripes` mirror group, after validating stripe geometry. RAID5/6
+permit one/two missing stripe devices after validating independent recovery
+columns; other chunk profiles require every stripe device. A four-device kernel RAID10 fixture
 checks all 14 nonempty proper attachment subsets, with full and stripe-crossing
 ordinary data reads plus cold FUSE mounts for supported subsets and refusal
 when an entire group is missing. C3/C4 validate mirror-profile geometry before
@@ -158,14 +159,21 @@ ordinary core and cold FUSE reads. Separate corruption tests use full attachment
 the complete corruption/missing-device/checksum-codec matrix remains unverified.
 Clean three-device RAID5 and four-device RAID6 kernel images pass
 full-file, stripe-boundary and cold FUSE reads with each primary. Their mapper
-rotates ordered data slots forward per physical row, matching Linux; it does
-not reconstruct parity, and admission still requires every stripe device.
+rotates ordered data slots forward per physical row, matching Linux. Missing or
+corrupt data columns are reconstructed from P/Q and validated against data
+checksums; reconstructed metadata must pass its own checksum, logical-address
+and structural checks before entering the cache. Encoded reads use the same
+logical routing and checksum policy as ordinary reads. Generation inspection
+also uses validated attached-device copies.
 Unused missing devices
 remain in the authoritative inventory. Kernel-image tests mount each RAID1
 survivor alone and reject a missing RAID0 data device despite readable mirrored
 metadata. No sibling images are discovered implicitly. Multi-device mounts require a clean
-tree log and no MVCC WAL; dirty-image recovery,
-the remaining degraded/profile coverage and parity reconstruction remain open. There is no
+tree log and no MVCC WAL. Nested subvolumes share the validated device handles,
+recheck committed superblocks and chunk coverage, and preserve the checksum
+policy. Unreadable attached subvolumes return errors rather than empty
+directories. Dirty-image recovery and remaining degraded/profile qualification
+remain open. There is no
 multi-device mutation support.
 `OpenFs::enable_writes` refuses any device count other than one and any known
 chunk profile other than Single/DUP before loading mutable allocation state.

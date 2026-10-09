@@ -4,16 +4,16 @@ use super::{
     Arc, BTRFS_FIRST_FREE_OBJECTID, BTRFS_FS_TREE_OBJECTID, BTRFS_INO_LOOKUP_USER_ARGS_SIZE,
     BTRFS_INO_LOOKUP_USER_NAME_OFFSET, BTRFS_INO_LOOKUP_USER_NAME_SIZE,
     BTRFS_INO_LOOKUP_USER_PATH_OFFSET, BTRFS_INO_LOOKUP_USER_PATH_SIZE,
-    BTRFS_INO_PATHS_MAX_BYTES_U64, BTRFS_ITEM_EXTENT_DATA, BTRFS_ITEM_INODE_ITEM,
-    BTRFS_ITEM_ROOT_ITEM, BTRFS_ITEM_ROOT_REF, BTRFS_ITEM_XATTR_ITEM, BTRFS_MAX_ROOTREF_BUFFER_NUM,
-    BTRFS_ROOT_SUBVOL_RDONLY, BTRFS_ROOTREF_ENTRY_SIZE, BTRFS_SUBVOL_ROOTREF_ARGS_SIZE,
-    BTRFS_SUBVOL_ROOTREF_NUM_ITEMS_OFFSET, BTRFS_SUPER_INFO_OFFSET, BTRFS_TREE_SEARCH_KEY_SIZE,
-    BTRFS_TREE_SEARCH_V2_HEADER_SIZE, BTRFS_USER_SETTABLE_FSFLAGS, BTRFS_USER_SETTABLE_XFLAGS,
-    BlockDevice, BlockNumber, BtrfsBTree, BtrfsExtentData, BtrfsKey, BtrfsParsedNode,
-    BtrfsQgroupLimitRequest, BtrfsRootItem, BtrfsTreeSearchKey, ByteOffset, CommitSeq, Cx,
-    DirEntry, DirNameIndex, EXT4_COMPRBLK_FL, EXT4_ENCRYPTION_XATTR_NAME, EXT4_SB_CHECKSUM_OFFSET,
-    Ext4FileType, Ext4Inode, Ext4MoveExtRequest, Ext4Superblock, Ext4Xattr,
-    FSCRYPT_CONTEXT_V1_SIZE, FSCRYPT_CONTEXT_V2_SIZE, FSCRYPT_POLICY_V1_SIZE,
+    BTRFS_INO_PATHS_MAX_BYTES_U64, BTRFS_INODE_NODATASUM, BTRFS_ITEM_EXTENT_DATA,
+    BTRFS_ITEM_INODE_ITEM, BTRFS_ITEM_ROOT_ITEM, BTRFS_ITEM_ROOT_REF, BTRFS_ITEM_XATTR_ITEM,
+    BTRFS_MAX_ROOTREF_BUFFER_NUM, BTRFS_ROOT_SUBVOL_RDONLY, BTRFS_ROOTREF_ENTRY_SIZE,
+    BTRFS_SUBVOL_ROOTREF_ARGS_SIZE, BTRFS_SUBVOL_ROOTREF_NUM_ITEMS_OFFSET, BTRFS_SUPER_INFO_OFFSET,
+    BTRFS_TREE_SEARCH_KEY_SIZE, BTRFS_TREE_SEARCH_V2_HEADER_SIZE, BTRFS_USER_SETTABLE_FSFLAGS,
+    BTRFS_USER_SETTABLE_XFLAGS, BlockDevice, BlockNumber, BtrfsBTree, BtrfsExtentData, BtrfsKey,
+    BtrfsParsedNode, BtrfsQgroupLimitRequest, BtrfsRootItem, BtrfsTreeSearchKey, ByteOffset,
+    CommitSeq, Cx, DirEntry, DirNameIndex, EXT4_COMPRBLK_FL, EXT4_ENCRYPTION_XATTR_NAME,
+    EXT4_SB_CHECKSUM_OFFSET, Ext4FileType, Ext4Inode, Ext4MoveExtRequest, Ext4Superblock,
+    Ext4Xattr, FSCRYPT_CONTEXT_V1_SIZE, FSCRYPT_CONTEXT_V2_SIZE, FSCRYPT_POLICY_V1_SIZE,
     FSCRYPT_POLICY_V1_VERSION, FSCRYPT_POLICY_V2_SIZE, FSCRYPT_POLICY_V2_VERSION, FfsError,
     FiemapExtent, FileType, FsFlavor, FsGeometry, FsOps, FsStat, FsxattrInfo, InodeAttr,
     InodeNumber, LINUX_PATH_MAX, LINUX_SYMLINK_TARGET_MAX, Mutex, OpenFs, OsStr, Path, QuotaInfo,
@@ -500,9 +500,16 @@ impl OpenFs {
         Ok(found)
     }
 
-    /// The generation in a tree block's header, read directly.
+    /// The generation in a tree block's header, using the attached-device
+    /// validation and recovery path when the filesystem spans devices.
     fn btrfs_tree_block_generation(&self, cx: &Cx, logical: u64) -> Option<u64> {
         let ctx = self.btrfs_context()?;
+        if let Some(devices) = &self.btrfs_devices {
+            return devices
+                .read_node_with_generation(cx, &ctx.chunks, logical, ctx.nodesize, ctx.csum_type)
+                .ok()
+                .map(|(_, generation)| generation);
+        }
         let ns = usize::try_from(ctx.nodesize).ok()?;
         let mapping = map_logical_to_physical(&ctx.chunks, logical).ok()??;
         let mut buf = vec![0_u8; ns];
@@ -796,7 +803,7 @@ impl FsOps for OpenFs {
             FsFlavor::Btrfs(_) => {
                 if let Some((slot, nested, inner)) = self.btrfs_nested_route(ino)? {
                     let mut attr = nested.btrfs_read_inode_attr(cx, inner)?;
-                    attr.ino = self.btrfs_nested_present(cx, slot, attr.ino, ino);
+                    attr.ino = self.btrfs_nested_present(cx, slot, attr.ino, ino)?;
                     return Ok(attr);
                 }
                 self.btrfs_read_inode_attr(cx, ino)
@@ -876,10 +883,10 @@ impl FsOps for OpenFs {
             FsFlavor::Btrfs(_) => {
                 if let Some((slot, nested, inner)) = self.btrfs_nested_route(ino)? {
                     let page = nested.btrfs_readdir(cx, &RequestScope::empty(), inner, offset)?;
-                    return Ok(self.btrfs_nested_present_page(cx, slot, inner, ino, page));
+                    return self.btrfs_nested_present_page(cx, slot, inner, ino, page);
                 }
                 let page = self.btrfs_readdir(cx, scope, ino, offset)?;
-                Ok(self.btrfs_nested_present_page(cx, 0, ino, ino, page))
+                self.btrfs_nested_present_page(cx, 0, ino, ino, page)
             }
         }
     }
@@ -2931,10 +2938,13 @@ impl FsOps for OpenFs {
     fn btrfs_encoded_read(
         &self,
         cx: &Cx,
-        _scope: &mut RequestScope,
+        scope: &mut RequestScope,
         ino: u64,
         args: &[u8],
     ) -> ffs_error::Result<Vec<u8>> {
+        if let Some((_, nested, inner)) = self.btrfs_nested_route(InodeNumber(ino))? {
+            return nested.btrfs_encoded_read(cx, scope, inner.0, args);
+        }
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_ENCODED_READ is not supported on ext4 filesystems".to_owned(),
@@ -2960,9 +2970,16 @@ impl FsOps for OpenFs {
                 // fallocate KEEP_SIZE prealloc extent on a shorter file), and
                 // will routinely once extents become sector-aligned (bd-7mi0p);
                 // without this clamp the ioctl returns data for the region past
-                // EOF. `btrfs_read_inode_attr` resolves i_size on both the
-                // writable (alloc-state) and read-only (tree-walk) paths.
-                let file_size = self.btrfs_read_inode_attr(cx, InodeNumber(ino))?.size;
+                // EOF. Resolve the current inode on both the
+                // writable (alloc-state) and read-only (tree-walk) paths. Keep
+                // the inode flags too: encoded reads obey NODATASUM just as
+                // ordinary reads do.
+                let inode = if let Some(alloc_mutex) = &self.btrfs_alloc_state {
+                    self.btrfs_read_inode_from_tree(&alloc_mutex.read(), canonical)?
+                } else {
+                    self.btrfs_read_ondisk_inode_item(cx, canonical)?
+                };
+                let file_size = inode.size;
                 if file_offset >= file_size {
                     // At/past EOF: no valid file data. Return the bare 32-byte
                     // metadata header with len = unencoded_len = 0.
@@ -3104,6 +3121,7 @@ impl FsOps for OpenFs {
                         )
                     }
                     BtrfsExtentData::Regular {
+                        extent_type,
                         compression,
                         disk_bytenr,
                         disk_num_bytes,
@@ -3117,20 +3135,47 @@ impl FsOps for OpenFs {
                             let len = (*num_bytes).min(max_len) as usize;
                             (vec![0u8; len], 0, *num_bytes, file_offset - extent_start)
                         } else {
-                            // Read raw extent data from disk
-                            let mapping = map_logical_to_physical(
-                                &self.btrfs_context().unwrap().chunks,
-                                *disk_bytenr,
-                            )
-                            .map_err(|e| FfsError::Parse(format!("{e}")))?
-                            .ok_or_else(|| {
-                                FfsError::Format("extent not covered by chunk".into())
-                            })?;
                             #[expect(clippy::cast_possible_truncation)]
                             let read_len = (*disk_num_bytes).min(max_len) as usize;
                             let mut buf = vec![0u8; read_len];
-                            self.dev
-                                .read_exact_at(cx, ByteOffset(mapping.physical), &mut buf)?;
+                            // Encoded bytes use the same logical-device routing
+                            // and checksum recovery as ordinary file reads.
+                            // A physical read on the primary would miss stripes,
+                            // mirror fallback and committed MVCC data.
+                            if self.btrfs_verify_data_on_read
+                                && inode.flags & BTRFS_INODE_NODATASUM == 0
+                            {
+                                let sectorsize = self
+                                    .btrfs_superblock()
+                                    .and_then(|sb| usize::try_from(sb.sectorsize).ok())
+                                    .filter(|size| *size != 0)
+                                    .ok_or_else(|| {
+                                        FfsError::Format("invalid btrfs sectorsize".into())
+                                    })?;
+                                let checksums = self.btrfs_read_csum_items_covering(
+                                    cx,
+                                    &[(*disk_bytenr, *disk_num_bytes)],
+                                )?;
+                                if self.btrfs_devices.is_none() {
+                                    self.btrfs_verify_one_extent_csum(
+                                        cx,
+                                        &checksums,
+                                        sectorsize,
+                                        *extent_type,
+                                        *disk_bytenr,
+                                        *disk_num_bytes,
+                                    )?;
+                                }
+                                self.btrfs_read_checksummed_into(
+                                    cx,
+                                    &checksums,
+                                    sectorsize,
+                                    *disk_bytenr,
+                                    &mut buf,
+                                )?;
+                            } else {
+                                self.btrfs_read_logical_into(cx, *disk_bytenr, &mut buf)?;
+                            }
                             let offset_in_extent = file_offset
                                 .saturating_sub(extent_start)
                                 .saturating_add(*extent_offset);

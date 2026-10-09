@@ -750,7 +750,9 @@ struct BtrfsReadDevices {
 impl BtrfsReadDevices {
     /// Prove device coverage for every committed chunk, not only the metadata
     /// touched during open. RAID1/C3/C4 need one complete copy; RAID10 needs
-    /// one copy in every mirrored stripe group. Other profiles need all devices.
+    /// one copy in every mirrored stripe group. RAID5/6 permit one/two absent
+    /// devices, with the same independent-column geometry as reconstruction.
+    /// Other profiles need all devices.
     fn validate_read_coverage(&self, chunks: &[BtrfsChunkEntry]) -> Result<(), FfsError> {
         use ffs_ondisk::chunk_type_flags::{
             BTRFS_BLOCK_GROUP_RAID1, BTRFS_BLOCK_GROUP_RAID1C3, BTRFS_BLOCK_GROUP_RAID1C4,
@@ -800,6 +802,10 @@ impl BtrfsReadDevices {
                 // data against its checksum, tree nodes against their own
                 // checksum, logical address and structure (read_node).
                 BTRFS_BLOCK_GROUP_RAID5 | BTRFS_BLOCK_GROUP_RAID6 => {
+                    // Validate even chunks not touched by the opening walks.
+                    // Repeated device IDs cannot provide independent parity
+                    // columns, regardless of the number of attached stripes.
+                    btrfs_raid56::read_shape(std::slice::from_ref(chunk), chunk.key.offset, 1)?;
                     let erasures = if chunk.chunk_type & RAID_MASK == BTRFS_BLOCK_GROUP_RAID5 {
                         1
                     } else {
@@ -849,22 +855,7 @@ impl BtrfsReadDevices {
             .map_err(|error| parse_to_ffs_error(&error))?;
         let sb = BtrfsSuperblock::parse_superblock_region(&region)
             .map_err(|error| parse_to_ffs_error(&error))?;
-        validate_btrfs_superblock(&sb)?;
-        if sb.fsid != primary.fsid
-            || sb.generation != primary.generation
-            || sb.root != primary.root
-            || sb.chunk_root != primary.chunk_root
-            || sb.chunk_root_generation != primary.chunk_root_generation
-            || sb.nodesize != primary.nodesize
-            || sb.sectorsize != primary.sectorsize
-            || sb.csum_type != primary.csum_type
-            || sb.num_devices != primary.num_devices
-            || sb.log_root != 0
-        {
-            return Err(FfsError::Format(
-                "attached btrfs device does not match the clean committed filesystem".into(),
-            ));
-        }
+        Self::validate_committed_superblock(&sb, primary)?;
         let item = read_btrfs_backing_device_item(cx, dev.as_ref(), &sb)?;
         if item.total_bytes > dev.len_bytes()
             || self
@@ -907,6 +898,66 @@ impl BtrfsReadDevices {
         Ok(())
     }
 
+    fn validate_committed_superblock(
+        sb: &BtrfsSuperblock,
+        primary: &BtrfsSuperblock,
+    ) -> Result<(), FfsError> {
+        validate_btrfs_superblock(sb)?;
+        if sb.fsid != primary.fsid
+            || sb.generation != primary.generation
+            || sb.root != primary.root
+            || sb.chunk_root != primary.chunk_root
+            || sb.chunk_root_generation != primary.chunk_root_generation
+            || sb.nodesize != primary.nodesize
+            || sb.sectorsize != primary.sectorsize
+            || sb.csum_type != primary.csum_type
+            || sb.num_devices != primary.num_devices
+            || sb.log_root != 0
+        {
+            return Err(FfsError::Format(
+                "attached btrfs device does not match the clean committed filesystem".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn validate_inherited_devices(
+        &self,
+        cx: &Cx,
+        primary: &BtrfsSuperblock,
+    ) -> Result<(), FfsError> {
+        for (devid, identity) in &self.identities {
+            let region = self
+                .readers
+                .read_physical(
+                    cx,
+                    *devid,
+                    BTRFS_SUPER_INFO_OFFSET as u64,
+                    ffs_types::BTRFS_SUPER_INFO_SIZE,
+                )
+                .map_err(btrfs_device_error_to_ffs)?;
+            ffs_ondisk::verify_btrfs_superblock_checksum(&region)
+                .map_err(|error| parse_to_ffs_error(&error))?;
+            let sb = BtrfsSuperblock::parse_superblock_region(&region)
+                .map_err(|error| parse_to_ffs_error(&error))?;
+            Self::validate_committed_superblock(&sb, primary)?;
+            let item = ffs_ondisk::parse_dev_item(
+                &region[0xC9..0xC9 + ffs_ondisk::btrfs::BTRFS_DEV_ITEM_SIZE],
+            )
+            .map_err(|error| parse_to_ffs_error(&error))?;
+            if item.fsid != primary.fsid
+                || item.devid != *devid
+                || item.uuid != identity.uuid
+                || item.total_bytes != identity.total_bytes
+            {
+                return Err(FfsError::Format(
+                    "inherited btrfs device identity or capacity changed".into(),
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn read_node(
         &self,
         cx: &Cx,
@@ -915,6 +966,23 @@ impl BtrfsReadDevices {
         nodesize: u32,
         csum_type: u16,
     ) -> Result<Arc<BtrfsParsedNode>, ParseError> {
+        self.read_node_with_generation(cx, chunks, logical, nodesize, csum_type)
+            .map(|(node, _)| node)
+    }
+
+    fn read_node_with_generation(
+        &self,
+        cx: &Cx,
+        chunks: &[BtrfsChunkEntry],
+        logical: u64,
+        nodesize: u32,
+        csum_type: u16,
+    ) -> Result<(Arc<BtrfsParsedNode>, u64), ParseError> {
+        let parse = |bytes: Vec<u8>| {
+            let generation = ffs_btrfs::BtrfsHeader::parse_from_block(&bytes)?.generation;
+            let node = parse_btrfs_tree_node_owned(bytes, csum_type, logical, nodesize)?;
+            Ok((Arc::new(node), generation))
+        };
         let mapping = ffs_ondisk::map_logical_to_stripes(chunks, logical)?.ok_or(
             ParseError::InvalidField {
                 field: "logical_address",
@@ -952,8 +1020,8 @@ impl BtrfsReadDevices {
             };
             // Only a checksum-valid, structurally valid node at the expected
             // logical address may reach the parsed-node cache or tree walker.
-            match parse_btrfs_tree_node_owned(bytes, csum_type, logical, nodesize) {
-                Ok(node) => return Ok(Arc::new(node)),
+            match parse(bytes) {
+                Ok(node) => return Ok(node),
                 Err(error) => failure = error,
             }
         }
@@ -980,8 +1048,7 @@ impl BtrfsReadDevices {
                     },
                 })?;
             if let Some(bytes) = rebuilt {
-                return parse_btrfs_tree_node_owned(bytes, csum_type, logical, nodesize)
-                    .map(Arc::new);
+                return parse(bytes);
             }
         }
         Err(failure)
@@ -2059,7 +2126,7 @@ pub struct OpenFs {
     /// Block device for I/O operations.
     dev: Arc<dyn ByteDevice>,
     /// Explicitly attached btrfs devices; writable mounts use the single-device path.
-    btrfs_devices: Option<BtrfsReadDevices>,
+    btrfs_devices: Option<Arc<BtrfsReadDevices>>,
     /// MVCC version store for snapshot-isolated block access.
     ///
     /// Shared across all snapshots/transactions that operate on this filesystem.
@@ -6432,11 +6499,23 @@ impl OpenFs {
     }
 
     /// Open a filesystem from an already-opened device.
-    #[expect(clippy::too_many_lines)]
     pub fn from_device(
         cx: &Cx,
         dev: Box<dyn ByteDevice>,
         options: &OpenOptions,
+    ) -> Result<Self, FfsError> {
+        Self::from_device_with_btrfs_devices(cx, dev, options, None)
+    }
+
+    /// Nested read-only subvolumes share the already validated backing handles.
+    /// Their chunk inventory, coverage and mount selection are still validated
+    /// by the same constructor as the parent filesystem.
+    #[expect(clippy::too_many_lines)]
+    fn from_device_with_btrfs_devices(
+        cx: &Cx,
+        dev: Box<dyn ByteDevice>,
+        options: &OpenOptions,
+        inherited_devices: Option<Arc<BtrfsReadDevices>>,
     ) -> Result<Self, FfsError> {
         let flavor = detect_filesystem_on_device(cx, &*dev).map_err(|e| match e {
             DetectionError::UnsupportedImage => {
@@ -6458,7 +6537,10 @@ impl OpenFs {
 
         let dev: Arc<dyn ByteDevice> = Arc::from(dev);
         let multi_device = matches!(&flavor, FsFlavor::Btrfs(sb) if sb.num_devices > 1);
-        let btrfs_devices = if options.btrfs_device_paths.is_empty() && !multi_device {
+        let btrfs_devices = if inherited_devices.is_none()
+            && options.btrfs_device_paths.is_empty()
+            && !multi_device
+        {
             None
         } else {
             let FsFlavor::Btrfs(sb) = &flavor else {
@@ -6469,12 +6551,18 @@ impl OpenFs {
                     "device attachment requires a clean multi-device btrfs image without an MVCC WAL".into(),
                 ));
             }
-            Some(BtrfsReadDevices::open(
-                cx,
-                &dev,
-                sb,
-                &options.btrfs_device_paths,
-            )?)
+            Some(match inherited_devices {
+                Some(devices) => {
+                    devices.validate_inherited_devices(cx, sb)?;
+                    devices
+                }
+                None => Arc::new(BtrfsReadDevices::open(
+                    cx,
+                    &dev,
+                    sb,
+                    &options.btrfs_device_paths,
+                )?),
+            })
         };
 
         let mut btrfs_tree_log_items = Vec::new();
@@ -13872,17 +13960,27 @@ impl OpenFs {
         }
         let options = OpenOptions {
             btrfs_mount_selection: BtrfsMountSelection::SubvolumeId(subvol_id),
+            btrfs_verify_data_on_read: self.btrfs_verify_data_on_read,
             ..OpenOptions::default()
         };
-        let mut nested = Self::from_device(
+        let mut nested = Self::from_device_with_btrfs_devices(
             cx,
             Box::new(SharedByteDevice(Arc::clone(&self.dev))),
             &options,
+            self.btrfs_devices.clone(),
         )?;
         nested.btrfs_nested_enabled = false;
         let root_dirid = nested
             .btrfs_context()
             .map_or(BTRFS_FIRST_FREE_OBJECTID, |ctx| ctx.subvol_root_dirid);
+        if self.btrfs_devices.is_some()
+            && nested
+                .btrfs_read_inode_attr(cx, InodeNumber(root_dirid))?
+                .kind
+                != FileType::Directory
+        {
+            return Err(FfsError::NotDirectory);
+        }
         slots.push(BtrfsNestedSlot {
             subvol_id,
             fs: Arc::new(nested),
@@ -13902,28 +14000,31 @@ impl OpenFs {
         slot: usize,
         ino: InodeNumber,
         dir: InodeNumber,
-    ) -> InodeNumber {
+    ) -> Result<InodeNumber, FfsError> {
         if !self.btrfs_nested_enabled {
-            return ino;
+            return Ok(ino);
         }
         if ino.0 & BTRFS_SUBVOL_LINK_INO_BIT != 0 {
             let subvol_id = ino.0 & !BTRFS_SUBVOL_LINK_INO_BIT;
             return match self.btrfs_nested_slot_for(cx, subvol_id, dir) {
-                Ok((child, root)) => Self::btrfs_nested_tag(child, InodeNumber(root)),
+                Ok((child, root)) => Ok(Self::btrfs_nested_tag(child, InodeNumber(root))),
+                // Attached-device mounts are read-only: a failed child read
+                // cannot be an uncommitted subvolume awaiting publication.
+                Err(err) if self.btrfs_devices.is_some() => Err(err),
                 // Not readable as a tree on the device (a subvolume created
                 // on this writable mount and not yet committed): it stays the
                 // empty placeholder.
                 Err(err) => {
                     debug!(subvol_id, error = %err, "nested btrfs subvolume not presented");
-                    ino
+                    Ok(ino)
                 }
             };
         }
         if slot != 0 && ino.0 == 1 {
             let root = self.btrfs_nested.lock()[slot - 1].root_dirid;
-            return Self::btrfs_nested_tag(slot, InodeNumber(root));
+            return Ok(Self::btrfs_nested_tag(slot, InodeNumber(root)));
         }
-        Self::btrfs_nested_tag(slot, ino)
+        Ok(Self::btrfs_nested_tag(slot, ino))
     }
 
     /// `..` of a nested subvolume's root: the directory holding its link.
@@ -13950,7 +14051,7 @@ impl OpenFs {
             None => (0, self.btrfs_lookup_child(cx, parent, name)?),
         };
         if self.btrfs_nested_enabled && attr.ino.0 & BTRFS_SUBVOL_LINK_INO_BIT != 0 {
-            let root = self.btrfs_nested_present(cx, slot, attr.ino, parent);
+            let root = self.btrfs_nested_present(cx, slot, attr.ino, parent)?;
             let Some((_, nested, inner)) = self.btrfs_nested_route(root)? else {
                 return Ok(attr); // still the placeholder
             };
@@ -13958,7 +14059,7 @@ impl OpenFs {
             root_attr.ino = root;
             return Ok(root_attr);
         }
-        attr.ino = self.btrfs_nested_present(cx, slot, attr.ino, parent);
+        attr.ino = self.btrfs_nested_present(cx, slot, attr.ino, parent)?;
         Ok(attr)
     }
 
@@ -13972,14 +14073,14 @@ impl OpenFs {
         inner_dir: InodeNumber,
         dir: InodeNumber,
         page: crate::vfs::ReaddirPage,
-    ) -> crate::vfs::ReaddirPage {
+    ) -> Result<crate::vfs::ReaddirPage, FfsError> {
         if !self.btrfs_nested_enabled
             || (slot == 0
                 && !page
                     .iter()
                     .any(|entry| entry.ino.0 & BTRFS_SUBVOL_LINK_INO_BIT != 0))
         {
-            return page;
+            return Ok(page);
         }
         let end_cookie = page.end_cookie();
         let mut entries = page.to_vec();
@@ -13990,9 +14091,9 @@ impl OpenFs {
                 entry.ino = parent;
                 continue;
             }
-            entry.ino = self.btrfs_nested_present(cx, slot, entry.ino, dir);
+            entry.ino = self.btrfs_nested_present(cx, slot, entry.ino, dir)?;
         }
-        crate::vfs::ReaddirPage::new(entries).with_end_cookie(end_cookie)
+        Ok(crate::vfs::ReaddirPage::new(entries).with_end_cookie(end_cookie))
     }
 
     /// Attributes of a nested-subvolume link (see [`Self::btrfs_dir_child_ino`]).
@@ -60195,10 +60296,10 @@ mod tests {
                     }),
                 )
                 .unwrap();
-            fs.btrfs_devices = Some(BtrfsReadDevices {
+            fs.btrfs_devices = Some(Arc::new(BtrfsReadDevices {
                 readers,
                 identities: Default::default(),
-            });
+            }));
             let result = match operation {
                 0 => fs.walk_btrfs_tree(&cx, root).map(|_| ()),
                 1 => fs
@@ -60331,10 +60432,10 @@ mod tests {
                                 )
                                 .unwrap();
                         }
-                        fs.btrfs_devices = Some(BtrfsReadDevices {
+                        fs.btrfs_devices = Some(Arc::new(BtrfsReadDevices {
                             readers,
                             identities: Default::default(),
-                        });
+                        }));
                         if metadata {
                             let result = fs.walk_btrfs_tree(&cx, root);
                             if all_bad {
@@ -60560,17 +60661,38 @@ mod tests {
 
             // Degraded data read: the data slot's device is ABSENT and the
             // read must be rebuilt from the survivors plus parity.
+            let full = make_devices(
+                &(1..=u64::from(num_stripes)).collect::<Vec<_>>(),
+                num_stripes,
+                false,
+                logical,
+                Arc::clone(&slots),
+            );
+            for invalid in 0..4 {
+                let mut malformed = chunk.clone();
+                match invalid {
+                    0 => malformed.stripes[1].devid = malformed.stripes[0].devid,
+                    1 => malformed.stripes[0].devid = 0,
+                    2 => malformed.num_stripes += 1,
+                    _ => malformed.stripe_len = 0,
+                }
+                assert!(
+                    full.validate_read_coverage(&[malformed]).is_err(),
+                    "RAID profile {profile_flag} admitted malformed geometry {invalid}"
+                );
+            }
+
             let degraded: Vec<u64> = match num_stripes {
                 3 => vec![2, 3],
                 _ => vec![2, 3, 4], // RAID6: omit ONE data device (single erasure)
             };
-            fs.btrfs_devices = Some(make_devices(
+            fs.btrfs_devices = Some(Arc::new(make_devices(
                 &degraded,
                 num_stripes,
                 corrupt_primary,
                 logical,
                 Arc::clone(&slots),
-            ));
+            )));
             let mut out = [0xA5; 22];
             fs.btrfs_read_checksummed_into(&cx, &csums, 4096, logical + 3, &mut out)
                 .expect("degraded read must reconstruct through parity");
@@ -60580,13 +60702,13 @@ mod tests {
             // Double erasure (RAID6: both data slots absent): the GF(256)
             // solve reconstructs BOTH data slots from P and Q.
             if num_stripes == 4 {
-                fs.btrfs_devices = Some(make_devices(
+                fs.btrfs_devices = Some(Arc::new(make_devices(
                     &[3, 4],
                     num_stripes,
                     corrupt_primary,
                     logical,
                     Arc::clone(&slots),
-                ));
+                )));
                 let mut out = [0xA5; 22];
                 fs.btrfs_read_checksummed_into(&cx, &csums, 4096, logical + 3, &mut out)
                     .expect("dual-erasure read must reconstruct via the GF solve");
@@ -60600,13 +60722,13 @@ mod tests {
             // RAID6 must serve a missing data column even when P is also
             // missing: Q alone still supplies the second independent equation.
             if num_stripes == 4 {
-                fs.btrfs_devices = Some(make_devices(
+                fs.btrfs_devices = Some(Arc::new(make_devices(
                     &[2, 4],
                     num_stripes,
                     false,
                     logical,
                     Arc::clone(&slots),
-                ));
+                )));
                 let mut out = [0xA5; 22];
                 fs.btrfs_read_checksummed_into(&cx, &csums, 4096, logical + 3, &mut out)
                     .expect("data plus P erasure must recover from Q");
@@ -60615,13 +60737,13 @@ mod tests {
 
             // Silent corruption of the primary data copy (all devices
             // attached, csum fails on slot 0) is repaired through parity.
-            fs.btrfs_devices = Some(make_devices(
+            fs.btrfs_devices = Some(Arc::new(make_devices(
                 &(1..=u64::from(num_stripes)).collect::<Vec<_>>(),
                 num_stripes,
                 corrupt_primary,
                 logical,
                 Arc::clone(&slots),
-            ));
+            )));
             let mut out = [0xA5; 22];
             if num_stripes == 3 {
                 fs.btrfs_read_checksummed_into(&cx, &csums, 4096, logical + 3, &mut out)
@@ -62912,10 +63034,10 @@ mod tests {
             readers
                 .add_device(2, Box::new(|_, _, _| panic!("fallback after cancellation")))
                 .unwrap();
-            fs.btrfs_devices = Some(BtrfsReadDevices {
+            fs.btrfs_devices = Some(Arc::new(BtrfsReadDevices {
                 readers,
                 identities: Default::default(),
-            });
+            }));
             let mut destination = [0xA5; 22];
             let error = fs
                 .btrfs_read_checksummed_into(&cx, &csums, 4096, logical, &mut destination)
@@ -94283,6 +94405,193 @@ mod tests {
         );
     }
 
+    #[test]
+    fn btrfs_nested_subvolume_inherits_attached_devices_and_rejects_unreadable_children() {
+        const NESTED_ROOT: usize = 0x3_0000;
+        const NESTED_DATA: usize = NESTED_ROOT + BTRFS_TEST_NODESIZE;
+        const NESTED_ID: u64 = 256;
+        let payload = b"only the attached nested device";
+        let (mut image, chunk_root) = build_btrfs_device_inventory_image();
+        let sb = BTRFS_SUPER_INFO_OFFSET;
+
+        // Keep the parent's trees on device 7, and put the nested tree and
+        // file data exclusively on the inventory's second device.
+        image[sb + 0x32B + 17..sb + 0x32B + 25]
+            .copy_from_slice(&(NESTED_ROOT as u64).to_le_bytes());
+        image[chunk_root + 3800..chunk_root + 3808]
+            .copy_from_slice(&(NESTED_ROOT as u64).to_le_bytes());
+        let mut nested_chunk = image[chunk_root + 3800..chunk_root + 3880].to_vec();
+        nested_chunk[..8].copy_from_slice(&(2 * BTRFS_TEST_NODESIZE as u64).to_le_bytes());
+        nested_chunk[48..56].copy_from_slice(&u64::MAX.to_le_bytes());
+        nested_chunk[56..64].copy_from_slice(&(NESTED_ROOT as u64).to_le_bytes());
+        nested_chunk[64..80].fill(0xD4);
+        image[chunk_root + 0x60..chunk_root + 0x64].copy_from_slice(&5_u32.to_le_bytes());
+        write_btrfs_leaf_item(
+            &mut image,
+            chunk_root,
+            4,
+            256,
+            ffs_btrfs::BTRFS_ITEM_CHUNK,
+            NESTED_ROOT as u64,
+            3700,
+            80,
+        );
+        image[chunk_root + 3700..chunk_root + 3780].copy_from_slice(&nested_chunk);
+        stamp_btrfs_test_tree_block_crc32c(&mut image, chunk_root);
+
+        let root = BTRFS_TEST_ROOT_TREE_LOGICAL;
+        let mut root_item = image[root + 3000..root + 3239].to_vec();
+        root_item[176..184].copy_from_slice(&(NESTED_ROOT as u64).to_le_bytes());
+        image[root + 0x60..root + 0x64].copy_from_slice(&2_u32.to_le_bytes());
+        write_btrfs_leaf_item(
+            &mut image,
+            root,
+            1,
+            NESTED_ID,
+            BTRFS_ITEM_ROOT_ITEM,
+            0,
+            2700,
+            239,
+        );
+        image[root + 2700..root + 2939].copy_from_slice(&root_item);
+        stamp_btrfs_test_tree_block_crc32c(&mut image, root);
+
+        let parent = BTRFS_TEST_FS_TREE_LOGICAL;
+        image.copy_within(parent..parent + BTRFS_TEST_NODESIZE, NESTED_ROOT);
+        image[NESTED_ROOT + 0x30..NESTED_ROOT + 0x38]
+            .copy_from_slice(&(NESTED_ROOT as u64).to_le_bytes());
+        image[NESTED_ROOT + 0x58..NESTED_ROOT + 0x60].copy_from_slice(&NESTED_ID.to_le_bytes());
+        let inode = NESTED_ROOT + BTRFS_TEST_FILE_INODE_OFF;
+        image[inode + 16..inode + 24].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+        image[inode + 24..inode + 32].copy_from_slice(&(payload.len() as u64).to_le_bytes());
+        let extent = encode_btrfs_extent_regular(NESTED_DATA as u64, payload.len() as u64);
+        image[NESTED_ROOT + BTRFS_TEST_EXTENT_OFF
+            ..NESTED_ROOT + BTRFS_TEST_EXTENT_OFF + extent.len()]
+            .copy_from_slice(&extent);
+        image[NESTED_DATA..NESTED_DATA + payload.len()].copy_from_slice(payload);
+        stamp_btrfs_test_tree_block_crc32c(&mut image, NESTED_ROOT);
+
+        // The same inode number names a different file in the parent. A
+        // primary-device read or missing inode-slot tag cannot satisfy this.
+        let header = parent + BTRFS_TEST_LEAF_HEADER_SIZE;
+        image.copy_within(
+            header + 2 * BTRFS_TEST_LEAF_ITEM_SIZE..header + 4 * BTRFS_TEST_LEAF_ITEM_SIZE,
+            header + 3 * BTRFS_TEST_LEAF_ITEM_SIZE,
+        );
+        let mut link = encode_btrfs_dir_index_entry(b"nested", NESTED_ID, ffs_btrfs::BTRFS_FT_DIR);
+        link[8] = BTRFS_ITEM_ROOT_ITEM;
+        write_btrfs_leaf_item(
+            &mut image,
+            parent,
+            2,
+            256,
+            BTRFS_ITEM_DIR_INDEX,
+            3,
+            2600,
+            u32::try_from(link.len()).unwrap(),
+        );
+        image[parent + 2600..parent + 2600 + link.len()].copy_from_slice(&link);
+        image[parent + 0x60..parent + 0x64].copy_from_slice(&5_u32.to_le_bytes());
+        stamp_btrfs_test_tree_block_crc32c(&mut image, parent);
+        let checksum = ffs_types::crc32c(&image[sb + 0x20..sb + 4096]);
+        image[sb..sb + 4].copy_from_slice(&checksum.to_le_bytes());
+        let mut secondary_image = image.clone();
+        let secondary_item = image[chunk_root + 3900..chunk_root + 3998].to_vec();
+        secondary_image[sb + 0xC9..sb + 0x12B].copy_from_slice(&secondary_item);
+        let checksum = ffs_types::crc32c(&secondary_image[sb + 0x20..sb + 4096]);
+        secondary_image[sb..sb + 4].copy_from_slice(&checksum.to_le_bytes());
+        image[NESTED_ROOT..NESTED_DATA + BTRFS_TEST_NODESIZE].fill(0);
+
+        for verify in [false, true] {
+            for fault in ["healthy", "missing", "unavailable", "corrupt", "stale"] {
+                let cx = Cx::for_testing();
+                let primary: Arc<dyn ByteDevice> = Arc::new(TestDevice::from_vec(image.clone()));
+                let secondary = TestDevice::from_vec(secondary_image.clone());
+                let FsFlavor::Btrfs(superblock) =
+                    detect_filesystem_on_device(&cx, primary.as_ref()).unwrap()
+                else {
+                    panic!("fixture is btrfs");
+                };
+                let mut devices = BtrfsReadDevices::open(&cx, &primary, &superblock, &[]).unwrap();
+                if fault != "missing" {
+                    devices
+                        .attach(&cx, Arc::new(secondary.clone()), &superblock)
+                        .unwrap();
+                }
+                let devices = Arc::new(devices);
+                let opened = OpenFs::from_device_with_btrfs_devices(
+                    &cx,
+                    Box::new(SharedByteDevice(Arc::clone(&primary))),
+                    &OpenOptions {
+                        btrfs_verify_data_on_read: verify,
+                        ..OpenOptions::default()
+                    },
+                    Some(Arc::clone(&devices)),
+                );
+                if fault == "missing" {
+                    assert!(opened.is_err(), "missing device must fail coverage");
+                    continue;
+                }
+                let fs = opened.expect("parent metadata and coverage are valid");
+                if fault == "unavailable" {
+                    secondary.data.lock().unwrap().truncate(NESTED_ROOT);
+                } else if fault == "corrupt" {
+                    secondary.data.lock().unwrap()[NESTED_ROOT + 0x100] ^= 0xFF;
+                } else if fault == "stale" {
+                    let mut bytes = secondary.data.lock().unwrap();
+                    bytes[sb + 0x48..sb + 0x50].copy_from_slice(&2_u64.to_le_bytes());
+                    let checksum = ffs_types::crc32c(&bytes[sb + 0x20..sb + 4096]);
+                    bytes[sb..sb + 4].copy_from_slice(&checksum.to_le_bytes());
+                }
+                let link = fs.lookup(&cx, InodeNumber(1), OsStr::new("nested"));
+                if fault != "healthy" {
+                    assert!(link.is_err(), "{fault} child must not become a placeholder");
+                    assert!(fs.readdir(&cx, InodeNumber(1), 0).is_err());
+                    assert!(
+                        fs.btrfs_nested.lock().is_empty(),
+                        "invalid child was cached"
+                    );
+                    continue;
+                }
+                let link = link.expect("attached nested root");
+                assert_eq!(link.kind, FileType::Directory);
+                let (slot, nested, _) = fs.btrfs_nested_route(link.ino).unwrap().unwrap();
+                assert_ne!(slot, 0);
+                assert!(Arc::ptr_eq(
+                    nested.btrfs_devices.as_ref().unwrap(),
+                    &devices
+                ));
+                assert_eq!(nested.btrfs_verify_data_on_read, verify);
+                let file = fs.lookup(&cx, link.ino, OsStr::new("hello.txt")).unwrap();
+                let parent_file = fs
+                    .lookup(&cx, InodeNumber(1), OsStr::new("hello.txt"))
+                    .unwrap();
+                assert_ne!(
+                    file.ino, parent_file.ino,
+                    "different subvolume inode aliases"
+                );
+                assert_eq!(fs.read(&cx, file.ino, 0, 128).unwrap(), payload);
+                assert_eq!(
+                    fs.read(&cx, parent_file.ino, 0, 128).unwrap(),
+                    b"hello from btrfs fsops"
+                );
+                let entries = fs.readdir(&cx, link.ino, 0).unwrap();
+                assert_eq!(
+                    entries
+                        .iter()
+                        .find(|entry| entry.name == b"..")
+                        .unwrap()
+                        .ino,
+                    InodeNumber(1)
+                );
+                assert_eq!(
+                    fs.write(&cx, file.ino, 0, b"x").unwrap_err().to_errno(),
+                    libc::EROFS
+                );
+            }
+        }
+    }
+
     /// bd-2ryx9: a nested subvolume is entered like the kernel enters it: its
     /// link in the parent directory is the root directory of the subvolume's
     /// own tree, and what is inside (files, directories, a subvolume nested in
@@ -112922,6 +113231,149 @@ mod tests {
     }
 
     #[test]
+    fn btrfs_root_generation_inspection_uses_validated_attached_mirror() {
+        let cx = Cx::for_testing();
+        let image = build_btrfs_csum_image();
+        let mut fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(image.clone())),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let logical = BTRFS_TEST_FS_TREE_LOGICAL;
+        assert!(
+            fs.btrfs_root_item_transid_mismatches(&cx)
+                .unwrap()
+                .iter()
+                .all(|mismatch| mismatch.logical != logical as u64)
+        );
+        let chunk = &mut fs.btrfs_context.as_mut().unwrap().chunks[0];
+        chunk.chunk_type = ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_RAID1;
+        chunk.num_stripes = 2;
+        chunk.stripes = (1..=2)
+            .map(|devid| ffs_ondisk::BtrfsStripe {
+                devid,
+                offset: 0,
+                dev_uuid: [0; 16],
+            })
+            .collect();
+        let mut readers = ffs_btrfs::BtrfsDeviceSet::new();
+        for devid in 1..=2 {
+            let mut backing = image.clone();
+            backing[logical + 0x50..logical + 0x58].copy_from_slice(&9_u64.to_le_bytes());
+            stamp_btrfs_test_tree_block_crc32c(&mut backing, logical);
+            if devid == 1 {
+                backing[logical] ^= 1; // Only the second copy has a valid checksum.
+            }
+            readers
+                .add_device(
+                    devid,
+                    Box::new(move |_, offset, len| {
+                        let start = usize::try_from(offset).unwrap();
+                        Ok(backing[start..start + len].to_vec())
+                    }),
+                )
+                .unwrap();
+        }
+        fs.btrfs_devices = Some(Arc::new(BtrfsReadDevices {
+            readers,
+            identities: Default::default(),
+        }));
+        assert!(
+            fs.btrfs_root_item_transid_mismatches(&cx)
+                .unwrap()
+                .iter()
+                .any(|mismatch| mismatch.logical == logical as u64 && mismatch.found == 9),
+            "the unchanged primary header must not hide the attached child's generation"
+        );
+    }
+
+    #[test]
+    fn btrfs_encoded_read_routes_to_checked_attached_mirrors() {
+        for (all_bad, verify, nodatasum) in [
+            (false, true, false),
+            (true, true, false),
+            (false, false, false),
+            (false, true, true),
+        ] {
+            let cx = Cx::for_testing();
+            let mut image = build_btrfs_csum_image();
+            if nodatasum {
+                let flags = BTRFS_TEST_FS_TREE_LOGICAL + BTRFS_TEST_FILE_INODE_OFF + 64;
+                image[flags..flags + 8].copy_from_slice(&BTRFS_INODE_NODATASUM.to_le_bytes());
+                stamp_btrfs_test_tree_block_crc32c(&mut image, BTRFS_TEST_FS_TREE_LOGICAL);
+            }
+            let logical = BTRFS_TEST_FILE_DATA_LOGICAL;
+            let expected = image[logical..logical + 21].to_vec();
+            let mut primary = image.clone();
+            primary[logical] ^= 0x80;
+            let mut fs = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(primary)),
+                &OpenOptions {
+                    btrfs_verify_data_on_read: verify,
+                    ..OpenOptions::default()
+                },
+            )
+            .unwrap();
+            let chunk = &mut fs.btrfs_context.as_mut().unwrap().chunks[0];
+            chunk.chunk_type = ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_RAID1;
+            chunk.num_stripes = 2;
+            chunk.stripes = (1..=2)
+                .map(|devid| ffs_ondisk::BtrfsStripe {
+                    devid,
+                    offset: 0,
+                    dev_uuid: [0; 16],
+                })
+                .collect();
+            let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut readers = ffs_btrfs::BtrfsDeviceSet::new();
+            for devid in 1..=2 {
+                let mut backing = image.clone();
+                if devid == 1 || all_bad {
+                    // Outside the requested seven-byte prefix: verifying only
+                    // returned bytes would miss this damaged sector.
+                    backing[logical + 17] ^= 0x40;
+                }
+                let reads = Arc::clone(&reads);
+                readers
+                    .add_device(
+                        devid,
+                        Box::new(move |_, offset, len| {
+                            let start = usize::try_from(offset).unwrap();
+                            if start == logical {
+                                reads.fetch_or(1 << (devid - 1), Ordering::Relaxed);
+                            }
+                            Ok(backing[start..start + len].to_vec())
+                        }),
+                    )
+                    .unwrap();
+            }
+            fs.btrfs_devices = Some(Arc::new(BtrfsReadDevices {
+                readers,
+                identities: Default::default(),
+            }));
+            let mut args = [0_u8; 64];
+            args[16..24].copy_from_slice(&3_u64.to_le_bytes());
+            args[32..40].copy_from_slice(&7_u64.to_le_bytes());
+            let result = fs.btrfs_encoded_read(&cx, &mut RequestScope::empty(), 257, &args);
+            if all_bad {
+                assert!(matches!(result, Err(FfsError::Corruption { .. })));
+            } else {
+                let result = result.unwrap();
+                assert_eq!(&result[32..], &expected[..7]);
+                assert_eq!(u64::from_le_bytes(result[0..8].try_into().unwrap()), 7);
+                assert_eq!(u64::from_le_bytes(result[16..24].try_into().unwrap()), 3);
+            }
+            assert_eq!(
+                reads.load(Ordering::Relaxed),
+                if verify && !nodatasum { 3 } else { 1 },
+                "verify={verify}, nodatasum={nodatasum}, all_bad={all_bad}"
+            );
+        }
+    }
+
+    #[test]
     fn btrfs_encoded_read_clamps_to_max_len() {
         let (fs, cx) = open_writable_btrfs();
         let attr = fs
@@ -112949,6 +113401,7 @@ mod tests {
             32 + header_len as usize,
             "result is the 32-byte header plus exactly header_len encoded bytes"
         );
+        assert_eq!(&result[32..], &[0xAB; 100], "read the committed MVCC data");
     }
 
     #[test]
