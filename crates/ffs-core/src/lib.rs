@@ -38835,9 +38835,12 @@ impl OpenFs {
             // The commit's own trees PLUS the chunk and device trees a growing
             // commit also rewrites — without the second term a chunk allocation
             // can require a chunk allocation.
+            // Plus one: the free-space-tree leaf moves to a fresh block on
+            // commits that rewrite it (bd-l68g8).
             let demand = u64::try_from(node_count)
                 .unwrap_or(u64::MAX)
-                .saturating_add(overhead);
+                .saturating_add(overhead)
+                .saturating_add(1);
             let policy = ffs_btrfs::ChunkSizePolicy::default();
             let mut grown = 0_u32;
             while grown < BTRFS_MAX_CHUNKS_PER_COMMIT {
@@ -39569,12 +39572,20 @@ impl OpenFs {
         // which reserve space without inserting the describing EXTENT_ITEM;
         // the items are placed below by the self-description fixpoint instead.
 
-        // bd-qxo5x: prepare to rewrite the FREE_SPACE_TREE in place. We reuse
-        // its current block address (a fresh allocation would itself perturb the
-        // free space we are recording), so only its ROOT_ITEM generation changes
-        // here — patch it now, before root_tree is serialized below. The leaf
-        // content and the FREE_SPACE_TREE_VALID flag are written after the
-        // extent tree is finalized, since the free ranges depend on it.
+        // bd-qxo5x / bd-l68g8: prepare to rewrite the single-leaf
+        // FREE_SPACE_TREE. Its leaf goes to a FRESH block like every other tree
+        // node, never back over the block the durable superblock names: that
+        // block is written before the superblock, so a crash (or a failed
+        // commit) between the two left the old superblock pointing at free
+        // space that described the new transaction, marking its own live
+        // tree blocks free. Allocating here, before the self-description
+        // fixpoint, gives the new block its extent item while the extent tree
+        // can still change shape, so the free ranges computed after the
+        // fixpoint record the leaf's own block as used (the "perturbation"
+        // that once argued for reusing the address is simply described). The
+        // old leaf is pinned until the new superblock lands. The leaf content
+        // and the FREE_SPACE_TREE_VALID flag are written after the extent
+        // tree is finalized, since the free ranges depend on it.
         //
         // bd-k74ef moved this patch AHEAD of the extent-tree commit: it is a
         // same-size `update` of an existing ROOT_ITEM, so it changes no shape,
@@ -39583,6 +39594,8 @@ impl OpenFs {
         //
         // The generation both the FST ROOT_ITEM and its block will carry (bd-73bi2).
         let mut fst_generation = new_gen;
+        // Whether the FST leaf moves to a fresh block this commit (bd-l68g8).
+        let mut fst_cow = false;
         let fst_root_key = BtrfsKey {
             objectid: ffs_btrfs::BTRFS_FREE_SPACE_TREE_OBJECTID,
             item_type: BTRFS_ITEM_ROOT_ITEM,
@@ -39594,18 +39607,39 @@ impl OpenFs {
             let parsed = ffs_btrfs::parse_root_item(&fst_root_data).map_err(|e| {
                 FfsError::Parse(format!("FREE_SPACE_TREE ROOT_ITEM parse failed: {e}"))
             })?;
-            let (fst_addr, fst_level) = (parsed.bytenr, parsed.level);
-            // bd-73bi2: keep the ROOT_ITEM at the tree's OWN generation
-            // instead of advancing it to `new_gen`. The block below is
-            // written with the same value, so pointer and block always
-            // agree -- whether or not the rewrite happens. Advancing the
-            // pointer while the block might not be rewritten is what
-            // stranded the tree above ~4000 files and made the image
-            // unopenable by the kernel while FrankenFS read it fine. An
-            // unchanged tree keeping an older generation than the
-            // superblock is ordinary btrfs: that is how every tree a
-            // transaction does not touch behaves.
-            fst_generation = parsed.generation;
+            let (mut fst_addr, fst_level) = (parsed.bytenr, parsed.level);
+            // The rewrite below needs a single-leaf FST and a single-leaf
+            // extent tree; with either one larger the superblock drops
+            // FREE_SPACE_TREE and nothing is written, as before.
+            fst_cow = fst_level == 0 && alloc.extent_alloc.extent_tree_root_is_leaf();
+            if fst_cow {
+                // bd-l68g8: COW the leaf. Pointer and block both carry
+                // `new_gen`, and the block below is written on EVERY commit
+                // that takes this branch (an empty leaf if the rewrite is
+                // refused after all), so the bd-73bi2 pair always agrees.
+                alloc
+                    .extent_alloc
+                    .remove_metadata_items_owned_by_roots(&[
+                        ffs_btrfs::BTRFS_FREE_SPACE_TREE_OBJECTID,
+                    ])
+                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                fst_addr = alloc
+                    .extent_alloc
+                    .alloc_metadata_for_tree(
+                        u64::from(nodesize),
+                        ffs_btrfs::BTRFS_FREE_SPACE_TREE_OBJECTID,
+                        0,
+                    )
+                    .map_err(|e| btrfs_mutation_to_ffs(&e))?
+                    .bytenr;
+            } else {
+                // Not rewritten this commit. bd-73bi2: keep the ROOT_ITEM
+                // at the tree's OWN generation, matching the untouched block;
+                // advancing the pointer over a block that is not rewritten
+                // stranded the tree above ~4000 files and made the image
+                // unopenable by the kernel while FrankenFS read it fine.
+                fst_generation = parsed.generation;
+            }
             BtrfsRootItem::patch_root_commit(
                 &mut fst_root_data,
                 fst_addr,
@@ -39934,21 +39968,6 @@ impl OpenFs {
             ))));
         }
 
-        // bd-qxo5x: the reused FREE_SPACE_TREE block is rewritten below, so bump
-        // its loaded extent-item generation to match (else btrfs check reports a
-        // backref generation mismatch for it). Gated exactly as the rewrite is,
-        // so a free-space tree we do NOT rewrite keeps the generation its block
-        // still carries. In-place update of an existing item: no shape change,
-        // so the fixpoint above stays converged.
-        if let Some((fst_addr, fst_level)) = fst_reuse
-            && alloc.extent_alloc.extent_tree_root_is_leaf()
-        {
-            alloc
-                .extent_alloc
-                .set_tree_block_generation(fst_addr, fst_level, new_gen)
-                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-        }
-
         // bd-4cxkd: every extent item this transaction touches is now in the
         // extent tree (the self-description items just above, data extent items
         // from the writes, csum/free-space tree blocks). Recompute each block
@@ -39957,11 +39976,11 @@ impl OpenFs {
         // bytes_used, so a net-new data extent no longer trips "block group used
         // N but extent items used M". Another same-size in-place update.
         //
-        // bd-xmh5g.193: when the FREE_SPACE_TREE is rewritten in place below,
-        // the accounting recompute and the free-space derivation scan the exact
+        // bd-xmh5g.193: when the FREE_SPACE_TREE is rewritten below, the
+        // accounting recompute and the free-space derivation scan the exact
         // same per-block-group extent keys, so compute both in one fused pass.
         let mut fused_free_groups: Option<Vec<ffs_btrfs::BlockGroupFreeSpace>> = None;
-        let recomputed_bytes_used: Option<u64> = if fst_reuse.is_some() {
+        let recomputed_bytes_used: Option<u64> = if fst_cow {
             let (bytes_used, free_groups) = alloc
                 .extent_alloc
                 .sync_accounting_and_free_space()
@@ -40195,16 +40214,36 @@ impl OpenFs {
         // the tree had already been written, which is also why it could describe
         // no more than one leaf.
         //
-        // What is left below is the free-space-tree rewrite. It is unchanged,
-        // including its single-leaf gate — that gate is about the FST, not about
-        // self-description, and widening it is a separate lever.
-        if alloc.extent_alloc.extent_tree_root_is_leaf() {
-            // bd-qxo5x: rewrite the FREE_SPACE_TREE in place from the now-final
-            // extent tree, so its free ranges reflect this transaction's
-            // allocations. btrfs check [4/8] rejects a stale free-space tree
-            // ("there is no free space entry for ..."). Single-leaf only; a tree
-            // that would split falls back (left not-VALID in the superblock).
-            if let Some((fst_addr, fst_level)) = fst_reuse {
+        // What is left below is the free-space-tree rewrite. Its single-leaf
+        // gate is about the FST, not about self-description, and widening it
+        // is a separate lever.
+        //
+        // bd-qxo5x: rewrite the FREE_SPACE_TREE from the now-final extent
+        // tree, so its free ranges reflect this transaction's allocations.
+        // btrfs check [4/8] rejects a stale free-space tree ("there is no
+        // free space entry for ..."). Single-leaf only; a tree that would
+        // split falls back (left not-VALID in the superblock).
+        if fst_cow && let Some((fst_addr, _)) = fst_reuse {
+            let fst_max_items = usize::try_from(u64::from(nodesize).saturating_sub(101) / 64)
+                .unwrap_or(5)
+                .max(5);
+            // The byte budget is what makes the single-leaf fallback below
+            // actually work (bd-cjqhh). `fst_max_items` is a 64-byte-per-item
+            // estimate; a FREE_SPACE_BITMAP item is far larger than that, so
+            // without a budget an oversized leaf stays at level 0, slips past
+            // the `root_level() == 0` guard, and fails the ENTIRE transaction
+            // at serialize_node — instead of splitting, tripping the guard,
+            // and leaving the free-space tree not-VALID as designed.
+            let new_fst_tree = || {
+                InMemoryCowBtrfsTree::new(fst_max_items)
+                    .map(|tree| tree.with_node_byte_budget((nodesize as usize).saturating_sub(101)))
+                    .map_err(|e| btrfs_mutation_to_ffs(&e))
+            };
+            let mut fst_tree = new_fst_tree()?;
+            // The fixpoint can grow the extent tree past one leaf after the
+            // COW decision; the free ranges are then not derived and the leaf
+            // is written empty.
+            if alloc.extent_alloc.extent_tree_root_is_leaf() {
                 // Reuse the free-space groups computed by the fused accounting
                 // pass above (bd-xmh5g.193); fall back to a standalone scan only
                 // if the single-leaf accounting branch did not run.
@@ -40215,63 +40254,53 @@ impl OpenFs {
                         .free_space_extents()
                         .map_err(|e| btrfs_mutation_to_ffs(&e))?,
                 };
-                let items = ffs_btrfs::build_free_space_tree_items(&groups);
-                let fst_max_items = usize::try_from(u64::from(nodesize).saturating_sub(101) / 64)
-                    .unwrap_or(5)
-                    .max(5);
-                // The byte budget is what makes the single-leaf fallback below
-                // actually work (bd-cjqhh). `fst_max_items` is a 64-byte-per-item
-                // estimate; a FREE_SPACE_BITMAP item is far larger than that, so
-                // without a budget an oversized leaf stays at level 0, slips past
-                // the `root_level() == 0` guard, and fails the ENTIRE transaction
-                // at serialize_node — instead of splitting, tripping the guard,
-                // and leaving the free-space tree not-VALID as designed.
-                let mut fst_tree = InMemoryCowBtrfsTree::new(fst_max_items)
-                    .map_err(|e| btrfs_mutation_to_ffs(&e))?
-                    .with_node_byte_budget((nodesize as usize).saturating_sub(101));
-                for (key, value) in &items {
+                for (key, value) in &ffs_btrfs::build_free_space_tree_items(&groups) {
                     fst_tree
                         .insert(*key, value)
                         .map_err(|e| btrfs_mutation_to_ffs(&e))?;
                 }
-                if fst_level == 0 && fst_tree.root_level() == 0 {
-                    let leaf_block = fst_tree.root_block();
-                    let mut addrs = std::collections::BTreeMap::new();
-                    addrs.insert(leaf_block, fst_addr);
-                    let fst_ctx = DiskWritebackContext::with_allocated_addresses(
-                        sb.fsid,
-                        sb.fsid,
-                        // Same generation the ROOT_ITEM keeps (bd-73bi2).
-                        fst_generation,
-                        ffs_btrfs::BTRFS_FREE_SPACE_TREE_OBJECTID,
-                        nodesize,
-                        sb.csum_type,
-                        alloc.sectorsize,
-                        addrs,
-                    );
-                    let serialized = fst_ctx
-                        .serialize_node(&fst_tree, leaf_block, 0)
-                        .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-                    write_mirrored(fst_addr, &serialized).map_err(|e| {
-                        FfsError::Io(std::io::Error::other(format!(
-                            "free-space tree write failed: {e}"
-                        )))
-                    })?;
-                    // Under `btrfs_commit_fst_early` this is the deferred
-                    // barrier from above, now covering the tree nodes AND this
-                    // leaf in one flush; otherwise it is the second of three.
-                    self.dev.sync(cx)?;
-                    commit_barrier_pending = false;
-                    fst_committed = true;
+                fst_committed = fst_tree.root_level() == 0;
+                if !fst_committed {
+                    fst_tree = new_fst_tree()?;
                 }
             }
+            // Written whether or not it carries the free ranges: the
+            // ROOT_ITEM already names this fresh block (bd-l68g8), and a
+            // not-committed FST is only ever a valid, flag-dropped tree.
+            let leaf_block = fst_tree.root_block();
+            let mut addrs = std::collections::BTreeMap::new();
+            addrs.insert(leaf_block, fst_addr);
+            let fst_ctx = DiskWritebackContext::with_allocated_addresses(
+                sb.fsid,
+                sb.fsid,
+                // Same generation the ROOT_ITEM carries (bd-73bi2).
+                fst_generation,
+                ffs_btrfs::BTRFS_FREE_SPACE_TREE_OBJECTID,
+                nodesize,
+                sb.csum_type,
+                alloc.sectorsize,
+                addrs,
+            );
+            let serialized = fst_ctx
+                .serialize_node(&fst_tree, leaf_block, 0)
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            write_mirrored(fst_addr, &serialized).map_err(|e| {
+                FfsError::Io(std::io::Error::other(format!(
+                    "free-space tree write failed: {e}"
+                )))
+            })?;
+            // Under `btrfs_commit_fst_early` this is the deferred barrier from
+            // above, now covering the tree nodes AND this leaf in one flush;
+            // otherwise it is the second of three.
+            self.dev.sync(cx)?;
+            commit_barrier_pending = false;
         }
 
         // Every path out of the FST block must leave the write set durable
         // before the bd-73bi2 read-back and the superblock. When the FST leaf
         // was written the barrier above already did it; when it was not (no
-        // `fst_reuse`, a multi-level extent tree, or a leaf that would split)
-        // the deferred barrier fires here, still ahead of both.
+        // FST, or one too large to rewrite) the deferred barrier fires here,
+        // still ahead of both.
         if commit_barrier_pending {
             self.dev.sync(cx)?;
             commit_barrier_pending = false;
@@ -79573,6 +79602,137 @@ mod tests {
             assert!(pending() > 0, "round {round}: a write queues delayed refs");
             fs.fsync(&cx, ino, 0, false).expect("commit");
             assert_eq!(pending(), 0, "round {round}: delayed refs after commit");
+        }
+    }
+
+    /// bd-l68g8: a commit must not write the free-space-tree leaf that the
+    /// durable superblock names before the new superblock lands. It used to
+    /// rewrite that block in place, so a crash between the two (the barrier
+    /// prefix {nodes + FST leaf}) left the old superblock with free space that
+    /// described the NEW transaction, marking its own live trees free.
+    #[test]
+    fn btrfs_commit_never_overwrites_the_committed_free_space_tree_leaf() {
+        struct RecordingDevice {
+            inner: TestDevice,
+            writes: Arc<Mutex<Vec<(u64, u64)>>>,
+        }
+        impl ByteDevice for RecordingDevice {
+            fn len_bytes(&self) -> u64 {
+                self.inner.len_bytes()
+            }
+            fn read_exact_at(
+                &self,
+                cx: &Cx,
+                offset: ByteOffset,
+                buf: &mut [u8],
+            ) -> ffs_error::Result<()> {
+                self.inner.read_exact_at(cx, offset, buf)
+            }
+            fn write_all_at(
+                &self,
+                cx: &Cx,
+                offset: ByteOffset,
+                buf: &[u8],
+            ) -> ffs_error::Result<()> {
+                self.writes
+                    .lock()
+                    .unwrap()
+                    .push((offset.0, buf.len() as u64));
+                self.inner.write_all_at(cx, offset, buf)
+            }
+            fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+                self.inner.sync(cx)
+            }
+        }
+
+        let Some((fs, dev, _tmp, image)) = open_writable_btrfs_mkfs(256) else {
+            return;
+        };
+        drop(fs);
+        // Reopen the formatted bytes through the recorder.
+        let cx = Cx::for_testing();
+        let writes = Arc::new(Mutex::new(Vec::new()));
+        let recorder = RecordingDevice {
+            inner: TestDevice::from_vec(dev.snapshot_bytes()),
+            writes: Arc::clone(&writes),
+        };
+        let inner = recorder.inner.clone();
+        // Default options: `btrfs_rw_ephemeral_ok` would serve every fsync from
+        // the tree log instead of a full transaction commit.
+        let mut fs = OpenFs::from_device(&cx, Box::new(recorder), &OpenOptions::default())
+            .expect("open btrfs");
+        fs.enable_writes(&cx).expect("enable writes");
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let ino = fs
+            .create(&cx, root, OsStr::new("f"), 0o644, 0, 0)
+            .expect("create")
+            .ino;
+        let fst_root_key = BtrfsKey {
+            objectid: ffs_btrfs::BTRFS_FREE_SPACE_TREE_OBJECTID,
+            item_type: BTRFS_ITEM_ROOT_ITEM,
+            offset: 0,
+        };
+        let committed_fst_leaf = |fs: &OpenFs| {
+            let data = fs
+                .btrfs_alloc_state
+                .as_ref()
+                .unwrap()
+                .read()
+                .root_tree
+                .get(&fst_root_key)
+                .expect("the formatter makes a free-space tree");
+            ffs_btrfs::parse_root_item(&data).expect("root item").bytenr
+        };
+        let sb_offset = u64::try_from(BTRFS_SUPER_INFO_OFFSET).unwrap();
+        let fst_valid = || {
+            let mut flags = [0_u8; 8];
+            inner
+                .read_exact_at(&cx, ByteOffset(sb_offset + 0xB4), &mut flags)
+                .unwrap();
+            u64::from_le_bytes(flags) & BTRFS_FEATURE_COMPAT_RO_FREE_SPACE_TREE_VALID != 0
+        };
+        let nodesize = u64::from(fs.btrfs_context().unwrap().nodesize);
+
+        for round in 0..4_u64 {
+            fs.write(&cx, ino, round * 8192, &[0xA5; 8192])
+                .expect("write");
+            fs.fsync(&cx, ino, 0, false).expect("commit");
+            assert!(fst_valid(), "round {round}: the commit rewrote the FST");
+            let old_leaf = committed_fst_leaf(&fs);
+            let mapping =
+                ffs_ondisk::map_logical_to_stripes(&fs.btrfs_context().unwrap().chunks, old_leaf)
+                    .unwrap()
+                    .expect("the FST leaf is mapped");
+
+            writes.lock().unwrap().clear();
+            fs.write(&cx, ino, round * 8192 + 4096, &[0x5A; 4096])
+                .expect("write");
+            fs.fsync(&cx, ino, 0, false).expect("commit");
+            let log = writes.lock().unwrap().clone();
+            let superblock_at = log
+                .iter()
+                .position(|&(offset, _)| offset == sb_offset)
+                .expect("the commit writes the superblock");
+            for &(offset, len) in &log[..superblock_at] {
+                for stripe in &mapping.stripes {
+                    assert!(
+                        offset + len <= stripe.physical || offset >= stripe.physical + nodesize,
+                        "round {round}: a write at {offset:#x}+{len} hit the committed FST \
+                         leaf (logical {old_leaf:#x}, physical {:#x}) before the superblock",
+                        stripe.physical
+                    );
+                }
+            }
+            assert_ne!(
+                committed_fst_leaf(&fs),
+                old_leaf,
+                "round {round}: the FST leaf moves to a fresh block"
+            );
+        }
+        drop(fs);
+        std::fs::write(&image, inner.snapshot_bytes()).expect("write image back");
+        if let Some((clean, output)) = run_btrfs_check(&image) {
+            assert!(clean, "btrfs check after COW'd FST commits:\n{output}");
         }
     }
 

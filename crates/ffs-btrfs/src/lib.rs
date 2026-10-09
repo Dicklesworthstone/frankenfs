@@ -8793,42 +8793,6 @@ impl BtrfsExtentAllocator {
         Ok(keyed_ok && counted == refs)
     }
 
-    /// Stamp `generation` into the existing skinny `METADATA_ITEM` extent item
-    /// for the tree block at `bytenr` / `level`, leaving its refs and inline
-    /// backref untouched. Returns `true` if the item was present and patched.
-    ///
-    /// Used at commit when a metadata tree block is rewritten in place at the
-    /// new transaction generation but its extent item was loaded at the previous
-    /// one: `btrfs check` requires the extent item's generation to equal the
-    /// generation written into the block header, otherwise it reports a "backref
-    /// generation mismatch" (bd-qxo5x, same class as bd-myrgc). The generation
-    /// field always occupies bytes 8..16 of the extent-item value (`refs:u64`,
-    /// `generation:u64`, `flags:u64`), independent of the inline-ref encoding.
-    ///
-    /// # Errors
-    /// Returns any error from updating the in-memory extent tree.
-    pub fn set_tree_block_generation(
-        &mut self,
-        bytenr: u64,
-        level: u8,
-        generation: u64,
-    ) -> Result<bool, BtrfsMutationError> {
-        let key = BtrfsKey {
-            objectid: bytenr,
-            item_type: BTRFS_ITEM_METADATA_ITEM,
-            offset: u64::from(level),
-        };
-        let Some(mut value) = self.extent_tree.get(&key) else {
-            return Ok(false);
-        };
-        if value.len() < 16 {
-            return Ok(false);
-        }
-        value[8..16].copy_from_slice(&generation.to_le_bytes());
-        self.extent_tree.update(&key, &value)?;
-        Ok(true)
-    }
-
     /// Number of nodes currently in the extent tree (1 == a single leaf).
     #[must_use]
     pub fn extent_tree_root_is_leaf(&self) -> bool {
