@@ -1045,7 +1045,13 @@ btrfs uses copy-on-write B-trees addressed by logical block addresses that must 
 2. **Chunk lookup.** Find the chunk entry whose `[key.offset, key.offset + length)` range contains the target logical address.
 3. **Stripe calculation.** For single-device images, `physical = stripe.offset + (logical - chunk.key.offset)`.
 
-`--btrfs-device PATH` attaches additional devices for clean, read-only btrfs mounts. A clean multi-device image uses `BtrfsDeviceSet` even without extra paths: a surviving RAID1/C3/C4 device can open alone if every committed chunk has a supported readable copy. RAID10 requires a survivor in every mirrored stripe group; RAID5/RAID6 chunks (data, metadata and system) may lack one/two stripe devices (reads are rebuilt from parity and verified), while all other profiles require all stripe devices. Nearby images are never discovered implicitly. Clean kernel-written RAID0, RAID1, RAID10, C3, C4, RAID5 and RAID6 images are tested through FUSE with each primary device; the same test attempts degraded RAID5/6 opens but accepts failure, so degraded kernel-image reads are not established (bd-mjxxk). Metadata validates copies before caching; checksummed file reads validate each sector before copying its bytes or decompressing, retrying corrupt mirrors. RAID1/RAID10/C3/C4 corruption recovery is tested for metadata, ordinary data and zstd data, including recovery with only the last mirror healthy and refusal when all copies are corrupt. The remaining profile/degraded matrix and dirty-image recovery remain open. Multi-device writes are deferred and refused.
+`--btrfs-device PATH` attaches additional devices for clean, read-only btrfs mounts. A clean multi-device image uses `BtrfsDeviceSet` even without extra paths: a surviving RAID1/C3/C4 device can open alone if every committed chunk has a supported readable copy. RAID10 requires a survivor in every mirrored stripe group; RAID5/RAID6 chunks (data, metadata and system) may lack one/two stripe devices (reads are rebuilt from parity and verified), while all other profiles require all stripe devices. Nearby images are never discovered implicitly.
+
+Clean kernel-written RAID0, RAID1, RAID10, C3, C4, RAID5 and RAID6 images are tested through library FUSE mounts and the public CLI with each primary device. Required-FUSE runs pass every single-device RAID5 omission and every single- or double-device RAID6 omission for CRC32C and xxHash64 images. Parent and nested-subvolume files match actual kernel readback; encoded prefixes are checked through `FsOps`. The 2026-10-09 CLI run completed 78 mounts, 82 expected refusals and 1,248 mounted probes with no skips. Missing, duplicate and foreign devices, read-only write attempts and unsupported `--rw` requests are covered. All backing-image hashes remain unchanged across the CLI operations.
+
+The two `btrfs_cli_attached_devices_read_seeded_files*` tests require `FFS_CLI_BIN` pointing to a prebuilt CLI, its build receipt in `FFS_CLI_SOURCE_STAMP`, and an absolute `FFS_CLI_ARTIFACT_DIR` for retained images and logs. Choose a mount location permitted by the host policy, outside RCH's disposable scratch tree; `/mnt` was used for this run with the CLI's default auto-unmount behavior. `FFS_REQUIRE_FUSE=1` makes missing prerequisites fail. Evidence records the measured binary SHA-256, harness source hash, device identities, commands, exit status, errno and readback hashes. The caller-provided source stamp is labeled separately from the measured binary identity.
+
+Metadata validates copies before caching; checksummed file reads validate each sector before copying its bytes or decompressing, retrying corrupt mirrors. RAID1/RAID10/C3/C4 corruption recovery is tested for metadata, ordinary data and zstd data, including recovery with only the last mirror healthy and refusal when all copies are corrupt. The remaining corruption/profile combinations and dirty-image recovery remain open. Multi-device writes are deferred and refused.
 
 ### Tree walk algorithm
 
@@ -3305,20 +3311,24 @@ The vendored copy can be diffed against upstream `fuser` 0.17.0.
 
 ## RAID Profile Support Matrix
 
-Btrfs stripe helpers and mounted support currently differ. The V1 multi-device
-read requirement remains open under `bd-hk5w3`; helper tests do not certify it.
+Btrfs stripe helpers and mounted support currently differ. Clean complete-set
+reads in the table have library FUSE and public CLI evidence. CLI degraded
+coverage includes both RAID1 survivors and every tolerated RAID5/6 omission;
+the other mirror-subset and corruption cases use the library mount path.
+Seed-device inventories and device-count reconciliation remain open under
+`bd-hk5w3`; the full V1 read scope is not complete.
 
 | Profile | Device-set read helper | Mounted read | Mounted write |
 |---|---|---|---|
 | `Single` | Linear, split at chunk boundaries | Implemented | Experimental |
 | `DUP` | Alternate copies on one device | Implemented; a corrupt primary copy falls back to the second (core test) | Experimental; rewritten tree blocks are written to both copies. A FrankenFS-written image passes `btrfs check` and mounts read-only under the Linux kernel, including with DUP copy 1 of the new fs-tree root corrupted (fuse_e2e interop test, bd-0mcvt) |
-| `RAID0` | Split across data stripes | Clean two-device kernel image + FUSE verified | Deferred |
-| `RAID1` | Mirror fallback on read error | Kernel image + FUSE verified, including either lone surviving device and corrupt metadata/ordinary/zstd data recovery | Deferred |
-| `RAID10` | Split across mirrored stripe groups | Four-device kernel image + FUSE reads; degraded reads require a survivor in every group of every chunk | Deferred |
-| `RAID5` | Owning data stripe | Clean three-device kernel image + core/FUSE reads with each primary; data and tree-node reads rebuild one missing stripe from P (core tests; a btrfs-progs RAID5 image opens without any one device; degraded reads of kernel-populated files through FUSE not established, bd-mjxxk) | Deferred |
-| `RAID6` | Owning data stripe | Clean four-device kernel image + core/FUSE reads with each primary; data and tree-node reads rebuild up to two missing stripes from P/Q (core tests; a btrfs-progs RAID6 image opens without any one or two devices; degraded reads of kernel-populated files through FUSE not established, bd-mjxxk) | Deferred |
-| `RAID1C3` | Three-copy mapping and read fallback | Clean kernel image + core/FUSE reads across all nonempty device subsets | Deferred |
-| `RAID1C4` | Four-copy mapping and read fallback | Clean kernel image + core/FUSE reads across all nonempty device subsets | Deferred |
+| `RAID0` | Split across data stripes | Clean two-device kernel image + FUSE verified | Refused; deferred |
+| `RAID1` | Mirror fallback on read error | Kernel image + FUSE verified, including either lone surviving device and corrupt metadata/ordinary/zstd data recovery | Refused; deferred |
+| `RAID10` | Split across mirrored stripe groups | Four-device kernel image + FUSE reads; degraded reads require a survivor in every group of every chunk | Refused; deferred |
+| `RAID5` | Owning data stripe; core reconstructs from P | Three-device kernel image + core/FUSE reads with each primary and each single-device omission; parent and nested files, CRC32C and xxHash64 | Refused; deferred |
+| `RAID6` | Owning data stripe; core reconstructs from P/Q | Four-device kernel image + core/FUSE reads with each primary and every single- or double-device omission; parent and nested files, CRC32C and xxHash64 | Refused; deferred |
+| `RAID1C3` | Three-copy mapping and read fallback | Clean kernel image + core/FUSE reads across all nonempty device subsets | Refused; deferred |
+| `RAID1C4` | Four-copy mapping and read fallback | Clean kernel image + core/FUSE reads across all nonempty device subsets | Refused; deferred |
 
 RAID5/6 data slots follow Linux's ordered forward rotation across devices.
 The earlier parity-slot fix (`18bc6b0`) still selected data in device order;
@@ -3330,8 +3340,11 @@ devices: a tree node on a missing column is rebuilt from parity and accepted
 only if its own checksum, logical address and structure verify (bd-hk5w3).
 For data chunks, `ffs-core` (`btrfs_raid56.rs`) rebuilds one missing RAID5
 stripe from P or up to two missing RAID6 stripes from P/Q and verifies the data
-checksum before serving; this is covered by core unit tests, while degraded
-kernel-written RAID5/6 images are not yet established (bd-mjxxk).
+checksum before serving. Core unit tests and required-FUSE tests on
+kernel-written RAID5/6 images cover these erasures. The latter also check
+encoded prefixes through `FsOps` and unchanged device hashes after read-only
+operation and rejected writes. The public CLI companion also verifies these
+erasures, but neither suite exercises the encoded-read ioctl through FUSE.
 The historical non-parity rank-selector microbenchmark does not measure this
 corrected mapping and provides no performance claim for it.
 Additional stripe-translation properties are validated via metamorphic relations:

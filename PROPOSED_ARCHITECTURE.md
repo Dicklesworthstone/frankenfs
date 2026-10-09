@@ -115,8 +115,14 @@ chunk-tree, root-tree and fs-tree copies independently: all but the final mirror
 can be corrupt and still recover through FUSE; corrupting every copy fails.
 The attached-device kernel-image suite runs with both CRC32C and XXHASH64,
 asserting the on-disk checksum type. Both runs cover mirrored metadata and
-ordinary/zstd data recovery, survivor-device reads, and clean RAID5/6 reads;
-they do not establish degraded parity reconstruction or multi-device writes.
+ordinary/zstd data recovery, survivor-device reads, and clean RAID5/6 reads.
+Required-FUSE execution also establishes every tolerated RAID5/6 erasure on
+these kernel-written images. Separate public CLI cases preserve default
+auto-unmount and cover every complete-set primary, both RAID1 survivors and
+all tolerated RAID5/6 omissions. They compare parent and nested files against
+kernel readback, record binary/source and device identities, require exact
+write-refusal errno and clean exits, and preserve all image hashes.
+Multi-device writes remain unsupported.
 Combined-failure probes also recover chunk/root/fs-tree metadata and ordinary
 or zstd data when a device is omitted and an attached copy is corrupt: C3/C4
 retain a valid copy in the same mirror set, while RAID10 retains a valid copy
@@ -158,13 +164,19 @@ nonempty proper subset (6 C3 and 14 C4), plus each complete-set primary, through
 ordinary core and cold FUSE reads. Separate corruption tests use full attachments;
 the complete corruption/missing-device/checksum-codec matrix remains unverified.
 Clean three-device RAID5 and four-device RAID6 kernel images pass
-full-file, stripe-boundary and cold FUSE reads with each primary. Their mapper
+full-file, stripe-boundary and cold FUSE reads with each primary. Required-FUSE
+tests also pass every RAID5 single-device omission and every RAID6 single- or
+double-device omission, including parent and nested files, for CRC32C and
+xxHash64. Encoded prefixes use `FsOps`; backing-image hashes prove that these
+reads and rejected writes do not mutate the devices. Their mapper
 rotates ordered data slots forward per physical row, matching Linux. Missing or
 corrupt data columns are reconstructed from P/Q and validated against data
 checksums; reconstructed metadata must pass its own checksum, logical-address
 and structural checks before entering the cache. Encoded reads use the same
 logical routing and checksum policy as ordinary reads. Generation inspection
-also uses validated attached-device copies.
+also uses validated attached-device copies. CLI mount modes pass `Arc<OpenFs>`
+to FUSE; the shared `FsOps` implementation forwards encoded reads and metadata
+queries with the original context, request scope, arguments and backend errors.
 Unused missing devices
 remain in the authoritative inventory. Kernel-image tests mount each RAID1
 survivor alone and reject a missing RAID0 data device despite readable mirrored
@@ -172,8 +184,9 @@ metadata. No sibling images are discovered implicitly. Multi-device mounts requi
 tree log and no MVCC WAL. Nested subvolumes share the validated device handles,
 recheck committed superblocks and chunk coverage, and preserve the checksum
 policy. Unreadable attached subvolumes return errors rather than empty
-directories. Dirty-image recovery and remaining degraded/profile qualification
-remain open. There is no
+directories. Dirty-image recovery, seed-device inventories with different
+filesystem UUIDs, device-count reconciliation and remaining corruption/profile
+qualification remain open. There is no
 multi-device mutation support.
 `OpenFs::enable_writes` refuses any device count other than one and any known
 chunk profile other than Single/DUP before loading mutable allocation state.

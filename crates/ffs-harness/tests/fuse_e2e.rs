@@ -16021,15 +16021,479 @@ fn assert_btrfs_mirror_survivors(cx: &Cx, images: &[PathBuf], payload: &[u8], pr
 
 #[test]
 fn btrfs_attached_devices_read_seeded_files() {
-    assert_btrfs_attached_devices_read_seeded_files("crc32c", ffs_types::BTRFS_CSUM_TYPE_CRC32C);
+    assert_btrfs_attached_devices_read_seeded_files(
+        "crc32c",
+        ffs_types::BTRFS_CSUM_TYPE_CRC32C,
+        None,
+    );
 }
 
 #[test]
 fn btrfs_attached_devices_read_seeded_files_xxhash64() {
-    assert_btrfs_attached_devices_read_seeded_files("xxhash", ffs_types::BTRFS_CSUM_TYPE_XXHASH64);
+    assert_btrfs_attached_devices_read_seeded_files(
+        "xxhash",
+        ffs_types::BTRFS_CSUM_TYPE_XXHASH64,
+        None,
+    );
 }
 
-fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u16) {
+#[test]
+fn btrfs_cli_attached_devices_read_seeded_files() {
+    if let Some(cli) = btrfs_cli_proof_binary() {
+        assert_btrfs_attached_devices_read_seeded_files(
+            "crc32c",
+            ffs_types::BTRFS_CSUM_TYPE_CRC32C,
+            Some(&cli),
+        );
+    }
+}
+
+#[test]
+fn btrfs_cli_attached_devices_read_seeded_files_xxhash64() {
+    if let Some(cli) = btrfs_cli_proof_binary() {
+        assert_btrfs_attached_devices_read_seeded_files(
+            "xxhash",
+            ffs_types::BTRFS_CSUM_TYPE_XXHASH64,
+            Some(&cli),
+        );
+    }
+}
+
+fn btrfs_cli_proof_binary() -> Option<PathBuf> {
+    let binary = std::env::var_os("FFS_CLI_BIN").map(PathBuf::from);
+    let available = binary.as_ref().is_some_and(|path| {
+        fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
+    });
+    if !available
+        || std::env::var("FFS_CLI_SOURCE_STAMP")
+            .ok()
+            .is_none_or(|stamp| stamp.trim().is_empty())
+        || std::env::var_os("FFS_CLI_ARTIFACT_DIR")
+            .is_none_or(|path| !Path::new(&path).is_absolute())
+        || !command_available("sha256sum")
+        || !command_available("fusermount3")
+    {
+        require_fuse_or_skip(
+            "CLI proof needs executable FFS_CLI_BIN, caller-provided FFS_CLI_SOURCE_STAMP, absolute FFS_CLI_ARTIFACT_DIR outside the build checkout, sha256sum and fusermount3",
+        );
+        return None;
+    }
+    Some(fs::canonicalize(binary.unwrap()).expect("canonical CLI binary path"))
+}
+
+fn btrfs_cli_record(directory: &Path, record: &Value) {
+    let mut evidence = fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(directory.join("evidence.jsonl"))
+        .expect("open retained CLI evidence");
+    writeln!(evidence, "{record}").expect("append CLI evidence");
+    eprintln!("BTRFS_CLI_EVIDENCE|{record}");
+}
+
+fn btrfs_cli_image_evidence(images: &[PathBuf], attached: &[PathBuf]) -> Vec<Value> {
+    images
+        .iter()
+        .map(|image| {
+            let mut file = fs::File::open(image).unwrap();
+            let mut hasher = blake3::Hasher::new();
+            let mut buffer = vec![0_u8; 1024 * 1024];
+            loop {
+                let len = file.read(&mut buffer).unwrap();
+                if len == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..len]);
+            }
+            file.seek(SeekFrom::Start(ffs_types::BTRFS_SUPER_INFO_OFFSET as u64))
+                .unwrap();
+            let mut region = [0_u8; ffs_types::BTRFS_SUPER_INFO_SIZE];
+            file.read_exact(&mut region).unwrap();
+            ffs_ondisk::verify_btrfs_superblock_checksum(&region).unwrap();
+            let sb = ffs_ondisk::BtrfsSuperblock::parse_superblock_region(&region).unwrap();
+            let device = ffs_ondisk::parse_dev_item(
+                &region[0xC9..0xC9 + ffs_ondisk::btrfs::BTRFS_DEV_ITEM_SIZE],
+            )
+            .unwrap();
+            serde_json::json!({
+                "path": image,
+                "attached": attached.contains(image),
+                "fsid": sb.fsid,
+                "devid": device.devid,
+                "device_uuid": device.uuid,
+                "generation": sb.generation,
+                "checksum_type": sb.csum_type,
+                "total_bytes": device.total_bytes,
+                "image_blake3": hasher.finalize().to_hex().to_string(),
+            })
+        })
+        .collect()
+}
+
+/// Owns one CLI child and its fresh private mountpoint. Cleanup never scans
+/// other mounts, signals a process group, or removes retained artifacts.
+struct BtrfsCliMount {
+    child: std::process::Child,
+    mountpoint: PathBuf,
+    directory: PathBuf,
+    finished: bool,
+}
+
+impl BtrfsCliMount {
+    fn spawn(cli: &Path, directory: &Path, attached: &[PathBuf], request_rw: bool) -> Self {
+        fs::create_dir(directory).unwrap();
+        let mountpoint = directory.join("mount");
+        fs::create_dir(&mountpoint).unwrap();
+        assert!(!mountinfo_has_mountpoint(&mountpoint));
+        let executable_hash = Command::new("sha256sum").arg(cli).output().unwrap();
+        assert!(
+            executable_hash.status.success(),
+            "CLI executable hash failed"
+        );
+        let executable_hash = String::from_utf8(executable_hash.stdout).unwrap();
+        let executable_sha256 = executable_hash.split_whitespace().next().unwrap();
+        let mut command = Command::new(cli);
+        command.arg("mount").arg(&attached[0]).arg(&mountpoint);
+        for image in &attached[1..] {
+            command.arg("--btrfs-device").arg(image);
+        }
+        if request_rw {
+            command.arg("--rw");
+        }
+        command
+            .stdin(Stdio::null())
+            .stdout(fs::File::create(directory.join("stdout.log")).unwrap())
+            .stderr(fs::File::create(directory.join("stderr.log")).unwrap());
+        btrfs_cli_record(
+            directory,
+            &serde_json::json!({
+                "event": "cli_start",
+                "proof_class": "live_public_cli_invocation",
+                "executable": cli,
+                "executable_sha256": executable_sha256,
+                "caller_provided_source_stamp": std::env::var("FFS_CLI_SOURCE_STAMP").unwrap(),
+                "source_stamp_is_independent_proof": false,
+                "harness_source_blake3": blake3::hash(include_bytes!("fuse_e2e.rs")).to_hex().to_string(),
+                "argv": command.get_args().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>(),
+            }),
+        );
+        let child = command.spawn().unwrap_or_else(|error| {
+            btrfs_cli_record(
+                directory,
+                &serde_json::json!({"event": "spawn_failed", "error": error.to_string()}),
+            );
+            panic!("CLI mount spawn failed: {error}");
+        });
+        Self {
+            child,
+            mountpoint,
+            directory: directory.to_path_buf(),
+            finished: false,
+        }
+    }
+
+    fn finish(&mut self) -> Value {
+        let unmount = if mountinfo_has_mountpoint(&self.mountpoint) {
+            match Command::new("fusermount3")
+                .arg("-u")
+                .arg(&self.mountpoint)
+                .output()
+            {
+                Ok(output) => serde_json::json!({
+                    "status": output.status.to_string(),
+                    "success": output.status.success(),
+                    "stdout": String::from_utf8_lossy(&output.stdout),
+                    "stderr": String::from_utf8_lossy(&output.stderr),
+                }),
+                Err(error) => serde_json::json!({"error": error.to_string()}),
+            }
+        } else {
+            serde_json::json!({"already_released": true})
+        };
+        let start = Instant::now();
+        let mut status = None;
+        let mut wait_error = None;
+        while start.elapsed() < Duration::from_secs(10) {
+            match self.child.try_wait() {
+                Ok(Some(exit)) => {
+                    status = Some(exit);
+                    break;
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(20)),
+                Err(error) => {
+                    wait_error = Some(error.to_string());
+                    break;
+                }
+            }
+        }
+        let forced_stop = status.is_none();
+        if forced_stop {
+            let _ = self.child.kill();
+            match self.child.wait() {
+                Ok(exit) => status = Some(exit),
+                Err(error) => wait_error = Some(error.to_string()),
+            }
+        }
+        // A killed child can leave a dead FUSE mount. Detach only this guard's
+        // mount; this fallback is recorded and cannot certify a clean exit.
+        let lazy_unmount = if mountinfo_has_mountpoint(&self.mountpoint) {
+            Command::new("fusermount3")
+                .arg("-uz")
+                .arg(&self.mountpoint)
+                .output()
+                .map(|out| out.status.to_string())
+                .ok()
+        } else {
+            None
+        };
+        self.finished = true;
+        let record = serde_json::json!({
+            "event": "cli_exit",
+            "pid": self.child.id(),
+            "unmount": unmount,
+            "status": status.map(|exit| exit.to_string()),
+            "exit_code": status.and_then(|exit| exit.code()),
+            "success": status.is_some_and(|exit| exit.success()),
+            "forced_stop": forced_stop,
+            "wait_error": wait_error,
+            "lazy_unmount": lazy_unmount,
+            "mount_released": !mountinfo_has_mountpoint(&self.mountpoint),
+        });
+        // Drop also calls this during a failing assertion; never panic there.
+        let _ = fs::write(self.directory.join("exit.json"), record.to_string());
+        eprintln!("BTRFS_CLI_EXIT|{record}");
+        record
+    }
+}
+
+impl Drop for BtrfsCliMount {
+    fn drop(&mut self) {
+        if !self.finished {
+            self.finish();
+        }
+    }
+}
+
+fn assert_btrfs_cli_mount_reads(
+    cli: &Path,
+    directory: &Path,
+    images: &[PathBuf],
+    attached: &[PathBuf],
+    payload: &[u8],
+    profile: &str,
+    checksum: &str,
+) {
+    let before = btrfs_cli_image_evidence(images, attached);
+    let mut mount = BtrfsCliMount::spawn(cli, directory, attached, false);
+    let mountpoint = mount.mountpoint.clone();
+    btrfs_cli_record(
+        directory,
+        &serde_json::json!({
+            "event": "cli_read_scenario",
+            "profile": profile,
+            "checksum": checksum,
+            "devices_before": before,
+        }),
+    );
+    let start = Instant::now();
+    while !mountinfo_has_mountpoint(&mountpoint) {
+        let status = mount.child.try_wait().expect("poll CLI mount");
+        if status.is_some() || start.elapsed() >= Duration::from_secs(10) {
+            for name in ["stdout.log", "stderr.log"] {
+                let output = fs::read_to_string(directory.join(name))
+                    .unwrap_or_else(|error| format!("cannot read {name}: {error}"));
+                eprintln!("BTRFS_CLI_STARTUP_FAILURE|{name}|{output}");
+            }
+        }
+        assert!(
+            status.is_none(),
+            "CLI exited before mount: {status:?}; logs: {}",
+            directory.display()
+        );
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "CLI mount timed out; logs: {}",
+            directory.display()
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let mut operations = Vec::new();
+    for relative_dir in ["", "nested"] {
+        let dir = mountpoint.join(relative_dir);
+        let file = dir.join("payload");
+        let entries = fs::read_dir(&dir).and_then(|entries| {
+            entries
+                .map(|entry| entry.map(|e| e.file_name()))
+                .collect::<Result<Vec<_>, _>>()
+        });
+        operations.push(serde_json::json!({
+            "op": "readdir",
+            "path": relative_dir,
+            "error": entries.as_ref().err().map(ToString::to_string),
+        }));
+        btrfs_cli_record(directory, operations.last().unwrap());
+        assert!(entries.unwrap().iter().any(|name| name == "payload"));
+        let metadata = fs::metadata(&file);
+        operations.push(serde_json::json!({
+            "op": "metadata",
+            "path": file,
+            "size": metadata.as_ref().ok().map(std::fs::Metadata::len),
+            "error": metadata.as_ref().err().map(ToString::to_string),
+        }));
+        btrfs_cli_record(directory, operations.last().unwrap());
+        assert_eq!(
+            metadata.unwrap().len(),
+            u64::try_from(payload.len()).unwrap()
+        );
+        let data = fs::read(&file);
+        operations.push(serde_json::json!({
+            "op": "read",
+            "path": file,
+            "readback_blake3": data.as_ref().ok().map(|bytes| blake3::hash(bytes).to_hex().to_string()),
+            "error": data.as_ref().err().map(ToString::to_string),
+        }));
+        btrfs_cli_record(directory, operations.last().unwrap());
+        assert_eq!(data.unwrap(), payload);
+        let boundary = (|| -> std::io::Result<[u8; 32]> {
+            let mut input = fs::File::open(&file)?;
+            input.seek(SeekFrom::Start(65_530))?;
+            let mut bytes = [0; 32];
+            input.read_exact(&mut bytes)?;
+            Ok(bytes)
+        })();
+        operations.push(serde_json::json!({
+            "op": "read_stripe_boundary",
+            "path": file,
+            "offset": 65_530,
+            "length": 32,
+            "error": boundary.as_ref().err().map(ToString::to_string),
+        }));
+        btrfs_cli_record(directory, operations.last().unwrap());
+        assert_eq!(boundary.unwrap(), payload[65_530..65_562]);
+        for (operation, target, create, expected_errno) in [
+            ("open_write", file.clone(), false, libc::EROFS),
+            ("create", dir.join("must-not-create"), true, libc::EROFS),
+            (
+                "open_missing",
+                dir.join("does-not-exist"),
+                false,
+                libc::ENOENT,
+            ),
+        ] {
+            let result = fs::OpenOptions::new()
+                .read(operation == "open_missing")
+                .write(operation != "open_missing")
+                .create_new(create)
+                .open(&target);
+            let errno = result.as_ref().err().and_then(std::io::Error::raw_os_error);
+            operations.push(serde_json::json!({
+                "op": operation,
+                "path": target,
+                "errno": errno,
+                "error": result.as_ref().err().map(ToString::to_string),
+            }));
+            btrfs_cli_record(directory, operations.last().unwrap());
+            assert_eq!(errno, Some(expected_errno), "{operation}: {result:?}");
+        }
+        let readback = fs::read(&file);
+        operations.push(serde_json::json!({
+            "op": "read_after_refused_writes",
+            "path": file,
+            "readback_blake3": readback.as_ref().ok().map(|bytes| blake3::hash(bytes).to_hex().to_string()),
+            "error": readback.as_ref().err().map(ToString::to_string),
+        }));
+        btrfs_cli_record(directory, operations.last().unwrap());
+        assert_eq!(readback.unwrap(), payload);
+    }
+    let exit = mount.finish();
+    let after = btrfs_cli_image_evidence(images, attached);
+    let evidence = serde_json::json!({
+        "event": "cli_readback_complete",
+        "profile": profile,
+        "checksum": checksum,
+        "operation_count": operations.len(),
+        "operation_count_unit": "recorded_mounted_probes",
+        "operations": operations,
+        "expected_payload_blake3": blake3::hash(payload).to_hex().to_string(),
+        "devices_after": after,
+        "exit": exit,
+    });
+    btrfs_cli_record(directory, &evidence);
+    assert_eq!(
+        before, after,
+        "CLI reads/refused writes changed device images"
+    );
+    assert_eq!(exit["success"], true, "CLI shutdown: {exit}");
+    assert_eq!(exit["forced_stop"], false, "CLI shutdown: {exit}");
+    assert_eq!(exit["lazy_unmount"], Value::Null, "CLI shutdown: {exit}");
+    assert_eq!(exit["mount_released"], true, "CLI shutdown: {exit}");
+    emit_scenario_result(
+        &format!("btrfs_cli_{profile}_{checksum}"),
+        "PASS",
+        Some(&directory.display().to_string()),
+    );
+}
+
+fn assert_btrfs_cli_mount_refused(
+    cli: &Path,
+    directory: &Path,
+    images: &[PathBuf],
+    attached: &[PathBuf],
+    request_rw: bool,
+    expected_diagnostic: &str,
+) {
+    let before = btrfs_cli_image_evidence(images, attached);
+    let mut mount = BtrfsCliMount::spawn(cli, directory, attached, request_rw);
+    btrfs_cli_record(
+        directory,
+        &serde_json::json!({
+            "event": "cli_refusal_scenario",
+            "case": directory.file_name().unwrap().to_string_lossy(),
+            "expected_diagnostic": expected_diagnostic,
+            "devices_before": before,
+        }),
+    );
+    let start = Instant::now();
+    let mut mounted = false;
+    loop {
+        if mountinfo_has_mountpoint(&mount.mountpoint) {
+            mounted = true;
+            break;
+        }
+        if mount.child.try_wait().unwrap().is_some() || start.elapsed() >= Duration::from_secs(10) {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    let exit = mount.finish();
+    let stderr = fs::read_to_string(directory.join("stderr.log")).unwrap();
+    let after = btrfs_cli_image_evidence(images, attached);
+    btrfs_cli_record(
+        directory,
+        &serde_json::json!({
+            "event": "cli_refusal_complete",
+            "exit": exit,
+            "mounted": mounted,
+            "diagnostic": stderr,
+            "devices_after": after,
+        }),
+    );
+    assert!(!mounted, "refused CLI invocation unexpectedly mounted");
+    assert_eq!(exit["forced_stop"], false, "refusal timed out: {exit}");
+    assert!(exit["exit_code"].as_i64().is_some_and(|code| code != 0));
+    assert!(
+        stderr.contains(expected_diagnostic),
+        "missing refusal diagnostic {expected_diagnostic:?}: {stderr}"
+    );
+    assert_eq!(before, after, "refused CLI mount changed device images");
+    assert_eq!(exit["mount_released"], true);
+}
+
+fn assert_btrfs_attached_devices_read_seeded_files(
+    checksum: &str,
+    csum_type: u16,
+    cli: Option<&Path>,
+) {
     fn check_encoded_prefix(filesystem: &OpenFs, cx: &Cx, ino: InodeNumber, payload: &[u8]) {
         let mut args = [0_u8; 64];
         args[32..40].copy_from_slice(&4096_u64.to_le_bytes());
@@ -16067,20 +16531,35 @@ fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u1
         "raid6",
     ] {
         eprintln!("attached-device kernel fixture: profile={profile}, checksum={checksum}");
-        let tmp = TempDir::new().expect("tmpdir");
+        let tmp = if cli.is_some() {
+            let parent = PathBuf::from(
+                std::env::var_os("FFS_CLI_ARTIFACT_DIR").expect("CLI artifact parent configured"),
+            );
+            assert!(parent.is_absolute(), "CLI artifact parent must be absolute");
+            fs::create_dir_all(&parent).expect("create retained CLI artifact parent");
+            TempDir::new_in(&parent).expect("unique retained CLI fixture directory")
+        } else {
+            TempDir::new().expect("tmpdir")
+        };
+        let fixture_dir = tmp.path().to_path_buf();
+        if cli.is_some() {
+            // CLI evidence, images and logs survive failures as well as success.
+            let _ = tmp.keep();
+            eprintln!("BTRFS_CLI_ARTIFACTS|path={}", fixture_dir.display());
+        }
         let payload = patterned_bytes(1024 * 1024 + 37, 251, 0);
         let mut images = vec![
-            tmp.path().join("first.btrfs"),
-            tmp.path().join("second.btrfs"),
+            fixture_dir.join("first.btrfs"),
+            fixture_dir.join("second.btrfs"),
         ];
         if matches!(
             profile,
             "raid10" | "raid1c3" | "raid1c4" | "raid5" | "raid6"
         ) {
-            images.push(tmp.path().join("third.btrfs"));
+            images.push(fixture_dir.join("third.btrfs"));
         }
         if matches!(profile, "raid10" | "raid1c4" | "raid6") {
-            images.push(tmp.path().join("fourth.btrfs"));
+            images.push(fixture_dir.join("fourth.btrfs"));
         }
         for image in &images {
             fs::File::create(image)
@@ -16154,7 +16633,7 @@ fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u1
                 .loops
                 .push(String::from_utf8(output.stdout).unwrap().trim().to_owned());
         }
-        let kernel_mount = tmp.path().join("kernel");
+        let kernel_mount = fixture_dir.join("kernel");
         fs::create_dir(&kernel_mount).unwrap();
         let output = Command::new("sudo")
             .args(["-n", "mount", "-t", "btrfs", "-o"])
@@ -16175,7 +16654,7 @@ fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u1
             String::from_utf8_lossy(&output.stderr)
         );
         kernel.mounted = Some(kernel_mount.clone());
-        let input = tmp.path().join("payload");
+        let input = fixture_dir.join("payload");
         fs::write(&input, &payload).unwrap();
         assert!(
             Command::new("sudo")
@@ -16294,6 +16773,24 @@ fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u1
                     .success()
             );
         }
+        for relative in ["payload", "nested/payload"] {
+            let kernel_readback = fs::read(kernel_mount.join(relative)).unwrap();
+            assert_eq!(kernel_readback, payload, "kernel readback: {relative}");
+            if cli.is_some() {
+                btrfs_cli_record(
+                    &fixture_dir,
+                    &serde_json::json!({
+                        "event": "kernel_readback",
+                        "profile": profile,
+                        "checksum": checksum,
+                        "path": relative,
+                        "length": kernel_readback.len(),
+                        "readback_blake3": blake3::hash(&kernel_readback).to_hex().to_string(),
+                        "expected_payload_blake3": blake3::hash(&payload).to_hex().to_string(),
+                    }),
+                );
+            }
+        }
         assert!(
             Command::new("sudo")
                 .args(["-n", "umount"])
@@ -16358,7 +16855,7 @@ fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u1
                     assert_eq!(degraded.mvcc_version_count(), 0);
                 }
                 drop(degraded);
-                let mountpoint = tmp.path().join(format!("degraded-{primary}"));
+                let mountpoint = fixture_dir.join(format!("degraded-{primary}"));
                 fs::create_dir(&mountpoint).unwrap();
                 let session = mount_background(
                     Box::new(OpenFs::open(&cx, image).unwrap()),
@@ -16376,10 +16873,32 @@ fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u1
                     assert_eq!(fs::read(mountpoint.join(name)).unwrap(), payload);
                 }
                 drop(mount);
+                if let Some(cli) = cli {
+                    assert_btrfs_cli_mount_reads(
+                        cli,
+                        &fixture_dir.join(format!("cli-surviving-mirror-{primary}")),
+                        &images,
+                        std::slice::from_ref(image),
+                        &payload,
+                        profile,
+                        checksum,
+                    );
+                    // No --btrfs-device argument: this reaches write admission
+                    // after opening the readable survivor, beyond Clap's
+                    // mutually exclusive --rw/--btrfs-device argument check.
+                    assert_btrfs_cli_mount_refused(
+                        cli,
+                        &fixture_dir.join(format!("cli-surviving-mirror-rw-{primary}")),
+                        &images,
+                        std::slice::from_ref(image),
+                        true,
+                        "multi-device and RAID mutation are not supported",
+                    );
+                }
             }
             emit_scenario_result("btrfs_raid1_each_surviving_device", "PASS", None);
         } else if !matches!(profile, "raid1c3" | "raid1c4") {
-            for image in &images {
+            for (primary, image) in images.iter().enumerate() {
                 let error = OpenFs::open(&cx, image).unwrap_err();
                 if profile == "raid0-data" {
                     assert!(
@@ -16387,6 +16906,16 @@ fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u1
                             .to_string()
                             .contains("lacks a supported readable device set"),
                         "readable metadata must not admit missing RAID0 data: {error}"
+                    );
+                }
+                if let Some(cli) = cli {
+                    assert_btrfs_cli_mount_refused(
+                        cli,
+                        &fixture_dir.join(format!("cli-missing-devices-{primary}")),
+                        &images,
+                        std::slice::from_ref(image),
+                        false,
+                        &error.to_string(),
                     );
                 }
             }
@@ -16471,7 +17000,7 @@ fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u1
                 );
                 assert_eq!(filesystem.mvcc_version_count(), 0);
             }
-            let mountpoint = tmp.path().join(format!("fuse-{primary}"));
+            let mountpoint = fixture_dir.join(format!("fuse-{primary}"));
             fs::create_dir(&mountpoint).unwrap();
             let session = match mount_background(
                 Box::new(filesystem),
@@ -16499,6 +17028,20 @@ fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u1
                 payload
             );
             drop(mount);
+            if let Some(cli) = cli {
+                let attached: Vec<_> = std::iter::once(images[primary].clone())
+                    .chain(options.btrfs_device_paths.iter().cloned())
+                    .collect();
+                assert_btrfs_cli_mount_reads(
+                    cli,
+                    &fixture_dir.join(format!("cli-full-{primary}")),
+                    &images,
+                    &attached,
+                    &payload,
+                    profile,
+                    checksum,
+                );
+            }
         }
         // Every tolerated erasure set must open and serve the kernel-seeded
         // bytes, including nested subvolumes, through core and mounted FUSE.
@@ -16548,7 +17091,7 @@ fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u1
                     check_encoded_prefix(&degraded, &cx, attr.ino, &payload);
                 }
                 assert!(degraded.enable_writes(&cx).is_err());
-                let mountpoint = tmp.path().join(format!("degraded-{omitted:?}"));
+                let mountpoint = fixture_dir.join(format!("degraded-{omitted:?}"));
                 fs::create_dir(&mountpoint).unwrap();
                 let session = mount_background(
                     Box::new(degraded),
@@ -16568,6 +17111,17 @@ fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u1
                     payload
                 );
                 drop(mount);
+                if let Some(cli) = cli {
+                    assert_btrfs_cli_mount_reads(
+                        cli,
+                        &fixture_dir.join(format!("cli-degraded-{omitted:?}")),
+                        &images,
+                        &attached,
+                        &payload,
+                        profile,
+                        checksum,
+                    );
+                }
                 emit_scenario_result(
                     &format!("btrfs_{profile}_degraded_open_omitted_{omitted:?}"),
                     "PASS",
@@ -16579,8 +17133,26 @@ fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u1
             btrfs_device_paths: vec![images[0].clone()],
             ..OpenOptions::default()
         };
-        assert!(OpenFs::open_with_options(&cx, &images[0], &duplicate).is_err());
-        let foreign = tmp.path().join("foreign.btrfs");
+        let duplicate_error = OpenFs::open_with_options(&cx, &images[0], &duplicate).unwrap_err();
+        if let Some(cli) = cli {
+            assert_btrfs_cli_mount_refused(
+                cli,
+                &fixture_dir.join("cli-duplicate-device"),
+                &images,
+                &[images[0].clone(), images[0].clone()],
+                false,
+                &duplicate_error.to_string(),
+            );
+            assert_btrfs_cli_mount_refused(
+                cli,
+                &fixture_dir.join("cli-rw-unsupported"),
+                &images,
+                &images,
+                true,
+                "cannot be used with",
+            );
+        }
+        let foreign = fixture_dir.join("foreign.btrfs");
         fs::File::create(&foreign)
             .unwrap()
             .set_len(128 * 1024 * 1024)
@@ -16595,7 +17167,7 @@ fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u1
                 .success()
         );
         let wrong = OpenOptions {
-            btrfs_device_paths: vec![foreign],
+            btrfs_device_paths: vec![foreign.clone()],
             ..OpenOptions::default()
         };
         let error = OpenFs::open_with_options(&cx, &images[0], &wrong).unwrap_err();
@@ -16605,6 +17177,21 @@ fn assert_btrfs_attached_devices_read_seeded_files(checksum: &str, csum_type: u1
                 .contains("does not match the clean committed filesystem"),
             "{error}"
         );
+        if let Some(cli) = cli {
+            let all_images: Vec<_> = images
+                .iter()
+                .cloned()
+                .chain(std::iter::once(foreign.clone()))
+                .collect();
+            assert_btrfs_cli_mount_refused(
+                cli,
+                &fixture_dir.join("cli-foreign-device"),
+                &all_images,
+                &[images[0].clone(), foreign],
+                false,
+                &error.to_string(),
+            );
+        }
         let cancelled = Cx::for_testing();
         cancelled.set_cancel_requested(true);
         let valid = OpenOptions {

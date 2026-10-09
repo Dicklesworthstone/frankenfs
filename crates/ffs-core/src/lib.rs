@@ -94091,16 +94091,21 @@ mod tests {
         };
         let cx = Cx::for_testing();
         let mut scope = RequestScope::empty();
+        let fs = Arc::new(fs);
         assert!(matches!(
-            <OpenFs as FsOps>::btrfs_scrub_start(&fs, &cx, &mut scope, 1),
+            <Arc<OpenFs> as FsOps>::btrfs_scrub_start(&fs, &cx, &mut scope, 1),
             Err(FfsError::UnsupportedFeature(_))
         ));
         assert!(matches!(
-            <OpenFs as FsOps>::btrfs_scrub_progress(&fs, &cx, &mut scope, 1),
+            <Arc<OpenFs> as FsOps>::btrfs_scrub_progress(&fs, &cx, &mut scope, 1),
             Err(FfsError::Io(ref e)) if e.raw_os_error() == Some(libc::ENOTCONN)
         ));
         assert!(matches!(
-            <OpenFs as FsOps>::btrfs_subvol_create(&fs, &cx, &mut scope, &[0_u8; 4096]),
+            <Arc<OpenFs> as FsOps>::btrfs_balance_progress(&fs, &cx, &mut scope),
+            Err(FfsError::Io(ref e)) if e.raw_os_error() == Some(libc::ENOTCONN)
+        ));
+        assert!(matches!(
+            <Arc<OpenFs> as FsOps>::btrfs_subvol_create(&fs, &cx, &mut scope, &[0_u8; 4096]),
             Err(FfsError::UnsupportedFeature(_))
         ));
     }
