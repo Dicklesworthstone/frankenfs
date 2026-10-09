@@ -63296,6 +63296,7 @@ mod tests {
         let cx = Cx::for_testing();
 
         let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let fs = Arc::new(fs);
         let ops: &dyn FsOps = &fs;
         let payload = ops
             .get_btrfs_supported_features(&cx, &mut RequestScope::empty())
@@ -63332,6 +63333,7 @@ mod tests {
         let cx = Cx::for_testing();
 
         let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let fs = Arc::new(fs);
         let ops: &dyn FsOps = &fs;
         let (nr_items, payload) = ops
             .btrfs_tree_search(
@@ -63371,6 +63373,33 @@ mod tests {
             .expect("tree-search ROOT_ITEM payload");
         assert_eq!(root_item.root_dirid, BTRFS_FIRST_FREE_OBJECTID);
         assert_eq!(root_item.bytenr, 0x20_000);
+
+        let mut args = [0_u8; 112];
+        args[..8].copy_from_slice(&BTRFS_ROOT_TREE_OBJECTID.to_ne_bytes());
+        args[8..16].copy_from_slice(&BTRFS_FS_TREE_OBJECTID.to_ne_bytes());
+        args[16..24].copy_from_slice(&BTRFS_FS_TREE_OBJECTID.to_ne_bytes());
+        args[32..40].copy_from_slice(&u64::MAX.to_ne_bytes());
+        args[48..56].copy_from_slice(&u64::MAX.to_ne_bytes());
+        args[56..60].copy_from_slice(&u32::from(BTRFS_ITEM_ROOT_ITEM).to_ne_bytes());
+        args[60..64].copy_from_slice(&u32::from(BTRFS_ITEM_ROOT_ITEM).to_ne_bytes());
+        args[64..68].copy_from_slice(&8_u32.to_ne_bytes());
+        args[104..112].copy_from_slice(&4096_u64.to_ne_bytes());
+        let v2 = ops
+            .btrfs_tree_search_v2(&cx, &mut RequestScope::empty(), &args)
+            .expect("shared backend must forward TREE_SEARCH_V2");
+        assert_eq!(u32::from_ne_bytes(v2[64..68].try_into().unwrap()), 1);
+        assert_eq!(v2.len(), 112 + BTRFS_TREE_SEARCH_HEADER_SIZE + 239);
+        let root_item = parse_root_item(&v2[112 + BTRFS_TREE_SEARCH_HEADER_SIZE..])
+            .expect("TREE_SEARCH_V2 root item");
+        assert_eq!(root_item.root_dirid, BTRFS_FIRST_FREE_OBJECTID);
+        assert_eq!(root_item.bytenr, 0x20_000);
+        assert_eq!(
+            ops.btrfs_tree_search_v2(&cx, &mut RequestScope::empty(), &args[..111])
+                .unwrap_err()
+                .to_errno(),
+            libc::EINVAL,
+            "shared backend must retain malformed-argument errors"
+        );
     }
 
     #[test]
@@ -63380,6 +63409,7 @@ mod tests {
         let cx = Cx::for_testing();
 
         let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let fs = Arc::new(fs);
         let ops: &dyn FsOps = &fs;
         let (nr_items, payload) = ops
             .btrfs_tree_search(
@@ -63419,6 +63449,7 @@ mod tests {
         let cx = Cx::for_testing();
 
         let fs = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let fs = Arc::new(fs);
         let ops: &dyn FsOps = &fs;
         let err = ops
             .btrfs_tree_search(
@@ -100869,6 +100900,7 @@ mod tests {
     #[test]
     fn btrfs_ino_paths_vfs_reports_all_hard_links() {
         let (fs, cx) = open_writable_btrfs();
+        let fs = Arc::new(fs);
         let ops: &dyn FsOps = &fs;
         let root = InodeNumber(1);
 

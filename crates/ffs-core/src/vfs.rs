@@ -3319,6 +3319,27 @@ impl<T: FsOps + ?Sized> FsOps for Arc<T> {
         self.as_ref().get_btrfs_fs_info(cx, scope)
     }
 
+    fn get_btrfs_features(&self, cx: &Cx, scope: &mut RequestScope) -> ffs_error::Result<Vec<u8>> {
+        self.as_ref().get_btrfs_features(cx, scope)
+    }
+
+    fn get_btrfs_supported_features(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+    ) -> ffs_error::Result<Vec<u8>> {
+        self.as_ref().get_btrfs_supported_features(cx, scope)
+    }
+
+    fn get_btrfs_space_info(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        space_slots: u64,
+    ) -> ffs_error::Result<Vec<u8>> {
+        self.as_ref().get_btrfs_space_info(cx, scope, space_slots)
+    }
+
     fn set_btrfs_features(
         &self,
         cx: &Cx,
@@ -3383,6 +3404,24 @@ impl<T: FsOps + ?Sized> FsOps for Arc<T> {
             .get_btrfs_dev_info(cx, scope, devid_in, uuid_in)
     }
 
+    fn btrfs_get_dev_stats(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        devid: u64,
+    ) -> ffs_error::Result<Vec<u8>> {
+        self.as_ref().btrfs_get_dev_stats(cx, scope, devid)
+    }
+
+    fn btrfs_get_subvol_info(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+    ) -> ffs_error::Result<Vec<u8>> {
+        self.as_ref().btrfs_get_subvol_info(cx, scope, ino)
+    }
+
     fn btrfs_tree_search(
         &self,
         cx: &Cx,
@@ -3390,6 +3429,61 @@ impl<T: FsOps + ?Sized> FsOps for Arc<T> {
         key: BtrfsTreeSearchKey,
     ) -> ffs_error::Result<(u32, Vec<u8>)> {
         self.as_ref().btrfs_tree_search(cx, scope, key)
+    }
+
+    fn btrfs_tree_search_v2(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        args: &[u8],
+    ) -> ffs_error::Result<Vec<u8>> {
+        self.as_ref().btrfs_tree_search_v2(cx, scope, args)
+    }
+
+    fn get_btrfs_ino_paths(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        inum: u64,
+    ) -> ffs_error::Result<Vec<u8>> {
+        self.as_ref().get_btrfs_ino_paths(cx, scope, inum)
+    }
+
+    fn btrfs_ino_lookup_user(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        treeid: u64,
+        dirid: u64,
+    ) -> ffs_error::Result<Vec<u8>> {
+        self.as_ref()
+            .btrfs_ino_lookup_user(cx, scope, treeid, dirid)
+    }
+
+    fn btrfs_get_subvol_rootref(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        args: &[u8],
+    ) -> ffs_error::Result<Vec<u8>> {
+        self.as_ref().btrfs_get_subvol_rootref(cx, scope, args)
+    }
+
+    fn btrfs_scrub_progress(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        devid: u64,
+    ) -> ffs_error::Result<Vec<u8>> {
+        self.as_ref().btrfs_scrub_progress(cx, scope, devid)
+    }
+
+    fn btrfs_balance_progress(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+    ) -> ffs_error::Result<Vec<u8>> {
+        self.as_ref().btrfs_balance_progress(cx, scope)
     }
 
     fn get_btrfs_logical_ino_v2(
@@ -3401,6 +3495,15 @@ impl<T: FsOps + ?Sized> FsOps for Arc<T> {
     ) -> ffs_error::Result<Vec<u8>> {
         self.as_ref()
             .get_btrfs_logical_ino_v2(cx, scope, logical, args)
+    }
+
+    fn get_btrfs_logical_ino(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        logical: u64,
+    ) -> ffs_error::Result<Vec<u8>> {
+        self.as_ref().get_btrfs_logical_ino(cx, scope, logical)
     }
 
     fn btrfs_resize(
