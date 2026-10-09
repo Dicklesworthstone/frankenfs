@@ -2241,6 +2241,14 @@ pub struct OpenFs {
     /// it, xfstests generic/027 created ~2M "successful" 1 KiB files on a 256
     /// MiB btrfs while every periodic commit failed with ENOSPC.
     btrfs_commit_out_of_space: AtomicBool,
+    /// Counter of btrfs transaction commit unpin rotations (bd-xfh0k).
+    ///
+    /// Bumped whenever `release_pinned_after_superblock_commit` runs.
+    /// Used by `btrfs_read_file_into` as a free-epoch seqlock: if this counter
+    /// changes between extent resolution and completion of device reads, a
+    /// commit has unpinned freed extents and may have reallocated those physical
+    /// blocks. The read retries under the fresh tree state.
+    btrfs_unpin_epoch: std::sync::atomic::AtomicU64,
     /// True when `log_root` held a tree log this implementation cannot replay —
     /// the kernel's log ROOT TREE shape rather than our single leaf (bd-jhuob).
     ///
@@ -6756,6 +6764,7 @@ impl OpenFs {
                 !btrfs_tree_log_items.is_empty() || !btrfs_tree_log_dir_ranges.is_empty(),
             ),
             btrfs_commit_out_of_space: AtomicBool::new(false),
+            btrfs_unpin_epoch: std::sync::atomic::AtomicU64::new(0),
             btrfs_tree_log_items,
             btrfs_tree_log_dir_ranges,
             btrfs_tree_log_hidden: BtrfsTreeLogHidden::default(),
@@ -16487,8 +16496,47 @@ impl OpenFs {
     /// the item it describes (the bd-0onu4 class). That function has been
     /// carrying another function's description, and this one lost the allowance
     /// it was given, which is why clippy started reporting it.
-    #[allow(clippy::too_many_lines)]
     fn btrfs_read_file_into(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        offset: u64,
+        size: u32,
+        dst: &mut [u8],
+        allow_symlink: bool,
+    ) -> Result<usize, FfsError> {
+        let max_attempts = if self.btrfs_alloc_state.is_some() {
+            5
+        } else {
+            1
+        };
+        for attempt in 0..max_attempts {
+            let start_epoch = self.btrfs_unpin_epoch.load(Ordering::Acquire);
+            match self.btrfs_read_file_into_once(cx, ino, offset, size, dst, allow_symlink) {
+                Ok(n) => {
+                    if self.btrfs_alloc_state.is_some()
+                        && self.btrfs_unpin_epoch.load(Ordering::Acquire) != start_epoch
+                    {
+                        continue;
+                    }
+                    return Ok(n);
+                }
+                Err(err) => {
+                    if self.btrfs_alloc_state.is_some()
+                        && self.btrfs_unpin_epoch.load(Ordering::Acquire) != start_epoch
+                        && attempt + 1 < max_attempts
+                    {
+                        continue;
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        self.btrfs_read_file_into_once(cx, ino, offset, size, dst, allow_symlink)
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn btrfs_read_file_into_once(
         &self,
         cx: &Cx,
         ino: InodeNumber,
@@ -40587,6 +40635,7 @@ impl OpenFs {
         // must not run on any error path. The allocation lock is still held.
         {
             let released = alloc.extent_alloc.release_pinned_after_superblock_commit();
+            self.btrfs_unpin_epoch.fetch_add(1, Ordering::Release);
             debug!(
                 target: "ffs::btrfs::writeback",
                 operation_id,
@@ -91443,6 +91492,147 @@ mod tests {
             data.iter().all(|&byte| byte == 0xA1),
             "after a crash A must read its committed bytes, got {:#x?}",
             &data[..16]
+        );
+    }
+
+    /// bd-xfh0k: a read in flight whose extents are freed and unpinned by a
+    /// concurrent commit must detect the unpin epoch change and retry under
+    /// the new tree state rather than returning stale/foreign bytes.
+    #[test]
+    fn btrfs_read_retries_on_unpin_epoch_change_bd_xfh0k() {
+        struct InterceptingDevice {
+            inner: TestDevice,
+            armed: Arc<std::sync::atomic::AtomicBool>,
+            on_read_barrier: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+            signal_read_started: Arc<(std::sync::Mutex<bool>, std::sync::Condvar)>,
+        }
+        impl ByteDevice for InterceptingDevice {
+            fn len_bytes(&self) -> u64 {
+                self.inner.len_bytes()
+            }
+            fn read_exact_at(
+                &self,
+                cx: &Cx,
+                offset: ByteOffset,
+                buf: &mut [u8],
+            ) -> ffs_error::Result<()> {
+                if self.armed.swap(false, std::sync::atomic::Ordering::AcqRel) {
+                    // Signal that the device read has begun (alloc lock has been dropped)
+                    {
+                        let (lock, cvar) = &*self.signal_read_started;
+                        let mut started = lock.lock().unwrap();
+                        *started = true;
+                        cvar.notify_all();
+                    }
+                    // Wait for the commit on the main thread to complete
+                    {
+                        let (lock, cvar) = &*self.on_read_barrier;
+                        let mut done = lock.lock().unwrap();
+                        while !*done {
+                            let (d, timeout_res) = cvar
+                                .wait_timeout(done, std::time::Duration::from_secs(10))
+                                .unwrap();
+                            done = d;
+                            if timeout_res.timed_out() {
+                                panic!("timed out waiting for on_read_barrier");
+                            }
+                        }
+                    }
+                }
+                self.inner.read_exact_at(cx, offset, buf)
+            }
+            fn write_all_at(
+                &self,
+                cx: &Cx,
+                offset: ByteOffset,
+                buf: &[u8],
+            ) -> ffs_error::Result<()> {
+                self.inner.write_all_at(cx, offset, buf)
+            }
+            fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+                self.inner.sync(cx)
+            }
+        }
+
+        let Some((fs, dev, _tmp, _image)) = open_writable_btrfs_mkfs(256) else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let mut fs = fs;
+        fs.enable_writes(&cx).expect("enable writes");
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let a = fs
+            .create(&cx, root, OsStr::new("a"), 0o644, 0, 0)
+            .expect("create a")
+            .ino;
+        const LEN: usize = 4096;
+        fs.write(&cx, a, 0, &[0xAA; LEN]).expect("write a initial");
+        fs.fsync(&cx, a, 0, false).expect("commit a initial");
+
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let on_read_barrier = Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+        let signal_read_started =
+            Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
+
+        let interceptor = InterceptingDevice {
+            inner: TestDevice::from_vec(dev.snapshot_bytes()),
+            armed: Arc::clone(&armed),
+            on_read_barrier: Arc::clone(&on_read_barrier),
+            signal_read_started: Arc::clone(&signal_read_started),
+        };
+        drop(fs);
+
+        let mut fs = OpenFs::from_device(&cx, Box::new(interceptor), &OpenOptions::default())
+            .expect("open btrfs");
+        fs.enable_writes(&cx).expect("enable writes");
+        let fs = Arc::new(fs);
+
+        // Arm the interceptor so that the reader thread's device read pauses
+        armed.store(true, std::sync::atomic::Ordering::Release);
+
+        let fs_clone = Arc::clone(&fs);
+        let read_handle = std::thread::spawn(move || {
+            let cx = Cx::for_testing();
+            fs_clone.as_ref().read(&cx, a, 0, LEN as u32)
+        });
+
+        // Wait until the reader enters device read (alloc lock dropped)
+        {
+            let (lock, cvar) = &*signal_read_started;
+            let mut started = lock.lock().unwrap();
+            while !*started {
+                let (s, timeout_res) = cvar
+                    .wait_timeout(started, std::time::Duration::from_secs(10))
+                    .unwrap();
+                started = s;
+                if timeout_res.timed_out() {
+                    panic!("timed out waiting for signal_read_started");
+                }
+            }
+        }
+
+        // Now mutate file a and commit, advancing the unpin epoch!
+        fs.as_ref()
+            .write(&cx, a, 0, &[0xBB; LEN])
+            .expect("overwrite a");
+        fs.as_ref()
+            .fsync(&cx, a, 0, false)
+            .expect("commit overwrite");
+
+        // Release the device read
+        {
+            let (lock, cvar) = &*on_read_barrier;
+            let mut done = lock.lock().unwrap();
+            *done = true;
+            cvar.notify_all();
+        }
+
+        let read_result = read_handle.join().unwrap().expect("read a must succeed");
+        // Because the unpin epoch changed, the reader retried and observed the updated file content!
+        assert_eq!(
+            read_result,
+            vec![0xBB; LEN],
+            "reader must retry on unpin epoch advance and observe post-commit data"
         );
     }
 
