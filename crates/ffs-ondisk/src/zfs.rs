@@ -4,6 +4,8 @@
 //! pool: topology, configuration, features and the complete MOS still matter.
 //! Sources: OpenZFS spa.h, vdev_impl.h, uberblock_impl.h, zio_checksum.c.
 
+pub mod nvlist;
+
 use ffs_types::ParseError;
 use sha2::{Digest, Sha256};
 
