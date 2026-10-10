@@ -2587,6 +2587,10 @@ For metadata blocks, verification includes:
     referenced log or extent tree is a recovery failure, not an empty tree:
     continuing must not discard acknowledged fsyncs or authorize allocation
     over existing extents.
+    Write admission also requires the canonical `(2, ROOT_ITEM, 0)` extent
+    root with a nonzero tree address. A missing or wrongly keyed root is not
+    an empty allocation tree. Read-only namespace access does not establish
+    allocation authority.
 
 ### 16.3 Key Implementation Patterns
 

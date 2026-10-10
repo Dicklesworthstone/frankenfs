@@ -298,9 +298,28 @@ checksum-correct foreign headers, real formatted DUP recovery, shared-reference
 conversion, corruption of both log levels, public-MVCC inspection freshness,
 and cancellation before another DUP backend read. Existing generation, cache,
 tree-log, subvolume and `btrfs check` controls also passed. These are synthetic
-and formatted-image executions, not mounted foreign-header injection. General
-cached-descent invalidation after raw MVCC writes, absent/zero-address extent
-trees, seed/sprout routing and remaining profile qualification keep `bd-hk5w3`
+and formatted-image executions, not mounted foreign-header injection.
+
+Write admission now also requires the canonical `(2, ROOT_ITEM, 0)` extent root.
+Missing or wrongly keyed roots cannot seed an empty allocator, and invalid root
+payloads (including zero addresses) return corruption/EIO before writes become
+available. Both new regressions failed against the previous missing-root path;
+the corrected metadata/admission cohort passed 31 tests with no failures or
+ignored cases under strict RCH and `FFS_REQUIRE_ORACLES=1`. Coverage includes
+both read-validation options and commit modes, unchanged readable file bytes,
+and corruption of both ROOT_TREE copies in a real formatted DUP image. The
+synthetic writer fixtures now carry an explicit empty extent tree; they do not
+prove complete allocation accounting or durable format compatibility.
+The same core source passed four strict mounted tests (`FFS_REQUIRE_FUSE=1`),
+emitting six PASS scenarios with no skips: ext4 and btrfs kernel readback of
+FrankenFS-written images, btrfs DUP second-copy recovery, kernel tree-log replay,
+and writes to snapshotted default and writable snapshot subvolumes. This is
+positive compatibility evidence; the damaged-root refusal cases above execute
+through OpenFs rather than an injected-corruption mount.
+The broader Btrfs run also reproduced the separately tracked inline-fallocate
+data loss and random-fallocate `NoSpace` failures (`bd-zx0fk`); this is not a
+clean broad-suite result. General cached-descent invalidation after raw MVCC
+writes, seed/sprout routing and remaining profile qualification keep `bd-hk5w3`
 open.
 
 Ext4 xattr parity includes the POSIX ACL namespaces in addition to `user.*` and

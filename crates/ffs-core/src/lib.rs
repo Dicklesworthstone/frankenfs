@@ -12466,42 +12466,44 @@ impl OpenFs {
         // to populate the in-memory extent_tree. Without this, commit would
         // create a fresh extent_tree containing only NEW allocations, losing
         // all existing extent accounting and causing `btrfs check` failures.
-        let extent_tree_items_loaded = if let Some(extent_root_entry) =
-            root_items.iter().find(|e| {
+        let extent_root_entry = root_items
+            .iter()
+            .find(|e| {
                 e.key.objectid == BTRFS_EXTENT_TREE_OBJECTID
                     && e.key.item_type == BTRFS_ITEM_ROOT_ITEM
-            }) {
-            let root_item =
-                parse_root_item(&extent_root_entry.data).map_err(|e| parse_to_ffs_error(&e))?;
-            if root_item.bytenr == 0 {
-                debug!(target: "ffs::write", "EXTENT_TREE ROOT_ITEM has zero bytenr");
-                0
-            } else {
-                let extent_items = self.walk_btrfs_tree(cx, root_item.bytenr)?;
-                let loaded = extent_items.len();
-                for item in extent_items {
-                    let key = BtrfsKey {
-                        objectid: item.key.objectid,
-                        item_type: item.key.item_type,
-                        offset: item.key.offset,
-                    };
-                    extent_alloc
-                        .extent_tree_mut()
-                        .insert(key, &item.data)
-                        .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-                }
-                debug!(
-                    target: "ffs::write",
-                    loaded,
-                    extent_root_bytenr = root_item.bytenr,
-                    "loaded on-disk extent_tree entries"
-                );
-                loaded
-            }
-        } else {
-            debug!(target: "ffs::write", "no EXTENT_TREE ROOT_ITEM found in root_tree");
-            0
-        };
+                    && e.key.offset == 0
+            })
+            .ok_or_else(|| FfsError::Corruption {
+                block: sb.root,
+                detail: "btrfs write admission requires EXTENT_TREE ROOT_ITEM (2, ROOT_ITEM, 0)"
+                    .into(),
+            })?;
+        // The parser also rejects a zero bytenr. Invalid allocation authority
+        // is on-disk corruption, not an invalid caller argument.
+        let extent_root_item =
+            parse_root_item(&extent_root_entry.data).map_err(|error| FfsError::Corruption {
+                block: sb.root,
+                detail: format!("invalid EXTENT_TREE ROOT_ITEM: {error}"),
+            })?;
+        let extent_items = self.walk_btrfs_tree(cx, extent_root_item.bytenr)?;
+        let extent_tree_items_loaded = extent_items.len();
+        for item in extent_items {
+            let key = BtrfsKey {
+                objectid: item.key.objectid,
+                item_type: item.key.item_type,
+                offset: item.key.offset,
+            };
+            extent_alloc
+                .extent_tree_mut()
+                .insert(key, &item.data)
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+        }
+        debug!(
+            target: "ffs::write",
+            loaded = extent_tree_items_loaded,
+            extent_root_bytenr = extent_root_item.bytenr,
+            "loaded on-disk extent_tree entries"
+        );
 
         // ── Load on-disk CHUNK_TREE and DEV_TREE items (bd-a136s) ───────────
         //
@@ -12647,13 +12649,7 @@ impl OpenFs {
                 Ok(())
             };
             pin_tree_nodes(sb.root)?;
-            if let Some(entry) = root_items.iter().find(|e| {
-                e.key.objectid == BTRFS_EXTENT_TREE_OBJECTID
-                    && e.key.item_type == BTRFS_ITEM_ROOT_ITEM
-            }) && let Ok(root_item) = parse_root_item(&entry.data)
-            {
-                pin_tree_nodes(root_item.bytenr)?;
-            }
+            pin_tree_nodes(extent_root_item.bytenr)?;
         }
         debug!(
             target: "ffs::write",
@@ -12678,7 +12674,7 @@ impl OpenFs {
         // synthetic fixtures: with an empty extent tree there is nothing to
         // reconcile from, so their existing tally stands and
         // `btrfs_largest_contiguous_free_run_uses_allocator_gaps` (whose fixture
-        // carries no extent tree) keeps its expected total. The allocation fence
+        // carries an empty extent tree) keeps its expected total. The allocation fence
         // lives in `min_usable_offset`, which this does not touch, so the
         // bytenr-0 sentinel protection (bd-5aybu) is unaffected either way. The
         // underflow guard is not weakened — it stops being reachable from a
@@ -62554,6 +62550,71 @@ mod tests {
     }
 
     #[test]
+    fn btrfs_singleton_metadata_requires_extent_root_before_writes() {
+        let cx = Cx::for_testing();
+        let healthy = build_btrfs_csum_image();
+        let root = BTRFS_TEST_ROOT_TREE_LOGICAL;
+        let header = root + BTRFS_TEST_LEAF_HEADER_SIZE;
+        let item_size = BTRFS_TEST_LEAF_ITEM_SIZE;
+        for damage in ["missing", "zero", "wrong_offset"] {
+            let mut image = healthy.clone();
+            match damage {
+                "missing" => {
+                    // Remove only the extent ROOT_ITEM, preserving the FS and
+                    // checksum roots and their payloads in the same valid leaf.
+                    image.copy_within(header + item_size..header + 3 * item_size, header);
+                    image[root + 0x60..root + 0x64].copy_from_slice(&2_u32.to_le_bytes());
+                }
+                "zero" => image[root + 2400 + 176..root + 2400 + 184].fill(0),
+                "wrong_offset" => {
+                    image[header + 9..header + 17].copy_from_slice(&1_u64.to_le_bytes());
+                }
+                _ => unreachable!(),
+            }
+            stamp_btrfs_test_tree_block_crc32c(&mut image, root);
+            for skip_validation in [false, true] {
+                for btrfs_rw_ephemeral_ok in [false, true] {
+                    let dev = TestDevice::from_vec(image.clone());
+                    let mut fs = OpenFs::from_device(
+                        &cx,
+                        Box::new(dev.clone()),
+                        &OpenOptions {
+                            skip_validation,
+                            btrfs_rw_ephemeral_ok,
+                            ..OpenOptions::default()
+                        },
+                    )
+                    .expect("read-only namespace remains available");
+                    let file = fs
+                        .lookup(&cx, InodeNumber(1), OsStr::new("hello.txt"))
+                        .unwrap();
+                    assert_eq!(
+                        fs.read(&cx, file.ino, 0, 64).unwrap(),
+                        b"hello from btrfs fsops"
+                    );
+                    let error = fs.enable_writes(&cx).expect_err(damage);
+                    assert_eq!(error.to_errno(), libc::EIO, "{damage}: {error}");
+                    assert!(
+                        error.to_string().contains("EXTENT_TREE ROOT_ITEM"),
+                        "{error}"
+                    );
+                    assert!(fs.btrfs_alloc_state.is_none(), "{damage}");
+                    assert!(!fs.is_writable(), "{damage}");
+                    assert_eq!(
+                        fs.read(&cx, file.ino, 0, 64).unwrap(),
+                        b"hello from btrfs fsops"
+                    );
+                    assert_eq!(
+                        dev.snapshot_bytes(),
+                        image,
+                        "{damage}: admission must not write"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
     fn btrfs_singleton_metadata_rejects_unreadable_tree_log_during_open() {
         let (image, _) = fsync_btrfs_file_to_tree_log(OsStr::new("identity.bin"), b"synced");
         let sb = BtrfsSuperblock::parse_from_image(&image).unwrap();
@@ -91970,6 +92031,7 @@ mod tests {
             for skip_validation in [false, true] {
                 for ephemeral in [false, true] {
                     let mut image = build_btrfs_fsops_image();
+                    add_btrfs_test_empty_extent_tree(&mut image);
                     let sb = BTRFS_SUPER_INFO_OFFSET;
                     // Linux BTRFS_SUPER_FLAG_SEEDING is bit 32, independent
                     // of the low WRITTEN bit also present on normal images.
@@ -92344,9 +92406,62 @@ mod tests {
         }
     }
 
+    /// Add the allocation-tree root required by write admission to a minimal
+    /// read fixture. Its empty tree preserves these fixtures' reserved-prefix
+    /// accounting; real allocation/refcount proof uses btrfs-progs images.
+    fn add_btrfs_test_empty_extent_tree(image: &mut [u8]) {
+        let root = BTRFS_TEST_ROOT_TREE_LOGICAL;
+        let extent = 0x18_000_usize;
+        let header = root + BTRFS_TEST_LEAF_HEADER_SIZE;
+        let item_size = BTRFS_TEST_LEAF_ITEM_SIZE;
+        assert_eq!(
+            u32::from_le_bytes(image[root + 0x60..root + 0x64].try_into().unwrap()),
+            1,
+            "the read fixture must have exactly its FS_TREE root"
+        );
+        assert_eq!(
+            u64::from_le_bytes(image[header..header + 8].try_into().unwrap()),
+            BTRFS_FS_TREE_OBJECTID
+        );
+        assert!(
+            image[extent..extent + BTRFS_TEST_NODESIZE]
+                .iter()
+                .all(|&byte| byte == 0)
+        );
+        image[extent + 0x30..extent + 0x38].copy_from_slice(&(extent as u64).to_le_bytes());
+        image[extent + 0x50..extent + 0x58].copy_from_slice(&1_u64.to_le_bytes());
+        image[extent + 0x58..extent + 0x60]
+            .copy_from_slice(&BTRFS_EXTENT_TREE_OBJECTID.to_le_bytes());
+        stamp_btrfs_test_tree_block_crc32c(image, extent);
+        // EXTENT_TREE sorts before FS_TREE; preserve the latter's payload and
+        // descriptor rather than replacing a root the original test exercised.
+        image.copy_within(header..header + item_size, header + item_size);
+        let entry = btrfs_test_root_item(
+            BTRFS_EXTENT_TREE_OBJECTID,
+            0,
+            extent as u64,
+            [0; 16],
+            [0; 16],
+        );
+        write_btrfs_leaf_item(
+            image,
+            root,
+            0,
+            BTRFS_EXTENT_TREE_OBJECTID,
+            BTRFS_ITEM_ROOT_ITEM,
+            0,
+            2400,
+            u32::try_from(entry.data.len()).unwrap(),
+        );
+        image[root + 2400..root + 2400 + entry.data.len()].copy_from_slice(&entry.data);
+        image[root + 0x60..root + 0x64].copy_from_slice(&2_u32.to_le_bytes());
+        stamp_btrfs_test_tree_block_crc32c(image, root);
+    }
+
     /// Open a writable btrfs filesystem from the test image.
     fn open_writable_btrfs_with_device() -> (OpenFs, Cx, TestDevice) {
-        let image = build_btrfs_fsops_image();
+        let mut image = build_btrfs_fsops_image();
+        add_btrfs_test_empty_extent_tree(&mut image);
         let dev = TestDevice::from_vec(image);
         let cx = Cx::for_testing();
         let opts = OpenOptions {
@@ -95096,6 +95211,92 @@ mod tests {
                 ok,
                 "btrfs check must accept a tick-committed image:\n{output}"
             );
+        }
+    }
+
+    #[test]
+    fn btrfs_singleton_metadata_requires_formatted_extent_root() {
+        let Some((fs, dev, _tmp, _image)) = open_writable_btrfs_mkfs(128) else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let image = dev.snapshot_bytes();
+        let sb = fs.btrfs_superblock().unwrap();
+        assert_eq!(sb.csum_type, 0, "fixture restamps CRC32C metadata");
+        let entries = fs.walk_btrfs_root_tree(&cx).unwrap();
+        let index = entries
+            .iter()
+            .position(|item| {
+                item.key.objectid == BTRFS_EXTENT_TREE_OBJECTID
+                    && item.key.item_type == BTRFS_ITEM_ROOT_ITEM
+                    && item.key.offset == 0
+            })
+            .expect("formatter supplies the canonical extent root");
+        let mapping = ffs_ondisk::map_logical_to_stripes(&fs.btrfs_live_chunks().unwrap(), sb.root)
+            .unwrap()
+            .unwrap();
+        assert_eq!(mapping.profile, ffs_ondisk::BtrfsRaidProfile::Dup);
+        assert_eq!(mapping.stripes.len(), 2);
+        let nodesize = usize::try_from(sb.nodesize).unwrap();
+        for damage in ["missing", "zero", "wrong_offset"] {
+            let mut damaged = image.clone();
+            for stripe in &mapping.stripes {
+                let physical = usize::try_from(stripe.physical).unwrap();
+                let header =
+                    ffs_btrfs::BtrfsHeader::parse_from_block(&image[physical..physical + nodesize])
+                        .unwrap();
+                assert_eq!(header.level, 0, "fresh formatter ROOT_TREE is one leaf");
+                let count = usize::try_from(header.nritems).unwrap();
+                assert_eq!(count, entries.len());
+                let table = physical + BTRFS_TEST_LEAF_HEADER_SIZE;
+                let item = table + index * BTRFS_TEST_LEAF_ITEM_SIZE;
+                match damage {
+                    "missing" => {
+                        damaged.copy_within(
+                            item + BTRFS_TEST_LEAF_ITEM_SIZE
+                                ..table + count * BTRFS_TEST_LEAF_ITEM_SIZE,
+                            item,
+                        );
+                        damaged[physical + 0x60..physical + 0x64]
+                            .copy_from_slice(&(header.nritems - 1).to_le_bytes());
+                    }
+                    "zero" => {
+                        let offset =
+                            u32::from_le_bytes(image[item + 17..item + 21].try_into().unwrap());
+                        let payload = physical
+                            + BTRFS_TEST_LEAF_HEADER_SIZE
+                            + usize::try_from(offset).unwrap();
+                        assert_eq!(
+                            &image[payload..payload + entries[index].data.len()],
+                            entries[index].data.as_slice()
+                        );
+                        damaged[payload + 176..payload + 184].fill(0);
+                    }
+                    "wrong_offset" => {
+                        damaged[item + 9..item + 17].copy_from_slice(&1_u64.to_le_bytes());
+                    }
+                    _ => unreachable!(),
+                }
+                let checksum = ffs_types::crc32c(&damaged[physical + 0x20..physical + nodesize]);
+                damaged[physical..physical + 4].copy_from_slice(&checksum.to_le_bytes());
+            }
+            let backing = TestDevice::from_vec(damaged.clone());
+            let mut reopened =
+                OpenFs::from_device(&cx, Box::new(backing.clone()), &OpenOptions::default())
+                    .expect("read-only open does not require allocation authority");
+            assert_eq!(
+                reopened.getattr(&cx, InodeNumber(1)).unwrap().kind,
+                FileType::Directory
+            );
+            let error = reopened.enable_writes(&cx).expect_err(damage);
+            assert_eq!(error.to_errno(), libc::EIO, "{damage}: {error}");
+            assert!(
+                error.to_string().contains("EXTENT_TREE ROOT_ITEM"),
+                "{error}"
+            );
+            assert!(!reopened.is_writable());
+            assert!(reopened.btrfs_alloc_state.is_none());
+            assert_eq!(backing.snapshot_bytes(), damaged, "{damage}");
         }
     }
 
@@ -114163,7 +114364,8 @@ mod tests {
     #[test]
     fn btrfs_rw_durable_mode_allows_mutations() {
         let cx = Cx::for_testing();
-        let image = build_btrfs_image();
+        let mut image = build_btrfs_image();
+        add_btrfs_test_empty_extent_tree(&mut image);
         let dev = TestDevice::from_vec(image);
         let opts = OpenOptions {
             btrfs_rw_ephemeral_ok: false, // durable mode
@@ -114181,11 +114383,7 @@ mod tests {
             1000,
             1000,
         );
-        // Should succeed or fail for reasons other than ReadOnly
-        #[allow(clippy::equatable_if_let)]
-        if let Err(FfsError::ReadOnly) = result {
-            panic!("create should not return ReadOnly in durable mode");
-        }
+        result.expect("create succeeds with admitted allocation state in durable mode");
 
         // mkdir should also succeed
         let result = fs.mkdir(
@@ -114196,17 +114394,15 @@ mod tests {
             1000,
             1000,
         );
-        #[allow(clippy::equatable_if_let)]
-        if let Err(FfsError::ReadOnly) = result {
-            panic!("mkdir should not return ReadOnly in durable mode");
-        }
+        result.expect("mkdir succeeds with admitted allocation state in durable mode");
     }
 
     /// Test that btrfs mutations succeed in ephemeral mode (btrfs_rw_ephemeral_ok=true).
     #[test]
     fn btrfs_rw_ephemeral_mode_allows_mutations() {
         let cx = Cx::for_testing();
-        let image = build_btrfs_image();
+        let mut image = build_btrfs_image();
+        add_btrfs_test_empty_extent_tree(&mut image);
         let dev = TestDevice::from_vec(image);
         let opts = OpenOptions {
             btrfs_rw_ephemeral_ok: true,
@@ -114215,7 +114411,7 @@ mod tests {
         let mut fs = OpenFs::from_device(&cx, Box::new(dev), &opts).unwrap();
         fs.enable_writes(&cx).unwrap();
 
-        // Attempt a create operation - should succeed (or fail for other reasons, not EROFS)
+        // Ephemeral commit strategy still needs valid write admission.
         let result = fs.create(
             &cx,
             InodeNumber(256),
@@ -114224,12 +114420,7 @@ mod tests {
             1000,
             1000,
         );
-        // The operation may fail for other reasons (e.g., parent not a directory),
-        // but it should NOT fail with ReadOnly since ephemeral_ok is true.
-        #[allow(clippy::equatable_if_let)]
-        if let Err(FfsError::ReadOnly) = result {
-            panic!("create should not return ReadOnly when btrfs_rw_ephemeral_ok=true");
-        }
+        result.expect("create succeeds with admitted allocation state in ephemeral mode");
     }
 
     /// Test that check_btrfs_mutation_allowed returns Ok for ext4 regardless of flag.

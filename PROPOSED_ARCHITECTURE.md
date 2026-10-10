@@ -243,8 +243,11 @@ parsed representation drops the raw header. They bypass the descent cache:
 public MVCC flushes can change a singleton backing without enabling FsOps.
 Generation inspection must propagate read failures. Failed log replay must refuse opening;
 a corrupt referenced EXTENT_TREE must refuse write admission rather than seed
-an empty allocator. The existing absent/zero-bytenr EXTENT_TREE path remains
-unqualified and is not evidence of validated allocation state.
+an empty allocator. Write admission also requires a nonzero extent-root address
+under the exact `(2, ROOT_ITEM, 0)` key used by commit. Missing, zero-address or
+wrongly keyed roots return corruption before an allocator is installed; the
+validated root address also drives live-tree pinning. Read-only access remains
+available when it does not need allocation authority.
 
 Seed support also requires explicit per-device filesystem identity and seed
 generation, anchored to the sprout's committed DEV_ITEMs. Seed handles remain
