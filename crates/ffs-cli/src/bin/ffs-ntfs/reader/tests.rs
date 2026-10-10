@@ -293,3 +293,4 @@ fn actual_file_backing_and_adjacent_partition_bytes_remain_unchanged() {
 }
 
 mod namespace;
+mod attributes;
