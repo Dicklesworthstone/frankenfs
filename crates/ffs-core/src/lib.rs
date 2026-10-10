@@ -979,9 +979,19 @@ impl BtrfsReadDevices {
         csum_type: u16,
     ) -> Result<(Arc<BtrfsParsedNode>, u64), ParseError> {
         let parse = |bytes: Vec<u8>| {
-            let generation = ffs_btrfs::BtrfsHeader::parse_from_block(&bytes)?.generation;
+            let header = ffs_btrfs::BtrfsHeader::parse_from_block(&bytes)?;
+            if !self
+                .identities
+                .values()
+                .any(|device| device.fsid == header.fsid)
+            {
+                return Err(ParseError::InvalidField {
+                    field: "tree_header_fsid",
+                    reason: "metadata tree filesystem UUID does not match attached devices",
+                });
+            }
             let node = parse_btrfs_tree_node_owned(bytes, csum_type, logical, nodesize)?;
-            Ok((Arc::new(node), generation))
+            Ok((Arc::new(node), header.generation))
         };
         let mapping = ffs_ondisk::map_logical_to_stripes(chunks, logical)?.ok_or(
             ParseError::InvalidField {
@@ -1018,24 +1028,23 @@ impl BtrfsReadDevices {
                 }
                 Err(_) => continue,
             };
-            // Only a checksum-valid, structurally valid node at the expected
-            // logical address may reach the parsed-node cache or tree walker.
+            // A node must match an admitted filesystem identity as well as
+            // its checksum, structure and logical address before caching.
             match parse(bytes) {
                 Ok(node) => return Ok(node),
                 Err(error) => failure = error,
             }
         }
         // bd-hk5w3: a RAID5/6 node whose column is absent or fails its
-        // checksum is rebuilt from parity. The node's own checksum, logical
-        // address and structure are the oracle, exactly as for a mirror copy.
+        // checksum is rebuilt from parity. Identity, checksum, logical address
+        // and structure form the same oracle used for a mirror copy.
         if matches!(
             mapping.profile,
             ffs_ondisk::BtrfsRaidProfile::Raid5 | ffs_ondisk::BtrfsRaidProfile::Raid6
         ) {
             let rebuilt = self
                 .reconstruct_raid56(cx, chunks, logical, ns, |candidate| {
-                    parse_btrfs_tree_node_owned(candidate.to_vec(), csum_type, logical, nodesize)
-                        .is_ok()
+                    parse(candidate.to_vec()).is_ok()
                 })
                 .map_err(|error| match error {
                     FfsError::Cancelled => ParseError::InvalidField {
@@ -60409,6 +60418,9 @@ mod tests {
                     for metadata in [true, false] {
                         let cx = Cx::for_testing();
                         let image = Arc::new(build_btrfs_csum_image());
+                        let identity =
+                            ffs_ondisk::parse_dev_item(&image[BTRFS_SUPER_INFO_OFFSET + 0xC9..])
+                                .unwrap();
                         let mut fs = OpenFs::from_device(
                             &cx,
                             Box::new(TestDevice::from_vec(image.as_ref().clone())),
@@ -60490,7 +60502,13 @@ mod tests {
                         }
                         fs.btrfs_devices = Some(Arc::new(BtrfsReadDevices {
                             readers,
-                            identities: Default::default(),
+                            identities: (1..=u64::from(count))
+                                .map(|devid| {
+                                    let mut item = identity.clone();
+                                    item.devid = devid;
+                                    (devid, item)
+                                })
+                                .collect(),
                         }));
                         if metadata {
                             let result = fs.walk_btrfs_tree(&cx, root);
@@ -60891,6 +60909,196 @@ mod tests {
                 .to_string()
                 .contains("crosses a stripe or chunk boundary")
         );
+    }
+
+    #[test]
+    fn btrfs_metadata_mirrors_reject_foreign_fsid_before_acceptance() {
+        let cx = Cx::for_testing();
+        let image = build_btrfs_image();
+        let sb =
+            BtrfsSuperblock::parse_superblock_region(&image[BTRFS_SUPER_INFO_OFFSET..]).unwrap();
+        let logical = usize::try_from(sb.root).unwrap();
+        let fsid = [0xA5; 16];
+        let mut identity =
+            ffs_ondisk::parse_dev_item(&image[BTRFS_SUPER_INFO_OFFSET + 0xC9..]).unwrap();
+        identity.fsid = fsid;
+        let mut chunk = parse_sys_chunk_array(&sb.sys_chunk_array)
+            .unwrap()
+            .remove(0);
+        chunk.chunk_type = ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_RAID1;
+        chunk.num_stripes = 2;
+        chunk.stripes = (1..=2)
+            .map(|devid| ffs_ondisk::BtrfsStripe {
+                devid,
+                offset: 0,
+                dev_uuid: [0; 16],
+            })
+            .collect();
+        // The wrong headers have valid checksums and different generations,
+        // so accepting the first copy cannot masquerade as mirror recovery.
+        for (identified, first_fsid, second_fsid, expected_generation) in [
+            (true, fsid, fsid, Some(10)),
+            (true, [0x44; 16], fsid, Some(20)),
+            (true, [0; 16], fsid, Some(20)),
+            (true, [0x44; 16], [0; 16], None),
+            (false, fsid, fsid, None),
+        ] {
+            let reads = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+            let mut devices = BtrfsReadDevices {
+                readers: ffs_btrfs::BtrfsDeviceSet::new(),
+                identities: (1..=2)
+                    .map(|devid| {
+                        let mut item = identity.clone();
+                        item.devid = devid;
+                        (devid, item)
+                    })
+                    .collect(),
+            };
+            if !identified {
+                devices.identities.clear();
+            }
+            for (index, header_fsid) in [first_fsid, second_fsid].into_iter().enumerate() {
+                let mut copy = image.clone();
+                copy[logical + 0x20..logical + 0x30].copy_from_slice(&header_fsid);
+                let generation = 10 * (u64::try_from(index).unwrap() + 1);
+                copy[logical + 0x50..logical + 0x58].copy_from_slice(&generation.to_le_bytes());
+                stamp_btrfs_test_tree_block_crc32c(&mut copy, logical);
+                let counted = Arc::clone(&reads);
+                devices
+                    .readers
+                    .add_device(
+                        u64::try_from(index).unwrap() + 1,
+                        Box::new(move |_, offset, len| {
+                            counted.fetch_or(1 << index, Ordering::Relaxed);
+                            let start = usize::try_from(offset).unwrap();
+                            Ok(copy[start..start + len].to_vec())
+                        }),
+                    )
+                    .unwrap();
+            }
+            let result = devices.read_node_with_generation(
+                &cx,
+                std::slice::from_ref(&chunk),
+                sb.root,
+                sb.nodesize,
+                sb.csum_type,
+            );
+            if let Some(expected) = expected_generation {
+                assert_eq!(result.unwrap().1, expected);
+            } else {
+                assert!(result.unwrap_err().to_string().contains("filesystem UUID"));
+            }
+            assert_eq!(
+                reads.load(Ordering::Relaxed),
+                if identified && first_fsid == fsid {
+                    1
+                } else {
+                    3
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn btrfs_metadata_parity_rejects_foreign_fsid_before_acceptance() {
+        let cx = Cx::for_testing();
+        let image = build_btrfs_image();
+        let sb =
+            BtrfsSuperblock::parse_superblock_region(&image[BTRFS_SUPER_INFO_OFFSET..]).unwrap();
+        let logical = usize::try_from(sb.root).unwrap();
+        let nodesize = usize::try_from(sb.nodesize).unwrap();
+        let fsid = [0xA5; 16];
+        let mut identity =
+            ffs_ondisk::parse_dev_item(&image[BTRFS_SUPER_INFO_OFFSET + 0xC9..]).unwrap();
+        identity.fsid = fsid;
+        let mut chunk = parse_sys_chunk_array(&sb.sys_chunk_array)
+            .unwrap()
+            .remove(0);
+        chunk.key.offset = sb.root;
+        chunk.length = 2 * u64::from(sb.nodesize);
+        chunk.stripe_len = u64::from(sb.nodesize);
+        chunk.chunk_type = ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_RAID5;
+        chunk.num_stripes = 3;
+        chunk.stripes = (1..=3)
+            .map(|devid| ffs_ondisk::BtrfsStripe {
+                devid,
+                offset: sb.root,
+                dev_uuid: [0; 16],
+            })
+            .collect();
+        for (header_fsid, q_recovers) in [
+            (fsid, false),
+            ([0x44; 16], false),
+            ([0; 16], false),
+            ([0x44; 16], true),
+        ] {
+            let mut chunk = chunk.clone();
+            let mut copy = image.clone();
+            copy[logical + 0x20..logical + 0x30].copy_from_slice(&header_fsid);
+            stamp_btrfs_test_tree_block_crc32c(&mut copy, logical);
+            let node = &copy[logical..logical + nodesize];
+            // Row zero is [D0, D1, P]. D0 is absent; D1 and P reconstruct
+            // precisely the original checksum-correct node, including its FSID.
+            let partner = vec![0x33; nodesize];
+            let parity = node.iter().zip(&partner).map(|(a, b)| a ^ b).collect();
+            let mut slots = vec![(2, partner), (3, parity)];
+            if q_recovers {
+                chunk.chunk_type = ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_RAID6;
+                chunk.num_stripes = 4;
+                chunk.stripes.push(ffs_ondisk::BtrfsStripe {
+                    devid: 4,
+                    offset: sb.root,
+                    dev_uuid: [0; 16],
+                });
+                copy[logical + 0x20..logical + 0x30].copy_from_slice(&fsid);
+                copy[logical + 0x50..logical + 0x58].copy_from_slice(&99_u64.to_le_bytes());
+                stamp_btrfs_test_tree_block_crc32c(&mut copy, logical);
+                // Q = D0 XOR (2 * D1); doubling 0x33 in GF(256) is 0x66.
+                let q = copy[logical..logical + nodesize]
+                    .iter()
+                    .map(|byte| byte ^ 0x66)
+                    .collect();
+                slots.push((4, q));
+            }
+            let mut devices = BtrfsReadDevices {
+                readers: ffs_btrfs::BtrfsDeviceSet::new(),
+                identities: (2..=u64::from(chunk.num_stripes))
+                    .map(|devid| {
+                        let mut item = identity.clone();
+                        item.devid = devid;
+                        (devid, item)
+                    })
+                    .collect(),
+            };
+            for (devid, bytes) in slots {
+                devices
+                    .readers
+                    .add_device(
+                        devid,
+                        Box::new(move |_, offset, len| {
+                            assert_eq!(offset, logical as u64);
+                            assert_eq!(len, nodesize);
+                            Ok(bytes.clone())
+                        }),
+                    )
+                    .unwrap();
+            }
+            let result = devices.read_node_with_generation(
+                &cx,
+                std::slice::from_ref(&chunk),
+                sb.root,
+                sb.nodesize,
+                sb.csum_type,
+            );
+            if header_fsid == fsid || q_recovers {
+                assert_eq!(result.unwrap().1, if q_recovers { 99 } else { 1 });
+            } else {
+                assert!(
+                    result.is_err(),
+                    "foreign tree header survived parity recovery"
+                );
+            }
+        }
     }
 
     #[test]
@@ -113773,6 +113981,8 @@ mod tests {
     fn btrfs_root_generation_inspection_uses_validated_attached_mirror() {
         let cx = Cx::for_testing();
         let image = build_btrfs_csum_image();
+        let identity =
+            ffs_ondisk::parse_dev_item(&image[BTRFS_SUPER_INFO_OFFSET + 0xC9..]).unwrap();
         let mut fs = OpenFs::from_device(
             &cx,
             Box::new(TestDevice::from_vec(image.clone())),
@@ -113816,7 +114026,13 @@ mod tests {
         }
         fs.btrfs_devices = Some(Arc::new(BtrfsReadDevices {
             readers,
-            identities: Default::default(),
+            identities: (1..=2)
+                .map(|devid| {
+                    let mut item = identity.clone();
+                    item.devid = devid;
+                    (devid, item)
+                })
+                .collect(),
         }));
         assert!(
             fs.btrfs_root_item_transid_mismatches(&cx)
@@ -113837,6 +114053,8 @@ mod tests {
         ] {
             let cx = Cx::for_testing();
             let mut image = build_btrfs_csum_image();
+            let identity =
+                ffs_ondisk::parse_dev_item(&image[BTRFS_SUPER_INFO_OFFSET + 0xC9..]).unwrap();
             if nodatasum {
                 let flags = BTRFS_TEST_FS_TREE_LOGICAL + BTRFS_TEST_FILE_INODE_OFF + 64;
                 image[flags..flags + 8].copy_from_slice(&BTRFS_INODE_NODATASUM.to_le_bytes());
@@ -113890,7 +114108,13 @@ mod tests {
             }
             fs.btrfs_devices = Some(Arc::new(BtrfsReadDevices {
                 readers,
-                identities: Default::default(),
+                identities: (1..=2)
+                    .map(|devid| {
+                        let mut item = identity.clone();
+                        item.devid = devid;
+                        (devid, item)
+                    })
+                    .collect(),
             }));
             let mut args = [0_u8; 64];
             args[16..24].copy_from_slice(&3_u64.to_le_bytes());

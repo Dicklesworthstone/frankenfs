@@ -2575,6 +2575,13 @@ For metadata blocks, verification includes:
     [`open_seed_devices` / `read_one_dev`](https://github.com/torvalds/linux/blob/v6.19/fs/btrfs/volumes.c#L6651-L6797).
     These are extracted kernel contracts, not evidence of implemented
     FrankenFS seed support (`bd-hk5w3`).
+15. A valid tree-block checksum does not establish filesystem identity.
+    Linux `check_tree_block_fsid` accepts the mounted metadata UUID or an
+    admitted seed group's filesystem UUID; otherwise the read fails before
+    the block is accepted. Identity validation therefore belongs inside each
+    mirror or parity-candidate check, before caching. A zero UUID is not a
+    wildcard. See Linux v6.19
+    [`disk-io.c`](https://github.com/torvalds/linux/blob/v6.19/fs/btrfs/disk-io.c#L318-L368).
 
 ### 16.3 Key Implementation Patterns
 

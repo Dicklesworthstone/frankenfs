@@ -273,6 +273,22 @@ durable count/checksum, reopened mutation and an independent read-only
 paths. These are formatted-image OpenFs executions, not count-corruption FUSE
 coverage. Seed/sprout and remaining profile qualification keep `bd-hk5w3` open.
 
+Attached-device tree reads now reject headers whose filesystem UUID is absent
+from the admitted device identities, including checksum-correct foreign blocks.
+The identity check runs inside both mirror validation and parity recovery.
+On 2026-10-10, the synthetic regressions
+`btrfs_metadata_mirrors_reject_foreign_fsid_before_acceptance` and
+`btrfs_metadata_parity_rejects_foreign_fsid_before_acceptance` both failed against
+the old reader and passed after the fix. They cover zero/foreign IDs, empty
+identity inventories, mirror fallback and RAID6 recovery through Q after P
+reconstructs a foreign block. A strict-remote `ffs-core --lib` cohort passed
+13 tests with `FFS_REQUIRE_ORACLES=1`, including existing cancellation,
+generation-inspection and encoded-read checks, degraded RAID5/6 formatted-image
+opens, and metadata operations checked by `btrfs check`. These are unit and
+formatted-image OpenFs results, not mounted foreign-header evidence. The
+separate singleton reader's identity validation and seed/sprout routing remain
+open under `bd-hk5w3`.
+
 Ext4 xattr parity includes the POSIX ACL namespaces in addition to `user.*` and
 `security.*`: `crates/ffs-harness/tests/kernel_reference.rs` now differentially
 validates `system.posix_acl_access` and `system.posix_acl_default` against

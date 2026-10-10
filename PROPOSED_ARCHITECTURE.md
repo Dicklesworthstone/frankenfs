@@ -176,7 +176,13 @@ reads and rejected writes do not mutate the devices. Their mapper
 rotates ordered data slots forward per physical row, matching Linux. Missing or
 corrupt data columns are reconstructed from P/Q and validated against data
 checksums; reconstructed metadata must pass its own checksum, logical-address
-and structural checks before entering the cache. Encoded reads use the same
+and structural checks before entering the cache. The attached-device reader
+also requires each tree header's filesystem UUID to match an admitted device
+identity. The same predicate runs inside parity reconstruction, so a
+checksum-correct foreign P candidate cannot hide a valid Q candidate. An empty
+identity set rejects every node, and zero UUIDs have no wildcard meaning.
+This check covers attached-device tree reads; it does not establish seed/sprout
+admission or validation in the separate singleton reader. Encoded reads use the same
 logical routing and checksum policy as ordinary reads. Generation inspection
 also uses validated attached-device copies. CLI mount modes pass `Arc<OpenFs>`
 to FUSE; the shared `FsOps` implementation forwards encoded reads and metadata

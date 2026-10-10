@@ -12,7 +12,10 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
-#[command(name = "ffs-ntfs", about = "Inspect immutable NTFS images and extract streams without replay or writes")]
+#[command(
+    name = "ffs-ntfs",
+    about = "Inspect immutable NTFS images and extract streams without replay or writes"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -33,7 +36,11 @@ struct ImageArgs {
 }
 impl ImageArgs {
     fn open(&self, cx: &Cx) -> Result<NtfsVolume> {
-        if !self.offline_image { bail!("--offline-image is required; an advisory lock does not prevent unrelated writers"); }
+        if !self.offline_image {
+            bail!(
+                "--offline-image is required; an advisory lock does not prevent unrelated writers"
+            );
+        }
         NtfsVolume::open(cx, &self.image, self.offset, self.length)
             .with_context(|| format!("opening offline NTFS image {}", self.image.display()))
     }
@@ -53,7 +60,10 @@ struct RecordArgs {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Check geometry, MFT bootstrap/mirror agreement and volume version/flags.
-    Inspect { #[command(flatten)] image: ImageArgs },
+    Inspect {
+        #[command(flatten)]
+        image: ImageArgs,
+    },
     /// List a directory through native $I30 indexes, retaining raw UTF-16 names.
     Ls {
         #[command(flatten)]
@@ -74,7 +84,10 @@ enum Command {
         bytes: Option<u64>,
     },
     /// Show the attributes and native UTF-16 stream names of an in-use MFT record.
-    Record { #[command(flatten)] file: RecordArgs },
+    Record {
+        #[command(flatten)]
+        file: RecordArgs,
+    },
     /// Stream logical DATA bytes to stdout, including sparse/uninitialized zeroes.
     Cat {
         #[command(flatten)]
@@ -99,19 +112,30 @@ fn json(value: &serde_json::Value) -> Result<()> {
 }
 
 fn stream_to_stdout(
-    cx: &Cx, volume: &NtfsVolume, record: &NtfsFileRecord,
-    name: &str, start: u64, bytes: Option<u64>,
+    cx: &Cx,
+    volume: &NtfsVolume,
+    record: &NtfsFileRecord,
+    name: &str,
+    start: u64,
+    bytes: Option<u64>,
 ) -> Result<()> {
     let name: Vec<u16> = name.encode_utf16().collect();
-    if name.len() > 255 || name.contains(&0) { bail!("invalid NTFS stream name"); }
+    if name.len() > 255 || name.contains(&0) {
+        bail!("invalid NTFS stream name");
+    }
     let stream = volume.data_stream(cx, record, &name)?;
-    let length = stream.size.saturating_sub(start).min(bytes.unwrap_or(u64::MAX));
+    let length = stream
+        .size
+        .saturating_sub(start)
+        .min(bytes.unwrap_or(u64::MAX));
     let mut done = 0_u64;
     let mut out = io::stdout().lock();
     while done < length {
         let count = (length - done).min(1024 * 1024) as usize;
         let data = volume.read(cx, &stream, start + done, count)?;
-        if data.is_empty() { bail!("NTFS stream ended before the validated logical EOF"); }
+        if data.is_empty() {
+            bail!("NTFS stream ended before the validated logical EOF");
+        }
         out.write_all(&data)?;
         done += data.len() as u64;
     }
@@ -141,15 +165,26 @@ fn main() -> Result<()> {
             let volume = image.open(&cx)?;
             let record = volume.resolve(&cx, &path)?;
             let entries = volume.list_directory(&cx, &record)?;
-            let report: Vec<_> = entries.into_iter().map(|entry| serde_json::json!({
-                "record": entry.reference.record, "sequence": entry.reference.sequence,
-                "name": String::from_utf16(&entry.filename.name).ok(),
-                "name_utf16": entry.filename.name, "namespace": entry.filename.namespace,
-                "directory": entry.directory
-            })).collect();
+            let report: Vec<_> = entries
+                .into_iter()
+                .map(|entry| {
+                    serde_json::json!({
+                        "record": entry.reference.record, "sequence": entry.reference.sequence,
+                        "name": String::from_utf16(&entry.filename.name).ok(),
+                        "name_utf16": entry.filename.name, "namespace": entry.filename.namespace,
+                        "directory": entry.directory
+                    })
+                })
+                .collect();
             json(&serde_json::json!(report))?;
         }
-        Command::Read { image, path, stream, start, bytes } => {
+        Command::Read {
+            image,
+            path,
+            stream,
+            start,
+            bytes,
+        } => {
             let volume = image.open(&cx)?;
             let record = volume.resolve(&cx, &path)?;
             stream_to_stdout(&cx, &volume, &record, &stream, start, bytes)?;
@@ -160,17 +195,32 @@ fn main() -> Result<()> {
             let mut attributes = Vec::new();
             for attr in record.attributes()? {
                 let (resident, size, initialized, first_vcn, last_vcn) = match &attr.value {
-                    NtfsValue::Resident(data) => (true, data.len() as u64, data.len() as u64, None, None),
-                    NtfsValue::NonResident(value) => (false, value.data_bytes, value.initialized_bytes,
-                        Some(value.first_vcn), Some(value.last_vcn)),
+                    NtfsValue::Resident(data) => {
+                        (true, data.len() as u64, data.len() as u64, None, None)
+                    }
+                    NtfsValue::NonResident(value) => (
+                        false,
+                        value.data_bytes,
+                        value.initialized_bytes,
+                        Some(value.first_vcn),
+                        Some(value.last_vcn),
+                    ),
                 };
                 let readability = if attr.kind == DATA {
                     match volume.data_stream(&cx, &record, &attr.name) {
-                        Ok(stream) => Some(serde_json::json!({"admitted": true, "allocated_bytes": stream.allocated})),
-                        Err(ffs_error::FfsError::Cancelled) => return Err(ffs_error::FfsError::Cancelled.into()),
-                        Err(error) => Some(serde_json::json!({"admitted": false, "error": error.to_string()})),
+                        Ok(stream) => Some(
+                            serde_json::json!({"admitted": true, "allocated_bytes": stream.allocated}),
+                        ),
+                        Err(ffs_error::FfsError::Cancelled) => {
+                            return Err(ffs_error::FfsError::Cancelled.into());
+                        }
+                        Err(error) => {
+                            Some(serde_json::json!({"admitted": false, "error": error.to_string()}))
+                        }
                     }
-                } else { None };
+                } else {
+                    None
+                };
                 attributes.push(serde_json::json!({
                     "type": format!("{:#x}", attr.kind), "instance": attr.id, "flags": attr.flags,
                     "name": String::from_utf16(&attr.name).ok(), "name_utf16": attr.name,
@@ -178,12 +228,19 @@ fn main() -> Result<()> {
                     "first_vcn": first_vcn, "last_vcn": last_vcn, "read_profile": readability
                 }));
             }
-            json(&serde_json::json!({"record": record.number, "sequence": record.sequence,
+            json(
+                &serde_json::json!({"record": record.number, "sequence": record.sequence,
                 "directory": record.is_directory(), "hard_links": record.hard_links,
                 "base_record": record.base.record, "base_sequence": record.base.sequence,
-                "attributes": attributes, "scope": "record metadata; listing does not certify stream readability"}))?;
+                "attributes": attributes, "scope": "record metadata; listing does not certify stream readability"}),
+            )?;
         }
-        Command::Cat { file, stream, start, bytes } => {
+        Command::Cat {
+            file,
+            stream,
+            start,
+            bytes,
+        } => {
             let volume = file.image.open(&cx)?;
             let record = volume.record(&cx, file.record, file.sequence)?;
             stream_to_stdout(&cx, &volume, &record, &stream, start, bytes)?;
@@ -198,22 +255,73 @@ mod tests {
     #[test]
     fn cli_requires_offline_acknowledgement_and_accepts_record_ranges() {
         assert!(Cli::try_parse_from(["ffs-ntfs", "inspect", "disk.img"]).is_err());
-        let cli = Cli::try_parse_from(["ffs-ntfs", "cat", "disk.img", "24", "--offline-image",
-            "--sequence", "7", "--stream", "note", "--start", "512", "--bytes", "1024"]).unwrap();
-        let Command::Cat { file, stream, start, bytes } = cli.command else { panic!("cat"); };
+        let cli = Cli::try_parse_from([
+            "ffs-ntfs",
+            "cat",
+            "disk.img",
+            "24",
+            "--offline-image",
+            "--sequence",
+            "7",
+            "--stream",
+            "note",
+            "--start",
+            "512",
+            "--bytes",
+            "1024",
+        ])
+        .unwrap();
+        let Command::Cat {
+            file,
+            stream,
+            start,
+            bytes,
+        } = cli.command
+        else {
+            panic!("cat");
+        };
         assert_eq!((file.record, file.sequence), (24, Some(7)));
         assert_eq!((stream.as_str(), start, bytes), ("note", 512, Some(1024)));
-        assert!(Cli::try_parse_from(["ffs-ntfs", "inspect", "disk.img", "--offline-image", "--rw"]).is_err());
+        assert!(
+            Cli::try_parse_from(["ffs-ntfs", "inspect", "disk.img", "--offline-image", "--rw"])
+                .is_err()
+        );
     }
     #[test]
     fn cli_accepts_directory_and_path_reads_without_reinterpreting_numeric_cat() {
         let cli = Cli::try_parse_from(["ffs-ntfs", "ls", "disk.img", "--offline-image"]).unwrap();
-        let Command::Ls { path, .. } = cli.command else { panic!("ls"); };
+        let Command::Ls { path, .. } = cli.command else {
+            panic!("ls");
+        };
         assert_eq!(path, "/");
-        let cli = Cli::try_parse_from(["ffs-ntfs", "read", "disk.img", "/folder/Ä.bin",
-            "--offline-image", "--stream", "note", "--start", "3", "--bytes", "2"]).unwrap();
-        let Command::Read { path, stream, start, bytes, .. } = cli.command else { panic!("read"); };
-        assert_eq!((path.as_str(), stream.as_str(), start, bytes), ("/folder/Ä.bin", "note", 3, Some(2)));
+        let cli = Cli::try_parse_from([
+            "ffs-ntfs",
+            "read",
+            "disk.img",
+            "/folder/Ä.bin",
+            "--offline-image",
+            "--stream",
+            "note",
+            "--start",
+            "3",
+            "--bytes",
+            "2",
+        ])
+        .unwrap();
+        let Command::Read {
+            path,
+            stream,
+            start,
+            bytes,
+            ..
+        } = cli.command
+        else {
+            panic!("read");
+        };
+        assert_eq!(
+            (path.as_str(), stream.as_str(), start, bytes),
+            ("/folder/Ä.bin", "note", 3, Some(2))
+        );
         assert!(Cli::try_parse_from(["ffs-ntfs", "read", "disk.img", "/a"]).is_err());
     }
 }

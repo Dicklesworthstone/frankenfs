@@ -23,7 +23,7 @@ fn root() -> Vec<u8> {
     let used = (value.len() - 16) as u32;
     value[20..24].copy_from_slice(&used.to_le_bytes());
     value[24..28].copy_from_slice(&used.to_le_bytes());
-    value[32..40].copy_from_slice(&((7_u64 << 48) | 24).to_le_bytes());
+    value[32..40].copy_from_slice(&((7_u64 << 48) | 0x0018).to_le_bytes());
     value[40..42].copy_from_slice(&(entry_len as u16).to_le_bytes());
     value[42..44].copy_from_slice(&(key.len() as u16).to_le_bytes());
     value[48..48 + key.len()].copy_from_slice(&key);
@@ -37,10 +37,20 @@ fn root() -> Vec<u8> {
 fn filename_preserves_native_utf16_and_rejects_invalid_components() {
     let value = file_name(&[0xD800, 65]);
     let parsed = NtfsFileName::parse(&value).unwrap();
-    assert_eq!(parsed.parent, NtfsReference { record: 5, sequence: 7 });
+    assert_eq!(
+        parsed.parent,
+        NtfsReference {
+            record: 5,
+            sequence: 7
+        }
+    );
     assert_eq!(parsed.name, [0xD800, 65]);
-    for unit in [0, 47, 92] { assert!(NtfsFileName::parse(&file_name(&[unit])).is_err()); }
-    for end in 0..value.len() { assert!(NtfsFileName::parse(&value[..end]).is_err()); }
+    for unit in [0, 47, 92] {
+        assert!(NtfsFileName::parse(&file_name(&[unit])).is_err());
+    }
+    for end in 0..value.len() {
+        assert!(NtfsFileName::parse(&value[..end]).is_err());
+    }
     let mut bad = value;
     bad[65] = 4;
     assert!(NtfsFileName::parse(&bad).is_err());
@@ -65,9 +75,21 @@ fn resident_index_keys_and_subcluster_vbn_units_are_explicit() {
 #[test]
 fn index_bounds_child_flags_key_lengths_and_terminal_are_mandatory() {
     let value = root();
-    for end in 0..value.len() { assert!(NtfsIndexRoot::parse(&value[..end], 512).is_err()); }
-    for (at, byte) in [(4, 0), (12, 0), (16, 8), (20, 16), (28, 1),
-                       (40, 0), (40, 17), (42, 255), (44, 1), (44, 4)] {
+    for end in 0..value.len() {
+        assert!(NtfsIndexRoot::parse(&value[..end], 512).is_err());
+    }
+    for (at, byte) in [
+        (4, 0),
+        (12, 0),
+        (16, 8),
+        (20, 16),
+        (28, 1),
+        (40, 0),
+        (40, 17),
+        (42, 255),
+        (44, 1),
+        (44, 4),
+    ] {
         let mut bad = value.clone();
         bad[at] = byte;
         assert!(NtfsIndexRoot::parse(&bad, 512).is_err(), "offset {at}");

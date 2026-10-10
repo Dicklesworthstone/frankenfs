@@ -61,12 +61,23 @@ fn boot_validates_addressable_range_and_both_record_size_encodings() {
     assert_eq!(g.volume_bytes(), 8191 * 512);
     assert!(g.cluster_offset(1023).is_err());
     assert!(NtfsGeometry::parse(&b, 8191 * 512 - 1).is_err());
-    for size in 0..512 { assert!(NtfsGeometry::parse(&b[..size], u64::MAX).is_err()); }
+    for size in 0..512 {
+        assert!(NtfsGeometry::parse(&b[..size], u64::MAX).is_err());
+    }
 }
 
 #[test]
 fn boot_rejects_aliases_zero_divisors_and_overflow_encodings() {
-    for (at, value) in [(13, 0), (13, 3), (14, 1), (64, 0), (64, 0x80), (64, 0xFF), (68, 0), (510, 0)] {
+    for (at, value) in [
+        (13, 0),
+        (13, 3),
+        (14, 1),
+        (64, 0),
+        (64, 0x80),
+        (64, 0xFF),
+        (68, 0),
+        (510, 0),
+    ] {
         let mut b = boot();
         b[at] = value;
         assert!(NtfsGeometry::parse(&b, u64::MAX).is_err(), "offset {at}");
@@ -90,7 +101,9 @@ fn all_trailers_are_checked_and_input_is_never_partially_restored() {
     assert!(restore_record(&torn, b"FILE").is_err());
     assert_eq!(torn, before);
     assert!(restore_record(&r, b"INDX").is_err());
-    for size in 0..r.len() { assert!(NtfsFileRecord::parse(&r[..size]).is_err()); }
+    for size in 0..r.len() {
+        assert!(NtfsFileRecord::parse(&r[..size]).is_err());
+    }
     for (at, value) in [(4, 49), (4, 0), (6, 2), (6, 4)] {
         let mut bad = r.clone();
         bad[at] = value;
@@ -104,10 +117,14 @@ fn update_sequence_stride_is_512_not_the_bpb_sector_size() {
     raw[..4].copy_from_slice(b"INDX");
     raw[4..6].copy_from_slice(&40_u16.to_le_bytes());
     raw[6..8].copy_from_slice(&9_u16.to_le_bytes());
-    for part in 1..=8 { raw[part * 512 - 2] = part as u8; }
+    for part in 1..=8 {
+        raw[part * 512 - 2] = part as u8;
+    }
     protect(&mut raw);
     let fixed = restore_record(&raw, b"INDX").unwrap();
-    for part in 1..=8 { assert_eq!(fixed[part * 512 - 2], part as u8); }
+    for part in 1..=8 {
+        assert_eq!(fixed[part * 512 - 2], part as u8);
+    }
     raw[1534] ^= 1;
     assert!(restore_record(&raw, b"INDX").is_err());
 }
@@ -120,16 +137,32 @@ fn file_record_exposes_resident_data_and_native_reference_identity() {
     assert_eq!((r.number, r.sequence), (24, 7));
     let attributes = r.attributes().unwrap();
     assert_eq!(attributes.len(), 1);
-    assert!(attributes[0].name.is_empty());
-    let NtfsValue::Resident(value) = &attributes[0].value else { panic!("resident"); };
+    assert_eq!(attributes[0].name, [] as [u16; 0]);
+    let NtfsValue::Resident(value) = &attributes[0].value else {
+        panic!("resident");
+    };
     assert_eq!(*value, b"abc");
-    assert_eq!(NtfsReference::decode((7_u64 << 48) | 24), NtfsReference { record: 24, sequence: 7 });
+    assert_eq!(
+        NtfsReference::decode((7_u64 << 48) | 0x0018),
+        NtfsReference {
+            record: 24,
+            sequence: 7
+        }
+    );
 }
 
 #[test]
 fn attributes_cannot_overlap_headers_escape_used_bytes_or_hide_bad_tails() {
-    for (at, value) in [(20, 48), (24, 88), (56 + 4, 0), (56 + 4, 31), (56 + 8, 2),
-                        (56 + 16, 200), (56 + 20, 16), (88, 0)] {
+    for (at, value) in [
+        (20, 48),
+        (24, 88),
+        (56 + 4, 0),
+        (56 + 4, 31),
+        (56 + 8, 2),
+        (56 + 16, 200),
+        (56 + 20, 16),
+        (88, 0),
+    ] {
         let mut r = record();
         r[at] = value;
         assert!(NtfsFileRecord::parse(&r).is_err(), "offset {at}");
@@ -144,19 +177,50 @@ fn attributes_cannot_overlap_headers_escape_used_bytes_or_hide_bad_tails() {
 fn mapping_pairs_handle_backward_deltas_and_sparse_runs_without_resetting_lcn() {
     let pairs = [0x11, 2, 100, 0x01, 3, 0x11, 1, 0xF6, 0];
     let runs = decode_mapping_pairs(&pairs, 0, 5, 1000).unwrap();
-    assert_eq!(runs, [NtfsRun { vcn: 0, clusters: 2, lcn: Some(100) },
-                     NtfsRun { vcn: 2, clusters: 3, lcn: None },
-                     NtfsRun { vcn: 5, clusters: 1, lcn: Some(90) }]);
-    assert_eq!(decode_mapping_pairs(&[0x11, 2, 10, 0], 8, 9, 100).unwrap()[0].vcn, 8);
-    assert!(decode_mapping_pairs(&[0], 0, u64::MAX, 100).unwrap().is_empty());
+    assert_eq!(
+        runs,
+        [
+            NtfsRun {
+                vcn: 0,
+                clusters: 2,
+                lcn: Some(100)
+            },
+            NtfsRun {
+                vcn: 2,
+                clusters: 3,
+                lcn: None
+            },
+            NtfsRun {
+                vcn: 5,
+                clusters: 1,
+                lcn: Some(90)
+            }
+        ]
+    );
+    assert_eq!(
+        decode_mapping_pairs(&[0x11, 2, 10, 0], 8, 9, 100).unwrap()[0].vcn,
+        8
+    );
+    assert_eq!(
+        decode_mapping_pairs(&[0], 0, u64::MAX, 100).unwrap(),
+        [] as [NtfsRun; 0]
+    );
 }
 
 #[test]
 fn mapping_pairs_refuse_truncation_zero_runs_bad_widths_and_incomplete_coverage() {
     let good = [0x11, 2, 10, 0];
-    for end in 0..good.len() { assert!(decode_mapping_pairs(&good[..end], 0, 1, 100).is_err()); }
-    for pairs in [&[0x11, 0, 10, 0][..], &[0x10, 1, 0], &[0x91, 1, 0],
-                  &[0x11, 3, 10, 0], &[0x11, 1, 10, 0], &[0x11, 2, 0xFF, 0]] {
+    for end in 0..good.len() {
+        assert!(decode_mapping_pairs(&good[..end], 0, 1, 100).is_err());
+    }
+    for pairs in [
+        &[0x11, 0, 10, 0][..],
+        &[0x10, 1, 0],
+        &[0x91, 1, 0],
+        &[0x11, 3, 10, 0],
+        &[0x11, 1, 10, 0],
+        &[0x11, 2, 0xFF, 0],
+    ] {
         assert!(decode_mapping_pairs(pairs, 0, 1, 100).is_err());
     }
     assert!(decode_mapping_pairs(&good, 0, 1, 11).is_err());
@@ -198,9 +262,15 @@ fn nonresident_names_mappings_and_initialized_bounds_are_validated() {
     let file = NtfsFileRecord::parse(&r).unwrap();
     let attrs = file.attributes().unwrap();
     assert_eq!(attrs[0].name, [97, 100, 115]);
-    let NtfsValue::NonResident(value) = &attrs[0].value else { panic!("nonresident"); };
+    let NtfsValue::NonResident(value) = &attrs[0].value else {
+        panic!("nonresident");
+    };
     assert_eq!(value.initialized_bytes, 2);
-    assert_eq!(decode_mapping_pairs(value.mapping_pairs, value.first_vcn, value.last_vcn, 100).unwrap()[0].lcn, Some(10));
+    assert_eq!(
+        decode_mapping_pairs(value.mapping_pairs, value.first_vcn, value.last_vcn, 100).unwrap()[0]
+            .lcn,
+        Some(10)
+    );
     r[56 + 56] = 4;
     assert!(NtfsFileRecord::parse(&r).is_err());
 }
