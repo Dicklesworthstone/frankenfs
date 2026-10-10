@@ -2,8 +2,9 @@
 
 `ffs-ntfs` implements native offline image reads using `ffs-ondisk::ntfs` and
 `ffs-block::ByteDevice`. It does not delegate data reads to ntfs-3g, a kernel
-filesystem or a mounted image. This is a companion binary, not yet an `OpenFs`
-backend, FUSE mount, or writable filesystem. It traverses native directory
+filesystem or a mounted image. This companion binary includes a restricted
+read-only `FsOps`/FUSE mount, but is not yet an `OpenFs` backend or writable
+filesystem. It traverses native directory
 indexes and resolves paths using the image's own UpCase table. Ordinary native
 LZNT1-compressed nonresident DATA uses the same numeric and path read commands.
 
@@ -24,6 +25,10 @@ ffs-ntfs cat volume.img 24 --offline-image > extracted.bin
 ffs-ntfs cat volume.img 24 --offline-image --stream note > alternate.bin
 ffs-ntfs cat volume.img 24 --offline-image --sequence 7 --start 507 --bytes 1031
 ffs-ntfs cat disk.img 24 --offline-image --offset 1048576 --length 67108864
+
+# Existing empty mountpoint; backing image must stay offline and immutable.
+ffs-ntfs mount volume.img /mnt/ntfs --offline-image --uid 1000 --gid 1000
+fusermount3 -u /mnt/ntfs
 ```
 
 Record numbers are MFT identities, not byte offsets. `record` reports the
@@ -146,7 +151,54 @@ with at most 256 path components. The entire directory and referenced FILE_NAME
 identities must be readable; a corrupt or unsupported target can cause the
 listing/lookup to fail rather than publish a partially validated result. Index
 block geometry must match the boot profile. Sub-cluster index blocks use 512-byte
-VBN units even on a larger-sector volume. Parent traversal (`..`) is not admitted.
+VBN units even on a larger-sector volume. Parent traversal (`..`) is not admitted
+by CLI image paths; the mount resolves parents from native FILE_NAME references.
+
+## Read-only native mount
+
+`ffs-ntfs mount` uses the existing `ffs-fuse` transport. FUSE node 1 maps to the
+native root (MFT record 5); other nodes encode the record number and sequence.
+DOS aliases and hard links share one inode. Stale or noncanonical references,
+directory cycles and inconsistent native parents are errors, not alternate roots.
+
+The adapter provides lookup, getattr, paginated readdir, regular-file reads,
+read-only open admission, statfs and non-writing synchronization. Unnamed DATA
+uses the same resident, fragmented, sparse, compressed and extension-aware reader
+as CLI extraction. Named streams remain available through CLI `--stream`, not an
+invented mounted `file:stream` namespace. SEEK_DATA/SEEK_HOLE use the conservative
+projection of data before EOF and a hole at EOF, including compressed files.
+
+STANDARD_INFORMATION supplies all four UTC timestamps at 100-nanosecond
+precision, including supported times before the Unix epoch. File size comes from
+the validated unnamed stream, allocation from physical clusters, and generation
+from the native sequence. Resident DATA has no separately allocated data blocks.
+Directory size zero is a host projection; external index allocation is counted.
+Capacity and free-object counts come from the native volume and MFT bitmaps,
+excluding padding bits and refusing uninitialized, sparse or compressed bitmaps.
+
+Ownership and modes are deliberately synthetic: configured uid/gid, 0555
+directories and 0444 regular files. This is NOT native SID/DACL enforcement.
+`allow_other` is disabled. Reparse and EFS objects are refused rather than exposed
+as ordinary plaintext files. Unrepresentable UTF-16 or names beyond the host's
+255-byte limit cause refusal, not lossy aliases. Use the numeric/JSON CLI for
+forensic metadata that the mounted namespace cannot represent.
+
+Only fully validated immutable metadata is cached. Exact and native-UpCase lookup
+indexes use binary search; directory continuation clones at most 256 entries
+from a retained snapshot rather than re-reading the tree for each page. Caches
+retain at most 4,096 inode attributes, eight stream maps and 64 directory snapshots.
+Directory rows/name-index payloads have a combined 16 MiB retention limit;
+oversized snapshots are served without retention. This is not a total-process
+memory limit: in-flight requests and map/Arc bookkeeping also consume memory.
+Stream maps retain the reader's existing per-stream run limits. Cache hits check
+cancellation; device reads and parsing never occur under the cache mutex. Data
+I/O and its errors are not replaced by cached success. No speedup is claimed
+without measured execution.
+
+Mounting does not establish that an image is quiescent. Shared advisory locks do
+not exclude a kernel mount or an unrelated writer. The image must remain
+unchanged for the whole mount lifetime; cached metadata is not live coherence.
+The mounted implementation has not yet been executed in the authoring environment.
 
 ## Admission limits and exclusions
 
@@ -172,7 +224,8 @@ A zero volume-flags field and matching record-zero mirror are **not** proof of
 a clean $LogFile, absence of hibernation, complete MFTMirr consistency, or global
 allocation/index integrity. The caller must supply a quiescent image. This is
 not a recovery or filesystem-check tool. Reparse handling, compressed writes,
-mounted operations, native security projection and NTFS mutation remain separate work.
+native security enforcement, generic OpenFs routing and NTFS mutation remain
+separate work. The restricted mount above is not full NTFS qualification.
 
 ## Validation
 
@@ -181,6 +234,7 @@ rch exec -- cargo test -p ffs-ondisk ntfs
 rch exec -- cargo test -p ffs-ondisk lznt1
 rch exec -- cargo test -p ffs-cli --bin ffs-ntfs
 python3 scripts/verify_ntfs_read.py --binary target/debug/ffs-ntfs
+python3 scripts/verify_ntfs_mount.py --binary target/debug/ffs-ntfs
 ```
 
 The runner creates a new scratch image with mkntfs, seeds it with ntfscp, gets
@@ -225,3 +279,21 @@ regressions add malformed tokens, displacement-width boundaries, raw/sparse/pack
 unit transitions, fragmented and split-attribute units, initialized-length refusal,
 large sparse files, raw final partial units, and full 64 KiB output units.
 Existing boot, stream, namespace, and read-only failure tests remain intact.
+
+The mount runner requires real Linux FUSE and creates 320 native files with
+mkntfs/ntfscp, comparing every seeded file independently with ntfscat. It checks
+repeated mounted directory enumeration, attributes, whole-file hashes, unaligned
+reads, EOF, native statfs and EROFS write-open refusal. It repeats the workload
+on an explicitly selected volume surrounded by partition sentinels, and checks
+whole-image hashes after unmount. Mounted operations run in a timed child; logs,
+images and failures are retained. Missing prerequisites fail, not skip. This
+runner exercises ordinary native files, not compressed or extension fixtures;
+those remain separate workloads in the existing reader runner and Rust tests.
+
+Mount delivery evidence: Python syntax compilation and mount-runner `--help`
+passed. Rust compilation/tests, rustfmt/Clippy and real/native mounted runs were
+not executed here because the required tools and FUSE are absent. Eleven FsOps
+regressions plus CLI mount parsing are added, not claimed passed. They cover
+record/sequence identities, hard links/aliases, parent lookup, native names and
+times, fragmented/compressed reads, EOF, directory cookies, bitmap padding,
+write rejection, cancellation, cache reuse/eviction and root-alias refusal.

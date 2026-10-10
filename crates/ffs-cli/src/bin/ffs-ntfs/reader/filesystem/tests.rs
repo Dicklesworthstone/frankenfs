@@ -315,3 +315,96 @@ fn filetime_conversion_is_exact_on_both_sides_of_unix_epoch() {
     assert_eq!(UNIX_EPOCH.duration_since(filetime(UNIX_FILETIME - 1).unwrap()).unwrap().as_nanos(), 100);
     assert!(filetime(u64::MAX).is_err());
 }
+
+#[test]
+fn warm_lookup_readdir_and_statfs_do_not_rescan_native_metadata() {
+    let cx = Cx::for_testing();
+    let reads: Reads = Arc::default();
+    let fs = open(image(), Arc::clone(&reads), None).unwrap();
+    let mut scope = RequestScope::empty();
+    let file = fs.lookup(&cx, &mut scope, ROOT, OsStr::new("hello.txt")).unwrap();
+    fs.statfs(&cx, &mut scope, ROOT).unwrap();
+    fs.open(&cx, &mut scope, file.ino, libc::O_RDONLY).unwrap();
+    reads.lock().unwrap().clear();
+    for _ in 0..10 {
+        assert_eq!(fs.lookup(&cx, &mut scope, ROOT, OsStr::new("HELLO.TXT")).unwrap().ino, file.ino);
+        assert_eq!(fs.lookup(&cx, &mut scope, ROOT, OsStr::new("hello~1.txt")).unwrap().ino, file.ino);
+        assert_eq!(fs.readdir(&cx, &mut scope, ROOT, 2).unwrap().len(), 6);
+        assert_eq!(fs.read(&cx, &mut scope, file.ino, 0, 50).unwrap(), b"hello");
+        assert_eq!(fs.statfs(&cx, &mut scope, ROOT).unwrap().blocks_free, 1016);
+    }
+    assert!(reads.lock().unwrap().is_empty());
+    let cache = fs.cache().unwrap();
+    assert!(cache.directory_bytes <= DIRECTORY_CACHE_BYTES);
+    assert!(cache.directories.len() <= MAX_CACHED_DIRECTORIES);
+    assert!(cache.attributes.len() <= MAX_CACHED_ATTRIBUTES);
+    assert!(cache.streams.len() <= MAX_CACHED_STREAMS);
+}
+
+#[test]
+fn cached_streams_keep_data_io_and_cancellation_live() {
+    let cx = Cx::for_testing();
+    let reads: Reads = Arc::default();
+    let fs = open(image(), Arc::clone(&reads), Some((BASE + 590 * 512) as u64)).unwrap();
+    let mut scope = RequestScope::empty();
+    let dir = fs.lookup(&cx, &mut scope, ROOT, OsStr::new("Subdir")).unwrap();
+    let file = fs.lookup(&cx, &mut scope, dir.ino, OsStr::new("payload.bin")).unwrap();
+    fs.open(&cx, &mut scope, file.ino, libc::O_RDONLY).unwrap();
+    reads.lock().unwrap().clear();
+    for _ in 0..2 {
+        assert!(matches!(fs.read(&cx, &mut scope, file.ino, 510, 4), Err(FfsError::Cancelled)));
+    }
+    assert_eq!(*reads.lock().unwrap(), [
+        ((BASE + 600 * 512 + 510) as u64, 2), ((BASE + 590 * 512) as u64, 2),
+        ((BASE + 600 * 512 + 510) as u64, 2), ((BASE + 590 * 512) as u64, 2),
+    ]);
+}
+
+#[test]
+fn root_aliases_and_inconsistent_directory_parents_refuse_mounting() {
+    let mut bytes = image();
+    put(&mut bytes, 5, &record(5, true, 1, &[standard(),
+        index(&[(5, "LOOP", 1)], 5), resident(0x30, 2, "", &filename(5, "LOOP", 1))]));
+    assert!(open(bytes, Arc::default(), None).is_err());
+    let mut bytes = image();
+    put(&mut bytes, 27, &record(27, true, 1, &[standard(), index(&[], 27),
+        resident(0x30, 2, "", &filename(5, "Subdir", 1)),
+        resident(0x30, 3, "", &filename(27, "LOOP", 1))]));
+    assert!(open(bytes, Arc::default(), None).is_err());
+}
+
+#[test]
+fn a_sparse_bitmap_cannot_turn_missing_allocation_metadata_into_free_space() {
+    let cx = Cx::for_testing();
+    let fs = open(image(), Arc::default(), None).unwrap();
+    let bitmap = Stream {
+        storage: Storage::Mapped(vec![crate::reader::NtfsRun { vcn: 0, clusters: 1, lcn: None }]),
+        size: 512, initialized: 512, allocated: 0,
+    };
+    assert!(matches!(fs.count_free(&cx, &bitmap, 8), Err(FfsError::Corruption { .. })));
+}
+
+#[test]
+fn stream_eviction_keeps_the_limit_and_reloads_exact_data() {
+    let cx = Cx::for_testing();
+    let mut bytes = image();
+    for number in 30..40 {
+        put(&mut bytes, number, &record(number, false, 1, &[standard(),
+            resident(DATA, 0, "", &number.to_le_bytes())]));
+    }
+    let fs = open(bytes, Arc::default(), None).unwrap();
+    let mut scope = RequestScope::empty();
+    for number in 30..40 {
+        let ino = fs.inode(NtfsReference { record: number, sequence: SEQUENCE }).unwrap();
+        fs.open(&cx, &mut scope, ino, libc::O_RDONLY).unwrap();
+        assert_eq!(fs.read(&cx, &mut scope, ino, 0, 4).unwrap(), (number as u32).to_le_bytes());
+    }
+    let first = fs.inode(NtfsReference { record: 30, sequence: SEQUENCE }).unwrap();
+    {
+        let cache = fs.cache().unwrap();
+        assert_eq!(cache.streams.len(), MAX_CACHED_STREAMS);
+        assert!(!cache.streams.contains_key(&first));
+    }
+    assert_eq!(fs.read(&cx, &mut scope, first, 0, 4).unwrap(), 30_u32.to_le_bytes());
+    assert_eq!(fs.cache().unwrap().streams.len(), MAX_CACHED_STREAMS);
+}

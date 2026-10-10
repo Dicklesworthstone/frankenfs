@@ -10,6 +10,7 @@ use ffs_ondisk::ntfs::index::NtfsFileName;
 use ffs_types::InodeNumber;
 use std::collections::{BTreeMap, BTreeSet};
 use std::ffi::OsStr;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const ROOT: InodeNumber = InodeNumber(1);
@@ -17,6 +18,37 @@ const I30: &[u16] = &[36, 73, 51, 48];
 const PAGE_ENTRIES: usize = 256;
 const UNIX_FILETIME: u64 = 116_444_736_000_000_000;
 const TICKS_PER_SECOND: u64 = 10_000_000;
+const MAX_CACHED_ATTRIBUTES: usize = 4096;
+const MAX_CACHED_STREAMS: usize = 8;
+const MAX_CACHED_DIRECTORIES: usize = 64;
+const DIRECTORY_CACHE_BYTES: usize = 16 * 1024 * 1024;
+
+struct DirectorySnapshot {
+    rows: Vec<DirEntry>,
+    exact: Vec<(Vec<u16>, InodeNumber)>,
+    folded: Vec<(Vec<u16>, Option<InodeNumber>)>,
+}
+
+impl DirectorySnapshot {
+    fn retained_bytes(&self) -> usize {
+        std::mem::size_of::<Self>()
+            + self.rows.capacity() * std::mem::size_of::<DirEntry>()
+            + self.rows.iter().map(|entry| entry.name.capacity()).sum::<usize>()
+            + self.exact.capacity() * std::mem::size_of::<(Vec<u16>, InodeNumber)>()
+            + self.exact.iter().map(|(name, _)| name.capacity() * 2).sum::<usize>()
+            + self.folded.capacity() * std::mem::size_of::<(Vec<u16>, Option<InodeNumber>)>()
+            + self.folded.iter().map(|(name, _)| name.capacity() * 2).sum::<usize>()
+    }
+}
+
+#[derive(Default)]
+struct Cache {
+    attributes: BTreeMap<InodeNumber, InodeAttr>,
+    streams: BTreeMap<InodeNumber, Arc<Stream>>,
+    directories: BTreeMap<InodeNumber, Arc<DirectorySnapshot>>,
+    directory_bytes: usize,
+    statistics: Option<FsStat>,
+}
 
 pub struct NtfsFs {
     volume: NtfsVolume,
@@ -24,6 +56,7 @@ pub struct NtfsFs {
     upcase: Vec<u16>,
     uid: u32,
     gid: u32,
+    cache: Mutex<Cache>,
 }
 
 impl NtfsFs {
@@ -50,11 +83,16 @@ impl NtfsFs {
                 return Err(corrupt(0, "invalid NTFS UpCase ASCII mapping"));
             }
         }
-        let fs = Self { root: reference(&record), volume, upcase, uid, gid };
+        let fs = Self { root: reference(&record), volume, upcase, uid, gid,
+            cache: Mutex::new(Cache::default()) };
         fs.describe(cx, ROOT)?;
         fs.directory(cx, ROOT)?;
         checkpoint(cx)?;
         Ok(fs)
+    }
+
+    fn cache(&self) -> Result<MutexGuard<'_, Cache>> {
+        self.cache.lock().map_err(|_| FfsError::Io(std::io::Error::other("NTFS mount cache poisoned")))
     }
 
     fn inode(&self, reference: NtfsReference) -> Result<InodeNumber> {
@@ -123,6 +161,25 @@ impl NtfsFs {
     }
 
     fn describe(&self, cx: &Cx, ino: InodeNumber) -> Result<InodeAttr> {
+        checkpoint(cx)?;
+        let hit = self.cache()?.attributes.get(&ino).cloned();
+        if let Some(hit) = hit {
+            checkpoint(cx)?;
+            return Ok(hit);
+        }
+        let attr = self.describe_uncached(cx, ino)?;
+        checkpoint(cx)?;
+        let mut cache = self.cache()?;
+        if cache.attributes.len() >= MAX_CACHED_ATTRIBUTES {
+            cache.attributes.pop_first();
+        }
+        cache.attributes.insert(ino, attr.clone());
+        drop(cache);
+        checkpoint(cx)?;
+        Ok(attr)
+    }
+
+    fn describe_uncached(&self, cx: &Cx, ino: InodeNumber) -> Result<InodeAttr> {
         let record = self.record(cx, ino)?;
         let catalog = self.volume.attributes(cx, &record)?;
         let all = catalog.all()?;
@@ -165,7 +222,39 @@ impl NtfsFs {
         })
     }
 
-    fn directory(&self, cx: &Cx, ino: InodeNumber) -> Result<Vec<DirEntry>> {
+    fn directory(&self, cx: &Cx, ino: InodeNumber) -> Result<Arc<DirectorySnapshot>> {
+        checkpoint(cx)?;
+        let hit = self.cache()?.directories.get(&ino).cloned();
+        if let Some(hit) = hit {
+            checkpoint(cx)?;
+            return Ok(hit);
+        }
+        // Parser/device work is outside the cache lock. Only a fully validated
+        // snapshot can be published; errors and partial trees are never cached.
+        let snapshot = Arc::new(self.directory_uncached(cx, ino)?);
+        let bytes = snapshot.retained_bytes();
+        checkpoint(cx)?;
+        if bytes <= DIRECTORY_CACHE_BYTES {
+            let mut cache = self.cache()?;
+            if let Some(existing) = cache.directories.get(&ino).cloned() {
+                drop(cache);
+                checkpoint(cx)?;
+                return Ok(existing);
+            }
+            while cache.directory_bytes + bytes > DIRECTORY_CACHE_BYTES
+                || cache.directories.len() >= MAX_CACHED_DIRECTORIES
+            {
+                let Some((_, old)) = cache.directories.pop_first() else { break; };
+                cache.directory_bytes -= old.retained_bytes();
+            }
+            cache.directory_bytes += bytes;
+            cache.directories.insert(ino, Arc::clone(&snapshot));
+        }
+        checkpoint(cx)?;
+        Ok(snapshot)
+    }
+
+    fn directory_uncached(&self, cx: &Cx, ino: InodeNumber) -> Result<DirectorySnapshot> {
         let record = self.record(cx, ino)?;
         let parent = self.parent(cx, &record)?;
         let native = self.volume.list_directory(cx, &record)?;
@@ -174,17 +263,29 @@ impl NtfsFs {
             DirEntry { ino: parent, offset: 2, kind: FileType::Directory, name: b"..".to_vec() },
         ];
         let mut names = BTreeMap::new();
+        let mut exact = BTreeMap::new();
+        let mut folded = BTreeMap::new();
         for entry in native {
             checkpoint(cx)?;
             let name = String::from_utf16(&entry.filename.name)
                 .map_err(|_| unsupported("NTFS name cannot be represented losslessly as UTF-8"))?;
             if name.len() > 255 { return Err(FfsError::NameTooLong); }
             let target = self.inode(entry.reference)?;
+            exact.insert(entry.filename.name.clone(), target);
+            if entry.filename.namespace != 0 {
+                let key: Vec<_> = entry.filename.name.iter()
+                    .map(|unit| self.upcase[usize::from(*unit)]).collect();
+                let value = folded.entry(key).or_insert(Some(target));
+                if *value != Some(target) { *value = None; }
+            }
             if let Some(old) = names.insert(name.clone(), target) {
                 if old != target { return Err(corrupt(0, "NTFS mount name collision")); }
                 continue;
             }
             if entry.directory {
+                if target == ino || target == ROOT {
+                    return Err(corrupt(0, "NTFS directory entry aliases itself or the mount root"));
+                }
                 let child = self.volume.record(cx, entry.reference.record, Some(entry.reference.sequence))?;
                 if self.parent(cx, &child)? != ino {
                     return Err(corrupt(0, "NTFS directory parent differs from its listing"));
@@ -195,10 +296,17 @@ impl NtfsFs {
                 name: name.into_bytes() });
         }
         checkpoint(cx)?;
-        Ok(entries)
+        Ok(DirectorySnapshot { rows: entries, exact: exact.into_iter().collect(),
+            folded: folded.into_iter().collect() })
     }
 
-    fn stream(&self, cx: &Cx, ino: InodeNumber) -> Result<Stream> {
+    fn stream(&self, cx: &Cx, ino: InodeNumber) -> Result<Arc<Stream>> {
+        checkpoint(cx)?;
+        let hit = self.cache()?.streams.get(&ino).cloned();
+        if let Some(hit) = hit {
+            checkpoint(cx)?;
+            return Ok(hit);
+        }
         // A caller need not have issued LOOKUP first. Enforce metadata-side
         // reparse/EFS admission on OPEN and READ as well as GETATTR.
         self.describe(cx, ino)?;
@@ -208,7 +316,17 @@ impl NtfsFs {
         if catalog.all()?.iter().any(|attr| attr.kind == 0xC0) {
             return Err(unsupported("NTFS reparse data is not mounted"));
         }
-        let stream = catalog.select(&self.volume.geometry, DATA, &[])?;
+        let stream = Arc::new(catalog.select(&self.volume.geometry, DATA, &[])?);
+        checkpoint(cx)?;
+        let mut cache = self.cache()?;
+        if let Some(existing) = cache.streams.get(&ino).cloned() {
+            drop(cache);
+            checkpoint(cx)?;
+            return Ok(existing);
+        }
+        if cache.streams.len() >= MAX_CACHED_STREAMS { cache.streams.pop_first(); }
+        cache.streams.insert(ino, Arc::clone(&stream));
+        drop(cache);
         checkpoint(cx)?;
         Ok(stream)
     }
@@ -254,39 +372,31 @@ impl FsOps for NtfsFs {
     }
 
     fn lookup(&self, cx: &Cx, _scope: &mut RequestScope, parent: InodeNumber, name: &OsStr) -> Result<InodeAttr> {
-        let record = self.record(cx, parent)?;
-        if !record.is_directory() { return Err(FfsError::NotDirectory); }
+        if self.describe(cx, parent)?.kind != FileType::Directory { return Err(FfsError::NotDirectory); }
         if name == OsStr::new(".") { return self.describe(cx, parent); }
-        if name == OsStr::new("..") { return self.describe(cx, self.parent(cx, &record)?); }
+        let directory = self.directory(cx, parent)?;
+        if name == OsStr::new("..") { return self.describe(cx, directory.rows[1].ino); }
         let name = name.to_str().ok_or_else(|| unsupported("NTFS lookup requires lossless UTF-8"))?;
         if name.is_empty() || name.contains(['/', '\\', '\0']) { return Err(FfsError::Format("invalid NTFS path component".into())); }
         if name.len() > 255 { return Err(FfsError::NameTooLong); }
         let units: Vec<u16> = name.encode_utf16().collect();
-        let entries = self.volume.list_directory(cx, &record)?;
-        let exact = entries.iter().any(|entry| entry.filename.name == units);
-        let mut found = None;
-        for entry in entries {
-            checkpoint(cx)?;
-            let matches = if exact { entry.filename.name == units } else {
-                entry.filename.namespace != 0 && entry.filename.name.len() == units.len()
-                    && entry.filename.name.iter().zip(&units)
-                        .all(|(a, b)| self.upcase[usize::from(*a)] == self.upcase[usize::from(*b)])
-            };
-            if matches {
-                if found.is_some_and(|old| old != entry.reference) {
-                    return Err(corrupt(0, "ambiguous NTFS folded mount name"));
-                }
-                found = Some(entry.reference);
-            }
-        }
-        let found = found.ok_or_else(|| FfsError::NotFound(format!("NTFS name {name}")))?;
-        self.describe(cx, self.inode(found)?)
+        let target = if let Ok(index) = directory.exact.binary_search_by(|(key, _)| key.cmp(&units)) {
+            directory.exact[index].1
+        } else {
+            let folded: Vec<_> = units.iter().map(|unit| self.upcase[usize::from(*unit)]).collect();
+            let index = directory.folded.binary_search_by(|(key, _)| key.cmp(&folded))
+                .map_err(|_| FfsError::NotFound(format!("NTFS name {name}")))?;
+            directory.folded[index].1.ok_or_else(|| corrupt(0, "ambiguous NTFS folded mount name"))?
+        };
+        self.describe(cx, target)
     }
 
     fn readdir(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber, offset: u64) -> Result<ReaddirPage> {
-        let entries = self.directory(cx, ino)?;
+        let snapshot = self.directory(cx, ino)?;
+        let entries = &snapshot.rows;
         let end = entries.len() as u64;
-        let page = entries.into_iter().filter(|entry| entry.offset > offset).take(PAGE_ENTRIES).collect();
+        let start = entries.partition_point(|entry| entry.offset <= offset);
+        let page = entries[start..entries.len().min(start + PAGE_ENTRIES)].to_vec();
         checkpoint(cx)?;
         Ok(ReaddirPage::new(page).with_end_cookie(Some(end)))
     }
@@ -311,7 +421,12 @@ impl FsOps for NtfsFs {
     }
 
     fn statfs(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber) -> Result<FsStat> {
-        self.record(cx, ino)?;
+        self.describe(cx, ino)?;
+        let hit = self.cache()?.statistics.clone();
+        if let Some(hit) = hit {
+            checkpoint(cx)?;
+            return Ok(hit);
+        }
         let record = self.volume.record(cx, 6, None)?;
         let bitmap = self.volume.select_stream(cx, &record, DATA, &[])?;
         let blocks = self.volume.geometry.cluster_count();
@@ -320,8 +435,12 @@ impl FsOps for NtfsFs {
         let bitmap = self.volume.select_stream(cx, &record, 0xB0, &[])?;
         let files = self.volume.record_count();
         let files_free = self.count_free(cx, &bitmap, files)?;
-        Ok(FsStat { blocks, blocks_free: free, blocks_available: free, files, files_free,
-            block_size: self.volume.geometry.cluster_bytes(), fragment_size: self.volume.geometry.cluster_bytes(), name_max: 255 })
+        let statistics = FsStat { blocks, blocks_free: free, blocks_available: free, files, files_free,
+            block_size: self.volume.geometry.cluster_bytes(), fragment_size: self.volume.geometry.cluster_bytes(), name_max: 255 };
+        checkpoint(cx)?;
+        self.cache()?.statistics = Some(statistics.clone());
+        checkpoint(cx)?;
+        Ok(statistics)
     }
 
     fn fsync(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber, _fh: u64, _datasync: bool) -> Result<()> {
