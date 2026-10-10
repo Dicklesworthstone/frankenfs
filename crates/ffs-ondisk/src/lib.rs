@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! On-disk format parsing for ext4 and btrfs structures.
+//! On-disk format parsing for ext4, btrfs, and FAT16/FAT32 structures.
 //!
 //! Pure parsing crate — no I/O, no side effects. Parses byte slices into
 //! typed Rust structures representing ext4 superblocks, group descriptors,
@@ -10,6 +10,7 @@
 pub mod btrfs;
 pub mod crc_incremental;
 pub mod ext4;
+pub mod fat;
 
 pub use btrfs::{
     BTRFS_CSUM_FIELD_SIZE, BtrfsChunkEntry, BtrfsCompatRoFeatures, BtrfsDevItem, BtrfsHeader,
