@@ -21,20 +21,21 @@ impl NtfsVolume {
     pub fn list_directory(&self, cx: &Cx, record: &NtfsFileRecord) -> Result<Vec<DirectoryEntry>> {
         checkpoint(cx)?;
         if !record.is_directory() { return Err(FfsError::NotDirectory); }
-        reject_reparse(record)?;
-        let root = select_stream(&self.geometry, record, 0x90, I30)?;
+        let catalog = self.attributes(cx, record)?;
+        let attributes = catalog.all()?;
+        reject_reparse(&attributes)?;
+        let root = catalog.select(&self.geometry, 0x90, I30)?;
         if !root.resident() { return Err(corrupt(0, "INDEX_ROOT must be resident")); }
         let bytes = self.read(cx, &root, 0, 65_536)?;
         let root = NtfsIndexRoot::parse(&bytes, self.geometry.cluster_bytes()).map_err(parse)?;
         if root.block_bytes != self.geometry.index_bytes() {
             return Err(unsupported("directory index block size differs from admitted boot geometry"));
         }
-        let attributes = record.attributes().map_err(parse)?;
         let external = root.entries.iter().any(|entry| entry.child_vcn.is_some())
             || attributes.iter().any(|attr| matches!(attr.kind, 0xA0 | 0xB0) && attr.name == I30);
         let (allocation, bitmap) = if external {
-            let allocation = select_stream(&self.geometry, record, 0xA0, I30)?;
-            let bitmap = select_stream(&self.geometry, record, 0xB0, I30)?;
+            let allocation = catalog.select(&self.geometry, 0xA0, I30)?;
+            let bitmap = catalog.select(&self.geometry, 0xB0, I30)?;
             if allocation.resident() || allocation.initialized != allocation.size
                 || !allocation.size.is_multiple_of(u64::from(root.block_bytes))
                 || allocation.size / u64::from(root.block_bytes) > MAX_BLOCKS as u64
@@ -73,12 +74,11 @@ impl NtfsVolume {
                 return Err(corrupt(0, "duplicate directory name points at different file records"));
             }
             let target = self.record(cx, reference.record, Some(reference.sequence))?;
-            let attributes = target.attributes().map_err(parse)?;
-            if attributes.iter().any(|attr| attr.kind == ATTRIBUTE_LIST) {
-                return Err(unsupported("directory target FILE_NAME requires ATTRIBUTE_LIST assembly"));
-            }
+            let target_catalog = self.attributes(cx, &target)?;
+            let attributes = target_catalog.all()?;
             let mut matched = false;
             for attr in attributes.iter().filter(|attr| attr.kind == 0x30) {
+                if attr.flags != 0 || !attr.name.is_empty() { return Err(corrupt(0, "invalid FILE_NAME storage or attribute name")); }
                 let NtfsValue::Resident(value) = &attr.value else { return Err(corrupt(0, "nonresident FILE_NAME")); };
                 if NtfsFileName::parse(value).map_err(parse)? == filename { matched = true; }
             }
@@ -122,12 +122,15 @@ impl NtfsVolume {
             }
             let reference = found.ok_or(FfsError::NotFound)?;
             record = self.record(cx, reference.record, Some(reference.sequence))?;
-            reject_reparse(&record)?;
+            let catalog = self.attributes(cx, &record)?;
+            reject_reparse(&catalog.all()?)?;
             if record.is_directory() && !ancestors.insert(reference.record) {
                 return Err(corrupt(0, "NTFS directory links to an ancestor"));
             }
         }
-        reject_reparse(&record)?;
+        let catalog = self.attributes(cx, &record)?;
+        reject_reparse(&catalog.all()?)?;
+        drop(catalog);
         if path.ends_with('/') && !record.is_directory() { return Err(FfsError::NotDirectory); }
         checkpoint(cx)?;
         Ok(record)
@@ -135,7 +138,7 @@ impl NtfsVolume {
 
     fn upcase(&self, cx: &Cx) -> Result<Vec<u16>> {
         let record = self.record(cx, 10, None)?;
-        let stream = select_stream(&self.geometry, &record, DATA, &[])?;
+        let stream = self.select_stream(cx, &record, DATA, &[])?;
         if stream.size != 131_072 || stream.initialized != stream.size {
             return Err(corrupt(0, "invalid NTFS UpCase table size or initialized boundary"));
         }
@@ -154,8 +157,8 @@ impl NtfsVolume {
     }
 }
 
-fn reject_reparse(record: &NtfsFileRecord) -> Result<()> {
-    if record.attributes().map_err(parse)?.iter().any(|attr| attr.kind == 0xC0) {
+fn reject_reparse(attributes: &[NtfsAttribute<'_>]) -> Result<()> {
+    if attributes.iter().any(|attr| attr.kind == 0xC0) {
         return Err(unsupported("NTFS reparse traversal is not implemented"));
     }
     Ok(())

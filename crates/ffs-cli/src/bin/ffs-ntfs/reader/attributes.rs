@@ -94,15 +94,16 @@ fn resolve_catalog<'a>(
         }
         if entry.reference.record == owner.record {
             if entry.reference != owner { return Err(corrupt(0, "stale base reference in ATTRIBUTE_LIST")); }
-        } else if !result.extensions.contains_key(&entry.reference.record) {
-            if result.extensions.len() >= MAX_EXTENSION_BYTES / geometry.record_bytes() as usize {
-                return Err(unsupported("NTFS extension-record byte budget exceeded"));
+        } else {
+            let over_budget = result.extensions.len() >= MAX_EXTENSION_BYTES / geometry.record_bytes() as usize;
+            if let std::collections::btree_map::Entry::Vacant(slot) = result.extensions.entry(entry.reference.record) {
+                if over_budget { return Err(unsupported("NTFS extension-record byte budget exceeded")); }
+                let extension = load(entry.reference)?;
+                if extension.base != owner {
+                    return Err(corrupt(0, "NTFS extension belongs to a different base or generation"));
+                }
+                slot.insert(extension);
             }
-            let extension = load(entry.reference)?;
-            if extension.base != owner {
-                return Err(corrupt(0, "NTFS extension belongs to a different base or generation"));
-            }
-            result.extensions.insert(entry.reference.record, extension);
         }
     }
     let mut matched = 0;
@@ -210,4 +211,160 @@ impl Stream {
         Ok(Self { storage: Storage::Mapped(runs), size: header.data_bytes,
             initialized: header.initialized_bytes, allocated })
     }
+}
+
+/// Discover a fragmented MFT without guessing physical record addresses. The
+/// private map may have holes while bootstrapping; a record is read only after
+/// its entire initialized byte range is covered. No partial map escapes here.
+pub(super) fn bootstrap_mft(source: &Source, geometry: &NtfsGeometry, cx: &Cx, base: &NtfsFileRecord) -> Result<Stream> {
+    validate_identity(base, 0, None)?;
+    let list = read_list(source, geometry, cx, base)?;
+    let Some(list) = list else {
+        return resolve_catalog(cx, geometry, base, None, |_| Err(FfsError::NotFound))?
+            .select(geometry, DATA, &[]);
+    };
+    let owner = NtfsReference { record: 0, sequence: base.sequence };
+    let data: Vec<_> = list.iter().filter(|entry| entry.kind == DATA && entry.name.is_empty()).collect();
+    let mut first = data.iter().filter(|entry| entry.first_vcn == 0);
+    let initial = *first.next().ok_or_else(|| corrupt(0, "MFT has no initial DATA extent"))?;
+    if first.next().is_some() || initial.reference != owner {
+        return Err(corrupt(0, "MFT initial DATA extent is ambiguous or outside record zero"));
+    }
+    let attributes = base.attributes().map_err(parse)?;
+    let initial_attr = attributes.iter().find(|attr| attr.id == initial.id)
+        .ok_or_else(|| corrupt(0, "missing MFT initial attribute instance"))?;
+    let NtfsValue::NonResident(header) = &initial_attr.value else {
+        return Err(corrupt(0, "MFT DATA must be nonresident"));
+    };
+    if header.data_bytes > header.allocated_bytes || header.initialized_bytes > header.data_bytes
+        || header.allocated_bytes > geometry.volume_bytes() || header.data_bytes > i64::MAX as u64 {
+        return Err(corrupt(0, "invalid MFT bootstrap size fields"));
+    }
+    let mut map = Stream { storage: Storage::Mapped(Vec::new()), size: header.data_bytes,
+        initialized: header.initialized_bytes, allocated: header.allocated_bytes };
+    let mut merge_work = 0;
+    install_mft_extent(geometry, &mut map, initial, initial_attr, &mut merge_work)?;
+    let Storage::Mapped(runs) = &map.storage else { return Err(corrupt(0, "invalid bootstrap storage")); };
+    if runs.first().is_none_or(|run| run.vcn != 0 || run.lcn != Some(geometry.mft_cluster())
+        || run.clusters * u64::from(geometry.cluster_bytes()) < u64::from(geometry.record_bytes())) {
+        return Err(corrupt(0, "MFT initial extent does not cover its physical bootstrap record"));
+    }
+    let mut records = BTreeMap::new();
+    let mut pending: Vec<_> = data.into_iter().filter(|entry| entry.first_vcn != 0).collect();
+    let mut probes = 0_usize;
+    while !pending.is_empty() {
+        let before = pending.len();
+        let mut blocked = Vec::new();
+        for entry in pending {
+            checkpoint(cx)?;
+            probes += 1;
+            if probes > 131_072 { return Err(unsupported("MFT bootstrap dependency work budget exceeded")); }
+            let record = if entry.reference.record == 0 {
+                if entry.reference != owner { return Err(corrupt(0, "stale MFT base reference")); }
+                base
+            } else {
+                let over_budget = records.len() >= MAX_EXTENSION_BYTES / geometry.record_bytes() as usize;
+                match records.entry(entry.reference.record) {
+                    std::collections::btree_map::Entry::Occupied(slot) => slot.into_mut(),
+                    std::collections::btree_map::Entry::Vacant(slot) => {
+                        if over_budget { return Err(unsupported("MFT extension-record byte budget exceeded")); }
+                        let Some(record) = bootstrap_record(source, geometry, cx, &map, entry.reference)? else {
+                            blocked.push(entry);
+                            continue;
+                        };
+                        if record.base != owner { return Err(corrupt(0, "MFT extension has a foreign base generation")); }
+                        slot.insert(record)
+                    }
+                }
+            };
+            validate_identity(record, entry.reference.record, Some(entry.reference.sequence))?;
+            let attributes = record.attributes().map_err(parse)?;
+            let attr = attributes.iter().find(|attr| attr.id == entry.id)
+                .ok_or_else(|| corrupt(0, "MFT list references a missing attribute instance"))?;
+            install_mft_extent(geometry, &mut map, entry, attr, &mut merge_work)?;
+        }
+        if blocked.len() == before {
+            return Err(corrupt(0, "MFT extent dependency cannot be resolved from known mappings"));
+        }
+        pending = blocked;
+    }
+    // Now validate every catalog entry, including non-DATA attributes. Reuse
+    // records already read, then assemble through the ordinary complete-stream
+    // validator. Missing extents and undeclared attributes still fail here.
+    let catalog = resolve_catalog(cx, geometry, base, Some(&list), |reference| {
+        if let Some(record) = records.remove(&reference.record) {
+            validate_identity(&record, reference.record, Some(reference.sequence))?;
+            return Ok(record);
+        }
+        bootstrap_record(source, geometry, cx, &map, reference)?
+            .ok_or_else(|| corrupt(0, "MFT catalog record lies in an unresolved mapping gap"))
+    })?;
+    let stream = catalog.select(geometry, DATA, &[])?;
+    checkpoint(cx)?;
+    Ok(stream)
+}
+
+fn install_mft_extent(
+    geometry: &NtfsGeometry,
+    map: &mut Stream,
+    entry: &NtfsAttributeListEntry,
+    attr: &NtfsAttribute<'_>,
+    work: &mut usize,
+) -> Result<()> {
+    let NtfsValue::NonResident(value) = &attr.value else { return Err(corrupt(0, "resident MFT extent")); };
+    if attr.id != entry.id || attr.kind != DATA || !attr.name.is_empty() || value.first_vcn != entry.first_vcn {
+        return Err(corrupt(0, "MFT extent disagrees with its ATTRIBUTE_LIST entry"));
+    }
+    if attr.flags != 0 || value.compression_unit != 0 { return Err(unsupported("transformed MFT DATA extent")); }
+    let decoded = decode_mapping_pairs(value.mapping_pairs, value.first_vcn,
+        value.last_vcn, geometry.cluster_count()).map_err(parse)?;
+    if decoded.is_empty() || decoded.iter().any(|run| run.lcn.is_none()) {
+        return Err(corrupt(0, "empty or sparse MFT DATA extent"));
+    }
+    let Storage::Mapped(runs) = &mut map.storage else { return Err(corrupt(0, "invalid MFT bootstrap storage")); };
+    *work += runs.len() + decoded.len();
+    if *work > 1_048_576 || runs.len() + decoded.len() > MAX_STREAM_RUNS {
+        return Err(unsupported("MFT bootstrap mapping merge budget exceeded"));
+    }
+    runs.extend(decoded);
+    runs.sort_unstable_by_key(|run| run.vcn);
+    if runs.windows(2).any(|pair| pair[0].vcn + pair[0].clusters > pair[1].vcn) {
+        return Err(corrupt(0, "overlapping logical MFT extents"));
+    }
+    let mut physical: Vec<_> = runs.iter().filter_map(|run| run.lcn.map(|lcn| (lcn, lcn + run.clusters))).collect();
+    physical.sort_unstable();
+    if physical.windows(2).any(|pair| pair[0].1 > pair[1].0) {
+        return Err(corrupt(0, "aliased physical MFT extents"));
+    }
+    Ok(())
+}
+
+fn bootstrap_record(
+    source: &Source,
+    geometry: &NtfsGeometry,
+    cx: &Cx,
+    map: &Stream,
+    reference: NtfsReference,
+) -> Result<Option<NtfsFileRecord>> {
+    checkpoint(cx)?;
+    if reference.record > u64::from(u32::MAX) { return Err(corrupt(0, "MFT record identity exceeds the read profile")); }
+    let start = reference.record * u64::from(geometry.record_bytes());
+    let end = start + u64::from(geometry.record_bytes());
+    if end > map.initialized { return Err(corrupt(start, "MFT extension lies beyond initialized data")); }
+    let cluster_bytes = u64::from(geometry.cluster_bytes());
+    let mut vcn = start / cluster_bytes;
+    let end_vcn = end.div_ceil(cluster_bytes);
+    let Storage::Mapped(runs) = &map.storage else { return Err(corrupt(start, "invalid bootstrap map")); };
+    // Check the entire range before issuing even its first physical read.
+    while vcn < end_vcn {
+        let Some(index) = runs.partition_point(|run| run.vcn <= vcn).checked_sub(1) else { return Ok(None) };
+        let run = &runs[index];
+        if run.lcn.is_none() || vcn >= run.vcn + run.clusters { return Ok(None); }
+        vcn = (run.vcn + run.clusters).min(end_vcn);
+    }
+    let raw = map.read(source, geometry, cx, start, geometry.record_bytes() as usize)?;
+    let record = NtfsFileRecord::parse(&raw).map_err(parse)?;
+    validate_identity(&record, reference.record, Some(reference.sequence))?;
+    checkpoint(cx)?;
+    Ok(Some(record))
 }

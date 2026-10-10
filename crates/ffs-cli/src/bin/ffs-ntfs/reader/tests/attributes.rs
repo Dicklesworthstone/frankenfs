@@ -1,6 +1,6 @@
 use super::*;
 
-fn list_entry(kind: u32, number: u64, id: u16, vcn: u64, name: &str) -> Vec<u8> {
+pub(super) fn list_entry(kind: u32, number: u64, id: u16, vcn: u64, name: &str) -> Vec<u8> {
     let name: Vec<u16> = name.encode_utf16().collect();
     let length = (26 + name.len() * 2).next_multiple_of(8);
     let mut entry = vec![0; length];
@@ -17,7 +17,7 @@ fn list_entry(kind: u32, number: u64, id: u16, vcn: u64, name: &str) -> Vec<u8> 
     entry
 }
 
-fn extension(number: u32, owner: u64, attrs: &[Vec<u8>]) -> Vec<u8> {
+pub(super) fn extension(number: u32, owner: u64, attrs: &[Vec<u8>]) -> Vec<u8> {
     let mut record = file_record(number, attrs);
     record[32..40].copy_from_slice(&(owner | (7_u64 << 48)).to_le_bytes());
     record
@@ -207,4 +207,85 @@ fn extension_reads_leave_file_backing_and_adjacent_regions_unchanged() {
     let stream = volume.data_stream(&cx, &record, &[]).unwrap();
     assert_eq!(volume.read(&cx, &stream, 510, 4).unwrap(), b"AABB");
     assert_eq!(std::fs::read(&path).unwrap(), image.bytes);
+}
+
+fn split_mft_image(nonresident_list: bool) -> Image {
+    let mut image = Image::new();
+    // The middle mapping is stored in record 24, which becomes readable only
+    // after the higher-VCN extent in already-reachable record 1 is discovered.
+    let mut list = list_entry(DATA, 0, 0, 0, "");
+    list.extend(list_entry(DATA, 24, 4, 16, ""));
+    list.extend(list_entry(DATA, 1, 5, 32, ""));
+    let list_attr = if nonresident_list {
+        image.bytes[BASE + 210 * 512..BASE + 210 * 512 + list.len()].copy_from_slice(&list);
+        let mut attr = mapped(&[0x21, 1, 210, 0, 0], 1, list.len() as u64, list.len() as u64, 0);
+        attr[..4].copy_from_slice(&ATTRIBUTE_LIST.to_le_bytes());
+        attr[14..16].copy_from_slice(&10_u16.to_le_bytes());
+        attr
+    } else { resident(ATTRIBUTE_LIST, 10, "", &list) };
+    let mut first = mapped(&[0x11, 16, 4, 0], 64, 32768, 32768, 0);
+    first[24..32].copy_from_slice(&15_u64.to_le_bytes());
+    let base = file_record(0, &[list_attr, first]);
+    image.put_record(0, &base);
+    image.bytes[BASE + 128 * 512..BASE + 130 * 512].copy_from_slice(&base);
+    let mut middle = mapped(&[0x11, 16, 40, 0], 32, 0, 0, 0);
+    middle[14..16].copy_from_slice(&4_u16.to_le_bytes());
+    middle[16..24].copy_from_slice(&16_u64.to_le_bytes());
+    image.put_record(24, &extension(24, 0, &[middle]));
+    let mut last = mapped(&[0x11, 32, 56, 0], 64, 0, 0, 0);
+    last[14..16].copy_from_slice(&5_u16.to_le_bytes());
+    last[16..24].copy_from_slice(&32_u64.to_le_bytes());
+    image.put_record(1, &extension(1, 0, &[last]));
+    image
+}
+
+#[test]
+fn mft_bootstrap_resolves_out_of_order_extent_dependencies() {
+    let cx = Cx::for_testing();
+    for nonresident in [false, true] {
+        let reads: Reads = Arc::default();
+        let volume = split_mft_image(nonresident).open(Arc::clone(&reads), None).unwrap();
+        assert_eq!(volume.record_count(), 32);
+        let record = volume.record(&cx, 25, Some(7)).unwrap();
+        let stream = volume.data_stream(&cx, &record, &[]).unwrap();
+        assert_eq!(volume.read(&cx, &stream, 510, 4).unwrap(), b"AABB");
+        let trace = reads.lock().unwrap();
+        let before = trace.iter().position(|(at, _)| *at == Image::record_offset(1) as u64).unwrap();
+        let after = trace.iter().position(|(at, _)| *at == Image::record_offset(24) as u64).unwrap();
+        assert!(before < after, "record 24 must not be guessed from boot arithmetic");
+    }
+}
+
+#[test]
+fn mft_bootstrap_deadlocks_fail_without_guessing_record_locations() {
+    let mut image = Image::new();
+    let mut list = list_entry(DATA, 0, 0, 0, "");
+    list.extend(list_entry(DATA, 24, 4, 16, ""));
+    let mut first = mapped(&[0x11, 16, 4, 0], 64, 32768, 32768, 0);
+    first[24..32].copy_from_slice(&15_u64.to_le_bytes());
+    let base = file_record(0, &[resident(ATTRIBUTE_LIST, 10, "", &list), first]);
+    image.put_record(0, &base);
+    image.bytes[BASE + 128 * 512..BASE + 130 * 512].copy_from_slice(&base);
+    let reads: Reads = Arc::default();
+    let result = image.open(Arc::clone(&reads), None);
+    assert!(matches!(result, Err(FfsError::Corruption { .. })));
+    assert!(!reads.lock().unwrap().iter().any(|(at, _)| *at == Image::record_offset(24) as u64));
+}
+
+#[test]
+fn mft_extension_identity_fixup_and_cancellation_fail_before_publication() {
+    for case in 0..4 {
+        let mut image = split_mft_image(false);
+        let at = Image::record_offset(1);
+        match case {
+            0 => image.bytes[at + 16] = 8, // stale generation
+            1 => image.bytes[at + 32] = 24, // foreign owner
+            2 => image.bytes[at + 1023] ^= 1, // torn sector
+            _ => {}
+        }
+        let fail = (case == 3).then_some(at as u64);
+        let result = image.open(Arc::default(), fail);
+        if case == 3 { assert!(matches!(result, Err(FfsError::Cancelled))); }
+        else { assert!(matches!(result, Err(FfsError::Corruption { .. }))); }
+    }
 }

@@ -238,3 +238,88 @@ fn index_read_cancellation_is_propagated_without_partial_directory_success() {
     assert!(matches!(volume.list_directory(&cx, &root), Err(FfsError::Cancelled)));
     assert_eq!(reads.lock().unwrap().iter().filter(|(offset, _)| *offset >= INDEX_START as u64).count(), 2);
 }
+
+// Split existing native-layout fixtures rather than generating new index keys
+// that merely mirror the resolver's implementation.
+fn split_namespace_image() -> Image {
+    use super::attributes::{extension, list_entry};
+    let mut image = namespace_image(true);
+    let restored = ffs_ondisk::ntfs::restore_record(&root_record(true, 7), b"FILE").unwrap();
+    let mut at = 56;
+    let mut attrs = Vec::new();
+    while u32::from_le_bytes(restored[at..at + 4].try_into().unwrap()) != u32::MAX {
+        let length = u32::from_le_bytes(restored[at + 4..at + 8].try_into().unwrap()) as usize;
+        attrs.push(restored[at..at + length].to_vec());
+        at += length;
+    }
+    let mut list = list_entry(0x90, 5, 0, 0, "$I30");
+    list.extend(list_entry(0xA0, 31, 1, 0, "$I30"));
+    list.extend(list_entry(0xB0, 31, 2, 0, "$I30"));
+    image.put_record(5, &directory_record(5, &[resident(ATTRIBUTE_LIST, 10, "", &list), attrs[0].clone()]));
+    image.put_record(31, &extension(31, 5, &attrs[1..]));
+    let mut list = list_entry(0x30, 30, 2, 0, "");
+    list.extend(list_entry(0x30, 30, 3, 0, ""));
+    list.extend(list_entry(DATA, 24, 0, 0, ""));
+    list.extend(list_entry(DATA, 24, 1, 0, "note"));
+    image.put_record(24, &file_record(24, &[resident(ATTRIBUTE_LIST, 10, "", &list),
+        resident(DATA, 0, "", b"resident!"), resident(DATA, 1, "note", b"named stream")]));
+    image.put_record(30, &extension(30, 24, &[
+        resident(0x30, 2, "", &name_value(5, "A.txt", 1)),
+        resident(0x30, 3, "", &name_value(5, "A~1.TXT", 2)),
+    ]));
+    image
+}
+
+#[test]
+fn extension_backed_indexes_and_file_names_support_path_reads_and_aliases() {
+    let cx = Cx::for_testing();
+    let volume = open(split_namespace_image(), Arc::default(), None).unwrap();
+    let root = volume.resolve(&cx, "/").unwrap();
+    assert_eq!(volume.list_directory(&cx, &root).unwrap().len(), 5);
+    for path in ["/a.txt", "/A~1.txt"] {
+        let file = volume.resolve(&cx, path).unwrap();
+        assert_eq!(file.number, 24);
+        let stream = volume.data_stream(&cx, &file, &[]).unwrap();
+        assert_eq!(volume.read(&cx, &stream, 0, 100).unwrap(), b"resident!");
+    }
+    assert_eq!(volume.resolve(&cx, "/subdir/nested.bin").unwrap().number, 28);
+}
+
+#[test]
+fn untrusted_file_name_extension_prevents_partial_directory_success() {
+    let cx = Cx::for_testing();
+    let mut image = split_namespace_image();
+    image.bytes[Image::record_offset(30) + 16] = 8;
+    let volume = open(image, Arc::default(), None).unwrap();
+    let root = volume.record(&cx, 5, None).unwrap();
+    assert!(matches!(volume.list_directory(&cx, &root), Err(FfsError::Corruption { .. })));
+}
+
+#[test]
+fn reparse_attributes_cannot_hide_in_an_extension_record() {
+    use super::attributes::{extension, list_entry};
+    let cx = Cx::for_testing();
+    let mut image = namespace_image(false);
+    let mut list = list_entry(0x30, 29, 1, 0, "");
+    list.extend(list_entry(DATA, 29, 0, 0, ""));
+    list.extend(list_entry(0xC0, 30, 2, 0, ""));
+    image.put_record(29, &file_record(29, &[resident(ATTRIBUTE_LIST, 10, "", &list),
+        resident(DATA, 0, "", b"posix"), resident(0x30, 1, "", &name_value(5, "mixed", 0))]));
+    image.put_record(30, &extension(30, 29, &[resident(0xC0, 2, "", &[0; 8])]));
+    let volume = open(image, Arc::default(), None).unwrap();
+    assert!(matches!(volume.resolve(&cx, "/mixed"), Err(FfsError::UnsupportedFeature(_))));
+}
+
+#[test]
+fn native_upcase_selection_follows_its_attribute_list() {
+    use super::attributes::{extension, list_entry};
+    let cx = Cx::for_testing();
+    let mut image = namespace_image(false);
+    image.put_record(10, &file_record(10, &[resident(ATTRIBUTE_LIST, 10, "",
+        &list_entry(DATA, 30, 0, 0, ""))]));
+    image.put_record(30, &extension(30, 10, &[
+        mapped(&[0x22, 0, 1, 44, 1, 0], 256, 131072, 131072, 0)
+    ]));
+    let volume = open(image, Arc::default(), None).unwrap();
+    assert_eq!(volume.resolve(&cx, "/ä.BIN").unwrap().number, 25);
+}
