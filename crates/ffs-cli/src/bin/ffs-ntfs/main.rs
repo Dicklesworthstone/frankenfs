@@ -102,6 +102,18 @@ enum Command {
         #[arg(long)]
         bytes: Option<u64>,
     },
+    /// Mount an immutable image using FrankenFS's native read-only FUSE adapter.
+    Mount {
+        #[command(flatten)]
+        image: ImageArgs,
+        /// Existing empty directory; must not contain the backing image.
+        mountpoint: PathBuf,
+        /// Synthetic host ownership, not an NTFS SID/ACL mapping.
+        #[arg(long, default_value_t = 0)]
+        uid: u32,
+        #[arg(long, default_value_t = 0)]
+        gid: u32,
+    },
 }
 
 fn json(value: &serde_json::Value) -> Result<()> {
@@ -245,6 +257,29 @@ fn main() -> Result<()> {
             let record = volume.record(&cx, file.record, file.sequence)?;
             stream_to_stdout(&cx, &volume, &record, &stream, start, bytes)?;
         }
+        Command::Mount { image, mountpoint, uid, gid } => {
+            let mountpoint = mountpoint.canonicalize().context("resolve NTFS mountpoint")?;
+            if !mountpoint.is_dir()
+                || std::fs::read_dir(&mountpoint)?.next().transpose()?.is_some()
+            {
+                bail!("NTFS mountpoint must be an existing empty directory");
+            }
+            if image.image.canonicalize()?.starts_with(&mountpoint) {
+                bail!("NTFS mountpoint would hide its backing image");
+            }
+            let volume = image.open(&cx)?;
+            let fs = reader::filesystem::NtfsFs::new(&cx, volume, uid, gid)?;
+            let options = ffs_fuse::MountOptions {
+                read_only: true,
+                allow_other: false,
+                auto_unmount: true,
+                ..ffs_fuse::MountOptions::default()
+            };
+            eprintln!(
+                "experimental NTFS read-only mount: offline immutable image required; no log replay or native ACL enforcement"
+            );
+            let _ = ffs_fuse::mount(Box::new(fs), &mountpoint, &options)?;
+        }
     }
     Ok(())
 }
@@ -252,6 +287,20 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cli_mount_requires_offline_acknowledgement_and_refuses_write_options() {
+        assert!(Cli::try_parse_from(["ffs-ntfs", "mount", "disk.img", "/mnt/ntfs"]).is_err());
+        let cli = Cli::try_parse_from([
+            "ffs-ntfs", "mount", "disk.img", "/mnt/ntfs", "--offline-image",
+            "--offset", "1024", "--length", "65536", "--uid", "123", "--gid", "456",
+        ]).unwrap();
+        let Command::Mount { image, mountpoint, uid, gid } = cli.command else { panic!("mount"); };
+        assert_eq!((image.offset, image.length, uid, gid), (1024, Some(65536), 123, 456));
+        assert_eq!(mountpoint, PathBuf::from("/mnt/ntfs"));
+        assert!(Cli::try_parse_from([
+            "ffs-ntfs", "mount", "disk.img", "/mnt/ntfs", "--offline-image", "--rw",
+        ]).is_err());
+    }
     #[test]
     fn cli_requires_offline_acknowledgement_and_accepts_record_ranges() {
         assert!(Cli::try_parse_from(["ffs-ntfs", "inspect", "disk.img"]).is_err());

@@ -2,6 +2,7 @@
 
 mod attributes;
 mod compression;
+pub(crate) mod filesystem;
 mod namespace;
 
 use asupersync::Cx;
