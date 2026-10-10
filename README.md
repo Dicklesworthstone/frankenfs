@@ -3318,6 +3318,13 @@ the other mirror-subset and corruption cases use the library mount path.
 Seed-device inventories and device-count reconciliation remain open under
 `bd-hk5w3`; the full V1 read scope is not complete.
 
+Standalone btrfs seed images remain readable, but `OpenFs` refuses write
+admission, transaction publication, mounted repair and flushing existing
+MVCC versions onto them. Neither skipped read validation nor ephemeral
+tree-log mode overrides the seed flag. Detection-only background scrub is
+available; background repair is refused before its worker starts. This does
+not provide seed/sprout attachment routing or change standalone `fsck --repair`.
+
 | Profile | Device-set read helper | Mounted read | Mounted write |
 |---|---|---|---|
 | `Single` | Linear, split at chunk boundaries | Implemented | Experimental |

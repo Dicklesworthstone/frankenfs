@@ -191,6 +191,14 @@ multi-device mutation support.
 `OpenFs::enable_writes` refuses any device count other than one and any known
 chunk profile other than Single/DUP before loading mutable allocation state.
 Skipping read validation does not bypass this write-admission check.
+The superblock's `BTRFS_SUPER_FLAG_SEEDING` also refuses write admission
+before allocation state is loaded. The same guard covers public transaction
+commits, write request scopes, mounted repair staging and physical MVCC
+flushes. A clean seed permits a no-op flush; existing MVCC versions cannot be
+persisted onto it. The CLI refuses background repair during plan creation,
+before starting a worker or ledger, while permitting detection-only scrub.
+These guards apply to standalone seeds and do not establish seed/sprout
+attachment support or cover standalone `fsck --repair`.
 `OpenFs::current_btrfs_device_items` reads the backing superblock through the request's
 `Cx`, verifies its checksum, parses the embedded device item, and checks its
 filesystem UUID. Writable mounts enumerate live CHUNK_TREE DEV_ITEM records
