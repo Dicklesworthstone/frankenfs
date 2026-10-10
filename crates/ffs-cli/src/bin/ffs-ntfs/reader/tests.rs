@@ -81,6 +81,8 @@ impl Image {
         b[11..13].copy_from_slice(&512_u16.to_le_bytes());
         b[13] = 1;
         b[21] = 0xF8;
+        b[36] = 0x80;
+        b[38] = 0x80;
         b[40..48].copy_from_slice(&255_u64.to_le_bytes());
         b[48..56].copy_from_slice(&4_u64.to_le_bytes());
         b[56..64].copy_from_slice(&128_u64.to_le_bytes());
@@ -289,3 +291,5 @@ fn actual_file_backing_and_adjacent_partition_bytes_remain_unchanged() {
     assert_eq!(volume.read(&cx, &stream, 0, 1024).unwrap().len(), 600);
     assert_eq!(std::fs::read(&path).unwrap(), image.bytes);
 }
+
+mod namespace;

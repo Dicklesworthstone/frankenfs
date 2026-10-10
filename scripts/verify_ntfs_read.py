@@ -87,6 +87,9 @@ def main() -> None:
         require(info["format"] == "NTFS" and info["version"] == "3.1", "wrong format/version")
         require(info["read_only"] is True and info["mft_mirror_record_zero_matches"] is True,
                 "candidate did not confirm the admitted read profile")
+        directory = json.loads(command(binary, "ls", image, "/", "--offline-image"))
+        require(set(payloads) <= {entry["name"] for entry in directory},
+                "candidate native directory index omitted seeded names")
         for name, expected in payloads.items():
             record = str(records[name])
             require(command("ntfscat", "-i", record, image) == expected, f"native oracle mismatch: {name}")
@@ -94,6 +97,12 @@ def main() -> None:
                     f"candidate bytes differ: {name}")
             require(command(binary, "cat", image, record, "--offline-image", "--start", "507", "--bytes", "1031")
                     == expected[507:1538], f"candidate range differs: {name}")
+            # ntfscp may create POSIX namespace entries, which this profile
+            # intentionally resolves exactly rather than case-insensitively.
+            folded = any(entry["name"] == name and entry["namespace"] != 0 for entry in directory)
+            lookup_name = name.upper() if folded else name
+            require(command(binary, "read", image, "/" + lookup_name, "--offline-image") == expected,
+                    f"candidate namespace-aware path read differs: {name}")
             metadata = json.loads(command(binary, "record", image, record, "--offline-image"))
             require(metadata["record"] == int(record), "candidate returned a different MFT identity")
             report["streams_checked"].append({"record": int(record), "name": name, "size": len(expected)})
@@ -101,6 +110,8 @@ def main() -> None:
         require(command("ntfscat", "-i", record, "-n", "note", image) == named, "native named stream differs")
         require(command(binary, "cat", image, record, "--offline-image", "--stream", "note") == named,
                 "candidate named stream differs")
+        require(command(binary, "read", image, "/tiny.txt", "--offline-image", "--stream", "note") == named,
+                "candidate path-selected named stream differs")
         require(digest(image) == before, "read operations changed the original image")
         disk = root / "partitioned.img"
         with disk.open("xb") as target, image.open("rb") as source:
@@ -113,7 +124,7 @@ def main() -> None:
                 "selected-partition data differs")
         require(digest(disk) == disk_before, "candidate modified image or adjacent partition bytes")
         report.update(status="passed", image_sha256=before, partitioned_sha256=disk_before,
-                      named_stream_checked=True)
+                      named_stream_checked=True, directory_and_path_reads_checked=True)
         print(json.dumps(report, indent=2))
     except Exception as error:
         report.update(status="failed", error=str(error))

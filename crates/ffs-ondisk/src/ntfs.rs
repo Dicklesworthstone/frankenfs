@@ -5,6 +5,8 @@
 //! documentation. Update-sequence protection uses 512-byte strides even when
 //! the BPB advertises larger sectors. Names remain native UTF-16 code units.
 
+pub mod index;
+
 use ffs_types::ParseError;
 
 pub const ATTRIBUTE_LIST: u32 = 0x20;
@@ -67,7 +69,9 @@ impl NtfsGeometry {
         if cluster_bytes > 65_536 {
             return Err(invalid("ntfs.cluster", "read profile supports at most 64 KiB clusters"));
         }
-        if boot[14..21].iter().chain(&boot[22..24]).chain(&boot[32..40]).any(|b| *b != 0) {
+        // 0x24 is the BIOS drive and 0x26 the extended boot signature;
+        // these are not the legacy FAT sector-count field at 0x20.
+        if boot[14..21].iter().chain(&boot[22..24]).chain(&boot[32..36]).any(|b| *b != 0) {
             return Err(invalid("ntfs.bpb", "legacy FAT fields must be zero"));
         }
         let volume_bytes = le64(boot, 40)?.checked_mul(u64::from(sector_bytes))

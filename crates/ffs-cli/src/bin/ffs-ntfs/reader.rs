@@ -1,5 +1,7 @@
 //! Offline, native NTFS 3.1 MFT/stream reads. No mount, replay or device writes.
 
+mod namespace;
+
 use asupersync::Cx;
 use ffs_block::ByteDevice;
 use ffs_error::{FfsError, Result};

@@ -6,6 +6,8 @@ fn boot() -> [u8; 512] {
     b[11..13].copy_from_slice(&512_u16.to_le_bytes());
     b[13] = 8;
     b[21] = 0xF8;
+    b[36] = 0x80;
+    b[38] = 0x80;
     b[40..48].copy_from_slice(&8191_u64.to_le_bytes());
     b[48..56].copy_from_slice(&4_u64.to_le_bytes());
     b[56..64].copy_from_slice(&512_u64.to_le_bytes());
@@ -201,4 +203,16 @@ fn nonresident_names_mappings_and_initialized_bounds_are_validated() {
     assert_eq!(decode_mapping_pairs(value.mapping_pairs, value.first_vcn, value.last_vcn, 100).unwrap()[0].lcn, Some(10));
     r[56 + 56] = 4;
     assert!(NtfsFileRecord::parse(&r).is_err());
+}
+
+#[test]
+fn ntfs_boot_drive_and_extended_signature_are_not_fat_reserved_fields() {
+    let mut b = boot();
+    for drive in [0, 0x80, 0x81] {
+        b[36] = drive;
+        b[38] = 0x80;
+        assert!(NtfsGeometry::parse(&b, 8192 * 512).is_ok());
+    }
+    b[32] = 1;
+    assert!(NtfsGeometry::parse(&b, 8192 * 512).is_err());
 }

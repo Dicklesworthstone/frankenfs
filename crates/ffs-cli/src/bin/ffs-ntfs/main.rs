@@ -1,12 +1,12 @@
 #![forbid(unsafe_code)]
-//! Native, read-only NTFS 3.1 inspection and stream extraction by MFT identity.
+//! Native, read-only NTFS 3.1 inspection, directory traversal and stream extraction.
 
 mod reader;
 
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
 use clap::{Args, Parser, Subcommand};
-use ffs_ondisk::ntfs::{DATA, NtfsValue};
+use ffs_ondisk::ntfs::{DATA, NtfsFileRecord, NtfsValue};
 use reader::NtfsVolume;
 use std::io::{self, Write};
 use std::path::PathBuf;
@@ -54,6 +54,25 @@ struct RecordArgs {
 enum Command {
     /// Check geometry, MFT bootstrap/mirror agreement and volume version/flags.
     Inspect { #[command(flatten)] image: ImageArgs },
+    /// List a directory through native $I30 indexes, retaining raw UTF-16 names.
+    Ls {
+        #[command(flatten)]
+        image: ImageArgs,
+        #[arg(default_value = "/")]
+        path: String,
+    },
+    /// Resolve an image path with its native UpCase table and extract DATA.
+    Read {
+        #[command(flatten)]
+        image: ImageArgs,
+        path: String,
+        #[arg(long, default_value = "")]
+        stream: String,
+        #[arg(long, default_value_t = 0)]
+        start: u64,
+        #[arg(long)]
+        bytes: Option<u64>,
+    },
     /// Show the attributes and native UTF-16 stream names of an in-use MFT record.
     Record { #[command(flatten)] file: RecordArgs },
     /// Stream logical DATA bytes to stdout, including sparse/uninitialized zeroes.
@@ -79,6 +98,27 @@ fn json(value: &serde_json::Value) -> Result<()> {
     Ok(())
 }
 
+fn stream_to_stdout(
+    cx: &Cx, volume: &NtfsVolume, record: &NtfsFileRecord,
+    name: &str, start: u64, bytes: Option<u64>,
+) -> Result<()> {
+    let name: Vec<u16> = name.encode_utf16().collect();
+    if name.len() > 255 || name.contains(&0) { bail!("invalid NTFS stream name"); }
+    let stream = volume.data_stream(cx, record, &name)?;
+    let length = stream.size.saturating_sub(start).min(bytes.unwrap_or(u64::MAX));
+    let mut done = 0_u64;
+    let mut out = io::stdout().lock();
+    while done < length {
+        let count = (length - done).min(1024 * 1024) as usize;
+        let data = volume.read(cx, &stream, start + done, count)?;
+        if data.is_empty() { bail!("NTFS stream ended before the validated logical EOF"); }
+        out.write_all(&data)?;
+        done += data.len() as u64;
+    }
+    out.flush()?;
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cx = Cx::for_request();
@@ -96,6 +136,23 @@ fn main() -> Result<()> {
                 "mft_mirror_record_zero_matches": true, "volume_flags": 0,
                 "scope": "offline MFT/stream read profile; not a filesystem check or recovery validation"
             }))?;
+        }
+        Command::Ls { image, path } => {
+            let volume = image.open(&cx)?;
+            let record = volume.resolve(&cx, &path)?;
+            let entries = volume.list_directory(&cx, &record)?;
+            let report: Vec<_> = entries.into_iter().map(|entry| serde_json::json!({
+                "record": entry.reference.record, "sequence": entry.reference.sequence,
+                "name": String::from_utf16(&entry.filename.name).ok(),
+                "name_utf16": entry.filename.name, "namespace": entry.filename.namespace,
+                "directory": entry.directory
+            })).collect();
+            json(&serde_json::json!(report))?;
+        }
+        Command::Read { image, path, stream, start, bytes } => {
+            let volume = image.open(&cx)?;
+            let record = volume.resolve(&cx, &path)?;
+            stream_to_stdout(&cx, &volume, &record, &stream, start, bytes)?;
         }
         Command::Record { file } => {
             let volume = file.image.open(&cx)?;
@@ -129,20 +186,7 @@ fn main() -> Result<()> {
         Command::Cat { file, stream, start, bytes } => {
             let volume = file.image.open(&cx)?;
             let record = volume.record(&cx, file.record, file.sequence)?;
-            let name: Vec<u16> = stream.encode_utf16().collect();
-            if name.len() > 255 || name.contains(&0) { bail!("invalid NTFS stream name"); }
-            let stream = volume.data_stream(&cx, &record, &name)?;
-            let length = stream.size.saturating_sub(start).min(bytes.unwrap_or(u64::MAX));
-            let mut done = 0_u64;
-            let mut out = io::stdout().lock();
-            while done < length {
-                let count = (length - done).min(1024 * 1024) as usize;
-                let data = volume.read(&cx, &stream, start + done, count)?;
-                if data.is_empty() { bail!("NTFS stream ended before the validated logical EOF"); }
-                out.write_all(&data)?;
-                done += data.len() as u64;
-            }
-            out.flush()?;
+            stream_to_stdout(&cx, &volume, &record, &stream, start, bytes)?;
         }
     }
     Ok(())
@@ -160,5 +204,16 @@ mod tests {
         assert_eq!((file.record, file.sequence), (24, Some(7)));
         assert_eq!((stream.as_str(), start, bytes), ("note", 512, Some(1024)));
         assert!(Cli::try_parse_from(["ffs-ntfs", "inspect", "disk.img", "--offline-image", "--rw"]).is_err());
+    }
+    #[test]
+    fn cli_accepts_directory_and_path_reads_without_reinterpreting_numeric_cat() {
+        let cli = Cli::try_parse_from(["ffs-ntfs", "ls", "disk.img", "--offline-image"]).unwrap();
+        let Command::Ls { path, .. } = cli.command else { panic!("ls"); };
+        assert_eq!(path, "/");
+        let cli = Cli::try_parse_from(["ffs-ntfs", "read", "disk.img", "/folder/Ä.bin",
+            "--offline-image", "--stream", "note", "--start", "3", "--bytes", "2"]).unwrap();
+        let Command::Read { path, stream, start, bytes, .. } = cli.command else { panic!("read"); };
+        assert_eq!((path.as_str(), stream.as_str(), start, bytes), ("/folder/Ä.bin", "note", 3, Some(2)));
+        assert!(Cli::try_parse_from(["ffs-ntfs", "read", "disk.img", "/a"]).is_err());
     }
 }
