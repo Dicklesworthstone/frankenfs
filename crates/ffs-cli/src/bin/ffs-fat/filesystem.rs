@@ -518,8 +518,8 @@ mod tests {
 
     #[test]
     fn fat_time_uses_calendar_rules_and_preserves_two_second_precision() {
-        let date = ((2024 - 1980) << 9) | (2 << 5) | 29;
-        let time = (12 << 11) | (34 << 5) | 28;
+        let date = ((2024 - 1980) << 9) | (2 << 5) | 0x001D;
+        let time = (12 << 11) | (34 << 5) | 0x001C;
         assert_eq!(
             fat_wall_time(date, time)
                 .unwrap()
@@ -528,7 +528,7 @@ mod tests {
                 .as_secs(),
             1_709_210_096
         );
-        assert!(fat_wall_time(((2023 - 1980) << 9) | (2 << 5) | 29, 0).is_err());
+        assert!(fat_wall_time(((2023 - 1980) << 9) | (2 << 5) | 0x001D, 0).is_err());
         assert!(fat_wall_time((1 << 5) | 1, 31).is_err());
         assert!(fat_wall_time(1, 0).is_err());
         assert_eq!(fat_wall_time(0, 0).unwrap(), UNIX_EPOCH);

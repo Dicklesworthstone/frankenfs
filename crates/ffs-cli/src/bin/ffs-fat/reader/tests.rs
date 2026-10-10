@@ -215,13 +215,19 @@ fn fat16_and_fat32_read_fragmented_files_nested_paths_and_eof() {
             volume.read(&cx, &chain, 510, 520).unwrap(),
             payload()[510..]
         );
-        assert!(volume.read(&cx, &chain, 1029, 1).unwrap().is_empty());
-        assert!(volume.read(&cx, &chain, u64::MAX, 10).unwrap().is_empty());
+        assert_eq!(volume.read(&cx, &chain, 1029, 1).unwrap(), [] as [u8; 0]);
+        assert_eq!(
+            volume.read(&cx, &chain, u64::MAX, 10).unwrap(),
+            [] as [u8; 0]
+        );
         let nested = volume.resolve(&cx, "/SUBDIR/nested.bin").unwrap().unwrap();
         let chain = volume.file_chain(&cx, &nested).unwrap();
         assert_eq!(volume.read(&cx, &chain, 0, 4).unwrap(), b"FAT!");
         let empty = volume.resolve(&cx, "/empty.txt").unwrap().unwrap();
-        assert!(volume.file_chain(&cx, &empty).unwrap().clusters.is_empty());
+        assert_eq!(
+            volume.file_chain(&cx, &empty).unwrap().clusters,
+            [] as [u32; 0]
+        );
         assert!(matches!(
             volume.resolve(&cx, "/HELLO.TXT/child"),
             Err(FfsError::NotDirectory)

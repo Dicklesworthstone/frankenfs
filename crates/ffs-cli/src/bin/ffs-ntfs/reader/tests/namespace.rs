@@ -147,7 +147,7 @@ fn namespace_image(external: bool) -> Image {
         10,
         &file_record(
             10,
-            &[mapped(&[0x22, 0, 1, 44, 1, 0], 256, 131072, 131072, 0)],
+            &[mapped(&[0x22, 0, 1, 44, 1, 0], 256, 131_072, 131_072, 0)],
         ),
     );
     image.put_record(

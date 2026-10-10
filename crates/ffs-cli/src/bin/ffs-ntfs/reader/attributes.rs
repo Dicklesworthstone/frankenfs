@@ -4,7 +4,11 @@
 //! list entries must identify exact attributes, and loaded attributes must all
 //! be represented in the list. Extension records never redirect to a new base.
 
-use super::*;
+use super::{
+    ATTRIBUTE_LIST, Cx, FfsError, NtfsAttribute, NtfsFileRecord, NtfsGeometry, NtfsReference,
+    NtfsValue, NtfsVolume, Result, SPARSE, Source, Storage, Stream, checkpoint, corrupt,
+    decode_mapping_pairs, parse, unsupported, validate_identity,
+};
 use ffs_ondisk::ntfs::attribute_list::{
     MAX_LIST_BYTES, NtfsAttributeListEntry, parse_attribute_list,
 };
@@ -29,7 +33,7 @@ impl AttributeSet<'_> {
             result.extend(
                 record
                     .attributes()
-                    .map_err(parse)?
+                    .map_err(|error| parse(&error))?
                     .into_iter()
                     .filter(|attr| attr.kind != ATTRIBUTE_LIST),
             );
@@ -91,7 +95,7 @@ fn read_list(
             "select NTFS attributes through their base record, not an extension",
         ));
     }
-    let attributes = base.attributes().map_err(parse)?;
+    let attributes = base.attributes().map_err(|error| parse(&error))?;
     let mut lists = attributes.iter().filter(|attr| attr.kind == ATTRIBUTE_LIST);
     let Some(list) = lists.next() else {
         return Ok(None);
@@ -110,7 +114,7 @@ fn read_list(
         ));
     }
     let bytes = stream.read(source, geometry, cx, 0, stream.size as usize)?;
-    let list = parse_attribute_list(&bytes).map_err(parse)?;
+    let list = parse_attribute_list(&bytes).map_err(|error| parse(&error))?;
     checkpoint(cx)?;
     Ok(Some(list))
 }
@@ -163,7 +167,7 @@ fn resolve_catalog<'a>(
     let mut matched = 0;
     for record in std::iter::once(base).chain(result.extensions.values()) {
         checkpoint(cx)?;
-        for attr in record.attributes().map_err(parse)? {
+        for attr in record.attributes().map_err(|error| parse(&error))? {
             checkpoint(cx)?;
             if attr.kind == ATTRIBUTE_LIST {
                 if record.number != base.number {
@@ -286,7 +290,7 @@ impl Stream {
                 extent.last_vcn,
                 geometry.cluster_count(),
             )
-            .map_err(parse)?;
+            .map_err(|error| parse(&error))?;
             if decoded.is_empty() && extents.len() != 1 {
                 return Err(corrupt(0, "empty continuation in NTFS extent list"));
             }

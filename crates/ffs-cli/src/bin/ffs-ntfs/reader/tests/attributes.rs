@@ -151,7 +151,7 @@ fn catalog_identity_failures_never_publish_a_stream() {
         let mut image = split_image(false);
         let mut list = list_entry(DATA, 25, 0, 0, "");
         let mut last_ref = list_entry(DATA, 27, 4, 1, "");
-        let mut last = last_extent();
+        let mut continuation = last_extent();
         let mut owner = 25;
         match case {
             0 => last_ref[22..24].copy_from_slice(&8_u16.to_le_bytes()),
@@ -163,17 +163,17 @@ fn catalog_identity_failures_never_publish_a_stream() {
             6 => {
                 // A catalog-consistent VCN gap still cannot be assembled.
                 last_ref[8..16].copy_from_slice(&2_u64.to_le_bytes());
-                last[16..24].copy_from_slice(&2_u64.to_le_bytes());
-                last[24..32].copy_from_slice(&2_u64.to_le_bytes());
+                continuation[16..24].copy_from_slice(&2_u64.to_le_bytes());
+                continuation[24..32].copy_from_slice(&2_u64.to_le_bytes());
             }
-            7 => last[66] = 180, // Physical alias across different extents.
-            8 => last[12..14].copy_from_slice(&SPARSE.to_le_bytes()),
+            7 => continuation[66] = 180, // Physical alias across different extents.
+            8 => continuation[12..14].copy_from_slice(&SPARSE.to_le_bytes()),
             _ => {
                 // Two extents both claim VCN zero.
                 last_ref[8..16].fill(0);
-                last[16..24].fill(0);
-                last[24..32].fill(0);
-                last[40..64].fill(0);
+                continuation[16..24].fill(0);
+                continuation[24..32].fill(0);
+                continuation[40..64].fill(0);
             }
         }
         list.extend(last_ref);
@@ -187,7 +187,11 @@ fn catalog_identity_failures_never_publish_a_stream() {
         );
         image.put_record(
             27,
-            &extension(27, owner, &[last, resident(DATA, 7, "note", b"named")]),
+            &extension(
+                27,
+                owner,
+                &[continuation, resident(DATA, 7, "note", b"named")],
+            ),
         );
         let volume = image.volume();
         let base = volume.record(&cx, 25, None).unwrap();
@@ -244,16 +248,16 @@ fn split_sparse_streams_keep_holes_and_uninitialized_tails_zero() {
     let mut image = Image::new();
     let mut first = mapped(&[0x21, 1, 200, 0, 0x01, 2, 0], 4, 2035, 1543, SPARSE);
     first[24..32].copy_from_slice(&2_u64.to_le_bytes());
-    let mut last = mapped(&[0x21, 1, 190, 0, 0], 4, 0, 0, SPARSE);
-    last[14..16].copy_from_slice(&4_u16.to_le_bytes());
-    last[16..24].copy_from_slice(&3_u64.to_le_bytes());
+    let mut continuation = mapped(&[0x21, 1, 190, 0, 0], 4, 0, 0, SPARSE);
+    continuation[14..16].copy_from_slice(&4_u16.to_le_bytes());
+    continuation[16..24].copy_from_slice(&3_u64.to_le_bytes());
     let mut list = list_entry(DATA, 26, 0, 0, "");
     list.extend(list_entry(DATA, 27, 4, 3, ""));
     image.put_record(
         26,
         &file_record(26, &[resident(ATTRIBUTE_LIST, 10, "", &list), first]),
     );
-    image.put_record(27, &extension(27, 26, &[last]));
+    image.put_record(27, &extension(27, 26, &[continuation]));
     let reads: Reads = Arc::default();
     let volume = image.open(Arc::clone(&reads), None).unwrap();
     let base = volume.record(&cx, 26, None).unwrap();

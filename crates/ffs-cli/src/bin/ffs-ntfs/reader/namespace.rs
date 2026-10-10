@@ -1,6 +1,9 @@
 //! Bounded directory-tree walks and native $UpCase-based path lookup.
 
-use super::*;
+use super::{
+    ATTRIBUTE_LIST, Cx, DATA, FfsError, NtfsFileRecord, NtfsReference, NtfsValue, NtfsVolume,
+    Result, Storage, Stream, checkpoint, corrupt, parse, select_stream, unsupported,
+};
 use ffs_ondisk::ntfs::index::{NtfsFileName, NtfsIndexEntry, NtfsIndexRoot, parse_index_block};
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -29,13 +32,14 @@ impl NtfsVolume {
             return Err(corrupt(0, "INDEX_ROOT must be resident"));
         }
         let bytes = self.read(cx, &root, 0, 65_536)?;
-        let root = NtfsIndexRoot::parse(&bytes, self.geometry.cluster_bytes()).map_err(parse)?;
+        let root = NtfsIndexRoot::parse(&bytes, self.geometry.cluster_bytes())
+            .map_err(|error| parse(&error))?;
         if root.block_bytes != self.geometry.index_bytes() {
             return Err(unsupported(
                 "directory index block size differs from admitted boot geometry",
             ));
         }
-        let attributes = record.attributes().map_err(parse)?;
+        let attributes = record.attributes().map_err(|error| parse(&error))?;
         let external = root.entries.iter().any(|entry| entry.child_vcn.is_some())
             || attributes
                 .iter()
@@ -117,7 +121,7 @@ impl NtfsVolume {
                 ));
             }
             let target = self.record(cx, reference.record, Some(reference.sequence))?;
-            let attributes = target.attributes().map_err(parse)?;
+            let attributes = target.attributes().map_err(|error| parse(&error))?;
             if attributes.iter().any(|attr| attr.kind == ATTRIBUTE_LIST) {
                 return Err(unsupported(
                     "directory target FILE_NAME requires ATTRIBUTE_LIST assembly",
@@ -128,7 +132,7 @@ impl NtfsVolume {
                 let NtfsValue::Resident(value) = &attr.value else {
                     return Err(corrupt(0, "nonresident FILE_NAME"));
                 };
-                if NtfsFileName::parse(value).map_err(parse)? == filename {
+                if NtfsFileName::parse(value).map_err(|error| parse(&error))? == filename {
                     matched = true;
                 }
             }
@@ -236,8 +240,10 @@ impl NtfsVolume {
         }
         let bytes = self.read(cx, &stream, 0, 131_072)?;
         let table: Vec<_> = bytes
-            .chunks_exact(2)
-            .map(|word| u16::from_le_bytes([word[0], word[1]]))
+            .as_chunks::<2>()
+            .0
+            .iter()
+            .map(|word| u16::from_le_bytes(*word))
             .collect();
         for (index, &upper) in table.iter().enumerate() {
             if index.is_multiple_of(1024) {
@@ -259,7 +265,7 @@ impl NtfsVolume {
 fn reject_reparse(record: &NtfsFileRecord) -> Result<()> {
     if record
         .attributes()
-        .map_err(parse)?
+        .map_err(|error| parse(&error))?
         .iter()
         .any(|attr| attr.kind == 0xC0)
     {
@@ -323,7 +329,7 @@ impl Walker<'_> {
                 let raw = self
                     .volume
                     .read(self.cx, stream, offset, self.block_bytes as usize)?;
-                let children = parse_index_block(&raw, vcn).map_err(parse)?;
+                let children = parse_index_block(&raw, vcn).map_err(|error| parse(&error))?;
                 self.visit(children, depth + 1)?;
             }
             if let Some(key) = entry.key {

@@ -26,7 +26,7 @@ fn corrupt(offset: u64, detail: impl Into<String>) -> FfsError {
         detail: detail.into(),
     }
 }
-fn parse(error: ParseError) -> FfsError {
+fn parse(error: &ParseError) -> FfsError {
     corrupt(0, error.to_string())
 }
 fn unsupported(detail: impl Into<String>) -> FfsError {
@@ -160,7 +160,10 @@ impl Stream {
                         .ok_or_else(|| corrupt(0, "gap in NTFS mapping"))?;
                     let count = available.min((initialized - done) as u64) as usize;
                     if let Some(lcn) = run.lcn {
-                        let physical = geometry.cluster_offset(lcn).map_err(parse)? + within;
+                        let physical = geometry
+                            .cluster_offset(lcn)
+                            .map_err(|error| parse(&error))?
+                            + within;
                         source.read(cx, physical, &mut result[done..done + count])?;
                     }
                     // Sparse runs intentionally remain zero; they do not trigger I/O.
@@ -195,7 +198,7 @@ impl NtfsVolume {
             cx,
             Box::new(ReadOnlyImage { file, length: size }),
             base,
-            length.unwrap_or(size.saturating_sub(base)),
+            length.unwrap_or_else(|| size.saturating_sub(base)),
         )
     }
 
@@ -222,26 +225,26 @@ impl NtfsVolume {
         };
         let mut boot = [0_u8; 512];
         source.read(cx, 0, &mut boot)?;
-        let geometry = NtfsGeometry::parse(&boot, length).map_err(parse)?;
+        let geometry = NtfsGeometry::parse(&boot, length).map_err(|error| parse(&error))?;
         source.length = geometry.volume_bytes();
         let mut raw = buffer(geometry.record_bytes() as usize)?;
         source.read(
             cx,
             geometry
                 .cluster_offset(geometry.mft_cluster())
-                .map_err(parse)?,
+                .map_err(|error| parse(&error))?,
             &mut raw,
         )?;
-        let primary = NtfsFileRecord::parse(&raw).map_err(parse)?;
+        let primary = NtfsFileRecord::parse(&raw).map_err(|error| parse(&error))?;
         validate_identity(&primary, 0, None)?;
         source.read(
             cx,
             geometry
                 .cluster_offset(geometry.mirror_cluster())
-                .map_err(parse)?,
+                .map_err(|error| parse(&error))?,
             &mut raw,
         )?;
-        let mirror = NtfsFileRecord::parse(&raw).map_err(parse)?;
+        let mirror = NtfsFileRecord::parse(&raw).map_err(|error| parse(&error))?;
         validate_identity(&mirror, 0, None)?;
         if primary.used_bytes() != mirror.used_bytes() {
             return Err(corrupt(
@@ -368,7 +371,7 @@ fn select_stream(
             "NTFS extension record needs its base record and ATTRIBUTE_LIST",
         ));
     }
-    let attributes = record.attributes().map_err(parse)?;
+    let attributes = record.attributes().map_err(|error| parse(&error))?;
     if attributes.iter().any(|attr| attr.kind == ATTRIBUTE_LIST) {
         return Err(unsupported(
             "NTFS ATTRIBUTE_LIST assembly is not implemented; refusing a partial stream",

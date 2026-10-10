@@ -31,10 +31,9 @@ fn fsops_root_lookup_read_cookies_parent_and_read_only_contract() {
             fs.read(&cx, &mut scope, file.ino, 510, 520).unwrap(),
             payload()[510..]
         );
-        assert!(
-            fs.read(&cx, &mut scope, file.ino, u64::MAX, 1)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            fs.read(&cx, &mut scope, file.ino, u64::MAX, 1).unwrap(),
+            [] as [u8; 0]
         );
         assert!(fs.open(&cx, &mut scope, file.ino, libc::O_RDONLY).is_ok());
         assert!(matches!(
