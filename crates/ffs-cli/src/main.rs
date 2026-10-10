@@ -14384,9 +14384,9 @@ mod tests {
                 OpenFs::open_with_options(&cx, &image, &options).expect("committed inventory wins");
             assert_eq!(fs.btrfs_superblock().unwrap().num_devices, 1);
             assert!(fs.btrfs_device_inventory_verified());
-            let info = fs
-                .get_btrfs_fs_info(&cx, &mut ffs_core::RequestScope::empty())
-                .unwrap();
+            let info =
+                ffs_core::FsOps::get_btrfs_fs_info(&fs, &cx, &mut ffs_core::RequestScope::empty())
+                    .unwrap();
             assert_eq!(&info[..8], &devid.to_ne_bytes());
             assert_eq!(&info[8..16], &1_u64.to_ne_bytes());
             let file = fs

@@ -91636,9 +91636,46 @@ mod tests {
     #[test]
     fn btrfs_single_device_reconciles_stale_count_before_write_admission() {
         let cx = Cx::for_testing();
+        // Overwriting the planted regular extent needs its real allocation
+        // record and backref, in addition to the read-only FS_TREE fixture.
+        let mut original = build_btrfs_csum_image();
+        set_btrfs_test_extent_lengths(&mut original, 4096);
+        let nbytes = BTRFS_TEST_FS_TREE_LOGICAL + BTRFS_TEST_FILE_INODE_OFF + 24;
+        original[nbytes..nbytes + 8].copy_from_slice(&4096_u64.to_le_bytes());
+        stamp_btrfs_test_tree_block_crc32c(&mut original, BTRFS_TEST_FS_TREE_LOGICAL);
+        let extent_leaf = 0x18_000;
+        let mut record = ffs_btrfs::BtrfsExtentItem {
+            refs: 1,
+            generation: 1,
+            flags: ffs_btrfs::BtrfsExtentItem::FLAG_DATA,
+        }
+        .to_bytes();
+        record.push(ffs_btrfs::BTRFS_ITEM_EXTENT_DATA_REF);
+        record.extend_from_slice(
+            &ffs_btrfs::BtrfsExtentDataRef {
+                root: BTRFS_FS_TREE_OBJECTID,
+                objectid: 257,
+                offset: 0,
+                count: 1,
+            }
+            .to_bytes(),
+        );
+        write_btrfs_leaf_item(
+            &mut original,
+            extent_leaf,
+            0,
+            u64::try_from(BTRFS_TEST_FILE_DATA_LOGICAL).unwrap(),
+            ffs_btrfs::BTRFS_ITEM_EXTENT_ITEM,
+            4096,
+            4000,
+            u32::try_from(record.len()).unwrap(),
+        );
+        original[extent_leaf + 4000..extent_leaf + 4000 + record.len()].copy_from_slice(&record);
+        original[extent_leaf + 0x60..extent_leaf + 0x64].copy_from_slice(&1_u32.to_le_bytes());
+        stamp_btrfs_test_tree_block_crc32c(&mut original, extent_leaf);
         for num_devices in [2_u64, 3] {
             for skip_validation in [false, true] {
-                let mut image = build_btrfs_fsops_image();
+                let mut image = original.clone();
                 let sb = BTRFS_SUPER_INFO_OFFSET;
                 image[sb + 0x88..sb + 0x90].copy_from_slice(&num_devices.to_le_bytes());
                 let checksum = ffs_types::crc32c(&image[sb + 0x20..sb + 4096]);
@@ -91671,6 +91708,10 @@ mod tests {
                 assert!(fs.is_writable());
                 assert_eq!(fs.write(&cx, file.ino, 0, b"reconciled").unwrap(), 10);
                 assert_eq!(fs.read(&cx, file.ino, 0, 10).unwrap(), b"reconciled");
+                assert_eq!(
+                    fs.read(&cx, file.ino, 0, 128).unwrap(),
+                    b"reconciled btrfs fsops"
+                );
             }
         }
     }
