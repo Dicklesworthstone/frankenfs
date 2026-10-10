@@ -12,7 +12,10 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
-#[command(name = "ffs-fat", about = "Read offline FAT16/FAT32 images without modifying them")]
+#[command(
+    name = "ffs-fat",
+    about = "Read offline FAT16/FAT32 images without modifying them"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -136,12 +139,25 @@ fn main() -> Result<()> {
             }
             stdout.flush()?;
         }
-        Command::Mount { image, mountpoint, offline_image, uid, gid } => {
+        Command::Mount {
+            image,
+            mountpoint,
+            offline_image,
+            uid,
+            gid,
+        } => {
             if !offline_image {
                 bail!("--offline-image is required; shared locks do not exclude unrelated writers");
             }
-            let mountpoint = mountpoint.canonicalize().context("resolve FAT mountpoint")?;
-            if !mountpoint.is_dir() || std::fs::read_dir(&mountpoint)?.next().transpose()?.is_some() {
+            let mountpoint = mountpoint
+                .canonicalize()
+                .context("resolve FAT mountpoint")?;
+            if !mountpoint.is_dir()
+                || std::fs::read_dir(&mountpoint)?
+                    .next()
+                    .transpose()?
+                    .is_some()
+            {
                 bail!("FAT mountpoint must be an existing empty directory");
             }
             if image.image.canonicalize()?.starts_with(&mountpoint) {
@@ -155,7 +171,9 @@ fn main() -> Result<()> {
                 auto_unmount: true,
                 ..ffs_fuse::MountOptions::default()
             };
-            eprintln!("experimental FAT read-only mount; modification times use a UTC wall-clock projection");
+            eprintln!(
+                "experimental FAT read-only mount; modification times use a UTC wall-clock projection"
+            );
             let _ = ffs_fuse::mount(Box::new(fs), &mountpoint, &options)?;
         }
     }
@@ -169,7 +187,14 @@ mod tests {
     #[test]
     fn clap_accepts_explicit_ranges_and_has_no_write_switch() {
         let cli = Cli::try_parse_from([
-            "ffs-fat", "cat", "disk.img", "--offset", "1024", "--length", "4096", "/hello.txt",
+            "ffs-fat",
+            "cat",
+            "disk.img",
+            "--offset",
+            "1024",
+            "--length",
+            "4096",
+            "/hello.txt",
         ])
         .unwrap();
         let Command::Cat { image, path } = cli.command else {
@@ -179,6 +204,15 @@ mod tests {
         assert_eq!(path, "/hello.txt");
         assert!(Cli::try_parse_from(["ffs-fat", "cat", "disk.img", "/hello.txt", "--rw"]).is_err());
         assert!(Cli::try_parse_from(["ffs-fat", "mount", "disk.img", "/mnt/fat"]).is_err());
-        assert!(Cli::try_parse_from(["ffs-fat", "mount", "disk.img", "/mnt/fat", "--offline-image"]).is_ok());
+        assert!(
+            Cli::try_parse_from([
+                "ffs-fat",
+                "mount",
+                "disk.img",
+                "/mnt/fat",
+                "--offline-image"
+            ])
+            .is_ok()
+        );
     }
 }

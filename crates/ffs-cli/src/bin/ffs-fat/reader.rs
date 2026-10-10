@@ -99,7 +99,10 @@ impl Entry {
             || name == ".."
             || name.chars().any(|c| c == '\0' || c == '/' || c == '\\')
         {
-            return Err(corrupt(self.offset, "FAT name is not a safe path component"));
+            return Err(corrupt(
+                self.offset,
+                "FAT name is not a safe path component",
+            ));
         }
         if name.len() > 255 {
             return Err(FfsError::NameTooLong);
@@ -157,7 +160,9 @@ impl FatVolume {
             .checked_add(length)
             .ok_or_else(|| FfsError::InvalidGeometry("FAT volume range overflow".into()))?;
         if length < 512 || end > device.len_bytes() {
-            return Err(FfsError::InvalidGeometry("FAT volume range exceeds backing".into()));
+            return Err(FfsError::InvalidGeometry(
+                "FAT volume range exceeds backing".into(),
+            ));
         }
         let mut boot = [0_u8; 512];
         device.read_exact_at(cx, ByteOffset(base), &mut boot)?;
@@ -214,8 +219,8 @@ impl FatVolume {
             ));
         }
         for copy in self.copies() {
-            let start = self.geometry.entry_offset(copy, 2).map_err(parse_error)?
-                - 2 * width as u64;
+            let start =
+                self.geometry.entry_offset(copy, 2).map_err(parse_error)? - 2 * width as u64;
             let mut header = [0_u8; 8];
             self.read_exact(cx, start, &mut header[..2 * width])?;
             let (first, second, expected, clean) = match self.geometry.kind() {
@@ -226,10 +231,8 @@ impl FatVolume {
                     0xFFFF,
                 ),
                 FatKind::Fat32 => (
-                    u32::from_le_bytes([header[0], header[1], header[2], header[3]])
-                        & 0x0FFF_FFFF,
-                    u32::from_le_bytes([header[4], header[5], header[6], header[7]])
-                        & 0x0FFF_FFFF,
+                    u32::from_le_bytes([header[0], header[1], header[2], header[3]]) & 0x0FFF_FFFF,
+                    u32::from_le_bytes([header[4], header[5], header[6], header[7]]) & 0x0FFF_FFFF,
                     0x0FFF_FF00 | u32::from(media),
                     0x0FFF_FFFF,
                 ),
@@ -250,7 +253,10 @@ impl FatVolume {
             let geometry = FatGeometry::parse(&backup, self.geometry.volume_bytes())
                 .map_err(|error| corrupt(offset, error.to_string()))?;
             if geometry != self.geometry || backup[21] != media {
-                return Err(corrupt(offset, "FAT primary and backup boot geometry disagree"));
+                return Err(corrupt(
+                    offset,
+                    "FAT primary and backup boot geometry disagree",
+                ));
             }
         }
         // FSInfo free counts are hints. Read-only operation never repairs them.
@@ -322,7 +328,9 @@ impl FatVolume {
     ) -> Result<()> {
         for (index, bytes) in bytes.chunks_exact(32).enumerate() {
             if *slots >= MAX_DIRECTORY_SLOTS {
-                return Err(FfsError::UnsupportedFeature("FAT directory exceeds 65536 slots".into()));
+                return Err(FfsError::UnsupportedFeature(
+                    "FAT directory exceeds 65536 slots".into(),
+                ));
             }
             *slots += 1;
             let slot: &[u8; 32] = bytes
@@ -364,7 +372,9 @@ impl FatVolume {
             let displayed = entry.name()?;
             let short = entry.native.ascii_short_name();
             if displayed.eq_ignore_ascii_case(name)
-                || short.as_deref().is_some_and(|alias| alias.eq_ignore_ascii_case(name))
+                || short
+                    .as_deref()
+                    .is_some_and(|alias| alias.eq_ignore_ascii_case(name))
             {
                 if found.is_some() {
                     return Err(corrupt(entry.offset, "ambiguous FAT name or short alias"));
@@ -373,7 +383,7 @@ impl FatVolume {
             }
         }
         checkpoint(cx)?;
-        found.ok_or(FfsError::NotFound)
+        found.ok_or_else(|| FfsError::NotFound(name.to_owned()))
     }
 
     /// Resolve an image path without following any host path or native '..'.
@@ -396,7 +406,9 @@ impl FatVolume {
         let mut result = None;
         for (index, component) in components.iter().enumerate() {
             if *component == ".." {
-                return Err(FfsError::Format("parent traversal is not accepted in image paths".into()));
+                return Err(FfsError::Format(
+                    "parent traversal is not accepted in image paths".into(),
+                ));
             }
             let entry = self.lookup(cx, directory, component)?;
             if entry.native.is_directory() && !ancestors.insert(entry.native.first_cluster) {
@@ -466,7 +478,10 @@ impl FatVolume {
         checkpoint(cx)?;
         let mut clusters = Vec::new();
         if required > u64::from(self.geometry.cluster_count()) {
-            return Err(corrupt(report_offset, "FAT size exceeds the volume's data capacity"));
+            return Err(corrupt(
+                report_offset,
+                "FAT size exceeds the volume's data capacity",
+            ));
         }
         if first == 0 {
             if required != 0 {
@@ -491,7 +506,9 @@ impl FatVolume {
             if clusters.len() == clusters.capacity() {
                 clusters
                     .try_reserve_exact(1024.min(limit - clusters.len()))
-                    .map_err(|error| FfsError::Format(format!("FAT chain allocation failed: {error}")))?;
+                    .map_err(|error| {
+                        FfsError::Format(format!("FAT chain allocation failed: {error}"))
+                    })?;
             }
             clusters.push(cluster);
             let Some(next) = table.next(cx, cluster)? else {
@@ -598,7 +615,10 @@ impl<'a> FatTable<'a> {
                 }
             };
             if previous.is_some_and(|other| other != value) {
-                return Err(corrupt(position, format!("FAT copies disagree at cluster {cluster}")));
+                return Err(corrupt(
+                    position,
+                    format!("FAT copies disagree at cluster {cluster}"),
+                ));
             }
             previous = Some(value);
         }

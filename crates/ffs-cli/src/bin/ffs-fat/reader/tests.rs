@@ -122,8 +122,8 @@ impl Image {
 
     fn set_copy_link(&mut self, copy: usize, cluster: u32, value: u32) {
         let width = self.kind.entry_bytes() as usize;
-        let at = self.base + self.fat_start + copy * self.fat_sectors * 512
-            + cluster as usize * width;
+        let at =
+            self.base + self.fat_start + copy * self.fat_sectors * 512 + cluster as usize * width;
         self.bytes[at..at + width].copy_from_slice(&value.to_le_bytes()[..width]);
     }
 
@@ -171,9 +171,15 @@ impl ByteDevice for Memory {
         if self.fail_at == Some(offset.0) {
             return Err(FfsError::Cancelled);
         }
-        let start = usize::try_from(offset.0).map_err(|_| io::Error::from(io::ErrorKind::UnexpectedEof))?;
-        let end = start.checked_add(dst.len()).ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
-        let bytes = self.bytes.get(start..end).ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
+        let start =
+            usize::try_from(offset.0).map_err(|_| io::Error::from(io::ErrorKind::UnexpectedEof))?;
+        let end = start
+            .checked_add(dst.len())
+            .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
+        let bytes = self
+            .bytes
+            .get(start..end)
+            .ok_or_else(|| io::Error::from(io::ErrorKind::UnexpectedEof))?;
         dst.copy_from_slice(bytes);
         Ok(())
     }
@@ -205,7 +211,10 @@ fn fat16_and_fat32_read_fragmented_files_nested_paths_and_eof() {
         let chain = volume.file_chain(&cx, &entry).unwrap();
         assert_eq!(chain.clusters, [5, 9, 7]);
         assert_eq!(volume.read(&cx, &chain, 0, 4096).unwrap(), payload());
-        assert_eq!(volume.read(&cx, &chain, 510, 520).unwrap(), payload()[510..]);
+        assert_eq!(
+            volume.read(&cx, &chain, 510, 520).unwrap(),
+            payload()[510..]
+        );
         assert!(volume.read(&cx, &chain, 1029, 1).unwrap().is_empty());
         assert!(volume.read(&cx, &chain, u64::MAX, 10).unwrap().is_empty());
         let nested = volume.resolve(&cx, "/SUBDIR/nested.bin").unwrap().unwrap();
@@ -213,8 +222,14 @@ fn fat16_and_fat32_read_fragmented_files_nested_paths_and_eof() {
         assert_eq!(volume.read(&cx, &chain, 0, 4).unwrap(), b"FAT!");
         let empty = volume.resolve(&cx, "/empty.txt").unwrap().unwrap();
         assert!(volume.file_chain(&cx, &empty).unwrap().clusters.is_empty());
-        assert!(matches!(volume.resolve(&cx, "/HELLO.TXT/child"), Err(FfsError::NotDirectory)));
-        assert!(matches!(volume.resolve(&cx, "/missing"), Err(FfsError::NotFound)));
+        assert!(matches!(
+            volume.resolve(&cx, "/HELLO.TXT/child"),
+            Err(FfsError::NotDirectory)
+        ));
+        assert!(matches!(
+            volume.resolve(&cx, "/missing"),
+            Err(FfsError::NotFound(_))
+        ));
         assert!(volume.resolve(&cx, "/../HELLO.TXT").is_err());
     }
 }
@@ -232,7 +247,13 @@ fn live_chain_rejects_free_bad_reserved_out_of_range_and_premature_end() {
             image.set_link(5, value);
             let volume = image.volume();
             let file = volume.resolve(&cx, "/HELLO.TXT").unwrap().unwrap();
-            assert!(matches!(volume.file_chain(&cx, &file), Err(FfsError::Corruption { .. })), "{kind:?} {value:x}");
+            assert!(
+                matches!(
+                    volume.file_chain(&cx, &file),
+                    Err(FfsError::Corruption { .. })
+                ),
+                "{kind:?} {value:x}"
+            );
         }
     }
 }
@@ -245,12 +266,24 @@ fn cycles_and_mirror_disagreement_fail_before_data_is_returned() {
         image.set_link(7, 9);
         let volume = image.volume();
         let file = volume.resolve(&cx, "/HELLO.TXT").unwrap().unwrap();
-        assert!(volume.file_chain(&cx, &file).unwrap_err().to_string().contains("cyclic"));
+        assert!(
+            volume
+                .file_chain(&cx, &file)
+                .unwrap_err()
+                .to_string()
+                .contains("cyclic")
+        );
         let mut image = Image::new(kind);
         image.set_copy_link(1, 5, image.end());
         let volume = image.volume();
         let file = volume.resolve(&cx, "/HELLO.TXT").unwrap().unwrap();
-        assert!(volume.file_chain(&cx, &file).unwrap_err().to_string().contains("copies disagree"));
+        assert!(
+            volume
+                .file_chain(&cx, &file)
+                .unwrap_err()
+                .to_string()
+                .contains("copies disagree")
+        );
     }
 }
 
@@ -309,7 +342,10 @@ fn read_cancellation_is_not_successful_short_data_or_mirror_retry() {
     let entry = volume.resolve(&cx, "/HELLO.TXT").unwrap().unwrap();
     let chain = volume.file_chain(&cx, &entry).unwrap();
     let before = reads.load(Ordering::Relaxed);
-    assert!(matches!(volume.read(&cx, &chain, 0, 1029), Err(FfsError::Cancelled)));
+    assert!(matches!(
+        volume.read(&cx, &chain, 0, 1029),
+        Err(FfsError::Cancelled)
+    ));
     assert_eq!(reads.load(Ordering::Relaxed) - before, 2);
 }
 
@@ -400,7 +436,10 @@ fn long_names_cross_sectors_and_fat32_root_clusters_without_losing_alias_identit
                 .enumerate()
             {
                 let at = start + index;
-                let unit = text.get(at).copied().unwrap_or(if at == text.len() { 0 } else { 0xFFFF });
+                let unit =
+                    text.get(at)
+                        .copied()
+                        .unwrap_or(if at == text.len() { 0 } else { 0xFFFF });
                 slot[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
             }
         }
@@ -409,10 +448,17 @@ fn long_names_cross_sectors_and_fat32_root_clusters_without_losing_alias_identit
         let volume = image.volume();
         let entries = volume.list(&cx, Directory::Root).unwrap();
         assert_eq!(entries.len(), 1);
-        let named = volume.lookup(&cx, Directory::Root, "Long fragmented name.txt").unwrap();
+        let named = volume
+            .lookup(&cx, Directory::Root, "Long fragmented name.txt")
+            .unwrap();
         let aliased = volume.lookup(&cx, Directory::Root, "longfr~1.txt").unwrap();
         assert_eq!(named.offset, aliased.offset);
-        assert_eq!(volume.read(&cx, &volume.file_chain(&cx, &named).unwrap(), 0, 2048).unwrap(), payload());
+        assert_eq!(
+            volume
+                .read(&cx, &volume.file_chain(&cx, &named).unwrap(), 0, 2048)
+                .unwrap(),
+            payload()
+        );
     }
 }
 
