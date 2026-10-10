@@ -71,6 +71,12 @@ pub struct BtrfsSuperblock {
 }
 
 impl BtrfsSuperblock {
+    /// Whether this device is an immutable seed (Linux superblock flag bit 32).
+    #[must_use]
+    pub const fn is_seeding(&self) -> bool {
+        self.flags & (1_u64 << 32) != 0
+    }
+
     /// Typed view of `incompat_flags`.
     #[must_use]
     pub const fn incompat_features(&self) -> BtrfsIncompatFeatures {

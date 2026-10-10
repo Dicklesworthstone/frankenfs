@@ -10765,6 +10765,10 @@ impl OpenFs {
     /// - `txn_commit_conflict`: on FCW conflict with conflict details
     #[allow(clippy::cast_possible_truncation)]
     pub fn commit_transaction(&self, cx: &Cx, txn: Transaction) -> Result<CommitSeq, CommitError> {
+        self.reject_btrfs_seed_mutation()
+            .map_err(|error| CommitError::DurabilityFailure {
+                detail: error.to_string(),
+            })?;
         if self.btrfs_devices.is_some() {
             return Err(CommitError::DurabilityFailure {
                 detail: "attached btrfs devices are read-only; transaction was not published"
@@ -10901,6 +10905,10 @@ impl OpenFs {
         cx: &Cx,
         txn: Transaction,
     ) -> Result<CommitSeq, CommitError> {
+        self.reject_btrfs_seed_mutation()
+            .map_err(|error| CommitError::DurabilityFailure {
+                detail: error.to_string(),
+            })?;
         if self.btrfs_devices.is_some() {
             return Err(CommitError::DurabilityFailure {
                 detail: "attached btrfs devices are read-only; transaction was not published"
@@ -11379,6 +11387,8 @@ impl OpenFs {
 
         self.validate_repair_writeback_blocks(recovered_blocks)?;
 
+        self.reject_btrfs_seed_mutation()?;
+
         let mut scope = self.begin_request_scope(cx, RequestOp::RepairWriteback)?;
         if let Err(err) = self.reject_stale_repair_writeback_blocks(cx, &scope, recovered_blocks) {
             self.cleanup_repair_writeback_scope(cx, scope);
@@ -11427,6 +11437,7 @@ impl OpenFs {
         cx: &Cx,
         device: &D,
     ) -> ffs_error::Result<usize> {
+        self.reject_btrfs_seed_mutation()?;
         let mut flushed_through = self.mvcc_flushed_through.lock();
         let (flushed, durable_through) =
             self.mvcc_store
@@ -11609,6 +11620,15 @@ impl OpenFs {
     /// before unmounting to ensure data written through the FUSE interface
     /// survives across remounts.  Returns the number of blocks flushed.
     pub fn flush_mvcc_to_device(&self, cx: &Cx) -> ffs_error::Result<usize> {
+        if let Err(error) = self.reject_btrfs_seed_mutation() {
+            // Preserve the no-op flush of a clean read-only seed, but never
+            // persist versions recovered from an external WAL onto the seed.
+            return if self.mvcc_version_count() == 0 {
+                Ok(0)
+            } else {
+                Err(error)
+            };
+        }
         self.handle_ext4_write_result(
             "flush_mvcc_to_device",
             (|| {
@@ -11689,7 +11709,20 @@ impl OpenFs {
         (!reasons.is_empty()).then(|| reasons.join(", "))
     }
 
+    fn reject_btrfs_seed_mutation(&self) -> Result<(), FfsError> {
+        if self
+            .btrfs_superblock()
+            .is_some_and(BtrfsSuperblock::is_seeding)
+        {
+            return Err(FfsError::UnsupportedFeature(
+                "btrfs seed devices are read-only; mutation is not permitted".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
     pub fn enable_writes(&mut self, cx: &Cx) -> Result<(), FfsError> {
+        self.reject_btrfs_seed_mutation()?;
         match &self.flavor {
             FsFlavor::Ext4(sb) => {
                 if let Some(reason) = Self::ext4_writer_unsupported_features(sb) {
@@ -12864,6 +12897,7 @@ impl OpenFs {
         cx: &Cx,
         txn: Transaction,
     ) -> std::result::Result<(CommitSeq, Jbd2WriteStats), FfsError> {
+        self.reject_btrfs_seed_mutation()?;
         let jbd2_mutex = self.jbd2_writer.as_ref().ok_or_else(|| {
             FfsError::Format("no JBD2 writer attached for journaled commit".to_owned())
         })?;
@@ -91305,6 +91339,119 @@ mod tests {
             backing
         );
         eprintln!("SCENARIO_RESULT|scenario_id=btrfs_dev_info_live_corruption|outcome=PASS");
+    }
+
+    #[test]
+    fn btrfs_enable_writes_preserves_read_only_seed_devices() {
+        let cx = Cx::for_testing();
+        for seeding in [false, true] {
+            for skip_validation in [false, true] {
+                for ephemeral in [false, true] {
+                    let mut image = build_btrfs_fsops_image();
+                    let sb = BTRFS_SUPER_INFO_OFFSET;
+                    // Linux BTRFS_SUPER_FLAG_SEEDING is bit 32, independent
+                    // of the low WRITTEN bit also present on normal images.
+                    let flags = 1_u64 | if seeding { 1_u64 << 32 } else { 0 };
+                    image[sb + 0x38..sb + 0x40].copy_from_slice(&flags.to_le_bytes());
+                    let checksum = ffs_types::crc32c(&image[sb + 0x20..sb + 4096]);
+                    image[sb..sb + 4].copy_from_slice(&checksum.to_le_bytes());
+                    let dev = TestDevice::from_vec(image.clone());
+                    let options = OpenOptions {
+                        skip_validation,
+                        btrfs_rw_ephemeral_ok: ephemeral,
+                        ..OpenOptions::default()
+                    };
+                    let mut fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &options)
+                        .expect("both ordinary and seed images remain readable");
+                    let file = fs
+                        .lookup(&cx, InodeNumber(1), OsStr::new("hello.txt"))
+                        .expect("seed file lookup");
+                    assert_eq!(
+                        fs.read(&cx, file.ino, 0, 128).unwrap(),
+                        b"hello from btrfs fsops"
+                    );
+                    let result = fs.enable_writes(&cx);
+                    if seeding {
+                        let error = result.expect_err("seed image must not become writable");
+                        assert!(matches!(error, FfsError::UnsupportedFeature(_)));
+                        assert!(error.to_string().contains("seed"));
+                        assert!(!fs.is_writable());
+                        assert!(fs.btrfs_alloc_state.is_none());
+                        assert_eq!(fs.mvcc_store.version_count(), 0);
+                    } else {
+                        result.expect("ordinary image must still permit writes");
+                        assert!(fs.is_writable());
+                    }
+                    drop(fs);
+                    assert_eq!(dev.snapshot_bytes(), image);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn btrfs_seed_rejects_public_transaction_and_repair_mutations() {
+        let cx = Cx::for_testing();
+        let mut image = build_btrfs_fsops_image();
+        let sb = BTRFS_SUPER_INFO_OFFSET;
+        image[sb + 0x38..sb + 0x40].copy_from_slice(&(1_u64 << 32).to_le_bytes());
+        let checksum = ffs_types::crc32c(&image[sb + 0x20..sb + 4096]);
+        image[sb..sb + 4].copy_from_slice(&checksum.to_le_bytes());
+        let dev = TestDevice::from_vec(image.clone());
+        let fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default())
+            .expect("open seed");
+        for ssi in [false, true] {
+            let mut txn = fs.begin_transaction();
+            txn.stage_write(BlockNumber(0), vec![0xAB; 4096]);
+            let result = if ssi {
+                fs.commit_transaction_ssi(&cx, txn)
+            } else {
+                fs.commit_transaction(&cx, txn)
+            };
+            let error = result.expect_err("seed transaction must not publish");
+            assert!(matches!(error, CommitError::DurabilityFailure { .. }));
+            assert!(error.to_string().contains("seed"));
+        }
+        let mut scope = RequestScope::empty();
+        let mut txn = fs.begin_transaction();
+        txn.stage_write(BlockNumber(0), vec![0xBC; 4096]);
+        scope.tx = Some(txn);
+        let error = fs.commit_request_scope(&cx, &mut scope).unwrap_err();
+        assert!(error.to_string().contains("seed"));
+        let mut txn = fs.begin_transaction();
+        txn.stage_write(BlockNumber(0), vec![0xCD; 4096]);
+        let error = fs.commit_transaction_journaled(&cx, txn).unwrap_err();
+        assert!(error.to_string().contains("seed"));
+        assert!(fs.begin_writeback_batch_scope(&cx).is_err());
+        assert!(fs.begin_request_scope(&cx, RequestOp::Write).is_err());
+        let read = fs
+            .begin_request_scope(&cx, RequestOp::Read)
+            .expect("read scope");
+        fs.end_request_scope(&cx, RequestOp::Read, read).unwrap();
+        let error = fs
+            .repair_writeback_blocks_via_mounted_mutation_path(
+                &cx,
+                &[RepairWritebackBlock {
+                    block: BlockNumber(0),
+                    expected_current: &image[..4096],
+                    data: &[0xDE; 4096],
+                }],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("seed"));
+        assert_eq!(fs.mvcc_version_count(), 0);
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+        assert_eq!(fs.flush_mvcc_to_device(&cx).unwrap(), 0);
+        assert_eq!(dev.snapshot_bytes(), image);
+
+        // A recovered external WAL can already contain versions without any
+        // public write admission. The physical flush boundary must refuse them.
+        let mut recovered = fs.mvcc_store.begin();
+        recovered.stage_write(BlockNumber(0), vec![0xEF; 4096]);
+        fs.mvcc_store.commit(recovered).unwrap();
+        let error = fs.flush_mvcc_to_device(&cx).unwrap_err();
+        assert!(error.to_string().contains("seed"));
+        assert_eq!(dev.snapshot_bytes(), image);
     }
 
     #[test]

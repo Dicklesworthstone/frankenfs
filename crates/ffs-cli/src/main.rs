@@ -8013,6 +8013,9 @@ fn build_mount_background_scrub_plan(
     }
 
     if let Some(sb) = open_fs.btrfs_superblock() {
+        if repair_writes_enabled && sb.is_seeding() {
+            bail!("btrfs seed devices are read-only; background repair is not permitted");
+        }
         if sb.num_devices != 1 {
             bail!("multi-device background scrub and repair are not yet supported");
         }
@@ -14177,6 +14180,145 @@ mod tests {
                 && f.kind == ffs_repair::scrub::CorruptionKind::ChecksumMismatch),
             "mounted background scrub validator must detect corrupted directory block {root_dir_block}: {:?}",
             report.findings
+        );
+    }
+
+    fn create_btrfs_seed_image(payload: &[u8]) -> Option<(PathBuf, PathBuf)> {
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let source = dir.join("source");
+        std::fs::create_dir(&source).expect("source directory");
+        std::fs::write(source.join("payload"), payload).expect("source file");
+        let image = dir.join("seed.btrfs");
+        std::fs::File::create(&image)
+            .and_then(|file| file.set_len(128 * 1024 * 1024))
+            .expect("sparse image");
+        let formatted = std::process::Command::new("mkfs.btrfs")
+            .args(["-f", "-m", "single", "-d", "single", "--rootdir"])
+            .arg(&source)
+            .arg(&image)
+            .output();
+        let Ok(formatted) = formatted else {
+            assert!(
+                std::env::var_os("FFS_REQUIRE_ORACLES").is_none_or(|v| v != "1"),
+                "FFS_REQUIRE_ORACLES=1 but mkfs.btrfs is unavailable"
+            );
+            eprintln!("SKIP: mkfs.btrfs unavailable");
+            return None;
+        };
+        assert!(
+            formatted.status.success(),
+            "{}",
+            String::from_utf8_lossy(&formatted.stderr)
+        );
+        let cx = Cx::for_testing();
+        {
+            let mut ordinary = OpenFs::open(&cx, &image).expect("ordinary image opens");
+            ordinary
+                .enable_writes(&cx)
+                .expect("ordinary image permits writes");
+            assert!(ordinary.is_writable());
+        }
+        let tuned = std::process::Command::new("btrfstune")
+            .args(["-S", "1"])
+            .arg(&image)
+            .output();
+        let Ok(tuned) = tuned else {
+            assert!(
+                std::env::var_os("FFS_REQUIRE_ORACLES").is_none_or(|v| v != "1"),
+                "FFS_REQUIRE_ORACLES=1 but btrfstune is unavailable"
+            );
+            eprintln!("SKIP: btrfstune unavailable");
+            return None;
+        };
+        assert!(
+            tuned.status.success(),
+            "{}",
+            String::from_utf8_lossy(&tuned.stderr)
+        );
+        Some((dir, image))
+    }
+
+    #[test]
+    fn btrfs_seed_image_reads_but_refuses_write_admission_and_repair() {
+        let payload = b"persistent seed payload\n".repeat(1024);
+        let Some((dir, image)) = create_btrfs_seed_image(&payload) else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let before = blake3::hash(&std::fs::read(&image).expect("seed image"));
+        let ledger = dir.join("repair.jsonl");
+        let config = MountBackgroundScrubConfig::resolve(
+            MountBackgroundScrubRequest::new(
+                MountAccessMode::ReadOnly,
+                MountBackgroundScrubMode::Enabled,
+                MountBackgroundRepairMode::Enabled,
+            ),
+            Some(1),
+            Some(ledger.clone()),
+        )
+        .expect("repair config");
+        for ephemeral in [false, true] {
+            let mut fs = OpenFs::open_with_options(
+                &cx,
+                &image,
+                &OpenOptions {
+                    btrfs_rw_ephemeral_ok: ephemeral,
+                    ..OpenOptions::default()
+                },
+            )
+            .expect("seed image remains readable");
+            assert_ne!(fs.btrfs_superblock().unwrap().flags & (1_u64 << 32), 0);
+            let file = fs
+                .lookup(
+                    &cx,
+                    ffs_types::InodeNumber(1),
+                    std::ffi::OsStr::new("payload"),
+                )
+                .expect("seed file lookup");
+            assert_eq!(
+                fs.read(&cx, file.ino, 0, u32::try_from(payload.len()).unwrap())
+                    .unwrap(),
+                payload
+            );
+            let error = fs.enable_writes(&cx).expect_err("seed write admission");
+            assert!(error.to_string().contains("seed"), "{error}");
+            assert!(!fs.is_writable());
+            let plan = super::build_mount_background_scrub_plan(&image, &fs, false)
+                .expect("detection-only scrub remains available");
+            assert!(!plan.groups.is_empty());
+            let error = start_mount_background_scrub(
+                &image,
+                &fs,
+                &config,
+                None,
+                "seed-write-admission",
+                "bd-hk5w3",
+            )
+            .err()
+            .expect("background repair must not start on a seed");
+            assert!(error.to_string().contains("seed"), "{error:#}");
+            assert!(
+                !ledger.exists(),
+                "rejected repair must not start its ledger/thread"
+            );
+        }
+        assert_eq!(
+            blake3::hash(&std::fs::read(&image).expect("image after refusals")),
+            before
+        );
+        let checked = std::process::Command::new("btrfs")
+            .args(["check", "--readonly"])
+            .arg(&image)
+            .output()
+            .expect("btrfs check");
+        assert!(
+            checked.status.success(),
+            "{}",
+            String::from_utf8_lossy(&checked.stderr)
+        );
+        eprintln!(
+            "SCENARIO_RESULT|scenario_id=btrfs_seed_write_admission|outcome=PASS|image_blake3={before}|artifacts={}",
+            dir.display()
         );
     }
 
