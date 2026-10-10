@@ -22,7 +22,7 @@ pub fn checkpoint(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FfsError::Cancelled)
 }
 
-fn parse_error(error: ParseError) -> FfsError {
+fn parse_error(error: &ParseError) -> FfsError {
     FfsError::Format(error.to_string())
 }
 
@@ -145,7 +145,7 @@ impl FatVolume {
         file.try_lock_shared()
             .map_err(|error| FfsError::Format(format!("cannot lock FAT image: {error}")))?;
         let len = metadata.len();
-        let length = length.unwrap_or(len.saturating_sub(base));
+        let length = length.unwrap_or_else(|| len.saturating_sub(base));
         Self::from_device(cx, Box::new(ReadOnlyImage { file, len }), base, length)
     }
 
@@ -167,7 +167,7 @@ impl FatVolume {
         let mut boot = [0_u8; 512];
         device.read_exact_at(cx, ByteOffset(base), &mut boot)?;
         checkpoint(cx)?;
-        let geometry = FatGeometry::parse(&boot, length).map_err(parse_error)?;
+        let geometry = FatGeometry::parse(&boot, length).map_err(|error| parse_error(&error))?;
         let volume = Self {
             device,
             base,
@@ -219,8 +219,11 @@ impl FatVolume {
             ));
         }
         for copy in self.copies() {
-            let start =
-                self.geometry.entry_offset(copy, 2).map_err(parse_error)? - 2 * width as u64;
+            let start = self
+                .geometry
+                .entry_offset(copy, 2)
+                .map_err(|error| parse_error(&error))?
+                - 2 * width as u64;
             let mut header = [0_u8; 8];
             self.read_exact(cx, start, &mut header[..2 * width])?;
             let (first, second, expected, clean) = match self.geometry.kind() {
@@ -326,16 +329,13 @@ impl FatVolume {
         entries: &mut Vec<Entry>,
         slots: &mut usize,
     ) -> Result<()> {
-        for (index, bytes) in bytes.chunks_exact(32).enumerate() {
+        for (index, slot) in bytes.as_chunks::<32>().0.iter().enumerate() {
             if *slots >= MAX_DIRECTORY_SLOTS {
                 return Err(FfsError::UnsupportedFeature(
                     "FAT directory exceeds 65536 slots".into(),
                 ));
             }
             *slots += 1;
-            let slot: &[u8; 32] = bytes
-                .try_into()
-                .map_err(|_| corrupt(offset, "short FAT directory record"))?;
             let position = offset + (index as u64) * 32;
             let native = decoder
                 .push(slot, self.geometry.kind())
@@ -595,7 +595,9 @@ impl<'a> FatTable<'a> {
         let sector_bytes = u64::from(geometry.sector_bytes());
         let mut previous = None;
         for copy in self.volume.copies() {
-            let position = geometry.entry_offset(copy, cluster).map_err(parse_error)?;
+            let position = geometry
+                .entry_offset(copy, cluster)
+                .map_err(|error| parse_error(&error))?;
             let start = position / sector_bytes * sector_bytes;
             let cache = &mut self.sectors[usize::from(copy)];
             if cache.as_ref().is_none_or(|(offset, _)| *offset != start) {
