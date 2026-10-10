@@ -1,0 +1,164 @@
+#![forbid(unsafe_code)]
+//! Native, read-only NTFS 3.1 inspection and stream extraction by MFT identity.
+
+mod reader;
+
+use anyhow::{Context, Result, bail};
+use asupersync::Cx;
+use clap::{Args, Parser, Subcommand};
+use ffs_ondisk::ntfs::{DATA, NtfsValue};
+use reader::NtfsVolume;
+use std::io::{self, Write};
+use std::path::PathBuf;
+
+#[derive(Debug, Parser)]
+#[command(name = "ffs-ntfs", about = "Inspect immutable NTFS images and extract streams without replay or writes")]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
+
+#[derive(Debug, Args)]
+struct ImageArgs {
+    image: PathBuf,
+    /// Byte offset of an already selected NTFS volume, not a sector number.
+    #[arg(long, default_value_t = 0)]
+    offset: u64,
+    /// Restrict all reads to this many bytes of the selected volume.
+    #[arg(long)]
+    length: Option<u64>,
+    /// Confirm the image is immutable and not mounted by another writer.
+    #[arg(long, required = true)]
+    offline_image: bool,
+}
+impl ImageArgs {
+    fn open(&self, cx: &Cx) -> Result<NtfsVolume> {
+        if !self.offline_image { bail!("--offline-image is required; an advisory lock does not prevent unrelated writers"); }
+        NtfsVolume::open(cx, &self.image, self.offset, self.length)
+            .with_context(|| format!("opening offline NTFS image {}", self.image.display()))
+    }
+}
+
+#[derive(Debug, Args)]
+struct RecordArgs {
+    #[command(flatten)]
+    image: ImageArgs,
+    /// MFT record number, not an on-disk byte offset or a host path.
+    record: u64,
+    /// Refuse a stale file reference if the sequence number differs.
+    #[arg(long)]
+    sequence: Option<u16>,
+}
+
+#[derive(Debug, Subcommand)]
+enum Command {
+    /// Check geometry, MFT bootstrap/mirror agreement and volume version/flags.
+    Inspect { #[command(flatten)] image: ImageArgs },
+    /// Show the attributes and native UTF-16 stream names of an in-use MFT record.
+    Record { #[command(flatten)] file: RecordArgs },
+    /// Stream logical DATA bytes to stdout, including sparse/uninitialized zeroes.
+    Cat {
+        #[command(flatten)]
+        file: RecordArgs,
+        /// Exact native stream name. Empty selects the unnamed DATA stream.
+        #[arg(long, default_value = "")]
+        stream: String,
+        /// Logical starting byte within the stream.
+        #[arg(long, default_value_t = 0)]
+        start: u64,
+        /// Maximum number of output bytes; defaults to the remaining stream.
+        #[arg(long)]
+        bytes: Option<u64>,
+    },
+}
+
+fn json(value: &serde_json::Value) -> Result<()> {
+    let mut out = io::stdout().lock();
+    serde_json::to_writer_pretty(&mut out, value)?;
+    writeln!(out)?;
+    Ok(())
+}
+
+fn main() -> Result<()> {
+    let cli = Cli::parse();
+    let cx = Cx::for_request();
+    match cli.command {
+        Command::Inspect { image } => {
+            let volume = image.open(&cx)?;
+            let g = &volume.geometry;
+            json(&serde_json::json!({
+                "format": "NTFS", "version": "3.1", "read_only": true,
+                "volume_offset": image.offset, "volume_bytes": g.volume_bytes(),
+                "sector_bytes": g.sector_bytes(), "cluster_bytes": g.cluster_bytes(),
+                "record_bytes": g.record_bytes(), "index_bytes": g.index_bytes(),
+                "serial": format!("{:016x}", g.serial()), "mft_cluster": g.mft_cluster(),
+                "mirror_cluster": g.mirror_cluster(), "initialized_mft_records": volume.record_count(),
+                "mft_mirror_record_zero_matches": true, "volume_flags": 0,
+                "scope": "offline MFT/stream read profile; not a filesystem check or recovery validation"
+            }))?;
+        }
+        Command::Record { file } => {
+            let volume = file.image.open(&cx)?;
+            let record = volume.record(&cx, file.record, file.sequence)?;
+            let mut attributes = Vec::new();
+            for attr in record.attributes()? {
+                let (resident, size, initialized, first_vcn, last_vcn) = match &attr.value {
+                    NtfsValue::Resident(data) => (true, data.len() as u64, data.len() as u64, None, None),
+                    NtfsValue::NonResident(value) => (false, value.data_bytes, value.initialized_bytes,
+                        Some(value.first_vcn), Some(value.last_vcn)),
+                };
+                let readability = if attr.kind == DATA {
+                    match volume.data_stream(&cx, &record, &attr.name) {
+                        Ok(stream) => Some(serde_json::json!({"admitted": true, "allocated_bytes": stream.allocated})),
+                        Err(ffs_error::FfsError::Cancelled) => return Err(ffs_error::FfsError::Cancelled.into()),
+                        Err(error) => Some(serde_json::json!({"admitted": false, "error": error.to_string()})),
+                    }
+                } else { None };
+                attributes.push(serde_json::json!({
+                    "type": format!("{:#x}", attr.kind), "instance": attr.id, "flags": attr.flags,
+                    "name": String::from_utf16(&attr.name).ok(), "name_utf16": attr.name,
+                    "resident": resident, "size": size, "initialized": initialized,
+                    "first_vcn": first_vcn, "last_vcn": last_vcn, "read_profile": readability
+                }));
+            }
+            json(&serde_json::json!({"record": record.number, "sequence": record.sequence,
+                "directory": record.is_directory(), "hard_links": record.hard_links,
+                "base_record": record.base.record, "base_sequence": record.base.sequence,
+                "attributes": attributes, "scope": "record metadata; listing does not certify stream readability"}))?;
+        }
+        Command::Cat { file, stream, start, bytes } => {
+            let volume = file.image.open(&cx)?;
+            let record = volume.record(&cx, file.record, file.sequence)?;
+            let name: Vec<u16> = stream.encode_utf16().collect();
+            if name.len() > 255 || name.contains(&0) { bail!("invalid NTFS stream name"); }
+            let stream = volume.data_stream(&cx, &record, &name)?;
+            let length = stream.size.saturating_sub(start).min(bytes.unwrap_or(u64::MAX));
+            let mut done = 0_u64;
+            let mut out = io::stdout().lock();
+            while done < length {
+                let count = (length - done).min(1024 * 1024) as usize;
+                let data = volume.read(&cx, &stream, start + done, count)?;
+                if data.is_empty() { bail!("NTFS stream ended before the validated logical EOF"); }
+                out.write_all(&data)?;
+                done += data.len() as u64;
+            }
+            out.flush()?;
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    #[test]
+    fn cli_requires_offline_acknowledgement_and_accepts_record_ranges() {
+        assert!(Cli::try_parse_from(["ffs-ntfs", "inspect", "disk.img"]).is_err());
+        let cli = Cli::try_parse_from(["ffs-ntfs", "cat", "disk.img", "24", "--offline-image",
+            "--sequence", "7", "--stream", "note", "--start", "512", "--bytes", "1024"]).unwrap();
+        let Command::Cat { file, stream, start, bytes } = cli.command else { panic!("cat"); };
+        assert_eq!((file.record, file.sequence), (24, Some(7)));
+        assert_eq!((stream.as_str(), start, bytes), ("note", 512, Some(1024)));
+        assert!(Cli::try_parse_from(["ffs-ntfs", "inspect", "disk.img", "--offline-image", "--rw"]).is_err());
+    }
+}
