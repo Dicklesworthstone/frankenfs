@@ -11,6 +11,7 @@ pub mod btrfs;
 pub mod crc_incremental;
 pub mod ext4;
 pub mod fat;
+pub mod lznt1;
 pub mod ntfs;
 
 pub use btrfs::{
