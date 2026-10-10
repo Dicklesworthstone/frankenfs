@@ -1,8 +1,8 @@
 //! Bounded directory-tree walks and native $UpCase-based path lookup.
 
 use super::{
-    ATTRIBUTE_LIST, Cx, DATA, FfsError, NtfsFileRecord, NtfsReference, NtfsValue, NtfsVolume,
-    Result, Storage, Stream, checkpoint, corrupt, parse, select_stream, unsupported,
+    Cx, DATA, FfsError, NtfsAttribute, NtfsFileRecord, NtfsReference, NtfsValue, NtfsVolume,
+    Result, Storage, Stream, checkpoint, corrupt, parse, unsupported,
 };
 use ffs_ondisk::ntfs::index::{NtfsFileName, NtfsIndexEntry, NtfsIndexRoot, parse_index_block};
 use std::collections::{BTreeMap, BTreeSet};
@@ -26,8 +26,10 @@ impl NtfsVolume {
         if !record.is_directory() {
             return Err(FfsError::NotDirectory);
         }
-        reject_reparse(record)?;
-        let root = select_stream(&self.geometry, record, 0x90, I30)?;
+        let catalog = self.attributes(cx, record)?;
+        let attributes = catalog.all()?;
+        reject_reparse(&attributes)?;
+        let root = catalog.select(&self.geometry, 0x90, I30)?;
         if !root.resident() {
             return Err(corrupt(0, "INDEX_ROOT must be resident"));
         }
@@ -39,14 +41,13 @@ impl NtfsVolume {
                 "directory index block size differs from admitted boot geometry",
             ));
         }
-        let attributes = record.attributes().map_err(|error| parse(&error))?;
         let external = root.entries.iter().any(|entry| entry.child_vcn.is_some())
             || attributes
                 .iter()
                 .any(|attr| matches!(attr.kind, 0xA0 | 0xB0) && attr.name == I30);
         let (allocation, bitmap) = if external {
-            let allocation = select_stream(&self.geometry, record, 0xA0, I30)?;
-            let bitmap = select_stream(&self.geometry, record, 0xB0, I30)?;
+            let allocation = catalog.select(&self.geometry, 0xA0, I30)?;
+            let bitmap = catalog.select(&self.geometry, 0xB0, I30)?;
             if allocation.resident()
                 || allocation.initialized != allocation.size
                 || !allocation.size.is_multiple_of(u64::from(root.block_bytes))
@@ -121,14 +122,13 @@ impl NtfsVolume {
                 ));
             }
             let target = self.record(cx, reference.record, Some(reference.sequence))?;
-            let attributes = target.attributes().map_err(|error| parse(&error))?;
-            if attributes.iter().any(|attr| attr.kind == ATTRIBUTE_LIST) {
-                return Err(unsupported(
-                    "directory target FILE_NAME requires ATTRIBUTE_LIST assembly",
-                ));
-            }
+            let target_catalog = self.attributes(cx, &target)?;
+            let attributes = target_catalog.all()?;
             let mut matched = false;
             for attr in attributes.iter().filter(|attr| attr.kind == 0x30) {
+                if attr.flags != 0 || !attr.name.is_empty() {
+                    return Err(corrupt(0, "invalid FILE_NAME storage or attribute name"));
+                }
                 let NtfsValue::Resident(value) = &attr.value else {
                     return Err(corrupt(0, "nonresident FILE_NAME"));
                 };
@@ -216,12 +216,15 @@ impl NtfsVolume {
                 ))
             })?;
             record = self.record(cx, reference.record, Some(reference.sequence))?;
-            reject_reparse(&record)?;
+            let catalog = self.attributes(cx, &record)?;
+            reject_reparse(&catalog.all()?)?;
             if record.is_directory() && !ancestors.insert(reference.record) {
                 return Err(corrupt(0, "NTFS directory links to an ancestor"));
             }
         }
-        reject_reparse(&record)?;
+        let catalog = self.attributes(cx, &record)?;
+        reject_reparse(&catalog.all()?)?;
+        drop(catalog);
         if path.ends_with('/') && !record.is_directory() {
             return Err(FfsError::NotDirectory);
         }
@@ -231,7 +234,7 @@ impl NtfsVolume {
 
     fn upcase(&self, cx: &Cx) -> Result<Vec<u16>> {
         let record = self.record(cx, 10, None)?;
-        let stream = select_stream(&self.geometry, &record, DATA, &[])?;
+        let stream = self.select_stream(cx, &record, DATA, &[])?;
         if stream.size != 131_072 || stream.initialized != stream.size {
             return Err(corrupt(
                 0,
@@ -262,13 +265,8 @@ impl NtfsVolume {
     }
 }
 
-fn reject_reparse(record: &NtfsFileRecord) -> Result<()> {
-    if record
-        .attributes()
-        .map_err(|error| parse(&error))?
-        .iter()
-        .any(|attr| attr.kind == 0xC0)
-    {
+fn reject_reparse(attributes: &[NtfsAttribute<'_>]) -> Result<()> {
+    if attributes.iter().any(|attr| attr.kind == 0xC0) {
         return Err(unsupported("NTFS reparse traversal is not implemented"));
     }
     Ok(())

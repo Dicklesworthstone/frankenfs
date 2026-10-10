@@ -3,6 +3,8 @@
 
 This does not build Rust, mount a filesystem, or modify any existing image.
 Missing tools and unsupported native layouts are failures, never skip credit.
+Native tools must actually create ATTRIBUTE_LIST-backed named streams; a
+single-record substitute is not accepted as extension-record coverage.
 """
 from __future__ import annotations
 
@@ -13,6 +15,7 @@ import os
 from pathlib import Path
 import re
 import shutil
+import struct
 import subprocess
 import tempfile
 
@@ -28,6 +31,30 @@ def digest(path: Path) -> str:
         for block in iter(lambda: source.read(1024 * 1024), b""):
             result.update(block)
     return result.hexdigest()
+
+
+def native_extension_records(value: bytes, base_record: int, names: set[str]) -> list[int]:
+    """Inspect the list returned by ntfscat, not candidate-generated metadata."""
+    require(bool(value), "native oracle returned an empty ATTRIBUTE_LIST")
+    offset = 0
+    named_records: dict[str, int] = {}
+    while offset < len(value):
+        require(len(value) - offset >= 26, "truncated native attribute-list header")
+        kind, length, count, start, vcn, reference, _ = struct.unpack_from("<IHBBQQH", value, offset)
+        require(length >= 32 and length % 8 == 0 and offset + length <= len(value),
+                "invalid native attribute-list boundary")
+        require(count == 0 or (start >= 26 and start + count * 2 <= length),
+                "native attribute-list name crosses its entry")
+        raw_name = value[offset + start:offset + start + count * 2] if count else b""
+        name = raw_name.decode("utf-16-le", errors="strict")
+        if kind == 0x80 and vcn == 0 and name in names:
+            require(name not in named_records, "native list has duplicate starting DATA entries")
+            named_records[name] = reference & 0x0000FFFFFFFFFFFF
+        offset += length
+    require(names <= named_records.keys(), "native list omitted seeded named streams")
+    records = sorted({record for record in named_records.values() if record != base_record})
+    require(bool(records), "native fixture did not put named streams in extension records")
+    return records
 
 
 def main() -> None:
@@ -75,6 +102,17 @@ def main() -> None:
         source = root / "named.bin"
         source.write_bytes(named)
         command("ntfscp", "-N", "note", image, source, "/tiny.txt")
+        # Even nonresident attribute headers for these names cannot all fit in
+        # one ordinary FILE record. The independent native list below must
+        # confirm actual extension references, not merely many stream names.
+        extension_streams = {
+            f"extension-{index:02d}": bytes((byte + index) % 256 for byte in range(256)) * (index + 1)
+            for index in range(32)
+        }
+        for name, payload in extension_streams.items():
+            source = root / f"{name}.bin"
+            source.write_bytes(payload)
+            command("ntfscp", "-N", name, image, source, "/tiny.txt")
         before = digest(image)
         listing = command("ntfsls", "-a", "-i", image).decode("utf-8", errors="strict")
         records = {}
@@ -83,6 +121,8 @@ def main() -> None:
             if match:
                 records[match[2]] = int(match[1])
         require(set(payloads) <= records.keys(), "native inode listing did not identify seeded files")
+        raw_list = command("ntfscat", "-i", str(records["tiny.txt"]), "-a", "0x20", image)
+        extension_records = native_extension_records(raw_list, records["tiny.txt"], set(extension_streams))
         info = json.loads(command(binary, "inspect", image, "--offline-image"))
         require(info["format"] == "NTFS" and info["version"] == "3.1", "wrong format/version")
         require(info["read_only"] is True and info["mft_mirror_record_zero_matches"] is True,
@@ -112,6 +152,15 @@ def main() -> None:
                 "candidate named stream differs")
         require(command(binary, "read", image, "/tiny.txt", "--offline-image", "--stream", "note") == named,
                 "candidate path-selected named stream differs")
+        for name, expected in extension_streams.items():
+            require(command("ntfscat", "-i", record, "-n", name, image) == expected,
+                    f"native extension-stream oracle differs: {name}")
+            require(command(binary, "cat", image, record, "--offline-image", "--stream", name) == expected,
+                    f"candidate extension stream differs: {name}")
+            require(command(binary, "read", image, "/tiny.txt", "--offline-image", "--stream", name,
+                            "--start", "507", "--bytes", "1031") == expected[507:1538],
+                    f"candidate extension path/range differs: {name}")
+            report["streams_checked"].append({"record": int(record), "stream": name, "size": len(expected)})
         require(digest(image) == before, "read operations changed the original image")
         disk = root / "partitioned.img"
         with disk.open("xb") as target, image.open("rb") as source:
@@ -122,9 +171,14 @@ def main() -> None:
         require(command(binary, "cat", disk, str(records["large.bin"]), "--offline-image",
                         "--offset", "1048576", "--length", str(image.stat().st_size)) == payloads["large.bin"],
                 "selected-partition data differs")
+        require(command(binary, "read", disk, "/tiny.txt", "--offline-image", "--stream", "extension-31",
+                        "--offset", "1048576", "--length", str(image.stat().st_size)) == extension_streams["extension-31"],
+                "selected-partition extension stream differs")
         require(digest(disk) == disk_before, "candidate modified image or adjacent partition bytes")
         report.update(status="passed", image_sha256=before, partitioned_sha256=disk_before,
-                      named_stream_checked=True, directory_and_path_reads_checked=True)
+                      named_stream_checked=True, directory_and_path_reads_checked=True,
+                      attribute_list_sha256=hashlib.sha256(raw_list).hexdigest(),
+                      native_extension_records=extension_records, extension_streams_checked=len(extension_streams))
         print(json.dumps(report, indent=2))
     except Exception as error:
         report.update(status="failed", error=str(error))

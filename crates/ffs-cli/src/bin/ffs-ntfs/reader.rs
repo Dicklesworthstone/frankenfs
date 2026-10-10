@@ -252,7 +252,7 @@ impl NtfsVolume {
                 "NTFS MFT bootstrap and MFTMirr disagree; no automatic recovery",
             ));
         }
-        let mft = select_stream(&geometry, &primary, DATA, &[])?;
+        let mft = attributes::bootstrap_mft(&source, &geometry, cx, &primary)?;
         let Storage::Mapped(runs) = &mft.storage else {
             return Err(corrupt(0, "MFT DATA must be nonresident"));
         };
@@ -283,7 +283,7 @@ impl NtfsVolume {
             ));
         }
         let record = volume.record(cx, 3, None)?;
-        let info = select_stream(&volume.geometry, &record, VOLUME_INFORMATION, &[])?;
+        let info = volume.select_stream(cx, &record, VOLUME_INFORMATION, &[])?;
         if !info.resident() || info.size < 12 || info.size > 4096 {
             return Err(corrupt(0, "invalid resident VOLUME_INFORMATION"));
         }
@@ -353,46 +353,6 @@ fn validate_identity(record: &NtfsFileRecord, number: u64, sequence: Option<u16>
         return Err(corrupt(0, "stale or mismatched NTFS file reference"));
     }
     Ok(())
-}
-
-fn select_stream(
-    geometry: &NtfsGeometry,
-    record: &NtfsFileRecord,
-    kind: u32,
-    name: &[u16],
-) -> Result<Stream> {
-    if record.base
-        != (NtfsReference {
-            record: 0,
-            sequence: 0,
-        })
-    {
-        return Err(unsupported(
-            "NTFS extension record needs its base record and ATTRIBUTE_LIST",
-        ));
-    }
-    let attributes = record.attributes().map_err(|error| parse(&error))?;
-    if attributes.iter().any(|attr| attr.kind == ATTRIBUTE_LIST) {
-        return Err(unsupported(
-            "NTFS ATTRIBUTE_LIST assembly is not implemented; refusing a partial stream",
-        ));
-    }
-    let mut matches = attributes
-        .iter()
-        .filter(|attr| attr.kind == kind && attr.name == name);
-    let attr = matches.next().ok_or_else(|| {
-        FfsError::NotFound(format!(
-            "NTFS attribute {kind:#x} with UTF-16 name {name:?} in MFT record {}",
-            record.number
-        ))
-    })?;
-    if matches.next().is_some() {
-        return Err(corrupt(
-            0,
-            "ambiguous NTFS stream or unassembled continuation extents",
-        ));
-    }
-    Stream::from_attribute(geometry, attr)
 }
 
 #[cfg(test)]
