@@ -207,7 +207,7 @@ fn image() -> Vec<u8> {
             10,
             false,
             1,
-            &[mapped(&[0x22, 0, 1, 44, 1, 0], 256, 131072, false)],
+            &[mapped(&[0x22, 0, 1, 44, 1, 0], 256, 131_072, false)],
         ),
     );
     for unit in 0..=u16::MAX {
@@ -447,10 +447,10 @@ fn fragmented_and_compressed_reads_share_the_native_stream_pipeline() {
         fs.read(&cx, &mut scope, compressed.ino, 4094, 4).unwrap(),
         b"CCDD"
     );
-    assert!(
+    assert_eq!(
         fs.read(&cx, &mut scope, compressed.ino, u64::MAX, 4)
-            .unwrap()
-            .is_empty()
+            .unwrap(),
+        [] as [u8; 0]
     );
     assert!(matches!(
         fs.read(&cx, &mut scope, ROOT, 0, 4),

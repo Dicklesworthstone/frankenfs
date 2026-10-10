@@ -88,7 +88,9 @@ impl NtfsFs {
         }
         let bytes = volume.read(cx, &stream, 0, 131_072)?;
         let upcase: Vec<_> = bytes
-            .chunks_exact(2)
+            .as_chunks::<2>()
+            .0
+            .iter()
             .map(|word| u16::from_le_bytes([word[0], word[1]]))
             .collect();
         for (index, &upper) in upcase.iter().enumerate() {
