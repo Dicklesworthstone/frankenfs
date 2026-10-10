@@ -257,10 +257,20 @@ fn main() -> Result<()> {
             let record = volume.record(&cx, file.record, file.sequence)?;
             stream_to_stdout(&cx, &volume, &record, &stream, start, bytes)?;
         }
-        Command::Mount { image, mountpoint, uid, gid } => {
-            let mountpoint = mountpoint.canonicalize().context("resolve NTFS mountpoint")?;
+        Command::Mount {
+            image,
+            mountpoint,
+            uid,
+            gid,
+        } => {
+            let mountpoint = mountpoint
+                .canonicalize()
+                .context("resolve NTFS mountpoint")?;
             if !mountpoint.is_dir()
-                || std::fs::read_dir(&mountpoint)?.next().transpose()?.is_some()
+                || std::fs::read_dir(&mountpoint)?
+                    .next()
+                    .transpose()?
+                    .is_some()
             {
                 bail!("NTFS mountpoint must be an existing empty directory");
             }
@@ -291,15 +301,46 @@ mod tests {
     fn cli_mount_requires_offline_acknowledgement_and_refuses_write_options() {
         assert!(Cli::try_parse_from(["ffs-ntfs", "mount", "disk.img", "/mnt/ntfs"]).is_err());
         let cli = Cli::try_parse_from([
-            "ffs-ntfs", "mount", "disk.img", "/mnt/ntfs", "--offline-image",
-            "--offset", "1024", "--length", "65536", "--uid", "123", "--gid", "456",
-        ]).unwrap();
-        let Command::Mount { image, mountpoint, uid, gid } = cli.command else { panic!("mount"); };
-        assert_eq!((image.offset, image.length, uid, gid), (1024, Some(65536), 123, 456));
+            "ffs-ntfs",
+            "mount",
+            "disk.img",
+            "/mnt/ntfs",
+            "--offline-image",
+            "--offset",
+            "1024",
+            "--length",
+            "65536",
+            "--uid",
+            "123",
+            "--gid",
+            "456",
+        ])
+        .unwrap();
+        let Command::Mount {
+            image,
+            mountpoint,
+            uid,
+            gid,
+        } = cli.command
+        else {
+            panic!("mount");
+        };
+        assert_eq!(
+            (image.offset, image.length, uid, gid),
+            (1024, Some(65536), 123, 456)
+        );
         assert_eq!(mountpoint, PathBuf::from("/mnt/ntfs"));
-        assert!(Cli::try_parse_from([
-            "ffs-ntfs", "mount", "disk.img", "/mnt/ntfs", "--offline-image", "--rw",
-        ]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "ffs-ntfs",
+                "mount",
+                "disk.img",
+                "/mnt/ntfs",
+                "--offline-image",
+                "--rw",
+            ])
+            .is_err()
+        );
     }
     #[test]
     fn cli_requires_offline_acknowledgement_and_accepts_record_ranges() {

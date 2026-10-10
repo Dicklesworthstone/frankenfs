@@ -50,8 +50,15 @@ fn mapped(pairs: &[u8], clusters: u64, size: u64, compressed: bool) -> Vec<u8> {
 
 fn standard() -> Vec<u8> {
     let mut info = [0; 72];
-    for (index, time) in [UNIX_FILETIME, UNIX_FILETIME + 123, UNIX_FILETIME + 10_000_000,
-        UNIX_FILETIME - 1].iter().enumerate() {
+    for (index, time) in [
+        UNIX_FILETIME,
+        UNIX_FILETIME + 123,
+        UNIX_FILETIME + 10_000_000,
+        UNIX_FILETIME - 1,
+    ]
+    .iter()
+    .enumerate()
+    {
         info[index * 8..index * 8 + 8].copy_from_slice(&time.to_le_bytes());
     }
     resident(0x10, 500, "", &info)
@@ -80,7 +87,8 @@ fn index(children: &[(u32, &str, u8)], parent: u64) -> Vec<u8> {
         let value = filename(parent, name, namespace);
         let length = (16 + value.len()).next_multiple_of(8);
         let mut entry = vec![0; length];
-        entry[..8].copy_from_slice(&((u64::from(SEQUENCE) << 48) | u64::from(record)).to_le_bytes());
+        entry[..8]
+            .copy_from_slice(&((u64::from(SEQUENCE) << 48) | u64::from(record)).to_le_bytes());
         entry[8..10].copy_from_slice(&(length as u16).to_le_bytes());
         entry[10..12].copy_from_slice(&(value.len() as u16).to_le_bytes());
         entry[16..16 + value.len()].copy_from_slice(&value);
@@ -143,71 +151,200 @@ fn image() -> Vec<u8> {
     boot[64] = 0xF6;
     boot[68] = 0xF4;
     boot[510..512].copy_from_slice(&[0x55, 0xAA]);
-    let mft = record(0, false, 1, &[mapped(&[0x11, 80, 4, 0], 80, 40960, false),
-        resident(0xB0, 1, "", &[0xFF, 0, 0, 0x0F, 0x80])]);
+    let mft = record(
+        0,
+        false,
+        1,
+        &[
+            mapped(&[0x11, 80, 4, 0], 80, 40960, false),
+            resident(0xB0, 1, "", &[0xFF, 0, 0, 0x0F, 0x80]),
+        ],
+    );
     put(&mut image, 0, &mft);
     image[BASE + 128 * 512..BASE + 130 * 512].copy_from_slice(&mft);
     let mut info = [0; 12];
     info[8..10].copy_from_slice(&[3, 1]);
-    put(&mut image, 3, &record(3, false, 1, &[resident(0x70, 0, "", &info)]));
-    put(&mut image, 5, &record(5, true, 1, &[standard(), index(&[
-        (24, "hello.txt", 1), (24, "HELLO~1.TXT", 2), (26, "packed.bin", 1),
-        (27, "Subdir", 1), (28, "Ä.bin", 1), (29, "mixed", 0)], 5)]));
+    put(
+        &mut image,
+        3,
+        &record(3, false, 1, &[resident(0x70, 0, "", &info)]),
+    );
+    put(
+        &mut image,
+        5,
+        &record(
+            5,
+            true,
+            1,
+            &[
+                standard(),
+                index(
+                    &[
+                        (24, "hello.txt", 1),
+                        (24, "HELLO~1.TXT", 2),
+                        (26, "packed.bin", 1),
+                        (27, "Subdir", 1),
+                        (28, "Ä.bin", 1),
+                        (29, "mixed", 0),
+                    ],
+                    5,
+                ),
+            ],
+        ),
+    );
     let mut bitmap = [0; 128];
     bitmap[0] = 0xAF;
     bitmap[127] = 0xC0; // Bit 1023 is padding and must not affect the count.
-    put(&mut image, 6, &record(6, false, 1, &[resident(DATA, 0, "", &bitmap)]));
-    put(&mut image, 10, &record(10, false, 1, &[mapped(&[0x22, 0, 1, 44, 1, 0], 256, 131072, false)]));
+    put(
+        &mut image,
+        6,
+        &record(6, false, 1, &[resident(DATA, 0, "", &bitmap)]),
+    );
+    put(
+        &mut image,
+        10,
+        &record(
+            10,
+            false,
+            1,
+            &[mapped(&[0x22, 0, 1, 44, 1, 0], 256, 131072, false)],
+        ),
+    );
     for unit in 0..=u16::MAX {
-        let upper = if (97..=122).contains(&unit) { unit - 32 }
-            else if unit == 0xE4 { 0xC4 } else { unit };
+        let upper = if (97..=122).contains(&unit) {
+            unit - 32
+        } else if unit == 0xE4 {
+            0xC4
+        } else {
+            unit
+        };
         let at = BASE + 300 * 512 + usize::from(unit) * 2;
         image[at..at + 2].copy_from_slice(&upper.to_le_bytes());
     }
-    put(&mut image, 24, &record(24, false, 2, &[standard(), resident(DATA, 0, "", b"hello"),
-        resident(0x30, 2, "", &filename(5, "hello.txt", 1)),
-        resident(0x30, 3, "", &filename(5, "HELLO~1.TXT", 2)),
-        resident(0x30, 4, "", &filename(27, "link.txt", 1))]));
-    put(&mut image, 25, &record(25, false, 1, &[standard(),
-        mapped(&[0x21, 1, 88, 2, 0x11, 1, 0xF6, 0], 2, 600, false),
-        resident(0x30, 2, "", &filename(27, "payload.bin", 1))]));
+    put(
+        &mut image,
+        24,
+        &record(
+            24,
+            false,
+            2,
+            &[
+                standard(),
+                resident(DATA, 0, "", b"hello"),
+                resident(0x30, 2, "", &filename(5, "hello.txt", 1)),
+                resident(0x30, 3, "", &filename(5, "HELLO~1.TXT", 2)),
+                resident(0x30, 4, "", &filename(27, "link.txt", 1)),
+            ],
+        ),
+    );
+    put(
+        &mut image,
+        25,
+        &record(
+            25,
+            false,
+            1,
+            &[
+                standard(),
+                mapped(&[0x21, 1, 88, 2, 0x11, 1, 0xF6, 0], 2, 600, false),
+                resident(0x30, 2, "", &filename(27, "payload.bin", 1)),
+            ],
+        ),
+    );
     image[BASE + 600 * 512..BASE + 601 * 512].fill(b'A');
     image[BASE + 590 * 512..BASE + 591 * 512].fill(b'B');
-    put(&mut image, 26, &record(26, false, 1, &[standard(),
-        mapped(&[0x21, 1, 98, 2, 1, 15, 0], 16, 8192, true),
-        resident(0x30, 2, "", &filename(5, "packed.bin", 1))]));
+    put(
+        &mut image,
+        26,
+        &record(
+            26,
+            false,
+            1,
+            &[
+                standard(),
+                mapped(&[0x21, 1, 98, 2, 1, 15, 0], 16, 8192, true),
+                resident(0x30, 2, "", &filename(5, "packed.bin", 1)),
+            ],
+        ),
+    );
     let at = BASE + 610 * 512;
-    image[at..at + 12].copy_from_slice(&[3, 0xB0, 2, b'C', 0xFC, 0x0F, 3, 0xB0, 2, b'D', 0xFC, 0x0F]);
-    put(&mut image, 27, &record(27, true, 1, &[standard(),
-        index(&[(24, "link.txt", 1), (25, "payload.bin", 1)], 27),
-        resident(0x30, 2, "", &filename(5, "Subdir", 1))]));
+    image[at..at + 12]
+        .copy_from_slice(&[3, 0xB0, 2, b'C', 0xFC, 0x0F, 3, 0xB0, 2, b'D', 0xFC, 0x0F]);
+    put(
+        &mut image,
+        27,
+        &record(
+            27,
+            true,
+            1,
+            &[
+                standard(),
+                index(&[(24, "link.txt", 1), (25, "payload.bin", 1)], 27),
+                resident(0x30, 2, "", &filename(5, "Subdir", 1)),
+            ],
+        ),
+    );
     for (number, name, namespace) in [(28, "Ä.bin", 1), (29, "mixed", 0)] {
-        put(&mut image, number, &record(number, false, 1, &[standard(), resident(DATA, 0, "", b"native"),
-            resident(0x30, 2, "", &filename(5, name, namespace))]));
+        put(
+            &mut image,
+            number,
+            &record(
+                number,
+                false,
+                1,
+                &[
+                    standard(),
+                    resident(DATA, 0, "", b"native"),
+                    resident(0x30, 2, "", &filename(5, name, namespace)),
+                ],
+            ),
+        );
     }
     image
 }
 
-struct Memory { bytes: Vec<u8>, reads: Reads, fail_at: Option<u64> }
+struct Memory {
+    bytes: Vec<u8>,
+    reads: Reads,
+    fail_at: Option<u64>,
+}
 impl ByteDevice for Memory {
-    fn len_bytes(&self) -> u64 { self.bytes.len() as u64 }
+    fn len_bytes(&self) -> u64 {
+        self.bytes.len() as u64
+    }
     fn read_exact_at(&self, _cx: &Cx, offset: ByteOffset, data: &mut [u8]) -> Result<()> {
         self.reads.lock().unwrap().push((offset.0, data.len()));
-        if self.fail_at == Some(offset.0) { return Err(FfsError::Cancelled); }
+        if self.fail_at == Some(offset.0) {
+            return Err(FfsError::Cancelled);
+        }
         let start = usize::try_from(offset.0).map_err(|_| corrupt(0, "test offset"))?;
-        let bytes = self.bytes.get(start..start + data.len()).ok_or_else(|| corrupt(0, "test read past image"))?;
+        let bytes = self
+            .bytes
+            .get(start..start + data.len())
+            .ok_or_else(|| corrupt(0, "test read past image"))?;
         data.copy_from_slice(bytes);
         Ok(())
     }
     fn write_all_at(&self, _cx: &Cx, _offset: ByteOffset, _data: &[u8]) -> Result<()> {
         panic!("NTFS FsOps attempted a write");
     }
-    fn sync(&self, _cx: &Cx) -> Result<()> { panic!("NTFS FsOps attempted a flush"); }
+    fn sync(&self, _cx: &Cx) -> Result<()> {
+        panic!("NTFS FsOps attempted a flush");
+    }
 }
 
 fn open(bytes: Vec<u8>, reads: Reads, fail_at: Option<u64>) -> Result<NtfsFs> {
     let cx = Cx::for_testing();
-    let volume = NtfsVolume::from_device(&cx, Box::new(Memory { bytes, reads, fail_at }), BASE as u64, LENGTH as u64)?;
+    let volume = NtfsVolume::from_device(
+        &cx,
+        Box::new(Memory {
+            bytes,
+            reads,
+            fail_at,
+        }),
+        BASE as u64,
+        LENGTH as u64,
+    )?;
     NtfsFs::new(&cx, volume, 123, 456)
 }
 
@@ -217,20 +354,65 @@ fn root_alias_hard_link_native_names_parent_and_metadata() {
     let fs = open(image(), Arc::default(), None).unwrap();
     let mut scope = RequestScope::empty();
     let root = fs.getattr(&cx, &mut scope, ROOT).unwrap();
-    assert_eq!((root.ino, root.uid, root.gid, root.perm), (ROOT, 123, 456, 0o555));
-    let file = fs.lookup(&cx, &mut scope, ROOT, OsStr::new("HELLO.txt")).unwrap();
-    assert_eq!((file.size, file.blocks, file.nlink, file.perm), (5, 0, 2, 0o444));
-    assert_eq!(file.mtime.duration_since(UNIX_EPOCH).unwrap().as_nanos(), 12300);
+    assert_eq!(
+        (root.ino, root.uid, root.gid, root.perm),
+        (ROOT, 123, 456, 0o555)
+    );
+    let file = fs
+        .lookup(&cx, &mut scope, ROOT, OsStr::new("HELLO.txt"))
+        .unwrap();
+    assert_eq!(
+        (file.size, file.blocks, file.nlink, file.perm),
+        (5, 0, 2, 0o444)
+    );
+    assert_eq!(
+        file.mtime.duration_since(UNIX_EPOCH).unwrap().as_nanos(),
+        12300
+    );
     assert_eq!(file.ctime.duration_since(UNIX_EPOCH).unwrap().as_secs(), 1);
-    assert_eq!(UNIX_EPOCH.duration_since(file.atime).unwrap().as_nanos(), 100);
-    assert_eq!(fs.lookup(&cx, &mut scope, ROOT, OsStr::new("hello~1.txt")).unwrap().ino, file.ino);
-    let dir = fs.lookup(&cx, &mut scope, ROOT, OsStr::new("subdir")).unwrap();
-    assert_eq!(fs.lookup(&cx, &mut scope, dir.ino, OsStr::new("link.txt")).unwrap().ino, file.ino);
-    assert_eq!(fs.lookup(&cx, &mut scope, dir.ino, OsStr::new("..")).unwrap().ino, ROOT);
-    assert_eq!(fs.lookup(&cx, &mut scope, ROOT, OsStr::new("ä.BIN")).unwrap().size, 6);
-    assert!(matches!(fs.lookup(&cx, &mut scope, ROOT, OsStr::new("MIXED")), Err(FfsError::NotFound(_))));
-    assert!(fs.lookup(&cx, &mut scope, ROOT, OsStr::new("mixed")).is_ok());
-    assert!(fs.getattr(&cx, &mut scope, InodeNumber(file.ino.0 + (1 << 32))).is_err());
+    assert_eq!(
+        UNIX_EPOCH.duration_since(file.atime).unwrap().as_nanos(),
+        100
+    );
+    assert_eq!(
+        fs.lookup(&cx, &mut scope, ROOT, OsStr::new("hello~1.txt"))
+            .unwrap()
+            .ino,
+        file.ino
+    );
+    let dir = fs
+        .lookup(&cx, &mut scope, ROOT, OsStr::new("subdir"))
+        .unwrap();
+    assert_eq!(
+        fs.lookup(&cx, &mut scope, dir.ino, OsStr::new("link.txt"))
+            .unwrap()
+            .ino,
+        file.ino
+    );
+    assert_eq!(
+        fs.lookup(&cx, &mut scope, dir.ino, OsStr::new(".."))
+            .unwrap()
+            .ino,
+        ROOT
+    );
+    assert_eq!(
+        fs.lookup(&cx, &mut scope, ROOT, OsStr::new("ä.BIN"))
+            .unwrap()
+            .size,
+        6
+    );
+    assert!(matches!(
+        fs.lookup(&cx, &mut scope, ROOT, OsStr::new("MIXED")),
+        Err(FfsError::NotFound(_))
+    ));
+    assert!(
+        fs.lookup(&cx, &mut scope, ROOT, OsStr::new("mixed"))
+            .is_ok()
+    );
+    assert!(
+        fs.getattr(&cx, &mut scope, InodeNumber(file.ino.0 + (1 << 32)))
+            .is_err()
+    );
     assert!(fs.getattr(&cx, &mut scope, InodeNumber(0)).is_err());
     assert!(fs.getattr(&cx, &mut scope, InodeNumber(u64::MAX)).is_err());
 }
@@ -240,18 +422,40 @@ fn fragmented_and_compressed_reads_share_the_native_stream_pipeline() {
     let cx = Cx::for_testing();
     let fs = open(image(), Arc::default(), None).unwrap();
     let mut scope = RequestScope::empty();
-    let dir = fs.lookup(&cx, &mut scope, ROOT, OsStr::new("Subdir")).unwrap();
-    let file = fs.lookup(&cx, &mut scope, dir.ino, OsStr::new("payload.bin")).unwrap();
+    let dir = fs
+        .lookup(&cx, &mut scope, ROOT, OsStr::new("Subdir"))
+        .unwrap();
+    let file = fs
+        .lookup(&cx, &mut scope, dir.ino, OsStr::new("payload.bin"))
+        .unwrap();
     assert_eq!((file.size, file.blocks), (600, 2));
     let mut expected = vec![b'A'; 512];
     expected.extend([b'B'; 88]);
-    assert_eq!(fs.read(&cx, &mut scope, file.ino, 0, 4096).unwrap(), expected);
-    assert_eq!(fs.read(&cx, &mut scope, file.ino, 510, 100).unwrap(), expected[510..]);
-    let compressed = fs.lookup(&cx, &mut scope, ROOT, OsStr::new("packed.bin")).unwrap();
+    assert_eq!(
+        fs.read(&cx, &mut scope, file.ino, 0, 4096).unwrap(),
+        expected
+    );
+    assert_eq!(
+        fs.read(&cx, &mut scope, file.ino, 510, 100).unwrap(),
+        expected[510..]
+    );
+    let compressed = fs
+        .lookup(&cx, &mut scope, ROOT, OsStr::new("packed.bin"))
+        .unwrap();
     assert_eq!((compressed.size, compressed.blocks), (8192, 1));
-    assert_eq!(fs.read(&cx, &mut scope, compressed.ino, 4094, 4).unwrap(), b"CCDD");
-    assert!(fs.read(&cx, &mut scope, compressed.ino, u64::MAX, 4).unwrap().is_empty());
-    assert!(matches!(fs.read(&cx, &mut scope, ROOT, 0, 4), Err(FfsError::IsDirectory)));
+    assert_eq!(
+        fs.read(&cx, &mut scope, compressed.ino, 4094, 4).unwrap(),
+        b"CCDD"
+    );
+    assert!(
+        fs.read(&cx, &mut scope, compressed.ino, u64::MAX, 4)
+            .unwrap()
+            .is_empty()
+    );
+    assert!(matches!(
+        fs.read(&cx, &mut scope, ROOT, 0, 4),
+        Err(FfsError::IsDirectory)
+    ));
 }
 
 #[test]
@@ -266,20 +470,44 @@ fn cookies_resume_and_read_only_operations_never_write() {
         assert_eq!(entry.offset, index as u64 + 1);
         let tail = fs.readdir(&cx, &mut scope, ROOT, entry.offset).unwrap();
         assert_eq!(tail.len(), page.len() - index - 1);
-        if let Some(first) = tail.first() { assert_eq!(*first, page[index + 1]); }
+        if let Some(first) = tail.first() {
+            assert_eq!(*first, page[index + 1]);
+        }
     }
-    let file = fs.lookup(&cx, &mut scope, ROOT, OsStr::new("hello.txt")).unwrap();
+    let file = fs
+        .lookup(&cx, &mut scope, ROOT, OsStr::new("hello.txt"))
+        .unwrap();
     assert!(fs.open(&cx, &mut scope, file.ino, libc::O_RDONLY).is_ok());
     for flags in [libc::O_WRONLY, libc::O_RDWR, libc::O_TRUNC, libc::O_CREAT] {
-        assert!(matches!(fs.open(&cx, &mut scope, file.ino, flags), Err(FfsError::ReadOnly)));
+        assert!(matches!(
+            fs.open(&cx, &mut scope, file.ino, flags),
+            Err(FfsError::ReadOnly)
+        ));
     }
-    assert!(matches!(fs.write(&cx, &mut scope, file.ino, 0, b"bad"), Err(FfsError::ReadOnly)));
-    assert!(matches!(fs.unlink(&cx, &mut scope, ROOT, OsStr::new("hello.txt")), Err(FfsError::ReadOnly)));
+    assert!(matches!(
+        fs.write(&cx, &mut scope, file.ino, 0, b"bad"),
+        Err(FfsError::ReadOnly)
+    ));
+    assert!(matches!(
+        fs.unlink(&cx, &mut scope, ROOT, OsStr::new("hello.txt")),
+        Err(FfsError::ReadOnly)
+    ));
     fs.fsync(&cx, &mut scope, file.ino, 0, false).unwrap();
     fs.fsyncdir(&cx, &mut scope, ROOT, 0, false).unwrap();
-    assert_eq!(fs.lseek(&cx, &mut scope, file.ino, 1, SeekWhence::Data).unwrap(), 1);
-    assert_eq!(fs.lseek(&cx, &mut scope, file.ino, 1, SeekWhence::Hole).unwrap(), 5);
-    assert!(fs.lseek(&cx, &mut scope, file.ino, 5, SeekWhence::Hole).is_err());
+    assert_eq!(
+        fs.lseek(&cx, &mut scope, file.ino, 1, SeekWhence::Data)
+            .unwrap(),
+        1
+    );
+    assert_eq!(
+        fs.lseek(&cx, &mut scope, file.ino, 1, SeekWhence::Hole)
+            .unwrap(),
+        5
+    );
+    assert!(
+        fs.lseek(&cx, &mut scope, file.ino, 5, SeekWhence::Hole)
+            .is_err()
+    );
 }
 
 #[test]
@@ -288,8 +516,16 @@ fn allocation_bitmaps_ignore_tail_padding_and_require_initialized_coverage() {
     let fs = open(image(), Arc::default(), None).unwrap();
     let mut scope = RequestScope::empty();
     let stat = fs.statfs(&cx, &mut scope, ROOT).unwrap();
-    assert_eq!((stat.blocks, stat.blocks_free, stat.files, stat.files_free), (1023, 1016, 40, 27));
-    let short = Stream { storage: Storage::Resident(vec![0]), size: 1, initialized: 0, allocated: 1 };
+    assert_eq!(
+        (stat.blocks, stat.blocks_free, stat.files, stat.files_free),
+        (1023, 1016, 40, 27)
+    );
+    let short = Stream {
+        storage: Storage::Resident(vec![0]),
+        size: 1,
+        initialized: 0,
+        allocated: 1,
+    };
     assert!(fs.count_free(&cx, &short, 8).is_err());
 }
 
@@ -298,21 +534,57 @@ fn reparse_and_cancellation_never_return_successful_data() {
     let cx = Cx::for_testing();
     let fs = open(image(), Arc::default(), Some((BASE + 590 * 512) as u64)).unwrap();
     let mut scope = RequestScope::empty();
-    let dir = fs.lookup(&cx, &mut scope, ROOT, OsStr::new("Subdir")).unwrap();
-    let file = fs.lookup(&cx, &mut scope, dir.ino, OsStr::new("payload.bin")).unwrap();
-    assert!(matches!(fs.read(&cx, &mut scope, file.ino, 0, 600), Err(FfsError::Cancelled)));
+    let dir = fs
+        .lookup(&cx, &mut scope, ROOT, OsStr::new("Subdir"))
+        .unwrap();
+    let file = fs
+        .lookup(&cx, &mut scope, dir.ino, OsStr::new("payload.bin"))
+        .unwrap();
+    assert!(matches!(
+        fs.read(&cx, &mut scope, file.ino, 0, 600),
+        Err(FfsError::Cancelled)
+    ));
     let mut bytes = image();
-    put(&mut bytes, 29, &record(29, false, 1, &[standard(), resident(DATA, 0, "", b"native"),
-        resident(0x30, 2, "", &filename(5, "mixed", 0)), resident(0xC0, 3, "", &[0; 8])]));
+    put(
+        &mut bytes,
+        29,
+        &record(
+            29,
+            false,
+            1,
+            &[
+                standard(),
+                resident(DATA, 0, "", b"native"),
+                resident(0x30, 2, "", &filename(5, "mixed", 0)),
+                resident(0xC0, 3, "", &[0; 8]),
+            ],
+        ),
+    );
     let fs = open(bytes, Arc::default(), None).unwrap();
-    assert!(matches!(fs.lookup(&cx, &mut scope, ROOT, OsStr::new("mixed")), Err(FfsError::UnsupportedFeature(_))));
+    assert!(matches!(
+        fs.lookup(&cx, &mut scope, ROOT, OsStr::new("mixed")),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
 }
 
 #[test]
 fn filetime_conversion_is_exact_on_both_sides_of_unix_epoch() {
     assert_eq!(filetime(UNIX_FILETIME).unwrap(), UNIX_EPOCH);
-    assert_eq!(filetime(UNIX_FILETIME + 1).unwrap().duration_since(UNIX_EPOCH).unwrap().as_nanos(), 100);
-    assert_eq!(UNIX_EPOCH.duration_since(filetime(UNIX_FILETIME - 1).unwrap()).unwrap().as_nanos(), 100);
+    assert_eq!(
+        filetime(UNIX_FILETIME + 1)
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos(),
+        100
+    );
+    assert_eq!(
+        UNIX_EPOCH
+            .duration_since(filetime(UNIX_FILETIME - 1).unwrap())
+            .unwrap()
+            .as_nanos(),
+        100
+    );
     assert!(filetime(u64::MAX).is_err());
 }
 
@@ -322,13 +594,25 @@ fn warm_lookup_readdir_and_statfs_do_not_rescan_native_metadata() {
     let reads: Reads = Arc::default();
     let fs = open(image(), Arc::clone(&reads), None).unwrap();
     let mut scope = RequestScope::empty();
-    let file = fs.lookup(&cx, &mut scope, ROOT, OsStr::new("hello.txt")).unwrap();
+    let file = fs
+        .lookup(&cx, &mut scope, ROOT, OsStr::new("hello.txt"))
+        .unwrap();
     fs.statfs(&cx, &mut scope, ROOT).unwrap();
     fs.open(&cx, &mut scope, file.ino, libc::O_RDONLY).unwrap();
     reads.lock().unwrap().clear();
     for _ in 0..10 {
-        assert_eq!(fs.lookup(&cx, &mut scope, ROOT, OsStr::new("HELLO.TXT")).unwrap().ino, file.ino);
-        assert_eq!(fs.lookup(&cx, &mut scope, ROOT, OsStr::new("hello~1.txt")).unwrap().ino, file.ino);
+        assert_eq!(
+            fs.lookup(&cx, &mut scope, ROOT, OsStr::new("HELLO.TXT"))
+                .unwrap()
+                .ino,
+            file.ino
+        );
+        assert_eq!(
+            fs.lookup(&cx, &mut scope, ROOT, OsStr::new("hello~1.txt"))
+                .unwrap()
+                .ino,
+            file.ino
+        );
         assert_eq!(fs.readdir(&cx, &mut scope, ROOT, 2).unwrap().len(), 6);
         assert_eq!(fs.read(&cx, &mut scope, file.ino, 0, 50).unwrap(), b"hello");
         assert_eq!(fs.statfs(&cx, &mut scope, ROOT).unwrap().blocks_free, 1016);
@@ -347,29 +631,65 @@ fn cached_streams_keep_data_io_and_cancellation_live() {
     let reads: Reads = Arc::default();
     let fs = open(image(), Arc::clone(&reads), Some((BASE + 590 * 512) as u64)).unwrap();
     let mut scope = RequestScope::empty();
-    let dir = fs.lookup(&cx, &mut scope, ROOT, OsStr::new("Subdir")).unwrap();
-    let file = fs.lookup(&cx, &mut scope, dir.ino, OsStr::new("payload.bin")).unwrap();
+    let dir = fs
+        .lookup(&cx, &mut scope, ROOT, OsStr::new("Subdir"))
+        .unwrap();
+    let file = fs
+        .lookup(&cx, &mut scope, dir.ino, OsStr::new("payload.bin"))
+        .unwrap();
     fs.open(&cx, &mut scope, file.ino, libc::O_RDONLY).unwrap();
     reads.lock().unwrap().clear();
     for _ in 0..2 {
-        assert!(matches!(fs.read(&cx, &mut scope, file.ino, 510, 4), Err(FfsError::Cancelled)));
+        assert!(matches!(
+            fs.read(&cx, &mut scope, file.ino, 510, 4),
+            Err(FfsError::Cancelled)
+        ));
     }
-    assert_eq!(*reads.lock().unwrap(), [
-        ((BASE + 600 * 512 + 510) as u64, 2), ((BASE + 590 * 512) as u64, 2),
-        ((BASE + 600 * 512 + 510) as u64, 2), ((BASE + 590 * 512) as u64, 2),
-    ]);
+    assert_eq!(
+        *reads.lock().unwrap(),
+        [
+            ((BASE + 600 * 512 + 510) as u64, 2),
+            ((BASE + 590 * 512) as u64, 2),
+            ((BASE + 600 * 512 + 510) as u64, 2),
+            ((BASE + 590 * 512) as u64, 2),
+        ]
+    );
 }
 
 #[test]
 fn root_aliases_and_inconsistent_directory_parents_refuse_mounting() {
     let mut bytes = image();
-    put(&mut bytes, 5, &record(5, true, 1, &[standard(),
-        index(&[(5, "LOOP", 1)], 5), resident(0x30, 2, "", &filename(5, "LOOP", 1))]));
+    put(
+        &mut bytes,
+        5,
+        &record(
+            5,
+            true,
+            1,
+            &[
+                standard(),
+                index(&[(5, "LOOP", 1)], 5),
+                resident(0x30, 2, "", &filename(5, "LOOP", 1)),
+            ],
+        ),
+    );
     assert!(open(bytes, Arc::default(), None).is_err());
     let mut bytes = image();
-    put(&mut bytes, 27, &record(27, true, 1, &[standard(), index(&[], 27),
-        resident(0x30, 2, "", &filename(5, "Subdir", 1)),
-        resident(0x30, 3, "", &filename(27, "LOOP", 1))]));
+    put(
+        &mut bytes,
+        27,
+        &record(
+            27,
+            true,
+            1,
+            &[
+                standard(),
+                index(&[], 27),
+                resident(0x30, 2, "", &filename(5, "Subdir", 1)),
+                resident(0x30, 3, "", &filename(27, "LOOP", 1)),
+            ],
+        ),
+    );
     assert!(open(bytes, Arc::default(), None).is_err());
 }
 
@@ -378,10 +698,19 @@ fn a_sparse_bitmap_cannot_turn_missing_allocation_metadata_into_free_space() {
     let cx = Cx::for_testing();
     let fs = open(image(), Arc::default(), None).unwrap();
     let bitmap = Stream {
-        storage: Storage::Mapped(vec![crate::reader::NtfsRun { vcn: 0, clusters: 1, lcn: None }]),
-        size: 512, initialized: 512, allocated: 0,
+        storage: Storage::Mapped(vec![crate::reader::NtfsRun {
+            vcn: 0,
+            clusters: 1,
+            lcn: None,
+        }]),
+        size: 512,
+        initialized: 512,
+        allocated: 0,
     };
-    assert!(matches!(fs.count_free(&cx, &bitmap, 8), Err(FfsError::Corruption { .. })));
+    assert!(matches!(
+        fs.count_free(&cx, &bitmap, 8),
+        Err(FfsError::Corruption { .. })
+    ));
 }
 
 #[test]
@@ -389,22 +718,46 @@ fn stream_eviction_keeps_the_limit_and_reloads_exact_data() {
     let cx = Cx::for_testing();
     let mut bytes = image();
     for number in 30..40 {
-        put(&mut bytes, number, &record(number, false, 1, &[standard(),
-            resident(DATA, 0, "", &number.to_le_bytes())]));
+        put(
+            &mut bytes,
+            number,
+            &record(
+                number,
+                false,
+                1,
+                &[standard(), resident(DATA, 0, "", &number.to_le_bytes())],
+            ),
+        );
     }
     let fs = open(bytes, Arc::default(), None).unwrap();
     let mut scope = RequestScope::empty();
     for number in 30..40 {
-        let ino = fs.inode(NtfsReference { record: number, sequence: SEQUENCE }).unwrap();
+        let ino = fs
+            .inode(NtfsReference {
+                record: number,
+                sequence: SEQUENCE,
+            })
+            .unwrap();
         fs.open(&cx, &mut scope, ino, libc::O_RDONLY).unwrap();
-        assert_eq!(fs.read(&cx, &mut scope, ino, 0, 4).unwrap(), (number as u32).to_le_bytes());
+        assert_eq!(
+            fs.read(&cx, &mut scope, ino, 0, 4).unwrap(),
+            (number as u32).to_le_bytes()
+        );
     }
-    let first = fs.inode(NtfsReference { record: 30, sequence: SEQUENCE }).unwrap();
+    let first = fs
+        .inode(NtfsReference {
+            record: 30,
+            sequence: SEQUENCE,
+        })
+        .unwrap();
     {
         let cache = fs.cache().unwrap();
         assert_eq!(cache.streams.len(), MAX_CACHED_STREAMS);
         assert!(!cache.streams.contains_key(&first));
     }
-    assert_eq!(fs.read(&cx, &mut scope, first, 0, 4).unwrap(), 30_u32.to_le_bytes());
+    assert_eq!(
+        fs.read(&cx, &mut scope, first, 0, 4).unwrap(),
+        30_u32.to_le_bytes()
+    );
     assert_eq!(fs.cache().unwrap().streams.len(), MAX_CACHED_STREAMS);
 }
