@@ -482,12 +482,29 @@ impl BtrfsSuperblock {
     /// transaction, which is precisely the one this field says has not committed.
     ///
     /// Patches `log_root` (0x60) and `log_root_level` (0xC8), then recomputes the
-    /// CRC32C over [0x20..].
-    pub fn patch_tree_log_commit(data: &mut [u8], log_root: u64, log_root_level: u8) {
+    /// filesystem's checksum over [0x20..4096]. Rejects short regions and
+    /// unsupported checksum types before changing any bytes.
+    pub fn patch_tree_log_commit(
+        data: &mut [u8],
+        log_root: u64,
+        log_root_level: u8,
+    ) -> Result<(), ParseError> {
+        let actual = data.len();
+        let data = data
+            .get_mut(..BTRFS_SUPER_INFO_SIZE)
+            .ok_or(ParseError::InsufficientData {
+                needed: BTRFS_SUPER_INFO_SIZE,
+                offset: 0,
+                actual,
+            })?;
+        let csum_type = read_le_u16(data, 0xC4)?;
+        validate_supported_csum_type(csum_type)?;
+        let csum_size = btrfs_csum_size(csum_type).expect("validated checksum type");
         data[0x60..0x68].copy_from_slice(&log_root.to_le_bytes());
         data[0xC8] = log_root_level;
-        let csum = ffs_types::crc32c(&data[0x20..]);
-        data[0..4].copy_from_slice(&csum.to_le_bytes());
+        let csum = btrfs_csum(csum_type, &data[0x20..]).expect("validated checksum type");
+        data[..csum_size].copy_from_slice(&csum[..csum_size]);
+        Ok(())
     }
 }
 
@@ -3230,9 +3247,10 @@ mod tests {
         data[0x40..0x48].copy_from_slice(&BTRFS_MAGIC.to_le_bytes());
         data[0x48..0x50].copy_from_slice(&10_u64.to_le_bytes()); // generation
         data[0x78..0x80].copy_from_slice(&100_000_u64.to_le_bytes()); // bytes_used
+        data[0xC4..0xC6].copy_from_slice(&ffs_types::BTRFS_CSUM_TYPE_CRC32C.to_le_bytes());
         let before = data.clone();
 
-        BtrfsSuperblock::patch_tree_log_commit(&mut data, 0x1F00_0000, 0);
+        BtrfsSuperblock::patch_tree_log_commit(&mut data, 0x1F00_0000, 0).unwrap();
 
         assert_eq!(
             u64::from_le_bytes(data[0x60..0x68].try_into().expect("8 bytes")),
@@ -3268,6 +3286,38 @@ mod tests {
             csum.to_le_bytes()[..],
             "the checksum must cover the patched bytes"
         );
+    }
+
+    #[test]
+    fn superblock_tree_log_patch_uses_declared_checksum() {
+        for csum_type in [
+            ffs_types::BTRFS_CSUM_TYPE_CRC32C,
+            ffs_types::BTRFS_CSUM_TYPE_XXHASH64,
+            ffs_types::BTRFS_CSUM_TYPE_SHA256,
+            ffs_types::BTRFS_CSUM_TYPE_BLAKE2B,
+        ] {
+            let mut data = vec![0xA7; BTRFS_SUPER_INFO_SIZE + 32];
+            data[0xC4..0xC6].copy_from_slice(&csum_type.to_le_bytes());
+            let before = data.clone();
+            BtrfsSuperblock::patch_tree_log_commit(&mut data, 0x1F00_0000, 1).unwrap();
+            verify_superblock_checksum(&data[..BTRFS_SUPER_INFO_SIZE]).unwrap();
+            let width = btrfs_csum_size(csum_type).unwrap();
+            for (offset, (&old, &new)) in before.iter().zip(&data).enumerate() {
+                if offset >= width && !(0x60..0x68).contains(&offset) && offset != 0xC8 {
+                    assert_eq!(new, old, "type={csum_type}, offset={offset:#x}");
+                }
+            }
+            assert_eq!(&data[0x60..0x68], &0x1F00_0000_u64.to_le_bytes());
+            assert_eq!(data[0xC8], 1);
+            data[0x60] ^= 1;
+            assert!(verify_superblock_checksum(&data[..BTRFS_SUPER_INFO_SIZE]).is_err());
+        }
+        for mut invalid in [vec![0; BTRFS_SUPER_INFO_SIZE - 1], vec![0; BTRFS_SUPER_INFO_SIZE]] {
+            invalid[0xC4..0xC6].copy_from_slice(&u16::MAX.to_le_bytes());
+            let before = invalid.clone();
+            assert!(BtrfsSuperblock::patch_tree_log_commit(&mut invalid, 4096, 0).is_err());
+            assert_eq!(invalid, before);
+        }
     }
 
     #[test]

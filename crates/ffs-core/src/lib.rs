@@ -59,9 +59,8 @@ use ffs_btrfs::{
     enumerate_snapshots, enumerate_subvolumes, find_xattr_item_value, fsflags_to_btrfs_inode_flags,
     generate_send_stream, lookup_data_block_csum, map_logical_to_physical,
     parse_btrfs_tree_node_owned, parse_dir_items, parse_extent_data, parse_inode_item,
-    parse_root_item, parse_xattr_item_names, parse_xattr_items, visit_dir_items, walk_chunk_tree,
-    walk_tree, walk_tree_floor_with_nodes, walk_tree_parallel_with_nodes,
-    walk_tree_range_parallel_with_nodes,
+    parse_root_item, parse_xattr_item_names, parse_xattr_items, visit_dir_items, walk_tree,
+    walk_tree_floor_with_nodes, walk_tree_parallel_with_nodes, walk_tree_range_parallel_with_nodes,
     writeback::{DiskWritebackContext, WriteDependencyDag, WritebackExecutor},
     xflags_to_btrfs_inode_flags,
 };
@@ -911,11 +910,10 @@ impl BtrfsReadDevices {
             || sb.nodesize != primary.nodesize
             || sb.sectorsize != primary.sectorsize
             || sb.csum_type != primary.csum_type
-            || sb.num_devices != primary.num_devices
-            || sb.log_root != 0
+            || sb.log_root != primary.log_root
         {
             return Err(FfsError::Format(
-                "attached btrfs device does not match the clean committed filesystem".into(),
+                "attached btrfs device does not match the committed filesystem".into(),
             ));
         }
         Ok(())
@@ -2127,6 +2125,8 @@ pub struct OpenFs {
     dev: Arc<dyn ByteDevice>,
     /// Explicitly attached btrfs devices; writable mounts use the single-device path.
     btrfs_devices: Option<Arc<BtrfsReadDevices>>,
+    /// Bootstrap-only inspection does not establish device inventory authority.
+    btrfs_inventory_verified: bool,
     /// MVCC version store for snapshot-isolated block access.
     ///
     /// Shared across all snapshots/transactions that operate on this filesystem.
@@ -6517,7 +6517,7 @@ impl OpenFs {
         options: &OpenOptions,
         inherited_devices: Option<Arc<BtrfsReadDevices>>,
     ) -> Result<Self, FfsError> {
-        let flavor = detect_filesystem_on_device(cx, &*dev).map_err(|e| match e {
+        let mut flavor = detect_filesystem_on_device(cx, &*dev).map_err(|e| match e {
             DetectionError::UnsupportedImage => {
                 FfsError::Format("image is not a recognized ext4 or btrfs filesystem".into())
             }
@@ -6536,39 +6536,18 @@ impl OpenFs {
         };
 
         let dev: Arc<dyn ByteDevice> = Arc::from(dev);
-        let multi_device = matches!(&flavor, FsFlavor::Btrfs(sb) if sb.num_devices > 1);
-        let btrfs_devices = if inherited_devices.is_none()
-            && options.btrfs_device_paths.is_empty()
-            && !multi_device
+        if !matches!(flavor, FsFlavor::Btrfs(_))
+            && (inherited_devices.is_some() || !options.btrfs_device_paths.is_empty())
         {
-            None
-        } else {
-            let FsFlavor::Btrfs(sb) = &flavor else {
-                return Err(FfsError::Format("additional devices require btrfs".into()));
-            };
-            if sb.num_devices < 2 || sb.log_root != 0 || options.mvcc_wal_path.is_some() {
-                return Err(FfsError::UnsupportedFeature(
-                    "device attachment requires a clean multi-device btrfs image without an MVCC WAL".into(),
-                ));
-            }
-            Some(match inherited_devices {
-                Some(devices) => {
-                    devices.validate_inherited_devices(cx, sb)?;
-                    devices
-                }
-                None => Arc::new(BtrfsReadDevices::open(
-                    cx,
-                    &dev,
-                    sb,
-                    &options.btrfs_device_paths,
-                )?),
-            })
-        };
+            return Err(FfsError::Format("additional devices require btrfs".into()));
+        }
+        let mut btrfs_devices = None;
+        let mut btrfs_inventory_verified = false;
 
         let mut btrfs_tree_log_items = Vec::new();
         let mut btrfs_tree_log_dir_ranges = Vec::new();
         let mut btrfs_foreign_tree_log = false;
-        let (ext4_geometry, btrfs_context) = match &flavor {
+        let (ext4_geometry, btrfs_context) = match &mut flavor {
             FsFlavor::Ext4(sb) => {
                 // Detect standalone journal device: image IS a journal, not a data FS.
                 if (sb.feature_incompat.0 & ffs_ondisk::Ext4IncompatFeatures::JOURNAL_DEV.0) != 0 {
@@ -6606,7 +6585,10 @@ impl OpenFs {
                 }
                 let bootstrap_chunks = parse_sys_chunk_array(&sb.sys_chunk_array)
                     .map_err(|e| parse_to_ffs_error(&e))?;
-                let bootstrap_only = btrfs_devices.is_none()
+                let bootstrap_only = inherited_devices.is_none()
+                    && options.btrfs_device_paths.is_empty()
+                    && sb.num_devices <= 1
+                    && sb.chunk_root == 0
                     && options.skip_validation
                     && matches!(
                         options.btrfs_mount_selection,
@@ -6625,53 +6607,91 @@ impl OpenFs {
                         sb.root_dir_objectid,
                     )
                 } else {
-                    let chunks = if let Some(devices) = &btrfs_devices {
-                        let items = devices.walk_tree(cx, &bootstrap_chunks, sb.chunk_root, sb)?;
-                        let mut chunks = Vec::new();
-                        for item in items {
-                            if item.key.item_type == ffs_btrfs::BTRFS_ITEM_CHUNK {
-                                chunks.push(
-                                    ffs_btrfs::parse_chunk_item(&item.data, item.key.offset)
-                                        .map_err(|error| parse_to_ffs_error(&error))?,
-                                );
-                            }
+                    // Device counts are accounting, not routing authority. A
+                    // provisional set resolves CHUNK_TREE before the committed
+                    // inventory chooses the permanent reader and writer policy.
+                    let devices = match inherited_devices {
+                        Some(devices) => {
+                            devices.validate_inherited_devices(cx, sb)?;
+                            devices
                         }
-                        chunks.sort_by_key(|chunk| chunk.key.offset);
-                        chunks
-                    } else {
-                        let bootstrap_ref = &bootstrap_chunks;
-                        let mut read_bootstrap =
-                            |physical: u64| -> std::result::Result<Vec<u8>, ParseError> {
-                                let mut buf = vec![0u8; sb.nodesize as usize];
-                                dev.read_exact_at(cx, ByteOffset(physical), &mut buf)
-                                    .map_err(|_| ParseError::InvalidField {
-                                        field: "chunk_tree",
-                                        reason: "failed to read chunk-tree block",
-                                    })?;
-                                Ok(buf)
-                            };
-
-                        match walk_chunk_tree(&mut read_bootstrap, sb, bootstrap_ref) {
-                            Ok(expanded) => {
-                                if expanded.len() > bootstrap_ref.len() {
-                                    info!(
-                                        bootstrap_chunks = bootstrap_ref.len(),
-                                        expanded_chunks = expanded.len(),
-                                        "btrfs chunk map expanded from chunk tree"
-                                    );
-                                }
-                                expanded
-                            }
-                            Err(err) => {
-                                warn!(
-                                    error = %err,
-                                    bootstrap_chunks = bootstrap_ref.len(),
-                                    "btrfs chunk tree expansion failed; falling back to sys_chunk_array"
-                                );
-                                bootstrap_chunks
-                            }
-                        }
+                        None => Arc::new(BtrfsReadDevices::open(
+                            cx,
+                            &dev,
+                            sb,
+                            &options.btrfs_device_paths,
+                        )?),
                     };
+                    let items = devices.walk_tree(cx, &bootstrap_chunks, sb.chunk_root, sb)?;
+                    let backing = read_btrfs_backing_device_item(cx, dev.as_ref(), sb)?;
+                    let inventory = parse_btrfs_device_inventory(
+                        sb,
+                        &backing,
+                        items.iter().map(|item| (item.key, item.data.as_slice())),
+                    )?;
+                    let mut chunks = Vec::new();
+                    for item in &items {
+                        if item.key.item_type == ffs_btrfs::BTRFS_ITEM_CHUNK {
+                            chunks.push(
+                                ffs_btrfs::parse_chunk_item(&item.data, item.key.offset)
+                                    .map_err(|error| parse_to_ffs_error(&error))?,
+                            );
+                        }
+                    }
+                    chunks.sort_by_key(|chunk| chunk.key.offset);
+                    if chunks.is_empty() {
+                        return Err(FfsError::Format("btrfs chunk tree has no chunks".into()));
+                    }
+                    for (id, attached) in &devices.identities {
+                        if !inventory.get(id).is_some_and(|item| {
+                            item.uuid == attached.uuid && item.total_bytes == attached.total_bytes
+                        }) {
+                            return Err(FfsError::Format(
+                                "attached device disagrees with chunk-tree identity or capacity"
+                                    .into(),
+                            ));
+                        }
+                    }
+                    for chunk in bootstrap_chunks.iter().chain(&chunks) {
+                        for stripe in &chunk.stripes {
+                            if inventory
+                                .get(&stripe.devid)
+                                .is_none_or(|item| item.uuid != stripe.dev_uuid)
+                            {
+                                return Err(FfsError::Format(
+                                    "chunk stripe device identity mismatch".into(),
+                                ));
+                            }
+                        }
+                    }
+                    devices.validate_read_coverage(&chunks)?;
+                    let device_count = u64::try_from(inventory.len()).map_err(|_| {
+                        FfsError::Format("btrfs device inventory is too large".into())
+                    })?;
+                    if sb.num_devices != device_count {
+                        info!(
+                            advertised = sb.num_devices,
+                            committed = device_count,
+                            "btrfs device count reconciled from committed inventory"
+                        );
+                        sb.num_devices = device_count;
+                    }
+                    let needs_device_set = device_count > 1
+                        || chunks.iter().any(|chunk| {
+                            !matches!(
+                                chunk.chunk_type & ffs_ondisk::chunk_type_flags::RAID_MASK,
+                                0 | ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_DUP
+                            )
+                        });
+                    if needs_device_set {
+                        if sb.log_root != 0 || options.mvcc_wal_path.is_some() {
+                            return Err(FfsError::UnsupportedFeature(
+                                "device attachment requires a clean multi-device btrfs image without an MVCC WAL".into(),
+                            ));
+                        }
+                        btrfs_devices = Some(devices);
+                    }
+                    btrfs_inventory_verified = true;
 
                     let root_tree_items = if let Some(devices) = &btrfs_devices {
                         devices.walk_tree(cx, &chunks, sb.root, sb)?
@@ -6875,6 +6895,7 @@ impl OpenFs {
             ext4_orphan_head: std::sync::atomic::AtomicU64::new(u64::MAX),
             dev,
             btrfs_devices,
+            btrfs_inventory_verified,
             mvcc_store,
             mvcc_conflict_policy: Mutex::new(ffs_mvcc::ConflictPolicy::default()),
             mvcc_evidence_ledger_path: Mutex::new(None),
@@ -6966,37 +6987,6 @@ impl OpenFs {
             btrfs_dir_entry_cache: ShardedCache::new(),
             btrfs_decompressed_extent_cache: ShardedCache::new(),
         };
-
-        if let Some(devices) = &fs.btrfs_devices {
-            let sb = fs
-                .btrfs_superblock()
-                .ok_or_else(|| FfsError::Format("not btrfs".into()))?;
-            let inventory = fs.current_btrfs_device_items(cx, sb)?;
-            for (id, attached) in &devices.identities {
-                if !inventory.get(id).is_some_and(|item| {
-                    item.uuid == attached.uuid && item.total_bytes == attached.total_bytes
-                }) {
-                    return Err(FfsError::Format(
-                        "attached device disagrees with chunk-tree identity or capacity".into(),
-                    ));
-                }
-            }
-            if let Some(ctx) = &fs.btrfs_context {
-                for chunk in &ctx.chunks {
-                    for stripe in &chunk.stripes {
-                        if inventory
-                            .get(&stripe.devid)
-                            .is_none_or(|item| item.uuid != stripe.dev_uuid)
-                        {
-                            return Err(FfsError::Format(
-                                "chunk stripe device identity mismatch".into(),
-                            ));
-                        }
-                    }
-                }
-                devices.validate_read_coverage(&ctx.chunks)?;
-            }
-        }
 
         if !fs.btrfs_tree_log_items.is_empty() {
             fs.btrfs_tree_log_hidden = fs.resolve_btrfs_tree_log_removals(cx)?;
@@ -7462,6 +7452,13 @@ impl OpenFs {
             FsFlavor::Btrfs(sb) => Some(sb.as_ref()),
             FsFlavor::Ext4(_) => None,
         }
+    }
+
+    /// Whether admission verified the complete committed btrfs device inventory.
+    /// Bootstrap-only inspection cannot authorize physical repair or mutation.
+    #[must_use]
+    pub fn btrfs_device_inventory_verified(&self) -> bool {
+        self.btrfs_inventory_verified
     }
 
     /// Return the btrfs context (chunk mapping + nodesize), or `None` if not btrfs.
@@ -10765,16 +10762,11 @@ impl OpenFs {
     /// - `txn_commit_conflict`: on FCW conflict with conflict details
     #[allow(clippy::cast_possible_truncation)]
     pub fn commit_transaction(&self, cx: &Cx, txn: Transaction) -> Result<CommitSeq, CommitError> {
-        self.reject_btrfs_seed_mutation()
-            .map_err(|error| CommitError::DurabilityFailure {
+        self.reject_btrfs_unsupported_mutation().map_err(|error| {
+            CommitError::DurabilityFailure {
                 detail: error.to_string(),
-            })?;
-        if self.btrfs_devices.is_some() {
-            return Err(CommitError::DurabilityFailure {
-                detail: "attached btrfs devices are read-only; transaction was not published"
-                    .into(),
-            });
-        }
+            }
+        })?;
         let txn_id = txn.id;
         let write_set_size = txn.pending_writes();
         let read_set_size = txn.read_set().len();
@@ -10905,16 +10897,11 @@ impl OpenFs {
         cx: &Cx,
         txn: Transaction,
     ) -> Result<CommitSeq, CommitError> {
-        self.reject_btrfs_seed_mutation()
-            .map_err(|error| CommitError::DurabilityFailure {
+        self.reject_btrfs_unsupported_mutation().map_err(|error| {
+            CommitError::DurabilityFailure {
                 detail: error.to_string(),
-            })?;
-        if self.btrfs_devices.is_some() {
-            return Err(CommitError::DurabilityFailure {
-                detail: "attached btrfs devices are read-only; transaction was not published"
-                    .into(),
-            });
-        }
+            }
+        })?;
         let txn_id = txn.id;
         let write_set_size = txn.pending_writes();
         let read_set_size = txn.read_set().len();
@@ -11387,7 +11374,7 @@ impl OpenFs {
 
         self.validate_repair_writeback_blocks(recovered_blocks)?;
 
-        self.reject_btrfs_seed_mutation()?;
+        self.reject_btrfs_unsupported_mutation()?;
 
         let mut scope = self.begin_request_scope(cx, RequestOp::RepairWriteback)?;
         if let Err(err) = self.reject_stale_repair_writeback_blocks(cx, &scope, recovered_blocks) {
@@ -11437,7 +11424,7 @@ impl OpenFs {
         cx: &Cx,
         device: &D,
     ) -> ffs_error::Result<usize> {
-        self.reject_btrfs_seed_mutation()?;
+        self.reject_btrfs_unsupported_mutation()?;
         let mut flushed_through = self.mvcc_flushed_through.lock();
         let (flushed, durable_through) =
             self.mvcc_store
@@ -11620,9 +11607,9 @@ impl OpenFs {
     /// before unmounting to ensure data written through the FUSE interface
     /// survives across remounts.  Returns the number of blocks flushed.
     pub fn flush_mvcc_to_device(&self, cx: &Cx) -> ffs_error::Result<usize> {
-        if let Err(error) = self.reject_btrfs_seed_mutation() {
-            // Preserve the no-op flush of a clean read-only seed, but never
-            // persist versions recovered from an external WAL onto the seed.
+        if let Err(error) = self.reject_btrfs_unsupported_mutation() {
+            // Preserve a no-op read-only flush, but never persist versions
+            // recovered from an external WAL onto an inadmissible backing.
             return if self.mvcc_version_count() == 0 {
                 Ok(0)
             } else {
@@ -11709,20 +11696,30 @@ impl OpenFs {
         (!reasons.is_empty()).then(|| reasons.join(", "))
     }
 
-    fn reject_btrfs_seed_mutation(&self) -> Result<(), FfsError> {
-        if self
-            .btrfs_superblock()
-            .is_some_and(BtrfsSuperblock::is_seeding)
-        {
+    fn reject_btrfs_unsupported_mutation(&self) -> Result<(), FfsError> {
+        let Some(sb) = self.btrfs_superblock() else {
+            return Ok(());
+        };
+        if sb.is_seeding() {
             return Err(FfsError::UnsupportedFeature(
                 "btrfs seed devices are read-only; mutation is not permitted".to_owned(),
+            ));
+        }
+        if !self.btrfs_inventory_verified {
+            return Err(FfsError::UnsupportedFeature(
+                "btrfs mutation requires a verified committed device inventory".to_owned(),
+            ));
+        }
+        if sb.num_devices != 1 || self.btrfs_devices.is_some() {
+            return Err(FfsError::UnsupportedFeature(
+                "btrfs mutation requires one device with only Single/DUP chunks".to_owned(),
             ));
         }
         Ok(())
     }
 
     pub fn enable_writes(&mut self, cx: &Cx) -> Result<(), FfsError> {
-        self.reject_btrfs_seed_mutation()?;
+        self.reject_btrfs_unsupported_mutation()?;
         match &self.flavor {
             FsFlavor::Ext4(sb) => {
                 if let Some(reason) = Self::ext4_writer_unsupported_features(sb) {
@@ -12806,38 +12803,14 @@ impl OpenFs {
                 .map(|entry| (entry.key, entry.data))
                 .collect()
         };
-        let mut devices = std::collections::BTreeMap::new();
-        let mut uuids = std::collections::BTreeSet::new();
-        for (key, bytes) in entries {
-            let device =
-                ffs_ondisk::parse_dev_item(&bytes).map_err(|error| corrupt(error.to_string()))?;
-            if key.offset != device.devid {
-                return Err(corrupt(
-                    "chunk-tree device ID disagrees with its key".to_owned(),
-                ));
-            }
-            if device.fsid != sb.fsid {
-                return Err(corrupt(
-                    "chunk-tree device filesystem UUID mismatch".to_owned(),
-                ));
-            }
-            if !uuids.insert(device.uuid) || devices.insert(device.devid, device).is_some() {
-                return Err(corrupt(
-                    "chunk tree contains duplicate device identities".to_owned(),
-                ));
-            }
-        }
+        let devices = parse_btrfs_device_inventory(
+            sb,
+            &backing,
+            entries.iter().map(|(key, bytes)| (*key, bytes.as_slice())),
+        )?;
         if u64::try_from(devices.len()).ok() != Some(sb.num_devices) {
             return Err(corrupt(
                 "chunk-tree device count disagrees with superblock".to_owned(),
-            ));
-        }
-        let current = devices
-            .get(&backing.devid)
-            .ok_or_else(|| corrupt("chunk tree has no backing device item".to_owned()))?;
-        if current.uuid != backing.uuid {
-            return Err(corrupt(
-                "chunk-tree device identity disagrees with backing superblock".to_owned(),
             ));
         }
         Ok(devices)
@@ -12897,7 +12870,7 @@ impl OpenFs {
         cx: &Cx,
         txn: Transaction,
     ) -> std::result::Result<(CommitSeq, Jbd2WriteStats), FfsError> {
-        self.reject_btrfs_seed_mutation()?;
+        self.reject_btrfs_unsupported_mutation()?;
         let jbd2_mutex = self.jbd2_writer.as_ref().ok_or_else(|| {
             FfsError::Format("no JBD2 writer attached for journaled commit".to_owned())
         })?;
@@ -25011,6 +24984,48 @@ const BTRFS_DEV_INFO_PATH_MAX: usize = 1024;
 /// `to_errno()` path forwards the right value to userspace.
 fn btrfs_dev_info_enodev() -> FfsError {
     FfsError::Io(std::io::Error::from_raw_os_error(libc::ENODEV))
+}
+
+/// Parse the complete committed inventory independently of superblock counts.
+/// The same identity checks apply during admission and live ioctl enumeration.
+fn parse_btrfs_device_inventory<'a>(
+    sb: &BtrfsSuperblock,
+    backing: &ffs_ondisk::BtrfsDevItem,
+    entries: impl IntoIterator<Item = (BtrfsKey, &'a [u8])>,
+) -> Result<std::collections::BTreeMap<u64, ffs_ondisk::BtrfsDevItem>, FfsError> {
+    let corrupt = |detail: &str| FfsError::Corruption {
+        block: sb.chunk_root / u64::from(sb.sectorsize),
+        detail: detail.to_owned(),
+    };
+    let mut devices = std::collections::BTreeMap::new();
+    let mut uuids = std::collections::BTreeSet::new();
+    for (key, bytes) in entries {
+        if key.objectid != ffs_ondisk::btrfs::BTRFS_DEV_ITEMS_OBJECTID
+            || key.item_type != ffs_ondisk::btrfs::BTRFS_DEV_ITEM_KEY
+        {
+            continue;
+        }
+        let device =
+            ffs_ondisk::parse_dev_item(bytes).map_err(|error| corrupt(&error.to_string()))?;
+        if key.offset != device.devid {
+            return Err(corrupt("chunk-tree device ID disagrees with its key"));
+        }
+        if device.fsid != sb.fsid {
+            return Err(corrupt("chunk-tree device filesystem UUID mismatch"));
+        }
+        if !uuids.insert(device.uuid) || devices.insert(device.devid, device).is_some() {
+            return Err(corrupt("chunk tree contains duplicate device identities"));
+        }
+    }
+    let current = devices
+        .get(&backing.devid)
+        .ok_or_else(|| corrupt("chunk tree has no backing device item"))?;
+    if current.uuid != backing.uuid {
+        return Err(corrupt(
+            "chunk-tree device identity disagrees with backing superblock",
+        ));
+    }
+    Ok(devices)
 }
 
 /// Read this backing image's identity and on-disk accounting for device ioctls.
@@ -38222,7 +38237,9 @@ impl OpenFs {
         // it because our own reader repopulates dev_item from the chunk tree
         // and never looks at that field.
         let mut sb_bytes = on_disk_sb.to_vec();
-        BtrfsSuperblock::patch_tree_log_commit(&mut sb_bytes, log_root, 0);
+        sb_bytes[0x88..0x90].copy_from_slice(&sb.num_devices.to_le_bytes());
+        BtrfsSuperblock::patch_tree_log_commit(&mut sb_bytes, log_root, 0)
+            .map_err(|error| parse_to_ffs_error(&error))?;
         Ok((log_tree_bytes, log_root_bytes, sb_bytes))
     }
 
@@ -40607,6 +40624,9 @@ impl OpenFs {
         sb_bytes[0x48..0x50].copy_from_slice(&new_gen.to_le_bytes());
         sb_bytes[0x50..0x58].copy_from_slice(&root_tree_bytenr.to_le_bytes());
         sb_bytes[0xC6] = root_tree_level;
+        // Admission reconciles this count from committed DEV_ITEMs without
+        // modifying the image. Publish that correction with the next commit.
+        sb_bytes[0x88..0x90].copy_from_slice(&sb.num_devices.to_le_bytes());
 
         // bd-a136s: a commit that grew the filesystem rewrote the chunk tree, and
         // its root lives HERE rather than in a ROOT_ITEM — the kernel maps the
@@ -60968,8 +60988,6 @@ mod tests {
         let root_logical = 0x4000_u64;
         let fs_tree_logical = 0x20_000_u64;
         image[sb_off + 0x50..sb_off + 0x58].copy_from_slice(&root_logical.to_le_bytes());
-        // chunk_root (set to 0 — we only use sys_chunk_array)
-        image[sb_off + 0x58..sb_off + 0x60].copy_from_slice(&0_u64.to_le_bytes());
         // total_bytes
         image[sb_off + 0x70..sb_off + 0x78].copy_from_slice(&(image_size as u64).to_le_bytes());
         // root_dir_objectid
@@ -61072,6 +61090,12 @@ mod tests {
         image[root_leaf..root_leaf + 4].copy_from_slice(&root_csum.to_le_bytes());
         let fs_csum = ffs_types::crc32c(&image[fs_leaf + 0x20..fs_leaf + nodesize]);
         image[fs_leaf..fs_leaf + 4].copy_from_slice(&fs_csum.to_le_bytes());
+
+        let device_item = sb_off + 0xC9;
+        image[device_item..device_item + 8].copy_from_slice(&1_u64.to_le_bytes());
+        image[device_item + 8..device_item + 16]
+            .copy_from_slice(&(image_size as u64).to_le_bytes());
+        add_btrfs_dev_info_chunk_tree(&mut image);
 
         image
     }
@@ -61329,7 +61353,6 @@ mod tests {
         image[sb_off + 0x40..sb_off + 0x48].copy_from_slice(&BTRFS_MAGIC.to_le_bytes()); // magic
         image[sb_off + 0x48..sb_off + 0x50].copy_from_slice(&1_u64.to_le_bytes()); // generation
         image[sb_off + 0x50..sb_off + 0x58].copy_from_slice(&root_tree_logical.to_le_bytes()); // root tree bytenr
-        image[sb_off + 0x58..sb_off + 0x60].copy_from_slice(&0_u64.to_le_bytes()); // chunk_root unused
         image[sb_off + 0x70..sb_off + 0x78].copy_from_slice(&(image_size as u64).to_le_bytes());
         image[sb_off + 0x80..sb_off + 0x88].copy_from_slice(&256_u64.to_le_bytes()); // root_dir_objectid
         image[sb_off + 0x88..sb_off + 0x90].copy_from_slice(&1_u64.to_le_bytes()); // num_devices
@@ -61475,6 +61498,12 @@ mod tests {
         stamp_btrfs_test_tree_block_crc32c(&mut image, BTRFS_TEST_ROOT_TREE_LOGICAL);
         stamp_btrfs_test_tree_block_crc32c(&mut image, BTRFS_TEST_FS_TREE_LOGICAL);
 
+        let device_item = sb_off + 0xC9;
+        image[device_item..device_item + 8].copy_from_slice(&1_u64.to_le_bytes());
+        image[device_item + 8..device_item + 16]
+            .copy_from_slice(&(image_size as u64).to_le_bytes());
+        add_btrfs_dev_info_chunk_tree(&mut image);
+
         image
     }
 
@@ -61603,6 +61632,11 @@ mod tests {
 
         stamp_btrfs_test_tree_block_crc32c(&mut image, root_leaf);
         stamp_btrfs_test_tree_block_crc32c(&mut image, internal);
+        let device_item = sb_off + 0xC9;
+        image[device_item..device_item + 8].copy_from_slice(&1_u64.to_le_bytes());
+        image[device_item + 8..device_item + 16]
+            .copy_from_slice(&(image_size as u64).to_le_bytes());
+        add_btrfs_dev_info_chunk_tree(&mut image);
         image
     }
 
@@ -61837,6 +61871,11 @@ mod tests {
         stamp_btrfs_test_tree_block_crc32c(&mut image, fs_leaf);
 
         stamp_btrfs_test_tree_block_crc32c(&mut image, internal);
+        let device_item = sb_off + 0xC9;
+        image[device_item..device_item + 8].copy_from_slice(&1_u64.to_le_bytes());
+        image[device_item + 8..device_item + 16]
+            .copy_from_slice(&(image_size as u64).to_le_bytes());
+        add_btrfs_dev_info_chunk_tree(&mut image);
         (image, subvol_ids)
     }
 
@@ -62269,6 +62308,9 @@ mod tests {
 
         stamp_btrfs_test_tree_block_crc32c(&mut image, root_leaf);
 
+        // Keep the authoritative mapping in step with the mixed bootstrap
+        // chunk above, and restamp its superblock after that deliberate edit.
+        add_btrfs_dev_info_chunk_tree(&mut image);
         image
     }
 
@@ -63605,6 +63647,8 @@ mod tests {
         let sb_off = BTRFS_SUPER_INFO_OFFSET;
         // Set nodesize to 128K (too large for our validation)
         image[sb_off + 0x94..sb_off + 0x98].copy_from_slice(&(128 * 1024_u32).to_le_bytes());
+        let checksum = ffs_types::crc32c(&image[sb_off + 0x20..sb_off + 4096]);
+        image[sb_off..sb_off + 4].copy_from_slice(&checksum.to_le_bytes());
 
         let dev = TestDevice::from_vec(image);
         let cx = Cx::for_testing();
@@ -63624,8 +63668,9 @@ mod tests {
         // breaks tree walking alignment checks, whereas sectorsize only
         // affects the superblock validation that skip_validation bypasses.
         image[sb_off + 0x90..sb_off + 0x94].copy_from_slice(&256_u32.to_le_bytes());
+        image[sb_off + 0x58..sb_off + 0x60].fill(0);
 
-        let dev = TestDevice::from_vec(image);
+        let dev = TestDevice::from_vec(image.clone());
         let cx = Cx::for_testing();
         let opts = OpenOptions {
             skip_validation: true,
@@ -63633,7 +63678,7 @@ mod tests {
         };
         // With skip_validation, the sectorsize check is bypassed and open falls
         // back to a bootstrap chunk map + superblock default root selection.
-        let fs = OpenFs::from_device(&cx, Box::new(dev), &opts)
+        let mut fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &opts)
             .expect("skip_validation should keep the btrfs bootstrap path mountable");
         assert!(fs.is_btrfs());
 
@@ -63642,6 +63687,25 @@ mod tests {
         assert_eq!(ctx.subvol_objectid, BTRFS_FS_TREE_OBJECTID);
         assert_eq!(ctx.subvol_root_dirid, sb.root_dir_objectid);
         assert!(!ctx.chunks.is_empty());
+        let error = fs.enable_writes(&cx).unwrap_err();
+        assert!(matches!(error, FfsError::UnsupportedFeature(_)));
+        assert!(
+            error
+                .to_string()
+                .contains("verified committed device inventory")
+        );
+        assert!(!fs.is_writable());
+        assert_eq!(fs.mvcc_store.version_count(), 0);
+        let mut txn = fs.begin_transaction();
+        txn.stage_write(BlockNumber(0), vec![0xAB; 4096]);
+        let error = fs.commit_transaction(&cx, txn).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("verified committed device inventory")
+        );
+        assert_eq!(fs.mvcc_store.version_count(), 0);
+        assert_eq!(dev.snapshot_bytes(), image);
     }
 
     // ── Btrfs file read tests ────────────────────────────────────────────
@@ -63804,6 +63868,11 @@ mod tests {
 
         stamp_btrfs_test_tree_block_crc32c(&mut image, BTRFS_TEST_ROOT_TREE_LOGICAL);
         stamp_btrfs_test_tree_block_crc32c(&mut image, BTRFS_TEST_FS_TREE_LOGICAL);
+        let device_item = sb_off + 0xC9;
+        image[device_item..device_item + 8].copy_from_slice(&1_u64.to_le_bytes());
+        image[device_item + 8..device_item + 16]
+            .copy_from_slice(&(image_size as u64).to_le_bytes());
+        add_btrfs_dev_info_chunk_tree(&mut image);
 
         image
     }
@@ -64715,6 +64784,11 @@ mod tests {
         image[root_leaf..root_leaf + 4].copy_from_slice(&csum_root.to_le_bytes());
         let csum_fs = ffs_types::crc32c(&image[fs_leaf + 0x20..fs_leaf + nodesize]);
         image[fs_leaf..fs_leaf + 4].copy_from_slice(&csum_fs.to_le_bytes());
+        let device_item = sb_off + 0xC9;
+        image[device_item..device_item + 8].copy_from_slice(&1_u64.to_le_bytes());
+        image[device_item + 8..device_item + 16]
+            .copy_from_slice(&(image_size as u64).to_le_bytes());
+        add_btrfs_dev_info_chunk_tree(&mut image);
 
         image
     }
@@ -90806,22 +90880,32 @@ mod tests {
 
     // ── Btrfs write-path integration tests ────────────────────────────
 
-    /// Give the ioctl fixture a committed device record, independently encoded
-    /// with the same leaf writer used by the filesystem-operation fixtures.
+    /// Publish the fixture's device identity and bootstrap mapping in CHUNK_TREE.
+    /// The independently selected device accounting is preserved.
     fn add_btrfs_dev_info_chunk_tree(image: &mut [u8]) -> usize {
         let sb = BTRFS_SUPER_INFO_OFFSET;
-        let root = 0x2_0000_usize;
+        // Separate from both FS_TREE layouts (0x8000 and 0x20000), the root
+        // tree, superblock, and file payloads starting at 0x12000.
+        let nodesize = usize::try_from(u32::from_le_bytes(
+            image[sb + 0x94..sb + 0x98].try_into().unwrap(),
+        ))
+        .unwrap();
+        let root = 0xA000_usize.next_multiple_of(nodesize);
         let logical = u64::try_from(root).unwrap();
         let item = image[sb + 0xC9..sb + 0x12B].to_vec();
         let devid = u64::from_le_bytes(item[..8].try_into().unwrap());
         let fsid: [u8; 16] = image[sb + 0x20..sb + 0x30].try_into().unwrap();
-        image[root..root + 4096].fill(0);
+        let stripe = sb + 0x32B + 17 + 48;
+        image[stripe..stripe + 8].copy_from_slice(&devid.to_le_bytes());
+        image[stripe + 16..stripe + 32].copy_from_slice(&item[66..82]);
+        let chunk = image[sb + 0x32B + 17..sb + 0x32B + 97].to_vec();
+        image[root..root + nodesize].fill(0);
         image[root + 0x20..root + 0x30].copy_from_slice(&fsid);
         image[root + 0x30..root + 0x38].copy_from_slice(&logical.to_le_bytes());
         image[root + 0x40..root + 0x50].copy_from_slice(&fsid);
         image[root + 0x50..root + 0x58].copy_from_slice(&1_u64.to_le_bytes());
         image[root + 0x58..root + 0x60].copy_from_slice(&BTRFS_CHUNK_TREE_OBJECTID.to_le_bytes());
-        image[root + 0x60..root + 0x64].copy_from_slice(&1_u32.to_le_bytes());
+        image[root + 0x60..root + 0x64].copy_from_slice(&2_u32.to_le_bytes());
         write_btrfs_leaf_item(
             image,
             root,
@@ -90833,7 +90917,10 @@ mod tests {
             98,
         );
         image[root + 3998..root + 4096].copy_from_slice(&item);
-        stamp_btrfs_test_tree_block_crc32c(image, root);
+        write_btrfs_leaf_item(image, root, 1, 256, 228, 0, 3800, 80);
+        image[root + 3800..root + 3880].copy_from_slice(&chunk);
+        let checksum = ffs_types::crc32c(&image[root + 0x20..root + nodesize]);
+        image[root..root + 4].copy_from_slice(&checksum.to_le_bytes());
         image[sb + 0x58..sb + 0x60].copy_from_slice(&logical.to_le_bytes());
         image[sb + 0xA4..sb + 0xAC].copy_from_slice(&1_u64.to_le_bytes());
         let checksum = ffs_types::crc32c(&image[sb + 0x20..sb + 4096]);
@@ -90900,6 +90987,59 @@ mod tests {
     }
 
     #[test]
+    fn btrfs_admission_rejects_corrupt_backing_identity() {
+        let cx = Cx::for_testing();
+        for defect in ["checksum", "fsid", "devid", "accounting"] {
+            for skip_validation in [false, true] {
+                let mut image = build_btrfs_fsops_image();
+                let sb = BTRFS_SUPER_INFO_OFFSET;
+                let item = sb + 0xC9;
+                match defect {
+                    "fsid" => image[item + 82] ^= 1,
+                    "devid" => image[item..item + 8].fill(0),
+                    "accounting" => {
+                        image[item + 16..item + 24].copy_from_slice(&524_289_u64.to_le_bytes())
+                    }
+                    _ => {}
+                }
+                let checksum = ffs_types::crc32c(&image[sb + 0x20..sb + 4096]);
+                image[sb..sb + 4].copy_from_slice(&checksum.to_le_bytes());
+                if defect == "checksum" {
+                    image[item + 66] ^= 1;
+                }
+                let dev = TestDevice::from_vec(image.clone());
+                let error = OpenFs::from_device(
+                    &cx,
+                    Box::new(dev.clone()),
+                    &OpenOptions {
+                        skip_validation,
+                        ..OpenOptions::default()
+                    },
+                )
+                .unwrap_err();
+                let expected = match defect {
+                    "checksum" => "checksum",
+                    "fsid" => "filesystem UUID mismatch",
+                    "devid" => "devid",
+                    "accounting" => "exceeds total_bytes",
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    error.to_errno(),
+                    if defect == "checksum" {
+                        libc::EINVAL
+                    } else {
+                        libc::EIO
+                    },
+                    "{defect}: {error}"
+                );
+                assert!(error.to_string().contains(expected), "{defect}: {error}");
+                assert_eq!(dev.snapshot_bytes(), image);
+            }
+        }
+    }
+
+    #[test]
     fn btrfs_dev_info_rejects_corrupt_identity() {
         let cx = Cx::for_testing();
         for defect in ["checksum", "fsid", "devid", "accounting"] {
@@ -90915,6 +91055,9 @@ mod tests {
             image[item + 66..item + 82].fill(0xA7);
             image[item + 82..item + 98].copy_from_slice(&fsid);
             add_btrfs_dev_info_chunk_tree(&mut image);
+            let dev = TestDevice::from_vec(image.clone());
+            let fs =
+                OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
             match defect {
                 "fsid" => image[item + 82] ^= 1,
                 "devid" => image[item..item + 8].fill(0),
@@ -90925,13 +91068,15 @@ mod tests {
             }
             let checksum = ffs_types::crc32c(&image[sb_offset + 0x20..sb_offset + 4096]);
             image[sb_offset..sb_offset + 4].copy_from_slice(&checksum.to_le_bytes());
-            let dev = TestDevice::from_vec(image);
-            let fs =
-                OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
             if defect == "checksum" {
-                dev.write_all_at(&cx, ByteOffset(u64::try_from(item + 66).unwrap()), &[0xA6])
-                    .unwrap();
+                image[item + 66] ^= 1;
             }
+            dev.write_all_at(
+                &cx,
+                ByteOffset(u64::try_from(sb_offset).unwrap()),
+                &image[sb_offset..sb_offset + 4096],
+            )
+            .unwrap();
             let before = dev.snapshot_bytes();
             let error = fs
                 .get_btrfs_dev_info(&cx, &mut RequestScope::empty(), 0, [0; 16])
@@ -90979,6 +91124,9 @@ mod tests {
             image[item + 16..item + 24].copy_from_slice(&8192_u64.to_le_bytes());
             image[item + 66..item + 82].fill(0xA7);
             let root = add_btrfs_dev_info_chunk_tree(&mut image);
+            let dev = TestDevice::from_vec(image.clone());
+            let fs =
+                OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
             match defect {
                 "missing" => image[root + 0x60..root + 0x64].fill(0),
                 "predecessor" => {
@@ -90993,9 +91141,12 @@ mod tests {
             if defect == "checksum" {
                 image[root + 3998 + 66] ^= 1;
             }
-            let dev = TestDevice::from_vec(image.clone());
-            let fs =
-                OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+            dev.write_all_at(
+                &cx,
+                ByteOffset(u64::try_from(root).unwrap()),
+                &image[root..root + 4096],
+            )
+            .unwrap();
             let error = fs
                 .get_btrfs_dev_info(&cx, &mut RequestScope::empty(), 7, [0; 16])
                 .unwrap_err();
@@ -91204,21 +91355,23 @@ mod tests {
     #[test]
     fn btrfs_dev_info_rejects_incomplete_or_conflicting_inventory() {
         let cx = Cx::for_testing();
-        for defect in [
-            "count_low",
-            "count_high",
+        for (defect, num_devices) in [
+            "missing_inventory",
             "duplicate_uuid",
             "foreign_fsid",
             "wrong_key",
             "missing_backing",
             "bad_accounting",
-        ] {
+        ]
+        .into_iter()
+        .flat_map(|defect| [1_u64, 2].map(|count| (defect, count)))
+        {
             let (mut image, root) = build_btrfs_device_inventory_image();
             let sb = BTRFS_SUPER_INFO_OFFSET;
+            image[sb + 0x88..sb + 0x90].copy_from_slice(&num_devices.to_le_bytes());
             let second = root + 3900;
             match defect {
-                "count_low" => image[sb + 0x88..sb + 0x90].copy_from_slice(&1_u64.to_le_bytes()),
-                "count_high" => image[sb + 0x88..sb + 0x90].copy_from_slice(&3_u64.to_le_bytes()),
+                "missing_inventory" => image[root + 0x60..root + 0x64].fill(0),
                 "duplicate_uuid" => image[second + 66..second + 82].fill(0xA7),
                 "foreign_fsid" => image[second + 82] ^= 1,
                 "wrong_key" => image[second..second + 8].copy_from_slice(&8_u64.to_le_bytes()),
@@ -91238,33 +91391,57 @@ mod tests {
             image[sb..sb + 4].copy_from_slice(&checksum.to_le_bytes());
             let dev = TestDevice::from_vec(image.clone());
             let opened = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default());
-            if defect == "count_low" {
-                let fs = opened.unwrap();
-                for result in [
-                    fs.get_btrfs_fs_info(&cx, &mut RequestScope::empty()),
-                    fs.get_btrfs_dev_info(&cx, &mut RequestScope::empty(), 7, [0; 16]),
-                ] {
-                    let error = result.unwrap_err();
-                    assert_eq!(error.to_errno(), libc::EIO, "{defect}: {error}");
-                    assert!(error.to_string().contains("device count disagrees"));
-                }
-            } else {
-                // Multi-device inventory is now validated at admission, before
-                // either ioctl can be reached. Keep the specific defect oracle.
-                let error = opened.unwrap_err();
-                let expected = match defect {
-                    "count_high" => "device count disagrees",
-                    "duplicate_uuid" => "duplicate device identities",
-                    "foreign_fsid" => "filesystem UUID mismatch",
-                    "wrong_key" => "device ID disagrees with its key",
-                    "missing_backing" => "no backing device item",
-                    "bad_accounting" => "exceeds total_bytes",
-                    _ => unreachable!(),
-                };
-                assert_eq!(error.to_errno(), libc::EIO, "{defect}: {error}");
-                assert!(error.to_string().contains(expected), "{defect}: {error}");
-            }
+            // Inventory is validated before ROOT_TREE traversal or mutation.
+            let error = opened.unwrap_err();
+            let expected = match defect {
+                "duplicate_uuid" => "duplicate device identities",
+                "foreign_fsid" => "filesystem UUID mismatch",
+                "wrong_key" => "device ID disagrees with its key",
+                "missing_inventory" | "missing_backing" => "no backing device item",
+                "bad_accounting" => "exceeds total_bytes",
+                _ => unreachable!(),
+            };
+            assert_eq!(error.to_errno(), libc::EIO, "{defect}: {error}");
+            assert!(error.to_string().contains(expected), "{defect}: {error}");
             assert_eq!(dev.snapshot_bytes(), image);
+        }
+    }
+
+    #[test]
+    fn btrfs_admission_checks_bootstrap_and_committed_stripe_identity() {
+        let cx = Cx::for_testing();
+        for bootstrap in [false, true] {
+            for skip_validation in [false, true] {
+                let mut image = build_btrfs_fsops_image();
+                let sb = BTRFS_SUPER_INFO_OFFSET;
+                let root = add_btrfs_dev_info_chunk_tree(&mut image);
+                let stripe_uuid = if bootstrap {
+                    sb + 0x32B + 17 + 64
+                } else {
+                    root + 3800 + 64
+                };
+                image[stripe_uuid] ^= 1;
+                stamp_btrfs_test_tree_block_crc32c(&mut image, root);
+                let checksum = ffs_types::crc32c(&image[sb + 0x20..sb + 4096]);
+                image[sb..sb + 4].copy_from_slice(&checksum.to_le_bytes());
+                let dev = TestDevice::from_vec(image.clone());
+                let error = OpenFs::from_device(
+                    &cx,
+                    Box::new(dev.clone()),
+                    &OpenOptions {
+                        skip_validation,
+                        ..OpenOptions::default()
+                    },
+                )
+                .unwrap_err();
+                assert_eq!(error.to_errno(), libc::EINVAL);
+                assert!(
+                    error
+                        .to_string()
+                        .contains("chunk stripe device identity mismatch")
+                );
+                assert_eq!(dev.snapshot_bytes(), image);
+            }
         }
     }
 
@@ -91455,9 +91632,111 @@ mod tests {
     }
 
     #[test]
-    fn btrfs_enable_writes_rejects_multi_device_before_mutation() {
+    fn btrfs_single_device_reconciles_stale_count_before_write_admission() {
         let cx = Cx::for_testing();
         for num_devices in [2_u64, 3] {
+            for skip_validation in [false, true] {
+                let mut image = build_btrfs_fsops_image();
+                let sb = BTRFS_SUPER_INFO_OFFSET;
+                image[sb + 0x88..sb + 0x90].copy_from_slice(&num_devices.to_le_bytes());
+                let checksum = ffs_types::crc32c(&image[sb + 0x20..sb + 4096]);
+                image[sb..sb + 4].copy_from_slice(&checksum.to_le_bytes());
+                let dev = TestDevice::from_vec(image.clone());
+                let options = OpenOptions {
+                    skip_validation,
+                    btrfs_rw_ephemeral_ok: true,
+                    ..OpenOptions::default()
+                };
+                let mut fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &options).unwrap();
+                assert_eq!(fs.btrfs_superblock().unwrap().num_devices, 1);
+                assert!(fs.btrfs_devices.is_none());
+                let info = fs
+                    .get_btrfs_fs_info(&cx, &mut RequestScope::empty())
+                    .unwrap();
+                assert_eq!(&info[..8], &1_u64.to_ne_bytes());
+                assert_eq!(&info[8..16], &1_u64.to_ne_bytes());
+                let file = fs
+                    .lookup(&cx, InodeNumber(1), OsStr::new("hello.txt"))
+                    .unwrap();
+                assert_eq!(
+                    fs.read(&cx, file.ino, 0, 128).unwrap(),
+                    b"hello from btrfs fsops"
+                );
+                // Reconciliation changes the mounted view, not the input image.
+                assert_eq!(dev.snapshot_bytes(), image);
+                fs.enable_writes(&cx)
+                    .expect("verified single-device inventory permits writes");
+                assert!(fs.is_writable());
+                assert_eq!(fs.write(&cx, file.ino, 0, b"reconciled").unwrap(), 10);
+                assert_eq!(fs.read(&cx, file.ino, 0, 10).unwrap(), b"reconciled");
+            }
+        }
+    }
+
+    #[test]
+    fn btrfs_stale_counts_route_root_and_file_to_attached_device() {
+        let cx = Cx::for_testing();
+        let (mut primary, root) = build_btrfs_device_inventory_image();
+        let sb = BTRFS_SUPER_INFO_OFFSET;
+        // Bootstrap remains on device 7; the committed map routes ROOT_TREE,
+        // FS_TREE and payload reads to the sparse second device.
+        primary[root + 3800 + 48..root + 3800 + 56]
+            .copy_from_slice(&u64::MAX.to_le_bytes());
+        primary[root + 3800 + 64..root + 3800 + 80].fill(0xD4);
+        stamp_btrfs_test_tree_block_crc32c(&mut primary, root);
+        let mut secondary = primary.clone();
+        secondary.copy_within(root + 3900..root + 3998, sb + 0xC9);
+        secondary[sb + 0x88..sb + 0x90].copy_from_slice(&3_u64.to_le_bytes());
+        primary[sb + 0x88..sb + 0x90].copy_from_slice(&1_u64.to_le_bytes());
+        // Reading the same physical offsets from the primary must not pass.
+        primary[0x4000..0x5000].fill(0xE7);
+        primary[0x8000..0x9000].fill(0xE7);
+        primary[0x12000..0x13000].fill(0xE7);
+        for image in [&mut primary, &mut secondary] {
+            let checksum = ffs_types::crc32c(&image[sb + 0x20..sb + 4096]);
+            image[sb..sb + 4].copy_from_slice(&checksum.to_le_bytes());
+        }
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("secondary.btrfs");
+        std::fs::write(&path, &secondary).unwrap();
+        let dev = TestDevice::from_vec(primary.clone());
+        let mut fs = OpenFs::from_device(
+            &cx,
+            Box::new(dev.clone()),
+            &OpenOptions {
+                btrfs_device_paths: vec![path.clone()],
+                ..OpenOptions::default()
+            },
+        )
+        .expect("reconciled inventory selects the attached reader before ROOT_TREE");
+        assert_eq!(fs.btrfs_superblock().unwrap().num_devices, 2);
+        let file = fs
+            .lookup(&cx, InodeNumber(1), OsStr::new("hello.txt"))
+            .unwrap();
+        assert_eq!(
+            fs.read(&cx, file.ino, 0, 128).unwrap(),
+            b"hello from btrfs fsops"
+        );
+        assert!(fs.enable_writes(&cx).is_err());
+        drop(fs);
+        let error = OpenFs::from_device(
+            &cx,
+            Box::new(dev.clone()),
+            &OpenOptions::default(),
+        )
+        .unwrap_err();
+        assert!(matches!(error, FfsError::UnsupportedFeature(_)));
+        assert!(error.to_string().contains("readable device set"));
+        assert_eq!(dev.snapshot_bytes(), primary);
+        assert_eq!(std::fs::read(path).unwrap(), secondary);
+    }
+
+    #[test]
+    fn btrfs_enable_writes_rejects_multi_device_before_mutation() {
+        let cx = Cx::for_testing();
+        // Linux reconciles both a count_low (1) and count_high (3) superblock
+        // from the two committed DEV_ITEMs, including the unused sparse ID.
+        for num_devices in [1_u64, 2, 3] {
             for skip_validation in [false, true] {
                 let (mut image, _) = build_btrfs_device_inventory_image();
                 let offset = BTRFS_SUPER_INFO_OFFSET + 0x88;
@@ -91471,14 +91750,16 @@ mod tests {
                     ..OpenOptions::default()
                 };
                 let opened = OpenFs::from_device(&cx, Box::new(dev.clone()), &options);
-                if num_devices == 3 {
-                    let error = opened.unwrap_err();
-                    assert_eq!(error.to_errno(), libc::EIO);
-                    assert!(error.to_string().contains("device count disagrees"));
-                    assert_eq!(dev.snapshot_bytes(), image);
-                    continue;
-                }
                 let mut fs = opened.unwrap();
+                assert_eq!(fs.btrfs_superblock().unwrap().num_devices, 2);
+                assert!(fs.btrfs_devices.is_some());
+                let file = fs
+                    .lookup(&cx, InodeNumber(1), OsStr::new("hello.txt"))
+                    .unwrap();
+                assert_eq!(
+                    fs.read(&cx, file.ino, 0, 128).unwrap(),
+                    b"hello from btrfs fsops"
+                );
                 let info = fs
                     .get_btrfs_fs_info(&cx, &mut RequestScope::empty())
                     .unwrap();
@@ -91488,6 +91769,17 @@ mod tests {
                 assert!(matches!(error, FfsError::UnsupportedFeature(_)));
                 assert!(error.to_string().contains("one device"));
                 assert!(!fs.is_writable());
+                for ssi in [false, true] {
+                    let mut txn = fs.begin_transaction();
+                    txn.stage_write(BlockNumber(0), vec![0xAB; 4096]);
+                    let result = if ssi {
+                        fs.commit_transaction_ssi(&cx, txn)
+                    } else {
+                        fs.commit_transaction(&cx, txn)
+                    };
+                    let error = result.expect_err("multi-device transaction must not publish");
+                    assert!(error.to_string().contains("one device"));
+                }
                 assert_eq!(fs.mvcc_store.version_count(), 0);
                 drop(fs);
                 assert_eq!(dev.snapshot_bytes(), image);
@@ -91536,12 +91828,31 @@ mod tests {
             let size_offset = BTRFS_SUPER_INFO_OFFSET + 0xA0;
             image[size_offset..size_offset + 4]
                 .copy_from_slice(&u32::try_from(encoded.len()).unwrap().to_le_bytes());
+            let sb = BTRFS_SUPER_INFO_OFFSET;
+            let checksum = ffs_types::crc32c(&image[sb + 0x20..sb + 4096]);
+            image[sb..sb + 4].copy_from_slice(&checksum.to_le_bytes());
             let dev = TestDevice::from_vec(image.clone());
             let options = OpenOptions {
                 skip_validation: true,
                 ..OpenOptions::default()
             };
+            // Skipping geometry checks does not admit an on-disk stripe set
+            // whose device IDs are absent from the committed inventory.
+            let error = OpenFs::from_device(&cx, Box::new(dev.clone()), &options).unwrap_err();
+            assert_eq!(error.to_errno(), libc::EINVAL, "{error}");
+            assert!(
+                error
+                    .to_string()
+                    .contains("chunk stripe device identity mismatch")
+            );
+            assert_eq!(dev.snapshot_bytes(), image);
+
+            // Independently exercise the writer's profile guard after valid
+            // admission, so the earlier rejection cannot conceal its removal.
+            let image = build_btrfs_fsops_image();
+            let dev = TestDevice::from_vec(image.clone());
             let mut fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &options).unwrap();
+            fs.btrfs_context.as_mut().unwrap().chunks = vec![chunk];
             let error = fs.enable_writes(&cx).unwrap_err();
             assert!(matches!(error, FfsError::UnsupportedFeature(_)));
             assert!(error.to_string().contains("RAID mutation"));

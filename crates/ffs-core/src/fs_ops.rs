@@ -4653,7 +4653,7 @@ impl FsOps for OpenFs {
 
     fn begin_request_scope(&self, _cx: &Cx, op: RequestOp) -> ffs_error::Result<RequestScope> {
         if op.is_write() {
-            self.reject_btrfs_seed_mutation()?;
+            self.reject_btrfs_unsupported_mutation()?;
         }
         // bd-9rutw: the whole request — its eager commits AND its scope commit —
         // runs inside the mutation gate, so a journaled boundary never captures
@@ -4814,7 +4814,7 @@ impl FsOps for OpenFs {
         scope: &mut RequestScope,
     ) -> ffs_error::Result<CommitSeq> {
         if scope.tx.is_some() {
-            self.reject_btrfs_seed_mutation()?;
+            self.reject_btrfs_unsupported_mutation()?;
         }
         let tx_id = scope.tx.as_ref().map(ffs_mvcc::Transaction::id);
         // Only the repair-flush lifecycle consumes write_blocks; when it is not

@@ -8016,6 +8016,9 @@ fn build_mount_background_scrub_plan(
         if repair_writes_enabled && sb.is_seeding() {
             bail!("btrfs seed devices are read-only; background repair is not permitted");
         }
+        if repair_writes_enabled && !open_fs.btrfs_device_inventory_verified() {
+            bail!("btrfs background repair requires a verified committed device inventory");
+        }
         if sb.num_devices != 1 {
             bail!("multi-device background scrub and repair are not yet supported");
         }
@@ -14183,7 +14186,11 @@ mod tests {
         );
     }
 
-    fn create_btrfs_seed_image(payload: &[u8]) -> Option<(PathBuf, PathBuf)> {
+    fn create_btrfs_admission_image(
+        payload: &[u8],
+        seeding: bool,
+        checksum: &str,
+    ) -> Option<(PathBuf, PathBuf)> {
         let dir = tempfile::tempdir().expect("tempdir").keep();
         let source = dir.join("source");
         std::fs::create_dir(&source).expect("source directory");
@@ -14193,6 +14200,7 @@ mod tests {
             .and_then(|file| file.set_len(128 * 1024 * 1024))
             .expect("sparse image");
         let formatted = std::process::Command::new("mkfs.btrfs")
+            .args(["--csum", checksum])
             .args(["-f", "-m", "single", "-d", "single", "--rootdir"])
             .arg(&source)
             .arg(&image)
@@ -14218,6 +14226,9 @@ mod tests {
                 .expect("ordinary image permits writes");
             assert!(ordinary.is_writable());
         }
+        if !seeding {
+            return Some((dir, image));
+        }
         let tuned = std::process::Command::new("btrfstune")
             .args(["-S", "1"])
             .arg(&image)
@@ -14241,7 +14252,7 @@ mod tests {
     #[test]
     fn btrfs_seed_image_reads_but_refuses_write_admission_and_repair() {
         let payload = b"persistent seed payload\n".repeat(1024);
-        let Some((dir, image)) = create_btrfs_seed_image(&payload) else {
+        let Some((dir, image)) = create_btrfs_admission_image(&payload, true, "crc32c") else {
             return;
         };
         let cx = Cx::for_testing();
@@ -14318,6 +14329,130 @@ mod tests {
         );
         eprintln!(
             "SCENARIO_RESULT|scenario_id=btrfs_seed_write_admission|outcome=PASS|image_sha256={before}|artifacts={}",
+            dir.display()
+        );
+    }
+
+    #[test]
+    fn btrfs_device_count_reconciles_real_image_before_read_and_commit() {
+        for checksum in ["crc32c", "xxhash"] {
+            for ephemeral in [false, true] {
+                assert_btrfs_device_count_reconciliation(checksum, ephemeral);
+            }
+        }
+    }
+
+    fn assert_btrfs_device_count_reconciliation(checksum: &str, ephemeral: bool) {
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let payload = b"committed device inventory\n".repeat(1024);
+        let Some((dir, image)) = create_btrfs_admission_image(&payload, false, checksum) else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let options = OpenOptions {
+            btrfs_rw_ephemeral_ok: ephemeral,
+            ..OpenOptions::default()
+        };
+        let mut backing = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&image)
+            .unwrap();
+        let mut region = [0_u8; 4096];
+        backing.seek(SeekFrom::Start(65_536)).unwrap();
+        backing.read_exact(&mut region).unwrap();
+        let csum_type = u16::from_le_bytes(region[0xC4..0xC6].try_into().unwrap());
+        assert_eq!(
+            csum_type,
+            if checksum == "crc32c" {
+                ffs_types::BTRFS_CSUM_TYPE_CRC32C
+            } else {
+                ffs_types::BTRFS_CSUM_TYPE_XXHASH64
+            }
+        );
+        let devid = u64::from_le_bytes(region[0xC9..0xD1].try_into().unwrap());
+        for advertised in [1_u64, 2, 3, u64::MAX] {
+            region[0x88..0x90].copy_from_slice(&advertised.to_le_bytes());
+            let checksum = ffs_ondisk::btrfs_csum(csum_type, &region[0x20..]).unwrap();
+            region[..32].copy_from_slice(&checksum);
+            backing.seek(SeekFrom::Start(65_536)).unwrap();
+            backing.write_all(&region).unwrap();
+            backing.sync_all().unwrap();
+            let before = super::file_sha256(&image).unwrap();
+            let mut fs = OpenFs::open_with_options(&cx, &image, &options)
+                .expect("committed inventory wins");
+            assert_eq!(fs.btrfs_superblock().unwrap().num_devices, 1);
+            assert!(fs.btrfs_device_inventory_verified());
+            let info = fs
+                .get_btrfs_fs_info(&cx, &mut ffs_core::RequestScope::empty())
+                .unwrap();
+            assert_eq!(&info[..8], &devid.to_ne_bytes());
+            assert_eq!(&info[8..16], &1_u64.to_ne_bytes());
+            let file = fs
+                .lookup(
+                    &cx,
+                    ffs_types::InodeNumber(1),
+                    std::ffi::OsStr::new("payload"),
+                )
+                .unwrap();
+            assert_eq!(
+                fs.read(&cx, file.ino, 0, u32::try_from(payload.len()).unwrap())
+                    .unwrap(),
+                payload
+            );
+            fs.enable_writes(&cx)
+                .expect("verified single device permits writes");
+            assert!(fs.is_writable());
+            drop(fs);
+            assert_eq!(super::file_sha256(&image).unwrap(), before);
+        }
+
+        // Publish the corrected count with a real filesystem mutation, then
+        // independently inspect the durable superblock and btrfs-progs check.
+        let mut fs = OpenFs::open_with_options(&cx, &image, &options).unwrap();
+        fs.enable_writes(&cx).unwrap();
+        let file = fs
+            .create(
+                &cx,
+                ffs_types::InodeNumber(1),
+                std::ffi::OsStr::new("reconciled"),
+                0o644,
+                0,
+                0,
+            )
+            .unwrap();
+        fs.write(&cx, file.ino, 0, b"durable count").unwrap();
+        fs.fsync(&cx, file.ino, 0, false).unwrap();
+        drop(fs);
+        backing.seek(SeekFrom::Start(65_536)).unwrap();
+        backing.read_exact(&mut region).unwrap();
+        assert_eq!(&region[0x88..0x90], &1_u64.to_le_bytes());
+        ffs_ondisk::verify_btrfs_superblock_checksum(&region).unwrap();
+        let reopened = OpenFs::open(&cx, &image).unwrap();
+        let file = reopened
+            .lookup(
+                &cx,
+                ffs_types::InodeNumber(1),
+                std::ffi::OsStr::new("reconciled"),
+            )
+            .unwrap();
+        assert_eq!(
+            reopened.read(&cx, file.ino, 0, 64).unwrap(),
+            b"durable count"
+        );
+        let checked = std::process::Command::new("btrfs")
+            .args(["check", "--readonly"])
+            .arg(&image)
+            .output()
+            .expect("btrfs check");
+        assert!(
+            checked.status.success(),
+            "{}",
+            String::from_utf8_lossy(&checked.stderr)
+        );
+        eprintln!(
+            "SCENARIO_RESULT|scenario_id=btrfs_device_count_reconciliation|outcome=PASS|checksum={checksum}|ephemeral={ephemeral}|artifacts={}",
             dir.display()
         );
     }
