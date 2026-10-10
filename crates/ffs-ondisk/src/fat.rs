@@ -104,11 +104,17 @@ impl FatGeometry {
         }
         let sectors_per_cluster = u32::from(boot[13]);
         if !sectors_per_cluster.is_power_of_two() || sectors_per_cluster > 128 {
-            return Err(invalid("fat.sectors_per_cluster", "invalid cluster geometry"));
+            return Err(invalid(
+                "fat.sectors_per_cluster",
+                "invalid cluster geometry",
+            ));
         }
         let cluster_bytes = sector_bytes * sectors_per_cluster;
         if cluster_bytes > 65_536 {
-            return Err(invalid("fat.cluster_bytes", "read profile supports at most 64 KiB"));
+            return Err(invalid(
+                "fat.cluster_bytes",
+                "read profile supports at most 64 KiB",
+            ));
         }
         let reserved = read_le_u16(boot, 14)?;
         let fat_count = boot[16];
@@ -140,9 +146,8 @@ impl FatGeometry {
         }
         let root_bytes = u64::from(root_entries) * 32;
         let root_sectors = root_bytes.div_ceil(u64::from(sector_bytes));
-        let first_data = u64::from(reserved)
-            + u64::from(fat_count) * u64::from(fat_sectors)
-            + root_sectors;
+        let first_data =
+            u64::from(reserved) + u64::from(fat_count) * u64::from(fat_sectors) + root_sectors;
         let data_sectors = u64::from(total)
             .checked_sub(first_data)
             .ok_or_else(|| invalid("fat.data_region", "metadata exceeds volume"))?;
@@ -154,57 +159,55 @@ impl FatGeometry {
             _ => FatKind::Fat32,
         };
         // A count-derived dialect must also have that dialect's BPB layout.
-        let (root_cluster, active_fat, mirrored, fs_info_sector, backup_boot_sector) =
-            match kind {
-                FatKind::Fat16 => {
-                    if small_fat == 0
-                        || root_entries == 0
-                        || !root_bytes.is_multiple_of(u64::from(sector_bytes))
-                    {
-                        return Err(invalid("fat16.layout", "invalid fixed root or FAT16 size"));
-                    }
-                    (0, 0, true, None, None)
+        let (root_cluster, active_fat, mirrored, fs_info_sector, backup_boot_sector) = match kind {
+            FatKind::Fat16 => {
+                if small_fat == 0
+                    || root_entries == 0
+                    || !root_bytes.is_multiple_of(u64::from(sector_bytes))
+                {
+                    return Err(invalid("fat16.layout", "invalid fixed root or FAT16 size"));
                 }
-                FatKind::Fat32 => {
-                    if small_fat != 0 || root_entries != 0 || small_total != 0 {
-                        return Err(invalid("fat32.layout", "FAT16 fields in FAT32 BPB"));
-                    }
-                    if read_le_u16(boot, 42)? != 0 {
-                        return Err(invalid("fat32.version", "unsupported filesystem version"));
-                    }
-                    if cluster_count >= 0x0FFF_FFF5 {
-                        return Err(invalid("fat32.cluster_count", "cluster namespace exhausted"));
-                    }
-                    let flags = read_le_u16(boot, 40)?;
-                    if flags & !0x008F != 0 {
-                        return Err(invalid("fat32.flags", "reserved flag bits are set"));
-                    }
-                    let mirrored = flags & 0x80 == 0;
-                    let active = if mirrored {
-                        0
-                    } else {
-                        (flags & 0x0F) as u8
-                    };
-                    if active >= fat_count {
-                        return Err(invalid("fat32.active_fat", "active copy is absent"));
-                    }
-                    let pointer = |offset| -> Result<Option<u16>, ParseError> {
-                        let value = read_le_u16(boot, offset)?;
-                        match value {
-                            0 | 0xFFFF => Ok(None),
-                            n if n < reserved => Ok(Some(n)),
-                            _ => Err(invalid("fat32.reserved_pointer", "outside reserved region")),
-                        }
-                    };
-                    (
-                        read_le_u32(boot, 44)?,
-                        active,
-                        mirrored,
-                        pointer(48)?,
-                        pointer(50)?,
-                    )
+                (0, 0, true, None, None)
+            }
+            FatKind::Fat32 => {
+                if small_fat != 0 || root_entries != 0 || small_total != 0 {
+                    return Err(invalid("fat32.layout", "FAT16 fields in FAT32 BPB"));
                 }
-            };
+                if read_le_u16(boot, 42)? != 0 {
+                    return Err(invalid("fat32.version", "unsupported filesystem version"));
+                }
+                if cluster_count >= 0x0FFF_FFF5 {
+                    return Err(invalid(
+                        "fat32.cluster_count",
+                        "cluster namespace exhausted",
+                    ));
+                }
+                let flags = read_le_u16(boot, 40)?;
+                if flags & !0x008F != 0 {
+                    return Err(invalid("fat32.flags", "reserved flag bits are set"));
+                }
+                let mirrored = flags & 0x80 == 0;
+                let active = if mirrored { 0 } else { (flags & 0x0F) as u8 };
+                if active >= fat_count {
+                    return Err(invalid("fat32.active_fat", "active copy is absent"));
+                }
+                let pointer = |offset| -> Result<Option<u16>, ParseError> {
+                    let value = read_le_u16(boot, offset)?;
+                    match value {
+                        0 | 0xFFFF => Ok(None),
+                        n if n < reserved => Ok(Some(n)),
+                        _ => Err(invalid("fat32.reserved_pointer", "outside reserved region")),
+                    }
+                };
+                (
+                    read_le_u32(boot, 44)?,
+                    active,
+                    mirrored,
+                    pointer(48)?,
+                    pointer(50)?,
+                )
+            }
+        };
         let fat_bytes = u64::from(fat_sectors) * u64::from(sector_bytes);
         if (u64::from(cluster_count) + 2) * u64::from(kind.entry_bytes()) > fat_bytes {
             return Err(invalid("fat.capacity", "FAT does not cover data clusters"));
@@ -336,10 +339,7 @@ impl FatDirEntry {
             return None;
         }
         let mut name = String::new();
-        for (part, lower) in [
-            (&self.short_name[..8], 0x08),
-            (&self.short_name[8..], 0x10),
-        ] {
+        for (part, lower) in [(&self.short_name[..8], 0x08), (&self.short_name[8..], 0x10)] {
             let end = part.iter().rposition(|b| *b != b' ').map_or(0, |n| n + 1);
             if end == 0 {
                 continue;
@@ -413,7 +413,10 @@ impl FatDirectoryDecoder {
         }
         let pending = self.long.take();
         if slot[11] & 0xC0 != 0 || slot[11] & 0x18 == 0x18 {
-            return Err(invalid("fat.directory_attributes", "invalid attribute combination"));
+            return Err(invalid(
+                "fat.directory_attributes",
+                "invalid attribute combination",
+            ));
         }
         if slot[11] & 0x08 != 0 {
             return Ok(None); // Volume label, not a file.
@@ -564,7 +567,10 @@ mod tests {
         for (offset, value) in [(13, 0), (13, 3), (14, 0), (16, 0), (16, 3), (510, 0)] {
             let mut bad = b;
             bad[offset] = value;
-            assert!(FatGeometry::parse(&bad, u64::MAX).is_err(), "offset {offset}");
+            assert!(
+                FatGeometry::parse(&bad, u64::MAX).is_err(),
+                "offset {offset}"
+            );
         }
         let mut bad = b;
         bad[22..24].copy_from_slice(&1_u16.to_le_bytes());

@@ -11,7 +11,10 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
-#[command(name = "ffs-fat", about = "Read offline FAT16/FAT32 images without modifying them")]
+#[command(
+    name = "ffs-fat",
+    about = "Read offline FAT16/FAT32 images without modifying them"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -131,7 +134,14 @@ mod tests {
     #[test]
     fn clap_accepts_explicit_ranges_and_has_no_write_switch() {
         let cli = Cli::try_parse_from([
-            "ffs-fat", "cat", "disk.img", "--offset", "1024", "--length", "4096", "/hello.txt",
+            "ffs-fat",
+            "cat",
+            "disk.img",
+            "--offset",
+            "1024",
+            "--length",
+            "4096",
+            "/hello.txt",
         ])
         .unwrap();
         let Command::Cat { image, path } = cli.command else {

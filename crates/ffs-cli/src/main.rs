@@ -14245,7 +14245,7 @@ mod tests {
             return;
         };
         let cx = Cx::for_testing();
-        let before = blake3::hash(&std::fs::read(&image).expect("seed image"));
+        let before = super::file_sha256(&image).expect("seed image hash");
         let ledger = dir.join("repair.jsonl");
         let config = MountBackgroundScrubConfig::resolve(
             MountBackgroundScrubRequest::new(
@@ -14303,7 +14303,7 @@ mod tests {
             );
         }
         assert_eq!(
-            blake3::hash(&std::fs::read(&image).expect("image after refusals")),
+            super::file_sha256(&image).expect("image hash after refusals"),
             before
         );
         let checked = std::process::Command::new("btrfs")
@@ -14317,7 +14317,7 @@ mod tests {
             String::from_utf8_lossy(&checked.stderr)
         );
         eprintln!(
-            "SCENARIO_RESULT|scenario_id=btrfs_seed_write_admission|outcome=PASS|image_blake3={before}|artifacts={}",
+            "SCENARIO_RESULT|scenario_id=btrfs_seed_write_admission|outcome=PASS|image_sha256={before}|artifacts={}",
             dir.display()
         );
     }

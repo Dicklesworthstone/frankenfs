@@ -247,6 +247,17 @@
 | ext4 JOURNAL_DEV paired-open | `fs/ext4/super.c` | ✅ | Standalone journal device detection (JOURNAL_DEV incompat flag → clear error with guidance). Data filesystems with non-zero `journal_dev` now support paired-open replay through `OpenOptions::external_journal_path`: UUID and block-size validation, external JBD2 replay into the data device, and deterministic refusal when crash recovery is required but the external journal is missing or mismatched. Harness integration coverage in `crates/ffs-harness/tests/ext4_journal_recovery.rs` exercises paired-open replay plus missing/mismatched journal refusal, and `fuzz/fuzz_targets/fuzz_jbd2_replay.rs` now coverage-fuzzes the main JBD2 descriptor/commit/revoke replay engine over equivalent region and segment layouts. |
 | ext4 JBD2 checksum verification | `fs/jbd2/recovery.c` | ✅ | CRC32C verification for JBD2 descriptor, revoke, and commit blocks (V2/V3 features). Implemented in `verify_jbd2_block_checksum()` with V3 UUID-seeded checksums and tail-position validation. Direct `ffs-journal` coverage now proves descriptor/revoke checksum roundtrips, tamper detection, and commit-block V3 UUID-seed validation. |
 
+Standalone btrfs seed protection has unit coverage in
+`ffs-core::tests::btrfs_enable_writes_preserves_read_only_seed_devices` and
+`ffs-core::tests::btrfs_seed_rejects_public_transaction_and_repair_mutations`.
+Both pass: seed files remain readable, ordinary images permit writes, and
+seed write admission, transaction publication, repair staging and MVCC
+flushes refuse mutation without changing backing bytes. The option matrix
+covers skipped validation and ephemeral tree-log mode. The flush test plants
+an existing MVCC version; it does not exercise WAL replay. Seed/sprout routing,
+device-count reconciliation and standalone `fsck --repair` are not covered
+by these tests, and `bd-hk5w3` remains open.
+
 Ext4 xattr parity includes the POSIX ACL namespaces in addition to `user.*` and
 `security.*`: `crates/ffs-harness/tests/kernel_reference.rs` now differentially
 validates `system.posix_acl_access` and `system.posix_acl_default` against
