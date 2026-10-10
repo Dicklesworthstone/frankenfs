@@ -13,10 +13,16 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
-#[command(name = "ffs-zfs", about = "Inspect offline ZFS leaves without importing, replaying or writing")]
-struct Cli { #[command(subcommand)] command: Command }
+#[command(
+    name = "ffs-zfs",
+    about = "Inspect offline ZFS leaves without importing, replaying or writing"
+)]
+struct Cli {
+    #[command(subcommand)]
+    command: Command,
+}
 #[derive(Debug, Args)]
-struct Image {
+struct ImageArgs {
     /// Immutable regular image containing a selected physical vdev.
     image: PathBuf,
     #[arg(long, default_value_t = 0)]
@@ -27,23 +33,32 @@ struct Image {
     #[arg(long, required = true)]
     offline_image: bool,
 }
-impl Image {
+impl ImageArgs {
     fn open(&self, cx: &Cx) -> Result<Leaf> {
-        if !self.offline_image { bail!("--offline-image is required"); }
+        if !self.offline_image {
+            bail!("--offline-image is required");
+        }
         Leaf::open(cx, &self.image, self.offset, self.length).context("opening selected ZFS leaf")
     }
 }
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Inventory checksum-valid configurations and uberblock candidates, not pool authority.
-    Inspect { #[command(flatten)] image: Image },
+    Inspect {
+        #[command(flatten)]
+        image: ImageArgs,
+    },
     /// Extract one checked META object-set block. No automatic TXG selection or import.
     Root {
-        #[command(flatten)] image: Image,
-        #[arg(long)] label: usize,
-        #[arg(long)] slot: usize,
+        #[command(flatten)]
+        image: ImageArgs,
+        #[arg(long)]
+        label: usize,
+        #[arg(long)]
+        slot: usize,
         /// Expected pool GUID as a decimal integer from inspect.
-        #[arg(long)] pool_guid: u64,
+        #[arg(long)]
+        pool_guid: u64,
     },
 }
 fn main() -> Result<()> {
@@ -94,13 +109,25 @@ fn main() -> Result<()> {
             let mut out = io::stdout().lock();
             serde_json::to_writer_pretty(&mut out, &report)?;
             writeln!(out)?;
-            if valid == 0 { bail!("no supported checksum-valid ZFS label configuration"); }
+            if valid == 0 {
+                bail!("no supported checksum-valid ZFS label configuration");
+            }
         }
-        Command::Root { image, label, slot, pool_guid } => {
+        Command::Root {
+            image,
+            label,
+            slot,
+            pool_guid,
+        } => {
             let leaf = image.open(&cx)?;
             let root = leaf.root(&cx, label, slot, pool_guid)?;
-            eprintln!("checked candidate txg={} copy={} vdev_offset={} bytes={}; not a pool import",
-                root.uberblock.txg, root.copy_index, root.physical_offset, root.data.len());
+            eprintln!(
+                "checked candidate txg={} copy={} vdev_offset={} bytes={}; not a pool import",
+                root.uberblock.txg,
+                root.copy_index,
+                root.physical_offset,
+                root.data.len()
+            );
             let mut out = io::stdout().lock();
             out.write_all(&root.data)?;
             out.flush()?;
@@ -116,10 +143,39 @@ mod tests {
     fn cli_requires_explicit_immutable_image_and_root_identity() {
         assert!(Cli::try_parse_from(["ffs-zfs", "inspect", "leaf.img"]).is_err());
         assert!(Cli::try_parse_from(["ffs-zfs", "root", "leaf.img", "--offline-image"]).is_err());
-        assert!(Cli::try_parse_from(["ffs-zfs", "inspect", "leaf.img", "--offline-image", "--rw"]).is_err());
-        let cli = Cli::try_parse_from(["ffs-zfs", "root", "disk.img", "--offline-image", "--offset", "1048576",
-            "--length", "67108864", "--label", "2", "--slot", "3", "--pool-guid", "123"]).unwrap();
-        let Command::Root { image, label, slot, pool_guid } = cli.command else { panic!("root"); };
-        assert_eq!((image.offset, image.length, label, slot, pool_guid), (1048576, Some(67108864), 2, 3, 123));
+        assert!(
+            Cli::try_parse_from(["ffs-zfs", "inspect", "leaf.img", "--offline-image", "--rw"])
+                .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "ffs-zfs",
+            "root",
+            "disk.img",
+            "--offline-image",
+            "--offset",
+            "1048576",
+            "--length",
+            "67108864",
+            "--label",
+            "2",
+            "--slot",
+            "3",
+            "--pool-guid",
+            "123",
+        ])
+        .unwrap();
+        let Command::Root {
+            image,
+            label,
+            slot,
+            pool_guid,
+        } = cli.command
+        else {
+            panic!("root");
+        };
+        assert_eq!(
+            (image.offset, image.length, label, slot, pool_guid),
+            (1_048_576, Some(67_108_864), 2, 3, 123)
+        );
     }
 }
