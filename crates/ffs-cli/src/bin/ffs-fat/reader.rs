@@ -15,7 +15,7 @@ use std::os::unix::fs::FileExt;
 use std::path::Path;
 
 const MAX_DIRECTORY_SLOTS: usize = 65_536;
-pub const MAX_CHAIN_CLUSTERS: usize = 8_388_608; // At most 32 MiB of cluster addresses.
+pub const MAX_CHAIN_CLUSTERS: usize = 8_388_608;
 const MAX_READ_BYTES: usize = 16 * 1024 * 1024;
 
 pub fn checkpoint(cx: &Cx) -> Result<()> {
@@ -99,10 +99,7 @@ impl Entry {
             || name == ".."
             || name.chars().any(|c| c == '\0' || c == '/' || c == '\\')
         {
-            return Err(corrupt(
-                self.offset,
-                "FAT name is not a safe path component",
-            ));
+            return Err(corrupt(self.offset, "FAT name is not a safe path component"));
         }
         if name.len() > 255 {
             return Err(FfsError::NameTooLong);
@@ -145,7 +142,7 @@ impl FatVolume {
         file.try_lock_shared()
             .map_err(|error| FfsError::Format(format!("cannot lock FAT image: {error}")))?;
         let len = metadata.len();
-        let length = length.unwrap_or_else(|| len.saturating_sub(base));
+        let length = length.unwrap_or(len.saturating_sub(base));
         Self::from_device(cx, Box::new(ReadOnlyImage { file, len }), base, length)
     }
 
@@ -160,9 +157,7 @@ impl FatVolume {
             .checked_add(length)
             .ok_or_else(|| FfsError::InvalidGeometry("FAT volume range overflow".into()))?;
         if length < 512 || end > device.len_bytes() {
-            return Err(FfsError::InvalidGeometry(
-                "FAT volume range exceeds backing".into(),
-            ));
+            return Err(FfsError::InvalidGeometry("FAT volume range exceeds backing".into()));
         }
         let mut boot = [0_u8; 512];
         device.read_exact_at(cx, ByteOffset(base), &mut boot)?;
@@ -219,8 +214,8 @@ impl FatVolume {
             ));
         }
         for copy in self.copies() {
-            let start =
-                self.geometry.entry_offset(copy, 2).map_err(parse_error)? - 2 * width as u64;
+            let start = self.geometry.entry_offset(copy, 2).map_err(parse_error)?
+                - 2 * width as u64;
             let mut header = [0_u8; 8];
             self.read_exact(cx, start, &mut header[..2 * width])?;
             let (first, second, expected, clean) = match self.geometry.kind() {
@@ -231,8 +226,10 @@ impl FatVolume {
                     0xFFFF,
                 ),
                 FatKind::Fat32 => (
-                    u32::from_le_bytes([header[0], header[1], header[2], header[3]]) & 0x0FFF_FFFF,
-                    u32::from_le_bytes([header[4], header[5], header[6], header[7]]) & 0x0FFF_FFFF,
+                    u32::from_le_bytes([header[0], header[1], header[2], header[3]])
+                        & 0x0FFF_FFFF,
+                    u32::from_le_bytes([header[4], header[5], header[6], header[7]])
+                        & 0x0FFF_FFFF,
                     0x0FFF_FF00 | u32::from(media),
                     0x0FFF_FFFF,
                 ),
@@ -253,10 +250,7 @@ impl FatVolume {
             let geometry = FatGeometry::parse(&backup, self.geometry.volume_bytes())
                 .map_err(|error| corrupt(offset, error.to_string()))?;
             if geometry != self.geometry || backup[21] != media {
-                return Err(corrupt(
-                    offset,
-                    "FAT primary and backup boot geometry disagree",
-                ));
+                return Err(corrupt(offset, "FAT primary and backup boot geometry disagree"));
             }
         }
         // FSInfo free counts are hints. Read-only operation never repairs them.
@@ -328,9 +322,7 @@ impl FatVolume {
     ) -> Result<()> {
         for (index, bytes) in bytes.chunks_exact(32).enumerate() {
             if *slots >= MAX_DIRECTORY_SLOTS {
-                return Err(FfsError::UnsupportedFeature(
-                    "FAT directory exceeds 65536 slots".into(),
-                ));
+                return Err(FfsError::UnsupportedFeature("FAT directory exceeds 65536 slots".into()));
             }
             *slots += 1;
             let slot: &[u8; 32] = bytes
@@ -372,9 +364,7 @@ impl FatVolume {
             let displayed = entry.name()?;
             let short = entry.native.ascii_short_name();
             if displayed.eq_ignore_ascii_case(name)
-                || short
-                    .as_deref()
-                    .is_some_and(|alias| alias.eq_ignore_ascii_case(name))
+                || short.as_deref().is_some_and(|alias| alias.eq_ignore_ascii_case(name))
             {
                 if found.is_some() {
                     return Err(corrupt(entry.offset, "ambiguous FAT name or short alias"));
@@ -406,9 +396,7 @@ impl FatVolume {
         let mut result = None;
         for (index, component) in components.iter().enumerate() {
             if *component == ".." {
-                return Err(FfsError::Format(
-                    "parent traversal is not accepted in image paths".into(),
-                ));
+                return Err(FfsError::Format("parent traversal is not accepted in image paths".into()));
             }
             let entry = self.lookup(cx, directory, component)?;
             if entry.native.is_directory() && !ancestors.insert(entry.native.first_cluster) {
@@ -434,22 +422,61 @@ impl FatVolume {
         }
         let size = entry.native.size;
         let required = u64::from(size).div_ceil(u64::from(self.geometry.cluster_bytes()));
+        let clusters = self.allocation_chain(
+            cx,
+            entry.native.first_cluster,
+            required,
+            entry.offset,
+            MAX_CHAIN_CLUSTERS,
+        )?;
+        Ok(FileChain { clusters, size })
+    }
+
+    pub fn directory_size(&self, cx: &Cx, directory: Directory) -> Result<u64> {
+        checkpoint(cx)?;
+        if directory == Directory::Root
+            && let Some((_, length)) = self.geometry.fixed_root()
+        {
+            return Ok(length);
+        }
+        let first = match directory {
+            Directory::Root => self.geometry.root_cluster(),
+            Directory::Cluster(cluster) => cluster,
+        };
+        let offset = self.cluster_offset(first)?;
+        let cluster_bytes = self.geometry.cluster_bytes() as usize;
+        let clusters = self.allocation_chain(
+            cx,
+            first,
+            1,
+            offset,
+            (MAX_DIRECTORY_SLOTS * 32).div_ceil(cluster_bytes),
+        )?;
+        Ok(clusters.len() as u64 * cluster_bytes as u64)
+    }
+
+    fn allocation_chain(
+        &self,
+        cx: &Cx,
+        first: u32,
+        required: u64,
+        report_offset: u64,
+        limit: usize,
+    ) -> Result<Vec<u32>> {
+        checkpoint(cx)?;
         let mut clusters = Vec::new();
         if required > u64::from(self.geometry.cluster_count()) {
-            return Err(corrupt(
-                entry.offset,
-                "FAT file size exceeds the volume's data capacity",
-            ));
+            return Err(corrupt(report_offset, "FAT size exceeds the volume's data capacity"));
         }
-        if entry.native.first_cluster == 0 {
-            if size != 0 {
-                return Err(corrupt(entry.offset, "nonempty FAT file has no chain"));
+        if first == 0 {
+            if required != 0 {
+                return Err(corrupt(report_offset, "nonempty FAT object has no chain"));
             }
-            return Ok(FileChain { clusters, size });
+            return Ok(clusters);
         }
-        let limit = MAX_CHAIN_CLUSTERS.min(self.geometry.cluster_count() as usize);
+        let limit = limit.min(self.geometry.cluster_count() as usize);
         let mut table = FatTable::new(self);
-        let mut cluster = entry.native.first_cluster;
+        let mut cluster = first;
         let mut anchor = cluster;
         let mut power = 1_u64;
         let mut distance = 0_u64;
@@ -457,17 +484,14 @@ impl FatVolume {
             checkpoint(cx)?;
             self.cluster_offset(cluster)?;
             if clusters.len() == limit {
-                return Err(corrupt(
-                    entry.offset,
-                    "FAT chain exceeds the volume or 32 MiB map budget",
+                return Err(FfsError::UnsupportedFeature(
+                    "FAT allocation chain exceeds the admitted map limit".into(),
                 ));
             }
             if clusters.len() == clusters.capacity() {
                 clusters
                     .try_reserve_exact(1024.min(limit - clusters.len()))
-                    .map_err(|error| {
-                        FfsError::Format(format!("FAT chain allocation failed: {error}"))
-                    })?;
+                    .map_err(|error| FfsError::Format(format!("FAT chain allocation failed: {error}")))?;
             }
             clusters.push(cluster);
             let Some(next) = table.next(cx, cluster)? else {
@@ -475,7 +499,7 @@ impl FatVolume {
             };
             distance += 1;
             if next == anchor {
-                return Err(corrupt(entry.offset, "cyclic FAT file chain"));
+                return Err(corrupt(report_offset, "cyclic FAT file chain"));
             }
             if distance == power {
                 anchor = next;
@@ -485,10 +509,10 @@ impl FatVolume {
             cluster = next;
         }
         if (clusters.len() as u64) < required {
-            return Err(corrupt(entry.offset, "FAT chain ends before logical EOF"));
+            return Err(corrupt(report_offset, "FAT chain ends before logical EOF"));
         }
         checkpoint(cx)?;
-        Ok(FileChain { clusters, size })
+        Ok(clusters)
     }
 
     pub fn read(&self, cx: &Cx, chain: &FileChain, offset: u64, size: usize) -> Result<Vec<u8>> {
@@ -574,10 +598,7 @@ impl<'a> FatTable<'a> {
                 }
             };
             if previous.is_some_and(|other| other != value) {
-                return Err(corrupt(
-                    position,
-                    format!("FAT copies disagree at cluster {cluster}"),
-                ));
+                return Err(corrupt(position, format!("FAT copies disagree at cluster {cluster}")));
             }
             previous = Some(value);
         }

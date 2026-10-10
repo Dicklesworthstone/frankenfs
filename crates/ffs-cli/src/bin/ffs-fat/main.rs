@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! Experimental native FAT16/FAT32 reader. No filesystem mutation is supported.
 
+mod filesystem;
 mod reader;
 
 use anyhow::{Context, Result, bail};
@@ -11,10 +12,7 @@ use std::io::{self, Write};
 use std::path::PathBuf;
 
 #[derive(Debug, Parser)]
-#[command(
-    name = "ffs-fat",
-    about = "Read offline FAT16/FAT32 images without modifying them"
-)]
+#[command(name = "ffs-fat", about = "Read offline FAT16/FAT32 images without modifying them")]
 struct Cli {
     #[command(subcommand)]
     command: Command,
@@ -58,6 +56,21 @@ enum Command {
         #[command(flatten)]
         image: ImageArgs,
         path: String,
+    },
+    /// Mount an immutable image through the existing FrankenFS FUSE adapter.
+    Mount {
+        #[command(flatten)]
+        image: ImageArgs,
+        /// Existing empty directory, outside the image's own path.
+        mountpoint: PathBuf,
+        /// Confirm the image will not be modified by a kernel mount or another program.
+        #[arg(long, required = true)]
+        offline_image: bool,
+        /// Synthetic Unix ownership; never written into native FAT metadata.
+        #[arg(long, default_value_t = 0)]
+        uid: u32,
+        #[arg(long, default_value_t = 0)]
+        gid: u32,
     },
 }
 
@@ -123,6 +136,28 @@ fn main() -> Result<()> {
             }
             stdout.flush()?;
         }
+        Command::Mount { image, mountpoint, offline_image, uid, gid } => {
+            if !offline_image {
+                bail!("--offline-image is required; shared locks do not exclude unrelated writers");
+            }
+            let mountpoint = mountpoint.canonicalize().context("resolve FAT mountpoint")?;
+            if !mountpoint.is_dir() || std::fs::read_dir(&mountpoint)?.next().transpose()?.is_some() {
+                bail!("FAT mountpoint must be an existing empty directory");
+            }
+            if image.image.canonicalize()?.starts_with(&mountpoint) {
+                bail!("mountpoint would hide the backing image");
+            }
+            let volume = image.open(&cx)?;
+            let fs = filesystem::FatFs::new(&cx, volume, uid, gid)?;
+            let options = ffs_fuse::MountOptions {
+                read_only: true,
+                allow_other: false,
+                auto_unmount: true,
+                ..ffs_fuse::MountOptions::default()
+            };
+            eprintln!("experimental FAT read-only mount; modification times use a UTC wall-clock projection");
+            let _ = ffs_fuse::mount(Box::new(fs), &mountpoint, &options)?;
+        }
     }
     Ok(())
 }
@@ -134,14 +169,7 @@ mod tests {
     #[test]
     fn clap_accepts_explicit_ranges_and_has_no_write_switch() {
         let cli = Cli::try_parse_from([
-            "ffs-fat",
-            "cat",
-            "disk.img",
-            "--offset",
-            "1024",
-            "--length",
-            "4096",
-            "/hello.txt",
+            "ffs-fat", "cat", "disk.img", "--offset", "1024", "--length", "4096", "/hello.txt",
         ])
         .unwrap();
         let Command::Cat { image, path } = cli.command else {
@@ -150,5 +178,7 @@ mod tests {
         assert_eq!((image.offset, image.length), (1024, Some(4096)));
         assert_eq!(path, "/hello.txt");
         assert!(Cli::try_parse_from(["ffs-fat", "cat", "disk.img", "/hello.txt", "--rw"]).is_err());
+        assert!(Cli::try_parse_from(["ffs-fat", "mount", "disk.img", "/mnt/fat"]).is_err());
+        assert!(Cli::try_parse_from(["ffs-fat", "mount", "disk.img", "/mnt/fat", "--offline-image"]).is_ok());
     }
 }
