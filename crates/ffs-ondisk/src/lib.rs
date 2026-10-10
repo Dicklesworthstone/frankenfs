@@ -13,6 +13,7 @@ pub mod ext4;
 pub mod fat;
 pub mod lznt1;
 pub mod ntfs;
+pub mod zfs;
 
 pub use btrfs::{
     BTRFS_CSUM_FIELD_SIZE, BtrfsChunkEntry, BtrfsCompatRoFeatures, BtrfsDevItem, BtrfsHeader,
