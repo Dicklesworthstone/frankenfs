@@ -234,6 +234,18 @@ flush existing MVCC versions, or start background repair. Actual device sets
 still require clean tree logs and no external MVCC WAL; verified singleton
 images retain their existing log replay and WAL paths.
 
+Singleton metadata candidates must match the admitted superblock FSID before
+ROOT_TREE bootstrap, tree-log replay or parsed-node caching accepts them.
+Identity failure participates in DUP fallback like checksum failure. Generation
+inspection and shared-tree release read fresh validated candidates and retain
+generation and owner from those same bytes, including internal nodes whose
+parsed representation drops the raw header. They bypass the descent cache:
+public MVCC flushes can change a singleton backing without enabling FsOps.
+Generation inspection must propagate read failures. Failed log replay must refuse opening;
+a corrupt referenced EXTENT_TREE must refuse write admission rather than seed
+an empty allocator. The existing absent/zero-bytenr EXTENT_TREE path remains
+unqualified and is not evidence of validated allocation state.
+
 Seed support also requires explicit per-device filesystem identity and seed
 generation, anchored to the sprout's committed DEV_ITEMs. Seed handles remain
 read-only; ordinary same-filesystem attachments retain their existing

@@ -748,6 +748,29 @@ struct BtrfsReadDevices {
     identities: std::collections::BTreeMap<u64, ffs_ondisk::BtrfsDevItem>,
 }
 
+/// Header fields needed after parsing, always retained from the accepted copy.
+#[derive(Clone, Copy)]
+struct BtrfsNodeMetadata {
+    generation: u64,
+    owner: u64,
+}
+
+/// Identity is checked per physical candidate, so a foreign primary cannot
+/// suppress recovery from a valid DUP mirror. Zero is never a wildcard.
+fn validate_btrfs_tree_fsid(
+    block: &[u8],
+    fsid: &[u8; 16],
+) -> Result<ffs_btrfs::BtrfsHeader, ParseError> {
+    let header = ffs_btrfs::BtrfsHeader::parse_from_block(block)?;
+    if &header.fsid != fsid {
+        return Err(ParseError::InvalidField {
+            field: "tree_header_fsid",
+            reason: "metadata tree filesystem UUID does not match the superblock",
+        });
+    }
+    Ok(header)
+}
+
 impl BtrfsReadDevices {
     /// Prove device coverage for every committed chunk, not only the metadata
     /// touched during open. RAID1/C3/C4 need one complete copy; RAID10 needs
@@ -978,6 +1001,18 @@ impl BtrfsReadDevices {
         nodesize: u32,
         csum_type: u16,
     ) -> Result<(Arc<BtrfsParsedNode>, u64), ParseError> {
+        self.read_node_with_metadata(cx, chunks, logical, nodesize, csum_type)
+            .map(|(node, header)| (node, header.generation))
+    }
+
+    fn read_node_with_metadata(
+        &self,
+        cx: &Cx,
+        chunks: &[BtrfsChunkEntry],
+        logical: u64,
+        nodesize: u32,
+        csum_type: u16,
+    ) -> Result<(Arc<BtrfsParsedNode>, BtrfsNodeMetadata), ParseError> {
         let parse = |bytes: Vec<u8>| {
             let header = ffs_btrfs::BtrfsHeader::parse_from_block(&bytes)?;
             if !self
@@ -991,7 +1026,13 @@ impl BtrfsReadDevices {
                 });
             }
             let node = parse_btrfs_tree_node_owned(bytes, csum_type, logical, nodesize)?;
-            Ok((Arc::new(node), header.generation))
+            Ok((
+                Arc::new(node),
+                BtrfsNodeMetadata {
+                    generation: header.generation,
+                    owner: header.owner,
+                },
+            ))
         };
         let mapping = ffs_ondisk::map_logical_to_stripes(chunks, logical)?.ok_or(
             ParseError::InvalidField {
@@ -6717,6 +6758,7 @@ impl OpenFs {
                                         field: "root_tree",
                                         reason: "failed to read root-tree block",
                                     })?;
+                                validate_btrfs_tree_fsid(&buf, &sb.fsid)?;
                                 Ok(buf)
                             };
 
@@ -6798,6 +6840,7 @@ impl OpenFs {
                                     field: "tree_log",
                                     reason: "failed to read tree-log block",
                                 })?;
+                            validate_btrfs_tree_fsid(&buf, &sb.fsid)?;
                             Ok(buf)
                         };
                     match ffs_btrfs::replay_tree_log(
@@ -6829,7 +6872,10 @@ impl OpenFs {
                         }
                         Ok(_) => {}
                         Err(err) => {
-                            warn!(error = %err, "btrfs tree-log replay failed");
+                            // Failed replay cannot be treated as an empty log:
+                            // a later commit would discard acknowledged fsyncs.
+                            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+                            return Err(parse_to_ffs_error(&err));
                         }
                     }
                 }
@@ -12420,61 +12466,37 @@ impl OpenFs {
         // to populate the in-memory extent_tree. Without this, commit would
         // create a fresh extent_tree containing only NEW allocations, losing
         // all existing extent accounting and causing `btrfs check` failures.
-        #[expect(clippy::option_if_let_else)]
         let extent_tree_items_loaded = if let Some(extent_root_entry) =
             root_items.iter().find(|e| {
                 e.key.objectid == BTRFS_EXTENT_TREE_OBJECTID
                     && e.key.item_type == BTRFS_ITEM_ROOT_ITEM
             }) {
-            match parse_root_item(&extent_root_entry.data) {
-                Ok(root_item) if root_item.bytenr != 0 => {
-                    match self.walk_btrfs_tree(cx, root_item.bytenr) {
-                        Ok(extent_items) => {
-                            let mut loaded = 0usize;
-                            for item in extent_items {
-                                let key = BtrfsKey {
-                                    objectid: item.key.objectid,
-                                    item_type: item.key.item_type,
-                                    offset: item.key.offset,
-                                };
-                                if extent_alloc
-                                    .extent_tree_mut()
-                                    .insert(key, &item.data)
-                                    .is_ok()
-                                {
-                                    loaded += 1;
-                                }
-                            }
-                            debug!(
-                                target: "ffs::write",
-                                loaded,
-                                extent_root_bytenr = root_item.bytenr,
-                                "loaded on-disk extent_tree entries"
-                            );
-                            loaded
-                        }
-                        Err(e) => {
-                            warn!(
-                                target: "ffs::write",
-                                error = %e,
-                                "failed to walk extent_tree; starting with empty extent_tree"
-                            );
-                            0
-                        }
-                    }
+            let root_item =
+                parse_root_item(&extent_root_entry.data).map_err(|e| parse_to_ffs_error(&e))?;
+            if root_item.bytenr == 0 {
+                debug!(target: "ffs::write", "EXTENT_TREE ROOT_ITEM has zero bytenr");
+                0
+            } else {
+                let extent_items = self.walk_btrfs_tree(cx, root_item.bytenr)?;
+                let loaded = extent_items.len();
+                for item in extent_items {
+                    let key = BtrfsKey {
+                        objectid: item.key.objectid,
+                        item_type: item.key.item_type,
+                        offset: item.key.offset,
+                    };
+                    extent_alloc
+                        .extent_tree_mut()
+                        .insert(key, &item.data)
+                        .map_err(|e| btrfs_mutation_to_ffs(&e))?;
                 }
-                Ok(_) => {
-                    debug!(target: "ffs::write", "EXTENT_TREE ROOT_ITEM has zero bytenr");
-                    0
-                }
-                Err(e) => {
-                    warn!(
-                        target: "ffs::write",
-                        error = %e,
-                        "failed to parse EXTENT_TREE ROOT_ITEM"
-                    );
-                    0
-                }
+                debug!(
+                    target: "ffs::write",
+                    loaded,
+                    extent_root_bytenr = root_item.bytenr,
+                    "loaded on-disk extent_tree entries"
+                );
+                loaded
             }
         } else {
             debug!(target: "ffs::write", "no EXTENT_TREE ROOT_ITEM found in root_tree");
@@ -12494,9 +12516,8 @@ impl OpenFs {
         // decides a physical range is free by finding no DEV_EXTENT covering it.
         // If a walk failed and left the tree empty, EVERY range reads as free and
         // the next chunk allocation writes on top of live data. The extent-tree
-        // load above can warn and continue with an empty tree because an empty
-        // extent tree only loses accounting; an empty device tree loses the only
-        // record of what is already on the disk. So a failure here is recorded,
+        // load above now refuses a failed referenced tree as well: lost extent
+        // accounting can authorize allocation over live data. A failure here is recorded,
         // and chunk allocation must refuse rather than proceed on a tree it
         // cannot trust — the same shape as bd-ftev0's
         // `extent_tree_items_loaded > 0` guard.
@@ -12611,38 +12632,27 @@ impl OpenFs {
         // commit that then fails leaves an image that will not mount.
         //
         // Walked rather than derived from the ROOT_ITEM bytenr because a tree is
-        // more than its root node. Best-effort: a walk failure here must not
-        // block the mount, and it only costs us the protection we had before.
+        // more than its root node. A failed walk refuses write admission:
+        // unpinned live blocks must never become allocation candidates.
         let mut pinned_live_nodes = 0usize;
         {
-            let mut pin_tree_nodes = |root_logical: u64, tree: &str| {
+            let mut pin_tree_nodes = |root_logical: u64| -> Result<(), FfsError> {
                 if root_logical == 0 {
-                    return;
+                    return Ok(());
                 }
-                match self.btrfs_tree_node_addresses(cx, root_logical) {
-                    Ok(addrs) => {
-                        for addr in addrs {
-                            extent_alloc.pin_live_tree_block(addr, u64::from(nodesize));
-                            pinned_live_nodes += 1;
-                        }
-                    }
-                    Err(e) => warn!(
-                        target: "ffs::write",
-                        error = %e,
-                        tree,
-                        root_logical,
-                        "could not walk tree to pin its live blocks; \
-                         a failed commit could overwrite them"
-                    ),
+                for addr in self.btrfs_tree_node_addresses(cx, root_logical)? {
+                    extent_alloc.pin_live_tree_block(addr, u64::from(nodesize));
+                    pinned_live_nodes += 1;
                 }
+                Ok(())
             };
-            pin_tree_nodes(sb.root, "root_tree");
+            pin_tree_nodes(sb.root)?;
             if let Some(entry) = root_items.iter().find(|e| {
                 e.key.objectid == BTRFS_EXTENT_TREE_OBJECTID
                     && e.key.item_type == BTRFS_ITEM_ROOT_ITEM
             }) && let Ok(root_item) = parse_root_item(&entry.data)
             {
-                pin_tree_nodes(root_item.bytenr, "extent_tree");
+                pin_tree_nodes(root_item.bytenr)?;
             }
         }
         debug!(
@@ -13244,12 +13254,6 @@ impl OpenFs {
             }
         }
 
-        let nodesize = usize::try_from(
-            self.btrfs_context()
-                .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?
-                .nodesize,
-        )
-        .map_err(|_| FfsError::Format("nodesize does not fit usize".into()))?;
         // `Some(via)`: the mounted root's path reaches this block through `via`, which is
         // dropped. `None`: the block survives (another root reaches it) and
         // only needs its references made parent-keyed.
@@ -13269,29 +13273,27 @@ impl OpenFs {
                         "btrfs tree block {bytenr} of subvolume {mounted} has no extent item"
                     ))
                 })?;
-            let mut block = vec![0_u8; nodesize];
-            self.btrfs_read_logical_into(cx, bytenr, &mut block)?;
-            let header = ffs_ondisk::btrfs::BtrfsHeader::parse_from_block(&block)
-                .map_err(|e| parse_to_ffs_error(&e))?;
+            let validated = self.btrfs_read_parsed_node_with_metadata(cx, bytenr);
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            let (node, header) = validated.map_err(|e| parse_to_ffs_error(&e))?;
             // (disk bytenr, disk bytes, inode, data-ref offset) per file extent.
             type LeafDataRefs = Vec<(u64, u64, u64, u64)>;
-            let (child_blocks, child_data): (Vec<u64>, LeafDataRefs) = if header.level > 0 {
-                let (_, ptrs) = ffs_ondisk::btrfs::parse_internal_items(&block)
-                    .map_err(|e| parse_to_ffs_error(&e))?;
-                (ptrs.iter().map(|ptr| ptr.blockptr).collect(), Vec::new())
-            } else {
-                let (_, leaf_items) = ffs_ondisk::btrfs::parse_leaf_items(&block)
-                    .map_err(|e| parse_to_ffs_error(&e))?;
-                let data = leaf_items
-                    .iter()
-                    .filter_map(|item| {
-                        let start = usize::try_from(item.data_offset).ok()?;
-                        let end = start.checked_add(usize::try_from(item.data_size).ok()?)?;
-                        let (db, dn, off) = data_ref(&item.key, block.get(start..end)?)?;
-                        Some((db, dn, item.key.objectid, off))
-                    })
-                    .collect();
-                (Vec::new(), data)
+            let (child_blocks, child_data): (Vec<u64>, LeafDataRefs) = match node.as_ref() {
+                BtrfsParsedNode::Internal { ptrs } => {
+                    (ptrs.iter().map(|ptr| ptr.blockptr).collect(), Vec::new())
+                }
+                BtrfsParsedNode::Leaf { block, items } => {
+                    let data = items
+                        .iter()
+                        .filter_map(|item| {
+                            let start = usize::try_from(item.data_offset).ok()?;
+                            let end = start.checked_add(usize::try_from(item.data_size).ok()?)?;
+                            let (db, dn, off) = data_ref(&item.key, block.get(start..end)?)?;
+                            Some((db, dn, item.key.objectid, off))
+                        })
+                        .collect();
+                    (Vec::new(), data)
+                }
             };
 
             // A block survives when another root still reaches it. The new tree
@@ -13432,6 +13434,29 @@ impl OpenFs {
         if cacheable {
             BTRFS_NODE_CACHE_MISSES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
+        let (node, _) = self.btrfs_read_parsed_node_with_metadata(cx, logical)?;
+        if cacheable {
+            self.btrfs_parsed_node_cache.insert_within(
+                logical,
+                Arc::clone(&node),
+                BTRFS_TREE_NODE_CACHE_LIMIT,
+            );
+        }
+        Ok(node)
+    }
+
+    /// Read a fresh validated candidate and retain its generation and owner.
+    /// Inspection and shared-tree release must not consume an older cached
+    /// header: public MVCC flushes can change the backing without enabling FsOps.
+    fn btrfs_read_parsed_node_with_metadata(
+        &self,
+        cx: &Cx,
+        logical: u64,
+    ) -> Result<(Arc<BtrfsParsedNode>, BtrfsNodeMetadata), ParseError> {
+        cx.checkpoint().map_err(|_| ParseError::InvalidField {
+            field: "btrfs_device_read",
+            reason: "metadata read cancelled",
+        })?;
         let ctx = self.btrfs_context().ok_or(ParseError::InvalidField {
             field: "btrfs_context",
             reason: "not a btrfs filesystem",
@@ -13440,15 +13465,13 @@ impl OpenFs {
         let ns = usize::try_from(nodesize)
             .map_err(|_| ParseError::IntegerConversion { field: "nodesize" })?;
         if let Some(devices) = &self.btrfs_devices {
-            let node = devices.read_node(cx, &ctx.chunks, logical, nodesize, ctx.csum_type)?;
-            if cacheable {
-                self.btrfs_parsed_node_cache.insert_within(
-                    logical,
-                    Arc::clone(&node),
-                    BTRFS_TREE_NODE_CACHE_LIMIT,
-                );
-            }
-            return Ok(node);
+            return devices.read_node_with_metadata(
+                cx,
+                &ctx.chunks,
+                logical,
+                nodesize,
+                ctx.csum_type,
+            );
         }
         // bd-cjqhh: the mount-time chunk list is the FAST path, and the live chunk
         // tree is the fallback.
@@ -13481,7 +13504,18 @@ impl OpenFs {
                 reason: "not covered by any chunk",
             })?
         };
-        let read_copy = |physical: u64| -> Result<BtrfsParsedNode, ParseError> {
+        let fsid = &self
+            .btrfs_superblock()
+            .ok_or(ParseError::InvalidField {
+                field: "btrfs_superblock",
+                reason: "not a btrfs filesystem",
+            })?
+            .fsid;
+        let read_copy = |physical: u64| -> Result<_, ParseError> {
+            cx.checkpoint().map_err(|_| ParseError::InvalidField {
+                field: "btrfs_device_read",
+                reason: "metadata read cancelled",
+            })?;
             let mut buf = vec![0_u8; ns];
             self.dev
                 .read_exact_at(cx, ByteOffset(physical), &mut buf)
@@ -13497,7 +13531,15 @@ impl OpenFs {
             // Verify + parse ONCE, before the node enters the cache, so every
             // cached node is already-verified — a hit never skips a checksum
             // that was not already checked.
-            parse_btrfs_tree_node_owned(buf, ctx.csum_type, logical, nodesize)
+            let header = validate_btrfs_tree_fsid(&buf, fsid)?;
+            let node = parse_btrfs_tree_node_owned(buf, ctx.csum_type, logical, nodesize)?;
+            Ok((
+                node,
+                BtrfsNodeMetadata {
+                    generation: header.generation,
+                    owner: header.owner,
+                },
+            ))
         };
         let node = match read_copy(mapping.physical) {
             Ok(node) => node,
@@ -13532,15 +13574,7 @@ impl OpenFs {
                 recovered.ok_or(primary_err)?
             }
         };
-        let node = Arc::new(node);
-        if cacheable {
-            self.btrfs_parsed_node_cache.insert_within(
-                logical,
-                Arc::clone(&node),
-                BTRFS_TREE_NODE_CACHE_LIMIT,
-            );
-        }
-        Ok(node)
+        Ok((Arc::new(node.0), node.1))
     }
 
     /// Test-only: drop the read-only tree-node cache so a following operation
@@ -62384,6 +62418,207 @@ mod tests {
         );
     }
 
+    #[test]
+    fn btrfs_singleton_metadata_inspection_reads_after_public_mvcc_flush() {
+        for foreign_identity in [false, true] {
+            let mut image = build_btrfs_csum_image();
+            let dev = TestDevice::from_vec(image.clone());
+            let cx = Cx::for_testing();
+            let fs =
+                OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+            let logical = BTRFS_TEST_FS_TREE_LOGICAL;
+            fs.btrfs_read_parsed_node(&cx, logical as u64).unwrap();
+            assert!(fs.btrfs_parsed_node_cache.get(&(logical as u64)).is_some());
+            image[logical + 0x50..logical + 0x58].copy_from_slice(&9_u64.to_le_bytes());
+            if foreign_identity {
+                image[logical + 0x20..logical + 0x30].fill(0xA5);
+            }
+            stamp_btrfs_test_tree_block_crc32c(&mut image, logical);
+            let block_size = fs.block_size() as usize;
+            let nodesize = fs.btrfs_context().unwrap().nodesize as usize;
+            let mut txn = fs.begin_transaction();
+            for (index, block) in image[logical..logical + nodesize]
+                .chunks_exact(block_size)
+                .enumerate()
+            {
+                txn.stage_write(
+                    BlockNumber((logical / block_size + index) as u64),
+                    block.to_vec(),
+                );
+            }
+            fs.commit_transaction(&cx, txn).unwrap();
+            assert_eq!(fs.flush_mvcc_to_device(&cx).unwrap(), nodesize / block_size);
+            assert_eq!(dev.snapshot_bytes(), image);
+            let reopened = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(image)),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            for instance in [&fs, &reopened] {
+                let generation = instance.btrfs_tree_block_generation(&cx, logical as u64);
+                if foreign_identity {
+                    let error = generation.unwrap_err();
+                    assert!(error.to_string().contains("filesystem UUID"), "{error}");
+                } else {
+                    assert_eq!(generation.unwrap(), 9);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn btrfs_singleton_metadata_rejects_foreign_fsid_before_caching() {
+        for logical in [0x8_000_usize, 0x20_000] {
+            let mut image = build_btrfs_multileaf_image(8);
+            image[logical + 0x20..logical + 0x30].fill(0xA5);
+            stamp_btrfs_test_tree_block_crc32c(&mut image, logical);
+            let dev = TestDevice::from_vec(image.clone());
+            let cx = Cx::for_testing();
+            let fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default())
+                .expect("deferred FS tree is not read during bootstrap");
+            for _ in 0..2 {
+                let error = fs.walk_btrfs_fs_tree(&cx).unwrap_err();
+                assert!(error.to_string().contains("filesystem UUID"), "{error}");
+                assert!(fs.btrfs_parsed_node_cache.get(&(logical as u64)).is_none());
+                assert!(fs.btrfs_tree_block_generation(&cx, logical as u64).is_err());
+                assert!(
+                    fs.btrfs_transid_mismatches(&cx, BTRFS_TEST_FS_TREE_LOGICAL as u64)
+                        .is_err()
+                );
+                if logical == BTRFS_TEST_FS_TREE_LOGICAL {
+                    assert!(fs.btrfs_root_item_transid_mismatches(&cx).is_err());
+                }
+            }
+            assert_eq!(dev.snapshot_bytes(), image, "rejected reads must not write");
+        }
+    }
+
+    #[test]
+    fn btrfs_singleton_metadata_rejects_foreign_root_during_open() {
+        let mut image = build_btrfs_multileaf_image(8);
+        let root = BTRFS_TEST_ROOT_TREE_LOGICAL;
+        image[root + 0x20..root + 0x30].fill(0xA5);
+        stamp_btrfs_test_tree_block_crc32c(&mut image, root);
+        for skip_validation in [false, true] {
+            let dev = TestDevice::from_vec(image.clone());
+            let error = OpenFs::from_device(
+                &Cx::for_testing(),
+                Box::new(dev.clone()),
+                &OpenOptions {
+                    skip_validation,
+                    ..OpenOptions::default()
+                },
+            )
+            .unwrap_err();
+            assert!(error.to_string().contains("filesystem UUID"), "{error}");
+            assert_eq!(dev.snapshot_bytes(), image);
+        }
+    }
+
+    #[test]
+    fn btrfs_singleton_metadata_rejects_unreadable_extent_tree_before_writes() {
+        let cx = Cx::for_testing();
+        let healthy = build_btrfs_csum_image();
+        let mut fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(healthy.clone())),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        fs.enable_writes(&cx)
+            .expect("valid extent tree admits writes");
+        for bad_identity in [false, true] {
+            let mut image = healthy.clone();
+            let extent_root = 0x18_000;
+            if bad_identity {
+                image[extent_root + 0x20..extent_root + 0x30].fill(0xA5);
+                stamp_btrfs_test_tree_block_crc32c(&mut image, extent_root);
+            } else {
+                image[extent_root + 0x100] ^= 0xff;
+            }
+            let dev = TestDevice::from_vec(image.clone());
+            let mut fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default())
+                .expect("read-only open does not consume the extent tree");
+            let error = fs.enable_writes(&cx).unwrap_err();
+            if bad_identity {
+                assert!(error.to_string().contains("filesystem UUID"), "{error}");
+            }
+            assert!(fs.btrfs_alloc_state.is_none());
+            assert_eq!(
+                dev.snapshot_bytes(),
+                image,
+                "admission failure must not write"
+            );
+        }
+    }
+
+    #[test]
+    fn btrfs_singleton_metadata_rejects_unreadable_tree_log_during_open() {
+        let (image, _) = fsync_btrfs_file_to_tree_log(OsStr::new("identity.bin"), b"synced");
+        let sb = BtrfsSuperblock::parse_from_image(&image).unwrap();
+        assert_ne!(sb.log_root, 0);
+        let chunks = parse_sys_chunk_array(&sb.sys_chunk_array).unwrap();
+        let nodesize = usize::try_from(sb.nodesize).unwrap();
+        let log_roots = walk_tree(
+            &mut |physical| {
+                let start = usize::try_from(physical).unwrap();
+                Ok(image[start..start + nodesize].to_vec())
+            },
+            &chunks,
+            sb.log_root,
+            sb.nodesize,
+            sb.csum_type,
+        )
+        .unwrap();
+        let log_tree = parse_root_item(
+            &log_roots
+                .iter()
+                .find(|item| item.key.item_type == BTRFS_ITEM_ROOT_ITEM)
+                .unwrap()
+                .data,
+        )
+        .unwrap()
+        .bytenr;
+        assert_ne!(log_tree, 0);
+        let cx = Cx::for_testing();
+        let healthy = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(image.clone())),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let file = healthy
+            .lookup(&cx, InodeNumber(1), OsStr::new("identity.bin"))
+            .unwrap();
+        assert_eq!(file.size, 6, "valid acknowledged log is replayed");
+        for logical in [sb.log_root, log_tree] {
+            let physical = usize::try_from(
+                map_logical_to_physical(&chunks, logical)
+                    .unwrap()
+                    .unwrap()
+                    .physical,
+            )
+            .unwrap();
+            for bad_identity in [false, true] {
+                let mut damaged = image.clone();
+                if bad_identity {
+                    damaged[physical + 0x20..physical + 0x30].fill(0xA5);
+                    stamp_btrfs_test_tree_block_crc32c(&mut damaged, physical);
+                } else {
+                    damaged[physical + 0x100] ^= 0xff;
+                }
+                let dev = TestDevice::from_vec(damaged.clone());
+                assert!(
+                    OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default(),)
+                        .is_err(),
+                    "a failed replay cannot discard acknowledged fsyncs"
+                );
+                assert_eq!(dev.snapshot_bytes(), damaged);
+            }
+        }
+    }
+
     /// Like [`build_btrfs_fsops_image`] but adds a csum tree covering the
     /// datasum file's single data sector, plus a CSUM_TREE(7) ROOT_ITEM in the
     /// root leaf — so the on-disk csum read path (bd-x3fcu) can be exercised.
@@ -94861,6 +95096,197 @@ mod tests {
                 ok,
                 "btrfs check must accept a tick-committed image:\n{output}"
             );
+        }
+    }
+
+    #[test]
+    fn btrfs_singleton_metadata_dup_cancellation_stops_before_next_copy() {
+        struct CancelAfterRead {
+            counted: AllReadsCounter,
+            armed: Arc<AtomicBool>,
+        }
+        impl ByteDevice for CancelAfterRead {
+            fn len_bytes(&self) -> u64 {
+                self.counted.len_bytes()
+            }
+            fn read_exact_at(
+                &self,
+                cx: &Cx,
+                offset: ByteOffset,
+                buf: &mut [u8],
+            ) -> ffs_error::Result<()> {
+                self.counted.read_exact_at(cx, offset, buf)?;
+                if self.armed.load(Ordering::Relaxed) {
+                    cx.set_cancel_requested(true);
+                }
+                Ok(())
+            }
+            fn write_all_at(
+                &self,
+                cx: &Cx,
+                offset: ByteOffset,
+                buf: &[u8],
+            ) -> ffs_error::Result<()> {
+                self.counted.write_all_at(cx, offset, buf)
+            }
+            fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+                self.counted.sync(cx)
+            }
+        }
+        let Some((_fs, dev, _tmp, _image)) = open_writable_btrfs_mkfs(256) else {
+            return;
+        };
+        let image = dev.snapshot_bytes();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let armed = Arc::new(AtomicBool::new(false));
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(CancelAfterRead {
+                counted: AllReadsCounter {
+                    inner: dev.clone(),
+                    reads: Arc::clone(&reads),
+                },
+                armed: Arc::clone(&armed),
+            }),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let logical = fs.btrfs_superblock().unwrap().root;
+        let mapping =
+            ffs_ondisk::map_logical_to_stripes(&fs.btrfs_context().unwrap().chunks, logical)
+                .unwrap()
+                .unwrap();
+        assert_eq!(mapping.profile, ffs_ondisk::BtrfsRaidProfile::Dup);
+        assert_eq!(mapping.stripes.len(), 2);
+        fs.walk_btrfs_tree(&cx, logical).unwrap();
+        fs.btrfs_test_clear_node_cache();
+        reads.store(0, AtomicOrdering::SeqCst);
+        armed.store(true, Ordering::Relaxed);
+        assert!(matches!(
+            fs.walk_btrfs_tree(&cx, logical),
+            Err(FfsError::Cancelled)
+        ));
+        assert_eq!(reads.load(AtomicOrdering::SeqCst), 1);
+        assert!(fs.btrfs_parsed_node_cache.get(&logical).is_none());
+        assert_eq!(dev.snapshot_bytes(), image);
+    }
+
+    #[test]
+    fn btrfs_singleton_metadata_dup_recovers_only_matching_fsid() {
+        let Some((fs, dev, _tmp, _image)) = open_writable_btrfs_mkfs(256) else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let image = dev.snapshot_bytes();
+        let sb = BtrfsSuperblock::parse_from_image(&image).unwrap();
+        assert_ne!(sb.fsid, [0; 16], "the real fixture must have an identity");
+        assert_eq!(sb.csum_type, 0, "fixture restamps CRC32C tree blocks");
+        let fs_root = fs
+            .walk_btrfs_root_tree(&cx)
+            .unwrap()
+            .into_iter()
+            .find(|item| {
+                item.key.objectid == BTRFS_FS_TREE_OBJECTID
+                    && item.key.item_type == BTRFS_ITEM_ROOT_ITEM
+            })
+            .unwrap();
+        let fs_root = ffs_btrfs::parse_root_item(&fs_root.data).unwrap().bytenr;
+        let chunks = fs.btrfs_live_chunks().unwrap();
+        let nodesize = usize::try_from(sb.nodesize).unwrap();
+        for logical in [sb.root, fs_root] {
+            let mapping = ffs_ondisk::map_logical_to_stripes(&chunks, logical)
+                .unwrap()
+                .unwrap();
+            assert_eq!(mapping.profile, ffs_ondisk::BtrfsRaidProfile::Dup);
+            assert_eq!(mapping.stripes.len(), 2);
+            let first = usize::try_from(mapping.stripes[0].physical).unwrap();
+            let second = usize::try_from(mapping.stripes[1].physical).unwrap();
+            let header =
+                ffs_btrfs::BtrfsHeader::parse_from_block(&image[second..second + nodesize])
+                    .unwrap();
+            let generation = header.generation;
+            for (first_fsid, second_fsid) in [
+                ([0; 16], sb.fsid),
+                ([0xA5; 16], sb.fsid),
+                ([0; 16], [0xA5; 16]),
+            ] {
+                let mut damaged = image.clone();
+                for (physical, identity, transid) in [
+                    (first, first_fsid, generation + 111),
+                    (second, second_fsid, generation),
+                ] {
+                    let block = &mut damaged[physical..physical + nodesize];
+                    block[0x20..0x30].copy_from_slice(&identity);
+                    block[0x50..0x58].copy_from_slice(&transid.to_le_bytes());
+                    let owner = if physical == first {
+                        header.owner + 111
+                    } else {
+                        header.owner
+                    };
+                    block[0x58..0x60].copy_from_slice(&owner.to_le_bytes());
+                    let csum = ffs_types::crc32c(&block[0x20..]);
+                    block[..4].copy_from_slice(&csum.to_le_bytes());
+                }
+                let device = TestDevice::from_vec(damaged.clone());
+                let opened =
+                    OpenFs::from_device(&cx, Box::new(device.clone()), &OpenOptions::default());
+                if second_fsid == sb.fsid {
+                    let reopened = opened.expect("valid DUP mirror must remain readable");
+                    for _ in 0..2 {
+                        reopened.walk_btrfs_fs_tree(&cx).unwrap();
+                        assert_eq!(
+                            reopened.btrfs_tree_block_generation(&cx, logical).unwrap(),
+                            generation,
+                            "generation must come from the identity-validated copy"
+                        );
+                        assert_eq!(
+                            reopened
+                                .btrfs_read_parsed_node_with_metadata(&cx, logical)
+                                .unwrap()
+                                .1
+                                .owner,
+                            header.owner,
+                            "write admission must consume the validated copy's owner"
+                        );
+                    }
+                    if logical == fs_root {
+                        // Plant a second root reference so shared-tree release
+                        // must convert this block's references using its owner.
+                        // The foreign primary has a different owner and would
+                        // silently skip that conversion on the old raw reader.
+                        let mut alloc = reopened.load_btrfs_alloc_state(&cx).unwrap();
+                        alloc
+                            .extent_alloc
+                            .add_tree_block_backref(
+                                fs_root,
+                                ffs_btrfs::backrefs::TreeBlockBackref::Root(256),
+                            )
+                            .unwrap();
+                        reopened
+                            .btrfs_release_shared_fs_tree(&cx, &mut alloc, fs_root)
+                            .unwrap();
+                        assert!(
+                            alloc
+                                .extent_alloc
+                                .tree_block_ref_state(fs_root)
+                                .unwrap()
+                                .unwrap()
+                                .full_backref()
+                        );
+                    }
+                } else if logical == sb.root {
+                    assert!(opened.is_err(), "all foreign ROOT_TREE copies must reject");
+                } else {
+                    let reopened = opened.unwrap();
+                    for _ in 0..2 {
+                        assert!(reopened.walk_btrfs_fs_tree(&cx).is_err());
+                        assert!(reopened.btrfs_tree_block_generation(&cx, logical).is_err());
+                        assert!(reopened.btrfs_parsed_node_cache.get(&logical).is_none());
+                    }
+                }
+                assert_eq!(device.snapshot_bytes(), damaged);
+            }
         }
     }
 

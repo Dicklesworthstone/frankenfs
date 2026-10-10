@@ -2582,6 +2582,11 @@ For metadata blocks, verification includes:
     mirror or parity-candidate check, before caching. A zero UUID is not a
     wildcard. See Linux v6.19
     [`disk-io.c`](https://github.com/torvalds/linux/blob/v6.19/fs/btrfs/disk-io.c#L318-L368).
+    This applies to singleton and DUP reads as well as attached-device reads.
+    Generation inspection must use the same validated copy. An unreadable
+    referenced log or extent tree is a recovery failure, not an empty tree:
+    continuing must not discard acknowledged fsyncs or authorize allocation
+    over existing extents.
 
 ### 16.3 Key Implementation Patterns
 

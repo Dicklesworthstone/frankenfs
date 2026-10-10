@@ -25,11 +25,10 @@ use super::{
     encode_btrfs_supported_feature_flags, encode_btrfs_tree_search_results,
     encode_btrfs_tree_search_results_with_limit, ext4_flags_to_xflags, ext4_present_xattr_value,
     ext4_read_buffer_len, first_nul, fsflags_to_btrfs_inode_flags, generate_send_stream, info,
-    map_logical_to_physical, parse_btrfs_tree_search_key_bytes, parse_extent_data, parse_root_item,
-    parse_to_ffs_error, read_btrfs_superblock_region, read_ext4_superblock_region,
-    readdir_snapshot_serve, readdir_snapshot_serve_unvalidated, readdir_snapshot_store,
-    slice_readdir_snapshot, systemtime_nanos, trace, warn, xflags_to_btrfs_inode_flags,
-    xflags_to_ext4_flags,
+    parse_btrfs_tree_search_key_bytes, parse_extent_data, parse_root_item, parse_to_ffs_error,
+    read_btrfs_superblock_region, read_ext4_superblock_region, readdir_snapshot_serve,
+    readdir_snapshot_serve_unvalidated, readdir_snapshot_store, slice_readdir_snapshot,
+    systemtime_nanos, trace, warn, xflags_to_btrfs_inode_flags, xflags_to_ext4_flags,
 };
 use crate::vfs::XattrPresence;
 
@@ -419,29 +418,11 @@ impl OpenFs {
                 continue;
             };
             for ptr in ptrs {
-                // Read the CHILD's own header and compare it against what this
-                // pointer claims. `btrfs_read_parsed_node` verifies the block's
-                // checksum on the way in, so a mismatch reported here is a
-                // generation disagreement and not a torn block.
-                let child = self
-                    .btrfs_read_parsed_node(cx, ptr.blockptr)
-                    .map_err(|e| parse_to_ffs_error(&e))?;
-                let generation = match child.as_ref() {
-                    BtrfsParsedNode::Leaf { block, .. } => {
-                        ffs_btrfs::parent_transid_mismatch(ptr.generation, block)
-                    }
-                    // An internal child's parsed form drops its header, so ask
-                    // the layer that still has the bytes.
-                    BtrfsParsedNode::Internal { .. } => self
-                        .btrfs_tree_block_generation(cx, ptr.blockptr)
-                        .and_then(|actual| {
-                            (actual != ptr.generation).then_some((ptr.generation, actual))
-                        }),
-                };
-                if let Some((wanted, actual)) = generation {
+                let actual = self.btrfs_tree_block_generation(cx, ptr.blockptr)?;
+                if actual != ptr.generation {
                     found.push(BtrfsTransidMismatch {
                         logical: ptr.blockptr,
-                        wanted,
+                        wanted: ptr.generation,
                         found: actual,
                     });
                 }
@@ -486,9 +467,8 @@ impl OpenFs {
                 let Ok(root_item) = ffs_btrfs::parse_root_item(payload) else {
                     continue;
                 };
-                if let Some(actual) = self.btrfs_tree_block_generation(cx, root_item.bytenr)
-                    && actual != root_item.generation
-                {
+                let actual = self.btrfs_tree_block_generation(cx, root_item.bytenr)?;
+                if actual != root_item.generation {
                     found.push(BtrfsTransidMismatch {
                         logical: root_item.bytenr,
                         wanted: root_item.generation,
@@ -500,25 +480,17 @@ impl OpenFs {
         Ok(found)
     }
 
-    /// The generation in a tree block's header, using the attached-device
-    /// validation and recovery path when the filesystem spans devices.
-    fn btrfs_tree_block_generation(&self, cx: &Cx, logical: u64) -> Option<u64> {
-        let ctx = self.btrfs_context()?;
-        if let Some(devices) = &self.btrfs_devices {
-            return devices
-                .read_node_with_generation(cx, &ctx.chunks, logical, ctx.nodesize, ctx.csum_type)
-                .ok()
-                .map(|(_, generation)| generation);
-        }
-        let ns = usize::try_from(ctx.nodesize).ok()?;
-        let mapping = map_logical_to_physical(&ctx.chunks, logical).ok()??;
-        let mut buf = vec![0_u8; ns];
-        self.dev
-            .read_exact_at(cx, ByteOffset(mapping.physical), &mut buf)
-            .ok()?;
-        ffs_btrfs::BtrfsHeader::parse_from_block(&buf)
-            .ok()
-            .map(|header| header.generation)
+    /// Generation from the same validated mirror as the parsed node. A failed
+    /// read is an error, not evidence that the parent and child agree.
+    pub(super) fn btrfs_tree_block_generation(
+        &self,
+        cx: &Cx,
+        logical: u64,
+    ) -> Result<u64, FfsError> {
+        let node = self.btrfs_read_parsed_node_with_metadata(cx, logical);
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        node.map(|(_, header)| header.generation)
+            .map_err(|e| parse_to_ffs_error(&e))
     }
 }
 

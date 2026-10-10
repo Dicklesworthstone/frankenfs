@@ -285,9 +285,23 @@ reconstructs a foreign block. A strict-remote `ffs-core --lib` cohort passed
 13 tests with `FFS_REQUIRE_ORACLES=1`, including existing cancellation,
 generation-inspection and encoded-read checks, degraded RAID5/6 formatted-image
 opens, and metadata operations checked by `btrfs check`. These are unit and
-formatted-image OpenFs results, not mounted foreign-header evidence. The
-separate singleton reader's identity validation and seed/sprout routing remain
-open under `bd-hk5w3`.
+formatted-image OpenFs results, not mounted foreign-header evidence.
+
+Singleton/DUP metadata now applies the same identity rule before ROOT_TREE
+bootstrap, log replay and node-cache admission. A corrupt referenced extent
+tree refuses write admission; unreadable log replay refuses opening. Fresh
+generation inspection and shared-tree release retain header fields from the
+accepted copy rather than a cached or separately selected block. On 2026-10-10,
+a strict-RCH `ffs-core --lib` cohort with `FFS_REQUIRE_ORACLES=1` passed 25 tests
+(zero failed/ignored), including seven new singleton cases. These cover
+checksum-correct foreign headers, real formatted DUP recovery, shared-reference
+conversion, corruption of both log levels, public-MVCC inspection freshness,
+and cancellation before another DUP backend read. Existing generation, cache,
+tree-log, subvolume and `btrfs check` controls also passed. These are synthetic
+and formatted-image executions, not mounted foreign-header injection. General
+cached-descent invalidation after raw MVCC writes, absent/zero-address extent
+trees, seed/sprout routing and remaining profile qualification keep `bd-hk5w3`
+open.
 
 Ext4 xattr parity includes the POSIX ACL namespaces in addition to `user.*` and
 `security.*`: `crates/ffs-harness/tests/kernel_reference.rs` now differentially
