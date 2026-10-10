@@ -17172,9 +17172,8 @@ fn assert_btrfs_attached_devices_read_seeded_files(
         };
         let error = OpenFs::open_with_options(&cx, &images[0], &wrong).unwrap_err();
         assert!(
-            error
-                .to_string()
-                .contains("does not match the clean committed filesystem"),
+            matches!(&error, ffs_error::FfsError::Format(detail)
+                if detail == "attached btrfs device does not match the committed filesystem"),
             "{error}"
         );
         if let Some(cli) = cli {
