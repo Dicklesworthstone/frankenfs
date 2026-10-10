@@ -1,5 +1,6 @@
 //! Offline, native NTFS 3.1 MFT/stream reads. No mount, replay or device writes.
 
+mod attributes;
 mod namespace;
 
 use asupersync::Cx;
@@ -92,8 +93,8 @@ enum Storage {
     Mapped(Vec<NtfsRun>),
 }
 
-/// Complete, validated single-record stream. No public constructor permits
-/// bypassing the bounds, flags and mapping checks performed during selection.
+/// Complete, validated stream. No public constructor permits bypassing the
+/// bounds, flags, catalog and mapping checks performed during selection.
 #[derive(Debug)]
 pub struct Stream {
     storage: Storage,
@@ -103,95 +104,7 @@ pub struct Stream {
 }
 impl Stream {
     fn from_attribute(geometry: &NtfsGeometry, attr: &NtfsAttribute<'_>) -> Result<Self> {
-        // Refuse every compression method, EFS, and unknown flag combination.
-        if attr.flags & !SPARSE != 0 {
-            return Err(unsupported(format!(
-                "NTFS attribute flags {:#06x}: compression, EFS or unknown flags",
-                attr.flags
-            )));
-        }
-        match &attr.value {
-            NtfsValue::Resident(value) => {
-                if attr.flags != 0 {
-                    return Err(corrupt(
-                        0,
-                        "resident attribute has nonresident storage flags",
-                    ));
-                }
-                Ok(Self {
-                    size: value.len() as u64,
-                    initialized: value.len() as u64,
-                    allocated: value.len() as u64,
-                    storage: Storage::Resident(value.to_vec()),
-                })
-            }
-            NtfsValue::NonResident(value) => {
-                if value.first_vcn != 0 {
-                    return Err(unsupported(
-                        "NTFS continuation extent requires ATTRIBUTE_LIST assembly",
-                    ));
-                }
-                if value.compression_unit != 0
-                    && !(attr.flags & SPARSE != 0 && value.compression_unit == 4)
-                {
-                    return Err(unsupported("unsupported NTFS compression-unit encoding"));
-                }
-                if value.data_bytes > i64::MAX as u64
-                    || value.allocated_bytes > i64::MAX as u64
-                    || value.initialized_bytes > value.data_bytes
-                {
-                    return Err(corrupt(0, "negative or inconsistent NTFS stream sizes"));
-                }
-                let runs = decode_mapping_pairs(
-                    value.mapping_pairs,
-                    value.first_vcn,
-                    value.last_vcn,
-                    geometry.cluster_count(),
-                )
-                .map_err(parse)?;
-                let cluster_bytes = u64::from(geometry.cluster_bytes());
-                let coverage_clusters = runs.last().map_or(0, |run| run.vcn + run.clusters);
-                let coverage = coverage_clusters
-                    .checked_mul(cluster_bytes)
-                    .ok_or_else(|| corrupt(0, "NTFS logical mapping size overflow"))?;
-                if value.data_bytes > coverage
-                    || !value.allocated_bytes.is_multiple_of(cluster_bytes)
-                    || value.allocated_bytes > coverage
-                {
-                    return Err(corrupt(0, "NTFS stream size is not covered by its mapping"));
-                }
-                if attr.flags & SPARSE == 0
-                    && (value.allocated_bytes != coverage
-                        || runs.iter().any(|run| run.lcn.is_none()))
-                {
-                    return Err(corrupt(
-                        0,
-                        "non-sparse NTFS stream has holes or incomplete allocation",
-                    ));
-                }
-                let mut extents: Vec<_> = runs
-                    .iter()
-                    .filter_map(|run| run.lcn.map(|lcn| (lcn, lcn + run.clusters)))
-                    .collect();
-                extents.sort_unstable();
-                if extents.windows(2).any(|pair| pair[0].1 > pair[1].0) {
-                    return Err(corrupt(0, "NTFS stream aliases its own physical clusters"));
-                }
-                let allocated = extents.iter().try_fold(0_u64, |sum, (start, end)| {
-                    sum.checked_add((end - start) * cluster_bytes)
-                        .ok_or_else(|| corrupt(0, "NTFS allocation sum overflow"))
-                })?;
-                if allocated > value.allocated_bytes {
-                    return Err(corrupt(0, "NTFS mapped allocation exceeds its header"));
-                }
-                Ok(Self {
-                    storage: Storage::Mapped(runs),
-                    size: value.data_bytes,
-                    initialized: value.initialized_bytes,
-                    allocated,
-                })
-            }
-        }
+        Self::from_attributes(geometry, std::slice::from_ref(attr))
     }
 
     #[must_use]
@@ -414,7 +327,7 @@ impl NtfsVolume {
         if record.is_directory() && name.is_empty() {
             return Err(FfsError::IsDirectory);
         }
-        let stream = select_stream(&self.geometry, record, DATA, name)?;
+        let stream = self.select_stream(cx, record, DATA, name)?;
         checkpoint(cx)?;
         Ok(stream)
     }

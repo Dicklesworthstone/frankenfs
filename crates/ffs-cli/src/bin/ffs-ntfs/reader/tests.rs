@@ -404,4 +404,5 @@ fn actual_file_backing_and_adjacent_partition_bytes_remain_unchanged() {
     assert_eq!(std::fs::read(&path).unwrap(), image.bytes);
 }
 
+mod attributes;
 mod namespace;

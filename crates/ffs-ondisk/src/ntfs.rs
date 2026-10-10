@@ -5,6 +5,7 @@
 //! documentation. Update-sequence protection uses 512-byte strides even when
 //! the BPB advertises larger sectors. Names remain native UTF-16 code units.
 
+pub mod attribute_list;
 pub mod index;
 
 use ffs_types::ParseError;
