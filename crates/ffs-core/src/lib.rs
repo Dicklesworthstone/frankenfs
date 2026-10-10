@@ -10775,7 +10775,7 @@ impl OpenFs {
     pub fn commit_transaction(&self, cx: &Cx, txn: Transaction) -> Result<CommitSeq, CommitError> {
         self.reject_btrfs_unsupported_mutation().map_err(|error| {
             CommitError::DurabilityFailure {
-                detail: error.to_string(),
+                detail: format!("transaction was not published: {error}"),
             }
         })?;
         let txn_id = txn.id;
@@ -10910,7 +10910,7 @@ impl OpenFs {
     ) -> Result<CommitSeq, CommitError> {
         self.reject_btrfs_unsupported_mutation().map_err(|error| {
             CommitError::DurabilityFailure {
-                detail: error.to_string(),
+                detail: format!("transaction was not published: {error}"),
             }
         })?;
         let txn_id = txn.id;
