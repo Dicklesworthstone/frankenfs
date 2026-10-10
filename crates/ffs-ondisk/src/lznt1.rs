@@ -183,10 +183,18 @@ mod tests {
         // Literal-prefix lengths and independently specified words copying the
         // first three bytes. These catch the <= / < boundary in the split rule.
         for (length, word) in [
-            (16, 0xF000_u16), (17, 0x8000), (32, 0xF800), (33, 0x8000),
-            (256, 0xFF00), (257, 0x8000), (2048, 0xFFE0), (2049, 0x8000),
+            (16, 0xF000_u16),
+            (17, 0x8000),
+            (32, 0xF800),
+            (33, 0x8000),
+            (256, 0xFF00),
+            (257, 0x8000),
+            (2048, 0xFFE0),
+            (2049, 0x8000),
         ] {
-            let prefix: Vec<_> = (0..length).map(|i| u8::try_from(i % 251).unwrap()).collect();
+            let prefix: Vec<_> = (0..length)
+                .map(|i| u8::try_from(i % 251).unwrap())
+                .collect();
             let mut payload = Vec::new();
             for group in prefix.chunks_exact(8) {
                 payload.push(0);
@@ -197,11 +205,16 @@ mod tests {
             payload.extend_from_slice(remainder);
             payload.extend_from_slice(&word.to_le_bytes());
             let mut encoded = (0xB000_u16 | u16::try_from(payload.len() - 1).unwrap())
-                .to_le_bytes().to_vec();
+                .to_le_bytes()
+                .to_vec();
             encoded.extend_from_slice(&payload);
             let mut expected = prefix.clone();
             expected.extend_from_slice(&prefix[..3]);
-            assert_eq!(decompress_unit(&encoded, 4096).unwrap(), expected, "{length}");
+            assert_eq!(
+                decompress_unit(&encoded, 4096).unwrap(),
+                expected,
+                "{length}"
+            );
         }
         // Reach dictionary position 4093 using one overlapping match, then
         // copy three bytes at distance 4093 with the four-bit length field.
@@ -212,9 +225,13 @@ mod tests {
     #[test]
     fn malformed_streams_never_return_partial_output() {
         for input in [
-            vec![], vec![0], vec![0x02, 0x30, b'A'],
-            vec![0x00, 0x20, b'A'], vec![0x00, 0xB0, 0],
-            vec![0x01, 0xB0, 1, 0], vec![0x02, 0xB0, 1, 0, 0],
+            vec![],
+            vec![0],
+            vec![0x02, 0x30, b'A'],
+            vec![0x00, 0x20, b'A'],
+            vec![0x00, 0xB0, 0],
+            vec![0x01, 0xB0, 1, 0],
+            vec![0x02, 0xB0, 1, 0, 0],
             vec![0x03, 0xB0, 2, b'A', 0, 0x10],
             vec![0x03, 0xB0, 2, b'A', 0xFF, 0x0F],
         ] {
