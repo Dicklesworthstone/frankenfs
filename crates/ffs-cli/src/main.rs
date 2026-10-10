@@ -14380,8 +14380,8 @@ mod tests {
             backing.write_all(&region).unwrap();
             backing.sync_all().unwrap();
             let before = super::file_sha256(&image).unwrap();
-            let mut fs = OpenFs::open_with_options(&cx, &image, &options)
-                .expect("committed inventory wins");
+            let mut fs =
+                OpenFs::open_with_options(&cx, &image, &options).expect("committed inventory wins");
             assert_eq!(fs.btrfs_superblock().unwrap().num_devices, 1);
             assert!(fs.btrfs_device_inventory_verified());
             let info = fs
@@ -14428,6 +14428,12 @@ mod tests {
         backing.seek(SeekFrom::Start(65_536)).unwrap();
         backing.read_exact(&mut region).unwrap();
         assert_eq!(&region[0x88..0x90], &1_u64.to_le_bytes());
+        let log_root = u64::from_le_bytes(region[0x60..0x68].try_into().unwrap());
+        assert_eq!(
+            log_root != 0,
+            ephemeral,
+            "the requested commit path must run"
+        );
         ffs_ondisk::verify_btrfs_superblock_checksum(&region).unwrap();
         let reopened = OpenFs::open(&cx, &image).unwrap();
         let file = reopened

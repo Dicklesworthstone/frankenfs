@@ -3312,7 +3312,10 @@ mod tests {
             data[0x60] ^= 1;
             assert!(verify_superblock_checksum(&data[..BTRFS_SUPER_INFO_SIZE]).is_err());
         }
-        for mut invalid in [vec![0; BTRFS_SUPER_INFO_SIZE - 1], vec![0; BTRFS_SUPER_INFO_SIZE]] {
+        for mut invalid in [
+            vec![0; BTRFS_SUPER_INFO_SIZE - 1],
+            vec![0; BTRFS_SUPER_INFO_SIZE],
+        ] {
             invalid[0xC4..0xC6].copy_from_slice(&u16::MAX.to_le_bytes());
             let before = invalid.clone();
             assert!(BtrfsSuperblock::patch_tree_log_commit(&mut invalid, 4096, 0).is_err());

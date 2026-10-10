@@ -105,9 +105,13 @@ incorrect lengths. Registration rejects zero IDs and duplicate IDs without
 replacing an existing reader. `OpenOptions::btrfs_device_paths` (CLI: repeatable
 `--btrfs-device`) attaches additional backings before bootstrap. Core validates
 superblock checksums, filesystem generation/roots/geometry, device IDs/UUIDs and
-capacity, then checks identities against the committed CHUNK_TREE inventory and
-stripe references. Bootstrap, parsed metadata and file-data reads use the device
-set. Kernel-written RAID0 and RAID1 images are covered through the core API and
+capacity. A provisional device set reads CHUNK_TREE before ROOT_TREE; its
+committed DEV_ITEMs validate every attachment and both bootstrap and committed
+stripe identities. The inventory reconciles `num_devices` in memory and selects
+the permanent reader. A verified single-device Single/DUP image uses the
+single-device path; other readable sets retain device routing. Opening does not
+write the count correction. Full and tree-log commits publish it with the
+filesystem's declared checksum algorithm. Kernel-written RAID0 and RAID1 images are covered through the core API and
 FUSE with each primary-device choice. Metadata reads validate each complete
 mirror's checksum, logical address and structure before caching it, retrying
 another copy on invalid content. Kernel-written RAID1/RAID10/C3/C4 tests corrupt
@@ -185,7 +189,7 @@ tree log and no MVCC WAL. Nested subvolumes share the validated device handles,
 recheck committed superblocks and chunk coverage, and preserve the checksum
 policy. Unreadable attached subvolumes return errors rather than empty
 directories. Dirty-image recovery, seed-device inventories with different
-filesystem UUIDs, device-count reconciliation and remaining corruption/profile
+filesystem UUIDs and remaining corruption/profile
 qualification remain open. There is no
 multi-device mutation support.
 `OpenFs::enable_writes` refuses any device count other than one and any known
@@ -207,23 +211,22 @@ descent over the committed device-item keyspace. Both include unused devices
 and maximum IDs, require IDs to match their keys, reject duplicate IDs/UUIDs
 and foreign filesystem UUIDs, and verify the backing device's identity.
 Partial live tree loads return an unsupported error; missing, malformed or
-count-inconsistent inventories return corruption errors. Unlike Linux's
-mount-time count repair, FrankenFS currently refuses a superblock/DEV_ITEM
-count mismatch. This inventory does not open or validate additional backing
-files, and does not enable cross-device reads. Seed-device inventories with
+count-inconsistent live inventories return corruption errors. Mount admission
+reconciles a stale superblock count from the verified committed inventory;
+later ioctl enumeration compares against that mounted count. The shared parser
+does not itself open additional backing files. Seed-device inventories with
 different filesystem UUIDs are not yet supported. The allocator lock stabilizes writable accounting,
 but full commit releases it before superblock publication; serializing that
 publication with device-info reads remains open (`bd-hk5w3`).
 
-The remaining `bd-hk5w3` admission work must resolve the inventory before
-walking ROOT_TREE or any selected subvolume. A raw `num_devices = 1` cannot
-select the single-image reader: committed DEV_ITEMs may include another
-device, even when that device owns no chunks. Bootstrap reads must honor
-stripe device identities, and the verified CHUNK_TREE pass must retain its
-device records alongside the expanded chunk map. Its inventory selects the
-reader used for subsequent metadata and data, and its corrected count feeds
-write and background-scrub admission. A count correction in `FS_INFO` alone
-would leave those decisions exposed to the stale superblock value.
+Admission resolves the inventory before walking ROOT_TREE or any selected
+subvolume. A raw `num_devices = 1` cannot select the single-image reader:
+committed DEV_ITEMs include unused devices. The corrected count feeds write
+and background-scrub admission as well as `FS_INFO`. Bootstrap-only diagnostic
+opens without CHUNK_TREE remain unverified and cannot publish transactions,
+flush existing MVCC versions, or start background repair. Actual device sets
+still require clean tree logs and no external MVCC WAL; verified singleton
+images retain their existing log replay and WAL paths.
 
 Seed support also requires explicit per-device filesystem identity and seed
 generation, anchored to the sprout's committed DEV_ITEMs. Seed handles remain

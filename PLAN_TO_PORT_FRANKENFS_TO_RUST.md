@@ -57,7 +57,7 @@ operational readiness.
 - [ ] `bd-rchk5` performance baselines: re-measure representative throughput/latency targets against current code and record environment metadata.
 - [x] `bd-rchk6` mounted self-healing lifecycle: implemented explicit mounted automatic repair via `--background-repair --background-scrub-ledger <jsonl>`, with read-write repair routed through the mounted MVCC repair-writeback serializer.
 - [ ] `bd-rchk7` fuzz/conformance expansion: replace remaining open-ended corpus expansion notes with completed fixtures or narrow beads.
-- [ ] `bd-hk5w3` device routing: CHUNK_TREE inventory feeds `FS_INFO` and `DEV_INFO`, including unused devices. Clean attached-device reads, nested reads and RAID5/6 erasure recovery have kernel-image/library-FUSE and public CLI evidence. Seed-device inventories with different filesystem UUIDs and Linux-style repair of a disagreeing superblock device count remain gaps; they are not newly excluded from the canonical read scope.
+- [ ] `bd-hk5w3` device routing: CHUNK_TREE inventory selects readers before ROOT_TREE and feeds `FS_INFO` and `DEV_INFO`, including unused devices. Admission reconciles stale nonzero device counts in memory; the next full/tree-log commit publishes the correction. Clean attached-device reads, nested reads and RAID5/6 erasure recovery have kernel-image/library-FUSE and public CLI evidence. Seed-device inventories with different filesystem UUIDs and remaining read-profile qualification stay open; they are not newly excluded from the canonical read scope.
 
 ### 0.2 `ffs-types` (Canonical Newtypes + Shared Parsing Primitives)
 

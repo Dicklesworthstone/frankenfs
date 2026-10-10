@@ -515,10 +515,12 @@ pub fn fuzz_btrfs_serialize_inode_ref_payload(
 #[derive(Debug, Clone)]
 #[allow(clippy::struct_excessive_bools)]
 pub struct OpenOptions {
-    /// Skip mount-time validation (geometry, features, checksums).
+    /// Allow limited recovery or diagnostic opening without mount validation.
     ///
-    /// When `true`, the superblock is parsed but not validated via
-    /// `validate_v1()`. Use for recovery or diagnostics only.
+    /// Ext4 skips `validate_v1()`. Btrfs may use a bootstrap-only default-root
+    /// view when CHUNK_TREE is absent; that view cannot authorize mutation.
+    /// Available btrfs inventories and device identities are still validated
+    /// before selecting the reader, regardless of this option.
     pub skip_validation: bool,
     /// ext4 internal journal replay mode.
     ///
@@ -91680,8 +91682,7 @@ mod tests {
         let sb = BTRFS_SUPER_INFO_OFFSET;
         // Bootstrap remains on device 7; the committed map routes ROOT_TREE,
         // FS_TREE and payload reads to the sparse second device.
-        primary[root + 3800 + 48..root + 3800 + 56]
-            .copy_from_slice(&u64::MAX.to_le_bytes());
+        primary[root + 3800 + 48..root + 3800 + 56].copy_from_slice(&u64::MAX.to_le_bytes());
         primary[root + 3800 + 64..root + 3800 + 80].fill(0xD4);
         stamp_btrfs_test_tree_block_crc32c(&mut primary, root);
         let mut secondary = primary.clone();
@@ -91719,12 +91720,8 @@ mod tests {
         );
         assert!(fs.enable_writes(&cx).is_err());
         drop(fs);
-        let error = OpenFs::from_device(
-            &cx,
-            Box::new(dev.clone()),
-            &OpenOptions::default(),
-        )
-        .unwrap_err();
+        let error =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap_err();
         assert!(matches!(error, FfsError::UnsupportedFeature(_)));
         assert!(error.to_string().contains("readable device set"));
         assert_eq!(dev.snapshot_bytes(), primary);

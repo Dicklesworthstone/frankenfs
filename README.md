@@ -3315,7 +3315,11 @@ Btrfs stripe helpers and mounted support currently differ. Clean complete-set
 reads in the table have library FUSE and public CLI evidence. CLI degraded
 coverage includes both RAID1 survivors and every tolerated RAID5/6 omission;
 the other mirror-subset and corruption cases use the library mount path.
-Seed-device inventories and device-count reconciliation remain open under
+Committed CHUNK_TREE device records determine reader selection before ROOT_TREE
+traversal, including devices with no allocated chunks. A stale nonzero superblock
+count is reconciled in memory and published by the next commit; opening alone
+does not alter the image. Missing or corrupt inventories cannot authorize writes.
+Seed-device inventories and remaining read-profile qualification stay open under
 `bd-hk5w3`; the full V1 read scope is not complete.
 
 Standalone btrfs seed images remain readable, but `OpenFs` refuses write
