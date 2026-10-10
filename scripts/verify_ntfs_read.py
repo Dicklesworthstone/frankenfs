@@ -5,10 +5,13 @@ This does not build Rust, mount a filesystem, or modify any existing image.
 Missing tools and unsupported native layouts are failures, never skip credit.
 Native tools must actually create ATTRIBUTE_LIST-backed named streams; a
 single-record substitute is not accepted as extension-record coverage.
+Additional fresh images require native compressed DATA at 512- and 4096-byte
+cluster sizes, with storage reduction observed in independently read MFT bytes.
 """
 from __future__ import annotations
 
 import argparse
+from collections.abc import Callable
 import hashlib
 import json
 import os
@@ -55,6 +58,100 @@ def native_extension_records(value: bytes, base_record: int, names: set[str]) ->
     records = sorted({record for record in named_records.values() if record != base_record})
     require(bool(records), "native fixture did not put named streams in extension records")
     return records
+
+
+def native_compressed_allocation(mft: bytes, boot: bytes, number: int, expected_size: int) -> int:
+    """Check a fresh fixture's unnamed DATA using ntfscat's raw MFT stream."""
+    sector = struct.unpack_from("<H", boot, 11)[0]
+    cluster = sector * boot[13]
+    encoded = struct.unpack_from("<b", boot, 64)[0]
+    require(-16 <= encoded <= 127 and encoded != 0, "invalid native FILE record size")
+    size = 1 << -encoded if encoded < 0 else encoded * cluster
+    require(512 <= size <= 65536 and size % 512 == 0, "unsupported native FILE record size")
+    raw = bytearray(mft[number * size:(number + 1) * size])
+    require(len(raw) == size and raw[:4] == b"FILE", "native MFT did not return the seeded record")
+    usa, count = struct.unpack_from("<HH", raw, 4)
+    require(count == size // 512 + 1 and 48 <= usa and usa + count * 2 <= 510,
+            "invalid native update-sequence array")
+    saved = bytes(raw[usa:usa + count * 2])
+    for index in range(1, count):
+        end = index * 512
+        require(raw[end - 2:end] == saved[:2], "torn record in native compression fixture")
+        raw[end - 2:end] = saved[index * 2:index * 2 + 2]
+    used = struct.unpack_from("<I", raw, 24)[0]
+    position = struct.unpack_from("<H", raw, 20)[0]
+    require(usa + count * 2 <= position <= used <= size, "invalid native record bounds")
+    while position + 4 <= used:
+        kind = struct.unpack_from("<I", raw, position)[0]
+        if kind == 0xFFFFFFFF:
+            break
+        require(position + 24 <= used, "truncated native attribute header")
+        length = struct.unpack_from("<I", raw, position + 4)[0]
+        require(length >= 24 and length % 8 == 0 and position + length <= used,
+                "invalid native attribute boundary")
+        if kind == 0x80 and raw[position + 9] == 0:
+            require(raw[position + 8] == 1 and length >= 72, "compression fixture DATA is resident")
+            flags = struct.unpack_from("<H", raw, position + 12)[0]
+            unit = struct.unpack_from("<H", raw, position + 34)[0]
+            require(flags & 0xFF == 1 and flags & 0x4000 == 0 and unit == 4,
+                    "native tools did not create an ordinary LZNT1 DATA stream")
+            require(struct.unpack_from("<Q", raw, position + 16)[0] == 0,
+                    "seeded DATA initial extent is not in its base record")
+            logical = struct.unpack_from("<Q", raw, position + 48)[0]
+            physical = struct.unpack_from("<Q", raw, position + 64)[0]
+            require(logical == expected_size and 0 < physical < logical,
+                    "native nonzero fixture has no actual compression savings")
+            return physical
+        position += length
+    raise RuntimeError("native MFT fixture has no unnamed compressed DATA")
+
+
+def compressed_cases(command: Callable[..., bytes], binary: Path, root: Path) -> list[dict[str, object]]:
+    results = []
+    for cluster in (512, 4096):
+        unit = 16 * cluster
+        image = root / f"compressed-{cluster}.img"
+        with image.open("xb") as target:
+            target.truncate(64 * 1024 * 1024)
+        command("mkntfs", "-F", "-Q", "-C", "-s", "512", "-c", str(cluster), image)
+        payloads = {
+            "dense.bin": b"ABCD" * (unit * 3 // 4) + b"Z" * 37,
+            "mixed.bin": hashlib.shake_256(b"native NTFS raw unit").digest(unit)
+                         + bytes(unit) + b"K" * unit + b"tail" * 253,
+        }
+        for name, expected in payloads.items():
+            source = root / f"compressed-{cluster}-{name}"
+            source.write_bytes(expected)
+            command("ntfscp", image, source, "/" + name)
+        before = digest(image)
+        listing = command("ntfsls", "-a", "-i", image).decode("utf-8", errors="strict")
+        records = {}
+        for line in listing.splitlines():
+            match = re.fullmatch(r"\s*(\d+)\s+(.+?)\s*", line)
+            if match:
+                records[match[2]] = int(match[1])
+        require(set(payloads) <= records.keys(), "native compressed fixture names are missing")
+        with image.open("rb") as source:
+            boot = source.read(512)
+        native_mft = command("ntfscat", "-i", "0", image)
+        allocated = native_compressed_allocation(native_mft, boot, records["dense.bin"], len(payloads["dense.bin"]))
+        for name, expected in payloads.items():
+            record = str(records[name])
+            require(command("ntfscat", "-i", record, image) == expected,
+                    f"native compressed oracle differs: {cluster} {name}")
+            require(command(binary, "cat", image, record, "--offline-image") == expected,
+                    f"candidate compressed numeric read differs: {cluster} {name}")
+            require(command(binary, "read", image, "/" + name, "--offline-image") == expected,
+                    f"candidate compressed path read differs: {cluster} {name}")
+            for start in (507, 4090, unit - 3, unit * 2 - 3, len(expected) - 3, len(expected)):
+                require(command(binary, "read", image, "/" + name, "--offline-image",
+                                "--start", str(start), "--bytes", "1031") == expected[start:start + 1031],
+                        f"candidate compressed range differs: {cluster} {name} at {start}")
+        require(digest(image) == before, "compressed reads changed the native image")
+        results.append({"cluster_bytes": cluster, "image_sha256": before,
+                        "dense_physical_bytes": allocated, "files_checked": len(payloads),
+                        "native_mft_sha256": hashlib.sha256(native_mft).hexdigest()})
+    return results
 
 
 def main() -> None:
@@ -175,10 +272,12 @@ def main() -> None:
                         "--offset", "1048576", "--length", str(image.stat().st_size)) == extension_streams["extension-31"],
                 "selected-partition extension stream differs")
         require(digest(disk) == disk_before, "candidate modified image or adjacent partition bytes")
+        compression = compressed_cases(command, binary, root)
         report.update(status="passed", image_sha256=before, partitioned_sha256=disk_before,
                       named_stream_checked=True, directory_and_path_reads_checked=True,
                       attribute_list_sha256=hashlib.sha256(raw_list).hexdigest(),
-                      native_extension_records=extension_records, extension_streams_checked=len(extension_streams))
+                      native_extension_records=extension_records, extension_streams_checked=len(extension_streams),
+                      compression=compression)
         print(json.dumps(report, indent=2))
     except Exception as error:
         report.update(status="failed", error=str(error))

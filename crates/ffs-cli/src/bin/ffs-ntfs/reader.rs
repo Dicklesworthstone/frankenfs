@@ -1,13 +1,14 @@
 //! Offline, native NTFS 3.1 MFT/stream reads. No mount, replay or device writes.
 
 mod attributes;
+mod compression;
 mod namespace;
 
 use asupersync::Cx;
 use ffs_block::ByteDevice;
 use ffs_error::{FfsError, Result};
 use ffs_ondisk::ntfs::{
-    ATTRIBUTE_LIST, DATA, NtfsAttribute, NtfsFileRecord, NtfsGeometry, NtfsReference, NtfsRun,
+    ATTRIBUTE_LIST, COMPRESSED, DATA, NtfsAttribute, NtfsFileRecord, NtfsGeometry, NtfsReference, NtfsRun,
     NtfsValue, SPARSE, VOLUME_INFORMATION, decode_mapping_pairs,
 };
 use ffs_types::{ByteOffset, ParseError};
@@ -91,6 +92,7 @@ impl Source {
 enum Storage {
     Resident(Vec<u8>),
     Mapped(Vec<NtfsRun>),
+    Compressed(compression::CompressedStorage),
 }
 
 /// Complete, validated stream. No public constructor permits bypassing the
@@ -130,6 +132,9 @@ impl Stream {
             return Ok(result);
         }
         match &self.storage {
+            Storage::Compressed(storage) => {
+                storage.read_into(source, geometry, cx, self.initialized, offset, &mut result)?;
+            }
             Storage::Resident(data) => {
                 let at = usize::try_from(offset)
                     .map_err(|_| corrupt(0, "resident read offset overflow"))?;

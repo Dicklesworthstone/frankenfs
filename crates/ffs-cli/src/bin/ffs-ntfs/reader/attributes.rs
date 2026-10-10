@@ -5,10 +5,11 @@
 //! be represented in the list. Extension records never redirect to a new base.
 
 use super::{
-    ATTRIBUTE_LIST, Cx, DATA, FfsError, NtfsAttribute, NtfsFileRecord, NtfsGeometry, NtfsReference,
+    ATTRIBUTE_LIST, COMPRESSED, Cx, DATA, FfsError, NtfsAttribute, NtfsFileRecord, NtfsGeometry, NtfsReference,
     NtfsValue, NtfsVolume, Result, SPARSE, Source, Storage, Stream, checkpoint, corrupt,
     decode_mapping_pairs, parse, unsupported, validate_identity,
 };
+use super::compression::CompressedStorage;
 use ffs_ondisk::ntfs::attribute_list::{
     MAX_LIST_BYTES, NtfsAttributeListEntry, parse_attribute_list,
 };
@@ -226,11 +227,15 @@ impl Stream {
         let first = attributes.first().ok_or_else(|| {
             FfsError::NotFound("NTFS stream has no matching attribute extents".into())
         })?;
-        if first.flags & !SPARSE != 0 {
+        if first.flags & !(SPARSE | COMPRESSED) != 0 {
             return Err(unsupported(format!(
-                "NTFS attribute flags {:#06x}: compression, EFS or unknown flags",
+                "NTFS attribute flags {:#06x}: unsupported compression method, EFS or unknown flags",
                 first.flags
             )));
+        }
+        let compressed = first.flags & COMPRESSED != 0;
+        if compressed && first.kind != DATA {
+            return Err(unsupported("native compression is supported only for NTFS DATA"));
         }
         if attributes.iter().any(|attr| {
             attr.kind != first.kind || attr.name != first.name || attr.flags != first.flags
@@ -269,7 +274,13 @@ impl Stream {
         if header.first_vcn != 0 {
             return Err(corrupt(0, "NTFS stream has no initial extent"));
         }
-        if header.compression_unit != 0
+        if compressed {
+            if header.compression_unit != 4 || geometry.cluster_bytes() > 4096 {
+                return Err(unsupported(
+                    "native NTFS compression requires 16-cluster units and clusters at most 4 KiB",
+                ));
+            }
+        } else if header.compression_unit != 0
             && !(first.flags & SPARSE != 0 && header.compression_unit == 4)
         {
             return Err(unsupported("unsupported NTFS compression-unit encoding"));
@@ -319,13 +330,16 @@ impl Stream {
                 "NTFS stream size is not covered by its complete mapping",
             ));
         }
-        if first.flags & SPARSE == 0
+        if first.flags & (SPARSE | COMPRESSED) == 0
             && (header.allocated_bytes != coverage || runs.iter().any(|run| run.lcn.is_none()))
         {
             return Err(corrupt(
                 0,
                 "non-sparse NTFS stream has holes or incomplete allocation",
             ));
+        }
+        if compressed && header.allocated_bytes != coverage {
+            return Err(corrupt(0, "compressed allocation length disagrees with mapped VCN coverage"));
         }
         let mut physical: Vec<_> = runs
             .iter()
@@ -342,8 +356,13 @@ impl Stream {
         if allocated > header.allocated_bytes {
             return Err(corrupt(0, "NTFS mapped allocation exceeds its header"));
         }
+        let storage = if compressed {
+            Storage::Compressed(CompressedStorage::new(geometry, runs)?)
+        } else {
+            Storage::Mapped(runs)
+        };
         Ok(Self {
-            storage: Storage::Mapped(runs),
+            storage,
             size: header.data_bytes,
             initialized: header.initialized_bytes,
             allocated,

@@ -4,7 +4,8 @@
 `ffs-block::ByteDevice`. It does not delegate data reads to ntfs-3g, a kernel
 filesystem or a mounted image. This is a companion binary, not yet an `OpenFs`
 backend, FUSE mount, or writable filesystem. It traverses native directory
-indexes and resolves paths using the image's own UpCase table.
+indexes and resolves paths using the image's own UpCase table. Ordinary native
+LZNT1-compressed nonresident DATA uses the same numeric and path read commands.
 
 ## Commands
 
@@ -54,6 +55,37 @@ allocation slack. Reads coalesce within a physical run, locate runs by binary
 search and cap each returned buffer at 16 MiB. Invalid mappings, storage errors
 and cancellation are errors, not successful short reads. Already streamed stdout
 prefixes may remain after later I/O errors.
+
+## Native compressed DATA
+
+Nonresident DATA with ordinary compression method 1 uses 16-cluster units on
+512..4096-byte clusters. Each unit is classified from the assembled runlist,
+not from a magic byte in its contents: fully allocated units are literal data,
+wholly sparse units produce zeroes without data I/O, and allocated prefixes
+followed by sparse padding contain LZNT1 bytes. Physical prefixes can be
+fragmented, including across attribute extents and backward LCN deltas. Sparse
+padding is not exposed as logical zeroes after a packed prefix.
+
+The decoder validates chunk signatures, token lengths, dictionary distances,
+independent 4 KiB windows and output bounds. Forward overlapping matches are
+supported. Short intermediate chunks have native zero padding; an early final
+terminator never invents missing initialized bytes. Even a prefix read rejects
+a packed unit that cannot reconstruct its full initialized logical range.
+
+Only units touched by the initialized part of a request are read. Raw units
+serve the requested subrange directly; packed units use bounded input/output
+buffers of at most 64 KiB each. There is no per-unit index proportional to file
+size: admission scans the bounded runlist and reads binary-search into it.
+Large sparse files therefore do not allocate millions of unit descriptors.
+Final partial units are admitted when fully raw; partial sparse/packed mappings
+and physical clusters following sparse padding within the same unit are refused.
+
+Compressed named streams and extension-backed mappings share the ordinary
+attribute catalog and EOF/ValidDataLength rules. Compression methods other than
+LZNT1, noncanonical unit sizes, clusters above 4 KiB, EFS and compressed non-DATA
+attributes remain refused. Resident attributes carrying nonresident storage
+flags remain refused. MFT data must still be untransformed. WOF/system compression
+and other reparse-backed formats are not ordinary LZNT1 DATA support.
 
 ## ATTRIBUTE_LIST and extension records
 
@@ -120,6 +152,7 @@ VBN units even on a larger-sector volume. Parent traversal (`..`) is not admitte
 
 Only immutable, offline regular files, NTFS 3.1, 512..4096-byte sectors,
 clusters up to 64 KiB and FILE/index record sizes up to 64 KiB are admitted.
+Compressed DATA has the narrower cluster/unit profile described above.
 The MFT bootstrap record must fit in the initial physical run. MFT indices
 above u32::MAX and records outside initialized MFT data are not exposed.
 
@@ -130,21 +163,22 @@ probes and 1,048,576 cumulative mapping-merge units. These are explicit resource
 limits, not maximum sizes of the native NTFS format.
 
 The list's own mapping cannot be recursively extended through other FILE records.
-Compression, EFS encryption, unknown attribute flags and nonzero volume flags
-remain refused. Sparse-only attributes accept zero or four as their frame-unit
-encoding. No writes, repairs, log replay, volume-flag changes or device flushes
-occur. A shared advisory lock does not exclude kernel mounts or unrelated writers.
+Unsupported compression profiles, EFS, unknown attribute flags and nonzero volume
+flags remain refused. Sparse-only attributes accept zero or four as their
+frame-unit encoding. No writes, repairs, log replay, volume-flag changes or device
+flushes occur. A shared advisory lock does not exclude unrelated writers.
 
 A zero volume-flags field and matching record-zero mirror are **not** proof of
 a clean $LogFile, absence of hibernation, complete MFTMirr consistency, or global
 allocation/index integrity. The caller must supply a quiescent image. This is
-not a recovery or filesystem-check tool. Reparse handling, compression, mounted
-operations, native security projection and NTFS mutation remain separate work.
+not a recovery or filesystem-check tool. Reparse handling, compressed writes,
+mounted operations, native security projection and NTFS mutation remain separate work.
 
 ## Validation
 
 ```sh
 rch exec -- cargo test -p ffs-ondisk ntfs
+rch exec -- cargo test -p ffs-ondisk lznt1
 rch exec -- cargo test -p ffs-cli --bin ffs-ntfs
 python3 scripts/verify_ntfs_read.py --binary target/debug/ffs-ntfs
 ```
@@ -163,17 +197,31 @@ reads, including an extension stream inside a selected partition. Missing tools,
 a formatter that does not produce the requested layout, and candidate failures
 are failures, not successful skips.
 
-Delivery evidence: Python syntax compilation and runner `--help` were executed
-for the extension-aware runner. Rust compilation/tests, rustfmt/Clippy and native
-NTFS-image execution were unavailable in the authoring environment. Added code
-and tests are not a passing conformance or Windows-interchange claim. The native
-runner does not force fragmented MFT bootstrap, split mapping-pair continuations,
-sparse/compressed/EFS images or directory-extension layouts; those mechanisms
-have separate constructed Rust fixtures and still require native evidence.
+The compressed cases create additional fresh images with `mkntfs -C` at 512- and
+4096-byte cluster sizes. Dense nonzero and mixed random/zero/repeating payloads
+are copied using ntfscp and independently read using ntfscat. The native MFT,
+also extracted by ntfscat, must demonstrate a nonresident method-1 DATA stream
+and real physical-allocation savings for the dense nonzero file. A compression
+flag on a wholly raw substitute cannot earn this coverage. Numeric reads, path
+reads, unit/chunk boundary ranges, EOF and unchanged image hashes are checked.
+These cases do not certify every native unit topology or Windows interoperability.
 
-The new Rust regressions cover resident/disk-backed lists, named/resident values
+Delivery evidence for the compression increment: Python syntax compilation,
+runner `--help`, and one positive/five negative constructed tests of the Python
+native-allocation evidence helper passed. Rust compilation/tests, rustfmt/Clippy
+and native-image execution remain unavailable in the authoring environment.
+The Python helper checks do not execute the Rust decoder or a native filesystem.
+Added code and tests are not a passing conformance or Windows-interchange claim.
+
+The native runner does not force fragmented MFT bootstrap, split mapping-pair
+continuations, EFS images or directory-extension layouts; those mechanisms
+have separate constructed Rust fixtures and still require native evidence.
+The Rust regressions cover resident/disk-backed lists, named/resident values
 in extensions, split fragmented and sparse mappings, stale or mismatched catalogs,
 physical aliases, partial coverage, cancellation, unchanged image bytes, MFT
 out-of-order dependency resolution and refusal, extended indexes/FILE_NAMEs,
-extended UpCase data and reparse attributes hidden in extensions. Existing boot,
-stream, namespace, and read-only failure tests remain intact.
+extended UpCase data and reparse attributes hidden in extensions. Compression
+regressions add malformed tokens, displacement-width boundaries, raw/sparse/packed
+unit transitions, fragmented and split-attribute units, initialized-length refusal,
+large sparse files, raw final partial units, and full 64 KiB output units.
+Existing boot, stream, namespace, and read-only failure tests remain intact.
