@@ -196,11 +196,11 @@ mod tests {
                 .map(|i| u8::try_from(i % 251).unwrap())
                 .collect();
             let mut payload = Vec::new();
-            for group in prefix.chunks_exact(8) {
+            let (groups, remainder) = prefix.as_chunks::<8>();
+            for group in groups {
                 payload.push(0);
                 payload.extend_from_slice(group);
             }
-            let remainder = prefix.chunks_exact(8).remainder();
             payload.push(1 << remainder.len());
             payload.extend_from_slice(remainder);
             payload.extend_from_slice(&word.to_le_bytes());

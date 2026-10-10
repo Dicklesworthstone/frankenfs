@@ -8,8 +8,8 @@ use asupersync::Cx;
 use ffs_block::ByteDevice;
 use ffs_error::{FfsError, Result};
 use ffs_ondisk::ntfs::{
-    ATTRIBUTE_LIST, COMPRESSED, DATA, NtfsAttribute, NtfsFileRecord, NtfsGeometry, NtfsReference, NtfsRun,
-    NtfsValue, SPARSE, VOLUME_INFORMATION, decode_mapping_pairs,
+    ATTRIBUTE_LIST, COMPRESSED, DATA, NtfsAttribute, NtfsFileRecord, NtfsGeometry, NtfsReference,
+    NtfsRun, NtfsValue, SPARSE, VOLUME_INFORMATION, decode_mapping_pairs,
 };
 use ffs_types::{ByteOffset, ParseError};
 use std::fs::File;

@@ -4,12 +4,12 @@
 //! list entries must identify exact attributes, and loaded attributes must all
 //! be represented in the list. Extension records never redirect to a new base.
 
-use super::{
-    ATTRIBUTE_LIST, COMPRESSED, Cx, DATA, FfsError, NtfsAttribute, NtfsFileRecord, NtfsGeometry, NtfsReference,
-    NtfsValue, NtfsVolume, Result, SPARSE, Source, Storage, Stream, checkpoint, corrupt,
-    decode_mapping_pairs, parse, unsupported, validate_identity,
-};
 use super::compression::CompressedStorage;
+use super::{
+    ATTRIBUTE_LIST, COMPRESSED, Cx, DATA, FfsError, NtfsAttribute, NtfsFileRecord, NtfsGeometry,
+    NtfsReference, NtfsValue, NtfsVolume, Result, SPARSE, Source, Storage, Stream, checkpoint,
+    corrupt, decode_mapping_pairs, parse, unsupported, validate_identity,
+};
 use ffs_ondisk::ntfs::attribute_list::{
     MAX_LIST_BYTES, NtfsAttributeListEntry, parse_attribute_list,
 };
@@ -235,7 +235,9 @@ impl Stream {
         }
         let compressed = first.flags & COMPRESSED != 0;
         if compressed && first.kind != DATA {
-            return Err(unsupported("native compression is supported only for NTFS DATA"));
+            return Err(unsupported(
+                "native compression is supported only for NTFS DATA",
+            ));
         }
         if attributes.iter().any(|attr| {
             attr.kind != first.kind || attr.name != first.name || attr.flags != first.flags
@@ -339,7 +341,10 @@ impl Stream {
             ));
         }
         if compressed && header.allocated_bytes != coverage {
-            return Err(corrupt(0, "compressed allocation length disagrees with mapped VCN coverage"));
+            return Err(corrupt(
+                0,
+                "compressed allocation length disagrees with mapped VCN coverage",
+            ));
         }
         let mut physical: Vec<_> = runs
             .iter()

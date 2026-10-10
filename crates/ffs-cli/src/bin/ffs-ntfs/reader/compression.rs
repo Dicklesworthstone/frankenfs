@@ -2,7 +2,9 @@
 //! Runs are retained once; neither admission nor reads expand a large sparse
 //! file into one heap object per unit. A read stages at most one 64 KiB unit.
 
-use super::{Cx, NtfsGeometry, NtfsRun, Result, Source, buffer, checkpoint, corrupt, parse, unsupported};
+use super::{
+    Cx, NtfsGeometry, NtfsRun, Result, Source, buffer, checkpoint, corrupt, parse, unsupported,
+};
 use ffs_ondisk::lznt1::decompress_unit;
 
 const UNIT_CLUSTERS: u64 = 16;
@@ -31,13 +33,21 @@ impl CompressedStorage {
     /// coverage, stream sizes, flags, self-aliases and the global run budget.
     pub(super) fn new(geometry: &NtfsGeometry, runs: Vec<NtfsRun>) -> Result<Self> {
         if geometry.cluster_bytes() > 4096 {
-            return Err(unsupported("native NTFS compression requires clusters at most 4 KiB"));
+            return Err(unsupported(
+                "native NTFS compression requires clusters at most 4 KiB",
+            ));
         }
         let end = runs.last().map_or(0, |run| run.vcn + run.clusters);
         if !end.is_multiple_of(UNIT_CLUSTERS) {
             let tail_start = end / UNIT_CLUSTERS * UNIT_CLUSTERS;
-            if runs.iter().any(|run| run.vcn + run.clusters > tail_start && run.lcn.is_none()) {
-                return Err(corrupt(0, "partial final compression unit must contain raw data only"));
+            if runs
+                .iter()
+                .any(|run| run.vcn + run.clusters > tail_start && run.lcn.is_none())
+            {
+                return Err(corrupt(
+                    0,
+                    "partial final compression unit must contain raw data only",
+                ));
             }
         }
         // A physical prefix can be fragmented, but once a unit becomes sparse
@@ -48,7 +58,10 @@ impl CompressedStorage {
                 && pair[1].lcn.is_some()
                 && !pair[1].vcn.is_multiple_of(UNIT_CLUSTERS)
             {
-                return Err(corrupt(0, "physical cluster follows sparse padding within a compressed unit"));
+                return Err(corrupt(
+                    0,
+                    "physical cluster follows sparse padding within a compressed unit",
+                ));
             }
         }
         Ok(Self {
@@ -69,7 +82,8 @@ impl CompressedStorage {
     ) -> Result<()> {
         checkpoint(cx)?;
         output.fill(0);
-        let initialized_count = initialized.saturating_sub(offset).min(output.len() as u64) as usize;
+        let initialized_count =
+            initialized.saturating_sub(offset).min(output.len() as u64) as usize;
         let mut done = 0;
         while done < initialized_count {
             checkpoint(cx)?;
@@ -87,15 +101,20 @@ impl CompressedStorage {
                 let mut packed = buffer(plan.stored_bytes)?;
                 read_spans(source, cx, &plan.spans, 0, &mut packed)?;
                 checkpoint(cx)?;
-                let decoded = decompress_unit(&packed, self.unit_bytes)
-                    .map_err(|error| parse(&error))?;
+                let decoded =
+                    decompress_unit(&packed, self.unit_bytes).map_err(|error| parse(&error))?;
                 checkpoint(cx)?;
                 // Validate all initialized bytes in this unit, not just the
                 // particular requested prefix. Early termination is corruption,
                 // never a reason to synthesize missing initialized data.
-                let required = initialized.saturating_sub(unit_start).min(self.unit_bytes as u64) as usize;
+                let required = initialized
+                    .saturating_sub(unit_start)
+                    .min(self.unit_bytes as u64) as usize;
                 if decoded.len() < required {
-                    return Err(corrupt(unit_start, "LZNT1 data ends before the initialized unit boundary"));
+                    return Err(corrupt(
+                        unit_start,
+                        "LZNT1 data ends before the initialized unit boundary",
+                    ));
                 }
                 destination.copy_from_slice(&decoded[within..within + count]);
             }
@@ -110,23 +129,34 @@ impl CompressedStorage {
     fn plan(&self, geometry: &NtfsGeometry, cx: &Cx, unit_start: u64) -> Result<UnitPlan> {
         let cluster_bytes = u64::from(geometry.cluster_bytes());
         let mut vcn = unit_start / cluster_bytes;
-        let end = vcn.checked_add(UNIT_CLUSTERS)
+        let end = vcn
+            .checked_add(UNIT_CLUSTERS)
             .ok_or_else(|| corrupt(unit_start, "compression-unit VCN overflow"))?
             .min(self.mapped_clusters);
         if vcn >= end {
-            return Err(corrupt(unit_start, "compression unit starts beyond mapped data"));
+            return Err(corrupt(
+                unit_start,
+                "compression unit starts beyond mapped data",
+            ));
         }
         let logical_bytes = ((end - vcn) * cluster_bytes) as usize;
-        let mut index = self.runs.partition_point(|run| run.vcn <= vcn).checked_sub(1)
+        let mut index = self
+            .runs
+            .partition_point(|run| run.vcn <= vcn)
+            .checked_sub(1)
             .ok_or_else(|| corrupt(unit_start, "missing compression-unit mapping"))?;
         let mut spans = Vec::new();
         let mut stored_bytes = 0;
         let mut sparse = false;
         while vcn < end {
             checkpoint(cx)?;
-            let run = self.runs.get(index)
+            let run = self
+                .runs
+                .get(index)
                 .ok_or_else(|| corrupt(unit_start, "short compression-unit mapping"))?;
-            let run_end = run.vcn.checked_add(run.clusters)
+            let run_end = run
+                .vcn
+                .checked_add(run.clusters)
                 .ok_or_else(|| corrupt(unit_start, "compression run overflow"))?;
             if vcn < run.vcn || vcn >= run_end {
                 return Err(corrupt(unit_start, "gap in compression-unit mapping"));
@@ -134,11 +164,17 @@ impl CompressedStorage {
             let count = run_end.min(end) - vcn;
             if let Some(lcn) = run.lcn {
                 if sparse {
-                    return Err(corrupt(unit_start, "data follows a compressed unit's sparse suffix"));
+                    return Err(corrupt(
+                        unit_start,
+                        "data follows a compressed unit's sparse suffix",
+                    ));
                 }
-                let physical_cluster = lcn.checked_add(vcn - run.vcn)
+                let physical_cluster = lcn
+                    .checked_add(vcn - run.vcn)
                     .ok_or_else(|| corrupt(unit_start, "compressed physical offset overflow"))?;
-                let offset = geometry.cluster_offset(physical_cluster).map_err(|error| parse(&error))?;
+                let offset = geometry
+                    .cluster_offset(physical_cluster)
+                    .map_err(|error| parse(&error))?;
                 let bytes = (count * cluster_bytes) as usize;
                 spans.push(Span { offset, bytes });
                 stored_bytes += bytes;
@@ -148,7 +184,11 @@ impl CompressedStorage {
             vcn += count;
             index += 1;
         }
-        Ok(UnitPlan { spans, stored_bytes, logical_bytes })
+        Ok(UnitPlan {
+            spans,
+            stored_bytes,
+            logical_bytes,
+        })
     }
 }
 
@@ -171,7 +211,9 @@ fn read_spans(
         }
         let count = (output.len() - done).min(span.bytes - skip);
         if count != 0 {
-            let offset = span.offset.checked_add(skip as u64)
+            let offset = span
+                .offset
+                .checked_add(skip as u64)
                 .ok_or_else(|| corrupt(span.offset, "compressed span offset overflow"))?;
             source.read(cx, offset, &mut output[done..done + count])?;
             done += count;
@@ -182,7 +224,10 @@ fn read_spans(
         }
     }
     if done != output.len() {
-        return Err(corrupt(0, "compressed unit spans do not cover requested bytes"));
+        return Err(corrupt(
+            0,
+            "compressed unit spans do not cover requested bytes",
+        ));
     }
     checkpoint(cx)
 }
