@@ -64,11 +64,14 @@ permission to interpret them as a required config field.
 Regular block pointers retain native sizes, birth, object type, byte order and
 DVAs. The physical reader checks vdev identity, allocation size, sector alignment,
 all-copy bounds and boot/label exclusions before issuing data I/O. Physical bytes
-are checked with Fletcher2, Fletcher4 or SHA256 before transformation. Native
-LZJB, ZLE and length-prefixed ZFS LZ4 decode to the exact declared logical length;
-short output, invalid backreferences, overflow and unsupported codecs fail.
-SHA256 words and Fletcher input order follow the native format, independently
-of the host and of the block-pointer container's byte order.
+are checked with Fletcher2, Fletcher4, SHA256 or SHA-512/256 before transformation.
+Native LZJB, ZLE and length-prefixed ZFS LZ4 decode to the exact declared logical
+length; short output, invalid backreferences, overflow and unsupported codecs fail.
+Fletcher inputs use the block's payload byte order, independently of the host
+and the block-pointer container. SHA256 keeps its historical big-endian numeric
+checksum words. Native checksum 11 (`sha512`) uses SHA-512/256 and interprets
+each standard digest word in the block's payload byte order. SHA-512/256 uses
+its own initialization values.
 
 Embedded DATA pointers carry up to 112 compressed bytes inside the pointer
 itself. Their native payload consists of fourteen numeric words, excluding the
@@ -413,3 +416,27 @@ embedded numeric words, token ranges and malformed fixture expectations. Rust
 compilation/tests, formatting, workspace checks, Clippy, UBS and native ZFS
 execution remain unavailable with the executor offline. The reference checks
 do not execute the Rust decoder or establish native interoperability.
+
+## Native SHA-512/256 validation
+
+Six regressions use NIST short and 112-byte known answers in both native word
+orders, preserve SHA256's historical representation, and exercise complete
+physical-sector decoding across all four container/payload order combinations.
+They also cover truncated or damaged payloads, damaged and swapped checksum
+words, incorrect payload-order bits, unsupported checksum algorithms and the
+existing input-size budget. This uses the existing sha2 dependency. Native
+SHA512 is a dataset feature rather than a label MOS feature; checksum support
+does not add a label feature requirement or relax the existing allowlist.
+
+Delivery evidence (2026-10-11): complete blob comparisons, independent source
+review, exact known-answer/message comparison and independent byte-order fixture
+checks. Rust compilation/tests, formatting, workspace checks, Clippy, UBS and
+native ZFS execution remain unavailable with the executor offline. Authored
+regressions and reference checks are not passing Rust or interoperability results.
+
+References: [NIST SHA-512/256 examples](https://csrc.nist.gov/CSRC/media/Projects/Cryptographic-Standards-and-Guidelines/documents/examples/SHA512_256.pdf),
+and OpenZFS `zfs-2.3.0`
+[`sha2_zfs.c`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zfs/sha2_zfs.c),
+[`zio_checksum.c`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zfs/zio_checksum.c),
+[`zfeature_common.c`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zcommon/zfeature_common.c)
+and [`sha2_test.c`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/tests/zfs-tests/cmd/checksum/sha2_test.c).

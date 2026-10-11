@@ -7,7 +7,7 @@
 pub mod nvlist;
 
 use ffs_types::ParseError;
-use sha2::{Digest, Sha256};
+use sha2::{Digest, Sha256, Sha512_256};
 
 pub const LABEL_BYTES: u64 = 256 * 1024;
 pub const LABEL_CONFIG_OFFSET: u64 = 16 * 1024;
@@ -90,12 +90,26 @@ fn sha_words(bytes: &[u8]) -> [u64; 4] {
     })
 }
 
+/// OpenZFS SHA512/256 stores standard digest bytes directly in native words.
+/// Each word follows the producing block's payload order, not its container.
+fn sha512_words(bytes: &[u8], order: Endian) -> [u64; 4] {
+    let digest = Sha512_256::digest(bytes);
+    std::array::from_fn(|index| {
+        let raw = std::array::from_fn(|i| digest[index * 8 + i]);
+        match order {
+            Endian::Little => u64::from_le_bytes(raw),
+            Endian::Big => u64::from_be_bytes(raw),
+        }
+    })
+}
+
 pub fn checksum(bytes: &[u8], algorithm: u8, order: Endian) -> Result<[u64; 4], ParseError> {
     if bytes.len() > MAX_BLOCK_BYTES {
         return Err(invalid("checksum input exceeds block budget"));
     }
     match algorithm {
         8 => Ok(sha_words(bytes)),
+        11 => Ok(sha512_words(bytes, order)),
         7 => {
             if !bytes.len().is_multiple_of(4) {
                 return Err(invalid("unaligned Fletcher4 input"));
@@ -308,7 +322,7 @@ impl BlockPointer {
         if self.physical_bytes() > self.logical_bytes() {
             return Err(invalid("physical block exceeds logical block size"));
         }
-        if !matches!(self.checksum_type(), 6..=8)
+        if !matches!(self.checksum_type(), 6..=8 | 11)
             || !matches!(self.compression(), 2 | 3 | 14 | 15)
         {
             return Err(invalid("unsupported block checksum or compression"));
@@ -586,6 +600,9 @@ fn copy_match(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod sha512_tests;
 
 #[cfg(test)]
 mod tests;

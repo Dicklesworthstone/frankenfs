@@ -907,4 +907,15 @@ cover both byte orders and malformed streams. Rust/build/fmt/Clippy/UBS and
 native-image execution remain unavailable with the executor offline; no
 executed native parity credit is added. See `docs/ZFS_READ_PROFILE.md`.
 
+### ZFS native SHA-512/256 block checksums
+
+The physical block pipeline admits native checksum 11 using the existing sha2
+dependency. Digest words follow the payload byte order, independently of the
+pointer container; SHA256 retains its native historical convention. Known-answer
+and block-dispatch regressions cover numeric word order, data/checksum damage
+and unsupported neighboring algorithms. Source/reference checks are recorded
+in `docs/ZFS_READ_PROFILE.md`; Rust/build/fmt/Clippy/UBS and native-image execution
+remain unavailable with the executor offline, so no executed parity credit is
+added.
+
 Details and commands: `docs/NTFS_READ_PROFILE.md` and `docs/FAT_READ_PROFILE.md`.
