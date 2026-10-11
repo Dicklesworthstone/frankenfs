@@ -935,3 +935,20 @@ stored DEFLATE vectors, all native levels, both byte orders and failure bounds.
 Source/reference checks are documented in `docs/ZFS_READ_PROFILE.md`.
 Rust/build/fmt/Clippy/UBS and native-image execution remain unavailable with the
 executor offline, so no executed parity credit is added.
+
+### FAT16/FAT32 lossless native catalog and extraction
+
+`ffs-fat catalog` reports exact short-name bytes and assembled UTF-16 long names,
+including names unavailable to the host-path projection. Validated root-to-entry
+`--entry-slots` selectors reach nested directories and extract regular files
+without choosing an OEM code page or replacing native units. Parent membership,
+complete directory parsing, ancestor checks and existing file-allocation/EOF
+validation prevent arbitrary image offsets from becoming file identities.
+Raw name separators are checked before display decoding.
+
+Three parser/CLI and seven constructed image regressions cover both dialects,
+lossless name cases, invalid selectors and structural failures, allocation tails,
+cancellation and image immutability. Source/fixture review and exact blob
+comparisons completed. Rust/build/fmt/Clippy/UBS and native-image execution remain
+unavailable with the executor offline; no executed parity credit is added.
+See `docs/FAT_READ_PROFILE.md`.

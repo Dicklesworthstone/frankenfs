@@ -586,5 +586,368 @@ fn directory_tail_validation_propagates_cancellation_before_publishing_names() {
     }
 }
 
+fn slot_selector(offsets: &[usize]) -> crate::EntrySlots {
+    crate::EntrySlots::parse(
+        &offsets
+            .iter()
+            .map(usize::to_string)
+            .collect::<Vec<_>>()
+            .join(","),
+    )
+    .unwrap()
+}
+
+fn write_native_lfn(
+    image: &mut Image,
+    start: usize,
+    alias: &[u8; 11],
+    units: &[u16],
+    cluster: u32,
+) -> usize {
+    let count = units.len().div_ceil(13);
+    let checksum = ffs_ondisk::fat::short_name_checksum(alias);
+    for index in 0..count {
+        let ordinal = count - index;
+        let position = start + index * 32;
+        let slot = &mut image.bytes[position..position + 32];
+        slot.fill(0);
+        slot[0] = ordinal as u8 | if index == 0 { 0x40 } else { 0 };
+        slot[11] = 0x0F;
+        slot[13] = checksum;
+        for (unit_index, offset) in [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30]
+            .into_iter()
+            .enumerate()
+        {
+            let at = (ordinal - 1) * 13 + unit_index;
+            let unit = units
+                .get(at)
+                .copied()
+                .unwrap_or(if at == units.len() { 0 } else { 0xFFFF });
+            slot[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
+        }
+    }
+    let position = start + count * 32;
+    image.record(position, alias, cluster, 4, false);
+    image.set_link(cluster, image.end());
+    position
+}
+
+#[test]
+fn native_catalog_and_extraction_preserve_oem_surrogates_and_long_utf8_names() {
+    let cx = Cx::for_testing();
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        let mut image = Image::new(kind);
+        let base = image.base;
+        let root = image.root_location();
+        let subdir = image.cluster(3);
+        image.bytes[root] = 0x82;
+        image.bytes[root + 32] = 0x83;
+        image.bytes[subdir + 64] = 0x05;
+        let raw = write_native_lfn(
+            &mut image,
+            root + 96,
+            b"RAW     BIN",
+            &[0xD800, 0x0061],
+            12,
+        );
+        let wide = vec![0x4E00; 100];
+        let long = write_native_lfn(&mut image, root + 160, b"LONG    BIN", &wide, 13);
+        for (cluster, bytes) in [(12, b"RAW!"), (13, b"UTF8")] {
+            let at = image.cluster(cluster);
+            image.bytes[at..at + 4].copy_from_slice(bytes);
+        }
+        let volume = image.volume();
+        assert!(matches!(
+            volume.resolve(&cx, "/HELLO.TXT"),
+            Err(FfsError::UnsupportedFeature(_))
+        ));
+        let catalog =
+            crate::native_catalog(&cx, &volume, &crate::EntrySlots::default(), base as u64)
+                .unwrap();
+        assert_eq!(catalog["entry_offset_origin"], "selected_volume");
+        assert_eq!(catalog["volume_offset"], base as u64);
+        assert!(catalog["directory_entry_slots"].is_null());
+        let entries = catalog["entries"].as_array().unwrap();
+        assert_eq!(entries.len(), 5);
+        assert_eq!(entries[0]["short_name_bytes"][0], 0x82);
+        assert!(entries[0]["name"].is_null());
+        assert!(entries[0]["short_alias"].is_null());
+        assert_eq!(entries[3]["long_name_utf16"], serde_json::json!([0xD800, 0x0061]));
+        assert!(entries[3]["name"].is_null());
+        assert_eq!(entries[4]["long_name_utf16"], serde_json::json!(wide));
+        assert!(entries[4]["name"].is_null());
+        for entry in [0, 1, 3, 4] {
+            assert!(entries[entry]["display_error"].as_str().is_some());
+        }
+        for (index, offset, expected) in [
+            (0, root - base, payload()),
+            (2, root + 64 - base, Vec::new()),
+            (3, raw - base, b"RAW!".to_vec()),
+            (4, long - base, b"UTF8".to_vec()),
+        ] {
+            let encoded = entries[index]["entry_slots"].as_str().unwrap();
+            assert_eq!(encoded, offset.to_string());
+            let selector = crate::EntrySlots::parse(encoded).unwrap();
+            let mut output = Vec::new();
+            crate::extract_slots(&cx, &volume, &selector, &mut output).unwrap();
+            assert_eq!(output, expected, "{kind:?}: {encoded}");
+        }
+        let directory = crate::EntrySlots::parse(entries[1]["entry_slots"].as_str().unwrap())
+            .unwrap();
+        let nested = crate::native_catalog(&cx, &volume, &directory, base as u64).unwrap();
+        let entry = &nested["entries"][0];
+        let expected = format!("{},{}", root + 32 - base, subdir + 64 - base);
+        assert_eq!(entry["entry_slots"], expected);
+        assert_eq!(entry["short_name_bytes"][0], 0x05);
+        assert!(entry["name"].is_null());
+        let selected = crate::EntrySlots::parse(entry["entry_slots"].as_str().unwrap()).unwrap();
+        let mut output = Vec::new();
+        crate::extract_slots(&cx, &volume, &selected, &mut output).unwrap();
+        assert_eq!(output, b"FAT!");
+        assert!(matches!(
+            slot_selector(&[root + 96 - base]).resolve(&cx, &volume),
+            Err(FfsError::NotFound(_))
+        ));
+    }
+}
+
+#[test]
+fn native_slots_reject_nonmembers_deleted_labels_dot_entries_and_end_marker_slack() {
+    let cx = Cx::for_testing();
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        let mut image = Image::new(kind);
+        let base = image.base;
+        let root = image.root_location();
+        let subdir = image.cluster(3);
+        image.record(root + 96, b"VOLUME     ", 0, 0, false);
+        image.bytes[root + 96 + 11] = 0x08;
+        image.record(root + 128, b"DELETED TXT", 0, 0, false);
+        image.bytes[root + 128] = 0xE5;
+        image.bytes[root + 160] = 0x41;
+        image.bytes[root + 160 + 11] = 0x0F;
+        // The live namespace ends at +192. These plausible records after it
+        // and in an unrelated data cluster must never become extractable.
+        image.record(root + 224, b"SLACK   TXT", 5, 1029, false);
+        let forged = image.cluster(13);
+        image.record(forged, b"FORGED  TXT", 5, 1029, false);
+        let volume = FatVolume::from_device(
+            &cx,
+            Box::new(Memory {
+                bytes: Arc::new(image.bytes),
+                reads: Arc::new(AtomicUsize::new(0)),
+                fail_at: Some(forged as u64),
+            }),
+            base as u64,
+            image.length as u64,
+        )
+        .unwrap();
+        for offsets in [
+            vec![0],
+            vec![root + 96 - base],
+            vec![root + 128 - base],
+            vec![root + 160 - base],
+            vec![root + 192 - base],
+            vec![root + 224 - base],
+            vec![forged - base],
+            vec![subdir + 64 - base],
+            vec![root + 32 - base, root - base],
+            vec![root + 32 - base, subdir - base],
+            vec![root + 32 - base, subdir + 32 - base],
+        ] {
+            let mut output = Vec::new();
+            assert!(
+                matches!(
+                    crate::extract_slots(&cx, &volume, &slot_selector(&offsets), &mut output),
+                    Err(FfsError::NotFound(_))
+                ),
+                "{kind:?}: {offsets:?}"
+            );
+            assert!(output.is_empty());
+        }
+        let mut output = Vec::new();
+        assert!(matches!(
+            crate::extract_slots(
+                &cx,
+                &volume,
+                &slot_selector(&[root - base, subdir + 64 - base]),
+                &mut output,
+            ),
+            Err(FfsError::NotDirectory)
+        ));
+        for selector in [
+            crate::EntrySlots::default(),
+            slot_selector(&[root + 32 - base]),
+        ] {
+            assert!(matches!(
+                crate::extract_slots(&cx, &volume, &selector, &mut output),
+                Err(FfsError::IsDirectory)
+            ));
+        }
+        assert!(output.is_empty());
+        assert!(matches!(
+            crate::native_catalog(&cx, &volume, &slot_selector(&[root - base]), base as u64),
+            Err(FfsError::NotDirectory)
+        ));
+    }
+}
+
+#[test]
+fn native_slot_resolution_rejects_directory_ancestor_links() {
+    let cx = Cx::for_testing();
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        let mut image = Image::new(kind);
+        let base = image.base;
+        let root = image.root_location();
+        let subdir = image.cluster(3);
+        image.record(subdir + 64, b"BACK       ", 3, 0, true);
+        let volume = image.volume();
+        let selector = slot_selector(&[root + 32 - base, subdir + 64 - base]);
+        assert!(matches!(
+            selector.resolve(&cx, &volume),
+            Err(FfsError::Corruption { .. })
+        ));
+        assert!(matches!(
+            crate::native_catalog(&cx, &volume, &selector, base as u64),
+            Err(FfsError::Corruption { .. })
+        ));
+    }
+}
+
+#[test]
+fn native_catalog_keeps_structural_record_and_name_corruption_fatal() {
+    let cx = Cx::for_testing();
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        for bad_name in [false, true] {
+            let mut image = Image::new(kind);
+            let base = image.base;
+            let root = image.root_location();
+            if bad_name {
+                write_native_lfn(
+                    &mut image,
+                    root + 96,
+                    b"BAD     BIN",
+                    &[0x0041, 0x002F, 0x0042],
+                    12,
+                );
+            } else {
+                image.bytes[root + 32 + 11] = 0xC0;
+            }
+            let volume = image.volume();
+            assert!(matches!(
+                crate::native_catalog(
+                    &cx,
+                    &volume,
+                    &crate::EntrySlots::default(),
+                    base as u64
+                ),
+                Err(FfsError::Corruption { .. })
+            ));
+            let mut output = Vec::new();
+            // A valid early slot cannot bypass damage later in its parent.
+            assert!(matches!(
+                crate::extract_slots(
+                    &cx,
+                    &volume,
+                    &slot_selector(&[root - base]),
+                    &mut output,
+                ),
+                Err(FfsError::Corruption { .. })
+            ));
+            assert!(output.is_empty());
+        }
+    }
+}
+
+#[test]
+fn native_extraction_validates_allocation_and_directory_tails_before_output() {
+    let cx = Cx::for_testing();
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        for damage in 0..4 {
+            let mut image = Image::new(kind);
+            let base = image.base;
+            let root = image.root_location();
+            let subdir = image.cluster(3);
+            let selector = if damage == 3 {
+                image.set_link(3, 4);
+                image.set_link(4, 0);
+                slot_selector(&[root + 32 - base, subdir + 64 - base])
+            } else {
+                match damage {
+                    0 => image.set_link(7, 9),
+                    1 => image.set_link(5, image.end()),
+                    _ => image.set_copy_link(1, 5, image.end()),
+                }
+                slot_selector(&[root - base])
+            };
+            let volume = image.volume();
+            let mut output = Vec::new();
+            assert!(
+                matches!(
+                    crate::extract_slots(&cx, &volume, &selector, &mut output),
+                    Err(FfsError::Corruption { .. })
+                ),
+                "{kind:?}: damage {damage}"
+            );
+            assert!(output.is_empty());
+        }
+    }
+}
+
+#[test]
+fn native_extraction_propagates_payload_cancellation() {
+    let cx = Cx::for_testing();
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        let image = Image::new(kind);
+        let selector = slot_selector(&[image.root_location() - image.base]);
+        let fail_at = image.cluster(9) as u64;
+        let volume = FatVolume::from_device(
+            &cx,
+            Box::new(Memory {
+                bytes: Arc::new(image.bytes),
+                reads: Arc::new(AtomicUsize::new(0)),
+                fail_at: Some(fail_at),
+            }),
+            image.base as u64,
+            image.length as u64,
+        )
+        .unwrap();
+        let mut output = Vec::new();
+        assert!(matches!(
+            crate::extract_slots(&cx, &volume, &selector, &mut output),
+            Err(FfsError::Cancelled)
+        ));
+        assert!(output.is_empty());
+    }
+}
+
+#[test]
+fn native_catalog_and_extraction_leave_file_images_and_adjacent_bytes_unchanged() {
+    let cx = Cx::for_testing();
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        let mut image = Image::new(kind);
+        let root = image.root_location();
+        image.bytes[root] = 0x82;
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("native-names.img");
+        std::fs::write(&path, &image.bytes).unwrap();
+        let volume =
+            FatVolume::open(&cx, &path, image.base as u64, Some(image.length as u64)).unwrap();
+        let catalog = crate::native_catalog(
+            &cx,
+            &volume,
+            &crate::EntrySlots::default(),
+            image.base as u64,
+        )
+        .unwrap();
+        let selector =
+            crate::EntrySlots::parse(catalog["entries"][0]["entry_slots"].as_str().unwrap())
+                .unwrap();
+        let mut output = Vec::new();
+        crate::extract_slots(&cx, &volume, &selector, &mut output).unwrap();
+        assert_eq!(output, payload());
+        assert_eq!(std::fs::read(&path).unwrap(), image.bytes);
+    }
+}
+
 mod check;
 mod filesystem;

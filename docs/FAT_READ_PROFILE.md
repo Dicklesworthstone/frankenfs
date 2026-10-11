@@ -18,6 +18,12 @@ target/debug/ffs-fat check volume.img
 target/debug/ffs-fat ls volume.img /nested
 target/debug/ffs-fat cat volume.img '/Long native filename.txt' > extracted.bin
 
+# Lossless native catalog; copy entry_slots from the returned JSON.
+target/debug/ffs-fat catalog volume.img
+# These offsets are examples; use the selector belonging to your immutable image.
+target/debug/ffs-fat catalog volume.img --entry-slots 20992
+target/debug/ffs-fat extract volume.img --entry-slots 20992,22592 > extracted.bin
+
 # The directory must already exist and be empty. No other program may write
 # the backing image for the lifetime of this mount.
 target/debug/ffs-fat mount volume.img /mnt/fat --offline-image --uid 1000 --gid 1000
@@ -31,8 +37,8 @@ target/debug/ffs-fat check disk.img --offset 1048576 --length 67108864
 All image opens are read-only. There is no write, repair, recovery, format,
 resize, or protection-initialization path. Shared advisory locks do not exclude
 kernel mounts or unrelated writers; image immutability is a caller requirement.
-`cat` validates allocation before output, but a later storage failure may still
-leave a previously streamed prefix on stdout and exits unsuccessfully.
+`cat` and `extract` validate allocation before output, but a later storage failure
+may still leave a previously streamed prefix on stdout and exits unsuccessfully.
 
 ## Implemented boundaries
 
@@ -60,10 +66,12 @@ individual file allocation maps at 8,388,608 clusters; individual reads at
 chain caches at 1,024 files and 32 MiB of cluster addresses. These are admission
 and resource limits, not assertions of full FAT parity.
 
-Names use lossless UTF-8 LFNs and ASCII short names; non-ASCII OEM-only names,
-unpaired UTF-16 surrogates and names exceeding the host's 255-byte limit are
-refused rather than silently altered. Comparisons fold ASCII only, not Windows
-Unicode collation. Permissions/ownership are explicit read-only Unix projections.
+Path commands and mounts use lossless UTF-8 LFNs and ASCII short names;
+non-ASCII OEM-only names, unpaired UTF-16 surrogates and names exceeding the
+host's 255-byte limit have no admitted path spelling. The native catalog and
+entry-slot extraction below can access those names without conversion.
+Comparisons fold ASCII only, not Windows Unicode collation. Permissions/ownership
+are explicit read-only Unix projections.
 Native timestamps use a deterministic UTC projection of FAT wall-clock fields;
 the format records no timezone, so this projection does not recover the original
 instant. Creation preserves its native 10 ms precision (including odd seconds),
@@ -76,6 +84,39 @@ repairs them automatically.
 
 FAT12, exFAT, FAT writes/recovery, complete OEM/Unicode naming parity, integrated
 MVCC/RaptorQ protection, and NTFS/ZFS implementation remain separate work.
+
+## Lossless native catalog and extraction
+
+`catalog` lists the root by default. Each live ordinary entry includes its raw
+11-byte short name, optional assembled UTF-16 LFN, optional lossless display name
+and display error, attributes, file size, first cluster, and an exact `entry_slots`
+selector. Non-ASCII OEM bytes are retained without assuming a code page; the
+native 0x05 short-name escape is retained. Unpaired UTF-16 units and names whose
+UTF-8 representation exceeds the host limit remain accessible through selectors.
+
+A selector is a comma-separated root-to-entry chain of decimal short-entry byte
+offsets. Offsets are relative to the selected FAT volume, including when `--offset`
+and `--length` select a volume inside a larger image. They are valid only for that
+same immutable image; changing the image can change the identity at a slot.
+`catalog --entry-slots ...` lists a selected directory, and
+`extract --entry-slots ...` streams a selected regular file through the existing
+allocation, EOF, read-size and cancellation checks.
+
+Every selector component must occur in the complete parsed directory selected
+by its preceding components. Arbitrary image offsets, deleted/LFN/volume-label
+slots, native dot entries, records after the directory-end marker, non-directory
+intermediates and ancestor cycles cannot select file contents. Native units are
+checked for invalid path separators before any display conversion, so an unpaired
+surrogate cannot hide another malformed name component. Existing structural
+parser failures remain fatal; the normal reader's short-alias fallback for an
+invalid LFN sequence remains unchanged. The checker continues to report those
+LFN defects separately.
+
+Selectors admit at most 256 components, each a 32-byte-aligned u64 offset, with a
+5,375-byte input bound. Existing directory and allocation-map budgets still apply.
+A requested slot does not stop validation early: damaged later entries or allocated
+directory tails fail before file output. Cataloging does not certify file payloads
+or perform the full allocation/namespace check described below.
 
 ## Read-only allocation check
 
@@ -182,3 +223,14 @@ and invalid-field error locations. The calendar constants were independently
 checked with JavaScript date conversion, and the source received a second review.
 Rust tests, formatting, workspace checks, Clippy and UBS remain unexecuted because
 the authoring executor is offline. No new native-image or mounted result is claimed.
+
+**Native name access increment (2026-10-11):** three parser/CLI tests and seven
+constructed image regressions cover FAT16 and FAT32, OEM bytes and the native
+0x05 escape, unpaired surrogates, host-overlong UTF-8, nested selectors, nonmember
+and deleted entries, label/LFN/dot/end-marker slack, ancestor links, raw separator
+corruption, damaged allocation and directory tails, cancellation, and unchanged
+images including adjacent volume bytes. Existing test assertions are preserved.
+Independent source/fixture review and exact GitHub blob comparisons completed;
+Rust compilation/tests, formatting, Clippy, UBS and native-image execution remain
+unavailable while the executor is offline. These tests are not executed native
+or mounted parity evidence.
