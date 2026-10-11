@@ -308,7 +308,9 @@ impl BlockPointer {
         if self.physical_bytes() > self.logical_bytes() {
             return Err(invalid("physical block exceeds logical block size"));
         }
-        if !matches!(self.checksum_type(), 6..=8) || !matches!(self.compression(), 2 | 3 | 15) {
+        if !matches!(self.checksum_type(), 6..=8)
+            || !matches!(self.compression(), 2 | 3 | 14 | 15)
+        {
             return Err(invalid("unsupported block checksum or compression"));
         }
         if self.compression() == 2 && self.physical_bytes() != self.logical_bytes() {
@@ -466,6 +468,35 @@ pub fn decompress(
                 }
             }
         }
+        14 => {
+            // OpenZFS zle.c uses parameter 64. Reaching the logical block
+            // length ends the stream; physical padding belongs to the
+            // caller's checksum and is not interpreted as more tokens.
+            let mut at = 0;
+            while output.len() < output_bytes {
+                let token = *input.get(at).ok_or_else(|| invalid("truncated ZLE token"))?;
+                at += 1;
+                let length = if token < 64 {
+                    usize::from(token) + 1
+                } else {
+                    usize::from(token) - 63
+                };
+                if length > output_bytes - output.len() {
+                    return Err(invalid("ZLE run exceeds output bound"));
+                }
+                if token < 64 {
+                    let end = at + length;
+                    output.extend_from_slice(
+                        input
+                            .get(at..end)
+                            .ok_or_else(|| invalid("truncated ZLE literals"))?,
+                    );
+                    at = end;
+                } else {
+                    output.resize(output.len() + length, 0);
+                }
+            }
+        }
         15 => {
             let header: [u8; 4] = input
                 .get(..4)
@@ -558,6 +589,9 @@ fn copy_match(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod zle_tests;
 
 #[cfg(test)]
 mod embedded_tests {

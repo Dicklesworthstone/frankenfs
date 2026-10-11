@@ -65,7 +65,7 @@ Regular block pointers retain native sizes, birth, object type, byte order and
 DVAs. The physical reader checks vdev identity, allocation size, sector alignment,
 all-copy bounds and boot/label exclusions before issuing data I/O. Physical bytes
 are checked with Fletcher2, Fletcher4 or SHA256 before transformation. Native
-LZJB and length-prefixed ZFS LZ4 decode to the exact declared logical length;
+LZJB, ZLE and length-prefixed ZFS LZ4 decode to the exact declared logical length;
 short output, invalid backreferences, overflow and unsupported codecs fail.
 SHA256 words and Fletcher input order follow the native format, independently
 of the host and of the block-pointer container's byte order.
@@ -76,12 +76,20 @@ property word and logical birth word; bytes are extracted least-significant
 first even when the pointer's containing block is big-endian. Logical and packed
 lengths are byte counts, not sector counts. Only level-zero, unencrypted,
 non-deduplicated DATA pointers are admitted, with no embedded DNODE/OBJSET
-blocks, reserved subtype or redacted-data interpretation. Uncompressed, LZJB
-and ZFS LZ4 payloads must reconstruct the exact bounded logical size. The parent
+blocks, reserved subtype or redacted-data interpretation. Uncompressed, LZJB,
+ZLE and ZFS LZ4 payloads must reconstruct the exact bounded logical size. The parent
 block's checksum protects these bytes; there is no fabricated child checksum
 or physical DVA read. A reached embedded pointer requires the native
 `com.delphix:embedded_data` label feature as well as the ordinary dnode
 type/size/birth checks before decoded bytes may enter the view's cache.
+
+Native ZLE (codec 14) uses literal runs of 1..64 bytes and zero runs of
+1..192 bytes. Every complete run must fit the declared logical output, and a
+short stream cannot invent missing bytes. Decoding stops at the logical block
+end, as in OpenZFS; trailing physical padding is still covered by the block's
+checksum. The same decoder serves physical and embedded blocks, so ordinary
+files, snapshots and mounted reads inherit the admitted codec without another
+path or a native library dependency.
 
 A bad physical read, checksum or transform can try another declared copy on the
 same leaf. Cancellation propagates immediately and cannot turn into a redundant
@@ -381,9 +389,27 @@ review and restored bytes do not replace those runtime gates.
 Reference: OpenZFS tag zfs-2.3.0, especially spa.h, vdev_impl.h,
 uberblock_impl.h, dnode.h, dmu_objset.h, zap_impl.h, dsl_dir.h, dsl_dataset.h,
 zap_leaf.h, zap_leaf.c, zap_micro.c, nvpair.c, zio_checksum.c, sha2_zfs.c,
-lzjb.c, lz4_zfs.c, sa_impl.h, sa.c, zfs_sa.c and zfs_znode.h.
+lzjb.c, zle.c, zio_compress.c, lz4_zfs.c, sa_impl.h, sa.c, zfs_sa.c and zfs_znode.h.
 Embedded layout and decoding contracts come from the same pinned tag's
 [spa.h](https://github.com/openzfs/zfs/blob/zfs-2.3.0/include/sys/spa.h),
 [blkptr.c](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zfs/blkptr.c),
 [zio.c](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zfs/zio.c) and
 [zfeature_common.c](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zcommon/zfeature_common.c).
+
+## Native ZLE validation
+
+Six focused regressions cover all 256 token values, fixed mixed literal/zero
+payloads, every truncated input prefix, output limits, physical checksum
+verification including padding, and checksum-valid malformed streams. Physical
+and embedded block dispatch are exercised in all four combinations of pointer
+container and logical payload byte order. Existing embedded feature, historical
+birth, image immutability and read-budget checks remain in their shared paths.
+
+Delivery evidence (2026-10-11): independent source review against pinned OpenZFS
+[`zle.c`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zfs/zle.c) and
+[`zio_compress.c`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zfs/zio_compress.c),
+complete blob comparisons, and JavaScript reference checks of the fixed payload,
+embedded numeric words, token ranges and malformed fixture expectations. Rust
+compilation/tests, formatting, workspace checks, Clippy, UBS and native ZFS
+execution remain unavailable with the executor offline. The reference checks
+do not execute the Rust decoder or establish native interoperability.

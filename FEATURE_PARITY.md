@@ -897,4 +897,14 @@ comparison. Rust tests, formatting, workspace checks, Clippy and UBS remain
 unexecuted with the authoring executor offline; no native or mounted parity
 credit is added.
 
+### ZFS native ZLE reads
+
+Native codec 14 now decodes bounded literal and zero runs through physical and
+embedded block paths, extending ordinary file, snapshot and mounted reads.
+Complete output is required; physical padding remains checksum-protected.
+Six parser/block regressions and independent source/reference-fixture checks
+cover both byte orders and malformed streams. Rust/build/fmt/Clippy/UBS and
+native-image execution remain unavailable with the executor offline; no
+executed native parity credit is added. See `docs/ZFS_READ_PROFILE.md`.
+
 Details and commands: `docs/NTFS_READ_PROFILE.md` and `docs/FAT_READ_PROFILE.md`.
