@@ -41,6 +41,18 @@ impl ImageArgs {
         Leaf::open(cx, &self.image, self.offset, self.length).context("opening selected ZFS leaf")
     }
 }
+#[derive(Debug, Args)]
+struct CandidateArgs {
+    #[command(flatten)]
+    image: ImageArgs,
+    #[arg(long)]
+    label: usize,
+    #[arg(long)]
+    slot: usize,
+    /// Expected pool GUID; this does not authorize automatic TXG selection.
+    #[arg(long)]
+    pool_guid: u64,
+}
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Inventory checksum-valid configurations and uberblock candidates, not pool authority.
@@ -60,6 +72,40 @@ enum Command {
         #[arg(long)]
         pool_guid: u64,
     },
+    /// Inspect one native MOS dnode and its exact bonus bytes.
+    Object {
+        #[command(flatten)]
+        candidate: CandidateArgs,
+        number: u64,
+    },
+    /// Extract an explicit raw DMU range, not a ZPL file or inferred logical EOF.
+    ObjectRead {
+        #[command(flatten)]
+        candidate: CandidateArgs,
+        number: u64,
+        #[arg(long, default_value_t = 0)]
+        start: u64,
+        /// Required explicit count; maximum 16 MiB.
+        #[arg(long)]
+        bytes: usize,
+    },
+    /// Enumerate a complete micro-ZAP object; unsupported fat-ZAPs are errors.
+    Zap {
+        #[command(flatten)]
+        candidate: CandidateArgs,
+        number: u64,
+    },
+    /// Inventory DSL head datasets beneath this MOS; no import, snapshots or mount.
+    Datasets {
+        #[command(flatten)]
+        candidate: CandidateArgs,
+    },
+}
+fn json(value: &serde_json::Value) -> Result<()> {
+    let mut out = io::stdout().lock();
+    serde_json::to_writer_pretty(&mut out, value)?;
+    writeln!(out)?;
+    Ok(())
 }
 fn main() -> Result<()> {
     let cli = Cli::parse();
@@ -132,6 +178,49 @@ fn main() -> Result<()> {
             out.write_all(&root.data)?;
             out.flush()?;
         }
+        Command::Object { candidate, number } => {
+            let leaf = candidate.image.open(&cx)?;
+            let mut view = leaf.objects(&cx, candidate.label, candidate.slot, candidate.pool_guid)?;
+            let node = view.object(&cx, number)?;
+            json(&serde_json::json!({"object": number, "txg": view.txg,
+                "object_type": node.object_type(), "bonus_type": node.bonus_type(),
+                "slots": node.slots(), "levels": node.levels(), "data_block_bytes": node.data_bytes(),
+                "max_block_id": node.max_block(), "used_bytes": node.used_bytes(),
+                "byte_order": format!("{:?}", node.order()), "bonus": node.bonus(),
+                "has_spill": node.spill().is_some(),
+                "scope": "native MOS dnode metadata; allocation geometry is not file EOF"}))?;
+        }
+        Command::ObjectRead { candidate, number, start, bytes } => {
+            let leaf = candidate.image.open(&cx)?;
+            let mut view = leaf.objects(&cx, candidate.label, candidate.slot, candidate.pool_guid)?;
+            let data = view.read(&cx, number, start, bytes)?;
+            let mut out = io::stdout().lock();
+            out.write_all(&data)?;
+            out.flush()?;
+        }
+        Command::Zap { candidate, number } => {
+            let leaf = candidate.image.open(&cx)?;
+            let mut view = leaf.objects(&cx, candidate.label, candidate.slot, candidate.pool_guid)?;
+            let entries: Vec<_> = view.zap(&cx, number)?.into_iter().map(|entry| serde_json::json!({
+                "name": std::str::from_utf8(&entry.name).ok(), "name_bytes": entry.name,
+                "value": entry.value, "collision": entry.collision
+            })).collect();
+            json(&serde_json::json!({"object": number, "txg": view.txg, "entries": entries}))?;
+        }
+        Command::Datasets { candidate } => {
+            let leaf = candidate.image.open(&cx)?;
+            let mut view = leaf.objects(&cx, candidate.label, candidate.slot, candidate.pool_guid)?;
+            let datasets: Vec<_> = view.datasets(&cx)?.into_iter().map(|entry| {
+                let name = entry.components.iter().map(|part| std::str::from_utf8(part))
+                    .collect::<std::result::Result<Vec<_>, _>>().ok().map(|parts| parts.join("/"));
+                serde_json::json!({"relative_name": name, "components_bytes": entry.components,
+                    "directory_object": entry.directory_object, "dataset_object": entry.dataset_object,
+                    "guid": entry.guid.to_string(), "creation_txg": entry.creation_txg,
+                    "flags": entry.flags, "objectset_kind": entry.objectset_kind, "root_birth": entry.root_birth})
+            }).collect();
+            json(&serde_json::json!({"pool_guid": candidate.pool_guid.to_string(), "txg": view.txg,
+                "datasets": datasets, "scope": "verified DSL head inventory; no snapshots, import or ZPL mount"}))?;
+        }
     }
     Ok(())
 }
@@ -177,5 +266,18 @@ mod tests {
             (image.offset, image.length, label, slot, pool_guid),
             (1_048_576, Some(67_108_864), 2, 3, 123)
         );
+    }
+    #[test]
+    fn object_commands_require_root_identity_and_explicit_range_length() {
+        let base = ["ffs-zfs", "object-read", "leaf.img", "7", "--offline-image",
+            "--label", "0", "--slot", "2", "--pool-guid", "123"];
+        assert!(Cli::try_parse_from(base).is_err());
+        let args: Vec<_> = base.into_iter().chain(["--start", "510", "--bytes", "1026"]).collect();
+        let cli = Cli::try_parse_from(args).unwrap();
+        let Command::ObjectRead { number, start, bytes, .. } = cli.command else { panic!("object-read"); };
+        assert_eq!((number, start, bytes), (7, 510, 1026));
+        assert!(Cli::try_parse_from(["ffs-zfs", "datasets", "leaf.img", "--offline-image"]).is_err());
+        assert!(Cli::try_parse_from(["ffs-zfs", "datasets", "leaf.img", "--offline-image", "--label", "0",
+            "--slot", "2", "--pool-guid", "123"]).is_ok());
     }
 }

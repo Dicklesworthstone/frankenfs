@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Compare ffs-zfs root bytes with zdb on NEW, isolated, exported file pools.
+"""Compare ffs-zfs root bytes and DSL heads with native tools on NEW exported pools.
 
 Requires an explicit scratch-pool opt-in and already-built candidate. Never
 accepts an existing image, uses force/destroy/import, mounts a dataset or deletes
@@ -31,6 +31,20 @@ def digest(path: Path) -> str:
         for block in iter(lambda: stream.read(1024 * 1024), b""):
             result.update(block)
     return result.hexdigest()
+
+
+def head_identities(report: dict, pool: str) -> dict[str, str]:
+    """Do not let duplicate candidate rows disappear in a dict comprehension."""
+    result = {}
+    for row in report["datasets"]:
+        relative = row["relative_name"]
+        require(isinstance(relative, str), "native fixture name was not losslessly represented")
+        name = pool + ("/" + relative if relative else "")
+        require(name not in result, "candidate returned duplicate dataset names")
+        require(row["objectset_kind"] == 2, "native filesystem was reported as another object-set kind")
+        require(str(row["guid"]).isdecimal() and int(row["guid"]) > 0, "invalid candidate dataset GUID")
+        result[name] = str(row["guid"])
+    return result
 
 
 def main() -> None:
@@ -80,6 +94,14 @@ def main() -> None:
                 guid = command("zpool", "get", "-H", "-o", "value", "guid", pool).decode().strip()
                 require(guid.isdecimal() and int(guid) > 0, "native pool GUID was not a decimal identity")
                 command("zfs", "create", "-o", "mountpoint=none", pool + "/data")
+                command("zfs", "create", "-o", "mountpoint=none", pool + "/data/nested")
+                native_heads = {}
+                rows = command("zfs", "list", "-H", "-r", "-t", "filesystem,volume", "-o", "name,guid", pool)
+                for row in rows.decode("utf-8", errors="strict").splitlines():
+                    name, identity = row.split("\t")
+                    require(name not in native_heads and identity.isdecimal(), "invalid native dataset identity listing")
+                    native_heads[name] = identity
+                require(set(native_heads) == {pool, pool + "/data", pool + "/data/nested"}, "native dataset fixture incomplete")
                 command("zpool", "export", pool)
                 active = False
                 before = digest(image)
@@ -112,6 +134,10 @@ def main() -> None:
                 actual = command(binary, "root", image, "--offline-image", "--label", "0",
                                  "--slot", str(slot), "--pool-guid", guid)
                 require(actual == expected, "candidate root differs byte-for-byte from zdb")
+                heads = json.loads(command(binary, "datasets", image, "--offline-image", "--label", "0",
+                                           "--slot", str(slot), "--pool-guid", guid))
+                require(head_identities(heads, pool) == native_heads, "candidate DSL names/GUIDs differ from native zfs list")
+                require(heads["txg"] == selected["txg"], "candidate DSL view changed the selected TXG")
                 require(digest(image) == before, "read verification changed the exported image")
                 partitioned = directory / "partitioned.img"
                 with partitioned.open("xb") as target, image.open("rb") as source:
@@ -122,10 +148,13 @@ def main() -> None:
                 actual = command(binary, "root", partitioned, "--offline-image", "--offset", "1048576",
                                  "--length", str(image.stat().st_size), "--label", "0", "--slot", str(slot), "--pool-guid", guid)
                 require(actual == expected, "partition base changed native offset-verifier or DVA semantics")
+                heads = json.loads(command(binary, "datasets", partitioned, "--offline-image", "--offset", "1048576",
+                                           "--length", str(image.stat().st_size), "--label", "0", "--slot", str(slot), "--pool-guid", guid))
+                require(head_identities(heads, pool) == native_heads, "partition base changed DSL identities")
                 require(digest(partitioned) == partition_hash, "candidate changed selected or adjacent partition bytes")
                 scenario = {"ashift": ashift, "pool_guid": guid, "slot": slot, "txg": selected["txg"],
                             "root_sha256": hashlib.sha256(expected).hexdigest(), "image_sha256": before,
-                            "partitioned_sha256": partition_hash, "status": "passed"}
+                            "partitioned_sha256": partition_hash, "datasets": native_heads, "status": "passed"}
                 report["scenarios"].append(scenario)
                 print(json.dumps(scenario), flush=True)
             finally:

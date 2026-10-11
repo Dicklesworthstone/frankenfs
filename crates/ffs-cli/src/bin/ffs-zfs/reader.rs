@@ -1,6 +1,8 @@
 //! Offline ZFS label discovery and explicit single-leaf MOS-root extraction.
 //! No pool import, TXG selection, log replay, device writes or host path following.
 
+pub mod dmu;
+
 use asupersync::Cx;
 use ffs_block::ByteDevice;
 use ffs_error::{FfsError, Result};
