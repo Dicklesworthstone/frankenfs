@@ -1222,6 +1222,7 @@ dependencies = [
  "crc32c",
  "criterion",
  "ffs-types",
+ "flate2",
  "proptest",
  "rustc-hash",
  "serde",

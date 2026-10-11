@@ -919,3 +919,19 @@ remain unavailable with the executor offline, so no executed parity credit is
 added.
 
 Details and commands: `docs/NTFS_READ_PROFILE.md` and `docs/FAT_READ_PROFILE.md`.
+
+### ZFS native GZIP reads
+
+Native compression IDs 5..13 now decode zlib-framed gzip-1 through gzip-9 through
+the shared physical and embedded block pipeline, extending ordinary files,
+snapshots and read-only mounts. The existing flate2/zlib-rs dependency uses a
+fixed logical-size output buffer and requires the complete stream, valid
+Adler-32 and exact output length. Physical padding remains checksum-protected;
+dictionary requests, other framing, malformed streams and unsupported codecs
+remain refused.
+
+Seven parser/block regressions cover independently specified fixed, dynamic and
+stored DEFLATE vectors, all native levels, both byte orders and failure bounds.
+Source/reference checks are documented in `docs/ZFS_READ_PROFILE.md`.
+Rust/build/fmt/Clippy/UBS and native-image execution remain unavailable with the
+executor offline, so no executed parity credit is added.

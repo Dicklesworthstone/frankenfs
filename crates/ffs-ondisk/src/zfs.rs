@@ -7,6 +7,7 @@
 pub mod nvlist;
 
 use ffs_types::ParseError;
+use flate2::{Decompress, FlushDecompress, Status};
 use sha2::{Digest, Sha256, Sha512_256};
 
 pub const LABEL_BYTES: u64 = 256 * 1024;
@@ -323,7 +324,7 @@ impl BlockPointer {
             return Err(invalid("physical block exceeds logical block size"));
         }
         if !matches!(self.checksum_type(), 6..=8 | 11)
-            || !matches!(self.compression(), 2 | 3 | 14 | 15)
+            || !matches!(self.compression(), 2 | 3 | 5..=15)
         {
             return Err(invalid("unsupported block checksum or compression"));
         }
@@ -482,6 +483,21 @@ pub fn decompress(
                 }
             }
         }
+        5..=13 => {
+            // Native gzip-1 through gzip-9 use zlib framing and Adler-32,
+            // not gzip members. Decode into exactly the admitted LSIZE:
+            // Finish must reach END and verify the trailer even when the
+            // output buffer is full. Bytes after that first stream are
+            // allocation padding, already covered by the caller's checksum.
+            output.resize(output_bytes, 0);
+            let mut decoder = Decompress::new(true);
+            let status = decoder
+                .decompress(input, &mut output, FlushDecompress::Finish)
+                .map_err(|_| invalid("invalid ZFS gzip zlib stream"))?;
+            if status != Status::StreamEnd || decoder.total_out() != output_bytes as u64 {
+                return Err(invalid("incomplete ZFS gzip stream or logical length mismatch"));
+            }
+        }
         14 => {
             // OpenZFS zle.c uses parameter 64. Reaching the logical block
             // length ends the stream; physical padding belongs to the
@@ -600,6 +616,9 @@ fn copy_match(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod gzip_tests;
 
 #[cfg(test)]
 mod sha512_tests;

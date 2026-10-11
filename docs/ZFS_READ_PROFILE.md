@@ -65,8 +65,9 @@ Regular block pointers retain native sizes, birth, object type, byte order and
 DVAs. The physical reader checks vdev identity, allocation size, sector alignment,
 all-copy bounds and boot/label exclusions before issuing data I/O. Physical bytes
 are checked with Fletcher2, Fletcher4, SHA256 or SHA-512/256 before transformation.
-Native LZJB, ZLE and length-prefixed ZFS LZ4 decode to the exact declared logical
-length; short output, invalid backreferences, overflow and unsupported codecs fail.
+Native LZJB, gzip-1 through gzip-9, ZLE and length-prefixed ZFS LZ4 decode to the
+exact declared logical length; short output, invalid backreferences, overflow
+and unsupported codecs fail.
 Fletcher inputs use the block's payload byte order, independently of the host
 and the block-pointer container. SHA256 keeps its historical big-endian numeric
 checksum words. Native checksum 11 (`sha512`) uses SHA-512/256 and interprets
@@ -80,8 +81,8 @@ first even when the pointer's containing block is big-endian. Logical and packed
 lengths are byte counts, not sector counts. Only level-zero, unencrypted,
 non-deduplicated DATA pointers are admitted, with no embedded DNODE/OBJSET
 blocks, reserved subtype or redacted-data interpretation. Uncompressed, LZJB,
-ZLE and ZFS LZ4 payloads must reconstruct the exact bounded logical size. The parent
-block's checksum protects these bytes; there is no fabricated child checksum
+gzip-1 through gzip-9, ZLE and ZFS LZ4 payloads must reconstruct the exact bounded
+logical size. The parent block's checksum protects these bytes; there is no fabricated child checksum
 or physical DVA read. A reached embedded pointer requires the native
 `com.delphix:embedded_data` label feature as well as the ordinary dnode
 type/size/birth checks before decoded bytes may enter the view's cache.
@@ -93,6 +94,16 @@ end, as in OpenZFS; trailing physical padding is still covered by the block's
 checksum. The same decoder serves physical and embedded blocks, so ordinary
 files, snapshots and mounted reads inherit the admitted codec without another
 path or a native library dependency.
+
+Native gzip-1 through gzip-9 (codecs 5..13) use RFC 1950 zlib framing, with
+DEFLATE and its Adler-32 trailer, rather than RFC 1952 gzip members. The existing
+flate2/zlib-rs dependency decodes into a fixed buffer of exactly the admitted
+logical size. Success requires the complete first zlib stream and exact output
+length; missing or damaged trailers, dictionaries, overrun and short output
+fail. Bytes after that stream are physical padding, still covered by the full
+physical-block checksum; a second stream is never concatenated to fill LSIZE.
+The shared decoder reaches ordinary file, snapshot and mounted reads for both
+physical and embedded blocks. No label feature requirement is added.
 
 A bad physical read, checksum or transform can try another declared copy on the
 same leaf. Cancellation propagates immediately and cannot turn into a redundant
@@ -440,3 +451,30 @@ and OpenZFS `zfs-2.3.0`
 [`zio_checksum.c`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zfs/zio_checksum.c),
 [`zfeature_common.c`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zcommon/zfeature_common.c)
 and [`sha2_test.c`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/tests/zfs-tests/cmd/checksum/sha2_test.c).
+
+## Native GZIP validation
+
+Seven regressions cover all nine native compression IDs with independently
+specified fixed-Huffman, dynamic-Huffman and stored-block zlib vectors. They
+exercise exact output length, every proper input prefix, Adler-32 failures,
+dictionary requests, wrong framing, invalid DEFLATE, concatenated-stream tails,
+input/output budgets, and physical/embedded dispatch in all four combinations
+of pointer-container and payload byte order. Complete physical-sector checksums
+remain mandatory, including padding bytes. Existing admission and tests are
+retained.
+
+Delivery evidence (2026-10-11): complete blob comparisons, independent source
+review against the pinned implementations below, and separate JavaScript
+DEFLATE/framing/Adler-32 fixture checks. Rust compilation/tests, formatting,
+workspace checks, Clippy, UBS and native ZFS execution remain unavailable with
+the executor offline. Reference checks and authored tests do not execute the
+Rust decoder or establish native interoperability. The dependency version and
+backend already exist in the workspace; only ffs-ondisk's dependency edge is new.
+
+References: OpenZFS `zfs-2.3.0`
+[gzip.c](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zfs/gzip.c),
+zlib `v1.3.1`
+[uncompr.c](https://github.com/madler/zlib/blob/v1.3.1/uncompr.c) and
+[infcover.c](https://github.com/madler/zlib/blob/v1.3.1/test/infcover.c),
+and flate2 `1.1.9`
+[mem.rs](https://github.com/rust-lang/flate2-rs/blob/1.1.9/src/mem.rs).

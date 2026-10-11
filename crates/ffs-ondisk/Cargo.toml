@@ -15,6 +15,8 @@ smallvec = { workspace = true }
 # btrfs SHA256 and BLAKE2b-256 checksums (csum_type 2 and 3).
 sha2 = { workspace = true }
 blake2 = { workspace = true }
+# Native ZFS gzip-1 through gzip-9 use the existing zlib-rs backend.
+flate2 = { workspace = true }
 
 [dev-dependencies]
 rustc-hash = "2"
