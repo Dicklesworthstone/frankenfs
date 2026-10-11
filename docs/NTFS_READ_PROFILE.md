@@ -9,7 +9,9 @@ indexes and resolves paths using the image's own UpCase table. Ordinary native
 LZNT1-compressed nonresident DATA uses the same numeric and path read commands.
 Relative native symbolic links can be resolved inside the image or presented
 through the mounted `readlink` operation. Reparse metadata remains inspectable
-for providers whose file contents are not supported.
+for providers whose file contents are not supported. Native security descriptors
+can be inspected or extracted by MFT record identity through the shared $Secure
+catalog or a legacy SECURITY_DESCRIPTOR attribute.
 
 ## Commands
 
@@ -27,6 +29,8 @@ ffs-ntfs read volume.img /nested/file.txt --offline-image --stream-utf16 d800,00
 ffs-ntfs readlink volume.img /nested/link --offline-image
 ffs-ntfs record volume.img 24 --offline-image
 ffs-ntfs streams volume.img 24 --offline-image --sequence 7
+ffs-ntfs security volume.img 24 --offline-image --sequence 7
+ffs-ntfs security volume.img 24 --offline-image --raw > descriptor.bin
 ffs-ntfs cat volume.img 24 --offline-image > extracted.bin
 ffs-ntfs cat volume.img 24 --offline-image --stream note > alternate.bin
 ffs-ntfs cat volume.img 24 --offline-image --stream-utf16 d800,0061 > native-name.bin
@@ -308,6 +312,62 @@ not exclude a kernel mount or an unrelated writer. The image must remain
 unchanged for the whole mount lifetime; cached metadata is not live coherence.
 The mounted implementation has not yet been executed in the authoring environment.
 
+## Native security descriptor inspection
+
+`ffs-ntfs security IMAGE RECORD --offline-image [--sequence N]` resolves the
+selected file's native security descriptor and reports its exact bytes,
+descriptor control flags, owner and group SIDs, and SACL/DACL presence,
+offset, revision and ACE count. The report identifies either the shared
+`secure_sds` source with its security ID, native hash and SDS offset, or the
+legacy `security_descriptor_attribute` source. Optional partition
+`--offset` and `--length` limits apply through the existing image reader.
+`--raw` writes only the exact self-relative descriptor bytes, without JSON
+or the surrounding SDS entry header.
+
+The reader validates STANDARD_INFORMATION from the complete base/extension
+catalog. A nonzero native security ID is resolved through record 9, $Secure,
+using its $SII index and $SDS stream. Legacy 48-byte STANDARD_INFORMATION, or
+a zero security ID in the extended form, uses the unnamed
+SECURITY_DESCRIPTOR attribute. Extension identities, sequence numbers, mapping
+continuations and resident/nonresident streams retain the existing catalog
+validation.
+
+The shared-index traversal validates the complete reachable $SII tree before
+returning a match. It checks ULONG collation, key and entry-header agreement,
+strict key ordering and parent ranges, INDX update-sequence fixups, allocated
+bitmap membership, cycles and shared children. An iterative traversal limits
+the path to 32 child levels, 16,384 index blocks, 65,536 keys and 64 MiB of
+index reads. Index allocation and bitmap streams must be initialized and
+untransformed. SDS may contain unmapped gaps outside the selected descriptor;
+the selected primary and duplicate ranges must be physically mapped and
+initialized.
+
+Each SDS entry starts on a 16-byte boundary and stays within its native
+256 KiB section. The reader validates its length, security ID, hash and primary
+offset against $SII, then reads the duplicate 256 KiB later. Both copies must
+be byte-identical, including their headers, before descriptor bytes are
+returned. The native rotating-word hash is checked over the descriptor.
+An inconsistent or missing copy fails the operation; this command performs
+no repair and chooses no preferred copy.
+
+The self-relative descriptor parser requires revision 1, valid bounded and
+aligned component offsets, native SID bounds, and supported ACL revisions
+with complete ACE envelopes. It preserves SID authority and subauthority
+values, all descriptor bytes and opaque ACE bodies. Absent ACLs, NULL ACLs
+and present empty ACLs remain distinct in JSON. Descriptors are bounded to
+128 KiB. Native ACL inspection does not evaluate permissions or map SIDs
+onto host accounts; the mounted view continues to use its existing explicit
+host ownership policy.
+
+Security metadata remains inspectable for files whose DATA requires an
+unsupported provider. This command does not read that file's DATA, bypass
+the DATA provider boundary or implement EFS/WOF/cloud-provider contents.
+All normal offline-image, shared-lock and immutable-image requirements apply.
+
+Native format references:
+[NTFS-3G layout definitions](https://github.com/tuxera/ntfs-3g/blob/2022.10.3/include/ntfs-3g/layout.h)
+and [NTFS-3G security handling](https://github.com/tuxera/ntfs-3g/blob/2022.10.3/libntfs-3g/security.c).
+
 ## Admission limits and exclusions
 
 Only immutable, offline regular files, NTFS 3.1, 512..4096-byte sectors,
@@ -499,3 +559,21 @@ execution remain unavailable with the executor offline.
 
 Native directory semantics: Microsoft,
 [Handling Encrypted Files and Directories](https://learn.microsoft.com/en-us/windows/win32/fileio/handling-encrypted-files-and-directories).
+
+## Native security descriptor validation
+
+Six pure parser, nine constructed image-reader and two CLI/report regressions
+cover legacy and shared descriptors; 48/72-byte STANDARD_INFORMATION; absent,
+NULL and empty ACLs; SIDs and malformed component bounds; fragmented SDS data
+and ATTRIBUTE_LIST continuations; stale record sequences; malformed, cyclic,
+free, unreachable and out-of-range SII children; duplicate/hash/initialized
+length/sparse-range failures; cancellation; unsupported-provider metadata
+inspection; raw descriptor output; and unchanged backing bytes.
+
+Delivery evidence (2026-10-11): complete source and fixture blobs received
+independent review. A separately calculated native rotating-word hash for the
+96-byte descriptor fixture is `f1c75d8c`; mapping-pair and primary/duplicate
+read offsets were checked independently. These calculations do not execute
+the Rust implementation. Rust compilation, the 17 new regressions, formatting,
+workspace checks, Clippy, UBS and native-image or Windows interoperability
+validation remain unexecuted because the authoring executor is offline.

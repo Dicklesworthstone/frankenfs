@@ -101,6 +101,14 @@ enum Command {
         #[command(flatten)]
         file: RecordArgs,
     },
+    /// Retrieve the native security descriptor without projecting host permissions.
+    Security {
+        #[command(flatten)]
+        file: RecordArgs,
+        /// Write exact self-relative descriptor bytes instead of the JSON report.
+        #[arg(long)]
+        raw: bool,
+    },
     /// Show the attributes and native UTF-16 stream names of an in-use MFT record.
     Record {
         #[command(flatten)]
@@ -142,6 +150,32 @@ fn json(value: &serde_json::Value) -> Result<()> {
     serde_json::to_writer_pretty(&mut out, value)?;
     writeln!(out)?;
     Ok(())
+}
+
+fn security_json(info: &reader::security::SecurityDescriptorInfo) -> serde_json::Value {
+    let descriptor = &info.descriptor;
+    let acl = |value: &ffs_ondisk::ntfs_security::NtfsAcl| {
+        serde_json::json!({
+            "present": value.present,
+            "offset": value.offset,
+            "revision": value.revision,
+            "ace_count": value.ace_count,
+        })
+    };
+    serde_json::json!({
+        "source": info.source,
+        "security_id": info.security_id,
+        "hash": info.hash,
+        "sds_offset": info.sds_offset,
+        "descriptor_bytes": info.bytes,
+        "control": descriptor.control,
+        "resource_manager_control": descriptor.resource_manager_control,
+        "owner": descriptor.owner.as_ref().map(ToString::to_string),
+        "group": descriptor.group.as_ref().map(ToString::to_string),
+        "sacl": acl(&descriptor.sacl),
+        "dacl": acl(&descriptor.dacl),
+        "scope": "native security metadata; no access evaluation or host ACL projection",
+    })
 }
 
 fn reparse_json(point: &NtfsReparsePoint) -> serde_json::Value {
@@ -294,6 +328,22 @@ fn main() -> Result<()> {
                 "scope": "complete DATA catalog; metadata admission does not verify payload bytes",
             }))?;
         }
+        Command::Security { file, raw } => {
+            let volume = file.image.open(&cx)?;
+            let record = volume.record(&cx, file.record, file.sequence)?;
+            let info = volume.security_descriptor(&cx, &record)?;
+            if raw {
+                let mut out = io::stdout().lock();
+                out.write_all(&info.bytes)?;
+                out.flush()?;
+            } else {
+                json(&serde_json::json!({
+                    "record": record.number,
+                    "sequence": record.sequence,
+                    "security_descriptor": security_json(&info),
+                }))?;
+            }
+        }
         Command::Record { file } => {
             let volume = file.image.open(&cx)?;
             let record = volume.record(&cx, file.record, file.sequence)?;
@@ -395,6 +445,95 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_security_keeps_native_record_identity_and_requires_offline_image() {
+        assert!(Cli::try_parse_from(["ffs-ntfs", "security", "disk.img", "24"]).is_err());
+        assert!(
+            Cli::try_parse_from(["ffs-ntfs", "security", "disk.img", "--offline-image"]).is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "ffs-ntfs",
+            "security",
+            "disk.img",
+            "24",
+            "--offline-image",
+            "--sequence",
+            "7",
+            "--offset",
+            "1024",
+            "--length",
+            "65536",
+            "--raw",
+        ])
+        .unwrap();
+        let Command::Security { file, raw } = cli.command else {
+            panic!("security");
+        };
+        assert_eq!((file.record, file.sequence), (24, Some(7)));
+        assert_eq!((file.image.offset, file.image.length), (1024, Some(65536)));
+        assert!(raw);
+        let cli = Cli::try_parse_from([
+            "ffs-ntfs",
+            "security",
+            "disk.img",
+            "24",
+            "--offline-image",
+        ])
+        .unwrap();
+        assert!(matches!(cli.command, Command::Security { raw: false, .. }));
+        assert!(
+            Cli::try_parse_from([
+                "ffs-ntfs",
+                "security",
+                "disk.img",
+                "24",
+                "--offline-image",
+                "--rw",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn security_json_preserves_absent_null_and_empty_acl_distinctions() {
+        for (control, acl_bytes, expected_present, expected_count) in [
+            (0x8000_u16, Vec::new(), false, None),
+            (0x8004, Vec::new(), true, None),
+            (0x8004, vec![2, 0, 8, 0, 0, 0, 0, 0], true, Some(0_u16)),
+        ] {
+            let mut bytes = vec![0_u8; 20];
+            bytes[0] = 1;
+            bytes[2..4].copy_from_slice(&control.to_le_bytes());
+            if !acl_bytes.is_empty() {
+                bytes[16..20].copy_from_slice(&20_u32.to_le_bytes());
+                bytes.extend_from_slice(&acl_bytes);
+            }
+            let info = reader::security::SecurityDescriptorInfo {
+                source: "security_descriptor_attribute",
+                security_id: None,
+                hash: None,
+                sds_offset: None,
+                descriptor: ffs_ondisk::ntfs_security::NtfsSecurityDescriptor::parse(&bytes)
+                    .unwrap(),
+                bytes: bytes.clone(),
+            };
+            let report = security_json(&info);
+            assert_eq!(report["descriptor_bytes"], serde_json::json!(bytes));
+            assert_eq!(report["dacl"]["present"], expected_present);
+            assert_eq!(report["dacl"]["ace_count"], serde_json::json!(expected_count));
+            assert_eq!(
+                report["dacl"]["offset"],
+                if acl_bytes.is_empty() { 0 } else { 20 }
+            );
+            assert_eq!(report["sacl"]["present"], false);
+            assert!(report["owner"].is_null());
+            assert!(report["group"].is_null());
+            assert!(report["security_id"].is_null());
+            assert!(report["sds_offset"].is_null());
+        }
+    }
+
     #[test]
     fn cli_readlink_requires_offline_image_and_keeps_the_final_path_literal() {
         assert!(Cli::try_parse_from(["ffs-ntfs", "readlink", "disk.img", "/link"]).is_err());

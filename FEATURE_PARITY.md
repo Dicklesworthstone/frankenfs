@@ -952,3 +952,21 @@ cancellation and image immutability. Source/fixture review and exact blob
 comparisons completed. Rust/build/fmt/Clippy/UBS and native-image execution remain
 unavailable with the executor offline; no executed parity credit is added.
 See `docs/FAT_READ_PROFILE.md`.
+
+### NTFS native security descriptors
+
+`ffs-ntfs security` resolves native file security through the complete
+base/extension catalog, then the bounded $Secure:$SII index and verified
+primary/duplicate $SDS entries, or a legacy SECURITY_DESCRIPTOR attribute.
+It reports lossless descriptor bytes, native SIDs and ACL structure, and
+supports raw extraction by validated MFT record identity. An iterative
+full-tree traversal, allocated-child checks, native hash validation and
+strict initialized-range/component bounds fail on inconsistent metadata.
+Absent, NULL and empty ACLs remain distinct. This is metadata inspection;
+native permission enforcement, SID mapping and mutation remain separate.
+
+Six parser, nine image-reader and two CLI/report regressions are authored
+and independently source-reviewed. Native hash and mapping calculations were
+checked separately. Rust/build/fmt/Clippy/UBS and native-image execution remain
+unavailable with the executor offline; no executed parity credit is added.
+See `docs/NTFS_READ_PROFILE.md`.
