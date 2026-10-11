@@ -1,8 +1,8 @@
 #![forbid(unsafe_code)]
 //! Native read-only ZFS label inspection and explicit MOS-root extraction.
 
-mod reader;
 mod file_commands;
+mod reader;
 
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;

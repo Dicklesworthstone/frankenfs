@@ -8,7 +8,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
 #[derive(Debug, Args)]
-pub(super) struct FileArgs {
+pub struct FileArgs {
     #[command(flatten)]
     candidate: CandidateArgs,
     /// Head dataset name relative to the pool. Empty selects the pool root.
@@ -19,7 +19,7 @@ pub(super) struct FileArgs {
 }
 
 #[derive(Debug, Subcommand)]
-pub(super) enum FileCommand {
+pub enum FileCommand {
     /// List an admitted ZPL directory using native micro/fat-ZAP entries.
     Ls {
         #[command(flatten)]
@@ -45,12 +45,19 @@ pub(super) enum FileCommand {
         file: FileArgs,
     },
 }
-enum Output { List, Stat, Read(u64, Option<u64>), Link }
+enum Output {
+    List,
+    Stat,
+    Read(u64, Option<u64>),
+    Link,
+}
 
 fn metadata_json(number: u64, metadata: &Metadata) -> serde_json::Value {
-    let times: Vec<_> = metadata.times.iter().map(|time| {
-        serde_json::json!({"seconds": time.seconds, "nanoseconds": time.nanos})
-    }).collect();
+    let times: Vec<_> = metadata
+        .times
+        .iter()
+        .map(|time| serde_json::json!({"seconds": time.seconds, "nanoseconds": time.nanos}))
+        .collect();
     serde_json::json!({"object": number, "kind": format!("{:?}", metadata.kind),
         "mode": metadata.mode, "size": metadata.size, "parent": metadata.parent,
         "links": metadata.links, "generation": metadata.generation, "flags": metadata.flags,
@@ -58,15 +65,21 @@ fn metadata_json(number: u64, metadata: &Metadata) -> serde_json::Value {
         "times_access_modify_change_create": times})
 }
 fn dataset_components(name: &str) -> Result<Vec<Vec<u8>>> {
-    if name.is_empty() { return Ok(Vec::new()); }
-    if name.len() > 65_536 { bail!("dataset path is too long"); }
+    if name.is_empty() {
+        return Ok(Vec::new());
+    }
+    if name.len() > 65_536 {
+        bail!("dataset path is too long");
+    }
     let mut result = Vec::new();
     for part in name.split('/') {
         if part.is_empty() || part == "." || part == ".." || part.contains(['\0', '@', '#']) {
             bail!("expected a relative head dataset name, not a snapshot or host path");
         }
         result.push(part.as_bytes().to_vec());
-        if result.len() > 64 { bail!("dataset path is too deep"); }
+        if result.len() > 64 {
+            bail!("dataset path is too deep");
+        }
     }
     Ok(result)
 }
@@ -91,29 +104,42 @@ impl FileCommand {
                     serde_json::json!({"name": std::str::from_utf8(&entry.name).ok(),
                         "name_bytes": entry.name, "metadata": metadata_json(entry.object, &entry.metadata)})
                 }).collect();
-                json(&serde_json::json!({"dataset_guid": view.dataset_guid.to_string(),
-                    "txg": txg, "zpl_version": view.version, "directory_object": object, "entries": entries}))?;
+                json(
+                    &serde_json::json!({"dataset_guid": view.dataset_guid.to_string(),
+                    "txg": txg, "zpl_version": view.version, "directory_object": object, "entries": entries}),
+                )?;
             }
             Output::Stat => {
                 let (metadata, allocated) = view.stat(cx, object)?;
-                json(&serde_json::json!({"dataset_guid": view.dataset_guid.to_string(), "txg": txg,
+                json(
+                    &serde_json::json!({"dataset_guid": view.dataset_guid.to_string(), "txg": txg,
                     "zpl_version": view.version, "metadata": metadata_json(object, &metadata),
-                    "dnode_used_bytes": allocated, "scope": "native metadata; not host ACL enforcement"}))?;
+                    "dnode_used_bytes": allocated, "scope": "native metadata; not host ACL enforcement"}),
+                )?;
             }
             Output::Link => {
                 let bytes = view.readlink(cx, object)?;
-                let mut out = io::stdout().lock(); out.write_all(&bytes)?; out.flush()?;
+                let mut out = io::stdout().lock();
+                out.write_all(&bytes)?;
+                out.flush()?;
             }
             Output::Read(start, bytes) => {
                 let (metadata, _) = view.stat(cx, object)?;
-                if metadata.kind != Kind::Regular { bail!("read requires a regular file; symlinks are not followed"); }
-                let length = metadata.size.saturating_sub(start).min(bytes.unwrap_or(u64::MAX));
+                if metadata.kind != Kind::Regular {
+                    bail!("read requires a regular file; symlinks are not followed");
+                }
+                let length = metadata
+                    .size
+                    .saturating_sub(start)
+                    .min(bytes.unwrap_or(u64::MAX));
                 let mut done = 0_u64;
                 let mut out = io::stdout().lock();
                 while done < length {
                     let count = (length - done).min(1024 * 1024) as usize;
                     let data = view.read(cx, object, start + done, count)?;
-                    if data.len() != count { bail!("ZPL reader returned a short range before validated EOF"); }
+                    if data.len() != count {
+                        bail!("ZPL reader returned a short range before validated EOF");
+                    }
                     out.write_all(&data)?;
                     done += data.len() as u64;
                 }
@@ -131,21 +157,53 @@ mod tests {
     use clap::Parser;
     #[test]
     fn path_commands_retain_explicit_candidate_and_native_file_ranges() {
-        let base = ["ffs-zfs", "read", "leaf.img", "/dir/file.bin", "--offline-image",
-            "--pool-guid", "123", "--label", "0", "--slot", "2", "--dataset", "data"];
-        let args: Vec<_> = base.into_iter().chain(["--start", "510", "--bytes", "600"]).collect();
+        let base = [
+            "ffs-zfs",
+            "read",
+            "leaf.img",
+            "/dir/file.bin",
+            "--offline-image",
+            "--pool-guid",
+            "123",
+            "--label",
+            "0",
+            "--slot",
+            "2",
+            "--dataset",
+            "data",
+        ];
+        let args: Vec<_> = base
+            .into_iter()
+            .chain(["--start", "510", "--bytes", "600"])
+            .collect();
         let parsed = Cli::try_parse_from(args).unwrap();
-        let Command::File(FileCommand::Read { file, start, bytes }) = parsed.command else { panic!("read"); };
-        assert_eq!((file.dataset.as_str(), start, bytes), ("data", 510, Some(600)));
+        let Command::File(FileCommand::Read { file, start, bytes }) = parsed.command else {
+            panic!("read");
+        };
+        assert_eq!(
+            (file.dataset.as_str(), start, bytes),
+            ("data", 510, Some(600))
+        );
         assert_eq!(file.path.as_os_str().as_bytes(), b"/dir/file.bin");
         assert!(Cli::try_parse_from(["ffs-zfs", "read", "leaf.img", "/file"]).is_err());
         assert!(Cli::try_parse_from(base.into_iter().chain(["--rw"])).is_err());
     }
     #[test]
     fn dataset_selection_cannot_be_a_host_path_or_snapshot() {
-        assert!(dataset_components("").unwrap().is_empty());
-        assert_eq!(dataset_components("data/nested").unwrap(), [b"data".to_vec(), b"nested".to_vec()]);
-        for name in ["/data", "data/", "data//nested", "../data", "data@snap", "data#bookmark", "a\0b"] {
+        assert_eq!(dataset_components("").unwrap(), [] as [Vec<u8>; 0]);
+        assert_eq!(
+            dataset_components("data/nested").unwrap(),
+            [b"data".to_vec(), b"nested".to_vec()]
+        );
+        for name in [
+            "/data",
+            "data/",
+            "data//nested",
+            "../data",
+            "data@snap",
+            "data#bookmark",
+            "a\0b",
+        ] {
             assert!(dataset_components(name).is_err(), "{name:?}");
         }
     }
