@@ -1,7 +1,8 @@
 #![forbid(unsafe_code)]
-//! Experimental native FAT16/FAT32 reader. No filesystem mutation is supported.
+//! Experimental native FAT16/FAT32 reader and new-image formatter.
 
 mod filesystem;
+mod formatter;
 mod reader;
 
 use anyhow::{Context, Result, bail};
@@ -17,7 +18,7 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(
     name = "ffs-fat",
-    about = "Read offline FAT16/FAT32 images without modifying them"
+    about = "Read offline FAT16/FAT32 images or create a new empty image"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -243,6 +244,12 @@ fn extract_slots(
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Create a new empty FAT16/FAT32 image and verify it before reporting success.
+    /// Existing files and devices are never formatted.
+    Format {
+        #[command(flatten)]
+        options: formatter::FormatArgs,
+    },
     /// Validate boot geometry, clean-state admission and FAT reserved records.
     Inspect {
         #[command(flatten)]
@@ -314,6 +321,11 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let cx = Cx::for_request();
     match cli.command {
+        Command::Format { options } => {
+            let report = formatter::create(&cx, &options)?;
+            serde_json::to_writer_pretty(io::stdout().lock(), &report)?;
+            println!();
+        }
         Command::Inspect { image } => {
             let volume = image.open(&cx)?;
             let geometry = &volume.geometry;

@@ -986,3 +986,22 @@ lengths, dictionary requirements, memory limits and block integrity in both
 byte orders. Source/fixture review and exact blob comparisons completed.
 Rust/build/fmt/Clippy/UBS and native pool execution remain unavailable with the
 executor offline; no executed parity credit is added. See `docs/ZFS_READ_PROFILE.md`.
+
+### FAT16/FAT32 native new-image creation
+
+`ffs-fat format` creates new empty native FAT16/FAT32 volume images with
+checked geometry, two mirrored allocation tables, fixed/chained roots, native
+labels/serials, and FAT32 boot/FSInfo backups. Atomic exclusive creation refuses
+every existing target. Bounded initialization writes and synchronizes metadata
+before the primary boot sector, verifies exact metadata and complete allocation
+counts through the existing reader/checker on the same locked file, then
+synchronizes the parent directory. Failures retain the new file and report its
+potentially incomplete state. Existing-volume mutation/recovery remains separate.
+
+Eleven regressions cover geometry boundaries, native layout and readback,
+no-overwrite behavior, partial I/O failures, cancellation, synchronization order
+and unexpected allocation. Independent source review and arithmetic comparison
+against a closed-form FAT sizing equation completed. Rust/build/fmt/Clippy/UBS,
+native fsck/mtools and mounted execution remain unavailable with the executor
+offline; no executed native-format or interoperability credit is added.
+See `docs/FAT_READ_PROFILE.md`.
