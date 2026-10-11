@@ -93,8 +93,10 @@ optional in the numeric inspection profile; when present, it must be a unique,
 unnamed, untransformed resident value of the admitted native size. For a
 directory, the ENCRYPTED file attribute specifies the default for new children;
 an unencrypted named directory stream remains readable, while the stream's own
-ENCRYPTED storage flag still requires an EFS provider. The mounted directory
-profile retains its separate admission policy.
+ENCRYPTED storage flag still requires an EFS provider. The mounted view follows
+the same directory-default rule: native directory metadata and unencrypted
+children remain readable, while encrypted files and DATA streams retain their
+provider refusal.
 
 ## Implemented data path
 
@@ -241,8 +243,10 @@ A trailing slash still requires the resolved object to be a directory.
 Numeric `cat`, path reads and mounted file reads enforce the same provider
 boundary. A file carrying reparse metadata cannot expose its own DATA as if it
 were resolved file contents, including named streams or metadata found in an
-extension. EFS-marked STANDARD_INFORMATION is also refused before data I/O,
-even when the DATA attribute itself appears unencrypted. Ordinary native LZNT1
+extension. On regular files, EFS-marked STANDARD_INFORMATION is also refused
+before data I/O, even when the DATA attribute itself appears unencrypted. A
+directory's ENCRYPTED flag describes the default for new children, not encrypted
+directory indexes. Ordinary native LZNT1
 compression remains a separate supported storage form; WOF/system compression
 and cloud placeholders need their own providers.
 
@@ -281,7 +285,8 @@ excluding padding bits and refusing uninitialized, sparse or compressed bitmaps.
 Ownership and modes are deliberately synthetic: configured uid/gid, 0555
 directories, 0444 regular files and 0777 symbolic links. This is NOT native
 SID/DACL enforcement. `allow_other` is disabled. Unresolved reparse providers
-and EFS objects are refused rather than exposed as ordinary plaintext files.
+and encrypted EFS files or DATA streams are refused rather than exposed as
+ordinary plaintext files. An encryption-default directory remains traversable.
 Unrepresentable UTF-16 or names beyond the host's
 255-byte limit cause refusal, not lossy aliases. Use the numeric/JSON CLI for
 forensic metadata that the mounted namespace cannot represent.
@@ -475,3 +480,22 @@ Delivery evidence (2026-10-11): complete source blobs and their changes were
 reviewed independently. Rust compilation, these tests, formatting, Clippy, UBS
 and native-image execution remain unexecuted because the executor is offline.
 No new native interoperability or mounted execution result is claimed.
+
+## Mounted encryption-default directory validation
+
+The mounted adapter applies the native directory ENCRYPTED flag as an
+inheritance default. Directory lookup, enumeration, attributes and reads of
+unencrypted children remain available. Actual encrypted files and DATA storage
+still require an EFS provider and are refused before payload I/O.
+
+Constructed FsOps regressions cover marked directories and plaintext child
+access alongside file-wide and per-stream encrypted refusals. A stream-reader
+regression also feeds the new raw UTF-16 selector into native catalog selection
+and verifies exact bytes without substituting a different native name.
+
+Delivery evidence (2026-10-11): source and fixture review only. Rust compilation,
+these regressions, formatting, workspace checks, Clippy, UBS and native mounted
+execution remain unavailable with the executor offline.
+
+Native directory semantics: Microsoft,
+[Handling Encrypted Files and Directories](https://learn.microsoft.com/en-us/windows/win32/fileio/handling-encrypted-files-and-directories).

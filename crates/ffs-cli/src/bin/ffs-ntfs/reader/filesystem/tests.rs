@@ -1071,3 +1071,135 @@ fn stream_eviction_keeps_the_limit_and_reloads_exact_data() {
     );
     assert_eq!(fs.cache().unwrap().streams.len(), MAX_CACHED_STREAMS);
 }
+
+#[test]
+fn directory_encryption_defaults_preserve_mounts_without_admitting_efs_data() {
+    let cx = Cx::for_testing();
+    for (root_flags, child_flags) in [(0x4000_u32, 0), (0, 0x4000), (0x4000, 0x4000)] {
+        let mut bytes = image();
+        put(
+            &mut bytes,
+            5,
+            &record(
+                5,
+                true,
+                1,
+                &[
+                    standard_with_flags(root_flags),
+                    index(
+                        &[
+                            (24, "hello.txt", 1),
+                            (24, "HELLO~1.TXT", 2),
+                            (26, "packed.bin", 1),
+                            (27, "Subdir", 1),
+                            (28, "Ä.bin", 1),
+                            (29, "mixed", 0),
+                        ],
+                        5,
+                    ),
+                ],
+            ),
+        );
+        let mut directory_stream = resident(DATA, 9, "secret", b"encrypted directory stream");
+        directory_stream[12..14].copy_from_slice(&0x4000_u16.to_le_bytes());
+        put(
+            &mut bytes,
+            27,
+            &record(
+                27,
+                true,
+                1,
+                &[
+                    standard_with_flags(child_flags),
+                    index(&[(24, "link.txt", 1), (25, "payload.bin", 1)], 27),
+                    resident(0x30, 2, "", &filename(5, "Subdir", 1)),
+                    directory_stream,
+                ],
+            ),
+        );
+        // Exercise both stream-level EFS and file-wide EFS with backing data
+        // that must never be read, even through a direct inode READ.
+        for (number, name, namespace, flags, attribute_flags) in [
+            (28, "Ä.bin", 1, 0_u32, 0x4000_u16),
+            (29, "mixed", 0, 0x4000, 0),
+        ] {
+            let mut data = mapped(&[0x21, 1, 0xBC, 2, 0], 1, 512, false);
+            data[12..14].copy_from_slice(&attribute_flags.to_le_bytes());
+            put(
+                &mut bytes,
+                number,
+                &record(
+                    number,
+                    false,
+                    1,
+                    &[
+                        standard_with_flags(flags),
+                        data,
+                        resident(0x30, 2, "", &filename(5, name, namespace)),
+                    ],
+                ),
+            );
+        }
+        let reads: Reads = Arc::default();
+        let fs = open(
+            bytes,
+            Arc::clone(&reads),
+            Some((BASE + 700 * 512) as u64),
+        )
+        .unwrap();
+        let mut scope = RequestScope::empty();
+        assert_eq!(
+            fs.getattr(&cx, &mut scope, ROOT).unwrap().kind,
+            FileType::Directory
+        );
+        let root = fs.readdir(&cx, &mut scope, ROOT, 0).unwrap();
+        assert_eq!(root.len(), 8);
+        assert!(root.iter().any(|entry| entry.name == b"Subdir"));
+        let dir = fs
+            .lookup(&cx, &mut scope, ROOT, OsStr::new("Subdir"))
+            .unwrap();
+        assert_eq!(dir.kind, FileType::Directory);
+        let children = fs.readdir(&cx, &mut scope, dir.ino, 0).unwrap();
+        assert_eq!(children.len(), 4);
+        assert!(children.iter().any(|entry| entry.name == b"payload.bin"));
+        let file = fs
+            .lookup(&cx, &mut scope, dir.ino, OsStr::new("payload.bin"))
+            .unwrap();
+        let mut expected = vec![b'A'; 512];
+        expected.extend([b'B'; 88]);
+        assert_eq!(
+            fs.read(&cx, &mut scope, file.ino, 0, 4096).unwrap(),
+            expected
+        );
+        for (number, name) in [(28_u64, "Ä.bin"), (29, "mixed")] {
+            let ino = fs
+                .inode(NtfsReference {
+                    record: number,
+                    sequence: SEQUENCE,
+                })
+                .unwrap();
+            let metadata = ((BASE + 4 * 512 + number as usize * 1024) as u64, 1024);
+            reads.lock().unwrap().clear();
+            assert!(matches!(
+                fs.lookup(&cx, &mut scope, ROOT, OsStr::new(name)),
+                Err(FfsError::UnsupportedFeature(_))
+            ));
+            assert_eq!(*reads.lock().unwrap(), [metadata]);
+            reads.lock().unwrap().clear();
+            assert!(matches!(
+                fs.read(&cx, &mut scope, ino, 0, 512),
+                Err(FfsError::UnsupportedFeature(_))
+            ));
+            assert_eq!(*reads.lock().unwrap(), [metadata]);
+        }
+        // A directory inheritance default does not permit encrypted named DATA.
+        let native = fs.volume.record(&cx, 27, Some(SEQUENCE)).unwrap();
+        let name: Vec<_> = "secret".encode_utf16().collect();
+        reads.lock().unwrap().clear();
+        assert!(matches!(
+            fs.volume.data_stream(&cx, &native, &name),
+            Err(FfsError::UnsupportedFeature(_))
+        ));
+        assert!(reads.lock().unwrap().is_empty());
+    }
+}

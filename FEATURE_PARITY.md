@@ -873,6 +873,15 @@ Parser and CLI regressions are authored and source-reviewed. Rust execution,
 formatting, workspace checks, Clippy, UBS and native-image validation remain
 unavailable with the executor offline; no execution parity credit is added.
 
+### NTFS mounted encryption-default directories
+
+The read-only mounted view admits native directories whose ENCRYPTED attribute
+sets the default for new children. Directory operations and unencrypted child
+reads retain normal behavior; actual EFS files and encrypted DATA still fail
+before payload I/O. Added FsOps and raw-stream extraction fixtures are
+source-reviewed, with Rust/build/fmt/Clippy/UBS and native mounted execution
+unavailable while the executor is offline. No executed parity credit is added.
+
 ### FAT16/FAT32 native timestamps
 
 Creation date/time and 10 ms increments, access date, and modification date/time

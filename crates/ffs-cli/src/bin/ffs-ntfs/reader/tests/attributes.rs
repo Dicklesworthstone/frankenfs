@@ -187,6 +187,16 @@ fn data_catalog_retains_unreadable_streams_and_lossless_native_names() {
     assert!(streams[2].read_profile.is_ok());
     let public = volume.data_stream(&cx, &record, &[]).unwrap();
     assert_eq!(volume.read(&cx, &public, 0, 100).unwrap(), b"public");
+
+    // The raw CLI selector must reach the exact native name and payload.
+    let native = crate::stream_name::StreamName::parse("d800").unwrap();
+    let selected = volume.data_stream(&cx, &record, native.as_units()).unwrap();
+    assert_eq!(volume.read(&cx, &selected, 0, 100).unwrap(), b"native name");
+    let missing = crate::stream_name::StreamName::parse("d801").unwrap();
+    assert!(matches!(
+        volume.data_stream(&cx, &record, missing.as_units()),
+        Err(FfsError::NotFound(_))
+    ));
 }
 
 #[test]

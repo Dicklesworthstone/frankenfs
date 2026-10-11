@@ -257,7 +257,10 @@ impl NtfsFs {
                 .try_into()
                 .map_err(|_| corrupt(0, "truncated NTFS file attributes"))?,
         );
-        if flags & 0x4000 != 0 {
+        // A directory's ENCRYPTED flag is an inheritance default for new
+        // children. Its index and plaintext children remain readable; actual
+        // encrypted DATA continues to fail native stream admission.
+        if flags & 0x4000 != 0 && !record.is_directory() {
             return Err(unsupported("NTFS encrypted file is not mounted"));
         }
         let (kind, size, blocks) = if let Some(point) = reparse {
