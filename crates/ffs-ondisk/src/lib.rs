@@ -16,6 +16,7 @@ pub mod ntfs;
 pub mod zfs;
 pub mod zfs_dmu;
 pub mod zfs_zap;
+pub mod zfs_zpl;
 
 pub use btrfs::{
     BTRFS_CSUM_FIELD_SIZE, BtrfsChunkEntry, BtrfsCompatRoFeatures, BtrfsDevItem, BtrfsHeader,
