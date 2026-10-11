@@ -37,6 +37,11 @@ fn integer(list: &NvList, name: &str) -> Result<u64> {
         .ok_or_else(|| corrupt(format!("missing or mistyped ZFS config integer {name}")))
 }
 
+fn supported_read_feature(name: &str, value: &Value) -> bool {
+    matches!(name, "org.illumos:lz4_compress" | "com.delphix:embedded_data")
+        && matches!(value, Value::Boolean(true))
+}
+
 struct ReadOnlyImage {
     file: File,
     length: u64,
@@ -117,7 +122,7 @@ impl Label {
                 .list("features_for_read")
                 .ok_or_else(|| corrupt("missing ZFS read-feature catalog"))?;
             for (name, value) in &features.fields {
-                if name != "org.illumos:lz4_compress" || !matches!(value, Value::Boolean(true)) {
+                if !supported_read_feature(name, value) {
                     return Err(unsupported(format!(
                         "unsupported ZFS label read feature {name}"
                     )));

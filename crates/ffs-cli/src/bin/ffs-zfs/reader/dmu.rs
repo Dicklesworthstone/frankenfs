@@ -82,9 +82,9 @@ impl Objects<'_> {
         ceiling: u64,
     ) -> Result<Option<CheckedBlock>> {
         checkpoint(cx)?;
-        if bp.embedded() || bp.protected() {
+        if bp.protected() {
             return Err(unsupported(
-                "embedded or encrypted DMU blocks need their native pipeline",
+                "encrypted DMU blocks need their native pipeline",
             ));
         }
         if bp.birth() > ceiling || bp.birth() > self.txg {
@@ -104,6 +104,18 @@ impl Objects<'_> {
                 "DMU block type, level or size disagrees with its dnode",
             ));
         }
+        if bp.embedded()
+            && (self.config.version != 5000
+                || !self
+                    .config
+                    .read_features
+                    .iter()
+                    .any(|name| name == "com.delphix:embedded_data"))
+        {
+            return Err(unsupported(
+                "embedded DMU block is not declared by the selected label features",
+            ));
+        }
         if let Some(index) = self.cache.iter().position(|(key, _)| key == bp) {
             let item = self
                 .cache
@@ -114,7 +126,13 @@ impl Objects<'_> {
             checkpoint(cx)?;
             return Ok(Some(block));
         }
-        let (bytes, _, _) = self.leaf.read_block(cx, &self.config, bp)?;
+        // The pointer came from a checksum-verified dnode/indirect block.
+        // Embedded words are payload, not DVAs or an independent checksum.
+        let bytes = if bp.embedded() {
+            bp.decode_embedded().map_err(|error| parse(&error))?
+        } else {
+            self.leaf.read_block(cx, &self.config, bp)?.0
+        };
         if bytes.len() != size {
             return Err(corrupt("decoded DMU block has the wrong length"));
         }
@@ -396,3 +414,5 @@ pub struct Dataset {
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod embedded_tests;
