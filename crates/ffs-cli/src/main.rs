@@ -80,10 +80,10 @@ use cmd_inspect::inspect_ext4_output;
 use cmd_repair::{
     DEFAULT_REPAIR_OVERHEAD_RATIO, Ext4RepairStaleness, REPAIR_COORDINATION_SCENARIO_FSCK,
     RepairCoordinationOutput, append_btrfs_repair_detail, block_range_contains,
-    btrfs_repair_tail_free, build_ext4_repair_group_specs, coordinate_repair_write_access,
+    build_ext4_repair_group_specs, coordinate_repair_write_access,
     detect_flavor_with_optional_btrfs_bootstrap, discover_btrfs_repair_group_specs,
-    ext4_repair_tail_free, primary_btrfs_superblock_block, probe_btrfs_repair_staleness,
-    probe_ext4_repair_staleness, recover_btrfs_corrupt_blocks,
+    preflight_btrfs_repair_groups, preflight_ext4_repair_groups, primary_btrfs_superblock_block,
+    probe_btrfs_repair_staleness, probe_ext4_repair_staleness, recover_btrfs_corrupt_blocks,
     recover_primary_btrfs_superblock_from_backup,
     repair_corrupt_btrfs_superblock_mirrors_from_primary, report_has_error_or_higher_for_block,
     scrub_range_for_repair,
@@ -7965,21 +7965,6 @@ impl Drop for MountBackgroundScrubGuard {
     }
 }
 
-/// bd-plamw: log and exclude a group whose repair tail cannot be proven free.
-fn mount_repair_tail_admitted(check: Result<()>) -> bool {
-    match check {
-        Ok(()) => true,
-        Err(error) => {
-            warn!(
-                target: "ffs::cli::mount",
-                reason = %format!("{error:#}"),
-                "mount_background_repair_group_excluded"
-            );
-            false
-        }
-    }
-}
-
 fn build_mount_background_scrub_plan(
     image_path: &Path,
     open_fs: &OpenFs,
@@ -7989,14 +7974,12 @@ fn build_mount_background_scrub_plan(
     if let Some(sb) = open_fs.ext4_superblock() {
         let specs = build_ext4_repair_group_specs(sb)
             .context("failed to compute ext4 repair group layout for mount background scrub")?;
+        if repair_writes_enabled {
+            let group_ids: Vec<_> = specs.iter().map(|spec| spec.group).collect();
+            preflight_ext4_repair_groups(&cx, open_fs, &specs, &group_ids, "mount_startup")?;
+        }
         let groups = specs
             .iter()
-            .filter(|spec| {
-                // bd-plamw: symbols may only be (re)written into a provably
-                // free tail; groups whose tail holds data are left out.
-                !repair_writes_enabled
-                    || mount_repair_tail_admitted(ext4_repair_tail_free(&cx, open_fs, spec))
-            })
             .map(|spec| GroupConfig {
                 layout: spec.layout,
                 source_first_block: spec.source_first_block,
@@ -8034,14 +8017,19 @@ fn build_mount_background_scrub_plan(
         let image_path = image_path.to_path_buf();
         let specs = discover_btrfs_repair_group_specs(&image_path, block_size)
             .context("failed to discover btrfs repair group layout for mount background scrub")?;
+        if repair_writes_enabled {
+            let group_ids: Vec<_> = specs.iter().map(|spec| spec.group).collect();
+            preflight_btrfs_repair_groups(
+                &cx,
+                open_fs,
+                &specs,
+                &group_ids,
+                block_size,
+                "mount_startup",
+            )?;
+        }
         let groups = specs
             .iter()
-            .filter(|spec| {
-                !repair_writes_enabled
-                    || mount_repair_tail_admitted(btrfs_repair_tail_free(
-                        &cx, open_fs, spec, block_size,
-                    ))
-            })
             .map(|spec| GroupConfig {
                 layout: spec.layout,
                 source_first_block: spec.physical_start_block,
@@ -11647,6 +11635,30 @@ mod tests {
         image
     }
 
+    fn repair_tail_test_image_bd_plamw() -> Vec<u8> {
+        let mut image = build_test_ext4_image_with_state(0x0001);
+        image.resize(64 * 4096, 0);
+        let sb = ffs_types::EXT4_SUPERBLOCK_OFFSET;
+        image[sb..sb + 4].copy_from_slice(&256_u32.to_le_bytes());
+        image[sb + 4..sb + 8].copy_from_slice(&64_u32.to_le_bytes());
+        image[sb + 0x0C..sb + 0x10].copy_from_slice(&40_u32.to_le_bytes());
+        image[sb + 0x10..sb + 0x14].copy_from_slice(&256_u32.to_le_bytes());
+        for group in 0..2_usize {
+            let first = u32::try_from(group * 32).unwrap();
+            let descriptor = 4096 + group * 32;
+            image[descriptor..descriptor + 4].copy_from_slice(&(first + 2).to_le_bytes());
+            image[descriptor + 4..descriptor + 8].copy_from_slice(&(first + 3).to_le_bytes());
+            image[descriptor + 8..descriptor + 12].copy_from_slice(&(first + 5).to_le_bytes());
+            image[descriptor + 12..descriptor + 14].copy_from_slice(&20_u16.to_le_bytes());
+            image[descriptor + 14..descriptor + 16].copy_from_slice(&128_u16.to_le_bytes());
+            let bitmap = (group * 32 + 2) * 4096;
+            for bit in (0..4).chain(5..13) {
+                image[bitmap + bit / 8] |= 1 << (bit % 8);
+            }
+        }
+        image
+    }
+
     fn build_test_ext4_image_with_mmp(state: u16, seq: u32) -> Vec<u8> {
         let mut image = build_test_ext4_image_with_state(state);
         let sb_off = ffs_types::EXT4_SUPERBLOCK_OFFSET;
@@ -11937,6 +11949,76 @@ mod tests {
     #[allow(clippy::cast_possible_truncation)]
     fn build_test_btrfs_image_with_root_inode_item() -> Vec<u8> {
         build_test_btrfs_image_with_root_inode_item_for_chunk(0, 512 * 1024, 0, 2)
+    }
+
+    fn build_test_btrfs_repair_image_bd_plamw() -> Vec<u8> {
+        let mut image = build_test_btrfs_image_with_root_inode_item();
+        let fsid = [0x11; 16];
+        let device_uuid = [0x22; 16];
+        let device = ffs_ondisk::BtrfsDevItem {
+            devid: 1,
+            total_bytes: 512 * 1024,
+            bytes_used: 512 * 1024,
+            io_align: 4096,
+            io_width: 4096,
+            sector_size: 4096,
+            dev_type: 0,
+            generation: 11,
+            start_offset: 0,
+            dev_group: 0,
+            seek_speed: 0,
+            bandwidth: 0,
+            uuid: device_uuid,
+            fsid,
+        };
+        let mut device_bytes = [0_u8; ffs_ondisk::btrfs::BTRFS_DEV_ITEM_SIZE];
+        device.write_to_bytes(&mut device_bytes).unwrap();
+        let sb = &mut image[super::BTRFS_SUPER_INFO_OFFSET
+            ..super::BTRFS_SUPER_INFO_OFFSET + super::BTRFS_SUPER_INFO_SIZE];
+        sb[0x20..0x30].copy_from_slice(&fsid);
+        sb[0x58..0x60].copy_from_slice(&0x3_0000_u64.to_le_bytes());
+        sb[0x70..0x78].copy_from_slice(&device.total_bytes.to_le_bytes());
+        sb[0xA4..0xAC].copy_from_slice(&1_u64.to_le_bytes());
+        sb[0xC9..0xC9 + device_bytes.len()].copy_from_slice(&device_bytes);
+        sb[0x32B + 81..0x32B + 97].copy_from_slice(&device_uuid);
+        let chunk_bytes = sb[0x32B + 17..0x32B + 97].to_vec();
+        let checksum = crc32c::crc32c(&sb[0x20..]);
+        sb[..4].copy_from_slice(&checksum.to_le_bytes());
+
+        // The old parser-only fixture has no committed device inventory.
+        // Give these geometry tests a real CHUNK_TREE, so normal admission
+        // must bind the backing device and bootstrap stripe before the test.
+        let chunk_tree = 0x3_0000;
+        write_btrfs_leaf_header(&mut image, chunk_tree, 0x3_0000, 3, 2);
+        write_btrfs_leaf_item(
+            &mut image,
+            chunk_tree,
+            0,
+            ffs_ondisk::btrfs::BTRFS_DEV_ITEMS_OBJECTID,
+            ffs_ondisk::btrfs::BTRFS_DEV_ITEM_KEY,
+            1,
+            3000,
+            u32::try_from(device_bytes.len()).unwrap(),
+        );
+        image[chunk_tree + 3000..chunk_tree + 3000 + device_bytes.len()]
+            .copy_from_slice(&device_bytes);
+        write_btrfs_leaf_item(
+            &mut image,
+            chunk_tree,
+            1,
+            256,
+            228,
+            0,
+            3200,
+            u32::try_from(chunk_bytes.len()).unwrap(),
+        );
+        image[chunk_tree + 3200..chunk_tree + 3200 + chunk_bytes.len()]
+            .copy_from_slice(&chunk_bytes);
+        for tree in [0x4_000, 0x8_000, chunk_tree] {
+            image[tree + 0x20..tree + 0x30].copy_from_slice(&fsid);
+            stamp_btrfs_test_tree_block_crc32c(&mut image, tree);
+        }
+        image
     }
 
     fn encode_btrfs_dir_index_entry(name: &[u8], child_objectid: u64, file_type: u8) -> Vec<u8> {
@@ -14461,6 +14543,172 @@ mod tests {
             "SCENARIO_RESULT|scenario_id=btrfs_device_count_reconciliation|outcome=PASS|checksum={checksum}|ephemeral={ephemeral}|artifacts={}",
             dir.display()
         );
+    }
+
+    #[test]
+    fn repair_tail_whole_plan_refusal_preserves_every_group_bd_plamw() {
+        for missing_layout in [false, true] {
+            let mut image = repair_tail_test_image_bd_plamw();
+            let sb = ffs_ondisk::Ext4Superblock::parse_from_image(&image).unwrap();
+            let mut specs = build_ext4_repair_group_specs(&sb).unwrap();
+            assert_eq!(specs.len(), 2);
+            if missing_layout {
+                specs.pop().unwrap();
+            } else {
+                let (first, _) = crate::cmd_repair::ext4_repair_tail_range(&specs[1]);
+                let bit = usize::try_from(first - 32).unwrap();
+                image[34 * 4096 + bit / 8] |= 1 << (bit % 8);
+            }
+            let dir = tempfile::tempdir().unwrap().keep();
+            let path = dir.join("plan.ext4");
+            std::fs::write(&path, &image).unwrap();
+            let fs = OpenFs::open(&crate::cli_cx(), &path).unwrap();
+            crate::cmd_repair::ext4_repair_tail_free(&crate::cli_cx(), &fs, &specs[0])
+                .expect("the first group really is admissible");
+            let mut limitations = Vec::new();
+            let error = crate::cmd_repair::rebuild_ext4_repair_symbols(
+                &path,
+                sb.block_size,
+                sb.uuid,
+                &specs,
+                &[0, 1],
+                &mut limitations,
+            )
+            .expect_err("the entire plan must fail before writing the first group");
+            let refusal = error
+                .downcast_ref::<crate::cmd_repair::RepairTailRefusal>()
+                .unwrap();
+            assert_eq!(refusal.code, "FFS_REPAIR_TAIL_UNSAFE");
+            assert_eq!(refusal.phase, "symbol_rebuild");
+            assert_eq!(refusal.group, Some(1));
+            assert_eq!(std::fs::read(&path).unwrap(), image);
+            assert_eq!(limitations, [] as [String; 0]);
+
+            if !missing_layout {
+                let error = build_repair_output(
+                    &path,
+                    RepairCommandOptions {
+                        flags: RepairFlags::empty().with_rebuild_symbols(true),
+                        block_group: None,
+                        max_threads: Some(1),
+                    },
+                )
+                .expect_err("explicit rebuild must preflight before recovery");
+                let refusal = error
+                    .downcast_ref::<crate::cmd_repair::RepairTailRefusal>()
+                    .unwrap();
+                assert_eq!(refusal.phase, "before_recovery");
+                assert_eq!(refusal.group, Some(1));
+                assert_eq!(std::fs::read(&path).unwrap(), image);
+            }
+        }
+    }
+
+    #[test]
+    fn repair_tail_safe_plan_rebuilds_and_unsafe_mount_refuses_bd_plamw() {
+        let image = repair_tail_test_image_bd_plamw();
+        let sb = ffs_ondisk::Ext4Superblock::parse_from_image(&image).unwrap();
+        let specs = build_ext4_repair_group_specs(&sb).unwrap();
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("plan.ext4");
+        std::fs::write(&path, &image).unwrap();
+        let cx = crate::cli_cx();
+        let fs = OpenFs::open(&cx, &path).unwrap();
+        assert_eq!(
+            super::build_mount_background_scrub_plan(&path, &fs, true)
+                .unwrap()
+                .groups
+                .len(),
+            2
+        );
+        let mut limitations = Vec::new();
+        assert_eq!(
+            crate::cmd_repair::rebuild_ext4_repair_symbols(
+                &path,
+                sb.block_size,
+                sb.uuid,
+                &specs,
+                &[0, 1, 0],
+                &mut limitations,
+            )
+            .unwrap(),
+            (2, 0)
+        );
+        assert_eq!(limitations, [] as [String; 0]);
+        let after = std::fs::read(&path).unwrap();
+        for spec in &specs {
+            let first = usize::try_from(spec.source_first_block.0).unwrap() * 4096;
+            let end = first + usize::try_from(spec.source_block_count).unwrap() * 4096;
+            assert_eq!(
+                after[first..end],
+                image[first..end],
+                "source bytes must be preserved"
+            );
+        }
+        assert_eq!(
+            crate::cmd_repair::probe_ext4_repair_staleness(&path, sb.block_size, &specs).unwrap(),
+            vec![
+                (0, Ext4RepairStaleness::Fresh),
+                (1, Ext4RepairStaleness::Fresh)
+            ]
+        );
+
+        let mut unsafe_image = after;
+        let (first, _) = crate::cmd_repair::ext4_repair_tail_range(&specs[1]);
+        let bit = usize::try_from(first - 32).unwrap();
+        unsafe_image[34 * 4096 + bit / 8] |= 1 << (bit % 8);
+        std::fs::write(&path, &unsafe_image).unwrap();
+        let fs = OpenFs::open(&cx, &path).unwrap();
+        let detection = super::build_mount_background_scrub_plan(&path, &fs, false).unwrap();
+        assert_eq!(detection.groups.len(), 2, "detection retains unsafe groups");
+        let cfg = MountBackgroundScrubConfig::resolve(
+            MountBackgroundScrubRequest::new(
+                MountAccessMode::ReadOnly,
+                MountBackgroundScrubMode::Auto,
+                MountBackgroundRepairMode::Enabled,
+            ),
+            Some(1),
+            Some(dir.join("repair.jsonl")),
+        )
+        .unwrap();
+        let error = start_mount_background_scrub(&path, &fs, &cfg, None, "unsafe-plan", "bd-plamw")
+            .err()
+            .expect("unsafe mounted repair must not start a worker");
+        let refusal = error
+            .downcast_ref::<crate::cmd_repair::RepairTailRefusal>()
+            .unwrap();
+        assert_eq!(refusal.code, "FFS_REPAIR_TAIL_UNSAFE");
+        assert_eq!(refusal.phase, "mount_startup");
+        assert_eq!(refusal.group, Some(1));
+        assert_eq!(std::fs::read(&path).unwrap(), unsafe_image);
+    }
+
+    #[test]
+    fn repair_tail_explicit_rebuild_refuses_pending_recovery_bd_plamw() {
+        for (offset, value) in [(0x3A, 0_u32), (0xE8, 12), (0x60, 0x46), (0x64, 0x1_0000)] {
+            let mut image = repair_tail_test_image_bd_plamw();
+            let start = ffs_types::EXT4_SUPERBLOCK_OFFSET + offset;
+            let width = if offset == 0x3A { 2 } else { 4 };
+            image[start..start + width].copy_from_slice(&value.to_le_bytes()[..width]);
+            let dir = tempfile::tempdir().unwrap().keep();
+            let path = dir.join("pending.ext4");
+            std::fs::write(&path, &image).unwrap();
+            let error = build_repair_output(
+                &path,
+                RepairCommandOptions {
+                    flags: RepairFlags::empty().with_rebuild_symbols(true),
+                    block_group: None,
+                    max_threads: Some(1),
+                },
+            )
+            .expect_err("pending recovery must not run before rebuild admission");
+            let refusal = error
+                .downcast_ref::<crate::cmd_repair::RepairTailRefusal>()
+                .unwrap();
+            assert_eq!(refusal.code, "FFS_REPAIR_TAIL_UNSAFE");
+            assert_eq!(refusal.phase, "before_recovery");
+            assert_eq!(std::fs::read(&path).unwrap(), image);
+        }
     }
 
     /// bd-plamw: repair-symbol tails are not reserved from the allocator, so a
@@ -19157,6 +19405,37 @@ mod tests {
     }
 
     #[test]
+    fn repair_tail_explicit_rebuild_refuses_btrfs_bootstrap_bd_plamw() {
+        let primary_offset = super::BTRFS_SUPER_INFO_OFFSET;
+        let backup_offset = 64 * 1024 * 1024_usize;
+        let mut image = vec![0_u8; backup_offset + super::BTRFS_SUPER_INFO_SIZE + 4096];
+        let mut primary = build_test_btrfs_superblock(primary_offset as u64, 31);
+        primary[0x40..0x48].fill(0);
+        image[primary_offset..primary_offset + super::BTRFS_SUPER_INFO_SIZE]
+            .copy_from_slice(&primary);
+        let backup = build_test_btrfs_superblock(backup_offset as u64, 33);
+        image[backup_offset..backup_offset + super::BTRFS_SUPER_INFO_SIZE].copy_from_slice(&backup);
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("bootstrap.btrfs");
+        std::fs::write(&path, &image).unwrap();
+        let error = build_repair_output(
+            &path,
+            RepairCommandOptions {
+                flags: RepairFlags::empty().with_rebuild_symbols(true),
+                block_group: None,
+                max_threads: Some(1),
+            },
+        )
+        .expect_err("explicit rebuild must refuse before restoring the primary superblock");
+        let refusal = error
+            .downcast_ref::<crate::cmd_repair::RepairTailRefusal>()
+            .unwrap();
+        assert_eq!(refusal.code, "FFS_REPAIR_TAIL_UNSAFE");
+        assert_eq!(refusal.phase, "before_recovery");
+        assert_eq!(std::fs::read(&path).unwrap(), image);
+    }
+
+    #[test]
     fn repair_bootstraps_btrfs_detection_from_backup_superblock() {
         let primary_offset = super::BTRFS_SUPER_INFO_OFFSET;
         let backup_offset = 64 * 1024 * 1024_usize;
@@ -19258,6 +19537,177 @@ mod tests {
         );
         assert_eq!(parsed_primary.bytenr, primary_offset as u64);
         assert!(output.scrub.scanned > 0);
+    }
+
+    #[test]
+    fn btrfs_repair_tail_rejects_unproven_physical_padding_bd_plamw() {
+        let image = build_test_btrfs_repair_image_bd_plamw();
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("padding.btrfs");
+        std::fs::write(&path, &image).unwrap();
+        let cx = crate::cli_cx();
+        let fs = OpenFs::open_with_options(&cx, &path, &OpenOptions::default()).unwrap();
+        assert!(fs.btrfs_device_inventory_verified());
+        let chunks = &fs.btrfs_context().unwrap().chunks;
+        for (start, length) in [(0x2_001, 0x1_0000), (0x2_000, 0x1_0001)] {
+            let spec = build_btrfs_repair_group_spec(0, start, length, 4096, chunks).unwrap();
+            let error = crate::cmd_repair::btrfs_repair_tail_free(&cx, &fs, &spec, 4096)
+                .expect_err("rounded physical padding cannot be proven free by logical extents");
+            assert_eq!(
+                error.to_string(),
+                "btrfs group 0 repair blocks extend outside its proven logical coverage"
+            );
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), image);
+    }
+
+    #[test]
+    fn btrfs_repair_tail_protects_superblock_stripes_bd_plamw() {
+        let image = build_test_btrfs_repair_image_bd_plamw();
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("super-stripe.btrfs");
+        std::fs::write(&path, &image).unwrap();
+        let cx = crate::cli_cx();
+        let fs = OpenFs::open_with_options(&cx, &path, &OpenOptions::default()).unwrap();
+        assert!(fs.btrfs_device_inventory_verified());
+        let chunks = &fs.btrfs_context().unwrap().chunks;
+        // Cover logical header space, the primary superblock, and only the
+        // remainder of its reserved 64KiB stripe past the 4KiB copy.
+        for (start, expected) in [
+            (0, "overlaps reserved logical header space"),
+            (
+                0x2_000,
+                "overlaps reserved superblock stripe [65536, 131072)",
+            ),
+            (
+                0x1_0000,
+                "overlaps reserved superblock stripe [65536, 131072)",
+            ),
+        ] {
+            let spec = build_btrfs_repair_group_spec(0, start, 0x1_0000, 4096, chunks).unwrap();
+            let error = crate::cmd_repair::btrfs_repair_tail_free(&cx, &fs, &spec, 4096)
+                .expect_err("extent-tree absence does not make a superblock stripe free");
+            assert!(error.to_string().contains(expected), "{error:#}");
+        }
+        assert_eq!(std::fs::read(&path).unwrap(), image);
+    }
+
+    #[test]
+    fn btrfs_repair_group_rejects_hidden_interior_mappings_bd_plamw() {
+        // The first and last physical bytes match a contiguous 128KiB span.
+        // Its final 16KiB, inside the repair tail, instead has a remapping or
+        // hole. A second overlapping chunk is equally ambiguous.
+        let first = test_btrfs_chunk_entry(0x2_0000, 0x1_C000, 0x8_0000);
+        let middle = test_btrfs_chunk_entry(0x3_C000, 0x1000, 0x10_0000);
+        let last = test_btrfs_chunk_entry(0x3_D000, 0x3000, 0x9_D000);
+        let whole = test_btrfs_chunk_entry(0x2_0000, 0x2_0000, 0x8_0000);
+        let other_owner = test_btrfs_chunk_entry(0x5_0000, 0x1000, 0x9_C000);
+        let remapped = vec![first.clone(), middle.clone(), last.clone(), other_owner];
+        let actual = ffs_ondisk::map_logical_to_physical(&remapped, 0x3_C000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(actual.physical, 0x10_0000);
+        let overwritten_owner = ffs_ondisk::map_logical_to_physical(&remapped, 0x5_0000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(overwritten_owner.physical, 0x9_C000);
+        for chunks in [remapped, vec![first, last], vec![whole, middle]] {
+            let start = ffs_ondisk::map_logical_to_physical(&chunks, 0x2_0000)
+                .unwrap()
+                .unwrap();
+            let end = ffs_ondisk::map_logical_to_physical(&chunks, 0x3_FFFF)
+                .unwrap()
+                .unwrap();
+            assert_eq!(start.devid, end.devid);
+            assert_eq!(start.physical, 0x8_0000);
+            assert_eq!(end.physical, start.physical + 0x1_FFFF);
+            let error = build_btrfs_repair_group_spec(4, 0x2_0000, 0x2_0000, 4096, &chunks)
+                .expect_err("endpoint agreement cannot authorize interior physical writes");
+            assert!(
+                error.to_string().contains("one unambiguous chunk"),
+                "{error:#}"
+            );
+        }
+
+        // The write preflight must independently reject an externally supplied
+        // spec whose span extends beyond the mounted filesystem's chunk map.
+        let image = build_test_btrfs_repair_image_bd_plamw();
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("coverage.btrfs");
+        std::fs::write(&path, &image).unwrap();
+        let cx = crate::cli_cx();
+        let fs = OpenFs::open_with_options(&cx, &path, &OpenOptions::default()).unwrap();
+        assert!(fs.btrfs_device_inventory_verified());
+        let mut chunks = fs.btrfs_context().unwrap().chunks.clone();
+        assert_eq!(chunks.len(), 1);
+        let logical_start = chunks[0].key.offset;
+        let logical_bytes = chunks[0].length + 4096;
+        chunks[0].length = logical_bytes;
+        let spec = build_btrfs_repair_group_spec(4, logical_start, logical_bytes, 4096, &chunks)
+            .expect("the forged larger chunk has internally consistent endpoint mappings");
+        let error = crate::cmd_repair::btrfs_repair_tail_free(&cx, &fs, &spec, 4096)
+            .expect_err("the actual mounted chunk cannot prove the forged span");
+        assert!(
+            error.to_string().contains("one unambiguous chunk"),
+            "{error:#}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), image);
+    }
+
+    #[test]
+    fn btrfs_repair_group_rejects_physical_aliases_bd_plamw() {
+        let whole = test_btrfs_chunk_entry(0x2_0000, 0x2_0000, 0x8_0000);
+        let alias = test_btrfs_chunk_entry(0x5_0000, 0x1000, 0x9_C000);
+        let chunks = [whole.clone(), alias.clone()];
+        let tail_owner = ffs_ondisk::map_logical_to_physical(&chunks, 0x3_C000)
+            .unwrap()
+            .unwrap();
+        let other_owner = ffs_ondisk::map_logical_to_physical(&chunks, 0x5_0000)
+            .unwrap()
+            .unwrap();
+        assert_eq!(tail_owner.physical, 0x9_C000);
+        assert_eq!(other_owner.physical, tail_owner.physical);
+        let error = build_btrfs_repair_group_spec(4, 0x2_0000, 0x2_0000, 4096, &chunks)
+            .expect_err("a distinct logical owner can alias an apparently free tail");
+        assert!(
+            error.to_string().contains("aliases chunk 327680 stripe 0"),
+            "{error:#}"
+        );
+
+        let mut dup = whole.clone();
+        dup.chunk_type = ffs_ondisk::chunk_type_flags::BTRFS_BLOCK_GROUP_DUP;
+        dup.num_stripes = 2;
+        dup.stripes.push(dup.stripes[0].clone());
+        dup.stripes[1].offset = 0x9_C000;
+        // A shifted secondary copy aliases the primary's tail with the start
+        // of this same chunk. Equal logical chunk identity is insufficient.
+        let error =
+            build_btrfs_repair_group_spec(4, 0x2_0000, 0x2_0000, 4096, std::slice::from_ref(&dup))
+                .expect_err("overlapping DUP copies must not authorize repair writes");
+        assert!(
+            error.to_string().contains("aliases chunk 131072 stripe 1"),
+            "{error:#}"
+        );
+        dup.stripes[1].offset = 0xA_0000;
+        build_btrfs_repair_group_spec(4, 0x2_0000, 0x2_0000, 4096, &[dup])
+            .expect("adjacent non-overlapping DUP copies remain supported");
+
+        for physical in [0x7_F000, 0xA_0000] {
+            let adjacent = test_btrfs_chunk_entry(0x5_0000, 0x1000, physical);
+            build_btrfs_repair_group_spec(4, 0x2_0000, 0x2_0000, 4096, &[whole.clone(), adjacent])
+                .expect("abutting physical chunks must not count as overlapping");
+        }
+        let mut overflowing = alias;
+        overflowing.stripes[0].offset = u64::MAX - 2048;
+        let error =
+            build_btrfs_repair_group_spec(4, 0x2_0000, 0x2_0000, 4096, &[whole, overflowing])
+                .expect_err("an overflowing competing range cannot establish unique ownership");
+        assert!(
+            error
+                .to_string()
+                .contains("overflowing physical chunk range"),
+            "{error:#}"
+        );
     }
 
     #[test]

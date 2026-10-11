@@ -19085,14 +19085,51 @@ impl OpenFs {
         }
     }
 
+    fn ext4_repair_metadata_clusters(
+        geo: &FsGeometry,
+        groups: &[ffs_alloc::GroupStats],
+        group: GroupNumber,
+    ) -> Result<Vec<(u64, u64)>, FfsError> {
+        let first =
+            u64::from(geo.first_data_block) + u64::from(group.0) * u64::from(geo.blocks_per_group);
+        let end = first.saturating_add(u64::from(geo.blocks_in_group(group)));
+        let ratio = u64::from(geo.cluster_ratio);
+        let mut ranges = Vec::new();
+        let mut add_range = |start: u64, length: u64| -> Result<(), FfsError> {
+            let range_end = start.checked_add(length).ok_or_else(|| {
+                FfsError::InvalidGeometry("ext4 repair metadata range overflows".into())
+            })?;
+            let start = start.max(first);
+            let range_end = range_end.min(end);
+            if start < range_end {
+                ranges.push(((start - first) / ratio, (range_end - first).div_ceil(ratio)));
+            }
+            Ok(())
+        };
+        add_range(first, u64::from(geo.base_meta_blocks_in_group(group)))?;
+        let table_blocks = (u64::from(geo.inodes_per_group) * u64::from(geo.inode_size))
+            .div_ceil(u64::from(geo.block_size));
+        // Linux v6.19 ext4_check_descriptors permits FLEX_BG metadata anywhere
+        // in the filesystem, including another flex neighborhood. Keep each
+        // table as one interval; never expand every table into block offsets.
+        for descriptor in groups {
+            add_range(descriptor.block_bitmap_block.0, 1)?;
+            add_range(descriptor.inode_bitmap_block.0, 1)?;
+            add_range(descriptor.inode_table_block.0, table_blocks)?;
+        }
+        ranges.sort_unstable();
+        Ok(ranges)
+    }
+
     /// Count ext4 blocks in `[start, end)` (absolute block numbers, all inside
-    /// `group`) that the group's block bitmap marks allocated.
+    /// `group`) that are allocated or reserved for filesystem metadata.
     ///
     /// bd-plamw: the repair-symbol tail at the end of each group is not
     /// reserved in the bitmap, so callers that are about to write symbols there
-    /// use this to refuse when file data or metadata already occupies it. A
-    /// `BLOCK_UNINIT` group has no initialized bitmap and no allocations beyond
-    /// its fixed metadata, which never lies in the tail.
+    /// use this to refuse when file data or metadata already occupies it.
+    /// `BLOCK_UNINIT` bitmap bytes are undefined: only the validated metadata
+    /// layout is authoritative for such groups. Metadata reservations also
+    /// protect initialized groups whose bitmap incorrectly marks metadata free.
     ///
     /// # Errors
     ///
@@ -19108,10 +19145,12 @@ impl OpenFs {
         let sb = self
             .ext4_superblock()
             .ok_or_else(|| FfsError::Format("not an ext4 filesystem".into()))?;
-        let group_start = u64::from(sb.first_data_block)
-            .saturating_add(u64::from(group.0).saturating_mul(u64::from(sb.blocks_per_group)));
-        let group_end = group_start.saturating_add(u64::from(sb.blocks_per_group));
-        if start > end || start < group_start || end > group_end {
+        let geo = FsGeometry::from_superblock(sb);
+        let group_start =
+            u64::from(geo.first_data_block) + u64::from(group.0) * u64::from(geo.blocks_per_group);
+        let group_end = group_start.saturating_add(u64::from(geo.blocks_in_group(group)));
+        let group_exists = group.0 < geo.group_count;
+        if !group_exists || start > end || start < group_start || end > group_end {
             return Err(FfsError::InvalidGeometry(format!(
                 "block range [{start}, {end}) is not inside ext4 group {}",
                 group.0
@@ -19120,19 +19159,64 @@ impl OpenFs {
         if start == end {
             return Ok(0);
         }
+        // Reuse the allocator's validated descriptors and base metadata geometry,
+        // but include descriptor-owned metadata from every flex neighborhood.
+        // Loading this state neither enables writes nor initializes bitmaps.
+        let alloc = self.load_ext4_alloc_state(cx)?;
+        let mut reserved = Self::ext4_repair_metadata_clusters(&geo, &alloc.groups, group)?
+            .into_iter()
+            .peekable();
         let gd = self.read_group_desc(cx, group)?;
-        if gd.flags & ffs_ondisk::ext4::EXT4_BG_BLOCK_UNINIT != 0 {
-            return Ok(0);
+        let uninitialized = gd.flags & ffs_ondisk::ext4::EXT4_BG_BLOCK_UNINIT != 0
+            && sb.group_desc_checksum_kind() != ffs_ondisk::ext4::Ext4GroupDescChecksumKind::None;
+        if uninitialized && group.0 == 0 {
+            return Err(FfsError::InvalidGeometry(
+                "ext4 group zero cannot have an uninitialized block bitmap".into(),
+            ));
         }
-        let bitmap = self.read_block_bitmap(cx, group)?;
+        let bitmap = if uninitialized {
+            None
+        } else {
+            let bitmap = self.read_block_vec(cx, BlockNumber(gd.block_bitmap))?;
+            let bitmap_units = Self::block_bitmap_units_per_group(&geo);
+            if u64::from(bitmap_units) > bitmap.len() as u64 * 8 {
+                return Err(FfsError::InvalidGeometry(
+                    "ext4 allocation bitmap cannot represent the group".into(),
+                ));
+            }
+            if sb.has_metadata_csum()
+                && (!self.is_writable() || !ffs_alloc::gdt_persistence_deferred())
+            {
+                ffs_ondisk::ext4::verify_block_bitmap_checksum(
+                    &bitmap,
+                    sb.csum_seed(),
+                    bitmap_units,
+                    &gd,
+                    sb.group_desc_size(),
+                )
+                .map_err(|e| parse_to_ffs_error(&e))?;
+            }
+            Some(bitmap)
+        };
         let mut allocated = 0_u64;
         for block in start..end {
-            let bit = usize::try_from(block - group_start)
+            let cluster = (block - group_start) / u64::from(geo.cluster_ratio);
+            let bit = usize::try_from(cluster)
                 .map_err(|_| FfsError::InvalidGeometry("bitmap index overflow".into()))?;
-            if bitmap
-                .get(bit / 8)
-                .is_some_and(|byte| byte & (1 << (bit % 8)) != 0)
-            {
+            while reserved.peek().is_some_and(|(_, end)| *end <= cluster) {
+                let _ = reserved.next();
+            }
+            let reserved_cluster = reserved.peek().is_some_and(|(start, _)| *start <= cluster);
+            let bitmap_allocated = match &bitmap {
+                Some(bitmap) => {
+                    let byte = bitmap.get(bit / 8).ok_or_else(|| {
+                        FfsError::InvalidGeometry("ext4 allocation bitmap is truncated".into())
+                    })?;
+                    byte & (1 << (bit % 8)) != 0
+                }
+                None => false,
+            };
+            if reserved_cluster || bitmap_allocated {
                 allocated += 1;
             }
         }
@@ -54927,6 +55011,295 @@ mod tests {
                 .is_err(),
             "a range crossing the group boundary is refused"
         );
+    }
+
+    #[test]
+    fn ext4_repair_tail_counts_metadata_despite_cleared_bitmap_bd_plamw() {
+        for flags in [0_u16, ffs_ondisk::ext4::EXT4_BG_BLOCK_UNINIT] {
+            let mut image = build_ext4_image_with_extents();
+            // Move the eight-block inode table into the queried tail, leaving
+            // every bitmap bit clear. An unchecked lazy flag is not authority
+            // to ignore allocations; metadata remains protected in either case.
+            image.copy_within(4 * 4096..12 * 4096, 56 * 4096);
+            image[4096 + 8..4096 + 12].copy_from_slice(&56_u32.to_le_bytes());
+            image[4096 + 0x12..4096 + 0x14].copy_from_slice(&flags.to_le_bytes());
+            image[2 * 4096..3 * 4096].fill(0);
+            let dev = TestDevice::from_vec(image.clone());
+            let cx = Cx::for_testing();
+            let fs = OpenFs::from_device(
+                &cx,
+                Box::new(dev.clone()),
+                &OpenOptions {
+                    ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                    ..OpenOptions::default()
+                },
+            )
+            .expect("open metadata-tail fixture without recovery writes");
+            assert_eq!(
+                fs.ext4_allocated_blocks_in_range(&cx, GroupNumber(0), 56, 64)
+                    .expect("count inode table"),
+                8,
+                "inode table is reserved even with flags={flags:#x}"
+            );
+            assert_eq!(
+                fs.ext4_allocated_blocks_in_range(&cx, GroupNumber(0), 48, 56)
+                    .expect("count free range"),
+                0
+            );
+            assert_eq!(
+                fs.ext4_allocated_blocks_in_range(&cx, GroupNumber(0), 0, 4)
+                    .expect("count superblock, GDT and bitmaps"),
+                4
+            );
+            assert_eq!(
+                dev.snapshot_bytes(),
+                image,
+                "inspection must not initialize metadata"
+            );
+        }
+    }
+
+    #[test]
+    fn ext4_repair_tail_counts_sibling_flex_metadata_bd_plamw() {
+        // Retain the same-flex control, then place group 2's metadata across
+        // the two-group flex boundary, with cleared and truly lazy bitmaps.
+        for (query_group, metadata_group, lazy) in
+            [(0_u32, 1_u32, false), (0, 2, false), (1, 2, true)]
+        {
+            let mut image = build_ext4_image_with_extents();
+            let group_count = metadata_group + 1;
+            image.resize(usize::try_from(group_count * 64).unwrap() * 4096, 0);
+            let sb = EXT4_SUPERBLOCK_OFFSET;
+            image[sb + 4..sb + 8].copy_from_slice(&(group_count * 64).to_le_bytes());
+            image[sb..sb + 4].copy_from_slice(&(group_count * 128).to_le_bytes());
+            let incompat = ffs_ondisk::Ext4IncompatFeatures::FILETYPE.0
+                | ffs_ondisk::Ext4IncompatFeatures::EXTENTS.0
+                | ffs_ondisk::Ext4IncompatFeatures::FLEX_BG.0;
+            image[sb + 0x60..sb + 0x64].copy_from_slice(&incompat.to_le_bytes());
+            image[sb + 0x174] = 1;
+            for group in 1..group_count {
+                let descriptor = 4096 + usize::try_from(group).unwrap() * 32;
+                for (offset, block) in [
+                    (0, group * 64 + 2),
+                    (4, group * 64 + 3),
+                    (8, group * 64 + 4),
+                ] {
+                    image[descriptor + offset..descriptor + offset + 4]
+                        .copy_from_slice(&block.to_le_bytes());
+                }
+            }
+            let first = query_group * 64;
+            let descriptor = 4096 + usize::try_from(metadata_group).unwrap() * 32;
+            for (offset, block) in [(0, first + 40), (4, first + 41), (8, first + 56)] {
+                image[descriptor + offset..descriptor + offset + 4]
+                    .copy_from_slice(&block.to_le_bytes());
+            }
+            let query_descriptor = 4096 + usize::try_from(query_group).unwrap() * 32;
+            image[query_descriptor + 0x12..query_descriptor + 0x14]
+                .copy_from_slice(&ffs_ondisk::ext4::EXT4_BG_BLOCK_UNINIT.to_le_bytes());
+            let bitmap = usize::try_from(first + 2).unwrap() * 4096;
+            image[bitmap..bitmap + 4096].fill(if lazy { 0xFF } else { 0 });
+            if lazy {
+                image[sb + 0x64..sb + 0x68]
+                    .copy_from_slice(&ffs_ondisk::Ext4RoCompatFeatures::GDT_CSUM.0.to_le_bytes());
+                for group in 0..group_count {
+                    let offset = 4096 + usize::try_from(group).unwrap() * 32;
+                    ffs_ondisk::ext4::stamp_group_desc_checksum(
+                        &mut image[offset..offset + 32],
+                        &[0; 16],
+                        0,
+                        group,
+                        32,
+                        ffs_ondisk::ext4::Ext4GroupDescChecksumKind::GdtCsum,
+                    );
+                }
+            }
+            let cx = Cx::for_testing();
+            let dev = TestDevice::from_vec(image.clone());
+            let fs = OpenFs::from_device(
+                &cx,
+                Box::new(dev.clone()),
+                &OpenOptions {
+                    ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                    ..OpenOptions::default()
+                },
+            )
+            .expect("open flex metadata fixture");
+            for (start, end, expected) in [(56, 64, 8), (40, 42, 2), (48, 56, 0)] {
+                assert_eq!(
+                    fs.ext4_allocated_blocks_in_range(
+                        &cx,
+                        GroupNumber(query_group),
+                        u64::from(first + start),
+                        u64::from(first + end)
+                    )
+                    .expect("count sibling metadata and free control"),
+                    expected,
+                    "query group {query_group}, metadata owner {metadata_group}, lazy={lazy}, range [{start}, {end})"
+                );
+            }
+            assert_eq!(
+                dev.snapshot_bytes(),
+                image,
+                "inspection must not initialize metadata"
+            );
+        }
+    }
+
+    #[test]
+    fn ext4_repair_tail_checks_lazy_group_authority_bd_plamw() {
+        for (lazy_group, undefined_byte) in [(1_u32, 0_u8), (1, 0xFF), (0, 0)] {
+            let mut image = build_ext4_image_with_extents();
+            image.resize(128 * 4096, 0);
+            let sb = EXT4_SUPERBLOCK_OFFSET;
+            image[sb + 4..sb + 8].copy_from_slice(&128_u32.to_le_bytes());
+            image[sb..sb + 4].copy_from_slice(&256_u32.to_le_bytes());
+            image[sb + 0x64..sb + 0x68]
+                .copy_from_slice(&ffs_ondisk::Ext4RoCompatFeatures::GDT_CSUM.0.to_le_bytes());
+            let second_gd = 4096 + 32;
+            image[second_gd..second_gd + 4].copy_from_slice(&66_u32.to_le_bytes());
+            image[second_gd + 4..second_gd + 8].copy_from_slice(&67_u32.to_le_bytes());
+            image[second_gd + 8..second_gd + 12].copy_from_slice(&120_u32.to_le_bytes());
+            let lazy_gd = 4096 + usize::try_from(lazy_group).unwrap() * 32;
+            image[lazy_gd + 0x12..lazy_gd + 0x14]
+                .copy_from_slice(&ffs_ondisk::ext4::EXT4_BG_BLOCK_UNINIT.to_le_bytes());
+            image[66 * 4096..67 * 4096].fill(undefined_byte);
+            for group in 0..2_u32 {
+                let offset = 4096 + usize::try_from(group).unwrap() * 32;
+                ffs_ondisk::ext4::stamp_group_desc_checksum(
+                    &mut image[offset..offset + 32],
+                    &[0; 16],
+                    0,
+                    group,
+                    32,
+                    ffs_ondisk::ext4::Ext4GroupDescChecksumKind::GdtCsum,
+                );
+            }
+            let cx = Cx::for_testing();
+            let dev = TestDevice::from_vec(image.clone());
+            let fs = OpenFs::from_device(
+                &cx,
+                Box::new(dev.clone()),
+                &OpenOptions {
+                    ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                    ..OpenOptions::default()
+                },
+            )
+            .expect("open checksummed group descriptors");
+            if lazy_group == 0 {
+                assert!(matches!(
+                    fs.ext4_allocated_blocks_in_range(&cx, GroupNumber(0), 56, 64),
+                    Err(FfsError::InvalidGeometry(_))
+                ));
+            } else {
+                for (start, end, expected) in [(120, 128, 8), (112, 120, 0), (64, 68, 4)] {
+                    assert_eq!(
+                        fs.ext4_allocated_blocks_in_range(&cx, GroupNumber(1), start, end)
+                            .expect("inspect lazy group without reading undefined bytes"),
+                        expected,
+                        "range [{start}, {end}), undefined bitmap byte={undefined_byte:#x}"
+                    );
+                }
+            }
+            assert_eq!(
+                dev.snapshot_bytes(),
+                image,
+                "read-only allocation inspection"
+            );
+        }
+    }
+
+    #[test]
+    fn ext4_repair_tail_unchecked_lazy_flag_cannot_hide_allocations_bd_plamw() {
+        let mut image = build_ext4_image_with_extents();
+        image[4096 + 0x12..4096 + 0x14]
+            .copy_from_slice(&ffs_ondisk::ext4::EXT4_BG_BLOCK_UNINIT.to_le_bytes());
+        image[2 * 4096 + 7] = 1 << 4; // Allocated block 60, no descriptor checksum.
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(image)),
+            &OpenOptions::default(),
+        )
+        .expect("open unchecked group flags");
+        assert_eq!(
+            fs.ext4_allocated_blocks_in_range(&cx, GroupNumber(0), 56, 64)
+                .expect("allocation bitmap remains authoritative"),
+            1
+        );
+    }
+
+    #[test]
+    fn ext4_repair_tail_rejects_partial_group_overrun_bd_plamw() {
+        let mut image = build_ext4_image_with_extents();
+        let sb = EXT4_SUPERBLOCK_OFFSET;
+        image[sb + 4..sb + 8].copy_from_slice(&60_u32.to_le_bytes());
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(image)),
+            &OpenOptions::default(),
+        )
+        .expect("open partial group fixture");
+        assert_eq!(
+            fs.ext4_allocated_blocks_in_range(&cx, GroupNumber(0), 59, 60)
+                .expect("last real block is free"),
+            0
+        );
+        for (group, start, end) in [(0, 59, 61), (0, 61, 61), (1, 64, 64), (0, 60, 59)] {
+            assert!(matches!(
+                fs.ext4_allocated_blocks_in_range(&cx, GroupNumber(group), start, end),
+                Err(FfsError::InvalidGeometry(_))
+            ));
+        }
+    }
+
+    #[test]
+    fn ext4_repair_tail_counts_allocated_clusters_bd_plamw() {
+        let mut image = build_ext4_image_with_extents();
+        let sb = EXT4_SUPERBLOCK_OFFSET;
+        image[sb + 0x1C..sb + 0x20].copy_from_slice(&3_u32.to_le_bytes());
+        image[sb + 0x24..sb + 0x28].copy_from_slice(&32_u32.to_le_bytes());
+        image[sb + 0x64..sb + 0x68]
+            .copy_from_slice(&ffs_ondisk::Ext4RoCompatFeatures::BIGALLOC.0.to_le_bytes());
+        image[2 * 4096..3 * 4096].fill(0);
+        image[2 * 4096 + 3] = 1 << 6; // Cluster 30 owns blocks 60 and 61.
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(image)),
+            &OpenOptions::default(),
+        )
+        .expect("open bigalloc fixture");
+        for (start, end, expected) in [(60, 62, 2), (61, 62, 1), (62, 64, 0), (59, 61, 1)] {
+            assert_eq!(
+                fs.ext4_allocated_blocks_in_range(&cx, GroupNumber(0), start, end)
+                    .expect("count cluster allocation"),
+                expected,
+                "range [{start}, {end})"
+            );
+        }
+    }
+
+    #[test]
+    fn ext4_repair_tail_rejects_unrepresentable_bitmap_bd_plamw() {
+        let mut image = build_ext4_image_with_extents();
+        let sb = EXT4_SUPERBLOCK_OFFSET;
+        image[sb + 0x20..sb + 0x24].copy_from_slice(&32_769_u32.to_le_bytes());
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(image)),
+            &OpenOptions {
+                skip_validation: true,
+                ..OpenOptions::default()
+            },
+        )
+        .expect("open corrupted geometry with validation explicitly skipped");
+        assert!(matches!(
+            fs.ext4_allocated_blocks_in_range(&cx, GroupNumber(0), 60, 64),
+            Err(FfsError::InvalidGeometry(_))
+        ));
     }
 
     /// bd-xsu7s: when mount-time orphan recovery fails, the orphan chain is in

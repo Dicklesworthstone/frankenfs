@@ -37,6 +37,53 @@ use crate::{
 /// superblocks that advertise billions of groups before allocation.
 pub const MAX_EXT4_REPAIR_GROUP_SPECS: u32 = 65_536;
 
+/// A write plan rejected before any of its repair symbols or descriptors change.
+#[derive(Debug, Serialize)]
+pub struct RepairTailRefusal {
+    pub code: &'static str,
+    pub phase: &'static str,
+    pub filesystem: &'static str,
+    pub group: Option<u32>,
+    pub detail: String,
+}
+
+impl std::fmt::Display for RepairTailRefusal {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            formatter,
+            "{}: {} repair plan refused during {}: {}",
+            self.code, self.filesystem, self.phase, self.detail
+        )
+    }
+}
+
+impl std::error::Error for RepairTailRefusal {}
+
+fn repair_tail_refusal(
+    phase: &'static str,
+    filesystem: &'static str,
+    group: Option<u32>,
+    detail: String,
+) -> anyhow::Error {
+    let refusal = RepairTailRefusal {
+        code: "FFS_REPAIR_TAIL_UNSAFE",
+        phase,
+        filesystem,
+        group,
+        detail,
+    };
+    warn!(
+        target: "ffs::cli::repair",
+        code = refusal.code,
+        phase,
+        filesystem,
+        group,
+        detail = refusal.detail,
+        "repair_tail_plan_refused"
+    );
+    refusal.into()
+}
+
 pub fn repair_cmd(path: &PathBuf, options: RepairCommandOptions) -> Result<()> {
     let flags = options.flags;
     let command_span = info_span!(
@@ -59,11 +106,13 @@ pub fn repair_cmd(path: &PathBuf, options: RepairCommandOptions) -> Result<()> {
         Err(err) => {
             if flags.json() {
                 let error_msg = format!("{err:#}");
-                let escaped = serde_json::to_string(&error_msg)
-                    .unwrap_or_else(|_| "\"unknown_error\"".to_string());
-                println!(
-                    "{{\"status\":\"operational_error\",\"exit_code\":4,\"error\":{escaped}}}"
-                );
+                let mut output = serde_json::json!({
+                    "status": "operational_error", "exit_code": 4, "error": error_msg,
+                });
+                if let Some(refusal) = err.downcast_ref::<RepairTailRefusal>() {
+                    output["refusal"] = serde_json::to_value(refusal)?;
+                }
+                println!("{output}");
             } else {
                 eprintln!("repair operational error: {err:#}");
             }
@@ -1092,6 +1141,65 @@ pub fn detect_flavor_with_optional_btrfs_bootstrap(
     }
 }
 
+/// A contiguous physical writer needs one unambiguous chunk for its full span.
+/// Matching endpoints cannot prove interior mapping or unique physical ownership.
+fn btrfs_repair_range_chunk(
+    group: u32,
+    logical_start: u64,
+    logical_bytes: u64,
+    chunks: &[BtrfsChunkEntry],
+) -> Result<&BtrfsChunkEntry> {
+    let logical_end = logical_start
+        .checked_add(logical_bytes)
+        .filter(|end| *end > logical_start)
+        .ok_or_else(|| anyhow::anyhow!("btrfs group {group} has an invalid logical repair span"))?;
+    let mut covering = None;
+    for chunk in chunks {
+        let chunk_end = chunk.key.offset.checked_add(chunk.length).ok_or_else(|| {
+            anyhow::anyhow!("btrfs group {group} chunk coverage has an overflowing logical range")
+        })?;
+        if chunk.key.offset >= logical_end || chunk_end <= logical_start {
+            continue;
+        }
+        if covering.is_some() || chunk.key.offset > logical_start || chunk_end < logical_end {
+            bail!("btrfs group {group} repair span is not covered by one unambiguous chunk");
+        }
+        covering = Some(chunk);
+    }
+    let covering = covering.ok_or_else(|| {
+        anyhow::anyhow!("btrfs group {group} repair span is not covered by one unambiguous chunk")
+    })?;
+    let mapping = map_logical_to_physical(std::slice::from_ref(covering), logical_start)?
+        .ok_or_else(|| anyhow::anyhow!("btrfs group {group} has no physical repair mapping"))?;
+    let physical_end = mapping.physical.checked_add(logical_bytes).ok_or_else(|| {
+        anyhow::anyhow!("btrfs group {group} has an overflowing physical repair span")
+    })?;
+    for chunk in chunks {
+        // The contiguous writer supports only Single/DUP. Validate that shape
+        // before interpreting each stripe as a full-length physical copy.
+        map_logical_to_physical(std::slice::from_ref(chunk), chunk.key.offset)?
+            .ok_or_else(|| anyhow::anyhow!("btrfs group {group} has an empty chunk mapping"))?;
+        for (index, stripe) in chunk.stripes.iter().enumerate() {
+            if stripe.devid != mapping.devid || (std::ptr::eq(chunk, covering) && index == 0) {
+                continue;
+            }
+            let stripe_end = stripe.offset.checked_add(chunk.length).ok_or_else(|| {
+                anyhow::anyhow!("btrfs group {group} has an overflowing physical chunk range")
+            })?;
+            if stripe.offset < physical_end && stripe_end > mapping.physical {
+                bail!(
+                    "btrfs group {group} physical repair span [{}, {physical_end}) aliases chunk {} stripe {index} [{}, {stripe_end}) on device {}",
+                    mapping.physical,
+                    chunk.key.offset,
+                    stripe.offset,
+                    stripe.devid
+                );
+            }
+        }
+    }
+    Ok(covering)
+}
+
 pub fn build_btrfs_repair_group_spec(
     group: u32,
     logical_start: u64,
@@ -1140,6 +1248,7 @@ pub fn build_btrfs_repair_group_spec(
             end_mapping.physical
         );
     }
+    btrfs_repair_range_chunk(group, logical_start, logical_bytes, chunks)?;
     let block_size_u64 = u64::from(block_size);
     let start_block = start_mapping.physical / block_size_u64;
     let end_exclusive = expected_end_physical
@@ -1799,16 +1908,19 @@ pub fn recover_btrfs_corrupt_blocks(
     Ok((recovered_blocks, unrecovered_blocks, repaired_groups))
 }
 
-/// Re-encode RaptorQ repair symbols for the given btrfs block groups after
-/// recovery, mirroring the ext4 symbol-rebuild workflow.
-#[allow(clippy::too_many_lines)]
 /// bd-plamw: open an image purely to read its allocation state. Journal
 /// replay is skipped (which also skips orphan recovery), so this never
 /// mutates the image.
 fn open_for_repair_tail_check(cx: &Cx, path: &Path) -> Result<OpenFs> {
-    OpenFs::open_with_options(
+    let device = FileByteDevice::open_read_only(path).with_context(|| {
+        format!(
+            "failed to open read-only repair-tail image: {}",
+            path.display()
+        )
+    })?;
+    OpenFs::from_device(
         cx,
-        path,
+        Box::new(device),
         &OpenOptions {
             ext4_journal_replay_mode: ffs_core::Ext4JournalReplayMode::Skip,
             ..OpenOptions::default()
@@ -1866,19 +1978,56 @@ pub fn ext4_repair_tail_free(cx: &Cx, fs: &OpenFs, spec: &Ext4RepairGroupSpec) -
 
 /// bd-plamw: btrfs counterpart of [`ext4_repair_tail_free`]. The tail is the
 /// end of the chunk's span after the protected source blocks; it is checked
-/// against the extent tree. The range starts one block early so an unaligned
-/// chunk start can only widen, never narrow, the checked range.
+/// against the extent tree. Physical padding outside that logical span is
+/// not covered by this proof and must never become symbol storage.
 pub fn btrfs_repair_tail_free(
     cx: &Cx,
     fs: &OpenFs,
     spec: &BtrfsRepairGroupSpec,
     block_size: u32,
 ) -> Result<()> {
+    let block_bytes = u64::from(block_size);
+    let chunks = &fs
+        .btrfs_context()
+        .ok_or_else(|| anyhow::anyhow!("btrfs chunk map is unavailable"))?
+        .chunks;
+    let chunk =
+        btrfs_repair_range_chunk(spec.group, spec.logical_start, spec.logical_bytes, chunks)?;
+    let mapping = map_logical_to_physical(std::slice::from_ref(chunk), spec.logical_start)?
+        .ok_or_else(|| anyhow::anyhow!("btrfs repair group has no physical mapping"))?;
+    if block_bytes == 0
+        || !spec.logical_start.is_multiple_of(block_bytes)
+        || !spec.logical_bytes.is_multiple_of(block_bytes)
+        || spec.physical_start_block.0.checked_mul(block_bytes) != Some(mapping.physical)
+        || spec.physical_block_count.checked_mul(block_bytes) != Some(spec.logical_bytes)
+    {
+        bail!(
+            "btrfs group {} repair blocks extend outside its proven logical coverage",
+            spec.group
+        );
+    }
     let source_bytes = u64::from(spec.source_block_count).saturating_mul(u64::from(block_size));
-    let first = spec
-        .logical_start
-        .saturating_add(source_bytes.saturating_sub(u64::from(block_size)));
+    let physical_first = mapping.physical.saturating_add(source_bytes);
+    let physical_end = mapping.physical.saturating_add(spec.logical_bytes);
+    // Superblock stripes are excluded from the kernel allocator independently
+    // of extent-tree records (Linux fs/btrfs/block-group.c exclude_super_stripes).
+    for mirror in btrfs_super_mirror_offsets(fs.device_len()) {
+        let stripe_end = mirror.saturating_add(ffs_btrfs::BTRFS_STRIPE_LEN);
+        if physical_first < stripe_end && physical_end > mirror {
+            bail!(
+                "btrfs group {} physical repair tail [{physical_first}, {physical_end}) overlaps reserved superblock stripe [{mirror}, {stripe_end})",
+                spec.group
+            );
+        }
+    }
+    let first = spec.logical_start.saturating_add(source_bytes);
     let end = spec.logical_start.saturating_add(spec.logical_bytes);
+    if first < BTRFS_SUPER_INFO_OFFSET as u64 {
+        bail!(
+            "btrfs group {} logical repair tail [{first}, {end}) overlaps reserved logical header space",
+            spec.group
+        );
+    }
     let allocated = fs
         .btrfs_allocated_bytes_in_logical_range(cx, first, end)
         .with_context(|| {
@@ -1897,6 +2046,101 @@ pub fn btrfs_repair_tail_free(
     Ok(())
 }
 
+fn require_clean_repair_tail_state(fs: &OpenFs, phase: &'static str) -> Result<()> {
+    if let Some(sb) = fs.ext4_superblock()
+        && (!ext4_appears_clean_state(sb.state)
+            || sb.last_orphan != 0
+            || sb.has_incompat(ffs_ondisk::Ext4IncompatFeatures::RECOVER)
+            || sb.has_ro_compat(ffs_ondisk::Ext4RoCompatFeatures::ORPHAN_PRESENT))
+    {
+        return Err(repair_tail_refusal(
+            phase,
+            "ext4",
+            None,
+            "pending recovery prevents a trustworthy allocation proof; recover without --rebuild-symbols first".to_owned(),
+        ));
+    }
+    if let Some(sb) = fs.btrfs_superblock()
+        && (sb.log_root != 0
+            || sb.is_seeding()
+            || sb.num_devices != 1
+            || !fs.btrfs_device_inventory_verified())
+    {
+        return Err(repair_tail_refusal(
+            phase,
+            "btrfs",
+            None,
+            "repair writes require a clean, verified, non-seed single-device inventory".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+pub fn preflight_ext4_repair_groups<'a>(
+    cx: &Cx,
+    fs: &OpenFs,
+    specs: &'a [Ext4RepairGroupSpec],
+    groups: &[u32],
+    phase: &'static str,
+) -> Result<Vec<&'a Ext4RepairGroupSpec>> {
+    require_clean_repair_tail_state(fs, phase)?;
+    let by_group: BTreeMap<_, _> = specs.iter().map(|spec| (spec.group, spec)).collect();
+    groups
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|group| {
+            let spec = by_group.get(&group).copied().ok_or_else(|| {
+                repair_tail_refusal(
+                    phase,
+                    "ext4",
+                    Some(group),
+                    "group layout is unavailable".to_owned(),
+                )
+            })?;
+            ext4_repair_tail_free(cx, fs, spec).map_err(|error| {
+                repair_tail_refusal(phase, "ext4", Some(group), format!("{error:#}"))
+            })?;
+            Ok(spec)
+        })
+        .collect()
+}
+
+pub fn preflight_btrfs_repair_groups<'a>(
+    cx: &Cx,
+    fs: &OpenFs,
+    specs: &'a [BtrfsRepairGroupSpec],
+    groups: &[u32],
+    block_size: u32,
+    phase: &'static str,
+) -> Result<Vec<&'a BtrfsRepairGroupSpec>> {
+    require_clean_repair_tail_state(fs, phase)?;
+    let by_group: BTreeMap<_, _> = specs.iter().map(|spec| (spec.group, spec)).collect();
+    groups
+        .iter()
+        .copied()
+        .collect::<BTreeSet<_>>()
+        .into_iter()
+        .map(|group| {
+            let spec = by_group.get(&group).copied().ok_or_else(|| {
+                repair_tail_refusal(
+                    phase,
+                    "btrfs",
+                    Some(group),
+                    "group layout is unavailable".to_owned(),
+                )
+            })?;
+            btrfs_repair_tail_free(cx, fs, spec, block_size).map_err(|error| {
+                repair_tail_refusal(phase, "btrfs", Some(group), format!("{error:#}"))
+            })?;
+            Ok(spec)
+        })
+        .collect()
+}
+
+/// Re-encode symbols only after the entire requested write plan is admitted.
+#[allow(clippy::too_many_lines)]
 pub fn rebuild_btrfs_repair_symbols(
     path: &PathBuf,
     block_size: u32,
@@ -1910,32 +2154,19 @@ pub fn rebuild_btrfs_repair_symbols(
     }
 
     let cx = cli_cx();
-    let tail_fs = open_for_repair_tail_check(&cx, path)?;
+    let tail_fs = open_for_repair_tail_check(&cx, path).map_err(|error| {
+        repair_tail_refusal("symbol_rebuild", "btrfs", None, format!("{error:#}"))
+    })?;
+    let admitted =
+        preflight_btrfs_repair_groups(&cx, &tail_fs, specs, groups, block_size, "symbol_rebuild")?;
     let byte_dev = FileByteDevice::open(path)
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     let block_dev = ByteBlockDevice::new(byte_dev, block_size)
         .with_context(|| format!("failed to create block device (block_size={block_size})"))?;
-    let spec_by_group: BTreeMap<u32, &BtrfsRepairGroupSpec> =
-        specs.iter().map(|spec| (spec.group, spec)).collect();
-
-    let mut unique_groups = BTreeSet::new();
-    unique_groups.extend(groups.iter().copied());
-
     let mut rebuilt_groups = 0_u64;
     let mut failed_groups = 0_u64;
-    for group in unique_groups {
-        let Some(spec) = spec_by_group.get(&group).copied() else {
-            failed_groups = failed_groups.saturating_add(1);
-            limitations.push(format!(
-                "cannot rebuild symbols for btrfs group {group}: group layout is unavailable"
-            ));
-            continue;
-        };
-        if let Err(error) = btrfs_repair_tail_free(&cx, &tail_fs, spec, block_size) {
-            failed_groups = failed_groups.saturating_add(1);
-            limitations.push(format!("{error:#}"));
-            continue;
-        }
+    for spec in admitted {
+        let group = spec.group;
 
         let encoded = match encode_group(
             &cx,
@@ -2035,35 +2266,18 @@ pub fn rebuild_ext4_repair_symbols(
     }
 
     let cx = cli_cx();
-    let tail_fs = open_for_repair_tail_check(&cx, path)?;
+    let tail_fs = open_for_repair_tail_check(&cx, path).map_err(|error| {
+        repair_tail_refusal("symbol_rebuild", "ext4", None, format!("{error:#}"))
+    })?;
+    let admitted = preflight_ext4_repair_groups(&cx, &tail_fs, specs, groups, "symbol_rebuild")?;
     let byte_dev = FileByteDevice::open(path)
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     let block_dev = ByteBlockDevice::new(byte_dev, block_size)
         .with_context(|| format!("failed to create block device (block_size={block_size})"))?;
-    let spec_by_group: BTreeMap<u32, Ext4RepairGroupSpec> = specs
-        .iter()
-        .copied()
-        .map(|spec| (spec.group, spec))
-        .collect();
-
-    let mut unique_groups = BTreeSet::new();
-    unique_groups.extend(groups.iter().copied());
-
     let mut rebuilt_groups = 0_u64;
     let mut failed_groups = 0_u64;
-    for group in unique_groups {
-        let Some(spec) = spec_by_group.get(&group).copied() else {
-            failed_groups = failed_groups.saturating_add(1);
-            limitations.push(format!(
-                "cannot rebuild symbols for ext4 group {group}: group layout is unavailable"
-            ));
-            continue;
-        };
-        if let Err(error) = ext4_repair_tail_free(&cx, &tail_fs, &spec) {
-            failed_groups = failed_groups.saturating_add(1);
-            limitations.push(format!("{error:#}"));
-            continue;
-        }
+    for spec in admitted {
+        let group = spec.group;
 
         let encoded = match encode_group(
             &cx,
@@ -2234,6 +2448,44 @@ pub fn scrub_range_for_repair(
     Ok(merge_scrub_reports(reports))
 }
 
+/// Explicit rebuild must prove its entire target set before bootstrap or journal
+/// recovery can change the image. Ordinary source recovery keeps its own path;
+/// its subsequent symbol refresh is preflighted by the rebuild helper.
+fn preflight_explicit_rebuild(path: &PathBuf, block_group: Option<u32>) -> Result<()> {
+    let phase = "before_recovery";
+    let cx = cli_cx();
+    let fs = open_for_repair_tail_check(&cx, path)
+        .map_err(|error| repair_tail_refusal(phase, "unknown", None, format!("{error:#}")))?;
+    require_clean_repair_tail_state(&fs, phase)?;
+    if let Some(sb) = fs.ext4_superblock() {
+        let specs = build_ext4_repair_group_specs(sb)
+            .map_err(|error| repair_tail_refusal(phase, "ext4", None, format!("{error:#}")))?;
+        let groups = block_group.map_or_else(
+            || specs.iter().map(|spec| spec.group).collect(),
+            |group| vec![group],
+        );
+        preflight_ext4_repair_groups(&cx, &fs, &specs, &groups, phase)?;
+    } else if let Some(sb) = fs.btrfs_superblock() {
+        let block_size = choose_btrfs_scrub_block_size(fs.device_len(), sb.nodesize, sb.sectorsize)
+            .map_err(|error| repair_tail_refusal(phase, "btrfs", None, format!("{error:#}")))?;
+        let specs = discover_btrfs_repair_group_specs(path, block_size)
+            .map_err(|error| repair_tail_refusal(phase, "btrfs", None, format!("{error:#}")))?;
+        // The existing btrfs explicit-rebuild path writes every discovered
+        // group, even when --block-group narrows the preceding scrub.
+        let groups: Vec<_> = specs.iter().map(|spec| spec.group).collect();
+        if groups.is_empty() {
+            return Err(repair_tail_refusal(
+                phase,
+                "btrfs",
+                None,
+                "no repair groups discovered".to_owned(),
+            ));
+        }
+        preflight_btrfs_repair_groups(&cx, &fs, &specs, &groups, block_size, phase)?;
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_lines)]
 pub fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Result<RepairOutput> {
     let flags = options.flags;
@@ -2249,6 +2501,10 @@ pub fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Res
     );
     if repair_coordination.output.is_blocked() {
         limitations.push(repair_coordination.output.detail.clone());
+    }
+    let rebuild_symbols_requested = flags.rebuild_symbols() && !flags.verify_only();
+    if rebuild_symbols_requested && repair_coordination.writes_allowed {
+        preflight_explicit_rebuild(path, options.block_group)?;
     }
     let (flavor, bootstrap_recovery_source) = detect_flavor_with_optional_btrfs_bootstrap(
         &cx,
@@ -2266,7 +2522,6 @@ pub fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Res
             format!("failed to detect ext4/btrfs metadata in {}", path.display())
         }
     })?;
-    let rebuild_symbols_requested = flags.rebuild_symbols() && !flags.verify_only();
     if flags.rebuild_symbols() && flags.verify_only() {
         limitations.push("--rebuild-symbols is ignored when --verify-only is set".to_owned());
     }
@@ -2735,6 +2990,8 @@ pub fn build_repair_output(path: &PathBuf, options: RepairCommandOptions) -> Res
                             }
                         }
                         Err(error) => {
+                            stats.symbol_rebuild_failed_groups =
+                                u64::try_from(rebuild_groups.len()).unwrap_or(u64::MAX);
                             limitations
                                 .push(format!("btrfs symbol rebuild attempt failed: {error:#}"));
                         }

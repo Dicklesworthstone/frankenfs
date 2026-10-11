@@ -16622,6 +16622,363 @@ finally:
     serde_json::from_slice(&output.stdout).expect("mounted seed/sprout inventory JSON")
 }
 
+fn repair_tail_sha256(directory: &Path, path: &Path) -> String {
+    let output = btrfs_seed_sprout_run(directory, Command::new("sha256sum").arg(path));
+    String::from_utf8(output.stdout)
+        .unwrap()
+        .split_whitespace()
+        .next()
+        .expect("SHA256 output")
+        .to_owned()
+}
+
+fn repair_tail_kernel_manifest(directory: &Path, mountpoint: &Path) -> Value {
+    let script = r"
+import hashlib, json, os, sys
+root = sys.argv[1]
+files = {}
+for base, dirs, names in os.walk(root):
+    dirs.sort()
+    for name in sorted(names):
+        path = os.path.join(base, name)
+        if not os.path.isfile(path):
+            continue
+        digest = hashlib.sha256()
+        with open(path, 'rb') as file:
+            while data := file.read(1024 * 1024):
+                digest.update(data)
+        files[os.path.relpath(path, root)] = {
+            'bytes': os.stat(path).st_size, 'sha256': digest.hexdigest()
+        }
+assert set(files) == {'sentinel', 'payload'}, files
+assert open(os.path.join(root, 'sentinel'), 'rb').read() == b'repair must preserve this file\n'
+print(json.dumps(files, sort_keys=True))
+";
+    let output = btrfs_seed_sprout_run(
+        directory,
+        Command::new("sudo")
+            .args(["-n", "python3", "-c", script])
+            .arg(mountpoint),
+    );
+    serde_json::from_slice(&output.stdout).expect("kernel file manifest")
+}
+
+fn repair_tail_fill_kernel_image(directory: &Path, mountpoint: &Path, image_bytes: u64) {
+    let script = r"
+import errno, json, os, random, sys
+root, limit = sys.argv[1], int(sys.argv[2])
+with open(os.path.join(root, 'sentinel'), 'xb') as file:
+    file.write(b'repair must preserve this file\n')
+    file.flush()
+    os.fsync(file.fileno())
+chunk = random.Random(312).randbytes(1024 * 1024)
+written, full = 0, False
+enospc_allocation_sizes = []
+fd = os.open(os.path.join(root, 'payload'), os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+try:
+    # Large-allocation ENOSPC can leave smaller holes in the repair tail.
+    # Fill those with progressively smaller writes before declaring it full.
+    for allocation_bytes in (len(chunk), 64 * 1024, 4096):
+        while written < limit:
+            try:
+                os.posix_fallocate(fd, written, allocation_bytes)
+                count = os.pwrite(fd, chunk[:allocation_bytes], written)
+                assert count == allocation_bytes, count
+                os.fsync(fd)
+                written += count
+            except OSError as error:
+                if error.errno != errno.ENOSPC:
+                    raise
+                enospc_allocation_sizes.append(allocation_bytes)
+                full = allocation_bytes == 4096
+                break
+finally:
+    os.close(fd)
+assert full, 'kernel did not reach ENOSPC within the image capacity'
+assert written > limit // 4, written
+stat = os.statvfs(root)
+print(json.dumps({'kernel_errno': errno.ENOSPC, 'written_bytes': written,
+                  'enospc_allocation_sizes': enospc_allocation_sizes,
+                  'free_blocks': stat.f_bfree, 'available_blocks': stat.f_bavail,
+                  'fragment_size': stat.f_frsize}))
+";
+    btrfs_seed_sprout_run(
+        directory,
+        Command::new("sudo")
+            .args(["-n", "python3", "-c", script])
+            .arg(mountpoint)
+            .arg(image_bytes.to_string()),
+    );
+}
+
+fn repair_tail_check_image(directory: &Path, image: &Path, fstype: &str) {
+    let mut checker = Command::new(if fstype == "ext4" { "e2fsck" } else { "btrfs" });
+    if fstype == "ext4" {
+        checker.args(["-f", "-n"]);
+    } else {
+        checker.args(["check", "--readonly"]);
+    }
+    btrfs_seed_sprout_run(directory, checker.arg(image));
+}
+
+fn repair_tail_refuse_background_mount(directory: &Path, cli: &Path, image: &Path) {
+    let logs = directory.join("background-refusal");
+    fs::create_dir(&logs).unwrap();
+    let mountpoint = logs.join("mount");
+    fs::create_dir(&mountpoint).unwrap();
+    let ledger = logs.join("ledger.jsonl");
+    let child = Command::new(cli)
+        .arg("mount")
+        .arg(image)
+        .arg(&mountpoint)
+        .args(["--background-repair", "--background-scrub-ledger"])
+        .arg(&ledger)
+        .stdout(fs::File::create(logs.join("stdout.log")).unwrap())
+        .stderr(fs::File::create(logs.join("stderr.log")).unwrap())
+        .spawn()
+        .expect("spawn repair-enabled mount");
+    let mut mount = BtrfsCliMount {
+        child,
+        mountpoint,
+        directory: logs.clone(),
+        finished: false,
+    };
+    let start = Instant::now();
+    let mut mounted = false;
+    while mount.child.try_wait().unwrap().is_none() && start.elapsed() < Duration::from_secs(30) {
+        mounted |= mountinfo_has_mountpoint(&mount.mountpoint);
+        if mounted {
+            break;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+    mounted |= mountinfo_has_mountpoint(&mount.mountpoint);
+    let exit = mount.finish();
+    let stderr = fs::read_to_string(logs.join("stderr.log")).unwrap();
+    btrfs_cli_record(
+        directory,
+        &serde_json::json!({
+            "event": "repair_tail_background_refusal", "mounted": mounted,
+            "exit": exit, "stderr": stderr, "ledger_created": ledger.exists(),
+        }),
+    );
+    assert!(!mounted, "unsafe repair plan reached FUSE startup");
+    assert_eq!(exit["forced_stop"], false, "{exit}");
+    assert!(exit["exit_code"].as_i64().is_some_and(|code| code != 0));
+    assert!(stderr.contains("FFS_REPAIR_TAIL_UNSAFE"), "{stderr}");
+    assert!(
+        !ledger.exists(),
+        "unsafe plan created a scrub worker ledger"
+    );
+}
+
+fn repair_tail_full_image(
+    directory: &Path,
+    fstype: &str,
+    image_bytes: u64,
+) -> (PathBuf, Value, Value) {
+    let image = directory.join(format!("full.{fstype}"));
+    fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(&image)
+        .unwrap()
+        .set_len(image_bytes)
+        .unwrap();
+    let mut mkfs = Command::new(format!("mkfs.{fstype}"));
+    if fstype == "ext4" {
+        mkfs.args([
+            "-F",
+            "-b",
+            "4096",
+            "-E",
+            "lazy_itable_init=0,lazy_journal_init=0",
+        ]);
+    } else {
+        // Share DATA and METADATA allocation so the fill can occupy their
+        // common tail. Mixed groups require equal sector and node sizes;
+        // the FIEMAP assertion still proves the refused tail holds payload.
+        mkfs.args([
+            "-f", "-M", "-s", "4096", "-n", "4096", "-d", "single", "-m", "single",
+        ]);
+    }
+    btrfs_seed_sprout_run(directory, mkfs.arg(&image));
+    let mountpoint = directory.join("kernel");
+    fs::create_dir(&mountpoint).unwrap();
+    let mut kernel = KernelDevices {
+        loops: Vec::new(),
+        mounted: None,
+    };
+    let device = kernel.attach(directory, &image, false);
+    btrfs_seed_sprout_run(
+        directory,
+        Command::new("sudo")
+            .args(["-n", "mount", "-t", fstype, "-o", "rw"])
+            .arg(&device)
+            .arg(&mountpoint),
+    );
+    kernel.mounted = Some(mountpoint.clone());
+    repair_tail_fill_kernel_image(directory, &mountpoint, image_bytes);
+    let files = repair_tail_kernel_manifest(directory, &mountpoint);
+    let fiemap = query_fiemap_with_options(
+        &mountpoint.join("payload"),
+        4096,
+        FIEMAP_REQUEST_FLAG_SYNC,
+        None,
+    );
+    assert!(fiemap["errno"].is_null(), "kernel FIEMAP failed: {fiemap}");
+    assert_eq!(
+        fiemap["extents"].as_array().unwrap().last().unwrap()["last"],
+        true,
+        "kernel FIEMAP must include the complete payload mapping"
+    );
+    kernel.detach(directory);
+    (image, files, fiemap)
+}
+
+fn repair_tail_assert_live_overlap(report: &Value, fiemap: &Value, fstype: &str) {
+    let refusal = &report["refusal"];
+    assert_eq!(refusal["code"], "FFS_REPAIR_TAIL_UNSAFE");
+    assert_eq!(refusal["filesystem"], fstype);
+    assert_eq!(refusal["phase"], "before_recovery");
+    let group = refusal["group"].as_u64().expect("refused repair group");
+    let detail = refusal["detail"].as_str().unwrap();
+    // A Btrfs physical-super-stripe refusal has a different address space and
+    // cannot prove that this payload occupies the logical repair tail.
+    let prefix = format!("{fstype} group {group} repair tail [");
+    let range = detail
+        .strip_prefix(&prefix)
+        .expect("allocated-tail refusal in the filesystem's allocation address space");
+    let (range, _) = range.split_once(") overlaps ").unwrap();
+    let (first, end) = range.split_once(", ").unwrap();
+    // ext4 reports physical blocks; Btrfs reports logical bytes, which is the
+    // address space returned by kernel Btrfs FIEMAP. The ext4 fixture uses 4KiB.
+    let unit = if fstype == "ext4" { 4096 } else { 1 };
+    let first = first.parse::<u64>().unwrap() * unit;
+    let end = end.parse::<u64>().unwrap() * unit;
+    assert!(first < end, "refused tail must have a nonempty range");
+    assert!(
+        fiemap["extents"].as_array().unwrap().iter().any(|extent| {
+            let physical = extent["physical"].as_u64().unwrap();
+            let length = extent["length"].as_u64().unwrap();
+            let flags = fiemap_extent_flags(extent);
+            physical > 0
+                && flags & (0x0002 | 0x0004 | 0x0008 | FIEMAP_EXTENT_UNWRITTEN_FLAG) == 0
+                && physical < end
+                && physical
+                    .checked_add(length)
+                    .is_some_and(|last| last > first)
+        }),
+        "refused tail must overlap written payload bytes according to the kernel: {report}; {fiemap}"
+    );
+}
+
+fn repair_tail_verify_files(directory: &Path, image: &Path, fstype: &str, expected: &Value) {
+    let mountpoint = directory.join("kernel");
+    let mut kernel = KernelDevices {
+        loops: Vec::new(),
+        mounted: None,
+    };
+    let device = kernel.attach(directory, image, true);
+    let options = if fstype == "ext4" {
+        "ro,noload"
+    } else {
+        "ro,rescue=nologreplay"
+    };
+    btrfs_seed_sprout_run(
+        directory,
+        Command::new("sudo")
+            .args(["-n", "mount", "-t", fstype, "-o", options])
+            .arg(&device)
+            .arg(&mountpoint),
+    );
+    kernel.mounted = Some(mountpoint.clone());
+    assert_eq!(
+        &repair_tail_kernel_manifest(directory, &mountpoint),
+        expected
+    );
+    kernel.detach(directory);
+}
+
+fn assert_repair_tail_cli_refusal(fstype: &str, image_bytes: u64) {
+    let Some(cli) = btrfs_cli_proof_binary() else {
+        return;
+    };
+    if !can_run_sudo()
+        || [
+            "mkfs.ext4",
+            "mkfs.btrfs",
+            "e2fsck",
+            "btrfs",
+            "losetup",
+            "mount",
+            "umount",
+            "python3",
+        ]
+        .iter()
+        .any(|name| !command_available(name))
+    {
+        require_fuse_or_skip(
+            "repair-tail proof needs sudo, filesystem tools and kernel loop mounts",
+        );
+        return;
+    }
+    let parent = PathBuf::from(std::env::var_os("FFS_CLI_ARTIFACT_DIR").unwrap());
+    fs::create_dir_all(&parent).unwrap();
+    let directory = TempDir::new_in(parent).unwrap().keep();
+    let (image, before_files, fiemap) = repair_tail_full_image(&directory, fstype, image_bytes);
+    repair_tail_check_image(&directory, &image, fstype);
+    let before_image = repair_tail_sha256(&directory, &image);
+    let binary_sha256 = repair_tail_sha256(&directory, &cli);
+    let output = Command::new(&cli)
+        .arg("repair")
+        .arg(&image)
+        .args(["--rebuild-symbols", "--json"])
+        .output()
+        .unwrap();
+    fs::write(directory.join("repair-stdout.json"), &output.stdout).unwrap();
+    fs::write(directory.join("repair-stderr.log"), &output.stderr).unwrap();
+    let report: Value = serde_json::from_slice(&output.stdout).expect("CLI refusal JSON");
+    btrfs_cli_record(
+        &directory,
+        &serde_json::json!({
+            "event": "repair_tail_offline_refusal", "filesystem": fstype,
+            "proof_class": "live_public_cli_invocation", "binary_sha256": binary_sha256,
+            "source_stamp": std::env::var("FFS_CLI_SOURCE_STAMP").unwrap(),
+            "status": output.status.to_string(), "report": report,
+            "image_sha256": before_image, "files": before_files,
+            "kernel_payload_fiemap": fiemap, "overlap_owner": "payload",
+        }),
+    );
+    assert!(
+        !output.status.success(),
+        "unsafe rebuild returned success: {report}"
+    );
+    repair_tail_assert_live_overlap(&report, &fiemap, fstype);
+    assert_eq!(repair_tail_sha256(&directory, &image), before_image);
+    repair_tail_refuse_background_mount(&directory, &cli, &image);
+    assert_eq!(repair_tail_sha256(&directory, &image), before_image);
+    repair_tail_check_image(&directory, &image, fstype);
+    repair_tail_verify_files(&directory, &image, fstype, &before_files);
+    assert_eq!(repair_tail_sha256(&directory, &image), before_image);
+    assert_eq!(repair_tail_sha256(&directory, &cli), binary_sha256);
+    emit_scenario_result(
+        &format!("{fstype}_repair_tail_refusal_bd_plamw"),
+        "PASS",
+        Some(&format!("artifacts={}", directory.display())),
+    );
+}
+
+#[test]
+fn ext4_cli_repair_tail_refusal_preserves_full_image_bd_plamw() {
+    assert_repair_tail_cli_refusal("ext4", 64 * 1024 * 1024);
+}
+
+#[test]
+fn btrfs_cli_repair_tail_refusal_preserves_full_image_bd_plamw() {
+    assert_repair_tail_cli_refusal("btrfs", 256 * 1024 * 1024);
+}
+
 #[test]
 fn btrfs_cli_seed_sprout_reads_kernel_generated_files() {
     let Some(cli) = btrfs_cli_proof_binary() else {

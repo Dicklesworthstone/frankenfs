@@ -129,11 +129,13 @@ Mounted automatic repair is implemented as an explicit opt-in mode. Default
 read-only mounts run detection-only scrub, read-write mounts keep background
 scrub disabled unless requested, and `--background-repair
 --background-scrub-ledger <jsonl>` grants the daemon permission to recover
-blocks and refresh repair symbols with durable evidence. Read-write mounted
-repair routes recovered source blocks through the mounted MVCC repair-writeback
-serializer before symbol refresh; `bd-rchk6` is closed for the V1.x lifecycle
-decision, while xfstests, mounted CI, and performance baselines remain tracked
-separately.
+blocks and refresh repair symbols with durable evidence on admitted read-only
+mounts. The read-write repair serializer exists, but CLI admission remains
+blocked until repair storage is reserved from the allocator. `bd-plamw` supplies
+the interim whole-plan allocation check and fail-closed startup/refusal path;
+`bd-11a8t` retains the allocator-owned storage and default lifecycle work.
+Historical `bd-rchk6` closure does not establish that storage contract. Xfstests,
+mounted CI, and performance baselines remain tracked separately.
 
 ### 1.1 Deliverable Summary
 
@@ -853,10 +855,13 @@ follows:
 
 **Storage Layout:**
 
-Repair symbols are stored in reserved blocks at the end of each block group.
-The number of reserved blocks is `ceil(blocks_per_group * repair_ratio)`. These
-blocks are marked as used in the block bitmap but are not part of the regular
-allocation pool.
+The required storage contract places repair symbols in reserved blocks at the
+end of each block group. The number of reserved blocks is
+`ceil(blocks_per_group * repair_ratio)`. These blocks must be marked as used in
+the block bitmap and excluded from the regular allocation pool. This reservation
+is not yet implemented. The interim `bd-plamw` path checks every target before
+writing symbols/descriptors and rejects unsafe plans; it does not satisfy the
+permanent reservation requirement.
 
 **Repair Flow:**
 

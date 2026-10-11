@@ -9,8 +9,25 @@
 > the tracked parity denominator is recorded in `bd-rchk1` through `bd-rchk7`.
 > Mounted self-healing now has an explicit repair-enabled read-only mount mode
 > (`--background-repair --background-scrub-ledger <jsonl>`); read-write mounted
-> automatic repair remains scoped out until repair writeback is serialized with
-> client write traffic.
+> automatic repair remains blocked until repair storage is reserved from client
+> allocations; the mounted writeback serializer alone is insufficient.
+>
+> **Repair-tail admission (`bd-plamw`):** CLI plan construction validates every
+> requested symbol/descriptor range before opening a writer. Explicit rebuild
+> does this before journal/superblock recovery, and repair-enabled mounts reject
+> an unsafe complete plan before creating a scrub worker. `ffs-core` provides
+> allocation inspection using the ext4 bitmap plus allocator metadata geometry
+> or the Btrfs extent tree. The contiguous Btrfs writer requires one unambiguous
+> chunk covering its entire range, with aligned physical coverage, no physical
+> aliases through another chunk or DUP copy, and reserved superblock stripes
+> excluded. `ffs-cli` owns plan selection and typed
+> `FFS_REPAIR_TAIL_UNSAFE` evidence. Ordinary source recovery retains its existing
+> path, then preflights the complete symbol-refresh set. Eight core and 23 CLI
+> controls passed, as did real kernel-filled ext4/Btrfs refusal tests proving
+> written-tail overlap, unchanged full images and file contents, clean filesystem
+> checks, and refusal before background worker startup. Exact source and execution
+> provenance is recorded in `FEATURE_PARITY.md`; allocator-owned storage remains
+> required.
 
 ---
 

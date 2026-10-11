@@ -359,6 +359,20 @@ Each block group has two bitmaps:
 For a standard 4096-byte block size with 32768 blocks per group, the block
 bitmap is exactly one block (4096 bytes = 32768 bits = 32768 blocks tracked).
 
+**Lazy-bitmap allocation contract:** Linux v6.19
+[`fs/ext4/balloc.c`](https://github.com/torvalds/linux/blob/v6.19/fs/ext4/balloc.c)
+(`ext4_read_block_bitmap_nowait`, `ext4_init_block_bitmap`,
+`num_clusters_in_group`) treats `BLOCK_UNINIT` as authoritative only with
+group-descriptor checksums and rejects a checksummed lazy group zero. Undefined
+bitmap bytes do not establish free space. Reserved superblock/GDT, bitmap and
+inode-table clusters remain occupied; partial final-group padding is unavailable.
+Bigalloc indexes clusters, not individual blocks. Repair admission must account
+for those reservations, including FLEX_BG metadata, before treating a tail as
+free. In [`fs/ext4/super.c::ext4_check_descriptors`](https://github.com/torvalds/linux/blob/v6.19/fs/ext4/super.c),
+FLEX_BG descriptor bounds cover the whole filesystem, so a repair proof must
+include metadata owned by groups outside the nominal flex neighborhood too.
+This extracted contract is separate from executed repair evidence.
+
 ### 2.4 Inode Table
 
 The inode table is a contiguous array of on-disk `ext4_inode` structures.
@@ -2516,6 +2530,12 @@ For metadata blocks, verification includes:
 6. Key comparison is strictly lexicographic on (objectid, type, offset).
 7. The superblock has copies at offsets 0x10000, 0x4000000, and
    0x4000000000 (64KB, 64MB, 256GB).
+   Linux v6.19 [`fs/btrfs/block-group.c::exclude_super_stripes`](https://github.com/torvalds/linux/blob/v6.19/fs/btrfs/block-group.c#L2068-L2116)
+   excludes their stripes independently of extent-tree allocations. For the
+   single-device contiguous repair layout, each present mirror excludes 64KiB
+   from its physical offset; logical space below 64KiB is also excluded.
+   An empty extent-tree lookup therefore cannot
+   establish that a repair tail overlapping such a stripe is available.
 8. Tree block checksums cover everything after the checksum field itself.
 9. Each subvolume is an independent B-tree sharing blocks with other
    subvolumes via reference counting.
@@ -2526,6 +2546,11 @@ For metadata blocks, verification includes:
     contiguous bytes before the next such boundary, not the entire request.
     Each segment must return exactly its requested length; a short mirror
     read is a failed attempt and may fall back to another copy of that segment.
+    Linux v6.19 [`check_chunk_block_group_mappings`](https://github.com/torvalds/linux/blob/v6.19/fs/btrfs/block-group.c#L2160-L2204)
+    also requires each block group to match its chunk's start, length and type.
+    Repair's contiguous physical writer must prove its entire span lies within
+    one unambiguous chunk: matching the first and last byte cannot establish
+    the mapping of an interior hole, remapping or overlapping chunk.
     RAID5/6 parity is not a readable mirror and requires separate reconstruction.
     For RAID5/6, Linux v6.19 `map_blocks_raid56_read` in
     [`fs/btrfs/volumes.c`](https://github.com/torvalds/linux/blob/v6.19/fs/btrfs/volumes.c#L6074-L6085)
