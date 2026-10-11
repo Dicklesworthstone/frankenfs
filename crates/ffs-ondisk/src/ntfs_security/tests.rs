@@ -290,7 +290,7 @@ fn sii_index_rejects_wrong_collation_bounds_identity_order_and_terminators() {
         false,
     );
     assert!(NtfsSecurityIndexRoot::parse(&duplicate, 512).is_err());
-    let mut no_terminal = source.clone();
+    let mut no_terminal = source;
     no_terminal.truncate(no_terminal.len() - 16);
     assert!(NtfsSecurityIndexRoot::parse(&no_terminal, 512).is_err());
 }

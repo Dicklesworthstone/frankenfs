@@ -496,7 +496,9 @@ pub fn decompress(
                 .decompress(input, &mut output, FlushDecompress::Finish)
                 .map_err(|_| invalid("invalid ZFS gzip zlib stream"))?;
             if status != Status::StreamEnd || decoder.total_out() != output_bytes as u64 {
-                return Err(invalid("incomplete ZFS gzip stream or logical length mismatch"));
+                return Err(invalid(
+                    "incomplete ZFS gzip stream or logical length mismatch",
+                ));
             }
         }
         14 => {
@@ -505,7 +507,9 @@ pub fn decompress(
             // caller's checksum and is not interpreted as more tokens.
             let mut at = 0;
             while output.len() < output_bytes {
-                let token = *input.get(at).ok_or_else(|| invalid("truncated ZLE token"))?;
+                let token = *input
+                    .get(at)
+                    .ok_or_else(|| invalid("truncated ZLE token"))?;
                 at += 1;
                 let length = if token < 64 {
                     usize::from(token) + 1
@@ -587,6 +591,52 @@ pub fn decompress(
     Ok(output)
 }
 
+// Decode these sizes before libzstd parses the header: its helper rejects very
+// large windows first and uses the largest u64 values as status sentinels.
+// A stored content size must never become an absent size through that API.
+fn zstd_frame_sizes(payload: &[u8]) -> Result<(u64, Option<u64>), ParseError> {
+    let descriptor = *payload
+        .first()
+        .ok_or_else(|| invalid("missing Zstandard frame descriptor"))?;
+    let single_segment = descriptor & 0x20 != 0;
+    let dictionary_width = match descriptor & 3 {
+        0 => 0,
+        1 => 1,
+        2 => 2,
+        _ => 4,
+    };
+    let encoded_length = match descriptor >> 6 {
+        0 => usize::from(single_segment),
+        flag => 1_usize << flag,
+    };
+    let field_start = 1 + usize::from(!single_segment) + dictionary_width;
+    let field = payload
+        .get(field_start..field_start + encoded_length)
+        .ok_or_else(|| invalid("truncated Zstandard frame header"))?;
+    let content_size = if field.is_empty() {
+        None
+    } else {
+        let mut bytes = [0; 8];
+        bytes[..encoded_length].copy_from_slice(field);
+        let size = u64::from_le_bytes(bytes);
+        Some(if encoded_length == 2 {
+            size + 256
+        } else {
+            size
+        })
+    };
+    let window = if single_segment {
+        content_size.ok_or_else(|| invalid("missing Zstandard single-segment size"))?
+    } else {
+        let descriptor = *payload
+            .get(1)
+            .ok_or_else(|| invalid("missing Zstandard window descriptor"))?;
+        let base = 1_u64 << (10 + u32::from(descriptor >> 3));
+        base + (base / 8) * u64::from(descriptor & 7)
+    };
+    Ok((window, content_size))
+}
+
 /// OpenZFS zfs-2.3.0 zstd.h/zfs_zstd.c: an eight-byte native wrapper
 /// followed by one magicless Zstandard frame. The wrapper is always big-endian.
 fn decompress_zstd(input: &[u8], output: &mut [u8]) -> Result<(), ParseError> {
@@ -618,6 +668,18 @@ fn decompress_zstd(input: &[u8], output: &mut [u8]) -> Result<(), ParseError> {
         return Err(invalid("invalid ZFS Zstandard compression level"));
     }
 
+    // Bulk decoding need not apply the streaming window limit. Check the raw
+    // advertised sizes before even copying the frame or constructing a context.
+    let (window, declared_size) = zstd_frame_sizes(payload)?;
+    if window > MAX_BLOCK_BYTES as u64 {
+        return Err(invalid("Zstandard window exceeds read budget"));
+    }
+    if declared_size.is_some_and(|size| size != output.len() as u64) {
+        return Err(invalid(
+            "Zstandard content size disagrees with logical length",
+        ));
+    }
+
     // Restoring the fixed magic permits the stable safe decoder API without
     // experimental format parameters. This copy stays within the input budget.
     let frame_bytes = packed
@@ -632,38 +694,27 @@ fn decompress_zstd(input: &[u8], output: &mut [u8]) -> Result<(), ParseError> {
     let content_size = zstd_safe::get_frame_content_size(&frame)
         .map_err(|_| invalid("invalid Zstandard frame header"))?;
 
-    // Bulk decoding need not apply the streaming window limit. Check the
-    // advertised window before constructing a context as well as setting its
-    // safe parameter: a small LSIZE must not admit a huge window allocation.
-    let window = if payload[0] & 0x20 != 0 {
-        content_size.ok_or_else(|| invalid("missing Zstandard single-segment size"))?
-    } else {
-        let descriptor = *payload
-            .get(1)
-            .ok_or_else(|| invalid("missing Zstandard window descriptor"))?;
-        let base = 1_u64 << (10 + u32::from(descriptor >> 3));
-        base + (base / 8) * u64::from(descriptor & 7)
-    };
-    if window > MAX_BLOCK_BYTES as u64 {
-        return Err(invalid("Zstandard window exceeds read budget"));
-    }
     if content_size.is_some_and(|size| size != output.len() as u64) {
-        return Err(invalid("Zstandard content size disagrees with logical length"));
+        return Err(invalid(
+            "Zstandard content size disagrees with logical length",
+        ));
     }
     let frame_size = zstd_safe::find_frame_compressed_size(&frame)
         .map_err(|_| invalid("incomplete or invalid Zstandard frame"))?;
     if frame_size != frame.len() {
-        return Err(invalid("Zstandard native length contains trailing frame data"));
+        return Err(invalid(
+            "Zstandard native length contains trailing frame data",
+        ));
     }
     let mut decoder =
         DCtx::try_create().ok_or_else(|| invalid("Zstandard context allocation failed"))?;
     decoder
         .set_parameter(DParameter::WindowLogMax(MAX_BLOCK_BYTES.ilog2()))
         .map_err(|_| invalid("Zstandard window limit could not be set"))?;
-    let decoded = decoder
+    let bytes_written = decoder
         .decompress(output, &frame)
         .map_err(|_| invalid("invalid Zstandard compressed data"))?;
-    if decoded != output.len() {
+    if bytes_written != output.len() {
         return Err(invalid("Zstandard logical length mismatch"));
     }
     Ok(())
@@ -812,7 +863,7 @@ mod embedded_tests {
         bp = good.clone();
         bp.words[6] &= !(1_u64 << 39);
         assert!(bp.decode_embedded().is_err());
-        bp = good.clone();
+        bp = good;
         bp.words[6] = (bp.words[6] & !(0x7f_u64 << 25)) | (112_u64 << 25);
         assert!(bp.decode_embedded().is_err());
         assert!(

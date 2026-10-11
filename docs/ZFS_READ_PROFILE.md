@@ -630,3 +630,25 @@ Independent vectors and format:
 and [Zstandard framing specification](https://github.com/facebook/zstd/blob/v1.5.7/doc/zstd_compression_format.md).
 The implementation uses the existing pinned zstd 0.13.3 / zstd-safe 7.2.4 dependency;
 no new package versions or experimental API features are introduced.
+
+### Bounded Zstandard header execution validation
+
+The decoder now reads the native frame's window and optional content size before
+restoring magic bytes, copying the frame or constructing a libzstd context. This
+preserves FrankenFS's 16 MiB budget even when a header exceeds libzstd's own
+window limit. An explicitly stored 64-bit content size must match LSIZE; values
+such as UINT64_MAX can no longer alias the library's "content size unknown"
+status and bypass the declared-size comparison. Dictionary-ID field widths and
+the native two-byte content-size bias are decoded before locating these fields.
+The existing header, frame extent, dictionary, checksum and output checks remain.
+
+The original ten Zstandard regressions are retained. An eleventh covers explicit
+64-bit sizes in both frame forms, all zero dictionary-ID widths, valid output
+and extreme values including both native sentinel values. The complete
+`cargo test -p ffs-ondisk --lib --locked` run passed 838 tests, including all
+eleven Zstandard and twelve NTFS security tests, with one compiler thread.
+`cargo clippy -p ffs-ondisk --all-targets --locked -- -D warnings` also passed.
+Changed Rust sources were parsed/formatted. The installed UBS launcher could
+not execute (permission denied); no UBS result is credited. Integrated CLI and
+native pool/mount execution remain unverified under the previously recorded
+resource and tool limits. These parser results do not qualify mirror mounts.

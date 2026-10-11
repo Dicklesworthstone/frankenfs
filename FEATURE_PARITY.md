@@ -1052,3 +1052,20 @@ Rust sources were parsed/formatted; integrated CLI checks/tests received SIGKILL
 while compiling `asupersync` under the shared memory limit. No native Windows,
 mounted security-enforcement or full-workspace gate credit is added.
 See `docs/NTFS_READ_PROFILE.md` for fields, boundaries and commands.
+
+### ZFS raw Zstandard size admission
+
+A bounded native-header preflight checks the advertised window before libzstd
+header parsing and distinguishes an explicit 64-bit content size from library
+status sentinels. Oversized windows and declared-size/LSIZE disagreements fail
+before frame copying or decoder-context creation. Existing physical checksums,
+single-frame consumption, dictionary refusal and exact output bounds remain.
+
+The original ten Zstandard tests and their assertions are retained; an eleventh
+covers both frame forms, every zero dictionary-ID width and extreme explicit
+sizes. The complete on-disk library suite passed 838 tests with no failures,
+and on-disk all-targets Clippy passed with warnings denied. This includes the
+merged NTFS security parser. Changed Rust sources were parsed/formatted. UBS
+could not execute its installed launcher (permission denied). CLI reader/FsOps,
+native OpenZFS and mounted mirror validation remain unexecuted; the parser
+results add no native-pool or mounted-readiness claim.
