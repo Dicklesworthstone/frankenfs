@@ -3,7 +3,7 @@
 use super::{
     CheckedBlock, Cx, FfsError, Object, Objects, Result, checkpoint, corrupt, parse, unsupported,
 };
-use ffs_ondisk::zfs_dmu::microzap;
+use ffs_ondisk::zfs_zap::names::{NamePolicy, microzap_with_names};
 use ffs_ondisk::zfs_zap::{Entry, FAT_TAG, FatHeader, MAX_ENTRIES, MICRO_TAG};
 use std::collections::BTreeSet;
 
@@ -14,6 +14,17 @@ impl Objects<'_> {
     /// Return the entire validated map or an error. No zero-filled missing
     /// leaves, skipped bad values, guessed integer widths or partial inventories.
     pub fn zap_values(&mut self, cx: &Cx, number: u64) -> Result<Vec<Entry>> {
+        self.zap_values_with_names(cx, number, NamePolicy::Unnormalized)
+    }
+
+    /// Only an owner that implements the corresponding naming contract may
+    /// opt into normalized metadata. The generic/ZPL path remains unnormalized.
+    pub(super) fn zap_values_with_names(
+        &mut self,
+        cx: &Cx,
+        number: u64,
+        policy: NamePolicy,
+    ) -> Result<Vec<Entry>> {
         let object = self.load(cx, number)?;
         let mut work = 0;
         let block = self.zap_block(cx, &object, 0, &mut work)?;
@@ -25,7 +36,8 @@ impl Objects<'_> {
             if object.node.max_block() != 0 {
                 return Err(corrupt("micro-ZAP unexpectedly has multiple blocks"));
             }
-            let entries = microzap(&block.bytes, block.order).map_err(|error| parse(&error))?;
+            let entries = microzap_with_names(&block.bytes, block.order, policy)
+                .map_err(|error| parse(&error))?;
             let entries = entries
                 .into_iter()
                 .map(|entry| Entry {
@@ -41,7 +53,7 @@ impl Objects<'_> {
         if tag != FAT_TAG {
             return Err(corrupt("object is neither a micro-ZAP nor a fat-ZAP"));
         }
-        let header = FatHeader::parse(&block.bytes, block.order, object.node.max_block())
+        let header = FatHeader::parse_with_names(&block.bytes, block.order, object.node.max_block(), policy)
             .map_err(|error| parse(&error))?;
         let table = if header.table_blocks().is_empty() {
             header

@@ -4,6 +4,8 @@
 //! payload byte orders. Header/table/leaf relationships are validated separately
 //! from physical I/O. Normalized and binary keys need their own naming contract.
 
+pub mod names;
+
 use crate::zfs::Endian;
 use ffs_types::ParseError;
 use std::collections::{BTreeMap, BTreeSet};
@@ -82,6 +84,7 @@ pub struct FatHeader {
     entries: usize,
     salt: u64,
     hash_bits: u32,
+    uppercase_names: bool,
 }
 
 /// One contiguous, aligned pointer-table interval belonging to a single leaf.
@@ -94,6 +97,17 @@ pub struct LeafRoute {
 
 impl FatHeader {
     pub fn parse(raw: &[u8], order: Endian, max_block: u64) -> Result<Self, ParseError> {
+        Self::parse_with_names(raw, order, max_block, names::NamePolicy::Unnormalized)
+    }
+
+    /// Explicitly admit the caller's implemented hash normalization. Returned
+    /// names retain their stored spelling; this does not choose lookup semantics.
+    pub fn parse_with_names(
+        raw: &[u8],
+        order: Endian,
+        max_block: u64,
+        policy: names::NamePolicy,
+    ) -> Result<Self, ParseError> {
         if !(512..=131_072).contains(&raw.len())
             || !raw.len().is_power_of_two()
             || order.u64(raw, 0)? != FAT_TAG
@@ -102,11 +116,12 @@ impl FatHeader {
             return Err(invalid("invalid fat-ZAP header or block size"));
         }
         let flags = order.u64(raw, 96)?;
-        if flags & !1 != 0 || order.u64(raw, 88)? != 0 {
+        if flags & !1 != 0 {
             return Err(invalid(
                 "normalized, binary or unknown ZAP keys are unsupported",
             ));
         }
+        let uppercase_names = policy.uppercase(order.u64(raw, 88)?)?;
         let shift = order.u64(raw, 32)?;
         if shift > u64::from(MAX_TABLE_ENTRIES.ilog2()) {
             return Err(invalid("ZAP pointer table exceeds entry budget"));
@@ -132,6 +147,7 @@ impl FatHeader {
             entries: entries as usize,
             salt: order.u64(raw, 80)?,
             hash_bits: if flags & 1 == 0 { 28 } else { 48 },
+            uppercase_names,
         };
         if header.salt == 0 || header.free_block < 2 || header.copied > header.table_blocks {
             return Err(invalid(
@@ -370,7 +386,15 @@ impl FatHeader {
                     return Err(invalid("ZAP string key is not exactly NUL terminated"));
                 }
                 name.truncate(name.len() - 1);
-                if name_hash(&name, self.salt, self.hash_bits) != hash
+                let expected_hash = if self.uppercase_names {
+                    if !name.is_ascii() {
+                        return Err(invalid("non-ASCII normalized ZAP keys need native Unicode tables"));
+                    }
+                    name_hash(&name.to_ascii_uppercase(), self.salt, self.hash_bits)
+                } else {
+                    name_hash(&name, self.salt, self.hash_bits)
+                };
+                if expected_hash != hash
                     || !names.insert(name.clone())
                 {
                     return Err(invalid("ZAP key hash mismatch or duplicate name"));
