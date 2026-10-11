@@ -1,5 +1,5 @@
-use super::*;
 use super::attributes::{extension, list_entry};
+use super::*;
 
 const SECURITY_LENGTH: usize = 2048 * 512;
 const COPY_DISTANCE: usize = 0x4_0000;
@@ -7,16 +7,12 @@ const SDS_SIZE: usize = COPY_DISTANCE + 720 + 116;
 const INDEX_LCN: usize = 1500;
 const DESCRIPTOR_HASH: u32 = 0xF1C7_5D8C;
 const DESCRIPTOR: [u8; 96] = [
-    1, 0, 4, 128, 20, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 48, 0, 0, 0,
-    1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0,
-    1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0,
-    2, 0, 48, 0, 2, 0, 0, 0,
-    1, 18, 20, 0, 2, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-    0, 3, 20, 0, 255, 1, 31, 0, 1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0,
+    1, 0, 4, 128, 20, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 48, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 5, 18, 0,
+    0, 0, 1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0, 2, 0, 48, 0, 2, 0, 0, 0, 1, 18, 20, 0,
+    2, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 3, 20, 0, 255, 1, 31, 0, 1, 1, 0, 0, 0, 0,
+    0, 5, 18, 0, 0, 0,
 ];
-const SDS_PAIRS: &[u8] = &[
-    0x21, 1, 88, 2, 0x22, 255, 1, 200, 0, 0x21, 2, 88, 2, 0,
-];
+const SDS_PAIRS: &[u8] = &[0x21, 1, 88, 2, 0x22, 255, 1, 200, 0, 0x21, 2, 88, 2, 0];
 
 fn standard(id: u32, flags: u32) -> [u8; 72] {
     let mut value = [0; 72];
@@ -173,20 +169,9 @@ fn secure_record(external: bool, bitmap: u8) -> Vec<u8> {
                 0x90,
                 1,
                 "$SII",
-                &index_root(
-                    &[index_key(0x200, 592, Some(0)), terminal(Some(8))],
-                    true,
-                ),
+                &index_root(&[index_key(0x200, 592, Some(0)), terminal(Some(8))], true),
             ),
-            named_mapping(
-                0xA0,
-                2,
-                "$SII",
-                16,
-                8192,
-                &[0x21, 16, 220, 5, 0],
-                false,
-            ),
+            named_mapping(0xA0, 2, "$SII", 16, 8192, &[0x21, 16, 220, 5, 0], false),
             resident(0xB0, 3, "$SII", &[bitmap]),
         ],
     )
@@ -275,13 +260,16 @@ fn shared_security_reads_resident_and_multilevel_sii_without_file_data_io() {
             assert_eq!(info.descriptor.owner.unwrap().to_string(), "S-1-5-18");
             assert_eq!(info.descriptor.dacl.ace_count, Some(2));
             let trace = reads.lock().unwrap();
-            assert!(!trace.iter().any(|(at, _)| *at == (BASE + 1700 * 512) as u64));
+            assert!(
+                !trace
+                    .iter()
+                    .any(|(at, _)| *at == (BASE + 1700 * 512) as u64)
+            );
             let sds_reads: Vec<_> = trace
                 .iter()
                 .copied()
                 .filter(|(at, _)| {
-                    *at >= (BASE + 600 * 512) as u64
-                        && *at < (BASE + INDEX_LCN * 512) as u64
+                    *at >= (BASE + 600 * 512) as u64 && *at < (BASE + INDEX_LCN * 512) as u64
                 })
                 .collect();
             assert_eq!(
@@ -351,7 +339,10 @@ fn security_identity_sii_and_split_sds_resolve_through_extension_catalogs() {
             ],
         ),
     );
-    image.put_record(30, &extension(30, 24, &[resident(0x10, 2, "", &standard(0x100, 0))]));
+    image.put_record(
+        30,
+        &extension(30, 24, &[resident(0x10, 2, "", &standard(0x100, 0))]),
+    );
     let mut first = named_mapping(
         DATA,
         0,
@@ -375,7 +366,10 @@ fn security_identity_sii_and_split_sds_resolve_through_extension_catalogs() {
     image.put_record(31, &extension(31, 9, &[last, resident_sii()]));
     let volume = open_security(image, Arc::default(), None).unwrap();
     let record = volume.record(&cx, 24, None).unwrap();
-    assert_eq!(volume.security_descriptor(&cx, &record).unwrap().bytes, DESCRIPTOR);
+    assert_eq!(
+        volume.security_descriptor(&cx, &record).unwrap().bytes,
+        DESCRIPTOR
+    );
 }
 
 #[test]
@@ -407,7 +401,13 @@ fn security_refuses_stale_extensions_and_never_falls_back_from_a_nonzero_id() {
             volume.security_descriptor(&cx, &record),
             Err(FfsError::Corruption { .. })
         ));
-        assert!(reads.lock().unwrap().iter().all(|(at, _)| *at < (BASE + 600 * 512) as u64));
+        assert!(
+            reads
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(at, _)| *at < (BASE + 600 * 512) as u64)
+        );
     }
 }
 
@@ -452,7 +452,13 @@ fn sds_headers_hashes_duplicate_bytes_and_initialized_ranges_are_enforced() {
             "case {case}"
         );
         if case >= 3 {
-            assert!(reads.lock().unwrap().iter().all(|(at, _)| *at < (BASE + 600 * 512) as u64));
+            assert!(
+                reads
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(at, _)| *at < (BASE + 600 * 512) as u64)
+            );
         }
     }
 }
@@ -478,7 +484,13 @@ fn sds_sparse_gaps_are_admitted_but_a_sparse_descriptor_is_not_read_as_zeroes() 
         let result = volume.security_descriptor(&cx, &record);
         if selected_hole {
             assert!(matches!(result, Err(FfsError::Corruption { .. })));
-            assert!(reads.lock().unwrap().iter().all(|(at, _)| *at < (BASE + 600 * 512) as u64));
+            assert!(
+                reads
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(at, _)| *at < (BASE + 600 * 512) as u64)
+            );
         } else {
             assert_eq!(result.unwrap().bytes, DESCRIPTOR);
         }
@@ -499,11 +511,8 @@ fn sii_tree_cycles_parent_bounds_bitmap_and_fixups_fail_before_sds_reads() {
                 image.bytes[at..at + 4096].copy_from_slice(&cycle);
             }
             3 => {
-                let misplaced = index_block(
-                    0,
-                    &[index_key(0x300, 720, None), terminal(None)],
-                    false,
-                );
+                let misplaced =
+                    index_block(0, &[index_key(0x300, 720, None), terminal(None)], false);
                 let at = BASE + INDEX_LCN * 512;
                 image.bytes[at..at + 4096].copy_from_slice(&misplaced);
             }
@@ -550,12 +559,21 @@ fn security_inspection_preserves_efs_and_reparse_data_provider_boundaries() {
         let volume = open_security(image, Arc::clone(&reads), None).unwrap();
         let record = volume.record(&cx, 24, None).unwrap();
         reads.lock().unwrap().clear();
-        assert_eq!(volume.security_descriptor(&cx, &record).unwrap().bytes, DESCRIPTOR);
+        assert_eq!(
+            volume.security_descriptor(&cx, &record).unwrap().bytes,
+            DESCRIPTOR
+        );
         assert!(matches!(
             volume.data_stream(&cx, &record, &[]),
             Err(FfsError::UnsupportedFeature(_))
         ));
-        assert!(!reads.lock().unwrap().iter().any(|(at, _)| *at == (BASE + 1700 * 512) as u64));
+        assert!(
+            !reads
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(at, _)| *at == (BASE + 1700 * 512) as u64)
+        );
     }
 }
 
@@ -582,4 +600,199 @@ fn security_metadata_cancellation_propagates_from_index_primary_and_duplicate_io
         ));
         assert_eq!(reads.lock().unwrap().last().unwrap().0, fail_at as u64);
     }
+}
+
+#[test]
+fn security_reports_exact_standard_fields_legacy_presence_and_secure_generation() {
+    let cx = Cx::for_testing();
+    for length in [48, 72] {
+        let mut image = security_image(false);
+        image.put_record(
+            24,
+            &file_record(
+                24,
+                &[
+                    resident(0x10, 2, "", &standard(0, 0)[..length]),
+                    resident(0x50, 3, "", &DESCRIPTOR),
+                ],
+            ),
+        );
+        let volume = open_security(image, Arc::default(), None).unwrap();
+        let record = volume.record(&cx, 24, Some(7)).unwrap();
+        let info = volume.security_descriptor(&cx, &record).unwrap();
+        assert_eq!(info.standard_security_id, (length == 72).then_some(0));
+        assert_eq!(info.security_id, None);
+        assert!(info.legacy_attribute_present);
+        assert!(info.secure_reference.is_none());
+    }
+    for legacy_present in [false, true] {
+        let mut image = security_image(false);
+        let mut attributes = vec![resident(0x10, 2, "", &standard(0x100, 0))];
+        if legacy_present {
+            attributes.push(resident(0x50, 3, "", &DESCRIPTOR));
+        }
+        image.put_record(24, &file_record(24, &attributes));
+        let mut secure = secure_record(false, 0);
+        secure[16..18].copy_from_slice(&91_u16.to_le_bytes());
+        image.put_record(9, &secure);
+        let volume = open_security(image, Arc::default(), None).unwrap();
+        let record = volume.record(&cx, 24, Some(7)).unwrap();
+        let info = volume.security_descriptor(&cx, &record).unwrap();
+        assert_eq!(info.standard_security_id, Some(0x100));
+        assert_eq!(info.security_id, Some(0x100));
+        assert_eq!(info.legacy_attribute_present, legacy_present);
+        let reference = info.secure_reference.unwrap();
+        assert_eq!((reference.record, reference.sequence), (9, 91));
+        assert_eq!(
+            info.descriptor.dacl.aces[0]
+                .sid
+                .as_ref()
+                .unwrap()
+                .to_string(),
+            "S-1-1-0"
+        );
+    }
+}
+
+#[test]
+fn sii_bitmap_must_cover_allocation_even_without_children_or_any_set_bits() {
+    let cx = Cx::for_testing();
+    for bitmap in [&[][..], &[0][..]] {
+        let mut image = security_image(false);
+        let blocks = if bitmap.is_empty() { 1_u8 } else { 9 };
+        let clusters = blocks * 8;
+        let allocation = named_mapping(
+            0xA0,
+            2,
+            "$SII",
+            u64::from(clusters),
+            u64::from(clusters) * 512,
+            &[0x21, clusters, 220, 5, 0],
+            false,
+        );
+        image.put_record(
+            9,
+            &file_record(
+                9,
+                &[
+                    sds_attribute(),
+                    resident_sii(),
+                    allocation,
+                    resident(0xB0, 3, "$SII", bitmap),
+                ],
+            ),
+        );
+        let reads: Reads = Arc::default();
+        let volume = open_security(image, Arc::clone(&reads), None).unwrap();
+        let record = volume.record(&cx, 24, None).unwrap();
+        reads.lock().unwrap().clear();
+        let error = volume.security_descriptor(&cx, &record).unwrap_err();
+        assert!(matches!(error, FfsError::Corruption { .. }));
+        assert!(error.to_string().contains("bitmap does not cover"));
+        assert!(
+            reads
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(at, _)| *at < (BASE + 600 * 512) as u64)
+        );
+    }
+}
+
+#[test]
+fn malformed_known_trustees_fail_after_matching_native_hashes_and_sds_copies() {
+    let cx = Cx::for_testing();
+    for shared in [false, true] {
+        let mut image = security_image(false);
+        let mut damaged = DESCRIPTOR;
+        damaged[64] = 2; // A deny ACE with a bounded but invalid SID revision.
+        if shared {
+            let hash = ffs_ondisk::ntfs_security::security_hash(&damaged);
+            let mut entry = security_header(0x100, 464).to_vec();
+            entry[..4].copy_from_slice(&hash.to_le_bytes());
+            entry.extend_from_slice(&damaged);
+            for copy in [0, COPY_DISTANCE] {
+                for (index, &byte) in entry.iter().enumerate() {
+                    image.bytes[sds_physical(464 + copy + index)] = byte;
+                }
+            }
+            let mut key = index_key(0x100, 464, None);
+            key[20..24].copy_from_slice(&hash.to_le_bytes());
+            image.put_record(
+                9,
+                &file_record(
+                    9,
+                    &[
+                        sds_attribute(),
+                        resident(0x90, 1, "$SII", &index_root(&[key, terminal(None)], false)),
+                    ],
+                ),
+            );
+        } else {
+            image.put_record(
+                24,
+                &file_record(
+                    24,
+                    &[
+                        resident(0x10, 2, "", &standard(0, 0)),
+                        resident(0x50, 3, "", &damaged),
+                    ],
+                ),
+            );
+        }
+        let volume = open_security(image, Arc::default(), None).unwrap();
+        let record = volume.record(&cx, 24, None).unwrap();
+        assert!(
+            matches!(
+                volume.security_descriptor(&cx, &record),
+                Err(FfsError::Corruption { .. })
+            ),
+            "shared={shared}"
+        );
+    }
+}
+
+#[test]
+fn secure_metadata_cannot_use_a_reparse_or_efs_provider_to_supply_sds_bytes() {
+    let cx = Cx::for_testing();
+    for provider in [
+        resident(0xC0, 3, "", &[0x17, 0, 0, 0x80, 0, 0, 0, 0]),
+        resident(0x10, 3, "", &standard(0, 0x4000)),
+    ] {
+        let mut image = security_image(false);
+        image.put_record(
+            9,
+            &file_record(9, &[sds_attribute(), resident_sii(), provider]),
+        );
+        let reads: Reads = Arc::default();
+        let volume = open_security(image, Arc::clone(&reads), None).unwrap();
+        let record = volume.record(&cx, 24, None).unwrap();
+        reads.lock().unwrap().clear();
+        assert!(matches!(
+            volume.security_descriptor(&cx, &record),
+            Err(FfsError::UnsupportedFeature(_))
+        ));
+        assert!(
+            reads
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(at, _)| *at < (BASE + 600 * 512) as u64)
+        );
+    }
+}
+
+#[test]
+fn security_and_decoded_ace_inspection_preserve_the_image_and_adjacent_bytes() {
+    let image = security_image(true);
+    let directory = tempfile::tempdir().unwrap();
+    let path = directory.path().join("security-aces.img");
+    std::fs::write(&path, &image.bytes).unwrap();
+    let cx = Cx::for_testing();
+    let volume = NtfsVolume::open(&cx, &path, BASE as u64, Some(SECURITY_LENGTH as u64)).unwrap();
+    let record = volume.record(&cx, 24, Some(7)).unwrap();
+    let info = volume.security_descriptor(&cx, &record).unwrap();
+    assert_eq!(info.bytes, DESCRIPTOR);
+    assert_eq!(info.descriptor.dacl.aces.len(), 2);
+    assert_eq!(std::fs::read(&path).unwrap(), image.bytes);
 }

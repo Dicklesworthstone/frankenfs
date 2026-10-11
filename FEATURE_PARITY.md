@@ -1030,3 +1030,25 @@ received SIGKILL under the shared memory limit. These new tests and native
 OpenZFS/mounted mirror workloads remain unexecuted. No import, degraded-member
 selection, repair write, healing or RAIDZ support is implied.
 See `docs/ZFS_READ_PROFILE.md` for the native profile and commands.
+
+### NTFS ordered ACE inspection and complete security-index bounds
+
+The existing native `security` command now reports ordered ACE kinds, flags,
+access masks, trustee SIDs, object GUID bytes and lossless callback/unknown data.
+Known layouts receive complete bounded validation; unused ACL bytes are retained.
+The report preserves absent/NULL/present ACL distinctions, the exact zero-versus-
+absent STANDARD_INFORMATION security ID, legacy-attribute presence and the native
+$Secure sequence. It explicitly records that no access decision was evaluated.
+
+The reader rejects $SII bitmaps that cannot cover every INDEX_ALLOCATION slot,
+including leaf roots without children, and rejects descriptor/SDS lengths that
+would leave unhashed partial words. The published iterative index traversal,
+physical-range validation, shared-descriptor precedence and raw extraction remain.
+
+All 12 merged native-security parser tests executed successfully, including six
+new regressions and the corrected inherited SID-boundary fixture. Five new reader
+regressions and one report regression are source-reviewed but unexecuted. Changed
+Rust sources were parsed/formatted; integrated CLI checks/tests received SIGKILL
+while compiling `asupersync` under the shared memory limit. No native Windows,
+mounted security-enforcement or full-workspace gate credit is added.
+See `docs/NTFS_READ_PROFILE.md` for fields, boundaries and commands.
