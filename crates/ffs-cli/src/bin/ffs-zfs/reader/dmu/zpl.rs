@@ -1,6 +1,8 @@
 //! Read-only ZPL namespace and file bytes at an explicitly selected head root.
 //! No host-path resolution, symlink following, log replay, mutation or mounting.
 
+pub mod snapshots;
+
 use super::{
     BTreeSet, BlockPointer, Cx, FfsError, MAX_READ_BYTES, Object, ObjectSet, Objects, Result,
     VecDeque, checkpoint, corrupt, parse, unsupported,
