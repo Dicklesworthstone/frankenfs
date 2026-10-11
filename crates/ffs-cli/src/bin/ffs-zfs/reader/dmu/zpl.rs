@@ -14,8 +14,8 @@ const MAX_PATH: usize = 65_536;
 const MAX_COMPONENTS: usize = 256;
 const MAX_DIRECTORY_BYTES: usize = 32 * 1024 * 1024;
 
-pub struct Zpl<'a> {
-    objects: Objects<'a>,
+pub struct Zpl {
+    objects: Objects,
     pub root: u64,
     pub dataset_guid: u64,
     pub version: u64,
@@ -38,17 +38,17 @@ fn value(entries: &[ZapEntry], name: &[u8]) -> Option<u64> {
 fn required(entries: &[ZapEntry], name: &[u8]) -> Result<u64> {
     value(entries, name).ok_or_else(|| corrupt("required ZPL master-node attribute is absent"))
 }
-fn typed_map(view: &mut Objects<'_>, cx: &Cx, number: u64, kind: u8) -> Result<Vec<ZapEntry>> {
+fn typed_map(view: &mut Objects, cx: &Cx, number: u64, kind: u8) -> Result<Vec<ZapEntry>> {
     if number == 0 || view.object(cx, number)?.object_type() != kind {
         return Err(corrupt("ZPL metadata reference has the wrong object type"));
     }
     view.zap(cx, number)
 }
 
-impl<'a> Objects<'a> {
+impl Objects {
     /// Selection is through the validated DSL inventory, never an arbitrary
     /// physical pointer. The returned dataset owns a NEW root-local cache.
-    pub fn zpl(&mut self, cx: &Cx, components: &[Vec<u8>]) -> Result<Zpl<'a>> {
+    pub fn zpl(&mut self, cx: &Cx, components: &[Vec<u8>]) -> Result<Zpl> {
         checkpoint(cx)?;
         let dataset = self
             .datasets(cx)?
@@ -71,7 +71,7 @@ impl<'a> Objects<'a> {
             return Err(corrupt("selected ZPL head identity changed"));
         }
         let view = Objects {
-            leaf: self.leaf,
+            leaf: self.leaf.clone(),
             config: self.config.clone(),
             txg: self.txg,
             root_birth: bp.birth(),
@@ -83,8 +83,8 @@ impl<'a> Objects<'a> {
     }
 }
 
-impl<'a> Zpl<'a> {
-    fn open(cx: &Cx, mut objects: Objects<'a>, dataset_guid: u64) -> Result<Self> {
+impl Zpl {
+    fn open(cx: &Cx, mut objects: Objects, dataset_guid: u64) -> Result<Self> {
         let master = typed_map(&mut objects, cx, 1, 21)?;
         let root = required(&master, b"ROOT")?;
         let version = required(&master, b"VERSION")?;

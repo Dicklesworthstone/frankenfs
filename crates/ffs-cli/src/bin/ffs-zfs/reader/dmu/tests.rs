@@ -76,6 +76,30 @@ fn micro(entries: &[(&[u8], u64)], order: Endian) -> Vec<u8> {
     bytes
 }
 
+/// Constructed native LZ4 DATA pointer for 512 repeated bytes. Only two payload
+/// words are needed; their numeric byte packing is independent of either order.
+pub(super) fn embedded_pointer(
+    byte: u8,
+    birth: u64,
+    containing: Endian,
+    payload: Endian,
+) -> Vec<u8> {
+    let mut words = [0_u64; 16];
+    words[0] = u64::from_le_bytes([0, 0, 0, 12, 0x1f, byte, 1, 0]);
+    words[1] = u64::from_le_bytes([255, 232, 0x50, byte, byte, byte, byte, byte]);
+    words[6] = 511
+        | (15 << 25)
+        | (15 << 32)
+        | (1 << 39)
+        | (19 << 48)
+        | (u64::from(payload == Endian::Little) << 63);
+    words[10] = birth;
+    words
+        .into_iter()
+        .flat_map(|word| containing.encode(word))
+        .collect()
+}
+
 /// Construct the graph directly so DMU tests isolate traversal from label
 /// admission, which has its own reader tests. This is NOT native-image proof.
 fn graph(order: Endian, case: u8, reads: Reads, failure: Option<u64>) -> (Leaf, Dnode) {
@@ -96,8 +120,8 @@ fn graph(order: Endian, case: u8, reads: Reads, failure: Option<u64>) -> (Leaf, 
     store(DATA_A, &a);
     store(DATA_B, &b);
     let mut indirect = vec![0; 4096];
-    let mut child = if matches!(case, 10 | 11) {
-        embedded_pointer(b'A', other, order)
+    let mut child = if matches!(case, 17 | 18) {
+        embedded_pointer_fixed_birth(b'A', other, order)
     } else {
         pointer(&a, DATA_A, 19, 0, 20, other, order)
     };
@@ -124,6 +148,22 @@ fn graph(order: Endian, case: u8, reads: Reads, failure: Option<u64>) -> (Leaf, 
         )),
         _ => {}
     }
+    if (10..=16).contains(&case) {
+        child = embedded_pointer(b'E', 20, other, order);
+        let prop = other.u64(&child, 48).unwrap();
+        let malformed_prop = match case {
+            11 => (prop & !(0x7f << 25)) | (112 << 25),
+            12 => prop | (2 << 40),
+            14 => (prop & !(0x7f << 32)) | (16 << 32),
+            15 => (prop & !(0xff << 48)) | (20 << 48),
+            16 => prop | (1 << 56),
+            _ => prop,
+        };
+        child[48..56].copy_from_slice(&other.encode(malformed_prop));
+        if case == 13 {
+            child[80..88].copy_from_slice(&other.encode(35));
+        }
+    }
     indirect[..128].copy_from_slice(&child);
     indirect[256..384].copy_from_slice(&pointer(&b, DATA_B, 19, 0, 20, other, order));
     store(INDIRECT, &indirect);
@@ -132,7 +172,7 @@ fn graph(order: Endian, case: u8, reads: Reads, failure: Option<u64>) -> (Leaf, 
     if case == 7 {
         data_node[64..192].fill(0);
     }
-    if case == 11 {
+    if case == 18 {
         data_node[160] ^= 1; // Corrupt the embedded pointer's containing block checksum.
     }
     // Large dnode occupies slots 7 and 8; slot 8 deliberately looks allocated.
@@ -183,9 +223,9 @@ fn graph(order: Endian, case: u8, reads: Reads, failure: Option<u64>) -> (Leaf, 
     (leaf, Dnode::parse(&meta, other).unwrap())
 }
 
-fn objects(leaf: &Leaf, meta: Dnode) -> Objects<'_> {
+fn objects(leaf: &Leaf, meta: Dnode) -> Objects {
     Objects {
-        leaf,
+        leaf: leaf.clone(),
         config: SingleLeaf {
             pool_guid: 123,
             leaf_guid: 999,
@@ -364,7 +404,69 @@ fn cached_block_still_requires_the_callers_type_level_and_birth() {
     assert!(view.checked(&cx, &bp, 19, 0, 512, 19).is_err());
 }
 
-fn embedded_pointer(fill: u8, containing: Endian, payload: Endian) -> Vec<u8> {
+#[test]
+fn embedded_reads_mix_sparse_and_physical_blocks_without_inventing_dva_io() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        let reads: Reads = Arc::default();
+        let (leaf, meta) = graph(order, 10, Arc::clone(&reads), None);
+        let mut view = objects(&leaf, meta);
+        view.config
+            .read_features
+            .push("com.delphix:embedded_data".into());
+        let mut expected = vec![b'E'; 2];
+        expected.extend_from_slice(&[0; 512]);
+        expected.extend_from_slice(&[b'B'; 512]);
+        assert_eq!(view.read(&cx, 7, 510, 1026).unwrap(), expected);
+        assert!(
+            !reads
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(at, _)| *at == BASE as u64 + DATA_A)
+        );
+        let count = reads.lock().unwrap().len();
+        assert_eq!(view.read(&cx, 7, 510, 1026).unwrap(), expected);
+        assert_eq!(reads.lock().unwrap().len(), count);
+        let bp = BlockPointer::parse(&embedded_pointer(b'E', 20, order, order), order).unwrap();
+        assert!(view.checked(&cx, &bp, 18, 0, 512, 30).is_err());
+        assert!(view.checked(&cx, &bp, 19, 1, 512, 30).is_err());
+        assert!(view.checked(&cx, &bp, 19, 0, 1024, 30).is_err());
+        assert!(view.checked(&cx, &bp, 19, 0, 512, 19).is_err());
+        view.config.read_features.clear();
+        assert!(view.checked(&cx, &bp, 19, 0, 512, 30).is_err());
+        assert_eq!(reads.lock().unwrap().len(), count);
+    }
+}
+
+#[test]
+fn invalid_embedded_data_never_becomes_cached_bytes_or_a_successful_read() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        for case in 10..=16 {
+            let reads: Reads = Arc::default();
+            let (leaf, meta) = graph(order, case, Arc::clone(&reads), None);
+            let mut view = objects(&leaf, meta);
+            // Case 10 is otherwise valid but its mandatory label feature is absent.
+            if case != 10 {
+                view.config
+                    .read_features
+                    .push("com.delphix:embedded_data".into());
+            }
+            assert!(view.read(&cx, 7, 0, 1536).is_err(), "case {case}");
+            assert!(!view.cache.iter().any(|(bp, _)| bp.embedded()));
+            assert!(
+                !reads.lock().unwrap().iter().any(|(at, _)| [
+                    BASE as u64 + DATA_A,
+                    BASE as u64 + DATA_B
+                ]
+                .contains(at))
+            );
+        }
+    }
+}
+
+fn embedded_pointer_fixed_birth(fill: u8, containing: Endian, payload: Endian) -> Vec<u8> {
     // Fixed LZ4 shape: one literal + 506 repeated bytes + five literals.
     // The native envelope is four length bytes plus twelve LZ4 bytes.
     let mut words = [0_u64; 16];
@@ -383,7 +485,7 @@ fn embedded_ranges_use_verified_parents_without_payload_device_reads() {
     let cx = Cx::for_testing();
     for order in [Endian::Little, Endian::Big] {
         let reads: Reads = Arc::default();
-        let (leaf, meta) = graph(order, 10, Arc::clone(&reads), None);
+        let (leaf, meta) = graph(order, 17, Arc::clone(&reads), None);
         let mut view = objects(&leaf, meta);
         view.config.read_features = vec![
             "com.delphix:embedded_data".into(),
@@ -412,7 +514,7 @@ fn embedded_ranges_use_verified_parents_without_payload_device_reads() {
 fn embedded_parent_damage_and_later_cancellation_never_return_partial_ranges() {
     let cx = Cx::for_testing();
     let reads: Reads = Arc::default();
-    let (leaf, meta) = graph(Endian::Little, 11, Arc::clone(&reads), None);
+    let (leaf, meta) = graph(Endian::Little, 18, Arc::clone(&reads), None);
     let mut view = objects(&leaf, meta);
     view.config.read_features = vec![
         "com.delphix:embedded_data".into(),
@@ -431,7 +533,7 @@ fn embedded_parent_damage_and_later_cancellation_never_return_partial_ranges() {
     let reads: Reads = Arc::default();
     let (leaf, meta) = graph(
         Endian::Little,
-        10,
+        17,
         Arc::clone(&reads),
         Some(BASE as u64 + DATA_B),
     );

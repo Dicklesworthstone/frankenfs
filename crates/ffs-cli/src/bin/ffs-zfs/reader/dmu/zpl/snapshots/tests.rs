@@ -1,4 +1,5 @@
 use super::*;
+use crate::reader::dmu::tests::embedded_pointer;
 use crate::reader::{Leaf, SingleLeaf};
 use ffs_block::ByteDevice;
 use ffs_ondisk::zfs::{DATA_OFFSET, Endian, LABEL_BYTES, checksum};
@@ -323,6 +324,24 @@ impl Image {
             order,
             order,
         ));
+        if matches!(case, 21 | 22) {
+            indirect[..128].copy_from_slice(&embedded_pointer(
+                b'A' + state as u8 * 2,
+                if case == 22 && state == 0 {
+                    21
+                } else {
+                    birth - 4
+                },
+                order,
+                self.order,
+            ));
+            indirect[256..384].copy_from_slice(&embedded_pointer(
+                b'B' + state as u8 * 2,
+                birth - 4,
+                order,
+                self.order,
+            ));
+        }
         self.store(at + 0x5000, &indirect);
         self.store(at + 0x6000, &a);
         self.store(at + 0x6800, &b);
@@ -419,9 +438,9 @@ impl ByteDevice for Memory {
         panic!("snapshot read flushed backing image")
     }
 }
-fn pool(leaf: &Leaf, meta: Dnode) -> Objects<'_> {
+fn pool(leaf: &Leaf, meta: Dnode) -> Objects {
     Objects {
-        leaf,
+        leaf: leaf.clone(),
         meta,
         config: SingleLeaf {
             pool_guid: 123,
@@ -594,3 +613,48 @@ fn snapshot_component_validation_and_corrupt_data_never_select_head_fallback() {
     let mut live = pool.zpl(&cx, &[]).unwrap();
     assert_eq!(live.read(&cx, 3, 0, 1).unwrap(), b"E");
 }
+
+#[test]
+fn embedded_snapshot_contents_are_historical_and_never_read_physical_payloads() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        let reads: Reads = Arc::default();
+        let (leaf, meta) = Image::new(order, 21).open(Arc::clone(&reads), None);
+        let mut selected = pool(&leaf, meta);
+        selected
+            .config
+            .read_features
+            .push("com.delphix:embedded_data".into());
+        let mut live = selected.zpl(&cx, &[]).unwrap();
+        let mut before = selected.zpl_snapshot(&cx, &[], b"before").unwrap();
+        let mut after = selected.zpl_snapshot(&cx, &[], b"after").unwrap();
+        for _ in 0..2 {
+            assert_eq!(live.read(&cx, 3, 0, 8).unwrap(), b"EEEEEEEE");
+            assert_eq!(
+                before.read(&cx, 3, 510, 1029).unwrap(),
+                old_bytes()[510..1539]
+            );
+            assert_eq!(after.read(&cx, 3, 0, 8).unwrap(), b"CCCCCCCC");
+            assert_eq!(before.read(&cx, 3, 0, 4096).unwrap(), old_bytes());
+        }
+        assert!(!reads.lock().unwrap().iter().any(|at| {
+            [0x36000, 0x36800, 0x46000, 0x46800, 0x56000, 0x56800]
+                .iter()
+                .any(|relative| *at == BASE as u64 + DATA_OFFSET + relative)
+        }));
+
+        let (leaf, meta) = Image::new(order, 22).open(Arc::default(), None);
+        let mut pool = pool(&leaf, meta);
+        pool.config
+            .read_features
+            .push("com.delphix:embedded_data".into());
+        let mut before = pool.zpl_snapshot(&cx, &[], b"before").unwrap();
+        assert!(before.read(&cx, 3, 0, 1).is_err());
+        assert_eq!(
+            pool.zpl(&cx, &[]).unwrap().read(&cx, 3, 0, 1).unwrap(),
+            b"E"
+        );
+    }
+}
+
+mod mount;

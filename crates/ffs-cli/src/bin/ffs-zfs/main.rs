@@ -2,6 +2,7 @@
 //! Native read-only ZFS label inspection and explicit MOS-root extraction.
 
 mod file_commands;
+mod filesystem;
 mod reader;
 
 use anyhow::{Context, Result, bail};

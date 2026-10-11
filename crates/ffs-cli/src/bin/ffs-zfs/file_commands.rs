@@ -1,6 +1,6 @@
 //! ZPL path commands; host paths are never resolved from native directory data.
 
-use super::{CandidateArgs, Cx, Result, bail, json};
+use super::{CandidateArgs, Context, Cx, Result, bail, json};
 use clap::{Args, Subcommand};
 use ffs_ondisk::zfs_zpl::{Kind, Metadata};
 use std::ffi::OsString;
@@ -24,6 +24,24 @@ pub struct FileArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum FileCommand {
+    /// Mount one explicit head or snapshot as a read-only extraction view.
+    Mount {
+        #[command(flatten)]
+        candidate: CandidateArgs,
+        /// Head dataset relative to the pool; empty selects the pool root.
+        #[arg(long, default_value = "")]
+        dataset: String,
+        /// Exact native snapshot name; omit for the selected committed head.
+        #[arg(long)]
+        snapshot: Option<OsString>,
+        /// Existing empty host directory outside the backing image's path.
+        mountpoint: PathBuf,
+        /// Synthetic ownership; native ZFS ACLs are not projected or enforced.
+        #[arg(long, default_value_t = 0)]
+        uid: u32,
+        #[arg(long, default_value_t = 0)]
+        gid: u32,
+    },
     /// List validated native snapshots of one dataset; no import or rewind.
     Snapshots {
         #[command(flatten)]
@@ -97,6 +115,57 @@ fn dataset_components(name: &str) -> Result<Vec<Vec<u8>>> {
 impl FileCommand {
     pub(super) fn run(self, cx: &Cx) -> Result<()> {
         let (file, output) = match self {
+            Self::Mount {
+                candidate,
+                dataset,
+                snapshot,
+                mountpoint,
+                uid,
+                gid,
+            } => {
+                let components = dataset_components(&dataset)?;
+                let mountpoint = mountpoint
+                    .canonicalize()
+                    .context("resolve ZFS mountpoint")?;
+                if !mountpoint.is_dir()
+                    || std::fs::read_dir(&mountpoint)?
+                        .next()
+                        .transpose()?
+                        .is_some()
+                {
+                    bail!("ZFS mountpoint must be an existing empty directory");
+                }
+                if candidate
+                    .image
+                    .image
+                    .canonicalize()?
+                    .starts_with(&mountpoint)
+                {
+                    bail!("ZFS mountpoint would hide the backing image");
+                }
+                let leaf = candidate.image.open(cx)?;
+                let mut pool =
+                    leaf.objects(cx, candidate.label, candidate.slot, candidate.pool_guid)?;
+                let view = match snapshot.as_deref() {
+                    Some(name) => pool.zpl_snapshot(cx, &components, name.as_bytes())?,
+                    None => pool.zpl(cx, &components)?,
+                };
+                let guid = view.dataset_guid;
+                let txg = view.view_txg();
+                let fs = crate::filesystem::ZfsFs::new(cx, view, uid, gid)?;
+                let options = ffs_fuse::MountOptions {
+                    read_only: true,
+                    allow_other: false,
+                    auto_unmount: true,
+                    ..ffs_fuse::MountOptions::default()
+                };
+                eprintln!(
+                    "ZFS read-only extraction mount: dataset_guid={guid} view_txg={txg}; \
+                     synthetic ownership and modes, no native ACL enforcement or pool import"
+                );
+                let _ = ffs_fuse::mount(Box::new(fs), &mountpoint, &options)?;
+                return Ok(());
+            }
             Self::Snapshots { candidate, dataset } => {
                 let components = dataset_components(&dataset)?;
                 let leaf = candidate.image.open(cx)?;
@@ -189,6 +258,58 @@ mod tests {
     use super::*;
     use crate::{Cli, Command};
     use clap::Parser;
+    #[test]
+    fn mount_requires_explicit_candidate_and_retains_snapshot_selection() {
+        let args = [
+            "ffs-zfs",
+            "mount",
+            "leaf.img",
+            "/mnt/zfs",
+            "--offline-image",
+            "--pool-guid",
+            "123",
+            "--label",
+            "0",
+            "--slot",
+            "2",
+            "--dataset",
+            "data",
+            "--snapshot",
+            "before",
+            "--uid",
+            "1000",
+            "--gid",
+            "1001",
+        ];
+        let parsed = Cli::try_parse_from(args).unwrap();
+        let Command::File(FileCommand::Mount {
+            candidate,
+            dataset,
+            snapshot,
+            mountpoint,
+            uid,
+            gid,
+        }) = parsed.command
+        else {
+            panic!("mount command");
+        };
+        assert_eq!(
+            (candidate.label, candidate.slot, candidate.pool_guid),
+            (0, 2, 123)
+        );
+        assert!(candidate.image.offline_image);
+        assert_eq!(dataset, "data");
+        assert_eq!(
+            snapshot.as_deref().map(OsStrExt::as_bytes),
+            Some(b"before".as_slice())
+        );
+        assert_eq!(mountpoint, PathBuf::from("/mnt/zfs"));
+        assert_eq!((uid, gid), (1000, 1001));
+        assert!(Cli::try_parse_from(["ffs-zfs", "mount", "leaf.img", "/mnt/zfs"]).is_err());
+        for option in ["--rw", "--allow-other", "--force", "--recover"] {
+            assert!(Cli::try_parse_from(args.into_iter().chain([option])).is_err());
+        }
+    }
     #[test]
     fn snapshot_selection_is_separate_from_dataset_paths_and_still_requires_a_candidate() {
         let options = [

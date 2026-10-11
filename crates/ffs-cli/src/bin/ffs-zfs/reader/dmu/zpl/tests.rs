@@ -1,4 +1,5 @@
 use super::*;
+use crate::reader::dmu::tests::embedded_pointer;
 use crate::reader::{ByteOffset, DATA_OFFSET, Endian, LABEL_BYTES, Leaf, SingleLeaf};
 use ffs_block::ByteDevice;
 use ffs_ondisk::zfs::checksum;
@@ -284,6 +285,13 @@ fn graph(order: Endian, sa: u8, case: u8, reads: Reads, failure: Option<u64>) ->
     let mut indirect = vec![0; 4096];
     indirect[..128].copy_from_slice(&bp(&a, FIRST, 19, 0, 20, other, order));
     indirect[256..384].copy_from_slice(&bp(&b, LAST, 19, 0, 20, other, order));
+    if (9..=11).contains(&case) {
+        indirect[..128].copy_from_slice(&embedded_pointer(b'A', 20, other, order));
+        indirect[256..384].copy_from_slice(&embedded_pointer(b'B', 20, other, order));
+        if case == 10 {
+            indirect[256..264].copy_from_slice(&other.encode(u64::MAX));
+        }
+    }
     store(INDIRECT, &indirect);
     let fields = sa_fields(other);
     let bonus = match sa {
@@ -293,6 +301,10 @@ fn graph(order: Endian, sa: u8, case: u8, reads: Reads, failure: Option<u64>) ->
     };
     let mut file = node(19, 512, 2, 2, &bonus, if sa == 0 { 17 } else { 44 }, order);
     file[64..192].copy_from_slice(&bp(&indirect, INDIRECT, 19, 1, 30, order, other));
+    if case == 11 {
+        indirect[0] ^= 1;
+        store(INDIRECT, &indirect);
+    }
     file[24..32].copy_from_slice(&order.encode(5120));
     if case == 4 && sa == 0 {
         file[192 + 64..192 + 72].copy_from_slice(&order.encode(99));
@@ -400,9 +412,9 @@ fn graph(order: Endian, sa: u8, case: u8, reads: Reads, failure: Option<u64>) ->
     .unwrap();
     (leaf, Dnode::parse(&meta, order).unwrap())
 }
-fn mos(leaf: &Leaf, meta: Dnode) -> Objects<'_> {
+fn mos(leaf: &Leaf, meta: Dnode) -> Objects {
     Objects {
-        leaf,
+        leaf: leaf.clone(),
         config: SingleLeaf {
             pool_guid: 123,
             leaf_guid: 999,
@@ -475,6 +487,67 @@ fn selected_dataset_reads_legacy_sa_and_spill_files_without_exposing_slack() {
                 (1027, 2, 1000, 5120)
             );
             assert_eq!(view.list(&cx, view.root).unwrap().len(), 6);
+        }
+    }
+}
+#[test]
+fn embedded_file_blocks_preserve_unaligned_eof_hardlinks_and_sa_metadata() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        for sa in 0..=2 {
+            let reads: Reads = Arc::default();
+            let (leaf, meta) = graph(order, sa, 9, Arc::clone(&reads), None);
+            let mut pool = mos(&leaf, meta);
+            pool.config
+                .read_features
+                .push("com.delphix:embedded_data".into());
+            let mut view = pool.zpl(&cx, &[]).unwrap();
+            assert_eq!(view.resolve(&cx, b"/alias.bin").unwrap(), 3);
+            let mut expected = vec![b'A'; 512];
+            expected.extend_from_slice(&[0; 512]);
+            expected.extend_from_slice(b"BBB");
+            assert_eq!(view.read(&cx, 3, 0, 4096).unwrap(), expected);
+            assert_eq!(view.read(&cx, 3, 510, 600).unwrap(), expected[510..]);
+            assert!(view.read(&cx, 3, 1027, 8).unwrap().is_empty());
+            assert_eq!(view.stat(&cx, 3).unwrap().0.size, 1027);
+            assert!(
+                !reads.lock().unwrap().iter().any(|(at, _)| [
+                    BASE as u64 + FIRST,
+                    BASE as u64 + LAST
+                ]
+                .contains(at))
+            );
+        }
+    }
+}
+
+#[test]
+fn embedded_file_corruption_fails_the_request_without_returning_a_prefix() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        for case in [10, 11] {
+            let reads: Reads = Arc::default();
+            let (leaf, meta) = graph(order, 2, case, Arc::clone(&reads), None);
+            let mut pool = mos(&leaf, meta);
+            pool.config
+                .read_features
+                .push("com.delphix:embedded_data".into());
+            let mut view = pool.zpl(&cx, &[]).unwrap();
+            assert!(view.read(&cx, 3, 0, 1027).is_err(), "case {case}");
+            assert!(
+                !reads.lock().unwrap().iter().any(|(at, _)| [
+                    BASE as u64 + FIRST,
+                    BASE as u64 + LAST
+                ]
+                .contains(at))
+            );
+            // A decoder failure does not poison earlier verified content, but
+            // a corrupt parent cannot authorize even its first embedded block.
+            if case == 10 {
+                assert_eq!(view.read(&cx, 3, 0, 3).unwrap(), b"AAA");
+            } else {
+                assert!(view.read(&cx, 3, 0, 3).is_err());
+            }
         }
     }
 }
@@ -615,3 +688,5 @@ fn dataset_views_do_not_reuse_mos_or_other_dataset_block_caches() {
             .all(|(at, len)| *at >= BASE as u64 && *at + *len as u64 <= (BASE + LENGTH) as u64)
     );
 }
+
+mod mount;

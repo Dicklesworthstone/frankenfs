@@ -399,6 +399,49 @@ fn native_boolean_features_and_uberblock_membership_are_required() {
 }
 
 #[test]
+fn embedded_data_feature_admission_retains_boolean_types_and_label_agreement() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        for case in 0..4 {
+            let feature = match case {
+                1 => uint("com.delphix:embedded_data", 1),
+                2 => presence("com.delphix:redacted_datasets"),
+                _ => presence("com.delphix:embedded_data"),
+            };
+            let features = list(&[presence("org.illumos:lz4_compress"), feature]);
+            let packed = config_features(999, 9, 1, &features);
+            let mut image = Image::new(order, true);
+            for label in 0..4 {
+                image.set_config(label, &packed);
+            }
+            if case == 3 {
+                let missing = list(&[presence("org.illumos:lz4_compress")]);
+                image.set_config(3, &config_features(999, 9, 1, &missing));
+            }
+            let expected = image.root.clone();
+            let reads: Reads = Arc::default();
+            let leaf = image.open(Arc::clone(&reads), None);
+            let result = leaf.root(&cx, 0, 2, 123);
+            if case == 0 {
+                assert_eq!(result.unwrap().data, expected);
+                assert!(
+                    leaf.label(&cx, 0)
+                        .unwrap()
+                        .single_leaf(123)
+                        .unwrap()
+                        .read_features
+                        .iter()
+                        .any(|feature| feature == "com.delphix:embedded_data")
+                );
+            } else {
+                assert!(result.is_err(), "case {case}");
+                assert_eq!(data_reads(&reads), [] as [u64; 0]);
+            }
+        }
+    }
+}
+
+#[test]
 fn embedded_read_feature_requires_native_boolean_and_all_label_agreement() {
     let cx = Cx::for_testing();
     let feature_name = "com.delphix:embedded_data";

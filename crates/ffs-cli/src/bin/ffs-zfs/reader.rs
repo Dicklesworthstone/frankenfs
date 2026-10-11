@@ -16,6 +16,7 @@ use ffs_types::ByteOffset;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
 use std::path::Path;
+use std::sync::Arc;
 
 fn checkpoint(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FfsError::Cancelled)
@@ -63,8 +64,9 @@ impl ByteDevice for ReadOnlyImage {
     }
 }
 
+#[derive(Clone)]
 pub struct Leaf {
-    device: Box<dyn ByteDevice>,
+    device: Arc<dyn ByteDevice>,
     base: u64,
     length: u64,
 }
@@ -245,7 +247,7 @@ impl Leaf {
         }
         label_offsets(length).map_err(|error| parse(&error))?;
         Ok(Self {
-            device,
+            device: Arc::from(device),
             base,
             length,
         })

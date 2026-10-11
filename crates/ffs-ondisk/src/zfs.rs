@@ -17,6 +17,8 @@ pub const UBERBLOCK_RING_BYTES: usize = 128 * 1024;
 pub const DATA_OFFSET: u64 = 4 * 1024 * 1024;
 /// Explicit read-profile bound; not the maximum size of the native format.
 pub const MAX_BLOCK_BYTES: usize = 16 * 1024 * 1024;
+/// Embedded DATA uses every pointer word except properties and logical birth.
+const EMBEDDED_PAYLOAD_BYTES: usize = 14 * 8;
 const ECK_MAGIC: u64 = 0x0210_da7a_b10c_7a11;
 const UBER_MAGIC: u64 = 0x00ba_b10c;
 
@@ -201,7 +203,7 @@ impl BlockPointer {
     #[must_use]
     pub fn physical_bytes(&self) -> usize {
         if self.embedded() {
-            0
+            0 // BP_GET_PSIZE: embedded data has no separately allocated block.
         } else {
             ((((self.words[6] >> 16) & 0xffff) + 1) * 512) as usize
         }
@@ -255,8 +257,8 @@ impl BlockPointer {
     /// This is not an independent integrity check: callers must validate the
     /// parent checksum, feature admission, object type, size and birth ceiling.
     ///
-    /// OpenZFS spa.h and blkptr.c pack bytes into the low bits of each numeric
-    /// payload word, regardless of container or logical payload byte order.
+    /// OpenZFS zfs-2.3.0 spa.h and blkptr.c pack bytes into the low bits of each
+    /// numeric payload word, regardless of container or logical payload order.
     /// Only words 6 (properties) and 10 (logical birth) are not payload words.
     /// Native DNODE/OBJSET types cannot embed because their fill counts are
     /// required by the metadata tree (OpenZFS zfs-2.3.0 `DMU_OT_HAS_FILL`).
@@ -268,16 +270,20 @@ impl BlockPointer {
             || matches!(self.object_type(), 10 | 11)
             || self.birth() == 0
         {
-            return Err(invalid("invalid embedded data flags, type, level or birth"));
+            return Err(invalid("invalid embedded DATA flags, type, level or birth"));
         }
         if (self.words[6] >> 40) & 0xff != 0 {
-            return Err(invalid("reserved or redacted embedded block type"));
+            return Err(invalid(
+                "reserved or redacted embedded subtype is unsupported",
+            ));
         }
         let packed = (((self.words[6] >> 25) & 0x7f) + 1) as usize;
-        if packed > 112 || packed > self.logical_bytes() {
-            return Err(invalid("embedded payload exceeds its native size bounds"));
+        if packed > EMBEDDED_PAYLOAD_BYTES || packed > self.logical_bytes() {
+            return Err(invalid(
+                "embedded payload exceeds pointer capacity or logical size",
+            ));
         }
-        let mut payload = [0_u8; 112];
+        let mut payload = [0_u8; EMBEDDED_PAYLOAD_BYTES];
         let mut at = 0;
         for (index, word) in self.words.iter().enumerate() {
             if index != 6 && index != 10 {
@@ -613,7 +619,9 @@ mod embedded_tests {
     #[test]
     fn embedded_lz4_reconstructs_a_full_logical_sector() {
         // One A, a 506-byte distance-one match, and five final literals.
-        let payload = [0, 0, 0, 12, 0x1f, b'A', 1, 0, 255, 232, 0x50, b'A', b'A', b'A', b'A', b'A'];
+        let payload = [
+            0, 0, 0, 12, 0x1f, b'A', 1, 0, 255, 232, 0x50, b'A', b'A', b'A', b'A', b'A',
+        ];
         for order in [Endian::Little, Endian::Big] {
             let bp = pointer(&payload, 512, 15, order);
             assert_eq!(bp.decode_embedded().unwrap(), vec![b'A'; 512]);
@@ -627,7 +635,13 @@ mod embedded_tests {
     #[test]
     fn embedded_rejects_unsupported_layouts_and_never_treats_redaction_as_zeroes() {
         let good = pointer(b"payload", 7, 2, Endian::Little);
-        for flags in [1_u64 << 40, 2_u64 << 40, 1_u64 << 56, 1_u64 << 61, 1_u64 << 62] {
+        for flags in [
+            1_u64 << 40,
+            2_u64 << 40,
+            1_u64 << 56,
+            1_u64 << 61,
+            1_u64 << 62,
+        ] {
             let mut bp = good.clone();
             bp.words[6] |= flags;
             assert!(bp.decode_embedded().is_err());
@@ -641,7 +655,15 @@ mod embedded_tests {
         bp = good.clone();
         bp.words[6] = (bp.words[6] & !(0x7f_u64 << 25)) | (112_u64 << 25);
         assert!(bp.decode_embedded().is_err());
-        assert!(pointer(b"payload", 8, 2, Endian::Little).decode_embedded().is_err());
-        assert!(pointer(b"payload", 7, 1, Endian::Little).decode_embedded().is_err());
+        assert!(
+            pointer(b"payload", 8, 2, Endian::Little)
+                .decode_embedded()
+                .is_err()
+        );
+        assert!(
+            pointer(b"payload", 7, 1, Endian::Little)
+                .decode_embedded()
+                .is_err()
+        );
     }
 }

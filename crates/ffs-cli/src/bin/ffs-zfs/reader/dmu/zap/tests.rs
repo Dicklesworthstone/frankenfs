@@ -277,9 +277,9 @@ impl ByteDevice for Memory {
         panic!("ZAP enumeration flushed image")
     }
 }
-fn view(leaf: &Leaf, meta: Dnode) -> Objects<'_> {
+fn view(leaf: &Leaf, meta: Dnode) -> Objects {
     Objects {
-        leaf,
+        leaf: leaf.clone(),
         config: SingleLeaf {
             pool_guid: 123,
             leaf_guid: 999,

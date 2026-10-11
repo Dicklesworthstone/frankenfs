@@ -12,7 +12,7 @@ use std::collections::{BTreeMap, BTreeSet};
 const MAX_SNAPSHOTS: usize = 4096;
 const MAX_SNAPSHOT_NAMES: usize = 1024 * 1024;
 
-impl Zpl<'_> {
+impl Zpl {
     /// Pool candidate TXG for heads; native creation TXG for snapshot views.
     #[must_use]
     pub const fn view_txg(&self) -> u64 {
@@ -133,7 +133,7 @@ fn valid_name(name: &[u8]) -> Result<()> {
     Ok(())
 }
 
-impl<'a> Objects<'a> {
+impl Objects {
     /// Return all named snapshots of exactly this head, never a partly checked
     /// list. Origin snapshots belong to another namespace and are not included.
     pub fn snapshots(&mut self, cx: &Cx, components: &[Vec<u8>]) -> Result<Vec<Snapshot>> {
@@ -350,7 +350,7 @@ impl<'a> Objects<'a> {
         cx: &Cx,
         components: &[Vec<u8>],
         name: &[u8],
-    ) -> Result<Zpl<'a>> {
+    ) -> Result<Zpl> {
         valid_name(name)?;
         let selected = self
             .snapshot_roots(cx, components)?
@@ -374,7 +374,7 @@ impl<'a> Objects<'a> {
             .ok_or_else(|| corrupt("selected snapshot object set is a hole"))?;
         let os = ObjectSet::parse(&block.bytes, block.order).map_err(|error| parse(&error))?;
         let view = Objects {
-            leaf: self.leaf,
+            leaf: self.leaf.clone(),
             config: self.config.clone(),
             txg: selected.info.creation_txg,
             root_birth: selected.root.birth(),

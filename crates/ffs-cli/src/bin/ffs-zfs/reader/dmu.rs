@@ -31,8 +31,8 @@ struct Object {
 
 /// Root/configuration ownership never leaves this object. Cache keys include
 /// the complete block pointer and caches never cross selected root lifetimes.
-pub struct Objects<'a> {
-    leaf: &'a Leaf,
+pub struct Objects {
+    leaf: Leaf,
     config: SingleLeaf,
     pub txg: u64,
     root_birth: u64,
@@ -48,7 +48,7 @@ impl Leaf {
         label: usize,
         slot: usize,
         pool_guid: u64,
-    ) -> Result<Objects<'_>> {
+    ) -> Result<Objects> {
         let root = self.root(cx, label, slot, pool_guid)?;
         let objectset = ObjectSet::parse(&root.data, root.uberblock.root.payload_order())
             .map_err(|error| parse(&error))?;
@@ -58,7 +58,7 @@ impl Leaf {
         let config = self.label(cx, label)?.single_leaf(pool_guid)?;
         checkpoint(cx)?;
         Ok(Objects {
-            leaf: self,
+            leaf: self.clone(),
             config,
             txg: root.uberblock.txg,
             root_birth: root.uberblock.root.birth(),
@@ -69,7 +69,7 @@ impl Leaf {
     }
 }
 
-impl Objects<'_> {
+impl Objects {
     /// Validate interpretation BEFORE cache lookup and physical I/O. Neither a
     /// valid checksum nor a cached byte string authorizes the wrong level/type.
     fn checked(

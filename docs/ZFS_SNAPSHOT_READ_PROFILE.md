@@ -11,6 +11,7 @@ ffs-zfs ls leaf.img / --offline-image --pool-guid 123 --label 0 --slot 2 --datas
 ffs-zfs stat leaf.img /file.bin --offline-image --pool-guid 123 --label 0 --slot 2 --dataset data --snapshot before
 ffs-zfs read leaf.img /file.bin --offline-image --pool-guid 123 --label 0 --slot 2 --dataset data --snapshot before
 ffs-zfs readlink leaf.img /link --offline-image --pool-guid 123 --label 0 --slot 2 --dataset data --snapshot before
+ffs-zfs mount leaf.img /mnt/zfs-before --offline-image --pool-guid 123 --label 0 --slot 2 --dataset data --snapshot before --uid 1000 --gid 1000
 ```
 
 Sample identities are placeholders. `--dataset` remains a relative head name;
@@ -19,6 +20,13 @@ a bookmark or a request to select another pool TXG. Missing or corrupt snapshot
 selection fails: it never falls back to live head bytes. Omitting the option
 retains the original head-read behavior. Snapshot maps can contain distinct
 case variants; selection is exact, not case folded.
+
+`mount` exposes the exact selected historical root through the read-only
+extraction backend documented in [ZFS_READ_PROFILE.md](ZFS_READ_PROFILE.md).
+The mountpoint must already exist and be empty. Each mount owns its view and
+cache, so mounting a head and a snapshot independently does not mix their
+namespaces or data. Host ownership and modes are synthetic; pool import,
+native ACL enforcement, xattrs and `statfs` are outside this mount's profile.
 
 ## Native identities and historical bounds
 

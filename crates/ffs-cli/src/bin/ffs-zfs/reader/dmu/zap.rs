@@ -10,7 +10,7 @@ use std::collections::BTreeSet;
 const MAX_ZAP_BLOCK_BYTES: usize = 64 * 1024 * 1024;
 const MAX_ZAP_RESULT_BYTES: usize = 16 * 1024 * 1024;
 
-impl Objects<'_> {
+impl Objects {
     /// Return the entire validated map or an error. No zero-filled missing
     /// leaves, skipped bad values, guessed integer widths or partial inventories.
     pub fn zap_values(&mut self, cx: &Cx, number: u64) -> Result<Vec<Entry>> {

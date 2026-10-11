@@ -1,10 +1,11 @@
-# Experimental native ZFS block, DMU and ZPL reading
+# Experimental native ZFS block, DMU, ZPL and extraction mounts
 
 `ffs-zfs` implements the restricted ZFS-01/ZFS-02 foundation and starts ZFS-03
 from the comprehensive expansion plan. It inspects labels and explicit uberblock
 candidates, extracts checked roots and MOS object ranges, inventories DSL head
-datasets, and reads files within an explicitly selected head. It is NOT a pool
-importer or FUSE backend. No ext4/btrfs/FAT/NTFS dispatch is changed.
+datasets, reads files within an explicitly selected head or named snapshot, and
+exposes that same committed view through a read-only FUSE extraction mount.
+It does not import a pool. No ext4/btrfs/FAT/NTFS dispatch is changed.
 
 ## Commands
 
@@ -32,6 +33,12 @@ ffs-zfs stat leaf.img /file.bin --dataset data --offline-image --pool-guid 123 -
 ffs-zfs read leaf.img /file.bin --dataset data --start 507 --bytes 8199 \
   --offline-image --pool-guid 123 --label 0 --slot 2 > file-range.bin
 ffs-zfs readlink leaf.img /link --dataset data --offline-image --pool-guid 123 --label 0 --slot 2
+
+# Mountpoints must already exist and be empty. UID/GID are synthetic host IDs.
+ffs-zfs mount leaf.img /mnt/zfs-head --dataset data --uid 1000 --gid 1000 \
+  --offline-image --pool-guid 123 --label 0 --slot 2
+ffs-zfs mount leaf.img /mnt/zfs-before --dataset data --snapshot before \
+  --uid 1000 --gid 1000 --offline-image --pool-guid 123 --label 0 --slot 2
 
 # All native checksum verifiers and DVA addresses remain vdev-relative.
 ffs-zfs inspect disk.img --offline-image --offset 1048576 --length 134217728
@@ -63,6 +70,19 @@ short output, invalid backreferences, overflow and unsupported codecs fail.
 SHA256 words and Fletcher input order follow the native format, independently
 of the host and of the block-pointer container's byte order.
 
+Embedded DATA pointers carry up to 112 compressed bytes inside the pointer
+itself. Their native payload consists of fourteen numeric words, excluding the
+property word and logical birth word; bytes are extracted least-significant
+first even when the pointer's containing block is big-endian. Logical and packed
+lengths are byte counts, not sector counts. Only level-zero, unencrypted,
+non-deduplicated DATA pointers are admitted, with no embedded DNODE/OBJSET
+blocks, reserved subtype or redacted-data interpretation. Uncompressed, LZJB
+and ZFS LZ4 payloads must reconstruct the exact bounded logical size. The parent
+block's checksum protects these bytes; there is no fabricated child checksum
+or physical DVA read. A reached embedded pointer requires the native
+`com.delphix:embedded_data` label feature as well as the ordinary dnode
+type/size/birth checks before decoded bytes may enter the view's cache.
+
 A bad physical read, checksum or transform can try another declared copy on the
 same leaf. Cancellation propagates immediately and cannot turn into a redundant
 copy retry. No copy is repaired. The uberblock's native GUID sum must match the
@@ -84,14 +104,8 @@ and a birth no later than their containing parent and the selected TXG. These
 checks occur before I/O and before cache hits. Every physical read reuses the
 existing checksum/transform/copy pipeline. Each child block supplies its own
 payload byte order. Sparse leaf or indirect subtrees yield context-sized zeroes
-without physical reads; encrypted/embedded pointers cannot take that path.
-
-Embedded DATA leaves require the declared `com.delphix:embedded_data` feature.
-Their block pointers carry at most 112 encoded bytes within a verified parent
-block. Existing raw/LZJB/LZ4 decoders enforce the 16 MiB logical-block bound;
-no payload DVA is read. The native DNODE/OBJSET types cannot embed because they
-require their fill counts. Nonleaf, reserved/redacted, protected and deduplicated
-embedded forms are also refused. The same interpretation and cache checks apply.
+without physical reads; embedded pointers use their dedicated decoder and
+encrypted pointers remain refused rather than taking the hole path.
 
 A view retains up to 32 fully checked blocks and 16 MiB of block bytes, keyed by
 the complete pointer. Views do not share caches across roots. In-flight output,
@@ -160,8 +174,9 @@ inventory. The selected filesystem gets its own object-set root and block cache,
 separate from the MOS and other datasets. Its master node supplies ROOT, VERSION
 and naming policies. Case-sensitive, unnormalized ZPL versions 1..5 are admitted;
 UTF8-only policy is checked when present. Unsupported policies fail rather than
-silently substituting host collation. Only a head filesystem is selected: no
-snapshot, zvol or recursive traversal into mounted child datasets is implied.
+silently substituting host collation. An exact `--snapshot` selects a validated
+historical filesystem as described in [ZFS_SNAPSHOT_READ_PROFILE.md](ZFS_SNAPSHOT_READ_PROFILE.md).
+There is no zvol or recursive traversal into mounted child datasets.
 
 Metadata can use legacy 264-byte znodes or native system attributes. Fixed
 legacy attribute IDs remain fixed; other IDs come from the dataset's REGISTRY.
@@ -199,6 +214,50 @@ whole-process memory limit. Reads describe the selected committed root only:
 there is no ZIL replay, recovery validation or claim that pending synchronous
 intent has been incorporated into that root.
 
+## Read-only extraction mounts
+
+`mount` uses the same explicit pool GUID, label and uberblock slot as extraction.
+It validates the selected head or snapshot, its root directory and the root's
+children before starting FUSE. A missing or invalid snapshot cannot fall back to
+the head. The mount owns its read-only image handle and selected object-set view;
+its lifetime and checked-block cache do not depend on a temporary CLI reader.
+Separate mounts retain separate roots, SA registries and caches even when a
+head and a snapshot contain the same native object numbers.
+
+Lookup, attributes, bounded directory enumeration, regular-file reads and
+symlink targets come from the native ZPL graph. Hard links share one mounted
+inode. Inode 1 is the selected filesystem root; native object numbers cannot
+provide a second alias for it. Reached object generations, types and directory
+parents are checked on every access. A directory's entire native listing is
+validated before any part of it or its discovered identities becomes visible.
+Directory cookies are stable within the immutable view and names remain exact
+byte strings. Reads preserve native EOF, sparse zeroes, checksums, compression,
+embedded payloads and cancellation errors.
+
+Mounted ownership is the supplied synthetic UID/GID, with modes 0555 for
+directories, 0444 for files and 0777 for symlinks. Native ZFS ACLs, FUID mapping
+and permission enforcement are not projected; `stat` continues to expose the
+native metadata separately. `allow_other` and writable mount options are not
+offered. Writable opens and filesystem mutations return read-only errors.
+`fsync` and `fsyncdir` validate the requested object without writing or flushing
+the image. Native symlink targets are returned to the host kernel, which applies
+normal mounted symlink semantics; this extraction mount is not a path sandbox.
+
+Special files, xattrs/ACL access and pool free-space reporting (`statfs`) are
+explicitly unsupported. A reached directory containing a special file fails
+rather than fabricating a device number or successful partial listing.
+`SEEK_DATA`/`SEEK_HOLE` use the permitted conservative projection of file data
+through EOF; they do not claim an exact physical-allocation map. At most 131,072
+object identities are retained per mount, with up to 32 cached directories and
+8 MiB of retained directory data in addition to the existing DMU view cache.
+These bounds do not represent a whole-process memory limit.
+
+Constructed regression fixtures exercise mounted lookup/read/readdir behavior,
+hard links, root identity, legacy and SA metadata, both byte orders, historical
+cache isolation, write refusal, corrupt directories and cancellation. The test
+devices reject every backing write or flush. These are unit-level fixtures;
+they do not establish executed kernel FUSE or native OpenZFS interchange.
+
 ## Explicit admission limits
 
 All input opens use read-only handles to regular offline files. The caller must
@@ -209,18 +268,18 @@ log replay, implicit native imports or host paths taken from a label.
 Extraction requires all four configurations to validate and agree on pool/leaf
 identity, addressing, configuration generation and read features. The pool must
 be exported and have one top-level file/disk leaf with ID zero and no removal,
-special or log state. Versions 1..28 or 5000 are admitted. Version 5000 admits
-only optional `org.illumos:lz4_compress` and `com.delphix:embedded_data` label
-read features, each encoded as a native boolean-presence field. This is not full
-MOS feature negotiation or pool import.
+special or log state. Versions 1..28 or 5000 are admitted. Version 5000 requires
+no label read features beyond optional `org.illumos:lz4_compress` and
+`com.delphix:embedded_data`, encoded as boolean-presence fields. Unknown features
+and wrong value types still fail admission. This is not full MOS feature
+negotiation or pool import.
 
 The selected uberblock cannot predate label configuration. Fork/history
 resolution, rewind, active/MMP ownership and multi-vdev import remain separate
-work. Gang and encrypted/authenticated blocks remain unsupported; embedded DATA
-is limited to the leaf pipeline above. Context-sized holes are handled only in
-the DMU traversal, not root extraction.
+work. Gang and encrypted/authenticated blocks remain unsupported;
+context-sized holes are handled only in the DMU traversal, not root extraction.
 RAIDZ/mirror topologies, indirect vdevs, normalized/binary ZAP keys, full ZPL/SA
-feature coverage, snapshot reads, security, native writes, maintenance and
+feature coverage, full snapshot/clone semantics, security, native writes, maintenance and
 MVCC/RaptorQ integration remain incomplete. Neither dataset inventory nor the
 restricted ZPL reader is a full ZFS-support claim.
 
@@ -309,7 +368,22 @@ compilation/tests and rustfmt/Clippy, and no native ZFS comparison was executed.
 Native fill semantics were checked against pinned OpenZFS `dmu.h` and `zio.c`;
 payload and feature layouts against `spa.h`, `blkptr.c` and `zfeature_common.c`.
 
+Extraction-mount implementation validation (2026-10-11): before the shared
+executor outage, the complete `ffs-ondisk` library suite passed 790 tests and
+parser-library Clippy passed with warnings denied. Workspace formatting passed
+at that point. CLI compilation was killed in `asupersync` under the shared
+memory limit. The source was then recovered through immutable GitHub blobs;
+the production embedded parser matched its pre-outage Git blob, while some
+added fixtures were reconstructed. The final integrated tree, CLI regressions,
+kernel FUSE mounts and native ZFS comparisons have not been executed. Source
+review and restored bytes do not replace those runtime gates.
+
 Reference: OpenZFS tag zfs-2.3.0, especially spa.h, vdev_impl.h,
 uberblock_impl.h, dnode.h, dmu_objset.h, zap_impl.h, dsl_dir.h, dsl_dataset.h,
 zap_leaf.h, zap_leaf.c, zap_micro.c, nvpair.c, zio_checksum.c, sha2_zfs.c,
 lzjb.c, lz4_zfs.c, sa_impl.h, sa.c, zfs_sa.c and zfs_znode.h.
+Embedded layout and decoding contracts come from the same pinned tag's
+[spa.h](https://github.com/openzfs/zfs/blob/zfs-2.3.0/include/sys/spa.h),
+[blkptr.c](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zfs/blkptr.c),
+[zio.c](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zfs/zio.c) and
+[zfeature_common.c](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zcommon/zfeature_common.c).

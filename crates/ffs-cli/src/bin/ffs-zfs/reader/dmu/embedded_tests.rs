@@ -47,7 +47,7 @@ fn embedded_raw(byte: u8, order: Endian, extra_flags: u64) -> [u8; 128] {
     raw
 }
 
-fn view(leaf: &Leaf, order: Endian, extra_flags: u64) -> Objects<'_> {
+fn view(leaf: &Leaf, order: Endian, extra_flags: u64) -> Objects {
     // Three level-zero pointers: embedded A, a hole, embedded B.
     let mut raw = [0; 512];
     raw[0] = 19;
@@ -64,7 +64,7 @@ fn view(leaf: &Leaf, order: Endian, extra_flags: u64) -> Objects<'_> {
     raw[64..192].copy_from_slice(&embedded_raw(b'A', order, extra_flags));
     raw[320..448].copy_from_slice(&embedded_raw(b'B', order, 0));
     Objects {
-        leaf,
+        leaf: leaf.clone(),
         config: SingleLeaf {
             pool_guid: 123,
             leaf_guid: 999,
