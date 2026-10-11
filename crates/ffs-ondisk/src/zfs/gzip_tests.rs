@@ -235,7 +235,7 @@ fn gzip_embedded_blocks_decode_all_levels_and_both_byte_orders() {
 fn gzip_admission_does_not_enable_unimplemented_compression_ids() {
     let mut physical = vec![0; 512];
     physical[..FIXED.len()].copy_from_slice(&FIXED);
-    for codec in [0, 1, 4, 16, 127] {
+    for codec in [0, 1, 4, 17, 127] {
         assert!(decompress(&FIXED, codec, LOGICAL).is_err());
         let bp = physical_pointer(&physical, codec, Endian::Little, Endian::Little);
         assert!(bp.regular_dvas().is_err());

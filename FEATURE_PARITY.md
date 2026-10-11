@@ -935,3 +935,98 @@ stored DEFLATE vectors, all native levels, both byte orders and failure bounds.
 Source/reference checks are documented in `docs/ZFS_READ_PROFILE.md`.
 Rust/build/fmt/Clippy/UBS and native-image execution remain unavailable with the
 executor offline, so no executed parity credit is added.
+
+### FAT16/FAT32 lossless native catalog and extraction
+
+`ffs-fat catalog` reports exact short-name bytes and assembled UTF-16 long names,
+including names unavailable to the host-path projection. Validated root-to-entry
+`--entry-slots` selectors reach nested directories and extract regular files
+without choosing an OEM code page or replacing native units. Parent membership,
+complete directory parsing, ancestor checks and existing file-allocation/EOF
+validation prevent arbitrary image offsets from becoming file identities.
+Raw name separators are checked before display decoding.
+
+Three parser/CLI and seven constructed image regressions cover both dialects,
+lossless name cases, invalid selectors and structural failures, allocation tails,
+cancellation and image immutability. Source/fixture review and exact blob
+comparisons completed. Rust/build/fmt/Clippy/UBS and native-image execution remain
+unavailable with the executor offline; no executed parity credit is added.
+See `docs/FAT_READ_PROFILE.md`.
+
+### NTFS native security descriptors
+
+`ffs-ntfs security` resolves native file security through the complete
+base/extension catalog, then the bounded $Secure:$SII index and verified
+primary/duplicate $SDS entries, or a legacy SECURITY_DESCRIPTOR attribute.
+It reports lossless descriptor bytes, native SIDs and ACL structure, and
+supports raw extraction by validated MFT record identity. An iterative
+full-tree traversal, allocated-child checks, native hash validation and
+strict initialized-range/component bounds fail on inconsistent metadata.
+Absent, NULL and empty ACLs remain distinct. This is metadata inspection;
+native permission enforcement, SID mapping and mutation remain separate.
+
+Six parser, nine image-reader and two CLI/report regressions are authored
+and independently source-reviewed. Native hash and mapping calculations were
+checked separately. Rust/build/fmt/Clippy/UBS and native-image execution remain
+unavailable with the executor offline; no executed parity credit is added.
+See `docs/NTFS_READ_PROFILE.md`.
+
+### ZFS native Zstandard reads
+
+Native codec 16 decodes OpenZFS's big-endian wrapper and magicless Zstandard
+frame through the shared physical/embedded pipeline. All native levels and
+historical header layouts are supported. Exact single-frame consumption,
+fixed LSIZE output, content integrity and explicit 16 MiB advertised-window
+bounds reject malformed or oversized streams. Full physical checksums retain
+padding coverage; ordinary file, snapshot and mounted reads use this transform.
+The per-dataset Zstandard feature does not expand the MOS label allowlist.
+
+Ten regressions cover independent Go/Zstandard vectors, malformed framing and
+lengths, dictionary requirements, memory limits and block integrity in both
+byte orders. Source/fixture review and exact blob comparisons completed.
+Rust/build/fmt/Clippy/UBS and native pool execution remain unavailable with the
+executor offline; no executed parity credit is added. See `docs/ZFS_READ_PROFILE.md`.
+
+### FAT16/FAT32 native new-image creation
+
+`ffs-fat format` creates new empty native FAT16/FAT32 volume images with
+checked geometry, two mirrored allocation tables, fixed/chained roots, native
+labels/serials, and FAT32 boot/FSInfo backups. Atomic exclusive creation refuses
+every existing target. Bounded initialization writes and synchronizes metadata
+before the primary boot sector, verifies exact metadata and complete allocation
+counts through the existing reader/checker on the same locked file, then
+synchronizes the parent directory. Failures retain the new file and report its
+potentially incomplete state. Existing-volume mutation/recovery remains separate.
+
+Eleven regressions cover geometry boundaries, native layout and readback,
+no-overwrite behavior, partial I/O failures, cancellation, synchronization order
+and unexpected allocation. Independent source review and arithmetic comparison
+against a closed-form FAT sizing equation completed. Rust/build/fmt/Clippy/UBS,
+native fsck/mtools and mounted execution remain unavailable with the executor
+offline; no executed native-format or interoperability credit is added.
+See `docs/FAT_READ_PROFILE.md`.
+
+
+### ZFS complete-mirror extraction and mounts
+
+Every explicit-root command accepts repeated `--mirror-member` images for one
+ordinary top-level mirror of two through eight leaves. The reader checks the
+complete native member GUID set, all four labels on each image, topology,
+geometry, read features and the selected root candidate. Argument order never
+supplies native identity, and configuration paths are never opened on the host.
+Mirror addressing uses the same physical offset on each member and native
+ashift-rounded DVA sizes. Each physical copy is checksum-verified before use;
+I/O/checksum failures try another supplied member, cancellation stops immediately,
+and failed data never enter the checked-block cache.
+
+One owned member set now reaches raw MOS/DMU operations, datasets, file reads,
+snapshot reads and the existing read-only FsOps/mount adapter. All backing image
+paths participate in the mountpoint guard. Eleven constructed engine regressions
+and four CLI regressions cover member admission, root agreement, redundant
+metadata/data reads, historical roots, cancellation and cache publication.
+The changed Rust files were parsed and formatted. Integrated CLI checks/tests
+were attempted, including one compiler thread, but `asupersync` compilation
+received SIGKILL under the shared memory limit. These new tests and native
+OpenZFS/mounted mirror workloads remain unexecuted. No import, degraded-member
+selection, repair write, healing or RAIDZ support is implied.
+See `docs/ZFS_READ_PROFILE.md` for the native profile and commands.

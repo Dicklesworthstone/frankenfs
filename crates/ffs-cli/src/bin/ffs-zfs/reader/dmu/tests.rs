@@ -225,10 +225,10 @@ fn graph(order: Endian, case: u8, reads: Reads, failure: Option<u64>) -> (Leaf, 
 
 fn objects(leaf: &Leaf, meta: Dnode) -> Objects {
     Objects {
-        leaf: leaf.clone(),
-        config: SingleLeaf {
+        pool: leaf.clone().into(),
+        config: VdevConfig {
             pool_guid: 123,
-            leaf_guid: 999,
+            top_guid: 999,
             version: 5000,
             txg: 42,
             ashift: 9,

@@ -71,7 +71,7 @@ impl Objects {
             return Err(corrupt("selected ZPL head identity changed"));
         }
         let view = Objects {
-            leaf: self.leaf.clone(),
+            pool: self.pool.clone(),
             config: self.config.clone(),
             txg: self.txg,
             root_birth: bp.birth(),

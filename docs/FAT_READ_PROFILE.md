@@ -1,8 +1,9 @@
-# Experimental FAT16/FAT32 read profile
+# Experimental FAT16/FAT32 read and new-image creation profile
 
 `ffs-fat` is a native Rust companion binary in `ffs-cli`. It uses the shared
 `ffs-ondisk::fat` parser and the existing `ffs-core::FsOps` / `ffs-fuse` adapter.
-It does not invoke another filesystem driver to implement reads. The ordinary
+It implements reads and creation of new empty images without invoking another
+filesystem driver or formatter. The ordinary
 ext4/btrfs `ffs-cli` dispatch and `FsFlavor` are unchanged; this is not yet
 integration into the generic `ffs mount` or `OpenFs` auto-detection path.
 
@@ -13,10 +14,20 @@ Build `ffs-fat` with the repository's prescribed Cargo/RCH workflow:
 ```sh
 rch exec -- cargo build -p ffs-cli --bin ffs-fat
 
+# These paths must not already exist; format creates an empty volume image.
+target/debug/ffs-fat format new-fat16.img --kind fat16 --size-mib 4 --label DATA
+target/debug/ffs-fat format new-fat32.img --kind fat32 --size-mib 64 --serial 305441741
+
 target/debug/ffs-fat inspect volume.img
 target/debug/ffs-fat check volume.img
 target/debug/ffs-fat ls volume.img /nested
 target/debug/ffs-fat cat volume.img '/Long native filename.txt' > extracted.bin
+
+# Lossless native catalog; copy entry_slots from the returned JSON.
+target/debug/ffs-fat catalog volume.img
+# These offsets are examples; use the selector belonging to your immutable image.
+target/debug/ffs-fat catalog volume.img --entry-slots 20992
+target/debug/ffs-fat extract volume.img --entry-slots 20992,22592 > extracted.bin
 
 # The directory must already exist and be empty. No other program may write
 # the backing image for the lifetime of this mount.
@@ -28,13 +39,71 @@ target/debug/ffs-fat cat disk.img --offset 1048576 --length 67108864 /FILE.BIN
 target/debug/ffs-fat check disk.img --offset 1048576 --length 67108864
 ```
 
-All image opens are read-only. There is no write, repair, recovery, format,
-resize, or protection-initialization path. Shared advisory locks do not exclude
+Commands that open existing images use read-only handles. The separate `format`
+command exclusively creates a new file; it cannot overwrite or format an existing
+image or device. Mutation, repair, recovery, resizing and protection initialization
+of existing volumes remain separate work. Shared advisory locks do not exclude
 kernel mounts or unrelated writers; image immutability is a caller requirement.
-`cat` validates allocation before output, but a later storage failure may still
-leave a previously streamed prefix on stdout and exits unsuccessfully.
+`cat` and `extract` validate allocation before output, but a later storage failure
+may still leave a previously streamed prefix on stdout and exits unsuccessfully.
 
-## Implemented boundaries
+## New-image formatter
+
+`ffs-fat format NEW_IMAGE --kind fat16|fat32 --size-mib N` creates a new empty
+volume image at byte zero. Both dialect and exact logical size are required.
+The output is a volume image, without a partition table or operating-system
+bootloader. No overwrite, device-format, partition-offset or resize option is
+provided.
+
+Geometry uses 512-byte sectors, two mirrored FATs and a power-of-two cluster
+size from 1..128 sectors (up to 64 KiB). The formatter chooses the smallest
+cluster size satisfying the selected dialect and resource bounds, then finds
+the smallest FAT that can represent every data cluster. FAT16 uses 512 fixed
+root entries and a data-cluster range of 4,087..65,518, avoiding ambiguous
+FAT12 thresholds and reserved cluster identifiers. FAT32 uses 32 reserved
+sectors, root cluster 2, boot backup sector 6, FSInfo sector 1 and its backup
+at sector 7. Its data-cluster count starts at 65,525 and is limited by the
+existing 8,388,608-cluster checker budget. Invalid sizes are rejected before
+the output file is created.
+
+An optional `--label` accepts a restricted ASCII label of 1..11 bytes with
+no leading or trailing space, uppercases it, and writes the same padded name
+to the native boot label and root volume-label entry. With no label, the boot
+field contains the native `NO NAME` default and the root is empty.
+`--serial` accepts a decimal 32-bit volume identifier; the default is derived
+from the system clock and is not a uniqueness guarantee. Supplying a serial
+makes the constructed image deterministic. Native label-entry dates use
+1980-01-01.
+
+All options and the completed BPB are checked before an atomic `create_new`
+open. Existing regular files, empty files, symlinks (including dangling links),
+directories and device paths are refused. The new file is exclusively locked
+and extended from zero length, supplying logical zeros for both allocation
+tables, reserved regions, directories and free space. Physical storage may
+be sparse; the command does not preallocate the image's entire logical size.
+
+Initialization writes clean native FAT headers, root metadata, and both
+FAT32 boot/FSInfo copies. These metadata writes are bounded independently of
+image size. The primary boot sector is written only after the other metadata
+has been synchronized; the completed file is synchronized again. Verification
+reads back every explicit metadata sector and runs the existing allocation
+checker through a read-only adapter over a clone of the same locked handle,
+without reopening the target pathname or reacquiring its lock. Success requires
+an empty namespace, expected free/allocated counts, agreeing FAT copies and
+no lost allocation, then synchronization of the parent directory entry.
+
+The JSON result identifies `operation: create_new_image`, reports native
+geometry/label/serial and includes the read-only verification report.
+Cancellation or any creation, write, synchronization or verification failure
+returns an error. A file already created by the command is retained and may
+be incomplete; it is not silently removed or reused on a subsequent attempt.
+The lock remains advisory. This adds empty-image creation; mutation and
+recovery of existing FAT filesystems still require their own native write path.
+
+Native layout reference:
+[dosfstools 4.2 formatter](https://github.com/dosfstools/dosfstools/blob/v4.2/src/mkfs.fat.c).
+
+## Implemented read boundaries
 
 FAT type comes from cluster count. Geometry, backing ranges, FAT capacity,
 FAT16 fixed roots, FAT32 root chains, active FAT selection, clean-state headers,
@@ -60,10 +129,12 @@ individual file allocation maps at 8,388,608 clusters; individual reads at
 chain caches at 1,024 files and 32 MiB of cluster addresses. These are admission
 and resource limits, not assertions of full FAT parity.
 
-Names use lossless UTF-8 LFNs and ASCII short names; non-ASCII OEM-only names,
-unpaired UTF-16 surrogates and names exceeding the host's 255-byte limit are
-refused rather than silently altered. Comparisons fold ASCII only, not Windows
-Unicode collation. Permissions/ownership are explicit read-only Unix projections.
+Path commands and mounts use lossless UTF-8 LFNs and ASCII short names;
+non-ASCII OEM-only names, unpaired UTF-16 surrogates and names exceeding the
+host's 255-byte limit have no admitted path spelling. The native catalog and
+entry-slot extraction below can access those names without conversion.
+Comparisons fold ASCII only, not Windows Unicode collation. Permissions/ownership
+are explicit read-only Unix projections.
 Native timestamps use a deterministic UTC projection of FAT wall-clock fields;
 the format records no timezone, so this projection does not recover the original
 instant. Creation preserves its native 10 ms precision (including odd seconds),
@@ -74,8 +145,41 @@ invalid fields report corruption at their directory record. Dirty volumes and
 conflicting boot copies require offline native investigation; this reader never
 repairs them automatically.
 
-FAT12, exFAT, FAT writes/recovery, complete OEM/Unicode naming parity, integrated
+FAT12, exFAT, mutation/recovery of existing FAT images, full OEM/Unicode naming parity, integrated
 MVCC/RaptorQ protection, and NTFS/ZFS implementation remain separate work.
+
+## Lossless native catalog and extraction
+
+`catalog` lists the root by default. Each live ordinary entry includes its raw
+11-byte short name, optional assembled UTF-16 LFN, optional lossless display name
+and display error, attributes, file size, first cluster, and an exact `entry_slots`
+selector. Non-ASCII OEM bytes are retained without assuming a code page; the
+native 0x05 short-name escape is retained. Unpaired UTF-16 units and names whose
+UTF-8 representation exceeds the host limit remain accessible through selectors.
+
+A selector is a comma-separated root-to-entry chain of decimal short-entry byte
+offsets. Offsets are relative to the selected FAT volume, including when `--offset`
+and `--length` select a volume inside a larger image. They are valid only for that
+same immutable image; changing the image can change the identity at a slot.
+`catalog --entry-slots ...` lists a selected directory, and
+`extract --entry-slots ...` streams a selected regular file through the existing
+allocation, EOF, read-size and cancellation checks.
+
+Every selector component must occur in the complete parsed directory selected
+by its preceding components. Arbitrary image offsets, deleted/LFN/volume-label
+slots, native dot entries, records after the directory-end marker, non-directory
+intermediates and ancestor cycles cannot select file contents. Native units are
+checked for invalid path separators before any display conversion, so an unpaired
+surrogate cannot hide another malformed name component. Existing structural
+parser failures remain fatal; the normal reader's short-alias fallback for an
+invalid LFN sequence remains unchanged. The checker continues to report those
+LFN defects separately.
+
+Selectors admit at most 256 components, each a 32-byte-aligned u64 offset, with a
+5,375-byte input bound. Existing directory and allocation-map budgets still apply.
+A requested slot does not stop validation early: damaged later entries or allocated
+directory tails fail before file output. Cataloging does not certify file payloads
+or perform the full allocation/namespace check described below.
 
 ## Read-only allocation check
 
@@ -182,3 +286,33 @@ and invalid-field error locations. The calendar constants were independently
 checked with JavaScript date conversion, and the source received a second review.
 Rust tests, formatting, workspace checks, Clippy and UBS remain unexecuted because
 the authoring executor is offline. No new native-image or mounted result is claimed.
+
+**Native name access increment (2026-10-11):** three parser/CLI tests and seven
+constructed image regressions cover FAT16 and FAT32, OEM bytes and the native
+0x05 escape, unpaired surrogates, host-overlong UTF-8, nested selectors, nonmember
+and deleted entries, label/LFN/dot/end-marker slack, ancestor links, raw separator
+corruption, damaged allocation and directory tails, cancellation, and unchanged
+images including adjacent volume bytes. Existing test assertions are preserved.
+Independent source/fixture review and exact GitHub blob comparisons completed;
+Rust compilation/tests, formatting, Clippy, UBS and native-image execution remain
+unavailable while the executor is offline. These tests are not executed native
+or mounted parity evidence.
+
+**Native formatter increment (2026-10-11):** eleven new regressions cover CLI
+requirements; independent geometry and FAT-capacity boundaries; new FAT16/FAT32
+images with complete mirrors, roots and FSInfo backups; labels and serials;
+no-overwrite behavior for existing files, directories, symlinks and devices;
+invalid and pre-cancelled requests without output creation; every initialization
+I/O failure and mid-I/O cancellation position; partial-write retention; boot-last
+flush ordering; readback damage and unexpected allocation beyond the explicitly
+written header; and bounded read-only verification.
+
+Complete production, CLI and fixture blobs received independent review and
+exact readback comparison. Independent arithmetic compared minimum FAT sizing
+with a separate closed form across the integer-MiB size range and checked all
+boundary fixtures. These are source and arithmetic checks, not execution of
+the formatter. Rust compilation, the eleven regressions, formatting, workspace
+checks, Clippy, UBS, native `fsck.fat`/mtools validation and mounted interchange
+remain unexecuted because the authoring executor is offline. The earlier
+external runner uses `mkfs.fat` to create its inputs and does not qualify this
+new native formatter.

@@ -17,6 +17,8 @@ sha2 = { workspace = true }
 blake2 = { workspace = true }
 # Native ZFS gzip-1 through gzip-9 use the existing zlib-rs backend.
 flate2 = { workspace = true }
+# Native ZFS Zstandard uses bounded magicless frame decoding.
+zstd = { workspace = true }
 
 [dev-dependencies]
 rustc-hash = "2"

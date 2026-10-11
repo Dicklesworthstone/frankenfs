@@ -66,10 +66,10 @@ fn view(leaf: &Leaf, order: Endian, extra_flags: u64) -> Objects {
     raw[64..192].copy_from_slice(&embedded_raw(b'A', order, extra_flags));
     raw[320..448].copy_from_slice(&embedded_raw(b'B', order, 0));
     Objects {
-        leaf: leaf.clone(),
-        config: SingleLeaf {
+        pool: leaf.clone().into(),
+        config: VdevConfig {
             pool_guid: 123,
-            leaf_guid: 999,
+            top_guid: 999,
             version: 5000,
             txg: 42,
             ashift: 9,

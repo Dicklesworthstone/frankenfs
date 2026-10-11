@@ -4,6 +4,7 @@ mod attributes;
 mod compression;
 pub mod filesystem;
 mod namespace;
+pub mod security;
 
 use asupersync::Cx;
 use ffs_block::ByteDevice;

@@ -1,10 +1,12 @@
 # Experimental native ZFS block, DMU, ZPL and extraction mounts
 
-`ffs-zfs` implements the restricted ZFS-01/ZFS-02 foundation and starts ZFS-03
-from the comprehensive expansion plan. It inspects labels and explicit uberblock
+`ffs-zfs` implements the restricted ZFS-01/ZFS-02 foundation, selected ZFS-03
+filesystem and snapshot reads, and a bounded ZFS-04 mirror profile from the
+comprehensive expansion plan. It inspects labels and explicit uberblock
 candidates, extracts checked roots and MOS object ranges, inventories DSL head
 datasets, reads files within an explicitly selected head or named snapshot, and
 exposes that same committed view through a read-only FUSE extraction mount.
+Reads can use a single leaf or an explicitly supplied complete mirror.
 It does not import a pool. No ext4/btrfs/FAT/NTFS dispatch is changed.
 
 ## Commands
@@ -42,6 +44,17 @@ ffs-zfs mount leaf.img /mnt/zfs-before --dataset data --snapshot before \
 
 # All native checksum verifiers and DVA addresses remain vdev-relative.
 ffs-zfs inspect disk.img --offline-image --offset 1048576 --length 134217728
+
+# Supply every configured mirror member explicitly; repeat --mirror-member
+# for each member after the first. GUID/label/slot remain explicit selections.
+ffs-zfs root mirror-a.img --mirror-member mirror-b.img \
+  --offline-image --pool-guid 123 --label 0 --slot 2 > mirror-mos-root.bin
+ffs-zfs read mirror-a.img /file.bin --mirror-member mirror-b.img \
+  --dataset data --snapshot before --start 507 --bytes 8199 \
+  --offline-image --pool-guid 123 --label 0 --slot 2 > mirror-file-range.bin
+ffs-zfs mount mirror-a.img /mnt/zfs-mirror --mirror-member mirror-b.img \
+  --dataset data --snapshot before --uid 1000 --gid 1000 \
+  --offline-image --pool-guid 123 --label 0 --slot 2
 ```
 
 `inspect` inventories configurations and candidate slots. It reports rejected
@@ -65,9 +78,9 @@ Regular block pointers retain native sizes, birth, object type, byte order and
 DVAs. The physical reader checks vdev identity, allocation size, sector alignment,
 all-copy bounds and boot/label exclusions before issuing data I/O. Physical bytes
 are checked with Fletcher2, Fletcher4, SHA256 or SHA-512/256 before transformation.
-Native LZJB, gzip-1 through gzip-9, ZLE and length-prefixed ZFS LZ4 decode to the
-exact declared logical length; short output, invalid backreferences, overflow
-and unsupported codecs fail.
+Native LZJB, gzip-1 through gzip-9, ZLE, length-prefixed ZFS LZ4 and native
+Zstandard decode to the exact declared logical length; short output, invalid
+backreferences, overflow and unsupported codecs fail.
 Fletcher inputs use the block's payload byte order, independently of the host
 and the block-pointer container. SHA256 keeps its historical big-endian numeric
 checksum words. Native checksum 11 (`sha512`) uses SHA-512/256 and interprets
@@ -81,8 +94,8 @@ first even when the pointer's containing block is big-endian. Logical and packed
 lengths are byte counts, not sector counts. Only level-zero, unencrypted,
 non-deduplicated DATA pointers are admitted, with no embedded DNODE/OBJSET
 blocks, reserved subtype or redacted-data interpretation. Uncompressed, LZJB,
-gzip-1 through gzip-9, ZLE and ZFS LZ4 payloads must reconstruct the exact bounded
-logical size. The parent block's checksum protects these bytes; there is no fabricated child checksum
+gzip-1 through gzip-9, ZLE, ZFS LZ4 and native Zstandard payloads must reconstruct
+the exact bounded logical size. The parent block's checksum protects these bytes; there is no fabricated child checksum
 or physical DVA read. A reached embedded pointer requires the native
 `com.delphix:embedded_data` label feature as well as the ordinary dnode
 type/size/birth checks before decoded bytes may enter the view's cache.
@@ -105,12 +118,96 @@ physical-block checksum; a second stream is never concatenated to fill LSIZE.
 The shared decoder reaches ordinary file, snapshot and mounted reads for both
 physical and embedded blocks. No label feature requirement is added.
 
+Native Zstandard (codec 16) reads the eight-byte big-endian OpenZFS wrapper and
+its magicless frame. The compressed-length field bounds exactly one complete
+frame. All four historical level/version byte layouts follow the native getter
+rule; normal levels 1..19 and fast-level IDs 103..123 are admitted. The producer
+version remains informational, as in OpenZFS.
+
+The existing zstd dependency decodes into a fixed logical-size output slice
+through its safe API. Before a decoder context is created, the frame's advertised
+window is checked against the 16 MiB budget and any declared content size must
+match LSIZE. The decoder also receives the 16 MiB window parameter. Truncated
+frames, dictionaries that are actually required, reserved framing, extra frames
+inside the declared native length, content-checksum failures and short or long
+output fail. Padding outside that native length remains covered by the full
+physical-block checksum. The same transform serves physical and embedded
+ordinary-file, snapshot and mounted reads.
+
+OpenZFS registers `org.freebsd:zstd_compress` as a per-dataset feature, not a MOS
+label feature. This codec addition does not broaden the label
+`features_for_read` allowlist or claim full MOS/dataset feature negotiation.
+
 A bad physical read, checksum or transform can try another declared copy on the
-same leaf. Cancellation propagates immediately and cannot turn into a redundant
-copy retry. No copy is repaired. The uberblock's native GUID sum must match the
-single-leaf configuration, including the root/pool GUID. The selected root must
-be a level-zero OBJSET pointer born no later than its uberblock and decode to a
-META object set. The `root` command alone does not validate its descendants.
+same leaf, or another explicitly supplied member of an admitted mirror.
+Cancellation propagates immediately and cannot turn into a redundant-copy
+retry. No copy is repaired. The uberblock's native GUID sum must match the
+complete admitted configuration, including the root/pool, top-level vdev and
+all mirror member GUIDs when present. The selected root must be a level-zero
+OBJSET pointer born no later than its uberblock and decode to a META object set.
+The `root` command alone does not validate its descendants.
+
+## Explicit mirror members and replica reads
+
+The mirror profile accepts exactly one top-level mirror, with native vdev ID
+zero and two through eight ordinary file/disk children. Every configured member
+must be supplied as a read-only offline image. `--mirror-member` is repeatable;
+there are no inferred paths, automatic device discovery, missing-member or
+forced/degraded admission options. The supplied order need not match the native
+child order: labels identify membership by GUID. Native path strings remain
+configuration metadata and are never opened on the host.
+
+All four label configurations on each supplied member must agree on its
+identity, exported state, top-level addressing, configuration TXG and allowed
+read features. Every member must describe the same complete mirror tree, with
+distinct member GUIDs and the native child IDs. The selected label and slot
+must contain the same semantic uberblock on every member: version, TXG, GUID
+sum, timestamp and complete root pointer must agree. Different valid native
+container byte orders are allowed. There is no majority vote, automatic newer
+candidate, rewind, or head fallback for an invalid historical selection.
+Offline, faulted, removing, rebuilding, spare, nested/replacing and allocation
+class topologies remain refused.
+
+`--offset` and `--length` apply to every supplied image. This CLI profile does
+not express different partition bases for different members. Omitting length
+uses each file's remaining selected span; unequal member lengths are admitted
+only when the common configured top-level allocation range fits every member.
+The mount guard checks all supplied backing paths, including canonical aliases,
+so mounting cannot hide one of the images beneath the mountpoint.
+
+Native mirror children use the same DVA offset. Physical I/O starts at the
+selected partition base plus the native 4 MiB data prefix plus that offset.
+The top-level mirror supplies ashift and allocation geometry; native child
+label nodes normally omit ashift/asize. DVA allocation size is the physical
+size rounded to the top-level sector size, without multiplication by mirror
+width. Every declared DVA must fit the configured allocation range and every
+member's selected usable span, excluding the boot/front-label region and the
+two end labels. These checks run for all declared copies before a good first
+copy can cause success.
+
+For each DVA, reads try the supplied members in argument order. Physical I/O,
+checksum or decompression failures can try the next member and then the next
+DVA. The complete physical checksum and bounded transform must succeed before
+bytes are returned or admitted to a DMU cache. Cancellation stops immediately,
+including before cache eviction/publication; it cannot trigger another replica
+read. An all-copy failure returns an error with bounded diagnostics. `root`
+reports the successful native member GUID and DVA copy index on stderr.
+
+MOS, head and snapshot views retain the immutable pool owner, including every
+member handle. Each selected object set keeps its own checked-block cache and
+historical birth limits. Root reads, indirect blocks, ZAPs, legacy/SA metadata,
+ordinary and embedded file data, and extraction mounts all use this same
+verified read path. A failed later file block is never cached as successful;
+previously verified metadata or data may remain cached. This is a bounded
+extraction profile, not DTL interpretation, scrub, healing, resilver, pool
+import, native write support or proof of full mirror feature coverage.
+
+Native contracts were checked against OpenZFS `zfs-2.3.0`
+[`vdev_mirror.c`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zfs/vdev_mirror.c),
+[`vdev.c`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zfs/vdev.c),
+[`vdev_label.c`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zfs/vdev_label.c),
+[`vdev_impl.h`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/include/sys/vdev_impl.h)
+and [`spa.h`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/include/sys/spa.h).
 
 ## DMU objects and DSL head inventory
 
@@ -120,7 +217,8 @@ endianness. Object lookup walks slot boundaries from the start of the containing
 16 KiB dnode block: interior slots of large dnodes cannot impersonate objects.
 Indirect routes use wide arithmetic rather than overflowing on high block IDs.
 
-Each object view owns one selected root and its admitted leaf configuration.
+Each object view owns one selected root, its admitted configuration and the
+complete set of read-only pool member handles.
 Traversed block pointers must have the expected type, level and logical size,
 and a birth no later than their containing parent and the selected TXG. These
 checks occur before I/O and before cache hits. Every physical read reuses the
@@ -241,7 +339,7 @@ intent has been incorporated into that root.
 `mount` uses the same explicit pool GUID, label and uberblock slot as extraction.
 It validates the selected head or snapshot, its root directory and the root's
 children before starting FUSE. A missing or invalid snapshot cannot fall back to
-the head. The mount owns its read-only image handle and selected object-set view;
+the head. The mount owns its read-only image handles and selected object-set view;
 its lifetime and checked-block cache do not depend on a temporary CLI reader.
 Separate mounts retain separate roots, SA registries and caches even when a
 head and a snapshot contain the same native object numbers.
@@ -287,10 +385,12 @@ keep the image immutable; shared advisory locks do not exclude unrelated writers
 or kernel mounts. There are no writes, flushes, label repairs, TXG publication,
 log replay, implicit native imports or host paths taken from a label.
 
-Extraction requires all four configurations to validate and agree on pool/leaf
-identity, addressing, configuration generation and read features. The pool must
-be exported and have one top-level file/disk leaf with ID zero and no removal,
-special or log state. Versions 1..28 or 5000 are admitted. Version 5000 requires
+Extraction requires all four configurations on every supplied image to validate
+and agree on pool/member identity, addressing, configuration generation and
+read features. The pool must be exported and have one top-level file/disk leaf
+or the complete two-to-eight-member mirror described above, with native ID
+zero and no removal, special or log state. Versions 1..28 or 5000 are admitted.
+Version 5000 requires
 no label read features beyond optional `org.illumos:lz4_compress` and
 `com.delphix:embedded_data`, encoded as boolean-presence fields. Unknown features
 and wrong value types still fail admission. This is not full MOS feature
@@ -300,8 +400,9 @@ The selected uberblock cannot predate label configuration. Fork/history
 resolution, rewind, active/MMP ownership and multi-vdev import remain separate
 work. Gang and encrypted/authenticated blocks remain unsupported;
 context-sized holes are handled only in the DMU traversal, not root extraction.
-RAIDZ/mirror topologies, indirect vdevs, normalized/binary ZAP keys, full ZPL/SA
-feature coverage, full snapshot/clone semantics, security, native writes, maintenance and
+RAIDZ/dRAID, nested/replacing or incomplete mirrors, indirect vdevs,
+normalized/binary ZAP keys, full ZPL/SA feature coverage, full snapshot/clone
+semantics, security, native writes, maintenance and
 MVCC/RaptorQ integration remain incomplete. Neither dataset inventory nor the
 restricted ZPL reader is a full ZFS-support claim.
 
@@ -400,6 +501,24 @@ added fixtures were reconstructed. The final integrated tree, CLI regressions,
 kernel FUSE mounts and native ZFS comparisons have not been executed. Source
 review and restored bytes do not replace those runtime gates.
 
+Mirror authoring evidence (2026-10-11): eleven constructed engine regression
+functions cover widths two, three and eight; both byte orders; ashift 9, 12 and
+16; raw/LZ4 roots; GUID membership independent of input order; unequal valid
+member spans; all-label and selected-candidate disagreement; unsupported
+states/topologies; all-member bounds; checksum and physical-I/O replica
+fallback; all-copy failure; cancellation; and successful-copy diagnostics.
+Complete label-to-MOS-to-ZPL fixtures exercise legacy and SA/spill metadata,
+embedded and ordinary data, mounted reads, historical cache isolation and a
+later historical block cancellation without another replica or head fallback.
+Backing devices reject every write or flush. Companion CLI regressions cover
+explicit member arguments, input limits and all-image mountpoint guards.
+The complete new mirror source and fixtures were parsed and formatted by
+rustfmt in an isolated checkout. CLI test attempts were killed while compiling
+the asupersync dependency under the shared memory limit, including a
+single-threaded retry. No mirror Rust execution, full CLI typecheck, kernel
+FUSE mount or native OpenZFS mirror comparison is claimed. Source review and
+formatting do not replace those runtime gates.
+
 Reference: OpenZFS tag zfs-2.3.0, especially spa.h, vdev_impl.h,
 uberblock_impl.h, dnode.h, dmu_objset.h, zap_impl.h, dsl_dir.h, dsl_dataset.h,
 zap_leaf.h, zap_leaf.c, zap_micro.c, nvpair.c, zio_checksum.c, sha2_zfs.c,
@@ -478,3 +597,36 @@ zlib `v1.3.1`
 [infcover.c](https://github.com/madler/zlib/blob/v1.3.1/test/infcover.c),
 and flate2 `1.1.9`
 [mem.rs](https://github.com/rust-lang/flate2-rs/blob/1.1.9/src/mem.rs).
+
+## Native Zstandard validation
+
+Ten regressions cover published raw, compressed-sequence, literal-only and
+multiblock RLE vectors; all native levels and four historical header layouts;
+truncation, native lengths and exact LSIZE; content sizes and memory windows;
+dictionary requests, wrong framing, reserved fields and trailing frames;
+content-checksum damage; physical padding with all four admitted checksum
+algorithms; and physical/embedded dispatch across both container and payload
+byte orders. The GZIP unsupported-codec test uses neighboring unsupported ID 17
+now that ID 16 has an implementation; its admission and failure assertions
+remain intact.
+
+Delivery evidence (2026-10-11): complete source blobs and their exact changes
+received independent review. Fixture bytes match the pinned Go examples and
+Zstandard binary goldens; their output layouts and the constructed mixed
+compressed/RLE block were checked separately through a small read-only fixture
+decoder. Those checks do not execute the Rust implementation or establish
+native pool interoperability. Rust compilation, these ten tests, formatting,
+workspace checks, Clippy, UBS and native-image execution remain unavailable
+because the authoring executor is offline.
+
+Native framing and feature references:
+[OpenZFS Zstandard metadata](https://github.com/openzfs/zfs/blob/zfs-2.3.0/include/sys/zstd/zstd.h),
+[OpenZFS codec](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zstd/zfs_zstd.c),
+[OpenZFS feature registration](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zcommon/zfeature_common.c),
+and [MOS label fields](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zfs/vdev_label.c).
+Independent vectors and format:
+[Go Zstandard examples](https://github.com/golang/go/blob/go1.24.0/src/internal/zstd/zstd_test.go),
+[Zstandard golden vectors](https://github.com/facebook/zstd/tree/v1.5.7/tests/golden-decompression),
+and [Zstandard framing specification](https://github.com/facebook/zstd/blob/v1.5.7/doc/zstd_compression_format.md).
+The implementation uses the existing pinned zstd 0.13.3 / zstd-safe 7.2.4 dependency;
+no new package versions or experimental API features are introduced.

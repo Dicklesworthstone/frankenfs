@@ -9,6 +9,7 @@ pub mod nvlist;
 use ffs_types::ParseError;
 use flate2::{Decompress, FlushDecompress, Status};
 use sha2::{Digest, Sha256, Sha512_256};
+use zstd::zstd_safe::{self, DCtx, DParameter};
 
 pub const LABEL_BYTES: u64 = 256 * 1024;
 pub const LABEL_CONFIG_OFFSET: u64 = 16 * 1024;
@@ -324,7 +325,7 @@ impl BlockPointer {
             return Err(invalid("physical block exceeds logical block size"));
         }
         if !matches!(self.checksum_type(), 6..=8 | 11)
-            || !matches!(self.compression(), 2 | 3 | 5..=15)
+            || !matches!(self.compression(), 2 | 3 | 5..=16)
         {
             return Err(invalid("unsupported block checksum or compression"));
         }
@@ -576,6 +577,10 @@ pub fn decompress(
                 copy_match(&mut output, distance, length, output_bytes)?;
             }
         }
+        16 => {
+            output.resize(output_bytes, 0);
+            decompress_zstd(input, &mut output)?;
+        }
         _ => return Err(invalid("unsupported compression algorithm")),
     }
     if output.len() != output_bytes {
@@ -584,6 +589,88 @@ pub fn decompress(
         ));
     }
     Ok(output)
+}
+
+/// OpenZFS zfs-2.3.0 zstd.h/zfs_zstd.c: an eight-byte native wrapper
+/// followed by one magicless Zstandard frame. The wrapper is always big-endian.
+fn decompress_zstd(input: &[u8], output: &mut [u8]) -> Result<(), ParseError> {
+    let header = input
+        .get(..8)
+        .ok_or_else(|| invalid("missing ZFS Zstandard header"))?;
+    let packed = usize::try_from(u32::from_be_bytes([
+        header[0], header[1], header[2], header[3],
+    ]))
+    .map_err(|_| invalid("Zstandard length overflow"))?;
+    let end = packed
+        .checked_add(8)
+        .ok_or_else(|| invalid("Zstandard length overflow"))?;
+    let payload = input
+        .get(8..end)
+        .filter(|data| !data.is_empty())
+        .ok_or_else(|| invalid("truncated ZFS Zstandard input"))?;
+
+    // Native historical bitfields have four admitted layouts. Match the
+    // upstream first-zero-byte rule from low to high numeric byte, rather
+    // than guessing a producer-version cutoff. The version is informational;
+    // only the native level enum is required for decoding.
+    let level = match header[4..8].iter().rev().position(|&byte| byte == 0) {
+        Some(0 | 2) => header[4],
+        Some(1 | 3) => header[7],
+        _ => 0,
+    };
+    if !matches!(level, 1..=19 | 103..=123) {
+        return Err(invalid("invalid ZFS Zstandard compression level"));
+    }
+
+    // Restoring the fixed magic permits the stable safe decoder API without
+    // experimental format parameters. This copy stays within the input budget.
+    let frame_bytes = packed
+        .checked_add(4)
+        .ok_or_else(|| invalid("Zstandard frame length overflow"))?;
+    let mut frame = Vec::new();
+    frame
+        .try_reserve_exact(frame_bytes)
+        .map_err(|_| invalid("Zstandard frame allocation failed"))?;
+    frame.extend_from_slice(&[0x28, 0xb5, 0x2f, 0xfd]);
+    frame.extend_from_slice(payload);
+    let content_size = zstd_safe::get_frame_content_size(&frame)
+        .map_err(|_| invalid("invalid Zstandard frame header"))?;
+
+    // Bulk decoding need not apply the streaming window limit. Check the
+    // advertised window before constructing a context as well as setting its
+    // safe parameter: a small LSIZE must not admit a huge window allocation.
+    let window = if payload[0] & 0x20 != 0 {
+        content_size.ok_or_else(|| invalid("missing Zstandard single-segment size"))?
+    } else {
+        let descriptor = *payload
+            .get(1)
+            .ok_or_else(|| invalid("missing Zstandard window descriptor"))?;
+        let base = 1_u64 << (10 + u32::from(descriptor >> 3));
+        base + (base / 8) * u64::from(descriptor & 7)
+    };
+    if window > MAX_BLOCK_BYTES as u64 {
+        return Err(invalid("Zstandard window exceeds read budget"));
+    }
+    if content_size.is_some_and(|size| size != output.len() as u64) {
+        return Err(invalid("Zstandard content size disagrees with logical length"));
+    }
+    let frame_size = zstd_safe::find_frame_compressed_size(&frame)
+        .map_err(|_| invalid("incomplete or invalid Zstandard frame"))?;
+    if frame_size != frame.len() {
+        return Err(invalid("Zstandard native length contains trailing frame data"));
+    }
+    let mut decoder =
+        DCtx::try_create().ok_or_else(|| invalid("Zstandard context allocation failed"))?;
+    decoder
+        .set_parameter(DParameter::WindowLogMax(MAX_BLOCK_BYTES.ilog2()))
+        .map_err(|_| invalid("Zstandard window limit could not be set"))?;
+    let decoded = decoder
+        .decompress(output, &frame)
+        .map_err(|_| invalid("invalid Zstandard compressed data"))?;
+    if decoded != output.len() {
+        return Err(invalid("Zstandard logical length mismatch"));
+    }
+    Ok(())
 }
 
 fn lz4_length(input: &[u8], at: &mut usize, mut length: usize) -> Result<usize, ParseError> {
@@ -632,6 +719,9 @@ mod tests;
 
 #[cfg(test)]
 mod zle_tests;
+
+#[cfg(test)]
+mod zstd_tests;
 
 #[cfg(test)]
 mod embedded_tests {

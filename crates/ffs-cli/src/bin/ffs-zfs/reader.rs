@@ -1,14 +1,17 @@
-//! Offline ZFS label discovery and explicit single-leaf MOS-root extraction.
+//! Offline ZFS label discovery and explicit leaf/mirror MOS-root extraction.
 //! No pool import, TXG selection, log replay, device writes or host path following.
 
 pub mod dmu;
+mod pool;
+
+pub use pool::Pool;
 
 use asupersync::Cx;
 use ffs_block::ByteDevice;
 use ffs_error::{FfsError, Result};
 use ffs_ondisk::zfs::nvlist::{NvList, Value};
 use ffs_ondisk::zfs::{
-    BlockPointer, DATA_OFFSET, Endian, LABEL_BYTES, LABEL_CONFIG_BYTES, LABEL_CONFIG_OFFSET,
+    BlockPointer, DATA_OFFSET, Dva, Endian, LABEL_BYTES, LABEL_CONFIG_BYTES, LABEL_CONFIG_OFFSET,
     UBERBLOCK_RING_BYTES, UBERBLOCK_RING_OFFSET, Uberblock, label_offsets, uberblock_bytes,
     verify_label_checksum,
 };
@@ -81,10 +84,11 @@ pub struct Label {
     pub slot_bytes: usize,
 }
 
+/// Addressing and read features of the single admitted top-level data vdev.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct SingleLeaf {
+struct VdevConfig {
     pool_guid: u64,
-    leaf_guid: u64,
+    top_guid: u64,
     version: u64,
     txg: u64,
     ashift: u8,
@@ -93,10 +97,48 @@ struct SingleLeaf {
     read_features: Vec<String>,
 }
 
+fn admit_vdev_state(tree: &NvList) -> Result<()> {
+    for name in [
+        "is_log",
+        "is_spare",
+        "not_present",
+        "offline",
+        "faulted",
+        "removed",
+        "removing",
+        "degraded",
+        "is_hole",
+        "resilver_txg",
+        "rebuild_txg",
+        "resilver_defer",
+        "unspare",
+    ] {
+        if let Some(value) = tree.fields.get(name)
+            && !matches!(value, Value::Unsigned(0))
+        {
+            return Err(unsupported(format!(
+                "ZFS vdev state {name} is not admitted"
+            )));
+        }
+    }
+    if [
+        "allocation_bias",
+        "indirect_object",
+        "indirect_births",
+        "prev_indirect_vdev",
+    ]
+    .iter()
+    .any(|name| tree.fields.contains_key(*name))
+    {
+        return Err(unsupported(
+            "special allocation and indirect vdev mappings are not admitted",
+        ));
+    }
+    Ok(())
+}
+
 impl Label {
-    /// Deliberately narrower than discovery. No multi-leaf or feature-registry
-    /// claim follows from being able to print a checksum-valid configuration.
-    fn single_leaf(&self, pool_guid: u64) -> Result<SingleLeaf> {
+    fn vdev_config(&self, pool_guid: u64) -> Result<VdevConfig> {
         let config = &self.config;
         let version = integer(config, "version")?;
         if !(1..=28).contains(&version) && version != 5000 {
@@ -112,12 +154,12 @@ impl Label {
         }
         if integer(config, "vdev_children")? != 1 {
             return Err(unsupported(
-                "root extraction currently requires exactly one top-level leaf",
+                "root extraction requires exactly one top-level data vdev",
             ));
         }
         if config.fields.contains_key("hole_array") {
             return Err(unsupported(
-                "a removed top-level vdev is outside the single-leaf profile",
+                "a removed top-level vdev is outside the read profile",
             ));
         }
         let mut read_features = Vec::new();
@@ -137,52 +179,15 @@ impl Label {
         let tree = config
             .list("vdev_tree")
             .ok_or_else(|| corrupt("missing vdev tree"))?;
-        if !matches!(tree.text("type"), Some("file" | "disk"))
-            || tree.fields.contains_key("children")
-        {
-            return Err(unsupported(
-                "mirror, RAIDZ, indirect and other compound vdevs require native mapping",
-            ));
-        }
-        for name in [
-            "is_log",
-            "is_spare",
-            "not_present",
-            "offline",
-            "faulted",
-            "removed",
-            "removing",
-            "degraded",
-            "is_hole",
-            "resilver_txg",
-            "rebuild_txg",
-        ] {
-            if let Some(value) = tree.fields.get(name)
-                && !matches!(value, Value::Unsigned(0))
-            {
-                return Err(unsupported(format!(
-                    "ZFS leaf state {name} is not admitted"
-                )));
-            }
-        }
-        if tree.fields.contains_key("allocation_bias")
-            || tree.fields.contains_key("indirect_object")
-        {
-            return Err(unsupported(
-                "special allocation and indirect vdev mappings are not admitted",
-            ));
-        }
-        let leaf_guid = integer(config, "guid")?;
-        if leaf_guid == 0
-            || integer(config, "top_guid")? != leaf_guid
-            || integer(tree, "guid")? != leaf_guid
-        {
-            return Err(corrupt("top-level and physical leaf GUIDs disagree"));
+        admit_vdev_state(tree)?;
+        let top_guid = integer(config, "top_guid")?;
+        if top_guid == 0 || top_guid == pool_guid || integer(tree, "guid")? != top_guid {
+            return Err(corrupt("top-level vdev GUIDs disagree"));
         }
         let id = u32::try_from(integer(tree, "id")?).map_err(|_| corrupt("vdev ID overflow"))?;
         if id != 0 {
             return Err(unsupported(
-                "single-leaf profile requires top-level vdev zero",
+                "read profile requires the single top-level vdev to have ID zero",
             ));
         }
         let ashift =
@@ -192,9 +197,9 @@ impl Label {
         if txg == 0 {
             return Err(corrupt("uninitialized label transaction group"));
         }
-        Ok(SingleLeaf {
+        Ok(VdevConfig {
             pool_guid,
-            leaf_guid,
+            top_guid,
             version,
             txg,
             ashift,
@@ -203,6 +208,27 @@ impl Label {
             read_features,
         })
     }
+
+    /// A standalone image must describe a standalone physical data vdev.
+    /// A mirror member needs the explicitly supplied complete member set.
+    fn single_leaf(&self, pool_guid: u64) -> Result<VdevConfig> {
+        let config = self.vdev_config(pool_guid)?;
+        let tree = self
+            .config
+            .list("vdev_tree")
+            .ok_or_else(|| corrupt("missing vdev tree"))?;
+        if !matches!(tree.text("type"), Some("file" | "disk"))
+            || tree.fields.contains_key("children")
+        {
+            return Err(unsupported(
+                "compound vdev requires its explicitly supplied native topology",
+            ));
+        }
+        if integer(&self.config, "guid")? != config.top_guid {
+            return Err(corrupt("top-level and physical leaf GUIDs disagree"));
+        }
+        Ok(config)
+    }
 }
 
 pub struct RootBlock {
@@ -210,6 +236,8 @@ pub struct RootBlock {
     pub data: Vec<u8>,
     pub physical_offset: u64,
     pub copy_index: usize,
+    pub member_guid: u64,
+    config: VdevConfig,
 }
 
 impl Leaf {
@@ -333,7 +361,7 @@ impl Leaf {
         }
         // Native vdev_guid_sum includes the root (pool GUID) and every child.
         // With one physical leaf there are exactly these two wrapping terms.
-        if ub.guid_sum != selected.pool_guid.wrapping_add(selected.leaf_guid) {
+        if ub.guid_sum != selected.pool_guid.wrapping_add(selected.top_guid) {
             return Err(corrupt(
                 "selected uberblock belongs to another vdev configuration",
             ));
@@ -355,14 +383,41 @@ impl Leaf {
             data,
             physical_offset,
             copy_index,
+            member_guid: selected.top_guid,
+            config: selected,
         })
     }
     fn read_block(
         &self,
         cx: &Cx,
-        config: &SingleLeaf,
+        config: &VdevConfig,
         bp: &BlockPointer,
     ) -> Result<(Vec<u8>, u64, usize)> {
+        let dvas = self.block_dvas(config, bp)?;
+        let mut failures = Vec::new();
+        for (index, dva) in dvas.iter().enumerate() {
+            checkpoint(cx)?;
+            let offset = DATA_OFFSET + dva.offset;
+            let result = self
+                .read(cx, offset, bp.physical_bytes())
+                .and_then(|bytes| bp.decode(&bytes).map_err(|error| parse(&error)));
+            match result {
+                Ok(data) => {
+                    checkpoint(cx)?;
+                    return Ok((data, offset, index));
+                }
+                Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
+                Err(error) => failures.push(format!("DVA {index}: {error}")),
+            }
+        }
+        Err(corrupt(format!(
+            "all ZFS block copies failed: {}",
+            failures.join("; ")
+        )))
+    }
+
+    /// Validate the whole DVA set against one physical member before data I/O.
+    fn block_dvas(&self, config: &VdevConfig, bp: &BlockPointer) -> Result<Vec<Dva>> {
         let dvas = bp.regular_dvas().map_err(|error| parse(&error))?;
         let sector = 1_u64 << config.ashift;
         let aligned_end = self.length / LABEL_BYTES * LABEL_BYTES - 2 * LABEL_BYTES;
@@ -388,29 +443,10 @@ impl Leaf {
                     .checked_add(dva.allocated_bytes)
                     .is_none_or(|end| end > config.allocated_bytes)
             {
-                return Err(corrupt("unaligned or out-of-range single-leaf DVA"));
+                return Err(corrupt("unaligned or out-of-range data-vdev DVA"));
             }
         }
-        let mut failures = Vec::new();
-        for (index, dva) in dvas.iter().enumerate() {
-            checkpoint(cx)?;
-            let offset = DATA_OFFSET + dva.offset;
-            let result = self
-                .read(cx, offset, bp.physical_bytes())
-                .and_then(|bytes| bp.decode(&bytes).map_err(|error| parse(&error)));
-            match result {
-                Ok(data) => {
-                    checkpoint(cx)?;
-                    return Ok((data, offset, index));
-                }
-                Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
-                Err(error) => failures.push(format!("DVA {index}: {error}")),
-            }
-        }
-        Err(corrupt(format!(
-            "all ZFS block copies failed: {}",
-            failures.join("; ")
-        )))
+        Ok(dvas)
     }
 }
 
