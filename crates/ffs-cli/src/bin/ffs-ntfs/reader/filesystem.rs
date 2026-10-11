@@ -4,7 +4,7 @@
 
 use super::{
     Cx, DATA, FfsError, NtfsFileRecord, NtfsReference, NtfsValue, NtfsVolume, Result, Stream,
-    checkpoint, corrupt, parse, unsupported,
+    checkpoint, corrupt, parse, relative_link_target, unsupported,
 };
 use ffs_core::{
     DirEntry, FileType, FsOps, FsStat, InodeAttr, ReaddirPage, RequestScope, SeekWhence,
@@ -114,7 +114,9 @@ impl NtfsFs {
             gid,
             cache: Mutex::new(Cache::default()),
         };
-        fs.describe(cx, ROOT)?;
+        if fs.describe(cx, ROOT)?.kind != FileType::Directory {
+            return Err(corrupt(0, "NTFS mount root is a reparse object"));
+        }
         fs.directory(cx, ROOT)?;
         checkpoint(cx)?;
         Ok(fs)
@@ -244,9 +246,7 @@ impl NtfsFs {
         let record = self.record(cx, ino)?;
         let catalog = self.volume.attributes(cx, &record)?;
         let all = catalog.all()?;
-        if all.iter().any(|attr| attr.kind == 0xC0) {
-            return Err(unsupported("NTFS reparse objects are not mounted"));
-        }
+        let reparse = self.volume.reparse_from_catalog(cx, &catalog)?;
         let standard = catalog.select(&self.volume.geometry, 0x10, &[])?;
         if !standard.resident() || !matches!(standard.size, 48 | 72) {
             return Err(corrupt(0, "invalid resident NTFS STANDARD_INFORMATION"));
@@ -257,13 +257,22 @@ impl NtfsFs {
                 .try_into()
                 .map_err(|_| corrupt(0, "truncated NTFS file attributes"))?,
         );
-        if flags & 0x400 != 0 {
-            return Err(unsupported("NTFS reparse file attribute is not mounted"));
-        }
         if flags & 0x4000 != 0 {
             return Err(unsupported("NTFS encrypted file is not mounted"));
         }
-        let (kind, size, blocks) = if record.is_directory() {
+        let (kind, size, blocks) = if let Some(point) = reparse {
+            let target = relative_link_target(&point)?;
+            let allocation = catalog.select(&self.volume.geometry, super::REPARSE_POINT, &[])?;
+            (
+                FileType::Symlink,
+                target.len() as u64,
+                if allocation.resident() {
+                    0
+                } else {
+                    allocation.allocated.div_ceil(512)
+                },
+            )
+        } else if record.is_directory() {
             self.parent(cx, &record)?;
             // Directory logical size is a host projection; count only native
             // external index allocation, never manufacture file DATA bytes.
@@ -308,10 +317,10 @@ impl NtfsFs {
             ctime: time(16)?,
             atime: time(24)?,
             kind,
-            perm: if kind == FileType::Directory {
-                0o555
-            } else {
-                0o444
+            perm: match kind {
+                FileType::Directory => 0o555,
+                FileType::Symlink => 0o777,
+                _ => 0o444,
             },
             nlink: u32::from(record.hard_links),
             uid: self.uid,
@@ -404,7 +413,7 @@ impl NtfsFs {
                 }
                 continue;
             }
-            if entry.directory {
+            if entry.directory && entry.reparse_tag.is_none() {
                 if target == ino || target == ROOT {
                     return Err(corrupt(
                         0,
@@ -423,7 +432,9 @@ impl NtfsFs {
             entries.push(DirEntry {
                 ino: target,
                 offset: entries.len() as u64 + 1,
-                kind: if entry.directory {
+                kind: if entry.reparse_tag.is_some_and(|tag| tag & 0x2000_0000 != 0) {
+                    FileType::Symlink
+                } else if entry.directory {
                     FileType::Directory
                 } else {
                     FileType::RegularFile
@@ -448,16 +459,15 @@ impl NtfsFs {
         }
         // A caller need not have issued LOOKUP first. Enforce metadata-side
         // reparse/EFS admission on OPEN and READ as well as GETATTR.
-        self.describe(cx, ino)?;
+        let kind = self.describe(cx, ino)?.kind;
+        if kind == FileType::Symlink {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::ELOOP)));
+        }
         let record = self.record(cx, ino)?;
-        let catalog = self.volume.attributes(cx, &record)?;
         if record.is_directory() {
             return Err(FfsError::IsDirectory);
         }
-        if catalog.all()?.iter().any(|attr| attr.kind == 0xC0) {
-            return Err(unsupported("NTFS reparse data is not mounted"));
-        }
-        let stream = Arc::new(catalog.select(&self.volume.geometry, DATA, &[])?);
+        let stream = Arc::new(self.volume.data_stream(cx, &record, &[])?);
         checkpoint(cx)?;
         let mut cache = self.cache()?;
         if let Some(existing) = cache.streams.get(&ino).cloned() {
@@ -583,6 +593,9 @@ impl FsOps for NtfsFs {
         ino: InodeNumber,
         offset: u64,
     ) -> Result<ReaddirPage> {
+        if self.describe(cx, ino)?.kind != FileType::Directory {
+            return Err(FfsError::NotDirectory);
+        }
         let snapshot = self.directory(cx, ino)?;
         let entries = &snapshot.rows;
         let end = entries.len() as u64;
@@ -621,8 +634,8 @@ impl FsOps for NtfsFs {
     }
 
     fn readlink(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber) -> Result<Vec<u8>> {
-        self.record(cx, ino)?;
-        Err(unsupported("NTFS reparse translation is not implemented"))
+        let record = self.record(cx, ino)?;
+        self.volume.readlink(cx, &record)
     }
 
     fn statfs(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber) -> Result<FsStat> {
@@ -676,8 +689,7 @@ impl FsOps for NtfsFs {
         _fh: u64,
         _datasync: bool,
     ) -> Result<()> {
-        let record = self.record(cx, ino)?;
-        if !record.is_directory() {
+        if self.describe(cx, ino)?.kind != FileType::Directory {
             return Err(FfsError::NotDirectory);
         }
         checkpoint(cx)

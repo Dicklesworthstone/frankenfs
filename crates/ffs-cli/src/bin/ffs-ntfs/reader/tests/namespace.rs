@@ -351,7 +351,7 @@ fn native_upcase_damage_and_reparse_traversal_are_not_silently_ignored() {
             &[
                 resident(DATA, 0, "", b"posix"),
                 resident(0x30, 1, "", &name_value(5, "mixed", 0)),
-                resident(0xC0, 2, "", &[0; 8]),
+                resident(0xC0, 2, "", &[0x17, 0, 0, 0x80, 0, 0, 0, 0]),
             ],
         ),
     );
@@ -493,7 +493,14 @@ fn reparse_attributes_cannot_hide_in_an_extension_record() {
             ],
         ),
     );
-    image.put_record(30, &extension(30, 29, &[resident(0xC0, 2, "", &[0; 8])]));
+    image.put_record(
+        30,
+        &extension(
+            30,
+            29,
+            &[resident(0xC0, 2, "", &[0x17, 0, 0, 0x80, 0, 0, 0, 0])],
+        ),
+    );
     let volume = open(image, Arc::default(), None).unwrap();
     assert!(matches!(
         volume.resolve(&cx, "/mixed"),

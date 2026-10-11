@@ -49,6 +49,10 @@ fn mapped(pairs: &[u8], clusters: u64, size: u64, compressed: bool) -> Vec<u8> {
 }
 
 fn standard() -> Vec<u8> {
+    standard_with_flags(0)
+}
+
+fn standard_with_flags(flags: u32) -> Vec<u8> {
     let mut info = [0; 72];
     for (index, time) in [
         UNIX_FILETIME,
@@ -61,7 +65,30 @@ fn standard() -> Vec<u8> {
     {
         info[index * 8..index * 8 + 8].copy_from_slice(&time.to_le_bytes());
     }
+    info[32..36].copy_from_slice(&flags.to_le_bytes());
     resident(0x10, 500, "", &info)
+}
+
+fn reparse(target: &str, relative: bool) -> Vec<u8> {
+    resident(
+        super::super::REPARSE_POINT,
+        3,
+        "",
+        &reparse_value(target, relative),
+    )
+}
+
+fn reparse_value(target: &str, relative: bool) -> Vec<u8> {
+    let units: Vec<_> = target.encode_utf16().collect();
+    let mut value = vec![0; 20];
+    value[..4].copy_from_slice(&0xA000_000C_u32.to_le_bytes());
+    value[4..6].copy_from_slice(&(12 + units.len() as u16 * 2).to_le_bytes());
+    value[10..12].copy_from_slice(&(units.len() as u16 * 2).to_le_bytes());
+    value[16..20].copy_from_slice(&u32::from(relative).to_le_bytes());
+    for unit in units {
+        value.extend(unit.to_le_bytes());
+    }
+    value
 }
 
 fn filename(parent: u64, name: &str, namespace: u8) -> Vec<u8> {
@@ -553,10 +580,10 @@ fn reparse_and_cancellation_never_return_successful_data() {
             false,
             1,
             &[
-                standard(),
+                standard_with_flags(0x400),
                 resident(DATA, 0, "", b"native"),
                 resident(0x30, 2, "", &filename(5, "mixed", 0)),
-                resident(0xC0, 3, "", &[0; 8]),
+                resident(0xC0, 3, "", &[0x17, 0, 0, 0x80, 0, 0, 0, 0]),
             ],
         ),
     );
@@ -565,6 +592,289 @@ fn reparse_and_cancellation_never_return_successful_data() {
         fs.lookup(&cx, &mut scope, ROOT, OsStr::new("mixed")),
         Err(FfsError::UnsupportedFeature(_))
     ));
+}
+
+#[test]
+fn relative_symlinks_expose_native_metadata_and_resolve_real_file_bytes() {
+    let cx = Cx::for_testing();
+    let mut bytes = image();
+    put(
+        &mut bytes,
+        29,
+        &record(
+            29,
+            false,
+            1,
+            &[
+                standard_with_flags(0x400),
+                resident(DATA, 0, "", b"not the target contents"),
+                resident(0x30, 2, "", &filename(5, "mixed", 0)),
+                reparse("Subdir\\payload.bin", true),
+            ],
+        ),
+    );
+    let reads: Reads = Arc::default();
+    let fs = open(bytes, Arc::clone(&reads), None).unwrap();
+    let mut scope = RequestScope::empty();
+    let link = fs
+        .lookup(&cx, &mut scope, ROOT, OsStr::new("mixed"))
+        .unwrap();
+    assert_eq!(link.kind, FileType::Symlink);
+    assert_eq!(link.size, b"Subdir/payload.bin".len() as u64);
+    assert_eq!(
+        fs.readlink(&cx, &mut scope, link.ino).unwrap(),
+        b"Subdir/payload.bin"
+    );
+    let page = fs.readdir(&cx, &mut scope, ROOT, 0).unwrap();
+    assert_eq!(
+        page.iter()
+            .find(|entry| entry.name == b"mixed")
+            .unwrap()
+            .kind,
+        FileType::Symlink
+    );
+    assert!(matches!(
+        fs.read(&cx, &mut scope, link.ino, 0, 100),
+        Err(FfsError::Io(error)) if error.raw_os_error() == Some(libc::ELOOP)
+    ));
+    let native = fs.volume.resolve_no_follow(&cx, "/mixed").unwrap();
+    assert_eq!(native.number, 29);
+    assert!(matches!(
+        fs.volume.data_stream(&cx, &native, &[]),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
+    let target = fs.volume.resolve(&cx, "/mixed").unwrap();
+    assert_eq!(target.number, 25);
+    let stream = fs.volume.data_stream(&cx, &target, &[]).unwrap();
+    assert_eq!(fs.volume.read(&cx, &stream, 510, 4).unwrap(), b"AABB");
+    assert!(reads.lock().unwrap().iter().all(|(offset, size)| {
+        *offset >= BASE as u64 && *offset + *size as u64 <= (BASE + LENGTH) as u64
+    }));
+}
+
+#[test]
+fn directory_symlinks_do_not_hide_the_parent_listing_or_follow_their_own_index() {
+    let cx = Cx::for_testing();
+    let mut bytes = image();
+    put(
+        &mut bytes,
+        27,
+        &record(
+            27,
+            true,
+            1,
+            &[
+                standard_with_flags(0x400),
+                resident(0x30, 2, "", &filename(5, "Subdir", 1)),
+                reparse(".", true),
+            ],
+        ),
+    );
+    let fs = open(bytes, Arc::default(), None).unwrap();
+    let mut scope = RequestScope::empty();
+    let link = fs
+        .lookup(&cx, &mut scope, ROOT, OsStr::new("Subdir"))
+        .unwrap();
+    assert_eq!(link.kind, FileType::Symlink);
+    assert_eq!(fs.readlink(&cx, &mut scope, link.ino).unwrap(), b".");
+    assert!(matches!(
+        fs.readdir(&cx, &mut scope, link.ino, 0),
+        Err(FfsError::NotDirectory)
+    ));
+    assert_eq!(fs.readdir(&cx, &mut scope, ROOT, 0).unwrap().len(), 8);
+    assert_eq!(
+        fs.volume.resolve(&cx, "/Subdir/hello.txt").unwrap().number,
+        24
+    );
+    assert_eq!(fs.volume.resolve(&cx, "/Subdir/").unwrap().number, 5);
+    assert!(fs.volume.resolve(&cx, "/hello.txt/.").is_err());
+}
+
+#[test]
+fn symlink_loops_dangling_targets_and_root_escapes_are_bounded() {
+    let cx = Cx::for_testing();
+    for (target, expected_errno) in [("mixed", libc::ELOOP), ("missing", libc::ENOENT)] {
+        let mut bytes = image();
+        put(
+            &mut bytes,
+            29,
+            &record(
+                29,
+                false,
+                1,
+                &[
+                    standard_with_flags(0x400),
+                    resident(0x30, 2, "", &filename(5, "mixed", 0)),
+                    reparse(target, true),
+                ],
+            ),
+        );
+        let fs = open(bytes, Arc::default(), None).unwrap();
+        let error = fs.volume.resolve(&cx, "/mixed").unwrap_err();
+        match error {
+            FfsError::Io(error) => assert_eq!(error.raw_os_error(), Some(expected_errno)),
+            FfsError::NotFound(_) => assert_eq!(expected_errno, libc::ENOENT),
+            other => panic!("wrong bounded-resolution error: {other:?}"),
+        }
+        assert_eq!(
+            fs.volume.resolve_no_follow(&cx, "/mixed").unwrap().number,
+            29
+        );
+    }
+    for (target, relative) in [
+        ("..\\hello.txt", true),
+        ("\\??\\C:\\Windows", false),
+        ("C:\\Windows", true),
+        ("\\\\server\\share", true),
+        ("hello.txt:stream", true),
+    ] {
+        let mut bytes = image();
+        put(
+            &mut bytes,
+            29,
+            &record(
+                29,
+                false,
+                1,
+                &[
+                    standard_with_flags(0x400),
+                    resident(0x30, 2, "", &filename(5, "mixed", 0)),
+                    reparse(target, relative),
+                ],
+            ),
+        );
+        let fs = open(bytes, Arc::default(), None).unwrap();
+        assert!(
+            matches!(
+                fs.volume.resolve(&cx, "/mixed"),
+                Err(FfsError::UnsupportedFeature(_))
+            ),
+            "target {target}"
+        );
+        if target == "..\\hello.txt" {
+            // Mounted readlink deliberately returns the native relative target
+            // for the host kernel's ordinary symlink handling. The image-path
+            // resolver above is confined; the FUSE mount is not a sandbox.
+            let mut scope = RequestScope::empty();
+            let link = fs
+                .lookup(&cx, &mut scope, ROOT, OsStr::new("mixed"))
+                .unwrap();
+            assert_eq!(
+                fs.readlink(&cx, &mut scope, link.ino).unwrap(),
+                b"../hello.txt"
+            );
+        }
+    }
+}
+
+#[test]
+fn relative_link_parent_components_stay_inside_the_native_volume() {
+    let cx = Cx::for_testing();
+    let mut bytes = image();
+    put(
+        &mut bytes,
+        25,
+        &record(
+            25,
+            false,
+            1,
+            &[
+                standard_with_flags(0x400),
+                resident(0x30, 2, "", &filename(27, "payload.bin", 1)),
+                reparse("..\\hello.txt", true),
+            ],
+        ),
+    );
+    let fs = open(bytes, Arc::default(), None).unwrap();
+    let target = fs.volume.resolve(&cx, "/Subdir/payload.bin").unwrap();
+    assert_eq!(target.number, 24);
+    let stream = fs.volume.data_stream(&cx, &target, &[]).unwrap();
+    assert_eq!(fs.volume.read(&cx, &stream, 0, 100).unwrap(), b"hello");
+}
+
+#[test]
+fn nonresident_reparse_reads_are_bounded_and_cancellation_is_not_cached() {
+    let cx = Cx::for_testing();
+    let value = reparse_value("hello.txt", true);
+    let mut reparse_attr = mapped(&[0x21, 1, 0x20, 3, 0], 1, value.len() as u64, false);
+    reparse_attr[..4].copy_from_slice(&super::super::REPARSE_POINT.to_le_bytes());
+    reparse_attr[14..16].copy_from_slice(&3_u16.to_le_bytes());
+    let mut bytes = image();
+    bytes[BASE + 800 * 512..BASE + 800 * 512 + value.len()].copy_from_slice(&value);
+    put(
+        &mut bytes,
+        29,
+        &record(
+            29,
+            false,
+            1,
+            &[
+                standard_with_flags(0x400),
+                resident(0x30, 2, "", &filename(5, "mixed", 0)),
+                reparse_attr,
+            ],
+        ),
+    );
+    let fs = open(bytes.clone(), Arc::default(), None).unwrap();
+    let target = fs.volume.resolve(&cx, "/mixed").unwrap();
+    assert_eq!(target.number, 24);
+    let mut scope = RequestScope::empty();
+    let link = fs
+        .lookup(&cx, &mut scope, ROOT, OsStr::new("mixed"))
+        .unwrap();
+    assert_eq!(link.blocks, 1);
+    assert_eq!(
+        fs.readlink(&cx, &mut scope, link.ino).unwrap(),
+        b"hello.txt"
+    );
+    // Root admission reads each native reparse value as part of validating the
+    // complete directory. Cancellation cannot publish a partially read tree.
+    assert!(matches!(
+        open(bytes, Arc::default(), Some((BASE + 800 * 512) as u64)),
+        Err(FfsError::Cancelled)
+    ));
+}
+
+#[test]
+fn opaque_reparse_directories_stay_listed_but_cannot_expose_data_or_children() {
+    let cx = Cx::for_testing();
+    let mut bytes = image();
+    put(
+        &mut bytes,
+        27,
+        &record(
+            27,
+            true,
+            1,
+            &[
+                standard_with_flags(0x400),
+                resident(0x30, 2, "", &filename(5, "Subdir", 1)),
+                resident(0xC0, 3, "", &[0x17, 0, 0, 0x80, 0, 0, 0, 0]),
+            ],
+        ),
+    );
+    let fs = open(bytes, Arc::default(), None).unwrap();
+    let mut scope = RequestScope::empty();
+    assert_eq!(fs.readdir(&cx, &mut scope, ROOT, 0).unwrap().len(), 8);
+    assert_eq!(
+        fs.lookup(&cx, &mut scope, ROOT, OsStr::new("hello.txt"))
+            .unwrap()
+            .size,
+        5
+    );
+    assert!(matches!(
+        fs.lookup(&cx, &mut scope, ROOT, OsStr::new("Subdir")),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
+    assert!(matches!(
+        fs.volume.resolve(&cx, "/Subdir/payload.bin"),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
+    let native = fs.volume.resolve_no_follow(&cx, "/Subdir").unwrap();
+    assert_eq!(
+        fs.volume.reparse_point(&cx, &native).unwrap().unwrap().tag,
+        0x8000_0017
+    );
 }
 
 #[test]

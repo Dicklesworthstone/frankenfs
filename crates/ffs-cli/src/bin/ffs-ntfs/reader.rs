@@ -8,9 +8,10 @@ mod namespace;
 use asupersync::Cx;
 use ffs_block::ByteDevice;
 use ffs_error::{FfsError, Result};
+use ffs_ondisk::ntfs::reparse::{MAX_REPARSE_BYTES, NtfsReparseData, NtfsReparsePoint};
 use ffs_ondisk::ntfs::{
     ATTRIBUTE_LIST, COMPRESSED, DATA, NtfsAttribute, NtfsFileRecord, NtfsGeometry, NtfsReference,
-    NtfsRun, NtfsValue, SPARSE, VOLUME_INFORMATION, decode_mapping_pairs,
+    NtfsRun, NtfsValue, REPARSE_POINT, SPARSE, VOLUME_INFORMATION, decode_mapping_pairs,
 };
 use ffs_types::{ByteOffset, ParseError};
 use std::fs::File;
@@ -337,20 +338,144 @@ impl NtfsVolume {
             return Err(FfsError::IsDirectory);
         }
         let catalog = self.attributes(cx, record)?;
-        // Numeric extraction must enforce the same provider boundary as path
-        // reads. Reparse metadata can live in an extension while ordinary DATA
-        // contains provider backing bytes or sparse placeholders.
-        if catalog.all()?.iter().any(|attr| attr.kind == 0xC0) {
-            return Err(unsupported("NTFS reparse DATA provider is not implemented"));
+        let attributes = catalog.all()?;
+        // A numeric record read must enforce the same provider boundary as a
+        // pathname read. WOF/cloud placeholders may have apparently ordinary
+        // DATA containing empty or encoded bytes; those are not file contents.
+        if attributes.iter().any(|attr| attr.kind == REPARSE_POINT) {
+            return Err(unsupported(
+                "NTFS reparse DATA requires target resolution or an implemented provider",
+            ));
+        }
+        if let Some(flags) = standard_flags(&attributes)? {
+            if flags & 0x400 != 0 {
+                return Err(corrupt(
+                    0,
+                    "NTFS reparse attribute flag has no reparse value",
+                ));
+            }
+            if flags & 0x4000 != 0 {
+                return Err(unsupported(
+                    "NTFS EFS data requires an implemented key provider",
+                ));
+            }
         }
         let stream = catalog.select(&self.geometry, DATA, name)?;
         checkpoint(cx)?;
         Ok(stream)
     }
 
+    /// Retrieve the actual native reparse metadata without following the target
+    /// or interpreting an unknown provider's DATA. Works for resident and
+    /// nonresident attributes, including validated attribute-list continuations.
+    pub fn reparse_point(
+        &self,
+        cx: &Cx,
+        record: &NtfsFileRecord,
+    ) -> Result<Option<NtfsReparsePoint>> {
+        let catalog = self.attributes(cx, record)?;
+        self.reparse_from_catalog(cx, &catalog)
+    }
+
+    fn reparse_from_catalog(
+        &self,
+        cx: &Cx,
+        catalog: &attributes::AttributeSet<'_>,
+    ) -> Result<Option<NtfsReparsePoint>> {
+        checkpoint(cx)?;
+        let attributes = catalog.all()?;
+        let mut present = false;
+        for attribute in &attributes {
+            if attribute.kind == REPARSE_POINT {
+                present = true;
+                if attribute.flags != 0 || !attribute.name.is_empty() {
+                    return Err(corrupt(0, "named or transformed NTFS reparse attribute"));
+                }
+            }
+        }
+        if let Some(flags) = standard_flags(&attributes)?
+            && (flags & 0x400 != 0) != present
+        {
+            return Err(corrupt(0, "NTFS reparse value and file attribute disagree"));
+        }
+        if !present {
+            return Ok(None);
+        }
+        let stream = catalog.select(&self.geometry, REPARSE_POINT, &[])?;
+        if !(8..=MAX_REPARSE_BYTES as u64).contains(&stream.size)
+            || stream.initialized != stream.size
+        {
+            return Err(corrupt(0, "invalid NTFS reparse initialized value length"));
+        }
+        let value = self.read(cx, &stream, 0, stream.size as usize)?;
+        let point = NtfsReparsePoint::parse(&value).map_err(|error| parse(&error))?;
+        checkpoint(cx)?;
+        Ok(Some(point))
+    }
+
+    pub fn readlink(&self, cx: &Cx, record: &NtfsFileRecord) -> Result<Vec<u8>> {
+        let point = self
+            .reparse_point(cx, record)?
+            .ok_or_else(|| FfsError::Io(std::io::Error::from_raw_os_error(libc::EINVAL)))?;
+        let target = relative_link_target(&point)?;
+        checkpoint(cx)?;
+        Ok(target.into_bytes())
+    }
+
     pub fn read(&self, cx: &Cx, stream: &Stream, offset: u64, size: usize) -> Result<Vec<u8>> {
         stream.read(&self.source, &self.geometry, cx, offset, size)
     }
+}
+
+fn standard_flags(attributes: &[NtfsAttribute<'_>]) -> Result<Option<u32>> {
+    let mut flags = None;
+    for attribute in attributes.iter().filter(|attribute| attribute.kind == 0x10) {
+        let NtfsValue::Resident(value) = attribute.value else {
+            return Err(corrupt(0, "nonresident NTFS STANDARD_INFORMATION"));
+        };
+        if flags.is_some()
+            || attribute.flags != 0
+            || !attribute.name.is_empty()
+            || !matches!(value.len(), 48 | 72)
+        {
+            return Err(corrupt(0, "invalid NTFS STANDARD_INFORMATION identity"));
+        }
+        flags =
+            Some(u32::from_le_bytes(value[32..36].try_into().map_err(
+                |_| corrupt(0, "short NTFS file attribute flags"),
+            )?));
+    }
+    Ok(flags)
+}
+
+/// Only native relative symbolic links have an unambiguous host representation.
+/// Absolute NT/drive/UNC paths and stream-qualified targets need explicit volume
+/// mapping/provider policy. The print name is never used for resolution.
+fn relative_link_target(point: &NtfsReparsePoint) -> Result<String> {
+    let NtfsReparseData::SymbolicLink {
+        substitute,
+        relative: true,
+        ..
+    } = &point.data
+    else {
+        return Err(unsupported(format!(
+            "NTFS reparse tag {:#010x} has no admitted relative symbolic-link target",
+            point.tag
+        )));
+    };
+    let native = String::from_utf16(substitute).map_err(|_| {
+        unsupported("NTFS symlink target cannot be represented losslessly as UTF-8")
+    })?;
+    if native.is_empty() || native.starts_with(['/', '\\']) || native.contains([':', '\0']) {
+        return Err(unsupported(
+            "NTFS relative symlink target is rooted or stream-qualified",
+        ));
+    }
+    let target = native.replace('\\', "/");
+    if target.len() > 4095 || target.split('/').any(|component| component.len() > 255) {
+        return Err(FfsError::NameTooLong);
+    }
+    Ok(target)
 }
 
 fn validate_identity(record: &NtfsFileRecord, number: u64, sequence: Option<u16>) -> Result<()> {

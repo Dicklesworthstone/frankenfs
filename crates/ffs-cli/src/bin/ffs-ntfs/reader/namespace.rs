@@ -1,11 +1,12 @@
 //! Bounded directory-tree walks and native $UpCase-based path lookup.
 
 use super::{
-    Cx, DATA, FfsError, NtfsAttribute, NtfsFileRecord, NtfsReference, NtfsValue, NtfsVolume,
-    Result, Storage, Stream, checkpoint, corrupt, parse, unsupported,
+    Cx, FfsError, NtfsAttribute, NtfsFileRecord, NtfsReference, NtfsValue, NtfsVolume,
+    REPARSE_POINT, Result, Storage, Stream, checkpoint, corrupt, parse, relative_link_target,
+    unsupported,
 };
 use ffs_ondisk::ntfs::index::{NtfsFileName, NtfsIndexEntry, NtfsIndexRoot, parse_index_block};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, VecDeque};
 
 const I30: &[u16] = &[36, 73, 51, 48];
 const MAX_ENTRIES: usize = 65_536;
@@ -16,6 +17,7 @@ pub struct DirectoryEntry {
     pub reference: NtfsReference,
     pub filename: NtfsFileName,
     pub directory: bool,
+    pub reparse_tag: Option<u32>,
 }
 
 impl NtfsVolume {
@@ -146,6 +148,9 @@ impl NtfsVolume {
                 reference,
                 filename,
                 directory: target.is_directory(),
+                reparse_tag: self
+                    .reparse_from_catalog(cx, &target_catalog)?
+                    .map(|point| point.tag),
             });
         }
         checkpoint(cx)?;
@@ -153,34 +158,74 @@ impl NtfsVolume {
     }
 
     pub fn resolve(&self, cx: &Cx, path: &str) -> Result<NtfsFileRecord> {
+        self.resolve_path(cx, path, true)
+    }
+
+    /// Resolve intermediate links but retain the final link's own native record
+    /// for readlink/metadata inspection. Trailing slash still requires a directory.
+    pub fn resolve_no_follow(&self, cx: &Cx, path: &str) -> Result<NtfsFileRecord> {
+        self.resolve_path(cx, path, false)
+    }
+
+    fn resolve_path(&self, cx: &Cx, path: &str, follow_final: bool) -> Result<NtfsFileRecord> {
         checkpoint(cx)?;
         if path.len() > 65_536 || path.contains(['\\', '\0']) {
             return Err(FfsError::NameTooLong);
         }
-        let components: Vec<_> = path
+        let mut components: VecDeque<_> = path
             .split('/')
-            .filter(|part| !part.is_empty() && *part != ".")
+            .filter(|part| !part.is_empty())
             .take(257)
+            .map(str::to_owned)
             .collect();
         if components.len() > 256 {
             return Err(FfsError::NameTooLong);
+        }
+        if components.iter().any(|component| component == "..") {
+            return Err(unsupported(
+                "parent traversal in image paths is not admitted",
+            ));
         }
         let mut record = self.record(cx, 5, None)?;
         if !record.is_directory() {
             return Err(corrupt(0, "NTFS root record is not a directory"));
         }
+        let root = NtfsReference {
+            record: 5,
+            sequence: record.sequence,
+        };
+        let root_catalog = self.attributes(cx, &record)?;
+        reject_reparse(&root_catalog.all()?)?;
+        drop(root_catalog);
         let table = if components.is_empty() {
             Vec::new()
         } else {
             self.upcase(cx)?
         };
-        let mut ancestors = BTreeSet::from([5_u64]);
-        for component in components {
+        let mut ancestors = vec![root];
+        let mut expanded_components = components.len();
+        let mut expanded_bytes = path.len();
+        let mut reparses = 0;
+        while let Some(component) = components.pop_front() {
             checkpoint(cx)?;
+            if !record.is_directory() {
+                return Err(FfsError::NotDirectory);
+            }
+            if component == "." {
+                continue;
+            }
             if component == ".." {
-                return Err(unsupported(
-                    "parent traversal in image paths is not admitted",
-                ));
+                if ancestors.len() <= 1 {
+                    return Err(unsupported(
+                        "NTFS relative symlink escapes the selected volume root",
+                    ));
+                }
+                ancestors.pop();
+                let parent = ancestors
+                    .last()
+                    .ok_or_else(|| corrupt(0, "missing path root"))?;
+                record = self.record(cx, parent.record, Some(parent.sequence))?;
+                continue;
             }
             let name: Vec<u16> = component.encode_utf16().collect();
             if name.len() > 255 {
@@ -215,16 +260,47 @@ impl NtfsVolume {
                     record.number
                 ))
             })?;
-            record = self.record(cx, reference.record, Some(reference.sequence))?;
-            let catalog = self.attributes(cx, &record)?;
-            reject_reparse(&catalog.all()?)?;
-            if record.is_directory() && !ancestors.insert(reference.record) {
-                return Err(corrupt(0, "NTFS directory links to an ancestor"));
+            let target = self.record(cx, reference.record, Some(reference.sequence))?;
+            if let Some(point) = self.reparse_point(cx, &target)? {
+                if !follow_final && components.is_empty() && !path.ends_with('/') {
+                    checkpoint(cx)?;
+                    return Ok(target);
+                }
+                reparses += 1;
+                if reparses > 63 {
+                    return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::ELOOP)));
+                }
+                let target_path = relative_link_target(&point)?;
+                let mut target_components: VecDeque<_> = target_path
+                    .split('/')
+                    .filter(|part| !part.is_empty())
+                    .map(str::to_owned)
+                    .collect();
+                if target_path.ends_with('/') {
+                    target_components.push_back(".".to_owned());
+                }
+                expanded_components += target_components.len();
+                expanded_bytes += target_path.len();
+                if expanded_components > 256 || expanded_bytes > 65_536 {
+                    return Err(FfsError::NameTooLong);
+                }
+                target_components.append(&mut components);
+                components = target_components;
+                // Stay at the containing native directory. No host pathname is
+                // ever opened and no absolute target is rebased onto this image.
+                continue;
             }
+            if target.is_directory() {
+                if ancestors
+                    .iter()
+                    .any(|ancestor| ancestor.record == reference.record)
+                {
+                    return Err(corrupt(0, "NTFS directory links to an ancestor"));
+                }
+                ancestors.push(reference);
+            }
+            record = target;
         }
-        let catalog = self.attributes(cx, &record)?;
-        reject_reparse(&catalog.all()?)?;
-        drop(catalog);
         if path.ends_with('/') && !record.is_directory() {
             return Err(FfsError::NotDirectory);
         }
@@ -234,7 +310,7 @@ impl NtfsVolume {
 
     fn upcase(&self, cx: &Cx) -> Result<Vec<u16>> {
         let record = self.record(cx, 10, None)?;
-        let stream = self.select_stream(cx, &record, DATA, &[])?;
+        let stream = self.data_stream(cx, &record, &[])?;
         if stream.size != 131_072 || stream.initialized != stream.size {
             return Err(corrupt(
                 0,
@@ -266,8 +342,10 @@ impl NtfsVolume {
 }
 
 fn reject_reparse(attributes: &[NtfsAttribute<'_>]) -> Result<()> {
-    if attributes.iter().any(|attr| attr.kind == 0xC0) {
-        return Err(unsupported("NTFS reparse traversal is not implemented"));
+    if attributes.iter().any(|attr| attr.kind == REPARSE_POINT) {
+        return Err(unsupported(
+            "NTFS reparse directory must be resolved through its provider",
+        ));
     }
     Ok(())
 }

@@ -7,6 +7,9 @@ read-only `FsOps`/FUSE mount, but is not yet an `OpenFs` backend or writable
 filesystem. It traverses native directory
 indexes and resolves paths using the image's own UpCase table. Ordinary native
 LZNT1-compressed nonresident DATA uses the same numeric and path read commands.
+Relative native symbolic links can be resolved inside the image or presented
+through the mounted `readlink` operation. Reparse metadata remains inspectable
+for providers whose file contents are not supported.
 
 ## Commands
 
@@ -20,6 +23,7 @@ ffs-ntfs ls volume.img / --offline-image
 ffs-ntfs ls volume.img /nested --offline-image
 ffs-ntfs read volume.img /nested/file.txt --offline-image > extracted.bin
 ffs-ntfs read volume.img /nested/file.txt --offline-image --stream note
+ffs-ntfs readlink volume.img /nested/link --offline-image
 ffs-ntfs record volume.img 24 --offline-image
 ffs-ntfs cat volume.img 24 --offline-image > extracted.bin
 ffs-ntfs cat volume.img 24 --offline-image --stream note > alternate.bin
@@ -39,6 +43,12 @@ the base record, not an arbitrary extension record. UTF-16 names that cannot be
 represented as UTF-8 retain their exact code units in JSON. `--stream` selects an
 exact UTF-16 encoding of the supplied name; named-stream selection remains exact
 rather than case-insensitive. An optional sequence number detects stale references.
+`record` also reports the base file's assembled `reparse_point`, including the
+native tag, optional GUID bytes, exact UTF-16 substitute/display names for links,
+or an unknown provider's opaque payload. Inspecting this metadata does not grant
+DATA access. `readlink` follows intermediate supported links and retains the
+final link's own record; it emits the relative substitute target with native
+backslash separators converted to `/`.
 
 ## Implemented data path
 
@@ -144,15 +154,60 @@ DOS aliases retain their native record identity. Conflicting folded matches are
 refused. JSON listings retain separate native namespace entries, so a short alias
 and long name may identify the same file. Unrepresentable UTF-16 names retain
 raw code units; numeric inspection remains available. Reparse traversal is
-refused even when the reparse attribute is stored in an extension record.
+dispatched using the assembled base-file catalog, including reparse attributes
+stored in extension records. Supported relative links use the target policy
+below; unknown providers do not fall through to ordinary DATA reads.
 
 Each directory is limited to 65,536 keys, 16,384 allocation blocks and depth 32,
 with at most 256 path components. The entire directory and referenced FILE_NAME
 identities must be readable; a corrupt or unsupported target can cause the
 listing/lookup to fail rather than publish a partially validated result. Index
 block geometry must match the boot profile. Sub-cluster index blocks use 512-byte
-VBN units even on a larger-sector volume. Parent traversal (`..`) is not admitted
-by CLI image paths; the mount resolves parents from native FILE_NAME references.
+VBN units even on a larger-sector volume. Parent traversal (`..`) supplied
+directly in a CLI image path remains refused. A relative link may contain `..`:
+the resolver follows the native directory stack and rejects attempts to move
+above the selected volume root. The mount resolves ordinary directory parents
+from native FILE_NAME references.
+
+## Relative symbolic links and reparse providers
+
+The native parser recognizes symbolic-link tag `0xA000000C` and junction/mount
+point tag `0xA0000003`. It validates the complete reparse value, the native
+16 KiB maximum, exact payload length, symbolic-link flags, and aligned UTF-16
+substitute/display ranges. The ranges are relative to the native PathBuffer;
+their order is unrestricted and their optional NUL terminators are not part of
+the names. Unpaired UTF-16 surrogates are retained for JSON inspection. Unknown
+tags retain their opaque bytes and, for the GUID form, their native GUID.
+Reparse values can be resident or nonresident, but must be fully initialized,
+unnamed and untransformed. Native STANDARD_INFORMATION reparse flags must agree
+with the presence of the attribute when that metadata is available.
+
+Path reads resolve only native symbolic links marked relative. The substitute
+name is authoritative; the display name cannot redirect a read. Absolute NT,
+drive-qualified and UNC paths, junction targets, stream-qualified targets, and
+unknown providers remain unsupported. Host presentation requires lossless UTF-8,
+at most 4,095 target bytes and at most 255 bytes per component. The in-image
+resolver never opens a host path. It limits a resolution to 63 link expansions,
+256 cumulative components and 65,536 cumulative path bytes. Cycles fail with
+`ELOOP`; dangling targets remain valid link metadata but fail a following read.
+A trailing slash still requires the resolved object to be a directory.
+
+Numeric `cat`, path reads and mounted file reads enforce the same provider
+boundary. A file carrying reparse metadata cannot expose its own DATA as if it
+were resolved file contents, including named streams or metadata found in an
+extension. EFS-marked STANDARD_INFORMATION is also refused before data I/O,
+even when the DATA attribute itself appears unencrypted. Ordinary native LZNT1
+compression remains a separate supported storage form; WOF/system compression
+and cloud placeholders need their own providers.
+
+The mounted view returns supported relative link targets to the host kernel
+using ordinary symlink semantics, including `..`. A host process can therefore
+follow a link beyond the mount's root; the mount is not a sandbox. This differs
+from CLI image-path resolution, which confines traversal to the selected volume.
+Directory symlinks are presented as symlinks, not as directories whose own
+indexes must be traversed. A valid opaque reparse object remains visible in its
+parent listing, while access that requires its provider returns an explicit
+unsupported error. Malformed metadata still fails directory validation.
 
 ## Read-only native mount
 
@@ -162,7 +217,8 @@ DOS aliases and hard links share one inode. Stale or noncanonical references,
 directory cycles and inconsistent native parents are errors, not alternate roots.
 
 The adapter provides lookup, getattr, paginated readdir, regular-file reads,
-read-only open admission, statfs and non-writing synchronization. Unnamed DATA
+relative-link readlink, read-only open admission, statfs and non-writing
+synchronization. Unnamed DATA
 uses the same resident, fragmented, sparse, compressed and extension-aware reader
 as CLI extraction. Named streams remain available through CLI `--stream`, not an
 invented mounted `file:stream` namespace. SEEK_DATA/SEEK_HOLE use the conservative
@@ -177,9 +233,10 @@ Capacity and free-object counts come from the native volume and MFT bitmaps,
 excluding padding bits and refusing uninitialized, sparse or compressed bitmaps.
 
 Ownership and modes are deliberately synthetic: configured uid/gid, 0555
-directories and 0444 regular files. This is NOT native SID/DACL enforcement.
-`allow_other` is disabled. Reparse and EFS objects are refused rather than exposed
-as ordinary plaintext files. Unrepresentable UTF-16 or names beyond the host's
+directories, 0444 regular files and 0777 symbolic links. This is NOT native
+SID/DACL enforcement. `allow_other` is disabled. Unresolved reparse providers
+and EFS objects are refused rather than exposed as ordinary plaintext files.
+Unrepresentable UTF-16 or names beyond the host's
 255-byte limit cause refusal, not lossy aliases. Use the numeric/JSON CLI for
 forensic metadata that the mounted namespace cannot represent.
 
@@ -223,8 +280,9 @@ flushes occur. A shared advisory lock does not exclude unrelated writers.
 A zero volume-flags field and matching record-zero mirror are **not** proof of
 a clean $LogFile, absence of hibernation, complete MFTMirr consistency, or global
 allocation/index integrity. The caller must supply a quiescent image. This is
-not a recovery or filesystem-check tool. Reparse handling, compressed writes,
-native security enforcement, generic OpenFs routing and NTFS mutation remain
+not a recovery or filesystem-check tool. Absolute Windows target mapping,
+external reparse providers, compressed writes, native security enforcement,
+generic OpenFs routing and NTFS mutation remain
 separate work. The restricted mount above is not full NTFS qualification.
 
 ## Validation
@@ -280,6 +338,17 @@ unit transitions, fragmented and split-attribute units, initialized-length refus
 large sparse files, raw final partial units, and full 64 KiB output units.
 Existing boot, stream, namespace, and read-only failure tests remain intact.
 
+Reparse regressions add native byte-range parsing, display/substitute distinction,
+unpaired-surrogate preservation, GUID payloads, truncated/unaligned buffers,
+relative and directory links, real mapped target bytes, bounded loops and
+dangling paths, in-image parent traversal/root refusal, the distinct mounted
+`..` policy, nonresident reparse cancellation, and opaque-directory listing.
+Numeric unnamed/named DATA admission tests require provider/EFS refusal before
+any data I/O. Existing unknown-provider tests retain their refusal assertions
+and now use a valid opaque tag instead of the reserved zero tag. These are
+constructed Rust fixtures; they do not establish Windows-created reparse
+interchange or actual mounted reparse execution.
+
 The mount runner requires real Linux FUSE and creates 320 native files with
 mkntfs/ntfscp, comparing every seeded file independently with ntfscat. It checks
 repeated mounted directory enumeration, attributes, whole-file hashes, unaligned
@@ -319,3 +388,12 @@ The Rust regression, formatting, workspace checks, Clippy and UBS could not run:
 the executor disconnected after storage exhaustion; the earlier offline Cargo
 attempt also lacked a required dependency. These added tests are not execution
 or native Windows interoperability evidence.
+
+Subsequent relative-symlink implementation validation on 2026-10-11: the complete
+`ffs-ondisk` library suite passed 790 tests, including the reparse parser. The
+parser library also passed Clippy with warnings denied, and workspace formatting
+passed before the executor disconnected. CLI compilation was killed while
+building `asupersync` under the shared memory limit; the engine regressions and
+native mounted reparse workload have not run. UBS could not complete because
+its helper downloads failed integrity checks. This evidence does not establish
+native Windows reparse interoperability.

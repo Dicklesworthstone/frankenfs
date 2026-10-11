@@ -6,6 +6,7 @@ mod reader;
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
 use clap::{Args, Parser, Subcommand};
+use ffs_ondisk::ntfs::reparse::{NtfsReparseData, NtfsReparsePoint};
 use ffs_ondisk::ntfs::{DATA, NtfsFileRecord, NtfsValue};
 use reader::NtfsVolume;
 use std::io::{self, Write};
@@ -83,6 +84,12 @@ enum Command {
         #[arg(long)]
         bytes: Option<u64>,
     },
+    /// Show a relative symbolic link's target without following the final link.
+    Readlink {
+        #[command(flatten)]
+        image: ImageArgs,
+        path: String,
+    },
     /// Show the attributes and native UTF-16 stream names of an in-use MFT record.
     Record {
         #[command(flatten)]
@@ -121,6 +128,33 @@ fn json(value: &serde_json::Value) -> Result<()> {
     serde_json::to_writer_pretty(&mut out, value)?;
     writeln!(out)?;
     Ok(())
+}
+
+fn reparse_json(point: &NtfsReparsePoint) -> serde_json::Value {
+    let data = match &point.data {
+        NtfsReparseData::SymbolicLink {
+            substitute,
+            print,
+            relative,
+        } => serde_json::json!({
+            "kind": "symbolic_link", "relative": relative,
+            "substitute": String::from_utf16(substitute).ok(), "substitute_utf16": substitute,
+            "print": String::from_utf16(print).ok(), "print_utf16": print
+        }),
+        NtfsReparseData::MountPoint { substitute, print } => serde_json::json!({
+            "kind": "mount_point",
+            "substitute": String::from_utf16(substitute).ok(), "substitute_utf16": substitute,
+            "print": String::from_utf16(print).ok(), "print_utf16": print
+        }),
+        NtfsReparseData::Opaque(bytes) => serde_json::json!({
+            "kind": "opaque_provider", "payload_bytes": bytes
+        }),
+    };
+    serde_json::json!({
+        "tag": format!("{:#010x}", point.tag),
+        "name_surrogate": point.is_name_surrogate(),
+        "guid_bytes": point.guid, "data": data
+    })
 }
 
 fn stream_to_stdout(
@@ -184,7 +218,8 @@ fn main() -> Result<()> {
                         "record": entry.reference.record, "sequence": entry.reference.sequence,
                         "name": String::from_utf16(&entry.filename.name).ok(),
                         "name_utf16": entry.filename.name, "namespace": entry.filename.namespace,
-                        "directory": entry.directory
+                        "directory": entry.directory,
+                        "reparse_tag": entry.reparse_tag.map(|tag| format!("{tag:#010x}"))
                     })
                 })
                 .collect();
@@ -200,6 +235,14 @@ fn main() -> Result<()> {
             let volume = image.open(&cx)?;
             let record = volume.resolve(&cx, &path)?;
             stream_to_stdout(&cx, &volume, &record, &stream, start, bytes)?;
+        }
+        Command::Readlink { image, path } => {
+            let volume = image.open(&cx)?;
+            let record = volume.resolve_no_follow(&cx, &path)?;
+            let target = volume.readlink(&cx, &record)?;
+            let mut out = io::stdout().lock();
+            out.write_all(&target)?;
+            writeln!(out)?;
         }
         Command::Record { file } => {
             let volume = file.image.open(&cx)?;
@@ -244,7 +287,9 @@ fn main() -> Result<()> {
                 &serde_json::json!({"record": record.number, "sequence": record.sequence,
                 "directory": record.is_directory(), "hard_links": record.hard_links,
                 "base_record": record.base.record, "base_sequence": record.base.sequence,
-                "attributes": attributes, "scope": "record metadata; listing does not certify stream readability"}),
+                "attributes": attributes,
+                "reparse_point": volume.reparse_point(&cx, &record)?.as_ref().map(reparse_json),
+                "scope": "record metadata; listing does not certify stream readability"}),
             )?;
         }
         Command::Cat {
@@ -297,6 +342,39 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn cli_readlink_requires_offline_image_and_keeps_the_final_path_literal() {
+        assert!(Cli::try_parse_from(["ffs-ntfs", "readlink", "disk.img", "/link"]).is_err());
+        let cli = Cli::try_parse_from([
+            "ffs-ntfs",
+            "readlink",
+            "disk.img",
+            "/Subdir/link",
+            "--offline-image",
+        ])
+        .unwrap();
+        let Command::Readlink { path, .. } = cli.command else {
+            panic!("readlink");
+        };
+        assert_eq!(path, "/Subdir/link");
+        let point = NtfsReparsePoint {
+            tag: 0xA000_000C,
+            guid: None,
+            data: NtfsReparseData::SymbolicLink {
+                substitute: vec![0xD800],
+                print: vec![u16::from(b'x')],
+                relative: true,
+            },
+        };
+        let value = reparse_json(&point);
+        assert_eq!(
+            value["data"]["substitute_utf16"],
+            serde_json::json!([0xD800])
+        );
+        assert!(value["data"]["substitute"].is_null());
+        assert_eq!(value["data"]["print"], "x");
+    }
+
     #[test]
     fn cli_mount_requires_offline_acknowledgement_and_refuses_write_options() {
         assert!(Cli::try_parse_from(["ffs-ntfs", "mount", "disk.img", "/mnt/ntfs"]).is_err());

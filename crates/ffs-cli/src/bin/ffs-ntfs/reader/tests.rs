@@ -5,6 +5,36 @@ type Reads = Arc<Mutex<Vec<(u64, usize)>>>;
 const BASE: usize = 1024;
 const LENGTH: usize = 256 * 512;
 
+#[test]
+fn direct_record_data_admission_refuses_reparse_providers_and_efs_before_data_io() {
+    let cx = Cx::for_testing();
+    for flags in [0x400_u32, 0x4000] {
+        let mut image = Image::new();
+        let mut standard = [0; 72];
+        standard[32..36].copy_from_slice(&flags.to_le_bytes());
+        let mut attributes = vec![
+            resident(0x10, 2, "", &standard),
+            mapped(&[0x21, 1, 180, 0, 0], 1, 512, 512, 0),
+            resident(DATA, 4, "alternate", b"not provider plaintext"),
+        ];
+        if flags == 0x400 {
+            attributes.push(resident(0xC0, 3, "", &[0x17, 0, 0, 0x80, 0, 0, 0, 0]));
+        }
+        image.put_record(24, &file_record(24, &attributes));
+        let reads: Reads = Arc::default();
+        let volume = image.open(Arc::clone(&reads), None).unwrap();
+        let record = volume.record(&cx, 24, Some(7)).unwrap();
+        reads.lock().unwrap().clear();
+        for name in [Vec::new(), "alternate".encode_utf16().collect()] {
+            assert!(matches!(
+                volume.data_stream(&cx, &record, &name),
+                Err(FfsError::UnsupportedFeature(_))
+            ));
+        }
+        assert!(reads.lock().unwrap().is_empty());
+    }
+}
+
 fn resident(kind: u32, id: u16, name: &str, value: &[u8]) -> Vec<u8> {
     let name: Vec<u16> = name.encode_utf16().collect();
     let start = (24 + name.len() * 2).next_multiple_of(8);
