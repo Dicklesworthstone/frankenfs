@@ -115,7 +115,10 @@ fn main() -> Result<()> {
             serde_json::to_writer_pretty(io::stdout().lock(), &report)?;
             println!();
             if !report.clean {
-                bail!("FAT allocation check {}; no changes were made", report.status);
+                bail!(
+                    "FAT allocation check {}; no changes were made",
+                    report.status
+                );
             }
         }
         Command::Ls { image, path } => {
@@ -201,13 +204,7 @@ mod tests {
     #[test]
     fn check_accepts_a_bounded_volume_and_refuses_repair_options() {
         let cli = Cli::try_parse_from([
-            "ffs-fat",
-            "check",
-            "disk.img",
-            "--offset",
-            "1024",
-            "--length",
-            "4096",
+            "ffs-fat", "check", "disk.img", "--offset", "1024", "--length", "4096",
         ])
         .unwrap();
         let Command::Check { image } = cli.command else {

@@ -476,7 +476,8 @@ fn fat_wall_time(
     let Some(timestamp) = timestamp.map_err(|error| FfsError::Corruption {
         block: offset / 512,
         detail: format!("invalid FAT timestamp: {error}"),
-    })? else {
+    })?
+    else {
         return Ok(UNIX_EPOCH);
     };
     UNIX_EPOCH
@@ -490,13 +491,10 @@ mod tests {
 
     #[test]
     fn native_wall_time_preserves_precision_absence_and_error_location() {
-        let timestamp = fat_wall_time(
-            FatTimestamp::parse(0x585D, 0x645C, 157).map(Some),
-            4096,
-        )
-        .unwrap()
-        .duration_since(UNIX_EPOCH)
-        .unwrap();
+        let timestamp = fat_wall_time(FatTimestamp::parse(0x585D, 0x645C, 157).map(Some), 4096)
+            .unwrap()
+            .duration_since(UNIX_EPOCH)
+            .unwrap();
         assert_eq!(
             (timestamp.as_secs(), timestamp.subsec_nanos()),
             (1_709_210_097, 570_000_000)

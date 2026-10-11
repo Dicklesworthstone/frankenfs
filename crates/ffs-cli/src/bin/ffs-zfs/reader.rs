@@ -39,8 +39,10 @@ fn integer(list: &NvList, name: &str) -> Result<u64> {
 }
 
 fn supported_read_feature(name: &str, value: &Value) -> bool {
-    matches!(name, "org.illumos:lz4_compress" | "com.delphix:embedded_data")
-        && matches!(value, Value::Boolean(true))
+    matches!(
+        name,
+        "org.illumos:lz4_compress" | "com.delphix:embedded_data"
+    ) && matches!(value, Value::Boolean(true))
 }
 
 struct ReadOnlyImage {

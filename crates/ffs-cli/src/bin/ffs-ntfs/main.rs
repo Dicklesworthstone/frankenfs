@@ -246,8 +246,8 @@ fn main() -> Result<()> {
             start,
             bytes,
         } => {
-            let stream = StreamName::select(stream.as_deref(), stream_utf16)
-                .map_err(anyhow::Error::msg)?;
+            let stream =
+                StreamName::select(stream.as_deref(), stream_utf16).map_err(anyhow::Error::msg)?;
             let volume = image.open(&cx)?;
             let record = volume.resolve(&cx, &path)?;
             stream_to_stdout(&cx, &volume, &record, stream.as_units(), start, bytes)?;
@@ -349,8 +349,8 @@ fn main() -> Result<()> {
             start,
             bytes,
         } => {
-            let stream = StreamName::select(stream.as_deref(), stream_utf16)
-                .map_err(anyhow::Error::msg)?;
+            let stream =
+                StreamName::select(stream.as_deref(), stream_utf16).map_err(anyhow::Error::msg)?;
             let volume = file.image.open(&cx)?;
             let record = volume.record(&cx, file.record, file.sequence)?;
             stream_to_stdout(&cx, &volume, &record, stream.as_units(), start, bytes)?;
@@ -446,8 +446,7 @@ mod tests {
         };
         assert_eq!((file.record, file.sequence), (24, Some(7)));
         assert!(
-            Cli::try_parse_from(["ffs-ntfs", "streams", "disk.img", "--offline-image"])
-                .is_err()
+            Cli::try_parse_from(["ffs-ntfs", "streams", "disk.img", "--offline-image"]).is_err()
         );
     }
 
@@ -526,7 +525,10 @@ mod tests {
             panic!("cat");
         };
         assert_eq!((file.record, file.sequence), (24, Some(7)));
-        assert_eq!((stream.as_deref(), start, bytes), (Some("note"), 512, Some(1024)));
+        assert_eq!(
+            (stream.as_deref(), start, bytes),
+            (Some("note"), 512, Some(1024))
+        );
         assert!(stream_utf16.is_none());
         assert!(
             Cli::try_parse_from(["ffs-ntfs", "inspect", "disk.img", "--offline-image", "--rw"])

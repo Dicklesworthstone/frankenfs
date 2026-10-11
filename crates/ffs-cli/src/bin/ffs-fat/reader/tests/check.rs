@@ -176,7 +176,10 @@ fn allocation_check_covers_short_excess_cyclic_free_and_invalid_file_chains() {
                     "{kind:?} scenario {scenario}: {report:?}"
                 );
             } else {
-                assert!(report.is_clean(), "{kind:?} scenario {scenario}: {report:?}");
+                assert!(
+                    report.is_clean(),
+                    "{kind:?} scenario {scenario}: {report:?}"
+                );
                 assert_eq!(report.preallocated_clusters, 1);
                 assert_eq!(report.lost_clusters, Some(0));
             }
@@ -721,7 +724,6 @@ fn checker_preserves_the_image_and_bytes_outside_the_selected_volume() {
     }
 }
 
-
 #[test]
 fn checker_terminates_when_a_shared_suffix_is_itself_cyclic() {
     let cx = Cx::for_testing();
@@ -736,13 +738,20 @@ fn checker_terminates_when_a_shared_suffix_is_itself_cyclic() {
         assert_eq!(report.referenced_clusters, report.allocated_clusters);
         assert_eq!(report.omitted_issues, 0);
         assert_eq!(
-            report.issues.iter().filter(|issue| issue.kind == "cyclic_chain").count(),
+            report
+                .issues
+                .iter()
+                .filter(|issue| issue.kind == "cyclic_chain")
+                .count(),
             2
         );
         for cluster in [9, 7] {
-            assert!(report.issues.iter().any(|issue| {
-                issue.kind == "cross_link" && issue.cluster == Some(cluster)
-            }));
+            assert!(
+                report
+                    .issues
+                    .iter()
+                    .any(|issue| { issue.kind == "cross_link" && issue.cluster == Some(cluster) })
+            );
         }
     }
 }

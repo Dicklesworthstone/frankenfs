@@ -143,12 +143,11 @@ fn data_catalog_groups_continuations_and_discovers_extension_only_streams() {
         assert_eq!(named.initialized, named.size);
         assert_eq!(named.allocated, 0);
         assert!(
-            reads
-                .lock()
-                .unwrap()
-                .iter()
-                .all(|(offset, _)| ![BASE as u64 + 180 * 512, BASE as u64 + 170 * 512]
-                    .contains(offset)),
+            reads.lock().unwrap().iter().all(|(offset, _)| ![
+                BASE as u64 + 180 * 512,
+                BASE as u64 + 170 * 512
+            ]
+            .contains(offset)),
             "catalog inspection must not read file payload clusters"
         );
         let extension = volume.record(&cx, 27, Some(7)).unwrap();
@@ -181,7 +180,13 @@ fn data_catalog_retains_unreadable_streams_and_lossless_native_names() {
     assert!(streams[0].name.is_empty());
     assert_eq!(streams[0].read_profile.as_ref().unwrap().size, 6);
     assert_eq!(streams[1].name, "secret".encode_utf16().collect::<Vec<_>>());
-    assert!(streams[1].read_profile.as_ref().unwrap_err().contains("EFS"));
+    assert!(
+        streams[1]
+            .read_profile
+            .as_ref()
+            .unwrap_err()
+            .contains("EFS")
+    );
     assert_eq!(streams[2].name, [0xD800]);
     assert!(String::from_utf16(&streams[2].name).is_err());
     assert!(streams[2].read_profile.is_ok());
@@ -235,7 +240,10 @@ fn reparse_metadata_in_an_extension_blocks_numeric_data_but_remains_inspectable(
     list.extend(list_entry(0xC0, 27, 8, 0, ""));
     image.put_record(
         25,
-        &file_record(25, &[resident(ATTRIBUTE_LIST, 10, "", &list), first_extent()]),
+        &file_record(
+            25,
+            &[resident(ATTRIBUTE_LIST, 10, "", &list), first_extent()],
+        ),
     );
     let mut reparse = [0; 8];
     reparse[..4].copy_from_slice(&0x8000_0017_u32.to_le_bytes());
@@ -269,9 +277,13 @@ fn reparse_metadata_in_an_extension_blocks_numeric_data_but_remains_inspectable(
             .as_ref()
             .is_err_and(|error| error.contains("reparse"))
     }));
-    assert!(reads.lock().unwrap().iter().all(|(offset, _)| {
-        *offset == Image::record_offset(27) as u64
-    }));
+    assert!(
+        reads
+            .lock()
+            .unwrap()
+            .iter()
+            .all(|(offset, _)| { *offset == Image::record_offset(27) as u64 })
+    );
 }
 
 #[test]

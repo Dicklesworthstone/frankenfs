@@ -31,9 +31,7 @@ fn extraction_mount_reads_native_graph_and_preserves_hardlinks_and_root_identity
             let alias = fs
                 .lookup(&cx, &mut scope, ROOT, OsStr::new("alias.bin"))
                 .unwrap();
-            let sub = fs
-                .lookup(&cx, &mut scope, ROOT, OsStr::new("sub"))
-                .unwrap();
+            let sub = fs.lookup(&cx, &mut scope, ROOT, OsStr::new("sub")).unwrap();
             let nested = fs
                 .lookup(&cx, &mut scope, sub.ino, OsStr::new("nested"))
                 .unwrap();
@@ -67,7 +65,10 @@ fn extraction_mount_reads_native_graph_and_preserves_hardlinks_and_root_identity
             let mut expected = vec![b'A'; 512];
             expected.extend_from_slice(&[0; 512]);
             expected.extend_from_slice(b"BBB");
-            assert_eq!(fs.read(&cx, &mut scope, file.ino, 0, 4096).unwrap(), expected);
+            assert_eq!(
+                fs.read(&cx, &mut scope, file.ino, 0, 4096).unwrap(),
+                expected
+            );
             assert_eq!(
                 fs.read(&cx, &mut scope, alias.ino, 510, 600).unwrap(),
                 expected[510..]
@@ -124,11 +125,9 @@ fn extraction_mount_reads_native_graph_and_preserves_hardlinks_and_root_identity
                     .unwrap()
                     .is_empty()
             );
-            assert!(
-                reads.lock().unwrap().iter().all(|(offset, count)| {
-                    *offset >= BASE as u64 && *offset + *count as u64 <= (BASE + LENGTH) as u64
-                })
-            );
+            assert!(reads.lock().unwrap().iter().all(|(offset, count)| {
+                *offset >= BASE as u64 && *offset + *count as u64 <= (BASE + LENGTH) as u64
+            }));
         }
     }
 }

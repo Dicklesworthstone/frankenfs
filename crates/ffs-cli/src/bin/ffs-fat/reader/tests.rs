@@ -476,9 +476,8 @@ fn directory_end_markers_do_not_hide_corrupt_allocation_tails() {
             FatKind::Fat16 => [0, 1, 0xFFF7, 0xFFF0, 5002, 4],
             FatKind::Fat32 => [0, 1, 0x0FFF_FFF7, 0x0FFF_FFF0, 70_002, 4],
         };
-        let directories = std::iter::once((Directory::Cluster(3), 3)).chain(
-            (kind == FatKind::Fat32).then_some((Directory::Root, 2)),
-        );
+        let directories = std::iter::once((Directory::Cluster(3), 3))
+            .chain((kind == FatKind::Fat32).then_some((Directory::Root, 2)));
         for (directory, first) in directories {
             for value in invalid {
                 let mut image = Image::new(kind);
@@ -486,7 +485,10 @@ fn directory_end_markers_do_not_hide_corrupt_allocation_tails() {
                 image.set_link(4, value);
                 let volume = image.volume();
                 assert!(
-                    matches!(volume.list(&cx, directory), Err(FfsError::Corruption { .. })),
+                    matches!(
+                        volume.list(&cx, directory),
+                        Err(FfsError::Corruption { .. })
+                    ),
                     "{kind:?} {directory:?}: trailing link {value:x}"
                 );
             }

@@ -139,9 +139,9 @@ fn gzip_rejects_other_framing_dictionaries_and_invalid_deflate() {
         assert!(decompress(&FIXED[2..15], codec, LOGICAL).is_err());
         assert!(decompress(&dictionary, codec, 1).is_err());
         for packed in [
-            &[0x78, 0x00][..], // Invalid header check bits.
+            &[0x78, 0x00][..],                   // Invalid header check bits.
             &[0x78, 0x01, 0x06, 0, 0, 0, 1][..], // Reserved DEFLATE block type.
-            &[0x78, 0x01, 0, 0, 0, 0, 0][..], // Stored LEN/NLEN disagree.
+            &[0x78, 0x01, 0, 0, 0, 0, 0][..],    // Stored LEN/NLEN disagree.
             &[0x78, 0x01, 4, 0, 0xfe, 0xff][..], // Invalid Huffman code lengths.
         ] {
             assert!(decompress(packed, codec, LOGICAL).is_err());

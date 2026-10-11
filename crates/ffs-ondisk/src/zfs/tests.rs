@@ -343,8 +343,8 @@ fn embedded_compression_is_bounded_and_preserves_exact_native_byte_counts() {
         );
         // Independently retained liblz4 vector: 1024 zeroes with byte 704 set.
         let packed = [
-            0, 0, 0, 19, 0x1f, 0, 1, 0, 0xff, 0xff, 0xae, 0x1f, 1, 0xc0, 2, 0xff, 0x28,
-            0x50, 0, 0, 0, 0, 0,
+            0, 0, 0, 19, 0x1f, 0, 1, 0, 0xff, 0xff, 0xae, 0x1f, 1, 0xc0, 2, 0xff, 0x28, 0x50, 0, 0,
+            0, 0, 0,
         ];
         let raw = embedded(order, &packed, 15, 1024);
         let bp = BlockPointer::parse(&raw, order).unwrap();
@@ -403,9 +403,8 @@ fn malformed_embedded_metadata_and_redacted_data_never_decode() {
         for packed in [113_u64, 128] {
             let mut bad = embedded(order, b"content", 2, 1024);
             let prop = order.u64(&bad, 48).unwrap();
-            bad[48..56].copy_from_slice(
-                &order.encode((prop & !(0x7f << 25)) | ((packed - 1) << 25)),
-            );
+            bad[48..56]
+                .copy_from_slice(&order.encode((prop & !(0x7f << 25)) | ((packed - 1) << 25)));
             assert!(
                 BlockPointer::parse(&bad, order)
                     .unwrap()
@@ -508,14 +507,26 @@ fn embedded_lz4_and_lzjb_decode_the_native_byte_sized_payload() {
     }
     let mut broken = lz4_words;
     broken[0] &= !(0xff_u64 << 48); // Zero match distance.
-    assert!(embedded_words(broken, Endian::Little).decode_embedded().is_err());
+    assert!(
+        embedded_words(broken, Endian::Little)
+            .decode_embedded()
+            .is_err()
+    );
     broken = lz4_words;
     broken[6] -= 1 << 25; // Truncate within the length-prefixed stream.
-    assert!(embedded_words(broken, Endian::Little).decode_embedded().is_err());
+    assert!(
+        embedded_words(broken, Endian::Little)
+            .decode_embedded()
+            .is_err()
+    );
     for logical_bytes in [1023_u64, 1025] {
         broken = lz4_words;
         broken[6] = (broken[6] & !0x01ff_ffff) | (logical_bytes - 1);
-        assert!(embedded_words(broken, Endian::Little).decode_embedded().is_err());
+        assert!(
+            embedded_words(broken, Endian::Little)
+                .decode_embedded()
+                .is_err()
+        );
     }
 }
 

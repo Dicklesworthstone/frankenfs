@@ -61,14 +61,17 @@ mod tests {
         assert_eq!(StreamName::parse("d800").unwrap().as_units(), [0xD800]);
         assert!(String::from_utf16(StreamName::parse("d800").unwrap().as_units()).is_err());
         assert!(StreamName::parse("").unwrap().as_units().is_empty());
-        assert!(StreamName::select(None, None).unwrap().as_units().is_empty());
+        assert!(
+            StreamName::select(None, None)
+                .unwrap()
+                .as_units()
+                .is_empty()
+        );
         assert_eq!(
             StreamName::select(Some("Foo😀"), None).unwrap().as_units(),
             [0x46, 0x6F, 0x6F, 0xD83D, 0xDE00]
         );
-        assert!(
-            StreamName::select(Some("Foo"), Some(StreamName::parse("0046").unwrap())).is_err()
-        );
+        assert!(StreamName::select(Some("Foo"), Some(StreamName::parse("0046").unwrap())).is_err());
     }
 
     #[test]

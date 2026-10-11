@@ -524,10 +524,7 @@ fn embedded_parent_damage_and_later_cancellation_never_return_partial_ranges() {
     assert!(!view.cache.iter().any(|(bp, _)| bp.embedded()));
     assert_eq!(
         *reads.lock().unwrap(),
-        [
-            (BASE as u64 + TABLE, 16384),
-            (BASE as u64 + INDIRECT, 4096),
-        ]
+        [(BASE as u64 + TABLE, 16384), (BASE as u64 + INDIRECT, 4096),]
     );
 
     let reads: Reads = Arc::default();

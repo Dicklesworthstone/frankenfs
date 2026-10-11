@@ -345,12 +345,7 @@ impl Objects {
 
     /// Exact stored-name selection, not case-folded alias selection. A missing
     /// snapshot is an error; never fall back to current head bytes or rewind TXG.
-    pub fn zpl_snapshot(
-        &mut self,
-        cx: &Cx,
-        components: &[Vec<u8>],
-        name: &[u8],
-    ) -> Result<Zpl> {
+    pub fn zpl_snapshot(&mut self, cx: &Cx, components: &[Vec<u8>], name: &[u8]) -> Result<Zpl> {
         valid_name(name)?;
         let selected = self
             .snapshot_roots(cx, components)?

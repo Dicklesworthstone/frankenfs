@@ -66,7 +66,9 @@ fn extraction_mounts_keep_snapshot_and_head_namespaces_and_data_separate() {
                 live_bytes
             );
             assert_eq!(
-                after.read(&cx, &mut scope, after_file.ino, 0, 4096).unwrap(),
+                after
+                    .read(&cx, &mut scope, after_file.ino, 0, 4096)
+                    .unwrap(),
                 after_bytes
             );
             assert_eq!(
@@ -91,7 +93,9 @@ fn extraction_mounts_keep_snapshot_and_head_namespaces_and_data_separate() {
                 ));
             }
             for fs in [&live, &before, &after] {
-                let link = fs.lookup(&cx, &mut scope, ROOT, OsStr::new("link")).unwrap();
+                let link = fs
+                    .lookup(&cx, &mut scope, ROOT, OsStr::new("link"))
+                    .unwrap();
                 assert_eq!(fs.readlink(&cx, &mut scope, link.ino).unwrap(), b"file");
             }
             let older = before.readdir(&cx, &mut scope, ROOT, 0).unwrap();

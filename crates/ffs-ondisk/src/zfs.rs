@@ -495,7 +495,9 @@ pub fn decompress(
                 .decompress(input, &mut output, FlushDecompress::Finish)
                 .map_err(|_| invalid("invalid ZFS gzip zlib stream"))?;
             if status != Status::StreamEnd || decoder.total_out() != output_bytes as u64 {
-                return Err(invalid("incomplete ZFS gzip stream or logical length mismatch"));
+                return Err(invalid(
+                    "incomplete ZFS gzip stream or logical length mismatch",
+                ));
             }
         }
         14 => {
@@ -504,7 +506,9 @@ pub fn decompress(
             // caller's checksum and is not interpreted as more tokens.
             let mut at = 0;
             while output.len() < output_bytes {
-                let token = *input.get(at).ok_or_else(|| invalid("truncated ZLE token"))?;
+                let token = *input
+                    .get(at)
+                    .ok_or_else(|| invalid("truncated ZLE token"))?;
                 at += 1;
                 let length = if token < 64 {
                     usize::from(token) + 1

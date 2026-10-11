@@ -1141,12 +1141,7 @@ fn directory_encryption_defaults_preserve_mounts_without_admitting_efs_data() {
             );
         }
         let reads: Reads = Arc::default();
-        let fs = open(
-            bytes,
-            Arc::clone(&reads),
-            Some((BASE + 700 * 512) as u64),
-        )
-        .unwrap();
+        let fs = open(bytes, Arc::clone(&reads), Some((BASE + 700 * 512) as u64)).unwrap();
         let mut scope = RequestScope::empty();
         assert_eq!(
             fs.getattr(&cx, &mut scope, ROOT).unwrap().kind,

@@ -871,15 +871,15 @@ mod tests {
         }
         for (date, time, fraction) in [
             (0, 0, 0),
-            (0x0001, 0, 0), // Month zero.
-            (0x0020, 0, 0), // Day zero.
-            (0x01A1, 0, 0), // Month thirteen.
-            (0x005E, 0, 0), // February thirty.
-            (0x565D, 0, 0), // 2023 is not a leap year.
-            (0xF05D, 0, 0), // 2100 is not a leap year.
+            (0x0001, 0, 0),      // Month zero.
+            (0x0020, 0, 0),      // Day zero.
+            (0x01A1, 0, 0),      // Month thirteen.
+            (0x005E, 0, 0),      // February thirty.
+            (0x565D, 0, 0),      // 2023 is not a leap year.
+            (0xF05D, 0, 0),      // 2100 is not a leap year.
             (0x0021, 0xC000, 0), // Hour twenty-four.
             (0x0021, 0x0780, 0), // Minute sixty.
-            (0x0021, 30, 0), // Encoded second sixty.
+            (0x0021, 30, 0),     // Encoded second sixty.
             (0x0021, 31, 0),
             (0x0021, 0, 200),
             (0x0021, 0, 255),
@@ -909,11 +909,7 @@ mod tests {
             assert_eq!(entry.created_time, 0x645C);
             assert_eq!(entry.created_centiseconds, 157);
             assert_eq!(entry.accessed_date, 0x5861);
-            let created = entry
-                .created_timestamp()
-                .unwrap()
-                .unwrap()
-                .utc_projection();
+            let created = entry.created_timestamp().unwrap().unwrap().utc_projection();
             assert_eq!(
                 (created.as_secs(), created.subsec_nanos()),
                 (1_709_210_097, 570_000_000)
@@ -948,7 +944,10 @@ mod tests {
             .push(&slot, FatKind::Fat16)
             .unwrap()
             .unwrap();
-        assert_eq!((entry.created_time, entry.created_centiseconds), (u16::MAX, 255));
+        assert_eq!(
+            (entry.created_time, entry.created_centiseconds),
+            (u16::MAX, 255)
+        );
         assert_eq!(entry.created_timestamp().unwrap(), None);
         assert_eq!(entry.accessed_timestamp().unwrap(), None);
         assert_eq!(entry.modified_timestamp().unwrap(), None);

@@ -195,22 +195,17 @@ fn fsops_rejects_invalid_native_timestamps_at_the_directory_record() {
             match case {
                 0 => image.bytes[at + 13] = 200,
                 1 => {
-                    image.bytes[at + 16..at + 18]
-                        .copy_from_slice(&0x565D_u16.to_le_bytes());
+                    image.bytes[at + 16..at + 18].copy_from_slice(&0x565D_u16.to_le_bytes());
                 }
                 2 => {
-                    image.bytes[at + 18..at + 20]
-                        .copy_from_slice(&0x565D_u16.to_le_bytes());
+                    image.bytes[at + 18..at + 20].copy_from_slice(&0x565D_u16.to_le_bytes());
                 }
                 3 => {
-                    image.bytes[at + 22..at + 24]
-                        .copy_from_slice(&0xC000_u16.to_le_bytes());
-                    image.bytes[at + 24..at + 26]
-                        .copy_from_slice(&0x585D_u16.to_le_bytes());
+                    image.bytes[at + 22..at + 24].copy_from_slice(&0xC000_u16.to_le_bytes());
+                    image.bytes[at + 24..at + 26].copy_from_slice(&0x585D_u16.to_le_bytes());
                 }
                 _ => {
-                    image.bytes[at + 22..at + 24]
-                        .copy_from_slice(&1_u16.to_le_bytes());
+                    image.bytes[at + 22..at + 24].copy_from_slice(&1_u16.to_le_bytes());
                 }
             }
             let fs = FatFs::new(&cx, image.volume(), 0, 0).unwrap();

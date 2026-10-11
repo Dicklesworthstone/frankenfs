@@ -42,13 +42,7 @@ pub struct Objects {
 }
 
 impl Leaf {
-    pub fn objects(
-        &self,
-        cx: &Cx,
-        label: usize,
-        slot: usize,
-        pool_guid: u64,
-    ) -> Result<Objects> {
+    pub fn objects(&self, cx: &Cx, label: usize, slot: usize, pool_guid: u64) -> Result<Objects> {
         let root = self.root(cx, label, slot, pool_guid)?;
         let objectset = ObjectSet::parse(&root.data, root.uberblock.root.payload_order())
             .map_err(|error| parse(&error))?;
@@ -413,6 +407,6 @@ pub struct Dataset {
 }
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod embedded_tests;
+#[cfg(test)]
+mod tests;

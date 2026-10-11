@@ -72,10 +72,7 @@ fn pointer(physical: &[u8], containing: Endian, payload: Endian) -> BlockPointer
     let mut words = [0_u64; 16];
     words[0] = 1; // One allocated sector.
     words[1] = 8;
-    words[6] = (2 << 32)
-        | (11 << 40)
-        | (19 << 48)
-        | (u64::from(payload == Endian::Little) << 63);
+    words[6] = (2 << 32) | (11 << 40) | (19 << 48) | (u64::from(payload == Endian::Little) << 63);
     words[10] = 42;
     words[12..].copy_from_slice(&checksum(physical, 11, payload).unwrap());
     let raw: Vec<u8> = words

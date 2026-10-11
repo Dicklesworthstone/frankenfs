@@ -311,8 +311,9 @@ impl Checker<'_> {
                     entry_offset: offset,
                     cluster: Some(cluster),
                     other_entry_offset: self.owner_offsets[previous as usize],
-                    detail: "multiple native objects reference this allocation; ownership is ambiguous"
-                        .into(),
+                    detail:
+                        "multiple native objects reference this allocation; ownership is ambiguous"
+                            .into(),
                 });
             } else {
                 self.owners[cluster as usize] = owner;
