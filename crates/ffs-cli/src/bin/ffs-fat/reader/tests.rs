@@ -468,4 +468,122 @@ fn long_names_cross_sectors_and_fat32_root_clusters_without_losing_alias_identit
     }
 }
 
+#[test]
+fn directory_end_markers_do_not_hide_corrupt_allocation_tails() {
+    let cx = Cx::for_testing();
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        let invalid = match kind {
+            FatKind::Fat16 => [0, 1, 0xFFF7, 0xFFF0, 5002, 4],
+            FatKind::Fat32 => [0, 1, 0x0FFF_FFF7, 0x0FFF_FFF0, 70_002, 4],
+        };
+        let directories = std::iter::once((Directory::Cluster(3), 3)).chain(
+            (kind == FatKind::Fat32).then_some((Directory::Root, 2)),
+        );
+        for (directory, first) in directories {
+            for value in invalid {
+                let mut image = Image::new(kind);
+                image.set_link(first, 4);
+                image.set_link(4, value);
+                let volume = image.volume();
+                assert!(
+                    matches!(volume.list(&cx, directory), Err(FfsError::Corruption { .. })),
+                    "{kind:?} {directory:?}: trailing link {value:x}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn directory_end_markers_do_not_hide_mirror_disagreement() {
+    let cx = Cx::for_testing();
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        let mut image = Image::new(kind);
+        image.set_link(3, 4);
+        image.set_link(4, image.end());
+        image.set_copy_link(1, 4, 0);
+        let volume = image.volume();
+        assert!(
+            volume
+                .list(&cx, Directory::Cluster(3))
+                .unwrap_err()
+                .to_string()
+                .contains("copies disagree")
+        );
+    }
+}
+
+#[test]
+fn valid_directory_tail_allocation_does_not_expose_or_read_unused_slots() {
+    let cx = Cx::for_testing();
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        let mut image = Image::new(kind);
+        image.set_link(3, 4);
+        image.set_link(4, image.end());
+        let tail = image.cluster(4);
+        image.bytes[tail..tail + 512].fill(0xFF);
+        let volume = FatVolume::from_device(
+            &cx,
+            Box::new(Memory {
+                bytes: Arc::new(image.bytes),
+                reads: Arc::new(AtomicUsize::new(0)),
+                fail_at: Some(tail as u64),
+            }),
+            image.base as u64,
+            image.length as u64,
+        )
+        .unwrap();
+        let entries = volume.list(&cx, Directory::Cluster(3)).unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].name().unwrap(), "NESTED.BIN");
+        assert_eq!(
+            volume.directory_size(&cx, Directory::Cluster(3)).unwrap(),
+            1024
+        );
+    }
+}
+
+#[test]
+fn directory_allocation_work_is_bounded_even_after_an_early_end_marker() {
+    let cx = Cx::for_testing();
+    let mut image = Image::new(FatKind::Fat16);
+    let limit = (MAX_DIRECTORY_SLOTS * 32 / 512) as u32;
+    for cluster in 3..3 + limit {
+        image.set_link(cluster, cluster + 1);
+    }
+    image.set_link(3 + limit, image.end());
+    let volume = image.volume();
+    assert!(matches!(
+        volume.list(&cx, Directory::Cluster(3)),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
+}
+
+#[test]
+fn directory_tail_validation_propagates_cancellation_before_publishing_names() {
+    let cx = Cx::for_testing();
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        let mut image = Image::new(kind);
+        image.set_link(3, 300);
+        image.set_link(300, image.end());
+        let fat_sector = 300 * kind.entry_bytes() as usize / 512 * 512;
+        let fail_at = (image.base + image.fat_start + fat_sector) as u64;
+        let volume = FatVolume::from_device(
+            &cx,
+            Box::new(Memory {
+                bytes: Arc::new(image.bytes),
+                reads: Arc::new(AtomicUsize::new(0)),
+                fail_at: Some(fail_at),
+            }),
+            image.base as u64,
+            image.length as u64,
+        )
+        .unwrap();
+        assert!(matches!(
+            volume.list(&cx, Directory::Cluster(3)),
+            Err(FfsError::Cancelled)
+        ));
+    }
+}
+
 mod filesystem;

@@ -277,7 +277,6 @@ impl FatVolume {
         let mut decoder = FatDirectoryDecoder::default();
         let mut entries = Vec::new();
         let mut slots = 0_usize;
-        let mut table = FatTable::new(self);
         let fixed = match directory {
             Directory::Root => self.geometry.fixed_root(),
             Directory::Cluster(_) => None,
@@ -292,27 +291,27 @@ impl FatVolume {
                 }
             }
         } else {
-            let mut cluster = match directory {
+            let first = match directory {
                 Directory::Root => self.geometry.root_cluster(),
                 Directory::Cluster(cluster) => cluster,
             };
-            let mut seen = BTreeSet::new();
+            // The end-of-directory marker ends the namespace, not the native
+            // allocation chain. Validate every allocated link before returning
+            // a listing, including unused tail clusters after that marker.
+            let clusters = self.allocation_chain(
+                cx,
+                first,
+                1,
+                self.cluster_offset(first)?,
+                (MAX_DIRECTORY_SLOTS * 32).div_ceil(self.geometry.cluster_bytes() as usize),
+            )?;
             let mut bytes = allocate(self.geometry.cluster_bytes() as usize)?;
-            loop {
+            for cluster in clusters {
                 checkpoint(cx)?;
                 let offset = self.cluster_offset(cluster)?;
-                if !seen.insert(cluster) {
-                    return Err(corrupt(offset, "cyclic FAT directory chain"));
-                }
-                let next = table.next(cx, cluster)?;
                 self.read_exact(cx, offset, &mut bytes)?;
                 self.decode_directory(&mut decoder, &bytes, offset, &mut entries, &mut slots)?;
                 if decoder.ended() {
-                    break;
-                }
-                if let Some(next) = next {
-                    cluster = next;
-                } else {
                     break;
                 }
             }

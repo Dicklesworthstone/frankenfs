@@ -44,7 +44,10 @@ Free-space accounting scans admitted FAT copies instead of trusting FSInfo hints
 The FUSE adapter supplies inode lookup/attributes, directory cookies and parent
 lookup, reads, read-only open admission, sync no-ops, statfs, and SEEK_DATA/HOLE.
 File allocation accounting includes preallocation but read output excludes it.
-Root and directory allocation chains are also validated for attribute reporting.
+Root and directory allocation chains are validated before both listing and
+attribute reporting, including allocated tails beyond the first end-of-directory
+marker. An unused tail is never decoded as additional names, but its links must
+still be bounded, acyclic, valid and consistent across admitted FAT copies.
 Mount-lifetime slot-based identities must not be reused as a writable-FAT or
 NFS-export design. Registry and allocation-map caches have explicit limits.
 
@@ -91,3 +94,11 @@ execution, mounted verification and rustfmt/Clippy were not executed there:
 Cargo, rustc and RCH were unavailable, and the connector-created commits had no
 reported Actions runs at the time checked. The presence of these tests and this
 runner is not a passing conformance or mounted-support certification.
+
+**Directory-tail regression coverage:** the reader tests include both dialects,
+FAT32 roots, invalid/free/bad/reserved/cyclic tail links, mirror disagreement,
+allocation limits and cancellation after an early directory end marker. A positive
+control rejects any physical read of unused tail data while preserving the visible
+listing. These added tests have not been executed in this editing session: the
+shared executor disconnected before compilation, and offline Cargo resolution
+also lacked required dependencies. Source review is not native or mounted proof.
