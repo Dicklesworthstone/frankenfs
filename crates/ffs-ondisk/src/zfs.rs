@@ -197,9 +197,14 @@ impl BlockPointer {
             (((self.words[6] & 0xffff) + 1) * 512) as usize
         }
     }
+    /// Bytes to read from a DVA. Embedded payloads occupy no physical block.
     #[must_use]
     pub fn physical_bytes(&self) -> usize {
-        ((((self.words[6] >> 16) & 0xffff) + 1) * 512) as usize
+        if self.embedded() {
+            0
+        } else {
+            ((((self.words[6] >> 16) & 0xffff) + 1) * 512) as usize
+        }
     }
     #[must_use]
     pub const fn embedded(&self) -> bool {
@@ -219,7 +224,11 @@ impl BlockPointer {
     }
     #[must_use]
     pub const fn checksum_type(&self) -> u8 {
-        ((self.words[6] >> 40) & 0xff) as u8
+        if self.embedded() {
+            2 // ZIO_CHECKSUM_OFF: integrity is supplied by the containing block.
+        } else {
+            ((self.words[6] >> 40) & 0xff) as u8
+        }
     }
     #[must_use]
     pub const fn object_type(&self) -> u8 {
@@ -240,6 +249,40 @@ impl BlockPointer {
         } else {
             Endian::Little
         }
+    }
+
+    /// Decode BP_EMBEDDED_TYPE_DATA from an already verified containing block.
+    /// This is not an independent integrity check: callers must validate the
+    /// parent checksum, feature admission, object type, size and birth ceiling.
+    ///
+    /// OpenZFS spa.h and blkptr.c pack bytes into the low bits of each numeric
+    /// payload word, regardless of container or logical payload byte order.
+    /// Only words 6 (properties) and 10 (logical birth) are not payload words.
+    pub fn decode_embedded(&self) -> Result<Vec<u8>, ParseError> {
+        if !self.embedded()
+            || self.protected()
+            || self.words[6] & (1_u64 << 62) != 0
+            || self.level() != 0
+            || self.birth() == 0
+        {
+            return Err(invalid("invalid embedded data flags, level or birth"));
+        }
+        if (self.words[6] >> 40) & 0xff != 0 {
+            return Err(invalid("reserved or redacted embedded block type"));
+        }
+        let packed = (((self.words[6] >> 25) & 0x7f) + 1) as usize;
+        if packed > 112 || packed > self.logical_bytes() {
+            return Err(invalid("embedded payload exceeds its native size bounds"));
+        }
+        let mut payload = [0_u8; 112];
+        let mut at = 0;
+        for (index, word) in self.words.iter().enumerate() {
+            if index != 6 && index != 10 {
+                payload[at..at + 8].copy_from_slice(&word.to_le_bytes());
+                at += 8;
+            }
+        }
+        decompress(&payload[..packed], self.compression(), self.logical_bytes())
     }
 
     /// Admission for the ordinary unencrypted single-leaf block pipeline.
@@ -292,7 +335,14 @@ impl BlockPointer {
 
     /// Check physical bytes (including allocation padding inside PSIZE) before
     /// decoding. No partial or unchecked logical bytes escape on failure.
+    /// Embedded pointers accept no physical bytes and require a checked parent.
     pub fn decode(&self, physical: &[u8]) -> Result<Vec<u8>, ParseError> {
+        if self.embedded() {
+            if !physical.is_empty() {
+                return Err(invalid("embedded data must not consume physical bytes"));
+            }
+            return self.decode_embedded();
+        }
         self.regular_dvas()?;
         if physical.len() != self.physical_bytes() {
             return Err(invalid("short physical block"));
@@ -499,3 +549,96 @@ fn copy_match(
 
 #[cfg(test)]
 mod tests;
+
+#[cfg(test)]
+mod embedded_tests {
+    use super::*;
+
+    fn pointer(payload: &[u8], logical: usize, codec: u8, order: Endian) -> BlockPointer {
+        assert!(!payload.is_empty() && payload.len() <= 112);
+        let mut words = [0_u64; 16];
+        let mut at = 0;
+        for (index, word) in words.iter_mut().enumerate() {
+            if index != 6 && index != 10 {
+                let mut packed = [0_u8; 8];
+                for byte in &mut packed {
+                    if let Some(value) = payload.get(at) {
+                        *byte = *value;
+                    }
+                    at += 1;
+                }
+                *word = u64::from_le_bytes(packed);
+            }
+        }
+        words[6] = (logical as u64 - 1)
+            | ((payload.len() as u64 - 1) << 25)
+            | (u64::from(codec) << 32)
+            | (1_u64 << 39)
+            | (19_u64 << 48);
+        words[10] = 7;
+        let mut raw = [0_u8; 128];
+        for (index, word) in words.iter().enumerate() {
+            raw[index * 8..index * 8 + 8].copy_from_slice(&order.encode(*word));
+        }
+        BlockPointer::parse(&raw, order).unwrap()
+    }
+
+    #[test]
+    fn embedded_bytes_cross_both_nonpayload_words_in_either_container_order() {
+        for length in 1..=112 {
+            let expected: Vec<u8> = (0..length).map(|i| (i * 37 + 11) as u8).collect();
+            for order in [Endian::Little, Endian::Big] {
+                let mut bp = pointer(&expected, length, 2, order);
+                for payload_order in [Endian::Big, Endian::Little] {
+                    bp.words[6] &= !(1_u64 << 63);
+                    if payload_order == Endian::Little {
+                        bp.words[6] |= 1_u64 << 63;
+                    }
+                    assert_eq!(bp.payload_order(), payload_order);
+                    assert_eq!(bp.decode_embedded().unwrap(), expected);
+                    assert_eq!(bp.decode(&[]).unwrap(), expected);
+                    assert_eq!(bp.physical_bytes(), 0);
+                    assert_eq!(bp.checksum_type(), 2);
+                    assert!(!bp.hole());
+                    assert!(bp.regular_dvas().is_err());
+                    assert!(bp.decode(&[0]).is_err());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn embedded_lz4_reconstructs_a_full_logical_sector() {
+        // One A, a 506-byte distance-one match, and five final literals.
+        let payload = [0, 0, 0, 12, 0x1f, b'A', 1, 0, 255, 232, 0x50, b'A', b'A', b'A', b'A', b'A'];
+        for order in [Endian::Little, Endian::Big] {
+            let bp = pointer(&payload, 512, 15, order);
+            assert_eq!(bp.decode_embedded().unwrap(), vec![b'A'; 512]);
+            let short = pointer(&payload[..payload.len() - 1], 512, 15, order);
+            assert!(short.decode_embedded().is_err());
+            let overrun = pointer(&payload, 511, 15, order);
+            assert!(overrun.decode_embedded().is_err());
+        }
+    }
+
+    #[test]
+    fn embedded_rejects_unsupported_layouts_and_never_treats_redaction_as_zeroes() {
+        let good = pointer(b"payload", 7, 2, Endian::Little);
+        for flags in [1_u64 << 40, 2_u64 << 40, 1_u64 << 56, 1_u64 << 61, 1_u64 << 62] {
+            let mut bp = good.clone();
+            bp.words[6] |= flags;
+            assert!(bp.decode_embedded().is_err());
+        }
+        let mut bp = good.clone();
+        bp.words[10] = 0;
+        assert!(bp.decode_embedded().is_err());
+        bp = good.clone();
+        bp.words[6] &= !(1_u64 << 39);
+        assert!(bp.decode_embedded().is_err());
+        bp = good.clone();
+        bp.words[6] = (bp.words[6] & !(0x7f_u64 << 25)) | (112_u64 << 25);
+        assert!(bp.decode_embedded().is_err());
+        assert!(pointer(b"payload", 8, 2, Endian::Little).decode_embedded().is_err());
+        assert!(pointer(b"payload", 7, 1, Endian::Little).decode_embedded().is_err());
+    }
+}
