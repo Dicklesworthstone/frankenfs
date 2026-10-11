@@ -1229,6 +1229,7 @@ dependencies = [
  "sha2 0.11.0",
  "smallvec",
  "xxhash-rust",
+ "zstd",
 ]
 
 [[package]]

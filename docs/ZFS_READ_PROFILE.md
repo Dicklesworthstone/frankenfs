@@ -65,9 +65,9 @@ Regular block pointers retain native sizes, birth, object type, byte order and
 DVAs. The physical reader checks vdev identity, allocation size, sector alignment,
 all-copy bounds and boot/label exclusions before issuing data I/O. Physical bytes
 are checked with Fletcher2, Fletcher4, SHA256 or SHA-512/256 before transformation.
-Native LZJB, gzip-1 through gzip-9, ZLE and length-prefixed ZFS LZ4 decode to the
-exact declared logical length; short output, invalid backreferences, overflow
-and unsupported codecs fail.
+Native LZJB, gzip-1 through gzip-9, ZLE, length-prefixed ZFS LZ4 and native
+Zstandard decode to the exact declared logical length; short output, invalid
+backreferences, overflow and unsupported codecs fail.
 Fletcher inputs use the block's payload byte order, independently of the host
 and the block-pointer container. SHA256 keeps its historical big-endian numeric
 checksum words. Native checksum 11 (`sha512`) uses SHA-512/256 and interprets
@@ -81,8 +81,8 @@ first even when the pointer's containing block is big-endian. Logical and packed
 lengths are byte counts, not sector counts. Only level-zero, unencrypted,
 non-deduplicated DATA pointers are admitted, with no embedded DNODE/OBJSET
 blocks, reserved subtype or redacted-data interpretation. Uncompressed, LZJB,
-gzip-1 through gzip-9, ZLE and ZFS LZ4 payloads must reconstruct the exact bounded
-logical size. The parent block's checksum protects these bytes; there is no fabricated child checksum
+gzip-1 through gzip-9, ZLE, ZFS LZ4 and native Zstandard payloads must reconstruct
+the exact bounded logical size. The parent block's checksum protects these bytes; there is no fabricated child checksum
 or physical DVA read. A reached embedded pointer requires the native
 `com.delphix:embedded_data` label feature as well as the ordinary dnode
 type/size/birth checks before decoded bytes may enter the view's cache.
@@ -104,6 +104,26 @@ fail. Bytes after that stream are physical padding, still covered by the full
 physical-block checksum; a second stream is never concatenated to fill LSIZE.
 The shared decoder reaches ordinary file, snapshot and mounted reads for both
 physical and embedded blocks. No label feature requirement is added.
+
+Native Zstandard (codec 16) reads the eight-byte big-endian OpenZFS wrapper and
+its magicless frame. The compressed-length field bounds exactly one complete
+frame. All four historical level/version byte layouts follow the native getter
+rule; normal levels 1..19 and fast-level IDs 103..123 are admitted. The producer
+version remains informational, as in OpenZFS.
+
+The existing zstd dependency decodes into a fixed logical-size output slice
+through its safe API. Before a decoder context is created, the frame's advertised
+window is checked against the 16 MiB budget and any declared content size must
+match LSIZE. The decoder also receives the 16 MiB window parameter. Truncated
+frames, dictionaries that are actually required, reserved framing, extra frames
+inside the declared native length, content-checksum failures and short or long
+output fail. Padding outside that native length remains covered by the full
+physical-block checksum. The same transform serves physical and embedded
+ordinary-file, snapshot and mounted reads.
+
+OpenZFS registers `org.freebsd:zstd_compress` as a per-dataset feature, not a MOS
+label feature. This codec addition does not broaden the label
+`features_for_read` allowlist or claim full MOS/dataset feature negotiation.
 
 A bad physical read, checksum or transform can try another declared copy on the
 same leaf. Cancellation propagates immediately and cannot turn into a redundant
@@ -478,3 +498,36 @@ zlib `v1.3.1`
 [infcover.c](https://github.com/madler/zlib/blob/v1.3.1/test/infcover.c),
 and flate2 `1.1.9`
 [mem.rs](https://github.com/rust-lang/flate2-rs/blob/1.1.9/src/mem.rs).
+
+## Native Zstandard validation
+
+Ten regressions cover published raw, compressed-sequence, literal-only and
+multiblock RLE vectors; all native levels and four historical header layouts;
+truncation, native lengths and exact LSIZE; content sizes and memory windows;
+dictionary requests, wrong framing, reserved fields and trailing frames;
+content-checksum damage; physical padding with all four admitted checksum
+algorithms; and physical/embedded dispatch across both container and payload
+byte orders. The GZIP unsupported-codec test uses neighboring unsupported ID 17
+now that ID 16 has an implementation; its admission and failure assertions
+remain intact.
+
+Delivery evidence (2026-10-11): complete source blobs and their exact changes
+received independent review. Fixture bytes match the pinned Go examples and
+Zstandard binary goldens; their output layouts and the constructed mixed
+compressed/RLE block were checked separately through a small read-only fixture
+decoder. Those checks do not execute the Rust implementation or establish
+native pool interoperability. Rust compilation, these ten tests, formatting,
+workspace checks, Clippy, UBS and native-image execution remain unavailable
+because the authoring executor is offline.
+
+Native framing and feature references:
+[OpenZFS Zstandard metadata](https://github.com/openzfs/zfs/blob/zfs-2.3.0/include/sys/zstd/zstd.h),
+[OpenZFS codec](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zstd/zfs_zstd.c),
+[OpenZFS feature registration](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zcommon/zfeature_common.c),
+and [MOS label fields](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zfs/vdev_label.c).
+Independent vectors and format:
+[Go Zstandard examples](https://github.com/golang/go/blob/go1.24.0/src/internal/zstd/zstd_test.go),
+[Zstandard golden vectors](https://github.com/facebook/zstd/tree/v1.5.7/tests/golden-decompression),
+and [Zstandard framing specification](https://github.com/facebook/zstd/blob/v1.5.7/doc/zstd_compression_format.md).
+The implementation uses the existing pinned zstd 0.13.3 / zstd-safe 7.2.4 dependency;
+no new package versions or experimental API features are introduced.

@@ -970,3 +970,19 @@ and independently source-reviewed. Native hash and mapping calculations were
 checked separately. Rust/build/fmt/Clippy/UBS and native-image execution remain
 unavailable with the executor offline; no executed parity credit is added.
 See `docs/NTFS_READ_PROFILE.md`.
+
+### ZFS native Zstandard reads
+
+Native codec 16 decodes OpenZFS's big-endian wrapper and magicless Zstandard
+frame through the shared physical/embedded pipeline. All native levels and
+historical header layouts are supported. Exact single-frame consumption,
+fixed LSIZE output, content integrity and explicit 16 MiB advertised-window
+bounds reject malformed or oversized streams. Full physical checksums retain
+padding coverage; ordinary file, snapshot and mounted reads use this transform.
+The per-dataset Zstandard feature does not expand the MOS label allowlist.
+
+Ten regressions cover independent Go/Zstandard vectors, malformed framing and
+lengths, dictionary requirements, memory limits and block integrity in both
+byte orders. Source/fixture review and exact blob comparisons completed.
+Rust/build/fmt/Clippy/UBS and native pool execution remain unavailable with the
+executor offline; no executed parity credit is added. See `docs/ZFS_READ_PROFILE.md`.
