@@ -16121,6 +16121,9 @@ fn btrfs_cli_image_evidence(images: &[PathBuf], attached: &[PathBuf]) -> Vec<Val
                 "fsid": sb.fsid,
                 "devid": device.devid,
                 "device_uuid": device.uuid,
+                "device_fsid": device.fsid,
+                "device_generation": device.generation,
+                "is_seeding": sb.is_seeding(),
                 "generation": sb.generation,
                 "checksum_type": sb.csum_type,
                 "total_bytes": device.total_bytes,
@@ -16128,6 +16131,28 @@ fn btrfs_cli_image_evidence(images: &[PathBuf], attached: &[PathBuf]) -> Vec<Val
             })
         })
         .collect()
+}
+
+// Owns only loop devices allocated for this fixture and its kernel mount.
+struct KernelDevices {
+    loops: Vec<String>,
+    mounted: Option<PathBuf>,
+}
+
+impl Drop for KernelDevices {
+    fn drop(&mut self) {
+        if let Some(path) = &self.mounted {
+            let _ = Command::new("sudo")
+                .args(["-n", "umount"])
+                .arg(path)
+                .status();
+        }
+        for device in &self.loops {
+            let _ = Command::new("sudo")
+                .args(["-n", "losetup", "-d", device])
+                .status();
+        }
+    }
 }
 
 /// Owns one CLI child and its fresh private mountpoint. Cleanup never scans
@@ -16189,6 +16214,31 @@ impl BtrfsCliMount {
             mountpoint,
             directory: directory.to_path_buf(),
             finished: false,
+        }
+    }
+
+    fn wait_until_ready(&mut self) {
+        let start = Instant::now();
+        while !mountinfo_has_mountpoint(&self.mountpoint) {
+            let status = self.child.try_wait().expect("poll CLI mount");
+            if status.is_some() || start.elapsed() >= Duration::from_secs(10) {
+                for name in ["stdout.log", "stderr.log"] {
+                    let output = fs::read_to_string(self.directory.join(name))
+                        .unwrap_or_else(|error| format!("cannot read {name}: {error}"));
+                    eprintln!("BTRFS_CLI_STARTUP_FAILURE|{name}|{output}");
+                }
+            }
+            assert!(
+                status.is_none(),
+                "CLI exited before mount: {status:?}; logs: {}",
+                self.directory.display()
+            );
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "CLI mount timed out; logs: {}",
+                self.directory.display()
+            );
+            thread::sleep(Duration::from_millis(20));
         }
     }
 
@@ -16295,28 +16345,7 @@ fn assert_btrfs_cli_mount_reads(
             "devices_before": before,
         }),
     );
-    let start = Instant::now();
-    while !mountinfo_has_mountpoint(&mountpoint) {
-        let status = mount.child.try_wait().expect("poll CLI mount");
-        if status.is_some() || start.elapsed() >= Duration::from_secs(10) {
-            for name in ["stdout.log", "stderr.log"] {
-                let output = fs::read_to_string(directory.join(name))
-                    .unwrap_or_else(|error| format!("cannot read {name}: {error}"));
-                eprintln!("BTRFS_CLI_STARTUP_FAILURE|{name}|{output}");
-            }
-        }
-        assert!(
-            status.is_none(),
-            "CLI exited before mount: {status:?}; logs: {}",
-            directory.display()
-        );
-        assert!(
-            start.elapsed() < Duration::from_secs(10),
-            "CLI mount timed out; logs: {}",
-            directory.display()
-        );
-        thread::sleep(Duration::from_millis(20));
-    }
+    mount.wait_until_ready();
     let mut operations = Vec::new();
     for relative_dir in ["", "nested"] {
         let dir = mountpoint.join(relative_dir);
@@ -16489,6 +16518,493 @@ fn assert_btrfs_cli_mount_refused(
     assert_eq!(exit["mount_released"], true);
 }
 
+fn btrfs_seed_sprout_run(directory: &Path, command: &mut Command) -> std::process::Output {
+    let output = command.output().expect("run seed/sprout fixture command");
+    btrfs_cli_record(
+        directory,
+        &serde_json::json!({
+            "event": "seed_sprout_command",
+            "program": command.get_program().to_string_lossy(),
+            "argv": command.get_args().map(|arg| arg.to_string_lossy()).collect::<Vec<_>>(),
+            "status": output.status.to_string(),
+            "stdout": String::from_utf8_lossy(&output.stdout),
+            "stderr": String::from_utf8_lossy(&output.stderr),
+        }),
+    );
+    assert!(
+        output.status.success(),
+        "seed/sprout command failed: {command:?}"
+    );
+    output
+}
+
+impl KernelDevices {
+    fn attach(&mut self, directory: &Path, image: &Path, read_only: bool) -> String {
+        let mut command = Command::new("sudo");
+        command.args(["-n", "losetup", "--find", "--show"]);
+        if read_only {
+            command.arg("--read-only");
+        }
+        let output = btrfs_seed_sprout_run(directory, command.arg(image));
+        let device = String::from_utf8(output.stdout).unwrap().trim().to_owned();
+        assert_ne!(device, "");
+        self.loops.push(device.clone());
+        device
+    }
+
+    fn unmount(&mut self, directory: &Path) {
+        if let Some(path) = &self.mounted {
+            btrfs_seed_sprout_run(
+                directory,
+                Command::new("sudo").args(["-n", "umount"]).arg(path),
+            );
+            self.mounted = None;
+        }
+    }
+
+    fn detach(&mut self, directory: &Path) {
+        self.unmount(directory);
+        for device in &self.loops {
+            btrfs_seed_sprout_run(
+                directory,
+                Command::new("sudo").args(["-n", "losetup", "-d", device]),
+            );
+        }
+        self.loops.clear();
+    }
+}
+
+fn btrfs_seed_sprout_inventory(directory: &Path, mountpoint: &Path, ids: &[u64]) -> Value {
+    // Query the same actual kernel ioctls for the reference mount and FUSE.
+    // DEV_INFO paths differ by transport; compare identity and accounting.
+    let script = r"
+import fcntl, json, os, struct, sys
+fd = os.open(sys.argv[1], os.O_RDONLY | os.O_DIRECTORY)
+try:
+    info = bytearray(1024)
+    fcntl.ioctl(fd, 0x8400941f, info, True)
+    maximum, count = struct.unpack_from('<QQ', info)
+    nodesize, sectorsize = struct.unpack_from('<II', info, 32)
+    result = {'max_id': maximum, 'num_devices': count,
+              'fsid': bytes(info[16:32]).hex(),
+              'nodesize': nodesize, 'sectorsize': sectorsize, 'devices': [],
+              'ioctl_operations': ['FS_INFO']}
+    for devid in json.loads(sys.argv[2]):
+        device = bytearray(4096)
+        struct.pack_into('<Q', device, 0, devid)
+        fcntl.ioctl(fd, 0xd000941e, device, True)
+        result['ioctl_operations'].append('DEV_INFO wildcard UUID')
+        actual_id = struct.unpack_from('<Q', device)[0]
+        uuid = bytes(device[8:24])
+        used, total = struct.unpack_from('<QQ', device, 24)
+        assert actual_id == devid
+        assert uuid != bytes(16)
+        assert 0 < used <= total
+        exact = bytearray(4096)
+        struct.pack_into('<Q', exact, 0, devid)
+        exact[8:24] = uuid
+        fcntl.ioctl(fd, 0xd000941e, exact, True)
+        result['ioctl_operations'].append('DEV_INFO exact UUID')
+        assert exact[:40] == device[:40]
+        result['devices'].append({'devid': devid, 'uuid': uuid.hex(),
+                                  'bytes_used': used, 'total_bytes': total})
+    print(json.dumps(result))
+finally:
+    os.close(fd)
+";
+    let output = btrfs_seed_sprout_run(
+        directory,
+        Command::new("python3")
+            .args(["-c", script])
+            .arg(mountpoint)
+            .arg(serde_json::to_string(ids).unwrap()),
+    );
+    serde_json::from_slice(&output.stdout).expect("mounted seed/sprout inventory JSON")
+}
+
+#[test]
+fn btrfs_cli_seed_sprout_reads_kernel_generated_files() {
+    let Some(cli) = btrfs_cli_proof_binary() else {
+        return;
+    };
+    if !fuse_available()
+        || !can_run_sudo()
+        || [
+            "mkfs.btrfs",
+            "btrfstune",
+            "btrfs",
+            "losetup",
+            "mount",
+            "umount",
+            "python3",
+        ]
+        .iter()
+        .any(|name| !command_available(name))
+    {
+        require_fuse_or_skip("seed/sprout needs FUSE, sudo, Btrfs tools, loop mounts and python3");
+        return;
+    }
+    let parent = PathBuf::from(std::env::var_os("FFS_CLI_ARTIFACT_DIR").unwrap());
+    fs::create_dir_all(&parent).unwrap();
+    let directory = TempDir::new_in(&parent).unwrap().keep();
+    eprintln!("BTRFS_CLI_ARTIFACTS|path={}", directory.display());
+    let seed = directory.join("seed.btrfs");
+    let sprout = directory.join("sprout.btrfs");
+    let unrelated = directory.join("unrelated-seed.btrfs");
+    let images = vec![seed.clone(), sprout.clone(), unrelated.clone()];
+    for image in &images {
+        fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .open(image)
+            .unwrap()
+            .set_len(256 * 1024 * 1024)
+            .unwrap();
+    }
+    for image in [&seed, &unrelated] {
+        btrfs_seed_sprout_run(
+            &directory,
+            Command::new("mkfs.btrfs")
+                .args(["-f", "-d", "single", "-m", "single"])
+                .arg(image),
+        );
+    }
+    let old_payload = patterned_bytes(1024 * 1024 + 37, 251, 0);
+    let new_payload = patterned_bytes(1024 * 1024 + 113, 239, 13);
+    let old_input = directory.join("seed-payload");
+    let new_input = directory.join("sprout-payload");
+    fs::write(&old_input, &old_payload).unwrap();
+    fs::write(&new_input, &new_payload).unwrap();
+    let kernel_mount = directory.join("kernel");
+    fs::create_dir(&kernel_mount).unwrap();
+    let mut kernel = KernelDevices {
+        loops: Vec::new(),
+        mounted: None,
+    };
+    let seed_loop = kernel.attach(&directory, &seed, false);
+    btrfs_seed_sprout_run(
+        &directory,
+        Command::new("sudo")
+            .args(["-n", "mount", "-t", "btrfs"])
+            .arg(&seed_loop)
+            .arg(&kernel_mount),
+    );
+    kernel.mounted = Some(kernel_mount.clone());
+    let populate = |input: &Path, file: &str, subvolume: &str| {
+        btrfs_seed_sprout_run(
+            &directory,
+            Command::new("sudo")
+                .args(["-n", "btrfs", "subvolume", "create"])
+                .arg(kernel_mount.join(subvolume)),
+        );
+        for target in [
+            kernel_mount.join(file),
+            kernel_mount.join(subvolume).join("payload"),
+        ] {
+            btrfs_seed_sprout_run(
+                &directory,
+                Command::new("sudo")
+                    .args(["-n", "cp", "--reflink=never"])
+                    .arg(input)
+                    .arg(target),
+            );
+        }
+        btrfs_seed_sprout_run(
+            &directory,
+            Command::new("sudo")
+                .args(["-n", "btrfs", "filesystem", "sync"])
+                .arg(&kernel_mount),
+        );
+    };
+    populate(&old_input, "seed-payload", "seed-nested");
+    kernel.detach(&directory);
+    for image in [&seed, &unrelated] {
+        btrfs_seed_sprout_run(
+            &directory,
+            Command::new("btrfstune").args(["-S", "1"]).arg(image),
+        );
+    }
+    let seed_before = btrfs_cli_image_evidence(std::slice::from_ref(&seed), &[]);
+    let seed_loop = kernel.attach(&directory, &seed, true);
+    let sprout_loop = kernel.attach(&directory, &sprout, false);
+    btrfs_seed_sprout_run(
+        &directory,
+        Command::new("sudo")
+            .args(["-n", "mount", "-t", "btrfs", "-o", "ro"])
+            .arg(&seed_loop)
+            .arg(&kernel_mount),
+    );
+    kernel.mounted = Some(kernel_mount.clone());
+    btrfs_seed_sprout_run(
+        &directory,
+        Command::new("sudo")
+            .args(["-n", "btrfs", "device", "add", "-f"])
+            .arg(&sprout_loop)
+            .arg(&kernel_mount),
+    );
+    kernel.unmount(&directory);
+    btrfs_seed_sprout_run(
+        &directory,
+        Command::new("sudo")
+            .args(["-n", "mount", "-t", "btrfs", "-o"])
+            .arg(format!("device={seed_loop}"))
+            .arg(&sprout_loop)
+            .arg(&kernel_mount),
+    );
+    kernel.mounted = Some(kernel_mount.clone());
+    populate(&new_input, "sprout-payload", "sprout-nested");
+    kernel.unmount(&directory);
+    btrfs_seed_sprout_run(
+        &directory,
+        Command::new("sudo")
+            .args(["-n", "mount", "-t", "btrfs", "-o"])
+            .arg(format!("ro,device={seed_loop}"))
+            .arg(&sprout_loop)
+            .arg(&kernel_mount),
+    );
+    kernel.mounted = Some(kernel_mount.clone());
+    let attached = vec![sprout.clone(), seed.clone()];
+    let before = btrfs_cli_image_evidence(&images, &attached);
+    assert_eq!(before[0]["is_seeding"], true);
+    assert_eq!(before[1]["is_seeding"], false);
+    assert_eq!(before[2]["is_seeding"], true);
+    assert_ne!(
+        before[0]["fsid"], before[1]["fsid"],
+        "sprout gets its own filesystem UUID"
+    );
+    assert_ne!(
+        before[0]["fsid"], before[2]["fsid"],
+        "negative fixture is an unrelated seed"
+    );
+    let ids = [
+        before[0]["devid"].as_u64().unwrap(),
+        before[1]["devid"].as_u64().unwrap(),
+    ];
+    let kernel_inventory = btrfs_seed_sprout_inventory(&directory, &kernel_mount, &ids);
+    assert_eq!(
+        kernel_inventory["num_devices"], 1,
+        "FS_INFO excludes the seed list"
+    );
+    assert_eq!(kernel_inventory["max_id"], ids[1]);
+    let files = [
+        ("seed-payload", old_payload.as_slice()),
+        ("seed-nested/payload", old_payload.as_slice()),
+        ("sprout-payload", new_payload.as_slice()),
+        ("sprout-nested/payload", new_payload.as_slice()),
+    ];
+    for (relative, expected) in files {
+        let bytes = fs::read(kernel_mount.join(relative)).unwrap();
+        btrfs_cli_record(
+            &directory,
+            &serde_json::json!({
+                "event": "kernel_seed_sprout_readback", "path": relative,
+                "length": bytes.len(), "readback_blake3": blake3::hash(&bytes).to_hex().to_string(),
+            }),
+        );
+        assert_eq!(bytes, expected, "kernel payload {relative}");
+    }
+    kernel.detach(&directory);
+    assert_eq!(
+        seed_before,
+        btrfs_cli_image_evidence(std::slice::from_ref(&seed), &[]),
+        "kernel sprouting must preserve its read-only seed"
+    );
+    assert_eq!(
+        before,
+        btrfs_cli_image_evidence(&images, &attached),
+        "read-only kernel oracle changed the images"
+    );
+    btrfs_cli_record(
+        &directory,
+        &serde_json::json!({
+            "event": "seed_sprout_kernel_fixture_ready",
+            "devices_before": before,
+            "kernel_inventory": kernel_inventory,
+        }),
+    );
+    assert_ne!(ids[0], ids[1], "seed and sprout need distinct device IDs");
+    let cx = Cx::for_testing();
+    let route_fs = OpenFs::open_with_options(
+        &cx,
+        &sprout,
+        &OpenOptions {
+            btrfs_device_paths: vec![seed.clone()],
+            ..OpenOptions::default()
+        },
+    )
+    .expect("open kernel sprout for physical placement proof");
+    for (relative, expected, devid, image) in [
+        ("seed-payload", old_payload.as_slice(), ids[0], &seed),
+        ("sprout-payload", new_payload.as_slice(), ids[1], &sprout),
+    ] {
+        let attr = route_fs
+            .lookup(&cx, InodeNumber(1), relative.as_ref())
+            .unwrap();
+        let length = u64::try_from(expected.len()).unwrap();
+        let extents = route_fs
+            .fiemap(&cx, &mut RequestScope::empty(), attr.ino, 0, length)
+            .unwrap();
+        assert!(!extents.is_empty(), "physical extents for {relative}");
+        let mut input = fs::File::open(image).unwrap();
+        let mut offset = 0_u64;
+        for extent in extents {
+            assert_eq!(extent.logical, offset, "dense payload extent coverage");
+            assert_eq!(
+                extent.flags
+                    & (ffs_core::FIEMAP_EXTENT_DATA_INLINE
+                        | ffs_core::FIEMAP_EXTENT_ENCODED
+                        | ffs_core::FIEMAP_EXTENT_UNWRITTEN),
+                0,
+                "physical proof requires ordinary uncompressed written extents"
+            );
+            let end = extent
+                .logical
+                .checked_add(extent.length)
+                .unwrap()
+                .min(length);
+            while offset < end {
+                // Btrfs FIEMAP's physical field is the filesystem logical
+                // bytenr; resolve it through CHUNK_TREE to the actual image.
+                let logical = extent
+                    .physical
+                    .checked_add(offset - extent.logical)
+                    .unwrap();
+                let mapping = ffs_ondisk::map_logical_to_stripes(
+                    &route_fs.btrfs_context().unwrap().chunks,
+                    logical,
+                )
+                .unwrap()
+                .unwrap();
+                assert_eq!(mapping.profile, ffs_ondisk::btrfs::BtrfsRaidProfile::Single);
+                assert_eq!(mapping.stripes.len(), 1);
+                let stripe = &mapping.stripes[0];
+                assert_eq!(
+                    stripe.devid, devid,
+                    "{relative} must reside on its own device"
+                );
+                let count = mapping.contiguous_len.min(end - offset);
+                assert!(count > 0);
+                let mut bytes = vec![0; usize::try_from(count).unwrap()];
+                input.seek(SeekFrom::Start(stripe.physical)).unwrap();
+                input.read_exact(&mut bytes).unwrap();
+                assert_eq!(
+                    bytes,
+                    expected[usize::try_from(offset).unwrap()
+                        ..usize::try_from(offset + count).unwrap()]
+                );
+                btrfs_cli_record(
+                    &directory,
+                    &serde_json::json!({
+                        "event": "seed_sprout_physical_readback", "path": relative,
+                        "devid": devid, "image": image, "logical_bytenr": logical,
+                        "physical_offset": stripe.physical, "file_offset": offset, "length": count,
+                        "readback_blake3": blake3::hash(&bytes).to_hex().to_string(),
+                    }),
+                );
+                offset += count;
+            }
+        }
+        assert_eq!(offset, length, "all payload bytes have a physical owner");
+    }
+    drop(route_fs);
+    let cli_directory = directory.join("cli");
+    let mut mount = BtrfsCliMount::spawn(&cli, &cli_directory, &attached, false);
+    mount.wait_until_ready();
+    let mut operations = Vec::new();
+    for (relative, expected) in files {
+        let path = mount.mountpoint.join(relative);
+        let bytes = fs::read(&path);
+        let operation = serde_json::json!({
+            "op": "seed_sprout_read", "path": relative,
+            "readback_blake3": bytes.as_ref().ok().map(|bytes| blake3::hash(bytes).to_hex().to_string()),
+            "error": bytes.as_ref().err().map(ToString::to_string),
+        });
+        btrfs_cli_record(&cli_directory, &operation);
+        operations.push(operation);
+        assert_eq!(bytes.unwrap(), expected, "CLI payload {relative}");
+        let result = fs::OpenOptions::new().write(true).open(&path);
+        let errno = result.as_ref().err().and_then(std::io::Error::raw_os_error);
+        let operation = serde_json::json!({"op": "open_write", "path": relative, "errno": errno});
+        btrfs_cli_record(&cli_directory, &operation);
+        operations.push(operation);
+        assert_eq!(
+            errno,
+            Some(libc::EROFS),
+            "seed/sprout write admission: {result:?}"
+        );
+        let readback = fs::read(&path);
+        let operation = serde_json::json!({
+            "op": "read_after_refused_write", "path": relative,
+            "readback_blake3": readback.as_ref().ok().map(|bytes| blake3::hash(bytes).to_hex().to_string()),
+            "error": readback.as_ref().err().map(ToString::to_string),
+        });
+        btrfs_cli_record(&cli_directory, &operation);
+        operations.push(operation);
+        assert_eq!(readback.unwrap(), expected, "payload after refused write");
+    }
+    let actual_inventory = btrfs_seed_sprout_inventory(&cli_directory, &mount.mountpoint, &ids);
+    assert_eq!(
+        actual_inventory, kernel_inventory,
+        "mounted ioctl identity and accounting"
+    );
+    let create = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(mount.mountpoint.join("must-not-create"));
+    let errno = create.as_ref().err().and_then(std::io::Error::raw_os_error);
+    let operation = serde_json::json!({"op": "create", "errno": errno});
+    btrfs_cli_record(&cli_directory, &operation);
+    operations.push(operation);
+    assert_eq!(errno, Some(libc::EROFS), "seed/sprout create: {create:?}");
+    let exit = mount.finish();
+    let after = btrfs_cli_image_evidence(&images, &attached);
+    btrfs_cli_record(
+        &cli_directory,
+        &serde_json::json!({
+            "event": "seed_sprout_complete", "devices_before": before, "devices_after": after,
+            "kernel_inventory": kernel_inventory, "cli_inventory": actual_inventory,
+            "operations": operations, "operation_count": operations.len(),
+            "operation_count_unit": "recorded_mounted_file_probes", "exit": exit,
+        }),
+    );
+    assert_eq!(before, after, "seed/sprout CLI changed an image");
+    assert_eq!(exit["success"], true, "CLI shutdown: {exit}");
+    assert_eq!(exit["forced_stop"], false, "CLI shutdown: {exit}");
+    assert_eq!(exit["lazy_unmount"], Value::Null, "CLI shutdown: {exit}");
+    assert_eq!(exit["mount_released"], true, "CLI shutdown: {exit}");
+    let wrong = OpenOptions {
+        btrfs_device_paths: vec![unrelated.clone()],
+        ..OpenOptions::default()
+    };
+    let error = OpenFs::open_with_options(&Cx::for_testing(), &sprout, &wrong).unwrap_err();
+    assert!(
+        matches!(&error, ffs_error::FfsError::Format(detail)
+            if detail == "bootstrap chunk stripe device identity mismatch"
+                || detail == "attached device disagrees with committed identity, capacity or seed generation")
+            || matches!(&error, ffs_error::FfsError::Corruption { detail, .. }
+                if detail == "chunk-tree device filesystem UUID mismatch"),
+        "unrelated seed must fail committed identity admission: {error}"
+    );
+    assert_eq!(
+        before,
+        btrfs_cli_image_evidence(&images, &attached),
+        "core wrong-seed refusal changed an image"
+    );
+    assert_btrfs_cli_mount_refused(
+        &cli,
+        &directory.join("wrong-seed"),
+        &images,
+        &[sprout, unrelated],
+        false,
+        &error.to_string(),
+    );
+    emit_scenario_result(
+        "btrfs_cli_seed_sprout",
+        "PASS",
+        Some(&directory.display().to_string()),
+    );
+}
+
 fn assert_btrfs_attached_devices_read_seeded_files(
     checksum: &str,
     csum_type: u16,
@@ -16595,25 +17111,6 @@ fn assert_btrfs_attached_devices_read_seeded_files(
         );
         // Populate through the kernel: mkfs --rootdir only supports one device.
         // The guard owns only loop devices allocated for these temporary images.
-        struct KernelDevices {
-            loops: Vec<String>,
-            mounted: Option<PathBuf>,
-        }
-        impl Drop for KernelDevices {
-            fn drop(&mut self) {
-                if let Some(path) = &self.mounted {
-                    let _ = Command::new("sudo")
-                        .args(["-n", "umount"])
-                        .arg(path)
-                        .status();
-                }
-                for device in &self.loops {
-                    let _ = Command::new("sudo")
-                        .args(["-n", "losetup", "-d", device])
-                        .status();
-                }
-            }
-        }
         let mut kernel = KernelDevices {
             loops: Vec::new(),
             mounted: None,

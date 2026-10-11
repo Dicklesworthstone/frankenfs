@@ -181,8 +181,8 @@ also requires each tree header's filesystem UUID to match an admitted device
 identity. The same predicate runs inside parity reconstruction, so a
 checksum-correct foreign P candidate cannot hide a valid Q candidate. An empty
 identity set rejects every node, and zero UUIDs have no wildcard meaning.
-This check covers attached-device tree reads; it does not establish seed/sprout
-admission or validation in the separate singleton reader. Encoded reads use the same
+This check covers attached-device tree reads; singleton validation is described
+below. Encoded reads use the same
 logical routing and checksum policy as ordinary reads. Generation inspection
 also uses validated attached-device copies. CLI mount modes pass `Arc<OpenFs>`
 to FUSE; the shared `FsOps` implementation forwards encoded reads and metadata
@@ -194,8 +194,7 @@ metadata. No sibling images are discovered implicitly. Multi-device mounts requi
 tree log and no MVCC WAL. Nested subvolumes share the validated device handles,
 recheck committed superblocks and chunk coverage, and preserve the checksum
 policy. Unreadable attached subvolumes return errors rather than empty
-directories. Dirty-image recovery, seed-device inventories with different
-filesystem UUIDs and remaining corruption/profile
+directories. Dirty-image recovery and remaining corruption/profile
 qualification remain open. There is no
 multi-device mutation support.
 `OpenFs::enable_writes` refuses any device count other than one and any known
@@ -207,28 +206,30 @@ commits, write request scopes, mounted repair staging and physical MVCC
 flushes. A clean seed permits a no-op flush; existing MVCC versions cannot be
 persisted onto it. The CLI refuses background repair during plan creation,
 before starting a worker or ledger, while permitting detection-only scrub.
-These guards apply to standalone seeds and do not establish seed/sprout
-attachment support or cover standalone `fsck --repair`.
+These guards also protect admitted seed/sprout device sets. They do not cover
+standalone `fsck --repair`.
 `OpenFs::current_btrfs_device_items` reads the backing superblock through the request's
 `Cx`, verifies its checksum, parses the embedded device item, and checks its
 filesystem UUID. Writable mounts enumerate live CHUNK_TREE DEV_ITEM records
 under the allocator's read lock; read-only mounts use checksum-verified range
 descent over the committed device-item keyspace. Both include unused devices
 and maximum IDs, require IDs to match their keys, reject duplicate IDs/UUIDs
-and foreign filesystem UUIDs, and verify the backing device's identity.
+and unattested foreign filesystem UUIDs, and verify the backing device's identity.
 Partial live tree loads return an unsupported error; missing, malformed or
 count-inconsistent live inventories return corruption errors. Mount admission
 reconciles a stale superblock count from the verified committed inventory;
 later ioctl enumeration compares against that mounted count. The shared parser
-does not itself open additional backing files. Seed-device inventories with
-different filesystem UUIDs are not yet supported. The allocator lock stabilizes writable accounting,
+does not itself open additional backing files. Seed records require the
+admission checks below. The allocator lock stabilizes writable accounting,
 but full commit releases it before superblock publication; serializing that
-publication with device-info reads remains open (`bd-hk5w3`).
+publication with device-info reads remains open. This Single/DUP write-side
+limitation is separate from the qualified read-only multi-device routing.
 
 Admission resolves the inventory before walking ROOT_TREE or any selected
 subvolume. A raw `num_devices = 1` cannot select the single-image reader:
 committed DEV_ITEMs include unused devices. The corrected count feeds write
-and background-scrub admission as well as `FS_INFO`. Bootstrap-only diagnostic
+and background-scrub admission. `FS_INFO` reports the count and maximum ID of
+the mounted filesystem's own FSID list, excluding seed lists. Bootstrap-only diagnostic
 opens without CHUNK_TREE remain unverified and cannot publish transactions,
 flush existing MVCC versions, or start background repair. Actual device sets
 still require clean tree logs and no external MVCC WAL; verified singleton
@@ -279,25 +280,32 @@ and allocation authority; it does not erase MVCC versions already written to
 new, unreferenced addresses. Ordinary regular-extent preallocation avoids this
 additional checkpoint.
 
-Seed support also requires explicit per-device filesystem identity and seed
-generation, anchored to the sprout's committed DEV_ITEMs. Seed handles remain
-read-only; ordinary same-filesystem attachments retain their existing
-generation/root/geometry validation. Nested opens must revalidate each role.
-The total inventory used for routing includes seed lists, while `FS_INFO`
-reports the mounted filesystem's own list as described in the extracted
-Linux contract. Neither `skip_validation` nor ephemeral tree-log commit mode
-can establish singleton write authority when inventory validation is absent
-or fails. Required regression cases include under/overstated counts, an
-unused extra device, Single chunks owned by another device, a wrong seed
-generation, an unrelated seed, and attempted writes to a lone seed. These
-are implementation requirements; no new execution or parity claim is made.
+Seed/sprout admission stages checksum-valid device candidates and checks the
+primary's bootstrap stripe UUIDs before reading CHUNK_TREE. A foreign candidate
+must have the seeding flag, a clean log and compatible geometry. Before any
+filesystem view is published, every candidate must match a committed DEV_ITEM's
+device ID, device UUID, filesystem UUID and capacity; a seed's frozen superblock
+generation must equal that record's generation. Extra candidates and unattached
+seed records are rejected. Ordinary members retain exact committed roots and
+generation checks. Provisional CHUNK_TREE reads may use candidate seed FSIDs,
+but none become metadata authority unless the entire inventory binds.
+
+Attachments use OS read-only handles. Nested views recheck each role, including
+the seed flag and frozen generation, before sharing the readers. Tree headers
+may name the mounted filesystem or an admitted seed, independently of which
+physical device supplies the block. Complete inventory still controls routing,
+DEV_INFO and mutation refusal; FS_INFO's own-device count cannot authorize
+singleton writes. Degraded seed groups and colliding device IDs are not admitted.
+Neither `skip_validation` nor ephemeral tree-log mode bypasses these checks.
+Execution evidence and remaining qualification are recorded in FEATURE_PARITY.md.
 
 Mount initialization preserves DATA, METADATA, and SYSTEM block-group types.
 Chunk-tree COW allocates from SYSTEM space so the superblock's bootstrap map
 can resolve the new root. When growth dirties CHUNK_TREE and DEV_TREE, full
 commit retires their old extent records before allocating replacement nodes;
 the existing pin mechanism protects those old blocks until publication.
-`FS_INFO` derives `max_id` from the complete validated inventory. `DEV_INFO`
+`FS_INFO` derives `max_id` from the mounted filesystem's own devices in the
+complete validated inventory, excluding foreign-FSID seeds. `DEV_INFO`
 looks up any inventory device by exact ID and optional UUID, with current
 per-device accounting. Neither ioctl infers device IDs from chunk stripes.
 

@@ -2509,14 +2509,16 @@ impl FsOps for OpenFs {
             )),
             FsFlavor::Btrfs(sb) => {
                 let devices = self.current_btrfs_device_items(cx, sb)?;
-                let (&max_id, _) =
-                    devices
-                        .last_key_value()
-                        .ok_or_else(|| FfsError::Corruption {
-                            block: sb.chunk_root / u64::from(sb.sectorsize),
-                            detail: "chunk tree has no devices".to_owned(),
-                        })?;
-                Ok(encode_btrfs_fs_info_args(sb, max_id))
+                let mut own_devices = devices.values().filter(|device| device.fsid == sb.fsid);
+                let first = own_devices.next().ok_or_else(|| FfsError::Corruption {
+                    block: sb.chunk_root / u64::from(sb.sectorsize),
+                    detail: "chunk tree has no own-filesystem devices".to_owned(),
+                })?;
+                let (max_id, count) = own_devices
+                    .fold((first.devid, 1), |(max_id, count), device| {
+                        (max_id.max(device.devid), count + 1)
+                    });
+                Ok(encode_btrfs_fs_info_args(sb, max_id, count))
             }
         }
     }

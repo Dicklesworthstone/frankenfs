@@ -1047,6 +1047,14 @@ btrfs uses copy-on-write B-trees addressed by logical block addresses that must 
 
 `--btrfs-device PATH` attaches additional devices for clean, read-only btrfs mounts. A clean multi-device image uses `BtrfsDeviceSet` even without extra paths: a surviving RAID1/C3/C4 device can open alone if every committed chunk has a supported readable copy. RAID10 requires a survivor in every mirrored stripe group; RAID5/RAID6 chunks (data, metadata and system) may lack one/two stripe devices (reads are rebuilt from parity and verified), while all other profiles require all stripe devices. Nearby images are never discovered implicitly.
 
+For a seed/sprout image, mount the sprout and supply every seed image with
+`--btrfs-device`. Attached images are opened read-only at the file-descriptor
+level. An immutable seed may retain its older generation and original filesystem
+UUID; its device ID, UUID, capacity and frozen generation must match the sprout's
+committed device inventory. `FS_INFO` reports the sprout's own device list, while
+`DEV_INFO` also exposes the validated seeds. Missing seeds and colliding device
+IDs are refused; multi-device writes remain unsupported.
+
 Clean kernel-written RAID0, RAID1, RAID10, C3, C4, RAID5 and RAID6 images are tested through library FUSE mounts and the public CLI with each primary device. Required-FUSE runs pass every single-device RAID5 omission and every single- or double-device RAID6 omission for CRC32C and xxHash64 images. Parent and nested-subvolume files match actual kernel readback; encoded prefixes are checked through `FsOps`. The 2026-10-09 CLI run completed 78 mounts, 82 expected refusals and 1,248 mounted probes with no skips. Missing, duplicate and foreign devices, read-only write attempts and unsupported `--rw` requests are covered. All backing-image hashes remain unchanged across the CLI operations.
 
 The two `btrfs_cli_attached_devices_read_seeded_files*` tests require `FFS_CLI_BIN` pointing to a prebuilt CLI, its build receipt in `FFS_CLI_SOURCE_STAMP`, and an absolute `FFS_CLI_ARTIFACT_DIR` for retained images and logs. Choose a mount location permitted by the host policy, outside RCH's disposable scratch tree; `/mnt` was used for this run with the CLI's default auto-unmount behavior. `FFS_REQUIRE_FUSE=1` makes missing prerequisites fail. Evidence records the measured binary SHA-256, harness source hash, device identities, commands, exit status, errno and readback hashes. The caller-provided source stamp is labeled separately from the measured binary identity.
@@ -3319,15 +3327,28 @@ Committed CHUNK_TREE device records determine reader selection before ROOT_TREE
 traversal, including devices with no allocated chunks. A stale nonzero superblock
 count is reconciled in memory and published by the next commit; opening alone
 does not alter the image. Missing or corrupt inventories cannot authorize writes.
-Seed-device inventories and remaining read-profile qualification stay open under
-`bd-hk5w3`; the full V1 read scope is not complete.
+Explicit seed attachments can have a different filesystem UUID and an older,
+frozen generation. They open read-only and must match the sprout's committed
+device records before its metadata or file reads are exposed. `FS_INFO` counts
+the sprout's own devices; `DEV_INFO` also describes its attached seeds. Focused
+core tests cover routing, nested views, identity rejection and mutation refusal.
+On 2026-10-11, an independent strict-RCH public-CLI test passed against real
+kernel-created seed/sprout images: four kernel readbacks, two physical-owner
+readbacks, thirteen mounted file probes and five matching inventory ioctls.
+Writes returned `EROFS`, a wrong seed was refused before mounting, all image
+hashes stayed unchanged, and unmount completed without forced cleanup or skips.
+The independent CRC32C/xxHash64 profile rerun also passed: 78 successful mounts,
+82 expected refusals and 1,248 mounted probes. All 42 affected core controls
+and the actual read-only OS file-descriptor control also passed independently.
+`FEATURE_PARITY.md` records the separate source receipts and evidence.
 
 Standalone btrfs seed images remain readable, but `OpenFs` refuses write
 admission, transaction publication, mounted repair and flushing existing
 MVCC versions onto them. Neither skipped read validation nor ephemeral
 tree-log mode overrides the seed flag. Detection-only background scrub is
-available; background repair is refused before its worker starts. This does
-not provide seed/sprout attachment routing or change standalone `fsck --repair`.
+available; background repair is refused before its worker starts. Sprouts with
+attached seeds are also read-only. These mount protections do not change
+standalone `fsck --repair`.
 
 | Profile | Device-set read helper | Mounted read | Mounted write |
 |---|---|---|---|
@@ -3398,8 +3419,10 @@ and cold FUSE reads. Separate corruption tests cover metadata, ordinary/zstd
 data and NODATASUM behavior with all attachments present; they do not exhaust
 every combination of corruption and missing devices or every checksum codec.
 Use repeatable `--btrfs-device PATH` options to attach other images; no implicit
-device discovery occurs. Attachments must share
-the same committed generation and pass checksum, identity and capacity checks.
+device discovery occurs. Ordinary attachments must share the same committed
+generation and pass checksum, identity and capacity checks. Foreign-FSID seeds
+instead require the seeding flag and their committed frozen generation, as
+described above.
 Dirty tree logs and MVCC WAL replay are not yet supported for attached mounts.
 Multi-device background scrub/repair is also pending; automatic scrub reports
 that limitation and explicit requests fail instead of scanning only one image.

@@ -14,21 +14,37 @@ const DATA_B: u64 = DATA_OFFSET + 0x1E000;
 const DATASET_ROOT: u64 = DATA_OFFSET + 0x24000;
 type Reads = Arc<Mutex<Vec<(u64, usize)>>>;
 
-fn pointer(raw: &[u8], at: u64, kind: u8, level: u8, birth: u64,
-    containing: Endian, payload: Endian) -> Vec<u8> {
+fn pointer(
+    raw: &[u8],
+    at: u64,
+    kind: u8,
+    level: u8,
+    birth: u64,
+    containing: Endian,
+    payload: Endian,
+) -> Vec<u8> {
     let mut words = [0_u64; 16];
     words[0] = raw.len() as u64 / 512;
     words[1] = (at - DATA_OFFSET) / 512;
     words[6] = (raw.len() as u64 / 512 - 1)
         | ((raw.len() as u64 / 512 - 1) << 16)
-        | (2 << 32) | (7 << 40) | (u64::from(kind) << 48)
-        | (u64::from(level) << 56) | (u64::from(payload == Endian::Little) << 63);
+        | (2 << 32)
+        | (7 << 40)
+        | (u64::from(kind) << 48)
+        | (u64::from(level) << 56)
+        | (u64::from(payload == Endian::Little) << 63);
     words[10] = birth;
     words[12..].copy_from_slice(&checksum(raw, 7, payload).unwrap());
-    words.into_iter().flat_map(|word| containing.encode(word)).collect()
+    words
+        .into_iter()
+        .flat_map(|word| containing.encode(word))
+        .collect()
 }
 fn word16(raw: &mut [u8], at: usize, word: u16, order: Endian) {
-    let bytes = match order { Endian::Little => word.to_le_bytes(), Endian::Big => word.to_be_bytes() };
+    let bytes = match order {
+        Endian::Little => word.to_le_bytes(),
+        Endian::Big => word.to_be_bytes(),
+    };
     raw[at..at + 2].copy_from_slice(&bytes);
 }
 fn node(kind: u8, data_bytes: usize, levels: u8, max_block: u64, order: Endian) -> Vec<u8> {
@@ -63,7 +79,11 @@ fn micro(entries: &[(&[u8], u64)], order: Endian) -> Vec<u8> {
 /// Construct the graph directly so DMU tests isolate traversal from label
 /// admission, which has its own reader tests. This is NOT native-image proof.
 fn graph(order: Endian, case: u8, reads: Reads, failure: Option<u64>) -> (Leaf, Dnode) {
-    let other = if order == Endian::Little { Endian::Big } else { Endian::Little };
+    let other = if order == Endian::Little {
+        Endian::Big
+    } else {
+        Endian::Little
+    };
     let mut image = vec![0; BASE + LENGTH + 512];
     image[..BASE].fill(0xA5);
     image[BASE + LENGTH..].fill(0x5A);
@@ -78,23 +98,36 @@ fn graph(order: Endian, case: u8, reads: Reads, failure: Option<u64>) -> (Leaf, 
     let mut indirect = vec![0; 4096];
     let mut child = pointer(&a, DATA_A, 19, 0, 20, other, order);
     match case {
-        1 => child[48..56].copy_from_slice(&other.encode((2 << 32) | (7 << 40) | (18 << 48)
-            | (u64::from(order == Endian::Little) << 63))),
+        1 => child[48..56].copy_from_slice(&other.encode(
+            (2 << 32) | (7 << 40) | (18 << 48) | (u64::from(order == Endian::Little) << 63),
+        )),
         2 => child[80..88].copy_from_slice(&other.encode(35)),
-        3 => child[48..56].copy_from_slice(&other.encode(1 | (1 << 16) | (2 << 32) | (7 << 40) | (19 << 48)
-            | (u64::from(order == Endian::Little) << 63))),
+        3 => child[48..56].copy_from_slice(&other.encode(
+            1 | (1 << 16)
+                | (2 << 32)
+                | (7 << 40)
+                | (19 << 48)
+                | (u64::from(order == Endian::Little) << 63),
+        )),
         4 => child[96] ^= 1,
         5 => child[..8].copy_from_slice(&other.encode(1 | (1 << 32))),
-        6 => child[48..56].copy_from_slice(&other.encode((2 << 32) | (7 << 40) | (19 << 48) | (1 << 56)
-            | (u64::from(order == Endian::Little) << 63))),
-        _ => {},
+        6 => child[48..56].copy_from_slice(&other.encode(
+            (2 << 32)
+                | (7 << 40)
+                | (19 << 48)
+                | (1 << 56)
+                | (u64::from(order == Endian::Little) << 63),
+        )),
+        _ => {}
     }
     indirect[..128].copy_from_slice(&child);
     indirect[256..384].copy_from_slice(&pointer(&b, DATA_B, 19, 0, 20, other, order));
     store(INDIRECT, &indirect);
     let mut data_node = node(19, 512, 2, 31, order);
     data_node[64..192].copy_from_slice(&pointer(&indirect, INDIRECT, 19, 1, 30, order, other));
-    if case == 7 { data_node[64..192].fill(0); }
+    if case == 7 {
+        data_node[64..192].fill(0);
+    }
     // Large dnode occupies slots 7 and 8; slot 8 deliberately looks allocated.
     data_node.resize(1024, 0);
     data_node[12] = 1;
@@ -106,7 +139,9 @@ fn graph(order: Endian, case: u8, reads: Reads, failure: Option<u64>) -> (Leaf, 
     zap_node[64..192].copy_from_slice(&pointer(&zap, ZAP, 1, 0, 25, order, other));
     let mut dir_bonus = vec![0; 256];
     dir_bonus[8..16].copy_from_slice(&order.encode(3));
-    if case == 8 { dir_bonus[16..24].copy_from_slice(&order.encode(99)); }
+    if case == 8 {
+        dir_bonus[16..24].copy_from_slice(&order.encode(99));
+    }
     let dir_node = bonus(12, &dir_bonus, order);
     let mut os = vec![0; 1024];
     os[..512].copy_from_slice(&node(10, 16384, 1, 0, other));
@@ -127,28 +162,71 @@ fn graph(order: Endian, case: u8, reads: Reads, failure: Option<u64>) -> (Leaf, 
     store(TABLE, &table);
     let mut meta = node(10, 16384, 1, 0, other);
     meta[64..192].copy_from_slice(&pointer(&table, TABLE, 10, 0, 40, other, order));
-    let leaf = Leaf::from_device(&Cx::for_testing(), Box::new(Memory { image, reads, failure }), BASE as u64, LENGTH as u64).unwrap();
+    let leaf = Leaf::from_device(
+        &Cx::for_testing(),
+        Box::new(Memory {
+            image,
+            reads,
+            failure,
+        }),
+        BASE as u64,
+        LENGTH as u64,
+    )
+    .unwrap();
     (leaf, Dnode::parse(&meta, other).unwrap())
 }
 
 fn objects(leaf: &Leaf, meta: Dnode) -> Objects<'_> {
-    Objects { leaf, config: SingleLeaf { pool_guid: 123, leaf_guid: 999, version: 5000,
-        txg: 42, ashift: 9, id: 0, allocated_bytes: LENGTH as u64 - DATA_OFFSET - 2 * LABEL_BYTES,
-        read_features: Vec::new() }, txg: 43, root_birth: 42, meta, cache: VecDeque::new(), cached_bytes: 0 }
+    Objects {
+        leaf,
+        config: SingleLeaf {
+            pool_guid: 123,
+            leaf_guid: 999,
+            version: 5000,
+            txg: 42,
+            ashift: 9,
+            id: 0,
+            allocated_bytes: LENGTH as u64 - DATA_OFFSET - 2 * LABEL_BYTES,
+            read_features: Vec::new(),
+        },
+        txg: 43,
+        root_birth: 42,
+        meta,
+        cache: VecDeque::new(),
+        cached_bytes: 0,
+    }
 }
-struct Memory { image: Vec<u8>, reads: Reads, failure: Option<u64> }
+struct Memory {
+    image: Vec<u8>,
+    reads: Reads,
+    failure: Option<u64>,
+}
 impl ByteDevice for Memory {
-    fn len_bytes(&self) -> u64 { self.image.len() as u64 }
+    fn len_bytes(&self) -> u64 {
+        self.image.len() as u64
+    }
     fn read_exact_at(&self, _cx: &Cx, offset: ByteOffset, bytes: &mut [u8]) -> Result<()> {
         self.reads.lock().unwrap().push((offset.0, bytes.len()));
-        if self.failure == Some(offset.0) { return Err(FfsError::Cancelled); }
+        if self.failure == Some(offset.0) {
+            return Err(FfsError::Cancelled);
+        }
         let at = offset.0 as usize;
-        let end = at.checked_add(bytes.len()).ok_or_else(|| corrupt("test span overflow"))?;
-        bytes.copy_from_slice(self.image.get(at..end).ok_or_else(|| corrupt("short test image"))?);
+        let end = at
+            .checked_add(bytes.len())
+            .ok_or_else(|| corrupt("test span overflow"))?;
+        bytes.copy_from_slice(
+            self.image
+                .get(at..end)
+                .ok_or_else(|| corrupt("short test image"))?,
+        );
         Ok(())
     }
-    fn write_all_at(&self, _: &Cx, _: ByteOffset, _: &[u8]) -> Result<()> { panic!("DMU read wrote to image") }
-    fn sync(&self, _: &Cx) -> Result<()> { panic!("DMU read flushed image") }
+    fn write_all_at(&self, _: &Cx, _: ByteOffset, _: &[u8]) -> Result<()> {
+        panic!("DMU read wrote to image")
+    }
+    fn sync(&self, _: &Cx) -> Result<()> {
+        panic!("DMU read flushed image")
+    }
 }
 
 #[test]
@@ -169,7 +247,11 @@ fn indirect_reads_follow_each_blocks_byte_order_and_preserve_holes() {
         assert_eq!(view.read(&cx, 7, 510, 1026).unwrap(), expected);
         assert_eq!(reads.lock().unwrap().len(), count);
         assert_eq!(view.zap(&cx, 1).unwrap()[0].name, b"root_dataset");
-        assert!(reads.lock().unwrap().iter().all(|(at, size)| *at >= BASE as u64 && *at + *size as u64 <= (BASE + LENGTH) as u64));
+        assert!(
+            reads.lock().unwrap().iter().all(
+                |(at, size)| *at >= BASE as u64 && *at + *size as u64 <= (BASE + LENGTH) as u64
+            )
+        );
     }
 }
 #[test]
@@ -179,7 +261,13 @@ fn typed_birth_size_and_vdev_mismatch_refuse_before_data_reads() {
         let reads: Reads = Arc::default();
         let (leaf, meta) = graph(Endian::Little, case, Arc::clone(&reads), None);
         assert!(objects(&leaf, meta).read(&cx, 7, 0, 1).is_err(), "{case}");
-        assert!(!reads.lock().unwrap().iter().any(|(at, _)| *at == BASE as u64 + DATA_A));
+        assert!(
+            !reads
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(at, _)| *at == BASE as u64 + DATA_A)
+        );
     }
 }
 #[test]
@@ -188,9 +276,25 @@ fn checksum_and_cancellation_fail_without_successful_partial_ranges() {
     let (leaf, meta) = graph(Endian::Little, 4, Arc::default(), None);
     assert!(objects(&leaf, meta).read(&cx, 7, 0, 1536).is_err());
     let reads: Reads = Arc::default();
-    let (leaf, meta) = graph(Endian::Little, 0, Arc::clone(&reads), Some(BASE as u64 + DATA_B));
-    assert!(matches!(objects(&leaf, meta).read(&cx, 7, 0, 1536), Err(FfsError::Cancelled)));
-    assert_eq!(reads.lock().unwrap().iter().filter(|(at, _)| *at == BASE as u64 + DATA_B).count(), 1);
+    let (leaf, meta) = graph(
+        Endian::Little,
+        0,
+        Arc::clone(&reads),
+        Some(BASE as u64 + DATA_B),
+    );
+    assert!(matches!(
+        objects(&leaf, meta).read(&cx, 7, 0, 1536),
+        Err(FfsError::Cancelled)
+    ));
+    assert_eq!(
+        reads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(at, _)| *at == BASE as u64 + DATA_B)
+            .count(),
+        1
+    );
 }
 #[test]
 fn sparse_indirect_subtrees_and_invalid_ranges_do_not_read_data() {
@@ -213,9 +317,16 @@ fn dsl_inventory_verifies_head_root_and_parent_relationships() {
         let (leaf, meta) = graph(order, 0, Arc::default(), None);
         let result = objects(&leaf, meta).datasets(&cx).unwrap();
         assert_eq!(result.len(), 1);
-        assert_eq!((result[0].directory_object, result[0].dataset_object, result[0].guid), (2, 3, 987));
+        assert_eq!(
+            (
+                result[0].directory_object,
+                result[0].head_object,
+                result[0].guid
+            ),
+            (2, 3, 987)
+        );
         assert_eq!((result[0].objectset_kind, result[0].root_birth), (2, 25));
-        assert!(result[0].components.is_empty());
+        assert_eq!(result[0].components, [] as [Vec<u8>; 0]);
     }
     for case in [8, 9] {
         let (leaf, meta) = graph(Endian::Little, case, Arc::default(), None);
@@ -228,7 +339,19 @@ fn cached_block_still_requires_the_callers_type_level_and_birth() {
     let (leaf, meta) = graph(Endian::Little, 0, Arc::default(), None);
     let mut view = objects(&leaf, meta);
     view.read(&cx, 7, 0, 1).unwrap();
-    let bp = BlockPointer::parse(&pointer(&vec![b'A'; 512], DATA_A, 19, 0, 20, Endian::Little, Endian::Little), Endian::Little).unwrap();
+    let bp = BlockPointer::parse(
+        &pointer(
+            &vec![b'A'; 512],
+            DATA_A,
+            19,
+            0,
+            20,
+            Endian::Little,
+            Endian::Little,
+        ),
+        Endian::Little,
+    )
+    .unwrap();
     assert!(view.checked(&cx, &bp, 18, 0, 512, 30).is_err());
     assert!(view.checked(&cx, &bp, 19, 1, 512, 30).is_err());
     assert!(view.checked(&cx, &bp, 19, 0, 512, 19).is_err());

@@ -680,6 +680,17 @@ impl FileByteDevice {
                     .open(path.as_ref())
                     .map(|file| (file, false))
             })?;
+        Self::from_file(file, writable)
+    }
+
+    /// Open without requesting write access, even when the caller could write
+    /// the backing file. Used for immutable attached filesystem devices.
+    pub fn open_read_only(path: impl AsRef<Path>) -> Result<Self> {
+        let file = OpenOptions::new().read(true).open(path)?;
+        Self::from_file(file, false)
+    }
+
+    fn from_file(file: File, writable: bool) -> Result<Self> {
         let block_device = file.metadata()?.file_type().is_block_device();
         let len = backing_len(&file)?;
         // Declare the access pattern so the kernel sizes its read-ahead window
@@ -4676,6 +4687,32 @@ mod tests {
         if !ro.writable {
             assert!(!ro.supports_discard());
         }
+    }
+
+    #[test]
+    fn file_byte_device_explicit_read_only_handle_refuses_os_writes() {
+        use std::os::unix::fs::FileExt;
+
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().expect("tempdir").keep();
+        let path = dir.join("read-only-device.img");
+        std::fs::write(&path, b"immutable seed").expect("seed file");
+        let dev = FileByteDevice::open_read_only(&path).expect("read-only device");
+        let mut data = [0; 14];
+        dev.read_exact_at(&cx, ByteOffset(0), &mut data).unwrap();
+        assert_eq!(&data, b"immutable seed");
+        assert!(!dev.writable);
+        assert!(dev.write_all_at(&cx, ByteOffset(0), b"changed").is_err());
+        // Test the actual file descriptor, independently of ByteDevice's guard,
+        // on a writable file (also meaningful when the tests run as root).
+        assert_eq!(
+            dev.file()
+                .write_at(b"changed", 0)
+                .unwrap_err()
+                .raw_os_error(),
+            Some(nix::libc::EBADF)
+        );
+        assert_eq!(std::fs::read(path).unwrap(), b"immutable seed");
     }
 
     #[test]
