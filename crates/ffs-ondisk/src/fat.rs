@@ -481,12 +481,27 @@ struct LongName {
 pub struct FatDirectoryDecoder {
     long: Option<LongName>,
     ended: bool,
+    malformed_long_name: bool,
 }
 
 impl FatDirectoryDecoder {
     #[must_use]
     pub const fn ended(&self) -> bool {
         self.ended
+    }
+
+    /// The ordinary reader may use the short alias after a damaged LFN set.
+    /// A checker must still report that damage instead of declaring it clean.
+    #[must_use]
+    pub const fn has_malformed_long_name(&self) -> bool {
+        self.malformed_long_name
+    }
+
+    /// Finish a full directory without an end-marker slot. A pending LFN set
+    /// at the allocation boundary is an orphan, even if its ordinals are valid.
+    pub fn finish(&mut self) {
+        self.malformed_long_name |= self.long.take().is_some();
+        self.ended = true;
     }
 
     pub fn push(
@@ -498,12 +513,11 @@ impl FatDirectoryDecoder {
             return Ok(None);
         }
         if slot[0] == 0 {
-            self.ended = true;
-            self.long = None;
+            self.finish();
             return Ok(None);
         }
         if slot[0] == 0xE5 {
-            self.long = None;
+            self.malformed_long_name |= self.long.take().is_some();
             return Ok(None);
         }
         if slot[11] == 0x0F {
@@ -512,18 +526,21 @@ impl FatDirectoryDecoder {
         }
         let pending = self.long.take();
         if slot[11] & 0xC0 != 0 || slot[11] & 0x18 == 0x18 {
+            self.malformed_long_name |= pending.is_some();
             return Err(invalid(
                 "fat.directory_attributes",
                 "invalid attribute combination",
             ));
         }
         if slot[11] & 0x08 != 0 {
+            self.malformed_long_name |= pending.is_some();
             return Ok(None); // Volume label, not a file.
         }
         let mut short_name = [0_u8; 11];
         short_name.copy_from_slice(&slot[..11]);
         let long_name = pending.and_then(|long| {
             if long.next != 0 || long.checksum != short_name_checksum(&short_name) {
+                self.malformed_long_name = true;
                 return None;
             }
             let units = &long.units[..usize::from(long.slots) * 13];
@@ -533,6 +550,7 @@ impl FatDirectoryDecoder {
                 || units[..end].contains(&0xFFFF)
                 || (end < units.len() && units[end + 1..].iter().any(|u| *u != 0xFFFF))
             {
+                self.malformed_long_name = true;
                 return None;
             }
             Some(units[..end].to_vec())
@@ -567,9 +585,11 @@ impl FatDirectoryDecoder {
             || slot[27] != 0
         {
             self.long = None;
+            self.malformed_long_name = true;
             return;
         }
         if slot[0] & 0x40 != 0 {
+            self.malformed_long_name |= self.long.is_some();
             self.long = Some(LongName {
                 units: [0xFFFF; 260],
                 slots: ordinal,
@@ -578,10 +598,12 @@ impl FatDirectoryDecoder {
             });
         }
         let Some(long) = self.long.as_mut() else {
+            self.malformed_long_name = true;
             return;
         };
         if ordinal != long.next || slot[13] != long.checksum {
             self.long = None;
+            self.malformed_long_name = true;
             return;
         }
         let start = usize::from(ordinal - 1) * 13;
@@ -939,5 +961,49 @@ mod tests {
             .unwrap()
             .unwrap();
         assert!(entry.modified_timestamp().is_err());
+    }
+
+    #[test]
+    fn checker_retains_long_name_damage_without_breaking_short_alias_fallback() {
+        let sum = short_name_checksum(b"LONGFI~1TXT");
+        let valid = long(0x41, sum, &[65]);
+        let mut decoder = FatDirectoryDecoder::default();
+        decoder.push(&valid, FatKind::Fat16).unwrap();
+        assert_eq!(
+            decoder
+                .push(&short(), FatKind::Fat16)
+                .unwrap()
+                .unwrap()
+                .long_name,
+            Some(vec![65])
+        );
+        decoder.finish();
+        assert!(!decoder.has_malformed_long_name());
+
+        for ending in 0..4 {
+            let mut decoder = FatDirectoryDecoder::default();
+            decoder.push(&valid, FatKind::Fat16).unwrap();
+            match ending {
+                0 => {
+                    decoder.finish();
+                }
+                1 => {
+                    decoder.push(&[0; 32], FatKind::Fat16).unwrap();
+                }
+                2 => {
+                    let mut deleted = short();
+                    deleted[0] = 0xE5;
+                    decoder.push(&deleted, FatKind::Fat16).unwrap();
+                }
+                _ => {
+                    let mut other = short();
+                    other[..11].copy_from_slice(b"OTHER   TXT");
+                    let entry = decoder.push(&other, FatKind::Fat16).unwrap().unwrap();
+                    assert_eq!(entry.ascii_short_name().as_deref(), Some("OTHER.TXT"));
+                    assert!(entry.long_name.is_none());
+                }
+            }
+            assert!(decoder.has_malformed_long_name(), "ending {ending}");
+        }
     }
 }

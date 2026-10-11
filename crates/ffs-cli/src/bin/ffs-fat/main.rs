@@ -47,7 +47,8 @@ enum Command {
         #[command(flatten)]
         image: ImageArgs,
     },
-    /// Check allocation ownership and directory reachability without writing.
+    /// Check allocation ownership, chain sizes, directories and FAT32 hints.
+    /// Emits JSON; findings or incomplete coverage cause a nonzero exit.
     Check {
         #[command(flatten)]
         image: ImageArgs,
@@ -114,7 +115,7 @@ fn main() -> Result<()> {
             serde_json::to_writer_pretty(io::stdout().lock(), &report)?;
             println!();
             if !report.clean {
-                bail!("FAT allocation check found inconsistencies; see JSON report");
+                bail!("FAT allocation check {}; no changes were made", report.status);
             }
         }
         Command::Ls { image, path } => {
@@ -236,6 +237,13 @@ mod tests {
         };
         assert_eq!((image.offset, image.length), (1024, Some(4096)));
         assert_eq!(path, "/hello.txt");
+        assert!(matches!(
+            Cli::try_parse_from(["ffs-fat", "check", "disk.img", "--offset", "1024"])
+                .unwrap()
+                .command,
+            Command::Check { .. }
+        ));
+        assert!(Cli::try_parse_from(["ffs-fat", "check", "disk.img", "--repair"]).is_err());
         assert!(Cli::try_parse_from(["ffs-fat", "cat", "disk.img", "/hello.txt", "--rw"]).is_err());
         assert!(Cli::try_parse_from(["ffs-fat", "mount", "disk.img", "/mnt/fat"]).is_err());
         assert!(

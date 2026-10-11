@@ -129,6 +129,18 @@ class Run:
         info = json.loads(self.command(self.binary, "inspect", image))
         check(info["format"] == f"Fat{bits}", "wrong count-derived FAT dialect")
         check(info["read_only"] is True, "candidate did not declare read-only mode")
+        allocation = json.loads(self.command(self.binary, "check", image))
+        check(allocation["format"] == f"Fat{bits}", "checker selected the wrong FAT dialect")
+        check(allocation["read_only"] is True, "checker did not declare read-only mode")
+        check(allocation["status"] == "clean", "native-created FAT allocation was not clean")
+        checked = allocation
+        check(checked["complete"] is True, "candidate allocation scan was incomplete")
+        check(checked["lost_clusters"] == 0, "candidate reported lost native allocation")
+        check(checked["files"] == len(payloads), "candidate did not examine every native file")
+        check(checked["directories"] == 2, "candidate did not examine root and nested directory")
+        check(checked["free_clusters"] == info["free_clusters"], "allocation/free scans disagree")
+        check(checked["issues"] == [] and checked["omitted_issues"] == 0,
+              "clean status concealed allocation findings")
         root = json.loads(self.command(self.binary, "ls", image, "/"))
         names = {entry["name"].lower() for entry in root}
         check({"long native filename.txt", "nested", "empty.txt"} <= names, "native root names missing")

@@ -592,32 +592,15 @@ impl<'a> FatTable<'a> {
 
     fn entry(&mut self, cx: &Cx, cluster: u32) -> Result<FatEntry> {
         checkpoint(cx)?;
-        let geometry = &self.volume.geometry;
-        let sector_bytes = u64::from(geometry.sector_bytes());
         let mut previous = None;
         for copy in self.volume.copies() {
-            let position = geometry
-                .entry_offset(copy, cluster)
-                .map_err(|error| parse_error(&error))?;
-            let start = position / sector_bytes * sector_bytes;
-            let cache = &mut self.sectors[usize::from(copy)];
-            if cache.as_ref().is_none_or(|(offset, _)| *offset != start) {
-                let mut bytes = allocate(geometry.sector_bytes() as usize)?;
-                self.volume.read_exact(cx, start, &mut bytes)?;
-                *cache = Some((start, bytes));
-            }
-            let (_, bytes) = cache
-                .as_ref()
-                .ok_or_else(|| corrupt(position, "FAT sector cache was not populated"))?;
-            let at = (position - start) as usize;
-            let value = match geometry.kind() {
-                FatKind::Fat16 => u32::from(u16::from_le_bytes([bytes[at], bytes[at + 1]])),
-                FatKind::Fat32 => {
-                    u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
-                        & 0x0FFF_FFFF
-                }
-            };
+            let value = self.raw_entry(cx, copy, cluster)?;
             if previous.is_some_and(|other| other != value) {
+                let position = self
+                    .volume
+                    .geometry
+                    .entry_offset(copy, cluster)
+                    .map_err(|error| parse_error(&error))?;
                 return Err(corrupt(
                     position,
                     format!("FAT copies disagree at cluster {cluster}"),
@@ -627,7 +610,37 @@ impl<'a> FatTable<'a> {
         }
         checkpoint(cx)?;
         let value = previous.ok_or_else(|| corrupt(0, "no admitted FAT copy"))?;
-        Ok(geometry.kind().decode_entry(value))
+        Ok(self.volume.geometry.kind().decode_entry(value))
+    }
+
+    /// Read one copy without declaring it authoritative. The normal reader
+    /// requires agreement above; the checker retains disagreements as findings.
+    fn raw_entry(&mut self, cx: &Cx, copy: u8, cluster: u32) -> Result<u32> {
+        let geometry = &self.volume.geometry;
+        let sector_bytes = u64::from(geometry.sector_bytes());
+        let position = geometry
+            .entry_offset(copy, cluster)
+            .map_err(|error| parse_error(&error))?;
+        let start = position / sector_bytes * sector_bytes;
+        let cache = &mut self.sectors[usize::from(copy)];
+        if cache.as_ref().is_none_or(|(offset, _)| *offset != start) {
+            let mut bytes = allocate(geometry.sector_bytes() as usize)?;
+            self.volume.read_exact(cx, start, &mut bytes)?;
+            *cache = Some((start, bytes));
+        }
+        let (_, bytes) = cache
+            .as_ref()
+            .ok_or_else(|| corrupt(position, "FAT sector cache was not populated"))?;
+        let at = (position - start) as usize;
+        let value = match geometry.kind() {
+            FatKind::Fat16 => u32::from(u16::from_le_bytes([bytes[at], bytes[at + 1]])),
+            FatKind::Fat32 => {
+                u32::from_le_bytes([bytes[at], bytes[at + 1], bytes[at + 2], bytes[at + 3]])
+                    & 0x0FFF_FFFF
+            }
+        };
+        checkpoint(cx)?;
+        Ok(value)
     }
 
     fn next(&mut self, cx: &Cx, cluster: u32) -> Result<Option<u32>> {

@@ -25,6 +25,7 @@ fusermount3 -u /mnt/fat
 
 # Explicit byte-bounded volume inside a larger image, without partition discovery.
 target/debug/ffs-fat cat disk.img --offset 1048576 --length 67108864 /FILE.BIN
+target/debug/ffs-fat check disk.img --offset 1048576 --length 67108864
 ```
 
 All image opens are read-only. There is no write, repair, recovery, format,
@@ -80,33 +81,51 @@ MVCC/RaptorQ protection, and NTFS/ZFS implementation remain separate work.
 
 `ffs-fat check` walks the admitted directory tree and every addressable allocation
 entry, returning a JSON report. It identifies cross-linked file/directory chains,
-allocated clusters unreachable from the tree, contradictory ASCII names/aliases,
-invalid native dot/parent links, nonzero directory sizes, reserved allocation
-values and invalid successors. FAT32 FSInfo signatures and known free-count/search
-hints are checked against the admitted FAT geometry and scan. FSInfo remains
-advisory; no hint or allocation is repaired.
+live chain cycles, short file chains, allocated clusters unreachable from the
+tree, contradictory native short names and ASCII aliases, invalid native
+dot/parent links, nonzero directory sizes, misplaced dot entries, malformed or
+orphaned LFN sets, reserved allocation values and invalid successors. FAT32
+FSInfo signatures and known free-count/search hints are checked against the
+admitted FAT geometry and scan. FSInfo remains advisory; no hint or allocation
+is repaired. The normal reader may still use a short alias after malformed LFN
+records; the checker retains that damage as an issue. Ownership traversal keeps
+raw native names even when the reader's UTF-8/OEM display projection is unavailable.
 
-The report includes allocated/free/bad/preallocated cluster counts, files and
-directories visited, and the volume-relative offsets of conflicting owners.
-Reachable file preallocation is accounted for and never exposed as file contents
-or classified as lost. Bad-cluster markers are counted, without treating the
-marked media as available. If a shared directory cannot be traversed uniquely,
-`namespace_complete` is false and `lost_clusters` is null, so an incomplete walk
-cannot invent a definitive orphan count.
+The flat report retains `format`, `read_only`, `scope`, `clean`,
+`namespace_complete`, `issues` (each with `kind`), `omitted_issues`, allocation
+counts, file/directory counts, and `fs_info_free_hint`. It also reports explicit
+`status`/`complete`, volume bounds, data-cluster coverage, and reserved,
+conflicting and uniquely referenced cluster counts. Every cross-link retains
+both volume-relative owner offsets when both are ordinary entries; a null
+offset denotes the native root. No owner is selected as the rightful owner.
 
-Exit status is zero only when all scoped checks complete without issues. A
-completed scan with issues prints JSON with `clean: false` and exits unsuccessfully.
-Malformed live chains, unsupported names/geometry, mirror conflicts, I/O errors,
-cancellation and resource exhaustion return an error without a clean report.
-The checker retains normal clean-volume admission: it does not bypass dirty-state
-refusal, replay a journal, or accept a concurrently writable image.
+Reachable file preallocation, including an allocated empty file, is counted in
+`preallocated_clusters` and never exposed as file contents or classified as
+lost. Native bad-cluster markers are counted separately and become a live-chain
+error only when a file or directory references them. Unknown FSInfo hints are
+accepted. Its next-cluster value is a search hint that may already be allocated;
+only its range is checked.
 
-Checks are bounded to 8,388,608 data clusters and total claimed chain entries,
-131,072 namespace objects, 256 directory levels, 128 MiB of total directory
-allocation and 1,024 retained issues. Further issues are counted explicitly.
-These checks cover the reader's admitted namespace and allocation profile; they
-do not verify file-content integrity, all native naming rules or complete
-`fsck.fat` behavior, and do not provide a repair plan.
+The `status` is `clean`, `issues_found`, or `incomplete`; only `clean` exits
+successfully. Structural failures produce specific issues rather than a clean
+report. Mirrored disagreement never selects a preferred FAT. If a directory
+cannot be fully examined, required allocation evidence is ambiguous, or a
+traversal budget is exhausted, `complete` and `namespace_complete` are false
+and `lost_clusters` is null. Unvisited allocation is then not asserted to be
+orphaned. Cancellation, physical I/O failure, allocation failure and unsupported
+volume geometry return an error. The checker retains normal clean-volume
+admission: it does not bypass dirty-state refusal, replay a journal, or accept
+a concurrently writable image.
+
+Checks are bounded to 8,388,608 data clusters and total visited chain entries
+(including shared suffixes), 131,072 namespace objects, 256 directory levels,
+128 MiB of total directory allocation and 1,024 retained issues. The existing
+per-directory allocation limit also applies. Further issues are counted in
+`omitted_issues` without turning truncation into a clean result. Two bounded
+`u32` arrays retain FAT evidence and ownership, and shared chains also receive
+cycle detection. These checks do not verify file-content integrity, full
+OEM/Unicode collation, all native naming rules or complete `fsck.fat` behavior,
+and do not provide a repair plan.
 
 ## Executable checks and evidence limits
 
@@ -120,11 +139,16 @@ python3 scripts/verify_fat_read.py --binary target/debug/ffs-fat --mounted
 ```
 
 The external runner creates real FAT16/FAT32 images with `mkfs.fat`, seeds and
-reads them with mtools, compares binary and optional mounted reads, requires
-EROFS for mounted write-open, checks unchanged image hashes, and runs
+reads them with mtools, checks the candidate's complete allocation report against
+the known namespace and independently scanned free count, compares binary and
+optional mounted reads, requires EROFS for mounted write-open, checks unchanged
+image hashes, and runs
 `fsck.fat -n`. It retains images and command logs and fails on missing prerequisites.
 The added Rust unit tests cover independent byte layouts, error/cancellation
 propagation, malformed chains, partition bounds, LFN boundaries, FsOps and dates.
+Additional checker regressions retain raw malformed/orphaned LFN records,
+duplicate empty-file names, misplaced dot entries, incomplete namespace and FAT
+coverage, both clusters of a shared suffix, and cycles inside shared suffixes.
 
 **Initial delivery evidence:** Python syntax compilation and runner help were
 executed in the authoring environment. Rust compilation/tests, native-image
