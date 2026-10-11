@@ -6,9 +6,10 @@
 
 use super::compression::CompressedStorage;
 use super::{
-    ATTRIBUTE_LIST, COMPRESSED, Cx, DATA, FfsError, NtfsAttribute, NtfsFileRecord, NtfsGeometry,
-    NtfsReference, NtfsValue, NtfsVolume, Result, SPARSE, Source, Storage, Stream, checkpoint,
-    corrupt, decode_mapping_pairs, parse, unsupported, validate_identity,
+    ATTRIBUTE_LIST, COMPRESSED, Cx, DATA, DataStreamInfo, DataStreamMetadata, FfsError,
+    NtfsAttribute, NtfsFileRecord, NtfsGeometry, NtfsReference, NtfsValue, NtfsVolume, Result,
+    SPARSE, Source, Storage, Stream, checkpoint, corrupt, data_read_admission,
+    decode_mapping_pairs, parse, unsupported, validate_identity,
 };
 use ffs_ondisk::ntfs::attribute_list::{
     MAX_LIST_BYTES, NtfsAttributeListEntry, parse_attribute_list,
@@ -58,6 +59,50 @@ impl AttributeSet<'_> {
 }
 
 impl NtfsVolume {
+    /// Enumerate the complete DATA catalog through the base file, including
+    /// extension-only streams and one row per set of continuation attributes.
+    /// Nonresident DATA payloads are never read. Catalog corruption or
+    /// cancellation fails the whole operation; an unsupported or malformed
+    /// stream remains inspectable with a refusal instead of being omitted.
+    pub fn data_streams(&self, cx: &Cx, record: &NtfsFileRecord) -> Result<Vec<DataStreamInfo>> {
+        checkpoint(cx)?;
+        let catalog = self.attributes(cx, record)?;
+        let attributes = catalog.all()?;
+        let admission_error = data_read_admission(record, &attributes)
+            .err()
+            .map(|error| error.to_string());
+        let mut groups: BTreeMap<Vec<u16>, Vec<NtfsAttribute<'_>>> = BTreeMap::new();
+        for attribute in attributes {
+            checkpoint(cx)?;
+            if attribute.kind == DATA {
+                groups
+                    .entry(attribute.name.clone())
+                    .or_default()
+                    .push(attribute);
+            }
+        }
+        let mut result = Vec::with_capacity(groups.len());
+        for (name, extents) in groups {
+            checkpoint(cx)?;
+            let read_profile = if let Some(error) = &admission_error {
+                Err(error.clone())
+            } else if record.is_directory() && name.is_empty() {
+                Err(FfsError::IsDirectory.to_string())
+            } else {
+                Stream::from_attributes(&self.geometry, &extents)
+                    .map(|stream| DataStreamMetadata::from_stream(&stream))
+                    .map_err(|error| error.to_string())
+            };
+            result.push(DataStreamInfo {
+                name,
+                attribute_extents: extents.len(),
+                read_profile,
+            });
+        }
+        checkpoint(cx)?;
+        Ok(result)
+    }
+
     pub(super) fn attributes<'a>(
         &self,
         cx: &Cx,

@@ -90,6 +90,11 @@ enum Command {
         image: ImageArgs,
         path: String,
     },
+    /// Enumerate logical DATA streams, including streams in extension records.
+    Streams {
+        #[command(flatten)]
+        file: RecordArgs,
+    },
     /// Show the attributes and native UTF-16 stream names of an in-use MFT record.
     Record {
         #[command(flatten)]
@@ -244,6 +249,40 @@ fn main() -> Result<()> {
             out.write_all(&target)?;
             writeln!(out)?;
         }
+        Command::Streams { file } => {
+            let volume = file.image.open(&cx)?;
+            let record = volume.record(&cx, file.record, file.sequence)?;
+            let streams: Vec<_> = volume
+                .data_streams(&cx, &record)?
+                .into_iter()
+                .map(|stream| {
+                    let read_profile = match stream.read_profile {
+                        Ok(metadata) => serde_json::json!({
+                            "admitted": true,
+                            "resident": metadata.resident,
+                            "size": metadata.size,
+                            "initialized": metadata.initialized,
+                            "allocated_bytes": metadata.allocated,
+                        }),
+                        Err(error) => serde_json::json!({
+                            "admitted": false, "error": error,
+                        }),
+                    };
+                    serde_json::json!({
+                        "name": String::from_utf16(&stream.name).ok(),
+                        "name_utf16": stream.name,
+                        "attribute_extents": stream.attribute_extents,
+                        "read_profile": read_profile,
+                    })
+                })
+                .collect();
+            json(&serde_json::json!({
+                "record": record.number,
+                "sequence": record.sequence,
+                "streams": streams,
+                "scope": "complete DATA catalog; metadata admission does not verify payload bytes",
+            }))?;
+        }
         Command::Record { file } => {
             let volume = file.image.open(&cx)?;
             let record = volume.record(&cx, file.record, file.sequence)?;
@@ -373,6 +412,29 @@ mod tests {
         );
         assert!(value["data"]["substitute"].is_null());
         assert_eq!(value["data"]["print"], "x");
+    }
+
+    #[test]
+    fn cli_streams_requires_offline_image_and_preserves_record_sequence() {
+        assert!(Cli::try_parse_from(["ffs-ntfs", "streams", "disk.img", "24"]).is_err());
+        let cli = Cli::try_parse_from([
+            "ffs-ntfs",
+            "streams",
+            "disk.img",
+            "24",
+            "--offline-image",
+            "--sequence",
+            "7",
+        ])
+        .unwrap();
+        let Command::Streams { file } = cli.command else {
+            panic!("streams");
+        };
+        assert_eq!((file.record, file.sequence), (24, Some(7)));
+        assert!(
+            Cli::try_parse_from(["ffs-ntfs", "streams", "disk.img", "--offline-image"])
+                .is_err()
+        );
     }
 
     #[test]

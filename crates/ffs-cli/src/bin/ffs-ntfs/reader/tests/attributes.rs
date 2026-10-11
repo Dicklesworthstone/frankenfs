@@ -116,6 +116,262 @@ fn resident_and_nonresident_lists_assemble_fragmented_and_named_streams() {
 }
 
 #[test]
+fn data_catalog_groups_continuations_and_discovers_extension_only_streams() {
+    let cx = Cx::for_testing();
+    for nonresident in [false, true] {
+        let reads: Reads = Arc::default();
+        let volume = split_image(nonresident)
+            .open(Arc::clone(&reads), None)
+            .unwrap();
+        let record = volume.record(&cx, 25, Some(7)).unwrap();
+        reads.lock().unwrap().clear();
+        let streams = volume.data_streams(&cx, &record).unwrap();
+        assert_eq!(streams.len(), 2);
+        assert!(streams[0].name.is_empty());
+        assert_eq!(streams[0].attribute_extents, 2);
+        let unnamed = streams[0].read_profile.as_ref().unwrap();
+        assert!(!unnamed.resident);
+        assert_eq!(
+            (unnamed.size, unnamed.initialized, unnamed.allocated),
+            (600, 600, 1024)
+        );
+        assert_eq!(streams[1].name, [110, 111, 116, 101]);
+        assert_eq!(streams[1].attribute_extents, 1);
+        let named = streams[1].read_profile.as_ref().unwrap();
+        assert!(named.resident);
+        assert_eq!(named.size, b"extension resident stream".len() as u64);
+        assert_eq!(named.initialized, named.size);
+        assert_eq!(named.allocated, 0);
+        assert!(
+            reads
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(offset, _)| ![BASE as u64 + 180 * 512, BASE as u64 + 170 * 512]
+                    .contains(offset)),
+            "catalog inspection must not read file payload clusters"
+        );
+        let extension = volume.record(&cx, 27, Some(7)).unwrap();
+        assert!(matches!(
+            volume.data_streams(&cx, &extension),
+            Err(FfsError::UnsupportedFeature(_))
+        ));
+    }
+}
+
+#[test]
+fn data_catalog_retains_unreadable_streams_and_lossless_native_names() {
+    let cx = Cx::for_testing();
+    let mut image = Image::new();
+    let mut encrypted = resident(DATA, 2, "secret", b"ciphertext");
+    encrypted[12..14].copy_from_slice(&0x4000_u16.to_le_bytes());
+    let mut native_name = resident(DATA, 3, "x", b"native name");
+    native_name[24..26].copy_from_slice(&0xD800_u16.to_le_bytes());
+    image.put_record(
+        24,
+        &file_record(
+            24,
+            &[resident(DATA, 0, "", b"public"), encrypted, native_name],
+        ),
+    );
+    let volume = image.volume();
+    let record = volume.record(&cx, 24, None).unwrap();
+    let streams = volume.data_streams(&cx, &record).unwrap();
+    assert_eq!(streams.len(), 3);
+    assert!(streams[0].name.is_empty());
+    assert_eq!(streams[0].read_profile.as_ref().unwrap().size, 6);
+    assert_eq!(streams[1].name, "secret".encode_utf16().collect::<Vec<_>>());
+    assert!(streams[1].read_profile.as_ref().unwrap_err().contains("EFS"));
+    assert_eq!(streams[2].name, [0xD800]);
+    assert!(String::from_utf16(&streams[2].name).is_err());
+    assert!(streams[2].read_profile.is_ok());
+    let public = volume.data_stream(&cx, &record, &[]).unwrap();
+    assert_eq!(volume.read(&cx, &public, 0, 100).unwrap(), b"public");
+}
+
+#[test]
+fn catalog_corruption_and_extension_cancellation_never_return_partial_stream_lists() {
+    let cx = Cx::for_testing();
+    let mut image = split_image(false);
+    image.put_record(27, &extension(27, 24, &[last_extent()]));
+    let volume = image.volume();
+    let record = volume.record(&cx, 25, None).unwrap();
+    assert!(matches!(
+        volume.data_streams(&cx, &record),
+        Err(FfsError::Corruption { .. })
+    ));
+
+    let reads: Reads = Arc::default();
+    let at = Image::record_offset(27) as u64;
+    let volume = split_image(false)
+        .open(Arc::clone(&reads), Some(at))
+        .unwrap();
+    let record = volume.record(&cx, 25, None).unwrap();
+    reads.lock().unwrap().clear();
+    assert!(matches!(
+        volume.data_streams(&cx, &record),
+        Err(FfsError::Cancelled)
+    ));
+    assert_eq!(*reads.lock().unwrap(), [(at, 1024)]);
+}
+
+#[test]
+fn reparse_metadata_in_an_extension_blocks_numeric_data_but_remains_inspectable() {
+    let cx = Cx::for_testing();
+    let mut image = split_image(false);
+    let mut list = list_entry(DATA, 25, 0, 0, "");
+    list.extend(list_entry(DATA, 27, 4, 1, ""));
+    list.extend(list_entry(DATA, 27, 7, 0, "note"));
+    list.extend(list_entry(0xC0, 27, 8, 0, ""));
+    image.put_record(
+        25,
+        &file_record(25, &[resident(ATTRIBUTE_LIST, 10, "", &list), first_extent()]),
+    );
+    let mut reparse = [0; 8];
+    reparse[..4].copy_from_slice(&0x8000_0017_u32.to_le_bytes());
+    image.put_record(
+        27,
+        &extension(
+            27,
+            25,
+            &[
+                last_extent(),
+                resident(DATA, 7, "note", b"provider storage"),
+                resident(0xC0, 8, "", &reparse),
+            ],
+        ),
+    );
+    let reads: Reads = Arc::default();
+    let volume = image.open(Arc::clone(&reads), None).unwrap();
+    let record = volume.record(&cx, 25, None).unwrap();
+    reads.lock().unwrap().clear();
+    for name in [Vec::new(), "note".encode_utf16().collect()] {
+        assert!(matches!(
+            volume.data_stream(&cx, &record, &name),
+            Err(FfsError::UnsupportedFeature(_))
+        ));
+    }
+    let streams = volume.data_streams(&cx, &record).unwrap();
+    assert_eq!(streams.len(), 2);
+    assert!(streams.iter().all(|stream| {
+        stream
+            .read_profile
+            .as_ref()
+            .is_err_and(|error| error.contains("reparse"))
+    }));
+    assert!(reads.lock().unwrap().iter().all(|(offset, _)| {
+        *offset == Image::record_offset(27) as u64
+    }));
+}
+
+#[test]
+fn file_level_reparse_and_efs_flags_cannot_bypass_numeric_stream_admission() {
+    let cx = Cx::for_testing();
+    for flags in [0x400_u32, 0x4000] {
+        for external in [false, true] {
+            let mut image = Image::new();
+            let mut standard = [0; 72];
+            standard[32..36].copy_from_slice(&flags.to_le_bytes());
+            let standard = resident(0x10, 2, "", &standard);
+            let mut attributes = vec![
+                resident(DATA, 0, "", b"must not be plaintext"),
+                resident(DATA, 1, "note", b"must not be plaintext"),
+            ];
+            if external {
+                let mut list = list_entry(0x10, 27, 2, 0, "");
+                list.extend(list_entry(DATA, 24, 0, 0, ""));
+                list.extend(list_entry(DATA, 24, 1, 0, "note"));
+                attributes.push(resident(ATTRIBUTE_LIST, 10, "", &list));
+                image.put_record(27, &extension(27, 24, &[standard]));
+            } else {
+                attributes.push(standard);
+            }
+            image.put_record(24, &file_record(24, &attributes));
+            let volume = image.volume();
+            let record = volume.record(&cx, 24, None).unwrap();
+            for name in [Vec::new(), "note".encode_utf16().collect()] {
+                let result = volume.data_stream(&cx, &record, &name);
+                if flags == 0x400 {
+                    assert!(matches!(result, Err(FfsError::Corruption { .. })));
+                } else {
+                    assert!(matches!(result, Err(FfsError::UnsupportedFeature(_))));
+                }
+            }
+            let streams = volume.data_streams(&cx, &record).unwrap();
+            assert_eq!(streams.len(), 2);
+            assert!(streams.iter().all(|stream| stream.read_profile.is_err()));
+        }
+    }
+}
+
+#[test]
+fn ordinary_metadata_and_directory_encryption_defaults_preserve_readable_streams() {
+    let cx = Cx::for_testing();
+    for (directory, flags) in [
+        (false, 0_u32),
+        (false, 0x27),
+        (false, 0x200),
+        (false, 0x800),
+        (true, 0x4000),
+    ] {
+        let mut image = Image::new();
+        let mut standard = [0; 48];
+        standard[32..36].copy_from_slice(&flags.to_le_bytes());
+        let mut raw = file_record(
+            24,
+            &[
+                resident(0x10, 2, "", &standard),
+                resident(DATA, 1, "note", b"readable"),
+            ],
+        );
+        if directory {
+            raw[22..24].copy_from_slice(&3_u16.to_le_bytes());
+        }
+        image.put_record(24, &raw);
+        let volume = image.volume();
+        let record = volume.record(&cx, 24, None).unwrap();
+        let name: Vec<_> = "note".encode_utf16().collect();
+        let stream = volume.data_stream(&cx, &record, &name).unwrap();
+        assert_eq!(volume.read(&cx, &stream, 0, 100).unwrap(), b"readable");
+        let streams = volume.data_streams(&cx, &record).unwrap();
+        assert_eq!(streams.len(), 1);
+        assert!(streams[0].read_profile.is_ok());
+    }
+}
+
+#[test]
+fn malformed_standard_information_never_authorizes_data_access() {
+    let cx = Cx::for_testing();
+    for case in 0..5 {
+        let mut image = Image::new();
+        let mut standard = resident(0x10, 2, "", &[0; 72]);
+        let mut attributes = vec![resident(DATA, 0, "", b"payload")];
+        match case {
+            0 => standard = resident(0x10, 2, "", &[0; 36]),
+            1 => standard = resident(0x10, 2, "named", &[0; 72]),
+            2 => standard[12..14].copy_from_slice(&SPARSE.to_le_bytes()),
+            3 => attributes.push(resident(0x10, 3, "", &[0; 72])),
+            _ => {
+                standard = mapped(&[0x21, 1, 180, 0, 0], 1, 72, 72, 0);
+                standard[..4].copy_from_slice(&0x10_u32.to_le_bytes());
+                standard[14..16].copy_from_slice(&2_u16.to_le_bytes());
+            }
+        }
+        attributes.push(standard);
+        image.put_record(24, &file_record(24, &attributes));
+        let volume = image.volume();
+        let record = volume.record(&cx, 24, None).unwrap();
+        assert!(matches!(
+            volume.data_stream(&cx, &record, &[]),
+            Err(FfsError::Corruption { .. })
+        ));
+        let streams = volume.data_streams(&cx, &record).unwrap();
+        assert_eq!(streams.len(), 1);
+        assert!(streams[0].read_profile.is_err());
+    }
+}
+
+#[test]
 fn repeated_resident_attributes_are_preserved_but_not_selected_as_one_stream() {
     let cx = Cx::for_testing();
     let mut image = Image::new();

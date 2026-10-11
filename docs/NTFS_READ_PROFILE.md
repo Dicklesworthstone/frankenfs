@@ -25,6 +25,7 @@ ffs-ntfs read volume.img /nested/file.txt --offline-image > extracted.bin
 ffs-ntfs read volume.img /nested/file.txt --offline-image --stream note
 ffs-ntfs readlink volume.img /nested/link --offline-image
 ffs-ntfs record volume.img 24 --offline-image
+ffs-ntfs streams volume.img 24 --offline-image --sequence 7
 ffs-ntfs cat volume.img 24 --offline-image > extracted.bin
 ffs-ntfs cat volume.img 24 --offline-image --stream note > alternate.bin
 ffs-ntfs cat volume.img 24 --offline-image --sequence 7 --start 507 --bytes 1031
@@ -49,6 +50,42 @@ or an unknown provider's opaque payload. Inspecting this metadata does not grant
 DATA access. `readlink` follows intermediate supported links and retains the
 final link's own record; it emits the relative substitute target with native
 backslash separators converted to `/`.
+
+## Complete DATA stream catalog
+
+`streams` enumerates logical DATA streams through the selected base file's
+complete validated ATTRIBUTE_LIST. It discovers named streams that exist only
+in extension records and groups continuation attributes into one row per exact
+native UTF-16 name. The rows are ordered by those code units; case folding and
+lossy replacement are not used. An unnamed stream has an empty name. A name that
+cannot be represented as UTF-8 has JSON `name: null` while `name_utf16` retains
+every original code unit. Stream selection still uses the existing `--stream`
+option on `cat` or `read`.
+
+Each row reports `attribute_extents` and `read_profile`. Admitted metadata
+includes resident/nonresident storage, logical size, initialized length and
+physical allocation bytes. Resident DATA reports zero separately allocated
+bytes because its value occupies the FILE record. Unsupported storage or an
+invalid stream mapping remains visible with `admitted: false` and its refusal
+reason. The command does not omit unreadable streams from an otherwise valid
+catalog.
+
+Catalog identity corruption, an unreadable extension or cancellation fails the
+whole command before JSON is emitted. Inspection reads the catalog and FILE
+records, including their resident values, but does not read nonresident DATA
+payloads. Metadata admission therefore does not certify subsequent data I/O,
+compressed payload validity, or native provider support. The existing 4 MiB
+ATTRIBUTE_LIST, 16 MiB extension-record and 65,536 assembled-run limits apply.
+
+Numeric extraction and catalog admission share the same reparse/EFS checks and
+STANDARD_INFORMATION validation, including metadata in extensions. A reparse
+flag without its native reparse value is corrupt. STANDARD_INFORMATION remains
+optional in the numeric inspection profile; when present, it must be a unique,
+unnamed, untransformed resident value of the admitted native size. For a
+directory, the ENCRYPTED file attribute specifies the default for new children;
+an unencrypted named directory stream remains readable, while the stream's own
+ENCRYPTED storage flag still requires an EFS provider. The mounted directory
+profile retains its separate admission policy.
 
 ## Implemented data path
 
@@ -366,6 +403,25 @@ regressions plus CLI mount parsing are added, not claimed passed. They cover
 record/sequence identities, hard links/aliases, parent lookup, native names and
 times, fragmented/compressed reads, EOF, directory cookies, bitmap padding,
 write rejection, cancellation, cache reuse/eviction and root-alias refusal.
+
+## Stream catalog validation
+
+Seven added reader regressions cover resident and disk-backed catalogs,
+continuation grouping, extension-only named streams, allocation accounting,
+unsupported streams retained beside readable streams, lossless native names,
+catalog corruption, cancellation, extension-backed reparse/SI metadata,
+directory encryption defaults and malformed STANDARD_INFORMATION. A CLI
+regression covers offline-image acknowledgement, record identity and sequence
+selection. The existing numeric-provider and relative-link regressions remain
+intact.
+
+Stream-catalog delivery evidence (2026-10-11): these changes and fixtures were
+reviewed against complete GitHub source blobs, including concurrent reparse
+implementation changes. Rust compilation, the new tests, rustfmt, Clippy and
+native-image execution could not run because the executor was disconnected.
+These are authored regression cases, not passing test results or native
+interoperability evidence. Earlier validation results below describe their
+respective increments and do not validate this stream-catalog change.
 
 ## Numeric DATA provider boundary
 

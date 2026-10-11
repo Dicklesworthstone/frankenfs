@@ -183,6 +183,38 @@ impl Stream {
     }
 }
 
+/// One logical DATA stream after assembling its attribute extents. Native
+/// names remain UTF-16; inspection never replaces unrepresentable code units.
+#[derive(Debug)]
+pub struct DataStreamInfo {
+    pub name: Vec<u16>,
+    pub attribute_extents: usize,
+    /// Metadata admission is not verification of every payload byte. Refused
+    /// streams remain visible without opening their data or invoking a provider.
+    pub read_profile: std::result::Result<DataStreamMetadata, String>,
+}
+
+#[derive(Debug)]
+pub struct DataStreamMetadata {
+    pub resident: bool,
+    pub size: u64,
+    pub initialized: u64,
+    pub allocated: u64,
+}
+
+impl DataStreamMetadata {
+    fn from_stream(stream: &Stream) -> Self {
+        let resident = stream.resident();
+        Self {
+            resident,
+            size: stream.size,
+            initialized: stream.initialized,
+            // Resident values occupy their FILE record, not separate clusters.
+            allocated: if resident { 0 } else { stream.allocated },
+        }
+    }
+}
+
 pub struct NtfsVolume {
     source: Source,
     pub geometry: NtfsGeometry,
@@ -339,27 +371,7 @@ impl NtfsVolume {
         }
         let catalog = self.attributes(cx, record)?;
         let attributes = catalog.all()?;
-        // A numeric record read must enforce the same provider boundary as a
-        // pathname read. WOF/cloud placeholders may have apparently ordinary
-        // DATA containing empty or encoded bytes; those are not file contents.
-        if attributes.iter().any(|attr| attr.kind == REPARSE_POINT) {
-            return Err(unsupported(
-                "NTFS reparse DATA requires target resolution or an implemented provider",
-            ));
-        }
-        if let Some(flags) = standard_flags(&attributes)? {
-            if flags & 0x400 != 0 {
-                return Err(corrupt(
-                    0,
-                    "NTFS reparse attribute flag has no reparse value",
-                ));
-            }
-            if flags & 0x4000 != 0 {
-                return Err(unsupported(
-                    "NTFS EFS data requires an implemented key provider",
-                ));
-            }
-        }
+        data_read_admission(record, &attributes)?;
         let stream = catalog.select(&self.geometry, DATA, name)?;
         checkpoint(cx)?;
         Ok(stream)
@@ -425,6 +437,32 @@ impl NtfsVolume {
     pub fn read(&self, cx: &Cx, stream: &Stream, offset: u64, size: usize) -> Result<Vec<u8>> {
         stream.read(&self.source, &self.geometry, cx, offset, size)
     }
+}
+
+/// Extraction and stream inspection share the complete catalog's file-level
+/// admission. Unknown providers must not turn backing DATA into file contents.
+fn data_read_admission(record: &NtfsFileRecord, attributes: &[NtfsAttribute<'_>]) -> Result<()> {
+    if attributes.iter().any(|attr| attr.kind == REPARSE_POINT) {
+        return Err(unsupported(
+            "NTFS reparse DATA requires target resolution or an implemented provider",
+        ));
+    }
+    if let Some(flags) = standard_flags(attributes)? {
+        if flags & 0x400 != 0 {
+            return Err(corrupt(
+                0,
+                "NTFS reparse attribute flag has no reparse value",
+            ));
+        }
+        // On directories ENCRYPTED is the default for newly created children.
+        // A named directory stream retains its own ENCRYPTED attribute flag.
+        if flags & 0x4000 != 0 && !record.is_directory() {
+            return Err(unsupported(
+                "NTFS EFS data requires an implemented key provider",
+            ));
+        }
+    }
+    Ok(())
 }
 
 fn standard_flags(attributes: &[NtfsAttribute<'_>]) -> Result<Option<u32>> {
