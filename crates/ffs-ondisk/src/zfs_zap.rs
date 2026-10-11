@@ -388,15 +388,15 @@ impl FatHeader {
                 name.truncate(name.len() - 1);
                 let expected_hash = if self.uppercase_names {
                     if !name.is_ascii() {
-                        return Err(invalid("non-ASCII normalized ZAP keys need native Unicode tables"));
+                        return Err(invalid(
+                            "non-ASCII normalized ZAP keys need native Unicode tables",
+                        ));
                     }
                     name_hash(&name.to_ascii_uppercase(), self.salt, self.hash_bits)
                 } else {
                     name_hash(&name, self.salt, self.hash_bits)
                 };
-                if expected_hash != hash
-                    || !names.insert(name.clone())
-                {
+                if expected_hash != hash || !names.insert(name.clone()) {
                     return Err(invalid("ZAP key hash mismatch or duplicate name"));
                 }
                 let bytes = leaf.array(value_first, value_len * usize::from(width))?;

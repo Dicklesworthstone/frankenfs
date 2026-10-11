@@ -100,15 +100,18 @@ impl FileCommand {
             Self::Snapshots { candidate, dataset } => {
                 let components = dataset_components(&dataset)?;
                 let leaf = candidate.image.open(cx)?;
-                let mut pool = leaf.objects(cx, candidate.label, candidate.slot, candidate.pool_guid)?;
+                let mut pool =
+                    leaf.objects(cx, candidate.label, candidate.slot, candidate.pool_guid)?;
                 let snapshots: Vec<_> = pool.snapshots(cx, &components)?.into_iter().map(|row| {
                     serde_json::json!({"name": std::str::from_utf8(&row.name).ok(), "name_bytes": row.name,
                         "object": row.object, "guid": row.guid.to_string(), "creation_txg": row.creation_txg,
                         "creation_time": row.creation_time, "root_birth": row.root_birth,
                         "referenced_bytes": row.referenced_bytes, "flags": row.flags, "objectset_kind": row.objectset_kind})
                 }).collect();
-                return json(&serde_json::json!({"pool_guid": candidate.pool_guid.to_string(), "dataset": dataset,
-                    "txg": pool.txg, "snapshots": snapshots, "scope": "named snapshot roots in this committed pool view"}));
+                return json(
+                    &serde_json::json!({"pool_guid": candidate.pool_guid.to_string(), "dataset": dataset,
+                    "txg": pool.txg, "snapshots": snapshots, "scope": "named snapshot roots in this committed pool view"}),
+                );
             }
             Self::Ls { file } => (file, Output::List),
             Self::Stat { file } => (file, Output::Stat),
@@ -188,20 +191,52 @@ mod tests {
     use clap::Parser;
     #[test]
     fn snapshot_selection_is_separate_from_dataset_paths_and_still_requires_a_candidate() {
-        let options = ["--offline-image", "--pool-guid", "123", "--label", "0", "--slot", "2", "--dataset", "data"];
-        let parsed = Cli::try_parse_from(["ffs-zfs", "snapshots", "leaf.img"].into_iter().chain(options)).unwrap();
-        assert!(matches!(parsed.command, Command::File(FileCommand::Snapshots { .. })));
+        let options = [
+            "--offline-image",
+            "--pool-guid",
+            "123",
+            "--label",
+            "0",
+            "--slot",
+            "2",
+            "--dataset",
+            "data",
+        ];
+        let parsed = Cli::try_parse_from(
+            ["ffs-zfs", "snapshots", "leaf.img"]
+                .into_iter()
+                .chain(options),
+        )
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            Command::File(FileCommand::Snapshots { .. })
+        ));
         for command in ["ls", "stat", "read", "readlink"] {
-            let parsed = Cli::try_parse_from(["ffs-zfs", command, "leaf.img", "/file"].into_iter()
-                .chain(options).chain(["--snapshot", "before"])).unwrap();
-            let file = match parsed.command {
-                Command::File(FileCommand::Ls { file } | FileCommand::Stat { file }
-                    | FileCommand::Read { file, .. } | FileCommand::Readlink { file }) => file,
-                _ => panic!("file command"),
+            let parsed = Cli::try_parse_from(
+                ["ffs-zfs", command, "leaf.img", "/file"]
+                    .into_iter()
+                    .chain(options)
+                    .chain(["--snapshot", "before"]),
+            )
+            .unwrap();
+            let Command::File(
+                FileCommand::Ls { file }
+                | FileCommand::Stat { file }
+                | FileCommand::Read { file, .. }
+                | FileCommand::Readlink { file },
+            ) = parsed.command
+            else {
+                panic!("file command");
             };
-            assert_eq!(file.snapshot.as_deref().map(OsStrExt::as_bytes), Some(b"before".as_slice()));
+            assert_eq!(
+                file.snapshot.as_deref().map(OsStrExt::as_bytes),
+                Some(b"before".as_slice())
+            );
         }
-        assert!(Cli::try_parse_from(["ffs-zfs", "snapshots", "leaf.img", "--offline-image"]).is_err());
+        assert!(
+            Cli::try_parse_from(["ffs-zfs", "snapshots", "leaf.img", "--offline-image"]).is_err()
+        );
     }
     #[test]
     fn path_commands_retain_explicit_candidate_and_native_file_ranges() {

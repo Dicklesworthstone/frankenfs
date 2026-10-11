@@ -91,6 +91,21 @@ were added. Rust compilation/tests, rustfmt/Clippy and native ZFS execution were
 not available in the authoring environment and are not claimed. Constructed
 Rust fixtures and Python helper checks are not native filesystem conformance.
 
+Integration validation on 2026-10-11 at source
+`aa359b9c4a56d3738447e2e6a4b9a6afc38ad237` executed through RCH:
+
+```sh
+cargo test -j2 --config profile.dev.debug=0 --config profile.test.debug=0 \
+  -p ffs-cli -p ffs-ondisk --lib --bin ffs-zfs -- \
+  zfs_zap file_commands:: reader:: --nocapture --test-threads=2
+```
+
+All 33 selected CLI tests and 11 ZAP parser tests passed, with no failures or
+ignored tests; two CLI and 769 other parser tests were filtered out. This covers
+constructed snapshot lineage, historical cache isolation, cancellation, malformed
+maps and normalized names. The native ZFS runner has not been executed as part of
+this validation, so these results do not establish native filesystem conformance.
+
 Reference behavior: OpenZFS `zfs-2.3.0` `dsl_dataset.c` snapshot creation and
 origin branches, `dsl_dataset.h`, `dsl_dir.h`, `zap.c`, `zap_micro.c` and
 `u8_textprep.h`. No OpenZFS implementation code is linked or executed by reads.

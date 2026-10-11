@@ -53,8 +53,9 @@ impl Objects<'_> {
         if tag != FAT_TAG {
             return Err(corrupt("object is neither a micro-ZAP nor a fat-ZAP"));
         }
-        let header = FatHeader::parse_with_names(&block.bytes, block.order, object.node.max_block(), policy)
-            .map_err(|error| parse(&error))?;
+        let header =
+            FatHeader::parse_with_names(&block.bytes, block.order, object.node.max_block(), policy)
+                .map_err(|error| parse(&error))?;
         let table = if header.table_blocks().is_empty() {
             header
                 .embedded_table(&block.bytes, block.order)
