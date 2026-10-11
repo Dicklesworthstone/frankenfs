@@ -1,8 +1,10 @@
 //! Read DMU objects under one explicitly selected, verified MOS root.
 //! No automatic import/TXG selection, writes, replay, or ZPL file-size guesses.
 
+mod zap;
+
 use super::{BlockPointer, Cx, Endian, FfsError, Leaf, Result, SingleLeaf, checkpoint, corrupt, parse, unsupported};
-use ffs_ondisk::zfs_dmu::{DNODE_BLOCK_BYTES, DNODE_BYTES, Dnode, ObjectSet, ZapEntry, dnode_at, microzap};
+use ffs_ondisk::zfs_dmu::{DNODE_BLOCK_BYTES, DNODE_BYTES, Dnode, ObjectSet, ZapEntry, dnode_at};
 use std::collections::{BTreeSet, VecDeque};
 use std::sync::Arc;
 
@@ -159,12 +161,12 @@ impl Objects<'_> {
     }
 
     pub fn zap(&mut self, cx: &Cx, number: u64) -> Result<Vec<ZapEntry>> {
-        let object = self.load(cx, number)?;
-        if object.node.max_block() != 0 {
-            return Err(unsupported("multi-block fat-ZAP enumeration is not implemented"));
+        let mut result = Vec::new();
+        for entry in self.zap_values(cx, number)? {
+            checkpoint(cx)?;
+            let value = entry.scalar().map_err(|error| parse(&error))?;
+            result.push(ZapEntry { name: entry.name, value, collision: entry.collision });
         }
-        let block = self.data_block(cx, &object, 0)?.ok_or_else(|| corrupt("ZAP block is a hole"))?;
-        let result = microzap(&block.bytes, block.order).map_err(|error| parse(&error))?;
         checkpoint(cx)?;
         Ok(result)
     }

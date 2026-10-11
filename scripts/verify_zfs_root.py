@@ -13,6 +13,7 @@ import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import secrets
 import shutil
 import struct
@@ -44,6 +45,44 @@ def head_identities(report: dict, pool: str) -> dict[str, str]:
         require(row["objectset_kind"] == 2, "native filesystem was reported as another object-set kind")
         require(str(row["guid"]).isdecimal() and int(row["guid"]) > 0, "invalid candidate dataset GUID")
         result[name] = str(row["guid"])
+    return result
+
+
+def native_child_map(text: str, names: set[str]) -> tuple[dict[str, int], int]:
+    """Require native multi-leaf topology and exact scalar child references.
+
+    This intentionally recognizes the OpenZFS zdb textual format documented by
+    its dump_zap/dump_zap_stats implementation. Unknown output fails, not skips.
+    """
+    require(text.count("Fat ZAP stats:") == 1, "native oracle did not identify one fat-ZAP")
+    leaf_counts = re.findall(r"^\s*Leaf blocks:\s*([0-9]+)\s*$", text, re.MULTILINE)
+    entry_counts = re.findall(r"^\s*ZAP entries:\s*([0-9]+)\s*$", text, re.MULTILINE)
+    require(len(leaf_counts) == 1 and int(leaf_counts[0]) > 1,
+            "native fixture is not a multi-leaf fat-ZAP; no substitute coverage")
+    require(len(entry_counts) == 1 and int(entry_counts[0]) == len(names),
+            "native fat-ZAP entry count differs from the seeded children")
+    result = {}
+    for name, value in re.findall(r"^[ \t]*([^=\r\n]+?)[ \t]*=[ \t]*([0-9]+)[ \t]*$", text, re.MULTILINE):
+        require(name not in result and name in names, "duplicate or unexpected native ZAP name")
+        require(0 < int(value) < 1 << 48, "native child reference is out of range")
+        result[name] = int(value)
+    require(set(result) == names, "native fat-ZAP dump did not supply every child reference")
+    return result, int(leaf_counts[0])
+
+
+def candidate_child_map(report: dict) -> dict[str, int]:
+    result = {}
+    for entry in report["entries"]:
+        name = entry["name"]
+        require(isinstance(name, str) and list(name.encode("utf-8")) == entry["name_bytes"],
+                "candidate altered the native child-name bytes")
+        require(name not in result, "candidate returned a duplicate ZAP key")
+        values = entry["values"]
+        require(type(entry["integer_bytes"]) is int and entry["integer_bytes"] == 8
+                and isinstance(values, list) and len(values) == 1
+                and type(values[0]) is int and 0 < values[0] < 1 << 48,
+                "candidate child value is not exactly one native uint64 reference")
+        result[name] = values[0]
     return result
 
 
@@ -95,13 +134,21 @@ def main() -> None:
                 require(guid.isdecimal() and int(guid) > 0, "native pool GUID was not a decimal identity")
                 command("zfs", "create", "-o", "mountpoint=none", pool + "/data")
                 command("zfs", "create", "-o", "mountpoint=none", pool + "/data/nested")
+                # Names larger than a micro-ZAP slot force a real fat-ZAP;
+                # enough native entries force multiple default-sized leaves.
+                children = {"nested"}
+                for index in range(128):
+                    child = f"child_{index:03d}_" + "long_native_name_" * 5
+                    command("zfs", "create", "-o", "mountpoint=none", pool + "/data/" + child)
+                    children.add(child)
                 native_heads = {}
                 rows = command("zfs", "list", "-H", "-r", "-t", "filesystem,volume", "-o", "name,guid", pool)
                 for row in rows.decode("utf-8", errors="strict").splitlines():
                     name, identity = row.split("\t")
                     require(name not in native_heads and identity.isdecimal(), "invalid native dataset identity listing")
                     native_heads[name] = identity
-                require(set(native_heads) == {pool, pool + "/data", pool + "/data/nested"}, "native dataset fixture incomplete")
+                require(set(native_heads) == {pool, pool + "/data"} | {pool + "/data/" + child for child in children},
+                        "native dataset fixture incomplete")
                 command("zpool", "export", pool)
                 active = False
                 before = digest(image)
@@ -138,6 +185,22 @@ def main() -> None:
                                            "--slot", str(slot), "--pool-guid", guid))
                 require(head_identities(heads, pool) == native_heads, "candidate DSL names/GUIDs differ from native zfs list")
                 require(heads["txg"] == selected["txg"], "candidate DSL view changed the selected TXG")
+                data_dir = next(row["directory_object"] for row in heads["datasets"] if row["relative_name"] == "data")
+                dnode = json.loads(command(binary, "object", image, str(data_dir), "--offline-image",
+                                          "--label", "0", "--slot", str(slot), "--pool-guid", guid))
+                require(dnode["bonus_type"] == 12 and len(dnode["bonus"]) == 256,
+                        "candidate returned an invalid DSL directory bonus")
+                require(dnode["byte_order"] in ("Little", "Big"), "unknown DSL directory byte order")
+                child_object = int.from_bytes(bytes(dnode["bonus"])[32:40], dnode["byte_order"].lower())
+                require(0 < child_object < 1 << 48, "missing or invalid native DSL child map")
+                # Pool (no trailing slash) selects the MOS in native zdb. The
+                # candidate nominates an object ID; zdb independently verifies
+                # its topology and every native name -> object-number mapping.
+                native_dump = command("zdb", "-e", "-p", directory, "-dddd", pool, str(child_object))
+                native_map, native_leaves = native_child_map(native_dump.decode("utf-8", errors="strict"), children)
+                mapping = json.loads(command(binary, "zap", image, str(child_object), "--offline-image",
+                                             "--label", "0", "--slot", str(slot), "--pool-guid", guid))
+                require(candidate_child_map(mapping) == native_map, "candidate fat-ZAP differs from native zdb")
                 require(digest(image) == before, "read verification changed the exported image")
                 partitioned = directory / "partitioned.img"
                 with partitioned.open("xb") as target, image.open("rb") as source:
@@ -151,10 +214,16 @@ def main() -> None:
                 heads = json.loads(command(binary, "datasets", partitioned, "--offline-image", "--offset", "1048576",
                                            "--length", str(image.stat().st_size), "--label", "0", "--slot", str(slot), "--pool-guid", guid))
                 require(head_identities(heads, pool) == native_heads, "partition base changed DSL identities")
+                mapping = json.loads(command(binary, "zap", partitioned, str(child_object), "--offline-image",
+                                             "--offset", "1048576", "--length", str(image.stat().st_size),
+                                             "--label", "0", "--slot", str(slot), "--pool-guid", guid))
+                require(candidate_child_map(mapping) == native_map, "partition base changed native fat-ZAP values")
                 require(digest(partitioned) == partition_hash, "candidate changed selected or adjacent partition bytes")
                 scenario = {"ashift": ashift, "pool_guid": guid, "slot": slot, "txg": selected["txg"],
                             "root_sha256": hashlib.sha256(expected).hexdigest(), "image_sha256": before,
-                            "partitioned_sha256": partition_hash, "datasets": native_heads, "status": "passed"}
+                            "partitioned_sha256": partition_hash, "datasets": native_heads,
+                            "fat_zap_object": child_object, "fat_zap_native_leaves": native_leaves,
+                            "fat_zap_children": len(native_map), "status": "passed"}
                 report["scenarios"].append(scenario)
                 print(json.dumps(scenario), flush=True)
             finally:

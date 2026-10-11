@@ -89,7 +89,7 @@ enum Command {
         #[arg(long)]
         bytes: usize,
     },
-    /// Enumerate a complete micro-ZAP object; unsupported fat-ZAPs are errors.
+    /// Enumerate complete micro/fat-ZAP string keys and typed integer arrays.
     Zap {
         #[command(flatten)]
         candidate: CandidateArgs,
@@ -201,9 +201,9 @@ fn main() -> Result<()> {
         Command::Zap { candidate, number } => {
             let leaf = candidate.image.open(&cx)?;
             let mut view = leaf.objects(&cx, candidate.label, candidate.slot, candidate.pool_guid)?;
-            let entries: Vec<_> = view.zap(&cx, number)?.into_iter().map(|entry| serde_json::json!({
+            let entries: Vec<_> = view.zap_values(&cx, number)?.into_iter().map(|entry| serde_json::json!({
                 "name": std::str::from_utf8(&entry.name).ok(), "name_bytes": entry.name,
-                "value": entry.value, "collision": entry.collision
+                "integer_bytes": entry.integer_bytes, "values": entry.values, "collision": entry.collision
             })).collect();
             json(&serde_json::json!({"object": number, "txg": view.txg, "entries": entries}))?;
         }

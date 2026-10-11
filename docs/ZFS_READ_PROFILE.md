@@ -88,8 +88,10 @@ is claimed without executed measurements.
 `object` reports a dnode and raw bonus bytes. `object-read` requires an explicit
 byte count of at most 16 MiB and rejects ranges beyond dn_maxblkid geometry.
 It does not mistake allocation capacity or bonus data for a ZPL file's EOF.
-`zap` enumerates complete, unnormalized micro-ZAPs, preserving raw name bytes;
-fat-ZAPs, duplicate keys and unterminated names are errors, not empty maps.
+`zap` enumerates complete, unnormalized micro/fat-ZAPs, preserving raw name bytes
+and typed values. JSON reports `integer_bytes` and a `values` array; an empty
+array is distinct from a scalar zero. DSL references require exactly one native
+8-byte integer and never silently cast a byte string or array into an object ID.
 
 `datasets` follows the pool directory's root_dataset, DSL child maps, directory
 bonus records and head dataset bonus records. It checks parent/backreferences,
@@ -105,6 +107,37 @@ path bytes. A corrupt or unsupported reached map fails the entire inventory;
 there is no partial-success list. DSL directory/dataset bonus layouts must be
 256/320 bytes; extensified ZAP-typed dnodes are recognized, but their extra
 properties and full feature obligations are not interpreted by this inventory.
+
+## Native fat-ZAP traversal
+
+The `ffs-ondisk::zfs_zap` parser handles embedded and external pointer tables,
+leaf prefix intervals, hash buckets, entry chains, chunked names, typed values
+and the free-chunk list. DMU traversal supplies checksum-verified blocks in each
+block's own byte order. Integer-array payloads retain their native big-endian
+encoding independent of the leaf header; widths 1, 2, 4 and 8 are supported.
+
+Each leaf must own one contiguous, aligned power-of-two pointer-table interval.
+Its prefix and every entry's salted CRC64 hash must match that routing. Both
+28-bit and HASH64/48-bit string-key hashes are supported. Entries, name/value
+arrays and free chunks cannot share chunks or form cycles. Counts and all chunk
+ownership must agree; orphan chunks, duplicate keys, unterminated names and
+missing metadata blocks are errors, never partially successful maps.
+
+During incremental external-table growth the old table remains authoritative.
+Every completed block pair in the growing copy is compared with the duplicated
+old pointers. Uncopied reserved blocks are not treated as initialized data.
+Leaf references cannot alias either pointer-table region. No table is changed,
+finished or repaired by a read. Normalized and binary/pre-hashed key layouts
+remain refused; string-key enumeration is not full naming-policy support.
+
+Per-map bounds are 512..128 KiB power-of-two blocks, 1,048,576 table pointers,
+4,096 leaves and 65,536 entries. Names are capped at 4 KiB including NUL; a value
+array is capped at 64 KiB before widening its integers. Enumeration charges at
+most 64 MiB of ZAP data-block work, including cached accesses; DMU indirect
+reads are separate. Returned entries and duplicate-name payload accounting are
+capped at 16 MiB. These are not total-process or physical-I/O memory limits:
+temporary leaf/table buffers, allocator bookkeeping and view caches also exist.
+The entire admitted map is validated before it is returned to CLI or DSL code.
 
 ## Explicit admission limits
 
@@ -124,7 +157,7 @@ The selected uberblock cannot predate label configuration. Fork/history
 resolution, rewind, active/MMP ownership and multi-vdev import remain separate
 work. Gang, embedded and encrypted/authenticated blocks remain unsupported;
 context-sized holes are handled only in the DMU traversal, not root extraction.
-RAIDZ/mirror topologies, indirect vdevs, fat-ZAP, ZPL/SA file interpretation,
+RAIDZ/mirror topologies, indirect vdevs, normalized/binary ZAP keys, ZPL/SA file interpretation,
 snapshot reads, security, native writes, maintenance and MVCC/RaptorQ integration
 remain incomplete. Dataset inventory is not a full ZFS-support claim.
 
@@ -150,6 +183,16 @@ a bounded partition, with whole-image hashes checked. Candidate selection on
 this fresh fixture is not a FrankenFS import algorithm. Missing tools, layout
 refusal and disagreement fail instead of earning skipped-test credit.
 
+The fat-ZAP workload adds 128 long-named children beneath `data`, alongside the
+existing `nested` child. Native `zdb` must independently identify a fat-ZAP with
+more than one leaf and exactly 129 child references. Candidate typed values and
+name bytes must match every native reference, and the entire DSL names/GUIDs
+comparison still runs. Both the child map and dataset inventory are repeated in
+the bounded partition with the original root/hash checks retained. A small-map
+substitute, unknown zdb output, missing tools or native disagreement fails.
+This runner does not manufacture external/growing pointer tables, mixed endian
+blocks or corrupt chains; those remain constructed Rust test coverage.
+
 Initial block-pipeline evidence included fixed Python SHA256 vectors, independent
 liblz4 vectors, and Python runner syntax/help checks, not Rust/native execution.
 For this DMU increment, six parser, six graph/traversal and one CLI regression
@@ -164,6 +207,16 @@ and no ZFS kernel/tools are present here. Compilation, Rust tests, rustfmt/Clipp
 native comparisons and mounted behavior are NOT claimed. Existing test assertions
 and root-verification gates are retained; new coverage is not a passing result.
 
+Fat-ZAP authoring evidence: seven parser and five DMU regression functions were
+added, including typed arrays, empty values, cross-chunk names, external/growing
+tables, mixed-endian blocks, DSL consumption, corruption and cancellation. Fixed
+hash vectors were calculated separately with Python. Runner syntax compilation,
+`--help`, two positive and seventeen negative constructed Python helper checks,
+and changed-file whitespace checks passed. Rust compilation/tests, rustfmt/Clippy
+and native ZFS execution remain unexecuted here. Helper checks do not execute the
+Rust parser or a filesystem and do not certify native interchange.
+
 Reference: OpenZFS tag zfs-2.3.0, especially spa.h, vdev_impl.h,
 uberblock_impl.h, dnode.h, dmu_objset.h, zap_impl.h, dsl_dir.h, dsl_dataset.h,
-nvpair.c, zio_checksum.c, sha2_zfs.c, lzjb.c and lz4_zfs.c.
+zap_leaf.h, zap_leaf.c, zap_micro.c, nvpair.c, zio_checksum.c, sha2_zfs.c,
+lzjb.c and lz4_zfs.c.
