@@ -47,6 +47,11 @@ enum Command {
         #[command(flatten)]
         image: ImageArgs,
     },
+    /// Check allocation ownership and directory reachability without writing.
+    Check {
+        #[command(flatten)]
+        image: ImageArgs,
+    },
     /// List a directory as JSON, preserving safely representable native names.
     Ls {
         #[command(flatten)]
@@ -103,6 +108,14 @@ fn main() -> Result<()> {
             });
             serde_json::to_writer_pretty(io::stdout().lock(), &report)?;
             println!();
+        }
+        Command::Check { image } => {
+            let report = image.open(&cx)?.check(&cx)?;
+            serde_json::to_writer_pretty(io::stdout().lock(), &report)?;
+            println!();
+            if !report.clean {
+                bail!("FAT allocation check found inconsistencies; see JSON report");
+            }
         }
         Command::Ls { image, path } => {
             let volume = image.open(&cx)?;
@@ -183,6 +196,27 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn check_accepts_a_bounded_volume_and_refuses_repair_options() {
+        let cli = Cli::try_parse_from([
+            "ffs-fat",
+            "check",
+            "disk.img",
+            "--offset",
+            "1024",
+            "--length",
+            "4096",
+        ])
+        .unwrap();
+        let Command::Check { image } = cli.command else {
+            panic!("expected check");
+        };
+        assert_eq!((image.offset, image.length), (1024, Some(4096)));
+        for option in ["--repair", "--rw"] {
+            assert!(Cli::try_parse_from(["ffs-fat", "check", "disk.img", option]).is_err());
+        }
+    }
 
     #[test]
     fn clap_accepts_explicit_ranges_and_has_no_write_switch() {

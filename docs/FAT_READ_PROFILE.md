@@ -14,6 +14,7 @@ Build `ffs-fat` with the repository's prescribed Cargo/RCH workflow:
 rch exec -- cargo build -p ffs-cli --bin ffs-fat
 
 target/debug/ffs-fat inspect volume.img
+target/debug/ffs-fat check volume.img
 target/debug/ffs-fat ls volume.img /nested
 target/debug/ffs-fat cat volume.img '/Long native filename.txt' > extracted.bin
 
@@ -70,6 +71,38 @@ native investigation; this reader never repairs them automatically.
 FAT12, exFAT, FAT writes/recovery, complete OEM/Unicode naming parity, integrated
 MVCC/RaptorQ protection, and NTFS/ZFS implementation remain separate work.
 
+## Read-only allocation check
+
+`ffs-fat check` walks the admitted directory tree and every addressable allocation
+entry, returning a JSON report. It identifies cross-linked file/directory chains,
+allocated clusters unreachable from the tree, contradictory ASCII names/aliases,
+invalid native dot/parent links, nonzero directory sizes, reserved allocation
+values and invalid successors. FAT32 FSInfo signatures and known free-count/search
+hints are checked against the admitted FAT geometry and scan. FSInfo remains
+advisory; no hint or allocation is repaired.
+
+The report includes allocated/free/bad/preallocated cluster counts, files and
+directories visited, and the volume-relative offsets of conflicting owners.
+Reachable file preallocation is accounted for and never exposed as file contents
+or classified as lost. Bad-cluster markers are counted, without treating the
+marked media as available. If a shared directory cannot be traversed uniquely,
+`namespace_complete` is false and `lost_clusters` is null, so an incomplete walk
+cannot invent a definitive orphan count.
+
+Exit status is zero only when all scoped checks complete without issues. A
+completed scan with issues prints JSON with `clean: false` and exits unsuccessfully.
+Malformed live chains, unsupported names/geometry, mirror conflicts, I/O errors,
+cancellation and resource exhaustion return an error without a clean report.
+The checker retains normal clean-volume admission: it does not bypass dirty-state
+refusal, replay a journal, or accept a concurrently writable image.
+
+Checks are bounded to 8,388,608 data clusters and total claimed chain entries,
+131,072 namespace objects, 256 directory levels, 128 MiB of total directory
+allocation and 1,024 retained issues. Further issues are counted explicitly.
+These checks cover the reader's admitted namespace and allocation profile; they
+do not verify file-content integrity, all native naming rules or complete
+`fsck.fat` behavior, and do not provide a repair plan.
+
 ## Executable checks and evidence limits
 
 ```sh
@@ -102,3 +135,12 @@ control rejects any physical read of unused tail data while preserving the visib
 listing. These added tests have not been executed in this editing session: the
 shared executor disconnected before compilation, and offline Cargo resolution
 also lacked required dependencies. Source review is not native or mounted proof.
+
+**Allocation-check regression coverage:** nine reader tests plus CLI argument
+coverage exercise both dialects, clean counts without payload reads, preallocation,
+bad/lost/shared clusters, directory aliases and ancestor cycles, parent/name/size
+inconsistencies, FSInfo hints, cancelled/mismatched FAT scans, bounded issue output
+and unchanged image/adjacent-volume bytes. These are authored, source-reviewed
+tests, not executed evidence: the editing executor is offline, and the most recent
+available Actions execution stopped at its action-owner policy before checkout.
+Rust compilation, formatting, Clippy and native-image validation remain required.

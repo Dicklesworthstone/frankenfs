@@ -4,6 +4,8 @@
 //! cooperating exclusive users, not kernel mounts or unrelated writers. No
 //! method in this module writes, replays, repairs, or marks an image dirty.
 
+mod check;
+
 use asupersync::Cx;
 use ffs_block::ByteDevice;
 use ffs_error::{FfsError, Result};

@@ -174,7 +174,7 @@ To avoid wasted reading, here is what this project is explicitly **not** trying 
 - **Not a drop-in replacement for `mount -t ext4`.** Mount the same images; observe semantically equivalent behavior; but the userspace path adds FUSE round-trip latency.
 - **Not production-ready for irreplaceable data.** The tracked V1 feature denominator is complete according to `ParityReport::current()`, but the operational readiness lanes (xfstests, swarm.responsiveness, performance.baseline, soak/canary) are mid-evidence. Use this on data you can lose.
 - **Not a loose parser experiment.** Parsers are fixture-pinned, kernel-differential-validated, and metamorphic-relation-proptested. The aim is fidelity to the documented V1 surface.
-- **Not a multi-filesystem framework.** ext4 and btrfs are V1; XFS, ZFS, NTFS, etc. are out of scope. The structured-concurrency + repair-symbol architecture could generalize, but each format requires its own behavioral extraction effort and is not part of this roadmap.
+- **Experimental additional filesystems.** ext4 and btrfs remain the V1 core. Separate read-only companion binaries now cover [FAT16/FAT32](docs/FAT_READ_PROFILE.md) (`ffs-fat`, including allocation checks), [NTFS](docs/NTFS_READ_PROFILE.md) (`ffs-ntfs`), and [ZFS](docs/ZFS_READ_PROFILE.md) (`ffs-zfs`) within their documented admission limits. Their [comprehensive implementation plan](COMPREHENSIVE_PLAN_FOR_NTFS_FAT16_FAT32_AND_ZFS.md) is distinct from V1 parity; they do not yet provide generic `OpenFs` integration or native writes/recovery.
 - **Not a tokio project.** A CI dependency scan fails the build if `Cargo.lock` contains `tokio`, `hyper`, `reqwest`, `axum`, `tower`, `async-std`, `smol` or related packages; asupersync is the runtime.
 
 ---

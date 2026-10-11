@@ -586,4 +586,5 @@ fn directory_tail_validation_propagates_cancellation_before_publishing_names() {
     }
 }
 
+mod check;
 mod filesystem;
