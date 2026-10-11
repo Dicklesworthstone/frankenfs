@@ -139,8 +139,30 @@
 > refresh lifecycles, and failed/cancelled refresh batches preserve pending work.
 > Scrub no longer regenerates symbols from detected corruption or recovers from
 > known-dirty groups. Full-device reports retain findings outside repair coverage.
-> These tested fixes do not establish default repair, reserved native storage,
-> or mounted restart freshness; `bd-11a8t` / `bd-j7a4e` remain incomplete.
+> These on-image pipeline fixes do not establish default repair, reserved native
+> storage, or mounted restart freshness; `bd-11a8t` / `bd-j7a4e` remain incomplete.
+>
+> **Compatibility repair (`bd-7zjfh`, verified 2026-10-11):** FFSRQSC2 sidecars
+> are the compatibility-mode repair substrate, exposed through the explicit
+> `ffs-protected-mount` binary. Native mode retains the allocator-owned,
+> per-group on-image target in `bd-11a8t`. Both production-CLI FUSE tests,
+> `protected_sidecar_cli_ext4_corruption_restart_bd_7zjfh` and
+> `protected_sidecar_cli_btrfs_corruption_restart_bd_7zjfh`, passed through RCH
+> at `c85b828c934e654e8d486a03fc6d3463d2aa476a`: two passed, none failed or
+> ignored, with FUSE and filesystem oracles required. Each repairs a cold
+> post-admission fault to exact payload and whole-image bytes, checks read-only
+> refusal, verifies and remounts an independent image/archive pair captured
+> immediately after fsync, then repairs newly written bytes after clean restart.
+> Startup mismatch returns exit 4 without altering either file. All successful
+> mounts exit normally without forced or lazy cleanup, and all independent
+> `e2fsck -f -n` / `btrfs check --readonly` checks pass. Journalled ext4 now
+> attaches its internal writer and syncs JBD2 cleanup before acknowledging fsync;
+> two protected CLI and four core journal controls passed separately at
+> `044077a2622ccf0137a19937fcd55eb9f4d4907c`. The mounted log is
+> `/tmp/ffs-chartreusestone-resume21-7zjfh-mounted.log`, SHA256
+> `ff5173a06b609728d38e21a90bf012a35946be7cf47bdef2834b3c4ef67a6a29`.
+> This proves explicit single-image sidecar mounts, not default self-healing,
+> native ownership, multi-device repair or recovery from an unfinished epoch.
 >
 > **Repair-tail safety (`bd-plamw`, verified 2026-10-11):** complete requested
 > symbol/descriptor plans now fail closed before their first write. Explicit
@@ -169,7 +191,9 @@
 > none failed or ignored). Independent Agent Mail review 1608 records source
 > provenance, hashes and earlier failed fixture runs; no assertion was relaxed.
 > This is an interim interlock: repair tails are still not allocator-reserved,
-> read-write mounted repair remains refused, and native storage is still required.
+> ordinary on-image read-write mounted repair remains refused, and native storage
+> is still required. Explicit compatibility sidecar mounts use the separate path
+> described above.
 >
 > **Btrfs fsync update:** full transaction commits now flush committed MVCC
 > file data before publishing extent metadata and checksums. A real non-inline
@@ -320,12 +344,10 @@ identity/role corruptions and inherited-handle revalidation. At source receipt
 seed, RAID, nested-view and Single/DUP cohort passed 42 tests with no failures or
 ignored tests through RCH. Workspace/all-targets Clippy with `-D warnings` also
 passed at that receipt. These are unit and compiler results, not mounted proof.
-The new `btrfs_cli_seed_sprout_reads_kernel_generated_files` test, the explicit
-OS read-only descriptor test and the fresh two-checksum CLI profile rerun remain
-pending. The exact-source CLI build passed; independent runtime verification is
-in progress through RCH.
-`bd-hk5w3` and `bd-mjxxk` remain unfinished; earlier mounted evidence below keeps
-its original source and scope.
+The independent mounted seed/sprout test, OS read-only descriptor control and
+two-checksum CLI profile rerun subsequently passed as recorded below;
+`bd-hk5w3` and `bd-mjxxk` are closed on that executed evidence. Each result
+retains its original source and scope.
 
 Standalone btrfs seed protection has unit coverage in
 `ffs-core::tests::btrfs_enable_writes_preserves_read_only_seed_devices` and

@@ -34,7 +34,7 @@ This section records *current* (not historical) drift between this spec and the 
 - **Missing normative traits (integration points):** Spec §8/§9/§14 define normative traits (repair manager, scrub progress, semantics ops) that are not yet fully present as explicit contracts in code (`crates/ffs-repair` now ships scrub/recovery pipelines and evidence wiring, and `crates/ffs-fuse` ships production mount scaffolding). Resolution: promote the remaining behavior to explicit trait contracts in the owning crates without creating dependency cycles, then migrate call sites to those contracts. Tracks: `bd-2l4`, `bd-3bf`, `bd-hv6`.
 - **Engine terminology drift:** This spec frequently uses `FrankenFsEngine` as the orchestration name. In current code, the active FUSE runtime path is `ffs-fuse -> ffs-core::FsOps` (currently `OpenFs`). Treat `FrankenFsEngine` mentions as conceptual/utility naming unless a section explicitly requires that concrete type. Track: `bd-vyt6`.
 - **Tracked parity vs runtime readiness:** `FEATURE_PARITY.md` now reports 97/97 tracked V1 rows complete. That is a denominator-scoped feature claim, not a production-readiness claim. Reality-check bridge items outside the parity denominator are tracked by `bd-rchk1` through `bd-rchk7` (docs/status, `DISC-004`, xfstests baseline, mounted FUSE CI, performance baselines, mounted self-healing lifecycle, and fuzz/conformance expansion).
-- **Mounted self-healing current behavior:** Sections that describe transparent online RaptorQ recovery are implemented for explicit mounted repair mode. The current V1.x mounted runtime starts detection-only scrub for default read-only mounts, leaves read-write background scrub disabled unless requested, and treats `--background-repair --background-scrub-ledger <jsonl>` as the opt-in authority to repair blocks and refresh repair symbols with durable evidence. Read-write mounted repair now routes recovered source blocks through the mounted MVCC repair-writeback serializer before symbol refresh and keeps kernel FUSE writeback-cache mode disabled.
+- **Mounted self-healing current behavior:** Ordinary mounts default to detection-only scrub for read-only access and disable read-write scrub unless requested. Explicit on-image repair requires `--background-repair --background-scrub-ledger <jsonl>` and safe tail admission; read-write on-image repair is refused until permanent allocator ownership exists. The separate `ffs-protected-mount` entry point supplies explicit compatibility-mode repair through a sidecar-backed device. Neither entry point satisfies the complete default/native lifecycle target in `bd-11a8t`.
 
 ### 0.1.2 Audit Checklist (Mechanical)
 
@@ -111,7 +111,7 @@ Type definitions and trait signatures in code blocks are normative unless labele
 
 RaptorQ is not optional. It is the **default substrate for block durability**:
 
-1. **Per-block-group repair symbols.** Every block group reserves `ceil(blocks_per_group * repair_ratio)` blocks (default 5%) for systematic RaptorQ parity. Marked allocated in bitmap, excluded from regular allocation.
+1. **Per-group repair symbols.** Native mode reserves `ceil(blocks_per_group * repair_ratio)` blocks (default 5%) per filesystem allocation group, with persistent ownership that excludes regular allocation. Compatibility mode stores protection groups in an external versioned sidecar, without repurposing filesystem blocks (§3.7).
 
 2. **Automatic corruption detection.** Background scrub reads all blocks, verifies checksums (CRC32C for ext4-compat metadata, BLAKE3 for native data), flags mismatches.
 
@@ -127,10 +127,13 @@ A block write that never triggers repair symbol refresh for its group is a spec-
 > write-side repair operations, and the mounted background scrub path can run
 > the same recovery/writeback pipeline when explicitly started with
 > `--background-repair --background-scrub-ledger <jsonl>`. Default read-only
-> mounts remain detection-only, read-write mounts require explicit scrub/repair
-> opt-in, and read-write mounted repair routes recovered source blocks through
-> the mounted MVCC repair-writeback serializer before repair-symbol refresh.
-> The normative V1.x fail-closed contract is data-backed in
+> mounts remain detection-only and read-write mounts require explicit scrub
+> opt-in. The implemented read-write recovery serializer is not activated by
+> the ordinary CLI. Read-write on-image activation is currently refused: a
+> mounted serializer does not reserve symbol storage from future file allocations. Explicit
+> compatibility-mode recovery is provided separately by `ffs-protected-mount`
+> through `SidecarImageDevice`; ordinary mount defaults are unchanged.
+> The V1.x source-write serialization contract is data-backed in
 > `docs/repair-writeback-serialization-contract.json` and validated by
 > `ffs-harness validate-repair-writeback-serialization`; direct repair
 > writeback that bypasses the mounted mutation authority remains rejected with
@@ -590,15 +593,49 @@ All other crates MUST NOT depend on `ffs-repair` or import RaptorQ types.
 
 #### 3.7.1 On-Disk Layout
 
-Repair symbols occupy **dedicated blocks at the end of each block group**:
+In native mode, repair symbols occupy **dedicated blocks at the end of each
+filesystem allocation group**:
 
 ```
 repair_block_count = ceil(data_block_count * (overhead_ratio - 1.0))
 ```
 
-For 5% overhead on a 32,768-block group (128 MiB at 4K): `ceil(32768 * 0.05) = 1639 blocks (~6.4 MiB)`. These blocks MUST be reserved in the block bitmap and MUST NOT be allocatable for file data.
+For 5% overhead on a 32,768-block group (128 MiB at 4K): `ceil(32768 * 0.05) = 1639 blocks (~6.4 MiB)`. These blocks MUST have persistent allocator ownership (including ext4 bitmap or Btrfs extent accounting) and MUST NOT be allocatable for file data.
+
+#### Compatibility Storage Decision (`bd-7zjfh`)
+
+Compatibility mode uses FFSRQSC2 sidecars and the existing
+`ffs-protected-mount` entry point. Protection groups cover image bytes and need
+not coincide with ext4 or Btrfs allocation groups. Source and archive ownership
+are held by the same device; all filesystem I/O MUST pass through that device.
+An existing matching archive and explicit exclusive-image/repair authority are
+required. A pending header MUST be durable before source mutation; successful
+sync MUST publish verified source bytes and matching fresh protection. Startup
+mismatch or an interrupted epoch MUST NOT authorize rollback to older parity.
+Journalled ext4 MUST attach its internal writer before writable admission and
+sync again after clearing the journal start and recovery flag. Cleanup writes
+MUST have fresh protection before fsync acknowledgement; failure MUST preserve
+the previous durability watermark and permit an idempotent retry.
+
+The loss ordering for this decision is: unintended data overwrite or rollback
+is inadmissible; explicit unavailability is preferable; additional storage and
+sync latency are accepted costs. No occurrence probabilities are inferred.
+
+| Choice | Data-integrity condition | Availability and cost | Decision |
+|---|---|---|---|
+| External compatibility sidecar | Existing device fences stale coverage before writes and verifies replacement protection before sync succeeds; no legacy allocator blocks are claimed | Requires both files and exclusive access; unfinished epochs refuse automatic reopen; dirty sync scans the complete image | Selected for compatibility; mounted execution must qualify the integration |
+| On-image ownership for compatibility | Requires an owner recognized by legacy allocation and checkers; bitmap bits alone are insufficient, and Btrfs metadata-only groups cannot contain arbitrary file-data parity | Additional format-specific ownership, conversion and crash-recovery implementation is required before activation | Not the compatibility storage path |
+| Native per-group on-image ownership | Persistent native ownership, restart discovery and allocator exclusion must be implemented before symbol writes | Explicit conversion and complete lifecycle proof still required | Retained native target in `bd-11a8t` |
+
+This choice changes the compatibility storage mechanism, not the required
+default durability, refresh, cancellation or recovery guarantees. Current
+sidecar mounts remain explicit opt-in; they do not close `bd-11a8t`.
 
 #### 3.7.2 Group Descriptor Extension
+
+This extension and the repair block format in §3.7.3 specify native on-image
+storage. Compatibility sidecars use the versioned FFSRQSC2 archive format;
+they do not add these structures to legacy filesystem groups.
 
 ```rust
 #[repr(C)]
@@ -682,12 +719,17 @@ pub struct ScrubReport {
 
 ### 3.10 Symbol Refresh Protocol
 
-Written blocks make repair symbols **stale**. Two modes:
+Written blocks make repair symbols **stale**. Native on-image storage supports
+two refresh modes:
 
 1. **Eager** (`eager_refresh = true`): Re-encode immediately after write commit. Continuous consistency but higher write amplification.
 2. **Lazy** (`eager_refresh = false`): Mark group dirty; refresh during next scrub. Between write and refresh, the repair set MUST NOT be used for recovery of affected source block partitions.
 
 The `repair_generation` counter MUST be incremented only after a **full** symbol refresh of the group completes. Partial refreshes MUST NOT increment the counter.
+
+Compatibility sidecars instead fence each write epoch with a durable pending
+header and publish matching fresh protection at successful sync, as required
+by §3.7. A lazy native refresh policy MUST NOT weaken that sync contract.
 
 A scrub finding MUST be handled before regenerating symbols for its source
 group: encoding known-corrupt bytes would replace the evidence needed for
@@ -955,18 +997,18 @@ This section records the key design choices extracted from FrankenSQLite's prove
 
 | FrankenSQLite Design Choice | FrankenSQLite Spec | Filesystem Adaptation | FrankenFS Section |
 |----|----|----|-----|
-| Sidecar files (`.wal-fec`, `.db-fec`) store symbols outside the main file | §3.4.1, §3.4.6 | Symbols stored in **reserved blocks at end of each block group** (in-image; no sidecar needed because the filesystem controls block allocation) | 3.7 |
+| Sidecar files (`.wal-fec`, `.db-fec`) store symbols outside the main file | §3.4.1, §3.4.6 | Compatibility images use versioned external sidecars; native mode retains **owned blocks at the end of each allocation group**, requiring persistent allocator exclusion | 3.7 |
 | Per-commit-group encoding (K = pages per transaction) | §3.4.1 | Per-block-group encoding (K = blocks per group, typically 32,768) | 3.3, 3.7 |
 | Small fixed repair count (default R=2 symbols per WAL commit group) | §3.4.1 | Proportional overhead (default 5%, yielding ~1,639 repair symbols per 32K-block group) | 3.8 |
-| Pipelined symbol generation (async, not on commit critical path) | §3.4.1, §3.4.6 | Lazy refresh (mark group stale on write, re-encode on next scrub) as default; eager refresh as option | 3.10 |
-| Generation digest prevents stale sidecar attacks | §3.4.6 | `repair_generation` counter in group descriptor must match stored symbols | 3.7.2 |
-| Per-source xxh3_128 hashes for independent frame validation | §3.4.1, §3.4.6 | Per-source BLAKE3 digests stored in validation blocks | 3.15 |
+| Pipelined symbol generation (async, not on commit critical path) | §3.4.1, §3.4.6 | Native storage defaults to lazy refresh with eager refresh optional; compatibility sidecars require fresh protection at successful sync | 3.7, 3.10 |
+| Generation digest prevents stale sidecar attacks | §3.4.6 | Native `repair_generation` must match stored symbols; compatibility archives bind coverage to source digests and fence unfinished epochs with a pending header | 3.7 |
+| Per-source xxh3_128 hashes for independent frame validation | §3.4.1, §3.4.6 | Per-source BLAKE3 digests reside in native validation blocks or compatibility archive records | 3.7, 3.15 |
 | Decode proofs (mathematical witness for every repair) | §3.5.8 | Decode proofs with BLAKE3 digests of recovered blocks | 3.12 |
 | Evidence ledger (auditable record of every policy change and repair action) | §4.16.1 | Repair evidence ledger with structured entries | 3.13 |
 | Deterministic repair symbol generation (same input = same symbols) | §3.5.3, §3.5.9 | Deterministic seed from `fs_uuid + group_number` | 3.14 |
 | Special page-1 treatment (elevated redundancy for header page) | §3.4.6 | Elevated overhead for metadata groups containing superblock/GDT | 3.16.2 |
 | Small-object clamping (avoid under-provisioning due to rounding/additive slack) | §3.5.12.1 | Minimum 3 repair symbols for tail block groups with K < 8 | 3.16.1 |
-| Checkpoint-only sidecar updates (single writer, no concurrent mutation) | §3.4.1, §3.4.6 | Symbol refresh only during scrub (lazy mode) or committed write path (eager mode); never during read | 3.10 |
+| Checkpoint-only sidecar updates (single writer, no concurrent mutation) | §3.4.1, §3.4.6 | Native refresh occurs during scrub or committed writes; compatibility sidecars publish fresh protection at sync. Reads do not encode changed source bytes into replacement protection | 3.7, 3.10 |
 | Adaptive redundancy (autopilot control loop; raise redundancy on evidence) | §3.5.12 | Beta posterior over corruption rate with expected-loss overhead selection | 3.11 |
 
 ---

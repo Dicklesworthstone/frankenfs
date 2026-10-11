@@ -26573,8 +26573,8 @@ impl OpenFs {
     ///  2. commit that set to the journal region and sync — after this returns a
     ///     crash is recoverable, because replay reapplies the whole set;
     ///  3. only THEN write the same blocks to their home locations, and sync;
-    ///  4. reclaim the journal region, now that the home copies are durable and
-    ///     the journal's contents are pure redundancy.
+    ///  4. reclaim the journal region, now that the home copies are durable,
+    ///     and sync the clean journal/superblock state before acknowledging.
     ///
     /// Steps 2 and 3 must not be reordered or merged: writing a home block before
     /// the commit block is durable is precisely the torn-metadata window this
@@ -26582,7 +26582,8 @@ impl OpenFs {
     ///
     /// COST, stated plainly because this bead exists to stop us hiding it. This
     /// writes the jbd2 descriptor and commit blocks we previously never wrote,
-    /// and syncs twice where we used to sync once. It is expected to make fsync
+    /// and syncs three times where we used to sync once, in addition to the
+    /// writer's journal-body barrier. It is expected to make fsync
     /// measurably SLOWER, and that is the correct outcome — the 0.182706x
     /// "win" it replaces compared an unjournalled FrankenFS against a journalled
     /// kernel, which is not a comparison.
@@ -26761,8 +26762,9 @@ impl OpenFs {
             // bd-cnmpm: the log is empty again. Order matters: `s_start = 0`
             // first, then clear needs_recovery — a crash between the two leaves
             // "flag set, journal empty", which the kernel and e2fsck treat as
-            // nothing to replay. These need no extra sync: replaying an already
-            // checkpointed transaction is idempotent until they land.
+            // nothing to replay. Replaying an already checkpointed transaction
+            // is idempotent until these writes land, but a protected byte device
+            // also needs the final sync below to publish matching protection.
             journal.mark_log_empty(cx, &direct).map_err(|e| {
                 FfsError::Io(std::io::Error::other(format!(
                     "jbd2 flush boundary could not mark the log empty: {e}"
@@ -26770,6 +26772,22 @@ impl OpenFs {
             })?;
         }
         self.ext4_write_needs_recovery(cx, &direct, false)?;
+        // bd-7zjfh: both cleanup writes dirty the device after phase 2. A
+        // sidecar-backed device fences that new epoch until sync publishes its
+        // protection, so acknowledging here without this barrier leaves even
+        // successfully fsynced data inadmissible on an independent reopen.
+        // Failure leaves the caller's durability watermark unchanged; the
+        // durable checkpoint permits an idempotent retry of the same versions.
+        if let Err(e) = self.dev.sync(cx) {
+            warn!(
+                target: "ffs::journal",
+                error = %e,
+                "flush_boundary_cleanup_sync_failed"
+            );
+            return Err(FfsError::Io(std::io::Error::other(format!(
+                "jbd2 flush boundary cleanup sync failed (checkpoint is durable; clean-state publication incomplete): {e}"
+            ))));
+        }
         Ok(())
     }
 
@@ -56367,6 +56385,94 @@ mod tests {
                 "acknowledged data must be durable after the retry ({phase_label} class)"
             );
         }
+    }
+
+    #[test]
+    fn flush_boundary_cleanup_sync_failure_retries_without_acknowledgement_bd_7zjfh() {
+        let (mut fs, dev, _tmp) = open_writable_ext4_mkfs_with_crash_device(64)
+            .expect("mkfs.ext4 is required for the cleanup-barrier regression");
+        let cx = Cx::for_testing();
+        assert!(fs.attach_ext4_internal_jbd2_writer(&cx).unwrap());
+        let segments = ext4_journal_segments_for_test(&fs, &cx).unwrap();
+        let block_size = usize::try_from(fs.block_size()).unwrap();
+        let journal_offset = usize::try_from(segments[0].start.0).unwrap() * block_size;
+        let journal_header = |image: &[u8]| {
+            Jbd2Superblock::parse(&image[journal_offset..journal_offset + block_size]).unwrap()
+        };
+        let needs_recovery = |image: &[u8]| {
+            Ext4Superblock::parse_superblock_region(
+                &image[EXT4_SUPERBLOCK_OFFSET..EXT4_SUPERBLOCK_OFFSET + EXT4_SUPERBLOCK_SIZE],
+            )
+            .unwrap()
+            .has_incompat(ffs_ondisk::Ext4IncompatFeatures::RECOVER)
+        };
+        let inode = fs
+            .create(&cx, InodeNumber(2), OsStr::new("cleanup.bin"), 0o600, 0, 0)
+            .unwrap()
+            .ino;
+        let payload: Vec<u8> = (0_u32..12_289)
+            .map(|offset| u8::try_from(offset % 251).unwrap())
+            .collect();
+        assert_eq!(
+            fs.write(&cx, inode, 0, &payload).unwrap(),
+            u32::try_from(payload.len()).unwrap()
+        );
+        let watermark = *fs.mvcc_flushed_through.lock();
+        let committed = fs.current_snapshot().high;
+        assert!(committed > watermark);
+
+        // The unchanged phase-1/2 test above covers calls 2 and 3. Call 1
+        // persists the journal body; call 4 must persist mark_log_empty and
+        // clear-RECOVER writes BEFORE public fsync acknowledges this boundary.
+        let failed_sync = dev.sync_count() + 4;
+        dev.arm_sync_failure(failed_sync);
+        let error = FsOps::fsync(&fs, &cx, &mut RequestScope::empty(), inode, 0, false)
+            .expect_err("cleanup sync failure must not acknowledge fsync");
+        assert!(matches!(error, FfsError::Io(_)), "{error:?}");
+        assert!(error.to_string().contains("cleanup sync"), "{error}");
+        assert_eq!(dev.sync_count(), failed_sync, "the intended barrier failed");
+        assert_eq!(*fs.mvcc_flushed_through.lock(), watermark);
+        assert_eq!(fs.current_snapshot().high, committed);
+        let failed_durable = dev.durable_bytes();
+        assert!(needs_recovery(&failed_durable));
+        assert_ne!(journal_header(&failed_durable).start_block, 0);
+
+        dev.disarm();
+        FsOps::fsync(&fs, &cx, &mut RequestScope::empty(), inode, 0, false)
+            .expect("retry must publish the same committed versions and clean state");
+        assert_eq!(*fs.mvcc_flushed_through.lock(), committed);
+        assert_eq!(fs.current_snapshot().high, committed);
+        let durable = dev.durable_bytes();
+        assert!(!needs_recovery(&durable));
+        assert_eq!(journal_header(&durable).start_block, 0);
+        assert!(
+            journal_header(&durable).start_sequence
+                > journal_header(&failed_durable).start_sequence,
+            "retry must not reuse the failed boundary's journal sequence"
+        );
+
+        // Reopen only the durable shadow, without replay or the original
+        // process's caches, to prove both namespace and file bytes reached home.
+        let reopened = OpenFs::from_device(
+            &cx,
+            Box::new(CrashDevice::from_vec(durable)),
+            &OpenOptions {
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        let found = reopened
+            .lookup(&cx, InodeNumber(2), OsStr::new("cleanup.bin"))
+            .unwrap();
+        assert_eq!(found.ino, inode);
+        assert_eq!(found.size, u64::try_from(payload.len()).unwrap());
+        assert_eq!(
+            reopened
+                .read(&cx, found.ino, 0, u32::try_from(payload.len()).unwrap())
+                .unwrap(),
+            payload
+        );
     }
 
     #[test]

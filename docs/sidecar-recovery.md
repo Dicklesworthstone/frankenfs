@@ -81,11 +81,16 @@ must match the saved whole-image digest before publication. An unrecoverable
 later group never exposes a partial final image.
 
 Checksums detect accidental corruption, not maliciously forged archives. This
-format does not authenticate a sidecar supplied by an adversary. It is a new,
-explicit offline path; it does not enable default mounted self-healing, change
-`ffs-cli repair`'s on-image storage layout, certify native allocator reservations,
-or provide multi-device image-set recovery. Those remain separate work under
-`bd-11a8t` and `bd-hk5w3`.
+format does not authenticate a sidecar supplied by an adversary. These commands
+are an explicit offline path. For subsequent writes and read repair,
+[ffs-protected-mount](protected-mount.md) uses the same versioned archive through
+a device that invalidates stale coverage before source writes and publishes new
+coverage at successful sync. Sidecars are the compatibility-mode repair storage
+design; native mode retains the on-image reservation target. Neither path enables
+default mounted self-healing, changes `ffs-cli repair`'s on-image storage layout,
+certifies native allocator reservations, or provides multi-device image-set
+recovery. Default/native lifecycle remains work under `bd-11a8t`; seed/sprout
+read attachment does not certify repair of an entire multi-device image set.
 
 ## Executable regressions
 

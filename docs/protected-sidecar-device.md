@@ -2,8 +2,10 @@
 
 `ffs_repair::sidecar::live::SidecarImageDevice` is a fixed-size `ByteDevice`
 implementation for a regular filesystem image and an existing FFSRQSC2 sidecar.
-It is a proposed implementation, not enabled by the existing mount CLI. It does
-not reserve or overwrite filesystem allocator space.
+The explicit `ffs-protected-mount` binary connects it to filesystem operations
+and FUSE; the ordinary mount command keeps its existing behavior. It does not
+reserve or overwrite filesystem allocator space. See
+[protected-mount.md](protected-mount.md) for authority, admission and shutdown.
 
 ## Durability contract
 
@@ -100,9 +102,10 @@ group buffers. No low-latency fsync claim is made. Truncated images and startup
 mismatches still require explicit offline recovery rather than live resizing or
 implicit rollback.
 
-The adapter is accepted by the existing `OpenFs::from_device` interface, but
-mount-CLI wiring, default/native repair, filesystem-level replay, background
-workers, multi-device recovery and mounted crash certification are not included.
+The adapter is accepted by `OpenFs::from_device`. The separate protected mount
+also supplies optional source/parity scrub and full filesystem shutdown barriers.
+Default/native repair, filesystem-level reconciliation of unfinished epochs,
+multi-device recovery and mounted crash certification remain incomplete.
 
 ## Validation required
 

@@ -218,6 +218,22 @@ fn prepare(cx: &Cx, args: &Args) -> Result<Prepared> {
     FsOps::getattr(&fs, cx, &mut RequestScope::empty(), InodeNumber(1))
         .context("read protected filesystem root")?;
     if args.rw {
+        // Match ordinary mount admission: a journalled ext4 image may not
+        // silently take the direct home-block durability path. The writer uses
+        // this same protected device, so journal and checkpoint syncs also
+        // publish fresh sidecar coverage. Clean admission above establishes
+        // the attachment helper's prerequisite that no replay is pending.
+        fs.attach_ext4_internal_jbd2_writer(cx)
+            .context("attach the protected ext4 internal JBD2 writer")?;
+        if fs
+            .ext4_superblock()
+            .is_some_and(|sb| sb.has_compat(ffs_ondisk::Ext4CompatFeatures::HAS_JOURNAL))
+            && !fs.has_jbd2_writer()
+        {
+            bail!(
+                "refusing writable journalled ext4 mount: no JBD2 writer is attached, so the durability checkpoint would skip the journal's descriptor and commit blocks"
+            );
+        }
         // Preserve all ordinary format/profile/feature write-admission checks.
         // No ephemeral btrfs mode or kernel writeback cache is enabled here.
         fs.enable_writes(cx)

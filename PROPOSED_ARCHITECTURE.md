@@ -8,8 +8,8 @@
 > crate topology and target boundaries. Current reality-check bridge work outside
 > the tracked parity denominator is recorded in `bd-rchk1` through `bd-rchk7`.
 > Mounted self-healing now has an explicit repair-enabled read-only mount mode
-> (`--background-repair --background-scrub-ledger <jsonl>`); read-write mounted
-> automatic repair remains blocked until repair storage is reserved from client
+> (`--background-repair --background-scrub-ledger <jsonl>`); ordinary read-write
+> on-image repair remains blocked until repair storage is reserved from client
 > allocations; the mounted writeback serializer alone is insufficient.
 >
 > **Repair-tail admission (`bd-plamw`):** CLI plan construction validates every
@@ -28,6 +28,17 @@
 > checks, and refusal before background worker startup. Exact source and execution
 > provenance is recorded in `FEATURE_PARITY.md`; allocator-owned storage remains
 > required.
+
+> **Compatibility repair storage (`bd-7zjfh`):** the existing
+> `ffs-protected-mount` binary passes one `SidecarImageDevice` through
+> `OpenFs::from_device` into FUSE. That device owns image/archive locks,
+> verifies reads, durably fences old coverage before source writes, and
+> publishes verified replacement protection at sync. It does not consume
+> legacy allocation space. Clean single-image admission and explicit repair
+> authority are required; unfinished epochs need offline reconciliation.
+> Native per-group storage, default activation and the full structured
+> cancellation/restart target remain `bd-11a8t`. The storage decision and loss
+> comparison are in specification §3.7.
 
 ---
 
@@ -484,7 +495,7 @@ pub trait RepairManager: Send + Sync {
 4. **Repair is orthogonal.** `ffs-repair` operates on blocks, not files. It doesn't know about inodes or directories.
 5. **Harness dependency boundary.** `ffs-harness` consumes internal crates for validation; `ffs-cli` and `ffs-ops` also depend on it for operator-facing validation commands. Core filesystem crates must remain independent of the harness.
 6. **No cycles.** The dependency graph is a DAG. If crate A depends on B, B must not depend on A.
-7. **Explicit Cx is required by the target design.** Context-aware filesystem operations accept `&Cx`; current repair-flush notification still has a `Cx::current()` path, and CLI/FUSE workers use standard threads. Completing explicit propagation and region ownership remains required work. Absence of a `Cx` argument does not prohibit Rust standard-library I/O.
+7. **Explicit Cx is required by the target design.** Context-aware filesystem operations and repair-flush notifications accept `&Cx`. CLI/FUSE workers still use standard threads; completing region ownership remains required work. Absence of a `Cx` argument does not prohibit Rust standard-library I/O.
 
 ---
 
@@ -494,7 +505,7 @@ pub trait RepairManager: Send + Sync {
 
 | Feature | Usage |
 |---------|-------|
-| `Cx` (capability context) | Passed through context-aware filesystem I/O; ambient and standard-thread paths remain to be integrated |
+| `Cx` (capability context) | Passed through context-aware filesystem I/O and repair-flush notification; standard-thread ownership remains to be integrated |
 | `Budget` | Resource budgeting for block cache memory, open file descriptors, repair symbol storage |
 | `Region` | Required target ownership for background tasks; current CLI scrub and FUSE workers also use standard threads |
 | `Lab` | Deterministic runtime for testing concurrent MVCC operations |

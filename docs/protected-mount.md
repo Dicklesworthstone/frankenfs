@@ -41,6 +41,8 @@ cargo run -p ffs-cli --bin ffs-protected-mount -- \
 including the existing ext4 and single-device btrfs write-admission checks. It does
 not enable ephemeral btrfs commits or kernel writeback cache. `--check` and `--rw`
 are mutually exclusive: an admission-only invocation cannot enable caller writes.
+Journalled ext4 attaches its internal JBD2 writer through that same device before
+enabling writes. A missing or empty journal mapping refuses writable admission.
 
 Opening first verifies the complete image against the admitted protection point.
 A startup mismatch is not presumed to be media damage and is never silently
@@ -65,6 +67,12 @@ verifies the intended source bytes, stages and verifies updated repair symbols,
 locks the replacement archive, atomically publishes it and synchronizes its parent
 directory. Publication errors propagate through the filesystem barrier. No second
 writable image descriptor bypasses this protocol.
+
+For journalled ext4, the journal commit and home-block checkpoint remain separate
+durability barriers. Clearing the journal start and recovery flag then requires
+a final device sync: those cleanup writes must also have matching sidecar coverage
+before fsync succeeds. A cleanup-sync failure returns an error without advancing
+the durability watermark; retry can safely repeat the durable checkpoint.
 
 Each dirty device sync scans the image and archive, although normally only changed
 groups are re-encoded. A filesystem commit can issue multiple such barriers. This
@@ -204,10 +212,39 @@ cargo test -p ffs-cli --bin ffs-protected-mount
 
 These tests do not require `/dev/fuse`, and therefore do not establish successful
 kernel mounting. They require e2fsprogs and btrfs-progs and fail rather than
-silently passing when an oracle is absent. Rust/Cargo/rustfmt/RCH and those oracle
-tools were unavailable while implementing the read-write extension: its added
-regressions, compilation, Clippy, formatting and mounted acceptance have **not**
-been executed in that environment.
+silently passing when an oracle is absent. The 2026-10-11 RCH run at
+`f87bbae7567fa1aaa9dbb87e950054a4be836062` executed all 44 cases: the existing
+42 passed and the two new journalled-ext4 cases failed. One failure exposed an
+invalid negative-fixture premise; the other exposed missing sidecar publication
+after JBD2 cleanup. At corrected source
+`044077a2622ccf0137a19937fcd55eb9f4d4907c`, both new cases and four core journal
+controls passed with no failures or ignored tests. The core controls include
+public-fsync cleanup-barrier failure/retry and actual `e2fsck` crash replay.
+These are separate executed cohorts.
+
+Actual production-CLI FUSE acceptance passed on 2026-10-11 at source
+`c85b828c934e654e8d486a03fc6d3463d2aa476a`: both
+`protected_sidecar_cli_ext4_corruption_restart_bd_7zjfh` and
+`protected_sidecar_cli_btrfs_corruption_restart_bd_7zjfh` passed, with no failures,
+ignored cases or capability skips (`FFS_REQUIRE_FUSE=1`, `FFS_REQUIRE_ORACLES=1`).
+The ext4 fixture has an internal journal. Each case checks cold mounted repair
+and exact whole-image restoration, read-only rejection, an independently
+remounted image/archive pair captured immediately after fsync, repair of newly
+written bytes after restart, and unchanged-file refusal of a startup mismatch.
+Every successful daemon exits normally, with no forced stop or lazy unmount;
+independent filesystem checks pass throughout. These tests do not simulate
+hardware power loss or recover unfinished epochs.
+
+RCH job `30059820987973680` retained its log at
+`/tmp/ffs-chartreusestone-resume21-7zjfh-mounted.log` (SHA256
+`ff5173a06b609728d38e21a90bf012a35946be7cf47bdef2834b3c4ef67a6a29`).
+The mounted binary SHA256 is
+`577916ac8a13a3940b2c9ad6ae7ddf3eab4b393d134890a2aedd0c966809b0be`;
+the offline protection binary SHA256 is
+`1ac91ff4ab8b46e526a1029fd7ed265c9fa3e1af7ea9c269f02fb0cd588e084b`.
+Both match the binaries built by RCH from that source. Images, archives and
+per-mount logs remain under
+`/mnt/ffs-chartreusestone-7zjfh-c85.IvQzgU/artifacts` on worker `vmi1153651`.
 
 This integration is experimental. It does not close `bd-11a8t` / `bd-j7a4e`,
 change default repair policy, reserve native on-image repair space, enable
@@ -223,16 +260,16 @@ need filesystem oracle binaries when selected separately:
 cargo test -p ffs-cli --bin ffs-protected-mount scrub::
 ```
 
-The implementation environment lacked Rust/Cargo/rustfmt/RCH for this extension too.
-These are added regression cases, not claimed executed tests or mounted acceptance.
+The source-scrub cases passed in the 42-test subset reported above. Those are
+executed device/worker tests, not mounted acceptance.
 
 Parity-maintenance regressions cover pending/busy deferral, bounded restart work,
 epoch and reopen identity, late header damage, cancellation and publication errors.
 The CLI worker cases damage all repair symbols for a tail group, replenish them,
 reopen the image/archive, and recover newly injected source damage using the new
 symbols. They also preserve the source-only mode and reject completion claims on
-deferral or reporting failure. The new cases require Rust execution; they were not
-run in the implementation environment, which still lacks the Rust/RCH toolchain.
+deferral or reporting failure. The CLI worker cases passed in the 42-test subset
+above; that invocation did not separately execute the `ffs-repair` test target.
 
 ```sh
 cargo test -p ffs-repair incremental_scrub

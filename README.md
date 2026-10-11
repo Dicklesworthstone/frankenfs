@@ -565,7 +565,34 @@ ffs mount IMAGE MOUNT --background-repair --background-scrub-ledger repair.jsonl
 - Read-write mounts keep scrub disabled by default; `--background-scrub` opts into detection-only monitoring. `--background-repair` is **refused on read-write mounts**: repair symbols live in each group's tail, which is not reserved from the allocator, so a file created during the mount could later be overwritten by a symbol refresh (bd-plamw).
 - Before writing repair symbols or descriptor slots, the complete requested group set must pass allocation checks. Ext4 checks bitmap allocations and reserved metadata, including checksummed lazy groups, FLEX_BG metadata and bigalloc clusters; Btrfs checks the extent tree, requires one unambiguous chunk covering the whole span, rejects physical aliases through other chunks or DUP copies, and excludes physical padding and reserved superblock stripes. An unsafe or unreadable tail rejects the whole plan with `FFS_REPAIR_TAIL_UNSAFE`, group and range evidence. Explicit `--rebuild-symbols` performs this admission before journal or superblock recovery can modify the image. A repair-enabled read-only mount refuses startup when any tail is unsafe; detection-only scrub still includes those groups.
 - The mount lifecycle owns the `ScrubDaemon`: cancellation is wired to mount shutdown, and the worker is joined on unmount.
-- Read-only repair uses the direct backing-image authority. The read-write repair route (recovered source blocks through the mounted MVCC request-scope serializer, stale repair snapshots failing closed) is implemented and unit-tested but not reachable from the CLI until repair storage is reserved. The serialization contract is formalized in `docs/repair-writeback-serialization-contract.json` (57 KB) and `docs/design-repair-writeback-serialization.md`.
+- Ordinary on-image read-only repair uses the direct backing-image authority. Its read-write route (recovered source blocks through the mounted MVCC request-scope serializer, stale repair snapshots failing closed) is implemented and unit-tested but not reachable from the CLI until repair storage is reserved. The serialization contract is formalized in `docs/repair-writeback-serialization-contract.json` (57 KB) and `docs/design-repair-writeback-serialization.md`.
+
+### Sidecar-protected compatibility mounts
+
+Compatibility-mode repair uses an external FFSRQSC2 sidecar so repair symbols
+never compete with ext4 or btrfs file allocations. The existing
+`ffs-protected-mount` binary connects that device to FUSE:
+
+```bash
+ffs-image-repair protect image.ext4 image.ffsrq --offline
+ffs-protected-mount image.ext4 image.ffsrq /path/to/empty/mountpoint \
+    --exclusive-image --allow-repair --rw
+```
+
+Create protection while the image is unmounted. The protected mount requires a
+clean, matching, single-device image; omit `--rw` for a read-only filesystem.
+Verified read repair can still write the backing image in that mode. All image
+I/O uses one protected device. Before source writes it durably invalidates old
+coverage; successful filesystem sync also publishes verified fresh protection.
+Startup mismatches and interrupted write epochs require explicit offline
+reconciliation, never automatic rollback to old parity. Dirty sync scans the
+whole image, so this mode makes no low-latency fsync claim.
+
+See [protected mounts](docs/protected-mount.md) for optional source/parity scrub,
+authority and shutdown, and [offline recovery](docs/sidecar-recovery.md) for
+restoration to a new image. Native per-group on-image reservation, default repair
+and the complete cancellation/restart lifecycle remain `bd-11a8t`; choosing
+sidecars for compatibility does not satisfy those native requirements.
 
 ### Hostile-image safety (separate claim)
 
@@ -2759,6 +2786,7 @@ frankenfs/
 | `ffs-cli` | `ffs-cli` | Operator, inspection, and benchmark commands; see `ffs-cli --help` |
 | `ffs-demo` | `ffs-repair` (`src/bin/ffs-demo.rs`) | RaptorQ encode/corrupt/decode demo on a synthetic raw 8 MiB image (no ext4/btrfs, no FUSE) |
 | `ffs-image-repair` | `ffs-repair` (`src/bin/ffs-image-repair.rs`) | Offline sidecar RaptorQ protect / verify / restore for unmounted images |
+| `ffs-protected-mount` | `ffs-cli` (`src/bin/ffs-protected-mount/`) | Explicit single-image FUSE mount through the sidecar-protected device; optional writes and source/parity scrub |
 | `ffs-harness` | `ffs-harness` | Conformance + proof-bundle validation tool |
 | `ffs-mounted-kernel-bench` | `ffs-harness` (`src/bin/ffs_mounted_kernel_bench.rs`) | Mounted kernel-vs-FrankenFS FUSE latency comparator |
 | `ffs-ops` | `tools/ffs-ops` | Operational validation commands |
@@ -3759,7 +3787,7 @@ Rows in the btrfs experimental RW contract can still be `partially supported` or
 - **ext4.** Superblock, inode, extent header/entry, group descriptor, feature flag decoding, mount-time journal recovery (JBD2 + fast-commit + external-journal pairing), FUSE mount (RO default, experimental RW), `e2compr` read+write for gzip/LZO/none, casefold, encryption nokey mode, inline data, indirect block addressing, fallocate (KEEP_SIZE / PUNCH_HOLE / ZERO_RANGE / COLLAPSE_RANGE / INSERT_RANGE), POSIX ACL xattrs, MMP conservative rejection.
 - **btrfs.** Superblock, B-tree header, leaf item metadata, geometry validation, RAID mapping helpers, single-device Single/Dup mounts and clean multi-device read-only attachment with clean-image RAID0/1/10/1C3/1C4/5/6 FUSE read evidence, FUSE mount (RO default; experimental single-device RW with durable writeback via `btrfs_full_transaction_commit`), transparent ZLIB/LZO/ZSTD decompression, named subvolume/snapshot selection, tree-log replay, send/receive stream parsing, btrfs fallocate (KEEP_SIZE / PUNCH_HOLE / ZERO_RANGE / COLLAPSE_RANGE / INSERT_RANGE), backup superblock mirror repair, fragmentation-aware free-run reporting. The remaining mounted multi-device profile/degraded matrix is incomplete.
 - **MVCC.** Snapshot visibility, commit sequencing, FCW conflict detection, four same-block merge mechanisms behind semantic `MergeProof` labels, three conflict policies with adaptive expected-loss selection, EMA contention tracking, sharded concurrent store, Zstd/Brotli version compression, WAL persistence + crash recovery, SSI two-edge rw-antidependency detection.
-- **Self-healing.** Bayesian durability autopilot, RaptorQ symbol generation/recovery, four refresh policies (Eager/Lazy/Adaptive/Hybrid), stale-window SLO with percentile-based breach detection, multi-host repair-ownership coordination, expected-loss policy comparison, mounted automatic repair contract (read-only + read-write via MVCC repair-writeback serializer).
+- **Self-healing.** RaptorQ codecs, refresh policies, durability autopilot, stale-window monitoring and repair ownership. Explicit sidecar-protected compatibility mounts route reads, writes and durability barriers through one repair device. Ordinary on-image background repair remains read-only; read-write activation requires permanent allocator ownership. Default/native repair remains incomplete.
 - **Writeback-cache.** Epoch-based commit barriers with per-inode staged/visible/durable tracking, deferred visibility for MVCC isolation, dirty-page ordering oracle, 12-point crash/replay matrix artifact gate, runtime guard, and host/lane manifest checks. Kernel option default-off; explicit opt-in is evidence-gated.
 - **Observability.** Evidence ledger with 23 event types and 8 operator presets (`replay-anomalies`, `repair-failures`, `pressure-transitions`, `contention`, `metrics`, `cache`, `mvcc`, `repair-live`), contention metrics, policy-switch detection, structured logging across all subsystems, JSONL audit trail.
 - **Selected CLI commands.** `inspect`, `read`, `walk`, `mvcc-stats`, `info`, `dump`, `fsck`, `repair`, `mount`, `scrub`, `parity`, `evidence`, `mkfs`; `ffs-cli --help` lists the full command set, including benchmark commands, and each subcommand's `--help` lists its current flags.
@@ -3776,7 +3804,7 @@ The following May 2026 bridge records are historical closeouts, not current read
 | `bd-rchk3` | xfstests | Real runs on every push to `main`: `.github/workflows/xfstests.yml` mounts throwaway ext4 and btrfs images through `scripts/e2e/mount.fuse.ffs` (FSTYP=fuse) and runs the curated generic subset (`scripts/e2e/xfstests_generic.list`, 91 tests) against per-format baselines; a baseline pass that regresses fails the job. As of 2026-10-02 (run 37020121412): ext4 and btrfs each pass all 87 runnable tests of the 90 then listed (generic/078 added since); 068/231/321 (freeze, quota, block-device scratch) do not apply to FUSE. This is a curated subset, not the full xfstests suite. |
 | `bd-rchk4` | Mounted FUSE CI | Use the permissioned lane in `scripts/e2e/README.md` to run critical mounted ext4/btrfs paths with structured capability and cleanup artifacts |
 | `bd-rchk5` | Performance | Complete: dated 2026-05-03 core and mounted throughput/latency artifacts, host/runtime metadata, delta closeout, quarantined mounted latency claims recorded |
-| `bd-rchk6` | Mounted self-healing | Complete: automatic mounted repair implemented for `--background-repair --background-scrub-ledger`; RW repair routes through MVCC repair-writeback serializer with stale-snapshot rejection |
+| `bd-rchk6` | Mounted self-healing | Historical serializer closeout. Ordinary on-image RW repair is currently refused until permanent storage ownership; explicit compatibility repair uses `ffs-protected-mount` and a sidecar. Default/native completion remains `bd-11a8t`. |
 | `bd-rchk7` | Fuzz / conformance | Complete: remaining open-ended corpus notes tied to completed fixtures, closed child beads, or the fixed-seed fuzz-smoke gate |
 
 See [`FEATURE_PARITY.md`](FEATURE_PARITY.md) for the full capability matrix and [`PLAN_TO_PORT_FRANKENFS_TO_RUST.md`](PLAN_TO_PORT_FRANKENFS_TO_RUST.md) for the 9-phase roadmap.
@@ -3833,7 +3861,7 @@ Full normative scope: [`COMPREHENSIVE_SPEC_FOR_FRANKENFS_V1.md`](COMPREHENSIVE_S
 - **Kernel FUSE writeback-cache mode is default-off and release-gated in V1.x.** The `--writeback-cache` opt-in requires `--rw`, an accepted audit gate, an accepted ordering oracle, fresh runtime-guard evidence, an accepted crash/replay oracle, a matching host/lane manifest, and a disarmed `FFS_WRITEBACK_CACHE_KILL_SWITCH`. `flush` is non-durable; `fsync` / `fsyncdir` are the explicit durability boundaries.
 - **Swarm responsiveness claims require permissioned large-host evidence.** Local swarm workload and tail-latency smoke lanes are downgrade artifacts; only fresh `authoritative_large_host` proof-bundle lanes strengthen `swarm.responsiveness`.
 - **Default CLI mount path does not enable optional backpressure / per-core scheduling hooks.** `ffs-cli mount` defaults to the `standard` runtime mode without wiring `BackpressureGate` controls.
-- **Mount background scrub is detection-only by default**, with explicit automatic repair available via `--background-repair --background-scrub-ledger <jsonl>`. Read-write repair uses the mounted MVCC request-scope authority so recovered blocks share the same serializer as client writes.
+- **Default/native repair is incomplete.** Ordinary read-only mounts default to detection-only scrub; ordinary read-write mounts require explicit scrub and refuse on-image repair until its storage is permanently reserved. The separate sidecar-protected mount is explicit opt-in and does not reconcile unfinished epochs automatically.
 - **External dependencies.** Workspace dependencies declare `asupersync = 0.5.0` and `ftui = 0.3.1`; local path overrides can be supplied with Cargo `[patch]` during sibling-repo development. `vendor/fuser` 0.17.0 is selected via `[patch.crates-io]` with ABI 7.42 enabled.
 - **Legacy reference corpus is not included.** The Linux kernel ext4/btrfs source used for behavioral extraction (~205K lines) is gitignored due to size. Extracted contracts are in [`EXISTING_EXT4_BTRFS_STRUCTURE.md`](EXISTING_EXT4_BTRFS_STRUCTURE.md). For the original source, see `git.kernel.org/pub/scm/linux/kernel/git/torvalds/linux.git` at tag v6.19.
 - **Multi-host repair is single-host only in V1.x.** Lease-based ownership coordination exists; concurrent write-side repair across hosts is V1.x-deferred.
@@ -3871,7 +3899,7 @@ A: Repair symbols become stale when source blocks are modified. FrankenFS suppor
 A: The project requires asupersync's explicit capabilities, cancellation-aware channels, structured regions, and deterministic lab support. Integrating those mechanisms throughout the filesystem remains work in progress; adopting the dependency alone does not establish those guarantees.
 
 **Q: What does `--background-repair` actually do?**
-A: It turns mounted scrub from detection-only into recovery-enabled. The `ScrubDaemon` runs as part of the mount lifecycle; on a corruption detect, it loads RaptorQ repair symbols, decodes the original data, validates the result, and writes the corrected block back. On read-only mounts this uses direct backing-image authority; on read-write mounts it routes through the MVCC repair-writeback serializer so repair writes share the serialization boundary with client writes. Every step emits structured evidence to the JSONL ledger.
+A: It enables the ordinary mount's on-image recovery worker on a read-only mount, subject to repair-tail admission and a durable evidence ledger. Read-write mounts refuse this option until allocator ownership is permanent. For explicit compatibility-mode read-write repair, use `ffs-protected-mount` with an existing matching sidecar; it verifies reads and refreshes protection at successful durability barriers through the same device.
 
 **Q: What if I just want to look inside an image without mounting it?**
 A: `ffs inspect`, `ffs info`, and `ffs dump` operate without FUSE; they read the image directly via seeked I/O. No `sudo` required, no FUSE headers needed, no kernel module loading.

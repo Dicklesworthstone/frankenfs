@@ -108,16 +108,31 @@ struct Fixture {
 
 impl Fixture {
     fn ext4() -> Self {
+        Self::ext4_with_journal(false)
+    }
+
+    fn ext4_with_journal(journalled: bool) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let image = dir.path().join("image.ext4");
         let sidecar = dir.path().join("image.ffs-rq");
         File::create(&image)
             .unwrap()
-            .set_len(8 * 1024 * 1024)
+            .set_len(if journalled { 32 } else { 8 } * 1024 * 1024)
             .unwrap();
         command(
             Command::new("mkfs.ext4")
-                .args(["-q", "-F", "-b", "4096", "-O", "^has_journal"])
+                .args([
+                    "-q",
+                    "-F",
+                    "-b",
+                    "4096",
+                    "-O",
+                    if journalled {
+                        "has_journal"
+                    } else {
+                        "^has_journal"
+                    },
+                ])
                 .arg(&image),
         );
         let payload: Vec<u8> = (0_u32..12_288)
@@ -519,6 +534,121 @@ fn writable_ext4_finish_persists_noninline_data_and_namespace() {
     let reopened = prepare(&cx, &fixture.args()).unwrap();
     assert_file(&reopened, &cx, InodeNumber(2), "payload", &fixture.payload);
     reopened.finish(&cx).unwrap();
+}
+
+#[test]
+fn protected_journalled_ext4_uses_internal_writer_and_publishes_fsync_bd_7zjfh() {
+    let fixture = Fixture::ext4_with_journal(true);
+    let cx = Cx::for_testing();
+    let prepared = prepare(&cx, &fixture.writable_args()).unwrap();
+    assert!(
+        prepared
+            .fs
+            .ext4_superblock()
+            .unwrap()
+            .has_compat(ffs_ondisk::Ext4CompatFeatures::HAS_JOURNAL)
+    );
+    assert!(
+        prepared.fs.has_jbd2_writer(),
+        "protected journalled ext4 must not bypass the ordinary journal durability rule"
+    );
+    let data: Vec<u8> = (0_u32..65_553)
+        .map(|index| u8::try_from(index % 239).unwrap())
+        .collect();
+    let inode = create_written(&prepared, &cx, InodeNumber(2), &data);
+    FsOps::fsync(
+        prepared.fs.as_ref(),
+        &cx,
+        &mut RequestScope::empty(),
+        inode,
+        0,
+        false,
+    )
+    .unwrap();
+    assert_published(&fixture, InodeNumber(2), &data);
+    prepared.finish(&cx).unwrap();
+    fixture.assert_healthy();
+    let reopened = prepare(&cx, &fixture.args()).unwrap();
+    assert_file(&reopened, &cx, InodeNumber(2), "written", &data);
+    assert_file(&reopened, &cx, InodeNumber(2), "payload", &fixture.payload);
+    reopened.finish(&cx).unwrap();
+}
+
+#[test]
+fn protected_journalled_ext4_refuses_missing_or_empty_journal_bd_7zjfh() {
+    for (mutation, diagnostic) in [
+        (
+            "set_super_value journal_inum 0",
+            "no JBD2 writer is attached",
+        ),
+        (
+            "set_inode_field <8> block[0] 0x0000f30a",
+            "no JBD2 writer is attached",
+        ),
+    ] {
+        let mut fixture = Fixture::ext4_with_journal(true);
+        let cx = Cx::for_testing();
+        let original = prepare(&cx, &fixture.args()).unwrap();
+        assert_eq!(original.fs.ext4_superblock().unwrap().journal_inum, 8);
+        let original_inode = original.fs.read_inode(&cx, InodeNumber(8)).unwrap();
+        assert_ne!(original_inode.flags & ffs_types::EXT4_EXTENTS_FL, 0);
+        let (original_header, _) =
+            ffs_ondisk::parse_extent_tree(&original_inode.extent_bytes).unwrap();
+        assert_eq!(original_header.depth, 0);
+        assert!(original_header.entries > 0);
+        original.finish(&cx).unwrap();
+        command(
+            Command::new("debugfs")
+                .args(["-w", "-R", mutation])
+                .arg(&fixture.image),
+        );
+        // Preserve a valid leaf header while clearing eh_entries. An invalid
+        // magic fails earlier during read-only fast-commit inspection, even
+        // with replay skipped; this empty mapping must reach the writer guard.
+        // Fresh protection makes the missing journal, not stale parity, the
+        // reason write admission refuses this filesystem.
+        fixture.sidecar = fixture.dir.path().join("invalid-journal.ffsrq");
+        protect(
+            &Cx::for_testing(),
+            &fixture.image,
+            &fixture.sidecar,
+            SidecarOptions {
+                block_size: 4096,
+                group_blocks: 16,
+                repair_symbols: 4,
+            },
+        )
+        .unwrap();
+        let source = std::fs::read(&fixture.image).unwrap();
+        let archive = std::fs::read(&fixture.sidecar).unwrap();
+        let readonly = prepare(&cx, &fixture.args()).unwrap();
+        if mutation == "set_super_value journal_inum 0" {
+            assert_eq!(readonly.fs.ext4_superblock().unwrap().journal_inum, 0);
+        } else {
+            assert_eq!(readonly.fs.ext4_superblock().unwrap().journal_inum, 8);
+            let inode = readonly.fs.read_inode(&cx, InodeNumber(8)).unwrap();
+            let (header, tree) = ffs_ondisk::parse_extent_tree(&inode.extent_bytes).unwrap();
+            assert_eq!(header.magic, original_header.magic);
+            assert_eq!(header.max_entries, original_header.max_entries);
+            assert_eq!(header.depth, 0);
+            assert_eq!(header.entries, 0, "debugfs must clear the journal mapping");
+            assert_eq!(tree, ffs_ondisk::ExtentTree::Leaf(Vec::new()));
+        }
+        assert_file(&readonly, &cx, InodeNumber(2), "payload", &fixture.payload);
+        readonly.finish(&cx).unwrap();
+        let error = prepare(&Cx::for_testing(), &fixture.writable_args())
+            .err()
+            .expect("journalled write admission must fail");
+        assert!(format!("{error:#}").contains(diagnostic), "{error:#}");
+        assert_eq!(std::fs::read(&fixture.image).unwrap(), source);
+        assert_eq!(std::fs::read(&fixture.sidecar).unwrap(), archive);
+        let cx = Cx::for_testing();
+        let readonly = prepare(&cx, &fixture.args()).unwrap();
+        assert_file(&readonly, &cx, InodeNumber(2), "payload", &fixture.payload);
+        readonly.finish(&cx).unwrap();
+        assert_eq!(std::fs::read(&fixture.image).unwrap(), source);
+        assert_eq!(std::fs::read(&fixture.sidecar).unwrap(), archive);
+    }
 }
 
 #[test]

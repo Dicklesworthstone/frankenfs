@@ -16060,7 +16060,11 @@ fn btrfs_cli_attached_devices_read_seeded_files_xxhash64() {
 }
 
 fn btrfs_cli_proof_binary() -> Option<PathBuf> {
-    let binary = std::env::var_os("FFS_CLI_BIN").map(PathBuf::from);
+    cli_proof_binary("FFS_CLI_BIN")
+}
+
+fn cli_proof_binary(variable: &str) -> Option<PathBuf> {
+    let binary = std::env::var_os(variable).map(PathBuf::from);
     let available = binary.as_ref().is_some_and(|path| {
         fs::metadata(path).is_ok_and(|m| m.is_file() && m.permissions().mode() & 0o111 != 0)
     });
@@ -16073,9 +16077,9 @@ fn btrfs_cli_proof_binary() -> Option<PathBuf> {
         || !command_available("sha256sum")
         || !command_available("fusermount3")
     {
-        require_fuse_or_skip(
-            "CLI proof needs executable FFS_CLI_BIN, caller-provided FFS_CLI_SOURCE_STAMP, absolute FFS_CLI_ARTIFACT_DIR outside the build checkout, sha256sum and fusermount3",
-        );
+        require_fuse_or_skip(&format!(
+            "CLI proof needs executable {variable}, caller-provided FFS_CLI_SOURCE_STAMP, absolute FFS_CLI_ARTIFACT_DIR outside the build checkout, sha256sum and fusermount3",
+        ));
         return None;
     }
     Some(fs::canonicalize(binary.unwrap()).expect("canonical CLI binary path"))
@@ -16166,6 +16170,41 @@ struct BtrfsCliMount {
 
 impl BtrfsCliMount {
     fn spawn(cli: &Path, directory: &Path, attached: &[PathBuf], request_rw: bool) -> Self {
+        Self::spawn_command(cli, directory, |command, mountpoint| {
+            command.arg("mount").arg(&attached[0]).arg(mountpoint);
+            for image in &attached[1..] {
+                command.arg("--btrfs-device").arg(image);
+            }
+            if request_rw {
+                command.arg("--rw");
+            }
+        })
+    }
+
+    fn spawn_protected(
+        cli: &Path,
+        directory: &Path,
+        image: &Path,
+        sidecar: &Path,
+        request_rw: bool,
+    ) -> Self {
+        Self::spawn_command(cli, directory, |command, mountpoint| {
+            command
+                .arg(image)
+                .arg(sidecar)
+                .arg(mountpoint)
+                .args(["--exclusive-image", "--allow-repair"]);
+            if request_rw {
+                command.arg("--rw");
+            }
+        })
+    }
+
+    fn spawn_command(
+        cli: &Path,
+        directory: &Path,
+        configure: impl FnOnce(&mut Command, &Path),
+    ) -> Self {
         fs::create_dir(directory).unwrap();
         let mountpoint = directory.join("mount");
         fs::create_dir(&mountpoint).unwrap();
@@ -16178,13 +16217,7 @@ impl BtrfsCliMount {
         let executable_hash = String::from_utf8(executable_hash.stdout).unwrap();
         let executable_sha256 = executable_hash.split_whitespace().next().unwrap();
         let mut command = Command::new(cli);
-        command.arg("mount").arg(&attached[0]).arg(&mountpoint);
-        for image in &attached[1..] {
-            command.arg("--btrfs-device").arg(image);
-        }
-        if request_rw {
-            command.arg("--rw");
-        }
+        configure(&mut command, &mountpoint);
         command
             .stdin(Stdio::null())
             .stdout(fs::File::create(directory.join("stdout.log")).unwrap())
@@ -16218,10 +16251,14 @@ impl BtrfsCliMount {
     }
 
     fn wait_until_ready(&mut self) {
+        self.wait_until_ready_with_timeout(Duration::from_secs(10));
+    }
+
+    fn wait_until_ready_with_timeout(&mut self, timeout: Duration) {
         let start = Instant::now();
         while !mountinfo_has_mountpoint(&self.mountpoint) {
             let status = self.child.try_wait().expect("poll CLI mount");
-            if status.is_some() || start.elapsed() >= Duration::from_secs(10) {
+            if status.is_some() || start.elapsed() >= timeout {
                 for name in ["stdout.log", "stderr.log"] {
                     let output = fs::read_to_string(self.directory.join(name))
                         .unwrap_or_else(|error| format!("cannot read {name}: {error}"));
@@ -16234,7 +16271,7 @@ impl BtrfsCliMount {
                 self.directory.display()
             );
             assert!(
-                start.elapsed() < Duration::from_secs(10),
+                start.elapsed() < timeout,
                 "CLI mount timed out; logs: {}",
                 self.directory.display()
             );
@@ -16243,6 +16280,10 @@ impl BtrfsCliMount {
     }
 
     fn finish(&mut self) -> Value {
+        self.finish_with_timeout(Duration::from_secs(10))
+    }
+
+    fn finish_with_timeout(&mut self, timeout: Duration) -> Value {
         let unmount = if mountinfo_has_mountpoint(&self.mountpoint) {
             match Command::new("fusermount3")
                 .arg("-u")
@@ -16263,7 +16304,7 @@ impl BtrfsCliMount {
         let start = Instant::now();
         let mut status = None;
         let mut wait_error = None;
-        while start.elapsed() < Duration::from_secs(10) {
+        while start.elapsed() < timeout {
             match self.child.try_wait() {
                 Ok(Some(exit)) => {
                     status = Some(exit);
@@ -16322,6 +16363,376 @@ impl Drop for BtrfsCliMount {
             self.finish();
         }
     }
+}
+
+fn protected_sidecar_finish(mount: &mut BtrfsCliMount) {
+    // Admission and dirty sync scan the entire protected image. This explicit
+    // bound applies only to this mode; ordinary CLI timing gates stay intact.
+    let exit = mount.finish_with_timeout(Duration::from_secs(120));
+    for name in ["stdout.log", "stderr.log"] {
+        let output = fs::read_to_string(mount.directory.join(name)).unwrap();
+        btrfs_cli_record(
+            &mount.directory,
+            &serde_json::json!({"event": "protected_cli_output", "stream": name, "text": output}),
+        );
+    }
+    assert_eq!(exit["success"], true, "protected mount shutdown: {exit}");
+    assert_eq!(exit["forced_stop"], false);
+    assert_eq!(exit["mount_released"], true);
+    assert!(exit["lazy_unmount"].is_null());
+}
+
+fn protected_sidecar_readback(directory: &Path, path: &Path, expected: &[u8]) {
+    let bytes = fs::read(path).expect("read actual protected FUSE file");
+    btrfs_cli_record(
+        directory,
+        &serde_json::json!({
+            "event": "protected_mounted_read", "path": path, "bytes": bytes.len(),
+            "readback_blake3": blake3::hash(&bytes).to_hex().to_string(),
+        }),
+    );
+    assert_eq!(bytes, expected, "mounted payload {}", path.display());
+}
+
+fn protected_sidecar_physical_offset(image: &Path, name: &str, expected: &[u8]) -> u64 {
+    let cx = Cx::for_testing();
+    let filesystem = OpenFs::open_with_options(
+        &cx,
+        image,
+        &OpenOptions {
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+            ..OpenOptions::default()
+        },
+    )
+    .unwrap();
+    let root = if filesystem.is_ext4() { 2 } else { 1 };
+    let inode = filesystem
+        .lookup(&cx, InodeNumber(root), name.as_ref())
+        .unwrap();
+    let extents = filesystem
+        .fiemap(&cx, &mut RequestScope::empty(), inode.ino, 0, 4096)
+        .unwrap();
+    let first = extents.first().expect("noninline written payload extent");
+    assert_eq!(first.logical, 0);
+    assert!(first.length >= 4096);
+    assert_eq!(
+        first.flags
+            & (ffs_core::FIEMAP_EXTENT_DATA_INLINE
+                | ffs_core::FIEMAP_EXTENT_ENCODED
+                | ffs_core::FIEMAP_EXTENT_UNWRITTEN),
+        0
+    );
+    let physical = filesystem
+        .btrfs_context()
+        .map_or(first.physical, |context| {
+            let mapping = ffs_ondisk::map_logical_to_stripes(&context.chunks, first.physical)
+                .unwrap()
+                .unwrap();
+            assert_eq!(mapping.profile, ffs_ondisk::btrfs::BtrfsRaidProfile::Single);
+            assert_eq!(mapping.stripes.len(), 1);
+            assert!(mapping.contiguous_len >= 4096);
+            mapping.stripes[0].physical
+        });
+    assert_eq!(physical % 4096, 0);
+    let mut source = fs::File::open(image).unwrap();
+    source.seek(SeekFrom::Start(physical)).unwrap();
+    let mut bytes = [0_u8; 4096];
+    source.read_exact(&mut bytes).unwrap();
+    assert_eq!(bytes, expected[..4096], "independent raw placement check");
+    physical
+}
+
+fn protected_sidecar_corrupt_block(directory: &Path, image: &Path, physical: u64) {
+    // Deliberate post-admission media fault, never a normal second writer.
+    // The mounted reader has not read this file yet, so a cached payload cannot
+    // stand in for repair. The later raw read verifies actual backing storage.
+    let mut source = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(image)
+        .unwrap();
+    source.seek(SeekFrom::Start(physical)).unwrap();
+    let mut original = [0_u8; 4096];
+    source.read_exact(&mut original).unwrap();
+    let damaged: Vec<u8> = original.iter().map(|byte| byte ^ 0xA5).collect();
+    source.seek(SeekFrom::Start(physical)).unwrap();
+    source.write_all(&damaged).unwrap();
+    source.sync_all().unwrap();
+    source.seek(SeekFrom::Start(physical)).unwrap();
+    let mut observed = [0_u8; 4096];
+    source.read_exact(&mut observed).unwrap();
+    assert_eq!(observed.as_slice(), damaged);
+    assert_ne!(observed, original);
+    btrfs_cli_record(
+        directory,
+        &serde_json::json!({
+            "event": "post_admission_media_fault", "physical": physical, "bytes": original.len(),
+            "before_blake3": blake3::hash(&original).to_hex().to_string(),
+            "damaged_blake3": blake3::hash(&observed).to_hex().to_string(),
+        }),
+    );
+}
+
+fn protected_sidecar_check(
+    directory: &Path,
+    repair: &Path,
+    image: &Path,
+    sidecar: &Path,
+    fstype: &str,
+) {
+    btrfs_seed_sprout_run(
+        directory,
+        Command::new(repair).arg("verify").arg(image).arg(sidecar),
+    );
+    repair_tail_check_image(directory, image, fstype);
+}
+
+fn protected_sidecar_fixture(
+    directory: &Path,
+    repair: &Path,
+    fstype: &str,
+    initial: &[u8],
+) -> (PathBuf, PathBuf, u64, String) {
+    let source = directory.join("source");
+    fs::create_dir(&source).unwrap();
+    fs::write(source.join("initial"), initial).unwrap();
+    let image = directory.join("image");
+    let sidecar = directory.join("image.ffsrq");
+    fs::File::create(&image)
+        .unwrap()
+        .set_len(if fstype == "ext4" { 32 } else { 128 } * 1024 * 1024)
+        .unwrap();
+    if fstype == "ext4" {
+        btrfs_seed_sprout_run(
+            directory,
+            Command::new("mkfs.ext4")
+                .args(["-q", "-F", "-b", "4096", "-O", "has_journal", "-d"])
+                .arg(&source)
+                .arg(&image),
+        );
+    } else {
+        btrfs_seed_sprout_run(
+            directory,
+            Command::new("mkfs.btrfs")
+                .args([
+                    "-q", "-f", "-n", "16384", "-s", "4096", "-m", "single", "-d", "single", "-r",
+                ])
+                .arg(&source)
+                .arg(&image),
+        );
+    }
+    repair_tail_check_image(directory, &image, fstype);
+    let physical = protected_sidecar_physical_offset(&image, "initial", initial);
+    let original_hash = repair_tail_sha256(directory, &image);
+    btrfs_cli_record(
+        directory,
+        &serde_json::json!({
+            "event": "protected_fixture", "fstype": fstype,
+            "image_sha256": original_hash, "repair_executable": repair,
+            "repair_executable_sha256": repair_tail_sha256(directory, repair),
+            "caller_provided_source_stamp": std::env::var("FFS_CLI_SOURCE_STAMP").unwrap(),
+            "source_stamp_is_independent_proof": false,
+        }),
+    );
+    btrfs_seed_sprout_run(
+        directory,
+        Command::new(repair)
+            .arg("protect")
+            .arg(&image)
+            .arg(&sidecar)
+            .args(["--offline", "--group-blocks", "64", "--repair-symbols", "8"]),
+    );
+    assert_eq!(repair_tail_sha256(directory, &image), original_hash);
+    (image, sidecar, physical, original_hash)
+}
+
+fn protected_sidecar_write_and_sync(
+    cli: &Path,
+    directory: &Path,
+    image: &Path,
+    sidecar: &Path,
+    written: &[u8],
+) -> BtrfsCliMount {
+    let mut writable =
+        BtrfsCliMount::spawn_protected(cli, &directory.join("writable"), image, sidecar, true);
+    writable.wait_until_ready_with_timeout(Duration::from_secs(120));
+    let path = writable.mountpoint.join("written");
+    let mut output = fs::File::create(&path).unwrap();
+    output.write_all(written).unwrap();
+    output
+        .sync_all()
+        .expect("acknowledged protected file fsync");
+    drop(output);
+    fs::File::open(&writable.mountpoint)
+        .unwrap()
+        .sync_all()
+        .unwrap();
+    protected_sidecar_readback(directory, &path, written);
+    writable
+}
+
+fn protected_sidecar_startup_refusal(
+    cli: &Path,
+    directory: &Path,
+    captured_image: &Path,
+    captured_sidecar: &Path,
+    written: &[u8],
+) {
+    // A startup difference is a distinct case: without a live admitted epoch,
+    // the public command must refuse rather than silently restore old bytes.
+    let captured_physical = protected_sidecar_physical_offset(captured_image, "written", written);
+    protected_sidecar_corrupt_block(directory, captured_image, captured_physical);
+    let mismatched_hash = repair_tail_sha256(directory, captured_image);
+    let archive_hash = repair_tail_sha256(directory, captured_sidecar);
+    let mut refused = BtrfsCliMount::spawn_protected(
+        cli,
+        &directory.join("startup-refused"),
+        captured_image,
+        captured_sidecar,
+        false,
+    );
+    let started = Instant::now();
+    while refused.child.try_wait().unwrap().is_none() {
+        assert!(!mountinfo_has_mountpoint(&refused.mountpoint));
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "startup refusal timed out"
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    let exit = refused.finish();
+    let stderr = fs::read_to_string(refused.directory.join("stderr.log")).unwrap();
+    btrfs_cli_record(
+        directory,
+        &serde_json::json!({
+            "event": "startup_mismatch_refused", "exit": exit, "stderr": stderr,
+        }),
+    );
+    assert_eq!(exit["exit_code"], 4);
+    assert_eq!(exit["forced_stop"], false);
+    assert_eq!(exit["mount_released"], true);
+    assert!(stderr.contains("refusing implicit rollback"));
+    assert_eq!(
+        repair_tail_sha256(directory, captured_image),
+        mismatched_hash
+    );
+    assert_eq!(
+        repair_tail_sha256(directory, captured_sidecar),
+        archive_hash
+    );
+}
+
+fn protected_sidecar_cli_corruption_restart(fstype: &str) {
+    if !fuse_available() {
+        return;
+    }
+    let Some(cli) = cli_proof_binary("FFS_PROTECTED_MOUNT_BIN") else {
+        return;
+    };
+    let Some(repair) = cli_proof_binary("FFS_IMAGE_REPAIR_BIN") else {
+        return;
+    };
+    if !command_available("e2fsck")
+        || !command_available("mkfs.btrfs")
+        || !command_available("btrfs")
+    {
+        require_fuse_or_skip("protected sidecar proof requires e2fsck, mkfs.btrfs and btrfs");
+        return;
+    }
+    let parent = PathBuf::from(std::env::var_os("FFS_CLI_ARTIFACT_DIR").unwrap());
+    fs::create_dir_all(&parent).unwrap();
+    let directory = tempfile::Builder::new()
+        .prefix(&format!("ffs-protected-{fstype}-"))
+        .tempdir_in(parent)
+        .unwrap()
+        .keep();
+    let initial = patterned_bytes(65_553, 239, 1);
+    let written = patterned_bytes(65_553, 241, 2);
+    let (image, sidecar, physical, original_hash) =
+        protected_sidecar_fixture(&directory, &repair, fstype, &initial);
+    let archive_hash = repair_tail_sha256(&directory, &sidecar);
+    let mut readonly =
+        BtrfsCliMount::spawn_protected(&cli, &directory.join("readonly"), &image, &sidecar, false);
+    readonly.wait_until_ready_with_timeout(Duration::from_secs(120));
+    protected_sidecar_corrupt_block(&directory, &image, physical);
+    protected_sidecar_readback(&directory, &readonly.mountpoint.join("initial"), &initial);
+    assert_eq!(repair_tail_sha256(&directory, &image), original_hash);
+    let refused = fs::OpenOptions::new()
+        .write(true)
+        .open(readonly.mountpoint.join("initial"));
+    assert_eq!(refused.unwrap_err().raw_os_error(), Some(libc::EROFS));
+    protected_sidecar_finish(&mut readonly);
+    assert_eq!(repair_tail_sha256(&directory, &sidecar), archive_hash);
+    protected_sidecar_check(&directory, &repair, &image, &sidecar, fstype);
+
+    let mut writable =
+        protected_sidecar_write_and_sync(&cli, &directory, &image, &sidecar, &written);
+
+    // Capture immediately after acknowledged barriers, BEFORE shutdown. Mount
+    // an independent pair so neither an old MVCC cache nor a later cleanup
+    // refresh can make a broken fsync publication look correct.
+    let captured_image = directory.join("fsync.image");
+    let captured_sidecar = directory.join("fsync.ffsrq");
+    fs::copy(&image, &captured_image).unwrap();
+    fs::copy(&sidecar, &captured_sidecar).unwrap();
+    btrfs_cli_record(
+        &directory,
+        &serde_json::json!({
+            "event": "acknowledged_fsync_capture",
+            "image_sha256": repair_tail_sha256(&directory, &captured_image),
+            "sidecar_sha256": repair_tail_sha256(&directory, &captured_sidecar),
+        }),
+    );
+    protected_sidecar_check(
+        &directory,
+        &repair,
+        &captured_image,
+        &captured_sidecar,
+        fstype,
+    );
+    let mut captured = BtrfsCliMount::spawn_protected(
+        &cli,
+        &directory.join("fsync-reopened"),
+        &captured_image,
+        &captured_sidecar,
+        false,
+    );
+    captured.wait_until_ready_with_timeout(Duration::from_secs(120));
+    protected_sidecar_readback(&directory, &captured.mountpoint.join("written"), &written);
+    protected_sidecar_readback(&directory, &captured.mountpoint.join("initial"), &initial);
+    protected_sidecar_finish(&mut captured);
+    protected_sidecar_finish(&mut writable);
+    protected_sidecar_check(&directory, &repair, &image, &sidecar, fstype);
+
+    let physical = protected_sidecar_physical_offset(&image, "written", &written);
+    let acknowledged_hash = repair_tail_sha256(&directory, &image);
+    let mut reopened =
+        BtrfsCliMount::spawn_protected(&cli, &directory.join("reopened"), &image, &sidecar, false);
+    reopened.wait_until_ready_with_timeout(Duration::from_secs(120));
+    protected_sidecar_corrupt_block(&directory, &image, physical);
+    protected_sidecar_readback(&directory, &reopened.mountpoint.join("written"), &written);
+    assert_eq!(repair_tail_sha256(&directory, &image), acknowledged_hash);
+    protected_sidecar_readback(&directory, &reopened.mountpoint.join("initial"), &initial);
+    protected_sidecar_finish(&mut reopened);
+    protected_sidecar_check(&directory, &repair, &image, &sidecar, fstype);
+
+    protected_sidecar_startup_refusal(
+        &cli,
+        &directory,
+        &captured_image,
+        &captured_sidecar,
+        &written,
+    );
+}
+
+#[test]
+fn protected_sidecar_cli_ext4_corruption_restart_bd_7zjfh() {
+    protected_sidecar_cli_corruption_restart("ext4");
+}
+
+#[test]
+fn protected_sidecar_cli_btrfs_corruption_restart_bd_7zjfh() {
+    protected_sidecar_cli_corruption_restart("btrfs");
 }
 
 fn assert_btrfs_cli_mount_reads(
