@@ -9,6 +9,7 @@ use asupersync::Cx;
 use ffs_error::FfsError;
 use ffs_types::{CommitSeq, InodeNumber, Snapshot};
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::Arc;
@@ -516,6 +517,10 @@ pub struct RequestScope {
     /// `find | xargs stat` walk) that DO benefit from the cache warm.
     #[serde(default)]
     pub skip_readdir_prefetch: bool,
+    /// Block-free credits staged with ext4 bitmap writes. Only successful
+    /// publication transfers these credits to the live allocator.
+    #[serde(default)]
+    pub(crate) ext4_freed_blocks: BTreeMap<usize, u32>,
 }
 
 impl RequestScope {
@@ -527,6 +532,7 @@ impl RequestScope {
             tx: None,
             commit_mode: RequestCommitMode::PerRequest,
             skip_readdir_prefetch: false,
+            ext4_freed_blocks: BTreeMap::new(),
         }
     }
 
@@ -538,6 +544,7 @@ impl RequestScope {
             tx: None,
             commit_mode: RequestCommitMode::PerRequest,
             skip_readdir_prefetch: false,
+            ext4_freed_blocks: BTreeMap::new(),
         }
     }
 
@@ -549,6 +556,7 @@ impl RequestScope {
             tx: Some(tx),
             commit_mode: RequestCommitMode::PerRequest,
             skip_readdir_prefetch: false,
+            ext4_freed_blocks: BTreeMap::new(),
         }
     }
 

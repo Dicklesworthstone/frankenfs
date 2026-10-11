@@ -413,31 +413,26 @@ impl PerGroupAlloc {
         .unwrap_or(Ok(()))
     }
 
-    /// Sharded per-group inode allocation (bd-bhh0i Part A): walk the
-    /// target→±neighbors→full order, locking ONE group at a time, and allocate an
-    /// inode in the first group that can satisfy. Simpler than `alloc_blocks` —
-    /// the inode core computes its own reserved set (`reserved_inodes_in_group` is
-    /// geo+group only), so no per-group cache read. The scan order mirrors the
+    /// Walk the inode allocation order, locking ONE group at a time while the
+    /// caller attempts allocation and preparation. The callback must publish its
+    /// transaction before installing private changes into the locked stats, and
+    /// leave those stats unchanged on failure. The scan order mirrors the
     /// single-lock `alloc_inode_persist` (target, then ±1..=8, then the full
     /// 0..group_count skipping target; neighbors re-appear in the full sweep
     /// exactly as the single-lock loop re-tries them — harmless, already-failed).
     ///
-    /// c2 scope: `target` is the caller's group for BOTH files and directories.
-    /// Directory Orlov placement (an all-groups above-average-free scan) and the
-    /// Part-B contention spread are slice c3 — they need a lock-free free-count
-    /// snapshot; `is_directory` is still threaded so `used_dirs` accounting is
-    /// correct wherever the inode lands.
-    #[allow(clippy::too_many_arguments)]
-    pub(crate) fn alloc_inode(
+    /// `target` is the caller's preferred group for files or directories. A
+    /// callback returning `Ok(None)` continues the scan; success or an error
+    /// stops it. The selected group lock is released before returning.
+    pub(crate) fn alloc_inode_with<T>(
         &self,
-        cx: &asupersync::Cx,
-        dev: &dyn ffs_block::BlockDevice,
-        geo: &ffs_alloc::FsGeometry,
         target: ffs_types::GroupNumber,
-        is_directory: bool,
-        pctx: &ffs_alloc::PersistCtx,
-    ) -> Result<Option<ffs_alloc::InodeAlloc>, ffs_error::FfsError> {
-        let group_count = geo.group_count;
+        group_count: u32,
+        mut attempt: impl FnMut(
+            ffs_types::GroupNumber,
+            &mut GroupStats,
+        ) -> Result<Option<T>, ffs_error::FfsError>,
+    ) -> Result<Option<T>, ffs_error::FfsError> {
         let target_idx = target.0;
         let mut order: Vec<usize> = Vec::with_capacity(17 + group_count as usize);
         order.push(target_idx as usize);
@@ -455,14 +450,9 @@ impl PerGroupAlloc {
             }
         }
         self.alloc_in_scan_order(order, |g, stats| {
-            match ffs_alloc::try_alloc_inode_in_group_persist_core(
-                cx,
-                dev,
-                geo,
-                stats,
+            match attempt(
                 ffs_types::GroupNumber(u32::try_from(g).unwrap_or(u32::MAX)),
-                is_directory,
-                pctx,
+                stats,
             ) {
                 Ok(Some(alloc)) => Some(Ok(alloc)), // allocated → stop the scan
                 Ok(None) => None,                   // group can't satisfy → continue
@@ -476,10 +466,10 @@ impl PerGroupAlloc {
     /// locking ONLY its owning group and composing [`ffs_alloc::free_inode_in_group`]
     /// over the locked `&mut GroupStats` — the inode counterpart to
     /// [`Self::free_blocks`]. The sharded create path allocates the inode lock-free
-    /// via [`Self::alloc_inode`]; on a subsequent dir-entry failure this frees it
+    /// via [`Self::alloc_inode_with`]; on a subsequent dir-entry failure this frees it
     /// back under the same per-group lock (the single-lock `free_inode_persist` over
     /// `&mut [GroupStats]` would free it against the wrong structure). `is_dir`
-    /// drives the `used_dirs` decrement, mirroring `alloc_inode`'s increment.
+    /// drives the `used_dirs` decrement, mirroring allocation's increment.
     pub(crate) fn free_inode(
         &self,
         cx: &asupersync::Cx,

@@ -557,6 +557,27 @@ userspace write(fd, buf, count)
   → fuser → kernel → userspace
 ```
 
+Ext4 request-scoped truncation stages bitmap frees against private allocation
+statistics and retains per-group free-block credits in `RequestScope`.
+Both extent and indirect mappings use the transaction device. Repeated shrinks
+accumulate credits, including freed mapping-tree blocks, without changing live
+`statfs` counts. Publication enters the mutation gate, holds the allocator lock,
+validates additions, commits MVCC, then applies only those credits to current
+live counts. A failed commit or an aborted scope discards them. Repair callbacks
+run afterward; a callback error cannot undo published accounting. Sharded
+descriptor reconciliation incorporates this single-lock counter movement once.
+This boundary does not establish atomic capture for existing ungated non-JBD2
+durability paths.
+
+Sharded ext4 creation holds one allocation-group lock while preparing a private
+copy of its statistics. Allocation and inode initialization share one MVCC
+transaction; the slot's prior generation is read inside its snapshot RMW.
+Only successful publication installs the private statistics. Failed preparation
+or cancellation discards them without compensating writes, and only unpublished
+MVCC conflicts are retried. The group lock is released before pruning or cache
+invalidation. Directory insertion remains a later namespace step with its
+existing rollback path.
+
 ### 6.3 Corruption Recovery Path
 
 ```

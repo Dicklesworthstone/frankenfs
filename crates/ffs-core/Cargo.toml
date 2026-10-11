@@ -24,9 +24,9 @@ rust-version.workspace = true
 #       not the fallback. Corrected 2026-08-26 after the stale text cost three
 #       build cycles chasing a lever that its own guard was disabling (bd-1bh8i).
 #
-# So: compiled in, not active by default. Enabling the feature also compiles the
-# `sharded_alloc` primitive + its tests so the decomposition can be
-# Loom/bench/cargo-validated remote-only before the (local-e2fsck-gated) cutover.
+# OpenFs library instances start with the runtime toggle disabled; the CLI mount
+# explicitly enables it by default. The feature also compiles the allocator's
+# deterministic concurrency tests and benchmarks.
 bhh0i_sharded_alloc = ["ffs-alloc/bhh0i_sharded_alloc"]
 
 [dependencies]

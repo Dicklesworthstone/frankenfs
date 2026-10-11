@@ -2706,6 +2706,13 @@ Modules:
 - `permissions.rs`: POSIX permission checking. `check_access(inode, uid, gid, groups, requested) -> Result<()>`. Algorithm: root bypasses (except execute without any x bit), match owner/group/other, check requested bits. Sticky bit enforcement for directories. Setuid/setgid clearing on chown.
 - `timestamps.rs`: Timestamp update helpers. `touch_atime(inode)` (respecting relatime/noatime), `touch_mtime_ctime(inode)`, `touch_ctime(inode)`. Nanosecond precision using `clock_gettime(CLOCK_REALTIME)`. Ext4 extra field encoding/decoding (34-bit seconds, 30-bit nanoseconds).
 
+Sharded ext4 inode allocation MUST publish its bitmap, group descriptor and
+initialized inode slot together. Failed or cancelled preparation must preserve
+the prior allocation state, including free-inode and directory counts, bitmap
+initialization flags and the search cursor. The new generation derives from
+the same snapshot ancestor used to update the slot. Retrying unpublished
+preparation must not replay an already-published namespace operation.
+
 Dependency rationale: depends on `ffs-block` for reading/writing inode
 table blocks via ARC cache; depends on `ffs-ondisk` for `Ext4Inode`
 parsing and serialization.
@@ -2737,6 +2744,13 @@ Modules:
 - `truncate.rs`: `truncate_extents(cx, inode, new_logical_end)`. Walks extent tree, removes extents beyond `new_logical_end`. Partial overlap: split extent at boundary, free blocks beyond split. Full overlap: remove entire extent, free all blocks. Updates inode `i_blocks`. Freed blocks returned to `ffs-alloc`.
 - `punch.rs`: `punch_hole(cx, inode, logical_start, count)`. Removes block mappings in range without changing file size. Handles three cases: (1) extent fully within hole -- remove and free, (2) extent partially overlaps start -- truncate extent end, (3) extent partially overlaps end -- adjust extent start. May split one extent into two (hole in middle).
 - `unwritten.rs`: Unwritten (uninitialized) extent handling. `mark_written(cx, inode, logical_start, count)`: clears the unwritten flag (bit 15 of `ee_len`) on extents in range. May require splitting extents at boundaries. Used by `fallocate` (mode=0 allocates unwritten) and first write to preallocated region.
+
+For a request-scoped truncate, bitmap changes, inode mappings and free-block
+credits MUST share the transaction outcome. Before publication, other requests
+must not observe its free credits. Abort or a failed commit must preserve the
+prior bitmap, file bytes and accounting, including allocations committed by
+other requests meanwhile. This also applies to indirect data and pointer blocks.
+An error during staging requires aborting the request scope.
 
 Dependency rationale: depends on `ffs-btree` for extent tree operations;
 depends on `ffs-alloc` for block allocation and deallocation.

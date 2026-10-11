@@ -4751,6 +4751,7 @@ impl FsOps for OpenFs {
             tx,
             commit_mode: RequestCommitMode::PerRequest,
             skip_readdir_prefetch: false,
+            ext4_freed_blocks: std::collections::BTreeMap::new(),
         })
     }
 
@@ -4877,7 +4878,7 @@ impl FsOps for OpenFs {
         // caller-supplied scope writes are raw block publication, just like
         // the public FCW/SSI transaction API, and invalidate captured state.
         let mut view = self.btrfs_raw_publication_guard(scope.pending_write_count());
-        let result = scope.commit_if_write(&self.mvcc_store);
+        let result = self.commit_scope_with_ext4_free_counts(scope);
         if result.is_ok()
             && let Some(stale) = view.as_mut()
         {

@@ -24030,11 +24030,122 @@ impl OpenFs {
         }
     }
 
-    /// Free a single filesystem block back to the allocator (bitmap + group
-    /// descriptor counts), persisting the update.
+    /// Keep scoped bitmap frees and their accounting private until publication.
+    /// The caller holds the live allocator lock; only the temporary copy moves.
+    /// Retain matching credits for partial staging on error, then discard them
+    /// with the transaction: callers must abort a scope after a failed operation.
+    fn ext4_with_scoped_block_frees<T>(
+        scope: &mut RequestScope,
+        alloc: &mut Ext4AllocState,
+        free: impl FnOnce(&mut RequestScope, &mut Ext4AllocState) -> Result<T, FfsError>,
+    ) -> Result<T, FfsError> {
+        if scope.tx.is_none() {
+            return free(scope, alloc);
+        }
+        let mut private = Ext4AllocState {
+            geo: alloc.geo.clone(),
+            groups: alloc.groups.clone(),
+            persist_ctx: alloc.persist_ctx.clone(),
+        };
+        for (&idx, &count) in &scope.ext4_freed_blocks {
+            let group = private
+                .groups
+                .get_mut(idx)
+                .ok_or_else(|| FfsError::Corruption {
+                    block: 0,
+                    detail: "scoped block free references a missing allocation group".into(),
+                })?;
+            group.free_blocks =
+                group
+                    .free_blocks
+                    .checked_add(count)
+                    .ok_or_else(|| FfsError::Corruption {
+                        block: group.block_bitmap_block.0,
+                        detail: "scoped free-block count overflow".into(),
+                    })?;
+        }
+        let before: Vec<_> = private
+            .groups
+            .iter()
+            .map(|group| group.free_blocks)
+            .collect();
+        let result = free(scope, &mut private);
+        for (idx, (before, after)) in before.iter().zip(&private.groups).enumerate() {
+            let freed =
+                after
+                    .free_blocks
+                    .checked_sub(*before)
+                    .ok_or_else(|| FfsError::Corruption {
+                        block: after.block_bitmap_block.0,
+                        detail: "block-free operation reduced the free-block count".into(),
+                    })?;
+            if freed != 0 {
+                let pending = scope.ext4_freed_blocks.entry(idx).or_default();
+                *pending = pending
+                    .checked_add(freed)
+                    .ok_or_else(|| FfsError::Corruption {
+                        block: after.block_bitmap_block.0,
+                        detail: "pending free-block count overflow".into(),
+                    })?;
+            }
+        }
+        result
+    }
+
+    /// Publish bitmap writes and their owned accounting delta under the same
+    /// allocator guard. A failed commit consumes the transaction but credits
+    /// nothing; later abort/cleanup therefore needs no compensating I/O.
+    fn commit_scope_with_ext4_free_counts(
+        &self,
+        scope: &mut RequestScope,
+    ) -> Result<CommitSeq, FfsError> {
+        if scope.ext4_freed_blocks.is_empty() {
+            return scope.commit_if_write(&self.mvcc_store);
+        }
+        if scope.tx.is_none() {
+            return Err(FfsError::Format(
+                "scoped block frees have no transaction".into(),
+            ));
+        }
+        // Deferred scopes have left their request gate. Enter before acquiring
+        // alloc; ordinary request gates can nest on the same thread. Never take
+        // mvcc_flushed_through here: a boundary may hold it while draining us.
+        let _gate = self.mutation_gate_guard();
+        let mut alloc = self.require_alloc_state()?.write();
+        let mut updated = Vec::with_capacity(scope.ext4_freed_blocks.len());
+        for (&idx, &freed) in &scope.ext4_freed_blocks {
+            let group = alloc.groups.get(idx).ok_or_else(|| FfsError::Corruption {
+                block: 0,
+                detail: "scoped block free references a missing allocation group".into(),
+            })?;
+            let count =
+                group
+                    .free_blocks
+                    .checked_add(freed)
+                    .ok_or_else(|| FfsError::Corruption {
+                        block: group.block_bitmap_block.0,
+                        detail: "committed free-block count overflow".into(),
+                    })?;
+            updated.push((idx, count));
+        }
+        let result = scope.commit_if_write(&self.mvcc_store);
+        if result.is_ok() {
+            for (idx, count) in updated {
+                let group = &mut alloc.groups[idx];
+                group.free_blocks = count;
+                group.invalidate_block_largest_free_run();
+            }
+        }
+        drop(alloc);
+        scope.ext4_freed_blocks.clear();
+        result
+    }
+
+    /// Free a single filesystem block through the request's bitmap transaction.
     fn free_one_block(
         &self,
         cx: &Cx,
+        scope: &mut RequestScope,
         alloc: &mut Ext4AllocState,
         block: BlockNumber,
     ) -> Result<(), FfsError> {
@@ -24045,7 +24156,15 @@ impl OpenFs {
             persist_ctx,
             ..
         } = &mut *alloc;
-        ffs_alloc::free_blocks_persist(cx, &dev, geo, groups, block, 1, persist_ctx)?;
+        if let Some(tx) = &mut scope.tx {
+            let tx_dev = TransactionBlockAdapter {
+                base: &dev,
+                tx: Mutex::new(tx),
+            };
+            ffs_alloc::free_blocks_persist(cx, &tx_dev, geo, groups, block, 1, persist_ctx)?;
+        } else {
+            ffs_alloc::free_blocks_persist(cx, &dev, geo, groups, block, 1, persist_ctx)?;
+        }
         Ok(())
     }
 
@@ -24127,7 +24246,7 @@ impl OpenFs {
             };
 
             if free_this {
-                self.free_one_block(cx, alloc, child)?;
+                self.free_one_block(cx, scope, alloc, child)?;
                 Self::write_indirect_pointer_slot(
                     &mut data,
                     ptr_block,
@@ -24161,17 +24280,30 @@ impl OpenFs {
     /// Returns the total number of freed filesystem blocks (for `i_blocks`
     /// accounting). A truncate-down calls this with `free_hi = u64::MAX`; a
     /// `FALLOC_FL_PUNCH_HOLE` calls it with a bounded window.
-    #[allow(clippy::too_many_arguments)] // chain walk threads device + alloc + inode + window
     fn ext4_free_indirect_range(
         &self,
         cx: &Cx,
         scope: &mut RequestScope,
         alloc: &mut Ext4AllocState,
         inode: &mut Ext4Inode,
-        free_lo: u64,
-        free_hi: u64,
-        block_size: u32,
+        range: std::ops::Range<u64>,
     ) -> Result<u64, FfsError> {
+        Self::ext4_with_scoped_block_frees(scope, alloc, |scope, alloc| {
+            self.ext4_free_indirect_range_inner(cx, scope, alloc, inode, range)
+        })
+    }
+
+    fn ext4_free_indirect_range_inner(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        alloc: &mut Ext4AllocState,
+        inode: &mut Ext4Inode,
+        range: std::ops::Range<u64>,
+    ) -> Result<u64, FfsError> {
+        let free_lo = range.start;
+        let free_hi = range.end;
+        let block_size = alloc.geo.block_size;
         let ppb = u64::from(block_size) / 4;
         let mut freed = 0u64;
 
@@ -24195,7 +24327,7 @@ impl OpenFs {
                 inode.extent_bytes[slot.start + 3],
             ]);
             if ptr != 0 {
-                self.free_one_block(cx, alloc, BlockNumber(u64::from(ptr)))?;
+                self.free_one_block(cx, scope, alloc, BlockNumber(u64::from(ptr)))?;
                 inode.extent_bytes[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
                 freed = freed.saturating_add(1);
             }
@@ -24249,7 +24381,7 @@ impl OpenFs {
             )?;
             freed = freed.saturating_add(sub_freed);
             if empty {
-                self.free_one_block(cx, alloc, root)?;
+                self.free_one_block(cx, scope, alloc, root)?;
                 inode.extent_bytes[off..off + 4].copy_from_slice(&0u32.to_le_bytes());
                 freed = freed.saturating_add(1);
             }
@@ -26305,7 +26437,7 @@ impl OpenFs {
     /// writes are not enabled — then the transient state is the only one and the
     /// descriptors it persisted stand.
     ///
-    /// (Scope: the single-lock `groups` array. Under the default-off
+    /// (Scope: the single-lock `groups` array. Under the CLI's default-on
     /// `bhh0i_sharded_alloc` path this is now sufficient rather than merely
     /// unreachable: the durability boundary reads the sharded records RECONCILED
     /// against this array's movement (bd-y2t0r, `reconciled_group_stats`), so a
@@ -27137,42 +27269,14 @@ impl OpenFs {
         sharded.free_inode(cx, dev, &geo, ino, is_dir, &pctx)
     }
 
-    /// Sharded (no-write-lock) inode allocation for the bd-bhh0i parallel-create
-    /// cutover (third wiring slice). Mirrors [`Self::ext4_sharded_alloc_blocks`]
-    /// on the inode side: derives geo + [`PersistCtx`] lock-free and routes to
-    /// [`PerGroupAlloc::alloc_inode`] (per-group locking). `target` is the
-    /// preferred group (Part-B spread: `spread_start_group(parent, seed, gc)` for
-    /// files, Orlov `choose_dir_group` for directories — computed by the caller);
-    /// the scan fans out target→±8→full exactly like the single-lock path.
-    /// `Ok(None)` = no free inode.
-    #[cfg(feature = "bhh0i_sharded_alloc")]
-    fn ext4_sharded_alloc_inode(
-        &self,
-        cx: &Cx,
-        dev: &dyn ffs_block::BlockDevice,
-        target: GroupNumber,
-        is_directory: bool,
-    ) -> Result<Option<ffs_alloc::InodeAlloc>, FfsError> {
-        self.note_sharded_alloc_happened();
-        let sharded = self.ext4_sharded_alloc.as_ref().ok_or(FfsError::ReadOnly)?;
-        let sb = self.ext4_superblock().ok_or_else(|| {
-            FfsError::Format("sharded inode alloc: not an ext4 filesystem".into())
-        })?;
-        let geo = FsGeometry::from_superblock(sb);
-        let pctx = self.ext4_persist_ctx_lockfree().ok_or_else(|| {
-            FfsError::Format("sharded inode alloc: persist ctx unavailable".into())
-        })?;
-        sharded.alloc_inode(cx, dev, &geo, target, is_directory, &pctx)
-    }
-
     /// Locate an inode's on-disk slot WITHOUT the alloc write lock (bd-bhh0i
     /// cutover slice 4). `locate_inode` needs only `groups[g].inode_table_block`,
     /// an IMMUTABLE per-group locator fixed at mkfs; the sharded allocator holds
     /// it per group, so this briefly locks just the target group to read that
     /// constant and reproduces `locate_inode`'s arithmetic exactly (asserted by
-    /// `ext4_sharded_locate_inode_matches_locate_inode_bd_bhh0i`). Used by the
-    /// sharded create path to read the old generation and write via
-    /// `write_inode_at` off a lock-free `InodeLocation`.
+    /// `ext4_sharded_locate_inode_matches_locate_inode_bd_bhh0i`). Used by
+    /// ordinary sharded inode updates; fresh inode creation uses its already
+    /// locked group's private stats instead of acquiring this lock again.
     #[cfg(feature = "bhh0i_sharded_alloc")]
     fn ext4_sharded_locate_inode(&self, ino: InodeNumber) -> Option<ffs_inode::InodeLocation> {
         let sb = self.ext4_superblock()?;
@@ -27203,14 +27307,10 @@ impl OpenFs {
         Some(ffs_inode::InodeLocation { block, byte_offset })
     }
 
-    /// Allocate + initialize + write a fresh inode via the sharded path, WITHOUT
-    /// the alloc write lock (bd-bhh0i cutover slice 6) — the no-write-lock
-    /// equivalent of `ffs_inode::create_inode`. Composes the earlier slices:
-    /// sharded `alloc_inode` (per-group lock) → read the old NFS generation off
-    /// the lock-free `InodeLocation` → shared `build_fresh_inode` → `write_inode_at`
-    /// at that location. `Ok`/errors mirror the single-lock path
-    /// (`FfsError::NoSpace` when no inode is free). `dev` is the same MVCC-aware
-    /// adapter the single-lock create writes through, so effects are identical.
+    /// Allocate and initialize a fresh inode in one unpublished transaction.
+    /// The selected group remains locked through commit; its counters and cursor
+    /// are installed only after the bitmap, descriptor, and inode slot publish
+    /// together. Preparation failures discard private state without cleanup I/O.
     #[cfg(feature = "bhh0i_sharded_alloc")]
     #[allow(clippy::too_many_arguments)]
     fn ext4_sharded_create_inode(
@@ -27225,61 +27325,136 @@ impl OpenFs {
         now_secs: u64,
         now_nsec: u32,
     ) -> Result<(InodeNumber, Ext4Inode), FfsError> {
+        self.note_sharded_alloc_happened();
+        let sharded = self.ext4_sharded_alloc.as_ref().ok_or(FfsError::ReadOnly)?;
         let sb = self.ext4_superblock().ok_or_else(|| {
             FfsError::Format("sharded create inode: not an ext4 filesystem".into())
         })?;
+        let geo = FsGeometry::from_superblock(sb);
+        let pctx = self.ext4_persist_ctx_lockfree().ok_or_else(|| {
+            FfsError::Format("sharded create inode: persist ctx unavailable".into())
+        })?;
         let csum_seed = sb.csum_seed();
-        // Read `inode_size` straight off the superblock (a verbatim field) rather
-        // than building the whole `FsGeometry` — a u64 group-count division plus a
-        // ~20-field struct build and a cluster-ratio feature check — just to pull
-        // one `u16` out of it. Byte-identical (`from_superblock` copies
-        // `sb.inode_size` unchanged into `geo.inode_size`); matches the direct
-        // `usize::from(sb.inode_size)` the non-sharded inode path already uses.
-        let inode_size = usize::from(sb.inode_size);
-
-        let alloc = self
-            .ext4_sharded_alloc_inode(cx, dev, target, is_directory)?
-            .ok_or(FfsError::NoSpace)?;
-        let ino = alloc.ino;
-
-        // Bump the NFS generation counter off the current on-disk slot (raw inode
-        // offset 0x64), exactly as prepare_inode does.
-        let loc = self
-            .ext4_sharded_locate_inode(ino)
-            .ok_or_else(|| FfsError::Corruption {
-                block: 0,
-                detail: format!("sharded create: inode {} out of range", ino.0),
-            })?;
-        let old_generation = {
-            let buf = dev.read_block(cx, loc.block)?;
-            let data = buf.as_slice();
-            let off = loc.byte_offset;
-            if off.checked_add(0x68).is_some_and(|end| end <= data.len()) {
-                u32::from_le_bytes([
-                    data[off + 0x64],
-                    data[off + 0x65],
-                    data[off + 0x66],
-                    data[off + 0x67],
-                ])
-            } else {
-                0
+        let created = sharded.alloc_inode_with(target, geo.group_count, |group, stats| {
+            const MAX_ATTEMPTS: u32 = 16;
+            let mut attempt = 1;
+            loop {
+                cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+                let mut working = stats.clone();
+                let result = (|| {
+                    let mut txn = self.mvcc_store.begin();
+                    let tx_dev = TransactionBlockAdapter {
+                        base: dev,
+                        tx: Mutex::new(&mut txn),
+                    };
+                    let Some(alloc) = ffs_alloc::try_alloc_inode_in_group_persist_core(
+                        cx,
+                        &tx_dev,
+                        &geo,
+                        &mut working,
+                        group,
+                        is_directory,
+                        &pctx,
+                    )?
+                    else {
+                        return Ok(None);
+                    };
+                    let mut inode = ffs_inode::build_fresh_inode(
+                        mode,
+                        uid,
+                        gid,
+                        is_directory,
+                        sb.has_incompat(ffs_ondisk::Ext4IncompatFeatures::EXTENTS),
+                        0,
+                        now_secs,
+                        now_nsec,
+                    );
+                    Self::ext4_stage_fresh_inode_slot(
+                        cx, &tx_dev, &geo, &working, alloc.ino, &mut inode, csum_seed,
+                    )?;
+                    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+                    let commit_seq =
+                        RequestScope::with_transaction(txn).commit_if_write(&self.mvcc_store)?;
+                    Ok(Some((alloc.ino, inode, commit_seq)))
+                })();
+                match result {
+                    Err(FfsError::MvccConflict { .. }) if attempt < MAX_ATTEMPTS => {
+                        trace!(
+                            target: "ffs::mvcc",
+                            group = group.0,
+                            attempt,
+                            "inode_prepare_retry_after_conflict"
+                        );
+                        attempt += 1;
+                    }
+                    Ok(Some(created)) => {
+                        *stats = working;
+                        return Ok(Some(created));
+                    }
+                    other => return other,
+                }
             }
-        };
-        let new_generation = old_generation.wrapping_add(1);
-
-        let inode = ffs_inode::build_fresh_inode(
-            mode,
-            uid,
-            gid,
-            is_directory,
-            sb.has_incompat(ffs_ondisk::Ext4IncompatFeatures::EXTENTS),
-            new_generation,
-            now_secs,
-            now_nsec,
-        );
-        self.ext4_sharded_stage_inode_slot(cx, dev, loc, inode_size, ino, &inode, csum_seed)?;
+        })?;
+        let (ino, inode, commit_seq) = created.ok_or(FfsError::NoSpace)?;
+        // The group lock is released before pruning or touching inode caches.
+        self.prune_mvcc_after_commit_if_due(commit_seq);
         self.forget_ext4_inode_caches(ino);
         Ok((ino, inode))
+    }
+
+    /// Stage a new inode's generation and body from the same snapshot ancestor.
+    /// `stats` belongs to the group already locked by the allocation callback.
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    fn ext4_stage_fresh_inode_slot(
+        cx: &Cx,
+        dev: &TransactionBlockAdapter<'_, '_>,
+        geo: &FsGeometry,
+        stats: &GroupStats,
+        ino: InodeNumber,
+        inode: &mut Ext4Inode,
+        csum_seed: u32,
+    ) -> Result<(), FfsError> {
+        if ino.0 == 0 || geo.inodes_per_group == 0 || geo.block_size == 0 || geo.inode_size < 128 {
+            return Err(FfsError::Corruption {
+                block: stats.inode_table_block.0,
+                detail: "sharded create: invalid inode geometry".into(),
+            });
+        }
+        let index = ffs_types::inode_index_in_group(ino, geo.inodes_per_group);
+        let byte_in_table = u64::from(index) * u64::from(geo.inode_size);
+        let block_offset = byte_in_table / u64::from(geo.block_size);
+        let byte_offset = usize::try_from(byte_in_table % u64::from(geo.block_size))
+            .map_err(|_| FfsError::Format("inode byte offset exceeds usize".into()))?;
+        let inode_size = usize::from(geo.inode_size);
+        let block = BlockNumber(
+            stats
+                .inode_table_block
+                .0
+                .checked_add(block_offset)
+                .ok_or_else(|| FfsError::Corruption {
+                    block: stats.inode_table_block.0,
+                    detail: "sharded create: inode table block overflow".into(),
+                })?,
+        );
+        let end = byte_offset
+            .checked_add(inode_size)
+            .ok_or_else(|| FfsError::Corruption {
+                block: block.0,
+                detail: "sharded create: inode slot overflow".into(),
+            })?;
+        dev.rmw_block(cx, block, &[(byte_offset, inode_size)], &mut |data| {
+            let slot = data
+                .get_mut(byte_offset..end)
+                .ok_or_else(|| FfsError::Corruption {
+                    block: block.0,
+                    detail: "inode extends beyond block boundary".into(),
+                })?;
+            let old_generation =
+                u32::from_le_bytes([slot[0x64], slot[0x65], slot[0x66], slot[0x67]]);
+            inode.generation = old_generation.wrapping_add(1);
+            ffs_inode::serialize_inode_with_checksum(inode, inode_size, ino, csum_seed, slot);
+            Ok(())
+        })
     }
 
     /// Stage `inode` into its inode-table slot under a SLOT-SCOPED merge proof
@@ -33156,8 +33331,6 @@ impl OpenFs {
         let bs_usize = usize::try_from(block_size)
             .map_err(|_| FfsError::Format("block size does not fit usize".into()))?;
         let sectors_per_block = block_size / u64::from(EXT4_SECTOR_SIZE);
-        let block_size_u32 = u32::try_from(block_size)
-            .map_err(|_| FfsError::Format("block size does not fit u32".into()))?;
 
         let mut alloc = alloc_mutex.write();
 
@@ -33223,15 +33396,7 @@ impl OpenFs {
             let lo = interior_start / block_size;
             let hi = interior_end / block_size;
             let freed = if lo < hi {
-                self.ext4_free_indirect_range(
-                    cx,
-                    scope,
-                    &mut alloc,
-                    &mut inode,
-                    lo,
-                    hi,
-                    block_size_u32,
-                )?
+                self.ext4_free_indirect_range(cx, scope, &mut alloc, &mut inode, lo..hi)?
             } else {
                 0
             };
@@ -34217,49 +34382,37 @@ impl OpenFs {
                         )
                     })?;
                     let mut root_bytes = Self::extent_root(&inode);
-                    let freed = if let Some(tx) = &mut scope.tx {
-                        let tx_dev = TransactionBlockAdapter {
-                            base: &block_dev,
-                            tx: Mutex::new(tx),
-                        };
-                        let Ext4AllocState {
-                            geo,
-                            groups,
-                            persist_ctx,
-                        } = &mut *alloc;
-                        ffs_extent::truncate_extents(
-                            cx,
-                            &tx_dev,
-                            &mut root_bytes,
-                            geo,
-                            groups,
-                            new_logical_end,
-                            persist_ctx,
-                            ffs_extent::ExtentOwner {
-                                ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
-                                generation: inode.generation,
-                            },
-                        )?
-                    } else {
-                        let Ext4AllocState {
-                            geo,
-                            groups,
-                            persist_ctx,
-                        } = &mut *alloc;
-                        ffs_extent::truncate_extents(
-                            cx,
-                            &block_dev,
-                            &mut root_bytes,
-                            geo,
-                            groups,
-                            new_logical_end,
-                            persist_ctx,
-                            ffs_extent::ExtentOwner {
-                                ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
-                                generation: inode.generation,
-                            },
-                        )?
-                    };
+                    let freed =
+                        Self::ext4_with_scoped_block_frees(scope, &mut alloc, |scope, alloc| {
+                            let Ext4AllocState {
+                                geo,
+                                groups,
+                                persist_ctx,
+                            } = alloc;
+                            let tx_dev;
+                            let dev: &dyn BlockDevice = if let Some(tx) = &mut scope.tx {
+                                tx_dev = TransactionBlockAdapter {
+                                    base: &block_dev,
+                                    tx: Mutex::new(tx),
+                                };
+                                &tx_dev
+                            } else {
+                                &block_dev
+                            };
+                            ffs_extent::truncate_extents(
+                                cx,
+                                dev,
+                                &mut root_bytes,
+                                geo,
+                                groups,
+                                new_logical_end,
+                                persist_ctx,
+                                ffs_extent::ExtentOwner {
+                                    ino: u32::try_from(ino.0).unwrap_or(u32::MAX),
+                                    generation: inode.generation,
+                                },
+                            )
+                        })?;
                     // A truncate-down frees blocks the allocator may recycle into
                     // any logical offset of this or another inode (bd-5911f). With
                     // the stable (ino,generation) cache namespace (bd-j6ljg) this
@@ -34345,9 +34498,7 @@ impl OpenFs {
                         scope,
                         &mut alloc,
                         &mut inode,
-                        cutoff,
-                        u64::MAX,
-                        block_size,
+                        cutoff..u64::MAX,
                     )?;
                     // Drop only this inode's cache namespace (bd-j6ljg stable
                     // key), keeping other inodes warm — see the extent-path note
@@ -46953,6 +47104,7 @@ impl OpenFs {
             tx: Some(txn),
             commit_mode: RequestCommitMode::PerRequest,
             skip_readdir_prefetch: false,
+            ext4_freed_blocks: BTreeMap::new(),
         };
         match self.ext4_rename2_exchange_staged(
             cx,
@@ -53019,6 +53171,7 @@ mod tests {
             tx: Some(txn),
             commit_mode: RequestCommitMode::PerRequest,
             skip_readdir_prefetch: false,
+            ext4_freed_blocks: BTreeMap::new(),
         };
 
         // Reference (prior behavior): per-block read_block_with_scope. Reset
@@ -53107,6 +53260,7 @@ mod tests {
             tx: Some(txn),
             commit_mode: RequestCommitMode::PerRequest,
             skip_readdir_prefetch: false,
+            ext4_freed_blocks: BTreeMap::new(),
         };
 
         let reference: Vec<Vec<u8>> = (START..START + COUNT as u64)
@@ -71580,7 +71734,11 @@ mod tests {
             let total_before = sharded.total_free().inodes;
 
             let alloc = sharded
-                .alloc_inode(&cx, &dev, &geo, target, false, &pctx)
+                .alloc_inode_with(target, geo.group_count, |group, stats| {
+                    ffs_alloc::try_alloc_inode_in_group_persist_core(
+                        &cx, &dev, &geo, stats, group, false, &pctx,
+                    )
+                })
                 .unwrap_or_else(|e| panic!("sharded alloc_inode call {call} errored: {e:?}"))
                 .unwrap_or_else(|| panic!("sharded alloc_inode call {call} found no free inode"));
 
@@ -71678,7 +71836,11 @@ mod tests {
             let fi_before = free_inodes();
 
             let alloc = sharded
-                .alloc_inode(&cx, &dev, &geo, target, true, &pctx)
+                .alloc_inode_with(target, geo.group_count, |group, stats| {
+                    ffs_alloc::try_alloc_inode_in_group_persist_core(
+                        &cx, &dev, &geo, stats, group, true, &pctx,
+                    )
+                })
                 .unwrap_or_else(|e| panic!("dir {i}: sharded alloc_inode errored: {e:?}"))
                 .unwrap_or_else(|| panic!("dir {i}: sharded alloc_inode found no free inode"));
 
@@ -71712,7 +71874,15 @@ mod tests {
         let ud_before_file = used_dirs();
         let fi_before_file = free_inodes();
         let file = sharded
-            .alloc_inode(&cx, &dev, &geo, ffs_types::GroupNumber(0), false, &pctx)
+            .alloc_inode_with(
+                ffs_types::GroupNumber(0),
+                geo.group_count,
+                |group, stats| {
+                    ffs_alloc::try_alloc_inode_in_group_persist_core(
+                        &cx, &dev, &geo, stats, group, false, &pctx,
+                    )
+                },
+            )
             .expect("file sharded alloc_inode errored")
             .expect("file sharded alloc_inode found no free inode");
         assert_eq!(
@@ -74307,10 +74477,14 @@ mod tests {
     /// contention point and the allocator is.
     ///
     /// Gated on the feature because the routing it exercises does not exist
-    /// without it; the runtime toggle is set explicitly since it now defaults off
-    /// (bd-pbyu0).
-    /// ⛔ **STILL `#[ignore]`d, now because it is FLAKY rather than reliably red.**
-    /// Measured across four full-suite runs after the third fix: 3 passed, 1
+    /// without it; the runtime toggle is explicit. Low-level OpenOptions
+    /// defaults off, while the CLI defaults on. Both this test and its
+    /// single-lock control are enabled and passed in the bd-y2t0r affected
+    /// cohort (32 core tests, one existing ignored performance measurement).
+    ///
+    /// Historical investigation follows; it describes earlier failures, not
+    /// the current test attributes or a newly demonstrated MVCC defect.
+    /// Across four earlier full-suite runs after the third fix: 3 passed, 1
     /// failed. Three defects have been found and fixed and the failure has moved
     /// three times, but a 3-of-4 gate is not a gate.
     ///
@@ -74325,8 +74499,8 @@ mod tests {
     /// gone and a contention residual remains. Four runs is a small sample and
     /// this reading should be re-checked, not trusted outright.
     ///
-    /// WHAT IS LEFT: a residual FCW on an inode-table block under true
-    /// contention, despite both writers declaring disjoint slots.
+    /// The remaining failure at that historical checkpoint was an FCW on an
+    /// inode-table block despite both writers declaring disjoint slots.
     ///
     /// ⛔ THE PROOF-DOWNGRADE EXPLANATION IS REFUTED — MEASURED, not argued. The
     /// suspect was a third writer staging an opaque whole-block write to that
@@ -74398,11 +74572,10 @@ mod tests {
     /// unattributable between "the sharded routing is broken" and "concurrent
     /// removal was never supported at all".
     ///
-    /// ⚠ The shipping default is still OFF (`bd-pbyu0`). This test green is
-    /// necessary but NOT sufficient to flip it: the parallel-metadata comparator
-    /// row that justifies the sharded path has not been re-measured with deletes
-    /// routed, and bd-pbyu0 shipped a P0 precisely because a cutover was declared
-    /// complete on partial evidence.
+    /// These correctness controls do not establish a performance improvement
+    /// or qualify a default change. The existing CLI-on / OpenOptions-off
+    /// defaults are unchanged by this work; the parallel-metadata comparator
+    /// still requires its own executed evidence.
     #[cfg(feature = "bhh0i_sharded_alloc")]
     #[test]
     fn concurrent_create_delete_under_sharded_alloc_keeps_counters_exact_bd_y2t0r() {
@@ -76195,6 +76368,238 @@ mod tests {
             "e2fsck must accept the image after {FILES} retained 16 KiB files \
              (sharded={sharded}):\n{output}"
         );
+    }
+
+    #[test]
+    fn aborted_scoped_truncate_preserves_single_lock_accounting_bd_y2t0r() {
+        scoped_truncate_accounting_check_bd_y2t0r(false, false);
+    }
+
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[test]
+    fn aborted_scoped_truncate_preserves_sharded_accounting_bd_y2t0r() {
+        scoped_truncate_accounting_check_bd_y2t0r(true, false);
+    }
+
+    #[test]
+    fn aborted_scoped_truncate_preserves_indirect_single_lock_accounting_bd_y2t0r() {
+        scoped_truncate_accounting_check_bd_y2t0r(false, true);
+    }
+
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[test]
+    fn aborted_scoped_truncate_preserves_indirect_sharded_accounting_bd_y2t0r() {
+        scoped_truncate_accounting_check_bd_y2t0r(true, true);
+    }
+
+    fn scoped_truncate_accounting_check_bd_y2t0r(sharded: bool, indirect: bool) {
+        let (fs, dev, tmp) = open_writable_ext4_mkfs_with_device(64)
+            .expect("bd-y2t0r scoped truncate requires a successful mkfs.ext4 invocation");
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        assert!(!fs.set_bhh0i_sharded_ops(sharded));
+        #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+        assert!(!sharded, "sharded control requires its feature");
+
+        let cx = Cx::for_testing();
+        let root = InodeNumber(2);
+        let block_size = fs.block_size();
+        let original_blocks = if indirect { 14 } else { 4 };
+        let original_size = original_blocks * block_size;
+        let freed_blocks = u64::from(original_blocks - 2) + u64::from(indirect);
+        let payload: Vec<u8> = (0..original_size)
+            .map(|index| u8::try_from(index % 251 + 1).expect("pattern byte fits u8"))
+            .collect();
+        let shortened = 2 * block_size;
+        let bitmap_blocks: Vec<_> = fs
+            .require_alloc_state()
+            .expect("writable allocator")
+            .read()
+            .groups
+            .iter()
+            .map(|group| group.block_bitmap_block)
+            .collect();
+        let read_bitmaps = || -> Vec<Vec<u8>> {
+            bitmap_blocks
+                .iter()
+                .map(|block| fs.read_block_vec(&cx, *block).expect("read block bitmap"))
+                .collect()
+        };
+        let allocated_bits = |bitmaps: &[Vec<u8>]| -> u64 {
+            bitmaps
+                .iter()
+                .flatten()
+                .map(|byte| u64::from(byte.count_ones()))
+                .sum()
+        };
+
+        // The committed control runs first: rejecting every truncate cannot
+        // satisfy the abort invariant. Indirect files need fourteen data blocks
+        // and a single-indirect root; extent files retain the four-block case.
+        for commit in [true, false] {
+            let name = if commit {
+                "truncate-commit"
+            } else {
+                "truncate-abort"
+            };
+            let file = fs
+                .create(&cx, root, OsStr::new(name), 0o644, 0, 0)
+                .expect("create truncate target");
+            if indirect {
+                let mut inode = fs.read_inode(&cx, file.ino).expect("empty inode");
+                assert_eq!(inode.size, 0);
+                assert_eq!(inode.blocks, 0);
+                inode.flags &= !ffs_types::EXT4_EXTENTS_FL;
+                inode.extent_bytes.fill(0);
+                fs.persist_ext4_inode_for_testing(&cx, file.ino, &inode)
+                    .expect("persist empty indirect inode");
+            }
+            assert_eq!(
+                fs.write(&cx, file.ino, 0, &payload)
+                    .expect("write all data blocks"),
+                original_size
+            );
+            fs.flush_mvcc_to_device(&cx).expect("flush initial file");
+            assert_eq!(
+                fs.read(&cx, file.ino, 0, original_size)
+                    .expect("read initial file"),
+                payload
+            );
+            let inode_before = fs.read_inode(&cx, file.ino).expect("materialized inode");
+            assert_eq!(
+                inode_before.blocks,
+                (u64::from(original_blocks) + u64::from(indirect))
+                    * u64::from(block_size / EXT4_SECTOR_SIZE)
+            );
+            if indirect {
+                assert_eq!(inode_before.flags & ffs_types::EXT4_EXTENTS_FL, 0);
+                assert_ne!(
+                    u32::from_le_bytes(inode_before.extent_bytes[48..52].try_into().unwrap()),
+                    0,
+                    "logical blocks twelve and thirteen must use an indirect root"
+                );
+            }
+            let before = fs.statfs(&cx, root).expect("initial free totals");
+            let bitmaps_before = read_bitmaps();
+            let mut scope = <OpenFs as FsOps>::begin_request_scope(&fs, &cx, RequestOp::Setattr)
+                .expect("begin truncate scope");
+            for staged_size in [(original_blocks - 1) * block_size, shortened] {
+                let staged = <OpenFs as FsOps>::setattr(
+                    &fs,
+                    &cx,
+                    &mut scope,
+                    file.ino,
+                    &SetAttrRequest {
+                        size: Some(u64::from(staged_size)),
+                        ..SetAttrRequest::default()
+                    },
+                )
+                .expect("stage repeated truncate");
+                assert_eq!(staged.size, u64::from(staged_size));
+                assert!(
+                    scope.pending_write_count() > 0,
+                    "truncate must stage real writes"
+                );
+                let staged_totals = fs.statfs(&cx, root).expect("precommit free totals");
+                println!(
+                    "bd-y2t0r staged truncate: sharded={sharded} indirect={indirect} \
+                     commit={commit} staged_size={staged_size} free_blocks_before={} \
+                     free_blocks_staged={}",
+                    before.blocks_free, staged_totals.blocks_free
+                );
+                assert_eq!(staged_totals.blocks_free, before.blocks_free);
+                assert_eq!(staged_totals.files_free, before.files_free);
+                assert_eq!(read_bitmaps(), bitmaps_before);
+            }
+            if commit {
+                <OpenFs as FsOps>::commit_request_scope(&fs, &cx, &mut scope)
+                    .expect("commit truncate control");
+            }
+            <OpenFs as FsOps>::end_request_scope(&fs, &cx, RequestOp::Setattr, scope)
+                .expect("end truncate scope");
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+
+            let expected = if commit {
+                &payload[..usize::try_from(shortened).expect("length fits usize")]
+            } else {
+                payload.as_slice()
+            };
+            assert_eq!(
+                fs.getattr(&cx, file.ino).expect("stored size").size,
+                u64::try_from(expected.len()).expect("length fits u64")
+            );
+            assert_eq!(
+                fs.read(&cx, file.ino, 0, original_size)
+                    .expect("stored bytes"),
+                expected
+            );
+            let inode_after = fs.read_inode(&cx, file.ino).expect("final inode");
+            if commit {
+                assert_eq!(
+                    inode_after.blocks,
+                    2 * u64::from(block_size / EXT4_SECTOR_SIZE)
+                );
+                if indirect {
+                    assert_eq!(
+                        u32::from_le_bytes(inode_after.extent_bytes[48..52].try_into().unwrap()),
+                        0,
+                        "the final shrink must release the indirect root"
+                    );
+                }
+            } else {
+                assert_eq!(inode_after.blocks, inode_before.blocks);
+                assert_eq!(inode_after.extent_bytes, inode_before.extent_bytes);
+            }
+            let bitmaps_after = read_bitmaps();
+            if commit {
+                assert_eq!(
+                    allocated_bits(&bitmaps_after) + freed_blocks,
+                    allocated_bits(&bitmaps_before)
+                );
+            } else {
+                assert_eq!(
+                    bitmaps_after, bitmaps_before,
+                    "aborted bitmap writes must disappear"
+                );
+            }
+            let after = fs.statfs(&cx, root).expect("final free totals");
+            println!(
+                "bd-y2t0r scoped truncate: sharded={sharded} indirect={indirect} commit={commit} \
+                 original_bytes={} stored_bytes={} free_blocks_before={} free_blocks_after={} \
+                 free_inodes_before={} free_inodes_after={}",
+                payload.len(),
+                expected.len(),
+                before.blocks_free,
+                after.blocks_free,
+                before.files_free,
+                after.files_free
+            );
+            assert_eq!(
+                after.files_free, before.files_free,
+                "truncate retains the inode"
+            );
+            assert_eq!(
+                after.blocks_free,
+                before.blocks_free + if commit { freed_blocks } else { 0 },
+                "only a committed truncate may credit free blocks (sharded={sharded})"
+            );
+            fs.flush_mvcc_to_device(&cx)
+                .expect("flush checked accounting");
+            assert_eq!(
+                ext4_group_free_block_mismatches(&dev.snapshot_bytes()),
+                [] as [(u32, u32, u32); 0],
+                "flushed descriptors must agree with allocation bitmaps"
+            );
+            let image = tmp.path().join("test.ext4");
+            std::fs::write(&image, dev.snapshot_bytes()).expect("write checked image");
+            let (clean, output) =
+                run_e2fsck(&image).expect("bd-y2t0r scoped truncate requires e2fsck to execute");
+            println!(
+                "bd-y2t0r scoped truncate e2fsck: sharded={sharded} indirect={indirect} \
+                 commit={commit} \
+                 success={clean}\n{output}"
+            );
+            assert!(clean, "e2fsck must accept the checked image:\n{output}");
+        }
     }
 
     /// bd-y2t0r: the composite gate for the block-side reconciliation — BOTH
@@ -85174,10 +85579,9 @@ mod tests {
             .total_free()
             .inodes;
 
-        let alloc = fs
-            .ext4_sharded_alloc_inode(&cx, &dev, GroupNumber(0), false)
-            .expect("alloc must not error")
-            .expect("alloc must find a free inode");
+        let (ino, _) = fs
+            .ext4_sharded_create_inode(&cx, &dev, 0o100_644, 0, 0, GroupNumber(0), false, 0, 0)
+            .expect("alloc and preparation must find a free inode without error");
         let after_alloc = fs
             .ext4_sharded_alloc
             .as_ref()
@@ -85190,7 +85594,7 @@ mod tests {
             "alloc must debit total_free().inodes by 1"
         );
 
-        fs.ext4_sharded_free_inode(&cx, &dev, alloc.ino, false)
+        fs.ext4_sharded_free_inode(&cx, &dev, ino, false)
             .expect("free_inode must not error");
         let after_free = fs
             .ext4_sharded_alloc
@@ -85206,14 +85610,15 @@ mod tests {
 
     #[cfg(feature = "bhh0i_sharded_alloc")]
     #[test]
-    fn ext4_sharded_alloc_inode_wrapper_allocates_bd_bhh0i() {
-        // Inode-side mirror of the block wrapper test: each call allocates an
-        // inode in a valid group and debits total_free().inodes by one.
+    fn ext4_sharded_create_inode_allocates_bd_bhh0i() {
+        // Each atomic allocation and preparation must land in a valid group
+        // and debit total_free().inodes by one.
         let Some((fs, _tmp)) = open_writable_ext4_mkfs(16) else {
             return;
         };
         let cx = Cx::for_testing();
         let dev = fs.block_device_adapter();
+        let inodes_per_group = fs.ext4_superblock().expect("ext4").inodes_per_group;
         let group_count = fs
             .ext4_sharded_alloc
             .as_ref()
@@ -85226,12 +85631,12 @@ mod tests {
             .total_free()
             .inodes;
         for call in 0..3 {
-            let alloc = fs
-                .ext4_sharded_alloc_inode(&cx, &dev, GroupNumber(0), false)
-                .unwrap_or_else(|e| panic!("wrapper inode alloc call {call} errored: {e:?}"))
-                .unwrap_or_else(|| panic!("wrapper inode alloc call {call} found no free inode"));
+            let (ino, _) = fs
+                .ext4_sharded_create_inode(&cx, &dev, 0o100_644, 0, 0, GroupNumber(0), false, 0, 0)
+                .unwrap_or_else(|e| panic!("atomic inode create call {call} errored: {e:?}"));
+            let group = ffs_types::inode_to_group(ino, inodes_per_group);
             assert!(
-                (alloc.group.0 as usize) < group_count,
+                (group.0 as usize) < group_count,
                 "call {call}: landing group out of range"
             );
         }
@@ -85274,6 +85679,155 @@ mod tests {
                 expected.map(|l| (l.block, l.byte_offset)),
                 "sharded locate mismatch for inode {ino_num}"
             );
+        }
+    }
+
+    #[cfg(feature = "bhh0i_sharded_alloc")]
+    #[test]
+    fn sharded_inode_preparation_failure_is_atomic_bd_y2t0r() {
+        use sha2::Digest;
+
+        for is_directory in [false, true] {
+            let (fs, image_dev, tmp) = open_writable_ext4_mkfs_with_device(16)
+                .expect("bd-y2t0r inode preparation requires successful mkfs.ext4");
+            assert!(!fs.set_bhh0i_sharded_ops(true));
+            let cx = Cx::for_testing();
+            let geo = FsGeometry::from_superblock(fs.ext4_superblock().expect("ext4"));
+            assert_eq!(geo.group_count, 1, "control must use the tested group");
+            let sharded = fs.ext4_sharded_alloc.as_ref().expect("sharded allocator");
+            let group_before = sharded.lock_group(0).clone();
+            let dev = fs.block_device_adapter();
+            let bitmap_before = dev
+                .read_block(&cx, group_before.inode_bitmap_block)
+                .expect("initial inode bitmap")
+                .into_inner();
+            let inode_count = geo.inodes_in_group(GroupNumber(0));
+            let reserved = ffs_alloc::reserved_inode_count_in_group(&geo, GroupNumber(0));
+            assert!((0..reserved).all(|bit| bitmap_get(&bitmap_before, bit)));
+            let bit = ffs_alloc::bitmap_find_free(
+                &bitmap_before,
+                inode_count,
+                group_before.inode_search_start(inode_count),
+            )
+            .expect("formatted image has a free inode");
+            let candidate = InodeNumber(u64::from(bit) + 1);
+            let loc = fs
+                .ext4_sharded_locate_inode(candidate)
+                .expect("candidate slot");
+            let snapshot_before = fs.current_snapshot();
+            let image_before = sha2::Sha256::digest(image_dev.snapshot_bytes());
+            let faulted = ffs_block::FaultInjector::new(dev, 0xA110_CAFE);
+            faulted.fail_on_read(loc.block, ffs_block::FaultMode::Persistent);
+
+            // The bitmap is selected first; fail the subsequent generation read,
+            // before the caller receives an inode number it could roll back.
+            let error = fs
+                .ext4_sharded_create_inode(
+                    &cx,
+                    &faulted,
+                    if is_directory { 0o040_755 } else { 0o100_644 },
+                    0,
+                    0,
+                    GroupNumber(0),
+                    is_directory,
+                    111,
+                    222,
+                )
+                .expect_err("inode preparation must propagate the injected read failure");
+            assert!(
+                matches!(&error, FfsError::Corruption { detail, .. }
+                    if detail.contains("injected fault on Read")),
+                "unexpected preparation error: {error}"
+            );
+            let faults = faulted.fault_log();
+            assert_eq!(faults.len(), 1, "the preparation read must actually fail");
+            assert_eq!(faults[0].target, ffs_block::FaultTarget::Read(loc.block));
+            let group_after = sharded.lock_group(0).clone();
+            println!(
+                "bd-y2t0r inode preparation: directory={is_directory} candidate={} \
+                 failed_block={} error={error} free_inodes_before={} free_inodes_after={} \
+                 used_dirs_before={} used_dirs_after={} commit_before={} commit_after={}",
+                candidate.0,
+                loc.block.0,
+                group_before.free_inodes,
+                group_after.free_inodes,
+                group_before.used_dirs,
+                group_after.used_dirs,
+                snapshot_before.high.0,
+                fs.current_snapshot().high.0
+            );
+            assert_eq!(
+                faulted
+                    .read_block(&cx, group_before.inode_bitmap_block)
+                    .expect("bitmap after failed preparation")
+                    .as_slice(),
+                bitmap_before,
+                "failed preparation must not publish its inode bitmap bit"
+            );
+            assert_eq!(
+                (
+                    group_after.free_inodes,
+                    group_after.used_dirs,
+                    group_after.flags,
+                    group_after.inode_search_start,
+                ),
+                (
+                    group_before.free_inodes,
+                    group_before.used_dirs,
+                    group_before.flags,
+                    group_before.inode_search_start,
+                ),
+                "failed preparation must preserve allocator accounting and search state"
+            );
+            assert_eq!(fs.current_snapshot(), snapshot_before);
+            assert_eq!(
+                sha2::Sha256::digest(image_dev.snapshot_bytes()),
+                image_before
+            );
+
+            // Remove the fault and exercise the ordinary namespace caller. A
+            // refusal-only implementation cannot satisfy this control.
+            faulted.reset();
+            let name = OsStr::new("prepared");
+            let created = if is_directory {
+                fs.mkdir(&cx, InodeNumber(2), name, 0o755, 0, 0)
+            } else {
+                fs.create(&cx, InodeNumber(2), name, 0o644, 0, 0)
+            }
+            .expect("ordinary creation succeeds after the preparation fault");
+            assert_eq!(
+                created.ino, candidate,
+                "the failed attempt must not consume an inode"
+            );
+            assert_eq!(
+                fs.lookup(&cx, InodeNumber(2), name)
+                    .expect("published name")
+                    .ino,
+                created.ino
+            );
+            assert_eq!(
+                fs.read_inode(&cx, created.ino)
+                    .expect("created inode")
+                    .is_dir(),
+                is_directory
+            );
+            let group_committed = sharded.lock_group(0).clone();
+            assert_eq!(group_committed.free_inodes + 1, group_before.free_inodes);
+            assert_eq!(
+                group_committed.used_dirs,
+                group_before.used_dirs + u32::from(is_directory)
+            );
+            fs.flush_mvcc_to_device(&cx)
+                .expect("flush successful control");
+            let image = tmp.path().join("test.ext4");
+            std::fs::write(&image, image_dev.snapshot_bytes()).expect("write checked image");
+            let (clean, output) =
+                run_e2fsck(&image).expect("bd-y2t0r inode preparation requires e2fsck to execute");
+            println!(
+                "bd-y2t0r inode preparation e2fsck: directory={is_directory} \
+                 success={clean}\n{output}"
+            );
+            assert!(clean, "successful control must be e2fsck-clean:\n{output}");
         }
     }
 
@@ -90452,6 +91006,7 @@ mod tests {
                 tx: None,
                 commit_mode: RequestCommitMode::PerRequest,
                 skip_readdir_prefetch: false,
+                ext4_freed_blocks: BTreeMap::new(),
             },
         )
         .expect("end request scope");
@@ -90683,6 +91238,268 @@ mod tests {
                 .as_slice(),
             bytes_b.as_slice()
         );
+    }
+
+    #[test]
+    fn scoped_truncate_conflict_preserves_concurrent_accounting_bd_y2t0r() {
+        #[cfg(feature = "bhh0i_sharded_alloc")]
+        let modes = [false, true];
+        #[cfg(not(feature = "bhh0i_sharded_alloc"))]
+        let modes = [false];
+
+        for sharded in modes {
+            let (fs, dev, tmp) = open_writable_ext4_mkfs_with_device(64)
+                .expect("bd-y2t0r conflict regression requires mkfs.ext4");
+            #[cfg(feature = "bhh0i_sharded_alloc")]
+            assert!(!fs.set_bhh0i_sharded_ops(sharded));
+            let cx = Cx::for_testing();
+            let root = InodeNumber(2);
+            let block_size = fs.block_size();
+            let block_len = usize::try_from(block_size).expect("block size fits usize");
+            let payload: Vec<u8> = (0..4 * block_len)
+                .map(|index| u8::try_from(index % 251 + 1).expect("pattern fits u8"))
+                .collect();
+            let unrelated_payload = vec![0xAD; 3 * block_len];
+            let target = fs
+                .create(&cx, root, OsStr::new("conflicting-truncate"), 0o644, 0, 0)
+                .expect("create truncate target");
+            let unrelated = fs
+                .create(&cx, root, OsStr::new("unrelated-allocation"), 0o644, 0, 0)
+                .expect("create unrelated file");
+            assert_eq!(
+                fs.write(&cx, target.ino, 0, &payload)
+                    .expect("write target"),
+                4 * block_size
+            );
+            fs.flush_mvcc_to_device(&cx).expect("flush initial files");
+            let initial = fs.statfs(&cx, root).expect("initial accounting");
+            let (inode_block, bitmap_blocks) = {
+                let alloc = fs.require_alloc_state().expect("allocator").read();
+                (
+                    ffs_inode::locate_inode(target.ino, &alloc.geo, &alloc.groups)
+                        .expect("locate target inode")
+                        .block,
+                    alloc
+                        .groups
+                        .iter()
+                        .map(|group| group.block_bitmap_block)
+                        .collect::<Vec<_>>(),
+                )
+            };
+            let read_bitmaps = || -> Vec<Vec<u8>> {
+                bitmap_blocks
+                    .iter()
+                    .map(|block| fs.read_block_vec(&cx, *block).expect("read live bitmap"))
+                    .collect()
+            };
+            let allocated_bits = |bitmaps: &[Vec<u8>]| -> u64 {
+                bitmaps
+                    .iter()
+                    .flatten()
+                    .map(|byte| u64::from(byte.count_ones()))
+                    .sum()
+            };
+            let shrink = |scope: &mut RequestScope, blocks: u32| {
+                let attr = FsOps::setattr(
+                    &fs,
+                    &cx,
+                    scope,
+                    target.ino,
+                    &SetAttrRequest {
+                        size: Some(u64::from(blocks * block_size)),
+                        ..SetAttrRequest::default()
+                    },
+                )
+                .expect("stage truncate");
+                assert_eq!(attr.size, u64::from(blocks * block_size));
+                assert!(scope.pending_write_count() > 0);
+            };
+            let initial_bitmaps = read_bitmaps();
+
+            // A real later truncate wins both the inode and bitmap publication.
+            // The unrelated allocation must survive the losing scope's cleanup.
+            let mut stale = fs
+                .begin_request_scope(&cx, RequestOp::Setattr)
+                .expect("begin stale truncate");
+            shrink(&mut stale, 2);
+            assert_eq!(read_bitmaps(), initial_bitmaps);
+            assert_eq!(
+                fs.statfs(&cx, root).unwrap().blocks_free,
+                initial.blocks_free
+            );
+            assert_eq!(
+                fs.write(&cx, unrelated.ino, 0, &unrelated_payload[..2 * block_len])
+                    .expect("commit unrelated allocation"),
+                2 * block_size
+            );
+            let mut winner = fs
+                .begin_request_scope(&cx, RequestOp::Setattr)
+                .expect("begin competing truncate");
+            shrink(&mut winner, 3);
+            let stale_tx = stale.tx.as_ref().expect("stale transaction exists");
+            let shared_blocks: Vec<_> = winner
+                .tx
+                .as_ref()
+                .expect("competing transaction exists")
+                .write_set()
+                .keys()
+                .filter(|block| stale_tx.write_set().contains_key(block))
+                .copied()
+                .collect();
+            assert!(shared_blocks.contains(&inode_block));
+            assert!(
+                bitmap_blocks
+                    .iter()
+                    .any(|block| shared_blocks.contains(block))
+            );
+            fs.commit_request_scope(&cx, &mut winner)
+                .expect("publish competing truncate");
+            fs.end_request_scope(&cx, RequestOp::Setattr, winner)
+                .expect("end competing truncate");
+            let committed = fs.statfs(&cx, root).expect("committed accounting");
+            let committed_bitmaps = read_bitmaps();
+            assert_eq!(committed.blocks_free + 1, initial.blocks_free);
+            assert_eq!(
+                allocated_bits(&committed_bitmaps),
+                allocated_bits(&initial_bitmaps) + 1
+            );
+            let error = fs
+                .commit_request_scope(&cx, &mut stale)
+                .expect_err("overlapping truncate must lose publication");
+            assert!(
+                matches!(&error, FfsError::MvccConflict { block, .. }
+                    if shared_blocks.contains(&BlockNumber(*block))),
+                "expected conflict on shared inode/bitmap metadata, got {error:?}"
+            );
+            assert!(stale.tx.is_none(), "failed commit consumes its transaction");
+            assert!(
+                stale.ext4_freed_blocks.is_empty(),
+                "failed credits are discarded"
+            );
+            fs.end_request_scope(&cx, RequestOp::Setattr, stale)
+                .expect("cleanup consumed losing scope");
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            assert_eq!(
+                fs.statfs(&cx, root).unwrap().blocks_free,
+                committed.blocks_free
+            );
+            assert_eq!(read_bitmaps(), committed_bitmaps);
+            assert_eq!(
+                fs.read(&cx, target.ino, 0, 4 * block_size).unwrap(),
+                payload[..3 * block_len]
+            );
+            assert_eq!(
+                fs.read(&cx, unrelated.ino, 0, 3 * block_size).unwrap(),
+                unrelated_payload[..2 * block_len]
+            );
+
+            // Explicit abort also must not restore an old allocator snapshot
+            // over a new allocation performed while the scope was outstanding.
+            let mut aborted = fs
+                .begin_request_scope(&cx, RequestOp::Setattr)
+                .expect("begin abort control");
+            shrink(&mut aborted, 1);
+            assert_eq!(
+                fs.write(
+                    &cx,
+                    unrelated.ino,
+                    u64::from(2 * block_size),
+                    &unrelated_payload[2 * block_len..],
+                )
+                .expect("commit another unrelated block"),
+                block_size
+            );
+            let before_abort = fs.statfs(&cx, root).expect("accounting before abort");
+            let before_abort_bitmaps = read_bitmaps();
+            assert_eq!(before_abort.blocks_free + 1, committed.blocks_free);
+            fs.end_request_scope(&cx, RequestOp::Setattr, aborted)
+                .expect("abort staged truncate");
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            assert_eq!(
+                fs.statfs(&cx, root).unwrap().blocks_free,
+                before_abort.blocks_free
+            );
+            assert_eq!(read_bitmaps(), before_abort_bitmaps);
+            assert_eq!(
+                fs.read(&cx, target.ino, 0, 4 * block_size).unwrap(),
+                payload[..3 * block_len]
+            );
+            assert_eq!(
+                fs.read(&cx, unrelated.ino, 0, 3 * block_size).unwrap(),
+                unrelated_payload
+            );
+
+            // Positive deferred publication credits exactly two blocks once.
+            let mut deferred = fs
+                .begin_writeback_batch_scope(&cx)
+                .expect("begin deferred truncate");
+            assert!(deferred.is_deferred_until_flush());
+            shrink(&mut deferred, 1);
+            assert_eq!(read_bitmaps(), before_abort_bitmaps);
+            assert_eq!(
+                fs.statfs(&cx, root).unwrap().blocks_free,
+                before_abort.blocks_free
+            );
+            let published = fs
+                .commit_request_scope(&cx, &mut deferred)
+                .expect("publish deferred truncate");
+            assert!(published.0 > 0);
+            assert!(deferred.tx.is_none());
+            assert!(deferred.ext4_freed_blocks.is_empty());
+            let after_publish = fs.statfs(&cx, root).expect("published accounting");
+            let published_bitmaps = read_bitmaps();
+            assert_eq!(after_publish.blocks_free, before_abort.blocks_free + 2);
+            assert_eq!(
+                allocated_bits(&published_bitmaps) + 2,
+                allocated_bits(&before_abort_bitmaps)
+            );
+            assert_eq!(
+                fs.commit_writeback_batch_scope(&cx, deferred)
+                    .expect("finish already-published batch"),
+                CommitSeq(0)
+            );
+            assert_eq!(fs.current_snapshot().high, published);
+            assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+            assert_eq!(
+                fs.statfs(&cx, root).unwrap().blocks_free,
+                after_publish.blocks_free
+            );
+            assert_eq!(read_bitmaps(), published_bitmaps);
+            assert_eq!(after_publish.files_free, initial.files_free);
+
+            fs.flush_mvcc_to_device(&cx).expect("flush final image");
+            assert_eq!(
+                ext4_group_free_block_mismatches(&dev.snapshot_bytes()),
+                [] as [(u32, u32, u32); 0]
+            );
+            let image = tmp.path().join("test.ext4");
+            std::fs::write(&image, dev.snapshot_bytes()).expect("persist checked image");
+            let (clean, output) =
+                run_e2fsck(&image).expect("bd-y2t0r conflict regression requires e2fsck execution");
+            println!(
+                "bd-y2t0r conflict/abort/deferred: sharded={sharded} conflict={error:?} \
+                 free_before={} free_after={} e2fsck_clean={clean}\n{output}",
+                initial.blocks_free, after_publish.blocks_free
+            );
+            assert!(clean, "final image must remain e2fsck-clean:\n{output}");
+            drop(fs);
+            let reopened = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default())
+                .expect("reopen checked image");
+            assert_eq!(
+                reopened.read(&cx, target.ino, 0, 4 * block_size).unwrap(),
+                payload[..block_len]
+            );
+            assert_eq!(
+                reopened
+                    .read(&cx, unrelated.ino, 0, 3 * block_size)
+                    .unwrap(),
+                unrelated_payload
+            );
+            assert_eq!(
+                reopened.statfs(&cx, root).unwrap().blocks_free,
+                after_publish.blocks_free
+            );
+        }
     }
 
     #[test]

@@ -276,6 +276,39 @@
 | ext4 JOURNAL_DEV paired-open | `fs/ext4/super.c` | ✅ | Standalone journal device detection (JOURNAL_DEV incompat flag → clear error with guidance). Data filesystems with non-zero `journal_dev` now support paired-open replay through `OpenOptions::external_journal_path`: UUID and block-size validation, external JBD2 replay into the data device, and deterministic refusal when crash recovery is required but the external journal is missing or mismatched. Harness integration coverage in `crates/ffs-harness/tests/ext4_journal_recovery.rs` exercises paired-open replay plus missing/mismatched journal refusal, and `fuzz/fuzz_targets/fuzz_jbd2_replay.rs` now coverage-fuzzes the main JBD2 descriptor/commit/revoke replay engine over equivalent region and segment layouts. |
 | ext4 JBD2 checksum verification | `fs/jbd2/recovery.c` | ✅ | CRC32C verification for JBD2 descriptor, revoke, and commit blocks (V2/V3 features). Implemented in `verify_jbd2_block_checksum()` with V3 UUID-seeded checksums and tail-position validation. Direct `ffs-journal` coverage now proves descriptor/revoke checksum roundtrips, tamper detection, and commit-block V3 UUID-seed validation. |
 
+Ext4 request-scoped truncation now publishes bitmap frees and free-space credits
+together, including indirect data and pointer blocks. Aborted or conflicting
+requests preserve concurrent allocations; repeated and deferred truncation
+credits each free once. Sharded inode preparation likewise publishes its bitmap,
+descriptor and initialized slot together. An injected preparation failure leaves
+the allocation bitmap, counters, cursor, flags and commit sequence unchanged.
+Both defects reproduced before their respective fixes.
+
+At source `24e20f7521fabfbe632801c79884b29636927bdc`, RCH execution passed
+32 affected core tests and the CLI default-selection test, with zero failures.
+One existing performance measurement remained ignored. Coverage includes both
+allocator modes, extent/indirect commit and abort, conflicting/deferred scopes,
+concurrent create/delete, directory churn, rename replacement, retained data,
+inode-slot merging, and injected file/directory preparation failures followed by
+successful reuse. The real formatted-image controls passed `e2fsck`; these are
+OpenFs tests, not mounted workload or performance evidence. CLI mounts continue
+to enable sharded allocation by default, while raw OpenFs instances start with
+the runtime toggle disabled.
+
+The original mounted acceptance also passed at source
+`c936e2371e8c336ddd94d0fe80149e5f54405fa6`, with
+`FFS_BHH0I_SHARDED=1`: 40 cycles × 2,000 empty files on a 2,048 MiB image,
+then four cycles × 300 files × 16 KiB on a 512 MiB image. The unchanged
+`scripts/pbyu0_mounted_repro.sh` completed all 81,200 create/delete pairs.
+An independent observer required zero unlink/sync errors, normal daemon exit,
+the enabled-sharded marker, absent mounts and full `e2fsck -f -n` exit zero
+for both images. Logs are
+`/tmp/ffs-chartreusestone-resume19-y2t0r-mounted-empty.log` and
+`/tmp/ffs-chartreusestone-resume22-y2t0r-mounted-data.log`.
+Workspace/all-targets check and strict Clippy passed through RCH at the same
+source. These sequential mounted workloads supplement the concurrent core
+controls; they make no mounted parallel-throughput claim.
+
 Seed/sprout attachment implementation now has executed core-test evidence in
 `btrfs_seed_sprout_admits_only_the_committed_frozen_seed` and
 `btrfs_seed_sprout_inherited_handles_recheck_frozen_role`. The fixtures place
