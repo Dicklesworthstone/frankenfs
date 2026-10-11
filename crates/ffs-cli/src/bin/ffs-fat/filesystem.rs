@@ -8,12 +8,12 @@ use ffs_core::{
     DirEntry, FileType, FsOps, FsStat, InodeAttr, ReaddirPage, RequestScope, SeekWhence,
 };
 use ffs_error::{FfsError, Result};
-use ffs_ondisk::fat::FatKind;
-use ffs_types::InodeNumber;
+use ffs_ondisk::fat::{FatKind, FatTimestamp};
+use ffs_types::{InodeNumber, ParseError};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
 use std::sync::{Arc, Mutex, MutexGuard};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 const ROOT: InodeNumber = InodeNumber(1);
 const MAX_NODES: usize = 131_072;
@@ -238,18 +238,24 @@ impl FatFs {
                 chain.clusters.len() as u64 * u64::from(self.volume.geometry.cluster_bytes()) / 512;
             (FileType::RegularFile, u64::from(chain.size), blocks, 1)
         };
-        let mtime = node.entry.as_ref().map_or(Ok(UNIX_EPOCH), |entry| {
-            fat_wall_time(entry.native.modified_date, entry.native.modified_time)
-        })?;
+        let (atime, mtime, crtime) = if let Some(entry) = &node.entry {
+            (
+                fat_wall_time(entry.native.accessed_timestamp(), entry.offset)?,
+                fat_wall_time(entry.native.modified_timestamp(), entry.offset)?,
+                fat_wall_time(entry.native.created_timestamp(), entry.offset)?,
+            )
+        } else {
+            (UNIX_EPOCH, UNIX_EPOCH, UNIX_EPOCH)
+        };
         checkpoint(cx)?;
         Ok(InodeAttr {
             ino,
             size,
             blocks,
-            atime: UNIX_EPOCH,
+            atime,
             mtime,
             ctime: UNIX_EPOCH,
-            crtime: UNIX_EPOCH,
+            crtime,
             kind,
             perm: if kind == FileType::Directory {
                 0o555
@@ -460,55 +466,21 @@ impl FsOps for FatFs {
     }
 }
 
-/// FAT stores a wall clock without a timezone. Project its modification fields
-/// onto UTC deterministically; do not guess the machine that wrote the image's
-/// timezone. Unavailable access/change/creation timestamps remain epoch zero.
-fn fat_wall_time(date: u16, time: u16) -> Result<SystemTime> {
-    if date == 0 && time == 0 {
+/// Native FAT timestamps have no timezone. Project available native fields
+/// onto UTC deterministically; preserve unknown timestamps as epoch zero.
+/// Report invalid native fields at their directory record, not at block zero.
+fn fat_wall_time(
+    timestamp: std::result::Result<Option<FatTimestamp>, ParseError>,
+    offset: u64,
+) -> Result<SystemTime> {
+    let Some(timestamp) = timestamp.map_err(|error| FfsError::Corruption {
+        block: offset / 512,
+        detail: format!("invalid FAT timestamp: {error}"),
+    })? else {
         return Ok(UNIX_EPOCH);
-    }
-    let year = 1980 + u64::from(date >> 9);
-    let month = usize::from((date >> 5) & 15);
-    let day = u64::from(date & 31);
-    let hour = u64::from(time >> 11);
-    let minute = u64::from((time >> 5) & 63);
-    let second = u64::from(time & 31) * 2;
-    let leap = year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
-    let months = [
-        31_u64,
-        if leap { 29 } else { 28 },
-        31,
-        30,
-        31,
-        30,
-        31,
-        31,
-        30,
-        31,
-        30,
-        31,
-    ];
-    if !(1..=12).contains(&month)
-        || day == 0
-        || day > months[month - 1]
-        || hour > 23
-        || minute > 59
-        || second > 59
-    {
-        return Err(FfsError::Corruption {
-            block: 0,
-            detail: "invalid FAT modification timestamp".into(),
-        });
-    }
-    let before = |year: u64| {
-        let last = year - 1;
-        365 * last + last / 4 - last / 100 + last / 400
     };
-    let days = before(year) - before(1970) + months[..month - 1].iter().sum::<u64>() + day - 1;
     UNIX_EPOCH
-        .checked_add(Duration::from_secs(
-            days * 86_400 + hour * 3600 + minute * 60 + second,
-        ))
+        .checked_add(timestamp.utc_projection())
         .ok_or_else(|| FfsError::Format("FAT timestamp is outside host SystemTime range".into()))
 }
 
@@ -517,20 +489,22 @@ mod tests {
     use super::*;
 
     #[test]
-    fn fat_time_uses_calendar_rules_and_preserves_two_second_precision() {
-        let date = ((2024 - 1980) << 9) | (2 << 5) | 0x001D;
-        let time = (12 << 11) | (34 << 5) | 0x001C;
+    fn native_wall_time_preserves_precision_absence_and_error_location() {
+        let timestamp = fat_wall_time(
+            FatTimestamp::parse(0x585D, 0x645C, 157).map(Some),
+            4096,
+        )
+        .unwrap()
+        .duration_since(UNIX_EPOCH)
+        .unwrap();
         assert_eq!(
-            fat_wall_time(date, time)
-                .unwrap()
-                .duration_since(UNIX_EPOCH)
-                .unwrap()
-                .as_secs(),
-            1_709_210_096
+            (timestamp.as_secs(), timestamp.subsec_nanos()),
+            (1_709_210_097, 570_000_000)
         );
-        assert!(fat_wall_time(((2023 - 1980) << 9) | (2 << 5) | 0x001D, 0).is_err());
-        assert!(fat_wall_time((1 << 5) | 1, 31).is_err());
-        assert!(fat_wall_time(1, 0).is_err());
-        assert_eq!(fat_wall_time(0, 0).unwrap(), UNIX_EPOCH);
+        assert_eq!(fat_wall_time(Ok(None), 4096).unwrap(), UNIX_EPOCH);
+        assert!(matches!(
+            fat_wall_time(FatTimestamp::parse(0, 0, 0).map(Some), 4096),
+            Err(FfsError::Corruption { block: 8, .. })
+        ));
     }
 }

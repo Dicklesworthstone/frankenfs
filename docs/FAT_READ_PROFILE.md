@@ -63,10 +63,15 @@ Names use lossless UTF-8 LFNs and ASCII short names; non-ASCII OEM-only names,
 unpaired UTF-16 surrogates and names exceeding the host's 255-byte limit are
 refused rather than silently altered. Comparisons fold ASCII only, not Windows
 Unicode collation. Permissions/ownership are explicit read-only Unix projections.
-Modification time is a deterministic UTC projection of native FAT wall-clock
-fields; missing access/change/creation timestamps are epoch zero, not fabricated
-native timestamps. Dirty volumes and conflicting boot copies require offline
-native investigation; this reader never repairs them automatically.
+Native timestamps use a deterministic UTC projection of FAT wall-clock fields;
+the format records no timezone, so this projection does not recover the original
+instant. Creation preserves its native 10 ms precision (including odd seconds),
+access preserves its native date precision, and modification preserves its native
+two-second precision. Unavailable fields and the nonexistent native metadata-change
+time remain epoch zero. Present dates/times must pass calendar and field bounds;
+invalid fields report corruption at their directory record. Dirty volumes and
+conflicting boot copies require offline native investigation; this reader never
+repairs them automatically.
 
 FAT12, exFAT, FAT writes/recovery, complete OEM/Unicode naming parity, integrated
 MVCC/RaptorQ protection, and NTFS/ZFS implementation remain separate work.
@@ -144,3 +149,12 @@ and unchanged image/adjacent-volume bytes. These are authored, source-reviewed
 tests, not executed evidence: the editing executor is offline, and the most recent
 available Actions execution stopped at its action-owner policy before checkout.
 Rust compilation, formatting, Clippy and native-image validation remain required.
+
+**Native timestamp increment (2026-10-11):** the parser retains creation date,
+time and 10 ms increments, access date, and modification date/time. Constructed
+parser and FsOps regressions cover FAT16 and FAT32, leap years including the
+2100 exception, the 1980/2107 endpoints, fractions and odd seconds, absent dates,
+and invalid-field error locations. The calendar constants were independently
+checked with JavaScript date conversion, and the source received a second review.
+Rust tests, formatting, workspace checks, Clippy and UBS remain unexecuted because
+the authoring executor is offline. No new native-image or mounted result is claimed.

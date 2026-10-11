@@ -6,6 +6,7 @@
 //! 64 KiB, and one or two FAT copies. FAT12 and exFAT are not admitted.
 
 use ffs_types::{ParseError, ensure_slice, read_le_u16, read_le_u32};
+use std::time::Duration;
 
 fn invalid(field: &'static str, reason: &'static str) -> ParseError {
     ParseError::InvalidField { field, reason }
@@ -321,6 +322,11 @@ pub struct FatDirEntry {
     pub case_flags: u8,
     pub first_cluster: u32,
     pub size: u32,
+    pub created_date: u16,
+    pub created_time: u16,
+    /// Creation-time increments of 10 ms, including the odd second (0..=199).
+    pub created_centiseconds: u8,
+    pub accessed_date: u16,
     pub modified_date: u16,
     pub modified_time: u16,
 }
@@ -329,6 +335,33 @@ impl FatDirEntry {
     #[must_use]
     pub const fn is_directory(&self) -> bool {
         self.attributes & 0x10 != 0
+    }
+
+    /// FAT has no creation date when this optional field is zero. Other raw
+    /// creation fields are retained even when they cannot identify a date.
+    pub fn created_timestamp(&self) -> Result<Option<FatTimestamp>, ParseError> {
+        (self.created_date != 0)
+            .then(|| {
+                FatTimestamp::parse(
+                    self.created_date,
+                    self.created_time,
+                    self.created_centiseconds,
+                )
+            })
+            .transpose()
+    }
+
+    /// Last access has day precision; FAT stores no access-time-of-day field.
+    pub fn accessed_timestamp(&self) -> Result<Option<FatTimestamp>, ParseError> {
+        (self.accessed_date != 0)
+            .then(|| FatTimestamp::parse(self.accessed_date, 0, 0))
+            .transpose()
+    }
+
+    pub fn modified_timestamp(&self) -> Result<Option<FatTimestamp>, ParseError> {
+        (self.modified_date != 0 || self.modified_time != 0)
+            .then(|| FatTimestamp::parse(self.modified_date, self.modified_time, 0))
+            .transpose()
     }
 
     /// ASCII short-name presentation. Non-ASCII OEM bytes are deliberately
@@ -359,6 +392,72 @@ impl FatDirEntry {
             }
         }
         (!name.is_empty()).then_some(name)
+    }
+}
+
+/// A checked FAT wall-clock timestamp. The format carries no timezone or UTC
+/// offset. `utc_projection` places its calendar fields on a UTC timeline as a
+/// deterministic presentation policy; it does not recover the original instant.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FatTimestamp {
+    seconds: u64,
+    nanoseconds: u32,
+}
+
+impl FatTimestamp {
+    /// Decode a present native date/time. Creation's extra byte is in 10 ms
+    /// units across the full two-second interval; use zero for modification
+    /// times, and zero for both time fields when decoding an access date.
+    pub fn parse(date: u16, time: u16, centiseconds: u8) -> Result<Self, ParseError> {
+        let year = 1980 + u64::from(date >> 9);
+        let month = usize::from((date >> 5) & 15);
+        let day = u64::from(date & 31);
+        let hour = u64::from(time >> 11);
+        let minute = u64::from((time >> 5) & 63);
+        let second = u64::from(time & 31) * 2;
+        let leap =
+            year.is_multiple_of(4) && (!year.is_multiple_of(100) || year.is_multiple_of(400));
+        let months = [
+            31_u64,
+            if leap { 29 } else { 28 },
+            31,
+            30,
+            31,
+            30,
+            31,
+            31,
+            30,
+            31,
+            30,
+            31,
+        ];
+        if !(1..=12).contains(&month) || day == 0 || day > months[month - 1] {
+            return Err(invalid("fat.timestamp_date", "invalid calendar date"));
+        }
+        if hour > 23 || minute > 59 || second > 58 || centiseconds > 199 {
+            return Err(invalid(
+                "fat.timestamp_time",
+                "invalid time or 10 ms increment",
+            ));
+        }
+        let before = |year: u64| {
+            let last = year - 1;
+            365 * last + last / 4 - last / 100 + last / 400
+        };
+        let days = before(year) - before(1970) + months[..month - 1].iter().sum::<u64>() + day - 1;
+        Ok(Self {
+            seconds: days * 86_400
+                + hour * 3600
+                + minute * 60
+                + second
+                + u64::from(centiseconds / 100),
+            nanoseconds: u32::from(centiseconds % 100) * 10_000_000,
+        })
+    }
+
+    #[must_use]
+    pub const fn utc_projection(self) -> Duration {
+        Duration::new(self.seconds, self.nanoseconds)
     }
 }
 
@@ -450,6 +549,10 @@ impl FatDirectoryDecoder {
             case_flags: slot[12],
             first_cluster,
             size: read_le_u32(slot, 28)?,
+            created_date: read_le_u16(slot, 16)?,
+            created_time: read_le_u16(slot, 14)?,
+            created_centiseconds: slot[13],
+            accessed_date: read_le_u16(slot, 18)?,
             modified_date: read_le_u16(slot, 24)?,
             modified_time: read_le_u16(slot, 22)?,
         }))
@@ -706,5 +809,135 @@ mod tests {
         decoder.push(&[0; 32], FatKind::Fat32).unwrap();
         assert!(decoder.ended());
         assert!(decoder.push(&short(), FatKind::Fat32).unwrap().is_none());
+    }
+
+    #[test]
+    fn native_timestamp_calendar_and_fraction_boundaries() {
+        // Independently specified UTC projections of the native calendar fields:
+        // 1980-01-01, 2000-02-29, 2024-02-29 12:34:56, 2100-03-01,
+        // and the last representable FAT date at 23:59:59.99.
+        for (date, time, fraction, seconds, nanos) in [
+            (0x0021, 0, 0, 315_532_800_u64, 0),
+            (0x285D, 0, 0, 951_782_400, 0),
+            (0x585D, 0x645C, 0, 1_709_210_096, 0),
+            (0xF061, 0, 0, 4_107_542_400, 0),
+            (0xFF9F, 0xBF7D, 199, 4_354_819_199, 990_000_000),
+        ] {
+            let timestamp = FatTimestamp::parse(date, time, fraction)
+                .unwrap()
+                .utc_projection();
+            assert_eq!(
+                (timestamp.as_secs(), timestamp.subsec_nanos()),
+                (seconds, nanos),
+                "date={date:#06x}, time={time:#06x}, fraction={fraction}"
+            );
+        }
+        for (fraction, seconds, nanos) in [
+            (0, 315_532_800_u64, 0),
+            (1, 315_532_800, 10_000_000),
+            (99, 315_532_800, 990_000_000),
+            (100, 315_532_801, 0),
+            (199, 315_532_801, 990_000_000),
+        ] {
+            let timestamp = FatTimestamp::parse(0x0021, 0, fraction)
+                .unwrap()
+                .utc_projection();
+            assert_eq!(
+                (timestamp.as_secs(), timestamp.subsec_nanos()),
+                (seconds, nanos)
+            );
+        }
+        for (date, time, fraction) in [
+            (0, 0, 0),
+            (0x0001, 0, 0), // Month zero.
+            (0x0020, 0, 0), // Day zero.
+            (0x01A1, 0, 0), // Month thirteen.
+            (0x005E, 0, 0), // February thirty.
+            (0x565D, 0, 0), // 2023 is not a leap year.
+            (0xF05D, 0, 0), // 2100 is not a leap year.
+            (0x0021, 0xC000, 0), // Hour twenty-four.
+            (0x0021, 0x0780, 0), // Minute sixty.
+            (0x0021, 30, 0), // Encoded second sixty.
+            (0x0021, 31, 0),
+            (0x0021, 0, 200),
+            (0x0021, 0, 255),
+        ] {
+            assert!(
+                FatTimestamp::parse(date, time, fraction).is_err(),
+                "date={date:#06x}, time={time:#06x}, fraction={fraction}"
+            );
+        }
+    }
+
+    #[test]
+    fn directory_timestamp_fields_are_lossless_in_both_dialects() {
+        for kind in [FatKind::Fat16, FatKind::Fat32] {
+            let mut slot = short();
+            slot[13] = 157;
+            slot[14..16].copy_from_slice(&0x645C_u16.to_le_bytes());
+            slot[16..18].copy_from_slice(&0x585D_u16.to_le_bytes());
+            slot[18..20].copy_from_slice(&0x5861_u16.to_le_bytes());
+            slot[22..24].copy_from_slice(&0x1883_u16.to_le_bytes());
+            slot[24..26].copy_from_slice(&0x5862_u16.to_le_bytes());
+            let entry = FatDirectoryDecoder::default()
+                .push(&slot, kind)
+                .unwrap()
+                .unwrap();
+            assert_eq!(entry.created_date, 0x585D);
+            assert_eq!(entry.created_time, 0x645C);
+            assert_eq!(entry.created_centiseconds, 157);
+            assert_eq!(entry.accessed_date, 0x5861);
+            let created = entry
+                .created_timestamp()
+                .unwrap()
+                .unwrap()
+                .utc_projection();
+            assert_eq!(
+                (created.as_secs(), created.subsec_nanos()),
+                (1_709_210_097, 570_000_000)
+            );
+            assert_eq!(
+                entry
+                    .accessed_timestamp()
+                    .unwrap()
+                    .unwrap()
+                    .utc_projection()
+                    .as_secs(),
+                1_709_251_200
+            );
+            assert_eq!(
+                entry
+                    .modified_timestamp()
+                    .unwrap()
+                    .unwrap()
+                    .utc_projection()
+                    .as_secs(),
+                1_709_348_646
+            );
+        }
+    }
+
+    #[test]
+    fn missing_optional_dates_remain_unknown_without_losing_raw_fields() {
+        let mut slot = short();
+        slot[13] = 255;
+        slot[14..16].copy_from_slice(&u16::MAX.to_le_bytes());
+        let entry = FatDirectoryDecoder::default()
+            .push(&slot, FatKind::Fat16)
+            .unwrap()
+            .unwrap();
+        assert_eq!((entry.created_time, entry.created_centiseconds), (u16::MAX, 255));
+        assert_eq!(entry.created_timestamp().unwrap(), None);
+        assert_eq!(entry.accessed_timestamp().unwrap(), None);
+        assert_eq!(entry.modified_timestamp().unwrap(), None);
+
+        // A partially populated mandatory modification timestamp remains an
+        // error rather than being silently presented as an absent timestamp.
+        slot[22..24].copy_from_slice(&1_u16.to_le_bytes());
+        let entry = FatDirectoryDecoder::default()
+            .push(&slot, FatKind::Fat16)
+            .unwrap()
+            .unwrap();
+        assert!(entry.modified_timestamp().is_err());
     }
 }

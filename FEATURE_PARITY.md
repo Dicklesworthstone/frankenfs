@@ -863,4 +863,19 @@ counts above and do not establish full filesystem or recovery qualification.
 |---|---|---|
 | NTFS numeric DATA provider admission | Complete base/extension catalog check rejects REPARSE_POINT before selecting unnamed or named DATA, matching the path-read provider boundary. One regression covers eight combinations of provider/control, base/extension location and resident/nonresident stream selection. | Source and fixture review plus exact GitHub blob comparison. Rust regression, formatting, workspace checks, Clippy and UBS remain unexecuted because the authoring executor disconnected; no native-image or Windows interoperability credit. |
 
-Details and commands: `docs/NTFS_READ_PROFILE.md`.
+### FAT16/FAT32 native timestamps
+
+Creation date/time and 10 ms increments, access date, and modification date/time
+are preserved and exposed through FsOps using the documented UTC wall-clock
+projection. Unknown fields retain the epoch sentinel; invalid present fields
+identify the directory record. Parser and FsOps regressions cover both dialects,
+calendar limits, precision, missing values and error locations. The inherited
+cyclic-directory listing assertion is aligned with the full-chain validation.
+
+Seven calendar constants were checked independently through JavaScript date
+conversion, and the source/fixtures received independent review and exact blob
+comparison. Rust tests, formatting, workspace checks, Clippy and UBS remain
+unexecuted with the authoring executor offline; no native or mounted parity
+credit is added.
+
+Details and commands: `docs/NTFS_READ_PROFILE.md` and `docs/FAT_READ_PROFILE.md`.

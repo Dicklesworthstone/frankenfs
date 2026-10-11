@@ -129,7 +129,98 @@ fn directory_allocation_chain_is_validated_even_after_early_end_marker() {
     image.set_link(2, 4);
     image.set_link(4, 2);
     let volume = image.volume();
-    assert_eq!(volume.list(&cx, Directory::Root).unwrap().len(), 3);
+    assert!(volume.list(&cx, Directory::Root).is_err());
     assert!(volume.directory_size(&cx, Directory::Root).is_err());
     assert!(FatFs::new(&cx, volume, 0, 0).is_err());
+}
+
+#[test]
+fn fsops_exposes_native_access_modification_and_creation_times() {
+    use std::time::UNIX_EPOCH;
+
+    let cx = Cx::for_testing();
+    let mut scope = RequestScope::empty();
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        let mut image = Image::new(kind);
+        let at = image.root_location();
+        image.bytes[at + 13] = 157;
+        image.bytes[at + 14..at + 16].copy_from_slice(&0x645C_u16.to_le_bytes());
+        image.bytes[at + 16..at + 18].copy_from_slice(&0x585D_u16.to_le_bytes());
+        image.bytes[at + 18..at + 20].copy_from_slice(&0x5861_u16.to_le_bytes());
+        image.bytes[at + 22..at + 24].copy_from_slice(&0x1883_u16.to_le_bytes());
+        image.bytes[at + 24..at + 26].copy_from_slice(&0x5862_u16.to_le_bytes());
+        let fs = FatFs::new(&cx, image.volume(), 0, 0).unwrap();
+        let attr = fs
+            .lookup(&cx, &mut scope, InodeNumber(1), OsStr::new("HELLO.TXT"))
+            .unwrap();
+        let created = attr.crtime.duration_since(UNIX_EPOCH).unwrap();
+        assert_eq!(
+            (created.as_secs(), created.subsec_nanos()),
+            (1_709_210_097, 570_000_000)
+        );
+        assert_eq!(
+            attr.atime.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            1_709_251_200
+        );
+        assert_eq!(
+            attr.mtime.duration_since(UNIX_EPOCH).unwrap().as_secs(),
+            1_709_348_646
+        );
+        assert_eq!(attr.ctime, UNIX_EPOCH);
+
+        let unknown = fs
+            .lookup(&cx, &mut scope, InodeNumber(1), OsStr::new("EMPTY.TXT"))
+            .unwrap();
+        assert_eq!(unknown.atime, UNIX_EPOCH);
+        assert_eq!(unknown.mtime, UNIX_EPOCH);
+        assert_eq!(unknown.crtime, UNIX_EPOCH);
+        let root = fs.getattr(&cx, &mut scope, InodeNumber(1)).unwrap();
+        assert_eq!(root.atime, UNIX_EPOCH);
+        assert_eq!(root.mtime, UNIX_EPOCH);
+        assert_eq!(root.crtime, UNIX_EPOCH);
+    }
+}
+
+#[test]
+fn fsops_rejects_invalid_native_timestamps_at_the_directory_record() {
+    let cx = Cx::for_testing();
+    let mut scope = RequestScope::empty();
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        for case in 0..5 {
+            let mut image = Image::new(kind);
+            let at = image.root_location();
+            let expected_block = ((at - image.base) / 512) as u64;
+            image.bytes[at + 14..at + 16].copy_from_slice(&0x645C_u16.to_le_bytes());
+            image.bytes[at + 16..at + 18].copy_from_slice(&0x585D_u16.to_le_bytes());
+            match case {
+                0 => image.bytes[at + 13] = 200,
+                1 => {
+                    image.bytes[at + 16..at + 18]
+                        .copy_from_slice(&0x565D_u16.to_le_bytes());
+                }
+                2 => {
+                    image.bytes[at + 18..at + 20]
+                        .copy_from_slice(&0x565D_u16.to_le_bytes());
+                }
+                3 => {
+                    image.bytes[at + 22..at + 24]
+                        .copy_from_slice(&0xC000_u16.to_le_bytes());
+                    image.bytes[at + 24..at + 26]
+                        .copy_from_slice(&0x585D_u16.to_le_bytes());
+                }
+                _ => {
+                    image.bytes[at + 22..at + 24]
+                        .copy_from_slice(&1_u16.to_le_bytes());
+                }
+            }
+            let fs = FatFs::new(&cx, image.volume(), 0, 0).unwrap();
+            assert!(
+                matches!(
+                    fs.lookup(&cx, &mut scope, InodeNumber(1), OsStr::new("HELLO.TXT")),
+                    Err(FfsError::Corruption { block, .. }) if block == expected_block
+                ),
+                "kind={kind:?}, case={case}"
+            );
+        }
+    }
 }

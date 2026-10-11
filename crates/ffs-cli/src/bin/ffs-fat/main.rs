@@ -185,7 +185,7 @@ fn main() -> Result<()> {
                 ..ffs_fuse::MountOptions::default()
             };
             eprintln!(
-                "experimental FAT read-only mount; modification times use a UTC wall-clock projection"
+                "experimental FAT read-only mount; native FAT timestamps use a UTC wall-clock projection"
             );
             let _ = ffs_fuse::mount(Box::new(fs), &mountpoint, &options)?;
         }
