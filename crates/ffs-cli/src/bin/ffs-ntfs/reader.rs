@@ -336,7 +336,14 @@ impl NtfsVolume {
         if record.is_directory() && name.is_empty() {
             return Err(FfsError::IsDirectory);
         }
-        let stream = self.select_stream(cx, record, DATA, name)?;
+        let catalog = self.attributes(cx, record)?;
+        // Numeric extraction must enforce the same provider boundary as path
+        // reads. Reparse metadata can live in an extension while ordinary DATA
+        // contains provider backing bytes or sparse placeholders.
+        if catalog.all()?.iter().any(|attr| attr.kind == 0xC0) {
+            return Err(unsupported("NTFS reparse DATA provider is not implemented"));
+        }
+        let stream = catalog.select(&self.geometry, DATA, name)?;
         checkpoint(cx)?;
         Ok(stream)
     }

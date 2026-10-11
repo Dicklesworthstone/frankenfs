@@ -145,6 +145,68 @@ fn repeated_resident_attributes_are_preserved_but_not_selected_as_one_stream() {
 }
 
 #[test]
+fn numeric_data_reads_enforce_base_and_extension_reparse_providers() {
+    let cx = Cx::for_testing();
+    for external in [false, true] {
+        for provider in [false, true] {
+            let mut image = Image::new();
+            let kind = if provider { 0xC0 } else { 0x40 };
+            let mut metadata = [0_u8; 16];
+            // WOF reparse header, version one, file provider. Its DATA must
+            // never be exposed as decoded content without that provider.
+            metadata[..4].copy_from_slice(&0x8000_0017_u32.to_le_bytes());
+            metadata[4..6].copy_from_slice(&8_u16.to_le_bytes());
+            metadata[8..12].copy_from_slice(&1_u32.to_le_bytes());
+            metadata[12..16].copy_from_slice(&2_u32.to_le_bytes());
+            let metadata = resident(kind, 2, "", &metadata);
+            let mut attrs = vec![
+                mapped(&[0x21, 1, 180, 0, 0x11, 1, 0xF6, 0], 2, 600, 600, 0),
+                resident(DATA, 1, "note", b"resident provider backing"),
+            ];
+            if external {
+                let mut list = list_entry(DATA, 25, 0, 0, "");
+                list.extend(list_entry(DATA, 25, 1, 0, "note"));
+                list.extend(list_entry(kind, 27, 2, 0, ""));
+                attrs.push(resident(ATTRIBUTE_LIST, 10, "", &list));
+                image.put_record(27, &extension(27, 25, &[metadata]));
+            } else {
+                attrs.push(metadata);
+            }
+            image.put_record(25, &file_record(25, &attrs));
+            let reads: Reads = Arc::default();
+            let volume = image.open(Arc::clone(&reads), None).unwrap();
+            let record = volume.record(&cx, 25, Some(7)).unwrap();
+            for name in [Vec::<u16>::new(), vec![110, 111, 116, 101]] {
+                reads.lock().unwrap().clear();
+                let result = volume.data_stream(&cx, &record, &name);
+                let expected_reads = if external {
+                    vec![(Image::record_offset(27) as u64, 1024)]
+                } else {
+                    Vec::new()
+                };
+                assert_eq!(*reads.lock().unwrap(), expected_reads);
+                if provider {
+                    assert!(
+                        matches!(result, Err(FfsError::UnsupportedFeature(_))),
+                        "external={external}, name={name:?}"
+                    );
+                } else {
+                    let stream = result.unwrap();
+                    let expected = if name.is_empty() {
+                        let mut bytes = vec![b'A'; 512];
+                        bytes.extend_from_slice(&[b'B'; 88]);
+                        bytes
+                    } else {
+                        b"resident provider backing".to_vec()
+                    };
+                    assert_eq!(volume.read(&cx, &stream, 0, 1024).unwrap(), expected);
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn catalog_identity_failures_never_publish_a_stream() {
     let cx = Cx::for_testing();
     for case in 0..10 {

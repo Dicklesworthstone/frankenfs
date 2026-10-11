@@ -853,3 +853,14 @@ project can honestly claim operational readiness beyond the current V1 contract.
 ## 5. Update Rule
 
 Any change touching compatibility behavior MUST update this file in the same patch.
+
+## Native companion increments (2026-10-11)
+
+These implementation entries do not change the legacy ext4/btrfs contract
+counts above and do not establish full filesystem or recovery qualification.
+
+| Mode and capability | Implemented scope | Execution evidence for this increment |
+|---|---|---|
+| NTFS numeric DATA provider admission | Complete base/extension catalog check rejects REPARSE_POINT before selecting unnamed or named DATA, matching the path-read provider boundary. One regression covers eight combinations of provider/control, base/extension location and resident/nonresident stream selection. | Source and fixture review plus exact GitHub blob comparison. Rust regression, formatting, workspace checks, Clippy and UBS remain unexecuted because the authoring executor disconnected; no native-image or Windows interoperability credit. |
+
+Details and commands: `docs/NTFS_READ_PROFILE.md`.

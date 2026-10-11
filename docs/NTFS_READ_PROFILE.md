@@ -297,3 +297,25 @@ regressions plus CLI mount parsing are added, not claimed passed. They cover
 record/sequence identities, hard links/aliases, parent lookup, native names and
 times, fragmented/compressed reads, EOF, directory cookies, bitmap padding,
 write rejection, cancellation, cache reuse/eviction and root-alias refusal.
+
+## Numeric DATA provider boundary
+
+Numeric `cat` and DATA admission now inspect the complete validated base and
+extension catalog for REPARSE_POINT before selecting either unnamed or named
+DATA. Unsupported reparse providers, including WOF/system compression and cloud
+placeholders, cannot bypass the path reader's provider boundary by using an MFT
+record number. Their backing DATA is not exposed as decoded file contents.
+Metadata inspection remains available; no provider implementation is implied.
+
+The regression
+`numeric_data_reads_enforce_base_and_extension_reparse_providers` covers
+unnamed nonresident and named resident DATA, base and extension reparse metadata,
+and benign non-reparse controls. Device traces assert admission reads only the
+necessary extension metadata and no file payload.
+
+Delivery evidence (2026-10-11): the source change and fixtures received independent
+review, and complete GitHub file blobs were read back and compared with the base.
+The Rust regression, formatting, workspace checks, Clippy and UBS could not run:
+the executor disconnected after storage exhaustion; the earlier offline Cargo
+attempt also lacked a required dependency. These added tests are not execution
+or native Windows interoperability evidence.
