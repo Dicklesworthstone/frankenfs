@@ -1,5 +1,5 @@
 use super::*;
-use crate::reader::{ByteOffset, DATA_OFFSET, Endian, LABEL_BYTES, Leaf, SingleLeaf};
+use crate::reader::{ByteOffset, DATA_OFFSET, Endian, LABEL_BYTES, Leaf, VdevConfig};
 use ffs_block::ByteDevice;
 use ffs_ondisk::zfs::checksum;
 use ffs_ondisk::zfs_dmu::Dnode;
@@ -279,10 +279,10 @@ impl ByteDevice for Memory {
 }
 fn view(leaf: &Leaf, meta: Dnode) -> Objects {
     Objects {
-        leaf: leaf.clone(),
-        config: SingleLeaf {
+        pool: leaf.clone().into(),
+        config: VdevConfig {
             pool_guid: 123,
-            leaf_guid: 999,
+            top_guid: 999,
             version: 5000,
             txg: 42,
             ashift: 9,

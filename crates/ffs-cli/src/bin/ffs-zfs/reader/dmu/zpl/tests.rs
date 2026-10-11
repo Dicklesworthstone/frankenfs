@@ -1,6 +1,6 @@
 use super::*;
 use crate::reader::dmu::tests::embedded_pointer;
-use crate::reader::{ByteOffset, DATA_OFFSET, Endian, LABEL_BYTES, Leaf, SingleLeaf};
+use crate::reader::{ByteOffset, DATA_OFFSET, Endian, LABEL_BYTES, Leaf, VdevConfig};
 use ffs_block::ByteDevice;
 use ffs_ondisk::zfs::checksum;
 use ffs_ondisk::zfs_dmu::Dnode;
@@ -414,10 +414,10 @@ fn graph(order: Endian, sa: u8, case: u8, reads: Reads, failure: Option<u64>) ->
 }
 fn mos(leaf: &Leaf, meta: Dnode) -> Objects {
     Objects {
-        leaf: leaf.clone(),
-        config: SingleLeaf {
+        pool: leaf.clone().into(),
+        config: VdevConfig {
             pool_guid: 123,
-            leaf_guid: 999,
+            top_guid: 999,
             version: 5000,
             txg: 60,
             ashift: 9,
@@ -690,3 +690,5 @@ fn dataset_views_do_not_reuse_mos_or_other_dataset_block_caches() {
 }
 
 mod mount;
+
+mod mirror;

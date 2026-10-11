@@ -225,10 +225,10 @@ fn graph(order: Endian, case: u8, reads: Reads, failure: Option<u64>) -> (Leaf, 
 
 fn objects(leaf: &Leaf, meta: Dnode) -> Objects {
     Objects {
-        leaf: leaf.clone(),
-        config: SingleLeaf {
+        pool: leaf.clone().into(),
+        config: VdevConfig {
             pool_guid: 123,
-            leaf_guid: 999,
+            top_guid: 999,
             version: 5000,
             txg: 42,
             ashift: 9,
@@ -524,10 +524,7 @@ fn embedded_parent_damage_and_later_cancellation_never_return_partial_ranges() {
     assert!(!view.cache.iter().any(|(bp, _)| bp.embedded()));
     assert_eq!(
         *reads.lock().unwrap(),
-        [
-            (BASE as u64 + TABLE, 16384),
-            (BASE as u64 + INDIRECT, 4096),
-        ]
+        [(BASE as u64 + TABLE, 16384), (BASE as u64 + INDIRECT, 4096),]
     );
 
     let reads: Reads = Arc::default();

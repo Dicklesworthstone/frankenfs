@@ -1005,3 +1005,28 @@ against a closed-form FAT sizing equation completed. Rust/build/fmt/Clippy/UBS,
 native fsck/mtools and mounted execution remain unavailable with the executor
 offline; no executed native-format or interoperability credit is added.
 See `docs/FAT_READ_PROFILE.md`.
+
+
+### ZFS complete-mirror extraction and mounts
+
+Every explicit-root command accepts repeated `--mirror-member` images for one
+ordinary top-level mirror of two through eight leaves. The reader checks the
+complete native member GUID set, all four labels on each image, topology,
+geometry, read features and the selected root candidate. Argument order never
+supplies native identity, and configuration paths are never opened on the host.
+Mirror addressing uses the same physical offset on each member and native
+ashift-rounded DVA sizes. Each physical copy is checksum-verified before use;
+I/O/checksum failures try another supplied member, cancellation stops immediately,
+and failed data never enter the checked-block cache.
+
+One owned member set now reaches raw MOS/DMU operations, datasets, file reads,
+snapshot reads and the existing read-only FsOps/mount adapter. All backing image
+paths participate in the mountpoint guard. Eleven constructed engine regressions
+and four CLI regressions cover member admission, root agreement, redundant
+metadata/data reads, historical roots, cancellation and cache publication.
+The changed Rust files were parsed and formatted. Integrated CLI checks/tests
+were attempted, including one compiler thread, but `asupersync` compilation
+received SIGKILL under the shared memory limit. These new tests and native
+OpenZFS/mounted mirror workloads remain unexecuted. No import, degraded-member
+selection, repair write, healing or RAIDZ support is implied.
+See `docs/ZFS_READ_PROFILE.md` for the native profile and commands.

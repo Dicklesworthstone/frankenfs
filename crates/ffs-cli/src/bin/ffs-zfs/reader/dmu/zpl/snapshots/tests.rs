@@ -1,6 +1,6 @@
 use super::*;
 use crate::reader::dmu::tests::embedded_pointer;
-use crate::reader::{Leaf, SingleLeaf};
+use crate::reader::{Leaf, VdevConfig};
 use ffs_block::ByteDevice;
 use ffs_ondisk::zfs::{DATA_OFFSET, Endian, LABEL_BYTES, checksum};
 use ffs_ondisk::zfs_dmu::Dnode;
@@ -440,11 +440,11 @@ impl ByteDevice for Memory {
 }
 fn pool(leaf: &Leaf, meta: Dnode) -> Objects {
     Objects {
-        leaf: leaf.clone(),
+        pool: leaf.clone().into(),
         meta,
-        config: SingleLeaf {
+        config: VdevConfig {
             pool_guid: 123,
-            leaf_guid: 999,
+            top_guid: 999,
             version: 5000,
             txg: 90,
             ashift: 9,
@@ -658,3 +658,5 @@ fn embedded_snapshot_contents_are_historical_and_never_read_physical_payloads() 
 }
 
 mod mount;
+
+mod mirror;

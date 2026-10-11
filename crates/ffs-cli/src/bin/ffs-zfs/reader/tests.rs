@@ -488,3 +488,5 @@ fn embedded_read_feature_requires_native_boolean_and_all_label_agreement() {
         assert!(data_reads(&reads).is_empty());
     }
 }
+
+pub(in crate::reader) mod mirror;

@@ -10,9 +10,9 @@ use asupersync::Cx;
 use clap::{Args, Parser, Subcommand};
 use ffs_error::FfsError;
 use ffs_ondisk::zfs::UBERBLOCK_RING_BYTES;
-use reader::Leaf;
+use reader::{Leaf, Pool};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -54,6 +54,35 @@ struct CandidateArgs {
     /// Expected pool GUID; this does not authorize automatic TXG selection.
     #[arg(long)]
     pool_guid: u64,
+    /// Additional immutable images of every other leaf in one native mirror.
+    /// The same --offset and --length select the volume range in every image.
+    #[arg(long = "mirror-member", value_name = "IMAGE")]
+    mirror_members: Vec<PathBuf>,
+}
+impl CandidateArgs {
+    fn open(&self, cx: &Cx) -> Result<Pool> {
+        if self.mirror_members.len() > 7 {
+            bail!("at most seven additional mirror images are supported");
+        }
+        let mut leaves = Vec::with_capacity(self.mirror_members.len() + 1);
+        leaves.push(self.image.open(cx)?);
+        for path in &self.mirror_members {
+            leaves.push(
+                Leaf::open(cx, path, self.image.offset, self.image.length)
+                    .with_context(|| format!("opening ZFS mirror member {}", path.display()))?,
+            );
+        }
+        Pool::from_leaves(leaves).context("opening explicitly supplied ZFS members")
+    }
+
+    fn reject_hidden_images(&self, mountpoint: &Path) -> Result<()> {
+        for path in std::iter::once(&self.image.image).chain(&self.mirror_members) {
+            if path.canonicalize()?.starts_with(mountpoint) {
+                bail!("ZFS mountpoint would hide a backing image");
+            }
+        }
+        Ok(())
+    }
 }
 #[derive(Debug, Subcommand)]
 enum Command {
@@ -67,14 +96,7 @@ enum Command {
     /// Extract one checked META object-set block. No automatic TXG selection or import.
     Root {
         #[command(flatten)]
-        image: ImageArgs,
-        #[arg(long)]
-        label: usize,
-        #[arg(long)]
-        slot: usize,
-        /// Expected pool GUID as a decimal integer from inspect.
-        #[arg(long)]
-        pool_guid: u64,
+        candidate: CandidateArgs,
     },
     /// Inspect one native MOS dnode and its exact bonus bytes.
     Object {
@@ -164,18 +186,14 @@ fn main() -> Result<()> {
                 bail!("no supported checksum-valid ZFS label configuration");
             }
         }
-        Command::Root {
-            image,
-            label,
-            slot,
-            pool_guid,
-        } => {
-            let leaf = image.open(&cx)?;
-            let root = leaf.root(&cx, label, slot, pool_guid)?;
+        Command::Root { candidate } => {
+            let pool = candidate.open(&cx)?;
+            let root = pool.root(&cx, candidate.label, candidate.slot, candidate.pool_guid)?;
             eprintln!(
-                "checked candidate txg={} copy={} vdev_offset={} bytes={}; not a pool import",
+                "checked candidate txg={} copy={} member_guid={} vdev_offset={} bytes={}; not a pool import",
                 root.uberblock.txg,
                 root.copy_index,
+                root.member_guid,
                 root.physical_offset,
                 root.data.len()
             );
@@ -184,9 +202,9 @@ fn main() -> Result<()> {
             out.flush()?;
         }
         Command::Object { candidate, number } => {
-            let leaf = candidate.image.open(&cx)?;
+            let pool = candidate.open(&cx)?;
             let mut view =
-                leaf.objects(&cx, candidate.label, candidate.slot, candidate.pool_guid)?;
+                pool.objects(&cx, candidate.label, candidate.slot, candidate.pool_guid)?;
             let node = view.object(&cx, number)?;
             json(&serde_json::json!({"object": number, "txg": view.txg,
                 "object_type": node.object_type(), "bonus_type": node.bonus_type(),
@@ -202,18 +220,18 @@ fn main() -> Result<()> {
             start,
             bytes,
         } => {
-            let leaf = candidate.image.open(&cx)?;
+            let pool = candidate.open(&cx)?;
             let mut view =
-                leaf.objects(&cx, candidate.label, candidate.slot, candidate.pool_guid)?;
+                pool.objects(&cx, candidate.label, candidate.slot, candidate.pool_guid)?;
             let data = view.read(&cx, number, start, bytes)?;
             let mut out = io::stdout().lock();
             out.write_all(&data)?;
             out.flush()?;
         }
         Command::Zap { candidate, number } => {
-            let leaf = candidate.image.open(&cx)?;
+            let pool = candidate.open(&cx)?;
             let mut view =
-                leaf.objects(&cx, candidate.label, candidate.slot, candidate.pool_guid)?;
+                pool.objects(&cx, candidate.label, candidate.slot, candidate.pool_guid)?;
             let entries: Vec<_> = view.zap_values(&cx, number)?.into_iter().map(|entry| serde_json::json!({
                 "name": std::str::from_utf8(&entry.name).ok(), "name_bytes": entry.name,
                 "integer_bytes": entry.integer_bytes, "values": entry.values, "collision": entry.collision
@@ -221,9 +239,9 @@ fn main() -> Result<()> {
             json(&serde_json::json!({"object": number, "txg": view.txg, "entries": entries}))?;
         }
         Command::Datasets { candidate } => {
-            let leaf = candidate.image.open(&cx)?;
+            let pool = candidate.open(&cx)?;
             let mut view =
-                leaf.objects(&cx, candidate.label, candidate.slot, candidate.pool_guid)?;
+                pool.objects(&cx, candidate.label, candidate.slot, candidate.pool_guid)?;
             let datasets: Vec<_> = view.datasets(&cx)?.into_iter().map(|entry| {
                 let name = entry.components.iter().map(|part| std::str::from_utf8(part))
                     .collect::<std::result::Result<Vec<_>, _>>().ok().map(|parts| parts.join("/"));
@@ -269,19 +287,20 @@ mod tests {
             "123",
         ])
         .unwrap();
-        let Command::Root {
-            image,
-            label,
-            slot,
-            pool_guid,
-        } = cli.command
-        else {
+        let Command::Root { candidate } = cli.command else {
             panic!("root");
         };
         assert_eq!(
-            (image.offset, image.length, label, slot, pool_guid),
+            (
+                candidate.image.offset,
+                candidate.image.length,
+                candidate.label,
+                candidate.slot,
+                candidate.pool_guid
+            ),
             (1_048_576, Some(67_108_864), 2, 3, 123)
         );
+        assert!(candidate.mirror_members.is_empty());
     }
     #[test]
     fn object_commands_require_root_identity_and_explicit_range_length() {
@@ -332,5 +351,152 @@ mod tests {
             ])
             .is_ok()
         );
+    }
+
+    #[test]
+    fn mirror_selection_reaches_every_raw_command_with_explicit_bounds() {
+        let options = [
+            "--offline-image",
+            "--offset",
+            "1048576",
+            "--length",
+            "67108864",
+            "--label",
+            "1",
+            "--slot",
+            "2",
+            "--pool-guid",
+            "123",
+            "--mirror-member",
+            "second.img",
+            "--mirror-member",
+            "third.img",
+        ];
+        for command in [
+            vec!["root", "first.img"],
+            vec!["object", "first.img", "7"],
+            vec!["object-read", "first.img", "7", "--bytes", "32"],
+            vec!["zap", "first.img", "7"],
+            vec!["datasets", "first.img"],
+        ] {
+            let parsed =
+                Cli::try_parse_from(std::iter::once("ffs-zfs").chain(command).chain(options))
+                    .unwrap();
+            let candidate = match parsed.command {
+                Command::Root { candidate }
+                | Command::Object { candidate, .. }
+                | Command::ObjectRead { candidate, .. }
+                | Command::Zap { candidate, .. }
+                | Command::Datasets { candidate } => candidate,
+                _ => panic!("raw pool command"),
+            };
+            assert_eq!(candidate.image.image, PathBuf::from("first.img"));
+            assert_eq!(
+                (candidate.image.offset, candidate.image.length),
+                (1_048_576, Some(67_108_864))
+            );
+            assert_eq!(
+                (candidate.label, candidate.slot, candidate.pool_guid),
+                (1, 2, 123)
+            );
+            assert!(candidate.image.offline_image);
+            assert_eq!(
+                candidate.mirror_members,
+                [PathBuf::from("second.img"), PathBuf::from("third.img")]
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "ffs-zfs",
+                "inspect",
+                "first.img",
+                "--offline-image",
+                "--mirror-member",
+                "second.img",
+            ])
+            .is_err()
+        );
+        assert!(
+            Cli::try_parse_from([
+                "ffs-zfs",
+                "root",
+                "first.img",
+                "--mirror-member",
+                "second.img",
+                "--label",
+                "1",
+                "--slot",
+                "2",
+                "--pool-guid",
+                "123",
+            ])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn member_count_is_bounded_before_any_image_is_opened() {
+        let candidate = CandidateArgs {
+            image: ImageArgs {
+                image: PathBuf::from("unopened-primary.img"),
+                offset: 0,
+                length: None,
+                offline_image: true,
+            },
+            label: 0,
+            slot: 0,
+            pool_guid: 1,
+            mirror_members: vec![PathBuf::from("unopened-member.img"); 8],
+        };
+        let Err(error) = candidate.open(&Cx::for_testing()) else {
+            panic!("an oversized member set must fail before image I/O");
+        };
+        assert_eq!(
+            error.to_string(),
+            "at most seven additional mirror images are supported"
+        );
+    }
+
+    #[test]
+    fn mountpoint_guard_checks_all_members_and_resolves_host_symlinks() {
+        let directory = tempfile::tempdir().unwrap();
+        let mountpoint = directory.path().join("mount");
+        std::fs::create_dir(&mountpoint).unwrap();
+        let outside = directory.path().join("first.img");
+        let inside = mountpoint.join("second.img");
+        for path in [&outside, &inside] {
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create_new(true)
+                .open(path)
+                .unwrap();
+        }
+        let alias = directory.path().join("member-alias.img");
+        std::os::unix::fs::symlink(&inside, &alias).unwrap();
+        let mut candidate = CandidateArgs {
+            image: ImageArgs {
+                image: outside.clone(),
+                offset: 0,
+                length: None,
+                offline_image: true,
+            },
+            label: 0,
+            slot: 0,
+            pool_guid: 1,
+            mirror_members: vec![outside],
+        };
+        let mountpoint = mountpoint.canonicalize().unwrap();
+        candidate.reject_hidden_images(&mountpoint).unwrap();
+        candidate.mirror_members = vec![alias];
+        assert_eq!(
+            candidate
+                .reject_hidden_images(&mountpoint)
+                .unwrap_err()
+                .to_string(),
+            "ZFS mountpoint would hide a backing image"
+        );
+        candidate.mirror_members.clear();
+        candidate.image.image = inside;
+        assert!(candidate.reject_hidden_images(&mountpoint).is_err());
     }
 }

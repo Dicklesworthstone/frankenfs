@@ -34,7 +34,7 @@ pub enum FileCommand {
         /// Exact native snapshot name; omit for the selected committed head.
         #[arg(long)]
         snapshot: Option<OsString>,
-        /// Existing empty host directory outside the backing image's path.
+        /// Existing empty host directory outside every backing image's path.
         mountpoint: PathBuf,
         /// Synthetic ownership; native ZFS ACLs are not projected or enforced.
         #[arg(long, default_value_t = 0)]
@@ -135,17 +135,10 @@ impl FileCommand {
                 {
                     bail!("ZFS mountpoint must be an existing empty directory");
                 }
-                if candidate
-                    .image
-                    .image
-                    .canonicalize()?
-                    .starts_with(&mountpoint)
-                {
-                    bail!("ZFS mountpoint would hide the backing image");
-                }
-                let leaf = candidate.image.open(cx)?;
+                candidate.reject_hidden_images(&mountpoint)?;
+                let source = candidate.open(cx)?;
                 let mut pool =
-                    leaf.objects(cx, candidate.label, candidate.slot, candidate.pool_guid)?;
+                    source.objects(cx, candidate.label, candidate.slot, candidate.pool_guid)?;
                 let view = match snapshot.as_deref() {
                     Some(name) => pool.zpl_snapshot(cx, &components, name.as_bytes())?,
                     None => pool.zpl(cx, &components)?,
@@ -168,9 +161,9 @@ impl FileCommand {
             }
             Self::Snapshots { candidate, dataset } => {
                 let components = dataset_components(&dataset)?;
-                let leaf = candidate.image.open(cx)?;
+                let source = candidate.open(cx)?;
                 let mut pool =
-                    leaf.objects(cx, candidate.label, candidate.slot, candidate.pool_guid)?;
+                    source.objects(cx, candidate.label, candidate.slot, candidate.pool_guid)?;
                 let snapshots: Vec<_> = pool.snapshots(cx, &components)?.into_iter().map(|row| {
                     serde_json::json!({"name": std::str::from_utf8(&row.name).ok(), "name_bytes": row.name,
                         "object": row.object, "guid": row.guid.to_string(), "creation_txg": row.creation_txg,
@@ -189,8 +182,8 @@ impl FileCommand {
         };
         let components = dataset_components(&file.dataset)?;
         let c = file.candidate;
-        let leaf = c.image.open(cx)?;
-        let mut pool = leaf.objects(cx, c.label, c.slot, c.pool_guid)?;
+        let source = c.open(cx)?;
+        let mut pool = source.objects(cx, c.label, c.slot, c.pool_guid)?;
         let txg = pool.txg;
         let mut view = match file.snapshot.as_deref() {
             Some(name) => pool.zpl_snapshot(cx, &components, name.as_bytes())?,
@@ -409,6 +402,102 @@ mod tests {
             "a\0b",
         ] {
             assert!(dataset_components(name).is_err(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn mirror_members_are_retained_for_dataset_and_snapshot_operations() {
+        let options = [
+            "--offline-image",
+            "--pool-guid",
+            "123",
+            "--label",
+            "0",
+            "--slot",
+            "2",
+            "--offset",
+            "1048576",
+            "--length",
+            "67108864",
+            "--mirror-member",
+            "second.img",
+            "--mirror-member",
+            "third.img",
+            "--dataset",
+            "data",
+        ];
+        let assert_candidate = |candidate: &CandidateArgs| {
+            assert_eq!(candidate.image.image, PathBuf::from("first.img"));
+            assert_eq!(
+                (candidate.image.offset, candidate.image.length),
+                (1_048_576, Some(67_108_864))
+            );
+            assert_eq!(
+                candidate.mirror_members,
+                [PathBuf::from("second.img"), PathBuf::from("third.img")]
+            );
+            assert_eq!(
+                (candidate.label, candidate.slot, candidate.pool_guid),
+                (0, 2, 123)
+            );
+            assert!(candidate.image.offline_image);
+        };
+        for command in ["ls", "stat", "read", "readlink"] {
+            let parsed = Cli::try_parse_from(
+                ["ffs-zfs", command, "first.img", "/file"]
+                    .into_iter()
+                    .chain(options)
+                    .chain(["--snapshot", "before"]),
+            )
+            .unwrap();
+            let Command::File(
+                FileCommand::Ls { file }
+                | FileCommand::Stat { file }
+                | FileCommand::Read { file, .. }
+                | FileCommand::Readlink { file },
+            ) = parsed.command
+            else {
+                panic!("dataset file command");
+            };
+            assert_candidate(&file.candidate);
+            assert_eq!(file.dataset, "data");
+            assert_eq!(file.path, PathBuf::from("/file"));
+            assert_eq!(file.snapshot, Some(OsString::from("before")));
+        }
+        let parsed = Cli::try_parse_from(
+            ["ffs-zfs", "snapshots", "first.img"]
+                .into_iter()
+                .chain(options),
+        )
+        .unwrap();
+        let Command::File(FileCommand::Snapshots { candidate, dataset }) = parsed.command else {
+            panic!("snapshot inventory");
+        };
+        assert_candidate(&candidate);
+        assert_eq!(dataset, "data");
+
+        let args: Vec<_> = ["ffs-zfs", "mount", "first.img", "/mnt/zfs"]
+            .into_iter()
+            .chain(options)
+            .chain(["--snapshot", "before"])
+            .collect();
+        let parsed = Cli::try_parse_from(&args).unwrap();
+        let Command::File(FileCommand::Mount {
+            candidate,
+            dataset,
+            snapshot,
+            mountpoint,
+            ..
+        }) = parsed.command
+        else {
+            panic!("snapshot mount");
+        };
+        assert_candidate(&candidate);
+        assert_eq!(dataset, "data");
+        assert_eq!(snapshot, Some(OsString::from("before")));
+        assert_eq!(mountpoint, PathBuf::from("/mnt/zfs"));
+        for option in ["--degraded", "--replace", "--heal", "--rw", "--force"] {
+            assert!(Cli::try_parse_from(args.iter().copied().chain([option])).is_err());
         }
     }
 }

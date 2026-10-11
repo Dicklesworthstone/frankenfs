@@ -28,7 +28,9 @@ impl ByteDevice for NoDataIo {
 
 fn embedded_raw(byte: u8, order: Endian, extra_flags: u64) -> [u8; 128] {
     // Native length-prefixed LZ4: one literal, distance-one match, five literals.
-    let payload = [0, 0, 0, 12, 0x1f, byte, 1, 0, 255, 232, 0x50, byte, byte, byte, byte, byte];
+    let payload = [
+        0, 0, 0, 12, 0x1f, byte, 1, 0, 255, 232, 0x50, byte, byte, byte, byte, byte,
+    ];
     let mut words = [0_u64; 16];
     words[0] = u64::from_le_bytes(payload[..8].try_into().unwrap());
     words[1] = u64::from_le_bytes(payload[8..].try_into().unwrap());
@@ -64,10 +66,10 @@ fn view(leaf: &Leaf, order: Endian, extra_flags: u64) -> Objects {
     raw[64..192].copy_from_slice(&embedded_raw(b'A', order, extra_flags));
     raw[320..448].copy_from_slice(&embedded_raw(b'B', order, 0));
     Objects {
-        leaf: leaf.clone(),
-        config: SingleLeaf {
+        pool: leaf.clone().into(),
+        config: VdevConfig {
             pool_guid: 123,
-            leaf_guid: 999,
+            top_guid: 999,
             version: 5000,
             txg: 42,
             ashift: 9,
@@ -155,7 +157,11 @@ fn label_feature_whitelist_preserves_typed_fail_closed_admission() {
         assert!(!supported_read_feature(name, &Value::Boolean(false)));
         assert!(!supported_read_feature(name, &Value::Unsigned(1)));
     }
-    for name in ["com.datto:encryption", "com.delphix:redacted_datasets", "unknown:feature"] {
+    for name in [
+        "com.datto:encryption",
+        "com.delphix:redacted_datasets",
+        "unknown:feature",
+    ] {
         assert!(!supported_read_feature(name, &Value::Boolean(true)));
     }
 }

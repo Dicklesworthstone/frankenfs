@@ -5,8 +5,8 @@ mod zap;
 pub mod zpl;
 
 use super::{
-    BlockPointer, Cx, Endian, FfsError, Leaf, Result, SingleLeaf, checkpoint, corrupt, parse,
-    unsupported,
+    BlockPointer, Cx, Endian, FfsError, Leaf, Pool, Result, RootBlock, VdevConfig, checkpoint,
+    corrupt, parse, unsupported,
 };
 use ffs_ondisk::zfs_dmu::{DNODE_BLOCK_BYTES, DNODE_BYTES, Dnode, ObjectSet, ZapEntry, dnode_at};
 use std::collections::{BTreeSet, VecDeque};
@@ -32,8 +32,8 @@ struct Object {
 /// Root/configuration ownership never leaves this object. Cache keys include
 /// the complete block pointer and caches never cross selected root lifetimes.
 pub struct Objects {
-    leaf: Leaf,
-    config: SingleLeaf,
+    pool: Pool,
+    config: VdevConfig,
     pub txg: u64,
     root_birth: u64,
     meta: Dnode,
@@ -42,23 +42,33 @@ pub struct Objects {
 }
 
 impl Leaf {
-    pub fn objects(
-        &self,
-        cx: &Cx,
-        label: usize,
-        slot: usize,
-        pool_guid: u64,
-    ) -> Result<Objects> {
+    pub fn objects(&self, cx: &Cx, label: usize, slot: usize, pool_guid: u64) -> Result<Objects> {
         let root = self.root(cx, label, slot, pool_guid)?;
+        Objects::from_root(cx, Pool::from(self.clone()), root)
+    }
+}
+
+impl Pool {
+    pub fn objects(&self, cx: &Cx, label: usize, slot: usize, pool_guid: u64) -> Result<Objects> {
+        if let Some(leaf) = self.standalone_leaf() {
+            return leaf.objects(cx, label, slot, pool_guid);
+        }
+        let root = self.root(cx, label, slot, pool_guid)?;
+        Objects::from_root(cx, self.clone(), root)
+    }
+}
+
+impl Objects {
+    fn from_root(cx: &Cx, pool: Pool, root: RootBlock) -> Result<Self> {
         let objectset = ObjectSet::parse(&root.data, root.uberblock.root.payload_order())
             .map_err(|error| parse(&error))?;
         if objectset.kind != 1 {
             return Err(corrupt("selected object set is not the MOS"));
         }
-        let config = self.label(cx, label)?.single_leaf(pool_guid)?;
+        let config = root.config;
         checkpoint(cx)?;
-        Ok(Objects {
-            leaf: self.clone(),
+        Ok(Self {
+            pool,
             config,
             txg: root.uberblock.txg,
             root_birth: root.uberblock.root.birth(),
@@ -131,11 +141,12 @@ impl Objects {
         let bytes = if bp.embedded() {
             bp.decode_embedded().map_err(|error| parse(&error))?
         } else {
-            self.leaf.read_block(cx, &self.config, bp)?.0
+            self.pool.read_block(cx, &self.config, bp)?.0
         };
         if bytes.len() != size {
             return Err(corrupt("decoded DMU block has the wrong length"));
         }
+        checkpoint(cx)?;
         let block = CheckedBlock {
             bytes: Arc::new(bytes),
             order: bp.payload_order(),
@@ -413,6 +424,6 @@ pub struct Dataset {
 }
 
 #[cfg(test)]
-mod tests;
-#[cfg(test)]
 mod embedded_tests;
+#[cfg(test)]
+mod tests;
