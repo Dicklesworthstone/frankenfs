@@ -863,6 +863,16 @@ counts above and do not establish full filesystem or recovery qualification.
 |---|---|---|
 | NTFS numeric DATA provider admission | Complete base/extension catalog check rejects REPARSE_POINT before selecting unnamed or named DATA, matching the path-read provider boundary. One regression covers eight combinations of provider/control, base/extension location and resident/nonresident stream selection. | Source and fixture review plus exact GitHub blob comparison. Rust regression, formatting, workspace checks, Clippy and UBS remain unexecuted because the authoring executor disconnected; no native-image or Windows interoperability credit. |
 
+### NTFS lossless DATA stream selection
+
+Numeric `cat` and path `read` accept `--stream-utf16` as exact comma-separated
+four-digit native code units, including unpaired surrogates reported by the
+logical stream catalog. The existing Unicode selector remains available; the
+options are mutually exclusive and enforce the native 255-unit name bound.
+Parser and CLI regressions are authored and source-reviewed. Rust execution,
+formatting, workspace checks, Clippy, UBS and native-image validation remain
+unavailable with the executor offline; no execution parity credit is added.
+
 ### FAT16/FAT32 native timestamps
 
 Creation date/time and 10 ms increments, access date, and modification date/time

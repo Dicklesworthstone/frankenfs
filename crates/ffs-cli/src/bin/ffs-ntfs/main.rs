@@ -2,6 +2,7 @@
 //! Native, read-only NTFS 3.1 inspection, directory traversal and stream extraction.
 
 mod reader;
+mod stream_name;
 
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
@@ -11,6 +12,7 @@ use ffs_ondisk::ntfs::{DATA, NtfsFileRecord, NtfsValue};
 use reader::NtfsVolume;
 use std::io::{self, Write};
 use std::path::PathBuf;
+use stream_name::StreamName;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -77,8 +79,12 @@ enum Command {
         #[command(flatten)]
         image: ImageArgs,
         path: String,
-        #[arg(long, default_value = "")]
-        stream: String,
+        /// Exact Unicode stream name. Omit both selectors for unnamed DATA.
+        #[arg(long, conflicts_with = "stream_utf16")]
+        stream: Option<String>,
+        /// Exact UTF-16 units, comma-separated four-digit hex (for example d800,0061).
+        #[arg(long, value_parser = StreamName::parse, conflicts_with = "stream")]
+        stream_utf16: Option<StreamName>,
         #[arg(long, default_value_t = 0)]
         start: u64,
         #[arg(long)]
@@ -104,9 +110,12 @@ enum Command {
     Cat {
         #[command(flatten)]
         file: RecordArgs,
-        /// Exact native stream name. Empty selects the unnamed DATA stream.
-        #[arg(long, default_value = "")]
-        stream: String,
+        /// Exact Unicode stream name. Omit both selectors for unnamed DATA.
+        #[arg(long, conflicts_with = "stream_utf16")]
+        stream: Option<String>,
+        /// Exact UTF-16 units, comma-separated four-digit hex (for example d800,0061).
+        #[arg(long, value_parser = StreamName::parse, conflicts_with = "stream")]
+        stream_utf16: Option<StreamName>,
         /// Logical starting byte within the stream.
         #[arg(long, default_value_t = 0)]
         start: u64,
@@ -166,15 +175,14 @@ fn stream_to_stdout(
     cx: &Cx,
     volume: &NtfsVolume,
     record: &NtfsFileRecord,
-    name: &str,
+    name: &[u16],
     start: u64,
     bytes: Option<u64>,
 ) -> Result<()> {
-    let name: Vec<u16> = name.encode_utf16().collect();
     if name.len() > 255 || name.contains(&0) {
         bail!("invalid NTFS stream name");
     }
-    let stream = volume.data_stream(cx, record, &name)?;
+    let stream = volume.data_stream(cx, record, name)?;
     let length = stream
         .size
         .saturating_sub(start)
@@ -234,12 +242,15 @@ fn main() -> Result<()> {
             image,
             path,
             stream,
+            stream_utf16,
             start,
             bytes,
         } => {
+            let stream = StreamName::select(stream.as_deref(), stream_utf16)
+                .map_err(anyhow::Error::msg)?;
             let volume = image.open(&cx)?;
             let record = volume.resolve(&cx, &path)?;
-            stream_to_stdout(&cx, &volume, &record, &stream, start, bytes)?;
+            stream_to_stdout(&cx, &volume, &record, stream.as_units(), start, bytes)?;
         }
         Command::Readlink { image, path } => {
             let volume = image.open(&cx)?;
@@ -334,12 +345,15 @@ fn main() -> Result<()> {
         Command::Cat {
             file,
             stream,
+            stream_utf16,
             start,
             bytes,
         } => {
+            let stream = StreamName::select(stream.as_deref(), stream_utf16)
+                .map_err(anyhow::Error::msg)?;
             let volume = file.image.open(&cx)?;
             let record = volume.record(&cx, file.record, file.sequence)?;
-            stream_to_stdout(&cx, &volume, &record, &stream, start, bytes)?;
+            stream_to_stdout(&cx, &volume, &record, stream.as_units(), start, bytes)?;
         }
         Command::Mount {
             image,
@@ -504,6 +518,7 @@ mod tests {
         let Command::Cat {
             file,
             stream,
+            stream_utf16,
             start,
             bytes,
         } = cli.command
@@ -511,7 +526,8 @@ mod tests {
             panic!("cat");
         };
         assert_eq!((file.record, file.sequence), (24, Some(7)));
-        assert_eq!((stream.as_str(), start, bytes), ("note", 512, Some(1024)));
+        assert_eq!((stream.as_deref(), start, bytes), (Some("note"), 512, Some(1024)));
+        assert!(stream_utf16.is_none());
         assert!(
             Cli::try_parse_from(["ffs-ntfs", "inspect", "disk.img", "--offline-image", "--rw"])
                 .is_err()
@@ -549,9 +565,75 @@ mod tests {
             panic!("read");
         };
         assert_eq!(
-            (path.as_str(), stream.as_str(), start, bytes),
-            ("/folder/Ä.bin", "note", 3, Some(2))
+            (path.as_str(), stream.as_deref(), start, bytes),
+            ("/folder/Ä.bin", Some("note"), 3, Some(2))
         );
         assert!(Cli::try_parse_from(["ffs-ntfs", "read", "disk.img", "/a"]).is_err());
+    }
+
+    #[test]
+    fn cli_raw_stream_selectors_preserve_units_in_path_and_record_reads() {
+        for (command, target) in [("cat", "24"), ("read", "/file")] {
+            let cli = Cli::try_parse_from([
+                "ffs-ntfs",
+                command,
+                "disk.img",
+                target,
+                "--offline-image",
+                "--stream-utf16",
+                "d800,006E",
+                "--start",
+                "3",
+                "--bytes",
+                "2",
+            ])
+            .unwrap();
+            let (stream, native, start, bytes) = match cli.command {
+                Command::Read {
+                    stream,
+                    stream_utf16,
+                    start,
+                    bytes,
+                    ..
+                }
+                | Command::Cat {
+                    stream,
+                    stream_utf16,
+                    start,
+                    bytes,
+                    ..
+                } => (stream, stream_utf16, start, bytes),
+                _ => panic!("stream extraction"),
+            };
+            assert!(stream.is_none());
+            assert_eq!(native.unwrap().as_units(), [0xD800, 0x006E]);
+            assert_eq!((start, bytes), (3, Some(2)));
+            assert!(
+                Cli::try_parse_from([
+                    "ffs-ntfs",
+                    command,
+                    "disk.img",
+                    target,
+                    "--offline-image",
+                    "--stream",
+                    "note",
+                    "--stream-utf16",
+                    "006E",
+                ])
+                .is_err()
+            );
+            assert!(
+                Cli::try_parse_from([
+                    "ffs-ntfs",
+                    command,
+                    "disk.img",
+                    target,
+                    "--offline-image",
+                    "--stream-utf16",
+                    "0000",
+                ])
+                .is_err()
+            );
+        }
     }
 }

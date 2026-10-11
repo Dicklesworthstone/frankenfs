@@ -23,11 +23,13 @@ ffs-ntfs ls volume.img / --offline-image
 ffs-ntfs ls volume.img /nested --offline-image
 ffs-ntfs read volume.img /nested/file.txt --offline-image > extracted.bin
 ffs-ntfs read volume.img /nested/file.txt --offline-image --stream note
+ffs-ntfs read volume.img /nested/file.txt --offline-image --stream-utf16 d800,0061
 ffs-ntfs readlink volume.img /nested/link --offline-image
 ffs-ntfs record volume.img 24 --offline-image
 ffs-ntfs streams volume.img 24 --offline-image --sequence 7
 ffs-ntfs cat volume.img 24 --offline-image > extracted.bin
 ffs-ntfs cat volume.img 24 --offline-image --stream note > alternate.bin
+ffs-ntfs cat volume.img 24 --offline-image --stream-utf16 d800,0061 > native-name.bin
 ffs-ntfs cat volume.img 24 --offline-image --sequence 7 --start 507 --bytes 1031
 ffs-ntfs cat disk.img 24 --offline-image --offset 1048576 --length 67108864
 
@@ -42,8 +44,14 @@ UTF-16 names; it is not a flattened extension-catalog listing. Its DATA admissio
 checks and `cat`/`read` operate on the assembled base file. Select streams through
 the base record, not an arbitrary extension record. UTF-16 names that cannot be
 represented as UTF-8 retain their exact code units in JSON. `--stream` selects an
-exact UTF-16 encoding of the supplied name; named-stream selection remains exact
-rather than case-insensitive. An optional sequence number detects stale references.
+exact UTF-16 encoding of the supplied Unicode name. `--stream-utf16` selects the
+original native code units directly, including unpaired surrogates. Supply one
+comma-separated argument of four-digit hexadecimal units: JSON `name_utf16`
+`[55296, 97]` is selected with `--stream-utf16 d800,0061`. Both numeric `cat` and
+path `read` support this selector; they reject using both options together.
+Omitting both options, or supplying an empty selector, selects unnamed DATA.
+Names are limited to 255 non-NUL UTF-16 units. Selection remains exact rather
+than case-insensitive. An optional sequence number detects stale references.
 `record` also reports the base file's assembled `reparse_point`, including the
 native tag, optional GUID bytes, exact UTF-16 substitute/display names for links,
 or an unknown provider's opaque payload. Inspecting this metadata does not grant
@@ -59,8 +67,9 @@ in extension records and groups continuation attributes into one row per exact
 native UTF-16 name. The rows are ordered by those code units; case folding and
 lossy replacement are not used. An unnamed stream has an empty name. A name that
 cannot be represented as UTF-8 has JSON `name: null` while `name_utf16` retains
-every original code unit. Stream selection still uses the existing `--stream`
-option on `cat` or `read`.
+every original code unit. Use `--stream` for a Unicode name or `--stream-utf16`
+for its exact native units on either `cat` or `read`; the latter allows extraction
+of streams whose JSON `name` is null.
 
 Each row reports `attribute_extents` and `read_profile`. Admitted metadata
 includes resident/nonresident storage, logical size, initialized length and
@@ -453,3 +462,16 @@ building `asupersync` under the shared memory limit; the engine regressions and
 native mounted reparse workload have not run. UBS could not complete because
 its helper downloads failed integrity checks. This evidence does not establish
 native Windows reparse interoperability.
+
+## Lossless stream-selector validation
+
+Two parser regressions and one CLI regression exercise exact UTF-16 units,
+unpaired surrogates, Unicode supplementary characters, the 255-unit limit,
+malformed hexadecimal input, NUL refusal, unnamed defaults and mutually
+exclusive selectors for numeric and path extraction. Source review confirms
+both commands pass the selected units directly to the existing DATA reader.
+
+Delivery evidence (2026-10-11): complete source blobs and their changes were
+reviewed independently. Rust compilation, these tests, formatting, Clippy, UBS
+and native-image execution remain unexecuted because the executor is offline.
+No new native interoperability or mounted execution result is claimed.
