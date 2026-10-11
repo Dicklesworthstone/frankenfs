@@ -249,6 +249,36 @@ wrongly keyed roots return corruption before an allocator is installed; the
 validated root address also drives live-tree pinning. Read-only access remains
 available when it does not need allocation authority.
 
+Raw MVCC publication is a separate authority from Btrfs filesystem mutation.
+A nonempty FCW, SSI, request-scope or repair publication invalidates the current
+semantic view before any later filesystem operation can use its cached state.
+The view and its nested subvolume instances share a recursive reader/writer
+gate: semantic operations hold read guards; raw publication holds the write
+guard and makes invalidation permanent. Journaled raw writes invalidate before
+the first physical I/O, including failed I/O. A recovered nonempty WAL starts
+with an invalid semantic view because the context was captured before recovery.
+Semantic operations return `ESTALE`; raw flush and retry remain available.
+After flushing, the caller must reopen to rebuild and validate the chunk map,
+roots, tree-log overlay, allocator and caches. This is refusal safety, not
+transparent cache refresh. Normal Btrfs operations maintain their own COW state
+and do not invalidate the view merely for committing or flushing data.
+Btrfs boundary eviction closes the request-mutation gate only when already
+quiescent. Otherwise it retains the durable MVCC chains for a later boundary:
+waiting while holding a semantic read guard could deadlock a request publishing
+raw blocks under the corresponding write guard. Durability does not depend on
+this optional eviction.
+
+Preallocation that starts from an inline Btrfs file checkpoints the filesystem
+tree and the existing commit-state snapshot, including allocator, checksum,
+chunk and device trees. The inline item stays authoritative until replacement
+bytes, backrefs and checksums are ready. The checkpoint extends through later
+preallocation and inode accounting, so an error restores a complete old file
+before the ENOSPC commit-and-retry path runs. Regular extents use sector-aligned
+lengths while the inode retains the visible file size. Rollback restores metadata
+and allocation authority; it does not erase MVCC versions already written to
+new, unreferenced addresses. Ordinary regular-extent preallocation avoids this
+additional checkpoint.
+
 Seed support also requires explicit per-device filesystem identity and seed
 generation, anchored to the sprout's committed DEV_ITEMs. Seed handles remain
 read-only; ordinary same-filesystem attachments retain their existing

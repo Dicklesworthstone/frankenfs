@@ -316,11 +316,72 @@ FrankenFS-written images, btrfs DUP second-copy recovery, kernel tree-log replay
 and writes to snapshotted default and writable snapshot subvolumes. This is
 positive compatibility evidence; the damaged-root refusal cases above execute
 through OpenFs rather than an injected-corruption mount.
-The broader Btrfs run also reproduced the separately tracked inline-fallocate
-data loss and random-fallocate `NoSpace` failures (`bd-zx0fk`); this is not a
-clean broad-suite result. General cached-descent invalidation after raw MVCC
-writes, seed/sprout routing and remaining profile qualification keep `bd-hk5w3`
-open.
+That earlier Btrfs run also reproduced the separately tracked inline-fallocate
+data loss and random-fallocate `NoSpace` failures (`bd-zx0fk`). The subsequent
+repair and current results are recorded below. Seed/sprout routing and remaining
+profile qualification keep `bd-hk5w3` open.
+
+Raw MVCC writes now invalidate the Btrfs semantic view and its retained nested
+views. Subsequent cached reads, metadata operations and allocator use return
+`ESTALE`; raw flush/retry remains available, followed by reopening the image.
+This covers FCW/SSI publication, caller-staged request scopes, repair writes,
+WAL recovery and journal I/O that can change backing bytes before failing.
+Empty non-journaled commits preserve the view. The family gate serializes raw
+publication with active semantic operations. Btrfs cache eviction skips active
+requests instead of waiting on a publisher that needs the same gate.
+This implements refusal safety, not transparent cache refresh or newly
+qualified multi-device mutation support. Raw external writes through a device
+handle remain outside this publication contract.
+Both original coherence regressions failed against the old implementation.
+At source `ba498483374b70c9767a28c8931a5b2e0f4918a7`, strict RCH execution
+passed all 46 selected raw-publication, metadata, mutation and repair controls
+(zero failed or ignored). This includes the corrected writable-DATA fixture,
+rejected FCW/SSI conflicts and registered-scope eviction. These are unit and
+formatter-backed OpenFs checks; the native-thread overlap probes do not establish
+LabRuntime/DPOR coverage.
+
+Btrfs inline-to-regular preallocation now preserves the inline file until its
+replacement is ready and restores metadata/allocation state if any later step
+fails. Regular extent lengths and their checksums cover whole sectors while
+KEEP_SIZE preserves the exact file length. The original patterned-data regression
+passes through commit, reopen, checksum verification and `btrfs check`; early
+conversion ENOSPC and later preallocation ENOSPC both retain the original bytes
+and allocation state. An unchanged eleven-operation churn reproduction also
+passes on a real formatted image, including exact reclamation accounting across
+commit, reopen and external validation.
+
+The randomized fallocate gate retains all 96 cases, operation ranges, unexpected
+error rejection and byte/size assertions. Its former DATA-only 512 KiB fixture
+could neither satisfy the generated COW workload nor allocate commit metadata.
+An independently reviewed, property-local 64 MiB mixed fixture now provides an
+explicit generator-derived capacity budget without adding a formatter skip.
+This is synthetic model coverage, separate from the formatter-backed proof above.
+Two independently reviewed extent/FIEMAP assertions now require the canonical
+4096-byte regular extent rather than an invalid unaligned payload length; exact
+file sizes, contents and extent flags remain checked.
+
+At source `79d5a09cc54b0088925b4f7fb1fdbefcfc8e0d56`, strict RCH execution of
+`cargo test -j2 -p ffs-core --lib -- btrfs --nocapture --test-threads=1` passed
+511 tests, failed none and retained 10 existing ignored tests. Mounted controls at the
+same production source (receipt `d5f66241e166fd593f944965c52891e4afc15537`)
+executed seven positive scenarios across five tests: KEEP_SIZE data preservation,
+tree-log recovery, two writable-snapshot modes, ext4/Btrfs kernel readback and
+Btrfs DUP recovery. The sixth selected test internally skipped FIEMAP because
+the host kernel returned EOPNOTSUPP before dispatch; it is not live FIEMAP proof.
+The original `generic/112` AIO/mmap qualification remains unmet: available workers
+lack fsx and its AIO/XFS build headers, and the upstream preallocation variants
+require an XFS reservation ioctl. `bd-zx0fk` remains open for that original
+workload; these results do not establish a new parity percentage.
+An independent agent re-executed the 17 critical core regressions at source
+`79d5a09` on a second health-checked RCH worker: all passed with required external
+oracles enabled. The final source, `ab5a5293554ac8c0c1587c9d4d24cc90acc859ab`,
+differs only in two branch reorderings requested by Clippy. It passed workspace
+check and Clippy (`--workspace --all-targets`, `-D warnings` for Clippy), formatting,
+and a final affected cohort: 94 passed, zero failed, three existing tests ignored.
+That cohort covers fallocate, all 12 raw-MVCC regressions and KEEP_SIZE FIEMAP,
+including the unchanged 96-case randomized model test with external oracles
+required. The ignores cover an ext4 profiler and two previously unsupported or
+unreachable ext4 cases; no new ignore or runtime skip was added.
 
 Ext4 xattr parity includes the POSIX ACL namespaces in addition to `user.*` and
 `security.*`: `crates/ffs-harness/tests/kernel_reference.rs` now differentially

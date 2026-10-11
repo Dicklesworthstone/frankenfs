@@ -409,6 +409,7 @@ impl OpenFs {
         cx: &Cx,
         root_logical: u64,
     ) -> Result<Vec<BtrfsTransidMismatch>, FfsError> {
+        let _view = self.btrfs_semantic_view_guard()?;
         let mut found = Vec::new();
         for logical in self.btrfs_tree_node_addresses(cx, root_logical)? {
             let node = self
@@ -444,6 +445,7 @@ impl OpenFs {
         &self,
         cx: &Cx,
     ) -> Result<Vec<BtrfsTransidMismatch>, FfsError> {
+        let _view = self.btrfs_semantic_view_guard()?;
         let Some(sb) = self.btrfs_superblock() else {
             return Ok(Vec::new());
         };
@@ -690,6 +692,9 @@ impl OpenFs {
 
 impl FsOps for OpenFs {
     fn xattr_presence(&self, cx: &Cx) -> XattrPresence {
+        let Ok(_view) = self.btrfs_semantic_view_guard() else {
+            return XattrPresence::Unknown;
+        };
         match &self.flavor {
             FsFlavor::Ext4(_) => self.ext4_scan_for_any_xattr(cx),
             FsFlavor::Btrfs(_) => self.btrfs_scan_for_any_xattr(cx),
@@ -768,6 +773,7 @@ impl FsOps for OpenFs {
         scope: &mut RequestScope,
         ino: InodeNumber,
     ) -> ffs_error::Result<InodeAttr> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => self
                 .read_inode_attr_with_scope(cx, scope, Self::ext4_canonical_inode(ino))
@@ -790,6 +796,7 @@ impl FsOps for OpenFs {
         parent: InodeNumber,
         name: &OsStr,
     ) -> ffs_error::Result<InodeAttr> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => {
                 let parent_ino = Self::ext4_canonical_inode(parent);
@@ -850,6 +857,7 @@ impl FsOps for OpenFs {
         ino: InodeNumber,
         offset: u64,
     ) -> ffs_error::Result<ReaddirPage> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => self.ext4_readdir(cx, scope, ino, offset),
             FsFlavor::Btrfs(_) => {
@@ -871,6 +879,7 @@ impl FsOps for OpenFs {
         offset: u64,
         size: u32,
     ) -> ffs_error::Result<Vec<u8>> {
+        let _view = self.btrfs_semantic_view_guard()?;
         if let Some((_, nested, inner)) = self.btrfs_nested_route(ino)? {
             return nested.read(cx, &mut RequestScope::empty(), inner, offset, size);
         }
@@ -932,6 +941,7 @@ impl FsOps for OpenFs {
         scope: &mut RequestScope,
         ino: InodeNumber,
     ) -> ffs_error::Result<Vec<u8>> {
+        let _view = self.btrfs_semantic_view_guard()?;
         if let Some((_, nested, inner)) = self.btrfs_nested_route(ino)? {
             return nested.readlink(cx, &mut RequestScope::empty(), inner);
         }
@@ -984,6 +994,7 @@ impl FsOps for OpenFs {
         scope: &mut RequestScope,
         _ino: InodeNumber,
     ) -> ffs_error::Result<FsStat> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(sb) => {
                 // On a writable fs the in-memory group stats mirror the on-disk
@@ -1103,6 +1114,7 @@ impl FsOps for OpenFs {
     }
 
     fn listxattr(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<Vec<String>> {
+        let _view = self.btrfs_semantic_view_guard()?;
         if let Some((_, nested, inner)) = self.btrfs_nested_route(ino)? {
             return nested.listxattr(cx, inner);
         }
@@ -1122,6 +1134,7 @@ impl FsOps for OpenFs {
         ino: InodeNumber,
         name: &str,
     ) -> ffs_error::Result<Option<Vec<u8>>> {
+        let _view = self.btrfs_semantic_view_guard()?;
         // An over-long name is ERANGE (kernel pre-fs check), not a spurious
         // not-found.
         Self::xattr_name_within_limit_or_erange(name)?;
@@ -1176,6 +1189,7 @@ impl FsOps for OpenFs {
         value: &[u8],
         mode: XattrSetMode,
     ) -> ffs_error::Result<()> {
+        let _view = self.btrfs_semantic_view_guard()?;
         // setxattr(2): the kernel's generic syscall path rejects a value larger
         // than XATTR_SIZE_MAX (65536) with E2BIG before reaching any filesystem,
         // so the limit is uniform across ext4 and btrfs. A FUSE mount never
@@ -1212,6 +1226,7 @@ impl FsOps for OpenFs {
         ino: InodeNumber,
         name: &str,
     ) -> ffs_error::Result<bool> {
+        let _view = self.btrfs_semantic_view_guard()?;
         // An over-long name is ERANGE (kernel pre-fs check).
         Self::xattr_name_within_limit_or_erange(name)?;
         match &self.flavor {
@@ -1237,6 +1252,7 @@ impl FsOps for OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        let _view = self.btrfs_semantic_view_guard()?;
         self.reject_dir_entry_change(cx, scope, parent, false)?;
         let (mode, gid) = self.setgid_dir_owner(cx, scope, parent, mode, gid, false)?;
         let _namespace = self.begin_namespace_mutation();
@@ -1269,6 +1285,7 @@ impl FsOps for OpenFs {
         now: std::time::SystemTime,
         strict: bool,
     ) -> ffs_error::Result<bool> {
+        let _view = self.btrfs_semantic_view_guard()?;
         // A nested subvolume is presented read-only (bd-2ryx9): no atime.
         if self.btrfs_nested_route(ino)?.is_some() {
             return Ok(false);
@@ -1290,6 +1307,7 @@ impl FsOps for OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        let _view = self.btrfs_semantic_view_guard()?;
         self.reject_dir_entry_change(cx, scope, parent, false)?;
         let (mode, gid) = self.setgid_dir_owner(cx, scope, parent, mode, gid, false)?;
         let attr = match &self.flavor {
@@ -1314,6 +1332,7 @@ impl FsOps for OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        let _view = self.btrfs_semantic_view_guard()?;
         self.reject_dir_entry_change(cx, scope, parent, false)?;
         let (mode, gid) = self.setgid_dir_owner(cx, scope, parent, mode, gid, false)?;
         let _namespace = self.begin_namespace_mutation();
@@ -1349,6 +1368,7 @@ impl FsOps for OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        let _view = self.btrfs_semantic_view_guard()?;
         self.reject_dir_entry_change(cx, scope, parent, false)?;
         let (mode, gid) = self.setgid_dir_owner(cx, scope, parent, mode, gid, true)?;
         let _namespace = self.begin_namespace_mutation();
@@ -1380,6 +1400,7 @@ impl FsOps for OpenFs {
         parent: InodeNumber,
         name: &OsStr,
     ) -> ffs_error::Result<()> {
+        let _view = self.btrfs_semantic_view_guard()?;
         self.reject_dir_entry_change(cx, scope, parent, true)?;
         let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
@@ -1405,6 +1426,7 @@ impl FsOps for OpenFs {
         parent: InodeNumber,
         name: &OsStr,
     ) -> ffs_error::Result<()> {
+        let _view = self.btrfs_semantic_view_guard()?;
         self.reject_dir_entry_change(cx, scope, parent, true)?;
         let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
@@ -1434,6 +1456,7 @@ impl FsOps for OpenFs {
         _scope: &mut RequestScope,
         ino: InodeNumber,
     ) -> ffs_error::Result<bool> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => self.ext4_finalize_unlinked_inode_impl(cx, ino),
             FsFlavor::Btrfs(_) => self.btrfs_finalize_unlinked_inode(ino),
@@ -1449,6 +1472,7 @@ impl FsOps for OpenFs {
         new_parent: InodeNumber,
         new_name: &OsStr,
     ) -> ffs_error::Result<()> {
+        let _view = self.btrfs_semantic_view_guard()?;
         self.reject_rename_dir_change(cx, scope, parent, new_parent, new_name)?;
         let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
@@ -1484,6 +1508,7 @@ impl FsOps for OpenFs {
         new_name: &OsStr,
         flags: u32,
     ) -> ffs_error::Result<()> {
+        let _view = self.btrfs_semantic_view_guard()?;
         // Reject combinations that linux/fs.h forbids before doing any work.
         // The kernel itself never sets more than one bit at a time but a
         // malformed FUSE request could; mirror ext4's strict check.
@@ -1561,6 +1586,7 @@ impl FsOps for OpenFs {
         offset: u64,
         data: &[u8],
     ) -> ffs_error::Result<u32> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => {
                 self.ext4_write(cx, scope, Self::ext4_canonical_inode(ino), offset, data)
@@ -1580,6 +1606,7 @@ impl FsOps for OpenFs {
         new_parent: InodeNumber,
         new_name: &OsStr,
     ) -> ffs_error::Result<InodeAttr> {
+        let _view = self.btrfs_semantic_view_guard()?;
         self.reject_dir_entry_change(cx, scope, new_parent, false)?;
         let _namespace = self.begin_namespace_mutation();
         clear_readdir_snapshot(&self.readdir_snapshot);
@@ -1610,6 +1637,7 @@ impl FsOps for OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        let _view = self.btrfs_semantic_view_guard()?;
         self.reject_dir_entry_change(cx, scope, parent, false)?;
         let (_, gid) = self.setgid_dir_owner(cx, scope, parent, 0, gid, false)?;
         let target_bytes = target.as_os_str().as_encoded_bytes();
@@ -1653,6 +1681,7 @@ impl FsOps for OpenFs {
         length: u64,
         mode: i32,
     ) -> ffs_error::Result<()> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => self.ext4_fallocate(
                 cx,
@@ -1685,6 +1714,7 @@ impl FsOps for OpenFs {
         start: u64,
         length: u64,
     ) -> ffs_error::Result<Vec<FiemapExtent>> {
+        let _view = self.btrfs_semantic_view_guard()?;
         if let Some((_, nested, inner)) = self.btrfs_nested_route(ino)? {
             return nested.fiemap(cx, &mut RequestScope::empty(), inner, start, length);
         }
@@ -1702,6 +1732,7 @@ impl FsOps for OpenFs {
         offset: u64,
         whence: SeekWhence,
     ) -> ffs_error::Result<u64> {
+        let _view = self.btrfs_semantic_view_guard()?;
         if let Some((_, nested, inner)) = self.btrfs_nested_route(ino)? {
             return nested.lseek(cx, &mut RequestScope::empty(), inner, offset, whence);
         }
@@ -1729,6 +1760,7 @@ impl FsOps for OpenFs {
         scope: &mut RequestScope,
         ino: InodeNumber,
     ) -> ffs_error::Result<u32> {
+        let _view = self.btrfs_semantic_view_guard()?;
         if let Some((_, nested, inner)) = self.btrfs_nested_route(ino)? {
             return nested.get_inode_flags(cx, &mut RequestScope::empty(), inner);
         }
@@ -1759,6 +1791,7 @@ impl FsOps for OpenFs {
         scope: &mut RequestScope,
         ino: InodeNumber,
     ) -> ffs_error::Result<u32> {
+        let _view = self.btrfs_semantic_view_guard()?;
         if let Some((_, nested, inner)) = self.btrfs_nested_route(ino)? {
             return nested.get_inode_state(cx, &mut RequestScope::empty(), inner);
         }
@@ -1786,6 +1819,7 @@ impl FsOps for OpenFs {
         scope: &mut RequestScope,
         ino: InodeNumber,
     ) -> ffs_error::Result<FsxattrInfo> {
+        let _view = self.btrfs_semantic_view_guard()?;
         if let Some((_, nested, inner)) = self.btrfs_nested_route(ino)? {
             return nested.get_inode_fsxattr(cx, &mut RequestScope::empty(), inner);
         }
@@ -1833,6 +1867,7 @@ impl FsOps for OpenFs {
     }
 
     fn fs_uuid(&self) -> ffs_error::Result<[u8; 16]> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(sb) => Ok(sb.uuid),
             // btrfs `fsid` is the 16-byte filesystem UUID; the kernel
@@ -1849,6 +1884,7 @@ impl FsOps for OpenFs {
         len: u64,
         min_len: u64,
     ) -> ffs_error::Result<u64> {
+        let _view = self.btrfs_semantic_view_guard()?;
         // Reject exactly the ranges the kernel rejects, so fstrim(8)
         // fails where it fails on ext4/btrfs (xfstests generic/260, 288).
         let invalid = match &self.flavor {
@@ -1908,6 +1944,7 @@ impl FsOps for OpenFs {
         ino: InodeNumber,
         fsx: FsxattrInfo,
     ) -> ffs_error::Result<()> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => {
                 // ext4 does not implement extsize / cowextsize hints,
@@ -2012,6 +2049,7 @@ impl FsOps for OpenFs {
         scope: &mut RequestScope,
         ino: InodeNumber,
     ) -> ffs_error::Result<()> {
+        let _view = self.btrfs_semantic_view_guard()?;
         // ext4_ext_precache walks the extent tree to pull index/leaf
         // blocks into the page cache so subsequent reads don't stall on
         // metadata I/O. The kernel returns 0 for inodes with no extents
@@ -2048,6 +2086,7 @@ impl FsOps for OpenFs {
         scope: &mut RequestScope,
         ino: InodeNumber,
     ) -> ffs_error::Result<()> {
+        let _view = self.btrfs_semantic_view_guard()?;
         // FrankenFS keeps extent-status state per-RequestScope rather
         // than in a process-lifetime per-inode cache, so there is
         // nothing for ext4_clear_inode_es to drop. Read the inode
@@ -2073,6 +2112,7 @@ impl FsOps for OpenFs {
         scope: &mut RequestScope,
         ino: InodeNumber,
     ) -> ffs_error::Result<u32> {
+        let _view = self.btrfs_semantic_view_guard()?;
         if let Some((_, nested, inner)) = self.btrfs_nested_route(ino)? {
             return nested.get_inode_generation(cx, &mut RequestScope::empty(), inner);
         }
@@ -2224,6 +2264,7 @@ impl FsOps for OpenFs {
     }
 
     fn get_fs_label(&self, cx: &Cx, _scope: &mut RequestScope) -> ffs_error::Result<Vec<u8>> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => {
                 let sb_region = read_ext4_superblock_region(cx, self.dev.as_ref())?;
@@ -2383,6 +2424,7 @@ impl FsOps for OpenFs {
         scope: &mut RequestScope,
         label: &[u8],
     ) -> ffs_error::Result<()> {
+        let _view = self.btrfs_semantic_view_guard()?;
         const EXT4_LABEL_MAX: usize = 16;
         const EXT4_VOLUME_NAME_OFFSET: usize = 0x78;
 
@@ -2460,6 +2502,7 @@ impl FsOps for OpenFs {
     }
 
     fn get_btrfs_fs_info(&self, cx: &Cx, _scope: &mut RequestScope) -> ffs_error::Result<Vec<u8>> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_FS_INFO is not supported on ext4 filesystems".to_owned(),
@@ -2479,6 +2522,7 @@ impl FsOps for OpenFs {
     }
 
     fn btrfs_start_sync(&self, cx: &Cx, scope: &mut RequestScope) -> ffs_error::Result<u64> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_START_SYNC is not supported on ext4 filesystems".to_owned(),
@@ -2500,6 +2544,7 @@ impl FsOps for OpenFs {
         scope: &mut RequestScope,
         _transid: u64,
     ) -> ffs_error::Result<()> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_WAIT_SYNC is not supported on ext4 filesystems".to_owned(),
@@ -2513,6 +2558,7 @@ impl FsOps for OpenFs {
         _cx: &Cx,
         _scope: &mut RequestScope,
     ) -> ffs_error::Result<Vec<u8>> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_GET_FEATURES is not supported on ext4 filesystems".to_owned(),
@@ -2562,6 +2608,7 @@ impl FsOps for OpenFs {
         _scope: &mut RequestScope,
         space_slots: u64,
     ) -> ffs_error::Result<Vec<u8>> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_SPACE_INFO is not supported on ext4 filesystems".to_owned(),
@@ -2609,6 +2656,7 @@ impl FsOps for OpenFs {
         _scope: &mut RequestScope,
         key: BtrfsTreeSearchKey,
     ) -> ffs_error::Result<(u32, Vec<u8>)> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_TREE_SEARCH is not supported on ext4 filesystems".to_owned(),
@@ -2626,6 +2674,7 @@ impl FsOps for OpenFs {
         _scope: &mut RequestScope,
         inum: u64,
     ) -> ffs_error::Result<Vec<u8>> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_INO_PATHS is not supported on ext4 filesystems".to_owned(),
@@ -2647,6 +2696,7 @@ impl FsOps for OpenFs {
         _scope: &mut RequestScope,
         logical: u64,
     ) -> ffs_error::Result<Vec<u8>> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_LOGICAL_INO is not supported on ext4 filesystems".to_owned(),
@@ -2707,6 +2757,7 @@ impl FsOps for OpenFs {
         logical: u64,
         _args: &[u8],
     ) -> ffs_error::Result<Vec<u8>> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_LOGICAL_INO_V2 is not supported on ext4 filesystems".to_owned(),
@@ -2914,6 +2965,7 @@ impl FsOps for OpenFs {
         ino: u64,
         args: &[u8],
     ) -> ffs_error::Result<Vec<u8>> {
+        let _view = self.btrfs_semantic_view_guard()?;
         if let Some((_, nested, inner)) = self.btrfs_nested_route(InodeNumber(ino))? {
             return nested.btrfs_encoded_read(cx, scope, inner.0, args);
         }
@@ -3301,6 +3353,7 @@ impl FsOps for OpenFs {
         args: &[u8],
         caller_pid: u32,
     ) -> ffs_error::Result<()> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_SEND is not supported on ext4 filesystems".to_owned(),
@@ -3595,6 +3648,7 @@ impl FsOps for OpenFs {
     }
 
     fn btrfs_get_fslabel(&self, _cx: &Cx, _scope: &mut RequestScope) -> ffs_error::Result<Vec<u8>> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_GET_FSLABEL is not supported on ext4 filesystems".to_owned(),
@@ -3635,6 +3689,7 @@ impl FsOps for OpenFs {
         _scope: &mut RequestScope,
         _ino: InodeNumber,
     ) -> ffs_error::Result<Vec<u8>> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_GET_SUBVOL_INFO is not supported on ext4 filesystems".to_owned(),
@@ -3660,6 +3715,7 @@ impl FsOps for OpenFs {
         _scope: &mut RequestScope,
         args: &[u8],
     ) -> ffs_error::Result<Vec<u8>> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_TREE_SEARCH_V2 is not supported on ext4 filesystems".to_owned(),
@@ -3704,6 +3760,7 @@ impl FsOps for OpenFs {
         treeid: u64,
         dirid: u64,
     ) -> ffs_error::Result<Vec<u8>> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_INO_LOOKUP_USER is not supported on ext4 filesystems".to_owned(),
@@ -3760,6 +3817,7 @@ impl FsOps for OpenFs {
         _scope: &mut RequestScope,
         args: &[u8],
     ) -> ffs_error::Result<Vec<u8>> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_GET_SUBVOL_ROOTREF is not supported on ext4 filesystems".to_owned(),
@@ -3821,6 +3879,7 @@ impl FsOps for OpenFs {
         dest_ino: InodeNumber,
         src_ino: InodeNumber,
     ) -> ffs_error::Result<()> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "FICLONE is not supported on ext4 filesystems".to_owned(),
@@ -3850,6 +3909,7 @@ impl FsOps for OpenFs {
         src_length: u64,
         dest_offset: u64,
     ) -> ffs_error::Result<()> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "FICLONERANGE is not supported on ext4 filesystems".to_owned(),
@@ -3912,6 +3972,7 @@ impl FsOps for OpenFs {
         treeid: u64,
         objectid: u64,
     ) -> ffs_error::Result<(u64, Vec<u8>)> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_INO_LOOKUP is not supported on ext4 filesystems".to_owned(),
@@ -3949,6 +4010,7 @@ impl FsOps for OpenFs {
         devid_in: u64,
         uuid_in: [u8; 16],
     ) -> ffs_error::Result<Vec<u8>> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_DEV_INFO is not supported on ext4 filesystems".to_owned(),
@@ -3967,6 +4029,7 @@ impl FsOps for OpenFs {
         _scope: &mut RequestScope,
         _ino: InodeNumber,
     ) -> ffs_error::Result<u64> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_SUBVOL_GETFLAGS is not supported on ext4 filesystems".to_owned(),
@@ -4001,6 +4064,7 @@ impl FsOps for OpenFs {
         _ino: InodeNumber,
         flags: u64,
     ) -> ffs_error::Result<()> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
                 "BTRFS_IOC_SUBVOL_SETFLAGS is not supported on ext4 filesystems".to_owned(),
@@ -4181,6 +4245,7 @@ impl FsOps for OpenFs {
         ino: InodeNumber,
         flags: u32,
     ) -> ffs_error::Result<()> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => {
                 let canonical = Self::ext4_canonical_inode(ino);
@@ -4461,6 +4526,7 @@ impl FsOps for OpenFs {
     }
 
     fn get_block_size(&self, _cx: &Cx, _scope: &mut RequestScope) -> ffs_error::Result<u32> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(sb) => Ok(sb.block_size),
             FsFlavor::Btrfs(sb) => Ok(sb.sectorsize),
@@ -4474,6 +4540,7 @@ impl FsOps for OpenFs {
         ino: InodeNumber,
         attrs: &SetAttrRequest,
     ) -> ffs_error::Result<InodeAttr> {
+        let _view = self.btrfs_semantic_view_guard()?;
         // A chmod of an inode with an access ACL rewrites that ACL too. ext4
         // writes xattrs straight to the device, so the mode change goes the
         // same way: through the request's transaction it would commit over a
@@ -4499,6 +4566,7 @@ impl FsOps for OpenFs {
         fh: u64,
         lock_owner: u64,
     ) -> ffs_error::Result<()> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => {
                 let scenario_id = Self::EXT4_RW_SCENARIO_FLUSH;
@@ -4579,6 +4647,7 @@ impl FsOps for OpenFs {
         _fh: u64,
         datasync: bool,
     ) -> ffs_error::Result<()> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => self.ext4_sync_with_logging(
                 cx,
@@ -4605,6 +4674,7 @@ impl FsOps for OpenFs {
         _fh: u64,
         datasync: bool,
     ) -> ffs_error::Result<()> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => self.ext4_sync_with_logging(
                 cx,
@@ -4624,6 +4694,7 @@ impl FsOps for OpenFs {
     }
 
     fn begin_request_scope(&self, _cx: &Cx, op: RequestOp) -> ffs_error::Result<RequestScope> {
+        let _view = self.btrfs_semantic_view_guard()?;
         if op.is_write() {
             self.reject_btrfs_unsupported_mutation()?;
         }
@@ -4800,7 +4871,17 @@ impl FsOps for OpenFs {
         } else {
             Vec::new()
         };
+        // Btrfs semantic operations maintain their own COW trees. Nonempty
+        // caller-supplied scope writes are raw block publication, just like
+        // the public FCW/SSI transaction API, and invalidate captured state.
+        let mut view = self.btrfs_raw_publication_guard(scope.pending_write_count());
         let result = scope.commit_if_write(&self.mvcc_store);
+        if result.is_ok()
+            && let Some(stale) = view.as_mut()
+        {
+            **stale = true;
+        }
+        drop(view);
         if let Ok(commit_seq) = &result {
             self.prune_mvcc_after_commit_if_due(*commit_seq);
             if let Some(tx_id) = tx_id {
@@ -4811,6 +4892,7 @@ impl FsOps for OpenFs {
     }
 
     fn flush_on_destroy(&self, cx: &Cx) -> ffs_error::Result<()> {
+        let _view = self.btrfs_semantic_view_guard()?;
         if !self.is_writable() {
             return Ok(());
         }

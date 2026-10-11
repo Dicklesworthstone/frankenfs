@@ -2385,6 +2385,12 @@ pub struct OpenFs {
     /// a slot here too.
     btrfs_nested: Mutex<Vec<BtrfsNestedSlot>>,
     btrfs_nested_enabled: bool,
+    /// Raw block publication cannot update the captured chunk map, tree-log
+    /// overlay, allocator and every semantic cache atomically. Such publication
+    /// invalidates this view and all nested views until the image is reopened.
+    /// Semantic operations hold a recursive read guard; raw publishers hold the
+    /// write guard until the stale flag is visible. False means usable.
+    btrfs_semantic_view_stale: Arc<RwLock<bool>>,
     /// LRU cache for extent tree lookups, avoiding repeated tree traversals
     /// for sequential reads. Invalidated on write/truncate/punch_hole.
     extent_cache: ffs_extent::ExtentCache,
@@ -6892,6 +6898,11 @@ impl OpenFs {
         };
 
         let (mvcc_store, mvcc_wal_recovery) = Self::init_mvcc_store(options)?;
+        // The format context above was read from the backing image, before WAL
+        // recovery. Recovered raw versions cannot share that semantic view.
+        let btrfs_semantic_view_stale = Arc::new(RwLock::new(
+            matches!(flavor, FsFlavor::Btrfs(_)) && mvcc_store.version_count() != 0,
+        ));
         let metadata_log = if options.metadata_log_enabled && matches!(flavor, FsFlavor::Ext4(_)) {
             options
                 .mvcc_wal_path
@@ -6992,6 +7003,7 @@ impl OpenFs {
             readdir_snapshot: Mutex::new(None),
             btrfs_nested: Mutex::new(Vec::new()),
             btrfs_nested_enabled: true,
+            btrfs_semantic_view_stale,
             dir_name_index: (0..DIR_NAME_INDEX_SHARDS)
                 .map(|_| Mutex::new(None))
                 .collect(),
@@ -10812,6 +10824,10 @@ impl OpenFs {
     /// That error does not roll back the transaction; callers must not assume
     /// that retrying the original write is safe.
     /// Attached read-only btrfs devices reject publication before any MVCC change.
+    /// Nonempty raw btrfs publication invalidates this instance's semantic view
+    /// (including nested subvolumes). Flush with [`Self::flush_mvcc_to_device`]
+    /// and reopen before further filesystem operations; those return `ESTALE`.
+    /// Normal filesystem writes maintain their own state and do not use this API.
     ///
     /// # Logging
     /// - `txn_commit_start`: transaction details before commit
@@ -10826,6 +10842,7 @@ impl OpenFs {
         })?;
         let txn_id = txn.id;
         let write_set_size = txn.pending_writes();
+        let mut view = self.btrfs_raw_publication_guard(write_set_size);
         let read_set_size = txn.read_set().len();
         // Capture write set blocks before commit consumes the transaction — but
         // ONLY when a repair-flush lifecycle is attached, the sole consumer
@@ -10852,6 +10869,14 @@ impl OpenFs {
         let start = tracing::enabled!(target: "ffs::mvcc", tracing::Level::INFO)
             .then(std::time::Instant::now);
         let result = self.mvcc_store.commit(txn);
+        if result.is_ok()
+            && let Some(stale) = view.as_mut()
+        {
+            **stale = true;
+        }
+        // Release before pruning or invoking repair callbacks: both can enter
+        // other filesystem boundaries. A callback error cannot restore freshness.
+        drop(view);
         let duration_us = start.map_or(0_u64, |s| s.elapsed().as_micros() as u64);
 
         match &result {
@@ -10948,6 +10973,8 @@ impl OpenFs {
     /// Returns `CommitError::SsiConflict` for rw-antidependency cycles.
     /// Repair notification failure returns `CommitError::DurabilityFailure`
     /// after commit visibility, with the committed sequence in its detail.
+    /// Like [`Self::commit_transaction`], nonempty raw btrfs publication requires
+    /// flushing and reopening before further semantic filesystem operations.
     #[allow(clippy::cast_possible_truncation)]
     pub fn commit_transaction_ssi(
         &self,
@@ -10961,6 +10988,7 @@ impl OpenFs {
         })?;
         let txn_id = txn.id;
         let write_set_size = txn.pending_writes();
+        let mut view = self.btrfs_raw_publication_guard(write_set_size);
         let read_set_size = txn.read_set().len();
         // Capture write set blocks before commit consumes the transaction — but
         // ONLY when a repair-flush lifecycle is attached, the sole consumer
@@ -10988,6 +11016,12 @@ impl OpenFs {
         let start = tracing::enabled!(target: "ffs::mvcc", tracing::Level::INFO)
             .then(std::time::Instant::now);
         let result = self.mvcc_store.commit_ssi(txn);
+        if result.is_ok()
+            && let Some(stale) = view.as_mut()
+        {
+            **stale = true;
+        }
+        drop(view);
         let duration_us = start.map_or(0_u64, |s| s.elapsed().as_micros() as u64);
 
         match &result {
@@ -11109,8 +11143,16 @@ impl OpenFs {
     /// while holding a lock a gated mutation may wait on (the btrfs allocator
     /// lock). From inside a gated mutation (a sync write's fsync) the gate
     /// cannot be closed, so eviction is skipped; the next boundary does it.
+    /// Btrfs boundaries also hold a semantic-view read guard. They must never
+    /// wait for a request that may need its write guard to publish raw blocks.
+    /// If any request is active, defer this optional eviction to a later boundary.
     fn evict_durable_mvcc_chains_quiesced(&self) {
-        let Some(_gate) = self.close_mutation_gate() else {
+        let gate = if self.btrfs_context().is_some() {
+            self.try_close_mutation_gate()
+        } else {
+            self.close_mutation_gate()
+        };
+        let Some(_gate) = gate else {
             return;
         };
         let durable_through = *self.mvcc_flushed_through.lock();
@@ -11379,7 +11421,12 @@ impl OpenFs {
             .tx
             .as_ref()
             .map_or_else(Vec::new, |tx| tx.write_set().keys().copied().collect());
+        let mut view = self.btrfs_raw_publication_guard(scope.pending_write_count());
         let commit_seq = scope.commit_if_write(&self.mvcc_store)?;
+        if let Some(stale) = view.as_mut() {
+            **stale = true;
+        }
+        drop(view);
         if let Some(tx_id) = tx_id {
             self.notify_repair_flush_lifecycle_with_cx(cx, tx_id, &write_blocks)?;
         }
@@ -11663,6 +11710,9 @@ impl OpenFs {
     /// This materialises in-memory writes to durable storage.  Call this
     /// before unmounting to ensure data written through the FUSE interface
     /// survives across remounts.  Returns the number of blocks flushed.
+    /// A btrfs view invalidated by raw publication remains stale even after a
+    /// successful flush (and after a failed flush). This method remains usable
+    /// for retries; a fresh open rebuilds and revalidates the semantic state.
     pub fn flush_mvcc_to_device(&self, cx: &Cx) -> ffs_error::Result<usize> {
         if let Err(error) = self.reject_btrfs_unsupported_mutation() {
             // Preserve a no-op read-only flush, but never persist versions
@@ -11753,6 +11803,31 @@ impl OpenFs {
         (!reasons.is_empty()).then(|| reasons.join(", "))
     }
 
+    fn btrfs_semantic_view_guard(
+        &self,
+    ) -> Result<Option<parking_lot::RwLockReadGuard<'_, bool>>, FfsError> {
+        if !self.is_btrfs() {
+            return Ok(None);
+        }
+        // FsOps calls other semantic helpers and routes nested subvolumes.
+        // Recursive acquisition avoids deadlock behind a waiting raw publisher.
+        let guard = self.btrfs_semantic_view_stale.read_recursive();
+        if *guard {
+            return Err(FfsError::Io(std::io::Error::new(
+                std::io::ErrorKind::StaleNetworkFileHandle,
+                "btrfs view invalidated by raw MVCC writes; flush and reopen the image",
+            )));
+        }
+        Ok(Some(guard))
+    }
+
+    fn btrfs_raw_publication_guard(
+        &self,
+        pending_writes: usize,
+    ) -> Option<parking_lot::RwLockWriteGuard<'_, bool>> {
+        (self.is_btrfs() && pending_writes != 0).then(|| self.btrfs_semantic_view_stale.write())
+    }
+
     fn reject_btrfs_unsupported_mutation(&self) -> Result<(), FfsError> {
         let Some(sb) = self.btrfs_superblock() else {
             return Ok(());
@@ -11776,6 +11851,9 @@ impl OpenFs {
     }
 
     pub fn enable_writes(&mut self, cx: &Cx) -> Result<(), FfsError> {
+        // &mut self excludes a simultaneous raw publisher on this instance.
+        // Do not rebuild an allocator from pre-recovery or invalidated metadata.
+        drop(self.btrfs_semantic_view_guard()?);
         self.reject_btrfs_unsupported_mutation()?;
         match &self.flavor {
             FsFlavor::Ext4(sb) => {
@@ -12881,6 +12959,8 @@ impl OpenFs {
     /// Returns `FfsError` if no JBD2 writer is attached or if the journal
     /// write fails. Returns `CommitError` (wrapped in `FfsError`) if the
     /// MVCC commit detects a conflict.
+    /// On btrfs, starting JBD2 I/O invalidates the semantic view even when the
+    /// journal write subsequently fails; raw flush/recovery must precede reopen.
     #[allow(clippy::cast_possible_truncation)]
     pub fn commit_transaction_journaled(
         &self,
@@ -12894,6 +12974,8 @@ impl OpenFs {
 
         let txn_id = txn.id;
         let write_count = txn.pending_writes();
+        // Family gate precedes the MVCC lock, matching semantic readers.
+        let mut view = self.btrfs_raw_publication_guard(1);
 
         debug!(
             target: "ffs::journal",
@@ -12930,6 +13012,12 @@ impl OpenFs {
                 "during merge resolution",
             )
         })?;
+
+        // Even an empty JBD2 transaction may write journal metadata. Once I/O
+        // starts, a failure can leave the backing changed without publication.
+        if let Some(stale) = view.as_mut() {
+            **stale = true;
+        }
 
         // Phase 2: write all pending blocks to the JBD2 journal.
         // Capture block numbers for repair lifecycle notification.
@@ -12991,6 +13079,7 @@ impl OpenFs {
             )
         })?;
         drop(mvcc_guard);
+        drop(view);
 
         info!(
             target: "ffs::journal",
@@ -13158,6 +13247,7 @@ impl OpenFs {
         cx: &Cx,
         root_logical: u64,
     ) -> Result<Vec<BtrfsLeafEntry>, FfsError> {
+        let _view = self.btrfs_semantic_view_guard()?;
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let ctx = self
             .btrfs_context()
@@ -13645,6 +13735,7 @@ impl OpenFs {
         lo: BtrfsKey,
         hi: BtrfsKey,
     ) -> Result<Vec<BtrfsLeafEntry>, FfsError> {
+        let _view = self.btrfs_semantic_view_guard()?;
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let ctx = self
             .btrfs_context()
@@ -14018,6 +14109,7 @@ impl OpenFs {
             self.btrfs_devices.clone(),
         )?;
         nested.btrfs_nested_enabled = false;
+        nested.btrfs_semantic_view_stale = Arc::clone(&self.btrfs_semantic_view_stale);
         let root_dirid = nested
             .btrfs_context()
             .map_or(BTRFS_FIRST_FREE_OBJECTID, |ctx| ctx.subvol_root_dirid);
@@ -16302,6 +16394,7 @@ impl OpenFs {
     /// Returns `Ok(true)` when a btrfs index is available, `Ok(false)` for ext4
     /// or writable btrfs mounts where the COW tree can change under the cache.
     pub fn prewarm_btrfs_read_plan_index(&self, cx: &Cx) -> ffs_error::Result<bool> {
+        let _view = self.btrfs_semantic_view_guard()?;
         self.btrfs_read_plan_index(cx).map(|idx| idx.is_some())
     }
 
@@ -16417,6 +16510,7 @@ impl OpenFs {
     /// Returns [`FfsError::Corruption`] on a checksum mismatch, or a read/parse
     /// error if the inode, extents, or csum tree cannot be read.
     pub fn btrfs_verify_file_data_csums(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<()> {
+        let _view = self.btrfs_semantic_view_guard()?;
         let canonical = self.btrfs_canonical_inode(ino)?;
         let sectorsize = {
             let sb = self
@@ -18634,6 +18728,7 @@ impl OpenFs {
         scope: &RequestScope,
         ino: InodeNumber,
     ) -> Result<InodeAttr, FfsError> {
+        let _view = self.btrfs_semantic_view_guard()?;
         // On a read-only mount the inode is immutable, so serve a previously
         // resolved attr without re-reading + re-parsing the inode (a directory scan
         // re-resolves the same children repeatedly). Writable mounts skip the cache.
@@ -18837,6 +18932,7 @@ impl OpenFs {
     ///
     /// Propagates I/O errors from reading group bitmaps.
     pub fn largest_contiguous_free_run(&self, cx: &Cx) -> Result<u64, FfsError> {
+        let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(sb) => {
                 let geo = FsGeometry::from_superblock(sb);
@@ -18977,6 +19073,7 @@ impl OpenFs {
         start: u64,
         end: u64,
     ) -> Result<u64, FfsError> {
+        let _view = self.btrfs_semantic_view_guard()?;
         let sb = self
             .btrfs_superblock()
             .ok_or_else(|| FfsError::Format("not a btrfs filesystem".into()))?;
@@ -41622,6 +41719,7 @@ impl OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<u64> {
+        let _view = self.btrfs_semantic_view_guard()?;
         if self.btrfs_context().is_none() {
             return Err(FfsError::UnsupportedFeature(
                 "subvolume creation is only supported on btrfs".into(),
@@ -41643,6 +41741,7 @@ impl OpenFs {
         parent: InodeNumber,
         name: &[u8],
     ) -> ffs_error::Result<u64> {
+        let _view = self.btrfs_semantic_view_guard()?;
         if self.btrfs_context().is_none() {
             return Err(FfsError::UnsupportedFeature(
                 "snapshots are only supported on btrfs".into(),
@@ -43325,159 +43424,174 @@ impl OpenFs {
             );
         }
 
-        // Every mode but collapse/insert (which shift every later extent)
-        // changes only EXTENT_DATA items keyed in [window_lo, new_end]; nbytes
-        // is then adjusted by that window's change instead of re-walked.
-        let window = if collapse_range || insert_range {
+        // A failed inline conversion must leave a complete old file for the
+        // ENOSPC commit-and-retry path. Include later preallocation and inode
+        // accounting in this checkpoint: they can fail after conversion, too.
+        // Ordinary regular-extent requests need no extra checkpoint here.
+        let inline_key = BtrfsKey {
+            objectid: canonical,
+            item_type: BTRFS_ITEM_EXTENT_DATA,
+            offset: 0,
+        };
+        let inline = if punch_hole || zero_range || collapse_range || insert_range {
             None
         } else {
-            let lo = Self::btrfs_extent_window_floor(&alloc, canonical, offset)?;
-            Some((
-                lo,
-                Self::btrfs_window_nbytes(&alloc, canonical, lo, new_end)?,
-            ))
-        };
-
-        if collapse_range {
-            if new_end >= inode.size {
-                return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                    libc::EINVAL,
-                )));
-            }
-            self.btrfs_collapse_extent_range(cx, &mut alloc, canonical, offset, length)?;
-            inode.size = inode
-                .size
-                .checked_sub(length)
-                .ok_or_else(|| FfsError::InvalidGeometry("collapse size underflow".into()))?;
-        } else if insert_range {
-            if offset >= inode.size {
-                return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                    libc::EINVAL,
-                )));
-            }
-            self.btrfs_insert_hole_range(cx, &mut alloc, canonical, offset, length)?;
-            inode.size = inode
-                .size
-                .checked_add(length)
-                .ok_or_else(|| FfsError::InvalidGeometry("insert size overflow".into()))?;
-        } else if punch_hole || zero_range {
-            // Only items keyed in [window_lo, new_end] can overlap the range.
-            let ext_start = BtrfsKey {
-                objectid: canonical,
-                item_type: BTRFS_ITEM_EXTENT_DATA,
-                offset: window.map_or(0, |(lo, _)| lo),
-            };
-            let ext_end = BtrfsKey {
-                objectid: canonical,
-                item_type: BTRFS_ITEM_EXTENT_DATA,
-                offset: new_end,
-            };
-            let extents = alloc
+            alloc
                 .fs_tree
-                .range(&ext_start, &ext_end)
-                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-            let mut touched_extents = Vec::new();
-            let mut segments = Vec::new();
-            let mut zero_cursor = offset;
+                .range(&inline_key, &inline_key)
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?
+                .first()
+                .map(|(_, bytes)| parse_extent_data(bytes).map_err(|e| parse_to_ffs_error(&e)))
+                .transpose()?
+                .filter(|extent| matches!(extent, BtrfsExtentData::Inline { .. }))
+        };
+        let checkpoint = inline.as_ref().map(|_| {
+            let fs_tree = alloc.fs_tree.checkpoint();
+            (fs_tree, BtrfsCommitSnapshot::take(&mut alloc, self))
+        });
+        let result = (|| {
+            // Every mode but collapse/insert (which shift every later extent)
+            // changes only EXTENT_DATA items keyed in [window_lo, new_end]; nbytes
+            // is then adjusted by that window's change instead of re-walked.
+            let window = if collapse_range || insert_range {
+                None
+            } else {
+                let lo = Self::btrfs_extent_window_floor(&alloc, canonical, offset)?;
+                Some((
+                    lo,
+                    Self::btrfs_window_nbytes(&alloc, canonical, lo, new_end)?,
+                ))
+            };
 
-            for (key, extent_bytes) in extents {
-                let extent =
-                    parse_extent_data(&extent_bytes).map_err(|e| parse_to_ffs_error(&e))?;
-                let logical_len = Self::btrfs_extent_logical_len(&extent)?;
-                let logical_end = key.offset.checked_add(logical_len).ok_or_else(|| {
-                    FfsError::InvalidGeometry("extent logical end overflow".into())
-                })?;
-                let overlap_start = key.offset.max(offset);
-                let overlap_end = logical_end.min(new_end);
-                if overlap_start >= overlap_end {
-                    continue;
+            if collapse_range {
+                if new_end >= inode.size {
+                    return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                        libc::EINVAL,
+                    )));
+                }
+                self.btrfs_collapse_extent_range(cx, &mut alloc, canonical, offset, length)?;
+                inode.size = inode
+                    .size
+                    .checked_sub(length)
+                    .ok_or_else(|| FfsError::InvalidGeometry("collapse size underflow".into()))?;
+            } else if insert_range {
+                if offset >= inode.size {
+                    return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                        libc::EINVAL,
+                    )));
+                }
+                self.btrfs_insert_hole_range(cx, &mut alloc, canonical, offset, length)?;
+                inode.size = inode
+                    .size
+                    .checked_add(length)
+                    .ok_or_else(|| FfsError::InvalidGeometry("insert size overflow".into()))?;
+            } else if punch_hole || zero_range {
+                // Only items keyed in [window_lo, new_end] can overlap the range.
+                let ext_start = BtrfsKey {
+                    objectid: canonical,
+                    item_type: BTRFS_ITEM_EXTENT_DATA,
+                    offset: window.map_or(0, |(lo, _)| lo),
+                };
+                let ext_end = BtrfsKey {
+                    objectid: canonical,
+                    item_type: BTRFS_ITEM_EXTENT_DATA,
+                    offset: new_end,
+                };
+                let extents = alloc
+                    .fs_tree
+                    .range(&ext_start, &ext_end)
+                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                let mut touched_extents = Vec::new();
+                let mut segments = Vec::new();
+                let mut zero_cursor = offset;
+
+                for (key, extent_bytes) in extents {
+                    let extent =
+                        parse_extent_data(&extent_bytes).map_err(|e| parse_to_ffs_error(&e))?;
+                    let logical_len = Self::btrfs_extent_logical_len(&extent)?;
+                    let logical_end = key.offset.checked_add(logical_len).ok_or_else(|| {
+                        FfsError::InvalidGeometry("extent logical end overflow".into())
+                    })?;
+                    let overlap_start = key.offset.max(offset);
+                    let overlap_end = logical_end.min(new_end);
+                    if overlap_start >= overlap_end {
+                        continue;
+                    }
+
+                    if zero_range && zero_cursor < overlap_start {
+                        Self::btrfs_push_prealloc_rewrite_segment(
+                            &mut segments,
+                            zero_cursor,
+                            overlap_start - zero_cursor,
+                        )?;
+                    }
+
+                    let materialized = if Self::btrfs_extent_is_prealloc(&extent) {
+                        Vec::new()
+                    } else {
+                        self.btrfs_materialize_extent(cx, &extent)?
+                    };
+                    Self::btrfs_push_rewrite_segment(
+                        &mut segments,
+                        key.offset,
+                        &extent,
+                        &materialized,
+                        0,
+                        overlap_start - key.offset,
+                    )?;
+                    if zero_range {
+                        Self::btrfs_push_prealloc_rewrite_segment(
+                            &mut segments,
+                            overlap_start,
+                            overlap_end - overlap_start,
+                        )?;
+                    }
+                    Self::btrfs_push_rewrite_segment(
+                        &mut segments,
+                        overlap_end,
+                        &extent,
+                        &materialized,
+                        overlap_end - key.offset,
+                        logical_len,
+                    )?;
+                    zero_cursor = zero_cursor.max(overlap_end);
+                    touched_extents.push((key, extent));
                 }
 
-                if zero_range && zero_cursor < overlap_start {
+                if zero_range && zero_cursor < new_end {
                     Self::btrfs_push_prealloc_rewrite_segment(
                         &mut segments,
                         zero_cursor,
-                        overlap_start - zero_cursor,
+                        new_end - zero_cursor,
                     )?;
                 }
 
-                let materialized = if Self::btrfs_extent_is_prealloc(&extent) {
-                    Vec::new()
-                } else {
-                    self.btrfs_materialize_extent(cx, &extent)?
-                };
-                Self::btrfs_push_rewrite_segment(
-                    &mut segments,
-                    key.offset,
-                    &extent,
-                    &materialized,
-                    0,
-                    overlap_start - key.offset,
+                self.btrfs_rewrite_extent_data_segments(
+                    cx,
+                    &mut alloc,
+                    canonical,
+                    &touched_extents,
+                    segments,
                 )?;
-                if zero_range {
-                    Self::btrfs_push_prealloc_rewrite_segment(
-                        &mut segments,
-                        overlap_start,
-                        overlap_end - overlap_start,
-                    )?;
-                }
-                Self::btrfs_push_rewrite_segment(
-                    &mut segments,
-                    overlap_end,
-                    &extent,
-                    &materialized,
-                    overlap_end - key.offset,
-                    logical_len,
-                )?;
-                zero_cursor = zero_cursor.max(overlap_end);
-                touched_extents.push((key, extent));
-            }
-
-            if zero_range && zero_cursor < new_end {
-                Self::btrfs_push_prealloc_rewrite_segment(
-                    &mut segments,
-                    zero_cursor,
-                    new_end - zero_cursor,
-                )?;
-            }
-
-            self.btrfs_rewrite_extent_data_segments(
-                cx,
-                &mut alloc,
-                canonical,
-                &touched_extents,
-                segments,
-            )?;
-        } else {
-            // If there's an existing inline extent at offset 0, convert it to
-            // a regular extent before inserting any prealloc extents. btrfs
-            // cannot mix inline and regular file extent items for one inode.
-            let inline_key = BtrfsKey {
-                objectid: canonical,
-                item_type: BTRFS_ITEM_EXTENT_DATA,
-                offset: 0,
-            };
-            let existing = alloc
-                .fs_tree
-                .range(&inline_key, &inline_key)
-                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-            if let Some((_, edata)) = existing.first() {
-                let inline_extent = parse_extent_data(edata).map_err(|e| parse_to_ffs_error(&e))?;
-                if matches!(inline_extent, BtrfsExtentData::Inline { .. }) {
-                    let prev_data = self.btrfs_materialize_extent(cx, &inline_extent)?;
-                    alloc
-                        .fs_tree
-                        .delete(&inline_key)
-                        .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+            } else {
+                // If there's an existing inline extent at offset 0, convert it to
+                // a regular extent before inserting any prealloc extents. btrfs
+                // cannot mix inline and regular file extent items for one inode.
+                if let Some(inline_extent) = &inline {
+                    let prev_data = self.btrfs_materialize_extent(cx, inline_extent)?;
                     let sectorsize = u64::from(alloc.sectorsize);
-                    if !prev_data.is_empty() {
+                    if prev_data.is_empty() {
+                        alloc
+                            .fs_tree
+                            .delete(&inline_key)
+                            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                    } else {
                         let prev_data_len = u64::try_from(prev_data.len()).map_err(|_| {
                             FfsError::InvalidGeometry(
                                 "existing inline extent length does not fit u64".into(),
                             )
                         })?;
-                        let prev_alloc_size =
-                            prev_data_len.saturating_add(sectorsize - 1) & !(sectorsize - 1);
+                        let prev_alloc_size = Self::btrfs_align_up(prev_data_len, sectorsize)?;
                         let prev_allocation = alloc
                             .extent_alloc
                             .alloc_data(prev_alloc_size)
@@ -43491,209 +43605,189 @@ impl OpenFs {
                         // file's data back after a fallocate converted a
                         // small file's inline extent).
                         let mut padded = prev_data;
-                        padded.resize(usize::try_from(prev_alloc_size).unwrap_or(usize::MAX), 0);
-                        if let Err(e) =
-                            self.btrfs_write_logical(cx, prev_allocation.bytenr, &padded)
-                        {
-                            let _ = alloc.extent_alloc.free_extent(
-                                prev_allocation.bytenr,
-                                prev_alloc_size,
-                                false,
-                            );
-                            return Err(e);
-                        }
+                        padded.resize(
+                            usize::try_from(prev_alloc_size).map_err(|_| {
+                                FfsError::InvalidGeometry("inline allocation exceeds usize".into())
+                            })?,
+                            0,
+                        );
+                        self.btrfs_write_logical(cx, prev_allocation.bytenr, &padded)?;
                         let prev_extent = BtrfsExtentData::Regular {
                             generation: alloc.generation,
-                            ram_bytes: prev_data_len,
+                            ram_bytes: prev_alloc_size,
                             extent_type: BTRFS_FILE_EXTENT_REG,
                             compression: 0,
                             disk_bytenr: prev_allocation.bytenr,
                             disk_num_bytes: prev_alloc_size,
                             extent_offset: 0,
-                            num_bytes: prev_data_len,
+                            num_bytes: prev_alloc_size,
                         };
-                        if let Err(e) = alloc.fs_tree.insert(inline_key, &prev_extent.to_bytes()) {
-                            let _ = alloc.extent_alloc.free_extent(
-                                prev_allocation.bytenr,
-                                prev_alloc_size,
-                                false,
-                            );
-                            return Err(btrfs_mutation_to_ffs(&e));
-                        }
                         // Register the converted extent's backref (bd-x3fcu);
                         // the inline extent always starts at file offset 0.
-                        if let Err(e) = Self::btrfs_register_data_extent_backref(
+                        Self::btrfs_register_data_extent_backref(
                             &mut alloc,
                             prev_allocation.bytenr,
                             prev_alloc_size,
                             canonical,
                             0,
-                        ) {
-                            let _ = alloc.fs_tree.delete(&inline_key);
-                            let _ = alloc.extent_alloc.free_extent(
-                                prev_allocation.bytenr,
-                                prev_alloc_size,
-                                false,
-                            );
-                            return Err(e);
-                        }
-                        // Capture data csums for the converted regular extent on a
-                        // datasum inode (bd-pb0ey sibling), matching the other data
-                        // sites — else a datasum file whose inline extent is
-                        // converted by fallocate trips btrfs check "some csum
-                        // missing". Near-unreachable for FrankenFS-created files
-                        // (writes are always regular), but real-image inline
-                        // extents reach it.
-                        let is_datasum = self
-                            .btrfs_read_inode_from_tree(&alloc, canonical)
-                            .is_ok_and(|inode| inode.flags & BTRFS_INODE_NODATASUM == 0);
-                        if is_datasum
-                            && let Err(e) = self.btrfs_capture_data_extent_csums(
+                        )?;
+                        // Checksum the exact padded bytes for a datasum inode,
+                        // including the sector tail beyond the visible file.
+                        if inode.flags & BTRFS_INODE_NODATASUM == 0 {
+                            self.btrfs_capture_data_extent_csums(
                                 cx,
                                 &mut alloc,
                                 prev_allocation.bytenr,
                                 prev_alloc_size,
-                                None,
-                            )
-                        {
-                            let _ = alloc.fs_tree.delete(&inline_key);
-                            let _ = alloc.extent_alloc.free_extent(
-                                prev_allocation.bytenr,
-                                prev_alloc_size,
-                                false,
-                            );
-                            return Err(e);
+                                Some(&padded),
+                            )?;
                         }
+                        // Publish only after the replacement bytes, allocation
+                        // reference and checksums are ready. The checkpoint
+                        // also restores this item if later preallocation fails.
+                        alloc
+                            .fs_tree
+                            .update(&inline_key, &prev_extent.to_bytes())
+                            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
                     }
                 }
-            }
 
-            let ext_start = BtrfsKey {
-                objectid: canonical,
-                item_type: BTRFS_ITEM_EXTENT_DATA,
-                offset: 0,
-            };
-            let ext_end = BtrfsKey {
-                objectid: canonical,
-                item_type: BTRFS_ITEM_EXTENT_DATA,
-                offset: u64::MAX,
-            };
-            let extents = alloc
-                .fs_tree
-                .range(&ext_start, &ext_end)
-                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-            let sectorsize = u64::from(alloc.sectorsize);
-            let mut cursor = offset;
-            let mut prealloc_gaps = Vec::new();
+                let ext_start = BtrfsKey {
+                    objectid: canonical,
+                    item_type: BTRFS_ITEM_EXTENT_DATA,
+                    offset: 0,
+                };
+                let ext_end = BtrfsKey {
+                    objectid: canonical,
+                    item_type: BTRFS_ITEM_EXTENT_DATA,
+                    offset: u64::MAX,
+                };
+                let extents = alloc
+                    .fs_tree
+                    .range(&ext_start, &ext_end)
+                    .map_err(|e| btrfs_mutation_to_ffs(&e))?;
+                let sectorsize = u64::from(alloc.sectorsize);
+                let mut cursor = offset;
+                let mut prealloc_gaps = Vec::new();
 
-            for (key, extent_bytes) in extents {
-                if key.offset >= new_end {
-                    break;
+                for (key, extent_bytes) in extents {
+                    if key.offset >= new_end {
+                        break;
+                    }
+
+                    let extent =
+                        parse_extent_data(&extent_bytes).map_err(|e| parse_to_ffs_error(&e))?;
+                    let logical_len = Self::btrfs_extent_logical_len(&extent)?;
+                    let logical_end = key.offset.checked_add(logical_len).ok_or_else(|| {
+                        FfsError::InvalidGeometry("extent logical end overflow".into())
+                    })?;
+                    if logical_end <= cursor {
+                        continue;
+                    }
+
+                    if key.offset > cursor {
+                        let gap_start = Self::btrfs_align_up(cursor, sectorsize)?;
+                        let gap_end = Self::btrfs_align_down(key.offset.min(new_end), sectorsize);
+                        if gap_start < gap_end {
+                            prealloc_gaps.push((gap_start, gap_end - gap_start));
+                        }
+                    }
+
+                    cursor = cursor.max(logical_end.min(new_end));
+                    if cursor >= new_end {
+                        break;
+                    }
                 }
 
-                let extent =
-                    parse_extent_data(&extent_bytes).map_err(|e| parse_to_ffs_error(&e))?;
-                let logical_len = Self::btrfs_extent_logical_len(&extent)?;
-                let logical_end = key.offset.checked_add(logical_len).ok_or_else(|| {
-                    FfsError::InvalidGeometry("extent logical end overflow".into())
-                })?;
-                if logical_end <= cursor {
-                    continue;
-                }
-
-                if key.offset > cursor {
+                if cursor < new_end {
                     let gap_start = Self::btrfs_align_up(cursor, sectorsize)?;
-                    let gap_end = Self::btrfs_align_down(key.offset.min(new_end), sectorsize);
+                    let gap_end = Self::btrfs_align_down(new_end, sectorsize);
                     if gap_start < gap_end {
                         prealloc_gaps.push((gap_start, gap_end - gap_start));
                     }
                 }
 
-                cursor = cursor.max(logical_end.min(new_end));
-                if cursor >= new_end {
-                    break;
+                for (gap_offset, gap_len) in prealloc_gaps {
+                    self.btrfs_insert_prealloc_extent_segment(
+                        &mut alloc, canonical, gap_offset, gap_len,
+                    )?;
                 }
             }
 
-            if cursor < new_end {
-                let gap_start = Self::btrfs_align_up(cursor, sectorsize)?;
-                let gap_end = Self::btrfs_align_down(new_end, sectorsize);
-                if gap_start < gap_end {
-                    prealloc_gaps.push((gap_start, gap_end - gap_start));
-                }
+            let size_before = inode.size;
+            if !keep_size && !collapse_range && !insert_range && new_end > inode.size {
+                inode.size = new_end;
             }
+            self.btrfs_fill_implicit_holes(
+                &mut alloc,
+                canonical,
+                offset.min(size_before),
+                new_end,
+                inode.size,
+            )?;
+            inode.nbytes = match window {
+                Some((lo, before)) => {
+                    let after = Self::btrfs_window_nbytes(&alloc, canonical, lo, new_end)?;
+                    // A stale nbytes on entry would underflow: re-walk instead.
+                    match inode
+                        .nbytes
+                        .checked_add(after)
+                        .and_then(|sum| sum.checked_sub(before))
+                    {
+                        Some(nbytes) => nbytes,
+                        None => Self::btrfs_recompute_inode_nbytes(&alloc, canonical)?,
+                    }
+                }
+                None => Self::btrfs_recompute_inode_nbytes(&alloc, canonical)?,
+            };
+            // fallocate(2): a successful allocation marks the file modified, so the
+            // kernel (via file_modified) bumps both mtime and ctime — for every mode
+            // (default prealloc, KEEP_SIZE, PUNCH_HOLE, ZERO_RANGE, COLLAPSE/INSERT).
+            // ext4_fallocate already touches both (lib.rs:15598); btrfs must match or
+            // mtime/ctime-based tooling (make, tar, rsync, backup) misses the change.
+            let (ts_secs, ts_nanos) = Self::btrfs_now_timestamp();
+            inode.mtime_sec = ts_secs;
+            inode.mtime_nsec = ts_nanos;
+            inode.ctime_sec = ts_secs;
+            inode.ctime_nsec = ts_nanos;
+            let inode_key = BtrfsKey {
+                objectid: canonical,
+                item_type: BTRFS_ITEM_INODE_ITEM,
+                offset: 0,
+            };
+            alloc
+                .fs_tree
+                .update(&inode_key, &inode.to_bytes())
+                .map_err(|e| btrfs_mutation_to_ffs(&e))?;
 
-            for (gap_offset, gap_len) in prealloc_gaps {
-                self.btrfs_insert_prealloc_extent_segment(
-                    &mut alloc, canonical, gap_offset, gap_len,
-                )?;
+            info!(
+                target: "ffs::btrfs::rw",
+                operation_id = %operation_id,
+                scenario_id,
+                outcome = "applied",
+                ino = canonical,
+                offset,
+                length,
+                keep_size,
+                punch_hole,
+                collapse_range,
+                zero_range,
+                insert_range,
+                "btrfs_fallocate_applied"
+            );
+            Ok(())
+        })();
+        if let Some((fs_tree, snapshot)) = checkpoint {
+            if result.is_err() {
+                alloc.fs_tree.rollback_to(fs_tree);
+                snapshot.restore(&mut alloc, self);
+            } else {
+                alloc.fs_tree.release_checkpoint();
+                snapshot.release(&mut alloc);
             }
         }
-
-        let size_before = inode.size;
-        if !keep_size && !collapse_range && !insert_range && new_end > inode.size {
-            inode.size = new_end;
-        }
-        self.btrfs_fill_implicit_holes(
-            &mut alloc,
-            canonical,
-            offset.min(size_before),
-            new_end,
-            inode.size,
-        )?;
-        inode.nbytes = match window {
-            Some((lo, before)) => {
-                let after = Self::btrfs_window_nbytes(&alloc, canonical, lo, new_end)?;
-                // A stale nbytes on entry would underflow: re-walk instead.
-                match inode
-                    .nbytes
-                    .checked_add(after)
-                    .and_then(|sum| sum.checked_sub(before))
-                {
-                    Some(nbytes) => nbytes,
-                    None => Self::btrfs_recompute_inode_nbytes(&alloc, canonical)?,
-                }
-            }
-            None => Self::btrfs_recompute_inode_nbytes(&alloc, canonical)?,
-        };
-        // fallocate(2): a successful allocation marks the file modified, so the
-        // kernel (via file_modified) bumps both mtime and ctime — for every mode
-        // (default prealloc, KEEP_SIZE, PUNCH_HOLE, ZERO_RANGE, COLLAPSE/INSERT).
-        // ext4_fallocate already touches both (lib.rs:15598); btrfs must match or
-        // mtime/ctime-based tooling (make, tar, rsync, backup) misses the change.
-        let (ts_secs, ts_nanos) = Self::btrfs_now_timestamp();
-        inode.mtime_sec = ts_secs;
-        inode.mtime_nsec = ts_nanos;
-        inode.ctime_sec = ts_secs;
-        inode.ctime_nsec = ts_nanos;
-        let inode_key = BtrfsKey {
-            objectid: canonical,
-            item_type: BTRFS_ITEM_INODE_ITEM,
-            offset: 0,
-        };
-        alloc
-            .fs_tree
-            .update(&inode_key, &inode.to_bytes())
-            .map_err(|e| btrfs_mutation_to_ffs(&e))?;
-
-        info!(
-            target: "ffs::btrfs::rw",
-            operation_id = %operation_id,
-            scenario_id,
-            outcome = "applied",
-            ino = canonical,
-            offset,
-            length,
-            keep_size,
-            punch_hole,
-            collapse_range,
-            zero_range,
-            insert_range,
-            "btrfs_fallocate_applied"
-        );
         drop(alloc);
-
-        Ok(())
+        result
     }
 
     /// List extended attribute names for a btrfs inode.
@@ -45554,6 +45648,7 @@ impl OpenFs {
         &self,
         f: impl FnOnce(&mut RequestScope) -> ffs_error::Result<T>,
     ) -> ffs_error::Result<T> {
+        let _view = self.btrfs_semantic_view_guard()?;
         let snapshot = self.latest_snapshot();
         let mut scope = RequestScope::with_snapshot(snapshot);
         f(&mut scope)
@@ -45767,6 +45862,21 @@ impl OpenFs {
     pub(crate) fn mutation_gate_guard(&self) -> MutationGateGuard<'_> {
         self.enter_mutation_gate();
         MutationGateGuard(self)
+    }
+
+    /// Close only an already quiescent gate, without waiting on a request
+    /// that might need a lock held by this boundary.
+    fn try_close_mutation_gate(&self) -> Option<BoundaryGateGuard<'_>> {
+        if MUTATION_GATE_DEPTH.get() > 0 {
+            return None;
+        }
+        let mut state = self.mutation_gate.lock();
+        if state.in_flight != 0 {
+            return None;
+        }
+        state.closing += 1;
+        drop(state);
+        Some(BoundaryGateGuard(self))
     }
 
     /// Close the gate and wait until no mutation is in flight (bd-9rutw).
@@ -46023,6 +46133,7 @@ impl OpenFs {
     /// kernel-comparable result must call it after its mutations. Read-only
     /// mounts return `ReadOnly`.
     pub fn sync_all_to_device(&self, cx: &Cx) -> ffs_error::Result<()> {
+        let _view = self.btrfs_semantic_view_guard()?;
         if !self.is_writable() {
             return Err(FfsError::ReadOnly);
         }
@@ -46236,6 +46347,7 @@ impl OpenFs {
         cx: &Cx,
         inode: u64,
     ) -> ffs_error::Result<Vec<(u8, u64, Vec<u8>)>> {
+        let _view = self.btrfs_semantic_view_guard()?;
         if !matches!(&self.flavor, FsFlavor::Btrfs(_)) {
             return Err(FfsError::Format(
                 "walk_btrfs_dir_entry_items is only available for btrfs images".into(),
@@ -62415,6 +62527,610 @@ mod tests {
     }
 
     #[test]
+    fn btrfs_raw_mvcc_flush_must_not_serve_stale_inline_bytes() {
+        check_btrfs_raw_mvcc_read_coherence(false);
+    }
+
+    #[test]
+    fn btrfs_raw_mvcc_flush_must_not_hide_foreign_metadata() {
+        check_btrfs_raw_mvcc_read_coherence(true);
+    }
+
+    #[test]
+    fn btrfs_raw_mvcc_publication_invalidates_semantics_before_flush() {
+        for publisher in ["fcw", "ssi", "scope", "repair"] {
+            for reject_notification in [false, true] {
+                let mut image = build_btrfs_inline_image(b"before");
+                add_btrfs_test_empty_extent_tree(&mut image);
+                let dev = TestDevice::from_vec(image.clone());
+                let cx = Cx::for_testing();
+                let mut fs =
+                    OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default())
+                        .unwrap();
+                assert_eq!(fs.read(&cx, InodeNumber(257), 0, 6).unwrap(), b"before");
+                fs.getattr(&cx, InodeNumber(257)).unwrap();
+                fs.readdir(&cx, InodeNumber(1), 0).unwrap();
+                fs.prewarm_btrfs_read_plan_index(&cx).unwrap();
+                fs.attach_repair_flush_lifecycle(Arc::new(RecordingRepairLifecycle {
+                    reject_notifications: reject_notification,
+                    ..RecordingRepairLifecycle::default()
+                }));
+                let logical = BTRFS_TEST_FS_TREE_LOGICAL;
+                let block_size = fs.block_size() as usize;
+                let block = BlockNumber((logical / block_size) as u64);
+                let before = image[logical..logical + block_size].to_vec();
+                write_btrfs_test_extent_payload(&mut image, &encode_btrfs_extent_inline(b"after!"));
+                let after = image[logical..logical + block_size].to_vec();
+                let mut txn = fs.begin_transaction();
+                txn.stage_write(block, after.clone());
+                let result = match publisher {
+                    "fcw" => fs
+                        .commit_transaction(&cx, txn)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string()),
+                    "ssi" => fs
+                        .commit_transaction_ssi(&cx, txn)
+                        .map(|_| ())
+                        .map_err(|e| e.to_string()),
+                    "scope" => fs
+                        .commit_request_scope(&cx, &mut RequestScope::with_transaction(txn))
+                        .map(|_| ())
+                        .map_err(|e| e.to_string()),
+                    "repair" => fs
+                        .repair_writeback_blocks_via_mounted_mutation_path(
+                            &cx,
+                            &[RepairWritebackBlock {
+                                block,
+                                expected_current: &before,
+                                data: &after,
+                            }],
+                        )
+                        .map(|_| ())
+                        .map_err(|e| e.to_string()),
+                    _ => unreachable!(),
+                };
+                assert_eq!(
+                    result.is_err(),
+                    reject_notification,
+                    "{publisher}: {result:?}"
+                );
+                if let Err(error) = result {
+                    assert!(error.contains("committed"), "{publisher}: {error}");
+                }
+                assert_eq!(
+                    fs.mvcc_read_visible(block, fs.current_snapshot()).unwrap(),
+                    after
+                );
+                let mut scope = RequestScope::empty();
+                let errors = [
+                    fs.read(&cx, InodeNumber(257), 0, 6).unwrap_err(),
+                    fs.read_into(&cx, InodeNumber(257), 0, &mut [0_u8; 6])
+                        .unwrap_err(),
+                    <OpenFs as FsOps>::read(&fs, &cx, &mut scope, InodeNumber(257), 0, 6)
+                        .unwrap_err(),
+                    fs.getattr(&cx, InodeNumber(257)).unwrap_err(),
+                    fs.read_inode_attr(&cx, InodeNumber(257)).unwrap_err(),
+                    fs.read_inode_attr_with_scope(&cx, &scope, InodeNumber(257))
+                        .unwrap_err(),
+                    fs.lookup(&cx, InodeNumber(1), OsStr::new("hello.txt"))
+                        .unwrap_err(),
+                    fs.readdir(&cx, InodeNumber(1), 0).unwrap_err(),
+                    fs.statfs(&cx, InodeNumber(1)).unwrap_err(),
+                    fs.getxattr(&cx, InodeNumber(257), "user.missing")
+                        .unwrap_err(),
+                    fs.prewarm_btrfs_read_plan_index(&cx).unwrap_err(),
+                    fs.enable_writes(&cx).unwrap_err(),
+                ];
+                for error in errors {
+                    assert_eq!(error.to_errno(), libc::ESTALE, "{publisher}: {error}");
+                }
+                assert!(fs.btrfs_alloc_state.is_none());
+                fs.flush_mvcc_to_device(&cx).unwrap();
+                assert_eq!(dev.snapshot_bytes(), image);
+                assert_eq!(fs.flush_mvcc_to_device(&cx).unwrap(), 0);
+                let reopened = OpenFs::from_device(
+                    &cx,
+                    Box::new(TestDevice::from_vec(dev.snapshot_bytes())),
+                    &OpenOptions::default(),
+                )
+                .unwrap();
+                assert_eq!(
+                    reopened.read(&cx, InodeNumber(257), 0, 6).unwrap(),
+                    b"after!"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn btrfs_raw_mvcc_empty_commits_keep_the_semantic_view_usable() {
+        let image = build_btrfs_inline_image(b"before");
+        let dev = TestDevice::from_vec(image.clone());
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+        assert_eq!(fs.read(&cx, InodeNumber(257), 0, 6).unwrap(), b"before");
+        fs.commit_transaction(&cx, fs.begin_transaction()).unwrap();
+        fs.commit_transaction_ssi(&cx, fs.begin_transaction())
+            .unwrap();
+        fs.commit_request_scope(
+            &cx,
+            &mut RequestScope::with_transaction(fs.begin_transaction()),
+        )
+        .unwrap();
+        assert_eq!(fs.flush_mvcc_to_device(&cx).unwrap(), 0);
+        assert_eq!(fs.read(&cx, InodeNumber(257), 0, 6).unwrap(), b"before");
+        assert_eq!(dev.snapshot_bytes(), image);
+    }
+
+    #[test]
+    fn btrfs_raw_mvcc_rejected_conflicts_keep_the_semantic_view_usable() {
+        for use_ssi in [false, true] {
+            let image = build_btrfs_inline_image(b"before");
+            let cx = Cx::for_testing();
+            let dev = TestDevice::from_vec(image.clone());
+            let fs =
+                OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+            assert_eq!(fs.read(&cx, InodeNumber(257), 0, 6).unwrap(), b"before");
+            let mut rejected = fs.begin_transaction();
+            rejected.stage_write(BlockNumber(0), vec![0xA5; 4096]);
+            let mut winner = fs.mvcc_store.begin();
+            // Internal publication of identical bytes creates a conflict
+            // without changing the backing or invalidating semantic state.
+            winner.stage_write(BlockNumber(0), image[..4096].to_vec());
+            fs.mvcc_store.commit(winner).unwrap();
+            let result = if use_ssi {
+                fs.commit_transaction_ssi(&cx, rejected)
+            } else {
+                fs.commit_transaction(&cx, rejected)
+            };
+            assert!(result.is_err(), "conflicting raw writes must not publish");
+            assert_eq!(fs.mvcc_version_count(), 1);
+            assert_eq!(fs.read(&cx, InodeNumber(257), 0, 6).unwrap(), b"before");
+            assert_eq!(fs.flush_mvcc_to_device(&cx).unwrap(), 1);
+            assert_eq!(dev.snapshot_bytes(), image);
+            assert_eq!(fs.read(&cx, InodeNumber(257), 0, 6).unwrap(), b"before");
+        }
+    }
+
+    #[test]
+    fn btrfs_raw_mvcc_stale_writer_cannot_reuse_its_allocator() {
+        // Unlike the inline read fixture's SYSTEM-only chunk, this writable
+        // fixture has DATA space and an admitted allocator that could mutate.
+        let (fs, cx, dev) = open_writable_btrfs_with_device();
+        let image = dev.snapshot_bytes();
+        assert_eq!(
+            fs.read(&cx, InodeNumber(257), 0, 64).unwrap(),
+            b"hello from btrfs fsops"
+        );
+        let root = InodeNumber(1);
+        let before_alloc = fs.largest_contiguous_free_run(&cx).unwrap();
+        assert!(before_alloc > 0);
+        let mut txn = fs.begin_transaction();
+        txn.stage_write(BlockNumber(0), image[..4096].to_vec());
+        fs.commit_transaction(&cx, txn).unwrap();
+        let errors = [
+            fs.create_subvolume(&cx, root, b"stale-subvolume", 0, 0)
+                .unwrap_err(),
+            fs.create_snapshot(&cx, root, b"stale-snapshot")
+                .unwrap_err(),
+            fs.mkdir(&cx, root, OsStr::new("stale-dir"), 0o755, 0, 0)
+                .unwrap_err(),
+            fs.write(&cx, InodeNumber(257), 0, b"wrong!").unwrap_err(),
+            fs.largest_contiguous_free_run(&cx).unwrap_err(),
+            fs.btrfs_extent_allocation_count().unwrap_err(),
+            fs.fsync(&cx, root, 0, false).unwrap_err(),
+        ];
+        for error in errors {
+            assert_eq!(error.to_errno(), libc::ESTALE, "{error}");
+        }
+        assert_eq!(dev.snapshot_bytes(), image);
+        assert_eq!(fs.flush_mvcc_to_device(&cx).unwrap(), 1);
+        assert_eq!(dev.snapshot_bytes(), image);
+        let reopened = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        assert_eq!(
+            reopened.read(&cx, InodeNumber(257), 0, 64).unwrap(),
+            b"hello from btrfs fsops"
+        );
+    }
+
+    #[test]
+    fn btrfs_raw_mvcc_invalidates_retained_nested_views() {
+        let mut image = build_btrfs_inline_image(b"before");
+        let cx = Cx::for_testing();
+        let dev = TestDevice::from_vec(image.clone());
+        let fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+        // Open the fixture's fs tree through the real nested-view constructor,
+        // retaining its independently populated caches across raw publication.
+        let (slot, _) = fs
+            .btrfs_nested_slot_for(&cx, BTRFS_FS_TREE_OBJECTID, InodeNumber(1))
+            .unwrap();
+        let tagged = OpenFs::btrfs_nested_tag(slot, InodeNumber(257));
+        let (_, nested, inner) = fs.btrfs_nested_route(tagged).unwrap().unwrap();
+        assert_eq!(fs.read(&cx, tagged, 0, 6).unwrap(), b"before");
+        assert_eq!(OpenFs::read(&nested, &cx, inner, 0, 6).unwrap(), b"before");
+        let logical = BTRFS_TEST_FS_TREE_LOGICAL;
+        let block_size = fs.block_size() as usize;
+        write_btrfs_test_extent_payload(&mut image, &encode_btrfs_extent_inline(b"after!"));
+        let mut txn = fs.begin_transaction();
+        txn.stage_write(
+            BlockNumber((logical / block_size) as u64),
+            image[logical..logical + block_size].to_vec(),
+        );
+        fs.commit_transaction(&cx, txn).unwrap();
+        assert_eq!(
+            fs.read(&cx, tagged, 0, 6).unwrap_err().to_errno(),
+            libc::ESTALE
+        );
+        assert_eq!(
+            OpenFs::read(&nested, &cx, inner, 0, 6)
+                .unwrap_err()
+                .to_errno(),
+            libc::ESTALE
+        );
+        fs.flush_mvcc_to_device(&cx).unwrap();
+        assert_eq!(
+            OpenFs::read(&nested, &cx, inner, 0, 6)
+                .unwrap_err()
+                .to_errno(),
+            libc::ESTALE
+        );
+        let reopened = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        assert_eq!(
+            reopened.read(&cx, InodeNumber(257), 0, 6).unwrap(),
+            b"after!"
+        );
+    }
+
+    #[test]
+    fn btrfs_raw_mvcc_recovery_requires_reopening_semantic_state() {
+        let _flocks = wal_flock_holder();
+        let mut image = build_btrfs_inline_image(b"before");
+        add_btrfs_test_empty_extent_tree(&mut image);
+        let dev = TestDevice::from_vec(image.clone());
+        let logical = BTRFS_TEST_FS_TREE_LOGICAL;
+        write_btrfs_test_extent_payload(&mut image, &encode_btrfs_extent_inline(b"after!"));
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let mut wal = ffs_mvcc::wal::encode_header(&ffs_mvcc::wal::WalHeader::default()).to_vec();
+        wal.extend_from_slice(
+            &ffs_mvcc::wal::encode_commit(&WalCommit {
+                commit_seq: CommitSeq(1),
+                txn_id: ffs_types::TxnId(1),
+                writes: vec![WalWrite {
+                    block: BlockNumber((logical / 4096) as u64),
+                    data: image[logical..logical + 4096].to_vec(),
+                }],
+            })
+            .unwrap(),
+        );
+        std::fs::write(tmp.path(), wal).unwrap();
+        let cx = Cx::for_testing();
+        let mut fs = OpenFs::from_device(
+            &cx,
+            Box::new(dev.clone()),
+            &OpenOptions {
+                mvcc_wal_path: Some(tmp.path().to_path_buf()),
+                ..OpenOptions::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(fs.mvcc_wal_recovery().unwrap().versions_replayed, 1);
+        assert_eq!(
+            fs.read(&cx, InodeNumber(257), 0, 6).unwrap_err().to_errno(),
+            libc::ESTALE
+        );
+        assert_eq!(fs.enable_writes(&cx).unwrap_err().to_errno(), libc::ESTALE);
+        assert!(fs.btrfs_alloc_state.is_none());
+        assert_eq!(fs.flush_mvcc_to_device(&cx).unwrap(), 1);
+        assert_eq!(dev.snapshot_bytes(), image);
+        let reopened = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        assert_eq!(
+            reopened.read(&cx, InodeNumber(257), 0, 6).unwrap(),
+            b"after!"
+        );
+    }
+
+    #[test]
+    fn btrfs_raw_mvcc_failed_flush_remains_stale_and_retryable() {
+        let mut image = build_btrfs_inline_image(b"before");
+        let dev = CrashDevice::from_vec(image.clone());
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+        assert_eq!(fs.read(&cx, InodeNumber(257), 0, 6).unwrap(), b"before");
+        let durable_before = dev.durable_bytes();
+        let logical = BTRFS_TEST_FS_TREE_LOGICAL;
+        let block_size = fs.block_size() as usize;
+        write_btrfs_test_extent_payload(&mut image, &encode_btrfs_extent_inline(b"after!"));
+        let mut txn = fs.begin_transaction();
+        txn.stage_write(
+            BlockNumber((logical / block_size) as u64),
+            image[logical..logical + block_size].to_vec(),
+        );
+        fs.commit_transaction(&cx, txn).unwrap();
+        dev.arm_sync_failure(dev.sync_count() + 1);
+        assert!(fs.flush_mvcc_to_device(&cx).is_err());
+        assert_eq!(dev.durable_bytes(), durable_before);
+        assert_eq!(
+            *dev.volatile.lock(),
+            image,
+            "failure occurs after backing writes"
+        );
+        assert_eq!(
+            fs.read(&cx, InodeNumber(257), 0, 6).unwrap_err().to_errno(),
+            libc::ESTALE
+        );
+        dev.disarm();
+        assert_eq!(fs.flush_mvcc_to_device(&cx).unwrap(), 1);
+        assert_eq!(dev.durable_bytes(), image);
+        assert_eq!(
+            fs.read(&cx, InodeNumber(257), 0, 6).unwrap_err().to_errno(),
+            libc::ESTALE
+        );
+        let reopened = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        assert_eq!(
+            reopened.read(&cx, InodeNumber(257), 0, 6).unwrap(),
+            b"after!"
+        );
+    }
+
+    #[test]
+    fn btrfs_raw_mvcc_publication_waits_for_an_active_semantic_read() {
+        #[derive(Debug)]
+        struct PausedRead {
+            inner: TestDevice,
+            entered: std::sync::mpsc::SyncSender<()>,
+            resume: parking_lot::Mutex<std::sync::mpsc::Receiver<()>>,
+            armed: std::sync::atomic::AtomicBool,
+        }
+        impl ByteDevice for PausedRead {
+            fn len_bytes(&self) -> u64 {
+                self.inner.len_bytes()
+            }
+            fn read_exact_at(
+                &self,
+                cx: &Cx,
+                offset: ByteOffset,
+                buf: &mut [u8],
+            ) -> ffs_error::Result<()> {
+                if offset.0 == BTRFS_TEST_FS_TREE_LOGICAL as u64
+                    && self.armed.swap(false, Ordering::AcqRel)
+                {
+                    self.entered.send(()).unwrap();
+                    self.resume
+                        .lock()
+                        .recv_timeout(std::time::Duration::from_secs(10))
+                        .unwrap();
+                }
+                self.inner.read_exact_at(cx, offset, buf)
+            }
+            fn write_all_at(
+                &self,
+                cx: &Cx,
+                offset: ByteOffset,
+                buf: &[u8],
+            ) -> ffs_error::Result<()> {
+                self.inner.write_all_at(cx, offset, buf)
+            }
+            fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+                self.inner.sync(cx)
+            }
+        }
+        let mut image = build_btrfs_inline_image(b"before");
+        let (entered_tx, entered_rx) = std::sync::mpsc::sync_channel(1);
+        let (resume_tx, resume_rx) = std::sync::mpsc::sync_channel(1);
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(PausedRead {
+                inner: TestDevice::from_vec(image.clone()),
+                entered: entered_tx,
+                resume: parking_lot::Mutex::new(resume_rx),
+                armed: std::sync::atomic::AtomicBool::new(true),
+            }),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        write_btrfs_test_extent_payload(&mut image, &encode_btrfs_extent_inline(b"after!"));
+        let logical = BTRFS_TEST_FS_TREE_LOGICAL;
+        let mut txn = fs.begin_transaction();
+        txn.stage_write(
+            BlockNumber((logical / 4096) as u64),
+            image[logical..logical + 4096].to_vec(),
+        );
+        std::thread::scope(|threads| {
+            let reader = threads.spawn(|| fs.read(&Cx::for_testing(), InodeNumber(257), 0, 6));
+            entered_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            let (started_tx, started_rx) = std::sync::mpsc::sync_channel(1);
+            let (published_tx, published_rx) = std::sync::mpsc::sync_channel(1);
+            let fs_ref = &fs;
+            let writer = threads.spawn(move || {
+                started_tx.send(()).unwrap();
+                let result = fs_ref.commit_transaction(&Cx::for_testing(), txn);
+                published_tx.send(()).unwrap();
+                result
+            });
+            started_rx
+                .recv_timeout(std::time::Duration::from_secs(10))
+                .unwrap();
+            let premature = published_rx.recv_timeout(std::time::Duration::from_millis(50));
+            // Always release the paused I/O before asserting, so a regression
+            // does not strand the scoped threads during panic unwinding.
+            resume_tx.send(()).unwrap();
+            assert_eq!(reader.join().unwrap().unwrap(), b"before");
+            writer.join().unwrap().unwrap();
+            assert!(matches!(
+                premature,
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+        });
+        assert_eq!(
+            fs.read(&cx, InodeNumber(257), 0, 6).unwrap_err().to_errno(),
+            libc::ESTALE
+        );
+        fs.flush_mvcc_to_device(&cx).unwrap();
+    }
+
+    #[test]
+    fn btrfs_raw_mvcc_registered_scope_does_not_deadlock_boundary_eviction() {
+        let image = build_btrfs_inline_image(b"before");
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(image.clone())),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        // Seed a durable internal version so the probe also checks that a
+        // skipped eviction retains chains, then reclaims them when quiescent.
+        let mut internal = fs.mvcc_store.begin();
+        internal.stage_write(BlockNumber(0), image[..4096].to_vec());
+        let durable = fs.mvcc_store.commit(internal).unwrap();
+        *fs.mvcc_flushed_through.lock() = durable;
+        fs.set_mvcc_resident_block_cap(0);
+        let mut scope = fs.begin_request_scope(&cx, RequestOp::Write).unwrap();
+        scope
+            .tx
+            .as_mut()
+            .unwrap()
+            .stage_write(BlockNumber(1), image[4096..8192].to_vec());
+        assert_eq!(fs.mvcc_active_snapshot_count(), 1);
+        std::thread::scope(|threads| {
+            let (done_tx, done_rx) = std::sync::mpsc::sync_channel(1);
+            let fs_ref = &fs;
+            let boundary = threads.spawn(move || {
+                let _view = fs_ref.btrfs_semantic_view_guard().unwrap();
+                fs_ref.evict_durable_mvcc_chains_quiesced();
+                done_tx.send(()).unwrap();
+            });
+            let completed = done_rx.recv_timeout(std::time::Duration::from_secs(2));
+            let result = completed.as_ref().ok().map(|()| {
+                assert_eq!(fs.mvcc_tracked_block_count(), 1);
+                fs.commit_request_scope(&cx, &mut scope)
+            });
+            // On a regression, release the request before joining the blocked
+            // boundary, so the test reports a failure instead of hanging.
+            fs.end_request_scope(&cx, RequestOp::Write, scope).unwrap();
+            boundary.join().unwrap();
+            completed.expect("optional eviction must not wait for an active request");
+            result.unwrap().unwrap();
+        });
+        assert_eq!(fs.mvcc_active_snapshot_count(), 0);
+        assert_eq!(fs.mutation_gate.lock().in_flight, 0);
+        assert_eq!(fs.mutation_gate.lock().closing, 0);
+        assert_eq!(fs.mvcc_tracked_block_count(), 2);
+        fs.evict_durable_mvcc_chains_quiesced();
+        assert_eq!(fs.mvcc_tracked_block_count(), 1);
+        assert_eq!(
+            fs.read(&cx, InodeNumber(257), 0, 6).unwrap_err().to_errno(),
+            libc::ESTALE
+        );
+    }
+
+    #[test]
+    fn btrfs_raw_mvcc_journal_failure_invalidates_after_io_only() {
+        let image = build_btrfs_inline_image(b"before");
+        let dev = CrashDevice::from_vec(image.clone());
+        let cx = Cx::for_testing();
+        let mut fs =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+        let mut txn = fs.begin_transaction();
+        txn.stage_write(BlockNumber(8), image[8 * 4096..9 * 4096].to_vec());
+        assert!(
+            fs.commit_transaction_journaled(&cx, txn).is_err(),
+            "no writer attached"
+        );
+        assert_eq!(fs.read(&cx, InodeNumber(257), 0, 6).unwrap(), b"before");
+        fs.attach_jbd2_writer(Jbd2Writer::new(
+            ffs_journal::JournalRegion {
+                start: BlockNumber(64),
+                blocks: 8,
+            },
+            1,
+        ));
+        dev.arm_sync_failure(dev.sync_count() + 1);
+        let mut txn = fs.begin_transaction();
+        txn.stage_write(BlockNumber(8), image[8 * 4096..9 * 4096].to_vec());
+        assert!(fs.commit_transaction_journaled(&cx, txn).is_err());
+        assert_eq!(
+            fs.mvcc_version_count(),
+            0,
+            "failed journal I/O did not publish"
+        );
+        assert_ne!(
+            *dev.volatile.lock(),
+            image,
+            "journal I/O changed the backing"
+        );
+        assert_eq!(
+            dev.durable_bytes(),
+            image,
+            "injected sync failure retained the old durable image"
+        );
+        assert_eq!(
+            fs.read(&cx, InodeNumber(257), 0, 6).unwrap_err().to_errno(),
+            libc::ESTALE
+        );
+        assert_eq!(fs.flush_mvcc_to_device(&cx).unwrap(), 0);
+    }
+
+    fn check_btrfs_raw_mvcc_read_coherence(foreign_identity: bool) {
+        let mut image = build_btrfs_inline_image(b"before");
+        let dev = TestDevice::from_vec(image.clone());
+        let cx = Cx::for_testing();
+        let fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+        assert_eq!(fs.read(&cx, InodeNumber(257), 0, 6).unwrap(), b"before");
+        let logical = BTRFS_TEST_FS_TREE_LOGICAL;
+        write_btrfs_test_extent_payload(&mut image, &encode_btrfs_extent_inline(b"after!"));
+        if foreign_identity {
+            image[logical + 0x20..logical + 0x30].fill(0xA5);
+            stamp_btrfs_test_tree_block_crc32c(&mut image, logical);
+        }
+        let block_size = fs.block_size() as usize;
+        let nodesize = fs.btrfs_context().unwrap().nodesize as usize;
+        let mut txn = fs.begin_transaction();
+        for (index, block) in image[logical..logical + nodesize]
+            .chunks_exact(block_size)
+            .enumerate()
+        {
+            txn.stage_write(
+                BlockNumber((logical / block_size + index) as u64),
+                block.to_vec(),
+            );
+        }
+        fs.commit_transaction(&cx, txn).unwrap();
+        assert_eq!(fs.flush_mvcc_to_device(&cx).unwrap(), nodesize / block_size);
+        assert_eq!(dev.snapshot_bytes(), image);
+        let reopened = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(dev.snapshot_bytes())),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        let fresh = reopened.read(&cx, InodeNumber(257), 0, 6);
+        let retained = fs.read(&cx, InodeNumber(257), 0, 6);
+        if foreign_identity {
+            let error = fresh.unwrap_err();
+            assert!(error.to_string().contains("filesystem UUID"), "{error}");
+            assert!(
+                retained.is_err(),
+                "cached bytes hid foreign metadata: {retained:?}"
+            );
+        } else {
+            assert_eq!(fresh.unwrap(), b"after!");
+            match retained {
+                Ok(bytes) => assert_eq!(bytes, b"after!", "old views must not serve stale bytes"),
+                Err(error) => assert_eq!(error.to_errno(), libc::ESTALE, "{error}"),
+            }
+        }
+        assert_eq!(
+            dev.snapshot_bytes(),
+            image,
+            "reads must not modify the image"
+        );
+    }
+
+    #[test]
     fn btrfs_singleton_metadata_inspection_reads_after_public_mvcc_flush() {
         for foreign_identity in [false, true] {
             let mut image = build_btrfs_csum_image();
@@ -65611,7 +66327,7 @@ mod tests {
     /// the file read back whatever the mapped block held (bd-zx0fk).
     #[test]
     fn btrfs_fallocate_inline_conversion_keeps_the_data_bd_zx0fk() {
-        let Some((fs, _dev, _tmp, _image)) = open_writable_btrfs_mkfs(256) else {
+        let Some((fs, dev, _tmp, image)) = open_writable_btrfs_mkfs(256) else {
             return;
         };
         let cx = Cx::for_testing();
@@ -65672,6 +66388,106 @@ mod tests {
             data[..0xf5d],
             "the converted extent must hold the file's bytes"
         );
+        fs.btrfs_full_transaction_commit(&cx, "inline-fallocate-preservation")
+            .expect("commit converted data and preallocation");
+        std::fs::write(&image, dev.snapshot_bytes()).expect("write committed image");
+        let reopened = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default())
+            .expect("reopen converted file");
+        let file = reopened
+            .lookup(&cx, InodeNumber(1), OsStr::new("f"))
+            .unwrap();
+        assert_eq!(file.size, data.len() as u64, "KEEP_SIZE survives reopen");
+        assert_eq!(reopened.read(&cx, file.ino, 0, 4096).unwrap(), data);
+        reopened
+            .btrfs_verify_file_data_csums(&cx, file.ino)
+            .unwrap();
+        if let Some((clean, output)) = run_btrfs_check(&image) {
+            assert!(
+                clean,
+                "converted extent and accounting must be valid: {output}"
+            );
+        }
+    }
+
+    #[test]
+    fn btrfs_fallocate_inline_failure_preserves_data_and_allocation_bd_zx0fk() {
+        for exhaust_before_conversion in [false, true] {
+            let (fs, cx) = open_writable_btrfs();
+            let file = fs
+                .create(&cx, InodeNumber(1), OsStr::new("inline"), 0o644, 0, 0)
+                .unwrap();
+            // This synthetic image has 4 KiB nodes and a smaller inline
+            // capacity than the formatter-backed regression's 16 KiB nodes.
+            let data: Vec<u8> = (0..1021)
+                .map(|i| u8::try_from(i % 251 + 1).unwrap())
+                .collect();
+            fs.write(&cx, file.ino, 0, &data).unwrap();
+            let canonical = fs.btrfs_canonical_inode(file.ino).unwrap();
+            let alloc_mutex = fs.require_btrfs_alloc_state().unwrap();
+            if exhaust_before_conversion {
+                let mut alloc = alloc_mutex.write();
+                while alloc.extent_alloc.alloc_data(4096).is_ok() {}
+                assert_eq!(
+                    alloc.extent_alloc.allocatable_bytes(BTRFS_BLOCK_GROUP_DATA),
+                    0
+                );
+            }
+            let state = || {
+                let alloc = alloc_mutex.read();
+                let all = |tree: &InMemoryCowBtrfsTree| {
+                    tree.range(
+                        &BtrfsKey {
+                            objectid: 0,
+                            item_type: 0,
+                            offset: 0,
+                        },
+                        &BtrfsKey {
+                            objectid: u64::MAX,
+                            item_type: u8::MAX,
+                            offset: u64::MAX,
+                        },
+                    )
+                    .unwrap()
+                };
+                (
+                    all(&alloc.fs_tree),
+                    all(&alloc.csum_tree),
+                    alloc.extent_alloc.total_used(),
+                    alloc.extent_alloc.allocatable_bytes(BTRFS_BLOCK_GROUP_DATA),
+                    alloc.extent_alloc.pinned_bytes_in(BTRFS_BLOCK_GROUP_DATA),
+                )
+            };
+            assert!(matches!(
+                OpenFs::btrfs_extent_data_items(&alloc_mutex.read(), canonical).unwrap()[0].1,
+                BtrfsExtentData::Inline { .. }
+            ));
+            let before = state();
+            let versions_before = fs.mvcc_version_count();
+            // Use the inner operation to observe the failed attempt before its
+            // caller can commit/unpin/retry. The small synthetic device cannot
+            // satisfy this reservation, even after converting the inline data.
+            let error = fs
+                .btrfs_fallocate(&cx, file.ino, 4096, 1024 * 1024, libc::FALLOC_FL_KEEP_SIZE)
+                .unwrap_err();
+            assert_eq!(error.to_errno(), libc::ENOSPC);
+            assert_eq!(
+                state(),
+                before,
+                "failed conversion changed metadata/accounting"
+            );
+            assert_eq!(fs.read(&cx, file.ino, 0, 4096).unwrap(), data);
+            if exhaust_before_conversion {
+                assert_eq!(fs.mvcc_version_count(), versions_before);
+            } else {
+                assert!(
+                    fs.mvcc_version_count() > versions_before,
+                    "must reach data publication before the later preallocation fails"
+                );
+                fs.fallocate(&cx, file.ino, 4096, 4096, libc::FALLOC_FL_KEEP_SIZE)
+                    .expect("smaller retry uses restored allocation state");
+                assert_eq!(fs.read(&cx, file.ino, 0, 4096).unwrap(), data);
+            }
+        }
     }
 
     /// Replay an fsx op log (the `.fsxops` file xfstests keeps next to a
@@ -103689,6 +104505,11 @@ mod tests {
             )
             .expect("read materialized inline data");
         assert_eq!(preserved, original);
+        assert_eq!(
+            fs.getattr(&cx, attr.ino).unwrap().size,
+            u64::try_from(original.len()).unwrap(),
+            "KEEP_SIZE preserves the file length after inline conversion"
+        );
 
         let entries = alloc_mutex
             .read()
@@ -103696,14 +104517,20 @@ mod tests {
             .range(&extent_key, &extent_key)
             .expect("lookup converted extent");
         let converted = parse_extent_data(&entries[0].1).expect("parse converted extent");
+        // Linux v6.19 tree-checker.c requires sector-aligned regular extent
+        // lengths, including when the original inline payload was compressed.
         assert!(
             matches!(
                 converted,
                 BtrfsExtentData::Regular {
+                    ram_bytes: 4096,
+                    extent_type: BTRFS_FILE_EXTENT_REG,
                     compression: 0,
-                    num_bytes,
+                    disk_num_bytes: 4096,
+                    extent_offset: 0,
+                    num_bytes: 4096,
                     ..
-                } if num_bytes == u64::try_from(original.len()).unwrap()
+                }
             ),
             "fallocate should convert inline data to an uncompressed regular extent: {converted:?}"
         );
@@ -111479,7 +112306,13 @@ mod tests {
         let data_extent = &extents[0];
         assert_eq!(data_extent.logical, 0);
         assert!(data_extent.physical > 0);
-        assert_eq!(data_extent.length, payload.len() as u64);
+        // Linux v6.19 fiemap.c reports regular extent num_bytes, not i_size.
+        assert_eq!(data_extent.length, 4096);
+        assert_eq!(
+            fs.getattr(&cx, attr.ino).unwrap().size,
+            payload.len() as u64,
+            "KEEP_SIZE preserves the file length independently of extent length"
+        );
         assert_eq!(
             data_extent.flags & FIEMAP_EXTENT_UNWRITTEN,
             0,
@@ -113900,6 +114733,152 @@ mod tests {
         }
     }
 
+    #[test]
+    fn btrfs_fallocate_churn_commit_reclaims_pins() {
+        // The old property fixture has DATA only. It cannot publish a COW
+        // transaction and therefore cannot reclaim any freed, pinned extent.
+        let (tiny, cx) = open_writable_btrfs();
+        tiny.create(&cx, InodeNumber(1), OsStr::new("dirty"), 0o644, 0, 0)
+            .unwrap();
+        assert_eq!(
+            tiny.require_btrfs_alloc_state()
+                .unwrap()
+                .read()
+                .extent_alloc
+                .allocatable_bytes(BTRFS_BLOCK_GROUP_METADATA),
+            0
+        );
+        assert_eq!(
+            tiny.btrfs_full_transaction_commit(&cx, "data-only-fixture")
+                .unwrap_err()
+                .to_errno(),
+            libc::ENOSPC
+        );
+
+        let Some((fs, dev, _tmp, image)) = open_writable_btrfs_mkfs(256) else {
+            return;
+        };
+        let file = fs
+            .create(&cx, InodeNumber(1), OsStr::new("churn"), 0o644, 0, 0)
+            .unwrap();
+        // Exact minimized sequence from the DATA-only fixture failure. Keep
+        // all operations and the byte/size oracle; ENOSPC is not accepted.
+        let operations = [
+            (0, 48_003, 29_822, 1),
+            (3, 32_768, 4_019, 0),
+            (0, 50_687, 39_426, 0),
+            (3, 0, 1_901, 0),
+            (1, 81_587, 1, 0),
+            (4, 89_779, 5_240, 0),
+            (2, 53_248, 1, 0),
+            (0, 50_742, 39_371, 1),
+            (3, 110_593, 2_631, 11),
+            (0, 152_633, 28_435, 251),
+            (3, 173_469, 11_525, 92),
+        ];
+        let mut model = Vec::new();
+        for (step, (kind, a, b, value)) in operations.into_iter().enumerate() {
+            match kind {
+                0 => {
+                    let data = vec![value; b];
+                    assert_eq!(fs.write(&cx, file.ino, a as u64, &data).unwrap(), b as u32);
+                    if a + b > model.len() {
+                        model.resize(a + b, 0);
+                    }
+                    model[a..a + b].copy_from_slice(&data);
+                }
+                1 => {
+                    fs.setattr(
+                        &cx,
+                        file.ino,
+                        &SetAttrRequest {
+                            size: Some(a as u64),
+                            ..Default::default()
+                        },
+                    )
+                    .unwrap();
+                    model.resize(a, 0);
+                }
+                2 | 3 => {
+                    let offset = (a % model.len()) & !4095;
+                    let length = (4096 * (1 + b % 8)).min((model.len() - offset) & !4095);
+                    let mode = if kind == 2 {
+                        libc::FALLOC_FL_KEEP_SIZE | libc::FALLOC_FL_PUNCH_HOLE
+                    } else {
+                        libc::FALLOC_FL_ZERO_RANGE
+                    };
+                    fs.fallocate(&cx, file.ino, offset as u64, length as u64, mode)
+                        .unwrap();
+                    model[offset..offset + length].fill(0);
+                }
+                4 => {
+                    let offset = (a % (model.len() - 4096)) & !4095;
+                    let length = 4096 * (1 + b % 8);
+                    assert!(offset + length < model.len());
+                    fs.fallocate(
+                        &cx,
+                        file.ino,
+                        offset as u64,
+                        length as u64,
+                        libc::FALLOC_FL_COLLAPSE_RANGE,
+                    )
+                    .unwrap();
+                    model.drain(offset..offset + length);
+                }
+                _ => unreachable!("fixed regression uses only these operations"),
+            }
+            assert_eq!(fs.getattr(&cx, file.ino).unwrap().size, model.len() as u64);
+            assert_eq!(
+                fs.read(&cx, file.ino, 0, model.len() as u32).unwrap(),
+                model,
+                "content after step {step}"
+            );
+        }
+        let accounting = || {
+            let alloc = fs.require_btrfs_alloc_state().unwrap().read();
+            let capacity: u64 = alloc
+                .extent_alloc
+                .space_info()
+                .into_iter()
+                .filter(|(flags, _, _)| flags & BTRFS_BLOCK_GROUP_DATA != 0)
+                .map(|(_, total, _)| total)
+                .sum();
+            (
+                alloc.generation,
+                alloc.extent_alloc.allocatable_bytes(BTRFS_BLOCK_GROUP_DATA),
+                alloc.extent_alloc.pinned_bytes_in(BTRFS_BLOCK_GROUP_DATA),
+                capacity,
+            )
+        };
+        let (generation, free, pinned, capacity) = accounting();
+        assert!(pinned > 0, "churn must pin old data until publication");
+        fs.btrfs_full_transaction_commit(&cx, "fallocate-churn-reclaim")
+            .unwrap();
+        let (after_generation, after_free, after_pinned, after_capacity) = accounting();
+        assert!(after_generation > generation);
+        assert_eq!(after_pinned, 0);
+        // Commit may also grow the DATA chunk; account for that capacity
+        // independently instead of attributing all newly free bytes to pins.
+        assert!(after_capacity >= capacity);
+        assert_eq!(after_free, free + pinned + (after_capacity - capacity));
+        std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+        let reopened = OpenFs::from_device(&cx, Box::new(dev), &OpenOptions::default()).unwrap();
+        let file = reopened
+            .lookup(&cx, InodeNumber(1), OsStr::new("churn"))
+            .unwrap();
+        assert_eq!(file.size, model.len() as u64);
+        assert_eq!(
+            reopened.read(&cx, file.ino, 0, model.len() as u32).unwrap(),
+            model
+        );
+        reopened
+            .btrfs_verify_file_data_csums(&cx, file.ino)
+            .unwrap();
+        if let Some((clean, output)) = run_btrfs_check(&image) {
+            assert!(clean, "churn commit must remain valid: {output}");
+        }
+    }
+
     // Property-based metamorphic check of the btrfs FALLOCATE surface (punch /
     // zero / collapse / insert interleaved with write / truncate) against a
     // byte-exact in-memory model. btrfs had write/truncate + overwrite + dir
@@ -113918,7 +114897,53 @@ mod tests {
                 1..40,
             ),
         ) {
-            let (fs, cx) = open_writable_btrfs();
+            // Preserve the always-running byte-model test with enough space
+            // for all 39 operations, including pinned COW replacements. INSERT
+            // can grow the model beyond CAP: budget a 240,000-byte initial
+            // span plus 39 insertions of 32,768 bytes, rewritten 39 times, and
+            // reserve two sector boundaries per operation for alignment.
+            // The tiny DATA-only fixture cannot commit to reclaim its pins;
+            // this local fixture also provides METADATA allocation space.
+            // It remains synthetic; the separate mkfs churn test proves commit,
+            // reopen and btrfs-check behavior on a formatter-created image.
+            const IMAGE_BYTES: usize = 64 * 1024 * 1024;
+            const COW_BUDGET: u64 = 39 * (240_000 + 39 * 32_768);
+            const ALIGNMENT_RESERVE: u64 = 39 * 2 * 4096;
+            let mut image = build_btrfs_csum_image();
+            image.resize(IMAGE_BYTES, 0);
+            let capacity = u64::try_from(IMAGE_BYTES).unwrap().to_le_bytes();
+            let sb = BTRFS_SUPER_INFO_OFFSET;
+            image[sb + 0x70..sb + 0x78].copy_from_slice(&capacity);
+            let device_item = sb + 0xC9;
+            image[device_item + 8..device_item + 16].copy_from_slice(&capacity);
+            let chunk = sb + 0x32B + 17;
+            image[chunk..chunk + 8].copy_from_slice(&capacity);
+            // Republish matching committed DEV_ITEM/CHUNK_ITEM capacities and
+            // recompute both CHUNK_TREE and superblock checksums.
+            add_btrfs_dev_info_chunk_tree(&mut image);
+            let cx = Cx::for_testing();
+            let mut fs = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(image)),
+                &OpenOptions {
+                    btrfs_rw_ephemeral_ok: true,
+                    ..OpenOptions::default()
+                },
+            )
+            .unwrap();
+            fs.enable_writes(&cx).unwrap();
+            {
+                let alloc = fs.require_btrfs_alloc_state().unwrap().read();
+                assert!(
+                    alloc.extent_alloc.allocatable_bytes(BTRFS_BLOCK_GROUP_DATA)
+                        > COW_BUDGET + ALIGNMENT_RESERVE,
+                    "fixture must cover the full generated COW workload"
+                );
+                assert!(
+                    alloc.extent_alloc.allocatable_bytes(BTRFS_BLOCK_GROUP_METADATA) > 0,
+                    "fixture must have metadata capacity for transaction publication"
+                );
+            }
             let attr = fs
                 .create(&cx, InodeNumber(1), OsStr::new("falloc.bin"), 0o644, 0, 0)
                 .expect("create");

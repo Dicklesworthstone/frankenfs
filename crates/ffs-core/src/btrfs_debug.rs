@@ -17,6 +17,7 @@ impl OpenFs {
     /// exists so integration tests can prove that an ephemeral tree-log rotation
     /// returns superseded extents rather than merely hiding them from the log root.
     pub fn btrfs_extent_allocation_count(&self) -> Result<BtrfsExtentAllocationCount, FfsError> {
+        let _view = self.btrfs_semantic_view_guard()?;
         let alloc = self.require_btrfs_alloc_state()?;
         let alloc = alloc.read();
         let extent_items = alloc
