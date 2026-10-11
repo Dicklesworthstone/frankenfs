@@ -1,10 +1,10 @@
-# Experimental native ZFS block and DMU reading
+# Experimental native ZFS block, DMU and ZPL reading
 
 `ffs-zfs` implements the restricted ZFS-01/ZFS-02 foundation and starts ZFS-03
 from the comprehensive expansion plan. It inspects labels and explicit uberblock
-candidates, extracts checked roots and MOS object ranges, and inventories DSL
-head datasets through supported metadata layouts. It is NOT a pool importer,
-ZPL file reader or FUSE backend. No ext4/btrfs/FAT/NTFS dispatch is changed.
+candidates, extracts checked roots and MOS object ranges, inventories DSL head
+datasets, and reads files within an explicitly selected head. It is NOT a pool
+importer or FUSE backend. No ext4/btrfs/FAT/NTFS dispatch is changed.
 
 ## Commands
 
@@ -26,16 +26,23 @@ ffs-zfs datasets leaf.img --offline-image --pool-guid 123 --label 0 --slot 2
 ffs-zfs object-read leaf.img 1 --start 0 --bytes 512 \
   --offline-image --pool-guid 123 --label 0 --slot 2 > object-range.bin
 
+# Actual ZPL paths: --dataset is relative to the pool, defaulting to its root.
+ffs-zfs ls leaf.img / --dataset data --offline-image --pool-guid 123 --label 0 --slot 2
+ffs-zfs stat leaf.img /file.bin --dataset data --offline-image --pool-guid 123 --label 0 --slot 2
+ffs-zfs read leaf.img /file.bin --dataset data --start 507 --bytes 8199 \
+  --offline-image --pool-guid 123 --label 0 --slot 2 > file-range.bin
+ffs-zfs readlink leaf.img /link --dataset data --offline-image --pool-guid 123 --label 0 --slot 2
+
 # All native checksum verifiers and DVA addresses remain vdev-relative.
 ffs-zfs inspect disk.img --offline-image --offset 1048576 --length 134217728
 ```
 
 `inspect` inventories configurations and candidate slots. It reports rejected
 labels and empty/invalid/unsupported slots, not a global integrity pass. It does
-not select the highest TXG or certify root authority. All extraction commands
-require the explicit candidate and stage the requested output before stdout.
-A stdout error can still leave a partial host file; a storage/checksum failure
-cannot produce a successful unchecked extraction.
+not select the highest TXG or certify root authority. Extraction requires the
+explicit candidate. Raw object/root commands stage their requested output;
+ZPL `read` streams bounded, checked chunks. A later storage or stdout failure
+can leave an earlier prefix in a host output file, but cannot report success.
 
 ## Implemented native pipeline
 
@@ -97,10 +104,10 @@ array is distinct from a scalar zero. DSL references require exactly one native
 bonus records and head dataset bonus records. It checks parent/backreferences,
 duplicate or cyclic directory/head identities, state flags, GUIDs and creation
 TXGs, then verifies and parses every reported head's object-set root. Filesystem
-and volume object-set kinds are reported, but neither is mounted or exposed as
-a ZPL file or zvol. Names are relative to the pool; the root has an empty name.
-Raw component arrays accompany lossless UTF-8 names. Internal DSL directories
-are not silently discarded. Snapshots and clone relationships are not enumerated.
+and volume object-set kinds are reported, but neither is mounted by inventory.
+Names are relative to the pool; the root has an empty name. Raw component arrays
+accompany lossless UTF-8 names. Internal DSL directories are not silently
+discarded. Snapshots and clone relationships are not enumerated.
 
 The inventory is bounded to 4,096 DSL directories, depth 64 and 1 MiB cumulative
 path bytes. A corrupt or unsupported reached map fails the entire inventory;
@@ -139,6 +146,52 @@ capped at 16 MiB. These are not total-process or physical-I/O memory limits:
 temporary leaf/table buffers, allocator bookkeeping and view caches also exist.
 The entire admitted map is validated before it is returned to CLI or DSL code.
 
+## ZPL paths and system attributes
+
+`ls`, `stat`, `read` and `readlink` select a head through the validated DSL
+inventory. The selected filesystem gets its own object-set root and block cache,
+separate from the MOS and other datasets. Its master node supplies ROOT, VERSION
+and naming policies. Case-sensitive, unnormalized ZPL versions 1..5 are admitted;
+UTF8-only policy is checked when present. Unsupported policies fail rather than
+silently substituting host collation. Only a head filesystem is selected: no
+snapshot, zvol or recursive traversal into mounted child datasets is implied.
+
+Metadata can use legacy 264-byte znodes or native system attributes. Fixed
+legacy attribute IDs remain fixed; other IDs come from the dataset's REGISTRY.
+LAYOUTS supplies ordered uint16 attribute arrays. Each SA bonus/spill buffer
+identifies its own byte order and layout, including variable-length fields and
+eight-byte alignment. Spill blocks pass the same type/birth/checksum pipeline
+as other metadata. Bounds are checked for unconsumed attributes too; duplicate
+attributes, conflicting registrations and missing required fields are errors.
+ACL/xattr bytes are not interpreted as access-control authorization.
+
+Directory entries are decoded as low-48-bit objects plus native type tags.
+Their target mode must agree. Directory parents and identities are validated;
+ordinary file hard links retain one object identity even when their stored
+parent differs. Enumeration returns no successful partial list if a later target
+is corrupt. Names retain their native bytes, with lossless UTF-8 when possible.
+No host path is opened from an image name. Parent traversal and symlink following
+are refused. `readlink` returns a native target without resolving it.
+
+File reads use ZPL_SIZE for EOF. Allocation slack is never returned; sparse
+subtrees and the logical tail beyond the last allocated block return zeroes
+without fabricated physical reads. Existing DMU transforms apply to allocated
+blocks. Legacy inline/long symlinks and SA symlink attributes are read separately
+from regular-file content. Reparse/offline providers and private xattr objects
+remain refused. Metadata reports native mode, IDs, link count, creation
+generation, allocation accounting and four timestamps, including signed seconds
+and nanosecond precision. This is offline extraction, not host SID/FUID/ACL
+mapping or permission enforcement, and no mode/owner mutation is offered.
+
+ZPL requests are capped at 16 MiB; CLI extraction streams 1 MiB chunks. Paths
+are capped at 64 KiB and 256 components, names at 255 bytes, symlink output at
+64 KiB, directory result payloads at 32 MiB. SA registries/layouts are capped at
+4,096 registered entries, 1,022 stored layouts, 65,536 layout items, and 128 KiB
+per bonus/spill buffer. These are admission budgets, not format maxima or a
+whole-process memory limit. Reads describe the selected committed root only:
+there is no ZIL replay, recovery validation or claim that pending synchronous
+intent has been incorporated into that root.
+
 ## Explicit admission limits
 
 All input opens use read-only handles to regular offline files. The caller must
@@ -157,9 +210,10 @@ The selected uberblock cannot predate label configuration. Fork/history
 resolution, rewind, active/MMP ownership and multi-vdev import remain separate
 work. Gang, embedded and encrypted/authenticated blocks remain unsupported;
 context-sized holes are handled only in the DMU traversal, not root extraction.
-RAIDZ/mirror topologies, indirect vdevs, normalized/binary ZAP keys, ZPL/SA file interpretation,
-snapshot reads, security, native writes, maintenance and MVCC/RaptorQ integration
-remain incomplete. Dataset inventory is not a full ZFS-support claim.
+RAIDZ/mirror topologies, indirect vdevs, normalized/binary ZAP keys, full ZPL/SA
+feature coverage, snapshot reads, security, native writes, maintenance and
+MVCC/RaptorQ integration remain incomplete. Neither dataset inventory nor the
+restricted ZPL reader is a full ZFS-support claim.
 
 Other budgets: 16 MiB logical/physical blocks; 112 KiB label configurations;
 8,192 nvlist items, depth 16 and 4 KiB config strings; 512..16,384-byte dnodes,
@@ -173,10 +227,13 @@ These are implementation bounds, not maximum sizes of the native filesystem.
 rch exec -- cargo test -p ffs-ondisk zfs
 rch exec -- cargo test -p ffs-cli --bin ffs-zfs
 python3 scripts/verify_zfs_root.py --binary target/debug/ffs-zfs --create-scratch-pool
+
+# Separate opt-in: this new runner creates AND natively mounts fresh scratch pools.
+python3 scripts/verify_zfs_files.py --binary target/debug/ffs-zfs --create-and-mount-scratch-pool
 ```
 
-The native runner creates only new random-named file pools without force,
-import, destroy or dataset mounts. It exports them and retains all images/logs.
+The original native runner creates only new random-named file pools without
+force, import, destroy or dataset mounts. It exports them and retains images/logs.
 It compares root bytes against zdb -R at ashift 9 and 12 and compares DSL head
 names/GUIDs with native zfs list captured before export. Both are repeated inside
 a bounded partition, with whole-image hashes checked. Candidate selection on
@@ -192,6 +249,16 @@ the bounded partition with the original root/hash checks retained. A small-map
 substitute, unknown zdb output, missing tools or native disagreement fails.
 This runner does not manufacture external/growing pointer tables, mixed endian
 blocks or corrupt chains; those remain constructed Rust test coverage.
+
+The new ZPL runner separately requires permission to create and natively mount
+its fresh random-named file pools. It creates ZPL version 4/5 datasets with long
+names, hard links, nested paths, a symlink, empty files and a multi-GiB sparse
+tail; records native file bytes and stat metadata; then exports before invoking
+the candidate. It compares listing/stat/read/ranged-read/readlink output on the
+exported image and on a bounded partition, checks EOF and refusal to follow the
+symlink, and requires unchanged hashes. It never imports or destroys an existing
+pool, accepts an existing image, forces an operation or removes evidence.
+This is an executable native comparison, not a claim that it has run here.
 
 Initial block-pipeline evidence included fixed Python SHA256 vectors, independent
 liblz4 vectors, and Python runner syntax/help checks, not Rust/native execution.
@@ -216,7 +283,14 @@ and changed-file whitespace checks passed. Rust compilation/tests, rustfmt/Clipp
 and native ZFS execution remain unexecuted here. Helper checks do not execute the
 Rust parser or a filesystem and do not certify native interchange.
 
+ZPL authoring evidence: eight parser, seven graph and two CLI/helper regression
+functions added. Python syntax compilation, runner help, two positive/twelve
+negative helper cases and source whitespace checks passed. Rust compilation,
+Rust tests, rustfmt/Clippy and native ZFS execution remain unexecuted here.
+Existing DMU and CLI source was retained byte-for-byte apart from module/command
+registration; existing test assertions and native comparison gates are unchanged.
+
 Reference: OpenZFS tag zfs-2.3.0, especially spa.h, vdev_impl.h,
 uberblock_impl.h, dnode.h, dmu_objset.h, zap_impl.h, dsl_dir.h, dsl_dataset.h,
 zap_leaf.h, zap_leaf.c, zap_micro.c, nvpair.c, zio_checksum.c, sha2_zfs.c,
-lzjb.c and lz4_zfs.c.
+lzjb.c, lz4_zfs.c, sa_impl.h, sa.c, zfs_sa.c and zfs_znode.h.

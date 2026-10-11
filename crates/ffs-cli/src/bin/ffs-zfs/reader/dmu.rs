@@ -2,6 +2,7 @@
 //! No automatic import/TXG selection, writes, replay, or ZPL file-size guesses.
 
 mod zap;
+pub mod zpl;
 
 use super::{
     BlockPointer, Cx, Endian, FfsError, Leaf, Result, SingleLeaf, checkpoint, corrupt, parse,

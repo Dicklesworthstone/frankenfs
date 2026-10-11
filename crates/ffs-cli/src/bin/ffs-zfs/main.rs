@@ -2,6 +2,7 @@
 //! Native read-only ZFS label inspection and explicit MOS-root extraction.
 
 mod reader;
+mod file_commands;
 
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
@@ -55,6 +56,8 @@ struct CandidateArgs {
 }
 #[derive(Debug, Subcommand)]
 enum Command {
+    #[command(flatten)]
+    File(file_commands::FileCommand),
     /// Inventory checksum-valid configurations and uberblock candidates, not pool authority.
     Inspect {
         #[command(flatten)]
@@ -111,6 +114,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let cx = Cx::for_request();
     match cli.command {
+        Command::File(command) => command.run(&cx)?,
         Command::Inspect { image } => {
             let leaf = image.open(&cx)?;
             let mut labels = Vec::new();
