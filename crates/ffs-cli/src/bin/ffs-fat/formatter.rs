@@ -3,15 +3,18 @@
 //! The file is exclusively created and locked once. Verification uses a clone
 //! of that same handle, so it neither reopens the path nor requests a second
 //! advisory lock. Uncooperating writers are outside the advisory-lock contract.
-//! Errors retain the new file, which may be incomplete; success requires file
-//! and parent-directory synchronization plus the existing read-only checker.
+//! Errors retain the new file and identify whether boot publication began.
+//! Success requires file and parent-directory synchronization plus the existing
+//! read-only checker. Keep the destination parent's identity/path stable until
+//! creation finishes: opening the directory and creating the file are separate
+//! pathname resolutions.
 
 #[cfg(test)]
 mod tests;
 
 use super::reader::{FatVolume, MAX_CHAIN_CLUSTERS, checkpoint};
 use anyhow::{Context, Result, anyhow, bail};
-use asupersync::Cx;
+use asupersync::{Cx, types::CancelKind};
 use clap::{Args, ValueEnum};
 use ffs_block::ByteDevice;
 use ffs_error::FfsError;
@@ -60,6 +63,7 @@ impl FormatKind {
 #[derive(Debug, Args)]
 pub struct FormatArgs {
     /// New regular image file. Existing files, symlinks and devices are refused.
+    /// Keep the destination parent's identity/path stable until format completes.
     #[arg(value_name = "NEW_IMAGE")]
     image: PathBuf,
     /// Native dialect; geometry must fit this dialect and the checker budget.
@@ -68,11 +72,15 @@ pub struct FormatArgs {
     /// Exact logical image size in MiB (1048576 bytes); storage may be sparse.
     #[arg(long, value_name = "MIB")]
     size_mib: u64,
+    /// Power of two from 1 to 128; defaults to the smallest admitted cluster.
+    /// Clusters above 32 KiB have limited compatibility with native FAT tools.
+    #[arg(long, value_name = "SECTORS")]
+    sectors_per_cluster: Option<u8>,
     /// 1..11 legal ASCII label bytes, uppercased; no leading or trailing space.
     #[arg(long)]
     label: Option<String>,
-    /// Decimal 32-bit volume serial; defaults to a time-derived identifier.
-    #[arg(long, value_name = "U32")]
+    /// 32-bit serial in decimal or 0x-prefixed hex; defaults to a time-derived ID.
+    #[arg(long, value_name = "U32", value_parser = parse_serial)]
     serial: Option<u32>,
 }
 
@@ -88,6 +96,17 @@ struct Layout {
 
 impl Layout {
     fn calculate(kind: FormatKind, size_mib: u64) -> Result<Self> {
+        Self::calculate_with_cluster(kind, size_mib, None)
+    }
+
+    fn calculate_with_cluster(
+        kind: FormatKind,
+        size_mib: u64,
+        requested_cluster: Option<u8>,
+    ) -> Result<Self> {
+        if requested_cluster.is_some_and(|value| !value.is_power_of_two() || value > 128) {
+            bail!("--sectors-per-cluster must be a power of two from 1 to 128");
+        }
         let total = size_mib
             .checked_mul(2048)
             .filter(|total| *total != 0 && *total <= u64::from(u32::MAX))
@@ -95,6 +114,9 @@ impl Layout {
         let width = u64::from(kind.native().entry_bytes());
         let headers = kind.reserved_sectors() + kind.fixed_root_sectors();
         for sectors_per_cluster in [1_u8, 2, 4, 8, 16, 32, 64, 128] {
+            if requested_cluster.is_some_and(|value| value != sectors_per_cluster) {
+                continue;
+            }
             let cluster_sectors = u64::from(sectors_per_cluster);
             let mut low = 1_u64;
             let mut high = ((total / cluster_sectors + 2) * width).div_ceil(SECTOR_BYTES);
@@ -137,8 +159,9 @@ impl Layout {
             }
         }
         bail!(
-            "size does not admit {:?} with 512-byte sectors, 1..128 sectors per cluster and the bounded FAT checker",
-            kind.native()
+            "size does not admit {:?} with 512-byte sectors, the requested cluster size {:?} (automatic: 1..128 sectors), and the bounded FAT checker",
+            kind.native(),
+            requested_cluster
         )
     }
 
@@ -154,6 +177,7 @@ impl Layout {
     }
 }
 
+#[derive(Clone, Copy)]
 struct Sector {
     offset: u64,
     bytes: [u8; 512],
@@ -175,6 +199,18 @@ fn dword(bytes: &mut [u8], at: usize, value: u32) {
     bytes[at..at + 4].copy_from_slice(&value.to_le_bytes());
 }
 
+fn parse_serial(value: &str) -> std::result::Result<u32, String> {
+    let parsed = value
+        .strip_prefix("0x")
+        .or_else(|| value.strip_prefix("0X"))
+        .map_or_else(
+            || value.parse::<u32>(),
+            |digits| u32::from_str_radix(digits, 16),
+        );
+    parsed
+        .map_err(|error| format!("serial must fit a 32-bit decimal or 0x-prefixed value: {error}"))
+}
+
 fn volume_label(value: Option<&str>) -> Result<Option<[u8; 11]>> {
     let Some(value) = value else {
         return Ok(None);
@@ -187,8 +223,21 @@ fn volume_label(value: Option<&str>) -> Result<Option<[u8; 11]>> {
             !(0x20..=0x7E).contains(&byte)
                 || matches!(
                     byte,
-                    b'"' | b'*' | b'+' | b',' | b'.' | b'/' | b':' | b';' | b'<'
-                        | b'=' | b'>' | b'?' | b'[' | b'\\' | b']' | b'|'
+                    b'"' | b'*'
+                        | b'+'
+                        | b','
+                        | b'.'
+                        | b'/'
+                        | b':'
+                        | b';'
+                        | b'<'
+                        | b'='
+                        | b'>'
+                        | b'?'
+                        | b'['
+                        | b'\\'
+                        | b']'
+                        | b'|'
                 )
         })
     {
@@ -206,7 +255,10 @@ impl FormatPlan {
         if args.image.file_name().is_none() {
             bail!("format target must name a new regular file");
         }
-        let layout = Layout::calculate(args.kind, args.size_mib)?;
+        let layout = match args.sectors_per_cluster {
+            Some(value) => Layout::calculate_with_cluster(args.kind, args.size_mib, Some(value))?,
+            None => Layout::calculate(args.kind, args.size_mib)?,
+        };
         let label = volume_label(args.label.as_deref())?;
         let serial = if let Some(serial) = args.serial {
             serial
@@ -235,8 +287,8 @@ impl FormatPlan {
             FormatKind::Fat16 => {
                 word(&mut boot, 17, 512);
                 word(&mut boot, 22, layout.fat_sectors as u16);
-                if layout.total_sectors <= u32::from(u16::MAX) {
-                    word(&mut boot, 19, layout.total_sectors as u16);
+                if let Ok(small_total) = u16::try_from(layout.total_sectors) {
+                    word(&mut boot, 19, small_total);
                 } else {
                     dword(&mut boot, 32, layout.total_sectors);
                 }
@@ -274,7 +326,9 @@ impl FormatPlan {
         }
         geometry
             .cluster_offset(layout.data_clusters + 1)
-            .map_err(|error| anyhow!("formatter selected a reserved cluster identifier: {error}"))?;
+            .map_err(|error| {
+                anyhow!("formatter selected a reserved cluster identifier: {error}")
+            })?;
 
         let mut fat = [0_u8; 512];
         match layout.kind {
@@ -319,6 +373,10 @@ impl FormatPlan {
             dword(&mut info, 488, layout.data_clusters - 1);
             dword(&mut info, 492, 3);
             dword(&mut info, 508, 0xAA55_0000);
+            // FAT32 reserves a three-sector boot record and a complete copy at
+            // sector 6. The zero boot-extension sectors still carry 0x55AA.
+            let mut boot_extension = [0_u8; 512];
+            word(&mut boot_extension, 510, 0xAA55);
             before_boot.extend([
                 Sector {
                     offset: SECTOR_BYTES,
@@ -329,26 +387,56 @@ impl FormatPlan {
                     bytes: info,
                 },
                 Sector {
-                    offset: 6 * SECTOR_BYTES,
-                    bytes: boot,
+                    offset: 2 * SECTOR_BYTES,
+                    bytes: boot_extension,
+                },
+                Sector {
+                    offset: 8 * SECTOR_BYTES,
+                    bytes: boot_extension,
                 },
             ]);
         }
-        for sector in &before_boot {
-            if sector.offset == 0
-                || !sector.offset.is_multiple_of(SECTOR_BYTES)
-                || sector.offset + SECTOR_BYTES > layout.image_bytes()
-            {
-                bail!("formatter metadata sector lies outside the new volume");
-            }
-        }
-        Ok(Self {
+        let plan = Self {
             layout,
             label,
             serial,
             boot,
             before_boot,
-        })
+        };
+        let mut offsets = Vec::new();
+        for sector in plan.metadata_sectors() {
+            if !sector.offset.is_multiple_of(SECTOR_BYTES)
+                || sector
+                    .offset
+                    .checked_add(SECTOR_BYTES)
+                    .is_none_or(|end| end > layout.image_bytes())
+                || offsets.contains(&sector.offset)
+            {
+                bail!("formatter metadata sector is duplicated or outside the new volume");
+            }
+            offsets.push(sector.offset);
+        }
+        Ok(plan)
+    }
+
+    /// Both BPBs are withheld until preparation is synchronized. Publish the
+    /// backup before the primary so the primary never precedes its full copy.
+    fn publication_sectors(&self) -> impl Iterator<Item = Sector> {
+        let backup = (self.layout.kind == FormatKind::Fat32).then_some(Sector {
+            offset: 6 * SECTOR_BYTES,
+            bytes: self.boot,
+        });
+        backup.into_iter().chain(std::iter::once(Sector {
+            offset: 0,
+            bytes: self.boot,
+        }))
+    }
+
+    fn metadata_sectors(&self) -> impl Iterator<Item = Sector> {
+        self.before_boot
+            .iter()
+            .copied()
+            .chain(self.publication_sectors())
     }
 }
 
@@ -374,26 +462,45 @@ impl ImageTarget for File {
     }
 }
 
-fn initialize(cx: &Cx, target: &impl ImageTarget, plan: &FormatPlan) -> Result<()> {
-    checkpoint(cx)?;
-    // create_new supplied a zero-length file. Extending it guarantees logical
-    // zeros throughout both FATs, reserved areas, directories and free space;
-    // no allocation or write scales with the image's logical byte length.
-    target.resize(plan.layout.image_bytes())?;
-    checkpoint(cx)?;
-    for sector in &plan.before_boot {
+fn initialize(
+    cx: &Cx,
+    target: &impl ImageTarget,
+    plan: &FormatPlan,
+    sync_parent: impl FnOnce() -> io::Result<()>,
+) -> Result<()> {
+    let prepared = (|| -> Result<()> {
         checkpoint(cx)?;
-        target.write_sector(sector.offset, &sector.bytes)?;
+        // create_new supplied a zero-length file. Extending it guarantees
+        // logical zeros throughout both FATs, directories and free space;
+        // initialization I/O does not scale with the logical image length.
+        target.resize(plan.layout.image_bytes())?;
         checkpoint(cx)?;
-    }
-    // The primary boot signature is published only after all other native
-    // metadata is synchronized. Failure at any phase retains the new file.
-    target.flush()?;
-    checkpoint(cx)?;
-    target.write_sector(0, &plan.boot)?;
-    checkpoint(cx)?;
-    target.flush()?;
-    checkpoint(cx)?;
+        for sector in &plan.before_boot {
+            checkpoint(cx)?;
+            target.write_sector(sector.offset, &sector.bytes)?;
+            checkpoint(cx)?;
+        }
+        target.flush()?;
+        // Last cancellation boundary before a valid backup or primary BPB may
+        // appear. From here, finish the bounded write/sync sequence.
+        checkpoint(cx)?;
+        Ok(())
+    })();
+    prepared.context("format incomplete before boot publication; new file retained")?;
+
+    let published = (|| -> Result<()> {
+        for sector in plan.publication_sectors() {
+            target.write_sector(sector.offset, &sector.bytes)?;
+        }
+        target.flush()?;
+        Ok(())
+    })();
+    published.context(
+        "FAT boot publication started; the retained image may already be valid and its file durability is uncertain",
+    )?;
+    sync_parent().context(
+        "FAT image initialized and file-synchronized; parent-directory synchronization failed, directory durability is uncertain",
+    )?;
     Ok(())
 }
 
@@ -429,12 +536,7 @@ impl ByteDevice for CreatedImage {
         checkpoint(cx)
     }
 
-    fn write_all_at(
-        &self,
-        _cx: &Cx,
-        _offset: ByteOffset,
-        _bytes: &[u8],
-    ) -> ffs_error::Result<()> {
+    fn write_all_at(&self, _cx: &Cx, _offset: ByteOffset, _bytes: &[u8]) -> ffs_error::Result<()> {
         Err(FfsError::ReadOnly)
     }
 
@@ -448,17 +550,16 @@ fn verify_created(cx: &Cx, file: &File, plan: &FormatPlan) -> Result<serde_json:
     if file.metadata()?.len() != plan.layout.image_bytes() {
         bail!("new FAT image changed length during creation");
     }
-    let boot_sector = Sector {
-        offset: 0,
-        bytes: plan.boot,
-    };
-    for sector in plan.before_boot.iter().chain(std::iter::once(&boot_sector)) {
+    for sector in plan.metadata_sectors() {
         checkpoint(cx)?;
         let mut actual = [0_u8; 512];
         file.read_exact_at(&mut actual, sector.offset)?;
         checkpoint(cx)?;
         if actual != sector.bytes {
-            bail!("new FAT metadata readback mismatch at byte {}", sector.offset);
+            bail!(
+                "new FAT metadata readback mismatch at byte {}",
+                sector.offset
+            );
         }
     }
     let volume = FatVolume::from_device(
@@ -488,6 +589,19 @@ fn verify_created(cx: &Cx, file: &File, plan: &FormatPlan) -> Result<serde_json:
     Ok(serde_json::to_value(report)?)
 }
 
+/// Ctrl+C cancels the actual context shared by device reads and the checker's
+/// cached-FAT loops. The bounded BPB/file/parent publication sequence has no
+/// checkpoints; subsequent verification remains cancellable and reports that
+/// the image is already initialized and synchronized.
+pub fn run(cx: &Cx, args: &FormatArgs) -> Result<serde_json::Value> {
+    let signal = cx.clone();
+    ctrlc::set_handler(move || {
+        signal.cancel_with(CancelKind::User, Some("FAT format interrupted by Ctrl+C"));
+    })
+    .context("installing FAT format cancellation handler; no destination was created")?;
+    create(cx, args)
+}
+
 pub fn create(cx: &Cx, args: &FormatArgs) -> Result<serde_json::Value> {
     checkpoint(cx)?;
     let plan = FormatPlan::prepare(args)?;
@@ -510,20 +624,28 @@ pub fn create(cx: &Cx, args: &FormatArgs) -> Result<serde_json::Value> {
         .create_new(true)
         .mode(0o600)
         .open(&args.image)
-        .with_context(|| format!("exclusively creating new FAT image {}", args.image.display()))?;
+        .with_context(|| {
+            format!(
+                "exclusively creating new FAT image {}",
+                args.image.display()
+            )
+        })?;
     let finish = || -> Result<serde_json::Value> {
-        checkpoint(cx)?;
-        let metadata = file.metadata()?;
-        if !metadata.is_file() || metadata.len() != 0 {
-            bail!("new FAT target is not an empty regular file");
-        }
-        file.try_lock()
-            .map_err(|error| anyhow!("cannot exclusively lock new FAT image: {error}"))?;
-        initialize(cx, &file, &plan)?;
-        let verification = verify_created(cx, &file, &plan)?;
-        checkpoint(cx)?;
-        parent.sync_all().context("synchronizing the new-image directory entry")?;
-        checkpoint(cx)?;
+        let setup = (|| -> Result<()> {
+            checkpoint(cx)?;
+            let metadata = file.metadata()?;
+            if !metadata.is_file() || metadata.len() != 0 {
+                bail!("new FAT target is not an empty regular file");
+            }
+            file.try_lock()
+                .map_err(|error| anyhow!("cannot exclusively lock new FAT image: {error}"))?;
+            Ok(())
+        })();
+        setup.context("format incomplete before boot publication; new file retained")?;
+        initialize(cx, &file, &plan, || parent.sync_all())?;
+        let verification = verify_created(cx, &file, &plan).context(
+            "FAT image initialized and file-and-parent synchronized; verification did not complete",
+        )?;
         let label = plan
             .label
             .as_ref()
@@ -542,13 +664,14 @@ pub fn create(cx: &Cx, args: &FormatArgs) -> Result<serde_json::Value> {
             "mirrored": true,
             "label": label,
             "serial": plan.serial,
+            "durability": "file_and_parent_synced",
             "storage": "logical zeros in a new file; physical storage may be sparse",
             "verification": verification
         }))
     };
     finish().with_context(|| {
         format!(
-            "creating {}; the new file was retained and may be incomplete",
+            "creating {}; the new file was retained",
             args.image.display()
         )
     })

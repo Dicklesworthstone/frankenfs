@@ -1069,3 +1069,33 @@ merged NTFS security parser. Changed Rust sources were parsed/formatted. UBS
 could not execute its installed launcher (permission denied). CLI reader/FsOps,
 native OpenZFS and mounted mirror validation remain unexecuted; the parser
 results add no native-pool or mounted-readiness claim.
+
+### FAT16/FAT32 complete boot publication and interruption semantics
+
+The native formatter preserves its existing geometry, optional labels, timestamps
+and report fields while adding explicit cluster selection and decimal/hex serials.
+FAT32 creates complete signed boot-record copies at sectors 0..2 and 6..8. Both
+BPBs remain withheld until the mirrored FATs, root, FSInfo and extension sectors
+are synchronized; final publication completes backup, primary, file sync and
+parent sync without a cancellation checkpoint between those bounded operations.
+
+Ctrl+C cancels the actual context shared by device reads and allocation-loop
+checkpoints. Mandatory verification uses the cloned locked file handle after
+durability, and an interrupted or failed scan identifies the already initialized,
+synchronized image. Existing targets remain refused through exclusive creation.
+
+All eleven original formatter tests remain, with publication/failure loops
+extended through parent synchronization. Fourteen additional tests cover native
+bytes and allocation, cluster/serial selection, hardlinks, request cancellation,
+both boot extensions and original-inode verification. The native runner now tests
+formatter-created images through fsck/mtools and exact byte/count/hash comparisons
+as well as its existing native-created and optional mounted cases.
+
+The five Rust files passed parsing/formatting checks and the runner passed Python
+syntax compilation. Production and all 25 formatter tests received independent
+source review. Earlier CLI dependency builds received SIGKILL during `asupersync`
+compilation; the merged formatter suite, native interchange and mounted cases
+remain unexecuted. UBS
+could not execute its installed launcher. On-disk parser tests and Clippy do not
+qualify this formatter. See `docs/FAT_READ_PROFILE.md` for the native profile,
+commands, interruption outcomes and interoperability limits.
