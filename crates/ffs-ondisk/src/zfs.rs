@@ -251,21 +251,24 @@ impl BlockPointer {
         }
     }
 
-    /// Decode BP_EMBEDDED_TYPE_DATA from an already verified containing block.
+    /// Decode `BP_EMBEDDED_TYPE_DATA` from an already verified containing block.
     /// This is not an independent integrity check: callers must validate the
     /// parent checksum, feature admission, object type, size and birth ceiling.
     ///
     /// OpenZFS spa.h and blkptr.c pack bytes into the low bits of each numeric
     /// payload word, regardless of container or logical payload byte order.
     /// Only words 6 (properties) and 10 (logical birth) are not payload words.
+    /// Native DNODE/OBJSET types cannot embed because their fill counts are
+    /// required by the metadata tree (OpenZFS zfs-2.3.0 `DMU_OT_HAS_FILL`).
     pub fn decode_embedded(&self) -> Result<Vec<u8>, ParseError> {
         if !self.embedded()
             || self.protected()
             || self.words[6] & (1_u64 << 62) != 0
             || self.level() != 0
+            || matches!(self.object_type(), 10 | 11)
             || self.birth() == 0
         {
-            return Err(invalid("invalid embedded data flags, level or birth"));
+            return Err(invalid("invalid embedded data flags, type, level or birth"));
         }
         if (self.words[6] >> 40) & 0xff != 0 {
             return Err(invalid("reserved or redacted embedded block type"));

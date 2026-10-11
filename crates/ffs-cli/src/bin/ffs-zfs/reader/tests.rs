@@ -397,3 +397,51 @@ fn native_boolean_features_and_uberblock_membership_are_required() {
     );
     assert_eq!(data_reads(&reads), [] as [u64; 0]);
 }
+
+#[test]
+fn embedded_read_feature_requires_native_boolean_and_all_label_agreement() {
+    let cx = Cx::for_testing();
+    let feature_name = "com.delphix:embedded_data";
+    for order in [Endian::Little, Endian::Big] {
+        for mistyped in [false, true] {
+            let feature = if mistyped {
+                uint(feature_name, 1)
+            } else {
+                presence(feature_name)
+            };
+            let packed = config_features(
+                999,
+                9,
+                1,
+                &list(&[feature, presence("org.illumos:lz4_compress")]),
+            );
+            let mut image = Image::new(order, true);
+            for label in 0..4 {
+                image.set_config(label, &packed);
+            }
+            let expected = image.root.clone();
+            let reads: Reads = Arc::default();
+            let result = image.open(Arc::clone(&reads), None).root(&cx, 0, 2, 123);
+            if mistyped {
+                assert!(result.is_err());
+                assert!(data_reads(&reads).is_empty());
+            } else {
+                assert_eq!(result.unwrap().data, expected);
+            }
+        }
+        let mut image = Image::new(order, false);
+        let packed = config_features(999, 9, 1, &list(&[presence(feature_name)]));
+        for label in 0..3 {
+            image.set_config(label, &packed);
+        }
+        // A valid fourth label lacking the feature is a contradictory catalog.
+        let reads: Reads = Arc::default();
+        assert!(
+            image
+                .open(Arc::clone(&reads), None)
+                .root(&cx, 0, 2, 123)
+                .is_err()
+        );
+        assert!(data_reads(&reads).is_empty());
+    }
+}

@@ -86,6 +86,13 @@ existing checksum/transform/copy pipeline. Each child block supplies its own
 payload byte order. Sparse leaf or indirect subtrees yield context-sized zeroes
 without physical reads; encrypted/embedded pointers cannot take that path.
 
+Embedded DATA leaves require the declared `com.delphix:embedded_data` feature.
+Their block pointers carry at most 112 encoded bytes within a verified parent
+block. Existing raw/LZJB/LZ4 decoders enforce the 16 MiB logical-block bound;
+no payload DVA is read. The native DNODE/OBJSET types cannot embed because they
+require their fill counts. Nonleaf, reserved/redacted, protected and deduplicated
+embedded forms are also refused. The same interpretation and cache checks apply.
+
 A view retains up to 32 fully checked blocks and 16 MiB of block bytes, keyed by
 the complete pointer. Views do not share caches across roots. In-flight output,
 clones and bookkeeping are outside this retention limit. Requests check
@@ -202,14 +209,16 @@ log replay, implicit native imports or host paths taken from a label.
 Extraction requires all four configurations to validate and agree on pool/leaf
 identity, addressing, configuration generation and read features. The pool must
 be exported and have one top-level file/disk leaf with ID zero and no removal,
-special or log state. Versions 1..28 or 5000 are admitted. Version 5000 requires
-no label read features beyond optional org.illumos:lz4_compress, encoded as a
-boolean-presence field. This is not full MOS feature negotiation or pool import.
+special or log state. Versions 1..28 or 5000 are admitted. Version 5000 admits
+only optional `org.illumos:lz4_compress` and `com.delphix:embedded_data` label
+read features, each encoded as a native boolean-presence field. This is not full
+MOS feature negotiation or pool import.
 
 The selected uberblock cannot predate label configuration. Fork/history
 resolution, rewind, active/MMP ownership and multi-vdev import remain separate
-work. Gang, embedded and encrypted/authenticated blocks remain unsupported;
-context-sized holes are handled only in the DMU traversal, not root extraction.
+work. Gang and encrypted/authenticated blocks remain unsupported; embedded DATA
+is limited to the leaf pipeline above. Context-sized holes are handled only in
+the DMU traversal, not root extraction.
 RAIDZ/mirror topologies, indirect vdevs, normalized/binary ZAP keys, full ZPL/SA
 feature coverage, snapshot reads, security, native writes, maintenance and
 MVCC/RaptorQ integration remain incomplete. Neither dataset inventory nor the
@@ -289,6 +298,16 @@ negative helper cases and source whitespace checks passed. Rust compilation,
 Rust tests, rustfmt/Clippy and native ZFS execution remain unexecuted here.
 Existing DMU and CLI source was retained byte-for-byte apart from module/command
 registration; existing test assertions and native comparison gates are unchanged.
+
+Additional embedded-data authoring evidence: three parser, two verified-parent
+graph and one full-label regression functions were added. They cover fixed
+numeric payload vectors, LZJB/LZ4 decoding, malformed LZ4 streams, fill-bearing
+type refusal, mixed inline/hole/physical ranges, parent checksum failure, cancellation
+and four-label feature agreement. These supplement the existing embedded runtime
+and its tests. They were source-reviewed only: executor loss prevented Rust
+compilation/tests and rustfmt/Clippy, and no native ZFS comparison was executed.
+Native fill semantics were checked against pinned OpenZFS `dmu.h` and `zio.c`;
+payload and feature layouts against `spa.h`, `blkptr.c` and `zfeature_common.c`.
 
 Reference: OpenZFS tag zfs-2.3.0, especially spa.h, vdev_impl.h,
 uberblock_impl.h, dnode.h, dmu_objset.h, zap_impl.h, dsl_dir.h, dsl_dataset.h,

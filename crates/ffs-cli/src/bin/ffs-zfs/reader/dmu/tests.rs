@@ -96,7 +96,11 @@ fn graph(order: Endian, case: u8, reads: Reads, failure: Option<u64>) -> (Leaf, 
     store(DATA_A, &a);
     store(DATA_B, &b);
     let mut indirect = vec![0; 4096];
-    let mut child = pointer(&a, DATA_A, 19, 0, 20, other, order);
+    let mut child = if matches!(case, 10 | 11) {
+        embedded_pointer(b'A', other, order)
+    } else {
+        pointer(&a, DATA_A, 19, 0, 20, other, order)
+    };
     match case {
         1 => child[48..56].copy_from_slice(&other.encode(
             (2 << 32) | (7 << 40) | (18 << 48) | (u64::from(order == Endian::Little) << 63),
@@ -127,6 +131,9 @@ fn graph(order: Endian, case: u8, reads: Reads, failure: Option<u64>) -> (Leaf, 
     data_node[64..192].copy_from_slice(&pointer(&indirect, INDIRECT, 19, 1, 30, order, other));
     if case == 7 {
         data_node[64..192].fill(0);
+    }
+    if case == 11 {
+        data_node[160] ^= 1; // Corrupt the embedded pointer's containing block checksum.
     }
     // Large dnode occupies slots 7 and 8; slot 8 deliberately looks allocated.
     data_node.resize(1024, 0);
@@ -355,4 +362,102 @@ fn cached_block_still_requires_the_callers_type_level_and_birth() {
     assert!(view.checked(&cx, &bp, 18, 0, 512, 30).is_err());
     assert!(view.checked(&cx, &bp, 19, 1, 512, 30).is_err());
     assert!(view.checked(&cx, &bp, 19, 0, 512, 19).is_err());
+}
+
+fn embedded_pointer(fill: u8, containing: Endian, payload: Endian) -> Vec<u8> {
+    // Fixed LZ4 shape: one literal + 506 repeated bytes + five literals.
+    // The native envelope is four length bytes plus twelve LZ4 bytes.
+    let mut words = [0_u64; 16];
+    words[0] = u64::from_le_bytes([0, 0, 0, 12, 0x1f, fill, 1, 0]);
+    words[1] = u64::from_le_bytes([255, 232, 0x50, fill, fill, fill, fill, fill]);
+    words[6] = 0x0013_008f_1e00_01ff | (u64::from(payload == Endian::Little) << 63);
+    words[10] = 20;
+    words
+        .into_iter()
+        .flat_map(|word| containing.encode(word))
+        .collect()
+}
+
+#[test]
+fn embedded_ranges_use_verified_parents_without_payload_device_reads() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        let reads: Reads = Arc::default();
+        let (leaf, meta) = graph(order, 10, Arc::clone(&reads), None);
+        let mut view = objects(&leaf, meta);
+        view.config.read_features = vec![
+            "com.delphix:embedded_data".into(),
+            "org.illumos:lz4_compress".into(),
+        ];
+        let mut expected = vec![b'A'; 2];
+        expected.extend_from_slice(&[0; 512]);
+        expected.extend_from_slice(&[b'B'; 512]);
+        assert_eq!(view.read(&cx, 7, 510, 1026).unwrap(), expected);
+        assert_eq!(
+            *reads.lock().unwrap(),
+            [
+                (BASE as u64 + TABLE, 16384),
+                (BASE as u64 + INDIRECT, 4096),
+                (BASE as u64 + DATA_B, 512),
+            ]
+        );
+        let read_count = reads.lock().unwrap().len();
+        assert_eq!(view.read(&cx, 7, 510, 1026).unwrap(), expected);
+        assert_eq!(view.read(&cx, 7, 0, 512).unwrap(), vec![b'A'; 512]);
+        assert_eq!(reads.lock().unwrap().len(), read_count);
+    }
+}
+
+#[test]
+fn embedded_parent_damage_and_later_cancellation_never_return_partial_ranges() {
+    let cx = Cx::for_testing();
+    let reads: Reads = Arc::default();
+    let (leaf, meta) = graph(Endian::Little, 11, Arc::clone(&reads), None);
+    let mut view = objects(&leaf, meta);
+    view.config.read_features = vec![
+        "com.delphix:embedded_data".into(),
+        "org.illumos:lz4_compress".into(),
+    ];
+    assert!(view.read(&cx, 7, 0, 1536).is_err());
+    assert!(!view.cache.iter().any(|(bp, _)| bp.embedded()));
+    assert_eq!(
+        *reads.lock().unwrap(),
+        [
+            (BASE as u64 + TABLE, 16384),
+            (BASE as u64 + INDIRECT, 4096),
+        ]
+    );
+
+    let reads: Reads = Arc::default();
+    let (leaf, meta) = graph(
+        Endian::Little,
+        10,
+        Arc::clone(&reads),
+        Some(BASE as u64 + DATA_B),
+    );
+    let mut view = objects(&leaf, meta);
+    view.config.read_features = vec![
+        "com.delphix:embedded_data".into(),
+        "org.illumos:lz4_compress".into(),
+    ];
+    assert!(matches!(
+        view.read(&cx, 7, 0, 1536),
+        Err(FfsError::Cancelled)
+    ));
+    assert_eq!(
+        reads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(at, _)| *at == BASE as u64 + DATA_B)
+            .count(),
+        1
+    );
+    assert!(
+        !reads
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(at, _)| *at == BASE as u64 + DATA_A)
+    );
 }

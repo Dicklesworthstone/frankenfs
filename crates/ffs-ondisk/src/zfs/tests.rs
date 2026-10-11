@@ -250,3 +250,107 @@ fn compressed_block_verifies_padded_physical_bytes_before_decoding() {
     physical[511] = 1; // Allocated padding is inside the checksum boundary.
     assert!(bp.decode(&physical).is_err());
 }
+
+fn embedded_words(words: [u64; 16], order: Endian) -> BlockPointer {
+    let raw: Vec<u8> = words
+        .into_iter()
+        .flat_map(|word| order.encode(word))
+        .collect();
+    BlockPointer::parse(&raw, order).unwrap()
+}
+
+#[test]
+fn embedded_payload_words_preserve_bytes_across_both_metadata_orders() {
+    // Fixed numeric words from the native layout, not a matching encoder:
+    // payload bytes are 0..111 across the two non-payload word positions.
+    let golden = [
+        0x0706_0504_0302_0100,
+        0x0f0e_0d0c_0b0a_0908,
+        0x1716_1514_1312_1110,
+        0x1f1e_1d1c_1b1a_1918,
+        0x2726_2524_2322_2120,
+        0x2f2e_2d2c_2b2a_2928,
+        0x0013_0082_de00_006f,
+        0x3736_3534_3332_3130,
+        0x3f3e_3d3c_3b3a_3938,
+        0x4746_4544_4342_4140,
+        42,
+        0x4f4e_4d4c_4b4a_4948,
+        0x5756_5554_5352_5150,
+        0x5f5e_5d5c_5b5a_5958,
+        0x6766_6564_6362_6160,
+        0x6f6e_6d6c_6b6a_6968,
+    ];
+    for order in [Endian::Little, Endian::Big] {
+        for payload_order in [Endian::Little, Endian::Big] {
+            for size in [1_u64, 7, 8, 47, 48, 49, 71, 72, 73, 111, 112] {
+                let mut words = golden;
+                words[6] = (words[6] & !0xffff_ffff)
+                    | (size - 1)
+                    | ((size - 1) << 25)
+                    | (u64::from(payload_order == Endian::Little) << 63);
+                let bp = embedded_words(words, order);
+                let expected: Vec<u8> = (0..u8::try_from(size).unwrap()).collect();
+                assert_eq!(bp.decode_embedded().unwrap(), expected);
+                assert_eq!(bp.logical_bytes(), size as usize);
+                assert_eq!(bp.physical_bytes(), 0);
+                assert_eq!(bp.checksum_type(), 2);
+                assert_eq!(bp.payload_order(), payload_order);
+                assert!(!bp.hole());
+                assert!(bp.regular_dvas().is_err());
+                assert!(bp.decode(&expected).is_err());
+            }
+        }
+    }
+}
+
+#[test]
+fn embedded_lz4_and_lzjb_decode_the_native_byte_sized_payload() {
+    // ZFS LZ4 envelope: 14 encoded bytes after its four-byte length.
+    // One literal + 1018 repeated bytes + five literals = 1024 'A' bytes.
+    let mut lz4_words = [0_u64; 16];
+    lz4_words[0] = 0x0001_411f_0e00_0000;
+    lz4_words[1] = 0x4141_4150_eaff_ffff;
+    lz4_words[2] = 0x0000_0000_0000_4141;
+    lz4_words[6] = 0x0013_008f_2200_03ff;
+    lz4_words[10] = 42;
+    let mut lzjb_words = [0_u64; 16];
+    lzjb_words[0] = 0x0000_0318_6362_6108;
+    lzjb_words[6] = 0x0013_0083_0a00_000b;
+    lzjb_words[10] = 42;
+    for order in [Endian::Little, Endian::Big] {
+        assert_eq!(
+            embedded_words(lz4_words, order).decode_embedded().unwrap(),
+            vec![b'A'; 1024]
+        );
+        assert_eq!(
+            embedded_words(lzjb_words, order).decode_embedded().unwrap(),
+            b"abcabcabcabc"
+        );
+    }
+    let mut broken = lz4_words;
+    broken[0] &= !(0xff_u64 << 48); // Zero match distance.
+    assert!(embedded_words(broken, Endian::Little).decode_embedded().is_err());
+    broken = lz4_words;
+    broken[6] -= 1 << 25; // Truncate within the length-prefixed stream.
+    assert!(embedded_words(broken, Endian::Little).decode_embedded().is_err());
+    for logical_bytes in [1023_u64, 1025] {
+        broken = lz4_words;
+        broken[6] = (broken[6] & !0x01ff_ffff) | (logical_bytes - 1);
+        assert!(embedded_words(broken, Endian::Little).decode_embedded().is_err());
+    }
+}
+
+#[test]
+fn embedded_fill_bearing_metadata_types_are_refused() {
+    // One valid uncompressed byte becomes invalid when interpreted as a
+    // dnode table or object set: embedding consumes their native fill count.
+    for kind in [10_u64, 11] {
+        let mut words = [0_u64; 16];
+        words[6] = 0x0000_0082_0000_0000 | (kind << 48);
+        words[10] = 42;
+        let bp = embedded_words(words, Endian::Little);
+        assert!(bp.decode_embedded().is_err());
+        assert!(bp.decode(&[]).is_err());
+    }
+}
