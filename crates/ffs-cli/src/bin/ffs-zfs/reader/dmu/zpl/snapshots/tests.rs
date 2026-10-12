@@ -300,14 +300,15 @@ impl Image {
         table[1024..1536].copy_from_slice(&dn);
         self.store(at + 0x4200, &directory);
         let mut indirect = vec![0; 4096];
-        let a = vec![b'A' + state as u8 * 2; 512];
-        let b = vec![b'B' + state as u8 * 2; 512];
+        let block_bytes = if matches!(case, 27 | 28) { 1024 } else { 512 };
+        let a = vec![b'A' + state as u8 * 2; block_bytes];
+        let b = vec![b'B' + state as u8 * 2; block_bytes];
         indirect[..128].copy_from_slice(&pointer(
             &a,
             at + 0x6000,
             19,
             0,
-            if state == 0 && case == 20 {
+            if state == 0 && matches!(case, 20 | 28) {
                 19
             } else {
                 birth - 4
@@ -347,7 +348,7 @@ impl Image {
         self.store(at + 0x6800, &b);
         let size = [2049, 600, 900][state];
         let mut dn = bonus(
-            node(19, 512, 2, 2, order),
+            node(19, block_bytes, 2, 2, order),
             17,
             &metadata(8, size, None, order),
             order,
@@ -374,7 +375,7 @@ impl Image {
             &metadata(8, 0, None, order),
             order,
         ));
-        if case >= 23 {
+        if (23..=26).contains(&case) {
             xattrs::augment(self, &mut table, at, state, birth, order, case);
         }
         let mut os = vec![0; 1024];
@@ -667,4 +668,5 @@ mod mirror;
 
 mod raidz;
 
+mod gang;
 mod xattrs;

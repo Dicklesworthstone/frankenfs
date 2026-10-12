@@ -1,9 +1,10 @@
-# Experimental FAT16/FAT32 read and new-image creation profile
+# Experimental FAT16/FAT32 reads, image creation and offline file replacement
 
 `ffs-fat` is a native Rust companion binary in `ffs-cli`. It uses the shared
 `ffs-ondisk::fat` parser and the existing `ffs-core::FsOps` / `ffs-fuse` adapter.
-It implements reads and creation of new images, including native population
-from a source directory, without invoking another filesystem driver or formatter.
+It implements reads, creation of new images with native source-directory
+population, and ordered replacement of existing regular-file contents on an
+offline image, without invoking another filesystem driver or formatter.
 The ordinary
 ext4/btrfs `ffs-cli` dispatch and `FsFlavor` are unchanged; this is not yet
 integration into the generic `ffs mount` or `OpenFs` auto-detection path.
@@ -22,6 +23,11 @@ target/debug/ffs-fat format selected-clusters.img --kind fat32 --size-mib 128 --
 # Source files and directories must remain immutable until this finishes.
 target/debug/ffs-fat format populated-fat16.img --kind fat16 --size-mib 64 --source-dir ./release-tree
 target/debug/ffs-fat format populated-fat32.img --kind fat32 --size-mib 128 --source-dir ./release-tree --label RELEASE --serial 0x1234ABCD
+
+# The existing image must be offline, with no mounted or unrelated writers.
+# Dry-run performs the complete source, allocation and capacity preflight.
+target/debug/ffs-fat replace volume.img '/Long native filename.txt' --source ./new-payload.bin --offline-image --dry-run
+target/debug/ffs-fat replace volume.img '/Long native filename.txt' --source ./new-payload.bin --offline-image
 
 target/debug/ffs-fat inspect volume.img
 target/debug/ffs-fat check volume.img
@@ -44,13 +50,120 @@ target/debug/ffs-fat cat disk.img --offset 1048576 --length 67108864 /FILE.BIN
 target/debug/ffs-fat check disk.img --offset 1048576 --length 67108864
 ```
 
-Commands that open existing images use read-only handles. The separate `format`
-command exclusively creates a new file; it cannot overwrite or format an existing
-image or device. Mutation, repair, recovery, resizing and protection initialization
-of existing volumes remain separate work. Shared advisory locks do not exclude
-kernel mounts or unrelated writers; image immutability is a caller requirement.
+Inspection, extraction, checking, mounts and replacement dry-runs use read-only
+handles. `replace` opens an existing regular image exclusively for an ordered
+native file-content update; `format` exclusively creates a new image. Repair,
+recovery, resizing, writable mounts and protection initialization of existing
+volumes remain separate work. Advisory locks do not exclude kernel mounts or
+unrelated writers; offline ownership and source immutability are caller requirements.
 `cat` and `extract` validate allocation before output, but a later storage failure
 may still leave a previously streamed prefix on stdout and exits unsuccessfully.
+
+## Replacing an existing file on an offline image
+
+`ffs-fat replace IMAGE /EXISTING.TXT --source SOURCE --offline-image` replaces
+the complete contents of one existing ordinary FAT16 or FAT32 file. Growth,
+shrink, zero-length replacement and filling an existing empty file are supported.
+Native long names and short aliases continue to select the same directory entry;
+the command also honors `--oem-code-page`, `--offset` and `--length`. The selected
+volume remains at its original offset and size, and bytes outside it are not
+written. No destination file, directory entry, image or partition is created.
+
+The image and source must be existing regular files. Final-component symlinks,
+devices, directories, and a source that aliases the image inode are refused.
+The image is exclusively advisory-locked and the retained source handle is
+shared-locked. Both named and opened identities, sizes, and nanosecond change
+and modification times are checked around preflight. The source must stay
+immutable and the image must have no other writers throughout the operation;
+these checks and advisory locks are not a host snapshot. A changed backing-file
+length is checked before every write. `--offline-image` is required even for
+`--dry-run`, which opens both files read-only, validates the planned operation
+and reports its digest and allocation without dirtying or writing the image.
+
+Before mutation, the native reader admits geometry, selected FAT copies and
+reserved entries. Replacement additionally requires clean primary and backup
+boot state without a native surface-test request, and a complete clean allocation
+and namespace check. This refuses cross-links, lost chains, inconsistent mirrors,
+invalid primary FSInfo, unrepresentable names and incomplete checker coverage.
+A target with the native read-only attribute, a directory or an unsupported
+attribute combination is refused. Names, long-name slots, creation/access dates,
+short-name case flags and unrelated directory bytes are preserved. The native
+archive attribute is set and modification time uses the reader's documented UTC
+wall-clock projection with FAT's two-second precision. FAT16's OS/2 EA index and
+FAT32's reserved high directory-cluster bits are preserved.
+
+Replacement needs enough **currently free, disjoint clusters for the entire new
+payload**, even when the old file is larger. Old clusters are not credited toward
+preflight capacity. This avoids overwriting the acknowledged original contents
+while the replacement is being prepared. Files remain bounded by the native
+4,294,967,295-byte length and the existing allocation/namespace checker budgets.
+Source SHA-256 is computed during preflight, while staging, and once again from
+the retained source before new allocation is published. Unused bytes in the final
+new cluster are zeroed.
+
+The native update has explicit synchronization boundaries:
+
+1. Mark the primary/backup BPBs and every selected FAT's reserved clean bit
+   dirty, set the primary FSInfo hints to unknown, and synchronize the image.
+2. Write initialized contents into the disjoint free clusters, verify the source
+   digest and identity, and synchronize the new data.
+3. Publish the new chain in every selected FAT and synchronize allocation.
+4. Update the existing short directory entry's first cluster, size, archive bit
+   and modification time, preserving the surrounding sector, and synchronize it.
+5. Resolve that native path again and verify its exact new chain and SHA-256
+   through the ordinary reader before releasing any old allocation.
+6. Release the old chain, update the primary FSInfo free count and synchronize.
+   Run the complete checker again and require the expected namespace/free counts.
+7. Clear the native dirty state and synchronize before reporting success.
+
+Mirrored FAT copies are updated independently, retaining each FAT32 entry's
+reserved high nibble. A non-mirrored FAT32 volume changes only its selected active
+FAT; the inactive copy remains untouched. Allocation changes are coalesced into
+native sectors and their prior values are verified. The primary FSInfo free
+count is exact after success, with an unknown next-free search hint; the backup
+FSInfo remains a native backup hint rather than an allocation authority.
+
+This is an ordered offline operation, **not an atomic replacement or a recovery
+protocol**. A write, flush, cancellation or verification failure can leave a dirty
+image, orphaned allocation or a partially changed directory sector. The original
+cause and phase are returned; the image is retained and no rollback is claimed.
+After such a failure, use native checking/recovery on a separate copy before
+another mutation. The success report includes `operation: replace_existing_file`,
+old/new sizes, new/released cluster counts, source SHA-256, native readback
+verification, the final checker report and
+`durability: all_data_metadata_and_clean_state_synced`. A reporting failure occurs
+after the completed operation and does not undo it.
+
+Existing-file creation, unlink, rename, directory mutation, general writable
+mounts, crash replay and MVCC/RaptorQ integration remain incomplete. The offline
+replacement path does not complete the comprehensive plan's native-write or
+recovery milestones.
+
+### Replacement validation status
+
+Eight authored regressions exercise FAT16/FAT32 growth, shrink, empty-file
+transitions and 512/4096-byte sectors; LFN/SFN identity and retained metadata;
+FAT32 active-copy/high-bit preservation; zero-write refusal of bad capacity,
+permissions, boot state, allocation and source sizes; source changes,
+cancellation and stale entries; and every modeled write/flush failure with
+discarded or retained pending bytes and several torn prefixes. They also cover
+calendar bounds and exact CLI admission. The crash device distinguishes pending
+from synchronized data and does not assume hardware sector atomicity.
+
+The four changed Rust source files passed pinned nightly rustfmt and check mode,
+and the publication/allocation protocol received an independent source review.
+At this increment's publication, the new runtime tests and native replacement
+interchange have not executed: the full CLI build and a smaller production-reader
+harness were both SIGKILLed in dependencies under the shared memory limit, before
+the writer could compile. No successful native writer, full CLI build, mounted
+write, hardware power-cut or recovery result is claimed. Formatter and ordinary
+reader evidence elsewhere in this document does not qualify replacement.
+
+The repository regression command is:
+
+```sh
+rch exec -- cargo test -p ffs-cli --bin ffs-fat replacement
+```
 
 ## New-image formatter
 
@@ -165,9 +278,10 @@ and the completed phase:
 
 The file is not silently removed or reused on a subsequent attempt. The lock
 remains advisory; unrelated writers and kernel mounts are outside the contract.
-This implements fresh empty and populated image creation. Writable mounts,
-mutation/recovery of existing FAT filesystems, partition formatting and
-MVCC/RaptorQ integration remain separate native write-path work.
+This implements fresh empty and populated image creation. Existing-file content
+replacement is described above; writable mounts, broader namespace mutation,
+recovery, partition formatting and MVCC/RaptorQ integration remain separate
+native write-path work.
 
 ### Populating a fresh image from a source directory
 
@@ -343,7 +457,7 @@ invalid fields report corruption at their directory record. Dirty volumes and
 conflicting boot copies require offline native investigation; this reader never
 repairs them automatically.
 
-FAT12, exFAT, mutation/recovery of existing FAT images, full OEM/Unicode naming parity, integrated
+FAT12, exFAT, general namespace mutation/recovery of existing FAT images, full OEM/Unicode naming parity, integrated
 MVCC/RaptorQ protection, and NTFS/ZFS implementation remain separate work.
 
 ## Lossless native catalog and extraction

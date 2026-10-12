@@ -284,6 +284,7 @@ pub struct RootBlock {
     pub uberblock: Uberblock,
     pub data: Vec<u8>,
     /// A replica address, or the first data-column address when raidz is set.
+    /// For a gang root this identifies its header, not contiguous root bytes.
     pub physical_offset: u64,
     pub copy_index: usize,
     /// A replica identity, or the first data-column identity when raidz is set.
@@ -446,6 +447,10 @@ impl Leaf {
         config: &VdevConfig,
         bp: &BlockPointer,
     ) -> Result<(Vec<u8>, u64, usize)> {
+        if bp.gang() {
+            let block = Pool::from(self.clone()).read_gang_block(cx, config, bp)?;
+            return Ok((block.bytes, block.physical_offset, block.copy_index));
+        }
         let dvas = self.block_dvas(config, bp)?;
         let mut failures = Vec::new();
         for (index, dva) in dvas.iter().enumerate() {

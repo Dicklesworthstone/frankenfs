@@ -3,6 +3,8 @@ use crate::reader::{ByteOffset, Storage};
 use ffs_block::ByteDevice;
 use std::sync::{Arc, Mutex};
 
+mod ea;
+
 const BASE: usize = 1024;
 const LENGTH: usize = 1024 * 512;
 const SEQUENCE: u16 = 7;

@@ -11,6 +11,8 @@ use crate::reader::tests::mirror::{
 };
 use std::collections::BTreeMap;
 
+mod gang;
+
 pub(in crate::reader) const ROOT: u64 = DATA_OFFSET + 0x28_0000;
 
 pub(in crate::reader) struct StripedImage {
@@ -23,6 +25,9 @@ pub(in crate::reader) struct StripedImage {
     parity: usize,
     maps: BTreeMap<u64, NativeMap>,
     reads: Vec<Reads>,
+    gang_next: Option<u64>,
+    gang_children: BTreeMap<u64, Vec<u64>>,
+    gang_rewrites: BTreeMap<u64, [u64; 10]>,
 }
 
 impl StripedImage {
@@ -84,6 +89,9 @@ impl StripedImage {
             parity,
             maps: BTreeMap::new(),
             reads: (0..width).map(|_| Arc::default()).collect(),
+            gang_next: None,
+            gang_children: BTreeMap::new(),
+            gang_rewrites: BTreeMap::new(),
         }
     }
 
@@ -229,6 +237,17 @@ impl StripedImage {
         let addresses = pointer.regular_dvas().unwrap();
         assert_eq!(addresses.len(), 1);
         let old = DATA_OFFSET + addresses[0].offset;
+        if let Some(words) = self.gang_rewrites.get(&old) {
+            for (index, value) in words.iter().copied().enumerate() {
+                let at = if index < 6 {
+                    index * 8
+                } else {
+                    96 + (index - 6) * 8
+                };
+                raw[at..at + 8].copy_from_slice(&order.encode(value));
+            }
+            return;
+        }
         let at = BASE + old as usize;
         let original = &source[at..at + pointer.physical_bytes()];
         assert_eq!(pointer.decode(original).unwrap(), original);
@@ -241,6 +260,10 @@ impl StripedImage {
             pointer.payload_order(),
             depth,
         );
+        if self.gang_next.is_some() && bytes.len() > 512 {
+            self.fragment_pointer(old, raw, order, &bytes, 2);
+            return;
+        }
         // Fourfold spacing also covers triple parity's maximum expansion.
         let offset = addresses[0].offset * 4;
         let map = self.store(old, offset, &bytes);

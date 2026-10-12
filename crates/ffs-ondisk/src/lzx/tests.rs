@@ -325,6 +325,13 @@ fn malformed_trees_runs_blocks_and_chunk_bounds_never_publish_partial_output() {
 fn independent_libfwnt_verbatim_and_aligned_vectors_match_complete_native_outputs() {
     use sha2::{Digest, Sha256};
 
+    let digest_hex = |bytes: &[u8]| {
+        Sha256::digest(bytes)
+            .iter()
+            .map(|byte| format!("{byte:02x}"))
+            .collect::<String>()
+    };
+
     // Exact upstream inputs and expected output digests, with source and
     // license retained beside the fixtures. No candidate encoder is involved.
     let cases: [(&[u8], usize, &str, &str); 2] = [
@@ -342,10 +349,10 @@ fn independent_libfwnt_verbatim_and_aligned_vectors_match_complete_native_output
         ),
     ];
     for (input, expected_size, input_digest, output_digest) in cases {
-        assert_eq!(format!("{:x}", Sha256::digest(input)), input_digest);
+        assert_eq!(digest_hex(input), input_digest);
         let output = decompress_chunk(input, expected_size).unwrap();
         assert_eq!(output.len(), expected_size);
-        assert_eq!(format!("{:x}", Sha256::digest(&output)), output_digest);
+        assert_eq!(digest_hex(&output), output_digest);
         assert!(decompress_chunk(input, expected_size - 1).is_err());
         for end in [0, 1, input.len() / 2, input.len() - 1] {
             assert!(

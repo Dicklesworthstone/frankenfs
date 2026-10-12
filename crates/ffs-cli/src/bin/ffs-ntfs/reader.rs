@@ -2,6 +2,7 @@
 
 mod attributes;
 mod compression;
+pub mod ea;
 pub mod filesystem;
 mod namespace;
 pub mod security;
