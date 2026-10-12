@@ -296,3 +296,98 @@ fn symlink_type_and_length_cannot_be_changed_by_an_optional_attribute() {
             .is_err()
     );
 }
+
+fn xdr_xattrs(fields: &[(&str, &[u8])]) -> Vec<u8> {
+    let mut out = vec![1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1];
+    for (name, value) in fields {
+        let mut pair = vec![0; 8];
+        pair.extend_from_slice(&(name.len() as u32).to_be_bytes());
+        pair.extend_from_slice(name.as_bytes());
+        pair.resize(pair.len().next_multiple_of(4), 0);
+        pair.extend_from_slice(&10_u32.to_be_bytes());
+        pair.extend_from_slice(&(value.len() as u32).to_be_bytes());
+        pair.extend_from_slice(value);
+        pair.resize(pair.len().next_multiple_of(4), 0);
+        let encoded = pair.len() as u32;
+        pair[..4].copy_from_slice(&encoded.to_be_bytes());
+        let decoded = (16 + name.len() + 1).next_multiple_of(8)
+            + value.len().next_multiple_of(8);
+        pair[4..8].copy_from_slice(&(decoded as u32).to_be_bytes());
+        out.extend_from_slice(&pair);
+    }
+    out.extend_from_slice(&[0; 8]);
+    out
+}
+
+#[test]
+fn xattr_sources_decode_legacy_pointer_and_dynamic_sa_bytes_in_both_orders() {
+    for order in [Endian::Little, Endian::Big] {
+        let mut raw = legacy(order, 0o100_640, 17);
+        assert_eq!(XattrSources::legacy(&raw, order).unwrap().directory, 0);
+        raw[104..112].copy_from_slice(&order.encode(901));
+        let source = XattrSources::legacy(&raw, order).unwrap();
+        assert_eq!(source.directory, 901);
+        assert!(source.inline.is_empty());
+        raw[104..112].copy_from_slice(&order.encode(1 << 48));
+        assert!(XattrSources::legacy(&raw, order).is_err());
+        assert!(XattrSources::legacy(&raw[..263], order).is_err());
+
+        let bonus_attrs = attributes(order, 0o100_640, 17);
+        let other_order = if order == Endian::Little { Endian::Big } else { Endian::Little };
+        let spill_attrs = vec![
+            (423, xdr_xattrs(&[("user.bin", &[0, 255, 65]), ("empty", &[])])),
+            (9, other_order.encode(901).to_vec()),
+        ];
+        let registry = SaRegistry::from_zaps(
+            &[registration("ZPL_DXATTR", 423, 0, 3)],
+            &[layout(2, &bonus_attrs), layout(3, &spill_attrs)],
+        ).unwrap();
+        let bonus = packed(2, &bonus_attrs, &[], order);
+        assert_eq!(registry.decode(&bonus, None).unwrap().xattrs().unwrap().directory, 0);
+        let spill = packed(3, &spill_attrs, &[423], other_order);
+        let decoded = registry.decode(&bonus, Some(&spill)).unwrap();
+        assert_eq!(decoded.metadata().unwrap().size, 17);
+        let source = decoded.xattrs().unwrap();
+        assert_eq!(source.directory, 901);
+        assert_eq!(source.inline["user.bin"], [0, 255, 65]);
+        assert!(source.inline["empty"].is_empty());
+    }
+}
+
+#[test]
+fn dxattr_values_reject_wrong_native_types_duplicates_tails_and_bounds() {
+    let good = xdr_xattrs(&[("user.bin", &[0, 255, 65])]);
+    let mut wrong_kind = good.clone();
+    wrong_kind[32..36].copy_from_slice(&23_u32.to_be_bytes()); // UINT8_ARRAY is not BYTE_ARRAY.
+    let mut trailing = good.clone();
+    trailing.extend_from_slice(&[0; 8]);
+    let mut corrupt_pad = good.clone();
+    corrupt_pad[43] = 1;
+    for bytes in [
+        wrong_kind,
+        trailing,
+        corrupt_pad,
+        good[..good.len() - 1].to_vec(),
+        xdr_xattrs(&[("same", &[]), ("same", &[])]),
+        xdr_xattrs(&[(&"x".repeat(256), &[])]),
+    ] {
+        let attrs = vec![(61, bytes)];
+        let registry = SaRegistry::from_zaps(
+            &[registration("ZPL_DXATTR", 61, 0, 3)],
+            &[layout(2, &attrs)],
+        ).unwrap();
+        assert!(registry.decode(&packed(2, &attrs, &[61], Endian::Little), None)
+            .unwrap().xattrs().is_err());
+    }
+    let attrs = vec![(61, good)];
+    let registry = SaRegistry::from_zaps(
+        &[registration("ZPL_DXATTR", 61, 0, 4)],
+        &[layout(2, &attrs)],
+    ).unwrap();
+    assert!(registry.decode(&packed(2, &attrs, &[61], Endian::Little), None)
+        .unwrap().xattrs().is_err());
+    let attrs = vec![(9, (1_u64 << 48).to_le_bytes().to_vec())];
+    let registry = SaRegistry::from_zaps(&[], &[layout(2, &attrs)]).unwrap();
+    assert!(registry.decode(&packed(2, &attrs, &[], Endian::Little), None)
+        .unwrap().xattrs().is_err());
+}

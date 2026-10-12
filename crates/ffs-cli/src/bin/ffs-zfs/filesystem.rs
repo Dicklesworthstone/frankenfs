@@ -347,17 +347,17 @@ impl FsOps for ZfsFs {
     }
 
     fn listxattr(&self, cx: &Cx, ino: InodeNumber) -> Result<Vec<String>> {
-        self.state(cx)?.metadata(cx, ino)?;
-        Err(unsupported(
-            "ZPL mount xattrs and native ACL projection are not implemented",
-        ))
+        let mut state = self.state(cx)?;
+        state.metadata(cx, ino)?;
+        let object = state.nodes[&ino].object;
+        state.view.listxattr(cx, object)
     }
 
-    fn getxattr(&self, cx: &Cx, ino: InodeNumber, _name: &str) -> Result<Option<Vec<u8>>> {
-        self.state(cx)?.metadata(cx, ino)?;
-        Err(unsupported(
-            "ZPL mount xattrs and native ACL projection are not implemented",
-        ))
+    fn getxattr(&self, cx: &Cx, ino: InodeNumber, name: &str) -> Result<Option<Vec<u8>>> {
+        let mut state = self.state(cx)?;
+        state.metadata(cx, ino)?;
+        let object = state.nodes[&ino].object;
+        state.view.getxattr(cx, object, name)
     }
 
     fn fsync(

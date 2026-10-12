@@ -73,12 +73,26 @@ pub enum FileCommand {
         #[command(flatten)]
         file: FileArgs,
     },
+    /// List native user xattrs from SA and directory storage as JSON names.
+    Listxattr {
+        #[command(flatten)]
+        file: FileArgs,
+    },
+    /// Output one complete user xattr as binary bytes, without a trailing newline.
+    Getxattr {
+        #[command(flatten)]
+        file: FileArgs,
+        /// Host user name, for example user.comment.
+        name: String,
+    },
 }
 enum Output {
     List,
     Stat,
     Read(u64, Option<u64>),
     Link,
+    Names,
+    Value(String),
 }
 
 fn metadata_json(number: u64, metadata: &Metadata) -> serde_json::Value {
@@ -179,6 +193,8 @@ impl FileCommand {
             Self::Stat { file } => (file, Output::Stat),
             Self::Read { file, start, bytes } => (file, Output::Read(start, bytes)),
             Self::Readlink { file } => (file, Output::Link),
+            Self::Listxattr { file } => (file, Output::Names),
+            Self::Getxattr { file, name } => (file, Output::Value(name)),
         };
         let components = dataset_components(&file.dataset)?;
         let c = file.candidate;
@@ -215,6 +231,23 @@ impl FileCommand {
             }
             Output::Link => {
                 let bytes = view.readlink(cx, object)?;
+                let mut out = io::stdout().lock();
+                out.write_all(&bytes)?;
+                out.flush()?;
+            }
+            Output::Names => {
+                let names = view.listxattr(cx, object)?;
+                json(&serde_json::json!({
+                    "dataset_guid": view.dataset_guid.to_string(), "txg": txg,
+                    "view_txg": view.view_txg(), "snapshot": snapshot_name,
+                    "snapshot_name_bytes": snapshot_bytes, "object": object,
+                    "names": names, "scope": "native user xattrs; no ACL or security projection"
+                }))?;
+            }
+            Output::Value(name) => {
+                let Some(bytes) = view.getxattr(cx, object, &name)? else {
+                    bail!("user xattr is absent: {name}");
+                };
                 let mut out = io::stdout().lock();
                 out.write_all(&bytes)?;
                 out.flush()?;
@@ -402,6 +435,35 @@ mod tests {
             "a\0b",
         ] {
             assert!(dataset_components(name).is_err(), "{name:?}");
+        }
+    }
+
+    #[test]
+    fn xattr_commands_retain_explicit_candidate_members_and_snapshot_view() {
+        let options = [
+            "--offline-image", "--pool-guid", "123", "--label", "0", "--slot", "2",
+            "--dataset", "data", "--snapshot", "before", "--member", "second.img",
+        ];
+        for (command, names) in [("listxattr", Vec::new()), ("getxattr", vec!["user.comment"])] {
+            let parsed = Cli::try_parse_from(
+                ["ffs-zfs", command, "leaf.img", "/file"].into_iter()
+                    .chain(names).chain(options),
+            ).unwrap();
+            let file = match parsed.command {
+                Command::File(FileCommand::Listxattr { file }) => file,
+                Command::File(FileCommand::Getxattr { file, name }) => {
+                    assert_eq!(name, "user.comment");
+                    file
+                }
+                _ => panic!("xattr command"),
+            };
+            assert_eq!((file.candidate.label, file.candidate.slot, file.candidate.pool_guid), (0, 2, 123));
+            assert!(file.candidate.image.offline_image);
+            assert_eq!(file.candidate.members, [PathBuf::from("second.img")]);
+            assert_eq!(file.dataset, "data");
+            assert_eq!(file.snapshot, Some(OsString::from("before")));
+            assert_eq!(file.path, PathBuf::from("/file"));
+            assert!(Cli::try_parse_from(["ffs-zfs", command, "leaf.img", "/file"]).is_err());
         }
     }
 

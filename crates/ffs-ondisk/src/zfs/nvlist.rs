@@ -1,4 +1,4 @@
-//! Bounded XDR nvlist decoding for native vdev label configurations.
+//! Bounded XDR nvlist decoding for native vdev labels and SA xattrs.
 //! OpenZFS module/nvpair/nvpair.c defines the wire representation. Encoded and
 //! decoded sizes are not trusted allocation requests. Unknown scalar/array
 //! types remain opaque; a consumer must require the type of every used field.
@@ -8,12 +8,14 @@ use std::collections::BTreeMap;
 
 const MAX_ITEMS: usize = 8192;
 const MAX_DEPTH: usize = 16;
+const MAX_BYTE_ARRAY: usize = 65_536;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
     Boolean(bool),
     Unsigned(u64),
     String(String),
+    Bytes(Vec<u8>),
     List(NvList),
     Lists(Vec<NvList>),
     UnsignedArray(Vec<u64>),
@@ -29,7 +31,21 @@ pub struct NvList {
 }
 
 impl NvList {
+    /// Label allocations may contain padding after the packed nvlist.
     pub fn parse(input: &[u8]) -> Result<Self, ParseError> {
+        Self::parse_prefix(input).map(|(list, _)| list)
+    }
+
+    /// SA values contain exactly one packed nvlist, without label padding.
+    pub fn parse_exact(input: &[u8]) -> Result<Self, ParseError> {
+        let (list, consumed) = Self::parse_prefix(input)?;
+        if consumed != input.len() {
+            return Err(invalid("bytes after packed nvlist terminator"));
+        }
+        Ok(list)
+    }
+
+    fn parse_prefix(input: &[u8]) -> Result<(Self, usize), ParseError> {
         if input.len() > LABEL_CONFIG_BYTES
             || input.len() < 20
             || input[0] != 1
@@ -43,8 +59,8 @@ impl NvList {
             at: 0,
         };
         let mut budget = MAX_ITEMS;
-        // Bytes following the outer terminator are label allocation padding.
-        cursor.list(0, &mut budget)
+        let list = cursor.list(0, &mut budget)?;
+        Ok((list, cursor.at + 4))
     }
     #[must_use]
     pub fn unsigned(&self, name: &str) -> Option<u64> {
@@ -144,7 +160,8 @@ impl<'a> Cursor<'a> {
             }
             let kind = pair.word()?;
             let elements = pair.word()?;
-            if elements as usize > MAX_ITEMS {
+            let limit = if kind == 10 { MAX_BYTE_ARRAY } else { MAX_ITEMS };
+            if elements as usize > limit {
                 return Err(invalid("nvpair element budget exceeded"));
             }
             let value = match (kind, elements) {
@@ -159,6 +176,16 @@ impl<'a> Cursor<'a> {
                 (6, 1) => Value::Unsigned(u64::from(pair.word()?)),
                 (8, 1) => Value::Unsigned(pair.wide()?),
                 (9, 1) => Value::String(pair.string()?),
+                (10, count) => {
+                    // DATA_TYPE_BYTE_ARRAY uses xdr_opaque: unlike numeric
+                    // arrays, it has no repeated count before the bytes.
+                    let count = count as usize;
+                    let bytes = pair.take(count)?.to_vec();
+                    if pair.take((4 - count % 4) % 4)?.iter().any(|byte| *byte != 0) {
+                        return Err(invalid("nonzero XDR byte-array padding"));
+                    }
+                    Value::Bytes(bytes)
+                }
                 (19, 1) => Value::List(pair.list(depth + 1, budget)?),
                 (20, count) => {
                     if count as usize > *budget {
@@ -298,5 +325,50 @@ mod tests {
             .is_err()
         );
         assert!(NvList::parse(&packed(&[pair("flag", 21, 1, &2_u32.to_be_bytes())])).is_err());
+    }
+
+    #[test]
+    fn native_byte_array_golden_is_opaque_and_preserves_binary_bytes() {
+        // OpenZFS nvs_xdr_nvp_op: eight name bytes, type 10, three opaque
+        // bytes and one pad byte. The native decoded nvpair occupies 40 bytes.
+        let raw = [
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 32, 0, 0, 0, 40,
+            0, 0, 0, 8, b'u', b's', b'e', b'r', b'.', b'b', b'i', b'n',
+            0, 0, 0, 10, 0, 0, 0, 3, 0, 255, 65, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        assert_eq!(
+            NvList::parse_exact(&raw).unwrap().fields["user.bin"],
+            Value::Bytes(vec![0, 255, 65])
+        );
+        for end in 0..raw.len() {
+            assert!(NvList::parse_exact(&raw[..end]).is_err(), "{end}");
+        }
+        let mut bad = raw;
+        bad[43] = 1;
+        assert!(NvList::parse_exact(&bad).is_err());
+        let mut bad = raw;
+        bad[39] = 8;
+        assert!(NvList::parse_exact(&bad).is_err());
+    }
+
+    #[test]
+    fn byte_array_budget_is_bytes_and_exact_values_reject_tails() {
+        for size in [0, 8193, MAX_BYTE_ARRAY] {
+            let mut bytes = vec![0x9b; size];
+            bytes.resize(size.next_multiple_of(4), 0);
+            let raw = packed(&[pair("user.value", 10, size as u32, &bytes)]);
+            let decoded = NvList::parse_exact(&raw).unwrap();
+            assert_eq!(decoded.fields["user.value"], Value::Bytes(vec![0x9b; size]));
+            let mut padded = raw;
+            padded.extend_from_slice(&[0; 8]);
+            assert_eq!(NvList::parse(&padded).unwrap(), decoded);
+            assert!(NvList::parse_exact(&padded).is_err());
+        }
+        let oversized = vec![0; (MAX_BYTE_ARRAY + 1).next_multiple_of(4)];
+        assert!(NvList::parse_exact(&packed(&[pair(
+            "user.large", 10, (MAX_BYTE_ARRAY + 1) as u32, &oversized
+        )])).is_err());
+        assert!(NvList::parse_exact(&packed(&[pair("numeric", 14, 8193, &[])]))
+            .is_err());
     }
 }

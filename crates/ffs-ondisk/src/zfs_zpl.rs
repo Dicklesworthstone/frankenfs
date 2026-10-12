@@ -8,12 +8,16 @@
 //! This parser neither authenticates storage nor implements ACL enforcement.
 
 use crate::zfs::Endian;
+use crate::zfs::nvlist::{NvList, Value};
 use crate::zfs_zap::Entry;
 use ffs_types::ParseError;
 use std::collections::{BTreeMap, BTreeSet};
 
 pub const LEGACY_BYTES: usize = 264;
 pub const SA_BYTES: usize = 128 * 1024;
+pub const XATTR_BYTES: usize = 65_536;
+pub const XATTR_NAME_BYTES: usize = 255;
+pub const XATTR_COUNT: usize = 4096;
 const MAX_ATTRIBUTES: usize = 4096;
 const MAX_LAYOUT_ITEMS: usize = 65_536;
 const OBJECT_LIMIT: u64 = 1 << 48;
@@ -161,6 +165,34 @@ impl Metadata {
                 timestamp(&raw[48..64], order)?,
             ],
             inline_symlink,
+        }
+        .validate()
+    }
+}
+
+/// Native storage references, before any host namespace projection. A zero
+/// directory means absent; inline names and values come from ZPL_DXATTR's XDR
+/// nvlist. Decoding these is independent of ordinary stat/file data access.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XattrSources {
+    pub directory: u64,
+    pub inline: BTreeMap<String, Vec<u8>>,
+}
+impl XattrSources {
+    fn validate(self) -> Result<Self, ParseError> {
+        if self.directory >= OBJECT_LIMIT {
+            return Err(invalid("xattr directory reference exceeds the object namespace"));
+        }
+        Ok(self)
+    }
+
+    pub fn legacy(raw: &[u8], order: Endian) -> Result<Self, ParseError> {
+        if !(LEGACY_BYTES..=16_384).contains(&raw.len()) {
+            return Err(invalid("truncated or oversized legacy xattr owner"));
+        }
+        Self {
+            directory: order.u64(raw, 104)?,
+            inline: BTreeMap::new(),
         }
         .validate()
     }
@@ -405,6 +437,37 @@ impl Attributes {
         let attr = self.required(name, 16)?;
         timestamp(&attr.bytes, attr.order)
     }
+    pub fn xattrs(&self) -> Result<XattrSources, ParseError> {
+        let directory = if self.values.contains_key(b"ZPL_XATTR".as_slice()) {
+            self.integer("ZPL_XATTR")?
+        } else {
+            0
+        };
+        let mut inline = BTreeMap::new();
+        if let Some(attr) = self.values.get(b"ZPL_DXATTR".as_slice()) {
+            if attr.swap != 3 {
+                return Err(invalid("inline xattr system attribute is not bytes"));
+            }
+            let packed = NvList::parse_exact(&attr.bytes)?;
+            if packed.fields.len() > XATTR_COUNT {
+                return Err(invalid("inline xattr count exceeds the read profile"));
+            }
+            for (name, value) in packed.fields {
+                if name.len() > XATTR_NAME_BYTES {
+                    return Err(invalid("inline xattr name exceeds the native limit"));
+                }
+                let Value::Bytes(bytes) = value else {
+                    return Err(invalid("inline xattr nvpair is not a byte array"));
+                };
+                if bytes.len() > XATTR_BYTES {
+                    return Err(invalid("inline xattr value exceeds the read profile"));
+                }
+                inline.insert(name, bytes);
+            }
+        }
+        XattrSources { directory, inline }.validate()
+    }
+
     pub fn metadata(&self) -> Result<Metadata, ParseError> {
         let inline_symlink = self
             .values
