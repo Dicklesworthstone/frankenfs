@@ -1,16 +1,19 @@
-//! Ordinary, unexpanded RAIDZ1 column mapping and in-memory reconstruction.
+//! Ordinary, unexpanded RAIDZ column mapping and in-memory reconstruction.
 //!
 //! Contract: OpenZFS zfs-2.3.0 vdev_raidz.c and zio.c. Round PSIZE to ashift,
 //! concatenate variable-width data columns, XOR P with zero tails for short
 //! columns, include allocation-only skip sectors, and preserve the historical
-//! offset-bit-20 parity/address swap. No writes, topology discovery or checksum
+//! offset-bit-20 parity/address swap for RAIDZ1. The parity module implements
+//! RAIDZ2/3 P/Q/R reconstruction. No writes, topology discovery or checksum
 //! authority live here; the caller must verify the assembled original PSIZE.
+
+pub mod parity;
 
 use super::{MAX_BLOCK_BYTES, invalid};
 use ffs_types::ParseError;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Raidz1Column {
+pub struct RaidzColumn {
     /// Native child ID, independent of the caller's image ordering.
     pub child_id: usize,
     /// Child-relative allocation offset, before the leaf's label/boot prefix.
@@ -29,7 +32,7 @@ pub struct Raidz1Map {
     physical_bytes: usize,
     aligned_bytes: usize,
     allocated_bytes: u64,
-    columns: Vec<Raidz1Column>,
+    columns: Vec<RaidzColumn>,
 }
 
 impl Raidz1Map {
@@ -101,7 +104,7 @@ impl Raidz1Map {
             } else {
                 None
             };
-            columns.push(Raidz1Column {
+            columns.push(RaidzColumn {
                 child_id: position % width,
                 offset,
                 bytes,
@@ -128,7 +131,7 @@ impl Raidz1Map {
     }
 
     #[must_use]
-    pub fn columns(&self) -> &[Raidz1Column] {
+    pub fn columns(&self) -> &[RaidzColumn] {
         &self.columns
     }
 
