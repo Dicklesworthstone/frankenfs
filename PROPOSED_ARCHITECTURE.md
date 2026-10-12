@@ -54,6 +54,19 @@
 > native storage and restart/default activation remain separate unmet parts of
 > the original lifecycle target.
 
+> **Explicit symbol regeneration (`bd-11a8t`):** both format rebuild paths
+> preflight the complete allocation plan, then freshly scan each group's full
+> source range before encoding. Incomplete scans, I/O failures and detected
+> corruption refuse that group's rebuild. Publication reads the existing
+> descriptor high-water mark, including interrupted generations, and advances
+> it with checked arithmetic. Only two empty descriptor slots permit bootstrap;
+> ambiguous, unreadable or incompatible descriptors remain errors. Recovery
+> still rejects pending generations. This source check covers the existing
+> validators' detectable corruption; it does not establish native write
+> freshness or authentication of every source byte. File-backed interruption and
+> real ext4 corruption/rebuild controls passed; execution provenance and the
+> remaining validation requirements are recorded in `FEATURE_PARITY.md`.
+
 ---
 
 ## 1. Crate Map

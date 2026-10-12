@@ -14729,6 +14729,8 @@ mod tests {
 
     #[test]
     fn repair_rebuild_ext4_refuses_corruption_then_advances_pending_generation_bd_11a8t() {
+        use ffs_block::{BlockDevice, ByteBlockDevice, FileByteDevice};
+
         let dir = tempfile::tempdir().unwrap();
         let fixture = protected_ext4_image_bd_jufod(&dir, 0);
         let _kept = dir.keep();

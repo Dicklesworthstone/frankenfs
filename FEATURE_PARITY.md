@@ -147,18 +147,38 @@
 > Shutdown cancels both workers, drains their physical I/O completion receipts,
 > preserves worker errors, and retains exclusive image ownership for background
 > repair even with read-only client access. At frozen source
-> `9c05cc63f1648ab348669561b9dd2da84924b83f`, RCH job `30059820987973701`
+> `bc4da5d98a4a3686f2c7fce241ec2ff3f622b525`, RCH job `30059820987973758`
 > passed 27 selected unit/real-image controls, including four new controls for
 > parent cancellation, queued cancellation, late I/O errors, and panic/Drop
-> cleanup. The real-FUSE periodic-commit SIGKILL positive/disabled-negative test
-> also passed. The new normal-unmount test failed: this worker's AppArmor policy
-> denied `fusermount3` on RCH's `/data/tmp` fixture location. It remains unverified
-> until the unchanged test runs with `TMPDIR=/tmp`, an allowed mount location.
-> The execution log is `ffs-chartreusestone-resume26-worker-tests6.log`.
-> Workspace check/Clippy are also pending: the next RCH check was refused before
-> compilation because of critical worker memory pressure. These results do not
+> cleanup. Both real-FUSE tests passed: ordinary unmount drains active workers
+> within the existing deadline and preserves clean fsck/readback, while periodic
+> commit survives SIGKILL with its disabled negative control. FUSE and filesystem
+> oracles were mandatory; no selected test failed or was ignored. The earlier
+> job `30059820987973701` failed normal unmount because AppArmor denied the
+> `/data/tmp` fixture location; the unchanged test passed with `TMPDIR=/tmp`.
+> The passing execution log is `ffs-chartreusestone-resume27-worker-tests.log`.
+> Workspace check/Clippy remain pending. These results do not
 > complete native storage, default activation, restart freshness, or the wider
 > core/FUSE worker migration on the original bead.
+
+> **Explicit regeneration (`bd-11a8t`, verified controls 2026-10-12):** the CLI
+> ext4 and Btrfs rebuild paths now use the existing descriptor high-water reader
+> to resume interrupted symbol publication. They freshly scan each source range
+> and refuse incomplete coverage or detected corruption before encoding. New
+> controls cover durable pending generations, corrupt/ambiguous descriptors,
+> generation exhaustion, incompatible geometry, I/O/cancellation errors, and a
+> real checksummed ext4 directory corruption followed by regeneration. RCH job
+> `30059820987973769` passed all five new controls, two existing repair regressions,
+> the 27 lifecycle/image controls and both real-FUSE tests: 34 + 2 passed, none
+> failed or ignored. The source was `5dfc2040c` plus the test-local block-device
+> imports, frozen by overlay fingerprint
+> `d14d9f3cf0dd03645709b05d9d238ae67ab3dd0d09a3c7c26f189147d9ac5b76`;
+> the log is `ffs-chartreusestone-resume27-rebuild-tests2.log`. The initial
+> unmodified source failed compilation on those missing test imports and ran no
+> tests. The regeneration controls use real files, a planted interrupted write,
+> and a checksummed ext4 image; they do not prove mounted native repair or full
+> source authentication. Workspace check/Clippy and the original native
+> storage/default activation/restart requirements remain open.
 >
 > **Compatibility repair (`bd-7zjfh`, verified 2026-10-11):** FFSRQSC2 sidecars
 > are the compatibility-mode repair substrate, exposed through the explicit
