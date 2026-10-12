@@ -1162,3 +1162,37 @@ formatting reports pre-existing differences in unchanged files, and the installe
 UBS launcher is not executable. Native Windows WOF images and mounted workloads
 have not been validated. See `docs/NTFS_READ_PROFILE.md` for precise admission,
 commands, native sources and evidence limits.
+
+### ZFS complete ordinary RAIDZ1 reads and reconstruction
+
+One complete ordinary RAIDZ1 group of two through eight explicitly supplied
+file/disk leaves now reaches the existing Pool, MOS/DMU, datasets, ZPL, snapshots
+and read-only FsOps pipeline. Every member's native GUID, complete label tree
+and selected root candidate must agree before native child IDs are bound to
+supplied images. Repeated `--member` accepts the complete set, with existing
+`--mirror-member` and new `--raidz-member` aliases. The root diagnostic reports
+actual data/parity/skip columns and reconstruction identity.
+
+The native mapper implements ashift rounding, short and long columns, parity
+address swapping and allocation-only skip sectors. All declared DVAs and every
+member allocation extent are checked before payload I/O. Reads try intact data
+without parity, then reconstruct one unavailable data column or try bounded
+single-column hypotheses after checksum failure. The original PSIZE is checked
+before the existing codec path supplies logical bytes. Cancellation stops
+immediately; unverified or failed blocks cannot enter the shared checked cache.
+Missing members, additional parity levels, dRAID, expanded/nested/replacing
+layouts and write/healing/import protocols remain outside admission.
+
+The complete on-disk suite passed 850 tests, including six new RAIDZ tests and
+twenty mapping cases captured by compiling and executing the verbatim OpenZFS
+zfs-2.3.0 mapping function in an isolated C harness. This is native-function
+capture, not native pool or mount validation. The final on-disk all-targets
+Clippy run passed with warnings denied. Twelve constructed engine regressions
+cover admission, recovery, complete legacy/SA/spill and embedded file graphs,
+historical snapshots, cancellation and cache failures; CLI coverage preserves
+the existing member-limit/mount guards and tests all alias spellings together.
+The changed Rust files passed parsing/formatting checks and independent reviews.
+The new CLI/engine regressions remain unexecuted: a further CLI compile retry
+again received SIGKILL while building `asupersync`. Workspace formatting reports
+13 unchanged files, and UBS could not execute its launcher. Native OpenZFS pool
+and kernel FUSE execution remain unverified. See `docs/ZFS_READ_PROFILE.md`.

@@ -490,3 +490,4 @@ fn embedded_read_feature_requires_native_boolean_and_all_label_agreement() {
 }
 
 pub(in crate::reader) mod mirror;
+pub(in crate::reader) mod raidz;

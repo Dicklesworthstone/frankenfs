@@ -1,12 +1,15 @@
-//! Explicit immutable member sets for one ordinary leaf or one native mirror.
+//! Explicit immutable member sets for a leaf, ordinary mirror or RAIDZ1 group.
 //!
-//! Mirrors use the same data offset on every physical child. Checksums decide
-//! whether a copy is usable; successful physical I/O alone never does. This is
-//! read-only extraction, without degraded import, DTL recovery or healing.
+//! Native child IDs come from verified labels, never argument positions.
+//! Checksums decide whether replica or reconstructed bytes are usable.
+//! This is read-only extraction, without degraded import, DTL recovery or healing.
+
+mod raidz;
 
 use super::{
-    BlockPointer, Cx, DATA_OFFSET, FfsError, Label, Leaf, NvList, Result, RootBlock, Uberblock,
-    Value, VdevConfig, admit_vdev_state, checkpoint, corrupt, integer, parse, unsupported,
+    BlockPointer, BlockRead, Cx, DATA_OFFSET, FfsError, Label, Leaf, NvList, RaidzMember, Result,
+    RootBlock, Uberblock, Value, VdevConfig, admit_vdev_state, checkpoint, corrupt, integer, parse,
+    unsupported,
 };
 use std::collections::BTreeSet;
 
@@ -26,32 +29,65 @@ impl From<Leaf> for Pool {
 }
 
 #[derive(Clone, PartialEq, Eq)]
-struct MirrorConfig {
+struct GroupConfig {
     vdev: VdevConfig,
     // Preserve the complete native top-level tree when checking agreement.
     // Native path strings are compared as metadata, never opened as host paths.
     tree: NvList,
     member_guids: Vec<u64>,
+    raidz1: bool,
+}
+
+impl GroupConfig {
+    fn mapped(self, supplied_guids: &[u64]) -> Result<VdevConfig> {
+        let mut config = self.vdev;
+        if self.raidz1 {
+            let mut members = Vec::with_capacity(self.member_guids.len());
+            for guid in self.member_guids {
+                let supplied_index = supplied_guids
+                    .iter()
+                    .position(|candidate| *candidate == guid)
+                    .ok_or_else(|| corrupt("configured RAIDZ1 child has no supplied member"))?;
+                members.push(RaidzMember {
+                    supplied_index,
+                    guid,
+                });
+            }
+            config.raidz_members = Some(members);
+        }
+        Ok(config)
+    }
 }
 
 impl Label {
-    fn mirror_config(&self, pool_guid: u64) -> Result<(MirrorConfig, u64)> {
+    fn group_config(&self, pool_guid: u64) -> Result<(GroupConfig, u64)> {
         let vdev = self.vdev_config(pool_guid)?;
         let tree = self
             .config
             .list("vdev_tree")
-            .ok_or_else(|| corrupt("missing mirror vdev tree"))?;
-        if tree.text("type") != Some("mirror") {
-            return Err(unsupported(
-                "multiple supplied images require one ordinary top-level mirror",
-            ));
-        }
+            .ok_or_else(|| corrupt("missing redundant vdev tree"))?;
+        let raidz1 = match tree.text("type") {
+            Some("mirror") => false,
+            Some("raidz") => {
+                if integer(tree, "nparity")? != 1 {
+                    return Err(unsupported("only ordinary single-parity RAIDZ is admitted"));
+                }
+                true
+            }
+            _ => {
+                return Err(unsupported(
+                    "multiple supplied images require one ordinary mirror or RAIDZ1 group",
+                ));
+            }
+        };
         let Some(Value::Lists(children)) = tree.fields.get("children") else {
-            return Err(corrupt("mirror has no native nvlist-array children"));
+            return Err(corrupt(
+                "redundant vdev has no native nvlist-array children",
+            ));
         };
         if !(2..=MAX_MEMBERS).contains(&children.len()) {
             return Err(unsupported(
-                "mirror profile requires two through eight children",
+                "redundant read profile requires two through eight children",
             ));
         }
         let mut seen = BTreeSet::from([vdev.pool_guid, vdev.top_guid]);
@@ -61,30 +97,29 @@ impl Label {
                 || child.fields.contains_key("children")
             {
                 return Err(unsupported(
-                    "mirror children must be ordinary file or disk leaves",
+                    "redundant vdev children must be ordinary file or disk leaves",
                 ));
             }
             admit_vdev_state(child)?;
             if integer(child, "id")? != index as u64 {
-                return Err(corrupt(
-                    "mirror child IDs do not match the native child array",
-                ));
+                return Err(corrupt("child IDs do not match the native child array"));
             }
             let guid = integer(child, "guid")?;
             if guid == 0 || !seen.insert(guid) {
-                return Err(corrupt("duplicate or zero mirror member GUID"));
+                return Err(corrupt("duplicate or zero redundant member GUID"));
             }
             member_guids.push(guid);
         }
         let member_guid = integer(&self.config, "guid")?;
         if !member_guids.contains(&member_guid) {
-            return Err(corrupt("label GUID is not a child of its declared mirror"));
+            return Err(corrupt("label GUID is not a child of its declared group"));
         }
         Ok((
-            MirrorConfig {
+            GroupConfig {
                 vdev,
                 tree: tree.clone(),
                 member_guids,
+                raidz1,
             },
             member_guid,
         ))
@@ -102,12 +137,12 @@ fn same_candidate(left: &Uberblock, right: &Uberblock) -> bool {
 }
 
 impl Pool {
-    /// Host paths have already been explicitly opened by the caller. A single
-    /// image retains the standalone-leaf profile; two or more require a mirror.
+    /// Host paths have already been explicitly opened by the caller. Multiple
+    /// images must supply the complete native mirror or RAIDZ1 member set.
     pub fn from_leaves(members: Vec<Leaf>) -> Result<Self> {
         if !(1..=MAX_MEMBERS).contains(&members.len()) {
             return Err(unsupported(
-                "supply one leaf or two through eight mirror members",
+                "supply one leaf or two through eight redundant members",
             ));
         }
         Ok(Self { members })
@@ -132,10 +167,10 @@ impl Pool {
             return self.members[0].root(cx, label_index, slot, pool_guid);
         }
         let first_label = self.members[0].label(cx, label_index)?;
-        let (selected, _) = first_label.mirror_config(pool_guid)?;
+        let (selected, _) = first_label.group_config(pool_guid)?;
         if selected.member_guids.len() != self.members.len() {
             return Err(unsupported(
-                "every configured mirror member must be explicitly supplied",
+                "every configured redundant member must be explicitly supplied",
             ));
         }
         let expected_sum = selected.member_guids.iter().fold(
@@ -148,7 +183,7 @@ impl Pool {
             || candidate.guid_sum != expected_sum
         {
             return Err(corrupt(
-                "mirror candidate disagrees with the pool configuration or GUID sum",
+                "candidate disagrees with the pool configuration or GUID sum",
             ));
         }
         let mut seen = BTreeSet::new();
@@ -156,50 +191,51 @@ impl Pool {
         for member in &self.members {
             checkpoint(cx)?;
             let label = member.label(cx, label_index)?;
-            let (config, guid) = label.mirror_config(pool_guid)?;
+            let (config, guid) = label.group_config(pool_guid)?;
             if config != selected || !seen.insert(guid) {
                 return Err(corrupt(
-                    "supplied mirror members disagree or repeat a physical GUID",
+                    "supplied members disagree or repeat a physical GUID",
                 ));
             }
             for index in 0..4 {
-                let (other, other_guid) = member.label(cx, index)?.mirror_config(pool_guid)?;
+                let (other, other_guid) = member.label(cx, index)?.group_config(pool_guid)?;
                 if other != selected || other_guid != guid {
                     return Err(corrupt(
-                        "mirror member labels disagree on identity or configuration",
+                        "member labels disagree on identity or configuration",
                     ));
                 }
             }
             let other = member.uberblock(cx, &label, slot)?;
             if !same_candidate(&candidate, &other) {
                 return Err(corrupt(
-                    "mirror members disagree on the explicitly selected root candidate",
+                    "members disagree on the explicitly selected root candidate",
                 ));
             }
             member_guids.push(guid);
         }
-        // Each member was checked for membership and uniqueness, and the counts
-        // match the complete configuration. Argument position never supplies an ID.
-        let (data, physical_offset, copy_index, member_index) =
-            self.read_block(cx, &selected.vdev, &candidate.root)?;
-        if data.len() < 1024
+        // Membership, uniqueness and counts prove this is the complete group.
+        // Bind native child IDs only after every label/candidate has agreed.
+        let config = selected.mapped(&member_guids)?;
+        let block = self.read_block(cx, &config, &candidate.root)?;
+        if block.bytes.len() < 1024
             || candidate
                 .root
                 .payload_order()
-                .u64(&data, 704)
+                .u64(&block.bytes, 704)
                 .map_err(|error| parse(&error))?
                 != 1
         {
-            return Err(corrupt("selected mirror root is not a META object set"));
+            return Err(corrupt("selected group root is not a META object set"));
         }
         checkpoint(cx)?;
         Ok(RootBlock {
             uberblock: candidate,
-            data,
-            physical_offset,
-            copy_index,
-            member_guid: member_guids[member_index],
-            config: selected.vdev,
+            data: block.bytes,
+            physical_offset: block.physical_offset,
+            copy_index: block.copy_index,
+            member_guid: member_guids[block.member_index],
+            raidz: block.raidz,
+            config,
         })
     }
 
@@ -208,12 +244,21 @@ impl Pool {
         cx: &Cx,
         config: &VdevConfig,
         bp: &BlockPointer,
-    ) -> Result<(Vec<u8>, u64, usize, usize)> {
+    ) -> Result<BlockRead> {
         checkpoint(cx)?;
+        if let Some(members) = &config.raidz_members {
+            return self.read_raidz1_block(cx, config, bp, members);
+        }
         if self.members.len() == 1 {
-            return self.members[0]
-                .read_block(cx, config, bp)
-                .map(|(bytes, offset, copy)| (bytes, offset, copy, 0));
+            return self.members[0].read_block(cx, config, bp).map(
+                |(bytes, physical_offset, copy_index)| BlockRead {
+                    bytes,
+                    physical_offset,
+                    copy_index,
+                    member_index: 0,
+                    raidz: None,
+                },
+            );
         }
         // OpenZFS zfs-2.3.0 vdev_default_asize rounds physical bytes to the
         // top-level ashift. Mirror width does not multiply the DVA asize.
@@ -235,7 +280,13 @@ impl Pool {
                 match result {
                     Ok(bytes) => {
                         checkpoint(cx)?;
-                        return Ok((bytes, offset, copy_index, member_index));
+                        return Ok(BlockRead {
+                            bytes,
+                            physical_offset: offset,
+                            copy_index,
+                            member_index,
+                            raidz: None,
+                        });
                     }
                     Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
                     Err(error) => failures.push(format!(

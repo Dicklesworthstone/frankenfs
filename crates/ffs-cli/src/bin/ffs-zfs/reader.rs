@@ -1,4 +1,4 @@
-//! Offline ZFS label discovery and explicit leaf/mirror MOS-root extraction.
+//! Offline ZFS label discovery and explicit leaf/mirror/RAIDZ1 MOS-root extraction.
 //! No pool import, TXG selection, log replay, device writes or host path following.
 
 pub mod dmu;
@@ -95,6 +95,15 @@ struct VdevConfig {
     id: u32,
     allocated_bytes: u64,
     read_features: Vec<String>,
+    /// Native child-ID order, bound to supplied images after group admission.
+    /// Absent for standalone leaves and ordinary mirrors.
+    raidz_members: Option<Vec<RaidzMember>>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RaidzMember {
+    supplied_index: usize,
+    guid: u64,
 }
 
 fn admit_vdev_state(tree: &NvList) -> Result<()> {
@@ -126,12 +135,14 @@ fn admit_vdev_state(tree: &NvList) -> Result<()> {
         "indirect_object",
         "indirect_births",
         "prev_indirect_vdev",
+        "raidz_expanding",
+        "raidz_expand_txgs",
     ]
     .iter()
     .any(|name| tree.fields.contains_key(*name))
     {
         return Err(unsupported(
-            "special allocation and indirect vdev mappings are not admitted",
+            "special allocation, indirect and expanded RAIDZ mappings are not admitted",
         ));
     }
     Ok(())
@@ -206,6 +217,7 @@ impl Label {
             id,
             allocated_bytes: integer(tree, "asize")?,
             read_features,
+            raidz_members: None,
         })
     }
 
@@ -231,12 +243,44 @@ impl Label {
     }
 }
 
+/// A native column extent in the selected RAIDZ1 DVA. Skip-only columns
+/// have zero read bytes; parity may be mapped without needing physical I/O.
+#[derive(Debug)]
+pub struct RaidzColumnInfo {
+    pub child_id: usize,
+    pub member_guid: u64,
+    pub physical_offset: u64,
+    pub bytes: usize,
+    pub parity: bool,
+}
+
+#[derive(Debug)]
+pub struct RaidzReadInfo {
+    pub dva_offset: u64,
+    pub allocated_bytes: u64,
+    pub columns: Vec<RaidzColumnInfo>,
+    pub parity_read: bool,
+    /// Native child ID whose data was reconstructed, never an argument index.
+    pub reconstructed_child: Option<usize>,
+}
+
+struct BlockRead {
+    bytes: Vec<u8>,
+    physical_offset: u64,
+    copy_index: usize,
+    member_index: usize,
+    raidz: Option<RaidzReadInfo>,
+}
+
 pub struct RootBlock {
     pub uberblock: Uberblock,
     pub data: Vec<u8>,
+    /// A replica address, or the first data-column address when raidz is set.
     pub physical_offset: u64,
     pub copy_index: usize,
+    /// A replica identity, or the first data-column identity when raidz is set.
     pub member_guid: u64,
+    pub raidz: Option<RaidzReadInfo>,
     config: VdevConfig,
 }
 
@@ -384,6 +428,7 @@ impl Leaf {
             physical_offset,
             copy_index,
             member_guid: selected.top_guid,
+            raidz: None,
             config: selected,
         })
     }

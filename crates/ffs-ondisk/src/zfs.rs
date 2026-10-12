@@ -5,6 +5,7 @@
 //! Sources: OpenZFS spa.h, vdev_impl.h, uberblock_impl.h, zio_checksum.c.
 
 pub mod nvlist;
+pub mod raidz;
 
 use ffs_types::ParseError;
 use flate2::{Decompress, FlushDecompress, Status};

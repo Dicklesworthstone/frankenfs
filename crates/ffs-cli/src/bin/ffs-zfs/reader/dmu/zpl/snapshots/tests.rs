@@ -451,6 +451,7 @@ fn pool(leaf: &Leaf, meta: Dnode) -> Objects {
             id: 0,
             allocated_bytes: LENGTH as u64 - DATA_OFFSET - 2 * LABEL_BYTES,
             read_features: Vec::new(),
+            raidz_members: None,
         },
         txg: 100,
         root_birth: 90,
@@ -660,3 +661,5 @@ fn embedded_snapshot_contents_are_historical_and_never_read_physical_payloads() 
 mod mount;
 
 mod mirror;
+
+mod raidz;

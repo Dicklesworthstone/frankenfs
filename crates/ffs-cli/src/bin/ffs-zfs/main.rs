@@ -54,29 +54,33 @@ struct CandidateArgs {
     /// Expected pool GUID; this does not authorize automatic TXG selection.
     #[arg(long)]
     pool_guid: u64,
-    /// Additional immutable images of every other leaf in one native mirror.
+    /// Additional immutable images of every other leaf in one mirror or RAIDZ1 vdev.
     /// The same --offset and --length select the volume range in every image.
-    #[arg(long = "mirror-member", value_name = "IMAGE")]
-    mirror_members: Vec<PathBuf>,
+    #[arg(
+        long = "member",
+        visible_aliases = ["mirror-member", "raidz-member"],
+        value_name = "IMAGE"
+    )]
+    members: Vec<PathBuf>,
 }
 impl CandidateArgs {
     fn open(&self, cx: &Cx) -> Result<Pool> {
-        if self.mirror_members.len() > 7 {
-            bail!("at most seven additional mirror images are supported");
+        if self.members.len() > 7 {
+            bail!("at most seven additional member images are supported");
         }
-        let mut leaves = Vec::with_capacity(self.mirror_members.len() + 1);
+        let mut leaves = Vec::with_capacity(self.members.len() + 1);
         leaves.push(self.image.open(cx)?);
-        for path in &self.mirror_members {
+        for path in &self.members {
             leaves.push(
                 Leaf::open(cx, path, self.image.offset, self.image.length)
-                    .with_context(|| format!("opening ZFS mirror member {}", path.display()))?,
+                    .with_context(|| format!("opening ZFS member {}", path.display()))?,
             );
         }
         Pool::from_leaves(leaves).context("opening explicitly supplied ZFS members")
     }
 
     fn reject_hidden_images(&self, mountpoint: &Path) -> Result<()> {
-        for path in std::iter::once(&self.image.image).chain(&self.mirror_members) {
+        for path in std::iter::once(&self.image.image).chain(&self.members) {
             if path.canonicalize()?.starts_with(mountpoint) {
                 bail!("ZFS mountpoint would hide a backing image");
             }
@@ -189,14 +193,43 @@ fn main() -> Result<()> {
         Command::Root { candidate } => {
             let pool = candidate.open(&cx)?;
             let root = pool.root(&cx, candidate.label, candidate.slot, candidate.pool_guid)?;
-            eprintln!(
-                "checked candidate txg={} copy={} member_guid={} vdev_offset={} bytes={}; not a pool import",
-                root.uberblock.txg,
-                root.copy_index,
-                root.member_guid,
-                root.physical_offset,
-                root.data.len()
-            );
+            if let Some(stripe) = &root.raidz {
+                eprintln!(
+                    "checked candidate txg={} copy={} raidz1_dva_offset={} allocated_bytes={} bytes={} parity_read={} reconstructed_child={:?}; not a pool import",
+                    root.uberblock.txg,
+                    root.copy_index,
+                    stripe.dva_offset,
+                    stripe.allocated_bytes,
+                    root.data.len(),
+                    stripe.parity_read,
+                    stripe.reconstructed_child,
+                );
+                for column in &stripe.columns {
+                    eprintln!(
+                        "  child={} member_guid={} vdev_offset={} bytes={} role={}",
+                        column.child_id,
+                        column.member_guid,
+                        column.physical_offset,
+                        column.bytes,
+                        if column.bytes == 0 {
+                            "skip"
+                        } else if column.parity {
+                            "parity"
+                        } else {
+                            "data"
+                        },
+                    );
+                }
+            } else {
+                eprintln!(
+                    "checked candidate txg={} copy={} member_guid={} vdev_offset={} bytes={}; not a pool import",
+                    root.uberblock.txg,
+                    root.copy_index,
+                    root.member_guid,
+                    root.physical_offset,
+                    root.data.len()
+                );
+            }
             let mut out = io::stdout().lock();
             out.write_all(&root.data)?;
             out.flush()?;
@@ -300,7 +333,7 @@ mod tests {
             ),
             (1_048_576, Some(67_108_864), 2, 3, 123)
         );
-        assert!(candidate.mirror_members.is_empty());
+        assert!(candidate.members.is_empty());
     }
     #[test]
     fn object_commands_require_root_identity_and_explicit_range_length() {
@@ -354,7 +387,7 @@ mod tests {
     }
 
     #[test]
-    fn mirror_selection_reaches_every_raw_command_with_explicit_bounds() {
+    fn member_selection_reaches_every_raw_command_with_explicit_bounds() {
         let options = [
             "--offline-image",
             "--offset",
@@ -367,9 +400,9 @@ mod tests {
             "2",
             "--pool-guid",
             "123",
-            "--mirror-member",
+            "--member",
             "second.img",
-            "--mirror-member",
+            "--raidz-member",
             "third.img",
         ];
         for command in [
@@ -401,7 +434,7 @@ mod tests {
             );
             assert!(candidate.image.offline_image);
             assert_eq!(
-                candidate.mirror_members,
+                candidate.members,
                 [PathBuf::from("second.img"), PathBuf::from("third.img")]
             );
         }
@@ -435,6 +468,40 @@ mod tests {
     }
 
     #[test]
+    fn all_member_spellings_append_to_one_explicit_member_set() {
+        let cli = Cli::try_parse_from([
+            "ffs-zfs",
+            "root",
+            "first.img",
+            "--offline-image",
+            "--pool-guid",
+            "123",
+            "--label",
+            "0",
+            "--slot",
+            "2",
+            "--member",
+            "second.img",
+            "--mirror-member",
+            "third.img",
+            "--raidz-member",
+            "fourth.img",
+        ])
+        .unwrap();
+        let Command::Root { candidate } = cli.command else {
+            panic!("root");
+        };
+        assert_eq!(
+            candidate.members,
+            [
+                PathBuf::from("second.img"),
+                PathBuf::from("third.img"),
+                PathBuf::from("fourth.img")
+            ]
+        );
+    }
+
+    #[test]
     fn member_count_is_bounded_before_any_image_is_opened() {
         let candidate = CandidateArgs {
             image: ImageArgs {
@@ -446,14 +513,14 @@ mod tests {
             label: 0,
             slot: 0,
             pool_guid: 1,
-            mirror_members: vec![PathBuf::from("unopened-member.img"); 8],
+            members: vec![PathBuf::from("unopened-member.img"); 8],
         };
         let Err(error) = candidate.open(&Cx::for_testing()) else {
             panic!("an oversized member set must fail before image I/O");
         };
         assert_eq!(
             error.to_string(),
-            "at most seven additional mirror images are supported"
+            "at most seven additional member images are supported"
         );
     }
 
@@ -483,11 +550,11 @@ mod tests {
             label: 0,
             slot: 0,
             pool_guid: 1,
-            mirror_members: vec![outside],
+            members: vec![outside],
         };
         let mountpoint = mountpoint.canonicalize().unwrap();
         candidate.reject_hidden_images(&mountpoint).unwrap();
-        candidate.mirror_members = vec![alias];
+        candidate.members = vec![alias];
         assert_eq!(
             candidate
                 .reject_hidden_images(&mountpoint)
@@ -495,7 +562,7 @@ mod tests {
                 .to_string(),
             "ZFS mountpoint would hide a backing image"
         );
-        candidate.mirror_members.clear();
+        candidate.members.clear();
         candidate.image.image = inside;
         assert!(candidate.reject_hidden_images(&mountpoint).is_err());
     }

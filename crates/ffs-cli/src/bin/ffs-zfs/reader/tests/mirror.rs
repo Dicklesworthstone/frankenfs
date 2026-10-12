@@ -239,7 +239,7 @@ fn payload_reads(reads: &Reads, offsets: &[u64]) -> Vec<u64> {
 }
 
 // Fixture mutation only. The runtime decoder never serializes native labels.
-fn repack(config: &NvList) -> Vec<u8> {
+pub(in crate::reader) fn repack(config: &NvList) -> Vec<u8> {
     fn nested(config: &NvList) -> Vec<u8> {
         let pairs: Vec<_> = config
             .fields
