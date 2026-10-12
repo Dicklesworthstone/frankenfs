@@ -1,6 +1,7 @@
-//! Constructed native RAIDZ1 admission and checksum-guided stripe reads.
+//! Constructed native RAIDZ admission and checksum-guided stripe reads.
 
 pub(in crate::reader) mod fixture;
+mod parity;
 
 use super::*;
 use crate::reader::tests::mirror::{Fault, repack};
@@ -44,7 +45,7 @@ fn complete_raidz_groups_use_native_guids_and_return_original_psize_across_secto
                 assert_eq!(stripe.dva_offset, ROOT - DATA_OFFSET);
                 assert_eq!(stripe.allocated_bytes, map.allocated_bytes());
                 assert!(!stripe.parity_read);
-                assert_eq!(stripe.reconstructed_child, None);
+                assert!(stripe.reconstructed_children.is_empty());
                 assert_eq!(count(&logs, parity), 0);
                 for (actual, expected) in stripe.columns.iter().zip(map.columns()) {
                     assert_eq!(actual.child_id, expected.child_id);
@@ -93,7 +94,7 @@ fn each_data_column_recovers_a_checksum_error_or_physical_io_erasure() {
                     assert_eq!(root.data, expected);
                     let stripe = root.raidz.unwrap();
                     assert!(stripe.parity_read);
-                    assert_eq!(stripe.reconstructed_child, Some(data.0));
+                    assert_eq!(stripe.reconstructed_children, vec![data.0]);
                     assert_eq!(count(&reads, data), 1);
                     assert_eq!(count(&reads, parity), 1);
                 }
@@ -233,7 +234,7 @@ fn alter_topology(config: &mut NvList, case: u8) {
         0..=2 => {
             native.fields.insert(
                 "nparity".into(),
-                Value::Unsigned([0, 2, 3][usize::from(case)]),
+                Value::Unsigned([0, 4, 3][usize::from(case)]),
             );
         }
         3 => {

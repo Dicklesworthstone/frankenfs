@@ -1,15 +1,15 @@
-//! Explicit immutable member sets for a leaf, ordinary mirror or RAIDZ1 group.
+//! Explicit immutable member sets for a leaf, ordinary mirror or RAIDZ group.
 //!
 //! Native child IDs come from verified labels, never argument positions.
 //! Checksums decide whether replica or reconstructed bytes are usable.
 //! This is read-only extraction, without degraded import, DTL recovery or healing.
 
-mod raidz;
+pub(in crate::reader) mod raidz;
 
 use super::{
-    BlockPointer, BlockRead, Cx, DATA_OFFSET, FfsError, Label, Leaf, NvList, RaidzMember, Result,
-    RootBlock, Uberblock, Value, VdevConfig, admit_vdev_state, checkpoint, corrupt, integer, parse,
-    unsupported,
+    BlockPointer, BlockRead, Cx, DATA_OFFSET, FfsError, Label, Leaf, NvList, RaidzGroup,
+    RaidzMember, Result, RootBlock, Uberblock, Value, VdevConfig, admit_vdev_state,
+    checkpoint, corrupt, integer, parse, unsupported,
 };
 use std::collections::BTreeSet;
 
@@ -35,25 +35,28 @@ struct GroupConfig {
     // Native path strings are compared as metadata, never opened as host paths.
     tree: NvList,
     member_guids: Vec<u64>,
-    raidz1: bool,
+    raidz_parity: usize,
 }
 
 impl GroupConfig {
     fn mapped(self, supplied_guids: &[u64]) -> Result<VdevConfig> {
         let mut config = self.vdev;
-        if self.raidz1 {
+        if self.raidz_parity != 0 {
             let mut members = Vec::with_capacity(self.member_guids.len());
             for guid in self.member_guids {
                 let supplied_index = supplied_guids
                     .iter()
                     .position(|candidate| *candidate == guid)
-                    .ok_or_else(|| corrupt("configured RAIDZ1 child has no supplied member"))?;
+                    .ok_or_else(|| corrupt("configured RAIDZ child has no supplied member"))?;
                 members.push(RaidzMember {
                     supplied_index,
                     guid,
                 });
             }
-            config.raidz_members = Some(members);
+            config.raidz_members = Some(RaidzGroup {
+                parity: self.raidz_parity,
+                members,
+            });
         }
         Ok(config)
     }
@@ -66,17 +69,20 @@ impl Label {
             .config
             .list("vdev_tree")
             .ok_or_else(|| corrupt("missing redundant vdev tree"))?;
-        let raidz1 = match tree.text("type") {
-            Some("mirror") => false,
+        let raidz_parity = match tree.text("type") {
+            Some("mirror") => 0,
             Some("raidz") => {
-                if integer(tree, "nparity")? != 1 {
-                    return Err(unsupported("only ordinary single-parity RAIDZ is admitted"));
+                let parity = integer(tree, "nparity")?;
+                if !(1..=3).contains(&parity) {
+                    return Err(unsupported(
+                        "ordinary RAIDZ requires one through three parity columns",
+                    ));
                 }
-                true
+                usize::try_from(parity).map_err(|_| corrupt("RAIDZ parity count overflow"))?
             }
             _ => {
                 return Err(unsupported(
-                    "multiple supplied images require one ordinary mirror or RAIDZ1 group",
+                    "multiple supplied images require one ordinary mirror or RAIDZ group",
                 ));
             }
         };
@@ -85,9 +91,9 @@ impl Label {
                 "redundant vdev has no native nvlist-array children",
             ));
         };
-        if !(2..=MAX_MEMBERS).contains(&children.len()) {
+        if !(2..=MAX_MEMBERS).contains(&children.len()) || children.len() <= raidz_parity {
             return Err(unsupported(
-                "redundant read profile requires two through eight children",
+                "redundant read profile requires two through eight children and a data column",
             ));
         }
         let mut seen = BTreeSet::from([vdev.pool_guid, vdev.top_guid]);
@@ -119,7 +125,7 @@ impl Label {
                 vdev,
                 tree: tree.clone(),
                 member_guids,
-                raidz1,
+                raidz_parity,
             },
             member_guid,
         ))
@@ -138,7 +144,7 @@ fn same_candidate(left: &Uberblock, right: &Uberblock) -> bool {
 
 impl Pool {
     /// Host paths have already been explicitly opened by the caller. Multiple
-    /// images must supply the complete native mirror or RAIDZ1 member set.
+    /// images must supply the complete native mirror or RAIDZ member set.
     pub fn from_leaves(members: Vec<Leaf>) -> Result<Self> {
         if !(1..=MAX_MEMBERS).contains(&members.len()) {
             return Err(unsupported(
@@ -214,7 +220,7 @@ impl Pool {
             member_guids.push(guid);
         }
         // Membership, uniqueness and counts prove this is the complete group.
-        // Bind native child IDs only after every label/candidate has agreed.
+        // Bind native child IDs and parity only after all labels have agreed.
         let config = selected.mapped(&member_guids)?;
         let block = self.read_block(cx, &config, &candidate.root)?;
         if block.bytes.len() < 1024
@@ -246,8 +252,8 @@ impl Pool {
         bp: &BlockPointer,
     ) -> Result<BlockRead> {
         checkpoint(cx)?;
-        if let Some(members) = &config.raidz_members {
-            return self.read_raidz1_block(cx, config, bp, members);
+        if let Some(group) = &config.raidz_members {
+            return self.read_raidz_block(cx, config, bp, group);
         }
         if self.members.len() == 1 {
             return self.members[0].read_block(cx, config, bp).map(

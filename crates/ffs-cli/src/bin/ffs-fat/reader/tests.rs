@@ -3,6 +3,96 @@ use std::io;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+#[test]
+fn selected_oem_names_resolve_and_read_in_both_fat_formats() {
+    let cx = Cx::for_testing();
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        let mut image = check::checked_image(kind);
+        let root = image.root_location();
+        image.record(root, b"\x90T\x9b     TXT", 5, 1029, false);
+        image.bytes[root + 12] = 0x18;
+        let volume = image.volume().with_oem_code_page(FatOemCodePage::Cp850);
+        let entry = volume.resolve(&cx, "/ÉTØ.TXT").unwrap().unwrap();
+        assert_eq!(entry.name().unwrap(), "étø.txt");
+        assert_eq!(entry.native.short_name, *b"\x90T\x9b     TXT");
+        let chain = volume.file_chain(&cx, &entry).unwrap();
+        assert_eq!(volume.read(&cx, &chain, 0, 2048).unwrap(), payload());
+        assert!(matches!(
+            volume.resolve(&cx, "/ÉT¢.TXT"),
+            Err(FfsError::NotFound(_))
+        ));
+        let report = volume.check(&cx).unwrap();
+        assert!(report.clean);
+        assert_eq!(report.oem_code_page, "850");
+
+        let mut image = Image::new(kind);
+        image.record(root, b"\x05       TXT", 5, 1029, false);
+        let volume = image.volume().with_oem_code_page(FatOemCodePage::Cp437);
+        assert_eq!(
+            volume
+                .resolve(&cx, "/Σ.txt")
+                .unwrap()
+                .unwrap()
+                .name()
+                .unwrap(),
+            "σ.TXT"
+        );
+        let catalog =
+            crate::native_catalog(&cx, &volume, &crate::EntrySlots::default(), 1024).unwrap();
+        assert_eq!(catalog["oem_code_page"], "437");
+        assert_eq!(catalog["entries"][0]["short_name_bytes"][0], 5);
+        assert_eq!(catalog["entries"][0]["short_alias"], "σ.TXT");
+    }
+}
+
+#[test]
+fn oem_case_collisions_fail_lookup_and_are_reported_without_lost_reachability() {
+    let cx = Cx::for_testing();
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        let mut image = check::checked_image(kind);
+        let root = image.root_location();
+        image.record(root, b"\x90COLE   TXT", 5, 1029, false);
+        image.record(root + 64, b"\x82COLE   TXT", 0, 0, false);
+        let volume = image.volume().with_oem_code_page(FatOemCodePage::Cp437);
+        assert!(matches!(
+            volume.lookup(&cx, Directory::Root, "école.txt"),
+            Err(FfsError::Corruption { .. })
+        ));
+        let report = volume.check(&cx).unwrap();
+        assert!(report.complete);
+        assert!(!report.clean);
+        assert_eq!(report.lost_clusters, Some(0));
+        let collisions: Vec<_> = report
+            .issues
+            .iter()
+            .filter(|issue| issue.kind == "name_collision")
+            .collect();
+        assert_eq!(collisions.len(), 1);
+        assert_eq!(
+            collisions[0].other_entry_offset,
+            Some(root as u64 - volume.base)
+        );
+    }
+}
+
+#[test]
+fn default_ascii_policy_keeps_oem_names_losslessly_accessible_by_slot_only() {
+    let cx = Cx::for_testing();
+    let mut image = Image::new(FatKind::Fat16);
+    let root = image.root_location();
+    image.record(root, b"\x90COLE   TXT", 5, 1029, false);
+    let volume = image.volume();
+    assert!(matches!(
+        volume.resolve(&cx, "/ÉCOLE.TXT"),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
+    let selector = crate::EntrySlots(vec![root as u64 - volume.base]);
+    let entry = selector.resolve(&cx, &volume).unwrap().unwrap();
+    let chain = volume.file_chain(&cx, &entry).unwrap();
+    assert_eq!(volume.read(&cx, &chain, 0, 2048).unwrap(), payload());
+    assert!(volume.check(&cx).unwrap().clean);
+}
+
 struct Image {
     bytes: Vec<u8>,
     kind: FatKind,

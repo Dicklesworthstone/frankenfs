@@ -1,6 +1,6 @@
 use super::*;
 
-fn checked_image(kind: FatKind) -> Image {
+pub(super) fn checked_image(kind: FatKind) -> Image {
     let mut image = Image::new(kind);
     if kind == FatKind::Fat32 {
         for (offset, value) in [
@@ -39,6 +39,34 @@ fn one_long_name(alias: &[u8; 11], text: &str) -> [u8; 32] {
         slot[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
     }
     slot
+}
+
+#[test]
+fn selected_oem_aliases_collide_with_native_lfns_consistently() {
+    let cx = Cx::for_testing();
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        for page in [FatOemCodePage::Cp437, FatOemCodePage::Cp850] {
+            let mut image = checked_image(kind);
+            let root = image.root_location();
+            image.record(root, b"\x90COLE   TXT", 5, 1029, false);
+            let alias = *b"LONGNA~1TXT";
+            image.bytes[root + 64..root + 96].copy_from_slice(&one_long_name(&alias, "école.txt"));
+            image.record(root + 96, &alias, 0, 0, false);
+            let volume = image.volume().with_oem_code_page(page);
+            assert!(matches!(
+                volume.lookup(&cx, Directory::Root, "ÉCOLE.TXT"),
+                Err(FfsError::Corruption { .. })
+            ));
+            let report = volume.check(&cx).unwrap();
+            assert!(report.complete);
+            assert!(has_finding(&report, "name_collision"));
+            assert_eq!(report.lost_clusters, Some(0));
+            assert!(matches!(
+                crate::filesystem::FatFs::new(&cx, volume, 0, 0),
+                Err(FfsError::Corruption { .. })
+            ));
+        }
+    }
 }
 
 #[test]

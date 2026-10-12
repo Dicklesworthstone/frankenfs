@@ -154,17 +154,17 @@ impl FatFs {
         Ok(ino)
     }
 
-    /// Reject display/short-alias collisions before publishing a listing. ASCII
-    /// folding is explicit; no host locale or guessed Unicode normalization.
+    /// Reject display/short-alias collisions before publishing a listing using
+    /// the volume's selected OEM case pairs, never host locale/normalization.
     fn checked_names(entries: &[Entry]) -> Result<Vec<String>> {
         let mut owners = BTreeMap::new();
         let mut names = Vec::with_capacity(entries.len());
         for (index, entry) in entries.iter().enumerate() {
             let name = entry.name()?;
-            let alias = entry.native.ascii_short_name();
+            let alias = entry.short_alias();
             for candidate in std::iter::once(name.as_str()).chain(alias.as_deref()) {
                 if owners
-                    .insert(candidate.to_ascii_lowercase(), index)
+                    .insert(entry.oem_code_page.name_key(candidate), index)
                     .is_some_and(|old| old != index)
                 {
                     return Err(FfsError::Corruption {

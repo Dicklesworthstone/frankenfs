@@ -8,6 +8,9 @@
 use ffs_types::{ParseError, ensure_slice, read_le_u16, read_le_u32};
 use std::time::Duration;
 
+mod names;
+pub use names::FatOemCodePage;
+
 fn invalid(field: &'static str, reason: &'static str) -> ParseError {
     ParseError::InvalidField { field, reason }
 }
@@ -368,30 +371,13 @@ impl FatDirEntry {
     /// not decoded with the host's locale or with a lossy UTF-8 conversion.
     #[must_use]
     pub fn ascii_short_name(&self) -> Option<String> {
-        if !self.short_name.is_ascii() || self.short_name[0] == 5 {
-            return None;
-        }
-        let mut name = String::new();
-        for (part, lower) in [(&self.short_name[..8], 0x08), (&self.short_name[8..], 0x10)] {
-            let end = part.iter().rposition(|b| *b != b' ').map_or(0, |n| n + 1);
-            if end == 0 {
-                continue;
-            }
-            if !name.is_empty() {
-                name.push('.');
-            }
-            for &byte in &part[..end] {
-                if byte < 0x20 || matches!(byte, b'/' | b'\\' | b':' | 0x7F) {
-                    return None;
-                }
-                name.push(char::from(if self.case_flags & lower != 0 {
-                    byte.to_ascii_lowercase()
-                } else {
-                    byte
-                }));
-            }
-        }
-        (!name.is_empty()).then_some(name)
+        self.oem_short_name(FatOemCodePage::Ascii)
+    }
+
+    /// Lossless short-name presentation using an explicitly selected OEM page.
+    #[must_use]
+    pub fn oem_short_name(&self, code_page: FatOemCodePage) -> Option<String> {
+        code_page.short_name(&self.short_name, self.case_flags)
     }
 }
 

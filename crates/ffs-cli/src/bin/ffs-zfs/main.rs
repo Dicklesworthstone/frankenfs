@@ -54,7 +54,7 @@ struct CandidateArgs {
     /// Expected pool GUID; this does not authorize automatic TXG selection.
     #[arg(long)]
     pool_guid: u64,
-    /// Additional immutable images of every other leaf in one mirror or RAIDZ1 vdev.
+    /// Additional immutable images of every other leaf in one mirror or RAIDZ1/2/3 vdev.
     /// The same --offset and --length select the volume range in every image.
     #[arg(
         long = "member",
@@ -195,14 +195,15 @@ fn main() -> Result<()> {
             let root = pool.root(&cx, candidate.label, candidate.slot, candidate.pool_guid)?;
             if let Some(stripe) = &root.raidz {
                 eprintln!(
-                    "checked candidate txg={} copy={} raidz1_dva_offset={} allocated_bytes={} bytes={} parity_read={} reconstructed_child={:?}; not a pool import",
+                    "checked candidate txg={} copy={} raidz{}_dva_offset={} allocated_bytes={} bytes={} parity_read={} reconstructed_children={:?}; not a pool import",
                     root.uberblock.txg,
                     root.copy_index,
+                    stripe.columns.iter().filter(|column| column.parity).count(),
                     stripe.dva_offset,
                     stripe.allocated_bytes,
                     root.data.len(),
                     stripe.parity_read,
-                    stripe.reconstructed_child,
+                    stripe.reconstructed_children,
                 );
                 for column in &stripe.columns {
                     eprintln!(

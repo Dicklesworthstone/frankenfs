@@ -5,6 +5,43 @@ use ffs_types::InodeNumber;
 use std::ffi::OsStr;
 
 #[test]
+fn mounted_oem_names_share_directory_lookup_and_payload_identity() {
+    let cx = Cx::for_testing();
+    let mut scope = RequestScope::empty();
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        let mut image = Image::new(kind);
+        let root = image.root_location();
+        image.record(root, b"\x90T\x9b     TXT", 5, 1029, false);
+        image.bytes[root + 12] = 0x18;
+        let fs = FatFs::new(
+            &cx,
+            image.volume().with_oem_code_page(FatOemCodePage::Cp850),
+            0,
+            0,
+        )
+        .unwrap();
+        let file = fs
+            .lookup(&cx, &mut scope, InodeNumber(1), OsStr::new("ÉTØ.TXT"))
+            .unwrap();
+        let same = fs
+            .lookup(&cx, &mut scope, InodeNumber(1), OsStr::new("étø.txt"))
+            .unwrap();
+        assert_eq!(file.ino, same.ino);
+        let listing = fs.readdir(&cx, &mut scope, InodeNumber(1), 0).unwrap();
+        assert_eq!(listing[2].name, "étø.txt".as_bytes());
+        assert_eq!(listing[2].ino, file.ino);
+        assert_eq!(
+            fs.read(&cx, &mut scope, file.ino, 510, 520).unwrap(),
+            payload()[510..]
+        );
+        assert!(matches!(
+            fs.write(&cx, &mut scope, file.ino, 0, b"write"),
+            Err(FfsError::ReadOnly)
+        ));
+    }
+}
+
+#[test]
 fn fsops_root_lookup_read_cookies_parent_and_read_only_contract() {
     let cx = Cx::for_testing();
     let mut scope = RequestScope::empty();

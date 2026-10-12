@@ -9,7 +9,9 @@ mod check;
 use asupersync::Cx;
 use ffs_block::ByteDevice;
 use ffs_error::{FfsError, Result};
-use ffs_ondisk::fat::{FatDirEntry, FatDirectoryDecoder, FatEntry, FatGeometry, FatKind};
+use ffs_ondisk::fat::{
+    FatDirEntry, FatDirectoryDecoder, FatEntry, FatGeometry, FatKind, FatOemCodePage,
+};
 use ffs_types::{ByteOffset, ParseError};
 use std::collections::BTreeSet;
 use std::fs::File;
@@ -81,19 +83,22 @@ pub struct Entry {
     /// Volume-relative short-entry position. Stable only on an immutable image.
     pub offset: u64,
     pub native: FatDirEntry,
+    pub oem_code_page: FatOemCodePage,
 }
 
 impl Entry {
-    /// Lossless UTF-8 long names and ASCII short names only. OEM code-page
-    /// selection and Windows-equivalent non-ASCII collation remain future work.
+    /// Lossless UTF-8 long names and explicitly selected OEM short names.
+    /// Full Windows Unicode LFN collation remains outside this read profile.
     pub fn name(&self) -> Result<String> {
         let name = if let Some(units) = &self.native.long_name {
             String::from_utf16(units).map_err(|_| {
                 FfsError::UnsupportedFeature("FAT name contains unpaired UTF-16 surrogates".into())
             })?
         } else {
-            self.native.ascii_short_name().ok_or_else(|| {
-                FfsError::UnsupportedFeature("FAT short name requires an OEM code page".into())
+            self.short_alias().ok_or_else(|| {
+                FfsError::UnsupportedFeature(
+                    "FAT short name is invalid or requires an explicit OEM code page".into(),
+                )
             })?
         };
         if name.is_empty()
@@ -110,6 +115,10 @@ impl Entry {
             return Err(FfsError::NameTooLong);
         }
         Ok(name)
+    }
+
+    pub fn short_alias(&self) -> Option<String> {
+        self.native.oem_short_name(self.oem_code_page)
     }
 
     pub fn directory(&self) -> Result<Directory> {
@@ -132,6 +141,7 @@ pub struct FatVolume {
     device: Box<dyn ByteDevice>,
     base: u64,
     pub geometry: FatGeometry,
+    oem_code_page: FatOemCodePage,
 }
 
 impl FatVolume {
@@ -174,10 +184,22 @@ impl FatVolume {
             device,
             base,
             geometry,
+            oem_code_page: FatOemCodePage::Ascii,
         };
         volume.validate_admission(cx, &boot)?;
         checkpoint(cx)?;
         Ok(volume)
+    }
+
+    /// Keep one explicit name policy for every directory and cached entry in
+    /// this volume. This changes presentation/lookup, never native bytes.
+    pub fn with_oem_code_page(mut self, code_page: FatOemCodePage) -> Self {
+        self.oem_code_page = code_page;
+        self
+    }
+
+    pub fn oem_code_page(&self) -> FatOemCodePage {
+        self.oem_code_page
     }
 
     fn read_exact(&self, cx: &Cx, offset: u64, bytes: &mut [u8]) -> Result<()> {
@@ -353,6 +375,7 @@ impl FatVolume {
                 entries.push(Entry {
                     offset: position,
                     native,
+                    oem_code_page: self.oem_code_page,
                 });
             }
             if decoder.ended() {
@@ -368,14 +391,15 @@ impl FatVolume {
             return Err(FfsError::Format("expected one FAT path component".into()));
         }
         let mut found = None;
+        let key = self.oem_code_page.name_key(name);
         for entry in self.list(cx, directory)? {
             checkpoint(cx)?;
             let displayed = entry.name()?;
-            let short = entry.native.ascii_short_name();
-            if displayed.eq_ignore_ascii_case(name)
+            let short = entry.short_alias();
+            if self.oem_code_page.name_key(&displayed) == key
                 || short
                     .as_deref()
-                    .is_some_and(|alias| alias.eq_ignore_ascii_case(name))
+                    .is_some_and(|alias| self.oem_code_page.name_key(alias) == key)
             {
                 if found.is_some() {
                     return Err(corrupt(entry.offset, "ambiguous FAT name or short alias"));

@@ -1,19 +1,98 @@
-//! Verified reads through one admitted ordinary RAIDZ1 group.
+//! Verified reads through an admitted ordinary RAIDZ1, RAIDZ2 or RAIDZ3 group.
 //!
-//! All member/DVA allocation extents are checked before I/O. Data is tried
-//! without parity first; parity is needed only for an erasure or a failed
-//! checksum. Each recovery hypothesis is bounded to one native data column.
+//! Validate every declared DVA and member extent before any data I/O. Intact
+//! data needs no parity. Recovery considers at most three erased columns among
+//! eight members, including corrupt-but-readable parity, and only publishes a
+//! candidate after the original physical checksum and transform both succeed.
 
 use super::Pool;
 use crate::reader::{
     BlockPointer, BlockRead, Cx, DATA_OFFSET, Dva, FfsError, LABEL_BYTES, RaidzColumnInfo,
-    RaidzMember, RaidzReadInfo, Result, VdevConfig, checkpoint, corrupt, parse, unsupported,
+    RaidzGroup, RaidzMember, RaidzReadInfo, Result, VdevConfig, checkpoint, corrupt, parse,
+    unsupported,
 };
-use ffs_ondisk::zfs::raidz::Raidz1Map;
+use ffs_ondisk::zfs::raidz::parity::RaidzParityMap;
+use ffs_ondisk::zfs::raidz::{Raidz1Map, RaidzColumn};
 use std::collections::BTreeSet;
 
+/// Keep the existing RAIDZ1 XOR path; only multi-parity uses field inversion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::reader) enum NativeMap {
+    Single(Raidz1Map),
+    Multiple(RaidzParityMap),
+}
+
+impl NativeMap {
+    pub(in crate::reader) fn new(
+        offset: u64,
+        bytes: usize,
+        ashift: u8,
+        width: usize,
+        parity: usize,
+    ) -> Result<Self> {
+        match parity {
+            1 => Raidz1Map::new(offset, bytes, ashift, width)
+                .map(Self::Single)
+                .map_err(|error| parse(&error)),
+            2 | 3 => RaidzParityMap::new(offset, bytes, ashift, width, parity)
+                .map(Self::Multiple)
+                .map_err(|error| parse(&error)),
+            _ => Err(unsupported(
+                "ordinary RAIDZ requires one through three parity columns",
+            )),
+        }
+    }
+
+    pub(in crate::reader) fn parity(&self) -> usize {
+        match self {
+            Self::Single(_) => 1,
+            Self::Multiple(map) => map.parity(),
+        }
+    }
+
+    #[cfg(test)]
+    pub(in crate::reader) fn aligned_bytes(&self) -> usize {
+        match self {
+            Self::Single(map) => map.aligned_bytes(),
+            Self::Multiple(map) => map.aligned_bytes(),
+        }
+    }
+
+    pub(in crate::reader) fn allocated_bytes(&self) -> u64 {
+        match self {
+            Self::Single(map) => map.allocated_bytes(),
+            Self::Multiple(map) => map.allocated_bytes(),
+        }
+    }
+
+    pub(in crate::reader) fn columns(&self) -> &[RaidzColumn] {
+        match self {
+            Self::Single(map) => map.columns(),
+            Self::Multiple(map) => map.columns(),
+        }
+    }
+
+    pub(in crate::reader) fn assemble(
+        &self,
+        columns: &[Option<&[u8]>],
+        erased: &[usize],
+    ) -> Result<Vec<u8>> {
+        match self {
+            Self::Single(map) => {
+                let erased = match erased {
+                    [] => None,
+                    [index] => Some(*index),
+                    _ => return Err(corrupt("RAIDZ1 cannot reconstruct multiple data columns")),
+                };
+                map.assemble(columns, erased).map_err(|error| parse(&error))
+            }
+            Self::Multiple(map) => map.assemble(columns, erased).map_err(|error| parse(&error)),
+        }
+    }
+}
+
 struct Stripe<'a> {
-    map: &'a Raidz1Map,
+    map: &'a NativeMap,
     members: &'a [RaidzMember],
     pointer: &'a BlockPointer,
     dva_offset: u64,
@@ -32,21 +111,23 @@ impl Pool {
         cx: &Cx,
         config: &VdevConfig,
         bp: &BlockPointer,
-        members: &[RaidzMember],
-    ) -> Result<Vec<(Dva, Raidz1Map)>> {
+        group: &RaidzGroup,
+    ) -> Result<Vec<(Dva, NativeMap)>> {
         checkpoint(cx)?;
+        let members = &group.members;
         let dvas = bp.regular_dvas().map_err(|error| parse(&error))?;
-        if !(2..=8).contains(&members.len())
+        if !(1..=3).contains(&group.parity)
+            || !(group.parity + 1..=8).contains(&members.len())
             || members.len() != self.members.len()
             || !(9..=16).contains(&config.ashift)
         {
-            return Err(corrupt("invalid admitted RAIDZ1 member geometry"));
+            return Err(corrupt("invalid admitted RAIDZ member or parity geometry"));
         }
         let sector = 1_u64 << config.ashift;
         let width = members.len() as u64;
         if config.allocated_bytes == 0 || !config.allocated_bytes.is_multiple_of(width * sector) {
             return Err(corrupt(
-                "RAIDZ1 allocation region is not a whole member stripe",
+                "RAIDZ allocation region is not a whole member stripe",
             ));
         }
         let member_capacity = config.allocated_bytes / width;
@@ -57,17 +138,17 @@ impl Pool {
             let leaf = self
                 .members
                 .get(member.supplied_index)
-                .ok_or_else(|| corrupt("RAIDZ1 child maps outside supplied members"))?;
+                .ok_or_else(|| corrupt("RAIDZ child maps outside supplied members"))?;
             if !indices.insert(member.supplied_index)
                 || member.guid == 0
                 || !guids.insert(member.guid)
             {
-                return Err(corrupt("RAIDZ1 child mapping repeats a supplied identity"));
+                return Err(corrupt("RAIDZ child mapping repeats a supplied identity"));
             }
             let end = leaf.length / LABEL_BYTES * LABEL_BYTES - 2 * LABEL_BYTES;
             if member_capacity > end - DATA_OFFSET {
                 return Err(corrupt(
-                    "configured RAIDZ1 capacity exceeds a selected member",
+                    "configured RAIDZ capacity exceeds a selected member",
                 ));
             }
         }
@@ -79,20 +160,20 @@ impl Pool {
                     "foreign-vdev or gang DVA needs a different native mapping",
                 ));
             }
-            let map = Raidz1Map::new(
+            let map = NativeMap::new(
                 dva.offset,
                 bp.physical_bytes(),
                 config.ashift,
                 members.len(),
-            )
-            .map_err(|error| parse(&error))?;
+                group.parity,
+            )?;
             if dva.allocated_bytes != map.allocated_bytes()
                 || dva
                     .offset
                     .checked_add(dva.allocated_bytes)
                     .is_none_or(|end| end > config.allocated_bytes)
             {
-                return Err(corrupt("RAIDZ1 DVA allocation size or bounds disagree"));
+                return Err(corrupt("RAIDZ DVA allocation size or bounds disagree"));
             }
             for column in map.columns() {
                 if column
@@ -101,7 +182,7 @@ impl Pool {
                     .is_none_or(|end| end > member_capacity)
                 {
                     return Err(corrupt(
-                        "RAIDZ1 column allocation exceeds its configured member",
+                        "RAIDZ column allocation exceeds its configured member",
                     ));
                 }
             }
@@ -110,27 +191,27 @@ impl Pool {
         Ok(maps)
     }
 
-    pub(super) fn read_raidz1_block(
+    pub(super) fn read_raidz_block(
         &self,
         cx: &Cx,
         config: &VdevConfig,
         bp: &BlockPointer,
-        members: &[RaidzMember],
+        group: &RaidzGroup,
     ) -> Result<BlockRead> {
-        // Finish the complete map set before any usable first DVA can conceal
-        // an out-of-range, foreign or unsupported later DVA.
-        let maps = self.raidz_maps(cx, config, bp, members)?;
+        // Complete every map before a usable first DVA can conceal another
+        // foreign, unsupported or out-of-range declared copy.
+        let maps = self.raidz_maps(cx, config, bp, group)?;
         let mut failures = Vec::new();
         for (copy_index, (dva, map)) in maps.iter().enumerate() {
             checkpoint(cx)?;
             let stripe = Stripe {
                 map,
-                members,
+                members: &group.members,
                 pointer: bp,
                 dva_offset: dva.offset,
                 copy_index,
             };
-            match self.read_raidz1_stripe(cx, &stripe) {
+            match self.read_raidz_stripe(cx, &stripe) {
                 Ok(block) => {
                     checkpoint(cx)?;
                     return Ok(block);
@@ -140,12 +221,12 @@ impl Pool {
             }
         }
         Err(corrupt(format!(
-            "all ZFS RAIDZ1 block copies failed: {}",
+            "all ZFS RAIDZ block copies failed: {}",
             failures.join("; ")
         )))
     }
 
-    fn read_raidz1_data(&self, cx: &Cx, stripe: &Stripe<'_>) -> Result<Columns> {
+    fn read_raidz_data(&self, cx: &Cx, stripe: &Stripe<'_>) -> Result<Columns> {
         let mut result = Columns {
             bytes: (0..stripe.map.columns().len()).map(|_| None).collect(),
             missing: Vec::new(),
@@ -175,78 +256,107 @@ impl Pool {
         Ok(result)
     }
 
-    fn read_raidz1_stripe(&self, cx: &Cx, stripe: &Stripe<'_>) -> Result<BlockRead> {
-        let mut columns = self.read_raidz1_data(cx, stripe)?;
+    fn read_raidz_stripe(&self, cx: &Cx, stripe: &Stripe<'_>) -> Result<BlockRead> {
+        let mut columns = self.read_raidz_data(cx, stripe)?;
         if columns.missing.is_empty() {
-            match verify_candidate(cx, stripe, &columns.bytes, None) {
-                Ok(bytes) => return Ok(stripe.complete(bytes, false, None)),
+            match verify_candidate(cx, stripe, &columns.bytes, &[]) {
+                Ok(bytes) => return Ok(stripe.complete(bytes, false, &[])),
                 Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
                 Err(error) => columns
                     .failures
                     .push(format!("unreconstructed data: {error}")),
             }
-        } else if columns.missing.len() > 1 {
+        } else if columns.missing.len() > stripe.map.parity() {
             return Err(corrupt(format!(
-                "multiple RAIDZ1 data columns are unavailable: {}",
+                "RAIDZ data erasures exceed native parity: {}",
                 columns.failures.join("; ")
             )));
         }
 
-        checkpoint(cx)?;
-        let parity = &stripe.map.columns()[0];
-        let member = &stripe.members[parity.child_id];
-        columns.bytes[0] = Some(
-            self.members[member.supplied_index]
-                .read(cx, DATA_OFFSET + parity.offset, parity.bytes)
-                .map_err(|error| match error {
-                    FfsError::Cancelled => FfsError::Cancelled,
-                    other => corrupt(format!(
-                        "RAIDZ1 parity child {} is unavailable: {other}",
-                        parity.child_id
-                    )),
-                })?,
-        );
-        let candidates = if columns.missing.is_empty() {
-            stripe
-                .map
-                .columns()
-                .iter()
-                .enumerate()
-                .filter_map(|(index, column)| column.data_offset.map(|_| index))
-                .collect()
-        } else {
-            columns.missing
-        };
-        for index in candidates {
+        // Read each parity at most once. An unavailable P does not preclude Q
+        // or R recovery, and a readable but corrupt parity is not authoritative.
+        for index in 0..stripe.map.parity() {
             checkpoint(cx)?;
-            match verify_candidate(cx, stripe, &columns.bytes, Some(index)) {
-                Ok(bytes) => return Ok(stripe.complete(bytes, true, Some(index))),
+            let parity = &stripe.map.columns()[index];
+            let member = &stripe.members[parity.child_id];
+            match self.members[member.supplied_index].read(
+                cx,
+                DATA_OFFSET + parity.offset,
+                parity.bytes,
+            ) {
+                Ok(bytes) => columns.bytes[index] = Some(bytes),
                 Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
-                Err(error) => columns.failures.push(format!(
-                    "erased child {}: {error}",
-                    stripe.map.columns()[index].child_id
-                )),
+                Err(error) => {
+                    columns.missing.push(index);
+                    columns.failures.push(format!(
+                        "parity child {}: {error}",
+                        parity.child_id
+                    ));
+                }
+            }
+        }
+        for erased in recovery_hypotheses(stripe.map, &columns.missing) {
+            checkpoint(cx)?;
+            match verify_candidate(cx, stripe, &columns.bytes, &erased) {
+                Ok(bytes) => return Ok(stripe.complete(bytes, true, &erased)),
+                Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
+                Err(error) => columns
+                    .failures
+                    .push(format!("erased columns {erased:?}: {error}")),
             }
         }
         Err(corrupt(format!(
-            "RAIDZ1 data cannot be verified within one-column recovery: {}",
+            "RAIDZ data cannot be verified within {}-column recovery: {}",
+            stripe.map.parity(),
             columns.failures.join("; ")
         )))
     }
+}
+
+/// At most 92 hypotheses (eight choose one, two or three), independent of file
+/// size. Known I/O failures are mandatory exclusions; skip-only columns are
+/// never candidates. Excluding parity lets later Q/R equations reject a bad P.
+fn recovery_hypotheses(map: &NativeMap, missing: &[usize]) -> Vec<Vec<usize>> {
+    let active = map
+        .columns()
+        .iter()
+        .take_while(|column| column.bytes != 0)
+        .count();
+    if missing.len() > map.parity() || missing.iter().any(|&index| index >= active) {
+        return Vec::new();
+    }
+    let required = missing
+        .iter()
+        .fold(0_u16, |mask, &index| mask | (1_u16 << index));
+    let parity_mask = (1_u16 << map.parity()) - 1;
+    let mut candidates = Vec::new();
+    for count in missing.len().max(1)..=map.parity() {
+        for mask in 1_u16..1_u16 << active {
+            if mask.count_ones() as usize != count
+                || mask & required != required
+                || mask & !parity_mask == 0
+            {
+                continue;
+            }
+            candidates.push(
+                (0..active)
+                    .filter(|&index| mask & (1_u16 << index) != 0)
+                    .collect(),
+            );
+        }
+    }
+    candidates
 }
 
 fn verify_candidate(
     cx: &Cx,
     stripe: &Stripe<'_>,
     columns: &[Option<Vec<u8>>],
-    erased: Option<usize>,
+    erased: &[usize],
 ) -> Result<Vec<u8>> {
     checkpoint(cx)?;
     let slices: Vec<_> = columns.iter().map(Option::as_deref).collect();
-    let physical = stripe
-        .map
-        .assemble(&slices, erased)
-        .map_err(|error| parse(&error))?;
+    let physical = stripe.map.assemble(&slices, erased)?;
     checkpoint(cx)?;
     let bytes = stripe
         .pointer
@@ -257,8 +367,8 @@ fn verify_candidate(
 }
 
 impl Stripe<'_> {
-    fn complete(&self, bytes: Vec<u8>, parity_read: bool, erased: Option<usize>) -> BlockRead {
-        let first = &self.map.columns()[1];
+    fn complete(&self, bytes: Vec<u8>, parity_read: bool, erased: &[usize]) -> BlockRead {
+        let first = &self.map.columns()[self.map.parity()];
         let columns = self
             .map
             .columns()
@@ -269,7 +379,7 @@ impl Stripe<'_> {
                 member_guid: self.members[column.child_id].guid,
                 physical_offset: DATA_OFFSET + column.offset,
                 bytes: column.bytes,
-                parity: index == 0,
+                parity: index < self.map.parity(),
             })
             .collect();
         BlockRead {
@@ -282,8 +392,51 @@ impl Stripe<'_> {
                 allocated_bytes: self.map.allocated_bytes(),
                 columns,
                 parity_read,
-                reconstructed_child: erased.map(|index| self.map.columns()[index].child_id),
+                reconstructed_children: erased
+                    .iter()
+                    .filter_map(|&index| {
+                        let column = &self.map.columns()[index];
+                        column.data_offset.map(|_| column.child_id)
+                    })
+                    .collect(),
             }),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn hypotheses_include_every_recoverable_failure_set_without_skip_columns() {
+        for parity in 1..=3 {
+            for width in parity + 1..=8 {
+                for size in [512, 1024, 16_384] {
+                    let map = NativeMap::new(0, size, 9, width, parity).unwrap();
+                    let active = map
+                        .columns()
+                        .iter()
+                        .filter(|column| column.bytes != 0)
+                        .count();
+                    for known in 0_u16..1_u16 << active {
+                        let missing: Vec<_> = (0..active)
+                            .filter(|&index| known & (1 << index) != 0)
+                            .collect();
+                        let candidates = recovery_hypotheses(&map, &missing);
+                        assert!(candidates.len() <= 92);
+                        for lost in 1_u16..1_u16 << active {
+                            let actual: Vec<_> = (0..active)
+                                .filter(|&index| lost & (1 << index) != 0)
+                                .collect();
+                            let expected = lost.count_ones() as usize <= parity
+                                && lost & known == known
+                                && actual.iter().any(|&index| index >= parity);
+                            assert_eq!(candidates.contains(&actual), expected);
+                        }
+                    }
+                }
+            }
         }
     }
 }
