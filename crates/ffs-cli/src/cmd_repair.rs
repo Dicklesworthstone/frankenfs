@@ -7,7 +7,7 @@ use ffs_ondisk::{
     BtrfsChunkEntry, BtrfsSuperblock, Ext4Superblock, map_logical_to_physical,
     verify_btrfs_superblock_checksum,
 };
-use ffs_repair::codec::encode_group;
+use ffs_repair::codec::{EncodedGroup, encode_group};
 use ffs_repair::ownership::{AcquireResult, OwnershipGuard, RepairOwnership};
 use ffs_repair::recovery::{GroupRecoveryOrchestrator, RecoveryOutcome};
 use ffs_repair::scrub::{BlockValidator, Ext4MetadataValidator, ScrubReport, Scrubber, Severity};
@@ -1802,7 +1802,10 @@ pub fn recover_ext4_corrupt_blocks(
         let unrecovered = corrupt.saturating_sub(repaired);
         recovered_blocks = recovered_blocks.saturating_add(repaired);
         unrecovered_blocks = unrecovered_blocks.saturating_add(unrecovered);
-        if repaired > 0 {
+        if repaired > 0
+            && unrecovered == 0
+            && outcome.evidence.outcome == RecoveryOutcome::Recovered
+        {
             repaired_groups.push(group);
         }
 
@@ -1892,7 +1895,10 @@ pub fn recover_btrfs_corrupt_blocks(
         let unrecovered = corrupt.saturating_sub(repaired);
         recovered_blocks = recovered_blocks.saturating_add(repaired);
         unrecovered_blocks = unrecovered_blocks.saturating_add(unrecovered);
-        if repaired > 0 {
+        if repaired > 0
+            && unrecovered == 0
+            && outcome.evidence.outcome == RecoveryOutcome::Recovered
+        {
             repaired_groups.push(group);
         }
 
@@ -2139,6 +2145,93 @@ pub fn preflight_btrfs_repair_groups<'a>(
         .collect()
 }
 
+/// Refuse to replace repair evidence with bytes still known to be corrupt.
+/// This checks the complete source range, including after partial recovery or
+/// when the command's initial scrub covered only a different selected group.
+fn check_rebuild_sources(
+    cx: &Cx,
+    device: &dyn BlockDevice,
+    validator: &dyn BlockValidator,
+    first: BlockNumber,
+    count: u32,
+) -> Result<()> {
+    cx.checkpoint()
+        .map_err(|_| ffs_error::FfsError::Cancelled)?;
+    let report = Scrubber::new(device, validator).scrub_range(cx, first, u64::from(count))?;
+    if count == 0
+        || report.blocks_scanned != u64::from(count)
+        || report.blocks_io_error != 0
+        || report.count_at_severity(Severity::Error) != 0
+    {
+        bail!(
+            "repair source validation refused: requested={count} scanned={} io_errors={} errors={}",
+            report.blocks_scanned,
+            report.blocks_io_error,
+            report.count_at_severity(Severity::Error)
+        );
+    }
+    Ok(())
+}
+
+/// Explicit regeneration may advance a pending generation, but may never use
+/// that generation for recovery or erase its high-water mark by bootstrapping.
+fn publish_rebuilt_symbols(
+    cx: &Cx,
+    device: &dyn BlockDevice,
+    layout: RepairGroupLayout,
+    encoded: EncodedGroup,
+) -> Result<()> {
+    let storage = RepairGroupStorage::new(device, layout);
+    let bootstrap = RepairGroupDescExt {
+        transfer_length: u64::from(encoded.source_block_count) * u64::from(encoded.symbol_size),
+        symbol_size: u16::try_from(encoded.symbol_size)
+            .context("repair symbol size exceeds u16")?,
+        source_block_count: u16::try_from(encoded.source_block_count)
+            .context("repair source block count exceeds u16")?,
+        sub_blocks: 1,
+        symbol_alignment: 4,
+        repair_start_block: layout.repair_start_block(),
+        repair_block_count: layout.repair_block_count,
+        repair_generation: 0,
+        checksum: 0,
+    };
+    let mut pristine = true;
+    for block in layout.descriptor_blocks() {
+        cx.checkpoint()
+            .map_err(|_| ffs_error::FfsError::Cancelled)?;
+        let bytes = device.read_block(cx, block)?;
+        if bytes.len() != device.block_size() as usize {
+            bail!("short repair descriptor read");
+        }
+        pristine &= bytes.as_slice().iter().all(|&byte| byte == 0);
+    }
+    let current = if pristine {
+        bootstrap.clone()
+    } else {
+        storage.read_refresh_descriptor(cx)?
+    };
+    let next = current
+        .repair_generation
+        .checked_add(1)
+        .context("repair generation exhausted")?;
+    let mut geometry = current;
+    geometry.repair_generation = 0;
+    geometry.checksum = 0;
+    if geometry.to_bytes() != bootstrap.to_bytes() {
+        bail!("stored repair geometry differs from regenerated source geometry");
+    }
+    if pristine {
+        storage.write_group_desc_ext(cx, &bootstrap)?;
+    }
+    let symbols: Vec<_> = encoded
+        .repair_symbols
+        .into_iter()
+        .map(|symbol| (symbol.esi, symbol.data))
+        .collect();
+    storage.write_repair_symbols(cx, &symbols, next)?;
+    Ok(())
+}
+
 /// Re-encode symbols only after the entire requested write plan is admitted.
 #[allow(clippy::too_many_lines)]
 pub fn rebuild_btrfs_repair_symbols(
@@ -2163,10 +2256,25 @@ pub fn rebuild_btrfs_repair_symbols(
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     let block_dev = ByteBlockDevice::new(byte_dev, block_size)
         .with_context(|| format!("failed to create block device (block_size={block_size})"))?;
+    let validator = scrub_validator(&tail_fs.flavor, block_size);
     let mut rebuilt_groups = 0_u64;
     let mut failed_groups = 0_u64;
     for spec in admitted {
         let group = spec.group;
+
+        if let Err(error) = check_rebuild_sources(
+            &cx,
+            &block_dev,
+            &*validator,
+            spec.physical_start_block,
+            spec.source_block_count,
+        ) {
+            failed_groups = failed_groups.saturating_add(1);
+            limitations.push(format!(
+                "cannot rebuild symbols for btrfs group {group}: {error}"
+            ));
+            continue;
+        }
 
         let encoded = match encode_group(
             &cx,
@@ -2187,56 +2295,7 @@ pub fn rebuild_btrfs_repair_symbols(
             }
         };
 
-        let Ok(symbol_size) = u16::try_from(encoded.symbol_size) else {
-            failed_groups = failed_groups.saturating_add(1);
-            limitations.push(format!(
-                "cannot rebuild symbols for btrfs group {group}: symbol_size {} exceeds u16",
-                encoded.symbol_size
-            ));
-            continue;
-        };
-        let Ok(source_block_count_u16) = u16::try_from(encoded.source_block_count) else {
-            failed_groups = failed_groups.saturating_add(1);
-            limitations.push(format!(
-                "cannot rebuild symbols for btrfs group {group}: source_block_count {} exceeds u16",
-                encoded.source_block_count
-            ));
-            continue;
-        };
-
-        let storage = RepairGroupStorage::new(&block_dev, spec.layout);
-        let current_generation = if let Ok(desc) = storage.read_group_desc_ext(&cx) {
-            desc.repair_generation
-        } else {
-            let bootstrap = RepairGroupDescExt {
-                transfer_length: u64::from(encoded.source_block_count)
-                    .saturating_mul(u64::from(encoded.symbol_size)),
-                symbol_size,
-                source_block_count: source_block_count_u16,
-                sub_blocks: 1,
-                symbol_alignment: 4,
-                repair_start_block: spec.layout.repair_start_block(),
-                repair_block_count: spec.layout.repair_block_count,
-                repair_generation: 0,
-                checksum: 0,
-            };
-            if let Err(error) = storage.write_group_desc_ext(&cx, &bootstrap) {
-                failed_groups = failed_groups.saturating_add(1);
-                limitations.push(format!(
-                    "failed to bootstrap repair descriptor for btrfs group {group}: {error}"
-                ));
-                continue;
-            }
-            0
-        };
-
-        let symbols: Vec<(u32, Vec<u8>)> = encoded
-            .repair_symbols
-            .into_iter()
-            .map(|symbol| (symbol.esi, symbol.data))
-            .collect();
-        let new_generation = current_generation.saturating_add(1).max(1);
-        match storage.write_repair_symbols(&cx, &symbols, new_generation) {
+        match publish_rebuilt_symbols(&cx, &block_dev, spec.layout, encoded) {
             Ok(()) => {
                 rebuilt_groups = rebuilt_groups.saturating_add(1);
             }
@@ -2274,10 +2333,28 @@ pub fn rebuild_ext4_repair_symbols(
         .with_context(|| format!("failed to open image: {}", path.display()))?;
     let block_dev = ByteBlockDevice::new(byte_dev, block_size)
         .with_context(|| format!("failed to create block device (block_size={block_size})"))?;
+    let sb = tail_fs
+        .ext4_superblock()
+        .context("ext4 repair rebuild requires an ext4 image")?;
+    let validator = offline_ext4_scrub_validator(&cx, path, &block_dev, sb)?;
     let mut rebuilt_groups = 0_u64;
     let mut failed_groups = 0_u64;
     for spec in admitted {
         let group = spec.group;
+
+        if let Err(error) = check_rebuild_sources(
+            &cx,
+            &block_dev,
+            &*validator,
+            spec.source_first_block,
+            spec.source_block_count,
+        ) {
+            failed_groups = failed_groups.saturating_add(1);
+            limitations.push(format!(
+                "cannot rebuild symbols for ext4 group {group}: {error}"
+            ));
+            continue;
+        }
 
         let encoded = match encode_group(
             &cx,
@@ -2298,56 +2375,7 @@ pub fn rebuild_ext4_repair_symbols(
             }
         };
 
-        let Ok(symbol_size) = u16::try_from(encoded.symbol_size) else {
-            failed_groups = failed_groups.saturating_add(1);
-            limitations.push(format!(
-                "cannot rebuild symbols for ext4 group {group}: symbol_size {} exceeds u16",
-                encoded.symbol_size
-            ));
-            continue;
-        };
-        let Ok(source_block_count_u16) = u16::try_from(encoded.source_block_count) else {
-            failed_groups = failed_groups.saturating_add(1);
-            limitations.push(format!(
-                "cannot rebuild symbols for ext4 group {group}: source_block_count {} exceeds u16",
-                encoded.source_block_count
-            ));
-            continue;
-        };
-
-        let storage = RepairGroupStorage::new(&block_dev, spec.layout);
-        let current_generation = if let Ok(desc) = storage.read_group_desc_ext(&cx) {
-            desc.repair_generation
-        } else {
-            let bootstrap = RepairGroupDescExt {
-                transfer_length: u64::from(encoded.source_block_count)
-                    .saturating_mul(u64::from(encoded.symbol_size)),
-                symbol_size,
-                source_block_count: source_block_count_u16,
-                sub_blocks: 1,
-                symbol_alignment: 4,
-                repair_start_block: spec.layout.repair_start_block(),
-                repair_block_count: spec.layout.repair_block_count,
-                repair_generation: 0,
-                checksum: 0,
-            };
-            if let Err(error) = storage.write_group_desc_ext(&cx, &bootstrap) {
-                failed_groups = failed_groups.saturating_add(1);
-                limitations.push(format!(
-                    "failed to bootstrap repair descriptor for ext4 group {group}: {error}"
-                ));
-                continue;
-            }
-            0
-        };
-
-        let symbols: Vec<(u32, Vec<u8>)> = encoded
-            .repair_symbols
-            .into_iter()
-            .map(|symbol| (symbol.esi, symbol.data))
-            .collect();
-        let new_generation = current_generation.saturating_add(1).max(1);
-        match storage.write_repair_symbols(&cx, &symbols, new_generation) {
+        match publish_rebuilt_symbols(&cx, &block_dev, spec.layout, encoded) {
             Ok(()) => {
                 rebuilt_groups = rebuilt_groups.saturating_add(1);
             }
@@ -3194,6 +3222,214 @@ pub fn print_repair_output(json: bool, output: &RepairOutput) -> Result<()> {
 mod coordination_tests {
     use super::*;
     use ffs_repair::ownership::CoordinationRecord;
+
+    fn repair_rebuild_fixture() -> (PathBuf, ByteBlockDevice<FileByteDevice>, RepairGroupLayout) {
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("repair-blocks.img");
+        let mut bytes = vec![0; 16 * 512];
+        for (index, byte) in bytes[..4 * 512].iter_mut().enumerate() {
+            *byte = u8::try_from(index % 251).unwrap();
+        }
+        std::fs::write(&path, bytes).unwrap();
+        let device = ByteBlockDevice::new(FileByteDevice::open(&path).unwrap(), 512).unwrap();
+        let layout = RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 16, 0, 2).unwrap();
+        (path, device, layout)
+    }
+
+    fn repair_rebuild_encoding(cx: &Cx, device: &dyn BlockDevice) -> EncodedGroup {
+        encode_group(cx, device, &[7; 16], GroupNumber(0), BlockNumber(0), 4, 2).unwrap()
+    }
+
+    struct InterruptedParityWrite<'a> {
+        device: &'a dyn BlockDevice,
+        first_parity: BlockNumber,
+        fail_read: Option<BlockNumber>,
+    }
+
+    impl BlockDevice for InterruptedParityWrite<'_> {
+        fn read_block(
+            &self,
+            cx: &Cx,
+            block: BlockNumber,
+        ) -> ffs_error::Result<ffs_block::BlockBuf> {
+            if self.fail_read == Some(block) {
+                return Err(ffs_error::FfsError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "planted descriptor read denial",
+                )));
+            }
+            self.device.read_block(cx, block)
+        }
+
+        fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> ffs_error::Result<()> {
+            if block == self.first_parity {
+                return Err(ffs_error::FfsError::Io(std::io::Error::other(
+                    "planted interruption after durable pending descriptors",
+                )));
+            }
+            self.device.write_block(cx, block, data)
+        }
+
+        fn block_size(&self) -> u32 {
+            self.device.block_size()
+        }
+
+        fn block_count(&self) -> u64 {
+            self.device.block_count()
+        }
+
+        fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+            self.device.sync(cx)
+        }
+    }
+
+    #[test]
+    fn repair_rebuild_resumes_durable_pending_generation_without_source_writes() {
+        let (path, device, layout) = repair_rebuild_fixture();
+        let cx = cli_cx();
+        let original = std::fs::read(&path).unwrap();
+        publish_rebuilt_symbols(&cx, &device, layout, repair_rebuild_encoding(&cx, &device))
+            .unwrap();
+        let encoded = repair_rebuild_encoding(&cx, &device);
+        let expected: Vec<_> = encoded
+            .repair_symbols
+            .into_iter()
+            .map(|symbol| (symbol.esi, symbol.data))
+            .collect();
+        let interrupted = InterruptedParityWrite {
+            device: &device,
+            first_parity: layout.repair_start_block(),
+            fail_read: None,
+        };
+        let error = RepairGroupStorage::new(&interrupted, layout)
+            .write_repair_symbols(&cx, &expected, 7)
+            .unwrap_err();
+        assert!(error.to_string().contains("planted interruption"));
+        // Reopen the real backing file: the fence must survive process-local state.
+        let reopened = ByteBlockDevice::new(FileByteDevice::open(&path).unwrap(), 512).unwrap();
+        let storage = RepairGroupStorage::new(&reopened, layout);
+        assert_eq!(
+            storage
+                .read_refresh_descriptor(&cx)
+                .unwrap()
+                .repair_generation,
+            7
+        );
+        assert!(storage.read_group_desc_ext(&cx).is_err());
+        assert!(storage.read_repair_symbols(&cx).is_err());
+        publish_rebuilt_symbols(
+            &cx,
+            &reopened,
+            layout,
+            repair_rebuild_encoding(&cx, &reopened),
+        )
+        .unwrap();
+        assert_eq!(
+            storage.read_group_desc_ext(&cx).unwrap().repair_generation,
+            8
+        );
+        assert_eq!(storage.read_repair_symbols(&cx).unwrap(), expected);
+        assert_eq!(
+            &std::fs::read(path).unwrap()[..4 * 512],
+            &original[..4 * 512]
+        );
+    }
+
+    #[test]
+    fn repair_rebuild_refuses_ambiguous_corrupt_and_exhausted_descriptors_without_writes() {
+        for case in ["ambiguous", "corrupt", "exhausted", "geometry"] {
+            let (path, device, layout) = repair_rebuild_fixture();
+            let cx = cli_cx();
+            publish_rebuilt_symbols(&cx, &device, layout, repair_rebuild_encoding(&cx, &device))
+                .unwrap();
+            let storage = RepairGroupStorage::new(&device, layout);
+            let mut descriptor = storage.read_refresh_descriptor(&cx).unwrap();
+            match case {
+                "ambiguous" => {
+                    descriptor.symbol_alignment = 8;
+                    let mut bytes = vec![0; 512];
+                    bytes[..RepairGroupDescExt::SIZE].copy_from_slice(&descriptor.to_bytes());
+                    device
+                        .write_block(&cx, layout.descriptor_blocks()[0], &bytes)
+                        .unwrap();
+                }
+                "corrupt" => {
+                    for block in layout.descriptor_blocks() {
+                        device.write_block(&cx, block, &[0xA5; 512]).unwrap();
+                    }
+                }
+                "exhausted" => {
+                    descriptor.repair_generation = u64::MAX;
+                    storage.write_group_desc_ext(&cx, &descriptor).unwrap();
+                }
+                "geometry" => {
+                    descriptor.repair_generation = 2;
+                    descriptor.symbol_alignment = 8;
+                    storage.write_group_desc_ext(&cx, &descriptor).unwrap();
+                }
+                _ => unreachable!(),
+            }
+            device.sync(&cx).unwrap();
+            let before = std::fs::read(&path).unwrap();
+            let error = publish_rebuilt_symbols(
+                &cx,
+                &device,
+                layout,
+                repair_rebuild_encoding(&cx, &device),
+            )
+            .unwrap_err();
+            let expected = match case {
+                "ambiguous" => "ambiguous descriptors",
+                "corrupt" => "no committed raw repair descriptor",
+                "exhausted" => "generation exhausted",
+                _ => "geometry differs",
+            };
+            assert!(error.to_string().contains(expected), "{case}: {error:#}");
+            assert_eq!(std::fs::read(path).unwrap(), before, "{case}");
+        }
+    }
+
+    #[test]
+    fn repair_rebuild_rejects_incomplete_or_corrupt_source_coverage() {
+        let (path, _, _) = repair_rebuild_fixture();
+        let device = ByteBlockDevice::new(FileByteDevice::open(&path).unwrap(), 1024).unwrap();
+        let cx = cli_cx();
+        let validator = ffs_repair::scrub::Ext4SuperblockValidator::new(1024);
+        // Block 1 contains the ext4 superblock location but no valid superblock.
+        assert!(check_rebuild_sources(&cx, &device, &validator, BlockNumber(1), 1).is_err());
+        assert!(check_rebuild_sources(&cx, &device, &validator, BlockNumber(7), 2).is_err());
+        assert!(check_rebuild_sources(&cx, &device, &validator, BlockNumber(0), 0).is_err());
+        check_rebuild_sources(&cx, &device, &validator, BlockNumber(0), 1).unwrap();
+    }
+
+    #[test]
+    fn repair_rebuild_preserves_descriptor_io_and_cancellation_errors() {
+        let (path, device, layout) = repair_rebuild_fixture();
+        let cx = cli_cx();
+        let before = std::fs::read(&path).unwrap();
+        let denied = InterruptedParityWrite {
+            device: &device,
+            first_parity: layout.repair_start_block(),
+            fail_read: Some(layout.descriptor_blocks()[1]),
+        };
+        let error =
+            publish_rebuilt_symbols(&cx, &denied, layout, repair_rebuild_encoding(&cx, &device))
+                .unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ffs_error::FfsError>(),
+            Some(ffs_error::FfsError::Io(error))
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+        ));
+        assert_eq!(std::fs::read(&path).unwrap(), before);
+        let encoded = repair_rebuild_encoding(&cx, &device);
+        cx.set_cancel_requested(true);
+        let error = publish_rebuilt_symbols(&cx, &device, layout, encoded).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ffs_error::FfsError>(),
+            Some(ffs_error::FfsError::Cancelled)
+        ));
+        assert_eq!(std::fs::read(path).unwrap(), before);
+    }
 
     /// Create a unique temporary directory and return a fake image path inside
     /// it. The image file itself is not created; coordination only needs the

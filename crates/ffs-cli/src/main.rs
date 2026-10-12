@@ -14728,6 +14728,80 @@ mod tests {
     }
 
     #[test]
+    fn repair_rebuild_ext4_refuses_corruption_then_advances_pending_generation_bd_11a8t() {
+        let dir = tempfile::tempdir().unwrap();
+        let fixture = protected_ext4_image_bd_jufod(&dir, 0);
+        let _kept = dir.keep();
+        let Some(ProtectedExt4 { image: path, .. }) = fixture else {
+            return;
+        };
+        let image = std::fs::read(&path).unwrap();
+        let sb = ffs_ondisk::Ext4Superblock::parse_from_image(&image).unwrap();
+        let specs = build_ext4_repair_group_specs(&sb).unwrap();
+        let cx = crate::cli_cx();
+        let fs = OpenFs::open(&cx, &path).unwrap();
+        let root = fs.read_inode(&cx, ffs_types::InodeNumber(2)).unwrap();
+        let directory = fs.collect_extents(&cx, &root).unwrap()[0].physical_start;
+        assert!(directory >= specs[0].source_first_block.0);
+        assert!(directory < specs[0].source_first_block.0 + u64::from(specs[0].source_block_count));
+        let mut limitations = Vec::new();
+        let rebuild = |limitations: &mut Vec<String>| {
+            crate::cmd_repair::rebuild_ext4_repair_symbols(
+                &path,
+                sb.block_size,
+                sb.uuid,
+                &specs,
+                &[0],
+                limitations,
+            )
+            .unwrap()
+        };
+        let device =
+            ByteBlockDevice::new(FileByteDevice::open(&path).unwrap(), sb.block_size).unwrap();
+        let storage = ffs_repair::storage::RepairGroupStorage::new(&device, specs[0].layout);
+        let mut descriptor = storage.read_refresh_descriptor(&cx).unwrap();
+        assert_eq!(descriptor.repair_generation, 1);
+        descriptor.repair_generation = 7;
+        storage.write_group_desc_ext(&cx, &descriptor).unwrap();
+        device.sync(&cx).unwrap();
+        assert!(storage.read_group_desc_ext(&cx).is_err());
+
+        let corrupt_offset =
+            usize::try_from(directory).unwrap() * usize::try_from(sb.block_size).unwrap() + 20;
+        flip_byte(&path, corrupt_offset);
+        let corrupted = std::fs::read(&path).unwrap();
+        let fs = OpenFs::open(&cx, &path).unwrap();
+        crate::cmd_repair::preflight_ext4_repair_groups(&cx, &fs, &specs, &[0], "rebuild_test")
+            .expect("allocation preflight must not mask the source-validation check");
+        assert_eq!(rebuild(&mut limitations), (0, 1));
+        assert!(
+            limitations
+                .iter()
+                .any(|error| error.contains("repair source validation refused")),
+            "{limitations:?}"
+        );
+        assert_eq!(std::fs::read(&path).unwrap(), corrupted);
+
+        flip_byte(&path, corrupt_offset);
+        limitations.clear();
+        assert_eq!(rebuild(&mut limitations), (1, 0));
+        assert!(limitations.is_empty(), "{limitations:?}");
+        assert_eq!(
+            storage.read_group_desc_ext(&cx).unwrap().repair_generation,
+            8
+        );
+        let source_start = usize::try_from(specs[0].source_first_block.0).unwrap()
+            * usize::try_from(sb.block_size).unwrap();
+        let source_end = source_start
+            + usize::try_from(specs[0].source_block_count).unwrap()
+                * usize::try_from(sb.block_size).unwrap();
+        assert_eq!(
+            &std::fs::read(path).unwrap()[source_start..source_end],
+            &image[source_start..source_end]
+        );
+    }
+
+    #[test]
     fn repair_tail_safe_plan_rebuilds_and_unsafe_mount_refuses_bd_plamw() {
         let image = repair_tail_test_image_bd_plamw();
         let sb = ffs_ondisk::Ext4Superblock::parse_from_image(&image).unwrap();
