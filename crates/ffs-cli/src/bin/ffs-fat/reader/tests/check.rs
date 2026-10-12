@@ -1,6 +1,6 @@
 use super::*;
 
-fn checked_image(kind: FatKind) -> Image {
+pub(super) fn checked_image(kind: FatKind) -> Image {
     let mut image = Image::new(kind);
     if kind == FatKind::Fat32 {
         for (offset, value) in [
@@ -39,6 +39,34 @@ fn one_long_name(alias: &[u8; 11], text: &str) -> [u8; 32] {
         slot[offset..offset + 2].copy_from_slice(&unit.to_le_bytes());
     }
     slot
+}
+
+#[test]
+fn selected_oem_aliases_collide_with_native_lfns_consistently() {
+    let cx = Cx::for_testing();
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        for page in [FatOemCodePage::Cp437, FatOemCodePage::Cp850] {
+            let mut image = checked_image(kind);
+            let root = image.root_location();
+            image.record(root, b"\x90COLE   TXT", 5, 1029, false);
+            let alias = *b"LONGNA~1TXT";
+            image.bytes[root + 64..root + 96].copy_from_slice(&one_long_name(&alias, "école.txt"));
+            image.record(root + 96, &alias, 0, 0, false);
+            let volume = image.volume().with_oem_code_page(page);
+            assert!(matches!(
+                volume.lookup(&cx, Directory::Root, "ÉCOLE.TXT"),
+                Err(FfsError::Corruption { .. })
+            ));
+            let report = volume.check(&cx).unwrap();
+            assert!(report.complete);
+            assert!(has_finding(&report, "name_collision"));
+            assert_eq!(report.lost_clusters, Some(0));
+            assert!(matches!(
+                crate::filesystem::FatFs::new(&cx, volume, 0, 0),
+                Err(FfsError::Corruption { .. })
+            ));
+        }
+    }
 }
 
 #[test]
@@ -176,7 +204,10 @@ fn allocation_check_covers_short_excess_cyclic_free_and_invalid_file_chains() {
                     "{kind:?} scenario {scenario}: {report:?}"
                 );
             } else {
-                assert!(report.is_clean(), "{kind:?} scenario {scenario}: {report:?}");
+                assert!(
+                    report.is_clean(),
+                    "{kind:?} scenario {scenario}: {report:?}"
+                );
                 assert_eq!(report.preallocated_clusters, 1);
                 assert_eq!(report.lost_clusters, Some(0));
             }
@@ -721,7 +752,6 @@ fn checker_preserves_the_image_and_bytes_outside_the_selected_volume() {
     }
 }
 
-
 #[test]
 fn checker_terminates_when_a_shared_suffix_is_itself_cyclic() {
     let cx = Cx::for_testing();
@@ -736,13 +766,20 @@ fn checker_terminates_when_a_shared_suffix_is_itself_cyclic() {
         assert_eq!(report.referenced_clusters, report.allocated_clusters);
         assert_eq!(report.omitted_issues, 0);
         assert_eq!(
-            report.issues.iter().filter(|issue| issue.kind == "cyclic_chain").count(),
+            report
+                .issues
+                .iter()
+                .filter(|issue| issue.kind == "cyclic_chain")
+                .count(),
             2
         );
         for cluster in [9, 7] {
-            assert!(report.issues.iter().any(|issue| {
-                issue.kind == "cross_link" && issue.cluster == Some(cluster)
-            }));
+            assert!(
+                report
+                    .issues
+                    .iter()
+                    .any(|issue| { issue.kind == "cross_link" && issue.cluster == Some(cluster) })
+            );
         }
     }
 }

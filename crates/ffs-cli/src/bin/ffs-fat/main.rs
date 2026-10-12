@@ -9,7 +9,7 @@ use anyhow::{Context, Result, bail};
 use asupersync::Cx;
 use clap::{Args, Parser, Subcommand};
 use ffs_error::FfsError;
-use ffs_ondisk::fat::FatKind;
+use ffs_ondisk::fat::{FatKind, FatOemCodePage};
 use reader::{Directory, Entry, FatVolume, checkpoint};
 use std::collections::BTreeSet;
 use std::io::{self, Write};
@@ -35,11 +35,15 @@ struct ImageArgs {
     /// Maximum byte length of that volume; defaults to the remaining image.
     #[arg(long)]
     length: Option<u64>,
+    /// Short-name code page: ascii, 437, or 850. FAT does not store this choice.
+    #[arg(long, default_value = "ascii")]
+    oem_code_page: FatOemCodePage,
 }
 
 impl ImageArgs {
     fn open(&self, cx: &Cx) -> Result<FatVolume> {
         FatVolume::open(cx, &self.image, self.offset, self.length)
+            .map(|volume| volume.with_oem_code_page(self.oem_code_page))
             .with_context(|| format!("opening offline FAT volume in {}", self.image.display()))
     }
 }
@@ -196,7 +200,7 @@ fn native_catalog(
             "name": name,
             "display_error": display_error,
             "short_name_bytes": entry.native.short_name,
-            "short_alias": entry.native.ascii_short_name(),
+            "short_alias": entry.short_alias(),
             "long_name_utf16": entry.native.long_name,
             "case_flags": entry.native.case_flags,
             "attributes": entry.native.attributes,
@@ -209,6 +213,7 @@ fn native_catalog(
     Ok(serde_json::json!({
         "format": format!("{:?}", volume.geometry.kind()),
         "read_only": true,
+        "oem_code_page": volume.oem_code_page().label(),
         "volume_offset": volume_offset,
         "volume_bytes": volume.geometry.volume_bytes(),
         "entry_offset_origin": "selected_volume",
@@ -344,6 +349,7 @@ fn main() -> Result<()> {
             let report = serde_json::json!({
                 "format": format!("{:?}", geometry.kind()),
                 "read_only": true,
+                "oem_code_page": volume.oem_code_page().label(),
                 "volume_offset": image.offset,
                 "volume_bytes": geometry.volume_bytes(),
                 "sector_bytes": geometry.sector_bytes(),
@@ -381,7 +387,7 @@ fn main() -> Result<()> {
             for entry in entries {
                 report.push(serde_json::json!({
                     "name": entry.name()?,
-                    "short_alias": entry.native.ascii_short_name(),
+                    "short_alias": entry.short_alias(),
                     "directory": entry.native.is_directory(),
                     "size": entry.native.size,
                     "first_cluster": entry.native.first_cluster,
@@ -453,6 +459,53 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_requires_an_explicit_supported_oem_code_page() {
+        for (value, page) in [
+            ("ascii", FatOemCodePage::Ascii),
+            ("437", FatOemCodePage::Cp437),
+            ("850", FatOemCodePage::Cp850),
+        ] {
+            for command in ["ls", "check", "catalog"] {
+                let cli =
+                    Cli::try_parse_from(["ffs-fat", command, "disk.img", "--oem-code-page", value])
+                        .unwrap();
+                let image = match cli.command {
+                    Command::Ls { image, .. }
+                    | Command::Check { image }
+                    | Command::Catalog { image, .. } => image,
+                    _ => panic!("expected image command"),
+                };
+                assert_eq!(image.oem_code_page, page);
+            }
+        }
+        for invalid in ["auto", "utf8", "932", "", "CP850"] {
+            assert!(
+                Cli::try_parse_from(["ffs-fat", "ls", "disk.img", "--oem-code-page", invalid])
+                    .is_err()
+            );
+        }
+        let Command::Ls { image, .. } = Cli::try_parse_from(["ffs-fat", "ls", "disk.img"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected ls");
+        };
+        assert_eq!(image.oem_code_page, FatOemCodePage::Ascii);
+        assert!(
+            Cli::try_parse_from([
+                "ffs-fat",
+                "mount",
+                "disk.img",
+                "/mnt/fat",
+                "--offline-image",
+                "--oem-code-page",
+                "850"
+            ])
+            .is_ok()
+        );
+    }
 
     #[test]
     fn check_accepts_a_bounded_volume_and_refuses_repair_options() {
@@ -640,6 +693,7 @@ mod tests {
                 let entry = Entry {
                     offset: 4096,
                     native,
+                    oem_code_page: FatOemCodePage::Ascii,
                 };
                 let result = native_presentation(&entry);
                 if invalid {
@@ -655,6 +709,7 @@ mod tests {
                 short[1] = byte;
                 let entry = Entry {
                     offset: 4096,
+                    oem_code_page: FatOemCodePage::Ascii,
                     native: FatDirectoryDecoder::default()
                         .push(&short, kind)
                         .unwrap()
@@ -668,6 +723,7 @@ mod tests {
             short[..8].fill(b' ');
             let entry = Entry {
                 offset: 4096,
+                oem_code_page: FatOemCodePage::Ascii,
                 native: FatDirectoryDecoder::default()
                     .push(&short, kind)
                     .unwrap()

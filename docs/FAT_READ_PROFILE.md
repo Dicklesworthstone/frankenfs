@@ -304,12 +304,35 @@ individual file allocation maps at 8,388,608 clusters; individual reads at
 chain caches at 1,024 files and 32 MiB of cluster addresses. These are admission
 and resource limits, not assertions of full FAT parity.
 
-Path commands and mounts use lossless UTF-8 LFNs and ASCII short names;
-non-ASCII OEM-only names, unpaired UTF-16 surrogates and names exceeding the
-host's 255-byte limit have no admitted path spelling. The native catalog and
-entry-slot extraction below can access those names without conversion.
-Comparisons fold ASCII only, not Windows Unicode collation. Permissions/ownership
-are explicit read-only Unix projections.
+Path commands and mounts use lossless UTF-8 LFNs and short names decoded with
+the explicit `--oem-code-page ascii|437|850` option. The default `ascii` preserves
+the conservative refusal of non-ASCII OEM-only names. FAT stores no OEM code-page
+identifier, so the reader never infers it from the BPB, volume label, host locale,
+or observed filenames. CP437 and CP850 decode all native bytes, restore the
+first-byte `0x05` escape to `0xE5`, and honor independent base/extension lowercase
+flags. The selected page remains fixed across a volume's cached directory entries.
+
+```sh
+ffs-fat ls disk.img --oem-code-page 850
+ffs-fat cat disk.img --oem-code-page 850 /ÉCOLE.TXT
+ffs-fat check disk.img --oem-code-page 437
+ffs-fat mount disk.img /mnt/fat --offline-image --oem-code-page 850
+```
+
+Lookup, mounted directory collision checks, and checker alias/LFN collision
+checks use ASCII case folding plus the selected page's representable native
+case pairs. They do not expand sharp s to `SS`, remove accents, normalize Unicode,
+or claim Windows' full Unicode LFN collation. Characters outside the selected
+page compare exactly; CP850 includes the native one-way dotless-i-to-`I` mapping.
+The byte mappings follow the Unicode Consortium's Microsoft
+[CP437](https://www.unicode.org/Public/MAPPINGS/VENDORS/MICSFT/PC/CP437.TXT) and
+[CP850](https://www.unicode.org/Public/MAPPINGS/VENDORS/MICSFT/PC/CP850.TXT) tables;
+the native case pairs agree with Linux v6.19's corresponding NLS tables.
+
+Unpaired UTF-16 surrogates and names exceeding the host's 255-byte limit still
+have no admitted path spelling. The native catalog and entry-slot extraction
+below access those entries without converting their identity. Permissions and
+ownership remain explicit read-only Unix projections.
 Native timestamps use a deterministic UTC projection of FAT wall-clock fields;
 the format records no timezone, so this projection does not recover the original
 instant. Creation preserves its native 10 ms precision (including odd seconds),
@@ -328,8 +351,9 @@ MVCC/RaptorQ protection, and NTFS/ZFS implementation remain separate work.
 `catalog` lists the root by default. Each live ordinary entry includes its raw
 11-byte short name, optional assembled UTF-16 LFN, optional lossless display name
 and display error, attributes, file size, first cluster, and an exact `entry_slots`
-selector. Non-ASCII OEM bytes are retained without assuming a code page; the
-native 0x05 short-name escape is retained. Unpaired UTF-16 units and names whose
+selector. All OEM bytes and the native `0x05` short-name escape remain unchanged
+in `short_name_bytes`; `name` and `short_alias` use the selected page, reported as
+`oem_code_page` in the catalog envelope. Unpaired UTF-16 units and names whose
 UTF-8 representation exceeds the host limit remain accessible through selectors.
 
 A selector is a comma-separated root-to-entry chain of decimal short-entry byte
@@ -361,7 +385,7 @@ or perform the full allocation/namespace check described below.
 `ffs-fat check` walks the admitted directory tree and every addressable allocation
 entry, returning a JSON report. It identifies cross-linked file/directory chains,
 live chain cycles, short file chains, allocated clusters unreachable from the
-tree, contradictory native short names and ASCII aliases, invalid native
+tree, contradictory native short names and aliases under the selected code page, invalid native
 dot/parent links, nonzero directory sizes, misplaced dot entries, malformed or
 orphaned LFN sets, reserved allocation values and invalid successors. FAT32
 FSInfo signatures and known free-count/search hints are checked against the
@@ -370,7 +394,7 @@ is repaired. The normal reader may still use a short alias after malformed LFN
 records; the checker retains that damage as an issue. Ownership traversal keeps
 raw native names even when the reader's UTF-8/OEM display projection is unavailable.
 
-The flat report retains `format`, `read_only`, `scope`, `clean`,
+The flat report retains `format`, `read_only`, `oem_code_page`, `scope`, `clean`,
 `namespace_complete`, `issues` (each with `kind`), `omitted_issues`, allocation
 counts, file/directory counts, and `fs_info_free_hint`. It also reports explicit
 `status`/`complete`, volume bounds, data-cluster coverage, and reserved,

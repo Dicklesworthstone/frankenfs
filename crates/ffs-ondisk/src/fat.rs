@@ -8,6 +8,9 @@
 use ffs_types::{ParseError, ensure_slice, read_le_u16, read_le_u32};
 use std::time::Duration;
 
+mod names;
+pub use names::FatOemCodePage;
+
 fn invalid(field: &'static str, reason: &'static str) -> ParseError {
     ParseError::InvalidField { field, reason }
 }
@@ -368,30 +371,13 @@ impl FatDirEntry {
     /// not decoded with the host's locale or with a lossy UTF-8 conversion.
     #[must_use]
     pub fn ascii_short_name(&self) -> Option<String> {
-        if !self.short_name.is_ascii() || self.short_name[0] == 5 {
-            return None;
-        }
-        let mut name = String::new();
-        for (part, lower) in [(&self.short_name[..8], 0x08), (&self.short_name[8..], 0x10)] {
-            let end = part.iter().rposition(|b| *b != b' ').map_or(0, |n| n + 1);
-            if end == 0 {
-                continue;
-            }
-            if !name.is_empty() {
-                name.push('.');
-            }
-            for &byte in &part[..end] {
-                if byte < 0x20 || matches!(byte, b'/' | b'\\' | b':' | 0x7F) {
-                    return None;
-                }
-                name.push(char::from(if self.case_flags & lower != 0 {
-                    byte.to_ascii_lowercase()
-                } else {
-                    byte
-                }));
-            }
-        }
-        (!name.is_empty()).then_some(name)
+        self.oem_short_name(FatOemCodePage::Ascii)
+    }
+
+    /// Lossless short-name presentation using an explicitly selected OEM page.
+    #[must_use]
+    pub fn oem_short_name(&self, code_page: FatOemCodePage) -> Option<String> {
+        code_page.short_name(&self.short_name, self.case_flags)
     }
 }
 
@@ -871,15 +857,15 @@ mod tests {
         }
         for (date, time, fraction) in [
             (0, 0, 0),
-            (0x0001, 0, 0), // Month zero.
-            (0x0020, 0, 0), // Day zero.
-            (0x01A1, 0, 0), // Month thirteen.
-            (0x005E, 0, 0), // February thirty.
-            (0x565D, 0, 0), // 2023 is not a leap year.
-            (0xF05D, 0, 0), // 2100 is not a leap year.
+            (0x0001, 0, 0),      // Month zero.
+            (0x0020, 0, 0),      // Day zero.
+            (0x01A1, 0, 0),      // Month thirteen.
+            (0x005E, 0, 0),      // February thirty.
+            (0x565D, 0, 0),      // 2023 is not a leap year.
+            (0xF05D, 0, 0),      // 2100 is not a leap year.
             (0x0021, 0xC000, 0), // Hour twenty-four.
             (0x0021, 0x0780, 0), // Minute sixty.
-            (0x0021, 30, 0), // Encoded second sixty.
+            (0x0021, 30, 0),     // Encoded second sixty.
             (0x0021, 31, 0),
             (0x0021, 0, 200),
             (0x0021, 0, 255),
@@ -909,11 +895,7 @@ mod tests {
             assert_eq!(entry.created_time, 0x645C);
             assert_eq!(entry.created_centiseconds, 157);
             assert_eq!(entry.accessed_date, 0x5861);
-            let created = entry
-                .created_timestamp()
-                .unwrap()
-                .unwrap()
-                .utc_projection();
+            let created = entry.created_timestamp().unwrap().unwrap().utc_projection();
             assert_eq!(
                 (created.as_secs(), created.subsec_nanos()),
                 (1_709_210_097, 570_000_000)
@@ -948,7 +930,10 @@ mod tests {
             .push(&slot, FatKind::Fat16)
             .unwrap()
             .unwrap();
-        assert_eq!((entry.created_time, entry.created_centiseconds), (u16::MAX, 255));
+        assert_eq!(
+            (entry.created_time, entry.created_centiseconds),
+            (u16::MAX, 255)
+        );
         assert_eq!(entry.created_timestamp().unwrap(), None);
         assert_eq!(entry.accessed_timestamp().unwrap(), None);
         assert_eq!(entry.modified_timestamp().unwrap(), None);

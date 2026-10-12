@@ -31,6 +31,7 @@ pub struct CheckIssue {
 pub struct FatCheckReport {
     pub format: &'static str,
     pub read_only: bool,
+    pub oem_code_page: &'static str,
     pub scope: &'static str,
     pub status: &'static str,
     pub clean: bool,
@@ -127,7 +128,8 @@ impl FatVolume {
     /// Check allocation ownership, chain lengths, directory structure and the
     /// primary FAT32 FSInfo hints. This reads no file payload and performs no
     /// repair, replay, state change, flush, or guessed selection of a FAT copy.
-    /// Native OEM/Unicode collation and content integrity are separate checks.
+    /// Full Unicode collation and content integrity are separate checks; name
+    /// collisions use this volume's explicitly selected OEM case pairs.
     pub fn check(&self, cx: &Cx) -> Result<FatCheckReport> {
         checkpoint(cx)?;
         let count = self.geometry.cluster_count() as usize;
@@ -147,6 +149,7 @@ impl FatVolume {
                     FatKind::Fat32 => "Fat32",
                 },
                 read_only: true,
+                oem_code_page: self.oem_code_page.label(),
                 scope: "allocation ownership, chain lengths, directory structure and primary FSInfo; file-content integrity, full native name collation and repair are not covered",
                 status: "incomplete",
                 clean: false,
@@ -311,8 +314,9 @@ impl Checker<'_> {
                     entry_offset: offset,
                     cluster: Some(cluster),
                     other_entry_offset: self.owner_offsets[previous as usize],
-                    detail: "multiple native objects reference this allocation; ownership is ambiguous"
-                        .into(),
+                    detail:
+                        "multiple native objects reference this allocation; ownership is ambiguous"
+                            .into(),
                 });
             } else {
                 self.owners[cluster as usize] = owner;
@@ -590,7 +594,11 @@ impl Checker<'_> {
             }
             return;
         }
-        scan.entries.push(Entry { offset, native });
+        scan.entries.push(Entry {
+            offset,
+            native,
+            oem_code_page: self.volume.oem_code_page,
+        });
     }
 
     fn check_directory_names(&mut self, cx: &Cx, entries: &[Entry]) -> Result<()> {
@@ -598,21 +606,33 @@ impl Checker<'_> {
         let mut native_names = BTreeMap::new();
         for entry in entries {
             checkpoint(cx)?;
-            let short = entry
+            let code_page = entry.oem_code_page;
+            let short: Vec<_> = entry
                 .native
                 .short_name
-                .map(|byte| byte.to_ascii_uppercase());
+                .iter()
+                .enumerate()
+                .map(|(index, &stored)| {
+                    let byte = if index == 0 && stored == 5 {
+                        0xE5
+                    } else {
+                        stored
+                    };
+                    let unit = code_page.decode_unit(byte).unwrap_or(u16::from(byte));
+                    code_page.fold_unit(unit)
+                })
+                .collect();
             let mut other = short_names.insert(short, entry.offset);
-            let alias = entry.native.ascii_short_name();
-            if entry.native.short_name.is_ascii()
-                && entry.native.short_name[0] != 5
+            let alias = entry.short_alias();
+            if (code_page != super::FatOemCodePage::Ascii
+                || (entry.native.short_name.is_ascii() && entry.native.short_name[0] != 5))
                 && alias.is_none()
             {
                 self.report.finding(
                     "invalid_short_name",
                     Some(entry.offset),
                     None,
-                    "short name cannot represent a native ASCII path component",
+                    "short name cannot represent a path component in the selected code page",
                 );
             }
             let alias_units = alias
@@ -633,13 +653,7 @@ impl Checker<'_> {
             for candidate in alias_units.iter().chain(entry.native.long_name.iter()) {
                 let key: Vec<_> = candidate
                     .iter()
-                    .map(|&unit| {
-                        if (u16::from(b'a')..=u16::from(b'z')).contains(&unit) {
-                            unit - 32
-                        } else {
-                            unit
-                        }
-                    })
+                    .map(|&unit| code_page.fold_unit(unit))
                     .collect();
                 if let Some(previous) = native_names.insert(key, entry.offset)
                     && previous != entry.offset
@@ -653,7 +667,7 @@ impl Checker<'_> {
                     entry_offset: Some(entry.offset),
                     cluster: None,
                     other_entry_offset: Some(other),
-                    detail: "duplicate native short name, long name, or ASCII alias".into(),
+                    detail: "duplicate native short name, long name, or alias under the selected name comparison".into(),
                 });
             }
         }
