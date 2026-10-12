@@ -54,6 +54,19 @@
 > native storage and restart/default activation remain separate unmet parts of
 > the original lifecycle target.
 
+> **Protected mount workers (`bd-11a8t`, 29 controls verified):** the CLI-private
+> `mount_worker` module shares that child-region and completion-drain ownership
+> with `ffs-protected-mount`. Its source scanner and parity maintenance receive
+> the worker context. Local stop leaves the parent and sibling regions running;
+> unexpected cancellation, I/O failure or unwinding panic requests managed unmount. An
+> admission-time guard also covers cancellation before blocking work starts.
+> Final image/archive cleanup uses an independent context after the worker has
+> released its device. The optional scrub flags and storage format are unchanged.
+> RCH job `30059820987973812` passed all 29 protected scrub controls on base
+> `10554dc68` plus overlay `d83601d389a6`; the identical source passed the full
+> workspace/all-targets check. Strict Clippy and the two new protected real-FUSE
+> lifecycle scenarios remain pending; see `FEATURE_PARITY.md` for the proof scope.
+
 > **Explicit symbol regeneration (`bd-11a8t`):** both format rebuild paths
 > preflight the complete allocation plan, then freshly scan each group's full
 > source range before encoding. Incomplete scans, I/O failures and detected
@@ -534,7 +547,7 @@ pub trait RepairManager: Send + Sync {
 |---------|-------|
 | `Cx` (capability context) | Passed through context-aware filesystem I/O and repair-flush notification; standard-thread ownership remains to be integrated |
 | `Budget` | Resource budgeting for block cache memory, open file descriptors, repair symbol storage |
-| `Region` | Ordinary CLI scrub and periodic commit use child regions with physical blocking-I/O completion drains; other FUSE/core workers still require migration |
+| `Region` | Ordinary CLI scrub/periodic commit and protected source/parity scrub share child-region ownership and physical blocking-I/O completion drains; protected execution proof is pending, and other FUSE/core workers still require migration |
 | `Lab` | Deterministic runtime for testing concurrent MVCC operations |
 | `RaptorQ codec` | Encoding/decoding repair symbols in `ffs-repair` |
 | `blocking_pool` | Offload synchronous disk I/O from async context |

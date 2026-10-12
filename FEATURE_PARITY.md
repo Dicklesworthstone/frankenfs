@@ -164,6 +164,28 @@
 > complete native storage, default activation, restart freshness, or the wider
 > core/FUSE worker migration on the original bead.
 
+> **Protected scrub integration (`bd-11a8t`, controls verified 2026-10-12):**
+> `ffs-protected-mount` now shares the ordinary CLI's child-region worker and
+> completion drain. Both source scans and parity maintenance use its child
+> context. Four added controls cover local-stop isolation and running/queued
+> parent cancellation, alongside the 25 existing scrub controls. All 29 passed in
+> RCH job `30059820987973812` on base `10554dc68` plus overlay `d83601d389a6`.
+> The same invocation passed 34 ordinary CLI/repair, 106 FAT, 113 NTFS, 115 ZFS
+> and two ordinary-mount FUSE tests: 399 total, no failures, ignores or skips.
+> Log: `ffs-chartreusestone-resume29-integrated-tests6.log`. Workspace/all-targets
+> checking passed on the identical source in RCH job `30059820987973806`.
+> Strict Clippy and the on-disk parser selection remain pending remote disk
+> admission. Two new protected real-FUSE cases require complete source/parity
+> reports, normal unmount, restart/readback, unchanged image/archive hashes and
+> independent ext4/Btrfs checks; these cases have not executed yet. The ordinary
+> mounted cases and protected unit controls do not substitute for them.
+> The first integrated run stopped on a malformed NTFS sparse-attribute fixture
+> before protected tests. Its correction retains all rejection and zero-payload
+> read checks and strengthens the sparse refusal reason; the corrected case
+> passed in the current 113-test NTFS cohort. The original failure remains recorded.
+> Native storage, default activation and mounted native corruption/restart
+> acceptance remain open.
+
 > **Explicit regeneration (`bd-11a8t`, verified controls 2026-10-12):** the CLI
 > ext4 and Btrfs rebuild paths now use the existing descriptor high-water reader
 > to resume interrupted symbol publication. They freshly scan each source range

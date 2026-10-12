@@ -265,7 +265,7 @@ impl Fixture {
         };
         for copy in 0..2 {
             let start = base + u64::from(reserved + copy * fat_sectors) * sector;
-            for cluster in 0..=16 {
+            for cluster in 0_u32..=16 {
                 let low = match cluster {
                     0 => end & !7,
                     1 | 6 | 7 => end,
@@ -463,7 +463,7 @@ fn fat32_active_copy_and_each_reserved_high_nibble_are_preserved() {
         let plan = Replacement::prepare(&cx, &volume, "/HELLO.TXT", &source, NOW).unwrap();
         plan.execute(&cx, &volume, &source, || Ok(())).unwrap();
         for copy in volume.copies() {
-            for cluster in 0..=16 {
+            for cluster in 0_u32..=16 {
                 let at = image.base + image.geometry.entry_offset(copy, 2).unwrap() - 8
                     + u64::from(cluster) * 4;
                 let raw = u32::from_le_bytes(image.read(at, 4).try_into().unwrap());

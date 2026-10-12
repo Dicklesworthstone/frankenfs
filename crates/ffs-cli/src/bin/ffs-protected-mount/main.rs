@@ -5,6 +5,8 @@
 //! Caller writes require --rw; read-only remains the default. The ordinary
 //! mount command is unchanged, and startup differences never authorize rollback.
 
+#[path = "../../mount_worker.rs"]
+mod mount_worker;
 mod scrub;
 
 use anyhow::{Context, Result, bail};
@@ -282,6 +284,7 @@ fn emit(event: &str, prepared: &Prepared) -> Result<()> {
 
 fn serve(
     cx: &Cx,
+    runtime: Option<&Arc<asupersync::runtime::Runtime>>,
     args: &Args,
     prepared: &Prepared,
     stopped: &AtomicBool,
@@ -312,6 +315,7 @@ fn serve(
             .map(|seconds| {
                 scrub::ScrubGuard::start(
                     cx,
+                    runtime.context("protected scrub requires its mount runtime")?,
                     Arc::clone(&prepared.device),
                     Arc::clone(&flag),
                     std::time::Duration::from_secs(seconds),
@@ -339,7 +343,14 @@ fn serve(
 }
 
 fn run(args: &Args) -> Result<()> {
-    let cx = Cx::for_request();
+    let runtime = args
+        .scrub
+        .interval_secs
+        .map(|_| mount_worker::mount_background_runtime())
+        .transpose()?;
+    let cx = runtime.as_ref().map_or_else(Cx::for_request, |runtime| {
+        runtime.request_cx_with_budget(asupersync::Budget::INFINITE)
+    });
     let cancellation = cx.clone();
     let stopped = Arc::new(AtomicBool::new(false));
     let shutdown: Arc<Mutex<Option<Arc<AtomicBool>>>> = Arc::new(Mutex::new(None));
@@ -347,7 +358,10 @@ fn run(args: &Args) -> Result<()> {
     let signal_shutdown = Arc::clone(&shutdown);
     ctrlc::set_handler(move || {
         signal_stopped.store(true, Ordering::Release);
-        cancellation.set_cancel_requested(true);
+        cancellation.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("protected mount stopping"),
+        );
         if let Ok(target) = signal_shutdown.lock()
             && let Some(flag) = target.as_ref()
         {
@@ -357,11 +371,14 @@ fn run(args: &Args) -> Result<()> {
     .context("install shutdown handler")?;
 
     let prepared = prepare(&cx, args)?;
-    let operation = serve(&cx, args, &prepared, &stopped, &shutdown);
+    let operation = serve(&cx, runtime.as_ref(), args, &prepared, &stopped, &shutdown);
     // Every exit after successful preparation attempts cleanup, including
     // mount failure, announcement failure and startup cancellation. Cleanup
     // has its own capability; Ctrl-C must not cancel the durability barrier.
-    let cleanup = prepared.finish(&Cx::for_request());
+    let cleanup_cx = runtime.as_ref().map_or_else(Cx::for_request, |runtime| {
+        runtime.request_cx_with_budget(asupersync::Budget::INFINITE)
+    });
+    let cleanup = prepared.finish(&cleanup_cx);
     match (operation, cleanup) {
         (Ok(()), cleanup) => cleanup,
         (Err(operation), Ok(())) => Err(operation),

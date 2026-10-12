@@ -6,6 +6,7 @@
 //! resumable device steps; it never publishes outstanding filesystem writes.
 //! Reports describe source reads or protection-group observations, not snapshots.
 
+use crate::mount_worker::MountIoWorker;
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
 use ffs_block::ByteDevice;
@@ -18,7 +19,7 @@ use serde::Serialize;
 use std::io::Write;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::thread::{self, JoinHandle};
+use std::thread;
 use std::time::{Duration, Instant};
 
 const READ_BYTES: usize = 64 * 1024;
@@ -193,106 +194,120 @@ impl ProtectionMaintenance {
     }
 }
 
-/// A joined blocking-I/O worker with the same Cx cancellation authority as
-/// startup. As in the ordinary mount's scrub guard, drop requests cancellation
-/// and joins; the worker releases its device ownership before stop returns.
-/// Final filesystem cleanup uses its separate, uncancelled context.
+/// A mount-owned child region whose blocking I/O is drained before cleanup.
+/// Local stop cancels only this worker; parent cancellation also stops it.
+/// Final filesystem cleanup uses a separate, uncancelled context.
 pub struct ScrubGuard {
-    cx: Cx,
     stop: Arc<AtomicBool>,
-    handle: Option<JoinHandle<Result<()>>>,
+    worker: MountIoWorker<()>,
 }
 
 impl ScrubGuard {
     pub(super) fn start(
         cx: &Cx,
+        runtime: &Arc<asupersync::runtime::Runtime>,
         device: Arc<SidecarImageDevice>,
         shutdown: Arc<AtomicBool>,
         interval: Duration,
         parity: bool,
     ) -> Result<Self> {
-        Self::start_with_reports(cx, device, shutdown, interval, parity, emit, emit)
+        Self::start_with_reports(
+            cx,
+            runtime,
+            device,
+            shutdown,
+            interval,
+            parity,
+            (emit, emit),
+        )
     }
 
     // Both production and worker tests use this exact integration. Report
     // failure stays inside the existing unmount-on-failure and joined lifetime.
     fn start_with_reports(
         cx: &Cx,
+        runtime: &Arc<asupersync::runtime::Runtime>,
         device: Arc<SidecarImageDevice>,
         shutdown: Arc<AtomicBool>,
         interval: Duration,
         parity: bool,
-        mut source_report: impl FnMut(&PassReport) -> Result<()> + Send + 'static,
-        mut parity_report: impl FnMut(&ProtectionPassReport) -> Result<()> + Send + 'static,
+        reports: (
+            impl FnMut(&PassReport) -> Result<()> + Send + 'static,
+            impl FnMut(&ProtectionPassReport) -> Result<()> + Send + 'static,
+        ),
     ) -> Result<Self> {
-        let maintenance_cx = cx.clone();
+        let (mut source_report, mut parity_report) = reports;
         let maintenance_device = Arc::clone(&device);
         let maintenance_shutdown = Arc::clone(&shutdown);
         let mut maintenance = ProtectionMaintenance::default();
-        Self::spawn(cx, device, shutdown, interval, move |source| {
-            source_report(source)?;
-            if parity {
-                maintenance.batch(
-                    &maintenance_cx,
-                    &maintenance_shutdown,
-                    |cursor| maintenance_device.scrub_step(&maintenance_cx, cursor),
-                    &mut parity_report,
-                )?;
-            }
-            Ok(())
-        })
+        Self::spawn(
+            cx,
+            runtime,
+            device,
+            shutdown,
+            interval,
+            move |worker_cx, source| {
+                source_report(source)?;
+                if parity {
+                    maintenance.batch(
+                        worker_cx,
+                        &maintenance_shutdown,
+                        |cursor| maintenance_device.scrub_step(worker_cx, cursor),
+                        &mut parity_report,
+                    )?;
+                }
+                Ok(())
+            },
+        )
     }
 
     fn spawn(
         cx: &Cx,
+        runtime: &Arc<asupersync::runtime::Runtime>,
         device: Arc<dyn ByteDevice>,
         shutdown: Arc<AtomicBool>,
         interval: Duration,
-        report: impl FnMut(&PassReport) -> Result<()> + Send + 'static,
+        report: impl FnMut(&Cx, &PassReport) -> Result<()> + Send + 'static,
     ) -> Result<Self> {
         let stop = Arc::new(AtomicBool::new(false));
-        let worker_cx = cx.clone();
-        let worker_stop = Arc::clone(&stop);
-        let handle = thread::Builder::new()
-            .name("ffs-protected-scrub".to_owned())
-            .spawn(move || {
-                // This guard also runs on panic: otherwise the main thread could
-                // remain blocked in managed wait after losing its scrub worker.
-                let mut failure = UnmountOnFailure {
-                    shutdown: &shutdown,
-                    armed: true,
-                };
-                let result = run(
-                    &worker_cx,
-                    device.as_ref(),
-                    &worker_stop,
-                    &shutdown,
-                    interval,
-                    report,
-                );
-                if result.is_ok() {
-                    failure.armed = false;
-                }
-                result
-            })
-            .context("start protected source scrub worker")?;
-        Ok(Self {
-            cx: cx.clone(),
-            stop,
-            handle: Some(handle),
+        // Capture before admission: a cancelled queued closure can be dropped
+        // without ever entering run(), but must still wake managed unmount.
+        let failure = UnmountOnFailure {
+            shutdown,
+            stop: Arc::clone(&stop),
+            started: false,
+            armed: true,
+        };
+        let worker = MountIoWorker::start(cx, runtime, move |worker_cx| {
+            let mut failure = failure;
+            failure.started = true;
+            let result = run(
+                worker_cx,
+                device.as_ref(),
+                &failure.stop,
+                &failure.shutdown,
+                interval,
+                report,
+            );
+            if result.is_ok() {
+                failure.armed = false;
+            }
+            result
         })
+        .context("start protected source scrub worker")?;
+        Ok(Self { stop, worker })
+    }
+
+    fn request_stop(&self) -> Result<()> {
+        self.stop.store(true, Ordering::Release);
+        self.worker.request_stop()
     }
 
     pub(super) fn stop(&mut self) -> Result<()> {
-        let Some(handle) = self.handle.take() else {
-            return Ok(());
-        };
-        self.stop.store(true, Ordering::Release);
-        self.cx.set_cancel_requested(true);
-        handle.thread().unpark();
-        handle
-            .join()
-            .map_err(|_| anyhow::anyhow!("protected source scrub worker panicked"))?
+        let cancel = self.request_stop();
+        // A failed cancellation request never authorizes early device release.
+        let drained = self.worker.stop();
+        cancel.and(drained).map(|_| ())
     }
 }
 
@@ -304,14 +319,18 @@ impl Drop for ScrubGuard {
     }
 }
 
-struct UnmountOnFailure<'a> {
-    shutdown: &'a AtomicBool,
+struct UnmountOnFailure {
+    shutdown: Arc<AtomicBool>,
+    stop: Arc<AtomicBool>,
+    started: bool,
     armed: bool,
 }
 
-impl Drop for UnmountOnFailure<'_> {
+impl Drop for UnmountOnFailure {
     fn drop(&mut self) {
-        if self.armed {
+        // A local stop before admission is normal. Once work starts, an I/O
+        // error or panic must request unmount even if it races that local stop.
+        if self.armed && (self.started || !self.stop.load(Ordering::Acquire)) {
             self.shutdown.store(true, Ordering::Release);
         }
     }
@@ -344,7 +363,7 @@ fn run(
     stop: &AtomicBool,
     shutdown: &AtomicBool,
     interval: Duration,
-    mut report: impl FnMut(&PassReport) -> Result<()>,
+    mut report: impl FnMut(&Cx, &PassReport) -> Result<()>,
 ) -> Result<()> {
     let result: Result<()> = (|| {
         let mut pass = SourcePass::new(device.len_bytes())?;
@@ -360,12 +379,15 @@ fn run(
                 continue;
             }
             completed_passes = completed_passes.saturating_add(1);
-            report(&PassReport {
-                event: "protected_source_scrub_pass",
-                completed_passes,
-                source_bytes_verified: pass.verified_bytes,
-                consistency: "per_read_not_snapshot",
-            })?;
+            report(
+                cx,
+                &PassReport {
+                    event: "protected_source_scrub_pass",
+                    completed_passes,
+                    source_bytes_verified: pass.verified_bytes,
+                    consistency: "per_read_not_snapshot",
+                },
+            )?;
             if !wait(cx, stop, shutdown, interval)? {
                 return Ok(());
             }

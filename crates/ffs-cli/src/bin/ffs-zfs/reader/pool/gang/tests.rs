@@ -345,6 +345,37 @@ fn extra_header_copy_uses_dva_zero_verifier_and_recovers_bad_first_header() {
 }
 
 #[test]
+fn raidz_header_replicas_keep_per_copy_allocations_during_fallback() {
+    for parity in 1..=3 {
+        let width = parity + 2;
+        let image = Fixture::new(parity, width, 12, 4096);
+        let expected = payload();
+        let (mut root, header) = image.seed_pair(Endian::Little, HEADER, &expected);
+        let allocation = header_allocation(&image.config).unwrap();
+        root[2] = allocation / 512;
+        root[3] = (1_u64 << 63) | (0x18000 / 512);
+        image.install(0x18000, &header);
+        // Lose the first header's entire stripe. The second DVA accounts only
+        // for its header, while DVA zero also accounts for the two fragments.
+        let map = NativeMap::new(HEADER, 512, 12, width, parity).unwrap();
+        for column in map.columns() {
+            image.fault(column.child_id, column.offset, Fault::Io);
+        }
+        let block = image.read(&root, Endian::Little).unwrap();
+        assert_eq!(block.bytes, expected);
+        assert_eq!(block.copy_index, 1);
+        assert_eq!(block.raidz.unwrap().allocated_bytes, allocation);
+
+        // A malformed later header copy must fail admission before any I/O,
+        // even though the first copy retains a valid aggregate allocation.
+        image.reads.lock().unwrap().clear();
+        root[2] -= 1;
+        assert!(image.read(&root, Endian::Little).is_err());
+        assert!(image.reads.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
 fn mirror_header_and_fragment_retries_keep_native_membership() {
     let image = Fixture::new(0, 2, 9, 0);
     let expected = payload();
@@ -643,7 +674,7 @@ fn repeated_verified_fragment_allocations_fail_before_payload_io_in_every_topolo
             // physical allocation twice must still invalidate the whole tree.
             let physical = [data.clone(), data.clone()].concat();
             let (root, raw) = gang(&physical, &[child, child], HEADER, allocation, order);
-            assert!(GangHeader::parse(&raw, &pointer(&root, order), allocation).is_ok());
+            assert!(GangHeader::parse(&raw, &pointer(&root, order), &[allocation]).is_ok());
             image.install(FIRST, &data);
             image.install(HEADER, &raw);
             let error = image.read(&root, order).err().expect("overlap must fail");

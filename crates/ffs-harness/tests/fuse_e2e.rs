@@ -16735,6 +16735,174 @@ fn protected_sidecar_cli_btrfs_corruption_restart_bd_7zjfh() {
     protected_sidecar_cli_corruption_restart("btrfs");
 }
 
+fn protected_scrub_wait_for_passes(mount: &mut BtrfsCliMount, image_bytes: u64) {
+    // The existing fixture has 64 source blocks per protection group. Parity
+    // advances only 64 steps per source pass, so Btrfs needs several passes.
+    let expected_groups = image_bytes.div_ceil(4096 * 64);
+    let started = Instant::now();
+    loop {
+        let stderr = fs::read_to_string(mount.directory.join("stderr.log")).unwrap();
+        let reports: Vec<Value> = stderr
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        let source = reports
+            .iter()
+            .find(|report| report["event"] == "protected_source_scrub_pass");
+        let parity = reports
+            .iter()
+            .find(|report| report["event"] == "protected_parity_scrub_pass");
+        let status = mount.child.try_wait().expect("poll protected scrub CLI");
+        let mounted = mountinfo_has_mountpoint(&mount.mountpoint);
+        let timed_out = started.elapsed() >= Duration::from_secs(180);
+        if status.is_some() || !mounted || timed_out {
+            btrfs_cli_record(
+                &mount.directory,
+                &serde_json::json!({
+                    "event": "protected_scrub_incomplete", "status": status.map(|exit| exit.to_string()),
+                    "mounted": mounted, "timed_out": timed_out, "stderr": stderr,
+                    "stdout": fs::read_to_string(mount.directory.join("stdout.log")).unwrap(),
+                }),
+            );
+        }
+        assert!(
+            status.is_none(),
+            "scrub CLI exited before complete passes: {status:?}"
+        );
+        assert!(mounted, "scrub CLI unmounted before complete passes");
+        assert!(
+            !timed_out,
+            "source/parity completion deadline; logs: {}",
+            mount.directory.display()
+        );
+        if let (Some(source), Some(parity)) = (source, parity) {
+            assert!(
+                source["completed_passes"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0)
+            );
+            assert_eq!(source["source_bytes_verified"], image_bytes);
+            assert_eq!(source["consistency"], "per_read_not_snapshot");
+            assert!(
+                parity["completed_passes"]
+                    .as_u64()
+                    .is_some_and(|count| count > 0)
+            );
+            assert_eq!(parity["source_bytes_verified"], image_bytes);
+            assert_eq!(parity["groups_verified"], expected_groups);
+            assert_eq!(parity["source_blocks_recovered_during_steps"], 0);
+            assert_eq!(parity["invalid_repair_symbols_observed"], 0);
+            assert_eq!(parity["archive_rebuilt"], false);
+            assert_eq!(parity["consistency"], "per_group_not_snapshot");
+            btrfs_cli_record(
+                &mount.directory,
+                &serde_json::json!({
+                    "event": "protected_scrub_completed_before_unmount",
+                    "proof_class": "live_public_cli_healthy_scrub_lifecycle",
+                    "pid": mount.child.id(), "mounted": mounted,
+                    "source": source, "parity": parity,
+                    "elapsed_ms": started.elapsed().as_millis(),
+                }),
+            );
+            return;
+        }
+        thread::sleep(Duration::from_millis(20));
+    }
+}
+
+fn protected_scrub_normal_unmount(mount: &mut BtrfsCliMount) {
+    assert!(mount.child.try_wait().unwrap().is_none());
+    assert!(mountinfo_has_mountpoint(&mount.mountpoint));
+    // Bound the external helper as well as the existing daemon-exit wait.
+    // A timeout or helper failure is a test failure; only ordinary -u can pass.
+    btrfs_seed_sprout_run(
+        &mount.directory,
+        Command::new("timeout")
+            .args(["--kill-after=5s", "30s", "fusermount3", "-u"])
+            .arg(&mount.mountpoint),
+    );
+    assert!(!mountinfo_has_mountpoint(&mount.mountpoint));
+    protected_sidecar_finish(mount);
+}
+
+fn protected_sidecar_cli_scrub_lifecycle(fstype: &str) {
+    if !fuse_available() {
+        return;
+    }
+    let Some(cli) = cli_proof_binary("FFS_PROTECTED_MOUNT_BIN") else {
+        return;
+    };
+    let Some(repair) = cli_proof_binary("FFS_IMAGE_REPAIR_BIN") else {
+        return;
+    };
+    if !command_available("e2fsck")
+        || !command_available("mkfs.btrfs")
+        || !command_available("btrfs")
+        || !command_available("timeout")
+    {
+        require_fuse_or_skip(
+            "protected scrub proof requires e2fsck, mkfs.btrfs, btrfs and timeout",
+        );
+        return;
+    }
+    let parent = PathBuf::from(std::env::var_os("FFS_CLI_ARTIFACT_DIR").unwrap());
+    fs::create_dir_all(&parent).unwrap();
+    let directory = tempfile::Builder::new()
+        .prefix(&format!("ffs-protected-scrub-{fstype}-"))
+        .tempdir_in(parent)
+        .unwrap()
+        .keep();
+    let initial = patterned_bytes(65_553, 239, 1);
+    let (image, sidecar, _, original_hash) =
+        protected_sidecar_fixture(&directory, &repair, fstype, &initial);
+    let archive_hash = repair_tail_sha256(&directory, &sidecar);
+    let image_bytes = fs::metadata(&image).unwrap().len();
+    let mut mount =
+        BtrfsCliMount::spawn_command(&cli, &directory.join("scrubbing"), |command, mountpoint| {
+            command.arg(&image).arg(&sidecar).arg(mountpoint).args([
+                "--exclusive-image",
+                "--allow-repair",
+                "--scrub-interval-secs",
+                "1",
+                "--scrub-parity",
+            ]);
+        });
+    mount.wait_until_ready_with_timeout(Duration::from_secs(120));
+    // Do not read the mounted payload until both actual background reports
+    // arrive. Startup requires an intact source AND archive, so this case is
+    // lifecycle coverage, separate from the existing foreground repair cases.
+    protected_scrub_wait_for_passes(&mut mount, image_bytes);
+    protected_sidecar_readback(&directory, &mount.mountpoint.join("initial"), &initial);
+    protected_scrub_normal_unmount(&mut mount);
+    assert_eq!(repair_tail_sha256(&directory, &image), original_hash);
+    assert_eq!(repair_tail_sha256(&directory, &sidecar), archive_hash);
+    protected_sidecar_check(&directory, &repair, &image, &sidecar, fstype);
+
+    let mut restarted =
+        BtrfsCliMount::spawn_protected(&cli, &directory.join("restarted"), &image, &sidecar, false);
+    restarted.wait_until_ready_with_timeout(Duration::from_secs(120));
+    protected_sidecar_readback(&directory, &restarted.mountpoint.join("initial"), &initial);
+    protected_scrub_normal_unmount(&mut restarted);
+    assert_eq!(repair_tail_sha256(&directory, &image), original_hash);
+    assert_eq!(repair_tail_sha256(&directory, &sidecar), archive_hash);
+    protected_sidecar_check(&directory, &repair, &image, &sidecar, fstype);
+    emit_scenario_result(
+        &format!("protected_sidecar_cli_{fstype}_scrub_lifecycle_bd_11a8t"),
+        "PASS",
+        None,
+    );
+}
+
+#[test]
+fn protected_sidecar_cli_ext4_scrub_lifecycle_bd_11a8t() {
+    protected_sidecar_cli_scrub_lifecycle("ext4");
+}
+
+#[test]
+fn protected_sidecar_cli_btrfs_scrub_lifecycle_bd_11a8t() {
+    protected_sidecar_cli_scrub_lifecycle("btrfs");
+}
+
 fn assert_btrfs_cli_mount_reads(
     cli: &Path,
     directory: &Path,

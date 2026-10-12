@@ -1,8 +1,10 @@
 use super::*;
+use crate::mount_worker::{MountIoWorker, mount_background_runtime};
 use clap::Parser;
 // The gated verify (see crate::tests): a sibling test's child process may
 // still hold a lock this test just released.
 use crate::tests::verify;
+use asupersync::Budget;
 use ffs_repair::sidecar::{SidecarOptions, protect};
 use std::fs::File;
 use std::os::unix::fs::FileExt;
@@ -53,8 +55,13 @@ impl ByteDevice for ProbeDevice {
         }
         assert!(!matches!(self.fault, Fault::Panic), "injected read panic");
         if matches!(self.fault, Fault::WaitForCancel) {
+            let deadline = Instant::now() + Duration::from_secs(10);
             loop {
                 cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+                assert!(
+                    Instant::now() < deadline,
+                    "read did not observe cancellation"
+                );
                 thread::yield_now();
             }
         }
@@ -153,17 +160,20 @@ fn cancellation_and_geometry_changes_are_rejected_before_io() {
 #[test]
 fn worker_error_and_panic_request_unmount_and_survive_join() {
     for panic in [false, true] {
+        let runtime = mount_background_runtime().unwrap();
+        let cx = runtime.request_cx_with_budget(Budget::INFINITE);
         let (entered, ready) = mpsc::sync_channel(1);
         let mut device = ProbeDevice::new(1);
         device.fault = if panic { Fault::Panic } else { Fault::Error };
         device.entered = Some(entered);
         let shutdown = Arc::new(AtomicBool::new(false));
         let mut guard = ScrubGuard::spawn(
-            &Cx::for_testing(),
+            &cx,
+            &runtime,
             Arc::new(device),
             Arc::clone(&shutdown),
             Duration::from_hours(24),
-            |_| panic!("failed scan must not emit a complete pass"),
+            |_, _| panic!("failed scan must not emit a complete pass"),
         )
         .unwrap();
         ready.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -182,16 +192,19 @@ fn worker_error_and_panic_request_unmount_and_survive_join() {
 
 #[test]
 fn worker_reports_complete_passes_and_restarts_from_zero() {
+    let runtime = mount_background_runtime().unwrap();
+    let cx = runtime.request_cx_with_budget(Budget::INFINITE);
     let device = Arc::new(ProbeDevice::new(1));
     let shutdown = Arc::new(AtomicBool::new(false));
     let finish = Arc::clone(&shutdown);
     let (sent, reports) = mpsc::sync_channel(2);
     let mut guard = ScrubGuard::spawn(
-        &Cx::for_testing(),
+        &cx,
+        &runtime,
         device.clone(),
         shutdown,
         Duration::ZERO,
-        move |report| {
+        move |_, report| {
             sent.send((report.completed_passes, report.source_bytes_verified))
                 .unwrap();
             assert_eq!(report.consistency, "per_read_not_snapshot");
@@ -216,14 +229,17 @@ fn worker_reports_complete_passes_and_restarts_from_zero() {
 
 #[test]
 fn failed_report_requests_unmount_instead_of_silent_scrub_loss() {
+    let runtime = mount_background_runtime().unwrap();
+    let cx = runtime.request_cx_with_budget(Budget::INFINITE);
     let (sent, reported) = mpsc::sync_channel(1);
     let shutdown = Arc::new(AtomicBool::new(false));
     let mut guard = ScrubGuard::spawn(
-        &Cx::for_testing(),
+        &cx,
+        &runtime,
         Arc::new(ProbeDevice::new(1)),
         Arc::clone(&shutdown),
         Duration::from_hours(24),
-        move |_| {
+        move |_, _| {
             sent.send(()).unwrap();
             bail!("injected evidence failure")
         },
@@ -242,6 +258,8 @@ fn failed_report_requests_unmount_instead_of_silent_scrub_loss() {
 
 #[test]
 fn dropping_worker_cancels_inflight_io_and_releases_ownership_before_returning() {
+    let runtime = mount_background_runtime().unwrap();
+    let cx = runtime.request_cx_with_budget(Budget::INFINITE);
     let (entered, ready) = mpsc::sync_channel(1);
     let mut device = ProbeDevice::new(1);
     device.fault = Fault::WaitForCancel;
@@ -249,11 +267,12 @@ fn dropping_worker_cancels_inflight_io_and_releases_ownership_before_returning()
     let device = Arc::new(device);
     let shutdown = Arc::new(AtomicBool::new(false));
     let guard = ScrubGuard::spawn(
-        &Cx::for_testing(),
+        &cx,
+        &runtime,
         device.clone(),
         Arc::clone(&shutdown),
         Duration::from_hours(24),
-        |_| panic!("cancelled read must not emit a completed pass"),
+        |_, _| panic!("cancelled read must not emit a completed pass"),
     )
     .unwrap();
     ready.recv_timeout(Duration::from_secs(5)).unwrap();
@@ -264,15 +283,18 @@ fn dropping_worker_cancels_inflight_io_and_releases_ownership_before_returning()
 
 #[test]
 fn stopping_after_a_pass_does_not_wait_for_the_next_scan_interval() {
+    let runtime = mount_background_runtime().unwrap();
+    let cx = runtime.request_cx_with_budget(Budget::INFINITE);
     let device = Arc::new(ProbeDevice::new(1));
     let shutdown = Arc::new(AtomicBool::new(false));
     let (sent, reports) = mpsc::sync_channel(1);
     let mut guard = ScrubGuard::spawn(
-        &Cx::for_testing(),
+        &cx,
+        &runtime,
         device.clone(),
         Arc::clone(&shutdown),
         Duration::from_hours(24),
-        move |_| {
+        move |_, _| {
             sent.send(()).unwrap();
             Ok(())
         },
@@ -283,6 +305,210 @@ fn stopping_after_a_pass_does_not_wait_for_the_next_scan_interval() {
     assert_eq!(Arc::strong_count(&device), 1);
     assert_eq!(*device.reads.lock().unwrap(), [(0, 1)]);
     assert!(!shutdown.load(Ordering::Acquire));
+}
+
+fn wait_for_scrub_condition(mut condition: impl FnMut() -> bool, message: &str) {
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while !condition() {
+        assert!(Instant::now() < deadline, "{message}");
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+fn occupying_worker(
+    cx: &Cx,
+    runtime: &Arc<asupersync::runtime::Runtime>,
+) -> (MountIoWorker<()>, Arc<AtomicU64>) {
+    let progress = Arc::new(AtomicU64::new(0));
+    let observed = Arc::clone(&progress);
+    let worker = MountIoWorker::start(cx, runtime, move |worker_cx| {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while worker_cx.checkpoint().is_ok() {
+            assert!(Instant::now() < deadline, "occupant was not cancelled");
+            observed.fetch_add(1, Ordering::Release);
+            thread::sleep(Duration::from_millis(1));
+        }
+        Ok(())
+    })
+    .unwrap();
+    wait_for_scrub_condition(
+        || progress.load(Ordering::Acquire) != 0,
+        "occupant did not start",
+    );
+    (worker, progress)
+}
+
+#[test]
+fn local_stop_preserves_parent_context_and_running_sibling() {
+    let runtime = mount_background_runtime().unwrap();
+    let cx = runtime.request_cx_with_budget(Budget::INFINITE);
+    let parent = runtime
+        .block_on(cx.open_child_region(asupersync::cx::ChildRegionSpec::inherit()))
+        .unwrap();
+    let (mut sibling, progress) = occupying_worker(parent.cx(), &runtime);
+    let (entered, ready) = mpsc::sync_channel(1);
+    let mut device = ProbeDevice::new(1);
+    device.fault = Fault::WaitForCancel;
+    device.entered = Some(entered);
+    let device = Arc::new(device);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let mut guard = ScrubGuard::spawn(
+        parent.cx(),
+        &runtime,
+        device.clone(),
+        Arc::clone(&shutdown),
+        Duration::from_hours(24),
+        |_, _| panic!("cancelled read must not emit a completed pass"),
+    )
+    .unwrap();
+    ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    guard.request_stop().unwrap();
+    guard.stop().unwrap();
+    parent.cx().checkpoint().unwrap();
+    cx.checkpoint().unwrap();
+    assert!(!shutdown.load(Ordering::Acquire));
+    assert_eq!(Arc::strong_count(&device), 1);
+    assert_eq!(*device.reads.lock().unwrap(), [(0, 1)]);
+    let after_stop = progress.load(Ordering::Acquire);
+    wait_for_scrub_condition(
+        || progress.load(Ordering::Acquire) > after_stop,
+        "local scrub stop cancelled its independent sibling",
+    );
+    assert_eq!(sibling.stop().unwrap(), Some(()));
+    parent.cx().checkpoint().unwrap();
+    runtime.block_on(parent.close()).unwrap();
+}
+
+#[test]
+fn parent_region_cancellation_requests_unmount_and_drains_device_ownership() {
+    let runtime = mount_background_runtime().unwrap();
+    let cx = runtime.request_cx_with_budget(Budget::INFINITE);
+    let parent = runtime
+        .block_on(cx.open_child_region(asupersync::cx::ChildRegionSpec::inherit()))
+        .unwrap();
+    let (entered, ready) = mpsc::sync_channel(1);
+    let mut device = ProbeDevice::new(1);
+    device.fault = Fault::WaitForCancel;
+    device.entered = Some(entered);
+    let device = Arc::new(device);
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let mut guard = ScrubGuard::spawn(
+        parent.cx(),
+        &runtime,
+        device.clone(),
+        Arc::clone(&shutdown),
+        Duration::from_hours(24),
+        |_, _| panic!("cancelled read must not emit a completed pass"),
+    )
+    .unwrap();
+    ready.recv_timeout(Duration::from_secs(5)).unwrap();
+    parent
+        .cancel(asupersync::types::CancelReason::user(
+            "parent mount cancelled",
+        ))
+        .unwrap();
+    // Observe failure before local stop can classify cancellation as shutdown.
+    wait_for_scrub_condition(
+        || shutdown.load(Ordering::Acquire),
+        "parent cancellation did not request unmount",
+    );
+    let error = guard.stop().unwrap_err();
+    assert!(
+        error
+            .chain()
+            .any(|cause| matches!(cause.downcast_ref::<FfsError>(), Some(FfsError::Cancelled)))
+    );
+    assert_eq!(Arc::strong_count(&device), 1);
+    assert_eq!(*device.reads.lock().unwrap(), [(0, 1)]);
+    cx.checkpoint().unwrap();
+    guard.stop().unwrap();
+    runtime.block_on(parent.close()).unwrap();
+}
+
+#[test]
+fn queued_parent_cancellation_requests_unmount_without_device_reads() {
+    let runtime = Arc::new(
+        asupersync::runtime::RuntimeBuilder::multi_thread()
+            .worker_threads(1)
+            .blocking_threads(1, 1)
+            .build()
+            .unwrap(),
+    );
+    let cx = runtime.request_cx_with_budget(Budget::INFINITE);
+    let (mut occupant, _) = occupying_worker(&cx, &runtime);
+    let parent = runtime
+        .block_on(cx.open_child_region(asupersync::cx::ChildRegionSpec::inherit()))
+        .unwrap();
+    let device = Arc::new(ProbeDevice::new(1));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let mut guard = ScrubGuard::spawn(
+        parent.cx(),
+        &runtime,
+        device.clone(),
+        Arc::clone(&shutdown),
+        Duration::from_hours(24),
+        |_, _| panic!("unstarted scrub must not emit a completed pass"),
+    )
+    .unwrap();
+    let pool = cx.blocking_pool_handle().unwrap();
+    wait_for_scrub_condition(|| pool.pending_count() == 1, "scrub was not queued");
+    assert!(device.reads.lock().unwrap().is_empty());
+    parent
+        .cancel(asupersync::types::CancelReason::user(
+            "queued mount cancelled",
+        ))
+        .unwrap();
+    // Release the sole pool slot before joining queued work. Its later
+    // cancellation follows the parent's cancellation on the sole scheduler.
+    assert_eq!(occupant.stop().unwrap(), Some(()));
+    wait_for_scrub_condition(
+        || shutdown.load(Ordering::Acquire),
+        "unstarted cancelled scrub did not request unmount",
+    );
+    guard.stop().unwrap();
+    assert!(device.reads.lock().unwrap().is_empty());
+    assert_eq!(Arc::strong_count(&device), 1);
+    cx.checkpoint().unwrap();
+    runtime.block_on(parent.close()).unwrap();
+}
+
+#[test]
+fn queued_local_stop_never_reads_or_cancels_parent_or_requests_unmount() {
+    let runtime = Arc::new(
+        asupersync::runtime::RuntimeBuilder::multi_thread()
+            .worker_threads(1)
+            .blocking_threads(1, 1)
+            .build()
+            .unwrap(),
+    );
+    let cx = runtime.request_cx_with_budget(Budget::INFINITE);
+    let (mut occupant, _) = occupying_worker(&cx, &runtime);
+    let parent = runtime
+        .block_on(cx.open_child_region(asupersync::cx::ChildRegionSpec::inherit()))
+        .unwrap();
+    let device = Arc::new(ProbeDevice::new(1));
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let mut guard = ScrubGuard::spawn(
+        parent.cx(),
+        &runtime,
+        device.clone(),
+        Arc::clone(&shutdown),
+        Duration::from_hours(24),
+        |_, _| panic!("unstarted scrub must not emit a completed pass"),
+    )
+    .unwrap();
+    let pool = cx.blocking_pool_handle().unwrap();
+    wait_for_scrub_condition(|| pool.pending_count() == 1, "scrub was not queued");
+    guard.request_stop().unwrap();
+    assert!(device.reads.lock().unwrap().is_empty());
+    assert_eq!(occupant.stop().unwrap(), Some(()));
+    guard.stop().unwrap();
+    assert!(device.reads.lock().unwrap().is_empty());
+    assert_eq!(Arc::strong_count(&device), 1);
+    assert!(!shutdown.load(Ordering::Acquire));
+    parent.cx().checkpoint().unwrap();
+    cx.checkpoint().unwrap();
+    runtime.block_on(parent.close()).unwrap();
 }
 
 struct Fixture {
@@ -500,6 +726,8 @@ fn command_scrub_option_is_explicit_bounded_and_requires_a_mount() {
 
 #[test]
 fn background_worker_repairs_real_sidecar_source_without_a_foreground_read() {
+    let runtime = mount_background_runtime().unwrap();
+    let cx = runtime.request_cx_with_budget(Budget::INFINITE);
     let fixture = Fixture::new();
     let device = Arc::new(fixture.open());
     let archive = std::fs::read(&fixture.sidecar).unwrap();
@@ -508,11 +736,12 @@ fn background_worker_repairs_real_sidecar_source_without_a_foreground_read() {
     let finish = Arc::clone(&shutdown);
     let (sent, reports) = mpsc::sync_channel(1);
     let mut guard = ScrubGuard::spawn(
-        &Cx::for_testing(),
+        &cx,
+        &runtime,
         device.clone(),
         shutdown,
         Duration::from_hours(24),
-        move |report| {
+        move |_, report| {
             sent.send(report.source_bytes_verified).unwrap();
             finish.store(true, Ordering::Release);
             Ok(())
@@ -705,6 +934,8 @@ impl Fixture {
 
 #[test]
 fn parity_worker_replenishes_symbols_that_source_only_reads_do_not_inspect() {
+    let runtime = mount_background_runtime().unwrap();
+    let cx = runtime.request_cx_with_budget(Budget::INFINITE);
     let fixture = Fixture::new();
     let device = Arc::new(fixture.open());
     fixture.damage_tail_parity();
@@ -714,20 +945,23 @@ fn parity_worker_replenishes_symbols_that_source_only_reads_do_not_inspect() {
     let source_count = Arc::clone(&source_passes);
     let (sent, reports) = mpsc::sync_channel(1);
     let mut guard = ScrubGuard::start_with_reports(
-        &Cx::for_testing(),
+        &cx,
+        &runtime,
         Arc::clone(&device),
         shutdown,
         Duration::from_hours(24),
         true,
-        move |report| {
-            source_count.store(report.completed_passes, Ordering::Release);
-            Ok(())
-        },
-        move |report| {
-            sent.send(serde_json::to_value(report)?).unwrap();
-            finish.store(true, Ordering::Release);
-            Ok(())
-        },
+        (
+            move |report| {
+                source_count.store(report.completed_passes, Ordering::Release);
+                Ok(())
+            },
+            move |report| {
+                sent.send(serde_json::to_value(report)?).unwrap();
+                finish.store(true, Ordering::Release);
+                Ok(())
+            },
+        ),
     )
     .unwrap();
     let report = reports.recv_timeout(Duration::from_secs(30)).unwrap();
@@ -775,6 +1009,8 @@ fn parity_worker_replenishes_symbols_that_source_only_reads_do_not_inspect() {
 
 #[test]
 fn parity_disabled_worker_does_not_republish_damaged_protection() {
+    let runtime = mount_background_runtime().unwrap();
+    let cx = runtime.request_cx_with_budget(Budget::INFINITE);
     let fixture = Fixture::new();
     let device = Arc::new(fixture.open());
     fixture.damage_tail_parity();
@@ -783,21 +1019,24 @@ fn parity_disabled_worker_does_not_republish_damaged_protection() {
     let finish = Arc::clone(&shutdown);
     let (sent, reports) = mpsc::sync_channel(1);
     let mut guard = ScrubGuard::start_with_reports(
-        &Cx::for_testing(),
+        &cx,
+        &runtime,
         Arc::clone(&device),
         shutdown,
         Duration::ZERO,
         false,
-        move |report| {
-            // Leave shutdown false after the first pass. An accidentally
-            // enabled parity path must not be masked by early cancellation.
-            if report.completed_passes == 2 {
-                sent.send(()).unwrap();
-                finish.store(true, Ordering::Release);
-            }
-            Ok(())
-        },
-        |_| panic!("parity mode was not authorized"),
+        (
+            move |report| {
+                // Leave shutdown false after the first pass. An accidentally
+                // enabled parity path must not be masked by early cancellation.
+                if report.completed_passes == 2 {
+                    sent.send(()).unwrap();
+                    finish.store(true, Ordering::Release);
+                }
+                Ok(())
+            },
+            |_| panic!("parity mode was not authorized"),
+        ),
     )
     .unwrap();
     reports.recv_timeout(Duration::from_secs(30)).unwrap();
@@ -861,21 +1100,26 @@ fn parity_maintenance_defers_real_pending_writes_until_the_writer_syncs() {
 
 #[test]
 fn parity_report_failure_requests_unmount_and_is_not_hidden_by_join() {
+    let runtime = mount_background_runtime().unwrap();
+    let cx = runtime.request_cx_with_budget(Budget::INFINITE);
     let fixture = Fixture::new();
     let device = Arc::new(fixture.open());
     let shutdown = Arc::new(AtomicBool::new(false));
     let (sent, reports) = mpsc::sync_channel(1);
     let mut guard = ScrubGuard::start_with_reports(
-        &Cx::for_testing(),
+        &cx,
+        &runtime,
         Arc::clone(&device),
         Arc::clone(&shutdown),
         Duration::from_hours(24),
         true,
-        |_| Ok(()),
-        move |_| {
-            sent.send(()).unwrap();
-            bail!("injected parity report failure")
-        },
+        (
+            |_| Ok(()),
+            move |_| {
+                sent.send(()).unwrap();
+                bail!("injected parity report failure")
+            },
+        ),
     )
     .unwrap();
     reports.recv_timeout(Duration::from_secs(30)).unwrap();

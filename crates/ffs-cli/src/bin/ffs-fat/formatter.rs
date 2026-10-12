@@ -115,7 +115,7 @@ impl Layout {
         }
         let total = size_mib
             .checked_mul(2048)
-            .filter(|total| *total != 0 && *total <= u64::from(u32::MAX))
+            .filter(|total| *total != 0 && u32::try_from(*total).is_ok())
             .ok_or_else(|| anyhow!("--size-mib must fit the nonzero 32-bit FAT sector count"))?;
         let width = u64::from(kind.native().entry_bytes());
         let headers = kind.reserved_sectors() + kind.fixed_root_sectors();
@@ -147,7 +147,7 @@ impl Layout {
                 // classify them as FAT12. Never allocate reserved cluster IDs.
                 FormatKind::Fat16 => {
                     (FAT16_MIN_CLUSTERS..=FAT16_MAX_CLUSTERS).contains(&clusters)
-                        && low <= u64::from(u16::MAX)
+                        && u16::try_from(low).is_ok()
                 }
                 FormatKind::Fat32 => {
                     (FAT32_MIN_CLUSTERS..=MAX_CHAIN_CLUSTERS as u64).contains(&clusters)
@@ -638,8 +638,8 @@ fn verify_created(cx: &Cx, file: &File, plan: &FormatPlan) -> Result<serde_json:
         plan.layout.image_bytes(),
     )?;
     let report = volume.check(cx)?;
-    let allocated = plan.population.as_ref().map_or(
-        u64::from(plan.layout.kind == FormatKind::Fat32),
+    let allocated = plan.population.as_ref().map_or_else(
+        || u64::from(plan.layout.kind == FormatKind::Fat32),
         population::Population::allocated,
     );
     let files = plan

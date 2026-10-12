@@ -488,7 +488,23 @@ fn backing_and_placeholder_admission_rejects_incomplete_or_transformed_values_wi
             }
             1 => attrs[2][56..64].copy_from_slice(&(stored.len() as u64 - 1).to_le_bytes()),
             2 => attrs[2][12..14].copy_from_slice(&0x4000_u16.to_le_bytes()),
-            3 => attrs[2][12..14].copy_from_slice(&SPARSE.to_le_bytes()),
+            3 => {
+                // Sparse attributes have an extra allocation-size field. Keep
+                // the name and mapping pairs outside that extended header so
+                // this reaches WOF admission rather than record corruption.
+                let backing = &mut attrs[2];
+                let old_length = backing.len();
+                let pairs_start = u16::from_le_bytes([backing[32], backing[33]]);
+                backing.resize(old_length + 8, 0);
+                backing.copy_within(64..old_length, 72);
+                backing[64..72]
+                    .copy_from_slice(&(stored.len().next_multiple_of(512) as u64).to_le_bytes());
+                backing[4..8]
+                    .copy_from_slice(&u32::try_from(old_length + 8).unwrap().to_le_bytes());
+                backing[10..12].copy_from_slice(&72_u16.to_le_bytes());
+                backing[32..34].copy_from_slice(&(pairs_start + 8).to_le_bytes());
+                backing[12..14].copy_from_slice(&SPARSE.to_le_bytes());
+            }
             _ => {
                 attrs.remove(2);
             }
@@ -498,7 +514,16 @@ fn backing_and_placeholder_admission_rejects_incomplete_or_transformed_values_wi
         let volume = image.open(Arc::clone(&reads), None).unwrap();
         let record = volume.record(&cx, 24, None).unwrap();
         reads.lock().unwrap().clear();
-        assert!(volume.data_stream(&cx, &record, &[]).is_err());
+        let result = volume.data_stream(&cx, &record, &[]);
+        if case == 3 {
+            assert!(matches!(
+                result,
+                Err(FfsError::UnsupportedFeature(ref detail))
+                    if detail == "WofCompressedData must not be encrypted, sparse or recursively compressed"
+            ));
+        } else {
+            assert!(result.is_err());
+        }
         assert!(reads.lock().unwrap().is_empty());
     }
 }

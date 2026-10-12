@@ -98,6 +98,18 @@ pub(super) fn header_allocation(config: &VdevConfig) -> Result<u64> {
     Ok((1_u64 << config.ashift) * sectors)
 }
 
+/// This reader admits one top-level vdev, so every declared header copy must
+/// use that vdev's geometry. Keep one allocation per actual DVA, in copy order.
+pub(super) fn header_allocations(config: &VdevConfig, pointer: &BlockPointer) -> Result<Vec<u64>> {
+    let dvas = pointer.regular_dvas().map_err(|error| parse(&error))?;
+    if dvas.iter().any(|dva| dva.vdev != config.id) {
+        return Err(unsupported(
+            "foreign-vdev gang header requires another topology",
+        ));
+    }
+    Ok(vec![header_allocation(config)?; dvas.len()])
+}
+
 impl Pool {
     pub(in crate::reader) fn read_gang_block(
         &self,
@@ -107,7 +119,7 @@ impl Pool {
     ) -> Result<BlockRead> {
         checkpoint(cx)?;
         let dvas = pointer
-            .gang_dvas(header_allocation(config)?)
+            .gang_dvas(&header_allocations(config, pointer)?)
             .map_err(|error| parse(&error))?;
         let replicas = if config.raidz_members.is_some() {
             1
@@ -181,7 +193,8 @@ impl Pool {
             .map(|(dva, _)| (dva.vdev, dva.offset))
             .ok_or_else(|| corrupt("gang header has no native allocation"))?;
         let block = self.read_gang_header(cx, config, pointer)?;
-        let header = GangHeader::parse(&block.bytes, pointer, header_allocation(config)?)
+        let header_allocations: Vec<_> = allocations.iter().map(|(_, bytes)| *bytes).collect();
+        let header = GangHeader::parse(&block.bytes, pointer, &header_allocations)
             .map_err(|error| parse(&error))?;
         for child in header.children() {
             self.admit_gang(cx, config, child, depth + 1, admission)?;
@@ -245,8 +258,9 @@ impl Pool {
             ));
         }
         budget.visit(destination.len())?;
+        let header_allocations = header_allocations(config, pointer)?;
         let dvas = pointer
-            .gang_dvas(header_allocation(config)?)
+            .gang_dvas(&header_allocations)
             .map_err(|error| parse(&error))?;
         let identities: BTreeSet<_> = dvas.iter().map(|dva| (dva.vdev, dva.offset)).collect();
         if identities.len() != dvas.len()
@@ -265,9 +279,8 @@ impl Pool {
             } else {
                 self.read_gang_header(cx, config, pointer)?
             };
-            let header =
-                GangHeader::parse(&header_block.bytes, pointer, header_allocation(config)?)
-                    .map_err(|error| parse(&error))?;
+            let header = GangHeader::parse(&header_block.bytes, pointer, &header_allocations)
+                .map_err(|error| parse(&error))?;
             let mut at = 0_usize;
             for child in header.children() {
                 checkpoint(cx)?;
@@ -319,7 +332,7 @@ impl Pool {
         checkpoint(cx)?;
         let allocated = header_allocation(config)?;
         let dvas = pointer
-            .gang_dvas(allocated)
+            .gang_dvas(&header_allocations(config, pointer)?)
             .map_err(|error| parse(&error))?;
         // All copies and all supplied members are bounded before a usable
         // first replica can conceal an invalid later DVA or undersized member.
@@ -370,13 +383,15 @@ impl Pool {
         }
         let allocated = header_allocation(config)?;
         let dvas = self.gang_header_dvas(cx, config, pointer)?;
+        let header_allocations = vec![allocated; dvas.len()];
         let mut failures = Vec::new();
         for (copy_index, dva) in dvas.iter().enumerate() {
             let offset = DATA_OFFSET + dva.offset;
             for (member_index, member) in self.members.iter().enumerate() {
                 checkpoint(cx)?;
                 let result = member.read(cx, offset, HEADER_BYTES).and_then(|bytes| {
-                    GangHeader::parse(&bytes, pointer, allocated).map_err(|error| parse(&error))?;
+                    GangHeader::parse(&bytes, pointer, &header_allocations)
+                        .map_err(|error| parse(&error))?;
                     Ok(bytes)
                 });
                 match result {

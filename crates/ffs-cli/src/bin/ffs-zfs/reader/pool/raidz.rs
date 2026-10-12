@@ -96,6 +96,7 @@ struct Stripe<'a> {
     map: &'a NativeMap,
     members: &'a [RaidzMember],
     pointer: &'a BlockPointer,
+    header_allocations: &'a [u64],
     dva_offset: u64,
     copy_index: usize,
 }
@@ -117,7 +118,7 @@ impl Pool {
         checkpoint(cx)?;
         let members = &group.members;
         let dvas = if bp.gang() {
-            bp.gang_dvas(super::gang::header_allocation(config)?)
+            bp.gang_dvas(&super::gang::header_allocations(config, bp)?)
         } else {
             bp.regular_dvas()
         }
@@ -223,6 +224,11 @@ impl Pool {
         // Complete every map before a usable first DVA can conceal another
         // foreign, unsupported or out-of-range declared copy.
         let maps = self.raidz_maps(cx, config, bp, group)?;
+        let header_allocations: Vec<_> = if bp.gang() {
+            maps.iter().map(|(_, map)| map.allocated_bytes()).collect()
+        } else {
+            Vec::new()
+        };
         let mut failures = Vec::new();
         for (copy_index, (dva, map)) in maps.iter().enumerate() {
             checkpoint(cx)?;
@@ -230,6 +236,7 @@ impl Pool {
                 map,
                 members: &group.members,
                 pointer: bp,
+                header_allocations: &header_allocations,
                 dva_offset: dva.offset,
                 copy_index,
             };
@@ -380,7 +387,7 @@ fn verify_candidate(
     let physical = stripe.map.assemble(&slices, erased)?;
     checkpoint(cx)?;
     let bytes = if stripe.pointer.gang() {
-        GangHeader::parse(&physical, stripe.pointer, stripe.map.allocated_bytes())
+        GangHeader::parse(&physical, stripe.pointer, stripe.header_allocations)
             .map_err(|error| parse(&error))?;
         physical
     } else {

@@ -82,7 +82,7 @@ impl NativeName {
                     let unit = units
                         .get(position)
                         .copied()
-                        .unwrap_or_else(|| if position == units.len() { 0 } else { 0xFFFF });
+                        .unwrap_or(if position == units.len() { 0 } else { 0xFFFF });
                     word(&mut slot, at, unit);
                 }
                 output.extend_from_slice(&slot);

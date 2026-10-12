@@ -618,7 +618,9 @@ impl Checker<'_> {
                     } else {
                         stored
                     };
-                    let unit = code_page.decode_unit(byte).unwrap_or(u16::from(byte));
+                    let unit = code_page
+                        .decode_unit(byte)
+                        .unwrap_or_else(|| u16::from(byte));
                     code_page.fold_unit(unit)
                 })
                 .collect();
