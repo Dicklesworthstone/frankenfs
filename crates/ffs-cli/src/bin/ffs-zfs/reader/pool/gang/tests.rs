@@ -46,7 +46,10 @@ impl ByteDevice for Memory {
     }
 
     fn read_exact_at(&self, _cx: &Cx, offset: ByteOffset, out: &mut [u8]) -> Result<()> {
-        self.reads.lock().unwrap().push((self.id, offset.0, out.len()));
+        self.reads
+            .lock()
+            .unwrap()
+            .push((self.id, offset.0, out.len()));
         let storage = self.storage.lock().unwrap();
         let fault = storage.faults.get(&offset.0);
         match fault {
@@ -142,11 +145,8 @@ impl Fixture {
     }
 
     fn read(&self, words: &Words, container: Endian) -> Result<BlockRead> {
-        self.pool().read_block(
-            &Cx::for_testing(),
-            &self.config,
-            &pointer(words, container),
-        )
+        self.pool()
+            .read_block(&Cx::for_testing(), &self.config, &pointer(words, container))
     }
 
     fn store(&self, id: usize, offset: u64, bytes: Vec<u8>) {
@@ -177,7 +177,10 @@ impl Fixture {
             )
             .unwrap();
             assert_eq!(
-                map.columns().iter().filter(|c| c.data_offset.is_some()).count(),
+                map.columns()
+                    .iter()
+                    .filter(|c| c.data_offset.is_some())
+                    .count(),
                 1,
             );
             for column in map.columns().iter().filter(|column| column.bytes != 0) {
@@ -260,7 +263,11 @@ fn header(parent: &Words, children: &[Words], order: Endian) -> [u8; 512] {
         raw[index * 128..index * 128 + 128].copy_from_slice(&encode(child, order));
     }
     raw[472..480].copy_from_slice(&order.encode(MAGIC));
-    let birth = if parent[9] == 0 { parent[10] } else { parent[9] };
+    let birth = if parent[9] == 0 {
+        parent[10]
+    } else {
+        parent[9]
+    };
     let verifier = [
         (parent[0] >> 32) & 0x00ff_ffff,
         (parent[1] & 0x7fff_ffff_ffff_ffff) * 512,
@@ -291,14 +298,22 @@ fn leaf_and_pool_paths_extract_gang_bytes_in_both_orders_and_bounded_partitions(
             let (root, _) = image.seed_pair(order, HEADER, &physical);
             let bp = pointer(&root, order);
             let pool = image.pool();
-            assert_eq!(pool.read_block(&cx, &image.config, &bp).unwrap().bytes, physical);
+            assert_eq!(
+                pool.read_block(&cx, &image.config, &bp).unwrap().bytes,
+                physical
+            );
             let leaf = pool.standalone_leaf().unwrap();
             let (bytes, offset, copy) = leaf.read_block(&cx, &image.config, &bp).unwrap();
             assert_eq!(bytes, physical);
             assert_eq!((offset, copy), (DATA_OFFSET + HEADER, 0));
-            assert!(image.reads.lock().unwrap().iter().all(|(_, at, length)| {
-                *at >= image.base + DATA_OFFSET && *length == 512
-            }));
+            assert!(
+                image
+                    .reads
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(_, at, length)| { *at >= image.base + DATA_OFFSET && *length == 512 })
+            );
         }
     }
 }
@@ -341,9 +356,14 @@ fn mirror_header_and_fragment_retries_keep_native_membership() {
     let block = image.read(&root, Endian::Big).unwrap();
     assert_eq!(block.bytes, expected);
     assert_eq!(block.member_index, 1);
-    assert!(image.reads.lock().unwrap().iter().any(|(id, at, _)| {
-        *id == 0 && *at == image.address(FIRST)
-    }));
+    assert!(
+        image
+            .reads
+            .lock()
+            .unwrap()
+            .iter()
+            .any(|(id, at, _)| { *id == 0 && *at == image.address(FIRST) })
+    );
 }
 
 #[test]
@@ -429,9 +449,15 @@ fn cancelled_raidz_header_does_not_attempt_parity_or_children() {
         let map = NativeMap::new(HEADER, 512, 9, parity + 2, parity).unwrap();
         let data = &map.columns()[parity];
         image.fault(data.child_id, data.offset, Fault::Cancel);
-        assert!(matches!(image.read(&root, Endian::Little), Err(FfsError::Cancelled)));
+        assert!(matches!(
+            image.read(&root, Endian::Little),
+            Err(FfsError::Cancelled)
+        ));
         let reads = image.reads.lock().unwrap();
-        assert_eq!(reads.as_slice(), &[(data.child_id, image.address(data.offset), 512)]);
+        assert_eq!(
+            reads.as_slice(),
+            &[(data.child_id, image.address(data.offset), 512)]
+        );
     }
 }
 
@@ -502,9 +528,14 @@ fn nested_gang_checks_interior_checksum_and_does_not_reinterpret_dmu_type() {
         let result = image.read(&root, Endian::Little);
         if bad_interior {
             assert!(result.is_err());
-            assert!(!image.reads.lock().unwrap().iter().any(|(_, at, _)| {
-                *at == image.address(0xc000)
-            }));
+            assert!(
+                !image
+                    .reads
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(_, at, _)| { *at == image.address(0xc000) })
+            );
         } else {
             assert_eq!(result.unwrap().bytes, expected);
         }
@@ -564,14 +595,29 @@ fn traversal_limits_and_active_header_identity_fail_before_io() {
     let pool = image.pool();
     let mut destination = [0; 1024];
     let mut budget = Budget::default();
-    assert!(pool.expand_gang(
-        &Cx::for_testing(), &image.config, &bp, &mut destination,
-        MAX_GANG_DEPTH, &mut budget,
-    ).is_err());
+    assert!(
+        pool.expand_gang(
+            &Cx::for_testing(),
+            &image.config,
+            &bp,
+            &mut destination,
+            MAX_GANG_DEPTH,
+            &mut budget,
+        )
+        .is_err()
+    );
     budget.active.insert((0, HEADER));
-    assert!(pool.expand_gang(
-        &Cx::for_testing(), &image.config, &bp, &mut destination, 0, &mut budget,
-    ).is_err());
+    assert!(
+        pool.expand_gang(
+            &Cx::for_testing(),
+            &image.config,
+            &bp,
+            &mut destination,
+            0,
+            &mut budget,
+        )
+        .is_err()
+    );
     assert!(image.reads.lock().unwrap().is_empty());
     let mut nodes = Budget {
         nodes: MAX_GANG_NODES,
@@ -583,4 +629,214 @@ fn traversal_limits_and_active_header_identity_fail_before_io() {
         ..Budget::default()
     };
     assert!(work.visit(512).is_err());
+}
+
+#[test]
+fn repeated_verified_fragment_allocations_fail_before_payload_io_in_every_topology() {
+    for order in [Endian::Little, Endian::Big] {
+        for parity in 0..=3 {
+            let image = Fixture::new(parity, if parity == 0 { 1 } else { parity + 2 }, 9, 4096);
+            let allocation = header_allocation(&image.config).unwrap();
+            let data = vec![0x71; 512];
+            let child = member(&data, FIRST, allocation, order);
+            // All checksums and exact native ASIZE sums are valid. Reusing one
+            // physical allocation twice must still invalidate the whole tree.
+            let physical = [data.clone(), data.clone()].concat();
+            let (root, raw) = gang(&physical, &[child, child], HEADER, allocation, order);
+            assert!(GangHeader::parse(&raw, &pointer(&root, order), allocation).is_ok());
+            image.install(FIRST, &data);
+            image.install(HEADER, &raw);
+            let error = image.read(&root, order).err().expect("overlap must fail");
+            assert!(error.to_string().contains("overlaps"));
+            let payload_offset = if parity == 0 {
+                FIRST
+            } else {
+                NativeMap::new(FIRST, 512, 9, parity + 2, parity)
+                    .unwrap()
+                    .columns()[parity]
+                    .offset
+            };
+            assert!(
+                !image
+                    .reads
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .any(|(_, at, _)| { *at == image.address(payload_offset) })
+            );
+        }
+    }
+}
+
+#[test]
+fn partial_header_and_replica_allocation_overlaps_are_rejected_before_payloads() {
+    for case in 0..3 {
+        let image = Fixture::new(0, 1, 9, 0);
+        let first_data = vec![0x39; 1024];
+        let second_data = vec![0x39; 512];
+        let first = member(&first_data, FIRST, 1024, Endian::Little);
+        let second_offset = if case == 1 { HEADER } else { FIRST + 512 };
+        let second = member(&second_data, second_offset, 512, Endian::Little);
+        let physical = [first_data.clone(), second_data.clone()].concat();
+        let (mut root, mut raw) = gang(&physical, &[first, second], HEADER, 512, Endian::Little);
+        if case == 2 {
+            // A valid first header cannot conceal a header-only replica that
+            // occupies bytes already claimed by the first ordinary fragment.
+            let second = member(&second_data, SECOND, 512, Endian::Little);
+            root[2] = 1;
+            root[3] = (1_u64 << 63) | (FIRST / 512);
+            raw = header(&root, &[first, second], Endian::Little);
+        }
+        image.store(0, FIRST, first_data);
+        image.install(SECOND, &second_data);
+        image.install(HEADER, &raw);
+        let error = image
+            .read(&root, Endian::Little)
+            .err()
+            .expect("overlap must fail");
+        assert!(
+            error.to_string().contains("overlaps"),
+            "case {case}: {error}"
+        );
+        assert_eq!(
+            image.reads.lock().unwrap().as_slice(),
+            &[(0, image.address(HEADER), 512)]
+        );
+    }
+}
+
+#[test]
+fn all_later_child_mappings_and_nested_headers_are_admitted_before_early_payloads() {
+    for case in 0..4 {
+        let image = Fixture::new(0, 1, 9, 0);
+        let first_data = vec![0x18; 512];
+        let tail_data = vec![0x27; 1024];
+        let first = member(&first_data, FIRST, 512, Endian::Little);
+        let mut children = [
+            member(&tail_data[..512], SECOND, 512, Endian::Little),
+            member(&tail_data[512..], 0xc000, 512, Endian::Little),
+        ];
+        let (nested, nested_raw) = gang(&tail_data, &children, 0x18000, 512, Endian::Little);
+        let later = match case {
+            0 => {
+                children[0][0] |= 1_u64 << 32;
+                children[0]
+            }
+            1 => {
+                children[0][1] = CAPACITY / 512;
+                children[0]
+            }
+            _ => nested,
+        };
+        let physical = if case < 2 {
+            [first_data.clone(), tail_data[..512].to_vec()].concat()
+        } else {
+            [first_data.clone(), tail_data.clone()].concat()
+        };
+        let (root, raw) = gang(&physical, &[first, later], HEADER, 512, Endian::Little);
+        image.install(FIRST, &first_data);
+        image.install(SECOND, &tail_data[..512]);
+        image.install(0xc000, &tail_data[512..]);
+        image.install(0x18000, &nested_raw);
+        image.install(HEADER, &raw);
+        if case >= 2 {
+            image.fault(
+                0,
+                0x18000,
+                if case == 2 {
+                    Fault::Flip
+                } else {
+                    Fault::Cancel
+                },
+            );
+        }
+        let result = image.read(&root, Endian::Little);
+        if case == 3 {
+            assert!(matches!(result, Err(FfsError::Cancelled)));
+        } else {
+            assert!(result.is_err());
+        }
+        assert!(!image.reads.lock().unwrap().iter().any(|(_, at, _)| {
+            [FIRST, SECOND, 0xc000]
+                .iter()
+                .any(|offset| *at == image.address(*offset))
+        }));
+    }
+}
+
+#[test]
+fn allocated_work_budget_counts_ditto_copies_and_every_mirror_member_before_io() {
+    for (width, copies, bytes_per_copy) in [
+        (1, 1, MAX_GANG_ALLOCATED_BYTES + 512),
+        (1, 2, MAX_GANG_ALLOCATED_BYTES / 2 + 512),
+        (2, 1, MAX_GANG_ALLOCATED_BYTES / 2 + 512),
+        (8, 2, MAX_GANG_ALLOCATED_BYTES / 16 + 512),
+    ] {
+        let image = Fixture::new(0, width, 9, 0);
+        let (mut root, _) = image.seed_pair(Endian::Little, HEADER, &payload());
+        root[0] = bytes_per_copy / 512;
+        if copies == 2 {
+            root[2] = bytes_per_copy / 512;
+            root[3] = (1_u64 << 63) | (0x18000 / 512);
+        }
+        let error = image
+            .read(&root, Endian::Little)
+            .err()
+            .expect("allocated budget must fail");
+        assert!(matches!(error, FfsError::UnsupportedFeature(_)));
+        assert!(error.to_string().contains("allocated read budget"));
+        assert!(image.reads.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn real_depth_boundary_is_admitted_before_any_fragment_read_and_headers_are_not_reread() {
+    for depth in [MAX_GANG_DEPTH, MAX_GANG_DEPTH + 1] {
+        let image = Fixture::new(0, 1, 9, 0);
+        let data = vec![0x52; 512];
+        let mut physical = data.clone();
+        let mut root = member(&data, FIRST, 512, Endian::Little);
+        image.install(FIRST, &data);
+        let mut leaves = vec![FIRST];
+        let mut headers = Vec::new();
+        for index in 0..depth {
+            let leaf_offset = FIRST + (index as u64 + 1) * 512;
+            let header_offset = 0x80000 + index as u64 * 512;
+            let leaf = member(&data, leaf_offset, 512, Endian::Little);
+            physical.extend_from_slice(&data);
+            let (parent, raw) = gang(&physical, &[leaf, root], header_offset, 512, Endian::Little);
+            image.install(leaf_offset, &data);
+            image.install(header_offset, &raw);
+            leaves.push(leaf_offset);
+            headers.push(header_offset);
+            root = parent;
+        }
+        let result = image.read(&root, Endian::Little);
+        let reads = image.reads.lock().unwrap();
+        if depth == MAX_GANG_DEPTH {
+            assert_eq!(result.unwrap().bytes, physical);
+            assert_eq!(reads.len(), headers.len() + leaves.len());
+            assert!(
+                reads[..headers.len()].iter().all(|(_, at, _)| {
+                    headers.iter().any(|offset| *at == image.address(*offset))
+                })
+            );
+            for offset in headers {
+                assert_eq!(
+                    reads
+                        .iter()
+                        .filter(|(_, at, _)| *at == image.address(offset))
+                        .count(),
+                    1
+                );
+            }
+        } else {
+            assert!(matches!(result, Err(FfsError::UnsupportedFeature(_))));
+            assert!(
+                !reads.iter().any(|(_, at, _)| {
+                    leaves.iter().any(|offset| *at == image.address(*offset))
+                })
+            );
+        }
+    }
 }

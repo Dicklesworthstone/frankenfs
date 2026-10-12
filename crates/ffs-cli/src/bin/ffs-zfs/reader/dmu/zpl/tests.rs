@@ -278,8 +278,10 @@ fn graph(order: Endian, sa: u8, case: u8, reads: Reads, failure: Option<u64>) ->
         dn[64..192].copy_from_slice(&bp(data, at, 20, 0, 20, order, payload));
         table[number * 512..(number + 1) * 512].copy_from_slice(&dn);
     }
-    let a = vec![b'A'; 512];
-    let b = vec![b'B'; 512];
+    let block_bytes = if case == 32 { 1024 } else { 512 };
+    let file_size = if case == 32 { 2051 } else { 1027 };
+    let a = vec![b'A'; block_bytes];
+    let b = vec![b'B'; block_bytes];
     store(FIRST, &a);
     store(LAST, &b);
     let mut indirect = vec![0; 4096];
@@ -293,13 +295,24 @@ fn graph(order: Endian, sa: u8, case: u8, reads: Reads, failure: Option<u64>) ->
         }
     }
     store(INDIRECT, &indirect);
-    let fields = sa_fields(other);
+    let mut fields = sa_fields(other);
+    if case == 32 {
+        fields.iter_mut().find(|(id, _)| *id == 6).unwrap().1 = other.encode(file_size).to_vec();
+    }
     let bonus = match sa {
-        0 => legacy(0o100_640, 1027, 2, order),
+        0 => legacy(0o100_640, file_size, 2, order),
         1 => sa_bytes(2, &fields, other),
         _ => sa_bytes(2, &fields[..5], other),
     };
-    let mut file = node(19, 512, 2, 2, &bonus, if sa == 0 { 17 } else { 44 }, order);
+    let mut file = node(
+        19,
+        block_bytes,
+        2,
+        2,
+        &bonus,
+        if sa == 0 { 17 } else { 44 },
+        order,
+    );
     file[64..192].copy_from_slice(&bp(&indirect, INDIRECT, 19, 1, 30, order, other));
     if case == 11 {
         indirect[0] ^= 1;
@@ -366,7 +379,7 @@ fn graph(order: Endian, sa: u8, case: u8, reads: Reads, failure: Option<u64>) ->
         dn[192..320].copy_from_slice(&bp(&leaf, SA_LAYOUTS + 512, 47, 0, 20, order, other));
         table[10 * 512..11 * 512].copy_from_slice(&dn);
     }
-    if case >= 12 {
+    if (12..32).contains(&case) {
         xattrs::augment(&mut table, &mut store, order, sa, case);
     }
     store(TABLE, &table);
@@ -699,4 +712,5 @@ mod mirror;
 
 mod raidz;
 
+mod gang;
 mod xattrs;

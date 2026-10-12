@@ -107,7 +107,7 @@ struct Columns {
 }
 
 impl Pool {
-    fn raidz_maps(
+    pub(super) fn raidz_maps(
         &self,
         cx: &Cx,
         config: &VdevConfig,
@@ -310,10 +310,9 @@ impl Pool {
                 Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
                 Err(error) => {
                     columns.missing.push(index);
-                    columns.failures.push(format!(
-                        "parity child {}: {error}",
-                        parity.child_id
-                    ));
+                    columns
+                        .failures
+                        .push(format!("parity child {}: {error}", parity.child_id));
                 }
             }
         }
