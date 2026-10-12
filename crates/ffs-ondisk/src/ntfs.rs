@@ -6,6 +6,7 @@
 //! the BPB advertises larger sectors. Names remain native UTF-16 code units.
 
 pub mod attribute_list;
+pub mod ea;
 pub mod index;
 pub mod reparse;
 
@@ -15,6 +16,8 @@ pub const ATTRIBUTE_LIST: u32 = 0x20;
 pub const DATA: u32 = 0x80;
 pub const VOLUME_INFORMATION: u32 = 0x70;
 pub const REPARSE_POINT: u32 = 0xC0;
+pub const EA_INFORMATION: u32 = 0xD0;
+pub const EA: u32 = 0xE0;
 pub const COMPRESSED: u16 = 0x0001;
 pub const ENCRYPTED: u16 = 0x4000;
 pub const SPARSE: u16 = 0x8000;

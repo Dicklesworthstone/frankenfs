@@ -1,12 +1,14 @@
 #![forbid(unsafe_code)]
 //! Native, read-only NTFS 3.1 inspection, directory traversal and stream extraction.
 
+mod ea_name;
 mod reader;
 mod stream_name;
 
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
 use clap::{Args, Parser, Subcommand};
+use ea_name::EaName;
 use ffs_ondisk::ntfs::reparse::{NtfsReparseData, NtfsReparsePoint};
 use ffs_ondisk::ntfs::{DATA, NtfsFileRecord, NtfsValue};
 use reader::NtfsVolume;
@@ -107,6 +109,20 @@ enum Command {
         file: RecordArgs,
         /// Write exact self-relative descriptor bytes instead of the JSON report.
         #[arg(long)]
+        raw: bool,
+    },
+    /// Enumerate native extended attributes or extract an exact binary EA value.
+    Ea {
+        #[command(flatten)]
+        file: RecordArgs,
+        /// Exact UTF-8 name bytes. Omit both selectors to enumerate every EA.
+        #[arg(long, conflicts_with = "name_hex", group = "ea_name", value_parser = EaName::parse_text)]
+        name: Option<EaName>,
+        /// Exact native name bytes as consecutive hex pairs, e.g. 757365722e8241.
+        #[arg(long, conflicts_with = "name", group = "ea_name", value_parser = EaName::parse_hex)]
+        name_hex: Option<EaName>,
+        /// Write the selected value's exact bytes instead of JSON; requires a name.
+        #[arg(long, requires = "ea_name")]
         raw: bool,
     },
     /// Show the attributes and native UTF-16 stream names of an in-use MFT record.
@@ -271,6 +287,35 @@ fn stream_to_stdout(
     Ok(())
 }
 
+fn ea_json(catalog: &reader::ea::EaCatalog, selected: Option<&[u8]>) -> Result<serde_json::Value> {
+    let entries: Vec<_> = if let Some(name) = selected {
+        vec![catalog.find(name).context("native EA name was not found")?]
+    } else {
+        catalog.entries.iter().collect()
+    };
+    let entries: Vec<_> = entries
+        .into_iter()
+        .map(|entry| {
+            serde_json::json!({
+                "name": std::str::from_utf8(&entry.name).ok(),
+                "name_bytes": entry.name,
+                "flags": entry.flags,
+                "need_ea": entry.need_ea(),
+                "value_length": entry.value.len(),
+                "value_bytes": entry.value,
+            })
+        })
+        .collect();
+    Ok(serde_json::json!({
+        "present": catalog.information.is_some(),
+        "packed_bytes": catalog.information.map(|info| info.packed_bytes),
+        "unpacked_bytes": catalog.information.map(|info| info.unpacked_bytes),
+        "need_ea_count": catalog.information.map(|info| info.need_ea_count),
+        "entries": entries,
+        "scope": "native EA metadata; values do not project host security or DATA streams",
+    }))
+}
+
 fn main() -> Result<()> {
     let cli = Cli::parse();
     let cx = Cx::for_request();
@@ -379,6 +424,34 @@ fn main() -> Result<()> {
                 }))?;
             }
         }
+        Command::Ea {
+            file,
+            name,
+            name_hex,
+            raw,
+        } => {
+            let selected = name.or(name_hex);
+            let volume = file.image.open(&cx)?;
+            let record = volume.record(&cx, file.record, file.sequence)?;
+            let catalog = volume.extended_attributes(&cx, &record)?;
+            if raw {
+                let name = selected
+                    .as_ref()
+                    .context("--raw requires an exact EA name")?;
+                let entry = catalog
+                    .find(name.as_bytes())
+                    .context("native EA name was not found")?;
+                let mut out = io::stdout().lock();
+                out.write_all(&entry.value)?;
+                out.flush()?;
+            } else {
+                json(&serde_json::json!({
+                    "record": record.number,
+                    "sequence": record.sequence,
+                    "extended_attributes": ea_json(&catalog, selected.as_ref().map(EaName::as_bytes))?,
+                }))?;
+            }
+        }
         Command::Record { file } => {
             let volume = file.image.open(&cx)?;
             let record = volume.record(&cx, file.record, file.sequence)?;
@@ -480,6 +553,158 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_ea_selectors_require_offline_identity_and_one_exact_name_for_raw_output() {
+        assert!(Cli::try_parse_from(["ffs-ntfs", "ea", "disk.img", "24"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "ffs-ntfs",
+                "ea",
+                "disk.img",
+                "24",
+                "--offline-image",
+                "--raw",
+            ])
+            .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "ffs-ntfs",
+            "ea",
+            "disk.img",
+            "24",
+            "--offline-image",
+            "--sequence",
+            "7",
+            "--offset",
+            "1024",
+            "--length",
+            "65536",
+            "--name-hex",
+            "757365722e8241",
+            "--raw",
+        ])
+        .unwrap();
+        let Command::Ea {
+            file,
+            name,
+            name_hex,
+            raw,
+        } = cli.command
+        else {
+            panic!("ea extraction");
+        };
+        assert_eq!((file.record, file.sequence), (24, Some(7)));
+        assert_eq!((file.image.offset, file.image.length), (1024, Some(65536)));
+        assert!(raw && name.is_none());
+        assert_eq!(name_hex.unwrap().as_bytes(), b"user.\x82A");
+        for selector in ["00", "aa,b1", "a"] {
+            assert!(
+                Cli::try_parse_from([
+                    "ffs-ntfs",
+                    "ea",
+                    "disk.img",
+                    "24",
+                    "--offline-image",
+                    "--name-hex",
+                    selector,
+                ])
+                .is_err()
+            );
+        }
+        assert!(
+            Cli::try_parse_from([
+                "ffs-ntfs",
+                "ea",
+                "disk.img",
+                "24",
+                "--offline-image",
+                "--name",
+                "user.A",
+                "--name-hex",
+                "757365722e41",
+            ])
+            .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "ffs-ntfs",
+            "ea",
+            "disk.img",
+            "24",
+            "--offline-image",
+            "--name",
+            "user.A",
+            "--raw",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Ea {
+                name: Some(_),
+                name_hex: None,
+                raw: true,
+                ..
+            }
+        ));
+        let cli =
+            Cli::try_parse_from(["ffs-ntfs", "ea", "disk.img", "24", "--offline-image"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Ea {
+                name: None,
+                name_hex: None,
+                raw: false,
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn ea_json_preserves_native_names_binary_values_and_exact_absence() {
+        use ffs_ondisk::ntfs::ea::{FILE_NEED_EA, NtfsEa, NtfsEaInformation};
+        let catalog = reader::ea::EaCatalog {
+            information: Some(NtfsEaInformation {
+                packed_bytes: 20,
+                need_ea_count: 1,
+                unpacked_bytes: 32,
+            }),
+            entries: vec![
+                NtfsEa {
+                    name: vec![0x82, b'A'],
+                    flags: FILE_NEED_EA,
+                    value: vec![0, 0xFF, 1],
+                },
+                NtfsEa {
+                    name: b"empty".to_vec(),
+                    flags: 0,
+                    value: Vec::new(),
+                },
+            ],
+        };
+        let report = ea_json(&catalog, None).unwrap();
+        assert_eq!(report["present"], true);
+        assert_eq!(report["need_ea_count"], 1);
+        assert_eq!(report["entries"][0]["name"], serde_json::Value::Null);
+        assert_eq!(
+            report["entries"][0]["name_bytes"],
+            serde_json::json!([0x82, b'A'])
+        );
+        assert_eq!(
+            report["entries"][0]["value_bytes"],
+            serde_json::json!([0, 255, 1])
+        );
+        assert_eq!(report["entries"][0]["need_ea"], true);
+        assert_eq!(report["entries"][1]["value_length"], 0);
+        let selected = ea_json(&catalog, Some(&[0x82, b'A'])).unwrap();
+        assert_eq!(selected["entries"].as_array().unwrap().len(), 1);
+        assert!(ea_json(&catalog, Some(b"EMPTY")).is_err());
+        let absent = reader::ea::EaCatalog {
+            information: None,
+            entries: Vec::new(),
+        };
+        assert_eq!(ea_json(&absent, None).unwrap()["present"], false);
+        assert!(ea_json(&absent, Some(b"empty")).is_err());
+    }
 
     #[test]
     fn cli_security_keeps_native_record_identity_and_requires_offline_image() {

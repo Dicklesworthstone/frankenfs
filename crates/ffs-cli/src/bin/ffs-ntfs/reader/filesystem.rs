@@ -9,6 +9,7 @@ use super::{
 use ffs_core::{
     DirEntry, FileType, FsOps, FsStat, InodeAttr, ReaddirPage, RequestScope, SeekWhence,
 };
+use ffs_ondisk::ntfs::ea::MAX_EA_NAME_BYTES;
 use ffs_ondisk::ntfs::index::NtfsFileName;
 use ffs_types::InodeNumber;
 use std::collections::{BTreeMap, BTreeSet};
@@ -126,6 +127,27 @@ impl NtfsFs {
         self.cache
             .lock()
             .map_err(|_| FfsError::Io(std::io::Error::other("NTFS mount cache poisoned")))
+    }
+
+    fn user_eas(&self, cx: &Cx, record: &NtfsFileRecord) -> Result<BTreeMap<String, Vec<u8>>> {
+        let catalog = self.volume.extended_attributes(cx, record)?;
+        let mut result = BTreeMap::new();
+        for entry in catalog.entries {
+            checkpoint(cx)?;
+            let Some(suffix) = entry.name.strip_prefix(b"user.") else {
+                // Native ACLs, capabilities, WSL metadata and unprefixed OS/2
+                // names remain accessible through the CLI's exact-byte view.
+                continue;
+            };
+            if suffix.is_empty() {
+                return Err(unsupported("native user EA has an empty host suffix"));
+            }
+            let name = String::from_utf8(entry.name)
+                .map_err(|_| unsupported("native user EA name is not lossless UTF-8"))?;
+            result.insert(name, entry.value);
+        }
+        checkpoint(cx)?;
+        Ok(result)
     }
 
     fn inode(&self, reference: NtfsReference) -> Result<InodeNumber> {
@@ -649,6 +671,29 @@ impl FsOps for NtfsFs {
     fn readlink(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber) -> Result<Vec<u8>> {
         let record = self.record(cx, ino)?;
         self.volume.readlink(cx, &record)
+    }
+
+    fn listxattr(&self, cx: &Cx, ino: InodeNumber) -> Result<Vec<String>> {
+        let record = self.record(cx, ino)?;
+        Ok(self.user_eas(cx, &record)?.into_keys().collect())
+    }
+
+    fn getxattr(&self, cx: &Cx, ino: InodeNumber, name: &str) -> Result<Option<Vec<u8>>> {
+        let record = self.record(cx, ino)?;
+        if name.len() > MAX_EA_NAME_BYTES {
+            return Err(FfsError::NameTooLong);
+        }
+        let Some(suffix) = name.strip_prefix("user.") else {
+            return Err(unsupported(
+                "only native NTFS user.* EAs are exposed as host xattrs",
+            ));
+        };
+        if suffix.is_empty() || suffix.as_bytes().contains(&0) {
+            return Err(FfsError::Format("invalid user xattr name".into()));
+        }
+        let result = self.user_eas(cx, &record)?.remove(name);
+        checkpoint(cx)?;
+        Ok(result)
     }
 
     fn statfs(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber) -> Result<FsStat> {

@@ -15,6 +15,9 @@ through the mounted `readlink` operation. Reparse metadata remains inspectable
 for providers whose file contents are not supported. Native security descriptors
 can be inspected or extracted by MFT record identity through the shared $Secure
 catalog or a legacy SECURITY_DESCRIPTOR attribute.
+Native extended attributes can also be enumerated or extracted by record
+identity. The mounted view exposes native `user.*` EAs through read-only xattr
+operations while preserving other EA namespaces for explicit inspection.
 
 ## Commands
 
@@ -35,6 +38,9 @@ ffs-ntfs record volume.img 24 --offline-image
 ffs-ntfs streams volume.img 24 --offline-image --sequence 7
 ffs-ntfs security volume.img 24 --offline-image --sequence 7
 ffs-ntfs security volume.img 24 --offline-image --raw > descriptor.bin
+ffs-ntfs ea volume.img 24 --offline-image --sequence 7
+ffs-ntfs ea volume.img 24 --offline-image --name user.note --raw > note.bin
+ffs-ntfs ea volume.img 24 --offline-image --name-hex 757365722e8241 --raw > native-ea.bin
 ffs-ntfs cat volume.img 24 --offline-image > extracted.bin
 ffs-ntfs cat volume.img 24 --offline-image --stream note > alternate.bin
 ffs-ntfs cat volume.img 24 --offline-image --stream-utf16 d800,0061 > native-name.bin
@@ -515,6 +521,81 @@ Descriptor and ACE framing also follows Microsoft's MS-DTYP
 and [callback ACE](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-dtyp/c9579cf4-0f4a-44f1-9444-422dfb10557a)
 specifications. These define native structure, not a host access policy.
 
+## Native extended attributes
+
+`ea` reads the native EA_INFORMATION (`0xD0`) and EA (`0xE0`) attributes through
+the same complete, validated base-file catalog used for streams. It discovers
+metadata held only in extension records and assembles nonresident EA extents,
+including fragmented runs and split attributes. The base sequence, every list
+entry's attribute instance and starting VCN, and each extension's owner and
+generation must agree before a catalog is published. Direct extension-record
+selection is refused. EA inspection does not open DATA, an alternate stream or
+an EFS/reparse provider; encrypted-file metadata remains inspectable independently
+of whether its contents can be read.
+
+The eight-byte EA_INFORMATION must be unique, resident, unnamed and untransformed.
+Both native attributes must occur together; a missing half is corruption, not
+an empty catalog. The EA stream must be unnamed, untransformed, fully initialized
+and exactly match the declared logical length, with a 64 KiB total-value limit.
+Ordinary extent admission rejects holes, VCN gaps/overlap and aliases within
+that stream. The complete EA chain is then checked before any entry escapes:
+entry offsets and alignment, name/value boundaries, nonempty NUL-terminated
+names, reserved flags, duplicate exact names, the packed byte total and the
+FILE_NEED_EA count. That count includes only flagged entries, not all EAs. The
+packed total excludes each four-byte offset and alignment padding.
+
+On-disk entry lengths, including a nonzero final length used by native NTFS
+implementations, are admitted. A zero final offset may end an unpadded or aligned
+last entry, but cannot hide another record or an arbitrary trailing suffix.
+Alignment padding is ignored and is not required to contain zeroes. A paired
+zero-length value with all-zero EA_INFORMATION is reported as present but empty;
+when both attributes are absent, the report has `present: false`. These checks
+are bounded metadata validation, not a global allocation check or recovery pass.
+
+The JSON catalog preserves entry order, exact `name_bytes`, binary `value_bytes`,
+value lengths, flags and `need_ea`. A name that is not UTF-8 has `name: null`;
+its original bytes remain usable. `--name` selects exact UTF-8 bytes and
+`--name-hex` selects one to 255 non-NUL native bytes as consecutive hexadecimal
+pairs. For example, `757365722e8241` selects `user.` followed by bytes `82 41`.
+The selectors are mutually exclusive. A selector narrows the JSON report to one
+entry; adding `--raw` emits only its exact value bytes, without a newline.
+`--raw` requires a selector. A missing name, a malformed later entry or
+cancellation fails before output, rather than returning a successful prefix.
+Native names are not case-folded or converted through a guessed OEM code page.
+
+The read-only FsOps adapter implements `listxattr` and `getxattr` for exact native
+names beginning with lowercase `user.` and a nonempty suffix. Names are sorted
+for host enumeration; values retain every byte, including NULs and empty values.
+Hard links share the same sequence-bearing inode identity. Each query checks
+that identity and the complete native EA catalog, even after ordinary attribute
+cache hits. A `user.*` name that cannot be represented losslessly in UTF-8 causes
+an explicit refusal; listing cannot silently omit it. No EA cache turns a later
+I/O or cancellation error into a previously successful answer.
+
+Unprefixed OS/2 names, `system.*`, `security.*`, `trusted.*` and WSL fields remain
+available through the CLI. The mount does not create `user.*` aliases for them,
+interpret EA values as ACLs/capabilities/UIDs, or replace its explicit synthetic
+uid/gid/mode policy. Requests for other host namespaces are unsupported. Missing
+valid `user.*` names return absence; an existing empty value remains distinct.
+Named DATA streams stay separate and are never substituted for EAs. FILE_NEED_EA
+is reported as native metadata; no OS/2 application semantics are inferred.
+Set/remove xattr operations retain the read-only refusal without device writes.
+
+Native layout and identity references:
+
+- [Microsoft FILE_FULL_EA_INFORMATION](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/wdm/ns-wdm-_file_full_ea_information)
+  defines the entry fields, flags and NUL-delimited name/value boundary.
+- [Microsoft MS-FSCC FileFullEaInformation](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-fscc/0eb94f48-6aac-41df-a878-79f4dcfd8989)
+  specifies alignment, final query offsets and ignored padding.
+- [Linux v6.17 NTFS3 structures](https://github.com/torvalds/linux/blob/v6.17/fs/ntfs3/ntfs.h)
+  and [native EA reader/writer](https://github.com/torvalds/linux/blob/v6.17/fs/ntfs3/xattr.c)
+  supply the on-disk information totals, nonzero final lengths and exact native
+  name matching, including Linux-prefixed EA names.
+- [NTFS-3G's EA documentation](https://github.com/tuxera/ntfs-3g/wiki/Using-Extended-Attributes#ntfs-ea)
+  distinguishes the native final length from the zero offset returned by Win32
+  query functions. NTFS-3G's ordinary ADS-backed xattr mapping is separate from
+  the native EA view implemented here.
+
 ## Admission limits and exclusions
 
 Only immutable, offline regular files, NTFS 3.1, 512..4096-byte sectors,
@@ -843,6 +924,12 @@ The first compile exposed `LowerHex` incompatibility in the two digest assertion
 explicit bytewise hex formatting fixed those assertions without changing their
 expected hashes, inputs or acceptance conditions.
 
+The same seven tests also passed inside the actual `ffs-ondisk` crate: seven
+passed, zero failed, with 865 other tests filtered out. The production decoder,
+fixtures and corrected assertions were unchanged. This establishes compilation
+in the real crate and focused decoder execution; it does not establish the
+unrun WOF reader/FsOps integration or passage of the entire on-disk test suite.
+
 The new WOF reader/image and FsOps regressions remain unexecuted. The earlier
 XPRESS results do not establish LZX integration passage. Remaining focused checks:
 
@@ -855,3 +942,44 @@ cargo fmt --all -- --check
 
 No native Windows-generated WOF image, kernel mount, mutation or recovery claim
 is made by this increment. The backing image must remain offline and immutable.
+
+## Native EA validation
+
+Six pure parser regressions cover native final lengths, arbitrary padding,
+zero-offset termination, binary/raw names and values, FILE_NEED_EA counts, packed
+totals, the 64 KiB boundary, every prefix truncation, invalid offsets and flags,
+duplicate names, case-distinct native names and absent/empty distinctions.
+Five constructed native-image regressions cover resident file/directory/EFS
+metadata, extension-only information records, resident/nonresident lists,
+fragmented/split EA storage, continuation-size authority, raw value extraction,
+stale/foreign generations, direct extension refusal, malformed pair admission,
+uninitialized/sparse/oversized metadata, partition bounds and late cancellation.
+
+Four FsOps regressions exercise real native-byte fixtures through the read-only
+adapter: binary and empty values, file/directory EAs, DOS aliases and hard links,
+namespace exclusions without aliases, unchanged synthetic ownership and DATA,
+fragmented metadata reads without DATA payload I/O, late cancellation, malformed
+hidden entries, lossless-name refusals, stale identities after cache hits and
+read-only set/remove operations. Two selector tests and two CLI/report tests
+cover exact UTF-8/hex names, argument conflicts, offline/sequence/partition
+options, raw-output name requirements and byte-preserving JSON.
+
+Execution evidence (2026-10-12): all six parser regressions passed with the
+exact formatted production `ntfs/ea.rs` and its unchanged test module, the four
+unchanged parent parser helpers, and the real precompiled `ffs-types` crate.
+The focused Rust harness compiled in 1.41 seconds; six tests passed and none
+failed. This is execution of the production EA parser, not the complete
+`ffs-ondisk` crate or the image reader. A full on-disk rebuild and CLI dependency
+builds were killed with SIGKILL under the shared memory limit before their
+project tests could run.
+
+All twelve changed Rust source files passed the pinned nightly formatter and
+its check mode. The five image-reader, four FsOps, two selector and two
+CLI/report regressions have been authored and reviewed but remain unexecuted.
+No Windows-created EA image, kernel mount or native interchange qualification
+is inferred from constructed fixtures. Focused repository commands are:
+
+```sh
+rch exec -- cargo test -p ffs-ondisk ntfs::ea
+rch exec -- cargo test -p ffs-cli --bin ffs-ntfs ea
+```
