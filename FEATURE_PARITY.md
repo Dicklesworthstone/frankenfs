@@ -202,6 +202,17 @@
 > iteration/mask passing address them without allowances. Revalidation and the
 > new regressions remain pending: subsequent RCH requests timed out before
 > compiler execution because the admitted worker's slots were occupied.
+> Source `277776282` then integrated the upstream gang-header parser. Review
+> found its scalar header-allocation argument rejected valid replicas on vdevs
+> with different sector sizes. The parser now validates allocation per DVA;
+> all 13 original controls and checksum goldens remain, with three added
+> unequal-allocation/count controls. These 16 tests await Rust execution.
+> Strict Clippy job `30059820987973795` ran on `277776282` plus overlay
+> `680c30f1f285d1ad32e13e58d18011eb97521b0dd4db1f5a9a4fb38dd099bed2`
+> and found two incoming gang-parser lints. Explicit generation ranges and a
+> renamed checksum buffer address them; the unchanged strict gate still needs
+> to pass. Full formatting passes, and independent source review preserves the
+> parser-only scope: existing mounted readers still refuse gang I/O.
 > The original native storage/default activation/restart requirements remain
 > open. No capacity guard or validation gate was weakened.
 >

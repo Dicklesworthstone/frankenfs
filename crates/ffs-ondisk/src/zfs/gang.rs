@@ -43,19 +43,32 @@ impl BlockPointer {
     /// Validate header identities before I/O. DVA zero accounts for every
     /// member's first copy, so it must cover at least PSIZE plus the header.
     /// Additional header replicas may contain no corresponding member copy.
-    pub fn gang_dvas(&self, header_allocation: u64) -> Result<Vec<Dva>, ParseError> {
+    /// Supply one native header allocation per declared DVA, in copy order.
+    pub fn gang_dvas(&self, header_allocations: &[u64]) -> Result<Vec<Dva>, ParseError> {
         let dvas = self.regular_dvas()?;
         if !self.gang()
             || dvas.iter().any(|dva| !dva.gang)
             || self.physical_birth() == 0
             || self.physical_birth() > self.birth()
         {
-            return Err(invalid("invalid gang identity, DVA flags or physical birth"));
+            return Err(invalid(
+                "invalid gang identity, DVA flags or physical birth",
+            ));
         }
-        if header_allocation < HEADER_BYTES as u64
-            || !header_allocation.is_multiple_of(HEADER_BYTES as u64)
-            || dvas.iter().any(|dva| dva.allocated_bytes < header_allocation)
-            || header_allocation
+        if header_allocations.len() != dvas.len() {
+            return Err(invalid(
+                "gang-header allocation count disagrees with DVA copies",
+            ));
+        }
+        if dvas
+            .iter()
+            .zip(header_allocations)
+            .any(|(dva, allocation)| {
+                *allocation < HEADER_BYTES as u64
+                    || !allocation.is_multiple_of(HEADER_BYTES as u64)
+                    || dva.allocated_bytes < *allocation
+            })
+            || header_allocations[0]
                 .checked_add(self.physical_bytes() as u64)
                 .is_none_or(|minimum| dvas[0].allocated_bytes < minimum)
         {
@@ -92,15 +105,16 @@ pub struct GangHeader {
 }
 
 impl GangHeader {
-    /// `header_allocation` is the native ASIZE of a 512-byte header on the
-    /// admitted top-level vdev, not the parent's aggregate DVA ASIZE. It is one
-    /// sector for a leaf/mirror and parity+1 sectors for ordinary RAIDZ.
+    /// `header_allocations` supplies the native ASIZE of a 512-byte header for
+    /// each parent DVA, in copy order, from its admitted top-level vdev. These
+    /// are not the parent's aggregate DVA ASIZEs and can differ across vdevs.
+    /// Each is one sector for a leaf/mirror or parity+1 sectors for ordinary RAIDZ.
     pub fn parse(
         raw: &[u8],
         parent: &BlockPointer,
-        header_allocation: u64,
+        header_allocations: &[u64],
     ) -> Result<Self, ParseError> {
-        let parent_dvas = parent.gang_dvas(header_allocation)?;
+        let parent_dvas = parent.gang_dvas(header_allocations)?;
         verify_header(raw, parent, parent_dvas[0])?;
         if raw[FILLER_START..CHECKSUM_MAGIC_OFFSET]
             .iter()
@@ -111,7 +125,8 @@ impl GangHeader {
 
         let mut children = Vec::with_capacity(HEADER_POINTERS);
         let mut total_bytes = 0_usize;
-        let mut totals = [header_allocation; HEADER_POINTERS];
+        let mut totals = [0_u64; HEADER_POINTERS];
+        totals[..parent_dvas.len()].copy_from_slice(header_allocations);
         let mut ended = false;
         for bytes in raw[..FILLER_START].as_chunks::<POINTER_BYTES>().0 {
             if bytes.iter().all(|byte| *byte == 0) {
@@ -135,17 +150,13 @@ impl GangHeader {
                 || child.logical_bytes() != child.physical_bytes()
                 || child.payload_order() != parent.payload_order()
                 || child.checksum_type() != parent.checksum_type()
-                || child.birth() == 0
-                || child.birth() > parent.physical_birth()
-                || child.physical_birth() == 0
-                || child.physical_birth() > child.birth()
+                || !(1..=parent.physical_birth()).contains(&child.birth())
+                || !(1..=child.birth()).contains(&child.physical_birth())
             {
                 return Err(invalid("invalid native gang-member properties or birth"));
             }
             let dvas = child.regular_dvas()?;
-            if dvas.len() > parent_dvas.len()
-                || dvas.iter().any(|dva| dva.gang != child.gang())
-            {
+            if dvas.len() > parent_dvas.len() || dvas.iter().any(|dva| dva.gang != child.gang()) {
                 return Err(invalid("gang child has invalid copies or mixed DVA flags"));
             }
             total_bytes = total_bytes
@@ -163,11 +174,15 @@ impl GangHeader {
             children.push(child);
         }
         if children.len() < 2 || total_bytes != parent.physical_bytes() {
-            return Err(invalid("gang header must partition its complete physical stream"));
+            return Err(invalid(
+                "gang header must partition its complete physical stream",
+            ));
         }
         for (index, dva) in parent_dvas.iter().enumerate() {
             if totals[index] != dva.allocated_bytes {
-                return Err(invalid("gang DVA aggregate allocation disagrees with children"));
+                return Err(invalid(
+                    "gang DVA aggregate allocation disagrees with children",
+                ));
             }
         }
         Ok(Self { children })
@@ -192,8 +207,8 @@ fn verify_header(raw: &[u8], parent: &BlockPointer, identity: Dva) -> Result<(),
         *value = order.u64(raw, CHECKSUM_OFFSET + index * 8)?;
     }
     // Fixed stack copy: never mutate bytes supplied by a device or its cache.
-    let mut verified = [0; HEADER_BYTES];
-    verified.copy_from_slice(raw);
+    let mut header_bytes = [0; HEADER_BYTES];
+    header_bytes.copy_from_slice(raw);
     let verifier = [
         u64::from(identity.vdev),
         identity.offset,
@@ -202,11 +217,13 @@ fn verify_header(raw: &[u8], parent: &BlockPointer, identity: Dva) -> Result<(),
     ];
     for (index, value) in verifier.iter().enumerate() {
         let start = CHECKSUM_OFFSET + index * 8;
-        verified[start..start + 8].copy_from_slice(&order.encode(*value));
+        header_bytes[start..start + 8].copy_from_slice(&order.encode(*value));
     }
     // SHA256's numeric words are big-endian regardless of the header's order.
-    if checksum(&verified, 8, Endian::Big)? != expected {
-        return Err(invalid("gang-header checksum or identity verifier mismatch"));
+    if checksum(&header_bytes, 8, Endian::Big)? != expected {
+        return Err(invalid(
+            "gang-header checksum or identity verifier mismatch",
+        ));
     }
     Ok(())
 }

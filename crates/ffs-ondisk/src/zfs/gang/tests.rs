@@ -81,8 +81,8 @@ fn fixture(order: Endian, allocated: u64) -> (BlockPointer, Vec<BlockPointer>, V
     (parent, children, data)
 }
 
-fn refuses(raw: &[u8], parent: &BlockPointer, reason: &str) {
-    let error = GangHeader::parse(raw, parent, 512).unwrap_err();
+fn refuses(raw: &[u8], parent: &BlockPointer, allocations: &[u64], reason: &str) {
+    let error = GangHeader::parse(raw, parent, allocations).unwrap_err();
     assert!(error.to_string().contains(reason), "{error}");
 }
 
@@ -116,7 +116,7 @@ fn header_digest_matches_independent_c_openssl_vectors_in_both_orders() {
         }
         for container in [Endian::Little, Endian::Big] {
             let decoded = BlockPointer::parse(&encode(&parent, container), container).unwrap();
-            let parsed = GangHeader::parse(&raw, &decoded, 512).unwrap();
+            let parsed = GangHeader::parse(&raw, &decoded, &[512; 2]).unwrap();
             assert_eq!(parsed.children(), children.as_slice());
             assert_eq!(decoded.physical_birth(), 5);
             assert_eq!(decoded.birth(), 7);
@@ -129,11 +129,82 @@ fn extra_header_copy_does_not_invent_extra_data_allocations() {
     for allocated in [512, 4096, 65_536] {
         let (parent, children, _) = fixture(Endian::Little, allocated);
         let raw = header(&parent, &children);
-        let parsed = GangHeader::parse(&raw, &parent, allocated).unwrap();
+        let parsed = GangHeader::parse(&raw, &parent, &[allocated; 2]).unwrap();
         assert_eq!(parsed.children().len(), 2);
         assert_eq!(parent.regular_dvas().unwrap()[1].allocated_bytes, allocated);
-        assert!(GangHeader::parse(&raw, &parent, allocated * 2).is_err());
+        assert!(GangHeader::parse(&raw, &parent, &[allocated * 2; 2]).is_err());
     }
+}
+
+#[test]
+fn heterogeneous_header_only_replica_uses_its_own_allocation() {
+    for order in [Endian::Little, Endian::Big] {
+        let (mut parent, children, data) = fixture(order, 512);
+        // The data and first header use an ashift=9 vdev. The second header
+        // lives on an ashift=12 vdev and has no corresponding data copies.
+        parent.words[2] = (8_u64 << 32) | 8;
+        let raw = header(&parent, &children);
+        let dvas = parent.gang_dvas(&[512, 4096]).unwrap();
+        assert_eq!((dvas[0].vdev, dvas[0].allocated_bytes), (7, 1536));
+        assert_eq!((dvas[1].vdev, dvas[1].allocated_bytes), (8, 4096));
+        let parsed = GangHeader::parse(&raw, &parent, &[512, 4096]).unwrap();
+        assert_eq!(parsed.children(), children.as_slice());
+        assert_eq!(parent.decode(&data).unwrap(), data);
+        refuses(&raw, &parent, &[512, 512], "aggregate allocation");
+        refuses(&raw, &parent, &[512, 3584], "aggregate allocation");
+        refuses(
+            &raw,
+            &parent,
+            &[4096, 512],
+            "invalid native gang-header allocation",
+        );
+    }
+}
+
+#[test]
+fn heterogeneous_member_copies_accumulate_allocations_independently() {
+    for order in [Endian::Little, Endian::Big] {
+        let (mut parent, mut children, data) = fixture(order, 1024);
+        // Each copy owns its own header plus two member allocations: three
+        // 1KiB allocations on vdev 7 and three 4KiB allocations on vdev 8.
+        parent.words[2] = (8_u64 << 32) | 0x18;
+        for (child, offset) in children.iter_mut().zip([0x0001_0000_u64, 0x0001_2000]) {
+            child.words[2] = (8_u64 << 32) | 8;
+            child.words[3] = offset / 512;
+        }
+        let raw = header(&parent, &children);
+        let dvas = parent.gang_dvas(&[1024, 4096]).unwrap();
+        assert_eq!((dvas[0].vdev, dvas[0].allocated_bytes), (7, 3072));
+        assert_eq!((dvas[1].vdev, dvas[1].allocated_bytes), (8, 12_288));
+        let parsed = GangHeader::parse(&raw, &parent, &[1024, 4096]).unwrap();
+        assert_eq!(parsed.children(), children.as_slice());
+        assert_eq!(parent.decode(&data).unwrap(), data);
+        // The total header allocation stays equal. Shifting it between copies
+        // must still fail rather than treating ASIZE as one combined budget.
+        refuses(&raw, &parent, &[512, 4608], "aggregate allocation");
+        refuses(&raw, &parent, &[1024, 1024], "aggregate allocation");
+        let mut misaccounted = parent.clone();
+        misaccounted.words[0] += 1;
+        misaccounted.words[2] -= 1;
+        refuses(&raw, &misaccounted, &[1024, 4096], "aggregate allocation");
+    }
+}
+
+#[test]
+fn header_allocation_count_must_match_every_declared_copy() {
+    let (mut parent, children, _) = fixture(Endian::Little, 512);
+    let raw = header(&parent, &children);
+    let invalid_counts: [&[u64]; 4] = [&[], &[512], &[512; 3], &[512; 4]];
+    for allocations in invalid_counts {
+        let error = parent.gang_dvas(allocations).unwrap_err();
+        assert!(error.to_string().contains("allocation count"), "{error}");
+        refuses(&raw, &parent, allocations, "allocation count");
+    }
+    // The API counts declared DVAs, not a fixed assumed replication factor.
+    parent.words[2..4].fill(0);
+    let parsed = GangHeader::parse(&raw, &parent, &[512]).unwrap();
+    assert_eq!(parsed.children(), children.as_slice());
+    refuses(&raw, &parent, &[512; 2], "allocation count");
 }
 
 #[test]
@@ -142,10 +213,10 @@ fn verifier_uses_first_dva_not_the_selected_replica_or_logical_birth() {
     let raw = header(&parent, &children);
     let mut other_replica = parent.clone();
     other_replica.words[3] += 8;
-    GangHeader::parse(&raw, &other_replica, 512).unwrap();
+    GangHeader::parse(&raw, &other_replica, &[512; 2]).unwrap();
     let mut reused = parent.clone();
     reused.words[10] = 99;
-    GangHeader::parse(&raw, &reused, 512).unwrap();
+    GangHeader::parse(&raw, &reused, &[512; 2]).unwrap();
     for (index, replacement) in [
         (0, parent.words[0] ^ (1_u64 << 32)),
         (1, parent.words[1] + 1),
@@ -154,7 +225,7 @@ fn verifier_uses_first_dva_not_the_selected_replica_or_logical_birth() {
     ] {
         let mut changed = parent.clone();
         changed.words[index] = replacement;
-        refuses(&raw, &changed, "identity verifier mismatch");
+        refuses(&raw, &changed, &[512; 2], "identity verifier mismatch");
     }
 }
 
@@ -164,12 +235,15 @@ fn every_header_byte_is_protected_and_input_is_never_modified() {
         let (parent, children, _) = fixture(order, 512);
         let raw = header(&parent, &children);
         let before = raw;
-        GangHeader::parse(&raw, &parent, 512).unwrap();
+        GangHeader::parse(&raw, &parent, &[512; 2]).unwrap();
         assert_eq!(raw, before);
         for at in 0..HEADER_BYTES {
             let mut damaged = raw;
             damaged[at] ^= 1;
-            assert!(GangHeader::parse(&damaged, &parent, 512).is_err(), "byte {at}");
+            assert!(
+                GangHeader::parse(&damaged, &parent, &[512; 2]).is_err(),
+                "byte {at}"
+            );
         }
     }
 }
@@ -179,14 +253,14 @@ fn malformed_header_lengths_and_pointer_byte_order_fail() {
     let (parent, children, _) = fixture(Endian::Little, 512);
     let raw = header(&parent, &children);
     for length in 0..HEADER_BYTES {
-        refuses(&raw[..length], &parent, "exactly 512 bytes");
+        refuses(&raw[..length], &parent, &[512; 2], "exactly 512 bytes");
     }
     let mut oversized = raw.to_vec();
     oversized.push(0);
-    refuses(&oversized, &parent, "exactly 512 bytes");
+    refuses(&oversized, &parent, &[512; 2], "exactly 512 bytes");
     let mut wrong_order = parent;
     wrong_order.words[6] ^= 1_u64 << 63;
-    refuses(&raw, &wrong_order, "byte order mismatch");
+    refuses(&raw, &wrong_order, &[512; 2], "byte order mismatch");
 }
 
 #[test]
@@ -195,7 +269,7 @@ fn reserved_filler_is_rejected_even_with_a_valid_checksum() {
     let mut raw = header(&parent, &children);
     raw[FILLER_START] = 1;
     seal(&mut raw, &parent);
-    refuses(&raw, &parent, "reserved filler");
+    refuses(&raw, &parent, &[512; 2], "reserved filler");
 }
 
 #[test]
@@ -205,14 +279,19 @@ fn child_slots_must_be_contiguous_and_cover_exactly_the_parent() {
     gap.copy_within(128..256, 256);
     gap[128..256].fill(0);
     seal(&mut gap, &parent);
-    refuses(&gap, &parent, "noncontiguous");
-    refuses(&header(&parent, &children[..1]), &parent, "partition");
+    refuses(&gap, &parent, &[512; 2], "noncontiguous");
+    refuses(
+        &header(&parent, &children[..1]),
+        &parent,
+        &[512; 2],
+        "partition",
+    );
     let raw = header(&parent, &children);
     for sectors in [1_u64, 3] {
         let mut wrong_size = parent.clone();
         wrong_size.words[6] =
             (wrong_size.words[6] & !0xffff_ffff) | (sectors - 1) | ((sectors - 1) << 16);
-        assert!(GangHeader::parse(&raw, &wrong_size, 512).is_err());
+        assert!(GangHeader::parse(&raw, &wrong_size, &[512; 2]).is_err());
     }
 }
 
@@ -231,7 +310,7 @@ fn transformed_typed_or_future_children_are_not_logical_data() {
         let mut invalid_children = children.clone();
         invalid_children[0].words[6] ^= bits;
         let raw = header(&parent, &invalid_children);
-        refuses(&raw, &parent, "gang-member properties");
+        refuses(&raw, &parent, &[512; 2], "gang-member properties");
     }
     for birth in [0, 6] {
         let mut invalid_children = children.clone();
@@ -239,6 +318,7 @@ fn transformed_typed_or_future_children_are_not_logical_data() {
         refuses(
             &header(&parent, &invalid_children),
             &parent,
+            &[512; 2],
             "gang-member properties",
         );
     }
@@ -248,7 +328,12 @@ fn transformed_typed_or_future_children_are_not_logical_data() {
 fn holes_do_not_silently_supply_zeros_or_hide_nonzero_unused_slots() {
     let (parent, mut children, _) = fixture(Endian::Little, 512);
     children[0].words[..6].fill(0);
-    refuses(&header(&parent, &children), &parent, "gang-member properties");
+    refuses(
+        &header(&parent, &children),
+        &parent,
+        &[512; 2],
+        "gang-member properties",
+    );
 }
 
 #[test]
@@ -257,7 +342,7 @@ fn mixed_gang_flags_and_excess_child_copies_fail() {
     let raw = header(&parent, &children);
     let mut mixed = parent.clone();
     mixed.words[3] &= !(1_u64 << 63);
-    refuses(&raw, &mixed, "DVA flags");
+    refuses(&raw, &mixed, &[512; 2], "DVA flags");
     let mut parent_one_copy = parent;
     parent_one_copy.words[2..4].fill(0);
     let mut invalid_children = children;
@@ -266,6 +351,7 @@ fn mixed_gang_flags_and_excess_child_copies_fail() {
     refuses(
         &header(&parent_one_copy, &invalid_children),
         &parent_one_copy,
+        &[512],
         "invalid copies",
     );
 }
@@ -274,10 +360,10 @@ fn mixed_gang_flags_and_excess_child_copies_fail() {
 fn forged_gang_flag_without_first_copy_tree_allocation_fails_before_io() {
     let (mut parent, _, _) = fixture(Endian::Little, 512);
     parent.words[0] = (7_u64 << 32) | 2;
-    assert!(parent.gang_dvas(512).is_err());
+    assert!(parent.gang_dvas(&[512; 2]).is_err());
     // The extra header-only copy remains valid when DVA zero owns the tree.
     parent.words[0] = (7_u64 << 32) | 3;
-    assert_eq!(parent.gang_dvas(512).unwrap()[1].allocated_bytes, 512);
+    assert_eq!(parent.gang_dvas(&[512; 2]).unwrap()[1].allocated_bytes, 512);
 }
 
 #[test]
@@ -287,10 +373,18 @@ fn aggregate_asize_is_validated_per_copy_not_as_a_contiguous_span() {
     for slot in [0, 2] {
         let mut changed = parent.clone();
         changed.words[slot] += 1;
-        refuses(&raw, &changed, "aggregate allocation");
+        refuses(&raw, &changed, &[512; 2], "aggregate allocation");
     }
     for invalid_allocation in [0, 1, 511, 513, u64::MAX] {
-        assert!(GangHeader::parse(&raw, &parent, invalid_allocation).is_err());
+        assert!(GangHeader::parse(&raw, &parent, &[invalid_allocation; 2]).is_err());
+        for allocations in [[invalid_allocation, 512], [512, invalid_allocation]] {
+            refuses(
+                &raw,
+                &parent,
+                &allocations,
+                "invalid native gang-header allocation",
+            );
+        }
     }
 }
 
@@ -306,5 +400,5 @@ fn ordinary_physical_data_and_leader_checksums_are_independent_of_header_hashes(
     assert!(parent.verify_physical(&corrupt_data).is_err());
     assert!(parent.decode(&corrupt_data).is_err());
     // The independent header checksum remains valid despite that data error.
-    GangHeader::parse(&raw, &parent, 512).unwrap();
+    GangHeader::parse(&raw, &parent, &[512; 2]).unwrap();
 }
