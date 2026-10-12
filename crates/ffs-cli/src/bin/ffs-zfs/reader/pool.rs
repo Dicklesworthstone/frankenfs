@@ -4,6 +4,7 @@
 //! Checksums decide whether replica or reconstructed bytes are usable.
 //! This is read-only extraction, without degraded import, DTL recovery or healing.
 
+mod gang;
 pub(in crate::reader) mod raidz;
 
 use super::{
@@ -252,6 +253,9 @@ impl Pool {
         bp: &BlockPointer,
     ) -> Result<BlockRead> {
         checkpoint(cx)?;
+        if bp.gang() {
+            return self.read_gang_block(cx, config, bp);
+        }
         if let Some(group) = &config.raidz_members {
             return self.read_raidz_block(cx, config, bp, group);
         }

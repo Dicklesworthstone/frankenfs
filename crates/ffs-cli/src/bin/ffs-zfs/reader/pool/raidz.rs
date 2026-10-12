@@ -11,6 +11,7 @@ use crate::reader::{
     RaidzGroup, RaidzMember, RaidzReadInfo, Result, VdevConfig, checkpoint, corrupt, parse,
     unsupported,
 };
+use ffs_ondisk::zfs::gang::{GangHeader, HEADER_BYTES};
 use ffs_ondisk::zfs::raidz::parity::RaidzParityMap;
 use ffs_ondisk::zfs::raidz::{Raidz1Map, RaidzColumn};
 use std::collections::BTreeSet;
@@ -115,7 +116,12 @@ impl Pool {
     ) -> Result<Vec<(Dva, NativeMap)>> {
         checkpoint(cx)?;
         let members = &group.members;
-        let dvas = bp.regular_dvas().map_err(|error| parse(&error))?;
+        let dvas = if bp.gang() {
+            bp.gang_dvas(super::gang::header_allocation(config)?)
+        } else {
+            bp.regular_dvas()
+        }
+        .map_err(|error| parse(&error))?;
         if !(1..=3).contains(&group.parity)
             || !(group.parity + 1..=8).contains(&members.len())
             || members.len() != self.members.len()
@@ -155,22 +161,38 @@ impl Pool {
         let mut maps = Vec::with_capacity(dvas.len());
         for dva in dvas {
             checkpoint(cx)?;
-            if dva.vdev != config.id || dva.gang {
+            if dva.vdev != config.id {
                 return Err(unsupported(
-                    "foreign-vdev or gang DVA needs a different native mapping",
+                    "foreign-vdev DVA needs a different native mapping",
                 ));
+            }
+            if dva.gang != bp.gang() {
+                return Err(corrupt("mixed gang and ordinary RAIDZ DVA flags"));
             }
             let map = NativeMap::new(
                 dva.offset,
-                bp.physical_bytes(),
+                if bp.gang() {
+                    HEADER_BYTES
+                } else {
+                    bp.physical_bytes()
+                },
                 config.ashift,
                 members.len(),
                 group.parity,
             )?;
-            if dva.allocated_bytes != map.allocated_bytes()
+            // Gang ASIZE accounts for scattered descendants. Only the header
+            // map is contiguous here; every child's map is bounded separately.
+            let valid_allocation = if bp.gang() {
+                dva.allocated_bytes >= map.allocated_bytes()
+                    && dva.allocated_bytes.is_multiple_of(sector)
+                    && dva.allocated_bytes <= config.allocated_bytes
+            } else {
+                dva.allocated_bytes == map.allocated_bytes()
+            };
+            if !valid_allocation
                 || dva
                     .offset
-                    .checked_add(dva.allocated_bytes)
+                    .checked_add(map.allocated_bytes())
                     .is_none_or(|end| end > config.allocated_bytes)
             {
                 return Err(corrupt("RAIDZ DVA allocation size or bounds disagree"));
@@ -358,10 +380,16 @@ fn verify_candidate(
     let slices: Vec<_> = columns.iter().map(Option::as_deref).collect();
     let physical = stripe.map.assemble(&slices, erased)?;
     checkpoint(cx)?;
-    let bytes = stripe
-        .pointer
-        .decode(&physical)
-        .map_err(|error| parse(&error))?;
+    let bytes = if stripe.pointer.gang() {
+        GangHeader::parse(&physical, stripe.pointer, stripe.map.allocated_bytes())
+            .map_err(|error| parse(&error))?;
+        physical
+    } else {
+        stripe
+            .pointer
+            .decode(&physical)
+            .map_err(|error| parse(&error))?
+    };
     checkpoint(cx)?;
     Ok(bytes)
 }
