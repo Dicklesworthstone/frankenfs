@@ -4,6 +4,7 @@
 //! pool: topology, configuration, features and the complete MOS still matter.
 //! Sources: OpenZFS spa.h, vdev_impl.h, uberblock_impl.h, zio_checksum.c.
 
+pub mod gang;
 pub mod nvlist;
 pub mod raidz;
 
@@ -371,19 +372,7 @@ impl BlockPointer {
             }
             return self.decode_embedded();
         }
-        self.regular_dvas()?;
-        if physical.len() != self.physical_bytes() {
-            return Err(invalid("short physical block"));
-        }
-        let expected = [
-            self.words[12],
-            self.words[13],
-            self.words[14],
-            self.words[15],
-        ];
-        if checksum(physical, self.checksum_type(), self.payload_order())? != expected {
-            return Err(invalid("physical block checksum mismatch"));
-        }
+        self.verify_physical(physical)?;
         decompress(physical, self.compression(), self.logical_bytes())
     }
 }
