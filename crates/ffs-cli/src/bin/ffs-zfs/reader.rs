@@ -1,4 +1,4 @@
-//! Offline ZFS label discovery and explicit leaf/mirror/RAIDZ1 MOS-root extraction.
+//! Offline ZFS label discovery and explicit leaf/mirror/RAIDZ MOS-root extraction.
 //! No pool import, TXG selection, log replay, device writes or host path following.
 
 pub mod dmu;
@@ -97,7 +97,14 @@ struct VdevConfig {
     read_features: Vec<String>,
     /// Native child-ID order, bound to supplied images after group admission.
     /// Absent for standalone leaves and ordinary mirrors.
-    raidz_members: Option<Vec<RaidzMember>>,
+    raidz_members: Option<RaidzGroup>,
+}
+
+/// Parity and child order are bound together by complete label agreement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct RaidzGroup {
+    parity: usize,
+    members: Vec<RaidzMember>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -243,7 +250,7 @@ impl Label {
     }
 }
 
-/// A native column extent in the selected RAIDZ1 DVA. Skip-only columns
+/// A native column extent in the selected RAIDZ DVA. Skip-only columns
 /// have zero read bytes; parity may be mapped without needing physical I/O.
 #[derive(Debug)]
 pub struct RaidzColumnInfo {
@@ -260,8 +267,9 @@ pub struct RaidzReadInfo {
     pub allocated_bytes: u64,
     pub columns: Vec<RaidzColumnInfo>,
     pub parity_read: bool,
-    /// Native child ID whose data was reconstructed, never an argument index.
-    pub reconstructed_child: Option<usize>,
+    /// Native child IDs whose data was reconstructed, never argument indices.
+    /// Excluded parity is not reported as repaired or reconstructed storage.
+    pub reconstructed_children: Vec<usize>,
 }
 
 struct BlockRead {
