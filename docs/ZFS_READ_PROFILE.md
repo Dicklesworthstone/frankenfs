@@ -1,12 +1,12 @@
 # Experimental native ZFS block, DMU, ZPL and extraction mounts
 
 `ffs-zfs` implements the restricted ZFS-01/ZFS-02 foundation, selected ZFS-03
-filesystem and snapshot reads, and a bounded ZFS-04 mirror profile from the
-comprehensive expansion plan. It inspects labels and explicit uberblock
+filesystem and snapshot reads, and bounded ZFS-04 mirror and ordinary RAIDZ1
+profiles from the comprehensive expansion plan. It inspects labels and explicit uberblock
 candidates, extracts checked roots and MOS object ranges, inventories DSL head
 datasets, reads files within an explicitly selected head or named snapshot, and
 exposes that same committed view through a read-only FUSE extraction mount.
-Reads can use a single leaf or an explicitly supplied complete mirror.
+Reads can use a single leaf or an explicitly supplied complete mirror or RAIDZ1 group.
 It does not import a pool. No ext4/btrfs/FAT/NTFS dispatch is changed.
 
 ## Commands
@@ -53,6 +53,15 @@ ffs-zfs read mirror-a.img /file.bin --mirror-member mirror-b.img \
   --dataset data --snapshot before --start 507 --bytes 8199 \
   --offline-image --pool-guid 123 --label 0 --slot 2 > mirror-file-range.bin
 ffs-zfs mount mirror-a.img /mnt/zfs-mirror --mirror-member mirror-b.img \
+  --dataset data --snapshot before --uid 1000 --gid 1000 \
+  --offline-image --pool-guid 123 --label 0 --slot 2
+
+# One ordinary RAIDZ1 group: every configured member is supplied explicitly.
+# --member is repeatable; --mirror-member and --raidz-member are aliases.
+ffs-zfs read raidz-a.img /file.bin --member raidz-b.img --member raidz-c.img \
+  --dataset data --snapshot before --start 507 --bytes 8199 \
+  --offline-image --pool-guid 123 --label 0 --slot 2 > raidz-file-range.bin
+ffs-zfs mount raidz-a.img /mnt/zfs-raidz --member raidz-b.img --member raidz-c.img \
   --dataset data --snapshot before --uid 1000 --gid 1000 \
   --offline-image --pool-guid 123 --label 0 --slot 2
 ```
@@ -139,11 +148,12 @@ label feature. This codec addition does not broaden the label
 `features_for_read` allowlist or claim full MOS/dataset feature negotiation.
 
 A bad physical read, checksum or transform can try another declared copy on the
-same leaf, or another explicitly supplied member of an admitted mirror.
+same leaf, another explicitly supplied member of an admitted mirror, or the
+bounded ordinary RAIDZ1 reconstruction path described below.
 Cancellation propagates immediately and cannot turn into a redundant-copy
 retry. No copy is repaired. The uberblock's native GUID sum must match the
 complete admitted configuration, including the root/pool, top-level vdev and
-all mirror member GUIDs when present. The selected root must be a level-zero
+all configured member GUIDs when present. The selected root must be a level-zero
 OBJSET pointer born no later than its uberblock and decode to a META object set.
 The `root` command alone does not validate its descendants.
 
@@ -151,8 +161,9 @@ The `root` command alone does not validate its descendants.
 
 The mirror profile accepts exactly one top-level mirror, with native vdev ID
 zero and two through eight ordinary file/disk children. Every configured member
-must be supplied as a read-only offline image. `--mirror-member` is repeatable;
-there are no inferred paths, automatic device discovery, missing-member or
+must be supplied as a read-only offline image. `--member` is repeatable, with
+`--mirror-member` retained as an alias; there are no inferred paths, automatic
+device discovery, missing-member or
 forced/degraded admission options. The supplied order need not match the native
 child order: labels identify membership by GUID. Native path strings remain
 configuration metadata and are never opened on the host.
@@ -208,6 +219,66 @@ Native contracts were checked against OpenZFS `zfs-2.3.0`
 [`vdev_label.c`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zfs/vdev_label.c),
 [`vdev_impl.h`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/include/sys/vdev_impl.h)
 and [`spa.h`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/include/sys/spa.h).
+
+## Ordinary RAIDZ1 read contract
+
+The additional RAIDZ1 profile admits one exported top-level `raidz` group
+with `nparity=1` and two through eight ordinary file/disk children. Every
+member image is supplied explicitly. The existing complete-label and explicit
+uberblock agreement checks bind all member GUIDs to one selected immutable
+root. Native child IDs, rather than host argument positions, determine columns.
+Expanded RAIDZ (`raidz_expanding` or `raidz_expand_txgs`), dRAID, nested
+replacement/spare layouts, unsupported active features and additional parity
+levels remain outside this profile.
+
+For sector size `S=2^ashift`, physical size `P` and width `N`, stripe
+data contains `ceil(P/S)` sectors and P parity contains
+`ceil(ceil(P/S)/(N-1))` sectors. The DVA allocation rounds their combined
+sector count up to a multiple of two. Native variable-width columns keep long
+columns before short columns; the data stream concatenates data columns in
+that logical column order. DVA offset bit 20 swaps the physical addresses of
+the parity and first data column. Allocated skip sectors do not contribute to
+parity or output. Sub-sector PSIZE padding participates in stripe I/O and XOR,
+then only the original PSIZE reaches the block checksum and decoder.
+
+All declared DVA allocation spans and all mapped child allocation extents,
+including skipped padding, are validated before any data I/O. The top-level
+allocation region must fit the complete selected storage set. Data columns
+are read first. A checksum-valid block can succeed without reading parity;
+parity-only failure therefore does not make intact data unreadable. One known
+data-column I/O failure can be reconstructed from P parity and the remaining
+data. If physical reads succeed but the checksum fails, each single data-column
+erasure hypothesis is attempted within the admitted width. Every result must
+pass the complete original-PSIZE checksum and transform. A missing/corrupt
+second required column is beyond the RAIDZ1 recovery budget. Failure may try
+another declared DVA, but never another root candidate or a newer TXG.
+
+Cancellation propagates before further reads or reconstruction candidates.
+No unverified or cancelled result enters the DMU cache. Recovery is in memory;
+the backend never writes parity, repairs a member, imports the pool or changes
+labels. Dataset, snapshot and extraction-mount reads share this block path.
+
+The mapping and reconstruction contract is extracted from pinned OpenZFS
+`zfs-2.3.0`
+[`vdev_raidz.c`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zfs/vdev_raidz.c),
+with alignment and leaf-label translation from
+[`zio.c`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zfs/zio.c)
+and storage geometry from
+[`vdev.c`](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zfs/vdev.c).
+
+`--offset` and `--length` apply to every explicitly supplied RAIDZ1 image, just
+as for mirrors. A top-level RAIDZ1 allocation region must contain a whole
+number of member stripes; its size divided by the native width must fit each
+selected member after native label/boot reservations. Child label nodes need
+not carry independent ashift/asize values. All configured members must open
+and agree on their labels and selected candidate even when an individual
+block subsequently needs parity recovery.
+
+Root diagnostics identify the native DVA allocation, each column's child ID,
+member GUID, relative physical offset and read span, whether parity was read,
+and any reconstructed native child ID. A parity stripe is never presented as
+a successful single-member replica. All supplied images, including aliases,
+remain subject to the extraction mount's backing-path visibility guard.
 
 ## DMU objects and DSL head inventory
 
@@ -388,8 +459,8 @@ log replay, implicit native imports or host paths taken from a label.
 Extraction requires all four configurations on every supplied image to validate
 and agree on pool/member identity, addressing, configuration generation and
 read features. The pool must be exported and have one top-level file/disk leaf
-or the complete two-to-eight-member mirror described above, with native ID
-zero and no removal, special or log state. Versions 1..28 or 5000 are admitted.
+or a complete two-to-eight-member mirror or ordinary RAIDZ1 group described
+above, with native ID zero and no removal, special or log state. Versions 1..28 or 5000 are admitted.
 Version 5000 requires
 no label read features beyond optional `org.illumos:lz4_compress` and
 `com.delphix:embedded_data`, encoded as boolean-presence fields. Unknown features
@@ -400,7 +471,8 @@ The selected uberblock cannot predate label configuration. Fork/history
 resolution, rewind, active/MMP ownership and multi-vdev import remain separate
 work. Gang and encrypted/authenticated blocks remain unsupported;
 context-sized holes are handled only in the DMU traversal, not root extraction.
-RAIDZ/dRAID, nested/replacing or incomplete mirrors, indirect vdevs,
+RAIDZ2/3, expanded RAIDZ, dRAID, nested/replacing or incomplete redundant groups,
+indirect vdevs,
 normalized/binary ZAP keys, full ZPL/SA feature coverage, full snapshot/clone
 semantics, security, native writes, maintenance and
 MVCC/RaptorQ integration remain incomplete. Neither dataset inventory nor the
@@ -652,3 +724,47 @@ Changed Rust sources were parsed/formatted. The installed UBS launcher could
 not execute (permission denied); no UBS result is credited. Integrated CLI and
 native pool/mount execution remain unverified under the previously recorded
 resource and tool limits. These parser results do not qualify mirror mounts.
+
+## Ordinary RAIDZ1 validation
+
+Six pure mapping/reconstruction regressions cover native child rotation,
+variable-width short columns, parity address swapping, skip sectors, PSIZE
+versus sector padding, geometry and overflow refusal, exact input spans and
+single-column XOR recovery. Their expected address table contains twenty
+captures from the unmodified OpenZFS `zfs-2.3.0` `vdev_raidz_map_alloc`
+function compiled in an isolated C harness. The harness and captured output
+executed successfully; the Rust mapper matches every captured tuple. This is
+native-function evidence, not a pool imported or mounted by OpenZFS.
+
+Twelve authored engine regression functions exercise labeled, bounded member
+images: native GUID order independent of supplied order, two through eight
+members, both byte orders, ashift 9/12/16, compressed PSIZE padding, data-first
+reads, checksum and physical-I/O reconstruction, parity-only failure, two-column
+failures, another declared DVA, immediate cancellation, expanded/unsupported
+topology, capacity, later-DVA and label disagreement refusals. Constructed MOS,
+DSL, legacy/SA/spill ZPL, embedded-data and historical snapshot graphs are
+re-encoded bottom-up with native stripe placement and newly checksummed parent
+pointers. FsOps reads preserve hardlinks, holes, unaligned EOF, snapshot names
+and historical bytes; failed or cancelled blocks cannot become cache entries
+or a successful partial request. Read-only test devices panic on writes or
+flushes.
+
+Execution evidence (2026-10-12): the full
+`cargo test -p ffs-ondisk --lib --locked` suite passed 850 tests, including all
+six RAIDZ tests and all twenty captured mapping cases. Integrated engine/CLI
+typechecking and these twelve graph tests remain unexecuted: the complete
+dependency graph is still blocked by `asupersync` compiler SIGKILL under the
+shared memory limit. No CLI, kernel FUSE or native RAIDZ-pool execution is
+claimed from the parser tests, mapping capture or source review.
+
+Final integration evidence (2026-10-12):
+`cargo clippy -p ffs-ondisk --all-targets --locked -- -D warnings` completed with
+exit 0 on the combined XPRESS/RAIDZ sources. All changed Rust files passed
+parsing/formatting checks; independent production and fixture/API reviews found
+no remaining concrete defect. The generic-member CLI retains its existing count
+and mountpoint guard assertions and adds one regression combining all three
+option spellings in a single ordered member set. A fresh
+`cargo check -p ffs-cli --all-targets --locked` retry still stopped in `asupersync`
+with SIGKILL, before checking the integration code. Workspace formatting reports
+pre-existing differences in 13 unchanged files. UBS could not execute its
+installed launcher. The new engine and CLI tests remain source-reviewed only.

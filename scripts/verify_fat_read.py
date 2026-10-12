@@ -247,6 +247,137 @@ class Run:
                 "files_checked": len(payloads), "mounted": mounted, "result": "passed"}
 
 
+    def populated(self, bits: int, mounted: bool) -> dict[str, object]:
+        source = self.root / f"populated-fat{bits}-source"
+        source.mkdir()
+        directories = ["nested", "nested/deep", "nested/Empty directory", "many"]
+        for name in directories:
+            (source / name).mkdir()
+        payloads = {
+            "LONGNA~1.TXT": b"reserve the native alias before generating long names",
+            "Long native filename.txt": (bytes(range(251)) * 9000)[:2 * 1024 * 1024 + 37],
+            "Long native filename two.txt": bytes(range(256)) * 5 + b"unaligned tail",
+            "empty.txt": b"",
+            "nested/Native café.bin": bytes(reversed(range(256))) * 33 + b"tail",
+            "nested/deep/last segment.txt": b"deep native payload\n",
+        }
+        # Enough long-name slots to force a multi-cluster directory in both
+        # dialects. None of these expected names or bytes come from the image.
+        for number in range(40):
+            payloads[f"many/Directory expansion payload {number:02d}.bin"] = (
+                number.to_bytes(2, "little") * (number + 1)
+            )
+        for name, expected in payloads.items():
+            (source / name).write_bytes(expected)
+        image = self.root / f"populated-fat{bits}.img"
+        arguments = [self.binary, "format", image, "--kind", f"fat{bits}",
+                     "--size-mib", "64", "--source-dir", source]
+        created = json.loads(self.command(*arguments))
+        check(created["created_new_image"] is True and created["format"] == f"Fat{bits}",
+              "populated formatter did not create the requested dialect")
+        check(created["source_directory"] == str(source.resolve()) and
+              created["copied_files"] == len(payloads) and
+              created["copied_directories"] == len(directories) + 1 and
+              created["copied_bytes"] == sum(map(len, payloads.values())),
+              "populated formatter report differs from the independent source tree")
+        check(created["payload_verification"] == "sha256_via_native_reader" and
+              created["durability"] == "file_and_parent_synced",
+              "populated formatter omitted payload verification or durability")
+        native = native_allocation(image)
+        verification = created["verification"]
+        check(verification["files"] == len(payloads) and
+              verification["directories"] == len(directories) + 1 and
+              verification["free_clusters"] == native["free_clusters"] and
+              verification["clean"] is True and verification["complete"] is True and
+              verification["namespace_complete"] is True and
+              verification["lost_clusters"] == 0 and verification["issues"] == [] and
+              verification["omitted_issues"] == 0,
+              "populated formatter verification differs from source/native allocation")
+        if bits == 32:
+            with image.open("rb") as stream:
+                for relative in range(3):
+                    stream.seek(relative * 512)
+                    primary = stream.read(512)
+                    stream.seek((6 + relative) * 512)
+                    backup = stream.read(512)
+                    check(primary == backup and primary[510:512] == b"\x55\xaa",
+                          "populated FAT32 boot record/backup differs")
+                    if relative == 1:
+                        check(int.from_bytes(primary[488:492], "little") == native["free_clusters"],
+                              "populated FSInfo free count differs from native FAT bytes")
+        before = digest(image)
+        self.command("fsck.fat", "-n", image)
+        for parent in [""] + directories:
+            expected_names = {
+                Path(name).name for name in list(payloads) + directories
+                if str(Path(name).parent) == (parent or ".")
+            }
+            listed = json.loads(self.command(self.binary, "ls", image, "/" + parent))
+            check({entry["name"] for entry in listed} == expected_names,
+                  f"populated directory names differ: {parent!r}")
+            aliases = [entry["short_alias"].upper() for entry in listed]
+            check(len(aliases) == len(set(aliases)), "populated short aliases collide")
+        for index, (name, expected) in enumerate(payloads.items()):
+            reference = self.root / f"populated-fat{bits}-native-{index}.bin"
+            self.command("mcopy", "-i", image, f"::/{name}", reference)
+            check(reference.read_bytes() == expected, f"native populated-image bytes differ: {name}")
+            check(self.command(self.binary, "cat", image, "/" + name) == expected,
+                  f"FrankenFS populated-image bytes differ: {name}")
+            check((source / name).read_bytes() == expected, f"formatter changed source bytes: {name}")
+        checked = json.loads(self.command(self.binary, "check", image))
+        check(checked["status"] == "clean" and checked["clean"] is True and
+              checked["complete"] is True and checked["namespace_complete"] is True and
+              checked["files"] == len(payloads) and checked["directories"] == len(directories) + 1 and
+              checked["free_clusters"] == native["free_clusters"] and
+              checked["lost_clusters"] == 0 and checked["issues"] == [] and checked["omitted_issues"] == 0,
+              "populated native allocation/namespace check differs")
+        if mounted:
+            self.mounted(image, payloads)
+        self.command(*arguments, expected_returncode=1)
+        check(digest(image) == before, "readback or refused reformat changed populated image")
+
+        # Verify that another FAT implementation can extend our allocation and
+        # namespace after population, then verify its bytes through our reader.
+        self.command("mmd", "-i", image, "::/Native added directory")
+        added = self.root / f"populated-fat{bits}-native-addition.bin"
+        added.write_bytes(bytes(range(256)) * 257 + b"native allocation after population")
+        self.command("mcopy", "-i", image, added, "::/Native added directory/Added payload.bin")
+        self.command("fsck.fat", "-n", image)
+        after_native = digest(image)
+        check(self.command(self.binary, "cat", image, "/Native added directory/Added payload.bin")
+              == added.read_bytes(), "native append to populated image could not be read")
+        for name, expected in payloads.items():
+            check(self.command(self.binary, "cat", image, "/" + name) == expected,
+                  f"native extension damaged an existing populated file: {name}")
+        checked = json.loads(self.command(self.binary, "check", image))
+        check(checked["status"] == "clean" and checked["clean"] is True and
+              checked["complete"] is True and checked["namespace_complete"] is True and
+              checked["files"] == len(payloads) + 1 and checked["directories"] == len(directories) + 2 and
+              checked["free_clusters"] == native_allocation(image)["free_clusters"] and
+              checked["lost_clusters"] == 0 and checked["issues"] == [] and checked["omitted_issues"] == 0,
+              "native extension of populated image failed allocation verification")
+        check(digest(image) == after_native, "native-extension readback changed the image")
+
+        for case in ("symlink", "case-collision", "invalid-name"):
+            bad_source = self.root / f"refused-{case}-fat{bits}-source"
+            bad_source.mkdir()
+            if case == "symlink":
+                (bad_source / "link.txt").symlink_to(source / "empty.txt")
+            elif case == "case-collision":
+                (bad_source / "case.txt").write_bytes(b"first")
+                (bad_source / "CASE.TXT").write_bytes(b"second")
+            else:
+                (bad_source / "invalid?.txt").write_bytes(b"invalid native name")
+            refused = self.root / f"refused-{case}-fat{bits}.img"
+            self.command(self.binary, "format", refused, "--kind", f"fat{bits}",
+                         "--size-mib", "64", "--source-dir", bad_source, expected_returncode=1)
+            check(not refused.exists(), f"{case} preflight created a destination")
+        return {"format": f"FAT{bits}", "creator": "ffs-fat format --source-dir",
+                "populated_image_sha256": before, "native_extended_sha256": after_native,
+                "files_checked": len(payloads) + 1, "directories_checked": len(directories) + 2,
+                "mounted": mounted, "result": "passed"}
+
+
     def dialect(self, bits: int, mounted: bool) -> dict[str, object]:
         image = self.root / f"fat{bits}.img"
         with image.open("xb") as stream:
@@ -328,6 +459,9 @@ def main() -> None:
             formatted = run.formatted(bits, args.mounted)
             report["scenarios"].append(formatted)
             print(json.dumps(formatted), flush=True)
+            populated = run.populated(bits, args.mounted)
+            report["scenarios"].append(populated)
+            print(json.dumps(populated), flush=True)
     finally:
         (root / "result.json").write_text(json.dumps(report, indent=2) + "\n")
 

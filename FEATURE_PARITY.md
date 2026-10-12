@@ -1117,3 +1117,100 @@ remain unexecuted. UBS
 could not execute its installed launcher. On-disk parser tests and Clippy do not
 qualify this formatter. See `docs/FAT_READ_PROFILE.md` for the native profile,
 commands, interruption outcomes and interoperability limits.
+
+### FAT16/FAT32 populated native image creation
+
+`ffs-fat format --source-dir DIRECTORY` now constructs complete native file and
+directory trees in new images. The existing geometry planner and publication
+sequence allocate both FAT copies, native short/long names, file and directory
+chains, dot/parent entries, zero slack and exact FAT32 FSInfo hints. Preflight
+checks native name and file-size limits, FAT16 fixed-root capacity and total
+cluster space before exclusive destination creation. Short aliases reserve all
+sibling native and long names before selection; the native U+FFFF LFN padding
+sentinel is refused before writing.
+
+Retained source handles, namespace/identity checks and SHA-256 checks detect
+source replacement or changes during preparation. Both BPBs remain withheld
+until planned payloads and metadata are ready and synchronized. After durable
+publication, verification uses the original locked output inode, the complete
+allocation/namespace checker and every payload through the native FAT reader.
+The source contract is bounded and requires a stable tree; it is not a host
+snapshot or an existing-volume mutation API.
+
+All 25 existing formatter tests remain, with 15 new substantive regression
+groups for layout, names, directory growth, capacity, source races, cancellation,
+I/O failures and payload corruption. The native oracle adds populated-image
+fsck/mtools extraction and extension, exact names/bytes/counts, source and image
+immutability checks and optional mounted reads while preserving previous cases.
+The changed Rust files passed parsing/formatting checks, the oracle passed Python
+syntax compilation, and two independent source/API reviews found no remaining
+concrete defect. CLI compilation remains blocked by `asupersync` receiving SIGKILL
+under the shared memory limit. The new formatter tests, native interchange and
+mounted cases remain unexecuted. Workspace formatting reports pre-existing
+differences in unchanged files; the installed UBS launcher is not executable.
+See `docs/FAT_READ_PROFILE.md` for the command, native limits and evidence scope.
+
+### NTFS WOF XPRESS logical file reads
+
+The shared DATA pipeline now reads WOF individual-file-provider XPRESS4K,
+XPRESS8K and XPRESS16K contents through numeric reads, path extraction and FsOps.
+It uses native sparse unnamed DATA only for logical size and ValidDataLength;
+initialized contents come from the validated `WofCompressedData` backing stream.
+Fragmented runs and ATTRIBUTE_LIST continuations retain native file identity.
+The reader fetches only the adjacent native offsets and the bounded selected
+chunk, distinguishes raw chunks by exact stored length, decodes final partial
+chunks to their exact logical length, and zero-fills the native uninitialized
+tail. Corruption and cancellation never become successful partial payloads.
+
+Explicit named-stream extraction preserves stored bytes for recognized WOF
+file providers even when the logical codec is unsupported. LZX logical reads,
+WIM/unknown providers and EFS contents remain outside admission. Ordinary native
+LZNT1, links, security metadata, stream catalogs and read-only enforcement remain.
+WOF files retain regular-file type, hard-link identity and backing allocation in
+the filesystem adapter; cached stream metadata does not conceal later I/O errors.
+
+All six new XPRESS decoder tests, including Microsoft's published MS-XCA byte
+vectors, passed in the complete 844-test on-disk run. On-disk all-targets Clippy
+passed with warnings denied at that decoder-only stage; the later combined
+on-disk run with RAIDZ additions passed 850 tests. Nineteen new provider, image-
+reader and FsOps regressions received source/API review but remain unexecuted:
+workspace check and Clippy both stop while `asupersync` receives SIGKILL under the
+shared memory limit. Changed Rust files pass parsing/formatting checks. Workspace
+formatting reports pre-existing differences in unchanged files, and the installed
+UBS launcher is not executable. Native Windows WOF images and mounted workloads
+have not been validated. See `docs/NTFS_READ_PROFILE.md` for precise admission,
+commands, native sources and evidence limits.
+
+### ZFS complete ordinary RAIDZ1 reads and reconstruction
+
+One complete ordinary RAIDZ1 group of two through eight explicitly supplied
+file/disk leaves now reaches the existing Pool, MOS/DMU, datasets, ZPL, snapshots
+and read-only FsOps pipeline. Every member's native GUID, complete label tree
+and selected root candidate must agree before native child IDs are bound to
+supplied images. Repeated `--member` accepts the complete set, with existing
+`--mirror-member` and new `--raidz-member` aliases. The root diagnostic reports
+actual data/parity/skip columns and reconstruction identity.
+
+The native mapper implements ashift rounding, short and long columns, parity
+address swapping and allocation-only skip sectors. All declared DVAs and every
+member allocation extent are checked before payload I/O. Reads try intact data
+without parity, then reconstruct one unavailable data column or try bounded
+single-column hypotheses after checksum failure. The original PSIZE is checked
+before the existing codec path supplies logical bytes. Cancellation stops
+immediately; unverified or failed blocks cannot enter the shared checked cache.
+Missing members, additional parity levels, dRAID, expanded/nested/replacing
+layouts and write/healing/import protocols remain outside admission.
+
+The complete on-disk suite passed 850 tests, including six new RAIDZ tests and
+twenty mapping cases captured by compiling and executing the verbatim OpenZFS
+zfs-2.3.0 mapping function in an isolated C harness. This is native-function
+capture, not native pool or mount validation. The final on-disk all-targets
+Clippy run passed with warnings denied. Twelve constructed engine regressions
+cover admission, recovery, complete legacy/SA/spill and embedded file graphs,
+historical snapshots, cancellation and cache failures; CLI coverage preserves
+the existing member-limit/mount guards and tests all alias spellings together.
+The changed Rust files passed parsing/formatting checks and independent reviews.
+The new CLI/engine regressions remain unexecuted: a further CLI compile retry
+again received SIGKILL while building `asupersync`. Workspace formatting reports
+13 unchanged files, and UBS could not execute its launcher. Native OpenZFS pool
+and kernel FUSE execution remain unverified. See `docs/ZFS_READ_PROFILE.md`.

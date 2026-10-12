@@ -406,7 +406,7 @@ mod tests {
     }
 
     #[test]
-    fn mirror_members_are_retained_for_dataset_and_snapshot_operations() {
+    fn members_are_retained_for_dataset_and_snapshot_operations() {
         let options = [
             "--offline-image",
             "--pool-guid",
@@ -419,9 +419,9 @@ mod tests {
             "1048576",
             "--length",
             "67108864",
-            "--mirror-member",
+            "--member",
             "second.img",
-            "--mirror-member",
+            "--raidz-member",
             "third.img",
             "--dataset",
             "data",
@@ -433,7 +433,7 @@ mod tests {
                 (1_048_576, Some(67_108_864))
             );
             assert_eq!(
-                candidate.mirror_members,
+                candidate.members,
                 [PathBuf::from("second.img"), PathBuf::from("third.img")]
             );
             assert_eq!(

@@ -7,6 +7,8 @@ read-only `FsOps`/FUSE mount, but is not yet an `OpenFs` backend or writable
 filesystem. It traverses native directory
 indexes and resolves paths using the image's own UpCase table. Ordinary native
 LZNT1-compressed nonresident DATA uses the same numeric and path read commands.
+Native WOF file-provider XPRESS 4K/8K/16K contents also use those commands and
+mounted regular-file reads, with explicit named-stream access to stored bytes.
 Relative native symbolic links can be resolved inside the image or presented
 through the mounted `readlink` operation. Reparse metadata remains inspectable
 for providers whose file contents are not supported. Native security descriptors
@@ -25,6 +27,7 @@ ffs-ntfs ls volume.img / --offline-image
 ffs-ntfs ls volume.img /nested --offline-image
 ffs-ntfs read volume.img /nested/file.txt --offline-image > extracted.bin
 ffs-ntfs read volume.img /nested/file.txt --offline-image --stream note
+ffs-ntfs read volume.img /Windows/compact.dll --offline-image --stream WofCompressedData > backing.bin
 ffs-ntfs read volume.img /nested/file.txt --offline-image --stream-utf16 d800,0061
 ffs-ntfs readlink volume.img /nested/link --offline-image
 ffs-ntfs record volume.img 24 --offline-image
@@ -151,8 +154,90 @@ Compressed named streams and extension-backed mappings share the ordinary
 attribute catalog and EOF/ValidDataLength rules. Compression methods other than
 LZNT1, noncanonical unit sizes, clusters above 4 KiB, EFS and compressed non-DATA
 attributes remain refused. Resident attributes carrying nonresident storage
-flags remain refused. MFT data must still be untransformed. WOF/system compression
-and other reparse-backed formats are not ordinary LZNT1 DATA support.
+flags remain refused. MFT data must still be untransformed. WOF uses the
+separate file-provider profile below; it is not ordinary LZNT1 DATA storage.
+
+## WOF individual-file XPRESS compression
+
+Numeric `cat`, path `read`, the DATA catalog and mounted regular-file reads
+support native WOF file-provider XPRESS4K, XPRESS8K and XPRESS16K. WOF supplies
+the contents of the same file; it is not a symbolic-link target. Native MFT
+identity, hard links, logical size and sequence remain intact. Mounted allocation
+counts the physical `WofCompressedData` backing, with no separately allocated
+blocks for resident backing.
+
+Admission requires the Microsoft WOF tag `0x80000017`, WOF version 1, file
+provider 2, file-provider version 1, and exactly the 16-byte V0 or 20-byte V1
+provider payload. V1 flags must be zero. Algorithms 0, 2 and 3 select independent
+4,096-, 8,192- and 16,384-byte XPRESS chunks. LZX (algorithm 1), other algorithms,
+WIM-backed files, other versions and nonzero file-provider flags remain outside
+the logical read profile.
+
+The unnamed native DATA must be an entirely sparse placeholder, or an empty
+resident value for an empty file. Its size and ValidDataLength govern the
+logical file. The named `WofCompressedData` stream must be fully initialized
+resident DATA or ordinary physically mapped nonresident DATA, including validated
+ATTRIBUTE_LIST continuations. Sparse, encrypted or recursively compressed
+backing is refused. The reader obtains logical contents from the provider
+stream; the unnamed sparse mapping never supplies initialized file bytes.
+Native bytes at or beyond ValidDataLength read as zero without accessing their
+provider chunks.
+
+Each backing value has one fewer stored offset than logical chunks. Offsets are
+relative to its payload after the table, with an implicit first zero and final
+payload-length offset. Entries are 32-bit for logical sizes through
+`0xFFFFFFFF`, and 64-bit above that boundary. The table remains on the image:
+a read fetches at most the selected chunk's two adjacent entries, checks their
+ordering and bounds, and reads only the needed chunks. This does not certify
+unselected offset pairs. Empty, reversed, oversized or truncated selected ranges
+are errors, not sparse data.
+
+A stored chunk whose length equals its exact logical length is raw, even if its
+bytes resemble a compression header. A shorter chunk is XPRESS Huffman/LZ77.
+The final partial chunk uses the exact remaining logical length. Its complete
+compressed chunk is decoded before any requested portion is returned, so an
+invalid later match cannot make a prefix read succeed. Canonical code tables,
+refills, sideband length extensions, back-reference distances and output limits
+are checked. Chunks cannot refer to a preceding chunk's dictionary. The decoder
+uses a bounded 64 KiB Huffman lookup table and buffers bounded by one stored and
+one decoded chunk; the ordinary 16 MiB maximum request buffer remains separate.
+
+Explicit named-stream selection returns that stream's stored native bytes:
+`--stream WofCompressedData` extracts the original table and compressed/raw
+payload, without applying the unnamed file's codec. For a recognized version-1,
+zero-flag file provider, raw named streams remain available even when its
+logical algorithm is LZX or unknown. Other provider identities or flags still
+require an implementation, and file-level or per-stream EFS refusal remains
+in force. This exception does not expose a cloud or WIM placeholder as file
+contents. Stream selection remains exact UTF-16, including the case of the
+backing stream name.
+
+Catalog inspection reports the provider's logical size, initialized length and
+backing allocation for unnamed DATA, and stored metadata for named DATA. It
+does not read nonresident chunk tables or payloads and does not claim those
+bytes are valid. Unreadable provider metadata and cancellation fail the catalog
+operation; an unsupported logical codec remains an explicit refusal on that
+row while admissible raw named rows stay available. Stream caches retain the
+fixed-size layout and ordinary backing run map; they do not cache decoded data
+or suppress later I/O failures. Cancellation is checked before metadata and
+chunk I/O, between chunks, and around bounded decompression.
+
+Native format references:
+
+- Microsoft's [WOF_EXTERNAL_INFO](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_wof_external_info),
+  [FILE_PROVIDER_EXTERNAL_INFO_V0](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_provider_external_info_v0)
+  and [V1](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_provider_external_info_v1)
+  define the provider identity and algorithm fields.
+- Microsoft's MS-XCA [XPRESS Huffman decoding](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-xca/26db8e62-bbd8-472c-a09e-623f6de10f0b)
+  and [published examples](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-xca/f59ff967-3032-4331-b108-0d2b4c09ee27)
+  define the byte grammar and provide the literal/overlapping-match golden vectors.
+- Linux v6.17 [frecord.c](https://github.com/torvalds/linux/blob/v6.17/fs/ntfs3/frecord.c),
+  [inode.c](https://github.com/torvalds/linux/blob/v6.17/fs/ntfs3/inode.c)
+  and [ntfs.h](https://github.com/torvalds/linux/blob/v6.17/fs/ntfs3/ntfs.h),
+  plus ntfs-3g-system-compression v1.0
+  [system_compression.c](https://github.com/ebiggers/ntfs-3g-system-compression/blob/v1.0/src/system_compression.c),
+  provide native offset-table, exact final-chunk, raw-chunk and ValidDataLength
+  handling references. FrankenFS reads and decodes these bytes directly.
 
 ## ATTRIBUTE_LIST and extension records
 
@@ -245,14 +330,15 @@ resolver never opens a host path. It limits a resolution to 63 link expansions,
 A trailing slash still requires the resolved object to be a directory.
 
 Numeric `cat`, path reads and mounted file reads enforce the same provider
-boundary. A file carrying reparse metadata cannot expose its own DATA as if it
-were resolved file contents, including named streams or metadata found in an
-extension. On regular files, EFS-marked STANDARD_INFORMATION is also refused
-before data I/O, even when the DATA attribute itself appears unencrypted. A
-directory's ENCRYPTED flag describes the default for new children, not encrypted
-directory indexes. Ordinary native LZNT1
-compression remains a separate supported storage form; WOF/system compression
-and cloud placeholders need their own providers.
+boundary. Relative symlinks supply a target; supported WOF files supply their
+logical contents through the file-provider profile above. Other reparse
+providers cannot expose their DATA as decoded file contents, including metadata
+found in extensions. Explicit raw WOF named-stream selection follows the
+recognized file-provider exception described above. On regular files,
+EFS-marked STANDARD_INFORMATION is refused before data I/O even when DATA appears
+unencrypted. A directory's ENCRYPTED flag describes the default for new children,
+not encrypted directory indexes. Ordinary native LZNT1 remains a separate storage
+form; WIM, LZX, cloud and other unsupported provider contents remain refused.
 
 The mounted view returns supported relative link targets to the host kernel
 using ordinary symlink semantics, including `..`. A host process can therefore
@@ -273,8 +359,8 @@ directory cycles and inconsistent native parents are errors, not alternate roots
 The adapter provides lookup, getattr, paginated readdir, regular-file reads,
 relative-link readlink, read-only open admission, statfs and non-writing
 synchronization. Unnamed DATA
-uses the same resident, fragmented, sparse, compressed and extension-aware reader
-as CLI extraction. Named streams remain available through CLI `--stream`, not an
+uses the same resident, fragmented, sparse, LZNT1, WOF XPRESS and extension-aware
+reader as CLI extraction. Named streams remain available through CLI `--stream`, not an
 invented mounted `file:stream` namespace. SEEK_DATA/SEEK_HOLE use the conservative
 projection of data before EOF and a hole at EOF, including compressed files.
 
@@ -391,7 +477,8 @@ JSON descriptor output begins.
 
 Security metadata remains inspectable for files whose DATA requires an
 unsupported provider. This command does not read that file's DATA, bypass
-the DATA provider boundary or implement EFS/WOF/cloud-provider contents.
+the DATA provider boundary or add support for otherwise unavailable provider
+contents. EFS, WIM, LZX and cloud-provider DATA remain outside the read profile.
 All normal offline-image, shared-lock and immutable-image requirements apply.
 
 Native format references:
@@ -536,6 +623,11 @@ respective increments and do not validate this stream-catalog change.
 
 ## Numeric DATA provider boundary
 
+Historical baseline: the later WOF XPRESS implementation above adds a validated
+file-provider path and explicit raw named-stream selection. The refusals below
+still describe unrecognized providers and unsupported provider metadata; they
+do not override that later bounded profile.
+
 Numeric `cat` and DATA admission now inspect the complete validated base and
 extension catalog for REPARSE_POINT before selecting either unnamed or named
 DATA. Unsupported reparse providers, including WOF/system compression and cloud
@@ -642,3 +734,41 @@ SIGKILL under the shared memory limit, so the new image-reader and report tests
 remain unexecuted. Earlier execution of a separate parser draft is not credited
 to this implementation. Native Windows descriptor comparison and mounted
 SID/DACL enforcement are not claimed.
+
+## WOF XPRESS validation
+
+Six pure decoder regressions cover Microsoft's published literal and overlapping
+match vectors, byte/word length extensions, all three WOF chunk sizes, maximum
+output bounds, complete canonical trees, truncation, refill/displacement
+boundaries and independent chunk dictionaries.
+
+Six provider/layout unit regressions cover V0/V1 identity, flags and algorithm
+admission; selected adjacent offsets; 32/64-bit table geometry; raw, partial and
+empty chunks; malformed ranges and oversized metadata. Ten constructed native
+image-reader regressions cover fragmented backing, complete DATA catalogs, raw
+ADS extraction with unavailable logical codecs, native ValidDataLength, corrupted
+tables and late matches, table/payload/later-extent cancellation, nonresident
+provider cancellation, extension-owned provider/backing attributes, stale native
+identity, partial resident-backed chunks, malformed storage admissions and
+unchanged real-image bytes. Three FsOps/path regressions cover all supported
+algorithms, hard links, logical metadata and allocation, readdir, read-only
+admission, raw path extraction, EOF and payload errors after stream caching.
+Existing native LZNT1, reparse, EFS, security and stream-selector tests are retained.
+
+Execution evidence (2026-10-12): the complete `ffs-ondisk` library suite with the
+XPRESS decoder passed 844 tests, including all six new decoder regressions.
+These results execute the Microsoft byte vectors and decoder implementation.
+The nineteen new provider/reader/FsOps regressions have been authored and reviewed,
+but CLI compilation again stopped in `asupersync` with SIGKILL under the shared
+memory limit. They are not recorded as passing tests. No Windows-generated WOF
+image comparison, kernel mount execution or new Windows interoperability result
+is claimed.
+
+Final source integration (2026-10-12): changed Rust files passed parsing and
+formatting checks, and independent native-boundary/API reviews found no remaining
+concrete defect. On-disk all-targets Clippy passed with warnings denied for the
+decoder-only stage; the later combined on-disk run with RAIDZ additions passed
+850 tests. Workspace check and Clippy both stop in `asupersync` with SIGKILL;
+workspace formatting reports existing differences in unchanged files. UBS could
+not execute its installed launcher. These limitations do not turn the nineteen
+unexecuted provider/reader/FsOps regressions into passing or native-image evidence.

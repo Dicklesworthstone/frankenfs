@@ -1,4 +1,5 @@
 mod native_layout;
+mod populated_images;
 mod publication;
 
 use super::*;
@@ -18,6 +19,7 @@ fn options(path: PathBuf, kind: FormatKind) -> FormatArgs {
         sectors_per_cluster: None,
         label: Some("frank data".into()),
         serial: Some(0x1234_ABCD),
+        source_dir: None,
     }
 }
 
@@ -142,6 +144,7 @@ fn geometry_matches_independent_native_sector_counts_and_boundary_choices() {
             sectors_per_cluster: None,
             label: None,
             serial: Some(0),
+            source_dir: None,
         };
         let plan = FormatPlan::prepare(&args).unwrap();
         let geometry = FatGeometry::parse(&plan.boot, layout.image_bytes()).unwrap();

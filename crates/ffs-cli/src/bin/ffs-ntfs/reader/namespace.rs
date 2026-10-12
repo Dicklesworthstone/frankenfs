@@ -266,29 +266,40 @@ impl NtfsVolume {
                     checkpoint(cx)?;
                     return Ok(target);
                 }
-                reparses += 1;
-                if reparses > 63 {
-                    return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::ELOOP)));
+                if point.tag == super::wof::TAG {
+                    // WOF supplies the contents of this same native file. It
+                    // is not a pathname redirection or a directory provider.
+                    super::wof::FileProvider::parse(&point)?;
+                    if target.is_directory() {
+                        return Err(unsupported(
+                            "WOF individual-file provider cannot describe a directory",
+                        ));
+                    }
+                } else {
+                    reparses += 1;
+                    if reparses > 63 {
+                        return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::ELOOP)));
+                    }
+                    let target_path = relative_link_target(&point)?;
+                    let mut target_components: VecDeque<_> = target_path
+                        .split('/')
+                        .filter(|part| !part.is_empty())
+                        .map(str::to_owned)
+                        .collect();
+                    if target_path.ends_with('/') {
+                        target_components.push_back(".".to_owned());
+                    }
+                    expanded_components += target_components.len();
+                    expanded_bytes += target_path.len();
+                    if expanded_components > 256 || expanded_bytes > 65_536 {
+                        return Err(FfsError::NameTooLong);
+                    }
+                    target_components.append(&mut components);
+                    components = target_components;
+                    // Stay at the containing native directory. No host pathname is
+                    // ever opened and no absolute target is rebased onto this image.
+                    continue;
                 }
-                let target_path = relative_link_target(&point)?;
-                let mut target_components: VecDeque<_> = target_path
-                    .split('/')
-                    .filter(|part| !part.is_empty())
-                    .map(str::to_owned)
-                    .collect();
-                if target_path.ends_with('/') {
-                    target_components.push_back(".".to_owned());
-                }
-                expanded_components += target_components.len();
-                expanded_bytes += target_path.len();
-                if expanded_components > 256 || expanded_bytes > 65_536 {
-                    return Err(FfsError::NameTooLong);
-                }
-                target_components.append(&mut components);
-                components = target_components;
-                // Stay at the containing native directory. No host pathname is
-                // ever opened and no absolute target is rebased onto this image.
-                continue;
             }
             if target.is_directory() {
                 if ancestors

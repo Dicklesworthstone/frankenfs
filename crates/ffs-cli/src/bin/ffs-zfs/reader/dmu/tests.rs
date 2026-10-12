@@ -235,6 +235,7 @@ fn objects(leaf: &Leaf, meta: Dnode) -> Objects {
             id: 0,
             allocated_bytes: LENGTH as u64 - DATA_OFFSET - 2 * LABEL_BYTES,
             read_features: Vec::new(),
+            raidz_members: None,
         },
         txg: 43,
         root_birth: 42,

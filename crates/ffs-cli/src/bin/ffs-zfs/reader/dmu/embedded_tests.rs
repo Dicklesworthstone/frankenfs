@@ -79,6 +79,7 @@ fn view(leaf: &Leaf, order: Endian, extra_flags: u64) -> Objects {
                 "com.delphix:embedded_data".into(),
                 "org.illumos:lz4_compress".into(),
             ],
+            raidz_members: None,
         },
         txg: 42,
         root_birth: 40,

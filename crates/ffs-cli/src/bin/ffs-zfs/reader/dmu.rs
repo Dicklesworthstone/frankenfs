@@ -141,7 +141,7 @@ impl Objects {
         let bytes = if bp.embedded() {
             bp.decode_embedded().map_err(|error| parse(&error))?
         } else {
-            self.pool.read_block(cx, &self.config, bp)?.0
+            self.pool.read_block(cx, &self.config, bp)?.bytes
         };
         if bytes.len() != size {
             return Err(corrupt("decoded DMU block has the wrong length"));

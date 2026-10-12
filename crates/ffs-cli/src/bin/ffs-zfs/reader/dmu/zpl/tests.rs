@@ -424,6 +424,7 @@ fn mos(leaf: &Leaf, meta: Dnode) -> Objects {
             id: 0,
             allocated_bytes: LENGTH as u64 - DATA_OFFSET - 2 * LABEL_BYTES,
             read_features: Vec::new(),
+            raidz_members: None,
         },
         txg: 61,
         root_birth: 60,
@@ -692,3 +693,5 @@ fn dataset_views_do_not_reuse_mos_or_other_dataset_block_caches() {
 mod mount;
 
 mod mirror;
+
+mod raidz;

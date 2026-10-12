@@ -1,4 +1,5 @@
-//! Create a new empty FAT image; never open an existing image for mutation.
+//! Create a new FAT image, optionally populated from an immutable source tree.
+//! Never open an existing image for mutation.
 //!
 //! The file is exclusively created and locked once. Verification uses a clone
 //! of that same handle, so it neither reopens the path nor requests a second
@@ -9,6 +10,7 @@
 //! creation finishes: opening the directory and creating the file are separate
 //! pathname resolutions.
 
+mod population;
 #[cfg(test)]
 mod tests;
 
@@ -82,6 +84,10 @@ pub struct FormatArgs {
     /// 32-bit serial in decimal or 0x-prefixed hex; defaults to a time-derived ID.
     #[arg(long, value_name = "U32", value_parser = parse_serial)]
     serial: Option<u32>,
+    /// Copy an immutable tree of regular files/directories into the new image.
+    /// No symlinks/special files; destination must be outside the source tree.
+    #[arg(long, value_name = "DIRECTORY")]
+    source_dir: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -189,6 +195,7 @@ struct FormatPlan {
     serial: u32,
     boot: [u8; 512],
     before_boot: Vec<Sector>,
+    population: Option<population::Population>,
 }
 
 fn word(bytes: &mut [u8], at: usize, value: u16) {
@@ -402,6 +409,7 @@ impl FormatPlan {
             serial,
             boot,
             before_boot,
+            population: None,
         };
         let mut offsets = Vec::new();
         for sector in plan.metadata_sectors() {
@@ -419,6 +427,36 @@ impl FormatPlan {
         Ok(plan)
     }
 
+    fn prepare_source(&mut self, cx: &Cx, args: &FormatArgs) -> Result<()> {
+        let Some(source) = &args.source_dir else {
+            return Ok(());
+        };
+        let population = population::Population::prepare(
+            cx,
+            source,
+            &args.image,
+            self.layout,
+            self.label.as_ref(),
+        )
+        .context("source-tree preflight failed; no destination was created")?;
+        population.update_headers(self.layout, &mut self.before_boot)?;
+        self.population = Some(population);
+        let mut offsets = std::collections::BTreeSet::new();
+        for sector in self.metadata_sectors() {
+            checkpoint(cx)?;
+            if !sector.offset.is_multiple_of(SECTOR_BYTES)
+                || sector
+                    .offset
+                    .checked_add(SECTOR_BYTES)
+                    .is_none_or(|end| end > self.layout.image_bytes())
+                || !offsets.insert(sector.offset)
+            {
+                bail!("populated metadata sector is duplicated or outside the new volume");
+            }
+        }
+        Ok(())
+    }
+
     /// Both BPBs are withheld until preparation is synchronized. Publish the
     /// backup before the primary so the primary never precedes its full copy.
     fn publication_sectors(&self) -> impl Iterator<Item = Sector> {
@@ -432,11 +470,16 @@ impl FormatPlan {
         }))
     }
 
+    fn preparation_sectors(&self) -> impl Iterator<Item = Sector> {
+        self.before_boot.iter().copied().chain(
+            self.population
+                .iter()
+                .flat_map(|population| population.extra_sectors(self.layout)),
+        )
+    }
+
     fn metadata_sectors(&self) -> impl Iterator<Item = Sector> {
-        self.before_boot
-            .iter()
-            .copied()
-            .chain(self.publication_sectors())
+        self.preparation_sectors().chain(self.publication_sectors())
     }
 }
 
@@ -445,6 +488,18 @@ impl FormatPlan {
 trait ImageTarget {
     fn resize(&self, length: u64) -> io::Result<()>;
     fn write_sector(&self, offset: u64, bytes: &[u8; 512]) -> io::Result<()>;
+    fn write_data(&self, offset: u64, bytes: &[u8]) -> io::Result<()> {
+        if !offset.is_multiple_of(SECTOR_BYTES) || !bytes.len().is_multiple_of(512) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "unaligned FAT payload write",
+            ));
+        }
+        for (index, sector) in bytes.as_chunks::<512>().0.iter().enumerate() {
+            self.write_sector(offset + index as u64 * SECTOR_BYTES, sector)?;
+        }
+        Ok(())
+    }
     fn flush(&self) -> io::Result<()>;
 }
 
@@ -454,6 +509,10 @@ impl ImageTarget for File {
     }
 
     fn write_sector(&self, offset: u64, bytes: &[u8; 512]) -> io::Result<()> {
+        self.write_all_at(bytes, offset)
+    }
+
+    fn write_data(&self, offset: u64, bytes: &[u8]) -> io::Result<()> {
         self.write_all_at(bytes, offset)
     }
 
@@ -471,14 +530,21 @@ fn initialize(
     let prepared = (|| -> Result<()> {
         checkpoint(cx)?;
         // create_new supplied a zero-length file. Extending it guarantees
-        // logical zeros throughout both FATs, directories and free space;
-        // initialization I/O does not scale with the logical image length.
+        // logical zeros throughout both FATs, directories and free space.
+        // Population writes only planned payload and metadata; unused cluster
+        // bytes and all newly visible file/directory slack remain zero.
         target.resize(plan.layout.image_bytes())?;
         checkpoint(cx)?;
-        for sector in &plan.before_boot {
+        if let Some(population) = &plan.population {
+            population.write_payloads(cx, target, plan.layout)?;
+        }
+        for sector in plan.preparation_sectors() {
             checkpoint(cx)?;
             target.write_sector(sector.offset, &sector.bytes)?;
             checkpoint(cx)?;
+        }
+        if let Some(population) = &plan.population {
+            population.revalidate(cx)?;
         }
         target.flush()?;
         // Last cancellation boundary before a valid backup or primary BPB may
@@ -572,18 +638,39 @@ fn verify_created(cx: &Cx, file: &File, plan: &FormatPlan) -> Result<serde_json:
         plan.layout.image_bytes(),
     )?;
     let report = volume.check(cx)?;
-    let allocated = u64::from(plan.layout.kind == FormatKind::Fat32);
+    let allocated = plan.population.as_ref().map_or(
+        u64::from(plan.layout.kind == FormatKind::Fat32),
+        population::Population::allocated,
+    );
+    let files = plan
+        .population
+        .as_ref()
+        .map_or(0, population::Population::files);
+    let directories = plan
+        .population
+        .as_ref()
+        .map_or(1, population::Population::directories);
     if !report.clean
-        || report.files != 0
-        || report.directories != 1
+        || !report.complete
+        || !report.namespace_complete
+        || report.files != files
+        || report.directories != directories
         || report.free_clusters != u64::from(plan.layout.data_clusters) - allocated
         || report.allocated_clusters != allocated
         || report.lost_clusters != Some(0)
     {
         bail!(
-            "new FAT image failed empty-filesystem verification: {}",
+            "new FAT image failed {}-filesystem verification: {}",
+            if plan.population.is_some() {
+                "populated"
+            } else {
+                "empty"
+            },
             serde_json::to_string(&report)?
         );
+    }
+    if let Some(population) = &plan.population {
+        population.verify(cx, &volume)?;
     }
     checkpoint(cx)?;
     Ok(serde_json::to_value(report)?)
@@ -604,7 +691,8 @@ pub fn run(cx: &Cx, args: &FormatArgs) -> Result<serde_json::Value> {
 
 pub fn create(cx: &Cx, args: &FormatArgs) -> Result<serde_json::Value> {
     checkpoint(cx)?;
-    let plan = FormatPlan::prepare(args)?;
+    let mut plan = FormatPlan::prepare(args)?;
+    plan.prepare_source(cx, args)?;
     let parent_path = args
         .image
         .parent()
@@ -666,6 +754,11 @@ pub fn create(cx: &Cx, args: &FormatArgs) -> Result<serde_json::Value> {
             "serial": plan.serial,
             "durability": "file_and_parent_synced",
             "storage": "logical zeros in a new file; physical storage may be sparse",
+            "source_directory": plan.population.as_ref().map(|population| population.source().display().to_string()),
+            "copied_files": plan.population.as_ref().map_or(0, population::Population::files),
+            "copied_directories": plan.population.as_ref().map_or(1, population::Population::directories),
+            "copied_bytes": plan.population.as_ref().map_or(0, population::Population::bytes),
+            "payload_verification": plan.population.as_ref().map(|_| "sha256_via_native_reader"),
             "verification": verification
         }))
     };
