@@ -142,6 +142,24 @@
 > These on-image pipeline fixes do not establish default repair, reserved native
 > storage, or mounted restart freshness; `bd-11a8t` / `bd-j7a4e` remain incomplete.
 >
+> **Mount worker ownership (`bd-11a8t`, partial evidence 2026-10-12):** ordinary
+> CLI scrub and periodic commit now use caller-owned asupersync child regions.
+> Shutdown cancels both workers, drains their physical I/O completion receipts,
+> preserves worker errors, and retains exclusive image ownership for background
+> repair even with read-only client access. At frozen source
+> `9c05cc63f1648ab348669561b9dd2da84924b83f`, RCH job `30059820987973701`
+> passed 27 selected unit/real-image controls, including four new controls for
+> parent cancellation, queued cancellation, late I/O errors, and panic/Drop
+> cleanup. The real-FUSE periodic-commit SIGKILL positive/disabled-negative test
+> also passed. The new normal-unmount test failed: this worker's AppArmor policy
+> denied `fusermount3` on RCH's `/data/tmp` fixture location. It remains unverified
+> until the unchanged test runs with `TMPDIR=/tmp`, an allowed mount location.
+> The execution log is `ffs-chartreusestone-resume26-worker-tests6.log`.
+> Workspace check/Clippy are also pending: the next RCH check was refused before
+> compilation because of critical worker memory pressure. These results do not
+> complete native storage, default activation, restart freshness, or the wider
+> core/FUSE worker migration on the original bead.
+>
 > **Compatibility repair (`bd-7zjfh`, verified 2026-10-11):** FFSRQSC2 sidecars
 > are the compatibility-mode repair substrate, exposed through the explicit
 > `ffs-protected-mount` binary. Native mode retains the allocator-owned,
