@@ -833,10 +833,18 @@ Together they exercised all three pretree run forms, all recent-offset slots
 and 113 E8 translations, with no byte differences. This is evidence for the
 arithmetic and native variant, not execution of the Rust implementation.
 
-The new Rust regressions have not been executed in this session: the executor
-disconnected during dependency compilation. The earlier XPRESS validation
-results above do not establish LZX test passage. The required focused checks
-when the executor is available are:
+All seven decoder regressions subsequently executed successfully with pinned
+nightly 1.100.0 (908501772) and the real `ffs-types` path dependency plus locked
+`sha2` 0.11.0: seven passed, zero failed. This included both complete native
+specimen output digests and their truncation/length negatives. Execution used a
+small external Cargo harness importing the exact production `lzx.rs` and its
+test module; it does not establish whole-crate or WOF/FsOps integration passage.
+The first compile exposed `LowerHex` incompatibility in the two digest assertions;
+explicit bytewise hex formatting fixed those assertions without changing their
+expected hashes, inputs or acceptance conditions.
+
+The new WOF reader/image and FsOps regressions remain unexecuted. The earlier
+XPRESS results do not establish LZX integration passage. Remaining focused checks:
 
 ```sh
 rch exec -- cargo test -p ffs-ondisk lzx::
