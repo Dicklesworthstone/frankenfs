@@ -374,6 +374,9 @@ impl Image {
             &metadata(8, 0, None, order),
             order,
         ));
+        if case >= 23 {
+            xattrs::augment(self, &mut table, at, state, birth, order, case);
+        }
         let mut os = vec![0; 1024];
         let mut meta = node(10, 16384, 1, 0, order);
         meta[64..192].copy_from_slice(&pointer(&table, at, 10, 0, birth - 1, order, order));
@@ -663,3 +666,5 @@ mod mount;
 mod mirror;
 
 mod raidz;
+
+mod xattrs;

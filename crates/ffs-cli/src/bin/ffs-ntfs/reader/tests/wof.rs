@@ -3,6 +3,18 @@ use super::*;
 
 const BACKING: &str = "WofCompressedData";
 
+// Constructed native 32 KiB LZX chunk: literal A and overlapping matches.
+// RLE precode lengths exercise the native compact header, not CAB framing.
+const REPEATED_LZX_32K: &[u8] = &[
+    0x00, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22, 0x02, 0xf5, 0x0f,
+    0xff, 0x3f, 0xe2, 0xff, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x41, 0x44, 0xff, 0x1b, 0xff, 0xff, 0x08, 0xfa, 0x00, 0x00, 0x00, 0x00,
+    0x00, 0x00, 0x08, 0x00, 0x3f, 0x88, 0xb5, 0xff, 0xff, 0xff, 0xff, 0x32,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0xfe,
+];
+
 pub(in crate::reader) fn provider_value(algorithm: u32, flags: Option<u32>) -> Vec<u8> {
     let mut value = vec![0; 8];
     value[..4].copy_from_slice(&0x8000_0017_u32.to_le_bytes());
@@ -66,10 +78,18 @@ pub(in crate::reader) fn named_mapping(pairs: &[u8], clusters: usize, size: usiz
 }
 
 pub(in crate::reader) fn encoded_chunks(chunk: usize) -> (Vec<u8>, Vec<u8>) {
-    let compressed = repeated_xpress(b'A', chunk);
+    let compressed = if chunk == 32_768 {
+        REPEATED_LZX_32K.to_vec()
+    } else {
+        repeated_xpress(b'A', chunk)
+    };
     let mut raw: Vec<_> = (0..chunk).map(|index| (index % 251) as u8).collect();
     // Exact stored length identifies a raw chunk even with this valid header.
     raw[..compressed.len()].copy_from_slice(&compressed);
+    if chunk == 32_768 {
+        raw[100] = 0xE8;
+        raw[101..105].copy_from_slice(&100_i32.to_le_bytes());
+    }
     let tail = b"final partial native WOF chunk bytes!";
     assert_eq!(tail.len(), 37);
     let mut stored = Vec::new();
@@ -218,7 +238,7 @@ fn native_valid_data_length_hides_uninitialized_bytes_without_reading_sparse_pla
 #[test]
 fn known_file_provider_preserves_raw_ads_for_unsupported_codec_but_not_efs_or_other_providers() {
     let cx = Cx::for_testing();
-    for algorithm in [1, 4, u32::MAX] {
+    for algorithm in [4, u32::MAX] {
         let (image, stored, _) = native_image(algorithm, 4096, None);
         let volume = image.volume();
         let record = volume.record(&cx, 24, None).unwrap();
@@ -497,4 +517,160 @@ fn actual_image_and_adjacent_partitions_remain_byte_identical_after_wof_reads() 
     let stream = volume.data_stream(&cx, &record, &[]).unwrap();
     assert_eq!(volume.read(&cx, &stream, 0, 30_000).unwrap(), expected);
     assert_eq!(std::fs::read(&path).unwrap(), image.bytes);
+}
+
+fn native_lzx_image(initialized: Option<usize>) -> (Image, Vec<u8>, Vec<u8>) {
+    let (stored, expected) = encoded_chunks(32_768);
+    let mut image = Image::new();
+    let clusters = stored.len().div_ceil(512);
+    let mut attrs = native_attributes(
+        1,
+        expected.len(),
+        initialized.unwrap_or(expected.len()),
+        stored.len(),
+    );
+    // The raw 32 KiB chunk needs a longer second run. Keep the first run at
+    // LCN 210 so it cannot alias the second run spanning LCNs 140 through 203.
+    attrs[2] = named_mapping(
+        &[0x21, 1, 210, 0, 0x11, u8::try_from(clusters - 1).unwrap(), 0xBA, 0],
+        clusters,
+        stored.len(),
+    );
+    image.put_record(24, &file_record(24, &attrs));
+    let first = BASE + 210 * 512;
+    image.bytes[first..first + 512].copy_from_slice(&stored[..512]);
+    let second = BASE + 140 * 512;
+    image.bytes[second..second + stored.len() - 512].copy_from_slice(&stored[512..]);
+    (image, stored, expected)
+}
+
+#[test]
+fn lzx_reads_fragmented_compressed_raw_and_partial_chunks_and_catalogs_without_payload_io() {
+    let cx = Cx::for_testing();
+    let (image, stored, expected) = native_lzx_image(None);
+    let reads: Reads = Arc::default();
+    let volume = image.open(Arc::clone(&reads), None).unwrap();
+    let record = volume.record(&cx, 24, Some(7)).unwrap();
+    reads.lock().unwrap().clear();
+    let stream = volume.data_stream(&cx, &record, &[]).unwrap();
+    let catalog = volume.data_streams(&cx, &record).unwrap();
+    let logical = catalog[0].read_profile.as_ref().unwrap();
+    assert_eq!(logical.size, 65_573);
+    assert_eq!(logical.initialized, logical.size);
+    assert_eq!(logical.allocated, stored.len().next_multiple_of(512) as u64);
+    assert!(!logical.resident);
+    assert!(reads.lock().unwrap().is_empty());
+
+    assert_eq!(volume.read(&cx, &stream, 0, 100_000).unwrap(), expected);
+    for (offset, size) in [(0, 1), (32_765, 9), (65_533, 100)] {
+        let end = (offset + size).min(expected.len());
+        assert_eq!(
+            volume.read(&cx, &stream, offset as u64, size).unwrap(),
+            expected[offset..end],
+        );
+    }
+    // The equal-size middle chunk starts with the same LZX header and also
+    // contains E8 bytes. Its original bytes must bypass decoding and E8 undo.
+    assert_eq!(
+        volume.read(&cx, &stream, 32_768, 32_768).unwrap(),
+        expected[32_768..65_536],
+    );
+    let raw = volume
+        .data_stream(&cx, &record, &BACKING.encode_utf16().collect::<Vec<_>>())
+        .unwrap();
+    assert_eq!(volume.read(&cx, &raw, 0, 100_000).unwrap(), stored);
+    assert_eq!(volume.read(&cx, &stream, 65_573, 1).unwrap(), [] as [u8; 0]);
+    assert_eq!(volume.read(&cx, &stream, u64::MAX, 1).unwrap(), [] as [u8; 0]);
+    assert!(reads.lock().unwrap().iter().all(|(at, size)| {
+        *at >= BASE as u64 && *at + *size as u64 <= (BASE + LENGTH) as u64
+    }));
+}
+
+#[test]
+fn lzx_valid_data_and_cancellation_keep_tail_and_fragment_boundaries() {
+    let cx = Cx::for_testing();
+    let (image, _, mut expected) = native_lzx_image(Some(32_762));
+    expected[32_762..].fill(0);
+    let reads: Reads = Arc::default();
+    let volume = image.open(Arc::clone(&reads), None).unwrap();
+    let record = volume.record(&cx, 24, None).unwrap();
+    let stream = volume.data_stream(&cx, &record, &[]).unwrap();
+    reads.lock().unwrap().clear();
+    assert_eq!(volume.read(&cx, &stream, 0, 100_000).unwrap(), expected);
+    assert_eq!(
+        *reads.lock().unwrap(),
+        [
+            ((BASE + 210 * 512) as u64, 4),
+            ((BASE + 210 * 512 + 8) as u64, REPEATED_LZX_32K.len()),
+        ],
+    );
+    reads.lock().unwrap().clear();
+    assert_eq!(volume.read(&cx, &stream, 32_762, 100).unwrap(), vec![0; 100]);
+    assert!(reads.lock().unwrap().is_empty());
+
+    for offset in [BASE + 210 * 512, BASE + 210 * 512 + 8, BASE + 140 * 512] {
+        let (image, _, _) = native_lzx_image(None);
+        let reads: Reads = Arc::default();
+        let volume = image.open(Arc::clone(&reads), Some(offset as u64)).unwrap();
+        let record = volume.record(&cx, 24, None).unwrap();
+        let stream = volume.data_stream(&cx, &record, &[]).unwrap();
+        reads.lock().unwrap().clear();
+        assert!(matches!(
+            volume.read(&cx, &stream, 0, 100_000),
+            Err(FfsError::Cancelled),
+        ));
+        assert_eq!(
+            reads.lock().unwrap().iter().filter(|(at, _)| *at == offset as u64).count(),
+            1,
+        );
+    }
+}
+
+#[test]
+fn lzx_resident_backing_validates_the_entire_chunk_before_a_one_byte_read() {
+    let cx = Cx::for_testing();
+    for case in 0..4 {
+        let mut compressed = REPEATED_LZX_32K.to_vec();
+        let logical = if case == 3 { 32_767 } else { 32_768 };
+        match case {
+            1 => {
+                *compressed.last_mut().unwrap() |= 1; // Late match exceeds its block.
+            }
+            2 => {
+                compressed.pop();
+            }
+            _ => {}
+        }
+        let mut image = Image::new();
+        let mut standard = [0; 72];
+        standard[32..36].copy_from_slice(&0x600_u32.to_le_bytes());
+        image.put_record(
+            24,
+            &file_record(
+                24,
+                &[
+                    resident(0x10, 2, "", &standard),
+                    placeholder(logical, logical),
+                    resident(DATA, 1, BACKING, &compressed),
+                    resident(0xC0, 3, "", &provider_value(1, None)),
+                ],
+            ),
+        );
+        let volume = image.volume();
+        let record = volume.record(&cx, 24, None).unwrap();
+        let stream = volume.data_stream(&cx, &record, &[]).unwrap();
+        assert_eq!(stream.allocated, 0);
+        for _ in 0..2 {
+            let result = volume.read(&cx, &stream, 0, 1);
+            if case == 0 {
+                assert_eq!(result.unwrap(), b"A");
+            } else {
+                assert!(matches!(result, Err(FfsError::Corruption { .. })));
+            }
+        }
+        let raw = volume
+            .data_stream(&cx, &record, &BACKING.encode_utf16().collect::<Vec<_>>())
+            .unwrap();
+        assert_eq!(volume.read(&cx, &raw, 0, 1024).unwrap(), compressed);
+    }
 }

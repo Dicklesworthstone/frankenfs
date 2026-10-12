@@ -2,13 +2,14 @@
 //! No host-path resolution, symlink following, log replay, mutation or mounting.
 
 pub mod snapshots;
+mod xattrs;
 
 use super::{
     BTreeSet, BlockPointer, Cx, FfsError, MAX_READ_BYTES, Object, ObjectSet, Objects, Result,
     VecDeque, checkpoint, corrupt, parse, unsupported,
 };
 use ffs_ondisk::zfs_dmu::ZapEntry;
-use ffs_ondisk::zfs_zpl::{Kind, Metadata, SA_BYTES, SaRegistry, directory_reference};
+use ffs_ondisk::zfs_zpl::{Attributes, Kind, Metadata, SA_BYTES, SaRegistry, directory_reference};
 
 const MAX_PATH: usize = 65_536;
 const MAX_COMPONENTS: usize = 256;
@@ -140,6 +141,39 @@ impl Zpl {
     }
 
     fn file(&mut self, cx: &Cx, number: u64) -> Result<(Object, Metadata)> {
+        self.file_in_namespace(cx, number, false)
+    }
+
+    fn sa_attributes(&mut self, cx: &Cx, object: &Object) -> Result<Attributes> {
+        let node = &object.node;
+        let spill = if let Some(bp) = node.spill() {
+            if bp.logical_bytes() > SA_BYTES {
+                return Err(unsupported("SA spill exceeds 128 KiB"));
+            }
+            Some(
+                self.objects
+                    .checked(cx, bp, 44, 0, bp.logical_bytes(), object.ceiling)?
+                    .ok_or_else(|| corrupt("SA spill pointer is a hole"))?,
+            )
+        } else {
+            None
+        };
+        self.registry
+            .as_ref()
+            .ok_or_else(|| corrupt("SA file has no dataset registry"))?
+            .decode(
+                node.bonus(),
+                spill.as_ref().map(|block| block.bytes.as_slice()),
+            )
+            .map_err(|error| parse(&error))
+    }
+
+    fn file_in_namespace(
+        &mut self,
+        cx: &Cx,
+        number: u64,
+        private_xattr: bool,
+    ) -> Result<(Object, Metadata)> {
         checkpoint(cx)?;
         if number == 0 {
             return Err(corrupt("meta-dnode is not a ZPL file"));
@@ -156,29 +190,7 @@ impl Zpl {
                 }
                 Metadata::legacy(node.bonus(), node.order()).map_err(|error| parse(&error))?
             }
-            44 => {
-                let spill = if let Some(bp) = node.spill() {
-                    if bp.logical_bytes() > SA_BYTES {
-                        return Err(unsupported("SA spill exceeds 128 KiB"));
-                    }
-                    Some(
-                        self.objects
-                            .checked(cx, bp, 44, 0, bp.logical_bytes(), object.ceiling)?
-                            .ok_or_else(|| corrupt("SA spill pointer is a hole"))?,
-                    )
-                } else {
-                    None
-                };
-                self.registry
-                    .as_ref()
-                    .ok_or_else(|| corrupt("SA file has no dataset registry"))?
-                    .decode(
-                        node.bonus(),
-                        spill.as_ref().map(|block| block.bytes.as_slice()),
-                    )
-                    .and_then(|attrs| attrs.metadata())
-                    .map_err(|error| parse(&error))?
-            }
+            44 => self.sa_attributes(cx, &object)?.metadata().map_err(|error| parse(&error))?,
             _ => return Err(unsupported("unknown ZPL bonus representation")),
         };
         if (metadata.kind == Kind::Directory) != (node.object_type() == 20)
@@ -190,10 +202,17 @@ impl Zpl {
                 "ZPL kind, creation generation or live link count is inconsistent",
             ));
         }
-        // Private xattr objects and reparse/offline providers are not ordinary
-        // file data. Exposing them as plaintext would claim unsupported semantics.
-        if metadata.flags & (1 | (1 << 43) | (1 << 44)) != 0 {
-            return Err(unsupported("private xattr, reparse or offline ZPL object"));
+        if metadata.flags & ((1 << 43) | (1 << 44)) != 0 {
+            return Err(unsupported("reparse or offline ZPL object"));
+        }
+        // Only the checked owner -> xattr directory -> value traversal may
+        // enter the private namespace. Ordinary lookup/stat/read cannot do so.
+        if (metadata.flags & 1 != 0) != private_xattr {
+            return Err(if private_xattr {
+                corrupt("xattr reference targets an ordinary ZPL object")
+            } else {
+                unsupported("private xattr object is not ordinary file content")
+            });
         }
         if metadata.kind == Kind::Directory && number != self.root && metadata.parent == number {
             return Err(corrupt("non-root ZPL directory is self-parented"));

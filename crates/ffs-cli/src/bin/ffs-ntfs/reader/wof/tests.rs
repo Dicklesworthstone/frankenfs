@@ -16,16 +16,16 @@ fn provider(algorithm: u32, flags: Option<u32>) -> NtfsReparsePoint {
 }
 
 #[test]
-fn native_file_provider_versions_identify_xpress_and_preserve_raw_codec_choices() {
+fn native_file_provider_versions_identify_xpress_lzx_and_preserve_raw_codec_choices() {
     for flags in [None, Some(0)] {
-        for (algorithm, expected) in [(0, 4096), (2, 8192), (3, 16_384)] {
+        for (algorithm, expected) in [(0, 4096), (1, 32_768), (2, 8192), (3, 16_384)] {
             let value = FileProvider::parse(&provider(algorithm, flags)).unwrap();
             assert_eq!(value.algorithm, algorithm);
             assert_eq!(value.chunk_bytes().unwrap(), expected);
         }
         // Provider identity is still known when its logical codec is absent.
         // Explicitly selected named DATA remains a stored native value.
-        for algorithm in [1, 4, u32::MAX] {
+        for algorithm in [4, u32::MAX] {
             let value = FileProvider::parse(&provider(algorithm, flags)).unwrap();
             assert_eq!(value.algorithm, algorithm);
             assert!(value.chunk_bytes().is_err());
@@ -141,7 +141,7 @@ fn empty_and_impossible_file_lengths_have_explicit_bounded_behavior() {
     assert!(ChunkLayout::new(8192, 3, 4096).is_err());
     assert!(ChunkLayout::new(8192, 5, 4096).is_err());
     assert!(ChunkLayout::new(8192, 4 + 8193, 4096).is_err());
-    for chunk in [0, 1, 2048, 32768, usize::MAX] {
+    for chunk in [0, 1, 2048, 65_536, usize::MAX] {
         assert!(ChunkLayout::new(1, 1, chunk).is_err());
     }
 }

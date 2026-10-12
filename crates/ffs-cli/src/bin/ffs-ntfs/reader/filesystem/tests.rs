@@ -1249,7 +1249,7 @@ fn wof_image(
 #[test]
 fn wof_numeric_path_and_fsops_reads_share_logical_bytes_and_native_hard_link_identity() {
     let cx = Cx::for_testing();
-    for (algorithm, chunk) in [(0, 4096), (2, 8192), (3, 16_384)] {
+    for (algorithm, chunk) in [(0, 4096), (1, 32_768), (2, 8192), (3, 16_384)] {
         let (bytes, stored, expected) = wof_image(algorithm, chunk, None);
         let reads: Reads = Arc::default();
         let fs = open(bytes, Arc::clone(&reads), None).unwrap();
@@ -1298,7 +1298,8 @@ fn wof_numeric_path_and_fsops_reads_share_logical_bytes_and_native_hard_link_ide
         );
         assert!(
             reads.lock().unwrap().iter().all(|(offset, _)| {
-                *offset < (BASE + 700 * 512) as u64 || *offset >= (BASE + 834 * 512) as u64
+                *offset < (BASE + 700 * 512) as u64
+                    || *offset >= (BASE + (799 + stored.len().div_ceil(512)) * 512) as u64
             }),
             "lookup and readdir do not read WOF payload"
         );
@@ -1313,9 +1314,9 @@ fn wof_numeric_path_and_fsops_reads_share_logical_bytes_and_native_hard_link_ide
             24
         );
         let logical = fs.volume.data_stream(&cx, &native, &[]).unwrap();
-        assert_eq!(fs.volume.read(&cx, &logical, 0, 65_536).unwrap(), expected);
+        assert_eq!(fs.volume.read(&cx, &logical, 0, 100_000).unwrap(), expected);
         assert_eq!(
-            fs.read(&cx, &mut scope, attr.ino, 0, 65_536).unwrap(),
+            fs.read(&cx, &mut scope, attr.ino, 0, 100_000).unwrap(),
             expected
         );
         assert_eq!(
@@ -1341,7 +1342,7 @@ fn wof_numeric_path_and_fsops_reads_share_logical_bytes_and_native_hard_link_ide
 #[test]
 fn unsupported_wof_codec_retains_inspection_and_exact_raw_ads_path_access() {
     let cx = Cx::for_testing();
-    for algorithm in [1, u32::MAX] {
+    for algorithm in [4, u32::MAX] {
         let (bytes, stored, _) = wof_image(algorithm, 4096, None);
         let fs = open(bytes, Arc::default(), None).unwrap();
         let native = fs.volume.resolve(&cx, "/hello.txt").unwrap();

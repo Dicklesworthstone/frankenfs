@@ -366,6 +366,9 @@ fn graph(order: Endian, sa: u8, case: u8, reads: Reads, failure: Option<u64>) ->
         dn[192..320].copy_from_slice(&bp(&leaf, SA_LAYOUTS + 512, 47, 0, 20, order, other));
         table[10 * 512..11 * 512].copy_from_slice(&dn);
     }
+    if case >= 12 {
+        xattrs::augment(&mut table, &mut store, order, sa, case);
+    }
     store(TABLE, &table);
     let mut os = vec![0; 1024];
     let mut meta = node(10, 16_384, 1, 0, &[], 0, other);
@@ -695,3 +698,5 @@ mod mount;
 mod mirror;
 
 mod raidz;
+
+mod xattrs;

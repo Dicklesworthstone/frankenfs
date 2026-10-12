@@ -7,8 +7,9 @@ read-only `FsOps`/FUSE mount, but is not yet an `OpenFs` backend or writable
 filesystem. It traverses native directory
 indexes and resolves paths using the image's own UpCase table. Ordinary native
 LZNT1-compressed nonresident DATA uses the same numeric and path read commands.
-Native WOF file-provider XPRESS 4K/8K/16K contents also use those commands and
-mounted regular-file reads, with explicit named-stream access to stored bytes.
+Native WOF file-provider XPRESS 4K/8K/16K and LZX 32K contents also use those
+commands and mounted regular-file reads, with explicit named-stream access to
+stored bytes.
 Relative native symbolic links can be resolved inside the image or presented
 through the mounted `readlink` operation. Reparse metadata remains inspectable
 for providers whose file contents are not supported. Native security descriptors
@@ -157,11 +158,11 @@ attributes remain refused. Resident attributes carrying nonresident storage
 flags remain refused. MFT data must still be untransformed. WOF uses the
 separate file-provider profile below; it is not ordinary LZNT1 DATA storage.
 
-## WOF individual-file XPRESS compression
+## WOF individual-file compression
 
 Numeric `cat`, path `read`, the DATA catalog and mounted regular-file reads
-support native WOF file-provider XPRESS4K, XPRESS8K and XPRESS16K. WOF supplies
-the contents of the same file; it is not a symbolic-link target. Native MFT
+support native WOF file-provider XPRESS4K, XPRESS8K, XPRESS16K and LZX32K.
+WOF supplies the contents of the same file; it is not a symbolic-link target. Native MFT
 identity, hard links, logical size and sequence remain intact. Mounted allocation
 counts the physical `WofCompressedData` backing, with no separately allocated
 blocks for resident backing.
@@ -169,9 +170,9 @@ blocks for resident backing.
 Admission requires the Microsoft WOF tag `0x80000017`, WOF version 1, file
 provider 2, file-provider version 1, and exactly the 16-byte V0 or 20-byte V1
 provider payload. V1 flags must be zero. Algorithms 0, 2 and 3 select independent
-4,096-, 8,192- and 16,384-byte XPRESS chunks. LZX (algorithm 1), other algorithms,
-WIM-backed files, other versions and nonzero file-provider flags remain outside
-the logical read profile.
+4,096-, 8,192- and 16,384-byte XPRESS chunks; algorithm 1 selects independent
+32,768-byte LZX chunks. Other algorithms, WIM-backed files, other versions and
+nonzero file-provider flags remain outside the logical read profile.
 
 The unnamed native DATA must be an entirely sparse placeholder, or an empty
 resident value for an empty file. Its size and ValidDataLength govern the
@@ -193,20 +194,37 @@ unselected offset pairs. Empty, reversed, oversized or truncated selected ranges
 are errors, not sparse data.
 
 A stored chunk whose length equals its exact logical length is raw, even if its
-bytes resemble a compression header. A shorter chunk is XPRESS Huffman/LZ77.
-The final partial chunk uses the exact remaining logical length. Its complete
-compressed chunk is decoded before any requested portion is returned, so an
-invalid later match cannot make a prefix read succeed. Canonical code tables,
-refills, sideband length extensions, back-reference distances and output limits
-are checked. Chunks cannot refer to a preceding chunk's dictionary. The decoder
-uses a bounded 64 KiB Huffman lookup table and buffers bounded by one stored and
-one decoded chunk; the ordinary 16 MiB maximum request buffer remains separate.
+bytes resemble a compression header. A shorter chunk uses the provider's
+XPRESS or LZX codec. The final partial chunk uses the exact remaining logical
+length. Its complete compressed chunk is decoded before any requested portion
+is returned, so an invalid later match cannot make a prefix read succeed.
+Canonical code tables, refills, length extensions, back-reference distances and
+output limits are checked. Chunks cannot refer to a preceding chunk's dictionary.
+XPRESS uses a bounded 64 KiB Huffman lookup table; LZX uses canonical ranges
+proportional to its fixed alphabets. Both stage at most one stored and one
+decoded chunk; the ordinary 16 MiB maximum request buffer remains separate.
+
+LZX implements the native 32 KiB WIM/System Compression byte grammar: compact
+block headers, verbatim and aligned Huffman blocks, uncompressed blocks,
+delta-coded code lengths, overlapping matches and the native three recent-offset
+slots. Lengths and dictionary bytes persist across blocks inside one chunk,
+with no cross-chunk state. Oversubscribed or incomplete nonempty code trees,
+out-of-alphabet length runs, invalid raw-block alignment, unavailable match
+history and block/output overruns are errors.
+
+The native x86 E8 transform is reversed after decoding the complete LZX chunk,
+using chunk-relative positions and the fixed 12,000,000-byte reference size.
+The final ten bytes retain the native exclusion rule. Outer WOF chunks stored
+at their exact logical size bypass both decoding and E8 transformation.
+CAB framing, larger LZX windows and LZX DELTA are outside this codec profile.
+Supporting the file provider's LZX byte grammar does not implement the separate
+WIM backing-store provider.
 
 Explicit named-stream selection returns that stream's stored native bytes:
 `--stream WofCompressedData` extracts the original table and compressed/raw
 payload, without applying the unnamed file's codec. For a recognized version-1,
 zero-flag file provider, raw named streams remain available even when its
-logical algorithm is LZX or unknown. Other provider identities or flags still
+logical algorithm is unknown. Other provider identities or flags still
 require an implementation, and file-level or per-stream EFS refusal remains
 in force. This exception does not expose a cloud or WIM placeholder as file
 contents. Stream selection remains exact UTF-16, including the case of the
@@ -228,6 +246,11 @@ Native format references:
   [FILE_PROVIDER_EXTERNAL_INFO_V0](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_provider_external_info_v0)
   and [V1](https://learn.microsoft.com/en-us/windows-hardware/drivers/ddi/ntifs/ns-ntifs-_file_provider_external_info_v1)
   define the provider identity and algorithm fields.
+- Microsoft's [WOF_FILE_COMPRESSION_INFO_V1](https://learn.microsoft.com/en-us/windows/win32/api/wofapi/ns-wofapi-wof_file_compression_info_v1)
+  defines the 32 KiB LZX chunk size. Microsoft
+  [go-winio v0.6.2 LZX](https://github.com/microsoft/go-winio/blob/v0.6.2/wim/lzx/lzx.go)
+  and Linux v6.17 [lzx_decompress.c](https://github.com/torvalds/linux/blob/v6.17/fs/ntfs3/lib/lzx_decompress.c)
+  provide the native framing, repeat-offset, raw-block alignment and E8 rules.
 - Microsoft's MS-XCA [XPRESS Huffman decoding](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-xca/26db8e62-bbd8-472c-a09e-623f6de10f0b)
   and [published examples](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-xca/f59ff967-3032-4331-b108-0d2b4c09ee27)
   define the byte grammar and provide the literal/overlapping-match golden vectors.
@@ -338,7 +361,7 @@ recognized file-provider exception described above. On regular files,
 EFS-marked STANDARD_INFORMATION is refused before data I/O even when DATA appears
 unencrypted. A directory's ENCRYPTED flag describes the default for new children,
 not encrypted directory indexes. Ordinary native LZNT1 remains a separate storage
-form; WIM, LZX, cloud and other unsupported provider contents remain refused.
+form; WIM, cloud and other unsupported provider contents remain refused.
 
 The mounted view returns supported relative link targets to the host kernel
 using ordinary symlink semantics, including `..`. A host process can therefore
@@ -359,7 +382,7 @@ directory cycles and inconsistent native parents are errors, not alternate roots
 The adapter provides lookup, getattr, paginated readdir, regular-file reads,
 relative-link readlink, read-only open admission, statfs and non-writing
 synchronization. Unnamed DATA
-uses the same resident, fragmented, sparse, LZNT1, WOF XPRESS and extension-aware
+uses the same resident, fragmented, sparse, LZNT1, WOF XPRESS/LZX and extension-aware
 reader as CLI extraction. Named streams remain available through CLI `--stream`, not an
 invented mounted `file:stream` namespace. SEEK_DATA/SEEK_HOLE use the conservative
 projection of data before EOF and a hole at EOF, including compressed files.
@@ -478,7 +501,7 @@ JSON descriptor output begins.
 Security metadata remains inspectable for files whose DATA requires an
 unsupported provider. This command does not read that file's DATA, bypass
 the DATA provider boundary or add support for otherwise unavailable provider
-contents. EFS, WIM, LZX and cloud-provider DATA remain outside the read profile.
+contents. EFS, WIM and cloud-provider DATA remain outside the read profile.
 All normal offline-image, shared-lock and immutable-image requirements apply.
 
 Native format references:
@@ -772,3 +795,55 @@ decoder-only stage; the later combined on-disk run with RAIDZ additions passed
 workspace formatting reports existing differences in unchanged files. UBS could
 not execute its installed launcher. These limitations do not turn the nineteen
 unexecuted provider/reader/FsOps regressions into passing or native-image evidence.
+
+## WOF LZX validation status
+
+The LZX increment adds seven decoder regressions in
+`crates/ffs-ondisk/src/lzx/tests.rs`: full 32 KiB overlapping matches and
+independent chunk histories; persistent main/length code deltas and native R2
+swaps; aligned versus verbatim distance suffixes; signed E8 transforms and
+chunk-relative positions across blocks; raw-block alignment and offsets; and
+malformed trees, runs, truncations and output bounds. The 80-byte repeated-A
+fixture is constructed from the native grammar, with explicit pretree zero runs
+and exact expected output; it is not presented as a Windows-encoder capture.
+
+Three native-image regressions in
+`crates/ffs-cli/src/bin/ffs-ntfs/reader/tests/wof.rs` cover fragmented LZX
+backing, compressed/raw/final-partial chunk boundaries, raw ADS extraction,
+metadata-only cataloging, ValidDataLength zero tails, table/payload/later-extent
+cancellation, and complete-chunk rejection before even a one-byte read.
+The shared numeric/path/FsOps hard-link and allocation test now includes LZX32K.
+The raw middle chunk deliberately contains both a valid-looking compressed
+header and an E8 operand that must remain unchanged.
+
+Two independent upstream specimens are also checked into
+`crates/ffs-ondisk/src/lzx/fixtures/`, with source attribution, input/output
+SHA-256 values and their original LGPL license notices. The executable Rust
+test uses the existing SHA-256 dependency to compare both complete outputs
+against digests of upstream uncompressed arrays. It also rejects truncated
+inputs and mismatched logical lengths; no new dependency is required.
+
+An interim arithmetic audit executed a temporary JavaScript transcription of
+the decoder against both independent LZX specimen pairs in
+[libfwnt's tests](https://github.com/libyal/libfwnt/blob/1178a070894abfbf0860b6b52842c89993ca0223/tests/fwnt_test_lzx.c)
+(source blob `ae5dce65cf4e3d16fc11b459b131048afab7fd4d`).
+The 7,520-byte verbatim specimen reconstructed all 28,672 expected bytes, and
+the 8,054-byte aligned specimen reconstructed all 10,752 expected bytes.
+Together they exercised all three pretree run forms, all recent-offset slots
+and 113 E8 translations, with no byte differences. This is evidence for the
+arithmetic and native variant, not execution of the Rust implementation.
+
+The new Rust regressions have not been executed in this session: the executor
+disconnected during dependency compilation. The earlier XPRESS validation
+results above do not establish LZX test passage. The required focused checks
+when the executor is available are:
+
+```sh
+rch exec -- cargo test -p ffs-ondisk lzx::
+rch exec -- cargo test -p ffs-cli --bin ffs-ntfs wof
+rch exec -- cargo clippy -p ffs-ondisk -p ffs-cli --all-targets -- -D warnings
+cargo fmt --all -- --check
+```
+
+No native Windows-generated WOF image, kernel mount, mutation or recovery claim
+is made by this increment. The backing image must remain offline and immutable.

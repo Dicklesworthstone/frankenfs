@@ -12,6 +12,7 @@ pub mod crc_incremental;
 pub mod ext4;
 pub mod fat;
 pub mod lznt1;
+pub mod lzx;
 pub mod ntfs;
 pub mod ntfs_security;
 pub mod xpress;

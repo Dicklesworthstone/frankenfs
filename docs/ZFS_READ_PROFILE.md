@@ -36,6 +36,12 @@ ffs-zfs read leaf.img /file.bin --dataset data --start 507 --bytes 8199 \
   --offline-image --pool-guid 123 --label 0 --slot 2 > file-range.bin
 ffs-zfs readlink leaf.img /link --dataset data --offline-image --pool-guid 123 --label 0 --slot 2
 
+# User xattrs share the selected dataset/snapshot and all explicit member options.
+ffs-zfs listxattr leaf.img /file.bin --dataset data --snapshot before \
+  --offline-image --pool-guid 123 --label 0 --slot 2
+ffs-zfs getxattr leaf.img /file.bin user.comment --dataset data --snapshot before \
+  --offline-image --pool-guid 123 --label 0 --slot 2 > comment.bin
+
 # Mountpoints must already exist and be empty. UID/GID are synthetic host IDs.
 ffs-zfs mount leaf.img /mnt/zfs-head --dataset data --uid 1000 --gid 1000 \
   --offline-image --pool-guid 123 --label 0 --slot 2
@@ -360,7 +366,7 @@ The entire admitted map is validated before it is returned to CLI or DSL code.
 
 ## ZPL paths and system attributes
 
-`ls`, `stat`, `read` and `readlink` select a head through the validated DSL
+`ls`, `stat`, `read`, `readlink`, `listxattr` and `getxattr` select a head through the validated DSL
 inventory. The selected filesystem gets its own object-set root and block cache,
 separate from the MOS and other datasets. Its master node supplies ROOT, VERSION
 and naming policies. Case-sensitive, unnormalized ZPL versions 1..5 are admitted;
@@ -390,8 +396,9 @@ File reads use ZPL_SIZE for EOF. Allocation slack is never returned; sparse
 subtrees and the logical tail beyond the last allocated block return zeroes
 without fabricated physical reads. Existing DMU transforms apply to allocated
 blocks. Legacy inline/long symlinks and SA symlink attributes are read separately
-from regular-file content. Reparse/offline providers and private xattr objects
-remain refused. Metadata reports native mode, IDs, link count, creation
+from regular-file content. Reparse/offline providers remain refused. Private
+xattr objects are accessible only through the owner-checked xattr traversal
+below, never through ordinary lookup/stat/read. Metadata reports native mode, IDs, link count, creation
 generation, allocation accounting and four timestamps, including signed seconds
 and nanosecond precision. This is offline extraction, not host SID/FUID/ACL
 mapping or permission enforcement, and no mode/owner mutation is offered.
@@ -404,6 +411,44 @@ per bonus/spill buffer. These are admission budgets, not format maxima or a
 whole-process memory limit. Reads describe the selected committed root only:
 there is no ZIL replay, recovery validation or claim that pending synchronous
 intent has been incorporated into that root.
+
+## Native user extended attributes
+
+The same selected head or named snapshot now serves `listxattr` and `getxattr`
+through the CLI and extraction mount. Directory storage follows the owner's
+native `ZPL_XATTR` reference, checks the private directory's kind and owner,
+then checks each private regular value file's type, flags, generation and parent.
+Directory references retain the native low-48-bit object/type encoding. Value
+bytes use the existing checked DMU reader, including sparse zeroes, compression,
+historical birth ceilings, checksums, explicit redundant members and cancellation.
+
+SA storage reads dataset-registered `ZPL_DXATTR` from bonus and checked spill
+buffers. Its value must be exactly one XDR nvlist of native byte-array pairs.
+Byte arrays use opaque bytes and four-byte padding, without the extra count
+used by numeric arrays. Wrong value types, duplicate packed names, truncated
+spans, nonzero XDR padding and trailing bytes fail. Labels retain their separate
+allocation-padding rule.
+
+Only user names are exposed. Native lookup priority is prefixed SA, prefixed
+directory, unprefixed compatibility SA, then unprefixed compatibility directory.
+An exact name present in both stores is valid and SA takes priority. Listing
+returns sorted, unique host names; compatibility aliases are deduplicated.
+`security.`, `system.`, `trusted.` and `freebsd:` attributes are not projected.
+A reserved namespace inside a requested `user.` suffix is rejected, so a user
+alias cannot retrieve a privileged native name.
+
+Both catalogs are admitted before any successful list/get result. Names must
+fit the lossless UTF-8 host interface and its 255-byte limit, including an added
+compatibility prefix. There are at most 4,096 native names across both stores
+and 64 KiB of returned names including terminators. A get returns at most
+64 KiB, preserves binary and empty values, and distinguishes an empty value
+from absence. Larger directory values can be listed but cannot be extracted by
+this interface. CLI get stages the complete value before writing stdout; a bad
+selected value never falls back to another spelling or the live head.
+
+These are extraction semantics with the mount's existing synthetic ownership.
+Native ACL/FUID enforcement, privileged namespace projection and xattr mutation
+remain outside this profile.
 
 ## Read-only extraction mounts
 
@@ -434,8 +479,9 @@ offered. Writable opens and filesystem mutations return read-only errors.
 the image. Native symlink targets are returned to the host kernel, which applies
 normal mounted symlink semantics; this extraction mount is not a path sandbox.
 
-Special files, xattrs/ACL access and pool free-space reporting (`statfs`) are
-explicitly unsupported. A reached directory containing a special file fails
+User xattr list/get use the shared native storage traversal above. Special
+files, native ACL/privileged xattr projection and pool free-space reporting
+(`statfs`) remain explicitly unsupported. A reached directory containing a special file fails
 rather than fabricating a device number or successful partial listing.
 `SEEK_DATA`/`SEEK_HOLE` use the permitted conservative projection of file data
 through EOF; they do not claim an exact physical-allocation map. At most 131,072
@@ -768,3 +814,32 @@ option spellings in a single ordered member set. A fresh
 with SIGKILL, before checking the integration code. Workspace formatting reports
 pre-existing differences in 13 unchanged files. UBS could not execute its
 installed launcher. The new engine and CLI tests remain source-reviewed only.
+
+## Native user xattr validation
+
+Eleven authored regression functions cover native XDR byte-array goldens,
+zero/large binary values, strict packed-value bounds, arbitrary SA registration
+IDs and independent bonus/spill byte orders. Constructed MOS/DSL/ZPL graphs
+exercise directory and SA/bonus/spill storage in both byte orders, native name
+precedence, hard links, private-object and parent validation, UTF-8/name budgets,
+64 KiB value bounds, corruption and cancellation. A corrupt prefixed directory
+value has a valid raw SA alternative and must still return an error. Historical
+snapshot graphs reuse native object numbers while retaining distinct attribute
+bytes through both direct ZPL and FsOps reads. Existing missing-xattr mount
+assertions now require an empty list and absent value; privileged names still
+require refusal.
+
+Authoring evidence (2026-10-12): complete source and native semantics received
+independent review. The shared executor disconnected while Cargo was compiling
+dependencies, before any FrankenFS crate or new regression ran. These eleven
+tests, final-tree compilation, rustfmt/Clippy, kernel FUSE and native pool
+comparisons are unexecuted; the earlier parser-suite results above do not cover
+this increment.
+
+Native contracts: OpenZFS `zfs-2.3.0`
+[zpl_xattr.c](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/os/linux/zfs/zpl_xattr.c),
+[zfs_sa.c](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/zfs/zfs_sa.c),
+[zfs_sa.h](https://github.com/openzfs/zfs/blob/zfs-2.3.0/include/sys/zfs_sa.h),
+[zfs_dir.c](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/os/linux/zfs/zfs_dir.c),
+[nvpair.c](https://github.com/openzfs/zfs/blob/zfs-2.3.0/module/nvpair/nvpair.c)
+and [namespace prefixes](https://github.com/openzfs/zfs/blob/zfs-2.3.0/include/sys/fs/zfs.h).

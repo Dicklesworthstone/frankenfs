@@ -1,4 +1,4 @@
-//! WOF individual-file provider: bounded, independent XPRESS chunks.
+//! WOF individual-file provider: bounded, independent XPRESS and LZX chunks.
 //!
 //! Native layout sources: Microsoft WOF_EXTERNAL_INFO / FILE_PROVIDER_EXTERNAL_INFO,
 //! and Linux v6.17 fs/ntfs3/frecord.c plus ntfs-3g-system-compression v1.0
@@ -10,7 +10,7 @@ use super::{
     Cx, DATA, NtfsGeometry, NtfsReparseData, NtfsReparsePoint, NtfsVolume, Result, SPARSE, Source,
     Storage, Stream, checkpoint, corrupt, parse, unsupported,
 };
-use ffs_ondisk::xpress::decompress_chunk;
+use ffs_ondisk::{lzx, xpress};
 
 pub(super) const TAG: u32 = 0x8000_0017;
 const BACKING_NAME: &[u16] = &[
@@ -57,11 +57,9 @@ impl FileProvider {
     fn chunk_bytes(self) -> Result<usize> {
         match self.algorithm {
             0 => Ok(4096),
+            1 => Ok(lzx::MAX_OUTPUT_BYTES),
             2 => Ok(8192),
             3 => Ok(16_384),
-            1 => Err(unsupported(
-                "WOF LZX file compression is not implemented; select a named stream for raw bytes",
-            )),
             other => Err(unsupported(format!(
                 "WOF file compression algorithm {other} is unsupported; select a named stream for raw bytes",
             ))),
@@ -143,7 +141,7 @@ pub(super) struct WofStorage {
 }
 
 /// The offset table stays on the image. At most two adjacent entries and one
-/// 16 KiB chunk are staged, even when the logical file requires 64-bit offsets.
+/// 32 KiB chunk are staged, even when the logical file requires 64-bit offsets.
 #[derive(Debug)]
 struct ChunkLayout {
     logical_bytes: u64,
@@ -156,7 +154,7 @@ struct ChunkLayout {
 
 impl ChunkLayout {
     fn new(logical_bytes: u64, stored_bytes: u64, chunk_bytes: usize) -> Result<Self> {
-        if !matches!(chunk_bytes, 4096 | 8192 | 16_384) {
+        if !matches!(chunk_bytes, 4096 | 8192 | 16_384 | 32_768) {
             return Err(unsupported("unsupported WOF chunk size"));
         }
         let chunks = logical_bytes.div_ceil(chunk_bytes as u64);
@@ -285,7 +283,12 @@ impl WofStorage {
                     return Err(corrupt(payload_offset, "short WOF compressed chunk read"));
                 }
                 checkpoint(cx)?;
-                let decoded = decompress_chunk(&packed, expected).map_err(|error| parse(&error))?;
+                let decoded = if self.layout.chunk_bytes == lzx::MAX_OUTPUT_BYTES {
+                    lzx::decompress_chunk(&packed, expected)
+                } else {
+                    xpress::decompress_chunk(&packed, expected)
+                }
+                .map_err(|error| parse(&error))?;
                 checkpoint(cx)?;
                 destination.copy_from_slice(&decoded[within..within + length]);
             }
