@@ -328,9 +328,14 @@ fn main() -> Result<()> {
     let cx = Cx::for_request();
     match cli.command {
         Command::Format { options } => {
-            let report = formatter::create(&cx, &options)?;
-            serde_json::to_writer_pretty(io::stdout().lock(), &report)?;
-            println!();
+            let report = formatter::run(&cx, &options)?;
+            let mut output = io::stdout().lock();
+            serde_json::to_writer_pretty(&mut output, &report).context(
+                "FAT image initialized, synchronized and verified; writing the success report failed",
+            )?;
+            writeln!(output).context(
+                "FAT image initialized, synchronized and verified; finishing the success report failed",
+            )?;
         }
         Command::Inspect { image } => {
             let volume = image.open(&cx)?;

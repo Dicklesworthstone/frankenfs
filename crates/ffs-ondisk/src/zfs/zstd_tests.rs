@@ -420,3 +420,53 @@ fn zstd_embedded_blocks_decode_native_headers_independently_of_both_orders() {
     let bp = embedded_pointer(&packed, 1024 * 1024, Endian::Big, Endian::Little);
     assert_eq!(bp.decode(&[]).unwrap(), vec![0; 1024 * 1024]);
 }
+
+#[test]
+fn zstd_explicit_u64_content_sizes_do_not_alias_library_status_sentinels() {
+    for (dictionary_flag, dictionary_width) in [(0_u8, 0), (1, 1), (2, 2), (3, 4)] {
+        for single_segment in [false, true] {
+            for advertised in [
+                LOGICAL as u64,
+                MAX_BLOCK_BYTES as u64 + 1,
+                1_u64 << 40,
+                u64::MAX - 1,
+                u64::MAX,
+            ] {
+                let descriptor = 0xc0 | dictionary_flag | if single_segment { 0x20 } else { 0 };
+                let mut payload = vec![descriptor];
+                if !single_segment {
+                    payload.push(MIXED[1]);
+                }
+                // A zero dictionary ID is equivalent to an omitted ID. Its
+                // encoded width must still be skipped before reading the FCS.
+                payload.resize(payload.len() + dictionary_width, 0);
+                payload.extend_from_slice(&advertised.to_le_bytes());
+                payload.extend_from_slice(&MIXED[2..]);
+                let result = decompress(&native(&payload, META), 16, LOGICAL);
+                if advertised == LOGICAL as u64 {
+                    assert_eq!(result.unwrap(), expected());
+                } else if single_segment {
+                    assert!(matches!(
+                        result,
+                        Err(ParseError::InvalidField {
+                            field: "zfs",
+                            reason: "Zstandard window exceeds read budget",
+                        })
+                    ));
+                } else {
+                    // An explicitly stored UINT64_MAX is not an absent FCS,
+                    // even though the native helper uses that value for
+                    // ZSTD_CONTENTSIZE_UNKNOWN. The small window cannot make
+                    // a huge declared content size agree with this LSIZE.
+                    assert!(matches!(
+                        result,
+                        Err(ParseError::InvalidField {
+                            field: "zfs",
+                            reason: "Zstandard content size disagrees with logical length",
+                        })
+                    ));
+                }
+            }
+        }
+    }
+}

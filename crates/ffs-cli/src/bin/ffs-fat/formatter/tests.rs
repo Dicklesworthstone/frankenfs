@@ -1,3 +1,6 @@
+mod native_layout;
+mod publication;
+
 use super::*;
 use crate::{Cli, Command};
 use clap::Parser;
@@ -12,6 +15,7 @@ fn options(path: PathBuf, kind: FormatKind) -> FormatArgs {
             FormatKind::Fat16 => 4,
             FormatKind::Fat32 => 33,
         },
+        sectors_per_cluster: None,
         label: Some("frank data".into()),
         serial: Some(0x1234_ABCD),
     }
@@ -135,6 +139,7 @@ fn geometry_matches_independent_native_sector_counts_and_boundary_choices() {
             image: PathBuf::from("not-created.img"),
             kind,
             size_mib: mib,
+            sectors_per_cluster: None,
             label: None,
             serial: Some(0),
         };
@@ -193,6 +198,8 @@ fn new_images_have_native_mirrors_roots_hints_labels_and_clean_readback() {
         assert_eq!(report["created_new_image"], true);
         assert_eq!(report["label"], "FRANK DATA");
         assert_eq!(report["serial"], 0x1234_ABCD_u32);
+        assert_eq!(report["durability"], "file_and_parent_synced");
+        assert_eq!(report["verification"]["complete"], true);
         assert_eq!(report["verification"]["read_only"], true);
         assert_eq!(report["verification"]["clean"], true);
         assert_eq!(report["verification"]["files"], 0);
@@ -231,6 +238,10 @@ fn new_images_have_native_mirrors_roots_hints_labels_and_clean_readback() {
                 assert_eq!(short(&boot, 50), 6);
                 assert_eq!(&boot[82..90], b"FAT32   ");
                 assert_eq!(boot, read_sector(&file, 6));
+                let extension = read_sector(&file, 2);
+                assert_eq!(extension, read_sector(&file, 8));
+                assert_eq!(&extension[..510], &[0; 510]);
+                assert_eq!(&extension[510..], &[0x55, 0xAA]);
                 let info = read_sector(&file, 1);
                 assert_eq!(info, read_sector(&file, 7));
                 assert_eq!(long(&info, 0), 0x4161_5252);
@@ -430,6 +441,7 @@ enum Event {
     Resize(u64),
     Write(u64),
     Flush,
+    ParentSync,
 }
 
 struct FaultTarget {
@@ -484,8 +496,10 @@ fn every_initialization_io_failure_is_reported_and_keeps_the_new_file() {
     for kind in [FormatKind::Fat16, FormatKind::Fat32] {
         let args = options(directory.path().join("unused.img"), kind);
         let plan = FormatPlan::prepare(&args).unwrap();
-        let primary_call = plan.before_boot.len() + 2;
-        let operations = plan.before_boot.len() + 4;
+        let publications = plan.publication_sectors().count();
+        let first_publication = plan.before_boot.len() + 2;
+        let primary_call = plan.before_boot.len() + publications + 1;
+        let operations = plan.before_boot.len() + publications + 4;
         for fail_at in 0..operations {
             let path = directory
                 .path()
@@ -499,8 +513,20 @@ fn every_initialization_io_failure_is_reported_and_keeps_the_new_file() {
                 cancel_at: None,
                 cx: cx.clone(),
             };
-            let error = initialize(&cx, &target, &plan).unwrap_err();
-            assert!(error.to_string().contains("injected creation I/O failure"));
+            let error =
+                initialize(&cx, &target, &plan, || target.event(Event::ParentSync)).unwrap_err();
+            let evidence = format!("{error:#}");
+            assert!(evidence.contains("injected creation I/O failure"));
+            if fail_at < first_publication {
+                assert!(evidence.contains("incomplete before boot publication"));
+            } else if fail_at < operations - 1 {
+                assert!(evidence.contains("boot publication started"));
+                assert!(evidence.contains("file durability is uncertain"));
+            } else {
+                assert!(evidence.contains("initialized and file-synchronized"));
+                assert!(evidence.contains("parent-directory synchronization failed"));
+                assert!(evidence.contains("directory durability is uncertain"));
+            }
             assert!(path.is_file());
             assert_eq!(target.calls.get(), fail_at + 1);
             if fail_at == 0 {
@@ -516,6 +542,14 @@ fn every_initialization_io_failure_is_reported_and_keeps_the_new_file() {
                 } else {
                     assert_eq!(boot, plan.boot);
                 }
+                if kind == FormatKind::Fat32 {
+                    let backup = read_sector(&target.file, 6);
+                    if fail_at <= first_publication {
+                        assert_eq!(&backup[510..], &[0, 0]);
+                    } else {
+                        assert_eq!(backup, plan.boot);
+                    }
+                }
             }
         }
     }
@@ -527,7 +561,9 @@ fn initialization_is_bounded_orders_flush_before_boot_and_observes_mid_io_cancel
     for kind in [FormatKind::Fat16, FormatKind::Fat32] {
         let args = options(directory.path().join("unused.img"), kind);
         let plan = FormatPlan::prepare(&args).unwrap();
-        let operations = plan.before_boot.len() + 4;
+        let publications = plan.publication_sectors().count();
+        let first_publication = plan.before_boot.len() + 2;
+        let operations = plan.before_boot.len() + publications + 4;
         for cancel_at in 0..=operations {
             let path = directory
                 .path()
@@ -541,24 +577,49 @@ fn initialization_is_bounded_orders_flush_before_boot_and_observes_mid_io_cancel
                 cancel_at: (cancel_at < operations).then_some(cancel_at),
                 cx: cx.clone(),
             };
-            let result = initialize(&cx, &target, &plan);
+            let result = initialize(&cx, &target, &plan, || target.event(Event::ParentSync));
             assert!(path.is_file());
-            if cancel_at < operations {
+            if cancel_at < first_publication {
+                let error = result.unwrap_err();
                 assert!(matches!(
-                    result.unwrap_err().downcast_ref::<FfsError>(),
+                    error.downcast_ref::<FfsError>(),
                     Some(FfsError::Cancelled)
                 ));
+                assert!(
+                    error
+                        .to_string()
+                        .contains("incomplete before boot publication")
+                );
                 assert_eq!(target.calls.get(), cancel_at + 1);
+                assert_eq!(&read_sector(&target.file, 0)[510..], &[0, 0]);
+                if kind == FormatKind::Fat32 {
+                    assert_eq!(&read_sector(&target.file, 6)[510..], &[0, 0]);
+                }
             } else {
                 result.unwrap();
+                assert_eq!(target.calls.get(), operations);
                 let events = target.events.borrow();
                 assert_eq!(events[0], Event::Resize(plan.layout.image_bytes()));
-                assert_eq!(
-                    &events[events.len() - 3..],
-                    &[Event::Flush, Event::Write(0), Event::Flush]
-                );
-                assert!(events.len() <= 10);
-                assert!(verify_created(&cx, &target.file, &plan).is_ok());
+                let mut suffix = vec![Event::Flush];
+                if kind == FormatKind::Fat32 {
+                    suffix.push(Event::Write(6 * 512));
+                }
+                suffix.extend([Event::Write(0), Event::Flush, Event::ParentSync]);
+                assert_eq!(&events[events.len() - suffix.len()..], &suffix);
+                assert!(events.len() <= 13);
+                if cancel_at < operations {
+                    // A pending request after publication cannot interrupt
+                    // synchronization, but must stop the subsequent scan.
+                    assert!(matches!(
+                        verify_created(&cx, &target.file, &plan)
+                            .unwrap_err()
+                            .downcast_ref::<FfsError>(),
+                        Some(FfsError::Cancelled)
+                    ));
+                    assert!(verify_created(&Cx::for_testing(), &target.file, &plan).is_ok());
+                } else {
+                    assert!(verify_created(&cx, &target.file, &plan).is_ok());
+                }
             }
         }
     }
@@ -576,7 +637,7 @@ fn readback_checks_backup_hints_labels_lengths_and_unplanned_fat_entries() {
             let plan = FormatPlan::prepare(&args).unwrap();
             let cx = Cx::for_testing();
             let file = new_file(&path);
-            initialize(&cx, &file, &plan).unwrap();
+            initialize(&cx, &file, &plan, || Ok(())).unwrap();
             match scenario {
                 0 => file.set_len(plan.layout.image_bytes() - 1).unwrap(),
                 1 => file
@@ -626,7 +687,7 @@ fn verification_device_is_read_only_bounded_and_cancel_aware() {
     let cx = Cx::for_testing();
     let file = new_file(&path);
     file.try_lock().unwrap();
-    initialize(&cx, &file, &plan).unwrap();
+    initialize(&cx, &file, &plan, || Ok(())).unwrap();
     let device = CreatedImage {
         file: file.try_clone().unwrap(),
         length: plan.layout.image_bytes(),

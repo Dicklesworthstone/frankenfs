@@ -2,8 +2,8 @@
 //! No SID mapping, access decision, descriptor repair or backing mutation.
 
 use super::{
-    Cx, DATA, NtfsFileRecord, NtfsGeometry, NtfsValue, NtfsVolume, Result, Storage, Stream,
-    checkpoint, corrupt, data_read_admission, parse, standard_flags, unsupported,
+    Cx, DATA, NtfsFileRecord, NtfsGeometry, NtfsReference, NtfsValue, NtfsVolume, Result, Storage,
+    Stream, checkpoint, corrupt, data_read_admission, parse, standard_flags, unsupported,
 };
 use ffs_ondisk::ntfs_security::{
     MAX_SECURITY_DESCRIPTOR_BYTES, NtfsSecurityDescriptor, NtfsSecurityHeader,
@@ -21,6 +21,12 @@ const MAX_INDEX_BYTES: u64 = 64 * 1024 * 1024;
 pub struct SecurityDescriptorInfo {
     pub source: &'static str,
     pub security_id: Option<u32>,
+    /// Exact extended STANDARD_INFORMATION field, including explicit zero.
+    /// None denotes the legacy 48-byte form without that native field.
+    pub standard_security_id: Option<u32>,
+    pub legacy_attribute_present: bool,
+    /// Native $Secure record identity and generation when the shared path wins.
+    pub secure_reference: Option<NtfsReference>,
     pub hash: Option<u32>,
     pub sds_offset: Option<u64>,
     /// The descriptor alone, without the SDS header or allocation padding.
@@ -48,17 +54,18 @@ impl NtfsVolume {
         }
         let standard = catalog.select(&self.geometry, 0x10, &[])?;
         let value = self.read(cx, &standard, 0, 72)?;
-        let security_id = if value.len() == 72 {
-            u32::from_le_bytes(
+        let standard_security_id = if value.len() == 72 {
+            Some(u32::from_le_bytes(
                 value[52..56]
                     .try_into()
                     .map_err(|_| corrupt(0, "short NTFS security ID"))?,
-            )
+            ))
         } else {
-            0
+            None
         };
-        if security_id != 0 {
-            return self.shared_security_descriptor(cx, security_id);
+        let legacy_attribute_present = attributes.iter().any(|attribute| attribute.kind == 0x50);
+        if let Some(security_id) = standard_security_id.filter(|id| *id != 0) {
+            return self.shared_security_descriptor(cx, security_id, legacy_attribute_present);
         }
 
         // NTFS permits the legacy attribute on upgraded/repaired files,
@@ -84,6 +91,9 @@ impl NtfsVolume {
         Ok(SecurityDescriptorInfo {
             source: "security_descriptor_attribute",
             security_id: None,
+            standard_security_id,
+            legacy_attribute_present,
+            secure_reference: None,
             hash: None,
             sds_offset: None,
             bytes,
@@ -95,6 +105,7 @@ impl NtfsVolume {
         &self,
         cx: &Cx,
         security_id: u32,
+        legacy_attribute_present: bool,
     ) -> Result<SecurityDescriptorInfo> {
         let secure = self.record(cx, 9, None)?;
         if secure.is_directory() {
@@ -146,6 +157,12 @@ impl NtfsVolume {
             {
                 return Err(unsupported(
                     "$SII allocation or bitmap exceeds the read profile",
+                ));
+            }
+            if bitmap.size * 8 < allocation.size / u64::from(root.block_bytes) {
+                return Err(corrupt(
+                    0,
+                    "$SII bitmap does not cover its allocation blocks",
                 ));
             }
             metadata_range(&self.geometry, &allocation, 0, allocation.size)?;
@@ -205,6 +222,12 @@ impl NtfsVolume {
         Ok(SecurityDescriptorInfo {
             source: "secure_sds",
             security_id: Some(security_id),
+            standard_security_id: Some(security_id),
+            legacy_attribute_present,
+            secure_reference: Some(NtfsReference {
+                record: 9,
+                sequence: secure.sequence,
+            }),
             hash: Some(header.hash),
             sds_offset: Some(header.offset),
             bytes,

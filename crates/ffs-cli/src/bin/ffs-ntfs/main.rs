@@ -155,16 +155,50 @@ fn json(value: &serde_json::Value) -> Result<()> {
 fn security_json(info: &reader::security::SecurityDescriptorInfo) -> serde_json::Value {
     let descriptor = &info.descriptor;
     let acl = |value: &ffs_ondisk::ntfs_security::NtfsAcl| {
+        let state = if !value.present {
+            "absent"
+        } else if value.offset == 0 {
+            "null"
+        } else {
+            "present"
+        };
+        let aces: Vec<_> = value
+            .aces
+            .iter()
+            .map(|ace| {
+                serde_json::json!({
+                    "kind": ace.kind,
+                    "flags": ace.flags,
+                    "size": ace.size,
+                    "layout": if ace.sid.is_some() { "sid" } else { "opaque" },
+                    "mask": ace.mask,
+                    "sid": ace.sid.as_ref().map(ToString::to_string),
+                    "object_flags": ace.object_flags,
+                    "object_type_bytes": ace.object_type,
+                    "inherited_object_type_bytes": ace.inherited_object_type,
+                    "opaque_bytes": ace.opaque,
+                })
+            })
+            .collect();
         serde_json::json!({
             "present": value.present,
             "offset": value.offset,
             "revision": value.revision,
             "ace_count": value.ace_count,
+            "state": state,
+            "size": value.size,
+            "aces": aces,
+            "unused_bytes": value.padding,
         })
     };
     serde_json::json!({
         "source": info.source,
         "security_id": info.security_id,
+        "standard_security_id": info.standard_security_id,
+        "legacy_attribute_present": info.legacy_attribute_present,
+        "secure_reference": info.secure_reference.as_ref().map(|reference| {
+            serde_json::json!({"record": reference.record, "sequence": reference.sequence})
+        }),
         "hash": info.hash,
         "sds_offset": info.sds_offset,
         "descriptor_bytes": info.bytes,
@@ -174,6 +208,7 @@ fn security_json(info: &reader::security::SecurityDescriptorInfo) -> serde_json:
         "group": descriptor.group.as_ref().map(ToString::to_string),
         "sacl": acl(&descriptor.sacl),
         "dacl": acl(&descriptor.dacl),
+        "access_evaluated": false,
         "scope": "native security metadata; no access evaluation or host ACL projection",
     })
 }
@@ -507,6 +542,9 @@ mod tests {
             let info = reader::security::SecurityDescriptorInfo {
                 source: "security_descriptor_attribute",
                 security_id: None,
+                standard_security_id: None,
+                legacy_attribute_present: true,
+                secure_reference: None,
                 hash: None,
                 sds_offset: None,
                 descriptor: ffs_ondisk::ntfs_security::NtfsSecurityDescriptor::parse(&bytes)
@@ -530,6 +568,62 @@ mod tests {
             assert!(report["security_id"].is_null());
             assert!(report["sds_offset"].is_null());
         }
+    }
+
+    #[test]
+    fn security_json_preserves_ordered_known_and_opaque_aces_without_access_decisions() {
+        let mut bytes = vec![
+            1, 0, 4, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0,
+        ];
+        bytes.extend_from_slice(&[4, 0, 76, 0, 2, 0, 0, 0]);
+        bytes.extend_from_slice(&[11, 3, 60, 0, 1, 0, 0, 0, 3, 0, 0, 0]);
+        bytes.extend_from_slice(&[0xA1; 16]);
+        bytes.extend_from_slice(&[0xB2; 16]);
+        bytes.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]);
+        bytes.extend_from_slice(b"artx");
+        bytes.extend_from_slice(&[0xFE, 0x40, 8, 0, 0xDE, 0xAD, 0xBE, 0xEF]);
+        let info = reader::security::SecurityDescriptorInfo {
+            source: "security_descriptor_attribute",
+            security_id: None,
+            standard_security_id: Some(0),
+            legacy_attribute_present: true,
+            secure_reference: None,
+            hash: None,
+            sds_offset: None,
+            descriptor: ffs_ondisk::ntfs_security::NtfsSecurityDescriptor::parse(&bytes).unwrap(),
+            bytes: bytes.clone(),
+        };
+        let report = security_json(&info);
+        assert_eq!(report["descriptor_bytes"], serde_json::json!(bytes));
+        assert_eq!(report["standard_security_id"], 0);
+        assert!(report["security_id"].is_null());
+        assert_eq!(report["legacy_attribute_present"], true);
+        assert_eq!(report["dacl"]["state"], "present");
+        assert_eq!(report["sacl"]["state"], "absent");
+        assert_eq!(report["dacl"]["aces"][0]["kind"], 11);
+        assert_eq!(report["dacl"]["aces"][0]["flags"], 3);
+        assert_eq!(report["dacl"]["aces"][0]["sid"], "S-1-5-18");
+        assert_eq!(report["dacl"]["aces"][0]["mask"], 1);
+        assert_eq!(
+            report["dacl"]["aces"][0]["object_type_bytes"],
+            serde_json::json!(vec![0xA1; 16])
+        );
+        assert_eq!(
+            report["dacl"]["aces"][0]["inherited_object_type_bytes"],
+            serde_json::json!(vec![0xB2; 16])
+        );
+        assert_eq!(
+            report["dacl"]["aces"][0]["opaque_bytes"],
+            serde_json::json!([97, 114, 116, 120])
+        );
+        assert_eq!(report["dacl"]["aces"][1]["layout"], "opaque");
+        assert!(report["dacl"]["aces"][1]["mask"].is_null());
+        assert!(report["dacl"]["aces"][1]["sid"].is_null());
+        assert_eq!(
+            report["dacl"]["aces"][1]["opaque_bytes"],
+            serde_json::json!([222, 173, 190, 239])
+        );
+        assert_eq!(report["access_evaluated"], false);
     }
 
     #[test]

@@ -324,6 +324,15 @@ legacy `security_descriptor_attribute` source. Optional partition
 `--raw` writes only the exact self-relative descriptor bytes, without JSON
 or the surrounding SDS entry header.
 
+The report also retains the exact extended STANDARD_INFORMATION field in
+`standard_security_id`: zero remains zero, while null denotes the legacy
+48-byte form without that field. `legacy_attribute_present` records whether
+the old descriptor attribute coexists with the selected source. When a nonzero
+ID selects shared security, `secure_reference` includes record 9 and its native
+sequence. The existing `security_id` field continues to identify the shared
+source and stays null for legacy descriptors; no legacy fallback is attempted
+when a nonzero reference is corrupt.
+
 The reader validates STANDARD_INFORMATION from the complete base/extension
 catalog. A nonzero native security ID is resolved through record 9, $Secure,
 using its $SII index and $SDS stream. Legacy 48-byte STANDARD_INFORMATION, or
@@ -335,7 +344,9 @@ validation.
 The shared-index traversal validates the complete reachable $SII tree before
 returning a match. It checks ULONG collation, key and entry-header agreement,
 strict key ordering and parent ranges, INDX update-sequence fixups, allocated
-bitmap membership, cycles and shared children. An iterative traversal limits
+bitmap membership, cycles and shared children. The bitmap must cover every
+block in INDEX_ALLOCATION, including when a resident root has no children and
+all bitmap bits are clear. An iterative traversal limits
 the path to 32 child levels, 16,384 index blocks, 65,536 keys and 64 MiB of
 index reads. Index allocation and bitmap streams must be initialized and
 untransformed. SDS may contain unmapped gaps outside the selected descriptor;
@@ -350,14 +361,33 @@ returned. The native rotating-word hash is checked over the descriptor.
 An inconsistent or missing copy fails the operation; this command performs
 no repair and chooses no preferred copy.
 
-The self-relative descriptor parser requires revision 1, valid bounded and
-aligned component offsets, native SID bounds, and supported ACL revisions
-with complete ACE envelopes. It preserves SID authority and subauthority
+The self-relative descriptor parser requires revision 1, DWORD-aligned
+descriptor and SDS entry lengths, valid bounded and aligned component offsets,
+native SID bounds, and supported ACL revisions with complete ACE envelopes. It preserves SID authority and subauthority
 values, all descriptor bytes and opaque ACE bodies. Absent ACLs, NULL ACLs
 and present empty ACLs remain distinct in JSON. Descriptors are bounded to
 128 KiB. Native ACL inspection does not evaluate permissions or map SIDs
 onto host accounts; the mounted view continues to use its existing explicit
 host ownership policy.
+
+SACL and DACL objects retain their original `present`, `offset`, `revision`
+and `ace_count` fields and add explicit `state`, native `size`, ordered `aces`
+and `unused_bytes`. Each ACE preserves its numeric `kind`, inheritance/audit
+`flags`, byte `size`, and remaining `opaque_bytes`. Recognized simple and
+object allow/deny/audit layouts, callback variants, mandatory labels, resource
+attributes and scoped policy IDs expose their bounded native mask and trustee
+SID. Object ACEs additionally preserve presence flags and the exact 16-byte
+object/inherited-object GUID fields; they require ACL revision 4. Known ACEs
+with missing or malformed SIDs, reserved object-presence bits, or the wrong
+system/discretionary ACL role are refused before output.
+
+Unknown or reserved ACE layouts retain their entire body with `layout: opaque`
+and null decoded fields. Callback conditions, claims, extra native bytes and
+unused ACL space are preserved without evaluation. ACE order is never changed,
+SIDs are not resolved to host users, and masks are not translated into Unix
+permissions. Every JSON report explicitly includes `access_evaluated: false`.
+All selected native framing, hash, copy and index checks finish before raw or
+JSON descriptor output begins.
 
 Security metadata remains inspectable for files whose DATA requires an
 unsupported provider. This command does not read that file's DATA, bypass
@@ -367,6 +397,13 @@ All normal offline-image, shared-lock and immutable-image requirements apply.
 Native format references:
 [NTFS-3G layout definitions](https://github.com/tuxera/ntfs-3g/blob/2022.10.3/include/ntfs-3g/layout.h)
 and [NTFS-3G security handling](https://github.com/tuxera/ntfs-3g/blob/2022.10.3/libntfs-3g/security.c).
+Descriptor and ACE framing also follows Microsoft's MS-DTYP
+[SECURITY_DESCRIPTOR](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-dtyp/7d4dac05-9cef-4563-a058-f108abecce1d),
+[ACL](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-dtyp/20233ed8-a6c6-4097-aafa-dd545ed24428),
+[ACE_HEADER](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-dtyp/628ebb1d-c509-4ea0-a10f-77ef97ca4586),
+[object ACE](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-dtyp/c79a383c-2b3f-4655-abe7-dcbb7ce0cfbe)
+and [callback ACE](https://learn.microsoft.com/en-us/openspecs/windows_protocols/ms-dtyp/c9579cf4-0f4a-44f1-9444-422dfb10557a)
+specifications. These define native structure, not a host access policy.
 
 ## Admission limits and exclusions
 
@@ -577,3 +614,31 @@ read offsets were checked independently. These calculations do not execute
 the Rust implementation. Rust compilation, the 17 new regressions, formatting,
 workspace checks, Clippy, UBS and native-image or Windows interoperability
 validation remain unexecuted because the authoring executor is offline.
+
+## Structured native ACE inspection validation
+
+Six additional parser regressions cover ordered deny/inherited trustees and
+masks, object/callback/unknown ACE bodies, missing trustee fields, ACL-role and
+reserved-field errors, preserved free space, and lengths with unhashed partial
+words. Five reader regressions add exact zero/absent SI identity and $Secure
+generation, incomplete bitmap coverage without reachable children, corrupted
+known trustees behind matching hashes and duplicate bytes, provider refusal on
+$Secure itself, and unchanged real image/adjacent bytes. A CLI regression checks
+lossless object GUID/callback/opaque JSON and explicit absence of access decisions.
+The original six parser, nine reader and two CLI security regressions are retained.
+
+These additions were merged onto the published native-security implementation,
+preserving its public fields, iterative index traversal, physically mapped and
+initialized descriptor ranges, source precedence and raw extraction. Source and
+fixture review are complete. An inherited SID-boundary fixture now distinguishes
+a valid 15-subauthority owner ending at byte 88 from an out-of-bounds group ending
+at byte 100 in the same 96-byte descriptor; component sharing remains supported.
+
+Execution evidence (2026-10-11): all 12 tests selected by
+`cargo test -p ffs-ondisk --lib ntfs_security::tests --locked` passed against the
+merged parser, with one compiler thread. The five changed Rust files were parsed
+and formatted. Full CLI checks/tests stopped during `asupersync` compilation with
+SIGKILL under the shared memory limit, so the new image-reader and report tests
+remain unexecuted. Earlier execution of a separate parser draft is not credited
+to this implementation. Native Windows descriptor comparison and mounted
+SID/DACL enforcement are not claimed.

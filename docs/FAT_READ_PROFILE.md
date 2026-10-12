@@ -17,6 +17,7 @@ rch exec -- cargo build -p ffs-cli --bin ffs-fat
 # These paths must not already exist; format creates an empty volume image.
 target/debug/ffs-fat format new-fat16.img --kind fat16 --size-mib 4 --label DATA
 target/debug/ffs-fat format new-fat32.img --kind fat32 --size-mib 64 --serial 305441741
+target/debug/ffs-fat format selected-clusters.img --kind fat32 --size-mib 128 --sectors-per-cluster 2 --serial 0x1234ABCD
 
 target/debug/ffs-fat inspect volume.img
 target/debug/ffs-fat check volume.img
@@ -58,50 +59,120 @@ provided.
 Geometry uses 512-byte sectors, two mirrored FATs and a power-of-two cluster
 size from 1..128 sectors (up to 64 KiB). The formatter chooses the smallest
 cluster size satisfying the selected dialect and resource bounds, then finds
-the smallest FAT that can represent every data cluster. FAT16 uses 512 fixed
-root entries and a data-cluster range of 4,087..65,518, avoiding ambiguous
-FAT12 thresholds and reserved cluster identifiers. FAT32 uses 32 reserved
-sectors, root cluster 2, boot backup sector 6, FSInfo sector 1 and its backup
-at sector 7. Its data-cluster count starts at 65,525 and is limited by the
-existing 8,388,608-cluster checker budget. Invalid sizes are rejected before
-the output file is created.
+the smallest FAT that can represent every data cluster. Optional
+`--sectors-per-cluster` selects an exact cluster size; an invalid power of two,
+wrong count-derived dialect, or exceeded resource bound is refused before
+creating the output. This preserves the original automatic geometry choices.
 
-An optional `--label` accepts a restricted ASCII label of 1..11 bytes with
-no leading or trailing space, uppercases it, and writes the same padded name
-to the native boot label and root volume-label entry. With no label, the boot
-field contains the native `NO NAME` default and the root is empty.
-`--serial` accepts a decimal 32-bit volume identifier; the default is derived
-from the system clock and is not a uniqueness guarantee. Supplying a serial
-makes the constructed image deterministic. Native label-entry dates use
-1980-01-01.
+| Native field | FAT16 | FAT32 |
+|---|---|---|
+| Data-cluster range | 4,087..65,518 | 65,525..8,388,608 |
+| Reserved sectors | 1 | 32 |
+| Root directory | Fixed 512-entry region | Allocated cluster 2, terminated by EOC |
+| Primary / backup boot record | Sector 0 / absent | Sectors 0..2 / 6..8 |
+| FSInfo | Absent | Sector 1 and initial copy at sector 7 |
+| FAT copies | Two matching complete copies | Two matching complete copies |
+| Explicit 512-byte metadata writes | 4 | 9 |
+
+The FAT16 range avoids ambiguous FAT12 thresholds and reserved cluster
+identifiers. FAT32 stays within the allocation checker's 8,388,608-cluster
+budget, so every successfully created image can receive complete allocation
+verification. The complete BPB and last data-cluster address are independently
+admitted by the ordinary native geometry parser before any output file is
+opened. The admitted range retains the original formatter's compatibility
+choices: it does not impose Microsoft's suggested 16-cluster separation from
+dialect cutovers, and its optional 64 KiB clusters exceed the specification's
+32 KiB application-compatibility recommendation. Native interchange evidence
+applies to the exercised geometries, not automatically to every admitted size.
+
+An optional `--label` accepts 1..11 legal printable ASCII FAT label bytes,
+without leading or trailing space, uppercases them, and writes the same padded
+name to the native boot label and root volume-label entry. With no label, the
+boot field contains the native `NO NAME` default and the entire root is empty.
+`--serial` accepts a 32-bit volume identifier in decimal or `0x`/`0X` hex;
+the default is derived from the system clock and is not a uniqueness guarantee.
+Supplying a serial makes the constructed image deterministic. Native label-entry
+creation/access/modification dates use 1980-01-01; ordinary root slots remain zero.
 
 All options and the completed BPB are checked before an atomic `create_new`
-open. Existing regular files, empty files, symlinks (including dangling links),
-directories and device paths are refused. The new file is exclusively locked
-and extended from zero length, supplying logical zeros for both allocation
-tables, reserved regions, directories and free space. Physical storage may
-be sparse; the command does not preallocate the image's entire logical size.
+open with mode 0600, subject to the caller's umask. Existing regular files,
+empty files, hardlinks, symlinks (including dangling links), directories and
+device paths are refused. The destination parent's identity and pathname
+resolution must remain stable until completion: the directory handle used for
+its final sync is opened separately from exclusive file creation. The new file
+is exclusively advisory-locked and extended from zero length, supplying logical
+zeros for both complete allocation tables and their padding, reserved regions,
+root slack and free space. Physical storage may be sparse; the command does
+not reserve the image's entire logical size for future writes. Existing image
+bytes are never read or copied during initialization.
 
-Initialization writes clean native FAT headers, root metadata, and both
-FAT32 boot/FSInfo copies. These metadata writes are bounded independently of
-image size. The primary boot sector is written only after the other metadata
-has been synchronized; the completed file is synchronized again. Verification
-reads back every explicit metadata sector and runs the existing allocation
-checker through a read-only adapter over a clone of the same locked handle,
-without reopening the target pathname or reacquiring its lock. Success requires
-an empty namespace, expected free/allocated counts, agreeing FAT copies and
-no lost allocation, then synchronization of the parent directory entry.
+Preparation writes clean native FAT headers, root metadata, both FAT32 FSInfo
+sectors and the signed FAT32 boot-extension sectors 2 and 8, then synchronizes
+the file. The initial FSInfo free count is exact and the next-free search hint
+is cluster 3. Both primary and backup BPBs remain unpublished throughout this
+stage. Cancellation from the request context or Ctrl+C is honored before
+creation and at preparation boundaries, including immediately after that sync.
 
-The JSON result identifies `operation: create_new_image`, reports native
-geometry/label/serial and includes the read-only verification report.
-Cancellation or any creation, write, synchronization or verification failure
-returns an error. A file already created by the command is retained and may
-be incomplete; it is not silently removed or reused on a subsequent attempt.
-The lock remains advisory. This adds empty-image creation; mutation and
-recovery of existing FAT filesystems still require their own native write path.
+After the final preparation checkpoint, publication writes the FAT32 backup
+BPB, then the primary BPB, synchronizes the file, and synchronizes the parent
+directory entry. This sequence has at most two sector writes and two syncs,
+with no cancellation checkpoint between them. A pending signal is delivered
+to the actual shared request context, so it can still stop the subsequent
+verification, including the checker's cached-allocation loops.
 
-Native layout reference:
+Verification reads back every explicitly written metadata sector, including
+all six FAT32 boot-record sectors, and runs the existing allocation checker
+through a read-only adapter over a clone of the same locked handle. It neither
+reopens the target pathname nor reacquires its lock. Success requires complete
+coverage, an empty namespace, expected free/allocated counts, agreeing FAT
+copies and no allocation findings. Full readback is mandatory; the bounded
+initialization phase is followed by verification that scales with the admitted
+allocation count.
+
+The JSON result preserves `operation: create_new_image`,
+`created_new_image: true`, native geometry/label/serial fields and the embedded
+read-only `verification` report. It adds `durability: file_and_parent_synced`.
+No successful result is emitted before final synchronization and verification.
+
+An error always retains any newly created destination, with its original cause
+and the completed phase:
+
+- Before boot publication, neither BPB has been published and the image is incomplete.
+- A backup/primary write or final file-sync error states that publication started
+  and file durability is uncertain; a partial prefix or valid boot copy may exist.
+- A parent-sync error states that the image was initialized and file-synchronized,
+  with uncertain directory-entry durability.
+- An error or cancellation during readback states that the image was already
+  initialized and file-and-parent synchronized, but verification did not complete.
+- A stdout/reporting error states that initialization, synchronization and
+  verification already succeeded.
+
+The file is not silently removed or reused on a subsequent attempt. The lock
+remains advisory; unrelated writers and kernel mounts are outside the contract.
+This adds empty-image creation. Writable mounts, mutation/recovery of existing
+FAT filesystems, partition formatting and MVCC/RaptorQ integration remain separate
+native write-path work.
+
+### Native format references
+
+The layout was reviewed against Microsoft's *FAT Specification 1.03*
+(`fatgen103.doc`), retrieved from the official
+[WHDC Legacy Documents archive](https://www.microsoft.com/en-us/download/details.aspx?id=53426):
+[original document](https://download.microsoft.com/download/1/6/1/161ba512-40e2-4cc9-843a-923143f3456c/fatgen103.doc).
+The retrieved document is 222,720 bytes with SHA-256
+`b17d66c796d9cd3070adf4ccbc00add5a8b6b6f5491fe8ea949df778fce60172`.
+Its BPB tables, FAT type determination, reserved entries, root initialization,
+FSInfo and three-sector backup description informed the encoder and independent
+byte fixtures. The original document is not redistributed in the repository.
+The existing native implementation reference is retained:
 [dosfstools 4.2 formatter](https://github.com/dosfstools/dosfstools/blob/v4.2/src/mkfs.fat.c).
+
+The host-file guarantees are documented in Rust's
+[`OpenOptions::create_new`](https://doc.rust-lang.org/std/fs/struct.OpenOptions.html#method.create_new)
+and [`File::set_len`](https://doc.rust-lang.org/std/fs/struct.File.html#method.set_len).
+The host filesystem's file and directory sync semantics define durability;
+process termination or power loss before completion may leave a retained partial
+image. Native oracle tools validate interchange; the formatter never invokes them.
 
 ## Implemented read boundaries
 
@@ -242,12 +313,15 @@ python3 scripts/verify_fat_read.py --binary target/debug/ffs-fat
 python3 scripts/verify_fat_read.py --binary target/debug/ffs-fat --mounted
 ```
 
-The external runner creates real FAT16/FAT32 images with `mkfs.fat`, seeds and
-reads them with mtools, checks the candidate's complete allocation report against
-the known namespace and independently scanned free count, compares binary and
-optional mounted reads, requires EROFS for mounted write-open, checks unchanged
-image hashes, and runs
-`fsck.fat -n`. It retains images and command logs and fails on missing prerequisites.
+The external runner exercises images created by both `mkfs.fat` and
+`ffs-fat format`. It independently scans native BPB/FAT bytes, verifies fresh
+FAT32 three-sector boot copies, seeds and reads files with mtools, and checks the
+candidate's complete allocation report against known namespace/free counts.
+It compares binary and optional mounted reads, requires EROFS for mounted
+write-open, checks unchanged image hashes, and runs `fsck.fat -n`. Formatter
+scenarios also require exact refusal statuses and unchanged bytes when trying
+to format an existing path, and no destination for rejected partition options.
+All images and command logs are retained; missing prerequisites fail the run.
 The added Rust unit tests cover independent byte layouts, error/cancellation
 propagation, malformed chains, partition bounds, LFN boundaries, FsOps and dates.
 Additional checker regressions retain raw malformed/orphaned LFN records,
@@ -311,8 +385,40 @@ Complete production, CLI and fixture blobs received independent review and
 exact readback comparison. Independent arithmetic compared minimum FAT sizing
 with a separate closed form across the integer-MiB size range and checked all
 boundary fixtures. These are source and arithmetic checks, not execution of
-the formatter. Rust compilation, the eleven regressions, formatting, workspace
-checks, Clippy, UBS, native `fsck.fat`/mtools validation and mounted interchange
-remain unexecuted because the authoring executor is offline. The earlier
-external runner uses `mkfs.fat` to create its inputs and does not qualify this
-new native formatter.
+the formatter. At that initial delivery, Rust compilation, the eleven
+regressions, formatting, workspace checks, Clippy, UBS, native
+`fsck.fat`/mtools validation and mounted interchange were unexecuted because its
+authoring executor was offline. The runner then used only `mkfs.fat` inputs,
+so that earlier runner did not qualify the native formatter.
+
+**Formatter integration coverage (2026-10-11):** all eleven original formatter
+test functions and their independent default-geometry, optional-label, timestamp,
+readback and allocation assertions are preserved. Their fault and cancellation
+loops now include every FAT32 backup write, primary write, final image sync and
+parent sync, retained partial prefixes, withheld BPBs before publication, and
+pending cancellation that stops later verification after durable initialization.
+Eight additional native-layout tests cover raw BPB constants, root dates,
+FSInfo/complete boot copies, finite independent FAT-capacity calculations,
+cluster selection and label/serial bounds. Six additional creation tests cover
+raw complete-FAT/free-space scans, existing hardlinks/inode preservation, explicit
+cluster and hex-serial CLI admission, production request-context cancellation,
+tampering in either boot-extension sector, and verification of the original
+locked inode after a leaf-path replacement.
+
+The combined formatter received independent source review. The updated native
+oracle passed Python syntax compilation; it now includes formatter-created
+images, native fsck/mtools interchange and retained command evidence. These
+source-level checks do not establish execution of the combined Rust suite,
+native interchange or mounted validation. Runtime results must identify the
+candidate revision and the actual commands/tools exercised.
+
+Final integration evidence (2026-10-11): the five changed Rust files passed
+rustfmt parsing and formatting checks, and the delivered Python oracle passed
+syntax compilation. Independent review covered the merged production code and
+all 25 formatter tests. Earlier CLI checks/tests in this session, including a
+one-compiler-thread attempt, received SIGKILL during `asupersync` compilation
+under the shared memory limit. This merged formatter has no compiled or executed
+result from those attempts. The installed UBS
+launcher was not executable. Native dosfstools/mtools and mounted runs have not
+executed. The separate 838-test on-disk parser run and on-disk Clippy pass do not
+validate this CLI formatter or count as native interchange evidence.

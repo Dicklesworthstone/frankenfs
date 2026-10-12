@@ -1030,3 +1030,72 @@ received SIGKILL under the shared memory limit. These new tests and native
 OpenZFS/mounted mirror workloads remain unexecuted. No import, degraded-member
 selection, repair write, healing or RAIDZ support is implied.
 See `docs/ZFS_READ_PROFILE.md` for the native profile and commands.
+
+### NTFS ordered ACE inspection and complete security-index bounds
+
+The existing native `security` command now reports ordered ACE kinds, flags,
+access masks, trustee SIDs, object GUID bytes and lossless callback/unknown data.
+Known layouts receive complete bounded validation; unused ACL bytes are retained.
+The report preserves absent/NULL/present ACL distinctions, the exact zero-versus-
+absent STANDARD_INFORMATION security ID, legacy-attribute presence and the native
+$Secure sequence. It explicitly records that no access decision was evaluated.
+
+The reader rejects $SII bitmaps that cannot cover every INDEX_ALLOCATION slot,
+including leaf roots without children, and rejects descriptor/SDS lengths that
+would leave unhashed partial words. The published iterative index traversal,
+physical-range validation, shared-descriptor precedence and raw extraction remain.
+
+All 12 merged native-security parser tests executed successfully, including six
+new regressions and the corrected inherited SID-boundary fixture. Five new reader
+regressions and one report regression are source-reviewed but unexecuted. Changed
+Rust sources were parsed/formatted; integrated CLI checks/tests received SIGKILL
+while compiling `asupersync` under the shared memory limit. No native Windows,
+mounted security-enforcement or full-workspace gate credit is added.
+See `docs/NTFS_READ_PROFILE.md` for fields, boundaries and commands.
+
+### ZFS raw Zstandard size admission
+
+A bounded native-header preflight checks the advertised window before libzstd
+header parsing and distinguishes an explicit 64-bit content size from library
+status sentinels. Oversized windows and declared-size/LSIZE disagreements fail
+before frame copying or decoder-context creation. Existing physical checksums,
+single-frame consumption, dictionary refusal and exact output bounds remain.
+
+The original ten Zstandard tests and their assertions are retained; an eleventh
+covers both frame forms, every zero dictionary-ID width and extreme explicit
+sizes. The complete on-disk library suite passed 838 tests with no failures,
+and on-disk all-targets Clippy passed with warnings denied. This includes the
+merged NTFS security parser. Changed Rust sources were parsed/formatted. UBS
+could not execute its installed launcher (permission denied). CLI reader/FsOps,
+native OpenZFS and mounted mirror validation remain unexecuted; the parser
+results add no native-pool or mounted-readiness claim.
+
+### FAT16/FAT32 complete boot publication and interruption semantics
+
+The native formatter preserves its existing geometry, optional labels, timestamps
+and report fields while adding explicit cluster selection and decimal/hex serials.
+FAT32 creates complete signed boot-record copies at sectors 0..2 and 6..8. Both
+BPBs remain withheld until the mirrored FATs, root, FSInfo and extension sectors
+are synchronized; final publication completes backup, primary, file sync and
+parent sync without a cancellation checkpoint between those bounded operations.
+
+Ctrl+C cancels the actual context shared by device reads and allocation-loop
+checkpoints. Mandatory verification uses the cloned locked file handle after
+durability, and an interrupted or failed scan identifies the already initialized,
+synchronized image. Existing targets remain refused through exclusive creation.
+
+All eleven original formatter tests remain, with publication/failure loops
+extended through parent synchronization. Fourteen additional tests cover native
+bytes and allocation, cluster/serial selection, hardlinks, request cancellation,
+both boot extensions and original-inode verification. The native runner now tests
+formatter-created images through fsck/mtools and exact byte/count/hash comparisons
+as well as its existing native-created and optional mounted cases.
+
+The five Rust files passed parsing/formatting checks and the runner passed Python
+syntax compilation. Production and all 25 formatter tests received independent
+source review. Earlier CLI dependency builds received SIGKILL during `asupersync`
+compilation; the merged formatter suite, native interchange and mounted cases
+remain unexecuted. UBS
+could not execute its installed launcher. On-disk parser tests and Clippy do not
+qualify this formatter. See `docs/FAT_READ_PROFILE.md` for the native profile,
+commands, interruption outcomes and interoperability limits.

@@ -149,7 +149,7 @@ fn descriptor_offsets_sid_and_ace_extents_are_bounded() {
         (4, 21),
         (20, 2),
         (21, 16),
-        (21, 15),
+        (33, 15),
         (48, 3),
         (50, 44),
         (52, 3),
@@ -173,6 +173,20 @@ fn descriptor_offsets_sid_and_ace_extents_are_bounded() {
     shared[8..12].copy_from_slice(&20_u32.to_le_bytes());
     let shared = NtfsSecurityDescriptor::parse(&shared).unwrap();
     assert_eq!(shared.owner, shared.group);
+    // A maximum-count owner at byte20 ends at byte88 and is bounded. The
+    // group-count15 mutation above instead ends at byte100, outside this
+    // 96-byte descriptor. Component offsets do not impose serialization order.
+    let mut bounded_owner = DESCRIPTOR;
+    bounded_owner[21] = 15;
+    assert_eq!(
+        NtfsSecurityDescriptor::parse(&bounded_owner)
+            .unwrap()
+            .owner
+            .unwrap()
+            .subauthorities
+            .len(),
+        15
+    );
 }
 
 #[test]
@@ -276,7 +290,182 @@ fn sii_index_rejects_wrong_collation_bounds_identity_order_and_terminators() {
         false,
     );
     assert!(NtfsSecurityIndexRoot::parse(&duplicate, 512).is_err());
-    let mut no_terminal = source.clone();
+    let mut no_terminal = source;
     no_terminal.truncate(no_terminal.len() - 16);
     assert!(NtfsSecurityIndexRoot::parse(&no_terminal, 512).is_err());
+}
+
+#[test]
+fn decoded_aces_preserve_native_order_masks_and_trustee_identity() {
+    let descriptor = NtfsSecurityDescriptor::parse(&DESCRIPTOR).unwrap();
+    let dacl = descriptor.dacl;
+    assert_eq!(dacl.size, Some(48));
+    assert_eq!(dacl.aces.len(), 2);
+    assert_eq!(
+        (dacl.aces[0].kind, dacl.aces[0].flags, dacl.aces[0].size),
+        (1, 18, 20)
+    );
+    assert_eq!(dacl.aces[0].mask, Some(2));
+    assert_eq!(dacl.aces[0].sid.as_ref().unwrap().to_string(), "S-1-1-0");
+    assert_eq!((dacl.aces[1].kind, dacl.aces[1].flags), (0, 3));
+    assert_eq!(dacl.aces[1].mask, Some(0x001F_01FF));
+    assert_eq!(dacl.aces[1].sid.as_ref().unwrap().to_string(), "S-1-5-18");
+    assert_eq!(dacl.padding, [] as [u8; 0]);
+
+    let mut reordered = DESCRIPTOR;
+    reordered[4..8].copy_from_slice(&32_u32.to_le_bytes());
+    reordered[8..12].copy_from_slice(&20_u32.to_le_bytes());
+    let descriptor = NtfsSecurityDescriptor::parse(&reordered).unwrap();
+    assert_eq!(descriptor.owner.unwrap().to_string(), "S-1-5-32-544");
+    assert_eq!(descriptor.group.unwrap().to_string(), "S-1-5-18");
+}
+
+#[test]
+fn callback_object_and_unknown_ace_bodies_are_lossless_without_access_evaluation() {
+    let mut value = vec![
+        1, 0, 4, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0,
+    ];
+    value.extend_from_slice(&[4, 0, 76, 0, 2, 0, 0, 0]);
+    value.extend_from_slice(&[11, 3, 60, 0, 1, 0, 0, 0, 3, 0, 0, 0]);
+    value.extend_from_slice(&[0xA1; 16]);
+    value.extend_from_slice(&[0xB2; 16]);
+    value.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0]);
+    value.extend_from_slice(b"artx");
+    value.extend_from_slice(&[0xFE, 0x40, 8, 0, 0xDE, 0xAD, 0xBE, 0xEF]);
+    let acl = NtfsSecurityDescriptor::parse(&value).unwrap().dacl;
+    assert_eq!(acl.aces[0].object_flags, Some(3));
+    assert_eq!(acl.aces[0].object_type, Some([0xA1; 16]));
+    assert_eq!(acl.aces[0].inherited_object_type, Some([0xB2; 16]));
+    assert_eq!(acl.aces[0].sid.as_ref().unwrap().to_string(), "S-1-5-18");
+    assert_eq!(acl.aces[0].opaque, b"artx");
+    assert_eq!(acl.aces[1].kind, 0xFE);
+    assert_eq!(acl.aces[1].mask, None);
+    assert_eq!(acl.aces[1].sid, None);
+    assert_eq!(acl.aces[1].opaque, [0xDE, 0xAD, 0xBE, 0xEF]);
+    for length in 0..value.len() {
+        assert!(
+            NtfsSecurityDescriptor::parse(&value[..length]).is_err(),
+            "{length}"
+        );
+    }
+    for (at, byte) in [(20, 2), (36, 4), (72, 2), (73, 15)] {
+        let mut damaged = value.clone();
+        damaged[at] = byte;
+        assert!(NtfsSecurityDescriptor::parse(&damaged).is_err(), "{at}");
+    }
+}
+
+#[test]
+fn known_aces_reject_missing_or_invalid_trustees_reserved_acls_and_wrong_acl_roles() {
+    for (at, byte) in [(49, 1), (54, 1), (64, 2), (65, 16), (65, 15), (56, 2)] {
+        let mut damaged = DESCRIPTOR;
+        damaged[at] = byte;
+        assert!(NtfsSecurityDescriptor::parse(&damaged).is_err(), "{at}");
+    }
+    // Every envelope below is wholly inside the ACL; it is the missing
+    // known-layout mask/SID, not an outer length error, that must refuse it.
+    for length in [4_u16, 8, 12, 16] {
+        let mut value = vec![
+            1, 0, 4, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0,
+        ];
+        value.extend_from_slice(&[2, 0, 0, 0, 1, 0, 0, 0]);
+        value[22..24].copy_from_slice(&(8 + length).to_le_bytes());
+        let mut ace = vec![0; usize::from(length)];
+        ace[2..4].copy_from_slice(&length.to_le_bytes());
+        if length >= 12 {
+            ace[8..12].copy_from_slice(&[1, 1, 0, 0]);
+        }
+        value.extend_from_slice(&ace);
+        assert!(NtfsSecurityDescriptor::parse(&value).is_err(), "{length}");
+        // An unknown type has only the envelope contract and keeps the body.
+        value[28] = 0xFE;
+        let opaque = NtfsSecurityDescriptor::parse(&value).unwrap().dacl;
+        assert_eq!(opaque.aces[0].opaque, ace[4..]);
+    }
+}
+
+#[test]
+fn system_ace_metadata_and_extra_native_bytes_remain_ordered_and_opaque() {
+    for kind in [2, 13, 17, 18, 19] {
+        let mut value = vec![
+            1, 0, 0x10, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0, 0, 0, 0, 0,
+        ];
+        value.extend_from_slice(&[2, 0, 32, 0, 1, 0, 0, 0]);
+        value.extend_from_slice(&[kind, 0x10, 24, 0, 1, 0, 0, 0]);
+        value.extend_from_slice(&[1, 1, 0, 0, 0, 0, 0, 16, 0, 0x10, 0, 0]);
+        value.extend_from_slice(&[0xAA, 0xBB, 0xCC, 0xDD]);
+        let descriptor = NtfsSecurityDescriptor::parse(&value).unwrap();
+        assert_eq!(descriptor.sacl.aces[0].kind, kind);
+        assert_eq!(descriptor.sacl.aces[0].mask, Some(1));
+        assert_eq!(
+            descriptor.sacl.aces[0].sid.as_ref().unwrap().to_string(),
+            "S-1-16-4096"
+        );
+        assert_eq!(descriptor.sacl.aces[0].opaque, [0xAA, 0xBB, 0xCC, 0xDD]);
+        value[2] = 4;
+        value[12..16].fill(0);
+        value[16..20].copy_from_slice(&20_u32.to_le_bytes());
+        assert!(NtfsSecurityDescriptor::parse(&value).is_err(), "{kind}");
+    }
+    // Additional bytes are preserved even for an ordinary non-callback ACE.
+    let mut value = DESCRIPTOR.to_vec();
+    value[50..52].copy_from_slice(&52_u16.to_le_bytes());
+    value[78..80].copy_from_slice(&24_u16.to_le_bytes());
+    value.extend_from_slice(&[1, 2, 3, 4]);
+    assert_eq!(
+        NtfsSecurityDescriptor::parse(&value).unwrap().dacl.aces[1].opaque,
+        [1, 2, 3, 4]
+    );
+}
+
+#[test]
+fn unused_acl_space_and_absent_null_empty_metadata_are_preserved() {
+    let mut value = vec![
+        1, 0, 4, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 20, 0, 0, 0,
+    ];
+    value.extend_from_slice(&[2, 0, 12, 0, 0, 0, 0, 0, 0xAA, 0xBB, 0xCC, 0xDD]);
+    let acl = NtfsSecurityDescriptor::parse(&value).unwrap().dacl;
+    assert_eq!(acl.size, Some(12));
+    assert_eq!(acl.aces, [] as [NtfsAce; 0]);
+    assert_eq!(acl.padding, [0xAA, 0xBB, 0xCC, 0xDD]);
+    value.truncate(20);
+    value[16..20].fill(0);
+    let null = NtfsSecurityDescriptor::parse(&value).unwrap().dacl;
+    assert!(null.present);
+    assert_eq!(null.size, None);
+    assert_eq!(null.aces, [] as [NtfsAce; 0]);
+    value[2] = 0;
+    let absent = NtfsSecurityDescriptor::parse(&value).unwrap().dacl;
+    assert!(!absent.present);
+    assert_eq!(absent.size, None);
+}
+
+#[test]
+fn selected_descriptor_lengths_cannot_hide_unhashed_partial_words() {
+    assert_eq!(security_hash(&[1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0]), 83);
+    assert_eq!(security_hash(&[255, 255, 255, 255, 1, 0, 0, 0]), 0);
+    let valid = header(0x100, 464);
+    let mut entry = valid.to_vec();
+    entry.extend_from_slice(&DESCRIPTOR);
+    // Keep the public prefix parser and complete-word hash contracts intact.
+    assert_eq!(
+        NtfsSecurityHeader::parse(&entry).unwrap(),
+        NtfsSecurityHeader::parse(&valid).unwrap()
+    );
+    assert_eq!(security_hash(&[1, 2, 3, 4, 5]), 0x0403_0201);
+    for extra in 1..=3 {
+        let mut descriptor = DESCRIPTOR.to_vec();
+        descriptor.extend(std::iter::repeat_n(0xA5, extra));
+        assert_eq!(security_hash(&descriptor), DESCRIPTOR_HASH);
+        assert!(NtfsSecurityDescriptor::parse(&descriptor).is_err());
+        let mut value = valid;
+        value[16..20].copy_from_slice(&(116_u32 + extra as u32).to_le_bytes());
+        assert!(NtfsSecurityHeader::parse(&value).is_err());
+    }
+    let valid = NtfsSecurityHeader::parse(&valid).unwrap();
+    assert!(
+        NtfsSecurityHeader { length: 0, ..valid }
+            .descriptor(&[])
+            .is_err()
+    );
 }

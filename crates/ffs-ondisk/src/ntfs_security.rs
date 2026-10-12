@@ -49,6 +49,33 @@ pub struct NtfsSid {
     pub subauthorities: Vec<u32>,
 }
 
+impl NtfsSid {
+    fn prefix(value: &[u8]) -> Result<(Self, usize), ParseError> {
+        if value.len() < 8 || value[0] != 1 || value[1] > 15 {
+            return Err(invalid("invalid SID revision, count or header"));
+        }
+        let length = 8 + usize::from(value[1]) * 4;
+        if length > value.len() {
+            return Err(invalid("SID subauthorities exceed their container"));
+        }
+        let mut authority = 0_u64;
+        for &byte in &value[2..8] {
+            authority = (authority << 8) | u64::from(byte);
+        }
+        let mut subauthorities = Vec::with_capacity(usize::from(value[1]));
+        for at in (8..length).step_by(4) {
+            subauthorities.push(le32(value, at)?);
+        }
+        Ok((
+            Self {
+                authority,
+                subauthorities,
+            },
+            length,
+        ))
+    }
+}
+
 impl fmt::Display for NtfsSid {
     fn fmt(&self, out: &mut fmt::Formatter<'_>) -> fmt::Result {
         if self.authority > u64::from(u32::MAX) {
@@ -63,6 +90,80 @@ impl fmt::Display for NtfsSid {
     }
 }
 
+/// An ACE in native order, retaining unimplemented layout bytes losslessly.
+/// This is structural metadata, never an evaluated grant, deny or condition.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NtfsAce {
+    pub kind: u8,
+    pub flags: u8,
+    pub size: u16,
+    /// None for an unrecognized layout; its entire body remains in opaque.
+    pub mask: Option<u32>,
+    pub sid: Option<NtfsSid>,
+    pub object_flags: Option<u32>,
+    pub object_type: Option<[u8; 16]>,
+    pub inherited_object_type: Option<[u8; 16]>,
+    /// Callback/claim data, extra native bytes, or the complete unknown body.
+    pub opaque: Vec<u8>,
+}
+
+impl NtfsAce {
+    fn parse(value: &[u8], revision: u8, system: bool) -> Result<Self, ParseError> {
+        let kind = value[0];
+        let ordinary = matches!(kind, 0 | 1 | 2 | 9 | 10 | 13 | 17 | 18 | 19);
+        let object = matches!(kind, 5 | 6 | 7 | 11 | 12 | 15);
+        let mut ace = Self {
+            kind,
+            flags: value[1],
+            size: le16(value, 2)?,
+            mask: None,
+            sid: None,
+            object_flags: None,
+            object_type: None,
+            inherited_object_type: None,
+            opaque: Vec::new(),
+        };
+        if !ordinary && !object {
+            ace.opaque = value[4..].to_vec();
+            return Ok(ace);
+        }
+        let system_kind = matches!(kind, 2 | 7 | 13 | 15 | 17 | 18 | 19);
+        if system_kind != system {
+            return Err(invalid("ACE belongs to the other ACL kind"));
+        }
+        if object && revision != 4 {
+            return Err(invalid("object ACE requires ACL revision 4"));
+        }
+        ace.mask = Some(le32(value, 4)?);
+        let mut at = 8;
+        if object {
+            let flags = le32(value, 8)?;
+            if flags & !3 != 0 {
+                return Err(invalid("unknown object-ACE presence flags"));
+            }
+            ace.object_flags = Some(flags);
+            at = 12;
+            if flags & 1 != 0 {
+                ace.object_type = Some(bytes(value, at)?);
+                at += 16;
+            }
+            if flags & 2 != 0 {
+                ace.inherited_object_type = Some(bytes(value, at)?);
+                at += 16;
+            }
+        }
+        let remaining = value
+            .get(at..)
+            .ok_or_else(|| invalid("missing ACE trustee SID"))?;
+        let (sid, length) = NtfsSid::prefix(remaining)?;
+        ace.sid = Some(sid);
+        // MS-DTYP permits extra bytes after known ACE fields. Callback and
+        // claim application data also remains opaque; no expression is run.
+        ace.opaque = remaining[length..].to_vec();
+        Ok(ace)
+    }
+}
+
 /// `present == false` is an absent ACL; `present && offset == 0` is a
 /// native NULL ACL. A present ACL with zero ACEs is a different state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -71,6 +172,11 @@ pub struct NtfsAcl {
     pub offset: u32,
     pub revision: Option<u8>,
     pub ace_count: Option<u16>,
+    pub size: Option<u16>,
+    /// Parsed in stored order; inherited and deny ACEs are never reordered.
+    pub aces: Vec<NtfsAce>,
+    /// AclSize includes unused bytes after the counted ACEs.
+    pub padding: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -85,7 +191,10 @@ pub struct NtfsSecurityDescriptor {
 
 impl NtfsSecurityDescriptor {
     pub fn parse(value: &[u8]) -> Result<Self, ParseError> {
-        if !(20..=MAX_SECURITY_DESCRIPTOR_BYTES).contains(&value.len()) || value[0] != 1 {
+        if !(20..=MAX_SECURITY_DESCRIPTOR_BYTES).contains(&value.len())
+            || !value.len().is_multiple_of(4)
+            || value[0] != 1
+        {
             return Err(invalid("invalid security descriptor revision or length"));
         }
         let control = le16(value, 2)?;
@@ -97,8 +206,8 @@ impl NtfsSecurityDescriptor {
             resource_manager_control: value[1],
             owner: sid_at(value, le32(value, 4)?)?,
             group: sid_at(value, le32(value, 8)?)?,
-            sacl: acl_at(value, le32(value, 12)?, control & 0x10 != 0)?,
-            dacl: acl_at(value, le32(value, 16)?, control & 0x04 != 0)?,
+            sacl: acl_at(value, le32(value, 12)?, control & 0x10 != 0, true)?,
+            dacl: acl_at(value, le32(value, 16)?, control & 0x04 != 0, false)?,
         })
     }
 }
@@ -121,25 +230,10 @@ fn sid_at(value: &[u8], offset: u32) -> Result<Option<NtfsSid>, ParseError> {
         return Ok(None);
     }
     let at = component_offset(value, offset, 8)?;
-    let count = usize::from(value[at + 1]);
-    if value[at] != 1 || count > 15 || at + 8 + count * 4 > value.len() {
-        return Err(invalid("invalid SID revision, count or extent"));
-    }
-    let mut authority = 0_u64;
-    for &byte in &value[at + 2..at + 8] {
-        authority = (authority << 8) | u64::from(byte);
-    }
-    let mut subauthorities = Vec::with_capacity(count);
-    for index in 0..count {
-        subauthorities.push(le32(value, at + 8 + index * 4)?);
-    }
-    Ok(Some(NtfsSid {
-        authority,
-        subauthorities,
-    }))
+    NtfsSid::prefix(&value[at..]).map(|(sid, _)| Some(sid))
 }
 
-fn acl_at(value: &[u8], offset: u32, present: bool) -> Result<NtfsAcl, ParseError> {
+fn acl_at(value: &[u8], offset: u32, present: bool, system: bool) -> Result<NtfsAcl, ParseError> {
     if !present && offset != 0 {
         return Err(invalid("ACL offset is present without its control flag"));
     }
@@ -149,18 +243,30 @@ fn acl_at(value: &[u8], offset: u32, present: bool) -> Result<NtfsAcl, ParseErro
             offset,
             revision: None,
             ace_count: None,
+            size: None,
+            aces: Vec::new(),
+            padding: Vec::new(),
         });
     }
     let at = component_offset(value, offset, 8)?;
     let revision = value[at];
     let size = usize::from(le16(value, at + 2)?);
     let count = le16(value, at + 4)?;
-    if !matches!(revision, 2 | 4) || size < 8 || !size.is_multiple_of(4) || at + size > value.len()
+    if !matches!(revision, 2 | 4)
+        || value[at + 1] != 0
+        || le16(value, at + 6)? != 0
+        || size < 8
+        || !size.is_multiple_of(4)
+        || at + size > value.len()
+        || usize::from(count) > (size - 8) / 4
     {
-        return Err(invalid("invalid ACL revision or declared extent"));
+        return Err(invalid(
+            "invalid ACL revision, reserved fields or declared extent",
+        ));
     }
     let end = at + size;
     let mut cursor = at + 8;
+    let mut aces = Vec::with_capacity(usize::from(count));
     for _ in 0..count {
         if cursor + 4 > end {
             return Err(invalid("ACL ACE count exceeds its declared extent"));
@@ -169,8 +275,11 @@ fn acl_at(value: &[u8], offset: u32, present: bool) -> Result<NtfsAcl, ParseErro
         if length < 4 || !length.is_multiple_of(4) || cursor + length > end {
             return Err(invalid("invalid ACE size or boundary"));
         }
-        // ACE bodies remain opaque. Their order, type, inheritance flags,
-        // object GUIDs and conditional application data stay in the raw bytes.
+        aces.push(NtfsAce::parse(
+            &value[cursor..cursor + length],
+            revision,
+            system,
+        )?);
         cursor += length;
     }
     // AclSize includes reserved free space after the counted ACEs.
@@ -179,6 +288,9 @@ fn acl_at(value: &[u8], offset: u32, present: bool) -> Result<NtfsAcl, ParseErro
         offset,
         revision: Some(revision),
         ace_count: Some(count),
+        size: Some(size as u16),
+        aces,
+        padding: value[cursor..end].to_vec(),
     })
 }
 
@@ -210,6 +322,7 @@ impl NtfsSecurityHeader {
         if header.security_id == 0
             || !(40..=MAX_SECURITY_DESCRIPTOR_BYTES as u32 + SDS_HEADER_BYTES as u32)
                 .contains(&header.length)
+            || !header.length.is_multiple_of(4)
             || !header.offset.is_multiple_of(16)
             || header.offset & SDS_COPY_DISTANCE != 0
             || header.offset % SDS_COPY_DISTANCE + u64::from(header.length) > SDS_COPY_DISTANCE
