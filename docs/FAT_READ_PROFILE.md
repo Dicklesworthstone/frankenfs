@@ -2,8 +2,9 @@
 
 `ffs-fat` is a native Rust companion binary in `ffs-cli`. It uses the shared
 `ffs-ondisk::fat` parser and the existing `ffs-core::FsOps` / `ffs-fuse` adapter.
-It implements reads and creation of new empty images without invoking another
-filesystem driver or formatter. The ordinary
+It implements reads and creation of new images, including native population
+from a source directory, without invoking another filesystem driver or formatter.
+The ordinary
 ext4/btrfs `ffs-cli` dispatch and `FsFlavor` are unchanged; this is not yet
 integration into the generic `ffs mount` or `OpenFs` auto-detection path.
 
@@ -14,10 +15,13 @@ Build `ffs-fat` with the repository's prescribed Cargo/RCH workflow:
 ```sh
 rch exec -- cargo build -p ffs-cli --bin ffs-fat
 
-# These paths must not already exist; format creates an empty volume image.
+# These paths must not already exist; format creates a fresh volume image.
 target/debug/ffs-fat format new-fat16.img --kind fat16 --size-mib 4 --label DATA
 target/debug/ffs-fat format new-fat32.img --kind fat32 --size-mib 64 --serial 305441741
 target/debug/ffs-fat format selected-clusters.img --kind fat32 --size-mib 128 --sectors-per-cluster 2 --serial 0x1234ABCD
+# Source files and directories must remain immutable until this finishes.
+target/debug/ffs-fat format populated-fat16.img --kind fat16 --size-mib 64 --source-dir ./release-tree
+target/debug/ffs-fat format populated-fat32.img --kind fat32 --size-mib 128 --source-dir ./release-tree --label RELEASE --serial 0x1234ABCD
 
 target/debug/ffs-fat inspect volume.img
 target/debug/ffs-fat check volume.img
@@ -50,8 +54,11 @@ may still leave a previously streamed prefix on stdout and exits unsuccessfully.
 
 ## New-image formatter
 
-`ffs-fat format NEW_IMAGE --kind fat16|fat32 --size-mib N` creates a new empty
-volume image at byte zero. Both dialect and exact logical size are required.
+`ffs-fat format NEW_IMAGE --kind fat16|fat32 --size-mib N` creates a new
+volume image at byte zero. Without `--source-dir`, it retains the original empty
+image behavior. With that option, it copies an admitted source tree into real
+native FAT files and directories before publishing either boot sector. Both
+dialect and exact logical size are required.
 The output is a volume image, without a partition table or operating-system
 bootloader. No overwrite, device-format, partition-offset or resize option is
 provided.
@@ -68,11 +75,11 @@ creating the output. This preserves the original automatic geometry choices.
 |---|---|---|
 | Data-cluster range | 4,087..65,518 | 65,525..8,388,608 |
 | Reserved sectors | 1 | 32 |
-| Root directory | Fixed 512-entry region | Allocated cluster 2, terminated by EOC |
+| Root directory | Fixed 512-entry region | Chain starting at cluster 2, extended for populated entries |
 | Primary / backup boot record | Sector 0 / absent | Sectors 0..2 / 6..8 |
 | FSInfo | Absent | Sector 1 and initial copy at sector 7 |
 | FAT copies | Two matching complete copies | Two matching complete copies |
-| Explicit 512-byte metadata writes | 4 | 9 |
+| Empty-image explicit 512-byte metadata writes | 4 | 9 |
 
 The FAT16 range avoids ambiguous FAT12 thresholds and reserved cluster
 identifiers. FAT32 stays within the allocation checker's 8,388,608-cluster
@@ -88,11 +95,14 @@ applies to the exercised geometries, not automatically to every admitted size.
 An optional `--label` accepts 1..11 legal printable ASCII FAT label bytes,
 without leading or trailing space, uppercases them, and writes the same padded
 name to the native boot label and root volume-label entry. With no label, the
-boot field contains the native `NO NAME` default and the entire root is empty.
+boot field contains the native `NO NAME` default and no root volume-label slot
+is consumed. The root is otherwise empty unless a source tree is supplied.
 `--serial` accepts a 32-bit volume identifier in decimal or `0x`/`0X` hex;
 the default is derived from the system clock and is not a uniqueness guarantee.
-Supplying a serial makes the constructed image deterministic. Native label-entry
-creation/access/modification dates use 1980-01-01; ordinary root slots remain zero.
+Supplying a serial makes the constructed image deterministic for the same admitted
+source tree and options. Native creation/access/modification dates use 1980-01-01;
+unused slots and allocation slack remain zero. Source permissions, timestamps,
+extended attributes and ownership are not imported.
 
 All options and the completed BPB are checked before an atomic `create_new`
 open with mode 0600, subject to the caller's umask. Existing regular files,
@@ -106,10 +116,12 @@ root slack and free space. Physical storage may be sparse; the command does
 not reserve the image's entire logical size for future writes. Existing image
 bytes are never read or copied during initialization.
 
-Preparation writes clean native FAT headers, root metadata, both FAT32 FSInfo
-sectors and the signed FAT32 boot-extension sectors 2 and 8, then synchronizes
-the file. The initial FSInfo free count is exact and the next-free search hint
-is cluster 3. Both primary and backup BPBs remain unpublished throughout this
+Preparation writes any source payloads, the complete planned allocation links in
+both FATs, native directories, both FAT32 FSInfo sectors and the signed FAT32
+boot-extension sectors 2 and 8, then synchronizes the file. The initial FSInfo
+free count is exact. Its next-free search hint is the first unused cluster,
+cluster 3 for an empty image, or the native unknown value when allocation is full.
+Both primary and backup BPBs remain unpublished throughout this
 stage. Cancellation from the request context or Ctrl+C is honored before
 creation and at preparation boundaries, including immediately after that sync.
 
@@ -124,14 +136,18 @@ Verification reads back every explicitly written metadata sector, including
 all six FAT32 boot-record sectors, and runs the existing allocation checker
 through a read-only adapter over a clone of the same locked handle. It neither
 reopens the target pathname nor reacquires its lock. Success requires complete
-coverage, an empty namespace, expected free/allocated counts, agreeing FAT
-copies and no allocation findings. Full readback is mandatory; the bounded
-initialization phase is followed by verification that scales with the admitted
-allocation count.
+coverage, the exact planned file/directory and free/allocated counts, agreeing
+FAT copies and no allocation findings. Populated images additionally enumerate
+every native directory and read every file through `FatVolume`, checking exact
+names/aliases, sizes, chains and SHA-256 payload digests. Full readback is mandatory;
+verification scales with the admitted allocation count and total copied payload.
 
 The JSON result preserves `operation: create_new_image`,
 `created_new_image: true`, native geometry/label/serial fields and the embedded
-read-only `verification` report. It adds `durability: file_and_parent_synced`.
+read-only `verification` report. It adds `durability: file_and_parent_synced`,
+`source_directory`, `copied_files`, `copied_directories` (including the root),
+`copied_bytes` and `payload_verification`. For a source tree the last field is
+`sha256_via_native_reader`; it is null without a source, as is `source_directory`.
 No successful result is emitted before final synchronization and verification.
 
 An error always retains any newly created destination, with its original cause
@@ -149,9 +165,94 @@ and the completed phase:
 
 The file is not silently removed or reused on a subsequent attempt. The lock
 remains advisory; unrelated writers and kernel mounts are outside the contract.
-This adds empty-image creation. Writable mounts, mutation/recovery of existing
-FAT filesystems, partition formatting and MVCC/RaptorQ integration remain separate
-native write-path work.
+This implements fresh empty and populated image creation. Writable mounts,
+mutation/recovery of existing FAT filesystems, partition formatting and
+MVCC/RaptorQ integration remain separate native write-path work.
+
+### Populating a fresh image from a source directory
+
+The source option is a bounded native creation operation: the existing geometry
+planner allocates real FAT chains, writes ordinary file contents and encodes
+native directory records. It does not store a tar archive, private object map,
+host-path reference or sidecar inside the image. A completed populated image is
+read through the same native FAT parser and allocation checker as an image
+created by another FAT implementation.
+
+Preflight completes before opening the output path. It enumerates and sorts the
+source tree, reserves every sibling name and alias, computes all native directory
+slots, allocates every chain, and hashes each source file. A FAT16 root can hold
+exactly 512 slots, including a requested volume label and all LFN slots; an exact
+full root is legal without an extra end marker. A name that needs an LFN occupies
+its short entry plus up to 20 preceding long entries. FAT32 roots and ordinary
+directories grow to complete cluster chains. Space and file-size failures return
+the original ENOSPC or file-too-large cause while leaving no destination.
+
+The first creation profile has the following explicit bounds:
+
+| Source property | Admitted profile |
+|---|---|
+| Tree objects | At most 4,096, including the root |
+| Retained regular-file handles | At most 1,024 |
+| Relative depth | At most 64 components below the root |
+| Individual component | Lossless UTF-8, at most 255 bytes and 255 UTF-16 units |
+| Ordinary directory | At most 65,536 native 32-byte slots |
+| File length | At most 4,294,967,295 bytes and enough image clusters |
+| Payload copying/hash I/O | At most 64 KiB per checkpoint interval |
+| Host entry types | Regular files and directories; no symlinks or special files |
+| Destination | A new regular file outside the canonical source directory |
+
+The caller must keep the entire source tree, its intermediate path components,
+and the destination parent namespace stable until creation finishes. Source
+regular files are opened read-only with final-component no-follow and nonblocking
+flags, verified with their opened metadata, shared-advisory-locked and retained
+through copying and native readback. Preflight and publication preparation
+compare device/inode identity, size, nanosecond modification/change timestamps
+and complete directory memberships. Access times are excluded because reads
+can update them. This detects ordinary concurrent edits and path replacement;
+it is not a host snapshot or protection against an adversarial writer bypassing
+advisory locks or changing intermediate path resolutions.
+
+SHA-256 is calculated from each retained source handle during preflight, again
+while copying that handle into its reserved native chain, and finally from file
+bytes returned by the native FAT reader on the locked output handle. A different
+copy digest or source metadata/membership check aborts before either BPB.
+Source hardlinks are copied as separate ordinary FAT files with separate chains.
+Empty files have zero length and cluster zero. No source object is written,
+renamed, removed or truncated.
+
+Name creation preserves the exact accepted Unicode text without normalization.
+It rejects invalid/control characters, the native U+FFFF LFN padding sentinel,
+final spaces/periods, reserved DOS device names (including the documented
+superscript COM/LPT variants), and non-UTF-8 host names. Sibling collisions use a conservative Unicode uppercase-then-lowercase
+key; this deliberately refuses case-equivalent names such as README/readme or
+É/é without claiming a particular Windows/OEM collation table.
+
+ASCII 8.3 names use native uppercase short entries and lowercase part flags when
+those flags reproduce the original spelling. Mixed-case and other long names
+retain the exact UTF-16 LFN. Generated ASCII aliases use a finite deterministic
+tilde-number search. Every existing natural short alias and every sibling long
+name is reserved before generation, so a long name cannot steal a later sibling's
+native name. LFN sets contain native descending ordinals, the last-entry bit,
+the short-name checksum, and the required terminator/padding when the final
+13-unit fragment is partial. Subdirectories begin with dot entries; a parent
+link to the root uses cluster zero in both FAT16 and FAT32.
+
+Each object receives its own contiguous initial chain. The allocator derives
+space from the checked fresh-image geometry, never from FSInfo hints. Both FATs
+receive identical links and EOC records. Every directory and file allocation
+starts as logical zero; payload tail bytes, unwritten cluster slack, free
+clusters, directory end slots and FAT padding remain zero. Only the payload
+and metadata required by the plan are written, so memory does not scale with
+the image's logical byte size. This deterministic initial allocation is not a
+defragmentation or future in-place allocation policy.
+
+The new source path adds preparation work; the existing bounded publication
+sequence is unchanged. A failed source preflight creates nothing. A later copy,
+source-stability, metadata or preparation-sync failure retains an incomplete
+new file with both BPBs unpublished. Once BPB publication starts, existing
+durability-phase reporting applies. An error during native directory or payload
+readback explicitly reports that the file and parent were already synchronized;
+it never turns a failed digest into success or silently removes the image.
 
 ### Native format references
 
@@ -162,8 +263,11 @@ The layout was reviewed against Microsoft's *FAT Specification 1.03*
 The retrieved document is 222,720 bytes with SHA-256
 `b17d66c796d9cd3070adf4ccbc00add5a8b6b6f5491fe8ea949df778fce60172`.
 Its BPB tables, FAT type determination, reserved entries, root initialization,
-FSInfo and three-sector backup description informed the encoder and independent
-byte fixtures. The original document is not redistributed in the repository.
+FSInfo, three-sector backup, short/long directory entries, alias checksums and
+native dot/parent rules informed the encoder and independent byte fixtures.
+The original document is not redistributed in the repository. The source-name
+profile also follows Microsoft's [file naming rules](https://learn.microsoft.com/en-us/windows/win32/fileio/naming-a-file)
+for invalid characters, trailing periods/spaces and reserved DOS device names.
 The existing native implementation reference is retained:
 [dosfstools 4.2 formatter](https://github.com/dosfstools/dosfstools/blob/v4.2/src/mkfs.fat.c).
 
@@ -422,3 +526,33 @@ result from those attempts. The installed UBS
 launcher was not executable. Native dosfstools/mtools and mounted runs have not
 executed. The separate 838-test on-disk parser run and on-disk Clippy pass do not
 validate this CLI formatter or count as native interchange evidence.
+
+
+**Populated-image increment (2026-10-12):** the source-directory command adds
+native file/directory creation to fresh images while preserving every original
+empty-format regression. Fifteen new Rust test groups cover end-to-end copies
+in both dialects; independently decoded FAT links, dots, zero slack and FSInfo;
+short-name case flags; exact Unicode and 13/14/255-unit LFN boundaries; reserved
+alias collisions; root and subdirectory growth; fixed-root/label/LFN capacity;
+preflight ENOSPC and the native file-size limit; source type/name/depth refusal;
+hardlink separation; source replacement and in-copy changes; payload and extra
+metadata I/O failures/cancellation; and data corruption detectable only by native
+payload readback. They also preserve verification on the created inode after
+its destination pathname is replaced.
+
+The extended external oracle includes populated images, native fsck and mtools
+extraction/insertion, exact source-tree payload/name comparisons, allocation and
+FSInfo counts, and optional mounted traversal. Authored tests and oracle coverage
+are not executed interoperability evidence. Runtime and formatting results for
+this increment must identify the actual revision and commands exercised; no
+native or mounted success is inferred from the source implementation.
+
+Final source integration evidence (2026-10-12): all five changed Rust source
+files passed rustfmt parsing/formatting checks, the expanded external runner
+passed Python syntax compilation, and independent production/API/fixture reviews
+found no remaining concrete defect. CLI compilation again received SIGKILL while
+building `asupersync` under the shared memory limit. The 15 new regression groups,
+native fsck/mtools interchange and mounted cases remain unexecuted. Workspace
+formatting reports existing differences in unchanged files; UBS could not execute
+its installed launcher. The separately passing 850-test on-disk suite does not
+validate this formatter or establish native interchange.

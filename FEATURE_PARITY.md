@@ -1099,3 +1099,35 @@ remain unexecuted. UBS
 could not execute its installed launcher. On-disk parser tests and Clippy do not
 qualify this formatter. See `docs/FAT_READ_PROFILE.md` for the native profile,
 commands, interruption outcomes and interoperability limits.
+
+### FAT16/FAT32 populated native image creation
+
+`ffs-fat format --source-dir DIRECTORY` now constructs complete native file and
+directory trees in new images. The existing geometry planner and publication
+sequence allocate both FAT copies, native short/long names, file and directory
+chains, dot/parent entries, zero slack and exact FAT32 FSInfo hints. Preflight
+checks native name and file-size limits, FAT16 fixed-root capacity and total
+cluster space before exclusive destination creation. Short aliases reserve all
+sibling native and long names before selection; the native U+FFFF LFN padding
+sentinel is refused before writing.
+
+Retained source handles, namespace/identity checks and SHA-256 checks detect
+source replacement or changes during preparation. Both BPBs remain withheld
+until planned payloads and metadata are ready and synchronized. After durable
+publication, verification uses the original locked output inode, the complete
+allocation/namespace checker and every payload through the native FAT reader.
+The source contract is bounded and requires a stable tree; it is not a host
+snapshot or an existing-volume mutation API.
+
+All 25 existing formatter tests remain, with 15 new substantive regression
+groups for layout, names, directory growth, capacity, source races, cancellation,
+I/O failures and payload corruption. The native oracle adds populated-image
+fsck/mtools extraction and extension, exact names/bytes/counts, source and image
+immutability checks and optional mounted reads while preserving previous cases.
+The changed Rust files passed parsing/formatting checks, the oracle passed Python
+syntax compilation, and two independent source/API reviews found no remaining
+concrete defect. CLI compilation remains blocked by `asupersync` receiving SIGKILL
+under the shared memory limit. The new formatter tests, native interchange and
+mounted cases remain unexecuted. Workspace formatting reports pre-existing
+differences in unchanged files; the installed UBS launcher is not executable.
+See `docs/FAT_READ_PROFILE.md` for the command, native limits and evidence scope.

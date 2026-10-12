@@ -250,7 +250,7 @@ fn extract_slots(
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Create a new empty FAT16/FAT32 image and verify it before reporting success.
+    /// Create a new FAT16/FAT32 image, optionally copy --source-dir, and verify it.
     /// Existing files and devices are never formatted.
     Format {
         #[command(flatten)]
