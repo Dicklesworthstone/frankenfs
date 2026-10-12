@@ -26,6 +26,9 @@ pub struct RaidzColumn {
     pub data_offset: Option<usize>,
 }
 
+/// Retain the original public column name for existing RAIDZ1 callers.
+pub type Raidz1Column = RaidzColumn;
+
 /// Construction validates the bounded geometry; callers cannot alter its map.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Raidz1Map {
