@@ -160,7 +160,11 @@ impl<'a> Cursor<'a> {
             }
             let kind = pair.word()?;
             let elements = pair.word()?;
-            let limit = if kind == 10 { MAX_BYTE_ARRAY } else { MAX_ITEMS };
+            let limit = if kind == 10 {
+                MAX_BYTE_ARRAY
+            } else {
+                MAX_ITEMS
+            };
             if elements as usize > limit {
                 return Err(invalid("nvpair element budget exceeded"));
             }
@@ -181,7 +185,11 @@ impl<'a> Cursor<'a> {
                     // arrays, it has no repeated count before the bytes.
                     let count = count as usize;
                     let bytes = pair.take(count)?.to_vec();
-                    if pair.take((4 - count % 4) % 4)?.iter().any(|byte| *byte != 0) {
+                    if pair
+                        .take((4 - count % 4) % 4)?
+                        .iter()
+                        .any(|byte| *byte != 0)
+                    {
                         return Err(invalid("nonzero XDR byte-array padding"));
                     }
                     Value::Bytes(bytes)
@@ -332,9 +340,9 @@ mod tests {
         // OpenZFS nvs_xdr_nvp_op: eight name bytes, type 10, three opaque
         // bytes and one pad byte. The native decoded nvpair occupies 40 bytes.
         let raw = [
-            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 32, 0, 0, 0, 40,
-            0, 0, 0, 8, b'u', b's', b'e', b'r', b'.', b'b', b'i', b'n',
-            0, 0, 0, 10, 0, 0, 0, 3, 0, 255, 65, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+            1, 1, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 32, 0, 0, 0, 40, 0, 0, 0, 8, b'u', b's',
+            b'e', b'r', b'.', b'b', b'i', b'n', 0, 0, 0, 10, 0, 0, 0, 3, 0, 255, 65, 0, 0, 0, 0, 0,
+            0, 0, 0, 0,
         ];
         assert_eq!(
             NvList::parse_exact(&raw).unwrap().fields["user.bin"],
@@ -365,10 +373,15 @@ mod tests {
             assert!(NvList::parse_exact(&padded).is_err());
         }
         let oversized = vec![0; (MAX_BYTE_ARRAY + 1).next_multiple_of(4)];
-        assert!(NvList::parse_exact(&packed(&[pair(
-            "user.large", 10, (MAX_BYTE_ARRAY + 1) as u32, &oversized
-        )])).is_err());
-        assert!(NvList::parse_exact(&packed(&[pair("numeric", 14, 8193, &[])]))
-            .is_err());
+        assert!(
+            NvList::parse_exact(&packed(&[pair(
+                "user.large",
+                10,
+                (MAX_BYTE_ARRAY + 1) as u32,
+                &oversized
+            )]))
+            .is_err()
+        );
+        assert!(NvList::parse_exact(&packed(&[pair("numeric", 14, 8193, &[])])).is_err());
     }
 }

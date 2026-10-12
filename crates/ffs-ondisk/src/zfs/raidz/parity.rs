@@ -45,7 +45,11 @@ impl RaidzParityMap {
         let data_sectors = physical_bytes.div_ceil(sector);
         let short_rows = data_sectors / (width - parity);
         let remainder = data_sectors % (width - parity);
-        let long_columns = if remainder == 0 { 0 } else { remainder + parity };
+        let long_columns = if remainder == 0 {
+            0
+        } else {
+            remainder + parity
+        };
         let rows = short_rows + usize::from(remainder != 0);
         let active_columns = if short_rows == 0 { long_columns } else { width };
         let column_count = if short_rows == 0 {
@@ -153,16 +157,21 @@ impl RaidzParityMap {
         let missing: Vec<_> = (self.parity..self.active_columns)
             .filter(|&index| excluded[index])
             .collect();
-        let recovered = self.reconstruct(columns, &excluded, &missing)?;
+        let recovered = self.reconstruct(columns, excluded, &missing)?;
         let mut physical = Vec::new();
         physical
             .try_reserve_exact(self.physical_bytes)
             .map_err(|_| invalid("RAIDZ2/3 assembly allocation failed"))?;
-        for index in self.parity..self.active_columns {
+        for (index, column) in columns
+            .iter()
+            .enumerate()
+            .take(self.active_columns)
+            .skip(self.parity)
+        {
             let bytes = if let Some(slot) = missing.iter().position(|&item| item == index) {
                 recovered[slot].as_slice()
             } else {
-                columns[index].ok_or_else(|| invalid("missing RAIDZ2/3 data column"))?
+                column.ok_or_else(|| invalid("missing RAIDZ2/3 data column"))?
             };
             let take = bytes.len().min(self.physical_bytes - physical.len());
             physical.extend_from_slice(&bytes[..take]);
@@ -176,7 +185,7 @@ impl RaidzParityMap {
     fn reconstruct(
         &self,
         columns: &[Option<&[u8]>],
-        excluded: &[bool; 8],
+        excluded: [bool; 8],
         missing: &[usize],
     ) -> Result<Vec<Vec<u8>>, ParseError> {
         let count = missing.len();
@@ -374,7 +383,12 @@ mod tests {
     // the decoder's multiplication, coefficient or inverse implementations.
     fn twice(value: u8) -> u8 {
         let widened = u16::from(value) * 2;
-        u8::try_from(if widened >= 256 { widened ^ 0x11d } else { widened }).unwrap()
+        u8::try_from(if widened >= 256 {
+            widened ^ 0x11d
+        } else {
+            widened
+        })
+        .unwrap()
     }
 
     fn stored_columns(map: &RaidzParityMap) -> Vec<Vec<u8>> {
@@ -414,7 +428,8 @@ mod tests {
         for parity in 2..=3 {
             for width in parity + 1..=8 {
                 for sectors in [1, width - parity, width - parity + 1, 2 * width + 1] {
-                    let map = RaidzParityMap::new(1 << 20, sectors * 512, 9, width, parity).unwrap();
+                    let map =
+                        RaidzParityMap::new(1 << 20, sectors * 512, 9, width, parity).unwrap();
                     let stored = stored_columns(&map);
                     let expected = stored[parity..map.active_columns].concat();
                     for mask in 0_u16..1 << map.active_columns {
@@ -470,7 +485,11 @@ mod tests {
             .iter()
             .enumerate()
             .map(|(index, data)| {
-                if index < 3 { None } else { Some(data.as_slice()) }
+                if index < 3 {
+                    None
+                } else {
+                    Some(data.as_slice())
+                }
             })
             .collect();
         assert_eq!(map.assemble(&slices, &[]).unwrap(), expected);

@@ -99,7 +99,8 @@ fn raidz_mount_recovers_metadata_legacy_sa_spill_and_embedded_file_parents() {
                         fs.read(&cx, &mut scope, file.ino, 0, 4096).unwrap(),
                         expected
                     );
-                    let before: Vec<_> = reads.iter().map(|log| log.lock().unwrap().len()).collect();
+                    let before: Vec<_> =
+                        reads.iter().map(|log| log.lock().unwrap().len()).collect();
                     assert_eq!(
                         fs.read(&cx, &mut scope, alias.ino, 510, 600).unwrap(),
                         expected[510..]
@@ -138,7 +139,9 @@ fn failed_or_cancelled_raidz_file_data_is_never_cached_and_no_prefix_escapes() {
         for case in 0..4 {
             let mut image = striped_graph(Endian::Little, 2, 0, nparity);
             let data = image.column(FIRST, nparity);
-            let parity: Vec<_> = (0..nparity).map(|index| image.column(FIRST, index)).collect();
+            let parity: Vec<_> = (0..nparity)
+                .map(|index| image.column(FIRST, index))
+                .collect();
             let last = image.column(LAST, nparity);
             let mut faults = vec![Fault::None; width(nparity)];
             match case {

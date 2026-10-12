@@ -181,7 +181,9 @@ pub struct XattrSources {
 impl XattrSources {
     fn validate(self) -> Result<Self, ParseError> {
         if self.directory >= OBJECT_LIMIT {
-            return Err(invalid("xattr directory reference exceeds the object namespace"));
+            return Err(invalid(
+                "xattr directory reference exceeds the object namespace",
+            ));
         }
         Ok(self)
     }

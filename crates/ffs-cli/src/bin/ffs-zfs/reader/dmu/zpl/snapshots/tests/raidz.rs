@@ -30,9 +30,7 @@ fn striped_pool(order: Endian, case: u8, parity: usize) -> StripedImage {
     if parity == 1 {
         StripedImage::graph(&image.bytes, root, order, 3, 100, 90)
     } else {
-        StripedImage::graph_with_parity(
-            &image.bytes, root, order, width(parity), 100, 90, parity,
-        )
+        StripedImage::graph_with_parity(&image.bytes, root, order, width(parity), 100, 90, parity)
     }
 }
 

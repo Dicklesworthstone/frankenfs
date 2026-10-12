@@ -8,8 +8,8 @@ pub(in crate::reader) mod raidz;
 
 use super::{
     BlockPointer, BlockRead, Cx, DATA_OFFSET, FfsError, Label, Leaf, NvList, RaidzGroup,
-    RaidzMember, Result, RootBlock, Uberblock, Value, VdevConfig, admit_vdev_state,
-    checkpoint, corrupt, integer, parse, unsupported,
+    RaidzMember, Result, RootBlock, Uberblock, Value, VdevConfig, admit_vdev_state, checkpoint,
+    corrupt, integer, parse, unsupported,
 };
 use std::collections::BTreeSet;
 

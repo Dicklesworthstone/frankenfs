@@ -190,7 +190,10 @@ impl Zpl {
                 }
                 Metadata::legacy(node.bonus(), node.order()).map_err(|error| parse(&error))?
             }
-            44 => self.sa_attributes(cx, &object)?.metadata().map_err(|error| parse(&error))?,
+            44 => self
+                .sa_attributes(cx, &object)?
+                .metadata()
+                .map_err(|error| parse(&error))?,
             _ => return Err(unsupported("unknown ZPL bonus representation")),
         };
         if (metadata.kind == Kind::Directory) != (node.object_type() == 20)

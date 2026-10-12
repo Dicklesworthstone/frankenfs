@@ -120,7 +120,11 @@ impl StripedImage {
             | (root.len() as u64 / 512 - 1)
             | ((physical.len() as u64 / 512 - 1) << 16);
         pointer[48..56].copy_from_slice(&order.encode(property));
-        for (index, value) in checksum(&physical, 7, order).unwrap().into_iter().enumerate() {
+        for (index, value) in checksum(&physical, 7, order)
+            .unwrap()
+            .into_iter()
+            .enumerate()
+        {
             pointer[96 + index * 8..104 + index * 8].copy_from_slice(&order.encode(value));
         }
         image.uberblock[40..168].copy_from_slice(&pointer);
@@ -280,7 +284,8 @@ impl StripedImage {
                 for (index, value) in parity.iter_mut().enumerate() {
                     for _ in 0..row {
                         let wide = u16::from(*value) * 2;
-                        *value = u8::try_from(if wide >= 256 { wide ^ 0x11d } else { wide }).unwrap();
+                        *value =
+                            u8::try_from(if wide >= 256 { wide ^ 0x11d } else { wide }).unwrap();
                     }
                     if index < data.bytes {
                         *value ^= padded[start + index];

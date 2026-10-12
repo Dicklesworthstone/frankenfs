@@ -36,7 +36,9 @@ pub fn decompress_chunk(input: &[u8], expected_bytes: usize) -> Result<Vec<u8>, 
         return Err(invalid("invalid expected chunk length"));
     }
     if !(2..=MAX_INPUT_BYTES).contains(&input.len()) {
-        return Err(invalid("compressed chunk length is outside the bounded profile"));
+        return Err(invalid(
+            "compressed chunk length is outside the bounded profile",
+        ));
     }
     let mut bits = InputBits::new(input);
     let mut main_lengths = [0_u8; MAIN_SYMBOLS];
@@ -59,12 +61,8 @@ pub fn decompress_chunk(input: &[u8], expected_bytes: usize) -> Result<Vec<u8>, 
         let end = output.len() + size;
         match kind {
             1 | 2 => {
-                let codes = read_codes(
-                    &mut bits,
-                    &mut main_lengths,
-                    &mut length_lengths,
-                    kind == 2,
-                )?;
+                let codes =
+                    read_codes(&mut bits, &mut main_lengths, &mut length_lengths, kind == 2)?;
                 decode_block(&mut bits, &codes, &mut recent, &mut output, end)?;
             }
             3 => {
@@ -87,7 +85,7 @@ pub fn decompress_chunk(input: &[u8], expected_bytes: usize) -> Result<Vec<u8>, 
             _ => return Err(invalid("unknown LZX block type")),
         }
     }
-    undo_e8(&mut output);
+    undo_e8(&mut output)?;
     Ok(output)
 }
 
@@ -120,8 +118,7 @@ impl<'a> InputBits<'a> {
             }
             let used = count.min(self.available);
             self.available -= used;
-            result = (result << used)
-                | ((self.word >> self.available) & ((1_u32 << used) - 1));
+            result = (result << used) | ((self.word >> self.available) & ((1_u32 << used) - 1));
             count -= used;
         }
         Ok(result)
@@ -186,9 +183,7 @@ impl Huffman {
                 return Err(invalid("oversubscribed Huffman code lengths"));
             }
         }
-        if total != 0
-            && code + u32::from(result.counts[MAX_CODE_BITS]) != 1_u32 << MAX_CODE_BITS
-        {
+        if total != 0 && code + u32::from(result.counts[MAX_CODE_BITS]) != 1_u32 << MAX_CODE_BITS {
             return Err(invalid("incomplete Huffman code lengths"));
         }
         result
@@ -215,7 +210,9 @@ impl Huffman {
             if let Some(index) = code.checked_sub(self.first[width])
                 && index < u32::from(self.counts[width])
             {
-                return Ok(usize::from(self.symbols[self.offsets[width] + index as usize]));
+                return Ok(usize::from(
+                    self.symbols[self.offsets[width] + index as usize],
+                ));
             }
         }
         Err(invalid("invalid Huffman code"))
@@ -312,7 +309,11 @@ fn decode_block(
             recent[0]
         } else {
             let extra = slot / 2 - 1;
-            let base = if slot == 3 { 3 } else { (2 + slot % 2) << extra };
+            let base = if slot == 3 {
+                3
+            } else {
+                (2 + slot % 2) << extra
+            };
             let suffix = if let Some(aligned) = &codes.aligned
                 && extra >= 3
             {
@@ -339,7 +340,7 @@ fn decode_block(
     Ok(())
 }
 
-fn undo_e8(output: &mut [u8]) {
+fn undo_e8(output: &mut [u8]) -> Result<(), ParseError> {
     let end = output.len().saturating_sub(10);
     let mut at = 0;
     while at < end {
@@ -347,8 +348,14 @@ fn undo_e8(output: &mut [u8]) {
             at += 1;
             continue;
         }
-        let position = at as i32;
-        let bytes = [output[at + 1], output[at + 2], output[at + 3], output[at + 4]];
+        let position =
+            i32::try_from(at).map_err(|_| invalid("E8 position exceeds the bounded chunk"))?;
+        let bytes = [
+            output[at + 1],
+            output[at + 2],
+            output[at + 3],
+            output[at + 4],
+        ];
         let absolute = i32::from_le_bytes(bytes);
         if absolute >= -position && absolute < E8_FILE_SIZE {
             let relative = if absolute >= 0 {
@@ -360,6 +367,7 @@ fn undo_e8(output: &mut [u8]) {
         }
         at += 5;
     }
+    Ok(())
 }
 
 #[cfg(test)]

@@ -6,13 +6,11 @@ const BACKING: &str = "WofCompressedData";
 // Constructed native 32 KiB LZX chunk: literal A and overlapping matches.
 // RLE precode lengths exercise the native compact header, not CAB framing.
 const REPEATED_LZX_32K: &[u8] = &[
-    0x00, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22, 0x02, 0xf5, 0x0f,
-    0xff, 0x3f, 0xe2, 0xff, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x41, 0x44, 0xff, 0x1b, 0xff, 0xff, 0x08, 0xfa, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x08, 0x00, 0x3f, 0x88, 0xb5, 0xff, 0xff, 0xff, 0xff, 0x32,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0xfe,
+    0x00, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22, 0x02, 0xf5, 0x0f, 0xff, 0x3f, 0xe2, 0xff,
+    0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x44, 0xff, 0x1b, 0xff, 0xff, 0x08, 0xfa,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x3f, 0x88, 0xb5, 0xff, 0xff, 0xff, 0xff, 0x32,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0xfe,
 ];
 
 pub(in crate::reader) fn provider_value(algorithm: u32, flags: Option<u32>) -> Vec<u8> {
@@ -532,7 +530,16 @@ fn native_lzx_image(initialized: Option<usize>) -> (Image, Vec<u8>, Vec<u8>) {
     // The raw 32 KiB chunk needs a longer second run. Keep the first run at
     // LCN 210 so it cannot alias the second run spanning LCNs 140 through 203.
     attrs[2] = named_mapping(
-        &[0x21, 1, 210, 0, 0x11, u8::try_from(clusters - 1).unwrap(), 0xBA, 0],
+        &[
+            0x21,
+            1,
+            210,
+            0,
+            0x11,
+            u8::try_from(clusters - 1).unwrap(),
+            0xBA,
+            0,
+        ],
         clusters,
         stored.len(),
     );
@@ -580,10 +587,15 @@ fn lzx_reads_fragmented_compressed_raw_and_partial_chunks_and_catalogs_without_p
         .unwrap();
     assert_eq!(volume.read(&cx, &raw, 0, 100_000).unwrap(), stored);
     assert_eq!(volume.read(&cx, &stream, 65_573, 1).unwrap(), [] as [u8; 0]);
-    assert_eq!(volume.read(&cx, &stream, u64::MAX, 1).unwrap(), [] as [u8; 0]);
-    assert!(reads.lock().unwrap().iter().all(|(at, size)| {
-        *at >= BASE as u64 && *at + *size as u64 <= (BASE + LENGTH) as u64
-    }));
+    assert_eq!(
+        volume.read(&cx, &stream, u64::MAX, 1).unwrap(),
+        [] as [u8; 0]
+    );
+    assert!(
+        reads.lock().unwrap().iter().all(|(at, size)| {
+            *at >= BASE as u64 && *at + *size as u64 <= (BASE + LENGTH) as u64
+        })
+    );
 }
 
 #[test]
@@ -605,7 +617,10 @@ fn lzx_valid_data_and_cancellation_keep_tail_and_fragment_boundaries() {
         ],
     );
     reads.lock().unwrap().clear();
-    assert_eq!(volume.read(&cx, &stream, 32_762, 100).unwrap(), vec![0; 100]);
+    assert_eq!(
+        volume.read(&cx, &stream, 32_762, 100).unwrap(),
+        vec![0; 100]
+    );
     assert!(reads.lock().unwrap().is_empty());
 
     for offset in [BASE + 210 * 512, BASE + 210 * 512 + 8, BASE + 140 * 512] {
@@ -620,7 +635,12 @@ fn lzx_valid_data_and_cancellation_keep_tail_and_fragment_boundaries() {
             Err(FfsError::Cancelled),
         ));
         assert_eq!(
-            reads.lock().unwrap().iter().filter(|(at, _)| *at == offset as u64).count(),
+            reads
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(at, _)| *at == offset as u64)
+                .count(),
             1,
         );
     }

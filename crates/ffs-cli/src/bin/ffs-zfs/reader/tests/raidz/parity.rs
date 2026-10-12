@@ -54,8 +54,7 @@ fn mixed_data_and_parity_faults_recover_through_the_actual_pool_reader() {
         for order in [Endian::Little, Endian::Big] {
             for lost in &cases {
                 for io in [false, true] {
-                    let mut image =
-                        StripedImage::root_with_parity(order, width, 9, false, parity);
+                    let mut image = StripedImage::root_with_parity(order, width, 9, false, parity);
                     let expected = image.root.clone();
                     let children: Vec<_> = lost
                         .iter()
@@ -116,8 +115,7 @@ fn beyond_parity_failure_can_try_another_declared_dva_but_never_return_bad_bytes
     for parity in 2..=3 {
         let width = parity + 3;
         for all_bad in [false, true] {
-            let mut image =
-                StripedImage::root_with_parity(Endian::Big, width, 9, false, parity);
+            let mut image = StripedImage::root_with_parity(Endian::Big, width, 9, false, parity);
             let copy = image.add_root_copy(0x30_0000);
             let expected = image.root.clone();
             let lost = if parity == 2 {
@@ -151,8 +149,7 @@ fn cancellation_of_data_or_any_parity_stops_before_recovery_and_later_dvas() {
     for parity in 2..=3 {
         let width = parity + 3;
         for cancelled in [parity, 0, parity - 1] {
-            let mut image =
-                StripedImage::root_with_parity(Endian::Little, width, 9, false, parity);
+            let mut image = StripedImage::root_with_parity(Endian::Little, width, 9, false, parity);
             let copy = image.add_root_copy(0x30_0000);
             if cancelled < parity {
                 image.poison(ROOT, parity, 0);
@@ -185,8 +182,7 @@ fn parity_identity_and_late_dva_corruption_are_refused_before_payload_io() {
     for parity in 2..=3 {
         let width = parity + 3;
         for case in 0..5 {
-            let mut image =
-                StripedImage::root_with_parity(Endian::Little, width, 9, false, parity);
+            let mut image = StripedImage::root_with_parity(Endian::Little, width, 9, false, parity);
             let locations = root_locations(&image);
             match case {
                 0 => {

@@ -90,22 +90,26 @@ impl Words {
 // Constructed WIM framing: RLE pretree lengths, literal A, 127 distance-one
 // matches of 257 bytes, then a match of 128 bytes. This is not a CAB stream.
 const REPEATED_A: &[u8] = &[
-    0x00, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22, 0x02, 0xf5, 0x0f,
-    0xff, 0x3f, 0xe2, 0xff, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
-    0x41, 0x44, 0xff, 0x1b, 0xff, 0xff, 0x08, 0xfa, 0x00, 0x00, 0x00, 0x00,
-    0x00, 0x00, 0x08, 0x00, 0x3f, 0x88, 0xb5, 0xff, 0xff, 0xff, 0xff, 0x32,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
-    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0xfe,
+    0x00, 0x32, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x22, 0x02, 0xf5, 0x0f, 0xff, 0x3f, 0xe2, 0xff,
+    0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x41, 0x44, 0xff, 0x1b, 0xff, 0xff, 0x08, 0xfa,
+    0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x08, 0x00, 0x3f, 0x88, 0xb5, 0xff, 0xff, 0xff, 0xff, 0x32,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff,
+    0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x00, 0xfe,
 ];
 
 #[test]
 fn full_native_chunk_uses_overlapping_extended_matches_and_no_cross_call_history() {
     let input = REPEATED_A.to_vec();
-    assert_eq!(decompress_chunk(&input, MAX_OUTPUT_BYTES).unwrap(), vec![b'A'; MAX_OUTPUT_BYTES]);
+    assert_eq!(
+        decompress_chunk(&input, MAX_OUTPUT_BYTES).unwrap(),
+        vec![b'A'; MAX_OUTPUT_BYTES]
+    );
     assert_eq!(input, REPEATED_A);
     for end in 0..input.len() {
-        assert!(decompress_chunk(&input[..end], MAX_OUTPUT_BYTES).is_err(), "{end}");
+        assert!(
+            decompress_chunk(&input[..end], MAX_OUTPUT_BYTES).is_err(),
+            "{end}"
+        );
     }
     assert!(decompress_chunk(&input, MAX_OUTPUT_BYTES - 1).is_err());
 
@@ -114,7 +118,12 @@ fn full_native_chunk_uses_overlapping_extended_matches_and_no_cross_call_history
     main[256] = 1;
     let mut words = Words::default();
     words.header(1, 2);
-    words.tables(&[0; MAIN_SYMBOLS], &main, &[0; LENGTH_SYMBOLS], &[0; LENGTH_SYMBOLS]);
+    words.tables(
+        &[0; MAIN_SYMBOLS],
+        &main,
+        &[0; LENGTH_SYMBOLS],
+        &[0; LENGTH_SYMBOLS],
+    );
     words.put(1, 1); // R0 before this chunk has produced a literal.
     assert!(decompress_chunk(&words.finish(), 2).is_err());
 
@@ -130,7 +139,12 @@ fn block_history_preserves_huffman_deltas_dictionary_and_native_r2_swaps() {
     main[66] = 1;
     let mut words = Words::default();
     words.header(1, 4);
-    words.tables(&[0; MAIN_SYMBOLS], &main, &[0; LENGTH_SYMBOLS], &[0; LENGTH_SYMBOLS]);
+    words.tables(
+        &[0; MAIN_SYMBOLS],
+        &main,
+        &[0; LENGTH_SYMBOLS],
+        &[0; LENGTH_SYMBOLS],
+    );
     words.put(0b0110, 4);
     words.header(1, 4);
     words.tables(&main, &main, &[0; LENGTH_SYMBOLS], &[0; LENGTH_SYMBOLS]);
@@ -143,9 +157,17 @@ fn block_history_preserves_huffman_deltas_dictionary_and_native_r2_swaps() {
     main[264] = 1; // R1, length 2.
     main[272] = 1; // R2, length 2.
     words.header(1, 6);
-    words.tables(&[0; MAIN_SYMBOLS], &main, &[0; LENGTH_SYMBOLS], &[0; LENGTH_SYMBOLS]);
+    words.tables(
+        &[0; MAIN_SYMBOLS],
+        &main,
+        &[0; LENGTH_SYMBOLS],
+        &[0; LENGTH_SYMBOLS],
+    );
     words.put(0b101, 3);
-    assert_eq!(decompress_chunk(&words.finish(), 16).unwrap(), b"ABCDEFGHIJFGJFJF");
+    assert_eq!(
+        decompress_chunk(&words.finish(), 16).unwrap(),
+        b"ABCDEFGHIJFGJFJF"
+    );
 
     let mut words = Words::default();
     words.raw_block(b"abc", [3, 1, 1]);
@@ -161,7 +183,10 @@ fn block_history_preserves_huffman_deltas_dictionary_and_native_r2_swaps() {
     words.header(1, 257);
     words.tables(&main, &main, &length, &length);
     words.put(0b11, 2);
-    assert_eq!(decompress_chunk(&words.finish(), 517).unwrap(), b"abc".repeat(173)[..517]);
+    assert_eq!(
+        decompress_chunk(&words.finish(), 517).unwrap(),
+        b"abc".repeat(173)[..517]
+    );
 }
 
 #[test]
@@ -179,7 +204,12 @@ fn aligned_offsets_keep_high_bits_and_verbatim_offsets_use_the_complete_suffix()
                 words.put(3, 3);
             }
         }
-        words.tables(&[0; MAIN_SYMBOLS], &main, &[0; LENGTH_SYMBOLS], &[0; LENGTH_SYMBOLS]);
+        words.tables(
+            &[0; MAIN_SYMBOLS],
+            &main,
+            &[0; LENGTH_SYMBOLS],
+            &[0; LENGTH_SYMBOLS],
+        );
         words.put(0, 1);
         words.put(4, 3); // Slot 8: base 16 plus suffix 4 minus 2 = 18.
         words.put(1, 1);
@@ -191,14 +221,24 @@ fn aligned_offsets_keep_high_bits_and_verbatim_offsets_use_the_complete_suffix()
         }
         let mut expected = prefix.clone();
         expected.extend([33, 34, 11, 12]);
-        assert_eq!(decompress_chunk(&words.finish(), expected.len()).unwrap(), expected);
+        assert_eq!(
+            decompress_chunk(&words.finish(), expected.len()).unwrap(),
+            expected
+        );
     }
 }
 
 #[test]
 fn e8_translation_uses_chunk_positions_and_preserves_native_tail_and_signed_limits() {
     let mut translated = vec![0x90; 64];
-    for (at, absolute) in [(2, 100_i32), (10, -3), (18, -19), (26, E8_FILE_SIZE), (34, 0), (54, 100)] {
+    for (at, absolute) in [
+        (2, 100_i32),
+        (10, -3),
+        (18, -19),
+        (26, E8_FILE_SIZE),
+        (34, 0),
+        (54, 100),
+    ] {
         translated[at] = 0xE8;
         translated[at + 1..at + 5].copy_from_slice(&absolute.to_le_bytes());
     }
@@ -213,7 +253,9 @@ fn e8_translation_uses_chunk_positions_and_preserves_native_tail_and_signed_limi
 
     // Literal native compact raw header and offsets, without the optional
     // final odd-byte padding. Expected bytes are independent of Words.
-    let raw = [0, 0x60, 0, 0x30, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, b'a', b'b', b'c'];
+    let raw = [
+        0, 0x60, 0, 0x30, 1, 0, 0, 0, 1, 0, 0, 0, 1, 0, 0, 0, b'a', b'b', b'c',
+    ];
     assert_eq!(decompress_chunk(&raw, 3).unwrap(), b"abc");
 }
 
@@ -306,7 +348,10 @@ fn independent_libfwnt_verbatim_and_aligned_vectors_match_complete_native_output
         assert_eq!(format!("{:x}", Sha256::digest(&output)), output_digest);
         assert!(decompress_chunk(input, expected_size - 1).is_err());
         for end in [0, 1, input.len() / 2, input.len() - 1] {
-            assert!(decompress_chunk(&input[..end], expected_size).is_err(), "{end}");
+            assert!(
+                decompress_chunk(&input[..end], expected_size).is_err(),
+                "{end}"
+            );
         }
     }
 }

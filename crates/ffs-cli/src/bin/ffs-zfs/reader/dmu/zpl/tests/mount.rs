@@ -200,8 +200,10 @@ fn extraction_mount_refuses_writes_and_preserves_corruption_and_cancellation_err
     assert!(fs.lookup(&cx, &mut scope, ROOT, OsStr::new("a/b")).is_err());
     assert!(fs.listxattr(&cx, file.ino).unwrap().is_empty());
     assert_eq!(fs.getxattr(&cx, file.ino, "user.missing").unwrap(), None);
-    assert!(matches!(fs.getxattr(&cx, file.ino, "security.capability"),
-        Err(FfsError::UnsupportedFeature(_))));
+    assert!(matches!(
+        fs.getxattr(&cx, file.ino, "security.capability"),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
     assert!(matches!(
         fs.statfs(&cx, &mut scope, ROOT),
         Err(FfsError::UnsupportedFeature(_))

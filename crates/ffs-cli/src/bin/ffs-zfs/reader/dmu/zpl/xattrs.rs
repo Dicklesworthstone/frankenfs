@@ -1,16 +1,24 @@
 //! Native user xattrs from SA nvlists and checked private ZPL directories.
 //! OpenZFS zfs-2.3.0 zpl_xattr.c defines prefixed-name fallback and SA priority.
 
-use super::{Cx, FfsError, Kind, Result, Zpl, checkpoint, corrupt, directory_reference, parse, unsupported};
+use super::{
+    Cx, FfsError, Kind, Result, Zpl, checkpoint, corrupt, directory_reference, parse, unsupported,
+};
 use ffs_ondisk::zfs_zpl::{XATTR_BYTES, XATTR_COUNT, XATTR_NAME_BYTES, XattrSources};
 use std::collections::{BTreeMap, BTreeSet};
 
 const USER: &[u8] = b"user.";
 
 fn reserved(name: &[u8]) -> bool {
-    [b"freebsd:".as_slice(), b"security.", b"system.", b"trusted.", USER]
-        .iter()
-        .any(|prefix| name.starts_with(prefix))
+    [
+        b"freebsd:".as_slice(),
+        b"security.",
+        b"system.",
+        b"trusted.",
+        USER,
+    ]
+    .iter()
+    .any(|prefix| name.starts_with(prefix))
 }
 
 /// Match the native Linux compatibility namespace, without projecting ACLs,
@@ -30,10 +38,12 @@ fn user_name(raw: &[u8]) -> Result<Option<String>> {
         raw
     };
     if USER.len() + suffix.len() > XATTR_NAME_BYTES {
-        return Err(unsupported("compatibility xattr name exceeds the host name limit"));
+        return Err(unsupported(
+            "compatibility xattr name exceeds the host name limit",
+        ));
     }
-    let suffix = std::str::from_utf8(suffix)
-        .map_err(|_| unsupported("user xattr name is not UTF-8"))?;
+    let suffix =
+        std::str::from_utf8(suffix).map_err(|_| unsupported("user xattr name is not UTF-8"))?;
     Ok(Some(format!("user.{suffix}")))
 }
 
@@ -58,11 +68,14 @@ impl Zpl {
             17 => XattrSources::legacy(object.node.bonus(), object.node.order()),
             44 => self.sa_attributes(cx, &object)?.xattrs(),
             _ => return Err(corrupt("xattr owner has an unknown bonus representation")),
-        }.map_err(|error| parse(&error))?;
+        }
+        .map_err(|error| parse(&error))?;
         let mut directory = BTreeMap::new();
         if source.directory != 0 {
             if source.directory == owner || source.directory == self.root {
-                return Err(corrupt("xattr directory aliases its owner or the dataset root"));
+                return Err(corrupt(
+                    "xattr directory aliases its owner or the dataset root",
+                ));
             }
             let (_, metadata) = self.file_in_namespace(cx, source.directory, true)?;
             if metadata.kind != Kind::Directory || metadata.parent != owner {
@@ -79,8 +92,8 @@ impl Zpl {
                 if entry.name == b"." || entry.name == b".." {
                     return Err(corrupt("stored dot entry in private xattr directory"));
                 }
-                let (number, tag) = directory_reference(entry.value)
-                    .map_err(|error| parse(&error))?;
+                let (number, tag) =
+                    directory_reference(entry.value).map_err(|error| parse(&error))?;
                 let (_, metadata) = self.file_in_namespace(cx, number, true)?;
                 if metadata.kind != Kind::Regular
                     || metadata.parent != source.directory
@@ -88,18 +101,27 @@ impl Zpl {
                 {
                     return Err(corrupt("xattr value has the wrong kind or private parent"));
                 }
-                if directory.insert(entry.name, ValueFile {
-                    object: number,
-                    generation: metadata.generation,
-                    size: metadata.size,
-                }).is_some() {
+                if directory
+                    .insert(
+                        entry.name,
+                        ValueFile {
+                            object: number,
+                            generation: metadata.generation,
+                            size: metadata.size,
+                        },
+                    )
+                    .is_some()
+                {
                     return Err(corrupt("duplicate private xattr directory name"));
                 }
             }
         }
         let mut names = BTreeSet::new();
         let mut bytes = 0_usize;
-        for raw in source.inline.keys().map(String::as_bytes)
+        for raw in source
+            .inline
+            .keys()
+            .map(String::as_bytes)
             .chain(directory.keys().map(Vec::as_slice))
         {
             checkpoint(cx)?;
@@ -157,9 +179,13 @@ impl Zpl {
                     || metadata.generation != value.generation
                     || metadata.size != value.size
                 {
-                    return Err(corrupt("xattr value identity changed within the selected root"));
+                    return Err(corrupt(
+                        "xattr value identity changed within the selected root",
+                    ));
                 }
-                return self.contents(cx, &object, value.size, 0, value.size as usize).map(Some);
+                return self
+                    .contents(cx, &object, value.size, 0, value.size as usize)
+                    .map(Some);
             }
         }
         checkpoint(cx)?;

@@ -157,7 +157,10 @@
 > job `30059820987973701` failed normal unmount because AppArmor denied the
 > `/data/tmp` fixture location; the unchanged test passed with `TMPDIR=/tmp`.
 > The passing execution log is `ffs-chartreusestone-resume27-worker-tests.log`.
-> Workspace check/Clippy remain pending. These results do not
+> RCH job `30059820987973772` subsequently passed the full workspace/all-targets
+> compiler check on `5dfc2040c` plus overlay `d14d9f3c` (the same repair source as
+> the regeneration tests below). The merged-source checks and tests below also
+> retain this coverage. These results do not
 > complete native storage, default activation, restart freshness, or the wider
 > core/FUSE worker migration on the original bead.
 
@@ -177,8 +180,30 @@
 > unmodified source failed compilation on those missing test imports and ran no
 > tests. The regeneration controls use real files, a planted interrupted write,
 > and a checksummed ext4 image; they do not prove mounted native repair or full
-> source authentication. Workspace check/Clippy and the original native
-> storage/default activation/restart requirements remain open.
+> source authentication. The same source passed the full workspace/all-targets
+> compiler check in RCH job `30059820987973772`; its log is
+> `ffs-chartreusestone-resume27-workspace-check.log`.
+>
+> **Merged execution evidence (2026-10-12):** source `30c41fe2` plus seven
+> formatting corrections (overlay `5681abf2e3fe57e15b8b33199881aa51ef1fd11378b8cd789fea08660f53f8a5`)
+> passed workspace/all-targets check in RCH job `30059820987973781`. Job
+> `30059820987973783` passed 171 tests: 34 repair/lifecycle controls, 59 FAT
+> reader/OEM controls, 76 ZFS reader controls, and both real-FUSE lifecycle
+> tests. Job `30059820987973787` passed 28 on-disk FAT/RAIDZ controls. None
+> failed or was ignored. FAT/ZFS reader cases use constructed images and direct
+> filesystem operations; they do not prove native FAT/OpenZFS mounted
+> interoperability. Logs are `ffs-chartreusestone-resume27-workspace-check-merged2.log`,
+> `ffs-chartreusestone-resume27-integrated-tests.log`, and
+> `ffs-chartreusestone-resume27-ondisk-tests.log`. The first merged check attempt
+> was refused by RCH memory admission before execution; capacity later recovered
+> without intervention. The subsequent `767054ae` merge adds upstream NTFS LZX
+> and ZFS user attributes. Strict Clippy job `30059820987973791` found three
+> incoming codec lints; checked LZX position conversion and equivalent RAIDZ
+> iteration/mask passing address them without allowances. Revalidation and the
+> new regressions remain pending: subsequent RCH requests timed out before
+> compiler execution because the admitted worker's slots were occupied.
+> The original native storage/default activation/restart requirements remain
+> open. No capacity guard or validation gate was weakened.
 >
 > **Compatibility repair (`bd-7zjfh`, verified 2026-10-11):** FFSRQSC2 sidecars
 > are the compatibility-mode repair substrate, exposed through the explicit

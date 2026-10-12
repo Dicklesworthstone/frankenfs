@@ -441,14 +441,31 @@ mod tests {
     #[test]
     fn xattr_commands_retain_explicit_candidate_members_and_snapshot_view() {
         let options = [
-            "--offline-image", "--pool-guid", "123", "--label", "0", "--slot", "2",
-            "--dataset", "data", "--snapshot", "before", "--member", "second.img",
+            "--offline-image",
+            "--pool-guid",
+            "123",
+            "--label",
+            "0",
+            "--slot",
+            "2",
+            "--dataset",
+            "data",
+            "--snapshot",
+            "before",
+            "--member",
+            "second.img",
         ];
-        for (command, names) in [("listxattr", Vec::new()), ("getxattr", vec!["user.comment"])] {
+        for (command, names) in [
+            ("listxattr", Vec::new()),
+            ("getxattr", vec!["user.comment"]),
+        ] {
             let parsed = Cli::try_parse_from(
-                ["ffs-zfs", command, "leaf.img", "/file"].into_iter()
-                    .chain(names).chain(options),
-            ).unwrap();
+                ["ffs-zfs", command, "leaf.img", "/file"]
+                    .into_iter()
+                    .chain(names)
+                    .chain(options),
+            )
+            .unwrap();
             let file = match parsed.command {
                 Command::File(FileCommand::Listxattr { file }) => file,
                 Command::File(FileCommand::Getxattr { file, name }) => {
@@ -457,7 +474,14 @@ mod tests {
                 }
                 _ => panic!("xattr command"),
             };
-            assert_eq!((file.candidate.label, file.candidate.slot, file.candidate.pool_guid), (0, 2, 123));
+            assert_eq!(
+                (
+                    file.candidate.label,
+                    file.candidate.slot,
+                    file.candidate.pool_guid
+                ),
+                (0, 2, 123)
+            );
             assert!(file.candidate.image.offline_image);
             assert_eq!(file.candidate.members, [PathBuf::from("second.img")]);
             assert_eq!(file.dataset, "data");
