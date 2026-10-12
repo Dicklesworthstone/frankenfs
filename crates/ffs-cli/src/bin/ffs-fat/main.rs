@@ -1,5 +1,5 @@
 #![forbid(unsafe_code)]
-//! Experimental native FAT16/FAT32 reader and new-image formatter.
+//! Experimental native FAT16/FAT32 reader, formatter and offline file replacement.
 
 mod filesystem;
 mod formatter;
@@ -18,7 +18,7 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(
     name = "ffs-fat",
-    about = "Read offline FAT16/FAT32 images or create a new empty image"
+    about = "Read, create or explicitly replace files in offline FAT16/FAT32 images"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -255,6 +255,12 @@ fn extract_slots(
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Replace an existing regular file using initialized, separately allocated clusters.
+    /// Requires exclusive offline ownership; --dry-run performs only preflight reads.
+    Replace {
+        #[command(flatten)]
+        options: reader::replacement::ReplaceArgs,
+    },
     /// Create a new FAT16/FAT32 image, optionally copy --source-dir, and verify it.
     /// Existing files and devices are never formatted.
     Format {
@@ -332,6 +338,13 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let cx = Cx::for_request();
     match cli.command {
+        Command::Replace { options } => {
+            let report = reader::replacement::run(&cx, &options)?;
+            let mut output = io::stdout().lock();
+            serde_json::to_writer_pretty(&mut output, &report)
+                .context("FAT operation completed; writing the report failed")?;
+            writeln!(output).context("FAT operation completed; finishing the report failed")?;
+        }
         Command::Format { options } => {
             let report = formatter::run(&cx, &options)?;
             let mut output = io::stdout().lock();

@@ -1,10 +1,12 @@
 //! Native FAT image reads for the experimental `ffs-fat` companion CLI.
 //!
 //! The backing must remain offline/immutable. Our shared advisory lock excludes
-//! cooperating exclusive users, not kernel mounts or unrelated writers. No
-//! method in this module writes, replays, repairs, or marks an image dirty.
+//! cooperating exclusive users, not kernel mounts or unrelated writers.
+//! Ordinary reader methods never write, replay, repair or mark an image dirty.
+//! Explicit offline replacement has a separate exclusive-open entry point.
 
 mod check;
+pub mod replacement;
 
 use asupersync::Cx;
 use ffs_block::ByteDevice;
