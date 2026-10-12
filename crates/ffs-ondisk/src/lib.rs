@@ -14,6 +14,7 @@ pub mod fat;
 pub mod lznt1;
 pub mod ntfs;
 pub mod ntfs_security;
+pub mod xpress;
 pub mod zfs;
 pub mod zfs_dmu;
 pub mod zfs_zap;

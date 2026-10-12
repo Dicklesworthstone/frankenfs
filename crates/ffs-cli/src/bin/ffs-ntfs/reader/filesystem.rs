@@ -263,7 +263,17 @@ impl NtfsFs {
         if flags & 0x4000 != 0 && !record.is_directory() {
             return Err(unsupported("NTFS encrypted file is not mounted"));
         }
-        let (kind, size, blocks) = if let Some(point) = reparse {
+        let (kind, size, blocks) = if reparse
+            .as_ref()
+            .is_some_and(|point| point.tag == super::wof::TAG)
+        {
+            let stream = self.volume.data_from_catalog(cx, &record, &catalog, &[])?;
+            (
+                FileType::RegularFile,
+                stream.size,
+                stream.allocated.div_ceil(512),
+            )
+        } else if let Some(point) = reparse {
             let target = relative_link_target(&point)?;
             let allocation = catalog.select(&self.volume.geometry, super::REPARSE_POINT, &[])?;
             (
@@ -290,7 +300,7 @@ impl NtfsFs {
                 allocation.map_or(0, |stream| stream.allocated.div_ceil(512)),
             )
         } else {
-            let stream = catalog.select(&self.volume.geometry, DATA, &[])?;
+            let stream = self.volume.data_from_catalog(cx, &record, &catalog, &[])?;
             let blocks = if stream.resident() {
                 0
             } else {
@@ -496,7 +506,7 @@ impl NtfsFs {
             ));
         }
         match &bitmap.storage {
-            super::Storage::Compressed(_) => {
+            super::Storage::Compressed(_) | super::Storage::Wof(_) => {
                 return Err(corrupt(0, "compressed NTFS allocation bitmap"));
             }
             super::Storage::Mapped(runs) => {

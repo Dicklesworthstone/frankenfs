@@ -8,8 +8,8 @@ use super::compression::CompressedStorage;
 use super::{
     ATTRIBUTE_LIST, COMPRESSED, Cx, DATA, DataStreamInfo, DataStreamMetadata, FfsError,
     NtfsAttribute, NtfsFileRecord, NtfsGeometry, NtfsReference, NtfsValue, NtfsVolume, Result,
-    SPARSE, Source, Storage, Stream, checkpoint, corrupt, data_read_admission,
-    decode_mapping_pairs, parse, unsupported, validate_identity,
+    SPARSE, Source, Storage, Stream, checkpoint, corrupt, decode_mapping_pairs, parse, unsupported,
+    validate_identity,
 };
 use ffs_ondisk::ntfs::attribute_list::{
     MAX_LIST_BYTES, NtfsAttributeListEntry, parse_attribute_list,
@@ -68,9 +68,10 @@ impl NtfsVolume {
         checkpoint(cx)?;
         let catalog = self.attributes(cx, record)?;
         let attributes = catalog.all()?;
-        let admission_error = data_read_admission(record, &attributes)
-            .err()
-            .map(|error| error.to_string());
+        let admission = match self.data_provider(cx, record, &catalog, &attributes) {
+            Err(error @ (FfsError::Cancelled | FfsError::Io(_))) => return Err(error),
+            result => result,
+        };
         let mut groups: BTreeMap<Vec<u16>, Vec<NtfsAttribute<'_>>> = BTreeMap::new();
         for attribute in attributes {
             checkpoint(cx)?;
@@ -84,15 +85,19 @@ impl NtfsVolume {
         let mut result = Vec::with_capacity(groups.len());
         for (name, extents) in groups {
             checkpoint(cx)?;
-            let read_profile = if let Some(error) = &admission_error {
-                Err(error.clone())
-            } else if record.is_directory() && name.is_empty() {
-                Err(FfsError::IsDirectory.to_string())
-            } else {
-                Stream::from_attributes(&self.geometry, &extents)
-                    .map(|stream| DataStreamMetadata::from_stream(&stream))
-                    .map_err(|error| error.to_string())
+            let selected = match &admission {
+                Err(error) => Err(error.to_string()),
+                Ok(_) if record.is_directory() && name.is_empty() => {
+                    Err(FfsError::IsDirectory.to_string())
+                }
+                Ok(Some(provider)) if name.is_empty() => {
+                    super::wof::open(self, cx, &catalog, *provider)
+                        .map_err(|error| error.to_string())
+                }
+                Ok(_) => Stream::from_attributes(&self.geometry, &extents)
+                    .map_err(|error| error.to_string()),
             };
+            let read_profile = selected.map(|stream| DataStreamMetadata::from_stream(&stream));
             result.push(DataStreamInfo {
                 name,
                 attribute_extents: extents.len(),

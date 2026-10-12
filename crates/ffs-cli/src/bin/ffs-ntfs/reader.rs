@@ -5,6 +5,7 @@ mod compression;
 pub mod filesystem;
 mod namespace;
 pub mod security;
+mod wof;
 
 use asupersync::Cx;
 use ffs_block::ByteDevice;
@@ -96,6 +97,7 @@ enum Storage {
     Resident(Vec<u8>),
     Mapped(Vec<NtfsRun>),
     Compressed(compression::CompressedStorage),
+    Wof(wof::WofStorage),
 }
 
 /// Complete, validated stream. No public constructor permits bypassing the
@@ -136,6 +138,9 @@ impl Stream {
         }
         match &self.storage {
             Storage::Compressed(storage) => {
+                storage.read_into(source, geometry, cx, self.initialized, offset, &mut result)?;
+            }
+            Storage::Wof(storage) => {
                 storage.read_into(source, geometry, cx, self.initialized, offset, &mut result)?;
             }
             Storage::Resident(data) => {
@@ -371,11 +376,58 @@ impl NtfsVolume {
             return Err(FfsError::IsDirectory);
         }
         let catalog = self.attributes(cx, record)?;
-        let attributes = catalog.all()?;
-        data_read_admission(record, &attributes)?;
-        let stream = catalog.select(&self.geometry, DATA, name)?;
+        let stream = self.data_from_catalog(cx, record, &catalog, name)?;
         checkpoint(cx)?;
         Ok(stream)
+    }
+
+    fn data_from_catalog(
+        &self,
+        cx: &Cx,
+        record: &NtfsFileRecord,
+        catalog: &attributes::AttributeSet<'_>,
+        name: &[u16],
+    ) -> Result<Stream> {
+        let all = catalog.all()?;
+        let provider = self.data_provider(cx, record, catalog, &all)?;
+        if let Some(provider) = provider
+            && name.is_empty()
+        {
+            return wof::open(self, cx, catalog, provider);
+        }
+        // An explicitly named DATA stream is its stored native value, including
+        // WofCompressedData. Never apply the unnamed file's codec to an ADS.
+        catalog.select(&self.geometry, DATA, name)
+    }
+
+    fn data_provider(
+        &self,
+        cx: &Cx,
+        record: &NtfsFileRecord,
+        catalog: &attributes::AttributeSet<'_>,
+        all: &[NtfsAttribute<'_>],
+    ) -> Result<Option<wof::FileProvider>> {
+        checkpoint(cx)?;
+        if all.iter().any(|attribute| attribute.kind == REPARSE_POINT) {
+            let point = self
+                .reparse_from_catalog(cx, catalog)?
+                .ok_or_else(|| corrupt(0, "missing NTFS provider metadata"))?;
+            let provider = wof::FileProvider::parse(&point)?;
+            if record.is_directory() {
+                return Err(unsupported(
+                    "WOF individual-file provider cannot describe a directory",
+                ));
+            }
+            if standard_flags(all)?.is_some_and(|flags| flags & 0x4000 != 0) {
+                return Err(unsupported(
+                    "NTFS EFS data requires an implemented key provider",
+                ));
+            }
+            checkpoint(cx)?;
+            return Ok(Some(provider));
+        }
+        data_read_admission(record, all)?;
+        Ok(None)
     }
 
     /// Retrieve the actual native reparse metadata without following the target

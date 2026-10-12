@@ -249,7 +249,7 @@ fn metadata_range(
         .filter(|end| *end <= stream.size && *end <= stream.initialized)
         .ok_or_else(|| corrupt(offset, "security metadata range is not initialized"))?;
     match &stream.storage {
-        Storage::Compressed(_) => {
+        Storage::Compressed(_) | Storage::Wof(_) => {
             return Err(unsupported("compressed security metadata is not admitted"));
         }
         Storage::Resident(_) => {}

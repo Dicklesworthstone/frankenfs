@@ -1131,3 +1131,34 @@ under the shared memory limit. The new formatter tests, native interchange and
 mounted cases remain unexecuted. Workspace formatting reports pre-existing
 differences in unchanged files; the installed UBS launcher is not executable.
 See `docs/FAT_READ_PROFILE.md` for the command, native limits and evidence scope.
+
+### NTFS WOF XPRESS logical file reads
+
+The shared DATA pipeline now reads WOF individual-file-provider XPRESS4K,
+XPRESS8K and XPRESS16K contents through numeric reads, path extraction and FsOps.
+It uses native sparse unnamed DATA only for logical size and ValidDataLength;
+initialized contents come from the validated `WofCompressedData` backing stream.
+Fragmented runs and ATTRIBUTE_LIST continuations retain native file identity.
+The reader fetches only the adjacent native offsets and the bounded selected
+chunk, distinguishes raw chunks by exact stored length, decodes final partial
+chunks to their exact logical length, and zero-fills the native uninitialized
+tail. Corruption and cancellation never become successful partial payloads.
+
+Explicit named-stream extraction preserves stored bytes for recognized WOF
+file providers even when the logical codec is unsupported. LZX logical reads,
+WIM/unknown providers and EFS contents remain outside admission. Ordinary native
+LZNT1, links, security metadata, stream catalogs and read-only enforcement remain.
+WOF files retain regular-file type, hard-link identity and backing allocation in
+the filesystem adapter; cached stream metadata does not conceal later I/O errors.
+
+All six new XPRESS decoder tests, including Microsoft's published MS-XCA byte
+vectors, passed in the complete 844-test on-disk run. On-disk all-targets Clippy
+passed with warnings denied at that decoder-only stage; the later combined
+on-disk run with RAIDZ additions passed 850 tests. Nineteen new provider, image-
+reader and FsOps regressions received source/API review but remain unexecuted:
+workspace check and Clippy both stop while `asupersync` receives SIGKILL under the
+shared memory limit. Changed Rust files pass parsing/formatting checks. Workspace
+formatting reports pre-existing differences in unchanged files, and the installed
+UBS launcher is not executable. Native Windows WOF images and mounted workloads
+have not been validated. See `docs/NTFS_READ_PROFILE.md` for precise admission,
+commands, native sources and evidence limits.

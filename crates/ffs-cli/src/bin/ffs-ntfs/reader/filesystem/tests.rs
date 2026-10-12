@@ -1141,12 +1141,7 @@ fn directory_encryption_defaults_preserve_mounts_without_admitting_efs_data() {
             );
         }
         let reads: Reads = Arc::default();
-        let fs = open(
-            bytes,
-            Arc::clone(&reads),
-            Some((BASE + 700 * 512) as u64),
-        )
-        .unwrap();
+        let fs = open(bytes, Arc::clone(&reads), Some((BASE + 700 * 512) as u64)).unwrap();
         let mut scope = RequestScope::empty();
         assert_eq!(
             fs.getattr(&cx, &mut scope, ROOT).unwrap().kind,
@@ -1202,4 +1197,223 @@ fn directory_encryption_defaults_preserve_mounts_without_admitting_efs_data() {
         ));
         assert!(reads.lock().unwrap().is_empty());
     }
+}
+
+fn wof_image(
+    algorithm: u32,
+    chunk: usize,
+    initialized: Option<usize>,
+) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    use crate::reader::tests::wof::{encoded_chunks, named_mapping, placeholder, provider_value};
+    let (stored, expected) = encoded_chunks(chunk);
+    let mut bytes = image();
+    let clusters = stored.len().div_ceil(512);
+    put(
+        &mut bytes,
+        24,
+        &record(
+            24,
+            false,
+            2,
+            &[
+                standard_with_flags(0x600),
+                placeholder(expected.len(), initialized.unwrap_or(expected.len())),
+                named_mapping(
+                    &[
+                        0x21,
+                        1,
+                        0xBC,
+                        2,
+                        0x11,
+                        u8::try_from(clusters - 1).unwrap(),
+                        100,
+                        0,
+                    ],
+                    clusters,
+                    stored.len(),
+                ),
+                resident(0xC0, 6, "", &provider_value(algorithm, Some(0))),
+                resident(0x30, 2, "", &filename(5, "hello.txt", 1)),
+                resident(0x30, 3, "", &filename(5, "HELLO~1.TXT", 2)),
+                resident(0x30, 4, "", &filename(27, "link.txt", 1)),
+            ],
+        ),
+    );
+    let first = BASE + 700 * 512;
+    bytes[first..first + 512].copy_from_slice(&stored[..512]);
+    let second = BASE + 800 * 512;
+    bytes[second..second + stored.len() - 512].copy_from_slice(&stored[512..]);
+    (bytes, stored, expected)
+}
+
+#[test]
+fn wof_numeric_path_and_fsops_reads_share_logical_bytes_and_native_hard_link_identity() {
+    let cx = Cx::for_testing();
+    for (algorithm, chunk) in [(0, 4096), (2, 8192), (3, 16_384)] {
+        let (bytes, stored, expected) = wof_image(algorithm, chunk, None);
+        let reads: Reads = Arc::default();
+        let fs = open(bytes, Arc::clone(&reads), None).unwrap();
+        let mut scope = RequestScope::empty();
+        let attr = fs
+            .lookup(&cx, &mut scope, ROOT, OsStr::new("HELLO.txt"))
+            .unwrap();
+        assert_eq!(attr.kind, FileType::RegularFile);
+        assert_eq!(
+            (
+                attr.size,
+                attr.blocks,
+                attr.nlink,
+                attr.perm,
+                attr.generation
+            ),
+            (
+                expected.len() as u64,
+                stored.len().div_ceil(512) as u64,
+                2,
+                0o444,
+                7
+            ),
+        );
+        assert_eq!(
+            fs.getattr(&cx, &mut scope, attr.ino).unwrap().size,
+            attr.size
+        );
+        let subdir = fs
+            .lookup(&cx, &mut scope, ROOT, OsStr::new("Subdir"))
+            .unwrap();
+        assert_eq!(
+            fs.lookup(&cx, &mut scope, subdir.ino, OsStr::new("link.txt"))
+                .unwrap()
+                .ino,
+            attr.ino,
+        );
+        assert_eq!(
+            fs.readdir(&cx, &mut scope, ROOT, 0)
+                .unwrap()
+                .iter()
+                .find(|entry| entry.name == b"hello.txt")
+                .unwrap()
+                .kind,
+            FileType::RegularFile,
+        );
+        assert!(
+            reads.lock().unwrap().iter().all(|(offset, _)| {
+                *offset < (BASE + 700 * 512) as u64 || *offset >= (BASE + 834 * 512) as u64
+            }),
+            "lookup and readdir do not read WOF payload"
+        );
+
+        let native = fs.volume.resolve(&cx, "/Subdir/link.txt").unwrap();
+        assert_eq!(native.number, 24);
+        assert_eq!(
+            fs.volume
+                .resolve_no_follow(&cx, "/hello.txt")
+                .unwrap()
+                .number,
+            24
+        );
+        let logical = fs.volume.data_stream(&cx, &native, &[]).unwrap();
+        assert_eq!(fs.volume.read(&cx, &logical, 0, 65_536).unwrap(), expected);
+        assert_eq!(
+            fs.read(&cx, &mut scope, attr.ino, 0, 65_536).unwrap(),
+            expected
+        );
+        assert_eq!(
+            fs.read(&cx, &mut scope, attr.ino, (chunk - 2) as u64, 7)
+                .unwrap(),
+            expected[chunk - 2..chunk + 5],
+        );
+        assert_eq!(
+            fs.read(&cx, &mut scope, attr.ino, u64::MAX, 1).unwrap(),
+            [] as [u8; 0],
+        );
+        let backing_name: Vec<_> = "WofCompressedData".encode_utf16().collect();
+        let backing = fs.volume.data_stream(&cx, &native, &backing_name).unwrap();
+        assert_eq!(fs.volume.read(&cx, &backing, 0, 65_536).unwrap(), stored);
+        assert!(fs.readlink(&cx, &mut scope, attr.ino).is_err());
+        assert!(matches!(
+            fs.write(&cx, &mut scope, attr.ino, 0, b"no"),
+            Err(FfsError::ReadOnly)
+        ));
+    }
+}
+
+#[test]
+fn unsupported_wof_codec_retains_inspection_and_exact_raw_ads_path_access() {
+    let cx = Cx::for_testing();
+    for algorithm in [1, u32::MAX] {
+        let (bytes, stored, _) = wof_image(algorithm, 4096, None);
+        let fs = open(bytes, Arc::default(), None).unwrap();
+        let native = fs.volume.resolve(&cx, "/hello.txt").unwrap();
+        assert_eq!(native.number, 24);
+        let mut scope = RequestScope::empty();
+        assert!(matches!(
+            fs.lookup(&cx, &mut scope, ROOT, OsStr::new("hello.txt")),
+            Err(FfsError::UnsupportedFeature(_)),
+        ));
+        assert!(matches!(
+            fs.volume.data_stream(&cx, &native, &[]),
+            Err(FfsError::UnsupportedFeature(_)),
+        ));
+        let name: Vec<_> = "WofCompressedData".encode_utf16().collect();
+        let raw = fs.volume.data_stream(&cx, &native, &name).unwrap();
+        assert_eq!(fs.volume.read(&cx, &raw, 0, 10_000).unwrap(), stored);
+        assert_eq!(
+            fs.readdir(&cx, &mut scope, ROOT, 0)
+                .unwrap()
+                .iter()
+                .find(|entry| entry.name == b"hello.txt")
+                .unwrap()
+                .kind,
+            FileType::RegularFile,
+        );
+    }
+}
+
+#[test]
+fn wof_stream_cache_keeps_payload_errors_visible_and_valid_data_tail_zero() {
+    let cx = Cx::for_testing();
+    let (bytes, _, _) = wof_image(0, 4096, None);
+    let reads: Reads = Arc::default();
+    let fail = (BASE + 800 * 512) as u64;
+    let fs = open(bytes, Arc::clone(&reads), Some(fail)).unwrap();
+    let mut scope = RequestScope::empty();
+    let file = fs
+        .lookup(&cx, &mut scope, ROOT, OsStr::new("hello.txt"))
+        .unwrap();
+    assert_eq!(fs.read(&cx, &mut scope, file.ino, 0, 3).unwrap(), b"AAA");
+    reads.lock().unwrap().clear();
+    for _ in 0..2 {
+        assert!(matches!(
+            fs.read(&cx, &mut scope, file.ino, 0, 10_000),
+            Err(FfsError::Cancelled),
+        ));
+    }
+    assert_eq!(
+        reads
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(at, _)| *at == fail)
+            .count(),
+        2
+    );
+
+    let (bytes, _, mut expected) = wof_image(0, 4096, Some(4090));
+    expected[4090..].fill(0);
+    let reads: Reads = Arc::default();
+    let fs = open(bytes, Arc::clone(&reads), None).unwrap();
+    let file = fs
+        .lookup(&cx, &mut scope, ROOT, OsStr::new("hello.txt"))
+        .unwrap();
+    assert_eq!(
+        fs.read(&cx, &mut scope, file.ino, 0, 10_000).unwrap(),
+        expected
+    );
+    reads.lock().unwrap().clear();
+    assert_eq!(
+        fs.read(&cx, &mut scope, file.ino, 4090, 100).unwrap(),
+        vec![0; 100]
+    );
+    assert!(reads.lock().unwrap().is_empty());
 }
