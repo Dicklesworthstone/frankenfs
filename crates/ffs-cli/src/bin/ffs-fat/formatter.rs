@@ -187,8 +187,21 @@ fn volume_label(value: Option<&str>) -> Result<Option<[u8; 11]>> {
             !(0x20..=0x7E).contains(&byte)
                 || matches!(
                     byte,
-                    b'"' | b'*' | b'+' | b',' | b'.' | b'/' | b':' | b';' | b'<'
-                        | b'=' | b'>' | b'?' | b'[' | b'\\' | b']' | b'|'
+                    b'"' | b'*'
+                        | b'+'
+                        | b','
+                        | b'.'
+                        | b'/'
+                        | b':'
+                        | b';'
+                        | b'<'
+                        | b'='
+                        | b'>'
+                        | b'?'
+                        | b'['
+                        | b'\\'
+                        | b']'
+                        | b'|'
                 )
         })
     {
@@ -274,7 +287,9 @@ impl FormatPlan {
         }
         geometry
             .cluster_offset(layout.data_clusters + 1)
-            .map_err(|error| anyhow!("formatter selected a reserved cluster identifier: {error}"))?;
+            .map_err(|error| {
+                anyhow!("formatter selected a reserved cluster identifier: {error}")
+            })?;
 
         let mut fat = [0_u8; 512];
         match layout.kind {
@@ -429,12 +444,7 @@ impl ByteDevice for CreatedImage {
         checkpoint(cx)
     }
 
-    fn write_all_at(
-        &self,
-        _cx: &Cx,
-        _offset: ByteOffset,
-        _bytes: &[u8],
-    ) -> ffs_error::Result<()> {
+    fn write_all_at(&self, _cx: &Cx, _offset: ByteOffset, _bytes: &[u8]) -> ffs_error::Result<()> {
         Err(FfsError::ReadOnly)
     }
 
@@ -458,7 +468,10 @@ fn verify_created(cx: &Cx, file: &File, plan: &FormatPlan) -> Result<serde_json:
         file.read_exact_at(&mut actual, sector.offset)?;
         checkpoint(cx)?;
         if actual != sector.bytes {
-            bail!("new FAT metadata readback mismatch at byte {}", sector.offset);
+            bail!(
+                "new FAT metadata readback mismatch at byte {}",
+                sector.offset
+            );
         }
     }
     let volume = FatVolume::from_device(
@@ -510,7 +523,12 @@ pub fn create(cx: &Cx, args: &FormatArgs) -> Result<serde_json::Value> {
         .create_new(true)
         .mode(0o600)
         .open(&args.image)
-        .with_context(|| format!("exclusively creating new FAT image {}", args.image.display()))?;
+        .with_context(|| {
+            format!(
+                "exclusively creating new FAT image {}",
+                args.image.display()
+            )
+        })?;
     let finish = || -> Result<serde_json::Value> {
         checkpoint(cx)?;
         let metadata = file.metadata()?;
@@ -522,7 +540,9 @@ pub fn create(cx: &Cx, args: &FormatArgs) -> Result<serde_json::Value> {
         initialize(cx, &file, &plan)?;
         let verification = verify_created(cx, &file, &plan)?;
         checkpoint(cx)?;
-        parent.sync_all().context("synchronizing the new-image directory entry")?;
+        parent
+            .sync_all()
+            .context("synchronizing the new-image directory entry")?;
         checkpoint(cx)?;
         let label = plan
             .label

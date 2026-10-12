@@ -645,13 +645,7 @@ fn native_catalog_and_extraction_preserve_oem_surrogates_and_long_utf8_names() {
         image.bytes[root] = 0x82;
         image.bytes[root + 32] = 0x83;
         image.bytes[subdir + 64] = 0x05;
-        let raw = write_native_lfn(
-            &mut image,
-            root + 96,
-            b"RAW     BIN",
-            &[0xD800, 0x0061],
-            12,
-        );
+        let raw = write_native_lfn(&mut image, root + 96, b"RAW     BIN", &[0xD800, 0x0061], 12);
         let wide = vec![0x4E00; 100];
         let long = write_native_lfn(&mut image, root + 160, b"LONG    BIN", &wide, 13);
         for (cluster, bytes) in [(12, b"RAW!"), (13, b"UTF8")] {
@@ -674,7 +668,10 @@ fn native_catalog_and_extraction_preserve_oem_surrogates_and_long_utf8_names() {
         assert_eq!(entries[0]["short_name_bytes"][0], 0x82);
         assert!(entries[0]["name"].is_null());
         assert!(entries[0]["short_alias"].is_null());
-        assert_eq!(entries[3]["long_name_utf16"], serde_json::json!([0xD800, 0x0061]));
+        assert_eq!(
+            entries[3]["long_name_utf16"],
+            serde_json::json!([0xD800, 0x0061])
+        );
         assert!(entries[3]["name"].is_null());
         assert_eq!(entries[4]["long_name_utf16"], serde_json::json!(wide));
         assert!(entries[4]["name"].is_null());
@@ -694,8 +691,8 @@ fn native_catalog_and_extraction_preserve_oem_surrogates_and_long_utf8_names() {
             crate::extract_slots(&cx, &volume, &selector, &mut output).unwrap();
             assert_eq!(output, expected, "{kind:?}: {encoded}");
         }
-        let directory = crate::EntrySlots::parse(entries[1]["entry_slots"].as_str().unwrap())
-            .unwrap();
+        let directory =
+            crate::EntrySlots::parse(entries[1]["entry_slots"].as_str().unwrap()).unwrap();
         let nested = crate::native_catalog(&cx, &volume, &directory, base as u64).unwrap();
         let entry = &nested["entries"][0];
         let expected = format!("{},{}", root + 32 - base, subdir + 64 - base);
@@ -836,23 +833,13 @@ fn native_catalog_keeps_structural_record_and_name_corruption_fatal() {
             }
             let volume = image.volume();
             assert!(matches!(
-                crate::native_catalog(
-                    &cx,
-                    &volume,
-                    &crate::EntrySlots::default(),
-                    base as u64
-                ),
+                crate::native_catalog(&cx, &volume, &crate::EntrySlots::default(), base as u64),
                 Err(FfsError::Corruption { .. })
             ));
             let mut output = Vec::new();
             // A valid early slot cannot bypass damage later in its parent.
             assert!(matches!(
-                crate::extract_slots(
-                    &cx,
-                    &volume,
-                    &slot_selector(&[root - base]),
-                    &mut output,
-                ),
+                crate::extract_slots(&cx, &volume, &slot_selector(&[root - base]), &mut output,),
                 Err(FfsError::Corruption { .. })
             ));
             assert!(output.is_empty());

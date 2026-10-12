@@ -473,14 +473,9 @@ mod tests {
         assert_eq!((file.record, file.sequence), (24, Some(7)));
         assert_eq!((file.image.offset, file.image.length), (1024, Some(65536)));
         assert!(raw);
-        let cli = Cli::try_parse_from([
-            "ffs-ntfs",
-            "security",
-            "disk.img",
-            "24",
-            "--offline-image",
-        ])
-        .unwrap();
+        let cli =
+            Cli::try_parse_from(["ffs-ntfs", "security", "disk.img", "24", "--offline-image"])
+                .unwrap();
         assert!(matches!(cli.command, Command::Security { raw: false, .. }));
         assert!(
             Cli::try_parse_from([
@@ -521,7 +516,10 @@ mod tests {
             let report = security_json(&info);
             assert_eq!(report["descriptor_bytes"], serde_json::json!(bytes));
             assert_eq!(report["dacl"]["present"], expected_present);
-            assert_eq!(report["dacl"]["ace_count"], serde_json::json!(expected_count));
+            assert_eq!(
+                report["dacl"]["ace_count"],
+                serde_json::json!(expected_count)
+            );
             assert_eq!(
                 report["dacl"]["offset"],
                 if acl_bytes.is_empty() { 0 } else { 20 }

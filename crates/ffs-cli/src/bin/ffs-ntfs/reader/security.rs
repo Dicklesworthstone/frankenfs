@@ -7,8 +7,7 @@ use super::{
 };
 use ffs_ondisk::ntfs_security::{
     MAX_SECURITY_DESCRIPTOR_BYTES, NtfsSecurityDescriptor, NtfsSecurityHeader,
-    NtfsSecurityIndexEntry, NtfsSecurityIndexRoot, SDS_COPY_DISTANCE,
-    parse_security_index_block,
+    NtfsSecurityIndexEntry, NtfsSecurityIndexRoot, SDS_COPY_DISTANCE, parse_security_index_block,
 };
 use std::collections::BTreeSet;
 
@@ -42,7 +41,10 @@ impl NtfsVolume {
         let catalog = self.attributes(cx, record)?;
         let attributes = catalog.all()?;
         if standard_flags(&attributes)?.is_none() {
-            return Err(corrupt(0, "NTFS file has no STANDARD_INFORMATION security identity"));
+            return Err(corrupt(
+                0,
+                "NTFS file has no STANDARD_INFORMATION security identity",
+            ));
         }
         let standard = catalog.select(&self.geometry, 0x10, &[])?;
         let value = self.read(cx, &standard, 0, 72)?;
@@ -62,15 +64,18 @@ impl NtfsVolume {
         // NTFS permits the legacy attribute on upgraded/repaired files,
         // including a 72-byte STANDARD_INFORMATION with security ID zero.
         for attribute in &attributes {
-            if attribute.kind == 0x50
-                && (attribute.flags != 0 || !attribute.name.is_empty())
-            {
-                return Err(corrupt(0, "named or transformed SECURITY_DESCRIPTOR attribute"));
+            if attribute.kind == 0x50 && (attribute.flags != 0 || !attribute.name.is_empty()) {
+                return Err(corrupt(
+                    0,
+                    "named or transformed SECURITY_DESCRIPTOR attribute",
+                ));
             }
         }
         let stream = catalog.select(&self.geometry, 0x50, &[])?;
         if !(20..=MAX_SECURITY_DESCRIPTOR_BYTES as u64).contains(&stream.size) {
-            return Err(unsupported("NTFS legacy security descriptor exceeds the read profile"));
+            return Err(unsupported(
+                "NTFS legacy security descriptor exceeds the read profile",
+            ));
         }
         metadata_range(&self.geometry, &stream, 0, stream.size)?;
         let bytes = self.read(cx, &stream, 0, stream.size as usize)?;
@@ -102,16 +107,14 @@ impl NtfsVolume {
         // physical initialized storage. INDEX_ROOT/ALLOCATION/BITMAP do not
         // admit transformed values in this read profile.
         for attribute in &attributes {
-            let index = matches!(attribute.kind, 0x90 | 0xA0 | 0xB0)
-                && attribute.name == SII;
+            let index = matches!(attribute.kind, 0x90 | 0xA0 | 0xB0) && attribute.name == SII;
             let sds = attribute.kind == DATA && attribute.name == SDS;
-            if (index && attribute.flags != 0)
-                || (sds && attribute.flags & !super::SPARSE != 0)
-            {
-                return Err(unsupported("transformed NTFS security metadata is not admitted"));
+            if (index && attribute.flags != 0) || (sds && attribute.flags & !super::SPARSE != 0) {
+                return Err(unsupported(
+                    "transformed NTFS security metadata is not admitted",
+                ));
             }
-            if index && attribute.kind == 0x90
-                && !matches!(attribute.value, NtfsValue::Resident(_))
+            if index && attribute.kind == 0x90 && !matches!(attribute.value, NtfsValue::Resident(_))
             {
                 return Err(corrupt(0, "$SII INDEX_ROOT is nonresident"));
             }
@@ -124,12 +127,14 @@ impl NtfsVolume {
         let root = NtfsSecurityIndexRoot::parse(&bytes, self.geometry.cluster_bytes())
             .map_err(|error| parse(&error))?;
         if root.block_bytes != self.geometry.index_bytes() {
-            return Err(unsupported("$SII index geometry differs from the boot profile"));
+            return Err(unsupported(
+                "$SII index geometry differs from the boot profile",
+            ));
         }
         let external = root.entries.iter().any(|entry| entry.child_vcn.is_some())
-            || attributes.iter().any(|attribute| {
-                matches!(attribute.kind, 0xA0 | 0xB0) && attribute.name == SII
-            });
+            || attributes
+                .iter()
+                .any(|attribute| matches!(attribute.kind, 0xA0 | 0xB0) && attribute.name == SII);
         let (allocation, bitmap) = if external {
             let allocation = catalog.select(&self.geometry, 0xA0, SII)?;
             let bitmap = catalog.select(&self.geometry, 0xB0, SII)?;
@@ -139,7 +144,9 @@ impl NtfsVolume {
                 || allocation.size / u64::from(root.block_bytes) > MAX_INDEX_BLOCKS as u64
                 || bitmap.size > MAX_INDEX_BLOCKS.div_ceil(8) as u64
             {
-                return Err(unsupported("$SII allocation or bitmap exceeds the read profile"));
+                return Err(unsupported(
+                    "$SII allocation or bitmap exceeds the read profile",
+                ));
             }
             metadata_range(&self.geometry, &allocation, 0, allocation.size)?;
             metadata_range(&self.geometry, &bitmap, 0, bitmap.size)?;
@@ -164,9 +171,7 @@ impl NtfsVolume {
         walker.visit(root.entries)?;
         for (index, &byte) in walker.bitmap.iter().enumerate() {
             for bit in 0..8 {
-                if byte & (1 << bit) != 0
-                    && !walker.visited.contains(&(index as u64 * 8 + bit))
-                {
+                if byte & (1 << bit) != 0 && !walker.visited.contains(&(index as u64 * 8 + bit)) {
                     return Err(corrupt(0, "$SII bitmap has an unreachable allocated block"));
                 }
             }
@@ -237,7 +242,10 @@ fn metadata_range(
                 .take_while(|run| run.vcn < end_vcn)
                 .any(|run| run.lcn.is_none())
             {
-                return Err(corrupt(offset, "security metadata range contains a sparse hole"));
+                return Err(corrupt(
+                    offset,
+                    "security metadata range contains a sparse hole",
+                ));
             }
         }
         Storage::Mapped(_) => {}
@@ -340,7 +348,10 @@ impl SecurityWalker<'_> {
             || !self.visited.insert(number)
             || self.visited.len() > MAX_INDEX_BLOCKS
         {
-            return Err(corrupt(offset, "$SII child is free, repeated or over budget"));
+            return Err(corrupt(
+                offset,
+                "$SII child is free, repeated or over budget",
+            ));
         }
         self.bytes_read += u64::from(self.block_bytes);
         if self.bytes_read > MAX_INDEX_BYTES {

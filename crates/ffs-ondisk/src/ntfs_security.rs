@@ -107,7 +107,9 @@ fn component_offset(value: &[u8], offset: u32, minimum: usize) -> Result<usize, 
     let offset = usize::try_from(offset).map_err(|_| invalid("component offset overflow"))?;
     if offset < 20
         || !offset.is_multiple_of(4)
-        || offset.checked_add(minimum).is_none_or(|end| end > value.len())
+        || offset
+            .checked_add(minimum)
+            .is_none_or(|end| end > value.len())
     {
         return Err(invalid("invalid security component offset or extent"));
     }
@@ -153,10 +155,7 @@ fn acl_at(value: &[u8], offset: u32, present: bool) -> Result<NtfsAcl, ParseErro
     let revision = value[at];
     let size = usize::from(le16(value, at + 2)?);
     let count = le16(value, at + 4)?;
-    if !matches!(revision, 2 | 4)
-        || size < 8
-        || !size.is_multiple_of(4)
-        || at + size > value.len()
+    if !matches!(revision, 2 | 4) || size < 8 || !size.is_multiple_of(4) || at + size > value.len()
     {
         return Err(invalid("invalid ACL revision or declared extent"));
     }
@@ -213,8 +212,7 @@ impl NtfsSecurityHeader {
                 .contains(&header.length)
             || !header.offset.is_multiple_of(16)
             || header.offset & SDS_COPY_DISTANCE != 0
-            || header.offset % SDS_COPY_DISTANCE + u64::from(header.length)
-                > SDS_COPY_DISTANCE
+            || header.offset % SDS_COPY_DISTANCE + u64::from(header.length) > SDS_COPY_DISTANCE
             || header
                 .offset
                 .checked_add(SDS_COPY_DISTANCE + u64::from(header.length))
@@ -227,7 +225,9 @@ impl NtfsSecurityHeader {
 
     pub fn descriptor<'a>(&self, entry: &'a [u8]) -> Result<&'a [u8], ParseError> {
         if entry.len() as u64 != u64::from(self.length) || Self::parse(entry)? != *self {
-            return Err(invalid("SDS entry does not match its security index header"));
+            return Err(invalid(
+                "SDS entry does not match its security index header",
+            ));
         }
         let descriptor = &entry[SDS_HEADER_BYTES..];
         if security_hash(descriptor) != self.hash {
@@ -309,7 +309,9 @@ fn index_entries(
         || !used.is_multiple_of(8)
         || used > allocated
         || allocated > value.len().saturating_sub(header)
-        || offset.checked_add(header).is_none_or(|start| start < minimum_entry)
+        || offset
+            .checked_add(header)
+            .is_none_or(|start| start < minimum_entry)
         || offset.checked_add(16).is_none_or(|end| end > used)
         || flags > 1
     {
@@ -335,7 +337,9 @@ fn index_entries(
             || entry_flags & !3 != 0
             || child != (flags == 1)
         {
-            return Err(invalid("invalid security index entry length or child flags"));
+            return Err(invalid(
+                "invalid security index entry length or child flags",
+            ));
         }
         let child_vcn = if child {
             Some(le64(value, at + length - 8)?)

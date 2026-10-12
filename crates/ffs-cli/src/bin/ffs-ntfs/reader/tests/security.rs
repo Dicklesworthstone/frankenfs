@@ -1,5 +1,5 @@
-use super::*;
 use super::attributes::{extension, list_entry};
+use super::*;
 
 const SECURITY_LENGTH: usize = 2048 * 512;
 const COPY_DISTANCE: usize = 0x4_0000;
@@ -7,16 +7,12 @@ const SDS_SIZE: usize = COPY_DISTANCE + 720 + 116;
 const INDEX_LCN: usize = 1500;
 const DESCRIPTOR_HASH: u32 = 0xF1C7_5D8C;
 const DESCRIPTOR: [u8; 96] = [
-    1, 0, 4, 128, 20, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 48, 0, 0, 0,
-    1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0,
-    1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0,
-    2, 0, 48, 0, 2, 0, 0, 0,
-    1, 18, 20, 0, 2, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-    0, 3, 20, 0, 255, 1, 31, 0, 1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0,
+    1, 0, 4, 128, 20, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 48, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 5, 18, 0,
+    0, 0, 1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0, 2, 0, 48, 0, 2, 0, 0, 0, 1, 18, 20, 0,
+    2, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 3, 20, 0, 255, 1, 31, 0, 1, 1, 0, 0, 0, 0,
+    0, 5, 18, 0, 0, 0,
 ];
-const SDS_PAIRS: &[u8] = &[
-    0x21, 1, 88, 2, 0x22, 255, 1, 200, 0, 0x21, 2, 88, 2, 0,
-];
+const SDS_PAIRS: &[u8] = &[0x21, 1, 88, 2, 0x22, 255, 1, 200, 0, 0x21, 2, 88, 2, 0];
 
 fn standard(id: u32, flags: u32) -> [u8; 72] {
     let mut value = [0; 72];
@@ -173,20 +169,9 @@ fn secure_record(external: bool, bitmap: u8) -> Vec<u8> {
                 0x90,
                 1,
                 "$SII",
-                &index_root(
-                    &[index_key(0x200, 592, Some(0)), terminal(Some(8))],
-                    true,
-                ),
+                &index_root(&[index_key(0x200, 592, Some(0)), terminal(Some(8))], true),
             ),
-            named_mapping(
-                0xA0,
-                2,
-                "$SII",
-                16,
-                8192,
-                &[0x21, 16, 220, 5, 0],
-                false,
-            ),
+            named_mapping(0xA0, 2, "$SII", 16, 8192, &[0x21, 16, 220, 5, 0], false),
             resident(0xB0, 3, "$SII", &[bitmap]),
         ],
     )
@@ -275,13 +260,16 @@ fn shared_security_reads_resident_and_multilevel_sii_without_file_data_io() {
             assert_eq!(info.descriptor.owner.unwrap().to_string(), "S-1-5-18");
             assert_eq!(info.descriptor.dacl.ace_count, Some(2));
             let trace = reads.lock().unwrap();
-            assert!(!trace.iter().any(|(at, _)| *at == (BASE + 1700 * 512) as u64));
+            assert!(
+                !trace
+                    .iter()
+                    .any(|(at, _)| *at == (BASE + 1700 * 512) as u64)
+            );
             let sds_reads: Vec<_> = trace
                 .iter()
                 .copied()
                 .filter(|(at, _)| {
-                    *at >= (BASE + 600 * 512) as u64
-                        && *at < (BASE + INDEX_LCN * 512) as u64
+                    *at >= (BASE + 600 * 512) as u64 && *at < (BASE + INDEX_LCN * 512) as u64
                 })
                 .collect();
             assert_eq!(
@@ -351,7 +339,10 @@ fn security_identity_sii_and_split_sds_resolve_through_extension_catalogs() {
             ],
         ),
     );
-    image.put_record(30, &extension(30, 24, &[resident(0x10, 2, "", &standard(0x100, 0))]));
+    image.put_record(
+        30,
+        &extension(30, 24, &[resident(0x10, 2, "", &standard(0x100, 0))]),
+    );
     let mut first = named_mapping(
         DATA,
         0,
@@ -375,7 +366,10 @@ fn security_identity_sii_and_split_sds_resolve_through_extension_catalogs() {
     image.put_record(31, &extension(31, 9, &[last, resident_sii()]));
     let volume = open_security(image, Arc::default(), None).unwrap();
     let record = volume.record(&cx, 24, None).unwrap();
-    assert_eq!(volume.security_descriptor(&cx, &record).unwrap().bytes, DESCRIPTOR);
+    assert_eq!(
+        volume.security_descriptor(&cx, &record).unwrap().bytes,
+        DESCRIPTOR
+    );
 }
 
 #[test]
@@ -407,7 +401,13 @@ fn security_refuses_stale_extensions_and_never_falls_back_from_a_nonzero_id() {
             volume.security_descriptor(&cx, &record),
             Err(FfsError::Corruption { .. })
         ));
-        assert!(reads.lock().unwrap().iter().all(|(at, _)| *at < (BASE + 600 * 512) as u64));
+        assert!(
+            reads
+                .lock()
+                .unwrap()
+                .iter()
+                .all(|(at, _)| *at < (BASE + 600 * 512) as u64)
+        );
     }
 }
 
@@ -452,7 +452,13 @@ fn sds_headers_hashes_duplicate_bytes_and_initialized_ranges_are_enforced() {
             "case {case}"
         );
         if case >= 3 {
-            assert!(reads.lock().unwrap().iter().all(|(at, _)| *at < (BASE + 600 * 512) as u64));
+            assert!(
+                reads
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(at, _)| *at < (BASE + 600 * 512) as u64)
+            );
         }
     }
 }
@@ -478,7 +484,13 @@ fn sds_sparse_gaps_are_admitted_but_a_sparse_descriptor_is_not_read_as_zeroes() 
         let result = volume.security_descriptor(&cx, &record);
         if selected_hole {
             assert!(matches!(result, Err(FfsError::Corruption { .. })));
-            assert!(reads.lock().unwrap().iter().all(|(at, _)| *at < (BASE + 600 * 512) as u64));
+            assert!(
+                reads
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .all(|(at, _)| *at < (BASE + 600 * 512) as u64)
+            );
         } else {
             assert_eq!(result.unwrap().bytes, DESCRIPTOR);
         }
@@ -499,11 +511,8 @@ fn sii_tree_cycles_parent_bounds_bitmap_and_fixups_fail_before_sds_reads() {
                 image.bytes[at..at + 4096].copy_from_slice(&cycle);
             }
             3 => {
-                let misplaced = index_block(
-                    0,
-                    &[index_key(0x300, 720, None), terminal(None)],
-                    false,
-                );
+                let misplaced =
+                    index_block(0, &[index_key(0x300, 720, None), terminal(None)], false);
                 let at = BASE + INDEX_LCN * 512;
                 image.bytes[at..at + 4096].copy_from_slice(&misplaced);
             }
@@ -550,12 +559,21 @@ fn security_inspection_preserves_efs_and_reparse_data_provider_boundaries() {
         let volume = open_security(image, Arc::clone(&reads), None).unwrap();
         let record = volume.record(&cx, 24, None).unwrap();
         reads.lock().unwrap().clear();
-        assert_eq!(volume.security_descriptor(&cx, &record).unwrap().bytes, DESCRIPTOR);
+        assert_eq!(
+            volume.security_descriptor(&cx, &record).unwrap().bytes,
+            DESCRIPTOR
+        );
         assert!(matches!(
             volume.data_stream(&cx, &record, &[]),
             Err(FfsError::UnsupportedFeature(_))
         ));
-        assert!(!reads.lock().unwrap().iter().any(|(at, _)| *at == (BASE + 1700 * 512) as u64));
+        assert!(
+            !reads
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(at, _)| *at == (BASE + 1700 * 512) as u64)
+        );
     }
 }
 

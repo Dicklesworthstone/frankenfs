@@ -40,6 +40,20 @@
 > cancellation/restart target remain `bd-11a8t`. The storage decision and loss
 > comparison are in specification §3.7.
 
+> **Ordinary mount worker ownership (`bd-11a8t`):** the CLI owns one
+> asupersync runtime with one scheduler thread and at most two blocking workers.
+> Scrub and periodic commit each run in a child region with a runtime-provided
+> context. Shutdown cancels both before joining either and drains independent
+> blocking-closure completion receipts before releasing image ownership. Those
+> receipts preserve actual results even when wrapper completion is classified as
+> cancellation. A checkpoint before user work prevents cancelled queued jobs from
+> starting I/O. Background repair takes the image write lock even when client
+> access is read-only. The existing synchronous loops check idle
+> cancellation in 100 ms slices; active device I/O must finish, so this is not a
+> hard deadline for an unresponsive device. Core compaction/FUSE worker ownership,
+> native storage and restart/default activation remain separate unmet parts of
+> the original lifecycle target.
+
 ---
 
 ## 1. Crate Map
@@ -507,7 +521,7 @@ pub trait RepairManager: Send + Sync {
 |---------|-------|
 | `Cx` (capability context) | Passed through context-aware filesystem I/O and repair-flush notification; standard-thread ownership remains to be integrated |
 | `Budget` | Resource budgeting for block cache memory, open file descriptors, repair symbol storage |
-| `Region` | Required target ownership for background tasks; current CLI scrub and FUSE workers also use standard threads |
+| `Region` | Ordinary CLI scrub and periodic commit use child regions with physical blocking-I/O completion drains; other FUSE/core workers still require migration |
 | `Lab` | Deterministic runtime for testing concurrent MVCC operations |
 | `RaptorQ codec` | Encoding/decoding repair symbols in `ffs-repair` |
 | `blocking_pool` | Offload synchronous disk I/O from async context |

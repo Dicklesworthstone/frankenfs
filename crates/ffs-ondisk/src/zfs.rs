@@ -652,12 +652,16 @@ fn decompress_zstd(input: &[u8], output: &mut [u8]) -> Result<(), ParseError> {
         return Err(invalid("Zstandard window exceeds read budget"));
     }
     if content_size.is_some_and(|size| size != output.len() as u64) {
-        return Err(invalid("Zstandard content size disagrees with logical length"));
+        return Err(invalid(
+            "Zstandard content size disagrees with logical length",
+        ));
     }
     let frame_size = zstd_safe::find_frame_compressed_size(&frame)
         .map_err(|_| invalid("incomplete or invalid Zstandard frame"))?;
     if frame_size != frame.len() {
-        return Err(invalid("Zstandard native length contains trailing frame data"));
+        return Err(invalid(
+            "Zstandard native length contains trailing frame data",
+        ));
     }
     let mut decoder =
         DCtx::try_create().ok_or_else(|| invalid("Zstandard context allocation failed"))?;

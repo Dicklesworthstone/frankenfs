@@ -67,7 +67,15 @@ fn format_cli_requires_dialect_and_size_and_has_no_existing_image_switch() {
         vec!["ffs-fat", "format", "new.img"],
         vec!["ffs-fat", "format", "new.img", "--kind", "fat16"],
         vec!["ffs-fat", "format", "new.img", "--size-mib", "4"],
-        vec!["ffs-fat", "format", "new.img", "--kind", "fat12", "--size-mib", "4"],
+        vec![
+            "ffs-fat",
+            "format",
+            "new.img",
+            "--kind",
+            "fat12",
+            "--size-mib",
+            "4",
+        ],
     ] {
         assert!(Cli::try_parse_from(missing).is_err());
     }
@@ -80,7 +88,15 @@ fn format_cli_requires_dialect_and_size_and_has_no_existing_image_switch() {
         vec!["--serial", "4294967296"],
         vec!["--size-mib", "18446744073709551616"],
     ] {
-        let mut argv = vec!["ffs-fat", "format", "new.img", "--kind", "fat16", "--size-mib", "4"];
+        let mut argv = vec![
+            "ffs-fat",
+            "format",
+            "new.img",
+            "--kind",
+            "fat16",
+            "--size-mib",
+            "4",
+        ];
         argv.extend(extra);
         assert!(Cli::try_parse_from(argv).is_err());
     }
@@ -106,7 +122,12 @@ fn geometry_matches_independent_native_sector_counts_and_boundary_choices() {
     ] {
         let layout = Layout::calculate(kind, mib).unwrap();
         assert_eq!(
-            (layout.sectors_per_cluster, layout.fat_sectors, layout.data_clusters, layout.first_data_sector),
+            (
+                layout.sectors_per_cluster,
+                layout.fat_sectors,
+                layout.data_clusters,
+                layout.first_data_sector
+            ),
             (spc, fat, clusters, data),
             "{kind:?} {mib} MiB"
         );
@@ -263,7 +284,12 @@ fn new_images_have_native_mirrors_roots_hints_labels_and_clean_readback() {
         // create returned only after dropping every clone of the exclusive
         // lock, so the normal independently opened reader must now work.
         let volume = FatVolume::open(&cx, &args.image, 0, None).unwrap();
-        assert!(volume.list(&cx, super::super::reader::Directory::Root).unwrap().is_empty());
+        assert!(
+            volume
+                .list(&cx, super::super::reader::Directory::Root)
+                .unwrap()
+                .is_empty()
+        );
         assert_eq!(
             volume.free_clusters(&cx).unwrap(),
             clusters - u64::from(kind == FormatKind::Fat32)
@@ -297,9 +323,30 @@ fn invalid_options_and_cancelled_requests_never_create_an_output() {
     let directory = tempfile::tempdir().unwrap();
     let path = directory.path().join("must-not-exist.img");
     for label in [
-        "", " ", " leading", "trailing ", "TOO-LONG-1234", "café", "A/B", "A\\B", "A.B",
-        "A+B", "A,B", "A:B", "A;B", "A=B", "A?B", "A[B", "A]B", "A|B", "A<B", "A>B",
-        "A\"B", "A*B", "A\0B", "A\u{7F}B",
+        "",
+        " ",
+        " leading",
+        "trailing ",
+        "TOO-LONG-1234",
+        "café",
+        "A/B",
+        "A\\B",
+        "A.B",
+        "A+B",
+        "A,B",
+        "A:B",
+        "A;B",
+        "A=B",
+        "A?B",
+        "A[B",
+        "A]B",
+        "A|B",
+        "A<B",
+        "A>B",
+        "A\"B",
+        "A*B",
+        "A\0B",
+        "A\u{7F}B",
     ] {
         let mut args = options(path.clone(), FormatKind::Fat16);
         args.label = Some(label.into());
@@ -322,7 +369,10 @@ fn invalid_options_and_cancelled_requests_never_create_an_output() {
     let cx = Cx::for_testing();
     cx.set_cancel_requested(true);
     let error = create(&cx, &options(path.clone(), FormatKind::Fat16)).unwrap_err();
-    assert!(matches!(error.downcast_ref::<FfsError>(), Some(FfsError::Cancelled)));
+    assert!(matches!(
+        error.downcast_ref::<FfsError>(),
+        Some(FfsError::Cancelled)
+    ));
     assert!(!path.exists());
 }
 
@@ -336,18 +386,37 @@ fn exclusive_creation_refuses_existing_files_directories_symlinks_and_devices() 
         assert!(create(&cx, &options(existing.clone(), FormatKind::Fat16)).is_err());
         assert_eq!(std::fs::read(&existing).unwrap(), original);
     }
-    assert!(create(&cx, &options(directory.path().to_owned(), FormatKind::Fat16)).is_err());
+    assert!(
+        create(
+            &cx,
+            &options(directory.path().to_owned(), FormatKind::Fat16)
+        )
+        .is_err()
+    );
     let linked = directory.path().join("linked.img");
     symlink(&existing, &linked).unwrap();
     assert!(create(&cx, &options(linked.clone(), FormatKind::Fat16)).is_err());
-    assert!(std::fs::symlink_metadata(&linked).unwrap().file_type().is_symlink());
-    assert_eq!(std::fs::read(&existing).unwrap(), b"retain all existing bytes");
+    assert!(
+        std::fs::symlink_metadata(&linked)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    assert_eq!(
+        std::fs::read(&existing).unwrap(),
+        b"retain all existing bytes"
+    );
     let absent = directory.path().join("absent.img");
     let dangling = directory.path().join("dangling.img");
     symlink(&absent, &dangling).unwrap();
     assert!(create(&cx, &options(dangling.clone(), FormatKind::Fat32)).is_err());
     assert!(!absent.exists());
-    assert!(std::fs::symlink_metadata(&dangling).unwrap().file_type().is_symlink());
+    assert!(
+        std::fs::symlink_metadata(&dangling)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
     assert!(create(&cx, &options(PathBuf::from("/dev/null"), FormatKind::Fat16)).is_err());
     let sibling = directory.path().join("sibling.bin");
     std::fs::write(&sibling, b"neighbor").unwrap();
@@ -418,7 +487,9 @@ fn every_initialization_io_failure_is_reported_and_keeps_the_new_file() {
         let primary_call = plan.before_boot.len() + 2;
         let operations = plan.before_boot.len() + 4;
         for fail_at in 0..operations {
-            let path = directory.path().join(format!("{kind:?}-failure-{fail_at}.img"));
+            let path = directory
+                .path()
+                .join(format!("{kind:?}-failure-{fail_at}.img"));
             let cx = Cx::for_testing();
             let target = FaultTarget {
                 file: new_file(&path),
@@ -435,7 +506,10 @@ fn every_initialization_io_failure_is_reported_and_keeps_the_new_file() {
             if fail_at == 0 {
                 assert_eq!(target.file.metadata().unwrap().len(), 0);
             } else {
-                assert_eq!(target.file.metadata().unwrap().len(), plan.layout.image_bytes());
+                assert_eq!(
+                    target.file.metadata().unwrap().len(),
+                    plan.layout.image_bytes()
+                );
                 let boot = read_sector(&target.file, 0);
                 if fail_at <= primary_call {
                     assert_eq!(&boot[510..], &[0, 0]);
@@ -455,7 +529,9 @@ fn initialization_is_bounded_orders_flush_before_boot_and_observes_mid_io_cancel
         let plan = FormatPlan::prepare(&args).unwrap();
         let operations = plan.before_boot.len() + 4;
         for cancel_at in 0..=operations {
-            let path = directory.path().join(format!("{kind:?}-cancel-{cancel_at}.img"));
+            let path = directory
+                .path()
+                .join(format!("{kind:?}-cancel-{cancel_at}.img"));
             let cx = Cx::for_testing();
             let target = FaultTarget {
                 file: new_file(&path),
@@ -493,7 +569,9 @@ fn readback_checks_backup_hints_labels_lengths_and_unplanned_fat_entries() {
     let directory = tempfile::tempdir().unwrap();
     for kind in [FormatKind::Fat16, FormatKind::Fat32] {
         for scenario in 0..5 {
-            let path = directory.path().join(format!("{kind:?}-readback-{scenario}.img"));
+            let path = directory
+                .path()
+                .join(format!("{kind:?}-readback-{scenario}.img"));
             let args = options(path.clone(), kind);
             let plan = FormatPlan::prepare(&args).unwrap();
             let cx = Cx::for_testing();
@@ -501,7 +579,9 @@ fn readback_checks_backup_hints_labels_lengths_and_unplanned_fat_entries() {
             initialize(&cx, &file, &plan).unwrap();
             match scenario {
                 0 => file.set_len(plan.layout.image_bytes() - 1).unwrap(),
-                1 => file.write_all_at(&[b'X'], plan.layout.root_sector() * 512).unwrap(),
+                1 => file
+                    .write_all_at(&[b'X'], plan.layout.root_sector() * 512)
+                    .unwrap(),
                 2 if kind == FormatKind::Fat32 => {
                     file.write_all_at(&[0], 7 * 512 + 488).unwrap();
                 }
@@ -572,7 +652,9 @@ fn verification_device_is_read_only_bounded_and_cancel_aware() {
     ));
     assert_eq!(untouched, [0xCC; 512]);
     assert!(matches!(
-        verify_created(&cx, &file, &plan).unwrap_err().downcast_ref::<FfsError>(),
+        verify_created(&cx, &file, &plan)
+            .unwrap_err()
+            .downcast_ref::<FfsError>(),
         Some(FfsError::Cancelled)
     ));
 }

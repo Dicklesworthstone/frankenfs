@@ -2473,6 +2473,156 @@ fn cli_mount_periodic_commit_survives_sigkill_bd_dj725() {
     emit_scenario_result("cli_mount_periodic_commit_sigkill", "PASS", None);
 }
 
+/// Real mount ownership and cancellation of both idle background workers.
+#[test]
+fn cli_mount_background_workers_drain_on_unmount_bd_11a8t() {
+    use std::time::{Duration, Instant};
+
+    let require = std::env::var_os("FFS_REQUIRE_FUSE").is_some_and(|value| value == "1");
+    if !Path::new("/dev/fuse").exists()
+        || !["mkfs.ext4", "e2fsck", "debugfs", "fusermount3"]
+            .iter()
+            .all(|tool| command_available(tool))
+    {
+        assert!(
+            !require,
+            "FFS_REQUIRE_FUSE=1 but mount prerequisites are missing"
+        );
+        emit_scenario_result(
+            "mount_worker_drain",
+            "SKIP",
+            Some("fuse_or_e2fsprogs_unavailable"),
+        );
+        return;
+    }
+    let dir = tempfile::tempdir().expect("test directory").keep();
+    let image = dir.join("workers.ext4");
+    format_ext4_owned_by_caller(&image, 32 << 20);
+    let mnt = dir.join("mnt");
+    fs::create_dir(&mnt).unwrap();
+    let log = dir.join("mount.log");
+    let Some(mut child) = spawn_cli_rw_mount(
+        &image,
+        &mnt,
+        &log,
+        &[
+            "--background-scrub",
+            "--background-scrub-interval-secs",
+            "3600",
+            "--commit-interval-secs",
+            "3600",
+        ],
+        &[("RUST_LOG", "info")],
+        "mount_worker_drain",
+        require,
+    ) else {
+        return;
+    };
+    let activity = (|| -> std::io::Result<()> {
+        fs::write(mnt.join("sentinel"), b"durable before worker shutdown")?;
+        fs::File::open(mnt.join("sentinel"))?.sync_all()?;
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let output = fs::read_to_string(&log)?;
+            if output.contains("scrub_round_complete") && output.contains("periodic_commit_started")
+            {
+                return Ok(());
+            }
+            if Instant::now() >= deadline {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::TimedOut,
+                    "background workers did not complete startup and a scrub round",
+                ));
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+    })();
+    // Both workers have hour-long intervals. Normal unmount must cancel their
+    // idle waits, drain actual I/O, and exit successfully without force/lazy detach.
+    let deadline = Instant::now() + Duration::from_secs(10);
+    let mut unmount = Command::new("fusermount3")
+        .arg("-u")
+        .arg(&mnt)
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    while unmount.try_wait().unwrap().is_none() {
+        if Instant::now() >= deadline {
+            unmount.kill().expect("stop only the failed test unmounter");
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+    let unmount = unmount.wait_with_output().unwrap();
+    let status = loop {
+        if let Some(status) = child.try_wait().unwrap() {
+            break Some(status);
+        }
+        if Instant::now() >= deadline {
+            child.kill().expect("stop only the failed test daemon");
+            child.wait().unwrap();
+            break None;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    };
+    if !unmount.status.success() || status.is_none() {
+        // Failure-only cleanup of this test's dead mount. This cannot satisfy
+        // the normal-unmount assertions below or extend their original deadline.
+        if let Ok(mut cleanup) = Command::new("fusermount3")
+            .args(["-u", "-z"])
+            .arg(&mnt)
+            .spawn()
+        {
+            let cleanup_deadline = Instant::now() + Duration::from_secs(5);
+            while !matches!(cleanup.try_wait(), Ok(Some(_))) {
+                if Instant::now() >= cleanup_deadline {
+                    let _ = cleanup.kill();
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            let _ = cleanup.wait();
+        }
+    }
+    let output = fs::read_to_string(&log).unwrap();
+    assert!(
+        unmount.status.success(),
+        "{}",
+        String::from_utf8_lossy(&unmount.stderr)
+    );
+    assert!(
+        status.is_some_and(|status| status.success()),
+        "daemon did not drain cleanly: {output}"
+    );
+    activity.expect("mounted write and a real scrub round must succeed");
+    assert!(output.contains("mount_background_scrub_stop"), "{output}");
+    assert!(output.contains("periodic_commit_started"), "{output}");
+    let check = Command::new("e2fsck")
+        .arg("-fn")
+        .arg(&image)
+        .output()
+        .unwrap();
+    assert!(
+        check.status.success(),
+        "{}{}",
+        String::from_utf8_lossy(&check.stdout),
+        String::from_utf8_lossy(&check.stderr)
+    );
+    let readback = Command::new("debugfs")
+        .args(["-R", "cat /sentinel"])
+        .arg(&image)
+        .output()
+        .unwrap();
+    assert!(readback.status.success());
+    assert_eq!(readback.stdout, b"durable before worker shutdown");
+    emit_scenario_result(
+        "mount_worker_drain",
+        "PASS",
+        Some(&dir.display().to_string()),
+    );
+}
+
 /// Outcome of one SIGKILL arm.
 enum SigkillArm {
     /// The mount could not start (a SKIP, only allowed without `FFS_REQUIRE_FUSE=1`).

@@ -149,7 +149,6 @@ use std::fs::{File, OpenOptions as StdOpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 use tracing::{debug, error, info, info_span, warn};
 use tracing_subscriber::EnvFilter;
@@ -7820,109 +7819,186 @@ struct MountBackgroundScrubPlan {
     static_metadata: bool,
 }
 
-/// Mount-owned periodic durability commit (bd-dj725). Stopped and joined on
-/// drop, i.e. when the mount returns, before the final unmount flush.
-struct PeriodicCommitGuard {
-    stop: Arc<std::sync::atomic::AtomicBool>,
-    handle: Option<JoinHandle<()>>,
+/// CLI-owned runtime for the two synchronous background I/O workers. The core
+/// filesystem continues to receive contexts from its caller (bd-11a8t).
+fn mount_background_runtime() -> Result<Arc<asupersync::runtime::Runtime>> {
+    asupersync::runtime::RuntimeBuilder::multi_thread()
+        .worker_threads(1)
+        .blocking_threads(0, 2)
+        .build()
+        .map(Arc::new)
+        .context("failed to create mount background runtime")
 }
 
-impl Drop for PeriodicCommitGuard {
+/// A child region plus an independent completion receipt for its blocking I/O.
+/// Task cancellation must not authorize releasing the image lock: the receipt
+/// establishes that all worker I/O and cleanup have finished and preserves the
+/// actual result even when the wrapper classifies completion as cancellation.
+struct MountIoWorker<T> {
+    runtime: Arc<asupersync::runtime::Runtime>,
+    region: Option<asupersync::cx::ChildRegion>,
+    task: Option<asupersync::runtime::TaskHandle<()>>,
+    completion: asupersync::channel::oneshot::Receiver<Result<T>>,
+    cleanup_cx: Cx,
+}
+
+impl<T: Send + 'static> MountIoWorker<T> {
+    fn start(
+        cx: &Cx,
+        runtime: &Arc<asupersync::runtime::Runtime>,
+        work: impl FnOnce(&Cx) -> Result<T> + Send + 'static,
+    ) -> Result<Self> {
+        let region = runtime
+            .block_on(cx.open_child_region(asupersync::cx::ChildRegionSpec::inherit()))
+            .context("failed to open mount worker region")?;
+        // Cleanup must remain waitable after cancellation of the work subtree.
+        let cleanup_cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let completion_cx = cleanup_cx.clone();
+        let (sender, completion) = asupersync::channel::oneshot::channel();
+        let task = region
+            .cx()
+            .spawn_blocking(move |worker_cx| {
+                // A cancelled pool job can remain queued until a slot opens.
+                // Refuse user work when cancellation won before execution.
+                if worker_cx.checkpoint().is_err() {
+                    return;
+                }
+                // Reserve before work, then publish without a cancellation point.
+                // Before admission the sender can be dropped safely: no I/O ran.
+                let Ok(permit) = sender.reserve(&completion_cx) else {
+                    return;
+                };
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| work(&worker_cx)))
+                        .unwrap_or_else(|_| {
+                            Err(anyhow::anyhow!("mount background I/O worker panicked"))
+                        });
+                let _ = permit.send(result);
+            })
+            .context("failed to admit mount background I/O worker")?;
+        Ok(Self {
+            runtime: Arc::clone(runtime),
+            region: Some(region),
+            task: Some(task),
+            completion,
+            cleanup_cx,
+        })
+    }
+}
+
+impl<T> MountIoWorker<T> {
+    fn request_stop(&self) -> Result<()> {
+        if let Some(region) = self.region.as_ref() {
+            region
+                .cancel(asupersync::types::CancelReason::user("mount stopping"))
+                .context("failed to cancel mount worker region")?;
+        }
+        Ok(())
+    }
+
+    fn stop(&mut self) -> Result<Option<T>> {
+        let Some(region) = self.region.take() else {
+            return Ok(None);
+        };
+        let cancel = region.cancel(asupersync::types::CancelReason::user("mount stopping"));
+        let mut task = self.task.take().expect("worker region has a task");
+        let joined = self.runtime.block_on(task.join(&self.cleanup_cx));
+        let closed = self.runtime.block_on(region.close());
+        // Never return early on a wrapper error: the closure may still own the
+        // device. Also do not replace this drain with shutdown_timeout, which
+        // may detach a still-running blocking writer.
+        let completed = self
+            .runtime
+            .block_on(self.completion.recv(&self.cleanup_cx));
+        cancel.context("failed to cancel mount worker region")?;
+        closed.context("failed to close mount worker region")?;
+        match completed {
+            Ok(result) => result.map(Some),
+            Err(_) if matches!(joined, Err(asupersync::runtime::JoinError::Cancelled(_))) => {
+                // Cancellation won before user work started; no I/O ran.
+                Ok(None)
+            }
+            Err(error) => {
+                bail!("mount worker lost its completion receipt: {error}; join={joined:?}")
+            }
+        }
+    }
+}
+
+impl<T> Drop for MountIoWorker<T> {
     fn drop(&mut self) {
-        self.stop.store(true, std::sync::atomic::Ordering::Release);
-        if let Some(handle) = self.handle.take() {
-            let _ = handle.join();
+        if let Err(error) = self.stop() {
+            error!(target: "ffs::cli::mount", %error, "mount_background_cleanup_failed");
         }
     }
 }
 
 fn start_periodic_commit(
+    cx: &Cx,
+    runtime: &Arc<asupersync::runtime::Runtime>,
     open_fs: &Arc<OpenFs>,
     interval: Duration,
     operation_id: &str,
-) -> Option<PeriodicCommitGuard> {
+) -> Result<Option<MountIoWorker<()>>> {
     if interval.is_zero() {
         info!(
             target: "ffs::cli::mount",
             operation_id,
             "periodic_commit_disabled"
         );
-        return None;
+        return Ok(None);
     }
-    let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
-    let thread_stop = Arc::clone(&stop);
     let fs = Arc::clone(open_fs);
-    let log_operation_id = operation_id.to_owned();
     let operation_id = operation_id.to_owned();
-    let handle = std::thread::Builder::new()
-        .name("ffs-periodic-commit".to_owned())
-        .spawn(move || {
-            let cx = Cx::for_request();
-            let tick = Duration::from_millis(100);
-            let mut waited = Duration::ZERO;
-            while !thread_stop.load(std::sync::atomic::Ordering::Acquire) {
-                std::thread::sleep(tick);
-                waited += tick;
-                if waited < interval {
-                    continue;
-                }
-                waited = Duration::ZERO;
-                match fs.periodic_commit(&cx) {
-                    Ok(true) => debug!(
-                        target: "ffs::cli::mount",
-                        operation_id = %operation_id,
-                        "periodic_commit_applied"
-                    ),
-                    Ok(false) => {}
-                    Err(error) => warn!(
-                        target: "ffs::cli::mount",
-                        operation_id = %operation_id,
-                        error = %error,
-                        "periodic_commit_failed"
-                    ),
-                }
+    let worker = MountIoWorker::start(cx, runtime, move |cx| {
+        info!(
+            target: "ffs::cli::mount",
+            operation_id = %operation_id,
+            interval_secs = interval.as_secs(),
+            "periodic_commit_started"
+        );
+        let tick = Duration::from_millis(100);
+        let mut waited = Duration::ZERO;
+        while cx.checkpoint().is_ok() {
+            std::thread::sleep(tick);
+            if cx.checkpoint().is_err() {
+                break;
             }
-        });
-    match handle {
-        Ok(handle) => {
-            info!(
-                target: "ffs::cli::mount",
-                operation_id = %log_operation_id,
-                interval_secs = interval.as_secs(),
-                "periodic_commit_started"
-            );
-            Some(PeriodicCommitGuard {
-                stop,
-                handle: Some(handle),
-            })
+            waited += tick;
+            if waited < interval {
+                continue;
+            }
+            waited = Duration::ZERO;
+            match fs.periodic_commit(cx) {
+                Ok(true) => debug!(
+                    target: "ffs::cli::mount",
+                    operation_id = %operation_id,
+                    "periodic_commit_applied"
+                ),
+                Ok(false) => {}
+                Err(error) => warn!(
+                    target: "ffs::cli::mount",
+                    operation_id = %operation_id,
+                    error = %error,
+                    "periodic_commit_failed"
+                ),
+            }
         }
-        Err(error) => {
-            warn!(
-                target: "ffs::cli::mount",
-                error = %error,
-                "periodic_commit_spawn_failed"
-            );
-            None
-        }
-    }
+        Ok(())
+    })?;
+    Ok(Some(worker))
 }
 
 struct MountBackgroundScrubGuard {
-    cx: Cx,
-    handle: Option<JoinHandle<Result<ScrubDaemonMetrics>>>,
+    worker: MountIoWorker<ScrubDaemonMetrics>,
     operation_id: String,
     scenario_id: String,
 }
 
 impl MountBackgroundScrubGuard {
-    fn stop(&mut self) {
-        self.cx.set_cancel_requested(true);
-        let Some(handle) = self.handle.take() else {
-            return;
-        };
-
-        match handle.join() {
-            Ok(Ok(metrics)) => {
+    fn stop(&mut self) -> Result<()> {
+        match self.worker.stop() {
+            Ok(Some(metrics)) => {
                 info!(
                     target: "ffs::cli::mount",
                     operation_id = %self.operation_id,
@@ -7936,7 +8012,7 @@ impl MountBackgroundScrubGuard {
                     "mount_background_scrub_stop"
                 );
             }
-            Ok(Err(error)) => {
+            Err(error) => {
                 error!(
                     target: "ffs::cli::mount",
                     operation_id = %self.operation_id,
@@ -7945,38 +8021,32 @@ impl MountBackgroundScrubGuard {
                     reason = %error,
                     "mount_background_scrub_stop"
                 );
+                return Err(error);
             }
-            Err(_) => {
-                error!(
-                    target: "ffs::cli::mount",
-                    operation_id = %self.operation_id,
-                    scenario_id = %self.scenario_id,
-                    outcome = "background_scrub_panicked",
-                    "mount_background_scrub_stop"
-                );
-            }
+            Ok(None) => {}
         }
+        Ok(())
     }
 }
 
 impl Drop for MountBackgroundScrubGuard {
     fn drop(&mut self) {
-        self.stop();
+        let _ = self.stop();
     }
 }
 
 fn build_mount_background_scrub_plan(
+    cx: &Cx,
     image_path: &Path,
     open_fs: &OpenFs,
     repair_writes_enabled: bool,
 ) -> Result<MountBackgroundScrubPlan> {
-    let cx = cli_cx();
     if let Some(sb) = open_fs.ext4_superblock() {
         let specs = build_ext4_repair_group_specs(sb)
             .context("failed to compute ext4 repair group layout for mount background scrub")?;
         if repair_writes_enabled {
             let group_ids: Vec<_> = specs.iter().map(|spec| spec.group).collect();
-            preflight_ext4_repair_groups(&cx, open_fs, &specs, &group_ids, "mount_startup")?;
+            preflight_ext4_repair_groups(cx, open_fs, &specs, &group_ids, "mount_startup")?;
         }
         let groups = specs
             .iter()
@@ -8020,7 +8090,7 @@ fn build_mount_background_scrub_plan(
         if repair_writes_enabled {
             let group_ids: Vec<_> = specs.iter().map(|spec| spec.group).collect();
             preflight_btrfs_repair_groups(
-                &cx,
+                cx,
                 open_fs,
                 &specs,
                 &group_ids,
@@ -8223,12 +8293,13 @@ fn run_mount_background_scrub_daemon(
 }
 
 fn start_mount_background_scrub(
+    cx: &Cx,
+    runtime: &Arc<asupersync::runtime::Runtime>,
     image_path: &Path,
     open_fs: &OpenFs,
     config: &MountBackgroundScrubConfig,
     mounted_repair_writeback: Option<Arc<OpenFs>>,
-    operation_id: &str,
-    scenario_id: &str,
+    (operation_id, scenario_id): (&str, &str),
 ) -> Result<Option<MountBackgroundScrubGuard>> {
     if !config.enabled {
         debug!(
@@ -8253,6 +8324,7 @@ fn start_mount_background_scrub(
         );
     }
     let plan = match build_mount_background_scrub_plan(
+        cx,
         image_path,
         open_fs,
         config.repair_writes_enabled,
@@ -8281,8 +8353,6 @@ fn start_mount_background_scrub(
         ensure_mount_background_repair_write_access(image_path)?;
     }
     let interval = Duration::from_secs(config.interval_secs);
-    let thread_cx = Cx::for_request();
-    let guard_cx = thread_cx.clone();
     let image_path = image_path.to_path_buf();
     let ledger_path = config.ledger_path.clone();
     let thread_operation_id = operation_id.to_owned();
@@ -8301,39 +8371,49 @@ fn start_mount_background_scrub(
         "mount_background_scrub_start"
     );
 
-    let handle = std::thread::Builder::new()
-        .name(if repair_writes_enabled {
-            "ffs-mount-repair".to_owned()
-        } else {
-            "ffs-mount-scrub".to_owned()
-        })
-        .spawn(move || {
-            run_mount_background_scrub_daemon(
-                &thread_cx,
-                &image_path,
-                plan,
-                MountBackgroundScrubThreadConfig {
-                    interval,
-                    ledger_path: ledger_path.as_deref(),
-                    repair_writes_enabled,
-                    mounted_repair_writeback,
-                    operation_id: &thread_operation_id,
-                    scenario_id: &thread_scenario_id,
-                },
-            )
-        })
-        .context("failed to spawn mount background scrub daemon")?;
+    let worker = MountIoWorker::start(cx, runtime, move |worker_cx| {
+        let result = run_mount_background_scrub_daemon(
+            worker_cx,
+            &image_path,
+            plan,
+            MountBackgroundScrubThreadConfig {
+                interval,
+                ledger_path: ledger_path.as_deref(),
+                repair_writes_enabled,
+                mounted_repair_writeback,
+                operation_id: &thread_operation_id,
+                scenario_id: &thread_scenario_id,
+            },
+        );
+        match result {
+            // Cancellation can also arrive while constructing the validator,
+            // before the daemon has accumulated any metrics. Treat only typed
+            // cancellation as normal shutdown; preserve real I/O failures.
+            Err(error)
+                if error.chain().any(|cause| {
+                    matches!(
+                        cause.downcast_ref::<ffs_error::FfsError>(),
+                        Some(ffs_error::FfsError::Cancelled)
+                    )
+                }) =>
+            {
+                Ok(ScrubDaemonMetrics::default())
+            }
+            other => other,
+        }
+    })
+    .context("failed to start mount background scrub daemon")?;
 
     Ok(Some(MountBackgroundScrubGuard {
-        cx: guard_cx,
-        handle: Some(handle),
+        worker,
         operation_id: operation_id.to_owned(),
         scenario_id: scenario_id.to_owned(),
     }))
 }
 
 #[allow(clippy::too_many_lines)]
-/// Take an exclusive advisory lock on the image for a read-write mount.
+/// Take an exclusive advisory lock when the mount can write the backing image,
+/// either through client writes or read-only mounted background repair.
 ///
 /// A FUSE `umount` returns before the daemon has run its final flush in
 /// DESTROY, so `umount; mount` of the same image could start a second daemon
@@ -8532,7 +8612,7 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
         "mount_start"
     );
     // Held until this process exits (the OS drops the lock with the fd).
-    let _image_lock = if options.read_write {
+    let _image_lock = if options.read_write || options.background_scrub.repair_writes_enabled {
         Some(lock_image_for_rw_mount(image_path)?)
     } else {
         wait_for_image_writer_to_exit(image_path)?;
@@ -8660,15 +8740,18 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
         && options.background_scrub.repair_writes_enabled)
         .then(|| Arc::clone(&open_fs));
 
-    let _background_scrub_guard = start_mount_background_scrub(
+    let background_runtime = mount_background_runtime()?;
+    let background_cx = background_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+    let mut background_scrub_guard = start_mount_background_scrub(
+        &background_cx,
+        &background_runtime,
         image_path,
         open_fs.as_ref(),
         &options.background_scrub,
         mounted_repair_writeback,
-        &operation_id,
-        scenario_id,
+        (&operation_id, scenario_id),
     )?;
-    let _periodic_commit_guard = options
+    let mut periodic_commit_guard = options
         .read_write
         .then(|| {
             let default_secs = match &open_fs.flavor {
@@ -8676,79 +8759,116 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
                 FsFlavor::Btrfs(_) => 30,
             };
             let secs = options.commit_interval_secs.unwrap_or(default_secs);
-            start_periodic_commit(&open_fs, Duration::from_secs(secs), &operation_id)
+            start_periodic_commit(
+                &background_cx,
+                &background_runtime,
+                &open_fs,
+                Duration::from_secs(secs),
+                &operation_id,
+            )
         })
+        .transpose()?
         .flatten();
 
-    match runtime.mode {
-        MountRuntimeMode::Standard => {
-            let metrics = mount_with_fuse(Arc::clone(&open_fs), mountpoint, options, auto_unmount)?;
-            // bd-viil0: emit the same shutdown metrics line the managed runtime emits.
-            // Without this the standard runtime — the one the mounted comparator
-            // actually uses — produced no `mount_dispatch_metrics` at all, so every
-            // banked mounted report carried "unreported_by_this_elf" and no per-op
-            // attribution could be reproduced from it by anyone else.
-            log_mount_shutdown_metrics(
-                &operation_id,
-                scenario_id,
-                match &open_fs.flavor {
-                    FsFlavor::Ext4(_) => "ext4",
-                    FsFlavor::Btrfs(_) => "btrfs",
-                },
-                &metrics,
-            );
-            emit_mount_adaptive_runtime_shutdown_summary(
-                MountAdaptiveRuntimeShutdownContext {
+    let mount_result = (|| -> Result<()> {
+        match runtime.mode {
+            MountRuntimeMode::Standard => {
+                let metrics =
+                    mount_with_fuse(Arc::clone(&open_fs), mountpoint, options, auto_unmount)?;
+                // bd-viil0: emit the same shutdown metrics line the managed runtime emits.
+                // Without this the standard runtime — the one the mounted comparator
+                // actually uses — produced no `mount_dispatch_metrics` at all, so every
+                // banked mounted report carried "unreported_by_this_elf" and no per-op
+                // attribution could be reproduced from it by anyone else.
+                log_mount_shutdown_metrics(
+                    &operation_id,
+                    scenario_id,
+                    match &open_fs.flavor {
+                        FsFlavor::Ext4(_) => "ext4",
+                        FsFlavor::Btrfs(_) => "btrfs",
+                    },
+                    &metrics,
+                );
+                emit_mount_adaptive_runtime_shutdown_summary(
+                    MountAdaptiveRuntimeShutdownContext {
+                        image_path,
+                        mountpoint,
+                        runtime,
+                        read_write: options.read_write,
+                        operation_id: &operation_id,
+                        cli_scenario_id: scenario_id,
+                        plan: None,
+                        summary_config: &options.adaptive_runtime_summary,
+                    },
+                    &MountAdaptiveRuntimeShutdownObservation {
+                        // bd-viil0: was a hand-constructed all-zeros snapshot, which
+                        // discarded the counters at the source on the exact path the
+                        // instrument uses.
+                        metrics,
+                        worker_count: 0,
+                        per_core: None,
+                    },
+                )?;
+            }
+            MountRuntimeMode::Managed | MountRuntimeMode::PerCore => {
+                let params = ManagedMountParams {
                     image_path,
                     mountpoint,
                     runtime,
                     read_write: options.read_write,
+                    allow_other: options.allow_other,
+                    auto_unmount,
+                    fsname: options.fsname.as_deref(),
+                    subtype: options.subtype.as_deref(),
+                    atime: options.atime,
+                    dev: options.dev,
+                    suid: options.suid,
+                    writeback_cache: WritebackCacheMode::from_enabled(
+                        options.writeback_cache.enabled,
+                    ),
+                    backpressure: adaptive_runtime_plan
+                        .as_ref()
+                        .map(|plan| Arc::clone(&plan.gate)),
+                    adaptive_runtime_plan: adaptive_runtime_plan.as_ref(),
+                    adaptive_runtime_summary: &options.adaptive_runtime_summary,
+                    console: &options.console,
+                    unmount_timeout_secs: runtime.managed_unmount_timeout_secs(),
                     operation_id: &operation_id,
-                    cli_scenario_id: scenario_id,
-                    plan: None,
-                    summary_config: &options.adaptive_runtime_summary,
-                },
-                &MountAdaptiveRuntimeShutdownObservation {
-                    // bd-viil0: was a hand-constructed all-zeros snapshot, which
-                    // discarded the counters at the source on the exact path the
-                    // instrument uses.
-                    metrics,
-                    worker_count: 0,
-                    per_core: None,
-                },
-            )?;
-        }
-        MountRuntimeMode::Managed | MountRuntimeMode::PerCore => {
-            let params = ManagedMountParams {
-                image_path,
-                mountpoint,
-                runtime,
-                read_write: options.read_write,
-                allow_other: options.allow_other,
-                auto_unmount,
-                fsname: options.fsname.as_deref(),
-                subtype: options.subtype.as_deref(),
-                atime: options.atime,
-                dev: options.dev,
-                suid: options.suid,
-                writeback_cache: WritebackCacheMode::from_enabled(options.writeback_cache.enabled),
-                backpressure: adaptive_runtime_plan
-                    .as_ref()
-                    .map(|plan| Arc::clone(&plan.gate)),
-                adaptive_runtime_plan: adaptive_runtime_plan.as_ref(),
-                adaptive_runtime_summary: &options.adaptive_runtime_summary,
-                console: &options.console,
-                unmount_timeout_secs: runtime.managed_unmount_timeout_secs(),
-                operation_id: &operation_id,
-                scenario_id,
-            };
-            if runtime.mode == MountRuntimeMode::PerCore {
-                mount_with_per_core_fuse(Arc::clone(&open_fs), &params)?;
-            } else {
-                mount_with_managed_fuse(Arc::clone(&open_fs), &params)?;
+                    scenario_id,
+                };
+                if runtime.mode == MountRuntimeMode::PerCore {
+                    mount_with_per_core_fuse(Arc::clone(&open_fs), &params)?;
+                } else {
+                    mount_with_managed_fuse(Arc::clone(&open_fs), &params)?;
+                }
             }
         }
-    }
+        Ok(())
+    })();
+    // Drain both workers even if FUSE or one worker failed. Releasing the image
+    // lock before the independent I/O receipts would permit another mount to
+    // race an old writer. Preserve the primary FUSE error after cleanup.
+    let commit_cancel = periodic_commit_guard
+        .as_ref()
+        .map(MountIoWorker::request_stop)
+        .transpose();
+    let scrub_cancel = background_scrub_guard
+        .as_ref()
+        .map(|guard| guard.worker.request_stop())
+        .transpose();
+    let commit_result = periodic_commit_guard
+        .as_mut()
+        .map(MountIoWorker::stop)
+        .transpose();
+    let scrub_result = background_scrub_guard
+        .as_mut()
+        .map(MountBackgroundScrubGuard::stop)
+        .transpose();
+    mount_result?;
+    commit_cancel?;
+    scrub_cancel?;
+    commit_result?;
+    scrub_result?;
 
     info!(
         target: "ffs::cli::mount",
@@ -14235,6 +14355,7 @@ mod tests {
         .expect("background scrub config should resolve");
 
         let plan = super::build_mount_background_scrub_plan(
+            &cx,
             &bad_path,
             &open_fs,
             cfg.repair_writes_enabled,
@@ -14376,16 +14497,18 @@ mod tests {
             let error = fs.enable_writes(&cx).expect_err("seed write admission");
             assert!(error.to_string().contains("seed"), "{error}");
             assert!(!fs.is_writable());
-            let plan = super::build_mount_background_scrub_plan(&image, &fs, false)
+            let plan = super::build_mount_background_scrub_plan(&cx, &image, &fs, false)
                 .expect("detection-only scrub remains available");
             assert!(!plan.groups.is_empty());
+            let runtime = super::mount_background_runtime().unwrap();
             let error = start_mount_background_scrub(
+                &cx,
+                &runtime,
                 &image,
                 &fs,
                 &config,
                 None,
-                "seed-write-admission",
-                "bd-hk5w3",
+                ("seed-write-admission", "bd-hk5w3"),
             )
             .err()
             .expect("background repair must not start on a seed");
@@ -14615,7 +14738,7 @@ mod tests {
         let cx = crate::cli_cx();
         let fs = OpenFs::open(&cx, &path).unwrap();
         assert_eq!(
-            super::build_mount_background_scrub_plan(&path, &fs, true)
+            super::build_mount_background_scrub_plan(&cx, &path, &fs, true)
                 .unwrap()
                 .groups
                 .len(),
@@ -14659,7 +14782,7 @@ mod tests {
         unsafe_image[34 * 4096 + bit / 8] |= 1 << (bit % 8);
         std::fs::write(&path, &unsafe_image).unwrap();
         let fs = OpenFs::open(&cx, &path).unwrap();
-        let detection = super::build_mount_background_scrub_plan(&path, &fs, false).unwrap();
+        let detection = super::build_mount_background_scrub_plan(&cx, &path, &fs, false).unwrap();
         assert_eq!(detection.groups.len(), 2, "detection retains unsafe groups");
         let cfg = MountBackgroundScrubConfig::resolve(
             MountBackgroundScrubRequest::new(
@@ -14671,9 +14794,18 @@ mod tests {
             Some(dir.join("repair.jsonl")),
         )
         .unwrap();
-        let error = start_mount_background_scrub(&path, &fs, &cfg, None, "unsafe-plan", "bd-plamw")
-            .err()
-            .expect("unsafe mounted repair must not start a worker");
+        let runtime = super::mount_background_runtime().unwrap();
+        let error = start_mount_background_scrub(
+            &cx,
+            &runtime,
+            &path,
+            &fs,
+            &cfg,
+            None,
+            ("unsafe-plan", "bd-plamw"),
+        )
+        .err()
+        .expect("unsafe mounted repair must not start a worker");
         let refusal = error
             .downcast_ref::<crate::cmd_repair::RepairTailRefusal>()
             .unwrap();
@@ -14735,13 +14867,18 @@ mod tests {
                 Some(ledger),
             )
             .expect("read-write repair config with a ledger resolves");
+            let runtime = super::mount_background_runtime().unwrap();
             let err = start_mount_background_scrub(
+                &cx,
+                &runtime,
                 &path,
                 open_fs.as_ref(),
                 &cfg,
                 Some(Arc::clone(&open_fs)),
-                "mount-bg-repair-rw-test",
-                "cli_mount_background_repair_rw_refused",
+                (
+                    "mount-bg-repair-rw-test",
+                    "cli_mount_background_repair_rw_refused",
+                ),
             )
             .err()
             .expect("read-write mounted repair must be refused");
@@ -14752,12 +14889,188 @@ mod tests {
         });
     }
 
+    fn wait_for_mount_test_signal(receiver: &mut asupersync::channel::oneshot::Receiver<()>) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !receiver.is_ready() {
+            assert!(!receiver.is_closed(), "worker exited without its signal");
+            assert!(
+                std::time::Instant::now() < deadline,
+                "worker signal timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        receiver.try_recv().unwrap();
+    }
+
+    fn wait_for_mount_test_cancellation(cx: &asupersync::Cx) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while cx.checkpoint().is_ok() {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "cancellation timed out"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+    }
+
+    #[test]
+    fn mount_io_worker_parent_cancel_drains_real_io_bd_11a8t() {
+        let runtime = super::mount_background_runtime().unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let parent = runtime
+            .block_on(cx.open_child_region(asupersync::cx::ChildRegionSpec::inherit()))
+            .unwrap();
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("completed");
+        let worker_path = path.clone();
+        let (started, mut ready) = asupersync::channel::oneshot::channel();
+        let (cancelled, mut observed_cancel) = asupersync::channel::oneshot::channel();
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let worker_release = Arc::clone(&release);
+        let mut worker = super::MountIoWorker::start(parent.cx(), &runtime, move |cx| {
+            started.send_blocking(()).unwrap();
+            wait_for_mount_test_cancellation(cx);
+            cancelled.send_blocking(()).unwrap();
+            // Model an in-flight synchronous operation finishing after its
+            // context is cancelled. It still owns write-capable resources.
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            while !worker_release.load(std::sync::atomic::Ordering::Acquire) {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "test release timed out"
+                );
+                std::thread::sleep(std::time::Duration::from_millis(1));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(50));
+            std::fs::write(worker_path, b"I/O and cleanup finished")?;
+            Ok(17_u32)
+        })
+        .unwrap();
+        wait_for_mount_test_signal(&mut ready);
+        parent
+            .cancel(asupersync::types::CancelReason::user(
+                "parent test cancellation",
+            ))
+            .unwrap();
+        wait_for_mount_test_signal(&mut observed_cancel);
+        assert!(
+            !path.exists(),
+            "cancelled I/O remains in flight until the test releases it"
+        );
+        release.store(true, std::sync::atomic::Ordering::Release);
+        assert_eq!(worker.stop().unwrap(), Some(17));
+        assert_eq!(std::fs::read(&path).unwrap(), b"I/O and cleanup finished");
+        assert_eq!(worker.stop().unwrap(), None, "shutdown is idempotent");
+        runtime.block_on(parent.close()).unwrap();
+    }
+
+    #[test]
+    fn mount_io_worker_queued_cancel_never_runs_bd_11a8t() {
+        let runtime = Arc::new(
+            asupersync::runtime::RuntimeBuilder::multi_thread()
+                .worker_threads(1)
+                .blocking_threads(1, 1)
+                .build()
+                .unwrap(),
+        );
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let (started, mut ready) = asupersync::channel::oneshot::channel();
+        let mut occupying = super::MountIoWorker::start(&cx, &runtime, move |cx| {
+            started.send_blocking(()).unwrap();
+            wait_for_mount_test_cancellation(cx);
+            Ok(())
+        })
+        .unwrap();
+        wait_for_mount_test_signal(&mut ready);
+
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("must-not-run");
+        let worker_path = path.clone();
+        let mut queued = super::MountIoWorker::start(&cx, &runtime, move |_| {
+            std::fs::write(worker_path, b"unexpected queued write")?;
+            Ok(())
+        })
+        .unwrap();
+        let pool = cx.blocking_pool_handle().unwrap();
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while pool.pending_count() != 1 {
+            assert!(std::time::Instant::now() < deadline, "work was not queued");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        queued.request_stop().unwrap();
+        // Region cancellations are processed FIFO by the sole scheduler. The
+        // occupant observes its later cancellation before it frees the slot,
+        // so the queued job must observe cancellation before invoking work.
+        assert!(!path.exists());
+        assert_eq!(occupying.stop().unwrap(), Some(()));
+        assert_eq!(queued.stop().unwrap(), None);
+        assert!(
+            !path.exists(),
+            "cancelled work must not run when the slot frees"
+        );
+    }
+
+    #[test]
+    fn mount_io_worker_preserves_error_after_cancel_bd_11a8t() {
+        let runtime = super::mount_background_runtime().unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let (started, mut ready) = asupersync::channel::oneshot::channel();
+        let dir = tempfile::tempdir().unwrap().keep();
+        let missing = dir.join("missing-parent").join("write");
+        let mut worker = super::MountIoWorker::start(&cx, &runtime, move |cx| {
+            started.send_blocking(()).unwrap();
+            wait_for_mount_test_cancellation(cx);
+            std::fs::write(missing, b"cannot succeed")?;
+            Ok(())
+        })
+        .unwrap();
+        wait_for_mount_test_signal(&mut ready);
+        let error = worker
+            .stop()
+            .expect_err("cancellation must not erase I/O errors");
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(worker.stop().unwrap(), None);
+    }
+
+    #[test]
+    fn mount_io_worker_reports_panics_and_drop_drains_bd_11a8t() {
+        let runtime = super::mount_background_runtime().unwrap();
+        let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+        let (started, mut ready) = asupersync::channel::oneshot::channel();
+        let mut worker = super::MountIoWorker::<()>::start(&cx, &runtime, move |_| {
+            started.send_blocking(()).unwrap();
+            panic!("deliberate background failure");
+        })
+        .unwrap();
+        wait_for_mount_test_signal(&mut ready);
+        assert!(worker.stop().unwrap_err().to_string().contains("panicked"));
+
+        let dir = tempfile::tempdir().unwrap().keep();
+        let path = dir.join("drop-finished");
+        let worker_path = path.clone();
+        let (started, mut ready) = asupersync::channel::oneshot::channel();
+        let worker = super::MountIoWorker::start(&cx, &runtime, move |cx| {
+            started.send_blocking(()).unwrap();
+            wait_for_mount_test_cancellation(cx);
+            std::fs::write(worker_path, b"dropped after join")?;
+            Ok(())
+        })
+        .unwrap();
+        wait_for_mount_test_signal(&mut ready);
+        drop(worker);
+        assert_eq!(std::fs::read(path).unwrap(), b"dropped after join");
+    }
+
     #[test]
     fn mount_background_scrub_can_start_and_stop_for_ext4() {
         const EXT4_VALID_FS: u16 = 0x0001;
         let image = build_test_ext4_image_with_state(EXT4_VALID_FS);
         with_temp_image_path(&image, |path| {
-            let cx = asupersync::Cx::for_testing();
+            let runtime = super::mount_background_runtime().unwrap();
+            let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
             let open_fs =
                 super::OpenFs::open_with_options(&cx, &path, &super::OpenOptions::default())
                     .expect("test ext4 image should open");
@@ -14772,16 +15085,19 @@ mod tests {
             )
             .expect("background scrub config should resolve");
             let mut guard = start_mount_background_scrub(
+                &cx,
+                &runtime,
                 &path,
                 &open_fs,
                 &cfg,
                 None,
-                "mount-bg-scrub-test",
-                "cli_mount_background_scrub_ro",
+                ("mount-bg-scrub-test", "cli_mount_background_scrub_ro"),
             )
             .expect("background scrub should start")
             .expect("background scrub should be enabled");
-            guard.stop();
+            guard
+                .stop()
+                .expect("background scrub must drain successfully");
         });
     }
 

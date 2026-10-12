@@ -17,39 +17,36 @@ const PREFIX: [u8; 22] = [
     b'0', 0, 0, 0, 0, 0, b'0', 0, 0, 0, 0, 0, b'1', 0, 0, 0, 0, 0, b'0', b'0', b'0', b'0',
 ];
 const SEQUENCES: [u8; 26] = [
-    0x04, 0x58, 0x8d, 0x00, 0x00, 0x50, 0x30, 0x00, 0x30, 0x00, 0x31, 0x00, 0x30, 0x30, 0x30,
-    0x30, 0x03, 0x54, 0x02, 0x00, 0x01, 0x01, 0x6d, 0xf9, 0xb7, 0x47,
+    0x04, 0x58, 0x8d, 0x00, 0x00, 0x50, 0x30, 0x00, 0x30, 0x00, 0x31, 0x00, 0x30, 0x30, 0x30, 0x30,
+    0x03, 0x54, 0x02, 0x00, 0x01, 0x01, 0x6d, 0xf9, 0xb7, 0x47,
 ];
 
 // A native-style frame made from the same independently published sequence
 // block: disable its content checksum, clear the block's last flag, and append
 // a final RLE block with 1,002 A bytes (LE24 header = (1002 << 3) | 3).
 const MIXED: [u8; 26] = [
-    0x00, 0x58, 0x8c, 0x00, 0x00, 0x50, 0x30, 0x00, 0x30, 0x00, 0x31, 0x00, 0x30, 0x30, 0x30,
-    0x30, 0x03, 0x54, 0x02, 0x00, 0x01, 0x01, 0x53, 0x1f, 0x00, b'A',
+    0x00, 0x58, 0x8c, 0x00, 0x00, 0x50, 0x30, 0x00, 0x30, 0x00, 0x31, 0x00, 0x30, 0x30, 0x30, 0x30,
+    0x03, 0x54, 0x02, 0x00, 0x01, 0x01, 0x53, 0x1f, 0x00, b'A',
 ];
 
 // Go's "hello": one raw block, single-segment content size and XXH64 trailer.
 const RAW: [u8; 22] = [
-    0x24, 0x0d, 0x69, 0x00, 0x00, b'h', b'e', b'l', b'l', b'o', b',', b' ', b'w', b'o', b'r',
-    b'l', b'd', 0x0a, 0x4c, 0x1f, 0xf9, 0xf1,
+    0x24, 0x0d, 0x69, 0x00, 0x00, b'h', b'e', b'l', b'l', b'o', b',', b' ', b'w', b'o', b'r', b'l',
+    b'd', 0x0a, 0x4c, 0x1f, 0xf9, 0xf1,
 ];
 
 // Compressed block containing 13 raw literals and a two-byte zero-sequence count.
 const LITERALS: [u8; 21] = [
-    0x00, 0x00, 0x85, 0x00, 0x00, 0x68, b'H', b'e', b'l', b'l', b'o', b' ', b'W', b'o', b'r',
-    b'l', b'd', b'!', 0x0a, 0x80, 0x00,
+    0x00, 0x00, 0x85, 0x00, 0x00, 0x68, b'H', b'e', b'l', b'l', b'o', b' ', b'W', b'o', b'r', b'l',
+    b'd', b'!', 0x0a, 0x80, 0x00,
 ];
 
 // Upstream golden frame: eight 128-KiB RLE blocks yield 1 MiB of zeroes,
 // with a four-byte content size and a verified content checksum.
 const RLE: [u8; 41] = [
-    0xa4, 0x00, 0x00, 0x10, 0x00,
-    0x02, 0x00, 0x10, 0x00, 0x02, 0x00, 0x10, 0x00,
-    0x02, 0x00, 0x10, 0x00, 0x02, 0x00, 0x10, 0x00,
-    0x02, 0x00, 0x10, 0x00, 0x02, 0x00, 0x10, 0x00,
-    0x02, 0x00, 0x10, 0x00, 0x03, 0x00, 0x10, 0x00,
-    0xf1, 0x3e, 0x16, 0xe1,
+    0xa4, 0x00, 0x00, 0x10, 0x00, 0x02, 0x00, 0x10, 0x00, 0x02, 0x00, 0x10, 0x00, 0x02, 0x00, 0x10,
+    0x00, 0x02, 0x00, 0x10, 0x00, 0x02, 0x00, 0x10, 0x00, 0x02, 0x00, 0x10, 0x00, 0x02, 0x00, 0x10,
+    0x00, 0x03, 0x00, 0x10, 0x00, 0xf1, 0x3e, 0x16, 0xe1,
 ];
 
 fn expected() -> Vec<u8> {
@@ -145,7 +142,10 @@ fn zstd_published_vectors_cover_raw_compressed_sequences_and_multiblock_rle() {
         (RLE.as_slice(), vec![0; 1024 * 1024]),
         (MIXED.as_slice(), expected()),
     ] {
-        assert_eq!(decompress(&native(payload, META), 16, bytes.len()).unwrap(), bytes);
+        assert_eq!(
+            decompress(&native(payload, META), 16, bytes.len()).unwrap(),
+            bytes
+        );
     }
 }
 
@@ -153,7 +153,10 @@ fn zstd_published_vectors_cover_raw_compressed_sequences_and_multiblock_rle() {
 fn zstd_all_native_levels_and_four_historical_header_layouts_are_admitted() {
     for level in (1_u8..=19).chain(103..=123) {
         for metadata in metadata_layouts(level) {
-            assert_eq!(decompress(&native(&MIXED, metadata), 16, LOGICAL).unwrap(), expected());
+            assert_eq!(
+                decompress(&native(&MIXED, metadata), 16, LOGICAL).unwrap(),
+                expected()
+            );
         }
     }
     for level in 0_u8..=255 {
@@ -163,12 +166,15 @@ fn zstd_all_native_levels_and_four_historical_header_layouts_are_admitted() {
     }
     // No producer-version cutoff: native readers treat this as information.
     for metadata in [[3, 0, 0x12, 0x34], [3, 0, 0xfe, 0xff]] {
-        assert_eq!(decompress(&native(&MIXED, metadata), 16, LOGICAL).unwrap(), expected());
+        assert_eq!(
+            decompress(&native(&MIXED, metadata), 16, LOGICAL).unwrap(),
+            expected()
+        );
     }
     for metadata in [
         [0, 0, 0, 0],
         [3, 1, 0x28, 0xa5], // No zero byte, so no native layout is identified.
-        [3, 0, 0, 0xa5], // First zero from the low end selects invalid level 0xa5.
+        [3, 0, 0, 0xa5],    // First zero from the low end selects invalid level 0xa5.
     ] {
         assert!(decompress(&native(&MIXED, metadata), 16, LOGICAL).is_err());
     }
@@ -189,7 +195,10 @@ fn zstd_requires_complete_native_length_frame_and_exact_logical_size() {
         }
         // Also truncate the frame while keeping the wrapper length consistent.
         for end in 0..payload.len() {
-            assert!(decompress(&native(&payload[..end], META), 16, length).is_err(), "{end}");
+            assert!(
+                decompress(&native(&payload[..end], META), 16, length).is_err(),
+                "{end}"
+            );
         }
         assert!(decompress(&packed, 16, length - 1).is_err());
         assert!(decompress(&packed, 16, length + 1).is_err());
@@ -244,7 +253,7 @@ fn zstd_rejects_dictionary_requirements_wrong_framing_and_reserved_bits() {
     for payload in [
         &[0x78, 0x01, 0x03, 0x00, 0x00, 0x00, 0x00, 0x01][..],
         &[0x50, 0x2a, 0x4d, 0x18, 0, 0, 0, 0][..], // Skippable standard frame.
-        &[0, 0, 1, 0, 0][..], // A complete empty raw frame cannot yield LSIZE.
+        &[0, 0, 1, 0, 0][..],                      // A complete empty raw frame cannot yield LSIZE.
     ] {
         assert!(decompress(&native(payload, META), 16, LOGICAL).is_err());
     }
@@ -261,15 +270,22 @@ fn zstd_rejects_dictionary_requirements_wrong_framing_and_reserved_bits() {
     // The format requires decoders to ignore the unused FHD bit (bit 4).
     let mut unused = MIXED;
     unused[0] |= 0x10;
-    assert_eq!(decompress(&native(&unused, META), 16, LOGICAL).unwrap(), expected());
+    assert_eq!(
+        decompress(&native(&unused, META), 16, LOGICAL).unwrap(),
+        expected()
+    );
 }
 
 #[test]
 fn zstd_advertised_window_is_bounded_before_context_or_output_expansion() {
-    for descriptor in [0, 0x6f, 0x70] { // 1 KiB, 15 MiB, exactly 16 MiB.
+    for descriptor in [0, 0x6f, 0x70] {
+        // 1 KiB, 15 MiB, exactly 16 MiB.
         let mut payload = MIXED;
         payload[1] = descriptor;
-        assert_eq!(decompress(&native(&payload, META), 16, LOGICAL).unwrap(), expected());
+        assert_eq!(
+            decompress(&native(&payload, META), 16, LOGICAL).unwrap(),
+            expected()
+        );
     }
     for descriptor in [0x71, 0x78, 0xf8, 0xff] {
         let mut payload = MIXED;
@@ -319,7 +335,10 @@ fn zstd_content_size_encodings_must_match_lsize_in_single_or_multiple_segments()
     let mut multiple = vec![0x80, 0x58];
     multiple.extend_from_slice(&(LOGICAL as u32).to_le_bytes());
     multiple.extend_from_slice(&MIXED[2..]);
-    assert_eq!(decompress(&native(&multiple, META), 16, LOGICAL).unwrap(), expected());
+    assert_eq!(
+        decompress(&native(&multiple, META), 16, LOGICAL).unwrap(),
+        expected()
+    );
 }
 
 #[test]

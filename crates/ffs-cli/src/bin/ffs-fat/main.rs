@@ -116,7 +116,9 @@ impl EntrySlots {
                 }
             }
             let entry = found.ok_or_else(|| {
-                FfsError::NotFound(format!("FAT entry slot {offset} is not in its selected parent"))
+                FfsError::NotFound(format!(
+                    "FAT entry slot {offset} is not in its selected parent"
+                ))
             })?;
             if entry.native.is_directory() && !ancestors.insert(entry.native.first_cluster) {
                 return Err(FfsError::Corruption {
@@ -139,7 +141,9 @@ impl EntrySlots {
 fn native_presentation(entry: &Entry) -> ffs_error::Result<(Option<String>, Option<String>)> {
     // Inspect native units first: an unpaired surrogate must not hide a path
     // separator merely because UTF-16 display conversion fails before seeing it.
-    let invalid_short = entry.native.short_name[..8].iter().all(|byte| *byte == b' ')
+    let invalid_short = entry.native.short_name[..8]
+        .iter()
+        .all(|byte| *byte == b' ')
         || entry
             .native
             .short_name
@@ -148,7 +152,9 @@ fn native_presentation(entry: &Entry) -> ffs_error::Result<(Option<String>, Opti
     let invalid_long = entry.native.long_name.as_ref().is_some_and(|units| {
         units.is_empty()
             || matches!(units.as_slice(), [0x002E] | [0x002E, 0x002E])
-            || units.iter().any(|unit| matches!(*unit, 0 | 0x002F | 0x005C))
+            || units
+                .iter()
+                .any(|unit| matches!(*unit, 0 | 0x002F | 0x005C))
     });
     if invalid_short || invalid_long {
         return Err(FfsError::Corruption {
@@ -389,12 +395,8 @@ fn main() -> Result<()> {
         }
         Command::Catalog { image, entry_slots } => {
             let volume = image.open(&cx)?;
-            let report = native_catalog(
-                &cx,
-                &volume,
-                &entry_slots.unwrap_or_default(),
-                image.offset,
-            )?;
+            let report =
+                native_catalog(&cx, &volume, &entry_slots.unwrap_or_default(), image.offset)?;
             serde_json::to_writer_pretty(io::stdout().lock(), &report)?;
             println!();
         }
@@ -567,14 +569,8 @@ mod tests {
             assert_eq!(slots.0, [20_992, 22_592]);
             for value in ["", "1", "32,", "32,,64"] {
                 assert!(
-                    Cli::try_parse_from([
-                        "ffs-fat",
-                        command,
-                        "disk.img",
-                        "--entry-slots",
-                        value
-                    ])
-                    .is_err()
+                    Cli::try_parse_from(["ffs-fat", command, "disk.img", "--entry-slots", value])
+                        .is_err()
                 );
             }
             assert!(

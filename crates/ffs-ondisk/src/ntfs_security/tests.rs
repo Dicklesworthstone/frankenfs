@@ -1,12 +1,10 @@
 use super::*;
 
 const DESCRIPTOR: [u8; 96] = [
-    1, 0, 4, 128, 20, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 48, 0, 0, 0,
-    1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0,
-    1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0,
-    2, 0, 48, 0, 2, 0, 0, 0,
-    1, 18, 20, 0, 2, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0,
-    0, 3, 20, 0, 255, 1, 31, 0, 1, 1, 0, 0, 0, 0, 0, 5, 18, 0, 0, 0,
+    1, 0, 4, 128, 20, 0, 0, 0, 32, 0, 0, 0, 0, 0, 0, 0, 48, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 5, 18, 0,
+    0, 0, 1, 2, 0, 0, 0, 0, 0, 5, 32, 0, 0, 0, 32, 2, 0, 0, 2, 0, 48, 0, 2, 0, 0, 0, 1, 18, 20, 0,
+    2, 0, 0, 0, 1, 1, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 3, 20, 0, 255, 1, 31, 0, 1, 1, 0, 0, 0, 0,
+    0, 5, 18, 0, 0, 0,
 ];
 const DESCRIPTOR_HASH: u32 = 0xF1C7_5D8C;
 
@@ -169,9 +167,7 @@ fn descriptor_offsets_sid_and_ace_extents_are_bounded() {
     let mut missing_flag = DESCRIPTOR;
     missing_flag[2] = 0;
     assert!(NtfsSecurityDescriptor::parse(&missing_flag).is_err());
-    assert!(
-        NtfsSecurityDescriptor::parse(&vec![0; MAX_SECURITY_DESCRIPTOR_BYTES + 1]).is_err()
-    );
+    assert!(NtfsSecurityDescriptor::parse(&vec![0; MAX_SECURITY_DESCRIPTOR_BYTES + 1]).is_err());
     // Component order is not prescribed; owner and group may share a SID.
     let mut shared = DESCRIPTOR;
     shared[8..12].copy_from_slice(&20_u32.to_le_bytes());
@@ -206,7 +202,11 @@ fn sds_header_binds_primary_bucket_exact_length_identity_and_hash() {
 
 #[test]
 fn sii_root_and_native_index_block_decode_data_headers_and_fixups() {
-    let keys = [entry(0x100, 464, None), entry(0x200, 592, None), terminal(None)];
+    let keys = [
+        entry(0x100, 464, None),
+        entry(0x200, 592, None),
+        terminal(None),
+    ];
     let root_bytes = root(&keys, false);
     let parsed = NtfsSecurityIndexRoot::parse(&root_bytes, 512).unwrap();
     assert_eq!(parsed.entries.len(), 3);
@@ -237,7 +237,11 @@ fn sii_root_and_native_index_block_decode_data_headers_and_fixups() {
 #[test]
 fn sii_index_rejects_wrong_collation_bounds_identity_order_and_terminators() {
     let source = root(
-        &[entry(0x100, 464, None), entry(0x200, 592, None), terminal(None)],
+        &[
+            entry(0x100, 464, None),
+            entry(0x200, 592, None),
+            terminal(None),
+        ],
         false,
     );
     for (offset, byte) in [
@@ -264,7 +268,11 @@ fn sii_index_rejects_wrong_collation_bounds_identity_order_and_terminators() {
         );
     }
     let duplicate = root(
-        &[entry(0x100, 464, None), entry(0x100, 592, None), terminal(None)],
+        &[
+            entry(0x100, 464, None),
+            entry(0x100, 592, None),
+            terminal(None),
+        ],
         false,
     );
     assert!(NtfsSecurityIndexRoot::parse(&duplicate, 512).is_err());
