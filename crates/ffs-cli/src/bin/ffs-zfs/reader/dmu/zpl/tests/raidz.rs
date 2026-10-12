@@ -105,10 +105,9 @@ fn raidz_mount_recovers_metadata_legacy_sa_spill_and_embedded_file_parents() {
                         fs.read(&cx, &mut scope, alias.ino, 510, 600).unwrap(),
                         expected[510..]
                     );
-                    assert!(
-                        fs.read(&cx, &mut scope, file.ino, 1027, 1)
-                            .unwrap()
-                            .is_empty()
+                    assert_eq!(
+                        fs.read(&cx, &mut scope, file.ino, 1027, 1).unwrap(),
+                        [] as [u8; 0]
                     );
                     assert_eq!(
                         reads

@@ -334,7 +334,7 @@ mod tests {
             ),
             (1_048_576, Some(67_108_864), 2, 3, 123)
         );
-        assert!(candidate.members.is_empty());
+        assert_eq!(candidate.members, [] as [PathBuf; 0]);
     }
     #[test]
     fn object_commands_require_root_identity_and_explicit_range_length() {
@@ -416,13 +416,13 @@ mod tests {
             let parsed =
                 Cli::try_parse_from(std::iter::once("ffs-zfs").chain(command).chain(options))
                     .unwrap();
-            let candidate = match parsed.command {
-                Command::Root { candidate }
-                | Command::Object { candidate, .. }
-                | Command::ObjectRead { candidate, .. }
-                | Command::Zap { candidate, .. }
-                | Command::Datasets { candidate } => candidate,
-                _ => panic!("raw pool command"),
+            let (Command::Root { candidate }
+            | Command::Object { candidate, .. }
+            | Command::ObjectRead { candidate, .. }
+            | Command::Zap { candidate, .. }
+            | Command::Datasets { candidate }) = parsed.command
+            else {
+                panic!("raw pool command");
             };
             assert_eq!(candidate.image.image, PathBuf::from("first.img"));
             assert_eq!(

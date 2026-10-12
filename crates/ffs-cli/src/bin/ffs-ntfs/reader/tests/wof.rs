@@ -389,14 +389,14 @@ fn provider_and_fragmented_backing_in_attribute_list_extensions_keep_native_iden
     let clusters = stored.len().div_ceil(512);
     let mut first = named_mapping(&[0x21, 1, 180, 0, 0], clusters, stored.len());
     first[24..32].fill(0);
-    let mut last = named_mapping(
+    let mut continuation = named_mapping(
         &[0x21, u8::try_from(clusters - 1).unwrap(), 140, 0, 0],
         clusters,
         0,
     );
-    last[14..16].copy_from_slice(&5_u16.to_le_bytes());
-    last[16..24].copy_from_slice(&1_u64.to_le_bytes());
-    last[40..64].fill(0xFF); // Only VCN zero owns the native size fields.
+    continuation[14..16].copy_from_slice(&5_u16.to_le_bytes());
+    continuation[16..24].copy_from_slice(&1_u64.to_le_bytes());
+    continuation[40..64].fill(0xFF); // Only VCN zero owns the native size fields.
     let mut list = list_entry(0x10, 24, 2, 0, "");
     list.extend(list_entry(DATA, 24, 0, 0, ""));
     list.extend(list_entry(DATA, 24, 1, 0, BACKING));
@@ -416,7 +416,7 @@ fn provider_and_fragmented_backing_in_attribute_list_extensions_keep_native_iden
             ],
         ),
     );
-    let extension_record = extension(27, 24, &[last, attrs[3].clone()]);
+    let extension_record = extension(27, 24, &[continuation, attrs[3].clone()]);
     image.put_record(27, &extension_record);
     let before = image.bytes.clone();
     let volume = image.volume();
@@ -428,7 +428,7 @@ fn provider_and_fragmented_backing_in_attribute_list_extensions_keep_native_iden
 
     let mut stale = Image { bytes: before };
     let mut wrong = extension_record;
-    wrong[32..40].copy_from_slice(&(24_u64 | (8_u64 << 48)).to_le_bytes());
+    wrong[32..40].copy_from_slice(&(0x0018_u64 | (8_u64 << 48)).to_le_bytes());
     stale.put_record(27, &wrong);
     let volume = stale.volume();
     let record = volume.record(&cx, 24, None).unwrap();
@@ -484,7 +484,7 @@ fn backing_and_placeholder_admission_rejects_incomplete_or_transformed_values_wi
                     expected.len() as u64,
                     expected.len() as u64,
                     0,
-                )
+                );
             }
             1 => attrs[2][56..64].copy_from_slice(&(stored.len() as u64 - 1).to_le_bytes()),
             2 => attrs[2][12..14].copy_from_slice(&0x4000_u16.to_le_bytes()),

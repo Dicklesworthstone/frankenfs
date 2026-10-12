@@ -330,7 +330,8 @@ impl FsOps for ZfsFs {
         {
             return Err(FfsError::ReadOnly);
         }
-        match self.state(cx)?.metadata(cx, ino)?.0.kind {
+        let kind = self.state(cx)?.metadata(cx, ino)?.0.kind;
+        match kind {
             Kind::Directory => Err(FfsError::IsDirectory),
             Kind::Regular => Ok((0, 0)),
             _ => Err(unsupported("ZPL open requires a regular file")),

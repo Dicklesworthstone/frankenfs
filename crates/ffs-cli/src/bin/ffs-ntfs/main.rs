@@ -1046,22 +1046,22 @@ mod tests {
                 "2",
             ])
             .unwrap();
-            let (stream, native, start, bytes) = match cli.command {
-                Command::Read {
-                    stream,
-                    stream_utf16,
-                    start,
-                    bytes,
-                    ..
-                }
-                | Command::Cat {
-                    stream,
-                    stream_utf16,
-                    start,
-                    bytes,
-                    ..
-                } => (stream, stream_utf16, start, bytes),
-                _ => panic!("stream extraction"),
+            let (Command::Read {
+                stream,
+                stream_utf16: native,
+                start,
+                bytes,
+                ..
+            }
+            | Command::Cat {
+                stream,
+                stream_utf16: native,
+                start,
+                bytes,
+                ..
+            }) = cli.command
+            else {
+                panic!("stream extraction");
             };
             assert!(stream.is_none());
             assert_eq!(native.unwrap().as_units(), [0xD800, 0x006E]);

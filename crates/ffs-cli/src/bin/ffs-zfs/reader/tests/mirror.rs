@@ -15,7 +15,7 @@ pub(in crate::reader) fn native_config(
     let children: Vec<_> = members
         .iter()
         .enumerate()
-        .map(|(id, guid)| {
+        .flat_map(|(id, guid)| {
             list(&[
                 pair("type", 9, &xstring("file")),
                 uint("id", id as u64),
@@ -25,11 +25,7 @@ pub(in crate::reader) fn native_config(
             ])
         })
         .collect();
-    let mut array = pair(
-        "children",
-        20,
-        &children.into_iter().flatten().collect::<Vec<_>>(),
-    );
+    let mut array = pair("children", 20, &children);
     let elements = 8 + xstring("children").len() + 4;
     array[elements..elements + 4].copy_from_slice(&(members.len() as u32).to_be_bytes());
     let tree = list(&[
@@ -272,8 +268,8 @@ pub(in crate::reader) fn repack(config: &NvList) -> Vec<u8> {
 #[test]
 fn complete_mirrors_cover_widths_orders_compression_ashift_and_reversed_inputs() {
     let cx = Cx::for_testing();
-    for (width, ashift) in [(2, 9), (3, 12), (8, 16)] {
-        let guids: Vec<_> = (0..width).map(|index| 1001 + index as u64).collect();
+    for (width, ashift) in [(2_u64, 9), (3, 12), (8, 16)] {
+        let guids: Vec<_> = (0..width).map(|index| 1001 + index).collect();
         for order in [Endian::Little, Endian::Big] {
             for compressed in [false, true] {
                 let expected = Member::new(order, compressed, ashift, guids[0], &guids).root;

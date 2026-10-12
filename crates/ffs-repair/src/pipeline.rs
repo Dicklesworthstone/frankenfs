@@ -38,7 +38,6 @@ use crate::recovery::{
 };
 use crate::scrub::{BlockValidator, ScrubReport, Scrubber, Severity};
 use crate::storage::{RepairGroupLayout, RepairGroupStorage};
-use crate::symbol::RepairGroupDescExt;
 
 // ── Per-group configuration ───────────────────────────────────────────────
 
@@ -2070,6 +2069,12 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
         // Read current generation.
         let old_desc = storage.read_group_desc_ext(cx)?;
         let old_gen = old_desc.repair_generation;
+        let new_gen = old_gen.checked_add(1).ok_or_else(|| {
+            FfsError::RepairFailed(format!(
+                "repair generation exhausted for group {}",
+                group_num.0
+            ))
+        })?;
         let effective_symbol_count = repair_symbol_count.min(group_cfg.layout.repair_block_count);
         if effective_symbol_count != repair_symbol_count {
             warn!(
@@ -2104,8 +2109,6 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             effective_symbol_count,
         )?;
 
-        let new_gen = old_gen + 1;
-
         // Write symbols.
         let symbols: Vec<(u32, Vec<u8>)> = encoded
             .repair_symbols
@@ -2114,14 +2117,10 @@ impl<'a, W: Write> ScrubWithRecovery<'a, W> {
             .collect();
         let symbols_generated = u32::try_from(symbols.len()).unwrap_or(u32::MAX);
 
+        // Storage publishes and syncs the descriptor together with the symbols.
+        // A second descriptor write would introduce a new failure after that
+        // durable boundary, incorrectly leaving a committed refresh dirty.
         storage.write_repair_symbols(cx, &symbols, new_gen)?;
-
-        // Write updated descriptor.
-        let new_desc = RepairGroupDescExt {
-            repair_generation: new_gen,
-            ..old_desc
-        };
-        storage.write_group_desc_ext(cx, &new_desc)?;
 
         info!(
             target: "ffs::repair::refresh",
@@ -2703,6 +2702,57 @@ mod tests {
         }
 
         fn sync(&self, _cx: &Cx) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Plant a descriptor I/O failure only after a new raw generation has
+    /// reached a sync boundary with identical, verified descriptor copies.
+    struct RejectPostPublicationWrite<'a> {
+        inner: &'a MemBlockDevice,
+        layout: RepairGroupLayout,
+        previous_generation: u64,
+        committed: Mutex<Option<HashMap<u64, Vec<u8>>>>,
+        rejected_writes: AtomicU64,
+    }
+
+    impl BlockDevice for RejectPostPublicationWrite<'_> {
+        fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
+            self.inner.read_block(cx, block)
+        }
+
+        fn write_block(&self, cx: &Cx, block: BlockNumber, data: &[u8]) -> Result<()> {
+            if self.layout.descriptor_blocks().contains(&block)
+                && self.committed.lock().expect("committed image").is_some()
+            {
+                self.rejected_writes.fetch_add(1, Ordering::Relaxed);
+                return Err(std::io::Error::other("descriptor fault after publication").into());
+            }
+            self.inner.write_block(cx, block, data)
+        }
+
+        fn block_size(&self) -> u32 {
+            self.inner.block_size()
+        }
+
+        fn block_count(&self) -> u64 {
+            self.inner.block_count()
+        }
+
+        fn sync(&self, cx: &Cx) -> Result<()> {
+            self.inner.sync(cx)?;
+            let storage = RepairGroupStorage::new(self.inner, self.layout);
+            if let Ok((descriptor, _)) = storage.read_verified_raw_generation(cx, false)
+                && descriptor.repair_generation > self.previous_generation
+            {
+                let [first, second] = self.layout.descriptor_blocks();
+                if self.inner.read_block(cx, first)?.as_slice()
+                    == self.inner.read_block(cx, second)?.as_slice()
+                {
+                    *self.committed.lock().expect("committed image") =
+                        Some(self.inner.blocks.lock().expect("image").clone());
+                }
+            }
             Ok(())
         }
     }
@@ -4110,6 +4160,133 @@ mod tests {
 
         let generation_after = read_generation(&cx, &device, layout);
         assert_eq!(generation_after, generation_before + 1);
+    }
+
+    #[test]
+    fn eager_refresh_does_not_write_descriptors_after_durable_publication() {
+        let cx = Cx::for_testing();
+        let device = MemBlockDevice::new(256, 64);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout");
+        write_source_blocks(&cx, &device, BlockNumber(0), 8);
+        bootstrap_storage(&cx, &device, layout, BlockNumber(0), 8, 4);
+        device
+            .write_block(&cx, BlockNumber(1), &[0x5A; 256])
+            .expect("new client data");
+        let expected = encode_group(
+            &cx,
+            &device,
+            &test_uuid(),
+            GroupNumber(0),
+            BlockNumber(0),
+            8,
+            4,
+        )
+        .expect("expected new-source parity")
+        .repair_symbols
+        .into_iter()
+        .map(|symbol| (symbol.esi, symbol.data))
+        .collect::<Vec<_>>();
+        let guarded = RejectPostPublicationWrite {
+            inner: &device,
+            layout,
+            previous_generation: 1,
+            committed: Mutex::new(None),
+            rejected_writes: AtomicU64::new(0),
+        };
+        let validator = CorruptBlockValidator::new(vec![]);
+        let mut pipeline = ScrubWithRecovery::new(
+            &guarded,
+            &validator,
+            test_uuid(),
+            vec![GroupConfig {
+                layout,
+                source_first_block: BlockNumber(0),
+                source_block_count: 8,
+            }],
+            Vec::new(),
+            4,
+        )
+        .with_group_refresh_policy(GroupNumber(0), RefreshPolicy::Eager);
+
+        pipeline
+            .on_group_write(&cx, GroupNumber(0))
+            .expect("durable refresh");
+
+        assert!(!pipeline.is_group_dirty(GroupNumber(0)));
+        assert_eq!(pipeline.runtime_metrics().symbol_refresh_count, 1);
+        assert_eq!(guarded.rejected_writes.load(Ordering::Relaxed), 0);
+        let committed = guarded.committed.lock().expect("committed image");
+        assert_eq!(
+            &*device.blocks.lock().expect("image"),
+            committed.as_ref().expect("publication sync observed")
+        );
+        let storage = RepairGroupStorage::new(&device, layout);
+        assert_eq!(
+            storage.read_group_desc_ext(&cx).unwrap().repair_generation,
+            2
+        );
+        assert_eq!(storage.read_repair_symbols(&cx).unwrap(), expected);
+        assert_eq!(
+            device.read_block(&cx, BlockNumber(1)).unwrap().as_slice(),
+            &[0x5A; 256]
+        );
+        let records = crate::evidence::parse_evidence_ledger(&pipeline.into_ledger());
+        assert_eq!(
+            records
+                .iter()
+                .filter(|record| record.event_type == EvidenceEventType::SymbolRefresh)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn eager_refresh_exhausted_generation_preserves_data_and_dirty_state() {
+        let cx = Cx::for_testing();
+        let device = MemBlockDevice::new(256, 64);
+        let layout =
+            RepairGroupLayout::new(GroupNumber(0), BlockNumber(0), 64, 0, 4).expect("layout");
+        write_source_blocks(&cx, &device, BlockNumber(0), 8);
+        bootstrap_storage(&cx, &device, layout, BlockNumber(0), 8, 4);
+        let storage = RepairGroupStorage::new(&device, layout);
+        let symbols = storage.read_repair_symbols(&cx).expect("bootstrap symbols");
+        storage
+            .write_repair_symbols(&cx, &symbols, u64::MAX - 1)
+            .expect("penultimate generation");
+        let validator = CorruptBlockValidator::new(vec![]);
+        let mut pipeline = ScrubWithRecovery::new(
+            &device,
+            &validator,
+            test_uuid(),
+            vec![GroupConfig {
+                layout,
+                source_first_block: BlockNumber(0),
+                source_block_count: 8,
+            }],
+            Vec::new(),
+            4,
+        )
+        .with_group_refresh_policy(GroupNumber(0), RefreshPolicy::Eager);
+
+        pipeline
+            .on_group_write(&cx, GroupNumber(0))
+            .expect("last valid generation");
+        assert_eq!(read_generation(&cx, &device, layout), u64::MAX);
+        assert!(!pipeline.is_group_dirty(GroupNumber(0)));
+        assert_eq!(storage.read_repair_symbols(&cx).unwrap(), symbols);
+        let before = device.blocks.lock().expect("image").clone();
+
+        let error = pipeline
+            .on_group_write(&cx, GroupNumber(0))
+            .expect_err("generation exhausted");
+
+        assert!(
+            matches!(error, FfsError::RepairFailed(ref message) if message.contains("generation exhausted"))
+        );
+        assert_eq!(*device.blocks.lock().expect("image"), before);
+        assert!(pipeline.is_group_dirty(GroupNumber(0)));
+        assert_eq!(pipeline.runtime_metrics().symbol_refresh_count, 1);
     }
 
     #[test]

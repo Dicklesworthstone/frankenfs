@@ -89,7 +89,7 @@ fn source_cli_preserves_existing_geometry_and_reports_native_payload_verificatio
         let volume = FatVolume::open(&cx, &args.image, 0, None).unwrap();
         assert_eq!(read_native(&cx, &volume, "/A.BIN"), [0xA5; 600]);
         assert_eq!(read_native(&cx, &volume, "/DIR/B.BIN"), b"B");
-        assert!(read_native(&cx, &volume, "/EMPTY.BIN").is_empty());
+        assert_eq!(read_native(&cx, &volume, "/EMPTY.BIN"), [] as [u8; 0]);
         assert_eq!(
             fs::read(args.source_dir.as_ref().unwrap().join("A.BIN")).unwrap(),
             [0xA5; 600]
@@ -288,12 +288,10 @@ fn unicode_names_short_case_flags_and_reserved_aliases_round_trip_exactly() {
                     .enumerate()
                 {
                     let position = (ordinal - 1) * 13 + within;
-                    let expected = if position < units.len() {
-                        units[position]
-                    } else if position == units.len() {
-                        0
-                    } else {
-                        0xFFFF
+                    let expected = match position.cmp(&units.len()) {
+                        std::cmp::Ordering::Less => units[position],
+                        std::cmp::Ordering::Equal => 0,
+                        std::cmp::Ordering::Greater => 0xFFFF,
                     };
                     assert_eq!(short(bytes, at), expected);
                 }
@@ -306,16 +304,16 @@ fn unicode_names_short_case_flags_and_reserved_aliases_round_trip_exactly() {
 fn root_and_subdirectory_growth_keep_complete_native_chains() {
     let temporary = tempfile::tempdir().unwrap();
     let args = source_options(temporary.path(), FormatKind::Fat32);
-    for index in 0..40 {
+    for index in 0_u8..40 {
         write_source(
             &args,
             &format!("Root long filename {index:02}.txt"),
-            &[index as u8; 37],
+            &[index; 37],
         );
         write_source(
             &args,
             &format!("nested/Subdirectory long filename {index:02}.txt"),
-            &[index as u8; 41],
+            &[index; 41],
         );
     }
     fs::create_dir(args.source_dir.as_ref().unwrap().join("nested/empty")).unwrap();
@@ -334,10 +332,10 @@ fn root_and_subdirectory_growth_keep_complete_native_chains() {
     assert!(volume.directory_size(&cx, nested).unwrap() > 512);
     assert_eq!(volume.list(&cx, Directory::Root).unwrap().len(), 41);
     assert_eq!(volume.list(&cx, nested).unwrap().len(), 41);
-    for index in 0..40 {
+    for index in 0_u8..40 {
         assert_eq!(
             read_native(&cx, &volume, &format!("/Root long filename {index:02}.txt")),
-            [index as u8; 37]
+            [index; 37]
         );
         assert_eq!(
             read_native(
@@ -345,7 +343,7 @@ fn root_and_subdirectory_growth_keep_complete_native_chains() {
                 &volume,
                 &format!("/nested/Subdirectory long filename {index:02}.txt")
             ),
-            [index as u8; 41]
+            [index; 41]
         );
     }
     let empty = volume.resolve(&cx, "/nested/empty").unwrap().unwrap();
@@ -581,8 +579,8 @@ fn host_hardlinks_become_independent_native_chains_and_empty_sources_match_empty
         create(&cx, &empty).unwrap();
         let left = File::open(&populated.image).unwrap();
         let right = File::open(&empty.image).unwrap();
-        let mut a = [0_u8; 64 * 1024];
-        let mut b = [0_u8; 64 * 1024];
+        let mut a = vec![0_u8; 64 * 1024];
+        let mut b = vec![0_u8; 64 * 1024];
         for offset in (0..plan.layout.image_bytes()).step_by(a.len()) {
             left.read_exact_at(&mut a, offset).unwrap();
             right.read_exact_at(&mut b, offset).unwrap();
@@ -665,7 +663,7 @@ fn source_changes_during_copy_or_directory_preparation_leave_no_admitted_bpb() {
     for directory_change in [false, true] {
         let temporary = tempfile::tempdir().unwrap();
         let args = source_options(temporary.path(), FormatKind::Fat32);
-        write_source(&args, "payload.bin", &[0x51; 131_073]);
+        write_source(&args, "payload.bin", &vec![0x51; 131_073]);
         let cx = Cx::for_testing();
         let plan = populated_plan(&cx, &args);
         let target = SourceChangingTarget {
@@ -698,7 +696,7 @@ fn payload_and_extra_metadata_failures_and_cancellation_are_unpublished() {
     for kind in [FormatKind::Fat16, FormatKind::Fat32] {
         let temporary = tempfile::tempdir().unwrap();
         let args = source_options(temporary.path(), kind);
-        write_source(&args, "payload.bin", &[0x71; 140_001]);
+        write_source(&args, "payload.bin", &vec![0x71; 140_001]);
         write_source(&args, "nested/child.txt", b"child");
         let plan = populated_plan(&Cx::for_testing(), &args);
         assert!(plan.preparation_sectors().count() > plan.before_boot.len() + 2);
@@ -755,7 +753,7 @@ fn native_payload_readback_rejects_data_corruption_even_when_allocation_is_clean
     for kind in [FormatKind::Fat16, FormatKind::Fat32] {
         let temporary = tempfile::tempdir().unwrap();
         let args = source_options(temporary.path(), kind);
-        write_source(&args, "nested/payload.bin", &[0x2A; 140_001]);
+        write_source(&args, "nested/payload.bin", &vec![0x2A; 140_001]);
         let cx = Cx::for_testing();
         let plan = populated_plan(&cx, &args);
         let file = new_file(&args.image);
@@ -789,7 +787,7 @@ fn native_payload_readback_rejects_data_corruption_even_when_allocation_is_clean
         assert!(args.image.is_file());
         assert_eq!(
             fs::read(args.source_dir.as_ref().unwrap().join("nested/payload.bin")).unwrap(),
-            [0x2A; 140_001]
+            vec![0x2A; 140_001]
         );
     }
 }

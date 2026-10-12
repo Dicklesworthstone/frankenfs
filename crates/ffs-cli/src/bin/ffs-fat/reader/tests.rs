@@ -851,7 +851,7 @@ fn native_slots_reject_nonmembers_deleted_labels_dot_entries_and_end_marker_slac
                 ),
                 "{kind:?}: {offsets:?}"
             );
-            assert!(output.is_empty());
+            assert_eq!(output, [] as [u8; 0]);
         }
         let mut output = Vec::new();
         assert!(matches!(
@@ -872,7 +872,7 @@ fn native_slots_reject_nonmembers_deleted_labels_dot_entries_and_end_marker_slac
                 Err(FfsError::IsDirectory)
             ));
         }
-        assert!(output.is_empty());
+        assert_eq!(output, [] as [u8; 0]);
         assert!(matches!(
             crate::native_catalog(&cx, &volume, &slot_selector(&[root - base]), base as u64),
             Err(FfsError::NotDirectory)
@@ -932,7 +932,7 @@ fn native_catalog_keeps_structural_record_and_name_corruption_fatal() {
                 crate::extract_slots(&cx, &volume, &slot_selector(&[root - base]), &mut output,),
                 Err(FfsError::Corruption { .. })
             ));
-            assert!(output.is_empty());
+            assert_eq!(output, [] as [u8; 0]);
         }
     }
 }
@@ -967,7 +967,7 @@ fn native_extraction_validates_allocation_and_directory_tails_before_output() {
                 ),
                 "{kind:?}: damage {damage}"
             );
-            assert!(output.is_empty());
+            assert_eq!(output, [] as [u8; 0]);
         }
     }
 }
@@ -995,7 +995,7 @@ fn native_extraction_propagates_payload_cancellation() {
             crate::extract_slots(&cx, &volume, &selector, &mut output),
             Err(FfsError::Cancelled)
         ));
-        assert!(output.is_empty());
+        assert_eq!(output, [] as [u8; 0]);
     }
 }
 

@@ -368,7 +368,7 @@ impl Objects {
             )?
             .ok_or_else(|| corrupt("selected snapshot object set is a hole"))?;
         let os = ObjectSet::parse(&block.bytes, block.order).map_err(|error| parse(&error))?;
-        let view = Objects {
+        let view = Self {
             pool: self.pool.clone(),
             config: self.config.clone(),
             txg: selected.info.creation_txg,

@@ -324,12 +324,14 @@ fn malformed_trees_runs_blocks_and_chunk_bounds_never_publish_partial_output() {
 #[test]
 fn independent_libfwnt_verbatim_and_aligned_vectors_match_complete_native_outputs() {
     use sha2::{Digest, Sha256};
+    use std::fmt::Write as _;
 
     let digest_hex = |bytes: &[u8]| {
-        Sha256::digest(bytes)
-            .iter()
-            .map(|byte| format!("{byte:02x}"))
-            .collect::<String>()
+        let mut output = String::with_capacity(64);
+        for byte in Sha256::digest(bytes) {
+            write!(&mut output, "{byte:02x}").expect("format SHA-256 into String");
+        }
+        output
     };
 
     // Exact upstream inputs and expected output digests, with source and

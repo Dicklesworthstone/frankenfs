@@ -174,15 +174,38 @@
 > and two ordinary-mount FUSE tests: 399 total, no failures, ignores or skips.
 > Log: `ffs-chartreusestone-resume29-integrated-tests6.log`. Workspace/all-targets
 > checking passed on the identical source in RCH job `30059820987973806`.
-> Strict Clippy and the on-disk parser selection remain pending remote disk
-> admission. Two new protected real-FUSE cases require complete source/parity
-> reports, normal unmount, restart/readback, unchanged image/archive hashes and
-> independent ext4/Btrfs checks; these cases have not executed yet. The ordinary
-> mounted cases and protected unit controls do not substitute for them.
+> Strict workspace/all-targets Clippy passed in RCH job `30062009357697036`,
+> followed by the compiler check in `30062009357697038`. Both used base
+> `fa547bdf3` plus overlay `a247339f089f59793f4e4bb1dac24304353c25c978d572e15c7fe218a221dd96`,
+> including the repair publication fix and behavior-preserving lint corrections.
+> Logs: `ffs-chartreusestone-resume35-clippy5.log` and
+> `ffs-chartreusestone-resume35-workspace-check3.log`. RCH job
+> `30062009357697037` passed all 407 selected CLI tests on that source: FAT 113,
+> NTFS 124, protected mount 48 and ZFS 122, with no failures, ignores or skips.
+> Log: `ffs-chartreusestone-resume35-cli-tests2.log`. On the same source, RCH job
+> `30062009357697039` passed all 72 selected on-disk FAT/RAIDZ/LZX/nvlist/ZPL/gang
+> and NTFS EA tests, including all 16 gang cases, with no failures or ignores.
+> Log: `ffs-chartreusestone-resume35-parser-tests.log`. These are unit, fixture
+> and captured-vector results. RCH job `30062009357697042` passed both protected
+> real-FUSE lifecycle cases on the same source and independently hashed binaries.
+> Source and parity scans completed before foreground reads: ext4 verified 32 MiB
+> across 128 groups in 4.070 s; Btrfs verified 128 MiB across 512 groups in 31.243 s.
+> Both passed normal unmount, daemon exit, restart/readback, unchanged image/archive
+> hashes, archive verification and independent ext4/Btrfs checks. The tests ran as
+> root, with required FUSE/oracles and unchanged deadlines. The preceding job
+> `30062009357697041` failed startup because the worker's FUSE configuration
+> disallowed non-root `allow_other`, which fuser adds for automatic unmount;
+> it supplied no scrub proof. No source or host configuration changed for the rerun.
+> Logs: `ffs-chartreusestone-resume35-protected-fuse.log` and
+> `ffs-chartreusestone-resume35-protected-fuse-root.log` (SHA-256
+> `9cd45da6a5386564dcbf593a3dbac5d9822e8f06d8894ffaf5c3bcc8b3971786`).
+> These are privileged healthy-sidecar lifecycle results; they do not demonstrate
+> native repair ownership, crash freshness or mounted corruption recovery.
 > The first integrated run stopped on a malformed NTFS sparse-attribute fixture
 > before protected tests. Its correction retains all rejection and zero-payload
 > read checks and strengthens the sparse refusal reason; the corrected case
-> passed in the current 113-test NTFS cohort. The original failure remains recorded.
+> passed in that earlier 113-test NTFS cohort and the current 124-test cohort.
+> The original failure remains recorded.
 > Native storage, default activation and mounted native corruption/restart
 > acceptance remain open.
 
@@ -205,6 +228,19 @@
 > source authentication. The same source passed the full workspace/all-targets
 > compiler check in RCH job `30059820987973772`; its log is
 > `ffs-chartreusestone-resume27-workspace-check.log`.
+>
+> **Repair refresh publication (`bd-11a8t`, unit controls verified 2026-10-12):**
+> the pipeline now relies on storage's descriptor publication and sync instead
+> of issuing another fallible descriptor write afterward. Generation exhaustion
+> returns a typed error before encoding, preserving data and the dirty state.
+> RCH job `30059820987973826` passed all 622 repair library tests, including two
+> new regressions for publication and the last valid/exhausted generations.
+> Source: base `fa547bdf3` plus pipeline overlay
+> `8e2eb8c509b9deda35d3d77cff6196ac95702f6c97da87e8d273aeeb8047ecfa`;
+> log: `ffs-chartreusestone-resume33-repair-tests.log`. These tests use real
+> codec/storage logic with an in-memory device and simulated sync boundary.
+> They do not prove hardware durability, mounted recovery or native freshness.
+> Later evidence-ledger writes remain fallible after publication.
 >
 > **Merged execution evidence (2026-10-12):** source `30c41fe2` plus seven
 > formatting corrections (overlay `5681abf2e3fe57e15b8b33199881aa51ef1fd11378b8cd789fea08660f53f8a5`)

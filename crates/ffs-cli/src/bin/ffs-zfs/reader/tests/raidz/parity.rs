@@ -26,7 +26,7 @@ fn double_and_triple_parity_use_native_member_order_and_skip_parity_for_intact_d
                         stripe.columns.iter().filter(|column| column.parity).count(),
                         parity
                     );
-                    assert!(stripe.reconstructed_children.is_empty());
+                    assert_eq!(stripe.reconstructed_children, [] as [usize; 0]);
                     assert!(!stripe.parity_read);
                     for &address in &locations[..parity] {
                         assert_eq!(count(&reads, address), 0);

@@ -17,6 +17,7 @@ use ffs_error::FfsError;
 use ffs_ondisk::fat::{FatEntry, FatKind};
 use ffs_types::ByteOffset;
 use sha2::{Digest, Sha256};
+use std::fmt::Write as _;
 use std::fs::{self, File, Metadata, OpenOptions};
 use std::os::unix::fs::{FileExt, MetadataExt, OpenOptionsExt};
 use std::path::{Path, PathBuf};
@@ -358,6 +359,10 @@ impl Replacement {
     }
 
     fn report(&self, volume: &FatVolume, dry_run: bool) -> serde_json::Value {
+        let mut source_sha256 = String::with_capacity(self.digest.len() * 2);
+        for byte in self.digest {
+            write!(&mut source_sha256, "{byte:02x}").expect("format SHA-256 into String");
+        }
         serde_json::json!({
             "operation": "replace_existing_file", "dry_run": dry_run,
             "format": format!("{:?}", volume.geometry.kind()),
@@ -366,7 +371,7 @@ impl Replacement {
             "entry_offset": self.entry_offset, "previous_bytes": self.old_size, "new_bytes": self.size,
             "new_clusters": self.clusters.len(), "released_clusters": self.release.len(),
             "free_clusters_after": self.free_after,
-            "source_sha256": self.digest.iter().map(|byte| format!("{byte:02x}")).collect::<String>(),
+            "source_sha256": source_sha256,
             "contract": "offline ordered replacement; interrupted mutation may require native recovery; not atomic"
         })
     }
@@ -420,7 +425,8 @@ impl Replacement {
             change_fat(
                 cx,
                 volume,
-                self.clusters
+                &self
+                    .clusters
                     .iter()
                     .copied()
                     .enumerate()
@@ -451,7 +457,8 @@ impl Replacement {
             change_fat(
                 cx,
                 volume,
-                self.release
+                &self
+                    .release
                     .iter()
                     .map(|&(cluster, expected)| (cluster, expected, 0)),
             )?;
@@ -604,7 +611,7 @@ fn set_dirty(cx: &Cx, volume: &FatVolume, dirty: bool) -> Result<()> {
 fn change_fat(
     cx: &Cx,
     volume: &FatVolume,
-    changes: impl Iterator<Item = (u32, u32, u32)> + Clone,
+    changes: &(impl Iterator<Item = (u32, u32, u32)> + Clone),
 ) -> Result<()> {
     let geometry = &volume.geometry;
     let width = geometry.kind().entry_bytes() as usize;

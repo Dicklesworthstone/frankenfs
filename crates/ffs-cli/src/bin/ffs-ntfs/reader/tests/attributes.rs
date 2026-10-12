@@ -127,7 +127,7 @@ fn data_catalog_groups_continuations_and_discovers_extension_only_streams() {
         reads.lock().unwrap().clear();
         let streams = volume.data_streams(&cx, &record).unwrap();
         assert_eq!(streams.len(), 2);
-        assert!(streams[0].name.is_empty());
+        assert_eq!(streams[0].name, [] as [u16; 0]);
         assert_eq!(streams[0].attribute_extents, 2);
         let unnamed = streams[0].read_profile.as_ref().unwrap();
         assert!(!unnamed.resident);
@@ -177,7 +177,7 @@ fn data_catalog_retains_unreadable_streams_and_lossless_native_names() {
     let record = volume.record(&cx, 24, None).unwrap();
     let streams = volume.data_streams(&cx, &record).unwrap();
     assert_eq!(streams.len(), 3);
-    assert!(streams[0].name.is_empty());
+    assert_eq!(streams[0].name, [] as [u16; 0]);
     assert_eq!(streams[0].read_profile.as_ref().unwrap().size, 6);
     assert_eq!(streams[1].name, "secret".encode_utf16().collect::<Vec<_>>());
     assert!(

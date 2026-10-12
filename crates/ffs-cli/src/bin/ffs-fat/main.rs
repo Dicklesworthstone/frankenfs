@@ -484,11 +484,11 @@ mod tests {
                 let cli =
                     Cli::try_parse_from(["ffs-fat", command, "disk.img", "--oem-code-page", value])
                         .unwrap();
-                let image = match cli.command {
-                    Command::Ls { image, .. }
-                    | Command::Check { image }
-                    | Command::Catalog { image, .. } => image,
-                    _ => panic!("expected image command"),
+                let (Command::Ls { image, .. }
+                | Command::Check { image }
+                | Command::Catalog { image, .. }) = cli.command
+                else {
+                    panic!("expected image command");
                 };
                 assert_eq!(image.oem_code_page, page);
             }
@@ -580,7 +580,7 @@ mod tests {
             EntrySlots::parse("20992,22592").unwrap().0,
             [20_992, 22_592]
         );
-        let largest = u64::MAX & !31;
+        let largest = !31_u64;
         let encoded = format!("0,32,{largest}");
         assert_eq!(EntrySlots::parse(&encoded).unwrap().encoded(), encoded);
         let maximum = vec!["32"; 256].join(",");

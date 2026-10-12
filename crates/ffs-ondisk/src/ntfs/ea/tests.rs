@@ -36,7 +36,7 @@ fn native_nonzero_final_lengths_preserve_names_binary_values_and_need_count() {
     assert!(!parsed[1].need_ea());
     assert_eq!(parsed[1].value, 123_u32.to_le_bytes());
     assert_eq!(parsed[2].name, [0x82, b'A']);
-    assert!(parsed[2].value.is_empty());
+    assert_eq!(parsed[2].value, [] as [u8; 0]);
 }
 
 #[test]
@@ -70,10 +70,9 @@ fn packed_sizes_exclude_offsets_padding_and_the_count_is_only_for_needed_eas() {
     ] {
         assert!(parse_extended_attributes(&bad, &bytes).is_err());
     }
-    assert!(
-        parse_extended_attributes(&information(0, 0, 0), &[])
-            .unwrap()
-            .is_empty()
+    assert_eq!(
+        parse_extended_attributes(&information(0, 0, 0), &[]).unwrap(),
+        [] as [NtfsEa; 0]
     );
     assert!(parse_extended_attributes(&information(1, 0, 0), &[]).is_err());
     assert!(parse_extended_attributes(&information(0, 1, 0), &[]).is_err());

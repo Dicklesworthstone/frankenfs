@@ -126,7 +126,7 @@ fn mounted_user_eas_preserve_binary_values_hard_links_and_conservative_namespace
         fs.getxattr(&cx, dir.ino, "user.folder").unwrap(),
         Some(vec![7, 0, 8])
     );
-    assert!(fs.listxattr(&cx, ROOT).unwrap().is_empty());
+    assert_eq!(fs.listxattr(&cx, ROOT).unwrap(), [] as [String; 0]);
     assert_eq!(fs.getxattr(&cx, ROOT, "user.missing").unwrap(), None);
     for name in [
         "security.capability",
@@ -173,7 +173,7 @@ fn mounted_user_eas_preserve_binary_values_hard_links_and_conservative_namespace
 
 fn fragmented_image() -> (Vec<u8>, Vec<u8>, usize) {
     let mut image = image();
-    let payload: Vec<_> = (0..700).map(|offset| (offset % 251) as u8).collect();
+    let payload: Vec<_> = (0_u32..700).map(|offset| (offset % 251) as u8).collect();
     let (info, value) = values(&[(b"user.large", &payload)]);
     image[BASE + 630 * 512..BASE + 631 * 512].copy_from_slice(&value[..512]);
     image[BASE + 620 * 512..BASE + 620 * 512 + value.len() - 512].copy_from_slice(&value[512..]);
@@ -251,8 +251,8 @@ fn mounted_eas_validate_hidden_tail_names_and_reject_lossy_user_projections() {
     let cx = Cx::for_testing();
     for name in [b"user.\xFF".as_slice(), b"user."] {
         let mut image = image();
-        let (info, value) = values(&[(b"user.good", b"first"), (name, b"native")]);
-        put_file_eas(&mut image, &info, &value);
+        let (information, value) = values(&[(b"user.good", b"first"), (name, b"native")]);
+        put_file_eas(&mut image, &information, &value);
         let fs = open(image, Arc::default(), None).unwrap();
         let ino = fs
             .inode(NtfsReference {
@@ -279,10 +279,11 @@ fn mounted_eas_validate_hidden_tail_names_and_reject_lossy_user_projections() {
         ));
     }
     let mut image = image();
-    let (info, mut value) = values(&[(b"user.good", b"first"), (b"security.hidden", b"bad")]);
+    let (information, mut value) =
+        values(&[(b"user.good", b"first"), (b"security.hidden", b"bad")]);
     let second = (9 + b"user.good".len() + b"first".len()).next_multiple_of(4);
     value[second + 4] = 1;
-    put_file_eas(&mut image, &info, &value);
+    put_file_eas(&mut image, &information, &value);
     let fs = open(image, Arc::default(), None).unwrap();
     let ino = fs
         .inode(NtfsReference {

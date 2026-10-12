@@ -228,8 +228,7 @@ fn a_pending_user_interrupt_reaches_precreation_device_reads_and_the_full_checke
     .unwrap();
     // Use the shared request context, so the checker's own checkpoints observe
     // the signal as well as this readback device's I/O checkpoints.
-    cx.clone()
-        .cancel_with(CancelKind::User, Some("cancel allocation verification"));
+    cx.cancel_with(CancelKind::User, Some("cancel allocation verification"));
     assert!(matches!(volume.check(&cx), Err(FfsError::Cancelled)));
     let mut untouched = [0xCC; 512];
     assert!(matches!(

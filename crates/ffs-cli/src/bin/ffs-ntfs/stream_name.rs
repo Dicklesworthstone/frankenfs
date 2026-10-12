@@ -1,7 +1,7 @@
 //! Lossless selectors for native NTFS DATA names.
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(super) struct StreamName(Vec<u16>);
+pub struct StreamName(Vec<u16>);
 
 impl StreamName {
     /// Parse one comma-separated argument of four-digit hexadecimal code units.
@@ -60,12 +60,10 @@ mod tests {
         assert_eq!(name.as_units(), [0x46, 0x6F, 0x6F, 0xD800, 0xDC00]);
         assert_eq!(StreamName::parse("d800").unwrap().as_units(), [0xD800]);
         assert!(String::from_utf16(StreamName::parse("d800").unwrap().as_units()).is_err());
-        assert!(StreamName::parse("").unwrap().as_units().is_empty());
-        assert!(
-            StreamName::select(None, None)
-                .unwrap()
-                .as_units()
-                .is_empty()
+        assert_eq!(StreamName::parse("").unwrap().as_units(), [] as [u16; 0]);
+        assert_eq!(
+            StreamName::select(None, None).unwrap().as_units(),
+            [] as [u16; 0]
         );
         assert_eq!(
             StreamName::select(Some("Foo😀"), None).unwrap().as_units(),

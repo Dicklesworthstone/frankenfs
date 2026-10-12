@@ -124,10 +124,9 @@ fn mirror_mount_reads_legacy_sa_spill_and_embedded_files_through_verified_altern
                     fs.read(&cx, &mut scope, alias.ino, 510, 600).unwrap(),
                     expected[510..]
                 );
-                assert!(
-                    fs.read(&cx, &mut scope, file.ino, 1027, 1)
-                        .unwrap()
-                        .is_empty()
+                assert_eq!(
+                    fs.read(&cx, &mut scope, file.ino, 1027, 1).unwrap(),
+                    [] as [u8; 0]
                 );
                 assert_eq!(
                     [

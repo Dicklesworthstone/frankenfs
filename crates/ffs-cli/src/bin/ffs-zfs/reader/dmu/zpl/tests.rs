@@ -525,7 +525,7 @@ fn embedded_file_blocks_preserve_unaligned_eof_hardlinks_and_sa_metadata() {
             expected.extend_from_slice(b"BBB");
             assert_eq!(view.read(&cx, 3, 0, 4096).unwrap(), expected);
             assert_eq!(view.read(&cx, 3, 510, 600).unwrap(), expected[510..]);
-            assert!(view.read(&cx, 3, 1027, 8).unwrap().is_empty());
+            assert_eq!(view.read(&cx, 3, 1027, 8).unwrap(), [] as [u8; 0]);
             assert_eq!(view.stat(&cx, 3).unwrap().0.size, 1027);
             assert!(
                 !reads.lock().unwrap().iter().any(|(at, _)| [

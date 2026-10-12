@@ -466,7 +466,7 @@ mod tests {
         let map = RaidzParityMap::new(0, 2560, 9, 6, 3).unwrap();
         let stored = stored_columns(&map);
         let expected = stored[3..map.active_columns].concat();
-        let mut damaged = stored.clone();
+        let mut damaged = stored;
         for index in [0, 3, 5] {
             damaged[index].fill(0xa5);
         }

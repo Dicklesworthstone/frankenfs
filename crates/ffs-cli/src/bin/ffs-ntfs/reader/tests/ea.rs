@@ -37,7 +37,7 @@ fn ea_mapped(pairs: &[u8], size: usize, initialized: usize) -> Vec<u8> {
 
 fn split_image(nonresident_list: bool) -> (Image, Vec<u8>) {
     let mut image = Image::new();
-    let payload: Vec<_> = (0..700).map(|offset| (offset % 251) as u8).collect();
+    let payload: Vec<_> = (0_u32..700).map(|offset| (offset % 251) as u8).collect();
     let (info, bytes) = value(&[
         (b"user.large", &payload, 0x80),
         (b"other", &[0, 0xFF, 2], 0),
@@ -47,10 +47,10 @@ fn split_image(nonresident_list: bool) -> (Image, Vec<u8>) {
         .copy_from_slice(&bytes[512..]);
     let mut first = ea_mapped(&[0x21, 1, 180, 0, 0], bytes.len(), bytes.len());
     first[24..32].copy_from_slice(&0_u64.to_le_bytes());
-    let mut last = ea_mapped(&[0x21, 1, 170, 0, 0], 0, 0);
-    last[14..16].copy_from_slice(&3_u16.to_le_bytes());
-    last[16..24].copy_from_slice(&1_u64.to_le_bytes());
-    last[40..64].fill(0xFF); // Continuation sizes are not authoritative.
+    let mut continuation = ea_mapped(&[0x21, 1, 170, 0, 0], 0, 0);
+    continuation[14..16].copy_from_slice(&3_u16.to_le_bytes());
+    continuation[16..24].copy_from_slice(&1_u64.to_le_bytes());
+    continuation[40..64].fill(0xFF); // Continuation sizes are not authoritative.
     let mut list = list_entry(DATA, 25, 0, 0, "");
     list.extend(list_entry(EA_INFORMATION, 27, 1, 0, ""));
     list.extend(list_entry(EA, 27, 2, 0, ""));
@@ -78,7 +78,7 @@ fn split_image(nonresident_list: bool) -> (Image, Vec<u8>) {
         27,
         &extension(27, 25, &[resident(EA_INFORMATION, 1, "", &info), first]),
     );
-    image.put_record(28, &extension(28, 25, &[last]));
+    image.put_record(28, &extension(28, 25, &[continuation]));
     (image, payload)
 }
 
@@ -120,7 +120,7 @@ fn resident_eas_are_binary_metadata_on_files_directories_and_efs_objects() {
             catalog.find(b"$LXUID").unwrap().value,
             123_u32.to_le_bytes()
         );
-        assert!(catalog.find(&[0x82, b'A']).unwrap().value.is_empty());
+        assert_eq!(catalog.find(&[0x82, b'A']).unwrap().value, [] as [u8; 0]);
         assert!(catalog.find(b"USER.NOTE").is_none());
         assert!(reads.lock().unwrap().is_empty());
         if standard_flags != 0 {
@@ -168,8 +168,8 @@ fn ea_catalog_rejects_foreign_generations_and_direct_extension_selection() {
     let cx = Cx::for_testing();
     for (at, bytes) in [
         (16, 8_u16.to_le_bytes().to_vec()),
-        (32, (24_u64 | (7_u64 << 48)).to_le_bytes().to_vec()),
-        (32, (25_u64 | (8_u64 << 48)).to_le_bytes().to_vec()),
+        (32, (0x0018_u64 | (7_u64 << 48)).to_le_bytes().to_vec()),
+        (32, (0x0019_u64 | (8_u64 << 48)).to_le_bytes().to_vec()),
     ] {
         let (mut image, _) = split_image(false);
         let offset = Image::record_offset(28) + at;
@@ -215,11 +215,7 @@ fn malformed_ea_pairs_sizes_and_storage_flags_never_read_a_data_payload() {
         vec![resident(EA_INFORMATION, 1, "", &huge_info), good_ea.clone()],
         vec![nonresident_info, good_ea.clone()],
         vec![good_info.clone(), transformed],
-        vec![
-            good_info.clone(),
-            good_ea.clone(),
-            resident(EA, 3, "", &bytes),
-        ],
+        vec![good_info.clone(), good_ea, resident(EA, 3, "", &bytes)],
         vec![
             good_info.clone(),
             ea_mapped(&[0x21, 2, 180, 0, 0], bytes.len(), bytes.len() - 1),

@@ -71,7 +71,7 @@ impl Objects {
         if os.kind != 2 || bp.birth() != dataset.root_birth {
             return Err(corrupt("selected ZPL head identity changed"));
         }
-        let view = Objects {
+        let view = Self {
             pool: self.pool.clone(),
             config: self.config.clone(),
             txg: self.txg,

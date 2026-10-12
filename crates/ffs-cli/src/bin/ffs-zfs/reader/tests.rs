@@ -467,7 +467,7 @@ fn embedded_read_feature_requires_native_boolean_and_all_label_agreement() {
             let result = image.open(Arc::clone(&reads), None).root(&cx, 0, 2, 123);
             if mistyped {
                 assert!(result.is_err());
-                assert!(data_reads(&reads).is_empty());
+                assert_eq!(data_reads(&reads), [] as [u64; 0]);
             } else {
                 assert_eq!(result.unwrap().data, expected);
             }
@@ -485,7 +485,7 @@ fn embedded_read_feature_requires_native_boolean_and_all_label_agreement() {
                 .root(&cx, 0, 2, 123)
                 .is_err()
         );
-        assert!(data_reads(&reads).is_empty());
+        assert_eq!(data_reads(&reads), [] as [u64; 0]);
     }
 }
 

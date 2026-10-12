@@ -644,7 +644,7 @@ fn readback_checks_backup_hints_labels_lengths_and_unplanned_fat_entries() {
             match scenario {
                 0 => file.set_len(plan.layout.image_bytes() - 1).unwrap(),
                 1 => file
-                    .write_all_at(&[b'X'], plan.layout.root_sector() * 512)
+                    .write_all_at(b"X", plan.layout.root_sector() * 512)
                     .unwrap(),
                 2 if kind == FormatKind::Fat32 => {
                     file.write_all_at(&[0], 7 * 512 + 488).unwrap();

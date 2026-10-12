@@ -80,6 +80,14 @@
 > real ext4 corruption/rebuild controls passed; execution provenance and the
 > remaining validation requirements are recorded in `FEATURE_PARITY.md`.
 
+> **Repair refresh publication (`bd-11a8t`):** `write_repair_symbols` owns the
+> descriptor publication and sync boundary. The pipeline does not write the
+> descriptor again afterward. It checks generation exhaustion before encoding;
+> refusal preserves device bytes and leaves the group dirty. Ordinary refresh
+> still requires a committed descriptor; interrupted generations need the
+> explicit, source-validated rebuild path above. Evidence-ledger I/O can still
+> fail after publication, so this does not make all post-commit work infallible.
+
 ---
 
 ## 1. Crate Map

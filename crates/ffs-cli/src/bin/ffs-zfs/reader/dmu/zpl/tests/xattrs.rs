@@ -8,7 +8,7 @@ use ffs_types::InodeNumber;
 use std::ffi::OsStr;
 
 const DIRECTORY: u64 = DATA_OFFSET + 0x40000;
-const VALUES: u64 = DATA_OFFSET + 0x100000;
+const VALUES: u64 = DATA_OFFSET + 0x0010_0000;
 const BINARY: u64 = VALUES + 5 * 0x10000;
 
 fn nvlist(fields: &[(&str, &[u8])]) -> Vec<u8> {
@@ -125,8 +125,8 @@ pub(super) fn augment(
         table[3 * 512..4 * 512].copy_from_slice(&file);
         let registry = micro(
             &[
-                (b"ZPL_SYMLINK", 47 | (3 << 16)),
-                (b"ZPL_DXATTR", 61 | (3 << 16)),
+                (b"ZPL_SYMLINK", 0x2f | (3 << 16)),
+                (b"ZPL_DXATTR", 0x3d | (3 << 16)),
             ],
             order,
         );
@@ -156,7 +156,7 @@ pub(super) fn augment(
         ));
     }
     let large = (0..65_536)
-        .map(|value| (value % 251) as u8)
+        .map(|value| u8::try_from(value % 251).unwrap())
         .collect::<Vec<_>>();
     let values: [(&[u8], &[u8]); 7] = [
         (b"user.prefer", b"directory"),
@@ -221,7 +221,7 @@ pub(super) fn augment(
     }
     if matches!(case, 28 | 29) {
         entries = (0..if case == 28 { 4097 } else { 1600 })
-            .map(|index| (format!("user.{index:040}").into_bytes(), (8 << 60) | 12))
+            .map(|index| (format!("user.{index:040}").into_bytes(), (8 << 60) | 0xc))
             .collect();
     }
     let mut map = vec![0; (64 + entries.len() * 64).next_power_of_two().max(512)];
@@ -308,7 +308,7 @@ fn native_user_xattrs_cover_directory_sa_bonus_and_spill_in_both_byte_orders() {
             assert_eq!(
                 view.getxattr(&cx, 3, "user.large").unwrap().unwrap(),
                 (0..65_536)
-                    .map(|value| (value % 251) as u8)
+                    .map(|value| u8::try_from(value % 251).unwrap())
                     .collect::<Vec<_>>()
             );
             if sa == 2 {
@@ -325,7 +325,7 @@ fn native_user_xattrs_cover_directory_sa_bonus_and_spill_in_both_byte_orders() {
                     b"slash"
                 );
             }
-            assert!(view.listxattr(&cx, 6).unwrap().is_empty());
+            assert_eq!(view.listxattr(&cx, 6).unwrap(), [] as [String; 0]);
             assert_eq!(view.getxattr(&cx, 6, "user.missing").unwrap(), None);
             for number in 11..=18 {
                 assert!(view.stat(&cx, number).is_err());

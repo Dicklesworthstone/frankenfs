@@ -365,7 +365,7 @@ fn xattr_sources_decode_legacy_pointer_and_dynamic_sa_bytes_in_both_orders() {
         let source = decoded.xattrs().unwrap();
         assert_eq!(source.directory, 901);
         assert_eq!(source.inline["user.bin"], [0, 255, 65]);
-        assert!(source.inline["empty"].is_empty());
+        assert_eq!(source.inline["empty"], [] as [u8; 0]);
     }
 }
 

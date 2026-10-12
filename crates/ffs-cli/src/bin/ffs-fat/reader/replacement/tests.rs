@@ -444,7 +444,7 @@ fn native_replacement_grows_shrinks_and_empties_both_dialects_without_changing_n
             }
             let source = Input::new(b"first contents".to_vec());
             let plan = Replacement::prepare(&cx, &volume, "/EMPTY.TXT", &source, NOW).unwrap();
-            assert!(plan.release.is_empty());
+            assert_eq!(plan.release, [] as [(u32, u32); 0]);
             plan.execute(&cx, &volume, &source, || Ok(())).unwrap();
             assert_eq!(contents(&image.volume(), "/EMPTY.TXT"), source.bytes);
         }

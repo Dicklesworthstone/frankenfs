@@ -45,7 +45,7 @@ fn complete_raidz_groups_use_native_guids_and_return_original_psize_across_secto
                 assert_eq!(stripe.dva_offset, ROOT - DATA_OFFSET);
                 assert_eq!(stripe.allocated_bytes, map.allocated_bytes());
                 assert!(!stripe.parity_read);
-                assert!(stripe.reconstructed_children.is_empty());
+                assert_eq!(stripe.reconstructed_children, [] as [usize; 0]);
                 assert_eq!(count(&logs, parity), 0);
                 for (actual, expected) in stripe.columns.iter().zip(map.columns()) {
                     assert_eq!(actual.child_id, expected.child_id);

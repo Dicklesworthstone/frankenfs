@@ -252,7 +252,6 @@ fn metadata_range(
         Storage::Compressed(_) | Storage::Wof(_) => {
             return Err(unsupported("compressed security metadata is not admitted"));
         }
-        Storage::Resident(_) => {}
         Storage::Mapped(runs) if length != 0 => {
             let cluster = u64::from(geometry.cluster_bytes());
             let first_vcn = offset / cluster;
@@ -271,7 +270,7 @@ fn metadata_range(
                 ));
             }
         }
-        Storage::Mapped(_) => {}
+        Storage::Resident(_) | Storage::Mapped(_) => {}
     }
     Ok(())
 }

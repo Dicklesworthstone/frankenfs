@@ -68,10 +68,9 @@ fn fragmented_metadata_and_files_preserve_legacy_sa_spill_hardlinks_and_eof() {
                     fs.read(&cx, &mut scope, alias.ino, 1022, 2000).unwrap(),
                     expected()[1022..]
                 );
-                assert!(
-                    fs.read(&cx, &mut scope, file.ino, 2051, 3)
-                        .unwrap()
-                        .is_empty()
+                assert_eq!(
+                    fs.read(&cx, &mut scope, file.ino, 2051, 3).unwrap(),
+                    [] as [u8; 0]
                 );
                 assert_eq!(
                     reads
