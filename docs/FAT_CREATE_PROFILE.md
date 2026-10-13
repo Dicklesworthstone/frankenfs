@@ -65,6 +65,32 @@ Only then is the actual file's short entry published. Hidden stale short records
 cannot adopt the new long name, and bytes after the prior end cannot become
 newly visible files.
 
+## Native directory creation
+
+`ffs-fat mkdir IMAGE /PATH --offline-image` creates one empty native directory
+under an existing parent. It uses the same long-name/short-alias collision policy
+and parent-slot reservation as file creation. The new directory receives its own
+disjoint cluster, which is initialized and synchronized with native `.` and
+`..` entries before the allocation entry and parent namespace entry are
+published. FAT16 root children use native parent cluster zero; FAT32 root
+children point `..` at the root cluster; nested children point at their actual
+parent cluster.
+
+The parent may grow through the same bounded FAT-chain protocol used by long file
+names. A dry-run performs admission, name, slot and allocation planning without
+writing. Success requires native path resolution, empty-directory enumeration,
+raw dot-entry readback, exact free-space accounting and a complete checker pass.
+
+```sh
+ffs-fat mkdir volume.img '/Release Assets' --offline-image --dry-run
+ffs-fat mkdir volume.img '/Release Assets' --offline-image
+ffs-fat ls volume.img '/Release Assets'
+ffs-fat check volume.img
+```
+
+This is still ordered offline mutation rather than an atomic mkdir transaction.
+A failed write or flush can leave the image dirty and requiring native recovery.
+
 ## Publication and failure contract
 
 New payload clusters are disjoint from existing allocation and initialized,
@@ -115,7 +141,7 @@ rch exec -- cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 ```
 
-Directory creation, unlink/rename, writable mounts, crash replay and MVCC/RaptorQ
+Recursive parent creation, unlink/rename, writable mounts, crash replay and MVCC/RaptorQ
 integration remain unfinished. NTFS/ZFS native recovery and write milestones
 are not changed by this FAT increment. Read-only FAT behavior and the existing
 replacement protocol remain described in [the FAT profile](FAT_READ_PROFILE.md).

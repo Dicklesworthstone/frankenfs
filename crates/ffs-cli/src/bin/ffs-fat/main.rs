@@ -261,6 +261,12 @@ enum Command {
         #[command(flatten)]
         options: reader::replacement::ReplaceArgs,
     },
+    /// Create one native directory with initialized . and .. entries.
+    /// Requires exclusive offline ownership; --dry-run performs only preflight reads.
+    Mkdir {
+        #[command(flatten)]
+        options: reader::replacement::MkdirArgs,
+    },
     /// Create a new FAT16/FAT32 image, optionally copy --source-dir, and verify it.
     /// Existing files and devices are never formatted.
     Format {
@@ -344,6 +350,14 @@ fn main() -> Result<()> {
             serde_json::to_writer_pretty(&mut output, &report)
                 .context("FAT operation completed; writing the report failed")?;
             writeln!(output).context("FAT operation completed; finishing the report failed")?;
+        }
+        Command::Mkdir { options } => {
+            let report = reader::replacement::run_mkdir(&cx, &options)?;
+            let mut output = io::stdout().lock();
+            serde_json::to_writer_pretty(&mut output, &report)
+                .context("FAT directory operation completed; writing the report failed")?;
+            writeln!(output)
+                .context("FAT directory operation completed; finishing the report failed")?;
         }
         Command::Format { options } => {
             let report = formatter::run(&cx, &options)?;

@@ -77,6 +77,10 @@ ffs-fat replace volume.img '/Release notes 🦀.txt' \
 # Read back and check allocation through the native FAT reader.
 ffs-fat cat volume.img '/Release notes 🦀.txt' > readback.bin
 ffs-fat check volume.img
+
+# Create an empty native directory under an existing parent.
+ffs-fat mkdir volume.img '/Release Assets' --offline-image --dry-run
+ffs-fat mkdir volume.img '/Release Assets' --offline-image
 ```
 
 Without `--create`, `replace` retains its existing-file-only behavior. Source
