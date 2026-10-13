@@ -1,19 +1,19 @@
 //! Create-only namespace publication for the ordered offline FAT writer.
 //!
-//! This initial profile admits portable ASCII 8.3 names in existing directory
-//! storage. It never replaces an existing long name or short alias, grows a
-//! directory, or silently converts a requested name. The successor end marker
+//! This profile admits portable ASCII 8.3 names, including bounded growth of
+//! cluster-backed parents. It never replaces an existing long name or short
+//! alias, or silently converts a requested name. The successor end marker
 //! is durable before an old end marker becomes a live file entry.
 
 use super::super::{Directory, FatVolume, MAX_DIRECTORY_SLOTS};
 use super::{
-    Replacement, allocate, checkpoint, hash_device, modified_timestamp, reserve_clusters,
-    validate_boot_state, write_volume,
+    EXPECT_END, Replacement, allocate, change_fat, checkpoint, hash_device,
+    modified_timestamp, reserve_clusters, validate_boot_state, write_volume,
 };
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
 use ffs_block::ByteDevice;
-use ffs_ondisk::fat::FatKind;
+use ffs_ondisk::fat::{FatEntry, FatKind};
 
 #[derive(Debug)]
 struct Slot {
@@ -21,14 +21,39 @@ struct Slot {
     bytes: [u8; 32],
 }
 
+#[derive(Debug)]
+struct Extension {
+    tail: u32,
+    cluster: u32,
+    /// Free-space bytes checked before initialization, not namespace contents.
+    original_entry: [u8; 32],
+}
+
 /// Extra native state required when a free slot becomes a namespace entry.
 #[derive(Debug)]
 pub(super) struct Namespace {
     successor: Option<Slot>,
+    extension: Option<Extension>,
 }
 
 impl Namespace {
+    pub(super) fn initial_entry(&self, existing: [u8; 32]) -> [u8; 32] {
+        self.extension.as_ref().map_or(existing, |extension| extension.original_entry)
+    }
+
+    pub(super) fn directory_clusters(&self) -> usize {
+        usize::from(self.extension.is_some())
+    }
+
     pub(super) fn validate(&self, cx: &Cx, volume: &FatVolume) -> Result<()> {
+        if let Some(extension) = &self.extension {
+            let mut table = super::super::FatTable::new(volume);
+            if table.entry(cx, extension.tail)? != FatEntry::End
+                || table.entry(cx, extension.cluster)? != FatEntry::Free
+            {
+                bail!("directory extension allocation changed after creation preflight");
+            }
+        }
         if let Some(slot) = &self.successor {
             let mut current = [0; 32];
             volume.read_exact(cx, slot.offset, &mut current)?;
@@ -41,6 +66,23 @@ impl Namespace {
     }
 
     pub(super) fn stage(&self, cx: &Cx, volume: &FatVolume) -> Result<()> {
+        if let Some(extension) = &self.extension {
+            // Publish no link into free-space garbage. First initialize the
+            // complete new directory cluster and synchronize its zero entries.
+            let bytes = allocate(volume.geometry.cluster_bytes() as usize)?;
+            write_volume(cx, volume, volume.cluster_offset(extension.cluster)?, &bytes)?;
+            volume.device.sync(cx)?;
+            let end = match volume.geometry.kind() {
+                FatKind::Fat16 => 0xFFFF,
+                FatKind::Fat32 => 0x0FFF_FFFF,
+            };
+            change_fat(cx, volume, &std::iter::once((extension.cluster, 0, end)))?;
+            volume.device.sync(cx)?;
+            // The new end-of-chain is durable in every selected FAT before
+            // any existing directory tail can point to it.
+            change_fat(cx, volume, &std::iter::once((extension.tail, EXPECT_END, extension.cluster)))?;
+            volume.device.sync(cx)?;
+        }
         if let Some(slot) = &self.successor {
             let sector_bytes = u64::from(volume.geometry.sector_bytes());
             let start = slot.offset / sector_bytes * sector_bytes;
@@ -133,8 +175,9 @@ fn parent(cx: &Cx, volume: &FatVolume, path: &str) -> Result<(Directory, String)
     Ok((directory, name.to_owned()))
 }
 
-fn directory_offsets(cx: &Cx, volume: &FatVolume, directory: Directory) -> Result<Vec<u64>> {
+fn directory_offsets(cx: &Cx, volume: &FatVolume, directory: Directory) -> Result<(Vec<u64>, Option<u32>)> {
     let mut offsets = Vec::new();
+    let tail;
     if directory == Directory::Root
         && let Some((start, length)) = volume.geometry.fixed_root()
     {
@@ -144,6 +187,7 @@ fn directory_offsets(cx: &Cx, volume: &FatVolume, directory: Directory) -> Resul
         }
         offsets.try_reserve_exact(count).context("reserving bounded root slots")?;
         offsets.extend((start..start + length).step_by(32));
+        tail = None;
     } else {
         let first = match directory {
             Directory::Root => volume.geometry.root_cluster(),
@@ -162,6 +206,7 @@ fn directory_offsets(cx: &Cx, volume: &FatVolume, directory: Directory) -> Resul
             bail!("creation parent exceeds the directory-slot budget");
         }
         offsets.try_reserve_exact(count).context("reserving bounded directory slots")?;
+        tail = chain.last().copied();
         for cluster in chain {
             checkpoint(cx)?;
             let start = volume.cluster_offset(cluster)?;
@@ -169,11 +214,16 @@ fn directory_offsets(cx: &Cx, volume: &FatVolume, directory: Directory) -> Resul
         }
     }
     checkpoint(cx)?;
-    Ok(offsets)
+    Ok((offsets, tail))
 }
 
-fn reserve_slot(cx: &Cx, volume: &FatVolume, directory: Directory) -> Result<(Slot, Namespace)> {
-    let offsets = directory_offsets(cx, volume, directory)?;
+enum Reservation {
+    Existing(Slot, Namespace),
+    Extend(u32),
+}
+
+fn reserve_slot(cx: &Cx, volume: &FatVolume, directory: Directory) -> Result<Reservation> {
+    let (offsets, tail) = directory_offsets(cx, volume, directory)?;
     let mut preceding_lfn = false;
     for (index, offset) in offsets.iter().copied().enumerate() {
         checkpoint(cx)?;
@@ -198,11 +248,19 @@ fn reserve_slot(cx: &Cx, volume: &FatVolume, directory: Directory) -> Result<(Sl
             } else {
                 None
             };
-            return Ok((Slot { offset, bytes }, Namespace { successor }));
+            return Ok(Reservation::Existing(Slot { offset, bytes }, Namespace { successor, extension: None }));
         }
         preceding_lfn = bytes[11] == 0x0F;
     }
-    bail!("creation parent has no reusable directory slot; directory growth is not yet admitted")
+    if preceding_lfn {
+        bail!("orphan long-name records at the directory tail forbid creation growth");
+    }
+    let tail = tail.context("full FAT16 fixed root cannot grow; no reusable directory slot")?;
+    let added = volume.geometry.cluster_bytes() as usize / 32;
+    if offsets.len().checked_add(added).is_none_or(|count| count > MAX_DIRECTORY_SLOTS) {
+        bail!("directory growth would exceed the admitted slot budget");
+    }
+    Ok(Reservation::Extend(tail))
 }
 
 pub(super) fn prepare(
@@ -237,9 +295,24 @@ pub(super) fn prepare(
             bail!("--create never replaces an existing native name or short alias: {name:?}");
         }
     }
-    let (slot, namespace) = reserve_slot(cx, volume, directory)?;
+    let reservation = reserve_slot(cx, volume, directory)?;
     let needed = u64::from(size).div_ceil(u64::from(volume.geometry.cluster_bytes())) as usize;
-    let clusters = reserve_clusters(cx, volume, needed, before.free_clusters)?;
+    let extra = usize::from(matches!(&reservation, Reservation::Extend(_)));
+    let total = needed.checked_add(extra).context("creation allocation overflow")?;
+    let mut clusters = reserve_clusters(cx, volume, total, before.free_clusters)?;
+    let (slot, namespace) = match reservation {
+        Reservation::Existing(slot, namespace) => (slot, namespace),
+        Reservation::Extend(tail) => {
+            let cluster = clusters.pop().context("missing reserved directory cluster")?;
+            let offset = volume.cluster_offset(cluster)?;
+            let mut original_entry = [0; 32];
+            volume.read_exact(cx, offset, &mut original_entry)?;
+            (Slot { offset, bytes: [0; 32] }, Namespace {
+                successor: None,
+                extension: Some(Extension { tail, cluster, original_entry }),
+            })
+        }
+    };
     let mut updated = [0; 32];
     updated[..11].copy_from_slice(&short);
     updated[11] = 0x20;
@@ -268,7 +341,7 @@ pub(super) fn prepare(
         clusters,
         release: Vec::new(),
         digest,
-        free_after: before.free_clusters - needed as u64,
+        free_after: before.free_clusters - total as u64,
         files: before.files.checked_add(1).context("FAT file count overflow")?,
         directories: before.directories,
         creation: Some(namespace),

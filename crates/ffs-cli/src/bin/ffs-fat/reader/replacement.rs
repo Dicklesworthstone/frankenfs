@@ -384,10 +384,11 @@ impl Replacement {
             "source_sha256": source_sha256,
             "contract": "offline ordered replacement; interrupted mutation may require native recovery; not atomic"
         });
-        if self.creation.is_some() {
+        if let Some(namespace) = &self.creation {
             report["operation"] = "create_new_file".into();
             report["created_new_file"] = (!dry_run).into();
             report["name_profile"] = "portable_ascii_8_3".into();
+            report["new_directory_clusters"] = namespace.directory_clusters().into();
             report["contract"] = "offline ordered creation; interrupted mutation may require native recovery; not atomic".into();
         }
         report
@@ -403,7 +404,8 @@ impl Replacement {
         checkpoint(cx)?;
         let mut current = [0; 32];
         volume.read_exact(cx, self.entry_offset, &mut current)?;
-        if current != self.original || source.len_bytes() != u64::from(self.size) {
+        let initial = self.creation.as_ref().map_or(self.original, |namespace| namespace.initial_entry(self.original));
+        if current != initial || source.len_bytes() != u64::from(self.size) {
             bail!("replacement target or source changed before dirty publication");
         }
         if let Some(namespace) = &self.creation {
@@ -460,7 +462,7 @@ impl Replacement {
             )?;
             volume.device.sync(cx)?;
             if let Some(namespace) = &self.creation {
-                phase = "synchronizing the successor directory terminator";
+                phase = "initializing and publishing directory storage";
                 namespace.stage(cx, volume)?;
             }
             phase = "publishing the replacement directory entry";
