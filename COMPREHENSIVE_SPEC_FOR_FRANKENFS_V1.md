@@ -1028,7 +1028,7 @@ rebaselining. No symbol or descriptor write, decoding authority, mounted
 freshness guarantee or active repair follows from validation initialization.
 
 Explicit offline native parity publication follows sealed source validation.
-Every owner block reserves bytes 320–447 for a generation-one `FFSRPR01`
+Every owner block reserves bytes 320–447 for a version-one `FFSRPR01`
 record. It binds UUID, owner inode/generation and group to parity generation,
 the sealed group source root, committed raw-manifest digest and
 Prepared/Pending/Sealed state, with CRC32C and canonical zero padding.
@@ -1047,6 +1047,18 @@ MUST refuse. The bytes supplied to encoding MUST themselves match the admitted
 digests. Dense encoder allocations require checked RFC-derived resource
 estimates and an explicit caller budget; they do not justify silently shrinking
 or partitioning source coverage.
+
+The 128-byte record contains magic at 0, UUID at 8, owner inode at 24,
+owner generation at 32, group at 36, parity generation at 40, source root at 48,
+manifest digest at 80, state at 112, CRC32C of bytes 0–115 at 116, and zero
+padding at 120. Prepared is state 3; Pending is 1; Sealed is 2. Groups other
+than zero retain zero plan bytes 192–319. All owner bytes after 447 stay zero.
+For serial native groups with complete blocks `T >= 1024`, `R <= K`, supported
+RFC parameters and unique erasures, decoding admits eight times the direct
+encoder working estimate plus native table/plan buffers. Dense wavefront
+decoding retains its equations and RHS snapshots; width four is not a four-row
+memory bound. This is an allocation estimate, excluding backing devices, global
+cache retention and allocator overhead, not a hard RSS or solve-latency bound.
 
 The owner Pending record MUST sync before descriptor/symbol mutation. Raw
 publication uses the existing two-slot pending fence, parity sync/readback and

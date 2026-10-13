@@ -677,6 +677,13 @@ the owned unwritten ranges and reads them through physical mappings. Its
 mutable intent/table records stay outside protected source coverage; the
 kernel-facing owner inode, allocation and zero-read behavior are unchanged.
 
+The same allocation contract permits physical parity and mutable generation
+records inside those owned unwritten ranges without changing ordinary ext4 file
+reads. Native publication must bind these records to the independent source
+baseline. Neither ext4 metadata checks nor allocator ownership distinguish a
+legitimate later write from corruption; baseline reconstruction therefore
+exports bytes read-only until durable freshness authority exists.
+
 The `ee_len` field uses its MSB (bit 15) as an "unwritten" flag:
 
 - If `ee_len <= 0x8000` (32768): the extent is **initialized** and

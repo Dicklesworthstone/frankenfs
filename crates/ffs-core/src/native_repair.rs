@@ -633,6 +633,33 @@ fn read_native_baseline(fs: &OpenFs, cx: &Cx) -> Result<NativeBaseline, FfsError
     })
 }
 
+fn ensure_native_baseline(fs: &OpenFs, cx: &Cx, expected: &NativeBaseline) -> Result<(), FfsError> {
+    let current = read_native_baseline(fs, cx)?;
+    if current.plan_root != expected.plan_root
+        || current.storage != expected.storage
+        || current.owner_generation != expected.owner_generation
+        || current.roots != expected.roots
+    {
+        return Err(FfsError::RepairFailed(
+            "native baseline authority changed during operation".into(),
+        ));
+    }
+    Ok(())
+}
+
+fn native_target(
+    storage: &NativeRepairStorage,
+    block: BlockNumber,
+) -> Result<&NativeRepairTail, FfsError> {
+    storage
+        .tails
+        .iter()
+        .find(|tail| block.0 >= tail.group_start.0 && block.0 < tail.start.0)
+        .ok_or_else(|| {
+            FfsError::RepairFailed("requested block is outside native source coverage".into())
+        })
+}
+
 fn read_native_parity_intent(
     cx: &Cx,
     dev: &dyn BlockDevice,
@@ -668,6 +695,61 @@ fn write_native_parity_intent(
     intent: ParityIntent,
 ) -> Result<(), FfsError> {
     let mut owner = dev.read_block(cx, tail.start)?.into_inner();
+    let current = parity_intent(
+        &owner[PARITY_HEADER_START..PARITY_HEADER_END],
+        sb,
+        &baseline.storage,
+        baseline.owner_generation,
+        tail,
+    )?;
+    let allowed = match (current, intent) {
+        (ParityIntent::Prepared, ParityIntent::Pending { generation, .. }) => generation > 0,
+        (
+            ParityIntent::Pending {
+                generation: previous,
+                ..
+            }
+            | ParityIntent::Sealed {
+                generation: previous,
+                ..
+            },
+            ParityIntent::Pending { generation, .. },
+        ) => generation > previous,
+        (
+            ParityIntent::Pending {
+                generation: previous,
+                source_root: root,
+            },
+            ParityIntent::Sealed {
+                generation,
+                source_root,
+                ..
+            },
+        ) => generation == previous && source_root == root,
+        _ => false,
+    };
+    let expected = owner_header(
+        sb,
+        baseline.storage.owner_inode,
+        baseline.owner_generation,
+        baseline.storage.repair_basis_points,
+        tail,
+    );
+    if !allowed
+        || owner[..OWNER_HEADER_BYTES] != expected[..OWNER_HEADER_BYTES]
+        || validation_intent(
+            &owner[OWNER_HEADER_BYTES..PLAN_HEADER_START],
+            sb,
+            baseline.storage.owner_inode,
+            baseline.owner_generation,
+            tail,
+        )? != ValidationIntent::Sealed(intent.source_root())
+    {
+        return Err(validation_error(
+            tail,
+            "native parity ownership changed before publication",
+        ));
+    }
     owner[PARITY_HEADER_START..PARITY_HEADER_END].copy_from_slice(&parity_header(
         sb,
         &baseline.storage,
@@ -1435,16 +1517,7 @@ impl OpenFs {
         for (tail, admission) in baseline.storage.tails.iter().zip(&admissions) {
             publish_native_group(cx, &dev, sb, &baseline, tail, admission)?;
         }
-        let current = read_native_baseline(&self, cx)?;
-        if current.plan_root != baseline.plan_root
-            || current.storage != baseline.storage
-            || current.owner_generation != baseline.owner_generation
-            || current.roots != baseline.roots
-        {
-            return Err(FfsError::RepairFailed(
-                "native baseline changed during parity publication".into(),
-            ));
-        }
+        ensure_native_baseline(&self, cx, &baseline)?;
         let report = self.check_native_ext4_repair(cx)?;
         dev.sync(cx)?;
         Ok(report)
@@ -1490,33 +1563,18 @@ impl OpenFs {
     ) -> Result<NativeReconstruction, FfsError> {
         self.require_native_mode("reconstruct_native_block")?;
         let owned = self.native_ext4_repair_storage(cx)?;
-        let selected = owned
-            .tails
-            .iter()
-            .find(|tail| block.0 >= tail.group_start.0 && block.0 < tail.start.0)
-            .ok_or_else(|| {
-                FfsError::RepairFailed("requested block is outside native source coverage".into())
-            })?;
+        let selected = native_target(&owned, block)?;
         let sb = self
             .ext4_superblock()
             .expect("validated native ext4 ownership");
         native_codec_budget(sb, &owned, selected, max_working_bytes, true)?;
         let baseline = read_native_baseline(self, cx)?;
-        let tail = baseline
-            .storage
-            .tails
-            .iter()
-            .find(|tail| block.0 >= tail.group_start.0 && block.0 < tail.start.0)
-            .ok_or_else(|| {
-                FfsError::RepairFailed("requested block is outside native source coverage".into())
-            })?;
-        let sb = self
-            .ext4_superblock()
-            .expect("validated native ext4 ownership");
+        let tail = native_target(&baseline.storage, block)?;
         let dev = ByteDeviceBlockAdapter {
             dev: self.dev.as_ref(),
             block_size: sb.block_size,
         };
+        let admitted_intent = read_native_parity_intent(cx, &dev, sb, &baseline, tail)?;
         let generation = native_sealed_generation(cx, &dev, sb, &baseline, tail, true)?;
         let (root, table) = read_sealed_table(
             cx,
@@ -1561,12 +1619,9 @@ impl OpenFs {
                 result.evidence.reason
             )));
         }
-        let current = read_native_baseline(self, cx)?;
-        if current.plan_root != baseline.plan_root
-            || current.storage != baseline.storage
-            || current.owner_generation != baseline.owner_generation
-            || current.roots != baseline.roots
-            || root != baseline.roots[tail.group.0 as usize]
+        ensure_native_baseline(self, cx, &baseline)?;
+        if root != baseline.roots[tail.group.0 as usize]
+            || read_native_parity_intent(cx, &dev, sb, &baseline, tail)? != admitted_intent
             || native_sealed_generation(cx, &dev, sb, &baseline, tail, true)? != generation
         {
             return Err(validation_error(

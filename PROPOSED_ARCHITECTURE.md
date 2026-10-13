@@ -47,7 +47,7 @@
 > `ffs native-prepare` owns the offline image lock across preparation and cold
 > discovery. Discovery verifies checksums, exact mappings and allocation rather
 > than treating readable old inode bytes as ownership. Prepared storage contains
-> no usable parity. Native encoding, freshness fencing and activation remain open.
+> no usable parity. Mounted freshness fencing and activation remain open.
 
 > **Native source validation (`bd-11a8t`):** the same offline core boundary
 > persists bounded per-source BLAKE3 tables with ownership/group identity.
@@ -59,6 +59,18 @@
 > and every source digest. Explicit `native-validate --initialize` creates or
 > resumes that baseline; the default command is read-only. This layer grants
 > no decoding authority and does not replace persistent mounted freshness.
+
+> **Offline native parity (`bd-11a8t`):** per-group `FFSRPR01` ownership records
+> bind the source root, monotonic parity generation and raw integrity manifest.
+> `native-encode` admits all groups before publication and uses the direct codec
+> through a digest-checking block device. Owner pending/sync precedes raw
+> descriptor fencing; verified parity/current sources precede owner seal/sync.
+> Checked RFC allocation estimates admit the synchronous solver's working set;
+> solve cancellation latency and total process RSS are not bounded by that estimate.
+> Read-only `native-recover` uses the existing orchestrator with mandatory decoded
+> digest validation and an asupersync `OnceCell` capture authority, exporting a
+> verified historical block to a new file. It never writes or syncs the image.
+> Durable pre-write freshness, mounted activation and Btrfs ownership stay open.
 
 > **Ordinary mount worker ownership (`bd-11a8t`):** the CLI owns one
 > asupersync runtime with one scheduler thread and at most two blocking workers.

@@ -73099,7 +73099,15 @@ mod tests {
 
     fn native_preparation_fixture()
     -> Option<(OpenFs, TestDevice, tempfile::TempDir, std::path::PathBuf)> {
-        let (fs, dev, tmp, image) = open_ext4_mke2fs_features(64, "extent,^fast_commit")?;
+        native_preparation_fixture_with_geometry(64, &[])
+    }
+
+    fn native_preparation_fixture_with_geometry(
+        size_mb: u64,
+        formatter_args: &[&str],
+    ) -> Option<(OpenFs, TestDevice, tempfile::TempDir, std::path::PathBuf)> {
+        let (fs, dev, tmp, image) =
+            open_ext4_mke2fs_features_args(size_mb, "extent,^fast_commit", formatter_args)?;
         let cx = Cx::for_testing();
         let file = fs
             .create(&cx, InodeNumber(2), OsStr::new("existing.bin"), 0o644, 0, 0)
@@ -73124,6 +73132,425 @@ mod tests {
             panic!("small existing file must have inline extents");
         };
         BlockNumber(extents[0].physical_start)
+    }
+
+    const NATIVE_PARITY_TEST_BUDGET: u64 = 256 * 1024 * 1024;
+
+    fn native_parity_baseline() -> (
+        native_repair::NativeRepairStorage,
+        TestDevice,
+        tempfile::TempDir,
+        std::path::PathBuf,
+    ) {
+        // Two real groups exercise whole-plan admission while bounding dense
+        // codec work. The 1 MiB journal fits wholly before its group's tail.
+        let (fs, dev, tmp, image) = native_preparation_fixture_with_geometry(
+            4,
+            &["-g", "2048", "-J", "size=1", "-N", "128"],
+        )
+        .expect("native parity regression requires actual mke2fs execution");
+        let cx = Cx::for_testing();
+        assert_eq!(fs.block_size(), 1024);
+        assert_eq!(fs.ext4_superblock().unwrap().blocks_per_group, 2048);
+        let storage = fs.prepare_native_ext4_repair(&cx, 500).unwrap();
+        assert_eq!(storage.tails.len(), 2);
+        let fs =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options()).unwrap();
+        let report = fs.initialize_native_ext4_validation(&cx).unwrap();
+        assert_eq!(report.groups, 2);
+        assert!(report.source_blocks > 3000);
+        eprintln!(
+            "native parity real fixture: groups={} source_blocks={} image={}",
+            report.groups,
+            report.source_blocks,
+            image.display()
+        );
+        (storage, dev, tmp, image)
+    }
+
+    fn native_parity_fsck(dev: &TestDevice, image: &std::path::Path) {
+        std::fs::write(image, dev.snapshot_bytes()).unwrap();
+        let (clean, output) =
+            run_e2fsck(image).expect("native parity regression requires actual e2fsck execution");
+        eprintln!("native parity e2fsck -fn {}:\n{output}", image.display());
+        assert!(
+            clean,
+            "native parity changed ext4 ownership/accounting: {output}"
+        );
+    }
+
+    #[test]
+    fn native_ext4_repair_initializes_reopens_and_exports_without_writes() {
+        let (storage, dev, _tmp, image) = native_parity_baseline();
+        let cx = Cx::for_testing();
+        let before = dev.snapshot_bytes();
+        let fs =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options()).unwrap();
+        let payload = native_existing_payload_block(&fs, &cx);
+        fs.check_native_ext4_repair(&cx)
+            .expect_err("parity is not initialized");
+        let error = fs.initialize_native_ext4_repair(&cx, 0).unwrap_err();
+        assert!(error.to_string().contains("working budget"), "{error}");
+        assert!(
+            dev.snapshot_bytes() == before,
+            "budget refusal wrote the image"
+        );
+
+        let fs =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options()).unwrap();
+        let report = fs
+            .initialize_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+            .unwrap();
+        assert_eq!(report.groups, 2);
+        assert_eq!(report.owner_inode, storage.owner_inode);
+        assert_eq!(report.generations, vec![1, 1]);
+        assert_eq!(
+            report.repair_blocks,
+            storage
+                .tails
+                .iter()
+                .map(|tail| u64::from(tail.repair_blocks))
+                .sum::<u64>()
+        );
+        let sealed = dev.snapshot_bytes();
+        for (index, (old, new)) in before
+            .as_chunks::<1024>()
+            .0
+            .iter()
+            .zip(sealed.as_chunks::<1024>().0)
+            .enumerate()
+        {
+            if old != new {
+                let block = index as u64;
+                assert!(
+                    storage.tails.iter().any(|tail| {
+                        block == tail.start.0
+                            || (block >= tail.start.0 + 1 + u64::from(tail.validation_blocks)
+                                && block < tail.group_start.0 + u64::from(tail.blocks_per_group))
+                    }),
+                    "parity publication changed source/validation block {block}"
+                );
+            }
+        }
+        for tail in &storage.tails {
+            let offset = tail.start.0 as usize * 1024;
+            assert_eq!(&before[offset..offset + 320], &sealed[offset..offset + 320]);
+            assert_eq!(
+                &before[offset + 448..offset + 1024],
+                &sealed[offset + 448..offset + 1024]
+            );
+            assert_eq!(&sealed[offset + 320..offset + 328], b"FFSRPR01");
+        }
+        let fs =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options()).unwrap();
+        assert_eq!(fs.check_native_ext4_repair(&cx).unwrap(), report);
+        let file = fs
+            .lookup(&cx, InodeNumber(2), OsStr::new("existing.bin"))
+            .unwrap();
+        assert_eq!(fs.read(&cx, file.ino, 0, 8192).unwrap(), vec![0xA7; 8192]);
+        let error = fs
+            .reconstruct_native_ext4_block(&cx, payload, NATIVE_PARITY_TEST_BUDGET)
+            .unwrap_err();
+        assert!(error.to_string().contains("already matches"), "{error}");
+        fs.reconstruct_native_ext4_block(&cx, storage.tails[0].start, NATIVE_PARITY_TEST_BUDGET)
+            .expect_err("owned storage is outside source coverage");
+        assert_eq!(
+            fs.initialize_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+                .unwrap(),
+            report
+        );
+        assert!(
+            dev.snapshot_bytes() == sealed,
+            "idempotent initialization changed bytes"
+        );
+        native_parity_fsck(&dev, &image);
+
+        let offset = payload.0 as usize * 1024;
+        let expected = sealed[offset..offset + 1024].to_vec();
+        let mut damaged = sealed.clone();
+        damaged[offset] ^= 0x40;
+        let changed = TestDevice::from_vec(damaged.clone());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let fault = ValidationFaultDevice {
+            inner: changed.clone(),
+            attempts: Arc::new(AtomicUsize::new(0)),
+            fail_on: usize::MAX,
+            events: Arc::clone(&events),
+        };
+        let fs = OpenFs::from_device(&cx, Box::new(fault), &native_preparation_options()).unwrap();
+        events.lock().unwrap().clear();
+        fs.check_native_ext4_repair(&cx)
+            .expect_err("current payload differs from baseline");
+        let error = fs
+            .reconstruct_native_ext4_block(&cx, payload, 1)
+            .unwrap_err();
+        assert!(error.to_string().contains("working budget"), "{error}");
+        let reconstructed = fs
+            .reconstruct_native_ext4_block(&cx, payload, NATIVE_PARITY_TEST_BUDGET)
+            .unwrap();
+        assert_eq!(reconstructed.block, payload);
+        assert_eq!(reconstructed.generation, 1);
+        assert_eq!(reconstructed.data, expected);
+        fs.initialize_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+            .expect_err("changed source must never become a new baseline");
+        assert_eq!(
+            *events.lock().unwrap(),
+            [] as [Option<u64>; 0],
+            "export must neither write nor sync"
+        );
+        assert!(
+            changed.snapshot_bytes() == damaged,
+            "export changed current image bytes"
+        );
+        assert!(
+            dev.snapshot_bytes() == sealed,
+            "export changed the original baseline image"
+        );
+        native_parity_fsck(&changed, &image);
+    }
+
+    #[test]
+    fn native_ext4_repair_admits_all_groups_before_writes() {
+        let (storage, dev, _tmp, _image) = native_parity_baseline();
+        let cx = Cx::for_testing();
+        let baseline = dev.snapshot_bytes();
+        let tail = storage.tails.last().unwrap();
+        let owner = tail.start.0 as usize * 1024;
+        let descriptor =
+            (tail.group_start.0 + u64::from(tail.blocks_per_group) - 2) as usize * 1024;
+        for (name, offset, length) in [
+            ("unknown late descriptor", descriptor, 1),
+            ("lost late parity ownership", owner + 320, 128),
+            ("lost late allocation ownership", owner, 64),
+        ] {
+            let mut damaged = baseline.clone();
+            if length == 1 {
+                damaged[offset] = 0xA5;
+            } else {
+                damaged[offset..offset + length].fill(0);
+            }
+            let changed = TestDevice::from_vec(damaged.clone());
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let fault = ValidationFaultDevice {
+                inner: changed.clone(),
+                attempts: Arc::new(AtomicUsize::new(0)),
+                fail_on: usize::MAX,
+                events: Arc::clone(&events),
+            };
+            let fs =
+                OpenFs::from_device(&cx, Box::new(fault), &native_preparation_options()).unwrap();
+            events.lock().unwrap().clear();
+            fs.initialize_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+                .expect_err(name);
+            assert_eq!(
+                *events.lock().unwrap(),
+                [] as [Option<u64>; 0],
+                "{name}: wrote or synced before complete admission"
+            );
+            assert!(changed.snapshot_bytes() == damaged, "{name}: changed image");
+        }
+        let fs =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options()).unwrap();
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        assert!(matches!(
+            fs.initialize_native_ext4_repair(&cancelled, NATIVE_PARITY_TEST_BUDGET),
+            Err(FfsError::Cancelled)
+        ));
+        assert!(
+            dev.snapshot_bytes() == baseline,
+            "cancelled admission wrote image"
+        );
+    }
+
+    #[test]
+    fn native_ext4_repair_interrupted_publication_preserves_generation_authority() {
+        let (storage, dev, _tmp, image) = native_parity_baseline();
+        let cx = Cx::for_testing();
+        let first = &storage.tails[0];
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let fault = ValidationFaultDevice {
+            inner: dev.clone(),
+            attempts: Arc::new(AtomicUsize::new(0)),
+            fail_on: 2,
+            events: Arc::clone(&events),
+        };
+        let fs = OpenFs::from_device(&cx, Box::new(fault), &native_preparation_options()).unwrap();
+        let error = fs
+            .initialize_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected native validation write failure"),
+            "{error}"
+        );
+        assert_eq!(
+            &events.lock().unwrap()[..2],
+            &[Some(first.start.0 * 1024), None],
+            "owner high-water must sync before descriptor publication"
+        );
+        let interrupted = dev.snapshot_bytes();
+        let record = first.start.0 as usize * 1024 + 320;
+        assert_eq!(&interrupted[record..record + 8], b"FFSRPR01");
+        assert_eq!(
+            u64::from_le_bytes(interrupted[record + 40..record + 48].try_into().unwrap()),
+            1
+        );
+        assert_eq!(
+            u32::from_le_bytes(interrupted[record + 112..record + 116].try_into().unwrap()),
+            1
+        );
+
+        for erase_owner in [false, true] {
+            let mut damaged = interrupted.clone();
+            if erase_owner {
+                damaged[record..record + 128].fill(0);
+            } else {
+                let late_source = storage.tails.last().unwrap().start.0 - 1;
+                damaged[late_source as usize * 1024] ^= 0x40;
+            }
+            let changed = TestDevice::from_vec(damaged.clone());
+            let writes = Arc::new(Mutex::new(Vec::new()));
+            let fault = ValidationFaultDevice {
+                inner: changed.clone(),
+                attempts: Arc::new(AtomicUsize::new(0)),
+                fail_on: usize::MAX,
+                events: Arc::clone(&writes),
+            };
+            let fs =
+                OpenFs::from_device(&cx, Box::new(fault), &native_preparation_options()).unwrap();
+            writes.lock().unwrap().clear();
+            fs.initialize_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+                .expect_err(
+                    "retry must retain original ownership and every group's source baseline",
+                );
+            assert_eq!(*writes.lock().unwrap(), [] as [Option<u64>; 0]);
+            assert!(
+                changed.snapshot_bytes() == damaged,
+                "refused retry mutated image"
+            );
+        }
+        let fs =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options()).unwrap();
+        fs.check_native_ext4_repair(&cx)
+            .expect_err("interrupted parity is not readable authority");
+        let report = fs
+            .initialize_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+            .unwrap();
+        assert_eq!(
+            report.generations,
+            vec![2, 1],
+            "retry must advance the durable owner high-water"
+        );
+        let fs =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options()).unwrap();
+        assert_eq!(fs.check_native_ext4_repair(&cx).unwrap(), report);
+
+        let end = first.group_start.0 + u64::from(first.blocks_per_group);
+        dev.write_all_at(&cx, ByteOffset((end - 2) * 1024), &[0; 2048])
+            .unwrap();
+        let fs =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options()).unwrap();
+        fs.check_native_ext4_repair(&cx)
+            .expect_err("erased descriptors must not authorize recovery");
+        let rebuilt = fs
+            .initialize_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+            .unwrap();
+        assert_eq!(
+            rebuilt.generations,
+            vec![3, 1],
+            "erased descriptors must not reset generation"
+        );
+        let fs =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options()).unwrap();
+        assert_eq!(fs.check_native_ext4_repair(&cx).unwrap(), rebuilt);
+        let file = fs
+            .lookup(&cx, InodeNumber(2), OsStr::new("existing.bin"))
+            .unwrap();
+        assert_eq!(fs.read(&cx, file.ino, 0, 8192).unwrap(), vec![0xA7; 8192]);
+        native_parity_fsck(&dev, &image);
+    }
+
+    #[test]
+    fn native_ext4_repair_retry_syncs_visible_pending_publication() {
+        let (storage, dev, _tmp, image) = native_parity_baseline();
+        let cx = Cx::for_testing();
+        let baseline = dev.snapshot_bytes();
+        let durable = TestDevice::from_vec(baseline.clone());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let fault = ValidationSyncFaultDevice {
+            inner: dev.clone(),
+            durable: durable.clone(),
+            syncs: Arc::new(AtomicUsize::new(0)),
+            fail_on: 1,
+            corrupt_on: None,
+            events: Arc::clone(&events),
+        };
+        let fs = OpenFs::from_device(&cx, Box::new(fault), &native_preparation_options()).unwrap();
+        let error = fs
+            .initialize_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected native validation sync failure"),
+            "{error}"
+        );
+        let owner_offset = storage.tails[0].start.0 * 1024;
+        assert_eq!(*events.lock().unwrap(), vec![Some(owner_offset), None]);
+        assert!(
+            durable.snapshot_bytes() == baseline,
+            "failed sync persisted bytes"
+        );
+        let visible = dev.snapshot_bytes();
+        assert!(
+            visible != baseline,
+            "fault did not leave visible pending state"
+        );
+        let record = owner_offset as usize + 320;
+        assert_eq!(&visible[record..record + 8], b"FFSRPR01");
+        assert_eq!(
+            u64::from_le_bytes(visible[record + 40..record + 48].try_into().unwrap()),
+            1
+        );
+        assert_eq!(
+            u32::from_le_bytes(visible[record + 112..record + 116].try_into().unwrap()),
+            1
+        );
+
+        let retry_events = Arc::new(Mutex::new(Vec::new()));
+        let retry = ValidationSyncFaultDevice {
+            inner: dev.clone(),
+            durable: durable.clone(),
+            syncs: Arc::new(AtomicUsize::new(0)),
+            fail_on: usize::MAX,
+            corrupt_on: None,
+            events: Arc::clone(&retry_events),
+        };
+        let fs = OpenFs::from_device(&cx, Box::new(retry), &native_preparation_options()).unwrap();
+        let report = fs
+            .initialize_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+            .unwrap();
+        assert_eq!(report.generations, vec![2, 1]);
+        assert_eq!(
+            &retry_events.lock().unwrap()[..2],
+            &[Some(owner_offset), None],
+            "retry must durably advance the visible high-water before publishing descriptors"
+        );
+        assert!(durable.snapshot_bytes() == dev.snapshot_bytes());
+        let cold = OpenFs::from_device(
+            &cx,
+            Box::new(durable.clone()),
+            &native_preparation_options(),
+        )
+        .unwrap();
+        assert_eq!(cold.check_native_ext4_repair(&cx).unwrap(), report);
+        let file = cold
+            .lookup(&cx, InodeNumber(2), OsStr::new("existing.bin"))
+            .unwrap();
+        assert_eq!(cold.read(&cx, file.ino, 0, 8192).unwrap(), vec![0xA7; 8192]);
+        native_parity_fsck(&durable, &image);
     }
 
     #[test]
@@ -97318,6 +97745,14 @@ mod tests {
         size_mb: u64,
         features: &str,
     ) -> Option<(OpenFs, TestDevice, tempfile::TempDir, std::path::PathBuf)> {
+        open_ext4_mke2fs_features_args(size_mb, features, &[])
+    }
+
+    fn open_ext4_mke2fs_features_args(
+        size_mb: u64,
+        features: &str,
+        formatter_args: &[&str],
+    ) -> Option<(OpenFs, TestDevice, tempfile::TempDir, std::path::PathBuf)> {
         let tmp = tempfile::TempDir::new().expect("tmpdir");
         let image = tmp.path().join("test.ext4");
         let f = std::fs::File::create(&image).expect("create image");
@@ -97325,17 +97760,9 @@ mod tests {
         drop(f);
 
         let out = std::process::Command::new("mke2fs")
-            .args([
-                "-q",
-                "-t",
-                "ext4",
-                "-O",
-                features,
-                "-b",
-                "1024",
-                "-F",
-                image.to_str().unwrap(),
-            ])
+            .args(["-q", "-t", "ext4", "-O", features, "-b", "1024", "-F"])
+            .args(formatter_args)
+            .arg(&image)
             .output();
         match out {
             Ok(o) if o.status.success() => {}

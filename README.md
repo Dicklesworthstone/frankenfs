@@ -610,8 +610,8 @@ free tails in every allocation group. It reserves a 5% symbol budget by default,
 plus validation digest storage and three metadata blocks per group, through the immutable
 `.frankenfs-repair` file. Ordinary reads of that file return zeros. Preparation
 is journaled; `--check` validates persisted ownership without writing. Successful
-output reports `storage_prepared=true` and `protection_active=false`: encoding,
-crash-safe freshness and default native repair are still unfinished.
+output reports `storage_prepared=true` and `protection_active=false`. This
+reserves storage; crash-safe freshness and default native repair remain unfinished.
 
 After preparation, create an explicit trusted source-data baseline while the
 image is offline, then check it without writing:
@@ -628,8 +628,26 @@ initialization resumes only if its recorded source fingerprints still match
 across every group, including groups not yet published. A missing whole-image
 initialization record causes refusal.
 Successful output reports `validation_initialized=true`, `source_matches=true`
-and `protection_active=false`. It detects data changes; symbol encoding and
-mounted repair activation remain unfinished.
+and `protection_active=false`. It detects changes against that baseline.
+
+Encode parity from the sealed baseline, then check it read-only:
+
+```bash
+ffs native-encode image.ext4 --max-codec-memory-mib 4096 --json
+ffs native-encode image.ext4 --check --json
+ffs native-recover image.ext4 1234 recovered-block.bin --json
+```
+
+Encoding admits every group's source digests, descriptor records and estimated
+codec allocations before writing. Publication binds each committed parity
+generation to its source baseline; interrupted regeneration advances its durable
+generation. The memory option bounds an allocation estimate, not process RSS;
+the synchronous codec solve cannot check cancellation internally.
+`native-recover` requires a changed source block and writes its verified baseline
+bytes to a new output file, leaving the image read-only. A mismatch can also be a
+legitimate later write, so reconstruction does not establish current freshness
+or authorize rollback. These offline commands report `protection_active=false`;
+mounted native activation and Btrfs ownership remain unfinished.
 
 ### Hostile-image safety (separate claim)
 

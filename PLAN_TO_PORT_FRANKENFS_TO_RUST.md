@@ -138,8 +138,10 @@ The native implementation sequence begins with explicit offline ext4 preparation
 reserve tails as immutable inode extents, journal the entire ownership change,
 and validate it after reopening. Initialize and consume per-source validation
 records with durable whole-plan admission and pending/sealed publication outside
-source coverage. Then connect encoding, durable pre-write
-freshness fencing and mounted activation. Preparation alone cannot enable
+source coverage. Connect offline encoding through strict all-group admission,
+generation-bound owner records and verified raw parity publication; export
+digest-validated baseline reconstruction read-only. Durable pre-write freshness
+fencing must precede in-place recovery and mounted activation. Preparation alone cannot enable
 read-write background repair; Btrfs needs its own allocation ownership path.
 Explicit sidecar-protected writable mounts share the ordinary periodic filesystem
 commit worker (5 seconds ext4, 30 seconds btrfs, configurable or disabled), so
