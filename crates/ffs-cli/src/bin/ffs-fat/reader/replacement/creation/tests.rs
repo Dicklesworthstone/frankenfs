@@ -304,7 +304,7 @@ fn creation_both_dialects_sectors_empty_files_and_active_fat_preserve_native_byt
                     assert_eq!(dry_run["created_new_file"], false);
                     let report = plan.execute(&cx, &volume, &input, || Ok(())).unwrap();
                     assert_eq!(report["created_new_file"], true);
-                    assert!(plan.release.is_empty());
+                    assert_eq!(plan.release, [] as [(u32, u32); 0]);
                     let reopened = image.volume();
                     assert_eq!(contents(&reopened, path), bytes);
                     assert_eq!(contents(&reopened, "/KEEP.BIN"), b"SAFE");
@@ -505,7 +505,7 @@ fn creation_every_write_and_sync_cut_has_no_clean_partial_file_or_resurrected_en
                             assert_eq!(contents(&reopened, "/KEEP.BIN"), b"SAFE");
                             match reopened.resolve(&cx, "/NEW.BIN") {
                                 Ok(Some(_)) => {
-                                    assert_eq!(contents(&reopened, "/NEW.BIN"), vec![0xD5; 1300])
+                                    assert_eq!(contents(&reopened, "/NEW.BIN"), vec![0xD5; 1300]);
                                 }
                                 Err(FfsError::NotFound(_)) => (),
                                 other => panic!("unexpected created-file result: {other:?}"),

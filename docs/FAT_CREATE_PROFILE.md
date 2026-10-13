@@ -97,12 +97,16 @@ that consuming the old end requires durable, harmless hidden slots, even if a
 flush fails. Formerly unsupported valid name cases now have positive native-
 publication controls; invalid names and collisions still have zero-write tests.
 
-These are authored synthetic native-image and storage-model controls, not
-executed Rust, Windows/dosfstools interchange or hardware power-cut evidence.
-The implementation session has no Cargo, rustc, rustfmt or RCH executable, and
-its network lookup fails, so compilation, formatting, Clippy and runtime
-qualification have not run. The prior concurrent formatting correction does
-not qualify these new changes. Run the unchanged required checks, including:
+All 130 FAT Rust tests, including all 17 creation/growth/name controls, passed
+in RCH job `j-30063538684821513`: zero failures, ignored or filtered tests.
+These are executed synthetic native-image and storage-model unit controls;
+Windows/dosfstools interchange and hardware power-cut qualification remain
+pending. The same source passed RCH workspace/all-target check
+`j-30063538684821509`, strict Clippy `j-30063538684821508` and formatting
+on base `401fd7402` plus overlay
+`0e707e9b2f919d59e61d92eca7b23a2d1ac18cfbd8e149bc29a5f9aabdf113f0`.
+Earlier gate failures were fixed without removing any verification condition or
+test case. The unchanged required checks include:
 
 ```sh
 rch exec -- cargo test -p ffs-cli --bin ffs-fat replacement

@@ -73881,6 +73881,83 @@ mod tests {
     }
 
     #[test]
+    fn native_freshness_table_seal_does_not_overwrite_changed_owner_authority() {
+        let baseline = native_freshness_baseline();
+        let tail = &baseline.storage.tails[0];
+        let owner_start = tail.start.0 as usize * 1024;
+        for relative in [0, 192] {
+            let cx = Cx::for_testing();
+            let dev = TestDevice::from_vec(baseline.sealed.clone());
+            let durable = TestDevice::from_vec(baseline.sealed.clone());
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let syncs = Arc::new(AtomicUsize::new(0));
+            let fault_offset = owner_start + relative;
+            let observed = ValidationSyncFaultDevice {
+                inner: dev.clone(),
+                durable: durable.clone(),
+                syncs: Arc::clone(&syncs),
+                fail_on: usize::MAX,
+                // Dirty fence, source sync, global Pending, local Pending,
+                // table payload, then table-header seal. Damage occurs after
+                // the owner snapshot was read but before its local seal.
+                corrupt_on: Some((6, ByteOffset(fault_offset as u64))),
+                events: Arc::clone(&events),
+            };
+            let mut fs =
+                OpenFs::from_device(&cx, Box::new(observed), &native_preparation_options())
+                    .unwrap();
+            let payload = ByteOffset(native_existing_payload_block(&fs, &cx).0 * 1024);
+            fs.activate_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+                .unwrap();
+            assert_eq!(syncs.load(AtomicOrdering::SeqCst), 0);
+            fs.dev.write_all_at(&cx, payload, &[0x3D; 31]).unwrap();
+            assert_eq!(syncs.load(AtomicOrdering::SeqCst), 1);
+            fs.dev
+                .sync(&cx)
+                .expect_err("table sealing must not restore stale owner authority over damage");
+            assert_eq!(syncs.load(AtomicOrdering::SeqCst), 6);
+            let damaged = dev.snapshot_bytes();
+            assert_eq!(
+                damaged[fault_offset],
+                baseline.sealed[fault_offset] ^ 0x40,
+                "planted owner fault was overwritten (relative={relative})"
+            );
+            assert!(durable.snapshot_bytes() == damaged);
+            assert_eq!(
+                &damaged[owner_start + 64 + 104..owner_start + 64 + 108],
+                &1_u32.to_le_bytes(),
+                "owner validation record must remain Pending"
+            );
+            let table_start = owner_start + 1024;
+            assert_eq!(
+                &damaged[table_start + 104..table_start + 108],
+                &2_u32.to_le_bytes(),
+                "fault must exercise the sealed-table/unsealed-owner boundary"
+            );
+            for group in &baseline.storage.tails {
+                let parity = (group.start.0 as usize + 1 + group.validation_blocks as usize) * 1024
+                    ..(group.group_start.0 as usize + group.blocks_per_group as usize) * 1024;
+                assert_eq!(&damaged[parity.clone()], &baseline.sealed[parity]);
+            }
+            let recorded = events.lock().unwrap().clone();
+            assert_eq!(
+                &recorded[recorded.len() - 2..],
+                &[Some(table_start as u64), None],
+                "no owner seal or parity publication may follow the fault"
+            );
+            assert!(matches!(fs.dev.sync(&cx), Err(FfsError::RepairFailed(_))));
+            assert!(matches!(
+                fs.dev.write_all_at(&cx, payload, &[0x55]),
+                Err(FfsError::RepairFailed(_))
+            ));
+            assert_eq!(*events.lock().unwrap(), recorded);
+            assert!(dev.snapshot_bytes() == damaged);
+            native_freshness_cold_refuses(damaged);
+            native_freshness_cold_refuses(durable.snapshot_bytes());
+        }
+    }
+
+    #[test]
     fn native_freshness_refuses_owned_tail_and_never_rebaselines_untouched_corruption() {
         let baseline = native_freshness_baseline();
         let cx = Cx::for_testing();
@@ -73935,6 +74012,120 @@ mod tests {
         assert_eq!(events.lock().unwrap().len(), count);
         native_freshness_cold_refuses(damaged);
         native_freshness_cold_refuses(durable.snapshot_bytes());
+    }
+
+    #[test]
+    fn native_freshness_clean_sync_rejects_unobserved_corruption_without_rebaselining() {
+        let baseline = native_freshness_baseline();
+        let cx = Cx::for_testing();
+        let dev = TestDevice::from_vec(baseline.sealed.clone());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = ValidationFaultDevice {
+            inner: dev.clone(),
+            attempts: Arc::new(AtomicUsize::new(0)),
+            fail_on: usize::MAX,
+            events: Arc::clone(&events),
+        };
+        let mut fs =
+            OpenFs::from_device(&cx, Box::new(observed), &native_preparation_options()).unwrap();
+        let payload = ByteOffset(native_existing_payload_block(&fs, &cx).0 * 1024);
+        fs.activate_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+            .unwrap();
+        assert!(events.lock().unwrap().is_empty());
+
+        // No write has passed through the active handle. Corruption introduced
+        // below its authority must still be detected by a clean-state sync.
+        let mut byte = [0];
+        dev.read_exact_at(&cx, payload, &mut byte).unwrap();
+        byte[0] ^= 0x40;
+        dev.write_all_at(&cx, payload, &byte).unwrap();
+        let corrupted = dev.snapshot_bytes();
+        assert_ne!(corrupted, baseline.sealed);
+        fs.dev
+            .sync(&cx)
+            .expect_err("a clean handle must not acknowledge unobserved source corruption");
+        assert!(events.lock().unwrap().is_empty());
+        assert!(dev.snapshot_bytes() == corrupted);
+        for tail in &baseline.storage.tails {
+            let evidence = tail.start.0 as usize * 1024
+                ..(tail.group_start.0 as usize + tail.blocks_per_group as usize) * 1024;
+            assert_eq!(&corrupted[evidence.clone()], &baseline.sealed[evidence]);
+        }
+        assert!(matches!(fs.dev.sync(&cx), Err(FfsError::RepairFailed(_))));
+        assert!(matches!(
+            fs.dev.write_all_at(&cx, payload, &[0x55]),
+            Err(FfsError::RepairFailed(_))
+        ));
+        assert!(events.lock().unwrap().is_empty());
+        assert!(dev.snapshot_bytes() == corrupted);
+        native_freshness_cold_refuses(corrupted);
+    }
+
+    #[test]
+    fn native_freshness_refuses_owned_allocation_and_inode_changes_before_io() {
+        let baseline = native_freshness_baseline();
+        for change_inode in [false, true] {
+            let cx = Cx::for_testing();
+            let dev = TestDevice::from_vec(baseline.sealed.clone());
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let observed = ValidationFaultDevice {
+                inner: dev.clone(),
+                attempts: Arc::new(AtomicUsize::new(0)),
+                fail_on: usize::MAX,
+                events: Arc::clone(&events),
+            };
+            let mut fs =
+                OpenFs::from_device(&cx, Box::new(observed), &native_preparation_options())
+                    .unwrap();
+            let alloc = fs.load_ext4_alloc_state(&cx).unwrap();
+            let (block, replacement) = if change_inode {
+                let location = ffs_inode::locate_inode(
+                    baseline.storage.owner_inode,
+                    &alloc.geo,
+                    &alloc.groups,
+                )
+                .unwrap();
+                let mut bytes = fs.read_block_vec(&cx, location.block).unwrap();
+                let flags = location.byte_offset + 0x20;
+                let current = u32::from_le_bytes(bytes[flags..flags + 4].try_into().unwrap());
+                assert_ne!(current & ffs_types::EXT4_IMMUTABLE_FL, 0);
+                bytes[flags..flags + 4]
+                    .copy_from_slice(&(current & !ffs_types::EXT4_IMMUTABLE_FL).to_le_bytes());
+                (location.block, bytes)
+            } else {
+                let tail = &baseline.storage.tails[0];
+                let block = alloc.groups[tail.group.0 as usize].block_bitmap_block;
+                let bit = u32::try_from(
+                    (tail.start.0 - tail.group_start.0) / u64::from(alloc.geo.cluster_ratio),
+                )
+                .unwrap();
+                let mut bitmap = fs.read_block_vec(&cx, block).unwrap();
+                assert!(bitmap_get(&bitmap, bit), "owned tail must be allocated");
+                bitmap[bit as usize / 8] &= !(1 << (bit % 8));
+                (block, bitmap)
+            };
+            let offset = ByteOffset(block.0 * u64::from(fs.block_size()));
+            let start = usize::try_from(offset.0).unwrap();
+            assert_ne!(
+                replacement.as_slice(),
+                &baseline.sealed[start..start + replacement.len()]
+            );
+            fs.activate_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+                .unwrap();
+            fs.dev
+                .write_all_at(&cx, offset, &replacement)
+                .expect_err("ordinary source writes cannot revoke native storage ownership");
+            assert!(
+                events.lock().unwrap().is_empty(),
+                "ownership refusal performed fence/source I/O (change_inode={change_inode})"
+            );
+            assert!(dev.snapshot_bytes() == baseline.sealed);
+            assert_eq!(
+                fs.check_native_ext4_repair(&cx).unwrap().generations,
+                vec![1, 1],
+                "rejected ownership change altered the sealed baseline"
+            );
+        }
     }
 
     #[derive(Debug, Clone)]

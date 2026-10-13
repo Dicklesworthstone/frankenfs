@@ -500,13 +500,19 @@ impl Replacement {
             volume.device.sync(cx)?;
             phase = "checking completed allocation and namespace";
             let verification = volume.check(cx)?;
-            if !verification.clean
-                || !verification.complete
-                || !verification.namespace_complete
-                || verification.free_clusters != self.free_after
-                || verification.files != self.files
-                || verification.directories != self.directories
-            {
+            if !verification.clean || !verification.complete || !verification.namespace_complete {
+                bail!(
+                    "replacement verification failed: {}",
+                    serde_json::to_string(&verification)?
+                );
+            }
+            if verification.free_clusters != self.free_after {
+                bail!(
+                    "replacement verification failed: {}",
+                    serde_json::to_string(&verification)?
+                );
+            }
+            if verification.files != self.files || verification.directories != self.directories {
                 bail!(
                     "replacement verification failed: {}",
                     serde_json::to_string(&verification)?

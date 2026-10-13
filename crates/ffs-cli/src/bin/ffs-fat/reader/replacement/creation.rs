@@ -86,7 +86,9 @@ impl Namespace {
     }
 
     pub(super) fn directory_clusters(&self) -> usize {
-        self.extension.as_ref().map_or(0, |extension| extension.clusters().count())
+        self.extension
+            .as_ref()
+            .map_or(0, |extension| extension.clusters().count())
     }
 
     pub(super) fn validate(&self, cx: &Cx, volume: &FatVolume) -> Result<()> {
@@ -101,12 +103,20 @@ impl Namespace {
                 }
             }
         }
-        for slot in self.long_slots.iter().chain(std::iter::once(&self.entry)).chain(self.successor.iter()) {
+        for slot in self
+            .long_slots
+            .iter()
+            .chain(std::iter::once(&self.entry))
+            .chain(self.successor.iter())
+        {
             checkpoint(cx)?;
             let mut current = [0; 32];
             volume.read_exact(cx, slot.offset, &mut current)?;
             if current != slot.bytes {
-                bail!("reserved directory slot changed after creation preflight at {}", slot.offset);
+                bail!(
+                    "reserved directory slot changed after creation preflight at {}",
+                    slot.offset
+                );
             }
         }
         checkpoint(cx)?;
@@ -125,14 +135,22 @@ impl Namespace {
                 FatKind::Fat32 => 0x0FFF_FFFF,
             };
             let changes = extension.clusters().enumerate().map(|(index, cluster)| {
-                let next = if index == 0 { extension.additional.unwrap_or(end) } else { end };
+                let next = if index == 0 {
+                    extension.additional.unwrap_or(end)
+                } else {
+                    end
+                };
                 (cluster, 0, next)
             });
             change_fat(cx, volume, &changes)?;
             volume.device.sync(cx)?;
             // All new directory links are durable before an existing parent
             // can reach any of them. No data/namespace slot moves are needed.
-            change_fat(cx, volume, &std::iter::once((extension.tail, EXPECT_END, extension.cluster)))?;
+            change_fat(
+                cx,
+                volume,
+                &std::iter::once((extension.tail, EXPECT_END, extension.cluster)),
+            )?;
             volume.device.sync(cx)?;
         }
         if let Some(slot) = &self.successor {
@@ -148,9 +166,18 @@ impl Namespace {
         // marker. Preserve that actual marker too, not merely the first slot,
         // until all hidden slots are durably harmless. New directory clusters
         // have zero end markers after initialization, regardless of old bytes.
-        let end_marker = self.long_slots.iter().position(|slot| slot.initialized()[0] == 0);
+        let end_marker = self
+            .long_slots
+            .iter()
+            .position(|slot| slot.initialized()[0] == 0);
         let deleted = deleted_slot();
-        patch_slot(cx, volume, self.entry.offset, &self.entry.initialized(), &deleted)?;
+        patch_slot(
+            cx,
+            volume,
+            self.entry.offset,
+            &self.entry.initialized(),
+            &deleted,
+        )?;
         for (index, slot) in self.long_slots.iter().enumerate().skip(1).rev() {
             if Some(index) != end_marker {
                 patch_slot(cx, volume, slot.offset, &slot.initialized(), &deleted)?;
@@ -183,8 +210,15 @@ impl Namespace {
 }
 
 fn parent(cx: &Cx, volume: &FatVolume, path: &str) -> Result<(Directory, String)> {
-    if path.len() > 65_536 || path.ends_with('/') || path.is_empty()
-        || path.split('/').filter(|part| !part.is_empty() && *part != ".").take(257).count() > 256
+    if path.len() > 65_536
+        || path.ends_with('/')
+        || path.is_empty()
+        || path
+            .split('/')
+            .filter(|part| !part.is_empty() && *part != ".")
+            .take(257)
+            .count()
+            > 256
     {
         bail!("creation requires a bounded non-root native file path");
     }
@@ -202,15 +236,23 @@ fn parent(cx: &Cx, volume: &FatVolume, path: &str) -> Result<(Directory, String)
     Ok((directory, name.to_owned()))
 }
 
-fn directory_offsets(cx: &Cx, volume: &FatVolume, directory: Directory) -> Result<(Vec<u64>, Option<u32>)> {
+fn directory_offsets(
+    cx: &Cx,
+    volume: &FatVolume,
+    directory: Directory,
+) -> Result<(Vec<u64>, Option<u32>)> {
     let mut offsets = Vec::new();
     let tail;
-    if directory == Directory::Root && let Some((start, length)) = volume.geometry.fixed_root() {
+    if directory == Directory::Root
+        && let Some((start, length)) = volume.geometry.fixed_root()
+    {
         let count = usize::try_from(length / 32).context("FAT root slot count overflow")?;
         if count > MAX_DIRECTORY_SLOTS {
             bail!("creation parent exceeds the directory-slot budget");
         }
-        offsets.try_reserve_exact(count).context("reserving bounded root slots")?;
+        offsets
+            .try_reserve_exact(count)
+            .context("reserving bounded root slots")?;
         offsets.extend((start..start + length).step_by(32));
         tail = None;
     } else {
@@ -219,12 +261,23 @@ fn directory_offsets(cx: &Cx, volume: &FatVolume, directory: Directory) -> Resul
             Directory::Cluster(first) => first,
         };
         let bytes = volume.geometry.cluster_bytes() as usize;
-        let chain = volume.allocation_chain(cx, first, 1, volume.cluster_offset(first)?, (MAX_DIRECTORY_SLOTS * 32).div_ceil(bytes))?;
-        let count = chain.len().checked_mul(bytes / 32).context("FAT directory slot overflow")?;
+        let chain = volume.allocation_chain(
+            cx,
+            first,
+            1,
+            volume.cluster_offset(first)?,
+            (MAX_DIRECTORY_SLOTS * 32).div_ceil(bytes),
+        )?;
+        let count = chain
+            .len()
+            .checked_mul(bytes / 32)
+            .context("FAT directory slot overflow")?;
         if count > MAX_DIRECTORY_SLOTS {
             bail!("creation parent exceeds the directory-slot budget");
         }
-        offsets.try_reserve_exact(count).context("reserving bounded directory slots")?;
+        offsets
+            .try_reserve_exact(count)
+            .context("reserving bounded directory slots")?;
         tail = chain.last().copied();
         for cluster in chain {
             checkpoint(cx)?;
@@ -246,10 +299,19 @@ struct Reservation {
 fn read_slot(cx: &Cx, volume: &FatVolume, offset: u64, fresh: bool) -> Result<Slot> {
     let mut bytes = [0; 32];
     volume.read_exact(cx, offset, &mut bytes)?;
-    Ok(Slot { offset, bytes, fresh })
+    Ok(Slot {
+        offset,
+        bytes,
+        fresh,
+    })
 }
 
-fn reserve_slots(cx: &Cx, volume: &FatVolume, directory: Directory, needed: usize) -> Result<Reservation> {
+fn reserve_slots(
+    cx: &Cx,
+    volume: &FatVolume,
+    directory: Directory,
+    needed: usize,
+) -> Result<Reservation> {
     let (offsets, tail) = directory_offsets(cx, volume, directory)?;
     let mut slots = Vec::with_capacity(needed);
     let mut after_end = false;
@@ -261,7 +323,9 @@ fn reserve_slots(cx: &Cx, volume: &FatVolume, directory: Directory, needed: usiz
         if after_end || slot.bytes[0] == 0xE5 {
             if preceding_lfn {
                 if after_end {
-                    bail!("orphan long-name records precede the directory end; native checking is required");
+                    bail!(
+                        "orphan long-name records precede the directory end; native checking is required"
+                    );
                 }
                 preceding_lfn = false;
                 slots.clear();
@@ -270,11 +334,19 @@ fn reserve_slots(cx: &Cx, volume: &FatVolume, directory: Directory, needed: usiz
             slots.push(slot);
             if slots.len() == needed {
                 let successor = if after_end {
-                    offsets.get(index + 1).map(|&offset| read_slot(cx, volume, offset, false)).transpose()?
+                    offsets
+                        .get(index + 1)
+                        .map(|&offset| read_slot(cx, volume, offset, false))
+                        .transpose()?
                 } else {
                     None
                 };
-                return Ok(Reservation { slots, successor, tail: None, extra: 0 });
+                return Ok(Reservation {
+                    slots,
+                    successor,
+                    tail: None,
+                    extra: 0,
+                });
             }
         } else {
             slots.clear();
@@ -284,16 +356,33 @@ fn reserve_slots(cx: &Cx, volume: &FatVolume, directory: Directory, needed: usiz
     if preceding_lfn {
         bail!("orphan long-name records at the directory tail forbid creation growth");
     }
-    let tail = tail.context("full FAT16 fixed root cannot grow; no contiguous directory slot set")?;
+    let tail =
+        tail.context("full FAT16 fixed root cannot grow; no contiguous directory slot set")?;
     let per_cluster = volume.geometry.cluster_bytes() as usize / 32;
     let extra = (needed - slots.len()).div_ceil(per_cluster);
-    if extra > 2 || offsets.len().checked_add(extra * per_cluster).is_none_or(|count| count > MAX_DIRECTORY_SLOTS) {
+    if extra > 2
+        || offsets
+            .len()
+            .checked_add(extra * per_cluster)
+            .is_none_or(|count| count > MAX_DIRECTORY_SLOTS)
+    {
         bail!("directory growth would exceed the admitted slot budget");
     }
-    Ok(Reservation { slots, successor: None, tail: Some(tail), extra })
+    Ok(Reservation {
+        slots,
+        successor: None,
+        tail: Some(tail),
+        extra,
+    })
 }
 
-pub(super) fn prepare(cx: &Cx, volume: &FatVolume, path: &str, source: &dyn ByteDevice, now: u64) -> Result<Replacement> {
+pub(super) fn prepare(
+    cx: &Cx,
+    volume: &FatVolume,
+    path: &str,
+    source: &dyn ByteDevice,
+    now: u64,
+) -> Result<Replacement> {
     checkpoint(cx)?;
     let size = u32::try_from(source.len_bytes()).context("FAT file size exceeds 2^32 - 1 bytes")?;
     let (date, time) = modified_timestamp(now)?;
@@ -302,16 +391,23 @@ pub(super) fn prepare(cx: &Cx, volume: &FatVolume, path: &str, source: &dyn Byte
     validate_boot_state(cx, volume)?;
     let before = volume.check(cx)?;
     if !before.clean || !before.complete || !before.namespace_complete {
-        bail!("creation requires a complete clean allocation/namespace check: {}", serde_json::to_string(&before)?);
+        bail!(
+            "creation requires a complete clean allocation/namespace check: {}",
+            serde_json::to_string(&before)?
+        );
     }
     let needed_slots = name.long_slots() + 1;
     let mut reservation = reserve_slots(cx, volume, directory, needed_slots)?;
     let needed = u64::from(size).div_ceil(u64::from(volume.geometry.cluster_bytes())) as usize;
-    let total = needed.checked_add(reservation.extra).context("creation allocation overflow")?;
+    let total = needed
+        .checked_add(reservation.extra)
+        .context("creation allocation overflow")?;
     let mut clusters = reserve_clusters(cx, volume, total, before.free_clusters)?;
     let extension = if let Some(tail) = reservation.tail {
         let extra = clusters.split_off(needed);
-        let cluster = *extra.first().context("missing reserved directory cluster")?;
+        let cluster = *extra
+            .first()
+            .context("missing reserved directory cluster")?;
         for &cluster in &extra {
             let start = volume.cluster_offset(cluster)?;
             for offset in (start..start + u64::from(volume.geometry.cluster_bytes())).step_by(32) {
@@ -323,12 +419,23 @@ pub(super) fn prepare(cx: &Cx, volume: &FatVolume, path: &str, source: &dyn Byte
                 }
             }
         }
-        Some(Extension { tail, cluster, additional: extra.get(1).copied() })
+        Some(Extension {
+            tail,
+            cluster,
+            additional: extra.get(1).copied(),
+        })
     } else {
         None
     };
-    let entry = reservation.slots.pop().context("missing reserved short-entry slot")?;
-    let original = if name.long.is_empty() { entry.initialized() } else { deleted_slot() };
+    let entry = reservation
+        .slots
+        .pop()
+        .context("missing reserved short-entry slot")?;
+    let original = if name.long.is_empty() {
+        entry.initialized()
+    } else {
+        deleted_slot()
+    };
     let mut updated = [0; 32];
     updated[..11].copy_from_slice(&name.short);
     updated[11] = 0x20;
@@ -358,9 +465,18 @@ pub(super) fn prepare(cx: &Cx, volume: &FatVolume, path: &str, source: &dyn Byte
         release: Vec::new(),
         digest,
         free_after: before.free_clusters - total as u64,
-        files: before.files.checked_add(1).context("FAT file count overflow")?,
+        files: before
+            .files
+            .checked_add(1)
+            .context("FAT file count overflow")?,
         directories: before.directories,
-        creation: Some(Namespace { successor: reservation.successor, extension, entry, long_slots: reservation.slots, name }),
+        creation: Some(Namespace {
+            successor: reservation.successor,
+            extension,
+            entry,
+            long_slots: reservation.slots,
+            name,
+        }),
     })
 }
 

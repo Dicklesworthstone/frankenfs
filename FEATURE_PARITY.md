@@ -256,15 +256,51 @@
 > Broader native coverage remains a V1 requirement.
 > No measured parity percentage or mounted/default repair credit is added.
 
-> **Explicit native write freshness (`bd-11a8t`, source under validation):**
+> **Explicit native write freshness (`bd-11a8t`, partial executed evidence):**
 > optional core activation and CLI `--native-repair-memory-mib` connect a single
 > protected physical device before constructor recovery. Intended digests derive
 > from verified beforeimages and caller writes. A durable Dirty fence precedes
 > source mutation; sync verifies all intended and untouched sources before exact
 > next-epoch plan/table/parity publication. The compactor shares its caller's
-> device Arc. Five new real-format freshness controls, one compactor authority
-> control and one CLI admission/wiring control are authored but unexecuted.
-> This source currently has no new compiler or mounted-runtime qualification.
+> device Arc. Eight new real-format freshness controls, one compactor authority
+> control and one CLI admission/wiring control accompany the implementation.
+> Source-bound native core job `j-30063538684821511` passed all 30 selected tests,
+> including all eight new controls: zero failures, ignored or measured tests,
+> 1,485 filtered out. Shared-compactor job `j-30063538684821512` passed both
+> supplied-device authority and existing WAL replay/checkpoint controls, with
+> zero failures or ignored tests. Full actual-bin job `j-30063538684821513`
+> passed all 401 CLI and 130 FAT tests with zero failures, ignored, measured
+> or filtered tests, including the CLI admission/wiring control and all 17 FAT
+> creation/growth/name regressions. Each used the combined source below.
+> Workspace/all-target compiler check `j-30063538684821505` passed on frozen
+> base `f56a350e8b8b45b8b80804e537654a608571ca9d` plus overlay
+> `b0de9273011e9c2402a60476d47e256f3d2d30a0095d5ac1d681ab2969b3b8c4`.
+> Earlier strict Clippy attempts failed on an existing FAT verification guard
+> and five FAT test lints. Equivalent guard/assertion spelling fixes preserve
+> every condition. Combined source (base `401fd7402296a0af55f94a07f55a9d1313cd120b`,
+> overlay `0e707e9b2f919d59e61d92eca7b23a2d1ac18cfbd8e149bc29a5f9aabdf113f0`)
+> passed strict workspace/all-target Clippy `j-30063538684821508` and locked
+> workspace/all-target check `j-30063538684821509`; formatting also passed.
+> Public build `j-30063538684821510` produced independently matching worker/local
+> binary SHA256 `15bd80678f4d25425fe5beb258c3a1ec1e944a4ae1f596f9b08a882ce913445c`.
+> A fresh 4 MiB/two-group/1 KiB ext4 actual-FUSE probe passed overwrite,
+> new-file inode/block allocation, acknowledged file and directory fsync,
+> graceful unmount, cold current-byte/parity verification, independent
+> `debugfs` payload equality and `e2fsck -fn`. Generations advanced `[1, 1]`
+> to `[9, 9]`, with owner inode 14, 3,755 source blocks and 206 repair blocks.
+> The explicit profile uses native/rw, 256 MiB, no background scrub, disabled
+> periodic commit, noatime and `FFS_AUTO_UNMOUNT=0`. The first auto-unmount
+> attempt failed before mounting because this host disallows `allow_other`;
+> that failure is retained and earns no mounted qualification.
+> Public read-only recovery from a separately damaged copy exported the exact
+> newly fsynced 1,024-byte payload block at generation 9, while both healthy
+> and damaged image hashes remained unchanged. Artifacts are retained at
+> `/data/tmp/ffs-chartreusestone-resume41-native-mount-artifacts-097Zf8`;
+> successful mount log SHA256
+> `76d1003baca56728a620c76002d75f3cda0845d69b3b3f066f2baefec17d490a`.
+> This is actual mounted execution plus offline planted-file-data recovery
+> on a small test image, not hardware power-cut or default repair evidence.
+> No performance win or measured parity percentage is claimed.
 > Default activation, automatic read repair, interrupted-epoch reconciliation,
 > Btrfs ownership and internal dense-solver cancellation latency remain open.
 

@@ -197,7 +197,7 @@ fn creation_extension_each_write_and_flush_cut_refuses_uncommitted_directory_gro
                             assert_eq!(contents(&reopened, "/KEEP.BIN"), b"SAFE");
                             match reopened.resolve(&cx, &path) {
                                 Ok(Some(_)) => {
-                                    assert_eq!(contents(&reopened, &path), b"complete new data")
+                                    assert_eq!(contents(&reopened, &path), b"complete new data");
                                 }
                                 Err(FfsError::NotFound(_)) => (),
                                 other => panic!("unexpected growth result: {other:?}"),

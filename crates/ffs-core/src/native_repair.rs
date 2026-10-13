@@ -281,14 +281,15 @@ impl NativeOwnershipConstraints {
 
     fn protect_geometry(&mut self, cx: &Cx, dev: &dyn BlockDevice) -> Result<(), FfsError> {
         // Primary ext4 geometry/identity and routing fields. RECOVER, free
-        // counts, timestamps, mount state and checksum remain writable.
+        // counts, timestamps, mount state, last_orphan and checksum remain writable.
         for (start, end) in [
             (0x00, 0x0C),
             (0x14, 0x2C),
             (0x38, 0x3A),
             (0x48, 0x60),
             (0x61, 0x78),
-            (0xCE, 0xFC),
+            (0xCE, 0xE8),
+            (0xEC, 0xFC),
             (0xFE, 0x100),
             (0x104, 0x108),
             (0x150, 0x158),
@@ -2398,6 +2399,16 @@ fn publish_validation_group(
         &table[..sb.block_size as usize],
     )?;
     dev.sync(cx)?;
+    // Re-read the owner after the table barriers. Never restore an admission
+    // snapshot over damage to the prefix or another authority record.
+    let current = check_native_owner_prefix(cx, dev, sb, storage, generation, tail)?;
+    if current != ownership {
+        return Err(validation_error(
+            tail,
+            "ownership changed before local validation seal",
+        ));
+    }
+    ownership = current;
     ownership[OWNER_HEADER_BYTES..OWNER_HEADER_BYTES + VALIDATION_HEADER_BYTES]
         .copy_from_slice(&sealed);
     dev.write_block(cx, tail.start, &ownership)?;

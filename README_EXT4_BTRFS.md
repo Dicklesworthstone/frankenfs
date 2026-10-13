@@ -649,7 +649,7 @@ legitimate later write, so reconstruction does not establish current freshness
 or authorize rollback. These offline commands report `protection_active=false`;
 mounted native activation and Btrfs ownership remain unfinished.
 
-An explicit native freshness path is being validated for prepared ext4 images:
+An explicit native freshness path is available for prepared ext4 images:
 
 ```bash
 ffs mount image.ext4 /path/to/empty/mountpoint --native --rw \
@@ -663,9 +663,17 @@ parity before succeeding. All groups are checked, including untouched sources.
 An interrupted or failed epoch refuses reopening with active protection; there
 is no automatic rebaselining or rollback. The memory budget covers estimates,
 not process RSS, and dense codec solves can make sync expensive. External
-metadata-WAL combinations are refused. This new path has no executed mounted
-qualification yet; default repair, automatic recovery, restart reconciliation
-and Btrfs native ownership remain unfinished.
+metadata-WAL combinations are refused. An actual 4 MiB/two-group/1 KiB ext4
+FUSE run passed overwrite, new-file allocation, file/directory fsync, unmount,
+cold parity checking, independent payload readback and `e2fsck`; parity advanced
+from generation 1 to 9. Read-only reconstruction from a damaged copy recovered
+the exact newly fsynced payload block. That focused run used a 256 MiB budget,
+no background scrub, disabled periodic commit, noatime and
+`FFS_AUTO_UNMOUNT=0`; the default auto-unmount attempt failed on this host's
+`allow_other` policy. Default repair, automatic recovery, restart reconciliation,
+hardware power-cut qualification and Btrfs native ownership remain unfinished.
+See [the source-bound evidence](FEATURE_PARITY.md) for the exact build and
+retained results.
 
 ### Hostile-image safety (separate claim)
 

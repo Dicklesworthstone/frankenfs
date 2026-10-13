@@ -117,11 +117,16 @@ failures, lost or retained pending data and torn prefixes. An interior-marker
 control specifically requires durable hidden-slot initialization before the
 old end marker is consumed.
 
-**These Rust tests have not been executed in the implementation session.**
-The environment has no Rust or RCH tools, and network resolution is unavailable.
-Compilation, formatting, Clippy, runtime and native-interchange qualification
-are not claimed. The earlier concurrent formatting correction does not qualify
-these new source changes. Required checks remain outstanding.
+**All 130 FAT Rust tests passed**, including the 17 creation/growth/name
+regressions, in RCH job `j-30063538684821513`. No tests failed, were ignored
+or were filtered out. Combined-source workspace/all-target check and strict
+Clippy passed in jobs `j-30063538684821509` and `j-30063538684821508`; formatting
+also passed. The source is base `401fd7402` plus overlay
+`0e707e9b2f919d59e61d92eca7b23a2d1ac18cfbd8e149bc29a5f9aabdf113f0`.
+Earlier gate failures required equivalent verification-guard and test-spelling
+fixes; no condition or case was removed. These are executed native-image and
+storage-model unit controls. Windows/dosfstools interchange, writable-mount,
+crash-replay and hardware power-cut qualification remain outstanding.
 
 ## Build and explore
 
