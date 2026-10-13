@@ -204,7 +204,8 @@ impl NativeOwnershipConstraints {
         mask: u8,
     ) -> Result<(), FfsError> {
         let size = u64::from(dev.block_size());
-        let end = offset.checked_add(length)
+        let end = offset
+            .checked_add(length)
             .ok_or_else(|| freshness_error("ownership constraint range overflows"))?;
         let mut cursor = offset;
         while cursor < end {
@@ -212,10 +213,14 @@ impl NativeOwnershipConstraints {
             let block = BlockNumber(cursor / size);
             if let std::collections::btree_map::Entry::Vacant(entry) = self.blocks.entry(block) {
                 // Two retained vectors plus one transient read and map margin.
-                let charge = size.checked_mul(3).and_then(|bytes| bytes.checked_add(256))
+                let charge = size
+                    .checked_mul(3)
+                    .and_then(|bytes| bytes.checked_add(256))
                     .ok_or_else(|| freshness_error("ownership constraint budget overflows"))?;
-                self.remaining_budget = self.remaining_budget.checked_sub(charge)
-                    .ok_or_else(|| freshness_error("working budget is below ownership constraints"))?;
+                self.remaining_budget =
+                    self.remaining_budget.checked_sub(charge).ok_or_else(|| {
+                        freshness_error("working budget is below ownership constraints")
+                    })?;
                 let expected = dev.read_block(cx, block)?.into_inner();
                 if expected.len() != size as usize {
                     return Err(freshness_error("short ownership constraint block"));
@@ -239,10 +244,15 @@ impl NativeOwnershipConstraints {
     fn check(&self, block: BlockNumber, bytes: &[u8]) -> Result<(), FfsError> {
         if let Some(guard) = self.blocks.get(&block)
             && (bytes.len() != guard.expected.len()
-                || bytes.iter().zip(&guard.expected).zip(&guard.mask)
+                || bytes
+                    .iter()
+                    .zip(&guard.expected)
+                    .zip(&guard.mask)
                     .any(|((&actual, &expected), &mask)| (actual ^ expected) & mask != 0))
         {
-            return Err(freshness_error("write changes permanent native allocation ownership"));
+            return Err(freshness_error(
+                "write changes permanent native allocation ownership",
+            ));
         }
         Ok(())
     }
@@ -254,7 +264,9 @@ impl NativeOwnershipConstraints {
         bitmap: BlockNumber,
         bit: u64,
     ) -> Result<(), FfsError> {
-        let offset = bitmap.0.checked_mul(u64::from(dev.block_size()))
+        let offset = bitmap
+            .0
+            .checked_mul(u64::from(dev.block_size()))
             .and_then(|offset| offset.checked_add(bit / 8))
             .ok_or_else(|| freshness_error("ownership bitmap offset overflows"))?;
         let mask = 1_u8 << (bit % 8);
@@ -271,13 +283,64 @@ impl NativeOwnershipConstraints {
         // Primary ext4 geometry/identity and routing fields. RECOVER, free
         // counts, timestamps, mount state and checksum remain writable.
         for (start, end) in [
-            (0x00, 0x0C), (0x14, 0x2C), (0x38, 0x3A), (0x48, 0x60),
-            (0x61, 0x78), (0xCE, 0xFC), (0xFE, 0x100), (0x104, 0x108),
-            (0x150, 0x158), (0x15C, 0x164), (0x174, 0x176), (0x270, 0x274),
+            (0x00, 0x0C),
+            (0x14, 0x2C),
+            (0x38, 0x3A),
+            (0x48, 0x60),
+            (0x61, 0x78),
+            (0xCE, 0xFC),
+            (0xFE, 0x100),
+            (0x104, 0x108),
+            (0x150, 0x158),
+            (0x15C, 0x164),
+            (0x174, 0x176),
+            (0x270, 0x274),
         ] {
             self.protect(cx, dev, 1024 + start, end - start, u8::MAX)?;
         }
         self.protect(cx, dev, 1024 + 0x60, 1, !0x04)
+    }
+
+    fn protect_groups(
+        &mut self,
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        sb: &Ext4Superblock,
+        storage: &NativeRepairStorage,
+        owner_group: GroupNumber,
+    ) -> Result<(), FfsError> {
+        for tail in &storage.tails {
+            let gd = read_native_group_desc(cx, dev, sb, tail.group)?;
+            let offset = sb
+                .group_desc_offset(tail.group)
+                .ok_or_else(|| freshness_error("native descriptor address overflows"))?;
+            self.protect(cx, dev, offset, 12, u8::MAX)?;
+            self.protect(cx, dev, offset + 0x14, 4, u8::MAX)?;
+            if sb.group_desc_size() >= 64 {
+                self.protect(cx, dev, offset + 0x20, 12, u8::MAX)?;
+                self.protect(cx, dev, offset + 0x34, 4, u8::MAX)?;
+            }
+            let flags = if tail.group == owner_group {
+                0x03
+            } else {
+                0x02
+            };
+            if gd.flags & u16::from(flags) != 0 {
+                return Err(freshness_error(
+                    "native ownership descriptor is uninitialized",
+                ));
+            }
+            self.protect(cx, dev, offset + 0x12, 1, flags)?;
+            for block in tail.start.0..tail.start.0 + u64::from(tail.blocks()) {
+                self.protect_allocated(
+                    cx,
+                    dev,
+                    BlockNumber(gd.block_bitmap),
+                    block - tail.group_start.0,
+                )?;
+            }
+        }
+        Ok(())
     }
 }
 
@@ -316,16 +379,25 @@ fn read_native_group_desc(
     sb: &Ext4Superblock,
     group: GroupNumber,
 ) -> Result<ffs_ondisk::Ext4GroupDesc, FfsError> {
-    let offset = sb.group_desc_offset(group)
+    let offset = sb
+        .group_desc_offset(group)
         .ok_or_else(|| freshness_error("native descriptor address overflows"))?;
     let size = u64::from(sb.block_size);
     let block = dev.read_block(cx, BlockNumber(offset / size))?;
     let start = (offset % size) as usize;
-    let bytes = block.as_slice().get(start..start + usize::from(sb.group_desc_size()))
+    let bytes = block
+        .as_slice()
+        .get(start..start + usize::from(sb.group_desc_size()))
         .ok_or_else(|| freshness_error("native descriptor crosses its block"))?;
     ffs_ondisk::ext4::verify_group_desc_checksum(
-        bytes, &sb.uuid, sb.csum_seed(), group.0, sb.group_desc_size(), sb.group_desc_checksum_kind(),
-    ).map_err(|error| parse_to_ffs_error(&error))?;
+        bytes,
+        &sb.uuid,
+        sb.csum_seed(),
+        group.0,
+        sb.group_desc_size(),
+        sb.group_desc_checksum_kind(),
+    )
+    .map_err(|error| parse_to_ffs_error(&error))?;
     ffs_ondisk::Ext4GroupDesc::parse_from_bytes(bytes, sb.group_desc_size())
         .map_err(|error| parse_to_ffs_error(&error))
 }
@@ -2341,32 +2413,28 @@ impl OpenFs {
         storage: &NativeRepairStorage,
         remaining_budget: u64,
     ) -> Result<NativeOwnershipConstraints, FfsError> {
-        let dev = ByteDeviceBlockAdapter { dev: self.dev.as_ref(), block_size: sb.block_size };
-        let mut constraints = NativeOwnershipConstraints { blocks: BTreeMap::new(), remaining_budget };
+        let dev = ByteDeviceBlockAdapter {
+            dev: self.dev.as_ref(),
+            block_size: sb.block_size,
+        };
+        let mut constraints = NativeOwnershipConstraints {
+            blocks: BTreeMap::new(),
+            remaining_budget,
+        };
         constraints.protect_geometry(cx, &dev)?;
-        let location = sb.locate_inode(storage.owner_inode).map_err(|error| parse_to_ffs_error(&error))?;
-        for tail in &storage.tails {
-            let gd = read_native_group_desc(cx, &dev, sb, tail.group)?;
-            let offset = sb.group_desc_offset(tail.group)
-                .ok_or_else(|| freshness_error("native descriptor address overflows"))?;
-            constraints.protect(cx, &dev, offset, 12, u8::MAX)?;
-            constraints.protect(cx, &dev, offset + 0x14, 4, u8::MAX)?;
-            if sb.group_desc_size() >= 64 {
-                constraints.protect(cx, &dev, offset + 0x20, 12, u8::MAX)?;
-                constraints.protect(cx, &dev, offset + 0x34, 4, u8::MAX)?;
-            }
-            let flags = if tail.group == location.group { 0x03 } else { 0x02 };
-            if gd.flags & u16::from(flags) != 0 {
-                return Err(freshness_error("native ownership descriptor is uninitialized"));
-            }
-            constraints.protect(cx, &dev, offset + 0x12, 1, flags)?;
-            for block in tail.start.0..tail.start.0 + u64::from(tail.blocks()) {
-                constraints.protect_allocated(cx, &dev, BlockNumber(gd.block_bitmap), block - tail.group_start.0)?;
-            }
-        }
+        let location = sb
+            .locate_inode(storage.owner_inode)
+            .map_err(|error| parse_to_ffs_error(&error))?;
+        constraints.protect_groups(cx, &dev, sb, storage, location.group)?;
         let gd = read_native_group_desc(cx, &dev, sb, location.group)?;
-        constraints.protect_allocated(cx, &dev, BlockNumber(gd.inode_bitmap), u64::from(location.index))?;
-        let inode_offset = sb.inode_device_offset(&location, gd.inode_table)
+        constraints.protect_allocated(
+            cx,
+            &dev,
+            BlockNumber(gd.inode_bitmap),
+            u64::from(location.index),
+        )?;
+        let inode_offset = sb
+            .inode_device_offset(&location, gd.inode_table)
             .map_err(|error| parse_to_ffs_error(&error))?;
         let inode = self.read_native_owner_inode(cx, sb, storage.owner_inode)?;
         // Preserve every inode byte except atime and the checksum fields.
@@ -2383,11 +2451,24 @@ impl OpenFs {
         let (_, nodes) = self.read_native_owner_extents(cx, sb, &inode)?;
         for node in nodes {
             let relative = node - u64::from(sb.first_data_block);
-            let group = GroupNumber(u32::try_from(relative / u64::from(sb.blocks_per_group))
-                .map_err(|_| freshness_error("owner extent node group overflows"))?);
+            let group = GroupNumber(
+                u32::try_from(relative / u64::from(sb.blocks_per_group))
+                    .map_err(|_| freshness_error("owner extent node group overflows"))?,
+            );
             let gd = read_native_group_desc(cx, &dev, sb, group)?;
-            constraints.protect_allocated(cx, &dev, BlockNumber(gd.block_bitmap), relative % u64::from(sb.blocks_per_group))?;
-            constraints.protect(cx, &dev, node * u64::from(sb.block_size), u64::from(sb.block_size), u8::MAX)?;
+            constraints.protect_allocated(
+                cx,
+                &dev,
+                BlockNumber(gd.block_bitmap),
+                relative % u64::from(sb.blocks_per_group),
+            )?;
+            constraints.protect(
+                cx,
+                &dev,
+                node * u64::from(sb.block_size),
+                u64::from(sb.block_size),
+                u8::MAX,
+            )?;
         }
         Ok(constraints)
     }

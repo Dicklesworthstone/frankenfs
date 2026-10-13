@@ -38,7 +38,7 @@ pub struct ReplaceArgs {
     /// Immutable regular source file; never opened for writing.
     #[arg(long)]
     source: PathBuf,
-    /// Create a new ASCII 8.3 file instead; refuse any existing name or alias.
+    /// Create a new short- or long-name file; refuse any existing name or alias.
     #[arg(long)]
     create: bool,
     /// Confirm exclusive ownership: no mounted or unrelated image writers.
@@ -393,7 +393,7 @@ impl Replacement {
         if let Some(namespace) = &self.creation {
             report["operation"] = "create_new_file".into();
             report["created_new_file"] = (!dry_run).into();
-            report["name_profile"] = "portable_ascii_8_3".into();
+            report["name_profile"] = "portable_utf16_lfn_ascii_alias".into();
             report["new_directory_clusters"] = namespace.directory_clusters().into();
             report["contract"] = "offline ordered creation; interrupted mutation may require native recovery; not atomic".into();
         }
@@ -530,6 +530,13 @@ impl Replacement {
             .ok_or(FfsError::IsDirectory)?;
         if entry.offset != self.entry_offset || entry.native.size != self.size {
             bail!("replacement readback resolved a different file identity or length");
+        }
+        if self.creation.is_some()
+            && (entry.name()? != self.path.rsplit('/').next().unwrap_or("")
+                || entry.native.short_name.as_slice() != &self.updated[..11]
+                || entry.native.case_flags != self.updated[12])
+        {
+            bail!("created file readback changed its native name, short alias or case flags");
         }
         let chain = volume.file_chain(cx, &entry)?;
         if chain.clusters != self.clusters {
