@@ -12,7 +12,7 @@
 //! independently trusted source data. It does not establish source freshness
 //! after client writes or provide exclusion against concurrent repair writers.
 
-use super::{RepairGroupStorage, SymbolBatch};
+use super::{RawRefreshAdmission, RepairGroupLayout, RepairGroupStorage, SymbolBatch};
 use crate::symbol::RepairGroupDescExt;
 use asupersync::Cx;
 use ffs_error::{FfsError, Result};
@@ -211,6 +211,152 @@ pub(super) fn refresh_descriptor(
     Ok(newest_records(storage, cx)?.remove(0).descriptor)
 }
 
+fn validate_bootstrap(
+    storage: &RepairGroupStorage<'_>,
+    expected: &RepairGroupDescExt,
+) -> Result<()> {
+    let layout = storage.layout;
+    RepairGroupLayout::new(
+        layout.group,
+        layout.group_start,
+        layout.blocks_per_group,
+        layout.validation_block_count,
+        layout.repair_block_count,
+    )?;
+    storage.validate_desc_layout(expected)?;
+    let block_size = storage.device.block_size();
+    if expected.repair_generation != 0
+        || expected.source_block_count == 0
+        || u32::from(expected.symbol_size) != block_size
+        || expected.transfer_length
+            != u64::from(expected.source_block_count) * u64::from(block_size)
+        || expected.sub_blocks != 1
+        || expected.symbol_alignment != 4
+    {
+        return Err(invalid("invalid raw bootstrap source geometry"));
+    }
+    let source_end = layout
+        .group_start
+        .0
+        .checked_add(u64::from(expected.source_block_count))
+        .ok_or_else(|| invalid("raw bootstrap source range overflows"))?;
+    if layout.group_end_exclusive() > storage.device.block_count()
+        || source_end > layout.validation_start_block().0
+    {
+        return Err(invalid("raw bootstrap exceeds source or device geometry"));
+    }
+    bucket_geometry(storage)?;
+    Ok(())
+}
+
+fn pending_record(
+    storage: &RepairGroupStorage<'_>,
+    descriptor: &RepairGroupDescExt,
+    block_size: usize,
+) -> Vec<u8> {
+    let mut pending = vec![0; block_size];
+    pending[..RepairGroupDescExt::SIZE].copy_from_slice(&descriptor.to_bytes());
+    pending[48..56].copy_from_slice(PENDING);
+    let checksum = record_hash(storage, &pending, TABLE_OFFSET);
+    pending[64..TABLE_OFFSET].copy_from_slice(&checksum);
+    pending
+}
+
+fn strict_record(
+    storage: &RepairGroupStorage<'_>,
+    expected: &RepairGroupDescExt,
+    bytes: Vec<u8>,
+) -> Result<Option<(Record, bool)>> {
+    if bytes.iter().all(|&byte| byte == 0) {
+        return Ok(None);
+    }
+    let descriptor = RepairGroupDescExt::parse(&bytes)
+        .map_err(|_| invalid("unknown or torn raw repair descriptor"))?;
+    let mut geometry = descriptor.clone();
+    geometry.repair_generation = 0;
+    geometry.checksum = 0;
+    if geometry.to_bytes() != expected.to_bytes() {
+        return Err(invalid(
+            "raw repair descriptor differs from expected geometry",
+        ));
+    }
+    if descriptor.repair_generation == 0 {
+        let mut bootstrap = vec![0; bytes.len()];
+        bootstrap[..RepairGroupDescExt::SIZE].copy_from_slice(&expected.to_bytes());
+        if bytes != bootstrap {
+            return Err(invalid("noncanonical raw bootstrap descriptor"));
+        }
+        return Ok(Some((Record { descriptor, bytes }, false)));
+    }
+    if bytes[48..56] == PENDING[..] {
+        if bytes != pending_record(storage, &descriptor, bytes.len()) {
+            return Err(invalid("noncanonical raw pending descriptor"));
+        }
+        return Ok(Some((Record { descriptor, bytes }, false)));
+    }
+    let manifest = decode_manifest(storage, Record { descriptor, bytes })?;
+    Ok(Some((manifest.record, true)))
+}
+
+pub(super) fn preflight_refresh(
+    storage: &RepairGroupStorage<'_>,
+    cx: &Cx,
+    expected: &RepairGroupDescExt,
+) -> Result<RawRefreshAdmission> {
+    checkpoint(cx)?;
+    validate_bootstrap(storage, expected)?;
+    let mut selected: Option<(Record, bool)> = None;
+    for slot in 0..2 {
+        checkpoint(cx)?;
+        let bytes = storage
+            .device
+            .read_block(cx, storage.descriptor_block(slot)?)?;
+        checkpoint(cx)?;
+        if bytes.len() != storage.block_size_usize()? {
+            return Err(invalid("short raw repair descriptor block"));
+        }
+        let Some((record, committed)) = strict_record(storage, expected, bytes.into_inner())?
+        else {
+            continue;
+        };
+        if let Some((previous, previous_committed)) = &selected {
+            let previous_generation = previous.descriptor.repair_generation;
+            let generation = record.descriptor.repair_generation;
+            if generation == previous_generation
+                && committed
+                && *previous_committed
+                && record.bytes != previous.bytes
+            {
+                return Err(invalid(
+                    "ambiguous integrity manifests for one repair generation",
+                ));
+            }
+            if generation < previous_generation
+                || (generation == previous_generation && *previous_committed)
+            {
+                continue;
+            }
+        }
+        selected = Some((record, committed));
+    }
+    checkpoint(cx)?;
+    let pristine = selected.is_none();
+    let (descriptor, committed) = selected.map_or_else(
+        || (expected.clone(), false),
+        |(record, committed)| (record.descriptor, committed),
+    );
+    let next_generation = descriptor
+        .repair_generation
+        .checked_add(1)
+        .ok_or_else(|| invalid("raw repair generation exhausted"))?;
+    Ok(RawRefreshAdmission {
+        descriptor,
+        pristine,
+        next_generation,
+        committed,
+    })
+}
+
 /// Preserve the seal when an existing committed descriptor is mirrored again.
 /// An arbitrary descriptor-only update never manufactures an integrity seal.
 pub(super) fn preserve_manifest(
@@ -351,7 +497,36 @@ pub(super) fn publish(
             "raw repair generation must increase, including after an interrupted refresh",
         ));
     }
-    let mut descriptor = current;
+    publish_admitted(storage, cx, symbols, current, generation)
+}
+
+pub(super) fn initialize(
+    storage: &RepairGroupStorage<'_>,
+    cx: &Cx,
+    expected: &RepairGroupDescExt,
+    symbols: &[(u32, Vec<u8>)],
+    generation: u64,
+) -> Result<()> {
+    checkpoint(cx)?;
+    if generation == 0 {
+        return Err(invalid("raw initialization generation must be positive"));
+    }
+    let admission = preflight_refresh(storage, cx, expected)?;
+    if !admission.pristine {
+        return Err(invalid(
+            "raw initialization requires two zero descriptor slots",
+        ));
+    }
+    publish_admitted(storage, cx, symbols, admission.descriptor, generation)
+}
+
+fn publish_admitted(
+    storage: &RepairGroupStorage<'_>,
+    cx: &Cx,
+    symbols: &[(u32, Vec<u8>)],
+    mut descriptor: RepairGroupDescExt,
+    generation: u64,
+) -> Result<()> {
     descriptor.repair_generation = generation;
     descriptor.checksum = 0;
     storage.validate_desc_layout(&descriptor)?;
@@ -400,11 +575,7 @@ pub(super) fn publish(
     }
     let checksum = record_hash(storage, &sealed, TABLE_OFFSET + count * HASH_BYTES);
     sealed[64..TABLE_OFFSET].copy_from_slice(&checksum);
-    let mut pending = vec![0; block_size];
-    pending[..RepairGroupDescExt::SIZE].copy_from_slice(&descriptor.to_bytes());
-    pending[48..56].copy_from_slice(PENDING);
-    let checksum = record_hash(storage, &pending, TABLE_OFFSET);
-    pending[64..TABLE_OFFSET].copy_from_slice(&checksum);
+    let pending = pending_record(storage, &descriptor, block_size);
     // Invalidation must reach BOTH durable slots before any in-place parity
     // overwrite. No older descriptor can survive this barrier as a fallback.
     for slot in 0..2 {
@@ -554,6 +725,446 @@ mod tests {
         (0..count)
             .map(|index| (8 + index, vec![salt.wrapping_add(index as u8); 256]))
             .collect()
+    }
+
+    fn pristine_fixture() -> (Device, RepairGroupLayout, RepairGroupDescExt) {
+        let device = Device::new(256);
+        let layout = RepairGroupLayout::new(GroupNumber(7), BlockNumber(0), 64, 1, 4).unwrap();
+        let bootstrap = RepairGroupDescExt {
+            transfer_length: 8 * 256,
+            symbol_size: 256,
+            source_block_count: 8,
+            sub_blocks: 1,
+            symbol_alignment: 4,
+            repair_start_block: layout.repair_start_block(),
+            repair_block_count: 4,
+            repair_generation: 0,
+            checksum: 0,
+        };
+        (device, layout, bootstrap)
+    }
+
+    #[test]
+    fn raw_strict_refresh_admits_pristine_bootstrap_and_committed_generation() {
+        let cx = Cx::for_testing();
+        let (device, layout, bootstrap) = pristine_fixture();
+        let storage = RepairGroupStorage::new(&device, layout);
+        let empty = storage.preflight_raw_refresh(&cx, &bootstrap).unwrap();
+        assert!(empty.pristine);
+        assert!(!empty.committed);
+        assert_eq!(empty.descriptor.to_bytes(), bootstrap.to_bytes());
+        assert_eq!(empty.next_generation, 1);
+        assert_eq!(device.0.lock().unwrap().events, 0);
+
+        storage.write_group_desc_ext(&cx, &bootstrap).unwrap();
+        let initialized = storage.preflight_raw_refresh(&cx, &bootstrap).unwrap();
+        assert!(!initialized.pristine);
+        assert!(!initialized.committed);
+        assert_eq!(initialized.next_generation, 1);
+        let expected = symbols(4, 27);
+        storage.write_repair_symbols(&cx, &expected, 7).unwrap();
+        let committed = storage.preflight_raw_refresh(&cx, &bootstrap).unwrap();
+        assert!(!committed.pristine);
+        assert!(committed.committed);
+        assert_eq!(committed.descriptor.repair_generation, 7);
+        assert_eq!(committed.next_generation, 8);
+
+        let (fresh_device, fresh_layout, fresh_bootstrap) = pristine_fixture();
+        let fresh = RepairGroupStorage::new(&fresh_device, fresh_layout);
+        fresh
+            .initialize_raw_repair_symbols(&cx, &fresh_bootstrap, &expected, 7)
+            .unwrap();
+        assert_eq!(fresh_device.0.lock().unwrap().events, 11);
+        assert_eq!(
+            device.0.lock().unwrap().durable,
+            fresh_device.0.lock().unwrap().durable,
+            "direct initialization must publish the same bytes without a bootstrap write"
+        );
+        fresh_device.crash();
+        let (descriptor, actual) = fresh.read_verified_raw_generation(&cx, false).unwrap();
+        assert_eq!(descriptor.repair_generation, 7);
+        assert_eq!(actual, expected);
+    }
+
+    #[test]
+    fn raw_strict_refresh_rejects_unknown_older_and_noncanonical_slots() {
+        for case in [
+            "torn",
+            "older geometry",
+            "pending checksum",
+            "pending reserved",
+            "pending trailing",
+            "unknown marker",
+            "bootstrap trailing",
+            "committed checksum",
+        ] {
+            let cx = Cx::for_testing();
+            let (device, layout, bootstrap) = pristine_fixture();
+            let storage = RepairGroupStorage::new(&device, layout);
+            storage
+                .initialize_raw_repair_symbols(&cx, &bootstrap, &symbols(4, 3), 7)
+                .unwrap();
+            let mut older = bootstrap.clone();
+            older.repair_generation = 3;
+            let mut bytes = pending_record(&storage, &older, 256);
+            let reason = match case {
+                "torn" => {
+                    bytes[0] ^= 1;
+                    "unknown or torn"
+                }
+                "older geometry" => {
+                    older.source_block_count = 9;
+                    older.transfer_length = 9 * 256;
+                    bytes = pending_record(&storage, &older, 256);
+                    "expected geometry"
+                }
+                "pending checksum" => {
+                    bytes[64] ^= 1;
+                    "noncanonical raw pending"
+                }
+                "pending reserved" => {
+                    bytes[56] = 1;
+                    let hash = record_hash(&storage, &bytes, TABLE_OFFSET);
+                    bytes[64..TABLE_OFFSET].copy_from_slice(&hash);
+                    "noncanonical raw pending"
+                }
+                "pending trailing" => {
+                    bytes[TABLE_OFFSET] = 1;
+                    "noncanonical raw pending"
+                }
+                "unknown marker" => {
+                    bytes[48] = b'?';
+                    "no committed integrity manifest"
+                }
+                "bootstrap trailing" => {
+                    bytes.fill(0);
+                    bytes[..RepairGroupDescExt::SIZE].copy_from_slice(&bootstrap.to_bytes());
+                    bytes[255] = 1;
+                    "noncanonical raw bootstrap"
+                }
+                "committed checksum" => {
+                    bytes = device
+                        .read_block(&cx, layout.descriptor_blocks()[0])
+                        .unwrap()
+                        .into_inner();
+                    bytes[TABLE_OFFSET] ^= 1;
+                    "manifest checksum or geometry"
+                }
+                _ => unreachable!(),
+            };
+            device
+                .write_block(&cx, layout.descriptor_blocks()[0], &bytes)
+                .unwrap();
+            let before = device.0.lock().unwrap().live.clone();
+            let events = device.0.lock().unwrap().events;
+            let error = storage.preflight_raw_refresh(&cx, &bootstrap).unwrap_err();
+            assert!(error.to_string().contains(reason), "{case}: {error}");
+            assert_eq!(device.0.lock().unwrap().live, before, "{case}");
+            assert_eq!(device.0.lock().unwrap().events, events, "{case}");
+            assert_eq!(
+                storage
+                    .read_refresh_descriptor(&cx)
+                    .unwrap()
+                    .repair_generation,
+                7,
+                "existing tolerant high-water behavior stays unchanged: {case}"
+            );
+        }
+    }
+
+    #[test]
+    fn raw_strict_refresh_detects_ambiguous_manifests_and_generation_exhaustion() {
+        let cx = Cx::for_testing();
+        let (device, layout, bootstrap) = pristine_fixture();
+        let storage = RepairGroupStorage::new(&device, layout);
+        storage
+            .initialize_raw_repair_symbols(&cx, &bootstrap, &symbols(4, 3), 7)
+            .unwrap();
+        let (other_device, other_layout, other_bootstrap) = pristine_fixture();
+        RepairGroupStorage::new(&other_device, other_layout)
+            .initialize_raw_repair_symbols(&cx, &other_bootstrap, &symbols(4, 99), 7)
+            .unwrap();
+        let different = other_device
+            .read_block(&cx, other_layout.descriptor_blocks()[0])
+            .unwrap();
+        device
+            .write_block(&cx, layout.descriptor_blocks()[0], different.as_slice())
+            .unwrap();
+        let before = device.0.lock().unwrap().live.clone();
+        assert!(
+            storage
+                .preflight_raw_refresh(&cx, &bootstrap)
+                .unwrap_err()
+                .to_string()
+                .contains("ambiguous integrity manifests")
+        );
+        assert_eq!(device.0.lock().unwrap().live, before);
+
+        let (last_device, last_layout, last_bootstrap) = pristine_fixture();
+        let last = RepairGroupStorage::new(&last_device, last_layout);
+        last.initialize_raw_repair_symbols(&cx, &last_bootstrap, &symbols(4, 3), u64::MAX)
+            .unwrap();
+        let before = last_device.0.lock().unwrap().live.clone();
+        assert!(
+            last.preflight_raw_refresh(&cx, &last_bootstrap)
+                .unwrap_err()
+                .to_string()
+                .contains("generation exhausted")
+        );
+        assert_eq!(last_device.0.lock().unwrap().live, before);
+    }
+
+    #[test]
+    fn raw_strict_initialization_pending_retry_keeps_explicit_high_water() {
+        let cx = Cx::for_testing();
+        let (device, layout, bootstrap) = pristine_fixture();
+        let storage = RepairGroupStorage::new(&device, layout);
+        device.0.lock().unwrap().fail_at = Some(0);
+        let expected = symbols(4, 19);
+        assert!(
+            storage
+                .initialize_raw_repair_symbols(&cx, &bootstrap, &expected, 9)
+                .is_err()
+        );
+        device.crash();
+        assert!(
+            storage
+                .preflight_raw_refresh(&cx, &bootstrap)
+                .unwrap()
+                .pristine
+        );
+        // The caller's ownership record supplies the next generation even if
+        // neither zero descriptor was changed by the failed first publication.
+        {
+            let mut state = device.0.lock().unwrap();
+            state.events = 0;
+            state.fail_at = Some(3);
+        }
+        assert!(
+            storage
+                .initialize_raw_repair_symbols(&cx, &bootstrap, &expected, 10)
+                .is_err()
+        );
+        device.crash();
+        let pending = storage.preflight_raw_refresh(&cx, &bootstrap).unwrap();
+        assert!(!pending.pristine);
+        assert!(!pending.committed);
+        assert_eq!(pending.descriptor.repair_generation, 10);
+        assert_eq!(pending.next_generation, 11);
+        assert!(storage.read_verified_raw_generation(&cx, false).is_err());
+        let before = device.0.lock().unwrap().live.clone();
+        let events = device.0.lock().unwrap().events;
+        assert!(
+            storage
+                .initialize_raw_repair_symbols(&cx, &bootstrap, &expected, 11)
+                .is_err()
+        );
+        assert!(storage.write_repair_symbols(&cx, &expected, 10).is_err());
+        assert_eq!(device.0.lock().unwrap().live, before);
+        assert_eq!(device.0.lock().unwrap().events, events);
+        storage
+            .write_repair_symbols(&cx, &expected, pending.next_generation)
+            .unwrap();
+        device.crash();
+        let (descriptor, actual) = storage.read_verified_raw_generation(&cx, false).unwrap();
+        assert_eq!(descriptor.repair_generation, 11);
+        assert_eq!(actual, expected);
+        assert!(
+            storage
+                .preflight_raw_refresh(&cx, &bootstrap)
+                .unwrap()
+                .committed
+        );
+    }
+
+    #[test]
+    fn raw_strict_initialization_refuses_invalid_inputs_before_any_write() {
+        let cx = Cx::for_testing();
+        let (device, layout, bootstrap) = pristine_fixture();
+        let storage = RepairGroupStorage::new(&device, layout);
+        let before = device.0.lock().unwrap().live.clone();
+        let expected = symbols(4, 3);
+        assert!(
+            storage
+                .initialize_raw_repair_symbols(&cx, &bootstrap, &expected, 0)
+                .is_err()
+        );
+        assert!(
+            storage
+                .initialize_raw_repair_symbols(&cx, &bootstrap, &symbols(5, 3), 1)
+                .is_err()
+        );
+        let mut short = expected.clone();
+        short[3].1.pop();
+        assert!(
+            storage
+                .initialize_raw_repair_symbols(&cx, &bootstrap, &short, 1)
+                .is_err()
+        );
+        let mut wrong_esi = expected.clone();
+        wrong_esi[3].0 += 1;
+        assert!(
+            storage
+                .initialize_raw_repair_symbols(&cx, &bootstrap, &wrong_esi, 1)
+                .is_err()
+        );
+        for case in [
+            "generation",
+            "transfer",
+            "symbol",
+            "source",
+            "sub-blocks",
+            "alignment",
+        ] {
+            let mut bad = bootstrap.clone();
+            match case {
+                "generation" => bad.repair_generation = 1,
+                "transfer" => bad.transfer_length += 1,
+                "symbol" => bad.symbol_size -= 1,
+                "source" => {
+                    bad.source_block_count = 63;
+                    bad.transfer_length = 63 * 256;
+                }
+                "sub-blocks" => bad.sub_blocks = 2,
+                "alignment" => bad.symbol_alignment = 8,
+                _ => unreachable!(),
+            }
+            assert!(
+                storage
+                    .initialize_raw_repair_symbols(&cx, &bad, &expected, 1)
+                    .is_err(),
+                "{case}"
+            );
+        }
+        let beyond_device =
+            RepairGroupLayout::new(GroupNumber(7), BlockNumber(0), 65, 1, 4).unwrap();
+        let mut bad = bootstrap.clone();
+        bad.repair_start_block = beyond_device.repair_start_block();
+        assert!(
+            RepairGroupStorage::new(&device, beyond_device)
+                .initialize_raw_repair_symbols(&cx, &bad, &expected, 1)
+                .is_err()
+        );
+        cx.set_cancel_requested(true);
+        assert!(matches!(
+            storage.initialize_raw_repair_symbols(&cx, &bootstrap, &expected, 1),
+            Err(FfsError::Cancelled)
+        ));
+        assert_eq!(device.0.lock().unwrap().live, before);
+        assert_eq!(device.0.lock().unwrap().events, 0);
+    }
+
+    #[test]
+    fn raw_strict_refresh_accepts_only_canonical_interrupted_publication_states() {
+        for fail_at in [1, 9] {
+            let cx = Cx::for_testing();
+            let (device, layout, bootstrap) = pristine_fixture();
+            let storage = RepairGroupStorage::new(&device, layout);
+            {
+                let mut state = device.0.lock().unwrap();
+                state.persist_writes = true;
+                state.fail_at = Some(fail_at);
+            }
+            let expected = symbols(4, 51);
+            assert!(
+                storage
+                    .initialize_raw_repair_symbols(&cx, &bootstrap, &expected, 23)
+                    .is_err()
+            );
+            device.crash();
+            let admission = storage.preflight_raw_refresh(&cx, &bootstrap).unwrap();
+            assert!(!admission.pristine);
+            assert_eq!(admission.descriptor.repair_generation, 23);
+            assert_eq!(admission.next_generation, 24);
+            assert_eq!(admission.committed, fail_at == 9);
+            // Cut 1 leaves one canonical pending slot and one zero slot. Cut 9
+            // leaves one committed copy and one pending copy of the same generation.
+            if fail_at == 1 {
+                assert!(storage.read_verified_raw_generation(&cx, false).is_err());
+            } else {
+                assert_eq!(
+                    storage.read_verified_raw_generation(&cx, false).unwrap().1,
+                    expected
+                );
+            }
+            let mut state = device.0.lock().unwrap();
+            state.live.swap(62, 63);
+            drop(state);
+            assert_eq!(
+                storage.preflight_raw_refresh(&cx, &bootstrap).unwrap(),
+                admission,
+                "slot ordering must not change the admitted generation"
+            );
+        }
+    }
+
+    struct DescriptorReadFault<'a> {
+        device: &'a Device,
+        block: BlockNumber,
+        short: bool,
+    }
+
+    impl BlockDevice for DescriptorReadFault<'_> {
+        fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
+            if block == self.block {
+                if self.short {
+                    return Ok(BlockBuf::zeroed(255));
+                }
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "planted descriptor read refusal",
+                )
+                .into());
+            }
+            self.device.read_block(cx, block)
+        }
+
+        fn write_block(&self, cx: &Cx, block: BlockNumber, bytes: &[u8]) -> Result<()> {
+            self.device.write_block(cx, block, bytes)
+        }
+
+        fn block_size(&self) -> u32 {
+            self.device.block_size()
+        }
+
+        fn block_count(&self) -> u64 {
+            self.device.block_count()
+        }
+
+        fn sync(&self, cx: &Cx) -> Result<()> {
+            self.device.sync(cx)
+        }
+    }
+
+    #[test]
+    fn raw_strict_refresh_never_treats_unreadable_or_short_slots_as_zero() {
+        let cx = Cx::for_testing();
+        let (device, layout, bootstrap) = pristine_fixture();
+        let before = device.0.lock().unwrap().live.clone();
+        for short in [false, true] {
+            let fault = DescriptorReadFault {
+                device: &device,
+                block: layout.descriptor_blocks()[1],
+                short,
+            };
+            let storage = RepairGroupStorage::new(&fault, layout);
+            for error in [
+                storage.preflight_raw_refresh(&cx, &bootstrap).unwrap_err(),
+                storage
+                    .initialize_raw_repair_symbols(&cx, &bootstrap, &symbols(4, 3), 1)
+                    .unwrap_err(),
+            ] {
+                if short {
+                    assert!(error.to_string().contains("short raw repair descriptor"));
+                } else {
+                    assert!(
+                        matches!(error, FfsError::Io(error) if error.kind() == std::io::ErrorKind::PermissionDenied)
+                    );
+                }
+            }
+        }
+        assert_eq!(device.0.lock().unwrap().live, before);
+        assert_eq!(device.0.lock().unwrap().events, 0);
     }
 
     #[test]

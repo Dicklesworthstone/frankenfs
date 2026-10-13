@@ -11,6 +11,13 @@ use super::{
     Serialize, SingleLockDirAlloc, TransactionBlockAdapter, debug,
     ext4_superblock_requires_journal_recovery, parse_extent_tree, parse_to_ffs_error,
 };
+use asupersync::sync::OnceCell;
+use ffs_block::BlockBuf;
+use ffs_repair::codec::{DirectEncodeRequest, direct_encode_workspace_bytes, encode_group_direct};
+use ffs_repair::recovery::{GroupRecoveryOrchestrator, RecoveryWriteback, RecoveryWritebackBlock};
+use ffs_repair::scrub::{BlockValidator, BlockVerdict, CorruptionKind, Severity};
+use ffs_repair::storage::{RawRefreshAdmission, RepairGroupLayout, RepairGroupStorage};
+use ffs_repair::symbol::RepairGroupDescExt;
 
 const OWNER_NAME: &str = ".frankenfs-repair";
 const OWNER_MAGIC: &[u8; 8] = b"FFSNAT01";
@@ -25,6 +32,9 @@ const PLAN_PREPARED: u32 = 3;
 const PLAN_MAGIC: &[u8; 8] = b"FFSPLN01";
 const PLAN_HEADER_START: usize = OWNER_HEADER_BYTES + VALIDATION_HEADER_BYTES;
 const PLAN_HEADER_END: usize = PLAN_HEADER_START + VALIDATION_HEADER_BYTES;
+const PARITY_MAGIC: &[u8; 8] = b"FFSRPR01";
+const PARITY_HEADER_START: usize = PLAN_HEADER_END;
+const PARITY_HEADER_END: usize = PARITY_HEADER_START + VALIDATION_HEADER_BYTES;
 
 /// An ext4 allocation group's owned native repair tail.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -61,6 +71,62 @@ pub struct NativeValidationReport {
     pub owner_inode: InodeNumber,
     pub groups: u32,
     pub source_blocks: u64,
+}
+
+/// Complete offline parity checked against the immutable native baseline.
+/// Does not authorize mounted repair or establish freshness after later writes.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NativeRepairReport {
+    pub owner_inode: InodeNumber,
+    pub groups: u32,
+    pub source_blocks: u64,
+    pub repair_blocks: u64,
+    pub generations: Vec<u64>,
+}
+
+/// A reconstructed block from the sealed baseline, without image writeback.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NativeReconstruction {
+    pub block: BlockNumber,
+    pub generation: u64,
+    pub data: Vec<u8>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ParityIntent {
+    Prepared,
+    Pending { generation: u64, source_root: [u8; 32] },
+    Sealed { generation: u64, source_root: [u8; 32], manifest: [u8; 32] },
+}
+
+impl ParityIntent {
+    fn generation(self) -> u64 {
+        match self {
+            Self::Prepared => 0,
+            Self::Pending { generation, .. } | Self::Sealed { generation, .. } => generation,
+        }
+    }
+
+    fn source_root(self) -> [u8; 32] {
+        match self {
+            Self::Prepared => [0; 32],
+            Self::Pending { source_root, .. } | Self::Sealed { source_root, .. } => source_root,
+        }
+    }
+}
+
+struct NativeBaseline {
+    storage: NativeRepairStorage,
+    owner_generation: u32,
+    plan_root: [u8; 32],
+    roots: Vec<[u8; 32]>,
+}
+
+struct NativeGroupAdmission {
+    intent: ParityIntent,
+    raw: RawRefreshAdmission,
+    retained: bool,
+    codec_budget: u64,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -328,6 +394,22 @@ fn build_validation_table(
     Ok(table)
 }
 
+fn verify_validation_table_integrity(
+    sb: &Ext4Superblock,
+    tail: &NativeRepairTail,
+    table: &[u8],
+    root: &[u8; 32],
+) -> Result<(), FfsError> {
+    let (_, capacity, used) = validation_sizes(sb, tail)?;
+    if table.len() != capacity
+        || &validation_root(table, used) != root
+        || table[used..].iter().any(|byte| *byte != 0)
+    {
+        return Err(validation_error(tail, "digest table integrity mismatch"));
+    }
+    Ok(())
+}
+
 fn verify_validation_table(
     cx: &Cx,
     dev: &dyn BlockDevice,
@@ -336,13 +418,8 @@ fn verify_validation_table(
     table: &[u8],
     root: &[u8; 32],
 ) -> Result<(), FfsError> {
-    let (sources, capacity, used) = validation_sizes(sb, tail)?;
-    if table.len() != capacity
-        || &validation_root(table, used) != root
-        || table[used..].iter().any(|byte| *byte != 0)
-    {
-        return Err(validation_error(tail, "digest table integrity mismatch"));
-    }
+    verify_validation_table_integrity(sb, tail, table, root)?;
+    let (sources, _, _) = validation_sizes(sb, tail)?;
     for index in 0..sources {
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let number = BlockNumber(tail.group_start.0 + u64::from(index));
@@ -356,6 +433,246 @@ fn verify_validation_table(
         }
     }
     Ok(())
+}
+
+fn parity_header(
+    sb: &Ext4Superblock,
+    storage: &NativeRepairStorage,
+    owner_generation: u32,
+    tail: &NativeRepairTail,
+    intent: ParityIntent,
+) -> [u8; VALIDATION_HEADER_BYTES] {
+    let mut bytes = [0; VALIDATION_HEADER_BYTES];
+    bytes[..8].copy_from_slice(PARITY_MAGIC);
+    bytes[8..24].copy_from_slice(&sb.uuid);
+    bytes[24..32].copy_from_slice(&storage.owner_inode.0.to_le_bytes());
+    bytes[32..36].copy_from_slice(&owner_generation.to_le_bytes());
+    bytes[36..40].copy_from_slice(&tail.group.0.to_le_bytes());
+    bytes[40..48].copy_from_slice(&intent.generation().to_le_bytes());
+    bytes[48..80].copy_from_slice(&intent.source_root());
+    let state = match intent {
+        ParityIntent::Prepared => PLAN_PREPARED,
+        ParityIntent::Pending { .. } => VALIDATION_PENDING,
+        ParityIntent::Sealed { manifest, .. } => {
+            bytes[80..112].copy_from_slice(&manifest);
+            VALIDATION_SEALED
+        }
+    };
+    bytes[112..116].copy_from_slice(&state.to_le_bytes());
+    let checksum = ffs_ondisk::ext4::ext4_chksum(!0, &bytes[..116]);
+    bytes[116..120].copy_from_slice(&checksum.to_le_bytes());
+    bytes
+}
+
+fn parity_intent(
+    bytes: &[u8],
+    sb: &Ext4Superblock,
+    storage: &NativeRepairStorage,
+    owner_generation: u32,
+    tail: &NativeRepairTail,
+) -> Result<ParityIntent, FfsError> {
+    if bytes.len() != VALIDATION_HEADER_BYTES {
+        return Err(validation_error(tail, "native parity record length mismatch"));
+    }
+    let generation = u64::from_le_bytes(bytes[40..48].try_into().expect("fixed record"));
+    let source_root = bytes[48..80].try_into().expect("fixed record");
+    let state = u32::from_le_bytes(bytes[112..116].try_into().expect("fixed record"));
+    let intent = match state {
+        PLAN_PREPARED if generation == 0 => ParityIntent::Prepared,
+        VALIDATION_PENDING if generation > 0 => ParityIntent::Pending { generation, source_root },
+        VALIDATION_SEALED if generation > 0 => ParityIntent::Sealed {
+            generation,
+            source_root,
+            manifest: bytes[80..112].try_into().expect("fixed record"),
+        },
+        _ => return Err(validation_error(tail, "native parity record missing or invalid state")),
+    };
+    if bytes != parity_header(sb, storage, owner_generation, tail, intent) {
+        return Err(validation_error(tail, "native parity record identity or checksum mismatch"));
+    }
+    Ok(intent)
+}
+
+fn native_layout(sb: &Ext4Superblock, tail: &NativeRepairTail) -> Result<(RepairGroupLayout, RepairGroupDescExt), FfsError> {
+    let (sources, _, _) = validation_sizes(sb, tail)?;
+    let layout = RepairGroupLayout::new(tail.group, tail.group_start, tail.blocks_per_group,
+        tail.validation_blocks.checked_add(1).ok_or_else(|| validation_error(tail, "validation span overflows"))?, tail.repair_blocks)?;
+    if layout.validation_start_block() != tail.start {
+        return Err(validation_error(tail, "native layout includes owned metadata in sources"));
+    }
+    let descriptor = RepairGroupDescExt {
+        transfer_length: u64::from(sources) * u64::from(sb.block_size),
+        symbol_size: u16::try_from(sb.block_size).map_err(|_| validation_error(tail, "native symbol size exceeds u16"))?,
+        source_block_count: u16::try_from(sources).map_err(|_| validation_error(tail, "native source count exceeds u16"))?,
+        sub_blocks: 1,
+        symbol_alignment: 4,
+        repair_start_block: layout.repair_start_block(),
+        repair_block_count: tail.repair_blocks,
+        repair_generation: 0,
+        checksum: 0,
+    };
+    Ok((layout, descriptor))
+}
+
+fn read_sealed_table(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    sb: &Ext4Superblock,
+    storage: &NativeRepairStorage,
+    generation: u32,
+    tail: &NativeRepairTail,
+) -> Result<([u8; 32], Vec<u8>), FfsError> {
+    let owner = dev.read_block(cx, tail.start)?;
+    let intent = validation_intent(&owner.as_slice()[OWNER_HEADER_BYTES..PLAN_HEADER_START], sb, storage.owner_inode, generation, tail)?;
+    let ValidationIntent::Sealed(root) = intent else {
+        return Err(validation_error(tail, "validation is uninitialized or pending"));
+    };
+    let table = read_validation_table(cx, dev, sb, tail)?;
+    if validation_intent(&table[..VALIDATION_HEADER_BYTES], sb, storage.owner_inode, generation, tail)? != intent {
+        return Err(validation_error(tail, "sealed intent and table disagree"));
+    }
+    verify_validation_table_integrity(sb, tail, &table, &root)?;
+    Ok((root, table))
+}
+
+fn read_native_baseline(fs: &OpenFs, cx: &Cx) -> Result<NativeBaseline, FfsError> {
+    let storage = fs.native_ext4_repair_storage(cx)?;
+    let sb = fs.ext4_superblock().expect("validated native ownership");
+    let generation = fs.read_native_owner_inode(cx, sb, storage.owner_inode)?.generation;
+    let dev = ByteDeviceBlockAdapter { dev: fs.dev.as_ref(), block_size: sb.block_size };
+    let owner = dev.read_block(cx, storage.tails[0].start)?;
+    let plan = validation_plan_intent(&owner.as_slice()[PLAN_HEADER_START..PLAN_HEADER_END], sb, &storage, generation)?;
+    let ValidationIntent::Sealed(plan_root) = plan else {
+        return Err(validation_error(&storage.tails[0], "whole-plan validation is uninitialized or pending"));
+    };
+    let mut admissions = Vec::with_capacity(storage.tails.len());
+    for tail in &storage.tails {
+        let (root, _) = read_sealed_table(cx, &dev, sb, &storage, generation, tail)?;
+        admissions.push(ValidationAdmission { root, intent: ValidationIntent::Sealed(root) });
+    }
+    if validation_plan_root(sb, &storage, generation, &admissions)? != plan_root {
+        return Err(validation_error(&storage.tails[0], "sealed whole-plan root mismatch"));
+    }
+    Ok(NativeBaseline { storage, owner_generation: generation, plan_root, roots: admissions.into_iter().map(|group| group.root).collect() })
+}
+
+fn read_native_parity_intent(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    sb: &Ext4Superblock,
+    baseline: &NativeBaseline,
+    tail: &NativeRepairTail,
+) -> Result<ParityIntent, FfsError> {
+    let owner = dev.read_block(cx, tail.start)?;
+    let intent = parity_intent(&owner.as_slice()[PARITY_HEADER_START..PARITY_HEADER_END], sb, &baseline.storage, baseline.owner_generation, tail)?;
+    if intent != ParityIntent::Prepared && intent.source_root() != baseline.roots[tail.group.0 as usize] {
+        return Err(validation_error(tail, "native parity binds a different source baseline"));
+    }
+    Ok(intent)
+}
+
+fn write_native_parity_intent(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    sb: &Ext4Superblock,
+    baseline: &NativeBaseline,
+    tail: &NativeRepairTail,
+    intent: ParityIntent,
+) -> Result<(), FfsError> {
+    let mut owner = dev.read_block(cx, tail.start)?.into_inner();
+    owner[PARITY_HEADER_START..PARITY_HEADER_END].copy_from_slice(&parity_header(sb, &baseline.storage, baseline.owner_generation, tail, intent));
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+    dev.write_block(cx, tail.start, &owner)?;
+    dev.sync(cx)
+}
+
+fn native_manifest(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    layout: RepairGroupLayout,
+    expected_generation: u64,
+) -> Result<[u8; 32], FfsError> {
+    let mut selected = None;
+    for number in layout.descriptor_blocks() {
+        let block = dev.read_block(cx, number)?;
+        if let Ok(desc) = RepairGroupDescExt::parse(block.as_slice())
+            && desc.repair_generation == expected_generation
+            && &block.as_slice()[48..56] == b"RQHASH01"
+        {
+            let digest: [u8; 32] = block.as_slice()[64..96].try_into().expect("full descriptor block");
+            if selected.is_some_and(|previous| previous != digest) {
+                return Err(FfsError::RepairFailed("ambiguous native manifest digests".into()));
+            }
+            selected = Some(digest);
+        }
+    }
+    selected.ok_or_else(|| FfsError::RepairFailed("native committed manifest missing".into()))
+}
+
+struct NativeDigestDevice<'a> {
+    dev: &'a dyn BlockDevice,
+    tail: &'a NativeRepairTail,
+    table: &'a [u8],
+    corrupt: &'a [u32],
+}
+
+impl BlockDevice for NativeDigestDevice<'_> {
+    fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf, FfsError> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        if block.0 < self.tail.group_start.0 || block.0 >= self.tail.group_start.0 + u64::from(self.tail.blocks_per_group) {
+            return Err(validation_error(self.tail, "codec read outside admitted native group"));
+        }
+        let bytes = self.dev.read_block(cx, block)?;
+        if block.0 < self.tail.start.0 {
+            let index = u32::try_from(block.0 - self.tail.group_start.0).expect("bounded native group");
+            let offset = VALIDATION_HEADER_BYTES + index as usize * 32;
+            if !self.corrupt.contains(&index) && (bytes.len() != self.block_size() as usize || blake3::hash(bytes.as_slice()).as_bytes() != &self.table[offset..offset + 32]) {
+                return Err(FfsError::Corruption { block: block.0, detail: "native codec input differs from sealed source digest".into() });
+            }
+        }
+        Ok(bytes)
+    }
+    fn write_block(&self, _cx: &Cx, _block: BlockNumber, _data: &[u8]) -> Result<(), FfsError> {
+        Err(FfsError::RepairFailed("native codec view is read-only".into()))
+    }
+    fn block_size(&self) -> u32 { self.dev.block_size() }
+    fn block_count(&self) -> u64 { self.dev.block_count() }
+    fn sync(&self, _cx: &Cx) -> Result<(), FfsError> {
+        Err(FfsError::RepairFailed("native codec view cannot sync input".into()))
+    }
+}
+
+impl BlockValidator for NativeDigestDevice<'_> {
+    fn validate(&self, block: BlockNumber, data: &BlockBuf) -> BlockVerdict {
+        let index = block.0.checked_sub(self.tail.group_start.0);
+        if let Some(index) = index.filter(|_| block.0 < self.tail.start.0) {
+            let offset = VALIDATION_HEADER_BYTES + index as usize * 32;
+            if data.len() == self.block_size() as usize && blake3::hash(data.as_slice()).as_bytes() == &self.table[offset..offset + 32] {
+                return BlockVerdict::Clean;
+            }
+        }
+        BlockVerdict::Corrupt(vec![(CorruptionKind::ChecksumMismatch, Severity::Error, "reconstructed bytes differ from the sealed native baseline".into())])
+    }
+}
+
+#[derive(Debug)]
+struct NativeReconstructionCapture {
+    blocks: OnceCell<Vec<(BlockNumber, Vec<u8>)>>,
+}
+
+impl RecoveryWriteback for NativeReconstructionCapture {
+    fn writeback_recovered(&self, cx: &Cx, device: &dyn BlockDevice, blocks: &[RecoveryWritebackBlock<'_>]) -> Result<(), FfsError> {
+        let mut captured = Vec::with_capacity(blocks.len());
+        for block in blocks {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            if device.read_block(cx, block.block)?.as_slice() != block.expected_current {
+                return Err(FfsError::RepairFailed("native reconstruction target changed during decode".into()));
+            }
+            captured.push((block.block, block.data.to_vec()));
+        }
+        self.blocks.set(captured).map_err(|_| FfsError::RepairFailed("native reconstruction capture repeated".into()))
+    }
+    fn authority_name(&self) -> &'static str { "native-read-only-baseline-reconstruction" }
 }
 
 fn native_validation_report(

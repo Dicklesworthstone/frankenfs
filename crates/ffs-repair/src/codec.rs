@@ -73,6 +73,263 @@ pub struct EncodedGroup {
     pub repair_symbols: Vec<EmittedSymbol>,
 }
 
+/// One bounded direct encoding operation over an admitted source range.
+#[derive(Debug, Clone, Copy)]
+pub struct DirectEncodeRequest {
+    /// Group identity used for deterministic encoding.
+    pub group: GroupNumber,
+    /// First source block on the device.
+    pub first_block: BlockNumber,
+    /// Number of complete source blocks.
+    pub source_block_count: u32,
+    /// Number of repair symbols to produce.
+    pub repair_count: u32,
+    /// Maximum estimated encoder working allocation, including its margin.
+    pub max_working_bytes: u64,
+}
+
+fn direct_encode_parameters(
+    source_block_count: u32,
+    block_size: u32,
+    repair_count: u32,
+) -> Result<SystematicParams> {
+    if block_size == 0 || block_size > u32::from(u16::MAX) || repair_count == 0 {
+        return Err(FfsError::RepairFailed(
+            "direct encode requires a nonzero u16 symbol size and nonzero repair count".to_owned(),
+        ));
+    }
+    let source_count = usize::try_from(source_block_count)
+        .map_err(|_| FfsError::RepairFailed("direct source count exceeds usize".to_owned()))?;
+    let symbol_size = usize::try_from(block_size)
+        .map_err(|_| FfsError::RepairFailed("direct symbol size exceeds usize".to_owned()))?;
+    let params = SystematicParams::try_for_source_block(source_count, symbol_size)
+        .map_err(|error| FfsError::RepairFailed(format!("direct encode parameters: {error:?}")))?;
+    let extended_count = u32::try_from(params.k_prime).map_err(|_| {
+        FfsError::RepairFailed("direct extended source count exceeds u32".to_owned())
+    })?;
+    extended_count
+        .checked_add(repair_count - 1)
+        .ok_or_else(|| {
+            FfsError::RepairFailed("direct repair ISI range overflows u32".to_owned())
+        })?;
+    usize::try_from(repair_count)
+        .map_err(|_| FfsError::RepairFailed("direct repair count exceeds usize".to_owned()))?;
+    Ok(params)
+}
+
+fn direct_workspace_sum(values: &[u64]) -> Result<u64> {
+    values.iter().try_fold(0_u64, |sum, value| {
+        sum.checked_add(*value)
+            .ok_or_else(|| FfsError::RepairFailed("direct workspace size overflow".to_owned()))
+    })
+}
+
+fn direct_workspace_product(count: u64, bytes: u64) -> Result<u64> {
+    count
+        .checked_mul(bytes)
+        .ok_or_else(|| FfsError::RepairFailed("direct workspace size overflow".to_owned()))
+}
+
+/// Estimate the peak allocation for the pinned direct systematic encoder.
+///
+/// This accounts for asupersync 0.5.0's dense matrix and solve copy, three
+/// simultaneous RHS/result arrays, retained sources, HDPC scratch, vector
+/// headers, pivots, and repair output. The maximum of construction, solving,
+/// encoder retention, source reading, and one-at-a-time emission receives a
+/// 25% margin plus 64 KiB for allocation bookkeeping and small temporaries.
+/// Device-owned buffers, caller-owned validation records, allocator retention,
+/// and unrelated tasks are outside this estimate: it is not a process-RSS cap.
+/// Revisit this accounting when upgrading the encoder implementation.
+///
+/// # Errors
+/// Rejects unsupported RFC parameters, unrepresentable symbol geometry or ESI
+/// ranges, zero counts/sizes, and arithmetic overflow before any source I/O.
+pub fn direct_encode_workspace_bytes(
+    source_block_count: u32,
+    block_size: u32,
+    repair_count: u32,
+) -> Result<u64> {
+    let params = direct_encode_parameters(source_block_count, block_size, repair_count)?;
+    let intermediate_count = u64::try_from(params.l)
+        .map_err(|_| FfsError::RepairFailed("direct intermediate count exceeds u64".to_owned()))?;
+    let hdpc_count = u64::try_from(params.h)
+        .map_err(|_| FfsError::RepairFailed("direct HDPC count exceeds u64".to_owned()))?;
+    let non_hdpc_count = intermediate_count.checked_sub(hdpc_count).ok_or_else(|| {
+        FfsError::RepairFailed("direct HDPC geometry exceeds intermediate count".to_owned())
+    })?;
+    let symbol_size = u64::from(block_size);
+    let vector_bytes = size_of::<Vec<u8>>() as u64;
+    let index_bytes = size_of::<usize>() as u64;
+    let emitted_bytes = size_of::<EmittedSymbol>() as u64;
+    let row_bytes = direct_workspace_sum(&[symbol_size, vector_bytes])?;
+    let source_rows = direct_workspace_product(u64::from(source_block_count), row_bytes)?;
+    let intermediate_rows = direct_workspace_product(intermediate_count, row_bytes)?;
+    let matrix = direct_workspace_product(intermediate_count, intermediate_count)?;
+
+    // Gf256 is repr(transparent) over u8. Construction's HDPC buffer is
+    // H*(K'+S); temporary LT indices cannot exceed the L-column domain.
+    let construction = direct_workspace_sum(&[
+        source_rows,
+        matrix,
+        direct_workspace_product(
+            hdpc_count,
+            direct_workspace_sum(&[non_hdpc_count, vector_bytes])?,
+        )?,
+        direct_workspace_product(intermediate_count, index_bytes)?,
+    ])?;
+    let solving = direct_workspace_sum(&[
+        source_rows,
+        direct_workspace_product(2, matrix)?,
+        direct_workspace_product(3, intermediate_rows)?,
+        direct_workspace_product(
+            intermediate_count,
+            direct_workspace_sum(&[index_bytes, 3 * size_of::<bool>() as u64])?,
+        )?,
+    ])?;
+    // new() clones the caller's sources while its original matrix and RHS
+    // still exist. The solve's working copy has already been released.
+    let retention = direct_workspace_sum(&[
+        direct_workspace_product(2, source_rows)?,
+        matrix,
+        direct_workspace_product(2, intermediate_rows)?,
+    ])?;
+    // Caller source rows are dropped before emitting. Allow an additional
+    // single-symbol batch and its temporary buffer alongside the full output.
+    let emission = direct_workspace_sum(&[
+        source_rows,
+        intermediate_rows,
+        direct_workspace_product(
+            u64::from(repair_count),
+            direct_workspace_sum(&[symbol_size, emitted_bytes])?,
+        )?,
+        direct_workspace_product(2, direct_workspace_sum(&[symbol_size, emitted_bytes])?)?,
+    ])?;
+    let reading = direct_workspace_sum(&[source_rows, direct_workspace_product(2, symbol_size)?])?;
+    let peak = construction
+        .max(solving)
+        .max(retention)
+        .max(emission)
+        .max(reading);
+    direct_workspace_sum(&[peak, peak.div_ceil(4), 64 * 1024])
+}
+
+/// Encode directly from source data without the global coefficient cache.
+///
+/// Admits parameters, device bounds, and the working allocation estimate before
+/// reading sources. Reads must return complete rows. Cancellation is checked
+/// around each read, around the solve, and for each emitted symbol. The pinned
+/// synchronous solve itself has no cancellation checkpoint.
+///
+/// This does not validate source digests or establish freshness; native callers
+/// must provide that authority for the exact source bytes read by this device.
+///
+/// # Errors
+/// Returns an error for invalid geometry, insufficient working budget, malformed
+/// source rows, device failures, cancellation, or unsuccessful encoding.
+pub fn encode_group_direct(
+    cx: &Cx,
+    device: &dyn BlockDevice,
+    fs_uuid: &[u8; 16],
+    request: DirectEncodeRequest,
+) -> Result<EncodedGroup> {
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+    let block_size = device.block_size();
+    let required = direct_encode_workspace_bytes(
+        request.source_block_count,
+        block_size,
+        request.repair_count,
+    )?;
+    if required > request.max_working_bytes {
+        return Err(FfsError::RepairFailed(format!(
+            "direct encode working budget exceeded: required={required} allowed={}",
+            request.max_working_bytes
+        )));
+    }
+    let end = request
+        .first_block
+        .0
+        .checked_add(u64::from(request.source_block_count))
+        .ok_or_else(|| FfsError::RepairFailed("direct source block range overflows".to_owned()))?;
+    if end > device.block_count() || end.checked_mul(u64::from(block_size)).is_none() {
+        return Err(FfsError::RepairFailed(
+            "direct source range exceeds device or byte-address bounds".to_owned(),
+        ));
+    }
+    let source_symbols = read_direct_source_symbols(cx, device, &request, block_size)?;
+    let seed = repair_seed(fs_uuid, request.group);
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+    let mut encoder = SystematicEncoder::new(&source_symbols, block_size as usize, seed)
+        .ok_or_else(|| {
+            FfsError::RepairFailed(format!(
+                "direct encode constraint matrix singular for group {}",
+                request.group.0
+            ))
+        })?;
+    drop(source_symbols);
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+    let mut repair_symbols = Vec::new();
+    repair_symbols
+        .try_reserve_exact(request.repair_count as usize)
+        .map_err(|error| FfsError::RepairFailed(format!("direct repair allocation: {error}")))?;
+    for index in 0..request.repair_count {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let mut batch = encoder.emit_repair(1);
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        if batch.len() != 1 {
+            return Err(FfsError::RepairFailed(
+                "direct encoder did not emit the requested symbol".to_owned(),
+            ));
+        }
+        let symbol = batch.pop().expect("one emitted symbol");
+        if symbol.esi != request.source_block_count + index
+            || symbol.is_source
+            || symbol.data.len() != block_size as usize
+        {
+            return Err(FfsError::RepairFailed(
+                "direct encoder returned inconsistent symbol geometry".to_owned(),
+            ));
+        }
+        repair_symbols.push(symbol);
+    }
+    Ok(EncodedGroup {
+        group: request.group,
+        source_block_count: request.source_block_count,
+        symbol_size: block_size,
+        seed,
+        repair_symbols,
+    })
+}
+
+fn read_direct_source_symbols(
+    cx: &Cx,
+    device: &dyn BlockDevice,
+    request: &DirectEncodeRequest,
+    block_size: u32,
+) -> Result<Vec<Vec<u8>>> {
+    let mut source_symbols = Vec::new();
+    source_symbols
+        .try_reserve_exact(request.source_block_count as usize)
+        .map_err(|error| FfsError::RepairFailed(format!("direct source allocation: {error}")))?;
+    for index in 0..u64::from(request.source_block_count) {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        // The complete block and byte ranges were checked before the first read.
+        let block = BlockNumber(request.first_block.0 + index);
+        let row = device.read_block(cx, block)?;
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        if row.len() != block_size as usize {
+            return Err(FfsError::RepairFailed(format!(
+                "direct source block {} has {} bytes, expected {block_size}",
+                block.0,
+                row.len()
+            )));
+        }
+        // Do not inherit arbitrary spare capacity from a device-owned buffer.
+        // The encoder's retained source allocation is bounded by these rows.
+        source_symbols.push(row.as_slice().to_vec());
+    }
+    Ok(source_symbols)
+}
+
 /// Encode repair symbols for a contiguous range of source blocks.
 ///
 /// Reads `source_block_count` blocks starting at `first_block` from the device,
@@ -1482,6 +1739,249 @@ mod tests {
             device.write(BlockNumber(i), make_deterministic_block(i, block_size));
         }
         device
+    }
+
+    #[test]
+    fn encode_group_direct_matches_projected_symbols() {
+        let cx = Cx::for_testing();
+        let uuid = test_uuid();
+        for (source_count, block_size, first, repair_count) in
+            [(16, 257, 0, 6), (64, 1024, 0, 7), (16, 4096, 11, 4)]
+        {
+            let device = MemBlockDevice::new(block_size, first + u64::from(source_count));
+            for block in first..first + u64::from(source_count) {
+                device.write(
+                    BlockNumber(block),
+                    make_deterministic_block(block, block_size),
+                );
+            }
+            let group = GroupNumber(7);
+            let expected = encode_group(
+                &cx,
+                &device,
+                &uuid,
+                group,
+                BlockNumber(first),
+                source_count,
+                repair_count,
+            )
+            .unwrap();
+            let actual = encode_group_direct(
+                &cx,
+                &device,
+                &uuid,
+                DirectEncodeRequest {
+                    group,
+                    first_block: BlockNumber(first),
+                    source_block_count: source_count,
+                    repair_count,
+                    max_working_bytes: direct_encode_workspace_bytes(
+                        source_count,
+                        block_size,
+                        repair_count,
+                    )
+                    .unwrap(),
+                },
+            )
+            .unwrap();
+            assert_eq!(actual.group, expected.group);
+            assert_eq!(actual.seed, expected.seed);
+            assert_eq!(actual.source_block_count, expected.source_block_count);
+            assert_eq!(actual.symbol_size, expected.symbol_size);
+            assert_eq!(actual.repair_symbols.len(), repair_count as usize);
+            assert_eq!(actual.repair_symbols.len(), expected.repair_symbols.len());
+            for (actual, expected) in actual.repair_symbols.iter().zip(&expected.repair_symbols) {
+                assert_eq!(actual.esi, expected.esi);
+                assert_eq!(actual.is_source, expected.is_source);
+                assert_eq!(actual.degree, expected.degree);
+                assert_eq!(actual.data, expected.data);
+            }
+            assert_eq!(device.read_count(), 2 * source_count as usize);
+        }
+    }
+
+    #[test]
+    fn encode_group_direct_budget_refuses_before_source_io() {
+        let cx = Cx::for_testing();
+        let device = setup_device(16, 257);
+        let required = direct_encode_workspace_bytes(16, 257, 6).unwrap();
+        let request = DirectEncodeRequest {
+            group: GroupNumber(3),
+            first_block: BlockNumber(0),
+            source_block_count: 16,
+            repair_count: 6,
+            max_working_bytes: required - 1,
+        };
+        let error = encode_group_direct(&cx, &device, &test_uuid(), request).unwrap_err();
+        assert!(matches!(error, FfsError::RepairFailed(_)), "{error}");
+        assert!(
+            error.to_string().contains("working budget exceeded"),
+            "{error}"
+        );
+        assert_eq!(device.read_count(), 0);
+
+        let encoded = encode_group_direct(
+            &cx,
+            &device,
+            &test_uuid(),
+            DirectEncodeRequest {
+                max_working_bytes: required,
+                ..request
+            },
+        )
+        .unwrap();
+        assert_eq!(encoded.repair_symbols.len(), 6);
+        assert_eq!(device.read_count(), 16);
+    }
+
+    #[test]
+    fn encode_group_direct_rejects_invalid_geometry_before_source_io() {
+        let cx = Cx::for_testing();
+        for (source_count, block_size, repair_count, reason) in [
+            (0, 64, 4, "parameters"),
+            (56_404, 64, 4, "parameters"),
+            (16, 0, 4, "nonzero u16 symbol size"),
+            (16, 65_536, 4, "nonzero u16 symbol size"),
+            (16, 64, 0, "nonzero repair count"),
+            (16, 64, u32::MAX, "ISI range overflows"),
+        ] {
+            assert!(direct_encode_workspace_bytes(source_count, block_size, repair_count).is_err());
+            let device = MemBlockDevice::new(block_size, 64);
+            let error = encode_group_direct(
+                &cx,
+                &device,
+                &test_uuid(),
+                DirectEncodeRequest {
+                    group: GroupNumber(0),
+                    first_block: BlockNumber(0),
+                    source_block_count: source_count,
+                    repair_count,
+                    max_working_bytes: u64::MAX,
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(error, FfsError::RepairFailed(_)), "{error}");
+            assert!(error.to_string().contains(reason), "{error}");
+            assert_eq!(device.read_count(), 0);
+        }
+        for (first, blocks, reason) in [
+            (u64::MAX, u64::MAX, "block range overflows"),
+            (63, 64, "device or byte-address bounds"),
+            (u64::MAX / 64, u64::MAX, "device or byte-address bounds"),
+        ] {
+            let device = MemBlockDevice::new(64, blocks);
+            let error = encode_group_direct(
+                &cx,
+                &device,
+                &test_uuid(),
+                DirectEncodeRequest {
+                    group: GroupNumber(0),
+                    first_block: BlockNumber(first),
+                    source_block_count: 16,
+                    repair_count: 4,
+                    max_working_bytes: u64::MAX,
+                },
+            )
+            .unwrap_err();
+            assert!(matches!(error, FfsError::RepairFailed(_)), "{error}");
+            assert!(error.to_string().contains(reason), "{error}");
+            assert_eq!(device.read_count(), 0);
+        }
+    }
+
+    #[test]
+    fn encode_group_direct_rejects_malformed_rows_and_preserves_io_errors() {
+        let cx = Cx::for_testing();
+        let request = DirectEncodeRequest {
+            group: GroupNumber(0),
+            first_block: BlockNumber(0),
+            source_block_count: 16,
+            repair_count: 4,
+            max_working_bytes: u64::MAX,
+        };
+        for malformed_size in [63, 65] {
+            let device = setup_device(16, 64);
+            device.blocks.lock().insert(2, vec![0; malformed_size]);
+            let error = encode_group_direct(&cx, &device, &test_uuid(), request).unwrap_err();
+            assert!(matches!(error, FfsError::RepairFailed(_)), "{error}");
+            assert!(
+                error.to_string().contains(&format!(
+                    "source block 2 has {malformed_size} bytes, expected 64"
+                )),
+                "{error}"
+            );
+            assert_eq!(device.read_count(), 3, "no reads after the malformed row");
+        }
+        let device = FailingReadDevice::new(64, vec![2]);
+        let error = encode_group_direct(&cx, &device, &test_uuid(), request).unwrap_err();
+        assert!(matches!(error, FfsError::Io(_)), "{error}");
+        assert_eq!(
+            error.to_string(),
+            "I/O error: injected read failure at block 2"
+        );
+        assert_eq!(*device.reads.lock(), vec![0, 1, 2]);
+    }
+
+    #[test]
+    fn encode_group_direct_observes_cancellation_before_and_during_reads() {
+        struct CancelOnRead {
+            device: MemBlockDevice,
+            cancel_at: BlockNumber,
+        }
+
+        impl BlockDevice for CancelOnRead {
+            fn read_block(&self, cx: &Cx, block: BlockNumber) -> Result<BlockBuf> {
+                let row = self.device.read_block(cx, block)?;
+                if block == self.cancel_at {
+                    cx.set_cancel_requested(true);
+                }
+                Ok(row)
+            }
+
+            fn write_block(&self, _cx: &Cx, _block: BlockNumber, _data: &[u8]) -> Result<()> {
+                Err(FfsError::ReadOnly)
+            }
+
+            fn block_size(&self) -> u32 {
+                self.device.block_size()
+            }
+
+            fn block_count(&self) -> u64 {
+                self.device.block_count()
+            }
+
+            fn sync(&self, _cx: &Cx) -> Result<()> {
+                Err(FfsError::ReadOnly)
+            }
+        }
+
+        let request = DirectEncodeRequest {
+            group: GroupNumber(0),
+            first_block: BlockNumber(0),
+            source_block_count: 16,
+            repair_count: 4,
+            max_working_bytes: u64::MAX,
+        };
+        let cx = Cx::for_testing();
+        cx.set_cancel_requested(true);
+        let device = setup_device(16, 64);
+        assert!(matches!(
+            encode_group_direct(&cx, &device, &test_uuid(), request),
+            Err(FfsError::Cancelled)
+        ));
+        assert_eq!(device.read_count(), 0);
+        for cancel_at in [0, 15] {
+            let cx = Cx::for_testing();
+            let device = CancelOnRead {
+                device: setup_device(16, 64),
+                cancel_at: BlockNumber(cancel_at),
+            };
+            assert!(matches!(
+                encode_group_direct(&cx, &device, &test_uuid(), request),
+                Err(FfsError::Cancelled)
+            ));
+            assert_eq!(device.device.read_count(), cancel_at as usize + 1);
+        }
     }
 
     #[test]

@@ -139,6 +139,21 @@ pub struct RepairGroupStorage<'a> {
     layout: RepairGroupLayout,
 }
 
+/// Strict descriptor admission for an externally excluded raw-symbol refresh.
+///
+/// This reports descriptor integrity, not source freshness or parity health.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawRefreshAdmission {
+    /// Highest admitted descriptor, or the expected bootstrap when both slots are zero.
+    pub descriptor: RepairGroupDescExt,
+    /// Both complete descriptor blocks were zero.
+    pub pristine: bool,
+    /// Checked successor of the highest admitted descriptor generation.
+    pub next_generation: u64,
+    /// The highest generation has a valid committed integrity manifest.
+    pub committed: bool,
+}
+
 impl<'a> RepairGroupStorage<'a> {
     #[must_use]
     pub fn new(device: &'a dyn BlockDevice, layout: RepairGroupLayout) -> Self {
@@ -284,6 +299,38 @@ impl<'a> RepairGroupStorage<'a> {
     /// trusted source data using a strictly higher generation, never reset to 0.
     pub fn read_refresh_descriptor(&self, cx: &Cx) -> Result<RepairGroupDescExt> {
         integrity::refresh_descriptor(self, cx)
+    }
+
+    /// Admit both complete raw descriptor slots without modifying storage.
+    ///
+    /// Every nonzero slot, including older generations, must be a canonical
+    /// bootstrap, pending record, or committed manifest matching the expected
+    /// full-block source geometry. Unknown or torn records are refused. This
+    /// stricter lane leaves the existing tolerant recovery readers unchanged.
+    /// The caller must exclude writers and separately validate source freshness.
+    pub fn preflight_raw_refresh(
+        &self,
+        cx: &Cx,
+        expected_bootstrap: &RepairGroupDescExt,
+    ) -> Result<RawRefreshAdmission> {
+        integrity::preflight_refresh(self, cx, expected_bootstrap)
+    }
+
+    /// Publish raw symbols directly into two wholly zero descriptor slots.
+    ///
+    /// The caller supplies a positive generation, retaining any higher durable
+    /// ownership high-water mark outside these slots. No generation-zero record
+    /// is written: both pending fences precede parity and committed publication.
+    /// Nonzero slots, invalid geometry or symbols, and generation zero are
+    /// refused before writes. The caller must exclude concurrent writers.
+    pub fn initialize_raw_repair_symbols(
+        &self,
+        cx: &Cx,
+        expected_bootstrap: &RepairGroupDescExt,
+        symbols: &[(u32, Vec<u8>)],
+        generation: u64,
+    ) -> Result<()> {
+        integrity::initialize(self, cx, expected_bootstrap, symbols, generation)
     }
 
     /// Read one committed raw generation together with its verified symbols.

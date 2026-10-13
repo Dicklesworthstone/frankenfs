@@ -1027,6 +1027,47 @@ valid table integrity and exact source digests; mismatch MUST refuse without
 rebaselining. No symbol or descriptor write, decoding authority, mounted
 freshness guarantee or active repair follows from validation initialization.
 
+Explicit offline native parity publication follows sealed source validation.
+Every owner block reserves bytes 320–447 for a generation-one `FFSRPR01`
+record. It binds UUID, owner inode/generation and group to parity generation,
+the sealed group source root, committed raw-manifest digest and
+Prepared/Pending/Sealed state, with CRC32C and canonical zero padding.
+Preparation MUST journal a nonzero Prepared record (generation zero, zero
+roots) in the existing ownership transaction; absent records never authorize
+first publication. Pending records bind the admitted source root and a strictly
+increasing generation; their manifest digest remains zero. Sealed records bind
+the committed generation and its verified raw integrity manifest.
+
+Before any parity intent, descriptor or symbol write, initialization MUST admit
+the sealed whole-plan baseline and all group tables, verify all current source
+bytes, strictly classify both complete descriptor slots of every group, and
+preflight actual source/tail/OTI/RFC geometry and estimated codec memory.
+Malformed nonzero slots, including an older slot beside a valid newer one,
+MUST refuse. The bytes supplied to encoding MUST themselves match the admitted
+digests. Dense encoder allocations require checked RFC-derived resource
+estimates and an explicit caller budget; they do not justify silently shrinking
+or partitioning source coverage.
+
+The owner Pending record MUST sync before descriptor/symbol mutation. Raw
+publication uses the existing two-slot pending fence, parity sync/readback and
+committed-manifest sync protocol. Verified complete parity and matching current
+sources precede the owner seal and sync. Retry/regeneration requires that same
+sealed baseline and advances the maximum owner/descriptor generation. Erased
+descriptor slots MUST NOT erase the owner high-water mark. No generation-zero
+descriptor is written to reset known history. Complete matching sealed parity
+may be checked or retained on an idempotent initialization; successful retries
+still establish a durability sync.
+
+Native reconstruction MUST admit the sealed native parity anchor as well as
+raw parity integrity, verify every intact decoder input and every recovered
+block against its sealed source digest, and recheck anchor/generation authority
+before returning bytes. Until durable pre-write freshness is implemented,
+reconstruction is read-only and exports verified bytes to an explicit new
+output file. The input image MUST neither be written nor synced. A digest
+mismatch may be a legitimate later write; baseline reconstruction therefore
+does not authorize automatic rollback or in-place repair. Default mounted
+activation, persistent freshness and Btrfs native ownership remain required.
+
 ### 3.16 Tail Group and Metadata Special Cases
 
 #### 3.16.1 Tail Block Groups
