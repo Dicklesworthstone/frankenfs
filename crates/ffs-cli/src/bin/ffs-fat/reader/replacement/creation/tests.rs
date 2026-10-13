@@ -568,3 +568,4 @@ fn cli_create_is_explicit_and_does_not_change_replace_default() {
 
 mod growth;
 mod long_names;
+mod directories;
