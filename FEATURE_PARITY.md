@@ -209,8 +209,8 @@
 > initialization refused without changing the image; `e2fsck -fn` still
 > accepted its metadata. Artifacts are retained at
 > `/data/tmp/ffs-chartreusestone-resume39-native-cli-artifacts-M1WFos`.
-> This is offline real-image and planted-fault evidence. Symbol encoding,
-> durable mounted freshness, Btrfs ownership and default repair remain incomplete;
+> This is offline real-image and planted-fault evidence. At that revision, symbol
+> encoding, durable mounted freshness, Btrfs ownership and default repair were incomplete;
 > successful validation reports `protection_active=false`. The bead remains open.
 
 > **Offline native parity (`bd-11a8t`, implementation under validation):**
@@ -218,7 +218,28 @@
 > admission and generation-bound `FFSRPR01` publication. `native-recover`
 > connects digest-validated reconstruction to a read-only capture and new output
 > file. Five real-format core controls and six CLI controls are authored;
-> RCH compilation, tests and public-command execution remain pending.
+> Source-bound RCH workspace/all-target Clippy `j-30063314843205638` and
+> locked workspace/all-target check `j-30063314843205639` passed, as did
+> formatting. Both used base `54df4474c010adab56607d4769ebb016af09c161`
+> plus overlay `0b10d340a837a43e6d4091b967f400d613cd362dd5bdda0f407821effb9c92b2`.
+> Full repair library job `j-30063314843205640` passed 635 tests with zero
+> failures, ignored or filtered tests, including five direct-encoder controls
+> and seven strict raw-admission controls. Public build `j-30063314843205645`
+> produced worker/retrieved binary SHA256
+> `d61fe0a113f2c901dd30f27782e20b06771cb49a39707e185eef3805bc78c99e`.
+> Its actual fresh 4 MiB/two-group ext4 run encoded 3,755 source blocks and
+> 206 repair blocks at generations `[1, 1]`. Cold checks and repeat encoding
+> preserved exact image bytes; native fsck and existing payload checks passed.
+> An inadequate budget and changed-source requests refused without image changes.
+> After planting damage in payload block 212, reconstruction exported the exact
+> 1,024-byte sealed baseline into a new file while leaving the image unchanged;
+> an existing output path refused without overwriting it. Metadata-only
+> `e2fsck -fn` still accepted the damaged image. Artifacts are retained at
+> `/data/tmp/ffs-chartreusestone-resume40-native-cli-artifacts-KmXLsh`.
+> This is executed offline real-image/planted-fault evidence, not mounted
+> freshness or current-data rollback authority. Full CLI job
+> `j-30063314843205647` passed all 400 tests with zero failures, ignored or
+> filtered tests on the same source. New native core controls remain under execution.
 > This partial path admits at most 56,403 source blocks per group, full-block
 > symbols of 1,024–65,535 bytes, repair count no greater than source count and
 > a checked working budget; oversized groups and 64 KiB symbols are refused.
