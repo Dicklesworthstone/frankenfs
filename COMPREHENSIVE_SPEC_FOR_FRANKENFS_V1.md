@@ -1080,6 +1080,55 @@ mismatch may be a legitimate later write; baseline reconstruction therefore
 does not authorize automatic rollback or in-place repair. Default mounted
 activation, persistent freshness and Btrfs native ownership remain required.
 
+#### 3.15.1 Native write freshness
+
+Explicit native ext4 activation MUST admit permanent ownership, the sealed
+whole-plan root, matching local validation epochs, all current source digests,
+every complete sealed parity generation and checked working-memory estimates
+before installing the shared physical device. The device MUST be installed
+before constructor journal, fast-commit or orphan recovery can write sources.
+The external metadata-WAL combination remains unqualified and MUST refuse
+activation until its independent acknowledgement boundary is proven.
+
+The validation epoch is a positive `u32` at local-record bytes 68–71, mirrored
+as a `u64` at whole-plan bytes 56–63. Epoch one remains initial publication;
+the owner's immutable inode generation is a separate identity. Ordered local
+roots and whole-plan bindings MUST agree on the epoch. Advancement MUST use
+checked addition and refuse exhaustion before source mutation.
+
+Under one cancel-aware state lock, every physical write MUST verify each
+complete beforeimage against the previously admitted digest or a digest
+derived from an earlier intended write. Its next digest MUST come only from
+those verified bytes modified by the caller's requested bytes. Source bytes
+freshly observed after writes MUST NOT independently establish new authority.
+All ordinary writes to owned tails or outside source coverage MUST refuse.
+An explicit internal publication authority alone may write those tails.
+
+Before the first source write of an epoch, group zero's whole-plan record MUST
+publish and sync Dirty (state 4, retaining only the prior sealed root, with no
+next-root authority). Failed fence sync
+MUST prevent source I/O. Failed writes, cancellation after mutation and failed
+publication MUST poison the handle; later calls cannot acknowledge a successful
+sync. A cold Dirty epoch MUST refuse automatic refresh or reconstruction,
+because its intended-write map was volatile.
+
+Successful sync MUST first sync source writes, then verify every source against
+the old attested digests patched only by intended writes. Only after this pass
+may it publish and sync the exact next-epoch whole-plan Pending root. This
+anchor MUST precede replacing any local table, intent or parity. Matching
+next-epoch tables and local seals, strictly advancing owner/raw parity
+generations, complete symbol readback and current-source verification MUST
+precede the global Sealed record and final sync. Only that success clears the
+intended-write state and permits acknowledgement. Interrupted Pending epochs
+remain unavailable until an explicit transition-aware recovery path proves
+their exact whole-plan authority; existing initialization is not that path.
+
+The FUSE path, public byte-device view and metadata compactor MUST share the
+same admitted device rather than reopen an independent image handle. This
+bounded explicit activation does not satisfy default activation, automatic
+native read repair, Pending/Dirty restart reconciliation, Btrfs ownership or
+the synchronous solver's cancellation-latency target.
+
 ### 3.16 Tail Group and Metadata Special Cases
 
 #### 3.16.1 Tail Block Groups

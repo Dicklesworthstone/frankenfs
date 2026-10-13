@@ -648,6 +648,7 @@ struct MountCmdOptions {
     dev: bool,
     suid: bool,
     mount_mode: MountMode,
+    native_repair_max_working_bytes: Option<u64>,
     btrfs_mount_selection: BtrfsMountSelection,
     btrfs_device_paths: Vec<PathBuf>,
     ext4_data_err_policy: Ext4DataErrPolicy,
@@ -1398,6 +1399,12 @@ enum Command {
         /// symbols, and BLAKE3 checksums.
         #[arg(long)]
         native: bool,
+        /// Fence writes and refresh on-image parity for a prepared ext4 image.
+        ///
+        /// Requires sealed native-encode validation and parity. This is an
+        /// estimated working-memory budget, not a process RSS limit.
+        #[arg(long, requires_all = ["native", "rw"], value_parser = clap::value_parser!(u32).range(1..))]
+        native_repair_memory_mib: Option<u32>,
         /// Abort the ext4 journal on ordered-mode file-data I/O errors.
         #[arg(long = "ext4-data-err-abort")]
         ext4_data_err_abort: bool,
@@ -2636,6 +2643,7 @@ fn run() -> Result<()> {
             background_scrub_ledger,
             background_repair,
             native,
+            native_repair_memory_mib,
             ext4_data_err_abort,
             ext4_nojournal_checksum,
             subvol,
@@ -2679,6 +2687,8 @@ fn run() -> Result<()> {
                     } else {
                         MountMode::Compat
                     },
+                    native_repair_max_working_bytes: native_repair_memory_mib
+                        .map(|mib| u64::from(mib) * 1024 * 1024),
                     btrfs_mount_selection,
                     btrfs_device_paths,
                     ext4_data_err_policy: if ext4_data_err_abort {
@@ -8841,6 +8851,7 @@ fn build_mount_open_options(options: &MountCmdOptions) -> OpenOptions {
         ext4_data_err_policy: options.ext4_data_err_policy,
         ext4_verify_journal_checksums: options.ext4_verify_journal_checksums,
         mount_mode: options.mount_mode,
+        native_repair_max_working_bytes: options.native_repair_max_working_bytes,
         btrfs_mount_selection: options.btrfs_mount_selection.clone(),
         btrfs_device_paths: options.btrfs_device_paths.clone(),
         btrfs_rw_ephemeral_ok: options.btrfs_rw_ephemeral_ok,
@@ -10462,6 +10473,7 @@ mod tests {
             suid: false,
             read_write,
             mount_mode: MountMode::Compat,
+            native_repair_max_working_bytes: None,
             btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
             btrfs_device_paths: Vec::new(),
             ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
@@ -15422,6 +15434,7 @@ mod tests {
                         mvcc_policy: None,
                         mvcc_evidence_ledger: None,
                         mount_mode: MountMode::Compat,
+                        native_repair_max_working_bytes: None,
                         btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
                         btrfs_device_paths: Vec::new(),
                         ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
@@ -15507,6 +15520,7 @@ mod tests {
                 mvcc_policy: None,
                 mvcc_evidence_ledger: None,
                 mount_mode: MountMode::Compat,
+                native_repair_max_working_bytes: None,
                 btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
                 btrfs_device_paths: Vec::new(),
                 ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
@@ -15552,6 +15566,7 @@ mod tests {
                 mvcc_policy: None,
                 mvcc_evidence_ledger: None,
                 mount_mode: MountMode::Compat,
+                native_repair_max_working_bytes: None,
                 btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
                 btrfs_device_paths: Vec::new(),
                 ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
@@ -15697,6 +15712,7 @@ mod tests {
             mvcc_policy: None,
             mvcc_evidence_ledger: None,
             mount_mode: MountMode::Compat,
+            native_repair_max_working_bytes: None,
             btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
             btrfs_device_paths: Vec::new(),
             ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
@@ -15793,6 +15809,7 @@ mod tests {
             mvcc_policy: None,
             mvcc_evidence_ledger: None,
             mount_mode: MountMode::Compat,
+            native_repair_max_working_bytes: None,
             btrfs_mount_selection: BtrfsMountSelection::DefaultRoot,
             btrfs_device_paths: Vec::new(),
             ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
@@ -15838,6 +15855,7 @@ mod tests {
             mvcc_policy: None,
             mvcc_evidence_ledger: None,
             mount_mode: MountMode::Compat,
+            native_repair_max_working_bytes: None,
             btrfs_mount_selection: BtrfsMountSelection::Subvolume("home".to_owned()),
             btrfs_device_paths: Vec::new(),
             ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
@@ -15878,6 +15896,7 @@ mod tests {
             mvcc_policy: None,
             mvcc_evidence_ledger: None,
             mount_mode: MountMode::Native,
+            native_repair_max_working_bytes: None,
             btrfs_mount_selection: BtrfsMountSelection::Snapshot("snap-1".to_owned()),
             btrfs_device_paths: Vec::new(),
             ext4_data_err_policy: Ext4DataErrPolicy::Abort,
@@ -15922,6 +15941,7 @@ mod tests {
                     mvcc_policy: None,
                     mvcc_evidence_ledger: None,
                     mount_mode: MountMode::Compat,
+                    native_repair_max_working_bytes: None,
                     btrfs_mount_selection: BtrfsMountSelection::Subvolume("missing".to_owned()),
                     btrfs_device_paths: Vec::new(),
                     ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
@@ -15975,6 +15995,7 @@ mod tests {
                     mvcc_policy: None,
                     mvcc_evidence_ledger: None,
                     mount_mode: MountMode::Compat,
+                    native_repair_max_working_bytes: None,
                     btrfs_mount_selection: BtrfsMountSelection::Snapshot(
                         "missing-snapshot".to_owned(),
                     ),
@@ -16029,6 +16050,7 @@ mod tests {
                     mvcc_policy: None,
                     mvcc_evidence_ledger: None,
                     mount_mode: MountMode::Compat,
+                    native_repair_max_working_bytes: None,
                     btrfs_mount_selection: BtrfsMountSelection::Subvolume("home".to_owned()),
                     btrfs_device_paths: Vec::new(),
                     ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
@@ -16100,6 +16122,7 @@ mod tests {
                     mvcc_policy: None,
                     mvcc_evidence_ledger: None,
                     mount_mode: MountMode::Compat,
+                    native_repair_max_working_bytes: None,
                     btrfs_mount_selection: BtrfsMountSelection::Snapshot("snap-home".to_owned()),
                     btrfs_device_paths: Vec::new(),
                     ext4_data_err_policy: Ext4DataErrPolicy::Ignore,
@@ -16231,6 +16254,95 @@ mod tests {
                 "expected mount command"
             ),
         }
+    }
+
+    #[test]
+    fn mount_native_repair_budget_requires_writable_native_and_reaches_open_options() {
+        for args in [
+            vec![
+                "ffs",
+                "mount",
+                "--native-repair-memory-mib",
+                "256",
+                "/img",
+                "/mnt",
+            ],
+            vec![
+                "ffs",
+                "mount",
+                "--native",
+                "--native-repair-memory-mib",
+                "256",
+                "/img",
+                "/mnt",
+            ],
+            vec![
+                "ffs",
+                "mount",
+                "--rw",
+                "--native-repair-memory-mib",
+                "256",
+                "/img",
+                "/mnt",
+            ],
+            vec![
+                "ffs",
+                "mount",
+                "--native",
+                "--rw",
+                "--native-repair-memory-mib",
+                "0",
+                "/img",
+                "/mnt",
+            ],
+            vec![
+                "ffs",
+                "mount",
+                "--native",
+                "--rw",
+                "--native-repair-memory-mib",
+                "4294967296",
+                "/img",
+                "/mnt",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        let cli = Cli::try_parse_from([
+            "ffs",
+            "mount",
+            "--native",
+            "--rw",
+            "--native-repair-memory-mib",
+            "256",
+            "/img",
+            "/mnt",
+        ])
+        .expect("explicit writable native repair should parse");
+        let Command::Mount {
+            native_repair_memory_mib,
+            native,
+            rw,
+            ..
+        } = cli.command
+        else {
+            panic!("expected mount command");
+        };
+        assert!(native && rw);
+        assert_eq!(native_repair_memory_mib, Some(256));
+        let mut options = test_mount_cmd_options(true, MountWritebackCacheConfig::disabled());
+        options.mount_mode = MountMode::Native;
+        options.native_repair_max_working_bytes =
+            native_repair_memory_mib.map(|mib| u64::from(mib) * 1024 * 1024);
+        let open = build_mount_open_options(&options);
+        assert_eq!(open.native_repair_max_working_bytes, Some(268_435_456));
+        assert_eq!(open.mount_mode, MountMode::Native);
+        assert_eq!(open.ext4_journal_replay_mode, ext4_mount_replay_mode(true));
+        let default = build_mount_open_options(&test_mount_cmd_options(
+            true,
+            MountWritebackCacheConfig::disabled(),
+        ));
+        assert_eq!(default.native_repair_max_working_bytes, None);
     }
 
     #[test]

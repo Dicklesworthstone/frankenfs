@@ -649,6 +649,24 @@ legitimate later write, so reconstruction does not establish current freshness
 or authorize rollback. These offline commands report `protection_active=false`;
 mounted native activation and Btrfs ownership remain unfinished.
 
+An explicit native freshness path is being validated for prepared ext4 images:
+
+```bash
+ffs mount image.ext4 /path/to/empty/mountpoint --native --rw \
+    --native-repair-memory-mib 4096
+```
+
+It requires sealed validation and complete parity before constructor recovery.
+Writes verify their beforeimages and sync an invalidation fence before changing
+sources; sync must verify the intended changes and publish fresh tables and
+parity before succeeding. All groups are checked, including untouched sources.
+An interrupted or failed epoch refuses reopening with active protection; there
+is no automatic rebaselining or rollback. The memory budget covers estimates,
+not process RSS, and dense codec solves can make sync expensive. External
+metadata-WAL combinations are refused. This new path has no executed mounted
+qualification yet; default repair, automatic recovery, restart reconciliation
+and Btrfs native ownership remain unfinished.
+
 ### Hostile-image safety (separate claim)
 
 `security.hostile_image` is its own release-gated claim. The adversarial threat model in `security/adversarial_image_threat_model.json` defines how malformed images, hostile proof bundles, tampered repair ledgers, resource-exhaustion seeds, unsupported mount options, and unsafe operator-command combinations must be rejected, quarantined, capped, downgraded to detection-only, or preserved as evidence. Each containment scenario records the resource class, limit value/unit, enforcement point, observed counters, cleanup policy, and confined artifact paths used by release gates.

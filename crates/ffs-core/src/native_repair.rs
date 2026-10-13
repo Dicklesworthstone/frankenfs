@@ -11,13 +11,16 @@ use super::{
     Serialize, SingleLockDirAlloc, TransactionBlockAdapter, debug,
     ext4_superblock_requires_journal_recovery, parse_extent_tree, parse_to_ffs_error,
 };
-use asupersync::sync::OnceCell;
-use ffs_block::BlockBuf;
+use asupersync::sync::{Mutex as NativeMutex, MutexGuard as NativeMutexGuard, OnceCell, TryLockError};
+use ffs_block::{BlockBuf, ByteDevice};
 use ffs_repair::codec::{DirectEncodeRequest, direct_encode_workspace_bytes, encode_group_direct};
 use ffs_repair::recovery::{GroupRecoveryOrchestrator, RecoveryWriteback, RecoveryWritebackBlock};
 use ffs_repair::scrub::{BlockValidator, BlockVerdict, CorruptionKind, Severity};
 use ffs_repair::storage::{RawRefreshAdmission, RepairGroupLayout, RepairGroupStorage};
 use ffs_repair::symbol::RepairGroupDescExt;
+use ffs_types::ByteOffset;
+use std::collections::BTreeMap;
+use std::sync::Arc;
 
 const OWNER_NAME: &str = ".frankenfs-repair";
 const OWNER_MAGIC: &[u8; 8] = b"FFSNAT01";
@@ -29,6 +32,7 @@ const MAX_VALIDATION_TABLE_BYTES: usize = 32 * 1024 * 1024;
 const VALIDATION_PENDING: u32 = 1;
 const VALIDATION_SEALED: u32 = 2;
 const PLAN_PREPARED: u32 = 3;
+const PLAN_DIRTY: u32 = 4;
 const PLAN_MAGIC: &[u8; 8] = b"FFSPLN01";
 const PLAN_HEADER_START: usize = OWNER_HEADER_BYTES + VALIDATION_HEADER_BYTES;
 const PLAN_HEADER_END: usize = PLAN_HEADER_START + VALIDATION_HEADER_BYTES;
@@ -125,6 +129,7 @@ impl ParityIntent {
 struct NativeBaseline {
     storage: NativeRepairStorage,
     owner_generation: u32,
+    epoch: u32,
     plan_root: [u8; 32],
     roots: Vec<[u8; 32]>,
 }
@@ -141,13 +146,424 @@ struct NativeGroupAdmission {
 enum ValidationIntent {
     Empty,
     Prepared,
+    Dirty([u8; 32]),
     Pending([u8; 32]),
     Sealed([u8; 32]),
 }
 
 struct ValidationAdmission {
+    epoch: u32,
     root: [u8; 32],
     intent: ValidationIntent,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum FreshnessPhase {
+    Clean,
+    Dirty,
+    Poisoned,
+}
+
+struct NativeFreshnessState {
+    baseline: NativeBaseline,
+    tables: Vec<Vec<u8>>,
+    parity: Vec<ParityIntent>,
+    intended: BTreeMap<BlockNumber, [u8; 32]>,
+    phase: FreshnessPhase,
+}
+
+/// The only writable handle published after native freshness admission.
+/// Internal ownership publication uses `inner` under the same state lock.
+struct NativeFreshnessDevice {
+    inner: Arc<dyn ByteDevice>,
+    sb: Ext4Superblock,
+    state: NativeMutex<NativeFreshnessState>,
+    codec_budget: u64,
+}
+
+fn freshness_error(detail: &str) -> FfsError {
+    FfsError::RepairFailed(format!("native freshness: {detail}"))
+}
+
+fn freshness_codec_budget(
+    sb: &Ext4Superblock,
+    storage: &NativeRepairStorage,
+    allowed: u64,
+) -> Result<u64, FfsError> {
+    let mut retained = 0_u64;
+    for tail in &storage.tails {
+        let (sources, capacity, _) = validation_sizes(sb, tail)?;
+        // Old/next tables plus transient publication/readback copies. The
+        // per-source allowance covers the intended BTreeMap and staged hashes;
+        // codec allocations are admitted separately. This is not an RSS cap.
+        let group = (capacity as u64)
+            .checked_mul(4)
+            .and_then(|bytes| bytes.checked_add(u64::from(sources) * 128))
+            .and_then(|bytes| bytes.checked_add(4096))
+            .ok_or_else(|| freshness_error("retained metadata budget overflows"))?;
+        retained = retained.checked_add(group)
+            .ok_or_else(|| freshness_error("retained metadata budget overflows"))?;
+    }
+    allowed.checked_sub(retained)
+        .ok_or_else(|| freshness_error("working budget is below retained metadata estimate"))
+}
+
+impl NativeFreshnessDevice {
+    fn lock(&self, cx: &Cx) -> Result<NativeMutexGuard<'_, NativeFreshnessState>, FfsError> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let state = self.state.try_lock().map_err(|error| match error {
+            TryLockError::Locked => FfsError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+            TryLockError::Poisoned => freshness_error("state mutex is poisoned"),
+        })?;
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        if state.phase == FreshnessPhase::Poisoned {
+            return Err(freshness_error("device is poisoned after an incomplete operation"));
+        }
+        Ok(state)
+    }
+
+    fn device(&self) -> ByteDeviceBlockAdapter<'_> {
+        ByteDeviceBlockAdapter { dev: self.inner.as_ref(), block_size: self.sb.block_size }
+    }
+
+    fn check_plan(
+        &self,
+        cx: &Cx,
+        baseline: &NativeBaseline,
+        intent: ValidationIntent,
+    ) -> Result<(), FfsError> {
+        let owner = self.device().read_block(cx, baseline.storage.tails[0].start)?;
+        let bytes = &owner.as_slice()[PLAN_HEADER_START..PLAN_HEADER_END];
+        if validation_plan_intent(bytes, &self.sb, &baseline.storage, baseline.owner_generation)? != intent
+            || validation_plan_epoch(bytes)? != baseline.epoch
+        {
+            return Err(freshness_error("whole-plan authority changed"));
+        }
+        Ok(())
+    }
+
+    fn check_group_authority(
+        &self,
+        cx: &Cx,
+        state: &NativeFreshnessState,
+        index: usize,
+    ) -> Result<(), FfsError> {
+        let baseline = &state.baseline;
+        let tail = &baseline.storage.tails[index];
+        let dev = self.device();
+        let owner = dev.read_block(cx, tail.start)?;
+        let expected = owner_header(
+            &self.sb, baseline.storage.owner_inode, baseline.owner_generation,
+            baseline.storage.repair_basis_points, tail,
+        );
+        if owner.as_slice()[..OWNER_HEADER_BYTES] != expected[..OWNER_HEADER_BYTES]
+            || owner.as_slice()[PARITY_HEADER_END..].iter().any(|byte| *byte != 0)
+            || (index != 0 && owner.as_slice()[PLAN_HEADER_START..PLAN_HEADER_END].iter().any(|byte| *byte != 0))
+            || owner.as_slice()[OWNER_HEADER_BYTES..PLAN_HEADER_START] != state.tables[index][..VALIDATION_HEADER_BYTES]
+            || read_native_parity_intent(cx, &dev, &self.sb, baseline, tail)? != state.parity[index]
+        {
+            return Err(validation_error(tail, "native ownership changed during active epoch"));
+        }
+        let (root, table) = read_sealed_table(
+            cx, &dev, &self.sb, &baseline.storage, baseline.owner_generation, tail,
+        )?;
+        if root != baseline.roots[index] || table != state.tables[index] {
+            return Err(validation_error(tail, "native validation authority changed"));
+        }
+        native_sealed_generation(cx, &dev, &self.sb, baseline, tail, false)?;
+        Ok(())
+    }
+
+    fn check_authority(&self, cx: &Cx, state: &NativeFreshnessState) -> Result<(), FfsError> {
+        let root = state.baseline.plan_root;
+        let intent = if state.phase == FreshnessPhase::Clean {
+            ValidationIntent::Sealed(root)
+        } else {
+            ValidationIntent::Dirty(root)
+        };
+        self.check_plan(cx, &state.baseline, intent)?;
+        for index in 0..state.baseline.storage.tails.len() {
+            self.check_group_authority(cx, state, index)?;
+        }
+        Ok(())
+    }
+
+    fn stage_intended(
+        &self,
+        cx: &Cx,
+        state: &NativeFreshnessState,
+        offset: u64,
+        end: u64,
+        buffers: &[&[u8]],
+    ) -> Result<Vec<(BlockNumber, [u8; 32])>, FfsError> {
+        let size = u64::from(self.sb.block_size);
+        let mut staged = Vec::new();
+        let mut input = 0;
+        let mut consumed = 0;
+        for number in offset / size..=(end - 1) / size {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            let block = BlockNumber(number);
+            let tail = native_target(&state.baseline.storage, block)?;
+            let table = &state.tables[tail.group.0 as usize];
+            let digest_offset = VALIDATION_HEADER_BYTES + (number - tail.group_start.0) as usize * 32;
+            let expected = state.intended.get(&block).map_or(
+                &table[digest_offset..digest_offset + 32], |digest| digest.as_slice(),
+            );
+            let mut bytes = self.device().read_block(cx, block)?.into_inner();
+            if blake3::hash(&bytes).as_bytes() != expected {
+                return Err(FfsError::Corruption {
+                    block: number, detail: "native freshness beforeimage digest mismatch".into(),
+                });
+            }
+            let start = offset.max(number * size);
+            let stop = end.min((number + 1) * size);
+            let mut cursor = (start - number * size) as usize;
+            let limit = (stop - number * size) as usize;
+            while cursor < limit {
+                while consumed == buffers[input].len() {
+                    input += 1;
+                    consumed = 0;
+                }
+                let count = (limit - cursor).min(buffers[input].len() - consumed);
+                bytes[cursor..cursor + count].copy_from_slice(&buffers[input][consumed..consumed + count]);
+                cursor += count;
+                consumed += count;
+            }
+            staged.push((block, *blake3::hash(&bytes).as_bytes()));
+        }
+        Ok(staged)
+    }
+
+    fn write_buffers(&self, cx: &Cx, offset: ByteOffset, buffers: &[&[u8]]) -> Result<(), FfsError> {
+        let length = buffers.iter().try_fold(0_u64, |length, bytes| {
+            length.checked_add(bytes.len() as u64).ok_or_else(|| freshness_error("write length overflows"))
+        })?;
+        let mut state = self.lock(cx)?;
+        if length == 0 {
+            return Ok(());
+        }
+        let end = offset.0.checked_add(length)
+            .filter(|end| *end <= self.inner.len_bytes())
+            .ok_or_else(|| freshness_error("write exceeds admitted image"))?;
+        let size = u64::from(self.sb.block_size);
+        for number in offset.0 / size..=(end - 1) / size {
+            native_target(&state.baseline.storage, BlockNumber(number))?;
+        }
+        state.baseline.epoch.checked_add(1)
+            .ok_or_else(|| freshness_error("validation epoch exhausted before source write"))?;
+        for intent in &state.parity {
+            intent.generation().checked_add(1)
+                .ok_or_else(|| freshness_error("parity generation exhausted before source write"))?;
+        }
+        let result = (|| {
+            let staged = self.stage_intended(cx, &state, offset.0, end, buffers)?;
+            if state.phase == FreshnessPhase::Clean {
+                self.check_authority(cx, &state)?;
+                state.phase = FreshnessPhase::Poisoned;
+                publish_validation_plan(
+                    cx, &self.device(), &self.sb, &state.baseline.storage,
+                    state.baseline.owner_generation, state.baseline.epoch,
+                    ValidationIntent::Dirty(state.baseline.plan_root),
+                )?;
+                state.phase = FreshnessPhase::Dirty;
+            }
+            self.inner.write_vectored_all_at(cx, offset, buffers)?;
+            state.intended.extend(staged);
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)
+        })();
+        if result.is_err() {
+            state.phase = FreshnessPhase::Poisoned;
+        }
+        result
+    }
+
+    fn next_tables(
+        &self,
+        cx: &Cx,
+        state: &NativeFreshnessState,
+        epoch: u32,
+    ) -> Result<(Vec<Vec<u8>>, Vec<ValidationAdmission>), FfsError> {
+        let mut tables = Vec::with_capacity(state.tables.len());
+        let mut admissions = Vec::with_capacity(state.tables.len());
+        for (index, tail) in state.baseline.storage.tails.iter().enumerate() {
+            let mut table = state.tables[index].clone();
+            table[..VALIDATION_HEADER_BYTES].copy_from_slice(&validation_header(
+                &self.sb, state.baseline.storage.owner_inode, state.baseline.owner_generation,
+                tail, epoch, VALIDATION_PENDING, &[0; 32],
+            )?);
+            for (block, digest) in state.intended.range(tail.group_start..tail.start) {
+                let offset = VALIDATION_HEADER_BYTES + (block.0 - tail.group_start.0) as usize * 32;
+                table[offset..offset + 32].copy_from_slice(digest);
+            }
+            let (_, _, used) = validation_sizes(&self.sb, tail)?;
+            let root = validation_root(&table, used);
+            table[..VALIDATION_HEADER_BYTES].copy_from_slice(&validation_header(
+                &self.sb, state.baseline.storage.owner_inode, state.baseline.owner_generation,
+                tail, epoch, VALIDATION_PENDING, &root,
+            )?);
+            // The expected hashes came only from admitted tables or verified
+            // caller writes. Reading current bytes cannot redefine them.
+            verify_validation_table(cx, &self.device(), &self.sb, tail, &table, &root)?;
+            tables.push(table);
+            admissions.push(ValidationAdmission { epoch, root, intent: ValidationIntent::Pending(root) });
+        }
+        Ok((tables, admissions))
+    }
+
+    fn publish_groups(
+        &self,
+        cx: &Cx,
+        state: &NativeFreshnessState,
+        next: &NativeBaseline,
+        tables: &mut [Vec<u8>],
+        admissions: &[NativeGroupAdmission],
+    ) -> Result<(), FfsError> {
+        let dev = self.device();
+        for (index, tail) in next.storage.tails.iter().enumerate() {
+            self.check_plan(cx, next, ValidationIntent::Pending(next.plan_root))?;
+            self.check_group_authority(cx, state, index)?;
+            let validation = ValidationAdmission {
+                epoch: next.epoch,
+                root: next.roots[index],
+                intent: ValidationIntent::Pending(next.roots[index]),
+            };
+            publish_validation_group(
+                cx, &dev, &self.sb, next.storage.owner_inode, next.owner_generation,
+                tail, &validation,
+            )?;
+            let (root, table) = read_sealed_table(
+                cx, &dev, &self.sb, &next.storage, next.owner_generation, tail,
+            )?;
+            tables[index][..VALIDATION_HEADER_BYTES].copy_from_slice(&validation_header(
+                &self.sb, next.storage.owner_inode, next.owner_generation, tail,
+                next.epoch, VALIDATION_SEALED, &validation.root,
+            )?);
+            if root != validation.root || table != tables[index] {
+                return Err(validation_error(tail, "freshness table publication disagrees with intended bytes"));
+            }
+            encode_and_publish_native_group(cx, &dev, &self.sb, next, tail, &admissions[index], &table)?;
+        }
+        Ok(())
+    }
+
+    fn verified_parity(
+        &self,
+        cx: &Cx,
+        next: &NativeBaseline,
+        tables: &[Vec<u8>],
+        admissions: &[NativeGroupAdmission],
+    ) -> Result<Vec<ParityIntent>, FfsError> {
+        self.check_plan(cx, next, ValidationIntent::Pending(next.plan_root))?;
+        let dev = self.device();
+        let mut parity = Vec::with_capacity(next.storage.tails.len());
+        for (index, tail) in next.storage.tails.iter().enumerate() {
+            check_native_owner_prefix(cx, &dev, &self.sb, &next.storage, next.owner_generation, tail)?;
+            let (root, table) = read_sealed_table(
+                cx, &dev, &self.sb, &next.storage, next.owner_generation, tail,
+            )?;
+            if root != next.roots[index] || table != tables[index] {
+                return Err(validation_error(tail, "freshness authority changed before final seal"));
+            }
+            verify_validation_table(cx, &dev, &self.sb, tail, &table, &root)?;
+            let generation = native_sealed_generation(cx, &dev, &self.sb, next, tail, false)?;
+            if generation != admissions[index].next_generation {
+                return Err(validation_error(tail, "freshness parity generation changed before final seal"));
+            }
+            parity.push(read_native_parity_intent(cx, &dev, &self.sb, next, tail)?);
+        }
+        Ok(parity)
+    }
+
+    fn refresh(&self, cx: &Cx, state: &mut NativeFreshnessState) -> Result<(), FfsError> {
+        self.inner.sync(cx)?;
+        self.check_authority(cx, state)?;
+        let epoch = state.baseline.epoch.checked_add(1)
+            .ok_or_else(|| freshness_error("validation epoch exhausted"))?;
+        let (mut tables, validations) = self.next_tables(cx, state, epoch)?;
+        let plan_root = validation_plan_root(
+            &self.sb, &state.baseline.storage, state.baseline.owner_generation, &validations,
+        )?;
+        let next = NativeBaseline {
+            storage: state.baseline.storage.clone(),
+            owner_generation: state.baseline.owner_generation,
+            epoch,
+            plan_root,
+            roots: validations.iter().map(|admission| admission.root).collect(),
+        };
+        let dev = self.device();
+        let mut admissions = Vec::with_capacity(next.storage.tails.len());
+        for tail in &next.storage.tails {
+            let mut admission = admit_native_group(
+                cx, &dev, &self.sb, &state.baseline, tail, self.codec_budget,
+            )?;
+            // Source-root changes require a new parity generation even when
+            // current raw parity is intact. Retain its exact high-water and seal.
+            admission.retained = false;
+            admissions.push(admission);
+        }
+        publish_validation_plan(
+            cx, &dev, &self.sb, &next.storage, next.owner_generation, epoch,
+            ValidationIntent::Pending(plan_root),
+        )?;
+        self.publish_groups(cx, state, &next, &mut tables, &admissions)?;
+        let parity = self.verified_parity(cx, &next, &tables, &admissions)?;
+        publish_validation_plan(
+            cx, &dev, &self.sb, &next.storage, next.owner_generation, epoch,
+            ValidationIntent::Sealed(plan_root),
+        )?;
+        self.check_plan(cx, &next, ValidationIntent::Sealed(plan_root))?;
+        self.inner.sync(cx)?;
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        state.baseline = next;
+        state.tables = tables;
+        state.parity = parity;
+        state.intended.clear();
+        state.phase = FreshnessPhase::Clean;
+        Ok(())
+    }
+
+    fn sync_clean(&self, cx: &Cx, state: &NativeFreshnessState) -> Result<(), FfsError> {
+        self.check_authority(cx, state)?;
+        for (index, tail) in state.baseline.storage.tails.iter().enumerate() {
+            verify_validation_table(
+                cx, &self.device(), &self.sb, tail, &state.tables[index],
+                &state.baseline.roots[index],
+            )?;
+        }
+        self.inner.sync(cx)?;
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)
+    }
+}
+
+impl ByteDevice for NativeFreshnessDevice {
+    fn len_bytes(&self) -> u64 {
+        self.inner.len_bytes()
+    }
+
+    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, bytes: &mut [u8]) -> Result<(), FfsError> {
+        self.inner.read_exact_at(cx, offset, bytes)
+    }
+
+    fn write_all_at(&self, cx: &Cx, offset: ByteOffset, bytes: &[u8]) -> Result<(), FfsError> {
+        self.write_buffers(cx, offset, &[bytes])
+    }
+
+    fn write_vectored_all_at(&self, cx: &Cx, offset: ByteOffset, buffers: &[&[u8]]) -> Result<(), FfsError> {
+        self.write_buffers(cx, offset, buffers)
+    }
+
+    fn sync(&self, cx: &Cx) -> Result<(), FfsError> {
+        let mut state = self.lock(cx)?;
+        let result = if state.phase == FreshnessPhase::Clean {
+            self.sync_clean(cx, &state)
+        } else {
+            self.refresh(cx, &mut state)
+        };
+        if result.is_err() {
+            state.phase = FreshnessPhase::Poisoned;
+        }
+        result
+    }
 }
 
 fn tail_plan(sb: &Ext4Superblock, basis_points: u32) -> Result<Vec<NativeRepairTail>, FfsError> {
@@ -284,10 +700,14 @@ fn validation_header(
     owner: InodeNumber,
     owner_generation: u32,
     tail: &NativeRepairTail,
+    epoch: u32,
     state: u32,
     root: &[u8; 32],
 ) -> Result<[u8; VALIDATION_HEADER_BYTES], FfsError> {
     let (sources, _, _) = validation_sizes(sb, tail)?;
+    if epoch == 0 {
+        return Err(validation_error(tail, "zero validation epoch"));
+    }
     let mut bytes = [0; VALIDATION_HEADER_BYTES];
     bytes[..8].copy_from_slice(VALIDATION_MAGIC);
     bytes[8..24].copy_from_slice(&sb.uuid);
@@ -299,7 +719,7 @@ fn validation_header(
     bytes[52..56].copy_from_slice(&sb.block_size.to_le_bytes());
     bytes[56..64].copy_from_slice(&(tail.start.0 + 1).to_le_bytes());
     bytes[64..68].copy_from_slice(&tail.validation_blocks.to_le_bytes());
-    bytes[68..72].copy_from_slice(&1_u32.to_le_bytes());
+    bytes[68..72].copy_from_slice(&epoch.to_le_bytes());
     bytes[72..104].copy_from_slice(root);
     bytes[104..108].copy_from_slice(&state.to_le_bytes());
     let checksum = ffs_ondisk::ext4::ext4_chksum(!0, &bytes[..108]);
@@ -321,9 +741,10 @@ fn validation_intent(
         return Ok(ValidationIntent::Empty);
     }
     let root: [u8; 32] = bytes[72..104].try_into().expect("fixed record length");
+    let epoch = u32::from_le_bytes(bytes[68..72].try_into().expect("fixed record length"));
     let state = u32::from_le_bytes(bytes[104..108].try_into().expect("fixed record length"));
     if !matches!(state, VALIDATION_PENDING | VALIDATION_SEALED)
-        || bytes != validation_header(sb, owner, owner_generation, tail, state, &root)?
+        || bytes != validation_header(sb, owner, owner_generation, tail, epoch, state, &root)?
     {
         return Err(validation_error(
             tail,
@@ -373,6 +794,7 @@ fn build_validation_table(
     owner: InodeNumber,
     owner_generation: u32,
     tail: &NativeRepairTail,
+    epoch: u32,
 ) -> Result<Vec<u8>, FfsError> {
     let (sources, capacity, used) = validation_sizes(sb, tail)?;
     let mut table = vec![0; capacity];
@@ -381,6 +803,7 @@ fn build_validation_table(
         owner,
         owner_generation,
         tail,
+        epoch,
         VALIDATION_PENDING,
         &[0; 32],
     )?);
@@ -396,6 +819,7 @@ fn build_validation_table(
         owner,
         owner_generation,
         tail,
+        epoch,
         VALIDATION_PENDING,
         &root,
     )?);
@@ -581,6 +1005,8 @@ fn read_sealed_table(
         generation,
         tail,
     )? != intent
+        || owner.as_slice()[OWNER_HEADER_BYTES..PLAN_HEADER_START]
+            != table[..VALIDATION_HEADER_BYTES]
     {
         return Err(validation_error(tail, "sealed intent and table disagree"));
     }
@@ -605,6 +1031,7 @@ fn read_native_baseline(fs: &OpenFs, cx: &Cx) -> Result<NativeBaseline, FfsError
         &storage,
         generation,
     )?;
+    let epoch = validation_plan_epoch(&owner.as_slice()[PLAN_HEADER_START..PLAN_HEADER_END])?;
     let ValidationIntent::Sealed(plan_root) = plan else {
         return Err(validation_error(
             &storage.tails[0],
@@ -613,8 +1040,13 @@ fn read_native_baseline(fs: &OpenFs, cx: &Cx) -> Result<NativeBaseline, FfsError
     };
     let mut admissions = Vec::with_capacity(storage.tails.len());
     for tail in &storage.tails {
-        let (root, _) = read_sealed_table(cx, &dev, sb, &storage, generation, tail)?;
+        let (root, table) = read_sealed_table(cx, &dev, sb, &storage, generation, tail)?;
+        let local_epoch = u32::from_le_bytes(table[68..72].try_into().expect("checked table"));
+        if local_epoch != epoch {
+            return Err(validation_error(tail, "whole-plan and local epochs disagree"));
+        }
         admissions.push(ValidationAdmission {
+            epoch,
             root,
             intent: ValidationIntent::Sealed(root),
         });
@@ -628,6 +1060,7 @@ fn read_native_baseline(fs: &OpenFs, cx: &Cx) -> Result<NativeBaseline, FfsError
     Ok(NativeBaseline {
         storage,
         owner_generation: generation,
+        epoch,
         plan_root,
         roots: admissions.into_iter().map(|group| group.root).collect(),
     })
@@ -638,6 +1071,7 @@ fn ensure_native_baseline(fs: &OpenFs, cx: &Cx, expected: &NativeBaseline) -> Re
     if current.plan_root != expected.plan_root
         || current.storage != expected.storage
         || current.owner_generation != expected.owner_generation
+        || current.epoch != expected.epoch
         || current.roots != expected.roots
     {
         return Err(FfsError::RepairFailed(
@@ -971,10 +1405,41 @@ fn publish_native_group(
         native_sealed_generation(cx, dev, sb, baseline, tail, false)?;
         return dev.sync(cx);
     }
+    encode_and_publish_native_group(cx, dev, sb, baseline, tail, admission, &table)
+}
+
+fn encode_and_publish_native_group(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    sb: &Ext4Superblock,
+    baseline: &NativeBaseline,
+    tail: &NativeRepairTail,
+    admission: &NativeGroupAdmission,
+    table: &[u8],
+) -> Result<(), FfsError> {
+    // A live epoch changes the validation root before parity. Only this
+    // already-admitted transition accepts the exact preceding parity anchor;
+    // cold readers continue to require the new root and a sealed whole plan.
+    let owner = dev.read_block(cx, tail.start)?;
+    if parity_intent(
+        &owner.as_slice()[PARITY_HEADER_START..PARITY_HEADER_END],
+        sb,
+        &baseline.storage,
+        baseline.owner_generation,
+        tail,
+    )? != admission.intent {
+        return Err(validation_error(tail, "native parity changed during transition"));
+    }
+    let root = baseline.roots[tail.group.0 as usize];
+    let (layout, expected) = native_layout(sb, tail)?;
+    let storage = RepairGroupStorage::new(dev, layout);
+    if storage.preflight_raw_refresh(cx, &expected)? != admission.raw {
+        return Err(validation_error(tail, "native descriptors changed during transition"));
+    }
     let view = NativeDigestDevice {
         dev,
         tail,
-        table: &table,
+        table,
         corrupt: &[],
     };
     let (sources, _, _) = validation_sizes(sb, tail)?;
@@ -995,7 +1460,7 @@ fn publish_native_group(
         .into_iter()
         .map(|symbol| (symbol.esi, symbol.data))
         .collect();
-    verify_validation_table(cx, dev, sb, tail, &table, &root)?;
+    verify_validation_table(cx, dev, sb, tail, table, &root)?;
     write_native_parity_intent(
         cx,
         dev,
@@ -1030,7 +1495,7 @@ fn publish_native_group(
             "native parity readback differs from encoded symbols",
         ));
     }
-    verify_validation_table(cx, dev, sb, tail, &table, &root)?;
+    verify_validation_table(cx, dev, sb, tail, table, &root)?;
     let manifest = native_manifest(cx, dev, layout, admission.next_generation)?;
     write_native_parity_intent(
         cx,
@@ -1212,10 +1677,14 @@ fn validation_plan_header(
     sb: &Ext4Superblock,
     storage: &NativeRepairStorage,
     generation: u32,
+    epoch: u32,
     state: u32,
     root: &[u8; 32],
 ) -> Result<[u8; VALIDATION_HEADER_BYTES], FfsError> {
     let report = native_validation_report(sb, storage)?;
+    if epoch == 0 {
+        return Err(FfsError::RepairFailed("zero native whole-plan epoch".into()));
+    }
     let mut bytes = [0; VALIDATION_HEADER_BYTES];
     bytes[..8].copy_from_slice(PLAN_MAGIC);
     bytes[8..24].copy_from_slice(&sb.uuid);
@@ -1225,12 +1694,23 @@ fn validation_plan_header(
     bytes[40..44].copy_from_slice(&storage.repair_basis_points.to_le_bytes());
     bytes[44..48].copy_from_slice(&sb.block_size.to_le_bytes());
     bytes[48..56].copy_from_slice(&report.source_blocks.to_le_bytes());
-    bytes[56..64].copy_from_slice(&1_u64.to_le_bytes());
+    bytes[56..64].copy_from_slice(&u64::from(epoch).to_le_bytes());
     bytes[64..96].copy_from_slice(root);
     bytes[96..100].copy_from_slice(&state.to_le_bytes());
     let checksum = ffs_ondisk::ext4::ext4_chksum(!0, &bytes[..100]);
     bytes[100..104].copy_from_slice(&checksum.to_le_bytes());
     Ok(bytes)
+}
+
+fn validation_plan_epoch(bytes: &[u8]) -> Result<u32, FfsError> {
+    let encoded = bytes
+        .get(56..64)
+        .ok_or_else(|| FfsError::RepairFailed("short native whole-plan epoch".into()))?;
+    let epoch = u64::from_le_bytes(encoded.try_into().expect("checked epoch length"));
+    u32::try_from(epoch)
+        .ok()
+        .filter(|epoch| *epoch != 0)
+        .ok_or_else(|| FfsError::RepairFailed("invalid native whole-plan epoch".into()))
 }
 
 fn validation_plan_intent(
@@ -1247,12 +1727,13 @@ fn validation_plan_intent(
         return Err(validation_error(tail, "whole-plan record missing"));
     }
     let root: [u8; 32] = bytes[64..96].try_into().expect("fixed record length");
+    let epoch = validation_plan_epoch(bytes)?;
     let state = u32::from_le_bytes(bytes[96..100].try_into().expect("fixed record length"));
     if !matches!(
         state,
-        PLAN_PREPARED | VALIDATION_PENDING | VALIDATION_SEALED
-    ) || (state == PLAN_PREPARED && root != [0; 32])
-        || bytes != validation_plan_header(sb, storage, generation, state, &root)?
+        PLAN_PREPARED | VALIDATION_PENDING | VALIDATION_SEALED | PLAN_DIRTY
+    ) || (state == PLAN_PREPARED && (root != [0; 32] || epoch != 1))
+        || bytes != validation_plan_header(sb, storage, generation, epoch, state, &root)?
     {
         return Err(validation_error(
             tail,
@@ -1261,6 +1742,8 @@ fn validation_plan_intent(
     }
     Ok(if state == PLAN_PREPARED {
         ValidationIntent::Prepared
+    } else if state == PLAN_DIRTY {
+        ValidationIntent::Dirty(root)
     } else if state == VALIDATION_PENDING {
         ValidationIntent::Pending(root)
     } else {
@@ -1274,7 +1757,15 @@ fn validation_plan_root(
     generation: u32,
     admissions: &[ValidationAdmission],
 ) -> Result<[u8; 32], FfsError> {
-    let header = validation_plan_header(sb, storage, generation, VALIDATION_PENDING, &[0; 32])?;
+    let epoch = admissions.first().ok_or_else(|| {
+        FfsError::RepairFailed("native whole-plan has no groups".into())
+    })?.epoch;
+    if admissions.len() != storage.tails.len()
+        || admissions.iter().any(|admission| admission.epoch != epoch)
+    {
+        return Err(FfsError::RepairFailed("native whole-plan epoch mismatch".into()));
+    }
+    let header = validation_plan_header(sb, storage, generation, epoch, VALIDATION_PENDING, &[0; 32])?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"FrankenFS native whole-plan validation v1");
     hasher.update(&header[..64]);
@@ -1284,6 +1775,7 @@ fn validation_plan_root(
             storage.owner_inode,
             generation,
             tail,
+            epoch,
             VALIDATION_PENDING,
             &admission.root,
         )?;
@@ -1298,13 +1790,21 @@ fn publish_validation_plan(
     sb: &Ext4Superblock,
     storage: &NativeRepairStorage,
     generation: u32,
-    state: u32,
-    root: &[u8; 32],
+    epoch: u32,
+    intent: ValidationIntent,
 ) -> Result<(), FfsError> {
+    let (state, root) = match intent {
+        ValidationIntent::Dirty(root) => (PLAN_DIRTY, root),
+        ValidationIntent::Pending(root) => (VALIDATION_PENDING, root),
+        ValidationIntent::Sealed(root) => (VALIDATION_SEALED, root),
+        ValidationIntent::Empty | ValidationIntent::Prepared => {
+            return Err(FfsError::RepairFailed("invalid native plan publication".into()));
+        }
+    };
     let first = storage.tails[0].start;
     let mut owner = dev.read_block(cx, first)?.into_inner();
     owner[PLAN_HEADER_START..PLAN_HEADER_END].copy_from_slice(&validation_plan_header(
-        sb, storage, generation, state, root,
+        sb, storage, generation, epoch, state, &root,
     )?);
     cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
     dev.write_block(cx, first, &owner)?;
@@ -1328,6 +1828,10 @@ fn admit_validation_plan(
         storage,
         generation,
     )?;
+    let epoch = validation_plan_epoch(&owner.as_slice()[PLAN_HEADER_START..PLAN_HEADER_END])?;
+    if admissions.iter().any(|admission| admission.epoch != epoch) {
+        return Err(validation_error(first, "whole-plan and local epochs disagree"));
+    }
     match plan {
         ValidationIntent::Prepared => {
             if admissions
@@ -1357,6 +1861,9 @@ fn admit_validation_plan(
         }
         ValidationIntent::Empty => {
             return Err(validation_error(first, "whole-plan record missing"));
+        }
+        ValidationIntent::Dirty(_) => {
+            return Err(validation_error(first, "native source write epoch is dirty"));
         }
     }
     Ok((plan, root))
@@ -1390,6 +1897,11 @@ fn admit_validation_group(
         tail,
     )?;
     let table = read_validation_table(cx, dev, sb, tail)?;
+    let epoch = if intent == ValidationIntent::Empty {
+        1
+    } else {
+        u32::from_le_bytes(block.as_slice()[132..136].try_into().expect("owner header"))
+    };
     if let ValidationIntent::Sealed(root) = intent {
         if validation_intent(
             &table[..VALIDATION_HEADER_BYTES],
@@ -1398,11 +1910,13 @@ fn admit_validation_group(
             generation,
             tail,
         )? != ValidationIntent::Sealed(root)
+            || block.as_slice()[OWNER_HEADER_BYTES..PLAN_HEADER_START]
+                != table[..VALIDATION_HEADER_BYTES]
         {
             return Err(validation_error(tail, "sealed intent and table disagree"));
         }
         verify_validation_table(cx, dev, sb, tail, &table, &root)?;
-        return Ok(ValidationAdmission { root, intent });
+        return Ok(ValidationAdmission { epoch, root, intent });
     }
     if intent == ValidationIntent::Empty
         && table[..sb.block_size as usize]
@@ -1411,7 +1925,7 @@ fn admit_validation_group(
     {
         return Err(validation_error(tail, "table has no initialization intent"));
     }
-    let expected = build_validation_table(cx, dev, sb, owner, generation, tail)?;
+    let expected = build_validation_table(cx, dev, sb, owner, generation, tail, epoch)?;
     let (_, _, used) = validation_sizes(sb, tail)?;
     let root = validation_root(&expected, used);
     if let ValidationIntent::Pending(persisted) = intent
@@ -1422,7 +1936,7 @@ fn admit_validation_group(
             "pending initialization source changed",
         ));
     }
-    Ok(ValidationAdmission { root, intent })
+    Ok(ValidationAdmission { epoch, root, intent })
 }
 
 fn publish_validation_group(
@@ -1432,9 +1946,11 @@ fn publish_validation_group(
     owner: InodeNumber,
     generation: u32,
     tail: &NativeRepairTail,
-    root: &[u8; 32],
+    admission: &ValidationAdmission,
 ) -> Result<(), FfsError> {
-    let mut table = build_validation_table(cx, dev, sb, owner, generation, tail)?;
+    let root = &admission.root;
+    let epoch = admission.epoch;
+    let mut table = build_validation_table(cx, dev, sb, owner, generation, tail, epoch)?;
     let (_, _, used) = validation_sizes(sb, tail)?;
     if &validation_root(&table, used) != root {
         return Err(validation_error(
@@ -1442,7 +1958,7 @@ fn publish_validation_group(
             "source changed after initialization admission",
         ));
     }
-    let pending = validation_header(sb, owner, generation, tail, VALIDATION_PENDING, root)?;
+    let pending = validation_header(sb, owner, generation, tail, epoch, VALIDATION_PENDING, root)?;
     // Preserve the entire immutable ownership prefix verbatim.
     let mut ownership = dev.read_block(cx, tail.start)?.into_inner();
     ownership[OWNER_HEADER_BYTES..OWNER_HEADER_BYTES + VALIDATION_HEADER_BYTES]
@@ -1464,7 +1980,7 @@ fn publish_validation_group(
         ));
     }
     verify_validation_table(cx, dev, sb, tail, &table, root)?;
-    let sealed = validation_header(sb, owner, generation, tail, VALIDATION_SEALED, root)?;
+    let sealed = validation_header(sb, owner, generation, tail, epoch, VALIDATION_SEALED, root)?;
     table[..VALIDATION_HEADER_BYTES].copy_from_slice(&sealed);
     dev.write_block(
         cx,
@@ -1480,6 +1996,67 @@ fn publish_validation_group(
 }
 
 impl OpenFs {
+    /// Admit sealed native protection and fence all subsequent source writes.
+    /// The caller must exclusively own the image and activate before recovery
+    /// or writable operation. No unwrapped device handle is returned.
+    ///
+    /// # Errors
+    /// Refuses unsealed or changed protection, insufficient resources, active
+    /// external metadata logs, repeated activation and unsupported ownership.
+    pub fn activate_native_ext4_repair(
+        &mut self,
+        cx: &Cx,
+        max_working_bytes: u64,
+    ) -> Result<NativeRepairReport, FfsError> {
+        self.require_native_mode("activate_native_repair")?;
+        if self.native_repair_active {
+            return Err(freshness_error("device is already active"));
+        }
+        if self.metadata_log.is_some() || self.metadata_compactor.lock().is_some() {
+            return Err(freshness_error("external metadata WAL is not admitted"));
+        }
+        let storage = self.native_ext4_repair_storage(cx)?;
+        let sb = self.ext4_superblock().expect("validated native ext4 ownership").clone();
+        let codec_budget = freshness_codec_budget(&sb, &storage, max_working_bytes)?;
+        for tail in &storage.tails {
+            native_codec_budget(&sb, &storage, tail, codec_budget, false)?;
+        }
+        let baseline = read_native_baseline(self, cx)?;
+        baseline.epoch.checked_add(1)
+            .ok_or_else(|| freshness_error("validation epoch exhausted before activation"))?;
+        let report = self.check_native_ext4_repair(cx)?;
+        let dev = ByteDeviceBlockAdapter { dev: self.dev.as_ref(), block_size: sb.block_size };
+        let mut tables = Vec::with_capacity(storage.tails.len());
+        let mut parity = Vec::with_capacity(storage.tails.len());
+        for (index, tail) in storage.tails.iter().enumerate() {
+            let (root, table) = read_sealed_table(
+                cx, &dev, &sb, &storage, baseline.owner_generation, tail,
+            )?;
+            if root != baseline.roots[index] {
+                return Err(validation_error(tail, "source authority changed during activation"));
+            }
+            verify_validation_table(cx, &dev, &sb, tail, &table, &root)?;
+            let admission = admit_native_group(cx, &dev, &sb, &baseline, tail, codec_budget)?;
+            if !admission.retained || admission.intent.generation() != report.generations[index] {
+                return Err(validation_error(tail, "parity authority changed during activation"));
+            }
+            tables.push(table);
+            parity.push(admission.intent);
+        }
+        ensure_native_baseline(self, cx, &baseline)?;
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        self.dev = Arc::new(NativeFreshnessDevice {
+            inner: Arc::clone(&self.dev),
+            sb,
+            state: NativeMutex::new(NativeFreshnessState {
+                baseline, tables, parity, intended: BTreeMap::new(), phase: FreshnessPhase::Clean,
+            }),
+            codec_budget,
+        });
+        self.native_repair_active = true;
+        Ok(report)
+    }
+
     /// Publish native parity from the existing sealed source baseline.
     /// The caller must exclude all writers for this consumed offline view.
     /// Resource and whole-plan admission precede writes; protection stays inactive.
@@ -1699,8 +2276,8 @@ impl OpenFs {
                 sb,
                 &storage,
                 inode.generation,
-                VALIDATION_PENDING,
-                &root,
+                admissions[0].epoch,
+                ValidationIntent::Pending(root),
             )?;
         } else if matches!(plan, ValidationIntent::Pending(_)) {
             // An earlier plan sync may have failed after its write became visible.
@@ -1718,7 +2295,7 @@ impl OpenFs {
                 storage.owner_inode,
                 inode.generation,
                 tail,
-                &admission.root,
+                admission,
             )?;
         }
         if !matches!(plan, ValidationIntent::Sealed(_)) {
@@ -1728,8 +2305,8 @@ impl OpenFs {
                 sb,
                 &storage,
                 inode.generation,
-                VALIDATION_SEALED,
-                &root,
+                admissions[0].epoch,
+                ValidationIntent::Sealed(root),
             )?;
         }
         // A previous failed sync may leave sealing visible but undurable.
@@ -1763,6 +2340,9 @@ impl OpenFs {
             &storage,
             inode.generation,
         )?;
+        let epoch = validation_plan_epoch(
+            &first_owner.as_slice()[PLAN_HEADER_START..PLAN_HEADER_END],
+        )?;
         let ValidationIntent::Sealed(plan_root) = plan else {
             return Err(validation_error(
                 &storage.tails[0],
@@ -1793,11 +2373,14 @@ impl OpenFs {
                 inode.generation,
                 tail,
             )? != ValidationIntent::Sealed(root)
+                || owner.as_slice()[OWNER_HEADER_BYTES..PLAN_HEADER_START]
+                    != table[..VALIDATION_HEADER_BYTES]
+                || u32::from_le_bytes(table[68..72].try_into().expect("checked table")) != epoch
             {
                 return Err(validation_error(tail, "sealed intent and table disagree"));
             }
             verify_validation_table(cx, &dev, sb, tail, &table, &root)?;
-            admissions.push(ValidationAdmission { root, intent });
+            admissions.push(ValidationAdmission { epoch, root, intent });
         }
         if validation_plan_root(sb, &storage, inode.generation, &admissions)? != plan_root {
             return Err(validation_error(
@@ -1921,6 +2504,7 @@ impl OpenFs {
                             &sb,
                             &storage,
                             inode.generation,
+                            1,
                             PLAN_PREPARED,
                             &[0; 32],
                         )?,

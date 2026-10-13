@@ -72,6 +72,18 @@
 > verified historical block to a new file. It never writes or syncs the image.
 > Durable pre-write freshness, mounted activation and Btrfs ownership stay open.
 
+> **Explicit native write freshness (`bd-11a8t`, implementation under validation):**
+> `OpenOptions::native_repair_max_working_bytes` installs one native physical
+> device before constructor recovery. Activation admits sealed whole-plan/local
+> epochs, actual source digests and complete parity. Writes derive intended
+> digests from verified beforeimages and caller bytes, with a synced Dirty fence
+> before source I/O. Sync verifies those expectations before publishing the exact
+> next-epoch plan, local tables and advancing parity. The compactor shares the
+> original device Arc rather than reopening the image. The initial path refuses
+> external metadata-WAL combinations and interrupted epochs; default activation,
+> automatic read repair, restart reconciliation and Btrfs ownership remain open.
+> Source wiring is not executed mounted proof.
+
 > **Ordinary mount worker ownership (`bd-11a8t`):** the CLI owns one
 > asupersync runtime with one scheduler thread and at most two blocking workers.
 > Scrub and periodic commit each run in a child region with a runtime-provided

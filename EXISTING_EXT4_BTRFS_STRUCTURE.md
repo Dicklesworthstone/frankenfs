@@ -684,6 +684,15 @@ baseline. Neither ext4 metadata checks nor allocator ownership distinguish a
 legitimate later write from corruption; baseline reconstruction therefore
 exports bytes read-only until durable freshness authority exists.
 
+JBD2 recovery-marker, log, checkpoint and orphan writes are legitimate physical
+source mutations and therefore need the same pre-write freshness fence as file
+data. A refresh must retain independently attested old digests and modify only
+the blocks intended by those writes. Rehashing the entire current image would
+silently bless unrelated corruption. Native epoch/intent records remain within
+the allocated unwritten ranges; their publication adds no kernel-visible extent
+or free-space changes. Background home-block compaction must share the admitted
+device rather than reopen a writer that bypasses that fence.
+
 The `ee_len` field uses its MSB (bit 15) as an "unwritten" flag:
 
 - If `ee_len <= 0x8000` (32768): the extent is **initialized** and

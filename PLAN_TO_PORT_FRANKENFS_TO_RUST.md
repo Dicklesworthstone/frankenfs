@@ -143,6 +143,13 @@ generation-bound owner records and verified raw parity publication; export
 digest-validated baseline reconstruction read-only. Durable pre-write freshness
 fencing must precede in-place recovery and mounted activation. Preparation alone cannot enable
 read-write background repair; Btrfs needs its own allocation ownership path.
+The next positive transition installs a shared native device before constructor
+recovery: verify beforeimages, derive intended digests, sync a Dirty fence before
+source writes, then publish the exact advancing validation/whole-plan/parity epoch
+only after sync verifies those intentions across all sources. Do not reconstruct
+new authority from arbitrary current bytes. Explicit activation is qualified
+separately from default repair, automatic recovery and interrupted-epoch restart;
+external metadata-WAL combinations remain refused until their boundary is proven.
 The current offline codec admits at most 56,403 source blocks per group,
 full-block symbols between 1,024 and 65,535 bytes, repair count no greater
 than source count, and a checked caller allocation budget. Larger native
