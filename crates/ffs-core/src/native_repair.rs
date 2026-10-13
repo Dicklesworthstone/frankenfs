@@ -5,17 +5,26 @@
 //! through normal file reads. Headers are read through physical block mappings.
 
 use super::{
-    AllocHint, BTreeSet, BlockDevice, BlockNumber, Cx, EXT4_SECTOR_SIZE, EXT4_VALID_FS,
-    Ext4AllocState, Ext4Extent, Ext4FileType, Ext4Inode, Ext4Superblock, ExtentTree, FfsError,
-    FsGeometry, GroupNumber, InodeNumber, Jbd2Superblock, Mutex, OpenFs, OsStr, Serialize,
-    SingleLockDirAlloc, TransactionBlockAdapter, debug, ext4_superblock_requires_journal_recovery,
-    parse_extent_tree, parse_to_ffs_error,
+    AllocHint, BTreeSet, BlockDevice, BlockNumber, ByteDeviceBlockAdapter, Cx, EXT4_SECTOR_SIZE,
+    EXT4_VALID_FS, Ext4AllocState, Ext4Extent, Ext4FileType, Ext4Inode, Ext4Superblock, ExtentTree,
+    FfsError, FsGeometry, GroupNumber, InodeNumber, Jbd2Superblock, Mutex, OpenFs, OsStr,
+    Serialize, SingleLockDirAlloc, TransactionBlockAdapter, debug,
+    ext4_superblock_requires_journal_recovery, parse_extent_tree, parse_to_ffs_error,
 };
 
 const OWNER_NAME: &str = ".frankenfs-repair";
 const OWNER_MAGIC: &[u8; 8] = b"FFSNAT01";
 const OWNER_HEADER_BYTES: usize = 64;
 const DESCRIPTOR_BLOCKS: u32 = 2;
+const VALIDATION_MAGIC: &[u8; 8] = b"FFSVAL01";
+const VALIDATION_HEADER_BYTES: usize = 128;
+const MAX_VALIDATION_TABLE_BYTES: usize = 32 * 1024 * 1024;
+const VALIDATION_PENDING: u32 = 1;
+const VALIDATION_SEALED: u32 = 2;
+const PLAN_PREPARED: u32 = 3;
+const PLAN_MAGIC: &[u8; 8] = b"FFSPLN01";
+const PLAN_HEADER_START: usize = OWNER_HEADER_BYTES + VALIDATION_HEADER_BYTES;
+const PLAN_HEADER_END: usize = PLAN_HEADER_START + VALIDATION_HEADER_BYTES;
 
 /// An ext4 allocation group's owned native repair tail.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -43,6 +52,28 @@ pub struct NativeRepairStorage {
     /// Hundredths of a percent: 500 means five percent of each allocation group.
     pub repair_basis_points: u32,
     pub tails: Vec<NativeRepairTail>,
+}
+
+/// Source data checked against persisted native validation records.
+/// This does not certify repair-symbol freshness or authorize decoding.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct NativeValidationReport {
+    pub owner_inode: InodeNumber,
+    pub groups: u32,
+    pub source_blocks: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ValidationIntent {
+    Empty,
+    Prepared,
+    Pending([u8; 32]),
+    Sealed([u8; 32]),
+}
+
+struct ValidationAdmission {
+    root: [u8; 32],
+    intent: ValidationIntent,
 }
 
 fn tail_plan(sb: &Ext4Superblock, basis_points: u32) -> Result<Vec<NativeRepairTail>, FfsError> {
@@ -141,7 +172,633 @@ fn owner_extents(tails: &[NativeRepairTail]) -> Vec<Ext4Extent> {
     extents
 }
 
+fn validation_error(tail: &NativeRepairTail, detail: &str) -> FfsError {
+    FfsError::Corruption {
+        block: tail.start.0,
+        detail: format!("native validation group {}: {detail}", tail.group.0),
+    }
+}
+
+fn validation_sizes(
+    sb: &Ext4Superblock,
+    tail: &NativeRepairTail,
+) -> Result<(u32, usize, usize), FfsError> {
+    let sources = tail
+        .start
+        .0
+        .checked_sub(tail.group_start.0)
+        .ok_or_else(|| validation_error(tail, "source range underflows"))?;
+    let sources =
+        u32::try_from(sources).map_err(|_| validation_error(tail, "source count exceeds u32"))?;
+    let capacity = usize::try_from(u64::from(tail.validation_blocks) * u64::from(sb.block_size))
+        .map_err(|_| validation_error(tail, "table capacity exceeds usize"))?;
+    let used = usize::try_from(u64::from(sources) * 32)
+        .ok()
+        .and_then(|bytes| bytes.checked_add(VALIDATION_HEADER_BYTES))
+        .ok_or_else(|| validation_error(tail, "table length overflows"))?;
+    if sources == 0 || used > capacity || capacity > MAX_VALIDATION_TABLE_BYTES {
+        return Err(validation_error(
+            tail,
+            "table does not fit bounded validation storage",
+        ));
+    }
+    Ok((sources, capacity, used))
+}
+
+fn validation_header(
+    sb: &Ext4Superblock,
+    owner: InodeNumber,
+    owner_generation: u32,
+    tail: &NativeRepairTail,
+    state: u32,
+    root: &[u8; 32],
+) -> Result<[u8; VALIDATION_HEADER_BYTES], FfsError> {
+    let (sources, _, _) = validation_sizes(sb, tail)?;
+    let mut bytes = [0; VALIDATION_HEADER_BYTES];
+    bytes[..8].copy_from_slice(VALIDATION_MAGIC);
+    bytes[8..24].copy_from_slice(&sb.uuid);
+    bytes[24..32].copy_from_slice(&owner.0.to_le_bytes());
+    bytes[32..36].copy_from_slice(&owner_generation.to_le_bytes());
+    bytes[36..40].copy_from_slice(&tail.group.0.to_le_bytes());
+    bytes[40..48].copy_from_slice(&tail.group_start.0.to_le_bytes());
+    bytes[48..52].copy_from_slice(&sources.to_le_bytes());
+    bytes[52..56].copy_from_slice(&sb.block_size.to_le_bytes());
+    bytes[56..64].copy_from_slice(&(tail.start.0 + 1).to_le_bytes());
+    bytes[64..68].copy_from_slice(&tail.validation_blocks.to_le_bytes());
+    bytes[68..72].copy_from_slice(&1_u32.to_le_bytes());
+    bytes[72..104].copy_from_slice(root);
+    bytes[104..108].copy_from_slice(&state.to_le_bytes());
+    let checksum = ffs_ondisk::ext4::ext4_chksum(!0, &bytes[..108]);
+    bytes[108..112].copy_from_slice(&checksum.to_le_bytes());
+    Ok(bytes)
+}
+
+fn validation_intent(
+    bytes: &[u8],
+    sb: &Ext4Superblock,
+    owner: InodeNumber,
+    owner_generation: u32,
+    tail: &NativeRepairTail,
+) -> Result<ValidationIntent, FfsError> {
+    if bytes.len() != VALIDATION_HEADER_BYTES {
+        return Err(validation_error(tail, "record length mismatch"));
+    }
+    if bytes.iter().all(|byte| *byte == 0) {
+        return Ok(ValidationIntent::Empty);
+    }
+    let root: [u8; 32] = bytes[72..104].try_into().expect("fixed record length");
+    let state = u32::from_le_bytes(bytes[104..108].try_into().expect("fixed record length"));
+    if !matches!(state, VALIDATION_PENDING | VALIDATION_SEALED)
+        || bytes != validation_header(sb, owner, owner_generation, tail, state, &root)?
+    {
+        return Err(validation_error(
+            tail,
+            "record identity or checksum mismatch",
+        ));
+    }
+    Ok(if state == VALIDATION_PENDING {
+        ValidationIntent::Pending(root)
+    } else {
+        ValidationIntent::Sealed(root)
+    })
+}
+
+fn validation_root(table: &[u8], used: usize) -> [u8; 32] {
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"FrankenFS native source validation v1");
+    hasher.update(&table[..72]);
+    hasher.update(&table[VALIDATION_HEADER_BYTES..used]);
+    *hasher.finalize().as_bytes()
+}
+
+fn read_validation_table(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    sb: &Ext4Superblock,
+    tail: &NativeRepairTail,
+) -> Result<Vec<u8>, FfsError> {
+    let (_, capacity, _) = validation_sizes(sb, tail)?;
+    let mut table = Vec::with_capacity(capacity);
+    for index in 0..tail.validation_blocks {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        table.extend_from_slice(
+            dev.read_block(cx, BlockNumber(tail.start.0 + 1 + u64::from(index)))?
+                .as_slice(),
+        );
+    }
+    if table.len() != capacity {
+        return Err(validation_error(tail, "short validation read"));
+    }
+    Ok(table)
+}
+
+fn build_validation_table(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    sb: &Ext4Superblock,
+    owner: InodeNumber,
+    owner_generation: u32,
+    tail: &NativeRepairTail,
+) -> Result<Vec<u8>, FfsError> {
+    let (sources, capacity, used) = validation_sizes(sb, tail)?;
+    let mut table = vec![0; capacity];
+    table[..VALIDATION_HEADER_BYTES].copy_from_slice(&validation_header(
+        sb,
+        owner,
+        owner_generation,
+        tail,
+        VALIDATION_PENDING,
+        &[0; 32],
+    )?);
+    for index in 0..sources {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let block = dev.read_block(cx, BlockNumber(tail.group_start.0 + u64::from(index)))?;
+        let offset = VALIDATION_HEADER_BYTES + index as usize * 32;
+        table[offset..offset + 32].copy_from_slice(blake3::hash(block.as_slice()).as_bytes());
+    }
+    let root = validation_root(&table, used);
+    table[..VALIDATION_HEADER_BYTES].copy_from_slice(&validation_header(
+        sb,
+        owner,
+        owner_generation,
+        tail,
+        VALIDATION_PENDING,
+        &root,
+    )?);
+    Ok(table)
+}
+
+fn verify_validation_table(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    sb: &Ext4Superblock,
+    tail: &NativeRepairTail,
+    table: &[u8],
+    root: &[u8; 32],
+) -> Result<(), FfsError> {
+    let (sources, capacity, used) = validation_sizes(sb, tail)?;
+    if table.len() != capacity
+        || &validation_root(table, used) != root
+        || table[used..].iter().any(|byte| *byte != 0)
+    {
+        return Err(validation_error(tail, "digest table integrity mismatch"));
+    }
+    for index in 0..sources {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let number = BlockNumber(tail.group_start.0 + u64::from(index));
+        let block = dev.read_block(cx, number)?;
+        let offset = VALIDATION_HEADER_BYTES + index as usize * 32;
+        if blake3::hash(block.as_slice()).as_bytes() != &table[offset..offset + 32] {
+            return Err(FfsError::Corruption {
+                block: number.0,
+                detail: format!("native source digest mismatch in group {}", tail.group.0),
+            });
+        }
+    }
+    Ok(())
+}
+
+fn native_validation_report(
+    sb: &Ext4Superblock,
+    storage: &NativeRepairStorage,
+) -> Result<NativeValidationReport, FfsError> {
+    let mut source_blocks = 0;
+    for tail in &storage.tails {
+        source_blocks += u64::from(validation_sizes(sb, tail)?.0);
+    }
+    Ok(NativeValidationReport {
+        owner_inode: storage.owner_inode,
+        groups: u32::try_from(storage.tails.len())
+            .map_err(|_| FfsError::InvalidGeometry("validation group count exceeds u32".into()))?,
+        source_blocks,
+    })
+}
+
+fn validation_plan_header(
+    sb: &Ext4Superblock,
+    storage: &NativeRepairStorage,
+    generation: u32,
+    state: u32,
+    root: &[u8; 32],
+) -> Result<[u8; VALIDATION_HEADER_BYTES], FfsError> {
+    let report = native_validation_report(sb, storage)?;
+    let mut bytes = [0; VALIDATION_HEADER_BYTES];
+    bytes[..8].copy_from_slice(PLAN_MAGIC);
+    bytes[8..24].copy_from_slice(&sb.uuid);
+    bytes[24..32].copy_from_slice(&storage.owner_inode.0.to_le_bytes());
+    bytes[32..36].copy_from_slice(&generation.to_le_bytes());
+    bytes[36..40].copy_from_slice(&report.groups.to_le_bytes());
+    bytes[40..44].copy_from_slice(&storage.repair_basis_points.to_le_bytes());
+    bytes[44..48].copy_from_slice(&sb.block_size.to_le_bytes());
+    bytes[48..56].copy_from_slice(&report.source_blocks.to_le_bytes());
+    bytes[56..64].copy_from_slice(&1_u64.to_le_bytes());
+    bytes[64..96].copy_from_slice(root);
+    bytes[96..100].copy_from_slice(&state.to_le_bytes());
+    let checksum = ffs_ondisk::ext4::ext4_chksum(!0, &bytes[..100]);
+    bytes[100..104].copy_from_slice(&checksum.to_le_bytes());
+    Ok(bytes)
+}
+
+fn validation_plan_intent(
+    bytes: &[u8],
+    sb: &Ext4Superblock,
+    storage: &NativeRepairStorage,
+    generation: u32,
+) -> Result<ValidationIntent, FfsError> {
+    let tail = &storage.tails[0];
+    if bytes.len() != VALIDATION_HEADER_BYTES {
+        return Err(validation_error(tail, "whole-plan record length mismatch"));
+    }
+    if bytes.iter().all(|byte| *byte == 0) {
+        return Err(validation_error(tail, "whole-plan record missing"));
+    }
+    let root: [u8; 32] = bytes[64..96].try_into().expect("fixed record length");
+    let state = u32::from_le_bytes(bytes[96..100].try_into().expect("fixed record length"));
+    if !matches!(
+        state,
+        PLAN_PREPARED | VALIDATION_PENDING | VALIDATION_SEALED
+    ) || (state == PLAN_PREPARED && root != [0; 32])
+        || bytes != validation_plan_header(sb, storage, generation, state, &root)?
+    {
+        return Err(validation_error(
+            tail,
+            "whole-plan identity or checksum mismatch",
+        ));
+    }
+    Ok(if state == PLAN_PREPARED {
+        ValidationIntent::Prepared
+    } else if state == VALIDATION_PENDING {
+        ValidationIntent::Pending(root)
+    } else {
+        ValidationIntent::Sealed(root)
+    })
+}
+
+fn validation_plan_root(
+    sb: &Ext4Superblock,
+    storage: &NativeRepairStorage,
+    generation: u32,
+    admissions: &[ValidationAdmission],
+) -> Result<[u8; 32], FfsError> {
+    let header = validation_plan_header(sb, storage, generation, VALIDATION_PENDING, &[0; 32])?;
+    let mut hasher = blake3::Hasher::new();
+    hasher.update(b"FrankenFS native whole-plan validation v1");
+    hasher.update(&header[..64]);
+    for (tail, admission) in storage.tails.iter().zip(admissions) {
+        let group = validation_header(
+            sb,
+            storage.owner_inode,
+            generation,
+            tail,
+            VALIDATION_PENDING,
+            &admission.root,
+        )?;
+        hasher.update(&group[..104]);
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+fn publish_validation_plan(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    sb: &Ext4Superblock,
+    storage: &NativeRepairStorage,
+    generation: u32,
+    state: u32,
+    root: &[u8; 32],
+) -> Result<(), FfsError> {
+    let first = storage.tails[0].start;
+    let mut owner = dev.read_block(cx, first)?.into_inner();
+    owner[PLAN_HEADER_START..PLAN_HEADER_END].copy_from_slice(&validation_plan_header(
+        sb, storage, generation, state, root,
+    )?);
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+    dev.write_block(cx, first, &owner)?;
+    dev.sync(cx)
+}
+
+fn admit_validation_plan(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    sb: &Ext4Superblock,
+    storage: &NativeRepairStorage,
+    generation: u32,
+    admissions: &[ValidationAdmission],
+) -> Result<(ValidationIntent, [u8; 32]), FfsError> {
+    let root = validation_plan_root(sb, storage, generation, admissions)?;
+    let first = &storage.tails[0];
+    let owner = dev.read_block(cx, first.start)?;
+    let plan = validation_plan_intent(
+        &owner.as_slice()[PLAN_HEADER_START..PLAN_HEADER_END],
+        sb,
+        storage,
+        generation,
+    )?;
+    match plan {
+        ValidationIntent::Prepared => {
+            if admissions
+                .iter()
+                .any(|group| group.intent != ValidationIntent::Empty)
+            {
+                return Err(validation_error(
+                    first,
+                    "group evidence has no whole-plan intent",
+                ));
+            }
+        }
+        ValidationIntent::Pending(expected) | ValidationIntent::Sealed(expected) => {
+            if expected != root {
+                return Err(validation_error(
+                    first,
+                    "whole-plan initialization source changed",
+                ));
+            }
+            if matches!(plan, ValidationIntent::Sealed(_))
+                && admissions
+                    .iter()
+                    .any(|group| !matches!(group.intent, ValidationIntent::Sealed(_)))
+            {
+                return Err(validation_error(first, "sealed plan has an unsealed group"));
+            }
+        }
+        ValidationIntent::Empty => {
+            return Err(validation_error(first, "whole-plan record missing"));
+        }
+    }
+    Ok((plan, root))
+}
+
+fn admit_validation_group(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    sb: &Ext4Superblock,
+    owner: InodeNumber,
+    generation: u32,
+    tail: &NativeRepairTail,
+) -> Result<ValidationAdmission, FfsError> {
+    let end = tail.start.0 + u64::from(tail.blocks());
+    for number in [end - 2, end - 1] {
+        if dev
+            .read_block(cx, BlockNumber(number))?
+            .as_slice()
+            .iter()
+            .any(|byte| *byte != 0)
+        {
+            return Err(validation_error(tail, "symbol descriptors already present"));
+        }
+    }
+    let block = dev.read_block(cx, tail.start)?;
+    let intent = validation_intent(
+        &block.as_slice()[OWNER_HEADER_BYTES..OWNER_HEADER_BYTES + VALIDATION_HEADER_BYTES],
+        sb,
+        owner,
+        generation,
+        tail,
+    )?;
+    let table = read_validation_table(cx, dev, sb, tail)?;
+    if let ValidationIntent::Sealed(root) = intent {
+        if validation_intent(
+            &table[..VALIDATION_HEADER_BYTES],
+            sb,
+            owner,
+            generation,
+            tail,
+        )? != ValidationIntent::Sealed(root)
+        {
+            return Err(validation_error(tail, "sealed intent and table disagree"));
+        }
+        verify_validation_table(cx, dev, sb, tail, &table, &root)?;
+        return Ok(ValidationAdmission { root, intent });
+    }
+    if intent == ValidationIntent::Empty
+        && table[..sb.block_size as usize]
+            .iter()
+            .any(|byte| *byte != 0)
+    {
+        return Err(validation_error(tail, "table has no initialization intent"));
+    }
+    let expected = build_validation_table(cx, dev, sb, owner, generation, tail)?;
+    let (_, _, used) = validation_sizes(sb, tail)?;
+    let root = validation_root(&expected, used);
+    if let ValidationIntent::Pending(persisted) = intent
+        && persisted != root
+    {
+        return Err(validation_error(
+            tail,
+            "pending initialization source changed",
+        ));
+    }
+    Ok(ValidationAdmission { root, intent })
+}
+
+fn publish_validation_group(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    sb: &Ext4Superblock,
+    owner: InodeNumber,
+    generation: u32,
+    tail: &NativeRepairTail,
+    root: &[u8; 32],
+) -> Result<(), FfsError> {
+    let mut table = build_validation_table(cx, dev, sb, owner, generation, tail)?;
+    let (_, _, used) = validation_sizes(sb, tail)?;
+    if &validation_root(&table, used) != root {
+        return Err(validation_error(
+            tail,
+            "source changed after initialization admission",
+        ));
+    }
+    let pending = validation_header(sb, owner, generation, tail, VALIDATION_PENDING, root)?;
+    // Preserve the entire immutable ownership prefix verbatim.
+    let mut ownership = dev.read_block(cx, tail.start)?.into_inner();
+    ownership[OWNER_HEADER_BYTES..OWNER_HEADER_BYTES + VALIDATION_HEADER_BYTES]
+        .copy_from_slice(&pending);
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+    dev.write_block(cx, tail.start, &ownership)?;
+    dev.sync(cx)?;
+    for (index, block) in table.chunks_exact(sb.block_size as usize).enumerate() {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        let index = u32::try_from(index)
+            .map_err(|_| validation_error(tail, "validation index exceeds u32"))?;
+        dev.write_block(cx, BlockNumber(tail.start.0 + 1 + u64::from(index)), block)?;
+    }
+    dev.sync(cx)?;
+    if read_validation_table(cx, dev, sb, tail)? != table {
+        return Err(validation_error(
+            tail,
+            "table readback mismatch before sealing",
+        ));
+    }
+    verify_validation_table(cx, dev, sb, tail, &table, root)?;
+    let sealed = validation_header(sb, owner, generation, tail, VALIDATION_SEALED, root)?;
+    table[..VALIDATION_HEADER_BYTES].copy_from_slice(&sealed);
+    dev.write_block(
+        cx,
+        BlockNumber(tail.start.0 + 1),
+        &table[..sb.block_size as usize],
+    )?;
+    dev.sync(cx)?;
+    ownership[OWNER_HEADER_BYTES..OWNER_HEADER_BYTES + VALIDATION_HEADER_BYTES]
+        .copy_from_slice(&sealed);
+    dev.write_block(cx, tail.start, &ownership)?;
+    dev.sync(cx)?;
+    cx.checkpoint().map_err(|_| FfsError::Cancelled)
+}
+
 impl OpenFs {
+    /// Persist generation-one source digests in owned native ext4 storage.
+    ///
+    /// The caller must exclude other image writers throughout this offline
+    /// operation. Consumes the view; reopen after success or ambiguous failure.
+    /// All groups are admitted before writes. A durable whole-plan root precedes
+    /// every group publication, so interrupted initialization can resume only
+    /// against all originally admitted sources. Sealed evidence is never rebaselined.
+    /// This initializes validation only; repair protection remains inactive.
+    ///
+    /// # Errors
+    /// Refuses unsupported ownership, symbols already present, damaged sealed
+    /// tables, changed sources, cancellation and storage failures.
+    pub fn initialize_native_ext4_validation(
+        self,
+        cx: &Cx,
+    ) -> Result<NativeValidationReport, FfsError> {
+        self.require_native_mode("initialize_native_validation")?;
+        let storage = self.native_ext4_repair_storage(cx)?;
+        let sb = self.ext4_superblock().expect("validated ext4 ownership");
+        let inode = self.read_native_owner_inode(cx, sb, storage.owner_inode)?;
+        let dev = ByteDeviceBlockAdapter {
+            dev: self.dev.as_ref(),
+            block_size: sb.block_size,
+        };
+        let mut admissions = Vec::with_capacity(storage.tails.len());
+        for tail in &storage.tails {
+            admissions.push(admit_validation_group(
+                cx,
+                &dev,
+                sb,
+                storage.owner_inode,
+                inode.generation,
+                tail,
+            )?);
+        }
+        let (plan, root) =
+            admit_validation_plan(cx, &dev, sb, &storage, inode.generation, &admissions)?;
+        if plan == ValidationIntent::Prepared {
+            publish_validation_plan(
+                cx,
+                &dev,
+                sb,
+                &storage,
+                inode.generation,
+                VALIDATION_PENDING,
+                &root,
+            )?;
+        } else if matches!(plan, ValidationIntent::Pending(_)) {
+            // An earlier plan sync may have failed after its write became visible.
+            // Establish durability again before publishing any local intent.
+            dev.sync(cx)?;
+        }
+        for (tail, admission) in storage.tails.iter().zip(&admissions) {
+            if matches!(admission.intent, ValidationIntent::Sealed(_)) {
+                continue;
+            }
+            publish_validation_group(
+                cx,
+                &dev,
+                sb,
+                storage.owner_inode,
+                inode.generation,
+                tail,
+                &admission.root,
+            )?;
+        }
+        if !matches!(plan, ValidationIntent::Sealed(_)) {
+            publish_validation_plan(
+                cx,
+                &dev,
+                sb,
+                &storage,
+                inode.generation,
+                VALIDATION_SEALED,
+                &root,
+            )?;
+        }
+        // A previous failed sync may leave sealing visible but undurable.
+        // Idempotent retries must also establish a successful durability barrier.
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        dev.sync(cx)?;
+        native_validation_report(sb, &storage)
+    }
+
+    /// Check persisted native source digests without writing the image.
+    ///
+    /// # Errors
+    /// Refuses empty/pending records, identity or table damage, and source
+    /// digest mismatches; propagates cancellation and read failures.
+    pub fn check_native_ext4_validation(
+        &self,
+        cx: &Cx,
+    ) -> Result<NativeValidationReport, FfsError> {
+        self.require_native_mode("check_native_validation")?;
+        let storage = self.native_ext4_repair_storage(cx)?;
+        let sb = self.ext4_superblock().expect("validated ext4 ownership");
+        let inode = self.read_native_owner_inode(cx, sb, storage.owner_inode)?;
+        let dev = ByteDeviceBlockAdapter {
+            dev: self.dev.as_ref(),
+            block_size: sb.block_size,
+        };
+        let first_owner = dev.read_block(cx, storage.tails[0].start)?;
+        let plan = validation_plan_intent(
+            &first_owner.as_slice()[PLAN_HEADER_START..PLAN_HEADER_END],
+            sb,
+            &storage,
+            inode.generation,
+        )?;
+        let ValidationIntent::Sealed(plan_root) = plan else {
+            return Err(validation_error(
+                &storage.tails[0],
+                "whole-plan validation is uninitialized or pending",
+            ));
+        };
+        let mut admissions = Vec::with_capacity(storage.tails.len());
+        for tail in &storage.tails {
+            let owner = dev.read_block(cx, tail.start)?;
+            let intent = validation_intent(
+                &owner.as_slice()[OWNER_HEADER_BYTES..OWNER_HEADER_BYTES + VALIDATION_HEADER_BYTES],
+                sb,
+                storage.owner_inode,
+                inode.generation,
+                tail,
+            )?;
+            let ValidationIntent::Sealed(root) = intent else {
+                return Err(validation_error(
+                    tail,
+                    "validation is uninitialized or pending",
+                ));
+            };
+            let table = read_validation_table(cx, &dev, sb, tail)?;
+            if validation_intent(
+                &table[..VALIDATION_HEADER_BYTES],
+                sb,
+                storage.owner_inode,
+                inode.generation,
+                tail,
+            )? != ValidationIntent::Sealed(root)
+            {
+                return Err(validation_error(tail, "sealed intent and table disagree"));
+            }
+            verify_validation_table(cx, &dev, sb, tail, &table, &root)?;
+            admissions.push(ValidationAdmission { root, intent });
+        }
+        if validation_plan_root(sb, &storage, inode.generation, &admissions)? != plan_root {
+            return Err(validation_error(
+                &storage.tails[0],
+                "sealed whole-plan root mismatch",
+            ));
+        }
+        native_validation_report(sb, &storage)
+    }
+
     /// Reserve native repair storage in a clean, exclusively held ext4 image.
     ///
     /// Consumes the view: reopen after success or any ambiguous I/O failure.
@@ -214,7 +871,7 @@ impl OpenFs {
         let mut alloc = self.load_ext4_alloc_state(cx)?;
         let base = self.direct_block_device_adapter();
         let mut txn = self.mvcc_store.begin();
-        let (owner, inode) = {
+        let (owner, inode, storage) = {
             let dev = TransactionBlockAdapter {
                 base: &base,
                 tx: Mutex::new(&mut txn),
@@ -242,19 +899,34 @@ impl OpenFs {
                 }
             }
             let (owner, inode) = Self::stage_native_owner(cx, &dev, &sb, &mut alloc, &tails)?;
-            for tail in &tails {
-                dev.write_block(
-                    cx,
-                    tail.start,
-                    &owner_header(&sb, owner, inode.generation, basis_points, tail),
-                )?;
+            let storage = NativeRepairStorage {
+                owner_inode: owner,
+                repair_basis_points: basis_points,
+                tails,
+            };
+            for tail in &storage.tails {
+                let mut header = owner_header(&sb, owner, inode.generation, basis_points, tail);
+                if tail.group.0 == 0 {
+                    header[PLAN_HEADER_START..PLAN_HEADER_END].copy_from_slice(
+                        &validation_plan_header(
+                            &sb,
+                            &storage,
+                            inode.generation,
+                            PLAN_PREPARED,
+                            &[0; 32],
+                        )?,
+                    );
+                }
+                dev.write_block(cx, tail.start, &header)?;
                 let end = tail.start.0 + u64::from(tail.blocks());
                 let zero = vec![0; sb.block_size as usize];
-                for block in [end - 2, end - 1] {
+                // Unwritten extents may still contain arbitrary old physical
+                // bytes. A prepared plan and empty local header grant first-init authority.
+                for block in [tail.start.0 + 1, end - 2, end - 1] {
                     dev.write_block(cx, BlockNumber(block), &zero)?;
                 }
             }
-            (owner, inode)
+            (owner, inode, storage)
         };
         let (secs, nanos) = Self::now_timestamp();
         self.ext4_stage_dir_entry(
@@ -294,14 +966,10 @@ impl OpenFs {
         debug!(
             owner = owner.0,
             generation = inode.generation,
-            groups = tails.len(),
+            groups = storage.tails.len(),
             "native_repair_storage_prepared"
         );
-        Ok(NativeRepairStorage {
-            owner_inode: owner,
-            repair_basis_points: basis_points,
-            tails,
-        })
+        Ok(storage)
     }
 
     fn attach_empty_native_journal(
@@ -527,7 +1195,13 @@ impl OpenFs {
         let first = extents
             .first()
             .ok_or_else(|| FfsError::Format("native repair owner has no extents".into()))?;
-        let header = self.read_block_vec(cx, BlockNumber(first.physical_start))?;
+        let dev = ByteDeviceBlockAdapter {
+            dev: self.dev.as_ref(),
+            block_size: sb.block_size,
+        };
+        let header = dev
+            .read_block(cx, BlockNumber(first.physical_start))?
+            .into_inner();
         if header.len() < OWNER_HEADER_BYTES || &header[..8] != OWNER_MAGIC {
             return Err(FfsError::Format(
                 "native repair ownership header missing".into(),
@@ -555,14 +1229,42 @@ impl OpenFs {
                 "native repair owner block accounting disagrees with extents".into(),
             ));
         }
-        for tail in &tails {
+        let storage = NativeRepairStorage {
+            owner_inode: attr.ino,
+            repair_basis_points: basis_points,
+            tails,
+        };
+        for tail in &storage.tails {
             cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
-            let stored = self.read_block_vec(cx, tail.start)?;
-            if stored != owner_header(sb, attr.ino, inode.generation, basis_points, tail) {
+            let stored = dev.read_block(cx, tail.start)?.into_inner();
+            let expected = owner_header(sb, attr.ino, inode.generation, basis_points, tail);
+            let reserved_end = if tail.group.0 == 0 {
+                PLAN_HEADER_END
+            } else {
+                PLAN_HEADER_START
+            };
+            if stored[..OWNER_HEADER_BYTES] != expected[..OWNER_HEADER_BYTES]
+                || stored[reserved_end..].iter().any(|byte| *byte != 0)
+            {
                 return Err(FfsError::Corruption {
                     block: tail.start.0,
                     detail: "native repair ownership header mismatch".into(),
                 });
+            }
+            validation_intent(
+                &stored[OWNER_HEADER_BYTES..OWNER_HEADER_BYTES + VALIDATION_HEADER_BYTES],
+                sb,
+                attr.ino,
+                inode.generation,
+                tail,
+            )?;
+            if tail.group.0 == 0 {
+                validation_plan_intent(
+                    &stored[PLAN_HEADER_START..PLAN_HEADER_END],
+                    sb,
+                    &storage,
+                    inode.generation,
+                )?;
             }
             self.validate_native_owned_range(cx, tail.start.0, tail.blocks())?;
             if tree_blocks
@@ -576,11 +1278,7 @@ impl OpenFs {
                 });
             }
         }
-        Ok(NativeRepairStorage {
-            owner_inode: attr.ino,
-            repair_basis_points: basis_points,
-            tails,
-        })
+        Ok(storage)
     }
 
     fn read_native_owner_inode(

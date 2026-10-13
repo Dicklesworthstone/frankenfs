@@ -49,6 +49,17 @@
 > than treating readable old inode bytes as ownership. Prepared storage contains
 > no usable parity. Native encoding, freshness fencing and activation remain open.
 
+> **Native source validation (`bd-11a8t`):** the same offline core boundary
+> persists bounded per-source BLAKE3 tables with ownership/group identity.
+> Preparation journals an explicit Prepared whole-plan record in group zero.
+> A durable whole-plan root binds every admitted group before local intent/table
+> publication. Uncached table readback and source verification precede sealing;
+> all group seals precede the plan seal. Successful retries always sync. Cold
+> checks validate the records
+> and every source digest. Explicit `native-validate --initialize` creates or
+> resumes that baseline; the default command is read-only. This layer grants
+> no decoding authority and does not replace persistent mounted freshness.
+
 > **Ordinary mount worker ownership (`bd-11a8t`):** the CLI owns one
 > asupersync runtime with one scheduler thread and at most two blocking workers.
 > Scrub and periodic commit each run in a child region with a runtime-provided

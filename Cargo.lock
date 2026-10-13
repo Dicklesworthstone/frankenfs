@@ -1000,6 +1000,7 @@ version = "0.1.0"
 dependencies = [
  "arc-swap",
  "asupersync",
+ "blake3",
  "criterion",
  "ffs-alloc",
  "ffs-block",

@@ -134,9 +134,11 @@ mounts. The read-write repair serializer exists, but CLI admission remains
 blocked until repair storage is reserved from the allocator. `bd-plamw` supplies
 the interim whole-plan allocation check and fail-closed startup/refusal path;
 `bd-11a8t` retains the allocator-owned storage and default lifecycle work.
-The next native implementation boundary is explicit offline ext4 preparation:
+The native implementation sequence begins with explicit offline ext4 preparation:
 reserve tails as immutable inode extents, journal the entire ownership change,
-and validate it after reopening. Only then connect encoding, durable pre-write
+and validate it after reopening. Initialize and consume per-source validation
+records with durable whole-plan admission and pending/sealed publication outside
+source coverage. Then connect encoding, durable pre-write
 freshness fencing and mounted activation. Preparation alone cannot enable
 read-write background repair; Btrfs needs its own allocation ownership path.
 Explicit sidecar-protected writable mounts share the ordinary periodic filesystem

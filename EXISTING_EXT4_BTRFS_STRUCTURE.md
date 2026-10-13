@@ -671,6 +671,12 @@ free totals must agree after either checkpoint or journal recovery. These
 requirements apply to `.frankenfs-repair` exactly as to other ext4 files; the
 native ownership header adds identity without replacing ext4 allocation rules.
 
+Ordinary ext4 metadata checking does not validate arbitrary file contents.
+Native source-data validation therefore stores independent BLAKE3 records in
+the owned unwritten ranges and reads them through physical mappings. Its
+mutable intent/table records stay outside protected source coverage; the
+kernel-facing owner inode, allocation and zero-read behavior are unchanged.
+
 The `ee_len` field uses its MSB (bit 15) as an "unwritten" flag:
 
 - If `ee_len <= 0x8000` (32768): the extent is **initialized** and

@@ -1208,6 +1208,17 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Check persisted native ext4 source digests without writing the image.
+    NativeValidate {
+        /// Path to the clean, offline ext4 image with prepared native storage.
+        image: PathBuf,
+        /// Initialize source digests, or resume an unchanged pending initialization.
+        #[arg(long)]
+        initialize: bool,
+        /// Output in JSON format.
+        #[arg(long)]
+        json: bool,
+    },
     /// Mount a filesystem image via FUSE.
     Mount {
         /// Path to the filesystem image.
@@ -1594,6 +1605,7 @@ impl Command {
             Self::Fsck { .. } => "fsck",
             Self::Repair { .. } => "repair",
             Self::NativePrepare { .. } => "native-prepare",
+            Self::NativeValidate { .. } => "native-validate",
             Self::Mount { .. } => "mount",
             Self::Scrub { .. } => "scrub",
             Self::Parity { .. } => "parity",
@@ -2538,6 +2550,11 @@ fn run() -> Result<()> {
             check,
             json,
         } => cmd_repair::native_prepare_cmd(&image, repair_basis_points, check, json),
+        Command::NativeValidate {
+            image,
+            initialize,
+            json,
+        } => cmd_repair::native_validate_cmd(&image, initialize, json),
         Command::Mount {
             image,
             mountpoint,
@@ -17217,6 +17234,39 @@ mod tests {
                 "invalid overhead {value} must be rejected"
             );
         }
+    }
+
+    #[test]
+    fn cli_parses_native_validation_defaults_and_initialization() {
+        for initialize in [false, true] {
+            let mut args = vec!["ffs", "native-validate", "/tmp/fs.img"];
+            if initialize {
+                args.extend(["--initialize", "--json"]);
+            }
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(cli.command.name(), "native-validate");
+            let Command::NativeValidate {
+                image,
+                initialize: parsed,
+                json,
+            } = cli.command
+            else {
+                panic!("expected native validation");
+            };
+            assert_eq!(image, PathBuf::from("/tmp/fs.img"));
+            assert_eq!(parsed, initialize);
+            assert_eq!(json, initialize);
+        }
+        assert!(Cli::try_parse_from(["ffs", "native-validate"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "ffs",
+                "native-validate",
+                "/tmp/fs.img",
+                "--initialize=false"
+            ])
+            .is_err()
+        );
     }
 
     #[test]

@@ -613,6 +613,24 @@ is journaled; `--check` validates persisted ownership without writing. Successfu
 output reports `storage_prepared=true` and `protection_active=false`: encoding,
 crash-safe freshness and default native repair are still unfinished.
 
+After preparation, create an explicit trusted source-data baseline while the
+image is offline, then check it without writing:
+
+```bash
+ffs native-validate image.ext4 --initialize --json
+ffs native-validate image.ext4 --json
+```
+
+Validation stores and reads per-block BLAKE3 digests for file data and metadata,
+excluding the owned repair tail. Initialization preserves existing sealed
+evidence; changed source data or damaged records cause refusal. An interrupted
+initialization resumes only if its recorded source fingerprints still match
+across every group, including groups not yet published. A missing whole-image
+initialization record causes refusal.
+Successful output reports `validation_initialized=true`, `source_matches=true`
+and `protection_active=false`. It detects data changes; symbol encoding and
+mounted repair activation remain unfinished.
+
 ### Hostile-image safety (separate claim)
 
 `security.hostile_image` is its own release-gated claim. The adversarial threat model in `security/adversarial_image_threat_model.json` defines how malformed images, hostile proof bundles, tampered repair ledgers, resource-exhaustion seeds, unsupported mount options, and unsafe operator-command combinations must be rejected, quarantined, capped, downgraded to detection-only, or preserved as evidence. Each containment scenario records the resource class, limit value/unit, enforcement point, observed counters, cleanup policy, and confined artifact paths used by release gates.

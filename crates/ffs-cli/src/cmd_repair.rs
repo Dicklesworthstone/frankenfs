@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
 use ffs_block::{BlockDevice, ByteBlockDevice, ByteDevice, FileByteDevice};
-use ffs_core::native_repair::NativeRepairStorage;
+use ffs_core::native_repair::{NativeRepairStorage, NativeValidationReport};
 use ffs_core::{Ext4JournalReplayMode, FsFlavor, OpenFs, OpenOptions, detect_filesystem_at_path};
 use ffs_ondisk::btrfs::BTRFS_FIRST_CHUNK_TREE_OBJECTID;
 use ffs_ondisk::{
@@ -177,6 +177,75 @@ pub fn native_prepare_cmd(path: &Path, basis_points: u32, check: bool, json: boo
             output.storage.owner_inode.0,
             output.storage.tails.len(),
             output.storage.repair_basis_points
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct NativeValidateOutput {
+    image: PathBuf,
+    initialize: bool,
+    validation_initialized: bool,
+    source_matches: bool,
+    protection_active: bool,
+    validation: NativeValidationReport,
+}
+
+fn build_native_validate_output(path: &Path, initialize: bool) -> Result<NativeValidateOutput> {
+    let cx = cli_cx();
+    let (device, lock) = lock_native_prepare_image(path, !initialize)?;
+    let fs = open_native_prepare_view(&cx, device)?;
+    let validation = if initialize {
+        let expected = fs.initialize_native_ext4_validation(&cx)?;
+        let device = FileByteDevice::open_read_only(path)?;
+        let locked = lock.0.metadata()?;
+        let reopened = device.file().metadata()?;
+        if (locked.dev(), locked.ino()) != (reopened.dev(), reopened.ino()) {
+            bail!("native validation image path changed before discovery");
+        }
+        let checked = open_native_prepare_view(&cx, device)?.check_native_ext4_validation(&cx)?;
+        if checked != expected {
+            bail!("reopened native validation differs from initialization");
+        }
+        checked
+    } else {
+        fs.check_native_ext4_validation(&cx)?
+    };
+    Ok(NativeValidateOutput {
+        image: path.to_path_buf(),
+        initialize,
+        validation_initialized: true,
+        source_matches: true,
+        protection_active: false,
+        validation,
+    })
+}
+
+pub fn native_validate_cmd(path: &Path, initialize: bool, json: bool) -> Result<()> {
+    let output = match build_native_validate_output(path, initialize) {
+        Ok(output) => output,
+        Err(error) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "error", "image": path, "initialize": initialize,
+                        "error": format!("{error:#}"), "protection_active": false,
+                    })
+                );
+            }
+            return Err(error);
+        }
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("Native source validation: {}", path.display());
+        println!("validation_initialized=true source_matches=true protection_active=false");
+        println!(
+            "Groups: {}; source blocks checked: {}",
+            output.validation.groups, output.validation.source_blocks
         );
     }
     Ok(())
@@ -3411,6 +3480,8 @@ mod coordination_tests {
         for check in [false, true] {
             let error = build_native_prepare_output(directory.path(), 500, check).unwrap_err();
             assert!(error.to_string().contains("regular image file"));
+            let error = build_native_validate_output(directory.path(), !check).unwrap_err();
+            assert!(error.to_string().contains("regular image file"));
         }
         let image = tempfile::NamedTempFile::new().unwrap();
         let bytes = vec![0xA5; 128 * 1024];
@@ -3421,6 +3492,9 @@ mod coordination_tests {
                 format!("{error:#}").contains("not a recognized ext4 or btrfs filesystem"),
                 "invalid image must fail format admission: {error:#}"
             );
+            assert_eq!(std::fs::read(image.path()).unwrap(), bytes);
+            let error = build_native_validate_output(image.path(), !check).unwrap_err();
+            assert!(format!("{error:#}").contains("not a recognized ext4 or btrfs filesystem"));
             assert_eq!(std::fs::read(image.path()).unwrap(), bytes);
             let (_device, _lock) = lock_native_prepare_image(image.path(), false).unwrap();
         }

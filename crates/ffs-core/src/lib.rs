@@ -73114,6 +73114,630 @@ mod tests {
         Some((fs, dev, tmp, image))
     }
 
+    fn native_existing_payload_block(fs: &OpenFs, cx: &Cx) -> BlockNumber {
+        let file = fs
+            .lookup(cx, InodeNumber(2), OsStr::new("existing.bin"))
+            .unwrap();
+        let inode = fs.read_inode(cx, file.ino).unwrap();
+        let (_, tree) = parse_extent_tree(&OpenFs::extent_root(&inode)).unwrap();
+        let ExtentTree::Leaf(extents) = tree else {
+            panic!("small existing file must have inline extents");
+        };
+        BlockNumber(extents[0].physical_start)
+    }
+
+    #[test]
+    fn native_ext4_validation_persists_and_detects_real_file_data() {
+        let Some((fs, dev, _tmp, image)) = native_preparation_fixture() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let storage = fs.prepare_native_ext4_repair(&cx, 500).unwrap();
+        let fs =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options()).unwrap();
+        fs.check_native_ext4_validation(&cx)
+            .expect_err("not initialized");
+        let payload_block = native_existing_payload_block(&fs, &cx);
+        // Physical unwritten payload may be nonzero; a prepared empty header
+        // distinguishes it from a table that has initialization authority.
+        dev.write_all_at(
+            &cx,
+            ByteOffset((storage.tails[0].start.0 + 2) * 1024),
+            &[0xA5; 1024],
+        )
+        .unwrap();
+        let before = dev.snapshot_bytes();
+        let initialized = fs.initialize_native_ext4_validation(&cx).unwrap();
+        assert_eq!(initialized.groups, 8);
+        assert!(initialized.source_blocks > 50_000);
+        let initialized_bytes = dev.snapshot_bytes();
+        for (index, (old, new)) in before
+            .as_chunks::<1024>()
+            .0
+            .iter()
+            .zip(initialized_bytes.as_chunks::<1024>().0)
+            .enumerate()
+        {
+            if old != new {
+                let number = index as u64;
+                assert!(
+                    storage.tails.iter().any(|tail| number >= tail.start.0
+                        && number < tail.start.0 + 1 + u64::from(tail.validation_blocks)),
+                    "changed source/symbol/descriptor block {number}"
+                );
+            }
+        }
+        for tail in &storage.tails {
+            let offset = tail.start.0 as usize * 1024;
+            assert_eq!(
+                &before[offset..offset + 64],
+                &initialized_bytes[offset..offset + 64],
+                "ownership prefix changed"
+            );
+        }
+        let reopened =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options()).unwrap();
+        assert_eq!(
+            reopened.check_native_ext4_validation(&cx).unwrap(),
+            initialized
+        );
+        assert_eq!(reopened.native_ext4_repair_storage(&cx).unwrap(), storage);
+        assert!(
+            dev.snapshot_bytes() == initialized_bytes,
+            "check wrote the image"
+        );
+        assert_eq!(
+            reopened.initialize_native_ext4_validation(&cx).unwrap(),
+            initialized
+        );
+        assert!(
+            dev.snapshot_bytes() == initialized_bytes,
+            "matching reinitialization wrote the image"
+        );
+        let mut damaged = initialized_bytes;
+        damaged[payload_block.0 as usize * 1024] ^= 0x40;
+        let changed = TestDevice::from_vec(damaged.clone());
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(changed.clone()),
+            &native_preparation_options(),
+        )
+        .unwrap();
+        let error = fs.check_native_ext4_validation(&cx).unwrap_err();
+        assert!(
+            matches!(&error, FfsError::Corruption { block, .. } if *block == payload_block.0),
+            "{error}"
+        );
+        fs.initialize_native_ext4_validation(&cx)
+            .expect_err("must not baseline corrupted file data");
+        assert!(
+            changed.snapshot_bytes() == damaged,
+            "source mismatch changed the image"
+        );
+        std::fs::write(&image, &damaged).unwrap();
+        let Some((clean, output)) = run_e2fsck(&image) else {
+            return;
+        };
+        assert!(
+            clean,
+            "native checker must still accept metadata after payload-only damage: {output}"
+        );
+    }
+
+    #[test]
+    fn native_ext4_validation_rejects_damaged_records_without_rebaseline() {
+        let Some((fs, dev, _tmp, _image)) = native_preparation_fixture() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let storage = fs.prepare_native_ext4_repair(&cx, 500).unwrap();
+        OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options())
+            .unwrap()
+            .initialize_native_ext4_validation(&cx)
+            .unwrap();
+        let original = dev.snapshot_bytes();
+        let tail = &storage.tails[0];
+        for (name, offset, clear_header) in [
+            (
+                "intent checksum",
+                tail.start.0 as usize * 1024 + 64 + 108,
+                false,
+            ),
+            (
+                "table checksum",
+                (tail.start.0 + 1) as usize * 1024 + 108,
+                false,
+            ),
+            (
+                "digest bytes",
+                (tail.start.0 + 1) as usize * 1024 + 128,
+                false,
+            ),
+            (
+                "lost table header",
+                (tail.start.0 + 1) as usize * 1024,
+                true,
+            ),
+            (
+                "whole-plan checksum",
+                tail.start.0 as usize * 1024 + 192 + 100,
+                false,
+            ),
+        ] {
+            let mut damaged = original.clone();
+            if clear_header {
+                damaged[offset..offset + 1024].fill(0);
+            } else {
+                damaged[offset] ^= 0x80;
+            }
+            let changed = TestDevice::from_vec(damaged.clone());
+            let fs = OpenFs::from_device(
+                &cx,
+                Box::new(changed.clone()),
+                &native_preparation_options(),
+            )
+            .unwrap();
+            fs.check_native_ext4_validation(&cx).expect_err(name);
+            fs.initialize_native_ext4_validation(&cx).expect_err(name);
+            assert!(
+                changed.snapshot_bytes() == damaged,
+                "{name} was rebaselined"
+            );
+        }
+        let mut damaged = original.clone();
+        let offset = tail.start.0 as usize * 1024 + 192;
+        damaged[offset..offset + 128].fill(0);
+        let changed = TestDevice::from_vec(damaged.clone());
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(changed.clone()),
+            &native_preparation_options(),
+        )
+        .unwrap();
+        fs.check_native_ext4_validation(&cx)
+            .expect_err("lost whole-plan anchor");
+        fs.initialize_native_ext4_validation(&cx)
+            .expect_err("group evidence cannot establish a new plan");
+        assert!(
+            changed.snapshot_bytes() == damaged,
+            "lost whole-plan anchor was rebaselined"
+        );
+        let live = TestDevice::from_vec(original.clone());
+        let fs = OpenFs::from_device(&cx, Box::new(live.clone()), &native_preparation_options())
+            .unwrap();
+        fs.check_native_ext4_validation(&cx).unwrap();
+        fs.direct_block_device_adapter()
+            .read_block(&cx, tail.start)
+            .unwrap();
+        assert!(
+            fs.ext4_base_block_cache.contains_key(&tail.start),
+            "ownership regression must start with a cached header"
+        );
+        let offset = tail.start.0 as usize * 1024 + 60;
+        live.write_all_at(&cx, ByteOffset(offset as u64), &[original[offset] ^ 0x80])
+            .unwrap();
+        let damaged = live.snapshot_bytes();
+        fs.check_native_ext4_validation(&cx)
+            .expect_err("repeat check must see changed ownership checksum");
+        fs.initialize_native_ext4_validation(&cx)
+            .expect_err("cached ownership cannot authorize initialization");
+        assert!(
+            live.snapshot_bytes() == damaged,
+            "corrupt ownership changed evidence"
+        );
+    }
+
+    #[test]
+    fn native_ext4_validation_admits_whole_plan_before_writes() {
+        let Some((fs, dev, _tmp, _image)) = native_preparation_fixture() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let storage = fs.prepare_native_ext4_repair(&cx, 500).unwrap();
+        let original = dev.snapshot_bytes();
+        let tail = storage.tails.last().unwrap();
+        for (name, number) in [
+            ("last group table without intent", tail.start.0 + 1),
+            (
+                "last group symbol descriptor",
+                tail.start.0
+                    + u64::from(tail.validation_blocks)
+                    + u64::from(tail.repair_blocks)
+                    + 1,
+            ),
+        ] {
+            let mut damaged = original.clone();
+            damaged[number as usize * 1024] = 0xA5;
+            let changed = TestDevice::from_vec(damaged.clone());
+            let fs = OpenFs::from_device(
+                &cx,
+                Box::new(changed.clone()),
+                &native_preparation_options(),
+            )
+            .unwrap();
+            fs.initialize_native_ext4_validation(&cx).expect_err(name);
+            assert!(
+                changed.snapshot_bytes() == damaged,
+                "partial plan was written before refusing {name}"
+            );
+        }
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        let fs =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options()).unwrap();
+        assert!(matches!(
+            fs.initialize_native_ext4_validation(&cancelled),
+            Err(FfsError::Cancelled)
+        ));
+        assert!(
+            dev.snapshot_bytes() == original,
+            "cancelled initialization changed the image"
+        );
+    }
+
+    #[derive(Debug, Clone)]
+    struct ValidationFaultDevice {
+        inner: TestDevice,
+        attempts: Arc<AtomicUsize>,
+        fail_on: usize,
+        events: Arc<Mutex<Vec<Option<u64>>>>,
+    }
+
+    impl ByteDevice for ValidationFaultDevice {
+        fn len_bytes(&self) -> u64 {
+            self.inner.len_bytes()
+        }
+
+        fn read_exact_at(
+            &self,
+            cx: &Cx,
+            offset: ByteOffset,
+            bytes: &mut [u8],
+        ) -> ffs_error::Result<()> {
+            self.inner.read_exact_at(cx, offset, bytes)
+        }
+
+        fn write_all_at(&self, cx: &Cx, offset: ByteOffset, bytes: &[u8]) -> ffs_error::Result<()> {
+            self.events.lock().unwrap().push(Some(offset.0));
+            if self.attempts.fetch_add(1, AtomicOrdering::SeqCst) + 1 == self.fail_on {
+                return Err(
+                    std::io::Error::other("injected native validation write failure").into(),
+                );
+            }
+            self.inner.write_all_at(cx, offset, bytes)
+        }
+
+        fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+            self.events.lock().unwrap().push(None);
+            self.inner.sync(cx)
+        }
+    }
+
+    #[test]
+    fn native_ext4_validation_interruption_resumes_only_unchanged_sources() {
+        let Some((fs, dev, _tmp, image)) = native_preparation_fixture() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let storage = fs.prepare_native_ext4_repair(&cx, 500).unwrap();
+        let initial = dev.snapshot_bytes();
+        let fs =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options()).unwrap();
+        let payload = native_existing_payload_block(&fs, &cx);
+        let tail = &storage.tails[0];
+        // Stop after the whole-plan root, before the first table, at both
+        // group seals, and after the first complete group publication.
+        for stop in [
+            2,
+            3,
+            tail.validation_blocks as usize + 3,
+            tail.validation_blocks as usize + 4,
+            tail.validation_blocks as usize + 5,
+        ] {
+            let changed = TestDevice::from_vec(initial.clone());
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let fault = ValidationFaultDevice {
+                inner: changed.clone(),
+                attempts: Arc::new(AtomicUsize::new(0)),
+                fail_on: stop,
+                events: Arc::clone(&events),
+            };
+            let fs =
+                OpenFs::from_device(&cx, Box::new(fault), &native_preparation_options()).unwrap();
+            let error = fs.initialize_native_ext4_validation(&cx).unwrap_err();
+            assert!(
+                error
+                    .to_string()
+                    .contains("injected native validation write failure"),
+                "{error}"
+            );
+            assert_eq!(
+                &events.lock().unwrap()[..2],
+                &[Some(tail.start.0 * 1024), None],
+                "whole-plan intent must sync before any group write"
+            );
+            let interrupted = changed.snapshot_bytes();
+            if stop == 2 {
+                let mut damaged = interrupted.clone();
+                let anchor = tail.start.0 as usize * 1024 + 192;
+                damaged[anchor..anchor + 128].fill(0);
+                let late_source = storage.tails.last().unwrap().group_start.0 + 100;
+                damaged[late_source as usize * 1024] ^= 0x40;
+                let damaged_dev = TestDevice::from_vec(damaged.clone());
+                let fs = OpenFs::from_device(
+                    &cx,
+                    Box::new(damaged_dev.clone()),
+                    &native_preparation_options(),
+                )
+                .unwrap();
+                let error = fs.initialize_native_ext4_validation(&cx).unwrap_err();
+                assert!(
+                    error.to_string().contains("whole-plan record missing"),
+                    "{error}"
+                );
+                assert!(
+                    damaged_dev.snapshot_bytes() == damaged,
+                    "lost early anchor was rebaselined"
+                );
+            }
+            let fs = OpenFs::from_device(
+                &cx,
+                Box::new(changed.clone()),
+                &native_preparation_options(),
+            )
+            .unwrap();
+            assert!(
+                fs.check_native_ext4_validation(&cx)
+                    .unwrap_err()
+                    .to_string()
+                    .contains("pending")
+            );
+            let last_source = BlockNumber(storage.tails.last().unwrap().group_start.0 + 100);
+            for source in [payload, last_source] {
+                let mut damaged = interrupted.clone();
+                damaged[source.0 as usize * 1024] ^= 0x40;
+                let damaged_dev = TestDevice::from_vec(damaged.clone());
+                let fs = OpenFs::from_device(
+                    &cx,
+                    Box::new(damaged_dev.clone()),
+                    &native_preparation_options(),
+                )
+                .unwrap();
+                let error = fs.initialize_native_ext4_validation(&cx).unwrap_err();
+                assert!(matches!(error, FfsError::Corruption { .. }), "{error}");
+                if source == last_source {
+                    assert!(
+                        error
+                            .to_string()
+                            .contains("whole-plan initialization source changed"),
+                        "{error}"
+                    );
+                }
+                assert!(
+                    damaged_dev.snapshot_bytes() == damaged,
+                    "pending-source mismatch rewrote evidence"
+                );
+            }
+            let fs = OpenFs::from_device(
+                &cx,
+                Box::new(changed.clone()),
+                &native_preparation_options(),
+            )
+            .unwrap();
+            let report = fs.initialize_native_ext4_validation(&cx).unwrap();
+            let fs = OpenFs::from_device(
+                &cx,
+                Box::new(changed.clone()),
+                &native_preparation_options(),
+            )
+            .unwrap();
+            assert_eq!(fs.check_native_ext4_validation(&cx).unwrap(), report);
+            assert_eq!(report.groups, 8);
+            std::fs::write(&image, changed.snapshot_bytes()).unwrap();
+            let Some((clean, output)) = run_e2fsck(&image) else {
+                return;
+            };
+            assert!(
+                clean,
+                "resumed validation must preserve ext4 accounting: {output}"
+            );
+        }
+    }
+
+    #[derive(Debug, Clone)]
+    struct ValidationSyncFaultDevice {
+        inner: TestDevice,
+        durable: TestDevice,
+        syncs: Arc<AtomicUsize>,
+        fail_on: usize,
+        corrupt_on: Option<(usize, ByteOffset)>,
+        events: Arc<Mutex<Vec<Option<u64>>>>,
+    }
+
+    impl ByteDevice for ValidationSyncFaultDevice {
+        fn len_bytes(&self) -> u64 {
+            self.inner.len_bytes()
+        }
+
+        fn read_exact_at(
+            &self,
+            cx: &Cx,
+            offset: ByteOffset,
+            bytes: &mut [u8],
+        ) -> ffs_error::Result<()> {
+            self.inner.read_exact_at(cx, offset, bytes)
+        }
+
+        fn write_all_at(&self, cx: &Cx, offset: ByteOffset, bytes: &[u8]) -> ffs_error::Result<()> {
+            self.events.lock().unwrap().push(Some(offset.0));
+            self.inner.write_all_at(cx, offset, bytes)
+        }
+
+        fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+            self.events.lock().unwrap().push(None);
+            let attempt = self.syncs.fetch_add(1, AtomicOrdering::SeqCst) + 1;
+            if attempt == self.fail_on {
+                return Err(
+                    std::io::Error::other("injected native validation sync failure").into(),
+                );
+            }
+            if let Some((trigger, offset)) = self.corrupt_on
+                && attempt == trigger
+            {
+                let mut byte = [0];
+                self.inner.read_exact_at(cx, offset, &mut byte)?;
+                byte[0] ^= 0x40;
+                self.inner.write_all_at(cx, offset, &byte)?;
+            }
+            self.durable
+                .write_all_at(cx, ByteOffset(0), &self.inner.snapshot_bytes())
+        }
+    }
+
+    #[test]
+    fn native_ext4_validation_retry_syncs_visible_but_undurable_sealing() {
+        let Some((fs, dev, _tmp, _image)) = native_preparation_fixture() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let storage = fs.prepare_native_ext4_repair(&cx, 500).unwrap();
+        let durable = TestDevice::from_vec(dev.snapshot_bytes());
+        let syncs = Arc::new(AtomicUsize::new(0));
+        // Whole-plan pending + four barriers per group + whole-plan sealing.
+        let failed_sync = 2 + storage.tails.len() * 4;
+        let fault = ValidationSyncFaultDevice {
+            inner: dev.clone(),
+            durable: durable.clone(),
+            syncs: Arc::clone(&syncs),
+            fail_on: failed_sync,
+            corrupt_on: None,
+            events: Arc::new(Mutex::new(Vec::new())),
+        };
+        let fs = OpenFs::from_device(&cx, Box::new(fault.clone()), &native_preparation_options())
+            .unwrap();
+        let error = fs.initialize_native_ext4_validation(&cx).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected native validation sync failure"),
+            "{error}"
+        );
+        assert_eq!(syncs.load(AtomicOrdering::SeqCst), failed_sync);
+        let volatile = dev.snapshot_bytes();
+        let visible =
+            OpenFs::from_device(&cx, Box::new(fault.clone()), &native_preparation_options())
+                .unwrap();
+        visible
+            .check_native_ext4_validation(&cx)
+            .expect("sealing is visible");
+        assert_eq!(
+            syncs.load(AtomicOrdering::SeqCst),
+            failed_sync,
+            "check must not sync"
+        );
+        let cold = OpenFs::from_device(
+            &cx,
+            Box::new(durable.clone()),
+            &native_preparation_options(),
+        )
+        .unwrap();
+        cold.check_native_ext4_validation(&cx)
+            .expect_err("whole-plan sealing is not durable");
+        let report = visible.initialize_native_ext4_validation(&cx).unwrap();
+        assert_eq!(
+            syncs.load(AtomicOrdering::SeqCst),
+            failed_sync + 1,
+            "sealed retry must sync"
+        );
+        assert!(
+            dev.snapshot_bytes() == volatile,
+            "sealed retry rewrote evidence"
+        );
+        let cold =
+            OpenFs::from_device(&cx, Box::new(durable), &native_preparation_options()).unwrap();
+        assert_eq!(cold.check_native_ext4_validation(&cx).unwrap(), report);
+    }
+
+    #[test]
+    fn native_ext4_validation_rereads_sources_after_table_sync() {
+        let Some((fs, dev, _tmp, _image)) = native_preparation_fixture() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let storage = fs.prepare_native_ext4_repair(&cx, 500).unwrap();
+        let last = storage.tails.last().unwrap();
+        let source = BlockNumber(last.group_start.0 + 100);
+        let table_sync = 3 + (storage.tails.len() - 1) * 4;
+        let fault = ValidationSyncFaultDevice {
+            inner: dev.clone(),
+            durable: TestDevice::from_vec(dev.snapshot_bytes()),
+            syncs: Arc::new(AtomicUsize::new(0)),
+            fail_on: usize::MAX,
+            corrupt_on: Some((table_sync, ByteOffset(source.0 * 1024))),
+            events: Arc::new(Mutex::new(Vec::new())),
+        };
+        let fs = OpenFs::from_device(&cx, Box::new(fault), &native_preparation_options()).unwrap();
+        fs.direct_block_device_adapter()
+            .read_block(&cx, source)
+            .unwrap();
+        assert!(
+            fs.ext4_base_block_cache.contains_key(&source),
+            "regression must start with stale-capable cached source"
+        );
+        let error = fs.initialize_native_ext4_validation(&cx).unwrap_err();
+        assert!(
+            matches!(error, FfsError::Corruption { block, .. } if block == source.0),
+            "{error}"
+        );
+        let fs = OpenFs::from_device(&cx, Box::new(dev), &native_preparation_options()).unwrap();
+        fs.check_native_ext4_validation(&cx)
+            .expect_err("faulted table cannot be certified");
+    }
+
+    #[test]
+    fn native_ext4_validation_retry_syncs_pending_plan_before_group_publication() {
+        let Some((fs, dev, _tmp, _image)) = native_preparation_fixture() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        fs.prepare_native_ext4_repair(&cx, 500).unwrap();
+        let durable = TestDevice::from_vec(dev.snapshot_bytes());
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let fault = ValidationSyncFaultDevice {
+            inner: dev,
+            durable: durable.clone(),
+            syncs: Arc::new(AtomicUsize::new(0)),
+            fail_on: 1,
+            corrupt_on: None,
+            events: Arc::clone(&events),
+        };
+        let fs = OpenFs::from_device(&cx, Box::new(fault.clone()), &native_preparation_options())
+            .unwrap();
+        let error = fs.initialize_native_ext4_validation(&cx).unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected native validation sync failure"),
+            "{error}"
+        );
+        assert_eq!(
+            events.lock().unwrap().len(),
+            2,
+            "only plan write and failed sync"
+        );
+        events.lock().unwrap().clear();
+        let fs = OpenFs::from_device(&cx, Box::new(fault), &native_preparation_options()).unwrap();
+        let report = fs.initialize_native_ext4_validation(&cx).unwrap();
+        assert_eq!(
+            events.lock().unwrap()[0],
+            None,
+            "visible pending plan must sync before any group write"
+        );
+        let cold =
+            OpenFs::from_device(&cx, Box::new(durable), &native_preparation_options()).unwrap();
+        assert_eq!(cold.check_native_ext4_validation(&cx).unwrap(), report);
+    }
+
     #[test]
     fn native_ext4_preparation_owns_tails_across_reopen_and_allocator() {
         let Some((fs, dev, _tmp, image)) = native_preparation_fixture() else {

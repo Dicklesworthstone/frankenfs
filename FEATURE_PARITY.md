@@ -177,6 +177,41 @@
 > CLI evidence, including a planted crash, not mounted native self-healing.
 > Native freshness fencing, encoding, Btrfs ownership and default activation
 > remain open on the original Bead.
+>
+> **Native ext4 source validation (`bd-11a8t`, partial evidence 2026-10-13):**
+> explicit offline `ffs native-validate --initialize` now persists per-source
+> BLAKE3 digests in owned validation storage; the default command checks them
+> without writing. Preparation journals an explicit Prepared whole-plan record.
+> Initialization durably binds every group's expected root before local
+> publication, then writes and verifies pending/sealed tables outside source
+> coverage. Interrupted retries refuse changed sources, missing authority or
+> damaged records; successful retries sync even when seals are already visible.
+> Source, table and ownership-header integrity reads bypass the block cache.
+> Final RCH `native_` selection passed 17 core + 9 CLI tests with mandatory
+> native oracles and no ignored tests. Controls include real file-data corruption
+> still accepted by metadata-only `e2fsck`, five write interruptions, volatile
+> versus durable sync failures, late-group changes and warmed-cache corruption.
+> Two test-only planted-red runs against earlier production reproduced incorrect
+> success: protocol job `j-30062613555576852` failed four controls; ownership-cache
+> job `j-30062613555576858` failed its selected repeat-check control. Final source
+> is base `41bc4c2d81b93f379bc324f690c43d046698f013` plus overlay
+> `dbdcfa0c4c4d8791ac5ddfba80cf735c56fb5103f4922a79e115f83572adc6a6`:
+> native job `j-30062613555576860`, strict workspace/all-target Clippy
+> `j-30062613555576859` and workspace/all-target check
+> `j-30062613555576862` all passed; formatting also passed. Full CLI/journal job
+> `j-30062613555576864` passed 394 + 296 tests with zero failures or ignored tests
+> on that same source. Public CLI build
+> `j-30062613555576861` produced binary SHA256
+> `37feec9cbe0f90d3689b26f6e94ceaae95fa1bc7264332b94120e8b6ff62a304`.
+> Its actual 64 MiB/eight-group image run checked 60,183 source blocks,
+> preserved the existing payload and left check/idempotent initialization
+> images unchanged. After payload block 4417 was corrupted, checking and
+> initialization refused without changing the image; `e2fsck -fn` still
+> accepted its metadata. Artifacts are retained at
+> `/data/tmp/ffs-chartreusestone-resume39-native-cli-artifacts-M1WFos`.
+> This is offline real-image and planted-fault evidence. Symbol encoding,
+> durable mounted freshness, Btrfs ownership and default repair remain incomplete;
+> successful validation reports `protection_active=false`. The bead remains open.
 
 > **Mount worker ownership (`bd-11a8t`, partial evidence 2026-10-12):** ordinary
 > CLI scrub and periodic commit now use caller-owned asupersync child regions.

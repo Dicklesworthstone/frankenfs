@@ -620,7 +620,9 @@ owner inode and generation, repair basis points, physical tail start and length
 with CRC32C. Cold discovery MUST validate that identity, exact unwritten extent
 mapping, inode/extent checksums, materialized allocation bits, block accounting,
 and exclusion of filesystem metadata and aliased extent nodes. Preparation writes
-zero descriptors and MUST NOT authorize decoding or report active protection.
+zero descriptors, a zero validation-header block and group zero's explicit
+Prepared whole-plan record (§3.15), all in that same transaction, and MUST NOT authorize
+decoding or report active protection.
 Fresh/pending state and source-validation records must be outside encoded source
 coverage so updating them cannot invalidate their own parity. Btrfs ownership,
 encoding/freshness integration, and default mounted activation remain required.
@@ -983,6 +985,47 @@ On recovery:
 4. After decode, verify recovered blocks against their stored digests.
 
 This prevents the decoder from being poisoned by silently corrupted blocks that happen to pass CRC32C (probability ~2^-32 per block) but have incorrect data.
+
+Native ext4 source validation is initialized explicitly offline with
+`ffs native-validate IMAGE --initialize`; the default invocation checks existing
+records without writing. Generation-one `FFSVAL01` records bind the filesystem
+UUID, owner inode/generation, group, source prefix, block size and physical
+validation span. The source prefix ends before the ownership block. The record
+contains a BLAKE3 root over these bindings and the per-source 32-byte digests,
+a pending/sealed state and CRC32C. A matching intent record occupies bytes
+64–191 of the ownership block; its first 64 ownership bytes remain unchanged.
+The validation table begins with the same 128-byte record, followed by digests.
+Both records and all validation storage are outside encoded source coverage.
+A generation-one `FFSPLN01` record occupies bytes 192–319 of group zero's
+ownership block. It binds UUID, owner identity/generation, group count, repair
+budget, block size, total source count and generation to a BLAKE3 root over
+the ordered bindings and expected roots of **all** groups, with
+prepared/pending/sealed state and CRC32C. Preparation journals a nonzero,
+checksum-bound Prepared record with a zero root; zero/missing plan bytes are
+never first-initialization authority. Other owner blocks keep those bytes zero.
+
+Preparation MUST journal a zero first validation block. Initialization MUST
+admit every group's metadata and source state before its first persistent write.
+The whole-plan pending root MUST be written and synced before any group intent
+or validation table mutation. On retry, every current group root MUST match
+that whole-plan binding, including groups that still have empty local intents.
+Missing whole-plan authority MUST refuse, including when interruption preceded
+the first local group intent. Only Prepared plus empty local intents admits a
+first initialization.
+An empty ownership intent may initialize only an empty validation header;
+arbitrary old payload bytes in unwritten storage are never table authority.
+A durable pending ownership intent with the expected source root MUST precede
+table writes. Complete payload write, sync and readback precede sealing the
+table; table sealing and sync precede sealing the ownership intent and sync.
+Interrupted initialization may resume only when current source digests match
+the persisted whole-plan root and any local pending root. All integrity passes
+MUST read the backing device rather than reuse an admission cache. The plan
+may seal only after every group has sealed; successful initialization MUST
+complete a durability sync even when a retry already sees all records sealed.
+Read-only checking MUST neither write nor sync. Sealed tables require matching sealed intent,
+valid table integrity and exact source digests; mismatch MUST refuse without
+rebaselining. No symbol or descriptor write, decoding authority, mounted
+freshness guarantee or active repair follows from validation initialization.
 
 ### 3.16 Tail Group and Metadata Special Cases
 

@@ -33,6 +33,7 @@ bhh0i_sharded_alloc = ["ffs-alloc/bhh0i_sharded_alloc"]
 rustc-hash = "2"
 arc-swap = { workspace = true }
 asupersync = { workspace = true }
+blake3 = { workspace = true }
 ffs-alloc = { workspace = true }
 ffs-block = { workspace = true }
 ffs-btree = { workspace = true }
