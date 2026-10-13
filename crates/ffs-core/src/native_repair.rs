@@ -11,7 +11,9 @@ use super::{
     Serialize, SingleLockDirAlloc, TransactionBlockAdapter, debug,
     ext4_superblock_requires_journal_recovery, parse_extent_tree, parse_to_ffs_error,
 };
-use asupersync::sync::{Mutex as NativeMutex, MutexGuard as NativeMutexGuard, OnceCell, TryLockError};
+use asupersync::sync::{
+    Mutex as NativeMutex, MutexGuard as NativeMutexGuard, OnceCell, TryLockError,
+};
 use ffs_block::{BlockBuf, ByteDevice};
 use ffs_repair::codec::{DirectEncodeRequest, direct_encode_workspace_bytes, encode_group_direct};
 use ffs_repair::recovery::{GroupRecoveryOrchestrator, RecoveryWriteback, RecoveryWritebackBlock};
@@ -201,10 +203,12 @@ fn freshness_codec_budget(
             .and_then(|bytes| bytes.checked_add(u64::from(sources) * 128))
             .and_then(|bytes| bytes.checked_add(4096))
             .ok_or_else(|| freshness_error("retained metadata budget overflows"))?;
-        retained = retained.checked_add(group)
+        retained = retained
+            .checked_add(group)
             .ok_or_else(|| freshness_error("retained metadata budget overflows"))?;
     }
-    allowed.checked_sub(retained)
+    allowed
+        .checked_sub(retained)
         .ok_or_else(|| freshness_error("working budget is below retained metadata estimate"))
 }
 
@@ -212,18 +216,25 @@ impl NativeFreshnessDevice {
     fn lock(&self, cx: &Cx) -> Result<NativeMutexGuard<'_, NativeFreshnessState>, FfsError> {
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         let state = self.state.try_lock().map_err(|error| match error {
-            TryLockError::Locked => FfsError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock)),
+            TryLockError::Locked => {
+                FfsError::Io(std::io::Error::from(std::io::ErrorKind::WouldBlock))
+            }
             TryLockError::Poisoned => freshness_error("state mutex is poisoned"),
         })?;
         cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
         if state.phase == FreshnessPhase::Poisoned {
-            return Err(freshness_error("device is poisoned after an incomplete operation"));
+            return Err(freshness_error(
+                "device is poisoned after an incomplete operation",
+            ));
         }
         Ok(state)
     }
 
     fn device(&self) -> ByteDeviceBlockAdapter<'_> {
-        ByteDeviceBlockAdapter { dev: self.inner.as_ref(), block_size: self.sb.block_size }
+        ByteDeviceBlockAdapter {
+            dev: self.inner.as_ref(),
+            block_size: self.sb.block_size,
+        }
     }
 
     fn check_plan(
@@ -232,9 +243,16 @@ impl NativeFreshnessDevice {
         baseline: &NativeBaseline,
         intent: ValidationIntent,
     ) -> Result<(), FfsError> {
-        let owner = self.device().read_block(cx, baseline.storage.tails[0].start)?;
+        let owner = self
+            .device()
+            .read_block(cx, baseline.storage.tails[0].start)?;
         let bytes = &owner.as_slice()[PLAN_HEADER_START..PLAN_HEADER_END];
-        if validation_plan_intent(bytes, &self.sb, &baseline.storage, baseline.owner_generation)? != intent
+        if validation_plan_intent(
+            bytes,
+            &self.sb,
+            &baseline.storage,
+            baseline.owner_generation,
+        )? != intent
             || validation_plan_epoch(bytes)? != baseline.epoch
         {
             return Err(freshness_error("whole-plan authority changed"));
@@ -251,24 +269,36 @@ impl NativeFreshnessDevice {
         let baseline = &state.baseline;
         let tail = &baseline.storage.tails[index];
         let dev = self.device();
-        let owner = dev.read_block(cx, tail.start)?;
-        let expected = owner_header(
-            &self.sb, baseline.storage.owner_inode, baseline.owner_generation,
-            baseline.storage.repair_basis_points, tail,
-        );
-        if owner.as_slice()[..OWNER_HEADER_BYTES] != expected[..OWNER_HEADER_BYTES]
-            || owner.as_slice()[PARITY_HEADER_END..].iter().any(|byte| *byte != 0)
-            || (index != 0 && owner.as_slice()[PLAN_HEADER_START..PLAN_HEADER_END].iter().any(|byte| *byte != 0))
-            || owner.as_slice()[OWNER_HEADER_BYTES..PLAN_HEADER_START] != state.tables[index][..VALIDATION_HEADER_BYTES]
+        let owner = check_native_owner_prefix(
+            cx,
+            &dev,
+            &self.sb,
+            &baseline.storage,
+            baseline.owner_generation,
+            tail,
+        )?;
+        if owner[OWNER_HEADER_BYTES..PLAN_HEADER_START]
+            != state.tables[index][..VALIDATION_HEADER_BYTES]
             || read_native_parity_intent(cx, &dev, &self.sb, baseline, tail)? != state.parity[index]
         {
-            return Err(validation_error(tail, "native ownership changed during active epoch"));
+            return Err(validation_error(
+                tail,
+                "native ownership changed during active epoch",
+            ));
         }
         let (root, table) = read_sealed_table(
-            cx, &dev, &self.sb, &baseline.storage, baseline.owner_generation, tail,
+            cx,
+            &dev,
+            &self.sb,
+            &baseline.storage,
+            baseline.owner_generation,
+            tail,
         )?;
         if root != baseline.roots[index] || table != state.tables[index] {
-            return Err(validation_error(tail, "native validation authority changed"));
+            return Err(validation_error(
+                tail,
+                "native validation authority changed",
+            ));
         }
         native_sealed_generation(cx, &dev, &self.sb, baseline, tail, false)?;
         Ok(())
@@ -305,14 +335,19 @@ impl NativeFreshnessDevice {
             let block = BlockNumber(number);
             let tail = native_target(&state.baseline.storage, block)?;
             let table = &state.tables[tail.group.0 as usize];
-            let digest_offset = VALIDATION_HEADER_BYTES + (number - tail.group_start.0) as usize * 32;
-            let expected = state.intended.get(&block).map_or(
-                &table[digest_offset..digest_offset + 32], |digest| digest.as_slice(),
-            );
+            let digest_offset =
+                VALIDATION_HEADER_BYTES + (number - tail.group_start.0) as usize * 32;
+            let expected = state
+                .intended
+                .get(&block)
+                .map_or(&table[digest_offset..digest_offset + 32], |digest| {
+                    digest.as_slice()
+                });
             let mut bytes = self.device().read_block(cx, block)?.into_inner();
             if blake3::hash(&bytes).as_bytes() != expected {
                 return Err(FfsError::Corruption {
-                    block: number, detail: "native freshness beforeimage digest mismatch".into(),
+                    block: number,
+                    detail: "native freshness beforeimage digest mismatch".into(),
                 });
             }
             let start = offset.max(number * size);
@@ -325,7 +360,8 @@ impl NativeFreshnessDevice {
                     consumed = 0;
                 }
                 let count = (limit - cursor).min(buffers[input].len() - consumed);
-                bytes[cursor..cursor + count].copy_from_slice(&buffers[input][consumed..consumed + count]);
+                bytes[cursor..cursor + count]
+                    .copy_from_slice(&buffers[input][consumed..consumed + count]);
                 cursor += count;
                 consumed += count;
             }
@@ -334,26 +370,39 @@ impl NativeFreshnessDevice {
         Ok(staged)
     }
 
-    fn write_buffers(&self, cx: &Cx, offset: ByteOffset, buffers: &[&[u8]]) -> Result<(), FfsError> {
+    fn write_buffers(
+        &self,
+        cx: &Cx,
+        offset: ByteOffset,
+        buffers: &[&[u8]],
+    ) -> Result<(), FfsError> {
         let length = buffers.iter().try_fold(0_u64, |length, bytes| {
-            length.checked_add(bytes.len() as u64).ok_or_else(|| freshness_error("write length overflows"))
+            length
+                .checked_add(bytes.len() as u64)
+                .ok_or_else(|| freshness_error("write length overflows"))
         })?;
         let mut state = self.lock(cx)?;
         if length == 0 {
             return Ok(());
         }
-        let end = offset.0.checked_add(length)
+        let end = offset
+            .0
+            .checked_add(length)
             .filter(|end| *end <= self.inner.len_bytes())
             .ok_or_else(|| freshness_error("write exceeds admitted image"))?;
         let size = u64::from(self.sb.block_size);
         for number in offset.0 / size..=(end - 1) / size {
             native_target(&state.baseline.storage, BlockNumber(number))?;
         }
-        state.baseline.epoch.checked_add(1)
+        state
+            .baseline
+            .epoch
+            .checked_add(1)
             .ok_or_else(|| freshness_error("validation epoch exhausted before source write"))?;
         for intent in &state.parity {
-            intent.generation().checked_add(1)
-                .ok_or_else(|| freshness_error("parity generation exhausted before source write"))?;
+            intent.generation().checked_add(1).ok_or_else(|| {
+                freshness_error("parity generation exhausted before source write")
+            })?;
         }
         let result = (|| {
             let staged = self.stage_intended(cx, &state, offset.0, end, buffers)?;
@@ -361,8 +410,12 @@ impl NativeFreshnessDevice {
                 self.check_authority(cx, &state)?;
                 state.phase = FreshnessPhase::Poisoned;
                 publish_validation_plan(
-                    cx, &self.device(), &self.sb, &state.baseline.storage,
-                    state.baseline.owner_generation, state.baseline.epoch,
+                    cx,
+                    &self.device(),
+                    &self.sb,
+                    &state.baseline.storage,
+                    state.baseline.owner_generation,
+                    state.baseline.epoch,
                     ValidationIntent::Dirty(state.baseline.plan_root),
                 )?;
                 state.phase = FreshnessPhase::Dirty;
@@ -388,8 +441,13 @@ impl NativeFreshnessDevice {
         for (index, tail) in state.baseline.storage.tails.iter().enumerate() {
             let mut table = state.tables[index].clone();
             table[..VALIDATION_HEADER_BYTES].copy_from_slice(&validation_header(
-                &self.sb, state.baseline.storage.owner_inode, state.baseline.owner_generation,
-                tail, epoch, VALIDATION_PENDING, &[0; 32],
+                &self.sb,
+                state.baseline.storage.owner_inode,
+                state.baseline.owner_generation,
+                tail,
+                epoch,
+                VALIDATION_PENDING,
+                &[0; 32],
             )?);
             for (block, digest) in state.intended.range(tail.group_start..tail.start) {
                 let offset = VALIDATION_HEADER_BYTES + (block.0 - tail.group_start.0) as usize * 32;
@@ -398,14 +456,23 @@ impl NativeFreshnessDevice {
             let (_, _, used) = validation_sizes(&self.sb, tail)?;
             let root = validation_root(&table, used);
             table[..VALIDATION_HEADER_BYTES].copy_from_slice(&validation_header(
-                &self.sb, state.baseline.storage.owner_inode, state.baseline.owner_generation,
-                tail, epoch, VALIDATION_PENDING, &root,
+                &self.sb,
+                state.baseline.storage.owner_inode,
+                state.baseline.owner_generation,
+                tail,
+                epoch,
+                VALIDATION_PENDING,
+                &root,
             )?);
             // The expected hashes came only from admitted tables or verified
             // caller writes. Reading current bytes cannot redefine them.
             verify_validation_table(cx, &self.device(), &self.sb, tail, &table, &root)?;
             tables.push(table);
-            admissions.push(ValidationAdmission { epoch, root, intent: ValidationIntent::Pending(root) });
+            admissions.push(ValidationAdmission {
+                epoch,
+                root,
+                intent: ValidationIntent::Pending(root),
+            });
         }
         Ok((tables, admissions))
     }
@@ -428,20 +495,46 @@ impl NativeFreshnessDevice {
                 intent: ValidationIntent::Pending(next.roots[index]),
             };
             publish_validation_group(
-                cx, &dev, &self.sb, &next.storage, next.owner_generation,
-                tail, &validation,
+                cx,
+                &dev,
+                &self.sb,
+                &next.storage,
+                next.owner_generation,
+                tail,
+                &validation,
             )?;
             let (root, table) = read_sealed_table(
-                cx, &dev, &self.sb, &next.storage, next.owner_generation, tail,
+                cx,
+                &dev,
+                &self.sb,
+                &next.storage,
+                next.owner_generation,
+                tail,
             )?;
             tables[index][..VALIDATION_HEADER_BYTES].copy_from_slice(&validation_header(
-                &self.sb, next.storage.owner_inode, next.owner_generation, tail,
-                next.epoch, VALIDATION_SEALED, &validation.root,
+                &self.sb,
+                next.storage.owner_inode,
+                next.owner_generation,
+                tail,
+                next.epoch,
+                VALIDATION_SEALED,
+                &validation.root,
             )?);
             if root != validation.root || table != tables[index] {
-                return Err(validation_error(tail, "freshness table publication disagrees with intended bytes"));
+                return Err(validation_error(
+                    tail,
+                    "freshness table publication disagrees with intended bytes",
+                ));
             }
-            encode_and_publish_native_group(cx, &dev, &self.sb, next, tail, &admissions[index], &table)?;
+            encode_and_publish_native_group(
+                cx,
+                &dev,
+                &self.sb,
+                next,
+                tail,
+                &admissions[index],
+                &table,
+            )?;
         }
         Ok(())
     }
@@ -457,17 +550,35 @@ impl NativeFreshnessDevice {
         let dev = self.device();
         let mut parity = Vec::with_capacity(next.storage.tails.len());
         for (index, tail) in next.storage.tails.iter().enumerate() {
-            check_native_owner_prefix(cx, &dev, &self.sb, &next.storage, next.owner_generation, tail)?;
+            check_native_owner_prefix(
+                cx,
+                &dev,
+                &self.sb,
+                &next.storage,
+                next.owner_generation,
+                tail,
+            )?;
             let (root, table) = read_sealed_table(
-                cx, &dev, &self.sb, &next.storage, next.owner_generation, tail,
+                cx,
+                &dev,
+                &self.sb,
+                &next.storage,
+                next.owner_generation,
+                tail,
             )?;
             if root != next.roots[index] || table != tables[index] {
-                return Err(validation_error(tail, "freshness authority changed before final seal"));
+                return Err(validation_error(
+                    tail,
+                    "freshness authority changed before final seal",
+                ));
             }
             verify_validation_table(cx, &dev, &self.sb, tail, &table, &root)?;
             let generation = native_sealed_generation(cx, &dev, &self.sb, next, tail, false)?;
             if generation != admissions[index].next_generation {
-                return Err(validation_error(tail, "freshness parity generation changed before final seal"));
+                return Err(validation_error(
+                    tail,
+                    "freshness parity generation changed before final seal",
+                ));
             }
             parity.push(read_native_parity_intent(cx, &dev, &self.sb, next, tail)?);
         }
@@ -477,11 +588,17 @@ impl NativeFreshnessDevice {
     fn refresh(&self, cx: &Cx, state: &mut NativeFreshnessState) -> Result<(), FfsError> {
         self.inner.sync(cx)?;
         self.check_authority(cx, state)?;
-        let epoch = state.baseline.epoch.checked_add(1)
+        let epoch = state
+            .baseline
+            .epoch
+            .checked_add(1)
             .ok_or_else(|| freshness_error("validation epoch exhausted"))?;
         let (mut tables, validations) = self.next_tables(cx, state, epoch)?;
         let plan_root = validation_plan_root(
-            &self.sb, &state.baseline.storage, state.baseline.owner_generation, &validations,
+            &self.sb,
+            &state.baseline.storage,
+            state.baseline.owner_generation,
+            &validations,
         )?;
         let next = NativeBaseline {
             storage: state.baseline.storage.clone(),
@@ -493,22 +610,31 @@ impl NativeFreshnessDevice {
         let dev = self.device();
         let mut admissions = Vec::with_capacity(next.storage.tails.len());
         for tail in &next.storage.tails {
-            let mut admission = admit_native_group(
-                cx, &dev, &self.sb, &state.baseline, tail, self.codec_budget,
-            )?;
+            let mut admission =
+                admit_native_group(cx, &dev, &self.sb, &state.baseline, tail, self.codec_budget)?;
             // Source-root changes require a new parity generation even when
             // current raw parity is intact. Retain its exact high-water and seal.
             admission.retained = false;
             admissions.push(admission);
         }
         publish_validation_plan(
-            cx, &dev, &self.sb, &next.storage, next.owner_generation, epoch,
+            cx,
+            &dev,
+            &self.sb,
+            &next.storage,
+            next.owner_generation,
+            epoch,
             ValidationIntent::Pending(plan_root),
         )?;
         self.publish_groups(cx, state, &next, &mut tables, &admissions)?;
         let parity = self.verified_parity(cx, &next, &tables, &admissions)?;
         publish_validation_plan(
-            cx, &dev, &self.sb, &next.storage, next.owner_generation, epoch,
+            cx,
+            &dev,
+            &self.sb,
+            &next.storage,
+            next.owner_generation,
+            epoch,
             ValidationIntent::Sealed(plan_root),
         )?;
         self.check_plan(cx, &next, ValidationIntent::Sealed(plan_root))?;
@@ -526,7 +652,11 @@ impl NativeFreshnessDevice {
         self.check_authority(cx, state)?;
         for (index, tail) in state.baseline.storage.tails.iter().enumerate() {
             verify_validation_table(
-                cx, &self.device(), &self.sb, tail, &state.tables[index],
+                cx,
+                &self.device(),
+                &self.sb,
+                tail,
+                &state.tables[index],
                 &state.baseline.roots[index],
             )?;
         }
@@ -548,7 +678,12 @@ impl ByteDevice for NativeFreshnessDevice {
         self.write_buffers(cx, offset, &[bytes])
     }
 
-    fn write_vectored_all_at(&self, cx: &Cx, offset: ByteOffset, buffers: &[&[u8]]) -> Result<(), FfsError> {
+    fn write_vectored_all_at(
+        &self,
+        cx: &Cx,
+        offset: ByteOffset,
+        buffers: &[&[u8]],
+    ) -> Result<(), FfsError> {
         self.write_buffers(cx, offset, buffers)
     }
 
