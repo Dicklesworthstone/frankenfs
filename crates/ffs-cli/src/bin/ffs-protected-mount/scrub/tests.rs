@@ -520,10 +520,14 @@ struct Fixture {
 
 impl Fixture {
     fn new() -> Self {
+        Self::with_geometry(8, READ_BYTES * 2 + 37)
+    }
+
+    fn with_geometry(group_blocks: u32, source_bytes: usize) -> Self {
         let dir = tempfile::tempdir().unwrap();
         let image = dir.path().join("source.img");
         let sidecar = dir.path().join("source.ffsrq");
-        let original: Vec<_> = (0..READ_BYTES * 2 + 37)
+        let original: Vec<_> = (0..source_bytes)
             .map(|index| u8::try_from((index * 31 + index / 512) % 251).unwrap())
             .collect();
         std::fs::write(&image, &original).unwrap();
@@ -533,7 +537,7 @@ impl Fixture {
             &sidecar,
             SidecarOptions {
                 block_size: 512,
-                group_blocks: 8,
+                group_blocks,
                 repair_symbols: 4,
             },
         )
@@ -831,7 +835,7 @@ fn parity_deferrals_never_count_as_success_or_spin_inside_a_source_pass() {
 }
 
 #[test]
-fn parity_epoch_restarts_cannot_starve_the_next_source_pass() {
+fn parity_epoch_restarts_cannot_exceed_one_batch() {
     let mut maintenance = ProtectionMaintenance::default();
     let mut calls = 0;
     for _ in 0..2 {
@@ -849,8 +853,167 @@ fn parity_epoch_restarts_cannot_starve_the_next_source_pass() {
             )
             .unwrap();
     }
-    assert_eq!(calls, 2 * PROTECTION_STEPS_PER_PASS);
+    assert_eq!(calls, 2 * PROTECTION_STEPS_PER_BATCH);
     assert_eq!(maintenance.completed_passes, 0);
+}
+
+#[test]
+fn parity_cycle_includes_publication_at_and_across_batch_boundaries() {
+    for (groups, expected_calls) in [(0, 1), (63, 64), (64, 65), (129, 130)] {
+        let mut maintenance = ProtectionMaintenance::default();
+        let mut calls = 0;
+        let mut reports = 0;
+        maintenance
+            .cycle(
+                &Cx::for_testing(),
+                &AtomicBool::new(false),
+                groups,
+                |_| {
+                    let group = calls;
+                    calls += 1;
+                    Ok(if group < groups {
+                        ProtectionScrubStep::GroupVerified { group }
+                    } else {
+                        ProtectionScrubStep::Complete(ProtectionScrubReport {
+                            groups_verified: groups,
+                            ..ProtectionScrubReport::default()
+                        })
+                    })
+                },
+                |report| {
+                    reports += 1;
+                    assert_eq!(report.groups_verified, groups);
+                    Ok(())
+                },
+            )
+            .unwrap();
+        assert_eq!(calls, expected_calls);
+        assert_eq!(reports, 1);
+        assert_eq!(maintenance.completed_passes, 1);
+    }
+}
+
+#[test]
+fn parity_cycle_epoch_churn_exhausts_its_budget_without_reporting_success() {
+    for (groups, expected_calls) in [(0, 64), (63, 64), (64, 128), (129, 192)] {
+        let mut maintenance = ProtectionMaintenance::default();
+        let mut calls = 0;
+        maintenance
+            .cycle(
+                &Cx::for_testing(),
+                &AtomicBool::new(false),
+                groups,
+                |_| {
+                    calls += 1;
+                    Ok(ProtectionScrubStep::GroupVerified { group: 0 })
+                },
+                |_| panic!("epoch churn cannot attest to complete coverage"),
+            )
+            .unwrap();
+        assert_eq!(calls, expected_calls);
+        assert_eq!(maintenance.completed_passes, 0);
+    }
+}
+
+#[test]
+fn parity_cycle_stops_on_writer_deferral_after_a_full_batch() {
+    for deferred in [
+        ProtectionScrubStep::Busy,
+        ProtectionScrubStep::PendingWrites,
+    ] {
+        let mut maintenance = ProtectionMaintenance::default();
+        let mut calls = 0;
+        maintenance
+            .cycle(
+                &Cx::for_testing(),
+                &AtomicBool::new(false),
+                129,
+                |_| {
+                    calls += 1;
+                    Ok(if calls <= 64 {
+                        ProtectionScrubStep::GroupVerified { group: calls - 1 }
+                    } else {
+                        deferred
+                    })
+                },
+                |_| panic!("deferred coverage is not a complete pass"),
+            )
+            .unwrap();
+        assert_eq!(calls, 65);
+        assert_eq!(maintenance.completed_passes, 0);
+    }
+}
+
+#[test]
+fn parity_cycle_honors_shutdown_and_cancellation_at_a_batch_boundary() {
+    for cancelled in [false, true] {
+        let cx = Cx::for_testing();
+        let shutdown = AtomicBool::new(false);
+        let mut maintenance = ProtectionMaintenance::default();
+        let mut calls = 0;
+        let result = maintenance.cycle(
+            &cx,
+            &shutdown,
+            129,
+            |_| {
+                calls += 1;
+                if calls == 64 {
+                    if cancelled {
+                        cx.set_cancel_requested(true);
+                    } else {
+                        shutdown.store(true, Ordering::Release);
+                    }
+                }
+                Ok(ProtectionScrubStep::GroupVerified { group: calls - 1 })
+            },
+            |_| panic!("stopped cycle cannot report coverage"),
+        );
+        if cancelled {
+            assert!(matches!(
+                result.unwrap_err().downcast_ref::<FfsError>(),
+                Some(FfsError::Cancelled)
+            ));
+        } else {
+            result.unwrap();
+        }
+        assert_eq!(calls, 64);
+        assert_eq!(maintenance.completed_passes, 0);
+    }
+}
+
+#[test]
+fn parity_cycle_deferral_and_cancellation_prevent_a_second_storage_call() {
+    for outcome in [
+        ProtectionScrubStep::Busy,
+        ProtectionScrubStep::PendingWrites,
+        ProtectionScrubStep::GroupVerified { group: 0 },
+    ] {
+        let cx = Cx::for_testing();
+        let mut maintenance = ProtectionMaintenance::default();
+        let mut calls = 0;
+        let cancelled = matches!(outcome, ProtectionScrubStep::GroupVerified { .. });
+        let result = maintenance.cycle(
+            &cx,
+            &AtomicBool::new(false),
+            129,
+            |_| {
+                calls += 1;
+                cx.set_cancel_requested(cancelled);
+                Ok(outcome)
+            },
+            |_| panic!("deferred or cancelled pass cannot report success"),
+        );
+        if cancelled {
+            assert!(matches!(
+                result.unwrap_err().downcast_ref::<FfsError>(),
+                Some(FfsError::Cancelled)
+            ));
+        } else {
+            result.unwrap();
+        }
+        assert_eq!(calls, 1);
+        assert_eq!(maintenance.completed_passes, 0);
+    }
 }
 
 #[test]
@@ -934,9 +1097,24 @@ impl Fixture {
 
 #[test]
 fn parity_worker_replenishes_symbols_that_source_only_reads_do_not_inspect() {
+    assert_parity_worker_replenishes_symbols(8, READ_BYTES * 2 + 37, 33);
+}
+
+#[test]
+fn parity_worker_finishes_large_archive_before_next_source_interval() {
+    // More than two 64-step batches, including a short final group. A worker
+    // that waits the 24-hour source interval between batches cannot pass.
+    assert_parity_worker_replenishes_symbols(4, READ_BYTES * 4 + 37, 129);
+}
+
+fn assert_parity_worker_replenishes_symbols(
+    group_blocks: u32,
+    source_bytes: usize,
+    expected_groups: u64,
+) {
     let runtime = mount_background_runtime().unwrap();
     let cx = runtime.request_cx_with_budget(Budget::INFINITE);
-    let fixture = Fixture::new();
+    let fixture = Fixture::with_geometry(group_blocks, source_bytes);
     let device = Arc::new(fixture.open());
     fixture.damage_tail_parity();
     let shutdown = Arc::new(AtomicBool::new(false));
@@ -969,7 +1147,7 @@ fn parity_worker_replenishes_symbols_that_source_only_reads_do_not_inspect() {
     assert_eq!(source_passes.load(Ordering::Acquire), 1);
     assert_eq!(report["event"], "protected_parity_scrub_pass");
     assert_eq!(report["consistency"], "per_group_not_snapshot");
-    assert_eq!(report["groups_verified"].as_u64(), Some(33));
+    assert_eq!(report["groups_verified"].as_u64(), Some(expected_groups));
     assert_eq!(
         report["source_bytes_verified"].as_u64(),
         Some(u64::try_from(fixture.original.len()).unwrap())
@@ -995,16 +1173,17 @@ fn parity_worker_replenishes_symbols_that_source_only_reads_do_not_inspect() {
     let reopened = fixture.open();
     // The sole source block in the final group must recover using the symbols
     // that were completely unusable before the worker replenished them.
-    fixture.damage(READ_BYTES * 2, 37);
+    let tail_offset = fixture.original.len() - 37;
+    fixture.damage(tail_offset, 37);
     let mut tail = [0; 37];
     reopened
         .read_exact_at(
             &Cx::for_testing(),
-            ByteOffset(u64::try_from(READ_BYTES * 2).unwrap()),
+            ByteOffset(u64::try_from(tail_offset).unwrap()),
             &mut tail,
         )
         .unwrap();
-    assert_eq!(tail.as_slice(), &fixture.original[READ_BYTES * 2..]);
+    assert_eq!(tail.as_slice(), &fixture.original[tail_offset..]);
 }
 
 #[test]
@@ -1054,6 +1233,7 @@ fn parity_maintenance_defers_real_pending_writes_until_the_writer_syncs() {
     let fixture = Fixture::new();
     let device = fixture.open();
     let cx = Cx::for_testing();
+    assert_eq!(device.protection_group_count(), 33);
     device
         .write_all_at(&cx, ByteOffset(0), &[0x65; 512])
         .unwrap();
@@ -1062,9 +1242,10 @@ fn parity_maintenance_defers_real_pending_writes_until_the_writer_syncs() {
     let pending = std::fs::read(&fixture.sidecar).unwrap();
     let mut maintenance = ProtectionMaintenance::default();
     maintenance
-        .batch(
+        .cycle(
             &cx,
             &AtomicBool::new(false),
+            device.protection_group_count(),
             |cursor| device.scrub_step(&cx, cursor),
             |_| panic!("pending writes cannot be published by maintenance"),
         )
@@ -1076,9 +1257,10 @@ fn parity_maintenance_defers_real_pending_writes_until_the_writer_syncs() {
     device.sync(&cx).unwrap(); // The WRITER explicitly publishes its epoch.
     let mut reports = 0;
     maintenance
-        .batch(
+        .cycle(
             &cx,
             &AtomicBool::new(false),
+            device.protection_group_count(),
             |cursor| device.scrub_step(&cx, cursor),
             |report| {
                 reports += 1;

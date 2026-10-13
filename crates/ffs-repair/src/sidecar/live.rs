@@ -138,6 +138,7 @@ pub struct SidecarImageDevice {
     image: File,
     sidecar_path: PathBuf,
     image_bytes: u64,
+    protection_groups: u32,
     state: Mutex<State>,
 }
 
@@ -221,6 +222,7 @@ impl SidecarImageDevice {
             image,
             sidecar_path,
             image_bytes: archive.header.image_bytes,
+            protection_groups: archive.header.groups,
             state: Mutex::new(State {
                 archive,
                 phase: Phase::Clean,
@@ -806,6 +808,16 @@ impl SidecarImageDevice {
         let report = cursor.report;
         *cursor = ProtectionScrubCursor::default();
         Ok(ProtectionScrubStep::Complete(report))
+    }
+
+    /// Number of protection groups in this fixed-size admitted image.
+    ///
+    /// This immutable geometry is available even during a pending write epoch,
+    /// without waiting for the device serializer. It bounds maintenance work;
+    /// it does not attest to the freshness or validity of any repair symbol.
+    #[must_use]
+    pub const fn protection_group_count(&self) -> u32 {
+        self.protection_groups
     }
 
     /// Last committed protection point. An outstanding epoch is reported as an

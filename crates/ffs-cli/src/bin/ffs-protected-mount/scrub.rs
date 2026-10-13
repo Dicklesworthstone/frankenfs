@@ -25,9 +25,9 @@ use std::time::{Duration, Instant};
 const READ_BYTES: usize = 64 * 1024;
 const STOP_POLL: Duration = Duration::from_millis(20);
 const BETWEEN_READS: Duration = Duration::from_millis(1);
-// A busy writer can continually replace the protection epoch and restart a
-// cursor. Bound work per source pass even when every step reports progress.
-const PROTECTION_STEPS_PER_PASS: usize = 64;
+// Yield/check cancellation between groups and cap each scheduling batch. A
+// cycle additionally limits total attempts using the admitted image geometry.
+const PROTECTION_STEPS_PER_BATCH: usize = 64;
 
 #[derive(Debug, Default, clap::Args)]
 pub struct Options {
@@ -158,39 +158,61 @@ struct ProtectionMaintenance {
 }
 
 impl ProtectionMaintenance {
+    /// Attempt one full protection pass after a source scan, without waiting
+    /// another source interval after each batch. Even continuous epoch changes
+    /// cannot consume more than a geometry-sized budget, rounded to one batch.
+    fn cycle(
+        &mut self,
+        cx: &Cx,
+        shutdown: &AtomicBool,
+        groups: u32,
+        mut step: impl FnMut(&mut ProtectionScrubCursor) -> ffs_error::Result<ProtectionScrubStep>,
+        mut report: impl FnMut(&ProtectionPassReport) -> Result<()>,
+    ) -> Result<()> {
+        // One step per group plus the final verification/publication step.
+        let batches = (u64::from(groups) + 1).div_ceil(PROTECTION_STEPS_PER_BATCH as u64);
+        for _ in 0..batches {
+            if !self.batch(cx, shutdown, &mut step, &mut report)? {
+                break;
+            }
+        }
+        Ok(())
+    }
+
     /// Resume one bounded batch after a complete source scan. Deferral retains
     /// the cursor but does not count as a completed parity pass. The library
     /// restarts this private cursor if a foreground sync publishes a new epoch.
+    /// Returns true only when all batch attempts made progress without finishing.
     fn batch(
         &mut self,
         cx: &Cx,
         shutdown: &AtomicBool,
         mut step: impl FnMut(&mut ProtectionScrubCursor) -> ffs_error::Result<ProtectionScrubStep>,
         mut report: impl FnMut(&ProtectionPassReport) -> Result<()>,
-    ) -> Result<()> {
+    ) -> Result<bool> {
         // The worker's stop() cancels this same Cx. Managed/external unmount
         // sets shutdown; no independent unjoined task or cleanup Cx is used.
         let never_stopped = AtomicBool::new(false);
-        for _ in 0..PROTECTION_STEPS_PER_PASS {
+        for _ in 0..PROTECTION_STEPS_PER_BATCH {
             if shutdown.load(Ordering::Acquire) {
-                return Ok(());
+                return Ok(false);
             }
             cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
             match step(&mut self.cursor).context("protected parity scrub")? {
-                ProtectionScrubStep::Busy | ProtectionScrubStep::PendingWrites => return Ok(()),
+                ProtectionScrubStep::Busy | ProtectionScrubStep::PendingWrites => return Ok(false),
                 ProtectionScrubStep::GroupVerified { .. } => {
                     if !wait(cx, &never_stopped, shutdown, BETWEEN_READS)? {
-                        return Ok(());
+                        return Ok(false);
                     }
                 }
                 ProtectionScrubStep::Complete(observed) => {
                     self.completed_passes = self.completed_passes.saturating_add(1);
                     report(&ProtectionPassReport::new(self.completed_passes, observed))?;
-                    return Ok(());
+                    return Ok(false);
                 }
             }
         }
-        Ok(())
+        Ok(true)
     }
 }
 
@@ -249,9 +271,10 @@ impl ScrubGuard {
             move |worker_cx, source| {
                 source_report(source)?;
                 if parity {
-                    maintenance.batch(
+                    maintenance.cycle(
                         worker_cx,
                         &maintenance_shutdown,
+                        maintenance_device.protection_group_count(),
                         |cursor| maintenance_device.scrub_step(worker_cx, cursor),
                         &mut parity_report,
                     )?;

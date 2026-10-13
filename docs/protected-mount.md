@@ -131,16 +131,21 @@ cargo run -p ffs-cli --bin ffs-protected-mount -- \
   --scrub-interval-secs 300 --scrub-parity
 ```
 
-After each completed source pass, maintenance attempts at most 64 device steps.
-Ordinary steps check one source group, its admitted digest table and every repair
-symbol, releasing the serializer between groups. A busy device or pending caller
+After each completed source pass, maintenance attempts a complete parity pass
+before waiting for the configured interval. Ordinary steps check one source group,
+its admitted digest table and every repair symbol, releasing the serializer and
+checking cancellation between groups. A quiescent image completes in that cycle
+regardless of whether it has more than 64 groups. A busy device or pending caller
 writes defer maintenance without touching bytes or reporting a completed parity
-pass. Progress resumes after the next source pass; large images can therefore need
-multiple source passes for one parity pass. Every successful archive publication
-restarts that progress at group zero, even when its bytes are identical. Sustained
-writes may postpone parity completion; the worker never forces a write epoch clean
-to make maintenance progress, and repeated restarts cannot consume unbounded steps
-within one source pass.
+pass; deferred progress resumes after the next source pass.
+
+Every successful archive publication restarts progress at group zero, even when its
+bytes are identical. To bound retries during sustained writes, each cycle permits
+at most `64 * ceil((group_count + 1) / 64)` device steps: one per admitted group plus
+final verification/publication, rounded to a 64-step batch. Reaching the limit
+defers remaining work without reporting success. Sustained writes may postpone
+parity completion; the worker never forces a write epoch clean to make maintenance
+progress.
 
 After all groups verify, damaged parity or header bytes trigger the existing
 verified atomic archive replacement. **This exceptional final step rescans the

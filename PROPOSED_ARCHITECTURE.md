@@ -54,7 +54,7 @@
 > native storage and restart/default activation remain separate unmet parts of
 > the original lifecycle target.
 
-> **Protected mount workers (`bd-11a8t`, 29 controls verified):** the CLI-private
+> **Protected mount workers (`bd-11a8t`):** the CLI-private
 > `mount_worker` module shares that child-region and completion-drain ownership
 > with `ffs-protected-mount`. Its source scanner and parity maintenance receive
 > the worker context. Local stop leaves the parent and sibling regions running;
@@ -62,10 +62,25 @@
 > admission-time guard also covers cancellation before blocking work starts.
 > Final image/archive cleanup uses an independent context after the worker has
 > released its device. The optional scrub flags and storage format are unchanged.
-> RCH job `30059820987973812` passed all 29 protected scrub controls on base
-> `10554dc68` plus overlay `d83601d389a6`; the identical source passed the full
-> workspace/all-targets check. Strict Clippy and the two new protected real-FUSE
-> lifecycle scenarios remain pending; see `FEATURE_PARITY.md` for the proof scope.
+> The published `287f5ccc9` source passed 48 protected CLI controls, strict
+> workspace/all-targets Clippy and compiler checks, and both privileged ext4/Btrfs
+> healthy-sidecar mounted lifecycle scenarios. See `FEATURE_PARITY.md` for exact
+> source, command and execution provenance; this is not native repair proof.
+
+> **Protected parity scheduling (`bd-11a8t`):** after a full source scan, the
+> worker attempts a complete parity pass before waiting for the next configured
+> source interval. Immutable admitted image geometry supplies the budget:
+> `64 * ceil((group_count + 1) / 64)` maximum step attempts per cycle. The extra
+> step permits final verification/publication. Each ordinary group releases the
+> device serializer and checks cancellation during the existing 1 ms pause.
+> Completion, writer contention, pending writes, shutdown or error ends the
+> cycle; epoch churn can exhaust the budget without producing a success report.
+> Maintenance does not sync a writer's pending epoch. The final archive rebuild
+> still scans the image while holding the serializer, so this attempt bound is
+> not a foreground latency guarantee. The current source passed 54 protected CLI
+> controls, 622 repair-library tests, workspace/all-targets compiler and strict
+> Clippy checks, and both privileged ext4/Btrfs first-cycle mounted lifecycle
+> cases. Exact source and commands are in `FEATURE_PARITY.md`.
 
 > **Explicit symbol regeneration (`bd-11a8t`):** both format rebuild paths
 > preflight the complete allocation plan, then freshly scan each group's full

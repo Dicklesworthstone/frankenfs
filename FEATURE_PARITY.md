@@ -209,6 +209,57 @@
 > Native storage, default activation and mounted native corruption/restart
 > acceptance remain open.
 
+> **Protected parity scheduling (`bd-11a8t`, 2026-10-13):** parity maintenance
+> now attempts a complete pass after each source scan, before the configured
+> interval. Previously only 64 steps ran per interval: 512 groups needed nine
+> source cycles, including final publication. The geometry-derived attempt
+> budget retains 64-step batches and stops the cycle on completion, contention,
+> pending writes, cancellation, shutdown or error. Repeated epoch resets cannot
+> create an unbounded retry or a false completed-pass report. Final archive
+> rebuild still holds the serializer across a full-image scan; this change does
+> not establish a foreground I/O latency bound.
+> A real 129-group archive with damaged tail parity reproduced the old timeout
+> in RCH job `30062009357697044`: one selected test failed after 30.22 s on
+> `287f5ccc9` plus test-only overlay `81be0e8cc296`. The first attempt (`7043`)
+> failed malformed fixture geometry and supplies no scheduling evidence; the
+> corrected fixture respects the existing geometry gate. With the fix, RCH job
+> `30062009357697045` passed all 54 protected CLI tests, including repaired
+> archive reopen/tail reconstruction, batch boundaries, epoch churn, writer
+> deferral and cancellation. Command: `cargo test -p ffs-cli --bin
+> ffs-protected-mount -- --nocapture`, executed remotely with one Cargo job and
+> debug information disabled. Source: `287f5ccc97d2283d049a1a5312c87a3c030e1e1c`
+> plus four-file overlay
+> `9a9401d807120135c5a4603e129420e61d38bf545e747871600d919bb2e1a1fa`.
+> Logs: `ffs-chartreusestone-resume36-red2.log` and
+> `ffs-chartreusestone-resume36-cli-tests.log`. On the same source, RCH job
+> `30062009357697046` passed all 622 repair-library tests (`cargo test -p
+> ffs-repair --lib -- --nocapture`), and `30062009357697047` passed
+> `cargo check --workspace --all-targets`. Logs:
+> `ffs-chartreusestone-resume36-repair-tests.log` and
+> `ffs-chartreusestone-resume36-check.log`. Strict workspace/all-targets Clippy
+> (`cargo clippy --workspace --all-targets -- -D warnings`) passed unchanged on
+> `vmi1227854`, RCH job `30062009357697049`, remote/wrapper exit 0. Log:
+> `/data/tmp/ffs-chartreusestone-resume36-clippy2.log`. The earlier `hz4` Clippy
+> job `7048` stalled under measured shared I/O pressure and was cancelled with
+> terminal recovery acknowledged; it supplies neither a lint pass nor a source
+> failure. Formatting also passed.
+> RCH job `30062009357697052` passed both strengthened real-FUSE lifecycle
+> cases on the same source: 2 passed, 0 failed/ignored, 292 filtered. The first
+> source/parity cycle covered Btrfs 128 MiB/512 groups and ext4 32 MiB/128 groups.
+> Both retained ordinary unmount, exact 65,553-byte restart readback, unchanged
+> image/archive hashes, archive verification and native filesystem checks.
+> Command: `cargo test -p ffs-harness --test fuse_e2e --
+> scrub_lifecycle_bd_11a8t --nocapture --test-threads=1`, through RCH on `hz4`
+> with required FUSE/oracles and Cargo's sudo runner. Public binaries were built
+> by RCH job `30062009357697051`; worker and retrieved executable hashes matched.
+> Log: `/data/tmp/ffs-chartreusestone-resume36-fuse.log` (SHA-256
+> `5396b826cc744e7e40bd4f3f52cd7b69aa3743589a6f7a1c8c4b05fb6dbdb7c0`);
+> images, archives and mount logs are retained in
+> `/data/tmp/ffs-chartreusestone-resume36-protected-hz4/`.
+> This is privileged healthy-sidecar evidence, not mounted corruption or a
+> comparative benchmark. Native ownership, default activation and native
+> corruption/restart acceptance remain open on the original bead.
+
 > **Explicit regeneration (`bd-11a8t`, verified controls 2026-10-12):** the CLI
 > ext4 and Btrfs rebuild paths now use the existing descriptor high-water reader
 > to resume interrupted symbol publication. They freshly scan each source range

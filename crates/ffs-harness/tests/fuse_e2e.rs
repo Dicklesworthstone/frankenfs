@@ -16736,8 +16736,8 @@ fn protected_sidecar_cli_btrfs_corruption_restart_bd_7zjfh() {
 }
 
 fn protected_scrub_wait_for_passes(mount: &mut BtrfsCliMount, image_bytes: u64) {
-    // The existing fixture has 64 source blocks per protection group. Parity
-    // advances only 64 steps per source pass, so Btrfs needs several passes.
+    // The existing fixture has 64 source blocks per protection group. The
+    // quiescent archive must finish in the first scheduled source/parity cycle.
     let expected_groups = image_bytes.div_ceil(4096 * 64);
     let started = Instant::now();
     loop {
@@ -16746,12 +16746,13 @@ fn protected_scrub_wait_for_passes(mount: &mut BtrfsCliMount, image_bytes: u64) 
             .lines()
             .filter_map(|line| serde_json::from_str(line).ok())
             .collect();
-        let source = reports
+        let parity_index = reports
             .iter()
-            .find(|report| report["event"] == "protected_source_scrub_pass");
-        let parity = reports
+            .position(|report| report["event"] == "protected_parity_scrub_pass");
+        let parity = parity_index.map(|index| &reports[index]);
+        let source = reports[..parity_index.unwrap_or(reports.len())]
             .iter()
-            .find(|report| report["event"] == "protected_parity_scrub_pass");
+            .rfind(|report| report["event"] == "protected_source_scrub_pass");
         let status = mount.child.try_wait().expect("poll protected scrub CLI");
         let mounted = mountinfo_has_mountpoint(&mount.mountpoint);
         let timed_out = started.elapsed() >= Duration::from_secs(180);
@@ -16776,11 +16777,7 @@ fn protected_scrub_wait_for_passes(mount: &mut BtrfsCliMount, image_bytes: u64) 
             mount.directory.display()
         );
         if let (Some(source), Some(parity)) = (source, parity) {
-            assert!(
-                source["completed_passes"]
-                    .as_u64()
-                    .is_some_and(|count| count > 0)
-            );
+            assert_eq!(source["completed_passes"], 1);
             assert_eq!(source["source_bytes_verified"], image_bytes);
             assert_eq!(source["consistency"], "per_read_not_snapshot");
             assert!(
