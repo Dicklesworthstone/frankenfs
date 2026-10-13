@@ -234,7 +234,11 @@ fn modified_timestamp(seconds: u64) -> Result<(u16, u16)> {
 fn validate_boot_state(cx: &Cx, volume: &FatVolume) -> Result<()> {
     // Both native boot copies must begin clean. A surface-test request must
     // never be silently cleared by either replacement or creation.
-    let state_at = if volume.geometry.kind() == FatKind::Fat16 { 37 } else { 65 };
+    let state_at = if volume.geometry.kind() == FatKind::Fat16 {
+        37
+    } else {
+        65
+    };
     for number in std::iter::once(0_u16).chain(volume.geometry.backup_boot_sector()) {
         let offset = u64::from(number) * u64::from(volume.geometry.sector_bytes());
         let mut boot = [0; 512];
@@ -255,7 +259,9 @@ fn reserve_clusters(cx: &Cx, volume: &FatVolume, needed: usize, free: u64) -> Re
         );
     }
     let mut clusters = Vec::new();
-    clusters.try_reserve_exact(needed).context("allocating bounded replacement chain")?;
+    clusters
+        .try_reserve_exact(needed)
+        .context("allocating bounded replacement chain")?;
     let mut table = FatTable::new(volume);
     for cluster in 2..=volume.geometry.cluster_count() + 1 {
         if clusters.len() == needed {
@@ -404,7 +410,9 @@ impl Replacement {
         checkpoint(cx)?;
         let mut current = [0; 32];
         volume.read_exact(cx, self.entry_offset, &mut current)?;
-        let initial = self.creation.as_ref().map_or(self.original, |namespace| namespace.initial_entry(self.original));
+        let initial = self.creation.as_ref().map_or(self.original, |namespace| {
+            namespace.initial_entry(self.original)
+        });
         if current != initial || source.len_bytes() != u64::from(self.size) {
             bail!("replacement target or source changed before dirty publication");
         }

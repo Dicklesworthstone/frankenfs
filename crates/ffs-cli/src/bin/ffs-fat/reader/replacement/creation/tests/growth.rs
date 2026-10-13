@@ -4,7 +4,11 @@ use super::*;
 
 fn full_parent(kind: FatKind, sector: u32, active: bool, nested: bool) -> (Image, String, u32) {
     let image = Image::new(kind, sector, active);
-    let end = if kind == FatKind::Fat16 { 0xFFFF } else { 0x0FFF_FFFF };
+    let end = if kind == FatKind::Fat16 {
+        0xFFFF
+    } else {
+        0x0FFF_FFFF
+    };
     let first = if nested { 8 } else { 2 };
     let start = image.base + image.geometry.cluster_offset(first).unwrap();
     // Select copies before locking the device; opening a volume reads it.
@@ -17,7 +21,11 @@ fn full_parent(kind: FatKind, sector: u32, active: bool, nested: bool) -> (Image
                 let width = kind.entry_bytes() as usize;
                 let mut raw = [0; 4];
                 state.read(at, &mut raw[..width]);
-                let mask = if kind == FatKind::Fat16 { 0xFFFF } else { 0x0FFF_FFFF };
+                let mask = if kind == FatKind::Fat16 {
+                    0xFFFF
+                } else {
+                    0x0FFF_FFFF
+                };
                 let updated = (u32::from_le_bytes(raw) & !mask) | end;
                 state.put(at, &updated.to_le_bytes()[..width]);
             }
@@ -35,7 +43,10 @@ fn full_parent(kind: FatKind, sector: u32, active: bool, nested: bool) -> (Image
         }
         for index in (if nested { 2 } else { 1 })..u64::from(sector) / 32 {
             let name = format!("F{index:07}TXT");
-            state.put(start + index * 32, &short_entry(name.as_bytes().try_into().unwrap(), 0, 0));
+            state.put(
+                start + index * 32,
+                &short_entry(name.as_bytes().try_into().unwrap(), 0, 0),
+            );
         }
         state.persist();
     }
@@ -47,20 +58,39 @@ fn full_parent(kind: FatKind, sector: u32, active: bool, nested: bool) -> (Image
 #[test]
 fn creation_grows_full_root_and_subdirectories_without_replacing_existing_allocation() {
     let cx = Cx::for_testing();
-    for (kind, nested) in [(FatKind::Fat16, true), (FatKind::Fat32, false), (FatKind::Fat32, true)] {
+    for (kind, nested) in [
+        (FatKind::Fat16, true),
+        (FatKind::Fat32, false),
+        (FatKind::Fat32, true),
+    ] {
         for sector in [512, 4096] {
             for active in [false, true] {
-                if active && kind == FatKind::Fat16 { continue; }
+                if active && kind == FatKind::Fat16 {
+                    continue;
+                }
                 let (image, path, first) = full_parent(kind, sector, active, nested);
                 let volume = image.volume();
-                let old_parent = image.bytes(image.base + image.geometry.cluster_offset(first).unwrap(), sector as usize);
+                let old_parent = image.bytes(
+                    image.base + image.geometry.cluster_offset(first).unwrap(),
+                    sector as usize,
+                );
                 let before = volume.check(&cx).unwrap();
                 let input = source(&vec![0xD5; 1300]);
                 let probe = prepare(&cx, &volume, &path, &input, NOW).unwrap();
-                let extension = probe.creation.as_ref().unwrap().extension.as_ref().unwrap().cluster;
+                let extension = probe
+                    .creation
+                    .as_ref()
+                    .unwrap()
+                    .extension
+                    .as_ref()
+                    .unwrap()
+                    .cluster;
                 // Free space need not be zero. Initialization must overwrite it
                 // without ever publishing it as live directory records.
-                image.device.state.lock().unwrap().put(image.base + image.geometry.cluster_offset(extension).unwrap(), &vec![0xCC; sector as usize]);
+                image.device.state.lock().unwrap().put(
+                    image.base + image.geometry.cluster_offset(extension).unwrap(),
+                    &vec![0xCC; sector as usize],
+                );
                 let plan = prepare(&cx, &volume, &path, &input, NOW).unwrap();
                 assert!(!plan.clusters.contains(&extension));
                 assert_eq!(plan.creation.as_ref().unwrap().directory_clusters(), 1);
@@ -69,11 +99,26 @@ fn creation_grows_full_root_and_subdirectories_without_replacing_existing_alloca
                 let reopened = image.volume();
                 assert_eq!(contents(&reopened, &path), vec![0xD5; 1300]);
                 assert_eq!(contents(&reopened, "/KEEP.BIN"), b"SAFE");
-                assert_eq!(image.bytes(image.base + image.geometry.cluster_offset(first).unwrap(), sector as usize), old_parent);
-                assert_eq!(image.bytes(image.base + image.geometry.cluster_offset(extension).unwrap() + 32, sector as usize - 32), vec![0; sector as usize - 32]);
+                assert_eq!(
+                    image.bytes(
+                        image.base + image.geometry.cluster_offset(first).unwrap(),
+                        sector as usize
+                    ),
+                    old_parent
+                );
+                assert_eq!(
+                    image.bytes(
+                        image.base + image.geometry.cluster_offset(extension).unwrap() + 32,
+                        sector as usize - 32
+                    ),
+                    vec![0; sector as usize - 32]
+                );
                 let after = reopened.check(&cx).unwrap();
                 assert!(after.clean);
-                assert_eq!(before.free_clusters - after.free_clusters, plan.clusters.len() as u64 + 1);
+                assert_eq!(
+                    before.free_clusters - after.free_clusters,
+                    plan.clusters.len() as u64 + 1
+                );
                 assert_eq!(after.files, before.files + 1);
                 assert_eq!(after.directories, before.directories);
                 image.guards();
@@ -110,7 +155,10 @@ fn creation_extension_each_write_and_flush_cut_refuses_uncommitted_directory_gro
         let (probe, path, _) = full_parent(kind, 512, false, nested);
         let input = source(b"complete new data");
         let volume = probe.volume();
-        prepare(&cx, &volume, &path, &input, NOW).unwrap().execute(&cx, &volume, &input, || Ok(())).unwrap();
+        prepare(&cx, &volume, &path, &input, NOW)
+            .unwrap()
+            .execute(&cx, &volume, &input, || Ok(()))
+            .unwrap();
         let operations = probe.device.state.lock().unwrap().operations;
         for fail in 1..=operations {
             for tear in [0, 27, 511] {
@@ -125,19 +173,40 @@ fn creation_extension_each_write_and_flush_cut_refuses_uncommitted_directory_gro
                 assert!(plan.execute(&cx, &volume, &input, || Ok(())).is_err());
                 for retain in [false, true] {
                     let mut state = image.device.state.lock().unwrap().clone();
-                    if retain { state.persist(); } else { state.pending.clear(); }
-                    let device = Device { state: Arc::new(Mutex::new(state)), length: image.device.length, writable: false };
-                    match FatVolume::from_device(&cx, Box::new(device), image.base, image.geometry.volume_bytes()) {
+                    if retain {
+                        state.persist();
+                    } else {
+                        state.pending.clear();
+                    }
+                    let device = Device {
+                        state: Arc::new(Mutex::new(state)),
+                        length: image.device.length,
+                        writable: false,
+                    };
+                    match FatVolume::from_device(
+                        &cx,
+                        Box::new(device),
+                        image.base,
+                        image.geometry.volume_bytes(),
+                    ) {
                         Ok(reopened) => {
-                            assert!(reopened.check(&cx).unwrap().clean, "{kind:?} growth cut {fail} tear {tear}");
+                            assert!(
+                                reopened.check(&cx).unwrap().clean,
+                                "{kind:?} growth cut {fail} tear {tear}"
+                            );
                             assert_eq!(contents(&reopened, "/KEEP.BIN"), b"SAFE");
                             match reopened.resolve(&cx, &path) {
-                                Ok(Some(_)) => assert_eq!(contents(&reopened, &path), b"complete new data"),
+                                Ok(Some(_)) => {
+                                    assert_eq!(contents(&reopened, &path), b"complete new data")
+                                }
                                 Err(FfsError::NotFound(_)) => (),
                                 other => panic!("unexpected growth result: {other:?}"),
                             }
                         }
-                        Err(FfsError::UnsupportedFeature(reason)) => assert!(reason.contains("dirty") || reason.contains("I/O errors"), "{reason}"),
+                        Err(FfsError::UnsupportedFeature(reason)) => assert!(
+                            reason.contains("dirty") || reason.contains("I/O errors"),
+                            "{reason}"
+                        ),
                         Err(error) => panic!("unexpected growth reopen error: {error}"),
                     }
                 }

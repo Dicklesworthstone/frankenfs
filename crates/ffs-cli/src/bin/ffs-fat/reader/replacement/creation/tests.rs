@@ -24,7 +24,9 @@ impl State {
     fn read(&self, offset: u64, output: &mut [u8]) {
         for (index, byte) in output.iter_mut().enumerate() {
             let at = offset + index as u64;
-            *byte = self.pending.get(&(at / 512))
+            *byte = self
+                .pending
+                .get(&(at / 512))
                 .or_else(|| self.durable.get(&(at / 512)))
                 .map_or(0, |page| page[(at % 512) as usize]);
         }
@@ -51,11 +53,22 @@ struct Device {
 }
 
 impl ByteDevice for Device {
-    fn len_bytes(&self) -> u64 { self.length }
+    fn len_bytes(&self) -> u64 {
+        self.length
+    }
 
-    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, output: &mut [u8]) -> ffs_error::Result<()> {
+    fn read_exact_at(
+        &self,
+        cx: &Cx,
+        offset: ByteOffset,
+        output: &mut [u8],
+    ) -> ffs_error::Result<()> {
         checkpoint(cx)?;
-        if offset.0.checked_add(output.len() as u64).is_none_or(|end| end > self.length) {
+        if offset
+            .0
+            .checked_add(output.len() as u64)
+            .is_none_or(|end| end > self.length)
+        {
             return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
         }
         self.state.lock().unwrap().read(offset.0, output);
@@ -69,9 +82,15 @@ impl ByteDevice for Device {
         let mut state = self.state.lock().unwrap();
         state.operations += 1;
         let failed = state.fail == Some(state.operations);
-        let count = if failed { state.tear.min(input.len()) } else { input.len() };
+        let count = if failed {
+            state.tear.min(input.len())
+        } else {
+            input.len()
+        };
         state.put(offset.0, &input[..count]);
-        if failed { return Err(io::Error::other("injected creation write failure").into()); }
+        if failed {
+            return Err(io::Error::other("injected creation write failure").into());
+        }
         Ok(())
     }
 
@@ -92,14 +111,20 @@ fn source(bytes: &[u8]) -> Device {
     let mut state = State::default();
     state.put(0, bytes);
     state.persist();
-    Device { state: Arc::new(Mutex::new(state)), length: bytes.len() as u64, writable: false }
+    Device {
+        state: Arc::new(Mutex::new(state)),
+        length: bytes.len() as u64,
+        writable: false,
+    }
 }
 
 fn short_entry(name: &[u8; 11], cluster: u32, size: u32) -> [u8; 32] {
     let mut bytes = [0; 32];
     bytes[..11].copy_from_slice(name);
     bytes[11] = 0x20;
-    for at in [16, 18, 24] { bytes[at..at + 2].copy_from_slice(&0x21_u16.to_le_bytes()); }
+    for at in [16, 18, 24] {
+        bytes[at..at + 2].copy_from_slice(&0x21_u16.to_le_bytes());
+    }
     bytes[20..22].copy_from_slice(&((cluster >> 16) as u16).to_le_bytes());
     bytes[26..28].copy_from_slice(&(cluster as u16).to_le_bytes());
     bytes[28..32].copy_from_slice(&size.to_le_bytes());
@@ -115,10 +140,19 @@ struct Image {
 
 impl Image {
     fn new(kind: FatKind, sector: u32, active: bool) -> Self {
-        let clusters = if kind == FatKind::Fat16 { 5000_u32 } else { 70_000 };
+        let clusters = if kind == FatKind::Fat16 {
+            5000_u32
+        } else {
+            70_000
+        };
         let reserved = if kind == FatKind::Fat16 { 1_u32 } else { 32 };
-        let fat = ((u64::from(clusters) + 2) * u64::from(kind.entry_bytes())).div_ceil(u64::from(sector)) as u32;
-        let roots = if kind == FatKind::Fat16 { (sector / 32).max(32) as u16 } else { 0 };
+        let fat = ((u64::from(clusters) + 2) * u64::from(kind.entry_bytes()))
+            .div_ceil(u64::from(sector)) as u32;
+        let roots = if kind == FatKind::Fat16 {
+            (sector / 32).max(32) as u16
+        } else {
+            0
+        };
         let total = reserved + 2 * fat + (u32::from(roots) * 32).div_ceil(sector) + clusters;
         let mut boot = [0; 512];
         boot[..3].copy_from_slice(&[0xEB, 0x58, 0x90]);
@@ -161,7 +195,11 @@ impl Image {
             info[508..512].copy_from_slice(&0xAA55_0000_u32.to_le_bytes());
             state.put(base + u64::from(sector), &info);
         }
-        let end = if kind == FatKind::Fat16 { 0xFFFF_u32 } else { 0x0FFF_FFFF };
+        let end = if kind == FatKind::Fat16 {
+            0xFFFF_u32
+        } else {
+            0x0FFF_FFFF
+        };
         let width = kind.entry_bytes() as usize;
         for copy in 0..2_u32 {
             let start = base + u64::from(reserved + copy * fat) * u64::from(sector);
@@ -172,22 +210,48 @@ impl Image {
                     2 if kind == FatKind::Fat32 => end,
                     _ => 0,
                 };
-                let raw = low | if kind == FatKind::Fat32 { (10 + copy) << 28 } else { 0 };
-                state.put(start + u64::from(cluster) * width as u64, &raw.to_le_bytes()[..width]);
+                let raw = low
+                    | if kind == FatKind::Fat32 {
+                        (10 + copy) << 28
+                    } else {
+                        0
+                    };
+                state.put(
+                    start + u64::from(cluster) * width as u64,
+                    &raw.to_le_bytes()[..width],
+                );
             }
         }
-        let root = base + geometry.fixed_root().map_or_else(|| geometry.cluster_offset(2).unwrap(), |(at, _)| at);
+        let root = base
+            + geometry
+                .fixed_root()
+                .map_or_else(|| geometry.cluster_offset(2).unwrap(), |(at, _)| at);
         state.put(root, &short_entry(b"KEEP    BIN", 5, 4));
         // This looks like a live alias/cross-link, but is after the end marker.
         // Creating a new entry at root+32 must never resurrect it.
         state.put(root + 64, &short_entry(b"GHOST   BIN", 5, 4));
         state.put(base + geometry.cluster_offset(5).unwrap(), b"SAFE");
         state.persist();
-        Self { device: Device { state: Arc::new(Mutex::new(state)), length: base + length + 512, writable: true }, geometry, base, root }
+        Self {
+            device: Device {
+                state: Arc::new(Mutex::new(state)),
+                length: base + length + 512,
+                writable: true,
+            },
+            geometry,
+            base,
+            root,
+        }
     }
 
     fn volume(&self) -> FatVolume {
-        FatVolume::from_device(&Cx::for_testing(), Box::new(self.device.clone()), self.base, self.geometry.volume_bytes()).unwrap()
+        FatVolume::from_device(
+            &Cx::for_testing(),
+            Box::new(self.device.clone()),
+            self.base,
+            self.geometry.volume_bytes(),
+        )
+        .unwrap()
     }
 
     fn bytes(&self, at: u64, count: usize) -> Vec<u8> {
@@ -198,8 +262,14 @@ impl Image {
 
     fn guards(&self) {
         assert_eq!(self.bytes(0, 512), [0xA7; 512]);
-        assert_eq!(self.bytes(self.base + self.geometry.volume_bytes(), 512), [0xB9; 512]);
-        assert_eq!(self.bytes(self.base + self.geometry.cluster_offset(5).unwrap(), 4), b"SAFE");
+        assert_eq!(
+            self.bytes(self.base + self.geometry.volume_bytes(), 512),
+            [0xB9; 512]
+        );
+        assert_eq!(
+            self.bytes(self.base + self.geometry.cluster_offset(5).unwrap(), 4),
+            b"SAFE"
+        );
     }
 }
 
@@ -216,12 +286,15 @@ fn creation_both_dialects_sectors_empty_files_and_active_fat_preserve_native_byt
     for kind in [FatKind::Fat16, FatKind::Fat32] {
         for sector in [512, 4096] {
             for active in [false, true] {
-                if active && kind == FatKind::Fat16 { continue; }
+                if active && kind == FatKind::Fat16 {
+                    continue;
+                }
                 let image = Image::new(kind, sector, active);
                 let volume = image.volume();
                 assert!(volume.check(&cx).unwrap().clean);
                 let keep = image.bytes(image.root, 32);
-                let fat0 = image.base + image.geometry.entry_offset(0, 2).unwrap() - 2 * u64::from(kind.entry_bytes());
+                let fat0 = image.base + image.geometry.entry_offset(0, 2).unwrap()
+                    - 2 * u64::from(kind.entry_bytes());
                 let previous = image.bytes(fat0, sector as usize);
                 for (path, bytes) in [("/new.bin", vec![0xD5; 1300]), ("/EMPTY.TXT", Vec::new())] {
                     let input = source(&bytes);
@@ -235,19 +308,32 @@ fn creation_both_dialects_sectors_empty_files_and_active_fat_preserve_native_byt
                     let reopened = image.volume();
                     assert_eq!(contents(&reopened, path), bytes);
                     assert_eq!(contents(&reopened, "/KEEP.BIN"), b"SAFE");
-                    assert!(matches!(reopened.resolve(&cx, "/GHOST.BIN"), Err(FfsError::NotFound(_))));
+                    assert!(matches!(
+                        reopened.resolve(&cx, "/GHOST.BIN"),
+                        Err(FfsError::NotFound(_))
+                    ));
                     assert!(reopened.check(&cx).unwrap().clean);
                     assert_eq!(input.state.lock().unwrap().operations, 0);
                     if let Some(last) = plan.clusters.last() {
                         let tail = bytes.len() % sector as usize;
                         if tail != 0 {
-                            assert_eq!(image.bytes(image.base + image.geometry.cluster_offset(*last).unwrap() + tail as u64, sector as usize - tail), vec![0; sector as usize - tail]);
+                            assert_eq!(
+                                image.bytes(
+                                    image.base
+                                        + image.geometry.cluster_offset(*last).unwrap()
+                                        + tail as u64,
+                                    sector as usize - tail
+                                ),
+                                vec![0; sector as usize - tail]
+                            );
                         }
                     }
                 }
                 assert_eq!(image.bytes(image.root, 32), keep);
                 assert_eq!(image.bytes(image.root + 32 + 12, 1), [24]);
-                if active { assert_eq!(image.bytes(fat0, sector as usize), previous); }
+                if active {
+                    assert_eq!(image.bytes(fat0, sector as usize), previous);
+                }
                 image.guards();
             }
         }
@@ -267,7 +353,20 @@ fn deleted_slot_creation_preserves_live_successor_and_rejects_names_without_writ
     }
     let volume = image.volume();
     let input = source(b"payload");
-    for path in ["/keep.bin", "/KEEP.BIN", "/CON", "/LPT1.TXT", "/Mixed.txt", "/long name.txt", "/é.txt", "/A.B.C", "/TRAIL.", "/", "/../NEW.TXT", "/KEEP.BIN/NEW.TXT"] {
+    for path in [
+        "/keep.bin",
+        "/KEEP.BIN",
+        "/CON",
+        "/LPT1.TXT",
+        "/Mixed.txt",
+        "/long name.txt",
+        "/é.txt",
+        "/A.B.C",
+        "/TRAIL.",
+        "/",
+        "/../NEW.TXT",
+        "/KEEP.BIN/NEW.TXT",
+    ] {
         assert!(prepare(&cx, &volume, path, &input, NOW).is_err(), "{path}");
     }
     assert_eq!(image.device.state.lock().unwrap().operations, 0);
@@ -287,8 +386,16 @@ fn creation_refuses_existing_long_name_and_native_short_alias() {
     lfn[0] = 0x41;
     lfn[11] = 0x0F;
     lfn[13] = short_name_checksum(b"KEEP    BIN");
-    let units: Vec<u16> = "OTHER.TXT".encode_utf16().chain(std::iter::once(0)).chain(std::iter::repeat(0xFFFF)).take(13).collect();
-    for (at, unit) in [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30].into_iter().zip(units) {
+    let units: Vec<u16> = "OTHER.TXT"
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .chain(std::iter::repeat(0xFFFF))
+        .take(13)
+        .collect();
+    for (at, unit) in [1, 3, 5, 7, 9, 14, 16, 18, 20, 22, 24, 28, 30]
+        .into_iter()
+        .zip(units)
+    {
         lfn[at..at + 2].copy_from_slice(&unit.to_le_bytes());
     }
     {
@@ -316,18 +423,29 @@ fn creation_stale_successor_size_overflow_cancellation_and_full_root_are_prewrit
     assert!(prepare(&cx, &volume, "/NEW.BIN", &input, NOW).is_err());
     input.length = 3;
     let plan = prepare(&cx, &volume, "/NEW.BIN", &input, NOW).unwrap();
-    image.device.state.lock().unwrap().put(image.root + 64 + 13, &[77]);
+    image
+        .device
+        .state
+        .lock()
+        .unwrap()
+        .put(image.root + 64 + 13, &[77]);
     assert!(plan.execute(&cx, &volume, &input, || Ok(())).is_err());
     assert_eq!(image.device.state.lock().unwrap().operations, 0);
     let cancelled = Cx::for_testing();
-    cancelled.cancel_with(asupersync::types::CancelKind::User, Some("creation control"));
+    cancelled.cancel_with(
+        asupersync::types::CancelKind::User,
+        Some("creation control"),
+    );
     assert!(prepare(&cancelled, &volume, "/NEW.BIN", &input, NOW).is_err());
     let (_, length) = image.geometry.fixed_root().unwrap();
     {
         let mut state = image.device.state.lock().unwrap();
         for index in 1..length / 32 {
             let name = format!("F{index:07}TXT");
-            state.put(image.root + index * 32, &short_entry(name.as_bytes().try_into().unwrap(), 0, 0));
+            state.put(
+                image.root + index * 32,
+                &short_entry(name.as_bytes().try_into().unwrap(), 0, 0),
+            );
         }
         state.persist();
     }
@@ -344,7 +462,10 @@ fn creation_every_write_and_sync_cut_has_no_clean_partial_file_or_resurrected_en
         let probe = Image::new(kind, 512, false);
         let input = source(&vec![0xD5; 1300]);
         let volume = probe.volume();
-        prepare(&cx, &volume, "/NEW.BIN", &input, NOW).unwrap().execute(&cx, &volume, &input, || Ok(())).unwrap();
+        prepare(&cx, &volume, "/NEW.BIN", &input, NOW)
+            .unwrap()
+            .execute(&cx, &volume, &input, || Ok(()))
+            .unwrap();
         let operations = probe.device.state.lock().unwrap().operations;
         assert!(operations >= 15);
         for fail in 1..=operations {
@@ -360,20 +481,44 @@ fn creation_every_write_and_sync_cut_has_no_clean_partial_file_or_resurrected_en
                 assert!(plan.execute(&cx, &volume, &input, || Ok(())).is_err());
                 for retain in [false, true] {
                     let mut state = image.device.state.lock().unwrap().clone();
-                    if retain { state.persist(); } else { state.pending.clear(); }
-                    let device = Device { state: Arc::new(Mutex::new(state)), length: image.device.length, writable: false };
-                    match FatVolume::from_device(&cx, Box::new(device), image.base, image.geometry.volume_bytes()) {
+                    if retain {
+                        state.persist();
+                    } else {
+                        state.pending.clear();
+                    }
+                    let device = Device {
+                        state: Arc::new(Mutex::new(state)),
+                        length: image.device.length,
+                        writable: false,
+                    };
+                    match FatVolume::from_device(
+                        &cx,
+                        Box::new(device),
+                        image.base,
+                        image.geometry.volume_bytes(),
+                    ) {
                         Ok(reopened) => {
-                            assert!(reopened.check(&cx).unwrap().clean, "{kind:?} cut {fail} tear {tear}");
+                            assert!(
+                                reopened.check(&cx).unwrap().clean,
+                                "{kind:?} cut {fail} tear {tear}"
+                            );
                             assert_eq!(contents(&reopened, "/KEEP.BIN"), b"SAFE");
                             match reopened.resolve(&cx, "/NEW.BIN") {
-                                Ok(Some(_)) => assert_eq!(contents(&reopened, "/NEW.BIN"), vec![0xD5; 1300]),
+                                Ok(Some(_)) => {
+                                    assert_eq!(contents(&reopened, "/NEW.BIN"), vec![0xD5; 1300])
+                                }
                                 Err(FfsError::NotFound(_)) => (),
                                 other => panic!("unexpected created-file result: {other:?}"),
                             }
-                            assert!(matches!(reopened.resolve(&cx, "/GHOST.BIN"), Err(FfsError::NotFound(_))));
+                            assert!(matches!(
+                                reopened.resolve(&cx, "/GHOST.BIN"),
+                                Err(FfsError::NotFound(_))
+                            ));
                         }
-                        Err(FfsError::UnsupportedFeature(reason)) => assert!(reason.contains("dirty") || reason.contains("I/O errors"), "{reason}"),
+                        Err(FfsError::UnsupportedFeature(reason)) => assert!(
+                            reason.contains("dirty") || reason.contains("I/O errors"),
+                            "{reason}"
+                        ),
                         Err(error) => panic!("unexpected reopen error: {error}"),
                     }
                 }
@@ -387,14 +532,38 @@ fn creation_every_write_and_sync_cut_has_no_clean_partial_file_or_resurrected_en
 fn cli_create_is_explicit_and_does_not_change_replace_default() {
     use clap::Parser;
     for create in [false, true] {
-        let mut args = vec!["ffs-fat", "replace", "image.img", "/NEW.BIN", "--source", "source.bin", "--offline-image", "--dry-run"];
-        if create { args.push("--create"); }
+        let mut args = vec![
+            "ffs-fat",
+            "replace",
+            "image.img",
+            "/NEW.BIN",
+            "--source",
+            "source.bin",
+            "--offline-image",
+            "--dry-run",
+        ];
+        if create {
+            args.push("--create");
+        }
         let cli = crate::Cli::try_parse_from(args).unwrap();
-        let crate::Command::Replace { options } = cli.command else { panic!("replace command"); };
+        let crate::Command::Replace { options } = cli.command else {
+            panic!("replace command");
+        };
         assert_eq!(options.create, create);
         assert!(options.dry_run && options.offline_image);
     }
-    assert!(crate::Cli::try_parse_from(["ffs-fat", "replace", "image.img", "/NEW.BIN", "--source", "source.bin", "--create"]).is_err());
+    assert!(
+        crate::Cli::try_parse_from([
+            "ffs-fat",
+            "replace",
+            "image.img",
+            "/NEW.BIN",
+            "--source",
+            "source.bin",
+            "--create"
+        ])
+        .is_err()
+    );
 }
 
 mod growth;

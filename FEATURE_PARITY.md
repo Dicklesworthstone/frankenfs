@@ -239,7 +239,12 @@
 > This is executed offline real-image/planted-fault evidence, not mounted
 > freshness or current-data rollback authority. Full CLI job
 > `j-30063314843205647` passed all 400 tests with zero failures, ignored or
-> filtered tests on the same source. New native core controls remain under execution.
+> filtered tests on the same source. Native core job `j-30063314843205644`
+> was cancelled during dependency compilation and recovered with exit 137;
+> no core tests ran. Its unchanged-source retry was refused before submission
+> by RCH disk admission. The five new core crash-boundary controls remain
+> unexecuted pending an admitted worker; compilation and public offline success
+> do not substitute for those fault tests.
 > This partial path admits at most 56,403 source blocks per group, full-block
 > symbols of 1,024–65,535 bytes, repair count no greater than source count and
 > a checked working budget; oversized groups and 64 KiB symbols are refused.
