@@ -102,8 +102,11 @@ fn mkdir_root_and_nested_long_names_initialize_dot_and_dotdot() {
             assert_eq!(after.files, before.files);
             assert_eq!(after.directories, before.directories + 1);
 
-            add_subdirectory(&image, kind, 8);
-            let volume = image.volume();
+            image.guards();
+
+            let nested_image = Image::new(kind, sector, kind == FatKind::Fat32);
+            add_subdirectory(&nested_image, kind, 8);
+            let volume = nested_image.volume();
             let nested = mkdir::DirectoryCreation::prepare(
                 &cx,
                 &volume,
@@ -113,15 +116,15 @@ fn mkdir_root_and_nested_long_names_initialize_dot_and_dotdot() {
             .unwrap();
             let child = nested.directory_cluster;
             nested.execute(&cx, &volume).unwrap();
-            let reopened = image.volume();
-            let raw = image.bytes(
-                image.base + image.geometry.cluster_offset(child).unwrap(),
+            let reopened = nested_image.volume();
+            let raw = nested_image.bytes(
+                nested_image.base + nested_image.geometry.cluster_offset(child).unwrap(),
                 64,
             );
             assert_eq!(raw_cluster(kind, &raw[..32]), child);
             assert_eq!(raw_cluster(kind, &raw[32..64]), 8);
             assert!(reopened.check(&cx).unwrap().clean);
-            image.guards();
+            nested_image.guards();
         }
     }
 }
