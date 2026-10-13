@@ -1,4 +1,4 @@
-//! Ordered native replacement of one existing FAT file on an offline image.
+//! Ordered native replacement or create-only publication on an offline FAT image.
 //!
 //! New contents use disjoint, initialized clusters. Data and new FAT links are
 //! synchronized before the directory entry, and that entry is synchronized
@@ -6,6 +6,8 @@
 //! after dirty publication require native checking/recovery on a separate copy.
 //! Native state and high-bit rules: Linux v6.19 fs/fat/{inode,fatent}.c and
 //! dosfstools v4.2 src/{fat,boot}.c. No native implementation code is reused.
+
+mod creation;
 
 use super::{FatTable, FatVolume, MAX_CHAIN_CLUSTERS, allocate, checkpoint, corrupt};
 use crate::ImageArgs;
@@ -31,11 +33,14 @@ const EXPECT_END: u32 = u32::MAX;
 pub struct ReplaceArgs {
     #[command(flatten)]
     image: ImageArgs,
-    /// Existing native regular-file path inside the selected volume.
+    /// Native regular-file path inside the selected volume.
     path: String,
     /// Immutable regular source file; never opened for writing.
     #[arg(long)]
     source: PathBuf,
+    /// Create a new ASCII 8.3 file instead; refuse any existing name or alias.
+    #[arg(long)]
+    create: bool,
     /// Confirm exclusive ownership: no mounted or unrelated image writers.
     #[arg(long, required = true)]
     offline_image: bool,
@@ -226,6 +231,48 @@ fn modified_timestamp(seconds: u64) -> Result<(u16, u16)> {
     Ok((date as u16, time as u16))
 }
 
+fn validate_boot_state(cx: &Cx, volume: &FatVolume) -> Result<()> {
+    // Both native boot copies must begin clean. A surface-test request must
+    // never be silently cleared by either replacement or creation.
+    let state_at = if volume.geometry.kind() == FatKind::Fat16 { 37 } else { 65 };
+    for number in std::iter::once(0_u16).chain(volume.geometry.backup_boot_sector()) {
+        let offset = u64::from(number) * u64::from(volume.geometry.sector_bytes());
+        let mut boot = [0; 512];
+        volume.read_exact(cx, offset, &mut boot)?;
+        if boot[state_at] & 3 != 0 {
+            bail!(
+                "replacement requires clean primary and backup boot state without a surface-test request"
+            );
+        }
+    }
+    Ok(())
+}
+
+fn reserve_clusters(cx: &Cx, volume: &FatVolume, needed: usize, free: u64) -> Result<Vec<u32>> {
+    if needed > MAX_CHAIN_CLUSTERS || needed as u64 > free {
+        bail!(
+            "insufficient disjoint free allocation for replacement; old clusters are not reused before publication"
+        );
+    }
+    let mut clusters = Vec::new();
+    clusters.try_reserve_exact(needed).context("allocating bounded replacement chain")?;
+    let mut table = FatTable::new(volume);
+    for cluster in 2..=volume.geometry.cluster_count() + 1 {
+        if clusters.len() == needed {
+            break;
+        }
+        checkpoint(cx)?;
+        if table.entry(cx, cluster)? == FatEntry::Free {
+            volume.cluster_offset(cluster)?;
+            clusters.push(cluster);
+        }
+    }
+    if clusters.len() != needed {
+        bail!("free allocation changed during replacement preflight");
+    }
+    Ok(clusters)
+}
+
 struct Replacement {
     path: String,
     entry_offset: u64,
@@ -240,6 +287,7 @@ struct Replacement {
     free_after: u64,
     files: u64,
     directories: u64,
+    creation: Option<creation::Namespace>,
 }
 
 impl Replacement {
@@ -254,24 +302,7 @@ impl Replacement {
         let size =
             u32::try_from(source.len_bytes()).context("FAT file size exceeds 2^32 - 1 bytes")?;
         let (date, time) = modified_timestamp(now)?;
-        // Both native boot copies must begin clean. In particular, the read
-        // profile does not use the backup's state for admission, and a native
-        // surface-test request must never be silently cleared by a writer.
-        let state_at = if volume.geometry.kind() == FatKind::Fat16 {
-            37
-        } else {
-            65
-        };
-        for number in std::iter::once(0_u16).chain(volume.geometry.backup_boot_sector()) {
-            let offset = u64::from(number) * u64::from(volume.geometry.sector_bytes());
-            let mut boot = [0; 512];
-            volume.read_exact(cx, offset, &mut boot)?;
-            if boot[state_at] & 3 != 0 {
-                bail!(
-                    "replacement requires clean primary and backup boot state without a surface-test request"
-                );
-            }
-        }
+        validate_boot_state(cx, volume)?;
         let entry = volume.resolve(cx, path)?.ok_or(FfsError::IsDirectory)?;
         if entry.native.is_directory() {
             return Err(FfsError::IsDirectory.into());
@@ -291,29 +322,7 @@ impl Replacement {
         }
         let old = volume.file_chain(cx, &entry)?;
         let needed = u64::from(size).div_ceil(u64::from(volume.geometry.cluster_bytes())) as usize;
-        if needed > MAX_CHAIN_CLUSTERS || needed as u64 > before.free_clusters {
-            bail!(
-                "insufficient disjoint free allocation for replacement; old clusters are not reused before publication"
-            );
-        }
-        let mut clusters = Vec::new();
-        clusters
-            .try_reserve_exact(needed)
-            .context("allocating bounded replacement chain")?;
-        let mut table = FatTable::new(volume);
-        for cluster in 2..=volume.geometry.cluster_count() + 1 {
-            if clusters.len() == needed {
-                break;
-            }
-            checkpoint(cx)?;
-            if table.entry(cx, cluster)? == FatEntry::Free {
-                volume.cluster_offset(cluster)?;
-                clusters.push(cluster);
-            }
-        }
-        if clusters.len() != needed {
-            bail!("free allocation changed during replacement preflight");
-        }
+        let clusters = reserve_clusters(cx, volume, needed, before.free_clusters)?;
         let mut release = Vec::new();
         release
             .try_reserve_exact(old.clusters.len())
@@ -355,6 +364,7 @@ impl Replacement {
             digest,
             files: before.files,
             directories: before.directories,
+            creation: None,
         })
     }
 
@@ -363,7 +373,7 @@ impl Replacement {
         for byte in self.digest {
             write!(&mut source_sha256, "{byte:02x}").expect("format SHA-256 into String");
         }
-        serde_json::json!({
+        let mut report = serde_json::json!({
             "operation": "replace_existing_file", "dry_run": dry_run,
             "format": format!("{:?}", volume.geometry.kind()),
             "volume_offset": volume.base, "volume_bytes": volume.geometry.volume_bytes(),
@@ -373,7 +383,14 @@ impl Replacement {
             "free_clusters_after": self.free_after,
             "source_sha256": source_sha256,
             "contract": "offline ordered replacement; interrupted mutation may require native recovery; not atomic"
-        })
+        });
+        if self.creation.is_some() {
+            report["operation"] = "create_new_file".into();
+            report["created_new_file"] = (!dry_run).into();
+            report["name_profile"] = "portable_ascii_8_3".into();
+            report["contract"] = "offline ordered creation; interrupted mutation may require native recovery; not atomic".into();
+        }
+        report
     }
 
     fn execute(
@@ -388,6 +405,9 @@ impl Replacement {
         volume.read_exact(cx, self.entry_offset, &mut current)?;
         if current != self.original || source.len_bytes() != u64::from(self.size) {
             bail!("replacement target or source changed before dirty publication");
+        }
+        if let Some(namespace) = &self.creation {
+            namespace.validate(cx, volume)?;
         }
         source_stable()?;
         let mut phase = "publishing dirty state";
@@ -439,6 +459,10 @@ impl Replacement {
                     }),
             )?;
             volume.device.sync(cx)?;
+            if let Some(namespace) = &self.creation {
+                phase = "synchronizing the successor directory terminator";
+                namespace.stage(cx, volume)?;
+            }
             phase = "publishing the replacement directory entry";
             let sector_bytes = u64::from(volume.geometry.sector_bytes());
             let start = self.entry_offset / sector_bytes * sector_bytes;
@@ -467,6 +491,8 @@ impl Replacement {
             phase = "checking completed allocation and namespace";
             let verification = volume.check(cx)?;
             if !verification.clean
+                || !verification.complete
+                || !verification.namespace_complete
                 || verification.free_clusters != self.free_after
                 || verification.files != self.files
                 || verification.directories != self.directories
@@ -485,7 +511,7 @@ impl Replacement {
             report["verification"] = serde_json::to_value(verification)?;
             Ok(report)
         })();
-        result.with_context(|| format!("FAT replacement failed while {phase}; image retained and may be dirty or partially changed; no rollback or atomicity is claimed"))
+        result.with_context(|| format!("FAT file update failed while {phase}; image retained and may be dirty or partially changed; no rollback or atomicity is claimed"))
     }
 
     fn verify_payload(&self, cx: &Cx, volume: &FatVolume) -> Result<()> {
@@ -661,10 +687,10 @@ pub fn run(cx: &Cx, args: &ReplaceArgs) -> Result<serde_json::Value> {
     ctrlc::set_handler(move || {
         signal.cancel_with(
             CancelKind::User,
-            Some("FAT replacement interrupted by Ctrl+C"),
+            Some("FAT file update interrupted by Ctrl+C"),
         );
     })
-    .context("installing FAT replacement cancellation handler; no mutation started")?;
+    .context("installing FAT file-update cancellation handler; no mutation started")?;
     replace(cx, args)
 }
 
@@ -702,7 +728,11 @@ fn replace(cx: &Cx, args: &ReplaceArgs) -> Result<serde_json::Value> {
         .duration_since(UNIX_EPOCH)
         .context("clock predates the Unix epoch")?
         .as_secs();
-    let plan = Replacement::prepare(cx, &volume, &args.path, &source_device, now)?;
+    let plan = if args.create {
+        creation::prepare(cx, &volume, &args.path, &source_device, now)?
+    } else {
+        Replacement::prepare(cx, &volume, &args.path, &source_device, now)?
+    };
     stable(&image, &args.image.image, image_stamp)?;
     stable(&source, &args.source, source_stamp)?;
     checkpoint(cx)?;
