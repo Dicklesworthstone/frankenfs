@@ -806,18 +806,44 @@ fn check_native_owner_prefix(
     tail: &NativeRepairTail,
 ) -> Result<Vec<u8>, FfsError> {
     let bytes = dev.read_block(cx, tail.start)?.into_inner();
-    let expected = owner_header(sb, storage.owner_inode, generation, storage.repair_basis_points, tail);
+    let expected = owner_header(
+        sb,
+        storage.owner_inode,
+        generation,
+        storage.repair_basis_points,
+        tail,
+    );
     if bytes.len() != sb.block_size as usize
         || bytes[..OWNER_HEADER_BYTES] != expected[..OWNER_HEADER_BYTES]
         || bytes[PARITY_HEADER_END..].iter().any(|byte| *byte != 0)
-        || (tail.group.0 != 0 && bytes[PLAN_HEADER_START..PLAN_HEADER_END].iter().any(|byte| *byte != 0))
+        || (tail.group.0 != 0
+            && bytes[PLAN_HEADER_START..PLAN_HEADER_END]
+                .iter()
+                .any(|byte| *byte != 0))
     {
         return Err(validation_error(tail, "native ownership prefix changed"));
     }
-    validation_intent(&bytes[OWNER_HEADER_BYTES..PLAN_HEADER_START], sb, storage.owner_inode, generation, tail)?;
-    parity_intent(&bytes[PARITY_HEADER_START..PARITY_HEADER_END], sb, storage, generation, tail)?;
+    validation_intent(
+        &bytes[OWNER_HEADER_BYTES..PLAN_HEADER_START],
+        sb,
+        storage.owner_inode,
+        generation,
+        tail,
+    )?;
+    parity_intent(
+        &bytes[PARITY_HEADER_START..PARITY_HEADER_END],
+        sb,
+        storage,
+        generation,
+        tail,
+    )?;
     if tail.group.0 == 0 {
-        validation_plan_intent(&bytes[PLAN_HEADER_START..PLAN_HEADER_END], sb, storage, generation)?;
+        validation_plan_intent(
+            &bytes[PLAN_HEADER_START..PLAN_HEADER_END],
+            sb,
+            storage,
+            generation,
+        )?;
     }
     Ok(bytes)
 }
@@ -1203,7 +1229,10 @@ fn read_native_baseline(fs: &OpenFs, cx: &Cx) -> Result<NativeBaseline, FfsError
         let (root, table) = read_sealed_table(cx, &dev, sb, &storage, generation, tail)?;
         let local_epoch = u32::from_le_bytes(table[68..72].try_into().expect("checked table"));
         if local_epoch != epoch {
-            return Err(validation_error(tail, "whole-plan and local epochs disagree"));
+            return Err(validation_error(
+                tail,
+                "whole-plan and local epochs disagree",
+            ));
         }
         admissions.push(ValidationAdmission {
             epoch,
@@ -1587,14 +1616,21 @@ fn encode_and_publish_native_group(
         &baseline.storage,
         baseline.owner_generation,
         tail,
-    )? != admission.intent {
-        return Err(validation_error(tail, "native parity changed during transition"));
+    )? != admission.intent
+    {
+        return Err(validation_error(
+            tail,
+            "native parity changed during transition",
+        ));
     }
     let root = baseline.roots[tail.group.0 as usize];
     let (layout, expected) = native_layout(sb, tail)?;
     let storage = RepairGroupStorage::new(dev, layout);
     if storage.preflight_raw_refresh(cx, &expected)? != admission.raw {
-        return Err(validation_error(tail, "native descriptors changed during transition"));
+        return Err(validation_error(
+            tail,
+            "native descriptors changed during transition",
+        ));
     }
     let view = NativeDigestDevice {
         dev,
@@ -1843,7 +1879,9 @@ fn validation_plan_header(
 ) -> Result<[u8; VALIDATION_HEADER_BYTES], FfsError> {
     let report = native_validation_report(sb, storage)?;
     if epoch == 0 {
-        return Err(FfsError::RepairFailed("zero native whole-plan epoch".into()));
+        return Err(FfsError::RepairFailed(
+            "zero native whole-plan epoch".into(),
+        ));
     }
     let mut bytes = [0; VALIDATION_HEADER_BYTES];
     bytes[..8].copy_from_slice(PLAN_MAGIC);
@@ -1917,15 +1955,19 @@ fn validation_plan_root(
     generation: u32,
     admissions: &[ValidationAdmission],
 ) -> Result<[u8; 32], FfsError> {
-    let epoch = admissions.first().ok_or_else(|| {
-        FfsError::RepairFailed("native whole-plan has no groups".into())
-    })?.epoch;
+    let epoch = admissions
+        .first()
+        .ok_or_else(|| FfsError::RepairFailed("native whole-plan has no groups".into()))?
+        .epoch;
     if admissions.len() != storage.tails.len()
         || admissions.iter().any(|admission| admission.epoch != epoch)
     {
-        return Err(FfsError::RepairFailed("native whole-plan epoch mismatch".into()));
+        return Err(FfsError::RepairFailed(
+            "native whole-plan epoch mismatch".into(),
+        ));
     }
-    let header = validation_plan_header(sb, storage, generation, epoch, VALIDATION_PENDING, &[0; 32])?;
+    let header =
+        validation_plan_header(sb, storage, generation, epoch, VALIDATION_PENDING, &[0; 32])?;
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"FrankenFS native whole-plan validation v1");
     hasher.update(&header[..64]);
@@ -1958,7 +2000,9 @@ fn publish_validation_plan(
         ValidationIntent::Pending(root) => (VALIDATION_PENDING, root),
         ValidationIntent::Sealed(root) => (VALIDATION_SEALED, root),
         ValidationIntent::Empty | ValidationIntent::Prepared => {
-            return Err(FfsError::RepairFailed("invalid native plan publication".into()));
+            return Err(FfsError::RepairFailed(
+                "invalid native plan publication".into(),
+            ));
         }
     };
     let first = storage.tails[0].start;
@@ -1990,7 +2034,10 @@ fn admit_validation_plan(
     )?;
     let epoch = validation_plan_epoch(&owner.as_slice()[PLAN_HEADER_START..PLAN_HEADER_END])?;
     if admissions.iter().any(|admission| admission.epoch != epoch) {
-        return Err(validation_error(first, "whole-plan and local epochs disagree"));
+        return Err(validation_error(
+            first,
+            "whole-plan and local epochs disagree",
+        ));
     }
     match plan {
         ValidationIntent::Prepared => {
@@ -2023,7 +2070,10 @@ fn admit_validation_plan(
             return Err(validation_error(first, "whole-plan record missing"));
         }
         ValidationIntent::Dirty(_) => {
-            return Err(validation_error(first, "native source write epoch is dirty"));
+            return Err(validation_error(
+                first,
+                "native source write epoch is dirty",
+            ));
         }
     }
     Ok((plan, root))
@@ -2076,7 +2126,11 @@ fn admit_validation_group(
             return Err(validation_error(tail, "sealed intent and table disagree"));
         }
         verify_validation_table(cx, dev, sb, tail, &table, &root)?;
-        return Ok(ValidationAdmission { epoch, root, intent });
+        return Ok(ValidationAdmission {
+            epoch,
+            root,
+            intent,
+        });
     }
     if intent == ValidationIntent::Empty
         && table[..sb.block_size as usize]
@@ -2096,7 +2150,11 @@ fn admit_validation_group(
             "pending initialization source changed",
         ));
     }
-    Ok(ValidationAdmission { epoch, root, intent })
+    Ok(ValidationAdmission {
+        epoch,
+        root,
+        intent,
+    })
 }
 
 fn publish_validation_group(
@@ -2174,36 +2232,52 @@ impl OpenFs {
             return Err(freshness_error("device is already active"));
         }
         if self.ext4_replay_overlay {
-            return Err(freshness_error("simulated replay cannot certify image durability"));
+            return Err(freshness_error(
+                "simulated replay cannot certify image durability",
+            ));
         }
         if self.metadata_log.is_some() || self.metadata_compactor.lock().is_some() {
             return Err(freshness_error("external metadata WAL is not admitted"));
         }
         let storage = self.native_ext4_repair_storage(cx)?;
-        let sb = self.ext4_superblock().expect("validated native ext4 ownership").clone();
-        sb.validate_v1().map_err(|error| parse_to_ffs_error(&error))?;
+        let sb = self
+            .ext4_superblock()
+            .expect("validated native ext4 ownership")
+            .clone();
+        sb.validate_v1()
+            .map_err(|error| parse_to_ffs_error(&error))?;
         let codec_budget = freshness_codec_budget(&sb, &storage, max_working_bytes)?;
         for tail in &storage.tails {
             native_codec_budget(&sb, &storage, tail, codec_budget, false)?;
         }
         let baseline = read_native_baseline(self, cx)?;
-        baseline.epoch.checked_add(1)
+        baseline
+            .epoch
+            .checked_add(1)
             .ok_or_else(|| freshness_error("validation epoch exhausted before activation"))?;
         let report = self.check_native_ext4_repair(cx)?;
-        let dev = ByteDeviceBlockAdapter { dev: self.dev.as_ref(), block_size: sb.block_size };
+        let dev = ByteDeviceBlockAdapter {
+            dev: self.dev.as_ref(),
+            block_size: sb.block_size,
+        };
         let mut tables = Vec::with_capacity(storage.tails.len());
         let mut parity = Vec::with_capacity(storage.tails.len());
         for (index, tail) in storage.tails.iter().enumerate() {
-            let (root, table) = read_sealed_table(
-                cx, &dev, &sb, &storage, baseline.owner_generation, tail,
-            )?;
+            let (root, table) =
+                read_sealed_table(cx, &dev, &sb, &storage, baseline.owner_generation, tail)?;
             if root != baseline.roots[index] {
-                return Err(validation_error(tail, "source authority changed during activation"));
+                return Err(validation_error(
+                    tail,
+                    "source authority changed during activation",
+                ));
             }
             verify_validation_table(cx, &dev, &sb, tail, &table, &root)?;
             let admission = admit_native_group(cx, &dev, &sb, &baseline, tail, codec_budget)?;
             if !admission.retained || admission.intent.generation() != report.generations[index] {
-                return Err(validation_error(tail, "parity authority changed during activation"));
+                return Err(validation_error(
+                    tail,
+                    "parity authority changed during activation",
+                ));
             }
             tables.push(table);
             parity.push(admission.intent);
@@ -2214,7 +2288,11 @@ impl OpenFs {
             inner: Arc::clone(&self.dev),
             sb,
             state: NativeMutex::new(NativeFreshnessState {
-                baseline, tables, parity, intended: BTreeMap::new(), phase: FreshnessPhase::Clean,
+                baseline,
+                tables,
+                parity,
+                intended: BTreeMap::new(),
+                phase: FreshnessPhase::Clean,
             }),
             codec_budget,
         });
@@ -2453,15 +2531,7 @@ impl OpenFs {
             if matches!(admission.intent, ValidationIntent::Sealed(_)) {
                 continue;
             }
-            publish_validation_group(
-                cx,
-                &dev,
-                sb,
-                &storage,
-                inode.generation,
-                tail,
-                admission,
-            )?;
+            publish_validation_group(cx, &dev, sb, &storage, inode.generation, tail, admission)?;
         }
         if !matches!(plan, ValidationIntent::Sealed(_)) {
             publish_validation_plan(
@@ -2505,9 +2575,8 @@ impl OpenFs {
             &storage,
             inode.generation,
         )?;
-        let epoch = validation_plan_epoch(
-            &first_owner.as_slice()[PLAN_HEADER_START..PLAN_HEADER_END],
-        )?;
+        let epoch =
+            validation_plan_epoch(&first_owner.as_slice()[PLAN_HEADER_START..PLAN_HEADER_END])?;
         let ValidationIntent::Sealed(plan_root) = plan else {
             return Err(validation_error(
                 &storage.tails[0],
@@ -2545,7 +2614,11 @@ impl OpenFs {
                 return Err(validation_error(tail, "sealed intent and table disagree"));
             }
             verify_validation_table(cx, &dev, sb, tail, &table, &root)?;
-            admissions.push(ValidationAdmission { epoch, root, intent });
+            admissions.push(ValidationAdmission {
+                epoch,
+                root,
+                intent,
+            });
         }
         if validation_plan_root(sb, &storage, inode.generation, &admissions)? != plan_root {
             return Err(validation_error(
