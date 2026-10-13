@@ -200,6 +200,10 @@ impl DirectoryCreation {
     ) -> Result<serde_json::Value> {
         checkpoint(cx)?;
         self.namespace.validate(cx, volume)?;
+        let mut table = super::super::FatTable::new(volume);
+        if table.entry(cx, self.directory_cluster)? != ffs_ondisk::fat::FatEntry::Free {
+            bail!("reserved directory cluster is no longer free");
+        }
         let mut phase = "publishing dirty state";
         let result = (|| -> Result<serde_json::Value> {
             set_dirty(cx, volume, true)?;
