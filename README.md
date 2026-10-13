@@ -33,11 +33,12 @@ separate copies for mutation experiments.** The first-party unsafe-code ban
 does not cover every dependency or the vendored FUSE transport, and it does not
 prevent logical filesystem corruption.
 
-The previous long-form README is retained, byte-for-byte, as the
-[detailed ext4/btrfs guide](README_EXT4_BTRFS.md). It preserves architecture,
-operational examples, benchmark qualifications, recovery/writeback discussion,
-and historical evidence. The format matrix below is the front-page overview
-of the broader project; per-format profiles define the actual admission rules.
+The previous long-form README was preserved in full as the
+[detailed ext4/btrfs guide](README_EXT4_BTRFS.md), which continues to receive
+native implementation updates. It retains architecture, operational examples,
+benchmark qualifications, recovery/writeback discussion and historical evidence.
+The format matrix below is the front-page overview of the broader project;
+per-format profiles define the actual admission rules.
 
 ## Current format surface
 
@@ -45,8 +46,8 @@ of the broader project; per-format profiles define the actual admission rules.
 |---|---|---|---|
 | **ext4** | Main `ffs-cli` / `OpenFs` path | Native reads, experimental mounted writes, journal integration, MVCC and repair work | Writeback, recovery and release readiness remain evidence-gated; see the detailed guide and current parity ledger. |
 | **btrfs** | Main `ffs-cli` / `OpenFs` path | Native reads and guarded experimental writes, transaction-commit and repair work | Native feature/topology admission and durability evidence still matter; not blanket kernel parity. |
-| **FAT16** | `ffs-fat` | Native reads/catalog/extraction, read-only FUSE, allocation checking, fresh-image formatting/population, ordered offline replacement and create-only files | New files use portable ASCII 8.3 names. Existing subdirectories can grow; the fixed root cannot. No writable mount or crash replay. |
-| **FAT32** | `ffs-fat` | The FAT16 companion surface plus FAT32 root chains, selected-FAT handling and free-space hints | Create-only updates can grow full roots/subdirectories with ordered native allocation. No atomic namespace transaction or writable mount. |
+| **FAT16** | `ffs-fat` | Native reads/catalog/extraction, read-only FUSE, allocation checking, fresh-image formatting/population, ordered offline replacement and short-/long-name file creation | New long names use a bounded UTF-16 profile with ASCII aliases. Existing subdirectories can grow; the fixed root cannot. No writable mount or crash replay. |
+| **FAT32** | `ffs-fat` | The FAT16 companion surface plus FAT32 root chains, selected-FAT handling and free-space hints | Create-only updates reserve complete name records and can grow roots/subdirectories with ordered native allocation. No atomic namespace transaction or writable mount. |
 | **NTFS** | `ffs-ntfs` | Read-only native namespace and file/stream access, sparse and admitted compressed/transformed data, metadata inspection and FUSE | The exact NTFS read profile controls admission. Native `$LogFile` recovery and general NTFS mutation are not implemented by these reads. |
 | **ZFS** | `ffs-zfs` | Native dataset/snapshot discovery and reads, admitted compression/checksums, selected mirror/RAIDZ and read-only mount profiles | Explicit offline pool/configuration selection is not native pool import. No native allocation/TXG writer or ZIL recovery claim. |
 
@@ -60,21 +61,21 @@ or a release-readiness score.
 
 ## FAT: create a file in an existing image
 
-The newest mutation increment closes a practical gap between fresh-image
-population and replacement: an offline image can now receive a **new file**,
-including when a cluster-backed parent needs another directory cluster.
+The offline writer can create a new file with a native short or long name,
+including mixed case, spaces and non-ASCII characters. It reserves the complete
+long-name/short-entry set, growing a cluster-backed parent when needed.
 
 ```sh
 # Preflight only: no image mutation. The parent directory must already exist.
-ffs-fat replace volume.img /NEW.BIN \
+ffs-fat replace volume.img '/Release notes 🦀.txt' \
   --source payload.bin --create --offline-image --dry-run
 
 # Explicit create-only publication. An existing name or alias is an error.
-ffs-fat replace volume.img /NEW.BIN \
+ffs-fat replace volume.img '/Release notes 🦀.txt' \
   --source payload.bin --create --offline-image
 
 # Read back and check allocation through the native FAT reader.
-ffs-fat cat volume.img /NEW.BIN > readback.bin
+ffs-fat cat volume.img '/Release notes 🦀.txt' > readback.bin
 ffs-fat check volume.img
 ```
 
@@ -83,29 +84,44 @@ files must remain immutable; the image must not be mounted or modified by
 another program. Advisory locks do not enforce that against unrelated writers.
 `--offset`, `--length` and `--oem-code-page` retain explicit volume/name selection.
 
-Creation checks visible names and native aliases, preserves existing entries,
-initializes disjoint payload allocation, and synchronizes a successor directory
-terminator before an old end marker becomes live. Directory growth zeroes and
-synchronizes the new cluster, then its FAT end-of-chain, before linking the old
-tail. Final native-reader SHA-256 and complete allocation checks precede clean
+Names must fit both 255 UTF-8 bytes and 255 UTF-16 units. Native forbidden
+characters, trailing dots/spaces and DOS device names are refused. Long names
+receive collision-checked ASCII short aliases; this conservative creation policy
+is not a claim of Windows-version-exact Unicode collation or alias generation.
+The native records preserve UTF-16 units, reverse ordinals, checksum binding,
+terminators and padding. Existing files and aliases are not renamed.
+
+Creation initializes disjoint payload allocation and preserves existing entries.
+The successor directory terminator is synchronized before any old end marker
+is consumed, including a marker inside a reusable run. Hidden slots become
+durably harmless before long-name records are written, and the file's short
+entry is published last. A parent can grow by up to two separately reserved,
+zeroed and synchronized clusters to fit a complete maximum-length name. All new
+FAT links are durable before the old tail points to them. Final native-reader
+name/alias checks, SHA-256 readback and complete allocation checks precede clean
 state publication. FAT32 inactive-copy and reserved-high-bit rules are retained.
 
 This is **ordered offline mutation, not an atomic transaction**. Interruption
 may leave a dirty image requiring native checking/recovery on another copy.
-The creation profile does not yet admit new long names, mixed-case 8.3
-components, new directories, unlink/rename or writable mounts. See the
-[creation and directory-growth contract](docs/FAT_CREATE_PROFILE.md).
+New directories, unlink/rename, writable mounts and native crash replay remain
+unfinished. See the [creation and directory-growth contract](docs/FAT_CREATE_PROFILE.md).
 
 ### Evidence for this increment
 
-Nine regressions have been authored for creation and directory growth, including
-both dialects, 512/4096-byte sectors, alias collisions, existing-byte preservation,
-stale plans, capacity, nonzero free space, and modeled write/flush failures with
-lost or retained pending data and torn prefixes. **They have not been executed
-in the implementation session.** Rust tools and network access were unavailable;
-compilation, formatting, Clippy, runtime and native-interchange qualification
-are not claimed. A concurrent source review also reported formatting differences
-in the initial increment. Those checks must be completed before relying on it.
+Seventeen regressions have been authored for creation, directory growth and
+long names: the nine earlier controls plus eight additions covering native name
+records, Unicode and maximum-length readback, alias collisions, two-cluster
+growth, contiguous-slot requirements, stale plans and publication ordering.
+The fault cases retain separate pending/durable bytes and cover write/flush
+failures, lost or retained pending data and torn prefixes. An interior-marker
+control specifically requires durable hidden-slot initialization before the
+old end marker is consumed.
+
+**These Rust tests have not been executed in the implementation session.**
+The environment has no Rust or RCH tools, and network resolution is unavailable.
+Compilation, formatting, Clippy, runtime and native-interchange qualification
+are not claimed. The earlier concurrent formatting correction does not qualify
+these new source changes. Required checks remain outstanding.
 
 ## Build and explore
 
@@ -148,10 +164,11 @@ blanket property of every existing path.
 
 The multi-format plan deliberately separates native compatibility from
 FrankenFS-specific improvements. The remaining high-impact work includes FAT
-long-name/directory creation and broader namespace operations; NTFS native
-recovery plus allocator/MFT/index mutation; ZFS native allocation/TXG/ZIL and
-pool lifecycle; shared backend integration; and executable native-interchange,
-crash/reopen and mounted-operation evidence for each admitted profile.
+directory creation, broader namespace operations and native naming/interchange
+qualification; NTFS native recovery plus allocator/MFT/index mutation; ZFS
+native allocation/TXG/ZIL and pool lifecycle; shared backend integration; and
+executable native-interchange, crash/reopen and mounted-operation evidence for
+each admitted profile.
 
 The [comprehensive plan](COMPREHENSIVE_PLAN_FOR_NTFS_FAT16_FAT32_AND_ZFS.md),
 [implementation workpackages](docs/NTFS_FAT_ZFS_IMPLEMENTATION_WORKPACKAGES.md),

@@ -219,3 +219,78 @@ fn creation_long_name_each_write_and_sync_cut_never_admits_partial_or_stale_name
         }
     }
 }
+
+fn interior_end_image(kind: FatKind) -> Image {
+    let image = Image::new(kind, 512, false);
+    {
+        let mut state = image.device.state.lock().unwrap();
+        let mut deleted = [0; 32];
+        deleted[0] = 0xE5;
+        state.put(image.root + 32, &deleted);
+        state.put(image.root + 64, &[0; 32]);
+        state.put(image.root + 96, &short_entry(b"HIDDEN1 BIN", 5, 4));
+        state.put(image.root + 128, &short_entry(b"HIDDEN2 BIN", 5, 4));
+        state.persist();
+    }
+    image
+}
+
+#[test]
+fn creation_interior_end_marker_waits_for_durable_hidden_slot_initialization() {
+    let cx = Cx::for_testing();
+    let input = source(b"new payload");
+    let path = "/Interior end marker file.txt";
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        let probe = interior_end_image(kind);
+        let volume = probe.volume();
+        let plan = prepare(&cx, &volume, path, &input, NOW).unwrap();
+        let namespace = plan.creation.as_ref().unwrap();
+        assert_eq!(namespace.long_slots.len(), 3);
+        assert_eq!(namespace.long_slots[0].bytes[0], 0xE5);
+        assert_eq!(namespace.long_slots[1].bytes[0], 0);
+        plan.execute(&cx, &volume, &input, || Ok(())).unwrap();
+        assert_eq!(contents(&probe.volume(), path), b"new payload");
+        let operations = probe.device.state.lock().unwrap().operations;
+        let mut checked_publications = 0;
+
+        for fail in 1..=operations {
+            let image = interior_end_image(kind);
+            let volume = image.volume();
+            let plan = prepare(&cx, &volume, path, &input, NOW).unwrap();
+            image.device.state.lock().unwrap().fail = Some(fail);
+            assert!(plan.execute(&cx, &volume, &input, || Ok(())).is_err());
+            let namespace = plan.creation.as_ref().unwrap();
+            let marker = image.base + namespace.long_slots[1].offset;
+            if image.bytes(marker, 1)[0] != 0 {
+                checked_publications += 1;
+                let state = image.device.state.lock().unwrap();
+                for slot in namespace
+                    .long_slots
+                    .iter()
+                    .skip(2)
+                    .chain(std::iter::once(&namespace.entry))
+                {
+                    // Intentionally bypass pending bytes. Once the old end
+                    // marker is consumed, a partial persistence may expose
+                    // only this slot's durable version, not the latest write.
+                    let mut durable = [0; 32];
+                    for (index, byte) in durable.iter_mut().enumerate() {
+                        let at = image.base + slot.offset + index as u64;
+                        *byte = state
+                            .durable
+                            .get(&(at / 512))
+                            .map_or(0, |page| page[(at % 512) as usize]);
+                    }
+                    assert!(
+                        matches!(durable[0], 0 | 0xE5)
+                            || durable[11] == 0x0F
+                            || durable == plan.updated,
+                        "{kind:?} cut {fail}: old end consumed with a stale durable slot"
+                    );
+                }
+            }
+            image.guards();
+        }
+        assert!(checked_publications > 0);
+    }
+}

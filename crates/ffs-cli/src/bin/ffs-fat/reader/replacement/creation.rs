@@ -144,20 +144,28 @@ impl Namespace {
             return Ok(());
         }
 
-        // Keep the first slot in place until the hidden suffix and successor
-        // terminator are durable. The unpublished short slot must not retain
-        // an old file identity that could adopt the new long name.
+        // A reusable run can start in deleted entries BEFORE the old end
+        // marker. Preserve that actual marker too, not merely the first slot,
+        // until all hidden slots are durably harmless. New directory clusters
+        // have zero end markers after initialization, regardless of old bytes.
+        let end_marker = self.long_slots.iter().position(|slot| slot.initialized()[0] == 0);
         let deleted = deleted_slot();
         patch_slot(cx, volume, self.entry.offset, &self.entry.initialized(), &deleted)?;
-        for slot in self.long_slots.iter().skip(1).rev() {
-            patch_slot(cx, volume, slot.offset, &slot.initialized(), &deleted)?;
+        for (index, slot) in self.long_slots.iter().enumerate().skip(1).rev() {
+            if Some(index) != end_marker {
+                patch_slot(cx, volume, slot.offset, &slot.initialized(), &deleted)?;
+            }
         }
         volume.device.sync(cx)?;
 
-        // Ordinal one is physically closest to the short entry. Write the
-        // first directory slot last, after preparing its logical successors.
+        // Ordinal one is physically closest to the short entry. No old end
+        // marker is consumed before the short/hidden-slot barrier above.
         for (index, slot) in self.long_slots.iter().enumerate().rev() {
-            let expected = if index == 0 { slot.initialized() } else { deleted };
+            let expected = if index == 0 || Some(index) == end_marker {
+                slot.initialized()
+            } else {
+                deleted
+            };
             let bytes = self.name.slot(self.long_slots.len() - index);
             patch_slot(cx, volume, slot.offset, &expected, &bytes)?;
         }

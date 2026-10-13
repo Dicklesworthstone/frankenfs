@@ -57,11 +57,13 @@ are refused during pre-publication validation.
 
 When an end marker is consumed, its successor after the complete name set is
 cleared and synchronized first. The short-entry position and later LFN slots
-are then prepared as deleted records while preserving the first slot until
-the hidden suffix is durable. LFN records are written from the short-entry end
-back toward that first slot and synchronized. Only then is the actual file's
-short entry published. Hidden stale short records cannot adopt the new long
-name, and bytes after the prior end cannot become newly visible files.
+are then prepared as deleted records while preserving both the first slot and
+the actual old end marker until the hidden suffix is durable. That marker can
+be inside the reserved run when earlier deleted slots are reused. LFN records
+are written from the short-entry end back toward the first slot and synchronized.
+Only then is the actual file's short entry published. Hidden stale short records
+cannot adopt the new long name, and bytes after the prior end cannot become
+newly visible files.
 
 ## Publication and failure contract
 
@@ -86,13 +88,14 @@ Completed updates add native-reader payload verification and
 
 ## Evidence and remaining work
 
-The nine earlier creation/growth regressions remain. Seven additional authored
+The nine earlier creation/growth regressions remain. Eight additional authored
 controls cover native LFN record encoding, name limits, mixed-case/Unicode and
 maximum-length readback, generated alias collisions, two-cluster growth,
-fragmented free slots, stale reserved slots, and every modeled write/flush cut
-across a sector/cluster-spanning name. Formerly unsupported valid name cases now
-have positive native-publication controls; invalid names and collisions still
-have zero-write rejection tests.
+fragmented free slots, stale reserved slots, and modeled write/flush cuts across
+a sector/cluster-spanning name. The interior-marker regression separately checks
+that consuming the old end requires durable, harmless hidden slots, even if a
+flush fails. Formerly unsupported valid name cases now have positive native-
+publication controls; invalid names and collisions still have zero-write tests.
 
 These are authored synthetic native-image and storage-model controls, not
 executed Rust, Windows/dosfstools interchange or hardware power-cut evidence.
