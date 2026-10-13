@@ -2,14 +2,14 @@
 
 The ordered offline writer has an explicit create-only mode. Unlike ordinary
 replacement, it refuses an existing destination, including collisions with a
-long name or native short alias. This is an implementation increment toward the
-comprehensive plan's FAT namespace-mutation milestone, not completion of it.
+long name or native short alias. This advances the comprehensive plan's FAT
+namespace-mutation milestone; it does not complete the native-write profile.
 
 ```sh
 # The image must be offline; the source must remain immutable.
-ffs-fat replace volume.img /NEW.BIN --source payload.bin --create --offline-image --dry-run
-ffs-fat replace volume.img /NEW.BIN --source payload.bin --create --offline-image
-ffs-fat cat volume.img /NEW.BIN > readback.bin
+ffs-fat replace volume.img '/Release notes 🦀.txt' --source payload.bin --create --offline-image --dry-run
+ffs-fat replace volume.img '/Release notes 🦀.txt' --source payload.bin --create --offline-image
+ffs-fat cat volume.img '/Release notes 🦀.txt' > readback.bin
 ffs-fat check volume.img
 ```
 
@@ -19,34 +19,49 @@ selection, regular-file-only inputs, retained handles, advisory locking,
 source/image identity checks, complete allocation checking and SHA-256 readback.
 Advisory locks do not exclude kernel mounts or unrelated writers.
 
-The creation profile admits portable ASCII 8.3 destination names in an existing
-parent directory. Each base/extension component may be entirely upper- or
-lowercase; native case bits preserve its spelling. Mixed-case components, new
-long names, spaces, non-ASCII names and reserved DOS device names are refused.
-Existing parent paths may use the reader's admitted long-name/OEM policy.
-No existing entry is renamed or overwritten.
+## Native short and long names
 
-FAT16's fixed root and FAT32/subdirectory cluster chains are searched within the
-existing 65,536-slot budget. Deleted slots preserve live successors. When an end
-marker becomes a file, the next logical slot is cleared and synchronized first,
-even across a physical boundary; stale bytes after the old end cannot become
-newly visible directory entries. Orphan long-name suffixes cannot adopt the new
-short entry.
+Creation supports portable ASCII 8.3 names and lossless UTF-16 long names,
+including mixed case, spaces and non-ASCII characters supplied as UTF-8. A
+component must fit both 255 UTF-8 bytes (the current host presentation limit)
+and 255 UTF-16 units. Control characters, native forbidden separators and
+punctuation, trailing dots/spaces, U+FFFF and reserved DOS device names are
+refused before mutation. Unpaired-surrogate names cannot be supplied through
+this UTF-8 command interface.
 
-## Bounded directory growth
+Exact short names retain the native base/extension case bits. Other names use
+one to twenty native LFN records and a collision-checked ASCII short alias.
+The records retain all UTF-16 units, native reverse ordinals, checksum binding,
+terminators and padding. Names exactly divisible by thirteen units do not
+consume an extra record. Generated numeric aliases reserve existing raw short
+names, displayed names and aliases under both the selected OEM comparison and
+a conservative Unicode case key. This is not Windows-version-exact Unicode
+collation or byte-identical Windows alias generation. Existing names are never
+renamed to accommodate a new alias. Final readback requires the exact requested
+spelling, prepared short alias and native case flags, not just matching payload.
 
-A full FAT32 root or FAT16/FAT32 subdirectory can grow by one cluster if both
-the free-allocation and directory-slot budgets admit it. The new cluster is
-reserved separately from the payload, fully zeroed and synchronized. Its native
-end-of-chain entry is then synchronized in every selected FAT before the old
-directory tail can point to it. The existing directory chain is never rebuilt,
-and old entries are not moved. A stale prepared tail or allocation refuses the
-operation before dirty publication.
+## Slot reservation and directory growth
 
-The new file entry is published only after those directory-storage barriers.
-The final allocation checker accounts for the extra directory cluster as well
-as file data. A full FAT16 fixed root cannot grow and is refused before writes.
-This does not create new directories or implement general namespace transactions.
+The entire LFN/short-entry set is reserved in logical directory order, across
+sector boundaries and fragmented cluster chains. Deleted slots can be reused,
+but scattered holes are not counted as a contiguous record set. Live entries
+are not moved. The existing 65,536-slot budget includes any added allocation.
+
+FAT16's fixed root cannot grow. A FAT32 root or FAT16/FAT32 subdirectory can add
+up to two clusters when needed for the complete name set. That covers twenty
+LFN records plus the short entry even with 512-byte clusters and a full parent.
+Directory allocation is separate from payload allocation. Every new directory
+cluster is zeroed and synchronized; all new FAT links are synchronized before
+the old parent tail points to them. Stale slots, tails or reserved allocation
+are refused during pre-publication validation.
+
+When an end marker is consumed, its successor after the complete name set is
+cleared and synchronized first. The short-entry position and later LFN slots
+are then prepared as deleted records while preserving the first slot until
+the hidden suffix is durable. LFN records are written from the short-entry end
+back toward that first slot and synchronized. Only then is the actual file's
+short entry published. Hidden stale short records cannot adopt the new long
+name, and bytes after the prior end cannot become newly visible files.
 
 ## Publication and failure contract
 
@@ -55,40 +70,45 @@ including zeroed final-cluster slack, before their FAT links are published.
 The native dirty state remains set until the directory entry, reader readback,
 exact free-space hints and complete checker result are synchronized. FAT32
 selected-copy and reserved-high-bit rules are unchanged. Empty files require
-no payload clusters, though a full cluster-backed parent needs a directory
-cluster. Native creation/access/modification dates use the existing writer's
-UTC projection.
+no payload clusters, though their parent may need directory allocation.
+Native timestamps use the existing writer's UTC projection.
 
 This operation is **not atomic** and has no replay/rollback protocol. Write,
 flush, cancellation or verification failures retain the image and report the
 phase; native checking/recovery on a separate copy may be required. Do not use
 unqualified experimental writes on the sole copy of valuable data.
 
-JSON identifies `operation: create_new_file`, `name_profile: portable_ascii_8_3`,
-`new_directory_clusters`, allocation/digest information, and
-`created_new_file: false` for a dry-run. Completed updates add native-reader
-payload verification and `durability: all_data_metadata_and_clean_state_synced`.
+JSON identifies `operation: create_new_file`,
+`name_profile: portable_utf16_lfn_ascii_alias`, `new_directory_clusters`,
+allocation/digest information and `created_new_file: false` for a dry-run.
+Completed updates add native-reader payload verification and
+`durability: all_data_metadata_and_clean_state_synced`.
 
 ## Evidence and remaining work
 
-Nine authored regressions cover both dialects, 512/4096-byte sectors, active FAT,
-empty/nonempty contents, retained bytes, deleted/end slots, stale successors,
-long-name/alias collisions, invalid names, capacity, cancellation, CLI admission,
-full root/subdirectory growth, nonzero free-space initialization, stale tails,
-and every modeled write/flush failure with retained/lost pending data and torn
-prefixes. They are synthetic native-image/storage-model controls, not Windows
-or dosfstools interchange or hardware power-cut evidence.
+The nine earlier creation/growth regressions remain. Seven additional authored
+controls cover native LFN record encoding, name limits, mixed-case/Unicode and
+maximum-length readback, generated alias collisions, two-cluster growth,
+fragmented free slots, stale reserved slots, and every modeled write/flush cut
+across a sector/cluster-spanning name. Formerly unsupported valid name cases now
+have positive native-publication controls; invalid names and collisions still
+have zero-write rejection tests.
 
-At publication, this session could not execute Rust compilation, rustfmt,
-Clippy or these tests: Rust tools were absent and the execution environment's
-network was unavailable. No passing runtime or native-interchange result is
-claimed. The existing replacement writer likewise retains its separate evidence
-limits in [the FAT profile](FAT_READ_PROFILE.md).
+These are authored synthetic native-image and storage-model controls, not
+executed Rust, Windows/dosfstools interchange or hardware power-cut evidence.
+The implementation session has no Cargo, rustc, rustfmt or RCH executable, and
+its network lookup fails, so compilation, formatting, Clippy and runtime
+qualification have not run. The prior concurrent formatting correction does
+not qualify these new changes. Run the unchanged required checks, including:
 
 ```sh
 rch exec -- cargo test -p ffs-cli --bin ffs-fat replacement
+rch exec -- cargo check --workspace --all-targets
+rch exec -- cargo clippy --workspace --all-targets -- -D warnings
+cargo fmt --check
 ```
 
-Long-name creation, directory creation, unlink/rename, writable mounts,
-crash replay and MVCC/RaptorQ integration remain unfinished. The NTFS and ZFS
-native recovery/write milestones are not changed by this FAT increment.
+Directory creation, unlink/rename, writable mounts, crash replay and MVCC/RaptorQ
+integration remain unfinished. NTFS/ZFS native recovery and write milestones
+are not changed by this FAT increment. Read-only FAT behavior and the existing
+replacement protocol remain described in [the FAT profile](FAT_READ_PROFILE.md).
