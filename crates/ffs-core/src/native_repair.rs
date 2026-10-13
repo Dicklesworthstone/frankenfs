@@ -428,7 +428,7 @@ impl NativeFreshnessDevice {
                 intent: ValidationIntent::Pending(next.roots[index]),
             };
             publish_validation_group(
-                cx, &dev, &self.sb, next.storage.owner_inode, next.owner_generation,
+                cx, &dev, &self.sb, &next.storage, next.owner_generation,
                 tail, &validation,
             )?;
             let (root, table) = read_sealed_table(
@@ -660,6 +660,31 @@ fn owner_extents(tails: &[NativeRepairTail]) -> Vec<Ext4Extent> {
         }
     }
     extents
+}
+
+fn check_native_owner_prefix(
+    cx: &Cx,
+    dev: &dyn BlockDevice,
+    sb: &Ext4Superblock,
+    storage: &NativeRepairStorage,
+    generation: u32,
+    tail: &NativeRepairTail,
+) -> Result<Vec<u8>, FfsError> {
+    let bytes = dev.read_block(cx, tail.start)?.into_inner();
+    let expected = owner_header(sb, storage.owner_inode, generation, storage.repair_basis_points, tail);
+    if bytes.len() != sb.block_size as usize
+        || bytes[..OWNER_HEADER_BYTES] != expected[..OWNER_HEADER_BYTES]
+        || bytes[PARITY_HEADER_END..].iter().any(|byte| *byte != 0)
+        || (tail.group.0 != 0 && bytes[PLAN_HEADER_START..PLAN_HEADER_END].iter().any(|byte| *byte != 0))
+    {
+        return Err(validation_error(tail, "native ownership prefix changed"));
+    }
+    validation_intent(&bytes[OWNER_HEADER_BYTES..PLAN_HEADER_START], sb, storage.owner_inode, generation, tail)?;
+    parity_intent(&bytes[PARITY_HEADER_START..PARITY_HEADER_END], sb, storage, generation, tail)?;
+    if tail.group.0 == 0 {
+        validation_plan_intent(&bytes[PLAN_HEADER_START..PLAN_HEADER_END], sb, storage, generation)?;
+    }
+    Ok(bytes)
 }
 
 fn validation_error(tail: &NativeRepairTail, detail: &str) -> FfsError {
@@ -1802,7 +1827,7 @@ fn publish_validation_plan(
         }
     };
     let first = storage.tails[0].start;
-    let mut owner = dev.read_block(cx, first)?.into_inner();
+    let mut owner = check_native_owner_prefix(cx, dev, sb, storage, generation, &storage.tails[0])?;
     owner[PLAN_HEADER_START..PLAN_HEADER_END].copy_from_slice(&validation_plan_header(
         sb, storage, generation, epoch, state, &root,
     )?);
@@ -1943,11 +1968,12 @@ fn publish_validation_group(
     cx: &Cx,
     dev: &dyn BlockDevice,
     sb: &Ext4Superblock,
-    owner: InodeNumber,
+    storage: &NativeRepairStorage,
     generation: u32,
     tail: &NativeRepairTail,
     admission: &ValidationAdmission,
 ) -> Result<(), FfsError> {
+    let owner = storage.owner_inode;
     let root = &admission.root;
     let epoch = admission.epoch;
     let mut table = build_validation_table(cx, dev, sb, owner, generation, tail, epoch)?;
@@ -1960,7 +1986,7 @@ fn publish_validation_group(
     }
     let pending = validation_header(sb, owner, generation, tail, epoch, VALIDATION_PENDING, root)?;
     // Preserve the entire immutable ownership prefix verbatim.
-    let mut ownership = dev.read_block(cx, tail.start)?.into_inner();
+    let mut ownership = check_native_owner_prefix(cx, dev, sb, storage, generation, tail)?;
     ownership[OWNER_HEADER_BYTES..OWNER_HEADER_BYTES + VALIDATION_HEADER_BYTES]
         .copy_from_slice(&pending);
     cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
@@ -2012,11 +2038,15 @@ impl OpenFs {
         if self.native_repair_active {
             return Err(freshness_error("device is already active"));
         }
+        if self.ext4_replay_overlay {
+            return Err(freshness_error("simulated replay cannot certify image durability"));
+        }
         if self.metadata_log.is_some() || self.metadata_compactor.lock().is_some() {
             return Err(freshness_error("external metadata WAL is not admitted"));
         }
         let storage = self.native_ext4_repair_storage(cx)?;
         let sb = self.ext4_superblock().expect("validated native ext4 ownership").clone();
+        sb.validate_v1().map_err(|error| parse_to_ffs_error(&error))?;
         let codec_budget = freshness_codec_budget(&sb, &storage, max_working_bytes)?;
         for tail in &storage.tails {
             native_codec_budget(&sb, &storage, tail, codec_budget, false)?;
@@ -2292,7 +2322,7 @@ impl OpenFs {
                 cx,
                 &dev,
                 sb,
-                storage.owner_inode,
+                &storage,
                 inode.generation,
                 tail,
                 admission,
