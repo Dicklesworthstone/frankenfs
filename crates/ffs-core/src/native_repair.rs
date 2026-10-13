@@ -867,7 +867,7 @@ fn admit_native_group(
         match storage.read_verified_raw_generation(cx, false) {
             Ok((descriptor, symbols)) => {
                 retained =
-                    descriptor == raw.descriptor && symbols.len() == tail.repair_blocks as usize
+                    descriptor == raw.descriptor && symbols.len() == tail.repair_blocks as usize;
             }
             Err(FfsError::RepairFailed(_) | FfsError::Corruption { .. }) => {}
             Err(error) => return Err(error),
@@ -1018,7 +1018,13 @@ fn publish_native_group(
         storage.write_repair_symbols(cx, &symbols, admission.next_generation)?;
     }
     let (descriptor, readback) = storage.read_verified_raw_generation(cx, false)?;
-    if descriptor.repair_generation != admission.next_generation || readback != symbols {
+    if descriptor.repair_generation != admission.next_generation {
+        return Err(validation_error(
+            tail,
+            "native parity readback generation mismatch",
+        ));
+    }
+    if readback != symbols {
         return Err(validation_error(
             tail,
             "native parity readback differs from encoded symbols",
@@ -1610,7 +1616,7 @@ impl OpenFs {
             layout,
             tail.group_start,
             u32::from(expected.source_block_count),
-        )
+        )?
         .with_decoded_block_validator(&view)
         .recover_from_indices(cx, &corrupt);
         if !result.is_success() || result.evidence.generation != generation {

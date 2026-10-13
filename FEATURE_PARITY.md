@@ -213,6 +213,18 @@
 > durable mounted freshness, Btrfs ownership and default repair remain incomplete;
 > successful validation reports `protection_active=false`. The bead remains open.
 
+> **Offline native parity (`bd-11a8t`, implementation under validation):**
+> `native-encode` now connects sealed source validation, strict descriptor
+> admission and generation-bound `FFSRPR01` publication. `native-recover`
+> connects digest-validated reconstruction to a read-only capture and new output
+> file. Five real-format core controls and six CLI controls are authored;
+> RCH compilation, tests and public-command execution remain pending.
+> This partial path admits at most 56,403 source blocks per group, full-block
+> symbols of 1,024–65,535 bytes, repair count no greater than source count and
+> a checked working budget; oversized groups and 64 KiB symbols are refused.
+> Broader native coverage remains a V1 requirement.
+> No measured parity percentage or mounted/default repair credit is added.
+
 > **Mount worker ownership (`bd-11a8t`, partial evidence 2026-10-12):** ordinary
 > CLI scrub and periodic commit now use caller-owned asupersync child regions.
 > Shutdown cancels both workers, drains their physical I/O completion receipts,

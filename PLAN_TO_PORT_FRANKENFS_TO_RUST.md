@@ -143,6 +143,13 @@ generation-bound owner records and verified raw parity publication; export
 digest-validated baseline reconstruction read-only. Durable pre-write freshness
 fencing must precede in-place recovery and mounted activation. Preparation alone cannot enable
 read-write background repair; Btrfs needs its own allocation ownership path.
+The current offline codec admits at most 56,403 source blocks per group,
+full-block symbols between 1,024 and 65,535 bytes, repair count no greater
+than source count, and a checked caller allocation budget. Larger native
+groups and 64 KiB symbols are temporarily unsupported in this partial path;
+admission refuses rather than partitions or silently reduces coverage.
+Extending native coverage remains required for V1; these limits do not narrow
+the filesystem-format targets or complete default repair acceptance.
 Explicit sidecar-protected writable mounts share the ordinary periodic filesystem
 commit worker (5 seconds ext4, 30 seconds btrfs, configurable or disabled), so
 successful timer boundaries also refresh their protection without caller fsync.

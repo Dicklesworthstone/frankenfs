@@ -372,7 +372,7 @@ fn build_native_recover_output(
 ) -> Result<NativeRecoverOutput> {
     let max_working_bytes = native_codec_working_bytes(max_codec_memory_mib)?;
     let cx = cli_cx();
-    let (device, _lock) = lock_native_prepare_image(path, true)?;
+    let (device, lock) = lock_native_prepare_image(path, true)?;
     let fs = open_native_prepare_view(&cx, device)?;
     let block_size = fs
         .ext4_superblock()
@@ -384,6 +384,11 @@ fn build_native_recover_output(
         || recovered.data.len() != block_size as usize
     {
         bail!("native reconstruction returned an invalid block or generation");
+    }
+    let locked = lock.0.metadata()?;
+    let current = std::fs::metadata(path)?;
+    if (locked.dev(), locked.ino()) != (current.dev(), current.ino()) {
+        bail!("native reconstruction image path changed before export");
     }
     write_native_reconstruction(&cx, output, &recovered.data)?;
     Ok(NativeRecoverOutput {

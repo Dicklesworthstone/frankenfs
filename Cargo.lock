@@ -1013,6 +1013,7 @@ dependencies = [
  "ffs-journal",
  "ffs-mvcc",
  "ffs-ondisk",
+ "ffs-repair",
  "ffs-types",
  "ffs-xattr",
  "flate2",

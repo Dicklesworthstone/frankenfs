@@ -73554,6 +73554,107 @@ mod tests {
     }
 
     #[test]
+    fn native_ext4_repair_retry_syncs_visible_but_undurable_owner_seal() {
+        let (storage, dev, _tmp, image) = native_parity_baseline();
+        let cx = Cx::for_testing();
+        let baseline = dev.snapshot_bytes();
+        let durable = TestDevice::from_vec(baseline.clone());
+        let syncs = Arc::new(AtomicUsize::new(0));
+        let fault = ValidationSyncFaultDevice {
+            inner: dev.clone(),
+            durable: durable.clone(),
+            syncs: Arc::clone(&syncs),
+            // Pending owner, raw fence, parity, committed descriptors, sealed owner.
+            fail_on: 5,
+            corrupt_on: None,
+            events: Arc::new(Mutex::new(Vec::new())),
+        };
+        let fs = OpenFs::from_device(&cx, Box::new(fault), &native_preparation_options()).unwrap();
+        let error = fs
+            .initialize_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+            .unwrap_err();
+        assert!(
+            error
+                .to_string()
+                .contains("injected native validation sync failure"),
+            "{error}"
+        );
+        assert_eq!(syncs.load(AtomicOrdering::SeqCst), 5);
+        let visible = dev.snapshot_bytes();
+        let persisted = durable.snapshot_bytes();
+        let record = storage.tails[0].start.0 as usize * 1024 + 320;
+        for (bytes, state) in [(&visible, 2_u32), (&persisted, 1)] {
+            assert_eq!(&bytes[record..record + 8], b"FFSRPR01");
+            assert_eq!(
+                u64::from_le_bytes(bytes[record + 40..record + 48].try_into().unwrap()),
+                1
+            );
+            assert_eq!(
+                u32::from_le_bytes(bytes[record + 112..record + 116].try_into().unwrap()),
+                state
+            );
+        }
+        assert_eq!(&visible[..record], &persisted[..record]);
+        assert_eq!(&visible[record + 128..], &persisted[record + 128..]);
+        let cold = OpenFs::from_device(
+            &cx,
+            Box::new(durable.clone()),
+            &native_preparation_options(),
+        )
+        .unwrap();
+        let error = cold.check_native_ext4_repair(&cx).unwrap_err();
+        assert!(
+            error.to_string().contains("uninitialized or pending"),
+            "{error}"
+        );
+        drop(cold);
+
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let retry = ValidationSyncFaultDevice {
+            inner: dev.clone(),
+            durable: durable.clone(),
+            syncs: Arc::new(AtomicUsize::new(0)),
+            fail_on: usize::MAX,
+            corrupt_on: None,
+            events: Arc::clone(&events),
+        };
+        let fs = OpenFs::from_device(&cx, Box::new(retry), &native_preparation_options()).unwrap();
+        events.lock().unwrap().clear();
+        let report = fs
+            .initialize_native_ext4_repair(&cx, NATIVE_PARITY_TEST_BUDGET)
+            .unwrap();
+        assert_eq!(report.generations, vec![1, 1]);
+        assert_eq!(
+            events.lock().unwrap().first(),
+            Some(&None),
+            "matching visible parity must sync before any subsequent group publication"
+        );
+        let completed = durable.snapshot_bytes();
+        assert!(completed == dev.snapshot_bytes());
+        for bytes in [&visible, &persisted, &completed] {
+            for tail in &storage.tails {
+                let source = tail.group_start.0 as usize * 1024..tail.start.0 as usize * 1024;
+                let table_start = (tail.start.0 as usize + 1) * 1024;
+                let table = table_start..table_start + tail.validation_blocks as usize * 1024;
+                assert_eq!(&bytes[source.clone()], &baseline[source]);
+                assert_eq!(&bytes[table.clone()], &baseline[table]);
+            }
+        }
+        let cold = OpenFs::from_device(
+            &cx,
+            Box::new(durable.clone()),
+            &native_preparation_options(),
+        )
+        .unwrap();
+        assert_eq!(cold.check_native_ext4_repair(&cx).unwrap(), report);
+        let file = cold
+            .lookup(&cx, InodeNumber(2), OsStr::new("existing.bin"))
+            .unwrap();
+        assert_eq!(cold.read(&cx, file.ino, 0, 8192).unwrap(), vec![0xA7; 8192]);
+        native_parity_fsck(&durable, &image);
+    }
+
+    #[test]
     fn native_ext4_validation_persists_and_detects_real_file_data() {
         let Some((fs, dev, _tmp, image)) = native_preparation_fixture() else {
             return;

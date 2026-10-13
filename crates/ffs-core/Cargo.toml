@@ -45,6 +45,7 @@ ffs-inode = { workspace = true }
 ffs-journal = { workspace = true }
 ffs-mvcc = { workspace = true }
 ffs-ondisk = { workspace = true }
+ffs-repair = { workspace = true }
 ffs-types = { workspace = true }
 ffs-xattr = { workspace = true }
 libc = { workspace = true }
