@@ -6689,6 +6689,14 @@ impl OpenFs {
             DetectionError::Io(ffs_err) => ffs_err,
         })?;
 
+        if options.native_repair_max_working_bytes.is_some()
+            && (!options.mount_mode.is_native() || !matches!(flavor, FsFlavor::Ext4(_)))
+        {
+            return Err(FfsError::UnsupportedFeature(
+                "native write freshness requires an ext4 image in native mode".into(),
+            ));
+        }
+
         let dev: Box<dyn ByteDevice> = if matches!(flavor, FsFlavor::Ext4(_))
             && !options.skip_validation
             && matches!(

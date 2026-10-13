@@ -242,14 +242,31 @@
 > filtered tests on the same source. Native core job `j-30063314843205644`
 > was cancelled during dependency compilation and recovered with exit 137;
 > no core tests ran. Its unchanged-source retry was refused before submission
-> by RCH disk admission. The five new core crash-boundary controls remain
-> unexecuted pending an admitted worker; compilation and public offline success
-> do not substitute for those fault tests.
+> by RCH disk admission. Resumed job `j-30063314843205648` executed the same
+> frozen source and passed all 22 selected native core tests: zero failures,
+> ignored or measured tests, 1,484 filtered out. This includes all five new
+> real-format parity and interrupted-publication controls. Its log is
+> `/tmp/ffs-chartreusestone-resume41-native-core1.log`, SHA256
+> `e8b14bdc9c14ee0c493b3305de62a1111c58bda5488c70fec93a75829a2b10fd`.
+> These tests use real ext4 format and instrumented write/sync fault boundaries;
+> they do not establish mounted freshness or hardware crash behavior.
 > This partial path admits at most 56,403 source blocks per group, full-block
 > symbols of 1,024–65,535 bytes, repair count no greater than source count and
 > a checked working budget; oversized groups and 64 KiB symbols are refused.
 > Broader native coverage remains a V1 requirement.
 > No measured parity percentage or mounted/default repair credit is added.
+
+> **Explicit native write freshness (`bd-11a8t`, source under validation):**
+> optional core activation and CLI `--native-repair-memory-mib` connect a single
+> protected physical device before constructor recovery. Intended digests derive
+> from verified beforeimages and caller writes. A durable Dirty fence precedes
+> source mutation; sync verifies all intended and untouched sources before exact
+> next-epoch plan/table/parity publication. The compactor shares its caller's
+> device Arc. Five new real-format freshness controls, one compactor authority
+> control and one CLI admission/wiring control are authored but unexecuted.
+> This source currently has no new compiler or mounted-runtime qualification.
+> Default activation, automatic read repair, interrupted-epoch reconciliation,
+> Btrfs ownership and internal dense-solver cancellation latency remain open.
 
 > **Mount worker ownership (`bd-11a8t`, partial evidence 2026-10-12):** ordinary
 > CLI scrub and periodic commit now use caller-owned asupersync child regions.
