@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
 use ffs_block::{BlockDevice, ByteBlockDevice, ByteDevice, FileByteDevice};
-use ffs_core::native_repair::{NativeRepairStorage, NativeValidationReport};
+use ffs_core::native_repair::{NativeRepairReport, NativeRepairStorage, NativeValidationReport};
 use ffs_core::{Ext4JournalReplayMode, FsFlavor, OpenFs, OpenOptions, detect_filesystem_at_path};
 use ffs_ondisk::btrfs::BTRFS_FIRST_CHUNK_TREE_OBJECTID;
 use ffs_ondisk::{
@@ -246,6 +246,188 @@ pub fn native_validate_cmd(path: &Path, initialize: bool, json: bool) -> Result<
         println!(
             "Groups: {}; source blocks checked: {}",
             output.validation.groups, output.validation.source_blocks
+        );
+    }
+    Ok(())
+}
+
+fn native_codec_working_bytes(mib: u64) -> Result<u64> {
+    if mib == 0 {
+        bail!("native codec memory limit must be positive");
+    }
+    mib.checked_mul(1024 * 1024)
+        .context("native codec memory limit overflows bytes")
+}
+
+#[derive(Debug, Serialize)]
+struct NativeEncodeOutput {
+    image: PathBuf,
+    check_only: bool,
+    baseline_verified: bool,
+    protection_active: bool,
+    repair: NativeRepairReport,
+}
+
+fn build_native_encode_output(
+    path: &Path,
+    check: bool,
+    max_codec_memory_mib: u64,
+) -> Result<NativeEncodeOutput> {
+    let max_working_bytes = native_codec_working_bytes(max_codec_memory_mib)?;
+    let cx = cli_cx();
+    let (device, lock) = lock_native_prepare_image(path, check)?;
+    let fs = open_native_prepare_view(&cx, device)?;
+    let repair = if check {
+        fs.check_native_ext4_repair(&cx)?
+    } else {
+        let expected = fs.initialize_native_ext4_repair(&cx, max_working_bytes)?;
+        let device = FileByteDevice::open_read_only(path)?;
+        let locked = lock.0.metadata()?;
+        let reopened = device.file().metadata()?;
+        if (locked.dev(), locked.ino()) != (reopened.dev(), reopened.ino()) {
+            bail!("native encoding image path changed before verification");
+        }
+        let checked = open_native_prepare_view(&cx, device)?.check_native_ext4_repair(&cx)?;
+        if checked != expected {
+            bail!("reopened native repair evidence differs from encoding");
+        }
+        checked
+    };
+    Ok(NativeEncodeOutput {
+        image: path.to_path_buf(),
+        check_only: check,
+        baseline_verified: true,
+        protection_active: false,
+        repair,
+    })
+}
+
+pub fn native_encode_cmd(
+    path: &Path,
+    check: bool,
+    max_codec_memory_mib: u64,
+    json: bool,
+) -> Result<()> {
+    let output = match build_native_encode_output(path, check, max_codec_memory_mib) {
+        Ok(output) => output,
+        Err(error) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "error", "image": path, "check_only": check,
+                        "error": format!("{error:#}"), "protection_active": false,
+                    })
+                );
+            }
+            return Err(error);
+        }
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("Native offline repair baseline: {}", path.display());
+        println!("baseline_verified=true protection_active=false");
+        println!(
+            "Groups: {}; source blocks: {}; repair blocks: {}",
+            output.repair.groups, output.repair.source_blocks, output.repair.repair_blocks
+        );
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct NativeRecoverOutput {
+    image: PathBuf,
+    output: PathBuf,
+    block: BlockNumber,
+    generation: u64,
+    bytes: usize,
+    baseline_verified: bool,
+    protection_active: bool,
+}
+
+fn write_native_reconstruction(cx: &Cx, path: &Path, data: &[u8]) -> Result<()> {
+    use std::io::Write;
+
+    cx.checkpoint()
+        .map_err(|_| ffs_error::FfsError::Cancelled)?;
+    let mut output = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("create new native reconstruction output {}", path.display()))?;
+    output.write_all(data)?;
+    output.sync_all()?;
+    cx.checkpoint()
+        .map_err(|_| ffs_error::FfsError::Cancelled)?;
+    Ok(())
+}
+
+fn build_native_recover_output(
+    path: &Path,
+    block: BlockNumber,
+    output: &Path,
+    max_codec_memory_mib: u64,
+) -> Result<NativeRecoverOutput> {
+    let max_working_bytes = native_codec_working_bytes(max_codec_memory_mib)?;
+    let cx = cli_cx();
+    let (device, _lock) = lock_native_prepare_image(path, true)?;
+    let fs = open_native_prepare_view(&cx, device)?;
+    let block_size = fs
+        .ext4_superblock()
+        .context("native reconstruction requires ext4")?
+        .block_size;
+    let recovered = fs.reconstruct_native_ext4_block(&cx, block, max_working_bytes)?;
+    if recovered.block != block
+        || recovered.generation == 0
+        || recovered.data.len() != block_size as usize
+    {
+        bail!("native reconstruction returned an invalid block or generation");
+    }
+    write_native_reconstruction(&cx, output, &recovered.data)?;
+    Ok(NativeRecoverOutput {
+        image: path.to_path_buf(),
+        output: output.to_path_buf(),
+        block: recovered.block,
+        generation: recovered.generation,
+        bytes: recovered.data.len(),
+        baseline_verified: true,
+        protection_active: false,
+    })
+}
+
+pub fn native_recover_cmd(
+    path: &Path,
+    block: BlockNumber,
+    output_path: &Path,
+    max_codec_memory_mib: u64,
+    json: bool,
+) -> Result<()> {
+    let output = match build_native_recover_output(path, block, output_path, max_codec_memory_mib) {
+        Ok(output) => output,
+        Err(error) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "error", "image": path, "block": block,
+                        "output": output_path, "error": format!("{error:#}"),
+                        "protection_active": false,
+                    })
+                );
+            }
+            return Err(error);
+        }
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("Native baseline reconstruction: {}", output_path.display());
+        println!("baseline_verified=true protection_active=false");
+        println!(
+            "Block: {}; generation: {}; bytes: {}",
+            output.block.0, output.generation, output.bytes
         );
     }
     Ok(())
@@ -3436,6 +3618,95 @@ pub fn print_repair_output(json: bool, output: &RepairOutput) -> Result<()> {
 mod coordination_tests {
     use super::*;
     use ffs_repair::ownership::CoordinationRecord;
+
+    #[test]
+    fn native_codec_memory_conversion_is_checked_before_image_access() {
+        assert_eq!(native_codec_working_bytes(4096).unwrap(), 4_294_967_296);
+        let maximum = u64::MAX / (1024 * 1024);
+        assert_eq!(
+            native_codec_working_bytes(maximum).unwrap(),
+            maximum * (1024 * 1024)
+        );
+        assert!(native_codec_working_bytes(0).is_err());
+        assert!(native_codec_working_bytes(maximum + 1).is_err());
+        let directory = tempfile::tempdir().unwrap();
+        let missing = directory.path().join("missing.img");
+        let output = directory.path().join("output.bin");
+        for check in [false, true] {
+            let error = build_native_encode_output(&missing, check, u64::MAX).unwrap_err();
+            assert!(error.to_string().contains("overflows bytes"));
+        }
+        let error =
+            build_native_recover_output(&missing, BlockNumber(0), &output, u64::MAX).unwrap_err();
+        assert!(error.to_string().contains("overflows bytes"));
+        assert!(!missing.exists());
+        assert!(!output.exists());
+    }
+
+    #[test]
+    fn native_codec_commands_refuse_locked_and_invalid_images_without_output() {
+        let directory = tempfile::tempdir().unwrap();
+        let image = tempfile::NamedTempFile::new().unwrap();
+        let output = directory.path().join("output.bin");
+        let bytes = vec![0xA5; 128 * 1024];
+        std::fs::write(image.path(), &bytes).unwrap();
+        image.as_file().try_lock().unwrap();
+        for check in [false, true] {
+            let error = build_native_encode_output(image.path(), check, 4096).unwrap_err();
+            assert!(error.chain().any(|cause| matches!(
+                cause.downcast_ref::<std::fs::TryLockError>(),
+                Some(std::fs::TryLockError::WouldBlock)
+            )));
+        }
+        let error =
+            build_native_recover_output(image.path(), BlockNumber(1), &output, 4096).unwrap_err();
+        assert!(error.chain().any(|cause| matches!(
+            cause.downcast_ref::<std::fs::TryLockError>(),
+            Some(std::fs::TryLockError::WouldBlock)
+        )));
+        assert!(!output.exists());
+        assert_eq!(std::fs::read(image.path()).unwrap(), bytes);
+        image.as_file().unlock().unwrap();
+        for check in [false, true] {
+            let error = build_native_encode_output(image.path(), check, 4096).unwrap_err();
+            assert!(format!("{error:#}").contains("not a recognized ext4 or btrfs filesystem"));
+        }
+        let error =
+            build_native_recover_output(image.path(), BlockNumber(1), &output, 4096).unwrap_err();
+        assert!(format!("{error:#}").contains("not a recognized ext4 or btrfs filesystem"));
+        assert_eq!(std::fs::read(image.path()).unwrap(), bytes);
+        assert!(!output.exists());
+        let (_device, _lock) = lock_native_prepare_image(image.path(), false).unwrap();
+    }
+
+    #[test]
+    fn native_reconstruction_output_is_exact_exclusive_and_cancel_safe() {
+        let cx = Cx::for_testing();
+        let directory = tempfile::tempdir().unwrap();
+        let output = directory.path().join("block.bin");
+        // This exercises output file I/O only; it is not decoder evidence.
+        let bytes = [0_u8, 1, 255, 42, 0, 127];
+        write_native_reconstruction(&cx, &output, &bytes).unwrap();
+        assert_eq!(std::fs::read(&output).unwrap(), bytes);
+        let error = write_native_reconstruction(&cx, &output, b"overwrite").unwrap_err();
+        assert_eq!(
+            error.downcast_ref::<std::io::Error>().unwrap().kind(),
+            std::io::ErrorKind::AlreadyExists
+        );
+        let alias = directory.path().join("alias.bin");
+        std::os::unix::fs::symlink(&output, &alias).unwrap();
+        assert!(write_native_reconstruction(&cx, &alias, b"overwrite").is_err());
+        assert_eq!(std::fs::read(&output).unwrap(), bytes);
+        let cancelled = directory.path().join("cancelled.bin");
+        cx.set_cancel_requested(true);
+        let error = write_native_reconstruction(&cx, &cancelled, &bytes).unwrap_err();
+        assert!(matches!(
+            error.downcast_ref::<ffs_error::FfsError>(),
+            Some(ffs_error::FfsError::Cancelled)
+        ));
+        assert!(!cancelled.exists());
+        assert_eq!(std::fs::read(&output).unwrap(), bytes);
+    }
 
     #[test]
     fn native_prepare_check_holds_shared_lock_and_read_only_descriptor() {

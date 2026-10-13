@@ -1219,6 +1219,37 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Encode native ext4 repair symbols against the sealed offline baseline.
+    NativeEncode {
+        /// Path to the clean, offline ext4 image with initialized source digests.
+        image: PathBuf,
+        /// Verify existing symbols without modifying the image.
+        #[arg(long)]
+        check: bool,
+        /// Maximum codec working memory during encoding, in MiB.
+        #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u64).range(1..))]
+        max_codec_memory_mib: u64,
+        /// Output in JSON format.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Reconstruct one block from the sealed native baseline into a new file.
+    ///
+    /// The image is read-only; this does not roll it back or establish freshness.
+    NativeRecover {
+        /// Path to the offline ext4 image with encoded native repair symbols.
+        image: PathBuf,
+        /// Absolute filesystem block number to reconstruct.
+        block: u64,
+        /// New output file; existing files are never overwritten.
+        output: PathBuf,
+        /// Maximum codec working memory during reconstruction, in MiB.
+        #[arg(long, default_value_t = 4096, value_parser = clap::value_parser!(u64).range(1..))]
+        max_codec_memory_mib: u64,
+        /// Output in JSON format.
+        #[arg(long)]
+        json: bool,
+    },
     /// Mount a filesystem image via FUSE.
     Mount {
         /// Path to the filesystem image.
@@ -1606,6 +1637,8 @@ impl Command {
             Self::Repair { .. } => "repair",
             Self::NativePrepare { .. } => "native-prepare",
             Self::NativeValidate { .. } => "native-validate",
+            Self::NativeEncode { .. } => "native-encode",
+            Self::NativeRecover { .. } => "native-recover",
             Self::Mount { .. } => "mount",
             Self::Scrub { .. } => "scrub",
             Self::Parity { .. } => "parity",
@@ -2555,6 +2588,25 @@ fn run() -> Result<()> {
             initialize,
             json,
         } => cmd_repair::native_validate_cmd(&image, initialize, json),
+        Command::NativeEncode {
+            image,
+            check,
+            max_codec_memory_mib,
+            json,
+        } => cmd_repair::native_encode_cmd(&image, check, max_codec_memory_mib, json),
+        Command::NativeRecover {
+            image,
+            block,
+            output,
+            max_codec_memory_mib,
+            json,
+        } => cmd_repair::native_recover_cmd(
+            &image,
+            BlockNumber(block),
+            &output,
+            max_codec_memory_mib,
+            json,
+        ),
         Command::Mount {
             image,
             mountpoint,
@@ -17267,6 +17319,96 @@ mod tests {
             ])
             .is_err()
         );
+    }
+
+    #[test]
+    fn cli_parses_native_encoding_defaults_and_read_only_check() {
+        for check in [false, true] {
+            let mut args = vec!["ffs", "native-encode", "/tmp/fs.img"];
+            if check {
+                args.extend(["--check", "--max-codec-memory-mib", "64", "--json"]);
+            }
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(cli.command.name(), "native-encode");
+            let Command::NativeEncode {
+                image,
+                check: parsed,
+                max_codec_memory_mib,
+                json,
+            } = cli.command
+            else {
+                panic!("expected native encoding");
+            };
+            assert_eq!(image, PathBuf::from("/tmp/fs.img"));
+            assert_eq!(parsed, check);
+            assert_eq!(max_codec_memory_mib, if check { 64 } else { 4096 });
+            assert_eq!(json, check);
+        }
+    }
+
+    #[test]
+    fn cli_parses_native_recovery_block_output_and_memory_limit() {
+        for explicit in [false, true] {
+            let mut args = vec![
+                "ffs",
+                "native-recover",
+                "/tmp/fs.img",
+                "42",
+                "/tmp/block.bin",
+            ];
+            if explicit {
+                args.extend(["--max-codec-memory-mib", "32", "--json"]);
+            }
+            let cli = Cli::try_parse_from(args).unwrap();
+            assert_eq!(cli.command.name(), "native-recover");
+            let Command::NativeRecover {
+                image,
+                block,
+                output,
+                max_codec_memory_mib,
+                json,
+            } = cli.command
+            else {
+                panic!("expected native reconstruction");
+            };
+            assert_eq!(image, PathBuf::from("/tmp/fs.img"));
+            assert_eq!(block, 42);
+            assert_eq!(output, PathBuf::from("/tmp/block.bin"));
+            assert_eq!(max_codec_memory_mib, if explicit { 32 } else { 4096 });
+            assert_eq!(json, explicit);
+        }
+    }
+
+    #[test]
+    fn cli_rejects_native_codec_missing_arguments_and_invalid_limits() {
+        assert!(Cli::try_parse_from(["ffs", "native-encode"]).is_err());
+        for args in [
+            vec!["ffs", "native-recover"],
+            vec!["ffs", "native-recover", "/tmp/fs.img"],
+            vec!["ffs", "native-recover", "/tmp/fs.img", "42"],
+            vec!["ffs", "native-recover", "/tmp/fs.img", "-1", "/tmp/out"],
+            vec!["ffs", "native-recover", "/tmp/fs.img", "bad", "/tmp/out"],
+            vec![
+                "ffs",
+                "native-recover",
+                "/tmp/fs.img",
+                "42",
+                "/tmp/out",
+                "--check",
+            ],
+        ] {
+            assert!(Cli::try_parse_from(args).is_err());
+        }
+        for value in ["0", "-1", "bad", "18446744073709551616"] {
+            for command in ["native-encode", "native-recover"] {
+                let mut args = vec!["ffs", command, "/tmp/fs.img"];
+                if command == "native-recover" {
+                    args.extend(["42", "/tmp/out"]);
+                }
+                args.extend(["--max-codec-memory-mib", value]);
+                assert!(Cli::try_parse_from(args).is_err(), "{command}: {value}");
+            }
+        }
     }
 
     #[test]
