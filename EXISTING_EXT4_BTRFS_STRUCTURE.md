@@ -661,6 +661,16 @@ This yields a 48-bit physical block address.
 
 ### 4.3 Unwritten (Preallocated) Extents
 
+Native repair preparation uses this standard allocation contract: an unwritten
+extent belongs to its inode and remains allocated, while ordinary reads return
+zeros. It is not a free-space marker. An owner with more than four disjoint tails
+requires external extent nodes; those nodes count toward `i_blocks`, must be
+allocated, and use the inode-number/generation checksum seed. Its data extents,
+external nodes, inode bitmap, directory entry, group descriptors and superblock
+free totals must agree after either checkpoint or journal recovery. These
+requirements apply to `.frankenfs-repair` exactly as to other ext4 files; the
+native ownership header adds identity without replacing ext4 allocation rules.
+
 The `ee_len` field uses its MSB (bit 15) as an "unwritten" flag:
 
 - If `ee_len <= 0x8000` (32768): the extent is **initialized** and

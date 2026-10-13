@@ -142,6 +142,42 @@
 > These on-image pipeline fixes do not establish default repair, reserved native
 > storage, or mounted restart freshness; `bd-11a8t` / `bd-j7a4e` remain incomplete.
 >
+> **Native ext4 allocation ownership (`bd-11a8t`, partial evidence 2026-10-13):**
+> `ffs native-prepare` now stages allocator-owned per-group tails through an
+> immutable unwritten-extent inode, including digest capacity and dual descriptor
+> slots, in one internal JBD2 transaction. Cold discovery verifies persisted
+> mappings, checksums, allocation and metadata exclusion. Preparation reports
+> `protection_active=false`; it does not encode symbols or enable mounted repair.
+> RCH core `native_` selection passed 10/10 tests with mandatory native oracles:
+> eight groups force an external owner extent node, ordinary allocation avoids
+> every tail, existing payload survives, and `e2fsck` accepts checkpointed and
+> post-commit-crash replayed ownership. Checksum damage, freed owner/node bitmap
+> bits, occupied tails and malformed journals are rejected. Core/journal `jbd2_`
+> selection passed 9 + 85 tests, including unchanged-image preflight refusal.
+> The pre-fix production run failed that regression because recovery markers
+> changed before NoSpace rejection. Source: base `6f9620e7f` plus overlay
+> `23febbb70a1c5f447ccb491f3df6b84f0cce79029ce3474d96247252d1f43c56`;
+> jobs `j-30062613555576837` and `j-30062613555576838`. Full CLI/journal job
+> `j-30062613555576841` passed 393 + 296 tests with no skips. Public CLI build
+> `j-30062613555576843` produced binary SHA256
+> `d855f4ef96b72a5d5a2d6abcf2dc789c6baf97e760f590ec1d825512b0c0bc76`:
+> an actual 64 MiB image preparation/check preserved its payload, passed native
+> `e2fsck -fn`, and left the image unchanged on checks and duplicate refusal.
+> Its JSON reports eight owned groups and inactive protection. Artifacts are
+> retained at `/data/tmp/ffs-chartreusestone-resume38-native-cli-artifacts`.
+> A subsequent test-only decimal-to-hex spelling correction preserves the exact
+> asserted value; overlay `237d6e32b6d728bbd46d64f6b8e380092a6f9144aa92c7269e057138115a5195`
+> passed all 10 native tests again in `j-30062613555576845` and workspace/all-targets
+> check in `j-30062613555576846`. Two subsequent test-counter renames preserve
+> every value and assertion. Final overlay
+> `7a303256ad788b080ebf6fb703e5bd4e9f977839028b7ea1d3063ff7c8d3cfaa`
+> passed strict workspace/all-targets Clippy in `j-30062613555576847` and all
+> 296 journal tests in `j-30062613555576848`. Formatting also passes. This is
+> real-format in-memory-device/native-tool and offline public
+> CLI evidence, including a planted crash, not mounted native self-healing.
+> Native freshness fencing, encoding, Btrfs ownership and default activation
+> remain open on the original Bead.
+
 > **Mount worker ownership (`bd-11a8t`, partial evidence 2026-10-12):** ordinary
 > CLI scrub and periodic commit now use caller-owned asupersync child regions.
 > Shutdown cancels both workers, drains their physical I/O completion receipts,

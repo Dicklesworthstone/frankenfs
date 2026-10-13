@@ -1,7 +1,8 @@
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
 use ffs_block::{BlockDevice, ByteBlockDevice, ByteDevice, FileByteDevice};
-use ffs_core::{FsFlavor, OpenFs, OpenOptions, detect_filesystem_at_path};
+use ffs_core::native_repair::NativeRepairStorage;
+use ffs_core::{Ext4JournalReplayMode, FsFlavor, OpenFs, OpenOptions, detect_filesystem_at_path};
 use ffs_ondisk::btrfs::BTRFS_FIRST_CHUNK_TREE_OBJECTID;
 use ffs_ondisk::{
     BtrfsChunkEntry, BtrfsSuperblock, Ext4Superblock, map_logical_to_physical,
@@ -14,11 +15,14 @@ use ffs_repair::scrub::{BlockValidator, Ext4MetadataValidator, ScrubReport, Scru
 use ffs_repair::storage::{REPAIR_DESC_SLOT_COUNT, RepairGroupLayout, RepairGroupStorage};
 use ffs_repair::symbol::RepairGroupDescExt;
 use ffs_types::{
-    BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE, BlockNumber, ByteOffset, GroupNumber,
+    BTRFS_SUPER_INFO_OFFSET, BTRFS_SUPER_INFO_SIZE, BlockNumber, ByteOffset, GroupNumber, MountMode,
 };
 use serde::Serialize;
 use std::collections::{BTreeMap, BTreeSet};
+use std::os::fd::AsRawFd;
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Instant;
 use tracing::{info, info_span, warn};
 
@@ -36,6 +40,147 @@ use crate::{
 /// This mirrors the integrity verifier's group-scan cap and rejects corrupt
 /// superblocks that advertise billions of groups before allocation.
 pub const MAX_EXT4_REPAIR_GROUP_SPECS: u32 = 65_536;
+
+#[derive(Debug, Serialize)]
+struct NativePrepareOutput {
+    image: PathBuf,
+    check_only: bool,
+    storage_prepared: bool,
+    protection_active: bool,
+    storage: NativeRepairStorage,
+}
+
+struct NativePrepareLock(Arc<std::fs::File>);
+
+impl Drop for NativePrepareLock {
+    fn drop(&mut self) {
+        // Release explicitly even if a fork retained the same open-file description.
+        if let Err(error) = self.0.unlock() {
+            warn!(%error, "native preparation image unlock failed");
+        }
+    }
+}
+
+fn lock_native_prepare_image(
+    path: &Path,
+    check: bool,
+) -> Result<(FileByteDevice, NativePrepareLock)> {
+    if !std::fs::metadata(path)?.is_file() {
+        bail!("native preparation requires a regular image file");
+    }
+    let device = if check {
+        FileByteDevice::open_read_only(path)?
+    } else {
+        FileByteDevice::open(path)?
+    };
+    if !device.file().metadata()?.is_file() {
+        bail!("native preparation requires a regular image file");
+    }
+    // FileByteDevice::open can fall back to O_RDONLY. Refuse that fallback
+    // before entering any conversion code, including when running as root.
+    let access = nix::fcntl::fcntl(device.file().as_raw_fd(), nix::fcntl::FcntlArg::F_GETFL)?;
+    if !check && access & libc::O_ACCMODE != libc::O_RDWR {
+        bail!("native preparation requires a writable image file");
+    }
+    let file = Arc::clone(device.file());
+    if check {
+        file.try_lock_shared()
+    } else {
+        file.try_lock()
+    }
+    .with_context(|| format!("lock {} for native preparation", path.display()))?;
+    Ok((device, NativePrepareLock(file)))
+}
+
+fn open_native_prepare_view(cx: &Cx, device: FileByteDevice) -> Result<OpenFs> {
+    let fs = OpenFs::from_device(
+        cx,
+        Box::new(device),
+        &OpenOptions {
+            mount_mode: MountMode::Native,
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+            ..OpenOptions::default()
+        },
+    )?;
+    let sb = fs
+        .ext4_superblock()
+        .context("native preparation currently requires ext4")?;
+    if sb.state != ffs_ondisk::ext4::EXT4_VALID_FS
+        || sb.has_incompat(ffs_ondisk::Ext4IncompatFeatures::RECOVER)
+    {
+        bail!("native preparation requires clean ext4; recover offline first");
+    }
+    Ok(fs)
+}
+
+fn build_native_prepare_output(
+    path: &Path,
+    basis_points: u32,
+    check: bool,
+) -> Result<NativePrepareOutput> {
+    let cx = cli_cx();
+    let (device, lock) = lock_native_prepare_image(path, check)?;
+    let fs = open_native_prepare_view(&cx, device)?;
+    let storage = if check {
+        fs.native_ext4_repair_storage(&cx)?
+    } else {
+        let prepared = fs.prepare_native_ext4_repair(&cx, basis_points)?;
+        // The consumed view may cache pre-conversion metadata. Discover from
+        // a new read-only device while retaining the original exclusive lock.
+        let device = FileByteDevice::open_read_only(path)?;
+        let locked = lock.0.metadata()?;
+        let reopened = device.file().metadata()?;
+        if (locked.dev(), locked.ino()) != (reopened.dev(), reopened.ino()) {
+            bail!("native preparation image path changed before discovery");
+        }
+        let discovered = open_native_prepare_view(&cx, device)?.native_ext4_repair_storage(&cx)?;
+        if discovered != prepared {
+            bail!("reopened native repair ownership differs from the prepared storage");
+        }
+        discovered
+    };
+    Ok(NativePrepareOutput {
+        image: path.to_path_buf(),
+        check_only: check,
+        storage_prepared: true,
+        protection_active: false,
+        storage,
+    })
+}
+
+pub fn native_prepare_cmd(path: &Path, basis_points: u32, check: bool, json: bool) -> Result<()> {
+    let output = match build_native_prepare_output(path, basis_points, check) {
+        Ok(output) => output,
+        Err(error) => {
+            if json {
+                println!(
+                    "{}",
+                    serde_json::json!({
+                        "status": "error",
+                        "image": path,
+                        "check_only": check,
+                        "error": format!("{error:#}"),
+                        "protection_active": false,
+                    })
+                );
+            }
+            return Err(error);
+        }
+    };
+    if json {
+        println!("{}", serde_json::to_string_pretty(&output)?);
+    } else {
+        println!("Native repair storage: {}", path.display());
+        println!("storage_prepared=true protection_active=false");
+        println!(
+            "Owner inode: {}; groups: {}; repair basis points: {}",
+            output.storage.owner_inode.0,
+            output.storage.tails.len(),
+            output.storage.repair_basis_points
+        );
+    }
+    Ok(())
+}
 
 /// A write plan rejected before any of its repair symbols or descriptors change.
 #[derive(Debug, Serialize)]
@@ -3222,6 +3367,64 @@ pub fn print_repair_output(json: bool, output: &RepairOutput) -> Result<()> {
 mod coordination_tests {
     use super::*;
     use ffs_repair::ownership::CoordinationRecord;
+
+    #[test]
+    fn native_prepare_check_holds_shared_lock_and_read_only_descriptor() {
+        use std::os::unix::fs::FileExt;
+
+        let image = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(image.path(), b"unchanged image").unwrap();
+        let (device, lock) = lock_native_prepare_image(image.path(), true).unwrap();
+        assert_eq!(
+            device.file().write_at(b"X", 0).unwrap_err().raw_os_error(),
+            Some(libc::EBADF),
+            "check must use an actual O_RDONLY descriptor"
+        );
+        let (other_device, other_lock) = lock_native_prepare_image(image.path(), true).unwrap();
+        assert!(lock_native_prepare_image(image.path(), false).is_err());
+        drop(device);
+        drop(lock);
+        assert!(lock_native_prepare_image(image.path(), false).is_err());
+        drop(other_device);
+        drop(other_lock);
+        let (_device, _lock) = lock_native_prepare_image(image.path(), false).unwrap();
+        assert_eq!(std::fs::read(image.path()).unwrap(), b"unchanged image");
+    }
+
+    #[test]
+    fn native_prepare_exclusive_lock_survives_consumed_device_and_releases_explicitly() {
+        let image = tempfile::NamedTempFile::new().unwrap();
+        let (device, lock) = lock_native_prepare_image(image.path(), false).unwrap();
+        let inherited = device.file().try_clone().unwrap();
+        drop(device);
+        assert!(lock_native_prepare_image(image.path(), true).is_err());
+        assert!(lock_native_prepare_image(image.path(), false).is_err());
+        drop(lock);
+        let (_device, _lock) = lock_native_prepare_image(image.path(), false).unwrap();
+        // An inherited open-file description must not extend the lock lifetime.
+        drop(inherited);
+    }
+
+    #[test]
+    fn native_prepare_refuses_nonregular_and_invalid_images_without_writes_or_lock_leaks() {
+        let directory = tempfile::tempdir().unwrap();
+        for check in [false, true] {
+            let error = build_native_prepare_output(directory.path(), 500, check).unwrap_err();
+            assert!(error.to_string().contains("regular image file"));
+        }
+        let image = tempfile::NamedTempFile::new().unwrap();
+        let bytes = vec![0xA5; 128 * 1024];
+        std::fs::write(image.path(), &bytes).unwrap();
+        for check in [false, true] {
+            let error = build_native_prepare_output(image.path(), 500, check).unwrap_err();
+            assert!(
+                format!("{error:#}").contains("not a recognized ext4 or btrfs filesystem"),
+                "invalid image must fail format admission: {error:#}"
+            );
+            assert_eq!(std::fs::read(image.path()).unwrap(), bytes);
+            let (_device, _lock) = lock_native_prepare_image(image.path(), false).unwrap();
+        }
+    }
 
     fn repair_rebuild_fixture() -> (PathBuf, ByteBlockDevice<FileByteDevice>, RepairGroupLayout) {
         let dir = tempfile::tempdir().unwrap().keep();

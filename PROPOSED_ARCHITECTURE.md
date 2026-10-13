@@ -40,6 +40,15 @@
 > cancellation/restart target remain `bd-11a8t`. The storage decision and loss
 > comparison are in specification §3.7.
 
+> **Native ext4 preparation (`bd-11a8t`):** `ffs-core::native_repair` stages
+> real per-group bitmap ownership through an immutable unwritten-extent inode.
+> It uses a private allocator and transaction adapter, then the existing internal
+> JBD2 checkpoint boundary; pure journal preflight precedes recovery-marker I/O.
+> `ffs native-prepare` owns the offline image lock across preparation and cold
+> discovery. Discovery verifies checksums, exact mappings and allocation rather
+> than treating readable old inode bytes as ownership. Prepared storage contains
+> no usable parity. Native encoding, freshness fencing and activation remain open.
+
 > **Ordinary mount worker ownership (`bd-11a8t`):** the CLI owns one
 > asupersync runtime with one scheduler thread and at most two blocking workers.
 > Scrub and periodic commit each run in a child region with a runtime-provided

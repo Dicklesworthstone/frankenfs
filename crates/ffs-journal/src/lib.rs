@@ -1527,27 +1527,20 @@ impl Jbd2Writer {
         )
     }
 
-    /// Commit a transaction to the journal region.
+    /// Check transaction admission without device I/O or changing writer state.
     ///
-    /// Layout produced:
-    /// 1. One or more descriptor blocks, each followed by its data blocks.
-    /// 2. Zero or more revoke blocks.
-    /// 3. One commit block.
+    /// Uses the same checks as [`Self::commit_transaction`], allowing callers
+    /// to reject a transaction before publishing recovery markers. This does
+    /// not reserve journal space or guarantee that the later write phase succeeds.
     ///
-    /// Returns `(sequence_number, write_stats)`.
-    /// Once the write phase starts, any error permanently aborts this writer.
-    /// Subsequent commits return an I/O error without touching the device;
-    /// recovery must precede opening a replacement writer. The sequence is
-    /// assigned when the write phase begins: preflight errors neither abort
-    /// the writer nor consume a sequence (bd-rnzr5). The caller must still
-    /// sync the commit record before acknowledging durability.
-    #[expect(clippy::too_many_lines)]
-    pub fn commit_transaction(
-        &mut self,
-        cx: &Cx,
+    /// # Errors
+    /// An aborted writer, unsupported block geometry, an oversized payload,
+    /// or insufficient remaining journal space.
+    pub fn preflight_transaction(
+        &self,
         dev: &dyn BlockDevice,
         txn: &Jbd2Transaction,
-    ) -> Result<(u32, Jbd2WriteStats)> {
+    ) -> Result<()> {
         if self.aborted {
             return Err(FfsError::Io(std::io::Error::other(
                 "JBD2 writer aborted after a failed commit; recovery is required",
@@ -1608,6 +1601,41 @@ impl Jbd2Writer {
         if needed > self.free_blocks() {
             return Err(FfsError::NoSpace);
         }
+        Ok(())
+    }
+
+    /// Commit a transaction to the journal region.
+    ///
+    /// Layout produced:
+    /// 1. One or more descriptor blocks, each followed by its data blocks.
+    /// 2. Zero or more revoke blocks.
+    /// 3. One commit block.
+    ///
+    /// Returns `(sequence_number, write_stats)`.
+    /// Once the write phase starts, any error permanently aborts this writer.
+    /// Subsequent commits return an I/O error without touching the device;
+    /// recovery must precede opening a replacement writer. The sequence is
+    /// assigned when the write phase begins: preflight errors neither abort
+    /// the writer nor consume a sequence (bd-rnzr5). The caller must still
+    /// sync the commit record before acknowledging durability.
+    #[expect(clippy::too_many_lines)]
+    pub fn commit_transaction(
+        &mut self,
+        cx: &Cx,
+        dev: &dyn BlockDevice,
+        txn: &Jbd2Transaction,
+    ) -> Result<(u32, Jbd2WriteStats)> {
+        self.preflight_transaction(dev, txn)?;
+        let bs = usize::try_from(dev.block_size())
+            .map_err(|_| FfsError::Format("block_size does not fit usize".to_owned()))?;
+        let tags_per_desc = max_tags_per_descriptor_for_format(
+            bs,
+            self.is_64bit,
+            self.has_checksum,
+            self.tag_format,
+        );
+        let entries_per_revoke =
+            max_revoke_entries_with_checksum(bs, self.is_64bit, self.has_checksum);
 
         // The sequence is assigned HERE, after every preflight check and at the
         // point of no return: from this line the write phase may reach the
@@ -5451,6 +5479,163 @@ mod tests {
     // -----------------------------------------------------------------------
     // JBD2 Writer tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn jbd2_explicit_preflight_preserves_commit_bytes_and_full_writer_state() {
+        let cx = test_cx();
+        let region = JournalRegion {
+            start: BlockNumber(16),
+            blocks: 5,
+        };
+        for (tag_format, is_64bit) in [
+            (Jbd2TagFormat::Legacy, false),
+            (Jbd2TagFormat::CsumV2, true),
+            (Jbd2TagFormat::CsumV3, true),
+        ] {
+            let dev = FailNthWriteBlockDevice::new(512, 64, usize::MAX);
+            let direct_dev = MemBlockDevice::new(512, 64);
+            let mut writer = Jbd2Writer::with_checksum_config(
+                region,
+                41,
+                tag_format != Jbd2TagFormat::Legacy,
+                0x1234_ABCD,
+            );
+            writer.tag_format = tag_format;
+            writer.set_64bit(is_64bit);
+            let mut txn = writer.begin_transaction();
+            let mut escaped = vec![0xA5; 512];
+            escaped[..4].copy_from_slice(&JBD2_MAGIC.to_be_bytes());
+            txn.add_write(BlockNumber(1), escaped);
+            txn.add_write(BlockNumber(2), vec![0xB6; 19]);
+            txn.add_revoke(BlockNumber(7));
+            let before = writer.clone();
+            let mut direct = writer.clone();
+
+            writer.preflight_transaction(&dev, &txn).expect("admitted");
+            assert_eq!(writer, before);
+            assert_eq!(dev.writes_seen.load(Ordering::Relaxed), 0);
+            assert!(dev.inner.blocks.read().is_empty());
+            let result = writer.commit_transaction(&cx, &dev, &txn).expect("commit");
+            assert_eq!(
+                result,
+                direct
+                    .commit_transaction(&cx, &direct_dev, &txn)
+                    .expect("direct commit")
+            );
+            assert_eq!(result.0, 41);
+            assert_eq!(
+                result.1,
+                Jbd2WriteStats {
+                    descriptor_blocks: 1,
+                    data_blocks: 2,
+                    revoke_blocks: 1,
+                    commit_blocks: 1,
+                }
+            );
+            assert_eq!(writer, direct);
+            assert_eq!(*dev.inner.blocks.read(), *direct_dev.blocks.read());
+            assert_eq!(writer.head(), 5);
+            assert_eq!(writer.next_seq(), 42);
+            assert_eq!(writer.free_blocks(), 0);
+
+            let full = writer.clone();
+            let stored = dev.inner.blocks.read().clone();
+            let io_count = dev.writes_seen.load(Ordering::Relaxed);
+            assert!(matches!(
+                writer.preflight_transaction(&dev, &txn),
+                Err(FfsError::NoSpace)
+            ));
+            assert!(matches!(
+                writer.commit_transaction(&cx, &dev, &txn),
+                Err(FfsError::NoSpace)
+            ));
+            assert_eq!(writer, full);
+            assert_eq!(dev.writes_seen.load(Ordering::Relaxed), io_count);
+            assert_eq!(*dev.inner.blocks.read(), stored);
+        }
+    }
+
+    #[test]
+    fn jbd2_explicit_preflight_preserves_geometry_and_payload_refusals() {
+        let cx = test_cx();
+        for (block_size, payload_size, revoke, checksum, diagnostic) in [
+            (8, None, false, false, "JBD2 headers"),
+            (12, Some(12), false, false, "JBD2 descriptor tags"),
+            (12, None, true, false, "JBD2 revoke entries"),
+            (16, None, false, true, "JBD2 commit checksum"),
+            (512, Some(513), false, false, "exceeds journal block size"),
+        ] {
+            let dev = FailNthWriteBlockDevice::new(block_size, 32, 1);
+            let mut writer = Jbd2Writer::with_checksum_config(
+                JournalRegion {
+                    start: BlockNumber(0),
+                    blocks: 8,
+                },
+                41,
+                checksum,
+                0,
+            );
+            let mut txn = writer.begin_transaction();
+            if let Some(size) = payload_size {
+                txn.add_write(BlockNumber(20), vec![0xA5; size]);
+            }
+            if revoke {
+                txn.add_revoke(BlockNumber(21));
+            }
+            let before = writer.clone();
+
+            let error = writer
+                .preflight_transaction(&dev, &txn)
+                .expect_err("refused");
+            assert!(
+                matches!(&error, FfsError::Format(message) if message.contains(diagnostic)),
+                "{error}"
+            );
+            let commit_error = writer
+                .commit_transaction(&cx, &dev, &txn)
+                .expect_err("commit refused");
+            assert_eq!(error.to_string(), commit_error.to_string());
+            assert_eq!(writer, before);
+            assert_eq!(dev.writes_seen.load(Ordering::Relaxed), 0);
+            assert!(dev.inner.blocks.read().is_empty());
+        }
+    }
+
+    #[test]
+    fn jbd2_explicit_preflight_preserves_aborted_writer_without_io() {
+        let cx = test_cx();
+        let dev = FailNthWriteBlockDevice::new(512, 32, 2);
+        let mut writer = Jbd2Writer::new(
+            JournalRegion {
+                start: BlockNumber(0),
+                blocks: 8,
+            },
+            41,
+        );
+        let mut txn = writer.begin_transaction();
+        txn.add_write(BlockNumber(20), vec![0xA5; 512]);
+        writer
+            .commit_transaction(&cx, &dev, &txn)
+            .expect_err("second write fails");
+        assert!(writer.aborted);
+        let before = writer.clone();
+        let stored = dev.inner.blocks.read().clone();
+        let io_count = dev.writes_seen.load(Ordering::Relaxed);
+
+        let error = writer
+            .preflight_transaction(&dev, &txn)
+            .expect_err("aborted writer");
+        assert!(
+            matches!(&error, FfsError::Io(error) if error.to_string().contains("writer aborted"))
+        );
+        let commit_error = writer
+            .commit_transaction(&cx, &dev, &txn)
+            .expect_err("commit refused");
+        assert_eq!(error.to_string(), commit_error.to_string());
+        assert_eq!(writer, before);
+        assert_eq!(dev.writes_seen.load(Ordering::Relaxed), io_count);
+        assert_eq!(*dev.inner.blocks.read(), stored);
+    }
 
     #[test]
     fn jbd2_writer_single_write_replays_correctly() {

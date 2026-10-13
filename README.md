@@ -598,6 +598,21 @@ restoration to a new image. Native per-group on-image reservation, default repai
 and the complete cancellation/restart lifecycle remain `bd-11a8t`; choosing
 sidecars for compatibility does not satisfy those native requirements.
 
+Native ext4 storage can be prepared explicitly while the image is unmounted:
+
+```bash
+ffs native-prepare image.ext4 --repair-basis-points 500 --json
+ffs native-prepare image.ext4 --check --json
+```
+
+Preparation requires clean ext4 with an empty supported internal journal and
+free tails in every allocation group. It reserves a 5% symbol budget by default,
+plus validation digest storage and three metadata blocks per group, through the immutable
+`.frankenfs-repair` file. Ordinary reads of that file return zeros. Preparation
+is journaled; `--check` validates persisted ownership without writing. Successful
+output reports `storage_prepared=true` and `protection_active=false`: encoding,
+crash-safe freshness and default native repair are still unfinished.
+
 ### Hostile-image safety (separate claim)
 
 `security.hostile_image` is its own release-gated claim. The adversarial threat model in `security/adversarial_image_threat_model.json` defines how malformed images, hostile proof bundles, tampered repair ledgers, resource-exhaustion seeds, unsupported mount options, and unsafe operator-command combinations must be rejected, quarantined, capped, downgraded to detection-only, or preserved as evidence. Each containment scenario records the resource class, limit value/unit, enforcement point, observed counters, cleanup policy, and confined artifact paths used by release gates.

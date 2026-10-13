@@ -602,6 +602,29 @@ repair_block_count = ceil(data_block_count * (overhead_ratio - 1.0))
 
 For 5% overhead on a 32,768-block group (128 MiB at 4K): `ceil(32768 * 0.05) = 1639 blocks (~6.4 MiB)`. These blocks MUST have persistent allocator ownership (including ext4 bitmap or Btrfs extent accounting) and MUST NOT be allocatable for file data.
 
+The ext4 preparation contract is an explicit offline `ffs native-prepare`
+operation. It reserves each complete tail through the root directory's
+`.frankenfs-repair` regular inode (uid/gid 0, mode 0400, immutable). Unwritten
+extents own the space while ordinary file reads return zero. Each tail contains
+one ownership block, validation storage for 32 bytes per group block, the
+repair-symbol allocation, and two descriptor blocks. Validation storage and
+the extra three blocks are separate from the configured 1–10% symbol budget.
+All tails MUST be free and outside filesystem metadata before staging. Bitmap,
+inode, extent-tree, namespace, free-count and ownership-header updates MUST
+publish as one recoverable JBD2 transaction. Capacity and format refusal MUST
+precede persistent recovery-marker writes. Preparation requires clean ext4 and
+an empty, supported internal journal; it does not replay an image as a side effect.
+
+Ownership block version `FFSNAT01` binds filesystem UUID, group and group count,
+owner inode and generation, repair basis points, physical tail start and length
+with CRC32C. Cold discovery MUST validate that identity, exact unwritten extent
+mapping, inode/extent checksums, materialized allocation bits, block accounting,
+and exclusion of filesystem metadata and aliased extent nodes. Preparation writes
+zero descriptors and MUST NOT authorize decoding or report active protection.
+Fresh/pending state and source-validation records must be outside encoded source
+coverage so updating them cannot invalidate their own parity. Btrfs ownership,
+encoding/freshness integration, and default mounted activation remain required.
+
 #### Compatibility Storage Decision (`bd-7zjfh`)
 
 Compatibility mode uses FFSRQSC2 sidecars and the existing

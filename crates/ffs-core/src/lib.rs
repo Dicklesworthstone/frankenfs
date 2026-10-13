@@ -12,6 +12,8 @@ pub mod file_handle;
 mod fs_mvcc_store;
 /// `FsOps` dispatch implementation for [`OpenFs`].
 mod fs_ops;
+/// Offline allocator ownership for native ext4 repair storage.
+pub mod native_repair;
 /// bd-bhh0i step 5: per-group allocator lock decomposition (default-off primitive).
 #[cfg(feature = "bhh0i_sharded_alloc")]
 mod sharded_alloc;
@@ -26679,6 +26681,14 @@ impl OpenFs {
                 Self::ext4_patch_needs_recovery(data, sb_off, has_csum, true);
             }
         }
+        let mut txn = journal.begin_transaction();
+        for (block, data) in writes.iter() {
+            txn.add_write(*block, data.clone());
+        }
+        // Reject an inadmissible transaction before changing even recovery
+        // metadata. In particular, a native reservation that cannot fit must
+        // leave the image byte-identical, without an empty live journal.
+        journal.preflight_transaction(&direct, &txn)?;
         self.ext4_write_needs_recovery(cx, &direct, true)?;
         {
             journal.mark_log_live(cx, &direct).map_err(|e| {
@@ -26686,10 +26696,6 @@ impl OpenFs {
                     "jbd2 flush boundary could not mark the log live: {e}"
                 )))
             })?;
-            let mut txn = journal.begin_transaction();
-            for (block, data) in writes.iter() {
-                txn.add_write(*block, data.clone());
-            }
             // Phase 1a — journal. The writer classifies its own failures: a
             // preflight rejection (NoSpace, format) did no I/O and left the
             // writer usable; a write-phase failure aborted the writer and may
@@ -73042,6 +73048,429 @@ mod tests {
             return;
         };
         assert!(clean, "image must be e2fsck-clean:\n{output}");
+    }
+
+    #[test]
+    fn ext4_jbd2_preflight_refusal_preserves_image_bd_11a8t() {
+        let cx = Cx::for_testing();
+        let Some((mut fs, dev, _tmp)) = open_writable_ext4_mkfs_with_device(32) else {
+            oracle_unavailable("ext4 image formatter");
+            return;
+        };
+        assert!(fs.attach_ext4_internal_jbd2_writer(&cx).unwrap());
+        let mut journal = fs.jbd2_writer.as_ref().unwrap().lock();
+        let before = dev.snapshot_bytes();
+        let head = journal.head();
+        let sequence = journal.next_seq();
+        let block_size = fs.block_size() as usize;
+        let mut too_large = BTreeMap::new();
+        // Payload blocks alone exhaust the region, before descriptor/commit
+        // overhead. The preflight must never reach any of these targets.
+        for block in 0..journal.free_blocks() {
+            too_large.insert(BlockNumber(block), vec![0xA6; block_size]);
+        }
+        let error = fs
+            .ext4_journal_and_checkpoint(&cx, &mut journal, &mut too_large)
+            .expect_err("oversized boundary must be refused");
+        assert!(error.to_string().contains("space"), "{error}");
+        assert!(
+            dev.snapshot_bytes() == before,
+            "NoSpace must not set needs_recovery or make an empty log live"
+        );
+        assert_eq!((journal.head(), journal.next_seq()), (head, sequence));
+
+        let mut malformed = BTreeMap::from([(BlockNumber(15), vec![0xB7; block_size + 1])]);
+        fs.ext4_journal_and_checkpoint(&cx, &mut journal, &mut malformed)
+            .expect_err("oversized payload must be refused");
+        assert!(
+            dev.snapshot_bytes() == before,
+            "format refusal mutated image"
+        );
+        assert_eq!((journal.head(), journal.next_seq()), (head, sequence));
+    }
+
+    fn native_preparation_options() -> OpenOptions {
+        OpenOptions {
+            mount_mode: MountMode::Native,
+            ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+            ..OpenOptions::default()
+        }
+    }
+
+    fn native_preparation_fixture()
+    -> Option<(OpenFs, TestDevice, tempfile::TempDir, std::path::PathBuf)> {
+        let (fs, dev, tmp, image) = open_ext4_mke2fs_features(64, "extent,^fast_commit")?;
+        let cx = Cx::for_testing();
+        let file = fs
+            .create(&cx, InodeNumber(2), OsStr::new("existing.bin"), 0o644, 0, 0)
+            .expect("create existing payload");
+        fs.write(&cx, file.ino, 0, &[0xA7; 8192])
+            .expect("write existing payload");
+        fs.flush_mvcc_to_device(&cx)
+            .expect("persist existing payload");
+        drop(fs);
+        let fs = OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options())
+            .expect("fresh native view");
+        Some((fs, dev, tmp, image))
+    }
+
+    #[test]
+    fn native_ext4_preparation_owns_tails_across_reopen_and_allocator() {
+        let Some((fs, dev, _tmp, image)) = native_preparation_fixture() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let prepared = fs
+            .prepare_native_ext4_repair(&cx, 500)
+            .expect("prepare native ownership");
+        assert_eq!(prepared.tails.len(), 8, "exercise an external extent node");
+        let bytes = dev.snapshot_bytes();
+        std::fs::write(&image, &bytes).unwrap();
+        let Some((clean, output)) = run_e2fsck(&image) else {
+            return;
+        };
+        assert!(
+            clean,
+            "native allocation owner must be e2fsck-clean:\n{output}"
+        );
+        let reopened =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options()).unwrap();
+        assert_eq!(
+            reopened
+                .native_ext4_repair_storage(&cx)
+                .expect("cold discovery"),
+            prepared
+        );
+        let inode = reopened.read_inode(&cx, prepared.owner_inode).unwrap();
+        let (header, _) = parse_extent_tree(&OpenFs::extent_root(&inode)).unwrap();
+        assert!(header.depth > 0);
+        assert_eq!(
+            reopened.read(&cx, prepared.owner_inode, 0, 1024).unwrap(),
+            vec![0; 1024],
+            "unwritten owner never discloses physical headers or stale free data"
+        );
+        let existing = reopened
+            .lookup(&cx, InodeNumber(2), OsStr::new("existing.bin"))
+            .unwrap();
+        assert_eq!(
+            reopened.read(&cx, existing.ino, 0, 8192).unwrap(),
+            vec![0xA7; 8192]
+        );
+        // Direct a real allocator at each reserved tail. Stage the probe so it
+        // does not leave unrelated allocated blocks in the prepared image.
+        let mut alloc = reopened.load_ext4_alloc_state(&cx).unwrap();
+        let base = reopened.direct_block_device_adapter();
+        let mut txn = reopened.mvcc_store.begin();
+        let staged = TransactionBlockAdapter {
+            base: &base,
+            tx: parking_lot::Mutex::new(&mut txn),
+        };
+        for tail in &prepared.tails {
+            let allocation = ffs_alloc::alloc_blocks(
+                &cx,
+                &staged,
+                &alloc.geo,
+                &mut alloc.groups,
+                1,
+                &AllocHint {
+                    goal_group: Some(tail.group),
+                    goal_block: Some(tail.start),
+                    ..AllocHint::default()
+                },
+            )
+            .unwrap();
+            assert!(
+                prepared
+                    .tails
+                    .iter()
+                    .all(|reserved| allocation.start.0 < reserved.start.0
+                        || allocation.start.0
+                            >= reserved.start.0
+                                + u64::from(reserved.validation_blocks)
+                                + u64::from(reserved.repair_blocks)
+                                + 3),
+                "allocator reused native owner space"
+            );
+        }
+        assert!(
+            dev.snapshot_bytes() == bytes,
+            "staged allocation probe wrote the image"
+        );
+    }
+
+    #[test]
+    fn native_ext4_preparation_refusals_leave_image_unchanged() {
+        let Some((fs, dev, _tmp, _image)) = native_preparation_fixture() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let before = dev.snapshot_bytes();
+        fs.prepare_native_ext4_repair(&cx, 99)
+            .expect_err("invalid overhead");
+        assert!(dev.snapshot_bytes() == before);
+        let compat =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &OpenOptions::default()).unwrap();
+        compat
+            .prepare_native_ext4_repair(&cx, 500)
+            .expect_err("compatibility mode is not conversion consent");
+        assert!(dev.snapshot_bytes() == before);
+        let fs =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options()).unwrap();
+        fs.prepare_native_ext4_repair(&cx, 500).expect("prepare");
+        let prepared = dev.snapshot_bytes();
+        let duplicate =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options()).unwrap();
+        duplicate
+            .prepare_native_ext4_repair(&cx, 500)
+            .expect_err("existing owner");
+        assert!(
+            dev.snapshot_bytes() == prepared,
+            "duplicate conversion altered image"
+        );
+
+        // A checksum-valid occupied bitmap bit anywhere in the proposed tails
+        // rejects the entire reservation before the first persistent write.
+        let occupied = TestDevice::from_vec(before);
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(occupied.clone()),
+            &native_preparation_options(),
+        )
+        .unwrap();
+        let mut alloc = fs.load_ext4_alloc_state(&cx).unwrap();
+        let target = alloc.geo.group_block_to_absolute(
+            GroupNumber(7),
+            alloc.geo.blocks_in_group(GroupNumber(7)) - 1,
+        );
+        let direct = fs.direct_block_device_adapter();
+        assert_eq!(
+            ffs_alloc::claim_blocks(&cx, &direct, &alloc.geo, &mut alloc.groups, target, 1)
+                .unwrap(),
+            1
+        );
+        OpenFs::ext4_write_group_descriptors_to(&cx, &alloc, &direct).unwrap();
+        let (blocks, inodes) = OpenFs::ext4_fold_group_free_totals(&alloc);
+        fs.ext4_write_superblock_free_totals(&cx, &direct, blocks, inodes)
+            .unwrap();
+        drop(fs);
+        let occupied_bytes = occupied.snapshot_bytes();
+        let fs = OpenFs::from_device(
+            &cx,
+            Box::new(occupied.clone()),
+            &native_preparation_options(),
+        )
+        .unwrap();
+        assert!(matches!(
+            fs.prepare_native_ext4_repair(&cx, 500),
+            Err(FfsError::NoSpace)
+        ));
+        assert!(
+            occupied.snapshot_bytes() == occupied_bytes,
+            "occupied-tail refusal changed image"
+        );
+    }
+
+    #[test]
+    fn native_ext4_preparation_rejects_invalid_journal_before_writes() {
+        let Some((fs, dev, _tmp, _image)) = native_preparation_fixture() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let segments = ext4_journal_segments_for_test(&fs, &cx).unwrap();
+        let offset = segments[0].start.0 as usize * fs.block_size() as usize;
+        let original = dev.snapshot_bytes();
+        // All faults leave the filesystem superblock clean. They must be
+        // discovered from the journal before needs_recovery is ever set.
+        for (name, field, value) in [
+            ("invalid magic", 0, 0),
+            ("wrong block size", 12, 4096),
+            ("wrong log start", 20, 2),
+            ("live log", 28, 1),
+            ("unknown feature", 40, 0x8000_0000),
+        ] {
+            let mut bytes = original.clone();
+            bytes[offset + field..offset + field + 4].copy_from_slice(&u32::to_be_bytes(value));
+            let damaged = TestDevice::from_vec(bytes.clone());
+            let fs = OpenFs::from_device(
+                &cx,
+                Box::new(damaged.clone()),
+                &native_preparation_options(),
+            )
+            .unwrap();
+            fs.prepare_native_ext4_repair(&cx, 500).expect_err(name);
+            assert!(
+                damaged.snapshot_bytes() == bytes,
+                "journal admission wrote image: {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_ext4_preparation_discovery_rejects_corrupt_ownership() {
+        let Some((fs, dev, _tmp, _image)) = native_preparation_fixture() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let prepared = fs.prepare_native_ext4_repair(&cx, 500).unwrap();
+        let original = dev.snapshot_bytes();
+        let fs =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options()).unwrap();
+        let alloc = fs.load_ext4_alloc_state(&cx).unwrap();
+        let loc = ffs_inode::locate_inode(prepared.owner_inode, &alloc.geo, &alloc.groups).unwrap();
+        let inode = fs.read_inode(&cx, prepared.owner_inode).unwrap();
+        let (_, tree) = parse_extent_tree(&OpenFs::extent_root(&inode)).unwrap();
+        let ExtentTree::Index(indices) = tree else {
+            panic!("external ownership tree required");
+        };
+        let node = indices[0].leaf_block;
+        let bs = fs.block_size() as usize;
+        let node_bytes = fs.read_block_vec(&cx, BlockNumber(node)).unwrap();
+        let max = u16::from_le_bytes(node_bytes[4..6].try_into().unwrap());
+        let damage_offsets = [
+            (
+                "ownership header",
+                prepared.tails[0].start.0 as usize * bs + 60,
+            ),
+            (
+                "owner inode checksum",
+                loc.block.0 as usize * bs + loc.byte_offset + 0x7C,
+            ),
+            (
+                "extent node checksum",
+                node as usize * bs + 12 + usize::from(max) * 12,
+            ),
+        ];
+        for (case, offset) in damage_offsets {
+            let mut damaged = original.clone();
+            damaged[offset] ^= 1;
+            let fs = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(damaged)),
+                &native_preparation_options(),
+            )
+            .unwrap();
+            fs.native_ext4_repair_storage(&cx).unwrap_err();
+            eprintln!("native ownership rejected {case}");
+        }
+        for inode_bit in [true, false] {
+            let changed = TestDevice::from_vec(original.clone());
+            let fs = OpenFs::from_device(
+                &cx,
+                Box::new(changed.clone()),
+                &native_preparation_options(),
+            )
+            .unwrap();
+            let mut alloc = fs.load_ext4_alloc_state(&cx).unwrap();
+            let (group, bit, bitmap_block) = if inode_bit {
+                let location = fs
+                    .ext4_superblock()
+                    .unwrap()
+                    .locate_inode(prepared.owner_inode)
+                    .unwrap();
+                let group = location.group.0 as usize;
+                alloc.groups[group].free_inodes += 1;
+                (
+                    group,
+                    location.index,
+                    alloc.groups[group].inode_bitmap_block,
+                )
+            } else {
+                let relative = node - u64::from(alloc.geo.first_data_block);
+                let group = (relative / u64::from(alloc.geo.blocks_per_group)) as usize;
+                alloc.groups[group].free_blocks += 1;
+                (
+                    group,
+                    (relative % u64::from(alloc.geo.blocks_per_group)) as u32,
+                    alloc.groups[group].block_bitmap_block,
+                )
+            };
+            let direct = fs.direct_block_device_adapter();
+            let mut bitmap = direct.read_block(&cx, bitmap_block).unwrap().into_inner();
+            assert!(bitmap_get(&bitmap, bit));
+            bitmap[bit as usize / 8] &= !(1 << (bit % 8));
+            direct.write_block(&cx, bitmap_block, &bitmap).unwrap();
+            OpenFs::ext4_write_group_descriptors_to(&cx, &alloc, &direct).unwrap();
+            let (blocks, inodes) = OpenFs::ext4_fold_group_free_totals(&alloc);
+            fs.ext4_write_superblock_free_totals(&cx, &direct, blocks, inodes)
+                .unwrap();
+            drop(fs);
+            let fs =
+                OpenFs::from_device(&cx, Box::new(changed), &native_preparation_options()).unwrap();
+            let error = fs
+                .native_ext4_repair_storage(&cx)
+                .expect_err("freed owner/node must not certify ownership");
+            assert!(
+                error.to_string().contains("not allocated"),
+                "group {group}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn native_ext4_preparation_crash_commit_recovered_by_e2fsck() {
+        let Some((fs, dev, _tmp, image)) = native_preparation_fixture() else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        fs.jbd2_crash_after_commit_sync
+            .store(true, Ordering::SeqCst);
+        let error = fs
+            .prepare_native_ext4_repair(&cx, 500)
+            .expect_err("stop after durable commit, before checkpoint");
+        assert!(
+            error.to_string().contains("crash after jbd2 commit sync"),
+            "{error}"
+        );
+        let crashed =
+            OpenFs::from_device(&cx, Box::new(dev.clone()), &native_preparation_options()).unwrap();
+        assert!(
+            matches!(
+                crashed.lookup(&cx, InodeNumber(2), OsStr::new(".frankenfs-repair")),
+                Err(FfsError::NotFound(_))
+            ),
+            "home namespace must still precede the transaction"
+        );
+        std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+        let repair = std::process::Command::new("e2fsck")
+            .args(["-fy"])
+            .arg(&image)
+            .output()
+            .expect("mandatory e2fsck oracle");
+        let output = format!(
+            "{}{}",
+            String::from_utf8_lossy(&repair.stdout),
+            String::from_utf8_lossy(&repair.stderr)
+        );
+        assert!(matches!(repair.status.code(), Some(0 | 1)), "{output}");
+        assert!(
+            output.to_ascii_lowercase().contains("recovering journal"),
+            "{output}"
+        );
+        let Some((clean, output)) = run_e2fsck(&image) else {
+            return;
+        };
+        assert!(clean, "replayed native ownership must be clean:\n{output}");
+        let recovered = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(std::fs::read(&image).unwrap())),
+            &native_preparation_options(),
+        )
+        .unwrap();
+        assert_eq!(
+            recovered
+                .native_ext4_repair_storage(&cx)
+                .expect("ownership recovered as a whole")
+                .tails
+                .len(),
+            8
+        );
+        let payload = recovered
+            .lookup(&cx, InodeNumber(2), OsStr::new("existing.bin"))
+            .unwrap();
+        assert_eq!(
+            recovered.read(&cx, payload.ino, 0, 8192).unwrap(),
+            vec![0xA7; 8192]
+        );
     }
 
     /// A durability boundary larger than the journal must still persist. The

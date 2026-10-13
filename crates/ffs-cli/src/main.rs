@@ -1192,6 +1192,22 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Reserve allocator-owned native repair storage in a clean ext4 image.
+    ///
+    /// This explicit offline conversion does not activate repair protection.
+    NativePrepare {
+        /// Path to the regular filesystem image.
+        image: PathBuf,
+        /// Space to reserve during preparation, in hundredths of a percent (500 means 5%).
+        #[arg(long, default_value_t = 500, value_parser = clap::value_parser!(u32).range(100..=1000))]
+        repair_basis_points: u32,
+        /// Validate existing ownership without modifying the image.
+        #[arg(long)]
+        check: bool,
+        /// Output in JSON format.
+        #[arg(long)]
+        json: bool,
+    },
     /// Mount a filesystem image via FUSE.
     Mount {
         /// Path to the filesystem image.
@@ -1577,6 +1593,7 @@ impl Command {
             Self::Dump { .. } => "dump",
             Self::Fsck { .. } => "fsck",
             Self::Repair { .. } => "repair",
+            Self::NativePrepare { .. } => "native-prepare",
             Self::Mount { .. } => "mount",
             Self::Scrub { .. } => "scrub",
             Self::Parity { .. } => "parity",
@@ -2515,6 +2532,12 @@ fn run() -> Result<()> {
                 max_threads,
             },
         ),
+        Command::NativePrepare {
+            image,
+            repair_basis_points,
+            check,
+            json,
+        } => cmd_repair::native_prepare_cmd(&image, repair_basis_points, check, json),
         Command::Mount {
             image,
             mountpoint,
@@ -17127,6 +17150,72 @@ mod tests {
                 matches!(other, Command::Repair { .. }),
                 "expected repair command"
             ),
+        }
+    }
+
+    #[test]
+    fn cli_parses_native_prepare_defaults() {
+        let cli = Cli::try_parse_from(["ffs", "native-prepare", "/tmp/fs.img"])
+            .expect("native preparation should parse");
+        assert_eq!(cli.command.name(), "native-prepare");
+        let Command::NativePrepare {
+            image,
+            repair_basis_points,
+            check,
+            json,
+        } = cli.command
+        else {
+            panic!("expected native-prepare command");
+        };
+        assert_eq!(image, PathBuf::from("/tmp/fs.img"));
+        assert_eq!(repair_basis_points, 500);
+        assert!(!check);
+        assert!(!json);
+    }
+
+    #[test]
+    fn cli_parses_native_prepare_check_and_overhead_boundaries() {
+        for value in ["100", "1000"] {
+            let cli = Cli::try_parse_from([
+                "ffs",
+                "native-prepare",
+                "/tmp/fs.img",
+                "--repair-basis-points",
+                value,
+                "--check",
+                "--json",
+            ])
+            .expect("native check and valid overhead should parse");
+            let Command::NativePrepare {
+                repair_basis_points,
+                check,
+                json,
+                ..
+            } = cli.command
+            else {
+                panic!("expected native-prepare command");
+            };
+            assert_eq!(repair_basis_points, value.parse::<u32>().unwrap());
+            assert!(check);
+            assert!(json);
+        }
+    }
+
+    #[test]
+    fn cli_rejects_native_prepare_missing_image_and_invalid_overhead() {
+        assert!(Cli::try_parse_from(["ffs", "native-prepare"]).is_err());
+        for value in ["0", "99", "1001", "-1", "five"] {
+            assert!(
+                Cli::try_parse_from([
+                    "ffs",
+                    "native-prepare",
+                    "/tmp/fs.img",
+                    "--repair-basis-points",
+                    value,
+                ])
+                .is_err(),
+                "invalid overhead {value} must be rejected"
+            );
         }
     }
 
