@@ -6,6 +6,8 @@
 //! This is ordered native mutation, not an atomic namespace transaction.
 
 mod names;
+mod mkdir;
+pub(crate) use mkdir::{MkdirArgs, run_mkdir};
 
 use super::super::{Directory, FatVolume, MAX_DIRECTORY_SLOTS};
 use super::{
