@@ -10420,7 +10420,7 @@ pub fn parse_chunk_item(data: &[u8], logical_offset: u64) -> Result<BtrfsChunkEn
 
     Ok(BtrfsChunkEntry {
         key: BtrfsKey {
-            objectid: BTRFS_CHUNK_TREE_OBJECTID,
+            objectid: BTRFS_FIRST_CHUNK_TREE_OBJECTID,
             item_type: BTRFS_ITEM_CHUNK,
             offset: logical_offset,
         },
@@ -25170,7 +25170,8 @@ mod tests {
             chunk_type_flags::BTRFS_BLOCK_GROUP_DATA | chunk_type_flags::BTRFS_BLOCK_GROUP_RAID0;
         let data = make_chunk_item_payload(8 * 1024 * 1024, 64 * 1024, chunk_type, 2);
         let parsed = parse_chunk_item(&data, 0x100_0000).expect("parse multi-stripe chunk");
-        assert_eq!(parsed.key.objectid, BTRFS_CHUNK_TREE_OBJECTID);
+        // CHUNK_ITEM keys use 256; 3 identifies the containing tree's root.
+        assert_eq!(parsed.key.objectid, 256);
         assert_eq!(parsed.key.item_type, BTRFS_ITEM_CHUNK);
         assert_eq!(parsed.key.offset, 0x100_0000);
         assert_eq!(parsed.length, 8 * 1024 * 1024);
@@ -25187,6 +25188,9 @@ mod tests {
         assert_eq!(parsed.stripes[1].devid, 2);
         assert_eq!(parsed.stripes[1].offset, 0x90_0000);
         assert_eq!(parsed.stripes[1].dev_uuid, [0xa1; 16]);
+        assert_eq!(parsed.to_item_bytes().unwrap(), data);
+        let encoded = parsed.to_bytes().expect("valid chunk key must serialize");
+        assert_eq!(parse_sys_chunk_array(&encoded).unwrap(), vec![parsed]);
 
         assert_insufficient_data(parse_chunk_item(&data[..47], 0x100_0000), 48, 0, 47);
 

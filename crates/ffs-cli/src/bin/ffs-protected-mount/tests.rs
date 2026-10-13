@@ -63,6 +63,7 @@ fn check_args(image: &Path, sidecar: &Path) -> Args {
         },
         check: true,
         rw: false,
+        commit_interval_secs: None,
         allow_other: false,
     }
 }
@@ -513,6 +514,85 @@ fn rw_requires_a_mount_and_keeps_kernel_writeback_disabled() {
             .to_string()
             .contains("--check")
     );
+}
+
+#[test]
+fn periodic_commit_options_require_writable_mount() {
+    let base = [
+        "ffs-protected-mount",
+        "image",
+        "archive",
+        "mount",
+        "--exclusive-image",
+        "--allow-repair",
+    ];
+    for seconds in ["0", "1", "30"] {
+        assert!(
+            Args::try_parse_from(base.into_iter().chain(["--commit-interval-secs", seconds,]))
+                .is_err()
+        );
+        let args = Args::try_parse_from(base.into_iter().chain([
+            "--rw",
+            "--commit-interval-secs",
+            seconds,
+        ]))
+        .unwrap();
+        assert_eq!(args.commit_interval_secs, Some(seconds.parse().unwrap()));
+    }
+    let defaults = Args::try_parse_from(base.into_iter().chain(["--rw"])).unwrap();
+    assert!(defaults.commit_interval_secs.is_none());
+    assert!(
+        Args::try_parse_from(
+            base.into_iter()
+                .chain(["--rw", "--commit-interval-secs", "-1",])
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn disabled_periodic_commit_retains_no_filesystem_owner() {
+    let fixture = Fixture::ext4();
+    let runtime = mount_worker::mount_background_runtime().unwrap();
+    let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+    let prepared = prepare(&cx, &fixture.writable_args()).unwrap();
+    let worker = mount_worker::start_periodic_commit(
+        &cx,
+        &runtime,
+        &prepared.fs,
+        Some(std::time::Duration::ZERO),
+        "disabled-test",
+    )
+    .unwrap();
+    assert!(worker.is_none());
+    prepared.finish(&cx).unwrap();
+    fixture.assert_healthy();
+}
+
+#[test]
+fn stopped_periodic_commit_releases_filesystem_before_final_checkpoint() {
+    let fixture = Fixture::ext4();
+    let runtime = mount_worker::mount_background_runtime().unwrap();
+    let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
+    let prepared = prepare(&cx, &fixture.writable_args()).unwrap();
+    let mut worker = mount_worker::start_periodic_commit(
+        &cx,
+        &runtime,
+        &prepared.fs,
+        Some(std::time::Duration::from_hours(24)),
+        "stop-test",
+    )
+    .unwrap()
+    .unwrap();
+    let written = [0x57; 8193];
+    create_written(&prepared, &cx, InodeNumber(2), &written);
+    worker.request_stop().unwrap();
+    worker.stop().unwrap();
+    prepared
+        .finish(&cx)
+        .expect("stopped worker must not retain the filesystem");
+    assert_published(&fixture, InodeNumber(2), &written);
+    fixture.assert_healthy();
 }
 
 #[test]

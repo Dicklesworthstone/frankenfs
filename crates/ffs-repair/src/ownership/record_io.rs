@@ -22,11 +22,25 @@ use std::path::{Path, PathBuf};
 const RETIRED_AT: &str = "1970-01-01T00:00:00Z";
 
 /// A bounded, exclusive read/compare/write transaction on one record.
-/// Closing the file releases the lock, including on errors and cancellation.
+/// Drop explicitly unlocks, including on errors and cancellation. Closing only
+/// this descriptor can leave a lock held by a fork-inherited duplicate.
 #[derive(Debug)]
 pub(super) struct RecordTransaction {
     record_path: PathBuf,
-    _lock: File,
+    lock: File,
+}
+
+impl Drop for RecordTransaction {
+    fn drop(&mut self) {
+        if let Err(error) = self.lock.unlock() {
+            tracing::warn!(
+                target: "ffs::repair::ownership",
+                path = %self.record_path.display(),
+                error = %error,
+                "ownership_transaction_unlock_failed"
+            );
+        }
+    }
 }
 
 impl RecordTransaction {
@@ -41,11 +55,12 @@ impl RecordTransaction {
         // Never wait indefinitely behind another process or hide cancellation
         // inside a blocking lock call. Unsupported locking is an error, too.
         lock.try_lock()?;
-        cx_checkpoint(cx, "acquire ownership transaction lock")?;
-        Ok(Self {
+        let transaction = Self {
             record_path: record_path.to_owned(),
-            _lock: lock,
-        })
+            lock,
+        };
+        cx_checkpoint(cx, "acquire ownership transaction lock")?;
+        Ok(transaction)
     }
 
     pub(super) fn path(&self) -> &Path {
@@ -296,6 +311,30 @@ mod tests {
                 .expect("retry after unlock"),
             AcquireResult::Acquired(_)
         ));
+    }
+
+    #[test]
+    fn dropped_transaction_releases_lock_with_cloned_descriptor_alive() {
+        let image = test_image();
+        let path = RepairOwnership::record_path_for(&image);
+        let cx = Cx::for_testing();
+        let transaction = RecordTransaction::begin(&cx, &path).expect("hold transaction");
+        // A forked child can retain this same open file description until
+        // exec. Keep a real duplicate alive without relying on spawn timing.
+        let retained = transaction.lock.try_clone().expect("duplicate lock file");
+        assert_eq!(
+            RecordTransaction::begin(&cx, &path)
+                .expect_err("active transaction must still exclude independent acquisition")
+                .kind(),
+            io::ErrorKind::WouldBlock
+        );
+
+        drop(transaction);
+
+        let next = RecordTransaction::begin(&cx, &path)
+            .expect("transaction drop must release the lock before the duplicate closes");
+        drop(retained);
+        drop(next);
     }
 
     #[test]

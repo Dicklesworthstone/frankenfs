@@ -584,6 +584,10 @@ clean, matching, single-device image; omit `--rw` for a read-only filesystem.
 Verified read repair can still write the backing image in that mode. All image
 I/O uses one protected device. Before source writes it durably invalidates old
 coverage; successful filesystem sync also publishes verified fresh protection.
+Writable protected mounts run periodic filesystem commits (5 seconds for ext4,
+30 seconds for btrfs), including when scrub is disabled. Use
+`--commit-interval-secs N` to override or zero to disable. These are scheduling
+intervals; a successful fsync remains the application's durability acknowledgement.
 Startup mismatches and interrupted write epochs require explicit offline
 reconciliation, never automatic rollback to old parity. Dirty sync scans the
 whole image, so this mode makes no low-latency fsync claim.

@@ -321,7 +321,7 @@ impl ScrubGuard {
         Ok(Self { stop, worker })
     }
 
-    fn request_stop(&self) -> Result<()> {
+    pub(super) fn request_stop(&self) -> Result<()> {
         self.stop.store(true, Ordering::Release);
         self.worker.request_stop()
     }

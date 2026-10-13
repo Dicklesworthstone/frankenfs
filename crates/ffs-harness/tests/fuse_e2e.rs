@@ -16900,6 +16900,157 @@ fn protected_sidecar_cli_btrfs_scrub_lifecycle_bd_11a8t() {
     protected_sidecar_cli_scrub_lifecycle("btrfs");
 }
 
+fn protected_sidecar_cli_periodic_commit(fstype: &str) {
+    if !fuse_available() {
+        return;
+    }
+    let Some(cli) = cli_proof_binary("FFS_PROTECTED_MOUNT_BIN") else {
+        return;
+    };
+    let Some(repair) = cli_proof_binary("FFS_IMAGE_REPAIR_BIN") else {
+        return;
+    };
+    if !command_available("e2fsck")
+        || !command_available("mkfs.btrfs")
+        || !command_available("btrfs")
+        || !command_available("timeout")
+    {
+        require_fuse_or_skip(
+            "protected periodic commit proof requires e2fsck, mkfs.btrfs, btrfs and timeout",
+        );
+        return;
+    }
+    let parent = PathBuf::from(std::env::var_os("FFS_CLI_ARTIFACT_DIR").unwrap());
+    fs::create_dir_all(&parent).unwrap();
+    let directory = tempfile::Builder::new()
+        .prefix(&format!("ffs-protected-periodic-{fstype}-"))
+        .tempdir_in(parent)
+        .unwrap()
+        .keep();
+    let initial = patterned_bytes(65_553, 239, 1);
+    let written = patterned_bytes(65_553, 241, 2);
+    let (image, sidecar, _, original_hash) =
+        protected_sidecar_fixture(&directory, &repair, fstype, &initial);
+    let original_archive_hash = repair_tail_sha256(&directory, &sidecar);
+    let mut writable =
+        BtrfsCliMount::spawn_command(&cli, &directory.join("writable"), |command, mountpoint| {
+            command
+                .arg(&image)
+                .arg(&sidecar)
+                .arg(mountpoint)
+                .args(["--exclusive-image", "--allow-repair", "--rw"])
+                .env("RUST_LOG", "ffs::cli::mount=debug");
+        });
+    writable.wait_until_ready_with_timeout(Duration::from_secs(120));
+    // No scrub and no interval override: exercise the actual format default.
+    // Keep the file open so release/flush cannot masquerade as the timer.
+    let mut output = fs::File::create(writable.mountpoint.join("written")).unwrap();
+    output.write_all(&written).unwrap();
+    let prior_log_bytes = fs::read(writable.directory.join("stderr.log"))
+        .unwrap()
+        .len();
+    let started = Instant::now();
+    loop {
+        let stderr = fs::read_to_string(writable.directory.join("stderr.log")).unwrap();
+        assert!(!stderr.contains("periodic_commit_failed"), "{stderr}");
+        assert!(writable.child.try_wait().unwrap().is_none(), "{stderr}");
+        assert!(mountinfo_has_mountpoint(&writable.mountpoint));
+        // Two completed ticks after write_all returns ensure at least one
+        // boundary started after the entire write. A timer that had captured
+        // only create/early write requests must not satisfy this wait. Idle
+        // receipts let the second tick attest to an already clean filesystem.
+        let completed_ticks = stderr
+            .get(prior_log_bytes..)
+            .unwrap_or_default()
+            .lines()
+            .filter(|line| {
+                line.contains("periodic_commit_applied") || line.contains("periodic_commit_idle")
+            })
+            .count();
+        if completed_ticks >= 2 {
+            assert!(stderr.contains("periodic_commit_applied"), "{stderr}");
+            let seconds = if fstype == "ext4" { 5 } else { 30 };
+            assert!(
+                stderr.contains(&format!("interval_secs={seconds}")),
+                "{stderr}"
+            );
+            btrfs_cli_record(
+                &directory,
+                &serde_json::json!({
+                    "event": "protected_periodic_commit_before_unmount",
+                    "elapsed_ms": started.elapsed().as_millis(),
+                    "explicit_fsync": false,
+                    "writer_handle_still_open": true,
+                    "stderr": stderr,
+                }),
+            );
+            break;
+        }
+        assert!(
+            started.elapsed() < Duration::from_secs(120),
+            "no periodic commit while writer remains open; image before={} now={}, archive before={} now={}; stderr={stderr}",
+            original_hash,
+            repair_tail_sha256(&directory, &image),
+            original_archive_hash,
+            repair_tail_sha256(&directory, &sidecar)
+        );
+        thread::sleep(Duration::from_millis(20));
+    }
+    // The completion event is only a scheduling receipt. Independent archive
+    // verification, native fsck and a second real mount prove persisted bytes.
+    // No further foreground mutation occurs while capturing this pair.
+    let captured_image = directory.join("periodic.image");
+    let captured_sidecar = directory.join("periodic.ffsrq");
+    fs::copy(&image, &captured_image).unwrap();
+    fs::copy(&sidecar, &captured_sidecar).unwrap();
+    assert_ne!(
+        repair_tail_sha256(&directory, &captured_image),
+        original_hash
+    );
+    assert_ne!(
+        repair_tail_sha256(&directory, &captured_sidecar),
+        original_archive_hash
+    );
+    protected_sidecar_check(
+        &directory,
+        &repair,
+        &captured_image,
+        &captured_sidecar,
+        fstype,
+    );
+    let mut reopened = BtrfsCliMount::spawn_protected(
+        &cli,
+        &directory.join("reopened"),
+        &captured_image,
+        &captured_sidecar,
+        false,
+    );
+    reopened.wait_until_ready_with_timeout(Duration::from_secs(120));
+    protected_sidecar_readback(&directory, &reopened.mountpoint.join("written"), &written);
+    protected_sidecar_readback(&directory, &reopened.mountpoint.join("initial"), &initial);
+    protected_scrub_normal_unmount(&mut reopened);
+    assert!(writable.child.try_wait().unwrap().is_none());
+    assert!(mountinfo_has_mountpoint(&writable.mountpoint));
+    drop(output);
+    protected_scrub_normal_unmount(&mut writable);
+    protected_sidecar_check(&directory, &repair, &image, &sidecar, fstype);
+    emit_scenario_result(
+        &format!("protected_sidecar_cli_{fstype}_periodic_commit_bd_11a8t"),
+        "PASS",
+        None,
+    );
+}
+
+#[test]
+fn protected_sidecar_cli_ext4_periodic_commit_bd_11a8t() {
+    protected_sidecar_cli_periodic_commit("ext4");
+}
+
+#[test]
+fn protected_sidecar_cli_btrfs_periodic_commit_bd_11a8t() {
+    protected_sidecar_cli_periodic_commit("btrfs");
+}
+
 fn assert_btrfs_cli_mount_reads(
     cli: &Path,
     directory: &Path,

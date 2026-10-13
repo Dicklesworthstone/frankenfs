@@ -142,7 +142,7 @@ use ffs_types::{BlockNumber, ByteOffset, GroupNumber, InodeNumber, MountMode};
 use mount_console::{
     MountConsoleConfig, MountConsoleCore, MountConsoleObservation, emit_mount_console,
 };
-use mount_worker::{MountIoWorker, mount_background_runtime};
+use mount_worker::{MountIoWorker, mount_background_runtime, start_periodic_commit};
 use serde::Serialize;
 use std::collections::BTreeSet;
 use std::env::VarError;
@@ -7821,62 +7821,6 @@ struct MountBackgroundScrubPlan {
     static_metadata: bool,
 }
 
-fn start_periodic_commit(
-    cx: &Cx,
-    runtime: &Arc<asupersync::runtime::Runtime>,
-    open_fs: &Arc<OpenFs>,
-    interval: Duration,
-    operation_id: &str,
-) -> Result<Option<MountIoWorker<()>>> {
-    if interval.is_zero() {
-        info!(
-            target: "ffs::cli::mount",
-            operation_id,
-            "periodic_commit_disabled"
-        );
-        return Ok(None);
-    }
-    let fs = Arc::clone(open_fs);
-    let operation_id = operation_id.to_owned();
-    let worker = MountIoWorker::start(cx, runtime, move |cx| {
-        info!(
-            target: "ffs::cli::mount",
-            operation_id = %operation_id,
-            interval_secs = interval.as_secs(),
-            "periodic_commit_started"
-        );
-        let tick = Duration::from_millis(100);
-        let mut waited = Duration::ZERO;
-        while cx.checkpoint().is_ok() {
-            std::thread::sleep(tick);
-            if cx.checkpoint().is_err() {
-                break;
-            }
-            waited += tick;
-            if waited < interval {
-                continue;
-            }
-            waited = Duration::ZERO;
-            match fs.periodic_commit(cx) {
-                Ok(true) => debug!(
-                    target: "ffs::cli::mount",
-                    operation_id = %operation_id,
-                    "periodic_commit_applied"
-                ),
-                Ok(false) => {}
-                Err(error) => warn!(
-                    target: "ffs::cli::mount",
-                    operation_id = %operation_id,
-                    error = %error,
-                    "periodic_commit_failed"
-                ),
-            }
-        }
-        Ok(())
-    })?;
-    Ok(Some(worker))
-}
-
 struct MountBackgroundScrubGuard {
     worker: MountIoWorker<ScrubDaemonMetrics>,
     operation_id: String,
@@ -8642,16 +8586,11 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
     let mut periodic_commit_guard = options
         .read_write
         .then(|| {
-            let default_secs = match &open_fs.flavor {
-                FsFlavor::Ext4(_) => 5,
-                FsFlavor::Btrfs(_) => 30,
-            };
-            let secs = options.commit_interval_secs.unwrap_or(default_secs);
             start_periodic_commit(
                 &background_cx,
                 &background_runtime,
                 &open_fs,
-                Duration::from_secs(secs),
+                options.commit_interval_secs.map(Duration::from_secs),
                 &operation_id,
             )
         })
@@ -11950,6 +11889,13 @@ mod tests {
 
         stamp_btrfs_test_tree_block_crc32c(&mut image, root_leaf_offset);
         stamp_btrfs_test_tree_block_crc32c(&mut image, fs_leaf_offset);
+        bind_test_btrfs_device_inventory(
+            &mut image,
+            logical_start,
+            logical_length,
+            physical_start,
+            &[root_leaf_offset, fs_leaf_offset],
+        );
 
         image
     }
@@ -11960,13 +11906,31 @@ mod tests {
     }
 
     fn build_test_btrfs_repair_image_bd_plamw() -> Vec<u8> {
-        let mut image = build_test_btrfs_image_with_root_inode_item();
+        build_test_btrfs_image_with_root_inode_item()
+    }
+
+    fn bind_test_btrfs_device_inventory(
+        image: &mut [u8],
+        logical_start: u64,
+        logical_length: u64,
+        physical_start: u64,
+        tree_offsets: &[usize],
+    ) {
+        // Keep the original repair fixture's chunk-tree location where it fits;
+        // the 64 KiB mapping fixtures instead use their final 16 KiB tree slot.
+        let chunk_tree_logical = logical_start
+            + logical_length
+                .min(0x3_4000)
+                .checked_sub(0x4_000)
+                .expect("test chunk must fit a tree block");
+        let chunk_tree =
+            map_btrfs_test_chunk_physical_offset(logical_start, physical_start, chunk_tree_logical);
         let fsid = [0x11; 16];
         let device_uuid = [0x22; 16];
         let device = ffs_ondisk::BtrfsDevItem {
             devid: 1,
-            total_bytes: 512 * 1024,
-            bytes_used: 512 * 1024,
+            total_bytes: u64::try_from(image.len()).expect("test image length fits"),
+            bytes_used: logical_length,
             io_align: 4096,
             io_width: 4096,
             sector_size: 4096,
@@ -11984,7 +11948,7 @@ mod tests {
         let sb = &mut image[super::BTRFS_SUPER_INFO_OFFSET
             ..super::BTRFS_SUPER_INFO_OFFSET + super::BTRFS_SUPER_INFO_SIZE];
         sb[0x20..0x30].copy_from_slice(&fsid);
-        sb[0x58..0x60].copy_from_slice(&0x3_0000_u64.to_le_bytes());
+        sb[0x58..0x60].copy_from_slice(&chunk_tree_logical.to_le_bytes());
         sb[0x70..0x78].copy_from_slice(&device.total_bytes.to_le_bytes());
         sb[0xA4..0xAC].copy_from_slice(&1_u64.to_le_bytes());
         sb[0xC9..0xC9 + device_bytes.len()].copy_from_slice(&device_bytes);
@@ -11993,13 +11957,11 @@ mod tests {
         let checksum = crc32c::crc32c(&sb[0x20..]);
         sb[..4].copy_from_slice(&checksum.to_le_bytes());
 
-        // The old parser-only fixture has no committed device inventory.
-        // Give these geometry tests a real CHUNK_TREE, so normal admission
-        // must bind the backing device and bootstrap stripe before the test.
-        let chunk_tree = 0x3_0000;
-        write_btrfs_leaf_header(&mut image, chunk_tree, 0x3_0000, 3, 2);
+        // Normal admission must bind both the backing device and bootstrap
+        // stripe to the committed CHUNK_TREE, including non-identity mappings.
+        write_btrfs_leaf_header(image, chunk_tree, chunk_tree_logical, 3, 2);
         write_btrfs_leaf_item(
-            &mut image,
+            image,
             chunk_tree,
             0,
             ffs_ondisk::btrfs::BTRFS_DEV_ITEMS_OBJECTID,
@@ -12011,22 +11973,25 @@ mod tests {
         image[chunk_tree + 3000..chunk_tree + 3000 + device_bytes.len()]
             .copy_from_slice(&device_bytes);
         write_btrfs_leaf_item(
-            &mut image,
+            image,
             chunk_tree,
             1,
             256,
             228,
-            0,
+            logical_start,
             3200,
             u32::try_from(chunk_bytes.len()).unwrap(),
         );
         image[chunk_tree + 3200..chunk_tree + 3200 + chunk_bytes.len()]
             .copy_from_slice(&chunk_bytes);
-        for tree in [0x4_000, 0x8_000, chunk_tree] {
+        for tree in tree_offsets
+            .iter()
+            .copied()
+            .chain(std::iter::once(chunk_tree))
+        {
             image[tree + 0x20..tree + 0x30].copy_from_slice(&fsid);
-            stamp_btrfs_test_tree_block_crc32c(&mut image, tree);
+            stamp_btrfs_test_tree_block_crc32c(image, tree);
         }
-        image
     }
 
     fn encode_btrfs_dir_index_entry(name: &[u8], child_objectid: u64, file_type: u8) -> Vec<u8> {
@@ -12385,6 +12350,17 @@ mod tests {
             b"hello from snapshot root\n",
             SNAPSHOT_FILE_DATA_LOGICAL,
         );
+        bind_test_btrfs_device_inventory(
+            &mut image,
+            0,
+            u64::try_from(image_size).expect("test image length fits"),
+            0,
+            &[
+                root_leaf_offset,
+                usize::try_from(SUBVOL_TREE_LOGICAL).expect("subvolume tree offset fits"),
+                usize::try_from(SNAPSHOT_TREE_LOGICAL).expect("snapshot tree offset fits"),
+            ],
+        );
 
         image
     }
@@ -12528,6 +12504,13 @@ mod tests {
 
         stamp_btrfs_test_tree_block_crc32c(&mut image, root_leaf_offset);
         stamp_btrfs_test_tree_block_crc32c(&mut image, fs_leaf_offset);
+        bind_test_btrfs_device_inventory(
+            &mut image,
+            0,
+            u64::try_from(image_size).expect("test image length fits"),
+            0,
+            &[root_leaf_offset, fs_leaf_offset],
+        );
 
         image
     }
@@ -19165,7 +19148,7 @@ mod tests {
                 &path,
                 true,
             );
-            assert!(second.writes_allowed);
+            assert!(second.writes_allowed, "{:?}", second.output);
             assert!(matches!(
                 second.output.status,
                 RepairCoordinationStatus::Claimed

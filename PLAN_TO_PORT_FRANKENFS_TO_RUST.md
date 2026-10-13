@@ -134,6 +134,9 @@ mounts. The read-write repair serializer exists, but CLI admission remains
 blocked until repair storage is reserved from the allocator. `bd-plamw` supplies
 the interim whole-plan allocation check and fail-closed startup/refusal path;
 `bd-11a8t` retains the allocator-owned storage and default lifecycle work.
+Explicit sidecar-protected writable mounts share the ordinary periodic filesystem
+commit worker (5 seconds ext4, 30 seconds btrfs, configurable or disabled), so
+successful timer boundaries also refresh their protection without caller fsync.
 Historical `bd-rchk6` closure does not establish that storage contract. Xfstests,
 mounted CI, and performance baselines remain tracked separately.
 

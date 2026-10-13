@@ -260,6 +260,73 @@
 > comparative benchmark. Native ownership, default activation and native
 > corruption/restart acceptance remain open on the original bead.
 
+> **Protected periodic durability (`bd-11a8t`, partial evidence 2026-10-13):**
+> writable `ffs-protected-mount` now shares the ordinary mount's periodic commit
+> worker: ext4 defaults to 5 seconds and Btrfs to 30 seconds, including without
+> scrub. `--commit-interval-secs` overrides the interval; zero disables it and
+> requires `--rw`. Both workers receive cancellation before either is drained,
+> and release their filesystem ownership before the final checkpoint. Scheduling
+> intervals do not establish a crash-loss deadline or replace acknowledged fsync.
+> The old protected binary reproduced the missing publication while an unsynced
+> writer remained open: RCH job `30062390921920513` failed its selected ext4
+> scenario after the 120-second observation window, with unchanged image and
+> archive hashes. The final harness strengthens the observation to two completed
+> ticks before capture, independent archive/native filesystem checks and a second
+> mounted readback; its live execution is recorded separately below.
+> Validation also exposed two concrete defects: chunk-item parsing synthesized
+> tree-root object ID 3 instead of chunk-item object ID 256, and dropping a repair
+> ownership transaction could retain its OS lock while a duplicate descriptor was
+> alive. The parser now emits 256 and passes strict serialization/readback. The
+> transaction explicitly unlocks at scope exit, including post-lock cancellation;
+> independent acquisition still fails while the transaction is active. Its real
+> duplicate-descriptor regression failed on old production in RCH job
+> `30062390921920525`, then passed with the fix. Nine synthetic CLI Btrfs fixtures
+> were corrected to supply the device identities and committed inventory already
+> required by normal admission; existing CLI assertions and rejection checks were
+> retained. A defective parser assertion was independently reviewed against the
+> format constants and corrected from 3 to literal 256, adding strict roundtrips.
+> Final affected-suite command: `cargo test -p ffs-repair -p ffs-cli -p ffs-btrfs
+> --lib --bin ffs-cli --bin ffs-protected-mount -- --nocapture`, through RCH on
+> `hz4`, job `30062390921920526`, remote/wrapper exit 0. Results: 623 repair,
+> 387 ordinary CLI, 57 protected CLI and 481 Btrfs tests passed; one existing
+> manual timing benchmark remains ignored. Source: `e5bc215f2f7c3598bc996a1eb3165a0152354d55`
+> plus eight-file overlay
+> `a645cbe84539b51cd865f0a07baff0e5e1887cb12d901fe3f2f5b14015a01907`.
+> Log: `/data/tmp/ffs-chartreusestone-resume37-final-tests.log`.
+> On the same source, strict workspace/all-targets Clippy passed with
+> `-D warnings` in RCH job `30062390921920527` on `vmi1227854`,
+> remote/wrapper exit 0. Log: `/data/tmp/ffs-chartreusestone-resume37-clippy6.log`.
+> Final workspace/all-targets `cargo check` passed on the same source in RCH job
+> `30062390921920529` on `vmi1227854`, remote/wrapper exit 0. Log:
+> `/data/tmp/ffs-chartreusestone-resume37-check-final2.log`.
+> Formatting and the dependency-cycle check also passed.
+> RCH job `30062390921920528` built both public binaries on `hz3`; worker and
+> retrieved SHA-256 hashes match: `ffs-protected-mount`
+> `c4f48fae994de10dde6a015b3c455e8e8a1e38ce948fb7f900d1856c58056b68`,
+> `ffs-image-repair`
+> `ca18cef6f0f7f4ca502a35a4f811a5396aca8d097c56619f10a8310c454a846a`.
+> RCH job `30062390921920530` passed all six real-FUSE protected CLI cases on
+> `hz3`: 6 passed, 0 failed/ignored, 290 filtered, 185.69 seconds. Command:
+> `cargo test -p ffs-harness --test fuse_e2e -- protected_sidecar_cli_
+> --nocapture --test-threads=1`, with required FUSE/native oracles and Cargo's
+> sudo runner. The new periodic cases kept the writer open without explicit
+> fsync; two default ticks completed in 10,727 ms for ext4 and 62,019 ms for
+> Btrfs. Captured image/archive pairs passed independent archive verification,
+> native filesystem checks and exact 65,553-byte readback through a second
+> mount before original shutdown. Existing corruption/restart and scrub cases
+> also passed. Across the suite, 16 mounts exited normally and two deliberate
+> startup-mismatch controls refused with exit 4; no forced/lazy unmount was used.
+> Log: `/data/tmp/ffs-chartreusestone-resume37-fuse-hz3.log`, SHA-256
+> `7ee633b029428f895081921747c0d2ca315482a035f2c28f7167ff10ee70f5df`.
+> Images, archives and mount outputs are retained in
+> `/data/tmp/ffs-chartreusestone-resume37-protected-hz3/`; both periodic capture
+> pairs independently hash-match the worker artifacts.
+> This is privileged, explicit compatibility-sidecar evidence; it does not
+> demonstrate native/default activation or survival of a power failure.
+> These controls do not complete native repair storage ownership, default
+> activation, durable pre-write freshness or native mounted corruption/restart
+> acceptance. The original bead remains open.
+
 > **Explicit regeneration (`bd-11a8t`, verified controls 2026-10-12):** the CLI
 > ext4 and Btrfs rebuild paths now use the existing descriptor high-water reader
 > to resume interrupted symbol publication. They freshly scan each source range

@@ -56,7 +56,13 @@
 
 > **Protected mount workers (`bd-11a8t`):** the CLI-private
 > `mount_worker` module shares that child-region and completion-drain ownership
-> with `ffs-protected-mount`. Its source scanner and parity maintenance receive
+> with `ffs-protected-mount`. Writable protected mounts also start the same
+> periodic commit implementation as ordinary mounts, with shared ext4 5-second
+> and Btrfs 30-second defaults. Both workers are cancelled before either is
+> drained; final cleanup begins only after both release their filesystem/device
+> ownership. Periodic boundaries publish the sidecar through the normal protected
+> device sync. The interval is not a hard deadline for slow or failing I/O.
+> Its source scanner and parity maintenance receive
 > the worker context. Local stop leaves the parent and sibling regions running;
 > unexpected cancellation, I/O failure or unwinding panic requests managed unmount. An
 > admission-time guard also covers cancellation before blocking work starts.

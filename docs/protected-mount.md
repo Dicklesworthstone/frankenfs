@@ -68,6 +68,16 @@ locks the replacement archive, atomically publishes it and synchronizes its pare
 directory. Publication errors propagate through the filesystem barrier. No second
 writable image descriptor bypasses this protocol.
 
+Writable mounts also run the ordinary filesystem's periodic commit worker, even
+when background scrub is disabled. Its default interval is 5 seconds for ext4 and
+30 seconds for btrfs. `--commit-interval-secs N` overrides that interval; zero
+explicitly disables the timer and requires `--rw`. Successful periodic commits
+publish fresh protection through the same filesystem and device barriers as fsync.
+The interval is a scheduling target, not a hard crash-loss bound: a commit can take
+longer or fail. Applications needing an acknowledgement must still call fsync.
+Failures are reported on stderr and retried on subsequent ticks. Set
+`RUST_LOG=ffs::cli::mount=debug` to observe successful periodic commits as well.
+
 For journalled ext4, the journal commit and home-block checkpoint remain separate
 durability barriers. Clearing the journal start and recovery flag then requires
 a final device sync: those cleanup writes must also have matching sidecar coverage
@@ -108,7 +118,7 @@ including source blocks no application reads and the short final block. It relea
 the device lock between requests and pauses between batches. Corrupt bytes use the
 device's ordinary verified repair path; a changed peer still forbids stale parity.
 The scanner never calls device sync, publishes a write epoch, or writes caller data.
-An explicit filesystem barrier remains responsible for publishing outstanding writes.
+Filesystem barriers, including periodic commits, publish outstanding writes.
 
 Each complete pass emits a `protected_source_scrub_pass` JSON line on stderr with
 the verified source-byte count and `consistency: "per_read_not_snapshot"`. Foreground
@@ -173,7 +183,8 @@ Cancellation is checked between reads and while waiting; blocking system calls a
 the device's existing group-recovery work do not carry a hard latency guarantee.
 
 Ctrl-C cancels startup or requests managed unmount. Shutdown retains device
-ownership until the managed filesystem relinquishes its operations. For a writable
+ownership until the managed filesystem relinquishes its operations, and cancels
+both periodic commit and scrub before draining either worker. For a writable
 filesystem it then invokes the full filesystem durability path before dropping
 `OpenFs`, so committed MVCC writes, allocation accounting and btrfs CoW roots are
 not lost by merely syncing the underlying device. A final device sync completes

@@ -49,6 +49,9 @@ struct Args {
     /// Allow filesystem writes. Durability barriers also refresh sidecar protection.
     #[arg(long, conflicts_with = "check")]
     rw: bool,
+    /// Periodic commit interval (ext4: 5s, btrfs: 30s); 0 disables the timer.
+    #[arg(long, requires = "rw", conflicts_with = "check")]
+    commit_interval_secs: Option<u64>,
     /// Let other users access the mount, subject to normal file permissions.
     #[arg(long, conflicts_with = "check")]
     allow_other: bool,
@@ -138,6 +141,9 @@ fn checked_paths(args: &Args) -> Result<(PathBuf, PathBuf, Option<PathBuf>)> {
     }
     if args.check && args.rw {
         bail!("--check cannot enable filesystem writes; omit --rw");
+    }
+    if args.commit_interval_secs.is_some() && !args.rw {
+        bail!("--commit-interval-secs requires --rw");
     }
     if args.check == args.mountpoint.is_some() {
         bail!("choose a mountpoint or --check, but not both");
@@ -293,6 +299,9 @@ fn serve(
     if args.check {
         return emit("checked_not_mounted", prepared);
     }
+    if (args.rw || args.scrub.interval_secs.is_some()) && runtime.is_none() {
+        bail!("protected background workers require their mount runtime");
+    }
     cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
     let mountpoint = prepared.mountpoint.as_ref().context("missing mountpoint")?;
     let config = MountConfig {
@@ -309,6 +318,18 @@ fn serve(
         flag.store(true, Ordering::Release);
     }
     let announce = emit("mounted", prepared);
+    let mut periodic = if announce.is_ok() && !flag.load(Ordering::Acquire) && args.rw {
+        mount_worker::start_periodic_commit(
+            cx,
+            runtime.context("protected periodic commit requires its mount runtime")?,
+            &prepared.fs,
+            args.commit_interval_secs
+                .map(std::time::Duration::from_secs),
+            "protected-mount",
+        )
+    } else {
+        Ok(None)
+    };
     let background = if announce.is_ok() && !flag.load(Ordering::Acquire) {
         args.scrub
             .interval_secs
@@ -326,27 +347,39 @@ fn serve(
     } else {
         Ok(None)
     };
-    if announce.is_err() || background.is_err() {
+    if announce.is_err() || periodic.is_err() || background.is_err() {
         flag.store(true, Ordering::Release);
     }
     let _metrics = handle.wait();
-    // A failed worker requests managed unmount. Join it before the caller can
-    // begin filesystem cleanup; never silently lose its error or device lease.
+    // Cancel both workers before draining either. Final filesystem cleanup must
+    // not race a periodic boundary or lose either worker's completion receipt.
+    let commit_cancel = match periodic.as_ref() {
+        Ok(Some(worker)) => worker.request_stop(),
+        _ => Ok(()),
+    };
+    let scrub_cancel = match background.as_ref() {
+        Ok(Some(guard)) => guard.request_stop(),
+        _ => Ok(()),
+    };
+    let commit_result = match periodic.as_mut() {
+        Ok(Some(worker)) => worker.stop().map(|_| ()),
+        _ => Ok(()),
+    };
     let scrub_result = match background {
         Ok(Some(mut guard)) => guard.stop(),
         Ok(None) => Ok(()),
         Err(error) => Err(error),
     };
-    // No worker was started if announcement failed, so this preserves all
-    // possible errors rather than dropping a concurrent scrub failure.
-    announce.and(scrub_result)
+    announce?;
+    drop(periodic?);
+    commit_cancel?;
+    scrub_cancel?;
+    commit_result.and(scrub_result)
 }
 
 fn run(args: &Args) -> Result<()> {
-    let runtime = args
-        .scrub
-        .interval_secs
-        .map(|_| mount_worker::mount_background_runtime())
+    let runtime = (args.rw || args.scrub.interval_secs.is_some())
+        .then(mount_worker::mount_background_runtime)
         .transpose()?;
     let cx = runtime.as_ref().map_or_else(Cx::for_request, |runtime| {
         runtime.request_cx_with_budget(asupersync::Budget::INFINITE)
@@ -389,6 +422,16 @@ fn run(args: &Args) -> Result<()> {
 }
 
 fn main() -> ExitCode {
+    // Shared mount workers report failed commits here as they do for ordinary
+    // mounts; debug logging also exposes successful periodic boundaries.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
+        )
+        .with_writer(std::io::stderr)
+        .with_ansi(false)
+        .init();
     match run(&Args::parse()) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {

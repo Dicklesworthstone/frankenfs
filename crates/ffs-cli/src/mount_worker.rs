@@ -2,8 +2,10 @@
 
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
+use ffs_core::{FsFlavor, OpenFs};
 use std::sync::Arc;
-use tracing::error;
+use std::time::Duration;
+use tracing::{debug, error, info, warn};
 
 /// CLI-owned runtime for the two synchronous background I/O workers. The core
 /// filesystem continues to receive contexts from its caller (bd-11a8t).
@@ -14,6 +16,75 @@ pub fn mount_background_runtime() -> Result<Arc<asupersync::runtime::Runtime>> {
         .build()
         .map(Arc::new)
         .context("failed to create mount background runtime")
+}
+
+/// Use the same periodic filesystem durability boundary for ordinary and
+/// sidecar-protected mounts. A protected device's sync also publishes current
+/// repair coverage. Zero explicitly disables the timer; fsync still works.
+pub fn start_periodic_commit(
+    cx: &Cx,
+    runtime: &Arc<asupersync::runtime::Runtime>,
+    open_fs: &Arc<OpenFs>,
+    interval: Option<Duration>,
+    operation_id: &str,
+) -> Result<Option<MountIoWorker<()>>> {
+    let interval = interval.unwrap_or_else(|| {
+        Duration::from_secs(match &open_fs.flavor {
+            FsFlavor::Ext4(_) => 5,
+            FsFlavor::Btrfs(_) => 30,
+        })
+    });
+    if interval.is_zero() {
+        info!(
+            target: "ffs::cli::mount",
+            operation_id,
+            "periodic_commit_disabled"
+        );
+        return Ok(None);
+    }
+    let fs = Arc::clone(open_fs);
+    let operation_id = operation_id.to_owned();
+    let worker = MountIoWorker::start(cx, runtime, move |cx| {
+        info!(
+            target: "ffs::cli::mount",
+            operation_id = %operation_id,
+            interval_secs = interval.as_secs(),
+            "periodic_commit_started"
+        );
+        let tick = Duration::from_millis(100);
+        let mut waited = Duration::ZERO;
+        while cx.checkpoint().is_ok() {
+            std::thread::sleep(tick);
+            if cx.checkpoint().is_err() {
+                break;
+            }
+            waited += tick;
+            if waited < interval {
+                continue;
+            }
+            waited = Duration::ZERO;
+            match fs.periodic_commit(cx) {
+                Ok(true) => debug!(
+                    target: "ffs::cli::mount",
+                    operation_id = %operation_id,
+                    "periodic_commit_applied"
+                ),
+                Ok(false) => debug!(
+                    target: "ffs::cli::mount",
+                    operation_id = %operation_id,
+                    "periodic_commit_idle"
+                ),
+                Err(error) => warn!(
+                    target: "ffs::cli::mount",
+                    operation_id = %operation_id,
+                    error = %error,
+                    "periodic_commit_failed"
+                ),
+            }
+        }
+        Ok(())
+    })?;
+    Ok(Some(worker))
 }
 
 /// A child region plus an independent completion receipt for its blocking I/O.
