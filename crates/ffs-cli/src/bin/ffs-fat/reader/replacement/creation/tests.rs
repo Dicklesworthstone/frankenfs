@@ -396,3 +396,5 @@ fn cli_create_is_explicit_and_does_not_change_replace_default() {
     }
     assert!(crate::Cli::try_parse_from(["ffs-fat", "replace", "image.img", "/NEW.BIN", "--source", "source.bin", "--create"]).is_err());
 }
+
+mod growth;
