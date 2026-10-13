@@ -358,16 +358,16 @@ fn deleted_slot_creation_preserves_live_successor_and_rejects_names_without_writ
         "/KEEP.BIN",
         "/CON",
         "/LPT1.TXT",
-        "/Mixed.txt",
-        "/long name.txt",
-        "/é.txt",
-        "/A.B.C",
         "/TRAIL.",
         "/",
         "/../NEW.TXT",
         "/KEEP.BIN/NEW.TXT",
     ] {
         assert!(prepare(&cx, &volume, path, &input, NOW).is_err(), "{path}");
+    }
+    // LFN publication controls exercise these formerly unsupported names.
+    for path in ["/Mixed.txt", "/long name.txt", "/é.txt", "/A.B.C"] {
+        assert!(prepare(&cx, &volume, path, &input, NOW).is_ok(), "{path}");
     }
     assert_eq!(image.device.state.lock().unwrap().operations, 0);
     let plan = prepare(&cx, &volume, "/NEW.TXT", &input, NOW).unwrap();
@@ -567,3 +567,4 @@ fn cli_create_is_explicit_and_does_not_change_replace_default() {
 }
 
 mod growth;
+mod long_names;
