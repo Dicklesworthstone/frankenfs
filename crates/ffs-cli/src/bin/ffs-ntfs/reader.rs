@@ -585,5 +585,7 @@ fn validate_identity(record: &NtfsFileRecord, number: u64, sequence: Option<u16>
     Ok(())
 }
 
-#[cfg(test)]
-mod tests;
+companion_bin_tests! {
+    #[cfg(test)]
+    mod tests;
+}

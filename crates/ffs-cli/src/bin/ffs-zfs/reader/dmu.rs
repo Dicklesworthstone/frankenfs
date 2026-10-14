@@ -77,7 +77,7 @@ impl Objects {
         self.config.pool_guid
     }
 
-    pub(in crate::reader) fn clone_mos(&self) -> Self {
+    pub(super) fn clone_mos(&self) -> Self {
         Self {
             pool: self.pool.clone(),
             config: self.config.clone(),
@@ -453,7 +453,9 @@ pub struct Dataset {
     pub root_birth: u64,
 }
 
-#[cfg(test)]
-mod embedded_tests;
-#[cfg(test)]
-mod tests;
+companion_bin_tests! {
+    #[cfg(test)]
+    mod embedded_tests;
+    #[cfg(test)]
+    mod tests;
+}

@@ -6,7 +6,7 @@
 //! candidate after the original physical checksum and transform both succeed.
 
 use super::Pool;
-use crate::reader::{
+use super::super::{
     BlockPointer, BlockRead, Cx, DATA_OFFSET, Dva, FfsError, LABEL_BYTES, RaidzColumnInfo,
     RaidzGroup, RaidzMember, RaidzReadInfo, Result, VdevConfig, checkpoint, corrupt, parse,
     unsupported,
@@ -18,13 +18,13 @@ use std::collections::BTreeSet;
 
 /// Keep the existing RAIDZ1 XOR path; only multi-parity uses field inversion.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub(in crate::reader) enum NativeMap {
+pub(in super::super) enum NativeMap {
     Single(Raidz1Map),
     Multiple(RaidzParityMap),
 }
 
 impl NativeMap {
-    pub(in crate::reader) fn new(
+    pub(in super::super) fn new(
         offset: u64,
         bytes: usize,
         ashift: u8,
@@ -44,7 +44,7 @@ impl NativeMap {
         }
     }
 
-    pub(in crate::reader) fn parity(&self) -> usize {
+    pub(in super::super) fn parity(&self) -> usize {
         match self {
             Self::Single(_) => 1,
             Self::Multiple(map) => map.parity(),
@@ -52,28 +52,28 @@ impl NativeMap {
     }
 
     #[cfg(test)]
-    pub(in crate::reader) fn aligned_bytes(&self) -> usize {
+    pub(in super::super) fn aligned_bytes(&self) -> usize {
         match self {
             Self::Single(map) => map.aligned_bytes(),
             Self::Multiple(map) => map.aligned_bytes(),
         }
     }
 
-    pub(in crate::reader) fn allocated_bytes(&self) -> u64 {
+    pub(in super::super) fn allocated_bytes(&self) -> u64 {
         match self {
             Self::Single(map) => map.allocated_bytes(),
             Self::Multiple(map) => map.allocated_bytes(),
         }
     }
 
-    pub(in crate::reader) fn columns(&self) -> &[RaidzColumn] {
+    pub(in super::super) fn columns(&self) -> &[RaidzColumn] {
         match self {
             Self::Single(map) => map.columns(),
             Self::Multiple(map) => map.columns(),
         }
     }
 
-    pub(in crate::reader) fn assemble(
+    pub(in super::super) fn assemble(
         &self,
         columns: &[Option<&[u8]>],
         erased: &[usize],

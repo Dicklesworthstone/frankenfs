@@ -801,5 +801,7 @@ fn filetime(ticks: u64) -> Result<SystemTime> {
     time.ok_or_else(|| unsupported("NTFS timestamp is outside host SystemTime range"))
 }
 
-#[cfg(test)]
-mod tests;
+companion_bin_tests! {
+    #[cfg(test)]
+    mod tests;
+}

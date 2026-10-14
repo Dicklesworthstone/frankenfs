@@ -5,7 +5,7 @@
 //! This is read-only extraction, without degraded import, DTL recovery or healing.
 
 mod gang;
-pub(in crate::reader) mod raidz;
+pub(super) mod raidz;
 
 use super::{
     BlockPointer, BlockRead, Cx, DATA_OFFSET, FfsError, Label, Leaf, NvList, RaidzGroup,

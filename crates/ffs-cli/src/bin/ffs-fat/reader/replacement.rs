@@ -13,8 +13,9 @@ pub use creation::{
     rmdir_in_volume, run_mkdir, run_rename, run_rmdir, run_unlink, unlink_in_volume,
 };
 
-use super::{FatTable, FatVolume, MAX_CHAIN_CLUSTERS, allocate, checkpoint, corrupt};
-use crate::ImageArgs;
+use super::{
+    FatTable, FatVolume, ImageArgs, MAX_CHAIN_CLUSTERS, allocate, checkpoint, corrupt,
+};
 use anyhow::{Context, Result, anyhow, bail};
 use asupersync::{Cx, types::CancelKind};
 use clap::Args;
@@ -728,29 +729,38 @@ fn replace(cx: &Cx, args: &ReplaceArgs) -> Result<serde_json::Value> {
             "--offline-image is required; advisory locks do not exclude kernel or unrelated writers"
         );
     }
-    let (image, image_stamp) = open_regular(&args.image.image, !args.dry_run)?;
     let (source, source_stamp) = open_regular(&args.source, false)?;
-    if (image_stamp.device, image_stamp.inode) == (source_stamp.device, source_stamp.inode) {
-        bail!("source must not alias the backing image");
-    }
     let source_device = ImageFile {
         file: source.clone(),
         length: source_stamp.length,
         writable: false,
     };
-    let volume = FatVolume::from_device(
-        cx,
-        Box::new(ImageFile {
-            file: image.clone(),
-            length: image_stamp.length,
-            writable: !args.dry_run,
-        }),
-        args.image.offset,
-        args.image
-            .length
-            .unwrap_or_else(|| image_stamp.length.saturating_sub(args.image.offset)),
-    )?
-    .with_oem_code_page(args.image.oem_code_page);
+    let (volume, image_check) = if args.image.sidecar.is_some() {
+        let img_meta = fs::symlink_metadata(&args.image.image)?;
+        if (img_meta.dev(), img_meta.ino()) == (source_stamp.device, source_stamp.inode) {
+            bail!("source must not alias the backing image");
+        }
+        (open_volume(cx, &args.image, !args.dry_run)?, None)
+    } else {
+        let (image, image_stamp) = open_regular(&args.image.image, !args.dry_run)?;
+        if (image_stamp.device, image_stamp.inode) == (source_stamp.device, source_stamp.inode) {
+            bail!("source must not alias the backing image");
+        }
+        let volume = FatVolume::from_device(
+            cx,
+            Box::new(ImageFile {
+                file: image.clone(),
+                length: image_stamp.length,
+                writable: !args.dry_run,
+            }),
+            args.image.offset,
+            args.image
+                .length
+                .unwrap_or_else(|| image_stamp.length.saturating_sub(args.image.offset)),
+        )?
+        .with_oem_code_page(args.image.oem_code_page);
+        (volume, Some((image, image_stamp)))
+    };
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("clock predates the Unix epoch")?
@@ -760,15 +770,54 @@ fn replace(cx: &Cx, args: &ReplaceArgs) -> Result<serde_json::Value> {
     } else {
         Replacement::prepare(cx, &volume, &args.path, &source_device, now)?
     };
-    stable(&image, &args.image.image, image_stamp)?;
+    if let Some((ref image, image_stamp)) = image_check {
+        stable(image, &args.image.image, image_stamp)?;
+    }
     stable(&source, &args.source, source_stamp)?;
     checkpoint(cx)?;
     if args.dry_run {
         return Ok(plan.report(&volume, true));
     }
-    plan.execute(cx, &volume, &source_device, || {
+    let mut report = plan.execute(cx, &volume, &source_device, || {
         stable(&source, &args.source, source_stamp)
-    })
+    })?;
+    if args.image.sidecar.is_some() {
+        report["sidecar_refreshed"] = true.into();
+    }
+    Ok(report)
+}
+
+struct SidecarDevice {
+    inner: ffs_repair::sidecar::live::SidecarImageDevice,
+    writable: bool,
+}
+
+impl ByteDevice for SidecarDevice {
+    fn len_bytes(&self) -> u64 {
+        self.inner.len_bytes()
+    }
+
+    fn read_exact_at(
+        &self,
+        cx: &Cx,
+        offset: ByteOffset,
+        bytes: &mut [u8],
+    ) -> ffs_error::Result<()> {
+        self.inner.read_exact_at(cx, offset, bytes)
+    }
+
+    fn write_all_at(&self, cx: &Cx, offset: ByteOffset, bytes: &[u8]) -> ffs_error::Result<()> {
+        checkpoint(cx)?;
+        if !self.writable {
+            return Err(FfsError::ReadOnly);
+        }
+        self.inner.write_all_at(cx, offset, bytes)
+    }
+
+    fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+        checkpoint(cx)?;
+        self.inner.sync(cx)
+    }
 }
 
 struct SliceSource<'a>(&'a [u8]);
@@ -808,6 +857,19 @@ impl ByteDevice for SliceSource<'_> {
 }
 
 pub fn open_volume(cx: &Cx, args: &ImageArgs, writable: bool) -> Result<FatVolume> {
+    if let Some(sidecar) = &args.sidecar {
+        let inner = ffs_repair::sidecar::live::SidecarImageDevice::open(cx, &args.image, sidecar)
+            .with_context(|| format!("admitting FAT image and sidecar {}", sidecar.display()))?;
+        let len = inner.len_bytes();
+        return Ok(FatVolume::from_device(
+            cx,
+            Box::new(SidecarDevice { inner, writable }),
+            args.offset,
+            args.length
+                .unwrap_or_else(|| len.saturating_sub(args.offset)),
+        )?
+        .with_oem_code_page(args.oem_code_page));
+    }
     let (image, image_stamp) = open_regular(&args.image, writable)?;
     Ok(FatVolume::from_device(
         cx,
@@ -954,5 +1016,7 @@ pub fn set_attr_in_volume(
     Ok(())
 }
 
-#[cfg(test)]
-mod tests;
+companion_bin_tests! {
+    #[cfg(test)]
+    mod tests;
+}

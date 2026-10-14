@@ -1,6 +1,12 @@
 #![forbid(unsafe_code)]
 //! Native read-only ZFS label inspection and explicit MOS-root extraction.
 
+macro_rules! companion_bin_tests {
+    ($($item:item)*) => {
+        $($item)*
+    };
+}
+
 mod file_commands;
 mod filesystem;
 mod reader;
@@ -23,6 +29,33 @@ struct Cli {
     #[command(subcommand)]
     command: Command,
 }
+struct ReadOnlySidecar(ffs_repair::sidecar::live::SidecarImageDevice);
+
+impl ffs_block::ByteDevice for ReadOnlySidecar {
+    fn len_bytes(&self) -> u64 {
+        self.0.len_bytes()
+    }
+    fn read_exact_at(
+        &self,
+        cx: &Cx,
+        offset: ffs_types::ByteOffset,
+        data: &mut [u8],
+    ) -> ffs_error::Result<()> {
+        self.0.read_exact_at(cx, offset, data)
+    }
+    fn write_all_at(
+        &self,
+        _cx: &Cx,
+        _offset: ffs_types::ByteOffset,
+        _data: &[u8],
+    ) -> ffs_error::Result<()> {
+        Err(FfsError::ReadOnly)
+    }
+    fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)
+    }
+}
+
 #[derive(Debug, Args)]
 struct ImageArgs {
     /// Immutable regular image containing a selected physical vdev.
@@ -34,11 +67,34 @@ struct ImageArgs {
     /// Acknowledge no kernel or external writer will modify the image.
     #[arg(long, required = true)]
     offline_image: bool,
+    /// Optional RaptorQ sidecar archive for read-verification and repair.
+    #[arg(long)]
+    sidecar: Option<PathBuf>,
 }
 impl ImageArgs {
     fn open(&self, cx: &Cx) -> Result<Leaf> {
         if !self.offline_image {
             bail!("--offline-image is required");
+        }
+        if let Some(sidecar) = &self.sidecar {
+            let device =
+                ffs_repair::sidecar::live::SidecarImageDevice::open(cx, &self.image, sidecar)
+                    .with_context(|| {
+                        format!(
+                            "admitting ZFS image {} with sidecar {}",
+                            self.image.display(),
+                            sidecar.display()
+                        )
+                    })?;
+            let size = ffs_block::ByteDevice::len_bytes(&device);
+            return Leaf::from_device(
+                cx,
+                Box::new(ReadOnlySidecar(device)),
+                self.offset,
+                self.length
+                    .unwrap_or_else(|| size.saturating_sub(self.offset)),
+            )
+            .context("opening sidecar-protected ZFS leaf");
         }
         Leaf::open(cx, &self.image, self.offset, self.length).context("opening selected ZFS leaf")
     }
@@ -527,6 +583,7 @@ mod tests {
                 offset: 0,
                 length: None,
                 offline_image: true,
+                sidecar: None,
             },
             auto_import: false,
             label: 0,
@@ -565,6 +622,7 @@ mod tests {
                 offset: 0,
                 length: None,
                 offline_image: true,
+                sidecar: None,
             },
             auto_import: false,
             label: 0,

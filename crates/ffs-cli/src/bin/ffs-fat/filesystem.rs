@@ -2,11 +2,11 @@
 //! Slot-based IDs are safe only for this immutable, mount-lifetime namespace;
 //! they are deliberately not a promise of FAT write or export-stable handles.
 
-use crate::reader::replacement::{
+use super::reader::replacement::{
     create_in_volume, mkdir_in_volume, rename_in_volume, rmdir_in_volume, set_attr_in_volume,
     sync_volume, truncate_in_volume, unlink_in_volume, write_range_in_volume,
 };
-use crate::reader::{Directory, Entry, FatVolume, FileChain, MAX_CHAIN_CLUSTERS, checkpoint};
+use super::reader::{Directory, Entry, FatVolume, FileChain, MAX_CHAIN_CLUSTERS, checkpoint};
 use asupersync::Cx;
 use ffs_core::{
     DirEntry, FileType, FsOps, FsStat, InodeAttr, ReaddirPage, RequestScope, SeekWhence,

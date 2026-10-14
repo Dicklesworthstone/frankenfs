@@ -117,7 +117,7 @@ struct RaidzMember {
 }
 
 impl VdevConfig {
-    pub(in crate::reader) fn total_data_bytes(&self) -> u64 {
+    pub(self) fn total_data_bytes(&self) -> u64 {
         if let Some(group) = &self.raidz_members {
             if group.parity == 0 {
                 return group
@@ -302,7 +302,7 @@ impl Label {
         Ok(config)
     }
 
-    pub(in crate::reader) fn striped_leaf_config(
+    pub(self) fn striped_leaf_config(
         &self,
         pool_guid: u64,
         expected_children: usize,
@@ -638,7 +638,7 @@ impl Leaf {
         )))
     }
 
-    pub(in crate::reader) fn validate_dva_for_vdev(
+    pub(self) fn validate_dva_for_vdev(
         &self,
         ashift: u8,
         allocated_bytes: u64,
@@ -694,5 +694,7 @@ impl Leaf {
     }
 }
 
-#[cfg(test)]
-mod tests;
+companion_bin_tests! {
+    #[cfg(test)]
+    mod tests;
+}

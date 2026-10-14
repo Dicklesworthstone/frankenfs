@@ -8,7 +8,9 @@
 mod check;
 pub mod replacement;
 
+use anyhow::Context as _;
 use asupersync::Cx;
+use clap::Args;
 use ffs_block::ByteDevice;
 use ffs_error::{FfsError, Result};
 use ffs_ondisk::fat::{
@@ -18,7 +20,36 @@ use ffs_types::{ByteOffset, ParseError};
 use std::collections::BTreeSet;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+
+#[derive(Debug, Args)]
+pub struct ImageArgs {
+    /// Offline regular image file. Do not use an image mounted by another writer.
+    pub image: PathBuf,
+    /// Byte offset of an explicitly selected volume inside the image.
+    #[arg(long, default_value_t = 0)]
+    pub offset: u64,
+    /// Maximum byte length of that volume; defaults to the remaining image.
+    #[arg(long)]
+    pub length: Option<u64>,
+    /// Short-name code page: ascii, 437, or 850. FAT does not store this choice.
+    #[arg(long, default_value = "ascii")]
+    pub oem_code_page: FatOemCodePage,
+    /// Optional RaptorQ sidecar archive for read-repair and post-commit refresh.
+    #[arg(long)]
+    pub sidecar: Option<PathBuf>,
+}
+
+impl ImageArgs {
+    pub fn open(&self, cx: &Cx) -> anyhow::Result<FatVolume> {
+        if self.sidecar.is_some() {
+            return replacement::open_volume(cx, self, false);
+        }
+        FatVolume::open(cx, &self.image, self.offset, self.length)
+            .map(|volume| volume.with_oem_code_page(self.oem_code_page))
+            .with_context(|| format!("opening offline FAT volume in {}", self.image.display()))
+    }
+}
 
 const MAX_DIRECTORY_SLOTS: usize = 65_536;
 pub const MAX_CHAIN_CLUSTERS: usize = 8_388_608;
@@ -684,5 +715,7 @@ impl<'a> FatTable<'a> {
     }
 }
 
-#[cfg(test)]
-mod tests;
+companion_bin_tests! {
+    #[cfg(test)]
+    mod tests;
+}

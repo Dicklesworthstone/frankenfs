@@ -298,5 +298,7 @@ impl WofStorage {
     }
 }
 
-#[cfg(test)]
-mod tests;
+companion_bin_tests! {
+    #[cfg(test)]
+    mod tests;
+}

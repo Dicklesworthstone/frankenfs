@@ -4,7 +4,7 @@
 //! object numbers identify hard links within this mount; generations are checked
 //! on every access. Host ownership/modes are synthetic, not a ZFS ACL projection.
 
-use crate::reader::dmu::zpl::Zpl;
+use super::reader::dmu::zpl::Zpl;
 use asupersync::Cx;
 use ffs_core::{DirEntry, FileType, FsOps, InodeAttr, ReaddirPage, RequestScope, SeekWhence};
 use ffs_error::{FfsError, Result};

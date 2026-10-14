@@ -5,7 +5,7 @@
 //! stream is decoded. Partial traversal never publishes bytes or cache entries.
 
 use super::Pool;
-use crate::reader::{
+use super::super::{
     BlockPointer, BlockRead, Cx, DATA_OFFSET, Dva, FfsError, LABEL_BYTES, Result, VdevConfig,
     checkpoint, corrupt, parse, unsupported,
 };
@@ -127,7 +127,7 @@ pub(super) fn header_allocations(config: &VdevConfig, pointer: &BlockPointer) ->
 }
 
 impl Pool {
-    pub(in crate::reader) fn read_gang_block(
+    pub(in super::super) fn read_gang_block(
         &self,
         cx: &Cx,
         config: &VdevConfig,
@@ -536,5 +536,7 @@ impl Pool {
     }
 }
 
-#[cfg(test)]
-mod tests;
+companion_bin_tests! {
+    #[cfg(test)]
+    mod tests;
+}

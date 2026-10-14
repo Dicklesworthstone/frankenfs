@@ -232,5 +232,7 @@ fn read_spans(
     checkpoint(cx)
 }
 
-#[cfg(test)]
-mod tests;
+companion_bin_tests! {
+    #[cfg(test)]
+    mod tests;
+}

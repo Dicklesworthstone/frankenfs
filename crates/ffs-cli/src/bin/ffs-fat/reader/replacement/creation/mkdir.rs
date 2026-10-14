@@ -12,7 +12,7 @@ use super::{
     Extension, Namespace, Slot, deleted_slot, directory_offsets, parent, patch_slot, read_slot,
     reserve_slots,
 };
-use crate::ImageArgs;
+use super::super::super::ImageArgs;
 use anyhow::{Context, Result, bail};
 use asupersync::{Cx, types::CancelKind};
 use clap::Args;
@@ -385,31 +385,42 @@ pub fn run_mkdir(cx: &Cx, args: &MkdirArgs) -> Result<serde_json::Value> {
     })
     .context("installing FAT mkdir cancellation handler; no mutation started")?;
 
-    let (image, image_stamp) = open_regular(&args.image.image, !args.dry_run)?;
-    let volume = super::super::super::FatVolume::from_device(
-        cx,
-        Box::new(ImageFile {
-            file: Arc::clone(&image),
-            length: image_stamp.length,
-            writable: !args.dry_run,
-        }),
-        args.image.offset,
-        args.image
-            .length
-            .unwrap_or_else(|| image_stamp.length.saturating_sub(args.image.offset)),
-    )?
-    .with_oem_code_page(args.image.oem_code_page);
+    let (volume, image_check) = if args.image.sidecar.is_some() {
+        (super::super::open_volume(cx, &args.image, !args.dry_run)?, None)
+    } else {
+        let (image, image_stamp) = open_regular(&args.image.image, !args.dry_run)?;
+        let volume = super::super::super::FatVolume::from_device(
+            cx,
+            Box::new(ImageFile {
+                file: Arc::clone(&image),
+                length: image_stamp.length,
+                writable: !args.dry_run,
+            }),
+            args.image.offset,
+            args.image
+                .length
+                .unwrap_or_else(|| image_stamp.length.saturating_sub(args.image.offset)),
+        )?
+        .with_oem_code_page(args.image.oem_code_page);
+        (volume, Some((image, image_stamp)))
+    };
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .context("clock predates the Unix epoch")?
         .as_secs();
     let plan = DirectoryCreation::prepare(cx, &volume, &args.path, now)?;
-    stable(&image, &args.image.image, image_stamp)?;
+    if let Some((ref image, image_stamp)) = image_check {
+        stable(image, &args.image.image, image_stamp)?;
+    }
     checkpoint(cx)?;
     if args.dry_run {
         return Ok(plan.report(&volume, true));
     }
-    plan.execute(cx, &volume)
+    let mut report = plan.execute(cx, &volume)?;
+    if args.image.sidecar.is_some() {
+        report["sidecar_refreshed"] = true.into();
+    }
+    Ok(report)
 }
 
 pub fn mkdir_in_volume(
@@ -851,22 +862,31 @@ pub fn run_unlink(cx: &Cx, args: &UnlinkArgs) -> Result<serde_json::Value> {
     if !args.offline_image {
         bail!("--offline-image is required");
     }
-    let (image, image_stamp) = open_regular(&args.image.image, !args.dry_run)?;
-    let volume = super::super::super::FatVolume::from_device(
-        cx,
-        Box::new(ImageFile {
-            file: Arc::clone(&image),
-            length: image_stamp.length,
-            writable: !args.dry_run,
-        }),
-        args.image.offset,
-        args.image
-            .length
-            .unwrap_or_else(|| image_stamp.length.saturating_sub(args.image.offset)),
-    )?
-    .with_oem_code_page(args.image.oem_code_page);
-    stable(&image, &args.image.image, image_stamp)?;
-    unlink_in_volume(cx, &volume, &args.path, args.dry_run)
+    let volume = if args.image.sidecar.is_some() {
+        super::super::open_volume(cx, &args.image, !args.dry_run)?
+    } else {
+        let (image, image_stamp) = open_regular(&args.image.image, !args.dry_run)?;
+        let volume = super::super::super::FatVolume::from_device(
+            cx,
+            Box::new(ImageFile {
+                file: Arc::clone(&image),
+                length: image_stamp.length,
+                writable: !args.dry_run,
+            }),
+            args.image.offset,
+            args.image
+                .length
+                .unwrap_or_else(|| image_stamp.length.saturating_sub(args.image.offset)),
+        )?
+        .with_oem_code_page(args.image.oem_code_page);
+        stable(&image, &args.image.image, image_stamp)?;
+        volume
+    };
+    let mut report = unlink_in_volume(cx, &volume, &args.path, args.dry_run)?;
+    if !args.dry_run && args.image.sidecar.is_some() {
+        report["sidecar_refreshed"] = true.into();
+    }
+    Ok(report)
 }
 
 pub fn run_rmdir(cx: &Cx, args: &RmdirArgs) -> Result<serde_json::Value> {
@@ -874,22 +894,31 @@ pub fn run_rmdir(cx: &Cx, args: &RmdirArgs) -> Result<serde_json::Value> {
     if !args.offline_image {
         bail!("--offline-image is required");
     }
-    let (image, image_stamp) = open_regular(&args.image.image, !args.dry_run)?;
-    let volume = super::super::super::FatVolume::from_device(
-        cx,
-        Box::new(ImageFile {
-            file: Arc::clone(&image),
-            length: image_stamp.length,
-            writable: !args.dry_run,
-        }),
-        args.image.offset,
-        args.image
-            .length
-            .unwrap_or_else(|| image_stamp.length.saturating_sub(args.image.offset)),
-    )?
-    .with_oem_code_page(args.image.oem_code_page);
-    stable(&image, &args.image.image, image_stamp)?;
-    rmdir_in_volume(cx, &volume, &args.path, args.dry_run)
+    let volume = if args.image.sidecar.is_some() {
+        super::super::open_volume(cx, &args.image, !args.dry_run)?
+    } else {
+        let (image, image_stamp) = open_regular(&args.image.image, !args.dry_run)?;
+        let volume = super::super::super::FatVolume::from_device(
+            cx,
+            Box::new(ImageFile {
+                file: Arc::clone(&image),
+                length: image_stamp.length,
+                writable: !args.dry_run,
+            }),
+            args.image.offset,
+            args.image
+                .length
+                .unwrap_or_else(|| image_stamp.length.saturating_sub(args.image.offset)),
+        )?
+        .with_oem_code_page(args.image.oem_code_page);
+        stable(&image, &args.image.image, image_stamp)?;
+        volume
+    };
+    let mut report = rmdir_in_volume(cx, &volume, &args.path, args.dry_run)?;
+    if !args.dry_run && args.image.sidecar.is_some() {
+        report["sidecar_refreshed"] = true.into();
+    }
+    Ok(report)
 }
 
 pub fn run_rename(cx: &Cx, args: &RenameArgs) -> Result<serde_json::Value> {
@@ -897,20 +926,29 @@ pub fn run_rename(cx: &Cx, args: &RenameArgs) -> Result<serde_json::Value> {
     if !args.offline_image {
         bail!("--offline-image is required");
     }
-    let (image, image_stamp) = open_regular(&args.image.image, !args.dry_run)?;
-    let volume = super::super::super::FatVolume::from_device(
-        cx,
-        Box::new(ImageFile {
-            file: Arc::clone(&image),
-            length: image_stamp.length,
-            writable: !args.dry_run,
-        }),
-        args.image.offset,
-        args.image
-            .length
-            .unwrap_or_else(|| image_stamp.length.saturating_sub(args.image.offset)),
-    )?
-    .with_oem_code_page(args.image.oem_code_page);
-    stable(&image, &args.image.image, image_stamp)?;
-    rename_in_volume(cx, &volume, &args.from, &args.to, args.dry_run)
+    let volume = if args.image.sidecar.is_some() {
+        super::super::open_volume(cx, &args.image, !args.dry_run)?
+    } else {
+        let (image, image_stamp) = open_regular(&args.image.image, !args.dry_run)?;
+        let volume = super::super::super::FatVolume::from_device(
+            cx,
+            Box::new(ImageFile {
+                file: Arc::clone(&image),
+                length: image_stamp.length,
+                writable: !args.dry_run,
+            }),
+            args.image.offset,
+            args.image
+                .length
+                .unwrap_or_else(|| image_stamp.length.saturating_sub(args.image.offset)),
+        )?
+        .with_oem_code_page(args.image.oem_code_page);
+        stable(&image, &args.image.image, image_stamp)?;
+        volume
+    };
+    let mut report = rename_in_volume(cx, &volume, &args.from, &args.to, args.dry_run)?;
+    if !args.dry_run && args.image.sidecar.is_some() {
+        report["sidecar_refreshed"] = true.into();
+    }
+    Ok(report)
 }

@@ -88,6 +88,9 @@ pub struct FormatArgs {
     /// No symlinks/special files; destination must be outside the source tree.
     #[arg(long, value_name = "DIRECTORY")]
     source_dir: Option<PathBuf>,
+    /// Optional RaptorQ sidecar archive to create after formatting completes.
+    #[arg(long)]
+    sidecar: Option<PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -738,6 +741,24 @@ pub fn create(cx: &Cx, args: &FormatArgs) -> Result<serde_json::Value> {
             .label
             .as_ref()
             .map(|label| String::from_utf8_lossy(label).trim_end().to_owned());
+        if let Some(sidecar) = &args.sidecar {
+            ffs_repair::sidecar::protect(
+                cx,
+                &args.image,
+                sidecar,
+                ffs_repair::sidecar::SidecarOptions {
+                    block_size: 4096,
+                    group_blocks: 16,
+                    repair_symbols: 4,
+                },
+            )
+            .with_context(|| {
+                format!(
+                    "FAT image initialized; creating RaptorQ sidecar {} failed",
+                    sidecar.display()
+                )
+            })?;
+        }
         Ok(serde_json::json!({
             "operation": "create_new_image",
             "created_new_image": true,
@@ -759,7 +780,8 @@ pub fn create(cx: &Cx, args: &FormatArgs) -> Result<serde_json::Value> {
             "copied_directories": plan.population.as_ref().map_or(1, population::Population::directories),
             "copied_bytes": plan.population.as_ref().map_or(0, population::Population::bytes),
             "payload_verification": plan.population.as_ref().map(|_| "sha256_via_native_reader"),
-            "verification": verification
+            "verification": verification,
+            "sidecar_refreshed": args.sidecar.is_some()
         }))
     };
     finish().with_context(|| {

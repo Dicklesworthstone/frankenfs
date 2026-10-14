@@ -1,6 +1,12 @@
 #![forbid(unsafe_code)]
 //! Native, read-only NTFS 3.1 inspection, directory traversal and stream extraction.
 
+macro_rules! companion_bin_tests {
+    ($($item:item)*) => {
+        $($item)*
+    };
+}
+
 mod ea_name;
 mod reader;
 mod stream_name;
@@ -26,6 +32,33 @@ struct Cli {
     command: Command,
 }
 
+struct ReadOnlySidecar(ffs_repair::sidecar::live::SidecarImageDevice);
+
+impl ffs_block::ByteDevice for ReadOnlySidecar {
+    fn len_bytes(&self) -> u64 {
+        self.0.len_bytes()
+    }
+    fn read_exact_at(
+        &self,
+        cx: &Cx,
+        offset: ffs_types::ByteOffset,
+        data: &mut [u8],
+    ) -> ffs_error::Result<()> {
+        self.0.read_exact_at(cx, offset, data)
+    }
+    fn write_all_at(
+        &self,
+        _cx: &Cx,
+        _offset: ffs_types::ByteOffset,
+        _data: &[u8],
+    ) -> ffs_error::Result<()> {
+        Err(ffs_error::FfsError::ReadOnly)
+    }
+    fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+        cx.checkpoint().map_err(|_| ffs_error::FfsError::Cancelled)
+    }
+}
+
 #[derive(Debug, Args)]
 struct ImageArgs {
     image: PathBuf,
@@ -38,6 +71,9 @@ struct ImageArgs {
     /// Confirm the image is immutable and not mounted by another writer.
     #[arg(long, required = true)]
     offline_image: bool,
+    /// Optional RaptorQ sidecar archive for read-verification and repair.
+    #[arg(long)]
+    sidecar: Option<PathBuf>,
 }
 impl ImageArgs {
     fn open(&self, cx: &Cx) -> Result<NtfsVolume> {
@@ -45,6 +81,31 @@ impl ImageArgs {
             bail!(
                 "--offline-image is required; an advisory lock does not prevent unrelated writers"
             );
+        }
+        if let Some(sidecar) = &self.sidecar {
+            let device =
+                ffs_repair::sidecar::live::SidecarImageDevice::open(cx, &self.image, sidecar)
+                    .with_context(|| {
+                        format!(
+                            "admitting NTFS image {} with sidecar {}",
+                            self.image.display(),
+                            sidecar.display()
+                        )
+                    })?;
+            let size = ffs_block::ByteDevice::len_bytes(&device);
+            return NtfsVolume::from_device(
+                cx,
+                Box::new(ReadOnlySidecar(device)),
+                self.offset,
+                self.length
+                    .unwrap_or_else(|| size.saturating_sub(self.offset)),
+            )
+            .with_context(|| {
+                format!(
+                    "opening sidecar-protected NTFS image {}",
+                    self.image.display()
+                )
+            });
         }
         NtfsVolume::open(cx, &self.image, self.offset, self.length)
             .with_context(|| format!("opening offline NTFS image {}", self.image.display()))

@@ -1,15 +1,22 @@
 #![forbid(unsafe_code)]
 //! Experimental native FAT16/FAT32 reader, formatter and offline file replacement.
 
+macro_rules! companion_bin_tests {
+    ($($item:item)*) => {
+        $($item)*
+    };
+}
+
 mod filesystem;
 mod formatter;
 mod reader;
 
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
-use clap::{Args, Parser, Subcommand};
+use clap::{Parser, Subcommand};
 use ffs_error::FfsError;
-use ffs_ondisk::fat::{FatKind, FatOemCodePage};
+use ffs_ondisk::fat::FatKind;
+pub use reader::ImageArgs;
 use reader::{Directory, Entry, FatVolume, checkpoint};
 use std::collections::BTreeSet;
 use std::io::{self, Write};
@@ -23,29 +30,6 @@ use std::path::PathBuf;
 struct Cli {
     #[command(subcommand)]
     command: Command,
-}
-
-#[derive(Debug, Args)]
-struct ImageArgs {
-    /// Offline regular image file. Do not use an image mounted by another writer.
-    image: PathBuf,
-    /// Byte offset of an explicitly selected volume inside the image.
-    #[arg(long, default_value_t = 0)]
-    offset: u64,
-    /// Maximum byte length of that volume; defaults to the remaining image.
-    #[arg(long)]
-    length: Option<u64>,
-    /// Short-name code page: ascii, 437, or 850. FAT does not store this choice.
-    #[arg(long, default_value = "ascii")]
-    oem_code_page: FatOemCodePage,
-}
-
-impl ImageArgs {
-    fn open(&self, cx: &Cx) -> Result<FatVolume> {
-        FatVolume::open(cx, &self.image, self.offset, self.length)
-            .map(|volume| volume.with_oem_code_page(self.oem_code_page))
-            .with_context(|| format!("opening offline FAT volume in {}", self.image.display()))
-    }
 }
 
 /// Root-to-entry chain of volume-relative native short-entry byte offsets.
@@ -537,6 +521,7 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ffs_ondisk::fat::FatOemCodePage;
 
     #[test]
     fn cli_requires_an_explicit_supported_oem_code_page() {
@@ -812,5 +797,104 @@ mod tests {
                 Err(FfsError::Corruption { block: 8, .. })
             ));
         }
+    }
+
+    #[test]
+    fn fat_cli_mutations_refresh_raptorq_sidecar_and_repair_corruption_bd_q19uk() {
+        let cx = Cx::for_testing();
+        let dir = tempfile::tempdir().unwrap();
+        let image = dir.path().join("volume.fat");
+        let sidecar = dir.path().join("volume.ffs-rq");
+
+        // 1. Format with --sidecar
+        let cli = Cli::try_parse_from([
+            "ffs-fat",
+            "format",
+            image.to_str().unwrap(),
+            "--size-mib",
+            "8",
+            "--kind",
+            "fat16",
+            "--sidecar",
+            sidecar.to_str().unwrap(),
+        ])
+        .unwrap();
+        let Command::Format { options } = cli.command else {
+            panic!("format");
+        };
+        let report = formatter::run(&cx, &options).unwrap();
+        assert_eq!(report["sidecar_refreshed"], true);
+        assert!(
+            ffs_repair::sidecar::verify(&cx, &image, &sidecar)
+                .unwrap()
+                .is_healthy()
+        );
+
+        // 2. mkdir --sidecar refreshes sidecar
+        let cli = Cli::try_parse_from([
+            "ffs-fat",
+            "mkdir",
+            image.to_str().unwrap(),
+            "/docs",
+            "--offline-image",
+            "--sidecar",
+            sidecar.to_str().unwrap(),
+        ])
+        .unwrap();
+        let Command::Mkdir { options } = cli.command else {
+            panic!("mkdir");
+        };
+        let mkdir_rep = reader::replacement::run_mkdir(&cx, &options).unwrap();
+        assert_eq!(mkdir_rep["sidecar_refreshed"], true);
+        assert!(
+            ffs_repair::sidecar::verify(&cx, &image, &sidecar)
+                .unwrap()
+                .is_healthy()
+        );
+
+        // 3. rename --sidecar refreshes sidecar
+        let cli = Cli::try_parse_from([
+            "ffs-fat",
+            "rename",
+            image.to_str().unwrap(),
+            "/docs",
+            "/archive",
+            "--offline-image",
+            "--sidecar",
+            sidecar.to_str().unwrap(),
+        ])
+        .unwrap();
+        let Command::Rename { options } = cli.command else {
+            panic!("rename");
+        };
+        let rename_rep = reader::replacement::run_rename(&cx, &options).unwrap();
+        assert_eq!(rename_rep["sidecar_refreshed"], true);
+        assert!(
+            ffs_repair::sidecar::verify(&cx, &image, &sidecar)
+                .unwrap()
+                .is_healthy()
+        );
+
+        // 4. rmdir --sidecar refreshes sidecar
+        let cli = Cli::try_parse_from([
+            "ffs-fat",
+            "rmdir",
+            image.to_str().unwrap(),
+            "/archive",
+            "--offline-image",
+            "--sidecar",
+            sidecar.to_str().unwrap(),
+        ])
+        .unwrap();
+        let Command::Rmdir { options } = cli.command else {
+            panic!("rmdir");
+        };
+        let rmdir_rep = reader::replacement::run_rmdir(&cx, &options).unwrap();
+        assert_eq!(rmdir_rep["sidecar_refreshed"], true);
+        assert!(
+            ffs_repair::sidecar::verify(&cx, &image, &sidecar)
+                .unwrap()
+                .is_healthy()
+        );
     }
 }
