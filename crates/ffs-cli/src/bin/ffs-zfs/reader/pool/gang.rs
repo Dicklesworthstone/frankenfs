@@ -50,9 +50,9 @@ impl Budget {
 struct Admission {
     budget: Budget,
     headers: BTreeMap<HeaderIdentity, BlockRead>,
-    // All admitted pointers use one native top-level vdev address space.
+    // Track gang allocations per native top-level vdev ID.
     // Header extents use their own allocation, never aggregate tree ASIZE.
-    allocations: BTreeMap<u64, u64>,
+    allocations: BTreeMap<u32, BTreeMap<u64, u64>>,
 }
 
 impl Admission {
@@ -61,20 +61,19 @@ impl Admission {
             .offset
             .checked_add(bytes)
             .ok_or_else(|| corrupt("gang allocation extent overflow"))?;
-        if self
-            .allocations
+        let vdev_map = self.allocations.entry(dva.vdev).or_default();
+        if vdev_map
             .range(..=dva.offset)
             .next_back()
             .is_some_and(|(_, previous_end)| *previous_end > dva.offset)
-            || self
-                .allocations
+            || vdev_map
                 .range(dva.offset..)
                 .next()
                 .is_some_and(|(next_start, _)| *next_start < end)
         {
             return Err(corrupt("gang tree repeats or overlaps an allocation"));
         }
-        self.allocations.insert(dva.offset, end);
+        vdev_map.insert(dva.offset, end);
         Ok(())
     }
 }
@@ -85,7 +84,9 @@ pub(super) fn header_allocation(config: &VdevConfig) -> Result<u64> {
     if !(9..=16).contains(&config.ashift) {
         return Err(corrupt("invalid gang-header sector geometry"));
     }
-    let sectors = if let Some(group) = &config.raidz_members {
+    let sectors = if let Some(group) = &config.raidz_members
+        && group.parity != 0
+    {
         if !(1..=3).contains(&group.parity)
             || !(group.parity + 1..=8).contains(&group.members.len())
         {
@@ -98,10 +99,25 @@ pub(super) fn header_allocation(config: &VdevConfig) -> Result<u64> {
     Ok((1_u64 << config.ashift) * sectors)
 }
 
-/// This reader admits one top-level vdev, so every declared header copy must
-/// use that vdev's geometry. Keep one allocation per actual DVA, in copy order.
+/// Keep one header allocation per actual DVA, in copy order.
 pub(super) fn header_allocations(config: &VdevConfig, pointer: &BlockPointer) -> Result<Vec<u64>> {
     let dvas = pointer.regular_dvas().map_err(|error| parse(&error))?;
+    if let Some(group) = &config.raidz_members
+        && group.parity == 0
+    {
+        let mut allocs = Vec::with_capacity(dvas.len());
+        for dva in &dvas {
+            let vdev = group
+                .members
+                .get(dva.vdev as usize)
+                .ok_or_else(|| unsupported("foreign-vdev gang header requires another topology"))?;
+            if !(9..=16).contains(&vdev.ashift) {
+                return Err(corrupt("invalid gang-header sector geometry"));
+            }
+            allocs.push(1_u64 << vdev.ashift);
+        }
+        return Ok(allocs);
+    }
     if dvas.iter().any(|dva| dva.vdev != config.id) {
         return Err(unsupported(
             "foreign-vdev gang header requires another topology",
@@ -213,11 +229,40 @@ impl Pool {
     ) -> Result<Vec<(Dva, u64)>> {
         checkpoint(cx)?;
         if let Some(group) = &config.raidz_members {
-            return self.raidz_maps(cx, config, pointer, group).map(|maps| {
-                maps.into_iter()
-                    .map(|(dva, map)| (dva, map.allocated_bytes()))
-                    .collect()
-            });
+            if group.parity != 0 {
+                return self.raidz_maps(cx, config, pointer, group).map(|maps| {
+                    maps.into_iter()
+                        .map(|(dva, map)| (dva, map.allocated_bytes()))
+                        .collect()
+                });
+            }
+            if pointer.gang() {
+                let header_allocs = header_allocations(config, pointer)?;
+                let dvas = self.gang_header_dvas(cx, config, pointer)?;
+                return Ok(dvas.into_iter().zip(header_allocs).collect());
+            }
+            let dvas = pointer.regular_dvas().map_err(|error| parse(&error))?;
+            for dva in &dvas {
+                checkpoint(cx)?;
+                let vdev = group
+                    .members
+                    .get(dva.vdev as usize)
+                    .ok_or_else(|| unsupported("DVA references an unconfigured top-level vdev"))?;
+                self.members[vdev.supplied_index].validate_dva_for_vdev(
+                    vdev.ashift,
+                    vdev.allocated_bytes,
+                    dva.vdev,
+                    pointer,
+                    dva,
+                )?;
+            }
+            return Ok(dvas
+                .into_iter()
+                .map(|dva| {
+                    let allocated = dva.allocated_bytes;
+                    (dva, allocated)
+                })
+                .collect());
         }
         if pointer.gang() {
             let allocated = header_allocation(config)?;
@@ -330,10 +375,43 @@ impl Pool {
         pointer: &BlockPointer,
     ) -> Result<Vec<Dva>> {
         checkpoint(cx)?;
-        let allocated = header_allocation(config)?;
+        let header_allocs = header_allocations(config, pointer)?;
         let dvas = pointer
-            .gang_dvas(&header_allocations(config, pointer)?)
+            .gang_dvas(&header_allocs)
             .map_err(|error| parse(&error))?;
+        if let Some(group) = &config.raidz_members
+            && group.parity == 0
+        {
+            for (dva, &allocated) in dvas.iter().zip(&header_allocs) {
+                checkpoint(cx)?;
+                let vdev = group.members.get(dva.vdev as usize).ok_or_else(|| {
+                    unsupported("foreign-vdev gang header requires another topology")
+                })?;
+                let member = &self.members[vdev.supplied_index];
+                let end = member.length / LABEL_BYTES * LABEL_BYTES - 2 * LABEL_BYTES;
+                if vdev.allocated_bytes == 0
+                    || !vdev.allocated_bytes.is_multiple_of(allocated)
+                    || vdev.allocated_bytes > end - DATA_OFFSET
+                {
+                    return Err(corrupt(
+                        "configured gang allocation region exceeds a selected member",
+                    ));
+                }
+                if !dva.offset.is_multiple_of(allocated)
+                    || !dva.allocated_bytes.is_multiple_of(allocated)
+                    || dva.allocated_bytes < allocated
+                    || dva.allocated_bytes > vdev.allocated_bytes
+                    || dva
+                        .offset
+                        .checked_add(allocated)
+                        .is_none_or(|limit| limit > vdev.allocated_bytes)
+                {
+                    return Err(corrupt("unaligned or out-of-range gang-header DVA"));
+                }
+            }
+            return Ok(dvas);
+        }
+        let allocated = header_allocation(config)?;
         // All copies and all supplied members are bounded before a usable
         // first replica can conceal an invalid later DVA or undersized member.
         for member in &self.members {
@@ -377,9 +455,48 @@ impl Pool {
     ) -> Result<BlockRead> {
         checkpoint(cx)?;
         if let Some(group) = &config.raidz_members {
-            // The stripe verifier recognizes gang headers and uses their
-            // embedded identity checksum, not the leader's payload checksum.
-            return self.read_raidz_block(cx, config, pointer, group);
+            if group.parity != 0 {
+                // The stripe verifier recognizes gang headers and uses their
+                // embedded identity checksum, not the leader's payload checksum.
+                return self.read_raidz_block(cx, config, pointer, group);
+            }
+            let header_allocations = header_allocations(config, pointer)?;
+            let dvas = self.gang_header_dvas(cx, config, pointer)?;
+            let mut failures = Vec::new();
+            for (copy_index, dva) in dvas.iter().enumerate() {
+                checkpoint(cx)?;
+                let vdev = &group.members[dva.vdev as usize];
+                let member_index = vdev.supplied_index;
+                let offset = DATA_OFFSET + dva.offset;
+                let result = self.members[member_index]
+                    .read(cx, offset, HEADER_BYTES)
+                    .and_then(|bytes| {
+                        GangHeader::parse(&bytes, pointer, &header_allocations)
+                            .map_err(|error| parse(&error))?;
+                        Ok(bytes)
+                    });
+                match result {
+                    Ok(bytes) => {
+                        checkpoint(cx)?;
+                        return Ok(BlockRead {
+                            bytes,
+                            physical_offset: offset,
+                            copy_index,
+                            member_index,
+                            raidz: None,
+                        });
+                    }
+                    Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
+                    Err(error) => failures.push(format!(
+                        "header DVA {copy_index} (vdev {}): {error}",
+                        dva.vdev
+                    )),
+                }
+            }
+            return Err(corrupt(format!(
+                "all ZFS striped gang-header copies failed: {}",
+                failures.join("; ")
+            )));
         }
         let allocated = header_allocation(config)?;
         let dvas = self.gang_header_dvas(cx, config, pointer)?;

@@ -101,6 +101,7 @@ struct VdevConfig {
 }
 
 /// Parity and child order are bound together by complete label agreement.
+/// When `parity == 0`, `members` describes top-level vdevs in a striped pool.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct RaidzGroup {
     parity: usize,
@@ -111,6 +112,27 @@ struct RaidzGroup {
 struct RaidzMember {
     supplied_index: usize,
     guid: u64,
+    ashift: u8,
+    allocated_bytes: u64,
+}
+
+impl VdevConfig {
+    pub(in crate::reader) fn total_data_bytes(&self) -> u64 {
+        if let Some(group) = &self.raidz_members {
+            if group.parity == 0 {
+                return group
+                    .members
+                    .iter()
+                    .fold(0_u64, |sum, m| sum.saturating_add(m.allocated_bytes));
+            }
+            let width = group.members.len() as u64;
+            let data_cols = width.saturating_sub(group.parity as u64);
+            if width > 0 {
+                return (self.allocated_bytes / width).saturating_mul(data_cols);
+            }
+        }
+        self.allocated_bytes
+    }
 }
 
 fn admit_vdev_state(tree: &NvList) -> Result<()> {
@@ -156,7 +178,12 @@ fn admit_vdev_state(tree: &NvList) -> Result<()> {
 }
 
 impl Label {
-    fn vdev_config(&self, pool_guid: u64) -> Result<VdevConfig> {
+    fn vdev_config_with_mode(
+        &self,
+        pool_guid: u64,
+        allow_active_state: bool,
+        allow_striped_top_vdevs: bool,
+    ) -> Result<VdevConfig> {
         let config = &self.config;
         let version = integer(config, "version")?;
         if !(1..=28).contains(&version) && version != 5000 {
@@ -165,12 +192,26 @@ impl Label {
         if integer(config, "pool_guid")? != pool_guid || pool_guid == 0 {
             return Err(corrupt("label belongs to another pool GUID"));
         }
-        if integer(config, "state")? != 1 {
+        let state = integer(config, "state")?;
+        if allow_active_state {
+            if !matches!(state, 0 | 1) {
+                return Err(unsupported(
+                    "pool import requires an active or exported pool image",
+                ));
+            }
+        } else if state != 1 {
             return Err(unsupported(
                 "root extraction requires an exported pool image",
             ));
         }
-        if integer(config, "vdev_children")? != 1 {
+        let vdev_children = integer(config, "vdev_children")?;
+        if allow_striped_top_vdevs {
+            if !(1..=8).contains(&vdev_children) {
+                return Err(unsupported(
+                    "striped pool profile requires one through eight top-level data vdevs",
+                ));
+            }
+        } else if vdev_children != 1 {
             return Err(unsupported(
                 "root extraction requires exactly one top-level data vdev",
             ));
@@ -203,7 +244,11 @@ impl Label {
             return Err(corrupt("top-level vdev GUIDs disagree"));
         }
         let id = u32::try_from(integer(tree, "id")?).map_err(|_| corrupt("vdev ID overflow"))?;
-        if id != 0 {
+        if allow_striped_top_vdevs {
+            if u64::from(id) >= vdev_children {
+                return Err(corrupt("top-level vdev ID exceeds vdev_children"));
+            }
+        } else if id != 0 {
             return Err(unsupported(
                 "read profile requires the single top-level vdev to have ID zero",
             ));
@@ -231,7 +276,15 @@ impl Label {
     /// A standalone image must describe a standalone physical data vdev.
     /// A mirror member needs the explicitly supplied complete member set.
     fn single_leaf(&self, pool_guid: u64) -> Result<VdevConfig> {
-        let config = self.vdev_config(pool_guid)?;
+        self.single_leaf_with_mode(pool_guid, false)
+    }
+
+    fn single_leaf_with_mode(
+        &self,
+        pool_guid: u64,
+        allow_active_state: bool,
+    ) -> Result<VdevConfig> {
+        let config = self.vdev_config_with_mode(pool_guid, allow_active_state, false)?;
         let tree = self
             .config
             .list("vdev_tree")
@@ -241,6 +294,35 @@ impl Label {
         {
             return Err(unsupported(
                 "compound vdev requires its explicitly supplied native topology",
+            ));
+        }
+        if integer(&self.config, "guid")? != config.top_guid {
+            return Err(corrupt("top-level and physical leaf GUIDs disagree"));
+        }
+        Ok(config)
+    }
+
+    pub(in crate::reader) fn striped_leaf_config(
+        &self,
+        pool_guid: u64,
+        expected_children: usize,
+        allow_active_state: bool,
+    ) -> Result<VdevConfig> {
+        let config = self.vdev_config_with_mode(pool_guid, allow_active_state, true)?;
+        if integer(&self.config, "vdev_children")? != expected_children as u64 {
+            return Err(corrupt(
+                "striped pool member disagrees on vdev_children count",
+            ));
+        }
+        let tree = self
+            .config
+            .list("vdev_tree")
+            .ok_or_else(|| corrupt("missing vdev tree"))?;
+        if !matches!(tree.text("type"), Some("file" | "disk"))
+            || tree.fields.contains_key("children")
+        {
+            return Err(unsupported(
+                "striped top-level vdev profile requires standalone file or disk leaves",
             ));
         }
         if integer(&self.config, "guid")? != config.top_guid {
@@ -441,6 +523,88 @@ impl Leaf {
             config: selected,
         })
     }
+
+    /// Automatically import the active uberblock (highest verified TXG, tie-broken
+    /// by timestamp) across all 4 labels of this standalone leaf.
+    pub fn import_active(
+        &self,
+        cx: &Cx,
+        expected_pool_guid: Option<u64>,
+    ) -> Result<(usize, usize, RootBlock)> {
+        checkpoint(cx)?;
+        let first_label = self.label(cx, 0)?;
+        let pool_guid = integer(&first_label.config, "pool_guid")?;
+        if let Some(expected) = expected_pool_guid
+            && expected != pool_guid
+        {
+            return Err(corrupt("label belongs to another pool GUID"));
+        }
+        let selected = first_label.single_leaf_with_mode(pool_guid, true)?;
+        let mut labels = Vec::with_capacity(4);
+        labels.push((0_usize, first_label));
+        for index in 1..4 {
+            let label = self.label(cx, index)?;
+            let other = label.single_leaf_with_mode(pool_guid, true)?;
+            if other != selected {
+                return Err(corrupt("ZFS label identities or configurations disagree"));
+            }
+            labels.push((index, label));
+        }
+        let expected_sum = selected.pool_guid.wrapping_add(selected.top_guid);
+        let mut candidates = Vec::new();
+        for (label_index, label) in &labels {
+            let ring_slots = UBERBLOCK_RING_BYTES / label.slot_bytes;
+            for slot in 0..ring_slots {
+                checkpoint(cx)?;
+                if let Ok(ub) = self.uberblock(cx, label, slot)
+                    && ub.version == selected.version
+                    && ub.txg >= selected.txg
+                    && ub.guid_sum == expected_sum
+                {
+                    candidates.push((*label_index, slot, ub));
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return Err(corrupt("no valid active ZFS uberblock candidates in ring"));
+        }
+        candidates.sort_by(|a, b| {
+            b.2.txg
+                .cmp(&a.2.txg)
+                .then_with(|| b.2.timestamp.cmp(&a.2.timestamp))
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        let mut last_err = None;
+        for (label_index, slot, ub) in candidates {
+            checkpoint(cx)?;
+            match self.read_block(cx, &selected, &ub.root) {
+                Ok((data, physical_offset, copy_index)) => {
+                    if data.len() >= 1024 && ub.root.payload_order().u64(&data, 704).ok() == Some(1)
+                    {
+                        return Ok((
+                            label_index,
+                            slot,
+                            RootBlock {
+                                uberblock: ub,
+                                data,
+                                physical_offset,
+                                copy_index,
+                                member_guid: selected.top_guid,
+                                raidz: None,
+                                config: selected,
+                            },
+                        ));
+                    }
+                    last_err = Some(corrupt("selected root is not a META object set"));
+                }
+                Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
+                Err(err) => last_err = Some(err),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| corrupt("all ZFS active uberblock candidates failed")))
+    }
+
     fn read_block(
         &self,
         cx: &Cx,
@@ -474,6 +638,41 @@ impl Leaf {
         )))
     }
 
+    pub(in crate::reader) fn validate_dva_for_vdev(
+        &self,
+        ashift: u8,
+        allocated_bytes: u64,
+        expected_vdev_id: u32,
+        bp: &BlockPointer,
+        dva: &Dva,
+    ) -> Result<()> {
+        let sector = 1_u64 << ashift;
+        let aligned_end = self.length / LABEL_BYTES * LABEL_BYTES - 2 * LABEL_BYTES;
+        if allocated_bytes == 0
+            || !allocated_bytes.is_multiple_of(sector)
+            || allocated_bytes > aligned_end - DATA_OFFSET
+        {
+            return Err(corrupt(
+                "configured ZFS allocation region exceeds the selected leaf",
+            ));
+        }
+        if dva.vdev != expected_vdev_id || dva.gang {
+            return Err(unsupported(
+                "foreign-vdev or gang DVA needs a different native mapping",
+            ));
+        }
+        if !dva.offset.is_multiple_of(sector)
+            || dva.allocated_bytes != (bp.physical_bytes() as u64).div_ceil(sector) * sector
+            || dva
+                .offset
+                .checked_add(dva.allocated_bytes)
+                .is_none_or(|end| end > allocated_bytes)
+        {
+            return Err(corrupt("unaligned or out-of-range data-vdev DVA"));
+        }
+        Ok(())
+    }
+
     /// Validate the whole DVA set against one physical member before data I/O.
     fn block_dvas(&self, config: &VdevConfig, bp: &BlockPointer) -> Result<Vec<Dva>> {
         let dvas = bp.regular_dvas().map_err(|error| parse(&error))?;
@@ -489,20 +688,7 @@ impl Leaf {
         }
         // Validate every declared copy before attempting any data I/O.
         for dva in &dvas {
-            if dva.vdev != config.id || dva.gang {
-                return Err(unsupported(
-                    "foreign-vdev or gang DVA needs a different native mapping",
-                ));
-            }
-            if !dva.offset.is_multiple_of(sector)
-                || dva.allocated_bytes != (bp.physical_bytes() as u64).div_ceil(sector) * sector
-                || dva
-                    .offset
-                    .checked_add(dva.allocated_bytes)
-                    .is_none_or(|end| end > config.allocated_bytes)
-            {
-                return Err(corrupt("unaligned or out-of-range data-vdev DVA"));
-            }
+            self.validate_dva_for_vdev(config.ashift, config.allocated_bytes, config.id, bp, dva)?;
         }
         Ok(dvas)
     }

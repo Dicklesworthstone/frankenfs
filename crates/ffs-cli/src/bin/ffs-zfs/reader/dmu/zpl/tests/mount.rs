@@ -204,9 +204,15 @@ fn extraction_mount_refuses_writes_and_preserves_corruption_and_cancellation_err
         fs.getxattr(&cx, file.ino, "security.capability"),
         Err(FfsError::UnsupportedFeature(_))
     ));
+    let st = fs.statfs(&cx, &mut scope, ROOT).unwrap();
+    assert_eq!(st.block_size, 4096);
+    assert_eq!(st.fragment_size, 512);
+    assert!(st.blocks > 0);
+    assert!(st.blocks_free <= st.blocks);
+    assert_eq!(st.name_max, 255);
     assert!(matches!(
-        fs.statfs(&cx, &mut scope, ROOT),
-        Err(FfsError::UnsupportedFeature(_))
+        fs.statfs(&cx, &mut scope, InodeNumber(999)),
+        Err(FfsError::NotFound(_))
     ));
     assert_eq!(
         fs.lseek(&cx, &mut scope, file.ino, 1, SeekWhence::Data)

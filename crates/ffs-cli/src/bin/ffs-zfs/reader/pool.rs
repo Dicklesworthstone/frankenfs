@@ -52,6 +52,8 @@ impl GroupConfig {
                 members.push(RaidzMember {
                     supplied_index,
                     guid,
+                    ashift: config.ashift,
+                    allocated_bytes: config.allocated_bytes,
                 });
             }
             config.raidz_members = Some(RaidzGroup {
@@ -64,8 +66,12 @@ impl GroupConfig {
 }
 
 impl Label {
-    fn group_config(&self, pool_guid: u64) -> Result<(GroupConfig, u64)> {
-        let vdev = self.vdev_config(pool_guid)?;
+    fn group_config_with_mode(
+        &self,
+        pool_guid: u64,
+        allow_active_state: bool,
+    ) -> Result<(GroupConfig, u64)> {
+        let vdev = self.vdev_config_with_mode(pool_guid, allow_active_state, false)?;
         let tree = self
             .config
             .list("vdev_tree")
@@ -145,11 +151,11 @@ fn same_candidate(left: &Uberblock, right: &Uberblock) -> bool {
 
 impl Pool {
     /// Host paths have already been explicitly opened by the caller. Multiple
-    /// images must supply the complete native mirror or RAIDZ member set.
+    /// images must supply the complete native mirror, RAIDZ, or striped top-level vdev set.
     pub fn from_leaves(members: Vec<Leaf>) -> Result<Self> {
         if !(1..=MAX_MEMBERS).contains(&members.len()) {
             return Err(unsupported(
-                "supply one leaf or two through eight redundant members",
+                "supply one leaf or two through eight redundant or striped members",
             ));
         }
         Ok(Self { members })
@@ -169,12 +175,32 @@ impl Pool {
         slot: usize,
         pool_guid: u64,
     ) -> Result<RootBlock> {
+        self.root_with_mode(cx, label_index, slot, pool_guid, false)
+    }
+
+    pub(super) fn root_with_mode(
+        &self,
+        cx: &Cx,
+        label_index: usize,
+        slot: usize,
+        pool_guid: u64,
+        allow_active_state: bool,
+    ) -> Result<RootBlock> {
         checkpoint(cx)?;
         if self.members.len() == 1 {
             return self.members[0].root(cx, label_index, slot, pool_guid);
         }
         let first_label = self.members[0].label(cx, label_index)?;
-        let (selected, _) = first_label.group_config(pool_guid)?;
+        if integer(&first_label.config, "vdev_children").unwrap_or(1) > 1 {
+            return self.striped_root_with_mode(
+                cx,
+                label_index,
+                slot,
+                pool_guid,
+                allow_active_state,
+            );
+        }
+        let (selected, _) = first_label.group_config_with_mode(pool_guid, allow_active_state)?;
         if selected.member_guids.len() != self.members.len() {
             return Err(unsupported(
                 "every configured redundant member must be explicitly supplied",
@@ -198,14 +224,16 @@ impl Pool {
         for member in &self.members {
             checkpoint(cx)?;
             let label = member.label(cx, label_index)?;
-            let (config, guid) = label.group_config(pool_guid)?;
+            let (config, guid) = label.group_config_with_mode(pool_guid, allow_active_state)?;
             if config != selected || !seen.insert(guid) {
                 return Err(corrupt(
                     "supplied members disagree or repeat a physical GUID",
                 ));
             }
             for index in 0..4 {
-                let (other, other_guid) = member.label(cx, index)?.group_config(pool_guid)?;
+                let (other, other_guid) = member
+                    .label(cx, index)?
+                    .group_config_with_mode(pool_guid, allow_active_state)?;
                 if other != selected || other_guid != guid {
                     return Err(corrupt(
                         "member labels disagree on identity or configuration",
@@ -246,6 +274,164 @@ impl Pool {
         })
     }
 
+    fn striped_root_with_mode(
+        &self,
+        cx: &Cx,
+        label_index: usize,
+        slot: usize,
+        pool_guid: u64,
+        allow_active_state: bool,
+    ) -> Result<RootBlock> {
+        let count = self.members.len();
+        let first_label = self.members[0].label(cx, label_index)?;
+        let first_cfg = first_label.striped_leaf_config(pool_guid, count, allow_active_state)?;
+        let candidate = self.members[0].uberblock(cx, &first_label, slot)?;
+        let mut seen_guids = BTreeSet::from([pool_guid]);
+        let mut by_vdev_id: Vec<Option<(usize, VdevConfig)>> = vec![None; count];
+        let mut member_guids_by_supplied = Vec::with_capacity(count);
+        for (supplied_index, member) in self.members.iter().enumerate() {
+            checkpoint(cx)?;
+            let label = member.label(cx, label_index)?;
+            let cfg = label.striped_leaf_config(pool_guid, count, allow_active_state)?;
+            if cfg.version != first_cfg.version || cfg.read_features != first_cfg.read_features {
+                return Err(corrupt(
+                    "striped top-level vdevs disagree on pool version or read features",
+                ));
+            }
+            if !seen_guids.insert(cfg.top_guid) {
+                return Err(corrupt("striped top-level vdevs repeat a GUID"));
+            }
+            for index in 0..4 {
+                let other = member.label(cx, index)?.striped_leaf_config(
+                    pool_guid,
+                    count,
+                    allow_active_state,
+                )?;
+                if other != cfg {
+                    return Err(corrupt(
+                        "striped member labels disagree on identity or configuration",
+                    ));
+                }
+            }
+            let ub = member.uberblock(cx, &label, slot)?;
+            if ub.version != cfg.version || ub.txg < cfg.txg || !same_candidate(&candidate, &ub) {
+                return Err(corrupt(
+                    "striped top-level vdevs disagree on the selected uberblock candidate",
+                ));
+            }
+            let vdev_slot = by_vdev_id
+                .get_mut(cfg.id as usize)
+                .ok_or_else(|| corrupt("striped top-level vdev ID out of bounds"))?;
+            if vdev_slot.is_some() {
+                return Err(corrupt("duplicate striped top-level vdev ID"));
+            }
+            member_guids_by_supplied.push(cfg.top_guid);
+            *vdev_slot = Some((supplied_index, cfg));
+        }
+        let mut striped_members = Vec::with_capacity(count);
+        let mut expected_sum = pool_guid;
+        for entry in by_vdev_id {
+            let (supplied_index, cfg) =
+                entry.ok_or_else(|| corrupt("missing striped top-level vdev ID"))?;
+            expected_sum = expected_sum.wrapping_add(cfg.top_guid);
+            striped_members.push(RaidzMember {
+                supplied_index,
+                guid: cfg.top_guid,
+                ashift: cfg.ashift,
+                allocated_bytes: cfg.allocated_bytes,
+            });
+        }
+        if candidate.guid_sum != expected_sum {
+            return Err(corrupt(
+                "candidate disagrees with the striped pool GUID sum",
+            ));
+        }
+        let mut config = first_cfg;
+        config.id = 0;
+        config.top_guid = striped_members[0].guid;
+        config.ashift = striped_members[0].ashift;
+        config.allocated_bytes = striped_members[0].allocated_bytes;
+        config.raidz_members = Some(RaidzGroup {
+            parity: 0,
+            members: striped_members,
+        });
+        let block = self.read_block(cx, &config, &candidate.root)?;
+        if block.bytes.len() < 1024
+            || candidate
+                .root
+                .payload_order()
+                .u64(&block.bytes, 704)
+                .map_err(|error| parse(&error))?
+                != 1
+        {
+            return Err(corrupt(
+                "selected striped pool root is not a META object set",
+            ));
+        }
+        checkpoint(cx)?;
+        Ok(RootBlock {
+            uberblock: candidate,
+            data: block.bytes,
+            physical_offset: block.physical_offset,
+            copy_index: block.copy_index,
+            member_guid: member_guids_by_supplied[block.member_index],
+            raidz: None,
+            config,
+        })
+    }
+
+    /// Automatically import the active uberblock (highest verified TXG, tie-broken
+    /// by timestamp) across all 4 labels and all supplied members.
+    pub fn import_active(
+        &self,
+        cx: &Cx,
+        expected_pool_guid: Option<u64>,
+    ) -> Result<(usize, usize, RootBlock)> {
+        checkpoint(cx)?;
+        if let Some(leaf) = self.standalone_leaf() {
+            return leaf.import_active(cx, expected_pool_guid);
+        }
+        let first_label = self.members[0].label(cx, 0)?;
+        let pool_guid = integer(&first_label.config, "pool_guid")?;
+        if let Some(expected) = expected_pool_guid
+            && expected != pool_guid
+        {
+            return Err(corrupt("label belongs to another pool GUID"));
+        }
+        let mut candidates = Vec::new();
+        for label_index in 0..4 {
+            checkpoint(cx)?;
+            let label = self.members[0].label(cx, label_index)?;
+            let ring_slots = super::UBERBLOCK_RING_BYTES / label.slot_bytes;
+            for slot in 0..ring_slots {
+                checkpoint(cx)?;
+                if let Ok(ub) = self.members[0].uberblock(cx, &label, slot) {
+                    candidates.push((label_index, slot, ub));
+                }
+            }
+        }
+        if candidates.is_empty() {
+            return Err(corrupt("no valid active ZFS uberblock candidates in ring"));
+        }
+        candidates.sort_by(|a, b| {
+            b.2.txg
+                .cmp(&a.2.txg)
+                .then_with(|| b.2.timestamp.cmp(&a.2.timestamp))
+                .then_with(|| a.0.cmp(&b.0))
+                .then_with(|| a.1.cmp(&b.1))
+        });
+        let mut last_err = None;
+        for (label_index, slot, _) in candidates {
+            checkpoint(cx)?;
+            match self.root_with_mode(cx, label_index, slot, pool_guid, true) {
+                Ok(root) => return Ok((label_index, slot, root)),
+                Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
+                Err(err) => last_err = Some(err),
+            }
+        }
+        Err(last_err.unwrap_or_else(|| corrupt("all ZFS active uberblock candidates failed")))
+    }
+
     pub(super) fn read_block(
         &self,
         cx: &Cx,
@@ -257,6 +443,9 @@ impl Pool {
             return self.read_gang_block(cx, config, bp);
         }
         if let Some(group) = &config.raidz_members {
+            if group.parity == 0 {
+                return self.read_striped_block(cx, bp, group);
+            }
             return self.read_raidz_block(cx, config, bp, group);
         }
         if self.members.len() == 1 {
@@ -307,6 +496,55 @@ impl Pool {
         }
         Err(corrupt(format!(
             "all ZFS mirror block copies failed: {}",
+            failures.join("; ")
+        )))
+    }
+
+    fn read_striped_block(
+        &self,
+        cx: &Cx,
+        bp: &BlockPointer,
+        group: &RaidzGroup,
+    ) -> Result<BlockRead> {
+        let dvas = bp.regular_dvas().map_err(|error| parse(&error))?;
+        for dva in &dvas {
+            checkpoint(cx)?;
+            let vdev_idx = usize::try_from(dva.vdev).map_err(|_| corrupt("vdev ID overflow"))?;
+            let vdev = group
+                .members
+                .get(vdev_idx)
+                .ok_or_else(|| unsupported("DVA references an unconfigured top-level vdev"))?;
+            let member = &self.members[vdev.supplied_index];
+            member.validate_dva_for_vdev(vdev.ashift, vdev.allocated_bytes, dva.vdev, bp, dva)?;
+        }
+        let mut failures = Vec::new();
+        for (copy_index, dva) in dvas.iter().enumerate() {
+            checkpoint(cx)?;
+            let vdev = &group.members[dva.vdev as usize];
+            let member_index = vdev.supplied_index;
+            let offset = DATA_OFFSET + dva.offset;
+            let result = self.members[member_index]
+                .read(cx, offset, bp.physical_bytes())
+                .and_then(|raw| bp.decode(&raw).map_err(|error| parse(&error)));
+            match result {
+                Ok(bytes) => {
+                    checkpoint(cx)?;
+                    return Ok(BlockRead {
+                        bytes,
+                        physical_offset: offset,
+                        copy_index,
+                        member_index,
+                        raidz: None,
+                    });
+                }
+                Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
+                Err(error) => {
+                    failures.push(format!("DVA {copy_index} (vdev {}): {error}", dva.vdev))
+                }
+            }
+        }
+        Err(corrupt(format!(
+            "all ZFS striped block copies failed: {}",
             failures.join("; ")
         )))
     }

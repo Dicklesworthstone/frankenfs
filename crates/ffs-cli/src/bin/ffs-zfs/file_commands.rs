@@ -150,9 +150,7 @@ impl FileCommand {
                     bail!("ZFS mountpoint must be an existing empty directory");
                 }
                 candidate.reject_hidden_images(&mountpoint)?;
-                let source = candidate.open(cx)?;
-                let mut pool =
-                    source.objects(cx, candidate.label, candidate.slot, candidate.pool_guid)?;
+                let mut pool = candidate.objects(cx)?;
                 let view = match snapshot.as_deref() {
                     Some(name) => pool.zpl_snapshot(cx, &components, name.as_bytes())?,
                     None => pool.zpl(cx, &components)?,
@@ -175,9 +173,8 @@ impl FileCommand {
             }
             Self::Snapshots { candidate, dataset } => {
                 let components = dataset_components(&dataset)?;
-                let source = candidate.open(cx)?;
-                let mut pool =
-                    source.objects(cx, candidate.label, candidate.slot, candidate.pool_guid)?;
+                let mut pool = candidate.objects(cx)?;
+                let pool_guid = pool.pool_guid();
                 let snapshots: Vec<_> = pool.snapshots(cx, &components)?.into_iter().map(|row| {
                     serde_json::json!({"name": std::str::from_utf8(&row.name).ok(), "name_bytes": row.name,
                         "object": row.object, "guid": row.guid.to_string(), "creation_txg": row.creation_txg,
@@ -185,7 +182,7 @@ impl FileCommand {
                         "referenced_bytes": row.referenced_bytes, "flags": row.flags, "objectset_kind": row.objectset_kind})
                 }).collect();
                 return json(
-                    &serde_json::json!({"pool_guid": candidate.pool_guid.to_string(), "dataset": dataset,
+                    &serde_json::json!({"pool_guid": pool_guid.to_string(), "dataset": dataset,
                     "txg": pool.txg, "snapshots": snapshots, "scope": "named snapshot roots in this committed pool view"}),
                 );
             }
@@ -198,8 +195,7 @@ impl FileCommand {
         };
         let components = dataset_components(&file.dataset)?;
         let c = file.candidate;
-        let source = c.open(cx)?;
-        let mut pool = source.objects(cx, c.label, c.slot, c.pool_guid)?;
+        let mut pool = c.objects(cx)?;
         let txg = pool.txg;
         let mut view = match file.snapshot.as_deref() {
             Some(name) => pool.zpl_snapshot(cx, &components, name.as_bytes())?,

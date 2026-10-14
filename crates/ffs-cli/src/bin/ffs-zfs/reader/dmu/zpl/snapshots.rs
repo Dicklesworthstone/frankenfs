@@ -377,7 +377,13 @@ impl Objects {
             cache: VecDeque::new(),
             cached_bytes: 0,
         };
-        Zpl::open(cx, view, selected.info.guid)
+        Zpl::open(
+            cx,
+            view,
+            selected.info.guid,
+            selected.info.referenced_bytes,
+            None,
+        )
     }
 }
 

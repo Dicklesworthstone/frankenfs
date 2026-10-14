@@ -46,6 +46,11 @@ impl Leaf {
         let root = self.root(cx, label, slot, pool_guid)?;
         Objects::from_root(cx, Pool::from(self.clone()), root)
     }
+
+    pub fn import_objects(&self, cx: &Cx, expected_pool_guid: Option<u64>) -> Result<Objects> {
+        let (_, _, root) = self.import_active(cx, expected_pool_guid)?;
+        Objects::from_root(cx, Pool::from(self.clone()), root)
+    }
 }
 
 impl Pool {
@@ -56,9 +61,34 @@ impl Pool {
         let root = self.root(cx, label, slot, pool_guid)?;
         Objects::from_root(cx, self.clone(), root)
     }
+
+    pub fn import_objects(&self, cx: &Cx, expected_pool_guid: Option<u64>) -> Result<Objects> {
+        if let Some(leaf) = self.standalone_leaf() {
+            return leaf.import_objects(cx, expected_pool_guid);
+        }
+        let (_, _, root) = self.import_active(cx, expected_pool_guid)?;
+        Objects::from_root(cx, self.clone(), root)
+    }
 }
 
 impl Objects {
+    #[must_use]
+    pub const fn pool_guid(&self) -> u64 {
+        self.config.pool_guid
+    }
+
+    pub(in crate::reader) fn clone_mos(&self) -> Self {
+        Self {
+            pool: self.pool.clone(),
+            config: self.config.clone(),
+            txg: self.txg,
+            root_birth: self.root_birth,
+            meta: self.meta.clone(),
+            cache: VecDeque::new(),
+            cached_bytes: 0,
+        }
+    }
+
     fn from_root(cx: &Cx, pool: Pool, root: RootBlock) -> Result<Self> {
         let objectset = ObjectSet::parse(&root.data, root.uberblock.root.payload_order())
             .map_err(|error| parse(&error))?;

@@ -489,6 +489,112 @@ fn embedded_read_feature_requires_native_boolean_and_all_label_agreement() {
     }
 }
 
+#[test]
+fn bd_glk87_auto_import_and_multi_top_level_vdev_striping_contract() {
+    let cx = Cx::for_testing();
+    // 1. Automatic active/exported uberblock import selects highest valid TXG across ring slots
+    let mut image = Image::new(Endian::Little, false);
+    // Write an active (state = 0) config and a newer uberblock at slot 5 (txg = 50)
+    for index in 0..4 {
+        image.set_config(index, &config(999, 9, 0, false));
+    }
+    let label0 = label_offsets(LENGTH as u64).unwrap()[0];
+    let slot2_off = label0 + UBERBLOCK_RING_OFFSET + 2 * 1024;
+    let slot5_off = label0 + UBERBLOCK_RING_OFFSET + 5 * 1024;
+    let mut ub50 =
+        image.bytes[BASE + slot2_off as usize..BASE + slot2_off as usize + 1024].to_vec();
+    ub50[16..24].copy_from_slice(&Endian::Little.encode(50));
+    ub50[32..40].copy_from_slice(&Endian::Little.encode(1_700_000_500));
+    stamp(&mut ub50, slot5_off, Endian::Little);
+    image.bytes[BASE + slot5_off as usize..BASE + slot5_off as usize + 1024].copy_from_slice(&ub50);
+
+    let expected_root = image.root.clone();
+    let leaf = image.open(Arc::default(), None);
+    let imported = leaf.import_active(&cx, None).unwrap();
+    assert_eq!(imported.2.uberblock.txg, 50);
+    assert_eq!(imported.2.data, expected_root);
+    assert!(leaf.import_active(&cx, Some(999_999)).is_err());
+
+    // 2. Multi-top-level-vdev striped pool (vdev_children = 2, DVA on vdev 1)
+    let mut img0 = Image::new(Endian::Little, false);
+    let mut img1 = Image::new(Endian::Little, false);
+    let asize = LENGTH as u64 - DATA_OFFSET - 2 * LABEL_BYTES;
+    let make_striped_cfg = |id: u64, guid: u64, state: u64| -> Vec<u8> {
+        let tree = list(&[
+            pair("type", 9, &xstring("file")),
+            uint("id", id),
+            uint("guid", guid),
+            uint("ashift", 9),
+            uint("asize", asize),
+            uint("is_log", 0),
+        ]);
+        let mut bytes = vec![1, 1, 0, 0];
+        bytes.extend_from_slice(&list(&[
+            uint("version", 5000),
+            uint("state", state),
+            uint("txg", 42),
+            uint("pool_guid", 123),
+            uint("guid", guid),
+            uint("top_guid", guid),
+            uint("vdev_children", 2),
+            pair("name", 9, &xstring("striped")),
+            pair("vdev_tree", 19, &tree),
+            pair("features_for_read", 19, &list(&[])),
+        ]));
+        bytes
+    };
+    // Point uberblock DVA[0] and DVA[1] on both leaves to vdev 1 (word 0 and word 2 high 32 bits = 1)
+    let vdev1_word = (1_u64 << 32) | (expected_root.len() as u64 / 512);
+    img0.change_dva(0, vdev1_word);
+    img0.change_dva(2, vdev1_word);
+    img1.change_dva(0, vdev1_word);
+    img1.change_dva(2, vdev1_word);
+    // Clear physical blocks on img0 so reading from vdev 0 would fail checksum
+    img0.bytes[BASE + FIRST as usize..BASE + FIRST as usize + 1024].fill(0);
+    img0.bytes[BASE + SECOND as usize..BASE + SECOND as usize + 1024].fill(0);
+
+    // 2a. Exported striped pool (state = 1) works with both explicit pool.root and pool.import_active
+    // Uberblock guid_sum is 1122 = pool_guid (123) + vdev0 (499) + vdev1 (500).
+    let cfg0_exp = make_striped_cfg(0, 499, 1);
+    let cfg1_exp = make_striped_cfg(1, 500, 1);
+    for index in 0..4 {
+        img0.set_config(index, &cfg0_exp);
+        img1.set_config(index, &cfg1_exp);
+    }
+    let mut img0_active = Image {
+        bytes: img0.bytes.clone(),
+        order: img0.order,
+        root: img0.root.clone(),
+    };
+    let mut img1_active = Image {
+        bytes: img1.bytes.clone(),
+        order: img1.order,
+        root: img1.root.clone(),
+    };
+    let leaf0 = img0.open(Arc::default(), None);
+    let leaf1 = img1.open(Arc::default(), None);
+    let pool = Pool::from_leaves(vec![leaf0, leaf1]).unwrap();
+    let striped_root = pool.root(&cx, 0, 2, 123).unwrap();
+    assert_eq!(striped_root.data, expected_root);
+    assert_eq!(striped_root.member_guid, 500);
+
+    // 2b. Active striped pool (state = 0) works with pool.import_active
+    let cfg0_act = make_striped_cfg(0, 499, 0);
+    let cfg1_act = make_striped_cfg(1, 500, 0);
+    for index in 0..4 {
+        img0_active.set_config(index, &cfg0_act);
+        img1_active.set_config(index, &cfg1_act);
+    }
+    let pool_active = Pool::from_leaves(vec![
+        img0_active.open(Arc::default(), None),
+        img1_active.open(Arc::default(), None),
+    ])
+    .unwrap();
+    let auto_striped = pool_active.import_active(&cx, Some(123)).unwrap();
+    assert_eq!(auto_striped.2.data, expected_root);
+    assert_eq!(auto_striped.2.member_guid, 500);
+}
+
 pub(in crate::reader) mod gang;
 pub(in crate::reader) mod mirror;
 pub(in crate::reader) mod raidz;

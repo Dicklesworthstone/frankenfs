@@ -47,18 +47,21 @@ impl ImageArgs {
 struct CandidateArgs {
     #[command(flatten)]
     image: ImageArgs,
+    /// Automatically import the highest-TXG active/exported uberblock across all 4 labels.
     #[arg(long)]
+    auto_import: bool,
+    #[arg(long, default_value_t = 0, required_unless_present = "auto_import")]
     label: usize,
-    #[arg(long)]
+    #[arg(long, default_value_t = 0, required_unless_present = "auto_import")]
     slot: usize,
-    /// Expected pool GUID; this does not authorize automatic TXG selection.
-    #[arg(long)]
+    /// Expected pool GUID; optional when --auto-import is set.
+    #[arg(long, default_value_t = 0, required_unless_present = "auto_import")]
     pool_guid: u64,
-    /// Additional immutable images of every other leaf in one mirror or RAIDZ1/2/3 vdev.
+    /// Additional immutable images of every other leaf in one mirror, RAIDZ1/2/3, or striped pool.
     /// The same --offset and --length select the volume range in every image.
     #[arg(
         long = "member",
-        visible_aliases = ["mirror-member", "raidz-member"],
+        visible_aliases = ["mirror-member", "raidz-member", "striped-member"],
         value_name = "IMAGE"
     )]
     members: Vec<PathBuf>,
@@ -79,6 +82,28 @@ impl CandidateArgs {
         Pool::from_leaves(leaves).context("opening explicitly supplied ZFS members")
     }
 
+    fn expected_pool_guid(&self) -> Option<u64> {
+        (self.pool_guid != 0).then_some(self.pool_guid)
+    }
+
+    fn root(&self, cx: &Cx) -> Result<reader::RootBlock> {
+        let pool = self.open(cx)?;
+        if self.auto_import {
+            Ok(pool.import_active(cx, self.expected_pool_guid())?.2)
+        } else {
+            Ok(pool.root(cx, self.label, self.slot, self.pool_guid)?)
+        }
+    }
+
+    fn objects(&self, cx: &Cx) -> Result<reader::dmu::Objects> {
+        let pool = self.open(cx)?;
+        if self.auto_import {
+            Ok(pool.import_objects(cx, self.expected_pool_guid())?)
+        } else {
+            Ok(pool.objects(cx, self.label, self.slot, self.pool_guid)?)
+        }
+    }
+
     fn reject_hidden_images(&self, mountpoint: &Path) -> Result<()> {
         for path in std::iter::once(&self.image.image).chain(&self.members) {
             if path.canonicalize()?.starts_with(mountpoint) {
@@ -97,7 +122,7 @@ enum Command {
         #[command(flatten)]
         image: ImageArgs,
     },
-    /// Extract one checked META object-set block. No automatic TXG selection or import.
+    /// Extract one checked META object-set block.
     Root {
         #[command(flatten)]
         candidate: CandidateArgs,
@@ -125,7 +150,7 @@ enum Command {
         candidate: CandidateArgs,
         number: u64,
     },
-    /// Inventory DSL head datasets beneath this MOS; no import, snapshots or mount.
+    /// Inventory DSL head datasets beneath this MOS.
     Datasets {
         #[command(flatten)]
         candidate: CandidateArgs,
@@ -191,8 +216,7 @@ fn main() -> Result<()> {
             }
         }
         Command::Root { candidate } => {
-            let pool = candidate.open(&cx)?;
-            let root = pool.root(&cx, candidate.label, candidate.slot, candidate.pool_guid)?;
+            let root = candidate.root(&cx)?;
             if let Some(stripe) = &root.raidz {
                 eprintln!(
                     "checked candidate txg={} copy={} raidz{}_dva_offset={} allocated_bytes={} bytes={} parity_read={} reconstructed_children={:?}; not a pool import",
@@ -236,9 +260,7 @@ fn main() -> Result<()> {
             out.flush()?;
         }
         Command::Object { candidate, number } => {
-            let pool = candidate.open(&cx)?;
-            let mut view =
-                pool.objects(&cx, candidate.label, candidate.slot, candidate.pool_guid)?;
+            let mut view = candidate.objects(&cx)?;
             let node = view.object(&cx, number)?;
             json(&serde_json::json!({"object": number, "txg": view.txg,
                 "object_type": node.object_type(), "bonus_type": node.bonus_type(),
@@ -254,18 +276,14 @@ fn main() -> Result<()> {
             start,
             bytes,
         } => {
-            let pool = candidate.open(&cx)?;
-            let mut view =
-                pool.objects(&cx, candidate.label, candidate.slot, candidate.pool_guid)?;
+            let mut view = candidate.objects(&cx)?;
             let data = view.read(&cx, number, start, bytes)?;
             let mut out = io::stdout().lock();
             out.write_all(&data)?;
             out.flush()?;
         }
         Command::Zap { candidate, number } => {
-            let pool = candidate.open(&cx)?;
-            let mut view =
-                pool.objects(&cx, candidate.label, candidate.slot, candidate.pool_guid)?;
+            let mut view = candidate.objects(&cx)?;
             let entries: Vec<_> = view.zap_values(&cx, number)?.into_iter().map(|entry| serde_json::json!({
                 "name": std::str::from_utf8(&entry.name).ok(), "name_bytes": entry.name,
                 "integer_bytes": entry.integer_bytes, "values": entry.values, "collision": entry.collision
@@ -273,9 +291,8 @@ fn main() -> Result<()> {
             json(&serde_json::json!({"object": number, "txg": view.txg, "entries": entries}))?;
         }
         Command::Datasets { candidate } => {
-            let pool = candidate.open(&cx)?;
-            let mut view =
-                pool.objects(&cx, candidate.label, candidate.slot, candidate.pool_guid)?;
+            let mut view = candidate.objects(&cx)?;
+            let pool_guid = view.pool_guid();
             let datasets: Vec<_> = view.datasets(&cx)?.into_iter().map(|entry| {
                 let name = entry.components.iter().map(|part| std::str::from_utf8(part))
                     .collect::<std::result::Result<Vec<_>, _>>().ok().map(|parts| parts.join("/"));
@@ -285,7 +302,7 @@ fn main() -> Result<()> {
                     "flags": entry.flags, "objectset_kind": entry.objectset_kind, "root_birth": entry.root_birth})
             }).collect();
             json(
-                &serde_json::json!({"pool_guid": candidate.pool_guid.to_string(), "txg": view.txg,
+                &serde_json::json!({"pool_guid": pool_guid.to_string(), "txg": view.txg,
                 "datasets": datasets, "scope": "verified DSL head inventory; no snapshots, import or ZPL mount"}),
             )?;
         }
@@ -511,6 +528,7 @@ mod tests {
                 length: None,
                 offline_image: true,
             },
+            auto_import: false,
             label: 0,
             slot: 0,
             pool_guid: 1,
@@ -548,6 +566,7 @@ mod tests {
                 length: None,
                 offline_image: true,
             },
+            auto_import: false,
             label: 0,
             slot: 0,
             pool_guid: 1,

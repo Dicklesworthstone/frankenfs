@@ -662,6 +662,99 @@ fn embedded_snapshot_contents_are_historical_and_never_read_physical_payloads() 
     }
 }
 
+#[test]
+fn bd_glk87_zfs_ctl_snapshot_virtual_dir_and_statfs_contract() {
+    use crate::filesystem::ZfsFs;
+    use ffs_core::{FileType, FsOps, RequestScope};
+    use ffs_types::InodeNumber;
+    use std::ffi::OsStr;
+
+    const ROOT: InodeNumber = InodeNumber(1);
+    let cx = Cx::for_testing();
+    let (leaf, meta) = Image::new(Endian::Little, 0).open(Arc::default(), None);
+    let view = pool(&leaf, meta).zpl(&cx, &[]).unwrap();
+    assert!(view.has_snapshot_dir());
+    let fs = ZfsFs::new(&cx, view, 1000, 1000).unwrap();
+    let mut scope = RequestScope::empty();
+
+    // 1. .zfs is hidden from root readdir (snapdir=hidden) but reachable via lookup
+    let root_entries = fs.readdir(&cx, &mut scope, ROOT, 0).unwrap();
+    assert!(
+        !root_entries.iter().any(|e| e.name == b".zfs"),
+        ".zfs must be hidden from root readdir"
+    );
+    let ctl = fs
+        .lookup(&cx, &mut scope, ROOT, OsStr::new(".zfs"))
+        .unwrap();
+    assert_eq!(ctl.kind, FileType::Directory);
+    assert_eq!(
+        fs.lookup(&cx, &mut scope, ctl.ino, OsStr::new(".."))
+            .unwrap()
+            .ino,
+        ROOT
+    );
+
+    // 2. .zfs/snapshot lists committed snapshots ("after", "before")
+    let snapdir = fs
+        .lookup(&cx, &mut scope, ctl.ino, OsStr::new("snapshot"))
+        .unwrap();
+    assert_eq!(snapdir.kind, FileType::Directory);
+    let snap_entries = fs.readdir(&cx, &mut scope, snapdir.ino, 0).unwrap();
+    let snap_names: Vec<&[u8]> = snap_entries.iter().map(|e| e.name.as_slice()).collect();
+    assert_eq!(snap_names, [b".".as_slice(), b"..", b"after", b"before"]);
+
+    // 3. Traverse into .zfs/snapshot/before and read historical files
+    let before_root = fs
+        .lookup(&cx, &mut scope, snapdir.ino, OsStr::new("before"))
+        .unwrap();
+    assert_eq!(before_root.kind, FileType::Directory);
+    assert_ne!(before_root.ino, ROOT);
+    assert_eq!(
+        fs.lookup(&cx, &mut scope, before_root.ino, OsStr::new(".."))
+            .unwrap()
+            .ino,
+        snapdir.ino
+    );
+    let before_file = fs
+        .lookup(&cx, &mut scope, before_root.ino, OsStr::new("file"))
+        .unwrap();
+    assert_eq!(before_file.size, 2049);
+    assert_eq!(
+        fs.read(&cx, &mut scope, before_file.ino, 0, 4096).unwrap(),
+        old_bytes()
+    );
+    let gone = fs
+        .lookup(&cx, &mut scope, before_root.ino, OsStr::new("gone"))
+        .unwrap();
+    assert_eq!(gone.kind, FileType::RegularFile);
+    assert!(
+        fs.lookup(&cx, &mut scope, ROOT, OsStr::new("gone"))
+            .is_err(),
+        "deleted file must not exist in head view"
+    );
+
+    // 4. Traverse into .zfs/snapshot/after and verify distinct inode & content
+    let after_root = fs
+        .lookup(&cx, &mut scope, snapdir.ino, OsStr::new("after"))
+        .unwrap();
+    let after_file = fs
+        .lookup(&cx, &mut scope, after_root.ino, OsStr::new("file"))
+        .unwrap();
+    assert_ne!(after_file.ino, before_file.ino);
+    assert_eq!(after_file.size, 600);
+    assert_eq!(
+        fs.read(&cx, &mut scope, after_file.ino, 0, 8).unwrap(),
+        b"CCCCCCCC"
+    );
+
+    // 5. statfs works on ROOT, .zfs, and snapshot inodes
+    let st_root = fs.statfs(&cx, &mut scope, ROOT).unwrap();
+    let st_snap = fs.statfs(&cx, &mut scope, before_file.ino).unwrap();
+    assert_eq!(st_root.block_size, 4096);
+    assert!(st_root.blocks > 0);
+    assert_eq!(st_snap.blocks, st_root.blocks);
+}
+
 mod mount;
 
 mod mirror;

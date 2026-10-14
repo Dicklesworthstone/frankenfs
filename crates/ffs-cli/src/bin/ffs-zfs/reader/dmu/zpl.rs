@@ -22,6 +22,8 @@ pub struct Zpl {
     pub version: u64,
     registry: Option<SaRegistry>,
     utf8_only: bool,
+    referenced_bytes: u64,
+    mos: Option<(Box<Objects>, Vec<Vec<u8>>)>,
 }
 #[derive(Debug)]
 pub struct DirectoryEntry {
@@ -62,6 +64,11 @@ impl Objects {
             ));
         }
         let object = self.load(cx, dataset.head_object)?;
+        let referenced_bytes = object
+            .node
+            .order()
+            .u64(object.node.bonus(), 72)
+            .map_err(|error| parse(&error))?;
         let bp = BlockPointer::parse(&object.node.bonus()[128..256], object.node.order())
             .map_err(|error| parse(&error))?;
         let raw = self
@@ -80,12 +87,24 @@ impl Objects {
             cache: VecDeque::new(),
             cached_bytes: 0,
         };
-        Zpl::open(cx, view, dataset.guid)
+        Zpl::open(
+            cx,
+            view,
+            dataset.guid,
+            referenced_bytes,
+            Some((Box::new(self.clone_mos()), components.to_vec())),
+        )
     }
 }
 
 impl Zpl {
-    fn open(cx: &Cx, mut objects: Objects, dataset_guid: u64) -> Result<Self> {
+    fn open(
+        cx: &Cx,
+        mut objects: Objects,
+        dataset_guid: u64,
+        referenced_bytes: u64,
+        mos: Option<(Box<Objects>, Vec<Vec<u8>>)>,
+    ) -> Result<Self> {
         let master = typed_map(&mut objects, cx, 1, 21)?;
         let root = required(&master, b"ROOT")?;
         let version = required(&master, b"VERSION")?;
@@ -131,6 +150,8 @@ impl Zpl {
             version,
             registry,
             utf8_only: utf8 != 0,
+            referenced_bytes,
+            mos,
         };
         let (_, metadata) = zpl.file(cx, root)?;
         if metadata.kind != Kind::Directory || metadata.parent != root {
@@ -138,6 +159,54 @@ impl Zpl {
         }
         checkpoint(cx)?;
         Ok(zpl)
+    }
+
+    #[must_use]
+    pub const fn has_snapshot_dir(&self) -> bool {
+        self.mos.is_some()
+    }
+
+    pub fn snapshots(&mut self, cx: &Cx) -> Result<Vec<snapshots::Snapshot>> {
+        let Some((mos, components)) = &mut self.mos else {
+            return Ok(Vec::new());
+        };
+        mos.snapshots(cx, components)
+    }
+
+    pub fn open_snapshot(&mut self, cx: &Cx, name: &[u8]) -> Result<Self> {
+        let Some((mos, components)) = &mut self.mos else {
+            return Err(FfsError::NotFound("ZFS named snapshot".into()));
+        };
+        mos.zpl_snapshot(cx, components, name)
+    }
+
+    #[must_use]
+    pub fn statfs_info(&self) -> ffs_core::FsStat {
+        let bsize = 4096_u64;
+        let total_bytes = self.objects.config.total_data_bytes();
+        let used_bytes = self.referenced_bytes.max(self.objects.meta.used_bytes());
+        let blocks = total_bytes / bsize;
+        let bfree = total_bytes.saturating_sub(used_bytes) / bsize;
+        let dnodes_per_block =
+            (ffs_ondisk::zfs_dmu::DNODE_BLOCK_BYTES / ffs_ondisk::zfs_dmu::DNODE_BYTES) as u64;
+        let files = self
+            .objects
+            .meta
+            .max_block()
+            .saturating_add(1)
+            .saturating_mul(dnodes_per_block);
+        let max_objects = 1_u64 << 48;
+        let frsize = (1_u32 << self.objects.config.ashift.clamp(9, 16)).max(512);
+        ffs_core::FsStat {
+            blocks,
+            blocks_free: bfree,
+            blocks_available: bfree,
+            files,
+            files_free: max_objects.saturating_sub(files),
+            block_size: bsize as u32,
+            name_max: 255,
+            fragment_size: frsize,
+        }
     }
 
     fn file(&mut self, cx: &Cx, number: u64) -> Result<(Object, Metadata)> {

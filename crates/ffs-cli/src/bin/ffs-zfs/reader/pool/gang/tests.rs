@@ -97,6 +97,8 @@ impl Fixture {
                 .map(|id| RaidzMember {
                     supplied_index: width - 1 - id,
                     guid: 100 + id as u64,
+                    ashift,
+                    allocated_bytes: CAPACITY,
                 })
                 .collect(),
         });

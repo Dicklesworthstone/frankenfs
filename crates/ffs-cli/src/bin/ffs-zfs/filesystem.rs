@@ -17,10 +17,25 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 const ROOT: InodeNumber = InodeNumber(1);
+const CTL_FLAG: u64 = 1_u64 << 62;
+pub const ZFS_CTL_INO: InodeNumber = InodeNumber(CTL_FLAG);
+pub const ZFS_SNAPDIR_INO: InodeNumber = InodeNumber(CTL_FLAG | 1);
 const MAX_NODES: usize = 131_072;
 const MAX_DIRECTORY_CACHE_BYTES: usize = 8 * 1024 * 1024;
 const MAX_CACHED_DIRECTORIES: usize = 32;
 const PAGE_ENTRIES: usize = 256;
+
+const fn snap_root_ino(snap_idx: u16) -> InodeNumber {
+    InodeNumber(CTL_FLAG | ((snap_idx as u64) << 48) | 1)
+}
+
+const fn decode_snap_idx(ino: InodeNumber) -> Option<u16> {
+    if ino.0 & CTL_FLAG == 0 {
+        return None;
+    }
+    let idx = ((ino.0 >> 48) & 0x3FFF) as u16;
+    if idx == 0 { None } else { Some(idx) }
+}
 
 fn checkpoint(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FfsError::Cancelled)
@@ -64,22 +79,48 @@ struct CachedDirectory {
     bytes: usize,
 }
 
-struct State {
+struct ViewState {
     view: Zpl,
+    root_ino: InodeNumber,
+    root_parent_ino: InodeNumber,
+    ino_prefix: u64,
     nodes: BTreeMap<InodeNumber, Identity>,
     directories: VecDeque<CachedDirectory>,
     directory_bytes: usize,
 }
 
-impl State {
+impl ViewState {
+    fn new(
+        cx: &Cx,
+        mut view: Zpl,
+        root_ino: InodeNumber,
+        root_parent_ino: InodeNumber,
+        ino_prefix: u64,
+    ) -> Result<Self> {
+        checkpoint(cx)?;
+        let (root, _) = view.stat(cx, view.root)?;
+        let identity = Identity::from_metadata(view.root, &root);
+        let mut state = Self {
+            view,
+            root_ino,
+            root_parent_ino,
+            ino_prefix,
+            nodes: BTreeMap::from([(root_ino, identity)]),
+            directories: VecDeque::new(),
+            directory_bytes: 0,
+        };
+        state.directory(cx, root_ino)?;
+        Ok(state)
+    }
+
     fn inode(&self, object: u64) -> Result<InodeNumber> {
         if object == self.view.root {
-            return Ok(ROOT);
+            return Ok(self.root_ino);
         }
-        if object == 0 || object >= 1 << 48 {
+        if object == 0 || object >= (1 << 48) - 1 {
             return Err(corrupt("invalid ZPL mount object number"));
         }
-        Ok(InodeNumber(object + 1))
+        Ok(InodeNumber(self.ino_prefix | (object + 1)))
     }
 
     fn metadata(&mut self, cx: &Cx, ino: InodeNumber) -> Result<(Metadata, u64)> {
@@ -113,10 +154,19 @@ impl State {
             return Ok(rows);
         }
         let object = self.nodes[&ino].object;
-        let parent = self.inode(metadata.parent)?;
-        if self.metadata(cx, parent)?.0.kind != Kind::Directory {
-            return Err(corrupt("ZPL mount directory parent is not a directory"));
-        }
+        let parent = if ino == self.root_ino {
+            let root_lookup_parent = self.inode(metadata.parent)?;
+            if self.metadata(cx, root_lookup_parent)?.0.kind != Kind::Directory {
+                return Err(corrupt("ZPL mount directory parent is not a directory"));
+            }
+            self.root_parent_ino
+        } else {
+            let p = self.inode(metadata.parent)?;
+            if self.metadata(cx, p)?.0.kind != Kind::Directory {
+                return Err(corrupt("ZPL mount directory parent is not a directory"));
+            }
+            p
+        };
         let mut entries = self.view.list(cx, object)?;
         entries.sort_unstable_by(|left, right| left.name.cmp(&right.name));
         let mut rows = vec![
@@ -189,6 +239,54 @@ impl State {
     }
 }
 
+struct State {
+    head: ViewState,
+    snapshot_names: Option<Vec<Vec<u8>>>,
+    snapshots: BTreeMap<u16, ViewState>,
+}
+
+impl State {
+    fn ensure_snapshot_names(&mut self, cx: &Cx) -> Result<&[Vec<u8>]> {
+        if !self.head.view.has_snapshot_dir() {
+            return Err(FfsError::NotFound("ZPL snapshot control directory".into()));
+        }
+        if self.snapshot_names.is_none() {
+            let snaps = self.head.view.snapshots(cx)?;
+            self.snapshot_names = Some(snaps.into_iter().map(|s| s.name).collect());
+        }
+        Ok(self.snapshot_names.as_deref().unwrap_or(&[]))
+    }
+
+    fn snapshot_view(&mut self, cx: &Cx, snap_idx: u16) -> Result<&mut ViewState> {
+        checkpoint(cx)?;
+        if !self.snapshots.contains_key(&snap_idx) {
+            let names = self.ensure_snapshot_names(cx)?;
+            let name = names
+                .get(usize::from(snap_idx.saturating_sub(1)))
+                .ok_or_else(|| FfsError::NotFound(format!("ZPL snapshot index {snap_idx}")))?
+                .clone();
+            let snap_zpl = self.head.view.open_snapshot(cx, &name)?;
+            let prefix = CTL_FLAG | (u64::from(snap_idx) << 48);
+            let root_ino = snap_root_ino(snap_idx);
+            let view_state = ViewState::new(cx, snap_zpl, root_ino, ZFS_SNAPDIR_INO, prefix)?;
+            self.snapshots.insert(snap_idx, view_state);
+        }
+        self.snapshots
+            .get_mut(&snap_idx)
+            .ok_or_else(|| FfsError::NotFound(format!("ZPL snapshot index {snap_idx}")))
+    }
+
+    fn view_for_ino(&mut self, cx: &Cx, ino: InodeNumber) -> Result<&mut ViewState> {
+        if let Some(snap_idx) = decode_snap_idx(ino) {
+            self.snapshot_view(cx, snap_idx)
+        } else if ino.0 & CTL_FLAG != 0 {
+            Err(FfsError::NotFound(format!("ZPL control inode {}", ino.0)))
+        } else {
+            Ok(&mut self.head)
+        }
+    }
+}
+
 pub struct ZfsFs {
     state: Mutex<State>,
     uid: u32,
@@ -196,20 +294,14 @@ pub struct ZfsFs {
 }
 
 impl ZfsFs {
-    pub fn new(cx: &Cx, mut view: Zpl, uid: u32, gid: u32) -> Result<Self> {
-        checkpoint(cx)?;
-        let (root, _) = view.stat(cx, view.root)?;
-        let identity = Identity::from_metadata(view.root, &root);
-        let mut state = State {
-            view,
-            nodes: BTreeMap::from([(ROOT, identity)]),
-            directories: VecDeque::new(),
-            directory_bytes: 0,
-        };
-        // A bad root is refused before FUSE INIT, including corrupt children.
-        state.directory(cx, ROOT)?;
+    pub fn new(cx: &Cx, view: Zpl, uid: u32, gid: u32) -> Result<Self> {
+        let head = ViewState::new(cx, view, ROOT, ROOT, 0)?;
         Ok(Self {
-            state: Mutex::new(state),
+            state: Mutex::new(State {
+                head,
+                snapshot_names: None,
+                snapshots: BTreeMap::new(),
+            }),
             uid,
             gid,
         })
@@ -225,8 +317,47 @@ impl ZfsFs {
         Ok(state)
     }
 
+    fn ctl_attributes(
+        &self,
+        cx: &Cx,
+        state: &mut State,
+        ino: InodeNumber,
+        nlink: u32,
+    ) -> Result<InodeAttr> {
+        if !state.head.view.has_snapshot_dir() {
+            return Err(FfsError::NotFound("ZPL control directory".into()));
+        }
+        let (root_meta, _) = state.head.metadata(cx, ROOT)?;
+        Ok(InodeAttr {
+            ino,
+            size: u64::from(nlink),
+            blocks: 0,
+            atime: system_time(root_meta.times[0])?,
+            mtime: system_time(root_meta.times[1])?,
+            ctime: system_time(root_meta.times[2])?,
+            crtime: system_time(root_meta.times[3])?,
+            kind: FileType::Directory,
+            perm: 0o555,
+            nlink,
+            uid: self.uid,
+            gid: self.gid,
+            rdev: 0,
+            blksize: 4096,
+            generation: 1,
+        })
+    }
+
     fn attributes(&self, cx: &Cx, state: &mut State, ino: InodeNumber) -> Result<InodeAttr> {
-        let (metadata, allocated) = state.metadata(cx, ino)?;
+        if ino == ZFS_CTL_INO {
+            return self.ctl_attributes(cx, state, ZFS_CTL_INO, 3);
+        }
+        if ino == ZFS_SNAPDIR_INO {
+            let count = state.ensure_snapshot_names(cx)?.len();
+            let nlink = u32::try_from(2 + count).unwrap_or(u32::MAX);
+            return self.ctl_attributes(cx, state, ZFS_SNAPDIR_INO, nlink);
+        }
+        let view_state = state.view_for_ino(cx, ino)?;
+        let (metadata, allocated) = view_state.metadata(cx, ino)?;
         let kind = file_type(metadata.kind)?;
         let perm = match kind {
             FileType::Directory => 0o555,
@@ -276,7 +407,40 @@ impl FsOps for ZfsFs {
             return Err(FfsError::Format("invalid ZPL mount path component".into()));
         }
         let mut state = self.state(cx)?;
-        let rows = state.directory(cx, parent)?;
+        if parent == ROOT && name == b".zfs" && state.head.view.has_snapshot_dir() {
+            return self.ctl_attributes(cx, &mut state, ZFS_CTL_INO, 3);
+        }
+        if parent == ZFS_CTL_INO {
+            if !state.head.view.has_snapshot_dir() {
+                return Err(FfsError::NotFound("ZPL control directory".into()));
+            }
+            return match name {
+                b"." => self.ctl_attributes(cx, &mut state, ZFS_CTL_INO, 3),
+                b".." => self.attributes(cx, &mut state, ROOT),
+                b"snapshot" => self.attributes(cx, &mut state, ZFS_SNAPDIR_INO),
+                _ => Err(FfsError::NotFound("ZPL control entry".into())),
+            };
+        }
+        if parent == ZFS_SNAPDIR_INO {
+            if !state.head.view.has_snapshot_dir() {
+                return Err(FfsError::NotFound("ZPL snapshot directory".into()));
+            }
+            return match name {
+                b"." => self.attributes(cx, &mut state, ZFS_SNAPDIR_INO),
+                b".." => self.ctl_attributes(cx, &mut state, ZFS_CTL_INO, 3),
+                _ => {
+                    let names = state.ensure_snapshot_names(cx)?;
+                    let index = names
+                        .binary_search_by(|candidate| candidate.as_slice().cmp(name))
+                        .map_err(|_| FfsError::NotFound("ZFS named snapshot".into()))?;
+                    let snap_idx = u16::try_from(index + 1)
+                        .map_err(|_| unsupported("snapshot index overflow"))?;
+                    let root_ino = state.snapshot_view(cx, snap_idx)?.root_ino;
+                    self.attributes(cx, &mut state, root_ino)
+                }
+            };
+        }
+        let rows = state.view_for_ino(cx, parent)?.directory(cx, parent)?;
         let target = match name {
             b"." => parent,
             b".." => rows[1].ino,
@@ -297,7 +461,69 @@ impl FsOps for ZfsFs {
         ino: InodeNumber,
         offset: u64,
     ) -> Result<ReaddirPage> {
-        let rows = self.state(cx)?.directory(cx, ino)?;
+        let mut state = self.state(cx)?;
+        if ino == ZFS_CTL_INO {
+            if !state.head.view.has_snapshot_dir() {
+                return Err(FfsError::NotFound("ZPL control directory".into()));
+            }
+            let rows = vec![
+                DirEntry {
+                    ino: ZFS_CTL_INO,
+                    offset: 1,
+                    kind: FileType::Directory,
+                    name: b".".to_vec(),
+                },
+                DirEntry {
+                    ino: ROOT,
+                    offset: 2,
+                    kind: FileType::Directory,
+                    name: b"..".to_vec(),
+                },
+                DirEntry {
+                    ino: ZFS_SNAPDIR_INO,
+                    offset: 3,
+                    kind: FileType::Directory,
+                    name: b"snapshot".to_vec(),
+                },
+            ];
+            let start = rows.partition_point(|row| row.offset <= offset);
+            let end = rows.len().min(start + PAGE_ENTRIES);
+            checkpoint(cx)?;
+            return Ok(ReaddirPage::new(rows[start..end].to_vec())
+                .with_end_cookie(Some(rows.len() as u64)));
+        }
+        if ino == ZFS_SNAPDIR_INO {
+            let names = state.ensure_snapshot_names(cx)?.to_vec();
+            let mut rows = Vec::with_capacity(2 + names.len());
+            rows.push(DirEntry {
+                ino: ZFS_SNAPDIR_INO,
+                offset: 1,
+                kind: FileType::Directory,
+                name: b".".to_vec(),
+            });
+            rows.push(DirEntry {
+                ino: ZFS_CTL_INO,
+                offset: 2,
+                kind: FileType::Directory,
+                name: b"..".to_vec(),
+            });
+            for (idx, name) in names.into_iter().enumerate() {
+                let snap_idx =
+                    u16::try_from(idx + 1).map_err(|_| unsupported("snapshot index overflow"))?;
+                rows.push(DirEntry {
+                    ino: snap_root_ino(snap_idx),
+                    offset: rows.len() as u64 + 1,
+                    kind: FileType::Directory,
+                    name,
+                });
+            }
+            let start = rows.partition_point(|row| row.offset <= offset);
+            let end = rows.len().min(start + PAGE_ENTRIES);
+            checkpoint(cx)?;
+            return Ok(ReaddirPage::new(rows[start..end].to_vec())
+                .with_end_cookie(Some(rows.len() as u64)));
+        }
+        let rows = state.view_for_ino(cx, ino)?.directory(cx, ino)?;
         let start = rows.partition_point(|row| row.offset <= offset);
         let end = rows.len().min(start + PAGE_ENTRIES);
         checkpoint(cx)?;
@@ -312,10 +538,14 @@ impl FsOps for ZfsFs {
         offset: u64,
         size: u32,
     ) -> Result<Vec<u8>> {
+        if ino == ZFS_CTL_INO || ino == ZFS_SNAPDIR_INO {
+            return Err(FfsError::IsDirectory);
+        }
         let mut state = self.state(cx)?;
-        state.metadata(cx, ino)?;
-        let object = state.nodes[&ino].object;
-        state.view.read(cx, object, offset, size as usize)
+        let view_state = state.view_for_ino(cx, ino)?;
+        view_state.metadata(cx, ino)?;
+        let object = view_state.nodes[&ino].object;
+        view_state.view.read(cx, object, offset, size as usize)
     }
 
     fn open(
@@ -330,7 +560,11 @@ impl FsOps for ZfsFs {
         {
             return Err(FfsError::ReadOnly);
         }
-        let kind = self.state(cx)?.metadata(cx, ino)?.0.kind;
+        if ino == ZFS_CTL_INO || ino == ZFS_SNAPDIR_INO {
+            return Err(FfsError::IsDirectory);
+        }
+        let mut state = self.state(cx)?;
+        let kind = state.view_for_ino(cx, ino)?.metadata(cx, ino)?.0.kind;
         match kind {
             Kind::Directory => Err(FfsError::IsDirectory),
             Kind::Regular => Ok((0, 0)),
@@ -339,26 +573,38 @@ impl FsOps for ZfsFs {
     }
 
     fn readlink(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber) -> Result<Vec<u8>> {
-        let mut state = self.state(cx)?;
-        if state.metadata(cx, ino)?.0.kind != Kind::Symlink {
+        if ino == ZFS_CTL_INO || ino == ZFS_SNAPDIR_INO {
             return Err(FfsError::Format("ZPL inode is not a symbolic link".into()));
         }
-        let object = state.nodes[&ino].object;
-        state.view.readlink(cx, object)
+        let mut state = self.state(cx)?;
+        let view_state = state.view_for_ino(cx, ino)?;
+        if view_state.metadata(cx, ino)?.0.kind != Kind::Symlink {
+            return Err(FfsError::Format("ZPL inode is not a symbolic link".into()));
+        }
+        let object = view_state.nodes[&ino].object;
+        view_state.view.readlink(cx, object)
     }
 
     fn listxattr(&self, cx: &Cx, ino: InodeNumber) -> Result<Vec<String>> {
+        if ino == ZFS_CTL_INO || ino == ZFS_SNAPDIR_INO {
+            return Ok(Vec::new());
+        }
         let mut state = self.state(cx)?;
-        state.metadata(cx, ino)?;
-        let object = state.nodes[&ino].object;
-        state.view.listxattr(cx, object)
+        let view_state = state.view_for_ino(cx, ino)?;
+        view_state.metadata(cx, ino)?;
+        let object = view_state.nodes[&ino].object;
+        view_state.view.listxattr(cx, object)
     }
 
     fn getxattr(&self, cx: &Cx, ino: InodeNumber, name: &str) -> Result<Option<Vec<u8>>> {
+        if ino == ZFS_CTL_INO || ino == ZFS_SNAPDIR_INO {
+            return Ok(None);
+        }
         let mut state = self.state(cx)?;
-        state.metadata(cx, ino)?;
-        let object = state.nodes[&ino].object;
-        state.view.getxattr(cx, object, name)
+        let view_state = state.view_for_ino(cx, ino)?;
+        view_state.metadata(cx, ino)?;
+        let object = view_state.nodes[&ino].object;
+        view_state.view.getxattr(cx, object, name)
     }
 
     fn fsync(
@@ -369,7 +615,10 @@ impl FsOps for ZfsFs {
         _fh: u64,
         _datasync: bool,
     ) -> Result<()> {
-        self.state(cx)?.metadata(cx, ino)?;
+        let mut state = self.state(cx)?;
+        if ino != ZFS_CTL_INO && ino != ZFS_SNAPDIR_INO {
+            state.view_for_ino(cx, ino)?.metadata(cx, ino)?;
+        }
         checkpoint(cx)
     }
 
@@ -381,10 +630,37 @@ impl FsOps for ZfsFs {
         _fh: u64,
         _datasync: bool,
     ) -> Result<()> {
-        if self.state(cx)?.metadata(cx, ino)?.0.kind != Kind::Directory {
+        let mut state = self.state(cx)?;
+        if ino == ZFS_CTL_INO || ino == ZFS_SNAPDIR_INO {
+            if !state.head.view.has_snapshot_dir() {
+                return Err(FfsError::NotFound("ZPL control directory".into()));
+            }
+            return checkpoint(cx);
+        }
+        if state.view_for_ino(cx, ino)?.metadata(cx, ino)?.0.kind != Kind::Directory {
             return Err(FfsError::NotDirectory);
         }
         checkpoint(cx)
+    }
+
+    fn statfs(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+    ) -> Result<ffs_core::FsStat> {
+        let mut state = self.state(cx)?;
+        if ino == ZFS_CTL_INO || ino == ZFS_SNAPDIR_INO {
+            if !state.head.view.has_snapshot_dir() {
+                return Err(FfsError::NotFound("ZPL control directory".into()));
+            }
+            checkpoint(cx)?;
+            return Ok(state.head.view.statfs_info());
+        }
+        let view_state = state.view_for_ino(cx, ino)?;
+        view_state.metadata(cx, ino)?;
+        checkpoint(cx)?;
+        Ok(view_state.view.statfs_info())
     }
 
     fn lseek(
@@ -395,7 +671,11 @@ impl FsOps for ZfsFs {
         offset: u64,
         whence: SeekWhence,
     ) -> Result<u64> {
-        let (metadata, _) = self.state(cx)?.metadata(cx, ino)?;
+        if ino == ZFS_CTL_INO || ino == ZFS_SNAPDIR_INO {
+            return Err(unsupported("ZPL seek requires a regular file"));
+        }
+        let mut state = self.state(cx)?;
+        let (metadata, _) = state.view_for_ino(cx, ino)?.metadata(cx, ino)?;
         if metadata.kind != Kind::Regular {
             return Err(unsupported("ZPL seek requires a regular file"));
         }
