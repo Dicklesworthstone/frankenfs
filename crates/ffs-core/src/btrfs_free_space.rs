@@ -9,9 +9,8 @@
 use asupersync::Cx;
 use ffs_btrfs::writeback::WriteDependencyDag;
 use ffs_btrfs::{
-    BTRFS_FREE_SPACE_TREE_OBJECTID, BlockGroupFreeSpace, BtrfsBTree,
-    BtrfsExtentAllocator, BtrfsRootItem, InMemoryCowBtrfsTree,
-    build_free_space_tree_items,
+    BTRFS_FREE_SPACE_TREE_OBJECTID, BlockGroupFreeSpace, BtrfsBTree, BtrfsExtentAllocator,
+    BtrfsRootItem, InMemoryCowBtrfsTree, build_free_space_tree_items,
 };
 use ffs_error::{FfsError, Result};
 use std::collections::BTreeMap;
@@ -47,7 +46,7 @@ fn build_tree(
 
 /// An estimate for the existing pre-allocation chunk-growth planner. The actual
 /// allocator and bounded fixpoint, not this estimate, decide whether a commit fits.
-pub(super) fn estimated_nodes(
+pub fn estimated_nodes(
     cx: &Cx,
     allocator: &BtrfsExtentAllocator,
     nodesize: u32,
@@ -63,7 +62,7 @@ pub(super) fn estimated_nodes(
         .map_err(|_| FfsError::InvalidGeometry("free-space tree node count overflow".into()))
 }
 
-pub(super) struct FreeSpaceTreeCow {
+pub struct FreeSpaceTreeCow {
     nodesize: u32,
     // Position in child-before-parent order, never an ephemeral in-memory id.
     pool: Vec<u64>,
@@ -72,7 +71,7 @@ pub(super) struct FreeSpaceTreeCow {
 }
 
 impl FreeSpaceTreeCow {
-    pub(super) fn new(nodesize: u32) -> Self {
+    pub fn new(nodesize: u32) -> Self {
         Self {
             nodesize,
             pool: Vec::new(),
@@ -84,7 +83,7 @@ impl FreeSpaceTreeCow {
     /// Rebuild from the current allocation map, then reconcile the addresses
     /// needed to store that tree. Any reservation/retirement/level change forces
     /// another OUTER pass: it can change all three trees' shapes. No device I/O.
-    pub(super) fn reconcile(
+    pub fn reconcile(
         &mut self,
         cx: &Cx,
         allocator: &mut BtrfsExtentAllocator,
@@ -145,7 +144,7 @@ impl FreeSpaceTreeCow {
 
     /// Called only after the outer extent/root/free-space fixpoint converges.
     /// The caller must not allocate or retire another extent after this point.
-    pub(super) fn finish(self, generation: u64) -> Result<PreparedFreeSpaceTree> {
+    pub fn finish(self, generation: u64) -> Result<PreparedFreeSpaceTree> {
         if !self.settled {
             return Err(FfsError::Format(
                 "free-space tree reservations are not settled".into(),
@@ -176,22 +175,22 @@ impl FreeSpaceTreeCow {
     }
 }
 
-pub(super) struct PreparedFreeSpaceTree {
-    pub(super) tree: InMemoryCowBtrfsTree,
-    pub(super) order: Vec<(u64, u8)>,
-    pub(super) addresses: BTreeMap<u64, u64>,
+pub struct PreparedFreeSpaceTree {
+    pub tree: InMemoryCowBtrfsTree,
+    pub order: Vec<(u64, u8)>,
+    pub addresses: BTreeMap<u64, u64>,
     nodesize: u32,
 }
 
 impl PreparedFreeSpaceTree {
-    pub(super) fn root_bytenr(&self) -> Result<u64> {
+    pub fn root_bytenr(&self) -> Result<u64> {
         self.addresses
             .get(&self.tree.root_block())
             .copied()
             .ok_or_else(|| FfsError::Format("free-space tree root has no reservation".into()))
     }
 
-    pub(super) fn patch_root_item(&self, data: &mut [u8], generation: u64) -> Result<()> {
+    pub fn patch_root_item(&self, data: &mut [u8], generation: u64) -> Result<()> {
         BtrfsRootItem::patch_root_commit(
             data,
             self.root_bytenr()?,
@@ -204,9 +203,7 @@ impl PreparedFreeSpaceTree {
         let bytes_used = u64::try_from(self.order.len())
             .ok()
             .and_then(|count| count.checked_mul(u64::from(self.nodesize)))
-            .ok_or_else(|| {
-                FfsError::InvalidGeometry("free-space tree size overflow".into())
-            })?;
+            .ok_or_else(|| FfsError::InvalidGeometry("free-space tree size overflow".into()))?;
         // Packed btrfs_root_item: 160-byte inode, then generation/root_dirid/
         // bytenr/byte_limit, followed by bytes_used at [192,200). Preserve all
         // other fields and the original legacy/extended root-item length.
