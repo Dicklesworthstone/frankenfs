@@ -1168,6 +1168,944 @@ impl ByteDevice for FileByteDevice {
     }
 }
 
+impl<D: ByteDevice + ?Sized> ByteDevice for Arc<D> {
+    fn len_bytes(&self) -> u64 {
+        (**self).len_bytes()
+    }
+
+    fn supports_vectored_reads(&self) -> bool {
+        (**self).supports_vectored_reads()
+    }
+
+    fn preserves_read_exact_at_destination_on_error(&self) -> bool {
+        (**self).preserves_read_exact_at_destination_on_error()
+    }
+
+    fn preserves_read_vectored_destinations_on_error(&self) -> bool {
+        (**self).preserves_read_vectored_destinations_on_error()
+    }
+
+    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
+        (**self).read_exact_at(cx, offset, buf)
+    }
+
+    fn read_exact_at_volatile(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
+        (**self).read_exact_at_volatile(cx, offset, buf)
+    }
+
+    fn read_vectored_exact_at(
+        &self,
+        cx: &Cx,
+        offset: ByteOffset,
+        bufs: &mut [IoSliceMut<'_>],
+    ) -> Result<()> {
+        (**self).read_vectored_exact_at(cx, offset, bufs)
+    }
+
+    fn write_all_at(&self, cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<()> {
+        (**self).write_all_at(cx, offset, buf)
+    }
+
+    fn write_vectored_all_at(&self, cx: &Cx, offset: ByteOffset, bufs: &[&[u8]]) -> Result<()> {
+        (**self).write_vectored_all_at(cx, offset, bufs)
+    }
+
+    fn sync(&self, cx: &Cx) -> Result<()> {
+        (**self).sync(cx)
+    }
+
+    fn supports_discard(&self) -> bool {
+        (**self).supports_discard()
+    }
+
+    fn discard(&self, cx: &Cx, offset: ByteOffset, len: u64) -> Result<()> {
+        (**self).discard(cx, offset, len)
+    }
+}
+
+impl<D: ByteDevice + ?Sized> ByteDevice for Box<D> {
+    fn len_bytes(&self) -> u64 {
+        (**self).len_bytes()
+    }
+
+    fn supports_vectored_reads(&self) -> bool {
+        (**self).supports_vectored_reads()
+    }
+
+    fn preserves_read_exact_at_destination_on_error(&self) -> bool {
+        (**self).preserves_read_exact_at_destination_on_error()
+    }
+
+    fn preserves_read_vectored_destinations_on_error(&self) -> bool {
+        (**self).preserves_read_vectored_destinations_on_error()
+    }
+
+    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
+        (**self).read_exact_at(cx, offset, buf)
+    }
+
+    fn read_exact_at_volatile(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
+        (**self).read_exact_at_volatile(cx, offset, buf)
+    }
+
+    fn read_vectored_exact_at(
+        &self,
+        cx: &Cx,
+        offset: ByteOffset,
+        bufs: &mut [IoSliceMut<'_>],
+    ) -> Result<()> {
+        (**self).read_vectored_exact_at(cx, offset, bufs)
+    }
+
+    fn write_all_at(&self, cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<()> {
+        (**self).write_all_at(cx, offset, buf)
+    }
+
+    fn write_vectored_all_at(&self, cx: &Cx, offset: ByteOffset, bufs: &[&[u8]]) -> Result<()> {
+        (**self).write_vectored_all_at(cx, offset, bufs)
+    }
+
+    fn sync(&self, cx: &Cx) -> Result<()> {
+        (**self).sync(cx)
+    }
+
+    fn supports_discard(&self) -> bool {
+        (**self).supports_discard()
+    }
+
+    fn discard(&self, cx: &Cx, offset: ByteOffset, len: u64) -> Result<()> {
+        (**self).discard(cx, offset, len)
+    }
+}
+
+/// Number of striped locks used by [`VolumeDevice`] to serialize sub-sector
+/// read-modify-write updates without a global volume lock (`CORE-01`).
+pub const VOLUME_DEVICE_RMW_STRIPES: usize = 64;
+
+/// Default logical and physical sector size for [`VolumeDevice`].
+pub const DEFAULT_VOLUME_SECTOR_SIZE: u32 = 512;
+
+fn validate_volume_sector_sizes(logical_sector_size: u32, physical_sector_size: u32) -> Result<()> {
+    if !(512..=65_536).contains(&logical_sector_size) || !logical_sector_size.is_power_of_two() {
+        return Err(FfsError::Format(format!(
+            "invalid logical sector size {logical_sector_size}: expected power of two in 512..=65536"
+        )));
+    }
+    if !(512..=65_536).contains(&physical_sector_size)
+        || !physical_sector_size.is_power_of_two()
+        || physical_sector_size < logical_sector_size
+    {
+        return Err(FfsError::Format(format!(
+            "invalid physical sector size {physical_sector_size}: expected power of two in {logical_sector_size}..=65536"
+        )));
+    }
+    Ok(())
+}
+
+/// Bounded volume slice over a [`ByteDevice`] with sector geometry and
+/// striped sub-sector Read-Modify-Write serialization (`CORE-01`).
+///
+/// Every read and write is bounds-checked against `self.length` **before**
+/// translating `self.base + offset`, preventing adjacent-partition reads or
+/// writes on multi-partition disk images. Unaligned sub-sector writes (such as
+/// 2-byte FAT16 entry updates or 32-byte directory slot writes) are serialized
+/// across 64 striped sector locks while sector-aligned writes pass directly
+/// through without extra copying.
+#[derive(Debug)]
+pub struct VolumeDevice<D> {
+    device: D,
+    base: u64,
+    length: u64,
+    logical_sector_size: u32,
+    physical_sector_size: u32,
+    read_only: bool,
+    rmw_stripes: Arc<[Mutex<()>; VOLUME_DEVICE_RMW_STRIPES]>,
+    rmw_operations: Arc<AtomicU64>,
+    passthrough_writes: Arc<AtomicU64>,
+}
+
+impl<D: Clone> Clone for VolumeDevice<D> {
+    fn clone(&self) -> Self {
+        Self {
+            device: self.device.clone(),
+            base: self.base,
+            length: self.length,
+            logical_sector_size: self.logical_sector_size,
+            physical_sector_size: self.physical_sector_size,
+            read_only: self.read_only,
+            rmw_stripes: Arc::clone(&self.rmw_stripes),
+            rmw_operations: Arc::clone(&self.rmw_operations),
+            passthrough_writes: Arc::clone(&self.passthrough_writes),
+        }
+    }
+}
+
+impl<D: ByteDevice> VolumeDevice<D> {
+    /// Construct a writable bounded volume over `device`.
+    pub fn new(
+        device: D,
+        base: u64,
+        length: u64,
+        logical_sector_size: u32,
+        physical_sector_size: u32,
+    ) -> Result<Self> {
+        Self::with_mode(
+            device,
+            base,
+            length,
+            logical_sector_size,
+            physical_sector_size,
+            false,
+        )
+    }
+
+    /// Construct a read-only bounded volume over `device`.
+    pub fn new_read_only(
+        device: D,
+        base: u64,
+        length: u64,
+        logical_sector_size: u32,
+        physical_sector_size: u32,
+    ) -> Result<Self> {
+        Self::with_mode(
+            device,
+            base,
+            length,
+            logical_sector_size,
+            physical_sector_size,
+            true,
+        )
+    }
+
+    /// Construct a bounded volume from `(base, optional_length)` with 512-byte
+    /// default sector geometry. When `length` is `None`, the volume spans the
+    /// remainder of `device`.
+    pub fn from_range(device: D, base: u64, length: Option<u64>, read_only: bool) -> Result<Self> {
+        let backing_len = device.len_bytes();
+        let resolved_len = match length {
+            Some(explicit) => explicit,
+            None => backing_len.checked_sub(base).ok_or_else(|| {
+                FfsError::Format(format!(
+                    "volume base {base} exceeds backing length {backing_len}"
+                ))
+            })?,
+        };
+        Self::with_mode(
+            device,
+            base,
+            resolved_len,
+            DEFAULT_VOLUME_SECTOR_SIZE,
+            DEFAULT_VOLUME_SECTOR_SIZE,
+            read_only,
+        )
+    }
+
+    fn with_mode(
+        device: D,
+        base: u64,
+        length: u64,
+        logical_sector_size: u32,
+        physical_sector_size: u32,
+        read_only: bool,
+    ) -> Result<Self> {
+        validate_volume_sector_sizes(logical_sector_size, physical_sector_size)?;
+        let backing_len = device.len_bytes();
+        let end = base
+            .checked_add(length)
+            .ok_or_else(|| FfsError::Format("volume range overflows u64".to_owned()))?;
+        if end > backing_len {
+            return Err(FfsError::Format(format!(
+                "volume range [{base}, {end}) exceeds backing length {backing_len}"
+            )));
+        }
+        Ok(Self {
+            device,
+            base,
+            length,
+            logical_sector_size,
+            physical_sector_size,
+            read_only,
+            rmw_stripes: Arc::new(std::array::from_fn(|_| Mutex::new(()))),
+            rmw_operations: Arc::new(AtomicU64::new(0)),
+            passthrough_writes: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    /// Physical byte offset of the volume start on the underlying device.
+    #[must_use]
+    pub const fn base(&self) -> u64 {
+        self.base
+    }
+
+    /// Logical sector size in bytes.
+    #[must_use]
+    pub const fn logical_sector_size(&self) -> u32 {
+        self.logical_sector_size
+    }
+
+    /// Physical sector size in bytes.
+    #[must_use]
+    pub const fn physical_sector_size(&self) -> u32 {
+        self.physical_sector_size
+    }
+
+    /// Whether write operations are refused with [`FfsError::ReadOnly`].
+    #[must_use]
+    pub const fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
+    /// Reference to the underlying [`ByteDevice`].
+    #[must_use]
+    pub const fn inner(&self) -> &D {
+        &self.device
+    }
+
+    /// Consume the volume wrapper and return the underlying [`ByteDevice`].
+    #[must_use]
+    pub fn into_inner(self) -> D {
+        self.device
+    }
+
+    /// Number of unaligned sub-sector read-modify-write operations executed.
+    #[must_use]
+    pub fn rmw_operations(&self) -> u64 {
+        self.rmw_operations.load(Ordering::Relaxed)
+    }
+
+    /// Number of sector-aligned passthrough writes executed without RMW staging.
+    #[must_use]
+    pub fn passthrough_writes(&self) -> u64 {
+        self.passthrough_writes.load(Ordering::Relaxed)
+    }
+
+    fn stripe_indices_for_sectors(first_sector: u64, last_sector: u64) -> Vec<usize> {
+        let span = last_sector.saturating_sub(first_sector).saturating_add(1);
+        if span >= VOLUME_DEVICE_RMW_STRIPES as u64 {
+            return (0..VOLUME_DEVICE_RMW_STRIPES).collect();
+        }
+        let mut indices = Vec::with_capacity(span as usize);
+        for sector in first_sector..=last_sector {
+            #[expect(clippy::cast_possible_truncation)]
+            let stripe = (sector % (VOLUME_DEVICE_RMW_STRIPES as u64)) as usize;
+            indices.push(stripe);
+        }
+        indices.sort_unstable();
+        indices.dedup();
+        indices
+    }
+}
+
+impl<D: ByteDevice> ByteDevice for VolumeDevice<D> {
+    fn len_bytes(&self) -> u64 {
+        self.length
+    }
+
+    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
+        cx_checkpoint(cx)?;
+        let len_u64 = u64::try_from(buf.len())
+            .map_err(|_| FfsError::Format("volume read length overflows u64".to_owned()))?;
+        let rel_end = offset
+            .0
+            .checked_add(len_u64)
+            .ok_or_else(|| FfsError::Format("volume read range overflows u64".to_owned()))?;
+        if rel_end > self.length {
+            return Err(FfsError::Format(format!(
+                "volume read out of bounds: offset={offset} len={len_u64} volume_len={}",
+                self.length
+            )));
+        }
+        if buf.is_empty() {
+            cx_checkpoint(cx)?;
+            return Ok(());
+        }
+        let phys_offset = self.base.checked_add(offset.0).ok_or_else(|| {
+            FfsError::Format("volume physical read offset overflows u64".to_owned())
+        })?;
+        self.device
+            .read_exact_at(cx, ByteOffset(phys_offset), buf)?;
+        cx_checkpoint(cx)?;
+        Ok(())
+    }
+
+    fn write_all_at(&self, cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<()> {
+        cx_checkpoint(cx)?;
+        if self.read_only {
+            return Err(FfsError::ReadOnly);
+        }
+        let len_u64 = u64::try_from(buf.len())
+            .map_err(|_| FfsError::Format("volume write length overflows u64".to_owned()))?;
+        let rel_end = offset
+            .0
+            .checked_add(len_u64)
+            .ok_or_else(|| FfsError::Format("volume write range overflows u64".to_owned()))?;
+        if rel_end > self.length {
+            return Err(FfsError::Format(format!(
+                "volume write out of bounds: offset={offset} len={len_u64} volume_len={}",
+                self.length
+            )));
+        }
+        if buf.is_empty() {
+            cx_checkpoint(cx)?;
+            return Ok(());
+        }
+
+        let sector_bytes = u64::from(self.logical_sector_size);
+        let first_sector = offset.0 / sector_bytes;
+        let last_sector = (rel_end - 1) / sector_bytes;
+        let stripe_indices = Self::stripe_indices_for_sectors(first_sector, last_sector);
+        let mut guards = Vec::with_capacity(stripe_indices.len());
+        for stripe in stripe_indices {
+            guards.push(self.rmw_stripes[stripe].lock());
+        }
+
+        let phys_offset = self.base.checked_add(offset.0).ok_or_else(|| {
+            FfsError::Format("volume physical write offset overflows u64".to_owned())
+        })?;
+
+        // Zero-copy passthrough when the write is aligned to `logical_sector_size`.
+        if offset.0.is_multiple_of(sector_bytes) && len_u64.is_multiple_of(sector_bytes) {
+            self.device.write_all_at(cx, ByteOffset(phys_offset), buf)?;
+            self.passthrough_writes.fetch_add(1, Ordering::Relaxed);
+            drop(guards);
+            cx_checkpoint(cx)?;
+            return Ok(());
+        }
+
+        // Sub-sector or unaligned write: stage Read-Modify-Write clamped strictly
+        // to `[0, self.length)` so adjacent partitions are never read or written.
+        let window_start = first_sector * sector_bytes;
+        let window_end = ((last_sector + 1) * sector_bytes).min(self.length);
+        let window_len = usize::try_from(window_end - window_start)
+            .map_err(|_| FfsError::Format("volume RMW window overflows usize".to_owned()))?;
+        let head_pad = usize::try_from(offset.0 - window_start)
+            .map_err(|_| FfsError::Format("volume RMW head offset overflows usize".to_owned()))?;
+        let phys_window_start = self.base.checked_add(window_start).ok_or_else(|| {
+            FfsError::Format("volume physical RMW offset overflows u64".to_owned())
+        })?;
+
+        let mut stage = vec![0_u8; window_len];
+        if first_sector == last_sector {
+            self.device
+                .read_exact_at(cx, ByteOffset(phys_window_start), &mut stage)?;
+        } else {
+            let sector_usize = self.logical_sector_size as usize;
+            if head_pad > 0 {
+                let head_read_len = sector_usize.min(window_len);
+                self.device.read_exact_at(
+                    cx,
+                    ByteOffset(phys_window_start),
+                    &mut stage[..head_read_len],
+                )?;
+            }
+            if rel_end < window_end {
+                let tail_rel_start = last_sector * sector_bytes;
+                let tail_offset_in_stage =
+                    usize::try_from(tail_rel_start - window_start).map_err(|_| {
+                        FfsError::Format("volume RMW tail offset overflows usize".to_owned())
+                    })?;
+                let phys_tail_start = self.base.checked_add(tail_rel_start).ok_or_else(|| {
+                    FfsError::Format("volume physical tail RMW offset overflows u64".to_owned())
+                })?;
+                self.device.read_exact_at(
+                    cx,
+                    ByteOffset(phys_tail_start),
+                    &mut stage[tail_offset_in_stage..],
+                )?;
+            }
+        }
+
+        stage[head_pad..head_pad + buf.len()].copy_from_slice(buf);
+        self.device
+            .write_all_at(cx, ByteOffset(phys_window_start), &stage)?;
+        self.rmw_operations.fetch_add(1, Ordering::Relaxed);
+        drop(guards);
+        cx_checkpoint(cx)?;
+        Ok(())
+    }
+
+    fn sync(&self, cx: &Cx) -> Result<()> {
+        cx_checkpoint(cx)?;
+        if self.read_only {
+            return Ok(());
+        }
+        self.device.sync(cx)
+    }
+}
+
+/// Operation kind targeted by a [`SectorFaultRule`] (`CORE-05`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SectorFaultOp {
+    Read,
+    Write,
+    Sync,
+}
+
+/// Fault action injected by [`SectorFaultDevice`] (`CORE-05`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SectorFaultAction {
+    /// Fail the operation with `io::ErrorKind::Other` without applying new writes.
+    FailIo,
+    /// Transfer only the first `bytes` bytes and return a short read/write error.
+    ShortTransfer { bytes: usize },
+    /// Tear a write or sync after `keep_sectors` sectors and return an I/O error.
+    TornWrite { keep_sectors: u64 },
+    /// Corrupt a read buffer by XORing `buf[byte_offset]` with `xor_mask`.
+    BitRot { byte_offset: usize, xor_mask: u8 },
+}
+
+/// Deterministic fault rule evaluated by [`SectorFaultDevice`] (`CORE-05`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SectorFaultRule {
+    pub op: SectorFaultOp,
+    /// Optional `[start_sector, end_sector)` filter. `None` matches any sector.
+    pub sector_range: Option<(u64, u64)>,
+    /// Optional 0-based match ordinal on this rule (`Some(0)` fires on first match
+    /// and consumes the rule; `None` fires on every matching operation).
+    pub trigger_on_match: Option<u64>,
+    pub action: SectorFaultAction,
+}
+
+#[derive(Debug, Default)]
+struct SectorFaultState {
+    pending_sectors: std::collections::BTreeMap<u64, Vec<u8>>,
+    bit_rot: std::collections::BTreeMap<u64, u8>,
+    rules: Vec<(SectorFaultRule, u64)>,
+}
+
+/// Shared deterministic fault-injecting [`ByteDevice`] with separate volatile
+/// (`pending`) and durable (`inner`) state (`CORE-05`).
+///
+/// Writes are staged in `pending_sectors` until [`ByteDevice::sync`] flushes them
+/// to `inner`. Calling [`SectorFaultDevice::crash`] discards all unflushed
+/// sectors since the last successful `sync()`, modeling power loss / crash
+/// recovery deterministically across FAT, NTFS, ZFS, ext4, and btrfs tests.
+#[derive(Debug)]
+pub struct SectorFaultDevice<D> {
+    inner: D,
+    sector_size: u32,
+    state: Arc<Mutex<SectorFaultState>>,
+    read_count: Arc<AtomicU64>,
+    write_count: Arc<AtomicU64>,
+    sync_count: Arc<AtomicU64>,
+}
+
+impl<D: Clone> Clone for SectorFaultDevice<D> {
+    fn clone(&self) -> Self {
+        Self {
+            inner: self.inner.clone(),
+            sector_size: self.sector_size,
+            state: Arc::clone(&self.state),
+            read_count: Arc::clone(&self.read_count),
+            write_count: Arc::clone(&self.write_count),
+            sync_count: Arc::clone(&self.sync_count),
+        }
+    }
+}
+
+impl<D: ByteDevice> SectorFaultDevice<D> {
+    /// Wrap `inner` in a deterministic fault-injecting device with `sector_size`
+    /// sector granularity.
+    pub fn new(inner: D, sector_size: u32) -> Result<Self> {
+        validate_volume_sector_sizes(sector_size, sector_size)?;
+        Ok(Self {
+            inner,
+            sector_size,
+            state: Arc::new(Mutex::new(SectorFaultState::default())),
+            read_count: Arc::new(AtomicU64::new(0)),
+            write_count: Arc::new(AtomicU64::new(0)),
+            sync_count: Arc::new(AtomicU64::new(0)),
+        })
+    }
+
+    /// Reference to the durable backing device.
+    #[must_use]
+    pub const fn inner(&self) -> &D {
+        &self.inner
+    }
+
+    /// Consume the fault wrapper and return the durable backing device.
+    #[must_use]
+    pub fn into_inner(self) -> D {
+        self.inner
+    }
+
+    /// Add a deterministic fault rule.
+    pub fn add_rule(&self, rule: SectorFaultRule) {
+        self.state.lock().rules.push((rule, 0));
+    }
+
+    /// Clear all scheduled fault rules.
+    pub fn clear_rules(&self) {
+        self.state.lock().rules.clear();
+    }
+
+    /// Inject persistent bit-rot at `byte_offset` by XORing subsequent reads with `xor_mask`.
+    pub fn inject_bit_rot(&self, byte_offset: ByteOffset, xor_mask: u8) {
+        let mut state = self.state.lock();
+        if xor_mask == 0 {
+            state.bit_rot.remove(&byte_offset.0);
+        } else {
+            *state.bit_rot.entry(byte_offset.0).or_insert(0) ^= xor_mask;
+        }
+    }
+
+    /// Clear all persistent bit-rot injections.
+    pub fn clear_bit_rot(&self) {
+        self.state.lock().bit_rot.clear();
+    }
+
+    /// Simulate a power loss / crash: discard all unflushed writes since the
+    /// last successful `sync()`, returning the number of discarded sectors.
+    pub fn crash(&self) -> usize {
+        let mut state = self.state.lock();
+        let count = state.pending_sectors.len();
+        state.pending_sectors.clear();
+        count
+    }
+
+    /// Number of dirty sectors currently waiting in volatile cache before `sync()`.
+    #[must_use]
+    pub fn unflushed_sector_count(&self) -> usize {
+        self.state.lock().pending_sectors.len()
+    }
+
+    /// Total number of `read_exact_at` calls attempted.
+    #[must_use]
+    pub fn read_count(&self) -> u64 {
+        self.read_count.load(Ordering::Relaxed)
+    }
+
+    /// Total number of `write_all_at` calls attempted.
+    #[must_use]
+    pub fn write_count(&self) -> u64 {
+        self.write_count.load(Ordering::Relaxed)
+    }
+
+    /// Total number of `sync` calls attempted.
+    #[must_use]
+    pub fn sync_count(&self) -> u64 {
+        self.sync_count.load(Ordering::Relaxed)
+    }
+
+    fn match_action(
+        state: &mut SectorFaultState,
+        op: SectorFaultOp,
+        span_sectors: Option<(u64, u64)>,
+    ) -> Option<SectorFaultAction> {
+        let mut matched_idx = None;
+        let mut consume = false;
+        let mut action = None;
+        for (idx, (rule, seen)) in state.rules.iter_mut().enumerate() {
+            if rule.op != op {
+                continue;
+            }
+            if let (Some((rule_start, rule_end)), Some((op_start, op_end))) =
+                (rule.sector_range, span_sectors)
+                && (op_end <= rule_start || op_start >= rule_end)
+            {
+                continue;
+            }
+            let current_match = *seen;
+            *seen = seen.saturating_add(1);
+            match rule.trigger_on_match {
+                Some(target) if target == current_match => {
+                    matched_idx = Some(idx);
+                    consume = true;
+                    action = Some(rule.action.clone());
+                    break;
+                }
+                None => {
+                    matched_idx = Some(idx);
+                    action = Some(rule.action.clone());
+                    break;
+                }
+                Some(_) => {}
+            }
+        }
+        if consume && let Some(idx) = matched_idx {
+            state.rules.remove(idx);
+        }
+        action
+    }
+
+    fn read_with_overlay(
+        &self,
+        cx: &Cx,
+        state: &SectorFaultState,
+        offset: u64,
+        buf: &mut [u8],
+    ) -> Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        self.inner.read_exact_at(cx, ByteOffset(offset), buf)?;
+        let sector_bytes = u64::from(self.sector_size);
+        let end = offset + buf.len() as u64;
+        let first_sector = offset / sector_bytes;
+        let last_sector = (end - 1) / sector_bytes;
+        for (&sector, data) in state.pending_sectors.range(first_sector..=last_sector) {
+            let sec_start = sector * sector_bytes;
+            let sec_end = sec_start + data.len() as u64;
+            let copy_start = offset.max(sec_start);
+            let copy_end = end.min(sec_end);
+            if copy_start < copy_end {
+                #[expect(clippy::cast_possible_truncation)]
+                let dst_off = (copy_start - offset) as usize;
+                #[expect(clippy::cast_possible_truncation)]
+                let src_off = (copy_start - sec_start) as usize;
+                #[expect(clippy::cast_possible_truncation)]
+                let copy_len = (copy_end - copy_start) as usize;
+                buf[dst_off..dst_off + copy_len]
+                    .copy_from_slice(&data[src_off..src_off + copy_len]);
+            }
+        }
+        for (&rot_offset, &mask) in state.bit_rot.range(offset..end) {
+            #[expect(clippy::cast_possible_truncation)]
+            let idx = (rot_offset - offset) as usize;
+            buf[idx] ^= mask;
+        }
+        Ok(())
+    }
+
+    fn stage_pending_bytes(
+        &self,
+        cx: &Cx,
+        state: &mut SectorFaultState,
+        offset: u64,
+        buf: &[u8],
+    ) -> Result<()> {
+        if buf.is_empty() {
+            return Ok(());
+        }
+        let sector_bytes = u64::from(self.sector_size);
+        let dev_len = self.inner.len_bytes();
+        let end = offset + buf.len() as u64;
+        let first_sector = offset / sector_bytes;
+        let last_sector = (end - 1) / sector_bytes;
+        for sector in first_sector..=last_sector {
+            let sec_start = sector * sector_bytes;
+            let sec_end = (sec_start + sector_bytes).min(dev_len);
+            #[expect(clippy::cast_possible_truncation)]
+            let sec_len = (sec_end - sec_start) as usize;
+            let copy_start = offset.max(sec_start);
+            let copy_end = end.min(sec_end);
+            #[expect(clippy::cast_possible_truncation)]
+            let dst_off = (copy_start - sec_start) as usize;
+            #[expect(clippy::cast_possible_truncation)]
+            let src_off = (copy_start - offset) as usize;
+            #[expect(clippy::cast_possible_truncation)]
+            let copy_len = (copy_end - copy_start) as usize;
+
+            if let std::collections::btree_map::Entry::Vacant(vacant) =
+                state.pending_sectors.entry(sector)
+            {
+                let mut sector_buf = vec![0_u8; sec_len];
+                if dst_off > 0 || copy_len < sec_len {
+                    self.inner
+                        .read_exact_at(cx, ByteOffset(sec_start), &mut sector_buf)?;
+                }
+                sector_buf[dst_off..dst_off + copy_len]
+                    .copy_from_slice(&buf[src_off..src_off + copy_len]);
+                vacant.insert(sector_buf);
+            } else if let Some(sector_buf) = state.pending_sectors.get_mut(&sector) {
+                sector_buf[dst_off..dst_off + copy_len]
+                    .copy_from_slice(&buf[src_off..src_off + copy_len]);
+            }
+        }
+        Ok(())
+    }
+}
+
+impl<D: ByteDevice> ByteDevice for SectorFaultDevice<D> {
+    fn len_bytes(&self) -> u64 {
+        self.inner.len_bytes()
+    }
+
+    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
+        cx_checkpoint(cx)?;
+        let len_u64 = u64::try_from(buf.len())
+            .map_err(|_| FfsError::Format("read length overflows u64".to_owned()))?;
+        let end = offset
+            .0
+            .checked_add(len_u64)
+            .ok_or_else(|| FfsError::Format("read range overflows u64".to_owned()))?;
+        let dev_len = self.inner.len_bytes();
+        if end > dev_len {
+            return Err(FfsError::Format(format!(
+                "read out of bounds: offset={offset} len={len_u64} device_len={dev_len}"
+            )));
+        }
+        self.read_count.fetch_add(1, Ordering::Relaxed);
+        if buf.is_empty() {
+            cx_checkpoint(cx)?;
+            return Ok(());
+        }
+        let sector_bytes = u64::from(self.sector_size);
+        let span = Some((offset.0 / sector_bytes, end.div_ceil(sector_bytes)));
+        let mut state = self.state.lock();
+        if let Some(action) = Self::match_action(&mut state, SectorFaultOp::Read, span) {
+            match action {
+                SectorFaultAction::FailIo | SectorFaultAction::TornWrite { .. } => {
+                    return Err(FfsError::Io(std::io::Error::other(
+                        "injected sector read fault",
+                    )));
+                }
+                SectorFaultAction::ShortTransfer { bytes } => {
+                    let actual = bytes.min(buf.len());
+                    self.read_with_overlay(cx, &state, offset.0, &mut buf[..actual])?;
+                    return Err(FfsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!("injected short read: got {actual} of {} bytes", buf.len()),
+                    )));
+                }
+                SectorFaultAction::BitRot {
+                    byte_offset,
+                    xor_mask,
+                } => {
+                    self.read_with_overlay(cx, &state, offset.0, buf)?;
+                    if let Some(slot) = buf.get_mut(byte_offset) {
+                        *slot ^= xor_mask;
+                    }
+                    drop(state);
+                    cx_checkpoint(cx)?;
+                    return Ok(());
+                }
+            }
+        }
+        self.read_with_overlay(cx, &state, offset.0, buf)?;
+        drop(state);
+        cx_checkpoint(cx)?;
+        Ok(())
+    }
+
+    fn write_all_at(&self, cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<()> {
+        cx_checkpoint(cx)?;
+        let len_u64 = u64::try_from(buf.len())
+            .map_err(|_| FfsError::Format("write length overflows u64".to_owned()))?;
+        let end = offset
+            .0
+            .checked_add(len_u64)
+            .ok_or_else(|| FfsError::Format("write range overflows u64".to_owned()))?;
+        let dev_len = self.inner.len_bytes();
+        if end > dev_len {
+            return Err(FfsError::Format(format!(
+                "write out of bounds: offset={offset} len={len_u64} device_len={dev_len}"
+            )));
+        }
+        self.write_count.fetch_add(1, Ordering::Relaxed);
+        if buf.is_empty() {
+            cx_checkpoint(cx)?;
+            return Ok(());
+        }
+        let sector_bytes = u64::from(self.sector_size);
+        let span = Some((offset.0 / sector_bytes, end.div_ceil(sector_bytes)));
+        let mut state = self.state.lock();
+        if let Some(action) = Self::match_action(&mut state, SectorFaultOp::Write, span) {
+            match action {
+                SectorFaultAction::FailIo | SectorFaultAction::BitRot { .. } => {
+                    return Err(FfsError::Io(std::io::Error::other(
+                        "injected sector write fault",
+                    )));
+                }
+                SectorFaultAction::ShortTransfer { bytes } => {
+                    let actual = bytes.min(buf.len());
+                    self.stage_pending_bytes(cx, &mut state, offset.0, &buf[..actual])?;
+                    return Err(FfsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::WriteZero,
+                        format!(
+                            "injected short write: wrote {actual} of {} bytes",
+                            buf.len()
+                        ),
+                    )));
+                }
+                SectorFaultAction::TornWrite { keep_sectors } => {
+                    let keep_bytes = usize::try_from(
+                        keep_sectors
+                            .saturating_mul(sector_bytes)
+                            .min(buf.len() as u64),
+                    )
+                    .unwrap_or(buf.len());
+                    self.stage_pending_bytes(cx, &mut state, offset.0, &buf[..keep_bytes])?;
+                    return Err(FfsError::Io(std::io::Error::other(format!(
+                        "injected torn write after {keep_sectors} sectors ({keep_bytes} bytes)"
+                    ))));
+                }
+            }
+        }
+        self.stage_pending_bytes(cx, &mut state, offset.0, buf)?;
+        drop(state);
+        cx_checkpoint(cx)?;
+        Ok(())
+    }
+
+    fn sync(&self, cx: &Cx) -> Result<()> {
+        cx_checkpoint(cx)?;
+        self.sync_count.fetch_add(1, Ordering::Relaxed);
+        let mut state = self.state.lock();
+        if let Some(action) = Self::match_action(&mut state, SectorFaultOp::Sync, None) {
+            match action {
+                SectorFaultAction::FailIo | SectorFaultAction::BitRot { .. } => {
+                    return Err(FfsError::Io(std::io::Error::other(
+                        "injected sector sync fault",
+                    )));
+                }
+                SectorFaultAction::TornWrite { keep_sectors } => {
+                    let sector_bytes = u64::from(self.sector_size);
+                    #[expect(clippy::cast_possible_truncation)]
+                    let limit = keep_sectors as usize;
+                    let keys: Vec<u64> =
+                        state.pending_sectors.keys().take(limit).copied().collect();
+                    for sector in keys {
+                        if let Some(bytes) = state.pending_sectors.remove(&sector) {
+                            self.inner.write_all_at(
+                                cx,
+                                ByteOffset(sector * sector_bytes),
+                                &bytes,
+                            )?;
+                        }
+                    }
+                    self.inner.sync(cx)?;
+                    return Err(FfsError::Io(std::io::Error::other(format!(
+                        "injected partial sync fault after {keep_sectors} sectors"
+                    ))));
+                }
+                SectorFaultAction::ShortTransfer { bytes } => {
+                    let sector_bytes = u64::from(self.sector_size);
+                    let keep_sectors = (bytes as u64) / sector_bytes;
+                    #[expect(clippy::cast_possible_truncation)]
+                    let limit = keep_sectors as usize;
+                    let keys: Vec<u64> =
+                        state.pending_sectors.keys().take(limit).copied().collect();
+                    for sector in keys {
+                        if let Some(sector_buf) = state.pending_sectors.remove(&sector) {
+                            self.inner.write_all_at(
+                                cx,
+                                ByteOffset(sector * sector_bytes),
+                                &sector_buf,
+                            )?;
+                        }
+                    }
+                    self.inner.sync(cx)?;
+                    return Err(FfsError::Io(std::io::Error::other(
+                        "injected partial sync transfer fault",
+                    )));
+                }
+            }
+        }
+        let sector_bytes = u64::from(self.sector_size);
+        let pending = std::mem::take(&mut state.pending_sectors);
+        for (sector, bytes) in pending {
+            self.inner
+                .write_all_at(cx, ByteOffset(sector * sector_bytes), &bytes)?;
+        }
+        drop(state);
+        self.inner.sync(cx)?;
+        cx_checkpoint(cx)?;
+        Ok(())
+    }
+}
+
 /// Block-addressed I/O interface.
 pub trait BlockDevice: Send + Sync {
     /// Read a block by number.
@@ -11629,5 +12567,211 @@ write_latency: 0ns, bandwidth_bps: 0, stall_probability: 0.0, stall_duration: \
             watchdog_join_started.elapsed() <= INJECTOR_WATCHDOG_POLL_INTERVAL * 25,
             "watchdog should observe completion promptly after workers finish"
         );
+    }
+
+    #[derive(Debug, Clone)]
+    struct InMemoryByteDevice {
+        bytes: Arc<Mutex<Vec<u8>>>,
+    }
+
+    impl InMemoryByteDevice {
+        fn new(initial: Vec<u8>) -> Self {
+            Self {
+                bytes: Arc::new(Mutex::new(initial)),
+            }
+        }
+
+        fn snapshot(&self) -> Vec<u8> {
+            self.bytes.lock().clone()
+        }
+    }
+
+    impl ByteDevice for InMemoryByteDevice {
+        fn len_bytes(&self) -> u64 {
+            self.bytes.lock().len() as u64
+        }
+
+        fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
+            cx_checkpoint(cx)?;
+            let guard = self.bytes.lock();
+            #[expect(clippy::cast_possible_truncation)]
+            let start = offset.0 as usize;
+            let end = start
+                .checked_add(buf.len())
+                .filter(|&end| end <= guard.len())
+                .ok_or_else(|| FfsError::Format("in-memory read out of bounds".to_owned()))?;
+            buf.copy_from_slice(&guard[start..end]);
+            drop(guard);
+            Ok(())
+        }
+
+        fn write_all_at(&self, cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<()> {
+            cx_checkpoint(cx)?;
+            let mut guard = self.bytes.lock();
+            #[expect(clippy::cast_possible_truncation)]
+            let start = offset.0 as usize;
+            let end = start
+                .checked_add(buf.len())
+                .filter(|&end| end <= guard.len())
+                .ok_or_else(|| FfsError::Format("in-memory write out of bounds".to_owned()))?;
+            guard[start..end].copy_from_slice(buf);
+            drop(guard);
+            Ok(())
+        }
+
+        fn sync(&self, cx: &Cx) -> Result<()> {
+            cx_checkpoint(cx)
+        }
+    }
+
+    #[test]
+    fn volume_device_concurrent_subsector_rmw_and_sentinel_bounds_bd_i0gk5() {
+        let cx = Cx::for_testing();
+        let mut raw = vec![0xAA_u8; 4096];
+        raw.extend(std::iter::repeat_n(0x00_u8, 8192));
+        raw.extend(std::iter::repeat_n(0xBB_u8, 4096));
+        let backing = InMemoryByteDevice::new(raw);
+
+        let vol = VolumeDevice::new(backing.clone(), 4096, 8192, 512, 512)
+            .expect("valid volume bounds and sector sizes");
+        assert_eq!(vol.len_bytes(), 8192);
+        assert_eq!(vol.base(), 4096);
+        assert_eq!(vol.logical_sector_size(), 512);
+        assert_eq!(vol.physical_sector_size(), 512);
+
+        // Out-of-bounds reads and writes at the volume end must fail before
+        // touching the trailing 0xBB sentinel partition.
+        let mut scratch = [0_u8; 16];
+        assert!(
+            vol.read_exact_at(&cx, ByteOffset(8192 - 8), &mut scratch)
+                .is_err()
+        );
+        assert!(
+            vol.write_all_at(&cx, ByteOffset(8192 - 8), &[0xFF; 16])
+                .is_err()
+        );
+
+        // 16 concurrent threads writing 256 disjoint 2-byte FAT16 entries inside
+        // sector 0 of the volume: every 2-byte entry must survive without RMW races.
+        let mut handles = Vec::new();
+        for tid in 0..16_u16 {
+            let vol_clone = vol.clone();
+            handles.push(thread::spawn(move || {
+                let worker_cx = Cx::for_testing();
+                for slot in 0..16_u16 {
+                    let entry_index = tid * 16 + slot;
+                    let byte_off = u64::from(entry_index) * 2;
+                    let value = (entry_index + 1).to_le_bytes();
+                    vol_clone
+                        .write_all_at(&worker_cx, ByteOffset(byte_off), &value)
+                        .expect("sub-sector RMW write must succeed");
+                }
+            }));
+        }
+        for handle in handles {
+            handle.join().expect("worker panicked");
+        }
+        assert_eq!(vol.rmw_operations(), 256);
+        assert_eq!(vol.passthrough_writes(), 0);
+
+        let mut sector0 = [0_u8; 512];
+        vol.read_exact_at(&cx, ByteOffset(0), &mut sector0)
+            .expect("read sector 0");
+        for entry_index in 0..256_u16 {
+            let off = (entry_index as usize) * 2;
+            let actual = u16::from_le_bytes([sector0[off], sector0[off + 1]]);
+            assert_eq!(
+                actual,
+                entry_index + 1,
+                "lost RMW update at slot {entry_index}"
+            );
+        }
+
+        // Sector-aligned write uses the zero-copy passthrough path.
+        let aligned_payload = [0x5A_u8; 512];
+        vol.write_all_at(&cx, ByteOffset(512), &aligned_payload)
+            .expect("aligned write must succeed");
+        assert_eq!(vol.passthrough_writes(), 1);
+
+        // Read-only volume rejects writes with FfsError::ReadOnly.
+        let ro_vol = VolumeDevice::new_read_only(backing.clone(), 4096, 8192, 512, 512)
+            .expect("read-only volume");
+        assert!(matches!(
+            ro_vol.write_all_at(&cx, ByteOffset(0), &[1, 2]),
+            Err(FfsError::ReadOnly)
+        ));
+
+        // Adjacent sentinels before 4096 and after 12288 must be 100% untouched.
+        let snap = backing.snapshot();
+        assert!(snap[..4096].iter().all(|&b| b == 0xAA));
+        assert!(snap[12288..].iter().all(|&b| b == 0xBB));
+    }
+
+    #[test]
+    fn sector_fault_device_crash_torn_write_and_bit_rot_bd_i0gk5() {
+        let cx = Cx::for_testing();
+        let backing = InMemoryByteDevice::new(vec![0_u8; 4096]);
+        let fault_dev = SectorFaultDevice::new(backing.clone(), 512).expect("fault device");
+
+        // Write sector 0 and sync -> durable.
+        fault_dev
+            .write_all_at(&cx, ByteOffset(0), &[0x11_u8; 512])
+            .expect("write sector 0");
+        assert_eq!(fault_dev.unflushed_sector_count(), 1);
+        fault_dev.sync(&cx).expect("sync sector 0");
+        assert_eq!(fault_dev.unflushed_sector_count(), 0);
+
+        // Write sector 1 without sync, then crash -> sector 1 reverts to 0, sector 0 stays 0x11.
+        fault_dev
+            .write_all_at(&cx, ByteOffset(512), &[0x22_u8; 512])
+            .expect("write sector 1");
+        let mut read_before_crash = [0_u8; 512];
+        fault_dev
+            .read_exact_at(&cx, ByteOffset(512), &mut read_before_crash)
+            .expect("volatile read before crash");
+        assert_eq!(read_before_crash, [0x22_u8; 512]);
+        assert_eq!(fault_dev.crash(), 1);
+
+        let mut read_after_crash = [0_u8; 512];
+        fault_dev
+            .read_exact_at(&cx, ByteOffset(512), &mut read_after_crash)
+            .expect("read sector 1 after crash");
+        assert_eq!(read_after_crash, [0_u8; 512]);
+        fault_dev
+            .read_exact_at(&cx, ByteOffset(0), &mut read_after_crash)
+            .expect("read sector 0 after crash");
+        assert_eq!(read_after_crash, [0x11_u8; 512]);
+
+        // Torn write across sectors 2..4 keeping only 1 sector.
+        fault_dev.add_rule(SectorFaultRule {
+            op: SectorFaultOp::Write,
+            sector_range: Some((2, 4)),
+            trigger_on_match: Some(0),
+            action: SectorFaultAction::TornWrite { keep_sectors: 1 },
+        });
+        assert!(
+            fault_dev
+                .write_all_at(&cx, ByteOffset(1024), &[0x33_u8; 1024])
+                .is_err()
+        );
+        fault_dev.sync(&cx).expect("sync torn sector 2");
+        let mut sec2 = [0_u8; 512];
+        let mut sec3 = [0_u8; 512];
+        fault_dev
+            .read_exact_at(&cx, ByteOffset(1024), &mut sec2)
+            .expect("read sector 2");
+        fault_dev
+            .read_exact_at(&cx, ByteOffset(1536), &mut sec3)
+            .expect("read sector 3");
+        assert_eq!(sec2, [0x33_u8; 512]);
+        assert_eq!(sec3, [0_u8; 512]);
+
+        // Persistent bit-rot injection.
+        fault_dev.inject_bit_rot(ByteOffset(0), 0xFF);
+        fault_dev
+            .read_exact_at(&cx, ByteOffset(0), &mut sec2)
+            .expect("read with bitrot");
+        assert_eq!(sec2[0], 0x11 ^ 0xFF);
+        assert_eq!(sec2[1], 0x11);
     }
 }

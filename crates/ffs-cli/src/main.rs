@@ -1680,6 +1680,60 @@ enum InspectOutput {
         generation: u64,
         label: String,
     },
+    Fat16 {
+        sector_bytes: u32,
+        cluster_bytes: u32,
+        cluster_count: u32,
+        volume_bytes: u64,
+        fat_count: u8,
+        active_fat: u8,
+        mirrored: bool,
+    },
+    Fat32 {
+        sector_bytes: u32,
+        cluster_bytes: u32,
+        cluster_count: u32,
+        volume_bytes: u64,
+        fat_count: u8,
+        active_fat: u8,
+        mirrored: bool,
+        root_cluster: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        fs_info_sector: Option<u16>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        backup_boot_sector: Option<u16>,
+    },
+    Ntfs {
+        sector_bytes: u32,
+        cluster_bytes: u32,
+        volume_bytes: u64,
+        cluster_count: u64,
+        mft_cluster: u64,
+        mirror_cluster: u64,
+        record_bytes: u32,
+        index_bytes: u32,
+        serial: u64,
+    },
+    Zfs {
+        valid_labels: usize,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pool_name: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        pool_guid: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        leaf_guid: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        version: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        state: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        config_txg: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        vdev_type: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        highest_uberblock_txg: Option<u64>,
+        candidate_uberblocks: usize,
+    },
 }
 
 /// Optional field indicating a mismatch between bitmap and group descriptor counts.
@@ -21259,6 +21313,71 @@ mod tests {
 
         let json = serde_json::to_string_pretty(&output).expect("MvccInfoOutput should serialize");
         assert_eq!(json, REPRESENTATIVE_MVCC_INFO_OUTPUT_GOLDEN);
+    }
+
+    #[test]
+    fn inspect_output_serializes_all_six_formats_bd_i0gk5() {
+        use crate::InspectOutput;
+
+        let fat16 = InspectOutput::Fat16 {
+            sector_bytes: 512,
+            cluster_bytes: 2048,
+            cluster_count: 10_000,
+            volume_bytes: 20_480_000,
+            fat_count: 2,
+            active_fat: 0,
+            mirrored: true,
+        };
+        let fat16_json: serde_json::Value = serde_json::to_value(&fat16).unwrap();
+        assert_eq!(fat16_json["filesystem"], "fat16");
+        assert_eq!(fat16_json["cluster_count"], 10_000);
+
+        let fat32 = InspectOutput::Fat32 {
+            sector_bytes: 512,
+            cluster_bytes: 4096,
+            cluster_count: 100_000,
+            volume_bytes: 409_600_000,
+            fat_count: 2,
+            active_fat: 0,
+            mirrored: true,
+            root_cluster: 2,
+            fs_info_sector: Some(1),
+            backup_boot_sector: Some(6),
+        };
+        let fat32_json: serde_json::Value = serde_json::to_value(&fat32).unwrap();
+        assert_eq!(fat32_json["filesystem"], "fat32");
+        assert_eq!(fat32_json["root_cluster"], 2);
+
+        let ntfs = InspectOutput::Ntfs {
+            sector_bytes: 512,
+            cluster_bytes: 4096,
+            volume_bytes: 4_194_304,
+            cluster_count: 1024,
+            mft_cluster: 4,
+            mirror_cluster: 8,
+            record_bytes: 1024,
+            index_bytes: 4096,
+            serial: 0x1122_3344_5566_7788,
+        };
+        let ntfs_json: serde_json::Value = serde_json::to_value(&ntfs).unwrap();
+        assert_eq!(ntfs_json["filesystem"], "ntfs");
+        assert_eq!(ntfs_json["record_bytes"], 1024);
+
+        let zfs = InspectOutput::Zfs {
+            valid_labels: 4,
+            pool_name: Some("tank".to_owned()),
+            pool_guid: Some("12345".to_owned()),
+            leaf_guid: Some("67890".to_owned()),
+            version: Some(5000),
+            state: Some(0),
+            config_txg: Some(4),
+            vdev_type: Some("file".to_owned()),
+            highest_uberblock_txg: Some(9),
+            candidate_uberblocks: 4,
+        };
+        let zfs_json: serde_json::Value = serde_json::to_value(&zfs).unwrap();
+        assert_eq!(zfs_json["filesystem"], "zfs");
+        assert_eq!(zfs_json["pool_name"], "tank");
     }
 
     // ── Property-based tests ────────────────────────────────────────────────

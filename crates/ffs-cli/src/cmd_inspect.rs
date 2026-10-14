@@ -5,7 +5,10 @@
 
 use anyhow::{Context, Result};
 use asupersync::Cx;
-use ffs_core::{Ext4JournalReplayMode, FsFlavor, OpenFs, OpenOptions, detect_filesystem_at_path};
+use ffs_core::{
+    DetectedFilesystem, Ext4JournalReplayMode, FsFlavor, OpenFs, OpenOptions,
+    detect_all_filesystems_at_path,
+};
 use ffs_ondisk::Ext4Superblock;
 use std::path::{Path, PathBuf};
 use std::time::Instant;
@@ -37,33 +40,82 @@ pub fn inspect(
         ext4_journal_replay_mode: Ext4JournalReplayMode::SimulateOverlay,
         ..OpenOptions::default()
     };
-    let flavor = detect_filesystem_at_path(&cx, path)
-        .with_context(|| format!("failed to detect ext4/btrfs metadata in {}", path.display()))?;
+    let detected = detect_all_filesystems_at_path(&cx, path)
+        .with_context(|| format!("failed to detect filesystem metadata in {}", path.display()))?;
 
     // Handle --subvolumes and --snapshots for btrfs
-    if (list_subvolumes || list_snapshots) && matches!(&flavor, FsFlavor::Btrfs(_)) {
-        return inspect_btrfs_subvolumes(&cx, path, &flavor, json, list_subvolumes, list_snapshots);
-    }
-    if (list_subvolumes || list_snapshots) && matches!(&flavor, FsFlavor::Ext4(_)) {
+    if list_subvolumes || list_snapshots {
+        if let DetectedFilesystem::Btrfs(sb) = &detected {
+            let flavor = FsFlavor::Btrfs(sb.clone());
+            return inspect_btrfs_subvolumes(
+                &cx,
+                path,
+                &flavor,
+                json,
+                list_subvolumes,
+                list_snapshots,
+            );
+        }
         anyhow::bail!("--subvolumes and --snapshots are only supported for btrfs images");
     }
 
-    let output = match &flavor {
-        FsFlavor::Ext4(sb) => inspect_ext4_output(&cx, path, &open_opts, sb)?,
-        FsFlavor::Btrfs(sb) => InspectOutput::Btrfs {
+    let output = match &detected {
+        DetectedFilesystem::Ext4(sb) => inspect_ext4_output(&cx, path, &open_opts, sb)?,
+        DetectedFilesystem::Btrfs(sb) => InspectOutput::Btrfs {
             sectorsize: sb.sectorsize,
             nodesize: sb.nodesize,
             generation: sb.generation,
             label: sb.label.clone(),
         },
+        DetectedFilesystem::Fat16(fat) => InspectOutput::Fat16 {
+            sector_bytes: fat.sector_bytes,
+            cluster_bytes: fat.cluster_bytes,
+            cluster_count: fat.cluster_count,
+            volume_bytes: fat.volume_bytes,
+            fat_count: fat.fat_count,
+            active_fat: fat.active_fat,
+            mirrored: fat.mirrored,
+        },
+        DetectedFilesystem::Fat32(fat) => InspectOutput::Fat32 {
+            sector_bytes: fat.sector_bytes,
+            cluster_bytes: fat.cluster_bytes,
+            cluster_count: fat.cluster_count,
+            volume_bytes: fat.volume_bytes,
+            fat_count: fat.fat_count,
+            active_fat: fat.active_fat,
+            mirrored: fat.mirrored,
+            root_cluster: fat.root_cluster,
+            fs_info_sector: fat.fs_info_sector,
+            backup_boot_sector: fat.backup_boot_sector,
+        },
+        DetectedFilesystem::Ntfs(ntfs) => InspectOutput::Ntfs {
+            sector_bytes: ntfs.sector_bytes,
+            cluster_bytes: ntfs.cluster_bytes,
+            volume_bytes: ntfs.volume_bytes,
+            cluster_count: ntfs.cluster_count,
+            mft_cluster: ntfs.mft_cluster,
+            mirror_cluster: ntfs.mirror_cluster,
+            record_bytes: ntfs.record_bytes,
+            index_bytes: ntfs.index_bytes,
+            serial: ntfs.serial,
+        },
+        DetectedFilesystem::Zfs(zfs) => InspectOutput::Zfs {
+            valid_labels: zfs.valid_labels,
+            pool_name: zfs.pool_name.clone(),
+            pool_guid: zfs.pool_guid.map(|g| g.to_string()),
+            leaf_guid: zfs.leaf_guid.map(|g| g.to_string()),
+            version: zfs.version,
+            state: zfs.state,
+            config_txg: zfs.config_txg,
+            vdev_type: zfs.vdev_type.clone(),
+            highest_uberblock_txg: zfs.highest_uberblock_txg,
+            candidate_uberblocks: zfs.candidate_uberblocks,
+        },
     };
 
     info!(
         target: "ffs::cli::inspect",
-        filesystem = match &flavor {
-            FsFlavor::Ext4(_) => "ext4",
-            FsFlavor::Btrfs(_) => "btrfs",
-        },
+        filesystem = detected.kind().as_str(),
         duration_us = u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX),
         "inspect_detected_filesystem"
     );
@@ -134,6 +186,114 @@ fn print_inspect_output(output: &InspectOutput) {
             println!("nodesize: {nodesize}");
             println!("generation: {generation}");
             println!("label: {label}");
+        }
+        InspectOutput::Fat16 {
+            sector_bytes,
+            cluster_bytes,
+            cluster_count,
+            volume_bytes,
+            fat_count,
+            active_fat,
+            mirrored,
+        } => {
+            println!("filesystem: fat16");
+            println!("sector_bytes: {sector_bytes}");
+            println!("cluster_bytes: {cluster_bytes}");
+            println!("cluster_count: {cluster_count}");
+            println!("volume_bytes: {volume_bytes}");
+            println!("fat_count: {fat_count}");
+            println!("active_fat: {active_fat}");
+            println!("mirrored: {mirrored}");
+        }
+        InspectOutput::Fat32 {
+            sector_bytes,
+            cluster_bytes,
+            cluster_count,
+            volume_bytes,
+            fat_count,
+            active_fat,
+            mirrored,
+            root_cluster,
+            fs_info_sector,
+            backup_boot_sector,
+        } => {
+            println!("filesystem: fat32");
+            println!("sector_bytes: {sector_bytes}");
+            println!("cluster_bytes: {cluster_bytes}");
+            println!("cluster_count: {cluster_count}");
+            println!("volume_bytes: {volume_bytes}");
+            println!("fat_count: {fat_count}");
+            println!("active_fat: {active_fat}");
+            println!("mirrored: {mirrored}");
+            println!("root_cluster: {root_cluster}");
+            if let Some(fsinfo) = fs_info_sector {
+                println!("fs_info_sector: {fsinfo}");
+            }
+            if let Some(backup) = backup_boot_sector {
+                println!("backup_boot_sector: {backup}");
+            }
+        }
+        InspectOutput::Ntfs {
+            sector_bytes,
+            cluster_bytes,
+            volume_bytes,
+            cluster_count,
+            mft_cluster,
+            mirror_cluster,
+            record_bytes,
+            index_bytes,
+            serial,
+        } => {
+            println!("filesystem: ntfs");
+            println!("sector_bytes: {sector_bytes}");
+            println!("cluster_bytes: {cluster_bytes}");
+            println!("volume_bytes: {volume_bytes}");
+            println!("cluster_count: {cluster_count}");
+            println!("mft_cluster: {mft_cluster}");
+            println!("mirror_cluster: {mirror_cluster}");
+            println!("record_bytes: {record_bytes}");
+            println!("index_bytes: {index_bytes}");
+            println!("serial: 0x{serial:016x}");
+        }
+        InspectOutput::Zfs {
+            valid_labels,
+            pool_name,
+            pool_guid,
+            leaf_guid,
+            version,
+            state,
+            config_txg,
+            vdev_type,
+            highest_uberblock_txg,
+            candidate_uberblocks,
+        } => {
+            println!("filesystem: zfs");
+            println!("valid_labels: {valid_labels}");
+            if let Some(name) = pool_name {
+                println!("pool_name: {name}");
+            }
+            if let Some(guid) = pool_guid {
+                println!("pool_guid: {guid}");
+            }
+            if let Some(guid) = leaf_guid {
+                println!("leaf_guid: {guid}");
+            }
+            if let Some(ver) = version {
+                println!("version: {ver}");
+            }
+            if let Some(st) = state {
+                println!("state: {st}");
+            }
+            if let Some(txg) = config_txg {
+                println!("config_txg: {txg}");
+            }
+            if let Some(vtype) = vdev_type {
+                println!("vdev_type: {vtype}");
+            }
+            if let Some(ub_txg) = highest_uberblock_txg {
+                println!("highest_uberblock_txg: {ub_txg}");
+            }
+            println!("candidate_uberblocks: {candidate_uberblocks}");
         }
     }
 }

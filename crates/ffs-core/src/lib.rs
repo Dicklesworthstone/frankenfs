@@ -366,12 +366,233 @@ pub enum FsFlavor {
     Btrfs(Box<BtrfsSuperblock>),
 }
 
-/// Error from filesystem detection (superblock probing).
+/// Canonical identifier for each of the six filesystem formats supported by
+/// FrankenFS discovery and inspection (`CORE-02`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum FsFormatKind {
+    Ext4,
+    Btrfs,
+    Fat16,
+    Fat32,
+    Ntfs,
+    Zfs,
+}
+
+impl FsFormatKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Ext4 => "ext4",
+            Self::Btrfs => "btrfs",
+            Self::Fat16 => "fat16",
+            Self::Fat32 => "fat32",
+            Self::Ntfs => "ntfs",
+            Self::Zfs => "zfs",
+        }
+    }
+}
+
+impl std::fmt::Display for FsFormatKind {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Validated FAT16/FAT32 volume geometry summary (`CORE-02`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FatVolumeSummary {
+    pub sector_bytes: u32,
+    pub cluster_bytes: u32,
+    pub cluster_count: u32,
+    pub volume_bytes: u64,
+    pub fat_count: u8,
+    pub active_fat: u8,
+    pub mirrored: bool,
+    pub root_cluster: u32,
+    pub fs_info_sector: Option<u16>,
+    pub backup_boot_sector: Option<u16>,
+}
+
+impl FatVolumeSummary {
+    #[must_use]
+    pub const fn from_geometry(geom: &ffs_ondisk::fat::FatGeometry) -> Self {
+        Self {
+            sector_bytes: geom.sector_bytes(),
+            cluster_bytes: geom.cluster_bytes(),
+            cluster_count: geom.cluster_count(),
+            volume_bytes: geom.volume_bytes(),
+            fat_count: geom.fat_count(),
+            active_fat: geom.active_fat(),
+            mirrored: geom.mirrored(),
+            root_cluster: geom.root_cluster(),
+            fs_info_sector: geom.fs_info_sector(),
+            backup_boot_sector: geom.backup_boot_sector(),
+        }
+    }
+}
+
+/// Validated NTFS 3.1 volume geometry summary (`CORE-02`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NtfsVolumeSummary {
+    pub sector_bytes: u32,
+    pub cluster_bytes: u32,
+    pub volume_bytes: u64,
+    pub cluster_count: u64,
+    pub mft_cluster: u64,
+    pub mirror_cluster: u64,
+    pub record_bytes: u32,
+    pub index_bytes: u32,
+    pub serial: u64,
+}
+
+impl NtfsVolumeSummary {
+    #[must_use]
+    pub const fn from_geometry(geom: &ffs_ondisk::ntfs::NtfsGeometry) -> Self {
+        Self {
+            sector_bytes: geom.sector_bytes(),
+            cluster_bytes: geom.cluster_bytes(),
+            volume_bytes: geom.volume_bytes(),
+            cluster_count: geom.cluster_count(),
+            mft_cluster: geom.mft_cluster(),
+            mirror_cluster: geom.mirror_cluster(),
+            record_bytes: geom.record_bytes(),
+            index_bytes: geom.index_bytes(),
+            serial: geom.serial(),
+        }
+    }
+}
+
+/// Validated ZFS vdev label and uberblock summary (`CORE-02`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ZfsVolumeSummary {
+    pub valid_labels: usize,
+    pub pool_name: Option<String>,
+    pub pool_guid: Option<u64>,
+    pub leaf_guid: Option<u64>,
+    pub version: Option<u64>,
+    pub state: Option<u64>,
+    pub config_txg: Option<u64>,
+    pub vdev_type: Option<String>,
+    pub highest_uberblock_txg: Option<u64>,
+    pub candidate_uberblocks: usize,
+}
+
+/// Six-format filesystem discovery result (`CORE-02`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum DetectedFilesystem {
+    Ext4(Box<Ext4Superblock>),
+    Btrfs(Box<BtrfsSuperblock>),
+    Fat16(FatVolumeSummary),
+    Fat32(FatVolumeSummary),
+    Ntfs(NtfsVolumeSummary),
+    Zfs(ZfsVolumeSummary),
+}
+
+impl DetectedFilesystem {
+    #[must_use]
+    pub const fn kind(&self) -> FsFormatKind {
+        match self {
+            Self::Ext4(_) => FsFormatKind::Ext4,
+            Self::Btrfs(_) => FsFormatKind::Btrfs,
+            Self::Fat16(_) => FsFormatKind::Fat16,
+            Self::Fat32(_) => FsFormatKind::Fat32,
+            Self::Ntfs(_) => FsFormatKind::Ntfs,
+            Self::Zfs(_) => FsFormatKind::Zfs,
+        }
+    }
+}
+
+/// Format-native object identity (`CORE-03`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum NativeObjectId {
+    /// POSIX inode number (`ext4`).
+    Ext4Inode(InodeNumber),
+    /// Btrfs `(root_objectid, inode_objectid)` pair.
+    BtrfsObject { root_id: u64, object_id: u64 },
+    /// FAT root-to-entry chain of volume-relative 32-byte directory entry offsets.
+    FatEntrySlots(Vec<u64>),
+    /// NTFS MFT `(record_number, sequence_number)` file reference (`FILE_REFERENCE`).
+    NtfsFileReference { record: u64, sequence: u16 },
+    /// ZFS `(dataset_objectid, znode_objectid, generation)` tuple.
+    ZfsObject {
+        dataset_id: u64,
+        object_id: u64,
+        generation: u64,
+    },
+}
+
+/// Lossless format-native directory or stream entry name (`CORE-03`).
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub enum NativeEntryName {
+    /// Raw POSIX byte sequence (`ext4`, `btrfs`, `zfs` ZPL).
+    Bytes(Vec<u8>),
+    /// Raw UTF-16 code units (`NTFS` `$I30`, `FAT` VFAT LFN) — preserves
+    /// unpaired surrogates without lossy UTF-8 replacement (`U+FFFD`).
+    Utf16Units(Vec<u16>),
+    /// FAT 8.3 short alias with explicit OEM code page (`ascii`, `cp437`, `cp850`).
+    FatShortOem {
+        raw_8_3: [u8; 11],
+        code_page: String,
+    },
+}
+
+/// Format-native durable commit witness (`CORE-04`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum FormatCommitToken {
+    Ext4 {
+        mvcc_seq: CommitSeq,
+        jbd2_tid: Option<u32>,
+        super_write_time: u32,
+    },
+    Btrfs {
+        mvcc_seq: CommitSeq,
+        generation: u64,
+        super_bytenr: u64,
+    },
+    Fat {
+        mvcc_seq: CommitSeq,
+        active_fat_hash: [u8; 32],
+        mirror_fat_synced: bool,
+        fsinfo_free_count: Option<u32>,
+        fsinfo_next_free: Option<u32>,
+        clean_bit_set: bool,
+    },
+    Ntfs {
+        mvcc_seq: CommitSeq,
+        logfile_lsn: u64,
+        usn_journal_id: Option<u64>,
+        next_usn: Option<u64>,
+        mft_mirror_synced: bool,
+    },
+    Zfs {
+        mvcc_seq: CommitSeq,
+        txg: u64,
+        uberblock_slot: u16,
+        labels_updated: u8,
+        mos_root_dva: (u32, u64),
+        zil_seq: u64,
+    },
+}
+
+/// Outcome of a durable filesystem commit (`CORE-04`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CommitOutcome {
+    pub commit_seq: CommitSeq,
+    pub format_token: FormatCommitToken,
+    pub blocks_flushed: usize,
+    pub device_synced: bool,
+}
+
+/// Error from filesystem detection (superblock/boot/label probing).
 #[derive(Debug, Error)]
 pub enum DetectionError {
-    /// The image does not contain a recognized ext4 or btrfs superblock.
+    /// The image does not contain a recognized superblock or boot/label header.
     #[error("image does not decode as supported ext4/btrfs superblock")]
     UnsupportedImage,
+    /// Multiple valid filesystem signatures were found on the same volume (`CORE-02`).
+    #[error("ambiguous filesystem signatures: {detected:?}")]
+    AmbiguousSignatures { detected: Vec<FsFormatKind> },
     /// An I/O error occurred while reading the image.
     #[error("I/O error while probing image: {0}")]
     Io(#[from] FfsError),
@@ -486,8 +707,251 @@ pub fn detect_filesystem_at_path(
     cx: &Cx,
     path: impl AsRef<Path>,
 ) -> Result<FsFlavor, DetectionError> {
-    let dev = FileByteDevice::open(path)?;
+    let dev = FileByteDevice::open_read_only(path)?;
     detect_filesystem_on_device(cx, &dev)
+}
+
+fn probe_zfs_on_device(
+    cx: &Cx,
+    dev: &dyn ByteDevice,
+) -> Result<Option<ZfsVolumeSummary>, FfsError> {
+    use ffs_ondisk::zfs::{
+        LABEL_CONFIG_BYTES, LABEL_CONFIG_OFFSET, UBERBLOCK_RING_BYTES, UBERBLOCK_RING_OFFSET,
+        Uberblock, label_offsets, nvlist::NvList, uberblock_bytes, verify_label_checksum,
+    };
+
+    let len = dev.len_bytes();
+    let Ok(offsets) = label_offsets(len) else {
+        return Ok(None);
+    };
+    let mut valid_labels = 0_usize;
+    let mut pool_name = None;
+    let mut pool_guid = None;
+    let mut leaf_guid = None;
+    let mut version = None;
+    let mut state = None;
+    let mut config_txg = None;
+    let mut vdev_type = None;
+    let mut highest_uberblock_txg = None;
+    let mut candidate_uberblocks = 0_usize;
+
+    let mut config_buf = vec![0_u8; LABEL_CONFIG_BYTES];
+    let mut ring_buf = vec![0_u8; UBERBLOCK_RING_BYTES];
+    for label_offset in offsets {
+        let config_offset = label_offset + LABEL_CONFIG_OFFSET;
+        dev.read_exact_at(cx, ByteOffset(config_offset), &mut config_buf)?;
+        if verify_label_checksum(&config_buf, config_offset).is_err() {
+            continue;
+        }
+        let Ok(config) = NvList::parse(&config_buf[..config_buf.len() - 40]) else {
+            continue;
+        };
+        let Some(tree) = config.list("vdev_tree") else {
+            continue;
+        };
+        let Some(ashift_u64) = tree.unsigned("ashift") else {
+            continue;
+        };
+        let Ok(ashift) = u8::try_from(ashift_u64) else {
+            continue;
+        };
+        let Ok(slot_bytes) = uberblock_bytes(ashift) else {
+            continue;
+        };
+        valid_labels += 1;
+        if pool_name.is_none() {
+            pool_name = config.text("name").map(str::to_owned);
+            pool_guid = config.unsigned("pool_guid");
+            leaf_guid = config.unsigned("guid");
+            version = config.unsigned("version");
+            state = config.unsigned("state");
+            config_txg = config.unsigned("txg");
+            vdev_type = tree.text("type").map(str::to_owned);
+        }
+
+        let ring_offset = label_offset + UBERBLOCK_RING_OFFSET;
+        dev.read_exact_at(cx, ByteOffset(ring_offset), &mut ring_buf)?;
+        let slots = UBERBLOCK_RING_BYTES / slot_bytes;
+        for slot in 0..slots {
+            let start = slot * slot_bytes;
+            let slot_offset = ring_offset + start as u64;
+            if let Ok(ub) = Uberblock::parse(&ring_buf[start..start + slot_bytes], slot_offset) {
+                candidate_uberblocks += 1;
+                highest_uberblock_txg =
+                    Some(highest_uberblock_txg.map_or(ub.txg, |cur: u64| cur.max(ub.txg)));
+            }
+        }
+    }
+
+    if valid_labels == 0 {
+        return Ok(None);
+    }
+    Ok(Some(ZfsVolumeSummary {
+        valid_labels,
+        pool_name,
+        pool_guid,
+        leaf_guid,
+        version,
+        state,
+        config_txg,
+        vdev_type,
+        highest_uberblock_txg,
+        candidate_uberblocks,
+    }))
+}
+
+/// Probe a [`ByteDevice`] across all six supported formats (`ext4`, `btrfs`,
+/// `fat16`, `fat32`, `ntfs`, `zfs`) with deterministic multi-signature
+/// ambiguity rejection (`CORE-02`).
+///
+/// When `explicit_format` is `None`, every format signature present on the
+/// volume is evaluated; if more than one format validates (for example a
+/// residual FAT/NTFS boot sector at byte 0 alongside an ext4 superblock at
+/// byte 1024 or btrfs superblock at 64 KiB), [`DetectionError::AmbiguousSignatures`]
+/// is returned.
+pub fn detect_all_filesystems_with_hint_on_device(
+    cx: &Cx,
+    dev: &dyn ByteDevice,
+    explicit_format: Option<FsFormatKind>,
+) -> Result<DetectedFilesystem, DetectionError> {
+    let len = dev.len_bytes();
+    let mut matches = Vec::new();
+
+    let should_probe = |kind: FsFormatKind| explicit_format.is_none_or(|f| f == kind);
+
+    // 1. Probe ext4 at byte 1024.
+    if should_probe(FsFormatKind::Ext4) {
+        let ext4_end =
+            u64::try_from(ffs_types::EXT4_SUPERBLOCK_OFFSET + ffs_types::EXT4_SUPERBLOCK_SIZE)
+                .map_err(|_| {
+                    FfsError::Format("ext4 superblock end offset overflows u64".to_owned())
+                })?;
+        if len >= ext4_end {
+            let ext4_region = read_ext4_superblock_region(cx, dev)?;
+            if let Ok(sb) = Ext4Superblock::parse_superblock_region(&ext4_region) {
+                matches.push(DetectedFilesystem::Ext4(Box::new(sb)));
+            }
+        }
+    }
+
+    // 2. Probe btrfs at byte 65536.
+    if should_probe(FsFormatKind::Btrfs) {
+        let btrfs_end =
+            u64::try_from(ffs_types::BTRFS_SUPER_INFO_OFFSET + ffs_types::BTRFS_SUPER_INFO_SIZE)
+                .map_err(|_| {
+                    FfsError::Format("btrfs superblock end offset overflows u64".to_owned())
+                })?;
+        if len >= btrfs_end {
+            let btrfs_region = read_btrfs_superblock_region(cx, dev)?;
+            if let Ok(sb) = BtrfsSuperblock::parse_superblock_region(&btrfs_region) {
+                matches.push(DetectedFilesystem::Btrfs(Box::new(sb)));
+            }
+        }
+    }
+
+    // 3. Probe FAT16 / FAT32 and NTFS at byte 0..512.
+    if len >= 512
+        && (should_probe(FsFormatKind::Fat16)
+            || should_probe(FsFormatKind::Fat32)
+            || should_probe(FsFormatKind::Ntfs))
+    {
+        let mut boot = [0_u8; 512];
+        dev.read_exact_at(cx, ByteOffset(0), &mut boot)?;
+        if (should_probe(FsFormatKind::Fat16) || should_probe(FsFormatKind::Fat32))
+            && let Ok(geom) = ffs_ondisk::fat::FatGeometry::parse(&boot, len)
+        {
+            let summary = FatVolumeSummary::from_geometry(&geom);
+            match geom.kind() {
+                ffs_ondisk::fat::FatKind::Fat16 if should_probe(FsFormatKind::Fat16) => {
+                    matches.push(DetectedFilesystem::Fat16(summary));
+                }
+                ffs_ondisk::fat::FatKind::Fat32 if should_probe(FsFormatKind::Fat32) => {
+                    matches.push(DetectedFilesystem::Fat32(summary));
+                }
+                _ => {}
+            }
+        }
+        if should_probe(FsFormatKind::Ntfs)
+            && let Ok(geom) = ffs_ondisk::ntfs::NtfsGeometry::parse(&boot, len)
+        {
+            matches.push(DetectedFilesystem::Ntfs(NtfsVolumeSummary::from_geometry(
+                &geom,
+            )));
+        }
+    }
+
+    // 4. Probe ZFS vdev labels (L0..L3).
+    if should_probe(FsFormatKind::Zfs)
+        && let Some(zfs_summary) = probe_zfs_on_device(cx, dev)?
+    {
+        matches.push(DetectedFilesystem::Zfs(zfs_summary));
+    }
+
+    match matches.len() {
+        0 => Err(DetectionError::UnsupportedImage),
+        1 => Ok(matches.swap_remove(0)),
+        _ => Err(DetectionError::AmbiguousSignatures {
+            detected: matches.iter().map(DetectedFilesystem::kind).collect(),
+        }),
+    }
+}
+
+/// Probe a [`ByteDevice`] across all six supported formats (`ext4`, `btrfs`,
+/// `fat16`, `fat32`, `ntfs`, `zfs`) (`CORE-02`).
+pub fn detect_all_filesystems_on_device(
+    cx: &Cx,
+    dev: &dyn ByteDevice,
+) -> Result<DetectedFilesystem, DetectionError> {
+    detect_all_filesystems_with_hint_on_device(cx, dev, None)
+}
+
+/// Probe a filesystem image at `path` across all six supported formats in
+/// strict read-only mode (`CORE-02`).
+pub fn detect_all_filesystems_at_path(
+    cx: &Cx,
+    path: impl AsRef<Path>,
+) -> Result<DetectedFilesystem, DetectionError> {
+    let dev = FileByteDevice::open_read_only(path)?;
+    detect_all_filesystems_on_device(cx, &dev)
+}
+
+/// Probe an in-memory byte slice across all six supported formats (`CORE-02`).
+pub fn detect_all_filesystems(image: &[u8]) -> Result<DetectedFilesystem, DetectionError> {
+    struct SliceByteDevice<'a>(&'a [u8]);
+    impl ByteDevice for SliceByteDevice<'_> {
+        fn len_bytes(&self) -> u64 {
+            self.0.len() as u64
+        }
+        fn read_exact_at(
+            &self,
+            cx: &Cx,
+            offset: ByteOffset,
+            buf: &mut [u8],
+        ) -> ffs_error::Result<()> {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+            let start = usize::try_from(offset.0)
+                .map_err(|_| FfsError::Format("slice read offset overflows usize".to_owned()))?;
+            let end = start
+                .checked_add(buf.len())
+                .filter(|&end| end <= self.0.len())
+                .ok_or_else(|| FfsError::Format("slice read out of bounds".to_owned()))?;
+            buf.copy_from_slice(&self.0[start..end]);
+            Ok(())
+        }
+        fn write_all_at(
+            &self,
+            _cx: &Cx,
+            _offset: ByteOffset,
+            _buf: &[u8],
+        ) -> ffs_error::Result<()> {
+            Err(FfsError::ReadOnly)
+        }
+        fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+            cx.checkpoint().map_err(|_| FfsError::Cancelled)
+        }
+    }
+    let cx = Cx::for_request();
+    detect_all_filesystems_on_device(&cx, &SliceByteDevice(image))
 }
 
 /// Fuzz-only helper exposing the btrfs INODE_REF payload parser.
@@ -6683,6 +7147,9 @@ impl OpenFs {
         let mut flavor = detect_filesystem_on_device(cx, &*dev).map_err(|e| match e {
             DetectionError::UnsupportedImage => {
                 FfsError::Format("image is not a recognized ext4 or btrfs filesystem".into())
+            }
+            DetectionError::AmbiguousSignatures { detected } => {
+                FfsError::Format(format!("ambiguous filesystem signatures: {detected:?}"))
             }
             DetectionError::Io(ffs_err) => ffs_err,
         })?;
@@ -119856,6 +120323,124 @@ mod tests {
 
         fs.disable_mvcc_evidence_ledger();
         assert!(!fs.has_mvcc_evidence_ledger());
+    }
+
+    fn build_fat16_boot_sector(total_sectors: u16) -> [u8; 512] {
+        let mut boot = [0_u8; 512];
+        boot[0..3].copy_from_slice(&[0xEB, 0x3C, 0x90]);
+        boot[3..11].copy_from_slice(b"MSDOS5.0");
+        boot[11..13].copy_from_slice(&512_u16.to_le_bytes());
+        boot[13] = 1; // sectors_per_cluster
+        boot[14..16].copy_from_slice(&1_u16.to_le_bytes()); // reserved
+        boot[16] = 2; // fat_count
+        boot[17..19].copy_from_slice(&512_u16.to_le_bytes()); // root_entries
+        boot[19..21].copy_from_slice(&total_sectors.to_le_bytes());
+        boot[22..24].copy_from_slice(&20_u16.to_le_bytes()); // fat_sectors
+        boot[510..512].copy_from_slice(&0xAA55_u16.to_le_bytes());
+        boot
+    }
+
+    fn build_fat32_boot_sector(total_sectors: u32) -> [u8; 512] {
+        let mut boot = [0_u8; 512];
+        boot[0..3].copy_from_slice(&[0xEB, 0x58, 0x90]);
+        boot[3..11].copy_from_slice(b"MSWIN4.1");
+        boot[11..13].copy_from_slice(&512_u16.to_le_bytes());
+        boot[13] = 1; // sectors_per_cluster
+        boot[14..16].copy_from_slice(&32_u16.to_le_bytes()); // reserved
+        boot[16] = 2; // fat_count
+        boot[32..36].copy_from_slice(&total_sectors.to_le_bytes());
+        boot[36..40].copy_from_slice(&548_u32.to_le_bytes()); // fat_sectors
+        boot[44..48].copy_from_slice(&2_u32.to_le_bytes()); // root_cluster
+        boot[48..50].copy_from_slice(&1_u16.to_le_bytes()); // fs_info_sector
+        boot[50..52].copy_from_slice(&6_u16.to_le_bytes()); // backup_boot_sector
+        boot[510..512].copy_from_slice(&0xAA55_u16.to_le_bytes());
+        boot
+    }
+
+    fn build_ntfs_boot_sector(total_sectors: u64) -> [u8; 512] {
+        let mut boot = [0_u8; 512];
+        boot[0..3].copy_from_slice(&[0xEB, 0x52, 0x90]);
+        boot[3..11].copy_from_slice(b"NTFS    ");
+        boot[11..13].copy_from_slice(&512_u16.to_le_bytes());
+        boot[13] = 8; // 4096-byte clusters
+        boot[40..48].copy_from_slice(&total_sectors.to_le_bytes());
+        boot[48..56].copy_from_slice(&4_u64.to_le_bytes()); // mft_cluster
+        boot[56..64].copy_from_slice(&8_u64.to_le_bytes()); // mirror_cluster
+        boot[64] = (-10_i8).to_ne_bytes()[0]; // 1024-byte MFT records
+        boot[68] = 1; // 1 cluster = 4096-byte index records
+        boot[72..80].copy_from_slice(&0xCAFE_BABE_1234_5678_u64.to_le_bytes());
+        boot[510..512].copy_from_slice(&0xAA55_u16.to_le_bytes());
+        boot
+    }
+
+    #[test]
+    fn detect_all_filesystems_identifies_fat16_fat32_ntfs_and_rejects_ambiguity_bd_i0gk5() {
+        use ffs_block::SectorFaultDevice;
+
+        let cx = Cx::for_testing();
+
+        // 1. FAT16 detection with zero-write proof via SectorFaultDevice.
+        let mut fat16_img = vec![0_u8; 5000 * 512];
+        fat16_img[..512].copy_from_slice(&build_fat16_boot_sector(5000));
+        let fat16_fault =
+            SectorFaultDevice::new(TestDevice::from_vec(fat16_img.clone()), 512).unwrap();
+        let detected_fat16 = detect_all_filesystems_on_device(&cx, &fat16_fault).unwrap();
+        assert_eq!(detected_fat16.kind(), FsFormatKind::Fat16);
+        assert_eq!(fat16_fault.write_count(), 0);
+        assert_eq!(fat16_fault.sync_count(), 0);
+
+        // 2. FAT32 detection with zero-write proof.
+        let mut fat32_img = vec![0_u8; 70_000 * 512];
+        fat32_img[..512].copy_from_slice(&build_fat32_boot_sector(70_000));
+        let fat32_fault = SectorFaultDevice::new(TestDevice::from_vec(fat32_img), 512).unwrap();
+        let detected_fat32 = detect_all_filesystems_on_device(&cx, &fat32_fault).unwrap();
+        assert_eq!(detected_fat32.kind(), FsFormatKind::Fat32);
+        assert_eq!(fat32_fault.write_count(), 0);
+
+        // 3. NTFS detection with zero-write proof.
+        let mut ntfs_img = vec![0_u8; 8192 * 512];
+        ntfs_img[..512].copy_from_slice(&build_ntfs_boot_sector(8192));
+        let ntfs_fault =
+            SectorFaultDevice::new(TestDevice::from_vec(ntfs_img.clone()), 512).unwrap();
+        let detected_ntfs = detect_all_filesystems_on_device(&cx, &ntfs_fault).unwrap();
+        assert_eq!(detected_ntfs.kind(), FsFormatKind::Ntfs);
+        if let DetectedFilesystem::Ntfs(summary) = detected_ntfs {
+            assert_eq!(summary.sector_bytes, 512);
+            assert_eq!(summary.cluster_bytes, 4096);
+            assert_eq!(summary.record_bytes, 1024);
+            assert_eq!(summary.serial, 0xCAFE_BABE_1234_5678);
+        } else {
+            panic!("expected NTFS summary");
+        }
+        assert_eq!(ntfs_fault.write_count(), 0);
+
+        // 4. Multi-signature ambiguity: NTFS boot sector at byte 0 + ext4 superblock at byte 1024.
+        let mut hybrid = ntfs_img;
+        hybrid[1024 + 0x18..1024 + 0x1C].copy_from_slice(&2_u32.to_le_bytes()); // log_block_size = 2 (4096B)
+        hybrid[1024 + 0x1C..1024 + 0x20].copy_from_slice(&2_u32.to_le_bytes()); // log_cluster_size = 2
+        hybrid[1024 + 0x38..1024 + 0x3A].copy_from_slice(&0xEF53_u16.to_le_bytes()); // EXT4_SUPER_MAGIC
+        let hybrid_dev = TestDevice::from_vec(hybrid);
+        let err = detect_all_filesystems_on_device(&cx, &hybrid_dev)
+            .expect_err("hybrid NTFS+ext4 image must fail ambiguity check");
+        assert!(
+            matches!(
+                &err,
+                DetectionError::AmbiguousSignatures { detected }
+                    if detected.contains(&FsFormatKind::Ext4)
+                        && detected.contains(&FsFormatKind::Ntfs)
+            ),
+            "unexpected error: {err:?}"
+        );
+
+        // Explicit format hint resolves the ambiguity deterministically.
+        let forced_ntfs =
+            detect_all_filesystems_with_hint_on_device(&cx, &hybrid_dev, Some(FsFormatKind::Ntfs))
+                .expect("explicit hint should select NTFS");
+        assert_eq!(forced_ntfs.kind(), FsFormatKind::Ntfs);
+        let forced_ext4 =
+            detect_all_filesystems_with_hint_on_device(&cx, &hybrid_dev, Some(FsFormatKind::Ext4))
+                .expect("explicit hint should select ext4");
+        assert_eq!(forced_ext4.kind(), FsFormatKind::Ext4);
     }
 }
 
