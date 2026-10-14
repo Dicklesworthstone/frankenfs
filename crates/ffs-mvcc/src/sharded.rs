@@ -653,6 +653,10 @@ pub struct ShardedMvccStore {
     /// transactions must acquire in sorted shard-index order
     /// (enforced by `lock_shards`).
     shards: Vec<RwLock<MvccShard>>,
+    /// Total number of aborted transactions since store creation.
+    aborted_transactions: AtomicU64,
+    /// Total number of SSI conflicts observed since store creation.
+    ssi_conflicts: AtomicU64,
     shard_count: usize,
     // NOTE: `shard_mask` shares a cache line with the per-commit-written
     // next_txn/next_commit/publication_gate (report_hot_field_cache_line_layout),
@@ -700,10 +704,6 @@ pub struct ShardedMvccStore {
     evidence_sink: RwLock<Option<MvccEvidenceSink>>,
     /// Lock-free fast-path gate so commits skip touching `evidence_sink` when disabled.
     has_evidence_sink: AtomicBool,
-    /// Total number of aborted transactions since store creation.
-    aborted_transactions: AtomicU64,
-    /// Total number of SSI conflicts observed since store creation.
-    ssi_conflicts: AtomicU64,
     /// Reusable staging buffer for `flush_to_device_after`'s coalesced runs.
     ///
     /// A flush builds one contiguous buffer per run and drops it at the end, so a
