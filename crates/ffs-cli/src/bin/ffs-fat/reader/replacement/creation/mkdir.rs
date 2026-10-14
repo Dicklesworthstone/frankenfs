@@ -285,10 +285,7 @@ impl DirectoryCreation {
             set_hints(cx, volume, self.free_after as u32)?;
             volume.device.sync(cx)?;
             let verification = volume.check(cx)?;
-            if !verification.clean
-                || !verification.complete
-                || !verification.namespace_complete
-            {
+            if !verification.clean || !verification.complete || !verification.namespace_complete {
                 bail!(
                     "directory creation verification failed: {}",
                     serde_json::to_string(&verification)?
@@ -300,8 +297,7 @@ impl DirectoryCreation {
                     serde_json::to_string(&verification)?
                 );
             }
-            if verification.files != self.files || verification.directories != self.directories
-            {
+            if verification.files != self.files || verification.directories != self.directories {
                 bail!(
                     "directory creation verification failed: {}",
                     serde_json::to_string(&verification)?
