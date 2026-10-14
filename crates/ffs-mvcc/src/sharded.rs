@@ -4169,7 +4169,7 @@ mod tests {
         t_abort.stage_write(block, vec![0xEE; 64]);
         store.abort(
             t_abort,
-            TxnAbortReason::ExplicitAbort,
+            TxnAbortReason::UserAbort,
             Some("test abort".to_string()),
         );
 
