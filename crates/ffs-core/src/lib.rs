@@ -33613,12 +33613,7 @@ impl OpenFs {
                         if let Some(tx) = &mut scope.tx {
                             let proof =
                                 MergeProof::non_overlapping_extent_range(zfrom, zto - zfrom);
-                            tx.stage_write_with_proof_and_base(
-                                phys_block,
-                                buf,
-                                proof,
-                                staged_base,
-                            );
+                            tx.stage_write_with_proof_and_base(phys_block, buf, proof, staged_base);
                         } else {
                             block_dev.write_block(cx, phys_block, &buf)?;
                         }
@@ -40395,9 +40390,7 @@ impl OpenFs {
             })?;
             alloc
                 .extent_alloc
-                .remove_metadata_items_owned_by_roots(&[
-                    ffs_btrfs::BTRFS_FREE_SPACE_TREE_OBJECTID,
-                ])
+                .remove_metadata_items_owned_by_roots(&[ffs_btrfs::BTRFS_FREE_SPACE_TREE_OBJECTID])
                 .map_err(|e| btrfs_mutation_to_ffs(&e))?;
             Some(btrfs_free_space::FreeSpaceTreeCow::new(nodesize))
         } else {
