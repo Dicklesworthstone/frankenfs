@@ -822,7 +822,7 @@ mod tests {
         let Command::Format { options } = cli.command else {
             panic!("format");
         };
-        let report = formatter::run(&cx, &options).unwrap();
+        let report = formatter::create(&cx, &options).unwrap();
         assert_eq!(report["sidecar_refreshed"], true);
         assert!(
             ffs_repair::sidecar::verify(&cx, &image, &sidecar)

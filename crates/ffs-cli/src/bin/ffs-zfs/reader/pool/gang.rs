@@ -4,11 +4,11 @@
 //! checksums and the leader's physical checksum are checked before the assembled
 //! stream is decoded. Partial traversal never publishes bytes or cache entries.
 
-use super::Pool;
 use super::super::{
     BlockPointer, BlockRead, Cx, DATA_OFFSET, Dva, FfsError, LABEL_BYTES, Result, VdevConfig,
     checkpoint, corrupt, parse, unsupported,
 };
+use super::Pool;
 use ffs_ondisk::zfs::MAX_BLOCK_BYTES;
 use ffs_ondisk::zfs::gang::{GangHeader, HEADER_BYTES};
 use std::collections::{BTreeMap, BTreeSet};

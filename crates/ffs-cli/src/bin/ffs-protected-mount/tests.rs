@@ -885,3 +885,736 @@ fn writable_btrfs_finish_publishes_data_roots_and_matching_protection() {
     );
     assert_published(&fixture, InodeNumber(1), &data);
 }
+
+#[test]
+fn protected_mount_fat32_repairs_multi_block_corruption_and_refreshes_on_rw_bd_q19uk() {
+    let dir = tempfile::tempdir().unwrap();
+    let image = dir.path().join("image.fat32");
+    let sidecar = dir.path().join("image.ffs-rq");
+    let cx = Cx::for_testing();
+    File::create(&image)
+        .unwrap()
+        .set_len(36 * 1024 * 1024)
+        .unwrap();
+    command(
+        Command::new("mkfs.fat")
+            .args(["-F", "32", "-S", "512", "-s", "1"])
+            .arg(&image),
+    );
+    let payload: Vec<u8> = (0_u32..16_384).map(|i| (i % 251) as u8).collect();
+    {
+        let volume = fat::reader::replacement::open_volume(
+            &cx,
+            &fat::reader::ImageArgs {
+                image: image.clone(),
+                offset: 0,
+                length: None,
+                oem_code_page: ffs_ondisk::fat::FatOemCodePage::Ascii,
+                sidecar: None,
+            },
+            true,
+        )
+        .unwrap();
+        fat::reader::replacement::create_in_volume(
+            &cx,
+            &volume,
+            "/payload.bin",
+            &payload,
+            1_700_000_000,
+            false,
+        )
+        .unwrap();
+    }
+    protect(
+        &cx,
+        &image,
+        &sidecar,
+        SidecarOptions {
+            block_size: 4096,
+            group_blocks: 16,
+            repair_symbols: 4,
+        },
+    )
+    .expect("protect fat32 image");
+
+    let fixture = Fixture {
+        dir,
+        image,
+        sidecar,
+        payload,
+    };
+
+    // Find physical 4096-byte blocks of /payload.bin
+    let data_block_0 = {
+        let vol = fat::reader::FatVolume::open(&cx, &fixture.image, 0, None).unwrap();
+        let entry = vol.resolve(&cx, "/payload.bin").unwrap().unwrap();
+        let chain = vol.file_chain(&cx, &entry).unwrap();
+        assert!(chain.clusters.len() >= 2);
+        let offset = fixture.read_block(0);
+        let _ = offset;
+        let bpb =
+            ffs_ondisk::fat::FatGeometry::parse(&fixture.read_block(0)[..512], 64 * 1024 * 1024)
+                .unwrap();
+        bpb.cluster_offset(chain.clusters[0]).unwrap() / 4096
+    };
+    let data_block_1 = data_block_0 + 1;
+    let orig_0 = fixture.read_block(data_block_0);
+    let orig_1 = fixture.read_block(data_block_1);
+
+    let prepared = prepare(&cx, &fixture.args()).expect("admit protected fat32");
+    assert_eq!(prepared.filesystem, "fat32");
+    // Inject multi-block corruption (2 blocks in the same group!)
+    fixture.damage_block(data_block_0);
+    fixture.damage_block(data_block_1);
+    assert_ne!(fixture.read_block(data_block_0), orig_0);
+    assert_ne!(fixture.read_block(data_block_1), orig_1);
+
+    let mut scope = RequestScope::empty();
+    let attr = FsOps::lookup(
+        prepared.fs.as_ref(),
+        &cx,
+        &mut scope,
+        InodeNumber(1),
+        OsStr::new("payload.bin"),
+    )
+    .unwrap();
+    let read_back = FsOps::read(
+        prepared.fs.as_ref(),
+        &cx,
+        &mut scope,
+        attr.ino,
+        0,
+        u32::try_from(fixture.payload.len()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(read_back, fixture.payload);
+    assert_eq!(
+        fixture.read_block(data_block_0),
+        orig_0,
+        "block 0 must be self-healed on disk"
+    );
+    assert_eq!(
+        fixture.read_block(data_block_1),
+        orig_1,
+        "block 1 must be self-healed on disk"
+    );
+    prepared.finish(&cx).unwrap();
+    assert!(
+        verify(&cx, &fixture.image, &fixture.sidecar)
+            .unwrap()
+            .is_healthy()
+    );
+
+    // Now mount writable (--rw), write a new file, and verify sidecar refreshes on finish
+    let rw_prepared = prepare(&cx, &fixture.writable_args()).expect("admit writable fat32");
+    assert!(rw_prepared.fs.is_writable());
+    let new_data = vec![0xA7_u8; 12_288];
+    let created = FsOps::create(
+        rw_prepared.fs.as_ref(),
+        &cx,
+        &mut scope,
+        InodeNumber(1),
+        OsStr::new("written.bin"),
+        0o644,
+        0,
+        0,
+    )
+    .unwrap();
+    let written = FsOps::write(
+        rw_prepared.fs.as_ref(),
+        &cx,
+        &mut scope,
+        created.ino,
+        0,
+        &new_data,
+    )
+    .unwrap();
+    assert_eq!(written as usize, new_data.len());
+    rw_prepared.finish(&cx).unwrap();
+    assert!(
+        verify(&cx, &fixture.image, &fixture.sidecar)
+            .unwrap()
+            .is_healthy()
+    );
+}
+
+#[test]
+fn protected_mount_ntfs_repairs_multi_block_corruption_on_read_bd_q19uk() {
+    let dir = tempfile::tempdir().unwrap();
+    let image_path = dir.path().join("image.ntfs");
+    let sidecar_path = dir.path().join("image.ffs-rq");
+    let cx = Cx::for_testing();
+
+    // Build a valid 1 MiB NTFS 3.1 image with 512-byte sectors/clusters and a 16 KiB non-resident file
+    let length = 1024 * 1024_usize;
+    let mut image = vec![0_u8; length];
+    let boot = &mut image[..512];
+    boot[3..11].copy_from_slice(b"NTFS    ");
+    boot[11..13].copy_from_slice(&512_u16.to_le_bytes());
+    boot[13] = 1;
+    boot[21] = 0xF8;
+    boot[40..48].copy_from_slice(&2047_u64.to_le_bytes());
+    boot[48..56].copy_from_slice(&4_u64.to_le_bytes());
+    boot[56..64].copy_from_slice(&128_u64.to_le_bytes());
+    boot[64] = 0xF6;
+    boot[68] = 0xF4;
+    boot[510..512].copy_from_slice(&[0x55, 0xAA]);
+
+    let resident = |kind: u32, id: u16, name: &str, value: &[u8]| -> Vec<u8> {
+        let name: Vec<_> = name.encode_utf16().collect();
+        let start = (24 + name.len() * 2).next_multiple_of(8);
+        let len = (start + value.len()).next_multiple_of(8);
+        let mut attr = vec![0; len];
+        attr[..4].copy_from_slice(&kind.to_le_bytes());
+        attr[4..8].copy_from_slice(&(len as u32).to_le_bytes());
+        attr[9] = name.len() as u8;
+        attr[10..12].copy_from_slice(&24_u16.to_le_bytes());
+        attr[14..16].copy_from_slice(&id.to_le_bytes());
+        attr[16..20].copy_from_slice(&(value.len() as u32).to_le_bytes());
+        attr[20..22].copy_from_slice(&(start as u16).to_le_bytes());
+        for (idx, unit) in name.iter().enumerate() {
+            attr[24 + idx * 2..26 + idx * 2].copy_from_slice(&unit.to_le_bytes());
+        }
+        attr[start..start + value.len()].copy_from_slice(value);
+        attr
+    };
+    let mapped = |pairs: &[u8], clusters: u64, size: u64| -> Vec<u8> {
+        let start = 64_usize;
+        let len = (start + pairs.len()).next_multiple_of(8);
+        let mut attr = vec![0; len];
+        attr[..4].copy_from_slice(&0x80_u32.to_le_bytes());
+        attr[4..8].copy_from_slice(&(len as u32).to_le_bytes());
+        attr[8] = 1;
+        attr[24..32].copy_from_slice(&(clusters - 1).to_le_bytes());
+        attr[32..34].copy_from_slice(&(start as u16).to_le_bytes());
+        attr[40..48].copy_from_slice(&(clusters * 512).to_le_bytes());
+        attr[48..56].copy_from_slice(&size.to_le_bytes());
+        attr[56..64].copy_from_slice(&size.to_le_bytes());
+        attr[start..start + pairs.len()].copy_from_slice(pairs);
+        attr
+    };
+    let mut std_info = [0_u8; 72];
+    for i in 0..4 {
+        std_info[i * 8..i * 8 + 8].copy_from_slice(&116_444_736_000_000_000_u64.to_le_bytes());
+    }
+    let standard = resident(0x10, 500, "", &std_info);
+    let filename = |parent: u64, name: &str, ns: u8| -> Vec<u8> {
+        let units: Vec<_> = name.encode_utf16().collect();
+        let mut bytes = vec![0; 66 + units.len() * 2];
+        bytes[..8].copy_from_slice(&((7_u64 << 48) | parent).to_le_bytes());
+        bytes[64] = units.len() as u8;
+        bytes[65] = ns;
+        for (i, u) in units.iter().enumerate() {
+            bytes[66 + i * 2..68 + i * 2].copy_from_slice(&u.to_le_bytes());
+        }
+        bytes
+    };
+    let make_record = |number: u32, directory: bool, links: u16, attrs: &[Vec<u8>]| -> Vec<u8> {
+        let mut raw = vec![0; 1024];
+        raw[..4].copy_from_slice(b"FILE");
+        raw[4..6].copy_from_slice(&48_u16.to_le_bytes());
+        raw[6..8].copy_from_slice(&3_u16.to_le_bytes());
+        raw[16..18].copy_from_slice(&7_u16.to_le_bytes());
+        raw[18..20].copy_from_slice(&links.to_le_bytes());
+        raw[20..22].copy_from_slice(&56_u16.to_le_bytes());
+        raw[22..24].copy_from_slice(&(if directory { 3_u16 } else { 1 }).to_le_bytes());
+        raw[28..32].copy_from_slice(&1024_u32.to_le_bytes());
+        raw[44..48].copy_from_slice(&number.to_le_bytes());
+        let mut at = 56;
+        for attr in attrs {
+            raw[at..at + attr.len()].copy_from_slice(attr);
+            at += attr.len();
+        }
+        raw[at..at + 4].copy_from_slice(&u32::MAX.to_le_bytes());
+        raw[24..28].copy_from_slice(&((at + 8) as u32).to_le_bytes());
+        raw[48..50].copy_from_slice(&0x1234_u16.to_le_bytes());
+        for part in 1..=2 {
+            let saved = [raw[part * 512 - 2], raw[part * 512 - 1]];
+            raw[48 + part * 2..50 + part * 2].copy_from_slice(&saved);
+            raw[part * 512 - 2..part * 512].copy_from_slice(&0x1234_u16.to_le_bytes());
+        }
+        raw
+    };
+    let put = |img: &mut [u8], number: u32, bytes: &[u8]| {
+        let at = 4 * 512 + number as usize * 1024;
+        img[at..at + 1024].copy_from_slice(bytes);
+    };
+    let mft = make_record(
+        0,
+        false,
+        1,
+        &[
+            mapped(&[0x11, 80, 4, 0], 80, 40960),
+            resident(0xB0, 1, "", &[0xFF, 0, 0, 0x01, 0]),
+        ],
+    );
+    put(&mut image, 0, &mft);
+    image[128 * 512..130 * 512].copy_from_slice(&mft);
+    let mut vol_info = [0_u8; 12];
+    vol_info[8..10].copy_from_slice(&[3, 1]);
+    put(
+        &mut image,
+        3,
+        &make_record(3, false, 1, &[resident(0x70, 0, "", &vol_info)]),
+    );
+    let mut root_idx = vec![0_u8; 32];
+    root_idx[..4].copy_from_slice(&0x30_u32.to_le_bytes());
+    root_idx[4..8].copy_from_slice(&1_u32.to_le_bytes());
+    root_idx[8..12].copy_from_slice(&4096_u32.to_le_bytes());
+    root_idx[12] = 8;
+    root_idx[16..20].copy_from_slice(&16_u32.to_le_bytes());
+    {
+        let val = filename(5, "payload.bin", 1);
+        let len = (16 + val.len()).next_multiple_of(8);
+        let mut entry = vec![0_u8; len];
+        entry[..8].copy_from_slice(&((7_u64 << 48) | 24).to_le_bytes());
+        entry[8..10].copy_from_slice(&(len as u16).to_le_bytes());
+        entry[10..12].copy_from_slice(&(val.len() as u16).to_le_bytes());
+        entry[16..16 + val.len()].copy_from_slice(&val);
+        root_idx.extend(entry);
+    }
+    let mut last_entry = [0_u8; 16];
+    last_entry[8] = 16;
+    last_entry[12] = 2;
+    root_idx.extend(last_entry);
+    let used = root_idx.len() as u32 - 16;
+    root_idx[20..24].copy_from_slice(&used.to_le_bytes());
+    root_idx[24..28].copy_from_slice(&used.to_le_bytes());
+    put(
+        &mut image,
+        5,
+        &make_record(
+            5,
+            true,
+            1,
+            &[standard.clone(), resident(0x90, 40, "$I30", &root_idx)],
+        ),
+    );
+    put(
+        &mut image,
+        6,
+        &make_record(6, false, 1, &[resident(0x80, 0, "", &[0xFF; 256])]),
+    );
+    // $UpCase at LCN 300 (256 sectors = 128 KiB)
+    put(
+        &mut image,
+        10,
+        &make_record(
+            10,
+            false,
+            1,
+            &[mapped(&[0x22, 0, 1, 44, 1, 0], 256, 131_072)],
+        ),
+    );
+    for unit in 0..=u16::MAX {
+        let upper = if (97..=122).contains(&unit) {
+            unit - 32
+        } else {
+            unit
+        };
+        let at = 300 * 512 + usize::from(unit) * 2;
+        image[at..at + 2].copy_from_slice(&upper.to_le_bytes());
+    }
+    // Record 24: non-resident 12 KiB file at LCN 640 (byte offset 327,680 = 4096-block 80)
+    // Mapping pairs for 24 clusters starting at LCN 640 (0x0280): [0x21, 24, 0x80, 0x02, 0]
+    let payload: Vec<u8> = (0_u32..12_288).map(|i| (i % 241) as u8).collect();
+    image[640 * 512..640 * 512 + payload.len()].copy_from_slice(&payload);
+    put(
+        &mut image,
+        24,
+        &make_record(
+            24,
+            false,
+            1,
+            &[
+                standard,
+                mapped(&[0x21, 24, 0x80, 0x02, 0], 24, payload.len() as u64),
+                resident(0x30, 2, "", &filename(5, "payload.bin", 1)),
+            ],
+        ),
+    );
+
+    std::fs::write(&image_path, &image).unwrap();
+    protect(
+        &cx,
+        &image_path,
+        &sidecar_path,
+        SidecarOptions {
+            block_size: 4096,
+            group_blocks: 16,
+            repair_symbols: 4,
+        },
+    )
+    .expect("protect ntfs image");
+
+    let fixture = Fixture {
+        dir,
+        image: image_path,
+        sidecar: sidecar_path,
+        payload,
+    };
+
+    // Refuse --rw for NTFS
+    assert!(prepare(&cx, &fixture.writable_args()).is_err());
+
+    let prepared = prepare(&cx, &fixture.args()).expect("admit protected ntfs");
+    assert_eq!(prepared.filesystem, "ntfs");
+
+    // Corrupt TWO 4096-byte blocks in the file's data region (blocks 80 and 81)
+    let orig_80 = fixture.read_block(80);
+    let orig_81 = fixture.read_block(81);
+    fixture.damage_block(80);
+    fixture.damage_block(81);
+    assert_ne!(fixture.read_block(80), orig_80);
+    assert_ne!(fixture.read_block(81), orig_81);
+
+    let mut scope = RequestScope::empty();
+    let attr = FsOps::lookup(
+        prepared.fs.as_ref(),
+        &cx,
+        &mut scope,
+        InodeNumber(1),
+        OsStr::new("payload.bin"),
+    )
+    .unwrap();
+    let read_back = FsOps::read(
+        prepared.fs.as_ref(),
+        &cx,
+        &mut scope,
+        attr.ino,
+        0,
+        u32::try_from(fixture.payload.len()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(read_back, fixture.payload);
+    assert_eq!(
+        fixture.read_block(80),
+        orig_80,
+        "NTFS block 80 must be self-healed on disk"
+    );
+    assert_eq!(
+        fixture.read_block(81),
+        orig_81,
+        "NTFS block 81 must be self-healed on disk"
+    );
+    prepared.finish(&cx).unwrap();
+    assert!(
+        verify(&cx, &fixture.image, &fixture.sidecar)
+            .unwrap()
+            .is_healthy()
+    );
+}
+
+#[test]
+fn protected_mount_zfs_repairs_multi_block_corruption_on_read_bd_q19uk() {
+    use ffs_ondisk::zfs::{
+        DATA_OFFSET, Endian, LABEL_BYTES, LABEL_CONFIG_BYTES, LABEL_CONFIG_OFFSET,
+        UBERBLOCK_RING_OFFSET, checksum, label_offsets,
+    };
+    use sha2::{Digest, Sha256};
+
+    let dir = tempfile::tempdir().unwrap();
+    let image_path = dir.path().join("image.zfs");
+    let sidecar_path = dir.path().join("image.ffs-rq");
+    let cx = Cx::for_testing();
+
+    let length = 8 * 1024 * 1024_usize;
+    let order = Endian::Little;
+    let mut image = vec![0_u8; length];
+
+    let u16put = |raw: &mut [u8], at: usize, value: u16| {
+        raw[at..at + 2].copy_from_slice(&value.to_le_bytes());
+    };
+    let bp = |raw: &[u8], at: u64, kind: u8, level: u8, birth: u64| -> Vec<u8> {
+        let mut words = [0_u64; 16];
+        words[0] = raw.len() as u64 / 512;
+        words[1] = (at - DATA_OFFSET) / 512;
+        words[6] = (raw.len() as u64 / 512 - 1)
+            | ((raw.len() as u64 / 512 - 1) << 16)
+            | (2 << 32)
+            | (7 << 40)
+            | (u64::from(kind) << 48)
+            | (u64::from(level) << 56)
+            | (1_u64 << 63);
+        words[10] = birth;
+        words[12..].copy_from_slice(&checksum(raw, 7, order).unwrap());
+        words.into_iter().flat_map(|w| order.encode(w)).collect()
+    };
+    let node =
+        |kind: u8, block: usize, levels: u8, max: u64, bonus: &[u8], bonus_type: u8| -> Vec<u8> {
+            let mut raw = vec![0_u8; 512];
+            raw[0] = kind;
+            raw[1] = 12;
+            raw[2] = levels;
+            raw[3] = 1;
+            raw[4] = bonus_type;
+            raw[7] = 1;
+            u16put(&mut raw, 8, (block / 512) as u16);
+            u16put(&mut raw, 10, bonus.len() as u16);
+            raw[16..24].copy_from_slice(&order.encode(max));
+            raw[192..192 + bonus.len()].copy_from_slice(bonus);
+            raw
+        };
+    let legacy = |mode: u64, size: u64, parent: u64| -> Vec<u8> {
+        let mut raw = vec![0_u8; 264];
+        for (at, value) in [
+            (0, 1_700_000_000),
+            (8, 123),
+            (64, 10),
+            (72, mode),
+            (80, size),
+            (88, parent),
+            (96, 2),
+            (128, 1000),
+            (136, 100),
+        ] {
+            raw[at..at + 8].copy_from_slice(&order.encode(value));
+        }
+        raw
+    };
+    let micro = |entries: &[(&[u8], u64)]| -> Vec<u8> {
+        let mut raw = vec![0_u8; 512];
+        raw[..8].copy_from_slice(&order.encode((1 << 63) + 3));
+        for (i, (name, value)) in entries.iter().enumerate() {
+            let at = 64 + i * 64;
+            raw[at..at + 8].copy_from_slice(&order.encode(*value));
+            raw[at + 14..at + 14 + name.len()].copy_from_slice(name);
+        }
+        raw
+    };
+
+    let mos_at = DATA_OFFSET + 0x10000;
+    let pool_map_at = DATA_OFFSET + 0x14000;
+    let os_at = DATA_OFFSET + 0x18000;
+    let table_at = DATA_OFFSET + 0x20000;
+    let master_at = DATA_OFFSET + 0x25000;
+    let root_map_at = DATA_OFFSET + 0x26000;
+    let file_blk0_at = DATA_OFFSET + 0x28000;
+    let file_blk1_at = DATA_OFFSET + 0x29000;
+    let indirect_at = DATA_OFFSET + 0x2e000;
+
+    let mut table = vec![0_u8; 16_384];
+    let master = micro(&[(b"ROOT", 2), (b"VERSION", 4)]);
+    image[master_at as usize..master_at as usize + 512].copy_from_slice(&master);
+    let mut master_node = node(21, 512, 1, 0, &[], 0);
+    master_node[64..192].copy_from_slice(&bp(&master, master_at, 21, 0, 20));
+    table[512..1024].copy_from_slice(&master_node);
+
+    let root_dir = micro(&[(b"payload.bin", (8 << 60) | 3)]);
+    image[root_map_at as usize..root_map_at as usize + 512].copy_from_slice(&root_dir);
+    let mut root_dn = node(20, 512, 1, 0, &legacy(0o040_755, 2, 2), 17);
+    root_dn[64..192].copy_from_slice(&bp(&root_dir, root_map_at, 20, 0, 20));
+    table[2 * 512..3 * 512].copy_from_slice(&root_dn);
+
+    let blk0: Vec<u8> = (0_u32..4096).map(|i| (i % 239) as u8).collect();
+    let blk1: Vec<u8> = (0_u32..4096).map(|i| ((i + 77) % 239) as u8).collect();
+    let mut payload = blk0.clone();
+    payload.extend_from_slice(&blk1);
+    image[file_blk0_at as usize..file_blk0_at as usize + 4096].copy_from_slice(&blk0);
+    image[file_blk1_at as usize..file_blk1_at as usize + 4096].copy_from_slice(&blk1);
+
+    let mut indirect = vec![0_u8; 4096];
+    indirect[..128].copy_from_slice(&bp(&blk0, file_blk0_at, 19, 0, 20));
+    indirect[128..256].copy_from_slice(&bp(&blk1, file_blk1_at, 19, 0, 20));
+    image[indirect_at as usize..indirect_at as usize + 4096].copy_from_slice(&indirect);
+
+    let mut file_dn = node(
+        19,
+        4096,
+        2,
+        1,
+        &legacy(0o100_644, payload.len() as u64, 2),
+        17,
+    );
+    file_dn[24..32].copy_from_slice(&order.encode(8192));
+    file_dn[64..192].copy_from_slice(&bp(&indirect, indirect_at, 19, 1, 30));
+    table[3 * 512..4 * 512].copy_from_slice(&file_dn);
+    image[table_at as usize..table_at as usize + table.len()].copy_from_slice(&table);
+
+    let mut os = vec![0_u8; 1024];
+    let mut os_meta = node(10, 16_384, 1, 0, &[], 0);
+    os_meta[64..192].copy_from_slice(&bp(&table, table_at, 10, 0, 40));
+    os[..512].copy_from_slice(&os_meta);
+    os[704..712].copy_from_slice(&order.encode(2));
+    image[os_at as usize..os_at as usize + 1024].copy_from_slice(&os);
+
+    let mut mos_table = vec![0_u8; 16_384];
+    let pool_zap = micro(&[(b"root_dataset", 2)]);
+    image[pool_map_at as usize..pool_map_at as usize + 512].copy_from_slice(&pool_zap);
+    let mut pool_dn = node(1, 512, 1, 0, &[], 0);
+    pool_dn[64..192].copy_from_slice(&bp(&pool_zap, pool_map_at, 1, 0, 20));
+    mos_table[512..1024].copy_from_slice(&pool_dn);
+    let mut dir_bonus = vec![0_u8; 256];
+    dir_bonus[8..16].copy_from_slice(&order.encode(3));
+    mos_table[1024..1536].copy_from_slice(&node(12, 512, 1, 0, &dir_bonus, 12));
+    let mut ds_bonus = vec![0_u8; 320];
+    for (at, value) in [(0, 2), (56, 5), (112, 987), (120, 4)] {
+        ds_bonus[at..at + 8].copy_from_slice(&order.encode(value));
+    }
+    ds_bonus[128..256].copy_from_slice(&bp(&os, os_at, 11, 0, 45));
+    mos_table[1536..2048].copy_from_slice(&node(16, 512, 1, 0, &ds_bonus, 16));
+    image[mos_at as usize..mos_at as usize + mos_table.len()].copy_from_slice(&mos_table);
+
+    let mut mos_os = vec![0_u8; 1024];
+    let mut mos_meta = node(10, 16_384, 1, 0, &[], 0);
+    mos_meta[64..192].copy_from_slice(&bp(&mos_table, mos_at, 10, 0, 50));
+    mos_os[..512].copy_from_slice(&mos_meta);
+    mos_os[704..712].copy_from_slice(&order.encode(1));
+    let mos_os_at = DATA_OFFSET + 0x1000;
+    image[mos_os_at as usize..mos_os_at as usize + 1024].copy_from_slice(&mos_os);
+
+    let mut ub = vec![0_u8; 1024];
+    for (at, value) in [
+        (0, 0x00ba_b10c),
+        (8, 5000),
+        (16, 50),
+        (24, 1122),
+        (32, 1_700_000_000),
+    ] {
+        ub[at..at + 8].copy_from_slice(&order.encode(value));
+    }
+    ub[40..168].copy_from_slice(&bp(&mos_os, mos_os_at, 11, 0, 50));
+
+    let xstring = |value: &str| -> Vec<u8> {
+        let mut bytes = (value.len() as u32).to_be_bytes().to_vec();
+        bytes.extend_from_slice(value.as_bytes());
+        bytes.resize(bytes.len().next_multiple_of(4), 0);
+        bytes
+    };
+    let pair = |name: &str, kind: u32, data: &[u8]| -> Vec<u8> {
+        let mut bytes = vec![0; 8];
+        bytes.extend_from_slice(&xstring(name));
+        bytes.extend_from_slice(&kind.to_be_bytes());
+        bytes.extend_from_slice(&1_u32.to_be_bytes());
+        bytes.extend_from_slice(data);
+        let len = bytes.len() as u32;
+        bytes[..4].copy_from_slice(&len.to_be_bytes());
+        bytes[4..8].copy_from_slice(&64_u32.to_be_bytes());
+        bytes
+    };
+    let uint = |name: &str, value: u64| pair(name, 8, &value.to_be_bytes());
+    let list = |pairs: &[Vec<u8>]| -> Vec<u8> {
+        let mut bytes = vec![0, 0, 0, 0, 0, 0, 0, 1];
+        for p in pairs {
+            bytes.extend_from_slice(p);
+        }
+        bytes.extend_from_slice(&[0; 8]);
+        bytes
+    };
+    let vdev_tree = list(&[
+        pair("type", 9, &xstring("file")),
+        uint("id", 0),
+        uint("guid", 999),
+        uint("ashift", 9),
+        uint("asize", length as u64 - DATA_OFFSET - 2 * LABEL_BYTES),
+        uint("is_log", 0),
+    ]);
+    let mut cfg = vec![1, 1, 0, 0];
+    cfg.extend_from_slice(&list(&[
+        uint("version", 5000),
+        uint("state", 1),
+        uint("txg", 50),
+        uint("pool_guid", 123),
+        uint("guid", 999),
+        uint("top_guid", 999),
+        uint("vdev_children", 1),
+        pair("name", 9, &xstring("tank")),
+        pair("vdev_tree", 19, &vdev_tree),
+        pair("features_for_read", 19, &list(&[])),
+    ]));
+    let stamp = |bytes: &mut [u8], offset: u64| {
+        let at = bytes.len() - 40;
+        bytes[at..at + 8].copy_from_slice(&order.encode(0x0210_da7a_b10c_7a11));
+        bytes[at + 8..].fill(0);
+        bytes[at + 8..at + 16].copy_from_slice(&order.encode(offset));
+        let digest = Sha256::digest(&*bytes);
+        for i in 0..4 {
+            let word = u64::from_be_bytes(std::array::from_fn(|n| digest[i * 8 + n]));
+            bytes[at + 8 + i * 8..at + 16 + i * 8].copy_from_slice(&order.encode(word));
+        }
+    };
+    for label in label_offsets(length as u64).unwrap() {
+        let cfg_off = label + LABEL_CONFIG_OFFSET;
+        let mut cfg_blk = vec![0_u8; LABEL_CONFIG_BYTES];
+        cfg_blk[..cfg.len()].copy_from_slice(&cfg);
+        stamp(&mut cfg_blk, cfg_off);
+        image[cfg_off as usize..cfg_off as usize + LABEL_CONFIG_BYTES].copy_from_slice(&cfg_blk);
+
+        let ub_off = label + UBERBLOCK_RING_OFFSET;
+        let mut ub_blk = ub.clone();
+        stamp(&mut ub_blk, ub_off);
+        image[ub_off as usize..ub_off as usize + ub_blk.len()].copy_from_slice(&ub_blk);
+    }
+
+    std::fs::write(&image_path, &image).unwrap();
+    protect(
+        &cx,
+        &image_path,
+        &sidecar_path,
+        SidecarOptions {
+            block_size: 4096,
+            group_blocks: 16,
+            repair_symbols: 4,
+        },
+    )
+    .expect("protect zfs image");
+
+    let fixture = Fixture {
+        dir,
+        image: image_path,
+        sidecar: sidecar_path,
+        payload,
+    };
+
+    // Refuse --rw for ZFS
+    assert!(prepare(&cx, &fixture.writable_args()).is_err());
+
+    let prepared = prepare(&cx, &fixture.args()).expect("admit protected zfs");
+    assert_eq!(prepared.filesystem, "zfs");
+
+    // Corrupt TWO 4096-byte blocks in the same group (file_blk0_at and file_blk1_at)
+    let blk_a = file_blk0_at / 4096;
+    let blk_b = file_blk1_at / 4096;
+    let orig_a = fixture.read_block(blk_a);
+    let orig_b = fixture.read_block(blk_b);
+    fixture.damage_block(blk_a);
+    fixture.damage_block(blk_b);
+    assert_ne!(fixture.read_block(blk_a), orig_a);
+    assert_ne!(fixture.read_block(blk_b), orig_b);
+
+    let mut scope = RequestScope::empty();
+    let attr = FsOps::lookup(
+        prepared.fs.as_ref(),
+        &cx,
+        &mut scope,
+        InodeNumber(1),
+        OsStr::new("payload.bin"),
+    )
+    .unwrap();
+    let read_back = FsOps::read(
+        prepared.fs.as_ref(),
+        &cx,
+        &mut scope,
+        attr.ino,
+        0,
+        u32::try_from(fixture.payload.len()).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(read_back, fixture.payload);
+    assert_eq!(
+        fixture.read_block(blk_a),
+        orig_a,
+        "ZFS block A must be self-healed on disk"
+    );
+    assert_eq!(
+        fixture.read_block(blk_b),
+        orig_b,
+        "ZFS block B must be self-healed on disk"
+    );
+    prepared.finish(&cx).unwrap();
+    assert!(
+        verify(&cx, &fixture.image, &fixture.sidecar)
+            .unwrap()
+            .is_healthy()
+    );
+}

@@ -4,6 +4,7 @@
 //! synchronized before its FAT allocation or parent namespace entry is published.
 //! Parent long-name and growth ordering is shared with file creation.
 
+use super::super::super::ImageArgs;
 use super::super::{
     ImageFile, change_fat, checkpoint, open_regular, reserve_clusters, set_dirty, set_hints,
     stable, validate_boot_state, write_volume,
@@ -12,7 +13,6 @@ use super::{
     Extension, Namespace, Slot, deleted_slot, directory_offsets, parent, patch_slot, read_slot,
     reserve_slots,
 };
-use super::super::super::ImageArgs;
 use anyhow::{Context, Result, bail};
 use asupersync::{Cx, types::CancelKind};
 use clap::Args;
@@ -386,7 +386,10 @@ pub fn run_mkdir(cx: &Cx, args: &MkdirArgs) -> Result<serde_json::Value> {
     .context("installing FAT mkdir cancellation handler; no mutation started")?;
 
     let (volume, image_check) = if args.image.sidecar.is_some() {
-        (super::super::open_volume(cx, &args.image, !args.dry_run)?, None)
+        (
+            super::super::open_volume(cx, &args.image, !args.dry_run)?,
+            None,
+        )
     } else {
         let (image, image_stamp) = open_regular(&args.image.image, !args.dry_run)?;
         let volume = super::super::super::FatVolume::from_device(

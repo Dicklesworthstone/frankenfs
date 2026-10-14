@@ -5,12 +5,12 @@
 //! eight members, including corrupt-but-readable parity, and only publishes a
 //! candidate after the original physical checksum and transform both succeed.
 
-use super::Pool;
 use super::super::{
     BlockPointer, BlockRead, Cx, DATA_OFFSET, Dva, FfsError, LABEL_BYTES, RaidzColumnInfo,
     RaidzGroup, RaidzMember, RaidzReadInfo, Result, VdevConfig, checkpoint, corrupt, parse,
     unsupported,
 };
+use super::Pool;
 use ffs_ondisk::zfs::gang::{GangHeader, HEADER_BYTES};
 use ffs_ondisk::zfs::raidz::parity::RaidzParityMap;
 use ffs_ondisk::zfs::raidz::{Raidz1Map, RaidzColumn};

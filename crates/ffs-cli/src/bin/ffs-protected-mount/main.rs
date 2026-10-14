@@ -5,6 +5,30 @@
 //! Caller writes require --rw; read-only remains the default. The ordinary
 //! mount command is unchanged, and startup differences never authorize rollback.
 
+macro_rules! companion_bin_tests {
+    ($($item:item)*) => {};
+}
+
+#[allow(unused, dead_code, clippy::all, clippy::pedantic, clippy::nursery)]
+#[path = "../ffs-fat"]
+mod fat {
+    pub mod filesystem;
+    pub mod reader;
+}
+
+#[allow(unused, dead_code, clippy::all, clippy::pedantic, clippy::nursery)]
+#[path = "../ffs-ntfs"]
+mod ntfs {
+    pub mod reader;
+}
+
+#[allow(unused, dead_code, clippy::all, clippy::pedantic, clippy::nursery)]
+#[path = "../ffs-zfs"]
+mod zfs {
+    pub mod filesystem;
+    pub mod reader;
+}
+
 #[path = "../../mount_worker.rs"]
 mod mount_worker;
 mod scrub;
@@ -13,20 +37,25 @@ use anyhow::{Context, Result, bail};
 use asupersync::Cx;
 use clap::Parser;
 use ffs_block::ByteDevice;
+use ffs_core::vfs::XattrPresence;
 use ffs_core::{
-    Ext4JournalReplayMode, FsFlavor, FsOps, OpenFs, OpenOptions, RequestScope, detect_filesystem,
+    DetectedFilesystem, Ext4JournalReplayMode, FiemapExtent, FsOps, FsStat, InodeAttr, OpenFs,
+    OpenOptions, ReaddirPage, ReleaseRequest, RequestOp, RequestScope, SeekWhence, SetAttrRequest,
+    XattrSetMode, detect_all_filesystems_on_device,
 };
 use ffs_error::FfsError;
 use ffs_fuse::{MountConfig, MountOptions, mount_managed};
 use ffs_ondisk::EXT4_VALID_FS;
 use ffs_repair::sidecar::live::SidecarImageDevice;
-use ffs_types::{ByteOffset, InodeNumber};
+use ffs_types::{ByteOffset, CommitSeq, InodeNumber};
 use serde::Serialize;
+use std::ffi::OsStr;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -101,8 +130,462 @@ impl ByteDevice for ProtectedDevice {
     }
 }
 
+pub enum ProtectedFs {
+    Core(OpenFs),
+    Fat {
+        fs: fat::filesystem::FatFs,
+        writable: bool,
+    },
+    Ntfs(ntfs::reader::filesystem::NtfsFs),
+    Zfs(zfs::filesystem::ZfsFs),
+}
+
+impl ProtectedFs {
+    pub fn is_writable(&self) -> bool {
+        match self {
+            Self::Core(fs) => fs.is_writable(),
+            Self::Fat { writable, .. } => *writable,
+            Self::Ntfs(_) | Self::Zfs(_) => false,
+        }
+    }
+
+    fn as_ops(&self) -> &dyn FsOps {
+        match self {
+            Self::Core(fs) => fs,
+            Self::Fat { fs, .. } => fs,
+            Self::Ntfs(fs) => fs,
+            Self::Zfs(fs) => fs,
+        }
+    }
+}
+
+impl std::ops::Deref for ProtectedFs {
+    type Target = OpenFs;
+
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Core(fs) => fs,
+            Self::Fat { .. } | Self::Ntfs(_) | Self::Zfs(_) => {
+                panic!("OpenFs deref is only valid on ext4/btrfs ProtectedFs::Core")
+            }
+        }
+    }
+}
+
+impl mount_worker::PeriodicCommitTarget for ProtectedFs {
+    fn default_commit_interval(&self) -> Option<std::time::Duration> {
+        match self {
+            Self::Core(fs) => mount_worker::PeriodicCommitTarget::default_commit_interval(fs),
+            Self::Fat { .. } | Self::Ntfs(_) | Self::Zfs(_) => None,
+        }
+    }
+
+    fn periodic_commit(&self, cx: &Cx) -> ffs_error::Result<bool> {
+        match self {
+            Self::Core(fs) => fs.periodic_commit(cx),
+            Self::Fat { .. } | Self::Ntfs(_) | Self::Zfs(_) => Ok(false),
+        }
+    }
+}
+
+impl FsOps for ProtectedFs {
+    fn xattr_presence(&self, cx: &Cx) -> XattrPresence {
+        self.as_ops().xattr_presence(cx)
+    }
+
+    fn getattr(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+    ) -> ffs_error::Result<InodeAttr> {
+        self.as_ops().getattr(cx, scope, ino)
+    }
+
+    fn getattr_batch(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        inos: &[InodeNumber],
+    ) -> Vec<ffs_error::Result<InodeAttr>> {
+        self.as_ops().getattr_batch(cx, scope, inos)
+    }
+
+    fn lookup(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+    ) -> ffs_error::Result<InodeAttr> {
+        self.as_ops().lookup(cx, scope, parent, name)
+    }
+
+    fn readdir(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        offset: u64,
+    ) -> ffs_error::Result<ReaddirPage> {
+        self.as_ops().readdir(cx, scope, ino, offset)
+    }
+
+    fn read(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        offset: u64,
+        size: u32,
+    ) -> ffs_error::Result<Vec<u8>> {
+        self.as_ops().read(cx, scope, ino, offset, size)
+    }
+
+    fn open(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        flags: i32,
+    ) -> ffs_error::Result<(u64, u32)> {
+        self.as_ops().open(cx, scope, ino, flags)
+    }
+
+    fn readlink(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+    ) -> ffs_error::Result<Vec<u8>> {
+        self.as_ops().readlink(cx, scope, ino)
+    }
+
+    fn statfs(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+    ) -> ffs_error::Result<FsStat> {
+        self.as_ops().statfs(cx, scope, ino)
+    }
+
+    fn listxattr(&self, cx: &Cx, ino: InodeNumber) -> ffs_error::Result<Vec<String>> {
+        self.as_ops().listxattr(cx, ino)
+    }
+
+    fn getxattr(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        name: &str,
+    ) -> ffs_error::Result<Option<Vec<u8>>> {
+        self.as_ops().getxattr(cx, ino, name)
+    }
+
+    fn setxattr(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        name: &str,
+        value: &[u8],
+        mode: XattrSetMode,
+    ) -> ffs_error::Result<()> {
+        self.as_ops().setxattr(cx, scope, ino, name, value, mode)
+    }
+
+    fn removexattr(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        name: &str,
+    ) -> ffs_error::Result<bool> {
+        self.as_ops().removexattr(cx, scope, ino, name)
+    }
+
+    fn create(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> ffs_error::Result<InodeAttr> {
+        self.as_ops()
+            .create(cx, scope, parent, name, mode, uid, gid)
+    }
+
+    fn touch_atime(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        now: SystemTime,
+        strict: bool,
+    ) -> ffs_error::Result<bool> {
+        self.as_ops().touch_atime(cx, scope, ino, now, strict)
+    }
+
+    fn tmpfile(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> ffs_error::Result<InodeAttr> {
+        self.as_ops().tmpfile(cx, scope, parent, mode, uid, gid)
+    }
+
+    fn mkdir(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        mode: u16,
+        uid: u32,
+        gid: u32,
+    ) -> ffs_error::Result<InodeAttr> {
+        self.as_ops().mkdir(cx, scope, parent, name, mode, uid, gid)
+    }
+
+    fn unlink(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+    ) -> ffs_error::Result<()> {
+        self.as_ops().unlink(cx, scope, parent, name)
+    }
+
+    fn rmdir(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+    ) -> ffs_error::Result<()> {
+        self.as_ops().rmdir(cx, scope, parent, name)
+    }
+
+    fn rename(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        new_parent: InodeNumber,
+        new_name: &OsStr,
+    ) -> ffs_error::Result<()> {
+        self.as_ops()
+            .rename(cx, scope, parent, name, new_parent, new_name)
+    }
+
+    fn mknod(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        mode: u16,
+        rdev: u32,
+        uid: u32,
+        gid: u32,
+    ) -> ffs_error::Result<InodeAttr> {
+        self.as_ops()
+            .mknod(cx, scope, parent, name, mode, rdev, uid, gid)
+    }
+
+    fn rename2(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        new_parent: InodeNumber,
+        new_name: &OsStr,
+        flags: u32,
+    ) -> ffs_error::Result<()> {
+        self.as_ops()
+            .rename2(cx, scope, parent, name, new_parent, new_name, flags)
+    }
+
+    fn write(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        offset: u64,
+        data: &[u8],
+    ) -> ffs_error::Result<u32> {
+        self.as_ops().write(cx, scope, ino, offset, data)
+    }
+
+    fn copy_file_range(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino_in: InodeNumber,
+        offset_in: u64,
+        ino_out: InodeNumber,
+        offset_out: u64,
+        len: u64,
+    ) -> ffs_error::Result<u64> {
+        self.as_ops()
+            .copy_file_range(cx, scope, ino_in, offset_in, ino_out, offset_out, len)
+    }
+
+    fn link(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        new_parent: InodeNumber,
+        new_name: &OsStr,
+    ) -> ffs_error::Result<InodeAttr> {
+        self.as_ops().link(cx, scope, ino, new_parent, new_name)
+    }
+
+    fn symlink(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        target: &Path,
+        uid: u32,
+        gid: u32,
+    ) -> ffs_error::Result<InodeAttr> {
+        self.as_ops()
+            .symlink(cx, scope, parent, name, target, uid, gid)
+    }
+
+    fn fallocate(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        offset: u64,
+        length: u64,
+        mode: i32,
+    ) -> ffs_error::Result<()> {
+        self.as_ops()
+            .fallocate(cx, scope, ino, offset, length, mode)
+    }
+
+    fn fiemap(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        start: u64,
+        length: u64,
+    ) -> ffs_error::Result<Vec<FiemapExtent>> {
+        self.as_ops().fiemap(cx, scope, ino, start, length)
+    }
+
+    fn lseek(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        offset: u64,
+        whence: SeekWhence,
+    ) -> ffs_error::Result<u64> {
+        self.as_ops().lseek(cx, scope, ino, offset, whence)
+    }
+
+    fn setattr(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        attrs: &SetAttrRequest,
+    ) -> ffs_error::Result<InodeAttr> {
+        self.as_ops().setattr(cx, scope, ino, attrs)
+    }
+
+    fn flush(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        fh: u64,
+        lock_owner: u64,
+    ) -> ffs_error::Result<()> {
+        self.as_ops().flush(cx, scope, ino, fh, lock_owner)
+    }
+
+    fn release(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        request: ReleaseRequest,
+    ) -> ffs_error::Result<()> {
+        self.as_ops().release(cx, scope, request)
+    }
+
+    fn fsync(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        fh: u64,
+        datasync: bool,
+    ) -> ffs_error::Result<()> {
+        self.as_ops().fsync(cx, scope, ino, fh, datasync)
+    }
+
+    fn fsyncdir(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+        ino: InodeNumber,
+        fh: u64,
+        datasync: bool,
+    ) -> ffs_error::Result<()> {
+        self.as_ops().fsyncdir(cx, scope, ino, fh, datasync)
+    }
+
+    fn sync_fs(&self, cx: &Cx, scope: &mut RequestScope) -> ffs_error::Result<()> {
+        self.as_ops().sync_fs(cx, scope)
+    }
+
+    fn begin_request_scope(&self, cx: &Cx, op: RequestOp) -> ffs_error::Result<RequestScope> {
+        self.as_ops().begin_request_scope(cx, op)
+    }
+
+    fn end_request_scope(
+        &self,
+        cx: &Cx,
+        op: RequestOp,
+        scope: RequestScope,
+    ) -> ffs_error::Result<()> {
+        self.as_ops().end_request_scope(cx, op, scope)
+    }
+
+    fn commit_request_scope(
+        &self,
+        cx: &Cx,
+        scope: &mut RequestScope,
+    ) -> ffs_error::Result<CommitSeq> {
+        self.as_ops().commit_request_scope(cx, scope)
+    }
+
+    fn flush_on_destroy(&self, cx: &Cx) -> ffs_error::Result<()> {
+        self.as_ops().flush_on_destroy(cx)
+    }
+}
+
 struct Prepared {
-    fs: Arc<OpenFs>,
+    fs: Arc<ProtectedFs>,
     device: Arc<SidecarImageDevice>,
     filesystem: &'static str,
     mountpoint: Option<PathBuf>,
@@ -174,13 +657,8 @@ fn checked_paths(args: &Args) -> Result<(PathBuf, PathBuf, Option<PathBuf>)> {
 }
 
 fn clean_single_image(cx: &Cx, device: &dyn ByteDevice) -> Result<&'static str> {
-    // Enough for either primary superblock, bounded independently of image
-    // size. Read through protection, never through a second unverified opener.
-    let len = usize::try_from(device.len_bytes().min(0x1_1000))?;
-    let mut probe = vec![0; len];
-    device.read_exact_at(cx, ByteOffset(0), &mut probe)?;
-    match detect_filesystem(&probe).context("detect protected filesystem")? {
-        FsFlavor::Ext4(sb) => {
+    match detect_all_filesystems_on_device(cx, device).context("detect protected filesystem")? {
+        DetectedFilesystem::Ext4(sb) => {
             // RECOVER and the orphan/error states require filesystem recovery,
             // not RaptorQ rollback. Admit only clean protection points, including
             // for --rw; Skip below is never a dirty-mount bypass.
@@ -192,12 +670,16 @@ fn clean_single_image(cx: &Cx, device: &dyn ByteDevice) -> Result<&'static str> 
             }
             Ok("ext4")
         }
-        FsFlavor::Btrfs(sb) => {
+        DetectedFilesystem::Btrfs(sb) => {
             if sb.num_devices != 1 || sb.log_root != 0 {
                 bail!("protected mount requires a clean single-device btrfs image");
             }
             Ok("btrfs")
         }
+        DetectedFilesystem::Fat16(_) => Ok("fat16"),
+        DetectedFilesystem::Fat32(_) => Ok("fat32"),
+        DetectedFilesystem::Ntfs(_) => Ok("ntfs"),
+        DetectedFilesystem::Zfs(_) => Ok("zfs"),
     }
 }
 
@@ -209,44 +691,102 @@ fn prepare(cx: &Cx, args: &Args) -> Result<Prepared> {
             .context("admit image and existing repair protection")?,
     );
     let filesystem = clean_single_image(cx, device.as_ref())?;
-    let options = OpenOptions {
-        ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
-        ..OpenOptions::default()
-    };
-    let mut fs = OpenFs::from_device(
-        cx,
-        Box::new(ProtectedDevice {
-            inner: Arc::clone(&device),
-            writable: args.rw,
-        }),
-        &options,
-    )
-    .context("open filesystem through the protected device")?;
-    // Exercise the actual FUSE root alias before enabling caller writes.
-    FsOps::getattr(&fs, cx, &mut RequestScope::empty(), InodeNumber(1))
-        .context("read protected filesystem root")?;
-    if args.rw {
-        // Match ordinary mount admission: a journalled ext4 image may not
-        // silently take the direct home-block durability path. The writer uses
-        // this same protected device, so journal and checkpoint syncs also
-        // publish fresh sidecar coverage. Clean admission above establishes
-        // the attachment helper's prerequisite that no replay is pending.
-        fs.attach_ext4_internal_jbd2_writer(cx)
-            .context("attach the protected ext4 internal JBD2 writer")?;
-        if fs
-            .ext4_superblock()
-            .is_some_and(|sb| sb.has_compat(ffs_ondisk::Ext4CompatFeatures::HAS_JOURNAL))
-            && !fs.has_jbd2_writer()
-        {
-            bail!(
-                "refusing writable journalled ext4 mount: no JBD2 writer is attached, so the durability checkpoint would skip the journal's descriptor and commit blocks"
-            );
+    let protected_device = Box::new(ProtectedDevice {
+        inner: Arc::clone(&device),
+        writable: args.rw,
+    });
+    let len = device.len_bytes();
+    let uid = nix::unistd::Uid::current().as_raw();
+    let gid = nix::unistd::Gid::current().as_raw();
+    let fs = match filesystem {
+        "ext4" | "btrfs" => {
+            let options = OpenOptions {
+                ext4_journal_replay_mode: Ext4JournalReplayMode::Skip,
+                ..OpenOptions::default()
+            };
+            let mut fs = OpenFs::from_device(cx, protected_device, &options)
+                .context("open filesystem through the protected device")?;
+            // Exercise the actual FUSE root alias before enabling caller writes.
+            FsOps::getattr(&fs, cx, &mut RequestScope::empty(), InodeNumber(1))
+                .context("read protected filesystem root")?;
+            if args.rw {
+                // Match ordinary mount admission: a journalled ext4 image may not
+                // silently take the direct home-block durability path. The writer uses
+                // this same protected device, so journal and checkpoint syncs also
+                // publish fresh sidecar coverage. Clean admission above establishes
+                // the attachment helper's prerequisite that no replay is pending.
+                fs.attach_ext4_internal_jbd2_writer(cx)
+                    .context("attach the protected ext4 internal JBD2 writer")?;
+                if fs
+                    .ext4_superblock()
+                    .is_some_and(|sb| sb.has_compat(ffs_ondisk::Ext4CompatFeatures::HAS_JOURNAL))
+                    && !fs.has_jbd2_writer()
+                {
+                    bail!(
+                        "refusing writable journalled ext4 mount: no JBD2 writer is attached, so the durability checkpoint would skip the journal's descriptor and commit blocks"
+                    );
+                }
+                // Preserve all ordinary format/profile/feature write-admission checks.
+                // No ephemeral btrfs mode or kernel writeback cache is enabled here.
+                fs.enable_writes(cx)
+                    .context("enable protected filesystem writes")?;
+            }
+            ProtectedFs::Core(fs)
         }
-        // Preserve all ordinary format/profile/feature write-admission checks.
-        // No ephemeral btrfs mode or kernel writeback cache is enabled here.
-        fs.enable_writes(cx)
-            .context("enable protected filesystem writes")?;
-    }
+        "fat16" | "fat32" => {
+            let volume = fat::reader::FatVolume::from_device(cx, protected_device, 0, len)
+                .context("open FAT volume through the protected device")?;
+            if args.rw {
+                let check = volume
+                    .check(cx)
+                    .context("check FAT volume before enabling protected writes")?;
+                if !check.clean || !check.complete || !check.namespace_complete {
+                    bail!("FAT volume is dirty or incomplete; reconcile offline before --rw");
+                }
+            }
+            let fat_fs = fat::filesystem::FatFs::new_with_mode(cx, volume, uid, gid, args.rw)
+                .context("initialize protected FAT filesystem")?;
+            FsOps::getattr(&fat_fs, cx, &mut RequestScope::empty(), InodeNumber(1))
+                .context("read protected FAT filesystem root")?;
+            ProtectedFs::Fat {
+                fs: fat_fs,
+                writable: args.rw,
+            }
+        }
+        "ntfs" => {
+            if args.rw {
+                bail!("protected mount supports NTFS in read-only mode only; omit --rw");
+            }
+            let volume = ntfs::reader::NtfsVolume::from_device(cx, protected_device, 0, len)
+                .context("open NTFS volume through the protected device")?;
+            let ntfs_fs = ntfs::reader::filesystem::NtfsFs::new(cx, volume, uid, gid)
+                .context("initialize protected NTFS filesystem")?;
+            FsOps::getattr(&ntfs_fs, cx, &mut RequestScope::empty(), InodeNumber(1))
+                .context("read protected NTFS filesystem root")?;
+            ProtectedFs::Ntfs(ntfs_fs)
+        }
+        "zfs" => {
+            if args.rw {
+                bail!("protected mount supports ZFS in read-only mode only; omit --rw");
+            }
+            let leaf = zfs::reader::Leaf::from_device(cx, protected_device, 0, len)
+                .context("open ZFS leaf through the protected device")?;
+            let pool = zfs::reader::Pool::from_leaves(vec![leaf])
+                .context("admit single-device protected ZFS pool")?;
+            let mut objects = pool
+                .import_objects(cx, None)
+                .context("import active ZFS MOS object set through the protected device")?;
+            let view = objects
+                .zpl(cx, &[])
+                .context("open root ZPL dataset through the protected device")?;
+            let zfs_fs = zfs::filesystem::ZfsFs::new(cx, view, uid, gid)
+                .context("initialize protected ZFS filesystem")?;
+            FsOps::getattr(&zfs_fs, cx, &mut RequestScope::empty(), InodeNumber(1))
+                .context("read protected ZFS filesystem root")?;
+            ProtectedFs::Zfs(zfs_fs)
+        }
+        other => bail!("unsupported protected filesystem {other}"),
+    };
     Ok(Prepared {
         fs: Arc::new(fs),
         device,

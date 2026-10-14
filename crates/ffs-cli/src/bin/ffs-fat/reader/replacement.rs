@@ -13,9 +13,7 @@ pub use creation::{
     rmdir_in_volume, run_mkdir, run_rename, run_rmdir, run_unlink, unlink_in_volume,
 };
 
-use super::{
-    FatTable, FatVolume, ImageArgs, MAX_CHAIN_CLUSTERS, allocate, checkpoint, corrupt,
-};
+use super::{FatTable, FatVolume, ImageArgs, MAX_CHAIN_CLUSTERS, allocate, checkpoint, corrupt};
 use anyhow::{Context, Result, anyhow, bail};
 use asupersync::{Cx, types::CancelKind};
 use clap::Args;
@@ -859,7 +857,9 @@ impl ByteDevice for SliceSource<'_> {
 pub fn open_volume(cx: &Cx, args: &ImageArgs, writable: bool) -> Result<FatVolume> {
     if let Some(sidecar) = &args.sidecar {
         let inner = ffs_repair::sidecar::live::SidecarImageDevice::open(cx, &args.image, sidecar)
-            .with_context(|| format!("admitting FAT image and sidecar {}", sidecar.display()))?;
+            .with_context(|| {
+            format!("admitting FAT image and sidecar {}", sidecar.display())
+        })?;
         let len = inner.len_bytes();
         return Ok(FatVolume::from_device(
             cx,
