@@ -20,6 +20,7 @@ fn options(path: PathBuf, kind: FormatKind) -> FormatArgs {
         label: Some("frank data".into()),
         serial: Some(0x1234_ABCD),
         source_dir: None,
+        sidecar: None,
     }
 }
 
@@ -145,6 +146,7 @@ fn geometry_matches_independent_native_sector_counts_and_boundary_choices() {
             label: None,
             serial: Some(0),
             source_dir: None,
+            sidecar: None,
         };
         let plan = FormatPlan::prepare(&args).unwrap();
         let geometry = FatGeometry::parse(&plan.boot, layout.image_bytes()).unwrap();

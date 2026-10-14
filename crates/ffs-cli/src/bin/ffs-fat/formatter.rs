@@ -721,7 +721,7 @@ pub fn create(cx: &Cx, args: &FormatArgs) -> Result<serde_json::Value> {
                 args.image.display()
             )
         })?;
-    let finish = || -> Result<serde_json::Value> {
+    let finish = move || -> Result<serde_json::Value> {
         let setup = (|| -> Result<()> {
             checkpoint(cx)?;
             let metadata = file.metadata()?;
@@ -737,6 +737,7 @@ pub fn create(cx: &Cx, args: &FormatArgs) -> Result<serde_json::Value> {
         let verification = verify_created(cx, &file, &plan).context(
             "FAT image initialized and file-and-parent synchronized; verification did not complete",
         )?;
+        drop(file);
         let label = plan
             .label
             .as_ref()
