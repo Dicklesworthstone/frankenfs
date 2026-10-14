@@ -230,7 +230,7 @@ pub fn merge_refusal_report() -> (u64, Option<MergeRefusalShape>, Option<MergeRe
     )
 }
 
-fn saturating_increment_atomic(counter: &AtomicU64, ordering: Ordering) -> u64 {
+pub(crate) fn saturating_increment_atomic(counter: &AtomicU64, ordering: Ordering) -> u64 {
     loop {
         if let Ok(previous) = counter.try_update(ordering, Ordering::Relaxed, |current| {
             Some(current.saturating_add(1))
@@ -558,7 +558,7 @@ fn append_only_merge_valid(base_len: usize, base: &[u8], latest: &[u8], staged: 
 }
 
 /// Extract the variant name from a `MergeProof` for diagnostic logging.
-fn merge_proof_variant_name(proof: &MergeProof) -> &'static str {
+pub(crate) fn merge_proof_variant_name(proof: &MergeProof) -> &'static str {
     match proof {
         MergeProof::Unsafe => "Unsafe",
         MergeProof::DisjointBlocks => "DisjointBlocks",
@@ -569,6 +569,28 @@ fn merge_proof_variant_name(proof: &MergeProof) -> &'static str {
         MergeProof::BitmapOr => "BitmapOr",
         MergeProof::BitmapDelta => "BitmapDelta",
     }
+}
+
+/// Sort and coalesce overlapping or adjacent byte ranges in place so multiple
+/// in-transaction RMWs to the same block produce pairwise-disjoint ranges.
+pub(crate) fn coalesce_byte_ranges(ranges: &mut MergeByteRanges) {
+    if ranges.len() <= 1 {
+        return;
+    }
+    ranges.sort_unstable_by_key(|r| (r.start, r.end()));
+    let mut write_idx = 0usize;
+    for read_idx in 1..ranges.len() {
+        let current = ranges[read_idx];
+        let prev = &mut ranges[write_idx];
+        if current.start <= prev.end() {
+            let new_end = prev.end().max(current.end());
+            prev.len = new_end.saturating_sub(prev.start);
+        } else {
+            write_idx += 1;
+            ranges[write_idx] = current;
+        }
+    }
+    ranges.truncate(write_idx + 1);
 }
 
 /// Validate a bit-level delta merge for a bitmap block whose writers both set
@@ -1096,37 +1118,19 @@ impl Transaction {
         );
     }
 
-    fn insert_staged_write(&mut self, block: BlockNumber, staged: StagedWrite) {
+    fn insert_staged_write(&mut self, block: BlockNumber, mut staged: StagedWrite) {
         match staged_write_pos(&self.staged_writes, block) {
             Ok(idx) => {
                 // A transaction that stages the same block twice keeps only the
-                // LAST proof. So a plain `stage_write` — which carries
-                // `MergeProof::Unsafe` — silently discards a merge proof an
-                // earlier proof-carrying write established for this block, and the
-                // block reverts to first-committer-wins with nothing in the type
-                // system or the logs to say so. The cost lands far away, as an
-                // unexplained FCW conflict on a block whose writers were in fact
-                // disjoint (bd-y2t0r: a residual conflict on an inode-table block
-                // survived slot-scoping both known writers of it).
-                //
-                // This is a real hazard rather than a bookkeeping nicety: a
-                // whole-block write MUST invalidate a range proof, so the
-                // downgrade is correct and cannot simply be suppressed. What is
-                // missing is visibility — the offending writer is whoever called
-                // plain `write_block` on a block someone else proof-staged, and
-                // there is otherwise no way to find them short of bisecting.
-                let previous = &self.staged_writes[idx].1;
+                // LAST proof unless both proofs are range-overlay proofs whose
+                // touched byte ranges can be unioned and coalesced. A plain
+                // `stage_write` — which carries `MergeProof::Unsafe` — discards a
+                // merge proof an earlier proof-carrying write established for this
+                // block, and the block reverts to first-committer-wins.
+                let previous = &mut self.staged_writes[idx].1;
                 if previous.merge_proof != MergeProof::Unsafe
                     && staged.merge_proof == MergeProof::Unsafe
                 {
-                    // Counted as well as logged, because the log is unreadable
-                    // where it matters most. The workload that exposes this
-                    // (bd-y2t0r's gate) runs 8 worker threads inside a parallel
-                    // test suite: `with_default` is thread-scoped so it misses the
-                    // workers, and a global subscriber cannot be installed
-                    // reliably from one test among many in a shared process. A
-                    // process-wide counter is readable from any thread by the test
-                    // that cares, with no subscriber at all.
                     saturating_increment_atomic(&PROOF_DOWNGRADES, Ordering::Relaxed);
                     warn!(
                         target: "ffs::mvcc::merge",
@@ -1136,6 +1140,88 @@ impl Transaction {
                          proof on a block already staged in this transaction; this block will now \
                          first-committer-wins"
                     );
+                } else {
+                    let combined_proof = match (&previous.merge_proof, &staged.merge_proof) {
+                        (
+                            MergeProof::IndependentKeys {
+                                touched_ranges: prev,
+                            },
+                            MergeProof::IndependentKeys {
+                                touched_ranges: next,
+                            },
+                        ) => {
+                            let mut combined = prev.clone();
+                            combined.extend(next.iter().copied());
+                            coalesce_byte_ranges(&mut combined);
+                            Some(MergeProof::IndependentKeys {
+                                touched_ranges: combined,
+                            })
+                        }
+                        (
+                            MergeProof::NonOverlappingExtents {
+                                touched_ranges: prev,
+                            },
+                            MergeProof::NonOverlappingExtents {
+                                touched_ranges: next,
+                            },
+                        ) => {
+                            let mut combined = prev.clone();
+                            combined.extend(next.iter().copied());
+                            coalesce_byte_ranges(&mut combined);
+                            Some(MergeProof::NonOverlappingExtents {
+                                touched_ranges: combined,
+                            })
+                        }
+                        (
+                            MergeProof::TimestampOnlyInode {
+                                touched_ranges: prev,
+                            },
+                            MergeProof::TimestampOnlyInode {
+                                touched_ranges: next,
+                            },
+                        ) => {
+                            let mut combined = prev.clone();
+                            combined.extend(next.iter().copied());
+                            coalesce_byte_ranges(&mut combined);
+                            Some(MergeProof::TimestampOnlyInode {
+                                touched_ranges: combined,
+                            })
+                        }
+                        (
+                            MergeProof::IndependentKeys {
+                                touched_ranges: prev,
+                            }
+                            | MergeProof::NonOverlappingExtents {
+                                touched_ranges: prev,
+                            }
+                            | MergeProof::TimestampOnlyInode {
+                                touched_ranges: prev,
+                            },
+                            MergeProof::IndependentKeys {
+                                touched_ranges: next,
+                            }
+                            | MergeProof::NonOverlappingExtents {
+                                touched_ranges: next,
+                            }
+                            | MergeProof::TimestampOnlyInode {
+                                touched_ranges: next,
+                            },
+                        ) => {
+                            let mut combined = prev.clone();
+                            combined.extend(next.iter().copied());
+                            coalesce_byte_ranges(&mut combined);
+                            Some(MergeProof::IndependentKeys {
+                                touched_ranges: combined,
+                            })
+                        }
+                        _ => None,
+                    };
+                    if let Some(proof) = combined_proof {
+                        staged.merge_proof = proof;
+                    }
+                    if staged.merge_proof != MergeProof::Unsafe {
+                        staged.base = previous.base.take().or(staged.base);
+                    }
                 }
                 self.staged_writes[idx] = (block, staged);
             }
@@ -1988,7 +2074,7 @@ fn sleep_for_gc_throttle(cx: &Cx, duration: Duration) {
 }
 
 #[derive(Debug, Clone)]
-struct EbrVersionReclaimer {
+pub(crate) struct EbrVersionReclaimer {
     collector: Arc<epoch::Collector>,
     retired_versions: Arc<AtomicU64>,
     reclaimed_versions: Arc<AtomicU64>,
@@ -2005,7 +2091,7 @@ impl Default for EbrVersionReclaimer {
 }
 
 impl EbrVersionReclaimer {
-    fn retire_versions(&self, retired: Vec<BlockVersion>) {
+    pub(crate) fn retire_versions(&self, retired: Vec<BlockVersion>) {
         if retired.is_empty() {
             return;
         }
@@ -2021,7 +2107,7 @@ impl EbrVersionReclaimer {
         }
     }
 
-    fn collect(&self) {
+    pub(crate) fn collect(&self) {
         let passes = usize::try_from(self.stats().pending_versions().clamp(1, 8)).unwrap_or(8);
         for _ in 0..passes {
             let handle = self.collector.register();
@@ -2033,7 +2119,7 @@ impl EbrVersionReclaimer {
         }
     }
 
-    fn collect_with_budget(&self, cx: &Cx, min_poll_quota: u32) -> bool {
+    pub(crate) fn collect_with_budget(&self, cx: &Cx, min_poll_quota: u32) -> bool {
         let passes = usize::try_from(self.stats().pending_versions().clamp(1, 8)).unwrap_or(8);
         let mut collected_any = false;
         for _ in 0..passes {
@@ -2056,7 +2142,7 @@ impl EbrVersionReclaimer {
         collected_any
     }
 
-    fn stats(&self) -> EbrVersionStats {
+    pub(crate) fn stats(&self) -> EbrVersionStats {
         EbrVersionStats {
             retired_versions: self.retired_versions.load(Ordering::Relaxed),
             reclaimed_versions: self.reclaimed_versions.load(Ordering::Relaxed),

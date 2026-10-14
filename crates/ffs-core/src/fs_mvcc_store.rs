@@ -10,9 +10,8 @@ use ffs_block::{BlockBuf, BlockDevice};
 use ffs_error::{FfsError, Result as FfsResult};
 use ffs_mvcc::sharded::{PublicationMode, ShardedMvccStore};
 use ffs_mvcc::{
-    BlockVersionStats, CommitError, EbrVersionStats, EvidenceRecord, MergeProof, MvccEvidenceSink,
-    MvccStore, Transaction, TransactionCommitDetail, TransactionOutcomeStats, TxnAbortReason,
-    TxnAbortedDetail,
+    BlockVersionStats, CommitError, EbrVersionStats, MergeProof, MvccStore, Transaction,
+    TransactionOutcomeStats, TxnAbortReason,
 };
 use ffs_types::{BlockNumber, CommitSeq, Snapshot};
 use parking_lot::RwLock;
@@ -40,7 +39,7 @@ fn commit_error_to_ffs(error: &CommitError) -> FfsError {
     }
 }
 
-/// The OpenFs MVCC store: single-lock or sharded, behind a uniform `&self` API./// The OpenFs MVCC store: single-lock or sharded, behind a uniform `&self` API.
+/// The OpenFs MVCC store: single-lock or sharded, behind a uniform `&self` API.
 ///
 /// The enum is always owned behind `Arc`; boxing a variant would add another
 /// hot-path indirection without reducing the outer handle size.
@@ -49,10 +48,7 @@ pub enum FsMvccStore {
     /// Single store behind a `RwLock`: legacy, JBD2, and MVCC-WAL configured path.
     Single(RwLock<MvccStore>),
     /// Sharded store: default in-memory parallel-write path.
-    Sharded {
-        store: ShardedMvccStore,
-        evidence_sink: RwLock<Option<MvccEvidenceSink>>,
-    },
+    Sharded { store: ShardedMvccStore },
 }
 
 impl FsMvccStore {
@@ -71,7 +67,6 @@ impl FsMvccStore {
         // lock, not shard count (docs/NEGATIVE_EVIDENCE.md).
         Self::Sharded {
             store: ShardedMvccStore::for_host_parallelism(),
-            evidence_sink: RwLock::new(None),
         }
     }
 
@@ -81,7 +76,6 @@ impl FsMvccStore {
                 ShardedMvccStore::host_parallelism_shard_count(),
                 mode,
             ),
-            evidence_sink: RwLock::new(None),
         }
     }
 
@@ -96,11 +90,7 @@ impl FsMvccStore {
     ) -> FfsResult<()> {
         match self {
             Self::Single(lock) => lock.write().enable_evidence_ledger(path),
-            Self::Sharded { evidence_sink, .. } => {
-                let sink = MvccEvidenceSink::open(path.as_ref())?;
-                *evidence_sink.write() = Some(sink);
-                Ok(())
-            }
+            Self::Sharded { store } => store.enable_evidence_ledger(path),
         }
     }
 
@@ -108,9 +98,7 @@ impl FsMvccStore {
     pub(super) fn disable_evidence_ledger(&self) {
         match self {
             Self::Single(lock) => lock.write().disable_evidence_ledger(),
-            Self::Sharded { evidence_sink, .. } => {
-                *evidence_sink.write() = None;
-            }
+            Self::Sharded { store } => store.disable_evidence_ledger(),
         }
     }
 
@@ -119,7 +107,7 @@ impl FsMvccStore {
     pub(super) fn has_evidence_ledger(&self) -> bool {
         match self {
             Self::Single(lock) => lock.read().has_evidence_ledger(),
-            Self::Sharded { evidence_sink, .. } => evidence_sink.read().is_some(),
+            Self::Sharded { store } => store.has_evidence_ledger(),
         }
     }
 
@@ -140,6 +128,22 @@ impl FsMvccStore {
         }
     }
 
+    /// The live store's effective conflict policy (resolving Adaptive).
+    pub(super) fn effective_policy(&self) -> ffs_mvcc::ConflictPolicy {
+        match self {
+            Self::Single(lock) => lock.read().effective_policy(),
+            Self::Sharded { store, .. } => store.effective_policy(),
+        }
+    }
+
+    /// Snapshot of current contention metrics.
+    pub(super) fn contention_metrics(&self) -> ffs_mvcc::ContentionMetrics {
+        match self {
+            Self::Single(lock) => *lock.read().contention_metrics(),
+            Self::Sharded { store, .. } => store.contention_metrics(),
+        }
+    }
+
     pub(super) fn begin(&self) -> Transaction {
         match self {
             Self::Single(lock) => lock.write().begin(),
@@ -150,135 +154,21 @@ impl FsMvccStore {
     pub(super) fn commit(&self, txn: Transaction) -> Result<CommitSeq, CommitError> {
         match self {
             Self::Single(lock) => lock.write().commit(txn),
-            Self::Sharded {
-                store,
-                evidence_sink,
-            } => {
-                let started = std::time::Instant::now();
-                let txn_id = txn.id().0;
-                let write_set_size = txn.pending_writes();
-                let read_set_size = txn.read_set().len();
-                match store.commit(txn) {
-                    Ok(commit_seq) => {
-                        let duration_us =
-                            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-                        if let Some(sink) = evidence_sink.read().as_ref() {
-                            sink.append(
-                                &EvidenceRecord::transaction_commit(TransactionCommitDetail {
-                                    txn_id,
-                                    commit_seq: commit_seq.0,
-                                    write_set_size,
-                                    duration_us,
-                                }),
-                                txn_id,
-                            );
-                        }
-                        Ok(commit_seq)
-                    }
-                    Err((error, _txn)) => {
-                        if let Some(sink) = evidence_sink.read().as_ref() {
-                            let reason = match &error {
-                                CommitError::Conflict { .. } => TxnAbortReason::FcwConflict,
-                                CommitError::SsiConflict { .. } => TxnAbortReason::SsiCycle,
-                                CommitError::ChainBackpressure { .. } => TxnAbortReason::Timeout,
-                                CommitError::DurabilityFailure { .. } => {
-                                    TxnAbortReason::DurabilityFailure
-                                }
-                            };
-                            sink.append(
-                                &EvidenceRecord::txn_aborted(TxnAbortedDetail {
-                                    txn_id,
-                                    reason,
-                                    detail: Some(error.to_string()),
-                                    read_set_size,
-                                    write_set_size,
-                                }),
-                                txn_id,
-                            );
-                        }
-                        Err(error)
-                    }
-                }
-            }
+            Self::Sharded { store } => store.commit(txn).map_err(|(error, _txn)| error),
         }
     }
 
     pub(super) fn commit_ssi(&self, txn: Transaction) -> Result<CommitSeq, CommitError> {
         match self {
             Self::Single(lock) => lock.write().commit_ssi(txn),
-            Self::Sharded {
-                store,
-                evidence_sink,
-            } => {
-                let started = std::time::Instant::now();
-                let txn_id = txn.id().0;
-                let write_set_size = txn.pending_writes();
-                let read_set_size = txn.read_set().len();
-                match store.commit_ssi(txn) {
-                    Ok(commit_seq) => {
-                        let duration_us =
-                            u64::try_from(started.elapsed().as_micros()).unwrap_or(u64::MAX);
-                        if let Some(sink) = evidence_sink.read().as_ref() {
-                            sink.append(
-                                &EvidenceRecord::transaction_commit(TransactionCommitDetail {
-                                    txn_id,
-                                    commit_seq: commit_seq.0,
-                                    write_set_size,
-                                    duration_us,
-                                }),
-                                txn_id,
-                            );
-                        }
-                        Ok(commit_seq)
-                    }
-                    Err((error, _txn)) => {
-                        if let Some(sink) = evidence_sink.read().as_ref() {
-                            let reason = match &error {
-                                CommitError::Conflict { .. } => TxnAbortReason::FcwConflict,
-                                CommitError::SsiConflict { .. } => TxnAbortReason::SsiCycle,
-                                CommitError::ChainBackpressure { .. } => TxnAbortReason::Timeout,
-                                CommitError::DurabilityFailure { .. } => {
-                                    TxnAbortReason::DurabilityFailure
-                                }
-                            };
-                            sink.append(
-                                &EvidenceRecord::txn_aborted(TxnAbortedDetail {
-                                    txn_id,
-                                    reason,
-                                    detail: Some(error.to_string()),
-                                    read_set_size,
-                                    write_set_size,
-                                }),
-                                txn_id,
-                            );
-                        }
-                        Err(error)
-                    }
-                }
-            }
+            Self::Sharded { store } => store.commit_ssi(txn).map_err(|(error, _txn)| error),
         }
     }
 
     pub(super) fn abort(&self, txn: Transaction, reason: TxnAbortReason, detail: Option<String>) {
         match self {
             Self::Single(lock) => lock.write().abort(txn, reason, detail),
-            Self::Sharded { evidence_sink, .. } => {
-                if let Some(sink) = evidence_sink.read().as_ref() {
-                    let txn_id = txn.id().0;
-                    let write_set_size = txn.pending_writes();
-                    let read_set_size = txn.read_set().len();
-                    sink.append(
-                        &EvidenceRecord::txn_aborted(TxnAbortedDetail {
-                            txn_id,
-                            reason,
-                            detail,
-                            read_set_size,
-                            write_set_size,
-                        }),
-                        txn_id,
-                    );
-                }
-            }
+            Self::Sharded { store } => store.abort(txn, reason, detail),
         }
     }
 
@@ -504,28 +394,21 @@ impl FsMvccStore {
     pub(super) fn block_version_stats(&self) -> BlockVersionStats {
         match self {
             Self::Single(lock) => lock.read().block_version_stats(),
-            Self::Sharded { store, .. } => BlockVersionStats {
-                tracked_blocks: store.version_count(),
-                max_chain_length: 0,
-                chains_over_cap: 0,
-                chains_over_critical: 0,
-                chain_cap: None,
-                critical_chain_length: None,
-            },
+            Self::Sharded { store, .. } => store.block_version_stats(),
         }
     }
 
     pub(super) fn ebr_stats(&self) -> EbrVersionStats {
         match self {
             Self::Single(lock) => lock.read().ebr_stats(),
-            Self::Sharded { .. } => EbrVersionStats::default(),
+            Self::Sharded { store, .. } => store.ebr_stats(),
         }
     }
 
     pub(super) fn transaction_outcome_stats(&self) -> TransactionOutcomeStats {
         match self {
             Self::Single(lock) => lock.read().transaction_outcome_stats(),
-            Self::Sharded { .. } => TransactionOutcomeStats::default(),
+            Self::Sharded { store, .. } => store.transaction_outcome_stats(),
         }
     }
 

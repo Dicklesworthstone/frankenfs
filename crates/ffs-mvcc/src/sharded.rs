@@ -10,9 +10,13 @@
 use crate::SnapshotRegistry;
 use crate::compression::{self, CompressionPolicy, VersionData};
 use crate::{
-    AdaptivePolicyConfig, BlockVersion, CommitError, CommittedTxnRecord, ConflictPolicy,
-    ContentionMetrics, MergeProof, Transaction, detect_ssi_dangerous_structure,
-    resolve_version_bytes_cow_at_or_before, validate_transaction_id,
+    AdaptivePolicyConfig, BlockVersion, BlockVersionStats, CommitError, CommittedTxnRecord,
+    ConflictPolicy, ContentionMetrics, ContentionSampleDetail, EbrVersionReclaimer,
+    EbrVersionStats, EvidenceRecord, MergeAppliedDetail, MergeProof, MergeProofCheckedDetail,
+    MergeRejectedDetail, MvccEvidenceSink, PolicySwitchedDetail, SerializationConflictDetail,
+    Transaction, TransactionCommitDetail, TransactionOutcomeStats, TxnAbortReason,
+    TxnAbortedDetail, detect_ssi_dangerous_structure, merge_proof_variant_name,
+    resolve_version_bytes_cow_at_or_before, saturating_increment_atomic, validate_transaction_id,
 };
 use asupersync::Cx;
 use ffs_block::BlockDevice;
@@ -22,7 +26,9 @@ use parking_lot::{Condvar, Mutex, RwLock, RwLockWriteGuard};
 use rustc_hash::{FxHashMap, FxHashSet};
 use smallvec::SmallVec;
 use std::collections::{BTreeMap, BTreeSet};
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::time::Instant;
 use tracing::{debug, info, trace};
 
 /// Number of MVCC version-store shards to provision per available CPU.
@@ -688,6 +694,16 @@ pub struct ShardedMvccStore {
     /// leaves this `false` — fixed policies never read the metrics, so recording
     /// them would just serialize otherwise-disjoint parallel commits.
     force_metrics_record: AtomicBool,
+    /// Epoch-based reclaimer for retired logical block versions across shards.
+    ebr_reclaimer: EbrVersionReclaimer,
+    /// Optional append-only evidence sink for transaction and merge decisions.
+    evidence_sink: RwLock<Option<MvccEvidenceSink>>,
+    /// Lock-free fast-path gate so commits skip touching `evidence_sink` when disabled.
+    has_evidence_sink: AtomicBool,
+    /// Total number of aborted transactions since store creation.
+    aborted_transactions: AtomicU64,
+    /// Total number of SSI conflicts observed since store creation.
+    ssi_conflicts: AtomicU64,
     /// Reusable staging buffer for `flush_to_device_after`'s coalesced runs.
     ///
     /// A flush builds one contiguous buffer per run and drops it at the end, so a
@@ -800,8 +816,339 @@ impl ShardedMvccStore {
             adaptive_config: AdaptivePolicyConfig::default(),
             contention_metrics: RwLock::new(ContentionMetrics::default()),
             force_metrics_record: AtomicBool::new(false),
+            ebr_reclaimer: EbrVersionReclaimer::default(),
+            evidence_sink: RwLock::new(None),
+            has_evidence_sink: AtomicBool::new(false),
+            aborted_transactions: AtomicU64::new(0),
+            ssi_conflicts: AtomicU64::new(0),
             flush_run_buf: Mutex::new(Vec::new()),
         }
+    }
+
+    /// Enable append-only evidence recording to a JSONL ledger path.
+    pub fn enable_evidence_ledger(&self, path: impl AsRef<Path>) -> FfsResult<()> {
+        let sink = MvccEvidenceSink::open(path.as_ref())?;
+        *self.evidence_sink.write() = Some(sink);
+        self.has_evidence_sink.store(true, Ordering::Release);
+        Ok(())
+    }
+
+    /// Disable evidence recording.
+    pub fn disable_evidence_ledger(&self) {
+        self.has_evidence_sink.store(false, Ordering::Release);
+        *self.evidence_sink.write() = None;
+    }
+
+    /// Returns true if an evidence ledger sink is currently configured.
+    #[must_use]
+    pub fn has_evidence_ledger(&self) -> bool {
+        self.has_evidence_sink.load(Ordering::Acquire)
+    }
+
+    /// Epoch-based retirement/reclamation counters for logical block versions.
+    #[must_use]
+    pub fn ebr_stats(&self) -> EbrVersionStats {
+        self.ebr_reclaimer.stats()
+    }
+
+    /// Best-effort collection pass for deferred version reclamation.
+    pub fn ebr_collect(&self) {
+        self.ebr_reclaimer.collect();
+    }
+
+    /// Monotonic transaction outcome counters since store creation.
+    #[must_use]
+    pub fn transaction_outcome_stats(&self) -> TransactionOutcomeStats {
+        TransactionOutcomeStats {
+            aborted_transactions: self.aborted_transactions.load(Ordering::Relaxed),
+            ssi_conflicts: self.ssi_conflicts.load(Ordering::Relaxed),
+        }
+    }
+
+    /// Chain-length monitoring snapshot for logical block versions across all shards.
+    #[must_use]
+    pub fn block_version_stats(&self) -> BlockVersionStats {
+        let chain_cap = self.compression_policy.max_chain_length;
+        let critical_chain_length = chain_cap.map(|max_len| {
+            let cap = max_len.max(1);
+            cap.saturating_mul(4).max(cap.saturating_add(1))
+        });
+
+        let mut tracked_blocks = 0_usize;
+        let mut max_chain_length = 0_usize;
+        let mut chains_over_cap = 0_usize;
+        let mut chains_over_critical = 0_usize;
+
+        for shard in &self.shards {
+            let shard = shard.read();
+            tracked_blocks = tracked_blocks.saturating_add(shard.versions.len());
+            for chain in shard.versions.values() {
+                let len = chain.len();
+                max_chain_length = max_chain_length.max(len);
+                if let Some(cap) = chain_cap {
+                    chains_over_cap += usize::from(len > cap);
+                }
+                if let Some(critical) = critical_chain_length {
+                    chains_over_critical += usize::from(len >= critical);
+                }
+            }
+        }
+
+        BlockVersionStats {
+            tracked_blocks,
+            max_chain_length,
+            chains_over_cap,
+            chains_over_critical,
+            chain_cap,
+            critical_chain_length,
+        }
+    }
+
+    /// Explicitly abort a transaction and emit an evidence entry.
+    pub fn abort(&self, txn: Transaction, reason: TxnAbortReason, detail: Option<String>) {
+        let txn_id = txn.id().0;
+        let read_set_size = txn.read_set().len();
+        let write_set_size = txn.pending_writes();
+        drop(txn);
+        self.emit_txn_aborted(TxnAbortedDetail {
+            txn_id,
+            reason,
+            detail,
+            read_set_size,
+            write_set_size,
+        });
+    }
+
+    fn append_evidence(&self, record: &EvidenceRecord, txn_id: u64) {
+        if !self.has_evidence_sink.load(Ordering::Relaxed) {
+            return;
+        }
+        if let Some(sink) = self.evidence_sink.read().as_ref() {
+            sink.append(record, txn_id);
+        }
+    }
+
+    fn emit_transaction_commit(
+        &self,
+        txn_id: u64,
+        commit_seq: CommitSeq,
+        write_set_size: usize,
+        started: Option<Instant>,
+    ) {
+        if !self.has_evidence_sink.load(Ordering::Relaxed) {
+            return;
+        }
+        let duration_us = started.map_or(0, |st| {
+            u64::try_from(st.elapsed().as_micros()).unwrap_or(u64::MAX)
+        });
+        self.append_evidence(
+            &EvidenceRecord::transaction_commit(TransactionCommitDetail {
+                txn_id,
+                commit_seq: commit_seq.0,
+                write_set_size,
+                duration_us,
+            }),
+            txn_id,
+        );
+    }
+
+    fn emit_txn_aborted(&self, detail: TxnAbortedDetail) {
+        saturating_increment_atomic(&self.aborted_transactions, Ordering::Relaxed);
+        if !self.has_evidence_sink.load(Ordering::Relaxed) {
+            return;
+        }
+        let txn_id = detail.txn_id;
+        self.append_evidence(&EvidenceRecord::txn_aborted(detail), txn_id);
+    }
+
+    fn emit_serialization_conflict(
+        &self,
+        txn_id: u64,
+        conflicting_txn: Option<u64>,
+        conflict_type: &str,
+    ) {
+        saturating_increment_atomic(&self.ssi_conflicts, Ordering::Relaxed);
+        if !self.has_evidence_sink.load(Ordering::Relaxed) {
+            return;
+        }
+        self.append_evidence(
+            &EvidenceRecord::serialization_conflict(SerializationConflictDetail {
+                txn_id,
+                conflicting_txn,
+                conflict_type: conflict_type.to_owned(),
+            }),
+            txn_id,
+        );
+    }
+
+    fn record_commit_abort(
+        &self,
+        txn_id: u64,
+        read_set_size: usize,
+        write_set_size: usize,
+        error: &CommitError,
+    ) {
+        match error {
+            CommitError::Conflict { .. } => self.emit_txn_aborted(TxnAbortedDetail {
+                txn_id,
+                reason: TxnAbortReason::FcwConflict,
+                detail: Some(error.to_string()),
+                read_set_size,
+                write_set_size,
+            }),
+            CommitError::SsiConflict { concurrent_txn, .. } => {
+                self.emit_txn_aborted(TxnAbortedDetail {
+                    txn_id,
+                    reason: TxnAbortReason::SsiCycle,
+                    detail: Some(error.to_string()),
+                    read_set_size,
+                    write_set_size,
+                });
+                self.emit_serialization_conflict(
+                    txn_id,
+                    Some(concurrent_txn.0),
+                    "two_edge_rw_antidependency_cycle",
+                );
+            }
+            CommitError::ChainBackpressure { .. } => self.emit_txn_aborted(TxnAbortedDetail {
+                txn_id,
+                reason: TxnAbortReason::Timeout,
+                detail: Some(error.to_string()),
+                read_set_size,
+                write_set_size,
+            }),
+            CommitError::DurabilityFailure { .. } => self.emit_txn_aborted(TxnAbortedDetail {
+                txn_id,
+                reason: TxnAbortReason::DurabilityFailure,
+                detail: Some(error.to_string()),
+                read_set_size,
+                write_set_size,
+            }),
+        }
+    }
+
+    fn emit_merge_proof_checked(
+        &self,
+        txn_id: u64,
+        block_id: u64,
+        proof_variant: &str,
+        valid: bool,
+        rejection_reason: Option<&str>,
+    ) {
+        if !self.has_evidence_sink.load(Ordering::Relaxed) {
+            return;
+        }
+        self.append_evidence(
+            &EvidenceRecord::merge_proof_checked(MergeProofCheckedDetail {
+                txn_id,
+                block_id,
+                proof_variant: proof_variant.to_owned(),
+                valid,
+                rejection_reason: rejection_reason.map(str::to_owned),
+            }),
+            txn_id,
+        );
+    }
+
+    fn emit_merge_applied(
+        &self,
+        txn_id: u64,
+        merged_block_count: usize,
+        combined_write_set_bytes: usize,
+        proof_variant: &str,
+    ) {
+        if !self.has_evidence_sink.load(Ordering::Relaxed) {
+            return;
+        }
+        self.append_evidence(
+            &EvidenceRecord::merge_applied(MergeAppliedDetail {
+                txn_id,
+                merged_block_count,
+                combined_write_set_bytes,
+                proof_variant: proof_variant.to_owned(),
+            }),
+            txn_id,
+        );
+    }
+
+    fn emit_merge_rejected(&self, txn_id: u64, block_id: u64, proof_variant: &str, reason: &str) {
+        if !self.has_evidence_sink.load(Ordering::Relaxed) {
+            return;
+        }
+        self.append_evidence(
+            &EvidenceRecord::merge_rejected(MergeRejectedDetail {
+                txn_id,
+                block_id,
+                proof_variant: proof_variant.to_owned(),
+                reason: reason.to_owned(),
+            }),
+            txn_id,
+        );
+    }
+
+    fn emit_merge_check_and_reject(
+        &self,
+        txn_id: u64,
+        block_id: u64,
+        variant: &str,
+        check_reason: &str,
+        reject_reason: &str,
+    ) {
+        if !self.has_evidence_sink.load(Ordering::Relaxed) {
+            return;
+        }
+        self.emit_merge_proof_checked(txn_id, block_id, variant, false, Some(check_reason));
+        self.emit_merge_rejected(txn_id, block_id, variant, reject_reason);
+    }
+
+    fn maybe_emit_policy_switch(
+        &self,
+        prev_effective: ConflictPolicy,
+        new_effective: ConflictPolicy,
+        cm: &ContentionMetrics,
+    ) {
+        if !self.has_evidence_sink.load(Ordering::Relaxed) || prev_effective == new_effective {
+            return;
+        }
+        let loss_strict = cm.expected_loss_strict(&self.adaptive_config);
+        let loss_merge = cm.expected_loss_safe_merge(&self.adaptive_config);
+        let loss_old = match prev_effective {
+            ConflictPolicy::Strict => loss_strict,
+            _ => loss_merge,
+        };
+        let loss_new = match new_effective {
+            ConflictPolicy::Strict => loss_strict,
+            _ => loss_merge,
+        };
+        let delta = loss_old - loss_new;
+        self.append_evidence(
+            &EvidenceRecord::policy_switched(PolicySwitchedDetail {
+                from_policy: format!("{prev_effective:?}"),
+                to_policy: format!("{new_effective:?}"),
+                expected_loss_delta: delta,
+                trigger_reason: "contention_rate_change".to_owned(),
+            }),
+            0,
+        );
+    }
+
+    fn emit_contention_sample(&self, cm: &ContentionMetrics, effective: ConflictPolicy) {
+        if !self.has_evidence_sink.load(Ordering::Relaxed) {
+            return;
+        }
+        self.append_evidence(
+            &EvidenceRecord::contention_sample(ContentionSampleDetail {
+                conflict_rate: cm.conflict_rate,
+                merge_success_rate: cm.merge_success_rate,
+                abort_rate: cm.abort_rate,
+                total_commits: cm.total_commits,
+                total_conflicts: cm.total_conflicts,
+                total_merges: cm.total_merges,
+                total_aborts: cm.total_aborts,
+                effective_policy: format!("{effective:?}"),
+            }),
+            0,
+        );
     }
 
     /// Number of shards.
@@ -1030,6 +1377,10 @@ impl ShardedMvccStore {
     ) -> Result<(), CommitError> {
         let mut had_conflict = false;
         let mut merge_succeeded = false;
+        let has_evidence = self.has_evidence_sink.load(Ordering::Relaxed);
+        let mut merged_block_count: usize = 0;
+        let mut combined_write_bytes: usize = 0;
+        let mut merge_variants: BTreeSet<&'static str> = BTreeSet::new();
 
         for &block in txn.write_set().keys() {
             let shard_idx = self.shard_index(block);
@@ -1045,14 +1396,27 @@ impl ShardedMvccStore {
             let latest = Self::latest_commit_seq_in_shard(shard, block);
             if latest > txn.snapshot().high {
                 had_conflict = true;
+                let variant = txn
+                    .merge_proof(block)
+                    .map_or("Unsafe", merge_proof_variant_name);
 
                 // Under Strict policy, any conflict is an immediate abort.
                 if effective == ConflictPolicy::Strict {
+                    self.emit_merge_check_and_reject(
+                        txn.id().0,
+                        block.0,
+                        variant,
+                        "strict_policy_rejects_all_merges",
+                        "strict_fcw_conflict",
+                    );
                     if record_metrics {
                         let mut cm = self.contention_metrics.write();
                         cm.record_commit(self.adaptive_config.ema_alpha, true, false, true);
-                        cm.last_selected = Some(cm.select_policy(&self.adaptive_config));
+                        let next_policy = cm.select_policy(&self.adaptive_config);
+                        cm.last_selected = Some(next_policy);
+                        let cm_snap = *cm;
                         drop(cm);
+                        self.maybe_emit_policy_switch(effective, next_policy, &cm_snap);
                     }
                     return Err(CommitError::Conflict {
                         block,
@@ -1065,6 +1429,13 @@ impl ShardedMvccStore {
                 // merged block is (re)built at install by merged_write_bytes_locked).
                 if Self::check_write_mergeable_locked(txn, block, shard).is_ok() {
                     merge_succeeded = true;
+                    if has_evidence {
+                        let bytes_len = txn.staged_write(block).map_or(0, <[u8]>::len);
+                        merged_block_count += 1;
+                        combined_write_bytes += bytes_len;
+                        merge_variants.insert(variant);
+                        self.emit_merge_proof_checked(txn.id().0, block.0, variant, true, None);
+                    }
                     debug!(
                         block = block.0,
                         merge_proof = ?txn.merge_proof(block),
@@ -1074,11 +1445,21 @@ impl ShardedMvccStore {
                         "{merge_log_event}"
                     );
                 } else {
+                    self.emit_merge_check_and_reject(
+                        txn.id().0,
+                        block.0,
+                        variant,
+                        "merge_bytes_returned_none",
+                        "merge_validation_failed",
+                    );
                     if record_metrics {
                         let mut cm = self.contention_metrics.write();
                         cm.record_commit(self.adaptive_config.ema_alpha, true, false, true);
-                        cm.last_selected = Some(cm.select_policy(&self.adaptive_config));
+                        let next_policy = cm.select_policy(&self.adaptive_config);
+                        cm.last_selected = Some(next_policy);
+                        let cm_snap = *cm;
                         drop(cm);
+                        self.maybe_emit_policy_switch(effective, next_policy, &cm_snap);
                     }
                     return Err(CommitError::Conflict {
                         block,
@@ -1087,6 +1468,16 @@ impl ShardedMvccStore {
                     });
                 }
             }
+        }
+
+        if has_evidence && merged_block_count > 0 {
+            let variants_joined: String = merge_variants.into_iter().collect::<Vec<_>>().join("+");
+            self.emit_merge_applied(
+                txn.id().0,
+                merged_block_count,
+                combined_write_bytes,
+                &variants_joined,
+            );
         }
 
         // Record successful preflight (no abort). Under a fixed conflict policy
@@ -1102,8 +1493,14 @@ impl ShardedMvccStore {
                 merge_succeeded,
                 false,
             );
-            cm.last_selected = Some(cm.select_policy(&self.adaptive_config));
+            let next_policy = cm.select_policy(&self.adaptive_config);
+            cm.last_selected = Some(next_policy);
+            let cm_snap = *cm;
             drop(cm);
+            self.maybe_emit_policy_switch(effective, next_policy, &cm_snap);
+            if cm_snap.total_commits.is_multiple_of(100) && cm_snap.total_commits > 0 {
+                self.emit_contention_sample(&cm_snap, next_policy);
+            }
         }
         Ok(())
     }
@@ -1720,13 +2117,24 @@ impl ShardedMvccStore {
         txn: Transaction,
         probe: &mut P,
     ) -> Result<CommitSeq, (CommitError, Transaction)> {
+        let txn_id = txn.id().0;
+        let read_set_size = txn.read_set().len();
+        let write_set_size = txn.pending_writes();
+        let started = self
+            .has_evidence_sink
+            .load(Ordering::Relaxed)
+            .then(Instant::now);
+
         if let Err(error) = validate_transaction_id(txn.id()) {
+            self.record_commit_abort(txn_id, read_set_size, write_set_size, &error);
             return Err((error, txn));
         }
 
         if txn.write_set().is_empty() {
             // Read-only transaction: nothing to commit.
-            return Ok(self.current_snapshot().high);
+            let commit_seq = self.current_snapshot().high;
+            self.emit_transaction_commit(txn_id, commit_seq, 0, started);
+            return Ok(commit_seq);
         }
 
         let shard_indices = self.involved_shards(&txn);
@@ -1745,6 +2153,7 @@ impl ShardedMvccStore {
         ) {
             drop(shard_guards);
             probe.finish(CommitLockPhase::ShardHold, shard_hold_started);
+            self.record_commit_abort(txn_id, read_set_size, write_set_size, &error);
             return Err((error, txn));
         }
 
@@ -1753,6 +2162,7 @@ impl ShardedMvccStore {
             Err(err) => {
                 drop(shard_guards);
                 probe.finish(CommitLockPhase::ShardHold, shard_hold_started);
+                self.record_commit_abort(txn_id, read_set_size, write_set_size, &err);
                 return Err((err, txn));
             }
         };
@@ -1805,6 +2215,7 @@ impl ShardedMvccStore {
         drop(shard_guards);
         probe.finish(CommitLockPhase::ShardHold, shard_hold_started);
         self.publication_gate.publish_with_probe(commit_seq, probe);
+        self.emit_transaction_commit(txn_id, commit_seq, write_set_size, started);
 
         Ok(commit_seq)
     }
@@ -1812,12 +2223,23 @@ impl ShardedMvccStore {
     /// Commit with Serializable Snapshot Isolation (SSI) enforcement.
     #[allow(clippy::result_large_err)]
     pub fn commit_ssi(&self, txn: Transaction) -> Result<CommitSeq, (CommitError, Transaction)> {
+        let txn_id = txn.id().0;
+        let read_set_size = txn.read_set().len();
+        let write_set_size = txn.pending_writes();
+        let started = self
+            .has_evidence_sink
+            .load(Ordering::Relaxed)
+            .then(Instant::now);
+
         if let Err(error) = validate_transaction_id(txn.id()) {
+            self.record_commit_abort(txn_id, read_set_size, write_set_size, &error);
             return Err((error, txn));
         }
 
         if txn.write_set().is_empty() {
-            return Ok(self.current_snapshot().high);
+            let commit_seq = self.current_snapshot().high;
+            self.emit_transaction_commit(txn_id, commit_seq, 0, started);
+            return Ok(commit_seq);
         }
 
         let shard_indices = self.ssi_shards_for_txn(&txn);
@@ -1831,16 +2253,24 @@ impl ShardedMvccStore {
             record_metrics,
             "sharded_ssi_fcw_conflict_merged",
         ) {
+            drop(shard_guards);
+            self.record_commit_abort(txn_id, read_set_size, write_set_size, &error);
             return Err((error, txn));
         }
 
         if let Err(error) = self.validate_ssi_read_set_locked(&txn, &shard_guards) {
+            drop(shard_guards);
+            self.record_commit_abort(txn_id, read_set_size, write_set_size, &error);
             return Err((error, txn));
         }
 
         let commit_seq = match self.next_commit_seq() {
             Ok(seq) => seq,
-            Err(err) => return Err((err, txn)),
+            Err(err) => {
+                drop(shard_guards);
+                self.record_commit_abort(txn_id, read_set_size, write_set_size, &err);
+                return Err((err, txn));
+            }
         };
         let install_ctx = CommitInstallContext {
             snapshot: txn.snapshot(),
@@ -1891,6 +2321,7 @@ impl ShardedMvccStore {
         // order.
         drop(shard_guards);
         self.publication_gate.publish(commit_seq);
+        self.emit_transaction_commit(txn_id, commit_seq, write_set_size, started);
 
         Ok(commit_seq)
     }
@@ -1940,6 +2371,7 @@ impl ShardedMvccStore {
 
     /// Prune versions older than `watermark` across all shards.
     pub fn prune_versions_older_than(&self, watermark: CommitSeq) {
+        let mut retired_versions = Vec::new();
         for (idx, shard_lock) in self.shards.iter().enumerate() {
             let mut shard = shard_lock.write();
             // Visit only blocks whose chain has grown past 1 version (the prune
@@ -1966,7 +2398,7 @@ impl ShardedMvccStore {
                 }
                 if keep_from > 0 {
                     Self::make_chain_head_full(versions, keep_from);
-                    versions.drain(0..keep_from);
+                    retired_versions.extend(versions.drain(0..keep_from));
                 }
                 if versions.len() > 1 {
                     still.insert(block);
@@ -1977,6 +2409,9 @@ impl ShardedMvccStore {
             shard.ssi_log.retain(|r| r.commit_seq > watermark);
             drop(shard);
             trace!(shard_idx = idx, watermark = watermark.0, "shard_pruned");
+        }
+        if !retired_versions.is_empty() {
+            self.ebr_reclaimer.retire_versions(retired_versions);
         }
     }
 
@@ -2053,6 +2488,7 @@ impl ShardedMvccStore {
             .watermark()
             .map_or(durable_through, |wm| wm.min(durable_through));
         let mut evicted = 0_usize;
+        let mut retired = Vec::new();
         for shard in &self.shards {
             let mut guard = shard.write();
             let MvccShard {
@@ -2067,10 +2503,15 @@ impl ShardedMvccStore {
                 if durable {
                     on_evict(*block);
                     prune_candidates.remove(block);
+                    retired.extend(chain.drain(..));
                     evicted += 1;
                 }
                 !durable
             });
+        }
+        if !retired.is_empty() {
+            self.ebr_reclaimer.retire_versions(retired);
+            self.ebr_reclaimer.collect();
         }
         evicted
     }
@@ -3636,6 +4077,146 @@ mod tests {
         assert!(
             watchdog_join_started.elapsed() <= LOCK_ORDERING_WATCHDOG_POLL_INTERVAL * 25,
             "watchdog should observe completion promptly after workers finish"
+        );
+    }
+
+    #[test]
+    fn sharded_evidence_ledger_stats_and_repeated_rmw_coalescing() {
+        use crate::{MergeByteRange, MergeProof};
+        use ffs_repair::evidence::{EvidenceEventType, EvidenceRecord, TxnAbortReason};
+        use smallvec::smallvec;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let ledger_path = dir.path().join("sharded-mvcc-evidence.jsonl");
+
+        let store = make_store(4);
+        store.set_conflict_policy(ConflictPolicy::SafeMerge);
+        store
+            .enable_evidence_ledger(&ledger_path)
+            .expect("enable evidence ledger");
+        assert!(store.has_evidence_ledger());
+
+        let block = BlockNumber(99);
+        let initial = vec![0_u8; 64];
+
+        // Commit initial block state.
+        let mut t0 = store.begin();
+        t0.stage_write(block, initial.clone());
+        let seq0 = store.commit(t0).expect("t0 commit");
+        assert_eq!(seq0, CommitSeq(1));
+
+        // Begin two concurrent transactions at snapshot seq0.
+        let mut t1 = store.begin();
+        let mut t2 = store.begin();
+
+        // t1 updates bytes 0..8 and commits.
+        let mut d1 = initial.clone();
+        d1[0..8].fill(0xAA);
+        t1.stage_write_with_proof_and_base(
+            block,
+            d1,
+            MergeProof::IndependentKeys {
+                touched_ranges: smallvec![MergeByteRange::new(0, 8)],
+            },
+            Some(initial.clone()),
+        );
+        let seq1 = store.commit(t1).expect("t1 commit");
+        assert_eq!(seq1, CommitSeq(2));
+
+        // t2 performs TWO in-transaction RMWs to the same block with overlapping
+        // ranges (16..24 then 20..32), passing an intermediate buffer as
+        // the second RMW's base. `insert_staged_write` must coalesce the ranges
+        // into [16..32] and preserve the original snapshot `initial` base!
+        let mut d2_step1 = initial.clone();
+        d2_step1[16..24].fill(0xBB);
+        t2.stage_write_with_proof_and_base(
+            block,
+            d2_step1.clone(),
+            MergeProof::IndependentKeys {
+                touched_ranges: smallvec![MergeByteRange::new(16, 8)],
+            },
+            Some(initial),
+        );
+
+        let mut d2_step2 = d2_step1;
+        d2_step2[20..32].fill(0xCC);
+        t2.stage_write_with_proof_and_base(
+            block,
+            d2_step2,
+            MergeProof::IndependentKeys {
+                touched_ranges: smallvec![MergeByteRange::new(16, 8), MergeByteRange::new(20, 12)],
+            },
+            Some(vec![0xFF; 64]), // intermediate base must NOT overwrite initial base
+        );
+
+        let seq2 = store
+            .commit(t2)
+            .expect("t2 safe-merge should succeed with coalesced ranges and preserved base");
+        assert_eq!(seq2, CommitSeq(3));
+
+        // Verify merged block contents: bytes 0..8 from t1 (0xAA), 16..20 (0xBB), 20..32 (0xCC).
+        let merged = store
+            .read_visible(block, store.current_snapshot())
+            .expect("merged block visible");
+        assert_eq!(&merged[0..8], &[0xAA; 8]);
+        assert_eq!(&merged[8..16], &[0; 8]);
+        assert_eq!(&merged[16..20], &[0xBB; 4]);
+        assert_eq!(&merged[20..32], &[0xCC; 12]);
+        assert_eq!(&merged[32..64], &[0; 32]);
+
+        // Abort a transaction and verify outcome stats + evidence ledger.
+        let mut t_abort = store.begin();
+        t_abort.stage_write(block, vec![0xEE; 64]);
+        store.abort(
+            t_abort,
+            TxnAbortReason::ExplicitAbort,
+            Some("test abort".to_string()),
+        );
+
+        let outcome = store.transaction_outcome_stats();
+        assert_eq!(outcome.aborted_transactions, 1);
+
+        let vstats = store.block_version_stats();
+        assert_eq!(vstats.tracked_blocks, 1);
+        assert_eq!(vstats.max_chain_length, 3);
+
+        // Prune and verify EBR stats update.
+        store.prune_versions_older_than(seq2);
+        store.ebr_collect();
+        let ebr = store.ebr_stats();
+        assert_eq!(ebr.retired_versions, 2);
+        assert_eq!(ebr.reclaimed_versions, 2);
+
+        store.disable_evidence_ledger();
+        let raw_ledger = std::fs::read_to_string(&ledger_path).expect("read evidence ledger");
+        let records: Vec<EvidenceRecord> = raw_ledger
+            .lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| serde_json::from_str(line).expect("parse evidence record"))
+            .collect();
+        assert!(
+            records
+                .iter()
+                .any(|r| r.event_type == EvidenceEventType::MergeProofChecked),
+            "expected MergeProofChecked in sharded evidence ledger"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| r.event_type == EvidenceEventType::MergeApplied),
+            "expected MergeApplied in sharded evidence ledger"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| r.event_type == EvidenceEventType::TransactionCommit),
+            "expected TransactionCommit in sharded evidence ledger"
+        );
+        assert!(
+            records
+                .iter()
+                .any(|r| r.event_type == EvidenceEventType::TxnAborted),
+            "expected TxnAborted in sharded evidence ledger"
         );
     }
 }
