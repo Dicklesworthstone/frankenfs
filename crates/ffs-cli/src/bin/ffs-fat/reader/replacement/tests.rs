@@ -706,3 +706,187 @@ fn cli_requires_offline_ownership_and_preserves_explicit_selection() {
         .is_err()
     );
 }
+
+#[test]
+fn bd_nu8nf_fat_unlink_rmdir_rename_and_writable_fsops_contract() {
+    use crate::filesystem::FatFs;
+    use ffs_core::{FsOps, RequestScope, SetAttrRequest};
+    use ffs_types::InodeNumber;
+    use std::ffi::OsStr;
+
+    let cx = Cx::for_testing();
+    let mut scope = RequestScope::empty();
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        let image = Fixture::new(kind, 512, false, true);
+        let volume = image.volume();
+        let fs = FatFs::new_with_mode(&cx, volume, 1000, 1000, true).unwrap();
+        let root = InodeNumber(1);
+
+        // 1. Create a file, write, partial-write, gap-write, truncate down & up.
+        let created = fs
+            .create(
+                &cx,
+                &mut scope,
+                root,
+                OsStr::new("created.txt"),
+                0o644,
+                1000,
+                1000,
+            )
+            .unwrap();
+        assert_eq!(created.size, 0);
+        assert_eq!(created.perm, 0o644);
+        assert_eq!(
+            fs.write(&cx, &mut scope, created.ino, 0, b"hello world")
+                .unwrap(),
+            11
+        );
+        assert_eq!(
+            fs.write(&cx, &mut scope, created.ino, 6, b"FAT!!").unwrap(),
+            5
+        );
+        assert_eq!(
+            fs.write(&cx, &mut scope, created.ino, 20, b"END").unwrap(),
+            3
+        );
+        assert_eq!(
+            fs.read(&cx, &mut scope, created.ino, 0, 64).unwrap(),
+            b"hello FAT!!\0\0\0\0\0\0\0\0\0END"
+        );
+        let truncated = fs
+            .setattr(
+                &cx,
+                &mut scope,
+                created.ino,
+                &SetAttrRequest {
+                    size: Some(11),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(truncated.size, 11);
+        assert_eq!(
+            fs.read(&cx, &mut scope, created.ino, 0, 64).unwrap(),
+            b"hello FAT!!"
+        );
+        let extended = fs
+            .setattr(
+                &cx,
+                &mut scope,
+                created.ino,
+                &SetAttrRequest {
+                    size: Some(16),
+                    ..Default::default()
+                },
+            )
+            .unwrap();
+        assert_eq!(extended.size, 16);
+        assert_eq!(
+            fs.read(&cx, &mut scope, created.ino, 0, 64).unwrap(),
+            b"hello FAT!!\0\0\0\0\0"
+        );
+        fs.open(&cx, &mut scope, created.ino, libc::O_WRONLY | libc::O_TRUNC)
+            .unwrap();
+        assert_eq!(fs.getattr(&cx, &mut scope, created.ino).unwrap().size, 0);
+        assert_eq!(
+            fs.write(&cx, &mut scope, created.ino, 0, b"renamed payload")
+                .unwrap(),
+            15
+        );
+
+        // 2. Mkdir, cross-dir rename of file preserving ino, rmdir ENOTEMPTY, cross-dir rename of dir updating '..'.
+        let dir = fs
+            .mkdir(
+                &cx,
+                &mut scope,
+                root,
+                OsStr::new("work_dir"),
+                0o755,
+                1000,
+                1000,
+            )
+            .unwrap();
+        assert_eq!(dir.perm, 0o755);
+        fs.rename(
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("created.txt"),
+            dir.ino,
+            OsStr::new("moved_long_name.txt"),
+        )
+        .unwrap();
+        let moved = fs
+            .lookup(&cx, &mut scope, dir.ino, OsStr::new("moved_long_name.txt"))
+            .unwrap();
+        assert_eq!(moved.ino, created.ino);
+        assert_eq!(
+            fs.read(&cx, &mut scope, moved.ino, 0, 64).unwrap(),
+            b"renamed payload"
+        );
+        assert!(matches!(
+            fs.rmdir(&cx, &mut scope, root, OsStr::new("work_dir")),
+            Err(FfsError::NotEmpty)
+        ));
+
+        let child_dir = fs
+            .mkdir(
+                &cx,
+                &mut scope,
+                dir.ino,
+                OsStr::new("nested_sub"),
+                0o755,
+                1000,
+                1000,
+            )
+            .unwrap();
+        assert_eq!(
+            fs.lookup(&cx, &mut scope, child_dir.ino, OsStr::new(".."))
+                .unwrap()
+                .ino,
+            dir.ino
+        );
+        fs.rename(
+            &cx,
+            &mut scope,
+            dir.ino,
+            OsStr::new("nested_sub"),
+            root,
+            OsStr::new("promoted_sub"),
+        )
+        .unwrap();
+        let promoted = fs
+            .lookup(&cx, &mut scope, root, OsStr::new("promoted_sub"))
+            .unwrap();
+        assert_eq!(promoted.ino, child_dir.ino);
+        assert_eq!(
+            fs.lookup(&cx, &mut scope, promoted.ino, OsStr::new(".."))
+                .unwrap()
+                .ino,
+            root
+        );
+
+        // 3. Unlink LFN file and rmdir directories, then verify full volume check is clean.
+        fs.unlink(&cx, &mut scope, dir.ino, OsStr::new("moved_long_name.txt"))
+            .unwrap();
+        assert!(matches!(
+            fs.lookup(&cx, &mut scope, dir.ino, OsStr::new("moved_long_name.txt")),
+            Err(FfsError::NotFound(_))
+        ));
+        fs.rmdir(&cx, &mut scope, root, OsStr::new("work_dir"))
+            .unwrap();
+        fs.rmdir(&cx, &mut scope, root, OsStr::new("promoted_sub"))
+            .unwrap();
+        fs.unlink(&cx, &mut scope, root, OsStr::new("Long name.txt"))
+            .unwrap();
+        fs.flush_on_destroy(&cx).unwrap();
+
+        let reopened = image.volume();
+        let report = reopened.check(&cx).unwrap();
+        assert!(report.clean, "{kind:?}: {report:?}");
+        assert!(report.complete);
+        assert!(report.namespace_complete);
+        assert_eq!(report.lost_clusters, Some(0));
+        image.assert_guards();
+    }
+}

@@ -8,7 +8,10 @@
 //! dosfstools v4.2 src/{fat,boot}.c. No native implementation code is reused.
 
 mod creation;
-pub use creation::{MkdirArgs, run_mkdir};
+pub use creation::{
+    MkdirArgs, RenameArgs, RmdirArgs, UnlinkArgs, mkdir_in_volume, rename_in_volume,
+    rmdir_in_volume, run_mkdir, run_rename, run_rmdir, run_unlink, unlink_in_volume,
+};
 
 use super::{FatTable, FatVolume, MAX_CHAIN_CLUSTERS, allocate, checkpoint, corrupt};
 use crate::ImageArgs;
@@ -766,6 +769,189 @@ fn replace(cx: &Cx, args: &ReplaceArgs) -> Result<serde_json::Value> {
     plan.execute(cx, &volume, &source_device, || {
         stable(&source, &args.source, source_stamp)
     })
+}
+
+struct SliceSource<'a>(&'a [u8]);
+
+impl ByteDevice for SliceSource<'_> {
+    fn len_bytes(&self) -> u64 {
+        self.0.len() as u64
+    }
+
+    fn read_exact_at(
+        &self,
+        cx: &Cx,
+        offset: ByteOffset,
+        bytes: &mut [u8],
+    ) -> ffs_error::Result<()> {
+        checkpoint(cx)?;
+        let start =
+            usize::try_from(offset.0).map_err(|_| corrupt(offset.0, "source offset overflow"))?;
+        let end = start
+            .checked_add(bytes.len())
+            .ok_or_else(|| corrupt(offset.0, "source length overflow"))?;
+        let slice = self
+            .0
+            .get(start..end)
+            .ok_or_else(|| corrupt(offset.0, "source read exceeds slice"))?;
+        bytes.copy_from_slice(slice);
+        checkpoint(cx)
+    }
+
+    fn write_all_at(&self, _cx: &Cx, _offset: ByteOffset, _bytes: &[u8]) -> ffs_error::Result<()> {
+        Err(FfsError::ReadOnly)
+    }
+
+    fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+        checkpoint(cx)
+    }
+}
+
+pub fn open_volume(cx: &Cx, args: &ImageArgs, writable: bool) -> Result<FatVolume> {
+    let (image, image_stamp) = open_regular(&args.image, writable)?;
+    Ok(FatVolume::from_device(
+        cx,
+        Box::new(ImageFile {
+            file: image,
+            length: image_stamp.length,
+            writable,
+        }),
+        args.offset,
+        args.length
+            .unwrap_or_else(|| image_stamp.length.saturating_sub(args.offset)),
+    )?
+    .with_oem_code_page(args.oem_code_page))
+}
+
+pub fn sync_volume(cx: &Cx, volume: &FatVolume) -> Result<()> {
+    volume.device.sync(cx)?;
+    Ok(())
+}
+
+pub fn create_in_volume(
+    cx: &Cx,
+    volume: &FatVolume,
+    path: &str,
+    data: &[u8],
+    now: u64,
+    read_only: bool,
+) -> Result<serde_json::Value> {
+    let source = SliceSource(data);
+    let plan = creation::prepare(cx, volume, path, &source, now)?;
+    let report = plan.execute(cx, volume, &source, || Ok(()))?;
+    if read_only {
+        set_attr_in_volume(cx, volume, path, Some(true), None, None)?;
+    }
+    Ok(report)
+}
+
+pub fn replace_in_volume(
+    cx: &Cx,
+    volume: &FatVolume,
+    path: &str,
+    data: &[u8],
+    now: u64,
+) -> Result<serde_json::Value> {
+    let source = SliceSource(data);
+    let plan = Replacement::prepare(cx, volume, path, &source, now)?;
+    plan.execute(cx, volume, &source, || Ok(()))
+}
+
+pub fn write_range_in_volume(
+    cx: &Cx,
+    volume: &FatVolume,
+    path: &str,
+    offset: u64,
+    data: &[u8],
+    now: u64,
+) -> Result<usize> {
+    let entry = volume
+        .resolve(cx, path)?
+        .ok_or_else(|| anyhow!("cannot write to the root directory"))?;
+    if entry.native.is_directory() {
+        return Err(FfsError::IsDirectory.into());
+    }
+    let end = offset
+        .checked_add(data.len() as u64)
+        .context("write offset overflow")?;
+    let end_u32 = u32::try_from(end).context("FAT regular file write exceeds 4 GiB - 1")?;
+    let chain = volume.file_chain(cx, &entry)?;
+    let current = if entry.native.size == 0 {
+        Vec::new()
+    } else {
+        volume.read(cx, &chain, 0, entry.native.size as usize)?
+    };
+    let new_len = (entry.native.size.max(end_u32)) as usize;
+    let mut updated = allocate(new_len)?;
+    updated[..current.len()].copy_from_slice(&current);
+    let start = offset as usize;
+    updated[start..start + data.len()].copy_from_slice(data);
+    replace_in_volume(cx, volume, path, &updated, now)?;
+    Ok(data.len())
+}
+
+pub fn truncate_in_volume(
+    cx: &Cx,
+    volume: &FatVolume,
+    path: &str,
+    size: u64,
+    now: u64,
+) -> Result<()> {
+    let entry = volume
+        .resolve(cx, path)?
+        .ok_or_else(|| anyhow!("cannot truncate the root directory"))?;
+    if entry.native.is_directory() {
+        return Err(FfsError::IsDirectory.into());
+    }
+    let size_u32 = u32::try_from(size).context("FAT regular file truncate exceeds 4 GiB - 1")?;
+    if size_u32 == entry.native.size {
+        return Ok(());
+    }
+    let chain = volume.file_chain(cx, &entry)?;
+    let keep = entry.native.size.min(size_u32) as usize;
+    let prefix = if keep == 0 {
+        Vec::new()
+    } else {
+        volume.read(cx, &chain, 0, keep)?
+    };
+    let mut updated = allocate(size_u32 as usize)?;
+    updated[..prefix.len()].copy_from_slice(&prefix);
+    replace_in_volume(cx, volume, path, &updated, now)?;
+    Ok(())
+}
+
+pub fn set_attr_in_volume(
+    cx: &Cx,
+    volume: &FatVolume,
+    path: &str,
+    read_only: Option<bool>,
+    mtime_secs: Option<u64>,
+    atime_secs: Option<u64>,
+) -> Result<()> {
+    let entry = volume
+        .resolve(cx, path)?
+        .ok_or_else(|| anyhow!("cannot modify root directory entry attributes"))?;
+    let mut raw = [0_u8; 32];
+    volume.read_exact(cx, entry.offset, &mut raw)?;
+    if let Some(ro) = read_only {
+        if ro {
+            raw[11] |= 0x01;
+        } else {
+            raw[11] &= !0x01;
+        }
+    }
+    if let Some(secs) = mtime_secs {
+        let (date, time) = modified_timestamp(secs.max(315_532_800))?;
+        raw[22..24].copy_from_slice(&time.to_le_bytes());
+        raw[24..26].copy_from_slice(&date.to_le_bytes());
+    }
+    if let Some(secs) = atime_secs {
+        let (date, _) = modified_timestamp(secs.max(315_532_800))?;
+        raw[18..20].copy_from_slice(&date.to_le_bytes());
+    }
+    write_volume(cx, volume, entry.offset, &raw)?;
+    volume.device.sync(cx)?;
+    Ok(())
 }
 
 #[cfg(test)]

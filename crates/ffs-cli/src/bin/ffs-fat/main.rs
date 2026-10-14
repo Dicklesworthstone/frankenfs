@@ -267,6 +267,24 @@ enum Command {
         #[command(flatten)]
         options: reader::replacement::MkdirArgs,
     },
+    /// Unlink one native regular file and release its cluster chain.
+    /// Requires exclusive offline ownership; --dry-run performs only preflight reads.
+    Unlink {
+        #[command(flatten)]
+        options: reader::replacement::UnlinkArgs,
+    },
+    /// Remove one empty native directory and release its cluster chain.
+    /// Requires exclusive offline ownership; --dry-run performs only preflight reads.
+    Rmdir {
+        #[command(flatten)]
+        options: reader::replacement::RmdirArgs,
+    },
+    /// Rename or move one native file or directory.
+    /// Requires exclusive offline ownership; --dry-run performs only preflight reads.
+    Rename {
+        #[command(flatten)]
+        options: reader::replacement::RenameArgs,
+    },
     /// Create a new FAT16/FAT32 image, optionally copy --source-dir, and verify it.
     /// Existing files and devices are never formatted.
     Format {
@@ -323,7 +341,7 @@ enum Command {
         )]
         entry_slots: EntrySlots,
     },
-    /// Mount an immutable image through the existing FrankenFS FUSE adapter.
+    /// Mount an image through the existing FrankenFS FUSE adapter.
     Mount {
         #[command(flatten)]
         image: ImageArgs,
@@ -332,6 +350,9 @@ enum Command {
         /// Confirm the image will not be modified by a kernel mount or another program.
         #[arg(long, required = true)]
         offline_image: bool,
+        /// Mount read-write instead of read-only.
+        #[arg(long)]
+        rw: bool,
         /// Synthetic Unix ownership; never written into native FAT metadata.
         #[arg(long, default_value_t = 0)]
         uid: u32,
@@ -358,6 +379,30 @@ fn main() -> Result<()> {
                 .context("FAT directory operation completed; writing the report failed")?;
             writeln!(output)
                 .context("FAT directory operation completed; finishing the report failed")?;
+        }
+        Command::Unlink { options } => {
+            let report = reader::replacement::run_unlink(&cx, &options)?;
+            let mut output = io::stdout().lock();
+            serde_json::to_writer_pretty(&mut output, &report)
+                .context("FAT unlink operation completed; writing the report failed")?;
+            writeln!(output)
+                .context("FAT unlink operation completed; finishing the report failed")?;
+        }
+        Command::Rmdir { options } => {
+            let report = reader::replacement::run_rmdir(&cx, &options)?;
+            let mut output = io::stdout().lock();
+            serde_json::to_writer_pretty(&mut output, &report)
+                .context("FAT rmdir operation completed; writing the report failed")?;
+            writeln!(output)
+                .context("FAT rmdir operation completed; finishing the report failed")?;
+        }
+        Command::Rename { options } => {
+            let report = reader::replacement::run_rename(&cx, &options)?;
+            let mut output = io::stdout().lock();
+            serde_json::to_writer_pretty(&mut output, &report)
+                .context("FAT rename operation completed; writing the report failed")?;
+            writeln!(output)
+                .context("FAT rename operation completed; finishing the report failed")?;
         }
         Command::Format { options } => {
             let report = formatter::run(&cx, &options)?;
@@ -446,6 +491,7 @@ fn main() -> Result<()> {
             image,
             mountpoint,
             offline_image,
+            rw,
             uid,
             gid,
         } => {
@@ -466,16 +512,21 @@ fn main() -> Result<()> {
             if image.image.canonicalize()?.starts_with(&mountpoint) {
                 bail!("mountpoint would hide the backing image");
             }
-            let volume = image.open(&cx)?;
-            let fs = filesystem::FatFs::new(&cx, volume, uid, gid)?;
+            let volume = if rw {
+                reader::replacement::open_volume(&cx, &image, true)?
+            } else {
+                image.open(&cx)?
+            };
+            let fs = filesystem::FatFs::new_with_mode(&cx, volume, uid, gid, rw)?;
             let options = ffs_fuse::MountOptions {
-                read_only: true,
+                read_only: !rw,
                 allow_other: false,
                 auto_unmount: true,
                 ..ffs_fuse::MountOptions::default()
             };
             eprintln!(
-                "experimental FAT read-only mount; native FAT timestamps use a UTC wall-clock projection"
+                "experimental FAT {} mount; native FAT timestamps use a UTC wall-clock projection",
+                if rw { "read-write" } else { "read-only" }
             );
             let _ = ffs_fuse::mount(Box::new(fs), &mountpoint, &options)?;
         }

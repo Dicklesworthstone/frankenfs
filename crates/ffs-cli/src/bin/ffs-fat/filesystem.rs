@@ -2,10 +2,15 @@
 //! Slot-based IDs are safe only for this immutable, mount-lifetime namespace;
 //! they are deliberately not a promise of FAT write or export-stable handles.
 
+use crate::reader::replacement::{
+    create_in_volume, mkdir_in_volume, rename_in_volume, rmdir_in_volume, set_attr_in_volume,
+    sync_volume, truncate_in_volume, unlink_in_volume, write_range_in_volume,
+};
 use crate::reader::{Directory, Entry, FatVolume, FileChain, MAX_CHAIN_CLUSTERS, checkpoint};
 use asupersync::Cx;
 use ffs_core::{
     DirEntry, FileType, FsOps, FsStat, InodeAttr, ReaddirPage, RequestScope, SeekWhence,
+    SetAttrRequest,
 };
 use ffs_error::{FfsError, Result};
 use ffs_ondisk::fat::{FatKind, FatTimestamp};
@@ -19,6 +24,7 @@ const ROOT: InodeNumber = InodeNumber(1);
 const MAX_NODES: usize = 131_072;
 const MAX_CACHED_CHAINS: usize = 1024;
 const DIRECTORY_PAGE: usize = 256;
+const FIRST_SYNTHETIC_INO: u64 = 1_u64 << 48;
 
 #[derive(Clone)]
 struct Node {
@@ -34,12 +40,26 @@ impl Node {
     }
 }
 
-#[derive(Default)]
 struct State {
     nodes: BTreeMap<InodeNumber, Node>,
+    slot_to_ino: BTreeMap<u64, InodeNumber>,
+    next_synthetic_ino: u64,
     chains: BTreeMap<InodeNumber, Arc<FileChain>>,
     cached_clusters: usize,
     free_clusters: Option<u64>,
+}
+
+impl Default for State {
+    fn default() -> Self {
+        Self {
+            nodes: BTreeMap::new(),
+            slot_to_ino: BTreeMap::new(),
+            next_synthetic_ino: FIRST_SYNTHETIC_INO,
+            chains: BTreeMap::new(),
+            cached_clusters: 0,
+            free_clusters: None,
+        }
+    }
 }
 
 pub struct FatFs {
@@ -47,10 +67,56 @@ pub struct FatFs {
     state: Mutex<State>,
     uid: u32,
     gid: u32,
+    writable: bool,
+}
+
+fn now_unix_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(315_532_800, |d| d.as_secs().max(315_532_800))
+}
+
+fn map_mutation_error(error: anyhow::Error) -> FfsError {
+    let error = match error.downcast::<FfsError>() {
+        Ok(ffs_err) => return ffs_err,
+        Err(other) => other,
+    };
+    let error = match error.downcast::<std::io::Error>() {
+        Ok(io_err) => return FfsError::Io(io_err),
+        Err(other) => other,
+    };
+    let msg = error.to_string();
+    if msg.contains("already exists") {
+        FfsError::Exists
+    } else if msg.contains("is not empty") {
+        FfsError::NotEmpty
+    } else if msg.contains("read-only")
+        || msg.contains("cannot unlink the root")
+        || msg.contains("cannot remove the root")
+        || msg.contains("cannot rename the root")
+    {
+        FfsError::PermissionDenied
+    } else if msg.contains("into a descendant") {
+        FfsError::Format(msg)
+    } else if msg.contains("insufficient") {
+        FfsError::NoSpace
+    } else {
+        FfsError::Format(msg)
+    }
 }
 
 impl FatFs {
     pub fn new(cx: &Cx, volume: FatVolume, uid: u32, gid: u32) -> Result<Self> {
+        Self::new_with_mode(cx, volume, uid, gid, false)
+    }
+
+    pub fn new_with_mode(
+        cx: &Cx,
+        volume: FatVolume,
+        uid: u32,
+        gid: u32,
+        writable: bool,
+    ) -> Result<Self> {
         checkpoint(cx)?;
         // Reject an unreadable root before exposing a mount, not after INIT.
         volume.directory_size(cx, Directory::Root)?;
@@ -70,7 +136,15 @@ impl FatFs {
             state: Mutex::new(state),
             uid,
             gid,
+            writable,
         })
+    }
+
+    fn ensure_writable(&self) -> Result<()> {
+        if !self.writable {
+            return Err(FfsError::ReadOnly);
+        }
+        Ok(())
     }
 
     fn state(&self) -> Result<MutexGuard<'_, State>> {
@@ -91,9 +165,90 @@ impl FatFs {
         Ok(node)
     }
 
+    fn path_for_inode(&self, ino: InodeNumber) -> Result<String> {
+        if ino == ROOT {
+            return Ok("/".to_owned());
+        }
+        let state = self.state()?;
+        let mut components = Vec::new();
+        let mut current = ino;
+        for _ in 0..=256 {
+            let node = state
+                .nodes
+                .get(&current)
+                .ok_or_else(|| FfsError::NotFound(format!("FAT inode {}", current.0)))?;
+            if current == ROOT {
+                components.reverse();
+                return Ok(format!("/{}", components.join("/")));
+            }
+            let entry = node
+                .entry
+                .as_ref()
+                .ok_or_else(|| FfsError::NotFound(format!("FAT inode {}", current.0)))?;
+            components.push(entry.name()?);
+            current = node.parent;
+        }
+        Err(FfsError::NameTooLong)
+    }
+
+    fn child_path(&self, parent: InodeNumber, name: &OsStr) -> Result<(String, String)> {
+        let name_str = name.to_str().ok_or_else(|| {
+            FfsError::UnsupportedFeature("FAT requires a UTF-8 presentation name".into())
+        })?;
+        if name_str.is_empty()
+            || matches!(name_str, "." | "..")
+            || name_str.contains(['/', '\\', '\0'])
+        {
+            return Err(FfsError::Format("invalid FAT path component".into()));
+        }
+        let parent_path = self.path_for_inode(parent)?;
+        let full = if parent_path == "/" {
+            format!("/{name_str}")
+        } else {
+            format!("{parent_path}/{name_str}")
+        };
+        Ok((full, name_str.to_owned()))
+    }
+
+    fn invalidate_cached_chain(state: &mut State, ino: InodeNumber) {
+        if let Some(prev) = state.chains.remove(&ino) {
+            state.cached_clusters = state
+                .cached_clusters
+                .saturating_sub(prev.clusters.capacity());
+        }
+    }
+
+    fn refresh_node_from_path(&self, cx: &Cx, ino: InodeNumber, path: &str) -> Result<Node> {
+        let entry = self
+            .volume
+            .resolve(cx, path)?
+            .ok_or_else(|| FfsError::NotFound(path.to_owned()))?;
+        let mut state = self.state()?;
+        Self::invalidate_cached_chain(&mut state, ino);
+        state.free_clusters = None;
+        let old_offset = state
+            .nodes
+            .get(&ino)
+            .ok_or_else(|| FfsError::NotFound(format!("FAT inode {}", ino.0)))?
+            .entry
+            .as_ref()
+            .map(|e| e.offset);
+        if let Some(old) = old_offset
+            && old != entry.offset
+        {
+            state.slot_to_ino.remove(&old);
+        }
+        state.slot_to_ino.insert(entry.offset, ino);
+        let node = state
+            .nodes
+            .get_mut(&ino)
+            .ok_or_else(|| FfsError::NotFound(format!("FAT inode {}", ino.0)))?;
+        node.entry = Some(entry);
+        Ok(node.clone())
+    }
+
     fn register(&self, cx: &Cx, parent: InodeNumber, entry: Entry) -> Result<InodeNumber> {
         checkpoint(cx)?;
-        let ino = InodeNumber(entry.offset / 32 + 2);
         let mut state = self.state()?;
         if entry.native.is_directory() {
             let mut ancestor = parent;
@@ -123,25 +278,64 @@ impl FatFs {
                 ancestor = node.parent;
             }
         }
-        if let Some(existing) = state.nodes.get(&ino) {
-            if existing.parent != parent
-                || existing
-                    .entry
-                    .as_ref()
-                    .is_none_or(|old| old.native != entry.native)
+        if let Some(&mapped_ino) = state.slot_to_ino.get(&entry.offset)
+            && let Some(existing) = state.nodes.get_mut(&mapped_ino)
+        {
+            if !self.writable
+                && (existing.parent != parent
+                    || existing
+                        .entry
+                        .as_ref()
+                        .is_none_or(|old| old.native != entry.native))
             {
                 return Err(FfsError::Corruption {
                     block: entry.offset / 512,
                     detail: "FAT namespace identity changed or is cross-linked".into(),
                 });
             }
-            return Ok(ino);
+            existing.parent = parent;
+            existing.entry = Some(entry);
+            return Ok(mapped_ino);
         }
+
+        let default_ino = InodeNumber(entry.offset / 32 + 2);
+        let ino = if let Some(existing) = state.nodes.get(&default_ino) {
+            let same_slot = existing
+                .entry
+                .as_ref()
+                .is_some_and(|old| old.offset == entry.offset);
+            if same_slot {
+                if !self.writable
+                    && (existing.parent != parent
+                        || existing
+                            .entry
+                            .as_ref()
+                            .is_none_or(|old| old.native != entry.native))
+                {
+                    return Err(FfsError::Corruption {
+                        block: entry.offset / 512,
+                        detail: "FAT namespace identity changed or is cross-linked".into(),
+                    });
+                }
+                let existing_mut = state.nodes.get_mut(&default_ino).expect("checked above");
+                existing_mut.parent = parent;
+                existing_mut.entry = Some(entry.clone());
+                state.slot_to_ino.insert(entry.offset, default_ino);
+                return Ok(default_ino);
+            }
+            let allocated = InodeNumber(state.next_synthetic_ino);
+            state.next_synthetic_ino += 1;
+            allocated
+        } else {
+            default_ino
+        };
+
         if state.nodes.len() >= MAX_NODES {
             return Err(FfsError::Io(std::io::Error::from_raw_os_error(
                 libc::ENOMEM,
             )));
         }
+        state.slot_to_ino.insert(entry.offset, ino);
         state.nodes.insert(
             ino,
             Node {
@@ -247,6 +441,16 @@ impl FatFs {
         } else {
             (UNIX_EPOCH, UNIX_EPOCH, UNIX_EPOCH)
         };
+        let read_only_attr = node
+            .entry
+            .as_ref()
+            .is_some_and(|entry| entry.native.attributes & 0x01 != 0);
+        let perm = match (self.writable, kind, read_only_attr) {
+            (false, FileType::Directory, _) | (true, FileType::Directory, true) => 0o555,
+            (true, FileType::Directory, false) => 0o755,
+            (false, _, _) | (true, _, true) => 0o444,
+            (true, _, false) => 0o644,
+        };
         checkpoint(cx)?;
         Ok(InodeAttr {
             ino,
@@ -257,11 +461,7 @@ impl FatFs {
             ctime: UNIX_EPOCH,
             crtime,
             kind,
-            perm: if kind == FileType::Directory {
-                0o555
-            } else {
-                0o444
-            },
+            perm,
             nlink,
             uid: self.uid,
             gid: self.gid,
@@ -377,14 +577,259 @@ impl FsOps for FatFs {
         flags: i32,
     ) -> Result<(u64, u32)> {
         checkpoint(cx)?;
-        if flags & libc::O_ACCMODE != libc::O_RDONLY || flags & (libc::O_TRUNC | libc::O_CREAT) != 0
-        {
+        let wants_write = flags & libc::O_ACCMODE != libc::O_RDONLY
+            || flags & (libc::O_TRUNC | libc::O_CREAT) != 0;
+        if wants_write && !self.writable {
             return Err(FfsError::ReadOnly);
         }
-        let node = self.node(cx, ino)?;
+        let mut node = self.node(cx, ino)?;
+        let entry = node.entry.as_ref().ok_or(FfsError::IsDirectory)?;
+        if entry.native.is_directory() {
+            return Err(FfsError::IsDirectory);
+        }
+        if wants_write && entry.native.attributes & 0x01 != 0 {
+            return Err(FfsError::PermissionDenied);
+        }
+        if flags & libc::O_TRUNC != 0 {
+            let path = self.path_for_inode(ino)?;
+            truncate_in_volume(cx, &self.volume, &path, 0, now_unix_secs())
+                .map_err(map_mutation_error)?;
+            node = self.refresh_node_from_path(cx, ino, &path)?;
+        }
         let entry = node.entry.as_ref().ok_or(FfsError::IsDirectory)?;
         self.chain(cx, ino, entry)?;
         Ok((0, 0))
+    }
+
+    fn create(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        mode: u16,
+        _uid: u32,
+        _gid: u32,
+    ) -> Result<InodeAttr> {
+        checkpoint(cx)?;
+        self.ensure_writable()?;
+        let parent_node = self.node(cx, parent)?;
+        let parent_dir = parent_node.directory()?;
+        let (path, name_str) = self.child_path(parent, name)?;
+        let read_only = (mode & 0o222) == 0;
+        create_in_volume(cx, &self.volume, &path, &[], now_unix_secs(), read_only)
+            .map_err(map_mutation_error)?;
+        self.state()?.free_clusters = None;
+        let entry = self.volume.lookup(cx, parent_dir, &name_str)?;
+        let ino = self.register(cx, parent, entry)?;
+        let node = self.node(cx, ino)?;
+        self.attributes(cx, ino, &node)
+    }
+
+    fn mkdir(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        _mode: u16,
+        _uid: u32,
+        _gid: u32,
+    ) -> Result<InodeAttr> {
+        checkpoint(cx)?;
+        self.ensure_writable()?;
+        let parent_node = self.node(cx, parent)?;
+        let parent_dir = parent_node.directory()?;
+        let (path, name_str) = self.child_path(parent, name)?;
+        mkdir_in_volume(cx, &self.volume, &path, now_unix_secs(), false)
+            .map_err(map_mutation_error)?;
+        self.state()?.free_clusters = None;
+        let entry = self.volume.lookup(cx, parent_dir, &name_str)?;
+        let ino = self.register(cx, parent, entry)?;
+        let node = self.node(cx, ino)?;
+        self.attributes(cx, ino, &node)
+    }
+
+    fn write(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        offset: u64,
+        data: &[u8],
+    ) -> Result<u32> {
+        checkpoint(cx)?;
+        self.ensure_writable()?;
+        let node = self.node(cx, ino)?;
+        let entry = node.entry.as_ref().ok_or(FfsError::IsDirectory)?;
+        if entry.native.is_directory() {
+            return Err(FfsError::IsDirectory);
+        }
+        if entry.native.attributes & 0x01 != 0 {
+            return Err(FfsError::PermissionDenied);
+        }
+        let path = self.path_for_inode(ino)?;
+        let written = write_range_in_volume(cx, &self.volume, &path, offset, data, now_unix_secs())
+            .map_err(map_mutation_error)?;
+        self.refresh_node_from_path(cx, ino, &path)?;
+        u32::try_from(written).map_err(|_| FfsError::Format("FAT write size overflow".into()))
+    }
+
+    fn setattr(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        attrs: &SetAttrRequest,
+    ) -> Result<InodeAttr> {
+        checkpoint(cx)?;
+        self.ensure_writable()?;
+        if ino == ROOT {
+            let node = self.node(cx, ROOT)?;
+            return self.attributes(cx, ROOT, &node);
+        }
+        let path = self.path_for_inode(ino)?;
+        if let Some(new_size) = attrs.size {
+            truncate_in_volume(cx, &self.volume, &path, new_size, now_unix_secs())
+                .map_err(map_mutation_error)?;
+        }
+        let read_only = attrs.mode.map(|mode| (mode & 0o222) == 0);
+        let modified_secs = attrs
+            .mtime
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs().max(315_532_800));
+        let accessed_secs = attrs
+            .atime
+            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+            .map(|d| d.as_secs().max(315_532_800));
+        if read_only.is_some() || modified_secs.is_some() || accessed_secs.is_some() {
+            set_attr_in_volume(
+                cx,
+                &self.volume,
+                &path,
+                read_only,
+                modified_secs,
+                accessed_secs,
+            )
+            .map_err(map_mutation_error)?;
+        }
+        let node = self.refresh_node_from_path(cx, ino, &path)?;
+        self.attributes(cx, ino, &node)
+    }
+
+    fn unlink(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+    ) -> Result<()> {
+        checkpoint(cx)?;
+        self.ensure_writable()?;
+        let parent_node = self.node(cx, parent)?;
+        let parent_dir = parent_node.directory()?;
+        let (path, name_str) = self.child_path(parent, name)?;
+        let existing_entry = self.volume.lookup(cx, parent_dir, &name_str)?;
+        if existing_entry.native.is_directory() {
+            return Err(FfsError::IsDirectory);
+        }
+        unlink_in_volume(cx, &self.volume, &path, false).map_err(map_mutation_error)?;
+        let mut state = self.state()?;
+        state.free_clusters = None;
+        if let Some(removed_ino) = state.slot_to_ino.remove(&existing_entry.offset) {
+            Self::invalidate_cached_chain(&mut state, removed_ino);
+            state.nodes.remove(&removed_ino);
+        } else {
+            let fallback_ino = InodeNumber(existing_entry.offset / 32 + 2);
+            if state
+                .nodes
+                .get(&fallback_ino)
+                .and_then(|n| n.entry.as_ref())
+                .is_some_and(|e| e.offset == existing_entry.offset)
+            {
+                Self::invalidate_cached_chain(&mut state, fallback_ino);
+                state.nodes.remove(&fallback_ino);
+            }
+        }
+        Ok(())
+    }
+
+    fn rmdir(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+    ) -> Result<()> {
+        checkpoint(cx)?;
+        self.ensure_writable()?;
+        let parent_node = self.node(cx, parent)?;
+        let parent_dir = parent_node.directory()?;
+        let (path, name_str) = self.child_path(parent, name)?;
+        let existing_entry = self.volume.lookup(cx, parent_dir, &name_str)?;
+        if !existing_entry.native.is_directory() {
+            return Err(FfsError::NotDirectory);
+        }
+        rmdir_in_volume(cx, &self.volume, &path, false).map_err(map_mutation_error)?;
+        let mut state = self.state()?;
+        state.free_clusters = None;
+        if let Some(removed_ino) = state.slot_to_ino.remove(&existing_entry.offset) {
+            state.nodes.remove(&removed_ino);
+        } else {
+            let fallback_ino = InodeNumber(existing_entry.offset / 32 + 2);
+            if state
+                .nodes
+                .get(&fallback_ino)
+                .and_then(|n| n.entry.as_ref())
+                .is_some_and(|e| e.offset == existing_entry.offset)
+            {
+                state.nodes.remove(&fallback_ino);
+            }
+        }
+        Ok(())
+    }
+
+    fn rename(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        new_parent: InodeNumber,
+        new_name: &OsStr,
+    ) -> Result<()> {
+        checkpoint(cx)?;
+        self.ensure_writable()?;
+        let parent_dir = self.node(cx, parent)?.directory()?;
+        let new_parent_dir = self.node(cx, new_parent)?.directory()?;
+        let (from_path, from_name) = self.child_path(parent, name)?;
+        let (to_path, to_name) = self.child_path(new_parent, new_name)?;
+        let src_before = self.volume.lookup(cx, parent_dir, &from_name)?;
+        let dst_before = self.volume.lookup(cx, new_parent_dir, &to_name).ok();
+        let src_ino = self.register(cx, parent, src_before.clone())?;
+
+        rename_in_volume(cx, &self.volume, &from_path, &to_path, false)
+            .map_err(map_mutation_error)?;
+
+        let new_entry = self.volume.lookup(cx, new_parent_dir, &to_name)?;
+        let mut state = self.state()?;
+        state.free_clusters = None;
+        if let Some(overwritten) = dst_before
+            && overwritten.offset != src_before.offset
+            && let Some(dst_ino) = state.slot_to_ino.remove(&overwritten.offset)
+            && dst_ino != src_ino
+        {
+            Self::invalidate_cached_chain(&mut state, dst_ino);
+            state.nodes.remove(&dst_ino);
+        }
+        state.slot_to_ino.remove(&src_before.offset);
+        state.slot_to_ino.insert(new_entry.offset, src_ino);
+        Self::invalidate_cached_chain(&mut state, src_ino);
+        if let Some(node) = state.nodes.get_mut(&src_ino) {
+            node.parent = new_parent;
+            node.entry = Some(new_entry);
+        }
+        Ok(())
     }
 
     fn readlink(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber) -> Result<Vec<u8>> {
@@ -426,6 +871,9 @@ impl FsOps for FatFs {
         _datasync: bool,
     ) -> Result<()> {
         self.node(cx, ino)?;
+        if self.writable {
+            sync_volume(cx, &self.volume).map_err(map_mutation_error)?;
+        }
         checkpoint(cx)
     }
 
@@ -438,6 +886,16 @@ impl FsOps for FatFs {
         _datasync: bool,
     ) -> Result<()> {
         self.node(cx, ino)?.directory()?;
+        if self.writable {
+            sync_volume(cx, &self.volume).map_err(map_mutation_error)?;
+        }
+        checkpoint(cx)
+    }
+
+    fn flush_on_destroy(&self, cx: &Cx) -> Result<()> {
+        if self.writable {
+            sync_volume(cx, &self.volume).map_err(map_mutation_error)?;
+        }
         checkpoint(cx)
     }
 

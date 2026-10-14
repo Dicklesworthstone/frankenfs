@@ -7,7 +7,10 @@
 
 mod mkdir;
 mod names;
-pub use mkdir::{MkdirArgs, run_mkdir};
+pub use mkdir::{
+    MkdirArgs, RenameArgs, RmdirArgs, UnlinkArgs, mkdir_in_volume, rename_in_volume,
+    rmdir_in_volume, run_mkdir, run_rename, run_rmdir, run_unlink, unlink_in_volume,
+};
 
 use super::super::{Directory, FatVolume, MAX_DIRECTORY_SLOTS};
 use super::{
@@ -238,7 +241,7 @@ fn parent(cx: &Cx, volume: &FatVolume, path: &str) -> Result<(Directory, String)
     Ok((directory, name.to_owned()))
 }
 
-fn directory_offsets(
+pub(super) fn directory_offsets(
     cx: &Cx,
     volume: &FatVolume,
     directory: Directory,
