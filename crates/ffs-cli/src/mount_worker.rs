@@ -18,22 +18,37 @@ pub fn mount_background_runtime() -> Result<Arc<asupersync::runtime::Runtime>> {
         .context("failed to create mount background runtime")
 }
 
+pub trait PeriodicCommitTarget: Send + Sync + 'static {
+    fn default_commit_interval(&self) -> Option<Duration>;
+    fn periodic_commit(&self, cx: &Cx) -> ffs_error::Result<bool>;
+}
+
+impl PeriodicCommitTarget for OpenFs {
+    fn default_commit_interval(&self) -> Option<Duration> {
+        Some(Duration::from_secs(match &self.flavor {
+            FsFlavor::Ext4(_) => 5,
+            FsFlavor::Btrfs(_) => 30,
+        }))
+    }
+
+    fn periodic_commit(&self, cx: &Cx) -> ffs_error::Result<bool> {
+        Self::periodic_commit(self, cx)
+    }
+}
+
 /// Use the same periodic filesystem durability boundary for ordinary and
 /// sidecar-protected mounts. A protected device's sync also publishes current
 /// repair coverage. Zero explicitly disables the timer; fsync still works.
-pub fn start_periodic_commit(
+pub fn start_periodic_commit<F: PeriodicCommitTarget>(
     cx: &Cx,
     runtime: &Arc<asupersync::runtime::Runtime>,
-    open_fs: &Arc<OpenFs>,
+    open_fs: &Arc<F>,
     interval: Option<Duration>,
     operation_id: &str,
 ) -> Result<Option<MountIoWorker<()>>> {
-    let interval = interval.unwrap_or_else(|| {
-        Duration::from_secs(match &open_fs.flavor {
-            FsFlavor::Ext4(_) => 5,
-            FsFlavor::Btrfs(_) => 30,
-        })
-    });
+    let Some(interval) = interval.or_else(|| open_fs.default_commit_interval()) else {
+        return Ok(None);
+    };
     if interval.is_zero() {
         info!(
             target: "ffs::cli::mount",
