@@ -4,13 +4,11 @@
 //! synchronized before its FAT allocation or parent namespace entry is published.
 //! Parent long-name and growth ordering is shared with file creation.
 
-use super::{
-    Extension, Namespace, deleted_slot, parent, patch_slot, read_slot, reserve_slots,
-};
 use super::super::{
     ImageFile, change_fat, checkpoint, open_regular, reserve_clusters, set_dirty, set_hints,
     stable, validate_boot_state, write_volume,
 };
+use super::{Extension, Namespace, deleted_slot, parent, patch_slot, read_slot, reserve_slots};
 use crate::ImageArgs;
 use anyhow::{Context, Result, bail};
 use asupersync::{Cx, types::CancelKind};
@@ -21,7 +19,7 @@ use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 #[derive(Debug, Args)]
-pub(crate) struct MkdirArgs {
+pub struct MkdirArgs {
     #[command(flatten)]
     image: ImageArgs,
     /// New native directory path. Every parent must already exist.
@@ -45,13 +43,7 @@ pub(super) struct DirectoryCreation {
     directories: u64,
 }
 
-fn directory_entry(
-    name: &[u8; 11],
-    flags: u8,
-    cluster: u32,
-    date: u16,
-    time: u16,
-) -> [u8; 32] {
+fn directory_entry(name: &[u8; 11], flags: u8, cluster: u32, date: u16, time: u16) -> [u8; 32] {
     let mut entry = [0; 32];
     entry[..11].copy_from_slice(name);
     entry[11] = 0x10;
@@ -136,17 +128,10 @@ impl DirectoryCreation {
             .pop()
             .context("missing reserved directory short-entry slot")?;
         let parent_cluster = match directory {
-            super::super::super::Directory::Root => {
-                if volume.geometry.kind() == FatKind::Fat32 {
-                    volume.geometry.root_cluster()
-                } else {
-                    0
-                }
-            }
+            super::super::super::Directory::Root => 0,
             super::super::super::Directory::Cluster(cluster) => cluster,
         };
-        let updated =
-            directory_entry(&name.short, name.flags, directory_cluster, date, time);
+        let updated = directory_entry(&name.short, name.flags, directory_cluster, date, time);
 
         Ok(Self {
             path: path.to_owned(),
@@ -169,11 +154,7 @@ impl DirectoryCreation {
         })
     }
 
-    fn report(
-        &self,
-        volume: &super::super::super::FatVolume,
-        dry_run: bool,
-    ) -> serde_json::Value {
+    fn report(&self, volume: &super::super::super::FatVolume, dry_run: bool) -> serde_json::Value {
         json!({
             "operation": "create_directory",
             "dry_run": dry_run,
@@ -213,16 +194,25 @@ impl DirectoryCreation {
             phase = "initializing new directory contents";
             let mut bytes = super::super::allocate(volume.geometry.cluster_bytes() as usize)?;
             let date = u16::from_le_bytes(
-                self.updated[16..18].try_into().expect("native directory date"),
+                self.updated[16..18]
+                    .try_into()
+                    .expect("native directory date"),
             );
             let time = u16::from_le_bytes(
-                self.updated[14..16].try_into().expect("native directory time"),
+                self.updated[14..16]
+                    .try_into()
+                    .expect("native directory time"),
             );
             let dot = directory_entry(b".          ", 0, self.directory_cluster, date, time);
             let dotdot = directory_entry(b"..         ", 0, self.parent_cluster, date, time);
             bytes[..32].copy_from_slice(&dot);
             bytes[32..64].copy_from_slice(&dotdot);
-            write_volume(cx, volume, volume.cluster_offset(self.directory_cluster)?, &bytes)?;
+            write_volume(
+                cx,
+                volume,
+                volume.cluster_offset(self.directory_cluster)?,
+                &bytes,
+            )?;
             volume.device.sync(cx)?;
 
             phase = "publishing new directory allocation";
@@ -283,12 +273,10 @@ impl DirectoryCreation {
             )?;
             if &prefix[..11] != b".          "
                 || prefix[11] != 0x10
-                || raw_cluster(volume.geometry.kind(), &prefix[..32])
-                    != self.directory_cluster
+                || raw_cluster(volume.geometry.kind(), &prefix[..32]) != self.directory_cluster
                 || &prefix[32..43] != b"..         "
                 || prefix[43] != 0x10
-                || raw_cluster(volume.geometry.kind(), &prefix[32..64])
-                    != self.parent_cluster
+                || raw_cluster(volume.geometry.kind(), &prefix[32..64]) != self.parent_cluster
             {
                 bail!("new directory native dot entries failed readback");
             }
@@ -300,9 +288,19 @@ impl DirectoryCreation {
             if !verification.clean
                 || !verification.complete
                 || !verification.namespace_complete
-                || verification.free_clusters != self.free_after
-                || verification.files != self.files
-                || verification.directories != self.directories
+            {
+                bail!(
+                    "directory creation verification failed: {}",
+                    serde_json::to_string(&verification)?
+                );
+            }
+            if verification.free_clusters != self.free_after {
+                bail!(
+                    "directory creation verification failed: {}",
+                    serde_json::to_string(&verification)?
+                );
+            }
+            if verification.files != self.files || verification.directories != self.directories
             {
                 bail!(
                     "directory creation verification failed: {}",
@@ -327,7 +325,7 @@ impl DirectoryCreation {
     }
 }
 
-pub(crate) fn run_mkdir(cx: &Cx, args: &MkdirArgs) -> Result<serde_json::Value> {
+pub fn run_mkdir(cx: &Cx, args: &MkdirArgs) -> Result<serde_json::Value> {
     checkpoint(cx)?;
     if !args.offline_image {
         bail!(

@@ -8,7 +8,7 @@
 //! dosfstools v4.2 src/{fat,boot}.c. No native implementation code is reused.
 
 mod creation;
-pub(crate) use creation::{MkdirArgs, run_mkdir};
+pub use creation::{MkdirArgs, run_mkdir};
 
 use super::{FatTable, FatVolume, MAX_CHAIN_CLUSTERS, allocate, checkpoint, corrupt};
 use crate::ImageArgs;

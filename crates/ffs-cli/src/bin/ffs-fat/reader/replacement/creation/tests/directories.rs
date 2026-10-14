@@ -3,7 +3,11 @@
 use super::*;
 
 fn mark_chain_end(image: &Image, kind: FatKind, cluster: u32) {
-    let end = if kind == FatKind::Fat16 { 0xFFFF } else { 0x0FFF_FFFF };
+    let end = if kind == FatKind::Fat16 {
+        0xFFFF
+    } else {
+        0x0FFF_FFFF
+    };
     let volume = image.volume();
     let copies = volume.copies();
     let width = kind.entry_bytes() as usize;
@@ -12,7 +16,11 @@ fn mark_chain_end(image: &Image, kind: FatKind, cluster: u32) {
         let at = image.base + image.geometry.entry_offset(copy, cluster).unwrap();
         let mut raw = [0; 4];
         state.read(at, &mut raw[..width]);
-        let mask = if kind == FatKind::Fat16 { 0xFFFF } else { 0x0FFF_FFFF };
+        let mask = if kind == FatKind::Fat16 {
+            0xFFFF
+        } else {
+            0x0FFF_FFFF
+        };
         let updated = (u32::from_le_bytes(raw) & !mask) | end;
         state.put(at, &updated.to_le_bytes()[..width]);
     }
@@ -28,12 +36,7 @@ fn add_subdirectory(image: &Image, kind: FatKind, cluster: u32) {
 
     let mut dot = short_entry(b".          ", cluster, 0);
     dot[11] = 0x10;
-    let root_parent = if kind == FatKind::Fat32 {
-        image.geometry.root_cluster()
-    } else {
-        0
-    };
-    let mut dotdot = short_entry(b"..         ", root_parent, 0);
+    let mut dotdot = short_entry(b"..         ", 0, 0);
     dotdot[11] = 0x10;
     let start = image.base + image.geometry.cluster_offset(cluster).unwrap();
     state.put(start, &dot);
@@ -59,21 +62,13 @@ fn mkdir_root_and_nested_long_names_initialize_dot_and_dotdot() {
             let image = Image::new(kind, sector, kind == FatKind::Fat32);
             let volume = image.volume();
             let before = volume.check(&cx).unwrap();
-            let plan = mkdir::DirectoryCreation::prepare(
-                &cx,
-                &volume,
-                "/Release notes 🦀",
-                NOW,
-            )
-            .unwrap();
+            let plan =
+                mkdir::DirectoryCreation::prepare(&cx, &volume, "/Release notes 🦀", NOW).unwrap();
             let cluster = plan.directory_cluster;
             plan.execute(&cx, &volume).unwrap();
 
             let reopened = image.volume();
-            let entry = reopened
-                .resolve(&cx, "/Release notes 🦀")
-                .unwrap()
-                .unwrap();
+            let entry = reopened.resolve(&cx, "/Release notes 🦀").unwrap().unwrap();
             assert!(entry.native.is_directory());
             assert_eq!(entry.native.first_cluster, cluster);
             assert!(
@@ -89,14 +84,7 @@ fn mkdir_root_and_nested_long_names_initialize_dot_and_dotdot() {
             assert_eq!(&raw[..11], b".          ");
             assert_eq!(raw_cluster(kind, &raw[..32]), cluster);
             assert_eq!(&raw[32..43], b"..         ");
-            assert_eq!(
-                raw_cluster(kind, &raw[32..64]),
-                if kind == FatKind::Fat32 {
-                    image.geometry.root_cluster()
-                } else {
-                    0
-                }
-            );
+            assert_eq!(raw_cluster(kind, &raw[32..64]), 0);
             let after = reopened.check(&cx).unwrap();
             assert!(after.clean);
             assert_eq!(after.files, before.files);
@@ -107,13 +95,8 @@ fn mkdir_root_and_nested_long_names_initialize_dot_and_dotdot() {
             let nested_image = Image::new(kind, sector, kind == FatKind::Fat32);
             add_subdirectory(&nested_image, kind, 8);
             let volume = nested_image.volume();
-            let nested = mkdir::DirectoryCreation::prepare(
-                &cx,
-                &volume,
-                "/SUB/Child folder",
-                NOW,
-            )
-            .unwrap();
+            let nested =
+                mkdir::DirectoryCreation::prepare(&cx, &volume, "/SUB/Child folder", NOW).unwrap();
             let child = nested.directory_cluster;
             nested.execute(&cx, &volume).unwrap();
             let reopened = nested_image.volume();
@@ -147,13 +130,8 @@ fn mkdir_full_fat32_root_grows_parent_and_preserves_existing_sector() {
     let volume = image.volume();
     let before = volume.check(&cx).unwrap();
     let first_sector = image.bytes(image.root, 512);
-    let plan = mkdir::DirectoryCreation::prepare(
-        &cx,
-        &volume,
-        "/A long directory name",
-        NOW,
-    )
-    .unwrap();
+    let plan =
+        mkdir::DirectoryCreation::prepare(&cx, &volume, "/A long directory name", NOW).unwrap();
     let parent_clusters = plan.namespace.directory_clusters();
     assert!(parent_clusters >= 1);
     plan.execute(&cx, &volume).unwrap();
@@ -206,9 +184,7 @@ fn mkdir_collision_fixed_root_and_cancellation_refuse_without_writes() {
         asupersync::types::CancelKind::User,
         Some("mkdir cancellation control"),
     );
-    assert!(
-        mkdir::DirectoryCreation::prepare(&cancelled, &volume, "/CANCEL", NOW).is_err()
-    );
+    assert!(mkdir::DirectoryCreation::prepare(&cancelled, &volume, "/CANCEL", NOW).is_err());
     assert_eq!(image.device.state.lock().unwrap().operations, 0);
     image.guards();
 }

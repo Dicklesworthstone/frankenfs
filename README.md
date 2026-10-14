@@ -107,8 +107,10 @@ state publication. FAT32 inactive-copy and reserved-high-bit rules are retained.
 
 This is **ordered offline mutation, not an atomic transaction**. Interruption
 may leave a dirty image requiring native checking/recovery on another copy.
-New directories, unlink/rename, writable mounts and native crash replay remain
-unfinished. See the [creation and directory-growth contract](docs/FAT_CREATE_PROFILE.md).
+Explicit `mkdir` initializes one empty native directory under an existing parent,
+including `.` and `..`, using the same parent-growth and publication protocol.
+Unlink/rename, writable mounts and native crash replay remain unfinished.
+See the [creation and directory-growth contract](docs/FAT_CREATE_PROFILE.md).
 
 ### Evidence for this increment
 
@@ -121,16 +123,23 @@ failures, lost or retained pending data and torn prefixes. An interior-marker
 control specifically requires durable hidden-slot initialization before the
 old end marker is consumed.
 
-**All 130 FAT Rust tests passed**, including the 17 creation/growth/name
-regressions, in RCH job `j-30063538684821513`. No tests failed, were ignored
-or were filtered out. Combined-source workspace/all-target check and strict
-Clippy passed in jobs `j-30063538684821509` and `j-30063538684821508`; formatting
-also passed. The source is base `401fd7402` plus overlay
-`0e707e9b2f919d59e61d92eca7b23a2d1ac18cfbd8e149bc29a5f9aabdf113f0`.
-Earlier gate failures required equivalent verification-guard and test-spelling
-fixes; no condition or case was removed. These are executed native-image and
-storage-model unit controls. Windows/dosfstools interchange, writable-mount,
-crash-replay and hardware power-cut qualification remain outstanding.
+**All 133 FAT Rust tests passed**, including the 17 creation/growth/name
+regressions and three mkdir controls, in RCH job `j-30063538684821517`.
+No tests failed, were ignored or were filtered out. Workspace/all-target check
+and strict Clippy passed in `j-30063538684821519` and `j-30063538684821516`;
+formatting also passed. The source is
+base `eeef44fe3` plus overlay
+`c58623d3232fa8c06bc8bdb3ca6de7d6da6b23952d887639b50a2e3280f36a81`.
+The old FAT32 mkdir writer failed the unchanged checker's root-parent invariant
+in `j-30063538684821514`; the fixed writer encodes `..` as cluster zero for root
+children in both dialects. Nested children retain their actual parent cluster.
+Earlier compiler-gate failures required equivalent verification-guard and
+visibility fixes; no condition or case was removed. These are executed
+native-image and storage-model unit controls. A separately built public
+`ffs-fat` also passed root/nested mkdir, exact dot-entry readback, hash-preserving
+dry-run/collision refusal and independent `fsck.fat -n` on fresh 64 MiB FAT16
+and FAT32 images. Windows, writable-mount, crash-replay and hardware power-cut
+qualification remain outstanding.
 
 ## Build and explore
 

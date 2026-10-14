@@ -72,9 +72,10 @@ under an existing parent. It uses the same long-name/short-alias collision polic
 and parent-slot reservation as file creation. The new directory receives its own
 disjoint cluster, which is initialized and synchronized with native `.` and
 `..` entries before the allocation entry and parent namespace entry are
-published. FAT16 root children use native parent cluster zero; FAT32 root
-children point `..` at the root cluster; nested children point at their actual
-parent cluster.
+published. FAT16 and FAT32 root children use native parent cluster zero;
+nested children point at their actual parent cluster. This follows the
+[Microsoft FAT specification, §6.5](https://www.scs.stanford.edu/~zyedidia/docs/_other/fat.pdf)
+and the existing strict native checker.
 
 The parent may grow through the same bounded FAT-chain protocol used by long file
 names. A dry-run performs admission, name, slot and allocation planning without
@@ -123,14 +124,20 @@ that consuming the old end requires durable, harmless hidden slots, even if a
 flush fails. Formerly unsupported valid name cases now have positive native-
 publication controls; invalid names and collisions still have zero-write tests.
 
-All 130 FAT Rust tests, including all 17 creation/growth/name controls, passed
-in RCH job `j-30063538684821513`: zero failures, ignored or filtered tests.
+All 133 FAT Rust tests, including all 17 creation/growth/name controls and three
+mkdir controls, passed in RCH job `j-30063538684821517`: zero failures, ignored
+or filtered tests. The mkdir controls cover root/nested dot entries in both
+dialects and sector sizes, full FAT32 parent growth, and collision/fixed-root/
+cancellation refusals without writes. The old FAT32 producer failed the
+unchanged native checker's root-parent invariant in `j-30063538684821514`;
+the corrected producer passed the complete suite with exact root-parent zero
+and nested-parent identity checks.
+
 These are executed synthetic native-image and storage-model unit controls;
-Windows/dosfstools interchange and hardware power-cut qualification remain
-pending. The same source passed RCH workspace/all-target check
-`j-30063538684821509`, strict Clippy `j-30063538684821508` and formatting
-on base `401fd7402` plus overlay
-`0e707e9b2f919d59e61d92eca7b23a2d1ac18cfbd8e149bc29a5f9aabdf113f0`.
+Windows and hardware power-cut qualification remain pending. The same source
+passed RCH workspace/all-target check `j-30063538684821519`, strict Clippy
+`j-30063538684821516` and formatting on base `eeef44fe3` plus overlay
+`c58623d3232fa8c06bc8bdb3ca6de7d6da6b23952d887639b50a2e3280f36a81`.
 Earlier gate failures were fixed without removing any verification condition or
 test case. The unchanged required checks include:
 
@@ -140,6 +147,17 @@ rch exec -- cargo check --workspace --all-targets
 rch exec -- cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --check
 ```
+
+The public `ffs-fat` built by RCH `j-30063538684821518` has SHA-256
+`65b85607187b6c9c3a6747991e76b77bcdb41d6676af5218316d8821a18534f4`,
+independently matched between worker and retrieved artifact. It executed
+root/nested mkdir on fresh 64 MiB FAT16 and FAT32 images produced by dosfstools.
+Independent raw boot-geometry/dot-entry reads, empty-child resolution, exact
+directory/free-space accounting and `fsck.fat -n` before/after all passed.
+Dry-run and case-insensitive collision refusal preserved full image hashes.
+This is real offline CLI/dosfstools interchange evidence for those profiles;
+it does not qualify writable mounts, interruption recovery, Windows or hardware
+power cuts.
 
 Recursive parent creation, unlink/rename, writable mounts, crash replay and MVCC/RaptorQ
 integration remain unfinished. NTFS/ZFS native recovery and write milestones
