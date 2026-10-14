@@ -24111,6 +24111,62 @@ mod tests {
         }
     }
 
+    #[test]
+    fn free_space_extents_and_fused_accounting_work_across_multileaf_extent_tree_bd_gedye() {
+        let mut alloc = BtrfsExtentAllocator::new(13).expect("alloc");
+        // Use a 4 KiB nodesize so ~62 items split the extent tree past level 0.
+        alloc.set_nodesize(0x1000);
+        let bg_start = 0x100_0000_u64;
+        let bg_len = 0x40_0000_u64; // 4 MiB data block group
+        let bg_item = BtrfsBlockGroupItem {
+            total_bytes: bg_len,
+            used_bytes: 0,
+            flags: BTRFS_BLOCK_GROUP_DATA,
+        };
+        alloc.add_block_group(bg_start, bg_item);
+        alloc
+            .extent_tree_mut()
+            .insert(
+                BtrfsKey {
+                    objectid: bg_start,
+                    item_type: BTRFS_ITEM_BLOCK_GROUP_ITEM,
+                    offset: bg_len,
+                },
+                &bg_item.to_bytes(),
+            )
+            .expect("insert block group item");
+
+        // Insert 80 alternating 4 KiB data extents (leaving 4 KiB gaps between them)
+        // so the extent tree splits into multiple leaves (`root_level() >= 1`).
+        let extent_count = 80_u64;
+        for idx in 0..extent_count {
+            let bytenr = bg_start + idx * 0x2000;
+            alloc
+                .insert_data_extent_item(bytenr, 0x1000, 5, 256 + idx, 0, 13)
+                .expect("insert data extent");
+        }
+        assert!(
+            !alloc.extent_tree_root_is_leaf(),
+            "extent tree must have split past a single leaf (root_level={})",
+            alloc.extent_tree().root_level()
+        );
+
+        let (used_fused, free_fused) = alloc
+            .sync_accounting_and_free_space()
+            .expect("fused accounting on multi-leaf extent tree");
+        let free_two = alloc
+            .free_space_extents()
+            .expect("free_space_extents on multi-leaf extent tree");
+
+        assert_eq!(used_fused, extent_count * 0x1000);
+        assert_eq!(free_fused, free_two);
+        assert_eq!(free_fused.len(), 1);
+        // 79 inter-extent 4 KiB holes + 1 trailing free range = 80 free ranges.
+        assert_eq!(free_fused[0].free_ranges.len(), extent_count as usize);
+        let total_free: u64 = free_fused[0].free_ranges.iter().map(|&(_, len)| len).sum();
+        assert_eq!(total_free + used_fused, bg_len);
+    }
+
     /// One generated block group: (total in 16 KiB units, used fraction n/255,
     /// list of (offset_blocks, len_blocks) data extents).
     type FusedAccountingGroupSpec = (u64, u64, Vec<(u64, u64)>);
