@@ -1143,21 +1143,6 @@ impl Transaction {
                 } else {
                     let combined_proof = match (&previous.merge_proof, &staged.merge_proof) {
                         (
-                            MergeProof::IndependentKeys {
-                                touched_ranges: prev,
-                            },
-                            MergeProof::IndependentKeys {
-                                touched_ranges: next,
-                            },
-                        ) => {
-                            let mut combined = prev.clone();
-                            combined.extend(next.iter().copied());
-                            coalesce_byte_ranges(&mut combined);
-                            Some(MergeProof::IndependentKeys {
-                                touched_ranges: combined,
-                            })
-                        }
-                        (
                             MergeProof::NonOverlappingExtents {
                                 touched_ranges: prev,
                             },

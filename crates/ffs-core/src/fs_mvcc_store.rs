@@ -129,6 +129,7 @@ impl FsMvccStore {
     }
 
     /// The live store's effective conflict policy (resolving Adaptive).
+    #[cfg(test)]
     pub(super) fn effective_policy(&self) -> ffs_mvcc::ConflictPolicy {
         match self {
             Self::Single(lock) => lock.read().effective_policy(),
@@ -137,6 +138,7 @@ impl FsMvccStore {
     }
 
     /// Snapshot of current contention metrics.
+    #[cfg(test)]
     pub(super) fn contention_metrics(&self) -> ffs_mvcc::ContentionMetrics {
         match self {
             Self::Single(lock) => *lock.read().contention_metrics(),
@@ -1551,6 +1553,10 @@ mod commit_error_mapping_tests {
             TxnAbortReason::UserAbort,
             Some("test abort".to_owned()),
         );
+        assert_eq!(store.effective_policy(), store.conflict_policy());
+        let metrics = store.contention_metrics();
+        assert_eq!(metrics.total_commits, 1);
+        assert_eq!(metrics.total_aborts, 1);
 
         // Verify the ledger contents
         let content = std::fs::read_to_string(&ledger_path).expect("read ledger");
