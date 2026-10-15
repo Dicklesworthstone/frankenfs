@@ -16,7 +16,7 @@ use anyhow::{Context, Result, anyhow, bail};
 use asupersync::Cx;
 use ffs_block::ByteDevice;
 use ffs_error::FfsError;
-use ffs_ondisk::fat::FatKind;
+use ffs_ondisk::fat::{FatGeometry, FatKind};
 use ffs_types::ByteOffset;
 
 struct FileSource<'a> {
@@ -150,26 +150,34 @@ impl ByteDevice for EditSource<'_> {
     }
 }
 
-/// Allocation admission is separate from the structural checker: the latter
-/// intentionally permits dirty bits while checking an in-flight mutation.
+/// Revalidate the retained handle before any write. The structural checker
+/// intentionally permits dirty bits while checking an in-flight mutation and
+/// cannot substitute for boot geometry, reserved-state and FSInfo admission.
 fn validate_edit_state(cx: &Cx, volume: &FatVolume) -> Result<()> {
+    checkpoint(cx)?;
+    let mut boot = [0; 512];
+    volume.read_exact(cx, 0, &mut boot)?;
+    let geometry = FatGeometry::parse(&boot, volume.geometry.volume_bytes())
+        .map_err(|error| anyhow!("invalid FAT boot geometry before file edit: {error}"))?;
+    if geometry != volume.geometry {
+        bail!("FAT boot geometry changed since the volume was opened");
+    }
+    // Check FAT[0] against the media descriptor as well as all selected FAT[1]
+    // clean/error bits and the backup boot geometry, not merely allocation links.
+    volume.validate_admission(cx, &boot)?;
     validate_boot_state(cx, volume)?;
-    let width = volume.geometry.kind().entry_bytes() as usize;
-    let mask = match volume.geometry.kind() {
-        FatKind::Fat16 => 0xFFFF,
-        FatKind::Fat32 => 0x0FFF_FFFF,
-    };
-    for copy in volume.copies() {
-        let offset = volume
-            .geometry
-            .entry_offset(copy, 2)
-            .map_err(|error| anyhow!("{error}"))?
-            - width as u64;
-        let mut bytes = [0; 4];
-        volume.read_exact(cx, offset, &mut bytes[..width])?;
-        if u32::from_le_bytes(bytes) & mask != mask {
-            bail!("file edit requires clean, error-free reserved FAT state in copy {copy}");
+    if let Some(number) = volume.geometry.fs_info_sector() {
+        let offset = u64::from(number) * u64::from(volume.geometry.sector_bytes());
+        let mut info = [0; 512];
+        volume.read_exact(cx, offset, &mut info)?;
+        if info[..4] != 0x4161_5252_u32.to_le_bytes()
+            || info[484..488] != 0x6141_7272_u32.to_le_bytes()
+            || info[508..512] != 0xAA55_0000_u32.to_le_bytes()
+        {
+            bail!("invalid FSInfo signatures before file edit; image left unchanged");
         }
+        // Free counts and next-free hints are advisory; only the signatures
+        // required by set_hints are admission requirements.
     }
     Ok(())
 }
@@ -610,6 +618,58 @@ mod tests {
             assert!(result.is_err());
             assert_eq!(hash_device(&cx, volume.device.as_ref()).unwrap(), before);
         }
+    }
+
+    fn assert_refused_edits_preserve_image(cx: &Cx, volume: &FatVolume) {
+        let before = hash_device(cx, volume.device.as_ref()).unwrap();
+        assert!(truncate_in_volume(cx, volume, "/target.bin", 17, 1_700_000_000).is_err());
+        assert!(truncate_in_volume(cx, volume, "/target.bin", 65536, 1_700_000_000).is_err());
+        assert!(write_range_in_volume(cx, volume, "/target.bin", 0, b"x", 1_700_000_000).is_err());
+        assert_eq!(hash_device(cx, volume.device.as_ref()).unwrap(), before);
+    }
+
+    #[test]
+    fn retained_fat16_handle_revalidates_media_and_all_reserved_entries() {
+        for corrupt_media in [false, true] {
+            let (_directory, volume) = edit_fixture("fat16");
+            let cx = Cx::for_testing();
+            if corrupt_media {
+                // A valid but different media byte must agree with FAT[0].
+                let mut original = [0];
+                volume.read_exact(&cx, 21, &mut original).unwrap();
+                let media = if original[0] == 0xF0 { 0xF8 } else { 0xF0 };
+                write_volume(&cx, &volume, 21, &[media]).unwrap();
+            } else {
+                let copy = volume.copies().last().unwrap();
+                let offset = volume.geometry.entry_offset(copy, 2).unwrap() - 4;
+                write_volume(&cx, &volume, offset, &0_u16.to_le_bytes()).unwrap();
+            }
+            assert_refused_edits_preserve_image(&cx, &volume);
+        }
+    }
+
+    #[test]
+    fn retained_fat16_handle_refuses_changed_but_parseable_boot_geometry() {
+        let (_directory, volume) = edit_fixture("fat16");
+        let cx = Cx::for_testing();
+        let mut boot = [0; 512];
+        volume.read_exact(&cx, 0, &mut boot).unwrap();
+        let reserved = u16::from_le_bytes([boot[14], boot[15]]);
+        boot[14..16].copy_from_slice(&(reserved + 1).to_le_bytes());
+        let changed = FatGeometry::parse(&boot, volume.geometry.volume_bytes()).unwrap();
+        assert_ne!(changed, volume.geometry);
+        write_volume(&cx, &volume, 0, &boot).unwrap();
+        assert_refused_edits_preserve_image(&cx, &volume);
+    }
+
+    #[test]
+    fn malformed_fsinfo_is_refused_before_dirty_publication() {
+        let (_directory, volume) = edit_fixture("fat32");
+        let cx = Cx::for_testing();
+        let sector = volume.geometry.fs_info_sector().unwrap();
+        let offset = u64::from(sector) * u64::from(volume.geometry.sector_bytes());
+        write_volume(&cx, &volume, offset, &[0; 4]).unwrap();
+        assert_refused_edits_preserve_image(&cx, &volume);
     }
 
     #[test]
