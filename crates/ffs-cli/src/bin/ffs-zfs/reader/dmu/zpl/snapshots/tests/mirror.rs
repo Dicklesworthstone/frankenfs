@@ -265,3 +265,62 @@ fn scrub_snapshot_cancellation_is_terminal_before_mirror_fallback() {
     assert_eq!(count(&reads[1], OLD_LAST), 0);
     assert_eq!(count(&reads[0], LIVE_FIRST), 0);
 }
+
+#[test]
+fn followed_links_keep_mirrored_snapshot_identity_after_owner_drop_and_head_reads() {
+    use crate::reader::dmu::zpl::PathPolicy;
+
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        for case in [0, 21] {
+            let (source, reads) = mirror_pool(order, case, [Fault::None; 2]);
+            let mut objects = source.objects(&cx, 0, 2, 123).unwrap();
+            let mut head = objects.zpl(&cx, &[]).unwrap();
+            let mut before = objects.zpl_snapshot(&cx, &[], b"before").unwrap();
+            drop(objects);
+            drop(source);
+            let head_file = head.resolve_with(&cx, b"/link", PathPolicy::Follow).unwrap();
+            assert_eq!(head.read(&cx, head_file, 0, 8).unwrap(), b"EEEEEEEE");
+            let head_reads = [count(&reads[0], LIVE_FIRST), count(&reads[1], LIVE_FIRST)];
+            for _ in 0..2 {
+                let old_file = before.resolve_with(&cx, b"/./link", PathPolicy::Follow).unwrap();
+                assert_eq!(old_file, 3);
+                assert_eq!(before.read(&cx, old_file, 0, 4096).unwrap(), old_bytes());
+                let link = before.resolve_with(&cx, b"/link", PathPolicy::NoFollowFinal).unwrap();
+                assert_eq!(link, 4);
+                assert_eq!(before.readlink(&cx, link).unwrap(), b"file");
+                assert!(matches!(before.resolve_with(&cx, b"/link/", PathPolicy::Follow),
+                    Err(FfsError::NotDirectory)));
+                assert_eq!(before.view_txg(), 20);
+                assert_eq!([count(&reads[0], LIVE_FIRST), count(&reads[1], LIVE_FIRST)], head_reads);
+            }
+            assert!(count(&reads[1], OLD_INDIRECT) > 0);
+        }
+    }
+}
+
+#[test]
+fn followed_historical_file_errors_do_not_reopen_a_healthy_live_head() {
+    use crate::reader::dmu::zpl::PathPolicy;
+
+    let cx = Cx::for_testing();
+    for faults in [
+        [Fault::Io(BASE as u64 + OLD_LAST); 2],
+        [Fault::Cancel(BASE as u64 + OLD_LAST), Fault::None],
+    ] {
+        let (source, reads) = mirror_pool(Endian::Little, 0, faults);
+        let mut objects = source.objects(&cx, 0, 2, 123).unwrap();
+        let mut before = objects.zpl_snapshot(&cx, &[], b"before").unwrap();
+        let file = before.resolve_with(&cx, b"/link", PathPolicy::Follow).unwrap();
+        let result = before.read(&cx, file, 0, 2049);
+        if matches!(faults[0], Fault::Cancel(_)) {
+            assert!(matches!(result, Err(FfsError::Cancelled)));
+            assert_eq!(count(&reads[1], OLD_LAST), 0);
+        } else {
+            assert!(result.is_err());
+            assert_eq!(count(&reads[1], OLD_LAST), 1);
+        }
+        assert_eq!(count(&reads[0], LIVE_FIRST), 0);
+        assert_eq!(count(&reads[1], LIVE_FIRST), 0);
+    }
+}
