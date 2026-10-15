@@ -5,6 +5,7 @@
 //! This is read-only extraction, without degraded import, DTL recovery or healing.
 
 mod gang;
+mod import;
 pub(super) mod raidz;
 
 use super::{
@@ -378,58 +379,6 @@ impl Pool {
             raidz: None,
             config,
         })
-    }
-
-    /// Automatically import the active uberblock (highest verified TXG, tie-broken
-    /// by timestamp) across all 4 labels and all supplied members.
-    pub fn import_active(
-        &self,
-        cx: &Cx,
-        expected_pool_guid: Option<u64>,
-    ) -> Result<(usize, usize, RootBlock)> {
-        checkpoint(cx)?;
-        if let Some(leaf) = self.standalone_leaf() {
-            return leaf.import_active(cx, expected_pool_guid);
-        }
-        let first_label = self.members[0].label(cx, 0)?;
-        let pool_guid = integer(&first_label.config, "pool_guid")?;
-        if let Some(expected) = expected_pool_guid
-            && expected != pool_guid
-        {
-            return Err(corrupt("label belongs to another pool GUID"));
-        }
-        let mut candidates = Vec::new();
-        for label_index in 0..4 {
-            checkpoint(cx)?;
-            let label = self.members[0].label(cx, label_index)?;
-            let ring_slots = super::UBERBLOCK_RING_BYTES / label.slot_bytes;
-            for slot in 0..ring_slots {
-                checkpoint(cx)?;
-                if let Ok(ub) = self.members[0].uberblock(cx, &label, slot) {
-                    candidates.push((label_index, slot, ub));
-                }
-            }
-        }
-        if candidates.is_empty() {
-            return Err(corrupt("no valid active ZFS uberblock candidates in ring"));
-        }
-        candidates.sort_by(|a, b| {
-            b.2.txg
-                .cmp(&a.2.txg)
-                .then_with(|| b.2.timestamp.cmp(&a.2.timestamp))
-                .then_with(|| a.0.cmp(&b.0))
-                .then_with(|| a.1.cmp(&b.1))
-        });
-        let mut last_err = None;
-        for (label_index, slot, _) in candidates {
-            checkpoint(cx)?;
-            match self.root_with_mode(cx, label_index, slot, pool_guid, true) {
-                Ok(root) => return Ok((label_index, slot, root)),
-                Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
-                Err(err) => last_err = Some(err),
-            }
-        }
-        Err(last_err.unwrap_or_else(|| corrupt("all ZFS active uberblock candidates failed")))
     }
 
     pub(super) fn read_block(
