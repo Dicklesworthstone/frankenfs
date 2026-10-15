@@ -1,6 +1,7 @@
 //! ZPL path commands; host paths are never resolved from native directory data.
 
 mod zil;
+mod zvol;
 
 use super::{CandidateArgs, Context, Cx, Result, bail, json};
 use super::reader::dmu::zpl::PathPolicy;
@@ -32,6 +33,8 @@ pub struct FileArgs {
 pub enum FileCommand {
     #[command(flatten)]
     Zil(zil::Command),
+    #[command(flatten)]
+    Zvol(zvol::Command),
     /// Verify one dataset's allocated DMU blocks without writing or healing.
     Scrub {
         #[command(flatten)]
@@ -170,6 +173,7 @@ impl FileCommand {
     pub(super) fn run(self, cx: &Cx) -> Result<()> {
         let (file, output) = match self {
             Self::Zil(command) => return command.run(cx),
+            Self::Zvol(command) => return command.run(cx),
             Self::Scrub {
                 candidate,
                 dataset,

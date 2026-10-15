@@ -436,3 +436,5 @@ fn readonly_device_sync_and_rejected_writes_never_touch_the_pool() {
     assert_eq!(first.as_slice(), &expected(true, 16384)[4050..4100]);
     assert_eq!(rest, [0; 70]);
 }
+
+mod redundancy;
