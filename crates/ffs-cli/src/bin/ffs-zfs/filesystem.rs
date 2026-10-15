@@ -671,26 +671,15 @@ impl FsOps for ZfsFs {
         offset: u64,
         whence: SeekWhence,
     ) -> Result<u64> {
+        checkpoint(cx)?;
         if ino == ZFS_CTL_INO || ino == ZFS_SNAPDIR_INO {
             return Err(unsupported("ZPL seek requires a regular file"));
         }
         let mut state = self.state(cx)?;
-        let (metadata, _) = state.view_for_ino(cx, ino)?.metadata(cx, ino)?;
-        if metadata.kind != Kind::Regular {
-            return Err(unsupported("ZPL seek requires a regular file"));
-        }
-        if offset >= metadata.size {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::ENXIO)));
-        }
-        // A conservative legal sparse-file projection. Compressed allocation
-        // and embedded payload boundaries do not define logical file holes.
-        match whence {
-            SeekWhence::Data => Ok(offset),
-            SeekWhence::Hole => Ok(metadata.size),
-            _ => Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                libc::EINVAL,
-            ))),
-        }
+        let view_state = state.view_for_ino(cx, ino)?;
+        view_state.metadata(cx, ino)?;
+        let object = view_state.nodes[&ino].object;
+        view_state.view.seek(cx, object, offset, whence)
     }
 }
 

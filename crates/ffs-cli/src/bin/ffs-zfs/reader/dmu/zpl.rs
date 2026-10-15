@@ -1,6 +1,7 @@
 //! Read-only ZPL namespace and file bytes at an explicitly selected head root.
 //! No host-path resolution, symlink following, log replay, mutation or mounting.
 
+mod seek;
 pub mod snapshots;
 mod xattrs;
 
