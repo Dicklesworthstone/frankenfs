@@ -6,7 +6,7 @@ use std::os::unix::fs::FileExt;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
-fn fixture(kind: &str) -> (tempfile::TempDir, ImageArgs, FatGeometry) {
+pub(super) fn fixture(kind: &str) -> (tempfile::TempDir, ImageArgs, FatGeometry) {
     let directory = tempfile::tempdir().unwrap();
     let image = directory.path().join("diagnostic.fat");
     let cli = crate::Cli::try_parse_from([
@@ -26,19 +26,19 @@ fn fixture(kind: &str) -> (tempfile::TempDir, ImageArgs, FatGeometry) {
     (directory, args, geometry)
 }
 
-fn patch(args: &ImageArgs, at: u64, bytes: &[u8]) {
+pub(super) fn patch(args: &ImageArgs, at: u64, bytes: &[u8]) {
     let file = OpenOptions::new().write(true).open(&args.image).unwrap();
     file.write_all_at(bytes, args.offset + at).unwrap();
 }
 
-fn fat(args: &ImageArgs, geometry: &FatGeometry, copy: u8, cluster: u32, raw: u32) {
+pub(super) fn fat(args: &ImageArgs, geometry: &FatGeometry, copy: u8, cluster: u32, raw: u32) {
     let width = geometry.kind().entry_bytes() as usize;
     let at = geometry.entry_offset(copy, cluster.max(2)).unwrap()
         - u64::from(2_u32.saturating_sub(cluster)) * width as u64;
     patch(args, at, &raw.to_le_bytes()[..width]);
 }
 
-fn mark_dirty(args: &ImageArgs, geometry: &FatGeometry) {
+pub(super) fn mark_dirty(args: &ImageArgs, geometry: &FatGeometry) {
     let (at, value) = match geometry.kind() {
         FatKind::Fat16 => (37, 0x7FFF),
         FatKind::Fat32 => (65, 0x07FF_FFFF),
@@ -87,13 +87,13 @@ fn dirty_lost_allocation_is_reported_but_mirror_ambiguity_has_no_orphan_authorit
     let report = check(&cx, &args).unwrap();
     assert!(report.complete && report.namespace_complete);
     assert_eq!(report.lost_clusters, Some(2));
-    assert!(has(&report, "lost_chain") && has(&report, "native_fat_dirty"));
+    assert!(has(&report, "lost_allocation") && has(&report, "native_fat_dirty"));
     assert_eq!(fs::read(&args.image).unwrap(), before);
     fat(&args, &geometry, 1, 10, 0);
     let report = check(&cx, &args).unwrap();
     assert!(!report.namespace_complete);
     assert_eq!(report.lost_clusters, None);
-    assert!(has(&report, "fat_copy_mismatch"));
+    assert!(has(&report, "fat_copies_disagree"));
 }
 
 #[test]

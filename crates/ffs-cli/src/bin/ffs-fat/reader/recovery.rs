@@ -4,6 +4,9 @@
 //! dirty bit, or synchronizes the backing. An unadmitted volume stays private to
 //! this module; its findings cannot turn into a mounted read or write capability.
 
+mod repair;
+pub use repair::{RecoverArgs, run};
+
 use super::check::{CheckIssue, FatCheckReport};
 use super::{FatGeometry, FatKind, FatVolume, ImageArgs, ReadOnlyImage, checkpoint, corrupt};
 use anyhow::{Context, Result, bail};

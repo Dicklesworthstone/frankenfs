@@ -239,6 +239,12 @@ fn extract_slots(
 
 #[derive(Debug, Subcommand)]
 enum Command {
+    /// Repair verified lost allocation, FSInfo hints and native dirty state offline.
+    /// Does not restore interrupted file contents; keep a separate copy first.
+    Recover {
+        #[command(flatten)]
+        options: reader::recovery::RecoverArgs,
+    },
     /// Replace an existing regular file using initialized, separately allocated clusters.
     /// Requires exclusive offline ownership; --dry-run performs only preflight reads.
     Replace {
@@ -349,6 +355,13 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let cx = Cx::for_request();
     match cli.command {
+        Command::Recover { options } => {
+            let report = reader::recovery::run(&cx, &options)?;
+            let mut output = io::stdout().lock();
+            serde_json::to_writer_pretty(&mut output, &report)
+                .context("FAT recovery completed; writing its report failed")?;
+            writeln!(output).context("FAT recovery completed; finishing its report failed")?;
+        }
         Command::Replace { options } => {
             let report = reader::replacement::run(&cx, &options)?;
             let mut output = io::stdout().lock();
@@ -439,7 +452,7 @@ fn main() -> Result<()> {
                 .resolve(&cx, &path)?
                 .map_or(Ok(Directory::Root), |entry| entry.directory())?;
             let entries = volume.list(&cx, directory)?;
-            let mut report = Vec::new();
+            let mut report = Vec::with_capacity(entries.len());
             for entry in entries {
                 report.push(serde_json::json!({
                     "name": entry.name()?,
