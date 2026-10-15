@@ -1,6 +1,7 @@
 //! Read DMU objects under one explicitly selected, verified MOS root.
 //! No automatic import/TXG selection, writes, replay, or ZPL file-size guesses.
 
+pub mod scrub;
 mod zap;
 pub mod zpl;
 
