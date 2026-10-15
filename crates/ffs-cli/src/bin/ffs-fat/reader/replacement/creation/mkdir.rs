@@ -469,21 +469,62 @@ fn find_entry_slots(
     Ok((short_slot, lfn_slots))
 }
 
+/// Set only the native deletion marker. Retaining the original cluster,
+/// size, timestamps and LFN payload avoids gratuitously destroying recovery
+/// evidence; it does not make undelete or crash recovery part of this writer.
+fn retired_slot(slot: &Slot) -> [u8; 32] {
+    let mut bytes = slot.bytes;
+    bytes[0] = 0xE5;
+    bytes
+}
+
+fn verify_retired_slot(
+    cx: &Cx,
+    volume: &super::super::super::FatVolume,
+    slot: &Slot,
+) -> Result<()> {
+    if read_slot(cx, volume, slot.offset, false)?.bytes != retired_slot(slot) {
+        bail!(
+            "native namespace retirement readback failed at {}; allocation retained; image may be dirty and require recovery",
+            slot.offset
+        );
+    }
+    Ok(())
+}
+
 fn delete_entry_slots(
     cx: &Cx,
     volume: &super::super::super::FatVolume,
     short_slot: &Slot,
     lfn_slots: &[Slot],
 ) -> Result<()> {
-    let deleted = deleted_slot();
-    patch_slot(cx, volume, short_slot.offset, &short_slot.bytes, &deleted)?;
+    // Validate the complete captured name set before retiring any of it.
+    validate_entry_slots(cx, volume, short_slot, lfn_slots)?;
+    patch_slot(
+        cx,
+        volume,
+        short_slot.offset,
+        &short_slot.bytes,
+        &retired_slot(short_slot),
+    )?;
     volume.device.sync(cx)?;
+    verify_retired_slot(cx, volume, short_slot)?;
+
+    // A verified durable short-entry tombstone must precede LFN retirement.
+    // Otherwise a lost acknowledged SFN write could expose its live alias
+    // after its long name is deleted, or point at subsequently freed clusters.
     for slot in lfn_slots {
-        patch_slot(cx, volume, slot.offset, &slot.bytes, &deleted)?;
+        patch_slot(cx, volume, slot.offset, &slot.bytes, &retired_slot(slot))?;
     }
     if !lfn_slots.is_empty() {
         volume.device.sync(cx)?;
     }
+    // Recheck the short entry too: SFN/LFN slots can share a physical sector.
+    // Callers may reclaim allocation only after this complete readback gate.
+    for slot in std::iter::once(short_slot).chain(lfn_slots) {
+        verify_retired_slot(cx, volume, slot)?;
+    }
+    checkpoint(cx)?;
     Ok(())
 }
 
@@ -549,6 +590,8 @@ pub fn unlink_in_volume(
         "released_clusters": release.len(),
         "free_clusters_after": free_after,
     });
+    validate_entry_slots(cx, volume, &short_slot, &lfn_slots)?;
+    checkpoint(cx)?;
     if dry_run {
         return Ok(report);
     }
@@ -644,6 +687,8 @@ pub fn rmdir_in_volume(
         "released_clusters": release.len(),
         "free_clusters_after": free_after,
     });
+    validate_entry_slots(cx, volume, &short_slot, &lfn_slots)?;
+    checkpoint(cx)?;
     if dry_run {
         return Ok(report);
     }
@@ -1012,9 +1057,6 @@ pub fn rename_in_volume(
 
         phase = "retiring source namespace";
         delete_entry_slots(cx, volume, &src_short, &src_lfn)?;
-        if read_slot(cx, volume, src_short.offset, false)?.bytes != deleted_slot() {
-            bail!("rename source retirement failed native readback");
-        }
         phase = "releasing replaced destination allocation";
         if !target.release().is_empty() {
             change_fat(cx, volume, &target.release().iter()

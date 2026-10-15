@@ -495,3 +495,231 @@ fn rename_fault_boundaries_never_reclaim_a_still_live_destination() {
         }
     }
 }
+
+/// Model an acknowledged write that loses a selected native tombstone. Reads
+/// continue to return the actual device state, rather than the intended bytes.
+struct LostRetirement {
+    device: Device,
+    slot: u64,
+    dropped: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl ByteDevice for LostRetirement {
+    fn len_bytes(&self) -> u64 {
+        self.device.len_bytes()
+    }
+
+    fn read_exact_at(
+        &self,
+        cx: &Cx,
+        offset: ByteOffset,
+        bytes: &mut [u8],
+    ) -> ffs_error::Result<()> {
+        self.device.read_exact_at(cx, offset, bytes)
+    }
+
+    fn write_all_at(
+        &self,
+        cx: &Cx,
+        offset: ByteOffset,
+        bytes: &[u8],
+    ) -> ffs_error::Result<()> {
+        checkpoint(cx)?;
+        if let Some(relative) = self.slot.checked_sub(offset.0)
+            && relative < bytes.len() as u64
+            && bytes[relative as usize] == 0xE5
+        {
+            self.dropped.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            return Ok(());
+        }
+        self.device.write_all_at(cx, offset, bytes)
+    }
+
+    fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+        self.device.sync(cx)
+    }
+}
+
+fn retirement_fixture(kind: FatKind, sector: u32, directory: bool) -> (Image, String) {
+    let image = Image::new(kind, sector, kind == FatKind::Fat32);
+    let path = if directory {
+        let path = "/Empty long directory";
+        mkdir::mkdir_in_volume(&Cx::for_testing(), &image.volume(), path, NOW, false).unwrap();
+        path.to_owned()
+    } else {
+        rename_target(&image, "Retired long file.bin");
+        "/Retired long file.bin".to_owned()
+    };
+    image.device.state.lock().unwrap().operations = 0;
+    (image, path)
+}
+
+fn retire(
+    cx: &Cx,
+    volume: &FatVolume,
+    path: &str,
+    operation: &str,
+    dry_run: bool,
+) -> anyhow::Result<serde_json::Value> {
+    match operation {
+        "unlink" => mkdir::unlink_in_volume(cx, volume, path, dry_run),
+        "rmdir" => mkdir::rmdir_in_volume(cx, volume, path, dry_run),
+        "rename" => mkdir::rename_in_volume(cx, volume, path, "/KEEP.BIN", dry_run),
+        _ => panic!("unknown retirement test operation"),
+    }
+}
+
+#[test]
+fn retirement_preserves_native_metadata_and_reclaims_only_after_verified_deletion() {
+    let cx = Cx::for_testing();
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        for sector in [512, 4096] {
+            for operation in ["unlink", "rmdir"] {
+                let (image, path) = retirement_fixture(kind, sector, operation == "rmdir");
+                let volume = image.volume();
+                let entry = volume.resolve(&cx, &path).unwrap().unwrap();
+                let long_count = entry.native.long_name.as_ref().unwrap().len().div_ceil(13);
+                let start = image.base + entry.offset - long_count as u64 * 32;
+                let before_slots = image.bytes(start, (long_count + 1) * 32);
+                let before = volume.check(&cx).unwrap();
+                let dry = retire(&cx, &volume, &path, operation, true).unwrap();
+                assert_eq!(image.device.state.lock().unwrap().operations, 0);
+                assert_eq!(image.bytes(start, before_slots.len()), before_slots);
+                let result = retire(&cx, &volume, &path, operation, false).unwrap();
+                assert_eq!(dry["free_clusters_after"], result["free_clusters_after"]);
+                for (index, original) in before_slots.chunks_exact(32).enumerate() {
+                    let actual = image.bytes(start + index as u64 * 32, 32);
+                    assert_eq!(actual[0], 0xE5);
+                    assert_eq!(&actual[1..], &original[1..]);
+                }
+                assert!(matches!(volume.resolve(&cx, &path), Err(FfsError::NotFound(_))));
+                let after = volume.check(&cx).unwrap();
+                assert!(after.clean && after.complete && after.namespace_complete);
+                assert_eq!(after.free_clusters, before.free_clusters + 1);
+                assert_eq!(after.files, before.files - u64::from(operation == "unlink"));
+                assert_eq!(after.directories, before.directories - u64::from(operation == "rmdir"));
+                image.guards();
+            }
+        }
+    }
+}
+
+#[test]
+fn retirement_lost_acknowledged_short_and_long_writes_never_release_allocation() {
+    let cx = Cx::for_testing();
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        for sector in [512, 4096] {
+            for operation in ["unlink", "rmdir", "rename"] {
+                for lose_short in [true, false] {
+                    let (image, path) = retirement_fixture(kind, sector, operation == "rmdir");
+                    let ordinary = image.volume();
+                    let entry = ordinary.resolve(&cx, &path).unwrap().unwrap();
+                    let long_count = entry.native.long_name.as_ref().unwrap().len().div_ceil(13);
+                    let first_long = image.base + entry.offset - long_count as u64 * 32;
+                    let slot = if lose_short { image.base + entry.offset } else { first_long };
+                    let snapshot = image.device.state.lock().unwrap().clone();
+                    let dropped = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+                    let volume = FatVolume::from_device(
+                        &cx,
+                        Box::new(LostRetirement {
+                            device: image.device.clone(),
+                            slot,
+                            dropped: Arc::clone(&dropped),
+                        }),
+                        image.base,
+                        image.geometry.volume_bytes(),
+                    ).unwrap();
+                    let error = retire(&cx, &volume, &path, operation, false).unwrap_err();
+                    assert!(format!("{error:#}").contains("retirement readback failed"), "{error:#}");
+                    assert!(dropped.load(std::sync::atomic::Ordering::SeqCst) > 0);
+                    assert!(validate_boot_state(&cx, &ordinary).is_err());
+                    let width = kind.entry_bytes() as usize;
+                    for cluster in [entry.native.first_cluster, 5] {
+                        for copy in 0..2 {
+                            let at = image.base + image.geometry.entry_offset(copy, cluster).unwrap();
+                            let mut old = vec![0; width];
+                            snapshot.read(at, &mut old);
+                            assert_eq!(image.bytes(at, width), old,
+                                "{operation} released a chain after a lost tombstone write");
+                        }
+                    }
+                    if lose_short {
+                        let mut old = [0; 32];
+                        snapshot.read(image.base + entry.offset, &mut old);
+                        assert_eq!(image.bytes(image.base + entry.offset, 32), old);
+                        let mut original_lfn = vec![0; long_count * 32];
+                        snapshot.read(first_long, &mut original_lfn);
+                        assert_eq!(image.bytes(first_long, original_lfn.len()), original_lfn,
+                            "long names must survive an unverified short-entry deletion");
+                    } else {
+                        assert_eq!(image.bytes(image.base + entry.offset, 1), [0xE5]);
+                    }
+                    image.guards();
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn retirement_write_and_flush_cuts_never_leave_live_entries_in_free_clusters() {
+    let cx = Cx::for_testing();
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        for operation in ["unlink", "rmdir"] {
+            let (control, path) = retirement_fixture(kind, 512, operation == "rmdir");
+            retire(&cx, &control.volume(), &path, operation, false).unwrap();
+            let operations = control.device.state.lock().unwrap().operations;
+            for fail in 1..=operations {
+                for tear in [0, 1, 31, 511] {
+                    let (image, path) = retirement_fixture(kind, 512, operation == "rmdir");
+                    let volume = image.volume();
+                    let entry = volume.resolve(&cx, &path).unwrap().unwrap();
+                    {
+                        let mut state = image.device.state.lock().unwrap();
+                        state.fail = Some(fail);
+                        state.tear = tear;
+                    }
+                    assert!(retire(&cx, &volume, &path, operation, false).is_err());
+                    let state = image.device.state.lock().unwrap().clone();
+                    for retain_pending in [false, true] {
+                        let mut crashed = state.clone();
+                        if retain_pending { crashed.persist(); } else { crashed.pending.clear(); }
+                        let mut short = [0; 32];
+                        crashed.read(image.base + entry.offset, &mut short);
+                        if short[0] != 0xE5 && short[0] != 0 {
+                            let cluster = raw_cluster(kind, &short);
+                            assert_eq!(cluster, entry.native.first_cluster);
+                            for copy in volume.copies() {
+                                let mut fat = [0; 4];
+                                let width = kind.entry_bytes() as usize;
+                                let at = image.base + image.geometry.entry_offset(copy, cluster).unwrap();
+                                crashed.read(at, &mut fat[..width]);
+                                assert_eq!(kind.decode_entry(u32::from_le_bytes(fat)), FatEntry::End,
+                                    "{operation} left a live entry on free storage: {kind:?}, fail={fail}, tear={tear}");
+                            }
+                        }
+                    }
+                    image.guards();
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn retirement_cancelled_requests_preserve_all_namespace_and_allocation_bytes() {
+    for kind in [FatKind::Fat16, FatKind::Fat32] {
+        for operation in ["unlink", "rmdir", "rename"] {
+            let (image, path) = retirement_fixture(kind, 512, operation == "rmdir");
+            let volume = image.volume();
+            let before = image.device.state.lock().unwrap().clone();
+            let cx = Cx::for_testing();
+            cx.cancel_with(asupersync::types::CancelKind::User, Some("cancel removal before mutation"));
+            assert!(retire(&cx, &volume, &path, operation, false).is_err());
+            let after = image.device.state.lock().unwrap();
+            assert_eq!(after.operations, 0);
+            assert_eq!(after.durable, before.durable);
+            assert_eq!(after.pending, before.pending);
+        }
+    }
+}
