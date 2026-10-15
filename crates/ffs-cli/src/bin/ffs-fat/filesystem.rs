@@ -824,6 +824,36 @@ impl FsOps for FatFs {
         operation.complete(written)
     }
 
+    fn copy_file_range(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino_in: InodeNumber,
+        offset_in: u64,
+        ino_out: InodeNumber,
+        offset_out: u64,
+        len: u64,
+    ) -> Result<u64> {
+        // Pin both native identities and their allocation for the WHOLE copy,
+        // including preflight and cache publication. Do not recursively call
+        // FsOps::read/write while this exclusive operation gate is held.
+        let operation = self.operation(cx, true)?;
+        if len == 0 {
+            return operation.complete(0);
+        }
+        self.ensure_writable()?;
+        let from = self.path_for_inode(ino_in)?;
+        let to = self.path_for_inode(ino_out)?;
+        let copied = self.volume.copy_range(
+            cx, &from, offset_in, &to, offset_out, len, now_unix_secs(),
+        ).map_err(map_mutation_error)?;
+        if copied != 0 {
+            self.refresh_node_from_path(cx, ino_out, &to)?;
+        }
+        checkpoint(cx)?;
+        operation.complete(copied)
+    }
+
     fn setattr(
         &self,
         cx: &Cx,
@@ -1182,6 +1212,7 @@ mod preallocation_tests;
 mod tests {
     use super::*;
 
+    mod copy;
     mod operations;
 
     #[test]

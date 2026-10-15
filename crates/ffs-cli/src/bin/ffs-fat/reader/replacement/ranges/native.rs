@@ -5,6 +5,7 @@
 //! data in place. A failed or interrupted operation can leave a partial overwrite
 //! or leaked allocation and requires checking/recovery; it is not crash-atomic.
 
+mod copy;
 mod zero;
 
 use super::super::super::{Entry, FatTable, FatVolume, FileChain, MAX_CHAIN_CLUSTERS};
