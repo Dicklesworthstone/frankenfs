@@ -865,10 +865,16 @@ impl ByteDevice for SliceSource<'_> {
 
 pub fn open_volume(cx: &Cx, args: &ImageArgs, writable: bool) -> Result<FatVolume> {
     if let Some(sidecar) = &args.sidecar {
-        let inner = ffs_repair::sidecar::live::SidecarImageDevice::open(cx, &args.image, sidecar)
-            .with_context(|| {
-            format!("admitting FAT image and sidecar {}", sidecar.display())
-        })?;
+        // Blocking caller writes in SidecarDevice alone does not prevent the
+        // underlying protected reader from repairing the image during a read.
+        // Strict read-only operations and dry runs must remove that authority
+        // at the owning device, before native admission performs its first read.
+        let inner = if writable {
+            ffs_repair::sidecar::live::SidecarImageDevice::open(cx, &args.image, sidecar)
+        } else {
+            ffs_repair::sidecar::live::SidecarImageDevice::open_read_only(cx, &args.image, sidecar)
+        }
+        .with_context(|| format!("admitting FAT image and sidecar {}", sidecar.display()))?;
         let len = inner.len_bytes();
         return Ok(FatVolume::from_device(
             cx,
@@ -932,4 +938,6 @@ pub fn replace_in_volume(
 companion_bin_tests! {
     #[cfg(test)]
     mod tests;
+    #[cfg(test)]
+    mod read_only_tests;
 }
