@@ -19,13 +19,14 @@ fn first_page(restart: &Restart) -> Result<u64> {
         .ok_or_else(|| corrupt(0, "$LogFile reserved-page extent overflow"))
 }
 
-/// Reconstruct the client bytes at the restart area's current LSN. The first
+/// Reconstruct the client bytes at the requested record's LSN. The first
 /// page and LFS header have already been validated by the caller. Every further
 /// page is independently read, USA-validated, and checked for record completion.
 pub(super) fn read(
     cx: &Cx,
     restart: &Restart,
     stream_length: u64,
+    lsn: u64,
     mut page_vbo: u64,
     mut page: RecordPage,
     read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
@@ -46,7 +47,7 @@ pub(super) fn read(
     {
         return Err(corrupt(page_vbo, "invalid $LogFile continuation geometry"));
     }
-    let record_off = lsn_page_offset(restart.current_lsn, restart.log_page)?;
+    let record_off = lsn_page_offset(lsn, restart.log_page)?;
     let mut offset = record_off
         .checked_add(usize::from(restart.record_header_len))
         .filter(|end| *end <= page_size)
@@ -69,15 +70,10 @@ pub(super) fn read(
         1 + (length.saturating_sub(first_capacity) as u64).div_ceil(continuation_bytes as u64);
     let ring_pages = (restart.file_size - first) / page_bytes;
     if pages > ring_pages {
-        return Err(corrupt(
-            page_vbo,
-            "$LogFile client record would revisit its first page",
-        ));
+        return Err(corrupt(page_vbo, "$LogFile client record would revisit its first page"));
     }
     if pages > MAX_CLIENT_PAGES {
-        return Err(unsupported(
-            "$LogFile client record exceeds the 4096-page read budget",
-        ));
+        return Err(unsupported("$LogFile client record exceeds the 4096-page read budget"));
     }
     // Check capacity before allocating. A hostile length must not turn journal
     // inspection into an unbounded allocation, read loop, or repeated ring walk.
@@ -91,7 +87,7 @@ pub(super) fn read(
         let last_end_lsn = u64_at(&page.bytes, 32)?;
         let page_flags = u32_at(&page.bytes, 16)?;
         let final_page = index + 1 == pages;
-        if last_lsn < restart.current_lsn || last_end_lsn > last_lsn {
+        if last_lsn < lsn || last_end_lsn > last_lsn {
             return Err(corrupt(
                 page_vbo,
                 "$LogFile continuation has stale or inconsistent LSNs",
@@ -99,7 +95,7 @@ pub(super) fn read(
         }
         if final_page {
             if page_flags & PAGE_RECORD_END == 0
-                || last_end_lsn < restart.current_lsn
+                || last_end_lsn < lsn
                 || (page.next_record_off != 0 && end > usize::from(page.next_record_off))
             {
                 return Err(corrupt(
@@ -107,7 +103,7 @@ pub(super) fn read(
                     "$LogFile client record has no valid page ending",
                 ));
             }
-        } else if last_end_lsn >= restart.current_lsn {
+        } else if last_end_lsn >= lsn {
             return Err(corrupt(
                 page_vbo,
                 "$LogFile client record ends before its declared length",
@@ -183,7 +179,7 @@ mod tests {
             data_off: 64,
             active_client_seq: Some(9),
             active_client_oldest_lsn: Some(lsn),
-            active_client_restart_lsn: Some(lsn),
+            active_client_restart_lsn: None,
             area: Vec::new(),
         };
         let mut expected: Vec<u8> = (0..length).map(|i| (i % 251) as u8).collect();
@@ -255,6 +251,7 @@ mod tests {
             &cx,
             &fixture.restart,
             LOG,
+            fixture.restart.current_lsn,
             fixture.first_vbo,
             page,
             &mut |vbo, size| {
@@ -358,6 +355,7 @@ mod tests {
                 &cx,
                 &fixture.restart,
                 LOG,
+                fixture.restart.current_lsn,
                 fixture.first_vbo,
                 first,
                 &mut |vbo, _| { Ok(fixture.pages[&vbo][..PAGE - 1].to_vec()) },
@@ -385,6 +383,7 @@ mod tests {
                 &cx,
                 &fixture.restart,
                 LOG,
+                fixture.restart.current_lsn,
                 fixture.first_vbo,
                 page,
                 &mut |_, _| panic!("budget rejection must precede continuation I/O"),

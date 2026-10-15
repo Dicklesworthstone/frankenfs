@@ -1,11 +1,12 @@
-//! Bounded decoding of the current native NTFS $LogFile record.
+//! Bounded native NTFS $LogFile record and checkpoint preflight.
 //!
 //! This is the first read-only recovery primitive after restart-area admission.
 //! It validates the record page's update-sequence protection and the native LFS
-//! record envelope, then decodes enough NTFS client metadata to identify the
-//! redo/undo vocabulary. It deliberately does not apply any operation.
+//! record envelope, then follows retained transaction and checkpoint references.
+//! Decoding and preflight do not apply operations or establish replay readiness.
 
 mod payload;
+mod preflight;
 
 use super::{Restart, SECTOR, bytes, checkpoint, corrupt, read_exact, u16_at, u32_at, u64_at};
 use crate::reader::{Cx, Result, unsupported};
@@ -26,6 +27,18 @@ pub(super) struct TailRecord {
     pub(super) transaction_id: u32,
     pub(super) redo_op: u16,
     pub(super) undo_op: u16,
+}
+
+/// An owned, validated LFS envelope. Keep client bytes and both native links
+/// together; a recovery consumer must not confuse a transaction ID with an LSN.
+#[derive(Debug)]
+struct LogRecord {
+    lsn: u64,
+    previous: u64,
+    undo_next: u64,
+    kind: u32,
+    summary: TailRecord,
+    data: Vec<u8>,
 }
 
 #[derive(Debug)]
@@ -139,10 +152,21 @@ fn validate_lsn_reference(restart: &Restart, lsn: u64, label: &str) -> Result<()
         return Ok(());
     }
     let vbo = lsn_to_vbo(lsn, restart.seq_num_bits)?;
-    if vbo >= restart.file_size {
+    let offset = lsn_page_offset(lsn, restart.log_page)?;
+    let page_bytes = u64::from(restart.log_page);
+    let reserved = if restart.version.0 >= 2 { 34 } else { 4 };
+    let header = usize::from(restart.record_header_len);
+    if vbo >= restart.file_size
+        || vbo / page_bytes < reserved
+        || offset < usize::from(restart.data_off)
+        || header < LFS_HEADER_BYTES
+        || !header.is_multiple_of(8)
+        || offset.checked_add(header).is_none_or(|end| end as u64 > page_bytes)
+        || lsn > restart.current_lsn
+    {
         return Err(corrupt(
             vbo,
-            format!("$LogFile {label} LSN points outside the native log"),
+            format!("$LogFile {label} LSN does not address a retained record location"),
         ));
     }
     Ok(())
@@ -152,7 +176,7 @@ fn payload_range(total: usize, offset: u16, len: u16, minimum: usize, label: &st
     let offset = usize::from(offset);
     let len = usize::from(len);
     if len == 0 {
-        if offset != 0 && offset < minimum {
+        if offset != 0 && (offset < minimum || !offset.is_multiple_of(8)) {
             return Err(corrupt(0, format!("invalid empty $LogFile {label} range")));
         }
         return Ok(());
@@ -234,26 +258,25 @@ fn validate_client_restart(restart: &Restart, data: &[u8]) -> Result<()> {
     Ok(())
 }
 
-pub(super) fn validate_dirty_tail(
+fn read_record(
     cx: &Cx,
     restart: &Restart,
     stream_length: u64,
+    lsn: u64,
     read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
-) -> Result<TailRecord> {
+) -> Result<LogRecord> {
     checkpoint(cx)?;
     let Some(client_seq) = restart.active_client_seq else {
         return Err(corrupt(0, "dirty $LogFile has no active NTFS client"));
     };
-    if restart.current_lsn == 0 || restart.file_size > stream_length {
+    if lsn == 0 || restart.file_size > stream_length {
         return Err(corrupt(0, "invalid dirty $LogFile current LSN or file size"));
     }
-    if let Some(oldest) = restart.active_client_oldest_lsn {
-        validate_lsn_reference(restart, oldest, "oldest-client")?;
+    validate_lsn_reference(restart, lsn, "requested-record")?;
+    if restart.active_client_oldest_lsn.is_some_and(|oldest| lsn < oldest) {
+        return Err(corrupt(0, "$LogFile record precedes the retained client window"));
     }
-    if let Some(client_restart) = restart.active_client_restart_lsn {
-        validate_lsn_reference(restart, client_restart, "client-restart")?;
-    }
-    let vbo = lsn_to_vbo(restart.current_lsn, restart.seq_num_bits)?;
+    let vbo = lsn_to_vbo(lsn, restart.seq_num_bits)?;
     let page_size = u64::from(restart.log_page);
     let page_vbo = vbo & !(page_size - 1);
     let first_page = if restart.version.0 >= 2 {
@@ -284,7 +307,7 @@ pub(super) fn validate_dirty_tail(
         restart,
         page_vbo,
     )?;
-    let record_off = lsn_page_offset(restart.current_lsn, restart.log_page)?;
+    let record_off = lsn_page_offset(lsn, restart.log_page)?;
     let header_len = usize::from(restart.record_header_len);
     if header_len < LFS_HEADER_BYTES
         || !header_len.is_multiple_of(8)
@@ -296,7 +319,7 @@ pub(super) fn validate_dirty_tail(
         return Err(corrupt(vbo, "invalid $LogFile current record offset"));
     }
     let header = &page.bytes[record_off..];
-    if u64_at(header, 0)? != restart.current_lsn {
+    if u64_at(header, 0)? != lsn {
         return Err(corrupt(vbo, "$LogFile current record LSN mismatch"));
     }
     let data_len = usize::try_from(u32_at(header, 24)?)
@@ -307,23 +330,30 @@ pub(super) fn validate_dirty_tail(
     if flags & !MULTI_PAGE != 0 || u16_at(header, 28)? != client_seq || u16_at(header, 30)? != 0 {
         return Err(corrupt(vbo, "invalid $LogFile client identity or record flags"));
     }
-    validate_lsn_reference(restart, u64_at(header, 8)?, "previous-record")?;
-    validate_lsn_reference(restart, u64_at(header, 16)?, "undo-next")?;
+    let previous = u64_at(header, 8)?;
+    let undo_next = u64_at(header, 16)?;
+    for (reference, label) in [(previous, "previous-record"), (undo_next, "undo-next")] {
+        validate_lsn_reference(restart, reference, label)?;
+        if reference != 0 && reference >= lsn {
+            return Err(corrupt(vbo, "$LogFile predecessor is self-referential or in the future"));
+        }
+    }
     if u64::try_from(data_len).unwrap_or(u64::MAX) > restart.file_size {
         return Err(corrupt(vbo, "$LogFile client record exceeds journal capacity"));
     }
-    if u32::try_from(data_len).ok() != Some(restart.last_lsn_data_len) {
+    if lsn == restart.current_lsn
+        && u32::try_from(data_len).ok() != Some(restart.last_lsn_data_len)
+    {
         return Err(corrupt(
             vbo,
             "$LogFile current record length disagrees with restart metadata",
         ));
     }
-    let data = payload::read(cx, restart, stream_length, page_vbo, page, read)?;
-    let data = data.as_slice();
+    let data = payload::read(cx, restart, stream_length, lsn, page_vbo, page, read)?;
     let mut tail = match record_type {
-        LFS_CLIENT_RECORD => parse_client_update(data)?,
+        LFS_CLIENT_RECORD => parse_client_update(&data)?,
         LFS_CLIENT_RESTART => {
-            validate_client_restart(restart, data)?;
+            validate_client_restart(restart, &data)?;
             TailRecord {
                 transaction_id,
                 redo_op: 0,
@@ -338,7 +368,48 @@ pub(super) fn validate_dirty_tail(
     };
     tail.transaction_id = transaction_id;
     checkpoint(cx)?;
-    Ok(tail)
+    Ok(LogRecord {
+        lsn,
+        previous,
+        undo_next,
+        kind: record_type,
+        summary: tail,
+        data,
+    })
+}
+
+/// Preflight the selected checkpoint and reachable retained transaction links.
+/// A successful return is still NOT permission to replay or mount a dirty log.
+/// Analysis of the entire chronological log and native redo/undo remain required.
+pub(super) fn validate_dirty_tail(
+    cx: &Cx,
+    restart: &Restart,
+    stream_length: u64,
+    read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
+) -> Result<TailRecord> {
+    checkpoint(cx)?;
+    for (reference, label) in [
+        (restart.active_client_oldest_lsn, "oldest-client"),
+        (restart.active_client_restart_lsn, "client-restart"),
+    ] {
+        if let Some(lsn) = reference {
+            validate_lsn_reference(restart, lsn, label)?;
+        }
+    }
+    // This shared budget covers the tail, checkpoint dumps, and every followed
+    // link, including re-reads. Per-record bounds alone do not bound a graph.
+    let mut remaining = 64_u64 * 1024 * 1024;
+    let mut bounded = |offset: u64, size: usize| {
+        checkpoint(cx)?;
+        remaining = remaining.checked_sub(size as u64).ok_or_else(|| {
+            unsupported("$LogFile recovery preflight exceeds the 64 MiB I/O budget")
+        })?;
+        read(offset, size)
+    };
+    let tail = read_record(cx, restart, stream_length, restart.current_lsn, &mut bounded)?;
+    preflight::validate(cx, restart, stream_length, &tail, &mut bounded)?;
+    checkpoint(cx)?;
+    Ok(tail.summary)
 }
 
 #[cfg(test)]
@@ -362,7 +433,7 @@ mod tests {
             data_off: 64,
             active_client_seq: Some(9),
             active_client_oldest_lsn: Some(lsn),
-            active_client_restart_lsn: Some(lsn),
+            active_client_restart_lsn: None,
             area: Vec::new(),
         }
     }
