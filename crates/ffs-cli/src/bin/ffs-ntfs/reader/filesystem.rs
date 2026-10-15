@@ -2,6 +2,8 @@
 //! pathnames, identify nodes, so DOS aliases and hard links share one inode.
 //! Permissions are an explicit host projection, not an interpretation of ACLs.
 
+mod extents;
+
 use super::{
     Cx, DATA, FfsError, NtfsFileRecord, NtfsReference, NtfsValue, NtfsVolume, Result, Stream,
     checkpoint, corrupt, parse, relative_link_target, unsupported,
@@ -753,6 +755,29 @@ impl FsOps for NtfsFs {
         checkpoint(cx)
     }
 
+    fn fiemap(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        start: u64,
+        length: u64,
+    ) -> Result<Vec<ffs_core::FiemapExtent>> {
+        if self.describe(cx, ino)?.kind != FileType::RegularFile {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                libc::EINVAL,
+            )));
+        }
+        let stream = self.stream(cx, ino)?;
+        extents::fiemap(
+            cx,
+            &stream,
+            self.volume.geometry.cluster_bytes(),
+            start,
+            length,
+        )
+    }
+
     fn lseek(
         &self,
         cx: &Cx,
@@ -762,18 +787,13 @@ impl FsOps for NtfsFs {
         whence: SeekWhence,
     ) -> Result<u64> {
         let stream = self.stream(cx, ino)?;
-        if offset >= stream.size {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::ENXIO)));
-        }
-        // Conservative legal SEEK_DATA/HOLE projection, also for compressed
-        // units: compression padding is not a logical hole in the file.
-        match whence {
-            SeekWhence::Data => Ok(offset),
-            SeekWhence::Hole => Ok(stream.size),
-            _ => Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                libc::EINVAL,
-            ))),
-        }
+        extents::seek(
+            cx,
+            &stream,
+            self.volume.geometry.cluster_bytes(),
+            offset,
+            whence,
+        )
     }
 }
 
