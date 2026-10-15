@@ -2,6 +2,8 @@
 //! Reclaim only allocation proven unreachable by complete independent namespace
 //! walks. Never choose a conflicting FAT or guess an owner for a cross-link.
 
+mod salvage;
+
 use super::{DiagnosticVolume, FatCheckReport, FatKind, FatVolume, ImageArgs, Stamp,
     checkpoint, corrupt, open_read_only, reject_sidecar, stable};
 use super::super::{Directory, FatEntry, FatTable, MAX_CHAIN_CLUSTERS, MAX_DIRECTORY_SLOTS, allocate};
@@ -14,6 +16,7 @@ use ffs_types::ByteOffset;
 use std::collections::VecDeque;
 use std::fs::{self, File, OpenOptions};
 use std::os::unix::fs::{FileExt, OpenOptionsExt};
+use std::path::PathBuf;
 use std::sync::Arc;
 
 #[derive(Debug, Args)]
@@ -24,9 +27,14 @@ pub struct RecoverArgs {
     #[arg(long, required = true)]
     offline_image: bool,
     /// Discard clusters proven unreachable. Their former contents may be lost.
-    /// Required when lost allocation exists; never repairs ambiguous ownership.
-    #[arg(long)]
+    /// Never repairs ambiguous ownership; use --salvage-to to preserve raw data.
+    #[arg(long, conflicts_with = "salvage_to")]
     reclaim_lost: bool,
+    /// Export unambiguous lost chains into a NEW private host directory.
+    /// Leaves the image unchanged. Files include slack and may contain sensitive
+    /// deleted data; original names and logical lengths cannot be inferred.
+    #[arg(long, value_name = "DIRECTORY", conflicts_with = "reclaim_lost")]
+    salvage_to: Option<PathBuf>,
     /// Perform every diagnosis and ownership preflight without writes or syncs.
     #[arg(long)]
     dry_run: bool,
@@ -73,7 +81,7 @@ impl ByteDevice for Image {
 }
 
 fn open(args: &RecoverArgs) -> Result<(Arc<File>, Stamp)> {
-    if args.dry_run {
+    if args.dry_run || args.salvage_to.is_some() {
         let (file, stamp) = open_read_only(&args.image.image)?;
         return Ok((Arc::new(file), stamp));
     }
@@ -101,7 +109,7 @@ struct Plan {
 }
 
 impl Plan {
-    fn prepare(cx: &Cx, diagnostic: &DiagnosticVolume, reclaim_lost: bool) -> Result<Self> {
+    fn prepare(cx: &Cx, diagnostic: &DiagnosticVolume, allow_lost: bool) -> Result<Self> {
         let before = diagnostic.report(cx)?;
         if !before.complete || !before.namespace_complete || before.omitted_issues != 0 {
             bail!("recovery requires complete, untruncated allocation and namespace evidence");
@@ -115,8 +123,8 @@ impl Plan {
             }
         }
         let count = before.lost_clusters.context("lost-allocation evidence is unavailable")?;
-        if count != 0 && !reclaim_lost {
-            bail!("{count} unreachable clusters require explicit --reclaim-lost; retain a separate copy before discarding their allocation");
+        if count != 0 && !allow_lost {
+            bail!("{count} unreachable clusters require --salvage-to to export raw data or explicit --reclaim-lost to discard allocation; retain a separate copy first");
         }
         let lost = collect_lost(cx, &diagnostic.volume, &before)?;
         Ok(Self { before, lost })
@@ -382,14 +390,24 @@ fn free_lost(cx: &Cx, volume: &FatVolume, lost: &[(u32, u32)]) -> Result<()> {
 fn recover(cx: &Cx, args: &RecoverArgs) -> Result<serde_json::Value> {
     checkpoint(cx)?;
     if !args.offline_image { bail!("--offline-image is required for structural recovery"); }
+    if args.reclaim_lost && args.salvage_to.is_some() {
+        bail!("--salvage-to never modifies the image and cannot be combined with --reclaim-lost");
+    }
     reject_sidecar(&args.image)?;
     let (file, stamp) = open(args)?;
     let diagnostic = DiagnosticVolume::from_device(cx, Box::new(Image {
-        file: Arc::clone(&file), length: stamp.length, writable: !args.dry_run,
+        file: Arc::clone(&file), length: stamp.length,
+        writable: !args.dry_run && args.salvage_to.is_none(),
     }), &args.image)?;
-    let plan = Plan::prepare(cx, &diagnostic, args.reclaim_lost)?;
+    let plan = Plan::prepare(cx, &diagnostic, args.reclaim_lost || args.salvage_to.is_some())?;
     stable(&file, &args.image.image, stamp)?;
     checkpoint(cx)?;
+    if let Some(output) = &args.salvage_to {
+        let export = salvage::Salvage::prepare(cx, &diagnostic.volume, plan, output)?;
+        stable(&file, &args.image.image, stamp)?;
+        if args.dry_run { return Ok(export.report(true)); }
+        return export.execute(cx, &diagnostic.volume, || stable(&file, &args.image.image, stamp));
+    }
     if args.dry_run { return Ok(plan.report(true)); }
     plan.execute(cx, &diagnostic)
 }
