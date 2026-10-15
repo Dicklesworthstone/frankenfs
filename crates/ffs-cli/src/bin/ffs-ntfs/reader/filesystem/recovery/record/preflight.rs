@@ -7,6 +7,7 @@
 //! Transaction Analysis and loser undo planning do not make an image mountable.
 
 mod analysis;
+mod redo;
 mod scan;
 mod table;
 mod targets;
@@ -322,7 +323,7 @@ pub(super) fn validate(
     // A transaction chain omits every other transaction. Read the physical
     // sequence as well, and check ownership of links from ALL encountered
     // records. The caller's shared I/O budget includes this entire pass.
-    let history = scan::collect(cx, restart, stream_length, scan_start, read)?;
+    let mut history = scan::collect(cx, restart, stream_length, scan_start, read)?;
     for record in &history {
         checkpoint(cx)?;
         state.observe(cx, record)?;
@@ -344,6 +345,15 @@ pub(super) fn validate(
     }
     let report = state.finish(cx, restart, stream_length, read)?;
     let target_report = targets.as_ref().map(|targets| targets.finish(cx)).transpose()?;
+    if let Some(first) = target_report.and_then(|report| report.2).filter(|first| *first < scan_start) {
+        // Checkpoint-start bounds Analysis, not Redo. A surviving dirty page
+        // can need an earlier record. Release the old payload window before
+        // collecting the complete redo interval under the same shared budget.
+        drop(history);
+        history = scan::collect(cx, restart, stream_length, first, read)?;
+    }
+    let redo_plan = targets.as_ref().map(|targets| redo::build(cx, targets, &history)).transpose()?;
+    let redo_summary = redo_plan.as_ref().map(redo::Plan::summary);
     tracing::debug!(
         target: "ffs::ntfs::recovery",
         active_transactions = report.active,
@@ -354,6 +364,13 @@ pub(super) fn validate(
         mapped_dirty_clusters = target_report.map(|report| report.0),
         retired_dirty_clusters = target_report.map(|report| report.1),
         target_redo_start = target_report.and_then(|report| report.2),
+        redo_records = redo_summary.as_ref().map(|summary| summary.records),
+        redo_obsolete_records = redo_summary.as_ref().map(|summary| summary.obsolete),
+        redo_payload_bytes = redo_summary.as_ref().map(|summary| summary.bytes),
+        redo_cluster_claims = redo_summary.as_ref().map(|summary| summary.clusters),
+        redo_native_files = redo_summary.as_ref().map(|summary| summary.files),
+        redo_relocated_claims = redo_summary.as_ref().map(|summary| summary.relocated),
+        redo_first_lsn = redo_summary.as_ref().and_then(|summary| summary.first_lsn),
         "Validated NTFS transaction Analysis through the selected restart; replay remains required"
     );
     checkpoint(cx)
