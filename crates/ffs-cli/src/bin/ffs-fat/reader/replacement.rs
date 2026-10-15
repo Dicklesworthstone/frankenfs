@@ -8,11 +8,13 @@
 //! dosfstools v4.2 src/{fat,boot}.c. No native implementation code is reused.
 
 mod creation;
+mod metadata;
 mod ranges;
 pub use creation::{
     MkdirArgs, RenameArgs, RmdirArgs, UnlinkArgs, mkdir_in_volume, rename_in_volume,
     rmdir_in_volume, run_mkdir, run_rename, run_rmdir, run_unlink, unlink_in_volume,
 };
+pub use metadata::set_attr_in_volume;
 pub use ranges::{truncate_in_volume, write_range_in_volume};
 
 use super::{FatTable, FatVolume, ImageArgs, MAX_CHAIN_CLUSTERS, allocate, checkpoint, corrupt};
@@ -536,6 +538,11 @@ impl Replacement {
     }
 
     fn verify_payload(&self, cx: &Cx, volume: &FatVolume) -> Result<()> {
+        let mut record = [0; 32];
+        volume.read_exact(cx, self.entry_offset, &mut record)?;
+        if record != self.updated {
+            bail!("replacement directory metadata differs from the prepared publication");
+        }
         let entry = volume
             .resolve(cx, &self.path)?
             .ok_or(FfsError::IsDirectory)?;
@@ -901,12 +908,13 @@ pub fn create_in_volume(
     read_only: bool,
 ) -> Result<serde_json::Value> {
     let source = SliceSource(data);
-    let plan = creation::prepare(cx, volume, path, &source, now)?;
-    let report = plan.execute(cx, volume, &source, || Ok(()))?;
+    let mut plan = creation::prepare(cx, volume, path, &source, now)?;
+    // Publish permissions with the initial directory record, not as a second
+    // mutation after a writable file has already been committed and verified.
     if read_only {
-        set_attr_in_volume(cx, volume, path, Some(true), None, None)?;
+        plan.updated[11] |= 1;
     }
-    Ok(report)
+    plan.execute(cx, volume, &source, || Ok(()))
 }
 
 pub fn replace_in_volume(
@@ -919,40 +927,6 @@ pub fn replace_in_volume(
     let source = SliceSource(data);
     let plan = Replacement::prepare(cx, volume, path, &source, now)?;
     plan.execute(cx, volume, &source, || Ok(()))
-}
-
-pub fn set_attr_in_volume(
-    cx: &Cx,
-    volume: &FatVolume,
-    path: &str,
-    read_only: Option<bool>,
-    mtime_secs: Option<u64>,
-    atime_secs: Option<u64>,
-) -> Result<()> {
-    let entry = volume
-        .resolve(cx, path)?
-        .ok_or_else(|| anyhow!("cannot modify root directory entry attributes"))?;
-    let mut raw = [0_u8; 32];
-    volume.read_exact(cx, entry.offset, &mut raw)?;
-    if let Some(ro) = read_only {
-        if ro {
-            raw[11] |= 0x01;
-        } else {
-            raw[11] &= !0x01;
-        }
-    }
-    if let Some(secs) = mtime_secs {
-        let (date, time) = modified_timestamp(secs.max(315_532_800))?;
-        raw[22..24].copy_from_slice(&time.to_le_bytes());
-        raw[24..26].copy_from_slice(&date.to_le_bytes());
-    }
-    if let Some(secs) = atime_secs {
-        let (date, _) = modified_timestamp(secs.max(315_532_800))?;
-        raw[18..20].copy_from_slice(&date.to_le_bytes());
-    }
-    write_volume(cx, volume, entry.offset, &raw)?;
-    volume.device.sync(cx)?;
-    Ok(())
 }
 
 companion_bin_tests! {
