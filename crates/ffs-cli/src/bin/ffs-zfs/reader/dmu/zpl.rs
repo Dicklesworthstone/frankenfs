@@ -1,9 +1,12 @@
 //! Read-only ZPL namespace and file bytes at an explicitly selected head root.
-//! No host-path resolution, symlink following, log replay, mutation or mounting.
+//! Native paths stay inside this view; no host paths, log replay or mutation.
 
+mod path;
 mod seek;
 pub mod snapshots;
 mod xattrs;
+
+pub use path::PathPolicy;
 
 use super::{
     BTreeSet, BlockPointer, Cx, FfsError, MAX_READ_BYTES, Object, ObjectSet, Objects, Result,
@@ -374,49 +377,6 @@ impl Zpl {
         }
         checkpoint(cx)?;
         Ok(result)
-    }
-
-    pub fn resolve(&mut self, cx: &Cx, path: &[u8]) -> Result<u64> {
-        checkpoint(cx)?;
-        if path.len() > MAX_PATH || path.contains(&0) {
-            return Err(FfsError::NameTooLong);
-        }
-        let mut current = self.root;
-        let mut kind = Kind::Directory;
-        let mut ancestors = BTreeSet::from([self.root]);
-        let mut count = 0;
-        for component in path
-            .split(|byte| *byte == b'/')
-            .filter(|part| !part.is_empty())
-        {
-            checkpoint(cx)?;
-            count += 1;
-            if count > MAX_COMPONENTS {
-                return Err(FfsError::NameTooLong);
-            }
-            if kind != Kind::Directory {
-                return Err(FfsError::NotDirectory);
-            }
-            if component == b"." {
-                continue;
-            }
-            self.component(component)?; // Parent traversal is deliberately refused.
-            let entry = self
-                .list(cx, current)?
-                .into_iter()
-                .find(|entry| entry.name == component)
-                .ok_or_else(|| FfsError::NotFound("ZPL path component".into()))?;
-            current = entry.object;
-            kind = entry.metadata.kind;
-            if kind == Kind::Directory && !ancestors.insert(current) {
-                return Err(corrupt("ZPL path returns to an ancestor"));
-            }
-        }
-        if path.last() == Some(&b'/') && kind != Kind::Directory {
-            return Err(FfsError::NotDirectory);
-        }
-        checkpoint(cx)?;
-        Ok(current)
     }
 
     fn contents(

@@ -3,6 +3,7 @@
 mod zil;
 
 use super::{CandidateArgs, Context, Cx, Result, bail, json};
+use super::reader::dmu::zpl::PathPolicy;
 use clap::{Args, Subcommand};
 use ffs_ondisk::zfs_zpl::{Kind, Metadata};
 use std::ffi::OsString;
@@ -20,7 +21,10 @@ pub struct FileArgs {
     /// Exact native snapshot name. Omit to read the selected committed head.
     #[arg(long)]
     snapshot: Option<OsString>,
-    /// Native path inside this dataset, not a host path. Symlinks are not followed.
+    /// Refuse symlink traversal; a final link remains available for inspection.
+    #[arg(long)]
+    no_symlinks: bool,
+    /// Native path confined to this dataset or snapshot, never a host path.
     path: PathBuf,
 }
 
@@ -78,7 +82,7 @@ pub enum FileCommand {
         #[command(flatten)]
         file: FileArgs,
     },
-    /// Inspect native file metadata. UID/GID and modes are not ACL enforcement.
+    /// Inspect native metadata without following the final link. Not ACL enforcement.
     Stat {
         #[command(flatten)]
         file: FileArgs,
@@ -92,7 +96,7 @@ pub enum FileCommand {
         #[arg(long)]
         bytes: Option<u64>,
     },
-    /// Output the native symlink target without resolving or following it.
+    /// Output the final symlink's target; ancestor links are resolved within the view.
     Readlink {
         #[command(flatten)]
         file: FileArgs,
@@ -117,6 +121,18 @@ enum Output {
     Link,
     Names,
     Value(String),
+}
+
+impl Output {
+    fn path_policy(&self, no_symlinks: bool) -> PathPolicy {
+        if no_symlinks {
+            return PathPolicy::NoSymlinks;
+        }
+        match self {
+            Self::List | Self::Read(..) => PathPolicy::Follow,
+            Self::Stat | Self::Link | Self::Names | Self::Value(_) => PathPolicy::NoFollowFinal,
+        }
+    }
 }
 
 fn metadata_json(number: u64, metadata: &Metadata) -> serde_json::Value {
@@ -277,7 +293,11 @@ impl FileCommand {
         };
         let snapshot_name = file.snapshot.as_deref().and_then(|name| name.to_str());
         let snapshot_bytes = file.snapshot.as_deref().map(OsStrExt::as_bytes);
-        let object = view.resolve(cx, file.path.as_os_str().as_bytes())?;
+        let object = view.resolve_with(
+            cx,
+            file.path.as_os_str().as_bytes(),
+            output.path_policy(file.no_symlinks),
+        )?;
         match output {
             Output::List => {
                 let entries: Vec<_> = view.list(cx, object)?.into_iter().map(|entry| {
@@ -325,7 +345,7 @@ impl FileCommand {
             Output::Read(start, bytes) => {
                 let (metadata, _) = view.stat(cx, object)?;
                 if metadata.kind != Kind::Regular {
-                    bail!("read requires a regular file; symlinks are not followed");
+                    bail!("resolved ZPL read target is not a regular file");
                 }
                 let length = metadata
                     .size
@@ -354,6 +374,45 @@ mod tests {
     use super::*;
     use crate::{Cli, Command};
     use clap::Parser;
+    #[test]
+    fn path_policy_preserves_final_link_inspection_and_explicit_traversal_refusal() {
+        for output in [Output::List, Output::Read(0, None)] {
+            assert_eq!(output.path_policy(false), PathPolicy::Follow);
+            assert_eq!(output.path_policy(true), PathPolicy::NoSymlinks);
+        }
+        for output in [Output::Stat, Output::Link, Output::Names, Output::Value("user.note".into())] {
+            assert_eq!(output.path_policy(false), PathPolicy::NoFollowFinal);
+            assert_eq!(output.path_policy(true), PathPolicy::NoSymlinks);
+        }
+    }
+
+    #[test]
+    fn all_native_path_commands_retain_no_symlinks_and_exact_snapshot_selection() {
+        for command in ["ls", "read", "stat", "readlink", "listxattr", "getxattr"] {
+            for no_symlinks in [false, true] {
+                let mut args = vec![
+                    "ffs-zfs", command, "leaf.img", "/dirlink/link", "--offline-image",
+                    "--auto-import", "--dataset", "data", "--snapshot", "before",
+                    "--member", "second.img",
+                ];
+                if command == "getxattr" { args.push("user.note"); }
+                if no_symlinks { args.push("--no-symlinks"); }
+                let cli = Cli::try_parse_from(args).unwrap();
+                let Command::File(
+                    FileCommand::Ls { file } | FileCommand::Stat { file }
+                    | FileCommand::Read { file, .. } | FileCommand::Readlink { file }
+                    | FileCommand::Listxattr { file } | FileCommand::Getxattr { file, .. }
+                ) = cli.command else { panic!("native path command"); };
+                assert_eq!(file.no_symlinks, no_symlinks);
+                assert_eq!(file.path, PathBuf::from("/dirlink/link"));
+                assert_eq!(file.snapshot, Some(OsString::from("before")));
+                assert_eq!(file.dataset, "data");
+                assert_eq!(file.candidate.members, [PathBuf::from("second.img")]);
+                assert!(file.candidate.auto_import);
+            }
+        }
+    }
+
     #[test]
     fn mount_requires_explicit_candidate_and_retains_snapshot_selection() {
         let args = [

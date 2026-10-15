@@ -139,6 +139,11 @@ fn assert_quarantined(fs: &FatFs, device: &Device, ino: InodeNumber) {
     assert!(matches!(fs.readdir(&cx, &mut scope, ROOT, 0), Err(FfsError::Io(_))));
     assert!(matches!(fs.statfs(&cx, &mut scope, ROOT), Err(FfsError::Io(_))));
     assert!(matches!(fs.write(&cx, &mut scope, ino, 0, b"unsafe"), Err(FfsError::Io(_))));
+    assert!(matches!(fs.fallocate(&cx, &mut scope, ino, 0, 4096, 0), Err(FfsError::Io(_))));
+    assert!(matches!(fs.rename2(
+        &cx, &mut scope, ROOT, OsStr::new("file.bin"), ROOT,
+        OsStr::new("no.bin"), libc::RENAME_NOREPLACE,
+    ), Err(FfsError::Io(_))));
     assert!(matches!(fs.create(&cx, &mut scope, ROOT, OsStr::new("no.bin"), 0o644, 1000, 1000), Err(FfsError::Io(_))));
     assert!(matches!(fs.unlink(&cx, &mut scope, ROOT, OsStr::new("file.bin")), Err(FfsError::Io(_))));
     assert!(matches!(fs.flush(&cx, &mut scope, ino, 0, 0), Err(FfsError::Io(_))));
@@ -287,4 +292,70 @@ fn readonly_sync_and_flush_do_not_add_backing_io() {
     fs.flush_on_destroy(&cx).unwrap();
     assert_eq!(device.counts(), before);
     assert_eq!(fs.health.epoch.load(Ordering::Acquire), 0);
+}
+
+#[test]
+fn fallocate_failures_and_post_commit_cache_errors_use_the_existing_health_gate() {
+    for kind in ["fat16", "fat32"] {
+        for failure in 0..4 {
+            let (fs, device, ino) = fixture(kind, true);
+            let cx = Cx::for_testing();
+            {
+                let mut state = device.0.lock().unwrap();
+                match failure {
+                    0 => state.fail_write = true,
+                    1 => state.fail_sync = true,
+                    2 => state.fail_read_after_clean = true,
+                    _ => state.cancel_after_clean = true,
+                }
+            }
+            let offset = u64::from(fs.volume.geometry.cluster_bytes()) + 7;
+            assert!(fs.fallocate(&cx, &mut RequestScope::empty(), ino, offset, 19, 0).is_err());
+            assert_quarantined(&fs, &device, ino);
+            if failure >= 2 {
+                // Publication completed; quarantine must not pretend it was
+                // rolled back or serve the old eight-byte cache as current.
+                let reopened = device.open();
+                let fresh = Cx::for_testing();
+                let entry = reopened.resolve(&fresh, "/file.bin").unwrap().unwrap();
+                let chain = reopened.file_chain(&fresh, &entry).unwrap();
+                let mut expected = b"original".to_vec();
+                expected.resize((offset + 19) as usize, 0);
+                assert_eq!(reopened.read(&fresh, &chain, 0, expected.len()).unwrap(), expected);
+                assert!(reopened.check(&fresh).unwrap().clean);
+            }
+        }
+    }
+}
+
+#[test]
+fn noreplace_rename_failures_share_the_existing_mount_quarantine() {
+    for kind in ["fat16", "fat32"] {
+        for fail_after_publication in [false, true] {
+            let (fs, device, ino) = fixture(kind, true);
+            let cx = Cx::for_testing();
+            {
+                let mut state = device.0.lock().unwrap();
+                if fail_after_publication {
+                    state.fail_read_after_clean = true;
+                } else {
+                    state.fail_write = true;
+                }
+            }
+            assert!(fs.rename2(
+                &cx, &mut RequestScope::empty(), ROOT, OsStr::new("file.bin"), ROOT,
+                OsStr::new("moved.bin"), libc::RENAME_NOREPLACE,
+            ).is_err());
+            assert_quarantined(&fs, &device, ino);
+            if fail_after_publication {
+                let reopened = device.open();
+                let fresh = Cx::for_testing();
+                assert!(matches!(reopened.resolve(&fresh, "/file.bin"), Err(FfsError::NotFound(_))));
+                let entry = reopened.resolve(&fresh, "/moved.bin").unwrap().unwrap();
+                let chain = reopened.file_chain(&fresh, &entry).unwrap();
+                assert_eq!(reopened.read(&fresh, &chain, 0, 8).unwrap(), b"original");
+                assert!(reopened.check(&fresh).unwrap().clean);
+            }
+        }
+    }
 }

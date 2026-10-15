@@ -119,6 +119,32 @@ fn natural(name: &str) -> Option<NativeName> {
 }
 
 impl NativeName {
+    /// Change display case without regenerating an existing native alias.
+    /// Only this object's current comparison key is exempt from collision
+    /// checks; the caller must resolve an unambiguous same-entry rename first.
+    pub(super) fn case_change(
+        volume: &FatVolume,
+        entry: &super::super::super::Entry,
+        name: &str,
+    ) -> Result<Self> {
+        validate(name)?;
+        if volume.oem_code_page.name_key(&entry.name()?)
+            != volume.oem_code_page.name_key(name)
+        {
+            bail!("case-only rename must preserve the native name comparison key");
+        }
+        if let Some(candidate) = natural(name)
+            && candidate.short == entry.native.short_name
+        {
+            return Ok(candidate);
+        }
+        Ok(Self {
+            short: entry.native.short_name,
+            flags: entry.native.case_flags & 0x18,
+            long: name.encode_utf16().collect(),
+        })
+    }
+
     pub(super) fn plan(
         cx: &Cx,
         volume: &FatVolume,

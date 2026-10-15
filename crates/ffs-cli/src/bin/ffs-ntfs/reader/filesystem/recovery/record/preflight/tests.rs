@@ -23,7 +23,7 @@ impl Journal {
                 file_size: LOG,
                 last_lsn_data_len: 0,
                 record_header_len: 48,
-                data_off: 64,
+                data_off: 128,
                 active_client_seq: Some(9),
                 active_client_oldest_lsn: None,
                 active_client_restart_lsn: None,

@@ -259,6 +259,61 @@ impl FatFs {
         Ok((full, name_str.to_owned()))
     }
 
+    /// Both rename entry points hold the same exclusive operation gate across
+    /// destination lookup, native publication and mount-identity updates.
+    /// NOREPLACE is a namespace exclusion rule, not crash-atomic FAT metadata.
+    fn rename_locked(
+        &self,
+        cx: &Cx,
+        parent: InodeNumber,
+        name: &OsStr,
+        new_parent: InodeNumber,
+        new_name: &OsStr,
+        no_replace: bool,
+    ) -> Result<()> {
+        checkpoint(cx)?;
+        self.ensure_writable()?;
+        let parent_dir = self.node(cx, parent)?.directory()?;
+        let new_parent_dir = self.node(cx, new_parent)?.directory()?;
+        let (from_path, from_name) = self.child_path(parent, name)?;
+        let (to_path, to_name) = self.child_path(new_parent, new_name)?;
+        let src_before = self.volume.lookup(cx, parent_dir, &from_name)?;
+        let dst_before = match self.volume.lookup(cx, new_parent_dir, &to_name) {
+            Ok(entry) => Some(entry),
+            Err(FfsError::NotFound(_)) => None,
+            Err(error) => return Err(error),
+        };
+        // Aliases, case variants and the source itself are existing targets
+        // too. Refuse before registering nodes or publishing any disk writes.
+        if no_replace && dst_before.is_some() {
+            return Err(FfsError::Exists);
+        }
+        let src_ino = self.register(cx, parent, src_before.clone())?;
+
+        rename_in_volume(cx, &self.volume, &from_path, &to_path, false)
+            .map_err(map_mutation_error)?;
+
+        let new_entry = self.volume.lookup(cx, new_parent_dir, &to_name)?;
+        let mut state = self.state()?;
+        state.free_clusters = None;
+        if let Some(overwritten) = dst_before
+            && overwritten.offset != src_before.offset
+            && let Some(dst_ino) = state.slot_to_ino.remove(&overwritten.offset)
+            && dst_ino != src_ino
+        {
+            Self::invalidate_cached_chain(&mut state, dst_ino);
+            state.nodes.remove(&dst_ino);
+        }
+        state.slot_to_ino.remove(&src_before.offset);
+        state.slot_to_ino.insert(new_entry.offset, src_ino);
+        Self::invalidate_cached_chain(&mut state, src_ino);
+        if let Some(node) = state.nodes.get_mut(&src_ino) {
+            node.parent = new_parent;
+            node.entry = Some(new_entry);
+        }
+        Ok(())
+    }
+
     fn invalidate_cached_chain(state: &mut State, ino: InodeNumber) {
         if let Some(prev) = state.chains.remove(&ino) {
             state.cached_clusters = state
@@ -769,6 +824,36 @@ impl FsOps for FatFs {
         operation.complete(written)
     }
 
+    fn copy_file_range(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino_in: InodeNumber,
+        offset_in: u64,
+        ino_out: InodeNumber,
+        offset_out: u64,
+        len: u64,
+    ) -> Result<u64> {
+        // Pin both native identities and their allocation for the WHOLE copy,
+        // including preflight and cache publication. Do not recursively call
+        // FsOps::read/write while this exclusive operation gate is held.
+        let operation = self.operation(cx, true)?;
+        if len == 0 {
+            return operation.complete(0);
+        }
+        self.ensure_writable()?;
+        let from = self.path_for_inode(ino_in)?;
+        let to = self.path_for_inode(ino_out)?;
+        let copied = self.volume.copy_range(
+            cx, &from, offset_in, &to, offset_out, len, now_unix_secs(),
+        ).map_err(map_mutation_error)?;
+        if copied != 0 {
+            self.refresh_node_from_path(cx, ino_out, &to)?;
+        }
+        checkpoint(cx)?;
+        operation.complete(copied)
+    }
+
     fn setattr(
         &self,
         cx: &Cx,
@@ -924,42 +1009,36 @@ impl FsOps for FatFs {
         new_name: &OsStr,
     ) -> Result<()> {
         let operation = self.operation(cx, true)?;
-        checkpoint(cx)?;
-        self.ensure_writable()?;
-        let parent_dir = self.node(cx, parent)?.directory()?;
-        let new_parent_dir = self.node(cx, new_parent)?.directory()?;
-        let (from_path, from_name) = self.child_path(parent, name)?;
-        let (to_path, to_name) = self.child_path(new_parent, new_name)?;
-        let src_before = self.volume.lookup(cx, parent_dir, &from_name)?;
-        let dst_before = match self.volume.lookup(cx, new_parent_dir, &to_name) {
-            Ok(entry) => Some(entry),
-            Err(FfsError::NotFound(_)) => None,
-            Err(error) => return Err(error),
-        };
-        let src_ino = self.register(cx, parent, src_before.clone())?;
+        self.rename_locked(cx, parent, name, new_parent, new_name, false)?;
+        operation.complete(())
+    }
 
-        rename_in_volume(cx, &self.volume, &from_path, &to_path, false)
-            .map_err(map_mutation_error)?;
-
-        let new_entry = self.volume.lookup(cx, new_parent_dir, &to_name)?;
-        let mut state = self.state()?;
-        state.free_clusters = None;
-        if let Some(overwritten) = dst_before
-            && overwritten.offset != src_before.offset
-            && let Some(dst_ino) = state.slot_to_ino.remove(&overwritten.offset)
-            && dst_ino != src_ino
-        {
-            Self::invalidate_cached_chain(&mut state, dst_ino);
-            state.nodes.remove(&dst_ino);
+    fn rename2(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        parent: InodeNumber,
+        name: &OsStr,
+        new_parent: InodeNumber,
+        new_name: &OsStr,
+        flags: u32,
+    ) -> Result<()> {
+        let operation = self.operation(cx, true)?;
+        if flags != 0 && flags != libc::RENAME_NOREPLACE {
+            // Exchange/whiteout and invalid combinations need distinct native
+            // protocols. Never silently degrade them into overwrite rename.
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                libc::EINVAL,
+            )));
         }
-        state.slot_to_ino.remove(&src_before.offset);
-        state.slot_to_ino.insert(new_entry.offset, src_ino);
-        Self::invalidate_cached_chain(&mut state, src_ino);
-        if let Some(node) = state.nodes.get_mut(&src_ino) {
-            node.parent = new_parent;
-            node.entry = Some(new_entry);
-        }
-        drop(state);
+        self.rename_locked(
+            cx,
+            parent,
+            name,
+            new_parent,
+            new_name,
+            flags == libc::RENAME_NOREPLACE,
+        )?;
         operation.complete(())
     }
 
@@ -1106,7 +1185,7 @@ impl FsOps for FatFs {
     }
 }
 
-/// Native FAT timestamps have no timezone. Project available native fields
+/// Native FAT timestamps have no timezone. Project available fields
 /// onto UTC deterministically; preserve unknown timestamps as epoch zero.
 /// Report invalid native fields at their directory record, not at block zero.
 fn fat_wall_time(
@@ -1132,6 +1211,9 @@ mod preallocation_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    mod copy;
+    mod operations;
 
     #[test]
     fn native_wall_time_preserves_precision_absence_and_error_location() {
