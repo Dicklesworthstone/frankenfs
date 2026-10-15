@@ -178,6 +178,17 @@ impl Image {
         ub[40 + word * 8..48 + word * 8].copy_from_slice(&self.order.encode(value));
         stamp(ub, offset, self.order);
     }
+    fn replicate_candidate(&mut self) {
+        let at = BASE + UBERBLOCK_RING_OFFSET as usize + 2 * 1024;
+        let candidate = self.bytes[at..at + 1024].to_vec();
+        for label in label_offsets(LENGTH as u64).unwrap().into_iter().skip(1) {
+            let offset = label + UBERBLOCK_RING_OFFSET + 2 * 1024;
+            let mut copy = candidate.clone();
+            stamp(&mut copy, offset, self.order);
+            let at = BASE + offset as usize;
+            self.bytes[at..at + copy.len()].copy_from_slice(&copy);
+        }
+    }
     fn open(self, reads: Reads, failure: Option<u64>) -> Leaf {
         Leaf::from_device(
             &Cx::for_testing(),
@@ -549,6 +560,10 @@ fn bd_glk87_auto_import_and_multi_top_level_vdev_striping_contract() {
     img0.change_dva(2, vdev1_word);
     img1.change_dva(0, vdev1_word);
     img1.change_dva(2, vdev1_word);
+    // Every copy of a committed TXG must describe the same root. Changing
+    // only label zero would manufacture a checksum-valid fork in this fixture.
+    img0.replicate_candidate();
+    img1.replicate_candidate();
     // Clear physical blocks on img0 so reading from vdev 0 would fail checksum
     img0.bytes[BASE + FIRST as usize..BASE + FIRST as usize + 1024].fill(0);
     img0.bytes[BASE + SECOND as usize..BASE + SECOND as usize + 1024].fill(0);
@@ -577,6 +592,7 @@ fn bd_glk87_auto_import_and_multi_top_level_vdev_striping_contract() {
     let striped_root = pool.root(&cx, 0, 2, 123).unwrap();
     assert_eq!(striped_root.data, expected_root);
     assert_eq!(striped_root.member_guid, 500);
+    assert_eq!(pool.import_active(&cx, Some(123)).unwrap().2.data, expected_root);
 
     // 2b. Active striped pool (state = 0) works with pool.import_active
     let cfg0_act = make_striped_cfg(0, 499, 0);
@@ -584,6 +600,12 @@ fn bd_glk87_auto_import_and_multi_top_level_vdev_striping_contract() {
     for index in 0..4 {
         img0_active.set_config(index, &cfg0_act);
         img1_active.set_config(index, &cfg1_act);
+    }
+    // Only the second supplied member retains uberblocks. Data routing must
+    // still use native vdev IDs, independently of the ring's physical source.
+    for label in label_offsets(LENGTH as u64).unwrap() {
+        let at = BASE + (label + UBERBLOCK_RING_OFFSET) as usize;
+        img0_active.bytes[at..at + UBERBLOCK_RING_BYTES].fill(0);
     }
     let pool_active = Pool::from_leaves(vec![
         img0_active.open(Arc::default(), None),
@@ -593,6 +615,99 @@ fn bd_glk87_auto_import_and_multi_top_level_vdev_striping_contract() {
     let auto_striped = pool_active.import_active(&cx, Some(123)).unwrap();
     assert_eq!(auto_striped.2.data, expected_root);
     assert_eq!(auto_striped.2.member_guid, 500);
+}
+
+#[test]
+fn auto_import_single_leaf_uses_one_config_and_independently_verified_rings() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        for survivor in 0..4 {
+            let mut image = Image::new(order, false);
+            let source = BASE + UBERBLOCK_RING_OFFSET as usize + 2 * 1024;
+            let mut candidate = image.bytes[source..source + 1024].to_vec();
+            let labels = label_offsets(LENGTH as u64).unwrap();
+            for (index, label) in labels.into_iter().enumerate() {
+                if index != survivor {
+                    let at = BASE + (label + LABEL_CONFIG_OFFSET) as usize;
+                    image.bytes[at] ^= 1;
+                }
+                let at = BASE + (label + UBERBLOCK_RING_OFFSET) as usize;
+                image.bytes[at..at + UBERBLOCK_RING_BYTES].fill(0);
+            }
+            let ring = (survivor + 1) % 4;
+            let offset = labels[ring] + UBERBLOCK_RING_OFFSET + 7 * 1024;
+            stamp(&mut candidate, offset, order);
+            let at = BASE + offset as usize;
+            image.bytes[at..at + candidate.len()].copy_from_slice(&candidate);
+            let expected = image.root.clone();
+            let leaf = image.open(Arc::default(), None);
+            assert!(leaf.root(&cx, survivor, 2, 123).is_err());
+            let (label, slot, root) = leaf.import_active(&cx, Some(123)).unwrap();
+            assert_eq!((label, slot), (ring, 7));
+            assert_eq!(root.data, expected);
+        }
+    }
+}
+
+#[test]
+fn auto_import_single_leaf_preserves_device_cancellation() {
+    for offset in [LABEL_CONFIG_OFFSET, UBERBLOCK_RING_OFFSET + 1024] {
+        let reads: Reads = Arc::default();
+        let leaf = Image::new(Endian::Little, false)
+            .open(Arc::clone(&reads), Some(BASE as u64 + offset));
+        assert!(matches!(
+            leaf.import_active(&Cx::for_testing(), None),
+            Err(FfsError::Cancelled)
+        ));
+        assert!(data_reads(&reads).is_empty());
+    }
+}
+
+#[test]
+fn auto_import_single_leaf_does_not_hide_valid_bad_metadata() {
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        for case in 0..4 {
+            let mut image = Image::new(order, false);
+            match case {
+                0 => image.set_config(3, &config(1000, 9, 1, false)),
+                1 => image.set_config(3, &config(999, 9, 1, true)),
+                2 => image.set_config(3, &config(999, 12, 1, false)),
+                _ => {
+                    let offset = label_offsets(LENGTH as u64).unwrap()[3] + LABEL_CONFIG_OFFSET;
+                    let at = BASE + offset as usize;
+                    let raw = &mut image.bytes[at..at + LABEL_CONFIG_BYTES];
+                    raw[0] = 2; // Unsupported nvlist encoding, with a valid label checksum.
+                    stamp(raw, offset, order);
+                }
+            }
+            let reads: Reads = Arc::default();
+            let leaf = image.open(Arc::clone(&reads), None);
+            assert!(leaf.import_active(&cx, None).is_err(), "case {case}");
+            assert!(data_reads(&reads).is_empty());
+        }
+    }
+}
+
+#[test]
+fn auto_import_expected_pool_identity_is_checked_before_data_io() {
+    let reads: Reads = Arc::default();
+    let leaf = Image::new(Endian::Little, false).open(Arc::clone(&reads), None);
+    assert!(leaf.import_active(&Cx::for_testing(), Some(456)).is_err());
+    assert!(data_reads(&reads).is_empty());
+}
+
+#[test]
+fn auto_import_does_not_rewrite_bad_labels_or_partition_neighbors() {
+    let mut image = Image::new(Endian::Little, false);
+    image.bytes[BASE + LABEL_CONFIG_OFFSET as usize] ^= 1;
+    let temp = tempfile::tempdir().unwrap();
+    let path = temp.path().join("damaged-label.img");
+    std::fs::write(&path, &image.bytes).unwrap();
+    let cx = Cx::for_testing();
+    let leaf = Leaf::open(&cx, &path, BASE as u64, Some(LENGTH as u64)).unwrap();
+    assert_eq!(leaf.import_active(&cx, None).unwrap().2.data, image.root);
+    assert_eq!(std::fs::read(&path).unwrap(), image.bytes);
 }
 
 pub(in crate::reader) mod gang;
