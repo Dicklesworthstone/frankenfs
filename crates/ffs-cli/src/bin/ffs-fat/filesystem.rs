@@ -1,6 +1,7 @@
-//! Read-only FsOps adapter for the same native reader used by inspect/ls/cat.
-//! Slot-based IDs are safe only for this immutable, mount-lifetime namespace;
-//! they are deliberately not a promise of FAT write or export-stable handles.
+//! FsOps adapter for the native FAT reader and ordered offline writer.
+//! Native mutation and its cache publication are serialized against every
+//! mounted read and write. This is not a crash-atomic transaction protocol;
+//! FAT node identities remain mount-local, not export-stable handles.
 
 use super::reader::replacement::{
     create_in_volume, mkdir_in_volume, rename_in_volume, rmdir_in_volume, set_attr_in_volume,
@@ -17,7 +18,7 @@ use ffs_ondisk::fat::{FatKind, FatTimestamp};
 use ffs_types::{InodeNumber, ParseError};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const ROOT: InodeNumber = InodeNumber(1);
@@ -62,8 +63,16 @@ impl Default for State {
     }
 }
 
+/// Keep the operation gate for the entire request, including cache updates.
+/// Always acquire it before `state`; private helpers never reacquire it.
+struct OperationGuard<'a> {
+    _reader: Option<RwLockReadGuard<'a, ()>>,
+    _writer: Option<RwLockWriteGuard<'a, ()>>,
+}
+
 pub struct FatFs {
     volume: FatVolume,
+    operations: RwLock<()>,
     state: Mutex<State>,
     uid: u32,
     gid: u32,
@@ -133,11 +142,35 @@ impl FatFs {
         checkpoint(cx)?;
         Ok(Self {
             volume,
+            operations: RwLock::new(()),
             state: Mutex::new(state),
             uid,
             gid,
             writable,
         })
+    }
+
+    fn operation(&self, cx: &Cx, mutation: bool) -> Result<OperationGuard<'_>> {
+        checkpoint(cx)?;
+        let poisoned = || {
+            FfsError::Io(std::io::Error::other(
+                "FAT operation lock poisoned; reopen and check the image",
+            ))
+        };
+        let guard = if mutation {
+            OperationGuard {
+                _reader: None,
+                _writer: Some(self.operations.write().map_err(|_| poisoned())?),
+            }
+        } else {
+            OperationGuard {
+                _reader: Some(self.operations.read().map_err(|_| poisoned())?),
+                _writer: None,
+            }
+        };
+        // A request cancelled while waiting must not start device I/O.
+        checkpoint(cx)?;
+        Ok(guard)
     }
 
     fn ensure_writable(&self) -> Result<()> {
@@ -221,8 +254,8 @@ impl FatFs {
     fn refresh_node_from_path(&self, cx: &Cx, ino: InodeNumber, path: &str) -> Result<Node> {
         let entry = self
             .volume
-            .resolve(cx, path)?
-            .ok_or_else(|| FfsError::NotFound(path.to_owned()))?;
+            .resolve(cx, path)?;
+        let entry = entry.ok_or_else(|| FfsError::NotFound(path.to_owned()))?;
         let mut state = self.state()?;
         Self::invalidate_cached_chain(&mut state, ino);
         state.free_clusters = None;
@@ -474,6 +507,7 @@ impl FatFs {
 
 impl FsOps for FatFs {
     fn getattr(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber) -> Result<InodeAttr> {
+        let _operation = self.operation(cx, false)?;
         let node = self.node(cx, ino)?;
         self.attributes(cx, ino, &node)
     }
@@ -485,6 +519,7 @@ impl FsOps for FatFs {
         parent: InodeNumber,
         name: &OsStr,
     ) -> Result<InodeAttr> {
+        let _operation = self.operation(cx, false)?;
         let node = self.node(cx, parent)?;
         let directory = node.directory()?;
         let name = name.to_str().ok_or_else(|| {
@@ -511,6 +546,7 @@ impl FsOps for FatFs {
         ino: InodeNumber,
         offset: u64,
     ) -> Result<ReaddirPage> {
+        let _operation = self.operation(cx, false)?;
         let node = self.node(cx, ino)?;
         let entries = self.volume.list(cx, node.directory()?)?;
         let names = Self::checked_names(&entries)?;
@@ -563,6 +599,7 @@ impl FsOps for FatFs {
         offset: u64,
         size: u32,
     ) -> Result<Vec<u8>> {
+        let _operation = self.operation(cx, false)?;
         let node = self.node(cx, ino)?;
         let entry = node.entry.as_ref().ok_or(FfsError::IsDirectory)?;
         let chain = self.chain(cx, ino, entry)?;
@@ -576,6 +613,7 @@ impl FsOps for FatFs {
         ino: InodeNumber,
         flags: i32,
     ) -> Result<(u64, u32)> {
+        let _operation = self.operation(cx, flags & libc::O_TRUNC != 0)?;
         checkpoint(cx)?;
         let wants_write = flags & libc::O_ACCMODE != libc::O_RDONLY
             || flags & (libc::O_TRUNC | libc::O_CREAT) != 0;
@@ -611,6 +649,7 @@ impl FsOps for FatFs {
         _uid: u32,
         _gid: u32,
     ) -> Result<InodeAttr> {
+        let _operation = self.operation(cx, true)?;
         checkpoint(cx)?;
         self.ensure_writable()?;
         let parent_node = self.node(cx, parent)?;
@@ -636,6 +675,7 @@ impl FsOps for FatFs {
         _uid: u32,
         _gid: u32,
     ) -> Result<InodeAttr> {
+        let _operation = self.operation(cx, true)?;
         checkpoint(cx)?;
         self.ensure_writable()?;
         let parent_node = self.node(cx, parent)?;
@@ -658,6 +698,7 @@ impl FsOps for FatFs {
         offset: u64,
         data: &[u8],
     ) -> Result<u32> {
+        let _operation = self.operation(cx, true)?;
         checkpoint(cx)?;
         self.ensure_writable()?;
         let node = self.node(cx, ino)?;
@@ -682,6 +723,7 @@ impl FsOps for FatFs {
         ino: InodeNumber,
         attrs: &SetAttrRequest,
     ) -> Result<InodeAttr> {
+        let _operation = self.operation(cx, true)?;
         checkpoint(cx)?;
         self.ensure_writable()?;
         if ino == ROOT {
@@ -724,6 +766,7 @@ impl FsOps for FatFs {
         parent: InodeNumber,
         name: &OsStr,
     ) -> Result<()> {
+        let _operation = self.operation(cx, true)?;
         checkpoint(cx)?;
         self.ensure_writable()?;
         let parent_node = self.node(cx, parent)?;
@@ -761,6 +804,7 @@ impl FsOps for FatFs {
         parent: InodeNumber,
         name: &OsStr,
     ) -> Result<()> {
+        let _operation = self.operation(cx, true)?;
         checkpoint(cx)?;
         self.ensure_writable()?;
         let parent_node = self.node(cx, parent)?;
@@ -798,6 +842,7 @@ impl FsOps for FatFs {
         new_parent: InodeNumber,
         new_name: &OsStr,
     ) -> Result<()> {
+        let _operation = self.operation(cx, true)?;
         checkpoint(cx)?;
         self.ensure_writable()?;
         let parent_dir = self.node(cx, parent)?.directory()?;
@@ -833,6 +878,7 @@ impl FsOps for FatFs {
     }
 
     fn readlink(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber) -> Result<Vec<u8>> {
+        let _operation = self.operation(cx, false)?;
         self.node(cx, ino)?;
         Err(FfsError::Io(std::io::Error::from_raw_os_error(
             libc::EINVAL,
@@ -840,6 +886,7 @@ impl FsOps for FatFs {
     }
 
     fn statfs(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber) -> Result<FsStat> {
+        let _operation = self.operation(cx, false)?;
         self.node(cx, ino)?;
         let cached = self.state()?.free_clusters;
         let free = if let Some(free) = cached {
@@ -870,6 +917,7 @@ impl FsOps for FatFs {
         _fh: u64,
         _datasync: bool,
     ) -> Result<()> {
+        let _operation = self.operation(cx, true)?;
         self.node(cx, ino)?;
         if self.writable {
             sync_volume(cx, &self.volume).map_err(map_mutation_error)?;
@@ -885,6 +933,7 @@ impl FsOps for FatFs {
         _fh: u64,
         _datasync: bool,
     ) -> Result<()> {
+        let _operation = self.operation(cx, true)?;
         self.node(cx, ino)?.directory()?;
         if self.writable {
             sync_volume(cx, &self.volume).map_err(map_mutation_error)?;
@@ -893,6 +942,7 @@ impl FsOps for FatFs {
     }
 
     fn flush_on_destroy(&self, cx: &Cx) -> Result<()> {
+        let _operation = self.operation(cx, true)?;
         if self.writable {
             sync_volume(cx, &self.volume).map_err(map_mutation_error)?;
         }
@@ -907,6 +957,7 @@ impl FsOps for FatFs {
         offset: u64,
         whence: SeekWhence,
     ) -> Result<u64> {
+        let _operation = self.operation(cx, false)?;
         let node = self.node(cx, ino)?;
         let entry = node.entry.as_ref().ok_or(FfsError::IsDirectory)?;
         let chain = self.chain(cx, ino, entry)?;
@@ -962,5 +1013,187 @@ mod tests {
             fat_wall_time(FatTimestamp::parse(0, 0, 0).map(Some), 4096),
             Err(FfsError::Corruption { block: 8, .. })
         ));
+    }
+
+    fn writable_fat16() -> (tempfile::TempDir, FatFs) {
+        use clap::Parser as _;
+
+        let cx = Cx::for_testing();
+        let directory = tempfile::tempdir().unwrap();
+        let image = directory.path().join("volume.fat");
+        let cli = crate::Cli::try_parse_from([
+            "ffs-fat",
+            "format",
+            image.to_str().unwrap(),
+            "--kind",
+            "fat16",
+            "--size-mib",
+            "4",
+        ])
+        .unwrap();
+        let crate::Command::Format { options } = cli.command else {
+            panic!("expected formatter options");
+        };
+        crate::formatter::create(&cx, &options).unwrap();
+        let args = crate::reader::ImageArgs {
+            image,
+            offset: 0,
+            length: None,
+            oem_code_page: ffs_ondisk::fat::FatOemCodePage::Ascii,
+            sidecar: None,
+        };
+        let volume = crate::reader::replacement::open_volume(&cx, &args, true).unwrap();
+        let fs = FatFs::new_with_mode(&cx, volume, 1000, 1000, true).unwrap();
+        (directory, fs)
+    }
+
+    #[test]
+    fn fat16_operation_gate_shares_reads_and_excludes_mutation() {
+        let (_directory, fs) = writable_fat16();
+        let cx = Cx::for_testing();
+        let reader = fs.operation(&cx, false).unwrap();
+        assert!(fs.operations.try_read().is_ok());
+        assert!(matches!(
+            fs.operations.try_write(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        drop(reader);
+        let writer = fs.operation(&cx, true).unwrap();
+        assert!(matches!(
+            fs.operations.try_read(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        assert!(matches!(
+            fs.operations.try_write(),
+            Err(std::sync::TryLockError::WouldBlock)
+        ));
+        drop(writer);
+        assert!(fs.operations.try_write().is_ok());
+    }
+
+    #[test]
+    fn fat16_panicked_mutation_gate_fails_closed() {
+        let (_directory, fs) = writable_fat16();
+        let cx = Cx::for_testing();
+        let panic = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _writer = fs.operation(&cx, true).unwrap();
+            panic!("injected interruption while holding the mutation gate");
+        }));
+        assert!(panic.is_err());
+        assert!(matches!(
+            fs.getattr(&cx, &mut RequestScope::empty(), ROOT),
+            Err(FfsError::Io(_))
+        ));
+        assert!(matches!(fs.flush_on_destroy(&cx), Err(FfsError::Io(_))));
+    }
+
+    #[test]
+    fn fat16_parallel_range_writes_preserve_all_updates() {
+        const WORKERS: usize = 8;
+        const STRIDE: usize = 512;
+        const PAYLOAD: usize = 37;
+        let (_directory, fs) = writable_fat16();
+        let cx = Cx::for_testing();
+        let file = fs
+            .create(
+                &cx,
+                &mut RequestScope::empty(),
+                ROOT,
+                OsStr::new("parallel.bin"),
+                0o644,
+                1000,
+                1000,
+            )
+            .unwrap();
+        let barrier = std::sync::Barrier::new(WORKERS);
+        std::thread::scope(|threads| {
+            for worker in 0..WORKERS {
+                let fs = &fs;
+                let barrier = &barrier;
+                let ino = file.ino;
+                threads.spawn(move || {
+                    let cx = Cx::for_testing();
+                    let payload = [u8::try_from(worker + 1).unwrap(); PAYLOAD];
+                    barrier.wait();
+                    assert_eq!(
+                        fs.write(
+                            &cx,
+                            &mut RequestScope::empty(),
+                            ino,
+                            (worker * STRIDE) as u64,
+                            &payload,
+                        )
+                        .unwrap(),
+                        PAYLOAD as u32
+                    );
+                });
+            }
+        });
+        let length = (WORKERS - 1) * STRIDE + PAYLOAD;
+        let mut expected = vec![0; length];
+        for worker in 0..WORKERS {
+            expected[worker * STRIDE..worker * STRIDE + PAYLOAD]
+                .fill(u8::try_from(worker + 1).unwrap());
+        }
+        assert_eq!(
+            fs.read(&cx, &mut RequestScope::empty(), file.ino, 0, length as u32)
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            fs.getattr(&cx, &mut RequestScope::empty(), file.ino)
+                .unwrap()
+                .size,
+            length as u64
+        );
+        let check = fs.volume.check(&cx).unwrap();
+        assert!(check.clean && check.complete && check.namespace_complete);
+    }
+
+    #[test]
+    fn fat16_parallel_creates_keep_allocation_and_namespace_consistent() {
+        const WORKERS: usize = 8;
+        let (_directory, fs) = writable_fat16();
+        let barrier = std::sync::Barrier::new(WORKERS);
+        std::thread::scope(|threads| {
+            for worker in 0..WORKERS {
+                let fs = &fs;
+                let barrier = &barrier;
+                threads.spawn(move || {
+                    let cx = Cx::for_testing();
+                    let name = format!("file{worker}.bin");
+                    let payload = vec![u8::try_from(worker + 1).unwrap(); 1061];
+                    barrier.wait();
+                    let file = fs
+                        .create(
+                            &cx,
+                            &mut RequestScope::empty(),
+                            ROOT,
+                            OsStr::new(&name),
+                            0o644,
+                            1000,
+                            1000,
+                        )
+                        .unwrap();
+                    fs.write(&cx, &mut RequestScope::empty(), file.ino, 0, &payload)
+                        .unwrap();
+                });
+            }
+        });
+        let cx = Cx::for_testing();
+        for worker in 0..WORKERS {
+            let name = format!("file{worker}.bin");
+            let file = fs
+                .lookup(&cx, &mut RequestScope::empty(), ROOT, OsStr::new(&name))
+                .unwrap();
+            assert_eq!(
+                fs.read(&cx, &mut RequestScope::empty(), file.ino, 0, 1061)
+                    .unwrap(),
+                vec![u8::try_from(worker + 1).unwrap(); 1061]
+            );
+        }
+        let check = fs.volume.check(&cx).unwrap();
+        assert!(check.clean && check.complete && check.namespace_complete);
+        assert_eq!(check.files, WORKERS as u64);
     }
 }
