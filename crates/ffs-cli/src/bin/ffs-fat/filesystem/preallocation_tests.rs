@@ -6,6 +6,8 @@ use ffs_block::ByteDevice;
 use ffs_ondisk::fat::FatGeometry;
 use ffs_types::ByteOffset;
 
+mod zero_range;
+
 type Pages = BTreeMap<u64, [u8; 512]>;
 
 #[derive(Default)]
@@ -396,7 +398,7 @@ fn invalid_allocation_requests_do_not_mutate_or_poison_the_mount() {
         (u64::MAX, 1, 0, libc::EFBIG),
         (u64::from(u32::MAX), 1, 1, libc::EFBIG),
         (0, 1, libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, libc::EOPNOTSUPP),
-        (0, 1, libc::FALLOC_FL_ZERO_RANGE, libc::EOPNOTSUPP),
+        (0, 1, libc::FALLOC_FL_ZERO_RANGE | libc::FALLOC_FL_PUNCH_HOLE, libc::EOPNOTSUPP),
         (0, 1, -1, libc::EOPNOTSUPP),
     ] {
         assert!(matches!(fs.fallocate(&cx, &mut scope, ino, offset, length, mode), Err(FfsError::Io(error)) if error.raw_os_error() == Some(errno)));

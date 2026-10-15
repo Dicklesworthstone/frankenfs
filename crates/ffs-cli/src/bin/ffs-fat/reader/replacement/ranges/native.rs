@@ -5,6 +5,8 @@
 //! data in place. A failed or interrupted operation can leave a partial overwrite
 //! or leaked allocation and requires checking/recovery; it is not crash-atomic.
 
+mod zero;
+
 use super::super::super::{Entry, FatTable, FatVolume, FileChain, MAX_CHAIN_CLUSTERS};
 use super::super::{
     EXPECT_END, HASH_BYTES, allocate, change_fat, checkpoint, modified_timestamp,
@@ -76,6 +78,9 @@ impl FatVolume {
         now: u64,
     ) -> Result<()> {
         checkpoint(cx)?;
+        if mode & libc::FALLOC_FL_ZERO_RANGE != 0 {
+            return zero::apply(cx, self, path, offset, length, mode, now);
+        }
         if mode & !libc::FALLOC_FL_KEEP_SIZE != 0 {
             return Err(FfsError::Io(std::io::Error::from_raw_os_error(
                 libc::EOPNOTSUPP,
@@ -105,6 +110,7 @@ impl FatVolume {
         apply_update(cx, self, path, &entry, &original.chain, &source, Update {
             capacity: u32::try_from(end.max(size)).context("FAT reservation exceeds native size")?,
             modified,
+            changed: changed_range(u64::from(original.chain.size), &source),
         })
     }
 }
@@ -113,6 +119,8 @@ struct Update {
     /// Allocation capacity and logical EOF are distinct for KEEP_SIZE.
     capacity: u32,
     modified: Option<(u16, u16)>,
+    /// Visible bytes whose expected contents do not depend on overwritten data.
+    changed: std::ops::Range<u64>,
 }
 
 struct Allocation {
@@ -204,6 +212,7 @@ pub(super) fn apply(
     apply_update(cx, volume, path, entry, old, source, Update {
         capacity: u32::try_from(source.size).context("FAT range exceeds 4 GiB - 1")?,
         modified: Some(modified_timestamp(now)?),
+        changed: changed_range(u64::from(old.size), source),
     })
 }
 
@@ -213,7 +222,7 @@ fn apply_update(
     path: &str,
     entry: &Entry,
     old: &FileChain,
-    source: &EditSource<'_>,
+    source: &dyn ByteDevice,
     update: Update,
 ) -> Result<()> {
     checkpoint(cx)?;
@@ -226,9 +235,17 @@ fn apply_update(
     if entry.native.attributes & 0xC8 != 0 || old.size != entry.native.size {
         bail!("unsupported or stale native range target");
     }
-    let size = u32::try_from(source.size).context("FAT range exceeds 4 GiB - 1")?;
+    let size = u32::try_from(source.len_bytes()).context("FAT range exceeds 4 GiB - 1")?;
     if size < old.size || update.capacity < size {
         bail!("native growth must not replace the verified shrink path");
+    }
+    let changed = update.changed;
+    if changed.start > changed.end
+        || changed.end > u64::from(size)
+        || (size > old.size
+            && (changed.start > u64::from(old.size) || changed.end != u64::from(size)))
+    {
+        bail!("native update must initialize every newly visible byte");
     }
     // The checker also runs inside dirty transactions, so clean allocation is
     // not clean-state admission. Recheck BPBs AND selected FAT reserved entries.
@@ -238,7 +255,11 @@ fn apply_update(
         bail!("native range update requires complete clean allocation and namespace: {}", serde_json::to_string(&before)?);
     }
     let allocation = Allocation::prepare(cx, volume, old, update.capacity, before.free_clusters)?;
-    if update.modified.is_none() && allocation.added.is_empty() && size == old.size {
+    if update.modified.is_none()
+        && allocation.added.is_empty()
+        && changed.is_empty()
+        && size == old.size
+    {
         // A reservation is idempotent. No dirty markers, timestamps, FSInfo
         // writes or synchronization are needed for already owned capacity.
         checkpoint(cx)?;
@@ -278,7 +299,6 @@ fn apply_update(
     if sector[within..within + 32] != original {
         bail!("native range directory entry changed before mutation");
     }
-    let changed = changed_range(u64::from(old.size), source);
     let mut phase = "publishing dirty state";
     let result = (|| -> Result<()> {
         set_dirty(cx, volume, true)?;
@@ -332,7 +352,7 @@ fn apply_update(
                     let count = (cluster_bytes - within).min(HASH_BYTES as u64) as usize;
                     bytes[..count].fill(0);
                     let logical = logical_base + within;
-                    let visible = source.size.saturating_sub(logical).min(count as u64) as usize;
+                    let visible = u64::from(size).saturating_sub(logical).min(count as u64) as usize;
                     if visible != 0 {
                         source.read_exact_at(cx, ByteOffset(logical), &mut bytes[..visible])?;
                     }
