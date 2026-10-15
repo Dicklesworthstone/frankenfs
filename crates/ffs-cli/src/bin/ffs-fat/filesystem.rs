@@ -26,6 +26,8 @@ const MAX_NODES: usize = 131_072;
 const MAX_CACHED_CHAINS: usize = 1024;
 const DIRECTORY_PAGE: usize = 256;
 const FIRST_SYNTHETIC_INO: u64 = 1_u64 << 48;
+// Reserve cookies 1/2 for dot entries and stay inside FUSE's signed d_off.
+const MAX_SYNTHETIC_INO: u64 = (1_u64 << 63) - 3;
 
 #[derive(Clone)]
 struct Node {
@@ -60,6 +62,22 @@ impl Default for State {
             cached_clusters: 0,
             free_clusters: None,
         }
+    }
+}
+
+impl State {
+    fn ensure_new_node(&self, writable: bool) -> Result<()> {
+        if self.nodes.len() >= MAX_NODES {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                libc::ENOMEM,
+            )));
+        }
+        if writable && self.next_synthetic_ino > MAX_SYNTHETIC_INO {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                libc::EOVERFLOW,
+            )));
+        }
+        Ok(())
     }
 }
 
@@ -254,8 +272,8 @@ impl FatFs {
     fn refresh_node_from_path(&self, cx: &Cx, ino: InodeNumber, path: &str) -> Result<Node> {
         let entry = self
             .volume
-            .resolve(cx, path)?;
-        let entry = entry.ok_or_else(|| FfsError::NotFound(path.to_owned()))?;
+            .resolve(cx, path)?
+            .ok_or_else(|| FfsError::NotFound(path.to_owned()))?;
         let mut state = self.state()?;
         Self::invalidate_cached_chain(&mut state, ino);
         state.free_clusters = None;
@@ -311,62 +329,45 @@ impl FatFs {
                 ancestor = node.parent;
             }
         }
-        if let Some(&mapped_ino) = state.slot_to_ino.get(&entry.offset)
-            && let Some(existing) = state.nodes.get_mut(&mapped_ino)
-        {
-            if !self.writable
-                && (existing.parent != parent
-                    || existing
-                        .entry
-                        .as_ref()
-                        .is_none_or(|old| old.native != entry.native))
-            {
+        if let Some(&mapped_ino) = state.slot_to_ino.get(&entry.offset) {
+            let existing = state.nodes.get_mut(&mapped_ino).ok_or_else(|| FfsError::Corruption {
+                block: entry.offset / 512,
+                detail: "FAT slot mapping has no live node".into(),
+            })?;
+            let changed = existing
+                .entry
+                .as_ref()
+                .is_none_or(|old| old.native != entry.native);
+            if existing.parent != parent || (!self.writable && changed) {
                 return Err(FfsError::Corruption {
                     block: entry.offset / 512,
                     detail: "FAT namespace identity changed or is cross-linked".into(),
                 });
             }
-            existing.parent = parent;
             existing.entry = Some(entry);
+            if changed {
+                Self::invalidate_cached_chain(&mut state, mapped_ino);
+                state.free_clusters = None;
+            }
             return Ok(mapped_ino);
         }
 
-        let default_ino = InodeNumber(entry.offset / 32 + 2);
-        let ino = if let Some(existing) = state.nodes.get(&default_ino) {
-            let same_slot = existing
-                .entry
-                .as_ref()
-                .is_some_and(|old| old.offset == entry.offset);
-            if same_slot {
-                if !self.writable
-                    && (existing.parent != parent
-                        || existing
-                            .entry
-                            .as_ref()
-                            .is_none_or(|old| old.native != entry.native))
-                {
-                    return Err(FfsError::Corruption {
-                        block: entry.offset / 512,
-                        detail: "FAT namespace identity changed or is cross-linked".into(),
-                    });
-                }
-                let existing_mut = state.nodes.get_mut(&default_ino).expect("checked above");
-                existing_mut.parent = parent;
-                existing_mut.entry = Some(entry.clone());
-                state.slot_to_ino.insert(entry.offset, default_ino);
-                return Ok(default_ino);
-            }
+        state.ensure_new_node(self.writable)?;
+        let ino = if self.writable {
+            // A deleted/replaced slot can be reused while the kernel still
+            // holds the old node ID. Never let that ID address another file.
             let allocated = InodeNumber(state.next_synthetic_ino);
             state.next_synthetic_ino += 1;
             allocated
         } else {
-            default_ino
+            // Preserve the immutable adapter's existing slot-based identity.
+            InodeNumber(entry.offset / 32 + 2)
         };
-
-        if state.nodes.len() >= MAX_NODES {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                libc::ENOMEM,
-            )));
+        if state.nodes.contains_key(&ino) {
+            return Err(FfsError::Corruption {
+                block: entry.offset / 512,
+                detail: "FAT node ID already belongs to another slot".into(),
+            });
         }
         state.slot_to_ino.insert(entry.offset, ino);
         state.nodes.insert(
@@ -403,6 +404,53 @@ impl FatFs {
             names.push(name);
         }
         Ok(names)
+    }
+
+    fn mutable_readdir(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        parent: InodeNumber,
+        offset: u64,
+        entries: Vec<Entry>,
+        names: Vec<String>,
+    ) -> Result<ReaddirPage> {
+        let mut page = Vec::with_capacity(entries.len() + 2);
+        for (cookie, target, name) in [
+            (1, ino, b".".as_slice()),
+            (2, parent, b"..".as_slice()),
+        ] {
+            page.push(DirEntry {
+                ino: target,
+                offset: cookie,
+                kind: FileType::Directory,
+                name: name.to_vec(),
+            });
+        }
+        for (entry, name) in entries.into_iter().zip(names) {
+            checkpoint(cx)?;
+            let kind = if entry.native.is_directory() {
+                FileType::Directory
+            } else {
+                FileType::RegularFile
+            };
+            let target = self.register(cx, ino, entry)?;
+            page.push(DirEntry {
+                ino: target,
+                offset: target.0 + 2,
+                kind,
+                name: name.into_bytes(),
+            });
+        }
+        // Physical cluster order may be fragmented. Neither physical offsets
+        // nor indexes in a filtered listing are restartable mutation cookies.
+        // Existing IDs/cookies survive unrelated deletions and slot reuse.
+        page.sort_unstable_by_key(|entry| entry.offset);
+        let end_cookie = page.last().map(|entry| entry.offset);
+        page.retain(|entry| entry.offset > offset);
+        page.truncate(DIRECTORY_PAGE);
+        checkpoint(cx)?;
+        Ok(ReaddirPage::new(page).with_end_cookie(end_cookie))
     }
 
     fn chain(&self, cx: &Cx, ino: InodeNumber, entry: &Entry) -> Result<Arc<FileChain>> {
@@ -550,6 +598,9 @@ impl FsOps for FatFs {
         let node = self.node(cx, ino)?;
         let entries = self.volume.list(cx, node.directory()?)?;
         let names = Self::checked_names(&entries)?;
+        if self.writable {
+            return self.mutable_readdir(cx, ino, node.parent, offset, entries, names);
+        }
         let end_cookie = entries.len() as u64 + 2;
         let mut page = Vec::new();
         for (cookie, target, name) in [
@@ -652,6 +703,7 @@ impl FsOps for FatFs {
         let _operation = self.operation(cx, true)?;
         checkpoint(cx)?;
         self.ensure_writable()?;
+        self.state()?.ensure_new_node(true)?;
         let parent_node = self.node(cx, parent)?;
         let parent_dir = parent_node.directory()?;
         let (path, name_str) = self.child_path(parent, name)?;
@@ -678,6 +730,7 @@ impl FsOps for FatFs {
         let _operation = self.operation(cx, true)?;
         checkpoint(cx)?;
         self.ensure_writable()?;
+        self.state()?.ensure_new_node(true)?;
         let parent_node = self.node(cx, parent)?;
         let parent_dir = parent_node.directory()?;
         let (path, name_str) = self.child_path(parent, name)?;
@@ -782,17 +835,6 @@ impl FsOps for FatFs {
         if let Some(removed_ino) = state.slot_to_ino.remove(&existing_entry.offset) {
             Self::invalidate_cached_chain(&mut state, removed_ino);
             state.nodes.remove(&removed_ino);
-        } else {
-            let fallback_ino = InodeNumber(existing_entry.offset / 32 + 2);
-            if state
-                .nodes
-                .get(&fallback_ino)
-                .and_then(|n| n.entry.as_ref())
-                .is_some_and(|e| e.offset == existing_entry.offset)
-            {
-                Self::invalidate_cached_chain(&mut state, fallback_ino);
-                state.nodes.remove(&fallback_ino);
-            }
         }
         Ok(())
     }
@@ -819,16 +861,6 @@ impl FsOps for FatFs {
         state.free_clusters = None;
         if let Some(removed_ino) = state.slot_to_ino.remove(&existing_entry.offset) {
             state.nodes.remove(&removed_ino);
-        } else {
-            let fallback_ino = InodeNumber(existing_entry.offset / 32 + 2);
-            if state
-                .nodes
-                .get(&fallback_ino)
-                .and_then(|n| n.entry.as_ref())
-                .is_some_and(|e| e.offset == existing_entry.offset)
-            {
-                state.nodes.remove(&fallback_ino);
-            }
         }
         Ok(())
     }
@@ -850,7 +882,11 @@ impl FsOps for FatFs {
         let (from_path, from_name) = self.child_path(parent, name)?;
         let (to_path, to_name) = self.child_path(new_parent, new_name)?;
         let src_before = self.volume.lookup(cx, parent_dir, &from_name)?;
-        let dst_before = self.volume.lookup(cx, new_parent_dir, &to_name).ok();
+        let dst_before = match self.volume.lookup(cx, new_parent_dir, &to_name) {
+            Ok(entry) => Some(entry),
+            Err(FfsError::NotFound(_)) => None,
+            Err(error) => return Err(error),
+        };
         let src_ino = self.register(cx, parent, src_before.clone())?;
 
         rename_in_volume(cx, &self.volume, &from_path, &to_path, false)
@@ -1195,5 +1231,148 @@ mod tests {
         let check = fs.volume.check(&cx).unwrap();
         assert!(check.clean && check.complete && check.namespace_complete);
         assert_eq!(check.files, WORKERS as u64);
+    }
+
+    fn create_file(fs: &FatFs, name: &str) -> InodeNumber {
+        fs.create(
+            &Cx::for_testing(),
+            &mut RequestScope::empty(),
+            ROOT,
+            OsStr::new(name),
+            0o644,
+            1000,
+            1000,
+        )
+        .unwrap()
+        .ino
+    }
+
+    #[test]
+    fn fat16_reused_slots_never_resurrect_retired_file_ids() {
+        let (_directory, fs) = writable_fat16();
+        let cx = Cx::for_testing();
+        let first = create_file(&fs, "FIRST.BIN");
+        let first_slot = fs.node(&cx, first).unwrap().entry.unwrap().offset;
+        fs.write(&cx, &mut RequestScope::empty(), first, 0, b"old")
+            .unwrap();
+        fs.unlink(&cx, &mut RequestScope::empty(), ROOT, OsStr::new("FIRST.BIN"))
+            .unwrap();
+        let second = create_file(&fs, "SECOND.BIN");
+        assert_eq!(fs.node(&cx, second).unwrap().entry.unwrap().offset, first_slot);
+        assert_ne!(first, second);
+        fs.write(&cx, &mut RequestScope::empty(), second, 0, b"new")
+            .unwrap();
+        assert!(matches!(
+            fs.read(&cx, &mut RequestScope::empty(), first, 0, 3),
+            Err(FfsError::NotFound(_))
+        ));
+        assert!(matches!(
+            fs.write(&cx, &mut RequestScope::empty(), first, 0, b"BAD"),
+            Err(FfsError::NotFound(_))
+        ));
+        assert_eq!(
+            fs.read(&cx, &mut RequestScope::empty(), second, 0, 3).unwrap(),
+            b"new"
+        );
+    }
+
+    #[test]
+    fn fat16_reused_directory_slots_never_resurrect_retired_ids() {
+        let (_directory, fs) = writable_fat16();
+        let cx = Cx::for_testing();
+        let mut scope = RequestScope::empty();
+        let first = fs.mkdir(&cx, &mut scope, ROOT, OsStr::new("OLD"), 0o755, 1000, 1000)
+            .unwrap();
+        fs.rmdir(&cx, &mut scope, ROOT, OsStr::new("OLD")).unwrap();
+        let second = fs.mkdir(&cx, &mut scope, ROOT, OsStr::new("NEW"), 0o755, 1000, 1000)
+            .unwrap();
+        assert_ne!(first.ino, second.ino);
+        assert!(matches!(fs.readdir(&cx, &mut scope, first.ino, 0), Err(FfsError::NotFound(_))));
+        assert_eq!(fs.lookup(&cx, &mut scope, ROOT, OsStr::new("NEW")).unwrap().ino, second.ino);
+    }
+
+    #[test]
+    fn fat16_readdir_cookies_survive_deletion_and_slot_reuse() {
+        let (_directory, fs) = writable_fat16();
+        let cx = Cx::for_testing();
+        for name in ["A.TXT", "B.TXT", "C.TXT"] {
+            create_file(&fs, name);
+        }
+        let first_page = fs.readdir(&cx, &mut RequestScope::empty(), ROOT, 0).unwrap();
+        let cursor = first_page.iter().find(|entry| entry.name == b"A.TXT").unwrap().offset;
+        let old_end = first_page.end_cookie().unwrap();
+        fs.unlink(&cx, &mut RequestScope::empty(), ROOT, OsStr::new("A.TXT"))
+            .unwrap();
+        create_file(&fs, "D.TXT");
+        let resumed = fs.readdir(&cx, &mut RequestScope::empty(), ROOT, cursor).unwrap();
+        let names: Vec<_> = resumed.iter().map(|entry| entry.name_str()).collect();
+        assert_eq!(names, ["B.TXT", "C.TXT", "D.TXT"]);
+        // The FUSE directory handle can still cap enumeration at its opening
+        // end cookie, without hiding any unchanged, previously unseen entry.
+        let bounded: Vec<_> = resumed.iter()
+            .filter(|entry| entry.offset <= old_end)
+            .map(|entry| entry.name_str())
+            .collect();
+        assert_eq!(bounded, ["B.TXT", "C.TXT"]);
+        assert!(resumed.iter().all(|entry| entry.offset > cursor));
+    }
+
+    #[test]
+    fn fat16_aliases_and_renames_keep_one_mount_identity() {
+        let (_directory, fs) = writable_fat16();
+        let cx = Cx::for_testing();
+        let ino = create_file(&fs, "A detailed report.txt");
+        let alias = fs.node(&cx, ino).unwrap().entry.unwrap().short_alias().unwrap();
+        assert_eq!(
+            fs.lookup(&cx, &mut RequestScope::empty(), ROOT, OsStr::new(&alias)).unwrap().ino,
+            ino
+        );
+        fs.rename(
+            &cx,
+            &mut RequestScope::empty(),
+            ROOT,
+            OsStr::new("A detailed report.txt"),
+            ROOT,
+            OsStr::new("FINAL.TXT"),
+        )
+        .unwrap();
+        assert_eq!(
+            fs.lookup(&cx, &mut RequestScope::empty(), ROOT, OsStr::new("FINAL.TXT")).unwrap().ino,
+            ino
+        );
+        assert_ne!(create_file(&fs, "FRESH.TXT"), ino);
+    }
+
+    #[test]
+    fn fat16_inode_exhaustion_refuses_creation_before_native_writes() {
+        let (directory, fs) = writable_fat16();
+        let cx = Cx::for_testing();
+        fs.state().unwrap().next_synthetic_ino = MAX_SYNTHETIC_INO;
+        let last = create_file(&fs, "LAST.TXT");
+        assert_eq!(last.0, MAX_SYNTHETIC_INO);
+        let page = fs.readdir(&cx, &mut RequestScope::empty(), ROOT, 0).unwrap();
+        assert_eq!(page.end_cookie(), Some((1_u64 << 63) - 1));
+        let image = directory.path().join("volume.fat");
+        let before = std::fs::read(&image).unwrap();
+        for directory_request in [false, true] {
+            let result = if directory_request {
+                fs.mkdir(&cx, &mut RequestScope::empty(), ROOT, OsStr::new("NO"), 0o755, 1000, 1000)
+            } else {
+                fs.create(
+                    &cx,
+                    &mut RequestScope::empty(),
+                    ROOT,
+                    OsStr::new("NO.TXT"),
+                    0o644,
+                    1000,
+                    1000,
+                )
+            };
+            assert!(matches!(
+                result,
+                Err(FfsError::Io(error)) if error.raw_os_error() == Some(libc::EOVERFLOW)
+            ));
+            assert_eq!(std::fs::read(&image).unwrap(), before);
+        }
     }
 }
