@@ -5,6 +5,7 @@
 //! Parent long-name and growth ordering is shared with file creation.
 
 mod rename_in_place;
+mod spelling;
 
 use super::super::super::ImageArgs;
 use super::super::{
@@ -74,6 +75,9 @@ pub struct RenameArgs {
     from: String,
     /// Destination native path inside the selected volume.
     to: String,
+    /// Refuse any existing destination, including another spelling or alias.
+    #[arg(long)]
+    no_replace: bool,
     /// Confirm exclusive ownership: no mounted or unrelated image writers.
     #[arg(long, required = true)]
     offline_image: bool,
@@ -830,6 +834,31 @@ pub fn rename_in_volume(
     to: &str,
     dry_run: bool,
 ) -> Result<serde_json::Value> {
+    rename_with_mode(cx, volume, from, to, dry_run, false)
+}
+
+impl super::super::super::FatVolume {
+    /// No-clobber rename under the caller's exclusive offline/mount writer gate.
+    /// Destination admission and mutation belong to one serialized operation.
+    pub fn rename_noreplace(
+        &self,
+        cx: &Cx,
+        from: &str,
+        to: &str,
+        dry_run: bool,
+    ) -> Result<serde_json::Value> {
+        rename_with_mode(cx, self, from, to, dry_run, true)
+    }
+}
+
+fn rename_with_mode(
+    cx: &Cx,
+    volume: &super::super::super::FatVolume,
+    from: &str,
+    to: &str,
+    dry_run: bool,
+    no_replace: bool,
+) -> Result<serde_json::Value> {
     checkpoint(cx)?;
     let (src_dir, _) = parent(cx, volume, from)?;
     let (dst_dir, dst_leaf) = parent(cx, volume, to)?;
@@ -849,7 +878,20 @@ pub fn rename_in_volume(
         Err(error) => return Err(error.into()),
     };
     if let Some(entry) = &dst_existing {
+        if no_replace {
+            return Err(FfsError::Exists.into());
+        }
         if entry.offset == src_entry.offset {
+            let displayed = src_entry.name()?;
+            if displayed != dst_leaf
+                && volume.oem_code_page.name_key(&displayed)
+                    == volume.oem_code_page.name_key(&dst_leaf)
+            {
+                if src_dir != dst_dir {
+                    bail!("same FAT entry is reachable through different native parents");
+                }
+                return spelling::rename(cx, volume, from, to, &src_entry, dry_run);
+            }
             return Ok(json!({
                 "operation": "rename",
                 "dry_run": dry_run,
@@ -1195,7 +1237,9 @@ pub fn run_rename(cx: &Cx, args: &RenameArgs) -> Result<serde_json::Value> {
         stable(&image, &args.image.image, image_stamp)?;
         volume
     };
-    let mut report = rename_in_volume(cx, &volume, &args.from, &args.to, args.dry_run)?;
+    let mut report = rename_with_mode(
+        cx, &volume, &args.from, &args.to, args.dry_run, args.no_replace,
+    )?;
     if !args.dry_run && args.image.sidecar.is_some() {
         report["sidecar_refreshed"] = true.into();
     }
