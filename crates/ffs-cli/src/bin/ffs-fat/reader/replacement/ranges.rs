@@ -1,10 +1,11 @@
 //! Bounded streaming sources for native range writes and truncation.
 //!
-//! Growing edits retain the replacement engine's disjoint-allocation, hash
-//! verification, publication and reclamation ordering. Shrinking retains the
-//! original prefix and publishes the shorter length before detaching and freeing
-//! the tail, so a full volume never prevents reclamation. Sources are composed
-//! on demand rather than materialized in a file-sized Vec.
+//! Old payload, patch bytes and zero extension are composed on demand, never in
+//! a file-sized Vec. Native range updates retain allocation and initialize only
+//! newly exposed bytes; explicit offline replacement keeps its separate COW
+//! protocol. In-place range updates are ordered, not crash-atomic overwrites.
+
+mod native;
 
 use super::super::{FatVolume, FileChain};
 use super::{
@@ -382,8 +383,7 @@ pub fn write_range_in_volume(
         offset,
         data,
     )?;
-    let plan = Replacement::prepare(cx, volume, path, &source, now)?;
-    plan.execute(cx, volume, &source, || Ok(()))?;
+    native::apply(cx, volume, path, &entry, &original.chain, &source, now)?;
     Ok(data.len())
 }
 
@@ -417,9 +417,7 @@ pub fn truncate_in_volume(
         chain: volume.file_chain(cx, &entry)?,
     };
     let source = EditSource::new(&original, size, 0, &[])?;
-    let plan = Replacement::prepare(cx, volume, path, &source, now)?;
-    plan.execute(cx, volume, &source, || Ok(()))?;
-    Ok(())
+    native::apply(cx, volume, path, &entry, &original.chain, &source, now)
 }
 
 companion_bin_tests! {
