@@ -1052,6 +1052,34 @@ impl FsOps for FatFs {
         operation.complete(())
     }
 
+    fn fallocate(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        offset: u64,
+        length: u64,
+        mode: i32,
+    ) -> Result<()> {
+        let operation = self.operation(cx, true)?;
+        self.ensure_writable()?;
+        let node = self.node(cx, ino)?;
+        let entry = node.entry.as_ref().ok_or(FfsError::IsDirectory)?;
+        if entry.native.is_directory() {
+            return Err(FfsError::IsDirectory);
+        }
+        if entry.native.attributes & 1 != 0 {
+            return Err(FfsError::PermissionDenied);
+        }
+        let path = self.path_for_inode(ino)?;
+        self.volume.preallocate(cx, &path, offset, length, mode, now_unix_secs())
+            .map_err(map_mutation_error)?;
+        // KEEP_SIZE changes st_blocks and free space even though st_size and
+        // the directory record may be unchanged. Invalidate both caches.
+        self.refresh_node_from_path(cx, ino, &path)?;
+        operation.complete(())
+    }
+
     fn lseek(
         &self,
         cx: &Cx,
@@ -1098,6 +1126,9 @@ fn fat_wall_time(
 }
 
 companion_bin_tests! {
+#[cfg(test)]
+mod preallocation_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
