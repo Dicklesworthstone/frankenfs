@@ -8,10 +8,12 @@
 //! dosfstools v4.2 src/{fat,boot}.c. No native implementation code is reused.
 
 mod creation;
+mod ranges;
 pub use creation::{
     MkdirArgs, RenameArgs, RmdirArgs, UnlinkArgs, mkdir_in_volume, rename_in_volume,
     rmdir_in_volume, run_mkdir, run_rename, run_rmdir, run_unlink, unlink_in_volume,
 };
+pub use ranges::{truncate_in_volume, write_range_in_volume};
 
 use super::{FatTable, FatVolume, ImageArgs, MAX_CHAIN_CLUSTERS, allocate, checkpoint, corrupt};
 use anyhow::{Context, Result, anyhow, bail};
@@ -917,69 +919,6 @@ pub fn replace_in_volume(
     let source = SliceSource(data);
     let plan = Replacement::prepare(cx, volume, path, &source, now)?;
     plan.execute(cx, volume, &source, || Ok(()))
-}
-
-pub fn write_range_in_volume(
-    cx: &Cx,
-    volume: &FatVolume,
-    path: &str,
-    offset: u64,
-    data: &[u8],
-    now: u64,
-) -> Result<usize> {
-    let entry = volume
-        .resolve(cx, path)?
-        .ok_or_else(|| anyhow!("cannot write to the root directory"))?;
-    if entry.native.is_directory() {
-        return Err(FfsError::IsDirectory.into());
-    }
-    let end = offset
-        .checked_add(data.len() as u64)
-        .context("write offset overflow")?;
-    let end_u32 = u32::try_from(end).context("FAT regular file write exceeds 4 GiB - 1")?;
-    let chain = volume.file_chain(cx, &entry)?;
-    let current = if entry.native.size == 0 {
-        Vec::new()
-    } else {
-        volume.read(cx, &chain, 0, entry.native.size as usize)?
-    };
-    let new_len = (entry.native.size.max(end_u32)) as usize;
-    let mut updated = allocate(new_len)?;
-    updated[..current.len()].copy_from_slice(&current);
-    let start = offset as usize;
-    updated[start..start + data.len()].copy_from_slice(data);
-    replace_in_volume(cx, volume, path, &updated, now)?;
-    Ok(data.len())
-}
-
-pub fn truncate_in_volume(
-    cx: &Cx,
-    volume: &FatVolume,
-    path: &str,
-    size: u64,
-    now: u64,
-) -> Result<()> {
-    let entry = volume
-        .resolve(cx, path)?
-        .ok_or_else(|| anyhow!("cannot truncate the root directory"))?;
-    if entry.native.is_directory() {
-        return Err(FfsError::IsDirectory.into());
-    }
-    let size_u32 = u32::try_from(size).context("FAT regular file truncate exceeds 4 GiB - 1")?;
-    if size_u32 == entry.native.size {
-        return Ok(());
-    }
-    let chain = volume.file_chain(cx, &entry)?;
-    let keep = entry.native.size.min(size_u32) as usize;
-    let prefix = if keep == 0 {
-        Vec::new()
-    } else {
-        volume.read(cx, &chain, 0, keep)?
-    };
-    let mut updated = allocate(size_u32 as usize)?;
-    updated[..prefix.len()].copy_from_slice(&prefix);
-    replace_in_volume(cx, volume, path, &updated, now)?;
-    Ok(())
 }
 
 pub fn set_attr_in_volume(
