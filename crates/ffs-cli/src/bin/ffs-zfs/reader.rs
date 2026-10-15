@@ -1,5 +1,6 @@
-//! Offline ZFS label discovery and explicit leaf/mirror/RAIDZ MOS-root extraction.
-//! No pool import, TXG selection, log replay, device writes or host path following.
+//! Offline ZFS label discovery and leaf/mirror/RAIDZ MOS-root extraction.
+//! Supports explicit or automatic read-only root selection, without log replay,
+//! device writes, live pool ownership or host path following.
 
 pub mod dmu;
 mod pool;
@@ -524,85 +525,14 @@ impl Leaf {
         })
     }
 
-    /// Automatically import the active uberblock (highest verified TXG, tie-broken
-    /// by timestamp) across all 4 labels of this standalone leaf.
+    /// Select the highest readable TXG using the same redundant-label policy
+    /// as multi-member pools. Explicit root extraction remains strict.
     pub fn import_active(
         &self,
         cx: &Cx,
         expected_pool_guid: Option<u64>,
     ) -> Result<(usize, usize, RootBlock)> {
-        checkpoint(cx)?;
-        let first_label = self.label(cx, 0)?;
-        let pool_guid = integer(&first_label.config, "pool_guid")?;
-        if let Some(expected) = expected_pool_guid
-            && expected != pool_guid
-        {
-            return Err(corrupt("label belongs to another pool GUID"));
-        }
-        let selected = first_label.single_leaf_with_mode(pool_guid, true)?;
-        let mut labels = Vec::with_capacity(4);
-        labels.push((0_usize, first_label));
-        for index in 1..4 {
-            let label = self.label(cx, index)?;
-            let other = label.single_leaf_with_mode(pool_guid, true)?;
-            if other != selected {
-                return Err(corrupt("ZFS label identities or configurations disagree"));
-            }
-            labels.push((index, label));
-        }
-        let expected_sum = selected.pool_guid.wrapping_add(selected.top_guid);
-        let mut candidates = Vec::new();
-        for (label_index, label) in &labels {
-            let ring_slots = UBERBLOCK_RING_BYTES / label.slot_bytes;
-            for slot in 0..ring_slots {
-                checkpoint(cx)?;
-                if let Ok(ub) = self.uberblock(cx, label, slot)
-                    && ub.version == selected.version
-                    && ub.txg >= selected.txg
-                    && ub.guid_sum == expected_sum
-                {
-                    candidates.push((*label_index, slot, ub));
-                }
-            }
-        }
-        if candidates.is_empty() {
-            return Err(corrupt("no valid active ZFS uberblock candidates in ring"));
-        }
-        candidates.sort_by(|a, b| {
-            b.2.txg
-                .cmp(&a.2.txg)
-                .then_with(|| b.2.timestamp.cmp(&a.2.timestamp))
-                .then_with(|| a.0.cmp(&b.0))
-                .then_with(|| a.1.cmp(&b.1))
-        });
-        let mut last_err = None;
-        for (label_index, slot, ub) in candidates {
-            checkpoint(cx)?;
-            match self.read_block(cx, &selected, &ub.root) {
-                Ok((data, physical_offset, copy_index)) => {
-                    if data.len() >= 1024 && ub.root.payload_order().u64(&data, 704).ok() == Some(1)
-                    {
-                        return Ok((
-                            label_index,
-                            slot,
-                            RootBlock {
-                                uberblock: ub,
-                                data,
-                                physical_offset,
-                                copy_index,
-                                member_guid: selected.top_guid,
-                                raidz: None,
-                                config: selected,
-                            },
-                        ));
-                    }
-                    last_err = Some(corrupt("selected root is not a META object set"));
-                }
-                Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
-                Err(err) => last_err = Some(err),
-            }
-        }
-        Err(last_err.unwrap_or_else(|| corrupt("all ZFS active uberblock candidates failed")))
+        Pool::from(self.clone()).import_active(cx, expected_pool_guid)
     }
 
     fn read_block(
