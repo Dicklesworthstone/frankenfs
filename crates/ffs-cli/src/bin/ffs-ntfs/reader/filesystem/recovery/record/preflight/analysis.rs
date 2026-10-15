@@ -234,6 +234,7 @@ impl State {
 mod tests {
     use super::*;
     use super::super::super::{LFS_CLIENT_RESTART, TailRecord};
+    use ffs_error::FfsError;
 
     fn record(lsn: u64, id: u32, redo: u16, undo: u16, previous: u64, next: u64) -> LogRecord {
         LogRecord { lsn, previous, undo_next: next, kind: LFS_CLIENT_RECORD,
@@ -373,12 +374,12 @@ mod tests {
         let mut calls = 0;
         let result = state.plan(&Cx::for_testing(), |lsn| {
             calls += 1;
-            if calls == 2 { return Err(crate::reader::FfsError::Cancelled); }
+            if calls == 2 { return Err(FfsError::Cancelled); }
             Ok(record(lsn, 24, 7, 7, 10, 10))
         });
-        assert!(matches!(result, Err(crate::reader::FfsError::Cancelled)));
+        assert!(matches!(result, Err(FfsError::Cancelled)));
         assert_eq!(calls, 2);
-        assert!(state.plan(&Cx::for_testing(), |_| Err(crate::reader::FfsError::Io(
+        assert!(state.plan(&Cx::for_testing(), |_| Err(FfsError::Io(
             std::io::Error::other("injected undo I/O failure")))).is_err());
     }
 
@@ -393,7 +394,7 @@ mod tests {
             reads += 1;
             Ok(record(lsn, 24, 7, 7, lsn - 1, lsn - 1))
         });
-        assert!(matches!(result, Err(crate::reader::FfsError::UnsupportedFeature(_))));
+        assert!(matches!(result, Err(FfsError::UnsupportedFeature(_))));
         assert_eq!(reads, MAX_UNDO_RECORDS);
     }
 
@@ -456,7 +457,7 @@ mod tests {
                 },
             );
             if reuse_committed {
-                assert!(matches!(result, Err(crate::reader::FfsError::Corruption { .. })));
+                assert!(matches!(result, Err(FfsError::Corruption { .. })));
             } else {
                 result.unwrap();
             }

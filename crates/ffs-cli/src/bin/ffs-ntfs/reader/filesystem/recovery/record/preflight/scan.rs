@@ -159,6 +159,7 @@ pub(super) fn collect(
 mod tests {
     use super::*;
     use super::super::super::{LFS_CLIENT_RECORD, MULTI_PAGE, PAGE_RECORD_END, TailRecord};
+    use ffs_error::FfsError;
     use std::collections::BTreeMap;
 
     const PAGE: usize = 4096;
@@ -347,10 +348,10 @@ mod tests {
         let mut calls = 0;
         let result = collect(&Cx::for_testing(), &restart, LOG, first, &mut |offset, _| {
             calls += 1;
-            if calls == 2 { return Err(crate::reader::FfsError::Cancelled); }
+            if calls == 2 { return Err(FfsError::Cancelled); }
             Ok(pages[&offset].clone())
         });
-        assert!(matches!(result, Err(crate::reader::FfsError::Cancelled)));
+        assert!(matches!(result, Err(FfsError::Cancelled)));
         assert_eq!(calls, 2);
     }
 
@@ -398,7 +399,7 @@ mod tests {
                 Ok(protect(page))
             },
         );
-        assert!(matches!(result, Err(crate::reader::FfsError::UnsupportedFeature(_))));
+        assert!(matches!(result, Err(FfsError::UnsupportedFeature(_))));
         assert_eq!(calls, 2 * MAX_RECORDS);
     }
 }
