@@ -9,6 +9,8 @@
 //! v6.17 fs/ntfs3/fslog.c. Their single-client records reserve different name
 //! capacities; only declared, bounded fields are interpreted here.
 
+mod record;
+
 use super::super::Storage;
 use super::{Cx, NtfsVolume, Result, Stream, checkpoint, corrupt, unsupported};
 
@@ -26,6 +28,15 @@ struct Restart {
     log_page: u32,
     version: (u16, u16),
     clean: bool,
+    current_lsn: u64,
+    seq_num_bits: u32,
+    file_size: u64,
+    last_lsn_data_len: u32,
+    record_header_len: u16,
+    data_off: u16,
+    active_client_seq: Option<u16>,
+    active_client_oldest_lsn: Option<u64>,
+    active_client_restart_lsn: Option<u64>,
     // Restored native restart bytes, excluding the header and its USA token.
     // Equal LSNs alone do not establish equal client/checkpoint state.
     area: Vec<u8>,
@@ -153,15 +164,17 @@ fn assess(
         read_exact(cx, length, system_page as u64, system_page, &mut read)?,
         length,
     )?;
-    if !first.clean || !second.clean {
-        return Err(unsupported(
-            "$LogFile requires native redo/undo recovery before mounting",
-        ));
-    }
     if first != second {
         return Err(unsupported(
             "$LogFile restart copies disagree; native recovery is required",
         ));
+    }
+    if !first.clean {
+        let tail = record::validate_dirty_tail(cx, &first, length, &mut read)?;
+        return Err(unsupported(format!(
+            "$LogFile requires native redo/undo recovery before mounting; current transaction {} has redo opcode {:#04x} and undo opcode {:#04x}",
+            tail.transaction_id, tail.redo_op, tail.undo_op
+        )));
     }
     checkpoint(cx)
 }
@@ -229,7 +242,10 @@ fn restart(cx: &Cx, mut page: Vec<u8>, stream_length: u64) -> Result<Restart> {
         return Err(corrupt(0, "invalid $LogFile restart/client region"));
     }
     let area = &tail[..area_length];
+    let current_lsn = u64_at(area, 0)?;
+    let seq_num_bits = u32_at(area, 16)?;
     let file_size = u64_at(area, 24)?;
+    let last_lsn_data_len = u32_at(area, 32)?;
     let minimum = 2 * u64::from(system_page) + 48 * u64::from(log_page);
     if file_size < minimum
         || file_size > stream_length
@@ -239,8 +255,10 @@ fn restart(cx: &Cx, mut page: Vec<u8>, stream_length: u64) -> Result<Restart> {
     {
         return Err(corrupt(0, "invalid $LogFile size or LSN sequence geometry"));
     }
-    let record_header = usize::from(u16_at(area, 36)?);
-    let data_offset = usize::from(u16_at(area, 38)?);
+    let record_header_len = u16_at(area, 36)?;
+    let data_off = u16_at(area, 38)?;
+    let record_header = usize::from(record_header_len);
+    let data_offset = usize::from(data_off);
     let minimum_data_offset = 40 + (log_size / SECTOR + 1) * 2;
     if record_header < 48
         || !record_header.is_multiple_of(8)
@@ -255,6 +273,9 @@ fn restart(cx: &Cx, mut page: Vec<u8>, stream_length: u64) -> Result<Restart> {
     let free = u16_at(area, 10)?;
     let active = u16_at(area, 12)?;
     let flags = u16_at(area, 14)?;
+    let mut active_client_seq = None;
+    let mut active_client_oldest_lsn = None;
+    let mut active_client_restart_lsn = None;
     if flags & !0x0003 != 0 || clients > 1 {
         return Err(unsupported("unknown $LogFile restart flags or multiple clients"));
     }
@@ -286,6 +307,11 @@ fn restart(cx: &Cx, mut page: Vec<u8>, stream_length: u64) -> Result<Restart> {
         if active != NO_CLIENT && &client[32..32 + name_size] != b"N\0T\0F\0S\0" {
             return Err(unsupported("unknown active $LogFile client"));
         }
+        if active != NO_CLIENT {
+            active_client_oldest_lsn = Some(u64_at(client, 0)?);
+            active_client_restart_lsn = Some(u64_at(client, 8)?);
+            active_client_seq = Some(u16_at(client, 20)?);
+        }
     }
     checkpoint(cx)?;
     Ok(Restart {
@@ -293,6 +319,15 @@ fn restart(cx: &Cx, mut page: Vec<u8>, stream_length: u64) -> Result<Restart> {
         log_page,
         version,
         clean: active == NO_CLIENT || flags & CLEAN != 0,
+        current_lsn,
+        seq_num_bits,
+        file_size,
+        last_lsn_data_len,
+        record_header_len,
+        data_off,
+        active_client_seq,
+        active_client_oldest_lsn,
+        active_client_restart_lsn,
         area: area.to_vec(),
     })
 }
@@ -411,13 +446,19 @@ mod tests {
         for (first, second) in [
             (clean.clone(), dirty.clone()),
             (dirty.clone(), clean.clone()),
-            (dirty.clone(), dirty),
         ] {
             assert!(matches!(
                 check(&pair(first, second)),
                 Err(FfsError::UnsupportedFeature(_))
             ));
         }
+        // Matching dirty copies advance to the record decoder. This fixture's
+        // tiny synthetic current LSN does not address a legal record page, so
+        // it is structural corruption rather than merely unsupported replay.
+        assert!(matches!(
+            check(&pair(dirty.clone(), dirty)),
+            Err(FfsError::Corruption { .. })
+        ));
         for at in [0, 40, 84] {
             let mut other = clean.clone();
             other[start + at] ^= 1;
