@@ -2,10 +2,11 @@
 //!
 //! Native layouts: Linux v6.17 fs/ntfs3/fslog.c (NTFS_RESTART,
 //! RESTART_TABLE, TRANSACTION_ENTRY, DIR_PAGE_ENTRY, OPEN_ATTR_ENRTY).
-//! No redo, undo, transaction-state inference, or backing writes occur here.
+//! No redo, undo, or backing writes occur here.
 //! Chronological traversal includes interleaved records after checkpoint-start.
-//! It does not infer transaction outcomes or prove that a dirty image is mountable.
+//! Transaction Analysis and loser undo planning do not make an image mountable.
 
+mod analysis;
 mod scan;
 mod table;
 
@@ -247,7 +248,8 @@ fn checkpoint_tables(
     record: &LogRecord,
     references: &mut References,
     read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
-) -> Result<()> {
+) -> Result<analysis::State> {
+    let mut state = analysis::State::default();
     let data = load_dump(cx, restart, stream_length, record, ATTRIBUTES, read)?;
     let attribute_table = data.as_deref()
         .map(|bytes| RestartTable::parse(cx, bytes)).transpose()?;
@@ -264,8 +266,9 @@ fn checkpoint_tables(
     if let Some(data) = load_dump(cx, restart, stream_length, record, TRANSACTIONS, read)? {
         let table = RestartTable::parse(cx, &data)?;
         transactions(cx, restart, &table, record.lsn, references)?;
+        state = analysis::State::from_table(cx, &table)?;
     }
-    Ok(())
+    Ok(state)
 }
 
 pub(super) fn validate(
@@ -277,6 +280,7 @@ pub(super) fn validate(
 ) -> Result<()> {
     checkpoint(cx)?;
     let mut references = References::default();
+    let mut state = analysis::State::default();
     let mut scan_start = restart.active_client_oldest_lsn
         .filter(|lsn| *lsn != 0).unwrap_or(tail.lsn);
     if tail.kind == LFS_CLIENT_RECORD {
@@ -291,14 +295,14 @@ pub(super) fn validate(
         let start = u64_at(&record.data, 8)?;
         older_reference(restart, start, record.lsn, "checkpoint-start")?;
         scan_start = if start == 0 { record.lsn } else { start };
-        checkpoint_tables(cx, restart, stream_length, &record, &mut references, read)?;
+        state = checkpoint_tables(cx, restart, stream_length, &record, &mut references, read)?;
     } else if tail.kind == LFS_CLIENT_RESTART {
         // Validate even a checkpoint tail whose active-client pointer is absent.
         // Its absence is not interpreted as a fully initialized recovery state.
         let start = u64_at(&tail.data, 8)?;
         older_reference(restart, start, tail.lsn, "checkpoint-start")?;
         scan_start = if start == 0 { tail.lsn } else { start };
-        checkpoint_tables(cx, restart, stream_length, tail, &mut references, read)?;
+        state = checkpoint_tables(cx, restart, stream_length, tail, &mut references, read)?;
     }
     // A transaction chain omits every other transaction. Read the physical
     // sequence as well, and check ownership of links from ALL encountered
@@ -306,6 +310,7 @@ pub(super) fn validate(
     let history = scan::collect(cx, restart, stream_length, scan_start, read)?;
     for record in &history {
         checkpoint(cx)?;
+        state.observe(cx, record)?;
         if record.kind == LFS_CLIENT_RECORD {
             references.add(restart, record.lsn, record.summary.transaction_id)?;
             references.links(restart, record)?;
@@ -319,6 +324,15 @@ pub(super) fn validate(
         }
         references.links(restart, &record)?;
     }
+    let report = state.finish(cx, restart, stream_length, read)?;
+    tracing::debug!(
+        target: "ffs::ntfs::recovery",
+        active_transactions = report.active,
+        prepared_transactions = report.prepared,
+        committed_transactions = report.committed,
+        undo_operations = report.undo.len(),
+        "Validated NTFS transaction Analysis through the selected restart; replay remains required"
+    );
     checkpoint(cx)
 }
 
