@@ -5,6 +5,7 @@ mod features;
 pub mod scrub;
 mod seek;
 mod zap;
+pub mod zil;
 pub mod zpl;
 
 use super::{

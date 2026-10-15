@@ -1,5 +1,7 @@
 //! ZPL path commands; host paths are never resolved from native directory data.
 
+mod zil;
+
 use super::{CandidateArgs, Context, Cx, Result, bail, json};
 use clap::{Args, Subcommand};
 use ffs_ondisk::zfs_zpl::{Kind, Metadata};
@@ -24,6 +26,8 @@ pub struct FileArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum FileCommand {
+    #[command(flatten)]
+    Zil(zil::Command),
     /// Verify one dataset's allocated DMU blocks without writing or healing.
     Scrub {
         #[command(flatten)]
@@ -149,6 +153,7 @@ fn dataset_components(name: &str) -> Result<Vec<Vec<u8>>> {
 impl FileCommand {
     pub(super) fn run(self, cx: &Cx) -> Result<()> {
         let (file, output) = match self {
+            Self::Zil(command) => return command.run(cx),
             Self::Scrub {
                 candidate,
                 dataset,
