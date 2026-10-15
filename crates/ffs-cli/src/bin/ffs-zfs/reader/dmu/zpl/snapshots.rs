@@ -34,9 +34,9 @@ pub struct Snapshot {
     pub objectset_kind: u64,
 }
 
-struct SnapshotRoot {
-    info: Snapshot,
-    root: BlockPointer,
+pub(in crate::reader::dmu) struct SnapshotRoot {
+    pub(in crate::reader::dmu) info: Snapshot,
+    pub(in crate::reader::dmu) root: BlockPointer,
 }
 
 struct Record {
@@ -345,13 +345,22 @@ impl Objects {
 
     /// Exact stored-name selection, not case-folded alias selection. A missing
     /// snapshot is an error; never fall back to current head bytes or rewind TXG.
-    pub fn zpl_snapshot(&mut self, cx: &Cx, components: &[Vec<u8>], name: &[u8]) -> Result<Zpl> {
+    pub(in crate::reader::dmu) fn named_snapshot_root(
+        &mut self,
+        cx: &Cx,
+        components: &[Vec<u8>],
+        name: &[u8],
+    ) -> Result<SnapshotRoot> {
         valid_name(name)?;
-        let selected = self
+        self
             .snapshot_roots(cx, components)?
             .into_iter()
             .find(|row| row.info.name == name)
-            .ok_or_else(|| FfsError::NotFound("ZFS named snapshot".into()))?;
+            .ok_or_else(|| FfsError::NotFound("ZFS named snapshot".into()))
+    }
+
+    pub fn zpl_snapshot(&mut self, cx: &Cx, components: &[Vec<u8>], name: &[u8]) -> Result<Zpl> {
+        let selected = self.named_snapshot_root(cx, components, name)?;
         if selected.info.objectset_kind != 2 || selected.info.flags & 0x1_0000 != 0 {
             return Err(unsupported(
                 "ZPL snapshot reads require a case-sensitive filesystem",
