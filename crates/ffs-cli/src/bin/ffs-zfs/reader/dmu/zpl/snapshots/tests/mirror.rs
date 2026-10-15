@@ -186,3 +186,82 @@ fn cancellation_of_a_later_historical_block_cannot_select_another_member_or_head
     );
     assert_eq!(before.stat(&cx, 3).unwrap().0.size, 2049);
 }
+
+#[test]
+fn scrub_rechecks_mirrored_snapshot_blocks_without_reading_the_head() {
+    use crate::reader::dmu::scrub::ScrubLimits;
+
+    let cx = Cx::for_testing();
+    for order in [Endian::Little, Endian::Big] {
+        for case in [0, 21] {
+            let (source, reads) = mirror_pool(order, case, [Fault::None; 2]);
+            let mut objects = source.objects(&cx, 0, 2, 123).unwrap();
+            let mut before = objects.zpl_snapshot(&cx, &[], b"before").unwrap();
+            drop(source);
+            assert_eq!(before.read(&cx, 3, 0, 2049).unwrap(), old_bytes());
+            let old_count = count(&reads[0], OLD_INDIRECT);
+            let report = before.scrub(&cx, ScrubLimits::default()).unwrap();
+            assert!(report.is_clean(), "{report:?}");
+            assert_eq!(report.view_txg, before.view_txg());
+            assert_eq!(report.root_birth, 18);
+            assert_eq!(report.objects_examined, 5);
+            assert_eq!(report.verified_blocks, 6);
+            assert!(count(&reads[0], OLD_INDIRECT) > old_count);
+            assert!(count(&reads[1], OLD_INDIRECT) > 0);
+            assert_eq!(count(&reads[0], LIVE_FIRST), 0);
+            assert_eq!(count(&reads[1], LIVE_FIRST), 0);
+            if case == 21 {
+                assert_eq!(count(&reads[0], OLD_FIRST), 0);
+                assert_eq!(count(&reads[1], OLD_FIRST), 0);
+            }
+            // A separately selected live view must retain its own root/caches.
+            let head = objects.zpl(&cx, &[]).unwrap();
+            let live = head.scrub(&cx, ScrubLimits::default()).unwrap();
+            assert!(live.is_clean(), "{live:?}");
+            assert_eq!(live.root_birth, 60);
+            assert_ne!(live.root_birth, report.root_birth);
+        }
+    }
+}
+
+#[test]
+fn scrub_reports_all_copy_failure_instead_of_substituting_live_data() {
+    use crate::reader::dmu::scrub::ScrubLimits;
+
+    let cx = Cx::for_testing();
+    let faults = [Fault::Io(BASE as u64 + OLD_LAST); 2];
+    let (source, reads) = mirror_pool(Endian::Little, 0, faults);
+    let mut objects = source.objects(&cx, 0, 2, 123).unwrap();
+    let before = objects.zpl_snapshot(&cx, &[], b"before").unwrap();
+    let report = before.scrub(&cx, ScrubLimits::default()).unwrap();
+    assert!(!report.is_clean());
+    assert_eq!(report.errors, 1);
+    assert_eq!(report.issues[0].object, 3);
+    assert_eq!(report.issues[0].block, Some(2));
+    assert_eq!(report.objects_examined, 5);
+    for member in &reads {
+        assert_eq!(count(member, OLD_LAST), 1);
+        assert_eq!(count(member, LIVE_FIRST), 0);
+    }
+}
+
+#[test]
+fn scrub_snapshot_cancellation_is_terminal_before_mirror_fallback() {
+    use crate::reader::dmu::scrub::ScrubLimits;
+
+    let cx = Cx::for_testing();
+    let (source, reads) = mirror_pool(
+        Endian::Little,
+        0,
+        [Fault::Cancel(BASE as u64 + OLD_LAST), Fault::None],
+    );
+    let mut objects = source.objects(&cx, 0, 2, 123).unwrap();
+    let before = objects.zpl_snapshot(&cx, &[], b"before").unwrap();
+    assert!(matches!(
+        before.scrub(&cx, ScrubLimits::default()),
+        Err(FfsError::Cancelled)
+    ));
+    assert_eq!(count(&reads[0], OLD_LAST), 1);
+    assert_eq!(count(&reads[1], OLD_LAST), 0);
+    assert_eq!(count(&reads[0], LIVE_FIRST), 0);
+}

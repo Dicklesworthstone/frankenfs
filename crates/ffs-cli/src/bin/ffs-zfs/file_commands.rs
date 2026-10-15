@@ -1,5 +1,7 @@
 //! ZPL path commands; host paths are never resolved from native directory data.
 
+mod zil;
+
 use super::{CandidateArgs, Context, Cx, Result, bail, json};
 use clap::{Args, Subcommand};
 use ffs_ondisk::zfs_zpl::{Kind, Metadata};
@@ -24,6 +26,28 @@ pub struct FileArgs {
 
 #[derive(Debug, Subcommand)]
 pub enum FileCommand {
+    #[command(flatten)]
+    Zil(zil::Command),
+    /// Verify one dataset's allocated DMU blocks without writing or healing.
+    Scrub {
+        #[command(flatten)]
+        candidate: CandidateArgs,
+        /// Head dataset relative to the pool; empty selects the pool root.
+        #[arg(long, default_value = "")]
+        dataset: String,
+        /// Exact native snapshot name; omit for the selected committed head.
+        #[arg(long)]
+        snapshot: Option<OsString>,
+        /// Maximum pointer visits, including sparse and failed branches.
+        #[arg(long, default_value_t = 16_777_216, value_parser = clap::value_parser!(u64).range(1..=4_294_967_296))]
+        max_pointers: u64,
+        /// Maximum cumulative decoded-block bytes attempted, not image length.
+        #[arg(long, default_value_t = 1_099_511_627_776, value_parser = clap::value_parser!(u64).range(1..))]
+        max_bytes: u64,
+        /// Maximum allocated dnodes examined, including malformed dnodes.
+        #[arg(long, default_value_t = 1_048_576, value_parser = clap::value_parser!(u64).range(1..=4_294_967_296))]
+        max_objects: u64,
+    },
     /// Mount one explicit head or snapshot as a read-only extraction view.
     Mount {
         #[command(flatten)]
@@ -129,6 +153,56 @@ fn dataset_components(name: &str) -> Result<Vec<Vec<u8>>> {
 impl FileCommand {
     pub(super) fn run(self, cx: &Cx) -> Result<()> {
         let (file, output) = match self {
+            Self::Zil(command) => return command.run(cx),
+            Self::Scrub {
+                candidate,
+                dataset,
+                snapshot,
+                max_pointers,
+                max_bytes,
+                max_objects,
+            } => {
+                // A healing sidecar can mutate backing storage during a read.
+                // This command certifies only the native read-only path.
+                if candidate.image.sidecar.is_some() {
+                    bail!("read-only ZFS scrub does not admit sidecar healing");
+                }
+                let components = dataset_components(&dataset)?;
+                let mut pool = candidate.objects(cx)?;
+                let pool_txg = pool.txg;
+                let view = match snapshot.as_deref() {
+                    Some(name) => pool.zpl_snapshot(cx, &components, name.as_bytes())?,
+                    None => pool.zpl(cx, &components)?,
+                };
+                let limits = super::reader::dmu::scrub::ScrubLimits {
+                    pointers: max_pointers,
+                    decoded_bytes: max_bytes,
+                    objects: max_objects,
+                };
+                let report = view.scrub(cx, limits)?;
+                let clean = report.is_clean();
+                cx.checkpoint().map_err(|_| ffs_error::FfsError::Cancelled)?;
+                json(&serde_json::json!({
+                    "format": "ZFS", "operation": "scrub", "read_only": true,
+                    "scope": "selected_dataset_dmu_blocks",
+                    "pool_guid": report.pool_guid.to_string(), "pool_txg": pool_txg,
+                    "dataset": dataset, "dataset_guid": view.dataset_guid.to_string(),
+                    "snapshot": snapshot.as_deref().and_then(|name| name.to_str()),
+                    "snapshot_name_bytes": snapshot.as_deref().map(OsStrExt::as_bytes),
+                    "clean": clean, "repaired_blocks": 0,
+                    "all_replicas_checked": false,
+                    "not_covered": [
+                        "other datasets and snapshots", "pool allocation and space maps",
+                        "ZIL and pending synchronous intent", "all physical replicas and parity sectors",
+                        "ZPL namespace, ACL and property semantics", "native repair and resilver"
+                    ],
+                    "report": report
+                }))?;
+                if !clean {
+                    bail!("ZFS scrub found errors or incomplete coverage; see the JSON report");
+                }
+                return Ok(());
+            }
             Self::Mount {
                 candidate,
                 dataset,
@@ -581,5 +655,46 @@ mod tests {
         for option in ["--degraded", "--replace", "--heal", "--rw", "--force"] {
             assert!(Cli::try_parse_from(args.iter().copied().chain([option])).is_err());
         }
+    }
+
+    #[test]
+    fn scrub_retains_members_snapshot_and_explicit_budgets() {
+        let parsed = Cli::try_parse_from([
+            "ffs-zfs", "scrub", "first.img", "--offline-image", "--auto-import",
+            "--dataset", "data", "--snapshot", "before", "--member", "second.img",
+            "--max-pointers", "1000", "--max-bytes", "40960", "--max-objects", "50",
+        ]).unwrap();
+        let Command::File(FileCommand::Scrub {
+            candidate, dataset, snapshot, max_pointers, max_bytes, max_objects,
+        }) = parsed.command else { panic!("scrub command"); };
+        assert!(candidate.auto_import);
+        assert!(candidate.image.offline_image);
+        assert_eq!(candidate.members, [PathBuf::from("second.img")]);
+        assert_eq!(dataset, "data");
+        assert_eq!(snapshot, Some(OsString::from("before")));
+        assert_eq!((max_pointers, max_bytes, max_objects), (1000, 40960, 50));
+    }
+
+    #[test]
+    fn scrub_rejects_zero_budgets_and_mutation_options() {
+        let base = ["ffs-zfs", "scrub", "leaf.img", "--offline-image", "--auto-import"];
+        for option in ["--max-pointers", "--max-bytes", "--max-objects"] {
+            assert!(Cli::try_parse_from(base.into_iter().chain([option, "0"])).is_err());
+        }
+        for option in ["--heal", "--rw", "--force", "--resilver"] {
+            assert!(Cli::try_parse_from(base.into_iter().chain([option])).is_err());
+        }
+        assert!(Cli::try_parse_from(["ffs-zfs", "scrub", "leaf.img", "--auto-import"]).is_err());
+    }
+
+    #[test]
+    fn scrub_rejects_sidecar_before_attempting_to_open_an_image() {
+        let cli = Cli::try_parse_from([
+            "ffs-zfs", "scrub", "nonexistent-scrub-fixture.img", "--offline-image",
+            "--auto-import", "--sidecar", "nonexistent-scrub-fixture.rq",
+        ]).unwrap();
+        let Command::File(command) = cli.command else { panic!("scrub command"); };
+        let error = command.run(&Cx::for_testing()).unwrap_err();
+        assert!(error.to_string().contains("does not admit sidecar healing"));
     }
 }

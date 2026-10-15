@@ -8,15 +8,112 @@
 use super::super::super::{Entry, FatTable, FatVolume, FileChain, MAX_CHAIN_CLUSTERS};
 use super::super::{
     EXPECT_END, HASH_BYTES, allocate, change_fat, checkpoint, modified_timestamp,
-    reserve_clusters, set_dirty, set_hints, validate_boot_state, write_volume,
+    reserve_clusters, set_dirty, set_hints, write_volume,
 };
-use super::EditSource;
+use super::{EditSource, FileSource, validate_edit_state};
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
 use ffs_block::ByteDevice;
 use ffs_error::FfsError;
 use ffs_ondisk::fat::{FatEntry, FatKind};
 use ffs_types::ByteOffset;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Observe attempts, not successes: a failing write can have changed a prefix,
+/// and a failed sync leaves durability uncertain. Reads remain unchanged.
+struct ObservedDevice {
+    inner: Box<dyn ByteDevice>,
+    epoch: Arc<AtomicU64>,
+}
+
+impl ByteDevice for ObservedDevice {
+    fn len_bytes(&self) -> u64 {
+        self.inner.len_bytes()
+    }
+
+    fn read_exact_at(&self, cx: &Cx, at: ByteOffset, bytes: &mut [u8]) -> ffs_error::Result<()> {
+        self.inner.read_exact_at(cx, at, bytes)
+    }
+
+    fn write_all_at(&self, cx: &Cx, at: ByteOffset, bytes: &[u8]) -> ffs_error::Result<()> {
+        checkpoint(cx)?;
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.inner.write_all_at(cx, at, bytes)
+    }
+
+    fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+        checkpoint(cx)?;
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.inner.sync(cx)
+    }
+}
+
+impl FatVolume {
+    /// Install once before exposing a mount. The adapter holds an exclusive
+    /// operation gate across every mutation and its cache publication; the
+    /// epoch lets it distinguish preflight refusal from uncertain publication.
+    /// This retains the existing device/locks and introduces no backing I/O.
+    pub fn with_mutation_observer(mut self) -> (Self, Arc<AtomicU64>) {
+        let epoch = Arc::new(AtomicU64::new(0));
+        self.device = Box::new(ObservedDevice {
+            inner: self.device,
+            epoch: Arc::clone(&epoch),
+        });
+        (self, epoch)
+    }
+
+    /// Reserve native FAT-chain capacity, optionally retaining logical EOF.
+    /// The caller must own the volume's writer gate through cache publication.
+    /// This is ordered allocation, not a sparse mapping or atomic transaction.
+    pub fn preallocate(
+        &self,
+        cx: &Cx,
+        path: &str,
+        offset: u64,
+        length: u64,
+        mode: i32,
+        now: u64,
+    ) -> Result<()> {
+        checkpoint(cx)?;
+        if mode & !libc::FALLOC_FL_KEEP_SIZE != 0 {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                libc::EOPNOTSUPP,
+            )).into());
+        }
+        if length == 0 {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EINVAL)).into());
+        }
+        let end = offset.checked_add(length).filter(|end| *end <= u64::from(u32::MAX))
+            .ok_or_else(|| FfsError::Io(std::io::Error::from_raw_os_error(libc::EFBIG)))?;
+        validate_edit_state(cx, self)?;
+        let entry = self.resolve(cx, path)?.ok_or(FfsError::IsDirectory)?;
+        let original = FileSource {
+            volume: self,
+            chain: self.file_chain(cx, &entry)?,
+        };
+        let size = if mode & libc::FALLOC_FL_KEEP_SIZE != 0 {
+            u64::from(original.chain.size)
+        } else {
+            end.max(u64::from(original.chain.size))
+        };
+        let source = EditSource::new(&original, size, 0, &[])?;
+        // KEEP_SIZE changes neither the recorded length nor modification time.
+        // The same is true of an already covered ordinary allocation request.
+        let modified = (size > u64::from(original.chain.size))
+            .then(|| modified_timestamp(now)).transpose()?;
+        apply_update(cx, self, path, &entry, &original.chain, &source, Update {
+            capacity: u32::try_from(end.max(size)).context("FAT reservation exceeds native size")?,
+            modified,
+        })
+    }
+}
+
+struct Update {
+    /// Allocation capacity and logical EOF are distinct for KEEP_SIZE.
+    capacity: u32,
+    modified: Option<(u16, u16)>,
+}
 
 struct Allocation {
     chain: Vec<u32>,
@@ -104,6 +201,21 @@ pub(super) fn apply(
     source: &EditSource<'_>,
     now: u64,
 ) -> Result<()> {
+    apply_update(cx, volume, path, entry, old, source, Update {
+        capacity: u32::try_from(source.size).context("FAT range exceeds 4 GiB - 1")?,
+        modified: Some(modified_timestamp(now)?),
+    })
+}
+
+fn apply_update(
+    cx: &Cx,
+    volume: &FatVolume,
+    path: &str,
+    entry: &Entry,
+    old: &FileChain,
+    source: &EditSource<'_>,
+    update: Update,
+) -> Result<()> {
     checkpoint(cx)?;
     if entry.native.is_directory() {
         return Err(FfsError::IsDirectory.into());
@@ -115,21 +227,23 @@ pub(super) fn apply(
         bail!("unsupported or stale native range target");
     }
     let size = u32::try_from(source.size).context("FAT range exceeds 4 GiB - 1")?;
-    if size < old.size {
+    if size < old.size || update.capacity < size {
         bail!("native growth must not replace the verified shrink path");
     }
-    let (date, time) = modified_timestamp(now)?;
     // The checker also runs inside dirty transactions, so clean allocation is
     // not clean-state admission. Recheck BPBs AND selected FAT reserved entries.
-    let mut boot = [0; 512];
-    volume.read_exact(cx, 0, &mut boot)?;
-    volume.validate_admission(cx, &boot)?;
-    validate_boot_state(cx, volume)?;
+    validate_edit_state(cx, volume)?;
     let before = volume.check(cx)?;
     if !before.clean || !before.complete || !before.namespace_complete {
         bail!("native range update requires complete clean allocation and namespace: {}", serde_json::to_string(&before)?);
     }
-    let allocation = Allocation::prepare(cx, volume, old, size, before.free_clusters)?;
+    let allocation = Allocation::prepare(cx, volume, old, update.capacity, before.free_clusters)?;
+    if update.modified.is_none() && allocation.added.is_empty() && size == old.size {
+        // A reservation is idempotent. No dirty markers, timestamps, FSInfo
+        // writes or synchronization are needed for already owned capacity.
+        checkpoint(cx)?;
+        return Ok(());
+    }
     let free_after = before.free_clusters - allocation.added.len() as u64;
     let free_hint = u32::try_from(free_after).context("native range free count overflow")?;
     let end_marker = match volume.geometry.kind() {
@@ -146,9 +260,11 @@ pub(super) fn apply(
     }
     updated[26..28].copy_from_slice(&(first as u16).to_le_bytes());
     updated[28..32].copy_from_slice(&size.to_le_bytes());
-    updated[22..24].copy_from_slice(&time.to_le_bytes());
-    updated[24..26].copy_from_slice(&date.to_le_bytes());
-    updated[11] |= 0x20;
+    if let Some((date, time)) = update.modified {
+        updated[22..24].copy_from_slice(&time.to_le_bytes());
+        updated[24..26].copy_from_slice(&date.to_le_bytes());
+        updated[11] |= 0x20;
+    }
     let sector_bytes = u64::from(volume.geometry.sector_bytes());
     let sector_start = entry.offset / sector_bytes * sector_bytes;
     let within = (entry.offset - sector_start) as usize;
@@ -202,6 +318,30 @@ pub(super) fn apply(
                     bail!("native range data readback differs from the requested bytes");
                 }
                 at += count as u64;
+            }
+            // KEEP_SIZE can allocate without changing any visible byte. Verify
+            // every new cluster, including reserved capacity and final slack,
+            // before a live chain can reach it. A dropped zeroing write must
+            // not be hidden by the empty changed-range loop above.
+            let cluster_bytes = u64::from(volume.geometry.cluster_bytes());
+            for (index, &cluster) in allocation.added.iter().enumerate() {
+                let logical_base = (old.clusters.len() + index) as u64 * cluster_bytes;
+                let physical_base = volume.cluster_offset(cluster)?;
+                let mut within = 0;
+                while within < cluster_bytes {
+                    let count = (cluster_bytes - within).min(HASH_BYTES as u64) as usize;
+                    bytes[..count].fill(0);
+                    let logical = logical_base + within;
+                    let visible = source.size.saturating_sub(logical).min(count as u64) as usize;
+                    if visible != 0 {
+                        source.read_exact_at(cx, ByteOffset(logical), &mut bytes[..visible])?;
+                    }
+                    volume.read_exact(cx, physical_base + within, &mut readback[..count])?;
+                    if bytes[..count] != readback[..count] {
+                        bail!("native reserved allocation failed initialized-data readback");
+                    }
+                    within += count as u64;
+                }
             }
         }
 

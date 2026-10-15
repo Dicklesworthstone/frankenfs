@@ -3,6 +3,8 @@
 //! mounted read and write. This is not a crash-atomic transaction protocol;
 //! FAT node identities remain mount-local, not export-stable handles.
 
+mod health;
+
 use super::reader::replacement::{
     create_in_volume, mkdir_in_volume, rename_in_volume, rmdir_in_volume, set_attr_in_volume,
     sync_volume, truncate_in_volume, unlink_in_volume, write_range_in_volume,
@@ -16,9 +18,10 @@ use ffs_core::{
 use ffs_error::{FfsError, Result};
 use ffs_ondisk::fat::{FatKind, FatTimestamp};
 use ffs_types::{InodeNumber, ParseError};
+use health::{MountHealth, OperationGuard};
 use std::collections::BTreeMap;
 use std::ffi::OsStr;
-use std::sync::{Arc, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard};
+use std::sync::{Arc, Mutex, MutexGuard, RwLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 const ROOT: InodeNumber = InodeNumber(1);
@@ -81,16 +84,10 @@ impl State {
     }
 }
 
-/// Keep the operation gate for the entire request, including cache updates.
-/// Always acquire it before `state`; private helpers never reacquire it.
-struct OperationGuard<'a> {
-    _reader: Option<RwLockReadGuard<'a, ()>>,
-    _writer: Option<RwLockWriteGuard<'a, ()>>,
-}
-
 pub struct FatFs {
     volume: FatVolume,
     operations: RwLock<()>,
+    health: MountHealth,
     state: Mutex<State>,
     uid: u32,
     gid: u32,
@@ -174,9 +171,11 @@ impl FatFs {
             },
         );
         checkpoint(cx)?;
+        let (volume, epoch) = volume.with_mutation_observer();
         Ok(Self {
             volume,
             operations: RwLock::new(()),
+            health: MountHealth::new(epoch),
             state: Mutex::new(state),
             uid,
             gid,
@@ -185,26 +184,9 @@ impl FatFs {
     }
 
     fn operation(&self, cx: &Cx, mutation: bool) -> Result<OperationGuard<'_>> {
-        checkpoint(cx)?;
-        let poisoned = || {
-            FfsError::Io(std::io::Error::other(
-                "FAT operation lock poisoned; reopen and check the image",
-            ))
-        };
-        let guard = if mutation {
-            OperationGuard {
-                _reader: None,
-                _writer: Some(self.operations.write().map_err(|_| poisoned())?),
-            }
-        } else {
-            OperationGuard {
-                _reader: Some(self.operations.read().map_err(|_| poisoned())?),
-                _writer: None,
-            }
-        };
-        // A request cancelled while waiting must not start device I/O.
-        checkpoint(cx)?;
-        Ok(guard)
+        // Always acquire the gate before `state`; private helpers never
+        // reacquire it. Failure publication happens before releasing it.
+        self.health.operation(cx, &self.operations, mutation)
     }
 
     fn ensure_writable(&self) -> Result<()> {
@@ -680,7 +662,7 @@ impl FsOps for FatFs {
         ino: InodeNumber,
         flags: i32,
     ) -> Result<(u64, u32)> {
-        let _operation = self.operation(cx, flags & libc::O_TRUNC != 0)?;
+        let operation = self.operation(cx, flags & libc::O_TRUNC != 0)?;
         checkpoint(cx)?;
         let wants_write = flags & libc::O_ACCMODE != libc::O_RDONLY
             || flags & (libc::O_TRUNC | libc::O_CREAT) != 0;
@@ -703,7 +685,7 @@ impl FsOps for FatFs {
         }
         let entry = node.entry.as_ref().ok_or(FfsError::IsDirectory)?;
         self.chain(cx, ino, entry)?;
-        Ok((0, 0))
+        operation.complete((0, 0))
     }
 
     fn create(
@@ -716,7 +698,7 @@ impl FsOps for FatFs {
         _uid: u32,
         _gid: u32,
     ) -> Result<InodeAttr> {
-        let _operation = self.operation(cx, true)?;
+        let operation = self.operation(cx, true)?;
         checkpoint(cx)?;
         self.ensure_writable()?;
         self.state()?.ensure_new_node(true)?;
@@ -730,7 +712,7 @@ impl FsOps for FatFs {
         let entry = self.volume.lookup(cx, parent_dir, &name_str)?;
         let ino = self.register(cx, parent, entry)?;
         let node = self.node(cx, ino)?;
-        self.attributes(cx, ino, &node)
+        operation.complete(self.attributes(cx, ino, &node)?)
     }
 
     fn mkdir(
@@ -743,7 +725,7 @@ impl FsOps for FatFs {
         _uid: u32,
         _gid: u32,
     ) -> Result<InodeAttr> {
-        let _operation = self.operation(cx, true)?;
+        let operation = self.operation(cx, true)?;
         checkpoint(cx)?;
         self.ensure_writable()?;
         self.state()?.ensure_new_node(true)?;
@@ -756,7 +738,7 @@ impl FsOps for FatFs {
         let entry = self.volume.lookup(cx, parent_dir, &name_str)?;
         let ino = self.register(cx, parent, entry)?;
         let node = self.node(cx, ino)?;
-        self.attributes(cx, ino, &node)
+        operation.complete(self.attributes(cx, ino, &node)?)
     }
 
     fn write(
@@ -767,7 +749,7 @@ impl FsOps for FatFs {
         offset: u64,
         data: &[u8],
     ) -> Result<u32> {
-        let _operation = self.operation(cx, true)?;
+        let operation = self.operation(cx, true)?;
         checkpoint(cx)?;
         self.ensure_writable()?;
         let node = self.node(cx, ino)?;
@@ -782,7 +764,9 @@ impl FsOps for FatFs {
         let written = write_range_in_volume(cx, &self.volume, &path, offset, data, now_unix_secs())
             .map_err(map_mutation_error)?;
         self.refresh_node_from_path(cx, ino, &path)?;
-        u32::try_from(written).map_err(|_| FfsError::Format("FAT write size overflow".into()))
+        let written = u32::try_from(written)
+            .map_err(|_| FfsError::Format("FAT write size overflow".into()))?;
+        operation.complete(written)
     }
 
     fn setattr(
@@ -792,7 +776,7 @@ impl FsOps for FatFs {
         ino: InodeNumber,
         attrs: &SetAttrRequest,
     ) -> Result<InodeAttr> {
-        let _operation = self.operation(cx, true)?;
+        let operation = self.operation(cx, true)?;
         self.ensure_writable()?;
         let mut node = self.node(cx, ino)?;
         // Ownership is a mount projection, not a field FAT can persist.
@@ -825,7 +809,7 @@ impl FsOps for FatFs {
                     "FAT root attributes are fixed mount projections".into(),
                 ));
             }
-            return self.attributes(cx, ino, &node);
+            return operation.complete(self.attributes(cx, ino, &node)?);
         }
         let read_only = attrs.mode.map(|mode| {
             let (writable_mode, readonly_mode) = if directory {
@@ -872,7 +856,7 @@ impl FsOps for FatFs {
             .map_err(map_mutation_error)?;
             node = self.refresh_node_from_path(cx, ino, &path)?;
         }
-        self.attributes(cx, ino, &node)
+        operation.complete(self.attributes(cx, ino, &node)?)
     }
 
     fn unlink(
@@ -882,7 +866,7 @@ impl FsOps for FatFs {
         parent: InodeNumber,
         name: &OsStr,
     ) -> Result<()> {
-        let _operation = self.operation(cx, true)?;
+        let operation = self.operation(cx, true)?;
         checkpoint(cx)?;
         self.ensure_writable()?;
         let parent_node = self.node(cx, parent)?;
@@ -899,7 +883,8 @@ impl FsOps for FatFs {
             Self::invalidate_cached_chain(&mut state, removed_ino);
             state.nodes.remove(&removed_ino);
         }
-        Ok(())
+        drop(state);
+        operation.complete(())
     }
 
     fn rmdir(
@@ -909,7 +894,7 @@ impl FsOps for FatFs {
         parent: InodeNumber,
         name: &OsStr,
     ) -> Result<()> {
-        let _operation = self.operation(cx, true)?;
+        let operation = self.operation(cx, true)?;
         checkpoint(cx)?;
         self.ensure_writable()?;
         let parent_node = self.node(cx, parent)?;
@@ -925,7 +910,8 @@ impl FsOps for FatFs {
         if let Some(removed_ino) = state.slot_to_ino.remove(&existing_entry.offset) {
             state.nodes.remove(&removed_ino);
         }
-        Ok(())
+        drop(state);
+        operation.complete(())
     }
 
     fn rename(
@@ -937,7 +923,7 @@ impl FsOps for FatFs {
         new_parent: InodeNumber,
         new_name: &OsStr,
     ) -> Result<()> {
-        let _operation = self.operation(cx, true)?;
+        let operation = self.operation(cx, true)?;
         checkpoint(cx)?;
         self.ensure_writable()?;
         let parent_dir = self.node(cx, parent)?.directory()?;
@@ -973,7 +959,8 @@ impl FsOps for FatFs {
             node.parent = new_parent;
             node.entry = Some(new_entry);
         }
-        Ok(())
+        drop(state);
+        operation.complete(())
     }
 
     fn readlink(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber) -> Result<Vec<u8>> {
@@ -1008,6 +995,20 @@ impl FsOps for FatFs {
         })
     }
 
+    fn flush(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        _ino: InodeNumber,
+        _fh: u64,
+        _lock_owner: u64,
+    ) -> Result<()> {
+        // Closing/duplicating a handle is not another fsync, but must not hide
+        // a sticky write or durability failure behind the trait's no-op default.
+        let _operation = self.operation(cx, false)?;
+        checkpoint(cx)
+    }
+
     fn fsync(
         &self,
         cx: &Cx,
@@ -1016,12 +1017,13 @@ impl FsOps for FatFs {
         _fh: u64,
         _datasync: bool,
     ) -> Result<()> {
-        let _operation = self.operation(cx, true)?;
+        let operation = self.operation(cx, true)?;
         self.node(cx, ino)?;
         if self.writable {
             sync_volume(cx, &self.volume).map_err(map_mutation_error)?;
         }
-        checkpoint(cx)
+        checkpoint(cx)?;
+        operation.complete(())
     }
 
     fn fsyncdir(
@@ -1032,20 +1034,50 @@ impl FsOps for FatFs {
         _fh: u64,
         _datasync: bool,
     ) -> Result<()> {
-        let _operation = self.operation(cx, true)?;
+        let operation = self.operation(cx, true)?;
         self.node(cx, ino)?.directory()?;
         if self.writable {
             sync_volume(cx, &self.volume).map_err(map_mutation_error)?;
         }
-        checkpoint(cx)
+        checkpoint(cx)?;
+        operation.complete(())
     }
 
     fn flush_on_destroy(&self, cx: &Cx) -> Result<()> {
-        let _operation = self.operation(cx, true)?;
+        let operation = self.operation(cx, true)?;
         if self.writable {
             sync_volume(cx, &self.volume).map_err(map_mutation_error)?;
         }
-        checkpoint(cx)
+        checkpoint(cx)?;
+        operation.complete(())
+    }
+
+    fn fallocate(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        offset: u64,
+        length: u64,
+        mode: i32,
+    ) -> Result<()> {
+        let operation = self.operation(cx, true)?;
+        self.ensure_writable()?;
+        let node = self.node(cx, ino)?;
+        let entry = node.entry.as_ref().ok_or(FfsError::IsDirectory)?;
+        if entry.native.is_directory() {
+            return Err(FfsError::IsDirectory);
+        }
+        if entry.native.attributes & 1 != 0 {
+            return Err(FfsError::PermissionDenied);
+        }
+        let path = self.path_for_inode(ino)?;
+        self.volume.preallocate(cx, &path, offset, length, mode, now_unix_secs())
+            .map_err(map_mutation_error)?;
+        // KEEP_SIZE changes st_blocks and free space even though st_size and
+        // the directory record may be unchanged. Invalidate both caches.
+        self.refresh_node_from_path(cx, ino, &path)?;
+        operation.complete(())
     }
 
     fn lseek(
@@ -1094,6 +1126,9 @@ fn fat_wall_time(
 }
 
 companion_bin_tests! {
+#[cfg(test)]
+mod preallocation_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;

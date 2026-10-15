@@ -6,6 +6,7 @@
 //! Explicit offline replacement has a separate exclusive-open entry point.
 
 mod check;
+pub mod recovery;
 pub mod replacement;
 
 use anyhow::Context as _;
@@ -200,6 +201,21 @@ impl FatVolume {
         base: u64,
         length: u64,
     ) -> Result<Self> {
+        let (volume, boot) = Self::parse_volume(cx, device, base, length)?;
+        volume.validate_admission(cx, &boot)?;
+        checkpoint(cx)?;
+        Ok(volume)
+    }
+
+    /// Geometry alone is not read or write admission. Only the private
+    /// diagnostic path may inspect this unadmitted volume; ordinary callers
+    /// must continue through `from_device` and its clean-state checks.
+    fn parse_volume(
+        cx: &Cx,
+        device: Box<dyn ByteDevice>,
+        base: u64,
+        length: u64,
+    ) -> Result<(Self, [u8; 512])> {
         checkpoint(cx)?;
         let end = base
             .checked_add(length)
@@ -219,9 +235,8 @@ impl FatVolume {
             geometry,
             oem_code_page: FatOemCodePage::Ascii,
         };
-        volume.validate_admission(cx, &boot)?;
         checkpoint(cx)?;
-        Ok(volume)
+        Ok((volume, boot))
     }
 
     /// Keep one explicit name policy for every directory and cached entry in

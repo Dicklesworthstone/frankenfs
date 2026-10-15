@@ -31,7 +31,8 @@ fn restart_page(clean: bool, token: u16) -> [u8; 512] {
     page[76..78].copy_from_slice(&48_u16.to_le_bytes());
     page[78..80].copy_from_slice(&64_u16.to_le_bytes());
     page[88..96].copy_from_slice(&CURRENT_LSN.to_le_bytes());
-    page[96..104].copy_from_slice(&CURRENT_LSN.to_le_bytes());
+    // The current record is an ordinary update, not a client checkpoint.
+    // Leave the restart reference absent rather than mislabel that record.
     page[104..106].copy_from_slice(&u16::MAX.to_le_bytes());
     page[106..108].copy_from_slice(&u16::MAX.to_le_bytes());
     page[108..110].copy_from_slice(&9_u16.to_le_bytes());
@@ -112,8 +113,16 @@ fn zero_volume_flags_cannot_hide_dirty_torn_or_incomplete_native_journal() {
             false,
             "redo/undo recovery before mounting; current transaction 17 has redo opcode 0x07 and undo opcode 0x07",
         ),
-        (false, true, "restart copies disagree"),
-        (true, false, "restart copies disagree"),
+        (
+            false,
+            true,
+            "equal-LSN restart copies disagree on checkpoint state",
+        ),
+        (
+            true,
+            false,
+            "equal-LSN restart copies disagree on checkpoint state",
+        ),
     ] {
         let reads: Reads = Arc::default();
         assert!(matches!(
@@ -164,8 +173,11 @@ fn matching_dirty_restarts_require_an_intact_current_native_record() {
                 for copy in 0..2 {
                     let at = LOG_START + copy * 512 + 40;
                     bytes[at..at + 8].copy_from_slice(&42_u64.to_le_bytes());
+                    // Isolate the invalid requested LSN from client-window
+                    // metadata, which has its own stricter validation.
+                    bytes[at + 48..at + 56].fill(0);
                 }
-                "current LSN does not address a record page"
+                "requested-record LSN does not address a retained record location"
             }
             1 => {
                 bytes[LOG_START + RECORD_PAGE + 511] ^= 1;

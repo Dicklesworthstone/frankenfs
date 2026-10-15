@@ -1461,7 +1461,12 @@ fn protected_mount_zfs_repairs_multi_block_corruption_on_read_bd_q19uk() {
     image[os_at as usize..os_at as usize + 1024].copy_from_slice(&os);
 
     let mut mos_table = vec![0_u8; 16_384];
-    let pool_zap = micro(&[(b"root_dataset", 2)]);
+    let pool_zap = micro(&[
+        (b"root_dataset", 2),
+        (b"features_for_read", 29),
+        (b"features_for_write", 30),
+        (b"feature_descriptions", 31),
+    ]);
     image[pool_map_at as usize..pool_map_at as usize + 512].copy_from_slice(&pool_zap);
     let mut pool_dn = node(1, 512, 1, 0, &[], 0);
     pool_dn[64..192].copy_from_slice(&bp(&pool_zap, pool_map_at, 1, 0, 20));
@@ -1475,6 +1480,20 @@ fn protected_mount_zfs_repairs_multi_block_corruption_on_read_bd_q19uk() {
     }
     ds_bonus[128..256].copy_from_slice(&bp(&os, os_at, 11, 0, 45));
     mos_table[1536..2048].copy_from_slice(&node(16, 512, 1, 0, &ds_bonus, 16));
+    // Version 5000 requires distinct native MOS feature catalogs, even when
+    // this uncompressed fixture enables no features. These blocks occupy the
+    // unused gap after the pool directory and before the dataset object set.
+    for (object, at) in [
+        (29, DATA_OFFSET + 0x14400),
+        (30, DATA_OFFSET + 0x14600),
+        (31, DATA_OFFSET + 0x14800),
+    ] {
+        let catalog = micro(&[]);
+        image[at as usize..at as usize + catalog.len()].copy_from_slice(&catalog);
+        let mut catalog_dn = node(196, 512, 1, 0, &[], 0);
+        catalog_dn[64..192].copy_from_slice(&bp(&catalog, at, 196, 0, 20));
+        mos_table[object * 512..(object + 1) * 512].copy_from_slice(&catalog_dn);
+    }
     image[mos_at as usize..mos_at as usize + mos_table.len()].copy_from_slice(&mos_table);
 
     let mut mos_os = vec![0_u8; 1024];
@@ -1593,6 +1612,7 @@ fn protected_mount_zfs_repairs_multi_block_corruption_on_read_bd_q19uk() {
 
     let prepared = prepare(&cx, &fixture.args()).expect("admit protected zfs");
     assert_eq!(prepared.filesystem, "zfs");
+    assert_eq!(std::fs::read(&fixture.image).unwrap(), image);
 
     // Corrupt TWO 4096-byte blocks in the same group (file_blk0_at and file_blk1_at)
     let blk_a = file_blk0_at / 4096;

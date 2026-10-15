@@ -8,6 +8,7 @@ mod pool;
 pub use pool::Pool;
 
 use asupersync::Cx;
+use dmu::supported_label_feature as supported_read_feature;
 use ffs_block::ByteDevice;
 use ffs_error::{FfsError, Result};
 use ffs_ondisk::zfs::nvlist::{NvList, Value};
@@ -40,13 +41,6 @@ fn parse(error: &ffs_types::ParseError) -> FfsError {
 fn integer(list: &NvList, name: &str) -> Result<u64> {
     list.unsigned(name)
         .ok_or_else(|| corrupt(format!("missing or mistyped ZFS config integer {name}")))
-}
-
-fn supported_read_feature(name: &str, value: &Value) -> bool {
-    matches!(
-        name,
-        "org.illumos:lz4_compress" | "com.delphix:embedded_data"
-    ) && matches!(value, Value::Boolean(true))
 }
 
 struct ReadOnlyImage {

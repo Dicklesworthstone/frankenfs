@@ -6,6 +6,8 @@ use ffs_core::{FileType, FsOps, RequestScope, SeekWhence};
 use ffs_types::InodeNumber;
 use std::ffi::OsStr;
 
+mod sparse;
+
 const ROOT: InodeNumber = InodeNumber(1);
 
 #[test]
@@ -222,7 +224,7 @@ fn extraction_mount_refuses_writes_and_preserves_corruption_and_cancellation_err
     assert_eq!(
         fs.lseek(&cx, &mut scope, file.ino, 1, SeekWhence::Hole)
             .unwrap(),
-        1027
+        512
     );
     assert!(
         fs.lseek(&cx, &mut scope, file.ino, 1027, SeekWhence::Hole)

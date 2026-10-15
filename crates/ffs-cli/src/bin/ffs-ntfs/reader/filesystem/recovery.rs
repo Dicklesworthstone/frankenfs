@@ -1,8 +1,9 @@
 //! Clean-only native $LogFile admission for immutable mounted views.
 //!
 //! The volume dirty bit is not a substitute for the recovery journal. A mount
-//! accepts agreeing, USA-validated clean restart areas or a completely erased
-//! log. It never chooses an older clean copy over uncertain recovery state.
+//! selects the newest comparable USA-validated restart area, requires it to
+//! be clean, or verifies a completely erased log. It never rolls back to an
+//! older clean copy over newer dirty or uncertain recovery state.
 //! This is not ARIES replay, hibernation detection, or writable admission.
 //!
 //! Layout references: NTFS-3G 2022.10.3 include/ntfs-3g/logfile.h and Linux
@@ -10,6 +11,7 @@
 //! capacities; only declared, bounded fields are interpreted here.
 
 mod record;
+mod selection;
 
 use super::super::Storage;
 use super::{Cx, NtfsVolume, Result, Stream, checkpoint, corrupt, unsupported};
@@ -164,13 +166,9 @@ fn assess(
         read_exact(cx, length, system_page as u64, system_page, &mut read)?,
         length,
     )?;
-    if first != second {
-        return Err(unsupported(
-            "$LogFile restart copies disagree; native recovery is required",
-        ));
-    }
-    if !first.clean {
-        let tail = record::validate_dirty_tail(cx, &first, length, &mut read)?;
+    let selected = selection::choose(&first, &second)?;
+    if !selected.clean {
+        let tail = record::validate_dirty_tail(cx, selected, length, &mut read)?;
         return Err(unsupported(format!(
             "$LogFile requires native redo/undo recovery before mounting; current transaction {} has redo opcode {:#04x} and undo opcode {:#04x}",
             tail.transaction_id, tail.redo_op, tail.undo_op
@@ -435,6 +433,51 @@ mod tests {
         page[start + 8..start + 10].copy_from_slice(&0_u16.to_le_bytes());
         page[start + 10..start + 12].copy_from_slice(&NO_CLIENT.to_le_bytes());
         check(&pair(page.clone(), page)).unwrap();
+    }
+
+    #[test]
+    fn ordered_clean_restart_copies_are_admitted_without_mutating_the_image() {
+        for version in [(1, 1), (2, 0)] {
+            for wrap in [false, true] {
+                for old_clean in [false, true] {
+                    let first = (if version.0 >= 2 { 34_u64 } else { 4 }) * 4096;
+                    let old_vbo = if wrap { LOG_SIZE as u64 - 4096 } else { first };
+                    let new_vbo = if wrap { first } else { first + 4096 };
+                    let old_lsn = (1_u64 << 20) | (old_vbo + 128) / 8;
+                    let new_lsn = ((if wrap { 2_u64 } else { 1 }) << 20)
+                        | (new_vbo + 128) / 8;
+                    let mut old = plain(4096, version, if old_clean { CLEAN } else { 0 }, true);
+                    let mut new = plain(4096, version, CLEAN, true);
+                    let start = usize::from(u16_at(&old, 24).unwrap());
+                    old[start..start + 8].copy_from_slice(&old_lsn.to_le_bytes());
+                    new[start..start + 8].copy_from_slice(&new_lsn.to_le_bytes());
+                    for (first, second) in [
+                        (old.clone(), new.clone()), (new.clone(), old.clone()),
+                    ] {
+                        let log = pair(first, second);
+                        let before = log.clone();
+                        check(&log).unwrap();
+                        assert_eq!(log, before);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn newer_dirty_restart_reaches_recovery_instead_of_using_the_clean_copy() {
+        let mut old = plain(4096, (2, 0), CLEAN, true);
+        let mut new = plain(4096, (2, 0), 0, true);
+        let start = usize::from(u16_at(&old, 24).unwrap());
+        let old_lsn = (1_u64 << 20) | (34 * 4096 + 128) / 8;
+        let new_lsn = (1_u64 << 20) | (35 * 4096 + 128) / 8;
+        old[start..start + 8].copy_from_slice(&old_lsn.to_le_bytes());
+        new[start..start + 8].copy_from_slice(&new_lsn.to_le_bytes());
+        for (first, second) in [(old.clone(), new.clone()), (new, old)] {
+            // The selected dirty tail points into erased RCRD storage. This
+            // must reach the decoder and fail, never admit the older clean RSTR.
+            assert!(matches!(check(&pair(first, second)), Err(FfsError::Corruption { .. })));
+        }
     }
 
     #[test]

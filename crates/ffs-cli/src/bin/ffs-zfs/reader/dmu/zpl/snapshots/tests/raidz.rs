@@ -219,3 +219,84 @@ fn a_failed_later_raidz_snapshot_block_returns_no_prefix_or_current_dataset_fall
         }
     }
 }
+
+#[test]
+fn scrub_raidz_snapshots_use_verified_reconstruction_and_remain_historical() {
+    use crate::reader::dmu::scrub::ScrubLimits;
+
+    let cx = Cx::for_testing();
+    for nparity in 1..=3 {
+        for order in [Endian::Little, Endian::Big] {
+            for case in [0, 21] {
+                let mut image = striped_pool(order, case, nparity);
+                let mut damaged = vec![OLD_TABLE, OLD_DIRECTORY, OLD_INDIRECT];
+                if case == 0 {
+                    damaged.extend_from_slice(&[OLD_FIRST, OLD_LAST]);
+                }
+                let recovered: Vec<_> = damaged
+                    .iter()
+                    .map(|key| (image.column(*key, nparity), image.column(*key, 0)))
+                    .collect();
+                for key in damaged {
+                    poison_parity_budget(&mut image, key, nparity);
+                }
+                let live = (case == 0).then(|| image.column(LIVE_FIRST, nparity));
+                let reads = image.reads();
+                let source = image.open(&vec![Fault::None; width(nparity)], true);
+                let mut objects = source.objects(&cx, 0, 2, 123).unwrap();
+                let before = objects.zpl_snapshot(&cx, &[], b"before").unwrap();
+                let report = before.scrub(&cx, ScrubLimits::default()).unwrap();
+                assert!(report.is_clean(), "parity={nparity}, case={case}: {report:?}");
+                assert_eq!(report.root_birth, 18);
+                assert_eq!(report.view_txg, before.view_txg());
+                assert_eq!(report.objects_examined, 5);
+                assert_eq!(report.verified_blocks, 6);
+                for (data, parity) in recovered {
+                    assert!(count(&reads, data) > 0);
+                    assert!(count(&reads, parity) > 0);
+                }
+                if let Some(live) = live {
+                    assert_eq!(count(&reads, live), 0);
+                }
+            }
+        }
+    }
+}
+
+#[test]
+fn scrub_raidz_unrecoverable_data_and_cancellation_never_become_clean() {
+    use crate::reader::dmu::scrub::ScrubLimits;
+
+    let cx = Cx::for_testing();
+    for nparity in 1..=3 {
+        for cancel in [false, true] {
+            let mut image = striped_pool(Endian::Little, 0, nparity);
+            let data = image.column(OLD_LAST, nparity);
+            let live = image.column(LIVE_FIRST, nparity);
+            let mut faults = vec![Fault::None; width(nparity)];
+            if cancel {
+                faults[data.0] = Fault::Cancel(data.1);
+            } else {
+                image.poison(OLD_LAST, nparity, 0);
+                for ordinal in 0..nparity {
+                    image.poison(OLD_LAST, ordinal, 32 + ordinal * 11);
+                }
+            }
+            let reads = image.reads();
+            let source = image.open(&faults, true);
+            let mut objects = source.objects(&cx, 0, 2, 123).unwrap();
+            let before = objects.zpl_snapshot(&cx, &[], b"before").unwrap();
+            let result = before.scrub(&cx, ScrubLimits::default());
+            if cancel {
+                assert!(matches!(result, Err(FfsError::Cancelled)));
+            } else {
+                let report = result.unwrap();
+                assert!(!report.is_clean());
+                assert_eq!(report.errors, 1);
+                assert_eq!(report.issues[0].object, 3);
+                assert_eq!(report.issues[0].block, Some(2));
+            }
+            assert_eq!(count(&reads, live), 0);
+        }
+    }
+}

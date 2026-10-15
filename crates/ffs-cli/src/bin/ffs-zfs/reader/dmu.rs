@@ -1,8 +1,15 @@
 //! Read DMU objects under one explicitly selected, verified MOS root.
 //! No automatic import/TXG selection, writes, replay, or ZPL file-size guesses.
 
+mod features;
+mod holes;
+pub mod scrub;
+mod seek;
 mod zap;
+pub mod zil;
 pub mod zpl;
+
+pub(super) use features::supported_label_feature;
 
 use super::{
     BlockPointer, Cx, Endian, FfsError, Leaf, Pool, Result, RootBlock, VdevConfig, checkpoint,
@@ -97,7 +104,7 @@ impl Objects {
         }
         let config = root.config;
         checkpoint(cx)?;
-        Ok(Self {
+        let mut view = Self {
             pool,
             config,
             txg: root.uberblock.txg,
@@ -105,23 +112,28 @@ impl Objects {
             meta: objectset.meta,
             cache: VecDeque::new(),
             cached_bytes: 0,
-        })
+        };
+        // Label features only describe what is needed to bootstrap the MOS.
+        // Keep this view private until its complete native feature catalogs
+        // admit reads. Every explicit/automatic leaf/group open joins here.
+        view.admit_features(cx)?;
+        checkpoint(cx)?;
+        Ok(view)
     }
 }
 
 impl Objects {
-    /// Validate interpretation BEFORE cache lookup and physical I/O. Neither a
-    /// valid checksum nor a cached byte string authorizes the wrong level/type.
-    fn checked(
-        &mut self,
-        cx: &Cx,
+    /// Check the interpretation of an already checksum-protected pointer.
+    /// Returns false for a native hole. This does not verify a data payload:
+    /// allocation queries inspect leaf pointers without reading file contents.
+    fn validate_pointer(
+        &self,
         bp: &BlockPointer,
         kind: u8,
         level: u8,
         size: usize,
         ceiling: u64,
-    ) -> Result<Option<CheckedBlock>> {
-        checkpoint(cx)?;
+    ) -> Result<bool> {
         if bp.protected() {
             return Err(unsupported(
                 "encrypted DMU blocks need their native pipeline",
@@ -133,7 +145,8 @@ impl Objects {
             ));
         }
         if bp.hole() {
-            return Ok(None);
+            self.validate_hole(bp, kind, level, size)?;
+            return Ok(false);
         }
         if bp.birth() == 0
             || bp.level() != level
@@ -155,6 +168,24 @@ impl Objects {
             return Err(unsupported(
                 "embedded DMU block is not declared by the selected label features",
             ));
+        }
+        Ok(true)
+    }
+
+    /// Validate interpretation BEFORE cache lookup and physical I/O. Neither a
+    /// valid checksum nor a cached byte string authorizes the wrong level/type.
+    fn checked(
+        &mut self,
+        cx: &Cx,
+        bp: &BlockPointer,
+        kind: u8,
+        level: u8,
+        size: usize,
+        ceiling: u64,
+    ) -> Result<Option<CheckedBlock>> {
+        checkpoint(cx)?;
+        if !self.validate_pointer(bp, kind, level, size, ceiling)? {
+            return Ok(None);
         }
         if let Some(index) = self.cache.iter().position(|(key, _)| key == bp) {
             let item = self
