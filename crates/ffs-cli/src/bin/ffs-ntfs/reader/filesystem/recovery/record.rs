@@ -5,6 +5,8 @@
 //! record envelope, then decodes enough NTFS client metadata to identify the
 //! redo/undo vocabulary. It deliberately does not apply any operation.
 
+mod payload;
+
 use super::{Restart, SECTOR, bytes, checkpoint, corrupt, read_exact, u16_at, u32_at, u64_at};
 use crate::reader::{Cx, Result, unsupported};
 
@@ -83,7 +85,7 @@ fn restore_page(
         || !fix_off.is_multiple_of(2)
         || fix_off
             .checked_add(fix_num * 2)
-            .is_none_or(|end| end > data_off || end > page_size)
+            .is_none_or(|end| end > data_off || end > SECTOR - 2)
     {
         return Err(corrupt(page_vbo, "invalid $LogFile record-page USA bounds"));
     }
@@ -117,7 +119,8 @@ fn restore_page(
     }
     if restart.version.0 >= 2 {
         let file_off = u64::from(u32_at(&page, 60)?);
-        if file_off != page_vbo {
+        // Native v2 pages reset this tail-copy field to zero after publication.
+        if file_off != 0 && file_off != page_vbo {
             return Err(corrupt(
                 page_vbo,
                 "$LogFile record page identifies a different file offset",
@@ -315,21 +318,8 @@ pub(super) fn validate_dirty_tail(
             "$LogFile current record length disagrees with restart metadata",
         ));
     }
-    if flags & MULTI_PAGE != 0 {
-        return Err(unsupported(
-            "current NTFS $LogFile record spans multiple pages; replay is not implemented",
-        ));
-    }
-    let data_start = record_off + header_len;
-    let data_end = data_start
-        .checked_add(data_len)
-        .ok_or_else(|| corrupt(vbo, "$LogFile client record length overflow"))?;
-    if data_end > page.bytes.len()
-        || (page.next_record_off != 0 && data_end > usize::from(page.next_record_off))
-    {
-        return Err(corrupt(vbo, "$LogFile client record crosses its page boundary"));
-    }
-    let data = &page.bytes[data_start..data_end];
+    let data = payload::read(cx, restart, stream_length, page_vbo, page, read)?;
+    let data = data.as_slice();
     let mut tail = match record_type {
         LFS_CLIENT_RECORD => parse_client_update(data)?,
         LFS_CLIENT_RESTART => {
@@ -367,7 +357,7 @@ mod tests {
             current_lsn: lsn,
             seq_num_bits: 44,
             file_size: LOG,
-            last_lsn_data_len: 64,
+            last_lsn_data_len: 48,
             record_header_len: LFS_HEADER_BYTES as u16,
             data_off: 64,
             active_client_seq: Some(9),
@@ -474,6 +464,26 @@ mod tests {
     }
 
     #[test]
+    fn published_v2_record_pages_do_not_require_a_tail_copy_offset() {
+        let (restart, mut raw) = page(7, 0);
+        raw[60..64].fill(0);
+        assert_eq!(check(&restart, &raw).unwrap().redo_op, 7);
+    }
+
+    #[test]
+    fn single_page_records_require_valid_completion_evidence() {
+        for mutation in 0..3 {
+            let (restart, mut raw) = page(7, 0);
+            match mutation {
+                0 => raw[16..20].fill(0),
+                1 => raw[32..40].fill(0),
+                _ => raw[8..16].fill(0),
+            }
+            assert!(check(&restart, &raw).is_err());
+        }
+    }
+
+    #[test]
     fn every_record_page_sector_requires_a_valid_update_sequence_trailer() {
         use crate::reader::FfsError;
 
@@ -500,7 +510,7 @@ mod tests {
                 0 => bad[24..26].copy_from_slice(&64_u16.to_le_bytes()),
                 1 => bad[at..at + 8].copy_from_slice(&1_u64.to_le_bytes()),
                 2 => bad[at + 24..at + 28].copy_from_slice(&u32::MAX.to_le_bytes()),
-                _ => bad[60..64].copy_from_slice(&0_u32.to_le_bytes()),
+                _ => bad[60..64].copy_from_slice(&4096_u32.to_le_bytes()),
             }
             assert!(matches!(
                 check(&restart, &bad),
@@ -510,7 +520,7 @@ mod tests {
     }
 
     #[test]
-    fn multi_page_current_records_are_recognized_but_not_falsely_replayed() {
+    fn inconsistent_multi_page_flags_are_refused() {
         use crate::reader::FfsError;
 
         let (restart, mut page) = page(0, 0);
@@ -518,7 +528,7 @@ mod tests {
         page[at + 40..at + 42].copy_from_slice(&MULTI_PAGE.to_le_bytes());
         assert!(matches!(
             check(&restart, &page),
-            Err(FfsError::UnsupportedFeature(_))
+            Err(FfsError::Corruption { .. })
         ));
     }
 
@@ -526,7 +536,8 @@ mod tests {
     fn client_restart_records_validate_version_and_referenced_lsns() {
         use crate::reader::FfsError;
 
-        let (restart, mut page) = page(0, 0);
+        let (mut restart, mut page) = page(0, 0);
+        restart.last_lsn_data_len = NTFS_RESTART_BYTES as u32;
         let at = lsn_page_offset(restart.current_lsn, restart.log_page).unwrap();
         page[at + 24..at + 28].copy_from_slice(&(NTFS_RESTART_BYTES as u32).to_le_bytes());
         page[at + 32..at + 36].copy_from_slice(&LFS_CLIENT_RESTART.to_le_bytes());
