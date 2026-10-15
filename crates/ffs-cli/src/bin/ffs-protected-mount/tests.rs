@@ -1150,6 +1150,23 @@ fn protected_mount_ntfs_repairs_multi_block_corruption_on_read_bd_q19uk() {
     );
     put(&mut image, 0, &mft);
     image[128 * 512..130 * 512].copy_from_slice(&mft);
+    // Supply the native journal required by clean-only NTFS admission. Its
+    // fully initialized erased bytes are disjoint from MFT, mirror, UpCase
+    // and the protected file payload; no recovery bypass is involved.
+    put(
+        &mut image,
+        2,
+        &make_record(
+            2,
+            false,
+            1,
+            &[
+                standard.clone(),
+                mapped(&[0x21, 64, 0xC0, 0, 0], 64, 32_768),
+            ],
+        ),
+    );
+    image[192 * 512..256 * 512].fill(0xFF);
     let mut vol_info = [0_u8; 12];
     vol_info[8..10].copy_from_slice(&[3, 1]);
     put(
@@ -1259,6 +1276,11 @@ fn protected_mount_ntfs_repairs_multi_block_corruption_on_read_bd_q19uk() {
 
     let prepared = prepare(&cx, &fixture.args()).expect("admit protected ntfs");
     assert_eq!(prepared.filesystem, "ntfs");
+    assert_eq!(
+        std::fs::read(&fixture.image).unwrap(),
+        image,
+        "clean NTFS preparation must not alter the native journal or backing bytes"
+    );
 
     // Corrupt TWO 4096-byte blocks in the file's data region (blocks 80 and 81)
     let orig_80 = fixture.read_block(80);

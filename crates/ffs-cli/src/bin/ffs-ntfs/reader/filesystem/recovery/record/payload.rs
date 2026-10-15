@@ -4,6 +4,7 @@
 //! clean-only mount policy. Page count/position describe an I/O transfer, not
 //! the number of pages in a client record, so they are not continuation IDs.
 
+use super::super::super::super::buffer;
 use super::{
     Cx, MULTI_PAGE, PAGE_RECORD_END, RecordPage, Restart, Result, checkpoint, corrupt,
     lsn_page_offset, read_exact, restore_page, u16_at, u32_at, u64_at, unsupported,
@@ -62,7 +63,9 @@ pub(super) fn read(
         ));
     }
     if length > MAX_CLIENT_BYTES {
-        return Err(unsupported("$LogFile client record exceeds the 16 MiB read budget"));
+        return Err(unsupported(
+            "$LogFile client record exceeds the 16 MiB read budget",
+        ));
     }
     let continuation_bytes = page_size - data_off;
     let pages =
@@ -81,7 +84,7 @@ pub(super) fn read(
     }
     // Check capacity before allocating. A hostile length must not turn journal
     // inspection into an unbounded allocation, read loop, or repeated ring walk.
-    let mut data = crate::reader::buffer(length)?;
+    let mut data = buffer(length)?;
     let mut copied = 0;
     for index in 0..pages {
         checkpoint(cx)?;
@@ -121,7 +124,11 @@ pub(super) fn read(
         let next = page_vbo
             .checked_add(page_bytes)
             .ok_or_else(|| corrupt(page_vbo, "$LogFile continuation offset overflow"))?;
-        page_vbo = if next == restart.file_size { first } else { next };
+        page_vbo = if next == restart.file_size {
+            first
+        } else {
+            next
+        };
         page = restore_page(
             cx,
             read_exact(cx, restart.file_size, page_vbo, page_size, read)?,
@@ -378,8 +385,8 @@ mod tests {
                 fixture.first_vbo,
             )
             .unwrap();
-            let at = lsn_page_offset(fixture.restart.current_lsn, fixture.restart.log_page)
-                .unwrap();
+            let at =
+                lsn_page_offset(fixture.restart.current_lsn, fixture.restart.log_page).unwrap();
             page.bytes[at + 24..at + 28].copy_from_slice(&(length as u32).to_le_bytes());
             let result = read(
                 &cx,

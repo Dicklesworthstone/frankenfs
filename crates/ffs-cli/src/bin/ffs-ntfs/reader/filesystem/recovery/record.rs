@@ -7,8 +7,10 @@
 
 mod payload;
 
-use super::{Restart, SECTOR, bytes, checkpoint, corrupt, read_exact, u16_at, u32_at, u64_at};
-use crate::reader::{Cx, Result, unsupported};
+use super::{
+    Cx, Restart, Result, SECTOR, bytes, checkpoint, corrupt, read_exact, u16_at, u32_at, u64_at,
+    unsupported,
+};
 
 const RCRD: [u8; 4] = *b"RCRD";
 const FFFF: [u8; 4] = [0xFF; 4];
@@ -245,7 +247,10 @@ pub(super) fn validate_dirty_tail(
         return Err(corrupt(0, "dirty $LogFile has no active NTFS client"));
     };
     if restart.current_lsn == 0 || restart.file_size > stream_length {
-        return Err(corrupt(0, "invalid dirty $LogFile current LSN or file size"));
+        return Err(corrupt(
+            0,
+            "invalid dirty $LogFile current LSN or file size",
+        ));
     }
     if let Some(oldest) = restart.active_client_oldest_lsn {
         validate_lsn_reference(restart, oldest, "oldest-client")?;
@@ -305,12 +310,18 @@ pub(super) fn validate_dirty_tail(
     let transaction_id = u32_at(header, 36)?;
     let flags = u16_at(header, 40)?;
     if flags & !MULTI_PAGE != 0 || u16_at(header, 28)? != client_seq || u16_at(header, 30)? != 0 {
-        return Err(corrupt(vbo, "invalid $LogFile client identity or record flags"));
+        return Err(corrupt(
+            vbo,
+            "invalid $LogFile client identity or record flags",
+        ));
     }
     validate_lsn_reference(restart, u64_at(header, 8)?, "previous-record")?;
     validate_lsn_reference(restart, u64_at(header, 16)?, "undo-next")?;
     if u64::try_from(data_len).unwrap_or(u64::MAX) > restart.file_size {
-        return Err(corrupt(vbo, "$LogFile client record exceeds journal capacity"));
+        return Err(corrupt(
+            vbo,
+            "$LogFile client record exceeds journal capacity",
+        ));
     }
     if u32::try_from(data_len).ok() != Some(restart.last_lsn_data_len) {
         return Err(corrupt(
@@ -344,6 +355,7 @@ pub(super) fn validate_dirty_tail(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ffs_error::FfsError;
 
     const PAGE: usize = 4096;
     const LOG: u64 = 4 * 1024 * 1024;
@@ -417,8 +429,7 @@ mod tests {
     }
 
     fn check(restart: &Restart, page: &[u8]) -> Result<TailRecord> {
-        let page_vbo =
-            lsn_to_vbo(restart.current_lsn, restart.seq_num_bits)? & !(PAGE as u64 - 1);
+        let page_vbo = lsn_to_vbo(restart.current_lsn, restart.seq_num_bits)? & !(PAGE as u64 - 1);
         validate_dirty_tail(&Cx::for_testing(), restart, LOG, &mut |offset, size| {
             if offset != page_vbo || size != PAGE {
                 return Err(corrupt(offset, "unexpected test read"));
@@ -441,8 +452,6 @@ mod tests {
 
     #[test]
     fn unknown_operations_record_types_and_client_identity_are_refused() {
-        use crate::reader::FfsError;
-
         let (restart, raw) = page(MAX_OPERATION + 1, 0);
         assert!(matches!(
             check(&restart, &raw),
@@ -485,8 +494,6 @@ mod tests {
 
     #[test]
     fn every_record_page_sector_requires_a_valid_update_sequence_trailer() {
-        use crate::reader::FfsError;
-
         let (restart, page) = page(0, 0);
         for sector in 1..=PAGE / SECTOR {
             let mut torn = page.clone();
@@ -500,8 +507,6 @@ mod tests {
 
     #[test]
     fn malformed_record_offsets_lengths_and_lsn_identity_never_escape() {
-        use crate::reader::FfsError;
-
         let (restart, page) = page(0, 0);
         let at = lsn_page_offset(restart.current_lsn, restart.log_page).unwrap();
         for mutate in 0..4 {
@@ -521,8 +526,6 @@ mod tests {
 
     #[test]
     fn inconsistent_multi_page_flags_are_refused() {
-        use crate::reader::FfsError;
-
         let (restart, mut page) = page(0, 0);
         let at = lsn_page_offset(restart.current_lsn, restart.log_page).unwrap();
         page[at + 40..at + 42].copy_from_slice(&MULTI_PAGE.to_le_bytes());
@@ -534,8 +537,6 @@ mod tests {
 
     #[test]
     fn client_restart_records_validate_version_and_referenced_lsns() {
-        use crate::reader::FfsError;
-
         let (mut restart, mut page) = page(0, 0);
         restart.last_lsn_data_len = NTFS_RESTART_BYTES as u32;
         let at = lsn_page_offset(restart.current_lsn, restart.log_page).unwrap();
