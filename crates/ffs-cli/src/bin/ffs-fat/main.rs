@@ -312,7 +312,7 @@ enum Command {
         )]
         entry_slots: Option<EntrySlots>,
     },
-    /// Stream a native file selected from catalog without converting its name.
+    /// Stream a native file selected from catalog, without converting its name.
     Extract {
         #[command(flatten)]
         image: ImageArgs,
@@ -423,7 +423,7 @@ fn main() -> Result<()> {
             println!();
         }
         Command::Check { image } => {
-            let report = image.open(&cx)?.check(&cx)?;
+            let report = reader::recovery::check(&cx, &image)?;
             serde_json::to_writer_pretty(io::stdout().lock(), &report)?;
             println!();
             if !report.clean {
@@ -439,7 +439,7 @@ fn main() -> Result<()> {
                 .resolve(&cx, &path)?
                 .map_or(Ok(Directory::Root), |entry| entry.directory())?;
             let entries = volume.list(&cx, directory)?;
-            let mut report = Vec::with_capacity(entries.len());
+            let mut report = Vec::new();
             for entry in entries {
                 report.push(serde_json::json!({
                     "name": entry.name()?,
