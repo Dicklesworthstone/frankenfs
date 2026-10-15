@@ -4,6 +4,8 @@
 //! synchronized before its FAT allocation or parent namespace entry is published.
 //! Parent long-name and growth ordering is shared with file creation.
 
+mod rename_in_place;
+
 use super::super::super::ImageArgs;
 use super::super::{
     ImageFile, change_fat, checkpoint, open_regular, reserve_clusters, set_dirty, set_hints,
@@ -897,6 +899,22 @@ pub fn rename_in_volume(
         RenameTarget::Existing { entry, long_slots, release }
     } else {
         let name = super::names::NativeName::plan(cx, volume, dst_dir, &dst_leaf)?;
+        if src_dir == dst_dir && name.long_slots() <= src_lfn.len() {
+            // FAT16's fixed root cannot grow, and a same-directory rename
+            // should not need a second free name set or any spare clusters.
+            // Compare native parent identities, not case/alias path spellings.
+            return rename_in_place::Rename {
+                from,
+                to,
+                leaf: &dst_leaf,
+                short: &src_short,
+                long: &src_lfn,
+                name: &name,
+                chain: &source_chain,
+                before: &before,
+            }
+            .execute(cx, volume, dry_run);
+        }
         let needed_slots = name.long_slots() + 1;
         let mut reservation = reserve_slots(cx, volume, dst_dir, needed_slots)?;
         let allocated = reserve_clusters(cx, volume, reservation.extra, before.free_clusters)?;
