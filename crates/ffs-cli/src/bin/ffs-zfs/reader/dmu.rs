@@ -1,6 +1,7 @@
 //! Read DMU objects under one explicitly selected, verified MOS root.
 //! No automatic import/TXG selection, writes, replay, or ZPL file-size guesses.
 
+mod features;
 pub mod scrub;
 mod seek;
 mod zap;
@@ -99,7 +100,7 @@ impl Objects {
         }
         let config = root.config;
         checkpoint(cx)?;
-        Ok(Self {
+        let mut view = Self {
             pool,
             config,
             txg: root.uberblock.txg,
@@ -107,7 +108,13 @@ impl Objects {
             meta: objectset.meta,
             cache: VecDeque::new(),
             cached_bytes: 0,
-        })
+        };
+        // Label features only describe what is needed to bootstrap the MOS.
+        // Keep this view private until its complete native feature catalogs
+        // admit reads. Every explicit/automatic leaf/group open joins here.
+        view.admit_features(cx)?;
+        checkpoint(cx)?;
+        Ok(view)
     }
 }
 
