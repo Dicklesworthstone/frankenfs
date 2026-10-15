@@ -5,6 +5,7 @@
 //! an unknown active feature. Write-only features do not authorize any writes.
 
 use super::{Cx, Objects, Result, checkpoint, corrupt, unsupported};
+use ffs_ondisk::zfs::nvlist::Value;
 use ffs_ondisk::zfs_zap::Entry;
 use std::collections::BTreeMap;
 
@@ -41,7 +42,7 @@ fn policy(name: &str) -> Option<Policy> {
         | "org.illumos:sha512" | "org.freebsd:zstd_compress" =>
             (false, false, true, EXTENSIBLE),
         "com.delphix:hole_birth" =>
-            (false, true, false, &["com.delphix:enabled_txg"]),
+            (false, true, true, &["com.delphix:enabled_txg"]),
         "org.illumos:skein" | "org.illumos:edonr" | "org.openzfs:blake3"
         | "com.delphix:redacted_datasets" | "org.zfsonlinux:longname" =>
             (false, false, false, EXTENSIBLE),
@@ -79,6 +80,18 @@ fn policy(name: &str) -> Option<Policy> {
         _ => return None,
     };
     Some(Policy { for_write, mos, read_supported, dependencies })
+}
+
+/// Bootstrap and full MOS admission share one implementation registry. Retain
+/// the existing label spelling for lz4 although the pinned upstream registry
+/// no longer marks it MOS-required. Ordinary dataset features do not belong in
+/// this label allowlist just because their reached structures can be read.
+pub(in crate::reader) fn supported_label_feature(name: &str, value: &Value) -> bool {
+    matches!(value, Value::Boolean(true))
+        && policy(name).is_some_and(|known| {
+            !known.for_write && known.read_supported
+                && (known.mos || name == "org.illumos:lz4_compress")
+        })
 }
 
 fn guid(bytes: &[u8]) -> Result<&str> {
@@ -189,5 +202,5 @@ impl Objects {
 
 companion_bin_tests! {
     #[cfg(test)]
-    mod tests;
+    pub(super) mod tests;
 }

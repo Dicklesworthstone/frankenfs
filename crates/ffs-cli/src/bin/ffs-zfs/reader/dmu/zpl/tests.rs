@@ -1,4 +1,5 @@
 use super::*;
+use crate::reader::dmu::features::tests::{GRAPH_DIRECTORY, install_graph_catalogs};
 use crate::reader::dmu::tests::embedded_pointer;
 use crate::reader::{ByteOffset, DATA_OFFSET, Endian, LABEL_BYTES, Leaf, VdevConfig};
 use ffs_block::ByteDevice;
@@ -390,7 +391,7 @@ fn graph(order: Endian, sa: u8, case: u8, reads: Reads, failure: Option<u64>) ->
     os[704..712].copy_from_slice(&other.encode(2));
     store(OS, &os);
     let mut mos_table = vec![0; 16_384];
-    let pool = micro(&[(b"root_dataset", 2)], order);
+    let pool = micro(GRAPH_DIRECTORY, order);
     store(POOL_MAP, &pool);
     let mut dn = node(1, 512, 1, 0, &[], 0, order);
     dn[64..192].copy_from_slice(&bp(&pool, POOL_MAP, 1, 0, 20, order, order));
@@ -412,6 +413,9 @@ fn graph(order: Endian, sa: u8, case: u8, reads: Reads, failure: Option<u64>) ->
         other,
     ));
     mos_table[1536..2048].copy_from_slice(&node(16, 512, 1, 0, &ds, 16, order));
+    for (at, bytes) in install_graph_catalogs(&mut mos_table, order) {
+        store(at, &bytes);
+    }
     store(MOS, &mos_table);
     let mut meta = node(10, 16_384, 1, 0, &[], 0, order);
     meta[64..192].copy_from_slice(&bp(&mos_table, MOS, 10, 0, 50, order, order));

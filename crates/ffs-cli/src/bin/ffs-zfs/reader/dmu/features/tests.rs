@@ -99,6 +99,27 @@ fn bootstrap_labels_and_selected_mos_must_agree_on_active_features() {
 }
 
 #[test]
+fn hole_birth_bootstrap_and_mos_use_the_same_registry_without_admitting_unknown_labels() {
+    let cx = Cx::for_testing();
+    let labels = vec!["com.delphix:hole_birth".into()];
+    let write = [entry("com.delphix:enabled_txg", 0)];
+    assert!(admit(&cx, &[entry("com.delphix:hole_birth", 1)], &write, &labels).is_ok());
+    assert!(admit(&cx, &[entry("com.delphix:hole_birth", 1)], &[], &labels).is_err());
+    assert!(admit(&cx, &[entry("com.delphix:hole_birth", 1)], &write, &[]).is_err());
+    assert!(admit(&cx, &[entry("com.delphix:hole_birth", 0)], &write, &labels).is_err());
+    assert!(admit(&cx, &[entry("com.delphix:hole_birth", 0)], &write, &[]).is_ok());
+    for name in ["com.delphix:hole_birth", "com.delphix:embedded_data", "org.illumos:lz4_compress"] {
+        assert!(crate::reader::supported_read_feature(name, &Value::Boolean(true)));
+        for value in [Value::Boolean(false), Value::Unsigned(1)] {
+            assert!(!crate::reader::supported_read_feature(name, &value));
+        }
+    }
+    for name in ["test:future", "com.delphix:enabled_txg", "com.datto:encryption", "org.open-zfs:large_blocks"] {
+        assert!(!crate::reader::supported_read_feature(name, &Value::Boolean(true)));
+    }
+}
+
+#[test]
 fn write_only_dependencies_must_be_present_but_need_not_be_active() {
     let cx = Cx::for_testing();
     let rows = [entry("com.delphix:log_spacemap", 1)];
@@ -181,15 +202,55 @@ fn micro(rows: &[(&[u8], u64)], order: Endian) -> Vec<u8> {
     raw
 }
 
+// Both existing complete ZPL graph families use native root_dataset object 2
+// and reserve MOS slots 29..31 plus the gap between their pool and child maps.
+// Install real checksum-protected ZAPs, never a production admission bypass.
+// Their mirror/RAIDZ/gang builders already copy/re-encode this same block graph.
+pub(in crate::reader) const GRAPH_DIRECTORY: &[(&[u8], u64)] = &[
+    (b"root_dataset", 2),
+    (b"features_for_read", 29),
+    (b"features_for_write", 30),
+    (b"feature_descriptions", 31),
+];
+
+pub(in crate::reader) fn install_graph_catalogs(
+    table: &mut [u8],
+    order: Endian,
+) -> Vec<(u64, Vec<u8>)> {
+    assert_eq!(table.len(), 16 * 1024);
+    let read = micro(&[
+        (b"org.illumos:lz4_compress", 1),
+        (b"com.delphix:embedded_data", 1),
+    ], order);
+    let mut blocks = Vec::new();
+    for (id, at, bytes) in [
+        (29, DATA_OFFSET + 0x14400, read),
+        (30, DATA_OFFSET + 0x14600, micro(&[], order)),
+        (31, DATA_OFFSET + 0x14800, micro(&[], order)),
+    ] {
+        let slot = &mut table[id * 512..(id + 1) * 512];
+        assert!(slot.iter().all(|byte| *byte == 0), "fixture catalog slot already used");
+        slot.copy_from_slice(&node(&bytes, at, 196, order));
+        blocks.push((at, bytes));
+    }
+    blocks
+}
+
 fn fixture(order: Endian, count: u64, case: u8, failure: Option<(u64, bool)>) -> (Pool, RootBlock, Reads) {
     let mut rows: Vec<(&[u8], u64)> = vec![
         (b"features_for_read", 2), (b"features_for_write", 3), (b"feature_descriptions", 4),
     ];
     if case == 1 { rows.pop(); }
     if case == 2 { rows[1].1 = 2; }
+    if case == 4 { rows = GRAPH_DIRECTORY.to_vec(); }
     let directory = micro(&rows, order);
-    let read = micro(&[(b"test:future", count)], order);
-    let write = micro(&[(b"test:writer_only", u64::MAX)], order);
+    let read_name: &[u8] = if case == 5 { b"com.delphix:hole_birth" } else { b"test:future" };
+    let read = micro(&[(read_name, count)], order);
+    let write = if case == 5 {
+        micro(&[(b"com.delphix:enabled_txg", 0)], order)
+    } else {
+        micro(&[(b"test:writer_only", u64::MAX)], order)
+    };
     let descriptions = micro(&[], order);
     let mut blocks = BTreeMap::new();
     let mut table = vec![0; 16 * 1024];
@@ -199,6 +260,18 @@ fn fixture(order: Endian, count: u64, case: u8, failure: Option<(u64, bool)>) ->
     ] {
         table[id * 512..(id + 1) * 512].copy_from_slice(&node(&bytes, at, kind, order));
         blocks.insert(BASE + at, bytes);
+    }
+    if case == 4 {
+        for (at, bytes) in install_graph_catalogs(&mut table, order) {
+            blocks.insert(BASE + at, bytes);
+        }
+    }
+    if case == 5 {
+        let mut sparse = node(&[0; 512], DATA_OFFSET, 19, order);
+        sparse[64..192].fill(0);
+        sparse[112..120].copy_from_slice(&order.encode(19_u64 << 48));
+        sparse[144..152].copy_from_slice(&order.encode(10));
+        table[5 * 512..6 * 512].copy_from_slice(&sparse);
     }
     let mut data = vec![0; 1024];
     data[..512].copy_from_slice(&node(&table, TABLE, 10, order));
@@ -214,9 +287,45 @@ fn fixture(order: Endian, count: u64, case: u8, failure: Option<(u64, bool)>) ->
         data, physical_offset: DATA_OFFSET, copy_index: 0, member_guid: 2, raidz: None,
         config: VdevConfig { pool_guid: 1, top_guid: 2, version: 5000, txg: 40, ashift: 9, id: 0,
             allocated_bytes: LENGTH - DATA_OFFSET - 2 * 256 * 1024,
-            read_features: Vec::new(), raidz_members: None },
+            read_features: if case == 4 {
+                vec!["org.illumos:lz4_compress".into(), "com.delphix:embedded_data".into()]
+            } else if case == 5 {
+                vec!["com.delphix:hole_birth".into()]
+            } else { Vec::new() }, raidz_members: None },
     };
     (leaf.into(), root, reads)
+}
+
+#[test]
+fn admitted_hole_birth_mos_reads_and_seeks_sparse_data_without_payload_io() {
+    for order in [Endian::Little, Endian::Big] {
+        let cx = Cx::for_testing();
+        let (pool, root, reads) = fixture(order, 1, 5, None);
+        let mut view = Objects::from_root(&cx, pool, root).unwrap();
+        let before = reads.lock().unwrap().len();
+        assert_eq!(view.read(&cx, 5, 37, 111).unwrap(), [0; 111]);
+        let object = view.load(&cx, 5).unwrap();
+        assert_eq!(view.seek_data_hole(&cx, &object, 512, 37, false).unwrap(), 37);
+        assert!(matches!(view.seek_data_hole(&cx, &object, 512, 37, true),
+            Err(FfsError::Io(error)) if error.raw_os_error() == Some(libc::ENXIO)));
+        assert_eq!(reads.lock().unwrap().len(), before);
+    }
+}
+
+#[test]
+fn shared_graph_catalogs_pass_the_real_constructor_with_both_label_features() {
+    for order in [Endian::Little, Endian::Big] {
+        let cx = Cx::for_testing();
+        let (pool, root, reads) = fixture(order, 0, 4, None);
+        let mut view = Objects::from_root(&cx, pool, root).unwrap();
+        for id in 29..=31 {
+            assert_eq!(view.object(&cx, id).unwrap().object_type(), 196);
+        }
+        let log = reads.lock().unwrap();
+        assert!(log.contains(&(BASE + DATA_OFFSET + 0x14400)));
+        assert!(log.contains(&(BASE + DATA_OFFSET + 0x14600)));
+        assert!(!log.contains(&(BASE + DATA_OFFSET + 0x14800)));
+    }
 }
 
 #[test]

@@ -1,4 +1,5 @@
 use super::*;
+use crate::reader::dmu::features::tests::{GRAPH_DIRECTORY, install_graph_catalogs};
 use crate::reader::dmu::tests::embedded_pointer;
 use crate::reader::{Leaf, VdevConfig};
 use ffs_block::ByteDevice;
@@ -128,7 +129,7 @@ impl Image {
             1,
             1,
             DATA_OFFSET + 0x14000,
-            &[(b"root_dataset", 2)],
+            GRAPH_DIRECTORY,
             0,
             other,
         );
@@ -232,6 +233,9 @@ impl Image {
                 0,
                 order,
             );
+        }
+        for (at, bytes) in install_graph_catalogs(&mut image.table, order) {
+            image.store(at, &bytes);
         }
         image.finish();
         image

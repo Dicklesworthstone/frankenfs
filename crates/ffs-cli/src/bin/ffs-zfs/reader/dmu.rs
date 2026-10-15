@@ -2,11 +2,14 @@
 //! No automatic import/TXG selection, writes, replay, or ZPL file-size guesses.
 
 mod features;
+mod holes;
 pub mod scrub;
 mod seek;
 mod zap;
 pub mod zil;
 pub mod zpl;
+
+pub(super) use features::supported_label_feature;
 
 use super::{
     BlockPointer, Cx, Endian, FfsError, Leaf, Pool, Result, RootBlock, VdevConfig, checkpoint,
@@ -142,6 +145,7 @@ impl Objects {
             ));
         }
         if bp.hole() {
+            self.validate_hole(bp, kind, level, size)?;
             return Ok(false);
         }
         if bp.birth() == 0
