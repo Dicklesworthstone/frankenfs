@@ -3,6 +3,7 @@
 //! Permissions are an explicit host projection, not an interpretation of ACLs.
 
 mod extents;
+mod recovery;
 
 use super::{
     Cx, DATA, FfsError, NtfsFileRecord, NtfsReference, NtfsValue, NtfsVolume, Result, Stream,
@@ -80,6 +81,7 @@ pub struct NtfsFs {
 impl NtfsFs {
     pub fn new(cx: &Cx, volume: NtfsVolume, uid: u32, gid: u32) -> Result<Self> {
         checkpoint(cx)?;
+        recovery::admit(cx, &volume)?;
         let record = volume.record(cx, 5, None)?;
         if !record.is_directory() {
             return Err(corrupt(0, "NTFS root is not a directory"));

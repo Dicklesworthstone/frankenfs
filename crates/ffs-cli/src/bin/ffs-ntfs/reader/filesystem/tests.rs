@@ -4,6 +4,8 @@ use ffs_block::ByteDevice;
 use std::sync::{Arc, Mutex};
 
 mod ea;
+mod extents;
+mod recovery;
 
 const BASE: usize = 1024;
 const LENGTH: usize = 1024 * 512;
@@ -191,6 +193,22 @@ fn image() -> Vec<u8> {
     );
     put(&mut image, 0, &mft);
     image[BASE + 128 * 512..BASE + 130 * 512].copy_from_slice(&mft);
+    // An erased native $LogFile, outside the existing data/UpCase fixtures.
+    // Every mount must verify the full initialized log, not bypass admission.
+    put(
+        &mut image,
+        2,
+        &record(
+            2,
+            false,
+            1,
+            &[
+                standard(),
+                mapped(&[0x21, 64, 0xC0, 0, 0], 64, 32_768, false),
+            ],
+        ),
+    );
+    image[BASE + 192 * 512..BASE + 256 * 512].fill(0xFF);
     let mut info = [0; 12];
     info[8..10].copy_from_slice(&[3, 1]);
     put(
