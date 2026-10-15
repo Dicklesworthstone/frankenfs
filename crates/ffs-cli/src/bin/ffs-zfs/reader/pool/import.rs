@@ -9,8 +9,8 @@ use super::{
     RootBlock, Uberblock, VdevConfig, checkpoint, corrupt, integer, parse, unsupported,
 };
 use ffs_ondisk::zfs::{
-    LABEL_CONFIG_BYTES, LABEL_CONFIG_OFFSET, UBERBLOCK_RING_BYTES, label_offsets,
-    uberblock_bytes, verify_label_checksum,
+    LABEL_CONFIG_BYTES, LABEL_CONFIG_OFFSET, UBERBLOCK_RING_BYTES, UBERBLOCK_RING_OFFSET,
+    label_offsets, uberblock_bytes, verify_label_checksum,
 };
 use std::collections::BTreeSet;
 
@@ -178,11 +178,81 @@ fn admit_stripe(labels: &[Vec<(usize, Label)>], pool_guid: u64) -> Result<Admiss
 }
 
 impl Pool {
+    fn import_candidates(
+        &self,
+        cx: &Cx,
+        labels: &[Vec<(usize, Label)>],
+        admission: &Admission,
+    ) -> Result<Vec<Candidate>> {
+        let mut candidates = Vec::new();
+        for (member_index, member_labels) in labels.iter().enumerate() {
+            let member = &self.members[member_index];
+            let slot_bytes = member_labels[0].1.slot_bytes;
+            // Configuration and uberblock rings have independent checksums.
+            // All surviving configurations already agreed on ashift. Use that
+            // geometry to scan every ring, even beside a damaged config copy.
+            for (label_index, label_offset) in label_offsets(member.length)
+                .map_err(|error| parse(&error))?
+                .into_iter()
+                .enumerate()
+            {
+                for slot in 0..UBERBLOCK_RING_BYTES / slot_bytes {
+                    checkpoint(cx)?;
+                    let offset = label_offset + UBERBLOCK_RING_OFFSET + (slot * slot_bytes) as u64;
+                    let result = member.read(cx, offset, slot_bytes).and_then(|raw| {
+                        Uberblock::parse(&raw, offset).map_err(|error| parse(&error))
+                    });
+                    let ub = match result {
+                        Ok(ub) => ub,
+                        Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
+                        Err(_) => continue,
+                    };
+                    if ub.version == admission.config.version
+                        && ub.txg >= admission.config.txg
+                        && ub.guid_sum == admission.guid_sum
+                    {
+                        candidates.push(Candidate {
+                            member_guid: admission.supplied_guids[member_index],
+                            label_index,
+                            slot,
+                            uberblock: ub,
+                        });
+                    }
+                }
+            }
+        }
+        candidates.sort_unstable_by(|left, right| {
+            right
+                .uberblock
+                .txg
+                .cmp(&left.uberblock.txg)
+                .then_with(|| right.uberblock.timestamp.cmp(&left.uberblock.timestamp))
+                .then_with(|| left.member_guid.cmp(&right.member_guid))
+                .then_with(|| left.label_index.cmp(&right.label_index))
+                .then_with(|| left.slot.cmp(&right.slot))
+        });
+        for pair in candidates.windows(2) {
+            if pair[0].uberblock.txg == pair[1].uberblock.txg
+                && pair[0].uberblock.root != pair[1].uberblock.root
+            {
+                return Err(corrupt(
+                    "checksum-valid ZFS uberblocks conflict within one TXG",
+                ));
+            }
+        }
+        // Identical roots would retry precisely the same DVAs on the same
+        // immutable devices. Deduplicate only AFTER checking for forks.
+        candidates.dedup_by(|left, right| left.uberblock.txg == right.uberblock.txg);
+        checkpoint(cx)?;
+        Ok(candidates)
+    }
+
     /// Select the highest readable, checksum-verified TXG from every supplied
-    /// member's usable labels. Ring locations need not agree across replicas.
+    /// member's rings. Ring locations need not agree across replicas, and a
+    /// ring remains readable even when its adjacent configuration copy is bad.
     ///
     /// The returned label/slot belongs to the selected uberblock's source
-    /// member; RootBlock::member_guid continues to identify the data read.
+    /// member; `RootBlock::member_guid` continues to identify the data read.
     /// All devices remain read-only. No ZIL replay, missing-member admission,
     /// configuration-history resolution, or on-disk repair is performed.
     pub fn import_active(
@@ -211,47 +281,7 @@ impl Pool {
         } else {
             admit_group(&labels, pool_guid)?
         };
-        let mut candidates = Vec::new();
-        for (member_index, member_labels) in labels.iter().enumerate() {
-            for (label_index, label) in member_labels {
-                for slot in 0..UBERBLOCK_RING_BYTES / label.slot_bytes {
-                    checkpoint(cx)?;
-                    let ub = match self.members[member_index].uberblock(cx, label, slot) {
-                        Ok(ub) => ub,
-                        Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
-                        Err(_) => continue,
-                    };
-                    if ub.version == admission.config.version
-                        && ub.txg >= admission.config.txg
-                        && ub.guid_sum == admission.guid_sum
-                    {
-                        candidates.push(Candidate {
-                            member_guid: admission.supplied_guids[member_index],
-                            label_index: *label_index,
-                            slot,
-                            uberblock: ub,
-                        });
-                    }
-                }
-            }
-        }
-        candidates.sort_unstable_by(|left, right| {
-            right.uberblock.txg.cmp(&left.uberblock.txg)
-                .then_with(|| right.uberblock.timestamp.cmp(&left.uberblock.timestamp))
-                .then_with(|| left.member_guid.cmp(&right.member_guid))
-                .then_with(|| left.label_index.cmp(&right.label_index))
-                .then_with(|| left.slot.cmp(&right.slot))
-        });
-        for pair in candidates.windows(2) {
-            if pair[0].uberblock.txg == pair[1].uberblock.txg
-                && pair[0].uberblock.root != pair[1].uberblock.root
-            {
-                return Err(corrupt("checksum-valid ZFS uberblocks conflict within one TXG"));
-            }
-        }
-        // Identical roots would retry precisely the same DVAs on the same
-        // immutable devices. Deduplicate only AFTER checking for forks.
-        candidates.dedup_by(|left, right| left.uberblock.txg == right.uberblock.txg);
+        let candidates = self.import_candidates(cx, &labels, &admission)?;
         let mut last_error = corrupt("no valid active ZFS uberblock candidates in ring");
         for candidate in candidates {
             checkpoint(cx)?;
@@ -259,23 +289,31 @@ impl Pool {
             match self.read_block(cx, &admission.config, &ub.root) {
                 Ok(block) => {
                     if block.bytes.len() < 1024
-                        || ub.root.payload_order().u64(&block.bytes, 704)
-                            .map_err(|error| parse(&error))? != 1
+                        || ub
+                            .root
+                            .payload_order()
+                            .u64(&block.bytes, 704)
+                            .map_err(|error| parse(&error))?
+                            != 1
                     {
                         last_error = corrupt("selected root is not a META object set");
                         continue;
                     }
                     let member_guid = admission.supplied_guids[block.member_index];
                     checkpoint(cx)?;
-                    return Ok((candidate.label_index, candidate.slot, RootBlock {
-                        uberblock: ub,
-                        data: block.bytes,
-                        physical_offset: block.physical_offset,
-                        copy_index: block.copy_index,
-                        member_guid,
-                        raidz: block.raidz,
-                        config: admission.config,
-                    }));
+                    return Ok((
+                        candidate.label_index,
+                        candidate.slot,
+                        RootBlock {
+                            uberblock: ub,
+                            data: block.bytes,
+                            physical_offset: block.physical_offset,
+                            copy_index: block.copy_index,
+                            member_guid,
+                            raidz: block.raidz,
+                            config: admission.config,
+                        },
+                    ));
                 }
                 Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
                 Err(error) => last_error = error,
@@ -420,6 +458,22 @@ companion_bin_tests! {
         }
 
         #[test]
+        fn auto_import_reads_a_healthy_ring_beside_a_damaged_configuration() {
+            for order in [Endian::Little, Endian::Big] {
+                let mut fixture = Fixture::new(order);
+                fixture.clear_rings();
+                let ub = fixture.ub.clone();
+                fixture.candidate(1, 3, 7, &ub);
+                fixture.damage_label(1, 3);
+                let expected = fixture.root.clone();
+                let pool = fixture.pool([Fault::None; 2], false, &Arc::default());
+                let (label, slot, root) = pool.import_active(&Cx::for_testing(), None).unwrap();
+                assert_eq!((label, slot), (3, 7));
+                assert_eq!(root.data, expected);
+            }
+        }
+
+        #[test]
         fn auto_import_recovers_bad_labels_but_explicit_selection_stays_strict() {
             for order in [Endian::Little, Endian::Big] {
                 let mut fixture = Fixture::new(order);
@@ -531,6 +585,22 @@ companion_bin_tests! {
             let root = pool.import_active(&Cx::for_testing(), None).unwrap().2;
             assert_eq!(root.uberblock.txg, 43);
             assert_eq!(root.data, expected);
+        }
+
+        #[test]
+        fn auto_import_does_not_repeat_failed_data_reads_for_identical_ring_copies() {
+            let mut fixture = Fixture::new(Endian::Little);
+            for image in &mut fixture.images {
+                for offset in [FIRST, SECOND] {
+                    let at = BASE + offset as usize;
+                    image[at..at + 1024].fill(0);
+                }
+            }
+            let reads = Arc::default();
+            let pool = fixture.pool([Fault::None; 2], false, &reads);
+            assert!(pool.import_active(&Cx::for_testing(), None).is_err());
+            // Two DVAs on two mirrors, not eight ring copies times four reads.
+            assert_eq!(data_reads(&reads), 4);
         }
     }
 }
