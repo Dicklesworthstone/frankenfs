@@ -941,7 +941,11 @@ fn rename_with_mode(
         RenameTarget::Existing { entry, long_slots, release }
     } else {
         let name = super::names::NativeName::plan(cx, volume, dst_dir, &dst_leaf)?;
-        if src_dir == dst_dir && name.long_slots() <= src_lfn.len() {
+        if src_dir == dst_dir
+            && let Some(slots) = rename_in_place::reserve_before(
+                cx, volume, src_dir, &src_short, &src_lfn, name.long_slots(),
+            )?
+        {
             // FAT16's fixed root cannot grow, and a same-directory rename
             // should not need a second free name set or any spare clusters.
             // Compare native parent identities, not case/alias path spellings.
@@ -950,7 +954,7 @@ fn rename_with_mode(
                 to,
                 leaf: &dst_leaf,
                 short: &src_short,
-                long: &src_lfn,
+                long: &slots,
                 name: &name,
                 chain: &source_chain,
                 before: &before,

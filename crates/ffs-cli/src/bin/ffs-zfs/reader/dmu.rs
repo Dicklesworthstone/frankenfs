@@ -8,6 +8,7 @@ mod seek;
 mod zap;
 pub mod zil;
 pub mod zpl;
+pub mod zvol;
 
 pub(super) use features::supported_label_feature;
 

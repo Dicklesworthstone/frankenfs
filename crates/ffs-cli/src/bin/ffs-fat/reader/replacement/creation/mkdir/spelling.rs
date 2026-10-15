@@ -128,7 +128,7 @@ pub(super) fn rename(
         bail!("case-only rename requires a complete clean allocation/namespace check");
     }
     let source_chain = rename_chain(cx, volume, source)?;
-    let (short, long) = find_entry_slots(cx, volume, directory, source.offset)?;
+    let (short, mut long) = find_entry_slots(cx, volume, directory, source.offset)?;
     let expected_long = source.native.long_name.as_ref().map_or(0, |units| units.len().div_ceil(13));
     if long.len() != expected_long {
         bail!("case-only rename captured an inconsistent native long-name set");
@@ -141,7 +141,10 @@ pub(super) fn rename(
     if decoded != source.native {
         bail!("case-only rename target changed after native lookup");
     }
-    let placement = if name.long_slots() <= long.len() {
+    let placement = if let Some(slots) = super::rename_in_place::reserve_before(
+        cx, volume, directory, &short, &long, name.long_slots(),
+    )? {
+        long = slots;
         Placement::Reuse(name)
     } else {
         Placement::Relocate(reserve_destination(cx, volume, directory, name, before.free_clusters)?)

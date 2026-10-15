@@ -6,10 +6,10 @@
 //! may leave an unreachable chain and require native recovery; this is not an
 //! atomic rename or a persistent orphan protocol.
 
-use super::super::super::super::{FatVolume, check::FatCheckReport};
+use super::super::super::super::{Directory, FatVolume, check::FatCheckReport};
 use super::super::names::NativeName;
 use super::{
-    Slot, checkpoint, delete_entry_slots, patch_slot, read_slot, rename_chain,
+    Slot, checkpoint, delete_entry_slots, directory_offsets, patch_slot, read_slot, rename_chain,
     retired_slot, set_dirty, validate_boot_state, validate_entry_slots, verify_retired_slot,
 };
 use anyhow::{Context, Result, bail};
@@ -17,6 +17,55 @@ use asupersync::Cx;
 use ffs_error::FfsError;
 use ffs_ondisk::fat::FatGeometry;
 use serde_json::json;
+
+/// Reserve the old name set plus immediately preceding deleted slots, in
+/// logical directory order. Never consume an end marker or a live neighbor.
+/// A failed partial reservation must not modify the source's retirement set.
+pub(super) fn reserve_before(
+    cx: &Cx,
+    volume: &FatVolume,
+    directory: Directory,
+    short: &Slot,
+    long: &[Slot],
+    needed: usize,
+) -> Result<Option<Vec<Slot>>> {
+    checkpoint(cx)?;
+    if needed > 20 || long.len() > 20 {
+        bail!("rename exceeds the native long-name slot limit");
+    }
+    let mut reserved = Vec::new();
+    reserved.try_reserve_exact(needed.max(long.len()))
+        .context("reserving bounded rename name slots")?;
+    for slot in long {
+        reserved.push(Slot { offset: slot.offset, bytes: slot.bytes, fresh: slot.fresh });
+    }
+    if needed <= reserved.len() {
+        return Ok(Some(reserved));
+    }
+    let (offsets, _) = directory_offsets(cx, volume, directory)?;
+    let short_index = offsets.iter().position(|&offset| offset == short.offset)
+        .context("rename source is not in its parent directory")?;
+    let Some(mut index) = short_index.checked_sub(long.len()) else {
+        bail!("rename long-name set extends before the parent directory");
+    };
+    for (ordinal, slot) in long.iter().enumerate() {
+        if slot.offset != offsets[short_index - 1 - ordinal] {
+            bail!("rename source name slots are not logically adjacent");
+        }
+    }
+    while reserved.len() < needed {
+        checkpoint(cx)?;
+        let Some(previous) = index.checked_sub(1) else { return Ok(None); };
+        let slot = read_slot(cx, volume, offsets[previous], false)?;
+        if slot.bytes[0] != 0xE5 {
+            return Ok(None);
+        }
+        reserved.push(slot);
+        index = previous;
+    }
+    checkpoint(cx)?;
+    Ok(Some(reserved))
+}
 
 /// Prepared by the ordinary rename preflight under the caller's operation gate.
 /// `long` is ordered from the short entry backwards, not by physical address:
@@ -74,7 +123,7 @@ impl Rename<'_> {
             .collect();
         let mut updated = self.short.bytes;
         updated[..11].copy_from_slice(&self.name.short);
-        updated[12] = self.name.flags;
+        updated[12] = (updated[12] & !0x18) | self.name.flags;
         let mut report = json!({
             "operation": "rename",
             "dry_run": dry_run,
@@ -176,4 +225,6 @@ impl Rename<'_> {
 companion_bin_tests! {
     #[cfg(test)]
     mod tests;
+    #[cfg(test)]
+    mod slot_growth_tests;
 }

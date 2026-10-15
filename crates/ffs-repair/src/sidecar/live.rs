@@ -62,6 +62,9 @@ struct State {
 struct GroupRepair {
     recovered_blocks: u64,
     invalid_symbols: u64,
+    /// Verified reconstruction for a strictly read-only device. Never retained
+    /// beyond this read, written back, or used as a new protection generation.
+    in_memory: BTreeMap<u64, Vec<u8>>,
 }
 
 /// Progress for an opportunistic, group-at-a-time protection scrub.
@@ -134,11 +137,17 @@ pub enum ProtectionScrubStep {
 /// low fsync latency; it is not the default filesystem mount path. Working memory
 /// includes one digest per admitted group, one per changed block, and bounded
 /// group buffers; the read-side metadata cache holds only one group at a time.
+///
+/// [`Self::open_read_only`] instead opens both files without write capability.
+/// Reads can reconstruct the admitted generation in memory, but never write
+/// repairs, invalidate protection, rebuild archives, or synchronize backing
+/// files. A pre-existing image/snapshot mismatch remains an admission error.
 pub struct SidecarImageDevice {
     image: File,
     sidecar_path: PathBuf,
     image_bytes: u64,
     protection_groups: u32,
+    read_only: bool,
     state: Mutex<State>,
 }
 
@@ -147,6 +156,7 @@ impl std::fmt::Debug for SidecarImageDevice {
         f.debug_struct("SidecarImageDevice")
             .field("image_bytes", &self.image_bytes)
             .field("sidecar_path", &self.sidecar_path)
+            .field("read_only", &self.read_only)
             .finish_non_exhaustive()
     }
 }
@@ -156,15 +166,45 @@ impl SidecarImageDevice {
     /// Neither file is changed on admission failure. The archive path is
     /// canonicalized once; future syncs replace that archive with a new snapshot.
     pub fn open(cx: &Cx, image_path: &Path, sidecar_path: &Path) -> Result<Self> {
+        Self::open_with_mode(cx, image_path, sidecar_path, false)
+    }
+
+    /// Open an immutable image and its existing protection without write access.
+    /// Shared inode locks permit other cooperating read-only owners and exclude
+    /// cooperating writers. Offline ownership is still the caller's obligation.
+    /// Admission uses the same whole-image and source-table generation checks
+    /// as the writable device; this is not implicit recovery of a stale image.
+    /// Later recoverable corruption is reconstructed only in memory. Neither
+    /// file needs write permission, and no scratch archive is created.
+    pub fn open_read_only(cx: &Cx, image_path: &Path, sidecar_path: &Path) -> Result<Self> {
+        Self::open_with_mode(cx, image_path, sidecar_path, true)
+    }
+
+    fn open_with_mode(
+        cx: &Cx,
+        image_path: &Path,
+        sidecar_path: &Path,
+        read_only: bool,
+    ) -> Result<Self> {
         checkpoint(cx)?;
-        let image = File::options().read(true).write(true).open(image_path)?;
+        let image = File::options()
+            .read(true)
+            .write(!read_only)
+            .open(image_path)?;
         let image_meta = image.metadata()?;
         if !image_meta.is_file() {
             return Err(corrupt("live repair requires a regular image file"));
         }
-        image.try_lock().map_err(io::Error::from)?;
+        if read_only {
+            image.try_lock_shared().map_err(io::Error::from)?;
+        } else {
+            image.try_lock().map_err(io::Error::from)?;
+        }
         let sidecar_path = sidecar_path.canonicalize()?;
-        let file = File::options().read(true).write(true).open(&sidecar_path)?;
+        let file = File::options()
+            .read(true)
+            .write(!read_only)
+            .open(&sidecar_path)?;
         let metadata = file.metadata()?;
         if !metadata.is_file()
             || (metadata.dev(), metadata.ino()) == (image_meta.dev(), image_meta.ino())
@@ -173,7 +213,11 @@ impl SidecarImageDevice {
                 "image and repair archive must be distinct regular files",
             ));
         }
-        file.try_lock().map_err(io::Error::from)?;
+        if read_only {
+            file.try_lock_shared().map_err(io::Error::from)?;
+        } else {
+            file.try_lock().map_err(io::Error::from)?;
+        }
         let mut raw = [0; HEADER_BYTES];
         file.read_exact_at(&mut raw, 0)?;
         if &raw[..8] == PENDING_MAGIC {
@@ -223,6 +267,7 @@ impl SidecarImageDevice {
             sidecar_path,
             image_bytes: archive.header.image_bytes,
             protection_groups: archive.header.groups,
+            read_only,
             state: Mutex::new(State {
                 archive,
                 phase: Phase::Clean,
@@ -232,6 +277,14 @@ impl SidecarImageDevice {
                 cached_hashes: None,
             }),
         })
+    }
+
+    fn require_writeback(&self, cx: &Cx) -> Result<()> {
+        checkpoint(cx)?;
+        if self.read_only {
+            return Err(FfsError::ReadOnly);
+        }
+        Ok(())
     }
 
     fn lock(&self, cx: &Cx) -> Result<MutexGuard<'_, State>> {
@@ -355,8 +408,11 @@ impl SidecarImageDevice {
             Err(error) if !Self::media_error(&error) => Err(error),
             _ => {
                 let group = (block / u64::from(state.archive.header.options.group_blocks)) as u32;
-                self.repair_group(cx, state, group)?;
-                let bytes = self.read_source_block(&state.archive.header, block)?;
+                let mut outcome = self.repair_group(cx, state, group)?;
+                let bytes = match outcome.in_memory.remove(&block) {
+                    Some(bytes) => bytes,
+                    None => self.read_source_block(&state.archive.header, block)?,
+                };
                 if source_digest(&state.archive.header, block, &bytes) != expected {
                     return Err(corrupt(
                         "live repair readback did not match the expected source",
@@ -414,6 +470,7 @@ impl SidecarImageDevice {
             return Ok(GroupRepair {
                 recovered_blocks: 0,
                 invalid_symbols: record.invalid_symbols,
+                in_memory: BTreeMap::new(),
             });
         }
         let source = MemoryGroup {
@@ -477,6 +534,17 @@ impl SidecarImageDevice {
                 _ => return Err(corrupt("live repair target changed before writeback")),
             }
         }
+        if self.read_only {
+            checkpoint(cx)?;
+            return Ok(GroupRepair {
+                recovered_blocks: damaged.len() as u64,
+                invalid_symbols: record.invalid_symbols,
+                in_memory: recovered_blocks
+                    .into_iter()
+                    .map(|recovered| (recovered.block.0, recovered.data))
+                    .collect(),
+            });
+        }
         for recovered in &recovered_blocks {
             checkpoint(cx)?;
             self.image.write_all_at(
@@ -494,6 +562,7 @@ impl SidecarImageDevice {
         Ok(GroupRepair {
             recovered_blocks: damaged.len() as u64,
             invalid_symbols: record.invalid_symbols,
+            in_memory: BTreeMap::new(),
         })
     }
 
@@ -603,6 +672,9 @@ impl SidecarImageDevice {
     }
 
     fn refresh(&self, cx: &Cx, state: &mut State) -> Result<()> {
+        // Guard the common publication seam as well as public entry points:
+        // a future maintenance caller must not give read-only I/O write power.
+        self.require_writeback(cx)?;
         self.check_image_len()?;
         self.image.sync_all()?;
         let mut header = state.archive.header.clone();
@@ -702,6 +774,7 @@ impl SidecarImageDevice {
     /// source groups verify against the admitted generation. A pending write
     /// epoch is never repaired using its preceding parity.
     pub fn scrub(&self, cx: &Cx) -> Result<u64> {
+        self.require_writeback(cx)?;
         let mut state = self.lock(cx)?;
         if !matches!(state.phase, Phase::Clean) {
             return Err(corrupt("sync outstanding writes before a repair scrub"));
@@ -747,7 +820,7 @@ impl SidecarImageDevice {
         cx: &Cx,
         cursor: &mut ProtectionScrubCursor,
     ) -> Result<ProtectionScrubStep> {
-        checkpoint(cx)?;
+        self.require_writeback(cx)?;
         let Some(mut state) = self.state.try_lock() else {
             checkpoint(cx)?;
             return Ok(ProtectionScrubStep::Busy);
@@ -860,7 +933,7 @@ impl ByteDevice for SidecarImageDevice {
     }
 
     fn write_all_at(&self, cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<()> {
-        checkpoint(cx)?;
+        self.require_writeback(cx)?;
         let end = self.range_end(offset, buf.len())?;
         if buf.is_empty() {
             return Ok(());
@@ -901,6 +974,13 @@ impl ByteDevice for SidecarImageDevice {
 
     fn sync(&self, cx: &Cx) -> Result<()> {
         let mut state = self.lock(cx)?;
+        if self.read_only {
+            if !matches!(state.phase, Phase::Clean) {
+                return Err(corrupt("read-only protection has an unexpected write epoch"));
+            }
+            self.check_image_len()?;
+            return checkpoint(cx);
+        }
         if matches!(state.phase, Phase::Clean) {
             self.check_image_len()?;
             self.image.sync_all()?;
@@ -915,6 +995,8 @@ mod tests {
     use super::*;
     use crate::sidecar::{SidecarOptions, protect, verify};
     use crate::sidecar_restore::restore;
+
+    mod read_only;
 
     fn finish_incremental_scrub(
         device: &SidecarImageDevice,

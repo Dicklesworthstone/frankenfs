@@ -7,8 +7,10 @@
 //! Transaction Analysis and loser undo planning do not make an image mountable.
 
 mod analysis;
+mod redo;
 mod scan;
 mod table;
+mod targets;
 
 use super::super::super::super::buffer;
 use super::{
@@ -310,8 +312,9 @@ fn checkpoint_tables(
     record: &LogRecord,
     references: &mut References,
     read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
-) -> Result<analysis::State> {
+) -> Result<(analysis::State, targets::State)> {
     let mut state = analysis::State::default();
+    let mut targets = targets::State::default();
     let data = load_dump(cx, restart, stream_length, record, ATTRIBUTES, read)?;
     let attribute_table = data
         .as_deref()
@@ -319,20 +322,23 @@ fn checkpoint_tables(
         .transpose()?;
     if let Some(table) = &attribute_table {
         attributes(cx, restart, table, record.lsn)?;
+        targets.seed_attributes(cx, table, record.lsn)?;
     }
     if let Some(data) = load_dump(cx, restart, stream_length, record, NAMES, read)? {
         names(cx, &data, attribute_table.as_ref())?;
+        targets.seed_names(cx, &data)?;
     }
     if let Some(data) = load_dump(cx, restart, stream_length, record, DIRTY, read)? {
         let table = RestartTable::parse(cx, &data)?;
         dirty_pages(cx, restart, &table, attribute_table.as_ref(), record.lsn)?;
+        targets.seed_dirty(cx, &table)?;
     }
     if let Some(data) = load_dump(cx, restart, stream_length, record, TRANSACTIONS, read)? {
         let table = RestartTable::parse(cx, &data)?;
         transactions(cx, restart, &table, record.lsn, references)?;
         state = analysis::State::from_table(cx, &table)?;
     }
-    Ok(state)
+    Ok((state, targets))
 }
 
 pub(super) fn validate(
@@ -345,6 +351,10 @@ pub(super) fn validate(
     checkpoint(cx)?;
     let mut references = References::default();
     let mut state = analysis::State::default();
+    // Without a native checkpoint there is no complete open-attribute/dirty
+    // target seed. Keep envelope/transaction inspection, but do not fabricate
+    // an empty target table or claim target Analysis completed.
+    let mut targets = None;
     let mut scan_start = restart
         .active_client_oldest_lsn
         .filter(|lsn| *lsn != 0)
@@ -366,22 +376,31 @@ pub(super) fn validate(
         let start = u64_at(&record.data, 8)?;
         older_reference(restart, start, record.lsn, "checkpoint-start")?;
         scan_start = if start == 0 { record.lsn } else { start };
-        state = checkpoint_tables(cx, restart, stream_length, &record, &mut references, read)?;
+        let (transactions, native_targets) =
+            checkpoint_tables(cx, restart, stream_length, &record, &mut references, read)?;
+        state = transactions;
+        targets = Some(native_targets);
     } else if tail.kind == LFS_CLIENT_RESTART {
         // Validate even a checkpoint tail whose active-client pointer is absent.
         // Its absence is not interpreted as a fully initialized recovery state.
         let start = u64_at(&tail.data, 8)?;
         older_reference(restart, start, tail.lsn, "checkpoint-start")?;
         scan_start = if start == 0 { tail.lsn } else { start };
-        state = checkpoint_tables(cx, restart, stream_length, tail, &mut references, read)?;
+        let (transactions, native_targets) =
+            checkpoint_tables(cx, restart, stream_length, tail, &mut references, read)?;
+        state = transactions;
+        targets = Some(native_targets);
     }
     // A transaction chain omits every other transaction. Read the physical
     // sequence as well, and check ownership of links from ALL encountered
     // records. The caller's shared I/O budget includes this entire pass.
-    let history = scan::collect(cx, restart, stream_length, scan_start, read)?;
+    let mut history = scan::collect(cx, restart, stream_length, scan_start, read)?;
     for record in &history {
         checkpoint(cx)?;
         state.observe(cx, record)?;
+        if let Some(targets) = &mut targets {
+            targets.observe(cx, record)?;
+        }
         if record.kind == LFS_CLIENT_RECORD {
             references.add(restart, record.lsn, record.summary.transaction_id)?;
             references.links(restart, record)?;
@@ -399,12 +418,33 @@ pub(super) fn validate(
         references.links(restart, &record)?;
     }
     let report = state.finish(cx, restart, stream_length, read)?;
+    let target_report = targets.as_ref().map(|targets| targets.finish(cx)).transpose()?;
+    if let Some(first) = target_report.and_then(|report| report.2).filter(|first| *first < scan_start) {
+        // Checkpoint-start bounds Analysis, not Redo. A surviving dirty page
+        // can need an earlier record. Release the old payload window before
+        // collecting the complete redo interval under the same shared budget.
+        drop(history);
+        history = scan::collect(cx, restart, stream_length, first, read)?;
+    }
+    let redo_plan = targets.as_ref().map(|targets| redo::build(cx, targets, &history)).transpose()?;
+    let redo_summary = redo_plan.as_ref().map(redo::Plan::summary);
     tracing::debug!(
         target: "ffs::ntfs::recovery",
         active_transactions = report.active,
         prepared_transactions = report.prepared,
         committed_transactions = report.committed,
         undo_operations = report.undo.len(),
+        target_analysis = target_report.is_some(),
+        mapped_dirty_clusters = target_report.map(|report| report.0),
+        retired_dirty_clusters = target_report.map(|report| report.1),
+        target_redo_start = target_report.and_then(|report| report.2),
+        redo_records = redo_summary.as_ref().map(|summary| summary.records),
+        redo_obsolete_records = redo_summary.as_ref().map(|summary| summary.obsolete),
+        redo_payload_bytes = redo_summary.as_ref().map(|summary| summary.bytes),
+        redo_cluster_claims = redo_summary.as_ref().map(|summary| summary.clusters),
+        redo_native_files = redo_summary.as_ref().map(|summary| summary.files),
+        redo_relocated_claims = redo_summary.as_ref().map(|summary| summary.relocated),
+        redo_first_lsn = redo_summary.as_ref().and_then(|summary| summary.first_lsn),
         "Validated NTFS transaction Analysis through the selected restart; replay remains required"
     );
     checkpoint(cx)
