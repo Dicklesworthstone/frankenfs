@@ -99,6 +99,17 @@ impl Objects {
 }
 
 impl Zpl {
+    /// Scrub this exact head or snapshot's DMU object set, including allocated
+    /// private objects that namespace enumeration would not visit. Never switch
+    /// to the MOS or live head; the selected historical birth ceiling is retained.
+    pub fn scrub(
+        &self,
+        cx: &Cx,
+        limits: super::scrub::ScrubLimits,
+    ) -> Result<super::scrub::ScrubReport> {
+        self.objects.scrub(cx, limits)
+    }
+
     fn open(
         cx: &Cx,
         mut objects: Objects,
