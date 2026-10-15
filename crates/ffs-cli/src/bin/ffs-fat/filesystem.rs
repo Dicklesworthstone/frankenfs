@@ -103,6 +103,22 @@ fn now_unix_secs() -> u64 {
         .map_or(315_532_800, |d| d.as_secs().max(315_532_800))
 }
 
+/// Validate all representability constraints before a truncate can publish.
+/// FAT stores local calendar fields; retain the adapter's UTC projection and
+/// let the native encoder round mtime to two seconds and atime to one day.
+fn requested_fat_time(time: SystemTime) -> Result<u64> {
+    let seconds = time
+        .duration_since(UNIX_EPOCH)
+        .map_err(|_| FfsError::Io(std::io::Error::from_raw_os_error(libc::EINVAL)))?
+        .as_secs();
+    if !(315_532_800..4_354_819_200).contains(&seconds) {
+        return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+            libc::EINVAL,
+        )));
+    }
+    Ok(seconds)
+}
+
 fn map_mutation_error(error: anyhow::Error) -> FfsError {
     let error = match error.downcast::<FfsError>() {
         Ok(ffs_err) => return ffs_err,
@@ -777,26 +793,73 @@ impl FsOps for FatFs {
         attrs: &SetAttrRequest,
     ) -> Result<InodeAttr> {
         let _operation = self.operation(cx, true)?;
-        checkpoint(cx)?;
         self.ensure_writable()?;
-        if ino == ROOT {
-            let node = self.node(cx, ROOT)?;
-            return self.attributes(cx, ROOT, &node);
+        let mut node = self.node(cx, ino)?;
+        // Ownership is a mount projection, not a field FAT can persist.
+        // Accept an explicit no-op, never silently claim a changed owner.
+        if attrs.uid.is_some_and(|uid| uid != self.uid)
+            || attrs.gid.is_some_and(|gid| gid != self.gid)
+        {
+            return Err(FfsError::PermissionDenied);
         }
+        let directory = node
+            .entry
+            .as_ref()
+            .is_none_or(|entry| entry.native.is_directory());
+        if attrs.size.is_some() && directory {
+            return Err(FfsError::IsDirectory);
+        }
+        if attrs.size.is_some_and(|size| size > u64::from(u32::MAX)) {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                libc::EFBIG,
+            )));
+        }
+        if ino == ROOT {
+            // Neither FAT16's fixed root nor FAT32's root has a parent entry
+            // in which this profile could store mode or native timestamps.
+            if attrs.mode.is_some_and(|mode| mode != 0o755)
+                || attrs.atime.is_some_and(|time| time != UNIX_EPOCH)
+                || attrs.mtime.is_some_and(|time| time != UNIX_EPOCH)
+            {
+                return Err(FfsError::UnsupportedFeature(
+                    "FAT root attributes are fixed mount projections".into(),
+                ));
+            }
+            return self.attributes(cx, ino, &node);
+        }
+        let read_only = attrs.mode.map(|mode| {
+            let (writable_mode, readonly_mode) = if directory {
+                (0o755, 0o555)
+            } else {
+                (0o644, 0o444)
+            };
+            if mode == writable_mode {
+                Ok(false)
+            } else if mode == readonly_mode {
+                Ok(true)
+            } else {
+                Err(FfsError::UnsupportedFeature(
+                    "FAT mode must match the native read-only-bit projection".into(),
+                ))
+            }
+        }).transpose()?;
+        let modified_secs = attrs.mtime.map(requested_fat_time).transpose()?;
+        let accessed_secs = attrs.atime.map(requested_fat_time).transpose()?;
+        if attrs.size.is_some()
+            && node.entry.as_ref().is_some_and(|entry| entry.native.attributes & 1 != 0)
+        {
+            return Err(FfsError::PermissionDenied);
+        }
+        // All deterministic policy/calendar/size failures have now been
+        // rejected without writes. The following native operations remain
+        // separately durable, not an atomic multi-attribute transaction.
         let path = self.path_for_inode(ino)?;
         if let Some(new_size) = attrs.size {
             truncate_in_volume(cx, &self.volume, &path, new_size, now_unix_secs())
                 .map_err(map_mutation_error)?;
+            // Do not retain the old chain if a later metadata update fails.
+            node = self.refresh_node_from_path(cx, ino, &path)?;
         }
-        let read_only = attrs.mode.map(|mode| (mode & 0o222) == 0);
-        let modified_secs = attrs
-            .mtime
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs().max(315_532_800));
-        let accessed_secs = attrs
-            .atime
-            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-            .map(|d| d.as_secs().max(315_532_800));
         if read_only.is_some() || modified_secs.is_some() || accessed_secs.is_some() {
             set_attr_in_volume(
                 cx,
@@ -807,8 +870,8 @@ impl FsOps for FatFs {
                 accessed_secs,
             )
             .map_err(map_mutation_error)?;
+            node = self.refresh_node_from_path(cx, ino, &path)?;
         }
-        let node = self.refresh_node_from_path(cx, ino, &path)?;
         self.attributes(cx, ino, &node)
     }
 
@@ -1030,6 +1093,7 @@ fn fat_wall_time(
         .ok_or_else(|| FfsError::Format("FAT timestamp is outside host SystemTime range".into()))
 }
 
+companion_bin_tests! {
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1375,4 +1439,118 @@ mod tests {
             assert_eq!(std::fs::read(&image).unwrap(), before);
         }
     }
+
+    #[test]
+    fn fat16_setattr_rejects_invalid_times_before_truncating() {
+        use std::time::Duration;
+
+        let (directory, fs) = writable_fat16();
+        let cx = Cx::for_testing();
+        let ino = create_file(&fs, "KEEP.BIN");
+        fs.write(&cx, &mut RequestScope::empty(), ino, 0, b"keep these bytes").unwrap();
+        let image = directory.path().join("volume.fat");
+        let before = std::fs::read(&image).unwrap();
+        for time in [
+            UNIX_EPOCH - Duration::from_secs(1),
+            UNIX_EPOCH,
+            UNIX_EPOCH + Duration::from_secs(315_532_799),
+            UNIX_EPOCH + Duration::from_secs(4_354_819_200),
+        ] {
+            for access_time in [false, true] {
+                let mut attrs = SetAttrRequest { size: Some(0), ..Default::default() };
+                if access_time { attrs.atime = Some(time); } else { attrs.mtime = Some(time); }
+                assert!(matches!(
+                    fs.setattr(&cx, &mut RequestScope::empty(), ino, &attrs),
+                    Err(FfsError::Io(error)) if error.raw_os_error() == Some(libc::EINVAL)
+                ));
+                assert_eq!(std::fs::read(&image).unwrap(), before);
+                assert_eq!(
+                    fs.read(&cx, &mut RequestScope::empty(), ino, 0, 64).unwrap(),
+                    b"keep these bytes"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn fat16_setattr_refuses_unrepresentable_metadata_without_writes() {
+        let (directory, fs) = writable_fat16();
+        let cx = Cx::for_testing();
+        let ino = create_file(&fs, "KEEP.BIN");
+        fs.write(&cx, &mut RequestScope::empty(), ino, 0, b"original").unwrap();
+        let image = directory.path().join("volume.fat");
+        let before = std::fs::read(&image).unwrap();
+        for attrs in [
+            SetAttrRequest { uid: Some(1001), size: Some(0), ..Default::default() },
+            SetAttrRequest { gid: Some(1001), size: Some(0), ..Default::default() },
+            SetAttrRequest { mode: Some(0o600), size: Some(0), ..Default::default() },
+            SetAttrRequest { mode: Some(0o755), size: Some(0), ..Default::default() },
+            SetAttrRequest { mode: Some(0o4644), size: Some(0), ..Default::default() },
+            SetAttrRequest { size: Some(u64::from(u32::MAX) + 1), ..Default::default() },
+        ] {
+            assert!(fs.setattr(&cx, &mut RequestScope::empty(), ino, &attrs).is_err());
+            assert_eq!(std::fs::read(&image).unwrap(), before);
+        }
+        assert_eq!(fs.getattr(&cx, &mut RequestScope::empty(), ino).unwrap().size, 8);
+    }
+
+    #[test]
+    fn fat16_setattr_persists_size_time_and_readonly_projection() {
+        use std::time::Duration;
+
+        let (_directory, fs) = writable_fat16();
+        let cx = Cx::for_testing();
+        let ino = create_file(&fs, "META.BIN");
+        fs.write(&cx, &mut RequestScope::empty(), ino, 0, b"abc").unwrap();
+        let time = UNIX_EPOCH + Duration::new(1_709_210_097, 570_000_000);
+        let attrs = SetAttrRequest {
+            mode: Some(0o444), uid: Some(1000), gid: Some(1000),
+            size: Some(9), atime: Some(time), mtime: Some(time),
+        };
+        let actual = fs.setattr(&cx, &mut RequestScope::empty(), ino, &attrs).unwrap();
+        assert_eq!((actual.size, actual.perm), (9, 0o444));
+        assert_eq!(actual.mtime, UNIX_EPOCH + Duration::from_secs(1_709_210_096));
+        assert_eq!(actual.atime, UNIX_EPOCH + Duration::from_secs(1_709_210_097 / 86_400 * 86_400));
+        assert_eq!(fs.read(&cx, &mut RequestScope::empty(), ino, 0, 9).unwrap(), b"abc\0\0\0\0\0\0");
+        assert!(matches!(
+            fs.write(&cx, &mut RequestScope::empty(), ino, 0, b"x"),
+            Err(FfsError::PermissionDenied)
+        ));
+        fs.setattr(&cx, &mut RequestScope::empty(), ino,
+            &SetAttrRequest { mode: Some(0o644), ..Default::default() }).unwrap();
+        fs.write(&cx, &mut RequestScope::empty(), ino, 0, b"x").unwrap();
+        assert!(fs.volume.check(&cx).unwrap().clean);
+    }
+
+    #[test]
+    fn fat16_root_setattr_accepts_only_explicit_noops() {
+        let (directory, fs) = writable_fat16();
+        let cx = Cx::for_testing();
+        let image = directory.path().join("volume.fat");
+        let before = std::fs::read(&image).unwrap();
+        for attrs in [
+            SetAttrRequest { size: Some(0), ..Default::default() },
+            SetAttrRequest { mode: Some(0o555), ..Default::default() },
+            SetAttrRequest { mtime: Some(SystemTime::now()), ..Default::default() },
+            SetAttrRequest { uid: Some(0), ..Default::default() },
+        ] {
+            assert!(fs.setattr(&cx, &mut RequestScope::empty(), ROOT, &attrs).is_err());
+            assert_eq!(std::fs::read(&image).unwrap(), before);
+        }
+        let attrs = SetAttrRequest {
+            mode: Some(0o755), uid: Some(1000), gid: Some(1000),
+            atime: Some(UNIX_EPOCH), mtime: Some(UNIX_EPOCH), size: None,
+        };
+        assert_eq!(fs.setattr(&cx, &mut RequestScope::empty(), ROOT, &attrs).unwrap().ino, ROOT);
+        assert_eq!(std::fs::read(&image).unwrap(), before);
+    }
+
+    #[test]
+    fn requested_fat_time_admits_both_native_calendar_boundaries() {
+        use std::time::Duration;
+        for seconds in [315_532_800, 4_354_819_199] {
+            assert_eq!(requested_fat_time(UNIX_EPOCH + Duration::from_secs(seconds)).unwrap(), seconds);
+        }
+    }
+}
 }
