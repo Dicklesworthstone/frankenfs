@@ -17,6 +17,52 @@ use ffs_block::ByteDevice;
 use ffs_error::FfsError;
 use ffs_ondisk::fat::{FatEntry, FatKind};
 use ffs_types::ByteOffset;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+
+/// Observe attempts, not successes: a failing write can have changed a prefix,
+/// and a failed sync leaves durability uncertain. Reads remain unchanged.
+struct ObservedDevice {
+    inner: Box<dyn ByteDevice>,
+    epoch: Arc<AtomicU64>,
+}
+
+impl ByteDevice for ObservedDevice {
+    fn len_bytes(&self) -> u64 {
+        self.inner.len_bytes()
+    }
+
+    fn read_exact_at(&self, cx: &Cx, at: ByteOffset, bytes: &mut [u8]) -> ffs_error::Result<()> {
+        self.inner.read_exact_at(cx, at, bytes)
+    }
+
+    fn write_all_at(&self, cx: &Cx, at: ByteOffset, bytes: &[u8]) -> ffs_error::Result<()> {
+        checkpoint(cx)?;
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.inner.write_all_at(cx, at, bytes)
+    }
+
+    fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+        checkpoint(cx)?;
+        self.epoch.fetch_add(1, Ordering::AcqRel);
+        self.inner.sync(cx)
+    }
+}
+
+impl FatVolume {
+    /// Install once before exposing a mount. The adapter holds an exclusive
+    /// operation gate across every mutation and its cache publication; the
+    /// epoch lets it distinguish preflight refusal from uncertain publication.
+    /// This retains the existing device/locks and introduces no backing I/O.
+    pub fn with_mutation_observer(mut self) -> (Self, Arc<AtomicU64>) {
+        let epoch = Arc::new(AtomicU64::new(0));
+        self.device = Box::new(ObservedDevice {
+            inner: self.device,
+            epoch: Arc::clone(&epoch),
+        });
+        (self, epoch)
+    }
+}
 
 struct Allocation {
     chain: Vec<u32>,
