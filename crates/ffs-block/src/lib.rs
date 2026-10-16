@@ -1285,15 +1285,17 @@ pub const VOLUME_DEVICE_RMW_STRIPES: usize = 64;
 /// Default logical and physical sector size for [`VolumeDevice`].
 pub const DEFAULT_VOLUME_SECTOR_SIZE: u32 = 512;
 
+fn is_supported_sector_size(size: u32) -> bool {
+    (512..=65_536).contains(&size) && size.is_power_of_two()
+}
+
 fn validate_volume_sector_sizes(logical_sector_size: u32, physical_sector_size: u32) -> Result<()> {
-    if !(512..=65_536).contains(&logical_sector_size) || !logical_sector_size.is_power_of_two() {
+    if !is_supported_sector_size(logical_sector_size) {
         return Err(FfsError::Format(format!(
             "invalid logical sector size {logical_sector_size}: expected power of two in 512..=65536"
         )));
     }
-    if !(512..=65_536).contains(&physical_sector_size)
-        || !physical_sector_size.is_power_of_two()
-        || physical_sector_size < logical_sector_size
+    if !is_supported_sector_size(physical_sector_size) || physical_sector_size < logical_sector_size
     {
         return Err(FfsError::Format(format!(
             "invalid physical sector size {physical_sector_size}: expected power of two in {logical_sector_size}..=65536"
@@ -12711,7 +12713,7 @@ write_latency: 0ns, bandwidth_bps: 0, stall_probability: 0.0, stall_duration: \
     fn sector_fault_device_crash_torn_write_and_bit_rot_bd_i0gk5() {
         let cx = Cx::for_testing();
         let backing = InMemoryByteDevice::new(vec![0_u8; 4096]);
-        let fault_dev = SectorFaultDevice::new(backing.clone(), 512).expect("fault device");
+        let fault_dev = SectorFaultDevice::new(backing, 512).expect("fault device");
 
         // Write sector 0 and sync -> durable.
         fault_dev
