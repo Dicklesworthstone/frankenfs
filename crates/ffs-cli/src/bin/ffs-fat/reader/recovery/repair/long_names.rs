@@ -203,6 +203,12 @@ impl Scan {
 }
 
 impl Names {
+    /// Retained namespace evidence for other explicitly authorized repairs.
+    /// Unlike orphan cleanup, an intact namespace may have no orphan records.
+    pub(super) fn capture(cx: &Cx, volume: &FatVolume) -> Result<Self> {
+        Self::scan(cx, volume)
+    }
+
     fn scan(cx: &Cx, volume: &FatVolume) -> Result<Self> {
         checkpoint(cx)?;
         let mut scan = Scan {

@@ -3,6 +3,7 @@
 //! walks. Never choose a conflicting FAT or guess an owner for a cross-link.
 
 mod long_names;
+mod mirrors;
 mod salvage;
 
 use super::{DiagnosticVolume, FatCheckReport, FatKind, FatVolume, ImageArgs, Stamp,
@@ -35,6 +36,11 @@ pub struct RecoverArgs {
     /// Does not repair names attached to live files or authorize cluster loss.
     #[arg(long, conflicts_with = "salvage_to")]
     discard_orphan_lfn: bool,
+    /// Reconcile mirrored allocation tables using this zero-based copy only.
+    /// Conflicting allocation in other copies is discarded; payload integrity
+    /// is not established. Inactive FAT32 tables are never repair candidates.
+    #[arg(long, value_name = "COPY", conflicts_with_all = ["reclaim_lost", "discard_orphan_lfn", "salvage_to"])]
+    repair_mirrors_from: Option<u8>,
     /// Export unambiguous lost chains into a NEW private host directory.
     /// Leaves the image unchanged. Files include slack and may contain sensitive
     /// deleted data; original names and logical lengths cannot be inferred.
@@ -414,6 +420,11 @@ fn free_lost(cx: &Cx, volume: &FatVolume, lost: &[(u32, u32)]) -> Result<()> {
 fn recover(cx: &Cx, args: &RecoverArgs) -> Result<serde_json::Value> {
     checkpoint(cx)?;
     if !args.offline_image { bail!("--offline-image is required for structural recovery"); }
+    if args.repair_mirrors_from.is_some()
+        && (args.reclaim_lost || args.discard_orphan_lfn || args.salvage_to.is_some())
+    {
+        bail!("mirror reconciliation is a separate operation; do not combine it with allocation/name cleanup or salvage");
+    }
     if args.reclaim_lost && args.salvage_to.is_some() {
         bail!("--salvage-to never modifies the image and cannot be combined with --reclaim-lost");
     }
@@ -426,6 +437,12 @@ fn recover(cx: &Cx, args: &RecoverArgs) -> Result<serde_json::Value> {
         file: Arc::clone(&file), length: stamp.length,
         writable: !args.dry_run && args.salvage_to.is_none(),
     }), &args.image)?;
+    if let Some(copy) = args.repair_mirrors_from {
+        let plan = mirrors::MirrorPlan::prepare(cx, diagnostic, copy, &args.image)?;
+        stable(&file, &args.image.image, stamp)?;
+        checkpoint(cx)?;
+        return if args.dry_run { Ok(plan.report(true)) } else { plan.execute(cx) };
+    }
     let plan = Plan::prepare(cx, &diagnostic,
         args.reclaim_lost || args.salvage_to.is_some(), args.discard_orphan_lfn)?;
     stable(&file, &args.image.image, stamp)?;
