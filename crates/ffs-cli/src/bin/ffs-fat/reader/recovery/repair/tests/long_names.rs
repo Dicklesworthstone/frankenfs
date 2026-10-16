@@ -48,6 +48,7 @@ fn options(image: ImageArgs) -> RecoverArgs {
     RecoverArgs {
         image, offline_image: true, reclaim_lost: false, discard_orphan_lfn: true,
         repair_mirrors_from: None,
+        repair_boot_from: None,
         salvage_to: None, dry_run: false,
     }
 }

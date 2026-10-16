@@ -2,6 +2,7 @@
 //! Reclaim only allocation proven unreachable by complete independent namespace
 //! walks. Never choose a conflicting FAT or guess an owner for a cross-link.
 
+mod boot;
 mod long_names;
 mod mirrors;
 mod salvage;
@@ -41,6 +42,11 @@ pub struct RecoverArgs {
     /// is not established. Inactive FAT32 tables are never repair candidates.
     #[arg(long, value_name = "COPY", conflicts_with_all = ["reclaim_lost", "discard_orphan_lfn", "salvage_to"])]
     repair_mirrors_from: Option<u8>,
+    /// Restore one FAT32 boot sector from an explicitly selected native copy.
+    /// Zero selects primary -> backup; otherwise supply the volume-relative
+    /// BYTE offset of the backup -> primary. Changed images remain dirty.
+    #[arg(long, value_name = "BYTE_OFFSET", conflicts_with_all = ["reclaim_lost", "discard_orphan_lfn", "repair_mirrors_from", "salvage_to"])]
+    repair_boot_from: Option<u64>,
     /// Export unambiguous lost chains into a NEW private host directory.
     /// Leaves the image unchanged. Files include slack and may contain sensitive
     /// deleted data; original names and logical lengths cannot be inferred.
@@ -420,6 +426,12 @@ fn free_lost(cx: &Cx, volume: &FatVolume, lost: &[(u32, u32)]) -> Result<()> {
 fn recover(cx: &Cx, args: &RecoverArgs) -> Result<serde_json::Value> {
     checkpoint(cx)?;
     if !args.offline_image { bail!("--offline-image is required for structural recovery"); }
+    if args.repair_boot_from.is_some()
+        && (args.reclaim_lost || args.discard_orphan_lfn || args.repair_mirrors_from.is_some()
+            || args.salvage_to.is_some())
+    {
+        bail!("boot restoration is a separate operation; do not combine repair authorities");
+    }
     if args.repair_mirrors_from.is_some()
         && (args.reclaim_lost || args.discard_orphan_lfn || args.salvage_to.is_some())
     {
@@ -433,10 +445,19 @@ fn recover(cx: &Cx, args: &RecoverArgs) -> Result<serde_json::Value> {
     }
     reject_sidecar(&args.image)?;
     let (file, stamp) = open(args)?;
-    let diagnostic = DiagnosticVolume::from_device(cx, Box::new(Image {
+    let device = Box::new(Image {
         file: Arc::clone(&file), length: stamp.length,
         writable: !args.dry_run && args.salvage_to.is_none(),
-    }), &args.image)?;
+    });
+    // A damaged primary cannot enter DiagnosticVolume::from_device until a
+    // separately validated backup has supplied the private boot projection.
+    if let Some(source) = args.repair_boot_from {
+        let plan = boot::BootPlan::prepare(cx, device, &args.image, source)?;
+        stable(&file, &args.image.image, stamp)?;
+        checkpoint(cx)?;
+        return if args.dry_run { Ok(plan.report(true)) } else { plan.execute(cx) };
+    }
+    let diagnostic = DiagnosticVolume::from_device(cx, device, &args.image)?;
     if let Some(copy) = args.repair_mirrors_from {
         let plan = mirrors::MirrorPlan::prepare(cx, diagnostic, copy, &args.image)?;
         stable(&file, &args.image.image, stamp)?;

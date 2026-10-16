@@ -9,7 +9,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 fn options(image: ImageArgs, copy: u8) -> RecoverArgs {
     RecoverArgs {
         image, offline_image: true, reclaim_lost: false, discard_orphan_lfn: false,
-        repair_mirrors_from: Some(copy), salvage_to: None, dry_run: false,
+        repair_mirrors_from: Some(copy), repair_boot_from: None, salvage_to: None, dry_run: false,
     }
 }
 

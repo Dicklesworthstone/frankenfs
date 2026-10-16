@@ -18,6 +18,7 @@ fn options(image: ImageArgs, output: &Path) -> RecoverArgs {
     RecoverArgs {
         image, offline_image: true, reclaim_lost: false, discard_orphan_lfn: false,
         repair_mirrors_from: None,
+        repair_boot_from: None,
         salvage_to: Some(output.to_path_buf()), dry_run: false,
     }
 }

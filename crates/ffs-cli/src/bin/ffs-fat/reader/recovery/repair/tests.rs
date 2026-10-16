@@ -40,7 +40,7 @@ fn both_dialects_recover_lost_allocation_hints_and_dirty_state_without_touching_
         orphan(&image, &geometry);
         let cx = Cx::for_testing();
         let before = fs::read(&image.image).unwrap();
-        let mut args = RecoverArgs { image, offline_image: true, reclaim_lost: false, discard_orphan_lfn: false, repair_mirrors_from: None, salvage_to: None, dry_run: false };
+        let mut args = RecoverArgs { image, offline_image: true, reclaim_lost: false, discard_orphan_lfn: false, repair_mirrors_from: None, repair_boot_from: None, salvage_to: None, dry_run: false };
         assert!(recover(&cx, &args).is_err());
         assert_eq!(fs::read(&args.image.image).unwrap(), before);
         args.reclaim_lost = true;
@@ -80,7 +80,7 @@ fn nonmirrored_recovery_preserves_inactive_fat_and_each_reserved_high_nibble() {
     let before = fs::read(&image.image).unwrap();
     let first = (geometry.entry_offset(0, 2).unwrap() - 8) as usize;
     let second = (geometry.entry_offset(1, 2).unwrap() - 8) as usize;
-    let args = RecoverArgs { image, offline_image: true, reclaim_lost: true, discard_orphan_lfn: false, repair_mirrors_from: None, salvage_to: None, dry_run: false };
+    let args = RecoverArgs { image, offline_image: true, reclaim_lost: true, discard_orphan_lfn: false, repair_mirrors_from: None, repair_boot_from: None, salvage_to: None, dry_run: false };
     let report = recover(&Cx::for_testing(), &args).unwrap();
     assert_eq!(report["verification"]["clean"], true);
     let after = fs::read(&args.image.image).unwrap();
@@ -114,7 +114,7 @@ fn recovery_refuses_ambiguous_or_unknown_damage_before_any_writes() {
             }
         }
         let before = fs::read(&image.image).unwrap();
-        let args = RecoverArgs { image, offline_image: true, reclaim_lost: true, discard_orphan_lfn: false, repair_mirrors_from: None, salvage_to: None, dry_run: false };
+        let args = RecoverArgs { image, offline_image: true, reclaim_lost: true, discard_orphan_lfn: false, repair_mirrors_from: None, repair_boot_from: None, salvage_to: None, dry_run: false };
         assert!(recover(&Cx::for_testing(), &args).is_err(), "{damage}");
         assert_eq!(fs::read(&args.image.image).unwrap(), before, "{damage}");
     }
@@ -132,7 +132,7 @@ fn selected_volume_recovery_never_modifies_neighboring_regions() {
     image.offset = 8192;
     image.length = Some(volume_bytes.len() as u64);
     fs::write(&image.image, &disk).unwrap();
-    let args = RecoverArgs { image, offline_image: true, reclaim_lost: true, discard_orphan_lfn: false, repair_mirrors_from: None, salvage_to: None, dry_run: false };
+    let args = RecoverArgs { image, offline_image: true, reclaim_lost: true, discard_orphan_lfn: false, repair_mirrors_from: None, repair_boot_from: None, salvage_to: None, dry_run: false };
     assert_eq!(recover(&Cx::for_testing(), &args).unwrap()["reclaimed_clusters"], 3);
     let after = fs::read(&args.image.image).unwrap();
     assert_eq!(&after[..8192], &disk[..8192]);
@@ -242,7 +242,7 @@ fn recovery_cli_requires_offline_authority_and_rejects_force_bypasses() {
 fn cancelled_recovery_and_noop_clean_recovery_do_not_mutate() {
     let (_directory, image, _geometry) = populated("fat16");
     let before = fs::read(&image.image).unwrap();
-    let args = RecoverArgs { image, offline_image: true, reclaim_lost: false, discard_orphan_lfn: false, repair_mirrors_from: None, salvage_to: None, dry_run: false };
+    let args = RecoverArgs { image, offline_image: true, reclaim_lost: false, discard_orphan_lfn: false, repair_mirrors_from: None, repair_boot_from: None, salvage_to: None, dry_run: false };
     let cx = Cx::for_testing();
     cx.set_cancel_requested(true);
     assert!(recover(&cx, &args).is_err());
@@ -292,3 +292,4 @@ fn cancellation_after_publication_stops_recovery_without_cleaning_up() {
 
 mod long_names;
 mod mirrors;
+mod boot;
