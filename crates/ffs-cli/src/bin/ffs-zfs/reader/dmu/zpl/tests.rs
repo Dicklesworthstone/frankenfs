@@ -783,12 +783,12 @@ fn zil_intent_log_replays_create_write_rename_truncate_and_remove_in_memory() {
         image[BASE..BASE + LENGTH].copy_from_slice(&existing);
         let at_zil = BASE + zil_at as usize;
         image[at_zil..at_zil + zil_raw.len()].copy_from_slice(&zil_raw);
-        let zil_bp = bp(&zil_raw, zil_at, 7, 0, 62, order, order);
+        let zil_bp = bp(&zil_raw, zil_at, 7, 0, 62, Endian::Big, order);
 
         // Update OS[512..704] with ZilHeader and recompute DS bonus BP for OS:
         let at_os = BASE + OS as usize;
         let mut os_bytes = image[at_os..at_os + 1024].to_vec();
-        os_bytes[512..520].copy_from_slice(&order.encode(62)); // claim_txg
+        os_bytes[512..520].copy_from_slice(&Endian::Big.encode(62)); // claim_txg
         os_bytes[528..656].copy_from_slice(&zil_bp); // zh_log BP
         image[at_os..at_os + 1024].copy_from_slice(&os_bytes);
 
