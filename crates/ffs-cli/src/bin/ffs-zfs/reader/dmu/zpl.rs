@@ -373,8 +373,17 @@ impl Zpl {
                     .or_default()
                     .insert(name.clone(), None);
                 if let Some(obj) = target_obj {
-                    overlay.removed_objects.insert(obj);
-                    overlay.objects.remove(&obj);
+                    let _ = self.ensure_overlay_metadata(cx, overlay, obj);
+                    let unlinked = if let Some(meta) = overlay.objects.get_mut(&obj) {
+                        meta.links = meta.links.saturating_sub(1);
+                        meta.links == 0
+                    } else {
+                        true
+                    };
+                    if unlinked {
+                        overlay.removed_objects.insert(obj);
+                        overlay.objects.remove(&obj);
+                    }
                 }
             }
             ZilRecordPayload::Rename {
