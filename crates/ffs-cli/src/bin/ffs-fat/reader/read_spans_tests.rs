@@ -7,11 +7,21 @@ use std::io;
 use std::ops::Range;
 use std::sync::{Arc, Mutex};
 
+#[derive(Clone, Copy, Default)]
+enum Failure {
+    #[default]
+    Media,
+    Corruption,
+    Cancelled,
+    Denied,
+}
+
 #[derive(Default)]
 struct Trace {
     reads: Vec<(u64, usize)>,
     fail: Option<Range<u64>>,
     cancel_after: Option<usize>,
+    failure: Failure,
 }
 
 #[derive(Clone)]
@@ -56,7 +66,12 @@ impl ByteDevice for Device {
             // A failed device may already have overwritten its entire output.
             // None of these bytes may become a successful logical read.
             bytes.fill(0xee);
-            return Err(io::Error::from(io::ErrorKind::UnexpectedEof).into());
+            return Err(match trace.failure {
+                Failure::Media => io::Error::from(io::ErrorKind::UnexpectedEof).into(),
+                Failure::Corruption => corrupt(offset.0, "injected read verification failure"),
+                Failure::Cancelled => FfsError::Cancelled,
+                Failure::Denied => io::Error::from(io::ErrorKind::PermissionDenied).into(),
+            });
         }
         let pages = self.pages.lock().unwrap();
         for (index, byte) in bytes.iter_mut().enumerate() {
@@ -312,3 +327,5 @@ fn the_maximum_logical_request_is_streamed_as_bounded_device_runs() {
     assert_eq!(trace.reads.len(), MAX_READ_BYTES / MAX_READ_RUN_BYTES);
     assert!(trace.reads.iter().all(|(_, length)| *length == MAX_READ_RUN_BYTES));
 }
+
+mod fat_windows_tests;
