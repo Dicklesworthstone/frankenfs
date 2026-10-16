@@ -6,8 +6,10 @@
 //! journal claims, NOT physical ownership, page LSNs, or volume geometry.
 //! A candidate plan is never permission to write or to mount a dirty image.
 
+mod replay;
+
 use super::{
-    Cx, LFS_CLIENT_RECORD, LogRecord, Result, checkpoint, corrupt,
+    Cx, LFS_CLIENT_RECORD, LogRecord, NtfsVolume, Result, checkpoint, corrupt,
     targets::{self, Attribute, State}, u16_at, u64_at, unsupported,
 };
 use std::collections::{BTreeMap, BTreeSet};
@@ -42,7 +44,31 @@ pub(super) struct Summary {
     pub(super) first_lsn: Option<u64>,
 }
 
+pub(super) struct ReplayInput<'a> {
+    pub(super) volume: &'a NtfsVolume,
+    pub(super) restart: &'a super::Restart,
+    pub(super) targets: &'a State,
+    pub(super) history: &'a [LogRecord],
+    pub(super) undo: &'a super::analysis::Report,
+}
+
+pub(super) struct ReplaySummary {
+    pub(super) records: usize,
+    pub(super) redo: usize,
+    pub(super) undo: usize,
+    pub(super) skipped: usize,
+}
+
 impl Plan<'_> {
+    pub(super) fn stage(
+        &self,
+        cx: &Cx,
+        input: ReplayInput<'_>,
+        read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
+    ) -> Result<ReplaySummary> {
+        replay::stage(cx, self, input, read)
+    }
+
     pub(super) fn summary(&self) -> Summary {
         Summary {
             records: self.candidates.len(),
