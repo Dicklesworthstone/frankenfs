@@ -434,6 +434,193 @@ fn actual_file_backing_and_adjacent_partition_bytes_remain_unchanged() {
     assert_eq!(std::fs::read(&path).unwrap(), image.bytes);
 }
 
+fn build_lfs_rcrd_entry(
+    this_lsn: u64,
+    prev_lsn: u64,
+    undo_next_lsn: u64,
+    tx_id: u32,
+    record_type: u32,
+    redo_op: u16,
+    undo_op: u16,
+    target_lcn: u64,
+    attribute_offset: u16,
+    redo_data: &[u8],
+    undo_data: &[u8],
+) -> Vec<u8> {
+    let redo_off = 40_usize;
+    let undo_off = (redo_off + redo_data.len()).next_multiple_of(8);
+    let client_len = (undo_off + undo_data.len()).next_multiple_of(8);
+    let mut rec = vec![0_u8; 48 + client_len];
+    rec[0..8].copy_from_slice(&this_lsn.to_le_bytes());
+    rec[8..16].copy_from_slice(&prev_lsn.to_le_bytes());
+    rec[16..24].copy_from_slice(&undo_next_lsn.to_le_bytes());
+    rec[24..28].copy_from_slice(&(client_len as u32).to_le_bytes());
+    rec[32..36].copy_from_slice(&record_type.to_le_bytes());
+    rec[36..40].copy_from_slice(&tx_id.to_le_bytes());
+    let body = &mut rec[48..];
+    body[0..2].copy_from_slice(&redo_op.to_le_bytes());
+    body[2..4].copy_from_slice(&undo_op.to_le_bytes());
+    body[4..6].copy_from_slice(&(redo_off as u16).to_le_bytes());
+    body[6..8].copy_from_slice(&(redo_data.len() as u16).to_le_bytes());
+    body[8..10].copy_from_slice(&(undo_off as u16).to_le_bytes());
+    body[10..12].copy_from_slice(&(undo_data.len() as u16).to_le_bytes());
+    body[12..14].copy_from_slice(&0x18_u16.to_le_bytes());
+    body[14..16].copy_from_slice(&1_u16.to_le_bytes()); // lcns_to_follow = 1
+    body[16..18].copy_from_slice(&0_u16.to_le_bytes()); // record_offset = 0
+    body[18..20].copy_from_slice(&attribute_offset.to_le_bytes()); // attribute_offset
+    body[24..32].copy_from_slice(&target_lcn.to_le_bytes()); // target_vcn
+    body[32..40].copy_from_slice(&target_lcn.to_le_bytes()); // target_lcn
+    body[redo_off..redo_off + redo_data.len()].copy_from_slice(redo_data);
+    body[undo_off..undo_off + undo_data.len()].copy_from_slice(undo_data);
+    rec
+}
+
+#[test]
+fn logfile_aries_recovery_redoes_committed_and_undoes_loser_transactions_in_overlay() {
+    let cx = Cx::for_testing();
+    let mut image = Image::new();
+    // Record 25 has uncommitted dirty resident data ("loser-bad") that Undo should revert to "CLEAN-25!".
+    image.put_record(
+        25,
+        &file_record(25, &[resident(DATA, 0, "", b"loser-bad")]),
+    );
+    // Build a 16 KiB (4-page, 32-cluster) $LogFile at LCN 210..242.
+    let mut rstr_page = vec![0_u8; 4096];
+    rstr_page[0..4].copy_from_slice(b"RSTR");
+    rstr_page[4..6].copy_from_slice(&32_u16.to_le_bytes());
+    rstr_page[6..8].copy_from_slice(&9_u16.to_le_bytes());
+    rstr_page[16..20].copy_from_slice(&4096_u32.to_le_bytes());
+    rstr_page[20..24].copy_from_slice(&4096_u32.to_le_bytes());
+    rstr_page[24..26].copy_from_slice(&64_u16.to_le_bytes());
+    rstr_page[28..30].copy_from_slice(&1_i16.to_le_bytes()); // major_version = 1
+    rstr_page[32..34].copy_from_slice(&0x1111_u16.to_le_bytes());
+    // Restart area at offset 64:
+    rstr_page[64..72].copy_from_slice(&300_u64.to_le_bytes()); // current_lsn
+    rstr_page[72..74].copy_from_slice(&1_u16.to_le_bytes()); // log_clients = 1
+    rstr_page[84..86].copy_from_slice(&128_u16.to_le_bytes()); // restart_area_length = 128
+    rstr_page[86..88].copy_from_slice(&64_u16.to_le_bytes()); // client_array_offset = 64
+    rstr_page[88..96].copy_from_slice(&16_384_u64.to_le_bytes()); // file_size
+    rstr_page[100..102].copy_from_slice(&48_u16.to_le_bytes()); // record_header_length = 48
+    rstr_page[102..104].copy_from_slice(&64_u16.to_le_bytes()); // log_page_data_offset = 64
+    // Client record at area + 64 = offset 128:
+    rstr_page[128..136].copy_from_slice(&100_u64.to_le_bytes()); // oldest_lsn = 100
+    rstr_page[136..144].copy_from_slice(&100_u64.to_le_bytes()); // client_restart_lsn = 100
+    let rstr_protected = ffs_ondisk::ntfs::protect_record(&rstr_page).unwrap();
+
+    // Build RCRD page at page 2 (offset 8192):
+    let mut rcrd_page = vec![0_u8; 4096];
+    rcrd_page[0..4].copy_from_slice(b"RCRD");
+    rcrd_page[4..6].copy_from_slice(&40_u16.to_le_bytes());
+    rcrd_page[6..8].copy_from_slice(&9_u16.to_le_bytes());
+    rcrd_page[8..16].copy_from_slice(&300_u64.to_le_bytes());
+    rcrd_page[20..22].copy_from_slice(&1_u16.to_le_bytes());
+    rcrd_page[22..24].copy_from_slice(&1_u16.to_le_bytes());
+    rcrd_page[32..40].copy_from_slice(&300_u64.to_le_bytes());
+    rcrd_page[40..42].copy_from_slice(&0x2222_u16.to_le_bytes());
+
+    let rec24_lcn = ((Image::record_offset(24) - BASE) / 512) as u64;
+    let rec25_lcn = ((Image::record_offset(25) - BASE) / 512) as u64;
+    // Resident attribute at offset 56 has value at offset 24 -> byte 80 in FILE record.
+    let e1 = build_lfs_rcrd_entry(
+        100,
+        0,
+        0,
+        1,
+        1,
+        0x07,
+        0x07,
+        rec24_lcn,
+        80,
+        b"COMMITTED",
+        b"resident!",
+    );
+    let e2 = build_lfs_rcrd_entry(200, 100, 0, 1, 1, 0x1C, 0x00, 0, 0, &[], &[]);
+    let e3 = build_lfs_rcrd_entry(
+        300,
+        0,
+        0,
+        2,
+        1,
+        0x07,
+        0x07,
+        rec25_lcn,
+        80,
+        b"loser-bad",
+        b"CLEAN-25!",
+    );
+    let mut pos = 64_usize;
+    for entry in [&e1, &e2, &e3] {
+        rcrd_page[pos..pos + entry.len()].copy_from_slice(entry);
+        pos += entry.len();
+    }
+    rcrd_page[24..26].copy_from_slice(&(pos as u16).to_le_bytes());
+    let rcrd_protected = ffs_ondisk::ntfs::protect_record(&rcrd_page).unwrap();
+
+    let log_base = BASE + 210 * 512;
+    image.bytes[log_base..log_base + 4096].copy_from_slice(&rstr_protected);
+    image.bytes[log_base + 4096..log_base + 8192].copy_from_slice(&rstr_protected);
+    image.bytes[log_base + 8192..log_base + 12_288].copy_from_slice(&rcrd_protected);
+    // Put MFT record 2 ($LogFile) mapped to 32 clusters at LCN 210 (0xD2):
+    image.put_record(
+        2,
+        &file_record(
+            2,
+            &[mapped(&[0x21, 32, 210, 0, 0], 32, 16_384, 16_384, 0)],
+        ),
+    );
+
+    // 1. Open without recovery: sees unrecovered on-disk bytes.
+    let unrecovered = NtfsVolume::from_device_with_options(
+        &cx,
+        Box::new(Memory {
+            bytes: image.bytes.clone(),
+            reads: Arc::default(),
+            fail_at: None,
+        }),
+        BASE as u64,
+        LENGTH as u64,
+        false,
+    )
+    .unwrap();
+    assert!(unrecovered.logfile_recovery.is_none());
+    let rec24_raw = unrecovered.record(&cx, 24, Some(7)).unwrap();
+    let s24_raw = unrecovered.data_stream(&cx, &rec24_raw, &[]).unwrap();
+    assert_eq!(unrecovered.read(&cx, &s24_raw, 0, 64).unwrap(), b"resident!");
+    let rec25_raw = unrecovered.record(&cx, 25, Some(7)).unwrap();
+    let s25_raw = unrecovered.data_stream(&cx, &rec25_raw, &[]).unwrap();
+    assert_eq!(unrecovered.read(&cx, &s25_raw, 0, 64).unwrap(), b"loser-bad");
+
+    // 2. Open with ARIES recovery: Redo commits record 24, Undo reverts loser record 25.
+    let recovered = NtfsVolume::from_device_with_options(
+        &cx,
+        Box::new(Memory {
+            bytes: image.bytes,
+            reads: Arc::default(),
+            fail_at: None,
+        }),
+        BASE as u64,
+        LENGTH as u64,
+        true,
+    )
+    .unwrap();
+    let plan = recovered
+        .logfile_recovery
+        .as_ref()
+        .expect("recovery plan present");
+    assert_eq!(plan.committed_transactions, vec![1]);
+    assert_eq!(plan.aborted_transactions, vec![2]);
+    assert_eq!(plan.redo_actions.len(), 2);
+    assert_eq!(plan.undo_actions.len(), 1);
+
+    let rec24 = recovered.record(&cx, 24, Some(7)).unwrap();
+    let s24 = recovered.data_stream(&cx, &rec24, &[]).unwrap();
+    assert_eq!(recovered.read(&cx, &s24, 0, 64).unwrap(), b"COMMITTED");
+
+    let rec25 = recovered.record(&cx, 25, Some(7)).unwrap();
+    let s25 = recovered.data_stream(&cx, &rec25, &[]).unwrap();
+    assert_eq!(recovered.read(&cx, &s25, 0, 64).unwrap(), b"CLEAN-25!");
+}
+
 mod attributes;
 mod ea;
 mod namespace;

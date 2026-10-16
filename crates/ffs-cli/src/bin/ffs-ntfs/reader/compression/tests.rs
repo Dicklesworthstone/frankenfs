@@ -113,6 +113,7 @@ impl Fixture {
             }),
             base: BASE,
             length: VOLUME_BYTES as u64,
+            overlay: std::collections::BTreeMap::new(),
         };
         // Raw 16 clusters; sparse 16; packed 4+5 (backward physical delta),
         // then 7 sparse clusters. Compression crosses a physical run boundary.
@@ -373,6 +374,7 @@ fn four_kib_clusters_decode_full_sixty_four_kib_units() {
         }),
         base: BASE,
         length: VOLUME_BYTES as u64,
+        overlay: std::collections::BTreeMap::new(),
     };
     let geometry = geometry(8);
     let mut attr = mapped(&[0x11, 1, 100, 0x01, 15, 0], 0, 15, 65_536, 65_536);

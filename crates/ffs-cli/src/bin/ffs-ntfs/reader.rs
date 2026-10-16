@@ -71,6 +71,7 @@ struct Source {
     device: Box<dyn ByteDevice>,
     base: u64,
     length: u64,
+    overlay: std::collections::BTreeMap<u64, [u8; 512]>,
 }
 impl Source {
     fn read(&self, cx: &Cx, offset: u64, data: &mut [u8]) -> Result<()> {
@@ -89,6 +90,63 @@ impl Source {
             .checked_add(offset)
             .ok_or_else(|| corrupt(offset, "physical offset overflow"))?;
         self.device.read_exact_at(cx, ByteOffset(physical), data)?;
+        if !self.overlay.is_empty() && !data.is_empty() {
+            let first_sec = offset / 512;
+            let last_sec = (offset + data.len() as u64 - 1) / 512;
+            for sec in first_sec..=last_sec {
+                if let Some(patch) = self.overlay.get(&sec) {
+                    let sec_start = sec * 512;
+                    let sec_end = sec_start + 512;
+                    let overlap_start = offset.max(sec_start);
+                    let overlap_end = (offset + data.len() as u64).min(sec_end);
+                    if overlap_start < overlap_end {
+                        let dst_off = (overlap_start - offset) as usize;
+                        let src_off = (overlap_start - sec_start) as usize;
+                        let len = (overlap_end - overlap_start) as usize;
+                        data[dst_off..dst_off + len].copy_from_slice(&patch[src_off..src_off + len]);
+                    }
+                }
+            }
+        }
+        checkpoint(cx)
+    }
+
+    fn write_overlay(&mut self, cx: &Cx, offset: u64, data: &[u8]) -> Result<()> {
+        checkpoint(cx)?;
+        if data.is_empty() {
+            return Ok(());
+        }
+        if offset
+            .checked_add(data.len() as u64)
+            .is_none_or(|end| end > self.length)
+        {
+            return Err(corrupt(
+                offset,
+                "NTFS overlay write outside the selected addressable volume",
+            ));
+        }
+        let first_sec = offset / 512;
+        let last_sec = (offset + data.len() as u64 - 1) / 512;
+        for sec in first_sec..=last_sec {
+            let sec_start = sec * 512;
+            if !self.overlay.contains_key(&sec) {
+                let mut buf = [0_u8; 512];
+                let physical = self
+                    .base
+                    .checked_add(sec_start)
+                    .ok_or_else(|| corrupt(sec_start, "physical offset overflow"))?;
+                self.device.read_exact_at(cx, ByteOffset(physical), &mut buf)?;
+                self.overlay.insert(sec, buf);
+            }
+            let patch = self.overlay.get_mut(&sec).expect("inserted above");
+            let sec_end = sec_start + 512;
+            let overlap_start = offset.max(sec_start);
+            let overlap_end = (offset + data.len() as u64).min(sec_end);
+            let src_off = (overlap_start - offset) as usize;
+            let dst_off = (overlap_start - sec_start) as usize;
+            let len = (overlap_end - overlap_start) as usize;
+            patch[dst_off..dst_off + len].copy_from_slice(&data[src_off..src_off + len]);
+        }
         checkpoint(cx)
     }
 }
@@ -226,9 +284,21 @@ pub struct NtfsVolume {
     source: Source,
     pub geometry: NtfsGeometry,
     mft: Stream,
+    pub volume_flags: u16,
+    pub logfile_recovery: Option<ffs_ondisk::ntfs::NtfsLogFilePlan>,
 }
 impl NtfsVolume {
     pub fn open(cx: &Cx, path: &Path, base: u64, length: Option<u64>) -> Result<Self> {
+        Self::open_with_options(cx, path, base, length, false)
+    }
+
+    pub fn open_with_options(
+        cx: &Cx,
+        path: &Path,
+        base: u64,
+        length: Option<u64>,
+        recover_logfile: bool,
+    ) -> Result<Self> {
         checkpoint(cx)?;
         let file = File::open(path)?;
         let metadata = file.metadata()?;
@@ -240,11 +310,12 @@ impl NtfsVolume {
         file.try_lock_shared()
             .map_err(|error| FfsError::Io(std::io::Error::other(error)))?;
         let size = metadata.len();
-        Self::from_device(
+        Self::from_device_with_options(
             cx,
             Box::new(ReadOnlyImage { file, length: size }),
             base,
             length.unwrap_or_else(|| size.saturating_sub(base)),
+            recover_logfile,
         )
     }
 
@@ -253,6 +324,16 @@ impl NtfsVolume {
         device: Box<dyn ByteDevice>,
         base: u64,
         length: u64,
+    ) -> Result<Self> {
+        Self::from_device_with_options(cx, device, base, length, false)
+    }
+
+    pub fn from_device_with_options(
+        cx: &Cx,
+        device: Box<dyn ByteDevice>,
+        base: u64,
+        length: u64,
+        recover_logfile: bool,
     ) -> Result<Self> {
         checkpoint(cx)?;
         if length < 512
@@ -268,6 +349,7 @@ impl NtfsVolume {
             device,
             base,
             length,
+            overlay: std::collections::BTreeMap::new(),
         };
         let mut boot = [0_u8; 512];
         source.read(cx, 0, &mut boot)?;
@@ -316,10 +398,12 @@ impl NtfsVolume {
                 "invalid MFT bootstrap mapping or initialized record boundary",
             ));
         }
-        let volume = Self {
+        let mut volume = Self {
             source,
             geometry,
             mft,
+            volume_flags: 0,
+            logfile_recovery: None,
         };
         // Read record zero again through the actual MFT map, not boot arithmetic.
         if volume.record(cx, 0, None)?.used_bytes() != primary.used_bytes() {
@@ -338,13 +422,95 @@ impl NtfsVolume {
             return Err(unsupported("NTFS reader currently admits version 3.1 only"));
         }
         let flags = u16::from_le_bytes([info[10], info[11]]);
-        if flags != 0 {
+        volume.volume_flags = flags;
+        if flags != 0 && !recover_logfile {
             return Err(unsupported(format!(
-                "NTFS volume flags {flags:#06x} require native investigation; replay is not implemented"
+                "NTFS volume flags {flags:#06x} require native investigation; pass --recover-logfile to replay $LogFile into a read-only overlay"
             )));
+        }
+        if recover_logfile {
+            volume.apply_logfile_recovery(cx)?;
         }
         checkpoint(cx)?;
         Ok(volume)
+    }
+
+    fn apply_logfile_recovery(&mut self, cx: &Cx) -> Result<()> {
+        checkpoint(cx)?;
+        let Ok(log_record) = self.record(cx, 2, None) else {
+            return Ok(());
+        };
+        let Ok(log_stream) = self.select_stream(cx, &log_record, DATA, &[]) else {
+            return Ok(());
+        };
+        let log_len = (log_stream.size as usize).min(MAX_READ);
+        if log_len == 0 {
+            return Ok(());
+        }
+        let log_bytes = self.read(cx, &log_stream, 0, log_len)?;
+        let Ok(plan) = ffs_ondisk::ntfs::parse_ntfs_logfile(&log_bytes) else {
+            return Ok(());
+        };
+        let record_bytes = usize::try_from(self.geometry.record_bytes()).unwrap_or(1024);
+        let cluster_bytes = u64::from(self.geometry.cluster_bytes());
+        for action in plan.redo_actions.iter().chain(plan.undo_actions.iter()) {
+            checkpoint(cx)?;
+            let lcn = action.target_lcn;
+            if lcn == 0 {
+                continue;
+            }
+            let Some(base_off) = lcn.checked_mul(cluster_bytes) else {
+                continue;
+            };
+            let target_off = base_off
+                .saturating_add(u64::from(action.cluster_block_offset) * 512)
+                .saturating_add(u64::from(action.record_offset));
+            let patch_off = target_off.saturating_add(u64::from(action.attribute_offset));
+            if action.data.is_empty() {
+                continue;
+            }
+            if target_off
+                .checked_add(record_bytes as u64)
+                .is_some_and(|end| end <= self.source.length)
+            {
+                let mut rec_buf = buffer(record_bytes)?;
+                if self.source.read(cx, target_off, &mut rec_buf).is_ok()
+                    && &rec_buf[..4] == b"FILE"
+                    && let Ok(mut unprot) = ffs_ondisk::ntfs::restore_record(&rec_buf, b"FILE")
+                {
+                    let rel = usize::from(action.attribute_offset);
+                    if rel
+                        .checked_add(action.data.len())
+                        .is_some_and(|end| end <= unprot.len())
+                    {
+                        unprot[rel..rel + action.data.len()].copy_from_slice(&action.data);
+                        if let Ok(reprot) = ffs_ondisk::ntfs::protect_record(&unprot) {
+                            self.source.write_overlay(cx, target_off, &reprot)?;
+                            continue;
+                        }
+                    }
+                }
+            }
+            if patch_off
+                .checked_add(action.data.len() as u64)
+                .is_some_and(|end| end <= self.source.length)
+            {
+                self.source.write_overlay(cx, patch_off, &action.data)?;
+            }
+        }
+        let primary_off = self
+            .geometry
+            .cluster_offset(self.geometry.mft_cluster())
+            .map_err(|error| parse(&error))?;
+        let mut raw = buffer(record_bytes)?;
+        self.source.read(cx, primary_off, &mut raw)?;
+        if let Ok(primary) = NtfsFileRecord::parse(&raw)
+            && let Ok(mft) = attributes::bootstrap_mft(&self.source, &self.geometry, cx, &primary)
+        {
+            self.mft = mft;
+        }
+        self.logfile_recovery = Some(plan);
+        checkpoint(cx)
     }
 
     #[must_use]

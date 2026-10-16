@@ -74,6 +74,9 @@ struct ImageArgs {
     /// Optional RaptorQ sidecar archive for read-verification and repair.
     #[arg(long)]
     sidecar: Option<PathBuf>,
+    /// Replay NTFS $LogFile (RSTR/RCRD) ARIES redo/undo records into an in-memory read overlay.
+    #[arg(long)]
+    recover_logfile: bool,
 }
 impl ImageArgs {
     fn open(&self, cx: &Cx) -> Result<NtfsVolume> {
@@ -98,12 +101,13 @@ impl ImageArgs {
                 )
             })?;
             let size = ffs_block::ByteDevice::len_bytes(&device);
-            return NtfsVolume::from_device(
+            return NtfsVolume::from_device_with_options(
                 cx,
                 Box::new(ReadOnlySidecar(device)),
                 self.offset,
                 self.length
                     .unwrap_or_else(|| size.saturating_sub(self.offset)),
+                self.recover_logfile,
             )
             .with_context(|| {
                 format!(
@@ -112,8 +116,14 @@ impl ImageArgs {
                 )
             });
         }
-        NtfsVolume::open(cx, &self.image, self.offset, self.length)
-            .with_context(|| format!("opening offline NTFS image {}", self.image.display()))
+        NtfsVolume::open_with_options(
+            cx,
+            &self.image,
+            self.offset,
+            self.length,
+            self.recover_logfile,
+        )
+        .with_context(|| format!("opening offline NTFS image {}", self.image.display()))
     }
 }
 
@@ -396,7 +406,15 @@ fn main() -> Result<()> {
                 "record_bytes": g.record_bytes(), "index_bytes": g.index_bytes(),
                 "serial": format!("{:016x}", g.serial()), "mft_cluster": g.mft_cluster(),
                 "mirror_cluster": g.mirror_cluster(), "initialized_mft_records": volume.record_count(),
-                "mft_mirror_record_zero_matches": true, "volume_flags": 0,
+                "mft_mirror_record_zero_matches": true, "volume_flags": volume.volume_flags,
+                "logfile_recovery": volume.logfile_recovery.as_ref().map(|plan| serde_json::json!({
+                    "current_lsn": plan.restart.current_lsn,
+                    "restart_lsn": plan.restart.client_restart_lsn,
+                    "committed_transactions": plan.committed_transactions,
+                    "aborted_transactions": plan.aborted_transactions,
+                    "redo_actions": plan.redo_actions.len(),
+                    "undo_actions": plan.undo_actions.len(),
+                })),
                 "scope": "offline MFT/stream read profile; not a filesystem check or recovery validation"
             }))?;
         }
@@ -639,6 +657,7 @@ mod tests {
         let args = ImageArgs {
             image: image.clone(), offset: 0, length: Some(1),
             offline_image: true, sidecar: Some(archive.clone()),
+            recover_logfile: false,
         };
         let error = match args.open(&cx) {
             Ok(_) => panic!("one-byte native volume must be refused"),

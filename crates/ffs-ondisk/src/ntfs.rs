@@ -542,5 +542,477 @@ pub fn decode_mapping_pairs(
     }
 }
 
+/// Re-apply update-sequence protection (`USA`) to an unpacked multi-sector record
+/// (`FILE`, `INDX`, `RSTR`, `RCRD`) so its 512-byte sector trailers carry the USA token
+/// and the USA array stores the actual trailer bytes.
+pub fn protect_record(restored: &[u8]) -> Result<Vec<u8>, ParseError> {
+    if restored.len() < 512 || restored.len() > MAX_RECORD_BYTES || !restored.len().is_multiple_of(512) {
+        return Err(invalid("ntfs.multi_sector", "invalid record length for USA protection"));
+    }
+    let offset = usize::from(le16(restored, 4)?);
+    let count = usize::from(le16(restored, 6)?);
+    let end = offset
+        .checked_add(count * 2)
+        .ok_or_else(|| invalid("ntfs.usa", "overflow"))?;
+    if offset < 8 || !offset.is_multiple_of(2) || count != restored.len() / 512 + 1 || end > 510 {
+        return Err(invalid("ntfs.usa", "invalid update sequence array bounds"));
+    }
+    let token_bytes = [restored[offset], restored[offset + 1]];
+    let mut raw = restored.to_vec();
+    for part in 1..count {
+        let trailer_at = part * 512 - 2;
+        let usa_slot = offset + part * 2;
+        raw[usa_slot..usa_slot + 2].copy_from_slice(&restored[trailer_at..trailer_at + 2]);
+        raw[trailer_at..trailer_at + 2].copy_from_slice(&token_bytes);
+    }
+    Ok(raw)
+}
+
+/// NTFS `$LogFile` operation codes (`NTFS_LOG_OPERATION`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NtfsLogOp {
+    Noop,
+    CompensationLogRecord,
+    InitializeFileRecordSegment,
+    DeallocateFileRecordSegment,
+    WriteEndOfFileRecordSegment,
+    CreateAttribute,
+    DeleteAttribute,
+    UpdateResidentValue,
+    UpdateNonresidentValue,
+    UpdateMappingPairs,
+    SetNewAttributeSizes,
+    AddIndexEntryRoot,
+    DeleteIndexEntryRoot,
+    AddIndexEntryAllocation,
+    DeleteIndexEntryAllocation,
+    WriteEndOfIndexBuffer,
+    SetIndexEntryVcnRoot,
+    SetIndexEntryVcnAllocation,
+    UpdateFileNameRoot,
+    UpdateFileNameAllocation,
+    SetBitsInNonresidentBitMap,
+    ClearBitsInNonresidentBitMap,
+    CommitTransaction,
+    ForgetTransaction,
+    OpenNonresidentAttribute,
+    Unknown(u16),
+}
+
+impl NtfsLogOp {
+    #[must_use]
+    pub const fn from_raw(code: u16) -> Self {
+        match code {
+            0x00 => Self::Noop,
+            0x01 => Self::CompensationLogRecord,
+            0x02 => Self::InitializeFileRecordSegment,
+            0x03 => Self::DeallocateFileRecordSegment,
+            0x04 => Self::WriteEndOfFileRecordSegment,
+            0x05 => Self::CreateAttribute,
+            0x06 => Self::DeleteAttribute,
+            0x07 => Self::UpdateResidentValue,
+            0x08 => Self::UpdateNonresidentValue,
+            0x09 => Self::UpdateMappingPairs,
+            0x0B => Self::SetNewAttributeSizes,
+            0x0C => Self::AddIndexEntryRoot,
+            0x0D => Self::DeleteIndexEntryRoot,
+            0x0E => Self::AddIndexEntryAllocation,
+            0x0F => Self::DeleteIndexEntryAllocation,
+            0x10 | 0x19 => Self::WriteEndOfIndexBuffer,
+            0x12 => Self::SetIndexEntryVcnRoot,
+            0x13 => Self::SetIndexEntryVcnAllocation,
+            0x14 => Self::UpdateFileNameRoot,
+            0x15 => Self::UpdateFileNameAllocation,
+            0x16 => Self::SetBitsInNonresidentBitMap,
+            0x17 => Self::ClearBitsInNonresidentBitMap,
+            0x1B => Self::CommitTransaction,
+            0x1C => Self::ForgetTransaction,
+            0x1D => Self::OpenNonresidentAttribute,
+            other => Self::Unknown(other),
+        }
+    }
+
+    #[must_use]
+    pub const fn patches_bytes(self) -> bool {
+        matches!(
+            self,
+            Self::InitializeFileRecordSegment
+                | Self::DeallocateFileRecordSegment
+                | Self::WriteEndOfFileRecordSegment
+                | Self::CreateAttribute
+                | Self::DeleteAttribute
+                | Self::UpdateResidentValue
+                | Self::UpdateNonresidentValue
+                | Self::UpdateMappingPairs
+                | Self::SetNewAttributeSizes
+                | Self::AddIndexEntryRoot
+                | Self::DeleteIndexEntryRoot
+                | Self::AddIndexEntryAllocation
+                | Self::DeleteIndexEntryAllocation
+                | Self::WriteEndOfIndexBuffer
+                | Self::SetIndexEntryVcnRoot
+                | Self::SetIndexEntryVcnAllocation
+                | Self::UpdateFileNameRoot
+                | Self::UpdateFileNameAllocation
+        )
+    }
+}
+
+/// Validated NTFS `$LogFile` restart area (`RSTR` page + `LFS_RESTART_AREA` + `LFS_CLIENT_RECORD`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NtfsLogRestartArea {
+    pub chkdsk_lsn: u64,
+    pub system_page_size: u32,
+    pub log_page_size: u32,
+    pub major_version: i16,
+    pub minor_version: i16,
+    pub current_lsn: u64,
+    pub oldest_lsn: u64,
+    pub client_restart_lsn: u64,
+    pub flags: u16,
+    pub file_size: u64,
+    pub record_header_length: u16,
+    pub log_page_data_offset: u16,
+}
+
+impl NtfsLogRestartArea {
+    pub fn parse_page(raw_page: &[u8]) -> Result<Self, ParseError> {
+        let restored = restore_record(raw_page, b"RSTR")?;
+        if restored.len() < 64 {
+            return Err(invalid("ntfs.rstr", "restart page too short"));
+        }
+        let chkdsk_lsn = le64(&restored, 8)?;
+        let system_page_size = le32(&restored, 16)?;
+        let log_page_size = le32(&restored, 20)?;
+        let restart_offset = usize::from(le16(&restored, 24)?);
+        let minor_version = i16::from_le_bytes(bytes(&restored, 26)?);
+        let major_version = i16::from_le_bytes(bytes(&restored, 28)?);
+        if !matches!(system_page_size, 512 | 1024 | 2048 | 4096)
+            || !matches!(log_page_size, 512 | 1024 | 2048 | 4096)
+            || !matches!(major_version, 1 | 2)
+        {
+            return Err(invalid("ntfs.rstr", "unsupported page size or LFS version"));
+        }
+        if restart_offset < 30 || restart_offset + 40 > restored.len() {
+            return Err(invalid("ntfs.rstr", "restart area offset out of bounds"));
+        }
+        let area = &restored[restart_offset..];
+        let current_lsn = le64(area, 0)?;
+        let log_clients = le16(area, 8)?;
+        let flags = le16(area, 14)?;
+        let restart_area_len = usize::from(le16(area, 20)?);
+        let client_array_offset = usize::from(le16(area, 22)?);
+        let file_size = le64(area, 24)?;
+        let record_header_length = le16(area, 36)?;
+        let log_page_data_offset = le16(area, 38)?;
+        if log_clients == 0
+            || restart_offset + restart_area_len > restored.len()
+            || client_array_offset + 16 > restart_area_len
+            || record_header_length < 48
+            || usize::from(log_page_data_offset) >= log_page_size as usize
+        {
+            return Err(invalid("ntfs.rstr", "invalid LFS_RESTART_AREA client bounds"));
+        }
+        let client = &area[client_array_offset..];
+        let oldest_lsn = le64(client, 0)?;
+        let client_restart_lsn = le64(client, 8)?;
+        Ok(Self {
+            chkdsk_lsn,
+            system_page_size,
+            log_page_size,
+            major_version,
+            minor_version,
+            current_lsn,
+            oldest_lsn,
+            client_restart_lsn,
+            flags,
+            file_size,
+            record_header_length,
+            log_page_data_offset,
+        })
+    }
+
+    #[must_use]
+    pub const fn is_clean(&self) -> bool {
+        self.flags & 0x0002 != 0
+    }
+}
+
+/// One parsed NTFS client log record inside an `RCRD` page.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NtfsLogRecord {
+    pub this_lsn: u64,
+    pub client_previous_lsn: u64,
+    pub client_undo_next_lsn: u64,
+    pub transaction_id: u32,
+    pub record_type: u32,
+    pub redo_op: NtfsLogOp,
+    pub undo_op: NtfsLogOp,
+    pub target_attribute: u16,
+    pub record_offset: u16,
+    pub attribute_offset: u16,
+    pub cluster_block_offset: u16,
+    pub target_vcn: u64,
+    pub target_lcn: u64,
+    pub redo_data: Vec<u8>,
+    pub undo_data: Vec<u8>,
+}
+
+/// One concrete byte-patch action produced by ARIES Redo or Undo.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NtfsRecoveryAction {
+    pub lsn: u64,
+    pub transaction_id: u32,
+    pub is_undo: bool,
+    pub op: NtfsLogOp,
+    pub target_lcn: u64,
+    pub cluster_block_offset: u16,
+    pub record_offset: u16,
+    pub attribute_offset: u16,
+    pub data: Vec<u8>,
+}
+
+/// Complete 3-pass ARIES recovery plan extracted from `$LogFile` (`NTFS-07`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NtfsLogFilePlan {
+    pub restart: NtfsLogRestartArea,
+    pub records_parsed: usize,
+    pub committed_transactions: Vec<u32>,
+    pub aborted_transactions: Vec<u32>,
+    pub dirty_lcns: Vec<u64>,
+    pub redo_actions: Vec<NtfsRecoveryAction>,
+    pub undo_actions: Vec<NtfsRecoveryAction>,
+}
+
+/// Parse `$LogFile` (`RSTR` + `RCRD` pages) and execute 3-pass ARIES
+/// (Analysis -> Redo -> Undo) to produce deterministic overlay actions (`NTFS-07`).
+pub fn parse_ntfs_logfile(raw_logfile: &[u8]) -> Result<NtfsLogFilePlan, ParseError> {
+    if raw_logfile.len() < 8192 {
+        return Err(invalid("ntfs.logfile", "$LogFile stream smaller than 8 KiB"));
+    }
+    // Probe page size from the first RSTR header (bytes 16..20 = system_page_size).
+    let probe_size = usize::try_from(le32(raw_logfile, 16).unwrap_or(4096))
+        .unwrap_or(4096)
+        .clamp(512, 4096);
+    let rstr0 = raw_logfile
+        .get(..probe_size)
+        .and_then(|page| NtfsLogRestartArea::parse_page(page).ok());
+    let rstr1 = raw_logfile
+        .get(probe_size..probe_size * 2)
+        .and_then(|page| NtfsLogRestartArea::parse_page(page).ok());
+    let restart = match (rstr0, rstr1) {
+        (Some(a), Some(b)) => {
+            if b.current_lsn > a.current_lsn {
+                b
+            } else {
+                a
+            }
+        }
+        (Some(a), None) => a,
+        (None, Some(b)) => b,
+        (None, None) => {
+            return Err(invalid(
+                "ntfs.logfile",
+                "neither primary nor backup RSTR page is valid",
+            ))
+        }
+    };
+
+    let page_bytes = restart.log_page_size as usize;
+    let data_start = usize::from(restart.log_page_data_offset).max(40);
+    let hdr_len = usize::from(restart.record_header_length).max(48);
+    let mut records = Vec::new();
+
+    for page_at in (probe_size * 2..raw_logfile.len()).step_by(page_bytes) {
+        let Some(raw_page) = raw_logfile.get(page_at..page_at + page_bytes) else {
+            break;
+        };
+        if raw_page.get(..4) != Some(b"RCRD".as_slice()) {
+            continue;
+        }
+        let Ok(page) = restore_record(raw_page, b"RCRD") else {
+            continue;
+        };
+        let end_off = usize::from(le16(&page, 24).unwrap_or(0)).min(page.len());
+        let mut pos = data_start;
+        while pos + hdr_len <= end_off {
+            let this_lsn = le64(&page, pos)?;
+            if this_lsn == 0 {
+                break;
+            }
+            let client_previous_lsn = le64(&page, pos + 8)?;
+            let client_undo_next_lsn = le64(&page, pos + 16)?;
+            let client_data_len = usize::try_from(le32(&page, pos + 24)?)
+                .map_err(|_| invalid("ntfs.rcrd", "client data length overflow"))?;
+            let record_type = le32(&page, pos + 32)?;
+            let transaction_id = le32(&page, pos + 36)?;
+            let payload_start = pos + hdr_len;
+            let Some(payload) = page.get(payload_start..payload_start + client_data_len) else {
+                break;
+            };
+            if record_type == 1 && payload.len() >= 40 {
+                let redo_op = NtfsLogOp::from_raw(le16(payload, 0)?);
+                let undo_op = NtfsLogOp::from_raw(le16(payload, 2)?);
+                let redo_offset = usize::from(le16(payload, 4)?);
+                let redo_length = usize::from(le16(payload, 6)?);
+                let undo_offset = usize::from(le16(payload, 8)?);
+                let undo_length = usize::from(le16(payload, 10)?);
+                let target_attribute = le16(payload, 12)?;
+                let lcns_to_follow = le16(payload, 14)?;
+                let record_offset = le16(payload, 16)?;
+                let attribute_offset = le16(payload, 18)?;
+                let cluster_block_offset = le16(payload, 20)?;
+                let target_vcn = le64(payload, 24)?;
+                let target_lcn = if lcns_to_follow > 0 {
+                    le64(payload, 32)?
+                } else {
+                    0
+                };
+                let redo_data = if redo_length > 0 {
+                    payload
+                        .get(redo_offset..redo_offset + redo_length)
+                        .ok_or_else(|| invalid("ntfs.rcrd", "redo slice out of bounds"))?
+                        .to_vec()
+                } else {
+                    Vec::new()
+                };
+                let undo_data = if undo_length > 0 {
+                    payload
+                        .get(undo_offset..undo_offset + undo_length)
+                        .ok_or_else(|| invalid("ntfs.rcrd", "undo slice out of bounds"))?
+                        .to_vec()
+                } else {
+                    Vec::new()
+                };
+                if this_lsn >= restart.oldest_lsn
+                    && (restart.current_lsn == 0 || this_lsn <= restart.current_lsn)
+                {
+                    records.push(NtfsLogRecord {
+                        this_lsn,
+                        client_previous_lsn,
+                        client_undo_next_lsn,
+                        transaction_id,
+                        record_type,
+                        redo_op,
+                        undo_op,
+                        target_attribute,
+                        record_offset,
+                        attribute_offset,
+                        cluster_block_offset,
+                        target_vcn,
+                        target_lcn,
+                        redo_data,
+                        undo_data,
+                    });
+                }
+            }
+            let aligned = (hdr_len + client_data_len + 7) & !7;
+            pos += aligned.max(hdr_len);
+        }
+    }
+
+    records.sort_by_key(|r| r.this_lsn);
+    records.dedup_by_key(|r| r.this_lsn);
+
+    // Pass 1: Analysis
+    #[derive(Clone, Copy, PartialEq, Eq)]
+    enum TxStatus {
+        Active,
+        Committed,
+    }
+    let mut tx_table: std::collections::BTreeMap<u32, (TxStatus, u64, u64)> =
+        std::collections::BTreeMap::new();
+    let mut dirty_pages: std::collections::BTreeMap<u64, u64> =
+        std::collections::BTreeMap::new();
+    let mut committed_set = std::collections::BTreeSet::new();
+
+    for rec in &records {
+        if rec.target_lcn != 0 && rec.redo_op.patches_bytes() {
+            dirty_pages.entry(rec.target_lcn).or_insert(rec.this_lsn);
+        }
+        match rec.redo_op {
+            NtfsLogOp::CommitTransaction => {
+                tx_table.insert(
+                    rec.transaction_id,
+                    (TxStatus::Committed, rec.this_lsn, rec.client_undo_next_lsn),
+                );
+                committed_set.insert(rec.transaction_id);
+            }
+            NtfsLogOp::ForgetTransaction => {
+                tx_table.remove(&rec.transaction_id);
+                committed_set.insert(rec.transaction_id);
+            }
+            _ => {
+                let status = tx_table
+                    .get(&rec.transaction_id)
+                    .map_or(TxStatus::Active, |entry| entry.0);
+                tx_table.insert(
+                    rec.transaction_id,
+                    (status, rec.this_lsn, rec.client_undo_next_lsn),
+                );
+            }
+        }
+    }
+
+    let min_rec_lsn = dirty_pages
+        .values()
+        .copied()
+        .min()
+        .unwrap_or(restart.oldest_lsn);
+
+    // Pass 2: Redo (repeating history in ascending LSN order)
+    let mut redo_actions = Vec::new();
+    for rec in &records {
+        if rec.this_lsn >= min_rec_lsn && rec.target_lcn != 0 && rec.redo_op.patches_bytes() {
+            redo_actions.push(NtfsRecoveryAction {
+                lsn: rec.this_lsn,
+                transaction_id: rec.transaction_id,
+                is_undo: false,
+                op: rec.redo_op,
+                target_lcn: rec.target_lcn,
+                cluster_block_offset: rec.cluster_block_offset,
+                record_offset: rec.record_offset,
+                attribute_offset: rec.attribute_offset,
+                data: rec.redo_data.clone(),
+            });
+        }
+    }
+
+    // Pass 3: Undo (loser transactions in descending LSN order)
+    let active_txs: std::collections::BTreeSet<u32> = tx_table
+        .iter()
+        .filter_map(|(&tx_id, &(status, _, _))| (status == TxStatus::Active).then_some(tx_id))
+        .collect();
+    let mut undo_actions = Vec::new();
+    for rec in records.iter().rev() {
+        if active_txs.contains(&rec.transaction_id)
+            && rec.target_lcn != 0
+            && rec.undo_op.patches_bytes()
+        {
+            undo_actions.push(NtfsRecoveryAction {
+                lsn: rec.this_lsn,
+                transaction_id: rec.transaction_id,
+                is_undo: true,
+                op: rec.undo_op,
+                target_lcn: rec.target_lcn,
+                cluster_block_offset: rec.cluster_block_offset,
+                record_offset: rec.record_offset,
+                attribute_offset: rec.attribute_offset,
+                data: rec.undo_data.clone(),
+            });
+        }
+    }
+
+    Ok(NtfsLogFilePlan {
+        restart,
+        records_parsed: records.len(),
+        committed_transactions: committed_set.into_iter().collect(),
+        aborted_transactions: active_txs.into_iter().collect(),
+        dirty_lcns: dirty_pages.keys().copied().collect(),
+        redo_actions,
+        undo_actions,
+    })
+}
+
 #[cfg(test)]
 mod tests;

@@ -443,12 +443,14 @@ fn concrete_volume_adapter_uses_selected_bounds_fragmented_mft_and_native_bitmap
     }
     let writes = Arc::new(AtomicUsize::new(0));
     let volume = NtfsVolume {
-        source: Source { device: Box::new(Device { bytes, writes: Arc::clone(&writes) }), base: base as u64, length: length as u64 },
+        source: Source { device: Box::new(Device { bytes, writes: Arc::clone(&writes) }), base: base as u64, length: length as u64, overlay: std::collections::BTreeMap::new() },
         geometry,
         mft: Stream { storage: Storage::Mapped(vec![
             NtfsRun { vcn: 0, clusters: 64, lcn: Some(128) },
             NtfsRun { vcn: 64, clusters: 64, lcn: Some(32) },
         ]), size: 64 * 1024, initialized: 64 * 1024, allocated: 64 * 1024 },
+        volume_flags: 0,
+        logfile_recovery: None,
     };
     let mut targets = targets();
     targets.clusters.get_mut(&(24, 84)).unwrap().lcn = Some(52);
