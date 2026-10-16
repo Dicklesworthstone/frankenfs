@@ -6,15 +6,17 @@
 //! binds each block to that identity. This is not ordinary DMU I/O.
 //! No pool claim, replay-sequence update, allocation or backing write occurs.
 
-use super::super::{Leaf, VdevConfig};
+mod storage;
+
+use super::super::{Pool, VdevConfig};
 use super::{
     BlockPointer, Cx, Endian, FfsError, MAX_READ_BYTES, Objects, Result, checkpoint,
     corrupt, parse, unsupported,
 };
-use ffs_ondisk::zfs::{DATA_OFFSET, Dva, MAX_BLOCK_BYTES, checksum};
+use ffs_ondisk::zfs::{Dva, MAX_BLOCK_BYTES, checksum};
 use ffs_ondisk::zfs_zpl::Kind;
 use serde::Serialize;
-use std::collections::BTreeMap;
+use storage::ReadState;
 
 const CHAIN_BYTES: usize = 184;
 const ECK_MAGIC: u64 = 0x0210_da7a_b10c_7a11;
@@ -202,44 +204,9 @@ pub struct IntentLog {
     pub header: Header,
     pub verified_blocks: usize,
     pub physical_work_bytes: usize,
+    pub reconstruction_work_bytes: usize,
     pub termination: Termination,
     pub records: Vec<Record>,
-}
-
-fn read_block(cx: &Cx, leaf: &Leaf, config: &VdevConfig, pointer: &Pointer, work: &mut usize, extents: &mut BTreeMap<u64, u64>) -> Result<Option<Vec<u8>>> {
-    let bytes = pointer.bp.physical_bytes();
-    let charge = bytes.checked_mul(pointer.dvas.len()).ok_or_else(|| corrupt("ZIL work overflow"))?;
-    *work = work.checked_add(charge).filter(|total| *total <= MAX_LOG_BYTES)
-        .ok_or_else(|| unsupported("ZIL scan exceeds 64 MiB physical work including replicas"))?;
-    for dva in &pointer.dvas {
-        checkpoint(cx)?;
-        leaf.validate_dva_for_vdev(config.ashift, config.allocated_bytes, config.id, &pointer.bp, dva)?;
-        let end = dva.offset.checked_add(dva.allocated_bytes).ok_or_else(|| corrupt("ZIL extent overflow"))?;
-        if extents.range(..end).next_back().is_some_and(|(_, old_end)| *old_end > dva.offset) {
-            return Err(corrupt("ZIL blocks or replicas alias an allocation interval"));
-        }
-        extents.insert(dva.offset, end);
-    }
-    let mut io_failure = None;
-    for dva in &pointer.dvas {
-        checkpoint(cx)?;
-        match leaf.read(cx, DATA_OFFSET + dva.offset, bytes) {
-            Ok(raw) => {
-                if pointer.checksum_valid(&raw)? {
-                    checkpoint(cx)?;
-                    return Ok(Some(raw));
-                }
-            }
-            Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
-            Err(error) => io_failure = Some(error),
-        }
-    }
-    // Only readable-but-unverified copies can constitute an unwritten tail.
-    // I/O failure and cancellation never turn into successful end-of-log.
-    if let Some(error) = io_failure {
-        return Err(error);
-    }
-    Ok(None)
 }
 
 #[derive(Clone, Copy)]
@@ -251,7 +218,7 @@ struct Selection {
 
 fn scan(
     cx: &Cx,
-    leaf: &Leaf,
+    pool: &Pool,
     config: &VdevConfig,
     header_bytes: &[u8],
     order: Endian,
@@ -269,6 +236,7 @@ fn scan(
         header,
         verified_blocks: 0,
         physical_work_bytes: 0,
+        reconstruction_work_bytes: 0,
         termination: Termination::Empty,
         records: Vec::new(),
     };
@@ -277,7 +245,7 @@ fn scan(
         return Err(corrupt("ZIL first block exceeds its claimed boundary"));
     }
     let mut last_record = 0;
-    let mut extents = BTreeMap::new();
+    let mut storage = ReadState::default();
     while let Some(current) = pointer {
         checkpoint(cx)?;
         if claimed && current.identity[3] >= result.header.claimed_block_sequence && last_record == result.header.claimed_record_sequence {
@@ -290,7 +258,10 @@ fn scan(
         if result.verified_blocks == MAX_LOG_BLOCKS {
             return Err(unsupported("ZIL scan exceeds 4096 log blocks"));
         }
-        let Some(raw) = read_block(cx, leaf, config, &current, &mut result.physical_work_bytes, &mut extents)? else {
+        let raw = storage::read_block(cx, pool, config, &current, &mut storage)?;
+        result.physical_work_bytes = storage.physical_bytes;
+        result.reconstruction_work_bytes = storage.reconstruction_bytes;
+        let Some(raw) = raw else {
             if claimed {
                 return Err(corrupt("claimed ZIL block failed every embedded checksum"));
             }
@@ -366,11 +337,10 @@ fn scan(
 
 impl Objects {
     /// Inspect a head's native log through its checked DSL and object-set root.
-    /// The initial log-I/O profile is one physical leaf, not RAIDZ or a mirror.
+    /// Log reads retain the same complete native storage set as the MOS/ZPL
+    /// view, with a dedicated ZIL verifier for replicas and RAIDZ reconstruction.
     pub fn intent_log(&mut self, cx: &Cx, components: &[Vec<u8>]) -> Result<IntentLog> {
         checkpoint(cx)?;
-        let leaf = self.pool.standalone_leaf()
-            .ok_or_else(|| unsupported("ZIL inspection currently requires a single-leaf pool"))?.clone();
         let dataset = self.datasets(cx)?.into_iter().find(|row| row.components == components)
             .ok_or_else(|| FfsError::NotFound("ZFS head dataset".into()))?;
         if dataset.objectset_kind != 2 {
@@ -382,7 +352,7 @@ impl Objects {
         let root = self.checked(cx, &bp, 11, 0, bp.logical_bytes(), object.ceiling)?
             .ok_or_else(|| corrupt("ZIL owner object set is a hole"))?;
         scan(
-            cx, &leaf, &self.config, &root.bytes[512..704], root.order,
+            cx, &self.pool, &self.config, &root.bytes[512..704], root.order,
             Selection { dataset: dataset.head_object, guid: dataset.guid, txg: self.txg },
         )
     }

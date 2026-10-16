@@ -1,8 +1,14 @@
 //! Constructed native log blocks, not a kernel/OpenZFS interchange claim.
 use super::*;
+use super::storage::read_block;
+use crate::reader::{Leaf, Pool};
 use ffs_block::ByteDevice;
+use ffs_ondisk::zfs::DATA_OFFSET;
 use ffs_types::ByteOffset;
+use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
+
+mod topology;
 
 const BASE: u64 = 4096;
 const LENGTH: u64 = 64 * 1024 * 1024;
@@ -42,14 +48,14 @@ fn config() -> VdevConfig {
         read_features: Vec::new(), raidz_members: None,
     }
 }
-fn leaf(blocks: &[(u64, Vec<u8>)], cancelled_at: Option<u64>) -> (Leaf, Reads) {
+fn leaf(blocks: &[(u64, Vec<u8>)], cancelled_at: Option<u64>) -> (Pool, Reads) {
     let reads = Arc::default();
     let device = Memory {
         blocks: blocks.iter().map(|(at, bytes)| (BASE + DATA_OFFSET + at, bytes.clone())).collect(),
         reads: Arc::clone(&reads), cancelled_at,
     };
     let leaf = Leaf::from_device(&Cx::for_testing(), Box::new(device), BASE, LENGTH).unwrap();
-    (leaf, reads)
+    (leaf.into(), reads)
 }
 fn put(raw: &mut [u8], at: usize, value: u64, order: Endian) {
     raw[at..at + 8].copy_from_slice(&order.encode(value));
@@ -203,12 +209,13 @@ fn replica_bounds_cycles_and_work_limits_are_checked_before_io() {
     put(&mut first, 24, SECOND / 512, order);
     let ptr = Pointer::parse(&first, order, 3).unwrap().unwrap();
     let (leaf, reads) = leaf(&[], None);
-    assert!(read_block(&cx, &leaf, &config(), &ptr, &mut 0, &mut BTreeMap::new()).is_err());
+    assert!(read_block(&cx, &leaf, &config(), &ptr, &mut ReadState::default()).is_err());
     assert!(reads.lock().unwrap().is_empty());
     first[16..32].fill(0);
     let ptr = Pointer::parse(&first, order, 3).unwrap().unwrap();
-    let mut exhausted = MAX_LOG_BYTES - 4095;
-    assert!(matches!(read_block(&cx, &leaf, &config(), &ptr, &mut exhausted, &mut BTreeMap::new()), Err(FfsError::UnsupportedFeature(_))));
+    let mut exhausted = ReadState::default();
+    exhausted.physical_bytes = MAX_LOG_BYTES - 4095;
+    assert!(matches!(read_block(&cx, &leaf, &config(), &ptr, &mut exhausted), Err(FfsError::UnsupportedFeature(_))));
     assert!(reads.lock().unwrap().is_empty());
     let next = pointer(FIRST, 2, 9, 4096, order, order);
     let raw = block(&first, order, &next, &[record(9, 43, 1, 0, b"valid", order)]);
@@ -378,7 +385,7 @@ fn recovery_graph(unsupported_namespace: bool) -> (Objects, Reads) {
         (0x4c000, master), (0x4c200, directory), (0x4c400, file),
     ], None);
     let objects = Objects {
-        pool: leaf.into(), config: config(), txg: 42, root_birth: 42,
+        pool: leaf, config: config(), txg: 42, root_birth: 42,
         meta: Dnode::parse(&meta, order).unwrap(),
         cache: std::collections::VecDeque::new(), cached_bytes: 0,
     };
