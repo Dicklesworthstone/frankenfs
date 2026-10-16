@@ -40,7 +40,7 @@ fn both_dialects_recover_lost_allocation_hints_and_dirty_state_without_touching_
         orphan(&image, &geometry);
         let cx = Cx::for_testing();
         let before = fs::read(&image.image).unwrap();
-        let mut args = RecoverArgs { image, offline_image: true, reclaim_lost: false, salvage_to: None, dry_run: false };
+        let mut args = RecoverArgs { image, offline_image: true, reclaim_lost: false, discard_orphan_lfn: false, salvage_to: None, dry_run: false };
         assert!(recover(&cx, &args).is_err());
         assert_eq!(fs::read(&args.image.image).unwrap(), before);
         args.reclaim_lost = true;
@@ -80,7 +80,7 @@ fn nonmirrored_recovery_preserves_inactive_fat_and_each_reserved_high_nibble() {
     let before = fs::read(&image.image).unwrap();
     let first = (geometry.entry_offset(0, 2).unwrap() - 8) as usize;
     let second = (geometry.entry_offset(1, 2).unwrap() - 8) as usize;
-    let args = RecoverArgs { image, offline_image: true, reclaim_lost: true, salvage_to: None, dry_run: false };
+    let args = RecoverArgs { image, offline_image: true, reclaim_lost: true, discard_orphan_lfn: false, salvage_to: None, dry_run: false };
     let report = recover(&Cx::for_testing(), &args).unwrap();
     assert_eq!(report["verification"]["clean"], true);
     let after = fs::read(&args.image.image).unwrap();
@@ -114,7 +114,7 @@ fn recovery_refuses_ambiguous_or_unknown_damage_before_any_writes() {
             }
         }
         let before = fs::read(&image.image).unwrap();
-        let args = RecoverArgs { image, offline_image: true, reclaim_lost: true, salvage_to: None, dry_run: false };
+        let args = RecoverArgs { image, offline_image: true, reclaim_lost: true, discard_orphan_lfn: false, salvage_to: None, dry_run: false };
         assert!(recover(&Cx::for_testing(), &args).is_err(), "{damage}");
         assert_eq!(fs::read(&args.image.image).unwrap(), before, "{damage}");
     }
@@ -132,7 +132,7 @@ fn selected_volume_recovery_never_modifies_neighboring_regions() {
     image.offset = 8192;
     image.length = Some(volume_bytes.len() as u64);
     fs::write(&image.image, &disk).unwrap();
-    let args = RecoverArgs { image, offline_image: true, reclaim_lost: true, salvage_to: None, dry_run: false };
+    let args = RecoverArgs { image, offline_image: true, reclaim_lost: true, discard_orphan_lfn: false, salvage_to: None, dry_run: false };
     assert_eq!(recover(&Cx::for_testing(), &args).unwrap()["reclaimed_clusters"], 3);
     let after = fs::read(&args.image.image).unwrap();
     assert_eq!(&after[..8192], &disk[..8192]);
@@ -197,7 +197,7 @@ fn every_recovery_write_sync_cut_preserves_reachable_payload_and_never_reports_s
     let cx = Cx::for_testing();
     let device = fault_device(&initial, None, 0);
     let diagnostic = DiagnosticVolume::from_device(&cx, Box::new(device.clone()), &image).unwrap();
-    let plan = Plan::prepare(&cx, &diagnostic, true).unwrap();
+    let plan = Plan::prepare(&cx, &diagnostic, true, false).unwrap();
     assert_eq!(plan.execute(&cx, &diagnostic).unwrap()["verification"]["clean"], true);
     let operations = device.0.lock().unwrap().operations;
     assert!(operations > 2);
@@ -205,7 +205,7 @@ fn every_recovery_write_sync_cut_preserves_reachable_payload_and_never_reports_s
         for tear in [0, 17, 511] {
             let device = fault_device(&initial, Some(cut), tear);
             let diagnostic = DiagnosticVolume::from_device(&cx, Box::new(device.clone()), &image).unwrap();
-            let plan = Plan::prepare(&cx, &diagnostic, true).unwrap();
+            let plan = Plan::prepare(&cx, &diagnostic, true, false).unwrap();
             assert!(plan.execute(&cx, &diagnostic).is_err(), "cut {cut}, tear {tear}");
             assert_eq!(device.0.lock().unwrap().operations, cut, "no cleanup writes after failure");
             for retain_pending in [false, true] {
@@ -242,7 +242,7 @@ fn recovery_cli_requires_offline_authority_and_rejects_force_bypasses() {
 fn cancelled_recovery_and_noop_clean_recovery_do_not_mutate() {
     let (_directory, image, _geometry) = populated("fat16");
     let before = fs::read(&image.image).unwrap();
-    let args = RecoverArgs { image, offline_image: true, reclaim_lost: false, salvage_to: None, dry_run: false };
+    let args = RecoverArgs { image, offline_image: true, reclaim_lost: false, discard_orphan_lfn: false, salvage_to: None, dry_run: false };
     let cx = Cx::for_testing();
     cx.set_cancel_requested(true);
     assert!(recover(&cx, &args).is_err());
@@ -250,7 +250,7 @@ fn cancelled_recovery_and_noop_clean_recovery_do_not_mutate() {
     let cx = Cx::for_testing();
     let device = fault_device(&before, Some(1), 0);
     let diagnostic = DiagnosticVolume::from_device(&cx, Box::new(device.clone()), &args.image).unwrap();
-    let plan = Plan::prepare(&cx, &diagnostic, false).unwrap();
+    let plan = Plan::prepare(&cx, &diagnostic, false, false).unwrap();
     assert_eq!(plan.execute(&cx, &diagnostic).unwrap()["changed"], false);
     assert_eq!(device.0.lock().unwrap().operations, 0);
     assert_eq!(fs::read(&args.image.image).unwrap(), before);
@@ -279,7 +279,7 @@ fn cancellation_after_publication_stops_recovery_without_cleaning_up() {
     let device = fault_device(&initial, None, 0);
     let cx = Cx::for_testing();
     let diagnostic = DiagnosticVolume::from_device(&cx, Box::new(CancelOnWrite(device.clone())), &image).unwrap();
-    let plan = Plan::prepare(&cx, &diagnostic, true).unwrap();
+    let plan = Plan::prepare(&cx, &diagnostic, true, false).unwrap();
     assert!(plan.execute(&cx, &diagnostic).is_err());
     // Already-dirty FAT16 needs one barrier before its first reclamation write.
     assert_eq!(device.0.lock().unwrap().operations, 2);
@@ -289,3 +289,5 @@ fn cancellation_after_publication_stops_recovery_without_cleaning_up() {
     retained(&fresh, &reopened.volume);
     assert!(!reopened.report(&fresh).unwrap().clean);
 }
+
+mod long_names;
