@@ -56,7 +56,7 @@ br create --type task --priority 2 --title "centralize test image factory helper
 **Scope:**
 - Current helpers scattered: create_test_image, build_ext4_*, create_btrfs_*
 - Create unified TestImageFactory module
-- Document options for each image type
+- Document options for each factory method
 - Add builder pattern for customization
 
 **Acceptance:**
@@ -79,3 +79,53 @@ br create --type task --priority 2 --title "centralize test image factory helper
 - cli_info_truncated_image_returns_error
 - cli_fsck_truncated_image_returns_error
 - cli_repair_truncated_image_returns_error
+
+## Security-first continuation — pending canonical import, 2026-10-16 UTC
+
+This section records current work; it does not replace `.beads/issues.jsonl` or
+close any existing bead. Canonical rows were retrieved by blob and relevant
+entries inspected. `br` is unavailable here and no safe partial-file mutation
+of the oversized canonical export is available. Import these statuses through
+`br` in the normal workspace after reconciling current ownership and dependencies.
+Full task/subtask record: `docs/SECURITY_WORKPLAN.md`.
+
+### Priority 0: remove hidden repair authority in NTFS/ZFS read-only consumers
+
+**Status: in progress; no closure.** Both companion ImageArgs open paths still
+select the writable SidecarImageDevice constructor even though their outer
+ByteDevice wrappers reject writes. The shared genuinely read-only constructor
+already exists from `117cc17`; FAT uses it from `724c1d5`. Reuse it in the remaining
+consumers, preserving explicit protected-mount repair authorization. Related
+closed integration bead: `bd-q19uk`; this is a newly discovered authority defect,
+not a claim that its historical tests never ran. Acceptance requires actual
+caller-path read-only tests, no image/archive changes, and fresh Rust execution.
+
+### Priority 1: isolate and audit offline native-image inspection
+
+**Status: implementation and 27 Python tests complete; kernel/native qualification
+pending.** Added `scripts/ffs_inspect_sandbox.py`, trusted pre-exec verifier,
+regressions and deployment contract. Real tests cover descriptor write refusal,
+shared locks, sealed bootstrap data, substituted bind identity, inherited-FD
+closure, child resource limits, hostile output, timeouts and pipe descendants.
+Exact command: `python3 -I -m unittest discover -s scripts/tests -p test_ffs_inspect_sandbox.py -v`.
+No bubblewrap or FrankenFS binary was executed by that suite. Production entry
+point refused root; bubblewrap is absent. Keep this item open until real namespace,
+no-write/no-network/host-access/descendant tests and native image workflows pass
+on a declared host. Aggregate cgroup/syscall policy remains a named obligation,
+not a capability inferred from per-process rlimits.
+
+### Priority 1: publish an accurate security-first README and capability matrix
+
+**Status: in progress.** Position the project as programmable native-image access,
+explicit mutation/repair authority and verifiable operation records. Distinguish
+memory safety, process containment, logical data correctness and authenticated
+provenance. Document actual commands, library/FUSE integration boundaries and
+unfinished profiles; no universal small-overhead or high-assurance certification
+claim. Preserve native feature goals rather than shrinking them to match code.
+
+### Existing work not reassigned or closed
+
+`bd-i0gk5`, `bd-q19uk`, `bd-nu8nf` are closed implementation rows, not blanket
+six-format qualification. `bd-ljrbw` remains open and depends on `bd-g49gi` and
+`bd-i0gk5`; inspect current dependency state before taking it. `bd-11a8t` remains
+in its existing owner lane. No acceptance criteria or test gates were weakened.
