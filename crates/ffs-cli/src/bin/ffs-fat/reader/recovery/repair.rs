@@ -321,6 +321,14 @@ fn mark_owned(cx: &Cx, owners: &mut [u8], chain: &[u32]) -> Result<u64> {
     Ok(chain.len() as u64)
 }
 
+/// Lowercase hex for a SHA-256 digest recorded in recovery reports.
+fn hex_digest(digest: &[u8; 32]) -> String {
+    use std::fmt::Write as _;
+    let mut text = String::with_capacity(64);
+    for byte in digest { write!(&mut text, "{byte:02x}").expect("format digest into String"); }
+    text
+}
+
 fn write_patch(cx: &Cx, volume: &FatVolume, offset: u64, original: &[u8], updated: &[u8]) -> Result<()> {
     checkpoint(cx)?;
     let size = volume.geometry.sector_bytes() as usize;

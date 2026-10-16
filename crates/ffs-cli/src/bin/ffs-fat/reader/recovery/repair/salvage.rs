@@ -6,7 +6,7 @@
 //! This is raw salvage, not undeletion, native repair or payload reconstruction.
 
 use super::{FatEntry, FatKind, FatTable, FatVolume, Plan, MAX_CHAIN_CLUSTERS,
-    allocate, checkpoint};
+    allocate, checkpoint, hex_digest};
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
 use serde::Serialize;
@@ -291,13 +291,6 @@ fn verify_output(cx: &Cx, file: &mut File, length: u64, expected: &[u8; 32], buf
     if &actual != expected { bail!("salvaged file SHA-256 failed readback"); }
     checkpoint(cx)?;
     Ok(())
-}
-
-fn hex_digest(digest: &[u8; 32]) -> String {
-    use std::fmt::Write as _;
-    let mut text = String::with_capacity(64);
-    for byte in digest { write!(&mut text, "{byte:02x}").expect("format digest into String"); }
-    text
 }
 
 companion_bin_tests! {

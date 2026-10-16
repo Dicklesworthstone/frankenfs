@@ -5,7 +5,7 @@
 
 use super::{
     DiagnosticVolume, FatCheckReport, FatKind, FatVolume, ImageArgs, MAX_CHAIN_CLUSTERS,
-    allocate, checkpoint, long_names::Names, write_patch,
+    allocate, checkpoint, hex_digest, long_names::Names, write_patch,
 };
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
@@ -301,8 +301,8 @@ impl<'a> BootPlan<'a> {
             "volume_offset": self.args.offset, "volume_bytes": self.volume.geometry.volume_bytes(),
             "source_byte_offset": self.source_at, "destination_byte_offset": self.target_at,
             "sector_bytes": self.source.len(), "original_destination_parseable": self.target_parseable,
-            "source_sha256": format!("{:x}", Sha256::digest(&self.source)),
-            "original_destination_sha256": format!("{:x}", Sha256::digest(&self.target)),
+            "source_sha256": hex_digest(&Sha256::digest(&self.source).into()),
+            "original_destination_sha256": hex_digest(&Sha256::digest(&self.target).into()),
             "selected_interpretation": self.before,
             "file_contents_verified": false, "clean_state_published": false,
             "requires_recovery": !self.unchanged() || !self.before.clean || self.target[65] & 1 != 0,
