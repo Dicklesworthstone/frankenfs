@@ -6,6 +6,7 @@
 //! binds each block to that identity. This is not ordinary DMU I/O.
 //! No pool claim, replay-sequence update, allocation or backing write occurs.
 
+mod recovery;
 mod storage;
 
 use super::super::{Pool, VdevConfig};
@@ -490,9 +491,9 @@ impl Objects {
         edits.retain(|edit| edit.object() == object);
         let file_size = edits.iter().fold(metadata.size, |size, edit| edit.size_after(size));
         let length = file_size.saturating_sub(start).min(bytes as u64) as usize;
-        let mut result = view.read(cx, object, start, length)?;
-        result.resize(length, 0);
-        apply(cx, &mut result, start, metadata.size, &edits)?;
+        let result = recovery::read(cx, metadata.size, start, length, &edits, |at, count| {
+            view.read(cx, object, at, count)
+        })?;
         let applied_records = edits.len();
         drop(edits);
         checkpoint(cx)?;
