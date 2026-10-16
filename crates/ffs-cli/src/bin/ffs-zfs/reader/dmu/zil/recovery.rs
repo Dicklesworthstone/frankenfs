@@ -46,6 +46,7 @@ pub(super) fn read(
             Edit::Write { offset, data, .. } => overlap(start, length, *offset, *offset + data.len() as u64),
             Edit::Truncate { size: next, .. } if *next < size => overlap(start, length, *next, u64::MAX),
             Edit::Truncate { size: next, .. } => overlap(start, length, size, *next),
+            Edit::Free { offset, end, .. } => overlap(start, length, size.min(*offset), *end),
         };
         charge_recovery(&mut remaining, changed.len())?;
         needed[changed].fill(false);
@@ -147,6 +148,10 @@ mod tests {
                 };
                 match &edit {
                     Edit::Truncate { size, .. } => oracle.resize(*size as usize, 0),
+                    Edit::Free { offset, end, .. } => {
+                        oracle.resize(oracle.len().max(*end as usize), 0);
+                        oracle[*offset as usize..*end as usize].fill(0);
+                    }
                     Edit::Write { offset, data, .. } => {
                         oracle.resize(oracle.len().max(*offset as usize + data.len()), 0);
                         oracle[*offset as usize..*offset as usize + data.len()].copy_from_slice(data);

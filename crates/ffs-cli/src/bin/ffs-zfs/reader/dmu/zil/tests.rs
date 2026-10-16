@@ -10,6 +10,7 @@ use std::sync::{Arc, Mutex};
 
 mod topology;
 mod indirect;
+mod range_free;
 
 const BASE: u64 = 4096;
 const LENGTH: u64 = 64 * 1024 * 1024;
@@ -242,7 +243,7 @@ fn zilog2_verifies_rounded_used_prefix_not_unwritten_allocation_tail() {
 #[test]
 fn recovery_rejects_unsupported_pending_intent_and_invalid_copied_lengths() {
     let order = Endian::Little;
-    for (kind, offset, data) in [(1, 0, b"".as_slice()), (20, 0, b""), (10, 1, b"range"), (9, u64::MAX, b"bad")] {
+    for (kind, offset, data) in [(1, 0, b"".as_slice()), (20, 0, b""), (10, i64::MAX as u64, b"range"), (9, u64::MAX, b"bad")] {
         let raw = record(kind, 43, 1, offset, data, order);
         let r = Record { kind, txg: 43, sequence: 1, record_bytes: raw.len(), pending: true, order, raw };
         assert!(edit(&r).is_err());
@@ -268,6 +269,10 @@ fn recovered_ranges_match_full_file_model_after_overwrites_shrink_regrowth_and_s
             };
             match &edit {
                 Edit::Truncate { size, .. } => oracle.resize(*size as usize, 0),
+                Edit::Free { offset, end, .. } => {
+                    oracle.resize(oracle.len().max(*end as usize), 0);
+                    oracle[*offset as usize..*end as usize].fill(0);
+                }
                 Edit::Write { offset, data, .. } => {
                     oracle.resize(oracle.len().max(*offset as usize + data.len()), 0);
                     oracle[*offset as usize..*offset as usize + data.len()].copy_from_slice(data);

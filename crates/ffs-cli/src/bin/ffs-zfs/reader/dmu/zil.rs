@@ -364,17 +364,20 @@ impl Objects {
 enum Edit<'a> {
     Write { object: u64, offset: u64, data: &'a [u8] },
     Truncate { object: u64, size: u64 },
+    Free { object: u64, offset: u64, end: u64 },
 }
 impl Edit<'_> {
     fn object(&self) -> u64 {
         match self {
-            Self::Write { object, .. } | Self::Truncate { object, .. } => *object,
+            Self::Write { object, .. } | Self::Truncate { object, .. }
+                | Self::Free { object, .. } => *object,
         }
     }
     fn size_after(&self, size: u64) -> u64 {
         match self {
             Self::Write { offset, data, .. } => size.max(*offset + data.len() as u64),
             Self::Truncate { size, .. } => *size,
+            Self::Free { end, .. } => size.max(*end),
         }
     }
 }
@@ -397,10 +400,17 @@ fn edit(record: &Record) -> Result<Edit<'_>> {
     let raw = &record.raw;
     let (object, offset, length) = file_range(record)?;
     if record.kind == 10 {
-        if raw.len() != 56 || length != 0 {
-            return Err(unsupported("file-data ZIL recovery admits EOF truncation, not range-free records"));
+        if raw.len() != 56 {
+            return Err(corrupt("ZIL truncate record must contain exactly 56 bytes"));
         }
-        return Ok(Edit::Truncate { object, size: offset });
+        // Native zfs_freesp uses len == 0 for EOF truncation. Nonzero
+        // ranges are freed without shortening the file, but CAN extend EOF
+        // to offset + length. They are not keep-size hole-punch requests.
+        return Ok(if length == 0 {
+            Edit::Truncate { object, size: offset }
+        } else {
+            Edit::Free { object, offset, end: offset + length }
+        });
     }
     if raw.len() <= 192 {
         return Err(unsupported("file-data ZIL recovery requires copied writes; indirect writes are not replayed"));
@@ -443,6 +453,11 @@ fn apply(cx: &Cx, bytes: &mut [u8], start: u64, mut size: u64, edits: &[Edit<'_>
                 } else {
                     overlap(start, bytes.len(), size, *next)
                 };
+                charge_recovery(&mut remaining, range.len())?;
+                bytes[range].fill(0);
+            }
+            Edit::Free { offset, end, .. } => {
+                let range = overlap(start, bytes.len(), size.min(*offset), *end);
                 charge_recovery(&mut remaining, range.len())?;
                 bytes[range].fill(0);
             }
