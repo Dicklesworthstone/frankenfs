@@ -377,6 +377,7 @@ impl Objects {
             )?
             .ok_or_else(|| corrupt("selected snapshot object set is a hole"))?;
         let os = ObjectSet::parse(&block.bytes, block.order).map_err(|error| parse(&error))?;
+        let zil_header = os.zil_header;
         let view = Self {
             pool: self.pool.clone(),
             config: self.config.clone(),
@@ -391,6 +392,7 @@ impl Objects {
             view,
             selected.info.guid,
             selected.info.referenced_bytes,
+            zil_header,
             None,
         )
     }

@@ -710,6 +710,155 @@ fn dataset_views_do_not_reuse_mos_or_other_dataset_block_caches() {
     );
 }
 
+#[test]
+fn zil_intent_log_replays_create_write_rename_truncate_and_remove_in_memory() {
+    let cx = Cx::for_testing();
+    let order = Endian::Little;
+    let (leaf, _meta) = graph(order, 0, 0, Arc::default(), None);
+
+    // Synthesize a 1024-byte ZIL block at ZIL_BLK (DATA_OFFSET + 0x36000) and attach its BP to view.zil_header.
+    let zil_at = DATA_OFFSET + 0x36000;
+    let mut zil_raw = vec![0_u8; 1024];
+    let mut pos = 0_usize;
+    let mut put_rec = |txtype: u64, txg: u64, seq: u64, body: &[u8]| {
+        let reclen = (32 + body.len()).next_multiple_of(8);
+        zil_raw[pos..pos + 8].copy_from_slice(&order.encode(txtype));
+        zil_raw[pos + 8..pos + 16].copy_from_slice(&order.encode(reclen as u64));
+        zil_raw[pos + 16..pos + 24].copy_from_slice(&order.encode(txg));
+        zil_raw[pos + 24..pos + 32].copy_from_slice(&order.encode(seq));
+        zil_raw[pos + 32..pos + 32 + body.len()].copy_from_slice(body);
+        pos += reclen;
+    };
+
+    // 1. TX_CREATE (txtype = 1): create "/created.txt" (dir_obj = 2, file_obj = 50, mode = 0o100644)
+    let mut create_body = vec![0_u8; 72];
+    create_body[0..8].copy_from_slice(&order.encode(2)); // dir_obj
+    create_body[8..16].copy_from_slice(&order.encode(50)); // file_obj
+    create_body[16..24].copy_from_slice(&order.encode(0o100_644)); // mode
+    create_body[24..32].copy_from_slice(&order.encode(1000)); // uid
+    create_body[32..40].copy_from_slice(&order.encode(1000)); // gid
+    create_body[40..48].copy_from_slice(&order.encode(10)); // gen
+    create_body[48..56].copy_from_slice(&order.encode(1_700_000_100)); // crtime sec
+    create_body.extend_from_slice(b"created.txt\0");
+    put_rec(1, 62, 1, &create_body);
+
+    // 2. TX_WRITE (txtype = 9): write "hello-zil-world" to file_obj = 50 at offset 0
+    let payload = b"hello-zil-world";
+    let mut write_body = vec![0_u8; 160];
+    write_body[0..8].copy_from_slice(&order.encode(50)); // file_obj
+    write_body[8..16].copy_from_slice(&order.encode(0)); // offset
+    write_body[16..24].copy_from_slice(&order.encode(payload.len() as u64)); // length
+    write_body.extend_from_slice(payload);
+    put_rec(9, 62, 2, &write_body);
+
+    // 3. TX_TRUNCATE (txtype = 10): truncate file_obj = 50 to length 9 ("hello-zil")
+    let mut trunc_body = vec![0_u8; 24];
+    trunc_body[0..8].copy_from_slice(&order.encode(50)); // file_obj
+    trunc_body[8..16].copy_from_slice(&order.encode(9)); // offset = new size
+    trunc_body[16..24].copy_from_slice(&order.encode(0)); // length = 0 means truncate to offset
+    put_rec(10, 62, 3, &trunc_body);
+
+    // 4. TX_RENAME (txtype = 8): rename "/empty" (dir 2) -> "/sub/renamed_empty" (dir 4)
+    let mut rename_body = vec![0_u8; 16];
+    rename_body[0..8].copy_from_slice(&order.encode(2)); // src_dir_obj
+    rename_body[8..16].copy_from_slice(&order.encode(4)); // dst_dir_obj
+    rename_body.extend_from_slice(b"empty\0renamed_empty\0");
+    put_rec(8, 62, 4, &rename_body);
+
+    // 5. TX_REMOVE (txtype = 5): remove "/alias.bin" from dir 2
+    let mut remove_body = vec![0_u8; 8];
+    remove_body[0..8].copy_from_slice(&order.encode(2)); // dir_obj
+    remove_body.extend_from_slice(b"alias.bin\0");
+    put_rec(5, 62, 5, &remove_body);
+
+    // Set zil_chain_t trailer at end - 184: nused at trailer + 136
+    let trailer_start = zil_raw.len() - 184;
+    zil_raw[trailer_start + 136..trailer_start + 144].copy_from_slice(&order.encode(pos as u64));
+
+    // Store the ZIL block into a new image with the ZIL header wired into OS[512..704]
+    let (leaf_with_zil, meta_with_zil) = {
+        let mut image = vec![0; BASE + LENGTH + 512];
+        // Read existing graph bytes from `leaf` into `image`:
+        let existing = leaf.read(&cx, 0, LENGTH).unwrap();
+        image[BASE..BASE + LENGTH].copy_from_slice(&existing);
+        let at_zil = BASE + zil_at as usize;
+        image[at_zil..at_zil + zil_raw.len()].copy_from_slice(&zil_raw);
+        let zil_bp = bp(&zil_raw, zil_at, 7, 0, 62, order, order);
+
+        // Update OS[512..704] with ZilHeader and recompute DS bonus BP for OS:
+        let at_os = BASE + OS as usize;
+        let mut os_bytes = image[at_os..at_os + 1024].to_vec();
+        os_bytes[512..520].copy_from_slice(&order.encode(62)); // claim_txg
+        os_bytes[528..656].copy_from_slice(&zil_bp); // zh_log BP
+        image[at_os..at_os + 1024].copy_from_slice(&os_bytes);
+
+        let at_mos = BASE + MOS as usize;
+        let mut mos_table = image[at_mos..at_mos + 16_384].to_vec();
+        let mut ds = mos_table[1536 + 192..1536 + 192 + 320].to_vec();
+        ds[128..256].copy_from_slice(&bp(&os_bytes, OS, 11, 0, 45, order, Endian::Big));
+        mos_table[1536..2048].copy_from_slice(&node(16, 512, 1, 0, &ds, 16, order));
+        image[at_mos..at_mos + 16_384].copy_from_slice(&mos_table);
+
+        let mut meta_raw = node(10, 16_384, 1, 0, &[], 0, order);
+        meta_raw[64..192].copy_from_slice(&bp(&mos_table, MOS, 10, 0, 50, order, order));
+        let new_leaf = Leaf::from_device(
+            &cx,
+            Box::new(Memory {
+                image,
+                reads: Arc::default(),
+                failure: None,
+            }),
+            BASE as u64,
+            LENGTH as u64,
+        )
+        .unwrap();
+        (new_leaf, Dnode::parse(&meta_raw, order).unwrap())
+    };
+
+    let mut pool = mos(&leaf_with_zil, meta_with_zil);
+    let mut view = pool.zpl(&cx, &[]).unwrap();
+    assert!(view.zil_header.has_work());
+    assert!(view.zil_replay_stats().is_none());
+    // Before replay_zil:
+    assert!(matches!(
+        view.resolve(&cx, b"/created.txt"),
+        Err(FfsError::NotFound(_))
+    ));
+    assert_eq!(view.resolve(&cx, b"/alias.bin").unwrap(), 3);
+    assert_eq!(view.resolve(&cx, b"/empty").unwrap(), 6);
+
+    // Replay ZIL:
+    let stats = view.replay_zil(&cx).unwrap();
+    assert_eq!(view.zil_replay_stats(), Some(&stats));
+    assert_eq!(stats.blocks_visited, 1);
+    assert_eq!(stats.records_replayed, 5);
+    assert_eq!(stats.last_txg, 62);
+    assert_eq!(stats.last_seq, 5);
+
+    // Verify TX_CREATE + TX_WRITE + TX_TRUNCATE on /created.txt:
+    let created_obj = view.resolve(&cx, b"/created.txt").unwrap();
+    assert_eq!(created_obj, 50);
+    let (meta50, _) = view.stat(&cx, created_obj).unwrap();
+    assert_eq!(meta50.size, 9);
+    assert_eq!(view.read(&cx, created_obj, 0, 64).unwrap(), b"hello-zil");
+
+    // Verify TX_REMOVE on /alias.bin:
+    assert!(matches!(
+        view.resolve(&cx, b"/alias.bin"),
+        Err(FfsError::NotFound(_))
+    ));
+
+    // Verify TX_RENAME of /empty -> /sub/renamed_empty:
+    assert!(matches!(
+        view.resolve(&cx, b"/empty"),
+        Err(FfsError::NotFound(_))
+    ));
+    let renamed_obj = view.resolve(&cx, b"/sub/renamed_empty").unwrap();
+    assert_eq!(renamed_obj, 6);
+    let (meta6, _) = view.stat(&cx, renamed_obj).unwrap();
+    assert_eq!(meta6.parent, 4);
+}
+
 mod mount;
 
 mod mirror;

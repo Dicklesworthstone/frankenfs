@@ -113,6 +113,9 @@ struct CandidateArgs {
     /// Automatically import the highest-TXG active/exported uberblock across all 4 labels.
     #[arg(long)]
     auto_import: bool,
+    /// Replay uncommitted ZIL intent-log blocks onto ZPL head dataset views.
+    #[arg(long)]
+    pub replay_zil: bool,
     #[arg(long, default_value_t = 0, required_unless_present = "auto_import")]
     label: usize,
     #[arg(long, default_value_t = 0, required_unless_present = "auto_import")]
@@ -643,6 +646,7 @@ mod tests {
                 sidecar: None,
             },
             auto_import: false,
+            replay_zil: false,
             label: 0,
             slot: 0,
             pool_guid: 1,
@@ -682,6 +686,7 @@ mod tests {
                 sidecar: None,
             },
             auto_import: false,
+            replay_zil: false,
             label: 0,
             slot: 0,
             pool_guid: 1,

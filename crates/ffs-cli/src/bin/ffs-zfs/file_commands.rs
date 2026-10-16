@@ -245,10 +245,13 @@ impl FileCommand {
                 }
                 candidate.reject_hidden_images(&mountpoint)?;
                 let mut pool = candidate.objects(cx)?;
-                let view = match snapshot.as_deref() {
+                let mut view = match snapshot.as_deref() {
                     Some(name) => pool.zpl_snapshot(cx, &components, name.as_bytes())?,
                     None => pool.zpl(cx, &components)?,
                 };
+                if candidate.replay_zil && snapshot.is_none() {
+                    view.replay_zil(cx)?;
+                }
                 let guid = view.dataset_guid;
                 let txg = view.view_txg();
                 let fs = crate::filesystem::ZfsFs::new(cx, view, uid, gid)?;
@@ -295,6 +298,9 @@ impl FileCommand {
             Some(name) => pool.zpl_snapshot(cx, &components, name.as_bytes())?,
             None => pool.zpl(cx, &components)?,
         };
+        if c.replay_zil && file.snapshot.is_none() {
+            view.replay_zil(cx)?;
+        }
         let snapshot_name = file.snapshot.as_deref().and_then(|name| name.to_str());
         let snapshot_bytes = file.snapshot.as_deref().map(OsStrExt::as_bytes);
         let object = view.resolve_with(

@@ -230,6 +230,19 @@ impl Objects {
         Ok(Some(block))
     }
 
+    pub(super) fn read_zil_block(
+        &mut self,
+        cx: &Cx,
+        bp: &BlockPointer,
+    ) -> Result<Option<(Vec<u8>, Endian)>> {
+        checkpoint(cx)?;
+        if bp.hole() {
+            return Ok(None);
+        }
+        let block = self.pool.read_block(cx, &self.config, bp)?;
+        Ok(Some((block.bytes, bp.payload_order())))
+    }
+
     fn data_block(&mut self, cx: &Cx, object: &Object, id: u64) -> Result<Option<CheckedBlock>> {
         let route = object.node.route(id).map_err(|error| parse(&error))?;
         let mut bp = object.node.pointers()[route[0]].clone();

@@ -12,12 +12,31 @@ use super::{
     BTreeSet, BlockPointer, Cx, FfsError, MAX_READ_BYTES, Object, ObjectSet, Objects, Result,
     VecDeque, checkpoint, corrupt, parse, unsupported,
 };
-use ffs_ondisk::zfs_dmu::ZapEntry;
+use ffs_ondisk::zfs_dmu::{ZapEntry, ZilBlock, ZilHeader, ZilRecordPayload};
 use ffs_ondisk::zfs_zpl::{Attributes, Kind, Metadata, SA_BYTES, SaRegistry, directory_reference};
+use std::collections::BTreeMap;
 
 const MAX_PATH: usize = 65_536;
 const MAX_COMPONENTS: usize = 256;
 const MAX_DIRECTORY_BYTES: usize = 32 * 1024 * 1024;
+const MAX_ZIL_BLOCKS: usize = 256;
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ZilReplayStats {
+    pub blocks_visited: usize,
+    pub records_replayed: usize,
+    pub last_txg: u64,
+    pub last_seq: u64,
+}
+
+#[derive(Debug, Clone, Default)]
+struct ZilOverlay {
+    stats: ZilReplayStats,
+    objects: BTreeMap<u64, Metadata>,
+    dir_entries: BTreeMap<u64, BTreeMap<Vec<u8>, Option<u64>>>,
+    file_data: BTreeMap<u64, Vec<u8>>,
+    removed_objects: BTreeSet<u64>,
+}
 
 pub struct Zpl {
     objects: Objects,
@@ -27,6 +46,8 @@ pub struct Zpl {
     registry: Option<SaRegistry>,
     utf8_only: bool,
     referenced_bytes: u64,
+    pub zil_header: ZilHeader,
+    zil_overlay: Option<ZilOverlay>,
     mos: Option<(Box<Objects>, Vec<Vec<u8>>)>,
 }
 #[derive(Debug)]
@@ -82,6 +103,7 @@ impl Objects {
         if os.kind != 2 || bp.birth() != dataset.root_birth {
             return Err(corrupt("selected ZPL head identity changed"));
         }
+        let zil_header = os.zil_header;
         let view = Self {
             pool: self.pool.clone(),
             config: self.config.clone(),
@@ -96,6 +118,7 @@ impl Objects {
             view,
             dataset.guid,
             referenced_bytes,
+            zil_header,
             Some((Box::new(self.clone_mos()), components.to_vec())),
         )
     }
@@ -118,6 +141,7 @@ impl Zpl {
         mut objects: Objects,
         dataset_guid: u64,
         referenced_bytes: u64,
+        zil_header: ZilHeader,
         mos: Option<(Box<Objects>, Vec<Vec<u8>>)>,
     ) -> Result<Self> {
         let master = typed_map(&mut objects, cx, 1, 21)?;
@@ -166,6 +190,8 @@ impl Zpl {
             registry,
             utf8_only: utf8 != 0,
             referenced_bytes,
+            zil_header,
+            zil_overlay: None,
             mos,
         };
         let (_, metadata) = zpl.file(cx, root)?;
@@ -174,6 +200,319 @@ impl Zpl {
         }
         checkpoint(cx)?;
         Ok(zpl)
+    }
+
+    #[must_use]
+    pub fn zil_replay_stats(&self) -> Option<&ZilReplayStats> {
+        self.zil_overlay.as_ref().map(|ov| &ov.stats)
+    }
+
+    /// Replay the ZIL intent-log chain (`zh_log`) into an in-memory ZPL overlay.
+    pub fn replay_zil(&mut self, cx: &Cx) -> Result<ZilReplayStats> {
+        checkpoint(cx)?;
+        let mut overlay = ZilOverlay::default();
+        if !self.zil_header.has_work() {
+            let stats = overlay.stats.clone();
+            self.zil_overlay = Some(overlay);
+            return Ok(stats);
+        }
+        let mut bp = self.zil_header.log.clone();
+        let min_seq = self.zil_header.replay_seq;
+        while !bp.hole() && overlay.stats.blocks_visited < MAX_ZIL_BLOCKS {
+            checkpoint(cx)?;
+            let Some((raw, order)) = self.objects.read_zil_block(cx, &bp)? else {
+                break;
+            };
+            let zblk = ZilBlock::parse(&raw, order).map_err(|e| parse(&e))?;
+            overlay.stats.blocks_visited += 1;
+            for rec in zblk.records {
+                checkpoint(cx)?;
+                if rec.seq <= min_seq {
+                    continue;
+                }
+                self.apply_zil_record(cx, &mut overlay, &rec.payload)?;
+                overlay.stats.records_replayed += 1;
+                overlay.stats.last_txg = overlay.stats.last_txg.max(rec.txg);
+                overlay.stats.last_seq = overlay.stats.last_seq.max(rec.seq);
+            }
+            if zblk.next_blk == bp {
+                break;
+            }
+            bp = zblk.next_blk;
+        }
+        let stats = overlay.stats.clone();
+        self.zil_overlay = Some(overlay);
+        checkpoint(cx)?;
+        Ok(stats)
+    }
+
+    fn ensure_overlay_metadata(
+        &mut self,
+        cx: &Cx,
+        overlay: &mut ZilOverlay,
+        object_id: u64,
+    ) -> Option<Metadata> {
+        if let Some(meta) = overlay.objects.get(&object_id) {
+            return Some(meta.clone());
+        }
+        let Ok((_, meta)) = self.file(cx, object_id) else {
+            return None;
+        };
+        overlay.objects.insert(object_id, meta.clone());
+        Some(meta)
+    }
+
+    fn ensure_overlay_file_data(
+        &mut self,
+        cx: &Cx,
+        overlay: &mut ZilOverlay,
+        object_id: u64,
+    ) -> Result<()> {
+        if overlay.file_data.contains_key(&object_id) {
+            return Ok(());
+        }
+        let data = if let Ok((object, meta)) = self.file(cx, object_id)
+            && meta.kind == Kind::Regular
+        {
+            self.contents(
+                cx,
+                object_id,
+                &object,
+                meta.size,
+                0,
+                (meta.size as usize).min(MAX_READ_BYTES),
+            )
+            .unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+        overlay.file_data.insert(object_id, data);
+        Ok(())
+    }
+
+    fn apply_zil_record(
+        &mut self,
+        cx: &Cx,
+        overlay: &mut ZilOverlay,
+        payload: &ZilRecordPayload,
+    ) -> Result<()> {
+        match payload {
+            ZilRecordPayload::Create {
+                dir_obj,
+                file_obj,
+                mode,
+                uid,
+                gid,
+                generation,
+                crtime,
+                name,
+                symlink_target,
+                is_dir,
+            } => {
+                self.component(name)?;
+                let kind = if symlink_target.is_some() || (*mode & 0o170_000) == 0o120_000 {
+                    Kind::Symlink
+                } else if *is_dir {
+                    Kind::Directory
+                } else {
+                    Kind::Regular
+                };
+                let size = symlink_target
+                    .as_ref()
+                    .map_or(if *is_dir { 2 } else { 0 }, |t| t.len() as u64);
+                let ts = ffs_ondisk::zfs_zpl::Timestamp {
+                    seconds: i64::from_le_bytes(crtime[0].to_le_bytes()),
+                    nanos: u32::try_from(crtime[1]).unwrap_or(0).min(999_999_999),
+                };
+                let meta = Metadata {
+                    mode: (*mode) & 0o7777,
+                    kind,
+                    uid: *uid,
+                    gid: *gid,
+                    size,
+                    links: if *is_dir { 2 } else { 1 },
+                    parent: *dir_obj,
+                    flags: 0,
+                    generation: (*generation).max(1).min(self.objects.txg),
+                    times: [ts, ts, ts, ts],
+                    inline_symlink: symlink_target.clone(),
+                };
+                overlay.removed_objects.remove(file_obj);
+                overlay.objects.insert(*file_obj, meta);
+                overlay
+                    .dir_entries
+                    .entry(*dir_obj)
+                    .or_default()
+                    .insert(name.clone(), Some(*file_obj));
+                if kind == Kind::Regular {
+                    overlay.file_data.entry(*file_obj).or_default();
+                }
+            }
+            ZilRecordPayload::Remove {
+                dir_obj,
+                name,
+                is_dir: _,
+            } => {
+                let target_obj = if let Some(Some(obj)) = overlay
+                    .dir_entries
+                    .get(dir_obj)
+                    .and_then(|m| m.get(name.as_slice()))
+                {
+                    Some(*obj)
+                } else if let Ok(entries) = self.objects.zap(cx, *dir_obj) {
+                    entries
+                        .into_iter()
+                        .find(|e| e.name == *name)
+                        .and_then(|e| directory_reference(e.value).ok().map(|(o, _)| o))
+                } else {
+                    None
+                };
+                overlay
+                    .dir_entries
+                    .entry(*dir_obj)
+                    .or_default()
+                    .insert(name.clone(), None);
+                if let Some(obj) = target_obj {
+                    overlay.removed_objects.insert(obj);
+                    overlay.objects.remove(&obj);
+                }
+            }
+            ZilRecordPayload::Rename {
+                src_dir_obj,
+                dst_dir_obj,
+                src_name,
+                dst_name,
+            } => {
+                self.component(dst_name)?;
+                let target_obj = if let Some(Some(obj)) = overlay
+                    .dir_entries
+                    .get(src_dir_obj)
+                    .and_then(|m| m.get(src_name.as_slice()))
+                {
+                    Some(*obj)
+                } else if let Ok(entries) = self.objects.zap(cx, *src_dir_obj) {
+                    entries
+                        .into_iter()
+                        .find(|e| e.name == *src_name)
+                        .and_then(|e| directory_reference(e.value).ok().map(|(o, _)| o))
+                } else {
+                    None
+                };
+                if let Some(obj) = target_obj {
+                    let _ = self.ensure_overlay_metadata(cx, overlay, obj);
+                    if let Some(meta) = overlay.objects.get_mut(&obj) {
+                        meta.parent = *dst_dir_obj;
+                    }
+                    overlay
+                        .dir_entries
+                        .entry(*src_dir_obj)
+                        .or_default()
+                        .insert(src_name.clone(), None);
+                    overlay
+                        .dir_entries
+                        .entry(*dst_dir_obj)
+                        .or_default()
+                        .insert(dst_name.clone(), Some(obj));
+                }
+            }
+            ZilRecordPayload::Write {
+                file_obj,
+                offset,
+                length,
+                blkoff,
+                blkptr,
+                inline_data,
+            } => {
+                let write_bytes = if !inline_data.is_empty() {
+                    inline_data.clone()
+                } else if !blkptr.hole() {
+                    if let Some((blk_bytes, _)) = self.objects.read_zil_block(cx, blkptr)? {
+                        let start = (*blkoff as usize).min(blk_bytes.len());
+                        let end = start.saturating_add(*length as usize).min(blk_bytes.len());
+                        blk_bytes[start..end].to_vec()
+                    } else {
+                        Vec::new()
+                    }
+                } else {
+                    Vec::new()
+                };
+                self.ensure_overlay_file_data(cx, overlay, *file_obj)?;
+                let _ = self.ensure_overlay_metadata(cx, overlay, *file_obj);
+                if let Some(buf) = overlay.file_data.get_mut(file_obj) {
+                    let end = (*offset as usize)
+                        .saturating_add(write_bytes.len())
+                        .min(MAX_READ_BYTES);
+                    if end > buf.len() {
+                        buf.resize(end, 0);
+                    }
+                    let start = (*offset as usize).min(end);
+                    let count = end - start;
+                    buf[start..end].copy_from_slice(&write_bytes[..count]);
+                    if let Some(meta) = overlay.objects.get_mut(file_obj) {
+                        meta.size = meta.size.max(buf.len() as u64);
+                    }
+                }
+            }
+            ZilRecordPayload::Truncate {
+                file_obj,
+                offset,
+                length,
+            } => {
+                self.ensure_overlay_file_data(cx, overlay, *file_obj)?;
+                let _ = self.ensure_overlay_metadata(cx, overlay, *file_obj);
+                if let Some(buf) = overlay.file_data.get_mut(file_obj) {
+                    if *length == 0 {
+                        buf.resize((*offset as usize).min(MAX_READ_BYTES), 0);
+                        if let Some(meta) = overlay.objects.get_mut(file_obj) {
+                            meta.size = *offset;
+                        }
+                    } else {
+                        let start = (*offset as usize).min(buf.len());
+                        let end = start.saturating_add(*length as usize).min(buf.len());
+                        buf[start..end].fill(0);
+                    }
+                }
+            }
+            ZilRecordPayload::Setattr {
+                file_obj,
+                mask,
+                mode,
+                uid,
+                gid,
+                size,
+                atime,
+                mtime,
+            } => {
+                let _ = self.ensure_overlay_metadata(cx, overlay, *file_obj);
+                if let Some(meta) = overlay.objects.get_mut(file_obj) {
+                    if mask & 1 != 0 {
+                        meta.mode = (*mode) & 0o7777;
+                    }
+                    if mask & 2 != 0 {
+                        meta.uid = *uid;
+                    }
+                    if mask & 4 != 0 {
+                        meta.gid = *gid;
+                    }
+                    if mask & 8 != 0 {
+                        meta.size = *size;
+                    }
+                    if mask & 16 != 0 {
+                        meta.times[0] = ffs_ondisk::zfs_zpl::Timestamp {
+                            seconds: i64::from_le_bytes(atime[0].to_le_bytes()),
+                            nanos: u32::try_from(atime[1]).unwrap_or(0).min(999_999_999),
+                        };
+                    }
+                    if mask & 32 != 0 {
+                        meta.times[1] = ffs_ondisk::zfs_zpl::Timestamp {
+                            seconds: i64::from_le_bytes(mtime[0].to_le_bytes()),
+                            nanos: u32::try_from(mtime[1]).unwrap_or(0).min(999_999_999),
+                        };
+                    }
+                }
+            }
+        }
+        Ok(())
     }
 
     #[must_use]
@@ -262,6 +601,18 @@ impl Zpl {
         if number == 0 {
             return Err(corrupt("meta-dnode is not a ZPL file"));
         }
+        if !private_xattr && let Some(ov) = &self.zil_overlay {
+            if ov.removed_objects.contains(&number) {
+                return Err(FfsError::NotFound(format!("ZFS object {number} removed in ZIL")));
+            }
+            if let Some(meta) = ov.objects.get(&number).cloned() {
+                let object = self.objects.load(cx, number).unwrap_or_else(|_| Object {
+                    node: self.objects.meta.clone(),
+                    ceiling: self.objects.root_birth,
+                });
+                return Ok((object, meta));
+            }
+        }
         let object = self.objects.load(cx, number)?;
         let node = &object.node;
         if !matches!(node.object_type(), 19 | 20) {
@@ -316,7 +667,16 @@ impl Zpl {
 
     pub fn stat(&mut self, cx: &Cx, number: u64) -> Result<(Metadata, u64)> {
         let (object, metadata) = self.file(cx, number)?;
-        Ok((metadata, object.node.used_bytes()))
+        let used = if self
+            .zil_overlay
+            .as_ref()
+            .is_some_and(|ov| ov.file_data.contains_key(&number))
+        {
+            metadata.size.next_multiple_of(512)
+        } else {
+            object.node.used_bytes()
+        };
+        Ok((metadata, used))
     }
 
     fn component(&self, name: &[u8]) -> Result<()> {
@@ -343,12 +703,50 @@ impl Zpl {
         if parent.kind != Kind::Directory {
             return Err(FfsError::NotDirectory);
         }
-        let entries = self.objects.zap(cx, number)?;
+        let entries = if self
+            .zil_overlay
+            .as_ref()
+            .is_some_and(|ov| ov.objects.contains_key(&number) && self.objects.load(cx, number).is_err())
+        {
+            Vec::new()
+        } else {
+            self.objects.zap(cx, number)?
+        };
+        let dir_overrides = self
+            .zil_overlay
+            .as_ref()
+            .and_then(|ov| ov.dir_entries.get(&number))
+            .cloned();
         let mut result = Vec::new();
         let mut directories = BTreeSet::new();
+        let mut seen_names = BTreeSet::new();
         let mut bytes = 0_usize;
         for entry in entries {
             checkpoint(cx)?;
+            if let Some(overrides) = &dir_overrides
+                && let Some(override_target) = overrides.get(&entry.name)
+            {
+                seen_names.insert(entry.name.clone());
+                let Some(object) = *override_target else {
+                    continue;
+                };
+                self.component(&entry.name)?;
+                let (_, metadata) = self.file(cx, object)?;
+                if metadata.kind == Kind::Directory
+                    && (object == self.root
+                        || object == number
+                        || metadata.parent != number
+                        || !directories.insert(object))
+                {
+                    return Err(corrupt("ZPL directory contains an alias or foreign parent"));
+                }
+                result.push(DirectoryEntry {
+                    name: entry.name,
+                    object,
+                    metadata,
+                });
+                continue;
+            }
             self.component(&entry.name)?;
             let (object, tag) = directory_reference(entry.value).map_err(|error| parse(&error))?;
             let (_, metadata) = self.file(cx, object)?;
@@ -375,6 +773,31 @@ impl Zpl {
                 metadata,
             });
         }
+        if let Some(overrides) = dir_overrides {
+            for (name, target_opt) in overrides {
+                if seen_names.contains(&name) {
+                    continue;
+                }
+                let Some(object) = target_opt else {
+                    continue;
+                };
+                self.component(&name)?;
+                let (_, metadata) = self.file(cx, object)?;
+                if metadata.kind == Kind::Directory
+                    && (object == self.root
+                        || object == number
+                        || metadata.parent != number
+                        || !directories.insert(object))
+                {
+                    return Err(corrupt("ZPL directory contains an alias or foreign parent"));
+                }
+                result.push(DirectoryEntry {
+                    name,
+                    object,
+                    metadata,
+                });
+            }
+        }
         checkpoint(cx)?;
         Ok(result)
     }
@@ -382,6 +805,7 @@ impl Zpl {
     fn contents(
         &mut self,
         cx: &Cx,
+        number: u64,
         object: &Object,
         file_size: u64,
         start: u64,
@@ -392,6 +816,15 @@ impl Zpl {
             return Err(unsupported("ZPL read exceeds 16 MiB"));
         }
         let length = file_size.saturating_sub(start).min(size as u64) as usize;
+        if let Some(ov) = &self.zil_overlay
+            && let Some(data) = ov.file_data.get(&number)
+        {
+            let mut result = vec![0_u8; length];
+            let s = (start as usize).min(data.len());
+            let e = s.saturating_add(length).min(data.len());
+            result[..e - s].copy_from_slice(&data[s..e]);
+            return Ok(result);
+        }
         let mut result = Vec::new();
         result
             .try_reserve_exact(length)
@@ -431,7 +864,7 @@ impl Zpl {
                 "read requires a regular ZPL file; links are not followed",
             ));
         }
-        self.contents(cx, &object, metadata.size, start, size)
+        self.contents(cx, number, &object, metadata.size, start, size)
     }
 
     pub fn readlink(&mut self, cx: &Cx, number: u64) -> Result<Vec<u8>> {
@@ -445,7 +878,7 @@ impl Zpl {
         let bytes = if let Some(bytes) = metadata.inline_symlink {
             bytes
         } else {
-            self.contents(cx, &object, metadata.size, 0, metadata.size as usize)?
+            self.contents(cx, number, &object, metadata.size, 0, metadata.size as usize)?
         };
         if bytes.contains(&0) {
             return Err(corrupt("ZPL symlink target contains NUL"));

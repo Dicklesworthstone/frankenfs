@@ -230,11 +230,294 @@ pub fn dnode_at(raw: &[u8], slot: usize, order: Endian) -> Result<Option<Dnode>,
     Err(invalid("unreachable dnode slot"))
 }
 
+/// Native ZFS Intent Log header (`zil_header_t`, 192 bytes at offset 512 of `objset_phys_t`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZilHeader {
+    pub claim_txg: u64,
+    pub replay_seq: u64,
+    pub log: BlockPointer,
+    pub claim_blk_seq: u64,
+    pub flags: u64,
+}
+
+impl ZilHeader {
+    pub fn parse(raw: &[u8], order: Endian) -> Result<Self, ParseError> {
+        if raw.len() < 192 {
+            return Err(invalid("truncated zil_header_t"));
+        }
+        let claim_txg = order.u64(raw, 0)?;
+        let replay_seq = order.u64(raw, 8)?;
+        let log = BlockPointer::parse(&raw[16..144], order)?;
+        let claim_blk_seq = order.u64(raw, 144)?;
+        let flags = order.u64(raw, 152)?;
+        Ok(Self {
+            claim_txg,
+            replay_seq,
+            log,
+            claim_blk_seq,
+            flags,
+        })
+    }
+
+    #[must_use]
+    pub fn has_unclaimed_log(&self) -> bool {
+        self.claim_txg == 0 && !self.log.hole()
+    }
+
+    #[must_use]
+    pub fn has_work(&self) -> bool {
+        !self.log.hole()
+    }
+}
+
+/// Decoded payload of one ZIL intent-log record (`lr_t` + operation-specific fields).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ZilRecordPayload {
+    Create {
+        dir_obj: u64,
+        file_obj: u64,
+        mode: u64,
+        uid: u64,
+        gid: u64,
+        generation: u64,
+        crtime: [u64; 2],
+        name: Vec<u8>,
+        symlink_target: Option<Vec<u8>>,
+        is_dir: bool,
+    },
+    Remove {
+        dir_obj: u64,
+        name: Vec<u8>,
+        is_dir: bool,
+    },
+    Rename {
+        src_dir_obj: u64,
+        dst_dir_obj: u64,
+        src_name: Vec<u8>,
+        dst_name: Vec<u8>,
+    },
+    Write {
+        file_obj: u64,
+        offset: u64,
+        length: u64,
+        blkoff: u64,
+        blkptr: BlockPointer,
+        inline_data: Vec<u8>,
+    },
+    Truncate {
+        file_obj: u64,
+        offset: u64,
+        length: u64,
+    },
+    Setattr {
+        file_obj: u64,
+        mask: u64,
+        mode: u64,
+        uid: u64,
+        gid: u64,
+        size: u64,
+        atime: [u64; 2],
+        mtime: [u64; 2],
+    },
+}
+
+/// One validated ZIL log record (`lr_t`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZilRecord {
+    pub txtype: u64,
+    pub reclen: u64,
+    pub txg: u64,
+    pub seq: u64,
+    pub payload: ZilRecordPayload,
+}
+
+/// One parsed ZIL log block (`lr_t` records + trailing 184-byte `zil_chain_t`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ZilBlock {
+    pub next_blk: BlockPointer,
+    pub nused: u64,
+    pub records: Vec<ZilRecord>,
+}
+
+fn cstr_pair(bytes: &[u8]) -> Result<(Vec<u8>, Option<Vec<u8>>), ParseError> {
+    let first_nul = bytes
+        .iter()
+        .position(|&b| b == 0)
+        .ok_or_else(|| invalid("unterminated ZIL record name"))?;
+    let first = bytes[..first_nul].to_vec();
+    if first.is_empty() {
+        return Err(invalid("empty ZIL record name"));
+    }
+    let rest = &bytes[first_nul + 1..];
+    let second = rest
+        .iter()
+        .position(|&b| b == 0)
+        .map(|end| rest[..end].to_vec())
+        .filter(|s| !s.is_empty());
+    Ok((first, second))
+}
+
+impl ZilBlock {
+    pub fn parse(raw: &[u8], order: Endian) -> Result<Self, ParseError> {
+        if raw.len() < 512 || !raw.len().is_multiple_of(512) || raw.len() > MAX_BLOCK_BYTES {
+            return Err(invalid("invalid ZIL block size"));
+        }
+        let trailer_start = raw.len() - 184;
+        let trailer = &raw[trailer_start..];
+        let next_blk = BlockPointer::parse(&trailer[8..136], order)?;
+        let nused = order.u64(trailer, 136)?;
+        let records_limit = (nused as usize).min(trailer_start);
+        let mut pos = 0_usize;
+        let mut records = Vec::new();
+        while pos + 32 <= records_limit {
+            let txtype = order.u64(raw, pos)?;
+            let reclen = order.u64(raw, pos + 8)?;
+            let txg = order.u64(raw, pos + 16)?;
+            let seq = order.u64(raw, pos + 24)?;
+            if txtype == 0 || reclen < 32 || !reclen.is_multiple_of(8) {
+                break;
+            }
+            let rec_end = pos
+                .checked_add(reclen as usize)
+                .filter(|&end| end <= records_limit)
+                .ok_or_else(|| invalid("ZIL record exceeds block used bytes"))?;
+            let rec = &raw[pos..rec_end];
+            let payload = match txtype & 0x1f {
+                1 | 2 | 4 | 14..=19 => {
+                    if rec.len() < 104 {
+                        return Err(invalid("truncated ZIL lr_create_t"));
+                    }
+                    let dir_obj = order.u64(rec, 32)?;
+                    let file_obj = order.u64(rec, 40)? & ((1_u64 << 48) - 1);
+                    let mode = order.u64(rec, 48)?;
+                    let uid = order.u64(rec, 56)?;
+                    let gid = order.u64(rec, 64)?;
+                    let generation = order.u64(rec, 72)?;
+                    let crtime = [order.u64(rec, 80)?, order.u64(rec, 88)?];
+                    let (name, symlink_target) = cstr_pair(&rec[104..])?;
+                    let is_dir = matches!(txtype & 0x1f, 2 | 17..=19) || (mode & 0o170_000) == 0o040_000;
+                    ZilRecordPayload::Create {
+                        dir_obj,
+                        file_obj,
+                        mode,
+                        uid,
+                        gid,
+                        generation,
+                        crtime,
+                        name,
+                        symlink_target,
+                        is_dir,
+                    }
+                }
+                5 | 6 => {
+                    if rec.len() < 40 {
+                        return Err(invalid("truncated ZIL lr_remove_t"));
+                    }
+                    let dir_obj = order.u64(rec, 32)?;
+                    let (name, _) = cstr_pair(&rec[40..])?;
+                    ZilRecordPayload::Remove {
+                        dir_obj,
+                        name,
+                        is_dir: (txtype & 0x1f) == 6,
+                    }
+                }
+                8 => {
+                    if rec.len() < 48 {
+                        return Err(invalid("truncated ZIL lr_rename_t"));
+                    }
+                    let src_dir_obj = order.u64(rec, 32)?;
+                    let dst_dir_obj = order.u64(rec, 40)?;
+                    let (src_name, dst_opt) = cstr_pair(&rec[48..])?;
+                    let dst_name = dst_opt.ok_or_else(|| invalid("missing destination name in ZIL lr_rename_t"))?;
+                    ZilRecordPayload::Rename {
+                        src_dir_obj,
+                        dst_dir_obj,
+                        src_name,
+                        dst_name,
+                    }
+                }
+                9 | 20 => {
+                    if rec.len() < 192 {
+                        return Err(invalid("truncated ZIL lr_write_t"));
+                    }
+                    let file_obj = order.u64(rec, 32)?;
+                    let offset = order.u64(rec, 40)?;
+                    let length = order.u64(rec, 48)?;
+                    let blkoff = order.u64(rec, 56)?;
+                    let blkptr = BlockPointer::parse(&rec[64..192], order)?;
+                    let inline_data = if rec.len() > 192 {
+                        let avail = (rec.len() - 192).min(length as usize);
+                        rec[192..192 + avail].to_vec()
+                    } else {
+                        Vec::new()
+                    };
+                    ZilRecordPayload::Write {
+                        file_obj,
+                        offset,
+                        length,
+                        blkoff,
+                        blkptr,
+                        inline_data,
+                    }
+                }
+                10 => {
+                    if rec.len() < 56 {
+                        return Err(invalid("truncated ZIL lr_truncate_t"));
+                    }
+                    ZilRecordPayload::Truncate {
+                        file_obj: order.u64(rec, 32)?,
+                        offset: order.u64(rec, 40)?,
+                        length: order.u64(rec, 48)?,
+                    }
+                }
+                11 => {
+                    if rec.len() < 96 {
+                        return Err(invalid("truncated ZIL lr_setattr_t"));
+                    }
+                    let mtime = if rec.len() >= 112 {
+                        [order.u64(rec, 96)?, order.u64(rec, 104)?]
+                    } else {
+                        [0, 0]
+                    };
+                    ZilRecordPayload::Setattr {
+                        file_obj: order.u64(rec, 32)?,
+                        mask: order.u64(rec, 40)?,
+                        mode: order.u64(rec, 48)?,
+                        uid: order.u64(rec, 56)?,
+                        gid: order.u64(rec, 64)?,
+                        size: order.u64(rec, 72)?,
+                        atime: [order.u64(rec, 80)?, order.u64(rec, 88)?],
+                        mtime,
+                    }
+                }
+                _ => {
+                    pos = rec_end;
+                    continue;
+                }
+            };
+            records.push(ZilRecord {
+                txtype,
+                reclen,
+                txg,
+                seq,
+                payload,
+            });
+            pos = rec_end;
+        }
+        Ok(Self {
+            next_blk,
+            nused,
+            records,
+        })
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct ObjectSet {
     pub kind: u64,
     pub flags: u64,
     pub meta: Dnode,
+    pub zil_header: ZilHeader,
 }
 
 impl ObjectSet {
@@ -255,7 +538,13 @@ impl ObjectSet {
         {
             return Err(invalid("object set has an invalid meta-dnode"));
         }
-        Ok(Self { kind, flags, meta })
+        let zil_header = ZilHeader::parse(&raw[512..704], order)?;
+        Ok(Self {
+            kind,
+            flags,
+            meta,
+            zil_header,
+        })
     }
 }
 

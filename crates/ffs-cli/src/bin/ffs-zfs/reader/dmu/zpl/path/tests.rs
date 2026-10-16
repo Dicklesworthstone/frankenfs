@@ -198,7 +198,7 @@ fn build(specs: &BTreeMap<u64, Spec>, order: Endian, fault: Fault) -> (Zpl, Read
         txg: 40, root_birth: 35, meta: Dnode::parse(&meta, payload).unwrap(),
         cache: VecDeque::new(), cached_bytes: 0,
     };
-    let view = Zpl::open(&cx, objects, 987, 4096, None).unwrap();
+    let view = Zpl::open(&cx, objects, 987, 4096, ffs_ondisk::zfs_dmu::ZilHeader::parse(&[0_u8; 192], order).unwrap(), None).unwrap();
     (view, reads)
 }
 
