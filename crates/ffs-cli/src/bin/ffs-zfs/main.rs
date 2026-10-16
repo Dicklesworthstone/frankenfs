@@ -7,6 +7,7 @@ macro_rules! companion_bin_tests {
     };
 }
 
+mod allocation_commands;
 mod file_commands;
 mod filesystem;
 mod properties_commands;
@@ -173,6 +174,8 @@ impl CandidateArgs {
 #[derive(Debug, Subcommand)]
 enum Command {
     #[command(flatten)]
+    Allocation(allocation_commands::AllocationCommand),
+    #[command(flatten)]
     File(file_commands::FileCommand),
     #[command(flatten)]
     Properties(properties_commands::PropertyCommand),
@@ -225,6 +228,7 @@ fn main() -> Result<()> {
     let cli = Cli::parse();
     let cx = Cx::for_request();
     match cli.command {
+        Command::Allocation(command) => command.run(&cx)?,
         Command::File(command) => command.run(&cx)?,
         Command::Properties(command) => command.run(&cx)?,
         Command::Inspect { image } => {
