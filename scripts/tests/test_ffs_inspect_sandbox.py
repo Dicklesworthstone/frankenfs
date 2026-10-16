@@ -14,7 +14,11 @@ import io
 import json
 import os
 from pathlib import Path
+import re
+import resource
 import stat
+import struct
+import subprocess
 import sys
 import tempfile
 import time
@@ -65,7 +69,9 @@ class PolicyTests(unittest.TestCase):
 
     def test_namespace_policy_has_no_host_root_home_network_or_writable_input_bind(self):
         argv = sandbox.sandbox_argv(Path("/usr/bin/bwrap"), 8, [("disk", 9)],
-                                    ["inspect", "/inputs/disk"], sandbox.Limits(), 10, 11, 12, 13)
+                                    ["inspect", "/inputs/disk"], sandbox.Limits(), 10, 11, 12, 13, 14)
+        self.assertEqual(argv[argv.index("--seccomp") + 1], "14")
+        self.assertLess(argv.index("--seccomp"), argv.index("--"))
         for flag in ["--unshare-user", "--unshare-pid", "--unshare-net", "--unshare-ipc", "--unshare-uts",
                      "--disable-userns", "--assert-userns-disabled", "--clearenv", "--new-session", "--die-with-parent"]:
             self.assertIn(flag, argv)
@@ -95,6 +101,94 @@ class PolicyTests(unittest.TestCase):
         for name in dataclasses.asdict(sandbox.Limits()):
             with self.assertRaises(sandbox.Refusal):
                 dataclasses.replace(sandbox.Limits(), **{name: 0}).validate()
+
+
+SECCOMP_DATA = struct.Struct("=iIQ6Q")  # struct seccomp_data
+RET_KILL, RET_ALLOW, RET_EPERM = 0x80000000, 0x7FFF0000, 0x00050000 | errno.EPERM
+
+
+def run_classic_bpf(program: bytes, nr: int, arch: int, args=(0, 0, 0, 0, 0, 0)) -> int:
+    """Interpret the four opcodes the filter uses, exactly as the kernel would."""
+    data = SECCOMP_DATA.pack(nr, arch, 0, *args)
+    accumulator, pc = 0, 0
+    instructions = [struct.unpack_from("=HBBI", program, at) for at in range(0, len(program), 8)]
+    while True:
+        code, jt, jf, k = instructions[pc]
+        if code == 0x20:
+            accumulator = struct.unpack_from("=I", data, k)[0]
+            pc += 1
+        elif code in (0x15, 0x35):
+            taken = accumulator == k if code == 0x15 else accumulator >= k
+            pc += 1 + (jt if taken else jf)
+        elif code == 0x06:
+            return k
+        else:
+            raise AssertionError(f"unexpected BPF opcode {code:#x}")
+
+
+class SeccompTests(unittest.TestCase):
+    HEADERS = {"x86_64": Path("/usr/include/x86_64-linux-gnu/asm/unistd_64.h"),
+               "aarch64": Path("/usr/include/asm-generic/unistd.h")}
+
+    def test_syscall_numbers_match_installed_kernel_uapi_headers(self):
+        checked = 0
+        for machine, header in self.HEADERS.items():
+            if not header.exists():
+                continue
+            column = sandbox.SECCOMP_ARCHES[machine][0]
+            defined = {m.group(1): int(m.group(2)) for m in
+                       re.finditer(r"^#define __NR_(\w+)\s+(\d+)\s*$", header.read_text(), re.M)}
+            for name, numbers in sandbox.DENIED_SYSCALLS.items():
+                expected = numbers[column]
+                if expected is None:
+                    self.assertNotIn(name, defined, f"{machine} defines {name}")
+                else:
+                    self.assertEqual(defined.get(name), expected, f"{machine} {name}")
+            self.assertEqual(defined["ioctl"], sandbox.SECCOMP_ARCHES[machine][2])
+            checked += 1
+        if checked == 0:
+            self.skipTest("no kernel UAPI syscall headers installed")
+
+    def test_filter_is_a_wellformed_forward_only_program(self):
+        for machine in sandbox.SECCOMP_ARCHES:
+            program = sandbox.seccomp_filter(machine)
+            self.assertEqual(len(program) % 8, 0)
+            count = len(program) // 8
+            self.assertLessEqual(count, 4096)
+            for index in range(count):
+                code, jt, jf, _ = struct.unpack_from("=HBBI", program, index * 8)
+                self.assertIn(code, (0x20, 0x15, 0x35, 0x06))
+                if code in (0x15, 0x35):
+                    self.assertLess(index + 1 + max(jt, jf), count)
+            self.assertEqual(struct.unpack_from("=HBBI", program, len(program) - 8)[0], 0x06)
+
+    def test_filter_kills_foreign_abis_denies_the_list_and_allows_the_rest(self):
+        for machine, (column, arch, ioctl) in sandbox.SECCOMP_ARCHES.items():
+            program = sandbox.seccomp_filter(machine)
+            for name, numbers in sandbox.DENIED_SYSCALLS.items():
+                if numbers[column] is not None:
+                    self.assertEqual(run_classic_bpf(program, numbers[column], arch), RET_EPERM, name)
+            denied = {numbers[column] for numbers in sandbox.DENIED_SYSCALLS.values()}
+            for nr in range(0, 470):
+                if nr not in denied and nr != ioctl:
+                    self.assertEqual(run_classic_bpf(program, nr, arch), RET_ALLOW, f"{machine} {nr}")
+            other = 0xC00000B7 if machine == "x86_64" else 0xC000003E
+            self.assertEqual(run_classic_bpf(program, 0, other), RET_KILL)
+            self.assertEqual(run_classic_bpf(program, 0, 0x40000003), RET_KILL)  # i386
+            for request, verdict in [(0x5412, RET_EPERM), (0x541C, RET_EPERM), (0x5401, RET_ALLOW),
+                                     ((0xFFFFFFFF << 32) | 0x5412, RET_EPERM)]:
+                self.assertEqual(run_classic_bpf(program, ioctl, arch, (1, request, 0, 0, 0, 0)), verdict)
+        x86 = sandbox.seccomp_filter("x86_64")
+        self.assertEqual(run_classic_bpf(x86, 0x40000000 | 41, 0xC000003E), RET_KILL)  # x32 socket
+
+    def test_unknown_architecture_is_refused_and_policy_is_recorded(self):
+        with self.assertRaises(sandbox.Refusal):
+            sandbox.seccomp_filter("mips")
+        program = sandbox.seccomp_filter("x86_64")
+        policy = sandbox.seccomp_policy("x86_64", program)
+        self.assertEqual(policy["sha256"], hashlib.sha256(program).hexdigest())
+        self.assertIn("socket", policy["denied_syscalls"])
+        self.assertNotIn("uselib", sandbox.seccomp_policy("aarch64", sandbox.seccomp_filter("aarch64"))["denied_syscalls"])
 
 
 class FileTests(unittest.TestCase):
@@ -215,14 +309,22 @@ class FileTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "did not isolate"):
             inner.verify_containment(namespaces)
 
-    def test_inner_checks_capabilities_and_no_new_privileges_after_namespace_checks(self):
+    def test_inner_checks_capabilities_no_new_privileges_and_filter_after_namespace_checks(self):
         namespaces = {name: -1 for name in ("mnt", "user", "pid", "net", "ipc", "uts")}
-        for status in ["NoNewPrivs:\t0\nCapEff:\t0\nCapPrm:\t0\nCapAmb:\t0\nCapBnd:\t0\n",
-                       "NoNewPrivs:\t1\nCapEff:\t1\nCapPrm:\t0\nCapAmb:\t0\nCapBnd:\t0\n"]:
+        good = "NoNewPrivs:\t1\nCapEff:\t0\nCapPrm:\t0\nCapAmb:\t0\nCapBnd:\t0\nSeccomp:\t2\n"
+        for status in [good.replace("NoNewPrivs:\t1", "NoNewPrivs:\t0"),
+                       good.replace("CapEff:\t0", "CapEff:\t1"),
+                       good.replace("Seccomp:\t2", "Seccomp:\t0"),
+                       good.replace("Seccomp:\t2\n", "")]:
             with mock.patch("builtins.open", mock.mock_open(read_data=status)), self.assertRaises(ValueError):
                 inner.verify_containment(namespaces)
-        with mock.patch("builtins.open", mock.mock_open(read_data="NoNewPrivs:\t1\nCapEff:\t0\nCapPrm:\t0\nCapAmb:\t0\nCapBnd:\t0\n")):
+        with mock.patch("builtins.open", mock.mock_open(read_data=good)):
             inner.verify_containment(namespaces)
+
+    def test_inner_process_limit_rejects_invalid_values(self):
+        for value in [None, "64", 3, 0, -1, True, 4.0]:
+            with self.assertRaisesRegex(ValueError, "process limit"):
+                inner.restrict_processes(value)
 
 
 class SupervisorTests(unittest.TestCase):
@@ -254,6 +356,14 @@ class SupervisorTests(unittest.TestCase):
         result, out, _ = self.run_child("import resource,json; print(json.dumps([resource.getrlimit(resource.RLIMIT_NOFILE),resource.getrlimit(resource.RLIMIT_CORE)]))")
         self.assertEqual(result["exit_code"], 0)
         self.assertEqual(json.loads(out), [[64, 64], [0, 0]])
+
+    def test_outer_child_keeps_the_account_task_limit_so_namespaces_can_be_created(self):
+        # A per-UID RLIMIT_NPROC on bubblewrap counts every task of the account
+        # and makes namespace creation fail on a busy host. The cap is applied
+        # inside the sandbox user namespace instead (see the live tests).
+        result, out, _ = self.run_child("import resource,json; print(json.dumps(resource.getrlimit(resource.RLIMIT_NPROC)))")
+        self.assertEqual(result["exit_code"], 0)
+        self.assertEqual(json.loads(out), list(resource.getrlimit(resource.RLIMIT_NPROC)))
 
     def test_combined_output_limit_kills_actual_flooding_child(self):
         result, out, err = self.run_child("import os\nwhile True:\n os.write(1,b'x'*4096)\n os.write(2,b'y'*4096)", cap=7000)
@@ -292,6 +402,164 @@ class SupervisorTests(unittest.TestCase):
         result, out, _ = self.run_child(program)
         self.assertEqual(result["exit_code"], 0)
         self.assertEqual(json.loads(out), [True, False])
+
+
+LIVE_PROBE = r"""
+import ctypes, errno, importlib.util, json, os, socket, threading
+out = {}
+status = dict(line.rstrip().split(":", 1) for line in open("/proc/self/status") if ":" in line)
+for key in ("Seccomp", "NoNewPrivs", "CapEff", "CapBnd"):
+    out[key] = status[key].strip()
+def errno_of(action):
+    try:
+        action()
+        return 0
+    except OSError as error:
+        return error.errno
+out["socket_unix"] = errno_of(lambda: socket.socket(socket.AF_UNIX).close())
+out["socket_inet"] = errno_of(lambda: socket.socket(socket.AF_INET).close())
+libc = ctypes.CDLL(None, use_errno=True)
+libc.syscall.restype = ctypes.c_long
+def raw(number, *args):
+    result = libc.syscall(ctypes.c_long(number), *(ctypes.c_long(a) for a in args))
+    return 0 if result != -1 else ctypes.get_errno()
+numbers = {"x86_64": {"personality": 135, "keyctl": 250, "unshare": 272, "getpid": 39},
+           "aarch64": {"personality": 92, "keyctl": 219, "unshare": 97, "getpid": 172}}[os.uname().machine]
+out["personality"] = raw(numbers["personality"], 0xFFFFFFFF)
+out["keyctl"] = raw(numbers["keyctl"], 0, -3, 0)
+out["unshare"] = raw(numbers["unshare"], 0x00020000)
+out["getpid"] = raw(numbers["getpid"])
+out["root"] = sorted(os.listdir("/"))
+out["visible"] = {path: os.path.exists(path) for path in ("/home", "/etc", "/root", "/dev/fuse", "/run")}
+out["input_write"] = errno_of(lambda: open("/inputs/disk", "r+b").close())
+out["input_bytes"] = open("/inputs/disk", "rb").read()
+out["input_bytes"] = len(out["input_bytes"])
+out["interfaces"] = sorted(line.split(":")[0].strip() for line in open("/proc/net/dev").readlines()[2:])
+spec = importlib.util.spec_from_file_location("verify", "/app/verify.py")
+verify = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(verify)
+verify.restrict_processes(8)
+def spawn(count):
+    stop, started = threading.Event(), []
+    try:
+        for _ in range(count):
+            thread = threading.Thread(target=stop.wait)
+            thread.start()
+            started.append(thread)
+    except RuntimeError:
+        pass
+    stop.set()
+    for thread in started:
+        thread.join()
+    return len(started)
+out["threads_4"], out["threads_20"] = spawn(4), spawn(20)
+print(json.dumps(out))
+"""
+
+
+def live_sandbox_unavailable() -> str | None:
+    """Why real bubblewrap cannot run here; FFS_REQUIRE_SANDBOX=1 makes it fatal."""
+    bwrap = Path("/usr/bin/bwrap")
+    if sys.platform != "linux" or os.geteuid() == 0:
+        reason = "live sandbox tests need an ordinary non-root Linux user"
+    elif not bwrap.exists():
+        reason = "bubblewrap is not installed at /usr/bin/bwrap"
+    else:
+        probe = subprocess.run([str(bwrap), "--unshare-user", "--unshare-pid", "--unshare-net",
+                                "--ro-bind", "/", "/", "--", "/usr/bin/python3", "-I", "-c", "pass"],
+                               capture_output=True, check=False, timeout=30)
+        reason = None if probe.returncode == 0 else f"bubblewrap cannot create namespaces: {probe.stderr[-200:]!r}"
+    if reason and os.environ.get("FFS_REQUIRE_SANDBOX") == "1":
+        raise AssertionError(f"FFS_REQUIRE_SANDBOX=1 but {reason}")
+    return reason
+
+
+def plain_true_executable() -> Path | None:
+    # Multicall coreutils dispatch on argv[0], which the launcher sets to /app/reader.
+    for candidate in (Path("/usr/bin/gnutrue"), Path("/usr/bin/true"), Path("/bin/true")):
+        if candidate.exists():
+            resolved = candidate.resolve()
+            if resolved.name in {"true", "gnutrue"} and resolved.read_bytes()[:4] == b"\x7fELF":
+                return resolved
+    return None
+
+
+class LiveSandboxTests(unittest.TestCase):
+    """Kernel-enforced behavior through real bubblewrap, not mocks."""
+
+    def setUp(self):
+        reason = live_sandbox_unavailable()
+        if reason:
+            self.skipTest(reason)
+        self.directory = Path(tempfile.mkdtemp(prefix="ffs-inspect-live-"))
+        self.input = self.directory / "disk.img"
+        self.content = os.urandom(12345)
+        self.input.write_bytes(self.content)
+
+    def test_live_policy_enforces_namespaces_filter_read_only_inputs_and_task_cap(self):
+        python = Path("/usr/bin/python3").resolve()
+        with contextlib.ExitStack() as stack:
+            binary_fd = sandbox.pin_file(stack, python, executable=True)
+            python_fd = sandbox.pin_file(stack, python, executable=True)
+            disk_fd = sandbox.pin_file(stack, self.input)
+            inner_fd = sandbox.sealed_data(stack, SOURCE.with_name("ffs_inspect_sandbox_inner.py").read_bytes())
+            config_fd = sandbox.sealed_data(stack, b"{}")
+            seccomp_fd = sandbox.sealed_data(stack, sandbox.seccomp_filter(os.uname().machine))
+            status = os.pipe2(os.O_CLOEXEC)
+            argv = sandbox.sandbox_argv(Path("/usr/bin/bwrap"), binary_fd, [("disk", disk_fd)],
+                                        ["inspect", "/inputs/disk"], sandbox.Limits(), status[1],
+                                        python_fd, inner_fd, config_fd, seccomp_fd)
+            # Same policy; replace only the verifier invocation with the probe.
+            argv = argv[:argv.index("--") + 1] + ["/app/python", "-I", "-S", "-c", LIVE_PROBE]
+            out, err = io.BytesIO(), io.BytesIO()
+            result = sandbox._supervise(argv, (binary_fd, python_fd, disk_fd, inner_fd, config_fd,
+                                               seccomp_fd, status[1]),
+                                        {"stdout": out, "stderr": err}, sandbox.Limits(),
+                                        time.monotonic() + 60, status)
+        self.assertEqual(result["exit_code"], 0, err.getvalue()[-2000:])
+        self.assertTrue(sandbox.status_confirms_execution(result["sandbox_status"], 0))
+        probe = json.loads(out.getvalue())
+        self.assertEqual(probe["Seccomp"], "2")
+        self.assertEqual(probe["NoNewPrivs"], "1")
+        self.assertEqual(int(probe["CapEff"], 16), 0)
+        self.assertEqual(int(probe["CapBnd"], 16), 0)
+        # Both succeed without the filter, even in an empty network namespace.
+        self.assertEqual(probe["socket_unix"], errno.EPERM)
+        self.assertEqual(probe["personality"], errno.EPERM)
+        for name in ("socket_inet", "keyctl", "unshare"):
+            self.assertEqual(probe[name], errno.EPERM, name)
+        self.assertEqual(probe["getpid"], 0)
+        self.assertFalse(any(probe["visible"].values()), probe["visible"])
+        self.assertTrue(set(probe["root"]) <= {"app", "inputs", "usr", "dev", "proc", "tmp", "lib", "lib64"},
+                        probe["root"])
+        self.assertEqual(probe["input_write"], errno.EROFS)
+        self.assertEqual(probe["input_bytes"], len(self.content))
+        self.assertEqual(probe["interfaces"], ["lo"])
+        # The cap counts this sandbox only, not the host account's other tasks.
+        self.assertEqual(probe["threads_4"], 4)
+        self.assertLess(probe["threads_20"], 8)
+        self.assertEqual(self.input.read_bytes(), self.content)
+
+    def test_live_end_to_end_execution_succeeds_and_records_the_enforced_policy(self):
+        reader = plain_true_executable()
+        if reader is None:
+            if os.environ.get("FFS_REQUIRE_SANDBOX") == "1":
+                self.fail("FFS_REQUIRE_SANDBOX=1 but no single-purpose ELF true is installed")
+            self.skipTest("no single-purpose ELF true to stand in for a reader")
+        output = self.directory / "evidence"
+        code = sandbox.execute(reader, "ffs-cli", [("disk", self.input)], ["inspect", "@disk"],
+                               output, sandbox.Limits(), Path("/usr/bin/bwrap"))
+        result = json.loads((output / "result.json").read_text())
+        request = json.loads((output / "request.json").read_text())
+        self.assertEqual(code, 0, result)
+        self.assertTrue(result["success"])
+        self.assertTrue(result["execution_confirmed"])
+        self.assertTrue(result["reader_and_inputs_unchanged"])
+        self.assertEqual(result["inputs"][0]["sha256_after"], hashlib.sha256(self.content).hexdigest())
+        self.assertEqual(request["policy"], sandbox.POLICY)
+        program = sandbox.seccomp_filter(os.uname().machine)
+        self.assertEqual(request["seccomp"]["sha256"], hashlib.sha256(program).hexdigest())
+        self.assertEqual(stat.S_IMODE(output.stat().st_mode), 0o700)
 
 
 if __name__ == "__main__":

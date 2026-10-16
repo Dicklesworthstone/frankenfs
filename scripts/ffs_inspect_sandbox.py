@@ -10,6 +10,7 @@ from __future__ import annotations
 import argparse
 import contextlib
 import dataclasses
+import errno
 import fcntl
 import hashlib
 import json
@@ -19,6 +20,7 @@ import resource
 import selectors
 import signal
 import stat
+import struct
 import subprocess
 import sys
 import time
@@ -33,6 +35,46 @@ TOOLS = {
 FORBIDDEN = frozenset({"--rw", "--allow-repair", "--reclaim-lost", "--salvage-to"})
 MIB = 1024 * 1024
 CHUNK = 64 * 1024
+POLICY = "ffs-offline-reader-v2"
+
+# Syscalls an offline reader never needs, refused with EPERM by a seccomp filter
+# that bubblewrap installs beneath the namespaces, capability drop and
+# no-new-privileges. Numbers per architecture: (x86_64, aarch64); None = absent.
+# Sources: arch/x86/entry/syscalls/syscall_64.tbl and
+# include/uapi/asm-generic/unistd.h. Tests re-check them against installed
+# kernel UAPI headers.
+DENIED_SYSCALLS = {
+    # Networking: offline readers have no network authority.
+    "socket": (41, 198), "socketpair": (53, 199), "connect": (42, 203), "bind": (49, 200),
+    "listen": (50, 201), "accept": (43, 202), "accept4": (288, 242),
+    # Other processes' memory and descriptors.
+    "ptrace": (101, 117), "process_vm_readv": (310, 270), "process_vm_writev": (311, 271),
+    "process_madvise": (440, 440), "kcmp": (312, 272), "pidfd_getfd": (438, 438),
+    # Mount and namespace changes, including the descriptor-based mount API.
+    "mount": (165, 40), "umount2": (166, 39), "pivot_root": (155, 41), "chroot": (161, 51),
+    "unshare": (272, 97), "setns": (308, 268), "fsopen": (430, 430), "fsconfig": (431, 431),
+    "fsmount": (432, 432), "fspick": (433, 433), "move_mount": (429, 429),
+    "open_tree": (428, 428), "mount_setattr": (442, 442),
+    # Handle-based opens bypass path confinement.
+    "name_to_handle_at": (303, 264), "open_by_handle_at": (304, 265),
+    # Kernel attack surface no reader uses.
+    "bpf": (321, 280), "perf_event_open": (298, 241), "userfaultfd": (323, 282),
+    "io_uring_setup": (425, 425), "io_uring_enter": (426, 426), "io_uring_register": (427, 427),
+    "keyctl": (250, 219), "add_key": (248, 217), "request_key": (249, 218),
+    "fanotify_init": (300, 262), "memfd_secret": (447, 447), "personality": (135, 92),
+    "lookup_dcookie": (212, 18), "syslog": (103, 116), "vhangup": (153, 58),
+    "uselib": (134, None), "ioperm": (173, None), "iopl": (172, None), "_sysctl": (156, None),
+    # Host administration.
+    "kexec_load": (246, 104), "kexec_file_load": (320, 294), "init_module": (175, 105),
+    "finit_module": (313, 273), "delete_module": (176, 106), "swapon": (167, 224),
+    "swapoff": (168, 225), "reboot": (169, 142), "acct": (163, 89), "quotactl": (179, 60),
+    "quotactl_fd": (443, 443), "settimeofday": (164, 170), "clock_settime": (227, 112),
+    "adjtimex": (159, 171), "clock_adjtime": (305, 266),
+}
+# uname machine -> (DENIED_SYSCALLS column, AUDIT_ARCH_*, ioctl number).
+SECCOMP_ARCHES = {"x86_64": (0, 0xC000003E, 16), "aarch64": (1, 0xC00000B7, 29)}
+# TIOCSTI and TIOCLINUX inject input into a terminal; refused on any descriptor.
+DENIED_IOCTLS = {"TIOCSTI": 0x5412, "TIOCLINUX": 0x541C}
 
 
 class Refusal(Exception):
@@ -139,9 +181,50 @@ def reader_arguments(tool: str, args: list[str], names: set[str]) -> list[str]:
     return result
 
 
+def seccomp_filter(machine: str) -> bytes:
+    """Classic BPF for `bwrap --seccomp`: kill foreign ABIs, EPERM the denylist.
+
+    Every jump is forward and short, so the program is a straight line a reader
+    can audit: architecture check, x32 check (x86_64), one equality test per
+    denied syscall, then the ioctl request filter. Anything else is allowed.
+    """
+    if machine not in SECCOMP_ARCHES:
+        raise Refusal(f"no reviewed syscall filter for architecture {machine}")
+    column, audit_arch, ioctl = SECCOMP_ARCHES[machine]
+
+    def op(code: int, k: int, jt: int = 0, jf: int = 0) -> bytes:
+        return struct.pack("=HBBI", code, jt, jf, k)  # struct sock_filter
+
+    load, equal, at_least, ret = 0x20, 0x15, 0x35, 0x06  # LD|W|ABS, JEQ|K, JGE|K, RET|K
+    kill, deny, allow = 0x80000000, 0x00050000 | errno.EPERM, 0x7FFF0000
+    # struct seccomp_data: nr @0, arch @4, args[1] low word @24 (little-endian).
+    program = [op(load, 4), op(equal, audit_arch, 1), op(ret, kill), op(load, 0)]
+    if machine == "x86_64":  # x32 shares AUDIT_ARCH_X86_64 but sets bit 30.
+        program += [op(at_least, 0x40000000, 0, 1), op(ret, kill)]
+    for name in sorted(DENIED_SYSCALLS):
+        number = DENIED_SYSCALLS[name][column]
+        if number is not None:
+            program += [op(equal, number, 0, 1), op(ret, deny)]
+    program += [op(equal, ioctl, 0, 4), op(load, 24),
+                op(equal, DENIED_IOCTLS["TIOCSTI"], 1),
+                op(equal, DENIED_IOCTLS["TIOCLINUX"], 0, 1),
+                op(ret, deny), op(ret, allow)]
+    return b"".join(program)
+
+
+def seccomp_policy(machine: str, program: bytes) -> dict:
+    column = SECCOMP_ARCHES[machine][0]
+    return {"architecture": machine, "sha256": hashlib.sha256(program).hexdigest(),
+            "instructions": len(program) // 8, "default": "allow",
+            "foreign_abi": "kill_process", "denied_errno": "EPERM",
+            "denied_syscalls": sorted(n for n, numbers in DENIED_SYSCALLS.items()
+                                      if numbers[column] is not None),
+            "denied_ioctls": sorted(DENIED_IOCTLS)}
+
+
 def sandbox_argv(bwrap: Path, binary_fd: int, inputs: list[tuple[str, int]],
                  args: list[str], limits: Limits, status_fd: int,
-                 python_fd: int, inner_fd: int, config_fd: int) -> list[str]:
+                 python_fd: int, inner_fd: int, config_fd: int, seccomp_fd: int) -> list[str]:
     argv = [str(bwrap), "--unshare-user", "--unshare-pid", "--unshare-net",
             "--unshare-ipc", "--unshare-uts", "--disable-userns", "--assert-userns-disabled",
             "--new-session", "--die-with-parent", "--cap-drop", "ALL", "--clearenv",
@@ -168,6 +251,7 @@ def sandbox_argv(bwrap: Path, binary_fd: int, inputs: list[tuple[str, int]],
     for name, fd in inputs:
         argv += ["--ro-bind", f"/proc/self/fd/{fd}", f"/inputs/{name}"]
     argv += ["--chdir", "/tmp", "--remount-ro", "/", "--json-status-fd", str(status_fd),
+             "--seccomp", str(seccomp_fd),
              "--", "/app/python", "-I", "-S", "/app/verify.py", "/app/config.json"]
     return argv
 
@@ -190,10 +274,13 @@ def sealed_data(stack: contextlib.ExitStack, data: bytes) -> int:
 
 
 def _child_limits(limits: Limits) -> None:
+    # RLIMIT_NPROC is deliberately absent. Outside the sandbox it counts every
+    # task of the real UID, so on a busy account bubblewrap cannot even create
+    # its namespaces. The trusted verifier applies it inside the sandbox's own
+    # user namespace, where the kernel counts only the sandbox's tasks.
     for kind, ceiling in ((resource.RLIMIT_CORE, 0), (resource.RLIMIT_CPU, limits.cpu_seconds),
                           (resource.RLIMIT_AS, limits.address_bytes),
                           (resource.RLIMIT_FSIZE, limits.output_bytes),
-                          (resource.RLIMIT_NPROC, limits.processes),
                           (resource.RLIMIT_NOFILE, limits.descriptors)):
         _, hard = resource.getrlimit(kind)
         value = ceiling if hard == resource.RLIM_INFINITY else min(ceiling, hard)
@@ -306,6 +393,8 @@ def execute(binary: Path, tool: str, inputs: list[tuple[str, Path]], args: list[
     command = reader_arguments(tool, args, set(names))
     if not bwrap.is_file() or not os.access(bwrap, os.X_OK):
         raise Refusal("bubblewrap is unavailable; refusing unsandboxed execution")
+    machine = os.uname().machine
+    filter_program = seccomp_filter(machine)
     # Resolve only trusted executables. Never resolve untrusted input symlinks.
     binary, bwrap = binary.resolve(strict=True), bwrap.resolve(strict=True)
     deadline = time.monotonic() + limits.wall_seconds
@@ -346,7 +435,8 @@ def execute(binary: Path, tool: str, inputs: list[tuple[str, Path]], args: list[
         if len(inner_code) != inner_before["bytes"] or stamp(inner_source_fd) != inner_before:
             raise Refusal("trusted bootstrap source changed during capture")
         inner_fd = sealed_data(stack, inner_code)
-        config = {"binary_fd": binary_fd, "arguments": command,
+        seccomp_fd = sealed_data(stack, filter_program)
+        config = {"binary_fd": binary_fd, "arguments": command, "process_limit": limits.processes,
                   "outer_namespaces": {name: os.stat(f"/proc/self/ns/{name}").st_ino
                                        for name in ("mnt", "user", "pid", "net", "ipc", "uts")},
                   "bindings": [{"fd": binary_fd, "path": "/app/reader", "identity": binary_before},
@@ -357,29 +447,33 @@ def execute(binary: Path, tool: str, inputs: list[tuple[str, Path]], args: list[
         # Existing directories are never reused or overwritten.
         output = output.absolute()
         output.mkdir(mode=0o700)
-        request = {"schema_version": 1, "policy": "ffs-offline-reader-v1", "tool": tool,
+        request = {"schema_version": 2, "policy": POLICY, "tool": tool,
                    "reader_sha256": binary_hash, "reader_identity": binary_before,
                    "bwrap": str(bwrap), "bwrap_sha256": bwrap_hash,
                    "bwrap_identity": bwrap_before, "arguments": command,
                    "bootstrap_sha256": hashlib.sha256(inner_code).hexdigest(),
                    "python_identity": python_before, "python_sha256": python_hash,
                    "limits": dataclasses.asdict(limits), "inputs": evidence,
+                   "seccomp": seccomp_policy(machine, filter_program),
                    "status": "requested_not_completed", "authentication": "none",
-                   "scope": "read-only contents; advisory locks do not exclude external writers; rlimits are per process"}
+                   "scope": ("read-only contents; advisory locks do not exclude external writers; "
+                             "rlimits are per process except the task limit, which applies per "
+                             "sandbox user namespace")}
         write_json(output / "request.json", request)
-        result = {"schema_version": 1, "success": False, "inputs": evidence}
+        result = {"schema_version": 2, "success": False, "inputs": evidence}
         try:
             with private_output(output / "stdout.bin") as stdout, private_output(output / "stderr.bin") as stderr:
                 status_pipe = os.pipe2(os.O_CLOEXEC)
                 try:
                     argv = sandbox_argv(Path(f"/proc/self/fd/{bwrap_fd}"), binary_fd, pinned,
-                                        command, limits, status_pipe[1], python_fd, inner_fd, config_fd)
+                                        command, limits, status_pipe[1], python_fd, inner_fd, config_fd,
+                                        seccomp_fd)
                 except BaseException:
                     for fd in status_pipe:
                         os.close(fd)
                     raise
                 observed = _supervise(argv, (bwrap_fd, binary_fd, python_fd, inner_fd, config_fd,
-                                            *(fd for _, fd in pinned), status_pipe[1]),
+                                            seccomp_fd, *(fd for _, fd in pinned), status_pipe[1]),
                                        {"stdout": stdout, "stderr": stderr}, limits, deadline, status_pipe)
                 for stream in (stdout, stderr):
                     stream.flush()

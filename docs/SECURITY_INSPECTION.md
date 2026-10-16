@@ -72,6 +72,26 @@ from the controlling terminal. Both namespace setup failure and an unsupported
 required option are fatal. No network-sharing or weaker compatibility option is
 added on failure.
 
+Bubblewrap also installs a seccomp syscall filter (`--seccomp`) beneath those
+namespaces. The launcher generates it as a short, straight-line classic BPF
+program for x86_64 or aarch64; any other architecture is refused. The filter
+kills the process on a foreign ABI (i386, or x32 on x86_64) and returns `EPERM`
+for 62 syscalls (58 on aarch64) that no offline reader needs:
+
+- networking (`socket`, `connect`, `bind`, ...);
+- access to other processes (`ptrace`, `process_vm_*`, `pidfd_getfd`, `kcmp`);
+- mount and namespace changes, including the descriptor mount API;
+- handle-based opens (`open_by_handle_at`);
+- BPF, perf, `userfaultfd`, `io_uring`, kernel keyrings and `personality`;
+- module, kexec, swap, reboot and clock administration.
+
+It also refuses the terminal-injection `ioctl`s `TIOCSTI` and `TIOCLINUX`. Everything
+else is allowed, so the filter narrows kernel attack surface rather than
+describing a reader's exact needs. The verifier refuses to execute the reader
+unless `/proc/self/status` reports an attached filter (`Seccomp: 2`). The
+syscall numbers are tested against the installed kernel UAPI headers, and the
+program is executed by an independent BPF interpreter in the tests.
+
 The sandbox receives only the explicit binary/inputs, read-only system runtime
 library directories, the trusted Python verifier/interpreter, `/dev/null`,
 `/dev/urandom`, its own `/proc`, and a size-limited
@@ -85,27 +105,35 @@ or debug settings. Standard input is null. Output is captured as bytes, never
 printed unescaped to a terminal by this launcher.
 
 Defaults: 120 seconds total including input hashing, 60 CPU seconds per process,
-2 GiB virtual address space per process, 64 descriptors, 64 processes under the
-Linux per-real-UID limit, a 64 MiB temporary filesystem, 16 GiB total input length,
-and 64 MiB combined stdout/stderr. CPU, wall, memory, output and input budgets have
-explicit CLI controls. Existing stricter inherited hard limits are never raised.
-Core dumps are disabled. On timeout/output overflow the supervisor kills its
-process group; bubblewrap's parent-death chain tears down the sandbox PID namespace.
-A failed reader or a killed process never earns a successful result.
+2 GiB virtual address space per process, 64 descriptors, 64 tasks per sandbox,
+a 64 MiB temporary filesystem, 16 GiB total input length, and 64 MiB combined
+stdout/stderr. CPU, wall, memory, output and input budgets have explicit CLI
+controls. Existing stricter inherited hard limits are never raised. Core dumps
+are disabled. On timeout/output overflow the supervisor kills its process group;
+bubblewrap's parent-death chain tears down the sandbox PID namespace. A failed
+reader or a killed process never earns a successful result.
 
-These are **not aggregate cgroup quotas**. Per-process memory/CPU and per-UID
-process limits do not establish an aggregate per-job memory/CPU guarantee. Run
-this profile under a dedicated account with externally enforced cgroup memory,
-process and CPU budgets on a host intended for hostile workloads. A stuck kernel
-I/O operation can delay process reaping; userspace deadlines are not kernel liveness
-proofs. No custom seccomp syscall filter is installed in this initial profile.
+The task limit is `RLIMIT_NPROC`, applied by the trusted verifier inside the
+sandbox's fresh user namespace, immediately before the reader executes. There
+the kernel counts only the sandbox's own tasks, so the limit caps the reader's
+threads and children. Outside, `RLIMIT_NPROC` counts every task of the real UID;
+applied to bubblewrap itself it made namespace creation fail on any account
+already running more than 64 tasks.
+
+These are **not aggregate cgroup quotas**. Per-process memory/CPU limits and a
+per-sandbox task count do not establish an aggregate per-job memory/CPU
+guarantee. Run this profile under a dedicated account with externally enforced
+cgroup memory, process and CPU budgets on a host intended for hostile workloads.
+A stuck kernel I/O operation can delay process reaping; userspace deadlines are
+not kernel liveness proofs.
 
 ## Evidence contract
 
 The new mode-0700 output directory contains mode-0600 files:
 
 - `request.json`: policy version, reader, bubblewrap, Python and bootstrap hashes, exact
-  mapped argv, resource limits, input identities and initial SHA-256 values.
+  mapped argv, resource limits, the syscall filter's SHA-256 and denylist, input
+  identities and initial SHA-256 values.
 - `stdout.bin` and `stderr.bin`: bounded, untrusted output. A failed operation may
   leave a valid-looking prefix; do not consume it as a successful extraction.
 - `result.json`: child exit, limit termination, bubblewrap start/exit observations,
@@ -136,14 +164,37 @@ small extraction. No mounted FUSE operation is exercised by this launcher.
 Run the executable policy/file-descriptor/supervisor tests with:
 
 ```sh
-python3 -I -m unittest discover -s scripts/tests -p test_ffs_inspect_sandbox.py -v
+FFS_REQUIRE_SANDBOX=1 python3 -I -m unittest discover -s scripts/tests -p test_ffs_inspect_sandbox.py -v
 ```
 
-The initial implementation was tested with real child processes, descriptor
-permissions, locks, timeout/pipe inheritance, output overflow, environment
-isolation, sealed bootstrap memory, substituted mount refusal, descriptor closure,
-and evidence-file refusal. Those tests do **not** run bubblewrap or
-establish kernel containment. Scratch directories are intentionally retained.
+`FFS_REQUIRE_SANDBOX=1` turns a missing or unusable bubblewrap into a failure
+instead of a skip, so a passing run proves the live tests executed.
+
+The unit tests use real child processes, descriptor permissions, locks,
+timeout/pipe inheritance, output overflow, environment isolation, sealed
+bootstrap memory, substituted mount refusal, descriptor closure and
+evidence-file refusal. They also check the filter's syscall numbers against
+kernel headers and interpret the filter program for both architectures.
+
+Two live tests run real bubblewrap. The first uses the exact launcher policy,
+filter included, with a probe in place of the reader. It observes:
+
+- filter mode 2, no-new-privileges and empty capability sets;
+- `EPERM` from `socket(AF_UNIX)` and a `personality` query, both of which
+  succeed without the filter;
+- no `/home`, `/etc`, `/run` or `/dev/fuse`;
+- `EROFS` when writing an input;
+- only a loopback interface;
+- a task limit that admits 4 threads but caps 20.
+
+The second runs the complete launcher end to end with a stand-in ELF reader.
+
+On 2026-10-16 (kernel 7.0, bubblewrap 0.11.1, Python 3.14, an account running
+over 1,000 tasks), all 35 passed. Planted negatives confirmed that the live and
+filter tests detect each of these: a dropped filter, a per-UID task limit, a
+verifier that no longer requires the filter, and an un-denied `socket`. Before
+the task-limit fix, the unmodified launcher could not start a sandbox on that
+account at all. Scratch directories are intentionally retained.
 
 Before using this profile for hostile production inputs, qualify the exact
 FrankenFS build, bubblewrap binary, runtime libraries, kernel and LSM policy.

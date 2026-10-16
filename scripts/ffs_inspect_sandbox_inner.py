@@ -10,6 +10,7 @@ from __future__ import annotations
 import fcntl
 import json
 import os
+import resource
 import stat
 import sys
 
@@ -52,6 +53,25 @@ def verify_containment(outer_namespaces: dict[str, int]) -> None:
         raise ValueError("no-new-privileges is not active")
     if any(int(status.get(name, "1"), 16) for name in ("CapEff", "CapPrm", "CapAmb", "CapBnd")):
         raise ValueError("sandbox retained capabilities")
+    # Mode 2 is SECCOMP_MODE_FILTER: the launcher's syscall filter is attached.
+    if status.get("Seccomp", "").strip() != "2":
+        raise ValueError("sandbox syscall filter is not active")
+
+
+def restrict_processes(limit: int) -> None:
+    """Cap tasks for this sandbox. Call only after verify_containment.
+
+    In a fresh user namespace the kernel charges RLIMIT_NPROC per namespace, so
+    this bounds the reader's threads and children without counting the host
+    account's unrelated tasks.
+    """
+    if type(limit) is not int or limit < 4:
+        raise ValueError("invalid sandbox process limit")
+    _, hard = resource.getrlimit(resource.RLIMIT_NPROC)
+    value = limit if hard == resource.RLIM_INFINITY else min(limit, hard)
+    resource.setrlimit(resource.RLIMIT_NPROC, (value, value))
+    if resource.getrlimit(resource.RLIMIT_NPROC) != (value, value):
+        raise ValueError("sandbox process limit did not take effect")
 
 
 def close_inherited(keep: int) -> None:
@@ -80,6 +100,7 @@ def main() -> int:
         verify_containment(config["outer_namespaces"])
         for binding in config["bindings"]:
             verify_binding(binding)
+        restrict_processes(config["process_limit"])
         executable = config["binary_fd"]
         if os.pread(executable, 4, 0) != b"\x7fELF":
             raise ValueError("reader must be a native ELF executable")

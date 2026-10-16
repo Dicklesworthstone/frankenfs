@@ -21,11 +21,29 @@ closures. Existing ownership of `bd-11a8t` remains intact.
 - [x] Read relevant canonical rows, shared rules, and FAT/native expansion plan.
 - [x] Verify `bd-i0gk5`, `bd-q19uk`, and `bd-nu8nf` are closed implementation rows.
 - [x] Identify remaining NTFS/ZFS read-only callers of writable sidecar admission.
-- [ ] Route NTFS and ZFS callers to the existing `open_read_only` constructor.
+- [x] Route NTFS and ZFS callers to the existing `open_read_only` constructor
+  (`80488c52c`).
 - [ ] Preserve native admission, recovery, namespace and existing test behavior.
 - [ ] Add caller-path regressions or record the precise missing execution proof.
-- [ ] Run targeted Rust checks on the changed consumers and protected-mount.
+- [~] Run targeted Rust checks on the changed consumers and protected-mount.
+  A workspace check of `4750f06cc` (2026-10-16) compiled the NTFS and ZFS
+  consumers. It failed on two unrelated breaks: FAT boot-recovery digest
+  formatting in `ffs-protected-mount`, and two NTFS clippy lints in `ffs-ondisk`.
+  Those are fixed separately; their tests remain to be run.
 - [ ] Verify the published source hashes and main ancestry.
+
+## P0b: ext4/btrfs reads must not write (found 2026-10-16)
+
+`OpenFs::open` acquired a read-write descriptor whenever the caller could
+write the image. Its default journal mode replayed JBD2 and orphan recovery
+into the base image. `ffs-cli read`, `walk`, `dump` and library callers could
+therefore modify a dirty ext4 image they were asked only to read.
+
+- [ ] Make `open`/`open_with_options` hold `O_RDONLY` and recover into an
+  in-memory overlay. Refuse `enable_writes` there, and add an explicit
+  `open_read_write` for mutation.
+- [ ] Executed regressions: a dirty-journal image stays byte-identical under
+  the default open, and the read-write open publishes the recovery.
 
 ## P1: isolated offline reader workflow (implemented; kernel qualification open)
 
@@ -52,10 +70,17 @@ closures. Existing ownership of `bd-11a8t` remains intact.
 - [x] Execute 27 Python tests, including real file permissions/locks, memfd seals,
   subprocess limits, hostile output, descriptor closure and descendant pipes.
 - [x] Attempt production entry point: correctly refused root in this environment.
-- [ ] Run actual bubblewrap namespace/escape and native-reader integration tests.
-  Bubblewrap is absent here; successful user-namespace probing alone is not proof.
-- [ ] Qualify aggregate cgroup quotas, syscall filtering and supported host/kernel
-  configurations before promoting this to a hostile-production security profile.
+- [x] Fix the task limit, which prevented any sandbox from starting on an account
+  running over 64 tasks: bubblewrap failed with "Creating new namespace failed".
+  The limit now applies per sandbox user namespace (2026-10-16).
+- [x] Add a seccomp denylist filter via `bwrap --seccomp`. The verifier refuses
+  to execute without `Seccomp: 2`, and the evidence records the filter's hash.
+- [x] Run actual bubblewrap namespace, filter and read-only-input tests, plus an
+  end-to-end launcher run with a stand-in reader: 35 passed live with
+  `FFS_REQUIRE_SANDBOX=1`, and four planted negatives were detected.
+- [ ] Run the native FrankenFS readers under the launcher against real images.
+- [ ] Qualify aggregate cgroup quotas and supported host/kernel configurations
+  before promoting this to a hostile-production security profile.
 
 Executed test command:
 
