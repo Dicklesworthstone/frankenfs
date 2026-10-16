@@ -79,15 +79,20 @@ impl ImageArgs {
             bail!("--offline-image is required");
         }
         if let Some(sidecar) = &self.sidecar {
-            let device =
-                ffs_repair::sidecar::live::SidecarImageDevice::open(cx, &self.image, sidecar)
-                    .with_context(|| {
-                        format!(
-                            "admitting ZFS image {} with sidecar {}",
-                            self.image.display(),
-                            sidecar.display()
-                        )
-                    })?;
+            // Blocking caller writes in the wrapper does not prevent an inner
+            // writable reader from healing the image. Remove that authority.
+            let device = ffs_repair::sidecar::live::SidecarImageDevice::open_read_only(
+                cx,
+                &self.image,
+                sidecar,
+            )
+            .with_context(|| {
+                format!(
+                    "admitting ZFS image {} with sidecar {}",
+                    self.image.display(),
+                    sidecar.display()
+                )
+            })?;
             let size = ffs_block::ByteDevice::len_bytes(&device);
             return Leaf::from_device(
                 cx,
@@ -377,6 +382,50 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn protected_read_only_admission_coexists_with_a_retained_reader() {
+        use ffs_repair::sidecar::live::SidecarImageDevice;
+        use ffs_repair::sidecar::{SidecarOptions, protect};
+
+        let directory = tempfile::tempdir().unwrap();
+        let image = directory.path().join("source.img");
+        let archive = directory.path().join("source.ffs-rq");
+        let original = vec![0_u8; 4096];
+        std::fs::write(&image, &original).unwrap();
+        let cx = Cx::for_testing();
+        protect(
+            &cx,
+            &image,
+            &archive,
+            SidecarOptions {
+                block_size: 512,
+                group_blocks: 8,
+                repair_symbols: 4,
+            },
+        )
+        .unwrap();
+        let before = std::fs::read(&archive).unwrap();
+        let _reader = SidecarImageDevice::open_read_only(&cx, &image, &archive).unwrap();
+        let args = ImageArgs {
+            image: image.clone(),
+            offset: 0,
+            length: Some(1),
+            offline_image: true,
+            sidecar: Some(archive.clone()),
+        };
+        let error = match args.open(&cx) {
+            Ok(_) => panic!("one-byte native volume must be refused"),
+            Err(error) => error,
+        };
+        // An exclusive writable open fails at sidecar admission. A genuine
+        // read-only caller reaches native geometry admission while sharing locks.
+        assert!(error.to_string().contains("opening sidecar-protected ZFS leaf"));
+        assert_eq!(std::fs::read(&image).unwrap(), original);
+        assert_eq!(std::fs::read(&archive).unwrap(), before);
+        assert!(SidecarImageDevice::open(&cx, &image, &archive).is_err());
+    }
+
     #[test]
     fn cli_requires_explicit_immutable_image_and_root_identity() {
         assert!(Cli::try_parse_from(["ffs-zfs", "inspect", "leaf.img"]).is_err());
