@@ -3,6 +3,7 @@
 
 mod features;
 mod holes;
+pub mod properties;
 pub mod scrub;
 mod seek;
 mod zap;
