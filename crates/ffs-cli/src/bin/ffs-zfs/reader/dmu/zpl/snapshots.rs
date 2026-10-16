@@ -34,9 +34,9 @@ pub struct Snapshot {
     pub objectset_kind: u64,
 }
 
-pub(in crate::reader::dmu) struct SnapshotRoot {
-    pub(in crate::reader::dmu) info: Snapshot,
-    pub(in crate::reader::dmu) root: BlockPointer,
+pub(in super::super) struct SnapshotRoot {
+    pub(in super::super) info: Snapshot,
+    pub(in super::super) root: BlockPointer,
 }
 
 struct Record {
@@ -345,7 +345,7 @@ impl Objects {
 
     /// Exact stored-name selection, not case-folded alias selection. A missing
     /// snapshot is an error; never fall back to current head bytes or rewind TXG.
-    pub(in crate::reader::dmu) fn named_snapshot_root(
+    pub(in super::super) fn named_snapshot_root(
         &mut self,
         cx: &Cx,
         components: &[Vec<u8>],
