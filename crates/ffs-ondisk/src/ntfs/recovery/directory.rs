@@ -190,7 +190,9 @@ pub(super) fn edit_root(
         operation, entry_offset: offset, data: edit.data,
     }, true, limit)?;
     root_header(&value)?;
-    let new_size = size.checked_sub(old_len).and_then(|size| size.checked_add(value.len())
+    let new_size = size
+        .checked_sub(old_len)
+        .and_then(|size| size.checked_add(value.len()))
         .ok_or_else(|| bad("resident index attribute size overflow"))?;
     resize_attribute(data, at, size, new_size)?;
     put32(data, at + 16, value.len())?;
