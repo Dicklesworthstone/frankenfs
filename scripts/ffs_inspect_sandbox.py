@@ -27,7 +27,7 @@ import time
 from typing import BinaryIO
 
 TOOLS = {
-    "ffs-cli": frozenset({"inspect"}),
+    "ffs-cli": frozenset({"inspect", "info", "dump", "read", "walk"}),
     "ffs-fat": frozenset({"inspect", "check", "ls", "cat", "catalog", "extract"}),
     "ffs-ntfs": frozenset({"inspect", "ls", "read", "readlink", "streams", "security", "ea", "record", "cat"}),
     "ffs-zfs": frozenset({"inspect", "root", "object", "object-read", "zap", "datasets", "ls", "stat", "cat", "readlink", "xattr", "snapshots", "zvol-info", "zvol-read", "zvol-seek"}),
