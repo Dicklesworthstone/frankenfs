@@ -1,3 +1,8 @@
+#![expect(
+    clippy::single_range_in_vec_init,
+    reason = "expected allocation maps are lists that may hold a single range"
+)]
+
 use super::*;
 
 fn words(values: &[u64], order: Endian) -> Vec<u8> {
@@ -13,7 +18,7 @@ fn bonus_lengths_signed_counts_and_histograms_are_independent_of_obsolete_identi
     for order in [Endian::Little, Endian::Big] {
         for length in [0, 8, u64::MAX - 7] {
             for allocated in [i64::MIN, -1, 0, 512, i64::MAX] {
-                let raw = words(&[u64::MAX, length, allocated as u64], order);
+                let raw = words(&[u64::MAX, length, allocated.cast_unsigned()], order);
                 let header = Header::parse(&raw, order).unwrap();
                 assert_eq!((header.length, header.allocated, header.histogram), (length, allocated, None));
                 let mut extended = raw;
@@ -134,6 +139,7 @@ fn range_map_merges_neighbors_splits_frees_and_reuses_allocations() {
 }
 
 #[test]
+#[expect(clippy::reversed_empty_ranges, reason = "a reversed range is deliberately invalid input")]
 fn invalid_ranges_double_allocation_and_double_free_leave_the_map_unchanged() {
     let mut map = AllocationMap::new(4096, 4096, 9, 8).unwrap();
     map.apply(MapType::Allocate, 4096..5120).unwrap();
