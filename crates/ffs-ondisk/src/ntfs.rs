@@ -863,7 +863,8 @@ pub fn parse_ntfs_logfile(raw_logfile: &[u8]) -> Result<NtfsLogFilePlan, ParseEr
                 let attribute_offset = le16(payload, 18)?;
                 let cluster_block_offset = le16(payload, 20)?;
                 let target_vcn = le64(payload, 24)?;
-                let target_lcn = if lcns_to_follow > 0 {
+                // First entry of the record's per-page LCN array.
+                let first_page_lcn = if lcns_to_follow > 0 {
                     le64(payload, 32)?
                 } else {
                     0
@@ -900,7 +901,7 @@ pub fn parse_ntfs_logfile(raw_logfile: &[u8]) -> Result<NtfsLogFilePlan, ParseEr
                         attribute_offset,
                         cluster_block_offset,
                         target_vcn,
-                        target_lcn,
+                        target_lcn: first_page_lcn,
                         redo_data,
                         undo_data,
                     });

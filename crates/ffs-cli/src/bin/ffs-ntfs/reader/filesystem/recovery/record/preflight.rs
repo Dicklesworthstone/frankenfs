@@ -175,7 +175,7 @@ fn attributes(cx: &Cx, restart: &Restart, table: &RestartTable<'_>, boundary: u6
     for entry in table.entries.values() {
         checkpoint(cx)?;
         let kind = u32_at(entry, 8)?;
-        if kind < 0x10 || kind > 0x100 || !kind.is_multiple_of(0x10) {
+        if !(0x10..=0x100).contains(&kind) || !kind.is_multiple_of(0x10) {
             return Err(unsupported(
                 "$LogFile checkpoint contains an unknown attribute type",
             ));

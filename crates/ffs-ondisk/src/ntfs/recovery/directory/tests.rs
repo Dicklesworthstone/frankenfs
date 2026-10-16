@@ -11,7 +11,7 @@ fn entry(name: &[u16], child: Option<u64>) -> Vec<u8> {
     let key_len = 66 + name.len() * 2;
     let length = (16 + key_len).next_multiple_of(8) + usize::from(child.is_some()) * 8;
     let mut bytes = vec![0; length];
-    bytes[..8].copy_from_slice(&((7_u64 << 48) | 99).to_le_bytes());
+    bytes[..8].copy_from_slice(&((7_u64 << 48) | 0x63).to_le_bytes());
     bytes[8..10].copy_from_slice(&(length as u16).to_le_bytes());
     bytes[10..12].copy_from_slice(&(key_len as u16).to_le_bytes());
     bytes[12..14].copy_from_slice(&u16::from(child.is_some()).to_le_bytes());
@@ -196,14 +196,14 @@ fn root_redo_skip_ignores_obsolete_entry_offsets_but_not_file_identity() {
 #[test]
 fn root_and_external_nodes_preserve_rightmost_children() {
     let row = entry(&[65], Some(3));
-    let raw = file(&[row.clone()], true);
+    let raw = file(std::slice::from_ref(&row), true);
     for at in [ENTRY, ENTRY + row.len() as u16] {
         let changed = applied(root_edit(&raw, IndexOperation::SetChild, at, &91_u64.to_le_bytes(), RecoveryPass::Redo(20)));
         let parsed = NtfsIndexRoot::parse(&root_value(&changed), 512).unwrap();
         let index = usize::from(at != ENTRY);
         assert_eq!(parsed.entries[index].child_vcn, Some(91));
     }
-    let (raw, first) = block(1024, &[row.clone()], true);
+    let (raw, first) = block(1024, std::slice::from_ref(&row), true);
     let changed = applied(apply_index_edit(&raw, 27, RecoveryPass::Redo(20), &IndexEdit {
         operation: IndexOperation::SetChild, entry_offset: first + row.len() as u16,
         data: &91_u64.to_le_bytes(),
@@ -215,7 +215,7 @@ fn root_and_external_nodes_preserve_rightmost_children() {
 fn duplicated_file_information_does_not_change_names_references_or_children() {
     let row = entry(&[65, 0xD800], Some(3));
     let payload = [0x5A; DUPLICATED_INFORMATION];
-    let raw = file(&[row.clone()], true);
+    let raw = file(std::slice::from_ref(&row), true);
     let changed = applied(root_edit(&raw, IndexOperation::UpdateFileName, ENTRY, &payload, RecoveryPass::Redo(20)));
     let root = root_value(&changed);
     assert_eq!(&root[32..56], &row[..24]);
@@ -272,7 +272,7 @@ fn external_write_end_replaces_complete_suffix_and_zeroes_retired_bytes() {
 #[test]
 fn no_terminal_deletion_childless_pointer_write_or_short_metadata_payload() {
     let row = entry(&[65], None);
-    let raw = file(&[row.clone()], false);
+    let raw = file(std::slice::from_ref(&row), false);
     let terminator = ENTRY + row.len() as u16;
     for (operation, at, payload) in [
         (IndexOperation::DeleteEntry, terminator, Vec::new()),

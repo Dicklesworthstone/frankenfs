@@ -239,7 +239,7 @@ fn validate_client_restart(restart: &Restart, data: &[u8]) -> Result<()> {
         return Err(corrupt(0, "short NTFS client restart record"));
     }
     let version = (u32_at(data, 0)?, u32_at(data, 4)?);
-    if !matches!(version, (1, 0) | (1, 1) | (2, 0)) {
+    if !matches!(version, (1, 0 | 1) | (2, 0)) {
         return Err(unsupported(format!(
             "unsupported NTFS client restart version {}.{}",
             version.0, version.1

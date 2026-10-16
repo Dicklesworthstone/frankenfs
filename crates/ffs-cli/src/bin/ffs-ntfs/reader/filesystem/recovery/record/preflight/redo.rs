@@ -44,6 +44,7 @@ pub(super) struct Summary {
     pub(super) first_lsn: Option<u64>,
 }
 
+#[derive(Clone, Copy)]
 pub(super) struct ReplayInput<'a> {
     pub(super) volume: &'a NtfsVolume,
     pub(super) restart: &'a super::Restart,
@@ -128,10 +129,10 @@ pub(super) fn build<'a>(cx: &Cx, targets: &'a State, history: &'a [LogRecord]) -
         return Err(unsupported("$LogFile redo exceeds 4096 records"));
     }
     ownership(cx, targets)?;
-    if let Some(oldest) = targets.finish(cx)?.2 {
-        if history.first().is_none_or(|record| record.lsn > oldest) {
-            return Err(unsupported("$LogFile redo window omits surviving pre-checkpoint dirty work"));
-        }
+    if let Some(oldest) = targets.finish(cx)?.2
+        && history.first().is_none_or(|record| record.lsn > oldest)
+    {
+        return Err(unsupported("$LogFile redo window omits surviving pre-checkpoint dirty work"));
     }
     let mut plan = Plan { candidates: Vec::new(), obsolete: 0, relocated: 0 };
     let mut previous = 0;
@@ -167,15 +168,14 @@ pub(super) fn build<'a>(cx: &Cx, targets: &'a State, history: &'a [LogRecord]) -
         let mut relocated = 0;
         for index in 0..count {
             checkpoint(cx)?;
-            if let Some(cluster) = targets.clusters.get(&(slot, vcn + index as u64)) {
-                if record.lsn >= cluster.oldest {
-                    if let Some(lcn) = cluster.lcn {
-                        if lcn != u64_at(&record.data, 32 + index * 8)? {
-                            relocated += 1;
-                        }
-                        lcns.push(lcn);
-                    }
+            if let Some(cluster) = targets.clusters.get(&(slot, vcn + index as u64))
+                && record.lsn >= cluster.oldest
+                && let Some(lcn) = cluster.lcn
+            {
+                if lcn != u64_at(&record.data, 32 + index * 8)? {
+                    relocated += 1;
                 }
+                lcns.push(lcn);
             }
         }
         if lcns.is_empty() {

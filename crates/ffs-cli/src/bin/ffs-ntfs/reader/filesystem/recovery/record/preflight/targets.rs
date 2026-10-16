@@ -86,8 +86,8 @@ fn name(data: &[u8]) -> Result<Vec<u16>> {
     if !data.len().is_multiple_of(2) || data.len() > 510 {
         return Err(corrupt(0, "invalid $LogFile native attribute-name length"));
     }
-    Ok(data.chunks_exact(2)
-        .map(|word| u16::from_le_bytes([word[0], word[1]]))
+    Ok(data.as_chunks::<2>().0.iter()
+        .map(|word| u16::from_le_bytes(*word))
         .collect())
 }
 
@@ -275,12 +275,12 @@ impl State {
             return Ok(());
         }
         if hotfix {
-            if let Some(entry) = self.clusters.get_mut(&(id, vcn)) {
-                if entry.lcn.is_some() {
-                    // HotFix relocates existing dirty data; unlike reuse after
-                    // deletion, earlier redo must still target the replacement.
-                    entry.lcn = values[0];
-                }
+            if let Some(entry) = self.clusters.get_mut(&(id, vcn))
+                && entry.lcn.is_some()
+            {
+                // HotFix relocates existing dirty data; unlike reuse after
+                // deletion, earlier redo must still target the replacement.
+                entry.lcn = values[0];
             }
             return checkpoint(cx);
         }
@@ -324,11 +324,11 @@ impl State {
         ranges.sort_unstable();
         let mut merged: Vec<(u64, u64)> = Vec::new();
         for (start, end) in ranges {
-            if let Some(last) = merged.last_mut() {
-                if start <= last.1 {
-                    last.1 = last.1.max(end);
-                    continue;
-                }
+            if let Some(last) = merged.last_mut()
+                && start <= last.1
+            {
+                last.1 = last.1.max(end);
+                continue;
             }
             merged.push((start, end));
         }

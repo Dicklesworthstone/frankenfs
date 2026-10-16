@@ -134,7 +134,7 @@ fn edit_bytes(data: &mut [u8], edit: &FileEdit<'_>) -> Result<(), ParseError> {
     match edit.operation {
         FileOperation::CreateAttribute => {
             if relative != 0 || payload.len() < 24 || !payload.len().is_multiple_of(8)
-                || le32(payload, 4)? as u64 != payload.len() as u64
+                || u64::from(le32(payload, 4)?) != payload.len() as u64
             {
                 return Err(bad("invalid complete CreateAttribute payload"));
             }

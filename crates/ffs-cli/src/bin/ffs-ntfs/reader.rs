@@ -288,6 +288,7 @@ pub struct NtfsVolume {
     pub logfile_recovery: Option<ffs_ondisk::ntfs::NtfsLogFilePlan>,
 }
 impl NtfsVolume {
+    #[cfg(test)]
     pub fn open(cx: &Cx, path: &Path, base: u64, length: Option<u64>) -> Result<Self> {
         Self::open_with_options(cx, path, base, length, false)
     }
@@ -319,6 +320,9 @@ impl NtfsVolume {
         )
     }
 
+    // ffs-protected-mount compiles this module through #[path] and opens
+    // through here; the ffs-ntfs binary itself always passes recovery options.
+    #[allow(dead_code)]
     pub fn from_device(
         cx: &Cx,
         device: Box<dyn ByteDevice>,
