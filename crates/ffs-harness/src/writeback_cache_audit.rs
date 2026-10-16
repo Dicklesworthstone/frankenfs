@@ -979,6 +979,16 @@ fn check_conflicting_flags(gate: &WritebackCacheAuditGate) -> Option<WritebackCa
 }
 
 #[must_use]
+pub fn has_writeback_cache_fuser_option(raw_fuser_options: &[String]) -> bool {
+    raw_fuser_options.iter().any(|opt| {
+        let trimmed = opt.trim();
+        trimmed == "writeback_cache"
+            || trimmed.eq_ignore_ascii_case("FUSE_WRITEBACK_CACHE")
+            || trimmed.eq_ignore_ascii_case("fuse_init:writeback_cache")
+    })
+}
+
+#[must_use]
 pub fn evaluate_writeback_ordering_oracle(
     oracle: &WritebackOrderingOracle,
 ) -> WritebackOrderingDecision {
@@ -991,11 +1001,7 @@ pub fn evaluate_writeback_ordering_oracle(
             "positive writeback-cache ordering proof requires an explicit rw opt-in scenario",
         );
     }
-    if !oracle
-        .raw_fuser_options
-        .iter()
-        .any(|v| v == "writeback_cache")
-    {
+    if !has_writeback_cache_fuser_option(&oracle.raw_fuser_options) {
         return reject_ordering(
             "raw_fuser_option_missing",
             ["I5"],
@@ -1157,11 +1163,7 @@ pub fn evaluate_writeback_crash_replay_oracle(
             "writeback-cache crash/replay proof requires an explicit read-write opt-in mount",
         );
     }
-    if !oracle
-        .raw_fuser_options
-        .iter()
-        .any(|v| v == "writeback_cache")
-    {
+    if !has_writeback_cache_fuser_option(&oracle.raw_fuser_options) {
         return reject_crash_replay(
             "raw_fuser_option_missing",
             Vec::<String>::new(),
