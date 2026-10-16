@@ -19,8 +19,8 @@ impl FatFs {
         let to_dir = self.node(cx, new_parent)?.directory()?;
         let (from, from_name) = self.child_path(parent, name)?;
         let (to, to_name) = self.child_path(new_parent, new_name)?;
-        let source = self.volume.lookup(cx, from_dir, &from_name)?;
-        let target = self.volume.lookup(cx, to_dir, &to_name)?;
+        let source = self.visible_lookup(cx, from_dir, &from_name)?;
+        let target = self.visible_lookup(cx, to_dir, &to_name)?;
         // Reserve BOTH mount-lifetime identities before any native write.
         // A capacity refusal must not leave a published exchange without IDs.
         let source_ino = self.register(cx, parent, source.clone())?;

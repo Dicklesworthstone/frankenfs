@@ -5,6 +5,7 @@
 
 mod exchange;
 mod health;
+mod lifetime;
 
 use super::reader::replacement::{
     create_in_volume, mkdir_in_volume, rename_in_volume, rmdir_in_volume, set_attr_in_volume,
@@ -90,6 +91,7 @@ pub struct FatFs {
     operations: RwLock<()>,
     health: MountHealth,
     state: Mutex<State>,
+    lifetime: Mutex<lifetime::Lifetime>,
     uid: u32,
     gid: u32,
     writable: bool,
@@ -178,6 +180,7 @@ impl FatFs {
             operations: RwLock::new(()),
             health: MountHealth::new(epoch),
             state: Mutex::new(state),
+            lifetime: Mutex::new(lifetime::Lifetime::default()),
             uid,
             gid,
             writable,
@@ -278,9 +281,12 @@ impl FatFs {
         let new_parent_dir = self.node(cx, new_parent)?.directory()?;
         let (from_path, from_name) = self.child_path(parent, name)?;
         let (to_path, to_name) = self.child_path(new_parent, new_name)?;
-        let src_before = self.volume.lookup(cx, parent_dir, &from_name)?;
+        let src_before = self.visible_lookup(cx, parent_dir, &from_name)?;
         let dst_before = match self.volume.lookup(cx, new_parent_dir, &to_name) {
-            Ok(entry) => Some(entry),
+            Ok(entry) => {
+                self.require_unreserved_target(entry.offset)?;
+                Some(entry)
+            }
             Err(FfsError::NotFound(_)) => None,
             Err(error) => return Err(error),
         };
@@ -288,6 +294,19 @@ impl FatFs {
         // too. Refuse before registering nodes or publishing any disk writes.
         if no_replace && dst_before.is_some() {
             return Err(FfsError::Exists);
+        }
+        if let Some(target) = &dst_before
+            && target.offset != src_before.offset
+            && !target.native.is_directory()
+        {
+            let target_ino = self.state()?.slot_to_ino.get(&target.offset).copied();
+            if let Some(target_ino) = target_ino
+                && self.pinned(target_ino)?
+            {
+                return self.replace_pinned_locked(
+                    cx, parent, name, new_parent, new_name, target_ino,
+                );
+            }
         }
         let src_ino = self.register(cx, parent, src_before.clone())?;
 
@@ -597,7 +616,7 @@ impl FatFs {
             crtime,
             kind,
             perm,
-            nlink,
+            nlink: if self.retained(ino)? { 0 } else { nlink },
             uid: self.uid,
             gid: self.gid,
             rdev: 0,
@@ -778,7 +797,7 @@ impl FsOps for FatFs {
                 self.attributes(cx, node.parent, &ancestor)
             }
             _ => {
-                let entry = self.volume.lookup(cx, directory, name)?;
+                let entry = self.visible_lookup(cx, directory, name)?;
                 let ino = self.register(cx, parent, entry)?;
                 self.attributes(cx, ino, &self.node(cx, ino)?)
             }
@@ -794,7 +813,7 @@ impl FsOps for FatFs {
     ) -> Result<ReaddirPage> {
         let _operation = self.operation(cx, false)?;
         let node = self.node(cx, ino)?;
-        let entries = self.volume.list(cx, node.directory()?)?;
+        let entries = self.visible_entries(self.volume.list(cx, node.directory()?)?)?;
         let names = Self::checked_names(&entries)?;
         if self.writable {
             return self.mutable_readdir(cx, ino, node.parent, offset, entries, names);
@@ -877,6 +896,9 @@ impl FsOps for FatFs {
         if wants_write && entry.native.attributes & 0x01 != 0 {
             return Err(FfsError::PermissionDenied);
         }
+        // Handle exhaustion is a preflight failure, never an O_TRUNC failure
+        // after the existing contents have already been shortened.
+        let handle = self.reserve_open(ino)?;
         if flags & libc::O_TRUNC != 0 {
             let path = self.path_for_inode(ino)?;
             truncate_in_volume(cx, &self.volume, &path, 0, now_unix_secs())
@@ -885,7 +907,7 @@ impl FsOps for FatFs {
         }
         let entry = node.entry.as_ref().ok_or(FfsError::IsDirectory)?;
         self.chain(cx, ino, entry)?;
-        operation.complete((0, 0))
+        operation.complete((handle.accept(), 0))
     }
 
     fn create(
@@ -1102,9 +1124,16 @@ impl FsOps for FatFs {
         let parent_node = self.node(cx, parent)?;
         let parent_dir = parent_node.directory()?;
         let (path, name_str) = self.child_path(parent, name)?;
-        let existing_entry = self.volume.lookup(cx, parent_dir, &name_str)?;
+        let existing_entry = self.visible_lookup(cx, parent_dir, &name_str)?;
         if existing_entry.native.is_directory() {
             return Err(FfsError::IsDirectory);
+        }
+        let existing_ino = self.state()?.slot_to_ino.get(&existing_entry.offset).copied();
+        if let Some(ino) = existing_ino
+            && self.pinned(ino)?
+        {
+            self.retain_unlink_locked(cx, parent, &path, &existing_entry, ino)?;
+            return operation.complete(());
         }
         unlink_in_volume(cx, &self.volume, &path, false).map_err(map_mutation_error)?;
         let mut state = self.state()?;
@@ -1130,7 +1159,7 @@ impl FsOps for FatFs {
         let parent_node = self.node(cx, parent)?;
         let parent_dir = parent_node.directory()?;
         let (path, name_str) = self.child_path(parent, name)?;
-        let existing_entry = self.volume.lookup(cx, parent_dir, &name_str)?;
+        let existing_entry = self.visible_lookup(cx, parent_dir, &name_str)?;
         if !existing_entry.native.is_directory() {
             return Err(FfsError::NotDirectory);
         }
@@ -1237,6 +1266,33 @@ impl FsOps for FatFs {
         checkpoint(cx)
     }
 
+    fn install_open_handle_oracle(&self, oracle: ffs_core::vfs::OpenHandleOracle) {
+        self.install_lifetime_oracle(oracle);
+    }
+
+    fn release(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        request: ffs_core::vfs::ReleaseRequest,
+    ) -> Result<()> {
+        let operation = self.operation(cx, true)?;
+        self.release_open(request.ino, request.fh)?;
+        self.reap_retained_locked(cx, request.ino, false)?;
+        operation.complete(())
+    }
+
+    fn finalize_unlinked_inode(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+    ) -> Result<bool> {
+        let operation = self.operation(cx, true)?;
+        let reclaimed = self.reap_retained_locked(cx, ino, false)?;
+        operation.complete(reclaimed)
+    }
+
     fn fsync(
         &self,
         cx: &Cx,
@@ -1274,6 +1330,7 @@ impl FsOps for FatFs {
     fn flush_on_destroy(&self, cx: &Cx) -> Result<()> {
         let operation = self.operation(cx, true)?;
         if self.writable {
+            self.reap_all_retained_locked(cx)?;
             sync_volume(cx, &self.volume).map_err(map_mutation_error)?;
         }
         checkpoint(cx)?;
