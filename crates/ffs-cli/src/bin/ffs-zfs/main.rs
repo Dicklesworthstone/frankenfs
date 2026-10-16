@@ -9,6 +9,7 @@ macro_rules! companion_bin_tests {
 
 mod file_commands;
 mod filesystem;
+mod properties_commands;
 mod reader;
 
 use anyhow::{Context, Result, bail};
@@ -173,6 +174,8 @@ impl CandidateArgs {
 enum Command {
     #[command(flatten)]
     File(file_commands::FileCommand),
+    #[command(flatten)]
+    Properties(properties_commands::PropertyCommand),
     /// Inventory checksum-valid configurations and uberblock candidates, not pool authority.
     Inspect {
         #[command(flatten)]
@@ -223,6 +226,7 @@ fn main() -> Result<()> {
     let cx = Cx::for_request();
     match cli.command {
         Command::File(command) => command.run(&cx)?,
+        Command::Properties(command) => command.run(&cx)?,
         Command::Inspect { image } => {
             let leaf = image.open(&cx)?;
             let mut labels = Vec::new();
