@@ -200,12 +200,16 @@ fn noreplace_rejects_existing_names_aliases_and_self_without_native_changes() {
                 OsStr::new(name), libc::RENAME_NOREPLACE,
             ), libc::EEXIST);
         }
-        for flags in [libc::RENAME_EXCHANGE, libc::RENAME_WHITEOUT, 3, 5, u32::MAX] {
+        for flags in [libc::RENAME_WHITEOUT, 3, 5, u32::MAX] {
             expect_errno(ops.rename2(
                 &cx, &mut scope, ROOT, OsStr::new("SOURCE.BIN"), ROOT,
                 OsStr::new("NEW.BIN"), flags,
             ), libc::EINVAL);
         }
+        expect_errno(ops.rename2(
+            &cx, &mut scope, ROOT, OsStr::new("SOURCE.BIN"), ROOT,
+            OsStr::new("NEW.BIN"), libc::RENAME_EXCHANGE,
+        ), libc::ENOENT);
         expect_errno(ops.rename2(
             &cx, &mut scope, ROOT, OsStr::new("MISSING.BIN"), ROOT,
             OsStr::new("NEW.BIN"), libc::RENAME_NOREPLACE,
