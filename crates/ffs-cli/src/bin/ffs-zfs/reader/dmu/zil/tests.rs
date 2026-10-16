@@ -9,6 +9,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
 
 mod topology;
+mod indirect;
 
 const BASE: u64 = 4096;
 const LENGTH: u64 = 64 * 1024 * 1024;

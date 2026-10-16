@@ -6,6 +6,7 @@
 //! binds each block to that identity. This is not ordinary DMU I/O.
 //! No pool claim, replay-sequence update, allocation or backing write occurs.
 
+mod indirect;
 mod recovery;
 mod storage;
 
@@ -378,10 +379,7 @@ impl Edit<'_> {
     }
 }
 
-fn edit(record: &Record) -> Result<Edit<'_>> {
-    if !matches!(record.kind, 9 | 10) {
-        return Err(unsupported("file-data ZIL recovery refuses pending namespace, attribute and other record types"));
-    }
+fn file_range(record: &Record) -> Result<(u64, u64, u64)> {
     let raw = &record.raw;
     let object = word(raw, 32, record.order)?;
     let offset = word(raw, 40, record.order)?;
@@ -389,6 +387,15 @@ fn edit(record: &Record) -> Result<Edit<'_>> {
     if object == 0 || object >= (1_u64 << 48) || offset > i64::MAX as u64 || length > i64::MAX as u64 - offset {
         return Err(corrupt("ZIL file identity or signed file range is invalid"));
     }
+    Ok((object, offset, length))
+}
+
+fn edit(record: &Record) -> Result<Edit<'_>> {
+    if !matches!(record.kind, 9 | 10) {
+        return Err(unsupported("file-data ZIL recovery refuses pending namespace, attribute and other record types"));
+    }
+    let raw = &record.raw;
+    let (object, offset, length) = file_range(record)?;
     if record.kind == 10 {
         if raw.len() != 56 || length != 0 {
             return Err(unsupported("file-data ZIL recovery admits EOF truncation, not range-free records"));
@@ -475,20 +482,15 @@ impl Objects {
         if log.termination == Termination::UnverifiedTail && !allow_unverified_tail {
             return Err(unsupported("unverified ZIL tail: explicit prefix-recovery authorization is required"));
         }
-        let mut edits = Vec::new();
-        for record in &log.records {
-            checkpoint(cx)?;
-            if record.pending {
-                edits.push(edit(record)?);
-            }
-        }
+        let plan = indirect::Plan::new(cx, &log.records)?;
         let mut view = self.zpl(cx, components)?;
         let object = view.resolve(cx, path)?;
         let (metadata, _) = view.stat(cx, object)?;
         if metadata.kind != Kind::Regular {
             return Err(unsupported("ZIL recovered read requires an existing regular file"));
         }
-        edits.retain(|edit| edit.object() == object);
+        let data = plan.load(cx, &self.pool, &self.config, object)?;
+        let edits = indirect::edits(cx, &log.records, &data, object)?;
         let file_size = edits.iter().fold(metadata.size, |size, edit| edit.size_after(size));
         let length = file_size.saturating_sub(start).min(bytes as u64) as usize;
         let result = recovery::read(cx, metadata.size, start, length, &edits, |at, count| {
