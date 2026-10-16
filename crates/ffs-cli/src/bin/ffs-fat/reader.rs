@@ -55,6 +55,9 @@ impl ImageArgs {
 const MAX_DIRECTORY_SLOTS: usize = 65_536;
 pub const MAX_CHAIN_CLUSTERS: usize = 8_388_608;
 const MAX_READ_BYTES: usize = 16 * 1024 * 1024;
+// Bound each physical transfer independently of the caller's logical request.
+// Small-cluster volumes must not require one device call per contiguous cluster.
+const MAX_READ_RUN_BYTES: usize = 64 * 1024;
 
 pub fn checkpoint(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FfsError::Cancelled)
@@ -605,6 +608,9 @@ impl FatVolume {
         Ok(clusters)
     }
 
+    /// Read exact logical bytes from a previously validated allocation chain.
+    /// Merge consecutive physical clusters without prefetching beyond the
+    /// requested range or EOF. Keep the result private until every run succeeds.
     pub fn read(&self, cx: &Cx, chain: &FileChain, offset: u64, size: usize) -> Result<Vec<u8>> {
         checkpoint(cx)?;
         if size > MAX_READ_BYTES {
@@ -615,15 +621,36 @@ impl FatVolume {
         let cluster_bytes = u64::from(self.geometry.cluster_bytes());
         let mut done = 0;
         while done < length {
+            checkpoint(cx)?;
             let file_offset = offset + done as u64;
-            let index = (file_offset / cluster_bytes) as usize;
+            let mut index = (file_offset / cluster_bytes) as usize;
             let within = file_offset % cluster_bytes;
-            let cluster = chain
+            let mut cluster = *chain
                 .clusters
                 .get(index)
                 .ok_or_else(|| corrupt(0, "FAT file map does not cover read"))?;
-            let count = (length - done).min((cluster_bytes - within) as usize);
-            let physical = self.cluster_offset(*cluster)? + within;
+            let limit = (length - done).min(MAX_READ_RUN_BYTES);
+            let mut count = limit.min((cluster_bytes - within) as usize);
+            let physical = self.cluster_offset(cluster)? + within;
+            while count < limit {
+                checkpoint(cx)?;
+                let next = *chain
+                    .clusters
+                    .get(index + 1)
+                    .ok_or_else(|| corrupt(0, "FAT file map does not cover read"))?;
+                if cluster.checked_add(1) != Some(next) {
+                    break;
+                }
+                // Numerically adjacent is not sufficient: reserved/out-of-range
+                // cluster IDs must pass the same geometry check as a new run.
+                let next_offset = self.cluster_offset(next)?;
+                if physical.checked_add(count as u64) != Some(next_offset) {
+                    return Err(corrupt(physical, "FAT read run is not physically contiguous"));
+                }
+                count += (limit - count).min(cluster_bytes as usize);
+                cluster = next;
+                index += 1;
+            }
             self.read_exact(cx, physical, &mut result[done..done + count])?;
             done += count;
         }
@@ -733,4 +760,6 @@ impl<'a> FatTable<'a> {
 companion_bin_tests! {
     #[cfg(test)]
     mod tests;
+    #[cfg(test)]
+    mod read_spans_tests;
 }
