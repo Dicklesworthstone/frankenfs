@@ -5,6 +5,7 @@ mod path;
 mod seek;
 pub mod snapshots;
 mod xattrs;
+mod zil_records;
 
 pub use path::PathPolicy;
 
@@ -12,7 +13,7 @@ use super::{
     BTreeSet, BlockPointer, Cx, FfsError, MAX_READ_BYTES, Object, ObjectSet, Objects, Result,
     VecDeque, checkpoint, corrupt, parse, unsupported,
 };
-use ffs_ondisk::zfs_dmu::{ZapEntry, ZilBlock, ZilHeader, ZilRecordPayload};
+use ffs_ondisk::zfs_dmu::{ZapEntry, ZilHeader, ZilRecordPayload};
 use ffs_ondisk::zfs_zpl::{Attributes, Kind, Metadata, SA_BYTES, SaRegistry, directory_reference};
 use std::collections::BTreeMap;
 
@@ -223,7 +224,7 @@ impl Zpl {
             let Some((raw, order)) = self.objects.read_zil_block(cx, &bp)? else {
                 break;
             };
-            let zblk = ZilBlock::parse(&raw, order).map_err(|e| parse(&e))?;
+            let zblk = zil_records::parse(cx, &raw, order)?;
             overlay.stats.blocks_visited += 1;
             for rec in zblk.records {
                 checkpoint(cx)?;
