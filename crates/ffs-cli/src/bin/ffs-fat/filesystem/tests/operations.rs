@@ -121,7 +121,7 @@ fn fallocate_invalid_ranges_and_unsupported_modes_are_byte_preserving() {
             (u64::from(u32::MAX), 1, 0, libc::EFBIG),
             (0, u64::from(u32::MAX) + 1, 0, libc::EFBIG),
             (0, 4096, libc::FALLOC_FL_PUNCH_HOLE | libc::FALLOC_FL_KEEP_SIZE, libc::EOPNOTSUPP),
-            (0, 4096, libc::FALLOC_FL_ZERO_RANGE, libc::EOPNOTSUPP),
+            (0, 4096, libc::FALLOC_FL_ZERO_RANGE | libc::FALLOC_FL_PUNCH_HOLE, libc::EOPNOTSUPP),
             (0, 4096, -1, libc::EOPNOTSUPP),
         ] {
             expect_errno(fs.fallocate(&cx, &mut scope, ino, offset, length, mode), errno);
