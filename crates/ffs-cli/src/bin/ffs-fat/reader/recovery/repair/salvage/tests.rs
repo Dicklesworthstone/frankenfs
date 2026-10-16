@@ -16,7 +16,8 @@ fn end(kind: FatKind) -> u32 {
 
 fn options(image: ImageArgs, output: &Path) -> RecoverArgs {
     RecoverArgs {
-        image, offline_image: true, reclaim_lost: false,
+        image, offline_image: true, reclaim_lost: false, discard_orphan_lfn: false,
+        repair_mirrors_from: None,
         salvage_to: Some(output.to_path_buf()), dry_run: false,
     }
 }
@@ -269,7 +270,7 @@ fn backing_is_read_only_even_during_success_and_failed_reads_do_not_emit_partial
     let (directory, image, expected) = fragmented("fat16");
     let (diagnostic, device) = diagnostic(&image);
     let cx = Cx::for_testing();
-    let plan = Plan::prepare(&cx, &diagnostic, true).unwrap();
+    let plan = Plan::prepare(&cx, &diagnostic, true, false).unwrap();
     let export = Salvage::prepare(&cx, &diagnostic.volume, plan, &directory.path().join("readonly")).unwrap();
     export.execute(&cx, &diagnostic.volume, || Ok(())).unwrap();
     let cluster = diagnostic.volume.geometry.cluster_bytes() as usize;
@@ -280,7 +281,7 @@ fn backing_is_read_only_even_during_success_and_failed_reads_do_not_emit_partial
     assert!(stream_chain(&cx, &diagnostic.volume, &[100, 300, 200], &mut received, &mut buffer).is_err());
     assert_eq!(received, expected[..cluster]);
     let output = directory.path().join("failed");
-    let plan = Plan::prepare(&cx, &diagnostic, true).unwrap();
+    let plan = Plan::prepare(&cx, &diagnostic, true, false).unwrap();
     let export = Salvage::prepare(&cx, &diagnostic.volume, plan, &output).unwrap();
     assert!(export.execute(&cx, &diagnostic.volume, || Ok(())).is_err());
     assert!(!output.join("manifest.json").exists());
@@ -294,7 +295,7 @@ fn cancellation_and_changed_source_keep_partial_evidence_without_success_manifes
     for cancel in [false, true] {
         let cx = Cx::for_testing();
         let output = directory.path().join(if cancel { "cancelled" } else { "changed" });
-        let plan = Plan::prepare(&cx, &diagnostic, true).unwrap();
+        let plan = Plan::prepare(&cx, &diagnostic, true, false).unwrap();
         let export = Salvage::prepare(&cx, &diagnostic.volume, plan, &output).unwrap();
         let mut checks = 0;
         assert!(export.execute(&cx, &diagnostic.volume, || {

@@ -4,7 +4,8 @@
 //! selects the newest comparable USA-validated restart area, requires it to
 //! be clean, or verifies a completely erased log. It never rolls back to an
 //! older clean copy over newer dirty or uncertain recovery state.
-//! This is not ARIES replay, hibernation detection, or writable admission.
+//! Dirty-log preflight stages supported MFT edits only in private memory; it
+//! does not publish a recovered view, detect hibernation or admit writes.
 //!
 //! Layout references: NTFS-3G 2022.10.3 include/ntfs-3g/logfile.h and Linux
 //! v6.17 fs/ntfs3/fslog.c. Their single-client records reserve different name
@@ -49,9 +50,12 @@ pub(super) fn admit(cx: &Cx, volume: &NtfsVolume) -> Result<()> {
     let record = volume.record(cx, 2, None)?;
     let stream = volume.data_stream(cx, &record, &[])?;
     validate_storage(&stream)?;
-    assess(cx, stream.size, |offset, size| {
-        volume.read(cx, &stream, offset, size)
-    })
+    assess_volume(
+        cx,
+        stream.size,
+        |offset, size| volume.read(cx, &stream, offset, size),
+        Some(volume),
+    )
 }
 
 fn validate_storage(stream: &Stream) -> Result<()> {
@@ -121,10 +125,11 @@ fn read_exact(
     Ok(value)
 }
 
-fn assess(
+fn assess_volume(
     cx: &Cx,
     length: u64,
     mut read: impl FnMut(u64, usize) -> Result<Vec<u8>>,
+    volume: Option<&NtfsVolume>,
 ) -> Result<()> {
     checkpoint(cx)?;
     if !(MIN_LOG..=MAX_LOG).contains(&length) || !length.is_multiple_of(SECTOR as u64) {
@@ -168,13 +173,22 @@ fn assess(
     )?;
     let selected = selection::choose(&first, &second)?;
     if !selected.clean {
-        let tail = record::validate_dirty_tail(cx, selected, length, &mut read)?;
+        let tail = record::validate_dirty_volume(cx, selected, length, &mut read, volume)?;
         return Err(unsupported(format!(
             "$LogFile requires native redo/undo recovery before mounting; current transaction {} has redo opcode {:#04x} and undo opcode {:#04x}",
             tail.transaction_id, tail.redo_op, tail.undo_op
         )));
     }
     checkpoint(cx)
+}
+
+#[cfg(test)]
+fn assess(
+    cx: &Cx,
+    length: u64,
+    read: impl FnMut(u64, usize) -> Result<Vec<u8>>,
+) -> Result<()> {
+    assess_volume(cx, length, read, None)
 }
 
 fn restart(cx: &Cx, mut page: Vec<u8>, stream_length: u64) -> Result<Restart> {

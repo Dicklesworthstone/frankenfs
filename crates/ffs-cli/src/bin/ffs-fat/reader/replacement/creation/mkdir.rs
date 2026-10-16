@@ -4,6 +4,7 @@
 //! synchronized before its FAT allocation or parent namespace entry is published.
 //! Parent long-name and growth ordering is shared with file creation.
 
+mod exchange;
 mod rename_in_place;
 mod spelling;
 
@@ -78,6 +79,10 @@ pub struct RenameArgs {
     /// Refuse any existing destination, including another spelling or alias.
     #[arg(long)]
     no_replace: bool,
+    /// Swap two existing objects without temporary names or allocation.
+    /// Serialized operation; native multi-sector FAT updates are not crash-atomic.
+    #[arg(long, conflicts_with = "no_replace")]
+    exchange: bool,
     /// Confirm exclusive ownership: no mounted or unrelated image writers.
     #[arg(long, required = true)]
     offline_image: bool,
@@ -1221,6 +1226,9 @@ pub fn run_rename(cx: &Cx, args: &RenameArgs) -> Result<serde_json::Value> {
     if !args.offline_image {
         bail!("--offline-image is required");
     }
+    if args.exchange && args.no_replace {
+        bail!("--exchange and --no-replace are mutually exclusive");
+    }
     let volume = if args.image.sidecar.is_some() {
         super::super::open_volume(cx, &args.image, !args.dry_run)?
     } else {
@@ -1241,9 +1249,13 @@ pub fn run_rename(cx: &Cx, args: &RenameArgs) -> Result<serde_json::Value> {
         stable(&image, &args.image.image, image_stamp)?;
         volume
     };
-    let mut report = rename_with_mode(
-        cx, &volume, &args.from, &args.to, args.dry_run, args.no_replace,
-    )?;
+    let mut report = if args.exchange {
+        volume.rename_exchange(cx, &args.from, &args.to, args.dry_run)?
+    } else {
+        rename_with_mode(
+            cx, &volume, &args.from, &args.to, args.dry_run, args.no_replace,
+        )?
+    };
     if !args.dry_run && args.image.sidecar.is_some() {
         report["sidecar_refreshed"] = true.into();
     }

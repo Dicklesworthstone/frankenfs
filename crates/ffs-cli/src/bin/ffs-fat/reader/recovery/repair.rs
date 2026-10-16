@@ -2,6 +2,8 @@
 //! Reclaim only allocation proven unreachable by complete independent namespace
 //! walks. Never choose a conflicting FAT or guess an owner for a cross-link.
 
+mod long_names;
+mod mirrors;
 mod salvage;
 
 use super::{DiagnosticVolume, FatCheckReport, FatKind, FatVolume, ImageArgs, Stamp,
@@ -30,6 +32,15 @@ pub struct RecoverArgs {
     /// Never repairs ambiguous ownership; use --salvage-to to preserve raw data.
     #[arg(long, conflicts_with = "salvage_to")]
     reclaim_lost: bool,
+    /// Retire only long-name records proved to have no live short entry.
+    /// Does not repair names attached to live files or authorize cluster loss.
+    #[arg(long, conflicts_with = "salvage_to")]
+    discard_orphan_lfn: bool,
+    /// Reconcile mirrored allocation tables using this zero-based copy only.
+    /// Conflicting allocation in other copies is discarded; payload integrity
+    /// is not established. Inactive FAT32 tables are never repair candidates.
+    #[arg(long, value_name = "COPY", conflicts_with_all = ["reclaim_lost", "discard_orphan_lfn", "salvage_to"])]
+    repair_mirrors_from: Option<u8>,
     /// Export unambiguous lost chains into a NEW private host directory.
     /// Leaves the image unchanged. Files include slack and may contain sensitive
     /// deleted data; original names and logical lengths cannot be inferred.
@@ -106,10 +117,11 @@ struct Plan {
     before: FatCheckReport,
     /// Ascending cluster ID and exact masked successor, never truncated findings.
     lost: Vec<(u32, u32)>,
+    orphan_names: long_names::Names,
 }
 
 impl Plan {
-    fn prepare(cx: &Cx, diagnostic: &DiagnosticVolume, allow_lost: bool) -> Result<Self> {
+    fn prepare(cx: &Cx, diagnostic: &DiagnosticVolume, allow_lost: bool, discard_orphan_lfn: bool) -> Result<Self> {
         let before = diagnostic.report(cx)?;
         if !before.complete || !before.namespace_complete || before.omitted_issues != 0 {
             bail!("recovery requires complete, untruncated allocation and namespace evidence");
@@ -118,6 +130,7 @@ impl Plan {
             if !matches!(issue.kind,
                 "native_boot_dirty" | "native_fat_dirty" | "lost_allocation"
                 | "fs_info_free_count" | "fs_info_next_free")
+                && !(discard_orphan_lfn && issue.kind == "invalid_long_name")
             {
                 bail!("recovery refuses {}: {}; no changes were made", issue.kind, issue.detail);
             }
@@ -126,8 +139,18 @@ impl Plan {
         if count != 0 && !allow_lost {
             bail!("{count} unreachable clusters require --salvage-to to export raw data or explicit --reclaim-lost to discard allocation; retain a separate copy first");
         }
+        // An aggregate invalid_long_name finding is NOT repair authority.
+        // Independently classify every record set and preserve a fingerprint
+        // of the complete retained namespace before accepting this exception.
+        let orphan_names = if discard_orphan_lfn
+            && before.issues.iter().any(|issue| issue.kind == "invalid_long_name")
+        {
+            long_names::Names::prepare(cx, &diagnostic.volume, &before)?
+        } else {
+            long_names::Names::default()
+        };
         let lost = collect_lost(cx, &diagnostic.volume, &before)?;
-        Ok(Self { before, lost })
+        Ok(Self { before, lost, orphan_names })
     }
 
     fn report(&self, dry_run: bool) -> serde_json::Value {
@@ -136,6 +159,7 @@ impl Plan {
             "format": self.before.format, "volume_offset": self.before.volume_offset,
             "volume_bytes": self.before.volume_bytes,
             "planned_reclaimed_clusters": self.lost.len(),
+            "planned_retired_lfn_records": self.orphan_names.count(),
             "free_clusters_after": self.before.free_clusters + self.lost.len() as u64,
             "before": self.before,
             "file_contents_verified": false,
@@ -151,17 +175,22 @@ impl Plan {
             return Ok(report);
         }
         let volume = &diagnostic.volume;
+        // Repeat the entire namespace proof before even setting a dirty bit.
+        self.orphan_names.validate(cx, volume)?;
         let mut phase = "persisting native dirty state";
         let result = (|| -> Result<serde_json::Value> {
             set_state(cx, diagnostic, true)?;
             set_hints(cx, volume, u32::MAX)?;
             volume.device.sync(cx)?;
+            phase = "retiring verified unbound long-name records";
+            self.orphan_names.retire(cx, volume)?;
             phase = "reclaiming verified unreachable allocation";
             free_lost(cx, volume, &self.lost)?;
             let free_after = self.before.free_clusters + self.lost.len() as u64;
             set_hints(cx, volume, u32::try_from(free_after)?)?;
             volume.device.sync(cx)?;
             phase = "verifying repaired allocation and namespace";
+            self.orphan_names.verify(cx, volume)?;
             let mut table = FatTable::new(volume);
             for &(cluster, _) in &self.lost {
                 if table.entry(cx, cluster)? != FatEntry::Free {
@@ -197,6 +226,7 @@ impl Plan {
             let mut report = self.report(false);
             report["changed"] = true.into();
             report["reclaimed_clusters"] = self.lost.len().into();
+            report["retired_lfn_records"] = self.orphan_names.count().into();
             report["durability"] = "repaired_metadata_and_clean_state_synced".into();
             report["verification"] = serde_json::to_value(verification)?;
             Ok(report)
@@ -390,8 +420,16 @@ fn free_lost(cx: &Cx, volume: &FatVolume, lost: &[(u32, u32)]) -> Result<()> {
 fn recover(cx: &Cx, args: &RecoverArgs) -> Result<serde_json::Value> {
     checkpoint(cx)?;
     if !args.offline_image { bail!("--offline-image is required for structural recovery"); }
+    if args.repair_mirrors_from.is_some()
+        && (args.reclaim_lost || args.discard_orphan_lfn || args.salvage_to.is_some())
+    {
+        bail!("mirror reconciliation is a separate operation; do not combine it with allocation/name cleanup or salvage");
+    }
     if args.reclaim_lost && args.salvage_to.is_some() {
         bail!("--salvage-to never modifies the image and cannot be combined with --reclaim-lost");
+    }
+    if args.discard_orphan_lfn && args.salvage_to.is_some() {
+        bail!("--salvage-to is read-only and cannot be combined with --discard-orphan-lfn");
     }
     reject_sidecar(&args.image)?;
     let (file, stamp) = open(args)?;
@@ -399,7 +437,14 @@ fn recover(cx: &Cx, args: &RecoverArgs) -> Result<serde_json::Value> {
         file: Arc::clone(&file), length: stamp.length,
         writable: !args.dry_run && args.salvage_to.is_none(),
     }), &args.image)?;
-    let plan = Plan::prepare(cx, &diagnostic, args.reclaim_lost || args.salvage_to.is_some())?;
+    if let Some(copy) = args.repair_mirrors_from {
+        let plan = mirrors::MirrorPlan::prepare(cx, diagnostic, copy, &args.image)?;
+        stable(&file, &args.image.image, stamp)?;
+        checkpoint(cx)?;
+        return if args.dry_run { Ok(plan.report(true)) } else { plan.execute(cx) };
+    }
+    let plan = Plan::prepare(cx, &diagnostic,
+        args.reclaim_lost || args.salvage_to.is_some(), args.discard_orphan_lfn)?;
     stable(&file, &args.image.image, stamp)?;
     checkpoint(cx)?;
     if let Some(output) = &args.salvage_to {

@@ -169,6 +169,12 @@ impl Pool {
         }
     }
 
+    /// Immutable handles retained by the admitted native topology. Log blocks
+    /// use their own checksum boundary rather than the ordinary DMU decoder.
+    pub(super) fn leaves(&self) -> &[Leaf] {
+        &self.members
+    }
+
     pub fn root(
         &self,
         cx: &Cx,

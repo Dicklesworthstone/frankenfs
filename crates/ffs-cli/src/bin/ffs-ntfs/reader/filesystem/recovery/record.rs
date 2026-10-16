@@ -3,13 +3,14 @@
 //! This is the first read-only recovery primitive after restart-area admission.
 //! It validates the record page's update-sequence protection and the native LFS
 //! record envelope, then follows retained transaction and checkpoint references.
-//! Decoding and preflight do not apply operations or establish replay readiness.
+//! With a volume, preflight stages supported FILE edits privately. This does not
+//! establish a recovered view or authorize backing writes.
 
 mod payload;
 mod preflight;
 
 use super::{
-    Cx, Restart, Result, SECTOR, bytes, checkpoint, corrupt, read_exact, u16_at, u32_at, u64_at,
+    Cx, NtfsVolume, Restart, Result, SECTOR, bytes, checkpoint, corrupt, read_exact, u16_at, u32_at, u64_at,
     unsupported,
 };
 
@@ -400,13 +401,14 @@ fn read_record(
 }
 
 /// Preflight the selected checkpoint and reachable retained transaction links.
-/// A successful return is still NOT permission to replay or mount a dirty log.
-/// Analysis of the entire chronological log and native redo/undo remain required.
-pub(super) fn validate_dirty_tail(
+/// With an immutable volume, execute the supported MFT recovery profile in a
+/// private stage. Success is NOT permission to publish it or mount a dirty log.
+pub(super) fn validate_dirty_volume(
     cx: &Cx,
     restart: &Restart,
     stream_length: u64,
     read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
+    volume: Option<&NtfsVolume>,
 ) -> Result<TailRecord> {
     checkpoint(cx)?;
     for (reference, label) in [
@@ -434,9 +436,21 @@ pub(super) fn validate_dirty_tail(
         restart.current_lsn,
         &mut bounded,
     )?;
-    preflight::validate(cx, restart, stream_length, &tail, &mut bounded)?;
+    preflight::validate(cx, restart, stream_length, &tail, &mut bounded, volume)?;
     checkpoint(cx)?;
     Ok(tail.summary)
+}
+
+/// Journal-only fixtures exercise the identical bounded decoding and Analysis
+/// path without inventing target records or an allocation-bitmap authority.
+#[cfg(test)]
+pub(super) fn validate_dirty_tail(
+    cx: &Cx,
+    restart: &Restart,
+    stream_length: u64,
+    read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
+) -> Result<TailRecord> {
+    validate_dirty_volume(cx, restart, stream_length, read, None)
 }
 
 #[cfg(test)]

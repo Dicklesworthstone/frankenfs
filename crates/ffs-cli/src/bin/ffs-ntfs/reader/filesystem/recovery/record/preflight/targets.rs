@@ -665,7 +665,7 @@ mod tests {
                 restart.file_size, &records[2], &mut |offset, size| {
                     assert_eq!(size, PAGE);
                     pages.get(&offset).cloned().ok_or_else(|| corrupt(offset, "unexpected fixture read"))
-                });
+                }, None);
             assert_eq!(result.is_err(), conflict);
             assert_eq!(pages, before);
         }

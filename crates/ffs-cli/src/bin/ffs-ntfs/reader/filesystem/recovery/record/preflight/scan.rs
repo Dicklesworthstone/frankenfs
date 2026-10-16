@@ -377,7 +377,7 @@ mod tests {
         // The selected tail itself remains valid and points only to the first
         // transaction. The complete preflight must nevertheless see the damage.
         let tail = read_record(&cx, &restart, LOG, restart.current_lsn, &mut read).unwrap();
-        assert!(super::super::validate(&cx, &restart, LOG, &tail, &mut read).is_err());
+        assert!(super::super::validate(&cx, &restart, LOG, &tail, &mut read, None).is_err());
     }
 
     #[test]

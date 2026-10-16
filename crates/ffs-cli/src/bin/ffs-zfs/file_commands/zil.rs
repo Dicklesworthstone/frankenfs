@@ -42,8 +42,8 @@ fn preflight(candidate: &CandidateArgs) -> Result<()> {
     if candidate.image.sidecar.is_some() {
         bail!("read-only ZIL inspection/recovery does not admit sidecar healing");
     }
-    if !candidate.members.is_empty() {
-        bail!("ZIL inspection/recovery currently requires a single-leaf pool");
+    if candidate.members.len() > 7 {
+        bail!("at most seven additional ZIL member images are supported");
     }
     Ok(())
 }
@@ -144,14 +144,14 @@ mod tests {
     }
 
     #[test]
-    fn zil_preflight_refuses_healing_members_and_unbounded_ranges_before_open() {
+    fn zil_preflight_refuses_healing_excess_members_and_unbounded_ranges_before_open() {
         for (command, extra) in [
             ("zil-inspect", Vec::new()),
             ("zil-read", vec!["/file", "--bytes", "1"]),
         ] {
             for (options, reason) in [
                 (vec!["--sidecar", "nonexistent-zil-sidecar.rq"], "does not admit sidecar healing"),
-                (vec!["--member", "nonexistent-zil-member.img"], "requires a single-leaf pool"),
+                (["--member", "nonexistent-zil-member.img"].repeat(8), "at most seven additional ZIL member images"),
             ] {
                 let cli = Cli::try_parse_from([
                     "ffs-zfs", command, "nonexistent-zil-fixture.img", "--offline-image", "--auto-import",
@@ -167,5 +167,29 @@ mod tests {
         ]).unwrap();
         let TopCommand::File(command) = cli.command else { panic!("ZIL command"); };
         assert!(command.run(&Cx::for_testing()).unwrap_err().to_string().contains("exceeds 16 MiB"));
+    }
+
+    #[test]
+    fn zil_commands_retain_complete_member_and_partition_selection() {
+        for alias in ["--member", "--mirror-member", "--raidz-member", "--striped-member"] {
+            for (command, extra) in [
+                ("zil-inspect", Vec::new()),
+                ("zil-read", vec!["/file", "--bytes", "4096"]),
+            ] {
+                let cli = Cli::try_parse_from([
+                    "ffs-zfs", command, "first.img", "--offline-image", "--auto-import",
+                    alias, "second.img", "--offset", "4096", "--length", "67108864",
+                ].into_iter().chain(extra)).unwrap();
+                let candidate = match cli.command {
+                    TopCommand::File(FileCommand::Zil(Command::ZilInspect { candidate, .. }
+                        | Command::ZilRead { candidate, .. })) => candidate,
+                    _ => panic!("ZIL command"),
+                };
+                assert_eq!(candidate.members, [PathBuf::from("second.img")]);
+                assert_eq!((candidate.image.offset, candidate.image.length), (4096, Some(67_108_864)));
+                assert!(candidate.image.offline_image);
+                preflight(&candidate).unwrap();
+            }
+        }
     }
 }

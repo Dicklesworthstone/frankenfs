@@ -1,6 +1,6 @@
 //! Bounded NTFS 3.1 boot, multi-sector record, attribute and mapping-pair parsing.
 //!
-//! No I/O, replay, decompression or mutation. Sources: Microsoft's
+//! No I/O, decompression or backing-store mutation. Sources: Microsoft's
 //! ATTRIBUTE_RECORD_HEADER, FILE_RECORD_SEGMENT_HEADER and MULTI_SECTOR_HEADER
 //! documentation. Update-sequence protection uses 512-byte strides even when
 //! the BPB advertises larger sectors. Names remain native UTF-16 code units.
@@ -8,6 +8,7 @@
 pub mod attribute_list;
 pub mod ea;
 pub mod index;
+pub mod recovery;
 pub mod reparse;
 
 use ffs_types::ParseError;

@@ -3,6 +3,7 @@
 //! mounted read and write. This is not a crash-atomic transaction protocol;
 //! FAT node identities remain mount-local, not export-stable handles.
 
+mod exchange;
 mod health;
 
 use super::reader::replacement::{
@@ -1024,9 +1025,13 @@ impl FsOps for FatFs {
         flags: u32,
     ) -> Result<()> {
         let operation = self.operation(cx, true)?;
+        if flags == libc::RENAME_EXCHANGE {
+            self.exchange_locked(cx, parent, name, new_parent, new_name)?;
+            return operation.complete(());
+        }
         if flags != 0 && flags != libc::RENAME_NOREPLACE {
-            // Exchange/whiteout and invalid combinations need distinct native
-            // protocols. Never silently degrade them into overwrite rename.
+            // Whiteout and invalid combinations need distinct native protocols.
+            // Never silently degrade them into overwrite rename.
             return Err(FfsError::Io(std::io::Error::from_raw_os_error(
                 libc::EINVAL,
             )));

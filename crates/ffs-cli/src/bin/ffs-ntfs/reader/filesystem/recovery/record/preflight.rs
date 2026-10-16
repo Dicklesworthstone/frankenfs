@@ -2,9 +2,9 @@
 //!
 //! Native layouts: Linux v6.17 fs/ntfs3/fslog.c (NTFS_RESTART,
 //! RESTART_TABLE, TRANSACTION_ENTRY, DIR_PAGE_ENTRY, OPEN_ATTR_ENRTY).
-//! No redo, undo, or backing writes occur here.
 //! Chronological traversal includes interleaved records after checkpoint-start.
-//! Transaction Analysis and loser undo planning do not make an image mountable.
+//! An attached immutable volume also runs bounded private MFT redo/undo staging.
+//! No staged bytes are published; this does not make a dirty image mountable.
 
 mod analysis;
 mod redo;
@@ -12,7 +12,7 @@ mod scan;
 mod table;
 mod targets;
 
-use super::super::super::super::buffer;
+use super::super::super::super::{NtfsVolume, buffer};
 use super::{
     Cx, LFS_CLIENT_RECORD, LFS_CLIENT_RESTART, LogRecord, Restart, Result, checkpoint, corrupt,
     read_record, u16_at, u32_at, u64_at, unsupported, validate_lsn_reference,
@@ -347,6 +347,7 @@ pub(super) fn validate(
     stream_length: u64,
     tail: &LogRecord,
     read: &mut impl FnMut(u64, usize) -> Result<Vec<u8>>,
+    volume: Option<&NtfsVolume>,
 ) -> Result<()> {
     checkpoint(cx)?;
     let mut references = References::default();
@@ -428,6 +429,14 @@ pub(super) fn validate(
     }
     let redo_plan = targets.as_ref().map(|targets| redo::build(cx, targets, &history)).transpose()?;
     let redo_summary = redo_plan.as_ref().map(redo::Plan::summary);
+    let replay_summary = match (volume, redo_plan.as_ref(), targets.as_ref()) {
+        (Some(volume), Some(plan), Some(targets)) => Some(plan.stage(
+            cx,
+            redo::ReplayInput { volume, restart, targets, history: &history, undo: &report },
+            read,
+        )?),
+        _ => None,
+    };
     tracing::debug!(
         target: "ffs::ntfs::recovery",
         active_transactions = report.active,
@@ -445,6 +454,10 @@ pub(super) fn validate(
         redo_native_files = redo_summary.as_ref().map(|summary| summary.files),
         redo_relocated_claims = redo_summary.as_ref().map(|summary| summary.relocated),
         redo_first_lsn = redo_summary.as_ref().and_then(|summary| summary.first_lsn),
+        staged_mft_records = replay_summary.as_ref().map(|summary| summary.records),
+        applied_mft_redo = replay_summary.as_ref().map(|summary| summary.redo),
+        applied_mft_undo = replay_summary.as_ref().map(|summary| summary.undo),
+        skipped_mft_redo = replay_summary.as_ref().map(|summary| summary.skipped),
         "Validated NTFS transaction Analysis through the selected restart; replay remains required"
     );
     checkpoint(cx)

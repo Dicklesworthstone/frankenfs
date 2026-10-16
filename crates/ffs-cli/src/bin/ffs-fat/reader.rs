@@ -55,6 +55,9 @@ impl ImageArgs {
 const MAX_DIRECTORY_SLOTS: usize = 65_536;
 pub const MAX_CHAIN_CLUSTERS: usize = 8_388_608;
 const MAX_READ_BYTES: usize = 16 * 1024 * 1024;
+// Bound each physical transfer independently of the caller's logical request.
+// Small-cluster volumes must not require one device call per contiguous cluster.
+const MAX_READ_RUN_BYTES: usize = 64 * 1024;
 
 pub fn checkpoint(cx: &Cx) -> Result<()> {
     cx.checkpoint().map_err(|_| FfsError::Cancelled)
@@ -605,6 +608,9 @@ impl FatVolume {
         Ok(clusters)
     }
 
+    /// Read exact logical bytes from a previously validated allocation chain.
+    /// Merge consecutive physical clusters without prefetching beyond the
+    /// requested range or EOF. Keep the result private until every run succeeds.
     pub fn read(&self, cx: &Cx, chain: &FileChain, offset: u64, size: usize) -> Result<Vec<u8>> {
         checkpoint(cx)?;
         if size > MAX_READ_BYTES {
@@ -615,15 +621,36 @@ impl FatVolume {
         let cluster_bytes = u64::from(self.geometry.cluster_bytes());
         let mut done = 0;
         while done < length {
+            checkpoint(cx)?;
             let file_offset = offset + done as u64;
-            let index = (file_offset / cluster_bytes) as usize;
+            let mut index = (file_offset / cluster_bytes) as usize;
             let within = file_offset % cluster_bytes;
-            let cluster = chain
+            let mut cluster = *chain
                 .clusters
                 .get(index)
                 .ok_or_else(|| corrupt(0, "FAT file map does not cover read"))?;
-            let count = (length - done).min((cluster_bytes - within) as usize);
-            let physical = self.cluster_offset(*cluster)? + within;
+            let limit = (length - done).min(MAX_READ_RUN_BYTES);
+            let mut count = limit.min((cluster_bytes - within) as usize);
+            let physical = self.cluster_offset(cluster)? + within;
+            while count < limit {
+                checkpoint(cx)?;
+                let next = *chain
+                    .clusters
+                    .get(index + 1)
+                    .ok_or_else(|| corrupt(0, "FAT file map does not cover read"))?;
+                if cluster.checked_add(1) != Some(next) {
+                    break;
+                }
+                // Numerically adjacent is not sufficient: reserved/out-of-range
+                // cluster IDs must pass the same geometry check as a new run.
+                let next_offset = self.cluster_offset(next)?;
+                if physical.checked_add(count as u64) != Some(next_offset) {
+                    return Err(corrupt(physical, "FAT read run is not physically contiguous"));
+                }
+                count += (limit - count).min(cluster_bytes as usize);
+                cluster = next;
+                index += 1;
+            }
             self.read_exact(cx, physical, &mut result[done..done + count])?;
             done += count;
         }
@@ -648,17 +675,23 @@ impl FatVolume {
     }
 }
 
-/// Two bounded sector caches, not an in-memory copy of a potentially huge FAT.
+/// Two demand-sector caches that grow to bounded windows on sequential access.
+/// Cache lifetime remains one operation, never across native mutation. A short
+/// random chain pays only for its demanded sectors, not speculative whole FATs.
 struct FatTable<'a> {
     volume: &'a FatVolume,
     sectors: [Option<(u64, Vec<u8>)>; 2],
+    prefetch_failed: [bool; 2],
 }
 
 impl<'a> FatTable<'a> {
+    const MAX_WINDOW_BYTES: u64 = 64 * 1024;
+
     fn new(volume: &'a FatVolume) -> Self {
         Self {
             volume,
             sectors: [None, None],
+            prefetch_failed: [false; 2],
         }
     }
 
@@ -688,6 +721,7 @@ impl<'a> FatTable<'a> {
     /// Read one copy without declaring it authoritative. The normal reader
     /// requires agreement above; the checker retains disagreements as findings.
     fn raw_entry(&mut self, cx: &Cx, copy: u8, cluster: u32) -> Result<u32> {
+        checkpoint(cx)?;
         let geometry = &self.volume.geometry;
         let sector_bytes = u64::from(geometry.sector_bytes());
         let position = geometry
@@ -695,15 +729,52 @@ impl<'a> FatTable<'a> {
             .map_err(|error| parse_error(&error))?;
         let start = position / sector_bytes * sector_bytes;
         let cache = &mut self.sectors[usize::from(copy)];
-        if cache.as_ref().is_none_or(|(offset, _)| *offset != start) {
-            let mut bytes = allocate(geometry.sector_bytes() as usize)?;
-            self.volume.read_exact(cx, start, &mut bytes)?;
+        let hit = cache.as_ref().is_some_and(|(offset, bytes)| {
+            position >= *offset && position - *offset < bytes.len() as u64
+        });
+        if !hit {
+            let sequential = !self.prefetch_failed[usize::from(copy)]
+                && cache.as_ref().is_some_and(|(offset, bytes)| {
+                    offset.checked_add(bytes.len() as u64) == Some(start)
+                });
+            let length = if sequential {
+                // BPB admission proves capacity for cluster_count + 2 entries.
+                // Round that required coverage to sectors, never into another
+                // FAT copy, FAT16's fixed root, or excess table padding.
+                let width = u64::from(geometry.kind().entry_bytes());
+                let copy_start = position - u64::from(cluster) * width;
+                let coverage = ((u64::from(geometry.cluster_count()) + 2) * width)
+                    .div_ceil(sector_bytes) * sector_bytes;
+                (copy_start + coverage - start).min(Self::MAX_WINDOW_BYTES)
+            } else {
+                sector_bytes
+            };
+            let mut bytes = allocate(length as usize)?;
+            match self.volume.read_exact(cx, start, &mut bytes) {
+                Ok(()) => {}
+                Err(error) if length > sector_bytes && Self::prefetch_failure(&error) => {
+                    // Read-ahead must not make an unrelated damaged sector a
+                    // prerequisite for this entry. Discard ALL failed bytes and
+                    // re-read only the demanded sector through the same checked
+                    // device. Never retry cancellation or authorization errors,
+                    // and never select a different mirror to mask disagreement.
+                    checkpoint(cx)?;
+                    // One failed speculation disables read-ahead for this copy
+                    // for the rest of the operation; do not repeatedly reread a
+                    // bad window for every otherwise healthy demanded sector.
+                    self.prefetch_failed[usize::from(copy)] = true;
+                    bytes = allocate(sector_bytes as usize)?;
+                    self.volume.read_exact(cx, start, &mut bytes)?;
+                }
+                Err(error) => return Err(error),
+            }
+            checkpoint(cx)?;
             *cache = Some((start, bytes));
         }
-        let (_, bytes) = cache
+        let (offset, bytes) = cache
             .as_ref()
             .ok_or_else(|| corrupt(position, "FAT sector cache was not populated"))?;
-        let at = (position - start) as usize;
+        let at = (position - *offset) as usize;
         let value = match geometry.kind() {
             FatKind::Fat16 => u32::from(u16::from_le_bytes([bytes[at], bytes[at + 1]])),
             FatKind::Fat32 => {
@@ -713,6 +784,17 @@ impl<'a> FatTable<'a> {
         };
         checkpoint(cx)?;
         Ok(value)
+    }
+
+    fn prefetch_failure(error: &FfsError) -> bool {
+        match error {
+            FfsError::Corruption { .. } | FfsError::RepairFailed(_) => true,
+            FfsError::Io(error) => {
+                error.kind() == std::io::ErrorKind::UnexpectedEof
+                    || error.raw_os_error() == Some(libc::EIO)
+            }
+            _ => false,
+        }
     }
 
     fn next(&mut self, cx: &Cx, cluster: u32) -> Result<Option<u32>> {
@@ -733,4 +815,6 @@ impl<'a> FatTable<'a> {
 companion_bin_tests! {
     #[cfg(test)]
     mod tests;
+    #[cfg(test)]
+    mod read_spans_tests;
 }

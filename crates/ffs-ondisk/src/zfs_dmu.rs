@@ -4,6 +4,8 @@
 //! Pure parsing only. A parsed dnode does not authorize a block read or import;
 //! its owner must verify block checksums, types, levels, births and volume bounds.
 
+pub mod space_map;
+
 use crate::zfs::{BlockPointer, Endian, MAX_BLOCK_BYTES};
 use ffs_types::ParseError;
 use std::collections::BTreeSet;

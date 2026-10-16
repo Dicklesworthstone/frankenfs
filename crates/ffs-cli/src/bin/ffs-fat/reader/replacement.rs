@@ -23,7 +23,7 @@ use asupersync::{Cx, types::CancelKind};
 use clap::Args;
 use ffs_block::ByteDevice;
 use ffs_error::FfsError;
-use ffs_ondisk::fat::{FatEntry, FatKind};
+use ffs_ondisk::fat::{FatEntry, FatGeometry, FatKind};
 use ffs_types::ByteOffset;
 use sha2::{Digest, Sha256};
 use std::fmt::Write as _;
@@ -238,9 +238,21 @@ fn modified_timestamp(seconds: u64) -> Result<(u16, u16)> {
     Ok((date as u16, time as u16))
 }
 
+/// Shared admission for retained writable handles. The structural checker also
+/// runs inside dirty mutations, so allocation consistency alone cannot prove
+/// that the boot mapping and every selected FAT are safe to start another write.
 fn validate_boot_state(cx: &Cx, volume: &FatVolume) -> Result<()> {
-    // Both native boot copies must begin clean. A surface-test request must
-    // never be silently cleared by either replacement or creation.
+    checkpoint(cx)?;
+    let mut primary = [0; 512];
+    volume.read_exact(cx, 0, &mut primary)?;
+    let geometry = FatGeometry::parse(&primary, volume.geometry.volume_bytes())
+        .map_err(|error| anyhow!("invalid FAT geometry before mutation: {error}"))?;
+    if geometry != volume.geometry {
+        bail!("FAT geometry changed since the volume was opened");
+    }
+    // Validate media/FAT[0], every selected FAT[1] clean/error state, and the
+    // backup geometry. Inactive FATs and reserved high bits retain their policy.
+    volume.validate_admission(cx, &primary)?;
     let state_at = if volume.geometry.kind() == FatKind::Fat16 {
         37
     } else {
@@ -250,12 +262,26 @@ fn validate_boot_state(cx: &Cx, volume: &FatVolume) -> Result<()> {
         let offset = u64::from(number) * u64::from(volume.geometry.sector_bytes());
         let mut boot = [0; 512];
         volume.read_exact(cx, offset, &mut boot)?;
-        if boot[state_at] & 3 != 0 {
+        if boot[state_at] != 0 {
             bail!(
-                "replacement requires clean primary and backup boot state without a surface-test request"
+                "mutation requires clean primary and backup boot state without surface-test requests or unknown flags"
             );
         }
     }
+    if let Some(number) = volume.geometry.fs_info_sector() {
+        let offset = u64::from(number) * u64::from(volume.geometry.sector_bytes());
+        let mut info = [0; 512];
+        volume.read_exact(cx, offset, &mut info)?;
+        if info[..4] != 0x4161_5252_u32.to_le_bytes()
+            || info[484..488] != 0x6141_7272_u32.to_le_bytes()
+            || info[508..512] != 0xAA55_0000_u32.to_le_bytes()
+        {
+            bail!("invalid FSInfo signatures before mutation; image left unchanged");
+        }
+        // Counts and next-free values remain advisory; validate only the
+        // signatures the hint writer needs, before any dirty marker is written.
+    }
+    checkpoint(cx)?;
     Ok(())
 }
 
@@ -614,6 +640,12 @@ fn set_hints(cx: &Cx, volume: &FatVolume, free: u32) -> Result<()> {
 }
 
 fn set_dirty(cx: &Cx, volume: &FatVolume, dirty: bool) -> Result<()> {
+    if dirty {
+        // Prepared plans can outlive preflight. Check the complete retained
+        // mapping and ALL selected reserved records before the first write,
+        // not after dirtying a boot sector or an earlier FAT copy.
+        validate_boot_state(cx, volume)?;
+    }
     let geometry = &volume.geometry;
     let width = geometry.kind().entry_bytes() as usize;
     let (state_at, clean_mask, value_mask) = match geometry.kind() {
@@ -940,4 +972,6 @@ companion_bin_tests! {
     mod tests;
     #[cfg(test)]
     mod read_only_tests;
+    #[cfg(test)]
+    mod admission_tests;
 }
