@@ -13,8 +13,8 @@ use super::reader::replacement::{
 use super::reader::{Directory, Entry, FatVolume, FileChain, MAX_CHAIN_CLUSTERS, checkpoint};
 use asupersync::Cx;
 use ffs_core::{
-    DirEntry, FileType, FsOps, FsStat, InodeAttr, ReaddirPage, RequestScope, SeekWhence,
-    SetAttrRequest,
+    DirEntry, FiemapExtent, FileType, FsOps, FsStat, InodeAttr, ReaddirPage, RequestScope,
+    SeekWhence, SetAttrRequest,
 };
 use ffs_error::{FfsError, Result};
 use ffs_ondisk::fat::{FatKind, FatTimestamp};
@@ -607,6 +607,150 @@ impl FatFs {
     }
 }
 
+const FIEMAP_EXTENT_LAST: u32 = 0x0001;
+const FIEMAP_EXTENT_NOT_ALIGNED: u32 = 0x0100;
+const FIEMAP_EXTENT_UNWRITTEN: u32 = 0x0800;
+
+fn fiemap_corrupt(offset: u64, detail: impl Into<String>) -> FfsError {
+    FfsError::Corruption {
+        block: offset / 512,
+        detail: detail.into(),
+    }
+}
+
+/// Map the complete verified FAT allocation chain into native physical extents.
+///
+/// FAT has no sparse/unwritten extent grammar: logical bytes before EOF are data.
+/// Retained allocation beyond EOF (KEEP_SIZE and final-cluster slack) is reported
+/// as UNWRITTEN so callers can see allocated blocks without treating them as file
+/// contents. Physical offsets are relative to the selected FAT volume.
+fn fat_fiemap(
+    cx: &Cx,
+    chain: &FileChain,
+    cluster_bytes: u32,
+    data_start: u64,
+    volume_bytes: u64,
+    start: u64,
+    length: u64,
+) -> Result<Vec<FiemapExtent>> {
+    checkpoint(cx)?;
+    if cluster_bytes == 0 {
+        return Err(fiemap_corrupt(0, "zero FAT FIEMAP cluster size"));
+    }
+    if chain.clusters.len() > MAX_CHAIN_CLUSTERS {
+        return Err(FfsError::UnsupportedFeature(
+            "FAT FIEMAP chain exceeds the mounted allocation budget".into(),
+        ));
+    }
+    let cluster_bytes = u64::from(cluster_bytes);
+    let capacity = u64::try_from(chain.clusters.len())
+        .ok()
+        .and_then(|clusters| clusters.checked_mul(cluster_bytes))
+        .ok_or_else(|| fiemap_corrupt(0, "FAT FIEMAP logical capacity overflow"))?;
+    if u64::from(chain.size) > capacity {
+        return Err(fiemap_corrupt(
+            u64::from(chain.size),
+            "FAT FIEMAP chain is shorter than the directory-entry size",
+        ));
+    }
+    if length == 0 || chain.clusters.is_empty() {
+        return Ok(Vec::new());
+    }
+    let query_end = start.saturating_add(length);
+    let query = (start, query_end);
+    let file_size = u64::from(chain.size);
+    let mut result = Vec::new();
+    let mut index = 0_usize;
+
+    let mut emit = |logical: u64, physical: u64, extent_length: u64, mut flags: u32| -> Result<()> {
+        if extent_length == 0 {
+            return Ok(());
+        }
+        let end = logical
+            .checked_add(extent_length)
+            .ok_or_else(|| fiemap_corrupt(logical, "FAT FIEMAP extent end overflow"))?;
+        if end == capacity {
+            flags |= FIEMAP_EXTENT_LAST;
+        }
+        if !logical.is_multiple_of(cluster_bytes)
+            || !physical.is_multiple_of(cluster_bytes)
+            || !extent_length.is_multiple_of(cluster_bytes)
+        {
+            flags |= FIEMAP_EXTENT_NOT_ALIGNED;
+        }
+        if logical >= query.1 || end <= query.0 {
+            return Ok(());
+        }
+        result
+            .try_reserve(1)
+            .map_err(|error| FfsError::Io(std::io::Error::other(error)))?;
+        result.push(FiemapExtent {
+            logical,
+            physical,
+            length: extent_length,
+            flags,
+        });
+        Ok(())
+    };
+
+    while index < chain.clusters.len() {
+        checkpoint(cx)?;
+        let first = chain.clusters[index];
+        if first < 2 {
+            return Err(fiemap_corrupt(
+                index as u64 * cluster_bytes,
+                "reserved cluster appears in FAT FIEMAP chain",
+            ));
+        }
+        let mut end_index = index + 1;
+        while end_index < chain.clusters.len()
+            && chain.clusters[end_index - 1].checked_add(1) == Some(chain.clusters[end_index])
+        {
+            end_index += 1;
+        }
+
+        let logical = u64::try_from(index)
+            .ok()
+            .and_then(|value| value.checked_mul(cluster_bytes))
+            .ok_or_else(|| fiemap_corrupt(0, "FAT FIEMAP logical offset overflow"))?;
+        let cluster_delta = u64::from(first - 2);
+        let physical = cluster_delta
+            .checked_mul(cluster_bytes)
+            .and_then(|delta| data_start.checked_add(delta))
+            .ok_or_else(|| fiemap_corrupt(logical, "FAT FIEMAP physical offset overflow"))?;
+        let run_clusters = u64::try_from(end_index - index)
+            .map_err(|_| fiemap_corrupt(logical, "FAT FIEMAP run length overflow"))?;
+        let run_length = run_clusters
+            .checked_mul(cluster_bytes)
+            .ok_or_else(|| fiemap_corrupt(logical, "FAT FIEMAP run byte length overflow"))?;
+        let run_end = logical
+            .checked_add(run_length)
+            .ok_or_else(|| fiemap_corrupt(logical, "FAT FIEMAP logical run overflow"))?;
+        let physical_end = physical
+            .checked_add(run_length)
+            .ok_or_else(|| fiemap_corrupt(logical, "FAT FIEMAP physical run overflow"))?;
+        if physical_end > volume_bytes {
+            return Err(fiemap_corrupt(
+                logical,
+                "FAT FIEMAP physical run exceeds the selected volume",
+            ));
+        }
+
+        let initialized_end = file_size.clamp(logical, run_end);
+        emit(logical, physical, initialized_end - logical, 0)?;
+        emit(
+            initialized_end,
+            physical + (initialized_end - logical),
+            run_end - initialized_end,
+            FIEMAP_EXTENT_UNWRITTEN,
+        )?;
+        index = end_index;
+    }
+
+    checkpoint(cx)?;
+    Ok(result)
+}
+
 impl FsOps for FatFs {
     fn getattr(&self, cx: &Cx, _scope: &mut RequestScope, ino: InodeNumber) -> Result<InodeAttr> {
         let _operation = self.operation(cx, false)?;
@@ -1164,6 +1308,41 @@ impl FsOps for FatFs {
         operation.complete(())
     }
 
+    fn fiemap(
+        &self,
+        cx: &Cx,
+        _scope: &mut RequestScope,
+        ino: InodeNumber,
+        start: u64,
+        length: u64,
+    ) -> Result<Vec<FiemapExtent>> {
+        let _operation = self.operation(cx, false)?;
+        let node = self.node(cx, ino)?;
+        let entry = node.entry.as_ref().ok_or_else(|| {
+            FfsError::Io(std::io::Error::from_raw_os_error(libc::EINVAL))
+        })?;
+        if entry.native.is_directory() {
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                libc::EINVAL,
+            )));
+        }
+        let chain = self.chain(cx, ino, entry)?;
+        let data_start = self
+            .volume
+            .geometry
+            .cluster_offset(2)
+            .map_err(|error| fiemap_corrupt(0, error.to_string()))?;
+        fat_fiemap(
+            cx,
+            &chain,
+            self.volume.geometry.cluster_bytes(),
+            data_start,
+            self.volume.geometry.volume_bytes(),
+            start,
+            length,
+        )
+    }
+
     fn lseek(
         &self,
         cx: &Cx,
@@ -1219,6 +1398,164 @@ mod tests {
 
     mod copy;
     mod operations;
+
+    fn extent(logical: u64, physical: u64, length: u64, flags: u32) -> FiemapExtent {
+        FiemapExtent {
+            logical,
+            physical,
+            length,
+            flags,
+        }
+    }
+
+    #[test]
+    fn fat_fiemap_preserves_fragmentation_and_query_extent_boundaries() {
+        let cx = Cx::for_testing();
+        let chain = FileChain {
+            clusters: vec![5, 6, 10, 11, 12],
+            size: 5 * 512,
+        };
+        let extents = fat_fiemap(&cx, &chain, 512, 4096, 64 * 1024, 0, u64::MAX).unwrap();
+        assert_eq!(
+            extents,
+            vec![
+                extent(0, 4096 + 3 * 512, 2 * 512, 0),
+                extent(2 * 512, 4096 + 8 * 512, 3 * 512, FIEMAP_EXTENT_LAST),
+            ]
+        );
+        assert_eq!(
+            fat_fiemap(&cx, &chain, 512, 4096, 64 * 1024, 1500, 1).unwrap(),
+            vec![extent(
+                2 * 512,
+                4096 + 8 * 512,
+                3 * 512,
+                FIEMAP_EXTENT_LAST
+            )]
+        );
+        assert!(fat_fiemap(&cx, &chain, 512, 4096, 64 * 1024, 3000, 1)
+            .unwrap()
+            .is_empty());
+    }
+
+    #[test]
+    fn fat_fiemap_exposes_keep_size_allocation_as_unwritten() {
+        let cx = Cx::for_testing();
+        let chain = FileChain {
+            clusters: vec![20, 21, 22, 23],
+            size: 1300,
+        };
+        assert_eq!(
+            fat_fiemap(&cx, &chain, 512, 4096, 64 * 1024, 0, u64::MAX).unwrap(),
+            vec![
+                extent(0, 4096 + 18 * 512, 1300, FIEMAP_EXTENT_NOT_ALIGNED),
+                extent(
+                    1300,
+                    4096 + 18 * 512 + 1300,
+                    4 * 512 - 1300,
+                    FIEMAP_EXTENT_LAST | FIEMAP_EXTENT_NOT_ALIGNED | FIEMAP_EXTENT_UNWRITTEN,
+                ),
+            ]
+        );
+
+        let large_clusters = FileChain {
+            clusters: vec![2, 3],
+            size: 1,
+        };
+        assert_eq!(
+            fat_fiemap(&cx, &large_clusters, 4096, 32 * 1024, 128 * 1024, 0, u64::MAX)
+                .unwrap(),
+            vec![
+                extent(0, 32 * 1024, 1, FIEMAP_EXTENT_NOT_ALIGNED),
+                extent(
+                    1,
+                    32 * 1024 + 1,
+                    8191,
+                    FIEMAP_EXTENT_LAST | FIEMAP_EXTENT_NOT_ALIGNED | FIEMAP_EXTENT_UNWRITTEN,
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn fat_fiemap_rejects_invalid_or_cancelled_native_maps() {
+        let cx = Cx::for_testing();
+        for chain in [
+            FileChain {
+                clusters: vec![1],
+                size: 1,
+            },
+            FileChain {
+                clusters: vec![2],
+                size: 513,
+            },
+        ] {
+            assert!(matches!(
+                fat_fiemap(&cx, &chain, 512, 4096, 64 * 1024, 0, u64::MAX),
+                Err(FfsError::Corruption { .. })
+            ));
+        }
+        let overflow = FileChain {
+            clusters: vec![u32::MAX],
+            size: 1,
+        };
+        assert!(matches!(
+            fat_fiemap(&cx, &overflow, 4096, u64::MAX - 1024, u64::MAX, 0, u64::MAX),
+            Err(FfsError::Corruption { .. })
+        ));
+
+        let cancelled = Cx::for_testing();
+        cancelled.set_cancel_requested(true);
+        assert!(matches!(
+            fat_fiemap(
+                &cancelled,
+                &FileChain {
+                    clusters: vec![2],
+                    size: 1,
+                },
+                512,
+                4096,
+                64 * 1024,
+                0,
+                u64::MAX,
+            ),
+            Err(FfsError::Cancelled)
+        ));
+    }
+
+    #[test]
+    fn mounted_fat_fiemap_reports_allocated_tail_and_rejects_directories() {
+        let (_directory, fs) = writable_fat16();
+        let cx = Cx::for_testing();
+        let mut scope = RequestScope::empty();
+        let ino = create_file(&fs, "MAP.BIN");
+        fs.write(&cx, &mut scope, ino, 0, &[0xA5; 701]).unwrap();
+        fs.fallocate(
+            &cx,
+            &mut scope,
+            ino,
+            0,
+            u64::from(fs.volume.geometry.cluster_bytes()) * 3,
+            libc::FALLOC_FL_KEEP_SIZE,
+        )
+        .unwrap();
+        let node = fs.node(&cx, ino).unwrap();
+        let chain = fs.chain(&cx, ino, node.entry.as_ref().unwrap()).unwrap();
+        let extents = fs.fiemap(&cx, &mut scope, ino, 0, u64::MAX).unwrap();
+        assert!(!extents.is_empty());
+        assert_eq!(
+            extents[0].physical,
+            fs.volume
+                .geometry
+                .cluster_offset(chain.clusters[0])
+                .unwrap()
+        );
+        assert!(extents.iter().any(|extent| extent.flags & FIEMAP_EXTENT_UNWRITTEN != 0));
+        assert_ne!(extents.last().unwrap().flags & FIEMAP_EXTENT_LAST, 0);
+        assert!(matches!(
+            fs.fiemap(&cx, &mut scope, ROOT, 0, u64::MAX),
+            Err(FfsError::Io(error)) if error.raw_os_error() == Some(libc::EINVAL)
+        ));
+    }
 
     #[test]
     fn native_wall_time_preserves_precision_absence_and_error_location() {
