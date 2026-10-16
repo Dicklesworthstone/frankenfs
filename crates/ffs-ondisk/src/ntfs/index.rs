@@ -101,7 +101,7 @@ pub fn parse_index_block(raw: &[u8], expected_vcn: u64) -> Result<Vec<NtfsIndexE
     entries(&value, 24, usa_end)
 }
 
-fn entries(
+pub(super) fn entries(
     value: &[u8],
     header: usize,
     minimum_entry: usize,

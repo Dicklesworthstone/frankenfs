@@ -8,6 +8,9 @@
 use super::{NtfsAttribute, NtfsFileRecord, NtfsValue, invalid, le16, le32, le64, restore_record};
 use ffs_types::ParseError;
 
+pub mod directory;
+pub use directory::{IndexEdit, IndexOperation, apply_index_edit};
+
 /// The native operations implemented for an already allocated FILE record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum FileOperation {
@@ -16,6 +19,7 @@ pub enum FileOperation {
     DeleteAttribute,
     UpdateResident { resize: bool },
     SetSizes,
+    IndexRoot(IndexOperation),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -203,6 +207,9 @@ fn edit_bytes(data: &mut [u8], edit: &FileEdit<'_>) -> Result<(), ParseError> {
             data[at..end].copy_from_slice(payload);
             data[end..new_used.max(old_used)].fill(0);
             put32(data, 24, new_used)?;
+        }
+        FileOperation::IndexRoot(operation) => {
+            directory::edit_root(data, at, size, edit, operation)?;
         }
         FileOperation::SetSizes => {
             if relative != 0 || !matches!(payload.len(), 24 | 32) || data[at + 8] != 1

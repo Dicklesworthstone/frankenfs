@@ -7,7 +7,7 @@ use super::{Candidate, Plan, ReplayInput, ReplaySummary};
 use super::super::{LogRecord, checkpoint, corrupt, read_record, targets, u16_at, u64_at, unsupported};
 use super::super::super::super::super::super as reader;
 use reader::{Cx, NtfsVolume, Result, Storage, Stream, parse};
-use ffs_ondisk::ntfs::recovery::{FileEdit, FileEditResult, FileOperation, RecoveryPass, apply_file_edit};
+use ffs_ondisk::ntfs::recovery::{FileEdit, FileEditResult, FileOperation, IndexOperation, RecoveryPass, apply_file_edit};
 use ffs_ondisk::ntfs::{DATA, NtfsFileRecord};
 use std::collections::BTreeMap;
 
@@ -131,6 +131,10 @@ fn operation(record: &LogRecord, undo: bool) -> Result<FileOperation> {
             resize: u16_at(&record.data, 6)? != u16_at(&record.data, 10)?,
         }),
         11 => Ok(FileOperation::SetSizes),
+        0x0C => Ok(FileOperation::IndexRoot(IndexOperation::AddEntry)),
+        0x0D => Ok(FileOperation::IndexRoot(IndexOperation::DeleteEntry)),
+        0x11 => Ok(FileOperation::IndexRoot(IndexOperation::SetChild)),
+        0x13 => Ok(FileOperation::IndexRoot(IndexOperation::UpdateFileName)),
         _ => Err(unsupported(format!(
             "NTFS private MFT replay does not implement required opcode {opcode:#04x}"
         ))),
@@ -368,4 +372,6 @@ pub(super) fn stage(
 companion_bin_tests! {
     #[cfg(test)]
     mod tests;
+    #[cfg(test)]
+    mod directory_tests;
 }
