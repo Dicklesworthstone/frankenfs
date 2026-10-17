@@ -46,12 +46,17 @@ impl Source {
         if length > MAX_READ {
             return Err(unsupported("NTFS source request exceeds 16 MiB"));
         }
-        let length = u64::try_from(length)
-            .map_err(|_| corrupt(offset, "NTFS source length overflow"))?;
+        let length =
+            u64::try_from(length).map_err(|_| corrupt(offset, "NTFS source length overflow"))?;
         offset
             .checked_add(length)
             .filter(|end| *end <= self.length)
-            .ok_or_else(|| corrupt(offset, "NTFS request outside the selected addressable volume"))
+            .ok_or_else(|| {
+                corrupt(
+                    offset,
+                    "NTFS request outside the selected addressable volume",
+                )
+            })
     }
 
     fn read_backing(&self, cx: &Cx, offset: u64, data: &mut [u8]) -> Result<()> {
@@ -157,7 +162,9 @@ fn overlay_capacity(retained: usize, touched: usize, existing: usize) -> Result<
         .checked_add(new)
         .is_none_or(|total| total > MAX_OVERLAY_SECTORS)
     {
-        return Err(unsupported("NTFS recovery overlay exceeds 64 MiB of sector payloads"));
+        return Err(unsupported(
+            "NTFS recovery overlay exceeds 64 MiB of sector payloads",
+        ));
     }
     Ok(())
 }

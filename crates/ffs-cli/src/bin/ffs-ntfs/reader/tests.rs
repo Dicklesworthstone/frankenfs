@@ -435,13 +435,9 @@ fn actual_file_backing_and_adjacent_partition_bytes_remain_unchanged() {
 }
 
 fn build_lfs_rcrd_entry(
-    this_lsn: u64,
-    prev_lsn: u64,
-    undo_next_lsn: u64,
-    tx_id: u32,
-    record_type: u32,
-    redo_op: u16,
-    undo_op: u16,
+    (this_lsn, prev_lsn, undo_next_lsn): (u64, u64, u64),
+    (tx_id, record_type): (u32, u32),
+    (redo_op, undo_op): (u16, u16),
     target_lcn: u64,
     attribute_offset: u16,
     redo_data: &[u8],
@@ -480,10 +476,7 @@ fn logfile_aries_recovery_redoes_committed_and_undoes_loser_transactions_in_over
     let cx = Cx::for_testing();
     let mut image = Image::new();
     // Record 25 has uncommitted dirty resident data ("loser-bad") that Undo should revert to "CLEAN-25!".
-    image.put_record(
-        25,
-        &file_record(25, &[resident(DATA, 0, "", b"loser-bad")]),
-    );
+    image.put_record(25, &file_record(25, &[resident(DATA, 0, "", b"loser-bad")]));
     // Build a 16 KiB (4-page, 32-cluster) $LogFile at LCN 210..242.
     let mut rstr_page = vec![0_u8; 4096];
     rstr_page[0..4].copy_from_slice(b"RSTR");
@@ -522,27 +515,19 @@ fn logfile_aries_recovery_redoes_committed_and_undoes_loser_transactions_in_over
     let rec25_lcn = ((Image::record_offset(25) - BASE) / 512) as u64;
     // Resident attribute at offset 56 has value at offset 24 -> byte 80 in FILE record.
     let e1 = build_lfs_rcrd_entry(
-        100,
-        0,
-        0,
-        1,
-        1,
-        0x07,
-        0x07,
+        (100, 0, 0),
+        (1, 1),
+        (0x07, 0x07),
         rec24_lcn,
         80,
         b"COMMITTED",
         b"resident!",
     );
-    let e2 = build_lfs_rcrd_entry(200, 100, 0, 1, 1, 0x1C, 0x00, 0, 0, &[], &[]);
+    let e2 = build_lfs_rcrd_entry((200, 100, 0), (1, 1), (0x1C, 0x00), 0, 0, &[], &[]);
     let e3 = build_lfs_rcrd_entry(
-        300,
-        0,
-        0,
-        2,
-        1,
-        0x07,
-        0x07,
+        (300, 0, 0),
+        (2, 1),
+        (0x07, 0x07),
         rec25_lcn,
         80,
         b"loser-bad",
@@ -563,10 +548,7 @@ fn logfile_aries_recovery_redoes_committed_and_undoes_loser_transactions_in_over
     // Put MFT record 2 ($LogFile) mapped to 32 clusters at LCN 210 (0xD2):
     image.put_record(
         2,
-        &file_record(
-            2,
-            &[mapped(&[0x21, 32, 210, 0, 0], 32, 16_384, 16_384, 0)],
-        ),
+        &file_record(2, &[mapped(&[0x21, 32, 210, 0, 0], 32, 16_384, 16_384, 0)]),
     );
 
     // 1. Open without recovery: sees unrecovered on-disk bytes.
@@ -585,10 +567,16 @@ fn logfile_aries_recovery_redoes_committed_and_undoes_loser_transactions_in_over
     assert!(unrecovered.logfile_recovery.is_none());
     let rec24_raw = unrecovered.record(&cx, 24, Some(7)).unwrap();
     let s24_raw = unrecovered.data_stream(&cx, &rec24_raw, &[]).unwrap();
-    assert_eq!(unrecovered.read(&cx, &s24_raw, 0, 64).unwrap(), b"resident!");
+    assert_eq!(
+        unrecovered.read(&cx, &s24_raw, 0, 64).unwrap(),
+        b"resident!"
+    );
     let rec25_raw = unrecovered.record(&cx, 25, Some(7)).unwrap();
     let s25_raw = unrecovered.data_stream(&cx, &rec25_raw, &[]).unwrap();
-    assert_eq!(unrecovered.read(&cx, &s25_raw, 0, 64).unwrap(), b"loser-bad");
+    assert_eq!(
+        unrecovered.read(&cx, &s25_raw, 0, 64).unwrap(),
+        b"loser-bad"
+    );
 
     // 2. Open with ARIES recovery: Redo commits record 24, Undo reverts loser record 25.
     let recovered = NtfsVolume::from_device_with_options(

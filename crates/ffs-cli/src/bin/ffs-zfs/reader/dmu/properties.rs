@@ -126,7 +126,7 @@ impl Spec {
                 true,
                 Index::Range(0, 1),
             ),
-            "readonly" => (
+            "readonly" | "snapdev" | "logbias" => (
                 DefaultValue::Number(0),
                 true,
                 true,
@@ -165,14 +165,6 @@ impl Spec {
                 false,
                 false,
                 Index::Range(0, 2),
-            ),
-            "snapdev" | "logbias" => (
-                DefaultValue::Number(0),
-                true,
-                true,
-                true,
-                false,
-                Index::Range(0, 1),
             ),
             "sync" => (
                 DefaultValue::Number(0),

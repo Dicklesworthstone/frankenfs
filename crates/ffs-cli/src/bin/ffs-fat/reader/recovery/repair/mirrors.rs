@@ -486,7 +486,7 @@ mod projection_tests {
                 starts: [16, 80],
                 width,
             };
-            let original: Vec<u8> = (0..128).map(|index| (index * 13 + 7) as u8).collect();
+            let original: Vec<u8> = (0_u32..128).map(|index| (index * 13 + 7) as u8).collect();
             let mut expected = original.clone();
             let mask = if width == 2 { 0xFFFF } else { 0x0FFF_FFFF };
             for start in [16, 80] {

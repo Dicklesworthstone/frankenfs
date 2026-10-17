@@ -231,7 +231,7 @@ impl Objects {
     }
 
     pub(super) fn read_zil_block(
-        &mut self,
+        &self,
         cx: &Cx,
         bp: &BlockPointer,
     ) -> Result<Option<(Vec<u8>, Endian)>> {

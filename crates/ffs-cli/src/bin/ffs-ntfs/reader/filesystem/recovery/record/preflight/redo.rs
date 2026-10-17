@@ -242,7 +242,7 @@ mod tests {
         state.attributes.insert(
             24,
             Attribute {
-                reference: (7 << 48) | 42,
+                reference: (7 << 48) | 0x002a,
                 kind: 0x80,
                 index_bytes: 0,
                 opened: 10,

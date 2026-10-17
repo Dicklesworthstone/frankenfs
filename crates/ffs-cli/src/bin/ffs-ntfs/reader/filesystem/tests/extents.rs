@@ -98,7 +98,8 @@ fn native_compression_padding_is_not_reported_as_a_file_hole() {
     );
     let after_admission = reads.lock().unwrap().len();
     assert_eq!(
-        fs.lseek(&cx, &mut scope, ino, 4096, SeekWhence::Data).unwrap(),
+        fs.lseek(&cx, &mut scope, ino, 4096, SeekWhence::Data)
+            .unwrap(),
         4096
     );
     assert_eq!(reads.lock().unwrap().len(), after_admission);
@@ -115,14 +116,7 @@ fn native_fiemap_reports_sparse_and_unwritten_ranges_without_payload_io() {
     let extents = fs.fiemap(&cx, &mut scope, ino, 0, u64::MAX).unwrap();
     let values: Vec<_> = extents
         .iter()
-        .map(|extent| {
-            (
-                extent.logical,
-                extent.physical,
-                extent.length,
-                extent.flags,
-            )
-        })
+        .map(|extent| (extent.logical, extent.physical, extent.length, extent.flags))
         .collect();
     // Physical offsets exclude the enclosing image's 1024-byte prefix.
     assert_eq!(
@@ -138,7 +132,10 @@ fn native_fiemap_reports_sparse_and_unwritten_ranges_without_payload_io() {
         fs.fiemap(&cx, &mut scope, ino, 512, 1).unwrap(),
         vec![extents[0]]
     );
-    assert!(fs.fiemap(&cx, &mut scope, ino, 0, 512).unwrap().is_empty());
+    assert_eq!(
+        fs.fiemap(&cx, &mut scope, ino, 0, 512).unwrap(),
+        [] as [ffs_core::FiemapExtent; 0]
+    );
     assert_eq!(reads.lock().unwrap().len(), after_admission);
     assert!(reads.lock().unwrap().iter().all(|&(offset, _)| {
         !(BASE as u64 + 590 * 512..BASE as u64 + 602 * 512).contains(&offset)

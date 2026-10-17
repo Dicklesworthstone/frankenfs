@@ -90,7 +90,7 @@ impl FatVolume {
         }
         let end = offset
             .checked_add(length)
-            .filter(|end| *end <= u64::from(u32::MAX))
+            .filter(|end| u32::try_from(*end).is_ok())
             .ok_or_else(|| FfsError::Io(std::io::Error::from_raw_os_error(libc::EFBIG)))?;
         validate_edit_state(cx, self)?;
         let entry = self.resolve(cx, path)?.ok_or(FfsError::IsDirectory)?;

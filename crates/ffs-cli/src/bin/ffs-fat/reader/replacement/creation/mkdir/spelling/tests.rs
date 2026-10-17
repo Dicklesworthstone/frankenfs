@@ -1,6 +1,6 @@
-use super::*;
-use super::super::{rename_in_volume, run_rename};
 use super::super::super::super::{create_in_volume, mkdir_in_volume, open_volume};
+use super::super::{rename_in_volume, run_rename};
+use super::*;
 use clap::Parser as _;
 use ffs_block::ByteDevice;
 use ffs_error::FfsError;
@@ -15,13 +15,25 @@ fn fixture(kind: &str) -> (tempfile::TempDir, crate::reader::ImageArgs, FatVolum
     let directory = tempfile::tempdir().unwrap();
     let image = directory.path().join("rename.fat");
     let cli = crate::Cli::try_parse_from([
-        "ffs-fat", "format", image.to_str().unwrap(), "--kind", kind,
-        "--size-mib", if kind == "fat16" { "4" } else { "64" },
-    ]).unwrap();
-    let crate::Command::Format { options } = cli.command else { panic!("format"); };
+        "ffs-fat",
+        "format",
+        image.to_str().unwrap(),
+        "--kind",
+        kind,
+        "--size-mib",
+        if kind == "fat16" { "4" } else { "64" },
+    ])
+    .unwrap();
+    let crate::Command::Format { options } = cli.command else {
+        panic!("format");
+    };
     crate::formatter::create(&Cx::for_testing(), &options).unwrap();
     let args = crate::reader::ImageArgs {
-        image, offset: 0, length: None, oem_code_page: FatOemCodePage::Ascii, sidecar: None,
+        image,
+        offset: 0,
+        length: None,
+        oem_code_page: FatOemCodePage::Ascii,
+        sidecar: None,
     };
     let volume = open_volume(&Cx::for_testing(), &args, true).unwrap();
     (directory, args, volume)
@@ -47,13 +59,22 @@ fn case_rename_round_trips_sfn_lfn_and_keeps_native_alias_metadata_and_payload()
         let entry = volume.resolve(&cx, "/HELLO.TXT").unwrap().unwrap();
         let mut record = read_slot(&cx, &volume, entry.offset, false).unwrap().bytes;
         let cluster_high = u16::from_le_bytes([record[20], record[21]]);
-        let retained = if kind == "fat16" { 0x4321 } else { cluster_high | 0xA000 };
+        let retained = if kind == "fat16" {
+            0x4321
+        } else {
+            cluster_high | 0xA000
+        };
         record[20..22].copy_from_slice(&retained.to_le_bytes());
-        volume.device.write_all_at(&cx, ByteOffset(entry.offset), &record).unwrap();
+        volume
+            .device
+            .write_all_at(&cx, ByteOffset(entry.offset), &record)
+            .unwrap();
         volume.device.sync(&cx).unwrap();
         let original = volume.resolve(&cx, "/HELLO.TXT").unwrap().unwrap();
         let original_chain = rename_chain(&cx, &volume, &original).unwrap();
-        let original_raw = read_slot(&cx, &volume, original.offset, false).unwrap().bytes;
+        let original_raw = read_slot(&cx, &volume, original.offset, false)
+            .unwrap()
+            .bytes;
         let original_free = volume.free_clusters(&cx).unwrap();
         let mut previous = "/HELLO.TXT";
         for wanted in ["/hello.txt", "/Hello.txt", "/hELLO.TXT", "/HELLO.TXT"] {
@@ -90,29 +111,66 @@ fn long_spelling_and_nonempty_directory_case_changes_preserve_native_identity() 
         let (_directory, _args, volume) = fixture(kind);
         let cx = Cx::for_testing();
         add(&volume, "/A detailed quarterly report.txt");
-        let original = volume.resolve(&cx, "/A detailed quarterly report.txt").unwrap().unwrap();
-        rename_in_volume(&cx, &volume, "/A detailed quarterly report.txt", "/A DETAILED QUARTERLY REPORT.TXT", false).unwrap();
-        let entry = volume.resolve(&cx, "/A DETAILED QUARTERLY REPORT.TXT").unwrap().unwrap();
+        let original = volume
+            .resolve(&cx, "/A detailed quarterly report.txt")
+            .unwrap()
+            .unwrap();
+        rename_in_volume(
+            &cx,
+            &volume,
+            "/A detailed quarterly report.txt",
+            "/A DETAILED QUARTERLY REPORT.TXT",
+            false,
+        )
+        .unwrap();
+        let entry = volume
+            .resolve(&cx, "/A DETAILED QUARTERLY REPORT.TXT")
+            .unwrap()
+            .unwrap();
         assert_eq!(entry.offset, original.offset);
         assert_eq!(entry.native.short_name, original.native.short_name);
         assert_eq!(entry.name().unwrap(), "A DETAILED QUARTERLY REPORT.TXT");
         let alias = original.short_alias().unwrap();
-        assert_eq!(volume.lookup(&cx, Directory::Root, &alias).unwrap().offset, original.offset);
+        assert_eq!(
+            volume.lookup(&cx, Directory::Root, &alias).unwrap().offset,
+            original.offset
+        );
 
         mkdir_in_volume(&cx, &volume, "/DOCS", NOW, false).unwrap();
         add(&volume, "/DOCS/KEEP.TXT");
         let directory = volume.resolve(&cx, "/DOCS").unwrap().unwrap();
         let mut dot_entries = [0; 64];
-        volume.read_exact(&cx, volume.cluster_offset(directory.native.first_cluster).unwrap(), &mut dot_entries).unwrap();
+        volume
+            .read_exact(
+                &cx,
+                volume
+                    .cluster_offset(directory.native.first_cluster)
+                    .unwrap(),
+                &mut dot_entries,
+            )
+            .unwrap();
         rename_in_volume(&cx, &volume, "/DOCS", "/Docs", false).unwrap();
         let renamed = volume.resolve(&cx, "/Docs").unwrap().unwrap();
         assert_eq!(renamed.native.first_cluster, directory.native.first_cluster);
         assert_eq!(renamed.name().unwrap(), "Docs");
         let mut after = [0; 64];
-        volume.read_exact(&cx, volume.cluster_offset(directory.native.first_cluster).unwrap(), &mut after).unwrap();
+        volume
+            .read_exact(
+                &cx,
+                volume
+                    .cluster_offset(directory.native.first_cluster)
+                    .unwrap(),
+                &mut after,
+            )
+            .unwrap();
         assert_eq!(after, dot_entries);
         let child = volume.resolve(&cx, "/Docs/KEEP.TXT").unwrap().unwrap();
-        assert_eq!(volume.read(&cx, &volume.file_chain(&cx, &child).unwrap(), 0, 4096).unwrap(), PAYLOAD);
+        assert_eq!(
+            volume
+                .read(&cx, &volume.file_chain(&cx, &child).unwrap(), 0, 4096)
+                .unwrap(),
+            PAYLOAD
+        );
         healthy(&volume);
     }
 }
@@ -127,12 +185,22 @@ fn full_fat16_root_allows_sfn_case_flags_but_refuses_extra_slots_without_writes(
         let mut record = [0; 32];
         record[..11].copy_from_slice(format!("F{index:07}TXT").as_bytes());
         record[11] = 0x20;
-        volume.device.write_all_at(&cx, ByteOffset(start + index * 32), &record).unwrap();
+        volume
+            .device
+            .write_all_at(&cx, ByteOffset(start + index * 32), &record)
+            .unwrap();
     }
     volume.device.sync(&cx).unwrap();
     healthy(&volume);
     rename_in_volume(&cx, &volume, "/HELLO.TXT", "/hello.txt", false).unwrap();
-    assert_eq!(volume.lookup(&cx, Directory::Root, "hello.txt").unwrap().name().unwrap(), "hello.txt");
+    assert_eq!(
+        volume
+            .lookup(&cx, Directory::Root, "hello.txt")
+            .unwrap()
+            .name()
+            .unwrap(),
+        "hello.txt"
+    );
     let before = std::fs::read(&args.image).unwrap();
     for dry in [true, false] {
         assert!(rename_in_volume(&cx, &volume, "/hello.txt", "/Hello.txt", dry).is_err());
@@ -148,20 +216,43 @@ fn no_replace_refuses_existing_names_aliases_and_same_entry_without_mutation() {
         let cx = Cx::for_testing();
         add(&volume, "/SOURCE.TXT");
         add(&volume, "/An existing long name.txt");
-        let target = volume.resolve(&cx, "/An existing long name.txt").unwrap().unwrap();
+        let target = volume
+            .resolve(&cx, "/An existing long name.txt")
+            .unwrap()
+            .unwrap();
         let alias = format!("/{}", target.short_alias().unwrap());
         let before = std::fs::read(&args.image).unwrap();
-        for to in ["/source.txt", "/SOURCE.TXT", "/AN EXISTING LONG NAME.TXT", alias.as_str()] {
+        for to in [
+            "/source.txt",
+            "/SOURCE.TXT",
+            "/AN EXISTING LONG NAME.TXT",
+            alias.as_str(),
+        ] {
             for dry in [true, false] {
-                let error = volume.rename_noreplace(&cx, "/SOURCE.TXT", to, dry).unwrap_err();
-                assert!(matches!(error.downcast_ref::<FfsError>(), Some(FfsError::Exists)));
+                let error = volume
+                    .rename_noreplace(&cx, "/SOURCE.TXT", to, dry)
+                    .unwrap_err();
+                assert!(matches!(
+                    error.downcast_ref::<FfsError>(),
+                    Some(FfsError::Exists)
+                ));
                 assert_eq!(std::fs::read(&args.image).unwrap(), before);
             }
         }
-        volume.rename_noreplace(&cx, "/SOURCE.TXT", "/DEST.TXT", false).unwrap();
-        assert!(matches!(volume.resolve(&cx, "/SOURCE.TXT"), Err(FfsError::NotFound(_))));
+        volume
+            .rename_noreplace(&cx, "/SOURCE.TXT", "/DEST.TXT", false)
+            .unwrap();
+        assert!(matches!(
+            volume.resolve(&cx, "/SOURCE.TXT"),
+            Err(FfsError::NotFound(_))
+        ));
         let entry = volume.resolve(&cx, "/DEST.TXT").unwrap().unwrap();
-        assert_eq!(volume.read(&cx, &volume.file_chain(&cx, &entry).unwrap(), 0, 4096).unwrap(), PAYLOAD);
+        assert_eq!(
+            volume
+                .read(&cx, &volume.file_chain(&cx, &entry).unwrap(), 0, 4096)
+                .unwrap(),
+            PAYLOAD
+        );
         healthy(&volume);
     }
 }
@@ -174,10 +265,19 @@ fn rename_cli_no_replace_runs_the_native_preflight_and_preserves_dry_run() {
     let cx = Cx::for_testing();
     let before = std::fs::read(&args.image).unwrap();
     let cli = crate::Cli::try_parse_from([
-        "ffs-fat", "rename", args.image.to_str().unwrap(), "/SOURCE.TXT", "/DEST.TXT",
-        "--offline-image", "--no-replace", "--dry-run",
-    ]).unwrap();
-    let crate::Command::Rename { mut options } = cli.command else { panic!("rename"); };
+        "ffs-fat",
+        "rename",
+        args.image.to_str().unwrap(),
+        "/SOURCE.TXT",
+        "/DEST.TXT",
+        "--offline-image",
+        "--no-replace",
+        "--dry-run",
+    ])
+    .unwrap();
+    let crate::Command::Rename { mut options } = cli.command else {
+        panic!("rename");
+    };
     assert!(options.no_replace);
     let dry = run_rename(&cx, &options).unwrap();
     assert_eq!(dry["dry_run"], true);
@@ -206,10 +306,18 @@ struct FaultDevice(Arc<Mutex<ImageState>>, u64);
 impl FaultDevice {
     fn new(bytes: Vec<u8>) -> Self {
         let len = bytes.len() as u64;
-        Self(Arc::new(Mutex::new(ImageState {
-            durable: bytes.clone(), bytes, operations: 0, fail: None,
-            tear: 0, drop_write: None, cancel: None,
-        })), len)
+        Self(
+            Arc::new(Mutex::new(ImageState {
+                durable: bytes.clone(),
+                bytes,
+                operations: 0,
+                fail: None,
+                tear: 0,
+                drop_write: None,
+                cancel: None,
+            })),
+            len,
+        )
     }
 
     fn volume(&self) -> FatVolume {
@@ -218,14 +326,19 @@ impl FaultDevice {
 }
 
 impl ByteDevice for FaultDevice {
-    fn len_bytes(&self) -> u64 { self.1 }
+    fn len_bytes(&self) -> u64 {
+        self.1
+    }
 
     fn read_exact_at(&self, cx: &Cx, at: ByteOffset, bytes: &mut [u8]) -> ffs_error::Result<()> {
         checkpoint(cx)?;
         let state = self.0.lock().unwrap();
         let start = at.0 as usize;
         let end = start.checked_add(bytes.len()).unwrap();
-        let source = state.bytes.get(start..end).ok_or_else(|| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?;
+        let source = state
+            .bytes
+            .get(start..end)
+            .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::UnexpectedEof))?;
         bytes.copy_from_slice(source);
         Ok(())
     }
@@ -235,12 +348,20 @@ impl ByteDevice for FaultDevice {
         let mut state = self.0.lock().unwrap();
         state.operations += 1;
         let fail = state.fail == Some(state.operations);
-        let count = if fail { state.tear.min(bytes.len()) } else { bytes.len() };
+        let count = if fail {
+            state.tear.min(bytes.len())
+        } else {
+            bytes.len()
+        };
         if state.drop_write != Some(state.operations) {
             state.bytes[at.0 as usize..at.0 as usize + count].copy_from_slice(&bytes[..count]);
         }
-        if state.cancel == Some(state.operations) { cx.set_cancel_requested(true); }
-        if fail { return Err(std::io::Error::other("injected case-rename write failure").into()); }
+        if state.cancel == Some(state.operations) {
+            cx.set_cancel_requested(true);
+        }
+        if fail {
+            return Err(std::io::Error::other("injected case-rename write failure").into());
+        }
         Ok(())
     }
 
@@ -252,7 +373,9 @@ impl ByteDevice for FaultDevice {
             return Err(std::io::Error::other("injected case-rename sync failure").into());
         }
         state.durable = state.bytes.clone();
-        if state.cancel == Some(state.operations) { cx.set_cancel_requested(true); }
+        if state.cancel == Some(state.operations) {
+            cx.set_cancel_requested(true);
+        }
         Ok(())
     }
 }
@@ -261,7 +384,10 @@ impl ByteDevice for FaultDevice {
 fn case_rename_write_sync_cuts_never_change_payload_or_admit_a_missing_clean_file() {
     for (original_name, new_name) in [
         ("/HELLO.TXT", "/Hello.txt"),
-        ("/A detailed quarterly report.txt", "/A DETAILED QUARTERLY REPORT.TXT"),
+        (
+            "/A detailed quarterly report.txt",
+            "/A DETAILED QUARTERLY REPORT.TXT",
+        ),
     ] {
         let (_directory, args, volume) = fixture("fat16");
         add(&volume, original_name);
@@ -269,7 +395,14 @@ fn case_rename_write_sync_cuts_never_change_payload_or_admit_a_missing_clean_fil
         let start_data = volume.geometry.cluster_offset(2).unwrap() as usize;
         let bytes = std::fs::read(&args.image).unwrap();
         let success = FaultDevice::new(bytes.clone());
-        rename_in_volume(&Cx::for_testing(), &success.volume(), original_name, new_name, false).unwrap();
+        rename_in_volume(
+            &Cx::for_testing(),
+            &success.volume(),
+            original_name,
+            new_name,
+            false,
+        )
+        .unwrap();
         let operations = success.0.lock().unwrap().operations;
         assert!(operations > 4);
         for cut in 1..=operations {
@@ -281,20 +414,34 @@ fn case_rename_write_sync_cuts_never_change_payload_or_admit_a_missing_clean_fil
                     state.fail = Some(cut);
                     state.tear = tear;
                 }
-                assert!(rename_in_volume(&Cx::for_testing(), &volume, original_name, new_name, false).is_err());
+                assert!(
+                    rename_in_volume(&Cx::for_testing(), &volume, original_name, new_name, false)
+                        .is_err()
+                );
                 for retain in [false, true] {
                     let snapshot = {
                         let state = device.0.lock().unwrap();
-                        if retain { state.bytes.clone() } else { state.durable.clone() }
+                        if retain {
+                            state.bytes.clone()
+                        } else {
+                            state.durable.clone()
+                        }
                     };
                     assert_eq!(&snapshot[start_data..], &bytes[start_data..]);
                     let restart = FaultDevice::new(snapshot);
                     let cx = Cx::for_testing();
-                    if let Ok(volume) = FatVolume::from_device(&cx, Box::new(restart.clone()), 0, restart.1) {
+                    if let Ok(volume) =
+                        FatVolume::from_device(&cx, Box::new(restart.clone()), 0, restart.1)
+                    {
                         let entry = volume.resolve(&cx, new_name).unwrap().unwrap();
                         let name = entry.name().unwrap();
-                        assert!(name == &original_name[1..] || name == &new_name[1..]);
-                        assert_eq!(volume.read(&cx, &volume.file_chain(&cx, &entry).unwrap(), 0, 4096).unwrap(), PAYLOAD);
+                        assert!(name == original_name[1..] || name == new_name[1..]);
+                        assert_eq!(
+                            volume
+                                .read(&cx, &volume.file_chain(&cx, &entry).unwrap(), 0, 4096)
+                                .unwrap(),
+                            PAYLOAD
+                        );
                         assert!(volume.resolve(&cx, "/KEEP.BIN").unwrap().is_some());
                         healthy(&volume);
                     }
@@ -310,21 +457,54 @@ fn cancelled_or_dropped_spelling_publication_is_never_reported_as_success() {
     add(&volume, "/HELLO.TXT");
     let bytes = std::fs::read(&args.image).unwrap();
     let success = FaultDevice::new(bytes.clone());
-    rename_in_volume(&Cx::for_testing(), &success.volume(), "/HELLO.TXT", "/hello.txt", false).unwrap();
+    rename_in_volume(
+        &Cx::for_testing(),
+        &success.volume(),
+        "/HELLO.TXT",
+        "/hello.txt",
+        false,
+    )
+    .unwrap();
     let operations = success.0.lock().unwrap().operations;
     for cut in 1..operations {
         let device = FaultDevice::new(bytes.clone());
         let volume = device.volume();
         device.0.lock().unwrap().cancel = Some(cut);
-        assert!(rename_in_volume(&Cx::for_testing(), &volume, "/HELLO.TXT", "/hello.txt", false).is_err());
+        assert!(
+            rename_in_volume(
+                &Cx::for_testing(),
+                &volume,
+                "/HELLO.TXT",
+                "/hello.txt",
+                false
+            )
+            .is_err()
+        );
     }
     // FAT16 dirty publication is BPB + two FAT copies + sync. The next write
     // updates the target SFN; dropping an acknowledged write must fail readback.
     let device = FaultDevice::new(bytes);
     let volume = device.volume();
     device.0.lock().unwrap().drop_write = Some(5);
-    assert!(rename_in_volume(&Cx::for_testing(), &volume, "/HELLO.TXT", "/hello.txt", false).is_err());
-    assert_eq!(volume.resolve(&Cx::for_testing(), "/HELLO.TXT").unwrap().unwrap().name().unwrap(), "HELLO.TXT");
+    assert!(
+        rename_in_volume(
+            &Cx::for_testing(),
+            &volume,
+            "/HELLO.TXT",
+            "/hello.txt",
+            false
+        )
+        .is_err()
+    );
+    assert_eq!(
+        volume
+            .resolve(&Cx::for_testing(), "/HELLO.TXT")
+            .unwrap()
+            .unwrap()
+            .name()
+            .unwrap(),
+        "HELLO.TXT"
+    );
 }
 
 #[test]
@@ -355,13 +535,17 @@ fn case_rename_honors_fat32_active_copy_reserved_bits_and_volume_boundaries() {
     backing.extend(bytes);
     backing.extend([0xD4; 4096]);
     let device = FaultDevice::new(backing);
-    let volume = FatVolume::from_device(&cx, Box::new(device.clone()), base as u64, length as u64).unwrap();
+    let volume =
+        FatVolume::from_device(&cx, Box::new(device.clone()), base as u64, length as u64).unwrap();
     rename_in_volume(&cx, &volume, "/HELLO.TXT", "/Hello.txt", false).unwrap();
     healthy(&volume);
     let state = device.0.lock().unwrap();
     assert_eq!(&state.bytes[..base], vec![0xC3; base]);
     assert_eq!(&state.bytes[base + length..], &[0xD4; 4096]);
-    assert_eq!(&state.bytes[base + inactive as usize..base + active as usize], &original[inactive as usize..active as usize]);
+    assert_eq!(
+        &state.bytes[base + inactive as usize..base + active as usize],
+        &original[inactive as usize..active as usize]
+    );
     for at in (active as usize..active as usize + fat_len).step_by(4) {
         assert_eq!(state.bytes[base + at + 3] & 0xF0, 0xB0);
     }

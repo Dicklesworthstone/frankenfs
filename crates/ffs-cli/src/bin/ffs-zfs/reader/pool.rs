@@ -494,7 +494,7 @@ impl Pool {
                 }
                 Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
                 Err(error) => {
-                    failures.push(format!("DVA {copy_index} (vdev {}): {error}", dva.vdev))
+                    failures.push(format!("DVA {copy_index} (vdev {}): {error}", dva.vdev));
                 }
             }
         }

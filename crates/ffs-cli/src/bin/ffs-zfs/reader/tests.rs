@@ -659,7 +659,7 @@ fn auto_import_single_leaf_preserves_device_cancellation() {
             leaf.import_active(&Cx::for_testing(), None),
             Err(FfsError::Cancelled)
         ));
-        assert!(data_reads(&reads).is_empty());
+        assert_eq!(data_reads(&reads), [] as [u64; 0]);
     }
 }
 
@@ -684,7 +684,7 @@ fn auto_import_single_leaf_does_not_hide_valid_bad_metadata() {
             let reads: Reads = Arc::default();
             let leaf = image.open(Arc::clone(&reads), None);
             assert!(leaf.import_active(&cx, None).is_err(), "case {case}");
-            assert!(data_reads(&reads).is_empty());
+            assert_eq!(data_reads(&reads), [] as [u64; 0]);
         }
     }
 }
@@ -694,7 +694,7 @@ fn auto_import_expected_pool_identity_is_checked_before_data_io() {
     let reads: Reads = Arc::default();
     let leaf = Image::new(Endian::Little, false).open(Arc::clone(&reads), None);
     assert!(leaf.import_active(&Cx::for_testing(), Some(456)).is_err());
-    assert!(data_reads(&reads).is_empty());
+    assert_eq!(data_reads(&reads), [] as [u64; 0]);
 }
 
 #[test]

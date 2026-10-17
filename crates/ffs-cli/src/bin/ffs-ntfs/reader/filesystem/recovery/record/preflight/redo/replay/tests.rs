@@ -1,9 +1,9 @@
-use super::*;
-use super::super::build;
-use super::super::super::targets::{Attribute, Cluster, State};
 use super::super::super::super::{LFS_CLIENT_RECORD, TailRecord};
-use reader::FfsError;
+use super::super::super::targets::{Attribute, Cluster, State};
+use super::super::build;
+use super::*;
 use ffs_ondisk::ntfs::NtfsValue;
+use reader::FfsError;
 use std::collections::BTreeSet;
 
 const REFERENCE: u64 = 7_u64 << 48;
@@ -44,7 +44,9 @@ fn file(number: u32, kind: u32, value: &[u8]) -> Vec<u8> {
 fn value(raw: &[u8]) -> Vec<u8> {
     let record = NtfsFileRecord::parse(raw).unwrap();
     let attrs = record.attributes().unwrap();
-    let NtfsValue::Resident(value) = &attrs[0].value else { panic!("expected resident") };
+    let NtfsValue::Resident(value) = &attrs[0].value else {
+        panic!("expected resident")
+    };
     value.to_vec()
 }
 
@@ -67,18 +69,39 @@ fn update(lsn: u64, relative: u16, redo: &[u8], undo: &[u8]) -> LogRecord {
     data[48..48 + redo.len()].copy_from_slice(redo);
     data[undo_at..].copy_from_slice(undo);
     LogRecord {
-        lsn, previous: 0, undo_next: 0, kind: LFS_CLIENT_RECORD,
-        summary: TailRecord { transaction_id: 24, redo_op: 7, undo_op: 7 }, data,
+        lsn,
+        previous: 0,
+        undo_next: 0,
+        kind: LFS_CLIENT_RECORD,
+        summary: TailRecord {
+            transaction_id: 24,
+            redo_op: 7,
+            undo_op: 7,
+        },
+        data,
     }
 }
 
 fn targets() -> State {
     let mut state = State::default();
-    state.attributes.insert(24, Attribute {
-        reference: REFERENCE, kind: DATA, index_bytes: 0, opened: 10, name: Vec::new(),
-    });
+    state.attributes.insert(
+        24,
+        Attribute {
+            reference: REFERENCE,
+            kind: DATA,
+            index_bytes: 0,
+            opened: 10,
+            name: Vec::new(),
+        },
+    );
     for vcn in [84, 85] {
-        state.clusters.insert((24, vcn), Cluster { oldest: 20, lcn: Some(vcn + 100) });
+        state.clusters.insert(
+            (24, vcn),
+            Cluster {
+                oldest: 20,
+                lcn: Some(vcn + 100),
+            },
+        );
     }
     state
 }
@@ -96,25 +119,48 @@ struct Input {
 impl Input {
     fn new() -> Self {
         Self {
-            layout: Layout { cluster_bytes: 512, record_bytes: 1024, clusters: 512,
-                mft_initialized: 64 * 1024, mft_reference: REFERENCE, boundary_lsn: 100 },
+            layout: Layout {
+                cluster_bytes: 512,
+                record_bytes: 1024,
+                clusters: 512,
+                mft_initialized: 64 * 1024,
+                mft_reference: REFERENCE,
+                boundary_lsn: 100,
+            },
             records: BTreeMap::from([(42, file(42, DATA, b"original"))]),
-            free_clusters: BTreeSet::new(), free_records: BTreeSet::new(),
-            mapping_delta: 100, reads: 0, failure: None,
+            free_clusters: BTreeSet::new(),
+            free_records: BTreeSet::new(),
+            mapping_delta: 100,
+            reads: 0,
+            failure: None,
         }
     }
 }
 
 impl MftInput for Input {
-    fn layout(&self) -> Layout { self.layout }
-    fn mapped_lcn(&self, vcn: u64) -> Result<u64> { Ok(vcn + self.mapping_delta) }
+    fn layout(&self) -> Layout {
+        self.layout
+    }
+    fn mapped_lcn(&self, vcn: u64) -> Result<u64> {
+        Ok(vcn + self.mapping_delta)
+    }
     fn allocated(&mut self, _cx: &Cx, mft: bool, bit: u64) -> Result<bool> {
-        Ok(!(if mft { &self.free_records } else { &self.free_clusters }).contains(&bit))
+        Ok(!(if mft {
+            &self.free_records
+        } else {
+            &self.free_clusters
+        })
+        .contains(&bit))
     }
     fn read_record(&mut self, _cx: &Cx, number: u32) -> Result<Vec<u8>> {
         self.reads += 1;
-        if let Some(error) = self.failure.take() { return Err(error); }
-        self.records.get(&number).cloned().ok_or_else(|| corrupt(0, "fixture missing record"))
+        if let Some(error) = self.failure.take() {
+            return Err(error);
+        }
+        self.records
+            .get(&number)
+            .cloned()
+            .ok_or_else(|| corrupt(0, "fixture missing record"))
     }
 }
 
@@ -122,15 +168,28 @@ impl MftInput for Input {
 fn redo_then_loser_undo_preserves_an_independent_committed_update() {
     let cx = Cx::for_testing();
     let targets = targets();
-    let records = [update(20, 24, b"AAAA", b"orig"), update(30, 28, b"BBBB", b"inal")];
+    let records = [
+        update(20, 24, b"AAAA", b"orig"),
+        update(30, 28, b"BBBB", b"inal"),
+    ];
     let undo = [update(20, 24, b"AAAA", b"orig")];
     let plan = build(&cx, &targets, &records).unwrap();
     let mut input = Input::new();
     let original = input.records.clone();
     let staged = execute(&cx, &mut input, &plan, &undo, &targets).unwrap();
     assert_eq!(value(&staged.records[&42]), b"origBBBB");
-    assert_eq!((staged.summary.redo, staged.summary.undo, staged.summary.skipped), (2, 1, 0));
-    assert_eq!(input.reads, 1, "second operation must consume the staged record");
+    assert_eq!(
+        (
+            staged.summary.redo,
+            staged.summary.undo,
+            staged.summary.skipped
+        ),
+        (2, 1, 0)
+    );
+    assert_eq!(
+        input.reads, 1,
+        "second operation must consume the staged record"
+    );
     assert_eq!(input.records, original, "no backing record is mutated");
 }
 
@@ -173,8 +232,12 @@ fn wrong_stream_generation_mapping_or_allocation_fails_before_target_reads() {
             0 => targets.attributes.get_mut(&24).unwrap().reference ^= 1_u64 << 48,
             1 => targets.attributes.get_mut(&24).unwrap().name.push(97),
             2 => input.mapping_delta = 200,
-            3 => { input.free_clusters.insert(185); }
-            4 => { input.free_records.insert(42); }
+            3 => {
+                input.free_clusters.insert(185);
+            }
+            4 => {
+                input.free_records.insert(42);
+            }
             _ => input.layout.mft_initialized = 42 * 1024,
         }
         let plan = build(&cx, &targets, &records).unwrap();
@@ -194,7 +257,10 @@ fn unsupported_later_opcode_prevents_even_the_first_file_read() {
     let records = [first, later];
     let plan = build(&cx, &targets, &records).unwrap();
     let mut input = Input::new();
-    assert!(matches!(execute(&cx, &mut input, &plan, &[], &targets), Err(FfsError::UnsupportedFeature(_))));
+    assert!(matches!(
+        execute(&cx, &mut input, &plan, &[], &targets),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
     assert_eq!(input.reads, 0);
 }
 
@@ -202,7 +268,10 @@ fn unsupported_later_opcode_prevents_even_the_first_file_read() {
 fn late_invalid_edit_discards_the_complete_private_stage() {
     let cx = Cx::for_testing();
     let targets = targets();
-    let records = [update(20, 24, b"changed!", b"original"), update(30, 20, b"header!!", b"original")];
+    let records = [
+        update(20, 24, b"changed!", b"original"),
+        update(30, 20, b"header!!", b"original"),
+    ];
     let plan = build(&cx, &targets, &records).unwrap();
     let mut input = Input::new();
     let original = input.records.clone();
@@ -240,11 +309,17 @@ fn io_and_cancellation_failures_do_not_become_skipped_successes() {
     let plan = build(&cx, &targets, &records).unwrap();
     for cancellation in [false, true] {
         let mut input = Input::new();
-        input.failure = Some(if cancellation { FfsError::Cancelled }
-            else { FfsError::Io(std::io::Error::other("injected target read")) });
+        input.failure = Some(if cancellation {
+            FfsError::Cancelled
+        } else {
+            FfsError::Io(std::io::Error::other("injected target read"))
+        });
         let result = execute(&cx, &mut input, &plan, &[], &targets);
-        if cancellation { assert!(matches!(result, Err(FfsError::Cancelled))); }
-        else { assert!(matches!(result, Err(FfsError::Io(_)))); }
+        if cancellation {
+            assert!(matches!(result, Err(FfsError::Cancelled)));
+        } else {
+            assert!(matches!(result, Err(FfsError::Io(_))));
+        }
     }
 }
 
@@ -252,13 +327,20 @@ fn io_and_cancellation_failures_do_not_become_skipped_successes() {
 fn undo_rejects_retired_allocations_and_wrong_execution_order() {
     let cx = Cx::for_testing();
     let mut targets = targets();
-    let records = [update(20, 24, b"changed!", b"original"), update(30, 24, b"changed!", b"original")];
+    let records = [
+        update(20, 24, b"changed!", b"original"),
+        update(30, 24, b"changed!", b"original"),
+    ];
     let mut input = Input::new();
     let plan = build(&cx, &targets, &records).unwrap();
     assert!(execute(&cx, &mut input, &plan, &records, &targets).is_err());
     assert_eq!(input.reads, 0);
     targets.clusters.get_mut(&(24, 85)).unwrap().lcn = None;
-    let empty = Plan { candidates: Vec::new(), obsolete: 0, relocated: 0 };
+    let empty = Plan {
+        candidates: Vec::new(),
+        obsolete: 0,
+        relocated: 0,
+    };
     assert!(execute(&cx, &mut input, &empty, &records[..1], &targets).is_err());
     assert_eq!(input.reads, 0);
 }
@@ -270,9 +352,16 @@ fn operation_budget_is_checked_before_any_source_io() {
     let record = update(20, 24, b"changed!", b"original");
     let attribute = &targets.attributes[&24];
     let plan = Plan {
-        candidates: (0..=MAX_RECORDS).map(|_| Candidate {
-            record: &record, attribute, lcns: vec![184, 185], payload: b"changed!",
-        }).collect(), obsolete: 0, relocated: 0,
+        candidates: (0..=MAX_RECORDS)
+            .map(|_| Candidate {
+                record: &record,
+                attribute,
+                lcns: vec![184, 185],
+                payload: b"changed!",
+            })
+            .collect(),
+        obsolete: 0,
+        relocated: 0,
     };
     let mut input = Input::new();
     assert!(execute(&cx, &mut input, &plan, &[], &targets).is_err());
@@ -296,7 +385,8 @@ fn native_sector_offsets_cover_subcluster_records_and_multicluster_transfers() {
         record.data[14..16].copy_from_slice(&u16::try_from(count).unwrap().to_le_bytes());
         let lcns = vec![100; usize::try_from(count).unwrap()];
         assert_eq!(target(input.layout, &record, attribute, &lcns).unwrap(), 42);
-        record.data[20..22].copy_from_slice(&u16::try_from(offset / 512 + 1).unwrap().to_le_bytes());
+        record.data[20..22]
+            .copy_from_slice(&u16::try_from(offset / 512 + 1).unwrap().to_le_bytes());
         assert!(target(input.layout, &record, attribute, &lcns).is_err());
     }
     // The sector offset can cover several small clusters in a logged transfer;
@@ -305,13 +395,20 @@ fn native_sector_offsets_cover_subcluster_records_and_multicluster_transfers() {
     record.data[24..32].copy_from_slice(&80_u64.to_le_bytes());
     record.data[20..22].copy_from_slice(&4_u16.to_le_bytes());
     record.data[14..16].copy_from_slice(&8_u16.to_le_bytes());
-    assert_eq!(target(Input::new().layout, &record, attribute, &[100; 8]).unwrap(), 42);
+    assert_eq!(
+        target(Input::new().layout, &record, attribute, &[100; 8]).unwrap(),
+        42
+    );
 }
 
 #[test]
 fn bitmap_profiles_and_record_lifetimes_cannot_supply_fabricated_targets() {
-    let mut stream = Stream { storage: Storage::Resident(vec![0xFF]),
-        size: 1, initialized: 1, allocated: 0 };
+    let mut stream = Stream {
+        storage: Storage::Resident(vec![0xFF]),
+        size: 1,
+        initialized: 1,
+        allocated: 0,
+    };
     bitmap(&stream, 8).unwrap();
     assert!(bitmap(&stream, 9).is_err());
     stream.initialized = 0;
@@ -321,10 +418,11 @@ fn bitmap_profiles_and_record_lifetimes_cannot_supply_fabricated_targets() {
     let records = [update(20, 24, b"changed!", b"original")];
     let plan = build(&cx, &targets, &records).unwrap();
     let mut input = Input::new();
-    input.records.get_mut(&42).unwrap()[32..40]
-        .copy_from_slice(&((7_u64 << 48) | 6).to_le_bytes());
-    assert!(matches!(execute(&cx, &mut input, &plan, &[], &targets),
-        Err(FfsError::UnsupportedFeature(_))));
+    input.records.get_mut(&42).unwrap()[32..40].copy_from_slice(&((7_u64 << 48) | 6).to_le_bytes());
+    assert!(matches!(
+        execute(&cx, &mut input, &plan, &[], &targets),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
 }
 
 /// A real protected journal page: checkpoint with an open-MFT attribute dump,
@@ -332,7 +430,7 @@ fn bitmap_profiles_and_record_lifetimes_cannot_supply_fabricated_targets() {
 fn journal(lcn: u64) -> (super::super::super::Restart, Vec<u8>) {
     let first = 34_u64 * 4096;
     let at = [64_usize, 216, 328, 440];
-    let lsns = at.map(|offset| (1_u64 << 20) | (first + offset as u64) / 8);
+    let lsns = at.map(|offset| (1_u64 << 20) | ((first + offset as u64) / 8));
     let mut dump = vec![0; 104];
     dump[..2].copy_from_slice(&0x1D_u16.to_le_bytes());
     dump[4..6].copy_from_slice(&40_u16.to_le_bytes());
@@ -366,10 +464,13 @@ fn journal(lcn: u64) -> (super::super::super::Restart, Vec<u8>) {
     for (index, payload) in [dump, checkpoint, change, commit].iter().enumerate() {
         let start = at[index];
         page[start..start + 8].copy_from_slice(&lsns[index].to_le_bytes());
-        page[start + 24..start + 28].copy_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
+        page[start + 24..start + 28]
+            .copy_from_slice(&u32::try_from(payload.len()).unwrap().to_le_bytes());
         page[start + 28..start + 30].copy_from_slice(&9_u16.to_le_bytes());
-        page[start + 32..start + 36].copy_from_slice(&(if index == 1 { 2_u32 } else { 1 }).to_le_bytes());
-        page[start + 36..start + 40].copy_from_slice(&(if index == 1 { 0_u32 } else { 24 }).to_le_bytes());
+        page[start + 32..start + 36]
+            .copy_from_slice(&(if index == 1 { 2_u32 } else { 1 }).to_le_bytes());
+        page[start + 36..start + 40]
+            .copy_from_slice(&(if index == 1 { 0_u32 } else { 24 }).to_le_bytes());
         if index == 3 {
             page[start + 8..start + 16].copy_from_slice(&lsns[2].to_le_bytes());
         }
@@ -383,29 +484,52 @@ fn journal(lcn: u64) -> (super::super::super::Restart, Vec<u8>) {
         page[40 + sector * 2..42 + sector * 2].copy_from_slice(&saved);
         page[end - 2..end].copy_from_slice(&token);
     }
-    (super::super::super::Restart {
-        system_page: 4096, log_page: 4096, version: (2, 0), clean: false,
-        current_lsn: lsns[3], seq_num_bits: 44, file_size: 4 * 1024 * 1024,
-        last_lsn_data_len: 40, record_header_len: 48, data_off: 64,
-        active_client_seq: Some(9), active_client_oldest_lsn: Some(lsns[0]),
-        active_client_restart_lsn: Some(lsns[1]), area: Vec::new(),
-    }, page)
+    (
+        super::super::super::Restart {
+            system_page: 4096,
+            log_page: 4096,
+            version: (2, 0),
+            clean: false,
+            current_lsn: lsns[3],
+            seq_num_bits: 44,
+            file_size: 4 * 1024 * 1024,
+            last_lsn_data_len: 40,
+            record_header_len: 48,
+            data_off: 64,
+            active_client_seq: Some(9),
+            active_client_oldest_lsn: Some(lsns[0]),
+            active_client_restart_lsn: Some(lsns[1]),
+            area: Vec::new(),
+        },
+        page,
+    )
 }
 
 #[test]
 fn concrete_volume_adapter_uses_selected_bounds_fragmented_mft_and_native_bitmaps() {
-    use reader::Source;
     use ffs_block::ByteDevice;
     use ffs_ondisk::ntfs::{NtfsGeometry, NtfsRun};
     use ffs_types::ByteOffset;
-    use std::sync::{Arc, atomic::{AtomicUsize, Ordering}};
+    use reader::Source;
+    use std::sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    };
 
-    struct Device { bytes: Vec<u8>, writes: Arc<AtomicUsize> }
+    struct Device {
+        bytes: Vec<u8>,
+        writes: Arc<AtomicUsize>,
+    }
     impl ByteDevice for Device {
-        fn len_bytes(&self) -> u64 { self.bytes.len() as u64 }
+        fn len_bytes(&self) -> u64 {
+            self.bytes.len() as u64
+        }
         fn read_exact_at(&self, _cx: &Cx, offset: ByteOffset, out: &mut [u8]) -> Result<()> {
             let at = usize::try_from(offset.0).map_err(|_| corrupt(0, "fixture offset"))?;
-            let source = self.bytes.get(at..at + out.len()).ok_or_else(|| corrupt(0, "fixture bounds"))?;
+            let source = self
+                .bytes
+                .get(at..at + out.len())
+                .ok_or_else(|| corrupt(0, "fixture bounds"))?;
             out.copy_from_slice(source);
             Ok(())
         }
@@ -435,7 +559,11 @@ fn concrete_volume_adapter_uses_selected_bounds_fragmented_mft_and_native_bitmap
     let geometry = NtfsGeometry::parse(&boot, length as u64).unwrap();
     // Construct an immutable reader view with a backwards-fragmented native
     // MFT map. This is an adapter test, not mount/bootstrap qualification.
-    for (number, kind, value) in [(0, 0xB0, &[0xFF; 8][..]), (6, DATA, &[0xFF; 64][..]), (42, DATA, &b"original"[..])] {
+    for (number, kind, value) in [
+        (0, 0xB0, &[0xFF; 8][..]),
+        (6, DATA, &[0xFF; 64][..]),
+        (42, DATA, &b"original"[..]),
+    ] {
         let vcn = number * 2;
         let lcn = if vcn < 64 { 128 + vcn } else { 32 + vcn - 64 };
         let at = base + lcn as usize * 512;
@@ -443,12 +571,33 @@ fn concrete_volume_adapter_uses_selected_bounds_fragmented_mft_and_native_bitmap
     }
     let writes = Arc::new(AtomicUsize::new(0));
     let volume = NtfsVolume {
-        source: Source { device: Box::new(Device { bytes, writes: Arc::clone(&writes) }), base: base as u64, length: length as u64, overlay: std::collections::BTreeMap::new() },
+        source: Source {
+            device: Box::new(Device {
+                bytes,
+                writes: Arc::clone(&writes),
+            }),
+            base: base as u64,
+            length: length as u64,
+            overlay: std::collections::BTreeMap::new(),
+        },
         geometry,
-        mft: Stream { storage: Storage::Mapped(vec![
-            NtfsRun { vcn: 0, clusters: 64, lcn: Some(128) },
-            NtfsRun { vcn: 64, clusters: 64, lcn: Some(32) },
-        ]), size: 64 * 1024, initialized: 64 * 1024, allocated: 64 * 1024 },
+        mft: Stream {
+            storage: Storage::Mapped(vec![
+                NtfsRun {
+                    vcn: 0,
+                    clusters: 64,
+                    lcn: Some(128),
+                },
+                NtfsRun {
+                    vcn: 64,
+                    clusters: 64,
+                    lcn: Some(32),
+                },
+            ]),
+            size: 64 * 1024,
+            initialized: 64 * 1024,
+            allocated: 64 * 1024,
+        },
         volume_flags: 0,
         logfile_recovery: None,
     };
@@ -471,13 +620,25 @@ fn concrete_volume_adapter_uses_selected_bounds_fragmented_mft_and_native_bitmap
             Ok(page.clone())
         };
         super::super::super::super::validate_dirty_volume(
-            &cx, &restart, restart.file_size, &mut read, None,
-        ).unwrap();
+            &cx,
+            &restart,
+            restart.file_size,
+            &mut read,
+            None,
+        )
+        .unwrap();
         let result = super::super::super::super::validate_dirty_volume(
-            &cx, &restart, restart.file_size, &mut read, Some(&volume),
+            &cx,
+            &restart,
+            restart.file_size,
+            &mut read,
+            Some(&volume),
         );
-        if lcn == 52 { result.unwrap(); }
-        else { assert!(matches!(result, Err(FfsError::Corruption { .. }))); }
+        if lcn == 52 {
+            result.unwrap();
+        } else {
+            assert!(matches!(result, Err(FfsError::Corruption { .. })));
+        }
     }
     assert_eq!(value(&input.read_record(&cx, 42).unwrap()), b"original");
     assert_eq!(writes.load(Ordering::SeqCst), 0);

@@ -10,19 +10,28 @@ pub(super) fn fixture(kind: &str) -> (tempfile::TempDir, ImageArgs, FatGeometry)
     let directory = tempfile::tempdir().unwrap();
     let image = directory.path().join("diagnostic.fat");
     let cli = crate::Cli::try_parse_from([
-        "ffs-fat", "format", image.to_str().unwrap(), "--kind", kind,
-        "--size-mib", if kind == "fat16" { "4" } else { "64" },
-    ]).unwrap();
+        "ffs-fat",
+        "format",
+        image.to_str().unwrap(),
+        "--kind",
+        kind,
+        "--size-mib",
+        if kind == "fat16" { "4" } else { "64" },
+    ])
+    .unwrap();
     let crate::Command::Format { options } = cli.command else {
         panic!("expected formatter options");
     };
     let cx = Cx::for_testing();
     crate::formatter::create(&cx, &options).unwrap();
     let args = ImageArgs {
-        image, offset: 0, length: None,
-        oem_code_page: FatOemCodePage::Ascii, sidecar: None,
+        image,
+        offset: 0,
+        length: None,
+        oem_code_page: FatOemCodePage::Ascii,
+        sidecar: None,
     };
-    let geometry = args.open(&cx).unwrap().geometry.clone();
+    let geometry = args.open(&cx).unwrap().geometry;
     (directory, args, geometry)
 }
 
@@ -44,7 +53,11 @@ pub(super) fn mark_dirty(args: &ImageArgs, geometry: &FatGeometry) {
         FatKind::Fat32 => (65, 0x07FF_FFFF),
     };
     for sector in std::iter::once(0_u16).chain(geometry.backup_boot_sector()) {
-        patch(args, u64::from(sector) * u64::from(geometry.sector_bytes()) + at, &[1]);
+        patch(
+            args,
+            u64::from(sector) * u64::from(geometry.sector_bytes()) + at,
+            &[1],
+        );
     }
     for copy in 0..geometry.fat_count() {
         fat(args, geometry, copy, 1, value);
@@ -69,7 +82,10 @@ fn dirty_fat16_and_fat32_receive_complete_zero_write_diagnosis() {
         assert_eq!(report.status, "issues_found");
         assert_eq!(report.lost_clusters, Some(0));
         assert!(has(&report, "native_boot_dirty") && has(&report, "native_fat_dirty"));
-        assert!(args.open(&cx).is_err(), "diagnosis must not grant reader admission");
+        assert!(
+            args.open(&cx).is_err(),
+            "diagnosis must not grant reader admission"
+        );
         assert_eq!(fs::read(&args.image).unwrap(), before);
     }
 }
@@ -107,14 +123,18 @@ fn native_errors_reserved_records_and_backup_dirty_state_remain_visible() {
         let at = if kind == "fat16" { 37 } else { 65 };
         patch(&args, at, &[6]);
         let report = check(&Cx::for_testing(), &args).unwrap();
-        for issue in ["native_reserved_zero", "native_reserved_fat", "native_io_error",
-            "native_surface_test", "native_boot_flags"] {
+        for issue in [
+            "native_reserved_zero",
+            "native_reserved_fat",
+            "native_io_error",
+            "native_surface_test",
+            "native_boot_flags",
+        ] {
             assert!(has(&report, issue), "missing {issue}");
         }
     }
     let (_directory, args, geometry) = fixture("fat32");
-    let at = u64::from(geometry.backup_boot_sector().unwrap())
-        * u64::from(geometry.sector_bytes());
+    let at = u64::from(geometry.backup_boot_sector().unwrap()) * u64::from(geometry.sector_bytes());
     patch(&args, at + 65, &[1]);
     let report = check(&Cx::for_testing(), &args).unwrap();
     assert!(has(&report, "native_boot_dirty"));
@@ -127,8 +147,11 @@ fn native_errors_reserved_records_and_backup_dirty_state_remain_visible() {
 fn nonmirrored_fat32_ignores_inactive_state_and_retains_reserved_high_bits() {
     let (_directory, args, geometry) = fixture("fat32");
     for sector in std::iter::once(0_u16).chain(geometry.backup_boot_sector()) {
-        patch(&args, u64::from(sector) * u64::from(geometry.sector_bytes()) + 40,
-            &0x0081_u16.to_le_bytes());
+        patch(
+            &args,
+            u64::from(sector) * u64::from(geometry.sector_bytes()) + 40,
+            &0x0081_u16.to_le_bytes(),
+        );
     }
     fat(&args, &geometry, 0, 0, 0);
     fat(&args, &geometry, 0, 1, 0);
@@ -146,8 +169,15 @@ struct ObservedReadOnly {
 }
 
 impl ByteDevice for ObservedReadOnly {
-    fn len_bytes(&self) -> u64 { self.length }
-    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, bytes: &mut [u8]) -> ffs_error::Result<()> {
+    fn len_bytes(&self) -> u64 {
+        self.length
+    }
+    fn read_exact_at(
+        &self,
+        cx: &Cx,
+        offset: ByteOffset,
+        bytes: &mut [u8],
+    ) -> ffs_error::Result<()> {
         checkpoint(cx)?;
         self.file.read_exact_at(bytes, offset.0)?;
         Ok(())
@@ -170,9 +200,16 @@ fn diagnostic_device_performs_neither_writes_nor_syncs() {
     let file = File::open(&args.image).unwrap();
     let length = file.metadata().unwrap().len();
     let cx = Cx::for_testing();
-    let diagnostic = DiagnosticVolume::from_device(&cx, Box::new(ObservedReadOnly {
-        file, length, mutations: Arc::clone(&mutations),
-    }), &args).unwrap();
+    let diagnostic = DiagnosticVolume::from_device(
+        &cx,
+        Box::new(ObservedReadOnly {
+            file,
+            length,
+            mutations: Arc::clone(&mutations),
+        }),
+        &args,
+    )
+    .unwrap();
     assert!(!diagnostic.report(&cx).unwrap().clean);
     assert_eq!(mutations.load(Ordering::SeqCst), 0);
 }
@@ -182,8 +219,13 @@ fn diagnostic_admission_refuses_sidecars_symlinks_bad_bounds_and_cancellation() 
     let (directory, mut args, _geometry) = fixture("fat16");
     let cx = Cx::for_testing();
     args.sidecar = Some(directory.path().join("must-not-be-opened"));
-    assert!(matches!(check(&cx, &args).unwrap_err().downcast::<FfsError>().unwrap(),
-        FfsError::UnsupportedFeature(_)));
+    assert!(matches!(
+        check(&cx, &args)
+            .unwrap_err()
+            .downcast::<FfsError>()
+            .unwrap(),
+        FfsError::UnsupportedFeature(_)
+    ));
     args.sidecar = None;
     args.offset = u64::MAX;
     args.length = Some(512);
@@ -197,8 +239,13 @@ fn diagnostic_admission_refuses_sidecars_symlinks_bad_bounds_and_cancellation() 
     args.image = alias;
     assert!(check(&cx, &args).is_err());
     cx.set_cancel_requested(true);
-    assert!(matches!(check(&cx, &args).unwrap_err().downcast::<FfsError>().unwrap(),
-        FfsError::Cancelled));
+    assert!(matches!(
+        check(&cx, &args)
+            .unwrap_err()
+            .downcast::<FfsError>()
+            .unwrap(),
+        FfsError::Cancelled
+    ));
 }
 
 #[test]

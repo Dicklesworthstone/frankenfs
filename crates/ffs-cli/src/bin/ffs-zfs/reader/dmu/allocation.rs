@@ -81,6 +81,13 @@ struct Budget {
     records: u64,
 }
 
+#[derive(Clone, Copy)]
+struct MetaslabRegion {
+    start: u64,
+    size: u64,
+    shift: u8,
+}
+
 impl Budget {
     fn charge(&mut self, bytes: u64) -> Result<()> {
         self.bytes = self
@@ -332,9 +339,11 @@ impl Objects {
                 let (map, stream_bytes) = view.load_allocation_map(
                     cx,
                     object,
-                    start,
-                    size,
-                    top.ashift,
+                    MetaslabRegion {
+                        start,
+                        size,
+                        shift: top.ashift,
+                    },
                     v2,
                     limits.ranges_per_metaslab,
                     &mut budget,
@@ -385,13 +394,12 @@ impl Objects {
         &mut self,
         cx: &Cx,
         number: u64,
-        start: u64,
-        size: u64,
-        shift: u8,
+        region: MetaslabRegion,
         v2: bool,
         max_ranges: usize,
         budget: &mut Budget,
     ) -> Result<(AllocationMap, u64)> {
+        let MetaslabRegion { start, size, shift } = region;
         let mut map =
             AllocationMap::new(start, size, shift, max_ranges).map_err(|error| parse(&error))?;
         if number == 0 {
@@ -510,17 +518,17 @@ impl Objects {
                     "nonallocating vdev state needs separate accounting",
                 ));
             }
-            let (guid, ashift, asize) = match striped {
-                Some(group) => {
-                    let member = &group.members[index];
-                    (member.guid, member.ashift, member.allocated_bytes)
-                }
-                None => (
+            let (guid, ashift, asize) = striped.map_or(
+                (
                     self.config.top_guid,
                     self.config.ashift,
                     self.config.allocated_bytes,
                 ),
-            };
+                |group| {
+                    let member = &group.members[index];
+                    (member.guid, member.ashift, member.allocated_bytes)
+                },
+            );
             if integer(child, "id")? != index as u64
                 || integer(child, "guid")? != guid
                 || integer(child, "ashift")? != u64::from(ashift)

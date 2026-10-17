@@ -162,14 +162,14 @@ impl Plan {
             bail!("recovery requires complete, untruncated allocation and namespace evidence");
         }
         for issue in &before.issues {
-            if !matches!(
+            if !(matches!(
                 issue.kind,
                 "native_boot_dirty"
                     | "native_fat_dirty"
                     | "lost_allocation"
                     | "fs_info_free_count"
                     | "fs_info_next_free"
-            ) && !(discard_orphan_lfn && issue.kind == "invalid_long_name")
+            ) || (discard_orphan_lfn && issue.kind == "invalid_long_name"))
             {
                 bail!(
                     "recovery refuses {}: {}; no changes were made",

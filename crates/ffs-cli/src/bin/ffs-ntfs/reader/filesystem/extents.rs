@@ -486,11 +486,13 @@ mod tests {
             fiemap(&cx, &stream, 512, 1024, 1).unwrap(),
             vec![extent(1024, 5120, 512, 1)]
         );
-        assert!(fiemap(&cx, &stream, 512, 512, 512).unwrap().is_empty());
-        assert!(
-            fiemap(&cx, &stream, 512, 1536, u64::MAX)
-                .unwrap()
-                .is_empty()
+        assert_eq!(
+            fiemap(&cx, &stream, 512, 512, 512).unwrap(),
+            [] as [FiemapExtent; 0]
+        );
+        assert_eq!(
+            fiemap(&cx, &stream, 512, 1536, u64::MAX).unwrap(),
+            [] as [FiemapExtent; 0]
         );
     }
 
@@ -508,12 +510,21 @@ mod tests {
             vec![extent(0, 0, 5, 0x303)]
         );
         for (start, length) in [(0, 0), (5, u64::MAX), (u64::MAX, 1)] {
-            assert!(fiemap(&cx, &stream, 512, start, length).unwrap().is_empty());
+            assert_eq!(
+                fiemap(&cx, &stream, 512, start, length).unwrap(),
+                [] as [FiemapExtent; 0]
+            );
         }
         let empty = mapped(Vec::new(), 0, 0);
         let hole = mapped(vec![run(0, 1, None)], 512, 0);
-        assert!(fiemap(&cx, &empty, 512, 0, u64::MAX).unwrap().is_empty());
-        assert!(fiemap(&cx, &hole, 512, 0, u64::MAX).unwrap().is_empty());
+        assert_eq!(
+            fiemap(&cx, &empty, 512, 0, u64::MAX).unwrap(),
+            [] as [FiemapExtent; 0]
+        );
+        assert_eq!(
+            fiemap(&cx, &hole, 512, 0, u64::MAX).unwrap(),
+            [] as [FiemapExtent; 0]
+        );
     }
 
     #[test]

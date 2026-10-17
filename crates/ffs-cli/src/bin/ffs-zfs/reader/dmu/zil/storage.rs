@@ -328,10 +328,7 @@ fn read_stripe(
             }
         }
     }
-    match io_error {
-        Some(error) => Err(error),
-        None => Ok(None),
-    }
+    io_error.map_or(Ok(None), Err)
 }
 pub(super) fn read_block(
     cx: &Cx,
@@ -363,8 +360,5 @@ pub(super) fn read_block(
         }
     }
     checkpoint(cx)?;
-    match last_error {
-        Some(error) => Err(error),
-        None => Ok(None),
-    }
+    last_error.map_or(Ok(None), Err)
 }

@@ -1,9 +1,9 @@
 //! Native-image tests; the fault device separates pending and durable bytes.
 //! These are deterministic storage cuts, not hardware sector-atomicity claims.
 
-use super::*;
-use super::super::{truncate_in_volume, write_range_in_volume};
 use super::super::super::{create_in_volume, creation, hash_device};
+use super::super::{truncate_in_volume, write_range_in_volume};
+use super::*;
 use clap::Parser as _;
 use std::collections::BTreeMap;
 use std::sync::{Arc, Mutex};
@@ -66,11 +66,12 @@ impl Device {
             Box::new(self.clone()),
             BASE,
             self.len_bytes() - 2 * BASE,
-        ).unwrap()
+        )
+        .unwrap()
     }
 
-    fn restart(&self, retain_pending: bool) -> Device {
-        Device::new(self.0.lock().unwrap().image(retain_pending))
+    fn restart(&self, retain_pending: bool) -> Self {
+        Self::new(self.0.lock().unwrap().image(retain_pending))
     }
 
     fn reset_audit(&self) {
@@ -86,7 +87,12 @@ impl ByteDevice for Device {
         self.0.lock().unwrap().durable.len() as u64
     }
 
-    fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, bytes: &mut [u8]) -> ffs_error::Result<()> {
+    fn read_exact_at(
+        &self,
+        cx: &Cx,
+        offset: ByteOffset,
+        bytes: &mut [u8],
+    ) -> ffs_error::Result<()> {
         checkpoint(cx)?;
         let state = self.0.lock().unwrap();
         let mut at = usize::try_from(offset.0).unwrap();
@@ -99,7 +105,10 @@ impl ByteDevice for Device {
             let page = at / 512 * 512;
             let within = at % 512;
             let count = (bytes.len() - filled).min(512 - within);
-            let source = state.pending.get(&page).map_or(&state.durable[page..page + 512], |p| &p[..]);
+            let source = state
+                .pending
+                .get(&page)
+                .map_or(&state.durable[page..page + 512], |p| &p[..]);
             bytes[filled..filled + count].copy_from_slice(&source[within..within + count]);
             at += count;
             filled += count;
@@ -114,7 +123,11 @@ impl ByteDevice for Device {
         assert!(offset.0 + bytes.len() as u64 <= state.durable.len() as u64 - BASE);
         state.attempts += 1;
         let fail = state.fail_at == Some(state.attempts);
-        let count = if fail { state.tear.min(bytes.len()) } else { bytes.len() };
+        let count = if fail {
+            state.tear.min(bytes.len())
+        } else {
+            bytes.len()
+        };
         state.put(offset.0 as usize, &bytes[..count]);
         state.writes.push((offset.0, count));
         if fail {
@@ -141,9 +154,15 @@ fn formatted(kind: &str) -> Device {
     let directory = tempfile::tempdir().unwrap();
     let image = directory.path().join("native.fat");
     let cli = crate::Cli::try_parse_from([
-        "ffs-fat", "format", image.to_str().unwrap(), "--kind", kind,
-        "--size-mib", if kind == "fat16" { "4" } else { "64" },
-    ]).unwrap();
+        "ffs-fat",
+        "format",
+        image.to_str().unwrap(),
+        "--kind",
+        kind,
+        "--size-mib",
+        if kind == "fat16" { "4" } else { "64" },
+    ])
+    .unwrap();
     let crate::Command::Format { options } = cli.command else {
         panic!("expected format options");
     };
@@ -163,14 +182,19 @@ fn file(volume: &FatVolume) -> (Entry, FileChain) {
 
 fn clean(volume: &FatVolume) -> u64 {
     let check = volume.check(&Cx::for_testing()).unwrap();
-    assert!(check.clean && check.complete && check.namespace_complete, "{check:?}");
+    assert!(
+        check.clean && check.complete && check.namespace_complete,
+        "{check:?}"
+    );
     check.free_clusters
 }
 
 struct Pattern(u64);
 
 impl ByteDevice for Pattern {
-    fn len_bytes(&self) -> u64 { self.0 }
+    fn len_bytes(&self) -> u64 {
+        self.0
+    }
     fn read_exact_at(&self, cx: &Cx, at: ByteOffset, bytes: &mut [u8]) -> ffs_error::Result<()> {
         checkpoint(cx)?;
         super::super::checked_end(at.0, bytes.len(), self.0)?;
@@ -182,7 +206,9 @@ impl ByteDevice for Pattern {
     fn write_all_at(&self, _: &Cx, _: ByteOffset, _: &[u8]) -> ffs_error::Result<()> {
         panic!("source must never be written")
     }
-    fn sync(&self, _: &Cx) -> ffs_error::Result<()> { panic!("source must never be synced") }
+    fn sync(&self, _: &Cx) -> ffs_error::Result<()> {
+        panic!("source must never be synced")
+    }
 }
 
 #[test]
@@ -201,22 +227,38 @@ fn full_volumes_allow_overwrite_shrink_and_delta_only_regrowth() {
         device.reset_audit();
         let offset = cluster - 3;
         let patch = b"cross-cluster overwrite";
-        assert_eq!(write_range_in_volume(&cx, &volume, "/file.bin", offset, patch, NOW).unwrap(), patch.len());
+        assert_eq!(
+            write_range_in_volume(&cx, &volume, "/file.bin", offset, patch, NOW).unwrap(),
+            patch.len()
+        );
         let (_, overwritten) = file(&volume);
         assert_eq!(overwritten.clusters, original.clusters);
         assert_eq!(clean(&volume), 0);
         let mut expected = vec![0; (2 * cluster) as usize];
-        source.read_exact_at(&cx, ByteOffset(0), &mut expected).unwrap();
+        source
+            .read_exact_at(&cx, ByteOffset(0), &mut expected)
+            .unwrap();
         expected[offset as usize..offset as usize + patch.len()].copy_from_slice(patch);
-        assert_eq!(volume.read(&cx, &overwritten, 0, expected.len()).unwrap(), expected);
+        assert_eq!(
+            volume.read(&cx, &overwritten, 0, expected.len()).unwrap(),
+            expected
+        );
         // Payload I/O must cover only the patch, not a replacement-sized copy.
         let state = device.0.lock().unwrap();
-        let payload_bytes: usize = state.writes.iter().filter_map(|&(at, count)| {
-            original.clusters.iter().any(|&c| {
-                let start = BASE + volume.cluster_offset(c).unwrap();
-                at >= start && at < start + cluster
-            }).then_some(count)
-        }).sum();
+        let payload_bytes: usize = state
+            .writes
+            .iter()
+            .filter_map(|&(at, count)| {
+                original
+                    .clusters
+                    .iter()
+                    .any(|&c| {
+                        let start = BASE + volume.cluster_offset(c).unwrap();
+                        at >= start && at < start + cluster
+                    })
+                    .then_some(count)
+            })
+            .sum();
         assert_eq!(payload_bytes, patch.len());
         drop(state);
 
@@ -224,16 +266,27 @@ fn full_volumes_allow_overwrite_shrink_and_delta_only_regrowth() {
         truncate_in_volume(&cx, &volume, "/file.bin", shorter, NOW).unwrap();
         assert_eq!(clean(&volume), 2);
         let (_, shrunk) = file(&volume);
-        assert_eq!(shrunk.clusters, original.clusters[..original.clusters.len() - 2]);
+        assert_eq!(
+            shrunk.clusters,
+            original.clusters[..original.clusters.len() - 2]
+        );
         truncate_in_volume(&cx, &volume, "/file.bin", length, NOW).unwrap();
         assert_eq!(clean(&volume), 0);
         let (_, grown) = file(&volume);
-        assert_eq!(volume.read(&cx, &grown, 0, expected.len()).unwrap(), expected);
-        assert_eq!(volume.read(&cx, &grown, shorter, (length - shorter) as usize).unwrap(), vec![0; (length - shorter) as usize]);
+        assert_eq!(
+            volume.read(&cx, &grown, 0, expected.len()).unwrap(),
+            expected
+        );
+        assert_eq!(
+            volume
+                .read(&cx, &grown, shorter, (length - shorter) as usize)
+                .unwrap(),
+            vec![0; (length - shorter) as usize]
+        );
         truncate_in_volume(&cx, &volume, "/file.bin", 0, NOW).unwrap();
         let (empty, chain) = file(&volume);
         assert_eq!(empty.native.first_cluster, 0);
-        assert!(chain.clusters.is_empty());
+        assert_eq!(chain.clusters, [] as [u32; 0]);
         assert_eq!(clean(&volume), length / cluster);
     }
 }
@@ -251,10 +304,24 @@ fn fragmented_growth_initializes_gap_and_poisoned_reused_storage() {
         let (_, old) = file(&volume);
         let free = clean(&volume);
         let mut table = FatTable::new(&volume);
-        let next = (2..=volume.geometry.cluster_count() + 1).find(|&c| table.entry(&cx, c).unwrap() == FatEntry::Free).unwrap();
+        let next = (2..=volume.geometry.cluster_count() + 1)
+            .find(|&c| table.entry(&cx, c).unwrap() == FatEntry::Free)
+            .unwrap();
         let poison = vec![0xE7; cluster as usize];
-        device.write_all_at(&cx, ByteOffset(BASE + volume.cluster_offset(next).unwrap()), &poison).unwrap();
-        device.write_all_at(&cx, ByteOffset(BASE + volume.cluster_offset(old.clusters[0]).unwrap() + 6), &poison[6..]).unwrap();
+        device
+            .write_all_at(
+                &cx,
+                ByteOffset(BASE + volume.cluster_offset(next).unwrap()),
+                &poison,
+            )
+            .unwrap();
+        device
+            .write_all_at(
+                &cx,
+                ByteOffset(BASE + volume.cluster_offset(old.clusters[0]).unwrap() + 6),
+                &poison[6..],
+            )
+            .unwrap();
         device.sync(&cx).unwrap();
         let offset = cluster + 17;
         write_range_in_volume(&cx, &volume, "/file.bin", offset, b"tail", NOW).unwrap();
@@ -265,12 +332,20 @@ fn fragmented_growth_initializes_gap_and_poisoned_reused_storage() {
         let mut expected = b"prefix".to_vec();
         expected.resize(offset as usize, 0);
         expected.extend_from_slice(b"tail");
-        assert_eq!(volume.read(&cx, &chain, 0, expected.len()).unwrap(), expected);
+        assert_eq!(
+            volume.read(&cx, &chain, 0, expected.len()).unwrap(),
+            expected
+        );
         let other = volume.resolve(&cx, "/other.bin").unwrap().unwrap();
         let other_chain = volume.file_chain(&cx, &other).unwrap();
-        assert_eq!(volume.read(&cx, &other_chain, 0, blocker.len()).unwrap(), blocker);
+        assert_eq!(
+            volume.read(&cx, &other_chain, 0, blocker.len()).unwrap(),
+            blocker
+        );
         let mut slack = vec![0xA5; cluster as usize - 21];
-        volume.read_exact(&cx, volume.cluster_offset(next).unwrap() + 21, &mut slack).unwrap();
+        volume
+            .read_exact(&cx, volume.cluster_offset(next).unwrap() + 21, &mut slack)
+            .unwrap();
         assert!(slack.iter().all(|&byte| byte == 0));
     }
 }
@@ -290,7 +365,10 @@ fn refused_and_noop_ranges_perform_no_backing_writes() {
     assert!(truncate_in_volume(&cx, &volume, "/file.bin", u64::from(u32::MAX), NOW).is_err());
     assert!(write_range_in_volume(&cx, &volume, "/readonly.bin", 0, b"x", NOW).is_err());
     assert!(truncate_in_volume(&cx, &volume, "/readonly.bin", 0, NOW).is_err());
-    assert_eq!(write_range_in_volume(&cx, &volume, "/file.bin", u64::MAX, &[], NOW).unwrap(), 0);
+    assert_eq!(
+        write_range_in_volume(&cx, &volume, "/file.bin", u64::MAX, &[], NOW).unwrap(),
+        0
+    );
     truncate_in_volume(&cx, &volume, "/file.bin", 8, NOW).unwrap();
     let cancelled = Cx::for_testing();
     cancelled.set_cancel_requested(true);
@@ -314,7 +392,8 @@ fn active_fat_and_reserved_high_bits_survive_incremental_ranges() {
         for copy in 0..2 {
             let start = BASE + geometry.entry_offset(copy, 2).unwrap() - 8;
             for entry in 0..geometry.cluster_count() + 2 {
-                state.durable[(start + u64::from(entry) * 4 + 3) as usize] |= if copy == 0 { 0xB0 } else { 0xA0 };
+                state.durable[(start + u64::from(entry) * 4 + 3) as usize] |=
+                    if copy == 0 { 0xB0 } else { 0xA0 };
             }
         }
     }
@@ -335,7 +414,10 @@ fn active_fat_and_reserved_high_bits_survive_incremental_ranges() {
         assert_eq!(current[second + entry as usize * 4 + 3] & 0xF0, 0xA0);
     }
     assert_eq!(&current[..BASE as usize], &original[..BASE as usize]);
-    assert_eq!(&current[current.len() - BASE as usize..], &original[original.len() - BASE as usize..]);
+    assert_eq!(
+        &current[current.len() - BASE as usize..],
+        &original[original.len() - BASE as usize..]
+    );
 }
 
 #[test]
@@ -353,7 +435,8 @@ fn every_write_and_sync_cut_only_readmits_consistent_clean_images() {
             match action {
                 0 => truncate_in_volume(&cx, volume, "/file.bin", 5 * cluster + 19, NOW),
                 1 => truncate_in_volume(&cx, volume, "/file.bin", cluster - 1, NOW),
-                _ => write_range_in_volume(&cx, volume, "/file.bin", cluster - 3, &[0x97; 31], NOW).map(|_| ()),
+                _ => write_range_in_volume(&cx, volume, "/file.bin", cluster - 3, &[0x97; 31], NOW)
+                    .map(|_| ()),
             }
         };
         let success = Device::new(baseline.clone());
@@ -374,15 +457,26 @@ fn every_write_and_sync_cut_only_readmits_consistent_clean_images() {
                     state.fail_at = Some(cut);
                     state.tear = tear;
                 }
-                assert!(execute(&device.open()).is_err(), "action={action}, cut={cut}");
+                assert!(
+                    execute(&device.open()).is_err(),
+                    "action={action}, cut={cut}"
+                );
                 for retain in [false, true] {
                     let crashed = device.restart(retain);
-                    let admitted = FatVolume::from_device(&cx, Box::new(crashed.clone()), BASE, crashed.len_bytes() - 2 * BASE);
+                    let admitted = FatVolume::from_device(
+                        &cx,
+                        Box::new(crashed.clone()),
+                        BASE,
+                        crashed.len_bytes() - 2 * BASE,
+                    );
                     if let Ok(reopened) = admitted {
                         clean(&reopened);
                         let (_, chain) = file(&reopened);
                         let bytes = reopened.read(&cx, &chain, 0, 8192).unwrap();
-                        assert!(bytes == original || bytes == expected, "action={action}, cut={cut}, tear={tear}, retain={retain}");
+                        assert!(
+                            bytes == original || bytes == expected,
+                            "action={action}, cut={cut}, tear={tear}, retain={retain}"
+                        );
                     }
                 }
             }

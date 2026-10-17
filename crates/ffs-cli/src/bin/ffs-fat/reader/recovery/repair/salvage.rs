@@ -55,9 +55,9 @@ fn chains(cx: &Cx, kind: FatKind, lost: &[(u32, u32)]) -> Result<Vec<Vec<u32>>> 
     }
     let mut result = Vec::new();
     let mut count = 0;
-    for head in 0..lost.len() {
+    for (head, incoming) in inbound.iter().enumerate() {
         checkpoint(cx)?;
-        if inbound[head] != 0 {
+        if *incoming != 0 {
             continue;
         }
         if result.len() == MAX_FILES {

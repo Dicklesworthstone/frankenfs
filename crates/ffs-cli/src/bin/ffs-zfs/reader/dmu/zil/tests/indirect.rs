@@ -24,7 +24,7 @@ fn data_bp(physical: &[u8], logical: usize, codec: u64, order: Endian, payload: 
     raw
 }
 
-fn indirect(bp: &[u8], offset: u64, length: u64, order: Endian) -> Record {
+fn indirect(bp: &[u8], offset: u64, length: u64, order: Endian) -> IntentRecord {
     let mut raw = vec![0; 192];
     for (at, value) in [
         (0, 9),
@@ -39,7 +39,7 @@ fn indirect(bp: &[u8], offset: u64, length: u64, order: Endian) -> Record {
         put(&mut raw, at, value, order);
     }
     raw[64..192].copy_from_slice(bp);
-    Record {
+    IntentRecord {
         kind: 9,
         txg: 43,
         sequence: 1,
@@ -122,7 +122,7 @@ fn partial_indirect_records_and_bad_native_identity_fail_during_admission() {
         }
         let good = indirect(&bp, 0, 512, order);
         let raw = record(1, 43, 2, 0, &[], order);
-        let namespace = Record {
+        let namespace = IntentRecord {
             kind: 1,
             txg: 43,
             sequence: 2,

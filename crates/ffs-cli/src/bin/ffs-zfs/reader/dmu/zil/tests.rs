@@ -410,7 +410,7 @@ fn recovery_rejects_unsupported_pending_intent_and_invalid_copied_lengths() {
         (9, u64::MAX, b"bad"),
     ] {
         let raw = record(kind, 43, 1, offset, data, order);
-        let r = Record {
+        let r = IntentRecord {
             kind,
             txg: 43,
             sequence: 1,
@@ -423,7 +423,7 @@ fn recovery_rejects_unsupported_pending_intent_and_invalid_copied_lengths() {
     }
     let mut raw = record(9, 43, 1, 0, b"small", order);
     put(&mut raw, 48, 1000, order);
-    let r = Record {
+    let r = IntentRecord {
         kind: 9,
         txg: 43,
         sequence: 1,
@@ -683,7 +683,7 @@ fn existing_file_recovery_is_wired_through_native_mos_zpl_and_explicit_prefix_au
     let eof = objects
         .read_with_intent_log(&cx, &[], b"/file", 13, 1, true)
         .unwrap();
-    assert!(eof.bytes.is_empty());
+    assert_eq!(eof.bytes, [] as [u8; 0]);
     // Ordinary readers still see the selected committed root; recovery did not
     // poison a DMU cache, change ZPL metadata, or mutate the backing device.
     let mut committed = objects.zpl(&cx, &[]).unwrap();
@@ -737,40 +737,40 @@ fn native_embedded_checksums_match_independent_closed_form_fletcher_vectors() {
             5,
             Endian::Little,
             [
-                9225911249059144401_u64,
-                148859008194477065,
-                20415476278831204,
-                446577024583484117,
+                9_225_911_249_059_144_401_u64,
+                148_859_008_194_477_065,
+                20_415_476_278_831_204,
+                446_577_024_583_484_117,
             ],
         ),
         (
             5,
             Endian::Big,
             [
-                8532757150060446043,
-                148859008194477065,
-                15358256057691948012,
-                446577024583484117,
+                8_532_757_150_060_446_043,
+                148_859_008_194_477_065,
+                15_358_256_057_691_948_012,
+                446_577_024_583_484_117,
             ],
         ),
         (
             9,
             Endian::Little,
             [
-                6922290034,
-                6781722369370,
-                3328605371134847,
-                1091294087630784666,
+                6_922_290_034,
+                6_781_722_369_370,
+                3_328_605_371_134_847,
+                1_091_294_087_630_784_666,
             ],
         ),
         (
             9,
             Endian::Big,
             [
-                6669913601,
-                6372747763356,
-                3050325511120534,
-                975252070626246001,
+                6_669_913_601,
+                6_372_747_763_356,
+                3_050_325_511_120_534,
+                975_252_070_626_246_001,
             ],
         ),
     ] {

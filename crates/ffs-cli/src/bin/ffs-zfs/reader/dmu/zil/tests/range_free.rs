@@ -2,10 +2,10 @@
 use super::super::indirect::{Plan, edits};
 use super::*;
 
-fn free_record(offset: u64, length: u64, sequence: u64, order: Endian) -> Record {
+fn free_record(offset: u64, length: u64, sequence: u64, order: Endian) -> IntentRecord {
     let mut raw = record(10, 43, sequence, offset, &[], order);
     put(&mut raw, 48, length, order);
-    Record {
+    IntentRecord {
         kind: 10,
         txg: 43,
         sequence,

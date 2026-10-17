@@ -101,7 +101,7 @@ mod tests {
     const FIRST: u64 = 34 * PAGE;
 
     fn lsn(sequence: u64, offset: u64) -> u64 {
-        sequence << 20 | offset / 8
+        (sequence << 20) | (offset / 8)
     }
 
     fn restart(current: u64, clean: bool) -> Restart {
@@ -132,8 +132,8 @@ mod tests {
             for new_clean in [false, true] {
                 let old = restart(lsn(1, FIRST + 128), old_clean);
                 let new = restart(lsn(1, FIRST + PAGE + 128), new_clean);
-                assert!(std::ptr::eq(choose(&old, &new).unwrap(), &new));
-                assert!(std::ptr::eq(choose(&new, &old).unwrap(), &new));
+                assert!(std::ptr::eq(choose(&old, &new).unwrap(), &raw const new));
+                assert!(std::ptr::eq(choose(&new, &old).unwrap(), &raw const new));
             }
         }
     }
@@ -142,8 +142,8 @@ mod tests {
     fn native_wrap_uses_lsn_sequence_not_the_smaller_physical_offset() {
         let old = restart(lsn(1, LOG - PAGE + 128), true);
         let new = restart(lsn(2, FIRST + 128), false);
-        assert!(std::ptr::eq(choose(&old, &new).unwrap(), &new));
-        assert!(std::ptr::eq(choose(&new, &old).unwrap(), &new));
+        assert!(std::ptr::eq(choose(&old, &new).unwrap(), &raw const new));
+        assert!(std::ptr::eq(choose(&new, &old).unwrap(), &raw const new));
         let too_old = restart(lsn(0, FIRST + 128), true);
         assert!(choose(&too_old, &new).is_err());
     }

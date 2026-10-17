@@ -85,7 +85,7 @@ pub(super) fn apply(
     }
     let end = offset
         .checked_add(length)
-        .filter(|end| *end <= u64::from(u32::MAX))
+        .filter(|end| u32::try_from(*end).is_ok())
         .ok_or_else(|| FfsError::Io(std::io::Error::from_raw_os_error(libc::EFBIG)))?;
     let modified = Some(modified_timestamp(now)?);
     validate_edit_state(cx, volume)?;

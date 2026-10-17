@@ -453,8 +453,8 @@ mod tests {
                     let first = (if version.0 >= 2 { 34_u64 } else { 4 }) * 4096;
                     let old_vbo = if wrap { LOG_SIZE as u64 - 4096 } else { first };
                     let new_vbo = if wrap { first } else { first + 4096 };
-                    let old_lsn = (1_u64 << 20) | (old_vbo + 128) / 8;
-                    let new_lsn = ((if wrap { 2_u64 } else { 1 }) << 20) | (new_vbo + 128) / 8;
+                    let old_lsn = (1_u64 << 20) | ((old_vbo + 128) / 8);
+                    let new_lsn = ((if wrap { 2_u64 } else { 1 }) << 20) | ((new_vbo + 128) / 8);
                     let mut old = plain(4096, version, if old_clean { CLEAN } else { 0 }, true);
                     let mut new = plain(4096, version, CLEAN, true);
                     let start = usize::from(u16_at(&old, 24).unwrap());
@@ -477,8 +477,8 @@ mod tests {
         let mut old = plain(4096, (2, 0), CLEAN, true);
         let mut new = plain(4096, (2, 0), 0, true);
         let start = usize::from(u16_at(&old, 24).unwrap());
-        let old_lsn = (1_u64 << 20) | (34 * 4096 + 128) / 8;
-        let new_lsn = (1_u64 << 20) | (35 * 4096 + 128) / 8;
+        let old_lsn = (1_u64 << 20) | ((34 * 4096 + 128) / 8);
+        let new_lsn = (1_u64 << 20) | ((35 * 4096 + 128) / 8);
         old[start..start + 8].copy_from_slice(&old_lsn.to_le_bytes());
         new[start..start + 8].copy_from_slice(&new_lsn.to_le_bytes());
         for (first, second) in [(old.clone(), new.clone()), (new, old)] {

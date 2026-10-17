@@ -200,7 +200,7 @@ mod tests {
     const FIRST: u64 = 34 * PAGE as u64;
 
     fn lsn(sequence: u64, vbo: u64) -> u64 {
-        (sequence << 15) | vbo / 8
+        (sequence << 15) | (vbo / 8)
     }
 
     fn restart(current: u64) -> Restart {
@@ -472,7 +472,7 @@ mod tests {
     #[test]
     fn scan_record_budget_is_enforced_before_the_next_record_read() {
         let address_bits = 24;
-        let first = (1_u64 << address_bits) | (FIRST + 64) / 8;
+        let first = (1_u64 << address_bits) | ((FIRST + 64) / 8);
         let last = first + MAX_RECORDS as u64 * PAGE as u64 / 8;
         let mut metadata = restart(last);
         metadata.file_size = 64 * 1024 * 1024;
@@ -485,7 +485,7 @@ mod tests {
             first,
             &mut |offset, _| {
                 calls += 1;
-                let current = (1_u64 << address_bits) | (offset + 64) / 8;
+                let current = (1_u64 << address_bits) | ((offset + 64) / 8);
                 let mut page = plain(current, current, 152);
                 put(&mut page, 64, current, 24, 0);
                 Ok(protect(page))

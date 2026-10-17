@@ -386,7 +386,7 @@ mod tests {
             (report.active, report.prepared, report.committed),
             (0, 1, 0)
         );
-        assert!(report.undo.is_empty());
+        assert_eq!(report.undo, [] as [(u64, u32, u16); 0]);
     }
 
     #[test]
@@ -433,7 +433,7 @@ mod tests {
             })
             .unwrap();
         assert_eq!(report.committed, 1);
-        assert!(report.undo.is_empty());
+        assert_eq!(report.undo, [] as [(u64, u32, u16); 0]);
     }
 
     #[test]
@@ -550,9 +550,9 @@ mod tests {
 
     fn native_journal(reuse_committed: bool) -> (Restart, Vec<u8>) {
         let page_vbo = 34_u64 * 4096;
-        let first = (1_u64 << 20) | (page_vbo + 64) / 8;
-        let second = (1_u64 << 20) | (page_vbo + 152) / 8;
-        let last = (1_u64 << 20) | (page_vbo + 240) / 8;
+        let first = (1_u64 << 20) | ((page_vbo + 64) / 8);
+        let second = (1_u64 << 20) | ((page_vbo + 152) / 8);
+        let last = (1_u64 << 20) | ((page_vbo + 240) / 8);
         let restart = Restart {
             system_page: 4096,
             log_page: 4096,
@@ -637,7 +637,7 @@ mod tests {
         for opcode in [0, 0x0A, 0x17, PREPARE, 0x1C, 0x1D, 0x1E, 0x1F, 0x20] {
             let records = [record(10, 24, 7, opcode, 0, 0)];
             let report = plan(&observe(&records), &records).unwrap();
-            assert!(report.undo.is_empty());
+            assert_eq!(report.undo, [] as [(u64, u32, u16); 0]);
             assert_eq!(report.active, 1);
         }
     }

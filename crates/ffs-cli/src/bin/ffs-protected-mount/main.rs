@@ -131,13 +131,13 @@ impl ByteDevice for ProtectedDevice {
 }
 
 pub enum ProtectedFs {
-    Core(OpenFs),
+    Core(Box<OpenFs>),
     Fat {
-        fs: fat::filesystem::FatFs,
+        fs: Box<fat::filesystem::FatFs>,
         writable: bool,
     },
-    Ntfs(ntfs::reader::filesystem::NtfsFs),
-    Zfs(zfs::filesystem::ZfsFs),
+    Ntfs(Box<ntfs::reader::filesystem::NtfsFs>),
+    Zfs(Box<zfs::filesystem::ZfsFs>),
 }
 
 impl ProtectedFs {
@@ -151,10 +151,10 @@ impl ProtectedFs {
 
     fn as_ops(&self) -> &dyn FsOps {
         match self {
-            Self::Core(fs) => fs,
-            Self::Fat { fs, .. } => fs,
-            Self::Ntfs(fs) => fs,
-            Self::Zfs(fs) => fs,
+            Self::Core(fs) => fs.as_ref(),
+            Self::Fat { fs, .. } => fs.as_ref(),
+            Self::Ntfs(fs) => fs.as_ref(),
+            Self::Zfs(fs) => fs.as_ref(),
         }
     }
 }
@@ -164,7 +164,7 @@ impl std::ops::Deref for ProtectedFs {
 
     fn deref(&self) -> &Self::Target {
         match self {
-            Self::Core(fs) => fs,
+            Self::Core(fs) => fs.as_ref(),
             Self::Fat { .. } | Self::Ntfs(_) | Self::Zfs(_) => {
                 panic!("OpenFs deref is only valid on ext4/btrfs ProtectedFs::Core")
             }
@@ -175,7 +175,9 @@ impl std::ops::Deref for ProtectedFs {
 impl mount_worker::PeriodicCommitTarget for ProtectedFs {
     fn default_commit_interval(&self) -> Option<std::time::Duration> {
         match self {
-            Self::Core(fs) => mount_worker::PeriodicCommitTarget::default_commit_interval(fs),
+            Self::Core(fs) => {
+                mount_worker::PeriodicCommitTarget::default_commit_interval(fs.as_ref())
+            }
             Self::Fat { .. } | Self::Ntfs(_) | Self::Zfs(_) => None,
         }
     }
@@ -731,7 +733,7 @@ fn prepare(cx: &Cx, args: &Args) -> Result<Prepared> {
                 fs.enable_writes(cx)
                     .context("enable protected filesystem writes")?;
             }
-            ProtectedFs::Core(fs)
+            ProtectedFs::Core(Box::new(fs))
         }
         "fat16" | "fat32" => {
             let volume = fat::reader::FatVolume::from_device(cx, protected_device, 0, len)
@@ -749,7 +751,7 @@ fn prepare(cx: &Cx, args: &Args) -> Result<Prepared> {
             FsOps::getattr(&fat_fs, cx, &mut RequestScope::empty(), InodeNumber(1))
                 .context("read protected FAT filesystem root")?;
             ProtectedFs::Fat {
-                fs: fat_fs,
+                fs: Box::new(fat_fs),
                 writable: args.rw,
             }
         }
@@ -763,7 +765,7 @@ fn prepare(cx: &Cx, args: &Args) -> Result<Prepared> {
                 .context("initialize protected NTFS filesystem")?;
             FsOps::getattr(&ntfs_fs, cx, &mut RequestScope::empty(), InodeNumber(1))
                 .context("read protected NTFS filesystem root")?;
-            ProtectedFs::Ntfs(ntfs_fs)
+            ProtectedFs::Ntfs(Box::new(ntfs_fs))
         }
         "zfs" => {
             if args.rw {
@@ -783,7 +785,7 @@ fn prepare(cx: &Cx, args: &Args) -> Result<Prepared> {
                 .context("initialize protected ZFS filesystem")?;
             FsOps::getattr(&zfs_fs, cx, &mut RequestScope::empty(), InodeNumber(1))
                 .context("read protected ZFS filesystem root")?;
-            ProtectedFs::Zfs(zfs_fs)
+            ProtectedFs::Zfs(Box::new(zfs_fs))
         }
         other => bail!("unsupported protected filesystem {other}"),
     };

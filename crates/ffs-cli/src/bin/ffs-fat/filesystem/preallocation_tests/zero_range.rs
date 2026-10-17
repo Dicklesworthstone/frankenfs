@@ -11,8 +11,18 @@ fn target(kind: FatKind, sector: u32, active: bool, payload: &[u8]) -> (Image, F
     let (fs, _) = image.mount();
     let cx = Cx::for_testing();
     let mut scope = RequestScope::empty();
-    let ino = fs.create(&cx, &mut scope, ROOT, OsStr::new("ZERO.BIN"), 0o644, 1000, 1000)
-        .unwrap().ino;
+    let ino = fs
+        .create(
+            &cx,
+            &mut scope,
+            ROOT,
+            OsStr::new("ZERO.BIN"),
+            0o644,
+            1000,
+            1000,
+        )
+        .unwrap()
+        .ino;
     if !payload.is_empty() {
         fs.write(&cx, &mut scope, ino, 0, payload).unwrap();
     }
@@ -21,14 +31,20 @@ fn target(kind: FatKind, sector: u32, active: bool, payload: &[u8]) -> (Image, F
 }
 
 fn profiles() -> [(FatKind, bool); 3] {
-    [(FatKind::Fat16, false), (FatKind::Fat32, false), (FatKind::Fat32, true)]
+    [
+        (FatKind::Fat16, false),
+        (FatKind::Fat32, false),
+        (FatKind::Fat32, true),
+    ]
 }
 
 #[test]
 fn zero_range_preserves_unaligned_edges_fragmented_chains_and_reopened_bytes() {
     for (kind, active) in profiles() {
         for sector in [512, 4096] {
-            let mut expected: Vec<u8> = (0..3 * sector + 37).map(|at| (at % 251 + 1) as u8).collect();
+            let mut expected: Vec<u8> = (0..3 * sector + 37)
+                .map(|at| (at % 251 + 1) as u8)
+                .collect();
             let (image, fs, ino) = target(kind, sector, active, &expected);
             let cx = Cx::for_testing();
             let mut scope = RequestScope::empty();
@@ -38,17 +54,28 @@ fn zero_range_preserves_unaligned_edges_fragmented_chains_and_reopened_bytes() {
             let before_free = free(&fs);
             let start = u64::from(sector) - 7;
             let length = u64::from(sector) + 23;
-            fs.fallocate(&cx, &mut scope, ino, start, length, ZERO).unwrap();
+            fs.fallocate(&cx, &mut scope, ino, start, length, ZERO)
+                .unwrap();
             expected[start as usize..(start + length) as usize].fill(0);
-            assert_eq!(fs.read(&cx, &mut scope, ino, 0, before.size as u32).unwrap(), expected);
+            assert_eq!(
+                fs.read(&cx, &mut scope, ino, 0, before.size as u32)
+                    .unwrap(),
+                expected
+            );
             assert_eq!(native_chain(&fs, "/ZERO.BIN").clusters, chain.clusters);
             let after = fs.getattr(&cx, &mut scope, ino).unwrap();
-            assert_eq!((after.size, after.blocks, after.ino), (before.size, before.blocks, ino));
+            assert_eq!(
+                (after.size, after.blocks, after.ino),
+                (before.size, before.blocks, ino)
+            );
             assert_eq!(free(&fs), before_free);
             let reopened = image.volume();
             let entry = reopened.resolve(&cx, "/ZERO.BIN").unwrap().unwrap();
             let chain = reopened.file_chain(&cx, &entry).unwrap();
-            assert_eq!(reopened.read(&cx, &chain, 0, expected.len()).unwrap(), expected);
+            assert_eq!(
+                reopened.read(&cx, &chain, 0, expected.len()).unwrap(),
+                expected
+            );
             assert!(reopened.check(&cx).unwrap().clean);
             image.guards();
         }
@@ -71,23 +98,39 @@ fn zero_keep_size_reserves_without_exposing_eof_and_later_growth_reuses_capacity
             });
             let start = u64::from(sector) + 5;
             let end = 3 * u64::from(sector) + 16;
-            fs.fallocate(&cx, &mut scope, ino, start, end - start, ZERO | KEEP).unwrap();
+            fs.fallocate(&cx, &mut scope, ino, start, end - start, ZERO | KEEP)
+                .unwrap();
             expected[start as usize..].fill(0);
             let after = fs.getattr(&cx, &mut scope, ino).unwrap();
             assert_eq!(after.size, expected.len() as u64);
             assert_eq!(after.blocks, 4 * u64::from(sector) / 512);
             assert_eq!(free(&fs), before_free - 2);
-            assert_eq!(fs.statfs(&cx, &mut scope, ROOT).unwrap().blocks_free, before_free - 2);
-            assert_eq!(fs.read(&cx, &mut scope, ino, 0, end as u32).unwrap(), expected);
+            assert_eq!(
+                fs.statfs(&cx, &mut scope, ROOT).unwrap().blocks_free,
+                before_free - 2
+            );
+            assert_eq!(
+                fs.read(&cx, &mut scope, ino, 0, end as u32).unwrap(),
+                expected
+            );
             let reserved = native_chain(&fs, "/ZERO.BIN");
-            assert_eq!(&reserved.clusters[..original.clusters.len()], &original.clusters);
+            assert_eq!(
+                &reserved.clusters[..original.clusters.len()],
+                &original.clusters
+            );
             let reopened = image.volume();
             let entry = reopened.resolve(&cx, "/ZERO.BIN").unwrap().unwrap();
             assert_eq!(entry.native.size as usize, expected.len());
-            assert_eq!(reopened.file_chain(&cx, &entry).unwrap().clusters, reserved.clusters);
+            assert_eq!(
+                reopened.file_chain(&cx, &entry).unwrap().clusters,
+                reserved.clusters
+            );
             fs.fallocate(&cx, &mut scope, ino, 0, end, 0).unwrap();
             expected.resize(end as usize, 0);
-            assert_eq!(fs.read(&cx, &mut scope, ino, 0, end as u32).unwrap(), expected);
+            assert_eq!(
+                fs.read(&cx, &mut scope, ino, 0, end as u32).unwrap(),
+                expected
+            );
             assert_eq!(native_chain(&fs, "/ZERO.BIN").clusters, reserved.clusters);
             assert_eq!(free(&fs), before_free - 2);
             if let Some((at, bytes)) = inactive {
@@ -104,10 +147,14 @@ fn empty_zero_reservations_and_full_volume_zeroing_need_no_replacement_chain() {
         let (image, fs, ino) = target(kind, 512, active, &[]);
         let cx = Cx::for_testing();
         let mut scope = RequestScope::empty();
-        fs.fallocate(&cx, &mut scope, ino, 700, 900, ZERO | KEEP).unwrap();
+        fs.fallocate(&cx, &mut scope, ino, 700, 900, ZERO | KEEP)
+            .unwrap();
         assert_eq!(fs.getattr(&cx, &mut scope, ino).unwrap().size, 0);
         assert_eq!(fs.getattr(&cx, &mut scope, ino).unwrap().blocks, 4);
-        assert!(fs.read(&cx, &mut scope, ino, 0, 1600).unwrap().is_empty());
+        assert_eq!(
+            fs.read(&cx, &mut scope, ino, 0, 1600).unwrap(),
+            [] as [u8; 0]
+        );
         fs.write(&cx, &mut scope, ino, 1599, b"Z").unwrap();
         let mut expected = vec![0; 1600];
         expected[1599] = b'Z';
@@ -118,21 +165,30 @@ fn empty_zero_reservations_and_full_volume_zeroing_need_no_replacement_chain() {
     let cx = Cx::for_testing();
     let mut scope = RequestScope::empty();
     let capacity = (free(&fs) + 1) * 512;
-    fs.fallocate(&cx, &mut scope, ino, 0, capacity, KEEP).unwrap();
+    fs.fallocate(&cx, &mut scope, ino, 0, capacity, KEEP)
+        .unwrap();
     let reserved = native_chain(&fs, "/ZERO.BIN").clusters;
     assert_eq!(free(&fs), 0);
-    fs.fallocate(&cx, &mut scope, ino, 1, 4, ZERO | KEEP).unwrap();
+    fs.fallocate(&cx, &mut scope, ino, 1, 4, ZERO | KEEP)
+        .unwrap();
     let mut expected = b"untouched".to_vec();
     expected[1..5].fill(0);
     assert_eq!(fs.read(&cx, &mut scope, ino, 0, 9).unwrap(), expected);
-    fs.fallocate(&cx, &mut scope, ino, capacity - 7, 7, ZERO).unwrap();
+    fs.fallocate(&cx, &mut scope, ino, capacity - 7, 7, ZERO)
+        .unwrap();
     assert_eq!(fs.getattr(&cx, &mut scope, ino).unwrap().size, capacity);
-    assert_eq!(fs.read(&cx, &mut scope, ino, capacity - 8, 8).unwrap(), [0; 8]);
+    assert_eq!(
+        fs.read(&cx, &mut scope, ino, capacity - 8, 8).unwrap(),
+        [0; 8]
+    );
     assert_eq!(fs.read(&cx, &mut scope, ino, 0, 9).unwrap(), expected);
     assert_eq!(native_chain(&fs, "/ZERO.BIN").clusters, reserved);
     assert_eq!(free(&fs), 0);
     let attempts = image.device.disk.lock().unwrap().attempts;
-    assert!(matches!(fs.fallocate(&cx, &mut scope, ino, capacity, 1, ZERO), Err(FfsError::NoSpace)));
+    assert!(matches!(
+        fs.fallocate(&cx, &mut scope, ino, capacity, 1, ZERO),
+        Err(FfsError::NoSpace)
+    ));
     assert_eq!(image.device.disk.lock().unwrap().attempts, attempts);
     image.guards();
 }
@@ -148,17 +204,41 @@ fn invalid_zero_requests_preserve_bytes_and_leave_the_mount_usable() {
             (0, 0, ZERO, libc::EINVAL),
             (u64::MAX, 2, ZERO, libc::EFBIG),
             (u64::from(u32::MAX), 1, ZERO | KEEP, libc::EFBIG),
-            (0, 1, ZERO | libc::FALLOC_FL_PUNCH_HOLE | KEEP, libc::EOPNOTSUPP),
-            (0, 1, ZERO | libc::FALLOC_FL_COLLAPSE_RANGE, libc::EOPNOTSUPP),
+            (
+                0,
+                1,
+                ZERO | libc::FALLOC_FL_PUNCH_HOLE | KEEP,
+                libc::EOPNOTSUPP,
+            ),
+            (
+                0,
+                1,
+                ZERO | libc::FALLOC_FL_COLLAPSE_RANGE,
+                libc::EOPNOTSUPP,
+            ),
             (0, 1, -1, libc::EOPNOTSUPP),
         ] {
-            assert!(matches!(fs.fallocate(&cx, &mut scope, ino, offset, length, mode), Err(FfsError::Io(error)) if error.raw_os_error() == Some(errno)));
+            assert!(
+                matches!(fs.fallocate(&cx, &mut scope, ino, offset, length, mode), Err(FfsError::Io(error)) if error.raw_os_error() == Some(errno))
+            );
         }
-        assert!(matches!(fs.fallocate(&cx, &mut scope, ROOT, 0, 1, ZERO), Err(FfsError::IsDirectory)));
-        assert!(matches!(fs.fallocate(&cx, &mut scope, ino, 0, u64::from(u32::MAX), ZERO), Err(FfsError::NoSpace)));
+        assert!(matches!(
+            fs.fallocate(&cx, &mut scope, ROOT, 0, 1, ZERO),
+            Err(FfsError::IsDirectory)
+        ));
+        assert!(matches!(
+            fs.fallocate(&cx, &mut scope, ino, 0, u64::from(u32::MAX), ZERO),
+            Err(FfsError::NoSpace)
+        ));
         let cancelled = Cx::for_testing();
-        cancelled.cancel_with(asupersync::types::CancelKind::User, Some("before zero range"));
-        assert!(matches!(fs.fallocate(&cancelled, &mut scope, ino, 0, 1, ZERO), Err(FfsError::Cancelled)));
+        cancelled.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("before zero range"),
+        );
+        assert!(matches!(
+            fs.fallocate(&cancelled, &mut scope, ino, 0, 1, ZERO),
+            Err(FfsError::Cancelled)
+        ));
         {
             let disk = image.device.disk.lock().unwrap();
             assert_eq!(disk.attempts, 0);
@@ -167,9 +247,21 @@ fn invalid_zero_requests_preserve_bytes_and_leave_the_mount_usable() {
         }
         fs.fallocate(&cx, &mut scope, ino, 1, 1, ZERO).unwrap();
         assert_eq!(fs.read(&cx, &mut scope, ino, 0, 9).unwrap(), b"u\0changed");
-        fs.setattr(&cx, &mut scope, ino, &SetAttrRequest { mode: Some(0o444), ..Default::default() }).unwrap();
+        fs.setattr(
+            &cx,
+            &mut scope,
+            ino,
+            &SetAttrRequest {
+                mode: Some(0o444),
+                ..Default::default()
+            },
+        )
+        .unwrap();
         let attempts = image.device.disk.lock().unwrap().attempts;
-        assert!(matches!(fs.fallocate(&cx, &mut scope, ino, 0, 1, ZERO), Err(FfsError::PermissionDenied)));
+        assert!(matches!(
+            fs.fallocate(&cx, &mut scope, ino, 0, 1, ZERO),
+            Err(FfsError::PermissionDenied)
+        ));
         assert_eq!(image.device.disk.lock().unwrap().attempts, attempts);
         image.guards();
     }
@@ -180,7 +272,15 @@ fn every_zero_write_and_sync_cut_quarantines_without_a_clean_partial_success() {
     for (kind, active) in profiles() {
         for mode in [ZERO, ZERO | KEEP] {
             let (baseline, fs, ino) = target(kind, 512, active, b"ABCDEFGH");
-            fs.fallocate(&Cx::for_testing(), &mut RequestScope::empty(), ino, 2, 1600, mode).unwrap();
+            fs.fallocate(
+                &Cx::for_testing(),
+                &mut RequestScope::empty(),
+                ino,
+                2,
+                1600,
+                mode,
+            )
+            .unwrap();
             let count = baseline.device.disk.lock().unwrap().attempts;
             assert!(count > 8);
             for fail in 1..=count {
@@ -191,19 +291,43 @@ fn every_zero_write_and_sync_cut_quarantines_without_a_clean_partial_success() {
                         disk.fail_at = Some(fail);
                         disk.tear = tear;
                     }
-                    assert!(fs.fallocate(&Cx::for_testing(), &mut RequestScope::empty(), ino, 2, 1600, mode).is_err(), "{kind:?} mode={mode} fail={fail} tear={tear}");
+                    assert!(
+                        fs.fallocate(
+                            &Cx::for_testing(),
+                            &mut RequestScope::empty(),
+                            ino,
+                            2,
+                            1600,
+                            mode
+                        )
+                        .is_err(),
+                        "{kind:?} mode={mode} fail={fail} tear={tear}"
+                    );
                     stopped(&fs, &image, ino);
                     image.guards();
                     for retain in [false, true] {
                         let durable = {
                             let disk = image.device.disk.lock().unwrap();
                             let mut bytes = disk.durable.clone();
-                            if retain { bytes.extend(disk.pending.clone()); }
+                            if retain {
+                                bytes.extend(disk.pending.clone());
+                            }
                             bytes
                         };
-                        let device = Device { disk: Arc::new(Mutex::new(Disk { durable, ..Disk::default() })), length: image.device.length };
+                        let device = Device {
+                            disk: Arc::new(Mutex::new(Disk {
+                                durable,
+                                ..Disk::default()
+                            })),
+                            length: image.device.length,
+                        };
                         let cx = Cx::for_testing();
-                        if let Ok(reopened) = FatVolume::from_device(&cx, Box::new(device), image.base, image.geometry.volume_bytes()) {
+                        if let Ok(reopened) = FatVolume::from_device(
+                            &cx,
+                            Box::new(device),
+                            image.base,
+                            image.geometry.volume_bytes(),
+                        ) {
                             let check = reopened.check(&cx).unwrap();
                             if check.clean && check.complete && check.namespace_complete {
                                 let entry = reopened.resolve(&cx, "/ZERO.BIN").unwrap().unwrap();
@@ -228,7 +352,17 @@ fn lost_zero_overwrites_are_detected_instead_of_reading_back_their_own_oracle() 
         let first = native_chain(&fs, "/ZERO.BIN").clusters[0];
         let physical = image.base + image.geometry.cluster_offset(first).unwrap();
         image.device.disk.lock().unwrap().drop_write_at = Some(physical + 1);
-        assert!(fs.fallocate(&Cx::for_testing(), &mut RequestScope::empty(), ino, 1, 1, ZERO | KEEP).is_err());
+        assert!(
+            fs.fallocate(
+                &Cx::for_testing(),
+                &mut RequestScope::empty(),
+                ino,
+                1,
+                1,
+                ZERO | KEEP
+            )
+            .is_err()
+        );
         assert_eq!(image.bytes(physical, 8), b"ABCDEFGH");
         stopped(&fs, &image, ino);
         image.guards();
@@ -244,7 +378,8 @@ fn zero_ranges_larger_than_the_read_request_limit_remain_bounded_and_persistent(
         let start = 32_771;
         let length = 16 * 1024 * 1024 + 19;
         let end = start + length;
-        fs.fallocate(&cx, &mut scope, ino, start, length, ZERO).unwrap();
+        fs.fallocate(&cx, &mut scope, ino, start, length, ZERO)
+            .unwrap();
         assert_eq!(fs.getattr(&cx, &mut scope, ino).unwrap().size, end);
         assert_eq!(fs.read(&cx, &mut scope, ino, 0, 9).unwrap(), b"preserved");
         for at in [9, start - 7, start, 16 * 1024 * 1024] {

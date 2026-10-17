@@ -511,7 +511,7 @@ mod tests {
                     24,
                     0,
                     &[],
-                    &attribute((7 << 48) | 42, 0),
+                    &attribute((7 << 48) | 0x002a, 0),
                     &[0, 0xD8, 97, 0],
                 ),
             )
@@ -528,7 +528,7 @@ mod tests {
 
     #[test]
     fn open_preserves_native_identity_name_and_ignores_serialized_pointers() {
-        let mut value = attribute((7 << 48) | 42, 0);
+        let mut value = attribute((7 << 48) | 0x002a, 0);
         value[32..40].fill(0xFF);
         let mut state = State::default();
         state
@@ -538,7 +538,7 @@ mod tests {
             )
             .unwrap();
         let target = &state.attributes[&24];
-        assert_eq!(target.reference, (7 << 48) | 42);
+        assert_eq!(target.reference, (7 << 48) | 0x002a);
         assert_eq!(target.name, vec![0xD800, 97]);
         assert_eq!(target.opened, 10);
     }
@@ -641,13 +641,13 @@ mod tests {
                     24,
                     0,
                     &[],
-                    &attribute((8 << 48) | 43, 0),
+                    &attribute((8 << 48) | 0x002b, 0),
                     &[],
                 ),
             )
             .unwrap();
         assert!(state.clusters.is_empty());
-        assert!(state.attributes[&24].name.is_empty());
+        assert_eq!(state.attributes[&24].name, [] as [u16; 0]);
         state
             .observe(&cx, &record(40, 8, 24, 0, &[99], b"b", &[]))
             .unwrap();
@@ -670,7 +670,7 @@ mod tests {
                     24,
                     0,
                     &[],
-                    &attribute((7 << 48) | 42, 0),
+                    &attribute((7 << 48) | 0x002a, 0),
                     &[0, 0xD8, 97, 0],
                 ),
             )
@@ -686,7 +686,7 @@ mod tests {
                         24,
                         0,
                         &[],
-                        &attribute((8 << 48) | 43, 0),
+                        &attribute((8 << 48) | 0x002b, 0),
                         &[]
                     )
                 )
@@ -720,7 +720,7 @@ mod tests {
             let mut state = state();
             assert!(state.observe(&cx, &record).is_err());
             assert!(state.clusters.is_empty());
-            assert_eq!(state.attributes[&24].reference, (7 << 48) | 42);
+            assert_eq!(state.attributes[&24].reference, (7 << 48) | 0x002a);
         }
     }
 
@@ -797,7 +797,7 @@ mod tests {
     #[test]
     fn checkpoint_incarnation_blocks_older_open_and_mapping_rewind() {
         let cx = Cx::for_testing();
-        let value = attribute((9 << 48) | 50, 30);
+        let value = attribute((9 << 48) | 0x0032, 30);
         let table = RestartTable {
             entry_size: 40,
             entries: BTreeMap::from([(24, value.as_slice())]),
@@ -814,7 +814,7 @@ mod tests {
             .observe(&cx, &record(20, 8, 24, 0, &[99], &[], &[]))
             .unwrap();
         assert!(state.clusters.is_empty());
-        assert_eq!(state.attributes[&24].reference, (9 << 48) | 50);
+        assert_eq!(state.attributes[&24].reference, (9 << 48) | 0x0032);
     }
 
     #[test]
@@ -824,13 +824,13 @@ mod tests {
         const PAGE: usize = 4096;
         const FIRST: u64 = 34 * PAGE as u64;
         let lsns = [FIRST, FIRST + PAGE as u64, FIRST + 2 * PAGE as u64]
-            .map(|offset| (1_u64 << 20) | (offset + 128) / 8);
+            .map(|offset| (1_u64 << 20) | ((offset + 128) / 8));
         for conflict in [false, true] {
             let mut attrs = vec![0; 64];
             attrs[..2].copy_from_slice(&40_u16.to_le_bytes());
             attrs[2..4].copy_from_slice(&1_u16.to_le_bytes());
             attrs[4..6].copy_from_slice(&1_u16.to_le_bytes());
-            attrs[24..].copy_from_slice(&attribute((7 << 48) | 42, 0));
+            attrs[24..].copy_from_slice(&attribute((7 << 48) | 0x002a, 0));
             let mut dirty = vec![0; 104];
             dirty[..2].copy_from_slice(&40_u16.to_le_bytes());
             dirty[2..4].copy_from_slice(&2_u16.to_le_bytes());

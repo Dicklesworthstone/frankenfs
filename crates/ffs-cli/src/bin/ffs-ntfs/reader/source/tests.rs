@@ -91,11 +91,11 @@ fn fully_replaced_sectors_do_not_read_the_old_backing_even_if_it_is_unreadable()
     let (mut source, trace, _) = fixture(37, 2048);
     trace.lock().unwrap().fail_at = Some(37 + 512);
     source.write_overlay(&cx, 512, &[0xA7; 1024]).unwrap();
-    assert!(trace.lock().unwrap().reads.is_empty());
+    assert_eq!(trace.lock().unwrap().reads, []);
     let mut out = [0; 1000];
     source.read(&cx, 519, &mut out).unwrap();
     assert_eq!(out, [0xA7; 1000]);
-    assert!(trace.lock().unwrap().reads.is_empty());
+    assert_eq!(trace.lock().unwrap().reads, []);
     let cancelled = Cx::for_testing();
     cancelled.cancel_with(CancelKind::User, Some("cached overlay read cancellation"));
     assert!(matches!(source.read(&cancelled, 519, &mut out), Err(FfsError::Cancelled)));
@@ -108,7 +108,7 @@ fn mixed_reads_copy_exact_overlay_ranges_and_coalesce_the_uncovered_gaps() {
     let (mut source, trace, original) = fixture(37, 4096);
     source.write_overlay(&cx, 512, &[0xA7; 512]).unwrap();
     source.write_overlay(&cx, 2560, &[0xB9; 512]).unwrap();
-    assert!(trace.lock().unwrap().reads.is_empty());
+    assert_eq!(trace.lock().unwrap().reads, []);
     let mut out = vec![0; 3500];
     source.read(&cx, 100, &mut out).unwrap();
     let mut expected = original[137..3637].to_vec();
@@ -199,7 +199,7 @@ fn empty_and_invalid_patches_are_bounded_before_any_state_change() {
     cx.cancel_with(CancelKind::User, Some("cancel before overlay staging"));
     assert!(matches!(source.write_overlay(&cx, 0, &[0; 512]), Err(FfsError::Cancelled)));
     assert!(source.overlay.is_empty());
-    assert!(trace.lock().unwrap().reads.is_empty());
+    assert_eq!(trace.lock().unwrap().reads, []);
 }
 
 #[test]
@@ -483,7 +483,7 @@ fn action_log(lcn: u64, offset: u16, data: &[u8]) -> Vec<u8> {
     assert_eq!(plan.records_parsed, 2);
     assert_eq!(plan.committed_transactions, [42]);
     assert_eq!(plan.redo_actions.len(), 1);
-    assert!(plan.undo_actions.is_empty());
+    assert_eq!(plan.undo_actions, []);
     assert_eq!(plan.redo_actions[0].target_lcn, lcn);
     assert_eq!(plan.redo_actions[0].data, data);
     log
@@ -500,7 +500,7 @@ fn a_constructed_native_redo_plan_reads_its_overlay_without_changing_the_backing
     let mut value = [0; 8];
     volume.source.read(&cx, 220 * 512 + 3, &mut value).unwrap();
     assert_eq!(&value, b"overlay!");
-    assert!(trace.lock().unwrap().reads.is_empty());
+    assert_eq!(trace.lock().unwrap().reads, []);
     let mut underlying = [0xFF; 8];
     volume.source.device.read_exact_at(&cx, ByteOffset(220 * 512 + 3), &mut underlying).unwrap();
     assert_eq!(underlying, [0; 8]);

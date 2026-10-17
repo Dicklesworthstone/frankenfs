@@ -421,9 +421,8 @@ mod tests {
             offline_image: true,
             sidecar: Some(archive.clone()),
         };
-        let error = match args.open(&cx) {
-            Ok(_) => panic!("one-byte native volume must be refused"),
-            Err(error) => error,
+        let Err(error) = args.open(&cx) else {
+            panic!("one-byte native volume must be refused");
         };
         // An exclusive writable open fails at sidecar admission. A genuine
         // read-only caller reaches native geometry admission while sharing locks.

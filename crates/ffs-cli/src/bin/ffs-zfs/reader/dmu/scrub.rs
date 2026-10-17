@@ -102,13 +102,13 @@ impl Walker<'_> {
         &mut self,
         object: u64,
         position: Position,
-        error: FfsError,
+        error: &FfsError,
         descendants_unknown: bool,
     ) -> Result<()> {
         if matches!(error, FfsError::Cancelled) {
             return Err(FfsError::Cancelled);
         }
-        let category = match &error {
+        let category = match error {
             FfsError::UnsupportedFeature(_) => {
                 self.report.unsupported += 1;
                 "unsupported"
@@ -190,7 +190,7 @@ impl Walker<'_> {
                 return self.issue(
                     tree.number,
                     position,
-                    unsupported("scrub only admits SA spills up to 128 KiB"),
+                    &unsupported("scrub only admits SA spills up to 128 KiB"),
                     false,
                 );
             }
@@ -208,10 +208,10 @@ impl Walker<'_> {
                 Ok(None) => self.issue(
                     tree.number,
                     position,
-                    corrupt("allocated SA spill is a hole"),
+                    &corrupt("allocated SA spill is a hole"),
                     false,
                 )?,
-                Err(error) => self.issue(tree.number, position, error, false)?,
+                Err(error) => self.issue(tree.number, position, &error, false)?,
             }
         }
         Ok(())
@@ -235,7 +235,7 @@ impl Walker<'_> {
             return self.issue(
                 tree.number,
                 position,
-                corrupt("allocated pointer exceeds dn_maxblkid"),
+                &corrupt("allocated pointer exceeds dn_maxblkid"),
                 descendants,
             );
         }
@@ -262,7 +262,7 @@ impl Walker<'_> {
                 self.report.hole_pointers += 1;
                 return Ok(());
             }
-            Err(error) => return self.issue(tree.number, position, error, descendants),
+            Err(error) => return self.issue(tree.number, position, &error, descendants),
         };
         self.report.verified_blocks += 1;
         self.report.verified_bytes += block.bytes.len() as u64;
@@ -274,7 +274,7 @@ impl Walker<'_> {
         }
         let fanout = block.bytes.len() / 128;
         let child_span = span / fanout as u128;
-        for (slot, raw) in block.bytes.chunks_exact(128).enumerate() {
+        for (slot, raw) in block.bytes.as_chunks::<128>().0.iter().enumerate() {
             checkpoint(cx)?;
             if self.report.limit_reached.is_some() {
                 break;
@@ -285,7 +285,7 @@ impl Walker<'_> {
             };
             match BlockPointer::parse(raw, block.order) {
                 Ok(child) => {
-                    self.visit(cx, tree, &child, child_position, child_span, block.birth)?
+                    self.visit(cx, tree, &child, child_position, child_span, block.birth)?;
                 }
                 Err(error) => {
                     if !self.charge_pointer() {
@@ -294,7 +294,7 @@ impl Walker<'_> {
                     self.issue(
                         tree.number,
                         child_position,
-                        parse(&error),
+                        &parse(&error),
                         child_position.level != 0 || tree.dnodes,
                     )?;
                 }
@@ -314,7 +314,7 @@ impl Walker<'_> {
             return self.issue(
                 0,
                 position,
-                corrupt("meta-dnode exceeds object namespace"),
+                &corrupt("meta-dnode exceeds object namespace"),
                 true,
             );
         }
@@ -339,7 +339,7 @@ impl Walker<'_> {
                 self.issue(
                     number,
                     position,
-                    corrupt("large dnode crosses its block"),
+                    &corrupt("large dnode crosses its block"),
                     true,
                 )?;
                 break;
@@ -351,7 +351,7 @@ impl Walker<'_> {
                 self.issue(
                     0,
                     position,
-                    corrupt("reserved object zero is allocated in dnode table"),
+                    &corrupt("reserved object zero is allocated in dnode table"),
                     true,
                 )?;
                 continue;
@@ -366,7 +366,7 @@ impl Walker<'_> {
                         dnodes: false,
                     },
                 )?,
-                Err(error) => self.issue(number, position, parse(&error), true)?,
+                Err(error) => self.issue(number, position, &parse(&error), true)?,
             }
         }
         Ok(())
@@ -615,7 +615,7 @@ companion_bin_tests! {
                 assert!(report.pointers_examined <= limits.pointers);
                 assert!(report.decoded_bytes_attempted <= limits.decoded_bytes);
                 assert!(report.objects_examined <= limits.objects);
-                if limits.decoded_bytes < 16_384 { assert!(fixture.storage.lock().unwrap().reads.is_empty()); }
+                if limits.decoded_bytes < 16_384 { assert_eq!(fixture.storage.lock().unwrap().reads, [] as [u64; 0]); }
             }
         }
 
@@ -650,7 +650,7 @@ companion_bin_tests! {
             let report = scrub(&view);
             assert_eq!(report.errors, 1);
             assert_eq!(report.incomplete_subtrees, 1);
-            assert!(fixture.storage.lock().unwrap().reads.is_empty());
+            assert_eq!(fixture.storage.lock().unwrap().reads, [] as [u64; 0]);
         }
 
         #[test]
@@ -682,7 +682,7 @@ companion_bin_tests! {
             let fixture = Fixture::new(Endian::Little);
             let view = fixture.view();
             assert!(view.scrub(&Cx::for_testing(), ScrubLimits { objects: 0, ..ScrubLimits::default() }).is_err());
-            assert!(fixture.storage.lock().unwrap().reads.is_empty());
+            assert_eq!(fixture.storage.lock().unwrap().reads, [] as [u64; 0]);
         }
     }
 }

@@ -177,7 +177,7 @@ mod tests {
         let first_vbo = if wrap { LOG - PAGE as u64 } else { first };
         let record_off = PAGE - if header_at_end { 48 } else { 64 };
         let seq_num_bits = 67 - (64 - LOG.leading_zeros());
-        let lsn = (1_u64 << (64 - seq_num_bits)) | (first_vbo + record_off as u64) / 8;
+        let lsn = (1_u64 << (64 - seq_num_bits)) | ((first_vbo + record_off as u64) / 8);
         let restart = Restart {
             system_page: PAGE as u32,
             log_page: PAGE as u32,

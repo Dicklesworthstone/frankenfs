@@ -264,14 +264,9 @@ impl Zpl {
         Some(meta)
     }
 
-    fn ensure_overlay_file_data(
-        &mut self,
-        cx: &Cx,
-        overlay: &mut ZilOverlay,
-        object_id: u64,
-    ) -> Result<()> {
+    fn ensure_overlay_file_data(&mut self, cx: &Cx, overlay: &mut ZilOverlay, object_id: u64) {
         if overlay.file_data.contains_key(&object_id) {
-            return Ok(());
+            return;
         }
         let data = if let Ok((object, meta)) = self.file(cx, object_id)
             && meta.kind == Kind::Regular
@@ -289,7 +284,6 @@ impl Zpl {
             Vec::new()
         };
         overlay.file_data.insert(object_id, data);
-        Ok(())
     }
 
     fn apply_zil_record(
@@ -447,7 +441,7 @@ impl Zpl {
                 } else {
                     Vec::new()
                 };
-                self.ensure_overlay_file_data(cx, overlay, *file_obj)?;
+                self.ensure_overlay_file_data(cx, overlay, *file_obj);
                 let _ = self.ensure_overlay_metadata(cx, overlay, *file_obj);
                 if let Some(buf) = overlay.file_data.get_mut(file_obj) {
                     let end = (*offset as usize)
@@ -469,7 +463,7 @@ impl Zpl {
                 offset,
                 length,
             } => {
-                self.ensure_overlay_file_data(cx, overlay, *file_obj)?;
+                self.ensure_overlay_file_data(cx, overlay, *file_obj);
                 let _ = self.ensure_overlay_metadata(cx, overlay, *file_obj);
                 if let Some(buf) = overlay.file_data.get_mut(file_obj) {
                     if *length == 0 {

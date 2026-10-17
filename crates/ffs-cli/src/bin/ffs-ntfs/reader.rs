@@ -358,18 +358,26 @@ impl NtfsVolume {
         if log_stream.initialized != log_stream.size
             || !matches!(&log_stream.storage, Storage::Mapped(runs) if runs.iter().all(|run| run.lcn.is_some()))
         {
-            return Err(unsupported("NTFS $LogFile must be fully initialized and physically mapped without a data transform"));
+            return Err(unsupported(
+                "NTFS $LogFile must be fully initialized and physically mapped without a data transform",
+            ));
         }
-        let log_len = usize::try_from(log_stream.size)
-            .map_err(|_| unsupported("NTFS $LogFile length exceeds the addressable read profile"))?;
+        let log_len = usize::try_from(log_stream.size).map_err(|_| {
+            unsupported("NTFS $LogFile length exceeds the addressable read profile")
+        })?;
         if !(8192..=MAX_READ).contains(&log_len) {
-            return Err(unsupported("NTFS $LogFile must fit the complete 8 KiB..16 MiB recovery read profile; prefix replay is refused"));
+            return Err(unsupported(
+                "NTFS $LogFile must fit the complete 8 KiB..16 MiB recovery read profile; prefix replay is refused",
+            ));
         }
         let log_bytes = self.read(cx, &log_stream, 0, log_len)?;
-        let plan = ffs_ondisk::ntfs::parse_ntfs_logfile(&log_bytes)
-            .map_err(|error| parse(&error))?;
+        let plan =
+            ffs_ondisk::ntfs::parse_ntfs_logfile(&log_bytes).map_err(|error| parse(&error))?;
         if plan.restart.file_size != log_stream.size {
-            return Err(corrupt(0, "NTFS $LogFile restart size disagrees with its complete DATA stream"));
+            return Err(corrupt(
+                0,
+                "NTFS $LogFile restart size disagrees with its complete DATA stream",
+            ));
         }
         let record_bytes = usize::try_from(self.geometry.record_bytes())
             .map_err(|_| corrupt(0, "NTFS record size exceeds addressable memory"))?;
@@ -378,7 +386,9 @@ impl NtfsVolume {
             checkpoint(cx)?;
             let lcn = action.target_lcn;
             if lcn == 0 {
-                return Err(unsupported("NTFS recovery action has no admitted target LCN"));
+                return Err(unsupported(
+                    "NTFS recovery action has no admitted target LCN",
+                ));
             }
             let target_off = lcn
                 .checked_mul(cluster_bytes)
@@ -401,9 +411,12 @@ impl NtfsVolume {
                     let mut unprot = ffs_ondisk::ntfs::restore_record(&rec_buf, b"FILE")
                         .map_err(|error| corrupt(target_off, error.to_string()))?;
                     let rel = usize::from(action.attribute_offset);
-                    let end = rel.checked_add(action.data.len())
+                    let end = rel
+                        .checked_add(action.data.len())
                         .filter(|end| *end <= unprot.len())
-                        .ok_or_else(|| corrupt(target_off, "NTFS recovery patch exceeds its FILE record"))?;
+                        .ok_or_else(|| {
+                            corrupt(target_off, "NTFS recovery patch exceeds its FILE record")
+                        })?;
                     unprot[rel..end].copy_from_slice(&action.data);
                     let reprot = ffs_ondisk::ntfs::protect_record(&unprot)
                         .map_err(|error| corrupt(target_off, error.to_string()))?;
@@ -427,7 +440,10 @@ impl NtfsVolume {
         validate_mft_stream(&mft, &self.geometry)?;
         self.mft = mft;
         if self.record(cx, 0, None)?.used_bytes() != primary.used_bytes() {
-            return Err(corrupt(0, "recovered MFT mapping does not reproduce record zero"));
+            return Err(corrupt(
+                0,
+                "recovered MFT mapping does not reproduce record zero",
+            ));
         }
         checkpoint(cx)?;
         self.logfile_recovery = Some(plan);
@@ -595,7 +611,10 @@ fn validate_mft_stream(mft: &Stream, geometry: &NtfsGeometry) -> Result<()> {
         || !mft.initialized.is_multiple_of(record_bytes)
         || !mft.size.is_multiple_of(record_bytes)
     {
-        return Err(corrupt(0, "invalid MFT bootstrap mapping or initialized record boundary"));
+        return Err(corrupt(
+            0,
+            "invalid MFT bootstrap mapping or initialized record boundary",
+        ));
     }
     Ok(())
 }

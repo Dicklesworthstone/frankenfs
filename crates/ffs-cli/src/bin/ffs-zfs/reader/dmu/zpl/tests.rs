@@ -792,12 +792,12 @@ fn zil_intent_log_replays_create_write_rename_truncate_and_remove_in_memory() {
         os_bytes[528..656].copy_from_slice(&zil_bp); // zh_log BP
         image[at_os..at_os + 1024].copy_from_slice(&os_bytes);
 
-        let at_mos = BASE + MOS as usize;
-        let mut mos_table = image[at_mos..at_mos + 16_384].to_vec();
+        let meta_offset = BASE + MOS as usize;
+        let mut mos_table = image[meta_offset..meta_offset + 16_384].to_vec();
         let mut ds = mos_table[1536 + 192..1536 + 192 + 320].to_vec();
         ds[128..256].copy_from_slice(&bp(&os_bytes, OS, 11, 0, 45, order, Endian::Big));
         mos_table[1536..2048].copy_from_slice(&node(16, 512, 1, 0, &ds, 16, order));
-        image[at_mos..at_mos + 16_384].copy_from_slice(&mos_table);
+        image[meta_offset..meta_offset + 16_384].copy_from_slice(&mos_table);
 
         let mut meta_raw = node(10, 16_384, 1, 0, &[], 0, order);
         meta_raw[64..192].copy_from_slice(&bp(&mos_table, MOS, 10, 0, 50, order, order));

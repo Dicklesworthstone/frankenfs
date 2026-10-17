@@ -122,8 +122,8 @@ impl VdevConfig {
             }
             let width = group.members.len() as u64;
             let data_cols = width.saturating_sub(group.parity as u64);
-            if width > 0 {
-                return (self.allocated_bytes / width).saturating_mul(data_cols);
+            if let Some(column_bytes) = self.allocated_bytes.checked_div(width) {
+                return column_bytes.saturating_mul(data_cols);
             }
         }
         self.allocated_bytes

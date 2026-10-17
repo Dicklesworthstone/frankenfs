@@ -75,7 +75,7 @@ fn string_values_preserve_native_bytes_and_refuse_invalid_encodings() {
     }
     assert!(spec.decode(&text("p:x", &vec![b'a'; MAX_VALUE_BYTES - 1])).is_ok());
     assert!(spec.decode(&text("p:x", &vec![b'a'; MAX_VALUE_BYTES])).is_err());
-    for values in [vec![], vec![b'a' as u64], vec![256, 0], vec![65, 0, 66, 0]] {
+    for values in [vec![], vec![u64::from(b'a')], vec![256, 0], vec![65, 0, 66, 0]] {
         let mut row = text("p:x", b"x");
         row.values = values;
         assert!(spec.decode(&row).is_err());

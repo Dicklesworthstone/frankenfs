@@ -113,9 +113,13 @@ impl VolumeDevice {
         cx_checkpoint(cx)?;
         let length = match length {
             Some(length) => length,
-            None => inner.as_ref().len_bytes().checked_sub(base.0).ok_or_else(|| {
-                FfsError::InvalidGeometry("volume base exceeds backing length".to_owned())
-            })?,
+            None => inner
+                .as_ref()
+                .len_bytes()
+                .checked_sub(base.0)
+                .ok_or_else(|| {
+                    FfsError::InvalidGeometry("volume base exceeds backing length".to_owned())
+                })?,
         };
         Self::new(inner, base, length, VolumeAccess::ReadOnly)
     }
@@ -136,12 +140,7 @@ impl VolumeDevice {
     ///
     /// `base` is relative to this volume. Attempting to make a writable child
     /// of a read-only parent is refused even if both happen to be empty.
-    pub fn subvolume(
-        &self,
-        base: ByteOffset,
-        length: u64,
-        access: VolumeAccess,
-    ) -> Result<Self> {
+    pub fn subvolume(&self, base: ByteOffset, length: u64, access: VolumeAccess) -> Result<Self> {
         if self.access == VolumeAccess::ReadOnly && access == VolumeAccess::ReadWrite {
             return Err(FfsError::ReadOnly);
         }
@@ -150,9 +149,10 @@ impl VolumeDevice {
 
     fn physical_range(&self, cx: &Cx, offset: ByteOffset, count: u64) -> Result<ByteOffset> {
         cx_checkpoint(cx)?;
-        let end = offset.0.checked_add(count).ok_or_else(|| {
-            FfsError::Format("volume-relative request overflows u64".to_owned())
-        })?;
+        let end = offset
+            .0
+            .checked_add(count)
+            .ok_or_else(|| FfsError::Format("volume-relative request overflows u64".to_owned()))?;
         if end > self.length {
             return Err(FfsError::Format(format!(
                 "request exceeds selected volume: offset={} length={count} volume_length={}",
@@ -211,15 +211,20 @@ impl ByteDevice for VolumeDevice {
     }
 
     fn preserves_read_exact_at_destination_on_error(&self) -> bool {
-        self.inner.as_ref().preserves_read_exact_at_destination_on_error()
+        self.inner
+            .as_ref()
+            .preserves_read_exact_at_destination_on_error()
     }
 
     fn preserves_read_vectored_destinations_on_error(&self) -> bool {
-        self.inner.as_ref().preserves_read_vectored_destinations_on_error()
+        self.inner
+            .as_ref()
+            .preserves_read_vectored_destinations_on_error()
     }
 
     fn read_exact_at(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
-        let physical = self.physical_range(cx, offset, total_bytes(cx, std::iter::once(buf.len()))?)?;
+        let physical =
+            self.physical_range(cx, offset, total_bytes(cx, std::iter::once(buf.len()))?)?;
         if buf.is_empty() {
             return Ok(());
         }
@@ -229,11 +234,14 @@ impl ByteDevice for VolumeDevice {
     }
 
     fn read_exact_at_volatile(&self, cx: &Cx, offset: ByteOffset, buf: &mut [u8]) -> Result<()> {
-        let physical = self.physical_range(cx, offset, total_bytes(cx, std::iter::once(buf.len()))?)?;
+        let physical =
+            self.physical_range(cx, offset, total_bytes(cx, std::iter::once(buf.len()))?)?;
         if buf.is_empty() {
             return Ok(());
         }
-        self.inner.as_ref().read_exact_at_volatile(cx, physical, buf)
+        self.inner
+            .as_ref()
+            .read_exact_at_volatile(cx, physical, buf)
     }
 
     fn read_vectored_exact_at(
@@ -251,12 +259,15 @@ impl ByteDevice for VolumeDevice {
         // Dispatch through the underlying trait object, not an Arc forwarder.
         // Preserve the native scatter path and its whole-request error policy;
         // do not flatten the buffers or silently fall back to scalar reads.
-        self.inner.as_ref().read_vectored_exact_at(cx, physical, bufs)
+        self.inner
+            .as_ref()
+            .read_vectored_exact_at(cx, physical, bufs)
     }
 
     fn write_all_at(&self, cx: &Cx, offset: ByteOffset, buf: &[u8]) -> Result<()> {
         self.require_write(cx)?;
-        let physical = self.physical_range(cx, offset, total_bytes(cx, std::iter::once(buf.len()))?)?;
+        let physical =
+            self.physical_range(cx, offset, total_bytes(cx, std::iter::once(buf.len()))?)?;
         if buf.is_empty() {
             return Ok(());
         }
@@ -271,7 +282,9 @@ impl ByteDevice for VolumeDevice {
             return Ok(());
         }
         // Keep the existing gather implementation, without a payload-sized copy.
-        self.inner.as_ref().write_vectored_all_at(cx, physical, bufs)
+        self.inner
+            .as_ref()
+            .write_vectored_all_at(cx, physical, bufs)
     }
 
     fn sync(&self, cx: &Cx) -> Result<()> {

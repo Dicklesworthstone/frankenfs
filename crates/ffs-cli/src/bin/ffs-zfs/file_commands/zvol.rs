@@ -26,12 +26,14 @@ pub enum SeekKind {
 #[derive(Debug, Subcommand)]
 pub enum Command {
     /// Inspect native zvol capacity, block size and pinned head/snapshot identity.
-    ZvolInfo {
+    #[command(name = "zvol-info")]
+    Info {
         #[command(flatten)]
         volume: VolumeArgs,
     },
     /// Extract a native zvol byte range to stdout without creating a host device.
-    ZvolRead {
+    #[command(name = "zvol-read")]
+    Read {
         #[command(flatten)]
         volume: VolumeArgs,
         #[arg(long, default_value_t = 0)]
@@ -41,7 +43,8 @@ pub enum Command {
         bytes: Option<u64>,
     },
     /// Locate allocated data or a native hole, without scrubbing data payloads.
-    ZvolSeek {
+    #[command(name = "zvol-seek")]
+    Seek {
         #[command(flatten)]
         volume: VolumeArgs,
         #[arg(long, default_value_t = 0)]
@@ -71,13 +74,13 @@ fn length(capacity: u64, start: u64, requested: Option<u64>) -> Result<u64> {
 impl Command {
     pub(super) fn run(self, cx: &Cx) -> Result<()> {
         let (args, action) = match self {
-            Self::ZvolInfo { volume } => (volume, Action::Info),
-            Self::ZvolRead {
+            Self::Info { volume } => (volume, Action::Info),
+            Self::Read {
                 volume,
                 start,
                 bytes,
             } => (volume, Action::Read(start, bytes)),
-            Self::ZvolSeek {
+            Self::Seek {
                 volume,
                 start,
                 kind,
@@ -182,8 +185,8 @@ mod tests {
                 panic!("zvol command");
             };
             let volume = match command {
-                Command::ZvolInfo { volume } => volume,
-                Command::ZvolRead {
+                Command::Info { volume } => volume,
+                Command::Read {
                     volume,
                     start,
                     bytes,
@@ -191,7 +194,7 @@ mod tests {
                     assert_eq!((start, bytes), (510, Some(600)));
                     volume
                 }
-                Command::ZvolSeek {
+                Command::Seek {
                     volume,
                     start,
                     kind,
@@ -204,8 +207,8 @@ mod tests {
             assert_eq!(volume.dataset, "vm/disk");
             assert_eq!(volume.snapshot, Some(OsString::from("before")));
             assert!(volume.candidate.auto_import && volume.candidate.image.offline_image);
-            assert_eq!(volume.candidate.image.offset, 1048576);
-            assert_eq!(volume.candidate.image.length, Some(67108864));
+            assert_eq!(volume.candidate.image.offset, 1_048_576);
+            assert_eq!(volume.candidate.image.length, Some(67_108_864));
             assert_eq!(
                 volume.candidate.members,
                 [std::path::PathBuf::from("second.img")]

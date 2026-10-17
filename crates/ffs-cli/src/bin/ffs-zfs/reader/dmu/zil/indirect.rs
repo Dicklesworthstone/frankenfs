@@ -6,7 +6,7 @@
 //! replay semantics. They remain refused rather than guessing their contents.
 
 use super::{
-    BlockPointer, Cx, Edit, MAX_LOG_BYTES, MAX_RECORDS, Pool, Record, Result, VdevConfig,
+    BlockPointer, Cx, Edit, IntentRecord, MAX_LOG_BYTES, MAX_RECORDS, Pool, Result, VdevConfig,
     checkpoint, corrupt, edit, file_range, parse, unsupported,
 };
 use std::collections::BTreeMap;
@@ -23,7 +23,7 @@ struct Write {
 
 impl Plan {
     /// Admit every pending operation before loading any indirect file payload.
-    pub(super) fn new(cx: &Cx, records: &[Record]) -> Result<Self> {
+    pub(super) fn new(cx: &Cx, records: &[IntentRecord]) -> Result<Self> {
         checkpoint(cx)?;
         if records.len() > MAX_RECORDS {
             return Err(unsupported("ZIL recovery exceeds 65536 records"));
@@ -126,7 +126,7 @@ impl Plan {
 
 pub(super) fn edits<'a>(
     cx: &Cx,
-    records: &'a [Record],
+    records: &'a [IntentRecord],
     data: &'a BTreeMap<usize, Vec<u8>>,
     object: u64,
 ) -> Result<Vec<Edit<'a>>> {

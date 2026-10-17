@@ -466,7 +466,7 @@ impl FsOps for ZfsFs {
             if !state.head.view.has_snapshot_dir() {
                 return Err(FfsError::NotFound("ZPL control directory".into()));
             }
-            let rows = vec![
+            let rows = [
                 DirEntry {
                     ino: ZFS_CTL_INO,
                     offset: 1,

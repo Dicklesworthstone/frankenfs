@@ -36,7 +36,7 @@ impl Journal {
     fn append(&mut self, kind: u32, transaction: u32, data: &[u8], prev: u64, undo: u64) -> u64 {
         assert!(data.len() < PAGE - 176);
         let offset = START + self.pages.len() as u64 * PAGE as u64;
-        let lsn = (1_u64 << 20) | (offset + 128) / 8;
+        let lsn = (1_u64 << 20) | ((offset + 128) / 8);
         let mut page = vec![0; PAGE];
         page[..4].copy_from_slice(b"RCRD");
         page[4..6].copy_from_slice(&40_u16.to_le_bytes());
@@ -197,7 +197,7 @@ fn current_record_and_checkpoint_links_reject_self_future_and_wrong_locations() 
             0 => first,
             1 => first + 8,
             2 => (1_u64 << 20) | 1,
-            _ => (1_u64 << 20) | START / 8,
+            _ => (1_u64 << 20) | (START / 8),
         };
         journal.page_mut(first)[136..144].copy_from_slice(&bad.to_le_bytes());
         assert!(journal.check().is_err());
@@ -291,7 +291,7 @@ fn referenced_record_budget_and_shared_ownership_apply_before_graph_io() {
     journal.restart.file_size = 32 * 1024 * 1024;
     journal.restart.seq_num_bits = 41;
     // Give this synthetic address space its own consistent LSN sequence width.
-    let first = (1_u64 << 23) | (START + 128) / 8;
+    let first = (1_u64 << 23) | ((START + 128) / 8);
     journal.restart.active_client_oldest_lsn = Some(first);
     journal.restart.current_lsn = first + PAGE as u64 * MAX_REFERENCED_RECORDS as u64 / 8;
     let mut references = References::default();

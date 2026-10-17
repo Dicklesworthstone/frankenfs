@@ -1502,9 +1502,8 @@ mod tests {
                 FIEMAP_EXTENT_LAST
             )]
         );
-        assert!(fat_fiemap(&cx, &chain, 512, 4096, 64 * 1024, 3000, 1)
-            .unwrap()
-            .is_empty());
+        assert_eq!(fat_fiemap(&cx, &chain, 512, 4096, 64 * 1024, 3000, 1)
+            .unwrap(), [] as [ffs_core::FiemapExtent; 0]);
     }
 
     #[test]
@@ -1611,7 +1610,7 @@ mod tests {
         let node = fs.node(&cx, ino).unwrap();
         let chain = fs.chain(&cx, ino, node.entry.as_ref().unwrap()).unwrap();
         let extents = fs.fiemap(&cx, &mut scope, ino, 0, u64::MAX).unwrap();
-        assert!(!extents.is_empty());
+        assert_ne!(extents, [] as [ffs_core::FiemapExtent; 0]);
         assert_eq!(
             extents[0].physical,
             fs.volume
@@ -1898,13 +1897,13 @@ mod tests {
             .unwrap();
         create_file(&fs, "D.TXT");
         let resumed = fs.readdir(&cx, &mut RequestScope::empty(), ROOT, cursor).unwrap();
-        let names: Vec<_> = resumed.iter().map(|entry| entry.name_str()).collect();
+        let names: Vec<_> = resumed.iter().map(ffs_core::DirEntry::name_str).collect();
         assert_eq!(names, ["B.TXT", "C.TXT", "D.TXT"]);
         // The FUSE directory handle can still cap enumeration at its opening
         // end cookie, without hiding any unchanged, previously unseen entry.
         let bounded: Vec<_> = resumed.iter()
             .filter(|entry| entry.offset <= old_end)
-            .map(|entry| entry.name_str())
+            .map(ffs_core::DirEntry::name_str)
             .collect();
         assert_eq!(bounded, ["B.TXT", "C.TXT"]);
         assert!(resumed.iter().all(|entry| entry.offset > cursor));
@@ -1983,7 +1982,7 @@ mod tests {
             UNIX_EPOCH - Duration::from_secs(1),
             UNIX_EPOCH,
             UNIX_EPOCH + Duration::from_secs(315_532_799),
-            UNIX_EPOCH + Duration::from_secs(4_354_819_200),
+            UNIX_EPOCH + Duration::from_hours(1_209_672),
         ] {
             for access_time in [false, true] {
                 let mut attrs = SetAttrRequest { size: Some(0), ..Default::default() };
@@ -2039,7 +2038,7 @@ mod tests {
         let actual = fs.setattr(&cx, &mut RequestScope::empty(), ino, &attrs).unwrap();
         assert_eq!((actual.size, actual.perm), (9, 0o444));
         assert_eq!(actual.mtime, UNIX_EPOCH + Duration::from_secs(1_709_210_096));
-        assert_eq!(actual.atime, UNIX_EPOCH + Duration::from_secs(1_709_210_097 / 86_400 * 86_400));
+        assert_eq!(actual.atime, UNIX_EPOCH + Duration::from_hours(474_768));
         assert_eq!(fs.read(&cx, &mut RequestScope::empty(), ino, 0, 9).unwrap(), b"abc\0\0\0\0\0\0");
         assert!(matches!(
             fs.write(&cx, &mut RequestScope::empty(), ino, 0, b"x"),

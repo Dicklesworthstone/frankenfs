@@ -333,12 +333,12 @@ fn shrink_in_volume(cx: &Cx, volume: &FatVolume, path: &str, size: u32, now: u64
         phase = "verifying retained payload and allocation";
         plan.verify_payload(cx, volume)?;
         let after = volume.check(cx)?;
+        let expected_counts = (plan.free_after, before.files, before.directories);
+        let actual_counts = (after.free_clusters, after.files, after.directories);
         if !after.clean
             || !after.complete
             || !after.namespace_complete
-            || after.free_clusters != plan.free_after
-            || after.files != before.files
-            || after.directories != before.directories
+            || actual_counts != expected_counts
         {
             bail!(
                 "shrink verification failed: {}",

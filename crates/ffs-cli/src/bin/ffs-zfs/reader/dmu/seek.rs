@@ -95,7 +95,7 @@ impl Objects {
                 level,
                 ceiling: object.ceiling,
             };
-            if let Some(block) = self.seek_subtree(cx, &object.node, subtree, &mut search)? {
+            if let Some(block) = self.seek_subtree(cx, &object.node, &subtree, &mut search)? {
                 // A returned block lies strictly below EOF, so this product
                 // fits u64 even when the unvisited tree's capacity would not.
                 let offset = u64::try_from(block * block_bytes)
@@ -119,7 +119,7 @@ impl Objects {
         &mut self,
         cx: &Cx,
         node: &Dnode,
-        subtree: Subtree,
+        subtree: &Subtree,
         search: &mut Search,
     ) -> Result<Option<u128>> {
         checkpoint(cx)?;
@@ -127,7 +127,8 @@ impl Objects {
             .first
             .checked_add(subtree.blocks)
             .ok_or_else(|| corrupt("DMU seek subtree overflow"))?;
-        if subtree.first >= search.end || end <= search.first || search.first >= search.end {
+        let outside_search = subtree.first >= search.end || end <= search.first;
+        if outside_search || search.first >= search.end {
             return Ok(None);
         }
         search.budget.pointer()?;
@@ -185,7 +186,7 @@ impl Objects {
                 level: subtree.level - 1,
                 ceiling: block.birth,
             };
-            if let Some(found) = self.seek_subtree(cx, node, child, search)? {
+            if let Some(found) = self.seek_subtree(cx, node, &child, search)? {
                 return Ok(Some(found));
             }
         }
@@ -710,25 +711,25 @@ mod tests {
             },
         };
         assert!(matches!(
-            objects.seek_subtree(&cx, &node, subtree(), &mut search(33, 4095)),
+            objects.seek_subtree(&cx, &node, &subtree(), &mut search(33, 4095)),
             Err(FfsError::UnsupportedFeature(_))
         ));
         assert!(reads.lock().unwrap().is_empty());
         let mut exact = search(33, 4096);
         assert_eq!(
             objects
-                .seek_subtree(&cx, &node, subtree(), &mut exact)
+                .seek_subtree(&cx, &node, &subtree(), &mut exact)
                 .unwrap(),
             None
         );
         assert_eq!((exact.budget.pointers, exact.budget.metadata_bytes), (0, 0));
         assert_eq!(*reads.lock().unwrap(), [(BASE + INDIRECT, 4096)]);
         assert!(matches!(
-            objects.seek_subtree(&cx, &node, subtree(), &mut search(33, 4095)),
+            objects.seek_subtree(&cx, &node, &subtree(), &mut search(33, 4095)),
             Err(FfsError::UnsupportedFeature(_))
         ));
         assert!(matches!(
-            objects.seek_subtree(&cx, &node, subtree(), &mut search(32, 4096)),
+            objects.seek_subtree(&cx, &node, &subtree(), &mut search(32, 4096)),
             Err(FfsError::UnsupportedFeature(_))
         ));
         assert_eq!(*reads.lock().unwrap(), [(BASE + INDIRECT, 4096)]);

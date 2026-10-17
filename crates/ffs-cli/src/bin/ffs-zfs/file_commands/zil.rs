@@ -286,11 +286,11 @@ mod tests {
                     .chain(extra),
                 )
                 .unwrap();
-                let candidate = match cli.command {
-                    TopCommand::File(FileCommand::Zil(
-                        Command::ZilInspect { candidate, .. } | Command::ZilRead { candidate, .. },
-                    )) => candidate,
-                    _ => panic!("ZIL command"),
+                let TopCommand::File(FileCommand::Zil(
+                    Command::ZilInspect { candidate, .. } | Command::ZilRead { candidate, .. },
+                )) = cli.command
+                else {
+                    panic!("ZIL command");
                 };
                 assert_eq!(candidate.members, [PathBuf::from("second.img")]);
                 assert_eq!(

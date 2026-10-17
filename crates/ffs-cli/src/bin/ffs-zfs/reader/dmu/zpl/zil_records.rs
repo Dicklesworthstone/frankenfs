@@ -303,11 +303,9 @@ mod tests {
                 let shorter = record(kind, &vec![0; body_size - 8], order);
                 assert!(parse(&cx, &block(&shorter, shorter.len() as u64, order), order).is_err());
             }
-            assert!(
-                parse(&cx, &block(&[], 0, order), order)
-                    .unwrap()
-                    .records
-                    .is_empty()
+            assert_eq!(
+                parse(&cx, &block(&[], 0, order), order).unwrap().records,
+                [] as [ffs_ondisk::zfs_dmu::ZilRecord; 0]
             );
         }
         cx.cancel_with(

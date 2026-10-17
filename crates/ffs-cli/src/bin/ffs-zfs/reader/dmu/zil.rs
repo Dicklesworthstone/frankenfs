@@ -98,7 +98,7 @@ impl Pointer {
             }
             if ended
                 || first & 0xff00_0000_ff00_0000 != 0
-                || first & 0x00ff_ffff == 0
+                || first.trailing_zeros() >= 24
                 || second >> 63 != 0
             {
                 return Err(corrupt("invalid, ganged or noncontiguous ZIL DVA"));
@@ -214,7 +214,7 @@ pub enum Termination {
 }
 
 #[derive(Debug, Serialize)]
-pub struct Record {
+pub struct IntentRecord {
     pub kind: u64,
     pub txg: u64,
     pub sequence: u64,
@@ -237,7 +237,7 @@ pub struct IntentLog {
     pub physical_work_bytes: usize,
     pub reconstruction_work_bytes: usize,
     pub termination: Termination,
-    pub records: Vec<Record>,
+    pub records: Vec<IntentRecord>,
 }
 
 #[derive(Clone, Copy)]
@@ -368,7 +368,7 @@ fn scan(
                 } else {
                     record_txg > txg
                 };
-            result.records.push(Record {
+            result.records.push(IntentRecord {
                 kind: word(&raw, at, payload_order)?,
                 txg: record_txg,
                 sequence,
@@ -461,7 +461,7 @@ impl Edit<'_> {
     }
 }
 
-fn file_range(record: &Record) -> Result<(u64, u64, u64)> {
+fn file_range(record: &IntentRecord) -> Result<(u64, u64, u64)> {
     let raw = &record.raw;
     let object = word(raw, 32, record.order)?;
     let offset = word(raw, 40, record.order)?;
@@ -476,7 +476,7 @@ fn file_range(record: &Record) -> Result<(u64, u64, u64)> {
     Ok((object, offset, length))
 }
 
-fn edit(record: &Record) -> Result<Edit<'_>> {
+fn edit(record: &IntentRecord) -> Result<Edit<'_>> {
     if !matches!(record.kind, 9 | 10) {
         return Err(unsupported(
             "file-data ZIL recovery refuses pending namespace, attribute and other record types",

@@ -1184,7 +1184,7 @@ fn protected_mount_ntfs_repairs_multi_block_corruption_on_read_bd_q19uk() {
         let val = filename(5, "payload.bin", 1);
         let len = (16 + val.len()).next_multiple_of(8);
         let mut entry = vec![0_u8; len];
-        entry[..8].copy_from_slice(&((7_u64 << 48) | 24).to_le_bytes());
+        entry[..8].copy_from_slice(&((7_u64 << 48) | 0x0018).to_le_bytes());
         entry[8..10].copy_from_slice(&(len as u16).to_le_bytes());
         entry[10..12].copy_from_slice(&(val.len() as u16).to_le_bytes());
         entry[16..16 + val.len()].copy_from_slice(&val);

@@ -170,7 +170,7 @@ mod tests {
         );
         assert_eq!(
             (candidate.image.offset, candidate.image.length),
-            (1048576, Some(67108864))
+            (1_048_576, Some(67_108_864))
         );
         assert_eq!(dataset, OsString::from("data/nested"));
         assert_eq!(snapshot.unwrap().as_bytes(), [0xfe]);
