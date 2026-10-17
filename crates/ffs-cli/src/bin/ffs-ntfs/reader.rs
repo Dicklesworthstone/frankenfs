@@ -6,6 +6,7 @@ pub mod ea;
 pub mod filesystem;
 mod namespace;
 pub mod security;
+mod source;
 mod wof;
 
 use asupersync::Cx;
@@ -72,85 +73,6 @@ struct Source {
     base: u64,
     length: u64,
     overlay: std::collections::BTreeMap<u64, [u8; 512]>,
-}
-impl Source {
-    fn read(&self, cx: &Cx, offset: u64, data: &mut [u8]) -> Result<()> {
-        checkpoint(cx)?;
-        if offset
-            .checked_add(data.len() as u64)
-            .is_none_or(|end| end > self.length)
-        {
-            return Err(corrupt(
-                offset,
-                "NTFS read outside the selected addressable volume",
-            ));
-        }
-        let physical = self
-            .base
-            .checked_add(offset)
-            .ok_or_else(|| corrupt(offset, "physical offset overflow"))?;
-        self.device.read_exact_at(cx, ByteOffset(physical), data)?;
-        if !self.overlay.is_empty() && !data.is_empty() {
-            let first_sec = offset / 512;
-            let last_sec = (offset + data.len() as u64 - 1) / 512;
-            for sec in first_sec..=last_sec {
-                if let Some(patch) = self.overlay.get(&sec) {
-                    let sec_start = sec * 512;
-                    let sec_end = sec_start + 512;
-                    let overlap_start = offset.max(sec_start);
-                    let overlap_end = (offset + data.len() as u64).min(sec_end);
-                    if overlap_start < overlap_end {
-                        let dst_off = (overlap_start - offset) as usize;
-                        let src_off = (overlap_start - sec_start) as usize;
-                        let len = (overlap_end - overlap_start) as usize;
-                        data[dst_off..dst_off + len]
-                            .copy_from_slice(&patch[src_off..src_off + len]);
-                    }
-                }
-            }
-        }
-        checkpoint(cx)
-    }
-
-    fn write_overlay(&mut self, cx: &Cx, offset: u64, data: &[u8]) -> Result<()> {
-        checkpoint(cx)?;
-        if data.is_empty() {
-            return Ok(());
-        }
-        if offset
-            .checked_add(data.len() as u64)
-            .is_none_or(|end| end > self.length)
-        {
-            return Err(corrupt(
-                offset,
-                "NTFS overlay write outside the selected addressable volume",
-            ));
-        }
-        let first_sec = offset / 512;
-        let last_sec = (offset + data.len() as u64 - 1) / 512;
-        for sec in first_sec..=last_sec {
-            let sec_start = sec * 512;
-            if !self.overlay.contains_key(&sec) {
-                let mut buf = [0_u8; 512];
-                let physical = self
-                    .base
-                    .checked_add(sec_start)
-                    .ok_or_else(|| corrupt(sec_start, "physical offset overflow"))?;
-                self.device
-                    .read_exact_at(cx, ByteOffset(physical), &mut buf)?;
-                self.overlay.insert(sec, buf);
-            }
-            let patch = self.overlay.get_mut(&sec).expect("inserted above");
-            let sec_end = sec_start + 512;
-            let overlap_start = offset.max(sec_start);
-            let overlap_end = (offset + data.len() as u64).min(sec_end);
-            let src_off = (overlap_start - offset) as usize;
-            let dst_off = (overlap_start - sec_start) as usize;
-            let len = (overlap_end - overlap_start) as usize;
-            patch[dst_off..dst_off + len].copy_from_slice(&data[src_off..src_off + len]);
-        }
-        checkpoint(cx)
-    }
 }
 
 #[derive(Debug)]
@@ -351,12 +273,7 @@ impl NtfsVolume {
                 "NTFS volume range exceeds backing".into(),
             ));
         }
-        let mut source = Source {
-            device,
-            base,
-            length,
-            overlay: std::collections::BTreeMap::new(),
-        };
+        let mut source = Source::bounded(cx, device, base, length)?;
         let mut boot = [0_u8; 512];
         source.read(cx, 0, &mut boot)?;
         let geometry = NtfsGeometry::parse(&boot, length).map_err(|error| parse(&error))?;
@@ -387,23 +304,7 @@ impl NtfsVolume {
             ));
         }
         let mft = attributes::bootstrap_mft(&source, &geometry, cx, &primary)?;
-        let Storage::Mapped(runs) = &mft.storage else {
-            return Err(corrupt(0, "MFT DATA must be nonresident"));
-        };
-        let record_bytes = u64::from(geometry.record_bytes());
-        if runs.first().is_none_or(|run| {
-            run.lcn != Some(geometry.mft_cluster())
-                || run.clusters * u64::from(geometry.cluster_bytes()) < record_bytes
-        }) || runs.iter().any(|run| run.lcn.is_none())
-            || mft.initialized < 4 * record_bytes
-            || !mft.initialized.is_multiple_of(record_bytes)
-            || !mft.size.is_multiple_of(record_bytes)
-        {
-            return Err(corrupt(
-                0,
-                "invalid MFT bootstrap mapping or initialized record boundary",
-            ));
-        }
+        validate_mft_stream(&mft, &geometry)?;
         let mut volume = Self {
             source,
             geometry,
@@ -435,6 +336,13 @@ impl NtfsVolume {
             )));
         }
         if recover_logfile {
+            // The dirty bit requests log handling. Other flags (resize,
+            // upgrade, chkdsk and unknown state) are not permission to replay.
+            if flags & !1 != 0 {
+                return Err(unsupported(format!(
+                    "NTFS volume flags {flags:#06x} require work beyond the admitted $LogFile overlay"
+                )));
+            }
             volume.apply_logfile_recovery(cx)?;
         }
         checkpoint(cx)?;
@@ -443,35 +351,43 @@ impl NtfsVolume {
 
     fn apply_logfile_recovery(&mut self, cx: &Cx) -> Result<()> {
         checkpoint(cx)?;
-        let Ok(log_record) = self.record(cx, 2, None) else {
-            return Ok(());
-        };
-        let Ok(log_stream) = self.select_stream(cx, &log_record, DATA, &[]) else {
-            return Ok(());
-        };
-        let log_len = (log_stream.size as usize).min(MAX_READ);
-        if log_len == 0 {
-            return Ok(());
+        // An explicit recovery request must never succeed because a required
+        // record, stream, read or parse failed. Preserve the original error.
+        let log_record = self.record(cx, 2, None)?;
+        let log_stream = self.data_stream(cx, &log_record, &[])?;
+        if log_stream.initialized != log_stream.size
+            || !matches!(&log_stream.storage, Storage::Mapped(runs) if runs.iter().all(|run| run.lcn.is_some()))
+        {
+            return Err(unsupported("NTFS $LogFile must be fully initialized and physically mapped without a data transform"));
+        }
+        let log_len = usize::try_from(log_stream.size)
+            .map_err(|_| unsupported("NTFS $LogFile length exceeds the addressable read profile"))?;
+        if !(8192..=MAX_READ).contains(&log_len) {
+            return Err(unsupported("NTFS $LogFile must fit the complete 8 KiB..16 MiB recovery read profile; prefix replay is refused"));
         }
         let log_bytes = self.read(cx, &log_stream, 0, log_len)?;
-        let Ok(plan) = ffs_ondisk::ntfs::parse_ntfs_logfile(&log_bytes) else {
-            return Ok(());
-        };
-        let record_bytes = usize::try_from(self.geometry.record_bytes()).unwrap_or(1024);
+        let plan = ffs_ondisk::ntfs::parse_ntfs_logfile(&log_bytes)
+            .map_err(|error| parse(&error))?;
+        if plan.restart.file_size != log_stream.size {
+            return Err(corrupt(0, "NTFS $LogFile restart size disagrees with its complete DATA stream"));
+        }
+        let record_bytes = usize::try_from(self.geometry.record_bytes())
+            .map_err(|_| corrupt(0, "NTFS record size exceeds addressable memory"))?;
         let cluster_bytes = u64::from(self.geometry.cluster_bytes());
         for action in plan.redo_actions.iter().chain(plan.undo_actions.iter()) {
             checkpoint(cx)?;
             let lcn = action.target_lcn;
             if lcn == 0 {
-                continue;
+                return Err(unsupported("NTFS recovery action has no admitted target LCN"));
             }
-            let Some(base_off) = lcn.checked_mul(cluster_bytes) else {
-                continue;
-            };
-            let target_off = base_off
-                .saturating_add(u64::from(action.cluster_block_offset) * 512)
-                .saturating_add(u64::from(action.record_offset));
-            let patch_off = target_off.saturating_add(u64::from(action.attribute_offset));
+            let target_off = lcn
+                .checked_mul(cluster_bytes)
+                .and_then(|offset| offset.checked_add(u64::from(action.cluster_block_offset) * 512))
+                .and_then(|offset| offset.checked_add(u64::from(action.record_offset)))
+                .ok_or_else(|| corrupt(0, "NTFS recovery target address overflow"))?;
+            let patch_off = target_off
+                .checked_add(u64::from(action.attribute_offset))
+                .ok_or_else(|| corrupt(target_off, "NTFS recovery patch address overflow"))?;
             if action.data.is_empty() {
                 continue;
             }
@@ -480,29 +396,24 @@ impl NtfsVolume {
                 .is_some_and(|end| end <= self.source.length)
             {
                 let mut rec_buf = buffer(record_bytes)?;
-                if self.source.read(cx, target_off, &mut rec_buf).is_ok()
-                    && &rec_buf[..4] == b"FILE"
-                    && let Ok(mut unprot) = ffs_ondisk::ntfs::restore_record(&rec_buf, b"FILE")
-                {
+                self.source.read(cx, target_off, &mut rec_buf)?;
+                if &rec_buf[..4] == b"FILE" {
+                    let mut unprot = ffs_ondisk::ntfs::restore_record(&rec_buf, b"FILE")
+                        .map_err(|error| corrupt(target_off, error.to_string()))?;
                     let rel = usize::from(action.attribute_offset);
-                    if rel
-                        .checked_add(action.data.len())
-                        .is_some_and(|end| end <= unprot.len())
-                    {
-                        unprot[rel..rel + action.data.len()].copy_from_slice(&action.data);
-                        if let Ok(reprot) = ffs_ondisk::ntfs::protect_record(&unprot) {
-                            self.source.write_overlay(cx, target_off, &reprot)?;
-                            continue;
-                        }
-                    }
+                    let end = rel.checked_add(action.data.len())
+                        .filter(|end| *end <= unprot.len())
+                        .ok_or_else(|| corrupt(target_off, "NTFS recovery patch exceeds its FILE record"))?;
+                    unprot[rel..end].copy_from_slice(&action.data);
+                    let reprot = ffs_ondisk::ntfs::protect_record(&unprot)
+                        .map_err(|error| corrupt(target_off, error.to_string()))?;
+                    self.source.write_overlay(cx, target_off, &reprot)?;
+                    continue;
                 }
             }
-            if patch_off
-                .checked_add(action.data.len() as u64)
-                .is_some_and(|end| end <= self.source.length)
-            {
-                self.source.write_overlay(cx, patch_off, &action.data)?;
-            }
+            // Source validates the whole range before staging any sector.
+            // An invalid later action cannot become a silently omitted patch.
+            self.source.write_overlay(cx, patch_off, &action.data)?;
         }
         let primary_off = self
             .geometry
@@ -510,13 +421,17 @@ impl NtfsVolume {
             .map_err(|error| parse(&error))?;
         let mut raw = buffer(record_bytes)?;
         self.source.read(cx, primary_off, &mut raw)?;
-        if let Ok(primary) = NtfsFileRecord::parse(&raw)
-            && let Ok(mft) = attributes::bootstrap_mft(&self.source, &self.geometry, cx, &primary)
-        {
-            self.mft = mft;
+        let primary = NtfsFileRecord::parse(&raw).map_err(|error| parse(&error))?;
+        validate_identity(&primary, 0, None)?;
+        let mft = attributes::bootstrap_mft(&self.source, &self.geometry, cx, &primary)?;
+        validate_mft_stream(&mft, &self.geometry)?;
+        self.mft = mft;
+        if self.record(cx, 0, None)?.used_bytes() != primary.used_bytes() {
+            return Err(corrupt(0, "recovered MFT mapping does not reproduce record zero"));
         }
+        checkpoint(cx)?;
         self.logfile_recovery = Some(plan);
-        checkpoint(cx)
+        Ok(())
     }
 
     #[must_use]
@@ -663,6 +578,26 @@ impl NtfsVolume {
     pub fn read(&self, cx: &Cx, stream: &Stream, offset: u64, size: usize) -> Result<Vec<u8>> {
         stream.read(&self.source, &self.geometry, cx, offset, size)
     }
+}
+
+/// Apply identical MFT invariants during initial bootstrap and after overlay
+/// replay. A failed rebuild must not silently retain the pre-recovery map.
+fn validate_mft_stream(mft: &Stream, geometry: &NtfsGeometry) -> Result<()> {
+    let Storage::Mapped(runs) = &mft.storage else {
+        return Err(corrupt(0, "MFT DATA must be nonresident"));
+    };
+    let record_bytes = u64::from(geometry.record_bytes());
+    if runs.first().is_none_or(|run| {
+        run.lcn != Some(geometry.mft_cluster())
+            || run.clusters * u64::from(geometry.cluster_bytes()) < record_bytes
+    }) || runs.iter().any(|run| run.lcn.is_none())
+        || mft.initialized < 4 * record_bytes
+        || !mft.initialized.is_multiple_of(record_bytes)
+        || !mft.size.is_multiple_of(record_bytes)
+    {
+        return Err(corrupt(0, "invalid MFT bootstrap mapping or initialized record boundary"));
+    }
+    Ok(())
 }
 
 /// Extraction and stream inspection share the complete catalog's file-level
