@@ -303,9 +303,8 @@ impl FatFs {
             if let Some(target_ino) = target_ino
                 && self.pinned(target_ino)?
             {
-                return self.replace_pinned_locked(
-                    cx, parent, name, new_parent, new_name, target_ino,
-                );
+                return self
+                    .replace_pinned_locked(cx, parent, name, new_parent, new_name, target_ino);
             }
         }
         let src_ino = self.register(cx, parent, src_before.clone())?;
@@ -403,10 +402,14 @@ impl FatFs {
             }
         }
         if let Some(&mapped_ino) = state.slot_to_ino.get(&entry.offset) {
-            let existing = state.nodes.get_mut(&mapped_ino).ok_or_else(|| FfsError::Corruption {
-                block: entry.offset / 512,
-                detail: "FAT slot mapping has no live node".into(),
-            })?;
+            let existing =
+                state
+                    .nodes
+                    .get_mut(&mapped_ino)
+                    .ok_or_else(|| FfsError::Corruption {
+                        block: entry.offset / 512,
+                        detail: "FAT slot mapping has no live node".into(),
+                    })?;
             let changed = existing
                 .entry
                 .as_ref()
@@ -489,10 +492,7 @@ impl FatFs {
         names: Vec<String>,
     ) -> Result<ReaddirPage> {
         let mut page = Vec::with_capacity(entries.len() + 2);
-        for (cookie, target, name) in [
-            (1, ino, b".".as_slice()),
-            (2, parent, b"..".as_slice()),
-        ] {
+        for (cookie, target, name) in [(1, ino, b".".as_slice()), (2, parent, b"..".as_slice())] {
             page.push(DirEntry {
                 ino: target,
                 offset: cookie,
@@ -681,36 +681,37 @@ fn fat_fiemap(
     let mut result = Vec::new();
     let mut index = 0_usize;
 
-    let mut emit = |logical: u64, physical: u64, extent_length: u64, mut flags: u32| -> Result<()> {
-        if extent_length == 0 {
-            return Ok(());
-        }
-        let end = logical
-            .checked_add(extent_length)
-            .ok_or_else(|| fiemap_corrupt(logical, "FAT FIEMAP extent end overflow"))?;
-        if end == capacity {
-            flags |= FIEMAP_EXTENT_LAST;
-        }
-        if !logical.is_multiple_of(cluster_bytes)
-            || !physical.is_multiple_of(cluster_bytes)
-            || !extent_length.is_multiple_of(cluster_bytes)
-        {
-            flags |= FIEMAP_EXTENT_NOT_ALIGNED;
-        }
-        if logical >= query.1 || end <= query.0 {
-            return Ok(());
-        }
-        result
-            .try_reserve(1)
-            .map_err(|error| FfsError::Io(std::io::Error::other(error)))?;
-        result.push(FiemapExtent {
-            logical,
-            physical,
-            length: extent_length,
-            flags,
-        });
-        Ok(())
-    };
+    let mut emit =
+        |logical: u64, physical: u64, extent_length: u64, mut flags: u32| -> Result<()> {
+            if extent_length == 0 {
+                return Ok(());
+            }
+            let end = logical
+                .checked_add(extent_length)
+                .ok_or_else(|| fiemap_corrupt(logical, "FAT FIEMAP extent end overflow"))?;
+            if end == capacity {
+                flags |= FIEMAP_EXTENT_LAST;
+            }
+            if !logical.is_multiple_of(cluster_bytes)
+                || !physical.is_multiple_of(cluster_bytes)
+                || !extent_length.is_multiple_of(cluster_bytes)
+            {
+                flags |= FIEMAP_EXTENT_NOT_ALIGNED;
+            }
+            if logical >= query.1 || end <= query.0 {
+                return Ok(());
+            }
+            result
+                .try_reserve(1)
+                .map_err(|error| FfsError::Io(std::io::Error::other(error)))?;
+            result.push(FiemapExtent {
+                logical,
+                physical,
+                length: extent_length,
+                flags,
+            });
+            Ok(())
+        };
 
     while index < chain.clusters.len() {
         checkpoint(cx)?;
@@ -1011,9 +1012,10 @@ impl FsOps for FatFs {
         self.ensure_writable()?;
         let from = self.path_for_inode(ino_in)?;
         let to = self.path_for_inode(ino_out)?;
-        let copied = self.volume.copy_range(
-            cx, &from, offset_in, &to, offset_out, len, now_unix_secs(),
-        ).map_err(map_mutation_error)?;
+        let copied = self
+            .volume
+            .copy_range(cx, &from, offset_in, &to, offset_out, len, now_unix_secs())
+            .map_err(map_mutation_error)?;
         if copied != 0 {
             self.refresh_node_from_path(cx, ino_out, &to)?;
         }
@@ -1046,9 +1048,7 @@ impl FsOps for FatFs {
             return Err(FfsError::IsDirectory);
         }
         if attrs.size.is_some_and(|size| size > u64::from(u32::MAX)) {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                libc::EFBIG,
-            )));
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EFBIG)));
         }
         if ino == ROOT {
             // Neither FAT16's fixed root nor FAT32's root has a parent entry
@@ -1063,26 +1063,32 @@ impl FsOps for FatFs {
             }
             return operation.complete(self.attributes(cx, ino, &node)?);
         }
-        let read_only = attrs.mode.map(|mode| {
-            let (writable_mode, readonly_mode) = if directory {
-                (0o755, 0o555)
-            } else {
-                (0o644, 0o444)
-            };
-            if mode == writable_mode {
-                Ok(false)
-            } else if mode == readonly_mode {
-                Ok(true)
-            } else {
-                Err(FfsError::UnsupportedFeature(
-                    "FAT mode must match the native read-only-bit projection".into(),
-                ))
-            }
-        }).transpose()?;
+        let read_only = attrs
+            .mode
+            .map(|mode| {
+                let (writable_mode, readonly_mode) = if directory {
+                    (0o755, 0o555)
+                } else {
+                    (0o644, 0o444)
+                };
+                if mode == writable_mode {
+                    Ok(false)
+                } else if mode == readonly_mode {
+                    Ok(true)
+                } else {
+                    Err(FfsError::UnsupportedFeature(
+                        "FAT mode must match the native read-only-bit projection".into(),
+                    ))
+                }
+            })
+            .transpose()?;
         let modified_secs = attrs.mtime.map(requested_fat_time).transpose()?;
         let accessed_secs = attrs.atime.map(requested_fat_time).transpose()?;
         if attrs.size.is_some()
-            && node.entry.as_ref().is_some_and(|entry| entry.native.attributes & 1 != 0)
+            && node
+                .entry
+                .as_ref()
+                .is_some_and(|entry| entry.native.attributes & 1 != 0)
         {
             return Err(FfsError::PermissionDenied);
         }
@@ -1128,7 +1134,11 @@ impl FsOps for FatFs {
         if existing_entry.native.is_directory() {
             return Err(FfsError::IsDirectory);
         }
-        let existing_ino = self.state()?.slot_to_ino.get(&existing_entry.offset).copied();
+        let existing_ino = self
+            .state()?
+            .slot_to_ino
+            .get(&existing_entry.offset)
+            .copied();
         if let Some(ino) = existing_ino
             && self.pinned(ino)?
         {
@@ -1357,7 +1367,8 @@ impl FsOps for FatFs {
             return Err(FfsError::PermissionDenied);
         }
         let path = self.path_for_inode(ino)?;
-        self.volume.preallocate(cx, &path, offset, length, mode, now_unix_secs())
+        self.volume
+            .preallocate(cx, &path, offset, length, mode, now_unix_secs())
             .map_err(map_mutation_error)?;
         // KEEP_SIZE changes st_blocks and free space even though st_size and
         // the directory record may be unchanged. Invalidate both caches.
@@ -1375,9 +1386,10 @@ impl FsOps for FatFs {
     ) -> Result<Vec<FiemapExtent>> {
         let _operation = self.operation(cx, false)?;
         let node = self.node(cx, ino)?;
-        let entry = node.entry.as_ref().ok_or_else(|| {
-            FfsError::Io(std::io::Error::from_raw_os_error(libc::EINVAL))
-        })?;
+        let entry = node
+            .entry
+            .as_ref()
+            .ok_or_else(|| FfsError::Io(std::io::Error::from_raw_os_error(libc::EINVAL)))?;
         if entry.native.is_directory() {
             return Err(FfsError::Io(std::io::Error::from_raw_os_error(
                 libc::EINVAL,

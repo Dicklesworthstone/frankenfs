@@ -55,7 +55,8 @@ impl Command {
                 preflight(&candidate)?;
                 let components = dataset_components(&dataset)?;
                 let log = candidate.objects(cx)?.intent_log(cx, &components)?;
-                cx.checkpoint().map_err(|_| ffs_error::FfsError::Cancelled)?;
+                cx.checkpoint()
+                    .map_err(|_| ffs_error::FfsError::Cancelled)?;
                 json(&serde_json::json!({
                     "format": "ZFS", "operation": "zil_inspect", "dataset": dataset,
                     "scope": "selected_head_native_log_prefix",
@@ -64,7 +65,12 @@ impl Command {
                 }))
             }
             Self::ZilRead {
-                candidate, dataset, path, start, bytes, allow_unverified_tail,
+                candidate,
+                dataset,
+                path,
+                start,
+                bytes,
+                allow_unverified_tail,
             } => {
                 preflight(&candidate)?;
                 if bytes > 16 * 1024 * 1024 {
@@ -72,10 +78,15 @@ impl Command {
                 }
                 let components = dataset_components(&dataset)?;
                 let recovered = candidate.objects(cx)?.read_with_intent_log(
-                    cx, &components, path.as_os_str().as_bytes(), start, bytes,
+                    cx,
+                    &components,
+                    path.as_os_str().as_bytes(),
+                    start,
+                    bytes,
                     allow_unverified_tail,
                 )?;
-                cx.checkpoint().map_err(|_| ffs_error::FfsError::Cancelled)?;
+                cx.checkpoint()
+                    .map_err(|_| ffs_error::FfsError::Cancelled)?;
                 let receipt = serde_json::json!({
                     "format": "ZFS", "operation": "zil_read", "dataset": dataset,
                     "scope": "existing_regular_file_copied_writes_and_eof_truncation",
@@ -106,20 +117,41 @@ impl Command {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Cli, Command as TopCommand};
     use crate::file_commands::FileCommand;
+    use crate::{Cli, Command as TopCommand};
     use clap::Parser;
 
     #[test]
     fn zil_commands_keep_selection_and_require_explicit_recovery_ranges() {
-        let base = ["ffs-zfs", "zil-read", "leaf.img", "/file", "--offline-image", "--auto-import"];
+        let base = [
+            "ffs-zfs",
+            "zil-read",
+            "leaf.img",
+            "/file",
+            "--offline-image",
+            "--auto-import",
+        ];
         assert!(Cli::try_parse_from(base).is_err());
         let parsed = Cli::try_parse_from(base.into_iter().chain([
-            "--bytes", "8192", "--start", "510", "--dataset", "data",
-        ])).unwrap();
+            "--bytes",
+            "8192",
+            "--start",
+            "510",
+            "--dataset",
+            "data",
+        ]))
+        .unwrap();
         let TopCommand::File(FileCommand::Zil(Command::ZilRead {
-            candidate, dataset, path, start, bytes, allow_unverified_tail,
-        })) = parsed.command else { panic!("ZIL recovery command"); };
+            candidate,
+            dataset,
+            path,
+            start,
+            bytes,
+            allow_unverified_tail,
+        })) = parsed.command
+        else {
+            panic!("ZIL recovery command");
+        };
         assert!(candidate.auto_import);
         assert!(candidate.image.offline_image);
         assert_eq!(dataset, "data");
@@ -129,18 +161,40 @@ mod tests {
             assert!(Cli::try_parse_from(base.into_iter().chain(["--bytes", "1", option])).is_err());
         }
         let parsed = Cli::try_parse_from(base.into_iter().chain([
-            "--bytes", "1", "--allow-unverified-tail",
-        ])).unwrap();
-        assert!(matches!(parsed.command,
-            TopCommand::File(FileCommand::Zil(Command::ZilRead { allow_unverified_tail: true, .. }))
+            "--bytes",
+            "1",
+            "--allow-unverified-tail",
+        ]))
+        .unwrap();
+        assert!(matches!(
+            parsed.command,
+            TopCommand::File(FileCommand::Zil(Command::ZilRead {
+                allow_unverified_tail: true,
+                ..
+            }))
         ));
         let parsed = Cli::try_parse_from([
-            "ffs-zfs", "zil-inspect", "leaf.img", "--offline-image", "--pool-guid", "123",
-            "--label", "2", "--slot", "7",
-        ]).unwrap();
-        let TopCommand::File(FileCommand::Zil(Command::ZilInspect { candidate, .. })) = parsed.command
-        else { panic!("ZIL inspection command"); };
-        assert_eq!((candidate.pool_guid, candidate.label, candidate.slot), (123, 2, 7));
+            "ffs-zfs",
+            "zil-inspect",
+            "leaf.img",
+            "--offline-image",
+            "--pool-guid",
+            "123",
+            "--label",
+            "2",
+            "--slot",
+            "7",
+        ])
+        .unwrap();
+        let TopCommand::File(FileCommand::Zil(Command::ZilInspect { candidate, .. })) =
+            parsed.command
+        else {
+            panic!("ZIL inspection command");
+        };
+        assert_eq!(
+            (candidate.pool_guid, candidate.label, candidate.slot),
+            (123, 2, 7)
+        );
     }
 
     #[test]
@@ -150,43 +204,99 @@ mod tests {
             ("zil-read", vec!["/file", "--bytes", "1"]),
         ] {
             for (options, reason) in [
-                (vec!["--sidecar", "nonexistent-zil-sidecar.rq"], "does not admit sidecar healing"),
-                (["--member", "nonexistent-zil-member.img"].repeat(8), "at most seven additional ZIL member images"),
+                (
+                    vec!["--sidecar", "nonexistent-zil-sidecar.rq"],
+                    "does not admit sidecar healing",
+                ),
+                (
+                    ["--member", "nonexistent-zil-member.img"].repeat(8),
+                    "at most seven additional ZIL member images",
+                ),
             ] {
-                let cli = Cli::try_parse_from([
-                    "ffs-zfs", command, "nonexistent-zil-fixture.img", "--offline-image", "--auto-import",
-                ].into_iter().chain(extra.clone()).chain(options)).unwrap();
-                let TopCommand::File(command) = cli.command else { panic!("ZIL command"); };
+                let cli = Cli::try_parse_from(
+                    [
+                        "ffs-zfs",
+                        command,
+                        "nonexistent-zil-fixture.img",
+                        "--offline-image",
+                        "--auto-import",
+                    ]
+                    .into_iter()
+                    .chain(extra.clone())
+                    .chain(options),
+                )
+                .unwrap();
+                let TopCommand::File(command) = cli.command else {
+                    panic!("ZIL command");
+                };
                 let error = command.run(&Cx::for_testing()).unwrap_err();
                 assert!(error.to_string().contains(reason), "{error}");
             }
         }
         let cli = Cli::try_parse_from([
-            "ffs-zfs", "zil-read", "nonexistent-zil-fixture.img", "/file", "--offline-image",
-            "--auto-import", "--bytes", "16777217",
-        ]).unwrap();
-        let TopCommand::File(command) = cli.command else { panic!("ZIL command"); };
-        assert!(command.run(&Cx::for_testing()).unwrap_err().to_string().contains("exceeds 16 MiB"));
+            "ffs-zfs",
+            "zil-read",
+            "nonexistent-zil-fixture.img",
+            "/file",
+            "--offline-image",
+            "--auto-import",
+            "--bytes",
+            "16777217",
+        ])
+        .unwrap();
+        let TopCommand::File(command) = cli.command else {
+            panic!("ZIL command");
+        };
+        assert!(
+            command
+                .run(&Cx::for_testing())
+                .unwrap_err()
+                .to_string()
+                .contains("exceeds 16 MiB")
+        );
     }
 
     #[test]
     fn zil_commands_retain_complete_member_and_partition_selection() {
-        for alias in ["--member", "--mirror-member", "--raidz-member", "--striped-member"] {
+        for alias in [
+            "--member",
+            "--mirror-member",
+            "--raidz-member",
+            "--striped-member",
+        ] {
             for (command, extra) in [
                 ("zil-inspect", Vec::new()),
                 ("zil-read", vec!["/file", "--bytes", "4096"]),
             ] {
-                let cli = Cli::try_parse_from([
-                    "ffs-zfs", command, "first.img", "--offline-image", "--auto-import",
-                    alias, "second.img", "--offset", "4096", "--length", "67108864",
-                ].into_iter().chain(extra)).unwrap();
+                let cli = Cli::try_parse_from(
+                    [
+                        "ffs-zfs",
+                        command,
+                        "first.img",
+                        "--offline-image",
+                        "--auto-import",
+                        alias,
+                        "second.img",
+                        "--offset",
+                        "4096",
+                        "--length",
+                        "67108864",
+                    ]
+                    .into_iter()
+                    .chain(extra),
+                )
+                .unwrap();
                 let candidate = match cli.command {
-                    TopCommand::File(FileCommand::Zil(Command::ZilInspect { candidate, .. }
-                        | Command::ZilRead { candidate, .. })) => candidate,
+                    TopCommand::File(FileCommand::Zil(
+                        Command::ZilInspect { candidate, .. } | Command::ZilRead { candidate, .. },
+                    )) => candidate,
                     _ => panic!("ZIL command"),
                 };
                 assert_eq!(candidate.members, [PathBuf::from("second.img")]);
-                assert_eq!((candidate.image.offset, candidate.image.length), (4096, Some(67_108_864)));
+                assert_eq!(
+                    (candidate.image.offset, candidate.image.length),
+                    (4096, Some(67_108_864))
+                );
                 assert!(candidate.image.offline_image);
                 preflight(&candidate).unwrap();
             }

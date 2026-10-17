@@ -10,7 +10,8 @@ mod replay;
 
 use super::{
     Cx, LFS_CLIENT_RECORD, LogRecord, NtfsVolume, Result, checkpoint, corrupt,
-    targets::{self, Attribute, State}, u16_at, u64_at, unsupported,
+    targets::{self, Attribute, State},
+    u16_at, u64_at, unsupported,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -74,10 +75,18 @@ impl Plan<'_> {
         Summary {
             records: self.candidates.len(),
             obsolete: self.obsolete,
-            bytes: self.candidates.iter().map(|entry| entry.payload.len()).sum(),
+            bytes: self
+                .candidates
+                .iter()
+                .map(|entry| entry.payload.len())
+                .sum(),
             clusters: self.candidates.iter().map(|entry| entry.lcns.len()).sum(),
-            files: self.candidates.iter().map(|entry| entry.attribute.reference)
-                .collect::<BTreeSet<_>>().len(),
+            files: self
+                .candidates
+                .iter()
+                .map(|entry| entry.attribute.reference)
+                .collect::<BTreeSet<_>>()
+                .len(),
             relocated: self.relocated,
             first_lsn: self.candidates.first().map(|entry| entry.record.lsn),
         }
@@ -85,7 +94,9 @@ impl Plan<'_> {
 }
 
 fn same_stream(a: &Attribute, b: &Attribute) -> bool {
-    a.reference == b.reference && a.kind == b.kind && a.name == b.name
+    a.reference == b.reference
+        && a.kind == b.kind
+        && a.name == b.name
         && a.index_bytes == b.index_bytes
 }
 
@@ -104,13 +115,20 @@ fn ownership(cx: &Cx, targets: &State) -> Result<()> {
         if lcn == 0 || lcn > i64::MAX as u64 {
             return Err(corrupt(0, "invalid physical LCN in $LogFile redo claims"));
         }
-        let attribute = targets.attributes.get(&slot)
+        let attribute = targets
+            .attributes
+            .get(&slot)
             .ok_or_else(|| corrupt(0, "dirty redo claim has no native stream identity"))?;
         if let Some(&(other, other_vcn)) = owners.get(&lcn) {
-            let previous = targets.attributes.get(&other)
+            let previous = targets
+                .attributes
+                .get(&other)
                 .ok_or_else(|| corrupt(0, "redo ownership lost a stream identity"))?;
             if vcn != other_vcn || !same_stream(attribute, previous) {
-                return Err(corrupt(0, "different NTFS streams or VCNs claim the same dirty LCN"));
+                return Err(corrupt(
+                    0,
+                    "different NTFS streams or VCNs claim the same dirty LCN",
+                ));
             }
         } else {
             owners.insert(lcn, (slot, vcn));
@@ -132,9 +150,15 @@ pub(super) fn build<'a>(cx: &Cx, targets: &'a State, history: &'a [LogRecord]) -
     if let Some(oldest) = targets.finish(cx)?.2
         && history.first().is_none_or(|record| record.lsn > oldest)
     {
-        return Err(unsupported("$LogFile redo window omits surviving pre-checkpoint dirty work"));
+        return Err(unsupported(
+            "$LogFile redo window omits surviving pre-checkpoint dirty work",
+        ));
     }
-    let mut plan = Plan { candidates: Vec::new(), obsolete: 0, relocated: 0 };
+    let mut plan = Plan {
+        candidates: Vec::new(),
+        obsolete: 0,
+        relocated: 0,
+    };
     let mut previous = 0;
     let mut claims = 0_usize;
     let mut payload_bytes = 0_usize;
@@ -151,7 +175,9 @@ pub(super) fn build<'a>(cx: &Cx, targets: &'a State, history: &'a [LogRecord]) -
         if count == 0 {
             continue;
         }
-        claims = claims.checked_add(count).filter(|claims| *claims <= MAX_CLAIMS)
+        claims = claims
+            .checked_add(count)
+            .filter(|claims| *claims <= MAX_CLAIMS)
             .ok_or_else(|| unsupported("$LogFile redo exceeds 65536 inspected mapping claims"))?;
         let payload = targets::payload(record, false)?;
         let slot = u32::from(u16_at(&record.data, 12)?);
@@ -189,11 +215,17 @@ pub(super) fn build<'a>(cx: &Cx, targets: &'a State, history: &'a [LogRecord]) -
         }
         let attribute = attribute
             .ok_or_else(|| corrupt(0, "$LogFile redo target has no current stream identity"))?;
-        payload_bytes = payload_bytes.checked_add(payload.len())
+        payload_bytes = payload_bytes
+            .checked_add(payload.len())
             .filter(|bytes| *bytes <= MAX_PAYLOAD)
             .ok_or_else(|| unsupported("$LogFile redo payloads exceed 16 MiB"))?;
         plan.relocated += relocated;
-        plan.candidates.push(Candidate { record, attribute, lcns, payload });
+        plan.candidates.push(Candidate {
+            record,
+            attribute,
+            lcns,
+            payload,
+        });
     }
     checkpoint(cx)?;
     Ok(plan)
@@ -201,15 +233,29 @@ pub(super) fn build<'a>(cx: &Cx, targets: &'a State, history: &'a [LogRecord]) -
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::super::TailRecord;
     use super::super::targets::Cluster;
+    use super::*;
 
     fn state() -> State {
         let mut state = State::default();
-        state.attributes.insert(24, Attribute { reference: (7 << 48) | 42,
-            kind: 0x80, index_bytes: 0, opened: 10, name: vec![0xD800, 97] });
-        state.clusters.insert((24, 5), Cluster { oldest: 20, lcn: Some(100) });
+        state.attributes.insert(
+            24,
+            Attribute {
+                reference: (7 << 48) | 42,
+                kind: 0x80,
+                index_bytes: 0,
+                opened: 10,
+                name: vec![0xD800, 97],
+            },
+        );
+        state.clusters.insert(
+            (24, 5),
+            Cluster {
+                oldest: 20,
+                lcn: Some(100),
+            },
+        );
         state
     }
 
@@ -227,19 +273,37 @@ mod tests {
             data[32 + i * 8..40 + i * 8].copy_from_slice(&lcn.to_le_bytes());
         }
         data[start..].copy_from_slice(bytes);
-        LogRecord { lsn, previous: 0, undo_next: 0, kind: LFS_CLIENT_RECORD,
-            summary: TailRecord { transaction_id: id, redo_op: 8, undo_op: undo }, data }
+        LogRecord {
+            lsn,
+            previous: 0,
+            undo_next: 0,
+            kind: LFS_CLIENT_RECORD,
+            summary: TailRecord {
+                transaction_id: id,
+                redo_op: 8,
+                undo_op: undo,
+            },
+            data,
+        }
     }
 
     #[test]
     fn repeat_history_keeps_interleaved_transactions_and_compensation_redo() {
         let cx = Cx::for_testing();
         let state = state();
-        let history = [record(20, 24, 8, 5, &[100], b"old"),
+        let history = [
+            record(20, 24, 8, 5, &[100], b"old"),
             record(30, 64, 8, 5, &[100], b"new"),
-            record(40, 24, 1, 5, &[100], b"undo")];
+            record(40, 24, 1, 5, &[100], b"undo"),
+        ];
         let plan = build(&cx, &state, &history).unwrap();
-        assert_eq!(plan.candidates.iter().map(|entry| entry.record.lsn).collect::<Vec<_>>(), vec![20, 30, 40]);
+        assert_eq!(
+            plan.candidates
+                .iter()
+                .map(|entry| entry.record.lsn)
+                .collect::<Vec<_>>(),
+            vec![20, 30, 40]
+        );
         assert_eq!(plan.candidates[2].payload, b"undo");
         let summary = plan.summary();
         assert_eq!((summary.records, summary.bytes, summary.files), (3, 10, 1));
@@ -261,9 +325,11 @@ mod tests {
     #[test]
     fn dirty_low_water_and_slot_lifetimes_exclude_obsolete_records() {
         let state = state();
-        let history = [record(9, 24, 8, 5, &[100], b"a"),
+        let history = [
+            record(9, 24, 8, 5, &[100], b"a"),
             record(19, 24, 8, 5, &[100], b"b"),
-            record(20, 24, 8, 5, &[100], b"c")];
+            record(20, 24, 8, 5, &[100], b"c"),
+        ];
         let plan = build(&Cx::for_testing(), &state, &history).unwrap();
         assert_eq!(plan.summary().obsolete, 2);
         assert_eq!(plan.candidates[0].payload, b"c");
@@ -273,14 +339,26 @@ mod tests {
     fn fully_retired_ranges_are_excluded_but_mixed_metadata_updates_are_refused() {
         let cx = Cx::for_testing();
         let mut state = state();
-        state.clusters.insert((24, 6), Cluster { oldest: 20, lcn: None });
+        state.clusters.insert(
+            (24, 6),
+            Cluster {
+                oldest: 20,
+                lcn: None,
+            },
+        );
         let history = [record(20, 24, 8, 6, &[200], b"gone")];
         let plan = build(&cx, &state, &history).unwrap();
         assert!(plan.candidates.is_empty());
         assert_eq!(plan.summary().obsolete, 1);
         let mixed = [record(20, 24, 8, 5, &[100, 200], b"cross-page")];
         assert!(build(&cx, &state, &mixed).is_err());
-        state.clusters.insert((24, 6), Cluster { oldest: 30, lcn: Some(200) });
+        state.clusters.insert(
+            (24, 6),
+            Cluster {
+                oldest: 30,
+                lcn: Some(200),
+            },
+        );
         assert!(build(&cx, &state, &mixed).is_err());
     }
 
@@ -290,7 +368,13 @@ mod tests {
         for mutation in 0..4 {
             let mut state = state();
             if mutation == 0 {
-                state.clusters.insert((24, 6), Cluster { oldest: 20, lcn: Some(100) });
+                state.clusters.insert(
+                    (24, 6),
+                    Cluster {
+                        oldest: 20,
+                        lcn: Some(100),
+                    },
+                );
             } else {
                 let mut alias = state.attributes[&24].clone();
                 match mutation {
@@ -299,7 +383,13 @@ mod tests {
                     _ => alias.kind = 0xB0,
                 }
                 state.attributes.insert(64, alias);
-                state.clusters.insert((64, 5), Cluster { oldest: 20, lcn: Some(100) });
+                state.clusters.insert(
+                    (64, 5),
+                    Cluster {
+                        oldest: 20,
+                        lcn: Some(100),
+                    },
+                );
             }
             assert!(build(&cx, &state, &[]).is_err());
         }
@@ -309,9 +399,21 @@ mod tests {
     fn exact_duplicate_native_stream_slots_are_not_false_crosslinks() {
         let mut state = state();
         state.attributes.insert(64, state.attributes[&24].clone());
-        state.clusters.insert((64, 5), Cluster { oldest: 20, lcn: Some(100) });
+        state.clusters.insert(
+            (64, 5),
+            Cluster {
+                oldest: 20,
+                lcn: Some(100),
+            },
+        );
         let history = [record(20, 24, 8, 5, &[100], b"data")];
-        assert_eq!(build(&Cx::for_testing(), &state, &history).unwrap().summary().records, 1);
+        assert_eq!(
+            build(&Cx::for_testing(), &state, &history)
+                .unwrap()
+                .summary()
+                .records,
+            1
+        );
     }
 
     #[test]
@@ -334,7 +436,9 @@ mod tests {
     fn candidate_mapping_work_is_bounded_even_when_every_record_is_obsolete() {
         let state = State::default();
         let lcns = vec![100; 4096];
-        let history: Vec<_> = (1..=17).map(|lsn| record(lsn, 24, 8, 0, &lcns, &[])).collect();
+        let history: Vec<_> = (1..=17)
+            .map(|lsn| record(lsn, 24, 8, 0, &lcns, &[]))
+            .collect();
         assert!(build(&Cx::for_testing(), &state, &history).is_err());
     }
 
@@ -343,8 +447,10 @@ mod tests {
         let state = state();
         assert_eq!(state.finish(&Cx::for_testing()).unwrap().2, Some(20));
         // A checkpoint-start-only history would omit the required byte update.
-        let history = [record(20, 24, 8, 5, &[100], b"before-checkpoint"),
-            record(50, 64, 8, 5, &[100], b"after-checkpoint")];
+        let history = [
+            record(20, 24, 8, 5, &[100], b"before-checkpoint"),
+            record(50, 64, 8, 5, &[100], b"after-checkpoint"),
+        ];
         let plan = build(&Cx::for_testing(), &state, &history).unwrap();
         assert_eq!(plan.summary().first_lsn, Some(20));
         assert_eq!(plan.summary().records, 2);

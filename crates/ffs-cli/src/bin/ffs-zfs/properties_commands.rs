@@ -24,11 +24,21 @@ pub enum PropertyCommand {
 }
 
 fn components(name: &[u8]) -> Result<Vec<Vec<u8>>> {
-    if name.is_empty() { return Ok(Vec::new()); }
-    if name.len() > 65_536 || name.contains(&0) { bail!("invalid dataset name length or NUL"); }
+    if name.is_empty() {
+        return Ok(Vec::new());
+    }
+    if name.len() > 65_536 || name.contains(&0) {
+        bail!("invalid dataset name length or NUL");
+    }
     let parts: Vec<_> = name.split(|byte| *byte == b'/').collect();
-    if parts.len() > 64 || parts.iter().any(|part| part.is_empty() || *part == b"."
-        || *part == b".." || part.contains(&b'@') || part.contains(&b'#'))
+    if parts.len() > 64
+        || parts.iter().any(|part| {
+            part.is_empty()
+                || *part == b"."
+                || *part == b".."
+                || part.contains(&b'@')
+                || part.contains(&b'#')
+        })
     {
         bail!("expected a pool-relative dataset name, not a host path or snapshot");
     }
@@ -84,15 +94,24 @@ fn report_json(report: &Properties) -> serde_json::Value {
 
 impl PropertyCommand {
     pub(super) fn run(self, cx: &Cx) -> Result<()> {
-        let Self::Properties { candidate, dataset, snapshot, names } = self;
+        let Self::Properties {
+            candidate,
+            dataset,
+            snapshot,
+            names,
+        } = self;
         // This path promises no on-read healing even when a sidecar is supplied.
         if candidate.image.sidecar.is_some() {
             bail!("read-only ZFS property queries do not admit sidecar healing");
         }
         let components = components(dataset.as_bytes())?;
         let mut objects = candidate.objects(cx)?;
-        let report = objects.properties(cx, &components,
-            snapshot.as_deref().map(OsStrExt::as_bytes), &names)?;
+        let report = objects.properties(
+            cx,
+            &components,
+            snapshot.as_deref().map(OsStrExt::as_bytes),
+            &names,
+        )?;
         cx.checkpoint().map_err(|_| super::FfsError::Cancelled)?;
         json(&report_json(&report))
     }
@@ -108,37 +127,94 @@ mod tests {
 
     #[test]
     fn command_preserves_explicit_root_members_ranges_and_snapshot_name_bytes() {
-        let mut args: Vec<OsString> = ["ffs-zfs", "properties", "first.img", "--offline-image",
-            "--pool-guid", "123", "--label", "1", "--slot", "2", "--member", "second.img",
-            "--offset", "1048576", "--length", "67108864", "--dataset", "data/nested",
-            "--snapshot"].into_iter().map(Into::into).collect();
+        let mut args: Vec<OsString> = [
+            "ffs-zfs",
+            "properties",
+            "first.img",
+            "--offline-image",
+            "--pool-guid",
+            "123",
+            "--label",
+            "1",
+            "--slot",
+            "2",
+            "--member",
+            "second.img",
+            "--offset",
+            "1048576",
+            "--length",
+            "67108864",
+            "--dataset",
+            "data/nested",
+            "--snapshot",
+        ]
+        .into_iter()
+        .map(Into::into)
+        .collect();
         args.push(OsString::from_vec(vec![0xfe]));
         args.push("exec,p:owner".into());
         let cli = Cli::try_parse_from(args).unwrap();
         let Command::Properties(PropertyCommand::Properties {
-            candidate, dataset, snapshot, names,
-        }) = cli.command else { panic!("properties command"); };
+            candidate,
+            dataset,
+            snapshot,
+            names,
+        }) = cli.command
+        else {
+            panic!("properties command");
+        };
         assert_eq!(candidate.members, [PathBuf::from("second.img")]);
-        assert_eq!((candidate.label, candidate.slot, candidate.pool_guid), (1, 2, 123));
-        assert_eq!((candidate.image.offset, candidate.image.length), (1048576, Some(67108864)));
+        assert_eq!(
+            (candidate.label, candidate.slot, candidate.pool_guid),
+            (1, 2, 123)
+        );
+        assert_eq!(
+            (candidate.image.offset, candidate.image.length),
+            (1048576, Some(67108864))
+        );
         assert_eq!(dataset, OsString::from("data/nested"));
         assert_eq!(snapshot.unwrap().as_bytes(), [0xfe]);
         assert_eq!(names, ["exec", "p:owner"]);
-        assert_eq!(components(&[b'd', b'/', 0xff]).unwrap(), [vec![b'd'], vec![0xff]]);
+        assert_eq!(
+            components(&[b'd', b'/', 0xff]).unwrap(),
+            [vec![b'd'], vec![0xff]]
+        );
     }
 
     #[test]
     fn property_cli_keeps_candidate_and_no_write_requirements() {
-        let base = ["ffs-zfs", "properties", "absent.img", "--offline-image", "--auto-import"];
+        let base = [
+            "ffs-zfs",
+            "properties",
+            "absent.img",
+            "--offline-image",
+            "--auto-import",
+        ];
         assert!(Cli::try_parse_from(base).is_err());
         assert!(Cli::try_parse_from(["ffs-zfs", "properties", "absent.img", "atime"]).is_err());
         for flag in ["--rw", "--set", "--inherit", "--force", "--heal"] {
             assert!(Cli::try_parse_from(base.into_iter().chain(["atime", flag])).is_err());
         }
-        let cli = Cli::try_parse_from(base.into_iter().chain(["--sidecar", "absent.rq", "atime"])).unwrap();
-        let Command::Properties(command) = cli.command else { panic!("properties command"); };
-        assert!(command.run(&Cx::for_testing()).unwrap_err().to_string().contains("sidecar healing"));
-        for path in [b"/data".as_slice(), b"data/", b"data//child", b"../data", b"data@snap", b"a\0b"] {
+        let cli = Cli::try_parse_from(base.into_iter().chain(["--sidecar", "absent.rq", "atime"]))
+            .unwrap();
+        let Command::Properties(command) = cli.command else {
+            panic!("properties command");
+        };
+        assert!(
+            command
+                .run(&Cx::for_testing())
+                .unwrap_err()
+                .to_string()
+                .contains("sidecar healing")
+        );
+        for path in [
+            b"/data".as_slice(),
+            b"data/",
+            b"data//child",
+            b"../data",
+            b"data@snap",
+            b"a\0b",
+        ] {
             assert!(components(path).is_err());
         }
     }
@@ -146,12 +222,20 @@ mod tests {
     #[test]
     fn json_preserves_uint64_byte_strings_and_distinct_property_time() {
         let report = Properties {
-            pool_guid: u64::MAX, pool_txg: 100, dataset_guid: 999, dataset_object: 7,
-            components: vec![vec![0xff]], snapshot: Some(b"before".to_vec()),
-            snapshot_creation_txg: Some(30), values: vec![Property {
-                name: "p:owner".into(), value: Some(PropertyValue::Text(vec![0xfe])),
-                source: PropertySource::Inherited, setpoint: Some(Vec::new()),
-                setpoint_snapshot: None, stored_source: Some(PropertySource::Received),
+            pool_guid: u64::MAX,
+            pool_txg: 100,
+            dataset_guid: 999,
+            dataset_object: 7,
+            components: vec![vec![0xff]],
+            snapshot: Some(b"before".to_vec()),
+            snapshot_creation_txg: Some(30),
+            values: vec![Property {
+                name: "p:owner".into(),
+                value: Some(PropertyValue::Text(vec![0xfe])),
+                source: PropertySource::Inherited,
+                setpoint: Some(Vec::new()),
+                setpoint_snapshot: None,
+                stored_source: Some(PropertySource::Received),
                 received: Some(PropertyValue::Text(Vec::new())),
             }],
         };
@@ -164,6 +248,9 @@ mod tests {
         assert!(encoded["properties"][0]["value"]["text"].is_null());
         assert_eq!(encoded["properties"][0]["value"]["bytes"][0], 254);
         assert_eq!(encoded["properties"][0]["received"]["text"], "");
-        assert_eq!(value_json(&PropertyValue::Number(u64::MAX))["decimal"], u64::MAX.to_string());
+        assert_eq!(
+            value_json(&PropertyValue::Number(u64::MAX))["decimal"],
+            u64::MAX.to_string()
+        );
     }
 }

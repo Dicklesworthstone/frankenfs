@@ -3,8 +3,8 @@
 mod zil;
 mod zvol;
 
-use super::{CandidateArgs, Context, Cx, Result, bail, json};
 use super::reader::dmu::zpl::PathPolicy;
+use super::{CandidateArgs, Context, Cx, Result, bail, json};
 use clap::{Args, Subcommand};
 use ffs_ondisk::zfs_zpl::{Kind, Metadata};
 use std::ffi::OsString;
@@ -201,7 +201,8 @@ impl FileCommand {
                 };
                 let report = view.scrub(cx, limits)?;
                 let clean = report.is_clean();
-                cx.checkpoint().map_err(|_| ffs_error::FfsError::Cancelled)?;
+                cx.checkpoint()
+                    .map_err(|_| ffs_error::FfsError::Cancelled)?;
                 json(&serde_json::json!({
                     "format": "ZFS", "operation": "scrub", "read_only": true,
                     "scope": "selected_dataset_dmu_blocks",
@@ -390,7 +391,12 @@ mod tests {
             assert_eq!(output.path_policy(false), PathPolicy::Follow);
             assert_eq!(output.path_policy(true), PathPolicy::NoSymlinks);
         }
-        for output in [Output::Stat, Output::Link, Output::Names, Output::Value("user.note".into())] {
+        for output in [
+            Output::Stat,
+            Output::Link,
+            Output::Names,
+            Output::Value("user.note".into()),
+        ] {
             assert_eq!(output.path_policy(false), PathPolicy::NoFollowFinal);
             assert_eq!(output.path_policy(true), PathPolicy::NoSymlinks);
         }
@@ -401,18 +407,37 @@ mod tests {
         for command in ["ls", "read", "stat", "readlink", "listxattr", "getxattr"] {
             for no_symlinks in [false, true] {
                 let mut args = vec![
-                    "ffs-zfs", command, "leaf.img", "/dirlink/link", "--offline-image",
-                    "--auto-import", "--dataset", "data", "--snapshot", "before",
-                    "--member", "second.img",
+                    "ffs-zfs",
+                    command,
+                    "leaf.img",
+                    "/dirlink/link",
+                    "--offline-image",
+                    "--auto-import",
+                    "--dataset",
+                    "data",
+                    "--snapshot",
+                    "before",
+                    "--member",
+                    "second.img",
                 ];
-                if command == "getxattr" { args.push("user.note"); }
-                if no_symlinks { args.push("--no-symlinks"); }
+                if command == "getxattr" {
+                    args.push("user.note");
+                }
+                if no_symlinks {
+                    args.push("--no-symlinks");
+                }
                 let cli = Cli::try_parse_from(args).unwrap();
                 let Command::File(
-                    FileCommand::Ls { file } | FileCommand::Stat { file }
-                    | FileCommand::Read { file, .. } | FileCommand::Readlink { file }
-                    | FileCommand::Listxattr { file } | FileCommand::Getxattr { file, .. }
-                ) = cli.command else { panic!("native path command"); };
+                    FileCommand::Ls { file }
+                    | FileCommand::Stat { file }
+                    | FileCommand::Read { file, .. }
+                    | FileCommand::Readlink { file }
+                    | FileCommand::Listxattr { file }
+                    | FileCommand::Getxattr { file, .. },
+                ) = cli.command
+                else {
+                    panic!("native path command");
+                };
                 assert_eq!(file.no_symlinks, no_symlinks);
                 assert_eq!(file.path, PathBuf::from("/dirlink/link"));
                 assert_eq!(file.snapshot, Some(OsString::from("before")));
@@ -729,13 +754,36 @@ mod tests {
     #[test]
     fn scrub_retains_members_snapshot_and_explicit_budgets() {
         let parsed = Cli::try_parse_from([
-            "ffs-zfs", "scrub", "first.img", "--offline-image", "--auto-import",
-            "--dataset", "data", "--snapshot", "before", "--member", "second.img",
-            "--max-pointers", "1000", "--max-bytes", "40960", "--max-objects", "50",
-        ]).unwrap();
+            "ffs-zfs",
+            "scrub",
+            "first.img",
+            "--offline-image",
+            "--auto-import",
+            "--dataset",
+            "data",
+            "--snapshot",
+            "before",
+            "--member",
+            "second.img",
+            "--max-pointers",
+            "1000",
+            "--max-bytes",
+            "40960",
+            "--max-objects",
+            "50",
+        ])
+        .unwrap();
         let Command::File(FileCommand::Scrub {
-            candidate, dataset, snapshot, max_pointers, max_bytes, max_objects,
-        }) = parsed.command else { panic!("scrub command"); };
+            candidate,
+            dataset,
+            snapshot,
+            max_pointers,
+            max_bytes,
+            max_objects,
+        }) = parsed.command
+        else {
+            panic!("scrub command");
+        };
         assert!(candidate.auto_import);
         assert!(candidate.image.offline_image);
         assert_eq!(candidate.members, [PathBuf::from("second.img")]);
@@ -746,7 +794,13 @@ mod tests {
 
     #[test]
     fn scrub_rejects_zero_budgets_and_mutation_options() {
-        let base = ["ffs-zfs", "scrub", "leaf.img", "--offline-image", "--auto-import"];
+        let base = [
+            "ffs-zfs",
+            "scrub",
+            "leaf.img",
+            "--offline-image",
+            "--auto-import",
+        ];
         for option in ["--max-pointers", "--max-bytes", "--max-objects"] {
             assert!(Cli::try_parse_from(base.into_iter().chain([option, "0"])).is_err());
         }
@@ -759,10 +813,18 @@ mod tests {
     #[test]
     fn scrub_rejects_sidecar_before_attempting_to_open_an_image() {
         let cli = Cli::try_parse_from([
-            "ffs-zfs", "scrub", "nonexistent-scrub-fixture.img", "--offline-image",
-            "--auto-import", "--sidecar", "nonexistent-scrub-fixture.rq",
-        ]).unwrap();
-        let Command::File(command) = cli.command else { panic!("scrub command"); };
+            "ffs-zfs",
+            "scrub",
+            "nonexistent-scrub-fixture.img",
+            "--offline-image",
+            "--auto-import",
+            "--sidecar",
+            "nonexistent-scrub-fixture.rq",
+        ])
+        .unwrap();
+        let Command::File(command) = cli.command else {
+            panic!("scrub command");
+        };
         let error = command.run(&Cx::for_testing()).unwrap_err();
         assert!(error.to_string().contains("does not admit sidecar healing"));
     }

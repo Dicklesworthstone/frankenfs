@@ -5,8 +5,10 @@
 //! Partial indirect writes and TX_WRITE2 require separate EOF/hidden-tail
 //! replay semantics. They remain refused rather than guessing their contents.
 
-use super::{BlockPointer, Cx, Edit, MAX_LOG_BYTES, MAX_RECORDS, Pool,
-    Record, Result, VdevConfig, checkpoint, corrupt, edit, file_range, parse, unsupported};
+use super::{
+    BlockPointer, Cx, Edit, MAX_LOG_BYTES, MAX_RECORDS, Pool, Record, Result, VdevConfig,
+    checkpoint, corrupt, edit, file_range, parse, unsupported,
+};
 use std::collections::BTreeMap;
 
 pub(super) struct Plan {
@@ -29,7 +31,9 @@ impl Plan {
         let mut writes = Vec::new();
         for (index, record) in records.iter().enumerate() {
             checkpoint(cx)?;
-            if !record.pending { continue; }
+            if !record.pending {
+                continue;
+            }
             if record.kind != 9 || record.raw.len() != 192 {
                 edit(record)?;
                 continue;
@@ -38,20 +42,31 @@ impl Plan {
             let pointer = BlockPointer::parse(&record.raw[64..192], record.order)
                 .map_err(|error| parse(&error))?;
             if pointer.hole() || pointer.embedded() || pointer.protected() || pointer.gang() {
-                return Err(unsupported("indirect ZIL recovery requires an ordinary unencrypted data block"));
+                return Err(unsupported(
+                    "indirect ZIL recovery requires an ordinary unencrypted data block",
+                ));
             }
             if pointer.object_type() != 19 || pointer.level() != 0 || pointer.birth() == 0 {
                 return Err(corrupt("indirect ZIL write does not reference file data"));
             }
-            if length == 0 || length != pointer.logical_bytes() as u64 || !offset.is_multiple_of(length) {
-                return Err(unsupported("indirect ZIL recovery requires a complete aligned logical block; partial-block EOF replay is not implemented"));
+            if length == 0
+                || length != pointer.logical_bytes() as u64
+                || !offset.is_multiple_of(length)
+            {
+                return Err(unsupported(
+                    "indirect ZIL recovery requires a complete aligned logical block; partial-block EOF replay is not implemented",
+                ));
             }
             // Enforce the existing ordinary BP grammar before any payload is
             // read. Verification and decoding still use the shared pipeline.
             // lr_blkoff is obsolete and
             // intentionally ignored, just as in the pinned native reader.
             pointer.regular_dvas().map_err(|error| parse(&error))?;
-            writes.push(Write { record: index, object, pointer });
+            writes.push(Write {
+                record: index,
+                object,
+                pointer,
+            });
         }
         checkpoint(cx)?;
         Ok(Self { writes })
@@ -72,11 +87,21 @@ impl Plan {
         let mut physical = 0_u64;
         for write in self.writes.iter().filter(|write| write.object == object) {
             checkpoint(cx)?;
-            logical = logical.checked_add(write.pointer.logical_bytes())
+            logical = logical
+                .checked_add(write.pointer.logical_bytes())
                 .filter(|bytes| *bytes <= MAX_LOG_BYTES)
-                .ok_or_else(|| unsupported("indirect ZIL recovery exceeds 64 MiB retained logical data"))?;
-            let copies = write.pointer.regular_dvas().map_err(|error| parse(&error))?;
-            let multiplier = if config.raidz_members.is_none() { pool.leaves().len() as u64 } else { 1 };
+                .ok_or_else(|| {
+                    unsupported("indirect ZIL recovery exceeds 64 MiB retained logical data")
+                })?;
+            let copies = write
+                .pointer
+                .regular_dvas()
+                .map_err(|error| parse(&error))?;
+            let multiplier = if config.raidz_members.is_none() {
+                pool.leaves().len() as u64
+            } else {
+                1
+            };
             for copy in copies {
                 physical = copy.allocated_bytes.checked_mul(multiplier)
                     .and_then(|bytes| physical.checked_add(bytes))
@@ -108,16 +133,27 @@ pub(super) fn edits<'a>(
     let mut edits = Vec::new();
     for (index, record) in records.iter().enumerate() {
         checkpoint(cx)?;
-        if !record.pending { continue; }
+        if !record.pending {
+            continue;
+        }
         if record.kind == 9 && record.raw.len() == 192 {
             let (target, offset, length) = file_range(record)?;
-            if target != object { continue; }
-            let bytes = data.get(&index)
+            if target != object {
+                continue;
+            }
+            let bytes = data
+                .get(&index)
                 .ok_or_else(|| corrupt("admitted indirect ZIL payload is missing"))?;
             if bytes.len() as u64 != length {
-                return Err(corrupt("indirect ZIL payload does not match the logged write"));
+                return Err(corrupt(
+                    "indirect ZIL payload does not match the logged write",
+                ));
             }
-            edits.push(Edit::Write { object, offset, data: bytes });
+            edits.push(Edit::Write {
+                object,
+                offset,
+                data: bytes,
+            });
         } else {
             let edit = edit(record)?;
             if edit.object() == object {

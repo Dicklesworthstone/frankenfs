@@ -645,7 +645,10 @@ impl FatVolume {
                 // cluster IDs must pass the same geometry check as a new run.
                 let next_offset = self.cluster_offset(next)?;
                 if physical.checked_add(count as u64) != Some(next_offset) {
-                    return Err(corrupt(physical, "FAT read run is not physically contiguous"));
+                    return Err(corrupt(
+                        physical,
+                        "FAT read run is not physically contiguous",
+                    ));
                 }
                 count += (limit - count).min(cluster_bytes as usize);
                 cluster = next;
@@ -744,7 +747,8 @@ impl<'a> FatTable<'a> {
                 let width = u64::from(geometry.kind().entry_bytes());
                 let copy_start = position - u64::from(cluster) * width;
                 let coverage = ((u64::from(geometry.cluster_count()) + 2) * width)
-                    .div_ceil(sector_bytes) * sector_bytes;
+                    .div_ceil(sector_bytes)
+                    * sector_bytes;
                 (copy_start + coverage - start).min(Self::MAX_WINDOW_BYTES)
             } else {
                 sector_bytes

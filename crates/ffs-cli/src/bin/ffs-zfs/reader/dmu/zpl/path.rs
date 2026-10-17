@@ -5,8 +5,10 @@
 //! restart at THIS dataset root; parent traversal above it is refused. No host
 //! paths, synthetic .zfs mounts, child datasets or live-head fallbacks are used.
 
-use super::{Cx, DirectoryEntry, FfsError, Kind, MAX_COMPONENTS, MAX_PATH, Result, Zpl,
-    checkpoint, corrupt, unsupported};
+use super::{
+    Cx, DirectoryEntry, FfsError, Kind, MAX_COMPONENTS, MAX_PATH, Result, Zpl, checkpoint, corrupt,
+    unsupported,
+};
 use std::collections::VecDeque;
 
 const MAX_SYMLINKS: usize = 40;
@@ -56,11 +58,18 @@ impl Walk {
         if path.contains(&0) {
             return Err(corrupt("ZPL path contains NUL"));
         }
-        self.bytes = self.bytes.checked_add(path.len())
+        self.bytes = self
+            .bytes
+            .checked_add(path.len())
             .filter(|&bytes| bytes <= MAX_PATH)
             .ok_or(FfsError::NameTooLong)?;
-        let count = path.split(|&byte| byte == b'/').filter(|part| !part.is_empty()).count();
-        self.components = self.components.checked_add(count)
+        let count = path
+            .split(|&byte| byte == b'/')
+            .filter(|part| !part.is_empty())
+            .count();
+        self.components = self
+            .components
+            .checked_add(count)
             .filter(|&components| components <= MAX_COMPONENTS)
             .ok_or(FfsError::NameTooLong)?;
         // Keep the directory requirement at the END OF THIS EXPANSION, before
@@ -68,7 +77,10 @@ impl Walk {
         if path.last() == Some(&b'/') {
             self.pending.push_front(Step::Directory);
         }
-        for component in path.rsplit(|&byte| byte == b'/').filter(|part| !part.is_empty()) {
+        for component in path
+            .rsplit(|&byte| byte == b'/')
+            .filter(|part| !part.is_empty())
+        {
             if component.len() > 255 {
                 return Err(FfsError::NameTooLong);
             }
@@ -88,9 +100,12 @@ impl Walk {
     fn directory(&mut self, cx: &Cx, entries: &[DirectoryEntry]) -> Result<()> {
         for entry in entries {
             checkpoint(cx)?;
-            let bytes = std::mem::size_of::<DirectoryEntry>() + entry.name.len()
+            let bytes = std::mem::size_of::<DirectoryEntry>()
+                + entry.name.len()
                 + entry.metadata.inline_symlink.as_ref().map_or(0, Vec::len);
-            self.directory_work = self.directory_work.checked_add(bytes)
+            self.directory_work = self
+                .directory_work
+                .checked_add(bytes)
                 .filter(|&work| work <= MAX_DIRECTORY_WORK)
                 .ok_or_else(|| unsupported("ZPL path exceeds 64 MiB directory-work budget"))?;
         }
@@ -132,17 +147,23 @@ impl Zpl {
             }
             if name == b".." {
                 if directories.len() == 1 {
-                    return Err(unsupported("ZPL path would escape the selected dataset root"));
+                    return Err(unsupported(
+                        "ZPL path would escape the selected dataset root",
+                    ));
                 }
                 directories.pop();
-                current = *directories.last().ok_or_else(|| corrupt("missing ZPL path root"))?;
+                current = *directories
+                    .last()
+                    .ok_or_else(|| corrupt("missing ZPL path root"))?;
                 continue;
             }
             self.component(&name)?;
             let entries = self.list(cx, current)?;
             walk.directory(cx, &entries)?;
             checkpoint(cx)?;
-            let entry = entries.into_iter().find(|entry| entry.name == name)
+            let entry = entries
+                .into_iter()
+                .find(|entry| entry.name == name)
                 .ok_or_else(|| FfsError::NotFound("ZPL path component".into()))?;
             let traversal_required = !walk.pending.is_empty() || policy == PathPolicy::Follow;
             if entry.metadata.kind == Kind::Symlink && traversal_required {

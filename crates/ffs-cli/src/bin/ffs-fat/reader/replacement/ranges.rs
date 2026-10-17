@@ -186,13 +186,7 @@ fn validate_edit_state(cx: &Cx, volume: &FatVolume) -> Result<()> {
 /// shrink. Publish and verify the shorter directory record before cutting the
 /// chain; sync the cut before freeing its tail. Interruption may leave excess
 /// allocation, but no successfully published length refers to freed storage.
-fn shrink_in_volume(
-    cx: &Cx,
-    volume: &FatVolume,
-    path: &str,
-    size: u32,
-    now: u64,
-) -> Result<()> {
+fn shrink_in_volume(cx: &Cx, volume: &FatVolume, path: &str, size: u32, now: u64) -> Result<()> {
     checkpoint(cx)?;
     let (date, time) = modified_timestamp(now)?;
     validate_edit_state(cx, volume)?;
@@ -230,7 +224,12 @@ fn shrink_in_volume(
     for index in keep..source.chain.clusters.len() {
         release.push((
             source.chain.clusters[index],
-            source.chain.clusters.get(index + 1).copied().unwrap_or(EXPECT_END),
+            source
+                .chain
+                .clusters
+                .get(index + 1)
+                .copied()
+                .unwrap_or(EXPECT_END),
         ));
     }
     release.sort_unstable_by_key(|&(cluster, _)| cluster);
@@ -341,7 +340,10 @@ fn shrink_in_volume(
             || after.files != before.files
             || after.directories != before.directories
         {
-            bail!("shrink verification failed: {}", serde_json::to_string(&after)?);
+            bail!(
+                "shrink verification failed: {}",
+                serde_json::to_string(&after)?
+            );
         }
         phase = "synchronizing final clean state";
         set_dirty(cx, volume, false)?;

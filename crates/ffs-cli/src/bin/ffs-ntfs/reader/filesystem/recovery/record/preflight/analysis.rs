@@ -5,8 +5,10 @@
 //! restores the native undo-next link. References: Linux v6.17 fs/ntfs3/fslog.c
 //! TRANSACTION_ENTRY and the Analysis/Undo passes. No operation is applied here.
 
-use super::{Cx, LFS_CLIENT_RECORD, LogRecord, Restart, Result, checkpoint, corrupt,
-    read_record, table::RestartTable, u64_at, unsupported};
+use super::{
+    Cx, LFS_CLIENT_RECORD, LogRecord, Restart, Result, checkpoint, corrupt, read_record,
+    table::RestartTable, u64_at, unsupported,
+};
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 const MAX_TRANSACTIONS: usize = 4096;
@@ -56,7 +58,9 @@ impl State {
     pub(super) fn from_table(cx: &Cx, table: &RestartTable<'_>) -> Result<Self> {
         checkpoint(cx)?;
         if table.entry_size != 40 || table.entries.len() > MAX_TRANSACTIONS {
-            return Err(unsupported("$LogFile Analysis requires a bounded native transaction table"));
+            return Err(unsupported(
+                "$LogFile Analysis requires a bounded native transaction table",
+            ));
         }
         let mut state = Self::default();
         for (&id, bytes) in &table.entries {
@@ -65,15 +69,23 @@ impl State {
                 Some(1) => Status::Active,
                 Some(2) => Status::Prepared,
                 Some(3) => Status::Committed,
-                _ => return Err(corrupt(0, "invalid checkpoint transaction state for Analysis")),
+                _ => {
+                    return Err(corrupt(
+                        0,
+                        "invalid checkpoint transaction state for Analysis",
+                    ));
+                }
             };
-            state.transactions.insert(id, Transaction {
-                status,
-                first: u64_at(bytes, 8)?,
-                previous: u64_at(bytes, 16)?,
-                undo: u64_at(bytes, 24)?,
-                retired_before: 0,
-            });
+            state.transactions.insert(
+                id,
+                Transaction {
+                    status,
+                    first: u64_at(bytes, 8)?,
+                    previous: u64_at(bytes, 16)?,
+                    undo: u64_at(bytes, 24)?,
+                    retired_before: 0,
+                },
+            );
         }
         Ok(state)
     }
@@ -81,7 +93,10 @@ impl State {
     pub(super) fn observe(&mut self, cx: &Cx, record: &LogRecord) -> Result<()> {
         checkpoint(cx)?;
         if record.lsn == 0 || record.lsn <= self.last_seen {
-            return Err(corrupt(0, "$LogFile Analysis input is not strictly chronological"));
+            return Err(corrupt(
+                0,
+                "$LogFile Analysis input is not strictly chronological",
+            ));
         }
         self.last_seen = record.lsn;
         if record.kind != LFS_CLIENT_RECORD {
@@ -101,41 +116,60 @@ impl State {
                 return Ok(());
             }
             if transaction.status == Status::Committed && !matches!(redo, COMMIT | FORGET) {
-                return Err(corrupt(0, "$LogFile modifies a committed transaction before forgetting it"));
+                return Err(corrupt(
+                    0,
+                    "$LogFile modifies a committed transaction before forgetting it",
+                ));
             }
         } else {
             if self.transactions.len() >= MAX_TRANSACTIONS {
-                return Err(unsupported("$LogFile Analysis exceeds 4096 active transaction slots"));
+                return Err(unsupported(
+                    "$LogFile Analysis exceeds 4096 active transaction slots",
+                ));
             }
             let retired_before = self.retired.get(&id).copied().unwrap_or(0);
             if retired_before != 0 && (record.previous != 0 || record.undo_next != 0) {
-                return Err(corrupt(0, "$LogFile reused transaction slot inherits an old chain"));
+                return Err(corrupt(
+                    0,
+                    "$LogFile reused transaction slot inherits an old chain",
+                ));
             }
-            self.transactions.insert(id, Transaction {
-                status: Status::Active,
-                // Without a checkpoint seed, a nonzero predecessor establishes
-                // that this is not the transaction's first retained record.
-                first: if record.previous == 0 { record.lsn } else { 0 },
-                previous: 0,
-                undo: 0,
-                retired_before,
-            });
+            self.transactions.insert(
+                id,
+                Transaction {
+                    status: Status::Active,
+                    // Without a checkpoint seed, a nonzero predecessor establishes
+                    // that this is not the transaction's first retained record.
+                    first: if record.previous == 0 { record.lsn } else { 0 },
+                    previous: 0,
+                    undo: 0,
+                    retired_before,
+                },
+            );
         }
         if redo == FORGET {
             self.transactions.remove(&id);
             self.retired.insert(id, record.lsn);
             if self.retired.len() > MAX_TRANSACTIONS {
-                return Err(unsupported("$LogFile Analysis exceeds 4096 retired transaction slots"));
+                return Err(unsupported(
+                    "$LogFile Analysis exceeds 4096 retired transaction slots",
+                ));
             }
             return checkpoint(cx);
         }
-        let transaction = self.transactions.get_mut(&id)
+        let transaction = self
+            .transactions
+            .get_mut(&id)
             .ok_or_else(|| corrupt(0, "$LogFile Analysis lost its transaction slot"))?;
         for link in [record.previous, record.undo_next] {
-            if link != 0 && (link <= transaction.retired_before
-                || (transaction.first != 0 && link < transaction.first))
+            if link != 0
+                && (link <= transaction.retired_before
+                    || (transaction.first != 0 && link < transaction.first))
             {
-                return Err(corrupt(0, "$LogFile transaction link crosses an incarnation boundary"));
+                return Err(corrupt(
+                    0,
+                    "$LogFile transaction link crosses an incarnation boundary",
+                ));
             }
         }
         transaction.previous = record.lsn;
@@ -162,13 +196,14 @@ impl State {
         self.plan(cx, |lsn| read_record(cx, restart, stream_length, lsn, read))
     }
 
-    fn plan(
-        &self,
-        cx: &Cx,
-        mut load: impl FnMut(u64) -> Result<LogRecord>,
-    ) -> Result<Report> {
+    fn plan(&self, cx: &Cx, mut load: impl FnMut(u64) -> Result<LogRecord>) -> Result<Report> {
         checkpoint(cx)?;
-        let mut report = Report { active: 0, prepared: 0, committed: 0, undo: Vec::new() };
+        let mut report = Report {
+            active: 0,
+            prepared: 0,
+            committed: 0,
+            undo: Vec::new(),
+        };
         let mut pending = BinaryHeap::new();
         for (&id, transaction) in &self.transactions {
             checkpoint(cx)?;
@@ -192,22 +227,35 @@ impl State {
             if !seen.insert(lsn) {
                 return Err(corrupt(0, "$LogFile undo chains share or revisit a record"));
             }
-            let transaction = self.transactions.get(&id)
+            let transaction = self
+                .transactions
+                .get(&id)
                 .ok_or_else(|| corrupt(0, "$LogFile undo refers to a missing transaction"))?;
-            if lsn > transaction.previous || lsn <= transaction.retired_before
+            if lsn > transaction.previous
+                || lsn <= transaction.retired_before
                 || (transaction.first != 0 && lsn < transaction.first)
             {
-                return Err(corrupt(0, "$LogFile undo LSN crosses its transaction lifetime"));
+                return Err(corrupt(
+                    0,
+                    "$LogFile undo LSN crosses its transaction lifetime",
+                ));
             }
             let record = load(lsn)?;
             checkpoint(cx)?;
-            if record.lsn != lsn || record.kind != LFS_CLIENT_RECORD
+            if record.lsn != lsn
+                || record.kind != LFS_CLIENT_RECORD
                 || record.summary.transaction_id != id
             {
-                return Err(corrupt(0, "$LogFile undo record has the wrong identity or owner"));
+                return Err(corrupt(
+                    0,
+                    "$LogFile undo record has the wrong identity or owner",
+                ));
             }
             if matches!(record.summary.redo_op, COMMIT | FORGET) {
-                return Err(corrupt(0, "$LogFile loser undo chain crosses a committed or forgotten transaction"));
+                return Err(corrupt(
+                    0,
+                    "$LogFile loser undo chain crosses a committed or forgotten transaction",
+                ));
             }
             let next = record.undo_next;
             if next != 0 && next >= lsn {
@@ -232,74 +280,133 @@ impl State {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::super::{LFS_CLIENT_RESTART, TailRecord};
+    use super::*;
     use ffs_error::FfsError;
 
     fn record(lsn: u64, id: u32, redo: u16, undo: u16, previous: u64, next: u64) -> LogRecord {
-        LogRecord { lsn, previous, undo_next: next, kind: LFS_CLIENT_RECORD,
-            summary: TailRecord { transaction_id: id, redo_op: redo, undo_op: undo },
-            data: Vec::new() }
+        LogRecord {
+            lsn,
+            previous,
+            undo_next: next,
+            kind: LFS_CLIENT_RECORD,
+            summary: TailRecord {
+                transaction_id: id,
+                redo_op: redo,
+                undo_op: undo,
+            },
+            data: Vec::new(),
+        }
     }
 
     fn observe(records: &[LogRecord]) -> State {
         let mut state = State::default();
-        for record in records { state.observe(&Cx::for_testing(), record).unwrap(); }
+        for record in records {
+            state.observe(&Cx::for_testing(), record).unwrap();
+        }
         state
     }
 
     fn plan(state: &State, records: &[LogRecord]) -> Result<Report> {
         state.plan(&Cx::for_testing(), |lsn| {
-            let r = records.iter().find(|r| r.lsn == lsn)
+            let r = records
+                .iter()
+                .find(|r| r.lsn == lsn)
                 .ok_or_else(|| corrupt(0, "missing test undo record"))?;
-            Ok(record(r.lsn, r.summary.transaction_id, r.summary.redo_op,
-                r.summary.undo_op, r.previous, r.undo_next))
+            Ok(record(
+                r.lsn,
+                r.summary.transaction_id,
+                r.summary.redo_op,
+                r.summary.undo_op,
+                r.previous,
+                r.undo_next,
+            ))
         })
     }
 
     #[test]
     fn interleaved_winners_and_losers_produce_global_reverse_lsn_undo() {
-        let records = [record(10, 24, 7, 7, 0, 0), record(20, 64, 7, 7, 0, 0),
-            record(30, 104, 7, 7, 0, 0), record(40, 24, 7, 7, 10, 10),
-            record(50, 64, COMMIT, 0, 20, 20), record(60, 104, 7, 7, 30, 30)];
+        let records = [
+            record(10, 24, 7, 7, 0, 0),
+            record(20, 64, 7, 7, 0, 0),
+            record(30, 104, 7, 7, 0, 0),
+            record(40, 24, 7, 7, 10, 10),
+            record(50, 64, COMMIT, 0, 20, 20),
+            record(60, 104, 7, 7, 30, 30),
+        ];
         let report = plan(&observe(&records), &records).unwrap();
-        assert_eq!((report.active, report.prepared, report.committed), (2, 0, 1));
-        assert_eq!(report.undo, [(60, 104, 7), (40, 24, 7), (30, 104, 7), (10, 24, 7)]);
+        assert_eq!(
+            (report.active, report.prepared, report.committed),
+            (2, 0, 1)
+        );
+        assert_eq!(
+            report.undo,
+            [(60, 104, 7), (40, 24, 7), (30, 104, 7), (10, 24, 7)]
+        );
     }
 
     #[test]
     fn compensation_uses_undo_opcode_and_does_not_repeat_completed_undo() {
-        let records = [record(10, 24, 7, 7, 0, 0), record(20, 24, 7, 7, 10, 10),
-            record(30, 24, 7, COMPENSATION, 20, 10)];
+        let records = [
+            record(10, 24, 7, 7, 0, 0),
+            record(20, 24, 7, 7, 10, 10),
+            record(30, 24, 7, COMPENSATION, 20, 10),
+        ];
         let report = plan(&observe(&records), &records).unwrap();
         assert_eq!(report.undo, [(10, 24, 7)]);
         let mut more = Vec::from(records);
         more.push(record(40, 24, 7, 7, 30, 30));
-        assert_eq!(plan(&observe(&more), &more).unwrap().undo, [(40, 24, 7), (10, 24, 7)]);
+        assert_eq!(
+            plan(&observe(&more), &more).unwrap().undo,
+            [(40, 24, 7), (10, 24, 7)]
+        );
     }
 
     #[test]
     fn top_level_completion_skips_the_completed_nested_action() {
-        let records = [record(10, 24, 7, 7, 0, 0), record(20, 24, 7, 7, 10, 10),
-            record(30, 24, END_TOP_LEVEL, 0, 20, 10)];
-        assert_eq!(plan(&observe(&records), &records).unwrap().undo, [(10, 24, 7)]);
+        let records = [
+            record(10, 24, 7, 7, 0, 0),
+            record(20, 24, 7, 7, 10, 10),
+            record(30, 24, END_TOP_LEVEL, 0, 20, 10),
+        ];
+        assert_eq!(
+            plan(&observe(&records), &records).unwrap().undo,
+            [(10, 24, 7)]
+        );
     }
 
     #[test]
     fn prepared_transactions_remain_in_doubt_and_are_not_silently_aborted() {
-        let records = [record(10, 24, 7, 7, 0, 0), record(20, 24, PREPARE, 0, 10, 10)];
+        let records = [
+            record(10, 24, 7, 7, 0, 0),
+            record(20, 24, PREPARE, 0, 10, 10),
+        ];
         let report = plan(&observe(&records), &records).unwrap();
-        assert_eq!((report.active, report.prepared, report.committed), (0, 1, 0));
+        assert_eq!(
+            (report.active, report.prepared, report.committed),
+            (0, 1, 0)
+        );
         assert!(report.undo.is_empty());
     }
 
     #[test]
     fn forget_and_slot_reuse_do_not_inherit_old_transaction_work() {
-        let records = [record(10, 24, 7, 7, 0, 0), record(20, 24, COMMIT, 0, 10, 10),
-            record(30, 24, FORGET, 0, 20, 0), record(40, 24, 7, 7, 0, 0)];
-        assert_eq!(plan(&observe(&records), &records).unwrap().undo, [(40, 24, 7)]);
+        let records = [
+            record(10, 24, 7, 7, 0, 0),
+            record(20, 24, COMMIT, 0, 10, 10),
+            record(30, 24, FORGET, 0, 20, 0),
+            record(40, 24, 7, 7, 0, 0),
+        ];
+        assert_eq!(
+            plan(&observe(&records), &records).unwrap().undo,
+            [(40, 24, 7)]
+        );
         let mut state = observe(&records[..3]);
-        assert!(state.observe(&Cx::for_testing(), &record(40, 24, 7, 7, 10, 10)).is_err());
+        assert!(
+            state
+                .observe(&Cx::for_testing(), &record(40, 24, 7, 7, 10, 10))
+                .is_err()
+        );
     }
 
     #[test]
@@ -317,8 +424,14 @@ mod tests {
         let table = RestartTable::parse(&cx, &bytes).unwrap();
         let mut state = State::from_table(&cx, &table).unwrap();
         state.observe(&cx, &record(20, 24, 7, 7, 10, 10)).unwrap();
-        state.observe(&cx, &record(30, 24, COMMIT, 0, 20, 20)).unwrap();
-        let report = state.plan(&cx, |_| panic!("committed checkpoint must not schedule undo")).unwrap();
+        state
+            .observe(&cx, &record(30, 24, COMMIT, 0, 20, 20))
+            .unwrap();
+        let report = state
+            .plan(&cx, |_| {
+                panic!("committed checkpoint must not schedule undo")
+            })
+            .unwrap();
         assert_eq!(report.committed, 1);
         assert!(report.undo.is_empty());
     }
@@ -326,10 +439,21 @@ mod tests {
     #[test]
     fn checkpoint_only_active_transaction_schedules_its_retained_history() {
         let mut state = State::default();
-        state.transactions.insert(24, Transaction { status: Status::Active,
-            first: 10, previous: 20, undo: 20, retired_before: 0 });
+        state.transactions.insert(
+            24,
+            Transaction {
+                status: Status::Active,
+                first: 10,
+                previous: 20,
+                undo: 20,
+                retired_before: 0,
+            },
+        );
         let records = [record(10, 24, 7, 7, 0, 0), record(20, 24, 7, 7, 10, 10)];
-        assert_eq!(plan(&state, &records).unwrap().undo, [(20, 24, 7), (10, 24, 7)]);
+        assert_eq!(
+            plan(&state, &records).unwrap().undo,
+            [(20, 24, 7), (10, 24, 7)]
+        );
     }
 
     #[test]
@@ -351,9 +475,16 @@ mod tests {
 
     #[test]
     fn committed_transaction_cannot_resume_mutation_without_forget() {
-        let records = [record(10, 24, 7, 7, 0, 0), record(20, 24, COMMIT, 0, 10, 10)];
+        let records = [
+            record(10, 24, 7, 7, 0, 0),
+            record(20, 24, COMMIT, 0, 10, 10),
+        ];
         let mut state = observe(&records);
-        assert!(state.observe(&Cx::for_testing(), &record(30, 24, 7, 7, 20, 20)).is_err());
+        assert!(
+            state
+                .observe(&Cx::for_testing(), &record(30, 24, 7, 7, 20, 20))
+                .is_err()
+        );
     }
 
     #[test]
@@ -364,7 +495,11 @@ mod tests {
         state.observe(&Cx::for_testing(), &restart).unwrap();
         assert!(state.transactions.is_empty());
         assert!(state.observe(&Cx::for_testing(), &restart).is_err());
-        assert!(State::default().observe(&Cx::for_testing(), &record(10, 0, 7, 7, 0, 0)).is_err());
+        assert!(
+            State::default()
+                .observe(&Cx::for_testing(), &record(10, 0, 7, 7, 0, 0))
+                .is_err()
+        );
     }
 
     #[test]
@@ -374,21 +509,36 @@ mod tests {
         let mut calls = 0;
         let result = state.plan(&Cx::for_testing(), |lsn| {
             calls += 1;
-            if calls == 2 { return Err(FfsError::Cancelled); }
+            if calls == 2 {
+                return Err(FfsError::Cancelled);
+            }
             Ok(record(lsn, 24, 7, 7, 10, 10))
         });
         assert!(matches!(result, Err(FfsError::Cancelled)));
         assert_eq!(calls, 2);
-        assert!(state.plan(&Cx::for_testing(), |_| Err(FfsError::Io(
-            std::io::Error::other("injected undo I/O failure")))).is_err());
+        assert!(
+            state
+                .plan(&Cx::for_testing(), |_| Err(FfsError::Io(
+                    std::io::Error::other("injected undo I/O failure")
+                )))
+                .is_err()
+        );
     }
 
     #[test]
     fn undo_work_limit_is_checked_before_loading_another_record() {
         let last = MAX_UNDO_RECORDS as u64 + 1;
         let mut state = State::default();
-        state.transactions.insert(24, Transaction { status: Status::Active,
-            first: 1, previous: last, undo: last, retired_before: 0 });
+        state.transactions.insert(
+            24,
+            Transaction {
+                status: Status::Active,
+                first: 1,
+                previous: last,
+                undo: last,
+                retired_before: 0,
+            },
+        );
         let mut reads = 0;
         let result = state.plan(&Cx::for_testing(), |lsn| {
             reads += 1;
@@ -404,11 +554,20 @@ mod tests {
         let second = (1_u64 << 20) | (page_vbo + 152) / 8;
         let last = (1_u64 << 20) | (page_vbo + 240) / 8;
         let restart = Restart {
-            system_page: 4096, log_page: 4096, version: (2, 0), clean: false,
-            current_lsn: last, seq_num_bits: 44, file_size: 4 * 1024 * 1024,
-            last_lsn_data_len: 40, record_header_len: 48, data_off: 64,
-            active_client_seq: Some(9), active_client_oldest_lsn: Some(first),
-            active_client_restart_lsn: None, area: Vec::new(),
+            system_page: 4096,
+            log_page: 4096,
+            version: (2, 0),
+            clean: false,
+            current_lsn: last,
+            seq_num_bits: 44,
+            file_size: 4 * 1024 * 1024,
+            last_lsn_data_len: 40,
+            record_header_len: 48,
+            data_off: 64,
+            active_client_seq: Some(9),
+            active_client_oldest_lsn: Some(first),
+            active_client_restart_lsn: None,
+            area: Vec::new(),
         };
         let mut page = vec![0; 4096];
         page[..4].copy_from_slice(b"RCRD");
@@ -423,8 +582,13 @@ mod tests {
         for (at, lsn, id, op, previous) in [
             (64_usize, first, 24_u32, 7_u16, 0),
             (152, second, 24, COMMIT, first),
-            (240, last, if reuse_committed { 24 } else { 64 }, 7,
-                if reuse_committed { second } else { 0 }),
+            (
+                240,
+                last,
+                if reuse_committed { 24 } else { 64 },
+                7,
+                if reuse_committed { second } else { 0 },
+            ),
         ] {
             page[at..at + 8].copy_from_slice(&lsn.to_le_bytes());
             page[at + 8..at + 16].copy_from_slice(&previous.to_le_bytes());
@@ -451,7 +615,10 @@ mod tests {
             let (restart, page) = native_journal(reuse_committed);
             let before = page.clone();
             let result = super::super::super::validate_dirty_tail(
-                &Cx::for_testing(), &restart, restart.file_size, &mut |offset, size| {
+                &Cx::for_testing(),
+                &restart,
+                restart.file_size,
+                &mut |offset, size| {
                     assert_eq!((offset, size), (34 * 4096, 4096));
                     Ok(page.clone())
                 },

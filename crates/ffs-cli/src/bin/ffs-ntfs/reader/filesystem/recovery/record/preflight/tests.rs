@@ -1,5 +1,5 @@
-use super::*;
 use super::super::{PAGE_RECORD_END, validate_dirty_tail};
+use super::*;
 
 const PAGE: usize = 4096;
 const LOG: u64 = 4 * 1024 * 1024;
@@ -71,12 +71,18 @@ impl Journal {
     fn check(&self) -> Result<()> {
         let original = self.pages.clone();
         let result = validate_dirty_tail(
-            &Cx::for_testing(), &self.restart, LOG, &mut |offset, size| {
+            &Cx::for_testing(),
+            &self.restart,
+            LOG,
+            &mut |offset, size| {
                 assert_eq!(size, PAGE);
-                self.pages.get(&offset).cloned()
+                self.pages
+                    .get(&offset)
+                    .cloned()
                     .ok_or_else(|| corrupt(offset, "unexpected journal fixture read"))
             },
-        ).map(|_| ());
+        )
+        .map(|_| ());
         assert_eq!(self.pages, original, "preflight must not mutate the image");
         result
     }
@@ -149,9 +155,14 @@ fn checkpoint_fixture() -> (Journal, u64, [u64; 4]) {
     restart[8..16].copy_from_slice(&first.to_le_bytes());
     let mut dumps = [0; 4];
     for (index, (spec, data)) in [
-        (ATTRIBUTES, attrs.as_slice()), (NAMES, names.as_slice()),
-        (DIRTY, dirty.as_slice()), (TRANSACTIONS, transactions.as_slice()),
-    ].into_iter().enumerate() {
+        (ATTRIBUTES, attrs.as_slice()),
+        (NAMES, names.as_slice()),
+        (DIRTY, dirty.as_slice()),
+        (TRANSACTIONS, transactions.as_slice()),
+    ]
+    .into_iter()
+    .enumerate()
+    {
         let lsn = journal.append(LFS_CLIENT_RECORD, 64, &update(spec.opcode, data), 0, 0);
         dumps[index] = lsn;
         restart[spec.lsn_offset..spec.lsn_offset + 8].copy_from_slice(&lsn.to_le_bytes());
@@ -220,11 +231,9 @@ fn checkpoint_declared_sizes_kinds_and_transaction_owners_are_not_trusted() {
             0 => journal.page_mut(dumps[0])[176..178].fill(0),
             1 => {
                 let tail = journal.restart.current_lsn;
-                journal.page_mut(tail)[176 + 48..176 + 52]
-                    .copy_from_slice(&2048_u32.to_le_bytes());
+                journal.page_mut(tail)[176 + 48..176 + 52].copy_from_slice(&2048_u32.to_le_bytes());
             }
-            2 => journal.page_mut(first)[128 + 36..128 + 40]
-                .copy_from_slice(&64_u32.to_le_bytes()),
+            2 => journal.page_mut(first)[128 + 36..128 + 40].copy_from_slice(&64_u32.to_le_bytes()),
             _ => {
                 let tail = journal.restart.current_lsn;
                 journal.page_mut(tail)[176 + 48..176 + 52].fill(0);
@@ -257,12 +266,19 @@ fn checkpoint_sector_tears_and_short_dump_reads_do_not_publish_partial_state() {
     journal.page_mut(dumps[0])[PAGE - 1] ^= 1;
     assert!(journal.check().is_err());
     let (journal, _, _) = checkpoint_fixture();
-    let tail_page = super::super::lsn_to_vbo(journal.restart.current_lsn, 44).unwrap()
-        & !(PAGE as u64 - 1);
+    let tail_page =
+        super::super::lsn_to_vbo(journal.restart.current_lsn, 44).unwrap() & !(PAGE as u64 - 1);
     let result = validate_dirty_tail(
-        &Cx::for_testing(), &journal.restart, LOG, &mut |offset, _| {
+        &Cx::for_testing(),
+        &journal.restart,
+        LOG,
+        &mut |offset, _| {
             let page = journal.pages[&offset].clone();
-            if offset == tail_page { Ok(page) } else { Ok(page[..PAGE - 1].to_vec()) }
+            if offset == tail_page {
+                Ok(page)
+            } else {
+                Ok(page[..PAGE - 1].to_vec())
+            }
         },
     );
     assert!(result.is_err());
@@ -280,9 +296,15 @@ fn referenced_record_budget_and_shared_ownership_apply_before_graph_io() {
     journal.restart.current_lsn = first + PAGE as u64 * MAX_REFERENCED_RECORDS as u64 / 8;
     let mut references = References::default();
     for index in 0..MAX_REFERENCED_RECORDS {
-        references.add(&journal.restart, first + index as u64 * PAGE as u64 / 8, 24).unwrap();
+        references
+            .add(&journal.restart, first + index as u64 * PAGE as u64 / 8, 24)
+            .unwrap();
     }
-    assert!(references.add(&journal.restart, journal.restart.current_lsn, 24).is_err());
+    assert!(
+        references
+            .add(&journal.restart, journal.restart.current_lsn, 24)
+            .is_err()
+    );
     // Shared edges are deduplicated; conflicting owners are not.
     references.add(&journal.restart, first, 24).unwrap();
     assert_eq!(references.pending.len(), MAX_REFERENCED_RECORDS);

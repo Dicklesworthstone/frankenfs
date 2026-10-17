@@ -6,8 +6,8 @@
 //! Native layout reference: OpenZFS zfs-2.3.0 include/sys/dnode.h.
 
 use super::{
-    BlockPointer, CheckedBlock, Cx, DNODE_BLOCK_BYTES, DNODE_BYTES, Dnode, FfsError,
-    MAX_OBJECT, Objects, Result, checkpoint, corrupt, parse, unsupported,
+    BlockPointer, CheckedBlock, Cx, DNODE_BLOCK_BYTES, DNODE_BYTES, Dnode, FfsError, MAX_OBJECT,
+    Objects, Result, checkpoint, corrupt, parse, unsupported,
 };
 use serde::Serialize;
 
@@ -170,7 +170,10 @@ impl Walker<'_> {
                 cx,
                 tree,
                 bp,
-                Position { block: slot as u128 * span, level },
+                Position {
+                    block: slot as u128 * span,
+                    level,
+                },
                 span,
                 tree.ceiling,
             )?;
@@ -194,13 +197,19 @@ impl Walker<'_> {
             if !self.charge_bytes(bp.logical_bytes()) {
                 return Ok(());
             }
-            match self.view.checked(cx, bp, 44, 0, bp.logical_bytes(), tree.ceiling) {
+            match self
+                .view
+                .checked(cx, bp, 44, 0, bp.logical_bytes(), tree.ceiling)
+            {
                 Ok(Some(block)) => {
                     self.report.verified_blocks += 1;
                     self.report.verified_bytes += block.bytes.len() as u64;
                 }
                 Ok(None) => self.issue(
-                    tree.number, position, corrupt("allocated SA spill is a hole"), false,
+                    tree.number,
+                    position,
+                    corrupt("allocated SA spill is a hole"),
+                    false,
                 )?,
                 Err(error) => self.issue(tree.number, position, error, false)?,
             }
@@ -239,7 +248,12 @@ impl Walker<'_> {
             return Ok(());
         }
         let block = match self.view.checked(
-            cx, bp, tree.node.object_type(), position.level, size, ceiling,
+            cx,
+            bp,
+            tree.node.object_type(),
+            position.level,
+            size,
+            ceiling,
         ) {
             Ok(Some(block)) => block,
             Ok(None) => {
@@ -270,13 +284,17 @@ impl Walker<'_> {
                 level: position.level - 1,
             };
             match BlockPointer::parse(raw, block.order) {
-                Ok(child) => self.visit(cx, tree, &child, child_position, child_span, block.birth)?,
+                Ok(child) => {
+                    self.visit(cx, tree, &child, child_position, child_span, block.birth)?
+                }
                 Err(error) => {
                     if !self.charge_pointer() {
                         break;
                     }
                     self.issue(
-                        tree.number, child_position, parse(&error),
+                        tree.number,
+                        child_position,
+                        parse(&error),
                         child_position.level != 0 || tree.dnodes,
                     )?;
                 }
@@ -288,9 +306,17 @@ impl Walker<'_> {
     fn dnodes(&mut self, cx: &Cx, block_id: u128, block: &CheckedBlock) -> Result<()> {
         let slots_per_block = DNODE_BLOCK_BYTES / DNODE_BYTES;
         let first_object = block_id * slots_per_block as u128;
-        let position = Position { block: block_id, level: 0 };
+        let position = Position {
+            block: block_id,
+            level: 0,
+        };
         if first_object + slots_per_block as u128 > u128::from(MAX_OBJECT) {
-            return self.issue(0, position, corrupt("meta-dnode exceeds object namespace"), true);
+            return self.issue(
+                0,
+                position,
+                corrupt("meta-dnode exceeds object namespace"),
+                true,
+            );
         }
         let mut slot = 0;
         while slot < slots_per_block && self.report.limit_reached.is_none() {
@@ -310,20 +336,36 @@ impl Walker<'_> {
             let slots = usize::from(block.bytes[at + 12]) + 1;
             if slot + slots > slots_per_block {
                 // A damaged size gives no authority to reinterpret interiors.
-                self.issue(number, position, corrupt("large dnode crosses its block"), true)?;
+                self.issue(
+                    number,
+                    position,
+                    corrupt("large dnode crosses its block"),
+                    true,
+                )?;
                 break;
             }
             let end = (slot + slots) * DNODE_BYTES;
             let node = Dnode::parse(&block.bytes[at..end], block.order);
             slot += slots;
             if number == 0 {
-                self.issue(0, position, corrupt("reserved object zero is allocated in dnode table"), true)?;
+                self.issue(
+                    0,
+                    position,
+                    corrupt("reserved object zero is allocated in dnode table"),
+                    true,
+                )?;
                 continue;
             }
             match node {
-                Ok(node) => self.tree(cx, &Tree {
-                    number, node, ceiling: block.birth, dnodes: false,
-                })?,
+                Ok(node) => self.tree(
+                    cx,
+                    &Tree {
+                        number,
+                        node,
+                        ceiling: block.birth,
+                        dnodes: false,
+                    },
+                )?,
                 Err(error) => self.issue(number, position, parse(&error), true)?,
             }
         }
@@ -342,23 +384,46 @@ impl Objects {
     /// allocation, ZIL, namespace, or cross-object-set consistency check.
     pub fn scrub(&self, cx: &Cx, limits: ScrubLimits) -> Result<ScrubReport> {
         checkpoint(cx)?;
-        if limits.pointers == 0 || limits.decoded_bytes == 0 || limits.objects == 0
-            || limits.pointers > (1 << 32) || limits.objects > (1 << 32)
+        if limits.pointers == 0
+            || limits.decoded_bytes == 0
+            || limits.objects == 0
+            || limits.pointers > (1 << 32)
+            || limits.objects > (1 << 32)
         {
-            return Err(FfsError::Format("scrub requires nonzero budgets and at most 2^32 pointers/objects".into()));
+            return Err(FfsError::Format(
+                "scrub requires nonzero budgets and at most 2^32 pointers/objects".into(),
+            ));
         }
         let mut view = self.clone_mos();
         let root = Tree {
-            number: 0, node: view.meta.clone(), ceiling: view.root_birth, dnodes: true,
+            number: 0,
+            node: view.meta.clone(),
+            ceiling: view.root_birth,
+            dnodes: true,
         };
         let report = ScrubReport {
-            pool_guid: view.pool_guid(), view_txg: view.txg, root_birth: view.root_birth,
-            objects_examined: 0, unallocated_slots_inspected: 0, pointers_examined: 0,
-            verified_blocks: 0, verified_bytes: 0, decoded_bytes_attempted: 0,
-            hole_pointers: 0, errors: 0, unsupported: 0, incomplete_subtrees: 0,
-            limit_reached: None, issues: Vec::new(), omitted_issues: 0,
+            pool_guid: view.pool_guid(),
+            view_txg: view.txg,
+            root_birth: view.root_birth,
+            objects_examined: 0,
+            unallocated_slots_inspected: 0,
+            pointers_examined: 0,
+            verified_blocks: 0,
+            verified_bytes: 0,
+            decoded_bytes_attempted: 0,
+            hole_pointers: 0,
+            errors: 0,
+            unsupported: 0,
+            incomplete_subtrees: 0,
+            limit_reached: None,
+            issues: Vec::new(),
+            omitted_issues: 0,
         };
-        let mut walker = Walker { view: &mut view, limits, report };
+        let mut walker = Walker {
+            view: &mut view,
+            limits,
+            report,
+        };
         walker.tree(cx, &root)?;
         checkpoint(cx)?;
         Ok(walker.report)

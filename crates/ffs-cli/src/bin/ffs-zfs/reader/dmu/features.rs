@@ -12,10 +12,7 @@ use std::collections::BTreeMap;
 const MAX_FEATURES: usize = 1024;
 const MAX_GUID_BYTES: usize = 255;
 const EXTENSIBLE: &[&str] = &["com.delphix:extensible_dataset"];
-const BOOKMARK_V2: &[&str] = &[
-    "com.delphix:extensible_dataset",
-    "com.delphix:bookmarks",
-];
+const BOOKMARK_V2: &[&str] = &["com.delphix:extensible_dataset", "com.delphix:bookmarks"];
 const REDACTION: &[&str] = &[
     "com.datto:bookmark_v2",
     "com.delphix:extensible_dataset",
@@ -35,51 +32,82 @@ struct Policy {
 /// compatibility; reached structures still pass their ordinary parser gates.
 fn policy(name: &str) -> Option<Policy> {
     let (for_write, mos, read_supported, dependencies): (_, _, _, &[&str]) = match name {
-        "org.illumos:lz4_compress" | "com.delphix:extensible_dataset" =>
-            (false, false, true, &[]),
+        "org.illumos:lz4_compress" | "com.delphix:extensible_dataset" => (false, false, true, &[]),
         "com.delphix:embedded_data" => (false, true, true, &[]),
-        "org.open-zfs:large_blocks" | "org.zfsonlinux:large_dnode"
-        | "org.illumos:sha512" | "org.freebsd:zstd_compress" =>
-            (false, false, true, EXTENSIBLE),
-        "com.delphix:hole_birth" =>
-            (false, true, true, &["com.delphix:enabled_txg"]),
-        "org.illumos:skein" | "org.illumos:edonr" | "org.openzfs:blake3"
-        | "com.delphix:redacted_datasets" | "org.zfsonlinux:longname" =>
-            (false, false, false, EXTENSIBLE),
-        "com.datto:encryption" => (false, false, false, &[
-            "com.delphix:extensible_dataset", "com.datto:bookmark_v2",
-        ]),
+        "org.open-zfs:large_blocks"
+        | "org.zfsonlinux:large_dnode"
+        | "org.illumos:sha512"
+        | "org.freebsd:zstd_compress" => (false, false, true, EXTENSIBLE),
+        "com.delphix:hole_birth" => (false, true, true, &["com.delphix:enabled_txg"]),
+        "org.illumos:skein"
+        | "org.illumos:edonr"
+        | "org.openzfs:blake3"
+        | "com.delphix:redacted_datasets"
+        | "org.zfsonlinux:longname" => (false, false, false, EXTENSIBLE),
+        "com.datto:encryption" => (
+            false,
+            false,
+            false,
+            &["com.delphix:extensible_dataset", "com.datto:bookmark_v2"],
+        ),
         "com.datto:bookmark_v2" => (false, false, false, BOOKMARK_V2),
-        "com.delphix:redaction_bookmarks" | "com.delphix:bookmark_written" =>
-            (false, false, false, REDACTION),
-        "com.delphix:redaction_list_spill" =>
-            (false, false, false, &["com.delphix:redaction_bookmarks"]),
-        "com.joyent:multi_vdev_crash_dump" | "com.delphix:head_errlog" =>
-            (false, false, false, &[]),
-        "com.delphix:device_removal" | "org.openzfs:draid"
-        | "com.klarasystems:vdev_zaps_v2" | "org.openzfs:raidz_expansion" =>
-            (false, true, false, &[]),
-        "com.delphix:async_destroy" | "com.delphix:empty_bpobj"
-        | "com.delphix:spacemap_histogram" | "com.delphix:enabled_txg"
-        | "com.delphix:zpool_checkpoint" | "com.delphix:spacemap_v2"
-        | "org.zfsonlinux:allocation_classes" | "com.datto:resilver_defer"
-        | "org.openzfs:device_rebuild" | "com.fudosecurity:block_cloning"
+        "com.delphix:redaction_bookmarks" | "com.delphix:bookmark_written" => {
+            (false, false, false, REDACTION)
+        }
+        "com.delphix:redaction_list_spill" => {
+            (false, false, false, &["com.delphix:redaction_bookmarks"])
+        }
+        "com.joyent:multi_vdev_crash_dump" | "com.delphix:head_errlog" => {
+            (false, false, false, &[])
+        }
+        "com.delphix:device_removal"
+        | "org.openzfs:draid"
+        | "com.klarasystems:vdev_zaps_v2"
+        | "org.openzfs:raidz_expansion" => (false, true, false, &[]),
+        "com.delphix:async_destroy"
+        | "com.delphix:empty_bpobj"
+        | "com.delphix:spacemap_histogram"
+        | "com.delphix:enabled_txg"
+        | "com.delphix:zpool_checkpoint"
+        | "com.delphix:spacemap_v2"
+        | "org.zfsonlinux:allocation_classes"
+        | "com.datto:resilver_defer"
+        | "org.openzfs:device_rebuild"
+        | "com.fudosecurity:block_cloning"
         | "com.klarasystems:fast_dedup" => (true, false, false, &[]),
-        "com.delphix:bookmarks" | "com.joyent:filesystem_limits"
-        | "com.delphix:livelist" | "org.zfsonlinux:userobj_accounting"
-        | "org.zfsonlinux:project_quota" | "org.openzfs:zilsaxattr" =>
-            (true, false, false, EXTENSIBLE),
-        "com.delphix:log_spacemap" =>
-            (true, false, false, &["com.delphix:spacemap_v2"]),
-        "com.delphix:obsolete_counts" => (true, false, false, &[
-            "com.delphix:extensible_dataset", "com.delphix:device_removal",
-        ]),
-        "com.klarasystems:large_microzap" => (true, false, false, &[
-            "com.delphix:extensible_dataset", "org.open-zfs:large_blocks",
-        ]),
+        "com.delphix:bookmarks"
+        | "com.joyent:filesystem_limits"
+        | "com.delphix:livelist"
+        | "org.zfsonlinux:userobj_accounting"
+        | "org.zfsonlinux:project_quota"
+        | "org.openzfs:zilsaxattr" => (true, false, false, EXTENSIBLE),
+        "com.delphix:log_spacemap" => (true, false, false, &["com.delphix:spacemap_v2"]),
+        "com.delphix:obsolete_counts" => (
+            true,
+            false,
+            false,
+            &[
+                "com.delphix:extensible_dataset",
+                "com.delphix:device_removal",
+            ],
+        ),
+        "com.klarasystems:large_microzap" => (
+            true,
+            false,
+            false,
+            &[
+                "com.delphix:extensible_dataset",
+                "org.open-zfs:large_blocks",
+            ],
+        ),
         _ => return None,
     };
-    Some(Policy { for_write, mos, read_supported, dependencies })
+    Some(Policy {
+        for_write,
+        mos,
+        read_supported,
+        dependencies,
+    })
 }
 
 /// Bootstrap and full MOS admission share one implementation registry. Retain
@@ -89,7 +117,8 @@ fn policy(name: &str) -> Option<Policy> {
 pub(in super::super) fn supported_label_feature(name: &str, value: &Value) -> bool {
     matches!(value, Value::Boolean(true))
         && policy(name).is_some_and(|known| {
-            !known.for_write && known.read_supported
+            !known.for_write
+                && known.read_supported
                 && (known.mos || name == "org.illumos:lz4_compress")
         })
 }
@@ -102,7 +131,8 @@ fn guid(bytes: &[u8]) -> Result<&str> {
     for &byte in bytes {
         if byte == b':' && !colon {
             colon = true;
-        } else if !(byte.is_ascii_lowercase() || byte.is_ascii_digit()
+        } else if !(byte.is_ascii_lowercase()
+            || byte.is_ascii_digit()
             || (colon && byte == b'_')
             || (!colon && matches!(byte, b'.' | b'-')))
         {
@@ -134,12 +164,16 @@ fn admit(cx: &Cx, read: &[Entry], write: &[Entry], labels: &[String]) -> Result<
             let name = guid(&row.name)?;
             let count = scalar(row)?;
             if all.insert(name, (count, for_write)).is_some() {
-                return Err(corrupt("ZFS feature GUID repeats within or across catalogs"));
+                return Err(corrupt(
+                    "ZFS feature GUID repeats within or across catalogs",
+                ));
             }
             if let Some(known) = policy(name)
                 && known.for_write != for_write
             {
-                return Err(corrupt(format!("ZFS feature {name} is in the wrong native catalog")));
+                return Err(corrupt(format!(
+                    "ZFS feature {name} is in the wrong native catalog"
+                )));
             }
         }
     }
@@ -150,23 +184,33 @@ fn admit(cx: &Cx, read: &[Entry], write: &[Entry], labels: &[String]) -> Result<
         if let Some(known) = policy(name) {
             for dependency in known.dependencies {
                 if !all.contains_key(dependency) {
-                    return Err(corrupt(format!("ZFS feature {name} lacks dependency {dependency}")));
+                    return Err(corrupt(format!(
+                        "ZFS feature {name} lacks dependency {dependency}"
+                    )));
                 }
             }
             if count != 0 && known.mos && !labels.iter().any(|label| label == name) {
-                return Err(corrupt(format!("active MOS feature {name} is absent from labels")));
+                return Err(corrupt(format!(
+                    "active MOS feature {name} is absent from labels"
+                )));
             }
         }
         if count != 0 && !for_write && !policy(name).is_some_and(|known| known.read_supported) {
-            return Err(unsupported(format!("active ZFS read feature {name} is not implemented")));
+            return Err(unsupported(format!(
+                "active ZFS read feature {name} is not implemented"
+            )));
         }
     }
     let mut seen = std::collections::BTreeSet::new();
     for label in labels {
         checkpoint(cx)?;
         guid(label.as_bytes())?;
-        if !seen.insert(label) || !matches!(all.get(label.as_str()), Some((count, false)) if *count != 0) {
-            return Err(corrupt(format!("label feature {label} has no unique active MOS read entry")));
+        if !seen.insert(label)
+            || !matches!(all.get(label.as_str()), Some((count, false)) if *count != 0)
+        {
+            return Err(corrupt(format!(
+                "label feature {label} has no unique active MOS read entry"
+            )));
         }
     }
     checkpoint(cx)
@@ -183,12 +227,20 @@ impl Objects {
         }
         let directory = self.zap_values(cx, 1)?;
         let mut ids = Vec::with_capacity(3);
-        for name in [b"features_for_read".as_slice(), b"features_for_write", b"feature_descriptions"] {
-            let row = directory.iter().find(|row| row.name == name)
+        for name in [
+            b"features_for_read".as_slice(),
+            b"features_for_write",
+            b"feature_descriptions",
+        ] {
+            let row = directory
+                .iter()
+                .find(|row| row.name == name)
                 .ok_or_else(|| corrupt("MOS is missing a required native feature catalog"))?;
             let id = scalar(row)?;
             if id <= 1 || ids.contains(&id) || self.object(cx, id)?.object_type() != 196 {
-                return Err(corrupt("MOS feature catalog has an invalid or aliased object identity"));
+                return Err(corrupt(
+                    "MOS feature catalog has an invalid or aliased object identity",
+                ));
             }
             ids.push(id);
         }

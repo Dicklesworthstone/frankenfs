@@ -112,7 +112,9 @@ impl DiagnosticVolume {
             let geometry = FatGeometry::parse(&backup, self.volume.geometry.volume_bytes())
                 .map_err(|error| corrupt(offset, error.to_string()))?;
             if geometry != self.volume.geometry || backup[21] != self.boot[21] {
-                return Err(corrupt(offset, "FAT primary and backup boot geometry disagree").into());
+                return Err(
+                    corrupt(offset, "FAT primary and backup boot geometry disagree").into(),
+                );
             }
         }
         Ok(())
@@ -158,8 +160,16 @@ impl DiagnosticVolume {
             volume.read_exact(cx, offset, &mut boot)?;
             for (bits, kind, message) in [
                 (1, "native_boot_dirty", "native boot dirty flag is set"),
-                (2, "native_surface_test", "native surface-test request is set"),
-                (0xFC, "native_boot_flags", "unknown native boot state flags are set"),
+                (
+                    2,
+                    "native_surface_test",
+                    "native surface-test request is set",
+                ),
+                (
+                    0xFC,
+                    "native_boot_flags",
+                    "unknown native boot state flags are set",
+                ),
             ] {
                 if boot[state_at] & bits != 0 {
                     issues.push(state_issue(kind, offset + state_at as u64, message));
@@ -170,8 +180,10 @@ impl DiagnosticVolume {
         let expected_zero = (mask & !0xFF) | u32::from(self.boot[21]);
         for copy in volume.copies() {
             checkpoint(cx)?;
-            let offset = geometry.entry_offset(copy, 2)
-                .map_err(|error| corrupt(0, error.to_string()))? - 2 * width as u64;
+            let offset = geometry
+                .entry_offset(copy, 2)
+                .map_err(|error| corrupt(0, error.to_string()))?
+                - 2 * width as u64;
             let mut header = [0; 8];
             volume.read_exact(cx, offset, &mut header[..2 * width])?;
             let raw = |at: usize| {
@@ -180,22 +192,34 @@ impl DiagnosticVolume {
                 u32::from_le_bytes(bytes) & mask
             };
             if raw(0) != expected_zero {
-                issues.push(state_issue("native_reserved_zero", offset,
-                    &format!("reserved FAT entry zero is invalid in copy {copy}")));
+                issues.push(state_issue(
+                    "native_reserved_zero",
+                    offset,
+                    &format!("reserved FAT entry zero is invalid in copy {copy}"),
+                ));
             }
             let value = raw(width);
             let required = mask & !(clean | io_ok);
             if value & required != required {
-                issues.push(state_issue("native_reserved_fat", offset + width as u64,
-                    &format!("reserved FAT entry one is invalid in copy {copy}")));
+                issues.push(state_issue(
+                    "native_reserved_fat",
+                    offset + width as u64,
+                    &format!("reserved FAT entry one is invalid in copy {copy}"),
+                ));
             }
             if value & clean == 0 {
-                issues.push(state_issue("native_fat_dirty", offset + width as u64,
-                    &format!("FAT copy {copy} records an unclean shutdown")));
+                issues.push(state_issue(
+                    "native_fat_dirty",
+                    offset + width as u64,
+                    &format!("FAT copy {copy} records an unclean shutdown"),
+                ));
             }
             if value & io_ok == 0 {
-                issues.push(state_issue("native_io_error", offset + width as u64,
-                    &format!("FAT copy {copy} records a hard I/O error")));
+                issues.push(state_issue(
+                    "native_io_error",
+                    offset + width as u64,
+                    &format!("FAT copy {copy} records a hard I/O error"),
+                ));
             }
         }
         Ok(issues)
@@ -219,10 +243,15 @@ pub fn check(cx: &Cx, args: &ImageArgs) -> Result<FatCheckReport> {
     checkpoint(cx)?;
     reject_sidecar(args)?;
     let (file, stamp) = open_read_only(&args.image)?;
-    let diagnostic = DiagnosticVolume::from_device(cx, Box::new(ReadOnlyImage {
-        file: file.try_clone()?,
-        len: stamp.length,
-    }), args).context("opening FAT image for non-mutating diagnosis")?;
+    let diagnostic = DiagnosticVolume::from_device(
+        cx,
+        Box::new(ReadOnlyImage {
+            file: file.try_clone()?,
+            len: stamp.length,
+        }),
+        args,
+    )
+    .context("opening FAT image for non-mutating diagnosis")?;
     let report = diagnostic.report(cx)?;
     stable(&file, &args.image, stamp)?;
     checkpoint(cx)?;

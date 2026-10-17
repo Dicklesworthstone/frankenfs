@@ -352,8 +352,7 @@ impl Objects {
         name: &[u8],
     ) -> Result<SnapshotRoot> {
         valid_name(name)?;
-        self
-            .snapshot_roots(cx, components)?
+        self.snapshot_roots(cx, components)?
             .into_iter()
             .find(|row| row.info.name == name)
             .ok_or_else(|| FfsError::NotFound("ZFS named snapshot".into()))

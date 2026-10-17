@@ -976,7 +976,9 @@ impl ByteDevice for SidecarImageDevice {
         let mut state = self.lock(cx)?;
         if self.read_only {
             if !matches!(state.phase, Phase::Clean) {
-                return Err(corrupt("read-only protection has an unexpected write epoch"));
+                return Err(corrupt(
+                    "read-only protection has an unexpected write epoch",
+                ));
             }
             self.check_image_len()?;
             return checkpoint(cx);

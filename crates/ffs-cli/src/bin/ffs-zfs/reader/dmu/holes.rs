@@ -16,8 +16,10 @@ impl Objects {
         level: u8,
         size: usize,
     ) -> Result<()> {
-        if !bp.hole() || !(512..=MAX_BLOCK_BYTES).contains(&size)
-            || !size.is_multiple_of(512) || level > 31
+        if !bp.hole()
+            || !(512..=MAX_BLOCK_BYTES).contains(&size)
+            || !size.is_multiple_of(512)
+            || level > 31
         {
             return Err(corrupt("invalid DMU hole or context geometry"));
         }
@@ -26,27 +28,39 @@ impl Objects {
         if bp == &zero {
             return Ok(()); // Legacy holes carry no size/type/birth information.
         }
-        if self.config.version != 5000 || !self.config.read_features.iter()
-            .any(|name| name == "com.delphix:hole_birth")
+        if self.config.version != 5000
+            || !self
+                .config
+                .read_features
+                .iter()
+                .any(|name| name == "com.delphix:hole_birth")
         {
-            return Err(unsupported("nonzero DMU hole requires native hole_birth admission"));
+            return Err(unsupported(
+                "nonzero DMU hole requires native hole_birth admission",
+            ));
         }
-        if bp.birth() == 0 || bp.object_type() != kind || bp.level() != level
+        if bp.birth() == 0
+            || bp.object_type() != kind
+            || bp.level() != level
             || (level != 0 && bp.logical_bytes() != size)
         {
-            return Err(corrupt("native hole birth, type or indirect geometry disagrees"));
+            return Err(corrupt(
+                "native hole birth, type or indirect geometry disagrees",
+            ));
         }
         // Compare complete numeric pointers to check every reserved/DVA word
         // without exposing their private representation. Data-hole LSIZE is
         // retained metadata; current dnode geometry supplies the logical span.
         let property = (bp.logical_bytes() as u64 / 512 - 1)
-            | (u64::from(kind) << 48) | (u64::from(level) << 56);
+            | (u64::from(kind) << 48)
+            | (u64::from(level) << 56);
         raw[48..56].copy_from_slice(&property.to_le_bytes());
         raw[80..88].copy_from_slice(&bp.birth().to_le_bytes());
-        let canonical = BlockPointer::parse(&raw, Endian::Little)
-            .map_err(|error| parse(&error))?;
+        let canonical = BlockPointer::parse(&raw, Endian::Little).map_err(|error| parse(&error))?;
         if bp != &canonical {
-            return Err(corrupt("hole retains noncanonical allocation, transform or checksum fields"));
+            return Err(corrupt(
+                "hole retains noncanonical allocation, transform or checksum fields",
+            ));
         }
         Ok(())
     }

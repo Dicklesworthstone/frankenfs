@@ -1,11 +1,19 @@
 //! Native TX_TRUNCATE range semantics over constructed logs, not live replay.
-use super::*;
 use super::super::indirect::{Plan, edits};
+use super::*;
 
 fn free_record(offset: u64, length: u64, sequence: u64, order: Endian) -> Record {
     let mut raw = record(10, 43, sequence, offset, &[], order);
     put(&mut raw, 48, length, order);
-    Record { kind: 10, txg: 43, sequence, record_bytes: raw.len(), pending: true, order, raw }
+    Record {
+        kind: 10,
+        txg: 43,
+        sequence,
+        record_bytes: raw.len(),
+        pending: true,
+        order,
+        raw,
+    }
 }
 
 #[test]
@@ -22,14 +30,19 @@ fn native_range_free_keeps_the_tail_and_extends_eof_in_both_byte_orders() {
             let mut expected = b"abcdefghijklmnop".to_vec();
             expected.resize(size as usize, 0);
             expected[offset as usize..(offset + length) as usize].fill(0);
-            let actual = super::super::recovery::read(&cx, 16, 0, size as usize, &changes, |at, count| {
-                Ok(b"abcdefghijklmnop"[at as usize..at as usize + count].to_vec())
-            }).unwrap();
+            let actual =
+                super::super::recovery::read(&cx, 16, 0, size as usize, &changes, |at, count| {
+                    Ok(b"abcdefghijklmnop"[at as usize..at as usize + count].to_vec())
+                })
+                .unwrap();
             assert_eq!(actual, expected, "offset={offset} length={length}");
             assert!(edits(&cx, &records, &data, 99).unwrap().is_empty());
         }
         let row = free_record(3, 0, 1, order);
-        assert!(matches!(edit(&row).unwrap(), Edit::Truncate { size: 3, .. }));
+        assert!(matches!(
+            edit(&row).unwrap(),
+            Edit::Truncate { size: 3, .. }
+        ));
     }
 }
 
@@ -47,7 +60,10 @@ fn malformed_range_free_records_are_rejected_before_any_payload_read() {
                 4 => put(&mut row.raw, 40, i64::MAX as u64, order),
                 _ => put(&mut row.raw, 48, u64::MAX, order),
             }
-            assert!(matches!(Plan::new(&cx, &[row]), Err(FfsError::Corruption { .. })), "case {case}");
+            assert!(
+                matches!(Plan::new(&cx, &[row]), Err(FfsError::Corruption { .. })),
+                "case {case}"
+            );
         }
         let records = [free_record(i64::MAX as u64 - 1, 1, 1, order)];
         Plan::new(&cx, &records).unwrap();
@@ -68,11 +84,30 @@ fn mixed_range_free_write_and_truncate_sequences_match_materialized_files() {
         for _ in 0..4 {
             let change = match digits % 6 {
                 0 => Edit::Truncate { object: 7, size: 3 },
-                1 => Edit::Truncate { object: 7, size: 24 },
-                2 => Edit::Write { object: 7, offset: 7, data: b"XY\0Z" },
-                3 => Edit::Write { object: 7, offset: 1, data: b"changed" },
-                4 => Edit::Free { object: 7, offset: 2, end: 7 },
-                _ => Edit::Free { object: 7, offset: 20, end: 25 },
+                1 => Edit::Truncate {
+                    object: 7,
+                    size: 24,
+                },
+                2 => Edit::Write {
+                    object: 7,
+                    offset: 7,
+                    data: b"XY\0Z",
+                },
+                3 => Edit::Write {
+                    object: 7,
+                    offset: 1,
+                    data: b"changed",
+                },
+                4 => Edit::Free {
+                    object: 7,
+                    offset: 2,
+                    end: 7,
+                },
+                _ => Edit::Free {
+                    object: 7,
+                    offset: 20,
+                    end: 25,
+                },
             };
             digits /= 6;
             match &change {
@@ -88,16 +123,28 @@ fn mixed_range_free_write_and_truncate_sequences_match_materialized_files() {
             }
             changes.push(change);
         }
-        let size = changes.iter().fold(16, |size, change| change.size_after(size));
+        let size = changes
+            .iter()
+            .fold(16, |size, change| change.size_after(size));
         assert_eq!(size, expected.len() as u64);
         for start in 0..=28 {
             for count in [0, 1, 5, 32] {
                 let length = expected.len().saturating_sub(start).min(count);
-                let actual = super::super::recovery::read(&cx, 16, start as u64, length, &changes, |at, count| {
-                    Ok(original[at as usize..at as usize + count].to_vec())
-                }).unwrap();
+                let actual = super::super::recovery::read(
+                    &cx,
+                    16,
+                    start as u64,
+                    length,
+                    &changes,
+                    |at, count| Ok(original[at as usize..at as usize + count].to_vec()),
+                )
+                .unwrap();
                 let from = start.min(expected.len());
-                assert_eq!(actual, expected[from..from + length], "pattern={pattern}, start={start}, count={count}");
+                assert_eq!(
+                    actual,
+                    expected[from..from + length],
+                    "pattern={pattern}, start={start}, count={count}"
+                );
             }
         }
     }
@@ -110,40 +157,62 @@ struct LogOverlay {
     failure: u8,
 }
 impl ByteDevice for LogOverlay {
-    fn len_bytes(&self) -> u64 { self.original.device.len_bytes() }
+    fn len_bytes(&self) -> u64 {
+        self.original.device.len_bytes()
+    }
     fn read_exact_at(&self, cx: &Cx, at: ByteOffset, out: &mut [u8]) -> Result<()> {
         checkpoint(cx)?;
         self.reads.lock().unwrap().push((at.0, out.len()));
         if at.0 == BASE + DATA_OFFSET + FIRST {
-            if out.len() != self.log.len() { return Err(corrupt("invalid test log read size")); }
+            if out.len() != self.log.len() {
+                return Err(corrupt("invalid test log read size"));
+            }
             out.copy_from_slice(&self.log);
             return Ok(());
         }
         if at.0 == BASE + DATA_OFFSET + 0x4c400 {
             match self.failure {
-                1 => { out.fill(0); return Ok(()); }
+                1 => {
+                    out.fill(0);
+                    return Ok(());
+                }
                 2 => return Err(FfsError::Cancelled),
                 _ => {}
             }
         }
         self.original.device.read_exact_at(cx, at, out)
     }
-    fn write_all_at(&self, _: &Cx, _: ByteOffset, _: &[u8]) -> Result<()> { panic!("range-free recovery wrote an image") }
-    fn sync(&self, _: &Cx) -> Result<()> { panic!("range-free recovery flushed an image") }
+    fn write_all_at(&self, _: &Cx, _: ByteOffset, _: &[u8]) -> Result<()> {
+        panic!("range-free recovery wrote an image")
+    }
+    fn sync(&self, _: &Cx) -> Result<()> {
+        panic!("range-free recovery flushed an image")
+    }
 }
 fn graph(offset: u64, length: u64, failure: u8) -> (Objects, Reads) {
     let (mut objects, _) = recovery_graph(false);
     let order = Endian::Little;
     let first = pointer(FIRST, 1, 9, 4096, order, order);
     let next = pointer(SECOND, 2, 9, 4096, order, order);
-    let log = block(&first, order, &next, &[
-        free_record(offset, length, 1, order).raw,
-        record(9, 43, 2, 4, b"!", order),
-    ]);
+    let log = block(
+        &first,
+        order,
+        &next,
+        &[
+            free_record(offset, length, 1, order).raw,
+            record(9, 43, 2, 4, b"!", order),
+        ],
+    );
     let reads = Arc::default();
-    let device = LogOverlay { original: objects.pool.leaves()[0].clone(), log,
-        reads: Arc::clone(&reads), failure };
-    objects.pool = Leaf::from_device(&Cx::for_testing(), Box::new(device), BASE, LENGTH).unwrap().into();
+    let device = LogOverlay {
+        original: objects.pool.leaves()[0].clone(),
+        log,
+        reads: Arc::clone(&reads),
+        failure,
+    };
+    objects.pool = Leaf::from_device(&Cx::for_testing(), Box::new(device), BASE, LENGTH)
+        .unwrap()
+        .into();
     (objects, reads)
 }
 
@@ -152,13 +221,25 @@ fn native_mos_recovery_discards_freed_damage_but_preserves_required_failures_and
     let cx = Cx::for_testing();
     for failure in 0..=2 {
         let (mut objects, reads) = graph(0, 20, failure);
-        assert!(objects.read_with_intent_log(&cx, &[], b"/file", 0, 32, false).is_err());
-        let recovered = objects.read_with_intent_log(&cx, &[], b"/file", 0, 32, true).unwrap();
+        assert!(
+            objects
+                .read_with_intent_log(&cx, &[], b"/file", 0, 32, false)
+                .is_err()
+        );
+        let recovered = objects
+            .read_with_intent_log(&cx, &[], b"/file", 0, 32, true)
+            .unwrap();
         let mut expected = vec![0; 20];
         expected[4] = b'!';
         assert_eq!(recovered.bytes, expected);
         assert_eq!((recovered.file_size, recovered.applied_records), (20, 2));
-        assert!(!reads.lock().unwrap().iter().any(|(at, _)| *at == BASE + DATA_OFFSET + 0x4c400));
+        assert!(
+            !reads
+                .lock()
+                .unwrap()
+                .iter()
+                .any(|(at, _)| *at == BASE + DATA_OFFSET + 0x4c400)
+        );
         let mut normal = objects.zpl(&cx, &[]).unwrap();
         let object = normal.resolve(&cx, b"/file").unwrap();
         assert_eq!(normal.stat(&cx, object).unwrap().0.size, 16);
@@ -182,17 +263,48 @@ fn native_mos_recovery_discards_freed_damage_but_preserves_required_failures_and
 fn huge_freed_ranges_have_request_sized_work_and_do_not_resurrect_retired_data() {
     let cx = Cx::for_testing();
     let end = (1_u64 << 60) + 19;
-    let changes = [Edit::Free { object: 7, offset: 0, end },
+    let changes = [
+        Edit::Free {
+            object: 7,
+            offset: 0,
+            end,
+        },
         Edit::Truncate { object: 7, size: 3 },
-        Edit::Free { object: 7, offset: end - 1, end }];
-    assert_eq!(changes.iter().fold(16, |size, edit| edit.size_after(size)), end);
+        Edit::Free {
+            object: 7,
+            offset: end - 1,
+            end,
+        },
+    ];
+    assert_eq!(
+        changes.iter().fold(16, |size, edit| edit.size_after(size)),
+        end
+    );
     for start in [0, 8, end - 9] {
-        assert_eq!(super::super::recovery::read(&cx, 16, start, 9, &changes,
-            |_, _| panic!("freed bytes do not require base I/O")).unwrap(), [0; 9]);
+        assert_eq!(
+            super::super::recovery::read(&cx, 16, start, 9, &changes, |_, _| panic!(
+                "freed bytes do not require base I/O"
+            ))
+            .unwrap(),
+            [0; 9]
+        );
     }
-    let changes: Vec<_> = (0..9).map(|_| Edit::Free {
-        object: 7, offset: 0, end: MAX_READ_BYTES as u64,
-    }).collect();
-    assert!(matches!(super::super::recovery::read(&cx, MAX_READ_BYTES as u64, 0, MAX_READ_BYTES,
-        &changes, |_, _| panic!("work budget must be checked first")), Err(FfsError::UnsupportedFeature(_))));
+    let changes: Vec<_> = (0..9)
+        .map(|_| Edit::Free {
+            object: 7,
+            offset: 0,
+            end: MAX_READ_BYTES as u64,
+        })
+        .collect();
+    assert!(matches!(
+        super::super::recovery::read(
+            &cx,
+            MAX_READ_BYTES as u64,
+            0,
+            MAX_READ_BYTES,
+            &changes,
+            |_, _| panic!("work budget must be checked first")
+        ),
+        Err(FfsError::UnsupportedFeature(_))
+    ));
 }

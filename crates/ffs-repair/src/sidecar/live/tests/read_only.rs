@@ -42,7 +42,15 @@ fn read_only_descriptors_have_no_write_capability() {
     // Permissions alone are not proof when tests run as root. These attempts
     // must fail because BOTH descriptors were opened O_RDONLY.
     assert!(device.image.write_all_at(&[0], 0).is_err());
-    assert!(device.state.lock().archive.file.write_all_at(&[0], 0).is_err());
+    assert!(
+        device
+            .state
+            .lock()
+            .archive
+            .file
+            .write_all_at(&[0], 0)
+            .is_err()
+    );
     let mut bytes = [0; 90];
     device
         .read_exact_at(&Cx::for_testing(), ByteOffset(500), &mut bytes)
@@ -82,7 +90,9 @@ fn read_only_reconstructs_multiple_groups_and_partial_tail_without_writeback() {
     assert_ne!(image.bytes, fixture.original);
     for _ in 0..2 {
         let mut bytes = vec![0; fixture.original.len()];
-        device.read_exact_at(&cx, ByteOffset(0), &mut bytes).unwrap();
+        device
+            .read_exact_at(&cx, ByteOffset(0), &mut bytes)
+            .unwrap();
         assert_eq!(bytes, fixture.original);
         device.sync(&cx).unwrap();
         assert_eq!(saved(&fixture.image), image);
@@ -168,7 +178,9 @@ fn read_only_keeps_admission_generation_and_pending_epoch_refusals() {
 
     let fixture = Fixture::new();
     let device = fixture.open();
-    device.write_all_at(&cx, ByteOffset(0), &[0x41; 10]).unwrap();
+    device
+        .write_all_at(&cx, ByteOffset(0), &[0x41; 10])
+        .unwrap();
     drop(device);
     let image = saved(&fixture.image);
     let archive = saved(&fixture.sidecar);

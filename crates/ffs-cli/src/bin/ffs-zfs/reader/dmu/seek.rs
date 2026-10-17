@@ -368,7 +368,19 @@ mod tests {
                 let (mut objects, reads) = view(BTreeMap::new(), None);
                 for eof in [0_u64, 1, 511, 512, 513, 1027, 1536, 4099] {
                     for start in [
-                        0, 1, 510, 511, 512, 513, 1023, 1024, 1026, 1536, 4098, eof, u64::MAX,
+                        0,
+                        1,
+                        510,
+                        511,
+                        512,
+                        513,
+                        1023,
+                        1024,
+                        1026,
+                        1536,
+                        4098,
+                        eof,
+                        u64::MAX,
                     ] {
                         for want_data in [false, true] {
                             // Independent bytewise oracle, including allocated
@@ -418,7 +430,9 @@ mod tests {
                 None,
             );
             assert_eq!(
-                objects.seek_data_hole(&cx, &object, 32768, 1, true).unwrap(),
+                objects
+                    .seek_data_hole(&cx, &object, 32768, 1, true)
+                    .unwrap(),
                 37 * 512
             );
             assert_eq!(
@@ -428,7 +442,9 @@ mod tests {
                 38 * 512
             );
             assert_eq!(
-                objects.seek_data_hole(&cx, &object, 32768, 1, false).unwrap(),
+                objects
+                    .seek_data_hole(&cx, &object, 32768, 1, false)
+                    .unwrap(),
                 1
             );
             assert_no_data(objects.seek_data_hole(&cx, &object, 32768, 38 * 512, true));
@@ -485,15 +501,21 @@ mod tests {
         };
         let (mut objects, reads) = view(BTreeMap::new(), None);
         assert_eq!(
-            objects.seek_data_hole(&cx, &object, 1535, 1534, false).unwrap(),
+            objects
+                .seek_data_hole(&cx, &object, 1535, 1534, false)
+                .unwrap(),
             1535
         );
         assert_eq!(
-            objects.seek_data_hole(&cx, &object, 1535, 1534, true).unwrap(),
+            objects
+                .seek_data_hole(&cx, &object, 1535, 1534, true)
+                .unwrap(),
             1534
         );
         assert_eq!(
-            objects.seek_data_hole(&cx, &object, 1 << 40, 1, false).unwrap(),
+            objects
+                .seek_data_hole(&cx, &object, 1 << 40, 1, false)
+                .unwrap(),
             1536
         );
         assert_eq!(
@@ -522,7 +544,15 @@ mod tests {
                     1,
                     0,
                     0,
-                    &[pointer(&vec![0; bytes], DATA, kind, level, birth, order, order)],
+                    &[pointer(
+                        &vec![0; bytes],
+                        DATA,
+                        kind,
+                        level,
+                        birth,
+                        order,
+                        order,
+                    )],
                     order,
                 ),
                 ceiling: 30,
@@ -575,7 +605,10 @@ mod tests {
                 .config
                 .read_features
                 .push("com.delphix:embedded_data".into());
-            assert_eq!(objects.seek_data_hole(&cx, &object, 511, 7, true).unwrap(), 7);
+            assert_eq!(
+                objects.seek_data_hole(&cx, &object, 511, 7, true).unwrap(),
+                7
+            );
             assert_eq!(
                 objects.seek_data_hole(&cx, &object, 511, 7, false).unwrap(),
                 511
@@ -625,15 +658,13 @@ mod tests {
         let cx = Cx::for_testing();
         for order in [Endian::Little, Endian::Big] {
             let mut indirect = vec![0; 4096];
-            indirect[..128]
-                .copy_from_slice(&pointer(&[0; 512], DATA, 19, 0, 26, order, order));
+            indirect[..128].copy_from_slice(&pointer(&[0; 512], DATA, 19, 0, 26, order, order));
             let root = pointer(&indirect, INDIRECT, 19, 1, 25, order, order);
             let mut object = Object {
                 node: node(512, 2, 12, 31, &[root], order),
                 ceiling: 30,
             };
-            let (mut objects, reads) =
-                view(BTreeMap::from([(BASE + INDIRECT, indirect)]), None);
+            let (mut objects, reads) = view(BTreeMap::from([(BASE + INDIRECT, indirect)]), None);
             for want_data in [true, false] {
                 // This child fits the selected TXG and dnode ceiling, but is
                 // newer than its checksum-valid containing indirect block.
@@ -685,7 +716,9 @@ mod tests {
         assert!(reads.lock().unwrap().is_empty());
         let mut exact = search(33, 4096);
         assert_eq!(
-            objects.seek_subtree(&cx, &node, subtree(), &mut exact).unwrap(),
+            objects
+                .seek_subtree(&cx, &node, subtree(), &mut exact)
+                .unwrap(),
             None
         );
         assert_eq!((exact.budget.pointers, exact.budget.metadata_bytes), (0, 0));

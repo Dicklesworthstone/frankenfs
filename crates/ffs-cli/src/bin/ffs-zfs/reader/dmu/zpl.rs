@@ -613,7 +613,9 @@ impl Zpl {
         }
         if !private_xattr && let Some(ov) = &self.zil_overlay {
             if ov.removed_objects.contains(&number) {
-                return Err(FfsError::NotFound(format!("ZFS object {number} removed in ZIL")));
+                return Err(FfsError::NotFound(format!(
+                    "ZFS object {number} removed in ZIL"
+                )));
             }
             if let Some(meta) = ov.objects.get(&number).cloned() {
                 let object = self.objects.load(cx, number).unwrap_or_else(|_| Object {
@@ -713,11 +715,9 @@ impl Zpl {
         if parent.kind != Kind::Directory {
             return Err(FfsError::NotDirectory);
         }
-        let entries = if self
-            .zil_overlay
-            .as_ref()
-            .is_some_and(|ov| ov.objects.contains_key(&number) && self.objects.load(cx, number).is_err())
-        {
+        let entries = if self.zil_overlay.as_ref().is_some_and(|ov| {
+            ov.objects.contains_key(&number) && self.objects.load(cx, number).is_err()
+        }) {
             Vec::new()
         } else {
             self.objects.zap(cx, number)?
@@ -888,7 +888,14 @@ impl Zpl {
         let bytes = if let Some(bytes) = metadata.inline_symlink {
             bytes
         } else {
-            self.contents(cx, number, &object, metadata.size, 0, metadata.size as usize)?
+            self.contents(
+                cx,
+                number,
+                &object,
+                metadata.size,
+                0,
+                metadata.size as usize,
+            )?
         };
         if bytes.contains(&0) {
             return Err(corrupt("ZPL symlink target contains NUL"));

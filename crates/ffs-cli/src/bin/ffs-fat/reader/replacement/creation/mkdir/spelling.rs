@@ -5,13 +5,12 @@
 //! possible and reserve complete new storage before retiring any old record.
 //! Intermediate native states are dirty, not crash-atomic rename transactions.
 
-use super::super::names::NativeName;
 use super::super::super::super::{Directory, Entry, FatVolume};
+use super::super::names::NativeName;
 use super::{
-    Extension, Namespace, Slot, checkpoint, delete_entry_slots, deleted_slot,
-    find_entry_slots, parent, patch_slot, read_slot, rename_chain, reserve_clusters,
-    reserve_slots, retired_slot, set_dirty, set_hints, validate_boot_state,
-    validate_entry_slots,
+    Extension, Namespace, Slot, checkpoint, delete_entry_slots, deleted_slot, find_entry_slots,
+    parent, patch_slot, read_slot, rename_chain, reserve_clusters, reserve_slots, retired_slot,
+    set_dirty, set_hints, validate_boot_state, validate_entry_slots,
 };
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
@@ -35,8 +34,11 @@ fn clean_state(cx: &Cx, volume: &FatVolume) -> Result<()> {
     }
     let width = volume.geometry.kind().entry_bytes() as usize;
     for copy in volume.copies() {
-        let at = volume.geometry.entry_offset(copy, 2)
-            .map_err(|error| anyhow::anyhow!("{error}"))? - width as u64;
+        let at = volume
+            .geometry
+            .entry_offset(copy, 2)
+            .map_err(|error| anyhow::anyhow!("{error}"))?
+            - width as u64;
         let mut bytes = [0; 4];
         volume.read_exact(cx, at, &mut bytes[..width])?;
         if u32::from_le_bytes(bytes) & mask != mask {
@@ -85,7 +87,9 @@ fn reserve_destination(
     let mut reservation = reserve_slots(cx, volume, directory, needed)?;
     let clusters = reserve_clusters(cx, volume, reservation.extra, free)?;
     let extension = if let Some(tail) = reservation.tail {
-        let cluster = *clusters.first().context("missing case-rename directory reservation")?;
+        let cluster = *clusters
+            .first()
+            .context("missing case-rename directory reservation")?;
         for &cluster in &clusters {
             let start = volume.cluster_offset(cluster)?;
             for offset in (start..start + u64::from(volume.geometry.cluster_bytes())).step_by(32) {
@@ -97,11 +101,18 @@ fn reserve_destination(
                 }
             }
         }
-        Some(Extension { tail, cluster, additional: clusters.get(1).copied() })
+        Some(Extension {
+            tail,
+            cluster,
+            additional: clusters.get(1).copied(),
+        })
     } else {
         None
     };
-    let entry = reservation.slots.pop().context("missing case-rename short-entry slot")?;
+    let entry = reservation
+        .slots
+        .pop()
+        .context("missing case-rename short-entry slot")?;
     Ok(Namespace {
         successor: reservation.successor,
         extension,
@@ -129,7 +140,11 @@ pub(super) fn rename(
     }
     let source_chain = rename_chain(cx, volume, source)?;
     let (short, mut long) = find_entry_slots(cx, volume, directory, source.offset)?;
-    let expected_long = source.native.long_name.as_ref().map_or(0, |units| units.len().div_ceil(13));
+    let expected_long = source
+        .native
+        .long_name
+        .as_ref()
+        .map_or(0, |units| units.len().div_ceil(13));
     if long.len() != expected_long {
         bail!("case-only rename captured an inconsistent native long-name set");
     }
@@ -142,17 +157,30 @@ pub(super) fn rename(
         bail!("case-only rename target changed after native lookup");
     }
     let placement = if let Some(slots) = super::rename_in_place::reserve_before(
-        cx, volume, directory, &short, &long, name.long_slots(),
+        cx,
+        volume,
+        directory,
+        &short,
+        &long,
+        name.long_slots(),
     )? {
         long = slots;
         Placement::Reuse(name)
     } else {
-        Placement::Relocate(reserve_destination(cx, volume, directory, name, before.free_clusters)?)
+        Placement::Relocate(reserve_destination(
+            cx,
+            volume,
+            directory,
+            name,
+            before.free_clusters,
+        )?)
     };
     let mut updated = short.bytes;
     // Keep the alias, timestamps, DOS attributes, EA index and all cluster bits.
     updated[12] = (updated[12] & !0x18) | placement.name().flags;
-    let free_after = before.free_clusters.checked_sub(placement.extra_clusters() as u64)
+    let free_after = before
+        .free_clusters
+        .checked_sub(placement.extra_clusters() as u64)
         .context("case-only rename free-cluster accounting underflow")?;
     validate_entry_slots(cx, volume, &short, &long)?;
     if let Placement::Relocate(namespace) = &placement {
@@ -192,12 +220,20 @@ pub(super) fn rename(
                 // Captured slots are ordered nearest to the short entry first.
                 // Surplus old slots remain deleted, not attached to a neighbor.
                 for (index, slot) in long.iter().take(name.long_slots()).enumerate() {
-                    patch_slot(cx, volume, slot.offset, &retired_slot(slot), &name.slot(index + 1))?;
+                    patch_slot(
+                        cx,
+                        volume,
+                        slot.offset,
+                        &retired_slot(slot),
+                        &name.slot(index + 1),
+                    )?;
                 }
                 volume.device.sync(cx)?;
                 for (index, slot) in long.iter().take(name.long_slots()).enumerate() {
                     if read_slot(cx, volume, slot.offset, false)?.bytes != name.slot(index + 1) {
-                        bail!("case-only rename long-name readback differs from the requested spelling");
+                        bail!(
+                            "case-only rename long-name readback differs from the requested spelling"
+                        );
                     }
                 }
                 phase = "publishing the renamed short entry";
@@ -222,7 +258,9 @@ pub(super) fn rename(
         }
         volume.device.sync(cx)?;
         phase = "verifying native spelling and identity";
-        let published = volume.resolve(cx, to)?.context("case-renamed native entry is missing")?;
+        let published = volume
+            .resolve(cx, to)?
+            .context("case-renamed native entry is missing")?;
         if published.offset != placement.offset(&short)
             || published.name()? != leaf
             || published.native.short_name != source.native.short_name
@@ -235,13 +273,19 @@ pub(super) fn rename(
         set_hints(cx, volume, u32::try_from(free_after)?)?;
         volume.device.sync(cx)?;
         let verification = volume.check(cx)?;
-        if !verification.clean || !verification.complete || !verification.namespace_complete
+        if !verification.clean
+            || !verification.complete
+            || !verification.namespace_complete
             || verification.free_clusters != free_after
             || verification.files != before.files
             || verification.directories != before.directories
-            || verification.allocated_clusters != before.allocated_clusters + placement.extra_clusters() as u64
+            || verification.allocated_clusters
+                != before.allocated_clusters + placement.extra_clusters() as u64
         {
-            bail!("case-only rename verification failed: {}", serde_json::to_string(&verification)?);
+            bail!(
+                "case-only rename verification failed: {}",
+                serde_json::to_string(&verification)?
+            );
         }
         phase = "synchronizing final clean state";
         set_dirty(cx, volume, false)?;

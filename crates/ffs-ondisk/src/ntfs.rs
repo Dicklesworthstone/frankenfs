@@ -546,8 +546,14 @@ pub fn decode_mapping_pairs(
 /// (`FILE`, `INDX`, `RSTR`, `RCRD`) so its 512-byte sector trailers carry the USA token
 /// and the USA array stores the actual trailer bytes.
 pub fn protect_record(restored: &[u8]) -> Result<Vec<u8>, ParseError> {
-    if restored.len() < 512 || restored.len() > MAX_RECORD_BYTES || !restored.len().is_multiple_of(512) {
-        return Err(invalid("ntfs.multi_sector", "invalid record length for USA protection"));
+    if restored.len() < 512
+        || restored.len() > MAX_RECORD_BYTES
+        || !restored.len().is_multiple_of(512)
+    {
+        return Err(invalid(
+            "ntfs.multi_sector",
+            "invalid record length for USA protection",
+        ));
     }
     let offset = usize::from(le16(restored, 4)?);
     let count = usize::from(le16(restored, 6)?);
@@ -711,7 +717,10 @@ impl NtfsLogRestartArea {
             || record_header_length < 48
             || usize::from(log_page_data_offset) >= log_page_size as usize
         {
-            return Err(invalid("ntfs.rstr", "invalid LFS_RESTART_AREA client bounds"));
+            return Err(invalid(
+                "ntfs.rstr",
+                "invalid LFS_RESTART_AREA client bounds",
+            ));
         }
         let client = &area[client_array_offset..];
         let oldest_lsn = le64(client, 0)?;
@@ -788,7 +797,10 @@ pub struct NtfsLogFilePlan {
 /// (Analysis -> Redo -> Undo) to produce deterministic overlay actions (`NTFS-07`).
 pub fn parse_ntfs_logfile(raw_logfile: &[u8]) -> Result<NtfsLogFilePlan, ParseError> {
     if raw_logfile.len() < 8192 {
-        return Err(invalid("ntfs.logfile", "$LogFile stream smaller than 8 KiB"));
+        return Err(invalid(
+            "ntfs.logfile",
+            "$LogFile stream smaller than 8 KiB",
+        ));
     }
     // Probe page size from the first RSTR header (bytes 16..20 = system_page_size).
     let probe_size = usize::try_from(le32(raw_logfile, 16).unwrap_or(4096))
@@ -814,7 +826,7 @@ pub fn parse_ntfs_logfile(raw_logfile: &[u8]) -> Result<NtfsLogFilePlan, ParseEr
             return Err(invalid(
                 "ntfs.logfile",
                 "neither primary nor backup RSTR page is valid",
-            ))
+            ));
         }
     };
 
@@ -923,8 +935,7 @@ pub fn parse_ntfs_logfile(raw_logfile: &[u8]) -> Result<NtfsLogFilePlan, ParseEr
     }
     let mut tx_table: std::collections::BTreeMap<u32, (TxStatus, u64, u64)> =
         std::collections::BTreeMap::new();
-    let mut dirty_pages: std::collections::BTreeMap<u64, u64> =
-        std::collections::BTreeMap::new();
+    let mut dirty_pages: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
     let mut committed_set = std::collections::BTreeSet::new();
 
     for rec in &records {

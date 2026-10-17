@@ -128,9 +128,7 @@ impl NativeName {
         name: &str,
     ) -> Result<Self> {
         validate(name)?;
-        if volume.oem_code_page.name_key(&entry.name()?)
-            != volume.oem_code_page.name_key(name)
-        {
+        if volume.oem_code_page.name_key(&entry.name()?) != volume.oem_code_page.name_key(name) {
             bail!("case-only rename must preserve the native name comparison key");
         }
         if let Some(candidate) = natural(name)

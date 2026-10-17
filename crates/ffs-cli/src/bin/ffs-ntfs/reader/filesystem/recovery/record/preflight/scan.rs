@@ -5,8 +5,8 @@
 //! This does not discover a newer durable tail or authorize recovery writes.
 
 use super::super::{
-    Cx, LogRecord, Restart, Result, checkpoint, corrupt, lsn_to_vbo, read_exact,
-    read_record, restore_page, u64_at, unsupported, validate_lsn_reference,
+    Cx, LogRecord, Restart, Result, checkpoint, corrupt, lsn_to_vbo, read_exact, read_record,
+    restore_page, u64_at, unsupported, validate_lsn_reference,
 };
 
 const MAX_RECORDS: usize = 4096;
@@ -21,16 +21,23 @@ struct Position {
 fn next_page(restart: &Restart, position: &mut Position) -> Result<()> {
     let page_bytes = u64::from(restart.log_page);
     let first = (if restart.version.0 >= 2 { 34_u64 } else { 4 }) * page_bytes;
-    position.page = position.page.checked_add(page_bytes)
+    position.page = position
+        .page
+        .checked_add(page_bytes)
         .ok_or_else(|| corrupt(0, "$LogFile chronological page offset overflow"))?;
     if position.page == restart.file_size {
         position.page = first;
-        position.sequence = position.sequence.checked_add(1)
+        position.sequence = position
+            .sequence
+            .checked_add(1)
             .filter(|sequence| *sequence < (1_u64 << restart.seq_num_bits))
             .ok_or_else(|| unsupported("$LogFile LSN sequence rollover is not admitted"))?;
     }
     if position.page < first || position.page >= restart.file_size {
-        return Err(corrupt(0, "$LogFile chronological page leaves the record ring"));
+        return Err(corrupt(
+            0,
+            "$LogFile chronological page leaves the record ring",
+        ));
     }
     position.offset = usize::from(restart.data_off);
     Ok(())
@@ -52,17 +59,24 @@ fn end_position(restart: &Restart, record: &LogRecord) -> Result<Position> {
         .checked_add(record.data.len())
         .ok_or_else(|| corrupt(0, "$LogFile chronological record length overflow"))?;
     let first = (if restart.version.0 >= 2 { 34_u64 } else { 4 }) * page_bytes;
-    let capacity = page_size.checked_sub(usize::from(restart.data_off))
+    let capacity = page_size
+        .checked_sub(usize::from(restart.data_off))
         .filter(|capacity| *capacity != 0)
         .ok_or_else(|| corrupt(0, "$LogFile chronological page has no data area"))?;
-    let ring_pages = restart.file_size.checked_sub(first)
+    let ring_pages = restart
+        .file_size
+        .checked_sub(first)
         .filter(|bytes| bytes.is_multiple_of(page_bytes))
         .ok_or_else(|| corrupt(0, "$LogFile chronological ring geometry is invalid"))?
         / page_bytes;
     let initial_capacity = page_size - position.offset;
-    let needed = 1 + remaining.saturating_sub(initial_capacity).div_ceil(capacity) as u64;
+    let needed = 1 + remaining
+        .saturating_sub(initial_capacity)
+        .div_ceil(capacity) as u64;
     if needed > ring_pages || needed > MAX_RECORDS as u64 {
-        return Err(unsupported("$LogFile chronological record exceeds the page budget"));
+        return Err(unsupported(
+            "$LogFile chronological record exceeds the page budget",
+        ));
     }
     while remaining > page_size - position.offset {
         remaining -= page_size - position.offset;
@@ -94,31 +108,49 @@ fn successor(
     let last = u64_at(&page.bytes, 8)?;
     let last_end = u64_at(&page.bytes, 32)?;
     if last < record.lsn || last_end < record.lsn || last_end > last {
-        return Err(corrupt(position.page, "$LogFile chronological ending is stale"));
+        return Err(corrupt(
+            position.page,
+            "$LogFile chronological ending is stale",
+        ));
     }
     if last == record.lsn {
         // A partially filled page can be sealed. Padding is not a next record.
         next_page(restart, &mut position)?;
     } else {
-        position.offset = position.offset.checked_add(7)
+        position.offset = position
+            .offset
+            .checked_add(7)
             .map(|offset| offset & !7)
             .ok_or_else(|| corrupt(0, "$LogFile chronological alignment overflow"))?;
-        let header_end = position.offset.checked_add(usize::from(restart.record_header_len));
+        let header_end = position
+            .offset
+            .checked_add(usize::from(restart.record_header_len));
         if header_end.is_none_or(|end| end > page_size)
             || (page.next_record_off != 0 && position.offset >= usize::from(page.next_record_off))
         {
-            return Err(corrupt(position.page, "$LogFile next record cannot fit its claimed page"));
+            return Err(corrupt(
+                position.page,
+                "$LogFile next record cannot fit its claimed page",
+            ));
         }
     }
     let address_bits = 64 - restart.seq_num_bits;
-    let vbo = position.page.checked_add(position.offset as u64)
+    let vbo = position
+        .page
+        .checked_add(position.offset as u64)
         .ok_or_else(|| corrupt(0, "$LogFile chronological LSN address overflow"))?;
     if vbo / 8 >= (1_u64 << address_bits) {
-        return Err(corrupt(vbo, "$LogFile chronological address overlaps its sequence bits"));
+        return Err(corrupt(
+            vbo,
+            "$LogFile chronological address overlaps its sequence bits",
+        ));
     }
     let next = (position.sequence << address_bits) | (vbo / 8);
     if next <= record.lsn || next > restart.current_lsn {
-        return Err(corrupt(vbo, "$LogFile chronology cannot reach the selected current LSN"));
+        return Err(corrupt(
+            vbo,
+            "$LogFile chronology cannot reach the selected current LSN",
+        ));
     }
     validate_lsn_reference(restart, next, "next-chronological")?;
     Ok(Some(next))
@@ -145,7 +177,8 @@ pub(super) fn collect(
             return Err(unsupported("$LogFile chronology exceeds 4096 records"));
         }
         let record = read_record(cx, restart, stream_length, lsn, read)?;
-        retained = retained.checked_add(record.data.len())
+        retained = retained
+            .checked_add(record.data.len())
             .filter(|bytes| *bytes <= MAX_RETAINED_BYTES)
             .ok_or_else(|| unsupported("$LogFile chronological payloads exceed 16 MiB"))?;
         next = successor(cx, restart, &record, read)?;
@@ -157,8 +190,8 @@ pub(super) fn collect(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::super::{LFS_CLIENT_RECORD, MULTI_PAGE, PAGE_RECORD_END, TailRecord};
+    use super::*;
     use ffs_error::FfsError;
     use std::collections::BTreeMap;
 
@@ -172,11 +205,20 @@ mod tests {
 
     fn restart(current: u64) -> Restart {
         Restart {
-            system_page: PAGE as u32, log_page: PAGE as u32, version: (2, 0),
-            clean: false, current_lsn: current, seq_num_bits: 49, file_size: LOG,
-            last_lsn_data_len: 40, record_header_len: 48, data_off: 64,
-            active_client_seq: Some(9), active_client_oldest_lsn: None,
-            active_client_restart_lsn: None, area: Vec::new(),
+            system_page: PAGE as u32,
+            log_page: PAGE as u32,
+            version: (2, 0),
+            clean: false,
+            current_lsn: current,
+            seq_num_bits: 49,
+            file_size: LOG,
+            last_lsn_data_len: 40,
+            record_header_len: 48,
+            data_off: 64,
+            active_client_seq: Some(9),
+            active_client_oldest_lsn: None,
+            active_client_restart_lsn: None,
+            area: Vec::new(),
         }
     }
 
@@ -216,11 +258,24 @@ mod tests {
         page
     }
 
-    fn check(restart: &Restart, first: u64, pages: &BTreeMap<u64, Vec<u8>>) -> Result<Vec<LogRecord>> {
-        collect(&Cx::for_testing(), restart, LOG, first, &mut |offset, size| {
-            assert_eq!(size, PAGE);
-            pages.get(&offset).cloned().ok_or_else(|| corrupt(offset, "missing test page"))
-        })
+    fn check(
+        restart: &Restart,
+        first: u64,
+        pages: &BTreeMap<u64, Vec<u8>>,
+    ) -> Result<Vec<LogRecord>> {
+        collect(
+            &Cx::for_testing(),
+            restart,
+            LOG,
+            first,
+            &mut |offset, size| {
+                assert_eq!(size, PAGE);
+                pages
+                    .get(&offset)
+                    .cloned()
+                    .ok_or_else(|| corrupt(offset, "missing test page"))
+            },
+        )
     }
 
     fn interleaved() -> (Restart, u64, BTreeMap<u64, Vec<u8>>) {
@@ -231,14 +286,24 @@ mod tests {
         put(&mut page, 64, first, 24, 0);
         put(&mut page, 152, middle, 64, 0);
         put(&mut page, 240, last, 24, first);
-        (restart(last), first, BTreeMap::from([(FIRST, protect(page))]))
+        (
+            restart(last),
+            first,
+            BTreeMap::from([(FIRST, protect(page))]),
+        )
     }
 
     #[test]
     fn physical_order_includes_transactions_missing_from_the_tail_chain() {
         let (restart, first, pages) = interleaved();
         let records = check(&restart, first, &pages).unwrap();
-        assert_eq!(records.iter().map(|r| r.summary.transaction_id).collect::<Vec<_>>(), [24, 64, 24]);
+        assert_eq!(
+            records
+                .iter()
+                .map(|r| r.summary.transaction_id)
+                .collect::<Vec<_>>(),
+            [24, 64, 24]
+        );
         assert_eq!(records[2].previous, records[0].lsn);
         assert_ne!(records[2].previous, records[1].lsn);
     }
@@ -257,7 +322,10 @@ mod tests {
             a[152..510].fill(0xA5);
             let pages = BTreeMap::from([(first_page, protect(a)), (second_page, protect(b))]);
             let records = check(&restart(last), first, &pages).unwrap();
-            assert_eq!(records.iter().map(|r| r.lsn).collect::<Vec<_>>(), [first, last]);
+            assert_eq!(
+                records.iter().map(|r| r.lsn).collect::<Vec<_>>(),
+                [first, last]
+            );
         }
     }
 
@@ -283,8 +351,7 @@ mod tests {
     #[test]
     fn corrupt_interleaved_record_is_not_hidden_by_a_valid_tail_chain() {
         let (restart, first, mut pages) = interleaved();
-        pages.get_mut(&FIRST).unwrap()[152 + 28..152 + 30]
-            .copy_from_slice(&10_u16.to_le_bytes());
+        pages.get_mut(&FIRST).unwrap()[152 + 28..152 + 30].copy_from_slice(&10_u16.to_le_bytes());
         assert!(check(&restart, first, &pages).is_err());
     }
 
@@ -304,7 +371,9 @@ mod tests {
                 match damage {
                     1 => bad[PAGE - 1] ^= 1,
                     2 => bad[64..72].copy_from_slice(&first.to_le_bytes()),
-                    _ => { bad.pop(); }
+                    _ => {
+                        bad.pop();
+                    }
                 }
                 pages.insert(FIRST + PAGE as u64, bad);
             }
@@ -318,8 +387,15 @@ mod tests {
             for length in [40, 48, 4000, 8064] {
                 let current = lsn(1, LOG - PAGE as u64 + offset);
                 let record = LogRecord {
-                    lsn: current, previous: 0, undo_next: 0, kind: LFS_CLIENT_RECORD,
-                    summary: TailRecord { transaction_id: 24, redo_op: 0, undo_op: 0 },
+                    lsn: current,
+                    previous: 0,
+                    undo_next: 0,
+                    kind: LFS_CLIENT_RECORD,
+                    summary: TailRecord {
+                        transaction_id: 24,
+                        redo_op: 0,
+                        undo_op: 0,
+                    },
                     data: vec![0; length],
                 };
                 let mut metadata = restart(lsn(2, FIRST + 3 * PAGE as u64 + 64));
@@ -332,12 +408,18 @@ mod tests {
                 for _ in 0..48 + length {
                     if at == PAGE {
                         page += PAGE as u64;
-                        if page == LOG { page = FIRST; seq += 1; }
+                        if page == LOG {
+                            page = FIRST;
+                            seq += 1;
+                        }
                         at = 64;
                     }
                     at += 1;
                 }
-                assert_eq!((position.page, position.offset, position.sequence), (page, at, seq));
+                assert_eq!(
+                    (position.page, position.offset, position.sequence),
+                    (page, at, seq)
+                );
             }
         }
     }
@@ -346,11 +428,19 @@ mod tests {
     fn cancellation_remains_terminal_during_chronological_reads() {
         let (restart, first, pages) = interleaved();
         let mut calls = 0;
-        let result = collect(&Cx::for_testing(), &restart, LOG, first, &mut |offset, _| {
-            calls += 1;
-            if calls == 2 { return Err(FfsError::Cancelled); }
-            Ok(pages[&offset].clone())
-        });
+        let result = collect(
+            &Cx::for_testing(),
+            &restart,
+            LOG,
+            first,
+            &mut |offset, _| {
+                calls += 1;
+                if calls == 2 {
+                    return Err(FfsError::Cancelled);
+                }
+                Ok(pages[&offset].clone())
+            },
+        );
         assert!(matches!(result, Err(FfsError::Cancelled)));
         assert_eq!(calls, 2);
     }
@@ -370,8 +460,7 @@ mod tests {
     fn integrated_preflight_checks_records_outside_the_tail_transaction() {
         let (mut restart, first, mut pages) = interleaved();
         restart.active_client_oldest_lsn = Some(first);
-        pages.get_mut(&FIRST).unwrap()[152 + 28..152 + 30]
-            .copy_from_slice(&10_u16.to_le_bytes());
+        pages.get_mut(&FIRST).unwrap()[152 + 28..152 + 30].copy_from_slice(&10_u16.to_le_bytes());
         let cx = Cx::for_testing();
         let mut read = |offset, _| Ok(pages[&offset].clone());
         // The selected tail itself remains valid and points only to the first
@@ -390,7 +479,10 @@ mod tests {
         metadata.seq_num_bits = 64 - address_bits;
         let mut calls = 0;
         let result = collect(
-            &Cx::for_testing(), &metadata, metadata.file_size, first,
+            &Cx::for_testing(),
+            &metadata,
+            metadata.file_size,
+            first,
             &mut |offset, _| {
                 calls += 1;
                 let current = (1_u64 << address_bits) | (offset + 64) / 8;

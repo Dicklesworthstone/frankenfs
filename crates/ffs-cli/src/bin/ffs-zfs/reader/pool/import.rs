@@ -102,12 +102,16 @@ fn admit_group(labels: &[Vec<(usize, Label)>], pool_guid: u64) -> Result<Admissi
         let (config, guid): (GroupConfig, u64) =
             member_labels[0].1.group_config_with_mode(pool_guid, true)?;
         if config != selected || !seen.insert(guid) {
-            return Err(corrupt("supplied members disagree or repeat a physical GUID"));
+            return Err(corrupt(
+                "supplied members disagree or repeat a physical GUID",
+            ));
         }
         for (_, label) in &member_labels[1..] {
             let (other, other_guid) = label.group_config_with_mode(pool_guid, true)?;
             if other != selected || other_guid != guid {
-                return Err(corrupt("member labels disagree on identity or configuration"));
+                return Err(corrupt(
+                    "member labels disagree on identity or configuration",
+                ));
             }
         }
         supplied_guids.push(guid);
@@ -127,9 +131,13 @@ fn admit_stripe(labels: &[Vec<(usize, Label)>], pool_guid: u64) -> Result<Admiss
     let mut seen = BTreeSet::from([pool_guid]);
     let mut config_txg = first.txg;
     for (supplied_index, member_labels) in labels.iter().enumerate() {
-        let config = member_labels[0].1.striped_leaf_config(pool_guid, count, true)?;
+        let config = member_labels[0]
+            .1
+            .striped_leaf_config(pool_guid, count, true)?;
         if config.version != first.version || config.read_features != first.read_features {
-            return Err(corrupt("striped vdevs disagree on pool version or read features"));
+            return Err(corrupt(
+                "striped vdevs disagree on pool version or read features",
+            ));
         }
         if !seen.insert(config.top_guid) {
             return Err(corrupt("striped top-level vdevs repeat a GUID"));

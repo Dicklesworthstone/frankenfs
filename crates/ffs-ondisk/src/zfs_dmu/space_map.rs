@@ -11,7 +11,10 @@ use std::collections::BTreeMap;
 use std::ops::Range;
 
 fn invalid(reason: &'static str) -> ParseError {
-    ParseError::InvalidField { field: "zfs.space_map", reason }
+    ParseError::InvalidField {
+        field: "zfs.space_map",
+        reason,
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,7 +50,11 @@ impl Header {
             None
         };
         // smp_object at offset zero is obsolete, not an identity authority.
-        Ok(Self { length, allocated, histogram })
+        Ok(Self {
+            length,
+            allocated,
+            histogram,
+        })
     }
 }
 
@@ -69,19 +76,26 @@ pub struct Extent {
 
 impl Extent {
     pub fn byte_range(self, start: u64, size: u64, shift: u8) -> Result<Range<u64>, ParseError> {
-        let unit = 1_u64.checked_shl(u32::from(shift))
+        let unit = 1_u64
+            .checked_shl(u32::from(shift))
             .ok_or_else(|| invalid("space-map unit shift overflow"))?;
-        let region_end = start.checked_add(size)
+        let region_end = start
+            .checked_add(size)
             .ok_or_else(|| invalid("space-map region overflow"))?;
         if size == 0 || !start.is_multiple_of(unit) || !size.is_multiple_of(unit) {
             return Err(invalid("unaligned or empty space-map region"));
         }
-        let offset = self.offset_units.checked_mul(unit)
+        let offset = self
+            .offset_units
+            .checked_mul(unit)
             .and_then(|offset| start.checked_add(offset))
             .ok_or_else(|| invalid("space-map entry offset overflow"))?;
-        let run = self.run_units.checked_mul(unit)
+        let run = self
+            .run_units
+            .checked_mul(unit)
             .ok_or_else(|| invalid("space-map entry length overflow"))?;
-        let end = offset.checked_add(run)
+        let end = offset
+            .checked_add(run)
             .ok_or_else(|| invalid("space-map entry end overflow"))?;
         if run == 0 || offset >= region_end || end > region_end {
             return Err(invalid("space-map entry exceeds its selected region"));
@@ -94,7 +108,11 @@ impl Extent {
 pub enum Record {
     Extent(Extent),
     /// TXG is only its low fifty bits. Debug records are not commit authority.
-    Debug { kind: MapType, txg: u64, sync_pass: u16 },
+    Debug {
+        kind: MapType,
+        txg: u64,
+        sync_pass: u16,
+    },
 }
 
 /// One authenticated DMU block's used prefix. Errors fuse the iterator; no
@@ -111,7 +129,12 @@ impl<'a> Records<'a> {
         if raw.len() > MAX_BLOCK_BYTES || !raw.len().is_multiple_of(8) {
             return Err(invalid("invalid space-map block prefix length"));
         }
-        Ok(Self { raw, order, at: 0, allow_v2 })
+        Ok(Self {
+            raw,
+            order,
+            at: 0,
+            allow_v2,
+        })
     }
 
     fn record(&mut self) -> Result<Record, ParseError> {
@@ -126,28 +149,46 @@ impl<'a> Records<'a> {
                     return Err(invalid("invalid space-map debug or padding record"));
                 }
                 return Ok(Record::Debug {
-                    kind: if action == 0 { MapType::Allocate } else { MapType::Free },
+                    kind: if action == 0 {
+                        MapType::Allocate
+                    } else {
+                        MapType::Free
+                    },
                     txg,
                     sync_pass,
                 });
             }
             3 => {
                 if !self.allow_v2 {
-                    return Err(invalid("two-word space map requires space_map_v2 admission"));
+                    return Err(invalid(
+                        "two-word space map requires space_map_v2 admission",
+                    ));
                 }
                 if first & (3_u64 << 60) != 0 {
                     return Err(invalid("unknown two-word space-map padding"));
                 }
                 let second = self.order.u64(self.raw, self.at)?;
                 self.at += 8;
-                (second >> 63, Some((first & 0x00ff_ffff) as u32),
-                    second & (u64::MAX >> 1), ((first >> 24) & ((1_u64 << 36) - 1)) + 1)
+                (
+                    second >> 63,
+                    Some((first & 0x00ff_ffff) as u32),
+                    second & (u64::MAX >> 1),
+                    ((first >> 24) & ((1_u64 << 36) - 1)) + 1,
+                )
             }
-            _ => ((first >> 15) & 1, None,
-                (first >> 16) & ((1_u64 << 47) - 1), (first & 0x7fff) + 1),
+            _ => (
+                (first >> 15) & 1,
+                None,
+                (first >> 16) & ((1_u64 << 47) - 1),
+                (first & 0x7fff) + 1,
+            ),
         };
         Ok(Record::Extent(Extent {
-            kind: if kind == 0 { MapType::Allocate } else { MapType::Free },
+            kind: if kind == 0 {
+                MapType::Allocate
+            } else {
+                MapType::Free
+            },
             vdev,
             offset_units,
             run_units,
@@ -186,36 +227,58 @@ pub struct AllocationMap {
 
 impl AllocationMap {
     pub fn new(start: u64, size: u64, shift: u8, max_ranges: usize) -> Result<Self, ParseError> {
-        let unit = 1_u64.checked_shl(u32::from(shift))
+        let unit = 1_u64
+            .checked_shl(u32::from(shift))
             .ok_or_else(|| invalid("allocation-map shift overflow"))?;
-        let end = start.checked_add(size)
+        let end = start
+            .checked_add(size)
             .ok_or_else(|| invalid("allocation-map region overflow"))?;
-        if size == 0 || !start.is_multiple_of(unit) || !size.is_multiple_of(unit)
+        if size == 0
+            || !start.is_multiple_of(unit)
+            || !size.is_multiple_of(unit)
             || !(1..=1_048_576).contains(&max_ranges)
         {
             return Err(invalid("invalid allocation-map geometry or range budget"));
         }
-        Ok(Self { region: start..end, unit, allocated: 0, max_ranges, ranges: BTreeMap::new() })
+        Ok(Self {
+            region: start..end,
+            unit,
+            allocated: 0,
+            max_ranges,
+            ranges: BTreeMap::new(),
+        })
     }
 
     pub fn apply(&mut self, kind: MapType, range: Range<u64>) -> Result<(), ParseError> {
         let (start, end) = (range.start, range.end);
-        if start >= end || start < self.region.start || end > self.region.end
-            || !start.is_multiple_of(self.unit) || !end.is_multiple_of(self.unit)
+        if start >= end
+            || start < self.region.start
+            || end > self.region.end
+            || !start.is_multiple_of(self.unit)
+            || !end.is_multiple_of(self.unit)
         {
             return Err(invalid("invalid allocation-map change range"));
         }
-        let left = self.ranges.range(..=start).next_back().map(|(&a, &b)| (a, b));
+        let left = self
+            .ranges
+            .range(..=start)
+            .next_back()
+            .map(|(&a, &b)| (a, b));
         if kind == MapType::Free {
-            let (a, b) = left.filter(|&(a, b)| a <= start && b >= end)
+            let (a, b) = left
+                .filter(|&(a, b)| a <= start && b >= end)
                 .ok_or_else(|| invalid("space-map free includes unallocated space"))?;
             let new_count = self.ranges.len() - 1 + usize::from(a < start) + usize::from(end < b);
             if new_count > self.max_ranges {
                 return Err(invalid("allocation-map range budget exceeded"));
             }
             self.ranges.remove(&a);
-            if a < start { self.ranges.insert(a, start); }
-            if end < b { self.ranges.insert(end, b); }
+            if a < start {
+                self.ranges.insert(a, start);
+            }
+            if end < b {
+                self.ranges.insert(end, b);
+            }
             self.allocated -= end - start;
         } else {
             let right = self.ranges.range(start..).next().map(|(&a, &b)| (a, b));
@@ -224,14 +287,19 @@ impl AllocationMap {
             }
             let left = left.filter(|&(_, b)| b == start);
             let right = right.filter(|&(a, _)| a == end);
-            let new_count = self.ranges.len() + 1 - usize::from(left.is_some()) - usize::from(right.is_some());
+            let new_count =
+                self.ranges.len() + 1 - usize::from(left.is_some()) - usize::from(right.is_some());
             if new_count > self.max_ranges {
                 return Err(invalid("allocation-map range budget exceeded"));
             }
             let a = left.map_or(start, |(a, _)| a);
             let b = right.map_or(end, |(_, b)| b);
-            if let Some((a, _)) = left { self.ranges.remove(&a); }
-            if let Some((a, _)) = right { self.ranges.remove(&a); }
+            if let Some((a, _)) = left {
+                self.ranges.remove(&a);
+            }
+            if let Some((a, _)) = right {
+                self.ranges.remove(&a);
+            }
             self.ranges.insert(a, b);
             self.allocated += end - start;
         }
@@ -239,10 +307,14 @@ impl AllocationMap {
     }
 
     #[must_use]
-    pub const fn allocated_bytes(&self) -> u64 { self.allocated }
+    pub const fn allocated_bytes(&self) -> u64 {
+        self.allocated
+    }
 
     #[must_use]
-    pub fn range_count(&self) -> usize { self.ranges.len() }
+    pub fn range_count(&self) -> usize {
+        self.ranges.len()
+    }
 
     pub fn ranges(&self) -> impl Iterator<Item = Range<u64>> + '_ {
         self.ranges.iter().map(|(&start, &end)| start..end)

@@ -21,7 +21,9 @@ fn word(raw: &[u8], at: usize, order: Endian) -> Result<u64> {
 
 fn padded_record(bytes: &[u8], used: usize) -> Result<()> {
     if used > bytes.len() || bytes.len() - used >= 8 {
-        return Err(corrupt("ZIL record contains missing data or an unexplained suffix"));
+        return Err(corrupt(
+            "ZIL record contains missing data or an unexplained suffix",
+        ));
     }
     // Native alignment padding is not required to contain zeroes.
     Ok(())
@@ -29,8 +31,12 @@ fn padded_record(bytes: &[u8], used: usize) -> Result<()> {
 
 fn names_end(bytes: &[u8], mut at: usize, count: usize) -> Result<usize> {
     for _ in 0..count {
-        let suffix = bytes.get(at..).ok_or_else(|| corrupt("truncated ZIL name"))?;
-        let length = suffix.iter().position(|byte| *byte == 0)
+        let suffix = bytes
+            .get(at..)
+            .ok_or_else(|| corrupt("truncated ZIL name"))?;
+        let length = suffix
+            .iter()
+            .position(|byte| *byte == 0)
             .ok_or_else(|| corrupt("unterminated ZIL name or link target"))?;
         if length == 0 {
             return Err(corrupt("empty ZIL name or link target"));
@@ -48,7 +54,9 @@ pub(super) fn parse(cx: &Cx, raw: &[u8], order: Endian) -> Result<ZilBlock> {
     let trailer = raw.len() - CHAIN_BYTES;
     let used = word(raw, trailer + 136, order)?;
     if used > trailer as u64 || !used.is_multiple_of(8) {
-        return Err(corrupt("ZIL used bytes overlap the chain trailer or are unaligned"));
+        return Err(corrupt(
+            "ZIL used bytes overlap the chain trailer or are unaligned",
+        ));
     }
     let used = used as usize;
     let mut at = 0_usize;
@@ -81,7 +89,10 @@ pub(super) fn parse(cx: &Cx, raw: &[u8], order: Endian) -> Result<ZilBlock> {
                 if foid & 0x00FF_0000_0000_0000 != 0 || foid >> 56 >= 32 {
                     return Err(unsupported("unsupported ZIL create object/slot encoding"));
                 }
-                padded_record(record, names_end(record, 104, if kind == 4 { 2 } else { 1 })?)?;
+                padded_record(
+                    record,
+                    names_end(record, 104, if kind == 4 { 2 } else { 1 })?,
+                )?;
             }
             5 | 6 => padded_record(record, names_end(record, 40, 1)?)?,
             8 => padded_record(record, names_end(record, 48, 2)?)?,
@@ -101,11 +112,17 @@ pub(super) fn parse(cx: &Cx, raw: &[u8], order: Endian) -> Result<ZilBlock> {
             10 if record.len() == 56 => {}
             11 if record.len() == 112 => {
                 if word(record, 40, order)? & !0x3F != 0 {
-                    return Err(unsupported("extended ZIL setattr masks need native decoding"));
+                    return Err(unsupported(
+                        "extended ZIL setattr masks need native decoding",
+                    ));
                 }
             }
             10 | 11 => return Err(corrupt("invalid fixed-size ZIL truncate/setattr record")),
-            _ => return Err(unsupported("ZIL operation or type flags are not implemented for replay")),
+            _ => {
+                return Err(unsupported(
+                    "ZIL operation or type flags are not implemented for replay",
+                ));
+            }
         }
         at = end;
     }
@@ -115,7 +132,12 @@ pub(super) fn parse(cx: &Cx, raw: &[u8], order: Endian) -> Result<ZilBlock> {
     }
     for record in &mut block.records {
         checkpoint(cx)?;
-        if let ZilRecordPayload::Create { symlink_target, is_dir, .. } = &mut record.payload {
+        if let ZilRecordPayload::Create {
+            symlink_target,
+            is_dir,
+            ..
+        } = &mut record.payload
+        {
             // A plain create has ONE name. Arbitrary alignment padding after
             // it must not become a second string and hence a symbolic link.
             if record.txtype != 4 {
@@ -165,7 +187,12 @@ mod tests {
         for order in [Endian::Little, Endian::Big] {
             let bytes = inline(order);
             let parsed = parse(&cx, &block(&bytes, bytes.len() as u64, order), order).unwrap();
-            let ZilRecordPayload::Write { offset, inline_data, .. } = &parsed.records[0].payload else {
+            let ZilRecordPayload::Write {
+                offset,
+                inline_data,
+                ..
+            } = &parsed.records[0].payload
+            else {
                 panic!("write");
             };
             assert_eq!(*offset, 1_u64 << 33);
@@ -177,7 +204,24 @@ mod tests {
     fn an_unknown_or_malformed_later_record_cannot_make_a_successful_prefix() {
         let cx = Cx::for_testing();
         for order in [Endian::Little, Endian::Big] {
-            for kind in [0, 3, 7, 12, 14, 15, 16, 17, 18, 19, 20, 21, 22, 24, 33, 1_u64 << 63 | 8] {
+            for kind in [
+                0,
+                3,
+                7,
+                12,
+                14,
+                15,
+                16,
+                17,
+                18,
+                19,
+                20,
+                21,
+                22,
+                24,
+                33,
+                1_u64 << 63 | 8,
+            ] {
                 let mut records = inline(order);
                 records.extend(record(kind, &[], order));
                 assert!(parse(&cx, &block(&records, records.len() as u64, order), order).is_err());
@@ -197,7 +241,13 @@ mod tests {
         let cx = Cx::for_testing();
         for order in [Endian::Little, Endian::Big] {
             let bytes = inline(order);
-            for used in [1, bytes.len() as u64 - 1, bytes.len() as u64 + 8, 336, u64::MAX] {
+            for used in [
+                1,
+                bytes.len() as u64 - 1,
+                bytes.len() as u64 + 8,
+                336,
+                u64::MAX,
+            ] {
                 assert!(parse(&cx, &block(&bytes, used, order), order).is_err());
             }
             for declared in [0, 9, u64::MAX] {
@@ -222,8 +272,14 @@ mod tests {
             let mut bytes = record(1, &body, order);
             bytes[106..109].copy_from_slice(b"zz\0");
             let parsed = parse(&cx, &block(&bytes, bytes.len() as u64, order), order).unwrap();
-            assert!(matches!(&parsed.records[0].payload,
-                ZilRecordPayload::Create { symlink_target: None, is_dir: false, .. }));
+            assert!(matches!(
+                &parsed.records[0].payload,
+                ZilRecordPayload::Create {
+                    symlink_target: None,
+                    is_dir: false,
+                    ..
+                }
+            ));
             for kind in [4, 8] {
                 let body = vec![b'x'; if kind == 4 { 80 } else { 24 }];
                 let bytes = record(kind, &body, order);
@@ -238,14 +294,30 @@ mod tests {
         for order in [Endian::Little, Endian::Big] {
             for (kind, body_size) in [(10, 24), (11, 80)] {
                 let bytes = record(kind, &vec![0; body_size], order);
-                assert_eq!(parse(&cx, &block(&bytes, bytes.len() as u64, order), order).unwrap().records.len(), 1);
+                assert_eq!(
+                    parse(&cx, &block(&bytes, bytes.len() as u64, order), order)
+                        .unwrap()
+                        .records
+                        .len(),
+                    1
+                );
                 let shorter = record(kind, &vec![0; body_size - 8], order);
                 assert!(parse(&cx, &block(&shorter, shorter.len() as u64, order), order).is_err());
             }
-            assert!(parse(&cx, &block(&[], 0, order), order).unwrap().records.is_empty());
+            assert!(
+                parse(&cx, &block(&[], 0, order), order)
+                    .unwrap()
+                    .records
+                    .is_empty()
+            );
         }
-        cx.cancel_with(asupersync::types::CancelKind::User, Some("ZIL admission test"));
-        assert!(matches!(parse(&cx, &block(&[], 0, Endian::Little), Endian::Little),
-            Err(super::super::FfsError::Cancelled)));
+        cx.cancel_with(
+            asupersync::types::CancelKind::User,
+            Some("ZIL admission test"),
+        );
+        assert!(matches!(
+            parse(&cx, &block(&[], 0, Endian::Little), Endian::Little),
+            Err(super::super::FfsError::Cancelled)
+        ));
     }
 }

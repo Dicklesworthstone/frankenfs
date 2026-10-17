@@ -6,8 +6,8 @@
 //! allocation determines capacity. Pending ZIL intent is not replayed.
 
 use super::{
-    BlockPointer, Cx, FfsError, MAX_READ_BYTES, Object, ObjectSet, Objects, Result,
-    VecDeque, checkpoint, corrupt, parse, unsupported,
+    BlockPointer, Cx, FfsError, MAX_READ_BYTES, Object, ObjectSet, Objects, Result, VecDeque,
+    checkpoint, corrupt, parse, unsupported,
 };
 use ffs_block::ByteDevice;
 use ffs_types::ByteOffset;
@@ -77,7 +77,11 @@ impl Objects {
                 return Err(corrupt("selected volume root identity changed"));
             }
             (
-                root, selected.guid, selected.flags, self.txg, object.ceiling,
+                root,
+                selected.guid,
+                selected.flags,
+                self.txg,
+                object.ceiling,
                 selected.objectset_kind,
             )
         };
@@ -129,7 +133,9 @@ impl Zvol {
             }
         }
         let rows = objects.zap_values(cx, PROPERTY_OBJECT)?;
-        let size = rows.iter().find(|entry| entry.name == b"size")
+        let size = rows
+            .iter()
+            .find(|entry| entry.name == b"size")
             .ok_or_else(|| corrupt("native zvol size property is absent"))?;
         if size.integer_bytes != 8 || size.values.len() != 1 {
             return Err(corrupt("native zvol size is not one uint64"));
@@ -147,7 +153,11 @@ impl Zvol {
         info.block_bytes = block_bytes;
         info.dnode_used_bytes = data.node.used_bytes();
         checkpoint(cx)?;
-        Ok(Self { objects, data, info })
+        Ok(Self {
+            objects,
+            data,
+            info,
+        })
     }
 
     #[must_use]
@@ -159,13 +169,21 @@ impl Zvol {
     /// the ByteDevice seam; callers exposing sectors impose their own alignment.
     /// A range crossing capacity is an error, not a short successful read.
     pub fn read(&mut self, cx: &Cx, start: u64, size: usize) -> Result<Vec<u8>> {
-        read_range(cx, &mut self.objects, &self.data, self.info.size_bytes, start, size)
+        read_range(
+            cx,
+            &mut self.objects,
+            &self.data,
+            self.info.size_bytes,
+            start,
+            size,
+        )
     }
 
     /// Allocation queries reuse the shared native pointer validator and skip
     /// hole subtrees. They do not verify the contents of allocated data blocks.
     pub fn seek_data_hole(&mut self, cx: &Cx, start: u64, want_data: bool) -> Result<u64> {
-        self.objects.seek_data_hole(cx, &self.data, self.info.size_bytes, start, want_data)
+        self.objects
+            .seek_data_hole(cx, &self.data, self.info.size_bytes, start, want_data)
     }
 }
 
@@ -173,9 +191,13 @@ fn check_range(capacity: u64, start: u64, size: usize) -> Result<()> {
     if size > MAX_READ_BYTES {
         return Err(unsupported("zvol request exceeds 16 MiB read budget"));
     }
-    if start.checked_add(size as u64).is_none_or(|end| end > capacity) {
+    if start
+        .checked_add(size as u64)
+        .is_none_or(|end| end > capacity)
+    {
         return Err(FfsError::Io(std::io::Error::new(
-            std::io::ErrorKind::UnexpectedEof, "zvol range exceeds native capacity",
+            std::io::ErrorKind::UnexpectedEof,
+            "zvol range exceeds native capacity",
         )));
     }
     Ok(())
@@ -192,7 +214,8 @@ fn read_range(
     checkpoint(cx)?;
     check_range(capacity, start, size)?;
     let mut result = Vec::new();
-    result.try_reserve_exact(size)
+    result
+        .try_reserve_exact(size)
         .map_err(|error| FfsError::Io(std::io::Error::other(error)))?;
     result.resize(size, 0);
     let block_bytes = data.node.data_bytes() as u64;
@@ -238,7 +261,14 @@ impl ByteDevice for Zvol {
         checkpoint(cx)?;
         check_range(self.info.size_bytes, offset.0, out.len())?;
         let mut view = self.objects.clone_mos(); // Same pinned object set, fresh cache.
-        let bytes = read_range(cx, &mut view, &self.data, self.info.size_bytes, offset.0, out.len())?;
+        let bytes = read_range(
+            cx,
+            &mut view,
+            &self.data,
+            self.info.size_bytes,
+            offset.0,
+            out.len(),
+        )?;
         checkpoint(cx)?;
         out.copy_from_slice(&bytes);
         // No fallible operation after publication to the caller's buffer.
@@ -253,12 +283,21 @@ impl ByteDevice for Zvol {
     ) -> Result<()> {
         checkpoint(cx)?;
         let size = out.iter().try_fold(0_usize, |total, part| {
-            total.checked_add(part.len()).filter(|sum| *sum <= MAX_READ_BYTES)
+            total
+                .checked_add(part.len())
+                .filter(|sum| *sum <= MAX_READ_BYTES)
                 .ok_or_else(|| unsupported("zvol vectored request exceeds 16 MiB"))
         })?;
         check_range(self.info.size_bytes, offset.0, size)?;
         let mut view = self.objects.clone_mos();
-        let bytes = read_range(cx, &mut view, &self.data, self.info.size_bytes, offset.0, size)?;
+        let bytes = read_range(
+            cx,
+            &mut view,
+            &self.data,
+            self.info.size_bytes,
+            offset.0,
+            size,
+        )?;
         checkpoint(cx)?;
         let mut done = 0;
         for part in out {

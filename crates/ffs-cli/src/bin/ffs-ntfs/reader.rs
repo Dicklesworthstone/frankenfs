@@ -103,7 +103,8 @@ impl Source {
                         let dst_off = (overlap_start - offset) as usize;
                         let src_off = (overlap_start - sec_start) as usize;
                         let len = (overlap_end - overlap_start) as usize;
-                        data[dst_off..dst_off + len].copy_from_slice(&patch[src_off..src_off + len]);
+                        data[dst_off..dst_off + len]
+                            .copy_from_slice(&patch[src_off..src_off + len]);
                     }
                 }
             }
@@ -135,7 +136,8 @@ impl Source {
                     .base
                     .checked_add(sec_start)
                     .ok_or_else(|| corrupt(sec_start, "physical offset overflow"))?;
-                self.device.read_exact_at(cx, ByteOffset(physical), &mut buf)?;
+                self.device
+                    .read_exact_at(cx, ByteOffset(physical), &mut buf)?;
                 self.overlay.insert(sec, buf);
             }
             let patch = self.overlay.get_mut(&sec).expect("inserted above");

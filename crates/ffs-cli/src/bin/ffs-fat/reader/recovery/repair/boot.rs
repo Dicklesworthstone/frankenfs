@@ -4,8 +4,8 @@
 //! clearing it and reclaiming lost allocation require a separate recovery call.
 
 use super::{
-    DiagnosticVolume, FatCheckReport, FatKind, FatVolume, ImageArgs, MAX_CHAIN_CLUSTERS,
-    allocate, checkpoint, hex_digest, long_names::Names, write_patch,
+    DiagnosticVolume, FatCheckReport, FatKind, FatVolume, ImageArgs, MAX_CHAIN_CLUSTERS, allocate,
+    checkpoint, hex_digest, long_names::Names, write_patch,
 };
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
@@ -22,14 +22,18 @@ const MAX_FAT_BYTES: u64 = 128 * 1024 * 1024;
 struct Shared(Arc<dyn ByteDevice>);
 
 impl ByteDevice for Shared {
-    fn len_bytes(&self) -> u64 { self.0.len_bytes() }
+    fn len_bytes(&self) -> u64 {
+        self.0.len_bytes()
+    }
     fn read_exact_at(&self, cx: &Cx, at: ByteOffset, bytes: &mut [u8]) -> ffs_error::Result<()> {
         self.0.read_exact_at(cx, at, bytes)
     }
     fn write_all_at(&self, cx: &Cx, at: ByteOffset, bytes: &[u8]) -> ffs_error::Result<()> {
         self.0.write_all_at(cx, at, bytes)
     }
-    fn sync(&self, cx: &Cx) -> ffs_error::Result<()> { self.0.sync(cx) }
+    fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+        self.0.sync(cx)
+    }
 }
 
 /// Substitution is confined to the two already range-checked boot sectors.
@@ -41,21 +45,26 @@ struct View {
 }
 
 impl ByteDevice for View {
-    fn len_bytes(&self) -> u64 { self.device.len_bytes() }
+    fn len_bytes(&self) -> u64 {
+        self.device.len_bytes()
+    }
     fn read_exact_at(&self, cx: &Cx, at: ByteOffset, bytes: &mut [u8]) -> ffs_error::Result<()> {
         checkpoint(cx)?;
-        let end = at.0.checked_add(bytes.len() as u64)
-            .filter(|&end| end <= self.len_bytes())
-            .ok_or_else(|| FfsError::Format("boot projection exceeds backing".into()))?;
+        let end =
+            at.0.checked_add(bytes.len() as u64)
+                .filter(|&end| end <= self.len_bytes())
+                .ok_or_else(|| FfsError::Format("boot projection exceeds backing".into()))?;
         self.device.read_exact_at(cx, at, bytes)?;
         for &start in &self.starts {
-            let stop = start.checked_add(self.source.len() as u64)
+            let stop = start
+                .checked_add(self.source.len() as u64)
                 .ok_or_else(|| FfsError::Format("boot projection overflow".into()))?;
             let begin = start.max(at.0);
             let stop = stop.min(end);
             if begin < stop {
-                bytes[(begin - at.0) as usize..(stop - at.0) as usize]
-                    .copy_from_slice(&self.source[(begin - start) as usize..(stop - start) as usize]);
+                bytes[(begin - at.0) as usize..(stop - at.0) as usize].copy_from_slice(
+                    &self.source[(begin - start) as usize..(stop - start) as usize],
+                );
             }
         }
         checkpoint(cx)
@@ -63,7 +72,9 @@ impl ByteDevice for View {
     fn write_all_at(&self, _: &Cx, _: ByteOffset, _: &[u8]) -> ffs_error::Result<()> {
         Err(FfsError::ReadOnly)
     }
-    fn sync(&self, _: &Cx) -> ffs_error::Result<()> { Err(FfsError::ReadOnly) }
+    fn sync(&self, _: &Cx) -> ffs_error::Result<()> {
+        Err(FfsError::ReadOnly)
+    }
 }
 
 struct Header {
@@ -100,27 +111,44 @@ fn digest(bytes: &[u8], fat_header: bool) -> [u8; 32] {
 }
 
 fn admissible(report: &FatCheckReport) -> Result<()> {
-    if !report.complete || !report.namespace_complete || report.omitted_issues != 0
+    if !report.complete
+        || !report.namespace_complete
+        || report.omitted_issues != 0
         || report.lost_clusters.is_none()
     {
         bail!("boot repair needs complete, untruncated allocation/namespace evidence");
     }
     for issue in &report.issues {
-        if !matches!(issue.kind, "native_boot_dirty" | "native_fat_dirty" | "lost_allocation"
-            | "fs_info_free_count" | "fs_info_next_free")
-        {
-            bail!("selected boot interpretation is not repair authority: {}: {}", issue.kind, issue.detail);
+        if !matches!(
+            issue.kind,
+            "native_boot_dirty"
+                | "native_fat_dirty"
+                | "lost_allocation"
+                | "fs_info_free_count"
+                | "fs_info_next_free"
+        ) {
+            bail!(
+                "selected boot interpretation is not repair authority: {}: {}",
+                issue.kind,
+                issue.detail
+            );
         }
     }
     Ok(())
 }
 
 fn same_structure(a: &FatCheckReport, b: &FatCheckReport) -> bool {
-    a.scanned_clusters == b.scanned_clusters && a.free_clusters == b.free_clusters
-        && a.allocated_clusters == b.allocated_clusters && a.bad_clusters == b.bad_clusters
-        && a.reserved_clusters == b.reserved_clusters && a.conflicting_clusters == b.conflicting_clusters
-        && a.referenced_clusters == b.referenced_clusters && a.preallocated_clusters == b.preallocated_clusters
-        && a.files == b.files && a.directories == b.directories && a.lost_clusters == b.lost_clusters
+    a.scanned_clusters == b.scanned_clusters
+        && a.free_clusters == b.free_clusters
+        && a.allocated_clusters == b.allocated_clusters
+        && a.bad_clusters == b.bad_clusters
+        && a.reserved_clusters == b.reserved_clusters
+        && a.conflicting_clusters == b.conflicting_clusters
+        && a.referenced_clusters == b.referenced_clusters
+        && a.preallocated_clusters == b.preallocated_clusters
+        && a.files == b.files
+        && a.directories == b.directories
+        && a.lost_clusters == b.lost_clusters
 }
 
 pub(super) struct BootPlan<'a> {
@@ -142,17 +170,29 @@ pub(super) struct BootPlan<'a> {
 
 impl<'a> BootPlan<'a> {
     pub(super) fn prepare(
-        cx: &Cx, device: Box<dyn ByteDevice>, args: &'a ImageArgs, source_at: u64,
+        cx: &Cx,
+        device: Box<dyn ByteDevice>,
+        args: &'a ImageArgs,
+        source_at: u64,
     ) -> Result<Self> {
         checkpoint(cx)?;
-        let length = args.length.unwrap_or_else(|| device.len_bytes().saturating_sub(args.offset));
-        let end = args.offset.checked_add(length).context("selected boot volume range overflow")?;
-        if length < 512 || end > device.len_bytes()
+        let length = args
+            .length
+            .unwrap_or_else(|| device.len_bytes().saturating_sub(args.offset));
+        let end = args
+            .offset
+            .checked_add(length)
+            .context("selected boot volume range overflow")?;
+        if length < 512
+            || end > device.len_bytes()
             || source_at.checked_add(512).is_none_or(|stop| stop > length)
         {
             bail!("boot source is outside the explicitly selected volume");
         }
-        let physical = args.offset.checked_add(source_at).context("boot source offset overflow")?;
+        let physical = args
+            .offset
+            .checked_add(source_at)
+            .context("boot source offset overflow")?;
         let mut first = [0; 512];
         device.read_exact_at(cx, ByteOffset(physical), &mut first)?;
         let geometry = FatGeometry::parse(&first, length)
@@ -164,10 +204,16 @@ impl<'a> BootPlan<'a> {
             bail!("selected boot geometry exceeds the structural-check budget");
         }
         let size = geometry.sector_bytes() as usize;
-        let backup = u64::from(geometry.backup_boot_sector().context("selected BPB has no backup boot sector")?)
-            * size as u64;
-        if backup == 0 || (source_at != 0 && source_at != backup)
-            || backup.checked_add(size as u64).is_none_or(|stop| stop > geometry.volume_bytes())
+        let backup = u64::from(
+            geometry
+                .backup_boot_sector()
+                .context("selected BPB has no backup boot sector")?,
+        ) * size as u64;
+        if backup == 0
+            || (source_at != 0 && source_at != backup)
+            || backup
+                .checked_add(size as u64)
+                .is_none_or(|stop| stop > geometry.volume_bytes())
         {
             bail!("explicit boot source does not match its own BPB backup location");
         }
@@ -190,27 +236,48 @@ impl<'a> BootPlan<'a> {
         let target_geometry = FatGeometry::parse(&target, length);
         let target_parseable = target_geometry.is_ok();
         if let Ok(other) = target_geometry {
-            if other != geometry || target[21] != source[21]
-                || target[28..32] != source[28..32] || target[67..71] != source[67..71]
+            if other != geometry
+                || target[21] != source[21]
+                || target[28..32] != source[28..32]
+                || target[67..71] != source[67..71]
             {
-                bail!("two parseable boot copies disagree on geometry or volume identity; refusing relocation or source guessing");
+                bail!(
+                    "two parseable boot copies disagree on geometry or volume identity; refusing relocation or source guessing"
+                );
             }
         }
         let device: Arc<dyn ByteDevice> = Arc::from(device);
-        let projected = DiagnosticVolume::from_device(cx, Box::new(View {
-            device: Arc::clone(&device), starts: [args.offset, args.offset + backup],
-            source: Arc::from(source.clone()),
-        }), args)?;
+        let projected = DiagnosticVolume::from_device(
+            cx,
+            Box::new(View {
+                device: Arc::clone(&device),
+                starts: [args.offset, args.offset + backup],
+                source: Arc::from(source.clone()),
+            }),
+            args,
+        )?;
         let before = projected.report(cx)?;
         admissible(&before)?;
         let names = Names::capture(cx, &projected.volume)?;
         let volume = FatVolume {
-            device: Box::new(Shared(Arc::clone(&device))), base: args.offset,
-            geometry, oem_code_page: args.oem_code_page,
+            device: Box::new(Shared(Arc::clone(&device))),
+            base: args.offset,
+            geometry,
+            oem_code_page: args.oem_code_page,
         };
         let mut plan = Self {
-            volume, device, args, source_at, target_at, source, target,
-            target_parseable, before, names, headers: Vec::new(), evidence: Vec::new(),
+            volume,
+            device,
+            args,
+            source_at,
+            target_at,
+            source,
+            target,
+            target_parseable,
+            before,
+            names,
+            headers: Vec::new(),
+            evidence: Vec::new(),
         };
         plan.capture(cx)?;
         // Anchor the structural walk to the captured table windows, not just
@@ -226,35 +293,52 @@ impl<'a> BootPlan<'a> {
 
     fn capture(&mut self, cx: &Cx) -> Result<()> {
         let size = self.volume.geometry.sector_bytes() as usize;
-        let fat_bytes = u64::from(u32::from_le_bytes(self.source[36..40].try_into()?)) * size as u64;
-        if fat_bytes.checked_mul(self.volume.copies().len() as u64)
+        let fat_bytes =
+            u64::from(u32::from_le_bytes(self.source[36..40].try_into()?)) * size as u64;
+        if fat_bytes
+            .checked_mul(self.volume.copies().len() as u64)
             .is_none_or(|total| total > MAX_FAT_BYTES)
         {
             bail!("boot repair exceeds the 128 MiB allocation-evidence budget");
         }
         let mut ranges = Vec::new();
         for copy in self.volume.copies() {
-            let start = self.volume.geometry.entry_offset(copy, 2)
-                .map_err(|error| anyhow::anyhow!("invalid selected FAT: {error}"))? - 8;
+            let start = self
+                .volume
+                .geometry
+                .entry_offset(copy, 2)
+                .map_err(|error| anyhow::anyhow!("invalid selected FAT: {error}"))?
+                - 8;
             let mut original = allocate(size)?;
             self.volume.read_exact(cx, start, &mut original)?;
-            self.headers.push(Header { offset: start, original });
+            self.headers.push(Header {
+                offset: start,
+                original,
+            });
             ranges.push((start, fat_bytes, true));
         }
         if let Some(info) = self.volume.geometry.fs_info_sector() {
             ranges.push((u64::from(info) * size as u64, size as u64, false));
         }
-        let windows = ranges.iter().map(|(_, length, _)| length.div_ceil(WINDOW as u64) as usize).sum();
-        self.evidence.try_reserve_exact(windows).context("reserving bounded boot-repair evidence")?;
+        let windows = ranges
+            .iter()
+            .map(|(_, length, _)| length.div_ceil(WINDOW as u64) as usize)
+            .sum();
+        self.evidence
+            .try_reserve_exact(windows)
+            .context("reserving bounded boot-repair evidence")?;
         let mut bytes = allocate(WINDOW)?;
         for (start, length, fat) in ranges {
             let mut done = 0;
             while done < length {
                 checkpoint(cx)?;
                 let count = (length - done).min(WINDOW as u64) as usize;
-                self.volume.read_exact(cx, start + done, &mut bytes[..count])?;
+                self.volume
+                    .read_exact(cx, start + done, &mut bytes[..count])?;
                 self.evidence.push(Evidence {
-                    offset: start + done, length: count, fat_header: fat && done == 0,
+                    offset: start + done,
+                    length: count,
+                    fat_header: fat && done == 0,
                     digest: digest(&bytes[..count], fat && done == 0),
                 });
                 done += count as u64;
@@ -267,9 +351,13 @@ impl<'a> BootPlan<'a> {
         let mut bytes = allocate(WINDOW)?;
         for evidence in &self.evidence {
             checkpoint(cx)?;
-            self.volume.read_exact(cx, evidence.offset, &mut bytes[..evidence.length])?;
+            self.volume
+                .read_exact(cx, evidence.offset, &mut bytes[..evidence.length])?;
             if digest(&bytes[..evidence.length], evidence.fat_header) != evidence.digest {
-                bail!("allocation or FSInfo changed during boot recovery at {}", evidence.offset);
+                bail!(
+                    "allocation or FSInfo changed during boot recovery at {}",
+                    evidence.offset
+                );
             }
         }
         self.names.validate(cx, &self.volume)
@@ -278,19 +366,24 @@ impl<'a> BootPlan<'a> {
     fn expect(&self, cx: &Cx, offset: u64, expected: &[u8]) -> Result<()> {
         let mut actual = allocate(expected.len())?;
         self.volume.read_exact(cx, offset, &mut actual)?;
-        if actual != expected { bail!("boot-repair sector changed or failed readback at {offset}"); }
+        if actual != expected {
+            bail!("boot-repair sector changed or failed readback at {offset}");
+        }
         Ok(())
     }
 
     fn validate(&self, cx: &Cx) -> Result<()> {
         self.expect(cx, self.source_at, &self.source)?;
         self.expect(cx, self.target_at, &self.target)?;
-        for header in &self.headers { self.expect(cx, header.offset, &header.original)?; }
+        for header in &self.headers {
+            self.expect(cx, header.offset, &header.original)?;
+        }
         self.verify_evidence(cx)
     }
 
     fn unchanged(&self) -> bool {
-        self.source[..65] == self.target[..65] && self.source[65] & !1 == self.target[65] & !1
+        self.source[..65] == self.target[..65]
+            && self.source[65] & !1 == self.target[65] & !1
             && self.source[66..] == self.target[66..]
     }
 
@@ -313,44 +406,82 @@ impl<'a> BootPlan<'a> {
     pub(super) fn execute(&self, cx: &Cx) -> Result<serde_json::Value> {
         checkpoint(cx)?;
         self.validate(cx)?;
-        if self.unchanged() { return Ok(self.report(false)); }
+        if self.unchanged() {
+            return Ok(self.report(false));
+        }
         let mut dirty_source = self.source.clone();
         dirty_source[65] |= 1;
         let mut phase = "synchronizing native allocation dirty markers";
         let result = (|| -> Result<serde_json::Value> {
             for header in &self.headers {
-                write_patch(cx, &self.volume, header.offset, &header.original, &header.dirty())?;
+                write_patch(
+                    cx,
+                    &self.volume,
+                    header.offset,
+                    &header.original,
+                    &header.dirty(),
+                )?;
             }
             self.volume.device.sync(cx)?;
-            for header in &self.headers { self.expect(cx, header.offset, &header.dirty())?; }
+            for header in &self.headers {
+                self.expect(cx, header.offset, &header.dirty())?;
+            }
             self.verify_evidence(cx)?;
 
             phase = "synchronizing the retained boot source as dirty";
-            write_patch(cx, &self.volume, self.source_at, &self.source, &dirty_source)?;
+            write_patch(
+                cx,
+                &self.volume,
+                self.source_at,
+                &self.source,
+                &dirty_source,
+            )?;
             self.volume.device.sync(cx)?;
             self.expect(cx, self.source_at, &dirty_source)?;
 
             phase = "restoring the destination boot sector";
-            write_patch(cx, &self.volume, self.target_at, &self.target, &dirty_source)?;
+            write_patch(
+                cx,
+                &self.volume,
+                self.target_at,
+                &self.target,
+                &dirty_source,
+            )?;
             self.volume.device.sync(cx)?;
             self.expect(cx, self.source_at, &dirty_source)?;
             self.expect(cx, self.target_at, &dirty_source)?;
-            for header in &self.headers { self.expect(cx, header.offset, &header.dirty())?; }
+            for header in &self.headers {
+                self.expect(cx, header.offset, &header.dirty())?;
+            }
             self.verify_evidence(cx)?;
 
             phase = "verifying native diagnosis without a boot projection";
-            let actual = DiagnosticVolume::from_device(cx, Box::new(Shared(Arc::clone(&self.device))), self.args)?;
+            let actual = DiagnosticVolume::from_device(
+                cx,
+                Box::new(Shared(Arc::clone(&self.device))),
+                self.args,
+            )?;
             let after = actual.report(cx)?;
             admissible(&after)?;
-            if actual.volume.geometry != self.volume.geometry || !same_structure(&self.before, &after)
-                || after.clean || !after.issues.iter().any(|issue| issue.kind == "native_boot_dirty")
-                || !after.issues.iter().any(|issue| issue.kind == "native_fat_dirty")
+            if actual.volume.geometry != self.volume.geometry
+                || !same_structure(&self.before, &after)
+                || after.clean
+                || !after
+                    .issues
+                    .iter()
+                    .any(|issue| issue.kind == "native_boot_dirty")
+                || !after
+                    .issues
+                    .iter()
+                    .any(|issue| issue.kind == "native_fat_dirty")
             {
                 bail!("restored boot changed native ownership or did not retain dirty state");
             }
             self.expect(cx, self.source_at, &dirty_source)?;
             self.expect(cx, self.target_at, &dirty_source)?;
-            for header in &self.headers { self.expect(cx, header.offset, &header.dirty())?; }
+            for header in &self.headers {
+                self.expect(cx, header.offset, &header.dirty())?;
+            }
             self.verify_evidence(cx)?;
             let mut report = self.report(false);
             report["verification"] = serde_json::to_value(after)?;

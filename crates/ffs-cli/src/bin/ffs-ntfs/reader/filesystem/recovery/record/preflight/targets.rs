@@ -6,8 +6,8 @@
 //! No target-page I/O, writes, or mount authorization is performed here.
 
 use super::{
-    Cx, LFS_CLIENT_RECORD, LogRecord, Result, checkpoint, corrupt,
-    table::RestartTable, u16_at, u32_at, u64_at, unsupported,
+    Cx, LFS_CLIENT_RECORD, LogRecord, Result, checkpoint, corrupt, table::RestartTable, u16_at,
+    u32_at, u64_at, unsupported,
 };
 use std::collections::{BTreeMap, BTreeSet};
 
@@ -30,13 +30,18 @@ pub(super) struct Attribute {
 impl Attribute {
     fn parse(data: &[u8], boundary: u64) -> Result<Self> {
         if data.len() != 40 {
-            return Err(unsupported("$LogFile target needs a native 40-byte open attribute"));
+            return Err(unsupported(
+                "$LogFile target needs a native 40-byte open attribute",
+            ));
         }
         let reference = u64_at(data, 16)?;
         let kind = u32_at(data, 8)?;
         let opened = u64_at(data, 24)?;
         if reference == 0 || opened > boundary {
-            return Err(corrupt(0, "invalid $LogFile open-attribute identity or LSN"));
+            return Err(corrupt(
+                0,
+                "invalid $LogFile open-attribute identity or LSN",
+            ));
         }
         if !(0x10..=0x100).contains(&kind) || !kind.is_multiple_of(0x10) {
             return Err(unsupported("unknown $LogFile open-attribute type"));
@@ -70,7 +75,10 @@ pub(super) struct State {
 
 fn slot(value: u32) -> Result<u32> {
     if value < 24 || value > u32::from(u16::MAX) || !(value - 24).is_multiple_of(40) {
-        return Err(corrupt(0, "$LogFile target is not an aligned open-attribute slot"));
+        return Err(corrupt(
+            0,
+            "$LogFile target is not an aligned open-attribute slot",
+        ));
     }
     Ok(value)
 }
@@ -86,7 +94,10 @@ fn name(data: &[u8]) -> Result<Vec<u16>> {
     if !data.len().is_multiple_of(2) || data.len() > 510 {
         return Err(corrupt(0, "invalid $LogFile native attribute-name length"));
     }
-    Ok(data.as_chunks::<2>().0.iter()
+    Ok(data
+        .as_chunks::<2>()
+        .0
+        .iter()
         .map(|word| u16::from_le_bytes(*word))
         .collect())
 }
@@ -119,16 +130,25 @@ pub(super) fn changes_pages(op: u16) -> bool {
 
 impl State {
     fn charge(&mut self, amount: usize) -> Result<()> {
-        self.work = self.work.checked_add(amount)
+        self.work = self
+            .work
+            .checked_add(amount)
             .filter(|work| *work <= MAX_WORK)
             .ok_or_else(|| unsupported("$LogFile target Analysis exceeds its work budget"))?;
         Ok(())
     }
 
-    pub(super) fn seed_attributes(&mut self, cx: &Cx, table: &RestartTable<'_>, boundary: u64) -> Result<()> {
+    pub(super) fn seed_attributes(
+        &mut self,
+        cx: &Cx,
+        table: &RestartTable<'_>,
+        boundary: u64,
+    ) -> Result<()> {
         checkpoint(cx)?;
         if table.entry_size != 40 || table.entries.len() > MAX_ATTRIBUTES {
-            return Err(unsupported("$LogFile target attribute table exceeds the native profile"));
+            return Err(unsupported(
+                "$LogFile target attribute table exceeds the native profile",
+            ));
         }
         for (&id, bytes) in &table.entries {
             checkpoint(cx)?;
@@ -158,14 +178,17 @@ impl State {
                 return checkpoint(cx);
             }
             let id = slot(id)?;
-            let bytes = data.get(at..at + size)
+            let bytes = data
+                .get(at..at + size)
                 .ok_or_else(|| corrupt(0, "truncated checkpoint attribute name"))?;
             let decoded = name(bytes)?;
             if !seen.insert(id) {
                 return Err(corrupt(0, "duplicate checkpoint attribute name"));
             }
-            self.attributes.get_mut(&id)
-                .ok_or_else(|| corrupt(0, "checkpoint name has no open attribute"))?.name = decoded;
+            self.attributes
+                .get_mut(&id)
+                .ok_or_else(|| corrupt(0, "checkpoint name has no open attribute"))?
+                .name = decoded;
             at += size;
         }
     }
@@ -182,7 +205,9 @@ impl State {
                 .map_err(|_| corrupt(0, "dirty-page cluster count overflow"))?;
             let vcn = u64_at(entry, 16)?;
             let oldest = u64_at(entry, 24)?;
-            if !self.attributes.contains_key(&id) || oldest == 0 || count == 0
+            if !self.attributes.contains_key(&id)
+                || oldest == 0
+                || count == 0
                 || count > (entry.len() - 32) / 8
                 || vcn.checked_add(count as u64).is_none()
             {
@@ -192,7 +217,10 @@ impl State {
             for index in 0..count {
                 checkpoint(cx)?;
                 let key = (id, vcn + index as u64);
-                let value = Cluster { oldest, lcn: lcn(u64_at(entry, 32 + index * 8)?)? };
+                let value = Cluster {
+                    oldest,
+                    lcn: lcn(u64_at(entry, 32 + index * 8)?)?,
+                };
                 if let Some(existing) = self.clusters.get_mut(&key) {
                     // Native tables can repeat a VCN for sub-cluster pages.
                     // Agreeing mappings merge; contradictory physical claims do not.
@@ -202,7 +230,9 @@ impl State {
                     existing.oldest = existing.oldest.min(oldest);
                 } else {
                     if self.clusters.len() == MAX_CLUSTERS {
-                        return Err(unsupported("$LogFile target Analysis exceeds 65536 clusters"));
+                        return Err(unsupported(
+                            "$LogFile target Analysis exceeds 65536 clusters",
+                        ));
                     }
                     self.clusters.insert(key, value);
                 }
@@ -224,24 +254,37 @@ impl State {
             }
             if value.opened == existing.opened {
                 if *existing != value {
-                    return Err(corrupt(0, "open-attribute record disagrees with its checkpoint identity"));
+                    return Err(corrupt(
+                        0,
+                        "open-attribute record disagrees with its checkpoint identity",
+                    ));
                 }
                 return Ok(());
             }
-            if existing.reference == value.reference && existing.kind == value.kind
-                && existing.index_bytes == value.index_bytes && existing.name == value.name
+            if existing.reference == value.reference
+                && existing.kind == value.kind
+                && existing.index_bytes == value.index_bytes
+                && existing.name == value.name
             {
                 // Reopening the same stream must not erase its outstanding
                 // checkpoint dirty pages or raise their redo low-water mark.
                 return Ok(());
             }
         } else if self.attributes.len() == MAX_ATTRIBUTES {
-            return Err(unsupported("$LogFile target Analysis exceeds 4096 attributes"));
+            return Err(unsupported(
+                "$LogFile target Analysis exceeds 4096 attributes",
+            ));
         }
         // Do not carry another incarnation's mapping into the new file/stream.
         self.charge(self.clusters.len())?;
-        if self.clusters.iter().any(|((target, _), entry)| *target == id && entry.lcn.is_some()) {
-            return Err(unsupported("$LogFile reuses an attribute slot with unresolved dirty ownership"));
+        if self
+            .clusters
+            .iter()
+            .any(|((target, _), entry)| *target == id && entry.lcn.is_some())
+        {
+            return Err(unsupported(
+                "$LogFile reuses an attribute slot with unresolved dirty ownership",
+            ));
         }
         self.clusters.retain(|(target, _), _| *target != id);
         self.attributes.insert(id, value);
@@ -271,7 +314,11 @@ impl State {
             checkpoint(cx)?;
             values.push(lcn(u64_at(&record.data, 32 + index * 8)?)?);
         }
-        if self.attributes.get(&id).is_some_and(|attribute| record.lsn < attribute.opened) {
+        if self
+            .attributes
+            .get(&id)
+            .is_some_and(|attribute| record.lsn < attribute.opened)
+        {
             return Ok(());
         }
         if hotfix {
@@ -294,9 +341,17 @@ impl State {
                 entry.lcn = value;
             } else {
                 if self.clusters.len() == MAX_CLUSTERS {
-                    return Err(unsupported("$LogFile target Analysis exceeds 65536 clusters"));
+                    return Err(unsupported(
+                        "$LogFile target Analysis exceeds 65536 clusters",
+                    ));
                 }
-                self.clusters.insert(key, Cluster { oldest: record.lsn, lcn: value });
+                self.clusters.insert(
+                    key,
+                    Cluster {
+                        oldest: record.lsn,
+                        lcn: value,
+                    },
+                );
             }
         }
         checkpoint(cx)
@@ -313,11 +368,15 @@ impl State {
             checkpoint(cx)?;
             let start = u64_at(data, at)?;
             let count = u64_at(data, at + 8)?;
-            let end = start.checked_add(count)
+            let end = start
+                .checked_add(count)
                 .filter(|end| *end <= i64::MAX as u64 + 1)
                 .ok_or_else(|| corrupt(0, "overflowing $LogFile deleted-cluster range"))?;
             if count == 0 || start > i64::MAX as u64 {
-                return Err(corrupt(0, "empty or negative $LogFile deleted-cluster range"));
+                return Err(corrupt(
+                    0,
+                    "empty or negative $LogFile deleted-cluster range",
+                ));
             }
             ranges.push((start, end));
         }
@@ -373,7 +432,10 @@ impl State {
             checkpoint(cx)?;
             if entry.lcn.is_some() {
                 if !self.attributes.contains_key(&id) {
-                    return Err(corrupt(0, "surviving dirty mapping has no native attribute identity"));
+                    return Err(corrupt(
+                        0,
+                        "surviving dirty mapping has no native attribute identity",
+                    ));
                 }
                 mapped += 1;
                 oldest = Some(oldest.map_or(entry.oldest, |lsn| lsn.min(entry.oldest)));
@@ -387,10 +449,18 @@ impl State {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::super::TailRecord;
+    use super::*;
 
-    fn record(lsn: u64, op: u16, id: u16, vcn: u64, lcns: &[u64], redo: &[u8], undo: &[u8]) -> LogRecord {
+    fn record(
+        lsn: u64,
+        op: u16,
+        id: u16,
+        vcn: u64,
+        lcns: &[u64],
+        redo: &[u8],
+        undo: &[u8],
+    ) -> LogRecord {
         let start = 32 + lcns.len().max(1) * 8;
         let undo_start = (start + redo.len()).next_multiple_of(8);
         let mut data = vec![0; undo_start + undo.len()];
@@ -407,8 +477,18 @@ mod tests {
         }
         data[start..start + redo.len()].copy_from_slice(redo);
         data[undo_start..].copy_from_slice(undo);
-        LogRecord { lsn, previous: 0, undo_next: 0, kind: LFS_CLIENT_RECORD,
-            summary: TailRecord { transaction_id: 24, redo_op: op, undo_op: 0 }, data }
+        LogRecord {
+            lsn,
+            previous: 0,
+            undo_next: 0,
+            kind: LFS_CLIENT_RECORD,
+            summary: TailRecord {
+                transaction_id: 24,
+                redo_op: op,
+                undo_op: 0,
+            },
+            data,
+        }
     }
 
     fn attribute(reference: u64, opened: u64) -> Vec<u8> {
@@ -422,14 +502,28 @@ mod tests {
 
     fn state() -> State {
         let mut state = State::default();
-        state.observe(&Cx::for_testing(), &record(10, OPEN_ATTRIBUTE, 24, 0, &[],
-            &attribute((7 << 48) | 42, 0), &[0, 0xD8, 97, 0])).unwrap();
+        state
+            .observe(
+                &Cx::for_testing(),
+                &record(
+                    10,
+                    OPEN_ATTRIBUTE,
+                    24,
+                    0,
+                    &[],
+                    &attribute((7 << 48) | 42, 0),
+                    &[0, 0xD8, 97, 0],
+                ),
+            )
+            .unwrap();
         state
     }
 
     fn ranges(values: &[(u64, u64)]) -> Vec<u8> {
-        values.iter().flat_map(|(start, count)| start.to_le_bytes()
-            .into_iter().chain(count.to_le_bytes())).collect()
+        values
+            .iter()
+            .flat_map(|(start, count)| start.to_le_bytes().into_iter().chain(count.to_le_bytes()))
+            .collect()
     }
 
     #[test]
@@ -437,8 +531,12 @@ mod tests {
         let mut value = attribute((7 << 48) | 42, 0);
         value[32..40].fill(0xFF);
         let mut state = State::default();
-        state.observe(&Cx::for_testing(), &record(10, OPEN_ATTRIBUTE, 24, 0, &[],
-            &value, &[0, 0xD8, 97, 0])).unwrap();
+        state
+            .observe(
+                &Cx::for_testing(),
+                &record(10, OPEN_ATTRIBUTE, 24, 0, &[], &value, &[0, 0xD8, 97, 0]),
+            )
+            .unwrap();
         let target = &state.attributes[&24];
         assert_eq!(target.reference, (7 << 48) | 42);
         assert_eq!(target.name, vec![0xD800, 97]);
@@ -449,11 +547,29 @@ mod tests {
     fn updates_keep_earliest_redo_lsn_and_hotfix_relocates_earlier_work() {
         let cx = Cx::for_testing();
         let mut state = state();
-        state.observe(&cx, &record(20, 8, 24, 8, &[100, 200], b"a", &[])).unwrap();
-        state.observe(&cx, &record(30, 8, 24, 8, &[100], b"b", &[])).unwrap();
-        state.observe(&cx, &record(40, HOT_FIX, 24, 8, &[300], &[], &[])).unwrap();
-        assert_eq!(state.clusters[&(24, 8)], Cluster { oldest: 20, lcn: Some(300) });
-        assert_eq!(state.clusters[&(24, 9)], Cluster { oldest: 20, lcn: Some(200) });
+        state
+            .observe(&cx, &record(20, 8, 24, 8, &[100, 200], b"a", &[]))
+            .unwrap();
+        state
+            .observe(&cx, &record(30, 8, 24, 8, &[100], b"b", &[]))
+            .unwrap();
+        state
+            .observe(&cx, &record(40, HOT_FIX, 24, 8, &[300], &[], &[]))
+            .unwrap();
+        assert_eq!(
+            state.clusters[&(24, 8)],
+            Cluster {
+                oldest: 20,
+                lcn: Some(300)
+            }
+        );
+        assert_eq!(
+            state.clusters[&(24, 9)],
+            Cluster {
+                oldest: 20,
+                lcn: Some(200)
+            }
+        );
         assert_eq!(state.finish(&cx).unwrap(), (2, 0, Some(20)));
     }
 
@@ -461,12 +577,29 @@ mod tests {
     fn deletion_uses_half_open_ranges_and_reallocation_resets_redo_age() {
         let cx = Cx::for_testing();
         let mut state = state();
-        state.observe(&cx, &record(20, 8, 24, 0, &[99, 100, 101, 102], b"a", &[])).unwrap();
-        state.observe(&cx, &record(30, DELETE_CLUSTERS, 0, 0, &[], &ranges(&[(100, 2)]), &[])).unwrap();
-        state.observe(&cx, &record(40, HOT_FIX, 24, 1, &[500], &[], &[])).unwrap();
+        state
+            .observe(&cx, &record(20, 8, 24, 0, &[99, 100, 101, 102], b"a", &[]))
+            .unwrap();
+        state
+            .observe(
+                &cx,
+                &record(30, DELETE_CLUSTERS, 0, 0, &[], &ranges(&[(100, 2)]), &[]),
+            )
+            .unwrap();
+        state
+            .observe(&cx, &record(40, HOT_FIX, 24, 1, &[500], &[], &[]))
+            .unwrap();
         assert_eq!(state.clusters[&(24, 1)].lcn, None);
-        state.observe(&cx, &record(50, 8, 24, 1, &[600], b"b", &[])).unwrap();
-        assert_eq!(state.clusters[&(24, 1)], Cluster { oldest: 50, lcn: Some(600) });
+        state
+            .observe(&cx, &record(50, 8, 24, 1, &[600], b"b", &[]))
+            .unwrap();
+        assert_eq!(
+            state.clusters[&(24, 1)],
+            Cluster {
+                oldest: 50,
+                lcn: Some(600)
+            }
+        );
         assert_eq!(state.finish(&cx).unwrap(), (3, 1, Some(20)));
         assert_eq!(state.clusters[&(24, 0)].lcn, Some(99));
         assert_eq!(state.clusters[&(24, 3)].lcn, Some(102));
@@ -476,9 +609,13 @@ mod tests {
     fn deletion_does_not_expand_enormous_ranges_or_depend_on_range_order() {
         let cx = Cx::for_testing();
         let mut state = state();
-        state.observe(&cx, &record(20, 8, 24, 0, &[99, 100, 101], b"x", &[])).unwrap();
+        state
+            .observe(&cx, &record(20, 8, 24, 0, &[99, 100, 101], b"x", &[]))
+            .unwrap();
         let data = ranges(&[(101, i64::MAX as u64 - 100), (100, 2), (100, 1)]);
-        state.observe(&cx, &record(30, DELETE_CLUSTERS, 0, 0, &[], &data, &[])).unwrap();
+        state
+            .observe(&cx, &record(30, DELETE_CLUSTERS, 0, 0, &[], &data, &[]))
+            .unwrap();
         assert_eq!(state.finish(&cx).unwrap(), (1, 2, Some(20)));
     }
 
@@ -486,12 +623,34 @@ mod tests {
     fn reused_attribute_slot_does_not_inherit_old_file_clusters_or_name() {
         let cx = Cx::for_testing();
         let mut state = state();
-        state.observe(&cx, &record(20, 8, 24, 0, &[99], b"a", &[])).unwrap();
-        state.observe(&cx, &record(25, DELETE_CLUSTERS, 0, 0, &[], &ranges(&[(99, 1)]), &[])).unwrap();
-        state.observe(&cx, &record(30, OPEN_ATTRIBUTE, 24, 0, &[], &attribute((8 << 48) | 43, 0), &[])).unwrap();
+        state
+            .observe(&cx, &record(20, 8, 24, 0, &[99], b"a", &[]))
+            .unwrap();
+        state
+            .observe(
+                &cx,
+                &record(25, DELETE_CLUSTERS, 0, 0, &[], &ranges(&[(99, 1)]), &[]),
+            )
+            .unwrap();
+        state
+            .observe(
+                &cx,
+                &record(
+                    30,
+                    OPEN_ATTRIBUTE,
+                    24,
+                    0,
+                    &[],
+                    &attribute((8 << 48) | 43, 0),
+                    &[],
+                ),
+            )
+            .unwrap();
         assert!(state.clusters.is_empty());
         assert!(state.attributes[&24].name.is_empty());
-        state.observe(&cx, &record(40, 8, 24, 0, &[99], b"b", &[])).unwrap();
+        state
+            .observe(&cx, &record(40, 8, 24, 0, &[99], b"b", &[]))
+            .unwrap();
         assert_eq!(state.clusters[&(24, 0)].oldest, 40);
     }
 
@@ -499,12 +658,40 @@ mod tests {
     fn reopen_preserves_dirty_stream_but_ambiguous_slot_reuse_is_not_authority() {
         let cx = Cx::for_testing();
         let mut state = state();
-        state.observe(&cx, &record(20, 8, 24, 0, &[99], b"a", &[])).unwrap();
-        state.observe(&cx, &record(30, OPEN_ATTRIBUTE, 24, 0, &[],
-            &attribute((7 << 48) | 42, 0), &[0, 0xD8, 97, 0])).unwrap();
+        state
+            .observe(&cx, &record(20, 8, 24, 0, &[99], b"a", &[]))
+            .unwrap();
+        state
+            .observe(
+                &cx,
+                &record(
+                    30,
+                    OPEN_ATTRIBUTE,
+                    24,
+                    0,
+                    &[],
+                    &attribute((7 << 48) | 42, 0),
+                    &[0, 0xD8, 97, 0],
+                ),
+            )
+            .unwrap();
         assert_eq!(state.clusters[&(24, 0)].oldest, 20);
-        assert!(state.observe(&cx, &record(40, OPEN_ATTRIBUTE, 24, 0, &[],
-            &attribute((8 << 48) | 43, 0), &[])).is_err());
+        assert!(
+            state
+                .observe(
+                    &cx,
+                    &record(
+                        40,
+                        OPEN_ATTRIBUTE,
+                        24,
+                        0,
+                        &[],
+                        &attribute((8 << 48) | 43, 0),
+                        &[]
+                    )
+                )
+                .is_err()
+        );
         assert_eq!(state.clusters[&(24, 0)].lcn, Some(99));
     }
 
@@ -513,7 +700,15 @@ mod tests {
         let cx = Cx::for_testing();
         let bad = [
             record(20, DELETE_CLUSTERS, 0, 0, &[], &ranges(&[(100, 0)]), &[]),
-            record(20, DELETE_CLUSTERS, 0, 0, &[], &ranges(&[(u64::MAX, 2)]), &[]),
+            record(
+                20,
+                DELETE_CLUSTERS,
+                0,
+                0,
+                &[],
+                &ranges(&[(u64::MAX, 2)]),
+                &[],
+            ),
             record(20, DELETE_CLUSTERS, 0, 0, &[], &[1; 15], &[]),
             record(20, 8, 24, u64::MAX, &[100], &[], &[]),
             record(20, 8, 24, 0, &[100, u64::MAX], &[], &[]),
@@ -533,9 +728,13 @@ mod tests {
     fn zero_lcn_is_not_physical_zero_and_unknown_surviving_targets_fail() {
         let cx = Cx::for_testing();
         let mut state = State::default();
-        state.observe(&cx, &record(10, 8, 24, 0, &[0], &[], &[])).unwrap();
+        state
+            .observe(&cx, &record(10, 8, 24, 0, &[0], &[], &[]))
+            .unwrap();
         assert_eq!(state.finish(&cx).unwrap(), (0, 1, None));
-        state.observe(&cx, &record(20, 8, 24, 0, &[9], &[], &[])).unwrap();
+        state
+            .observe(&cx, &record(20, 8, 24, 0, &[9], &[], &[]))
+            .unwrap();
         assert!(state.finish(&cx).is_err());
     }
 
@@ -543,9 +742,17 @@ mod tests {
     fn target_analysis_is_chronological_and_has_a_cumulative_work_limit() {
         let cx = Cx::for_testing();
         let mut state = state();
-        assert!(state.observe(&cx, &record(10, 0, 0, 0, &[], &[], &[])).is_err());
+        assert!(
+            state
+                .observe(&cx, &record(10, 0, 0, 0, &[], &[], &[]))
+                .is_err()
+        );
         state.work = MAX_WORK;
-        assert!(state.observe(&cx, &record(20, 8, 24, 0, &[9], &[], &[])).is_err());
+        assert!(
+            state
+                .observe(&cx, &record(20, 8, 24, 0, &[9], &[], &[]))
+                .is_err()
+        );
         assert!(state.clusters.is_empty());
     }
 
@@ -559,28 +766,53 @@ mod tests {
         a[32..40].copy_from_slice(&100_u64.to_le_bytes());
         let mut b = a.clone();
         b[24..32].copy_from_slice(&15_u64.to_le_bytes());
-        let table = RestartTable { entry_size: 40,
-            entries: BTreeMap::from([(24, a.as_slice()), (64, b.as_slice())]) };
+        let table = RestartTable {
+            entry_size: 40,
+            entries: BTreeMap::from([(24, a.as_slice()), (64, b.as_slice())]),
+        };
         let mut state = state();
         state.seed_dirty(&cx, &table).unwrap();
-        assert_eq!(state.clusters[&(24, 0)], Cluster { oldest: 15, lcn: Some(100) });
+        assert_eq!(
+            state.clusters[&(24, 0)],
+            Cluster {
+                oldest: 15,
+                lcn: Some(100)
+            }
+        );
         b[32..40].copy_from_slice(&200_u64.to_le_bytes());
-        let conflicting = RestartTable { entry_size: 40,
-            entries: BTreeMap::from([(24, a.as_slice()), (64, b.as_slice())]) };
-        assert!(State { attributes: state.attributes, ..State::default() }
-            .seed_dirty(&cx, &conflicting).is_err());
+        let conflicting = RestartTable {
+            entry_size: 40,
+            entries: BTreeMap::from([(24, a.as_slice()), (64, b.as_slice())]),
+        };
+        assert!(
+            State {
+                attributes: state.attributes,
+                ..State::default()
+            }
+            .seed_dirty(&cx, &conflicting)
+            .is_err()
+        );
     }
 
     #[test]
     fn checkpoint_incarnation_blocks_older_open_and_mapping_rewind() {
         let cx = Cx::for_testing();
         let value = attribute((9 << 48) | 50, 30);
-        let table = RestartTable { entry_size: 40,
-            entries: BTreeMap::from([(24, value.as_slice())]) };
+        let table = RestartTable {
+            entry_size: 40,
+            entries: BTreeMap::from([(24, value.as_slice())]),
+        };
         let mut state = State::default();
         state.seed_attributes(&cx, &table, 40).unwrap();
-        state.observe(&cx, &record(10, OPEN_ATTRIBUTE, 24, 0, &[], &attribute(42, 0), &[])).unwrap();
-        state.observe(&cx, &record(20, 8, 24, 0, &[99], &[], &[])).unwrap();
+        state
+            .observe(
+                &cx,
+                &record(10, OPEN_ATTRIBUTE, 24, 0, &[], &attribute(42, 0), &[]),
+            )
+            .unwrap();
+        state
+            .observe(&cx, &record(20, 8, 24, 0, &[99], &[], &[]))
+            .unwrap();
         assert!(state.clusters.is_empty());
         assert_eq!(state.attributes[&24].reference, (9 << 48) | 50);
     }
@@ -622,8 +854,11 @@ mod tests {
             let mut tail = record(lsns[2], 0, 0, 0, &[], &[], &[]);
             tail.kind = LFS_CLIENT_RESTART;
             tail.data = checkpoint_data;
-            let records = [record(lsns[0], 0x1D, 0, 0, &[], &attrs, &[]),
-                record(lsns[1], 0x1F, 0, 0, &[], &dirty, &[]), tail];
+            let records = [
+                record(lsns[0], 0x1D, 0, 0, &[], &attrs, &[]),
+                record(lsns[1], 0x1F, 0, 0, &[], &dirty, &[]),
+                tail,
+            ];
             let mut pages = BTreeMap::new();
             for (index, record) in records.iter().enumerate() {
                 let mut page = vec![0; PAGE];
@@ -653,19 +888,36 @@ mod tests {
                 pages.insert(FIRST + index as u64 * PAGE as u64, page);
             }
             let restart = Restart {
-                system_page: PAGE as u32, log_page: PAGE as u32, version: (2, 0),
-                clean: false, current_lsn: lsns[2], seq_num_bits: 44,
-                file_size: 4 * 1024 * 1024, last_lsn_data_len: 64,
-                record_header_len: 48, data_off: 128,
-                active_client_seq: Some(9), active_client_oldest_lsn: Some(lsns[0]),
-                active_client_restart_lsn: Some(lsns[2]), area: Vec::new(),
+                system_page: PAGE as u32,
+                log_page: PAGE as u32,
+                version: (2, 0),
+                clean: false,
+                current_lsn: lsns[2],
+                seq_num_bits: 44,
+                file_size: 4 * 1024 * 1024,
+                last_lsn_data_len: 64,
+                record_header_len: 48,
+                data_off: 128,
+                active_client_seq: Some(9),
+                active_client_oldest_lsn: Some(lsns[0]),
+                active_client_restart_lsn: Some(lsns[2]),
+                area: Vec::new(),
             };
             let before = pages.clone();
-            let result = super::super::validate(&Cx::for_testing(), &restart,
-                restart.file_size, &records[2], &mut |offset, size| {
+            let result = super::super::validate(
+                &Cx::for_testing(),
+                &restart,
+                restart.file_size,
+                &records[2],
+                &mut |offset, size| {
                     assert_eq!(size, PAGE);
-                    pages.get(&offset).cloned().ok_or_else(|| corrupt(offset, "unexpected fixture read"))
-                }, None);
+                    pages
+                        .get(&offset)
+                        .cloned()
+                        .ok_or_else(|| corrupt(offset, "unexpected fixture read"))
+                },
+                None,
+            );
             assert_eq!(result.is_err(), conflict);
             assert_eq!(pages, before);
         }

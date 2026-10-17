@@ -12,8 +12,8 @@ mod storage;
 
 use super::super::{Pool, VdevConfig};
 use super::{
-    BlockPointer, Cx, Endian, FfsError, MAX_READ_BYTES, Objects, Result, checkpoint,
-    corrupt, parse, unsupported,
+    BlockPointer, Cx, Endian, FfsError, MAX_READ_BYTES, Objects, Result, checkpoint, corrupt,
+    parse, unsupported,
 };
 use ffs_ondisk::zfs::{Dva, MAX_BLOCK_BYTES, checksum};
 use ffs_ondisk::zfs_zpl::Kind;
@@ -40,7 +40,12 @@ fn word(raw: &[u8], at: usize, order: Endian) -> Result<u64> {
 }
 
 fn identity(raw: &[u8], order: Endian) -> Result<[u64; 4]> {
-    Ok([word(raw, 96, order)?, word(raw, 104, order)?, word(raw, 112, order)?, word(raw, 120, order)?])
+    Ok([
+        word(raw, 96, order)?,
+        word(raw, 104, order)?,
+        word(raw, 112, order)?,
+        word(raw, 120, order)?,
+    ])
 }
 
 impl Pointer {
@@ -50,14 +55,23 @@ impl Pointer {
             return Ok(None);
         }
         let property = word(raw, 48, order)?;
-        if bp.embedded() || bp.protected() || property & (1_u64 << 62) != 0
-            || bp.gang() || bp.level() != 0 || bp.object_type() != 9
-            || bp.compression() != 2 || !matches!(bp.checksum_type(), 5 | 9)
+        if bp.embedded()
+            || bp.protected()
+            || property & (1_u64 << 62) != 0
+            || bp.gang()
+            || bp.level() != 0
+            || bp.object_type() != 9
+            || bp.compression() != 2
+            || !matches!(bp.checksum_type(), 5 | 9)
         {
-            return Err(unsupported("ZIL requires unencrypted, uncompressed ZILOG/ZILOG2 log blocks"));
+            return Err(unsupported(
+                "ZIL requires unencrypted, uncompressed ZILOG/ZILOG2 log blocks",
+            ));
         }
-        if bp.birth() == 0 || bp.physical_birth() > bp.birth()
-            || word(raw, 56, order)? != 0 || word(raw, 64, order)? != 0
+        if bp.birth() == 0
+            || bp.physical_birth() > bp.birth()
+            || word(raw, 56, order)? != 0
+            || word(raw, 64, order)? != 0
             || bp.physical_bytes() != bp.logical_bytes()
             || !(4096..=MAX_BLOCK_BYTES).contains(&bp.physical_bytes())
             || !bp.physical_bytes().is_multiple_of(4096)
@@ -66,7 +80,9 @@ impl Pointer {
         }
         let identity = identity(raw, order)?;
         if identity[2] != dataset || identity[3] == 0 {
-            return Err(corrupt("ZIL chain identifies a different dataset or a zero sequence"));
+            return Err(corrupt(
+                "ZIL chain identifies a different dataset or a zero sequence",
+            ));
         }
         // Ordinary regular_dvas deliberately refuses ZIL checksum algorithms.
         // Decode their native address slots here, then reuse the leaf's complete
@@ -80,12 +96,18 @@ impl Pointer {
                 ended = true;
                 continue;
             }
-            if ended || first & 0xff00_0000_ff00_0000 != 0 || first & 0x00ff_ffff == 0 || second >> 63 != 0 {
+            if ended
+                || first & 0xff00_0000_ff00_0000 != 0
+                || first & 0x00ff_ffff == 0
+                || second >> 63 != 0
+            {
                 return Err(corrupt("invalid, ganged or noncontiguous ZIL DVA"));
             }
             dvas.push(Dva {
                 vdev: ((first >> 32) & 0x00ff_ffff) as u32,
-                offset: second.checked_mul(512).ok_or_else(|| corrupt("ZIL DVA offset overflow"))?,
+                offset: second
+                    .checked_mul(512)
+                    .ok_or_else(|| corrupt("ZIL DVA offset overflow"))?,
                 allocated_bytes: (first & 0x00ff_ffff) * 512,
                 gang: false,
             });
@@ -114,7 +136,8 @@ impl Pointer {
             if used < CHAIN_BYTES as u64 || used > raw.len() as u64 {
                 return Ok(false);
             }
-            usize::try_from(used.div_ceil(4096) * 4096).map_err(|_| corrupt("ZIL checksum span overflow"))?
+            usize::try_from(used.div_ceil(4096) * 4096)
+                .map_err(|_| corrupt("ZIL checksum span overflow"))?
         } else {
             raw.len()
         };
@@ -157,15 +180,21 @@ impl Header {
         if header.claim_txg > txg {
             return Err(corrupt("ZIL claim is newer than the selected pool TXG"));
         }
-        if header.claim_txg == 0 && (header.replay_sequence != 0
-            || header.claimed_block_sequence != 0 || header.claimed_record_sequence != 0
-            || header.flags != 0)
+        if header.claim_txg == 0
+            && (header.replay_sequence != 0
+                || header.claimed_block_sequence != 0
+                || header.claimed_record_sequence != 0
+                || header.flags != 0)
         {
-            return Err(corrupt("unclaimed ZIL header contains claim or replay state"));
+            return Err(corrupt(
+                "unclaimed ZIL header contains claim or replay state",
+            ));
         }
         if header.claim_txg != 0 {
             if header.flags & CLAIM_LR_VALID == 0 {
-                return Err(unsupported("legacy ZIL claims without a record-sequence boundary"));
+                return Err(unsupported(
+                    "legacy ZIL claims without a record-sequence boundary",
+                ));
             }
             if header.replay_sequence > header.claimed_record_sequence {
                 return Err(corrupt("ZIL replay sequence exceeds its claimed boundary"));
@@ -243,19 +272,28 @@ fn scan(
         records: Vec::new(),
     };
     let claimed = result.header.claim_txg != 0;
-    if claimed && pointer.as_ref().is_some_and(|first| first.identity[3] > result.header.claimed_block_sequence) {
+    if claimed
+        && pointer
+            .as_ref()
+            .is_some_and(|first| first.identity[3] > result.header.claimed_block_sequence)
+    {
         return Err(corrupt("ZIL first block exceeds its claimed boundary"));
     }
     let mut last_record = 0;
     let mut storage = ReadState::default();
     while let Some(current) = pointer {
         checkpoint(cx)?;
-        if claimed && current.identity[3] >= result.header.claimed_block_sequence && last_record == result.header.claimed_record_sequence {
+        if claimed
+            && current.identity[3] >= result.header.claimed_block_sequence
+            && last_record == result.header.claimed_record_sequence
+        {
             result.termination = Termination::ClaimedBoundary;
             break;
         }
         if claimed && current.identity[3] > result.header.claimed_block_sequence {
-            return Err(corrupt("ZIL chain ended before all claimed records were read"));
+            return Err(corrupt(
+                "ZIL chain ended before all claimed records were read",
+            ));
         }
         if result.verified_blocks == MAX_LOG_BLOCKS {
             return Err(unsupported("ZIL scan exceeds 4096 log blocks"));
@@ -285,9 +323,13 @@ fn scan(
         };
         let next = &raw[chain + 8..chain + 136];
         let mut expected = current.identity;
-        expected[3] = expected[3].checked_add(1).ok_or_else(|| corrupt("ZIL block sequence exhausted"))?;
+        expected[3] = expected[3]
+            .checked_add(1)
+            .ok_or_else(|| corrupt("ZIL block sequence exhausted"))?;
         if identity(next, payload_order)? != expected {
-            return Err(corrupt("ZIL next pointer changes chain identity or skips a sequence"));
+            return Err(corrupt(
+                "ZIL next pointer changes chain identity or skips a sequence",
+            ));
         }
         result.verified_blocks += 1;
         while at < end {
@@ -299,8 +341,15 @@ fn scan(
                 .map_err(|_| corrupt("ZIL record length overflow"))?;
             let sequence = word(&raw, at + 24, payload_order)?;
             let record_txg = word(&raw, at + 16, payload_order)?;
-            if length < 32 || !length.is_multiple_of(8) || length > end - at || sequence <= last_record || record_txg == 0 {
-                return Err(corrupt("invalid ZIL record length, transaction or sequence"));
+            if length < 32
+                || !length.is_multiple_of(8)
+                || length > end - at
+                || sequence <= last_record
+                || record_txg == 0
+            {
+                return Err(corrupt(
+                    "invalid ZIL record length, transaction or sequence",
+                ));
             }
             if claimed && sequence > result.header.claimed_record_sequence {
                 if last_record != result.header.claimed_record_sequence {
@@ -314,7 +363,11 @@ fn scan(
                 return Err(unsupported("ZIL scan exceeds 65536 records"));
             }
             let pending = sequence > result.header.replay_sequence
-                && if claimed { record_txg >= result.header.claim_txg } else { record_txg > txg };
+                && if claimed {
+                    record_txg >= result.header.claim_txg
+                } else {
+                    record_txg > txg
+                };
             result.records.push(Record {
                 kind: word(&raw, at, payload_order)?,
                 txg: record_txg,
@@ -343,34 +396,60 @@ impl Objects {
     /// view, with a dedicated ZIL verifier for replicas and RAIDZ reconstruction.
     pub fn intent_log(&mut self, cx: &Cx, components: &[Vec<u8>]) -> Result<IntentLog> {
         checkpoint(cx)?;
-        let dataset = self.datasets(cx)?.into_iter().find(|row| row.components == components)
+        let dataset = self
+            .datasets(cx)?
+            .into_iter()
+            .find(|row| row.components == components)
             .ok_or_else(|| FfsError::NotFound("ZFS head dataset".into()))?;
         if dataset.objectset_kind != 2 {
-            return Err(unsupported("ZIL file recovery requires a filesystem head, not a snapshot or zvol"));
+            return Err(unsupported(
+                "ZIL file recovery requires a filesystem head, not a snapshot or zvol",
+            ));
         }
         let object = self.load(cx, dataset.head_object)?;
         let bp = BlockPointer::parse(&object.node.bonus()[128..256], object.node.order())
             .map_err(|error| parse(&error))?;
-        let root = self.checked(cx, &bp, 11, 0, bp.logical_bytes(), object.ceiling)?
+        let root = self
+            .checked(cx, &bp, 11, 0, bp.logical_bytes(), object.ceiling)?
             .ok_or_else(|| corrupt("ZIL owner object set is a hole"))?;
         scan(
-            cx, &self.pool, &self.config, &root.bytes[512..704], root.order,
-            Selection { dataset: dataset.head_object, guid: dataset.guid, txg: self.txg },
+            cx,
+            &self.pool,
+            &self.config,
+            &root.bytes[512..704],
+            root.order,
+            Selection {
+                dataset: dataset.head_object,
+                guid: dataset.guid,
+                txg: self.txg,
+            },
         )
     }
 }
 
 #[derive(Debug)]
 enum Edit<'a> {
-    Write { object: u64, offset: u64, data: &'a [u8] },
-    Truncate { object: u64, size: u64 },
-    Free { object: u64, offset: u64, end: u64 },
+    Write {
+        object: u64,
+        offset: u64,
+        data: &'a [u8],
+    },
+    Truncate {
+        object: u64,
+        size: u64,
+    },
+    Free {
+        object: u64,
+        offset: u64,
+        end: u64,
+    },
 }
 impl Edit<'_> {
     fn object(&self) -> u64 {
         match self {
-            Self::Write { object, .. } | Self::Truncate { object, .. }
-                | Self::Free { object, .. } => *object,
+            Self::Write { object, .. }
+            | Self::Truncate { object, .. }
+            | Self::Free { object, .. } => *object,
         }
     }
     fn size_after(&self, size: u64) -> u64 {
@@ -387,7 +466,11 @@ fn file_range(record: &Record) -> Result<(u64, u64, u64)> {
     let object = word(raw, 32, record.order)?;
     let offset = word(raw, 40, record.order)?;
     let length = word(raw, 48, record.order)?;
-    if object == 0 || object >= (1_u64 << 48) || offset > i64::MAX as u64 || length > i64::MAX as u64 - offset {
+    if object == 0
+        || object >= (1_u64 << 48)
+        || offset > i64::MAX as u64
+        || length > i64::MAX as u64 - offset
+    {
         return Err(corrupt("ZIL file identity or signed file range is invalid"));
     }
     Ok((object, offset, length))
@@ -395,7 +478,9 @@ fn file_range(record: &Record) -> Result<(u64, u64, u64)> {
 
 fn edit(record: &Record) -> Result<Edit<'_>> {
     if !matches!(record.kind, 9 | 10) {
-        return Err(unsupported("file-data ZIL recovery refuses pending namespace, attribute and other record types"));
+        return Err(unsupported(
+            "file-data ZIL recovery refuses pending namespace, attribute and other record types",
+        ));
     }
     let raw = &record.raw;
     let (object, offset, length) = file_range(record)?;
@@ -407,19 +492,34 @@ fn edit(record: &Record) -> Result<Edit<'_>> {
         // ranges are freed without shortening the file, but CAN extend EOF
         // to offset + length. They are not keep-size hole-punch requests.
         return Ok(if length == 0 {
-            Edit::Truncate { object, size: offset }
+            Edit::Truncate {
+                object,
+                size: offset,
+            }
         } else {
-            Edit::Free { object, offset, end: offset + length }
+            Edit::Free {
+                object,
+                offset,
+                end: offset + length,
+            }
         });
     }
     if raw.len() <= 192 {
-        return Err(unsupported("file-data ZIL recovery requires copied writes; indirect writes are not replayed"));
+        return Err(unsupported(
+            "file-data ZIL recovery requires copied writes; indirect writes are not replayed",
+        ));
     }
     let size = usize::try_from(length).map_err(|_| corrupt("ZIL copied-write length overflow"))?;
     if size == 0 || size > raw.len() - 192 || raw.len() - 192 - size > 7 {
-        return Err(corrupt("ZIL copied-write payload length disagrees with its record"));
+        return Err(corrupt(
+            "ZIL copied-write payload length disagrees with its record",
+        ));
     }
-    Ok(Edit::Write { object, offset, data: &raw[192..192 + size] })
+    Ok(Edit::Write {
+        object,
+        offset,
+        data: &raw[192..192 + size],
+    })
 }
 
 fn overlap(start: u64, size: usize, from: u64, to: u64) -> std::ops::Range<usize> {
@@ -488,25 +588,39 @@ impl Objects {
     /// Recover a bounded range of an EXISTING regular file into memory only.
     /// Every pending record is admitted before any file bytes can escape. This
     /// is not namespace replay, native durable recovery or a writable mount.
-    pub fn read_with_intent_log(&mut self, cx: &Cx, components: &[Vec<u8>], path: &[u8], start: u64, bytes: usize, allow_unverified_tail: bool) -> Result<RecoveredRead> {
+    pub fn read_with_intent_log(
+        &mut self,
+        cx: &Cx,
+        components: &[Vec<u8>],
+        path: &[u8],
+        start: u64,
+        bytes: usize,
+        allow_unverified_tail: bool,
+    ) -> Result<RecoveredRead> {
         checkpoint(cx)?;
         if bytes > MAX_READ_BYTES {
             return Err(unsupported("ZIL recovered range exceeds 16 MiB"));
         }
         let log = self.intent_log(cx, components)?;
         if log.termination == Termination::UnverifiedTail && !allow_unverified_tail {
-            return Err(unsupported("unverified ZIL tail: explicit prefix-recovery authorization is required"));
+            return Err(unsupported(
+                "unverified ZIL tail: explicit prefix-recovery authorization is required",
+            ));
         }
         let plan = indirect::Plan::new(cx, &log.records)?;
         let mut view = self.zpl(cx, components)?;
         let object = view.resolve(cx, path)?;
         let (metadata, _) = view.stat(cx, object)?;
         if metadata.kind != Kind::Regular {
-            return Err(unsupported("ZIL recovered read requires an existing regular file"));
+            return Err(unsupported(
+                "ZIL recovered read requires an existing regular file",
+            ));
         }
         let data = plan.load(cx, &self.pool, &self.config, object)?;
         let edits = indirect::edits(cx, &log.records, &data, object)?;
-        let file_size = edits.iter().fold(metadata.size, |size, edit| edit.size_after(size));
+        let file_size = edits
+            .iter()
+            .fold(metadata.size, |size, edit| edit.size_after(size));
         let length = file_size.saturating_sub(start).min(bytes as u64) as usize;
         let result = recovery::read(cx, metadata.size, start, length, &edits, |at, count| {
             view.read(cx, object, at, count)
@@ -514,6 +628,11 @@ impl Objects {
         let applied_records = edits.len();
         drop(edits);
         checkpoint(cx)?;
-        Ok(RecoveredRead { bytes: result, file_size, applied_records, log })
+        Ok(RecoveredRead {
+            bytes: result,
+            file_size,
+            applied_records,
+            log,
+        })
     }
 }

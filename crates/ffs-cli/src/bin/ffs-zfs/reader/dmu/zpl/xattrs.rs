@@ -184,7 +184,14 @@ impl Zpl {
                     ));
                 }
                 return self
-                    .contents(cx, value.object, &object, value.size, 0, value.size as usize)
+                    .contents(
+                        cx,
+                        value.object,
+                        &object,
+                        value.size,
+                        0,
+                        value.size as usize,
+                    )
                     .map(Some);
             }
         }

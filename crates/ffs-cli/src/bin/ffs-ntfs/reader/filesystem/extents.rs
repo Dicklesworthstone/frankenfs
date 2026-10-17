@@ -75,7 +75,14 @@ pub(super) fn seek(
             Ok(offset)
         }
     } else if let Storage::Mapped(runs) = &stream.storage {
-        seek_mapped(cx, runs, cluster_bytes, stream.initialized, offset, want_data)
+        seek_mapped(
+            cx,
+            runs,
+            cluster_bytes,
+            stream.initialized,
+            offset,
+            want_data,
+        )
     } else if want_data {
         Ok(offset)
     } else {
@@ -262,11 +269,7 @@ mod tests {
     }
 
     fn run(vcn: u64, clusters: u64, lcn: Option<u64>) -> NtfsRun {
-        NtfsRun {
-            vcn,
-            clusters,
-            lcn,
-        }
+        NtfsRun { vcn, clusters, lcn }
     }
 
     fn assert_errno<T: std::fmt::Debug>(result: Result<T>, expected: i32) {
@@ -375,8 +378,8 @@ mod tests {
                     .collect();
                 let stream = mapped(runs, 16, initialized);
                 for offset in 0..16 {
-                    let expected_data = (offset..initialized)
-                        .find(|byte| mask & (1 << (byte / 4)) != 0);
+                    let expected_data =
+                        (offset..initialized).find(|byte| mask & (1 << (byte / 4)) != 0);
                     let expected_hole = (offset..16)
                         .find(|byte| *byte >= initialized || mask & (1 << (byte / 4)) == 0)
                         .unwrap_or(16);
@@ -425,17 +428,10 @@ mod tests {
         );
         assert_eq!(
             fiemap(&cx, &stream, 512, 0, u64::MAX).unwrap(),
-            vec![
-                extent(512, 307_200, 1024, 0),
-                extent(2048, 302_080, 512, 1),
-            ]
+            vec![extent(512, 307_200, 1024, 0), extent(2048, 302_080, 512, 1),]
         );
         // Adjacent physical runs remain distinct without FIEMAP_FLAG_MERGED.
-        let adjacent = mapped(
-            vec![run(0, 1, Some(40)), run(1, 1, Some(41))],
-            1024,
-            1024,
-        );
+        let adjacent = mapped(vec![run(0, 1, Some(40)), run(1, 1, Some(41))], 1024, 1024);
         assert_eq!(
             fiemap(&cx, &adjacent, 512, 0, u64::MAX).unwrap(),
             vec![extent(0, 20_480, 512, 0), extent(512, 20_992, 512, 1)]
@@ -491,7 +487,11 @@ mod tests {
             vec![extent(1024, 5120, 512, 1)]
         );
         assert!(fiemap(&cx, &stream, 512, 512, 512).unwrap().is_empty());
-        assert!(fiemap(&cx, &stream, 512, 1536, u64::MAX).unwrap().is_empty());
+        assert!(
+            fiemap(&cx, &stream, 512, 1536, u64::MAX)
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]
@@ -536,11 +536,7 @@ mod tests {
         }
         // A narrow query must not return an apparently complete prefix if a
         // later mapping is corrupt and therefore invalidates LAST accounting.
-        let later = mapped(
-            vec![run(0, 1, Some(20)), run(2, 1, Some(30))],
-            1536,
-            1536,
-        );
+        let later = mapped(vec![run(0, 1, Some(20)), run(2, 1, Some(30))], 1536, 1536);
         assert!(matches!(
             fiemap(&cx, &later, 512, 0, 1),
             Err(FfsError::Corruption { .. })

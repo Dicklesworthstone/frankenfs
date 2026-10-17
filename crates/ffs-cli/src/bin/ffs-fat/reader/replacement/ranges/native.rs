@@ -10,8 +10,8 @@ mod zero;
 
 use super::super::super::{Entry, FatTable, FatVolume, FileChain, MAX_CHAIN_CLUSTERS};
 use super::super::{
-    EXPECT_END, HASH_BYTES, allocate, change_fat, checkpoint, modified_timestamp,
-    reserve_clusters, set_dirty, set_hints, write_volume,
+    EXPECT_END, HASH_BYTES, allocate, change_fat, checkpoint, modified_timestamp, reserve_clusters,
+    set_dirty, set_hints, write_volume,
 };
 use super::{EditSource, FileSource, validate_edit_state};
 use anyhow::{Context, Result, bail};
@@ -83,14 +83,14 @@ impl FatVolume {
             return zero::apply(cx, self, path, offset, length, mode, now);
         }
         if mode & !libc::FALLOC_FL_KEEP_SIZE != 0 {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                libc::EOPNOTSUPP,
-            )).into());
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EOPNOTSUPP)).into());
         }
         if length == 0 {
             return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EINVAL)).into());
         }
-        let end = offset.checked_add(length).filter(|end| *end <= u64::from(u32::MAX))
+        let end = offset
+            .checked_add(length)
+            .filter(|end| *end <= u64::from(u32::MAX))
             .ok_or_else(|| FfsError::Io(std::io::Error::from_raw_os_error(libc::EFBIG)))?;
         validate_edit_state(cx, self)?;
         let entry = self.resolve(cx, path)?.ok_or(FfsError::IsDirectory)?;
@@ -107,12 +107,22 @@ impl FatVolume {
         // KEEP_SIZE changes neither the recorded length nor modification time.
         // The same is true of an already covered ordinary allocation request.
         let modified = (size > u64::from(original.chain.size))
-            .then(|| modified_timestamp(now)).transpose()?;
-        apply_update(cx, self, path, &entry, &original.chain, &source, Update {
-            capacity: u32::try_from(end.max(size)).context("FAT reservation exceeds native size")?,
-            modified,
-            changed: changed_range(u64::from(original.chain.size), &source),
-        })
+            .then(|| modified_timestamp(now))
+            .transpose()?;
+        apply_update(
+            cx,
+            self,
+            path,
+            &entry,
+            &original.chain,
+            &source,
+            Update {
+                capacity: u32::try_from(end.max(size))
+                    .context("FAT reservation exceeds native size")?,
+                modified,
+                changed: changed_range(u64::from(original.chain.size), &source),
+            },
+        )
     }
 }
 
@@ -167,10 +177,7 @@ impl Allocation {
                 bail!("native range reservation is no longer free");
             }
         }
-        Ok(Self {
-            chain,
-            added,
-        })
+        Ok(Self { chain, added })
     }
 }
 
@@ -188,7 +195,8 @@ fn changed_range(old_size: u64, source: &EditSource<'_>) -> std::ops::Range<u64>
 
 fn span(volume: &FatVolume, chain: &[u32], at: u64, remaining: u64) -> Result<(u64, usize)> {
     let cluster_bytes = u64::from(volume.geometry.cluster_bytes());
-    let index = usize::try_from(at / cluster_bytes).context("native range cluster index overflow")?;
+    let index =
+        usize::try_from(at / cluster_bytes).context("native range cluster index overflow")?;
     let cluster = chain
         .get(index)
         .context("native range exceeds its prepared chain")?;
@@ -210,11 +218,19 @@ pub(super) fn apply(
     source: &EditSource<'_>,
     now: u64,
 ) -> Result<()> {
-    apply_update(cx, volume, path, entry, old, source, Update {
-        capacity: u32::try_from(source.size).context("FAT range exceeds 4 GiB - 1")?,
-        modified: Some(modified_timestamp(now)?),
-        changed: changed_range(u64::from(old.size), source),
-    })
+    apply_update(
+        cx,
+        volume,
+        path,
+        entry,
+        old,
+        source,
+        Update {
+            capacity: u32::try_from(source.size).context("FAT range exceeds 4 GiB - 1")?,
+            modified: Some(modified_timestamp(now)?),
+            changed: changed_range(u64::from(old.size), source),
+        },
+    )
 }
 
 fn apply_update(
@@ -253,7 +269,10 @@ fn apply_update(
     validate_edit_state(cx, volume)?;
     let before = volume.check(cx)?;
     if !before.clean || !before.complete || !before.namespace_complete {
-        bail!("native range update requires complete clean allocation and namespace: {}", serde_json::to_string(&before)?);
+        bail!(
+            "native range update requires complete clean allocation and namespace: {}",
+            serde_json::to_string(&before)?
+        );
     }
     let allocation = Allocation::prepare(cx, volume, old, update.capacity, before.free_clusters)?;
     if update.modified.is_none()
@@ -353,7 +372,8 @@ fn apply_update(
                     let count = (cluster_bytes - within).min(HASH_BYTES as u64) as usize;
                     bytes[..count].fill(0);
                     let logical = logical_base + within;
-                    let visible = u64::from(size).saturating_sub(logical).min(count as u64) as usize;
+                    let visible =
+                        u64::from(size).saturating_sub(logical).min(count as u64) as usize;
                     if visible != 0 {
                         source.read_exact_at(cx, ByteOffset(logical), &mut bytes[..visible])?;
                     }
@@ -371,9 +391,22 @@ fn apply_update(
             change_fat(
                 cx,
                 volume,
-                &allocation.added.iter().copied().enumerate().map(|(index, cluster)| {
-                    (cluster, 0, allocation.added.get(index + 1).copied().unwrap_or(end_marker))
-                }),
+                &allocation
+                    .added
+                    .iter()
+                    .copied()
+                    .enumerate()
+                    .map(|(index, cluster)| {
+                        (
+                            cluster,
+                            0,
+                            allocation
+                                .added
+                                .get(index + 1)
+                                .copied()
+                                .unwrap_or(end_marker),
+                        )
+                    }),
             )?;
             volume.device.sync(cx)?;
             if let Some(&tail) = old.clusters.last() {
@@ -423,7 +456,10 @@ fn apply_update(
             || after.files != before.files
             || after.directories != before.directories
         {
-            bail!("native range verification failed: {}", serde_json::to_string(&after)?);
+            bail!(
+                "native range verification failed: {}",
+                serde_json::to_string(&after)?
+            );
         }
         phase = "synchronizing final clean state";
         set_dirty(cx, volume, false)?;

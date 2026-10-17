@@ -19,8 +19,8 @@
 //! visibility comes only from this mount's registry. No crash atomicity claimed.
 
 use super::{
-    Directory, Entry, FatFs, FfsError, InodeNumber, OsStr, Result, checkpoint,
-    map_mutation_error, rename_in_volume, set_attr_in_volume, unlink_in_volume,
+    Directory, Entry, FatFs, FfsError, InodeNumber, OsStr, Result, checkpoint, map_mutation_error,
+    rename_in_volume, set_attr_in_volume, unlink_in_volume,
 };
 use asupersync::Cx;
 use ffs_core::vfs::OpenHandleOracle;
@@ -47,9 +47,9 @@ pub(super) struct Lifetime {
 }
 
 fn locked(lifetime: &Mutex<Lifetime>) -> Result<MutexGuard<'_, Lifetime>> {
-    lifetime.lock().map_err(|_| {
-        FfsError::Io(std::io::Error::other("FAT lifetime registry poisoned"))
-    })
+    lifetime
+        .lock()
+        .map_err(|_| FfsError::Io(std::io::Error::other("FAT lifetime registry poisoned")))
 }
 
 fn errno(value: i32) -> FfsError {
@@ -61,12 +61,13 @@ impl Lifetime {
         if self.handles.get(&handle) != Some(&ino) {
             return Err(errno(libc::EBADF));
         }
-        let count = self.counts.get_mut(&ino).ok_or_else(|| {
-            FfsError::Io(std::io::Error::other("FAT handle count missing"))
-        })?;
-        *count = count.checked_sub(1).ok_or_else(|| {
-            FfsError::Io(std::io::Error::other("FAT handle count underflow"))
-        })?;
+        let count = self
+            .counts
+            .get_mut(&ino)
+            .ok_or_else(|| FfsError::Io(std::io::Error::other("FAT handle count missing")))?;
+        *count = count
+            .checked_sub(1)
+            .ok_or_else(|| FfsError::Io(std::io::Error::other("FAT handle count underflow")))?;
         if *count == 0 {
             self.counts.remove(&ino);
         }
@@ -93,7 +94,9 @@ impl OpenReservation<'_> {
 
 impl Drop for OpenReservation<'_> {
     fn drop(&mut self) {
-        if !self.accepted && let Ok(mut state) = self.lifetime.lock() {
+        if !self.accepted
+            && let Ok(mut state) = self.lifetime.lock()
+        {
             // A mismatched internal reservation must fail closed, not silently
             // permit reclamation. Such a mismatch leaves the remaining pins.
             let _ = state.remove_handle(self.handle, self.ino);
@@ -129,7 +132,9 @@ impl RetentionReservation<'_> {
 
 impl Drop for RetentionReservation<'_> {
     fn drop(&mut self) {
-        if !self.accepted && let Ok(mut state) = self.lifetime.lock() {
+        if !self.accepted
+            && let Ok(mut state) = self.lifetime.lock()
+        {
             state.retained.remove(&self.ino);
         }
     }
@@ -140,7 +145,9 @@ impl FatFs {
         // Installation is a once-per-mount transport hook. Replacing a live
         // oracle with one returning zero could release another caller's pins.
         // Poison is not recovered: subsequent operations report the error.
-        if let Ok(mut state) = self.lifetime.lock() && state.oracle.is_none() {
+        if let Ok(mut state) = self.lifetime.lock()
+            && state.oracle.is_none()
+        {
             state.oracle = Some(oracle);
         }
     }
@@ -150,13 +157,26 @@ impl FatFs {
         if state.handles.len() >= MAX_HANDLES {
             return Err(errno(libc::EMFILE));
         }
-        let handle = state.next_handle.checked_add(1).ok_or_else(|| errno(libc::EOVERFLOW))?;
-        let count = state.counts.get(&ino).copied().unwrap_or(0)
-            .checked_add(1).ok_or_else(|| errno(libc::EOVERFLOW))?;
+        let handle = state
+            .next_handle
+            .checked_add(1)
+            .ok_or_else(|| errno(libc::EOVERFLOW))?;
+        let count = state
+            .counts
+            .get(&ino)
+            .copied()
+            .unwrap_or(0)
+            .checked_add(1)
+            .ok_or_else(|| errno(libc::EOVERFLOW))?;
         state.handles.insert(handle, ino);
         state.counts.insert(ino, count);
         state.next_handle = handle;
-        Ok(OpenReservation { lifetime: &self.lifetime, handle, ino, accepted: false })
+        Ok(OpenReservation {
+            lifetime: &self.lifetime,
+            handle,
+            ino,
+            accepted: false,
+        })
     }
 
     pub(super) fn release_open(&self, ino: InodeNumber, handle: u64) -> Result<()> {
@@ -171,22 +191,34 @@ impl FatFs {
     pub(super) fn pinned(&self, ino: InodeNumber) -> Result<bool> {
         let (own, oracle) = {
             let state = locked(&self.lifetime)?;
-            (state.counts.get(&ino).copied().unwrap_or(0), state.oracle.clone())
+            (
+                state.counts.get(&ino).copied().unwrap_or(0),
+                state.oracle.clone(),
+            )
         };
         // No registry/namespace mutex is held while invoking transport code.
         Ok(own != 0 || oracle.is_some_and(|oracle| oracle(ino) != 0))
     }
 
     pub(super) fn retained(&self, ino: InodeNumber) -> Result<bool> {
-        Ok(locked(&self.lifetime)?.retained.get(&ino)
+        Ok(locked(&self.lifetime)?
+            .retained
+            .get(&ino)
             .is_some_and(|record| record.visible_to_handles))
     }
 
-    pub(super) fn visible_lookup(&self, cx: &Cx, directory: Directory, name: &str) -> Result<Entry> {
+    pub(super) fn visible_lookup(
+        &self,
+        cx: &Cx,
+        directory: Directory,
+        name: &str,
+    ) -> Result<Entry> {
         let entry = self.volume.lookup(cx, directory, name)?;
-        if locked(&self.lifetime)?.retained.values().any(|record| {
-            record.visible_to_handles && record.slot == entry.offset
-        }) {
+        if locked(&self.lifetime)?
+            .retained
+            .values()
+            .any(|record| record.visible_to_handles && record.slot == entry.offset)
+        {
             return Err(FfsError::NotFound(name.to_owned()));
         }
         checkpoint(cx)?;
@@ -196,9 +228,11 @@ impl FatFs {
     pub(super) fn require_unreserved_target(&self, slot: u64) -> Result<()> {
         // Invisible is NOT free. Otherwise rename to a guessed recovery name
         // would let the native writer overwrite and free a still-open object.
-        if locked(&self.lifetime)?.retained.values().any(|record| {
-            record.visible_to_handles && record.slot == slot
-        }) {
+        if locked(&self.lifetime)?
+            .retained
+            .values()
+            .any(|record| record.visible_to_handles && record.slot == slot)
+        {
             return Err(FfsError::Exists);
         }
         Ok(())
@@ -206,8 +240,12 @@ impl FatFs {
 
     pub(super) fn visible_entries(&self, mut entries: Vec<Entry>) -> Result<Vec<Entry>> {
         let state = locked(&self.lifetime)?;
-        let hidden: BTreeSet<_> = state.retained.values()
-            .filter(|record| record.visible_to_handles).map(|record| record.slot).collect();
+        let hidden: BTreeSet<_> = state
+            .retained
+            .values()
+            .filter(|record| record.visible_to_handles)
+            .map(|record| record.slot)
+            .collect();
         entries.retain(|entry| !hidden.contains(&entry.offset));
         Ok(entries)
     }
@@ -225,8 +263,18 @@ impl FatFs {
                 detail: "FAT retention identity or slot already registered".into(),
             });
         }
-        state.retained.insert(ino, Retained { slot, visible_to_handles: false });
-        Ok(RetentionReservation { lifetime: &self.lifetime, ino, accepted: false })
+        state.retained.insert(
+            ino,
+            Retained {
+                slot,
+                visible_to_handles: false,
+            },
+        );
+        Ok(RetentionReservation {
+            lifetime: &self.lifetime,
+            ino,
+            accepted: false,
+        })
     }
 
     fn recovery_name(&self, cx: &Cx, parent: InodeNumber) -> Result<String> {
@@ -239,7 +287,9 @@ impl FatFs {
             checkpoint(cx)?;
             let name = entry.name()?;
             let alias = entry.short_alias().ok_or_else(|| {
-                FfsError::UnsupportedFeature("retention requires representable native aliases".into())
+                FfsError::UnsupportedFeature(
+                    "retention requires representable native aliases".into(),
+                )
             })?;
             for value in [name, alias] {
                 keys.insert(page.name_key(&value));
@@ -260,7 +310,9 @@ impl FatFs {
             if !keys.contains(&page.name_key(&name))
                 && !conservative.contains(&name.to_uppercase().to_lowercase())
             {
-                return self.child_path(parent, OsStr::new(&name)).map(|(path, _)| path);
+                return self
+                    .child_path(parent, OsStr::new(&name))
+                    .map(|(path, _)| path);
             }
         }
         Err(errno(libc::ENOSPC))
@@ -269,7 +321,12 @@ impl FatFs {
     /// The supplied source is already resolved through the visible namespace.
     /// Ordinary unlink policy (including native read-only attributes) applies.
     pub(super) fn retain_unlink_locked(
-        &self, cx: &Cx, parent: InodeNumber, path: &str, entry: &Entry, ino: InodeNumber,
+        &self,
+        cx: &Cx,
+        parent: InodeNumber,
+        path: &str,
+        entry: &Entry,
+        ino: InodeNumber,
     ) -> Result<()> {
         unlink_in_volume(cx, &self.volume, path, true).map_err(map_mutation_error)?;
         let recovery = self.recovery_name(cx, parent)?;
@@ -287,16 +344,26 @@ impl FatFs {
     /// objects and retain the displaced target in the source's old footprint.
     /// This works without spare source/destination slots or copying payloads.
     pub(super) fn replace_pinned_locked(
-        &self, cx: &Cx, parent: InodeNumber, name: &OsStr,
-        new_parent: InodeNumber, new_name: &OsStr, target_ino: InodeNumber,
+        &self,
+        cx: &Cx,
+        parent: InodeNumber,
+        name: &OsStr,
+        new_parent: InodeNumber,
+        new_name: &OsStr,
+        target_ino: InodeNumber,
     ) -> Result<()> {
         let (from, _) = self.child_path(parent, name)?;
         let (to, _) = self.child_path(new_parent, new_name)?;
         rename_in_volume(cx, &self.volume, &from, &to, true).map_err(map_mutation_error)?;
-        self.volume.rename_exchange(cx, &from, &to, true).map_err(map_mutation_error)?;
+        self.volume
+            .rename_exchange(cx, &from, &to, true)
+            .map_err(map_mutation_error)?;
         let recovery = self.recovery_name(cx, parent)?;
         rename_in_volume(cx, &self.volume, &from, &recovery, true).map_err(map_mutation_error)?;
-        let source = self.volume.resolve(cx, &from)?.ok_or(FfsError::IsDirectory)?;
+        let source = self
+            .volume
+            .resolve(cx, &from)?
+            .ok_or(FfsError::IsDirectory)?;
         let reservation = self.reserve_retention(target_ino, source.offset)?;
         self.exchange_locked(cx, parent, name, new_parent, new_name)?;
         // Do not recurse through public rename/unlink: this operation retains
@@ -309,7 +376,12 @@ impl FatFs {
 
     /// Called under the operation writer gate by RELEASE, FORGET or destroy.
     /// Never infer a reclaimable record from a filename, even after remount.
-    pub(super) fn reap_retained_locked(&self, cx: &Cx, ino: InodeNumber, destroying: bool) -> Result<bool> {
+    pub(super) fn reap_retained_locked(
+        &self,
+        cx: &Cx,
+        ino: InodeNumber,
+        destroying: bool,
+    ) -> Result<bool> {
         checkpoint(cx)?;
         if !self.retained(ino)? || (!destroying && self.pinned(ino)?) {
             return Ok(false);
@@ -318,12 +390,19 @@ impl FatFs {
         let path = self.path_for_inode(ino)?;
         let node = self.node(cx, ino)?;
         let entry = node.entry.as_ref().ok_or(FfsError::IsDirectory)?;
-        let expected = locked(&self.lifetime)?.retained.get(&ino).copied().ok_or_else(|| {
-            FfsError::NotFound(format!("FAT retained inode {}", ino.0))
-        })?;
-        let actual = self.volume.resolve(cx, &path)?.ok_or(FfsError::IsDirectory)?;
-        if entry.offset != expected.slot || actual.offset != expected.slot
-            || actual.native != entry.native || actual.native.is_directory()
+        let expected = locked(&self.lifetime)?
+            .retained
+            .get(&ino)
+            .copied()
+            .ok_or_else(|| FfsError::NotFound(format!("FAT retained inode {}", ino.0)))?;
+        let actual = self
+            .volume
+            .resolve(cx, &path)?
+            .ok_or(FfsError::IsDirectory)?;
+        if entry.offset != expected.slot
+            || actual.offset != expected.slot
+            || actual.native != entry.native
+            || actual.native.is_directory()
         {
             return Err(FfsError::Corruption {
                 block: expected.slot / 512,
@@ -357,8 +436,11 @@ impl FatFs {
     }
 
     pub(super) fn reap_all_retained_locked(&self, cx: &Cx) -> Result<()> {
-        let ids: Vec<_> = locked(&self.lifetime)?.retained.iter()
-            .filter_map(|(&ino, record)| record.visible_to_handles.then_some(ino)).collect();
+        let ids: Vec<_> = locked(&self.lifetime)?
+            .retained
+            .iter()
+            .filter_map(|(&ino, record)| record.visible_to_handles.then_some(ino))
+            .collect();
         for ino in ids {
             checkpoint(cx)?;
             self.reap_retained_locked(cx, ino, true)?;

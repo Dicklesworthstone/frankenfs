@@ -774,9 +774,9 @@ impl RenameTarget {
 
     fn validate(&self, cx: &Cx, volume: &super::super::super::FatVolume) -> Result<()> {
         match self {
-            Self::Existing { entry, long_slots, .. } => {
-                validate_entry_slots(cx, volume, entry, long_slots)
-            }
+            Self::Existing {
+                entry, long_slots, ..
+            } => validate_entry_slots(cx, volume, entry, long_slots),
             Self::New(namespace) => namespace.validate(cx, volume),
         }
     }
@@ -791,7 +791,10 @@ fn validate_entry_slots(
     for slot in std::iter::once(short).chain(long) {
         checkpoint(cx)?;
         if read_slot(cx, volume, slot.offset, false)?.bytes != slot.bytes {
-            bail!("native rename entry changed after preflight at {}", slot.offset);
+            bail!(
+                "native rename entry changed after preflight at {}",
+                slot.offset
+            );
         }
     }
     Ok(())
@@ -821,7 +824,10 @@ fn validate_rename_ancestry(
 ) -> Result<()> {
     let parent_path = to.rsplit_once('/').map_or("", |(path, _)| path);
     let mut directory = super::super::super::Directory::Root;
-    for component in parent_path.split('/').filter(|part| !part.is_empty() && *part != ".") {
+    for component in parent_path
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+    {
         checkpoint(cx)?;
         let entry = volume.lookup(cx, directory, component)?;
         directory = entry.directory()?;
@@ -921,9 +927,7 @@ fn rename_with_mode(
         if entry.native.attributes & 0xC8 != 0 {
             bail!("unsupported native attributes on rename destination");
         }
-        if entry.native.is_directory()
-            && !volume.list(cx, entry.directory()?)?.is_empty()
-        {
+        if entry.native.is_directory() && !volume.list(cx, entry.directory()?)?.is_empty() {
             return Err(FfsError::NotEmpty).context("FAT target directory is not empty");
         }
     }
@@ -943,12 +947,21 @@ fn rename_with_mode(
     let target = if let Some(entry) = dst_existing {
         let release = release_map(&rename_chain(cx, volume, &entry)?);
         let (entry, long_slots) = find_entry_slots(cx, volume, dst_dir, entry.offset)?;
-        RenameTarget::Existing { entry, long_slots, release }
+        RenameTarget::Existing {
+            entry,
+            long_slots,
+            release,
+        }
     } else {
         let name = super::names::NativeName::plan(cx, volume, dst_dir, &dst_leaf)?;
         if src_dir == dst_dir
             && let Some(slots) = rename_in_place::reserve_before(
-                cx, volume, src_dir, &src_short, &src_lfn, name.long_slots(),
+                cx,
+                volume,
+                src_dir,
+                &src_short,
+                &src_lfn,
+                name.long_slots(),
             )?
         {
             // FAT16's fixed root cannot grow, and a same-directory rename
@@ -975,7 +988,9 @@ fn rename_with_mode(
                 .context("missing reserved destination directory cluster")?;
             for &ext_cluster in &allocated {
                 let start = volume.cluster_offset(ext_cluster)?;
-                for offset in (start..start + u64::from(volume.geometry.cluster_bytes())).step_by(32) {
+                for offset in
+                    (start..start + u64::from(volume.geometry.cluster_bytes())).step_by(32)
+                {
                     if reservation.slots.len() < needed_slots {
                         reservation.slots.push(read_slot(cx, volume, offset, true)?);
                     } else if reservation.successor.is_none() {
@@ -984,11 +999,17 @@ fn rename_with_mode(
                     }
                 }
             }
-            Some(Extension { tail, cluster, additional: allocated.get(1).copied() })
+            Some(Extension {
+                tail,
+                cluster,
+                additional: allocated.get(1).copied(),
+            })
         } else {
             None
         };
-        let entry = reservation.slots.pop()
+        let entry = reservation
+            .slots
+            .pop()
             .context("missing reserved rename destination short-entry slot")?;
         RenameTarget::New(Namespace {
             successor: reservation.successor,
@@ -1038,15 +1059,18 @@ fn rename_with_mode(
     } else {
         None
     };
-    let free_after = before.free_clusters
+    let free_after = before
+        .free_clusters
         .checked_sub(target.directory_clusters() as u64)
         .and_then(|free| free.checked_add(target.release().len() as u64))
         .filter(|free| *free <= u64::from(volume.geometry.cluster_count()))
         .context("rename free-cluster accounting overflow")?;
-    let files_after = before.files
+    let files_after = before
+        .files
         .checked_sub(u64::from(replaced && !src_entry.native.is_directory()))
         .context("rename file accounting underflow")?;
-    let directories_after = before.directories
+    let directories_after = before
+        .directories
         .checked_sub(u64::from(replaced && src_entry.native.is_directory()))
         .context("rename directory accounting underflow")?;
     validate_entry_slots(cx, volume, &src_short, &src_lfn)?;
@@ -1100,7 +1124,9 @@ fn rename_with_mode(
         // Do not remove the source or reclaim the replaced object until the
         // ordinary native reader sees the exact published record and chain.
         phase = "verifying destination before source retirement";
-        let published = volume.resolve(cx, to)?.context("renamed destination is missing")?;
+        let published = volume
+            .resolve(cx, to)?
+            .context("renamed destination is missing")?;
         if published.offset != target.entry().offset
             || read_slot(cx, volume, published.offset, false)?.bytes != updated
             || rename_chain(cx, volume, &published)? != source_chain
@@ -1128,8 +1154,14 @@ fn rename_with_mode(
         delete_entry_slots(cx, volume, &src_short, &src_lfn)?;
         phase = "releasing replaced destination allocation";
         if !target.release().is_empty() {
-            change_fat(cx, volume, &target.release().iter()
-                .map(|&(cluster, expected)| (cluster, expected, 0)))?;
+            change_fat(
+                cx,
+                volume,
+                &target
+                    .release()
+                    .iter()
+                    .map(|&(cluster, expected)| (cluster, expected, 0)),
+            )?;
             volume.device.sync(cx)?;
         }
         phase = "checking completed rename";
@@ -1143,7 +1175,10 @@ fn rename_with_mode(
             || verification.files != files_after
             || verification.directories != directories_after
         {
-            bail!("rename verification failed: {}", serde_json::to_string(&verification)?);
+            bail!(
+                "rename verification failed: {}",
+                serde_json::to_string(&verification)?
+            );
         }
         phase = "synchronizing final clean state";
         set_dirty(cx, volume, false)?;
@@ -1253,7 +1288,12 @@ pub fn run_rename(cx: &Cx, args: &RenameArgs) -> Result<serde_json::Value> {
         volume.rename_exchange(cx, &args.from, &args.to, args.dry_run)?
     } else {
         rename_with_mode(
-            cx, &volume, &args.from, &args.to, args.dry_run, args.no_replace,
+            cx,
+            &volume,
+            &args.from,
+            &args.to,
+            args.dry_run,
+            args.no_replace,
         )?
     };
     if !args.dry_run && args.image.sidecar.is_some() {

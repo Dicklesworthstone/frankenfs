@@ -395,7 +395,8 @@ impl ZilBlock {
                     let generation = order.u64(rec, 72)?;
                     let crtime = [order.u64(rec, 80)?, order.u64(rec, 88)?];
                     let (name, symlink_target) = cstr_pair(&rec[104..])?;
-                    let is_dir = matches!(txtype & 0x1f, 2 | 17..=19) || (mode & 0o170_000) == 0o040_000;
+                    let is_dir =
+                        matches!(txtype & 0x1f, 2 | 17..=19) || (mode & 0o170_000) == 0o040_000;
                     ZilRecordPayload::Create {
                         dir_obj,
                         file_obj,
@@ -428,7 +429,8 @@ impl ZilBlock {
                     let src_dir_obj = order.u64(rec, 32)?;
                     let dst_dir_obj = order.u64(rec, 40)?;
                     let (src_name, dst_opt) = cstr_pair(&rec[48..])?;
-                    let dst_name = dst_opt.ok_or_else(|| invalid("missing destination name in ZIL lr_rename_t"))?;
+                    let dst_name = dst_opt
+                        .ok_or_else(|| invalid("missing destination name in ZIL lr_rename_t"))?;
                     ZilRecordPayload::Rename {
                         src_dir_obj,
                         dst_dir_obj,

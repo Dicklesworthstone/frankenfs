@@ -42,7 +42,10 @@ impl Publication {
         if let std::collections::btree_map::Entry::Vacant(slot) = self.0.entry(start) {
             let mut bytes = vec![0; size as usize];
             volume.read_exact(cx, start, &mut bytes)?;
-            slot.insert(Sector { updated: bytes.clone(), original: bytes });
+            slot.insert(Sector {
+                updated: bytes.clone(),
+                original: bytes,
+            });
         }
         let sector = self.0.get_mut(&start).context("missing exchange sector")?;
         if sector.original[within..within + 32] != *original
@@ -59,7 +62,11 @@ impl Publication {
         for (&offset, sector) in &self.0 {
             super::checkpoint(cx)?;
             volume.read_exact(cx, offset, &mut bytes)?;
-            let expected = if published { &sector.updated } else { &sector.original };
+            let expected = if published {
+                &sector.updated
+            } else {
+                &sector.original
+            };
             if &bytes != expected {
                 bail!("exchange sector failed exact readback at {offset}");
             }
@@ -86,9 +93,14 @@ fn check_ancestry(cx: &Cx, volume: &FatVolume, entry: &Entry, destination: &str)
     if !entry.native.is_directory() {
         return Ok(());
     }
-    let path = destination.rsplit_once('/').map_or("", |(parent, _)| parent);
+    let path = destination
+        .rsplit_once('/')
+        .map_or("", |(parent, _)| parent);
     let mut directory = Directory::Root;
-    for part in path.split('/').filter(|part| !part.is_empty() && *part != ".") {
+    for part in path
+        .split('/')
+        .filter(|part| !part.is_empty() && *part != ".")
+    {
         super::checkpoint(cx)?;
         let ancestor = volume.lookup(cx, directory, part)?;
         directory = ancestor.directory()?;
@@ -119,7 +131,8 @@ fn stage_parent(
     }
     let offset = volume.cluster_offset(entry.native.first_cluster)? + 32;
     let old = read_slot(cx, volume, offset, false)?;
-    if old.bytes[..11] != *b"..         " || old.bytes[11] != 0x10
+    if old.bytes[..11] != *b"..         "
+        || old.bytes[11] != 0x10
         || old.bytes[28..32] != [0; 4]
         || raw_cluster(volume.geometry.kind(), &old.bytes) != parent_cluster(old_parent)
     {
@@ -145,7 +158,11 @@ fn verify_state(cx: &Cx, volume: &FatVolume, dirty: bool) -> Result<()> {
     };
     for number in std::iter::once(0_u16).chain(geometry.backup_boot_sector()) {
         let mut boot = [0; 512];
-        volume.read_exact(cx, u64::from(number) * u64::from(geometry.sector_bytes()), &mut boot)?;
+        volume.read_exact(
+            cx,
+            u64::from(number) * u64::from(geometry.sector_bytes()),
+            &mut boot,
+        )?;
         if boot[state_at] != u8::from(dirty) {
             bail!("native exchange boot state failed verification");
         }
@@ -153,7 +170,9 @@ fn verify_state(cx: &Cx, volume: &FatVolume, dirty: bool) -> Result<()> {
     let width = geometry.kind().entry_bytes() as usize;
     let expected = if dirty { mask & !clean } else { mask };
     for copy in volume.copies() {
-        let at = geometry.entry_offset(copy, 2).map_err(|e| anyhow::anyhow!("{e}"))?
+        let at = geometry
+            .entry_offset(copy, 2)
+            .map_err(|e| anyhow::anyhow!("{e}"))?
             - width as u64;
         let mut bytes = [0; 4];
         volume.read_exact(cx, at, &mut bytes[..width])?;
@@ -169,7 +188,13 @@ impl FatVolume {
     /// Swap existing objects, including nonempty directories and different
     /// types, under the caller's writer gate. Names/aliases remain in place.
     /// No allocation, reclamation, payload writes or crash atomicity is implied.
-    pub fn rename_exchange(&self, cx: &Cx, from: &str, to: &str, dry_run: bool) -> Result<serde_json::Value> {
+    pub fn rename_exchange(
+        &self,
+        cx: &Cx,
+        from: &str,
+        to: &str,
+        dry_run: bool,
+    ) -> Result<serde_json::Value> {
         super::checkpoint(cx)?;
         let (from_dir, from_leaf) = parent(cx, self, from)?;
         let (to_dir, to_leaf) = parent(cx, self, to)?;
@@ -177,7 +202,9 @@ impl FatVolume {
         self.read_exact(cx, 0, &mut boot)?;
         let geometry = FatGeometry::parse(&boot, self.geometry.volume_bytes())
             .map_err(|error| anyhow::anyhow!("invalid FAT exchange geometry: {error}"))?;
-        if geometry != self.geometry { bail!("FAT exchange geometry changed since open"); }
+        if geometry != self.geometry {
+            bail!("FAT exchange geometry changed since open");
+        }
         self.validate_admission(cx, &boot)?;
         verify_state(cx, self, false)?;
         let from_entry = self.lookup(cx, from_dir, &from_leaf)?;
@@ -192,15 +219,22 @@ impl FatVolume {
             "contract": "serialized native namespace exchange; interrupted metadata may require recovery; not crash-atomic"
         });
         if from_entry.offset == to_entry.offset {
-            if from_dir != to_dir { bail!("exchange aliases have conflicting parent identities"); }
+            if from_dir != to_dir {
+                bail!("exchange aliases have conflicting parent identities");
+            }
             report["unchanged"] = true.into();
             super::checkpoint(cx)?;
             return Ok(report);
         }
         for entry in [&from_entry, &to_entry] {
-            if entry.native.attributes & 1 != 0 { return Err(FfsError::PermissionDenied.into()); }
+            if entry.native.attributes & 1 != 0 {
+                return Err(FfsError::PermissionDenied.into());
+            }
             if entry.native.attributes & 0xC8 != 0 {
-                return Err(FfsError::UnsupportedFeature("unsupported native exchange attributes".into()).into());
+                return Err(FfsError::UnsupportedFeature(
+                    "unsupported native exchange attributes".into(),
+                )
+                .into());
             }
         }
         check_ancestry(cx, self, &from_entry, to)?;
@@ -224,7 +258,9 @@ impl FatVolume {
         super::checkpoint(cx)?;
         report["unchanged"] = false.into();
         report["metadata_sectors"] = publication.0.len().into();
-        if dry_run { return Ok(report); }
+        if dry_run {
+            return Ok(report);
+        }
 
         let mut phase = "persisting dirty state";
         let result = (|| -> Result<serde_json::Value> {
@@ -241,21 +277,30 @@ impl FatVolume {
             phase = "verifying exchanged objects and allocation";
             let at_from = self.lookup(cx, from_dir, &from_leaf)?;
             let at_to = self.lookup(cx, to_dir, &to_leaf)?;
-            if at_from.offset != from_slot.offset || at_to.offset != to_slot.offset
-                || at_from.name()? != from_entry.name()? || at_to.name()? != to_entry.name()?
+            if at_from.offset != from_slot.offset
+                || at_to.offset != to_slot.offset
+                || at_from.name()? != from_entry.name()?
+                || at_to.name()? != to_entry.name()?
                 || at_from.native.short_name != from_entry.native.short_name
                 || at_to.native.short_name != to_entry.native.short_name
                 || rename_chain(cx, self, &at_from)? != to_chain
                 || rename_chain(cx, self, &at_to)? != from_chain
-            { bail!("exchange changed name bindings or prepared object allocation"); }
+            {
+                bail!("exchange changed name bindings or prepared object allocation");
+            }
             let after = self.check(cx)?;
-            if !after.clean || !after.complete || !after.namespace_complete
+            if !after.clean
+                || !after.complete
+                || !after.namespace_complete
                 || after.free_clusters != before.free_clusters
                 || after.allocated_clusters != before.allocated_clusters
                 || after.referenced_clusters != before.referenced_clusters
                 || after.preallocated_clusters != before.preallocated_clusters
-                || after.files != before.files || after.directories != before.directories
-            { bail!("exchange changed allocation or namespace consistency"); }
+                || after.files != before.files
+                || after.directories != before.directories
+            {
+                bail!("exchange changed allocation or namespace consistency");
+            }
             phase = "synchronizing and verifying clean state";
             set_dirty(cx, self, false)?;
             self.device.sync(cx)?;

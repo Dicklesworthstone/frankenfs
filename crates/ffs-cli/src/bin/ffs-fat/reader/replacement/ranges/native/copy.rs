@@ -4,8 +4,10 @@
 //! gate. Overlapping same-file ranges are refused, not emulated as memmove.
 
 use super::super::checked_end;
-use super::{ByteDevice, Cx, FatVolume, FfsError, FileSource, Update, apply_update,
-    checkpoint, modified_timestamp};
+use super::{
+    ByteDevice, Cx, FatVolume, FfsError, FileSource, Update, apply_update, checkpoint,
+    modified_timestamp,
+};
 use anyhow::{Context, Result, bail};
 use ffs_types::ByteOffset;
 
@@ -48,19 +50,31 @@ impl<'a> CopySource<'a> {
         length: u64,
     ) -> Result<Self> {
         let input_end = input_offset.checked_add(length).ok_or_else(invalid_range)?;
-        let output_end = output_offset.checked_add(length).ok_or_else(invalid_range)?;
+        let output_end = output_offset
+            .checked_add(length)
+            .ok_or_else(invalid_range)?;
         if input_end > input.len_bytes() {
             bail!("native copy source does not cover its prepared range");
         }
         Ok(Self {
-            input, original, input_offset, output_offset, output_end,
-            size: if length == 0 { original.len_bytes() } else { original.len_bytes().max(output_end) },
+            input,
+            original,
+            input_offset,
+            output_offset,
+            output_end,
+            size: if length == 0 {
+                original.len_bytes()
+            } else {
+                original.len_bytes().max(output_end)
+            },
         })
     }
 }
 
 impl ByteDevice for CopySource<'_> {
-    fn len_bytes(&self) -> u64 { self.size }
+    fn len_bytes(&self) -> u64 {
+        self.size
+    }
 
     fn read_exact_at(&self, cx: &Cx, at: ByteOffset, bytes: &mut [u8]) -> ffs_error::Result<()> {
         checkpoint(cx)?;
@@ -69,20 +83,27 @@ impl ByteDevice for CopySource<'_> {
         let original_end = end.min(self.original.len_bytes());
         let prefix_end = original_end.min(self.output_offset);
         if at.0 < prefix_end {
-            self.original.read_exact_at(cx, at, &mut bytes[..(prefix_end - at.0) as usize])?;
+            self.original
+                .read_exact_at(cx, at, &mut bytes[..(prefix_end - at.0) as usize])?;
         }
         let suffix_start = at.0.max(self.output_end);
         if suffix_start < original_end {
-            self.original.read_exact_at(cx, ByteOffset(suffix_start),
-                &mut bytes[(suffix_start - at.0) as usize..(original_end - at.0) as usize])?;
+            self.original.read_exact_at(
+                cx,
+                ByteOffset(suffix_start),
+                &mut bytes[(suffix_start - at.0) as usize..(original_end - at.0) as usize],
+            )?;
         }
         let copy_start = at.0.max(self.output_offset);
         let copy_end = end.min(self.output_end);
         if copy_start < copy_end {
             // Constructor range checks prove this translated span fits input.
             let input = self.input_offset + (copy_start - self.output_offset);
-            self.input.read_exact_at(cx, ByteOffset(input),
-                &mut bytes[(copy_start - at.0) as usize..(copy_end - at.0) as usize])?;
+            self.input.read_exact_at(
+                cx,
+                ByteOffset(input),
+                &mut bytes[(copy_start - at.0) as usize..(copy_end - at.0) as usize],
+            )?;
         }
         checkpoint(cx)
     }
@@ -91,7 +112,9 @@ impl ByteDevice for CopySource<'_> {
         Err(FfsError::ReadOnly)
     }
 
-    fn sync(&self, cx: &Cx) -> ffs_error::Result<()> { checkpoint(cx) }
+    fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+        checkpoint(cx)
+    }
 }
 
 impl FatVolume {
@@ -126,19 +149,32 @@ impl FatVolume {
         if input_entry.native.attributes & 0xC8 != 0 || output_entry.native.attributes & 0xC8 != 0 {
             bail!("unsupported native attributes on copy source or destination");
         }
-        validate_ranges(input_entry.offset == output_entry.offset, input_offset, output_offset, length)?;
+        validate_ranges(
+            input_entry.offset == output_entry.offset,
+            input_offset,
+            output_offset,
+            length,
+        )?;
         let length = length.min(u64::from(input_entry.native.size).saturating_sub(input_offset));
         if length == 0 {
             // EOF is not permission to extend or timestamp the destination.
             checkpoint(cx)?;
             return Ok(0);
         }
-        let end = output_offset.checked_add(length).ok_or_else(invalid_range)?;
+        let end = output_offset
+            .checked_add(length)
+            .ok_or_else(invalid_range)?;
         if end > u64::from(u32::MAX) {
             return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EFBIG)).into());
         }
-        let input = FileSource { volume: self, chain: self.file_chain(cx, &input_entry)? };
-        let original = FileSource { volume: self, chain: self.file_chain(cx, &output_entry)? };
+        let input = FileSource {
+            volume: self,
+            chain: self.file_chain(cx, &input_entry)?,
+        };
+        let original = FileSource {
+            volume: self,
+            chain: self.file_chain(cx, &output_entry)?,
+        };
         let source = CopySource::new(&input, &original, input_offset, output_offset, length)?;
         let update = Update {
             capacity: u32::try_from(source.size).context("FAT copy exceeds native capacity")?,
@@ -148,7 +184,15 @@ impl FatVolume {
         // This shared engine checks all ownership before mutation, reserves only
         // missing clusters, initializes gaps/new storage, verifies copied bytes,
         // and synchronizes FAT/directory/clean state in their existing order.
-        apply_update(cx, self, to, &output_entry, &original.chain, &source, update)?;
+        apply_update(
+            cx,
+            self,
+            to,
+            &output_entry,
+            &original.chain,
+            &source,
+            update,
+        )?;
         Ok(length)
     }
 }

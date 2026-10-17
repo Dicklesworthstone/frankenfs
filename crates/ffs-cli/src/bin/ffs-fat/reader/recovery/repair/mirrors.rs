@@ -3,9 +3,8 @@
 //! overlay, then copy only data-entry value bits. Never mount that overlay.
 
 use super::{
-    DiagnosticVolume, FatCheckReport, FatEntry, FatKind, FatVolume, ImageArgs,
-    MAX_CHAIN_CLUSTERS, allocate, checkpoint, long_names::Names, set_hints,
-    set_state, write_patch,
+    DiagnosticVolume, FatCheckReport, FatEntry, FatKind, FatVolume, ImageArgs, MAX_CHAIN_CLUSTERS,
+    allocate, checkpoint, long_names::Names, set_hints, set_state, write_patch,
 };
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
@@ -18,14 +17,18 @@ use std::sync::Arc;
 struct Shared(Arc<dyn ByteDevice>);
 
 impl ByteDevice for Shared {
-    fn len_bytes(&self) -> u64 { self.0.len_bytes() }
+    fn len_bytes(&self) -> u64 {
+        self.0.len_bytes()
+    }
     fn read_exact_at(&self, cx: &Cx, at: ByteOffset, bytes: &mut [u8]) -> ffs_error::Result<()> {
         self.0.read_exact_at(cx, at, bytes)
     }
     fn write_all_at(&self, cx: &Cx, at: ByteOffset, bytes: &[u8]) -> ffs_error::Result<()> {
         self.0.write_all_at(cx, at, bytes)
     }
-    fn sync(&self, cx: &Cx) -> ffs_error::Result<()> { self.0.sync(cx) }
+    fn sync(&self, cx: &Cx) -> ffs_error::Result<()> {
+        self.0.sync(cx)
+    }
 }
 
 /// Only entries 2..=cluster_count+1 are projected. Reserved entries, BPBs,
@@ -38,19 +41,29 @@ struct Table {
 
 impl Table {
     fn project(&self, cx: &Cx, at: u64, bytes: &mut [u8]) -> ffs_error::Result<()> {
-        let end = at.checked_add(bytes.len() as u64)
+        let end = at
+            .checked_add(bytes.len() as u64)
             .ok_or_else(|| FfsError::Format("mirror projection range overflow".into()))?;
         for &start in &self.starts {
-            let stop = start.checked_add(self.bytes.len() as u64)
+            let stop = start
+                .checked_add(self.bytes.len() as u64)
                 .ok_or_else(|| FfsError::Format("mirror table range overflow".into()))?;
             let begin = start.max(at);
             let stop = stop.min(end);
-            if begin >= stop { continue; }
+            if begin >= stop {
+                continue;
+            }
             for position in begin..stop {
-                if (position - begin).is_multiple_of(4096) { checkpoint(cx)?; }
+                if (position - begin).is_multiple_of(4096) {
+                    checkpoint(cx)?;
+                }
                 let index = (position - start) as usize;
                 let target = &mut bytes[(position - at) as usize];
-                let mask = if self.width == 4 && index % 4 == 3 { 0x0F } else { 0xFF };
+                let mask = if self.width == 4 && index % 4 == 3 {
+                    0x0F
+                } else {
+                    0xFF
+                };
                 *target = (*target & !mask) | (self.bytes[index] & mask);
             }
         }
@@ -64,7 +77,9 @@ struct View {
 }
 
 impl ByteDevice for View {
-    fn len_bytes(&self) -> u64 { self.device.len_bytes() }
+    fn len_bytes(&self) -> u64 {
+        self.device.len_bytes()
+    }
     fn read_exact_at(&self, cx: &Cx, at: ByteOffset, bytes: &mut [u8]) -> ffs_error::Result<()> {
         self.device.read_exact_at(cx, at, bytes)?;
         self.table.project(cx, at.0, bytes)
@@ -72,7 +87,9 @@ impl ByteDevice for View {
     fn write_all_at(&self, _: &Cx, _: ByteOffset, _: &[u8]) -> ffs_error::Result<()> {
         Err(FfsError::ReadOnly)
     }
-    fn sync(&self, _: &Cx) -> ffs_error::Result<()> { Err(FfsError::ReadOnly) }
+    fn sync(&self, _: &Cx) -> ffs_error::Result<()> {
+        Err(FfsError::ReadOnly)
+    }
 }
 
 struct Sector {
@@ -88,7 +105,11 @@ struct Sector {
 fn fingerprint(kind: FatKind, first: bool, bytes: &[u8]) -> [u8; 32] {
     let mut digest = Sha256::new();
     if first {
-        let (index, clean) = if kind == FatKind::Fat16 { (3, 0x80) } else { (7, 0x08) };
+        let (index, clean) = if kind == FatKind::Fat16 {
+            (3, 0x80)
+        } else {
+            (7, 0x08)
+        };
         digest.update(&bytes[..index]);
         digest.update([bytes[index] & !clean]);
         digest.update(&bytes[index + 1..]);
@@ -107,7 +128,11 @@ fn raw(bytes: &[u8]) -> u32 {
 fn native_state(diagnostic: &DiagnosticVolume, cx: &Cx) -> Result<()> {
     for issue in diagnostic.native_state(cx)? {
         if !matches!(issue.kind, "native_boot_dirty" | "native_fat_dirty") {
-            bail!("mirror reconciliation refuses {}: {}", issue.kind, issue.detail);
+            bail!(
+                "mirror reconciliation refuses {}: {}",
+                issue.kind,
+                issue.detail
+            );
         }
     }
     Ok(())
@@ -118,13 +143,24 @@ fn admissible(report: &FatCheckReport) -> Result<()> {
         bail!("selected FAT copy lacks complete, untruncated structural evidence");
     }
     for issue in &report.issues {
-        if !matches!(issue.kind, "native_boot_dirty" | "native_fat_dirty" | "lost_allocation"
-            | "fs_info_free_count" | "fs_info_next_free")
-        {
-            bail!("selected FAT copy is not an admitted repair source: {}: {}", issue.kind, issue.detail);
+        if !matches!(
+            issue.kind,
+            "native_boot_dirty"
+                | "native_fat_dirty"
+                | "lost_allocation"
+                | "fs_info_free_count"
+                | "fs_info_next_free"
+        ) {
+            bail!(
+                "selected FAT copy is not an admitted repair source: {}: {}",
+                issue.kind,
+                issue.detail
+            );
         }
     }
-    if report.lost_clusters.is_none() { bail!("selected FAT reachability is incomplete"); }
+    if report.lost_clusters.is_none() {
+        bail!("selected FAT reachability is incomplete");
+    }
     Ok(())
 }
 
@@ -140,12 +176,19 @@ pub(super) struct MirrorPlan {
 }
 
 impl MirrorPlan {
-    pub(super) fn prepare(cx: &Cx, diagnostic: DiagnosticVolume, copy: u8, args: &ImageArgs) -> Result<Self> {
+    pub(super) fn prepare(
+        cx: &Cx,
+        diagnostic: DiagnosticVolume,
+        copy: u8,
+        args: &ImageArgs,
+    ) -> Result<Self> {
         checkpoint(cx)?;
         let volume = &diagnostic.volume;
         let geometry = &volume.geometry;
         if !geometry.mirrored() || geometry.fat_count() != 2 || copy >= geometry.fat_count() {
-            bail!("mirror reconciliation requires two mirrored FATs and an explicit source copy 0 or 1; inactive FATs are not repair authority");
+            bail!(
+                "mirror reconciliation requires two mirrored FATs and an explicit source copy 0 or 1; inactive FATs are not repair authority"
+            );
         }
         if geometry.cluster_count() as usize > MAX_CHAIN_CLUSTERS {
             bail!("mirror reconciliation exceeds the allocation budget");
@@ -154,29 +197,46 @@ impl MirrorPlan {
         // conceal disagreement. A bad hardware/error marker is not cleared.
         native_state(&diagnostic, cx)?;
         let width = geometry.kind().entry_bytes() as usize;
-        let count = (geometry.cluster_count() as usize).checked_mul(width)
+        let count = (geometry.cluster_count() as usize)
+            .checked_mul(width)
             .context("mirror allocation size overflow")?;
         let mut bytes = allocate(count)?;
-        let source = geometry.entry_offset(copy, 2)
+        let source = geometry
+            .entry_offset(copy, 2)
             .map_err(|error| anyhow::anyhow!("invalid source FAT range: {error}"))?;
         volume.read_exact(cx, source, &mut bytes)?;
         let mut starts = [0; 2];
         for (index, start) in starts.iter_mut().enumerate() {
-            *start = volume.base.checked_add(geometry.entry_offset(index as u8, 2)
-                .map_err(|error| anyhow::anyhow!("invalid mirror range: {error}"))?)
+            *start = volume
+                .base
+                .checked_add(
+                    geometry
+                        .entry_offset(index as u8, 2)
+                        .map_err(|error| anyhow::anyhow!("invalid mirror range: {error}"))?,
+                )
                 .context("mirror physical offset overflow")?;
         }
-        let table = Arc::new(Table { bytes, starts, width });
+        let table = Arc::new(Table {
+            bytes,
+            starts,
+            width,
+        });
         let expected_geometry = geometry.clone();
         let expected_boot = diagnostic.boot;
         let device: Arc<dyn ByteDevice> = Arc::from(diagnostic.volume.device);
-        let diagnostic = DiagnosticVolume::from_device(cx, Box::new(Shared(Arc::clone(&device))), args)?;
+        let diagnostic =
+            DiagnosticVolume::from_device(cx, Box::new(Shared(Arc::clone(&device))), args)?;
         if diagnostic.volume.geometry != expected_geometry || diagnostic.boot != expected_boot {
             bail!("volume geometry or boot record changed during mirror preflight");
         }
-        let view = DiagnosticVolume::from_device(cx, Box::new(View {
-            device: Arc::clone(&device), table: Arc::clone(&table),
-        }), args)?;
+        let view = DiagnosticVolume::from_device(
+            cx,
+            Box::new(View {
+                device: Arc::clone(&device),
+                table: Arc::clone(&table),
+            }),
+            args,
+        )?;
         let selected = view.report(cx)?;
         admissible(&selected)?;
         let names = Names::capture(cx, &view.volume)?;
@@ -187,14 +247,21 @@ impl MirrorPlan {
         let size = geometry.sector_bytes() as usize;
         let per_copy = (count + 2 * width).div_ceil(size);
         let mut sectors = Vec::new();
-        sectors.try_reserve_exact(per_copy.checked_mul(2).context("mirror sector count overflow")?)
+        sectors
+            .try_reserve_exact(
+                per_copy
+                    .checked_mul(2)
+                    .context("mirror sector count overflow")?,
+            )
             .context("reserving bounded mirror sector evidence")?;
         let mut original = allocate(size)?;
         let mut updated = allocate(size)?;
         let mut different_entries = 0_u64;
         for fat in 0..2_u8 {
-            let start = geometry.entry_offset(fat, 2)
-                .map_err(|error| anyhow::anyhow!("invalid FAT range: {error}"))? - (2 * width) as u64;
+            let start = geometry
+                .entry_offset(fat, 2)
+                .map_err(|error| anyhow::anyhow!("invalid FAT range: {error}"))?
+                - (2 * width) as u64;
             for index in 0..per_copy {
                 checkpoint(cx)?;
                 let offset = start + (index * size) as u64;
@@ -204,32 +271,57 @@ impl MirrorPlan {
                 if fat == copy && original != updated {
                     bail!("selected FAT changed during mirror preflight");
                 }
-                for (old, new) in original.chunks_exact(width).zip(updated.chunks_exact(width)) {
+                for (old, new) in original
+                    .chunks_exact(width)
+                    .zip(updated.chunks_exact(width))
+                {
                     if old != new {
                         if geometry.kind().decode_entry(raw(old)) == FatEntry::Bad {
-                            bail!("selected copy would clear a native bad-cluster marker; refusing to erase media-error evidence");
+                            bail!(
+                                "selected copy would clear a native bad-cluster marker; refusing to erase media-error evidence"
+                            );
                         }
                         different_entries += 1;
                     }
                 }
                 sectors.push(Sector {
-                    offset, first: index == 0, changed: original != updated,
+                    offset,
+                    first: index == 0,
+                    changed: original != updated,
                     before: fingerprint(geometry.kind(), index == 0, &original),
                     after: fingerprint(geometry.kind(), index == 0, &updated),
                 });
             }
         }
-        let plan = Self { diagnostic, device, table, selected, names, sectors, copy, different_entries };
+        let plan = Self {
+            diagnostic,
+            device,
+            table,
+            selected,
+            names,
+            sectors,
+            copy,
+            different_entries,
+        };
         plan.validate(cx)?;
         Ok(plan)
     }
 
     fn view(&self, cx: &Cx) -> Result<DiagnosticVolume> {
         let volume = &self.diagnostic.volume;
-        let (view, boot) = FatVolume::parse_volume(cx, Box::new(View {
-            device: Arc::clone(&self.device), table: Arc::clone(&self.table),
-        }), volume.base, volume.geometry.volume_bytes())?;
-        let result = DiagnosticVolume { volume: view.with_oem_code_page(volume.oem_code_page()), boot };
+        let (view, boot) = FatVolume::parse_volume(
+            cx,
+            Box::new(View {
+                device: Arc::clone(&self.device),
+                table: Arc::clone(&self.table),
+            }),
+            volume.base,
+            volume.geometry.volume_bytes(),
+        )?;
+        let result = DiagnosticVolume {
+            volume: view.with_oem_code_page(volume.oem_code_page()),
+            boot,
+        };
         result.validate_geometry(cx)?;
         Ok(result)
     }
@@ -242,7 +334,10 @@ impl MirrorPlan {
             volume.read_exact(cx, sector.offset, &mut bytes)?;
             let expected = if after { sector.after } else { sector.before };
             if fingerprint(volume.geometry.kind(), sector.first, &bytes) != expected {
-                bail!("mirror sector evidence changed at volume byte {}", sector.offset);
+                bail!(
+                    "mirror sector evidence changed at volume byte {}",
+                    sector.offset
+                );
             }
         }
         Ok(())
@@ -252,7 +347,9 @@ impl MirrorPlan {
         checkpoint(cx)?;
         let mut boot = [0; 512];
         self.diagnostic.volume.read_exact(cx, 0, &mut boot)?;
-        if boot != self.diagnostic.boot { bail!("primary boot record changed after mirror preflight"); }
+        if boot != self.diagnostic.boot {
+            bail!("primary boot record changed after mirror preflight");
+        }
         self.diagnostic.validate_geometry(cx)?;
         native_state(&self.diagnostic, cx)?;
         self.verify_sectors(cx, false)?;
@@ -300,7 +397,8 @@ impl MirrorPlan {
                     bail!("mirror changed before publication at {}", sector.offset);
                 }
                 updated.copy_from_slice(&original);
-                self.table.project(cx, volume.base + sector.offset, &mut updated)?;
+                self.table
+                    .project(cx, volume.base + sector.offset, &mut updated)?;
                 write_patch(cx, volume, sector.offset, &original, &updated)?;
             }
             volume.device.sync(cx)?;
@@ -320,7 +418,8 @@ impl MirrorPlan {
                 || after.referenced_clusters != self.selected.referenced_clusters
                 || after.preallocated_clusters != self.selected.preallocated_clusters
                 || after.lost_clusters != self.selected.lost_clusters
-                || after.files != self.selected.files || after.directories != self.selected.directories
+                || after.files != self.selected.files
+                || after.directories != self.selected.directories
             {
                 bail!("reconciled image does not match the selected allocation interpretation");
             }
@@ -343,10 +442,20 @@ impl MirrorPlan {
             if needs_recovery {
                 let state = self.diagnostic.native_state(cx)?;
                 let boots = 1 + usize::from(volume.geometry.backup_boot_sector().is_some());
-                if state.iter().filter(|issue| issue.kind == "native_boot_dirty").count() != boots
-                    || state.iter().filter(|issue| issue.kind == "native_fat_dirty").count() != 2
+                if state
+                    .iter()
+                    .filter(|issue| issue.kind == "native_boot_dirty")
+                    .count()
+                    != boots
+                    || state
+                        .iter()
+                        .filter(|issue| issue.kind == "native_fat_dirty")
+                        .count()
+                        != 2
                 {
-                    bail!("unresolved lost allocation requires durable dirty state in every native copy");
+                    bail!(
+                        "unresolved lost allocation requires durable dirty state in every native copy"
+                    );
                 }
             }
             report["changed"] = true.into();
@@ -369,10 +478,14 @@ mod projection_tests {
     fn byte_windows_match_independent_entry_word_projection() {
         let cx = Cx::for_testing();
         for width in [2, 4] {
-            let bytes: Vec<_> = (0..7_u32).flat_map(|value| {
-                (0xC000_0000 | (value * 97 + 2)).to_le_bytes()[..width].to_vec()
-            }).collect();
-            let table = Table { bytes, starts: [16, 80], width };
+            let bytes: Vec<_> = (0..7_u32)
+                .flat_map(|value| (0xC000_0000 | (value * 97 + 2)).to_le_bytes()[..width].to_vec())
+                .collect();
+            let table = Table {
+                bytes,
+                starts: [16, 80],
+                width,
+            };
             let original: Vec<u8> = (0..128).map(|index| (index * 13 + 7) as u8).collect();
             let mut expected = original.clone();
             let mask = if width == 2 { 0xFFFF } else { 0x0FFF_FFFF };
@@ -381,14 +494,19 @@ mod projection_tests {
                     let at = start + index * width;
                     let old = raw(&expected[at..at + width]);
                     let value = raw(&table.bytes[index * width..(index + 1) * width]);
-                    expected[at..at + width].copy_from_slice(&((old & !mask) | (value & mask)).to_le_bytes()[..width]);
+                    expected[at..at + width]
+                        .copy_from_slice(&((old & !mask) | (value & mask)).to_le_bytes()[..width]);
                 }
             }
             for start in 0..=128 {
                 for end in start..=128 {
                     let mut actual = original[start..end].to_vec();
                     table.project(&cx, start as u64, &mut actual).unwrap();
-                    assert_eq!(actual, expected[start..end], "width {width}, {start}..{end}");
+                    assert_eq!(
+                        actual,
+                        expected[start..end],
+                        "width {width}, {start}..{end}"
+                    );
                 }
             }
         }
@@ -397,12 +515,19 @@ mod projection_tests {
     #[test]
     fn projection_rejects_overflow_and_cancellation_before_patching() {
         let cx = Cx::for_testing();
-        let table = Table { bytes: vec![0; 8], starts: [16, 80], width: 4 };
+        let table = Table {
+            bytes: vec![0; 8],
+            starts: [16, 80],
+            width: 4,
+        };
         let mut bytes = [0xAB; 4];
         assert!(table.project(&cx, u64::MAX - 1, &mut bytes).is_err());
         assert_eq!(bytes, [0xAB; 4]);
         cx.set_cancel_requested(true);
-        assert!(matches!(table.project(&cx, 16, &mut bytes), Err(FfsError::Cancelled)));
+        assert!(matches!(
+            table.project(&cx, 16, &mut bytes),
+            Err(FfsError::Cancelled)
+        ));
         assert_eq!(bytes, [0xAB; 4]);
     }
 }

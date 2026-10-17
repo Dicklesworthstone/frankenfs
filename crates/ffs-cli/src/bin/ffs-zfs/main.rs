@@ -423,7 +423,11 @@ mod tests {
         };
         // An exclusive writable open fails at sidecar admission. A genuine
         // read-only caller reaches native geometry admission while sharing locks.
-        assert!(error.to_string().contains("opening sidecar-protected ZFS leaf"));
+        assert!(
+            error
+                .to_string()
+                .contains("opening sidecar-protected ZFS leaf")
+        );
         assert_eq!(std::fs::read(&image).unwrap(), original);
         assert_eq!(std::fs::read(&archive).unwrap(), before);
         assert!(SidecarImageDevice::open(&cx, &image, &archive).is_err());

@@ -34,16 +34,23 @@ pub(super) fn reserve_before(
         bail!("rename exceeds the native long-name slot limit");
     }
     let mut reserved = Vec::new();
-    reserved.try_reserve_exact(needed.max(long.len()))
+    reserved
+        .try_reserve_exact(needed.max(long.len()))
         .context("reserving bounded rename name slots")?;
     for slot in long {
-        reserved.push(Slot { offset: slot.offset, bytes: slot.bytes, fresh: slot.fresh });
+        reserved.push(Slot {
+            offset: slot.offset,
+            bytes: slot.bytes,
+            fresh: slot.fresh,
+        });
     }
     if needed <= reserved.len() {
         return Ok(Some(reserved));
     }
     let (offsets, _) = directory_offsets(cx, volume, directory)?;
-    let short_index = offsets.iter().position(|&offset| offset == short.offset)
+    let short_index = offsets
+        .iter()
+        .position(|&offset| offset == short.offset)
         .context("rename source is not in its parent directory")?;
     let Some(mut index) = short_index.checked_sub(long.len()) else {
         bail!("rename long-name set extends before the parent directory");
@@ -55,7 +62,9 @@ pub(super) fn reserve_before(
     }
     while reserved.len() < needed {
         checkpoint(cx)?;
-        let Some(previous) = index.checked_sub(1) else { return Ok(None); };
+        let Some(previous) = index.checked_sub(1) else {
+            return Ok(None);
+        };
         let slot = read_slot(cx, volume, offsets[previous], false)?;
         if slot.bytes[0] != 0xE5 {
             return Ok(None);
@@ -85,7 +94,10 @@ impl Rename<'_> {
     fn verify_names(&self, cx: &Cx, volume: &FatVolume, encoded: &[[u8; 32]]) -> Result<()> {
         for (index, slot) in self.long.iter().enumerate() {
             checkpoint(cx)?;
-            let expected = encoded.get(index).copied().unwrap_or_else(|| retired_slot(slot));
+            let expected = encoded
+                .get(index)
+                .copied()
+                .unwrap_or_else(|| retired_slot(slot));
             if read_slot(cx, volume, slot.offset, false)?.bytes != expected {
                 bail!("in-place rename LFN readback failed at {}", slot.offset);
             }
@@ -184,7 +196,9 @@ impl Rename<'_> {
             self.verify_names(cx, volume, &encoded)?;
 
             phase = "verifying native name and unchanged allocation";
-            let published = volume.resolve(cx, self.to)?.context("renamed destination is missing")?;
+            let published = volume
+                .resolve(cx, self.to)?
+                .context("renamed destination is missing")?;
             if published.offset != self.short.offset
                 || published.name()? != self.leaf
                 || rename_chain(cx, volume, &published)?.as_slice() != self.chain
@@ -205,7 +219,10 @@ impl Rename<'_> {
                 || verification.files != self.before.files
                 || verification.directories != self.before.directories
             {
-                bail!("in-place rename verification failed: {}", serde_json::to_string(&verification)?);
+                bail!(
+                    "in-place rename verification failed: {}",
+                    serde_json::to_string(&verification)?
+                );
             }
             // FSInfo is untouched: neither free allocation nor search hints
             // change. Directory contents (including . and ..) are also untouched.

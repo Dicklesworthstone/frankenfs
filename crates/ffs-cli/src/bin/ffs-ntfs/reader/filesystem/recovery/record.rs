@@ -10,8 +10,8 @@ mod payload;
 mod preflight;
 
 use super::{
-    Cx, NtfsVolume, Restart, Result, SECTOR, bytes, checkpoint, corrupt, read_exact, u16_at, u32_at, u64_at,
-    unsupported,
+    Cx, NtfsVolume, Restart, Result, SECTOR, bytes, checkpoint, corrupt, read_exact, u16_at,
+    u32_at, u64_at, unsupported,
 };
 
 const RCRD: [u8; 4] = *b"RCRD";

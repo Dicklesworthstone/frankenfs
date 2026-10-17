@@ -9,10 +9,7 @@ use super::{Restart, Result, u32_at, unsupported};
 
 fn comparable_lsn(restart: &Restart, lsn: u64) -> Result<()> {
     let page = u64::from(restart.log_page);
-    if !(3..64).contains(&restart.seq_num_bits)
-        || page < 512
-        || !page.is_power_of_two()
-        || lsn == 0
+    if !(3..64).contains(&restart.seq_num_bits) || page < 512 || !page.is_power_of_two() || lsn == 0
     {
         return Err(unsupported("$LogFile restart LSNs are not comparable"));
     }
@@ -30,7 +27,9 @@ fn comparable_lsn(restart: &Restart, lsn: u64) -> Result<()> {
     {
         // Initial/pseudo LSNs can occur natively, but do not prove ordering of
         // differing checkpoints in this profile. Equal copies remain admitted.
-        return Err(unsupported("$LogFile differing restart copies need real bounded record LSNs"));
+        return Err(unsupported(
+            "$LogFile differing restart copies need real bounded record LSNs",
+        ));
     }
     Ok(())
 }
@@ -40,7 +39,9 @@ pub(super) fn choose<'a>(first: &'a Restart, second: &'a Restart) -> Result<&'a 
         return Ok(first);
     }
     if first.current_lsn == second.current_lsn {
-        return Err(unsupported("$LogFile equal-LSN restart copies disagree on checkpoint state"));
+        return Err(unsupported(
+            "$LogFile equal-LSN restart copies disagree on checkpoint state",
+        ));
     }
     if first.system_page != second.system_page
         || first.log_page != second.log_page
@@ -52,12 +53,19 @@ pub(super) fn choose<'a>(first: &'a Restart, second: &'a Restart) -> Result<&'a 
         || first.active_client_seq != second.active_client_seq
         || u32_at(&first.area, 40)? != u32_at(&second.area, 40)?
     {
-        return Err(unsupported("$LogFile restart copies have incompatible geometry or epochs"));
+        return Err(unsupported(
+            "$LogFile restart copies have incompatible geometry or epochs",
+        ));
     }
     for restart in [first, second] {
         comparable_lsn(restart, restart.current_lsn)?;
-        for lsn in [restart.active_client_oldest_lsn, restart.active_client_restart_lsn]
-            .into_iter().flatten().filter(|lsn| *lsn != 0)
+        for lsn in [
+            restart.active_client_oldest_lsn,
+            restart.active_client_restart_lsn,
+        ]
+        .into_iter()
+        .flatten()
+        .filter(|lsn| *lsn != 0)
         {
             comparable_lsn(restart, lsn)?;
         }
@@ -71,12 +79,13 @@ pub(super) fn choose<'a>(first: &'a Restart, second: &'a Restart) -> Result<&'a 
     let old_sequence = older.current_lsn >> address_bits;
     let new_sequence = newer.current_lsn >> address_bits;
     if new_sequence - old_sequence > 1
-        || newer.active_client_oldest_lsn.unwrap_or(0)
-            < older.active_client_oldest_lsn.unwrap_or(0)
+        || newer.active_client_oldest_lsn.unwrap_or(0) < older.active_client_oldest_lsn.unwrap_or(0)
         || newer.active_client_restart_lsn.unwrap_or(0)
             < older.active_client_restart_lsn.unwrap_or(0)
     {
-        return Err(unsupported("$LogFile restart generations or client progress are ambiguous"));
+        return Err(unsupported(
+            "$LogFile restart generations or client progress are ambiguous",
+        ));
     }
     // Deliberately do not prefer 'clean'. A newer dirty checkpoint wins and is
     // rejected by the caller's recovery-required policy, never rolled back.
@@ -174,7 +183,13 @@ mod tests {
     #[test]
     fn pseudo_reserved_header_and_future_client_lsns_are_not_ordering_evidence() {
         let good = restart(lsn(1, FIRST + PAGE + 128), true);
-        for current in [0, 42, lsn(1, PAGE + 128), lsn(1, FIRST), lsn(1, FIRST + PAGE - 8)] {
+        for current in [
+            0,
+            42,
+            lsn(1, PAGE + 128),
+            lsn(1, FIRST),
+            lsn(1, FIRST + PAGE - 8),
+        ] {
             let bad = restart(current, true);
             assert!(choose(&bad, &good).is_err());
         }

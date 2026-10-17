@@ -25,7 +25,8 @@ impl FatFs {
         // A capacity refusal must not leave a published exchange without IDs.
         let source_ino = self.register(cx, parent, source.clone())?;
         let target_ino = self.register(cx, new_parent, target.clone())?;
-        self.volume.rename_exchange(cx, &from, &to, false)
+        self.volume
+            .rename_exchange(cx, &from, &to, false)
             .map_err(map_mutation_error)?;
         if source_ino == target_ino {
             return Ok(());
@@ -44,14 +45,16 @@ impl FatFs {
         state.free_clusters = None;
         // Inodes follow objects, NOT names/slots. Cached descendants continue
         // to refer to the same directory inode, whose own parent now changes.
-        let source_node = state.nodes.get_mut(&source_ino).ok_or_else(|| {
-            FfsError::NotFound(format!("FAT exchange inode {}", source_ino.0))
-        })?;
+        let source_node = state
+            .nodes
+            .get_mut(&source_ino)
+            .ok_or_else(|| FfsError::NotFound(format!("FAT exchange inode {}", source_ino.0)))?;
         source_node.parent = new_parent;
         source_node.entry = Some(at_to);
-        let target_node = state.nodes.get_mut(&target_ino).ok_or_else(|| {
-            FfsError::NotFound(format!("FAT exchange inode {}", target_ino.0))
-        })?;
+        let target_node = state
+            .nodes
+            .get_mut(&target_ino)
+            .ok_or_else(|| FfsError::NotFound(format!("FAT exchange inode {}", target_ino.0)))?;
         target_node.parent = parent;
         target_node.entry = Some(at_from);
         state.slot_to_ino.insert(source.offset, target_ino);

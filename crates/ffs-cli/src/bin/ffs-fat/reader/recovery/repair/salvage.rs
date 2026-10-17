@@ -5,8 +5,10 @@
 //! exported bytes are whole clusters and may include sensitive deleted data.
 //! This is raw salvage, not undeletion, native repair or payload reconstruction.
 
-use super::{FatEntry, FatKind, FatTable, FatVolume, Plan, MAX_CHAIN_CLUSTERS,
-    allocate, checkpoint, hex_digest};
+use super::{
+    FatEntry, FatKind, FatTable, FatVolume, MAX_CHAIN_CLUSTERS, Plan, allocate, checkpoint,
+    hex_digest,
+};
 use anyhow::{Context, Result, bail};
 use asupersync::Cx;
 use serde::Serialize;
@@ -30,8 +32,10 @@ fn chains(cx: &Cx, kind: FatKind, lost: &[(u32, u32)]) -> Result<Vec<Vec<u32>>> 
     }
     let mut inbound = allocate(lost.len())?;
     let mut visited = allocate(lost.len())?;
-    let locate = |cluster| lost.binary_search_by_key(&cluster, |&(id, _)| id)
-        .map_err(|_| anyhow::anyhow!("lost chain points outside proven unreachable allocation"));
+    let locate = |cluster| {
+        lost.binary_search_by_key(&cluster, |&(id, _)| id)
+            .map_err(|_| anyhow::anyhow!("lost chain points outside proven unreachable allocation"))
+    };
     for (index, &(cluster, raw)) in lost.iter().enumerate() {
         checkpoint(cx)?;
         if cluster < 2 || (index != 0 && lost[index - 1].0 >= cluster) {
@@ -53,16 +57,24 @@ fn chains(cx: &Cx, kind: FatKind, lost: &[(u32, u32)]) -> Result<Vec<Vec<u32>>> 
     let mut count = 0;
     for head in 0..lost.len() {
         checkpoint(cx)?;
-        if inbound[head] != 0 { continue; }
-        if result.len() == MAX_FILES { bail!("salvage exceeds 10000 recovered files"); }
+        if inbound[head] != 0 {
+            continue;
+        }
+        if result.len() == MAX_FILES {
+            bail!("salvage exceeds 10000 recovered files");
+        }
         let mut chain = Vec::new();
         let mut at = head;
         loop {
             checkpoint(cx)?;
-            if visited[at] != 0 { bail!("lost chain revisits an already assigned cluster"); }
+            if visited[at] != 0 {
+                bail!("lost chain revisits an already assigned cluster");
+            }
             visited[at] = 1;
             count += 1;
-            chain.try_reserve(1).context("reserving bounded salvage chain")?;
+            chain
+                .try_reserve(1)
+                .context("reserving bounded salvage chain")?;
             chain.push(lost[at].0);
             match kind.decode_entry(lost[at].1) {
                 FatEntry::End => break,
@@ -70,10 +82,14 @@ fn chains(cx: &Cx, kind: FatKind, lost: &[(u32, u32)]) -> Result<Vec<Vec<u32>>> 
                 _ => bail!("invalid salvage chain successor"),
             }
         }
-        result.try_reserve(1).context("reserving bounded salvage file list")?;
+        result
+            .try_reserve(1)
+            .context("reserving bounded salvage file list")?;
         result.push(chain);
     }
-    if count != lost.len() { bail!("lost allocation contains a cycle without a unique head"); }
+    if count != lost.len() {
+        bail!("lost allocation contains a cycle without a unique head");
+    }
     Ok(result)
 }
 
@@ -94,7 +110,12 @@ struct ExportedFile {
 }
 
 impl Salvage {
-    pub(super) fn prepare(cx: &Cx, volume: &FatVolume, evidence: Plan, output: &Path) -> Result<Self> {
+    pub(super) fn prepare(
+        cx: &Cx,
+        volume: &FatVolume,
+        evidence: Plan,
+        output: &Path,
+    ) -> Result<Self> {
         checkpoint(cx)?;
         let bytes = (evidence.lost.len() as u64)
             .checked_mul(u64::from(volume.geometry.cluster_bytes()))
@@ -103,15 +124,23 @@ impl Salvage {
         let chains = chains(cx, volume.geometry.kind(), &evidence.lost)?;
         // Resolve the operator-selected parent once, and require a fresh leaf.
         // The caller must keep this host directory namespace exclusively owned.
-        let leaf = output.file_name().context("salvage requires a new output directory name")?;
-        let parent = output.parent().filter(|path| !path.as_os_str().is_empty())
-            .unwrap_or_else(|| Path::new(".")).canonicalize()
+        let leaf = output
+            .file_name()
+            .context("salvage requires a new output directory name")?;
+        let parent = output
+            .parent()
+            .filter(|path| !path.as_os_str().is_empty())
+            .unwrap_or_else(|| Path::new("."))
+            .canonicalize()
             .context("resolve existing salvage output parent")?;
         let output = parent.join(leaf);
         match fs::symlink_metadata(&output) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => return Err(error.into()),
-            Ok(_) => bail!("salvage output must not already exist: {}", output.display()),
+            Ok(_) => bail!(
+                "salvage output must not already exist: {}",
+                output.display()
+            ),
         }
         for chain in &chains {
             for &cluster in chain {
@@ -119,7 +148,12 @@ impl Salvage {
                 volume.cluster_offset(cluster)?;
             }
         }
-        Ok(Self { evidence, chains, output, bytes })
+        Ok(Self {
+            evidence,
+            chains,
+            output,
+            bytes,
+        })
     }
 
     pub(super) fn report(&self, dry_run: bool) -> serde_json::Value {
@@ -164,7 +198,9 @@ impl Salvage {
         // Reserve buffers and reporting capacity BEFORE creating output.
         let mut buffer = allocate(BUFFER_BYTES)?;
         let mut files = Vec::new();
-        files.try_reserve_exact(self.chains.len()).context("reserving salvage manifest")?;
+        files
+            .try_reserve_exact(self.chains.len())
+            .context("reserving salvage manifest")?;
         let mut report = self.report(false);
         if self.chains.is_empty() {
             report["output_created"] = false.into();
@@ -174,13 +210,22 @@ impl Salvage {
             checkpoint(cx)?;
             return Ok(report);
         }
-        let parent = OpenOptions::new().read(true)
+        let parent = OpenOptions::new()
+            .read(true)
             .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
-            .open(self.output.parent().context("salvage output has no parent")?)?;
-        DirBuilder::new().mode(0o700).create(&self.output)
+            .open(
+                self.output
+                    .parent()
+                    .context("salvage output has no parent")?,
+            )?;
+        DirBuilder::new()
+            .mode(0o700)
+            .create(&self.output)
             .context("create new private salvage directory; existing targets are never reused")?;
-        let directory = OpenOptions::new().read(true)
-            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW).open(&self.output)?;
+        let directory = OpenOptions::new()
+            .read(true)
+            .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW)
+            .open(&self.output)?;
         let identity = directory.metadata()?;
         let result = (|| -> Result<serde_json::Value> {
             for (index, chain) in self.chains.iter().enumerate() {
@@ -195,10 +240,15 @@ impl Salvage {
                 verify_output(cx, &mut target, length, &digest, &mut buffer)?;
                 source_stable()?;
                 let mut retained_chain = Vec::new();
-                retained_chain.try_reserve_exact(chain.len()).context("retaining salvage provenance")?;
+                retained_chain
+                    .try_reserve_exact(chain.len())
+                    .context("retaining salvage provenance")?;
                 retained_chain.extend_from_slice(chain);
                 files.push(ExportedFile {
-                    name, clusters: retained_chain, bytes: length, sha256: hex_digest(&digest),
+                    name,
+                    clusters: retained_chain,
+                    bytes: length,
+                    sha256: hex_digest(&digest),
                 });
             }
             self.validate_links(cx, volume)?;
@@ -223,22 +273,31 @@ impl Salvage {
             checkpoint(cx)?;
             Ok(report)
         })();
-        result.with_context(|| format!(
-            "FAT salvage failed; image was not modified; partial output retained at {}",
-            self.output.display()
-        ))
+        result.with_context(|| {
+            format!(
+                "FAT salvage failed; image was not modified; partial output retained at {}",
+                self.output.display()
+            )
+        })
     }
 }
 
 fn new_file(path: &Path) -> Result<File> {
-    Ok(OpenOptions::new().read(true).write(true).create_new(true).mode(0o600)
-        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK).open(path)?)
+    Ok(OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create_new(true)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?)
 }
 
 fn same_directory(path: &Path, original: &Metadata) -> Result<()> {
     let current = fs::symlink_metadata(path)?;
-    if !current.is_dir() || current.file_type().is_symlink()
-        || current.dev() != original.dev() || current.ino() != original.ino()
+    if !current.is_dir()
+        || current.file_type().is_symlink()
+        || current.dev() != original.dev()
+        || current.ino() != original.ino()
     {
         bail!("salvage output directory identity changed");
     }
@@ -252,7 +311,9 @@ fn stream_chain(
     output: &mut impl Write,
     buffer: &mut [u8],
 ) -> Result<[u8; 32]> {
-    if buffer.is_empty() { bail!("salvage streaming buffer is empty"); }
+    if buffer.is_empty() {
+        bail!("salvage streaming buffer is empty");
+    }
     let mut hash = Sha256::new();
     for &cluster in chain {
         let base = volume.cluster_offset(cluster)?;
@@ -274,9 +335,19 @@ fn stream_chain(
     Ok(hash.finalize().into())
 }
 
-fn verify_output(cx: &Cx, file: &mut File, length: u64, expected: &[u8; 32], buffer: &mut [u8]) -> Result<()> {
-    if buffer.is_empty() { bail!("salvage readback buffer is empty"); }
-    if file.metadata()?.len() != length { bail!("salvaged file length failed readback"); }
+fn verify_output(
+    cx: &Cx,
+    file: &mut File,
+    length: u64,
+    expected: &[u8; 32],
+    buffer: &mut [u8],
+) -> Result<()> {
+    if buffer.is_empty() {
+        bail!("salvage readback buffer is empty");
+    }
+    if file.metadata()?.len() != length {
+        bail!("salvaged file length failed readback");
+    }
     file.seek(SeekFrom::Start(0))?;
     let mut hash = Sha256::new();
     let mut left = length;
@@ -288,7 +359,9 @@ fn verify_output(cx: &Cx, file: &mut File, length: u64, expected: &[u8; 32], buf
         left -= count as u64;
     }
     let actual: [u8; 32] = hash.finalize().into();
-    if &actual != expected { bail!("salvaged file SHA-256 failed readback"); }
+    if &actual != expected {
+        bail!("salvaged file SHA-256 failed readback");
+    }
     checkpoint(cx)?;
     Ok(())
 }

@@ -183,11 +183,7 @@ fn assess_volume(
 }
 
 #[cfg(test)]
-fn assess(
-    cx: &Cx,
-    length: u64,
-    read: impl FnMut(u64, usize) -> Result<Vec<u8>>,
-) -> Result<()> {
+fn assess(cx: &Cx, length: u64, read: impl FnMut(u64, usize) -> Result<Vec<u8>>) -> Result<()> {
     assess_volume(cx, length, read, None)
 }
 
@@ -289,7 +285,9 @@ fn restart(cx: &Cx, mut page: Vec<u8>, stream_length: u64) -> Result<Restart> {
     let mut active_client_oldest_lsn = None;
     let mut active_client_restart_lsn = None;
     if flags & !0x0003 != 0 || clients > 1 {
-        return Err(unsupported("unknown $LogFile restart flags or multiple clients"));
+        return Err(unsupported(
+            "unknown $LogFile restart flags or multiple clients",
+        ));
     }
     if clients == 0 {
         if free != NO_CLIENT || active != NO_CLIENT {
@@ -305,9 +303,7 @@ fn restart(cx: &Cx, mut page: Vec<u8>, stream_length: u64) -> Result<Restart> {
         let client = &area[client_offset..];
         // Linux uses a 96-byte client; older Windows layouts reserve 160.
         // No unchecked indexing or guessed stride is needed for one client.
-        if client.len() < 96
-            || u16_at(client, 16)? != NO_CLIENT
-            || u16_at(client, 18)? != NO_CLIENT
+        if client.len() < 96 || u16_at(client, 16)? != NO_CLIENT || u16_at(client, 18)? != NO_CLIENT
         {
             return Err(corrupt(0, "truncated or cyclic $LogFile client record"));
         }
@@ -458,16 +454,14 @@ mod tests {
                     let old_vbo = if wrap { LOG_SIZE as u64 - 4096 } else { first };
                     let new_vbo = if wrap { first } else { first + 4096 };
                     let old_lsn = (1_u64 << 20) | (old_vbo + 128) / 8;
-                    let new_lsn = ((if wrap { 2_u64 } else { 1 }) << 20)
-                        | (new_vbo + 128) / 8;
+                    let new_lsn = ((if wrap { 2_u64 } else { 1 }) << 20) | (new_vbo + 128) / 8;
                     let mut old = plain(4096, version, if old_clean { CLEAN } else { 0 }, true);
                     let mut new = plain(4096, version, CLEAN, true);
                     let start = usize::from(u16_at(&old, 24).unwrap());
                     old[start..start + 8].copy_from_slice(&old_lsn.to_le_bytes());
                     new[start..start + 8].copy_from_slice(&new_lsn.to_le_bytes());
-                    for (first, second) in [
-                        (old.clone(), new.clone()), (new.clone(), old.clone()),
-                    ] {
+                    for (first, second) in [(old.clone(), new.clone()), (new.clone(), old.clone())]
+                    {
                         let log = pair(first, second);
                         let before = log.clone();
                         check(&log).unwrap();
@@ -490,7 +484,10 @@ mod tests {
         for (first, second) in [(old.clone(), new.clone()), (new, old)] {
             // The selected dirty tail points into erased RCRD storage. This
             // must reach the decoder and fail, never admit the older clean RSTR.
-            assert!(matches!(check(&pair(first, second)), Err(FfsError::Corruption { .. })));
+            assert!(matches!(
+                check(&pair(first, second)),
+                Err(FfsError::Corruption { .. })
+            ));
         }
     }
 

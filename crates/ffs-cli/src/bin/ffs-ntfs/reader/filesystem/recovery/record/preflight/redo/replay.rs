@@ -3,12 +3,16 @@
 //! No backing writes, native CLR publication or recovered-mount admission.
 //! Unknown required operations abort the complete stage, never a partial view.
 
-use super::{Candidate, Plan, ReplayInput, ReplaySummary};
-use super::super::{LogRecord, checkpoint, corrupt, read_record, targets, u16_at, u64_at, unsupported};
 use super::super::super::super::super::super as reader;
-use reader::{Cx, NtfsVolume, Result, Storage, Stream, parse};
-use ffs_ondisk::ntfs::recovery::{FileEdit, FileEditResult, FileOperation, IndexOperation, RecoveryPass, apply_file_edit};
+use super::super::{
+    LogRecord, checkpoint, corrupt, read_record, targets, u16_at, u64_at, unsupported,
+};
+use super::{Candidate, Plan, ReplayInput, ReplaySummary};
+use ffs_ondisk::ntfs::recovery::{
+    FileEdit, FileEditResult, FileOperation, IndexOperation, RecoveryPass, apply_file_edit,
+};
 use ffs_ondisk::ntfs::{DATA, NtfsFileRecord};
+use reader::{Cx, NtfsVolume, Result, Storage, Stream, parse};
 use std::collections::BTreeMap;
 
 const MAX_RECORDS: usize = 4096;
@@ -50,7 +54,9 @@ fn bitmap(stream: &Stream, bits: u64) -> Result<()> {
     match &stream.storage {
         Storage::Resident(_) => Ok(()),
         Storage::Mapped(runs) if runs.iter().all(|run| run.lcn.is_some()) => Ok(()),
-        _ => Err(unsupported("NTFS replay needs untransformed allocation bitmaps")),
+        _ => Err(unsupported(
+            "NTFS replay needs untransformed allocation bitmaps",
+        )),
     }
 }
 
@@ -80,7 +86,9 @@ impl<'a> VolumeInput<'a> {
     }
 
     fn charge(&mut self, bytes: u64) -> Result<()> {
-        self.remaining = self.remaining.checked_sub(bytes)
+        self.remaining = self
+            .remaining
+            .checked_sub(bytes)
             .ok_or_else(|| unsupported("NTFS replay target reads exceed 64 MiB"))?;
         Ok(())
     }
@@ -93,36 +101,56 @@ impl MftInput for VolumeInput<'_> {
 
     fn mapped_lcn(&self, vcn: u64) -> Result<u64> {
         let Storage::Mapped(runs) = &self.volume.mft.storage else {
-            return Err(corrupt(0, "NTFS replay MFT map is not ordinary nonresident DATA"));
+            return Err(corrupt(
+                0,
+                "NTFS replay MFT map is not ordinary nonresident DATA",
+            ));
         };
-        let index = runs.partition_point(|run| run.vcn <= vcn).checked_sub(1)
+        let index = runs
+            .partition_point(|run| run.vcn <= vcn)
+            .checked_sub(1)
             .ok_or_else(|| corrupt(0, "NTFS replay VCN precedes the MFT map"))?;
         let run = &runs[index];
         let within = vcn - run.vcn;
         if within >= run.clusters {
             return Err(corrupt(0, "NTFS replay VCN is outside the MFT map"));
         }
-        run.lcn.and_then(|lcn| lcn.checked_add(within))
+        run.lcn
+            .and_then(|lcn| lcn.checked_add(within))
             .ok_or_else(|| corrupt(0, "NTFS replay MFT map is sparse or overflowing"))
     }
 
     fn allocated(&mut self, cx: &Cx, mft: bool, bit: u64) -> Result<bool> {
         self.charge(1)?;
-        let stream = if mft { &self.mft_bitmap } else { &self.cluster_bitmap };
+        let stream = if mft {
+            &self.mft_bitmap
+        } else {
+            &self.cluster_bitmap
+        };
         let byte = self.volume.read(cx, stream, bit / 8, 1)?;
-        let byte = byte.first().ok_or_else(|| corrupt(0, "short NTFS replay bitmap read"))?;
+        let byte = byte
+            .first()
+            .ok_or_else(|| corrupt(0, "short NTFS replay bitmap read"))?;
         Ok(*byte & (1_u8 << (bit % 8)) != 0)
     }
 
     fn read_record(&mut self, cx: &Cx, number: u32) -> Result<Vec<u8>> {
         self.charge(self.layout.record_bytes as u64)?;
-        self.volume.read(cx, &self.volume.mft,
-            u64::from(number) * self.layout.record_bytes as u64, self.layout.record_bytes)
+        self.volume.read(
+            cx,
+            &self.volume.mft,
+            u64::from(number) * self.layout.record_bytes as u64,
+            self.layout.record_bytes,
+        )
     }
 }
 
 fn operation(record: &LogRecord, undo: bool) -> Result<FileOperation> {
-    let opcode = if undo { record.summary.undo_op } else { record.summary.redo_op };
+    let opcode = if undo {
+        record.summary.undo_op
+    } else {
+        record.summary.redo_op
+    };
     match opcode {
         4 => Ok(FileOperation::WriteEnd),
         5 => Ok(FileOperation::CreateAttribute),
@@ -151,11 +179,20 @@ struct Action<'a> {
     number: u32,
 }
 
-fn target(layout: Layout, record: &LogRecord, attribute: &targets::Attribute, lcns: &[u64]) -> Result<u32> {
-    if attribute.reference != layout.mft_reference || attribute.kind != DATA
-        || !attribute.name.is_empty() || attribute.index_bytes != 0
+fn target(
+    layout: Layout,
+    record: &LogRecord,
+    attribute: &targets::Attribute,
+    lcns: &[u64],
+) -> Result<u32> {
+    if attribute.reference != layout.mft_reference
+        || attribute.kind != DATA
+        || !attribute.name.is_empty()
+        || attribute.index_bytes != 0
     {
-        return Err(unsupported("FILE replay requires the current unnamed $MFT DATA identity"));
+        return Err(unsupported(
+            "FILE replay requires the current unnamed $MFT DATA identity",
+        ));
     }
     if lcns.is_empty() || lcns.len() != usize::from(u16_at(&record.data, 14)?) {
         return Err(corrupt(0, "FILE replay is missing native mapping claims"));
@@ -163,21 +200,29 @@ fn target(layout: Layout, record: &LogRecord, attribute: &targets::Attribute, lc
     let vcn = u64_at(&record.data, 24)?;
     let offset = u64::from(u16_at(&record.data, 20)?) * 512;
     let bytes = lcns.len() as u64 * layout.cluster_bytes;
-    let logical = vcn.checked_mul(layout.cluster_bytes).and_then(|at| at.checked_add(offset))
+    let logical = vcn
+        .checked_mul(layout.cluster_bytes)
+        .and_then(|at| at.checked_add(offset))
         .ok_or_else(|| corrupt(0, "FILE replay logical target overflows"))?;
     if offset + layout.record_bytes as u64 > bytes
         || !logical.is_multiple_of(layout.record_bytes as u64)
-        || logical.checked_add(layout.record_bytes as u64)
+        || logical
+            .checked_add(layout.record_bytes as u64)
             .is_none_or(|end| end > layout.mft_initialized)
     {
-        return Err(corrupt(0, "FILE replay target exceeds initialized MFT geometry"));
+        return Err(corrupt(
+            0,
+            "FILE replay target exceeds initialized MFT geometry",
+        ));
     }
     let number = u32::try_from(logical / layout.record_bytes as u64)
         .map_err(|_| corrupt(0, "FILE replay record identity overflows"))?;
     // The current bootstrap and bitmap streams are immutable inputs. Mutating
     // their own metadata would require rebuilding those views before reuse.
     if number < 16 {
-        return Err(unsupported("NTFS system-record replay requires bootstrap-view reconstruction"));
+        return Err(unsupported(
+            "NTFS system-record replay requires bootstrap-view reconstruction",
+        ));
     }
     Ok(number)
 }
@@ -193,13 +238,20 @@ fn validate_action(cx: &Cx, input: &mut impl MftInput, action: &Action<'_>) -> R
     let vcn = u64_at(&action.record.data, 24)?;
     for (index, &lcn) in action.lcns.iter().enumerate() {
         checkpoint(cx)?;
-        let vcn = vcn.checked_add(index as u64)
+        let vcn = vcn
+            .checked_add(index as u64)
             .ok_or_else(|| corrupt(0, "FILE replay VCN overflows"))?;
         if lcn == 0 || lcn >= layout.clusters || input.mapped_lcn(vcn)? != lcn {
-            return Err(corrupt(0, "journal target disagrees with the current MFT mapping"));
+            return Err(corrupt(
+                0,
+                "journal target disagrees with the current MFT mapping",
+            ));
         }
         if !input.allocated(cx, false, lcn)? {
-            return Err(corrupt(0, "journal targets an unallocated physical MFT cluster"));
+            return Err(corrupt(
+                0,
+                "journal targets an unallocated physical MFT cluster",
+            ));
         }
     }
     if !input.allocated(cx, true, u64::from(action.number))? {
@@ -222,8 +274,10 @@ fn execute(
 ) -> Result<Staged> {
     checkpoint(cx)?;
     let layout = input.layout();
-    if !(512..=65_536).contains(&layout.cluster_bytes) || !layout.cluster_bytes.is_power_of_two()
-        || !(512..=65_536).contains(&layout.record_bytes) || !layout.record_bytes.is_power_of_two()
+    if !(512..=65_536).contains(&layout.cluster_bytes)
+        || !layout.cluster_bytes.is_power_of_two()
+        || !(512..=65_536).contains(&layout.record_bytes)
+        || !layout.record_bytes.is_power_of_two()
         || layout.boundary_lsn == 0
     {
         return Err(corrupt(0, "invalid FILE replay geometry or boundary"));
@@ -233,13 +287,25 @@ fn execute(
     }
     let mut actions = Vec::new();
     let mut claims = 0_usize;
-    for Candidate { record, attribute, lcns, payload } in &plan.candidates {
+    for Candidate {
+        record,
+        attribute,
+        lcns,
+        payload,
+    } in &plan.candidates
+    {
         checkpoint(cx)?;
-        claims = claims.checked_add(lcns.len()).filter(|claims| *claims <= MAX_CLAIMS)
+        claims = claims
+            .checked_add(lcns.len())
+            .filter(|claims| *claims <= MAX_CLAIMS)
             .ok_or_else(|| unsupported("FILE replay exceeds 65536 mapping claims"))?;
         actions.push(Action {
-            record, attribute, lcns: lcns.clone(), payload,
-            pass: RecoveryPass::Redo(record.lsn), operation: operation(record, false)?,
+            record,
+            attribute,
+            lcns: lcns.clone(),
+            payload,
+            pass: RecoveryPass::Redo(record.lsn),
+            operation: operation(record, false)?,
             number: target(layout, record, attribute, lcns)?,
         });
     }
@@ -247,49 +313,75 @@ fn execute(
     for record in undo_records {
         checkpoint(cx)?;
         if record.lsn >= previous_undo {
-            return Err(corrupt(0, "FILE replay undo is not strictly reverse chronological"));
+            return Err(corrupt(
+                0,
+                "FILE replay undo is not strictly reverse chronological",
+            ));
         }
         previous_undo = record.lsn;
         let slot = u32::from(u16_at(&record.data, 12)?);
-        let attribute = targets.attributes.get(&slot)
+        let attribute = targets
+            .attributes
+            .get(&slot)
             .filter(|attribute| attribute.opened <= record.lsn)
             .ok_or_else(|| unsupported("FILE undo target incarnation no longer survives"))?;
         let count = usize::from(u16_at(&record.data, 14)?);
-        claims = claims.checked_add(count).filter(|claims| *claims <= MAX_CLAIMS)
+        claims = claims
+            .checked_add(count)
+            .filter(|claims| *claims <= MAX_CLAIMS)
             .ok_or_else(|| unsupported("FILE redo/undo exceeds 65536 mapping claims"))?;
         let vcn = u64_at(&record.data, 24)?;
         let mut lcns = Vec::with_capacity(count);
         for index in 0..count {
-            let vcn = vcn.checked_add(index as u64)
+            let vcn = vcn
+                .checked_add(index as u64)
                 .ok_or_else(|| corrupt(0, "FILE undo VCN overflows"))?;
-            let lcn = targets.clusters.get(&(slot, vcn))
-                .filter(|cluster| cluster.oldest <= record.lsn).and_then(|cluster| cluster.lcn)
+            let lcn = targets
+                .clusters
+                .get(&(slot, vcn))
+                .filter(|cluster| cluster.oldest <= record.lsn)
+                .and_then(|cluster| cluster.lcn)
                 .ok_or_else(|| unsupported("FILE undo spans retired or superseded allocation"))?;
             lcns.push(lcn);
         }
         let number = target(layout, record, attribute, &lcns)?;
         actions.push(Action {
-            record, attribute, lcns, number, pass: RecoveryPass::Undo,
-            operation: operation(record, true)?, payload: targets::payload(record, true)?,
+            record,
+            attribute,
+            lcns,
+            number,
+            pass: RecoveryPass::Undo,
+            operation: operation(record, true)?,
+            payload: targets::payload(record, true)?,
         });
     }
     // Reject every unsupported opcode and mapping before reading any target
     // FILE bytes. A later operation must never leave an earlier partial view.
     for action in &actions {
         if action.record.lsn == 0 || action.record.lsn > layout.boundary_lsn {
-            return Err(corrupt(0, "FILE replay action is beyond its selected journal boundary"));
+            return Err(corrupt(
+                0,
+                "FILE replay action is beyond its selected journal boundary",
+            ));
         }
         validate_action(cx, input, action)?;
     }
     let mut stage = Staged {
         records: BTreeMap::new(),
-        summary: ReplaySummary { records: 0, redo: 0, undo: 0, skipped: 0 },
+        summary: ReplaySummary {
+            records: 0,
+            redo: 0,
+            undo: 0,
+            skipped: 0,
+        },
     };
     let mut retained = 0_usize;
     for action in actions {
         checkpoint(cx)?;
         if !stage.records.contains_key(&action.number) {
-            retained = retained.checked_add(layout.record_bytes).filter(|bytes| *bytes <= MAX_BYTES)
+            retained = retained
+                .checked_add(layout.record_bytes)
+                .filter(|bytes| *bytes <= MAX_BYTES)
                 .ok_or_else(|| unsupported("FILE replay private records exceed 16 MiB"))?;
             if stage.records.len() == MAX_RECORDS {
                 return Err(unsupported("FILE replay exceeds 4096 private records"));
@@ -301,14 +393,20 @@ fn execute(
             }
             let record = NtfsFileRecord::parse(&raw).map_err(|error| parse(&error))?;
             if record.base.sequence != 0 && record.base.record < 16 {
-                return Err(unsupported("NTFS system extension replay requires bootstrap reconstruction"));
+                return Err(unsupported(
+                    "NTFS system extension replay requires bootstrap reconstruction",
+                ));
             }
             if u64_at(&raw, 8)? > layout.boundary_lsn {
-                return Err(unsupported("FILE page is newer than the selected journal boundary"));
+                return Err(unsupported(
+                    "FILE page is newer than the selected journal boundary",
+                ));
             }
             stage.records.insert(action.number, raw);
         }
-        let raw = stage.records.get(&action.number)
+        let raw = stage
+            .records
+            .get(&action.number)
             .ok_or_else(|| corrupt(0, "FILE replay lost its private record"))?;
         let edit = FileEdit {
             operation: action.operation,
@@ -316,7 +414,9 @@ fn execute(
             attribute_offset: u16_at(&action.record.data, 18)?,
             data: action.payload,
         };
-        match apply_file_edit(raw, action.number, action.pass, &edit).map_err(|error| parse(&error))? {
+        match apply_file_edit(raw, action.number, action.pass, &edit)
+            .map_err(|error| parse(&error))?
+        {
             FileEditResult::AlreadyApplied => stage.summary.skipped += 1,
             FileEditResult::Applied(raw) => {
                 stage.records.insert(action.number, raw);
@@ -341,12 +441,16 @@ pub(super) fn stage(
 ) -> Result<ReplaySummary> {
     checkpoint(cx)?;
     if input.undo.prepared != 0 {
-        return Err(unsupported("prepared NTFS transactions need an external recovery decision"));
+        return Err(unsupported(
+            "prepared NTFS transactions need an external recovery decision",
+        ));
     }
     for record in input.history {
         checkpoint(cx)?;
         if targets::changes_pages(record.summary.redo_op) && u16_at(&record.data, 14)? == 0 {
-            return Err(unsupported("required NTFS page operation has no replay mapping"));
+            return Err(unsupported(
+                "required NTFS page operation has no replay mapping",
+            ));
         }
     }
     let mut undo_records = Vec::new();
@@ -355,9 +459,14 @@ pub(super) fn stage(
         checkpoint(cx)?;
         let record = read_record(cx, input.restart, input.restart.file_size, lsn, read)?;
         if record.summary.transaction_id != transaction || record.summary.undo_op != opcode {
-            return Err(corrupt(0, "NTFS undo application identity disagrees with Analysis"));
+            return Err(corrupt(
+                0,
+                "NTFS undo application identity disagrees with Analysis",
+            ));
         }
-        retained = retained.checked_add(record.data.len()).filter(|bytes| *bytes <= MAX_BYTES)
+        retained = retained
+            .checked_add(record.data.len())
+            .filter(|bytes| *bytes <= MAX_BYTES)
             .ok_or_else(|| unsupported("FILE undo payloads exceed 16 MiB"))?;
         undo_records.push(record);
     }

@@ -4,8 +4,10 @@
 //! allocator admission. Active log space maps and pool checkpoints require
 //! additional state and are explicitly refused, never silently omitted.
 
-use super::{CheckedBlock, Cx, FfsError, Object, Objects, Result, checkpoint, corrupt, parse, unsupported};
 use super::super::{NvList, Value, VdevConfig, admit_vdev_state, integer};
+use super::{
+    CheckedBlock, Cx, FfsError, Object, Objects, Result, checkpoint, corrupt, parse, unsupported,
+};
 use ffs_ondisk::zfs::LABEL_CONFIG_BYTES;
 use ffs_ondisk::zfs_dmu::space_map::{AllocationMap, Header, Record, Records};
 use ffs_ondisk::zfs_zap::Entry;
@@ -22,8 +24,12 @@ pub struct AllocationLimits {
 
 impl Default for AllocationLimits {
     fn default() -> Self {
-        Self { metaslabs: 65_536, records: 16_777_216, metadata_bytes: 512 * 1024 * 1024,
-            ranges_per_metaslab: 65_536 }
+        Self {
+            metaslabs: 65_536,
+            records: 16_777_216,
+            metadata_bytes: 512 * 1024 * 1024,
+            ranges_per_metaslab: 65_536,
+        }
     }
 }
 
@@ -70,11 +76,16 @@ pub struct PoolAllocation {
     pub vdevs: Vec<VdevAllocation>,
 }
 
-struct Budget { bytes: u64, records: u64 }
+struct Budget {
+    bytes: u64,
+    records: u64,
+}
 
 impl Budget {
     fn charge(&mut self, bytes: u64) -> Result<()> {
-        self.bytes = self.bytes.checked_sub(bytes)
+        self.bytes = self
+            .bytes
+            .checked_sub(bytes)
             .ok_or_else(|| unsupported("allocation inspection exceeds metadata-work budget"))?;
         Ok(())
     }
@@ -84,7 +95,13 @@ impl Budget {
         view.load(cx, number)
     }
 
-    fn block(&mut self, view: &mut Objects, cx: &Cx, object: &Object, id: u64) -> Result<Option<CheckedBlock>> {
+    fn block(
+        &mut self,
+        view: &mut Objects,
+        cx: &Cx,
+        object: &Object,
+        id: u64,
+    ) -> Result<Option<CheckedBlock>> {
         checkpoint(cx)?;
         self.charge(tree_work(&object.node))?;
         view.data_block(cx, object, id)
@@ -95,9 +112,13 @@ impl Budget {
         if id == 0 || object.node.object_type() != kind || object.node.spill().is_some() {
             return Err(corrupt("allocation metadata has the wrong ZAP identity"));
         }
-        let blocks = object.node.max_block().checked_add(1)
+        let blocks = object
+            .node
+            .max_block()
+            .checked_add(1)
             .ok_or_else(|| corrupt("allocation ZAP geometry overflow"))?;
-        let size = blocks.checked_mul(object.node.data_bytes() as u64)
+        let size = blocks
+            .checked_mul(object.node.data_bytes() as u64)
             .ok_or_else(|| corrupt("allocation ZAP byte size overflow"))?;
         if size > 1024 * 1024 {
             return Err(unsupported("allocation metadata ZAP exceeds one MiB"));
@@ -105,8 +126,11 @@ impl Budget {
         // The ZAP reader reloads its dnode and can check copied pointer-table
         // blocks as well as its primary routes. Charge that work before entry.
         self.charge(tree_work(&view.meta))?;
-        self.charge(blocks.checked_mul(2 * tree_work(&object.node))
-            .ok_or_else(|| corrupt("allocation ZAP work overflow"))?)?;
+        self.charge(
+            blocks
+                .checked_mul(2 * tree_work(&object.node))
+                .ok_or_else(|| corrupt("allocation ZAP work overflow"))?,
+        )?;
         view.zap_values(cx, id)
     }
 }
@@ -123,16 +147,25 @@ fn scalar(entry: &Entry) -> Result<u64> {
 }
 
 fn required(rows: &[Entry], name: &[u8]) -> Result<u64> {
-    scalar(rows.iter().find(|row| row.name == name)
-        .ok_or_else(|| corrupt("required allocation metadata entry is absent"))?)
+    scalar(
+        rows.iter()
+            .find(|row| row.name == name)
+            .ok_or_else(|| corrupt("required allocation metadata entry is absent"))?,
+    )
 }
 
 fn sum(left: u64, right: u64) -> Result<u64> {
-    left.checked_add(right).ok_or_else(|| corrupt("pool allocation accounting overflow"))
+    left.checked_add(right)
+        .ok_or_else(|| corrupt("pool allocation accounting overflow"))
 }
 
 struct Top {
-    id: u32, guid: u64, ashift: u8, shift: u8, array: u64, asize: u64,
+    id: u32,
+    guid: u64,
+    ashift: u8,
+    shift: u8,
+    array: u64,
+    asize: u64,
     objects: Vec<u64>,
 }
 
@@ -141,13 +174,18 @@ impl Objects {
     /// it never promotes incomplete results into mount free-space accounting.
     pub fn allocation(&self, cx: &Cx, limits: AllocationLimits) -> Result<PoolAllocation> {
         checkpoint(cx)?;
-        if !(1..=65_536).contains(&limits.metaslabs) || limits.records == 0
-            || limits.metadata_bytes == 0 || !(1..=1_048_576).contains(&limits.ranges_per_metaslab)
+        if !(1..=65_536).contains(&limits.metaslabs)
+            || limits.records == 0
+            || limits.metadata_bytes == 0
+            || !(1..=1_048_576).contains(&limits.ranges_per_metaslab)
         {
             return Err(unsupported("invalid allocation inspection limits"));
         }
         let mut view = self.clone_mos();
-        let mut budget = Budget { bytes: limits.metadata_bytes, records: limits.records };
+        let mut budget = Budget {
+            bytes: limits.metadata_bytes,
+            records: limits.records,
+        };
         let directory = budget.zap(&mut view, cx, 1, 1)?;
         let v2 = if view.config.version == 5000 {
             let id = required(&directory, b"features_for_write")?;
@@ -156,23 +194,42 @@ impl Objects {
             for feature in features {
                 checkpoint(cx)?;
                 let active = scalar(&feature)? != 0;
-                if active && matches!(feature.name.as_slice(), b"com.delphix:log_spacemap" | b"com.delphix:zpool_checkpoint") {
-                    return Err(unsupported("current allocation needs unflushed log-space-map or pool-checkpoint accounting"));
+                if active
+                    && matches!(
+                        feature.name.as_slice(),
+                        b"com.delphix:log_spacemap" | b"com.delphix:zpool_checkpoint"
+                    )
+                {
+                    return Err(unsupported(
+                        "current allocation needs unflushed log-space-map or pool-checkpoint accounting",
+                    ));
                 }
                 v2 |= active && feature.name == b"com.delphix:spacemap_v2";
             }
             v2
-        } else { false };
+        } else {
+            false
+        };
         let config_id = required(&directory, b"config")?;
         let object = budget.load(&mut view, cx, config_id)?;
-        if object.node.object_type() != 3 || object.node.bonus_type() != 4
-            || object.node.bonus().len() != 8 || object.node.spill().is_some()
+        if object.node.object_type() != 3
+            || object.node.bonus_type() != 4
+            || object.node.bonus().len() != 8
+            || object.node.spill().is_some()
         {
-            return Err(corrupt("MOS config is not a packed nvlist with a size bonus"));
+            return Err(corrupt(
+                "MOS config is not a packed nvlist with a size bonus",
+            ));
         }
-        let length = object.node.order().u64(object.node.bonus(), 0).map_err(|error| parse(&error))?;
+        let length = object
+            .node
+            .order()
+            .u64(object.node.bonus(), 0)
+            .map_err(|error| parse(&error))?;
         if !(1..=LABEL_CONFIG_BYTES as u64).contains(&length) {
-            return Err(unsupported("MOS allocation config exceeds the native nvlist reader budget or is empty"));
+            return Err(unsupported(
+                "MOS allocation config exceeds the native nvlist reader budget or is empty",
+            ));
         }
         let mut bytes = Vec::with_capacity(length as usize);
         let block_bytes = object.node.data_bytes() as u64;
@@ -181,7 +238,8 @@ impl Objects {
             return Err(corrupt("MOS config size exceeds its dnode geometry"));
         }
         for id in 0..blocks {
-            let block = budget.block(&mut view, cx, &object, id)?
+            let block = budget
+                .block(&mut view, cx, &object, id)?
                 .ok_or_else(|| corrupt("MOS config contains a sparse block"))?;
             let count = (length - bytes.len() as u64).min(block_bytes) as usize;
             bytes.extend_from_slice(&block.bytes[..count]);
@@ -207,8 +265,10 @@ impl Objects {
                 return Err(corrupt("metaslab-array object is absent or aliased"));
             }
             let array = budget.load(&mut view, cx, top.array)?;
-            if array.node.object_type() != 2 || array.node.bonus_type() != 0
-                || !array.node.bonus().is_empty() || array.node.spill().is_some()
+            if array.node.object_type() != 2
+                || array.node.bonus_type() != 0
+                || !array.node.bonus().is_empty()
+                || array.node.spill().is_some()
             {
                 return Err(corrupt("metaslab array has the wrong native layout"));
             }
@@ -218,37 +278,67 @@ impl Objects {
                 checkpoint(cx)?;
                 let block = if block_id <= array.node.max_block() {
                     budget.block(&mut view, cx, &array, block_id)?
-                } else { None };
+                } else {
+                    None
+                };
                 let remaining = number - top.objects.len() as u64;
                 for slot in 0..remaining.min(per_block) {
                     checkpoint(cx)?;
                     let id = match &block {
-                        Some(block) => block.order.u64(&block.bytes, slot as usize * 8)
+                        Some(block) => block
+                            .order
+                            .u64(&block.bytes, slot as usize * 8)
                             .map_err(|error| parse(&error))?,
                         None => 0,
                     };
                     if id != 0 && (id >= super::MAX_OBJECT || !identities.insert(id)) {
-                        return Err(corrupt("space-map object aliases another metaslab or metadata object"));
+                        return Err(corrupt(
+                            "space-map object aliases another metaslab or metadata object",
+                        ));
                     }
                     top.objects.push(id);
                 }
             }
         }
-        let mut report = PoolAllocation { pool_guid: view.config.pool_guid, txg: view.txg,
-            mapped_bytes: 0, allocated_bytes: 0, free_bytes: 0,
-            records_examined: 0, charged_metadata_bytes: 0, vdevs: Vec::new() };
+        let mut report = PoolAllocation {
+            pool_guid: view.config.pool_guid,
+            txg: view.txg,
+            mapped_bytes: 0,
+            allocated_bytes: 0,
+            free_bytes: 0,
+            records_examined: 0,
+            charged_metadata_bytes: 0,
+            vdevs: Vec::new(),
+        };
         for top in tops {
             let size = 1_u64 << top.shift;
             let mapped_bytes = size * top.objects.len() as u64; // bounded by asize
-            let mut vdev = VdevAllocation { id: top.id, guid: top.guid, ashift: top.ashift,
-                metaslab_shift: top.shift, metaslab_array: top.array, asize: top.asize,
-                mapped_bytes, allocated_bytes: 0, free_bytes: 0,
-                unmapped_tail_bytes: top.asize - mapped_bytes, metaslabs: Vec::new() };
+            let mut vdev = VdevAllocation {
+                id: top.id,
+                guid: top.guid,
+                ashift: top.ashift,
+                metaslab_shift: top.shift,
+                metaslab_array: top.array,
+                asize: top.asize,
+                mapped_bytes,
+                allocated_bytes: 0,
+                free_bytes: 0,
+                unmapped_tail_bytes: top.asize - mapped_bytes,
+                metaslabs: Vec::new(),
+            };
             for (id, object) in top.objects.into_iter().enumerate() {
                 checkpoint(cx)?;
                 let start = id as u64 * size;
-                let (map, stream_bytes) = view.load_allocation_map(cx, object, start, size,
-                    top.ashift, v2, limits.ranges_per_metaslab, &mut budget)?;
+                let (map, stream_bytes) = view.load_allocation_map(
+                    cx,
+                    object,
+                    start,
+                    size,
+                    top.ashift,
+                    v2,
+                    limits.ranges_per_metaslab,
+                    &mut budget,
+                )?;
                 let mut cursor = start;
                 let mut free_ranges = 0;
                 let mut largest = 0;
@@ -267,10 +357,18 @@ impl Objects {
                 let allocated = map.allocated_bytes();
                 vdev.allocated_bytes = sum(vdev.allocated_bytes, allocated)?;
                 vdev.free_bytes = sum(vdev.free_bytes, size - allocated)?;
-                vdev.metaslabs.push(MetaslabAllocation { id: id as u64, object, start, size,
-                    allocated_bytes: allocated, free_bytes: size - allocated,
-                    allocated_ranges: map.range_count(), free_ranges, largest_free_range: largest,
-                    stream_bytes });
+                vdev.metaslabs.push(MetaslabAllocation {
+                    id: id as u64,
+                    object,
+                    start,
+                    size,
+                    allocated_bytes: allocated,
+                    free_bytes: size - allocated,
+                    allocated_ranges: map.range_count(),
+                    free_ranges,
+                    largest_free_range: largest,
+                    stream_bytes,
+                });
             }
             report.mapped_bytes = sum(report.mapped_bytes, vdev.mapped_bytes)?;
             report.allocated_bytes = sum(report.allocated_bytes, vdev.allocated_bytes)?;
@@ -283,44 +381,78 @@ impl Objects {
         Ok(report)
     }
 
-    fn load_allocation_map(&mut self, cx: &Cx, number: u64, start: u64, size: u64,
-        shift: u8, v2: bool, max_ranges: usize, budget: &mut Budget) -> Result<(AllocationMap, u64)> {
-        let mut map = AllocationMap::new(start, size, shift, max_ranges).map_err(|error| parse(&error))?;
-        if number == 0 { return Ok((map, 0)); }
-        let object = budget.load(self, cx, number)?;
-        if object.node.object_type() != 8 || object.node.bonus_type() != 7 || object.node.spill().is_some() {
-            return Err(corrupt("metaslab reference is not a native space-map object"));
+    fn load_allocation_map(
+        &mut self,
+        cx: &Cx,
+        number: u64,
+        start: u64,
+        size: u64,
+        shift: u8,
+        v2: bool,
+        max_ranges: usize,
+        budget: &mut Budget,
+    ) -> Result<(AllocationMap, u64)> {
+        let mut map =
+            AllocationMap::new(start, size, shift, max_ranges).map_err(|error| parse(&error))?;
+        if number == 0 {
+            return Ok((map, 0));
         }
-        let header = Header::parse(object.node.bonus(), object.node.order()).map_err(|error| parse(&error))?;
+        let object = budget.load(self, cx, number)?;
+        if object.node.object_type() != 8
+            || object.node.bonus_type() != 7
+            || object.node.spill().is_some()
+        {
+            return Err(corrupt(
+                "metaslab reference is not a native space-map object",
+            ));
+        }
+        let header = Header::parse(object.node.bonus(), object.node.order())
+            .map_err(|error| parse(&error))?;
         let expected = u64::try_from(header.allocated)
             .map_err(|_| corrupt("metaslab space map has negative allocated bytes"))?;
         if expected > size || !expected.is_multiple_of(1_u64 << shift) {
-            return Err(corrupt("metaslab space-map allocation counter exceeds its region"));
+            return Err(corrupt(
+                "metaslab space-map allocation counter exceeds its region",
+            ));
         }
         let bytes = object.node.data_bytes() as u64;
         let blocks = header.length.div_ceil(bytes);
         if blocks != 0 && blocks - 1 > object.node.max_block() {
-            return Err(corrupt("space-map stream exceeds its native dnode geometry"));
+            return Err(corrupt(
+                "space-map stream exceeds its native dnode geometry",
+            ));
         }
         for id in 0..blocks {
-            let block = budget.block(self, cx, &object, id)?
+            let block = budget
+                .block(self, cx, &object, id)?
                 .ok_or_else(|| corrupt("space-map stream contains a hole"))?;
             let used = (header.length - id * bytes).min(bytes) as usize;
-            for record in Records::new(&block.bytes[..used], block.order, v2).map_err(|error| parse(&error))? {
+            for record in Records::new(&block.bytes[..used], block.order, v2)
+                .map_err(|error| parse(&error))?
+            {
                 checkpoint(cx)?;
-                budget.records = budget.records.checked_sub(1)
+                budget.records = budget
+                    .records
+                    .checked_sub(1)
                     .ok_or_else(|| unsupported("allocation inspection exceeds record budget"))?;
                 if let Record::Extent(entry) = record.map_err(|error| parse(&error))? {
                     if entry.vdev.is_some_and(|id| id != 0) {
-                        return Err(corrupt("metaslab space map contains a log-map vdev identity"));
+                        return Err(corrupt(
+                            "metaslab space map contains a log-map vdev identity",
+                        ));
                     }
-                    let range = entry.byte_range(start, size, shift).map_err(|error| parse(&error))?;
-                    map.apply(entry.kind, range).map_err(|error| parse(&error))?;
+                    let range = entry
+                        .byte_range(start, size, shift)
+                        .map_err(|error| parse(&error))?;
+                    map.apply(entry.kind, range)
+                        .map_err(|error| parse(&error))?;
                 }
             }
         }
         if map.allocated_bytes() != expected {
-            return Err(corrupt("reconstructed allocation disagrees with native space-map counter"));
+            return Err(corrupt(
+                "reconstructed allocation disagrees with native space-map counter",
+            ));
         }
         checkpoint(cx)?;
         Ok((map, header.length))
@@ -328,17 +460,25 @@ impl Objects {
 
     fn allocation_topology(&self, cx: &Cx, config: &NvList) -> Result<Vec<Top>> {
         if config.fields.contains_key("hole_array") {
-            return Err(unsupported("removed top-level vdevs need separate allocation accounting"));
+            return Err(unsupported(
+                "removed top-level vdevs need separate allocation accounting",
+            ));
         }
         if integer(config, "pool_guid")? != self.config.pool_guid
             || integer(config, "version")? != self.config.version
-            || integer(config, "txg")? > self.txg || integer(config, "txg")? < self.config.txg
+            || integer(config, "txg")? > self.txg
+            || integer(config, "txg")? < self.config.txg
         {
-            return Err(corrupt("MOS allocation config disagrees with the selected pool view"));
+            return Err(corrupt(
+                "MOS allocation config disagrees with the selected pool view",
+            ));
         }
-        let root = config.list("vdev_tree").ok_or_else(|| corrupt("MOS config has no vdev tree"))?;
+        let root = config
+            .list("vdev_tree")
+            .ok_or_else(|| corrupt("MOS config has no vdev tree"))?;
         admit_vdev_state(root)?;
-        if root.text("type") != Some("root") || integer(root, "guid")? != self.config.pool_guid
+        if root.text("type") != Some("root")
+            || integer(root, "guid")? != self.config.pool_guid
             || integer(root, "id")? != 0
         {
             return Err(corrupt("MOS allocation config has a foreign root vdev"));
@@ -346,26 +486,49 @@ impl Objects {
         let Some(Value::Lists(children)) = root.fields.get("children") else {
             return Err(corrupt("MOS allocation tree has no top-level children"));
         };
-        let striped = self.config.raidz_members.as_ref().filter(|group| group.parity == 0);
+        let striped = self
+            .config
+            .raidz_members
+            .as_ref()
+            .filter(|group| group.parity == 0);
         let count = striped.map_or(1, |group| group.members.len());
         if children.len() != count {
-            return Err(unsupported("MOS allocation tree differs from the admitted topology"));
+            return Err(unsupported(
+                "MOS allocation tree differs from the admitted topology",
+            ));
         }
         let mut tops = Vec::with_capacity(count);
         for (index, child) in children.iter().enumerate() {
             checkpoint(cx)?;
             admit_vdev_state(child)?;
-            if child.fields.get("nonallocating").is_some_and(|value| !matches!(value, Value::Unsigned(0))) {
-                return Err(unsupported("nonallocating vdev state needs separate accounting"));
+            if child
+                .fields
+                .get("nonallocating")
+                .is_some_and(|value| !matches!(value, Value::Unsigned(0)))
+            {
+                return Err(unsupported(
+                    "nonallocating vdev state needs separate accounting",
+                ));
             }
             let (guid, ashift, asize) = match striped {
-                Some(group) => { let member = &group.members[index]; (member.guid, member.ashift, member.allocated_bytes) }
-                None => (self.config.top_guid, self.config.ashift, self.config.allocated_bytes),
+                Some(group) => {
+                    let member = &group.members[index];
+                    (member.guid, member.ashift, member.allocated_bytes)
+                }
+                None => (
+                    self.config.top_guid,
+                    self.config.ashift,
+                    self.config.allocated_bytes,
+                ),
             };
-            if integer(child, "id")? != index as u64 || integer(child, "guid")? != guid
-                || integer(child, "ashift")? != u64::from(ashift) || integer(child, "asize")? != asize
+            if integer(child, "id")? != index as u64
+                || integer(child, "guid")? != guid
+                || integer(child, "ashift")? != u64::from(ashift)
+                || integer(child, "asize")? != asize
             {
-                return Err(corrupt("MOS metaslab geometry differs from admitted label geometry"));
+                return Err(corrupt(
+                    "MOS metaslab geometry differs from admitted label geometry",
+                ));
             }
             if striped.is_some() || self.pool.leaves().len() == 1 {
                 physical_leaf(child)?;
@@ -385,24 +548,45 @@ impl Objects {
                     }
                 }
                 if let Some(group) = &self.config.raidz_members {
-                    if child.text("type") != Some("raidz") || integer(child, "nparity")? != group.parity as u64
-                        || leaves.iter().zip(&group.members).any(|(leaf, member)| leaf.unsigned("guid") != Some(member.guid))
+                    if child.text("type") != Some("raidz")
+                        || integer(child, "nparity")? != group.parity as u64
+                        || leaves
+                            .iter()
+                            .zip(&group.members)
+                            .any(|(leaf, member)| leaf.unsigned("guid") != Some(member.guid))
                     {
-                        return Err(corrupt("MOS RAIDZ allocation layout disagrees with selected mapping"));
+                        return Err(corrupt(
+                            "MOS RAIDZ allocation layout disagrees with selected mapping",
+                        ));
                     }
                 } else {
-                    if child.text("type") != Some("mirror") { return Err(corrupt("MOS allocation tree is not the selected mirror")); }
-                    let expected: BTreeSet<_> = leaves.iter().filter_map(|leaf| leaf.unsigned("guid")).collect();
+                    if child.text("type") != Some("mirror") {
+                        return Err(corrupt("MOS allocation tree is not the selected mirror"));
+                    }
+                    let expected: BTreeSet<_> = leaves
+                        .iter()
+                        .filter_map(|leaf| leaf.unsigned("guid"))
+                        .collect();
                     self.check_allocation_mirror_members(cx, &expected)?;
                 }
             }
             let shift = u8::try_from(integer(child, "metaslab_shift")?)
                 .map_err(|_| corrupt("metaslab shift overflow"))?;
-            if !(ashift..=63).contains(&shift) || asize == 0 || !asize.is_multiple_of(1_u64 << ashift) {
+            if !(ashift..=63).contains(&shift)
+                || asize == 0
+                || !asize.is_multiple_of(1_u64 << ashift)
+            {
                 return Err(corrupt("invalid metaslab extent geometry"));
             }
-            tops.push(Top { id: index as u32, guid, ashift, shift, asize,
-                array: integer(child, "metaslab_array")?, objects: Vec::new() });
+            tops.push(Top {
+                id: index as u32,
+                guid,
+                ashift,
+                shift,
+                asize,
+                array: integer(child, "metaslab_array")?,
+                objects: Vec::new(),
+            });
         }
         Ok(tops)
     }
@@ -418,27 +602,39 @@ impl Objects {
                     Err(FfsError::Cancelled) => return Err(FfsError::Cancelled),
                     Err(_) => continue,
                 };
-                let candidate: VdevConfig = match label.vdev_config_with_mode(self.config.pool_guid, true, false) {
-                    Ok(candidate) => candidate,
-                    Err(_) => continue,
-                };
+                let candidate: VdevConfig =
+                    match label.vdev_config_with_mode(self.config.pool_guid, true, false) {
+                        Ok(candidate) => candidate,
+                        Err(_) => continue,
+                    };
                 if candidate == self.config {
-                    matched = label.config.unsigned("guid").filter(|guid| expected.contains(guid));
-                    if matched.is_some() { break; }
+                    matched = label
+                        .config
+                        .unsigned("guid")
+                        .filter(|guid| expected.contains(guid));
+                    if matched.is_some() {
+                        break;
+                    }
                 }
             }
             if !matched.is_some_and(|guid| supplied.insert(guid)) {
-                return Err(corrupt("MOS allocation mirror does not match supplied member labels"));
+                return Err(corrupt(
+                    "MOS allocation mirror does not match supplied member labels",
+                ));
             }
         }
-        if &supplied != expected { return Err(corrupt("incomplete allocation mirror identity set")); }
+        if &supplied != expected {
+            return Err(corrupt("incomplete allocation mirror identity set"));
+        }
         Ok(())
     }
 }
 
 fn physical_leaf(tree: &NvList) -> Result<()> {
     if !matches!(tree.text("type"), Some("file" | "disk")) || tree.fields.contains_key("children") {
-        return Err(unsupported("allocation inspection needs the admitted ordinary vdev topology"));
+        return Err(unsupported(
+            "allocation inspection needs the admitted ordinary vdev topology",
+        ));
     }
     admit_vdev_state(tree)
 }

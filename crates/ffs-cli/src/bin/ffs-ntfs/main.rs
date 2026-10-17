@@ -640,8 +640,8 @@ mod tests {
 
     #[test]
     fn protected_read_only_admission_coexists_with_a_retained_reader() {
-        use ffs_repair::sidecar::{SidecarOptions, protect};
         use ffs_repair::sidecar::live::SidecarImageDevice;
+        use ffs_repair::sidecar::{SidecarOptions, protect};
 
         let directory = tempfile::tempdir().unwrap();
         let image = directory.path().join("source.img");
@@ -649,14 +649,25 @@ mod tests {
         let original = vec![0_u8; 4096];
         std::fs::write(&image, &original).unwrap();
         let cx = Cx::for_testing();
-        protect(&cx, &image, &archive, SidecarOptions {
-            block_size: 512, group_blocks: 8, repair_symbols: 4,
-        }).unwrap();
+        protect(
+            &cx,
+            &image,
+            &archive,
+            SidecarOptions {
+                block_size: 512,
+                group_blocks: 8,
+                repair_symbols: 4,
+            },
+        )
+        .unwrap();
         let before = std::fs::read(&archive).unwrap();
         let _reader = SidecarImageDevice::open_read_only(&cx, &image, &archive).unwrap();
         let args = ImageArgs {
-            image: image.clone(), offset: 0, length: Some(1),
-            offline_image: true, sidecar: Some(archive.clone()),
+            image: image.clone(),
+            offset: 0,
+            length: Some(1),
+            offline_image: true,
+            sidecar: Some(archive.clone()),
             recover_logfile: false,
         };
         let error = match args.open(&cx) {
@@ -665,7 +676,11 @@ mod tests {
         };
         // An exclusive writable open fails at sidecar admission. A genuine
         // read-only caller reaches native geometry admission while sharing locks.
-        assert!(error.to_string().contains("opening sidecar-protected NTFS image"));
+        assert!(
+            error
+                .to_string()
+                .contains("opening sidecar-protected NTFS image")
+        );
         assert_eq!(std::fs::read(&image).unwrap(), original);
         assert_eq!(std::fs::read(&archive).unwrap(), before);
         assert!(SidecarImageDevice::open(&cx, &image, &archive).is_err());

@@ -18,7 +18,9 @@ impl Zpl {
             SeekWhence::Data => true,
             SeekWhence::Hole => false,
             _ => {
-                return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EINVAL)));
+                return Err(FfsError::Io(std::io::Error::from_raw_os_error(
+                    libc::EINVAL,
+                )));
             }
         };
         let (object, metadata) = self.file(cx, number)?;

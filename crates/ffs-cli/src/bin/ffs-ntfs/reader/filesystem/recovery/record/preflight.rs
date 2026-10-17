@@ -419,20 +419,35 @@ pub(super) fn validate(
         references.links(restart, &record)?;
     }
     let report = state.finish(cx, restart, stream_length, read)?;
-    let target_report = targets.as_ref().map(|targets| targets.finish(cx)).transpose()?;
-    if let Some(first) = target_report.and_then(|report| report.2).filter(|first| *first < scan_start) {
+    let target_report = targets
+        .as_ref()
+        .map(|targets| targets.finish(cx))
+        .transpose()?;
+    if let Some(first) = target_report
+        .and_then(|report| report.2)
+        .filter(|first| *first < scan_start)
+    {
         // Checkpoint-start bounds Analysis, not Redo. A surviving dirty page
         // can need an earlier record. Release the old payload window before
         // collecting the complete redo interval under the same shared budget.
         drop(history);
         history = scan::collect(cx, restart, stream_length, first, read)?;
     }
-    let redo_plan = targets.as_ref().map(|targets| redo::build(cx, targets, &history)).transpose()?;
+    let redo_plan = targets
+        .as_ref()
+        .map(|targets| redo::build(cx, targets, &history))
+        .transpose()?;
     let redo_summary = redo_plan.as_ref().map(redo::Plan::summary);
     let replay_summary = match (volume, redo_plan.as_ref(), targets.as_ref()) {
         (Some(volume), Some(plan), Some(targets)) => Some(plan.stage(
             cx,
-            redo::ReplayInput { volume, restart, targets, history: &history, undo: &report },
+            redo::ReplayInput {
+                volume,
+                restart,
+                targets,
+                history: &history,
+                undo: &report,
+            },
             read,
         )?),
         _ => None,

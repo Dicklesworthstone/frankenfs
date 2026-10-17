@@ -58,7 +58,8 @@ enum Action {
 }
 
 fn length(capacity: u64, start: u64, requested: Option<u64>) -> Result<u64> {
-    let remaining = capacity.checked_sub(start)
+    let remaining = capacity
+        .checked_sub(start)
         .ok_or_else(|| anyhow::anyhow!("zvol start exceeds native capacity"))?;
     let count = requested.unwrap_or(remaining);
     if count > remaining {
@@ -71,8 +72,16 @@ impl Command {
     pub(super) fn run(self, cx: &Cx) -> Result<()> {
         let (args, action) = match self {
             Self::ZvolInfo { volume } => (volume, Action::Info),
-            Self::ZvolRead { volume, start, bytes } => (volume, Action::Read(start, bytes)),
-            Self::ZvolSeek { volume, start, kind } => (volume, Action::Seek(start, kind)),
+            Self::ZvolRead {
+                volume,
+                start,
+                bytes,
+            } => (volume, Action::Read(start, bytes)),
+            Self::ZvolSeek {
+                volume,
+                start,
+                kind,
+            } => (volume, Action::Seek(start, kind)),
         };
         // Read-triggered sidecar healing is not strict read-only extraction.
         // Refuse before opening any backing image or native pool metadata.
@@ -81,14 +90,19 @@ impl Command {
         }
         let components = dataset_components(&args.dataset)?;
         let mut objects = args.candidate.objects(cx)?;
-        let mut volume = objects.zvol(cx, &components, args.snapshot.as_deref().map(OsStrExt::as_bytes))?;
+        let mut volume = objects.zvol(
+            cx,
+            &components,
+            args.snapshot.as_deref().map(OsStrExt::as_bytes),
+        )?;
         match action {
             Action::Read(start, requested) => {
                 let bytes = length(volume.info().size_bytes, start, requested)?;
                 let mut out = io::stdout().lock();
                 let mut done = 0_u64;
                 while done < bytes {
-                    cx.checkpoint().map_err(|_| ffs_error::FfsError::Cancelled)?;
+                    cx.checkpoint()
+                        .map_err(|_| ffs_error::FfsError::Cancelled)?;
                     let count = (bytes - done).min(1024 * 1024) as usize;
                     let data = volume.read(cx, start + done, count)?;
                     if data.len() != count {
@@ -97,17 +111,21 @@ impl Command {
                     out.write_all(&data)?;
                     done += count as u64;
                 }
-                cx.checkpoint().map_err(|_| ffs_error::FfsError::Cancelled)?;
+                cx.checkpoint()
+                    .map_err(|_| ffs_error::FfsError::Cancelled)?;
                 out.flush()?;
                 Ok(())
             }
             Action::Info | Action::Seek(..) => {
                 let found = match action {
-                    Action::Seek(start, kind) => Some(volume.seek_data_hole(cx, start, matches!(kind, SeekKind::Data))?),
+                    Action::Seek(start, kind) => {
+                        Some(volume.seek_data_hole(cx, start, matches!(kind, SeekKind::Data))?)
+                    }
                     _ => None,
                 };
                 let info = volume.info();
-                cx.checkpoint().map_err(|_| ffs_error::FfsError::Cancelled)?;
+                cx.checkpoint()
+                    .map_err(|_| ffs_error::FfsError::Cancelled)?;
                 json(&serde_json::json!({
                     "format": "ZFS", "kind": "zvol", "read_only": true,
                     "operation": if found.is_some() { "zvol-seek" } else { "zvol-info" },
@@ -129,29 +147,58 @@ impl Command {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{Cli, Command as RootCommand};
     use crate::file_commands::FileCommand;
+    use crate::{Cli, Command as RootCommand};
     use clap::Parser;
 
     #[test]
     fn native_volume_commands_retain_candidate_members_partition_and_snapshot() {
         for verb in ["zvol-info", "zvol-read", "zvol-seek"] {
             let mut args = vec![
-                "ffs-zfs", verb, "first.img", "--offline-image", "--auto-import",
-                "--member", "second.img", "--offset", "1048576", "--length", "67108864",
-                "--dataset", "vm/disk", "--snapshot", "before",
+                "ffs-zfs",
+                verb,
+                "first.img",
+                "--offline-image",
+                "--auto-import",
+                "--member",
+                "second.img",
+                "--offset",
+                "1048576",
+                "--length",
+                "67108864",
+                "--dataset",
+                "vm/disk",
+                "--snapshot",
+                "before",
             ];
-            if verb == "zvol-read" { args.extend(["--start", "510", "--bytes", "600"]); }
-            if verb == "zvol-seek" { args.extend(["--start", "510", "--kind", "hole"]); }
+            if verb == "zvol-read" {
+                args.extend(["--start", "510", "--bytes", "600"]);
+            }
+            if verb == "zvol-seek" {
+                args.extend(["--start", "510", "--kind", "hole"]);
+            }
             let cli = Cli::try_parse_from(args).unwrap();
-            let RootCommand::File(FileCommand::Zvol(command)) = cli.command else { panic!("zvol command"); };
+            let RootCommand::File(FileCommand::Zvol(command)) = cli.command else {
+                panic!("zvol command");
+            };
             let volume = match command {
                 Command::ZvolInfo { volume } => volume,
-                Command::ZvolRead { volume, start, bytes } => {
-                    assert_eq!((start, bytes), (510, Some(600))); volume
+                Command::ZvolRead {
+                    volume,
+                    start,
+                    bytes,
+                } => {
+                    assert_eq!((start, bytes), (510, Some(600)));
+                    volume
                 }
-                Command::ZvolSeek { volume, start, kind } => {
-                    assert_eq!(start, 510); assert!(matches!(kind, SeekKind::Hole)); volume
+                Command::ZvolSeek {
+                    volume,
+                    start,
+                    kind,
+                } => {
+                    assert_eq!(start, 510);
+                    assert!(matches!(kind, SeekKind::Hole));
+                    volume
                 }
             };
             assert_eq!(volume.dataset, "vm/disk");
@@ -159,21 +206,49 @@ mod tests {
             assert!(volume.candidate.auto_import && volume.candidate.image.offline_image);
             assert_eq!(volume.candidate.image.offset, 1048576);
             assert_eq!(volume.candidate.image.length, Some(67108864));
-            assert_eq!(volume.candidate.members, [std::path::PathBuf::from("second.img")]);
+            assert_eq!(
+                volume.candidate.members,
+                [std::path::PathBuf::from("second.img")]
+            );
         }
     }
 
     #[test]
     fn volume_selection_is_explicit_and_mutation_options_are_not_admitted() {
-        let base = ["ffs-zfs", "zvol-info", "image", "--offline-image", "--auto-import", "--dataset", "vm"];
+        let base = [
+            "ffs-zfs",
+            "zvol-info",
+            "image",
+            "--offline-image",
+            "--auto-import",
+            "--dataset",
+            "vm",
+        ];
         for option in ["--rw", "--force", "--replay", "--create-device"] {
             assert!(Cli::try_parse_from(base.into_iter().chain([option])).is_err());
         }
-        assert!(Cli::try_parse_from(["ffs-zfs", "zvol-info", "image", "--offline-image", "--auto-import"]).is_err());
+        assert!(
+            Cli::try_parse_from([
+                "ffs-zfs",
+                "zvol-info",
+                "image",
+                "--offline-image",
+                "--auto-import"
+            ])
+            .is_err()
+        );
         assert!(Cli::try_parse_from(["ffs-zfs", "zvol-info", "image", "--dataset", "vm"]).is_err());
         let cli = Cli::try_parse_from(base.into_iter().chain(["--sidecar", "absent.rq"])).unwrap();
-        let RootCommand::File(FileCommand::Zvol(command)) = cli.command else { panic!("zvol command"); };
-        assert!(command.run(&Cx::for_testing()).unwrap_err().to_string().contains("do not admit sidecar healing"));
+        let RootCommand::File(FileCommand::Zvol(command)) = cli.command else {
+            panic!("zvol command");
+        };
+        assert!(
+            command
+                .run(&Cx::for_testing())
+                .unwrap_err()
+                .to_string()
+                .contains("do not admit sidecar healing")
+        );
     }
 
     #[test]

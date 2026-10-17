@@ -69,15 +69,17 @@ fn boundary(data: &[u8], wanted: usize, allow_end: bool) -> Result<usize, ParseE
                 Err(bad("target does not address an attribute"))
             };
         }
-        let size = usize::try_from(le32(data, at + 4)?)
-            .map_err(|_| bad("attribute size overflow"))?;
+        let size =
+            usize::try_from(le32(data, at + 4)?).map_err(|_| bad("attribute size overflow"))?;
         if size < 24 || !size.is_multiple_of(8) {
             return Err(bad("invalid attribute boundary"));
         }
         if at == wanted {
             return Ok(size);
         }
-        at = at.checked_add(size).ok_or_else(|| bad("attribute offset overflow"))?;
+        at = at
+            .checked_add(size)
+            .ok_or_else(|| bad("attribute offset overflow"))?;
         if at > wanted {
             return Err(bad("target enters an attribute body"));
         }
@@ -97,23 +99,27 @@ fn indexed(raw: &[u8]) -> Result<bool, ParseError> {
 
 fn change_links(data: &mut [u8], add: bool) -> Result<(), ParseError> {
     let old = le16(data, 18)?;
-    let new = if add { old.checked_add(1) } else { old.checked_sub(1) }
-        .ok_or_else(|| bad("FILE_NAME link count overflow or underflow"))?;
+    let new = if add {
+        old.checked_add(1)
+    } else {
+        old.checked_sub(1)
+    }
+    .ok_or_else(|| bad("FILE_NAME link count overflow or underflow"))?;
     data[18..20].copy_from_slice(&new.to_le_bytes());
     Ok(())
 }
 
-fn resize_attribute(
-    data: &mut [u8],
-    at: usize,
-    old: usize,
-    new: usize,
-) -> Result<(), ParseError> {
+fn resize_attribute(data: &mut [u8], at: usize, old: usize, new: usize) -> Result<(), ParseError> {
     let used = usize::try_from(le32(data, 24)?).map_err(|_| bad("used size overflow"))?;
-    let end = at.checked_add(old).filter(|end| *end <= used)
+    let end = at
+        .checked_add(old)
+        .filter(|end| *end <= used)
         .ok_or_else(|| bad("old attribute exceeds used bytes"))?;
-    let new_used = used.checked_sub(old).and_then(|size| size.checked_add(new))
-        .filter(|size| *size <= data.len()).ok_or_else(|| bad("FILE record has no room"))?;
+    let new_used = used
+        .checked_sub(old)
+        .and_then(|size| size.checked_add(new))
+        .filter(|size| *size <= data.len())
+        .ok_or_else(|| bad("FILE record has no room"))?;
     data.copy_within(end..used, at + new);
     if new_used < used {
         data[new_used..used].fill(0);
@@ -129,11 +135,16 @@ fn edit_bytes(data: &mut [u8], edit: &FileEdit<'_>) -> Result<(), ParseError> {
     let at = usize::from(edit.record_offset);
     let relative = usize::from(edit.attribute_offset);
     let payload = edit.data;
-    let insertion = matches!(edit.operation, FileOperation::CreateAttribute | FileOperation::WriteEnd);
+    let insertion = matches!(
+        edit.operation,
+        FileOperation::CreateAttribute | FileOperation::WriteEnd
+    );
     let size = boundary(data, at, insertion)?;
     match edit.operation {
         FileOperation::CreateAttribute => {
-            if relative != 0 || payload.len() < 24 || !payload.len().is_multiple_of(8)
+            if relative != 0
+                || payload.len() < 24
+                || !payload.len().is_multiple_of(8)
                 || u64::from(le32(payload, 4)?) != payload.len() as u64
             {
                 return Err(bad("invalid complete CreateAttribute payload"));
@@ -146,12 +157,15 @@ fn edit_bytes(data: &mut [u8], edit: &FileEdit<'_>) -> Result<(), ParseError> {
             let id = attr.id;
             let next = le16(data, 40)?;
             let new_next = if next <= id {
-                id.checked_add(1).ok_or_else(|| bad("attribute instance space exhausted"))?
+                id.checked_add(1)
+                    .ok_or_else(|| bad("attribute instance space exhausted"))?
             } else {
                 next
             };
             let used = usize::try_from(le32(data, 24)?).map_err(|_| bad("used size overflow"))?;
-            let new_used = used.checked_add(payload.len()).filter(|used| *used <= data.len())
+            let new_used = used
+                .checked_add(payload.len())
+                .filter(|used| *used <= data.len())
                 .ok_or_else(|| bad("created attribute exceeds FILE capacity"))?;
             data.copy_within(at..used, at + payload.len());
             data[at..at + payload.len()].copy_from_slice(payload);
@@ -177,9 +191,11 @@ fn edit_bytes(data: &mut [u8], edit: &FileEdit<'_>) -> Result<(), ParseError> {
             let value_at = usize::from(le16(data, at + 20)?);
             let value_size = usize::try_from(le32(data, at + 16)?)
                 .map_err(|_| bad("resident value length overflow"))?;
-            let value_end = value_at.checked_add(value_size)
+            let value_end = value_at
+                .checked_add(value_size)
                 .ok_or_else(|| bad("resident value range overflow"))?;
-            let end = relative.checked_add(payload.len())
+            let end = relative
+                .checked_add(payload.len())
                 .ok_or_else(|| bad("resident edit length overflow"))?;
             // Never initialize a newly exposed gap from old allocation slack.
             // Header edits and value-to-header overlap need a different opcode.
@@ -187,7 +203,9 @@ fn edit_bytes(data: &mut [u8], edit: &FileEdit<'_>) -> Result<(), ParseError> {
                 return Err(bad("resident update is outside the initialized value"));
             }
             if resize {
-                let new_size = end.checked_add(7).map(|size| size & !7)
+                let new_size = end
+                    .checked_add(7)
+                    .map(|size| size & !7)
                     .ok_or_else(|| bad("resident attribute alignment overflow"))?;
                 resize_attribute(data, at, size, new_size)?;
                 put32(data, at + 16, end - value_at)?;
@@ -199,11 +217,17 @@ fn edit_bytes(data: &mut [u8], edit: &FileEdit<'_>) -> Result<(), ParseError> {
             if relative != 0 || payload.len() < 4 {
                 return Err(bad("invalid WriteEndOfFileRecordSegment payload"));
             }
-            let end = at.checked_add(payload.len()).filter(|end| *end <= data.len())
+            let end = at
+                .checked_add(payload.len())
+                .filter(|end| *end <= data.len())
                 .ok_or_else(|| bad("FILE tail replacement exceeds capacity"))?;
-            let new_used = end.checked_add(7).map(|size| size & !7)
-                .filter(|size| *size <= data.len()).ok_or_else(|| bad("FILE tail alignment overflow"))?;
-            let old_used = usize::try_from(le32(data, 24)?).map_err(|_| bad("used size overflow"))?;
+            let new_used = end
+                .checked_add(7)
+                .map(|size| size & !7)
+                .filter(|size| *size <= data.len())
+                .ok_or_else(|| bad("FILE tail alignment overflow"))?;
+            let old_used =
+                usize::try_from(le32(data, 24)?).map_err(|_| bad("used size overflow"))?;
             data[at..end].copy_from_slice(payload);
             data[end..new_used.max(old_used)].fill(0);
             put32(data, 24, new_used)?;
@@ -212,7 +236,9 @@ fn edit_bytes(data: &mut [u8], edit: &FileEdit<'_>) -> Result<(), ParseError> {
             directory::edit_root(data, at, size, edit, operation)?;
         }
         FileOperation::SetSizes => {
-            if relative != 0 || !matches!(payload.len(), 24 | 32) || data[at + 8] != 1
+            if relative != 0
+                || !matches!(payload.len(), 24 | 32)
+                || data[at + 8] != 1
                 || le64(data, at + 16)? != 0
             {
                 return Err(bad("invalid SetNewAttributeSizes target or payload"));
@@ -226,7 +252,9 @@ fn edit_bytes(data: &mut [u8], edit: &FileEdit<'_>) -> Result<(), ParseError> {
             }
             if payload.len() == 32 {
                 if attr.flags & (super::SPARSE | super::COMPRESSED) == 0 || size < 72 {
-                    return Err(bad("physical-size update needs an extended nonresident header"));
+                    return Err(bad(
+                        "physical-size update needs an extended nonresident header",
+                    ));
                 }
                 data[at + 64..at + 72].copy_from_slice(&payload[24..32]);
             }
@@ -270,7 +298,9 @@ pub fn apply_file_edit(
 ) -> Result<FileEditResult, ParseError> {
     let record = NtfsFileRecord::parse(raw)?;
     if record.number != expected_record || !record.in_use() {
-        return Err(bad("recovery target is a different or unallocated FILE record"));
+        return Err(bad(
+            "recovery target is a different or unallocated FILE record",
+        ));
     }
     if let RecoveryPass::Redo(lsn) = pass {
         if lsn == 0 {

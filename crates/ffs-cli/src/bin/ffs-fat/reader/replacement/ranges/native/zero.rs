@@ -3,8 +3,8 @@
 //! FAT has no unwritten extents: zeros are actually initialized and verified.
 //! KEEP_SIZE reserves capacity without exposing bytes beyond logical EOF.
 
-use super::{FileSource, Update, apply_update, modified_timestamp, validate_edit_state};
 use super::super::super::super::{FatVolume, checkpoint};
+use super::{FileSource, Update, apply_update, modified_timestamp, validate_edit_state};
 use anyhow::Result;
 use asupersync::Cx;
 use ffs_block::ByteDevice;
@@ -32,14 +32,20 @@ impl ByteDevice for ZeroSource<'_> {
         bytes: &mut [u8],
     ) -> ffs_error::Result<()> {
         checkpoint(cx)?;
-        let end = offset.0.checked_add(bytes.len() as u64)
+        let end = offset
+            .0
+            .checked_add(bytes.len() as u64)
             .filter(|end| *end <= self.size)
             .ok_or_else(|| FfsError::Format("FAT zero source read exceeds its length".into()))?;
         bytes.fill(0);
         let old_end = end.min(self.original.len_bytes());
         let prefix_end = old_end.min(self.zeroed.start);
         if offset.0 < prefix_end {
-            self.original.read_exact_at(cx, offset, &mut bytes[..(prefix_end - offset.0) as usize])?;
+            self.original.read_exact_at(
+                cx,
+                offset,
+                &mut bytes[..(prefix_end - offset.0) as usize],
+            )?;
         }
         let suffix_start = offset.0.max(self.zeroed.end);
         if suffix_start < old_end {
@@ -77,24 +83,44 @@ pub(super) fn apply(
     if length == 0 {
         return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EINVAL)).into());
     }
-    let end = offset.checked_add(length)
+    let end = offset
+        .checked_add(length)
         .filter(|end| *end <= u64::from(u32::MAX))
         .ok_or_else(|| FfsError::Io(std::io::Error::from_raw_os_error(libc::EFBIG)))?;
     let modified = Some(modified_timestamp(now)?);
     validate_edit_state(cx, volume)?;
     let entry = volume.resolve(cx, path)?.ok_or(FfsError::IsDirectory)?;
-    let original = FileSource { volume, chain: volume.file_chain(cx, &entry)? };
+    let original = FileSource {
+        volume,
+        chain: volume.file_chain(cx, &entry)?,
+    };
     let old_size = u64::from(original.chain.size);
-    let size = if mode & libc::FALLOC_FL_KEEP_SIZE != 0 { old_size } else { old_size.max(end) };
-    let source = ZeroSource { original: &original, size, zeroed: offset.min(size)..end.min(size) };
+    let size = if mode & libc::FALLOC_FL_KEEP_SIZE != 0 {
+        old_size
+    } else {
+        old_size.max(end)
+    };
+    let source = ZeroSource {
+        original: &original,
+        size,
+        zeroed: offset.min(size)..end.min(size),
+    };
     // When extending beyond EOF, the gap preceding the requested interval is
     // also initialized. A KEEP_SIZE interval past EOF changes capacity only.
     let changed = offset.min(old_size)..end.min(size);
-    apply_update(cx, volume, path, &entry, &original.chain, &source, Update {
-        capacity: u32::try_from(end.max(size))?,
-        modified,
-        changed,
-    })
+    apply_update(
+        cx,
+        volume,
+        path,
+        &entry,
+        &original.chain,
+        &source,
+        Update {
+            capacity: u32::try_from(end.max(size))?,
+            modified,
+            changed,
+        },
+    )
 }
 
 companion_bin_tests! {
