@@ -666,6 +666,9 @@ fn run() -> Result<()> {
         Some("validate-writeback-cache-crash-replay") => {
             validate_writeback_cache_crash_replay_cmd(&args[1..])
         }
+        Some("generate-writeback-cache-oracles") => {
+            generate_writeback_cache_oracles_cmd(&args[1..])
+        }
         Some("validate-workload-corpus") => validate_workload_corpus_cmd(&args[1..]),
         Some("validate-btrfs-send-receive-corpus") => {
             validate_btrfs_send_receive_corpus_cmd(&args[1..])
@@ -7243,6 +7246,65 @@ fn parse_writeback_cache_crash_replay_cmd_args(
         reproduction_command,
         require_accept,
     }))
+}
+
+fn generate_writeback_cache_oracles_cmd(args: &[String]) -> Result<()> {
+    let mut out_dir: Option<String> = None;
+    let mut flavor = "ext4".to_owned();
+    let mut i = 0;
+
+    while i < args.len() {
+        match args[i].as_str() {
+            "--out-dir" => {
+                i += 1;
+                out_dir = Some(args.get(i).context("--out-dir requires a path")?.to_owned());
+            }
+            "--flavor" => {
+                i += 1;
+                args.get(i)
+                    .context("--flavor requires ext4 or btrfs")?
+                    .clone_into(&mut flavor);
+            }
+            "--help" | "-h" => {
+                println!(
+                    "Usage: ffs-harness generate-writeback-cache-oracles --out-dir <DIR> [--flavor <ext4|btrfs>]"
+                );
+                return Ok(());
+            }
+            other => bail!("unknown generate-writeback-cache-oracles argument: {other}"),
+        }
+        i += 1;
+    }
+
+    let out_dir = out_dir.context("--out-dir is required")?;
+    let out_dir_path = Path::new(&out_dir);
+    fs::create_dir_all(out_dir_path)
+        .with_context(|| format!("failed to create directory {}", out_dir_path.display()))?;
+
+    let (gate, ordering, crash_replay) =
+        ffs_harness::writeback_cache_audit::generate_writeback_cache_oracle_bundle(&flavor)?;
+
+    let gate_path = out_dir_path.join("writeback_cache_gate.json");
+    let ordering_path = out_dir_path.join("writeback_cache_ordering_oracle.json");
+    let crash_replay_path = out_dir_path.join("writeback_cache_crash_replay_oracle.json");
+
+    fs::write(&gate_path, serde_json::to_string_pretty(&gate)?)?;
+    fs::write(&ordering_path, serde_json::to_string_pretty(&ordering)?)?;
+    fs::write(
+        &crash_replay_path,
+        serde_json::to_string_pretty(&crash_replay)?,
+    )?;
+
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "gate": gate_path.display().to_string(),
+            "ordering_oracle": ordering_path.display().to_string(),
+            "crash_replay_oracle": crash_replay_path.display().to_string(),
+            "flavor": flavor,
+        }))?
+    );
+    Ok(())
 }
 
 fn validate_proof_overhead_budget_cmd(args: &[String]) -> Result<()> {

@@ -1023,6 +1023,30 @@ fn capability_shortcircuit_from_env() -> bool {
     )
 }
 
+/// Pure parser for `FFS_FUSE_AUTO_XATTR_FAST_PATH` (`bd-xvhsz`).
+///
+/// Defaults to `true` (shipping fast-path enabled automatically when the
+/// underlying filesystem proves [`ffs_core::vfs::XattrPresence::ProvenAbsent`]);
+/// disabled by `"0"`, `"false"`, or `"off"`.
+fn auto_xattr_fast_path_from_value(value: Option<&str>) -> bool {
+    !value.is_some_and(|raw| {
+        let trimmed = raw.trim();
+        trimmed == "0"
+            || trimmed.eq_ignore_ascii_case("false")
+            || trimmed.eq_ignore_ascii_case("off")
+    })
+}
+
+/// Whether the automatic per-mount xattr-empty fast-path is enabled (`bd-xvhsz`).
+#[must_use]
+pub fn auto_xattr_fast_path_enabled() -> bool {
+    auto_xattr_fast_path_from_value(
+        std::env::var("FFS_FUSE_AUTO_XATTR_FAST_PATH")
+            .ok()
+            .as_deref(),
+    )
+}
+
 /// Whether the short-circuit is authorised for this mount.
 ///
 /// THREE conditions, and the read-only one is load-bearing rather than
@@ -4337,6 +4361,11 @@ struct FuseInner {
     /// the parent directory has a default ACL, which replaces the umask.
     dont_mask: std::sync::atomic::AtomicBool,
     missing_capability_xattr: LastMissingCapabilityXattr,
+    /// bd-xvhsz: per-mount automatic xattr-empty fast-path. Armed at mount
+    /// construction when the filesystem proves [`ffs_core::vfs::XattrPresence::ProvenAbsent`]
+    /// (which also proves no directory carries `system.posix_acl_default`, so file creation
+    /// cannot synthesize an xattr), and disarmed unconditionally before the first `setxattr`.
+    xattr_empty_fast_path: std::sync::atomic::AtomicBool,
     inode_locks: Arc<FuseInodeLocks>,
     /// bd-2i2ez: stage a run of WRITEs into one MVCC transaction. Default OFF.
     writeback: WritebackBatch,
@@ -5762,7 +5791,12 @@ impl FrankenFuse {
         // inode probed exactly once, so a bigger table still misses every time.
         // A whole-filesystem absence proof is the only thing that can answer a
         // probe the mount has never seen.
-        if is_capability_probe && XATTR_PROVEN_ABSENT.load(std::sync::atomic::Ordering::Relaxed) {
+        if (is_capability_probe && XATTR_PROVEN_ABSENT.load(std::sync::atomic::Ordering::Relaxed))
+            || self
+                .inner
+                .xattr_empty_fast_path
+                .load(std::sync::atomic::Ordering::Acquire)
+        {
             if self.inner.count_memoized_requests {
                 self.inner.metrics.record_memoized();
             }
@@ -6757,6 +6791,18 @@ impl Filesystem for FrankenFuse {
             return;
         }
         let ino = InodeNumber(ino);
+        if self
+            .inner
+            .xattr_empty_fast_path
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            if self.inner.count_memoized_requests {
+                self.inner.metrics.record_memoized();
+            }
+            trace!(ino = ino.0, "listxattr answered from xattr-empty fast-path");
+            Self::reply_xattr_payload(size, &[], reply);
+            return;
+        }
         if self.inner.read_only
             && let Some(payload) = self.inner.readonly_xattr_cache.list_payload(ino)
         {
@@ -7977,6 +8023,9 @@ impl FrankenFuse {
         // that fails partway is not a promise the xattr is still absent. Losing a
         // memo entry costs one format lookup; keeping a stale one reports a
         // capability that exists as missing.
+        self.inner
+            .xattr_empty_fast_path
+            .store(false, std::sync::atomic::Ordering::Release);
         self.inner.missing_capability_xattr.forget(InodeNumber(ino));
         self.inner.readdirplus_attr_memo.forget(InodeNumber(ino));
         match self.dispatch_setxattr(&cx, ino, name, value, flags, position) {
@@ -8992,6 +9041,7 @@ mod tests {
                 true,
             ),
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
+            xattr_empty_fast_path: std::sync::atomic::AtomicBool::new(false),
             inode_locks: Arc::new(FuseInodeLocks::default()),
             writeback: WritebackBatch::from_env(),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
@@ -9037,6 +9087,7 @@ mod tests {
             readonly_xattr_cache: ReadonlyXattrCache::default(),
             readdirplus_attr_memo: ReaddirplusAttrMemo::with_slots(4, true),
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
+            xattr_empty_fast_path: std::sync::atomic::AtomicBool::new(false),
             inode_locks: Arc::new(FuseInodeLocks::default()),
             writeback: WritebackBatch::from_env(),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
@@ -10240,6 +10291,7 @@ mod tests {
             readonly_xattr_cache: ReadonlyXattrCache::default(),
             readdirplus_attr_memo: ReaddirplusAttrMemo::from_env(),
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
+            xattr_empty_fast_path: std::sync::atomic::AtomicBool::new(false),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
             dir_handles: DirHandles::default(),
             dont_mask: std::sync::atomic::AtomicBool::new(false),
@@ -22843,6 +22895,7 @@ mod tests {
                 false,
             ),
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
+            xattr_empty_fast_path: std::sync::atomic::AtomicBool::new(false),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
             dir_handles: DirHandles::default(),
             dont_mask: std::sync::atomic::AtomicBool::new(false),
@@ -24957,6 +25010,7 @@ AllowOther"#;
                 false,
             ),
             missing_capability_xattr: LastMissingCapabilityXattr::default(),
+            xattr_empty_fast_path: std::sync::atomic::AtomicBool::new(false),
             zero_message_opendir: std::sync::atomic::AtomicBool::new(false),
             dir_handles: DirHandles::default(),
             dont_mask: std::sync::atomic::AtomicBool::new(false),
@@ -26082,4 +26136,171 @@ AllowOther"#;
     // a wrapper around load-shedding unit tests made the gate report PASS
     // without mounting anything. With no match, `ffs-harness gates` reports
     // gate5 as not_implemented until a real mounted gate lands.
+
+    #[test]
+    fn auto_xattr_fast_path_knob_defaults_on_and_respects_opt_out_bd_xvhsz() {
+        assert!(auto_xattr_fast_path_from_value(None));
+        assert!(auto_xattr_fast_path_from_value(Some("")));
+        assert!(auto_xattr_fast_path_from_value(Some("1")));
+        assert!(auto_xattr_fast_path_from_value(Some("true")));
+        assert!(!auto_xattr_fast_path_from_value(Some("0")));
+        assert!(!auto_xattr_fast_path_from_value(Some("false")));
+        assert!(!auto_xattr_fast_path_from_value(Some("FALSE")));
+        assert!(!auto_xattr_fast_path_from_value(Some("off")));
+        assert!(!auto_xattr_fast_path_from_value(Some(" Off ")));
+    }
+
+    #[test]
+    fn xattr_empty_fast_path_arms_automatically_and_disarms_on_setxattr_bd_xvhsz() {
+        struct ProvenAbsentTestFs {
+            getxattr_calls: Arc<AtomicU64>,
+        }
+
+        impl FsOps for ProvenAbsentTestFs {
+            fn xattr_presence(&self, _cx: &Cx) -> ffs_core::vfs::XattrPresence {
+                ffs_core::vfs::XattrPresence::ProvenAbsent
+            }
+
+            fn getattr(
+                &self,
+                _cx: &Cx,
+                _scope: &mut RequestScope,
+                ino: InodeNumber,
+            ) -> ffs_error::Result<InodeAttr> {
+                let mut attr = make_test_attr(FfsFileType::RegularFile, 64);
+                attr.ino = ino;
+                Ok(attr)
+            }
+
+            fn lookup(
+                &self,
+                _cx: &Cx,
+                _scope: &mut RequestScope,
+                _parent: InodeNumber,
+                _name: &OsStr,
+            ) -> ffs_error::Result<InodeAttr> {
+                Err(FfsError::NotFound("not found".into()))
+            }
+
+            fn readdir(
+                &self,
+                _cx: &Cx,
+                _scope: &mut RequestScope,
+                _ino: InodeNumber,
+                _offset: u64,
+            ) -> ffs_error::Result<ffs_core::ReaddirPage> {
+                Ok(ffs_core::ReaddirPage::new(Vec::new()))
+            }
+
+            fn read(
+                &self,
+                _cx: &Cx,
+                _scope: &mut RequestScope,
+                _ino: InodeNumber,
+                _offset: u64,
+                _size: u32,
+            ) -> ffs_error::Result<Vec<u8>> {
+                Ok(Vec::new())
+            }
+
+            fn readlink(
+                &self,
+                _cx: &Cx,
+                _scope: &mut RequestScope,
+                _ino: InodeNumber,
+            ) -> ffs_error::Result<Vec<u8>> {
+                Err(FfsError::NotFound("not found".into()))
+            }
+
+            fn statfs(
+                &self,
+                _cx: &Cx,
+                _scope: &mut RequestScope,
+                _ino: InodeNumber,
+            ) -> ffs_error::Result<FsStat> {
+                Ok(FsStat {
+                    blocks: 1000,
+                    blocks_free: 500,
+                    blocks_available: 500,
+                    files: 100,
+                    files_free: 50,
+                    block_size: 4096,
+                    name_max: 255,
+                    fragment_size: 4096,
+                })
+            }
+
+            fn getxattr(
+                &self,
+                _cx: &Cx,
+                _ino: InodeNumber,
+                _name: &str,
+            ) -> ffs_error::Result<Option<Vec<u8>>> {
+                self.getxattr_calls.fetch_add(1, Ordering::Relaxed);
+                Ok(Some(b"unexpected-format-read".to_vec()))
+            }
+
+            fn setxattr(
+                &self,
+                _cx: &Cx,
+                _scope: &mut RequestScope,
+                _ino: InodeNumber,
+                _name: &str,
+                _value: &[u8],
+                _mode: XattrSetMode,
+            ) -> ffs_error::Result<()> {
+                Ok(())
+            }
+        }
+
+        let getxattr_calls = Arc::new(AtomicU64::new(0));
+        let rw_options = MountOptions {
+            read_only: false,
+            ..MountOptions::default()
+        };
+        let fs = FrankenFuse::with_options(
+            Box::new(ProvenAbsentTestFs {
+                getxattr_calls: Arc::clone(&getxattr_calls),
+            }),
+            &rw_options,
+        );
+
+        assert!(
+            fs.is_xattr_empty_fast_path_active(),
+            "ProvenAbsent filesystem must arm xattr_empty_fast_path automatically"
+        );
+        assert_eq!(
+            fs.getxattr_value(InodeNumber(99), SECURITY_CAPABILITY_XATTR)
+                .expect("getxattr_value"),
+            None,
+            "xattr_empty_fast_path must answer None without calling ops.getxattr"
+        );
+        assert_eq!(
+            getxattr_calls.load(Ordering::Relaxed),
+            0,
+            "ops.getxattr must not be called while xattr_empty_fast_path is active"
+        );
+
+        let sender = RecordingSender::default();
+        fs.setxattr_impl(
+            99,
+            OsStr::new("user.test"),
+            b"val",
+            0,
+            0,
+            false,
+            <ReplyEmpty as fuser::Reply>::new(0x44, sender.clone()),
+        );
+        assert_eq!(sender.errno(), None);
+        assert!(
+            !fs.is_xattr_empty_fast_path_active(),
+            "setxattr must disarm xattr_empty_fast_path on a writable mount"
+        );
+        assert_eq!(
+            fs.getxattr_value(InodeNumber(99), "user.test")
+                .expect("getxattr_value after setxattr"),
+            Some(b"unexpected-format-read".to_vec())
+        );
+        assert_eq!(getxattr_calls.load(Ordering::Relaxed), 1);
+    }
 }

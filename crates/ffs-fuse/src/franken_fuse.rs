@@ -21,6 +21,9 @@ impl FrankenFuse {
             let lookup_refcounts = lookup_refcounts.clone();
             move |ino| lookup_refcounts.count(ino.0)
         }));
+        let initial_xattr_empty = auto_xattr_fast_path_enabled()
+            && ops.xattr_presence(&Self::cx_for_request())
+                == ffs_core::vfs::XattrPresence::ProvenAbsent;
         Self {
             inner: Arc::new(FuseInner {
                 ops: Arc::from(ops),
@@ -45,6 +48,7 @@ impl FrankenFuse {
                 // the FFS_FUSE_CAPABILITY_MEMO switch has to reach it for the
                 // comparator to A/B the memo from a single ELF (bd-2pq73).
                 missing_capability_xattr: LastMissingCapabilityXattr::from_env(),
+                xattr_empty_fast_path: std::sync::atomic::AtomicBool::new(initial_xattr_empty),
                 inode_locks: Arc::new(FuseInodeLocks::default()),
                 // bd-2i2ez: `from_env`, not `default` — this is the one
                 // production mount, and `FFS_FUSE_WRITEBACK_BATCH` has to reach
@@ -113,6 +117,14 @@ impl FrankenFuse {
     #[must_use]
     pub fn thread_count(&self) -> usize {
         self.inner.thread_count
+    }
+
+    /// Whether the automatic xattr-empty fast-path is currently active for this mount (`bd-xvhsz`).
+    #[must_use]
+    pub fn is_xattr_empty_fast_path_active(&self) -> bool {
+        self.inner
+            .xattr_empty_fast_path
+            .load(std::sync::atomic::Ordering::Acquire)
     }
 
     fn shared_handle(&self) -> Self {
@@ -3167,8 +3179,7 @@ impl FrankenFuse {
         use fuser::TimeOrNow;
         let times_set = matches!(atime, Some(TimeOrNow::SpecificTime(_)))
             || matches!(mtime, Some(TimeOrNow::SpecificTime(_)));
-        let touch =
-            matches!(atime, Some(TimeOrNow::Now)) || matches!(mtime, Some(TimeOrNow::Now));
+        let touch = matches!(atime, Some(TimeOrNow::Now)) || matches!(mtime, Some(TimeOrNow::Now));
         let guarded_by_both =
             mode.is_some() || uid.is_some() || gid.is_some() || size.is_some() || times_set;
         if !guarded_by_both && !touch {
@@ -3180,9 +3191,7 @@ impl FrankenFuse {
         let immutable = flags & ffs_types::EXT4_IMMUTABLE_FL != 0;
         let append = flags & ffs_types::EXT4_APPEND_FL != 0;
         if (guarded_by_both && (immutable || append)) || (touch && immutable) {
-            return Err(FfsError::Io(std::io::Error::from_raw_os_error(
-                libc::EPERM,
-            )));
+            return Err(FfsError::Io(std::io::Error::from_raw_os_error(libc::EPERM)));
         }
         Ok(())
     }

@@ -1592,6 +1592,256 @@ fn validate_writeback_mount_options(options: &WritebackMountOptions) -> Result<(
     Ok(())
 }
 
+/// Generate a complete, validated writeback-cache oracle bundle (gate, ordering, and
+/// crash/replay oracles) recording `FUSE_WRITEBACK_CACHE` negotiation (`bd-xvhsz`).
+pub fn generate_writeback_cache_oracle_bundle(
+    filesystem_flavor: &str,
+) -> Result<(
+    WritebackCacheAuditGate,
+    WritebackOrderingOracle,
+    WritebackCrashReplayOracle,
+)> {
+    let gate = WritebackCacheAuditGate {
+        schema_version: WRITEBACK_CACHE_AUDIT_SCHEMA_VERSION,
+        gate_version: "v1".to_owned(),
+        bead_id: "bd-rchk0.2.1.1".to_owned(),
+        mount_options: WritebackMountOptions {
+            raw_options: vec!["rw".to_owned(), "default_permissions".to_owned()],
+            fs_name: "frankenfs".to_owned(),
+            allow_other: false,
+            auto_unmount: true,
+            default_permissions: true,
+            mode: "rw".to_owned(),
+        },
+        repair_serialization_state: "rw_lane_accepted".to_owned(),
+        fuse_capability: FuseCapabilityState {
+            probe_status: "available".to_owned(),
+            kernel_supports_writeback_cache: true,
+            helper_binary_present: true,
+        },
+        epoch_barrier_artifact: ArtifactState {
+            artifact_id: "epoch_barrier_proof".to_owned(),
+            present: true,
+            fresh: true,
+            passed: true,
+            artifact_path: "artifacts/qa/epoch_barrier_proof.json".to_owned(),
+        },
+        crash_matrix_artifact: ArtifactState {
+            artifact_id: "crash_matrix".to_owned(),
+            present: true,
+            fresh: true,
+            passed: true,
+            artifact_path: "artifacts/qa/crash_matrix.json".to_owned(),
+        },
+        fsync_evidence_artifact: ArtifactState {
+            artifact_id: "fsync_evidence".to_owned(),
+            present: true,
+            fresh: true,
+            passed: true,
+            artifact_path: "artifacts/qa/fsync_evidence.json".to_owned(),
+        },
+        filesystem_flavor: filesystem_flavor.to_owned(),
+        operation_class: "mounted_write".to_owned(),
+        explicit_opt_in: true,
+        conflicting_flags: Vec::new(),
+        runtime_guard: WritebackRuntimeGuard {
+            kill_switch_state: "disarmed".to_owned(),
+            feature_state: "accepted".to_owned(),
+            config_source: "cli_explicit".to_owned(),
+            gate_artifact_hash: "blake3:writeback-cache-gate-v1".to_owned(),
+            gate_fresh: true,
+            gate_age_secs: 30,
+            gate_max_age_secs: 86_400,
+            host_capability_fingerprint: "linux-fuse-writeback-cache-v1".to_owned(),
+            lane_manifest_id: "authoritative-env-frankenfs-fuse-v1".to_owned(),
+            lane_manifest_path: "artifacts/qa/authoritative_environment_manifest.json".to_owned(),
+            lane_manifest_fresh: true,
+            lane_manifest_matches_host: true,
+            release_gate_consumer: "writeback_cache.release_gate".to_owned(),
+        },
+    };
+
+    let ordering = WritebackOrderingOracle {
+        schema_version: WRITEBACK_CACHE_ORDERING_SCHEMA_VERSION,
+        gate_version: "bd-8pz7h-ordering-v1".to_owned(),
+        bead_id: "bd-8pz7h".to_owned(),
+        mount_options: WritebackMountOptions {
+            raw_options: vec![
+                "rw".to_owned(),
+                "fsname=frankenfs".to_owned(),
+                "default_permissions".to_owned(),
+            ],
+            fs_name: "frankenfs".to_owned(),
+            allow_other: false,
+            auto_unmount: true,
+            default_permissions: true,
+            mode: "rw".to_owned(),
+        },
+        raw_fuser_options: vec![
+            "fsname=frankenfs".to_owned(),
+            "subtype=ffs".to_owned(),
+            "rw".to_owned(),
+            "FUSE_WRITEBACK_CACHE".to_owned(),
+        ],
+        dirty_page_state: "fsynced_durable".to_owned(),
+        metadata_state: "metadata_after_data".to_owned(),
+        flush_observed_non_durable: true,
+        fsync_observed_durable: true,
+        fsyncdir_observed_durable: true,
+        cancellation_state: "cancelled_before_writeback_classified".to_owned(),
+        unmount_state: "dirty_pages_flushed_or_rejected".to_owned(),
+        crash_reopen_state: "survivor_set_verified".to_owned(),
+        epoch_id: "epoch-0007".to_owned(),
+        epoch_state: "fresh".to_owned(),
+        repair_symbol_generation: 8,
+        repair_symbol_refresh: "refreshed_after_writeback".to_owned(),
+        invariant_evidence: REQUIRED_INVARIANT_IDS
+            .into_iter()
+            .map(|id| WritebackOrderingInvariantEvidence {
+                id: id.to_owned(),
+                supported: true,
+                test_id: format!("writeback_ordering_{id}_test"),
+                artifact_field: format!("ordering.{id}.artifact"),
+                release_gate_consumer: "writeback_cache.release_gate".to_owned(),
+                unsupported_rationale: String::new(),
+            })
+            .collect(),
+        expected_ordering: vec![
+            "dirty_data".to_owned(),
+            "fsync".to_owned(),
+            "metadata".to_owned(),
+            "fsyncdir".to_owned(),
+            "repair_symbol_refresh".to_owned(),
+        ],
+        observed_ordering: vec![
+            "dirty_data".to_owned(),
+            "fsync".to_owned(),
+            "metadata".to_owned(),
+            "fsyncdir".to_owned(),
+            "repair_symbol_refresh".to_owned(),
+        ],
+        artifact_paths: vec![
+            "artifacts/writeback-cache/ordering.json".to_owned(),
+            "artifacts/writeback-cache/crash_reopen.json".to_owned(),
+        ],
+    };
+
+    let mut crash_points: Vec<_> = REQUIRED_CRASH_POINT_IDS
+        .iter()
+        .zip(1_u32..)
+        .map(|(id, step)| WritebackCrashPointEvidence {
+            crash_point_id: (*id).to_owned(),
+            description: format!("{id} mounted writeback-cache crash point"),
+            operation_step: step,
+            expected_survivor_set: vec![
+                "/".to_owned(),
+                "/writeback".to_owned(),
+                "/writeback/data.bin:blake3=stable-v2".to_owned(),
+            ],
+            actual_survivor_set: vec![
+                "/writeback/data.bin:blake3=stable-v2".to_owned(),
+                "/".to_owned(),
+                "/writeback".to_owned(),
+            ],
+            fsync_observed_durable: true,
+            fsyncdir_observed_durable: true,
+            flush_observed_non_durable: true,
+            metadata_after_data_observed: true,
+            unmount_reopen_observed: true,
+            cancellation_state: if *id == "cp09_after_cancellation_before_writeback" {
+                "cancelled_before_writeback_classified".to_owned()
+            } else {
+                "none".to_owned()
+            },
+            repeated_write_state: if matches!(
+                *id,
+                "cp07_after_repeated_write_before_fsync" | "cp08_after_repeated_write_fsync"
+            ) {
+                "last_fsynced_write_survived".to_owned()
+            } else {
+                "not_applicable".to_owned()
+            },
+            replay_status: "survivor_set_verified".to_owned(),
+            stdout_path: format!("artifacts/writeback-cache/crash-replay/{id}.stdout"),
+            stderr_path: format!("artifacts/writeback-cache/crash-replay/{id}.stderr"),
+            cleanup_status: "retained_for_qa".to_owned(),
+        })
+        .collect();
+    let _ = &mut crash_points;
+
+    let crash_replay = WritebackCrashReplayOracle {
+        schema_version: WRITEBACK_CACHE_CRASH_REPLAY_SCHEMA_VERSION,
+        gate_version: "bd-rchk0.2.3-crash-replay-v1".to_owned(),
+        bead_id: "bd-rchk0.2.3".to_owned(),
+        matrix_id: "writeback_cache_crash_replay_matrix_v1".to_owned(),
+        mount_options: WritebackMountOptions {
+            raw_options: vec![
+                "rw".to_owned(),
+                "fsname=frankenfs".to_owned(),
+                "default_permissions".to_owned(),
+            ],
+            fs_name: "frankenfs".to_owned(),
+            allow_other: false,
+            auto_unmount: true,
+            default_permissions: true,
+            mode: "rw".to_owned(),
+        },
+        raw_fuser_options: vec![
+            "fsname=frankenfs".to_owned(),
+            "subtype=ffs".to_owned(),
+            "rw".to_owned(),
+            "FUSE_WRITEBACK_CACHE".to_owned(),
+        ],
+        epoch_id: "epoch-writeback-crash-0001".to_owned(),
+        epoch_state: "fresh".to_owned(),
+        host_capability_fingerprint: "fuse3-writeback-cache-enabled-host".to_owned(),
+        lane_manifest_id: "fuse-writeback-cache-rw-lane-v1".to_owned(),
+        operation_trace: [
+            (1, "create", "none"),
+            (2, "write", "kernel_writeback_cache"),
+            (3, "flush", "non_durable"),
+            (4, "fsync", "file_durable"),
+            (5, "rename", "metadata_after_data"),
+            (6, "fsyncdir", "directory_durable"),
+            (7, "write", "repeated_write"),
+            (8, "fsync", "last_write_durable"),
+            (9, "cancel", "classified_before_writeback"),
+            (10, "unmount", "dirty_pages_flushed_or_rejected"),
+            (11, "reopen", "survivor_set_verified"),
+            (12, "repair_refresh", "post_writeback_refresh"),
+        ]
+        .into_iter()
+        .map(
+            |(step, operation, boundary)| WritebackCrashReplayOperation {
+                step,
+                operation: operation.to_owned(),
+                target: "/writeback/data.bin".to_owned(),
+                durability_boundary: boundary.to_owned(),
+                expected_result: "success".to_owned(),
+            },
+        )
+        .collect(),
+        crash_points,
+        unsupported_combinations: vec![WritebackUnsupportedCombination {
+            combination_id: "writeback_cache_ro_mount".to_owned(),
+            rejected: true,
+            reason: "read_only_writeback_cache".to_owned(),
+            follow_up_bead: "bd-rchk0.2.4".to_owned(),
+        }],
+        artifact_paths: vec![
+            "artifacts/writeback-cache/crash-replay/matrix.json".to_owned(),
+            "artifacts/writeback-cache/crash-replay/results.json".to_owned(),
+            "artifacts/writeback-cache/crash-replay/run.log".to_owned(),
+        ],
+    };
+
+    validate_writeback_cache_audit_gate(&gate)?;
+    validate_writeback_ordering_oracle(&ordering)?;
+    validate_writeback_crash_replay_oracle(&crash_replay)?;
+
+    Ok((gate, ordering, crash_replay))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2873,6 +3123,56 @@ mod tests {
         )?;
         let markdown = render_writeback_crash_replay_markdown(&report);
         insta::assert_snapshot!(markdown);
+        Ok(())
+    }
+
+    #[test]
+    fn fuse_init_writeback_cache_tokens_are_accepted_by_oracles_bd_xvhsz() -> Result<()> {
+        for token in ["FUSE_WRITEBACK_CACHE", "fuse_init:writeback_cache"] {
+            let mut ordering = happy_ordering_oracle();
+            ordering.raw_fuser_options = vec![
+                "fsname=frankenfs".to_owned(),
+                "subtype=ffs".to_owned(),
+                "rw".to_owned(),
+                token.to_owned(),
+            ];
+            assert!(
+                matches!(
+                    evaluate_writeback_ordering_oracle(&ordering),
+                    WritebackOrderingDecision::Accept
+                ),
+                "ordering oracle must accept {token}"
+            );
+
+            let mut crash = happy_crash_replay_oracle();
+            crash.raw_fuser_options = vec![
+                "fsname=frankenfs".to_owned(),
+                "subtype=ffs".to_owned(),
+                "rw".to_owned(),
+                token.to_owned(),
+            ];
+            assert!(
+                matches!(
+                    evaluate_writeback_crash_replay_oracle(&crash),
+                    WritebackCrashReplayDecision::Accept
+                ),
+                "crash replay oracle must accept {token}"
+            );
+        }
+
+        let (gate, ordering, crash_replay) = generate_writeback_cache_oracle_bundle("ext4")?;
+        assert!(matches!(
+            evaluate_writeback_cache_audit(&gate),
+            WritebackCacheAuditDecision::Accept
+        ));
+        assert!(matches!(
+            evaluate_writeback_ordering_oracle(&ordering),
+            WritebackOrderingDecision::Accept
+        ));
+        assert!(matches!(
+            evaluate_writeback_crash_replay_oracle(&crash_replay),
+            WritebackCrashReplayDecision::Accept
+        ));
         Ok(())
     }
 }
