@@ -359,6 +359,18 @@ mod tests {
     fn dirty_fat_reserved_state_is_rejected_before_changing_clean_boot_copies() {
         let (_dir, volume, trace) = fixture("fat32");
         let cx = Cx::for_testing();
+        validate_boot_state(&cx, &volume).unwrap();
+        let sector_bytes = volume.geometry.sector_bytes();
+        let backup = volume.geometry.backup_boot_sector()
+            .expect("FAT32 fixture has a backup boot sector");
+        let boot_sectors = [0, backup];
+        let read_boot = |sector: u16| {
+            let mut boot = vec![0; usize::try_from(sector_bytes).unwrap()];
+            let offset = u64::from(sector) * u64::from(sector_bytes);
+            volume.read_exact(&cx, offset, &mut boot).unwrap();
+            boot
+        };
+        let original_boots = boot_sectors.map(read_boot);
         let original = raw_entry(&cx, &volume, "/entry.bin");
         let copy = volume.copies().next().unwrap();
         let offset = volume.geometry.entry_offset(copy, 2).unwrap() - 4;
@@ -370,7 +382,8 @@ mod tests {
         assert!(set_attr_in_volume(&cx, &volume, "/entry.bin", Some(true), None, None)
             .is_err());
         assert!(trace.lock().unwrap().events.is_empty());
-        validate_boot_state(&cx, &volume).unwrap();
+        assert!(validate_boot_state(&cx, &volume).is_err());
+        assert_eq!(boot_sectors.map(read_boot), original_boots);
         assert_eq!(raw_entry(&cx, &volume, "/entry.bin"), original);
     }
 

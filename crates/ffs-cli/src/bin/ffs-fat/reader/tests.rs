@@ -258,7 +258,13 @@ impl ByteDevice for Memory {
 
     fn read_exact_at(&self, _cx: &Cx, offset: ByteOffset, dst: &mut [u8]) -> Result<()> {
         self.reads.fetch_add(1, Ordering::Relaxed);
-        if self.fail_at == Some(offset.0) {
+        if self.fail_at.is_some_and(|fail_at| {
+            fail_at == offset.0
+                || fail_at
+                    .checked_sub(offset.0)
+                    .and_then(|delta| usize::try_from(delta).ok())
+                    .is_some_and(|delta| delta < dst.len())
+        }) {
             return Err(FfsError::Cancelled);
         }
         let start =

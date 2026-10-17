@@ -710,7 +710,7 @@ fn cli_requires_offline_ownership_and_preserves_explicit_selection() {
 #[test]
 fn bd_nu8nf_fat_unlink_rmdir_rename_and_writable_fsops_contract() {
     use crate::filesystem::FatFs;
-    use ffs_core::{FsOps, RequestScope, SetAttrRequest};
+    use ffs_core::{FsOps, ReleaseRequest, RequestScope, SetAttrRequest};
     use ffs_types::InodeNumber;
     use std::ffi::OsStr;
 
@@ -785,9 +785,22 @@ fn bd_nu8nf_fat_unlink_rmdir_rename_and_writable_fsops_contract() {
             fs.read(&cx, &mut scope, created.ino, 0, 64).unwrap(),
             b"hello FAT!!\0\0\0\0\0"
         );
-        fs.open(&cx, &mut scope, created.ino, libc::O_WRONLY | libc::O_TRUNC)
+        let (truncate_fh, _) = fs
+            .open(&cx, &mut scope, created.ino, libc::O_WRONLY | libc::O_TRUNC)
             .unwrap();
         assert_eq!(fs.getattr(&cx, &mut scope, created.ino).unwrap().size, 0);
+        fs.release(
+            &cx,
+            &mut scope,
+            ReleaseRequest {
+                ino: created.ino,
+                fh: truncate_fh,
+                flags: libc::O_WRONLY | libc::O_TRUNC,
+                lock_owner: None,
+                flush: false,
+            },
+        )
+        .unwrap();
         assert_eq!(
             fs.write(&cx, &mut scope, created.ino, 0, b"renamed payload")
                 .unwrap(),
