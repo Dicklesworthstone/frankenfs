@@ -235,16 +235,15 @@ impl<'a> BootPlan<'a> {
         }
         let target_geometry = FatGeometry::parse(&target, length);
         let target_parseable = target_geometry.is_ok();
-        if let Ok(other) = target_geometry {
-            if other != geometry
+        if let Ok(other) = target_geometry
+            && (other != geometry
                 || target[21] != source[21]
                 || target[28..32] != source[28..32]
-                || target[67..71] != source[67..71]
-            {
-                bail!(
-                    "two parseable boot copies disagree on geometry or volume identity; refusing relocation or source guessing"
-                );
-            }
+                || target[67..71] != source[67..71])
+        {
+            bail!(
+                "two parseable boot copies disagree on geometry or volume identity; refusing relocation or source guessing"
+            );
         }
         let device: Arc<dyn ByteDevice> = Arc::from(device);
         let projected = DiagnosticVolume::from_device(
@@ -360,7 +359,12 @@ impl<'a> BootPlan<'a> {
                 );
             }
         }
-        self.names.validate(cx, &self.volume)
+        // Boot repair retains the namespace even when no orphan names exist.
+        // The orphan-retirement validator intentionally skips that case.
+        if Names::capture(cx, &self.volume)? != self.names {
+            bail!("native namespace changed during boot recovery");
+        }
+        Ok(())
     }
 
     fn expect(&self, cx: &Cx, offset: u64, expected: &[u8]) -> Result<()> {
@@ -565,9 +569,9 @@ mod tests {
     fn boot_projection_is_range_exact_read_only_and_cancellation_aware() {
         let cx = Cx::for_testing();
         let device = Sparse::new(16384);
-        let original: Vec<u8> = (0..16384).map(|at| (at % 251) as u8).collect();
+        let original: Vec<u8> = (0_u32..16384).map(|at| (at % 251) as u8).collect();
         device.put(0, &original);
-        let source: Vec<u8> = (0..512).map(|at| (at % 127 + 17) as u8).collect();
+        let source: Vec<u8> = (0_u32..512).map(|at| (at % 127 + 17) as u8).collect();
         let view = View { device: Arc::new(device.clone()), starts: [2048, 8192], source: Arc::from(source.clone()) };
         let mut expected = original.clone();
         expected[2048..2560].copy_from_slice(&source);
