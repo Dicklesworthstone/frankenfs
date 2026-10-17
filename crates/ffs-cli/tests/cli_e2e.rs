@@ -2473,6 +2473,51 @@ fn cli_mount_periodic_commit_survives_sigkill_bd_dj725() {
     emit_scenario_result("cli_mount_periodic_commit_sigkill", "PASS", None);
 }
 
+/// The btrfs timer must publish un-fsynced mutations before a daemon crash.
+/// The disabled-timer arm must lose them, and both images must remain clean.
+#[test]
+fn cli_mount_btrfs_periodic_commit_survives_sigkill_bd_dj725() {
+    let require = std::env::var_os("FFS_REQUIRE_FUSE").is_some_and(|value| value == "1");
+    if !Path::new("/dev/fuse").exists()
+        || !["mkfs.btrfs", "btrfs", "fusermount3"]
+            .iter()
+            .all(|tool| command_available(tool))
+    {
+        assert!(
+            !require,
+            "FFS_REQUIRE_FUSE=1 but btrfs FUSE prerequisites are missing"
+        );
+        emit_scenario_result(
+            "cli_mount_btrfs_periodic_commit_sigkill",
+            "SKIP",
+            Some("fuse_or_btrfs_tools_unavailable"),
+        );
+        return;
+    }
+    let payload: Vec<u8> = (0..65_536_u32).map(|i| (i % 251) as u8).collect();
+    for interval_secs in [1, 0] {
+        let kept = match btrfs_periodic_commit_sigkill_arm(interval_secs, &payload, require) {
+            SigkillArm::Skipped => return,
+            SigkillArm::Missing => None,
+            SigkillArm::Bytes(bytes) => Some(bytes),
+        };
+        if interval_secs == 0 {
+            assert_ne!(
+                kept.as_deref(),
+                Some(payload.as_slice()),
+                "disabled btrfs timer kept the bytes; this control cannot detect a missing tick"
+            );
+        } else {
+            assert_eq!(
+                kept.as_deref(),
+                Some(payload.as_slice()),
+                "btrfs writes older than the commit interval must survive SIGKILL"
+            );
+        }
+    }
+    emit_scenario_result("cli_mount_btrfs_periodic_commit_sigkill", "PASS", None);
+}
+
 /// Real mount ownership and cancellation of both idle background workers.
 #[test]
 fn cli_mount_background_workers_drain_on_unmount_bd_11a8t() {
@@ -2784,10 +2829,15 @@ fn cli_mount_rss_stays_bounded_without_fsync_bd_dj725() {
         // Peak VmRSS over the first and second GiB written.
         let mut halves = [0_u64; 2];
         {
-            let mut file = fs::File::create(mnt.join("big.bin")).expect("create big.bin");
+            let mut file = fs::File::create(mnt.join("big.bin")).unwrap_or_else(|error| {
+                sigkill_cli_mount(&mut child, &mnt);
+                panic!("create big.bin: {error}");
+            });
             for mib in 0..2048_u32 {
-                file.write_all(&chunk)
-                    .unwrap_or_else(|e| panic!("write MiB {mib}: {e}"));
+                file.write_all(&chunk).unwrap_or_else(|error| {
+                    sigkill_cli_mount(&mut child, &mnt);
+                    panic!("write MiB {mib}: {error}");
+                });
                 if mib % 16 == 15 {
                     let half = usize::from(mib >= 1024);
                     halves[half] = halves[half].max(rss_kib(pid));
@@ -2847,6 +2897,85 @@ fn cli_mount_rss_stays_bounded_without_fsync_bd_dj725() {
     emit_scenario_result("cli_mount_rss_bound", "PASS", None);
 }
 
+fn btrfs_periodic_commit_sigkill_arm(
+    interval_secs: u64,
+    payload: &[u8],
+    require: bool,
+) -> SigkillArm {
+    use std::os::unix::fs::PermissionsExt as _;
+    use std::time::Duration;
+
+    let tmp = tempfile::tempdir().expect("create temp dir");
+    let seed_root = tmp.path().join("seed_root");
+    fs::create_dir(&seed_root).expect("create btrfs seed root");
+    fs::set_permissions(&seed_root, fs::Permissions::from_mode(0o777))
+        .expect("make seeded root writable for unprivileged mounts");
+    let image = tmp.path().join("commit.btrfs");
+    fs::File::create(&image)
+        .and_then(|file| file.set_len(256 << 20))
+        .expect("size btrfs image");
+    let made = Command::new("mkfs.btrfs")
+        .args(["-f", "-q", "--rootdir"])
+        .arg(&seed_root)
+        .arg(&image)
+        .output()
+        .expect("run mkfs.btrfs");
+    assert!(
+        made.status.success(),
+        "mkfs.btrfs failed: {}",
+        String::from_utf8_lossy(&made.stderr)
+    );
+    let mnt = tmp.path().join("mnt");
+    fs::create_dir(&mnt).expect("create mountpoint");
+    let interval = interval_secs.to_string();
+    let Some(mut child) = spawn_cli_mount(
+        &image,
+        &mnt,
+        &tmp.path().join("mount.log"),
+        &["--rw", "--commit-interval-secs", &interval],
+        &[],
+        "cli_mount_btrfs_periodic_commit_sigkill",
+        require,
+    ) else {
+        return SigkillArm::Skipped;
+    };
+    if let Err(error) = fs::write(mnt.join("durable.bin"), payload) {
+        sigkill_cli_mount(&mut child, &mnt);
+        panic!("write unsynced btrfs payload: {error}");
+    }
+    std::thread::sleep(Duration::from_secs(4));
+    sigkill_cli_mount(&mut child, &mnt);
+    let checked = Command::new("btrfs")
+        .args(["check", "--readonly"])
+        .arg(&image)
+        .output()
+        .expect("run btrfs check");
+    assert!(
+        checked.status.success(),
+        "btrfs image is inconsistent after SIGKILL (interval={interval_secs}): {} {}",
+        String::from_utf8_lossy(&checked.stdout),
+        String::from_utf8_lossy(&checked.stderr)
+    );
+    let Some(mut remounted) = spawn_cli_mount(
+        &image,
+        &mnt,
+        &tmp.path().join("remount.log"),
+        &[],
+        &[],
+        "cli_mount_btrfs_periodic_commit_sigkill_remount",
+        require,
+    ) else {
+        return SigkillArm::Skipped;
+    };
+    let mounted_bytes = fs::read(mnt.join("durable.bin"));
+    sigkill_cli_mount(&mut remounted, &mnt);
+    match mounted_bytes {
+        Ok(bytes) => SigkillArm::Bytes(bytes),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => SigkillArm::Missing,
+        Err(error) => panic!("read btrfs payload after remount: {error}"),
+    }
+}
+
 fn periodic_commit_sigkill_arm(interval_secs: u64, payload: &[u8], require: bool) -> SigkillArm {
     use std::time::Duration;
 
@@ -2875,7 +3004,10 @@ fn periodic_commit_sigkill_arm(interval_secs: u64, payload: &[u8], require: bool
     };
 
     // No fsync, no close-time flush semantics relied on: fs::write only closes.
-    fs::write(mnt.join("durable.bin"), payload).expect("write through the mount");
+    if let Err(error) = fs::write(mnt.join("durable.bin"), payload) {
+        sigkill_cli_mount(&mut child, &mnt);
+        panic!("write through the mount: {error}");
+    }
     // Both arms wait the same, well past a 1 s interval.
     std::thread::sleep(Duration::from_secs(4));
     sigkill_cli_mount(&mut child, &mnt);
