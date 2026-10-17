@@ -2077,17 +2077,30 @@ impl Default for EbrVersionReclaimer {
 
 impl EbrVersionReclaimer {
     pub(crate) fn retire_versions(&self, retired: Vec<BlockVersion>) {
+        const VERSIONS_PER_CALLBACK: usize = 64;
         if retired.is_empty() {
             return;
         }
         let handle = self.collector.register();
         let guard = handle.pin();
-        for version in retired {
-            saturating_increment_atomic(self.retired_versions.as_ref(), Ordering::Relaxed);
+        // Bound each callback while keeping a bulk eviction from filling the
+        // epoch queue with one entry per block. Every batch uses this pin;
+        // existing reader grace periods still govern destruction.
+        let mut retired = retired.into_iter();
+        loop {
+            let batch: Vec<_> = retired.by_ref().take(VERSIONS_PER_CALLBACK).collect();
+            if batch.is_empty() {
+                break;
+            }
+            for _ in &batch {
+                saturating_increment_atomic(self.retired_versions.as_ref(), Ordering::Relaxed);
+            }
             let reclaimed = Arc::clone(&self.reclaimed_versions);
             guard.defer(move || {
-                drop(version);
-                saturating_increment_atomic(reclaimed.as_ref(), Ordering::Relaxed);
+                for version in batch {
+                    drop(version);
+                    saturating_increment_atomic(reclaimed.as_ref(), Ordering::Relaxed);
+                }
             });
         }
     }
@@ -6427,6 +6440,43 @@ mod tests {
         let after = store.ebr_stats();
         assert_eq!(before, after);
         assert_eq!(after.pending_versions(), 0);
+    }
+
+    #[test]
+    fn ebr_bulk_retirement_drains_after_reader_unpins_bd_dj725() {
+        const VERSIONS: u64 = 32_769;
+        let reclaimer = EbrVersionReclaimer::default();
+        let reader = reclaimer.collector.register();
+        let pinned = reader.pin();
+        let payload = Arc::new(ffs_block::AlignedVec::from_vec(vec![0xA5; 32], 1));
+        let retained = Arc::downgrade(&payload);
+        let retired = (0..VERSIONS)
+            .map(|block| BlockVersion {
+                block: BlockNumber(block),
+                commit_seq: CommitSeq(1),
+                writer: TxnId(1),
+                data: VersionData::Full(Arc::clone(&payload)),
+            })
+            .collect();
+        drop(payload);
+        reclaimer.retire_versions(retired);
+        reclaimer.collect();
+        assert_eq!(reclaimer.stats().retired_versions, VERSIONS);
+        assert_eq!(reclaimer.stats().reclaimed_versions, 0);
+        assert!(
+            retained.upgrade().is_some(),
+            "pinned reader protects payloads"
+        );
+
+        drop(pinned);
+        drop(reader);
+        reclaimer.collect();
+        assert_eq!(reclaimer.stats().reclaimed_versions, VERSIONS);
+        assert_eq!(reclaimer.stats().pending_versions(), 0);
+        assert!(
+            retained.upgrade().is_none(),
+            "payloads must actually be freed"
+        );
     }
 
     #[test]
