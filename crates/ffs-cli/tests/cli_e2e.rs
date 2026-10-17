@@ -2501,11 +2501,12 @@ fn cli_mount_background_workers_drain_on_unmount_bd_11a8t() {
     let mnt = dir.join("mnt");
     fs::create_dir(&mnt).unwrap();
     let log = dir.join("mount.log");
-    let Some(mut child) = spawn_cli_rw_mount(
+    let Some(mut child) = spawn_cli_mount(
         &image,
         &mnt,
         &log,
         &[
+            "--rw",
             "--background-scrub",
             "--background-scrub-interval-secs",
             "3600",
@@ -2634,10 +2635,10 @@ enum SigkillArm {
 }
 
 /// One SIGKILL arm of [`cli_mount_periodic_commit_survives_sigkill_bd_dj725`].
-/// Spawn `ffs mount --rw <extra_args> image mnt` and wait for it to appear in
+/// Spawn `ffs mount <extra_args> image mnt` and wait for it to appear in
 /// mountinfo. `None` is a SKIP (the mount could not start), which is a
 /// failure under `FFS_REQUIRE_FUSE=1`.
-fn spawn_cli_rw_mount(
+fn spawn_cli_mount(
     image: &Path,
     mnt: &Path,
     log_path: &Path,
@@ -2655,7 +2656,7 @@ fn spawn_cli_rw_mount(
         .into_owned();
     // A file, not a pipe: an unread pipe would block a chatty daemon.
     let mut child = Command::new(env!("CARGO_BIN_EXE_ffs-cli"))
-        .args(["mount", "--rw"])
+        .arg("mount")
         .args(extra_args)
         .arg(image)
         .arg(mnt)
@@ -2666,7 +2667,7 @@ fn spawn_cli_rw_mount(
         .stdout(std::process::Stdio::null())
         .stderr(fs::File::create(log_path).expect("create mount log"))
         .spawn()
-        .expect("spawn `ffs mount --rw`");
+        .expect("spawn `ffs mount`");
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         let mounted = fs::read_to_string("/proc/self/mountinfo")
@@ -2680,7 +2681,7 @@ fn spawn_cli_rw_mount(
             let stderr = fs::read_to_string(log_path).unwrap_or_default();
             assert!(
                 !require,
-                "FFS_REQUIRE_FUSE=1 but `ffs mount --rw` exited {status}: {stderr}"
+                "FFS_REQUIRE_FUSE=1 but `ffs mount` exited {status}: {stderr}"
             );
             emit_scenario_result(scenario, "SKIP", Some("mount_failed"));
             return None;
@@ -2688,7 +2689,7 @@ fn spawn_cli_rw_mount(
         if Instant::now() > deadline {
             let _ = child.kill();
             let _ = child.wait();
-            panic!("`ffs mount --rw` did not appear in mountinfo within 30s");
+            panic!("`ffs mount` did not appear in mountinfo within 30s");
         }
         std::thread::sleep(Duration::from_millis(50));
     }
@@ -2732,7 +2733,7 @@ fn sigkill_cli_mount(child: &mut std::process::Child, mnt: &Path) {
     }
 }
 
-/// bd-dj725 memory bound, measured on the real daemon: 1 GiB written through
+/// bd-dj725 memory bound, measured on the real daemon: 2 GiB written through
 /// `ffs mount --rw` without any fsync. Before durable MVCC chains were evicted
 /// the store kept every block ever written, so the daemon's RSS grew past the
 /// data size; with journal-pressure commits and eviction it stays bounded by
@@ -2754,18 +2755,18 @@ fn cli_mount_rss_stays_bounded_without_fsync_bd_dj725() {
         emit_scenario_result("cli_mount_rss_bound", "SKIP", Some("fuse_unavailable"));
         return;
     }
-    // One arm: mount, write 1 GiB without fsync, return the peak VmRSS (KiB).
+    // One arm: mount, write 2 GiB without fsync, return the peak VmRSS (KiB).
     let arm = |envs: &[(&str, &str)]| -> Option<[u64; 2]> {
         let tmp = tempfile::tempdir().expect("create temp dir");
         let image = tmp.path().join("rss.ext4");
-        format_ext4_owned_by_caller(&image, 2 << 30);
+        format_ext4_owned_by_caller(&image, 4 << 30);
         let mnt = tmp.path().join("mnt");
         fs::create_dir(&mnt).expect("create mountpoint");
-        let mut child = spawn_cli_rw_mount(
+        let mut child = spawn_cli_mount(
             &image,
             &mnt,
             &tmp.path().join("mount.log"),
-            &[],
+            &["--rw"],
             envs,
             "cli_mount_rss_bound",
             require,
@@ -2780,15 +2781,15 @@ fn cli_mount_rss_stays_bounded_without_fsync_bd_dj725() {
         };
         let pid = child.id();
         let chunk: Vec<u8> = (0..1024 * 1024_u32).map(|i| (i % 253) as u8).collect();
-        // Peak VmRSS over the first and second 512 MiB written.
+        // Peak VmRSS over the first and second GiB written.
         let mut halves = [0_u64; 2];
         {
             let mut file = fs::File::create(mnt.join("big.bin")).expect("create big.bin");
-            for mib in 0..1024_u32 {
+            for mib in 0..2048_u32 {
                 file.write_all(&chunk)
                     .unwrap_or_else(|e| panic!("write MiB {mib}: {e}"));
                 if mib % 16 == 15 {
-                    let half = usize::from(mib >= 512);
+                    let half = usize::from(mib >= 1024);
                     halves[half] = halves[half].max(rss_kib(pid));
                 }
             }
@@ -2812,34 +2813,35 @@ fn cli_mount_rss_stays_bounded_without_fsync_bd_dj725() {
         return;
     };
     eprintln!(
-        "RSS_BOUND|written_mib=1024|default_cap_kib={bounded_first},{bounded_second}\
+        "RSS_BOUND|written_mib=2048|default_cap_kib={bounded_first},{bounded_second}\
          |no_eviction_kib={unbounded_first},{unbounded_second}"
     );
     // "Bounded" = memory stops growing with the data written. Measured
     // 2026-09-25: ~0.5 GiB with the default cap vs ~1.9 GiB without eviction
-    // for the same 1 GiB (per-block overhead, the boundary's transient block
-    // copies and allocator retention make the absolute level workload- and
-    // allocator-dependent, so the test asserts the TREND, not a number).
-    // Compared with the control's growth over the same second 512 MiB, not an
-    // absolute allowance: 13 runs on identical daemon code (2026-09-25) grew
+    // for the same 1 GiB in the original control. Per-block overhead, transient
+    // block copies and allocator retention make the absolute level workload-
+    // and allocator-dependent, so the test asserts the growth trend.
+    // Now exercise the bead's full 2 GiB workload, comparing growth over the
+    // same second GiB in both arms, rather than an absolute allowance:
+    // 13 runs on identical daemon code (2026-09-25) grew
     // 33..139 MiB with eviction, so a 64 MiB bound failed ~40% of runs on
     // noise, while the control grew ~650 MiB.
     let bounded_growth = bounded_second.saturating_sub(bounded_first);
     let unbounded_growth = unbounded_second.saturating_sub(unbounded_first);
     assert!(
-        unbounded_growth > 256 * 1024,
+        unbounded_growth > 512 * 1024,
         "control arm (no eviction) did not grow ({unbounded_first} -> {unbounded_second} \
          KiB): the test is not detecting the growth eviction prevents"
     );
     assert!(
         bounded_growth * 3 < unbounded_growth,
         "daemon RSS kept growing with the default resident cap: +{bounded_growth} KiB over \
-         the second 512 MiB vs +{unbounded_growth} KiB without eviction \
+         the second GiB vs +{unbounded_growth} KiB without eviction \
          ({bounded_first} -> {bounded_second} KiB)"
     );
     assert!(
         bounded_second * 2 < unbounded_second,
-        "eviction must at least halve the daemon's memory for 1 GiB written: \
+        "eviction must at least halve the daemon's memory for 2 GiB written: \
          {bounded_second} KiB vs {unbounded_second} KiB without it"
     );
     emit_scenario_result("cli_mount_rss_bound", "PASS", None);
@@ -2854,12 +2856,18 @@ fn periodic_commit_sigkill_arm(interval_secs: u64, payload: &[u8], require: bool
     let mnt = tmp.path().join("mnt");
     fs::create_dir(&mnt).expect("create mountpoint");
     let interval = interval_secs.to_string();
-    let Some(mut child) = spawn_cli_rw_mount(
+    let Some(mut child) = spawn_cli_mount(
         &image,
         &mnt,
         &tmp.path().join("mount.log"),
-        &["--commit-interval-secs", &interval],
-        &[],
+        &[
+            "--rw",
+            "--commit-interval-secs",
+            &interval,
+            "--log-format",
+            "json",
+        ],
+        &[("RUST_LOG", "info")],
         "cli_mount_periodic_commit_sigkill",
         require,
     ) else {
@@ -2871,6 +2879,29 @@ fn periodic_commit_sigkill_arm(interval_secs: u64, payload: &[u8], require: bool
     // Both arms wait the same, well past a 1 s interval.
     std::thread::sleep(Duration::from_secs(4));
     sigkill_cli_mount(&mut child, &mnt);
+
+    if interval_secs != 0 {
+        let logs = fs::read_to_string(tmp.path().join("mount.log")).expect("read daemon log");
+        let commits: Vec<serde_json::Value> = logs
+            .lines()
+            .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+            .filter(|event| event["message"] == "ext4_journal_checkpoint_durable")
+            .collect();
+        assert!(
+            !commits.is_empty(),
+            "periodic commit must report the completed journal boundary: {logs}"
+        );
+        for commit in commits {
+            assert!(commit["journal_sequence"].as_u64().is_some(), "{commit}");
+            assert!(
+                commit["checkpoint_blocks"]
+                    .as_u64()
+                    .is_some_and(|blocks| blocks > 0),
+                "{commit}"
+            );
+            assert!(commit["duration_us"].as_u64().is_some(), "{commit}");
+        }
+    }
 
     let replay = Command::new("e2fsck")
         .args(["-E", "journal_only", "-y"])
@@ -2903,6 +2934,26 @@ fn periodic_commit_sigkill_arm(interval_secs: u64, payload: &[u8], require: bool
     let stderr = String::from_utf8_lossy(&cat.stderr);
     if stderr.contains("not found") {
         return SigkillArm::Missing;
+    }
+    if interval_secs != 0 {
+        let Some(mut remounted) = spawn_cli_mount(
+            &image,
+            &mnt,
+            &tmp.path().join("remount.log"),
+            &[],
+            &[],
+            "cli_mount_periodic_commit_sigkill_remount",
+            require,
+        ) else {
+            return SigkillArm::Skipped;
+        };
+        let mounted_bytes = fs::read(mnt.join("durable.bin"));
+        sigkill_cli_mount(&mut remounted, &mnt);
+        assert_eq!(
+            mounted_bytes.expect("read durable data after FUSE remount"),
+            cat.stdout,
+            "FUSE remount must expose the same durable bytes as native debugfs"
+        );
     }
     SigkillArm::Bytes(cat.stdout)
 }

@@ -27175,6 +27175,8 @@ impl OpenFs {
         journal: &mut Jbd2Writer,
         writes: &mut BTreeMap<BlockNumber, Vec<u8>>,
     ) -> Result<(), FfsError> {
+        let started =
+            tracing::enabled!(target: "ffs::journal", tracing::Level::INFO).then(Instant::now);
         let direct = ByteDeviceBlockAdapter {
             dev: self.dev.as_ref(),
             block_size: self.block_size(),
@@ -27205,7 +27207,7 @@ impl OpenFs {
         // leave the image byte-identical, without an empty live journal.
         journal.preflight_transaction(&direct, &txn)?;
         self.ext4_write_needs_recovery(cx, &direct, true)?;
-        {
+        let journal_sequence = {
             journal.mark_log_live(cx, &direct).map_err(|e| {
                 FfsError::Io(std::io::Error::other(format!(
                     "jbd2 flush boundary could not mark the log live: {e}"
@@ -27215,16 +27217,19 @@ impl OpenFs {
             // preflight rejection (NoSpace, format) did no I/O and left the
             // writer usable; a write-phase failure aborted the writer and may
             // have left partial blocks. Only recovery resumes the latter.
-            if let Err(e) = journal.commit_transaction(cx, &direct, &txn) {
-                warn!(
-                    target: "ffs::journal",
-                    error = %e,
-                    "flush_boundary_journal_write_failed"
-                );
-                return Err(FfsError::Io(std::io::Error::other(format!(
-                    "jbd2 flush boundary journal write failed: {e}"
-                ))));
-            }
+            let (sequence, _) = match journal.commit_transaction(cx, &direct, &txn) {
+                Ok(committed) => committed,
+                Err(e) => {
+                    warn!(
+                        target: "ffs::journal",
+                        error = %e,
+                        "flush_boundary_journal_write_failed"
+                    );
+                    return Err(FfsError::Io(std::io::Error::other(format!(
+                        "jbd2 flush boundary journal write failed: {e}"
+                    ))));
+                }
+            };
             // Phase 1b — journal commit record durability. Ambiguous on
             // failure: the commit record may or may not have reached storage.
             // The writer is NOT aborted (its write phase completed); the
@@ -27291,7 +27296,8 @@ impl OpenFs {
                     "jbd2 flush boundary could not mark the log empty: {e}"
                 )))
             })?;
-        }
+            sequence
+        };
         self.ext4_write_needs_recovery(cx, &direct, false)?;
         // bd-7zjfh: both cleanup writes dirty the device after phase 2. A
         // sidecar-backed device fences that new epoch until sync publishes its
@@ -27309,6 +27315,15 @@ impl OpenFs {
                 "jbd2 flush boundary cleanup sync failed (checkpoint is durable; clean-state publication incomplete): {e}"
             ))));
         }
+        info!(
+            target: "ffs::journal",
+            journal_sequence,
+            checkpoint_blocks = writes.len(),
+            duration_us = started.map_or(0, |start| {
+                u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX)
+            }),
+            "ext4_journal_checkpoint_durable"
+        );
         Ok(())
     }
 
