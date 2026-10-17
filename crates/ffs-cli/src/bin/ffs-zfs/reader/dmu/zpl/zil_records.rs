@@ -8,8 +8,7 @@
 //! Layout: OpenZFS zfs-2.3.0 include/sys/zil.h and module/zfs/zfs_replay.c.
 
 use super::{Cx, Result, checkpoint, corrupt, parse as parse_error, unsupported};
-use crate::reader::Endian;
-use ffs_ondisk::zfs::MAX_BLOCK_BYTES;
+use ffs_ondisk::zfs::{Endian, MAX_BLOCK_BYTES};
 use ffs_ondisk::zfs_dmu::{ZilBlock, ZilRecordPayload};
 
 const CHAIN_BYTES: usize = 184;

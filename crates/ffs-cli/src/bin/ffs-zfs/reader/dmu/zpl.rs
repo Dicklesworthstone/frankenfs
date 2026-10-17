@@ -203,6 +203,7 @@ impl Zpl {
         Ok(zpl)
     }
 
+    #[cfg(test)]
     #[must_use]
     pub fn zil_replay_stats(&self) -> Option<&ZilReplayStats> {
         self.zil_overlay.as_ref().map(|ov| &ov.stats)

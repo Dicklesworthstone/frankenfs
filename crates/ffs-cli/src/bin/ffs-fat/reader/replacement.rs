@@ -955,6 +955,7 @@ pub fn create_in_volume(
     plan.execute(cx, volume, &source, || Ok(()))
 }
 
+#[cfg(test)]
 pub fn replace_in_volume(
     cx: &Cx,
     volume: &FatVolume,

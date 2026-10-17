@@ -3,7 +3,6 @@
 
 use super::*;
 use super::super::boot::BootPlan;
-use clap::Parser as _;
 use ffs_ondisk::fat::FatGeometry;
 use std::sync::atomic::{AtomicBool, Ordering};
 

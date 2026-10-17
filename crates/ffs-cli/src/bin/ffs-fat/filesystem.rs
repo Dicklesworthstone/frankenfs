@@ -149,6 +149,7 @@ fn map_mutation_error(error: anyhow::Error) -> FfsError {
 }
 
 impl FatFs {
+    #[cfg(test)]
     pub fn new(cx: &Cx, volume: FatVolume, uid: u32, gid: u32) -> Result<Self> {
         Self::new_with_mode(cx, volume, uid, gid, false)
     }
