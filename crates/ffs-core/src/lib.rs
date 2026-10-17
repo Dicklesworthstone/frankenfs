@@ -2752,7 +2752,7 @@ pub struct OpenFs {
     /// base device. The mutex serializes concurrent fsync/flush calls so an older
     /// checkpoint cannot overwrite a newer one after its watermark publishes.
     mvcc_flushed_through: Mutex<CommitSeq>,
-    /// Count of mutating request scopes begun (bd-dj725). The periodic commit
+    /// Count of mutating request scopes completed (bd-dj725). The periodic commit
     /// compares it with [`Self::committed_mutation_epoch`] so an idle mount
     /// never pays for a commit.
     mutation_epoch: std::sync::atomic::AtomicU64,
@@ -100388,12 +100388,26 @@ mod tests {
                 .generation
         };
         let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
-        let scope = <OpenFs as FsOps>::begin_request_scope(&fs, &cx, RequestOp::Write)
+        let mut scope = <OpenFs as FsOps>::begin_request_scope(&fs, &cx, RequestOp::Write)
             .expect("write scope");
-        let file = fs
-            .create(&cx, root, OsStr::new("tick.bin"), 0o644, 0, 0)
-            .expect("create");
-        fs.write(&cx, file.ino, 0, &[0x42_u8; 8192]).expect("write");
+        // Reproduce a timer running after admission but before the writer
+        // acquires its mutation locks. BEGIN alone cannot make later writes
+        // durable: END must publish a marker the following tick still sees.
+        fs.periodic_commit(&cx).expect("tick before mutation");
+        let file = <OpenFs as FsOps>::create(
+            &fs,
+            &cx,
+            &mut scope,
+            root,
+            OsStr::new("tick.bin"),
+            0o644,
+            0,
+            0,
+        )
+        .expect("create");
+        <OpenFs as FsOps>::write(&fs, &cx, &mut scope, file.ino, 0, &[0x42_u8; 8192])
+            .expect("write");
+        <OpenFs as FsOps>::commit_request_scope(&fs, &cx, &mut scope).expect("commit scope");
         <OpenFs as FsOps>::end_request_scope(&fs, &cx, RequestOp::Write, scope).expect("end scope");
 
         let before = generation(&dev.snapshot_bytes());
@@ -100411,6 +100425,21 @@ mod tests {
             generation(&dev.snapshot_bytes()),
             after,
             "an idle tick must not bump the generation"
+        );
+        let reopened = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(dev.snapshot_bytes())),
+            &OpenOptions::default(),
+        )
+        .expect("reopen tick-committed image");
+        let durable_file = reopened
+            .lookup(&cx, root, OsStr::new("tick.bin"))
+            .expect("durable file");
+        assert_eq!(
+            reopened
+                .read(&cx, durable_file.ino, 0, 8192)
+                .expect("durable bytes"),
+            vec![0x42_u8; 8192]
         );
         std::fs::write(&image, dev.snapshot_bytes()).expect("write image");
         if let Some((ok, output)) = run_btrfs_check(&image) {

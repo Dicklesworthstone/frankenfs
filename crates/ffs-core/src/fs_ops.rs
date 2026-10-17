@@ -4708,9 +4708,6 @@ impl FsOps for OpenFs {
             self.enter_mutation_gate();
         }
         let (snapshot, tx) = if op.is_write() {
-            // bd-dj725: feeds the periodic commit's "anything changed?" check.
-            self.mutation_epoch
-                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             // Write operations must use a transaction for isolation and atomicity.
             let txn = self.mvcc_store.begin();
             let snapshot = txn.snapshot;
@@ -4809,6 +4806,11 @@ impl FsOps for OpenFs {
 
         // bd-1o6tq: commit early if the dirty set is outgrowing the journal.
         if op.is_write() {
+            // Publish completion before any pressure boundary. A periodic tick
+            // that ran after BEGIN but before these mutations must not consume
+            // their only dirty marker (bd-dj725).
+            self.mutation_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
             self.ext4_commit_on_journal_pressure(cx);
         }
 
