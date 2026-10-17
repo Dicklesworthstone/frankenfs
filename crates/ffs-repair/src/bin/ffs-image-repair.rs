@@ -1,6 +1,5 @@
 //! Offline image protection without writing parity into filesystem space.
 
-use asupersync::Cx;
 use clap::{Parser, Subcommand};
 use ffs_error::{FfsError, Result};
 use ffs_repair::sidecar::{SidecarOptions, protect, verify};
@@ -58,7 +57,11 @@ fn emit(value: &impl Serialize) -> Result<()> {
 fn run(cli: Cli) -> Result<u8> {
     // The standalone consumer owns its capability root. All library work
     // receives this explicit context, including the cancellation signal.
-    let cx = Cx::for_testing();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .blocking_threads(0, 0)
+        .build()
+        .map_err(|error| FfsError::Io(std::io::Error::other(error.to_string())))?;
+    let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
     let cancellation = cx.clone();
     ctrlc::set_handler(move || cancellation.set_cancel_requested(true))
         .map_err(|error| FfsError::Io(std::io::Error::other(error)))?;

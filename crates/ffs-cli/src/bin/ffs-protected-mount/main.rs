@@ -921,9 +921,21 @@ fn run(args: &Args) -> Result<()> {
     let runtime = (args.rw || args.scrub.interval_secs.is_some())
         .then(mount_worker::mount_background_runtime)
         .transpose()?;
-    let cx = runtime.as_ref().map_or_else(Cx::for_request, |runtime| {
-        runtime.request_cx_with_budget(asupersync::Budget::INFINITE)
-    });
+    let fallback_runtime = if runtime.is_none() {
+        Some(
+            asupersync::runtime::RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .build()
+                .context("failed to create protected mount request runtime")?,
+        )
+    } else {
+        None
+    };
+    let cx_runtime = runtime
+        .as_deref()
+        .or(fallback_runtime.as_ref())
+        .expect("runtime or fallback_runtime must exist");
+    let cx = cx_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
     let cancellation = cx.clone();
     let stopped = Arc::new(AtomicBool::new(false));
     let shutdown: Arc<Mutex<Option<Arc<AtomicBool>>>> = Arc::new(Mutex::new(None));
@@ -948,9 +960,7 @@ fn run(args: &Args) -> Result<()> {
     // Every exit after successful preparation attempts cleanup, including
     // mount failure, announcement failure and startup cancellation. Cleanup
     // has its own capability; Ctrl-C must not cancel the durability barrier.
-    let cleanup_cx = runtime.as_ref().map_or_else(Cx::for_request, |runtime| {
-        runtime.request_cx_with_budget(asupersync::Budget::INFINITE)
-    });
+    let cleanup_cx = cx_runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
     let cleanup = prepared.finish(&cleanup_cx);
     match (operation, cleanup) {
         (Ok(()), cleanup) => cleanup,

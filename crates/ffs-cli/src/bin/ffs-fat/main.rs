@@ -353,7 +353,11 @@ enum Command {
 
 fn main() -> Result<()> {
     let cli = Cli::parse();
-    let cx = Cx::for_request();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .blocking_threads(0, 0)
+        .build()
+        .map_err(|err| anyhow::anyhow!("failed to build ffs-fat runtime: {err}"))?;
+    let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
     match cli.command {
         Command::Recover { options } => {
             let report = reader::recovery::run(&cx, &options)?;

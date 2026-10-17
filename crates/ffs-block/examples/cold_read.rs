@@ -88,7 +88,6 @@
 //! FASTER". Both framings are arithmetically correct; only the first is honest.
 //! See bd-q6k00.
 
-use asupersync::Cx;
 use ffs_block::{ByteDevice, FileByteDevice};
 use ffs_types::ByteOffset;
 use std::sync::Arc;
@@ -127,7 +126,11 @@ fn main() {
         };
         let pat_rand = rand;
         handles.push(std::thread::spawn(move || {
-            let cx = Cx::for_testing();
+            let rt = asupersync::runtime::RuntimeBuilder::current_thread()
+                .blocking_threads(0, 0)
+                .build()
+                .expect("example runtime");
+            let cx = rt.request_cx_with_budget(asupersync::Budget::INFINITE);
             let mut buf = vec![0_u8; chunk];
             let mut sum: u64 = 0;
             if pat_rand {

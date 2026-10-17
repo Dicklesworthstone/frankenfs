@@ -159,7 +159,15 @@ use tracing_subscriber::EnvFilter;
 
 #[must_use]
 pub fn cli_cx() -> Cx {
-    Cx::for_request()
+    static CLI_RUNTIME: std::sync::OnceLock<asupersync::runtime::Runtime> =
+        std::sync::OnceLock::new();
+    let runtime = CLI_RUNTIME.get_or_init(|| {
+        asupersync::runtime::RuntimeBuilder::current_thread()
+            .blocking_threads(0, 0)
+            .build()
+            .expect("ffs-cli runtime must initialize")
+    });
+    runtime.request_cx_with_budget(asupersync::Budget::INFINITE)
 }
 
 // ── CLI definition ──────────────────────────────────────────────────────────

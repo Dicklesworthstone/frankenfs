@@ -1002,7 +1002,11 @@ fn profile_read_path_cmd(args: &[String]) -> Result<()> {
         return Ok(());
     }
 
-    let cx = Cx::for_testing();
+    let runtime = asupersync::runtime::RuntimeBuilder::current_thread()
+        .blocking_threads(0, 0)
+        .build()
+        .map_err(|err| anyhow::anyhow!("failed to build harness runtime: {err}"))?;
+    let cx = runtime.request_cx_with_budget(asupersync::Budget::INFINITE);
     let deadline = Instant::now() + args.duration;
     let mut cached_fs = None;
     let mut cached_fuse = None;
