@@ -2496,11 +2496,12 @@ fn cli_mount_btrfs_periodic_commit_survives_sigkill_bd_dj725() {
     }
     let payload: Vec<u8> = (0..65_536_u32).map(|i| (i % 251) as u8).collect();
     for interval_secs in [None, Some(1), Some(0)] {
-        let kept = match btrfs_periodic_commit_sigkill_arm(interval_secs, &payload, require) {
-            SigkillArm::Skipped => return,
-            SigkillArm::Missing => None,
-            SigkillArm::Bytes(bytes) => Some(bytes),
-        };
+        let kept =
+            match btrfs_periodic_commit_sigkill_arm(interval_secs, &payload, require, None, None) {
+                SigkillArm::Skipped => return,
+                SigkillArm::Missing => None,
+                SigkillArm::Bytes(bytes) => Some(bytes),
+            };
         if interval_secs == Some(0) {
             assert_ne!(
                 kept.as_deref(),
@@ -2516,6 +2517,55 @@ fn cli_mount_btrfs_periodic_commit_survives_sigkill_bd_dj725() {
         }
     }
     emit_scenario_result("cli_mount_btrfs_periodic_commit_sigkill", "PASS", None);
+}
+
+#[test]
+fn cli_mount_btrfs_pressure_commit_survives_sigkill_without_timer_bd_dj725() {
+    let require = std::env::var_os("FFS_REQUIRE_FUSE").is_some_and(|value| value == "1");
+    let prerequisites = Path::new("/dev/fuse").exists()
+        && ["mkfs.btrfs", "btrfs", "fusermount3"]
+            .iter()
+            .all(|tool| command_available(tool));
+    if !prerequisites {
+        assert!(
+            !require,
+            "required FUSE/btrfs pressure prerequisites unavailable"
+        );
+        emit_scenario_result(
+            "cli_mount_btrfs_pressure_sigkill",
+            "SKIP",
+            Some("fuse_unavailable"),
+        );
+        return;
+    }
+    let payload: Vec<u8> = (0..65_536_u32).map(|i| (i % 251) as u8).collect();
+    for threshold in [1, u64::MAX] {
+        let kept = match btrfs_periodic_commit_sigkill_arm(
+            Some(0),
+            &payload,
+            require,
+            Some(threshold),
+            Some(2),
+        ) {
+            SigkillArm::Skipped => return,
+            SigkillArm::Missing => None,
+            SigkillArm::Bytes(bytes) => Some(bytes),
+        };
+        if threshold == 1 {
+            assert_eq!(
+                kept.as_deref(),
+                Some(payload.as_slice()),
+                "pressure must persist unsynced writes"
+            );
+        } else {
+            assert_ne!(
+                kept.as_deref(),
+                Some(payload.as_slice()),
+                "timer-off high-threshold control must detect missing pressure commits"
+            );
+        }
+    }
+    emit_scenario_result("cli_mount_btrfs_pressure_sigkill", "PASS", None);
 }
 
 /// Real mount ownership and cancellation of both idle background workers.
@@ -2923,6 +2973,8 @@ fn btrfs_periodic_commit_sigkill_arm(
     interval_secs: Option<u64>,
     payload: &[u8],
     require: bool,
+    pressure_bytes: Option<u64>,
+    wait_override_secs: Option<u64>,
 ) -> SigkillArm {
     use std::os::unix::fs::PermissionsExt as _;
     use std::time::Duration;
@@ -2954,12 +3006,17 @@ fn btrfs_periodic_commit_sigkill_arm(
     if let Some(interval) = &interval {
         args.extend(["--commit-interval-secs", interval.as_str()]);
     }
+    let threshold = pressure_bytes.map(|bytes| bytes.to_string());
+    let mut envs = vec![("RUST_LOG", "info")];
+    if let Some(threshold) = &threshold {
+        envs.push(("FFS_BTRFS_DIRTY_BYTES_THRESHOLD", threshold.as_str()));
+    }
     let Some(mut child) = spawn_cli_mount(
         &image,
         &mnt,
         &tmp.path().join("mount.log"),
         &args,
-        &[("RUST_LOG", "info")],
+        &envs,
         "cli_mount_btrfs_periodic_commit_sigkill",
         require,
     ) else {
@@ -2971,9 +3028,24 @@ fn btrfs_periodic_commit_sigkill_arm(
     }
     // The disabled control waits as long as the 30 s default arm, so an
     // unrelated delayed flush cannot masquerade as the default commit timer.
-    let wait_secs = interval_secs.filter(|secs| *secs != 0).unwrap_or(30) + 3;
+    let wait_secs = wait_override_secs
+        .unwrap_or_else(|| interval_secs.filter(|secs| *secs != 0).unwrap_or(30) + 3);
     std::thread::sleep(Duration::from_secs(wait_secs));
     sigkill_cli_mount(&mut child, &mnt);
+    if pressure_bytes == Some(1) {
+        let logs = fs::read_to_string(tmp.path().join("mount.log")).expect("read pressure log");
+        assert!(
+            logs.lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .any(|event| event["message"] == "btrfs_pressure_commit"
+                    && event["committed"].as_bool() == Some(true)),
+            "timer-off writes must cross a real pressure durability boundary: {logs}"
+        );
+        assert!(
+            !logs.contains("periodic_commit_started"),
+            "pressure proof must run with the periodic timer disabled: {logs}"
+        );
+    }
     if interval_secs != Some(0) {
         let logs = fs::read_to_string(tmp.path().join("mount.log")).expect("read daemon log");
         assert!(

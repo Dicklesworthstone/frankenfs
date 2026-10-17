@@ -2832,6 +2832,19 @@ that share the same trait interface (`JournalManager`, Section 9.7).
 Modules:
 - `replay.rs`: JBD2 journal replay engine. Implements the four-phase algorithm from Section 11.6.4: (1) SCAN from `s_start` following `s_sequence`, matching magic and sequence numbers, parsing DESCRIPTOR/COMMIT/REVOKE blocks, stopping on mismatch or wrap; (2) REVOKE set construction (`HashMap<BlockNumber, u32>` mapping block to highest revoking sequence); (3) REPLAY oldest-first, skipping revoked blocks, writing data to target locations, restoring escaped magic bytes; (4) CLEANUP: set `s_start=0`, write journal superblock. Handles circular wrap via `next(pos) = s_first + ((pos - s_first + 1) % (s_maxlen - s_first))`.
 - `jbd2.rs`: JBD2-compatible transaction lifecycle for write operations (active only in JBD2-compat mode). `JournalTransaction`: reserve blocks, write descriptor tags, copy data blocks to journal area, write revoke blocks, write commit block. Compound transactions: multiple FS operations batched within a single journal transaction (commit interval 5s or when journal space below 25%). Checkpoint: write committed journal data to final locations, advance journal head.
+- Mount durability scheduling (`bd-dj725`): ext4 uses a 5-second default and
+  btrfs a 30-second default, measured with the inherited `Cx` clock. Completed
+  mutations must also force a boundary under dirty-write pressure, independently
+  of the timer. Btrfs defaults to a conservative 128 MiB budget combining data
+  block writes and COW-node allocations; `FFS_BTRFS_DIRTY_BYTES_THRESHOLD`
+  configures that budget and zero disables that pressure trigger explicitly.
+  Loading durable trees establishes a zero-debt baseline. Checkpoint rollback
+  restores metadata debt; failed writes or syncs never acknowledge it. Installed
+  sharded versions may precede publication: capture the covered write counter
+  before draining, under allocator and semantic-publication exclusion, and
+  acknowledge it only after the full superblock sync. Saturated counters remain
+  conservatively dirty. Direct library calls and orphan finalization have the
+  same contract as managed requests; reads do not create completion epochs.
 - Native/MVCC journal coordination: journal replay is still supported for
   mounting dirty ext4 images, and write-side journaling is real when a
   JBD2-compatible journal is configured. `Jbd2Writer::begin_transaction()` and

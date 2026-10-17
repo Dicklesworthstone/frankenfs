@@ -160,6 +160,12 @@ the filesystem-format targets or complete default repair acceptance.
 Explicit sidecar-protected writable mounts share the ordinary periodic filesystem
 commit worker (5 seconds ext4, 30 seconds btrfs, configurable or disabled), so
 successful timer boundaries also refresh their protection without caller fsync.
+The original `bd-dj725` acceptance also requires pressure boundaries independent
+of the timer. Btrfs's data-write/COW-allocation budget defaults to 128 MiB and is
+configurable through `FFS_BTRFS_DIRTY_BYTES_THRESHOLD`; failed final syncs must
+retain debt for retry. Direct library and orphan-finalization paths share this
+contract. Source implementation alone does not complete the mounted pressure,
+retry and configured RSS evidence requirements.
 Historical `bd-rchk6` closure does not establish that storage contract. Xfstests,
 mounted CI, and performance baselines remain tracked separately.
 

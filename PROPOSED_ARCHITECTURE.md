@@ -98,6 +98,19 @@
 > native storage and restart/default activation remain separate unmet parts of
 > the original lifecycle target.
 
+> **Dirty-state boundaries (`bd-dj725`):** completed mutation guards publish
+> dirt after mutation work and release the gate before testing pressure. Managed
+> request completion, direct library mutation, unmanaged trait calls and orphan
+> finalization feed the same boundary. Btrfs combines installed data-write bytes
+> with checkpointed COW allocation debt across all native trees and extra
+> subvolumes. Its default pressure budget is 128 MiB, configurable through
+> `FFS_BTRFS_DIRTY_BYTES_THRESHOLD` (zero disables pressure independently of the
+> timer). Full commit holds recursive semantic-read and allocator-write guards,
+> captures the covered data count before draining, and acknowledges both debts
+> only after final superblock sync. Failed commits retain retryable debt and
+> extra subvolume trees. Counters saturate conservatively; this is a dirty-write
+> budget, not an exact resident-memory measurement.
+
 > **Protected mount workers (`bd-11a8t`):** the CLI-private
 > `mount_worker` module shares that child-region and completion-drain ownership
 > with `ffs-protected-mount`. Writable protected mounts also start the same

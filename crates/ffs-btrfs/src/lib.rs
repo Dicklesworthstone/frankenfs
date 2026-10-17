@@ -3733,6 +3733,9 @@ pub struct InMemoryCowBtrfsTree {
     allocator: Box<dyn BtrfsAllocator>,
     deferred_frees: Vec<u64>,
     staged_allocations: Vec<u64>,
+    /// Nodes allocated by successful mutations since the last durable baseline.
+    /// Includes superseded nodes conservatively; request commits do not clear it.
+    pending_allocated_nodes: u64,
     staged_deferred_frees: Vec<u64>,
     /// Block ids retired by the PREVIOUS committed batch, retained for exactly
     /// one generation so the immediately-previous version stays readable via
@@ -3760,6 +3763,7 @@ pub struct CowCheckpoint {
     root: u64,
     prev_committed_retired: Vec<u64>,
     deferred_frees_len: usize,
+    pending_allocated_nodes: u64,
 }
 
 impl InMemoryCowBtrfsTree {
@@ -3793,6 +3797,7 @@ impl InMemoryCowBtrfsTree {
             allocator,
             deferred_frees: Vec::new(),
             staged_allocations: Vec::new(),
+            pending_allocated_nodes: 0,
             staged_deferred_frees: Vec::new(),
             prev_committed_retired: Vec::new(),
             nodes,
@@ -3818,6 +3823,7 @@ impl InMemoryCowBtrfsTree {
             root: self.root,
             prev_committed_retired: self.prev_committed_retired.clone(),
             deferred_frees_len: self.deferred_frees.len(),
+            pending_allocated_nodes: self.pending_allocated_nodes,
         }
     }
 
@@ -3834,6 +3840,7 @@ impl InMemoryCowBtrfsTree {
         self.root = checkpoint.root;
         self.prev_committed_retired = checkpoint.prev_committed_retired;
         self.deferred_frees.truncate(checkpoint.deferred_frees_len);
+        self.pending_allocated_nodes = checkpoint.pending_allocated_nodes;
     }
 
     /// Keep everything done since the checkpoint and resume eviction: the
@@ -3844,6 +3851,21 @@ impl InMemoryCowBtrfsTree {
                 self.nodes.remove(&block);
             }
         }
+    }
+
+    /// Conservative count of nodes allocated by successful mutations since the
+    /// last baseline. Failed mutations and rolled-back checkpoints add no debt.
+    #[must_use]
+    pub const fn pending_allocated_node_count(&self) -> u64 {
+        self.pending_allocated_nodes
+    }
+
+    /// Establish a baseline after loading already-durable tree contents, or
+    /// after the full filesystem commit's final superblock sync succeeds.
+    /// A request commit, tree serialization, or failed durability attempt must
+    /// not reset this debt. The caller must exclude concurrent tree mutations.
+    pub fn reset_pending_allocated_node_count(&mut self) {
+        self.pending_allocated_nodes = 0;
     }
 
     /// Set the per-node serialized-byte budget (`nodesize - BTRFS_HEADER_SIZE`)
@@ -4020,6 +4042,9 @@ impl InMemoryCowBtrfsTree {
     }
 
     fn commit_allocated_nodes(&mut self) {
+        self.pending_allocated_nodes = self
+            .pending_allocated_nodes
+            .saturating_add(u64::try_from(self.staged_allocations.len()).unwrap_or(u64::MAX));
         self.staged_allocations.clear();
     }
 
@@ -15357,6 +15382,108 @@ mod tests {
             offset: u64::MAX,
         };
         tree.range(&lo, &hi).expect("range")
+    }
+
+    #[test]
+    fn cow_pending_allocated_nodes_count_committed_batches_once_bd_dj725() {
+        let mut tree = InMemoryCowBtrfsTree::new(6).expect("tree");
+        assert_eq!(tree.pending_allocated_node_count(), 0);
+        tree.insert_many(
+            [1, 2, 3]
+                .into_iter()
+                .map(|objectid| BtrfsTreeItem {
+                    key: test_key(objectid),
+                    data: vec![0x42].into(),
+                })
+                .collect(),
+            false,
+        )
+        .expect("one leaf allocated for the whole batch");
+        assert_eq!(tree.pending_allocated_node_count(), 1);
+        tree.insert_many(Vec::new(), false).expect("empty batch");
+        assert_eq!(tree.pending_allocated_node_count(), 1);
+        tree.update(&test_key(1), b"updated").expect("update");
+        assert_eq!(tree.pending_allocated_node_count(), 2);
+        tree.remove_many(&[test_key(2), test_key(3)])
+            .expect("one leaf allocated for both removals");
+        assert_eq!(tree.pending_allocated_node_count(), 3);
+        assert_eq!(
+            tree.find(&test_key(1)).expect("retained item"),
+            Some(b"updated".to_vec())
+        );
+        tree.reset_pending_allocated_node_count();
+        assert_eq!(tree.pending_allocated_node_count(), 0);
+        tree.update(&test_key(1), b"later").expect("later update");
+        assert_eq!(tree.pending_allocated_node_count(), 1);
+        tree.validate_invariants().expect("invariants");
+    }
+
+    #[test]
+    fn cow_pending_allocated_nodes_follow_checkpoint_outcome_bd_dj725() {
+        let mut tree = InMemoryCowBtrfsTree::new(6).expect("tree");
+        tree.insert(test_key(1), b"seed").expect("seed");
+        assert_eq!(tree.pending_allocated_node_count(), 1);
+        let before = tree_items(&tree);
+        let checkpoint = tree.checkpoint();
+        tree.insert(test_key(2), b"rolled back").expect("insert");
+        tree.update(&test_key(1), b"rolled back").expect("update");
+        assert_eq!(tree.pending_allocated_node_count(), 3);
+        tree.rollback_to(checkpoint);
+        assert_eq!(tree.pending_allocated_node_count(), 1);
+        assert_eq!(tree_items(&tree), before);
+
+        let _checkpoint = tree.checkpoint();
+        tree.insert(test_key(2), b"kept").expect("kept insert");
+        tree.release_checkpoint();
+        assert_eq!(tree.pending_allocated_node_count(), 2);
+        assert_eq!(
+            tree.find(&test_key(2)).expect("kept item"),
+            Some(b"kept".to_vec())
+        );
+        tree.reset_pending_allocated_node_count();
+        let checkpoint = tree.checkpoint();
+        tree.update(&test_key(1), b"rolled back again")
+            .expect("update");
+        assert_eq!(tree.pending_allocated_node_count(), 1);
+        tree.rollback_to(checkpoint);
+        assert_eq!(tree.pending_allocated_node_count(), 0);
+        tree.validate_invariants().expect("invariants");
+    }
+
+    #[test]
+    fn cow_pending_allocated_nodes_exclude_failed_allocations_bd_dj725() {
+        let (mut tree, allocator_state) = cow_tree_with_shared_allocator();
+        for objectid in [10_u64, 20, 30, 40] {
+            tree.insert(test_key(objectid), &test_payload(objectid))
+                .expect("seed");
+        }
+        assert_eq!(tree.height().expect("height"), 2);
+        tree.reset_pending_allocated_node_count();
+        let before = tree_items(&tree);
+        let deferred_before = allocator_deferred_len(&allocator_state);
+        set_allocator_remaining_successes(&allocator_state, Some(1));
+        assert_eq!(
+            tree.update(&test_key(20), b"updated"),
+            Err(BtrfsMutationError::BrokenInvariant(
+                "injected allocation failure"
+            ))
+        );
+        set_allocator_remaining_successes(&allocator_state, None);
+        assert_allocator_deferred_delta(&allocator_state, deferred_before, 1);
+        assert_eq!(tree.pending_allocated_node_count(), 0);
+        assert_eq!(tree_items(&tree), before);
+        tree.update(&test_key(20), b"updated").expect("retry");
+        assert_eq!(tree.pending_allocated_node_count(), 2);
+        assert_eq!(
+            tree.insert(test_key(20), b"duplicate"),
+            Err(BtrfsMutationError::KeyAlreadyExists)
+        );
+        assert_eq!(tree.pending_allocated_node_count(), 2);
+        assert_eq!(
+            tree.find(&test_key(20)).expect("updated item"),
+            Some(b"updated".to_vec())
+        );
+        tree.validate_invariants().expect("invariants");
     }
 
     /// bd-x4h1q: after hundreds of mutations (enough that every node of the

@@ -2411,6 +2411,41 @@ struct BtrfsAllocState {
 }
 
 impl BtrfsAllocState {
+    fn pending_metadata_bytes(&self) -> u64 {
+        let nodes = [
+            &self.fs_tree,
+            &self.root_tree,
+            &self.csum_tree,
+            &self.chunk_tree,
+            &self.dev_tree,
+            self.extent_alloc.extent_tree(),
+        ]
+        .into_iter()
+        .chain(self.extra_subvol_trees.iter().map(|(_, tree)| tree))
+        .fold(0_u64, |total, tree| {
+            total.saturating_add(tree.pending_allocated_node_count())
+        });
+        nodes.saturating_mul(u64::from(self.nodesize))
+    }
+
+    fn reset_pending_metadata(&mut self) {
+        for tree in [
+            &mut self.fs_tree,
+            &mut self.root_tree,
+            &mut self.csum_tree,
+            &mut self.chunk_tree,
+            &mut self.dev_tree,
+        ] {
+            tree.reset_pending_allocated_node_count();
+        }
+        self.extent_alloc
+            .extent_tree_mut()
+            .reset_pending_allocated_node_count();
+        for (_, tree) in &mut self.extra_subvol_trees {
+            tree.reset_pending_allocated_node_count();
+        }
+    }
+
     /// bd-a136s: a DATA allocation hit `NoSpace` — grow one data chunk from
     /// unallocated device space (the kernel-btrfs behaviour) and report
     /// whether the failed allocation is worth retrying.
@@ -2758,6 +2793,10 @@ pub struct OpenFs {
     mutation_epoch: std::sync::atomic::AtomicU64,
     /// `mutation_epoch` value covered by the last periodic commit (bd-dj725).
     committed_mutation_epoch: std::sync::atomic::AtomicU64,
+    /// Btrfs pressure budget for committed data writes and pending COW-node
+    /// allocations. A successful full superblock sync acknowledges this debt.
+    btrfs_dirty_bytes_threshold: AtomicU64,
+    btrfs_block_writes_at_boundary: AtomicU64,
     /// Journal-pressure commit threshold in committed MVCC block writes
     /// (bd-1o6tq); 0 while no JBD2 writer is attached.
     jbd2_pressure_limit: std::sync::atomic::AtomicU64,
@@ -3449,6 +3488,10 @@ struct ReaddirSnapshot {
 /// a 4 KiB block size (bd-dj725).
 pub const DEFAULT_MVCC_RESIDENT_BLOCK_CAP: usize = 32_768;
 
+/// Default btrfs dirty-write budget before a completed mutation forces the
+/// normal durability boundary (128 MiB, bd-dj725).
+pub const DEFAULT_BTRFS_DIRTY_BYTES_THRESHOLD: u64 = 128 * 1024 * 1024;
+
 /// State of [`OpenFs::mutation_gate`] (bd-9rutw).
 #[derive(Debug, Default)]
 struct MutationGateState {
@@ -3461,11 +3504,22 @@ struct MutationGateState {
 
 /// Library-path RAII for the mutation gate (FUSE requests enter and leave it
 /// in `begin_request_scope` / `end_request_scope`).
-pub(crate) struct MutationGateGuard<'a>(&'a OpenFs);
+pub(crate) struct MutationGateGuard<'a> {
+    fs: &'a OpenFs,
+    pressure_cx: Option<&'a Cx>,
+}
 
 impl Drop for MutationGateGuard<'_> {
     fn drop(&mut self) {
-        self.0.leave_mutation_gate();
+        // Publish after the guarded mutations, including partial-error paths,
+        // before a waiting durability boundary can capture their final state.
+        self.fs.mutation_epoch.fetch_add(1, Ordering::AcqRel);
+        self.fs.leave_mutation_gate();
+        if MUTATION_GATE_DEPTH.get() == 0
+            && let Some(cx) = self.pressure_cx
+        {
+            self.fs.commit_on_dirty_pressure(cx);
+        }
     }
 }
 
@@ -7546,6 +7600,8 @@ impl OpenFs {
             mvcc_flushed_through: Mutex::new(CommitSeq(0)),
             mutation_epoch: std::sync::atomic::AtomicU64::new(0),
             committed_mutation_epoch: std::sync::atomic::AtomicU64::new(0),
+            btrfs_dirty_bytes_threshold: AtomicU64::new(DEFAULT_BTRFS_DIRTY_BYTES_THRESHOLD),
+            btrfs_block_writes_at_boundary: AtomicU64::new(0),
             jbd2_pressure_limit: std::sync::atomic::AtomicU64::new(0),
             jbd2_block_writes_at_boundary: std::sync::atomic::AtomicU64::new(0),
             mvcc_resident_block_cap: std::sync::atomic::AtomicUsize::new(
@@ -11715,7 +11771,7 @@ impl OpenFs {
         self.jbd2_pressure_limit
             .store(limit, std::sync::atomic::Ordering::Release);
         self.jbd2_block_writes_at_boundary.store(
-            self.mvcc_store.committed_block_writes().unwrap_or(0),
+            self.mvcc_store.committed_block_writes(),
             std::sync::atomic::Ordering::Release,
         );
         self.jbd2_writer = Some(Mutex::new(writer));
@@ -11806,9 +11862,7 @@ impl OpenFs {
         if limit == 0 {
             return;
         }
-        let Some(written) = self.mvcc_store.committed_block_writes() else {
-            return;
-        };
+        let written = self.mvcc_store.committed_block_writes();
         let pending = written.saturating_sub(
             self.jbd2_block_writes_at_boundary
                 .load(std::sync::atomic::Ordering::Acquire),
@@ -11830,6 +11884,73 @@ impl OpenFs {
                 limit,
                 %error,
                 "journal_pressure_commit_failed"
+            ),
+        }
+    }
+
+    /// Configure btrfs's conservative pending-data/COW-allocation budget.
+    /// Zero disables pressure commits; the periodic timer remains independent.
+    pub fn set_btrfs_dirty_bytes_threshold(&self, bytes: u64) {
+        self.btrfs_dirty_bytes_threshold
+            .store(bytes, Ordering::Release);
+    }
+
+    fn btrfs_pending_dirty_bytes(&self) -> u64 {
+        let Some(alloc) = &self.btrfs_alloc_state else {
+            return 0;
+        };
+        let alloc = alloc.read();
+        let written = self.mvcc_store.committed_block_writes();
+        let covered = self.btrfs_block_writes_at_boundary.load(Ordering::Acquire);
+        // Saturation must stay conservatively dirty, including when the last
+        // acknowledged counter also reached MAX; subtraction would hide writes.
+        let data_bytes = if written == u64::MAX {
+            u64::MAX
+        } else {
+            written
+                .saturating_sub(covered)
+                .saturating_mul(u64::from(self.block_size()))
+        };
+        data_bytes.saturating_add(alloc.pending_metadata_bytes())
+    }
+
+    /// Run only after the outermost mutation and its semantic/allocator guards
+    /// have released. A request has already completed, so retain debt and log a
+    /// failed boundary rather than replacing the request's result.
+    pub(crate) fn commit_on_dirty_pressure(&self, cx: &Cx) {
+        if std::thread::panicking()
+            || MUTATION_GATE_DEPTH.get() != 0
+            || cx.checkpoint().is_err()
+            || !self.is_writable()
+        {
+            return;
+        }
+        if self.btrfs_alloc_state.is_none() {
+            self.ext4_commit_on_journal_pressure(cx);
+            return;
+        }
+        let limit = self.btrfs_dirty_bytes_threshold.load(Ordering::Acquire);
+        if limit == 0 {
+            return;
+        }
+        let pending_bytes = self.btrfs_pending_dirty_bytes();
+        if pending_bytes < limit {
+            return;
+        }
+        match self.periodic_commit(cx) {
+            Ok(committed) => info!(
+                target: "ffs::btrfs::writeback",
+                pending_bytes,
+                limit,
+                committed,
+                "btrfs_pressure_commit"
+            ),
+            Err(error) => warn!(
+                target: "ffs::btrfs::writeback",
+                pending_bytes,
+                limit,
+                %error,
+                "btrfs_pressure_commit_failed"
             ),
         }
     }
@@ -12292,12 +12413,17 @@ impl OpenFs {
             FsFlavor::Ext4(_) => {
                 self.mvcc_store.current_snapshot().high > *self.mvcc_flushed_through.lock()
             }
-            FsFlavor::Btrfs(_) => false,
+            FsFlavor::Btrfs(_) => self.btrfs_pending_dirty_bytes() != 0,
         };
         if !epoch_dirty && !mvcc_dirty {
             return Ok(false);
         }
-        self.fsync(cx, InodeNumber(1), 0, false)?;
+        match &self.flavor {
+            FsFlavor::Ext4(_) => self.fsync(cx, InodeNumber(1), 0, false)?,
+            FsFlavor::Btrfs(_) => {
+                self.btrfs_full_transaction_commit(cx, "periodic-commit")?;
+            }
+        }
         self.committed_mutation_epoch
             .fetch_max(epoch, Ordering::AcqRel);
         Ok(true)
@@ -13406,7 +13532,7 @@ impl OpenFs {
             }
         }
 
-        Ok(BtrfsAllocState {
+        let mut state = BtrfsAllocState {
             commit_refused: false,
             root_tree,
             fs_tree,
@@ -13438,7 +13564,11 @@ impl OpenFs {
             btrfs_tree_log_has_deletions: false,
             // No tree log published yet (bd-0ajub).
             btrfs_live_log_blocks: Vec::new(),
-        })
+        };
+        // Loading durable items uses the same COW operations as mutations.
+        // Establish the mount baseline before charging new dirty metadata.
+        state.reset_pending_metadata();
+        Ok(state)
     }
 
     /// Require the btrfs alloc state to be present (i.e., writes enabled).
@@ -27155,10 +27285,8 @@ impl OpenFs {
         if quiesced {
             self.evict_durable_mvcc_chains(durable_through);
         }
-        if let Some(writes) = writes_before {
-            self.jbd2_block_writes_at_boundary
-                .fetch_max(writes, std::sync::atomic::Ordering::AcqRel);
-        }
+        self.jbd2_block_writes_at_boundary
+            .fetch_max(writes_before, std::sync::atomic::Ordering::AcqRel);
         Ok(Some((flushed, durable_through)))
     }
 
@@ -39857,6 +39985,9 @@ impl OpenFs {
         cx: &Cx,
         operation_id: &str,
     ) -> ffs_error::Result<BtrfsWritebackStats> {
+        // Recursive semantic readers are supported. Hold this exclusion here,
+        // including private/native callers, before sampling installed writes.
+        let _view = self.btrfs_semantic_view_guard()?;
         let alloc_mutex = self.require_btrfs_alloc_state()?;
         let mut alloc = alloc_mutex.write();
         let snapshot = BtrfsCommitSnapshot::take(&mut alloc, self);
@@ -39866,8 +39997,14 @@ impl OpenFs {
         let mut durable = false;
         let result =
             self.btrfs_commit_locked(cx, operation_id, &mut alloc, &subvol_trees, &mut durable);
-        if result.is_err() && !durable {
-            snapshot.restore(&mut alloc, self);
+        if result.is_err() {
+            if durable {
+                snapshot.release(&mut alloc);
+            } else {
+                snapshot.restore(&mut alloc, self);
+            }
+            // A failed final sync cannot acknowledge or discard extra-tree
+            // debt, even if the superblock write has already started.
             alloc.extra_subvol_trees = subvol_trees;
         } else {
             snapshot.release(&mut alloc);
@@ -39893,6 +40030,7 @@ impl OpenFs {
         subvol_trees: &[(u64, InMemoryCowBtrfsTree)],
         durable: &mut bool,
     ) -> ffs_error::Result<BtrfsWritebackStats> {
+        let started = std::time::Instant::now();
         // The subvolume this commit publishes (5 unless --subvol/--snapshot).
         let fs_root = alloc.fs_root_objectid;
 
@@ -39913,6 +40051,11 @@ impl OpenFs {
         // then makes both data and tree nodes durable. A failed drain must leave
         // the old generation and tree publication state intact.
         let base_dev = self.direct_block_device_adapter();
+        // The allocator excludes native data writers and the caller's semantic
+        // read guard excludes raw publication. Capture BEFORE draining: sharded
+        // installation precedes publication, so a later sample is not proof
+        // that the flushed snapshot covered those writes.
+        let data_writes_at_boundary = self.mvcc_store.committed_block_writes();
         let flushed_data_blocks = self.flush_mvcc_versions_to_device(cx, &base_dev)?;
 
         let current_gen = alloc.generation;
@@ -41763,6 +41906,10 @@ impl OpenFs {
         // Final fsync to ensure superblock is durable
         self.dev.sync(cx)?;
 
+        alloc.reset_pending_metadata();
+        self.btrfs_block_writes_at_boundary
+            .fetch_max(data_writes_at_boundary, Ordering::AcqRel);
+
         // The durable commit now contains the mount-time replay and no longer
         // names its source log. Disable the overlay only after that same sync;
         // otherwise a failed commit could hide acknowledged data (bd-jhuob).
@@ -41803,6 +41950,8 @@ impl OpenFs {
             nodes_written,
             bytes_written,
             new_gen,
+            flushed_data_blocks,
+            duration_secs = started.elapsed().as_secs_f64(),
             "full_transaction_committed"
         );
 
@@ -42569,6 +42718,7 @@ impl OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<u64> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         if self.btrfs_context().is_none() {
             return Err(FfsError::UnsupportedFeature(
@@ -42591,6 +42741,7 @@ impl OpenFs {
         parent: InodeNumber,
         name: &[u8],
     ) -> ffs_error::Result<u64> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         if self.btrfs_context().is_none() {
             return Err(FfsError::UnsupportedFeature(
@@ -46568,7 +46719,7 @@ impl OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
-        let _gate = self.mutation_gate_guard();
+        let _gate = self.mutation_gate_guard_with_pressure(cx);
         let gen_before = self.namespace_gen_now();
         let result = self.handle_ext4_write_result(
             "create",
@@ -46711,7 +46862,23 @@ impl OpenFs {
 
     pub(crate) fn mutation_gate_guard(&self) -> MutationGateGuard<'_> {
         self.enter_mutation_gate();
-        MutationGateGuard(self)
+        MutationGateGuard {
+            fs: self,
+            pressure_cx: None,
+        }
+    }
+
+    /// Declare before semantic-view or allocator guards, so they are released
+    /// before this completed mutation can force a durability boundary.
+    pub(crate) fn mutation_gate_guard_with_pressure<'a>(
+        &'a self,
+        cx: &'a Cx,
+    ) -> MutationGateGuard<'a> {
+        self.enter_mutation_gate();
+        MutationGateGuard {
+            fs: self,
+            pressure_cx: Some(cx),
+        }
     }
 
     /// Close only an already quiescent gate, without waiting on a request
@@ -46779,7 +46946,7 @@ impl OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
-        let _gate = self.mutation_gate_guard();
+        let _gate = self.mutation_gate_guard_with_pressure(cx);
         let gen_before = self.namespace_gen_now();
         let result = self.handle_ext4_write_result(
             "mknod",
@@ -46804,7 +46971,7 @@ impl OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
-        let _gate = self.mutation_gate_guard();
+        let _gate = self.mutation_gate_guard_with_pressure(cx);
         let gen_before = self.namespace_gen_now();
         let result = self.handle_ext4_write_result(
             "mkdir",
@@ -46822,7 +46989,7 @@ impl OpenFs {
     }
 
     pub fn unlink(&self, cx: &Cx, parent: InodeNumber, name: &OsStr) -> ffs_error::Result<()> {
-        let _gate = self.mutation_gate_guard();
+        let _gate = self.mutation_gate_guard_with_pressure(cx);
         self.handle_ext4_write_result(
             "unlink",
             self.with_latest_scope(|scope| <Self as FsOps>::unlink(self, cx, scope, parent, name)),
@@ -46840,13 +47007,14 @@ impl OpenFs {
         cx: &Cx,
         ino: InodeNumber,
     ) -> ffs_error::Result<bool> {
+        let _gate = self.mutation_gate_guard_with_pressure(cx);
         self.with_latest_scope(|scope| {
             <Self as FsOps>::finalize_unlinked_inode(self, cx, scope, ino)
         })
     }
 
     pub fn rmdir(&self, cx: &Cx, parent: InodeNumber, name: &OsStr) -> ffs_error::Result<()> {
-        let _gate = self.mutation_gate_guard();
+        let _gate = self.mutation_gate_guard_with_pressure(cx);
         self.handle_ext4_write_result(
             "rmdir",
             self.with_latest_scope(|scope| <Self as FsOps>::rmdir(self, cx, scope, parent, name)),
@@ -46861,7 +47029,7 @@ impl OpenFs {
         new_parent: InodeNumber,
         new_name: &OsStr,
     ) -> ffs_error::Result<()> {
-        let _gate = self.mutation_gate_guard();
+        let _gate = self.mutation_gate_guard_with_pressure(cx);
         let gen_before = self.namespace_gen_now();
         self.handle_ext4_write_result(
             "rename",
@@ -46895,7 +47063,7 @@ impl OpenFs {
         };
         // Library writes bypass `end_request_scope`, where the FUSE path runs
         // this; data volume is what fills a journal (bd-1o6tq).
-        self.ext4_commit_on_journal_pressure(cx);
+        self.commit_on_dirty_pressure(cx);
         Ok(written)
     }
 
@@ -46907,7 +47075,7 @@ impl OpenFs {
         value: &[u8],
         mode: XattrSetMode,
     ) -> ffs_error::Result<()> {
-        let _gate = self.mutation_gate_guard();
+        let _gate = self.mutation_gate_guard_with_pressure(cx);
         self.handle_ext4_write_result(
             "setxattr",
             self.with_latest_scope(|scope| {
@@ -46917,7 +47085,7 @@ impl OpenFs {
     }
 
     pub fn removexattr(&self, cx: &Cx, ino: InodeNumber, name: &str) -> ffs_error::Result<bool> {
-        let _gate = self.mutation_gate_guard();
+        let _gate = self.mutation_gate_guard_with_pressure(cx);
         self.handle_ext4_write_result(
             "removexattr",
             self.with_latest_scope(|scope| {
@@ -46966,7 +47134,7 @@ impl OpenFs {
         length: u64,
         mode: i32,
     ) -> ffs_error::Result<()> {
-        let _gate = self.mutation_gate_guard();
+        let _gate = self.mutation_gate_guard_with_pressure(cx);
         self.handle_ext4_write_result(
             "fallocate",
             self.with_latest_scope(|scope| {
@@ -47387,7 +47555,7 @@ impl OpenFs {
         new_parent: InodeNumber,
         new_name: &OsStr,
     ) -> ffs_error::Result<InodeAttr> {
-        let _gate = self.mutation_gate_guard();
+        let _gate = self.mutation_gate_guard_with_pressure(cx);
         let gen_before = self.namespace_gen_now();
         let result = self.handle_ext4_write_result(
             "link",
@@ -47416,7 +47584,7 @@ impl OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
-        let _gate = self.mutation_gate_guard();
+        let _gate = self.mutation_gate_guard_with_pressure(cx);
         let gen_before = self.namespace_gen_now();
         let result = self.handle_ext4_write_result(
             "symlink",
@@ -47441,7 +47609,7 @@ impl OpenFs {
         ino: InodeNumber,
         attrs: &SetAttrRequest,
     ) -> ffs_error::Result<InodeAttr> {
-        let _gate = self.mutation_gate_guard();
+        let _gate = self.mutation_gate_guard_with_pressure(cx);
         self.handle_ext4_write_result(
             "setattr",
             self.with_latest_scope(|scope| <Self as FsOps>::setattr(self, cx, scope, ino, attrs)),
@@ -100447,6 +100615,466 @@ mod tests {
                 ok,
                 "btrfs check must accept a tick-committed image:\n{output}"
             );
+        }
+    }
+
+    #[test]
+    fn btrfs_dirty_publication_direct_and_unmanaged_periodic_bd_dj725() {
+        let Some((fs, dev, _tmp, image)) = open_writable_btrfs_mkfs(256) else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let payload = [0x4D_u8; 4096];
+        assert!(fs.mvcc_store.is_sharded(), "exercise the default store");
+        fs.set_btrfs_dirty_bytes_threshold(0);
+        assert!(!fs.periodic_commit(&cx).expect("initial idle tick"));
+        for unmanaged in [false, true] {
+            let name = OsStr::new(if unmanaged { "trait.bin" } else { "direct.bin" });
+            let before = fs.require_btrfs_alloc_state().unwrap().read().generation;
+            let file = if unmanaged {
+                FsOps::create(
+                    &fs,
+                    &cx,
+                    &mut RequestScope::empty(),
+                    root,
+                    name,
+                    0o644,
+                    0,
+                    0,
+                )
+            } else {
+                fs.create(&cx, root, name, 0o644, 0, 0)
+            }
+            .expect("create without a managed request");
+            let written = if unmanaged {
+                FsOps::write(&fs, &cx, &mut RequestScope::empty(), file.ino, 0, &payload)
+            } else {
+                fs.write(&cx, file.ino, 0, &payload)
+            }
+            .expect("write without a managed request");
+            assert_eq!(written, 4096);
+            assert!(fs.btrfs_pending_dirty_bytes() > 0);
+            assert!(fs.periodic_commit(&cx).expect("commit direct mutation"));
+            assert_eq!(fs.btrfs_pending_dirty_bytes(), 0);
+            let committed = dev.snapshot_bytes();
+            let generation = BtrfsSuperblock::parse_from_image(&committed)
+                .unwrap()
+                .generation;
+            assert!(generation > before);
+            let reopened = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(committed)),
+                &OpenOptions::default(),
+            )
+            .expect("reopen committed direct mutation");
+            let durable = reopened.lookup(&cx, root, name).expect("durable name");
+            assert_eq!(reopened.read(&cx, durable.ino, 0, 4096).unwrap(), payload);
+            assert_eq!(fs.lookup(&cx, root, name).unwrap().ino, file.ino);
+            assert_eq!(fs.getattr(&cx, file.ino).unwrap().size, 4096);
+            assert_eq!(fs.read(&cx, file.ino, 0, 4096).unwrap(), payload);
+            fs.readdir(&cx, root, 0).expect("idle directory read");
+            assert!(!fs.periodic_commit(&cx).expect("idle read tick"));
+            assert_eq!(
+                fs.require_btrfs_alloc_state().unwrap().read().generation,
+                generation
+            );
+        }
+        std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+        if let Some((ok, output)) = run_btrfs_check(&image) {
+            assert!(ok, "direct publication image: {output}");
+        }
+    }
+
+    #[test]
+    fn btrfs_dirty_publication_metadata_pressure_boundary_bd_dj725() {
+        let Some((fs, dev, _tmp, _image)) = open_writable_btrfs_mkfs(256) else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        fs.set_btrfs_dirty_bytes_threshold(u64::MAX);
+        assert_eq!(fs.btrfs_pending_dirty_bytes(), 0);
+        let before = fs.require_btrfs_alloc_state().unwrap().read().generation;
+        fs.create(&cx, root, OsStr::new("exact"), 0o644, 0, 0)
+            .unwrap();
+        let metadata = fs
+            .require_btrfs_alloc_state()
+            .unwrap()
+            .read()
+            .pending_metadata_bytes();
+        assert!(metadata > 0);
+        assert_eq!(fs.mvcc_store.committed_block_writes(), 0, "metadata only");
+        assert_eq!(fs.btrfs_pending_dirty_bytes(), metadata);
+        assert_eq!(
+            fs.require_btrfs_alloc_state().unwrap().read().generation,
+            before
+        );
+        fs.set_btrfs_dirty_bytes_threshold(metadata + 1);
+        fs.commit_on_dirty_pressure(&cx);
+        assert_eq!(
+            fs.require_btrfs_alloc_state().unwrap().read().generation,
+            before
+        );
+        assert_eq!(fs.btrfs_pending_dirty_bytes(), metadata);
+        fs.set_btrfs_dirty_bytes_threshold(metadata);
+        fs.commit_on_dirty_pressure(&cx);
+        assert!(fs.require_btrfs_alloc_state().unwrap().read().generation > before);
+        assert_eq!(fs.btrfs_pending_dirty_bytes(), 0);
+        fs.set_btrfs_dirty_bytes_threshold(1);
+        for unmanaged in [false, true] {
+            let name = OsStr::new(if unmanaged {
+                "auto-trait"
+            } else {
+                "auto-direct"
+            });
+            let generation = fs.require_btrfs_alloc_state().unwrap().read().generation;
+            if unmanaged {
+                FsOps::create(
+                    &fs,
+                    &cx,
+                    &mut RequestScope::empty(),
+                    root,
+                    name,
+                    0o644,
+                    0,
+                    0,
+                )
+            } else {
+                fs.create(&cx, root, name, 0o644, 0, 0)
+            }
+            .expect("threshold-one metadata mutation");
+            assert!(fs.require_btrfs_alloc_state().unwrap().read().generation > generation);
+            assert_eq!(fs.btrfs_pending_dirty_bytes(), 0);
+        }
+        assert_eq!(fs.mvcc_store.committed_block_writes(), 0);
+        let reopened = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(dev.snapshot_bytes())),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        for name in ["exact", "auto-direct", "auto-trait"] {
+            assert_eq!(
+                reopened.lookup(&cx, root, OsStr::new(name)).unwrap().size,
+                0
+            );
+        }
+        assert!(!fs.periodic_commit(&cx).expect("idle metadata tick"));
+    }
+
+    #[test]
+    fn btrfs_dirty_publication_data_pressure_boundary_bd_dj725() {
+        let Some((fs, dev, _tmp, _image)) = open_writable_btrfs_mkfs(256) else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let payload = [0x6B_u8; 4096];
+        fs.set_btrfs_dirty_bytes_threshold(0);
+        let file = fs
+            .create(&cx, root, OsStr::new("data"), 0o644, 0, 0)
+            .unwrap();
+        fs.write(&cx, file.ino, 0, &payload).unwrap();
+        assert!(fs.periodic_commit(&cx).unwrap());
+        assert_eq!(fs.btrfs_pending_dirty_bytes(), 0);
+        assert!(fs.mvcc_store.is_sharded());
+        let extents = fs.btrfs_fiemap(&cx, file.ino, 0, 4096).unwrap();
+        assert_eq!(extents.len(), 1);
+        assert!(extents[0].physical > 0, "regular mapped payload");
+        let covered = fs.btrfs_block_writes_at_boundary.load(Ordering::Acquire);
+        // Rewrite identical payload bytes through the normal mapped MVCC
+        // adapter, leaving the COW trees and their checksums unchanged.
+        fs.btrfs_write_logical(&cx, extents[0].physical, &payload)
+            .unwrap();
+        let once = fs.mvcc_store.committed_block_writes();
+        assert!(once > covered);
+        let tracked = fs.mvcc_store.tracked_block_count();
+        fs.btrfs_write_logical(&cx, extents[0].physical, &payload)
+            .unwrap();
+        let written = fs.mvcc_store.committed_block_writes();
+        assert_eq!(
+            written - once,
+            once - covered,
+            "count repeated writes to the same block"
+        );
+        assert_eq!(fs.mvcc_store.tracked_block_count(), tracked);
+        assert_eq!(
+            fs.require_btrfs_alloc_state()
+                .unwrap()
+                .read()
+                .pending_metadata_bytes(),
+            0
+        );
+        let debt = (written - covered) * u64::from(fs.block_size());
+        assert_eq!(fs.btrfs_pending_dirty_bytes(), debt);
+        let before = fs.require_btrfs_alloc_state().unwrap().read().generation;
+        fs.set_btrfs_dirty_bytes_threshold(debt + 1);
+        fs.commit_on_dirty_pressure(&cx);
+        assert_eq!(
+            fs.require_btrfs_alloc_state().unwrap().read().generation,
+            before
+        );
+        assert_eq!(
+            fs.btrfs_block_writes_at_boundary.load(Ordering::Acquire),
+            covered
+        );
+        assert_eq!(fs.btrfs_pending_dirty_bytes(), debt);
+        fs.set_btrfs_dirty_bytes_threshold(debt);
+        fs.commit_on_dirty_pressure(&cx);
+        assert!(fs.require_btrfs_alloc_state().unwrap().read().generation > before);
+        assert_eq!(
+            fs.btrfs_block_writes_at_boundary.load(Ordering::Acquire),
+            written
+        );
+        assert_eq!(fs.btrfs_pending_dirty_bytes(), 0);
+        let reopened = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(dev.snapshot_bytes())),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(reopened.read(&cx, file.ino, 0, 4096).unwrap(), payload);
+        assert!(!fs.periodic_commit(&cx).expect("idle data tick"));
+    }
+
+    #[test]
+    fn btrfs_dirty_publication_finalization_after_unlink_commit_bd_dj725() {
+        let Some((fs, dev, _tmp, image)) = open_writable_btrfs_mkfs(256) else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let pinned_ino = Arc::new(AtomicU64::new(0));
+        let pins = Arc::new(AtomicU64::new(0));
+        let oracle_ino = Arc::clone(&pinned_ino);
+        let oracle_pins = Arc::clone(&pins);
+        fs.install_open_handle_oracle(Arc::new(move |ino| {
+            if ino.0 == oracle_ino.load(Ordering::Acquire) {
+                oracle_pins.load(Ordering::Acquire)
+            } else {
+                0
+            }
+        }));
+        for unmanaged in [false, true] {
+            fs.set_btrfs_dirty_bytes_threshold(0);
+            let name = OsStr::new(if unmanaged {
+                "forget-trait"
+            } else {
+                "forget-direct"
+            });
+            let file = fs.create(&cx, root, name, 0o644, 0, 0).unwrap();
+            fs.write(&cx, file.ino, 0, &[0x71; 4096]).unwrap();
+            pinned_ino.store(file.ino.0, Ordering::Release);
+            pins.store(1, Ordering::Release);
+            fs.unlink(&cx, root, name).unwrap();
+            assert_eq!(fs.getattr(&cx, file.ino).unwrap().nlink, 0);
+            assert!(
+                fs.periodic_commit(&cx)
+                    .expect("persist unlink before FORGET")
+            );
+            assert_eq!(fs.btrfs_pending_dirty_bytes(), 0);
+            let before = fs.require_btrfs_alloc_state().unwrap().read().generation;
+            let orphan = OpenFs::btrfs_orphan_item_key(file.ino.0);
+            assert!(
+                fs.require_btrfs_alloc_state()
+                    .unwrap()
+                    .read()
+                    .fs_tree
+                    .get(&orphan)
+                    .is_some()
+            );
+            pins.store(0, Ordering::Release);
+            fs.set_btrfs_dirty_bytes_threshold(1);
+            let reclaimed = if unmanaged {
+                FsOps::finalize_unlinked_inode(&fs, &cx, &mut RequestScope::empty(), file.ino)
+            } else {
+                fs.finalize_unlinked_inode_public(&cx, file.ino)
+            }
+            .expect("completed final reference");
+            assert!(reclaimed);
+            assert!(fs.require_btrfs_alloc_state().unwrap().read().generation > before);
+            assert_eq!(fs.btrfs_pending_dirty_bytes(), 0);
+            let reopened = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(dev.snapshot_bytes())),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            let tree = reopened
+                .btrfs_fs_tree_root_bytenr(&cx, BTRFS_FS_TREE_OBJECTID)
+                .unwrap();
+            let items = reopened.walk_btrfs_tree(&cx, tree).unwrap();
+            assert!(
+                !items.iter().any(|entry| entry.key == orphan),
+                "durable ORPHAN_ITEM removed"
+            );
+            assert!(
+                !items.iter().any(|entry| {
+                    entry.key.objectid == file.ino.0 && entry.key.item_type == BTRFS_ITEM_INODE_ITEM
+                }),
+                "durable orphan inode removed"
+            );
+            assert!(!fs.periodic_commit(&cx).expect("idle finalization tick"));
+        }
+        std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+        if let Some((ok, output)) = run_btrfs_check(&image) {
+            assert!(ok, "finalized native image: {output}");
+        }
+    }
+
+    #[test]
+    fn btrfs_dirty_publication_first_and_final_sync_retry_bd_dj725() {
+        let Some((seed_fs, seed_dev, _tmp, image)) = open_writable_btrfs_mkfs(256) else {
+            return;
+        };
+        let seed = seed_dev.snapshot_bytes();
+        drop(seed_fs);
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let payload = [0x59_u8; 8192];
+        let open = |device: &CrashDevice| {
+            let mut fs =
+                OpenFs::from_device(&cx, Box::new(device.clone()), &OpenOptions::default())
+                    .unwrap();
+            fs.enable_writes(&cx).unwrap();
+            fs.set_btrfs_dirty_bytes_threshold(0);
+            assert!(fs.mvcc_store.is_sharded());
+            fs
+        };
+        let write = |fs: &OpenFs| {
+            let file = fs
+                .create(&cx, root, OsStr::new("retry"), 0o644, 0, 0)
+                .unwrap();
+            assert_eq!(fs.write(&cx, file.ino, 0, &payload).unwrap(), 8192);
+            file.ino
+        };
+        let sync_span = {
+            let device = CrashDevice::from_vec(seed.clone());
+            let fs = open(&device);
+            write(&fs);
+            let before = device.sync_count();
+            assert!(
+                fs.periodic_commit(&cx)
+                    .expect("successful barrier-span control")
+            );
+            assert_eq!(fs.btrfs_pending_dirty_bytes(), 0);
+            device.sync_count() - before
+        };
+        assert!(sync_span >= 2, "distinct first and final sync barriers");
+        for cut in [1, sync_span] {
+            let device = CrashDevice::from_vec(seed.clone());
+            let fs = open(&device);
+            let ino = write(&fs);
+            let covered = fs.btrfs_block_writes_at_boundary.load(Ordering::Acquire);
+            let epoch = fs.committed_mutation_epoch.load(Ordering::Acquire);
+            assert!(fs.mvcc_store.committed_block_writes() > covered);
+            let failed_at = device.sync_count() + cut;
+            device.arm_sync_failure(failed_at);
+            let error = fs
+                .periodic_commit(&cx)
+                .expect_err("injected durability barrier");
+            assert!(
+                error.to_string().contains("injected sync failure"),
+                "{error}"
+            );
+            assert_eq!(device.sync_count(), failed_at, "fail the measured barrier");
+            assert_eq!(
+                fs.btrfs_block_writes_at_boundary.load(Ordering::Acquire),
+                covered
+            );
+            assert_eq!(fs.committed_mutation_epoch.load(Ordering::Acquire), epoch);
+            assert!(fs.btrfs_pending_dirty_bytes() > 0);
+            assert!(
+                fs.require_btrfs_alloc_state()
+                    .unwrap()
+                    .read()
+                    .pending_metadata_bytes()
+                    > 0
+            );
+            device.disarm();
+            assert!(
+                fs.periodic_commit(&cx)
+                    .expect("retry the unacknowledged debt")
+            );
+            assert_eq!(fs.btrfs_pending_dirty_bytes(), 0);
+            assert_eq!(
+                fs.btrfs_block_writes_at_boundary.load(Ordering::Acquire),
+                fs.mvcc_store.committed_block_writes()
+            );
+            assert!(!fs.periodic_commit(&cx).expect("idle retry tick"));
+            let durable = device.durable_bytes();
+            std::fs::write(&image, &durable).unwrap();
+            let reopened = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(durable)),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(
+                reopened.lookup(&cx, root, OsStr::new("retry")).unwrap().ino,
+                ino
+            );
+            assert_eq!(reopened.read(&cx, ino, 0, 8192).unwrap(), payload);
+            if let Some((ok, output)) = run_btrfs_check(&image) {
+                assert!(ok, "sync failure {cut} retry image: {output}");
+            }
+        }
+    }
+
+    #[test]
+    fn btrfs_dirty_publication_subvolume_and_snapshot_pressure_bd_dj725() {
+        let Some((fs, dev, _tmp, image)) = open_writable_btrfs_mkfs(256) else {
+            return;
+        };
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        fs.set_btrfs_dirty_bytes_threshold(1);
+        let before = fs.require_btrfs_alloc_state().unwrap().read().generation;
+        let subvolume = fs
+            .create_subvolume(&cx, root, b"pressure-subvol", 0, 0)
+            .unwrap();
+        let after_subvolume = fs.require_btrfs_alloc_state().unwrap().read().generation;
+        assert!(after_subvolume > before);
+        assert_eq!(fs.btrfs_pending_dirty_bytes(), 0);
+        assert_eq!(
+            fs.require_btrfs_alloc_state()
+                .unwrap()
+                .read()
+                .extra_subvol_trees
+                .len(),
+            0
+        );
+        let snapshot = fs.create_snapshot(&cx, root, b"pressure-snapshot").unwrap();
+        assert!(fs.require_btrfs_alloc_state().unwrap().read().generation > after_subvolume);
+        assert_eq!(fs.btrfs_pending_dirty_bytes(), 0);
+        assert_eq!(
+            fs.require_btrfs_alloc_state()
+                .unwrap()
+                .read()
+                .extra_subvol_trees
+                .len(),
+            0
+        );
+        let reopened = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(dev.snapshot_bytes())),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        for objectid in [subvolume, snapshot] {
+            assert!(reopened.btrfs_fs_tree_root_bytenr(&cx, objectid).unwrap() > 0);
+        }
+        for name in ["pressure-subvol", "pressure-snapshot"] {
+            assert_eq!(
+                reopened.lookup(&cx, root, OsStr::new(name)).unwrap().kind,
+                FileType::Directory
+            );
+        }
+        assert!(!fs.periodic_commit(&cx).expect("idle subvolume tick"));
+        std::fs::write(&image, dev.snapshot_bytes()).unwrap();
+        if let Some((ok, output)) = run_btrfs_check(&image) {
+            assert!(ok, "pressure-created native subvolumes: {output}");
         }
     }
 

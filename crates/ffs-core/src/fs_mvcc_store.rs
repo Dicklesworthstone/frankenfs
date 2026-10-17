@@ -349,12 +349,12 @@ impl FsMvccStore {
     }
 
     /// Blocks installed by successful commits since the store was created
-    /// (bd-1o6tq). `None` for the sharded store, which never carries a JBD2
-    /// writer (attaching one switches to the single store).
-    pub(super) fn committed_block_writes(&self) -> Option<u64> {
+    /// (bd-1o6tq, bd-dj725). Sharded installation can precede publication;
+    /// acknowledge a captured count only under the format's commit exclusion.
+    pub(super) fn committed_block_writes(&self) -> u64 {
         match self {
-            Self::Single(lock) => Some(lock.read().committed_block_writes()),
-            Self::Sharded { .. } => None,
+            Self::Single(lock) => lock.read().committed_block_writes(),
+            Self::Sharded { store, .. } => store.committed_block_writes(),
         }
     }
 

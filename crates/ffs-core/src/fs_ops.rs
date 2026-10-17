@@ -1189,6 +1189,7 @@ impl FsOps for OpenFs {
         value: &[u8],
         mode: XattrSetMode,
     ) -> ffs_error::Result<()> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         // setxattr(2): the kernel's generic syscall path rejects a value larger
         // than XATTR_SIZE_MAX (65536) with E2BIG before reaching any filesystem,
@@ -1226,6 +1227,7 @@ impl FsOps for OpenFs {
         ino: InodeNumber,
         name: &str,
     ) -> ffs_error::Result<bool> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         // An over-long name is ERANGE (kernel pre-fs check).
         Self::xattr_name_within_limit_or_erange(name)?;
@@ -1252,6 +1254,7 @@ impl FsOps for OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         self.reject_dir_entry_change(cx, scope, parent, false)?;
         let (mode, gid) = self.setgid_dir_owner(cx, scope, parent, mode, gid, false)?;
@@ -1285,6 +1288,7 @@ impl FsOps for OpenFs {
         now: std::time::SystemTime,
         strict: bool,
     ) -> ffs_error::Result<bool> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         // A nested subvolume is presented read-only (bd-2ryx9): no atime.
         if self.btrfs_nested_route(ino)?.is_some() {
@@ -1307,6 +1311,7 @@ impl FsOps for OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         self.reject_dir_entry_change(cx, scope, parent, false)?;
         let (mode, gid) = self.setgid_dir_owner(cx, scope, parent, mode, gid, false)?;
@@ -1332,6 +1337,7 @@ impl FsOps for OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         self.reject_dir_entry_change(cx, scope, parent, false)?;
         let (mode, gid) = self.setgid_dir_owner(cx, scope, parent, mode, gid, false)?;
@@ -1368,6 +1374,7 @@ impl FsOps for OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         self.reject_dir_entry_change(cx, scope, parent, false)?;
         let (mode, gid) = self.setgid_dir_owner(cx, scope, parent, mode, gid, true)?;
@@ -1400,6 +1407,7 @@ impl FsOps for OpenFs {
         parent: InodeNumber,
         name: &OsStr,
     ) -> ffs_error::Result<()> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         self.reject_dir_entry_change(cx, scope, parent, true)?;
         let _namespace = self.begin_namespace_mutation();
@@ -1426,6 +1434,7 @@ impl FsOps for OpenFs {
         parent: InodeNumber,
         name: &OsStr,
     ) -> ffs_error::Result<()> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         self.reject_dir_entry_change(cx, scope, parent, true)?;
         let _namespace = self.begin_namespace_mutation();
@@ -1456,6 +1465,7 @@ impl FsOps for OpenFs {
         _scope: &mut RequestScope,
         ino: InodeNumber,
     ) -> ffs_error::Result<bool> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => self.ext4_finalize_unlinked_inode_impl(cx, ino),
@@ -1472,6 +1482,7 @@ impl FsOps for OpenFs {
         new_parent: InodeNumber,
         new_name: &OsStr,
     ) -> ffs_error::Result<()> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         self.reject_rename_dir_change(cx, scope, parent, new_parent, new_name)?;
         let _namespace = self.begin_namespace_mutation();
@@ -1508,6 +1519,7 @@ impl FsOps for OpenFs {
         new_name: &OsStr,
         flags: u32,
     ) -> ffs_error::Result<()> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         // Reject combinations that linux/fs.h forbids before doing any work.
         // The kernel itself never sets more than one bit at a time but a
@@ -1586,6 +1598,7 @@ impl FsOps for OpenFs {
         offset: u64,
         data: &[u8],
     ) -> ffs_error::Result<u32> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => {
@@ -1606,6 +1619,7 @@ impl FsOps for OpenFs {
         new_parent: InodeNumber,
         new_name: &OsStr,
     ) -> ffs_error::Result<InodeAttr> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         self.reject_dir_entry_change(cx, scope, new_parent, false)?;
         let _namespace = self.begin_namespace_mutation();
@@ -1637,6 +1651,7 @@ impl FsOps for OpenFs {
         uid: u32,
         gid: u32,
     ) -> ffs_error::Result<InodeAttr> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         self.reject_dir_entry_change(cx, scope, parent, false)?;
         let (_, gid) = self.setgid_dir_owner(cx, scope, parent, 0, gid, false)?;
@@ -1681,6 +1696,7 @@ impl FsOps for OpenFs {
         length: u64,
         mode: i32,
     ) -> ffs_error::Result<()> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => self.ext4_fallocate(
@@ -1944,6 +1960,7 @@ impl FsOps for OpenFs {
         ino: InodeNumber,
         fsx: FsxattrInfo,
     ) -> ffs_error::Result<()> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => {
@@ -2148,6 +2165,7 @@ impl FsOps for OpenFs {
         ino: InodeNumber,
         generation: u32,
     ) -> ffs_error::Result<()> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         match &self.flavor {
             FsFlavor::Ext4(_) => {
                 let canonical = Self::ext4_canonical_inode(ino);
@@ -2424,6 +2442,7 @@ impl FsOps for OpenFs {
         scope: &mut RequestScope,
         label: &[u8],
     ) -> ffs_error::Result<()> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         const EXT4_LABEL_MAX: usize = 16;
         const EXT4_VOLUME_NAME_OFFSET: usize = 0x78;
@@ -3876,11 +3895,12 @@ impl FsOps for OpenFs {
 
     fn clone_file(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         _scope: &mut RequestScope,
         dest_ino: InodeNumber,
         src_ino: InodeNumber,
     ) -> ffs_error::Result<()> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
@@ -3911,6 +3931,7 @@ impl FsOps for OpenFs {
         src_length: u64,
         dest_offset: u64,
     ) -> ffs_error::Result<()> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
@@ -4061,11 +4082,12 @@ impl FsOps for OpenFs {
 
     fn set_subvol_flags(
         &self,
-        _cx: &Cx,
+        cx: &Cx,
         _scope: &mut RequestScope,
         _ino: InodeNumber,
         flags: u64,
     ) -> ffs_error::Result<()> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => Err(FfsError::UnsupportedFeature(
@@ -4247,6 +4269,7 @@ impl FsOps for OpenFs {
         ino: InodeNumber,
         flags: u32,
     ) -> ffs_error::Result<()> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {
             FsFlavor::Ext4(_) => {
@@ -4369,6 +4392,7 @@ impl FsOps for OpenFs {
         donor_start: u64,
         len: u64,
     ) -> ffs_error::Result<u64> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         match &self.flavor {
             FsFlavor::Ext4(_) => self.ext4_move_ext(
                 cx,
@@ -4542,6 +4566,7 @@ impl FsOps for OpenFs {
         ino: InodeNumber,
         attrs: &SetAttrRequest,
     ) -> ffs_error::Result<InodeAttr> {
+        let _mutation = self.mutation_gate_guard_with_pressure(cx);
         let _view = self.btrfs_semantic_view_guard()?;
         // A chmod of an inode with an access ACL rewrites that ACL too. ext4
         // writes xattrs straight to the device, so the mode change goes the
@@ -4811,7 +4836,7 @@ impl FsOps for OpenFs {
             // their only dirty marker (bd-dj725).
             self.mutation_epoch
                 .fetch_add(1, std::sync::atomic::Ordering::AcqRel);
-            self.ext4_commit_on_journal_pressure(cx);
+            self.commit_on_dirty_pressure(cx);
         }
 
         Ok(())

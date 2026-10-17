@@ -326,6 +326,21 @@
 > complete native storage, default activation, restart freshness, or the wider
 > core/FUSE worker migration on the original bead.
 
+> **Periodic/pressure durability (`bd-dj725`, partial evidence 2026-10-17):**
+> RCH `30067604894777420` passed five worker units and four real-FUSE controls
+> on `20b10aad4` plus its 58-path reviewed overlay: omitted ext4/btrfs defaults,
+> explicit 1-second intervals, equal-duration disabled controls, SIGKILL/remount
+> byte checks, native checkers, worker drain, and 2 GiB without fsync. The daemon
+> VmHWM was 930,744 KiB against the prospectively fixed 1,048,576 KiB ceiling.
+> An older different-host run exceeded that same ceiling; no optimization win
+> or universal RSS guarantee follows from this single passing run. Two core
+> periodic tests also passed as RCH `30067604894777421`. New btrfs pressure
+> accounting includes sharded data and checkpointed COW allocations, with a
+> configurable 128 MiB default and acknowledgement after final superblock sync.
+> Direct-operation, orphan-finalization, pressure-only mounted crash and
+> failed-boundary retry tests are pending execution for that new source. The
+> original bead remains open; no parity percentage is advanced by these claims.
+
 > **Protected scrub integration (`bd-11a8t`, controls verified 2026-10-12):**
 > `ffs-protected-mount` now shares the ordinary CLI's child-region worker and
 > completion drain. Both source scans and parity maintenance use its child

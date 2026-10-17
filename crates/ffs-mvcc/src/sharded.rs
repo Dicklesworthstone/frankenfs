@@ -563,6 +563,9 @@ impl std::fmt::Debug for CommitPublicationGate {
 #[derive(Debug, Default)]
 struct MvccShard {
     versions: FxHashMap<BlockNumber, ShardVersionChain>,
+    /// Monotone count of installed block writes, including overwrites. Updated
+    /// under this shard's installation lock, without a shared hot-path counter.
+    committed_block_writes: u64,
     /// Per-shard SSI log.  Entries are kept here because SSI checks
     /// are per-block and shards are block-partitioned.
     ssi_log: Vec<CommittedTxnRecord>,
@@ -1577,6 +1580,7 @@ impl ShardedMvccStore {
                 data: version_data,
             },
         );
+        shard.committed_block_writes = shard.committed_block_writes.saturating_add(1);
         // Record the block as a prune candidate the moment its chain FIRST crosses
         // to 2 versions. Installs add one version at a time, so every multi-version
         // chain passes through `len == 2` exactly once per episode — inserting only
@@ -2473,6 +2477,21 @@ impl ShardedMvccStore {
         self.shards.iter().map(|s| s.read().versions.len()).sum()
     }
 
+    /// Blocks installed by successful commits since store creation, including
+    /// repeated writes to the same block. Aborts and rejected commits add none.
+    /// The per-shard counters and their aggregate saturate instead of wrapping.
+    ///
+    /// Installation precedes ordered publication: this can include a version
+    /// newer than [`Self::current_snapshot`]. A durability caller must capture
+    /// its covered count while excluding new installs and wait for publication;
+    /// sampling this after a flush cannot establish a durable watermark.
+    #[must_use]
+    pub fn committed_block_writes(&self) -> u64 {
+        self.shards.iter().fold(0_u64, |total, shard| {
+            total.saturating_add(shard.read().committed_block_writes)
+        })
+    }
+
     /// Drop every block chain whose newest version is durable at its home
     /// location and visible to every registered snapshot (bd-dj725); the
     /// sharded counterpart of [`crate::MvccStore::evict_durable_chains`], with
@@ -3028,6 +3047,7 @@ mod tests {
         assert_eq!(visible_snapshot.high, CommitSeq(0));
         assert_eq!(store.latest_commit_seq(block), CommitSeq(0));
         assert_eq!(store.read_visible(block, visible_snapshot), None);
+        assert_eq!(store.committed_block_writes(), 1);
 
         store.publication_gate.publish(CommitSeq(1));
         worker.join().expect("worker joined");
@@ -3036,6 +3056,7 @@ mod tests {
         assert_eq!(latest.high, CommitSeq(2));
         assert_eq!(store.latest_commit_seq(block), CommitSeq(2));
         assert_eq!(store.read_visible(block, latest), Some(vec![0xC2]));
+        assert_eq!(store.committed_block_writes(), 1);
     }
 
     #[test]
@@ -3049,6 +3070,92 @@ mod tests {
         let snap = store.current_snapshot();
         let data = store.read_visible(BlockNumber(1), snap).expect("visible");
         assert_eq!(data, vec![0xAA; 8]);
+    }
+
+    #[test]
+    fn committed_block_writes_count_installs_across_shards_bd_dj725() {
+        let store = make_store(4);
+        assert_eq!(store.committed_block_writes(), 0);
+        let mut first = store.begin();
+        first.stage_write(BlockNumber(0), vec![0xAA]);
+        first.stage_write(BlockNumber(0), vec![0xBB]);
+        first.stage_write(BlockNumber(1), vec![0xCC]);
+        first.stage_write(BlockNumber(4), vec![0xDD]);
+        first.stage_write(BlockNumber(7), vec![0xEE]);
+        store.commit(first).expect("multi-shard commit");
+        assert_eq!(store.committed_block_writes(), 4);
+        assert_eq!(store.block_count_versioned(), 4);
+        assert_eq!(
+            store.read_visible(BlockNumber(0), store.current_snapshot()),
+            Some(vec![0xBB])
+        );
+
+        let mut second = store.begin();
+        second.stage_write(BlockNumber(0), vec![0xFF]);
+        second.stage_write(BlockNumber(2), vec![0x42]);
+        store
+            .commit_ssi(second)
+            .expect("SSI overwrite and new block");
+        assert_eq!(store.committed_block_writes(), 6);
+        assert_eq!(store.block_count_versioned(), 5);
+        store.commit(store.begin()).expect("empty commit");
+        assert_eq!(store.committed_block_writes(), 6);
+    }
+
+    #[test]
+    fn committed_block_writes_exclude_rejected_and_aborted_transactions_bd_dj725() {
+        let store = make_store(4);
+        let mut winner = store.begin();
+        let mut conflict = store.begin();
+        winner.stage_write(BlockNumber(0), vec![1]);
+        conflict.stage_write(BlockNumber(0), vec![2]);
+        conflict.stage_write(BlockNumber(2), vec![3]);
+        store.commit(winner).expect("winner");
+        assert!(matches!(
+            store.commit_ssi(conflict),
+            Err((CommitError::Conflict { .. }, _))
+        ));
+        assert_eq!(store.committed_block_writes(), 1);
+
+        let mut aborted = store.begin();
+        aborted.stage_write(BlockNumber(1), vec![4]);
+        store.abort(aborted, TxnAbortReason::Timeout, None);
+        assert_eq!(store.committed_block_writes(), 1);
+        assert_eq!(
+            store.read_visible(BlockNumber(1), store.current_snapshot()),
+            None
+        );
+        assert_eq!(
+            store.read_visible(BlockNumber(2), store.current_snapshot()),
+            None
+        );
+
+        store.next_commit.store(u64::MAX, Ordering::SeqCst);
+        let mut exhausted = store.begin();
+        exhausted.stage_write(BlockNumber(3), vec![5]);
+        assert!(matches!(
+            store.commit(exhausted),
+            Err((CommitError::DurabilityFailure { .. }, _))
+        ));
+        assert_eq!(store.committed_block_writes(), 1);
+        assert_eq!(
+            store.read_visible(BlockNumber(3), store.current_snapshot()),
+            None
+        );
+    }
+
+    #[test]
+    fn committed_block_writes_saturate_per_shard_and_in_total_bd_dj725() {
+        let store = make_store(4);
+        store.shards[0].write().committed_block_writes = u64::MAX - 1;
+        store.shards[1].write().committed_block_writes = 1;
+        assert_eq!(store.committed_block_writes(), u64::MAX);
+        let mut txn = store.begin();
+        txn.stage_write(BlockNumber(0), vec![1]);
+        txn.stage_write(BlockNumber(4), vec![2]);
+        store.commit(txn).expect("two installs in one shard");
+        assert_eq!(store.shards[0].read().committed_block_writes, u64::MAX);
+        assert_eq!(store.committed_block_writes(), u64::MAX);
     }
 
     #[test]

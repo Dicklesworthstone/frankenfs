@@ -8731,6 +8731,18 @@ fn mount_cmd(image_path: &Path, mountpoint: &Path, options: &MountCmdOptions) ->
         })?;
         open_fs.set_mvcc_resident_block_cap(blocks);
     }
+    match std::env::var("FFS_BTRFS_DIRTY_BYTES_THRESHOLD") {
+        Ok(raw) => {
+            let bytes: u64 = raw.trim().parse().with_context(|| {
+                format!("invalid FFS_BTRFS_DIRTY_BYTES_THRESHOLD={raw:?}; expected a byte count")
+            })?;
+            open_fs.set_btrfs_dirty_bytes_threshold(bytes);
+        }
+        Err(std::env::VarError::NotPresent) => {}
+        Err(std::env::VarError::NotUnicode(_)) => {
+            bail!("FFS_BTRFS_DIRTY_BYTES_THRESHOLD must be valid UTF-8");
+        }
+    }
     let open_fs = Arc::new(open_fs);
     let mounted_repair_writeback = (options.read_write
         && options.background_scrub.repair_writes_enabled)
