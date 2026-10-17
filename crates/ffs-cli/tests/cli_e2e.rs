@@ -3029,7 +3029,7 @@ fn btrfs_periodic_commit_sigkill_arm(
     // The disabled control waits as long as the 30 s default arm, so an
     // unrelated delayed flush cannot masquerade as the default commit timer.
     let wait_secs = wait_override_secs
-        .unwrap_or_else(|| interval_secs.filter(|secs| *secs != 0).unwrap_or(30) + 3);
+        .unwrap_or_else(|| interval_secs.filter(|secs| *secs != 0).unwrap_or(30) + 1);
     std::thread::sleep(Duration::from_secs(wait_secs));
     sigkill_cli_mount(&mut child, &mnt);
     if pressure_bytes == Some(1) {
@@ -3122,7 +3122,7 @@ fn periodic_commit_sigkill_arm(
         panic!("write through the mount: {error}");
     }
     // The disabled control waits as long as the 5 s default arm.
-    let wait_secs = interval_secs.filter(|secs| *secs != 0).unwrap_or(5) + 3;
+    let wait_secs = interval_secs.filter(|secs| *secs != 0).unwrap_or(5) + 1;
     std::thread::sleep(Duration::from_secs(wait_secs));
     sigkill_cli_mount(&mut child, &mnt);
 
