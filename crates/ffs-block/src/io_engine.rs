@@ -28,6 +28,9 @@
 //! will use a safe wrapper crate (`io-uring` or similar) that handles
 //! the unsafe kernel interface internally.
 
+pub mod volume;
+pub use volume::{VolumeAccess, VolumeDevice};
+
 use ffs_error::{FfsError, Result};
 use std::path::Path;
 use std::sync::Arc;
@@ -917,7 +920,7 @@ mod tests {
     ///   2. The final `stats.writes` count equals the cumulative
     ///      writes the writers logged. This proves the inner
     ///      `stats` lock serialized correctly under the outer
-    ///      `data` lock — a regression that violated the order
+    ///      data lock — a regression that violated the order
     ///      would either deadlock or under-count.
     #[test]
     fn mem_io_engine_no_deadlock_under_concurrent_submit_and_stats() {
