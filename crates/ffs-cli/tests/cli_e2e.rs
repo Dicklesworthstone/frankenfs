@@ -2448,28 +2448,28 @@ fn cli_mount_periodic_commit_survives_sigkill_bd_dj725() {
     }
     let payload: Vec<u8> = (0..65_536_u32).map(|i| (i % 251) as u8).collect();
 
-    let kept = match periodic_commit_sigkill_arm(1, &payload, require) {
-        SigkillArm::Skipped => return,
-        SigkillArm::Missing => None,
-        SigkillArm::Bytes(bytes) => Some(bytes),
-    };
-    assert_eq!(
-        kept.as_deref(),
-        Some(payload.as_slice()),
-        "a write older than the commit interval must survive SIGKILL of the daemon"
-    );
-
-    let lost = match periodic_commit_sigkill_arm(0, &payload, require) {
-        SigkillArm::Skipped => return,
-        SigkillArm::Missing => None,
-        SigkillArm::Bytes(bytes) => Some(bytes),
-    };
-    assert_ne!(
-        lost.as_deref(),
-        Some(payload.as_slice()),
-        "control arm: with the tick disabled the un-fsynced bytes must not be durable, \
-         else this test cannot detect a missing periodic commit"
-    );
+    // Omit the option to exercise the actual default, then retain the explicit
+    // override and disabled control. The default and control wait equally long.
+    for interval_secs in [None, Some(1), Some(0)] {
+        let kept = match periodic_commit_sigkill_arm(interval_secs, &payload, require) {
+            SigkillArm::Skipped => return,
+            SigkillArm::Missing => None,
+            SigkillArm::Bytes(bytes) => Some(bytes),
+        };
+        if interval_secs == Some(0) {
+            assert_ne!(
+                kept.as_deref(),
+                Some(payload.as_slice()),
+                "disabled ext4 timer kept the bytes; this control cannot detect a missing tick"
+            );
+        } else {
+            assert_eq!(
+                kept.as_deref(),
+                Some(payload.as_slice()),
+                "ext4 writes older than the commit interval {interval_secs:?} must survive SIGKILL"
+            );
+        }
+    }
     emit_scenario_result("cli_mount_periodic_commit_sigkill", "PASS", None);
 }
 
@@ -2495,13 +2495,13 @@ fn cli_mount_btrfs_periodic_commit_survives_sigkill_bd_dj725() {
         return;
     }
     let payload: Vec<u8> = (0..65_536_u32).map(|i| (i % 251) as u8).collect();
-    for interval_secs in [1, 0] {
+    for interval_secs in [None, Some(1), Some(0)] {
         let kept = match btrfs_periodic_commit_sigkill_arm(interval_secs, &payload, require) {
             SigkillArm::Skipped => return,
             SigkillArm::Missing => None,
             SigkillArm::Bytes(bytes) => Some(bytes),
         };
-        if interval_secs == 0 {
+        if interval_secs == Some(0) {
             assert_ne!(
                 kept.as_deref(),
                 Some(payload.as_slice()),
@@ -2511,7 +2511,7 @@ fn cli_mount_btrfs_periodic_commit_survives_sigkill_bd_dj725() {
             assert_eq!(
                 kept.as_deref(),
                 Some(payload.as_slice()),
-                "btrfs writes older than the commit interval must survive SIGKILL"
+                "btrfs writes older than the commit interval {interval_secs:?} must survive SIGKILL"
             );
         }
     }
@@ -2779,14 +2779,27 @@ fn sigkill_cli_mount(child: &mut std::process::Child, mnt: &Path) {
 }
 
 /// bd-dj725 memory bound, measured on the real daemon: 2 GiB written through
-/// `ffs mount --rw` without any fsync. Before durable MVCC chains were evicted
-/// the store kept every block ever written, so the daemon's RSS grew past the
-/// data size; with journal-pressure commits and eviction it stays bounded by
-/// the resident cap (128 MiB) plus working overhead.
+/// `ffs mount --rw` without any fsync. The absolute ceiling defaults to 1 GiB
+/// (half the workload) and can be configured with `FFS_TEST_MAX_DAEMON_RSS_MIB`.
+/// VmHWM measures the process peak; sampled VmRSS retains the growth comparison
+/// against the control with durable MVCC eviction disabled.
 #[test]
 fn cli_mount_rss_stays_bounded_without_fsync_bd_dj725() {
     use std::io::Write as _;
 
+    let max_rss_mib = match std::env::var("FFS_TEST_MAX_DAEMON_RSS_MIB") {
+        Ok(raw) => raw
+            .parse::<u64>()
+            .expect("FFS_TEST_MAX_DAEMON_RSS_MIB must be an integer"),
+        Err(std::env::VarError::NotPresent) => 1024,
+        Err(std::env::VarError::NotUnicode(_)) => {
+            panic!("FFS_TEST_MAX_DAEMON_RSS_MIB must be valid UTF-8");
+        }
+    };
+    assert!(max_rss_mib > 0, "RSS ceiling must be nonzero");
+    let ceiling_kib = max_rss_mib
+        .checked_mul(1024)
+        .expect("RSS ceiling exceeds the KiB measurement range");
     let require = std::env::var_os("FFS_REQUIRE_FUSE").is_some_and(|v| v == "1");
     let prerequisites = Path::new("/dev/fuse").exists()
         && ["mkfs.ext4", "fusermount3"]
@@ -2800,8 +2813,9 @@ fn cli_mount_rss_stays_bounded_without_fsync_bd_dj725() {
         emit_scenario_result("cli_mount_rss_bound", "SKIP", Some("fuse_unavailable"));
         return;
     }
-    // One arm: mount, write 2 GiB without fsync, return the peak VmRSS (KiB).
-    let arm = |envs: &[(&str, &str)]| -> Option<[u64; 2]> {
+    // One arm: write 2 GiB without fsync; return the two sampled VmRSS peaks
+    // and the kernel's whole-process VmHWM, all in KiB.
+    let arm = |envs: &[(&str, &str)]| -> Option<([u64; 2], u64)> {
         let tmp = tempfile::tempdir().expect("create temp dir");
         let image = tmp.path().join("rss.ext4");
         format_ext4_owned_by_caller(&image, 4 << 30);
@@ -2816,11 +2830,11 @@ fn cli_mount_rss_stays_bounded_without_fsync_bd_dj725() {
             "cli_mount_rss_bound",
             require,
         )?;
-        let rss_kib = |pid: u32| -> u64 {
+        let status_kib = |pid: u32, field: &str| -> u64 {
             fs::read_to_string(format!("/proc/{pid}/status"))
                 .unwrap_or_default()
                 .lines()
-                .find_map(|line| line.strip_prefix("VmRSS:"))
+                .find_map(|line| line.strip_prefix(field))
                 .and_then(|rest| rest.split_whitespace().next()?.parse().ok())
                 .unwrap_or(0)
         };
@@ -2840,39 +2854,47 @@ fn cli_mount_rss_stays_bounded_without_fsync_bd_dj725() {
                 });
                 if mib % 16 == 15 {
                     let half = usize::from(mib >= 1024);
-                    halves[half] = halves[half].max(rss_kib(pid));
+                    halves[half] = halves[half].max(status_kib(pid, "VmRSS:"));
                 }
             }
         }
+        let peak_kib = status_kib(pid, "VmHWM:");
         sigkill_cli_mount(&mut child, &mnt);
         assert!(
-            halves[0] > 0 && halves[1] > 0,
-            "could not read the daemon's VmRSS; the bound was not measured"
+            halves[0] > 0 && halves[1] > 0 && peak_kib >= halves[0].max(halves[1]),
+            "could not measure daemon VmRSS/VmHWM: halves={halves:?}, peak={peak_kib} KiB"
         );
-        Some(halves)
+        Some((halves, peak_kib))
     };
 
-    let Some([bounded_first, bounded_second]) = arm(&[]) else {
+    let Some(([bounded_first, bounded_second], bounded_peak)) = arm(&[]) else {
         return;
     };
     // Control: eviction disabled. It must show the growth the bound prevents,
     // or this test could pass without measuring anything.
-    let Some([unbounded_first, unbounded_second]) =
+    let Some(([unbounded_first, unbounded_second], unbounded_peak)) =
         arm(&[("FFS_MVCC_RESIDENT_CAP_BLOCKS", "18446744073709551615")])
     else {
         return;
     };
     eprintln!(
         "RSS_BOUND|written_mib=2048|default_cap_kib={bounded_first},{bounded_second}\
-         |no_eviction_kib={unbounded_first},{unbounded_second}"
+         |no_eviction_kib={unbounded_first},{unbounded_second}\
+         |default_peak_kib={bounded_peak}|no_eviction_peak_kib={unbounded_peak}\
+         |ceiling_kib={ceiling_kib}"
     );
-    // "Bounded" = memory stops growing with the data written. Measured
+    assert!(
+        bounded_peak <= ceiling_kib,
+        "daemon peak RSS {bounded_peak} KiB exceeded the configured ceiling \
+         {ceiling_kib} KiB during 2 GiB written without fsync"
+    );
+    // Also check that memory stops growing with the data written. Measured
     // 2026-09-25: ~0.5 GiB with the default cap vs ~1.9 GiB without eviction
     // for the same 1 GiB in the original control. Per-block overhead, transient
     // block copies and allocator retention make the absolute level workload-
-    // and allocator-dependent, so the test asserts the growth trend.
-    // Now exercise the bead's full 2 GiB workload, comparing growth over the
-    // same second GiB in both arms, rather than an absolute allowance:
+    // and allocator-dependent, so retain the growth trend as an independent
+    // check alongside the absolute peak ceiling. Exercise the full 2 GiB
+    // workload, comparing growth over the same second GiB in both arms:
     // 13 runs on identical daemon code (2026-09-25) grew
     // 33..139 MiB with eviction, so a 64 MiB bound failed ~40% of runs on
     // noise, while the control grew ~650 MiB.
@@ -2898,7 +2920,7 @@ fn cli_mount_rss_stays_bounded_without_fsync_bd_dj725() {
 }
 
 fn btrfs_periodic_commit_sigkill_arm(
-    interval_secs: u64,
+    interval_secs: Option<u64>,
     payload: &[u8],
     require: bool,
 ) -> SigkillArm {
@@ -2927,13 +2949,17 @@ fn btrfs_periodic_commit_sigkill_arm(
     );
     let mnt = tmp.path().join("mnt");
     fs::create_dir(&mnt).expect("create mountpoint");
-    let interval = interval_secs.to_string();
+    let interval = interval_secs.map(|secs| secs.to_string());
+    let mut args = vec!["--rw", "--log-format", "json"];
+    if let Some(interval) = &interval {
+        args.extend(["--commit-interval-secs", interval.as_str()]);
+    }
     let Some(mut child) = spawn_cli_mount(
         &image,
         &mnt,
         &tmp.path().join("mount.log"),
-        &["--rw", "--commit-interval-secs", &interval],
-        &[],
+        &args,
+        &[("RUST_LOG", "info")],
         "cli_mount_btrfs_periodic_commit_sigkill",
         require,
     ) else {
@@ -2943,8 +2969,21 @@ fn btrfs_periodic_commit_sigkill_arm(
         sigkill_cli_mount(&mut child, &mnt);
         panic!("write unsynced btrfs payload: {error}");
     }
-    std::thread::sleep(Duration::from_secs(4));
+    // The disabled control waits as long as the 30 s default arm, so an
+    // unrelated delayed flush cannot masquerade as the default commit timer.
+    let wait_secs = interval_secs.filter(|secs| *secs != 0).unwrap_or(30) + 3;
+    std::thread::sleep(Duration::from_secs(wait_secs));
     sigkill_cli_mount(&mut child, &mnt);
+    if interval_secs != Some(0) {
+        let logs = fs::read_to_string(tmp.path().join("mount.log")).expect("read daemon log");
+        assert!(
+            logs.lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .any(|event| event["message"] == "periodic_commit_started"
+                    && event["interval_secs"].as_u64() == Some(interval_secs.unwrap_or(30))),
+            "btrfs timer must start with the requested or default interval: {logs}"
+        );
+    }
     let checked = Command::new("btrfs")
         .args(["check", "--readonly"])
         .arg(&image)
@@ -2952,7 +2991,7 @@ fn btrfs_periodic_commit_sigkill_arm(
         .expect("run btrfs check");
     assert!(
         checked.status.success(),
-        "btrfs image is inconsistent after SIGKILL (interval={interval_secs}): {} {}",
+        "btrfs image is inconsistent after SIGKILL (interval={interval_secs:?}): {} {}",
         String::from_utf8_lossy(&checked.stdout),
         String::from_utf8_lossy(&checked.stderr)
     );
@@ -2976,7 +3015,11 @@ fn btrfs_periodic_commit_sigkill_arm(
     }
 }
 
-fn periodic_commit_sigkill_arm(interval_secs: u64, payload: &[u8], require: bool) -> SigkillArm {
+fn periodic_commit_sigkill_arm(
+    interval_secs: Option<u64>,
+    payload: &[u8],
+    require: bool,
+) -> SigkillArm {
     use std::time::Duration;
 
     let tmp = tempfile::tempdir().expect("create temp dir");
@@ -2984,18 +3027,16 @@ fn periodic_commit_sigkill_arm(interval_secs: u64, payload: &[u8], require: bool
     format_ext4_owned_by_caller(&image, 64 << 20);
     let mnt = tmp.path().join("mnt");
     fs::create_dir(&mnt).expect("create mountpoint");
-    let interval = interval_secs.to_string();
+    let interval = interval_secs.map(|secs| secs.to_string());
+    let mut args = vec!["--rw", "--log-format", "json"];
+    if let Some(interval) = &interval {
+        args.extend(["--commit-interval-secs", interval.as_str()]);
+    }
     let Some(mut child) = spawn_cli_mount(
         &image,
         &mnt,
         &tmp.path().join("mount.log"),
-        &[
-            "--rw",
-            "--commit-interval-secs",
-            &interval,
-            "--log-format",
-            "json",
-        ],
+        &args,
         &[("RUST_LOG", "info")],
         "cli_mount_periodic_commit_sigkill",
         require,
@@ -3008,12 +3049,20 @@ fn periodic_commit_sigkill_arm(interval_secs: u64, payload: &[u8], require: bool
         sigkill_cli_mount(&mut child, &mnt);
         panic!("write through the mount: {error}");
     }
-    // Both arms wait the same, well past a 1 s interval.
-    std::thread::sleep(Duration::from_secs(4));
+    // The disabled control waits as long as the 5 s default arm.
+    let wait_secs = interval_secs.filter(|secs| *secs != 0).unwrap_or(5) + 3;
+    std::thread::sleep(Duration::from_secs(wait_secs));
     sigkill_cli_mount(&mut child, &mnt);
 
-    if interval_secs != 0 {
+    if interval_secs != Some(0) {
         let logs = fs::read_to_string(tmp.path().join("mount.log")).expect("read daemon log");
+        assert!(
+            logs.lines()
+                .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
+                .any(|event| event["message"] == "periodic_commit_started"
+                    && event["interval_secs"].as_u64() == Some(interval_secs.unwrap_or(5))),
+            "ext4 timer must start with the requested or default interval: {logs}"
+        );
         let commits: Vec<serde_json::Value> = logs
             .lines()
             .filter_map(|line| serde_json::from_str::<serde_json::Value>(line).ok())
@@ -3042,7 +3091,7 @@ fn periodic_commit_sigkill_arm(interval_secs: u64, payload: &[u8], require: bool
         .expect("run e2fsck journal replay");
     assert!(
         replay.status.code().is_some_and(|code| code <= 1),
-        "journal replay must succeed after SIGKILL (interval {interval_secs}): {}{}",
+        "journal replay must succeed after SIGKILL (interval {interval_secs:?}): {}{}",
         String::from_utf8_lossy(&replay.stdout),
         String::from_utf8_lossy(&replay.stderr)
     );
@@ -3053,7 +3102,7 @@ fn periodic_commit_sigkill_arm(interval_secs: u64, payload: &[u8], require: bool
         .expect("run e2fsck -fn");
     assert!(
         check.status.success(),
-        "image must be e2fsck-clean after SIGKILL + replay (interval {interval_secs}):\n{}{}",
+        "image must be e2fsck-clean after SIGKILL + replay (interval {interval_secs:?}):\n{}{}",
         String::from_utf8_lossy(&check.stdout),
         String::from_utf8_lossy(&check.stderr)
     );
@@ -3067,7 +3116,7 @@ fn periodic_commit_sigkill_arm(interval_secs: u64, payload: &[u8], require: bool
     if stderr.contains("not found") {
         return SigkillArm::Missing;
     }
-    if interval_secs != 0 {
+    if interval_secs != Some(0) {
         let Some(mut remounted) = spawn_cli_mount(
             &image,
             &mnt,
