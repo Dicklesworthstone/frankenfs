@@ -2542,6 +2542,34 @@ impl FsOps for OpenFs {
         }
     }
 
+    fn sync_fs(&self, cx: &Cx, _scope: &mut RequestScope) -> ffs_error::Result<()> {
+        cx.checkpoint().map_err(|_| FfsError::Cancelled)?;
+        if !self.is_writable() {
+            return Err(FfsError::ReadOnly);
+        }
+        let epoch = self
+            .mutation_epoch
+            .load(std::sync::atomic::Ordering::Acquire);
+        match &self.flavor {
+            FsFlavor::Ext4(_) => self.ext4_sync_with_logging(
+                cx,
+                "sync-fs",
+                Self::EXT4_RW_SCENARIO_FSYNC,
+                InodeNumber(1),
+                false,
+            )?,
+            FsFlavor::Btrfs(_) => {
+                // A filesystem-wide sync always publishes all trees, including
+                // on an opt-in ephemeral mount; per-inode tree logging cannot
+                // satisfy this boundary. ENOSPC pressure admission cannot skip it.
+                self.btrfs_full_transaction_commit(cx, "sync-fs")?;
+            }
+        }
+        self.committed_mutation_epoch
+            .fetch_max(epoch, std::sync::atomic::Ordering::AcqRel);
+        Ok(())
+    }
+
     fn btrfs_start_sync(&self, cx: &Cx, scope: &mut RequestScope) -> ffs_error::Result<u64> {
         let _view = self.btrfs_semantic_view_guard()?;
         match &self.flavor {

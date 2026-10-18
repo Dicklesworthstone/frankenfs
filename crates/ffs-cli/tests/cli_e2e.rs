@@ -2495,7 +2495,7 @@ fn cli_mount_btrfs_periodic_commit_survives_sigkill_bd_dj725() {
     let payload: Vec<u8> = (0..65_536_u32).map(|i| (i % 251) as u8).collect();
     for interval_secs in [None, Some(1), Some(0)] {
         let kept =
-            match btrfs_periodic_commit_sigkill_arm(interval_secs, &payload, require, None, None) {
+            match btrfs_commit_sigkill_arm(interval_secs, &payload, require, None, None, false) {
                 SigkillArm::Skipped => return,
                 SigkillArm::Missing => None,
                 SigkillArm::Bytes(bytes) => Some(bytes),
@@ -2538,12 +2538,13 @@ fn cli_mount_btrfs_pressure_commit_survives_sigkill_without_timer_bd_dj725() {
     }
     let payload: Vec<u8> = (0..65_536_u32).map(|i| (i % 251) as u8).collect();
     for threshold in [1, u64::MAX] {
-        let kept = match btrfs_periodic_commit_sigkill_arm(
+        let kept = match btrfs_commit_sigkill_arm(
             Some(0),
             &payload,
             require,
             Some(threshold),
             Some(2),
+            false,
         ) {
             SigkillArm::Skipped => return,
             SigkillArm::Missing => None,
@@ -2564,6 +2565,56 @@ fn cli_mount_btrfs_pressure_commit_survives_sigkill_without_timer_bd_dj725() {
         }
     }
     emit_scenario_result("cli_mount_btrfs_pressure_sigkill", "PASS", None);
+}
+
+#[test]
+fn cli_mount_btrfs_sync_ioctl_survives_sigkill_bd_8u2a5() {
+    let require = std::env::var_os("FFS_REQUIRE_FUSE").is_some_and(|value| value == "1");
+    let prerequisites = Path::new("/dev/fuse").exists()
+        && ["mkfs.btrfs", "btrfs", "fusermount3"]
+            .iter()
+            .all(|tool| command_available(tool));
+    if !prerequisites {
+        assert!(
+            !require,
+            "required FUSE/btrfs sync prerequisites unavailable"
+        );
+        emit_scenario_result(
+            "cli_mount_btrfs_sync_ioctl_sigkill",
+            "SKIP",
+            Some("fuse_unavailable"),
+        );
+        return;
+    }
+    let payload: Vec<u8> = (0..65_536_u32).map(|i| (i % 251) as u8).collect();
+    for sync_ioctl in [false, true] {
+        let kept = match btrfs_commit_sigkill_arm(
+            Some(0),
+            &payload,
+            require,
+            Some(0),
+            Some(0),
+            sync_ioctl,
+        ) {
+            SigkillArm::Skipped => return,
+            SigkillArm::Missing => None,
+            SigkillArm::Bytes(bytes) => Some(bytes),
+        };
+        if sync_ioctl {
+            assert_eq!(
+                kept.as_deref(),
+                Some(payload.as_slice()),
+                "BTRFS_IOC_SYNC must persist every acknowledged byte before SIGKILL"
+            );
+        } else {
+            assert_ne!(
+                kept.as_deref(),
+                Some(payload.as_slice()),
+                "the omitted-ioctl control must detect the missing durability boundary"
+            );
+        }
+    }
+    emit_scenario_result("cli_mount_btrfs_sync_ioctl_sigkill", "PASS", None);
 }
 
 /// Real mount ownership and cancellation of both idle background workers.
@@ -2967,12 +3018,13 @@ fn cli_mount_rss_stays_bounded_without_fsync_bd_dj725() {
     emit_scenario_result("cli_mount_rss_bound", "PASS", None);
 }
 
-fn btrfs_periodic_commit_sigkill_arm(
+fn btrfs_commit_sigkill_arm(
     interval_secs: Option<u64>,
     payload: &[u8],
     require: bool,
     pressure_bytes: Option<u64>,
     wait_override_secs: Option<u64>,
+    sync_ioctl: bool,
 ) -> SigkillArm {
     use std::os::unix::fs::PermissionsExt as _;
     use std::time::Duration;
@@ -3023,6 +3075,18 @@ fn btrfs_periodic_commit_sigkill_arm(
     if let Err(error) = fs::write(mnt.join("durable.bin"), payload) {
         sigkill_cli_mount(&mut child, &mnt);
         panic!("write unsynced btrfs payload: {error}");
+    }
+    if sync_ioctl {
+        // btrfs-progs issues BTRFS_IOC_SYNC directly. syncfs(2) on an ordinary
+        // FUSE mount does not request a userspace filesystem-wide boundary.
+        let synced = Command::new("btrfs")
+            .args(["filesystem", "sync"])
+            .arg(&mnt)
+            .output();
+        if !synced.as_ref().is_ok_and(|output| output.status.success()) {
+            sigkill_cli_mount(&mut child, &mnt);
+            panic!("BTRFS_IOC_SYNC failed: {synced:?}");
+        }
     }
     // The disabled control waits as long as the 30 s default arm, so an
     // unrelated delayed flush cannot masquerade as the default commit timer.

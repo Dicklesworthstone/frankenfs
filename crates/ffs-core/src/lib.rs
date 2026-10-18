@@ -101114,6 +101114,206 @@ mod tests {
     }
 
     #[test]
+    fn ext4_sync_fs_uses_existing_checkpoint_boundary_bd_8u2a5() {
+        for journaled in [false, true] {
+            let Some((mut fs, device, tmp)) = open_writable_ext4_mkfs_with_crash_device(64) else {
+                oracle_unavailable("mkfs.ext4 (e2fsprogs)");
+                return;
+            };
+            let cx = Cx::for_testing();
+            if journaled {
+                assert!(fs.attach_ext4_internal_jbd2_writer(&cx).unwrap());
+            }
+            let root = InodeNumber(2);
+            let name = OsStr::new("sync-fs.bin");
+            let file = fs.create(&cx, root, name, 0o644, 0, 0).unwrap();
+            fs.write(&cx, file.ino, 0, &[0x6D; 4096]).unwrap();
+            let durable_through = *fs.mvcc_flushed_through.lock();
+            let cancelled = Cx::for_testing();
+            cancelled.set_cancel_requested(true);
+            let before = device.sync_count();
+            assert!(matches!(
+                FsOps::sync_fs(&fs, &cancelled, &mut RequestScope::empty()),
+                Err(FfsError::Cancelled)
+            ));
+            assert_eq!(device.sync_count(), before);
+            assert_eq!(*fs.mvcc_flushed_through.lock(), durable_through);
+            FsOps::sync_fs(&fs, &cx, &mut RequestScope::empty()).unwrap();
+            assert!(device.sync_count() > before);
+            assert_eq!(*fs.mvcc_flushed_through.lock(), fs.current_snapshot().high);
+            assert!(
+                !fs.periodic_commit(&cx).unwrap(),
+                "successful full sync acknowledges the completed work"
+            );
+            let reopened = OpenFs::from_device(
+                &cx,
+                Box::new(TestDevice::from_vec(device.durable_bytes())),
+                &OpenOptions::default(),
+            )
+            .unwrap();
+            assert_eq!(reopened.lookup(&cx, root, name).unwrap().ino, file.ino);
+            assert_eq!(
+                reopened.read(&cx, file.ino, 0, 4096).unwrap(),
+                vec![0x6D; 4096]
+            );
+            assert_eq!(
+                FsOps::sync_fs(&reopened, &cx, &mut RequestScope::empty())
+                    .unwrap_err()
+                    .to_errno(),
+                libc::EROFS
+            );
+            let image = tmp.path().join("test.ext4");
+            std::fs::write(&image, device.durable_bytes()).unwrap();
+            if let Some((ok, output)) = run_e2fsck(&image) {
+                assert!(ok, "sync_fs journaled={journaled}: {output}");
+            }
+        }
+    }
+
+    #[test]
+    fn btrfs_sync_ioctls_publish_full_boundaries_bd_8u2a5() {
+        let Some((seed_fs, seed_dev, _tmp, image)) = open_writable_btrfs_mkfs(256) else {
+            return;
+        };
+        drop(seed_fs);
+        let seed = seed_dev.snapshot_bytes();
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let sync = |fs: &OpenFs, cx: &Cx, operation: &str| {
+            let mut scope = RequestScope::empty();
+            match operation {
+                "sync" => FsOps::sync_fs(fs, cx, &mut scope),
+                "start" => FsOps::btrfs_start_sync(fs, cx, &mut scope).map(|token| {
+                    assert_eq!(
+                        token,
+                        fs.require_btrfs_alloc_state().unwrap().read().generation
+                    );
+                }),
+                "wait" => FsOps::btrfs_wait_sync(fs, cx, &mut scope, 0),
+                _ => unreachable!("fixed sync operation table"),
+            }
+        };
+        for ephemeral in [false, true] {
+            let device = CrashDevice::from_vec(seed.clone());
+            let mut fs =
+                OpenFs::from_device(&cx, Box::new(device.clone()), &OpenOptions::default())
+                    .unwrap();
+            fs.enable_writes(&cx).unwrap();
+            fs.btrfs_rw_ephemeral_ok = ephemeral;
+            fs.set_btrfs_dirty_bytes_threshold(0);
+            for operation in ["sync", "start", "wait"] {
+                let name = format!("ioctl-{operation}");
+                let file = fs
+                    .create(&cx, root, OsStr::new(&name), 0o644, 0, 0)
+                    .unwrap();
+                fs.write(&cx, file.ino, 0, &[0x35; 4096]).unwrap();
+                let generation = fs.require_btrfs_alloc_state().unwrap().read().generation;
+                let before = device.sync_count();
+                let omitted = OpenFs::from_device(
+                    &cx,
+                    Box::new(TestDevice::from_vec(device.durable_bytes())),
+                    &OpenOptions::default(),
+                )
+                .unwrap();
+                assert_eq!(
+                    omitted
+                        .lookup(&cx, root, OsStr::new(&name))
+                        .unwrap_err()
+                        .to_errno(),
+                    libc::ENOENT,
+                    "the omitted-boundary control must lose the new name"
+                );
+                sync(&fs, &cx, operation).unwrap();
+                let barrier_span = device.sync_count() - before;
+                assert!(
+                    barrier_span >= 2,
+                    "{operation} must execute a durability barrier"
+                );
+                assert!(fs.require_btrfs_alloc_state().unwrap().read().generation > generation);
+                assert_eq!(fs.btrfs_pending_dirty_bytes(), 0);
+                let committed = device.durable_bytes();
+                let sb = BtrfsSuperblock::parse_from_image(&committed).unwrap();
+                assert_eq!(sb.log_root, 0, "filesystem sync must use a full commit");
+                let reopened = OpenFs::from_device(
+                    &cx,
+                    Box::new(TestDevice::from_vec(committed)),
+                    &OpenOptions::default(),
+                )
+                .unwrap();
+                assert_eq!(
+                    reopened.lookup(&cx, root, OsStr::new(&name)).unwrap().ino,
+                    file.ino
+                );
+                assert_eq!(
+                    reopened.read(&cx, file.ino, 0, 4096).unwrap(),
+                    vec![0x35; 4096]
+                );
+                let read_only =
+                    OpenFs::from_device(&cx, Box::new(device.clone()), &OpenOptions::default())
+                        .unwrap();
+                let read_only_syncs = device.sync_count();
+                assert_eq!(
+                    sync(&read_only, &cx, operation).unwrap_err().to_errno(),
+                    libc::EROFS
+                );
+                assert_eq!(device.sync_count(), read_only_syncs);
+
+                for fail_final in [false, true] {
+                    let byte = if fail_final { 0xBD } else { 0xB9 };
+                    fs.write(&cx, file.ino, 0, &[byte; 4096]).unwrap();
+                    let debt = fs.btrfs_pending_dirty_bytes();
+                    assert!(debt > 0);
+                    let failed_generation =
+                        fs.require_btrfs_alloc_state().unwrap().read().generation;
+                    let failed_sync =
+                        device.sync_count() + if fail_final { barrier_span } else { 1 };
+                    device.arm_sync_failure(failed_sync);
+                    assert_eq!(sync(&fs, &cx, operation).unwrap_err().to_errno(), libc::EIO);
+                    assert_eq!(device.sync_count(), failed_sync);
+                    let retained_debt = fs.btrfs_pending_dirty_bytes();
+                    assert!(retained_debt >= debt);
+                    if !fail_final {
+                        assert_eq!(retained_debt, debt);
+                        assert_eq!(
+                            fs.require_btrfs_alloc_state().unwrap().read().generation,
+                            failed_generation
+                        );
+                    }
+                    device.disarm();
+                    let cancelled = Cx::for_testing();
+                    cancelled.set_cancel_requested(true);
+                    let before_cancel = device.sync_count();
+                    assert!(matches!(
+                        sync(&fs, &cancelled, operation),
+                        Err(FfsError::Cancelled)
+                    ));
+                    assert_eq!(
+                        device.sync_count(),
+                        before_cancel,
+                        "cancelled sync must not start I/O"
+                    );
+                    assert_eq!(fs.btrfs_pending_dirty_bytes(), retained_debt);
+                    sync(&fs, &cx, operation).unwrap();
+                    let recovered = OpenFs::from_device(
+                        &cx,
+                        Box::new(TestDevice::from_vec(device.durable_bytes())),
+                        &OpenOptions::default(),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        recovered.read(&cx, file.ino, 0, 4096).unwrap(),
+                        vec![byte; 4096]
+                    );
+                }
+            }
+            std::fs::write(&image, device.durable_bytes()).unwrap();
+            if let Some((ok, output)) = run_btrfs_check(&image) {
+                assert!(ok, "sync ioctl full-boundary image: {output}");
+            }
+        }
+    }
+
+    #[test]
     fn btrfs_pressure_retry_admission_boundaries_bd_x4h1q() {
         for (failed, pending, limit, demand, expected) in [
             (None, 0, 128, false, false),

@@ -433,6 +433,42 @@
 > 2,922 informational reports. Neither that result nor the earlier partial/red
 > seven-file scan establishes a globally clean tree.
 
+> **Filesystem sync ioctl connection (`bd-8u2a5`, native-qualified 2026-10-18):**
+> The existing ioctl dispatch reached the default `FsOps::sync_fs` success
+> response because `OpenFs` had no override. The original bead is reopened.
+> Its override now uses a full btrfs commit in both ordinary and ephemeral
+> modes, and the existing ext4 direct/JBD2 checkpoint paths. Cancellation and
+> read-only refusal precede I/O; failed boundaries do not acknowledge work.
+> Regression-only source `39e247621` failed RCH `30067604894777499`: zero passed,
+> one failed, 1,535 filtered, 1.73 seconds, because sync issued no barrier.
+> Corrected candidate `cafe23fc0` passed RCH `30067604894777502`: 30 passed,
+> zero failed or ignored, 1,507 filtered, 150.45 seconds, no overlays,
+> tree `3c2896cc4be2ed11b678afaa84955e6e4f85339a`. Two new native test
+> functions cover full-image readback, both btrfs modes, sync/start/wait calls,
+> first/final EIO retry, cancellation, and ext4 direct/journaled checkpoints;
+> the other 28 repeat existing controls, including real 128 MiB ENOSPC recovery.
+> An earlier candidate failed compilation due to two unqualified `Ordering`
+> uses and ran zero tests; the explicit qualification corrected those errors.
+> Full frozen-source formatting passes. The mandatory FUSE invocation was
+> refused by normal RCH slot admission before compilation or tests; local
+> fallback was refused. Mounted SIGKILL/checker/remount proof and final
+> workspace checks remain required on this original bead.
+> A separate, independently owned scanner correction in `51f1db273` inlines
+> Cargo's identical compile-time executable path and annotates one trusted
+> benchmark executable sink. An adjacent untrusted executable remains detected.
+> The exception loses this heuristic at that sink; a future untrusted caller
+> invalidates it. No runtime assertions or ignored-test status changed, and
+> benchmark hashes are identity witnesses, not authorization. Matched-context
+> CLI scans changed from two critical reports to zero; the full working CLI
+> retains 389 warnings and 112 informational reports. The manifest-free
+> 16-critical diagnostic and earlier three-file nonzero scan remain recorded.
+> Final code snapshot `285de1141` passes full-workspace formatting and the
+> three-file static UBS scan: zero critical reports, 14,388 warnings and
+> 3,099 informational reports, exit zero.
+> These helper edits do not relabel the `cafe23fc0` runtime receipt or establish
+> a globally clean scan, a parity-percentage increase, or ordinary `syncfs`
+> delivery. Current hosted `75ec3254f` validation remains separately qualified.
+
 > **Protected scrub integration (`bd-11a8t`, controls verified 2026-10-12):**
 > `ffs-protected-mount` now shares the ordinary CLI's child-region worker and
 > completion drain. Both source scans and parity maintenance use its child

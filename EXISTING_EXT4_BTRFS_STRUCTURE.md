@@ -2649,6 +2649,17 @@ For metadata blocks, verification includes:
     an empty allocation tree. Read-only namespace access does not establish
     allocation authority.
 
+16. Filesystem-wide `BTRFS_IOC_SYNC` is a different boundary from a per-file
+    tree-log fsync. On a writable filesystem, Linux v6.19 starts delayed
+    allocation across roots, calls `btrfs_sync_fs(..., 1)`, and returns its
+    error to the caller. A successful dispatch alone does not establish a
+    completed commit. FrankenFS must connect the ioctl to its full transaction
+    boundary rather than a default success response, a pressure-admission
+    shortcut, or per-file tree logging. See the
+    [`BTRFS_IOC_SYNC` dispatch](https://github.com/torvalds/linux/blob/v6.19/fs/btrfs/ioctl.c#L4952-L4963).
+    Ordinary FUSE `syncfs(2)` delivery is a separate kernel interface; wiring
+    this ioctl does not establish that delivery.
+
 ### 16.3 Key Implementation Patterns
 
 #### ext4 Block Address Reconstruction
