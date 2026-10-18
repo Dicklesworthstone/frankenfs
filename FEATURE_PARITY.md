@@ -333,13 +333,41 @@
 > byte checks, native checkers, worker drain, and 2 GiB without fsync. The daemon
 > VmHWM was 930,744 KiB against the prospectively fixed 1,048,576 KiB ceiling.
 > An older different-host run exceeded that same ceiling; no optimization win
-> or universal RSS guarantee follows from this single passing run. Two core
-> periodic tests also passed as RCH `30067604894777421`. New btrfs pressure
-> accounting includes sharded data and checkpointed COW allocations, with a
-> configurable 128 MiB default and acknowledgement after final superblock sync.
-> Direct-operation, orphan-finalization, pressure-only mounted crash and
-> failed-boundary retry tests are pending execution for that new source. The
-> original bead remains open; no parity percentage is advanced by these claims.
+> or universal RSS guarantee follows from this single passing run. On immutable
+> `05e3dc76b`, RCH `30067604894777435` passed 24 core controls, including direct
+> and unmanaged operations, metadata/data pressure, orphan finalization,
+> subvolume/snapshot durability, first/final sync failure retries, concurrent
+> writers, and raw-MVCC recovery. Sharded data and checkpointed COW debt use a
+> configurable 128 MiB default, acknowledged only after final superblock sync.
+> RCH `30067604894777436` passed five worker units and four live controls,
+> including timer-disabled btrfs pressure-on/off SIGKILL/remount/checker arms,
+> but FAILED the unchanged RSS ceiling: VmHWM 1,210,912 KiB after 2 GiB without
+> fsync, against 1,048,576 KiB. Subsequent relative assertions did not execute.
+> Both timer helpers were then tightened from interval plus three seconds to
+> the original interval plus one second. RCH `30067604894777437` passed both
+> real-FUSE timer probes on immutable `e8b250af9`, preserving default/configured
+> and equally long disabled arms, native checkers, and fresh-remount byte checks.
+> A test-only overlay on `e8b250af9` reproduced an epoch-reclamation backlog
+> (RCH `30067604894777439`): after readers unpinned, one collection reclaimed
+> 7,168 of 32,769 versions. Candidate `076772e09` batches at most 64 moved
+> versions per callback under the same epoch pin, retaining grace protection,
+> per-version counters, collection budgets, resident cap, and allocator decay.
+> Independent review and frozen-workspace formatting passed. RCH
+> `30067604894777441` passed five worker units and five real-FUSE controls on
+> immutable `076772e09`, including the tightened timer and pressure crash arms.
+> After 2 GiB without fsync, VmHWM was 701,944 KiB against the unchanged
+> 1,048,576 KiB ceiling; eviction-disabled VmHWM was 3,366,868 KiB, and all
+> three original relative assertions also passed. This is one source-qualified
+> live measurement, with the earlier losses retained. Strict workspace/all-targets
+> Clippy passed on the same source as RCH `30067604894777442`. Full backend MVCC
+> RCH `30067604894777440` passed all 607 tests, with zero failures or ignores,
+> including protected-reader refusal and actual payload release after unpinning.
+> Fresh core controls and workspace check remain unexecuted: all three usable
+> candidate workers returned nonzero `sbh check --need 20G` probes under their
+> local disk policies. No threshold was changed. The new seven-file UBS scan
+> also remains partial (13 critical reports); no clean scan is claimed. The
+> original bead remains open, with no parity percentage, latency guarantee,
+> or performance win advanced.
 
 > **Protected scrub integration (`bd-11a8t`, controls verified 2026-10-12):**
 > `ffs-protected-mount` now shares the ordinary CLI's child-region worker and
