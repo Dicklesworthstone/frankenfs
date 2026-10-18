@@ -854,9 +854,54 @@ When mounting an ext4 image with `needs_recovery` set, FrankenFS replays committ
 
 Replay is idempotent. V2/V3 checksums are verified with the kernel's seed (raw CRC32C from `~0` over the journal UUID), and a live log that runs past the end of the journal continues at `s_first`, as the kernel wraps it. Non-contiguous ext4 journal extents are supported. Both are checked against the kernel itself: `jbd2_wrapped_log_crash_image_recovery_matches_kernel` takes a crash image from a kernel mount whose live log wraps (start 921, end 490 of 1024 blocks), lets the kernel recover one copy, and requires FrankenFS's replay of another to produce the same 700 files byte for byte. Until 2026-09-26 the seed was wrong (raw CRC32C from 0), so FrankenFS replayed no transaction of any checksummed kernel journal, and a wrapped log lost every transaction after the wrap (bd-9m84h).
 
-FrankenFS's own ext4 write path journals each durability boundary through JBD2 and follows the kernel's recovery contract (bd-cnmpm): before the commit record is durable the journal superblock records the live log (`s_start`, `s_sequence`) and the filesystem superblock carries `needs_recovery`; after the checkpoint both are cleared, and sequence numbers continue across mounts. A crash between commit and checkpoint therefore leaves an image that kernel `e2fsck` recognizes and replays — tested by injecting that crash and running `e2fsck -fy` then `e2fsck -fn` on the result. Periodic commits (`--commit-interval-secs`) bound how much un-fsynced data a crash can lose (tested by SIGKILLing a real `ffs mount --rw` daemon: data older than the interval survives, and with the tick disabled it does not). A boundary is also forced once the blocks dirtied since the last one approach half of the journal, because a transaction larger than the log is refused (bd-1o6tq). A boundary never captures a half-applied mutation: it waits for in-flight ones first (bd-9rutw). Once more than 32768 blocks (`FFS_MVCC_RESIDENT_CAP_BLOCKS`) are resident in the MVCC store, each boundary evicts the versions it just made durable (bd-dj725). Measured on a 1 GiB un-fsynced write (cli_e2e, one run):
+FrankenFS's own ext4 write path journals each durability boundary through JBD2 and follows the kernel's recovery contract (bd-cnmpm): before the commit record is durable the journal superblock records the live log (`s_start`, `s_sequence`) and the filesystem superblock carries `needs_recovery`; after the checkpoint both are cleared, and sequence numbers continue across mounts. A crash between commit and checkpoint therefore leaves an image that kernel `e2fsck` recognizes and replays — tested by injecting that crash and running `e2fsck -fy` then `e2fsck -fn` on the result.
+
+Writable mounts schedule periodic commits every 5 seconds for ext4 and 30 seconds
+for btrfs. `--commit-interval-secs N` overrides the interval; zero disables the
+timer. The worker uses its mount-owned asupersync region and inherited `Cx`
+clock, and shutdown drains its outstanding I/O. These intervals are scheduling
+targets: only a completed successful boundary makes the covered writes durable;
+scheduling delays and I/O failures can extend the volatile window. The live
+crash probes exercise the actual defaults, a 1-second override and equally long
+timer-disabled controls, then check native recovery and fresh-remount bytes.
+
+Pressure commits operate independently of that timer. Journalled ext4 forces a
+boundary as dirty blocks approach half the journal's capacity (bd-1o6tq). Btrfs
+defaults to a conservative 128 MiB budget combining installed data writes and
+COW-node allocations across its native trees and extra subvolumes.
+`FFS_BTRFS_DIRTY_BYTES_THRESHOLD` sets this budget in bytes; zero disables btrfs
+pressure commits. This is accounting debt, not an RSS limit. Btrfs acknowledges
+the captured debt only after the final superblock sync succeeds, retaining it
+for retry on failure. Direct library mutations and final orphan reclamation
+also participate. Commit logs report the actual transaction/generation, work
+counts and duration after successful durability.
+
+The ENOSPC recovery change is under qualification (`bd-x4h1q`). It batches
+pressure retries until another work budget has accumulated. A refused ordinary
+allocation after real freeing work can request recovery below that budget,
+including when normal pressure commits are disabled. Explicit sync and periodic
+boundaries bypass batching. This does not promise an autonomous retry on a quiet
+mount. The current hosted btrfs `generic/027` run timed out; source review and
+27 passing native/unit controls plus the original real 128 MiB full-image
+recovery test do not establish that this mounted regression is resolved.
+
+Journalled ext4 periodic and pressure boundaries wait for in-flight gated
+mutations before capture (bd-9rutw); this does not make ext4 namespace operations
+one atomic MVCC commit.
+Once more than 32768 blocks (`FFS_MVCC_RESIDENT_CAP_BLOCKS`) are resident in the
+MVCC store, a journalled boundary evicts the chains it made durable when snapshot
+protection permits it (bd-dj725). Historical 1 GiB no-fsync measurements were:
+
 - with eviction, daemon RSS went from 426 MiB after the first 512 MiB to 476 MiB after 1 GiB;
 - without eviction, it went from 1.19 GiB to 1.75 GiB.
+
+On immutable `076772e09`, RCH `30067604894777441` passed the full 2 GiB ext4
+no-fsync workload: kernel VmHWM was 701,944 KiB against the unchanged prospectively
+declared 1,048,576 KiB ceiling, and all three original relative controls passed.
+The eviction-disabled control peaked at 3,366,868 KiB. Earlier runs exceeded the
+same ceiling; this passing qualification is neither a universal process-memory
+bound nor a performance comparison with the kernel. The exact source, crash,
+failure/retry and reclamation evidence is retained in [FEATURE_PARITY.md](FEATURE_PARITY.md).
 
 ### Ext4 fast-commit replay
 
@@ -3136,7 +3181,7 @@ Filesystems fail in many ways; here is a structured map of what FrankenFS does w
 | **Dirty cache critical watermark** | Writeback can't keep up | New writes block until dirty ratio drops below high watermark | `BackpressureActivated`; caller sees write latency spike |
 | **Disk full** | Backing image cannot accept writes | `FfsError::NoSpace` → `ENOSPC` to caller | Write returns ENOSPC |
 | **WAL write failure mid-commit** | Backing image I/O error | Commit aborts; WAL writer logs error; no partial commit visible | `TxnAborted { reason: durability_failure }` |
-| **Kill -9 of the mount process** | Sudden process death | Kernel sees daemon disappear; mount becomes "transport endpoint not connected"; image is consistent. Writes that completed `fsync` persist, and so do un-fsynced writes older than the periodic commit interval (`--commit-interval-secs`, default 5 s ext4 / 30 s btrfs; bd-dj725) | Caller must `fusermount3 -u` and remount |
+| **Kill -9 of the mount process** | Sudden process death | Kernel sees daemon disappear; mount becomes "transport endpoint not connected"; image is consistent. Writes covered by a successful `fsync`, periodic commit or pressure boundary persist after native recovery. Scheduled intervals default to 5 s ext4 / 30 s btrfs (`--commit-interval-secs`); scheduling delays or failed I/O can extend the volatile window (bd-dj725). | Caller must `fusermount3 -u` and remount |
 | **OOM kill of the mount process** | Memory pressure on host | Same as kill -9 | Same |
 | **Backing image truncated externally** | Operator did something they shouldn't | Subsequent block reads beyond `block_count` return `EIO`; mount may fail to unmount cleanly | `EIO` on affected reads; ledger records `CorruptionDetected` with `severity: "critical"` |
 | **Backing image deleted while mounted** | Same as above | Open file descriptor keeps the inode alive on Unix; behavior is "the mount continues until process exit" | None until unmount |

@@ -326,7 +326,7 @@
 > complete native storage, default activation, restart freshness, or the wider
 > core/FUSE worker migration on the original bead.
 
-> **Periodic/pressure durability (`bd-dj725`, partial evidence 2026-10-17):**
+> **Periodic/pressure durability (`bd-dj725`, executed controls; recovery regression open 2026-10-18):**
 > RCH `30067604894777420` passed five worker units and four real-FUSE controls
 > on `20b10aad4` plus its 58-path reviewed overlay: omitted ext4/btrfs defaults,
 > explicit 1-second intervals, equal-duration disabled controls, SIGKILL/remount
@@ -349,7 +349,7 @@
 > and equally long disabled arms, native checkers, and fresh-remount byte checks.
 > A test-only overlay on `e8b250af9` reproduced an epoch-reclamation backlog
 > (RCH `30067604894777439`): after readers unpinned, one collection reclaimed
-> 7,168 of 32,769 versions. Candidate `076772e09` batches at most 64 moved
+> 7,168 of 32,769 versions. Commit `076772e09` batches at most 64 moved
 > versions per callback under the same epoch pin, retaining grace protection,
 > per-version counters, collection budgets, resident cap, and allocator decay.
 > Independent review and frozen-workspace formatting passed. RCH
@@ -362,12 +362,76 @@
 > Clippy passed on the same source as RCH `30067604894777442`. Full backend MVCC
 > RCH `30067604894777440` passed all 607 tests, with zero failures or ignores,
 > including protected-reader refusal and actual payload release after unpinning.
-> Fresh core controls and workspace check remain unexecuted: all three usable
-> candidate workers returned nonzero `sbh check --need 20G` probes under their
-> local disk policies. No threshold was changed. The new seven-file UBS scan
-> also remains partial (13 critical reports); no clean scan is claimed. The
-> original bead remains open, with no parity percentage, latency guarantee,
-> or performance win advanced.
+> Fresh immutable `866fa911e` has identical Rust and manifests to `076772e09`.
+> Strict RCH `30067604894777452` passed `cargo check --workspace --all-targets`,
+> and `30067604894777458` passed all 24 selected core/native-oracle controls:
+> zero failures or ignores, 1,509 filtered, 94.82 seconds. Both receipts identify
+> tree `d438817021858525402420c44c307915bf411064`, with no overlays. The earlier
+> failed disk probes remain recorded; a private RCH configuration placed both
+> source and target on hz3's separate `/tmp` tmpfs after its actual
+> `sbh check /tmp --need 20G` passed. No disk threshold changed. Core attempt
+> `30067604894777457` failed source-namespace initialization before compilation
+> and ran zero tests; the unchanged retry passed through the normal guards.
+> A reviewer outside the implementation checked the source and retained original
+> execution output. Initial fresh independent execution was blocked: both hz3
+> attempts stopped at namespace initialization before compilation, and the
+> alternative vmi1227854 tmpfs lane passed its disk probe but hit the normal
+> 300-second queue timeout while another project occupied its slots. Those
+> attempts ran zero tests. After that other job finished, strict RCH
+> `30067604894777472` independently executed the same frozen command on
+> vmi1227854: 24 passed, zero failed or ignored, 1,509 filtered, 14.69 seconds,
+> with the same source tree and no-overlay receipt. Its cold compilation took
+> 49 minutes 30 seconds. This repeats existing coverage rather than adding 24
+> unique controls, and does not qualify the later recovery candidate. Contributor
+> cross-reviews are not counted as independent final certification. The
+> seven-file UBS scan remains partial/red (13 critical reports); no clean scan
+> is claimed. These source-qualified controls do not advance a global parity
+> percentage, universal RSS bound, latency guarantee or performance win.
+>
+> Repository Actions are restored. Hosted CI `39084434442` on `866fa911e`
+> passed formatting, strict Clippy and compiler checks, but its workspace test
+> step failed: core reported 1,578 passed, one failed and 25 ignored. The failing
+> `sharded_mvcc_store_evidence_ledger_records_commits_and_aborts_bd_7ssc7`
+> asserted adaptive contention counters under a fixed policy that deliberately
+> skips recording them. The original workspace-baseline bead `bd-vuzzq` is
+> reopened; its separately reviewed test-only correction and full baseline
+> verification are pending. No whole-workspace green result is claimed.
+> The same source's xfstests run `39084434440` completed the ext4 job, but the
+> btrfs job reached its unchanged 60-minute limit during `generic/027` disk-full
+> recovery. Artifact `12121423186` records repeated pressure-commit `ENOSPC`
+> failures. This is an unresolved recovery regression against the earlier
+> `bd-x4h1q` qualification, not a btrfs suite pass; the original durability item
+> remains open while its relationship to the new pressure path is investigated.
+> The retained mount log records 15,155 failed pressure attempts over 39 minutes
+> 14 seconds before the first recovery commit. Pending COW/data accounting debt
+> rose during that interval; it is not RSS. Stable rolled-back physical
+> allocation does not establish a new allocator leak. Candidate `374f4604c`
+> coalesces failed pressure retries until another configured work budget, while
+> an ordinary allocation refusal after real freeing progress can request a
+> boundary even with pressure disabled. Admission, post-rollback failure debt
+> and latch publication share allocator-write exclusion. Explicit/periodic
+> boundaries remain available without that budget. Native planted-ENOSPC,
+> unchanged-refusal and recovered-name/payload controls passed independent RCH
+> `30067604894777493`: 27 passed, zero failed or ignored, 1,508 filtered,
+> 65.54 seconds, tree `d57766d01ab47457f73c9fa192c5a1c395624dcf`, no overlays.
+> This includes both first/final sync ENOSPC and the earlier 24 controls.
+> The test-only old-runtime probe `30067604894777489` failed both selected
+> negatives: the ledger assertion and pressure retry after unlink. These native
+> injected failures are not real metadata exhaustion. Two runs on hz3 stopped before
+> compilation (SSH timeout, then namespace initialization); neither is a test
+> result. The original `generic/027` completion remains required.
+> Original real-volume recovery test `btrfs_creates_get_enospc_once_commits_run_out_of_space`
+> separately passed independent RCH `30067604894777494` on the same frozen source:
+> one passed, zero failed or ignored, 1,534 filtered, 165.64 seconds. It fills a
+> 128 MiB image, unlinks its files, then requires fsync and new create/write/read
+> success. It does not replace mounted `generic/027`. Subsequent test-helper
+> cleanup replaces three constant-formatted tool names with identical literal
+> executables, preserving all arguments and assertions; it has separate source
+> review, with final runtime gates still pending. Before cleanup, scoped UBS
+> reported three inherited constant-tool false positives and 13,856 warnings.
+> The final scoped scan exits zero: no critical reports, 13,856 warnings and
+> 2,922 informational reports. Neither that result nor the earlier partial/red
+> seven-file scan establishes a globally clean tree.
 
 > **Protected scrub integration (`bd-11a8t`, controls verified 2026-10-12):**
 > `ffs-protected-mount` now shares the ordinary CLI's child-region worker and

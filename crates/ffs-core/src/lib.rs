@@ -2172,6 +2172,33 @@ fn for_each_uncovered(
     Ok(())
 }
 
+/// Work admitted after a full-commit ENOSPC failure. Result publication and
+/// admission both follow the allocator lock, so old failures cannot reappear
+/// after a newer successful boundary.
+#[derive(Default)]
+struct BtrfsPressureRetry {
+    failed_after_bytes: Option<u64>,
+    space_request_refused: bool,
+}
+
+impl BtrfsPressureRetry {
+    fn should_attempt(&self, pending: u64, limit: u64, space_demand: bool) -> bool {
+        if space_demand
+            && self
+                .failed_after_bytes
+                .is_some_and(|failed| pending == u64::MAX || pending > failed)
+        {
+            return true;
+        }
+        limit != 0
+            && pending >= limit
+            && (pending == u64::MAX
+                || self
+                    .failed_after_bytes
+                    .is_none_or(|failed| pending.saturating_sub(failed) >= limit))
+    }
+}
+
 /// Everything a btrfs commit changes in memory before its superblock write,
 /// restored if it fails there (bd-x4h1q). Trees are COW checkpoints (no
 /// copy); the rest is small and cloned. The FS tree is only read by a commit.
@@ -2797,6 +2824,9 @@ pub struct OpenFs {
     /// allocations. A successful full superblock sync acknowledges this debt.
     btrfs_dirty_bytes_threshold: AtomicU64,
     btrfs_block_writes_at_boundary: AtomicU64,
+    /// Coalesce ENOSPC pressure retries by additional work. Always acquire
+    /// after the allocator when both locks are needed; never hold across I/O.
+    btrfs_pressure_retry: Mutex<BtrfsPressureRetry>,
     /// Journal-pressure commit threshold in committed MVCC block writes
     /// (bd-1o6tq); 0 while no JBD2 writer is attached.
     jbd2_pressure_limit: std::sync::atomic::AtomicU64,
@@ -7602,6 +7632,7 @@ impl OpenFs {
             committed_mutation_epoch: std::sync::atomic::AtomicU64::new(0),
             btrfs_dirty_bytes_threshold: AtomicU64::new(DEFAULT_BTRFS_DIRTY_BYTES_THRESHOLD),
             btrfs_block_writes_at_boundary: AtomicU64::new(0),
+            btrfs_pressure_retry: Mutex::new(BtrfsPressureRetry::default()),
             jbd2_pressure_limit: std::sync::atomic::AtomicU64::new(0),
             jbd2_block_writes_at_boundary: std::sync::atomic::AtomicU64::new(0),
             mvcc_resident_block_cap: std::sync::atomic::AtomicUsize::new(
@@ -11890,6 +11921,7 @@ impl OpenFs {
 
     /// Configure btrfs's conservative pending-data/COW-allocation budget.
     /// Zero disables pressure commits; the periodic timer remains independent.
+    /// A refused allocation after ENOSPC can still retry completed freeing work.
     pub fn set_btrfs_dirty_bytes_threshold(&self, bytes: u64) {
         self.btrfs_dirty_bytes_threshold
             .store(bytes, Ordering::Release);
@@ -11900,6 +11932,10 @@ impl OpenFs {
             return 0;
         };
         let alloc = alloc.read();
+        self.btrfs_pending_dirty_bytes_locked(&alloc)
+    }
+
+    fn btrfs_pending_dirty_bytes_locked(&self, alloc: &BtrfsAllocState) -> u64 {
         let written = self.mvcc_store.committed_block_writes();
         let covered = self.btrfs_block_writes_at_boundary.load(Ordering::Acquire);
         // Saturation must stay conservatively dirty, including when the last
@@ -11930,14 +11966,15 @@ impl OpenFs {
             return;
         }
         let limit = self.btrfs_dirty_bytes_threshold.load(Ordering::Acquire);
-        if limit == 0 {
+        let out_of_space = self.btrfs_commit_out_of_space.load(Ordering::Acquire);
+        if limit == 0 && !out_of_space {
             return;
         }
         let pending_bytes = self.btrfs_pending_dirty_bytes();
-        if pending_bytes < limit {
+        if pending_bytes < limit && !out_of_space {
             return;
         }
-        match self.periodic_commit(cx) {
+        match self.btrfs_pressure_transaction_commit(cx, limit) {
             Ok(committed) => info!(
                 target: "ffs::btrfs::writeback",
                 pending_bytes,
@@ -11945,13 +11982,15 @@ impl OpenFs {
                 committed,
                 "btrfs_pressure_commit"
             ),
-            Err(error) => warn!(
-                target: "ffs::btrfs::writeback",
-                pending_bytes,
-                limit,
-                %error,
-                "btrfs_pressure_commit_failed"
-            ),
+            Err(error) => {
+                warn!(
+                    target: "ffs::btrfs::writeback",
+                    pending_bytes,
+                    limit,
+                    %error,
+                    "btrfs_pressure_commit_failed"
+                );
+            }
         }
     }
 
@@ -38704,7 +38743,7 @@ impl OpenFs {
     /// - If `btrfs_rw_ephemeral_ok` is FALSE (default) → durable mode, full transaction commit
     /// - If `btrfs_rw_ephemeral_ok` is TRUE → ephemeral mode, tree-log only (opt-in)
     ///
-    /// This function now always returns `Ok(())` — the EROFS interlock is retired.
+    /// A refused durable commit can still return read-only or ENOSPC below.
     #[inline]
     #[allow(clippy::unnecessary_wraps, clippy::unused_self)]
     fn require_btrfs_rw_allowed(&self, operation: &str) -> ffs_error::Result<()> {
@@ -38728,6 +38767,9 @@ impl OpenFs {
         if btrfs_operation_consumes_space(operation)
             && self.btrfs_commit_out_of_space.load(Ordering::Acquire)
         {
+            // The outer completion guard can retry after real freeing work,
+            // even if it is below the ordinary pressure budget or disabled.
+            self.btrfs_pressure_retry.lock().space_request_refused = true;
             return Err(FfsError::NoSpace);
         }
         Ok(())
@@ -39947,17 +39989,103 @@ impl OpenFs {
     /// - **WB-I1:** At every crash point, the set of durable nodes is prefix-closed
     ///   under references (no durable parent points at a non-durable child).
     /// - **WB-I2:** After crash, a reader observes generation `g` or `g+1`, never torn.
+    ///
+    /// One commit, transactional in memory (bd-x4h1q): the allocator lock is
+    /// held throughout, so nothing else interleaves, and if the commit fails
+    /// before its superblock write everything it changed in memory is
+    /// restored, so a retry starts from the same state instead of leaking
+    /// the space the failed attempt allocated. Its device writes went to
+    /// freshly allocated addresses that are free again after the restore.
+    /// (The free-space-tree leaf rewritten in place is the exception,
+    /// bd-x4h1q note.)
     fn btrfs_full_transaction_commit(
         &self,
         cx: &Cx,
         operation_id: &str,
     ) -> ffs_error::Result<BtrfsWritebackStats> {
-        let result = self.btrfs_full_transaction_commit_once(cx, operation_id);
+        // Recursive semantic readers are supported. Hold this exclusion here,
+        // including private/native callers, before sampling installed writes.
+        let _view = self.btrfs_semantic_view_guard()?;
+        let alloc_mutex = self.require_btrfs_alloc_state()?;
+        let mut alloc = alloc_mutex.write();
+        let result = self.btrfs_commit_with_rollback_locked(cx, operation_id, &mut alloc);
+        drop(alloc);
+        if result.is_ok() {
+            self.evict_durable_mvcc_chains_quiesced();
+        }
+        result
+    }
+
+    fn btrfs_pressure_transaction_commit(&self, cx: &Cx, limit: u64) -> ffs_error::Result<bool> {
+        let _view = self.btrfs_semantic_view_guard()?;
+        let alloc_mutex = self.require_btrfs_alloc_state()?;
+        let mut alloc = alloc_mutex.write();
+        let pending = self.btrfs_pending_dirty_bytes_locked(&alloc);
+        {
+            let mut retry = self.btrfs_pressure_retry.lock();
+            let space_demand = std::mem::take(&mut retry.space_request_refused);
+            // Recheck after acquiring the write lock. Another caller may have
+            // completed a boundary or failed against the same debt meanwhile.
+            if !retry.should_attempt(pending, limit, space_demand) {
+                return Ok(false);
+            }
+        }
+        let epoch = self.mutation_epoch.load(Ordering::Acquire);
+        let result = self.btrfs_commit_with_rollback_locked(cx, "pressure-commit", &mut alloc);
+        drop(alloc);
+        result?;
+        self.evict_durable_mvcc_chains_quiesced();
+        self.committed_mutation_epoch
+            .fetch_max(epoch, Ordering::AcqRel);
+        Ok(true)
+    }
+
+    /// Caller holds semantic-read and allocator-write exclusion. This is also
+    /// the serialization point for retry admission and the ENOSPC latch.
+    fn btrfs_commit_with_rollback_locked(
+        &self,
+        cx: &Cx,
+        operation_id: &str,
+        alloc: &mut BtrfsAllocState,
+    ) -> ffs_error::Result<BtrfsWritebackStats> {
+        let snapshot = BtrfsCommitSnapshot::take(alloc, self);
+        // Not mutated by the commit, only written out: handed back intact if
+        // it fails (they used to be dropped, losing new subvolumes).
+        let subvol_trees = std::mem::take(&mut alloc.extra_subvol_trees);
+        let mut durable = false;
+        let result = self.btrfs_commit_locked(cx, operation_id, alloc, &subvol_trees, &mut durable);
+        if result.is_err() {
+            if durable {
+                snapshot.release(alloc);
+            } else {
+                snapshot.restore(alloc, self);
+            }
+            // A failed final sync cannot acknowledge or discard extra-tree
+            // debt, even if the superblock write has already started.
+            alloc.extra_subvol_trees = subvol_trees;
+        } else {
+            snapshot.release(alloc);
+        }
+        // Publish the result while commits are still serialized. Otherwise a
+        // delayed failed caller can re-latch ENOSPC after a newer success, or
+        // its old retry baseline can suppress a fresh healthy pressure budget.
         match &result {
-            Ok(_) => self
-                .btrfs_commit_out_of_space
-                .store(false, Ordering::Release),
-            Err(err) if err.to_errno() == libc::ENOSPC => {
+            Ok(_) => {
+                self.btrfs_commit_out_of_space
+                    .store(false, Ordering::Release);
+                let mut retry = self.btrfs_pressure_retry.lock();
+                retry.failed_after_bytes = None;
+                retry.space_request_refused = false;
+            }
+            Err(error) if error.to_errno() == libc::ENOSPC => {
+                // Sample after rollback/release and restoration of extra trees.
+                // Commit-generated work retained after a failed final sync is
+                // not evidence of a later freeing mutation.
+                let pending = self.btrfs_pending_dirty_bytes_locked(alloc);
+                let mut retry = self.btrfs_pressure_retry.lock();
+                retry.failed_after_bytes = Some(pending);
+                retry.space_request_refused = false;
+                drop(retry);
                 if !self.btrfs_commit_out_of_space.swap(true, Ordering::AcqRel) {
                     warn!(
                         target: "ffs::btrfs::rw",
@@ -39968,54 +40096,6 @@ impl OpenFs {
                 }
             }
             Err(_) => {}
-        }
-        result
-    }
-
-    /// One commit, transactional in memory (bd-x4h1q): the allocator lock is
-    /// held throughout, so nothing else interleaves, and if the commit fails
-    /// before its superblock write everything it changed in memory is
-    /// restored, so a retry starts from the same state instead of leaking
-    /// the space the failed attempt allocated. Its device writes went to
-    /// freshly allocated addresses that are free again after the restore.
-    /// (The free-space-tree leaf rewritten in place is the exception,
-    /// bd-x4h1q note.)
-    fn btrfs_full_transaction_commit_once(
-        &self,
-        cx: &Cx,
-        operation_id: &str,
-    ) -> ffs_error::Result<BtrfsWritebackStats> {
-        // Recursive semantic readers are supported. Hold this exclusion here,
-        // including private/native callers, before sampling installed writes.
-        let _view = self.btrfs_semantic_view_guard()?;
-        let alloc_mutex = self.require_btrfs_alloc_state()?;
-        let mut alloc = alloc_mutex.write();
-        let snapshot = BtrfsCommitSnapshot::take(&mut alloc, self);
-        // Not mutated by the commit, only written out: handed back intact if
-        // it fails (they used to be dropped, losing new subvolumes).
-        let subvol_trees = std::mem::take(&mut alloc.extra_subvol_trees);
-        let mut durable = false;
-        let result =
-            self.btrfs_commit_locked(cx, operation_id, &mut alloc, &subvol_trees, &mut durable);
-        if result.is_err() {
-            if durable {
-                snapshot.release(&mut alloc);
-            } else {
-                snapshot.restore(&mut alloc, self);
-            }
-            // A failed final sync cannot acknowledge or discard extra-tree
-            // debt, even if the superblock write has already started.
-            alloc.extra_subvol_trees = subvol_trees;
-        } else {
-            snapshot.release(&mut alloc);
-        }
-        drop(alloc);
-        // bd-dj725: drop the data this commit made durable from the MVCC
-        // store once over the resident cap. Only with the allocator lock
-        // released: this closes the mutation gate, and a gated mutation
-        // waiting for the lock would never drain.
-        if result.is_ok() {
-            self.evict_durable_mvcc_chains_quiesced();
         }
         result
     }
@@ -41939,7 +42019,7 @@ impl OpenFs {
         executor.commit_superblock();
 
         // bd-dj725's eviction of the data this commit made durable runs in
-        // btrfs_full_transaction_commit_once AFTER the allocator lock is
+        // btrfs_full_transaction_commit AFTER the allocator lock is
         // released: it closes the mutation gate, and a gated btrfs mutation
         // waiting for that lock would never drain (deadlock seen in CI with
         // xfstests generic/273's 50 writers).
@@ -51147,6 +51227,7 @@ mod tests {
         durable: Arc<parking_lot::Mutex<Vec<u8>>>,
         sync_count: Arc<AtomicUsize>,
         fail_on_sync: Arc<AtomicUsize>,
+        sync_failure_is_no_space: Arc<AtomicBool>,
     }
 
     impl CrashDevice {
@@ -51156,10 +51237,19 @@ mod tests {
                 durable: Arc::new(parking_lot::Mutex::new(v)),
                 sync_count: Arc::new(AtomicUsize::new(0)),
                 fail_on_sync: Arc::new(AtomicUsize::new(0)),
+                sync_failure_is_no_space: Arc::new(AtomicBool::new(false)),
             }
         }
 
         fn arm_sync_failure(&self, index: usize) {
+            self.sync_failure_is_no_space
+                .store(false, AtomicOrdering::SeqCst);
+            self.fail_on_sync.store(index, AtomicOrdering::SeqCst);
+        }
+
+        fn arm_sync_no_space_failure(&self, index: usize) {
+            self.sync_failure_is_no_space
+                .store(true, AtomicOrdering::SeqCst);
             self.fail_on_sync.store(index, AtomicOrdering::SeqCst);
         }
 
@@ -51221,6 +51311,9 @@ mod tests {
             let n = self.sync_count.fetch_add(1, AtomicOrdering::SeqCst) + 1;
             let fail = self.fail_on_sync.load(AtomicOrdering::SeqCst);
             if fail != 0 && n == fail {
+                if self.sync_failure_is_no_space.load(AtomicOrdering::SeqCst) {
+                    return Err(FfsError::NoSpace);
+                }
                 return Err(FfsError::Io(std::io::Error::other("injected sync failure")));
             }
             let snapshot = self.volatile.lock().clone();
@@ -98946,10 +99039,8 @@ mod tests {
         f.set_len(size_mb * 1024 * 1024).expect("set image size");
         drop(f);
 
-        // Format with the btrfs userspace tool. mkfs name assembled to avoid a
-        // literal that the dev sandbox command-guard rejects.
-        let fmt_tool = format!("mk{}.btrfs", "fs");
-        let out = std::process::Command::new(fmt_tool)
+        // Format the new test image with the fixed btrfs userspace tool.
+        let out = std::process::Command::new("mkfs.btrfs")
             .args(mkfs_args)
             .args(["-f", image.to_str().unwrap()])
             .output();
@@ -101023,6 +101114,335 @@ mod tests {
     }
 
     #[test]
+    fn btrfs_pressure_retry_admission_boundaries_bd_x4h1q() {
+        for (failed, pending, limit, demand, expected) in [
+            (None, 0, 128, false, false),
+            (None, 128, 128, false, true),
+            (Some(128), 128, 128, false, false),
+            (Some(128), 255, 128, false, false),
+            (Some(128), 256, 128, false, true),
+            (Some(128), 129, 128, true, true),
+            (Some(128), 128, 128, true, false),
+            (Some(8), 9, 128, true, true),
+            (Some(8), 9, 0, true, true),
+            (Some(8), 8, 0, true, false),
+            (Some(u64::MAX), u64::MAX, 0, true, true),
+            (Some(u64::MAX), u64::MAX, u64::MAX, false, true),
+            (None, u64::MAX, 0, false, false),
+            (None, 129, 0, true, false),
+        ] {
+            let retry = BtrfsPressureRetry {
+                failed_after_bytes: failed,
+                space_request_refused: demand,
+            };
+            assert_eq!(
+                retry.should_attempt(pending, limit, demand),
+                expected,
+                "failed={failed:?}, pending={pending}, limit={limit}, demand={demand}"
+            );
+        }
+    }
+
+    #[test]
+    fn btrfs_pressure_enospc_recovery_batches_real_mutations_bd_x4h1q() {
+        let Some((seed_fs, seed_dev, _tmp, image)) = open_writable_btrfs_mkfs(256) else {
+            return;
+        };
+        let device = CrashDevice::from_vec(seed_dev.snapshot_bytes());
+        drop(seed_fs);
+        let cx = Cx::for_testing();
+        let root = InodeNumber(u64::from(BTRFS_FIRST_FREE_OBJECTID));
+        let mut fs =
+            OpenFs::from_device(&cx, Box::new(device.clone()), &OpenOptions::default()).unwrap();
+        fs.enable_writes(&cx).unwrap();
+        fs.set_btrfs_dirty_bytes_threshold(0);
+        let mut files = Vec::new();
+        for index in 0..24 {
+            let name = format!("pressure-recovery-{index}");
+            let file = fs
+                .create(&cx, root, OsStr::new(&name), 0o644, 0, 0)
+                .unwrap();
+            fs.write(&cx, file.ino, 0, &[0x5C; 4096]).unwrap();
+            files.push((name, file.ino));
+        }
+        let pinned_ino = files[0].1;
+        let pins = Arc::new(AtomicU64::new(1));
+        let oracle_pins = Arc::clone(&pins);
+        fs.install_open_handle_oracle(Arc::new(move |ino| {
+            if ino == pinned_ino {
+                oracle_pins.load(Ordering::Acquire)
+            } else {
+                0
+            }
+        }));
+        let budget = fs.btrfs_pending_dirty_bytes();
+        assert!(budget > 0);
+        fs.set_btrfs_dirty_bytes_threshold(budget);
+        let generation = fs.require_btrfs_alloc_state().unwrap().read().generation;
+        let failed_sync = device.sync_count() + 1;
+        device.arm_sync_no_space_failure(failed_sync);
+        fs.commit_on_dirty_pressure(&cx);
+        assert_eq!(
+            device.sync_count(),
+            failed_sync,
+            "execute the failed boundary"
+        );
+        assert!(fs.btrfs_commit_out_of_space.load(Ordering::Acquire));
+        assert_eq!(
+            fs.btrfs_pending_dirty_bytes(),
+            budget,
+            "failed debt retained"
+        );
+
+        // Real unlink and FORGET work must remain possible without retrying an
+        // expensive failed full commit after every small recovery mutation.
+        fs.unlink(&cx, root, OsStr::new(&files[0].0)).unwrap();
+        assert_eq!(device.sync_count(), failed_sync, "batch recovery unlink");
+        pins.store(0, Ordering::Release);
+        assert!(fs.finalize_unlinked_inode_public(&cx, pinned_ino).unwrap());
+        assert_eq!(device.sync_count(), failed_sync, "batch final FORGET");
+        let recovery_work = fs.btrfs_pending_dirty_bytes().saturating_sub(budget);
+        assert!(recovery_work > 0 && recovery_work < budget);
+        assert_eq!(
+            fs.require_btrfs_alloc_state().unwrap().read().generation,
+            generation
+        );
+
+        // An explicit durability boundary never waits for the retry budget.
+        device.disarm();
+        fs.fsync(&cx, files[1].1, 0, false).unwrap();
+        assert_eq!(fs.btrfs_pending_dirty_bytes(), 0);
+        assert!(!fs.btrfs_commit_out_of_space.load(Ordering::Acquire));
+        assert!(device.sync_count() > failed_sync);
+
+        // A completed boundary starts a new healthy pressure budget.
+        fs.set_btrfs_dirty_bytes_threshold(1);
+        let after_recovery = fs.require_btrfs_alloc_state().unwrap().read().generation;
+        fs.write(&cx, files[1].1, 0, &[0xA6; 4096]).unwrap();
+        assert!(fs.require_btrfs_alloc_state().unwrap().read().generation > after_recovery);
+        assert_eq!(fs.btrfs_pending_dirty_bytes(), 0);
+
+        let keeper = files[1].1;
+        let change_mode = |index: u32| {
+            fs.setattr(
+                &cx,
+                keeper,
+                &SetAttrRequest {
+                    mode: Some(if index.is_multiple_of(2) {
+                        0o600
+                    } else {
+                        0o644
+                    }),
+                    ..SetAttrRequest::default()
+                },
+            )
+            .unwrap();
+        };
+        fs.set_btrfs_dirty_bytes_threshold(0);
+        for index in 0..512 {
+            change_mode(index);
+            if fs.btrfs_pending_dirty_bytes() >= budget {
+                break;
+            }
+        }
+        let failed_debt = fs.btrfs_pending_dirty_bytes();
+        assert!(failed_debt >= budget, "real COW work fills the next budget");
+        fs.set_btrfs_dirty_bytes_threshold(budget);
+        let next_failed_sync = device.sync_count() + 1;
+        device.arm_sync_no_space_failure(next_failed_sync);
+        fs.commit_on_dirty_pressure(&cx);
+        assert_eq!(device.sync_count(), next_failed_sync);
+        assert_eq!(fs.btrfs_pending_dirty_bytes(), failed_debt);
+
+        // Measure actual new COW work before re-enabling ordinary pressure.
+        // No fsync/timer or counter assignment can make this retry succeed.
+        let mut retried = false;
+        for index in 0..512 {
+            fs.set_btrfs_dirty_bytes_threshold(0);
+            change_mode(index);
+            let pending = fs.btrfs_pending_dirty_bytes();
+            fs.set_btrfs_dirty_bytes_threshold(budget);
+            fs.commit_on_dirty_pressure(&cx);
+            if pending.saturating_sub(failed_debt) >= budget {
+                assert!(device.sync_count() > next_failed_sync);
+                assert_eq!(fs.btrfs_pending_dirty_bytes(), 0);
+                assert!(!fs.btrfs_commit_out_of_space.load(Ordering::Acquire));
+                retried = true;
+                break;
+            }
+            assert_eq!(
+                device.sync_count(),
+                next_failed_sync,
+                "sub-budget work batches"
+            );
+            assert_eq!(fs.btrfs_pending_dirty_bytes(), pending, "debt never hidden");
+            assert!(fs.btrfs_commit_out_of_space.load(Ordering::Acquire));
+        }
+        assert!(
+            retried,
+            "ordinary pressure retries after one more work budget"
+        );
+
+        // The periodic entry point also bypasses a failed-pressure budget,
+        // even with no new mutation since the failed boundary.
+        fs.set_btrfs_dirty_bytes_threshold(0);
+        change_mode(0);
+        change_mode(1);
+        let periodic_debt = fs.btrfs_pending_dirty_bytes();
+        assert!(periodic_debt > 0);
+        fs.set_btrfs_dirty_bytes_threshold(periodic_debt);
+        let periodic_failed_sync = device.sync_count() + 1;
+        device.arm_sync_no_space_failure(periodic_failed_sync);
+        fs.commit_on_dirty_pressure(&cx);
+        assert_eq!(device.sync_count(), periodic_failed_sync);
+        assert_eq!(fs.btrfs_pending_dirty_bytes(), periodic_debt);
+        assert!(fs.periodic_commit(&cx).unwrap());
+        assert!(device.sync_count() > periodic_failed_sync);
+        assert_eq!(fs.btrfs_pending_dirty_bytes(), 0);
+        assert!(!fs.btrfs_commit_out_of_space.load(Ordering::Acquire));
+
+        fs.set_btrfs_dirty_bytes_threshold(0);
+        change_mode(0);
+        change_mode(1);
+        let before_span = device.sync_count();
+        fs.fsync(&cx, keeper, 0, false).unwrap();
+        let final_sync_span = device.sync_count() - before_span;
+        assert!(final_sync_span >= 2, "measure distinct durability barriers");
+        change_mode(0);
+        let before_final_debt = fs.btrfs_pending_dirty_bytes();
+        assert!(before_final_debt > 0);
+        let final_failed_sync = device.sync_count() + final_sync_span;
+        device.arm_sync_no_space_failure(final_failed_sync);
+        assert_eq!(
+            fs.fsync(&cx, keeper, 0, false).unwrap_err().to_errno(),
+            libc::ENOSPC
+        );
+        assert_eq!(device.sync_count(), final_failed_sync);
+        let final_failed_debt = fs.btrfs_pending_dirty_bytes();
+        assert!(final_failed_debt >= before_final_debt);
+        assert!(fs.btrfs_commit_out_of_space.load(Ordering::Acquire));
+        fs.set_btrfs_dirty_bytes_threshold(1);
+        assert_eq!(
+            fs.create(
+                &cx,
+                root,
+                OsStr::new("unchanged-final-failure"),
+                0o644,
+                0,
+                0
+            )
+            .expect_err("commit-generated work is not later recovery progress")
+            .to_errno(),
+            libc::ENOSPC
+        );
+        assert_eq!(device.sync_count(), final_failed_sync);
+        assert_eq!(fs.btrfs_pending_dirty_bytes(), final_failed_debt);
+        fs.fsync(&cx, keeper, 0, false).unwrap();
+        assert!(device.sync_count() > final_failed_sync);
+        assert_eq!(fs.btrfs_pending_dirty_bytes(), 0);
+        assert!(!fs.btrfs_commit_out_of_space.load(Ordering::Acquire));
+
+        fs.set_btrfs_dirty_bytes_threshold(0);
+        change_mode(0);
+        change_mode(1);
+        let demand_debt = fs.btrfs_pending_dirty_bytes();
+        assert!(demand_debt > 0);
+        let demand_failed_sync = device.sync_count() + 1;
+        device.arm_sync_no_space_failure(demand_failed_sync);
+        assert_eq!(
+            fs.fsync(&cx, keeper, 0, false).unwrap_err().to_errno(),
+            libc::ENOSPC
+        );
+        assert_eq!(device.sync_count(), demand_failed_sync);
+        assert!(fs.btrfs_commit_out_of_space.load(Ordering::Acquire));
+        assert_eq!(fs.btrfs_pending_dirty_bytes(), demand_debt);
+        let retry_name = OsStr::new("ordinary-enospc-retry");
+        assert_eq!(
+            fs.create(&cx, root, retry_name, 0o644, 0, 0)
+                .expect_err("unchanged space demand remains refused")
+                .to_errno(),
+            libc::ENOSPC
+        );
+        assert_eq!(
+            device.sync_count(),
+            demand_failed_sync,
+            "no repeated unchanged retry"
+        );
+
+        // Timer and pressure are disabled. Freeing work alone batches, but an
+        // ordinary allocation refusal must retry after that real progress.
+        let (removed_name, removed_ino) = files.remove(2);
+        fs.unlink(&cx, root, OsStr::new(&removed_name)).unwrap();
+        assert_eq!(
+            fs.getattr(&cx, removed_ino).unwrap_err().to_errno(),
+            libc::ENOENT
+        );
+        assert!(fs.btrfs_pending_dirty_bytes() > demand_debt);
+        assert_eq!(
+            device.sync_count(),
+            demand_failed_sync,
+            "disabled pressure batches unlink"
+        );
+        assert_eq!(
+            fs.create(&cx, root, retry_name, 0o644, 0, 0)
+                .expect_err("this refusal drives the recovery boundary")
+                .to_errno(),
+            libc::ENOSPC
+        );
+        assert!(device.sync_count() > demand_failed_sync);
+        assert_eq!(fs.btrfs_pending_dirty_bytes(), 0);
+        assert!(!fs.btrfs_commit_out_of_space.load(Ordering::Acquire));
+        let replacement = fs.create(&cx, root, retry_name, 0o644, 0, 0).unwrap();
+        fs.write(&cx, replacement.ino, 0, &[0x5C; 4096]).unwrap();
+        files.push((retry_name.to_string_lossy().into_owned(), replacement.ino));
+        fs.fsync(&cx, replacement.ino, 0, false).unwrap();
+
+        std::fs::write(&image, device.durable_bytes()).unwrap();
+        let reopened = OpenFs::from_device(
+            &cx,
+            Box::new(TestDevice::from_vec(device.durable_bytes())),
+            &OpenOptions::default(),
+        )
+        .unwrap();
+        assert_eq!(
+            reopened
+                .lookup(&cx, root, OsStr::new(&files[0].0))
+                .expect_err("unlinked name is absent")
+                .to_errno(),
+            libc::ENOENT
+        );
+        assert_eq!(
+            reopened
+                .getattr(&cx, pinned_ino)
+                .expect_err("final FORGET reclaims the inode")
+                .to_errno(),
+            libc::ENOENT
+        );
+        assert_eq!(
+            reopened
+                .lookup(&cx, root, OsStr::new(&removed_name))
+                .unwrap_err()
+                .to_errno(),
+            libc::ENOENT
+        );
+        assert_eq!(
+            reopened.lookup(&cx, root, retry_name).unwrap().ino,
+            replacement.ino
+        );
+        for (index, (name, ino)) in files.iter().enumerate().skip(1) {
+            assert_eq!(
+                reopened.lookup(&cx, root, OsStr::new(name)).unwrap().ino,
+                *ino
+            );
+            let byte = if index == 1 { 0xA6 } else { 0x5C };
+            assert_eq!(reopened.read(&cx, *ino, 0, 4096).unwrap(), vec![byte; 4096]);
+        }
+        if let Some((ok, output)) = run_btrfs_check(&image) {
+            assert!(ok, "recovery pressure boundary: {output}");
+        }
+    }
+
+    #[test]
     fn btrfs_dirty_publication_subvolume_and_snapshot_pressure_bd_dj725() {
         let Some((fs, dev, _tmp, image)) = open_writable_btrfs_mkfs(256) else {
             return;
@@ -101855,8 +102275,7 @@ mod tests {
         std::fs::File::create(&image)
             .and_then(|f| f.set_len(256 * 1024 * 1024))
             .expect("create image");
-        let fmt_tool = format!("mk{}.btrfs", "fs");
-        let made = std::process::Command::new(fmt_tool)
+        let made = std::process::Command::new("mkfs.btrfs")
             .args(["-q", "-f", "--rootdir"])
             .arg(&tree)
             .args(["--subvol", "rw:sv", "--subvol", "rw:sv/inner"])
@@ -110845,12 +111264,8 @@ mod tests {
         let tmp = tempfile::TempDir::new().expect("tmpdir");
         let path = tmp.path().join(format!("{label}.btrfs"));
         std::fs::write(&path, image).ok()?;
-        // Assembled so the development command guard does not read this as an
-        // operator filesystem-repair command; `--readonly` is belt and braces
-        // since `check` does not repair unless asked, and this must never mutate
-        // the artefact it is judging.
-        let tool = format!("btr{}", "fs");
-        let out = std::process::Command::new(tool)
+        // The oracle must never mutate the artifact it is judging.
+        let out = std::process::Command::new("btrfs")
             .arg("check")
             .arg("--readonly")
             .arg(&path)
