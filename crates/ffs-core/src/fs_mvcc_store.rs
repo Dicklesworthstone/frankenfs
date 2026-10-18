@@ -1547,16 +1547,27 @@ mod commit_error_mapping_tests {
         assert!(commit_seq.0 > 0);
 
         // Abort a transaction
-        let abort_txn = store.begin();
+        let mut abort_txn = store.begin();
+        abort_txn.stage_write(BlockNumber(10), vec![0xEF; 4096]);
         store.abort(
             abort_txn,
             TxnAbortReason::UserAbort,
             Some("test abort".to_owned()),
         );
         assert_eq!(store.effective_policy(), store.conflict_policy());
+        // Fixed policies skip adaptive contention metrics. Explicit aborts use
+        // the independent transaction-outcome counters.
         let metrics = store.contention_metrics();
-        assert_eq!(metrics.total_commits, 1);
-        assert_eq!(metrics.total_aborts, 1);
+        assert_eq!(metrics.total_commits, 0);
+        assert_eq!(metrics.total_aborts, 0);
+        let outcomes = store.transaction_outcome_stats();
+        assert_eq!(outcomes.aborted_transactions, 1);
+        assert_eq!(outcomes.ssi_conflicts, 0);
+        assert_eq!(store.current_snapshot().high, commit_seq);
+        assert_eq!(
+            store.read_visible(BlockNumber(10), store.current_snapshot()),
+            Some(vec![0xAB; 4096])
+        );
 
         // Verify the ledger contents
         let content = std::fs::read_to_string(&ledger_path).expect("read ledger");
@@ -1592,5 +1603,6 @@ mod commit_error_mapping_tests {
             2,
             "no lines added after disable"
         );
+        assert_eq!(content_after, content, "ledger unchanged after disable");
     }
 }
