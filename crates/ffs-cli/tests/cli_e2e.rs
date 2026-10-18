@@ -134,9 +134,7 @@ fn create_minimal_ext4_image(dir: &Path, size_mb: u32) -> std::path::PathBuf {
 }
 
 fn run_ffs_cli(args: &[&str]) -> std::process::Output {
-    let bin_path = env!("CARGO_BIN_EXE_ffs-cli");
-
-    Command::new(bin_path)
+    Command::new(env!("CARGO_BIN_EXE_ffs-cli"))
         .args(args)
         .output()
         .expect("failed to execute ffs-cli")
@@ -186,7 +184,7 @@ fn sha256_bytes(bytes: &[u8]) -> String {
 }
 
 fn run_cli_binary(binary: &Path, args: &[&str]) -> Output {
-    Command::new(binary)
+    Command::new(binary) // ubs:ignore[rust.security.command-executable] Ignored bd-b9dug benchmarks intentionally execute a trusted operator-selected baseline or Cargo-built candidate.
         .args(args)
         .output()
         .unwrap_or_else(|error| panic!("execute {}: {error}", binary.display()))
