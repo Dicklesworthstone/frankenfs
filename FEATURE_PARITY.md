@@ -419,7 +419,8 @@
 > negatives: the ledger assertion and pressure retry after unlink. These native
 > injected failures are not real metadata exhaustion. Two runs on hz3 stopped before
 > compilation (SSH timeout, then namespace initialization); neither is a test
-> result. The original `generic/027` completion remains required.
+> result. Those native runs did not qualify mounted `generic/027`; its later
+> hosted completion is recorded below.
 > Original real-volume recovery test `btrfs_creates_get_enospc_once_commits_run_out_of_space`
 > separately passed independent RCH `30067604894777494` on the same frozen source:
 > one passed, zero failed or ignored, 1,534 filtered, 165.64 seconds. It fills a
@@ -432,6 +433,27 @@
 > The final scoped scan exits zero: no critical reports, 13,856 warnings and
 > 2,922 informational reports. Neither that result nor the earlier partial/red
 > seven-file scan establishes a globally clean tree.
+> Hosted follow-up on published `75ec3254f`: xfstests run `39093406212`
+> completed the actual btrfs `generic/027` in 2,634 seconds. Retained artifact
+> `12125251312` contains all 100 iterations in `generic/027.full`, no 027
+> mismatch, and subsequent tests through `generic/241`. Its SHA-256 is
+> `46e9a1337a8b3439f4e2944f98dd8d3d6a320076020a58c8212de3dbd7c1594c`.
+> Independent review accepted closure of original `bd-x4h1q` on these two
+> executed recovery conditions; broader durability and workspace items remain open.
+> The job later reached its unchanged one-hour limit; this is not a complete
+> btrfs-suite pass. `generic/015` still reports free space of 3,456 outside
+> its required 175,760.64–179,311.36 range. The ext4 job completed successfully.
+> No performance win is claimed from a comparison between separate runs.
+> The same source's workspace CI `39093406215` failed the unchanged
+> chunk-growth test's growth-disabled control at create `fill41359.dat`;
+> its integration binary reported two passed, one failed and one ignored.
+> The growth-enabled candidate and its kernel checks were never reached.
+> Independent review identified the test's intended single-boundary workload
+> interacting with automatic pressure commits. A three-line, separately owned
+> candidate disables pressure in both arms while preserving all 60,000 creates,
+> explicit control ENOSPC, default candidate growth and native/kernel checks.
+> It remains unlanded and unexecuted; it does not qualify default pressure
+> scheduling. Original workspace-baseline acceptance remains open.
 
 > **Filesystem sync ioctl connection (`bd-8u2a5`, native-qualified 2026-10-18):**
 > The existing ioctl dispatch reached the default `FsOps::sync_fs` success
@@ -467,7 +489,10 @@
 > 3,099 informational reports, exit zero.
 > These helper edits do not relabel the `cafe23fc0` runtime receipt or establish
 > a globally clean scan, a parity-percentage increase, or ordinary `syncfs`
-> delivery. Current hosted `75ec3254f` validation remains separately qualified.
+> delivery. Latest published `2a50f1449` passes hosted CI `39095726991`
+> formatting, strict all-target Clippy and compiler checks. Its workspace tests
+> and mounted qualification remain outstanding. Further compilation is blocked
+> by failed storage preflights; no guard or workload was reduced.
 
 > **Protected scrub integration (`bd-11a8t`, controls verified 2026-10-12):**
 > `ffs-protected-mount` now shares the ordinary CLI's child-region worker and
