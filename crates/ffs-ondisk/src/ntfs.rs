@@ -8,6 +8,7 @@
 pub mod attribute_list;
 pub mod ea;
 pub mod index;
+mod log_transactions;
 pub mod recovery;
 pub mod reparse;
 
@@ -575,6 +576,8 @@ pub fn protect_record(restored: &[u8]) -> Result<Vec<u8>, ParseError> {
 }
 
 /// NTFS `$LogFile` operation codes (`NTFS_LOG_OPERATION`).
+/// Native numbers follow Linux v6.17 `fs/ntfs3/fslog.c`. Recognition is not
+/// execution support: transaction controls must never become byte patches.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NtfsLogOp {
     Noop,
@@ -587,6 +590,7 @@ pub enum NtfsLogOp {
     UpdateResidentValue,
     UpdateNonresidentValue,
     UpdateMappingPairs,
+    DeleteDirtyClusters,
     SetNewAttributeSizes,
     AddIndexEntryRoot,
     DeleteIndexEntryRoot,
@@ -599,9 +603,21 @@ pub enum NtfsLogOp {
     UpdateFileNameAllocation,
     SetBitsInNonresidentBitMap,
     ClearBitsInNonresidentBitMap,
+    HotFix,
+    EndTopLevelAction,
+    PrepareTransaction,
     CommitTransaction,
     ForgetTransaction,
     OpenNonresidentAttribute,
+    OpenAttributeTableDump,
+    AttributeNamesDump,
+    DirtyPageTableDump,
+    TransactionTableDump,
+    UpdateRecordDataRoot,
+    UpdateRecordDataAllocation,
+    UpdateRelativeDataInIndex,
+    UpdateRelativeDataInIndex2,
+    ZeroEndOfFileRecord,
     Unknown(u16),
 }
 
@@ -619,25 +635,40 @@ impl NtfsLogOp {
             0x07 => Self::UpdateResidentValue,
             0x08 => Self::UpdateNonresidentValue,
             0x09 => Self::UpdateMappingPairs,
+            0x0A => Self::DeleteDirtyClusters,
             0x0B => Self::SetNewAttributeSizes,
             0x0C => Self::AddIndexEntryRoot,
             0x0D => Self::DeleteIndexEntryRoot,
             0x0E => Self::AddIndexEntryAllocation,
             0x0F => Self::DeleteIndexEntryAllocation,
-            0x10 | 0x19 => Self::WriteEndOfIndexBuffer,
-            0x12 => Self::SetIndexEntryVcnRoot,
-            0x13 => Self::SetIndexEntryVcnAllocation,
-            0x14 => Self::UpdateFileNameRoot,
-            0x15 => Self::UpdateFileNameAllocation,
-            0x16 => Self::SetBitsInNonresidentBitMap,
-            0x17 => Self::ClearBitsInNonresidentBitMap,
-            0x1B => Self::CommitTransaction,
-            0x1C => Self::ForgetTransaction,
-            0x1D => Self::OpenNonresidentAttribute,
+            0x10 => Self::WriteEndOfIndexBuffer,
+            0x11 => Self::SetIndexEntryVcnRoot,
+            0x12 => Self::SetIndexEntryVcnAllocation,
+            0x13 => Self::UpdateFileNameRoot,
+            0x14 => Self::UpdateFileNameAllocation,
+            0x15 => Self::SetBitsInNonresidentBitMap,
+            0x16 => Self::ClearBitsInNonresidentBitMap,
+            0x17 => Self::HotFix,
+            0x18 => Self::EndTopLevelAction,
+            0x19 => Self::PrepareTransaction,
+            0x1A => Self::CommitTransaction,
+            0x1B => Self::ForgetTransaction,
+            0x1C => Self::OpenNonresidentAttribute,
+            0x1D => Self::OpenAttributeTableDump,
+            0x1E => Self::AttributeNamesDump,
+            0x1F => Self::DirtyPageTableDump,
+            0x20 => Self::TransactionTableDump,
+            0x21 => Self::UpdateRecordDataRoot,
+            0x22 => Self::UpdateRecordDataAllocation,
+            0x23 => Self::UpdateRelativeDataInIndex,
+            0x24 => Self::UpdateRelativeDataInIndex2,
+            0x25 => Self::ZeroEndOfFileRecord,
             other => Self::Unknown(other),
         }
     }
 
+    /// Legacy physical-plan classification, not an instruction to memcpy a
+    /// payload. FILE/index operations require their native semantic executor.
     #[must_use]
     pub const fn patches_bytes(self) -> bool {
         matches!(
@@ -842,10 +873,14 @@ pub fn parse_ntfs_logfile(raw_logfile: &[u8]) -> Result<NtfsLogFilePlan, ParseEr
         if raw_page.get(..4) != Some(b"RCRD".as_slice()) {
             continue;
         }
-        let Ok(page) = restore_record(raw_page, b"RCRD") else {
-            continue;
-        };
-        let end_off = usize::from(le16(&page, 24).unwrap_or(0)).min(page.len());
+        // Dropping a torn page can drop a commit while retaining its updates,
+        // converting a winner into a loser. This flat scanner cannot prove a
+        // damaged RCRD page obsolete, so it must refuse the complete plan.
+        let page = restore_record(raw_page, b"RCRD")?;
+        let end_off = usize::from(le16(&page, 24)?);
+        if end_off < data_start || end_off > page.len() || !end_off.is_multiple_of(8) {
+            return Err(invalid("ntfs.rcrd", "invalid record-page data boundary"));
+        }
         let mut pos = data_start;
         while pos + hdr_len <= end_off {
             let this_lsn = le64(&page, pos)?;
@@ -859,9 +894,14 @@ pub fn parse_ntfs_logfile(raw_logfile: &[u8]) -> Result<NtfsLogFilePlan, ParseEr
             let record_type = le32(&page, pos + 32)?;
             let transaction_id = le32(&page, pos + 36)?;
             let payload_start = pos + hdr_len;
-            let Some(payload) = page.get(payload_start..payload_start + client_data_len) else {
-                break;
-            };
+            let payload_end = payload_start
+                .checked_add(client_data_len)
+                .filter(|end| *end <= end_off)
+                .ok_or_else(|| invalid("ntfs.rcrd", "client record exceeds initialized page data"))?;
+            let payload = &page[payload_start..payload_end];
+            if le16(&page, pos + 40)? != 0 {
+                return Err(invalid("ntfs.rcrd", "record flags require multi-page recovery"));
+            }
             if record_type == 1 && payload.len() >= 40 {
                 let redo_op = NtfsLogOp::from_raw(le16(payload, 0)?);
                 let undo_op = NtfsLogOp::from_raw(le16(payload, 2)?);
@@ -900,6 +940,9 @@ pub fn parse_ntfs_logfile(raw_logfile: &[u8]) -> Result<NtfsLogFilePlan, ParseEr
                 if this_lsn >= restart.oldest_lsn
                     && (restart.current_lsn == 0 || this_lsn <= restart.current_lsn)
                 {
+                    if records.len() >= 65_536 {
+                        return Err(invalid("ntfs.logfile", "record scan exceeds 65536 records"));
+                    }
                     records.push(NtfsLogRecord {
                         this_lsn,
                         client_previous_lsn,
@@ -918,51 +961,41 @@ pub fn parse_ntfs_logfile(raw_logfile: &[u8]) -> Result<NtfsLogFilePlan, ParseEr
                         undo_data,
                     });
                 }
+            } else if this_lsn >= restart.oldest_lsn
+                && (restart.current_lsn == 0 || this_lsn <= restart.current_lsn)
+            {
+                return Err(invalid(
+                    "ntfs.rcrd",
+                    "retained record needs checkpoint-aware or unsupported record decoding",
+                ));
             }
             let aligned = (hdr_len + client_data_len + 7) & !7;
             pos += aligned.max(hdr_len);
         }
+        if pos != end_off {
+            return Err(invalid("ntfs.rcrd", "partial record before the declared page boundary"));
+        }
     }
 
     records.sort_by_key(|r| r.this_lsn);
+    // Identical tail copies are harmless here. Conflicting copies must not
+    // allow sort order to choose a transaction's commit or undo contents.
+    if records.windows(2).any(|pair| {
+        pair[0].this_lsn == pair[1].this_lsn && pair[0] != pair[1]
+    }) {
+        return Err(invalid("ntfs.logfile", "conflicting records share an LSN"));
+    }
     records.dedup_by_key(|r| r.this_lsn);
 
-    // Pass 1: Analysis
-    #[derive(Clone, Copy, PartialEq, Eq)]
-    enum TxStatus {
-        Active,
-        Committed,
-    }
-    let mut tx_table: std::collections::BTreeMap<u32, (TxStatus, u64, u64)> =
-        std::collections::BTreeMap::new();
+    // Native transaction links, not all records sharing a numeric table slot,
+    // determine loser undo. This flat API has no checkpoint table seed; an
+    // incomplete lifetime or unsupported context fails instead of guessing.
+    let transactions = log_transactions::build(&records)?;
     let mut dirty_pages: std::collections::BTreeMap<u64, u64> = std::collections::BTreeMap::new();
-    let mut committed_set = std::collections::BTreeSet::new();
 
     for rec in &records {
         if rec.target_lcn != 0 && rec.redo_op.patches_bytes() {
             dirty_pages.entry(rec.target_lcn).or_insert(rec.this_lsn);
-        }
-        match rec.redo_op {
-            NtfsLogOp::CommitTransaction => {
-                tx_table.insert(
-                    rec.transaction_id,
-                    (TxStatus::Committed, rec.this_lsn, rec.client_undo_next_lsn),
-                );
-                committed_set.insert(rec.transaction_id);
-            }
-            NtfsLogOp::ForgetTransaction => {
-                tx_table.remove(&rec.transaction_id);
-                committed_set.insert(rec.transaction_id);
-            }
-            _ => {
-                let status = tx_table
-                    .get(&rec.transaction_id)
-                    .map_or(TxStatus::Active, |entry| entry.0);
-                tx_table.insert(
-                    rec.transaction_id,
-                    (status, rec.this_lsn, rec.client_undo_next_lsn),
-                );
-            }
         }
     }
 
@@ -990,39 +1023,14 @@ pub fn parse_ntfs_logfile(raw_logfile: &[u8]) -> Result<NtfsLogFilePlan, ParseEr
         }
     }
 
-    // Pass 3: Undo (loser transactions in descending LSN order)
-    let active_txs: std::collections::BTreeSet<u32> = tx_table
-        .iter()
-        .filter_map(|(&tx_id, &(status, _, _))| (status == TxStatus::Active).then_some(tx_id))
-        .collect();
-    let mut undo_actions = Vec::new();
-    for rec in records.iter().rev() {
-        if active_txs.contains(&rec.transaction_id)
-            && rec.target_lcn != 0
-            && rec.undo_op.patches_bytes()
-        {
-            undo_actions.push(NtfsRecoveryAction {
-                lsn: rec.this_lsn,
-                transaction_id: rec.transaction_id,
-                is_undo: true,
-                op: rec.undo_op,
-                target_lcn: rec.target_lcn,
-                cluster_block_offset: rec.cluster_block_offset,
-                record_offset: rec.record_offset,
-                attribute_offset: rec.attribute_offset,
-                data: rec.undo_data.clone(),
-            });
-        }
-    }
-
     Ok(NtfsLogFilePlan {
         restart,
         records_parsed: records.len(),
-        committed_transactions: committed_set.into_iter().collect(),
-        aborted_transactions: active_txs.into_iter().collect(),
+        committed_transactions: transactions.committed,
+        aborted_transactions: transactions.active,
         dirty_lcns: dirty_pages.keys().copied().collect(),
         redo_actions,
-        undo_actions,
+        undo_actions: transactions.undo_actions,
     })
 }
 

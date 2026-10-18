@@ -523,7 +523,7 @@ fn logfile_aries_recovery_redoes_committed_and_undoes_loser_transactions_in_over
         b"COMMITTED",
         b"resident!",
     );
-    let e2 = build_lfs_rcrd_entry((200, 100, 0), (1, 1), (0x1C, 0x00), 0, 0, &[], &[]);
+    let e2 = build_lfs_rcrd_entry((200, 100, 0), (1, 1), (0x1A, 0x00), 0, 0, &[], &[]);
     let e3 = build_lfs_rcrd_entry(
         (300, 0, 0),
         (2, 1),

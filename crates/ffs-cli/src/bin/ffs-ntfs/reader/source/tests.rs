@@ -458,9 +458,13 @@ fn action_log(lcn: u64, offset: u16, data: &[u8]) -> Vec<u8> {
     page[6..8].copy_from_slice(&9_u16.to_le_bytes());
     page[40..42].copy_from_slice(&0x1357_u16.to_le_bytes());
     let mut at = 64;
-    for (lsn, operation, patch) in [(10_u64, 0x08_u16, data), (11, 0x1B, b"".as_slice())] {
+    for (lsn, previous, operation, patch) in [
+        (10_u64, 0_u64, 0x08_u16, data),
+        (11, 10, 0x1A, b"".as_slice()),
+    ] {
         let payload_length = 40 + patch.len();
         page[at..at + 8].copy_from_slice(&lsn.to_le_bytes());
+        page[at + 8..at + 16].copy_from_slice(&previous.to_le_bytes());
         page[at + 24..at + 28].copy_from_slice(&(payload_length as u32).to_le_bytes());
         page[at + 32..at + 36].copy_from_slice(&1_u32.to_le_bytes());
         page[at + 36..at + 40].copy_from_slice(&42_u32.to_le_bytes());
