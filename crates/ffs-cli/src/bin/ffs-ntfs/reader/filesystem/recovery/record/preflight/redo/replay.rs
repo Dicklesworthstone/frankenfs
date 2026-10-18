@@ -145,7 +145,7 @@ impl MftInput for VolumeInput<'_> {
     }
 }
 
-fn operation(record: &LogRecord, undo: bool) -> Result<FileOperation> {
+fn operation(record: &LogRecord, undo: bool, volume_clusters: u64) -> Result<FileOperation> {
     let opcode = if undo {
         record.summary.undo_op
     } else {
@@ -158,6 +158,7 @@ fn operation(record: &LogRecord, undo: bool) -> Result<FileOperation> {
         7 => Ok(FileOperation::UpdateResident {
             resize: u16_at(&record.data, 6)? != u16_at(&record.data, 10)?,
         }),
+        9 => Ok(FileOperation::UpdateMappingPairs { volume_clusters }),
         11 => Ok(FileOperation::SetSizes),
         0x0C => Ok(FileOperation::IndexRoot(IndexOperation::AddEntry)),
         0x0D => Ok(FileOperation::IndexRoot(IndexOperation::DeleteEntry)),
@@ -305,7 +306,7 @@ fn execute(
             lcns: lcns.clone(),
             payload,
             pass: RecoveryPass::Redo(record.lsn),
-            operation: operation(record, false)?,
+            operation: operation(record, false, layout.clusters)?,
             number: target(layout, record, attribute, lcns)?,
         });
     }
@@ -351,7 +352,7 @@ fn execute(
             lcns,
             number,
             pass: RecoveryPass::Undo,
-            operation: operation(record, true)?,
+            operation: operation(record, true, layout.clusters)?,
             payload: targets::payload(record, true)?,
         });
     }

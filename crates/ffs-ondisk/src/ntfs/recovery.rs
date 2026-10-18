@@ -10,6 +10,7 @@ use ffs_types::ParseError;
 
 pub mod directory;
 pub use directory::{IndexEdit, IndexOperation, apply_index_edit};
+mod mapping;
 
 /// The native operations implemented for an already allocated FILE record.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -18,6 +19,9 @@ pub enum FileOperation {
     CreateAttribute,
     DeleteAttribute,
     UpdateResident { resize: bool },
+    /// Replace a logged mapping-pairs suffix. The caller supplies the selected
+    /// volume's cluster bound; this is not allocation/ownership authority.
+    UpdateMappingPairs { volume_clusters: u64 },
     SetSizes,
     IndexRoot(IndexOperation),
 }
@@ -234,6 +238,9 @@ fn edit_bytes(data: &mut [u8], edit: &FileEdit<'_>) -> Result<(), ParseError> {
         }
         FileOperation::IndexRoot(operation) => {
             directory::edit_root(data, at, size, edit, operation)?;
+        }
+        FileOperation::UpdateMappingPairs { volume_clusters } => {
+            mapping::edit(data, at, size, relative, payload, volume_clusters)?;
         }
         FileOperation::SetSizes => {
             if relative != 0

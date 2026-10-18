@@ -6,6 +6,8 @@ use ffs_ondisk::ntfs::NtfsValue;
 use reader::FfsError;
 use std::collections::BTreeSet;
 
+mod mapping;
+
 const REFERENCE: u64 = 7_u64 << 48;
 
 fn file(number: u32, kind: u32, value: &[u8]) -> Vec<u8> {
@@ -252,8 +254,10 @@ fn unsupported_later_opcode_prevents_even_the_first_file_read() {
     let targets = targets();
     let first = update(20, 24, b"changed!", b"original");
     let mut later = update(30, 24, b"changed!", b"original");
-    later.summary.redo_op = 9;
-    later.data[..2].copy_from_slice(&9_u16.to_le_bytes());
+    // Mapping-pairs updates now execute. Keep this pre-I/O refusal control
+    // on InitializeFileRecordSegment, which this executor still rejects.
+    later.summary.redo_op = 2;
+    later.data[..2].copy_from_slice(&2_u16.to_le_bytes());
     let records = [first, later];
     let plan = build(&cx, &targets, &records).unwrap();
     let mut input = Input::new();
