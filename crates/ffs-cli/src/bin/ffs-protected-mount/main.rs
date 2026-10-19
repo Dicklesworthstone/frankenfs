@@ -1,4 +1,5 @@
 #![forbid(unsafe_code)]
+#![recursion_limit = "256"]
 //! Explicitly authorized, sidecar-protected FUSE mounts.
 //!
 //! All format reads and writes go through the same admitted repair device.

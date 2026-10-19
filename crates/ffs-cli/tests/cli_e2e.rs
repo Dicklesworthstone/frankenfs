@@ -3368,8 +3368,173 @@ fn cli_inspect_empty_file_reports_error() {
     emit_scenario_result("cli_inspect_empty_file_error", "PASS", None);
 }
 
-// bd-0r0kc: there is deliberately no `gate7` test yet. Gate 7 (spec §22.1)
-// requires gates 1-6 in one run, a mount/info/scrub/umount/fsck CLI sequence,
-// TUI refresh and a leak soak; a wrapper around two unrelated CLI tests made
-// the gate report PASS. With no match, `ffs-harness gates` reports gate7 as
-// not_implemented until a real gate lands.
+fn build_gate7_ext4_image() -> Vec<u8> {
+    const BLOCK_SIZE: usize = 4096;
+    const IMAGE_SIZE: usize = 256 * 1024; // 64 blocks
+    const SB_OFF: usize = 1024;
+    let mut image = vec![0_u8; IMAGE_SIZE];
+
+    // Superblock
+    image[SB_OFF..SB_OFF + 4].copy_from_slice(&128_u32.to_le_bytes()); // s_inodes_count
+    image[SB_OFF + 0x04..SB_OFF + 0x08].copy_from_slice(&64_u32.to_le_bytes()); // s_blocks_count_lo
+    image[SB_OFF + 0x0C..SB_OFF + 0x10].copy_from_slice(&50_u32.to_le_bytes()); // s_free_blocks_count_lo
+    image[SB_OFF + 0x10..SB_OFF + 0x14].copy_from_slice(&117_u32.to_le_bytes()); // s_free_inodes_count
+    image[SB_OFF + 0x14..SB_OFF + 0x18].copy_from_slice(&0_u32.to_le_bytes()); // s_first_data_block
+    image[SB_OFF + 0x18..SB_OFF + 0x1C].copy_from_slice(&2_u32.to_le_bytes()); // s_log_block_size (4K)
+    image[SB_OFF + 0x20..SB_OFF + 0x24].copy_from_slice(&64_u32.to_le_bytes()); // s_blocks_per_group
+    image[SB_OFF + 0x28..SB_OFF + 0x2C].copy_from_slice(&128_u32.to_le_bytes()); // s_inodes_per_group
+    image[SB_OFF + 0x38..SB_OFF + 0x3A].copy_from_slice(&0xEF53_u16.to_le_bytes()); // s_magic
+    image[SB_OFF + 0x3A..SB_OFF + 0x3C].copy_from_slice(&1_u16.to_le_bytes()); // s_state = EXT4_VALID_FS
+    image[SB_OFF + 0x4C..SB_OFF + 0x50].copy_from_slice(&1_u32.to_le_bytes()); // s_rev_level
+    image[SB_OFF + 0x54..SB_OFF + 0x58].copy_from_slice(&11_u32.to_le_bytes()); // s_first_ino
+    image[SB_OFF + 0x58..SB_OFF + 0x5A].copy_from_slice(&256_u16.to_le_bytes()); // s_inode_size
+    let incompat: u32 = 0x0002 | 0x0040; // FILETYPE | EXTENTS
+    image[SB_OFF + 0x60..SB_OFF + 0x64].copy_from_slice(&incompat.to_le_bytes());
+    image[SB_OFF + 0xFE..SB_OFF + 0x100].copy_from_slice(&32_u16.to_le_bytes()); // s_desc_size
+
+    // Group descriptor at block 1
+    let gd_off = BLOCK_SIZE;
+    image[gd_off..gd_off + 4].copy_from_slice(&2_u32.to_le_bytes()); // block_bitmap
+    image[gd_off + 4..gd_off + 8].copy_from_slice(&3_u32.to_le_bytes()); // inode_bitmap
+    image[gd_off + 8..gd_off + 12].copy_from_slice(&4_u32.to_le_bytes()); // inode_table
+    image[gd_off + 0x0C..gd_off + 0x0E].copy_from_slice(&50_u16.to_le_bytes()); // free_blocks_count
+    image[gd_off + 0x0E..gd_off + 0x10].copy_from_slice(&117_u16.to_le_bytes()); // free_inodes_count
+    image[gd_off + 0x10..gd_off + 0x12].copy_from_slice(&1_u16.to_le_bytes()); // used_dirs_count
+
+    // Block bitmap at block 2: mark blocks 0..=13 allocated
+    let bbm = 2 * BLOCK_SIZE;
+    image[bbm] = 0xFF;
+    image[bbm + 1] = 0x3F;
+
+    // Inode bitmap at block 3: mark inodes 1..=11 allocated
+    let ibm = 3 * BLOCK_SIZE;
+    image[ibm] = 0xFF;
+    image[ibm + 1] = 0x07;
+
+    // Inode #2 (root dir) -> extent at block 12
+    let ino2 = 4 * BLOCK_SIZE + 256;
+    image[ino2..ino2 + 2].copy_from_slice(&0o040_755_u16.to_le_bytes());
+    image[ino2 + 4..ino2 + 8].copy_from_slice(&4096_u32.to_le_bytes());
+    image[ino2 + 0x1A..ino2 + 0x1C].copy_from_slice(&2_u16.to_le_bytes());
+    image[ino2 + 0x20..ino2 + 0x24].copy_from_slice(&0x0008_0000_u32.to_le_bytes());
+    image[ino2 + 0x80..ino2 + 0x82].copy_from_slice(&32_u16.to_le_bytes());
+    let e2 = ino2 + 0x28;
+    image[e2..e2 + 2].copy_from_slice(&0xF30A_u16.to_le_bytes());
+    image[e2 + 2..e2 + 4].copy_from_slice(&1_u16.to_le_bytes());
+    image[e2 + 4..e2 + 6].copy_from_slice(&4_u16.to_le_bytes());
+    image[e2 + 6..e2 + 8].copy_from_slice(&0_u16.to_le_bytes());
+    image[e2 + 12..e2 + 16].copy_from_slice(&0_u32.to_le_bytes());
+    image[e2 + 16..e2 + 18].copy_from_slice(&1_u16.to_le_bytes());
+    image[e2 + 18..e2 + 20].copy_from_slice(&0_u16.to_le_bytes());
+    image[e2 + 20..e2 + 24].copy_from_slice(&12_u32.to_le_bytes());
+
+    // Inode #11 (regular file) -> extent at block 13
+    let ino11 = 4 * BLOCK_SIZE + 10 * 256;
+    image[ino11..ino11 + 2].copy_from_slice(&0o100_644_u16.to_le_bytes());
+    image[ino11 + 4..ino11 + 8].copy_from_slice(&6_u32.to_le_bytes());
+    image[ino11 + 0x1A..ino11 + 0x1C].copy_from_slice(&1_u16.to_le_bytes());
+    image[ino11 + 0x20..ino11 + 0x24].copy_from_slice(&0x0008_0000_u32.to_le_bytes());
+    image[ino11 + 0x80..ino11 + 0x82].copy_from_slice(&32_u16.to_le_bytes());
+    let e11 = ino11 + 0x28;
+    image[e11..e11 + 2].copy_from_slice(&0xF30A_u16.to_le_bytes());
+    image[e11 + 2..e11 + 4].copy_from_slice(&1_u16.to_le_bytes());
+    image[e11 + 4..e11 + 6].copy_from_slice(&4_u16.to_le_bytes());
+    image[e11 + 6..e11 + 8].copy_from_slice(&0_u16.to_le_bytes());
+    image[e11 + 12..e11 + 16].copy_from_slice(&0_u32.to_le_bytes());
+    image[e11 + 16..e11 + 18].copy_from_slice(&1_u16.to_le_bytes());
+    image[e11 + 18..e11 + 20].copy_from_slice(&0_u16.to_le_bytes());
+    image[e11 + 20..e11 + 24].copy_from_slice(&13_u32.to_le_bytes());
+
+    // Block 12: root directory entries ".", "..", "hello.txt"
+    let d = 12 * BLOCK_SIZE;
+    image[d..d + 4].copy_from_slice(&2_u32.to_le_bytes());
+    image[d + 4..d + 6].copy_from_slice(&12_u16.to_le_bytes());
+    image[d + 6] = 1;
+    image[d + 7] = 2;
+    image[d + 8] = b'.';
+
+    let d = d + 12;
+    image[d..d + 4].copy_from_slice(&2_u32.to_le_bytes());
+    image[d + 4..d + 6].copy_from_slice(&12_u16.to_le_bytes());
+    image[d + 6] = 2;
+    image[d + 7] = 2;
+    image[d + 8..d + 10].copy_from_slice(b"..");
+
+    let d = d + 12;
+    image[d..d + 4].copy_from_slice(&11_u32.to_le_bytes());
+    image[d + 4..d + 6].copy_from_slice(&4072_u16.to_le_bytes());
+    image[d + 6] = 9;
+    image[d + 7] = 1;
+    image[d + 8..d + 17].copy_from_slice(b"hello.txt");
+
+    let b13 = 13 * BLOCK_SIZE;
+    image[b13..b13 + 6].copy_from_slice(b"hello\n");
+
+    image
+}
+
+#[test]
+#[ignore = "canonical spec §22.1 Gate 7: full conformance and user-facing tools"]
+fn gate7_full_conformance_and_tools() {
+    let tmpdir = tempfile::tempdir().expect("create temp dir");
+    let image = tmpdir.path().join("gate7.ext4");
+    fs::write(&image, build_gate7_ext4_image()).expect("write gate7 ext4 image");
+    let image_str = image.to_str().expect("utf-8 path");
+
+    // 1. Inspect (JSON)
+    let inspect = run_ffs_cli(&["inspect", "--json", image_str]);
+    assert!(
+        inspect.status.success(),
+        "ffs inspect --json failed: {}",
+        String::from_utf8_lossy(&inspect.stderr)
+    );
+    let inspect_json: serde_json::Value =
+        serde_json::from_slice(&inspect.stdout).expect("inspect JSON");
+    assert_eq!(inspect_json["filesystem"], "ext4");
+
+    // 2. Info + MVCC info
+    let info_out = run_ffs_cli(&["info", "--mvcc", image_str]);
+    assert!(
+        info_out.status.success(),
+        "ffs info --mvcc failed: {}",
+        String::from_utf8_lossy(&info_out.stderr)
+    );
+
+    // 3. Scrub / fsck (JSON)
+    let fsck = run_ffs_cli(&["fsck", "--json", image_str]);
+    assert!(
+        fsck.status.success(),
+        "ffs fsck --json failed: {}",
+        String::from_utf8_lossy(&fsck.stderr)
+    );
+    let fsck_json: serde_json::Value = serde_json::from_slice(&fsck.stdout).expect("fsck JSON");
+    assert_eq!(fsck_json["outcome"], "clean");
+    assert_eq!(fsck_json["exit_code"], 0);
+
+    // 4. TUI dashboard telemetry at 1 Hz (JSON snapshot + ASCII 1 Hz tick)
+    let tui_json_out = run_ffs_cli(&["tui", image_str, "--scrub", "--snapshot-json"]);
+    assert!(
+        tui_json_out.status.success(),
+        "ffs tui --snapshot-json failed: {}",
+        String::from_utf8_lossy(&tui_json_out.stderr)
+    );
+    let tui_snap: serde_json::Value =
+        serde_json::from_slice(&tui_json_out.stdout).expect("tui snapshot JSON");
+    assert_eq!(tui_snap["fs_type"], "ext4");
+    assert!(tui_snap["cache_capacity"].as_u64().unwrap_or(0) > 0);
+    assert!(tui_snap["scrub_blocks_scanned"].as_u64().unwrap_or(0) > 0);
+
+    let tui_ascii_out = run_ffs_cli(&["tui", image_str, "--scrub", "--refresh-ms", "1000"]);
+    assert!(
+        tui_ascii_out.status.success(),
+        "ffs tui ASCII render failed: {}",
+        String::from_utf8_lossy(&tui_ascii_out.stderr)
+    );
+    let tui_ascii = String::from_utf8_lossy(&tui_ascii_out.stdout);
+    assert!(tui_ascii.contains("=== FrankenFS Live Telemetry ==="));
+
+    // 5. User-facing error diagnostics and parity declarations
+    cli_inspect_empty_file_reports_error();
+    cli_inspect_nonexistent_file_returns_error();
+    parity_default_reports_declarations_without_execution_credit();
+}

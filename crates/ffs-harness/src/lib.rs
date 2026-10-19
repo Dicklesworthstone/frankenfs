@@ -1074,6 +1074,320 @@ const PARITY_CONTRACTS: &[(&str, &str, &str, &[&str])] = &[
             "tests::cli_parses_dump_dir_command_with_hex",
         ],
     ),
+    (
+        "ext4 extent header decode",
+        "Extent header offsets match kernel layout and zero-length leaf extents are rejected",
+        "ondisk-lib",
+        &[
+            "ext4::tests::ext4_extent_header_kernel_offsets_match_extents_h",
+            "ext4::tests::parse_extent_tree_rejects_zero_length_leaf_extent",
+        ],
+    ),
+    (
+        "ext4 allocator parity",
+        "Sharded block and inode allocators allocate valid distinct blocks and inodes",
+        "core-lib",
+        &[
+            "tests::bd_bhh0i_sharded_alloc_blocks_allocates_valid_distinct_blocks",
+            "tests::bd_bhh0i_sharded_alloc_inode_allocates_valid_distinct_inodes",
+        ],
+    ),
+    (
+        "ext4 orphan recovery parity",
+        "Mount-time orphan cleanup recovers deleted and truncated orphan chains and guards invalid heads",
+        "core-lib",
+        &[
+            "tests::open_fs_recovers_deleted_ext4_orphan_inode",
+            "tests::open_fs_recovers_truncated_ext4_orphan_inode",
+            "tests::open_fs_recovers_orphan_list_with_invalid_head",
+        ],
+    ),
+    (
+        "btrfs open/validate pipeline",
+        "Btrfs open validates tree roots and serves getattr, lookup, readdir, and read",
+        "core-lib",
+        &[
+            "tests::open_fs_btrfs_fsops_getattr_lookup_readdir_read",
+            "tests::btrfs_singleton_metadata_rejects_foreign_root_during_open",
+        ],
+    ),
+    (
+        "btrfs transaction parity",
+        "Btrfs transactions persist committed tree roots and drop uncommitted changes cleanly",
+        "btrfs-lib",
+        &[
+            "tests::btrfs_tx_commit_persists_tree_root_and_payload",
+            "tests::btrfs_tx_drop_without_commit_has_no_visible_effect",
+        ],
+    ),
+    (
+        "btrfs subvolume mount",
+        "Named subvolume and snapshot mount selection scopes root operations to the selected tree",
+        "cli-bins",
+        &[
+            "tests::open_filesystem_for_mount_scopes_named_btrfs_subvolume_operator_path",
+            "tests::open_filesystem_for_mount_scopes_named_btrfs_snapshot_operator_path",
+        ],
+    ),
+    (
+        "btrfs tree-log replay",
+        "Tree-log replay synthesizes directory entries from inode refs and round-trips delete records",
+        "btrfs-lib",
+        &[
+            "tests::tree_log_replay_synthesizes_dir_entries_from_inode_refs",
+            "tests::tree_log_delete_records_round_trip_exact_keys_bd_uxh7t",
+        ],
+    ),
+    (
+        "ext4 fscrypt (nokey read-only mode)",
+        "Encryption policy getters read hidden ext4 v1 and v2 fscrypt contexts",
+        "core-lib",
+        &[
+            "tests::get_encryption_policy_v1_reads_hidden_ext4_fscrypt_context",
+            "tests::get_encryption_policy_ex_reads_hidden_ext4_fscrypt_v2_context",
+        ],
+    ),
+    (
+        "btrfs multi-device RAID",
+        "Degraded RAID5/6 parity reconstruction and mirror read recovery succeed from eligible copies",
+        "core-lib",
+        &[
+            "tests::btrfs_raid56_degraded_reads_reconstruct_and_refuse_bd_hk5w3",
+            "tests::btrfs_mirror_read_failures_recover_only_from_eligible_complete_copies",
+        ],
+    ),
+    (
+        "btrfs RW durability (remount persistence)",
+        "Writable btrfs create path commits inode, directory, extent data, and updated root item location",
+        "btrfs-lib",
+        &[
+            "tests::integration_create_path_commits_inode_dir_and_extent_data",
+            "tests::root_item_commit_updates_tree_location",
+        ],
+    ),
+    (
+        "ext4 COMPRESSION (e2compr R/W)",
+        "Bidirectional gzip and LZO cluster compression round-trips and seeds inode defaults",
+        "core-lib",
+        &[
+            "tests::e2compr_compress_decompress_roundtrip_gzip",
+            "tests::e2compr_compress_decompress_roundtrip_lzo",
+            "tests::set_inode_flags_enabling_compr_with_feature_seeds_e2compr_defaults_and_write_path",
+        ],
+    ),
+    (
+        "asupersync config mapping",
+        "RaptorQ fountain-code encoder produces repair symbols and recovers corrupt blocks",
+        "repair-lib",
+        &[
+            "codec::tests::encode_produces_repair_symbols",
+            "codec::tests::decode_recovers_single_corrupt_block",
+        ],
+    ),
+    (
+        "FUSE mount runtime",
+        "Mount options default to read-only and validate mountpoint existence",
+        "fuse-lib",
+        &[
+            "tests::mount_options_default_is_read_only",
+            "tests::mount_rejects_nonexistent_mountpoint",
+        ],
+    ),
+    (
+        "FUSE mount background scrub lifecycle",
+        "Scrub daemon scans groups, detects corruption, and honors detection-only mode",
+        "repair-lib",
+        &[
+            "pipeline::tests::scrub_daemon_scans_at_least_one_group",
+            "pipeline::tests::scrub_daemon_detection_only_does_not_write_recovery_blocks",
+        ],
+    ),
+    (
+        "FUSE inotify rename + dentry notification lifecycle",
+        "Rename dispatch routes through FsOps and serializes overlapping parent pairs",
+        "fuse-lib",
+        &[
+            "tests::conformance_fuse_rename_directory_round_trip",
+            "tests::dispatch_rename_routes_to_fsops",
+            "tests::dispatch_rename_serializes_overlapping_parent_pairs",
+        ],
+    ),
+    (
+        "xfstests generic/ext4 subset infrastructure",
+        "Baseline manifest JSON and failure triage product extraction preserve subset invariants",
+        "xfstests-lib",
+        &[
+            "xfstests::tests::xfstests_baseline_manifest_json_shape",
+            "xfstests::tests::failure_triage_extracts_products_excludes_non_products_and_merges_duplicates",
+        ],
+    ),
+    (
+        "FAT16/FAT32 BPB and cluster geometry parsing",
+        "FAT geometry uses cluster count and validates active FAT32 copy and root cluster",
+        "ondisk-lib",
+        &[
+            "fat::tests::geometry_uses_cluster_count_and_volume_relative_offsets",
+            "fat::tests::fat32_active_copy_and_root_are_validated",
+        ],
+    ),
+    (
+        "FAT16/FAT32 allocation table entry classification",
+        "FAT entry decoding classifies free, allocated, reserved, bad, and EOF clusters",
+        "ondisk-lib",
+        &["fat::tests::allocation_entry_classes_and_reserved_bits"],
+    ),
+    (
+        "FAT16/FAT32 directory and LFN sequence decoding",
+        "VFAT long filenames bind to short records and preserve deleted and end markers",
+        "ondisk-lib",
+        &[
+            "fat::tests::long_name_is_bound_to_its_short_record",
+            "fat::tests::multi_slot_names_deleted_entries_and_end_marker",
+        ],
+    ),
+    (
+        "FAT16/FAT32 timestamp and OEM short-name projection",
+        "Directory timestamps and OEM codepage short names decode losslessly",
+        "ondisk-lib",
+        &[
+            "fat::tests::directory_timestamp_fields_are_lossless_in_both_dialects",
+            "fat::names::tests::explicit_code_page_controls_native_bytes_and_part_flags",
+        ],
+    ),
+    (
+        "NTFS boot sector and MFT record USA fixup decoding",
+        "NTFS boot geometry and 512-byte Update Sequence Array trailers are validated before use",
+        "ondisk-lib",
+        &[
+            "ntfs::tests::boot_validates_addressable_range_and_both_record_size_encodings",
+            "ntfs::tests::all_trailers_are_checked_and_input_is_never_partially_restored",
+        ],
+    ),
+    (
+        "NTFS attribute list and non-resident mapping pairs",
+        "Mapping pairs handle signed deltas and sparse runs and attribute lists preserve continuation VCNs",
+        "ondisk-lib",
+        &[
+            "ntfs::tests::mapping_pairs_handle_backward_deltas_and_sparse_runs_without_resetting_lcn",
+            "ntfs::attribute_list::tests::references_names_and_continuation_vcns_are_lossless",
+        ],
+    ),
+    (
+        "NTFS index root and INDX B-tree block decoding",
+        "Resident index roots and INDX blocks enforce VBN units, USA fixups, and bounds",
+        "ondisk-lib",
+        &[
+            "ntfs::index::tests::resident_index_keys_and_subcluster_vbn_units_are_explicit",
+            "ntfs::index::tests::indx_requires_matching_vbn_valid_fixups_and_no_usa_overlap",
+        ],
+    ),
+    (
+        "NTFS extended attributes and security descriptor catalog",
+        "Extended attributes and security descriptors preserve names, SIDs, ACLs, and hashes",
+        "ondisk-lib",
+        &[
+            "ntfs::ea::tests::native_nonzero_final_lengths_preserve_names_binary_values_and_need_count",
+            "ntfs_security::tests::native_descriptor_preserves_owner_group_acl_and_hash",
+        ],
+    ),
+    (
+        "NTFS $LogFile restart and redo/undo transaction planning",
+        "Log transaction commit/undo rules preserve winner data and apply resident redo/undo cleanly",
+        "ondisk-lib",
+        &[
+            "ntfs::log_transactions::tests::commit_preserves_winner_data_and_forget_is_not_itself_a_commit",
+            "ntfs::recovery::tests::resident_redo_and_undo_preserve_neighbors_and_do_not_mutate_input",
+        ],
+    ),
+    (
+        "NTFS transparent compression (LZNT1/XPRESS/LZX)",
+        "LZNT1 decompression decodes raw chunks, compressed chunks, and end markers",
+        "ondisk-lib",
+        &[
+            "lznt1::tests::raw_chunks_short_chunks_and_end_markers",
+            "lznt1::tests::overlapping_matches_and_independent_chunk_dictionaries",
+        ],
+    ),
+    (
+        "ZFS vdev label, nvlist, and uberblock ring validation",
+        "Vdev labels, salted verifiers, and uberblock ring slots are validated before root selection",
+        "ondisk-lib",
+        &[
+            "zfs::tests::label_positions_and_uberblock_strides_are_checked",
+            "zfs::tests::salted_labels_reject_copy_to_another_offset_and_damage",
+        ],
+    ),
+    (
+        "ZFS blkptr, embedded block, and gang header decoding",
+        "Regular and embedded block pointers verify bounds, checksums, and codecs before decode",
+        "ondisk-lib",
+        &[
+            "zfs::tests::regular_block_checks_bounds_checksum_and_codec_before_success",
+            "zfs::tests::embedded_lz4_and_lzjb_decode_the_native_byte_sized_payload",
+        ],
+    ),
+    (
+        "ZFS block compression (LZ4/LZJB/GZIP/ZLE/ZSTD)",
+        "ZFS LZ4, LZJB, and framed ZSTD blocks decompress to exact logical sizes",
+        "ondisk-lib",
+        &[
+            "zfs::tests::zfs_lz4_envelope_literals_matches_and_exact_output",
+            "zfs::zstd_tests::zstd_published_vectors_cover_raw_compressed_sequences_and_multiblock_rle",
+        ],
+    ),
+    (
+        "ZFS RAIDZ stripe mapping and parity reconstruction",
+        "RAIDZ column mappings match reference captures and reconstruct erased data columns",
+        "ondisk-lib",
+        &[
+            "zfs::raidz::tests::maps_match_twenty_executed_native_function_captures",
+            "zfs::raidz::tests::every_single_data_erasure_and_corruption_hypothesis_reconstructs_long_and_short_columns",
+        ],
+    ),
+    (
+        "ZFS DMU dnode, bonus/spill, and indirect block routing",
+        "DMU dnodes preserve bonus/spill buffers and compute indirect block routes without overflow",
+        "ondisk-lib",
+        &[
+            "zfs_dmu::tests::both_orders_preserve_bonus_spill_and_used_units",
+            "zfs_dmu::tests::routes_include_root_slot_and_all_indirect_digits_without_overflow",
+        ],
+    ),
+    (
+        "ZFS MicroZAP and FatZAP directory table resolution",
+        "MicroZAP and FatZAP tables resolve exact leaf prefixes and reject duplicate or cyclic entries",
+        "ondisk-lib",
+        &[
+            "zfs_dmu::tests::microzap_preserves_raw_names_and_refuses_duplicate_or_incomplete_maps",
+            "zfs_zap::tests::embedded_and_external_tables_resolve_exact_leaf_prefix_ranges",
+        ],
+    ),
+    (
+        "ZFS ZPL POSIX attributes and System Attribute (SA) layouts",
+        "Legacy znode bonus and dynamic SA layouts decode POSIX metadata in both byte orders",
+        "ondisk-lib",
+        &[
+            "zfs_zpl::tests::legacy_metadata_retains_native_times_ids_and_inline_links_in_both_orders",
+            "zfs_zpl::tests::sa_reordered_layout_and_dynamic_registration_decode_without_fixed_offsets",
+        ],
+    ),
+    (
+        "multi-format OpenFs auto-detection and read-only VFS mount",
+        "Multi-format detection identifies FAT16, FAT32, and NTFS and rejects hybrid signature ambiguity",
+        "core-lib",
+        &[
+            "tests::detect_all_filesystems_identifies_fat16_fat32_ntfs_and_rejects_ambiguity_bd_i0gk5",
+        ],
+    ),
+    (
+        "CLI tui live telemetry dashboard and mount-console integration",
+        "Live TUI and mount-console snapshots populate real block-cache, MVCC, and scrub telemetry",
+        "cli-bins",
+        &[
+            "tests::cli_parses_tui_command_and_mount_console_alias",
+            "tests::build_live_tui_and_mount_console_snapshot_populates_real_cache_and_scrub_telemetry",
+        ],
+    ),
 ];
 
 // These test the evidence consumer itself, not filesystem capability rows.
@@ -1153,6 +1467,15 @@ const PARITY_SUITES: &[ParitySuite] = &[
         targets: &["--lib"],
         exact: PARITY_HONESTY_TESTS,
     },
+    ParitySuite {
+        id: "xfstests-lib",
+        package: "ffs-harness",
+        targets: &["--lib"],
+        exact: &[
+            "xfstests::tests::xfstests_baseline_manifest_json_shape",
+            "xfstests::tests::failure_triage_extracts_products_excludes_non_products_and_merges_duplicates",
+        ],
+    },
     // Cross-package suites: the MVCC and repair rows are proven by the crates'
     // own unit tests, selected by exact module-qualified name.
     ParitySuite {
@@ -1214,6 +1537,10 @@ const PARITY_SUITES: &[ParitySuite] = &[
             "pipeline::tests::adaptive_policy_clamp_preserves_metadata_expected_loss",
             "pipeline::tests::adaptive_policy_controls_symbol_refresh_count",
             "pipeline::tests::lazy_policy_defers_refresh_until_scrub_or_timeout",
+            "codec::tests::encode_produces_repair_symbols",
+            "codec::tests::decode_recovers_single_corrupt_block",
+            "pipeline::tests::scrub_daemon_scans_at_least_one_group",
+            "pipeline::tests::scrub_daemon_detection_only_does_not_write_recovery_blocks",
         ],
     },
     // The FUSE rows are proven at the dispatch boundary, which is where the FUSE
@@ -1245,6 +1572,11 @@ const PARITY_SUITES: &[ParitySuite] = &[
             "tests::dispatch_write_rwf_noappend_suppresses_open_append_offset_rewrite",
             "tests::dispatch_write_rwf_append_noappend_conflict_rejects_before_mutation",
             "tests::io_uring_kernel_switch_is_read_strictly_bd_vbqc6",
+            "tests::mount_options_default_is_read_only",
+            "tests::mount_rejects_nonexistent_mountpoint",
+            "tests::conformance_fuse_rename_directory_round_trip",
+            "tests::dispatch_rename_routes_to_fsops",
+            "tests::dispatch_rename_serializes_overlapping_parent_pairs",
         ],
     },
     // The CLI rows are proven by whole-binary end-to-end tests: the target spawns the
@@ -1277,10 +1609,16 @@ const PARITY_SUITES: &[ParitySuite] = &[
             "crash_consistency::tests::writeback_cache_crash_matrix_passes_every_invariant",
             "crash_consistency::tests::writeback_cache_crash_matrix_observes_generation_atomicity",
             "crash_consistency::proptests::mr_wb_writeback_order_preserves_invariants",
+            "tests::btrfs_tx_commit_persists_tree_root_and_payload",
+            "tests::btrfs_tx_drop_without_commit_has_no_visible_effect",
+            "tests::tree_log_replay_synthesizes_dir_entries_from_inode_refs",
+            "tests::tree_log_delete_records_round_trip_exact_keys_bd_uxh7t",
+            "tests::integration_create_path_commits_inode_dir_and_extent_data",
+            "tests::root_item_commit_updates_tree_location",
         ],
     },
-    // ffs-ondisk owns on-disk structure decode for both formats, including the
-    // ext4 feature-flag and casefold rules and the btrfs header/leaf layout.
+    // ffs-ondisk owns on-disk structure decode for all supported formats, including
+    // ext4, btrfs, FAT16/FAT32, NTFS, and ZFS.
     ParitySuite {
         id: "ondisk-lib",
         package: "ffs-ondisk",
@@ -1290,9 +1628,44 @@ const PARITY_SUITES: &[ParitySuite] = &[
             "ext4::tests::build_htree_directory_casefold_rebuild_is_fold_navigable_bd_owt2r",
             "ext4::tests::casefold_eq_matches_key_on_unicode_folds",
             "ext4::tests::ext4_casefold_key_capital_sigma_folds_like_lowercase_sigma",
+            "ext4::tests::ext4_extent_header_kernel_offsets_match_extents_h",
+            "ext4::tests::parse_extent_tree_rejects_zero_length_leaf_extent",
             "btrfs::tests::btrfs_header_parse_from_block_kernel_offsets_match_ctree_h",
             "btrfs::tests::btrfs_proptest_leaf_items_structured_key_roundtrip",
             "btrfs::tests::btrfs_proptest_internal_items_structured_roundtrip",
+            "fat::tests::geometry_uses_cluster_count_and_volume_relative_offsets",
+            "fat::tests::fat32_active_copy_and_root_are_validated",
+            "fat::tests::allocation_entry_classes_and_reserved_bits",
+            "fat::tests::long_name_is_bound_to_its_short_record",
+            "fat::tests::multi_slot_names_deleted_entries_and_end_marker",
+            "fat::tests::directory_timestamp_fields_are_lossless_in_both_dialects",
+            "fat::names::tests::explicit_code_page_controls_native_bytes_and_part_flags",
+            "ntfs::tests::boot_validates_addressable_range_and_both_record_size_encodings",
+            "ntfs::tests::all_trailers_are_checked_and_input_is_never_partially_restored",
+            "ntfs::tests::mapping_pairs_handle_backward_deltas_and_sparse_runs_without_resetting_lcn",
+            "ntfs::attribute_list::tests::references_names_and_continuation_vcns_are_lossless",
+            "ntfs::index::tests::resident_index_keys_and_subcluster_vbn_units_are_explicit",
+            "ntfs::index::tests::indx_requires_matching_vbn_valid_fixups_and_no_usa_overlap",
+            "ntfs::ea::tests::native_nonzero_final_lengths_preserve_names_binary_values_and_need_count",
+            "ntfs_security::tests::native_descriptor_preserves_owner_group_acl_and_hash",
+            "ntfs::log_transactions::tests::commit_preserves_winner_data_and_forget_is_not_itself_a_commit",
+            "ntfs::recovery::tests::resident_redo_and_undo_preserve_neighbors_and_do_not_mutate_input",
+            "lznt1::tests::raw_chunks_short_chunks_and_end_markers",
+            "lznt1::tests::overlapping_matches_and_independent_chunk_dictionaries",
+            "zfs::tests::label_positions_and_uberblock_strides_are_checked",
+            "zfs::tests::salted_labels_reject_copy_to_another_offset_and_damage",
+            "zfs::tests::regular_block_checks_bounds_checksum_and_codec_before_success",
+            "zfs::tests::embedded_lz4_and_lzjb_decode_the_native_byte_sized_payload",
+            "zfs::tests::zfs_lz4_envelope_literals_matches_and_exact_output",
+            "zfs::zstd_tests::zstd_published_vectors_cover_raw_compressed_sequences_and_multiblock_rle",
+            "zfs::raidz::tests::maps_match_twenty_executed_native_function_captures",
+            "zfs::raidz::tests::every_single_data_erasure_and_corruption_hypothesis_reconstructs_long_and_short_columns",
+            "zfs_dmu::tests::both_orders_preserve_bonus_spill_and_used_units",
+            "zfs_dmu::tests::routes_include_root_slot_and_all_indirect_digits_without_overflow",
+            "zfs_dmu::tests::microzap_preserves_raw_names_and_refuses_duplicate_or_incomplete_maps",
+            "zfs_zap::tests::embedded_and_external_tables_resolve_exact_leaf_prefix_ranges",
+            "zfs_zpl::tests::legacy_metadata_retains_native_times_ids_and_inline_links_in_both_orders",
+            "zfs_zpl::tests::sa_reordered_layout_and_dynamic_registration_decode_without_fixed_offsets",
         ],
     },
     // Infrastructure rows. These two suites are the only place the fixture and
@@ -1327,6 +1700,21 @@ const PARITY_SUITES: &[ParitySuite] = &[
             "tests::ext4_fallocate_insert_range_rejects_misaligned_and_past_eof",
             "tests::ext4_fallocate_insert_range_past_max_file_size_returns_efbig_bd_a3fh8",
             "tests::ext4_fallocate_rejects_invalid_mode_combinations",
+            "tests::bd_bhh0i_sharded_alloc_blocks_allocates_valid_distinct_blocks",
+            "tests::bd_bhh0i_sharded_alloc_inode_allocates_valid_distinct_inodes",
+            "tests::open_fs_recovers_deleted_ext4_orphan_inode",
+            "tests::open_fs_recovers_truncated_ext4_orphan_inode",
+            "tests::open_fs_recovers_orphan_list_with_invalid_head",
+            "tests::open_fs_btrfs_fsops_getattr_lookup_readdir_read",
+            "tests::btrfs_singleton_metadata_rejects_foreign_root_during_open",
+            "tests::get_encryption_policy_v1_reads_hidden_ext4_fscrypt_context",
+            "tests::get_encryption_policy_ex_reads_hidden_ext4_fscrypt_v2_context",
+            "tests::btrfs_raid56_degraded_reads_reconstruct_and_refuse_bd_hk5w3",
+            "tests::btrfs_mirror_read_failures_recover_only_from_eligible_complete_copies",
+            "tests::e2compr_compress_decompress_roundtrip_gzip",
+            "tests::e2compr_compress_decompress_roundtrip_lzo",
+            "tests::set_inode_flags_enabling_compr_with_feature_seeds_e2compr_defaults_and_write_path",
+            "tests::detect_all_filesystems_identifies_fat16_fat32_ntfs_and_rejects_ambiguity_bd_i0gk5",
         ],
     },
     // The dump command's behavior is unit-tested inside the binary, not in the
@@ -1341,6 +1729,10 @@ const PARITY_SUITES: &[ParitySuite] = &[
             "tests::build_dump_group_output_btrfs_returns_chunk_mapping",
             "tests::build_dump_inode_output_btrfs_reads_root_inode_alias",
             "tests::cli_parses_dump_dir_command_with_hex",
+            "tests::open_filesystem_for_mount_scopes_named_btrfs_subvolume_operator_path",
+            "tests::open_filesystem_for_mount_scopes_named_btrfs_snapshot_operator_path",
+            "tests::cli_parses_tui_command_and_mount_console_alias",
+            "tests::build_live_tui_and_mount_console_snapshot_populates_real_cache_and_scrub_telemetry",
         ],
     },
 ];
@@ -3089,5 +3481,62 @@ Prose mentioning Tracked Capability Matrix does not start the section.
             "FEATURE_PARITY.md has {} improperly classified rows (see stderr for list)",
             report.improperly_classified.len()
         );
+    }
+
+    #[test]
+    fn parity_matrix_reconciles_all_97_rows_and_contracts_bd_ljrbw() {
+        let summary = ParityReport::current();
+        let rows = capability_rows_from_feature_parity(FEATURE_PARITY_MARKDOWN);
+        let audit = TestCitationAuditReport::audit();
+
+        assert_eq!(summary.overall_total, 97, "summary table total must be 97");
+        assert_eq!(
+            rows.len(),
+            97,
+            "Tracked Capability Matrix must have 97 rows"
+        );
+        assert_eq!(
+            PARITY_CONTRACTS.len(),
+            97,
+            "PARITY_CONTRACTS must map all 97 capability rows"
+        );
+        assert!(
+            audit.all_cited(),
+            "all 97 capability rows must carry concrete test citations, uncited: {:?}",
+            audit.uncited_rows
+        );
+        assert_eq!(audit.unproven_rows, 0);
+
+        for row in &rows {
+            let matches: Vec<_> = PARITY_CONTRACTS
+                .iter()
+                .filter(|&&(cap, _, _, _)| cap == row.capability)
+                .collect();
+            assert_eq!(
+                matches.len(),
+                1,
+                "capability row {:?} must have exactly one PARITY_CONTRACTS entry",
+                row.capability
+            );
+        }
+
+        for &(capability, _contract, suite_id, required_tests) in PARITY_CONTRACTS {
+            assert!(
+                !required_tests.is_empty(),
+                "contract {capability:?} must require at least one test"
+            );
+            let suite = PARITY_SUITES
+                .iter()
+                .find(|s| s.id == suite_id)
+                .unwrap_or_else(|| panic!("unknown suite {suite_id:?} for {capability:?}"));
+            if !suite.exact.is_empty() {
+                for &test in required_tests {
+                    assert!(
+                        suite.exact.contains(&test),
+                        "suite {suite_id:?} exact list is missing required test {test:?} for {capability:?}"
+                    );
+                }
+            }
+        }
     }
 }
