@@ -8745,24 +8745,46 @@ impl MountHandle {
             {
                 let notify_cx = root_cx.clone();
                 let _ = region.cx().spawn_blocking(move |_worker_cx| {
-                    drop(session);
+                    // Dropping the session only requests unmount and detaches
+                    // its dispatch thread. The receipt must follow the actual
+                    // destroy callback and thread retirement, including errors.
+                    let joined = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        session.join();
+                    }));
                     if let Ok(permit) = tx.reserve(&notify_cx) {
-                        let _ = permit.send(());
+                        let _ = permit.send(joined);
                     }
                 });
                 let completed = runtime.block_on(async {
                     asupersync::time::timeout(root_cx.now(), timeout, rx.recv(root_cx)).await
                 });
-                if matches!(completed, Ok(Ok(()))) {
-                    let _ = runtime.block_on(region.close());
-                    info!(mountpoint = %self.mountpoint.display(), "unmount complete");
-                } else {
-                    let _ = region.cancel(asupersync::types::CancelReason::timeout());
-                    warn!("unmount timed out after {:?}", timeout);
+                match completed {
+                    Ok(Ok(joined)) => {
+                        let _ = runtime.block_on(region.close());
+                        if let Err(payload) = joined {
+                            error!("FUSE background session join failed during unmount");
+                            if !std::thread::panicking() {
+                                std::panic::resume_unwind(payload);
+                            }
+                            return snap;
+                        }
+                        info!(mountpoint = %self.mountpoint.display(), "unmount complete");
+                    }
+                    Ok(Err(_)) => {
+                        let _ = region.cancel(asupersync::types::CancelReason::shutdown());
+                        error!("FUSE unmount worker ended without a join completion receipt");
+                    }
+                    Err(_) => {
+                        let _ = region.cancel(asupersync::types::CancelReason::timeout());
+                        warn!("unmount timed out after {:?}", timeout);
+                    }
                 }
             } else {
                 drop(session);
-                info!(mountpoint = %self.mountpoint.display(), "unmount complete");
+                error!(
+                    mountpoint = %self.mountpoint.display(),
+                    "FUSE unmount worker region unavailable; dispatch was not joined"
+                );
             }
         }
         snap
@@ -23548,6 +23570,236 @@ mod tests {
         assert_eq!(snap.requests_total, 0);
         assert!(elapsed >= config.unmount_timeout);
         assert!(elapsed < Duration::from_millis(500));
+    }
+
+    /// Real kernel transport/lifecycle proof, with no storage durability claim.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn managed_unmount_joins_actual_destroy_and_retirement_bd_in31y() {
+        const WATCHDOG: Duration = Duration::from_secs(10);
+
+        struct DestroyGate {
+            entered: AtomicBool,
+            released: Mutex<bool>,
+            wake: Condvar,
+            finished: AtomicBool,
+            retired: AtomicBool,
+            expired: AtomicBool,
+            getattr_calls: AtomicUsize,
+        }
+
+        struct ReleaseDestroy(Arc<DestroyGate>);
+        impl Drop for ReleaseDestroy {
+            fn drop(&mut self) {
+                *self
+                    .0
+                    .released
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) = true;
+                self.0.wake.notify_all();
+            }
+        }
+
+        struct DestroyGatedFs(Arc<DestroyGate>);
+        impl Drop for DestroyGatedFs {
+            fn drop(&mut self) {
+                self.0.retired.store(true, Ordering::Release);
+            }
+        }
+        impl FsOps for DestroyGatedFs {
+            fn getattr(
+                &self,
+                _cx: &Cx,
+                _scope: &mut RequestScope,
+                ino: InodeNumber,
+            ) -> ffs_error::Result<InodeAttr> {
+                self.0.getattr_calls.fetch_add(1, Ordering::Relaxed);
+                let mut attr = make_test_attr(FfsFileType::Directory, 4096);
+                attr.ino = ino;
+                attr.perm = 0o755;
+                Ok(attr)
+            }
+
+            fn lookup(
+                &self,
+                cx: &Cx,
+                scope: &mut RequestScope,
+                parent: InodeNumber,
+                name: &OsStr,
+            ) -> ffs_error::Result<InodeAttr> {
+                MinimalTestFs.lookup(cx, scope, parent, name)
+            }
+
+            fn readdir(
+                &self,
+                cx: &Cx,
+                scope: &mut RequestScope,
+                ino: InodeNumber,
+                offset: u64,
+            ) -> ffs_error::Result<ReaddirPage> {
+                MinimalTestFs.readdir(cx, scope, ino, offset)
+            }
+
+            fn read(
+                &self,
+                cx: &Cx,
+                scope: &mut RequestScope,
+                ino: InodeNumber,
+                offset: u64,
+                size: u32,
+            ) -> ffs_error::Result<Vec<u8>> {
+                MinimalTestFs.read(cx, scope, ino, offset, size)
+            }
+
+            fn readlink(
+                &self,
+                cx: &Cx,
+                scope: &mut RequestScope,
+                ino: InodeNumber,
+            ) -> ffs_error::Result<Vec<u8>> {
+                MinimalTestFs.readlink(cx, scope, ino)
+            }
+
+            fn flush_on_destroy(&self, _cx: &Cx) -> ffs_error::Result<()> {
+                self.0.entered.store(true, Ordering::Release);
+                let released = self.0.released.lock().expect("destroy release gate");
+                let (released, _) = self
+                    .0
+                    .wake
+                    .wait_timeout_while(released, WATCHDOG, |released| !*released)
+                    .expect("destroy gate watchdog");
+                if !*released {
+                    self.0.expired.store(true, Ordering::Release);
+                    return Err(FfsError::Io(std::io::Error::new(
+                        std::io::ErrorKind::TimedOut,
+                        "test destroy gate was not released",
+                    )));
+                }
+                self.0.finished.store(true, Ordering::Release);
+                Ok(())
+            }
+        }
+
+        let required = std::env::var_os("FFS_REQUIRE_FUSE").is_some_and(|value| value == "1");
+        if !Path::new("/dev/fuse").exists() {
+            assert!(!required, "FFS_REQUIRE_FUSE=1 but /dev/fuse is unavailable");
+            eprintln!("SKIP fuse_unavailable reason=/dev/fuse is unavailable");
+            return;
+        }
+        let unique = SystemTime::now()
+            .duration_since(SystemTime::UNIX_EPOCH)
+            .expect("system time after unix epoch")
+            .as_nanos();
+        let mountpoint = std::env::temp_dir().join(format!(
+            "ffs-managed-unmount-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir(&mountpoint).expect("create managed lifecycle mountpoint");
+        let gate = Arc::new(DestroyGate {
+            entered: AtomicBool::new(false),
+            released: Mutex::new(false),
+            wake: Condvar::new(),
+            finished: AtomicBool::new(false),
+            retired: AtomicBool::new(false),
+            expired: AtomicBool::new(false),
+            getattr_calls: AtomicUsize::new(0),
+        });
+        let config = MountConfig {
+            options: MountOptions {
+                auto_unmount: false,
+                worker_threads: 1,
+                ..MountOptions::default()
+            },
+            ..MountConfig::default()
+        };
+        let handle = match mount_managed(
+            Box::new(DestroyGatedFs(Arc::clone(&gate))),
+            &mountpoint,
+            &config,
+        ) {
+            Ok(handle) => handle,
+            Err(error) => {
+                assert!(
+                    !required,
+                    "FFS_REQUIRE_FUSE=1 but real mount failed: {error}"
+                );
+                eprintln!("SKIP fuse_unavailable reason=real mount failed: {error}");
+                return;
+            }
+        };
+        // Declared after the handle so unwind releases the callback before
+        // MountHandle::drop can wait for it. No assertion can strand the gate.
+        let release = ReleaseDestroy(Arc::clone(&gate));
+        assert!(
+            std::fs::metadata(&mountpoint)
+                .expect("getattr through the mounted kernel path")
+                .is_dir()
+        );
+        assert!(gate.getattr_calls.load(Ordering::Relaxed) > 0);
+
+        let (returned, mut returned_rx) = asupersync::channel::oneshot::channel();
+        let retirement = Arc::clone(&gate);
+        let unmount = std::thread::spawn(move || {
+            let result =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| handle.unmount()));
+            let retired_on_return = retirement.retired.load(Ordering::Acquire);
+            if let Ok(permit) = returned.reserve(fuse_root_cx()) {
+                let _ = permit.send((result, retired_on_return));
+            }
+        });
+        let started = Instant::now();
+        while !gate.entered.load(Ordering::Acquire) && started.elapsed() < WATCHDOG {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        let entered = gate.entered.load(Ordering::Acquire);
+        // The callback is genuinely running on the session dispatch thread,
+        // held before completion. Old drop(session) returns during this hold.
+        let early = fuse_runtime().block_on(asupersync::time::timeout(
+            fuse_root_cx().now(),
+            Duration::from_millis(250),
+            returned_rx.recv(fuse_root_cx()),
+        ));
+        let returned_early = early.is_ok();
+        let finished_early = gate.finished.load(Ordering::Acquire);
+        drop(release);
+        let completed = match early {
+            Ok(result) => result,
+            Err(_) => fuse_runtime()
+                .block_on(asupersync::time::timeout(
+                    fuse_root_cx().now(),
+                    WATCHDOG.saturating_sub(started.elapsed()),
+                    returned_rx.recv(fuse_root_cx()),
+                ))
+                .expect("managed unmount must finish after the destroy gate is released"),
+        };
+        let (result, retired_on_return) =
+            completed.expect("actual managed-unmount completion receipt");
+        result.expect("real session join must not panic");
+        unmount.join().expect("managed-unmount caller retired");
+        // Also drain the OLD-source failure path before its negative assertion:
+        // its detached session may still be leaving the released callback.
+        while !gate.retired.load(Ordering::Acquire) && started.elapsed() < WATCHDOG {
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(entered, "actual destroy callback must start");
+        assert!(
+            !finished_early,
+            "held destroy callback must remain unfinished"
+        );
+        assert!(
+            !returned_early,
+            "managed unmount returned before its actual destroy callback finished"
+        );
+        assert!(
+            !gate.expired.load(Ordering::Acquire),
+            "destroy watchdog expired"
+        );
+        assert!(
+            retired_on_return,
+            "actual filesystem must already be retired when public unmount returns"
+        );
+        assert!(gate.finished.load(Ordering::Acquire));
+        assert!(gate.retired.load(Ordering::Acquire));
     }
 
     // ── FuseErrorContext errno mapping for all 21 variants (bd-2s4.6) ──
