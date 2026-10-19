@@ -159,7 +159,7 @@ fn successor(
 /// Return every native record in an inclusive, physically contiguous window.
 /// Every record is decoded through the ordinary protected payload reader.
 /// On failure the private collection is dropped; no partial history escapes.
-pub(super) fn collect(
+pub(in super::super) fn collect(
     cx: &Cx,
     restart: &Restart,
     stream_length: u64,

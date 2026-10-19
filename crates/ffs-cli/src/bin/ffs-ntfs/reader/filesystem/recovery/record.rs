@@ -8,6 +8,9 @@
 
 mod payload;
 mod preflight;
+mod tail;
+
+pub(super) use tail::validate_latest_volume;
 
 use super::{
     Cx, NtfsVolume, Restart, Result, SECTOR, bytes, checkpoint, corrupt, read_exact, u16_at,

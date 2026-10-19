@@ -8,7 +8,7 @@
 
 mod analysis;
 mod redo;
-mod scan;
+pub(super) mod scan;
 mod table;
 mod targets;
 

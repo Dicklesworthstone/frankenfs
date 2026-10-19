@@ -25,7 +25,7 @@ const ERASED_SCAN_LIMIT: u64 = 64 * 1024 * 1024;
 const NO_CLIENT: u16 = 0xFFFF;
 const CLEAN: u16 = 0x0002;
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct Restart {
     system_page: u32,
     log_page: u32,
@@ -78,7 +78,7 @@ fn bytes<const N: usize>(data: &[u8], offset: usize) -> Result<[u8; N]> {
     data.get(offset..end)
         .ok_or_else(|| corrupt(0, "truncated $LogFile field"))?
         .try_into()
-        .map_err(|_| corrupt(0, "invalid $LogFile field width"))
+        .map_err(|_| corrupt(0, "$LogFile field width"))
 }
 
 fn u16_at(data: &[u8], offset: usize) -> Result<u16> {
@@ -173,7 +173,7 @@ fn assess_volume(
     )?;
     let selected = selection::choose(&first, &second)?;
     if !selected.clean {
-        let tail = record::validate_dirty_volume(cx, selected, length, &mut read, volume)?;
+        let tail = record::validate_latest_volume(cx, selected, length, &mut read, volume)?;
         return Err(unsupported(format!(
             "$LogFile requires native redo/undo recovery before mounting; current transaction {} has redo opcode {:#04x} and undo opcode {:#04x}",
             tail.transaction_id, tail.redo_op, tail.undo_op
